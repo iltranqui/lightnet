@@ -147,22 +147,17 @@ impl CutileBackend {
         channel_stride: usize,
         tile_len: usize,
     ) -> Result<CutileTensorF32, CutileBackendError> {
-        let (rows, cols) =
-            validate_bias_add_layout(x.len(), bias.len(), channels, channel_stride)?;
+        let (rows, cols) = validate_bias_add_layout(x.len(), bias.len(), channels, channel_stride)?;
         let tile_len = tile_len.min(cols).max(1);
         let x_view = x.arc().try_view_dyn(&[rows, cols])?;
         let bias_view = bias.arc().try_view_dyn(&[channels])?;
         let z = api::zeros([rows, cols])
             .sync_on(&self.stream)?
             .partition([1, tile_len as i32]);
-        let (z, _, _, _) = cutile_darknet_kernels::bias_add_2d(
-            z,
-            x_view,
-            bias_view,
-            channels as i32,
-        )
-            .grid((rows as u32, grid_1d(cols, tile_len), 1))
-            .sync_on(&self.stream)?;
+        let (z, _, _, _) =
+            cutile_darknet_kernels::bias_add_2d(z, x_view, bias_view, channels as i32)
+                .grid((rows as u32, grid_1d(cols, tile_len), 1))
+                .sync_on(&self.stream)?;
         let out: Tensor<f32> = z.unpartition();
         Ok(CutileTensorF32 {
             inner: Arc::new(out.reshape_dyn(&x.shape_usize())),
@@ -416,6 +411,55 @@ impl CutileBackend {
         })
     }
 
+    pub fn maxpool_f32(
+        &self,
+        x: &CutileTensorF32,
+        output_shape: &[usize],
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        padding: usize,
+        tile_len: usize,
+    ) -> Result<CutileTensorF32, CutileBackendError> {
+        let layout = validate_maxpool_layout(
+            x.len(),
+            output_shape,
+            channels,
+            input_height,
+            input_width,
+            size,
+            stride_x,
+            stride_y,
+        )?;
+        let _tile_len = tile_len.min(layout.output_len).max(1);
+        let out = api::zeros([layout.output_len]).sync_on(&self.stream)?;
+
+        unsafe {
+            cutile_darknet_kernels::maxpool_flat(
+                out.device_pointer(),
+                x.arc().device_pointer(),
+                layout.output_len as i32,
+                input_height as i32,
+                input_width as i32,
+                layout.output_height as i32,
+                layout.output_width as i32,
+                size as i32,
+                stride_x as i32,
+                stride_y as i32,
+                (padding / 2) as i32,
+            )
+        }
+        .grid((grid_1d(layout.output_len, POINTER_TILE_1D), 1, 1))
+        .sync_on(&self.stream)?;
+
+        Ok(CutileTensorF32 {
+            inner: Arc::new(out.reshape_dyn(output_shape)),
+        })
+    }
+
     pub fn vector_add_f32(
         &self,
         x: &CutileTensorF32,
@@ -613,6 +657,34 @@ impl F32TensorOpsBackend for CutileBackend {
             stride,
             scale,
             reverse,
+            config.tile_len,
+        )
+    }
+
+    fn maxpool_f32(
+        &self,
+        x: &Self::Tensor,
+        output_shape: &[usize],
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        padding: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        CutileBackend::maxpool_f32(
+            self,
+            x,
+            output_shape,
+            channels,
+            input_height,
+            input_width,
+            size,
+            stride_x,
+            stride_y,
+            padding,
             config.tile_len,
         )
     }
@@ -841,9 +913,9 @@ fn validate_conv2d_layout(
         )));
     }
 
-    let input_plane = input_height.checked_mul(input_width).ok_or_else(|| {
-        CutileBackendError::Shape("conv2d_f32 input plane overflow".to_owned())
-    })?;
+    let input_plane = input_height
+        .checked_mul(input_width)
+        .ok_or_else(|| CutileBackendError::Shape("conv2d_f32 input plane overflow".to_owned()))?;
     let input_batch_stride = input_channels.checked_mul(input_plane).ok_or_else(|| {
         CutileBackendError::Shape("conv2d_f32 input batch stride overflow".to_owned())
     })?;
@@ -858,7 +930,9 @@ fn validate_conv2d_layout(
     let weights_per_filter = channels_per_group
         .checked_mul(kernel_size)
         .and_then(|value| value.checked_mul(kernel_size))
-        .ok_or_else(|| CutileBackendError::Shape("conv2d_f32 weights-per-filter overflow".to_owned()))?;
+        .ok_or_else(|| {
+            CutileBackendError::Shape("conv2d_f32 weights-per-filter overflow".to_owned())
+        })?;
     let expected_weight_len = filters
         .checked_mul(weights_per_filter)
         .ok_or_else(|| CutileBackendError::Shape("conv2d_f32 weight length overflow".to_owned()))?;
@@ -885,6 +959,13 @@ fn validate_conv2d_layout(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct UpsampleLayout {
+    output_height: usize,
+    output_width: usize,
+    output_len: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MaxPoolLayout {
     output_height: usize,
     output_width: usize,
     output_len: usize,
@@ -967,7 +1048,9 @@ fn validate_upsample_layout(
         input_height
             .checked_mul(stride)
             .and_then(|height| input_width.checked_mul(stride).map(|width| height * width))
-            .ok_or_else(|| CutileBackendError::Shape("upsample_f32 expanded plane overflow".to_owned()))?
+            .ok_or_else(|| {
+                CutileBackendError::Shape("upsample_f32 expanded plane overflow".to_owned())
+            })?
     };
     if output_plane != expected_output_plane {
         return Err(CutileBackendError::Shape(format!(
@@ -976,6 +1059,89 @@ fn validate_upsample_layout(
     }
 
     Ok(UpsampleLayout {
+        output_height,
+        output_width,
+        output_len,
+    })
+}
+
+fn validate_maxpool_layout(
+    input_len: usize,
+    output_shape: &[usize],
+    channels: usize,
+    input_height: usize,
+    input_width: usize,
+    size: usize,
+    stride_x: usize,
+    stride_y: usize,
+) -> Result<MaxPoolLayout, CutileBackendError> {
+    if channels == 0 {
+        return Err(CutileBackendError::Shape(
+            "maxpool_f32 requires channels > 0".to_owned(),
+        ));
+    }
+    if input_height == 0 || input_width == 0 {
+        return Err(CutileBackendError::Shape(
+            "maxpool_f32 requires non-zero input spatial dimensions".to_owned(),
+        ));
+    }
+    if size == 0 || stride_x == 0 || stride_y == 0 {
+        return Err(CutileBackendError::Shape(
+            "maxpool_f32 requires non-zero kernel size and strides".to_owned(),
+        ));
+    }
+    if output_shape.len() != 4 {
+        return Err(CutileBackendError::Shape(
+            "maxpool_f32 output shape must be [batch, channels, height, width]".to_owned(),
+        ));
+    }
+
+    let input_plane = input_height
+        .checked_mul(input_width)
+        .ok_or_else(|| CutileBackendError::Shape("maxpool_f32 input plane overflow".to_owned()))?;
+    if input_len % input_plane != 0 {
+        return Err(CutileBackendError::Shape(format!(
+            "maxpool_f32 input length {input_len} is not divisible by input plane {input_plane}"
+        )));
+    }
+    let batch_channels = input_len / input_plane;
+    if batch_channels % channels != 0 {
+        return Err(CutileBackendError::Shape(format!(
+            "maxpool_f32 batch*channels {batch_channels} is not divisible by channels {channels}"
+        )));
+    }
+    let batch = batch_channels / channels;
+    if output_shape[0] != batch {
+        return Err(CutileBackendError::Shape(format!(
+            "maxpool_f32 output batch mismatch: expected {batch}, got {}",
+            output_shape[0]
+        )));
+    }
+    if output_shape[1] != channels {
+        return Err(CutileBackendError::Shape(format!(
+            "maxpool_f32 output channels mismatch: expected {channels}, got {}",
+            output_shape[1]
+        )));
+    }
+
+    let output_len = shape_num_elements(output_shape)?;
+    let output_height = output_shape[2];
+    let output_width = output_shape[3];
+    let expected_output_len = batch
+        .checked_mul(channels)
+        .and_then(|value| value.checked_mul(output_height))
+        .and_then(|value| value.checked_mul(output_width))
+        .ok_or_else(|| {
+            CutileBackendError::Shape("maxpool_f32 output length overflow".to_owned())
+        })?;
+    if output_len != expected_output_len {
+        return Err(CutileBackendError::Shape(format!(
+            "maxpool_f32 output shape {:?} expects {output_len} elements, got {expected_output_len}",
+            output_shape
+        )));
+    }
+
+    Ok(MaxPoolLayout {
         output_height,
         output_width,
         output_len,
@@ -1061,19 +1227,13 @@ mod cutile_darknet_kernels {
     }
 
     #[cutile::entry(print_ir = true)]
-    fn activation_linear<const S: [i32; 1]>(
-        z: &mut Tensor<f32, S>,
-        x: &Tensor<f32, { [-1] }>,
-    ) {
+    fn activation_linear<const S: [i32; 1]>(z: &mut Tensor<f32, S>, x: &Tensor<f32, { [-1] }>) {
         let tile_x = load_tile_like_1d(x, z);
         z.store(tile_x);
     }
 
     #[cutile::entry(print_ir = true)]
-    fn activation_logistic<const S: [i32; 1]>(
-        z: &mut Tensor<f32, S>,
-        x: &Tensor<f32, { [-1] }>,
-    ) {
+    fn activation_logistic<const S: [i32; 1]>(z: &mut Tensor<f32, S>, x: &Tensor<f32, { [-1] }>) {
         let tile_x = load_tile_like_1d(x, z);
         let one: Tile<f32, S> = constant(1.0f32, z.shape());
         let neg_x: Tile<f32, S> = negf(tile_x);
@@ -1082,20 +1242,14 @@ mod cutile_darknet_kernels {
     }
 
     #[cutile::entry(print_ir = true)]
-    fn activation_relu<const S: [i32; 1]>(
-        z: &mut Tensor<f32, S>,
-        x: &Tensor<f32, { [-1] }>,
-    ) {
+    fn activation_relu<const S: [i32; 1]>(z: &mut Tensor<f32, S>, x: &Tensor<f32, { [-1] }>) {
         let tile_x = load_tile_like_1d(x, z);
         let zero: Tile<f32, S> = constant(0.0f32, z.shape());
         z.store(max_tile(tile_x, zero));
     }
 
     #[cutile::entry(print_ir = true)]
-    fn activation_leaky<const S: [i32; 1]>(
-        z: &mut Tensor<f32, S>,
-        x: &Tensor<f32, { [-1] }>,
-    ) {
+    fn activation_leaky<const S: [i32; 1]>(z: &mut Tensor<f32, S>, x: &Tensor<f32, { [-1] }>) {
         let tile_x = load_tile_like_1d(x, z);
         let zero: Tile<f32, S> = constant(0.0f32, z.shape());
         let slope: Tile<f32, S> = constant(0.1f32, z.shape());
@@ -1103,10 +1257,7 @@ mod cutile_darknet_kernels {
     }
 
     #[cutile::entry(print_ir = true)]
-    fn activation_mish<const S: [i32; 1]>(
-        z: &mut Tensor<f32, S>,
-        x: &Tensor<f32, { [-1] }>,
-    ) {
+    fn activation_mish<const S: [i32; 1]>(z: &mut Tensor<f32, S>, x: &Tensor<f32, { [-1] }>) {
         let tile_x = load_tile_like_1d(x, z);
         let one: Tile<f32, S> = constant(1.0f32, z.shape());
         let exp_x: Tile<f32, S> = exp(tile_x);
@@ -1116,10 +1267,7 @@ mod cutile_darknet_kernels {
     }
 
     #[cutile::entry(print_ir = true)]
-    fn activation_swish<const S: [i32; 1]>(
-        z: &mut Tensor<f32, S>,
-        x: &Tensor<f32, { [-1] }>,
-    ) {
+    fn activation_swish<const S: [i32; 1]>(z: &mut Tensor<f32, S>, x: &Tensor<f32, { [-1] }>) {
         let tile_x = load_tile_like_1d(x, z);
         let one: Tile<f32, S> = constant(1.0f32, z.shape());
         let neg_x: Tile<f32, S> = negf(tile_x);
@@ -1128,10 +1276,7 @@ mod cutile_darknet_kernels {
     }
 
     #[cutile::entry(print_ir = true)]
-    fn activation_tanh<const S: [i32; 1]>(
-        z: &mut Tensor<f32, S>,
-        x: &Tensor<f32, { [-1] }>,
-    ) {
+    fn activation_tanh<const S: [i32; 1]>(z: &mut Tensor<f32, S>, x: &Tensor<f32, { [-1] }>) {
         let tile_x = load_tile_like_1d(x, z);
         let tanh_x: Tile<f32, S> = tanh(tile_x);
         z.store(tanh_x);
@@ -1184,32 +1329,22 @@ mod cutile_darknet_kernels {
             let channel_idx = within_batch / channel_stride_tile;
             let elem_idx = within_batch % channel_stride_tile;
 
-            let src_offsets =
-                batch_idx * source_batch_stride + source_channel_offset_tile + channel_idx * channel_stride_tile + elem_idx;
+            let src_offsets = batch_idx * source_batch_stride
+                + source_channel_offset_tile
+                + channel_idx * channel_stride_tile
+                + elem_idx;
             let src: PointerTile<*mut f32, { [128] }> = src_ptrs.offset_tile(src_offsets);
-            let src_values: (Tile<f32, { [128] }>, Token) = load_ptr_tko(
-                src,
-                "weak",
-                "tl_blk",
-                Some(mask),
-                Some(0.0f32),
-                None,
-                None,
-            );
+            let src_values: (Tile<f32, { [128] }>, Token) =
+                load_ptr_tko(src, "weak", "tl_blk", Some(mask), Some(0.0f32), None, None);
             let src_tile: Tile<f32, { [128] }> = src_values.0;
 
-            let dst_offsets =
-                batch_idx * output_batch_stride + output_channel_offset_tile + channel_idx * channel_stride_tile + elem_idx;
+            let dst_offsets = batch_idx * output_batch_stride
+                + output_channel_offset_tile
+                + channel_idx * channel_stride_tile
+                + elem_idx;
             let dst: PointerTile<*mut f32, { [128] }> = dst_ptrs.offset_tile(dst_offsets);
-            let _store_token: Token = store_ptr_tko(
-                dst,
-                src_tile,
-                "weak",
-                "tl_blk",
-                Some(mask),
-                None,
-                None,
-            );
+            let _store_token: Token =
+                store_ptr_tko(dst, src_tile, "weak", "tl_blk", Some(mask), None, None);
         }
     }
 
@@ -1235,8 +1370,7 @@ mod cutile_darknet_kernels {
         let out_base: PointerTile<*mut f32, { [1] }> = out_root.reshape(const_shape![1]);
         let out_ptrs: PointerTile<*mut f32, { [128] }> = out_base.broadcast(const_shape![128]);
 
-        let output_len_tile: Tile<i32, { [128] }> =
-            broadcast_scalar(output_len, const_shape![128]);
+        let output_len_tile: Tile<i32, { [128] }> = broadcast_scalar(output_len, const_shape![128]);
         let output_plane_tile: Tile<i32, { [128] }> =
             broadcast_scalar(output_height * output_width, const_shape![128]);
         let input_width_tile: Tile<i32, { [128] }> =
@@ -1258,31 +1392,17 @@ mod cutile_darknet_kernels {
             let output_x = within_plane % output_width_tile;
             let input_y = output_y / stride_tile;
             let input_x = output_x / stride_tile;
-            let input_offsets =
-                batch_channel * broadcast_scalar(input_height * input_width, const_shape![128])
-                    + input_y * input_width_tile
-                    + input_x;
+            let input_offsets = batch_channel
+                * broadcast_scalar(input_height * input_width, const_shape![128])
+                + input_y * input_width_tile
+                + input_x;
             let src: PointerTile<*mut f32, { [128] }> = in_ptrs.offset_tile(input_offsets);
-            let values: (Tile<f32, { [128] }>, Token) = load_ptr_tko(
-                src,
-                "weak",
-                "tl_blk",
-                Some(mask),
-                Some(0.0f32),
-                None,
-                None,
-            );
+            let values: (Tile<f32, { [128] }>, Token) =
+                load_ptr_tko(src, "weak", "tl_blk", Some(mask), Some(0.0f32), None, None);
             let scaled_values: Tile<f32, { [128] }> = values.0 * scale_tile;
             let dst: PointerTile<*mut f32, { [128] }> = out_ptrs.offset_tile(output_idx);
-            let _store_token: Token = store_ptr_tko(
-                dst,
-                scaled_values,
-                "weak",
-                "tl_blk",
-                Some(mask),
-                None,
-                None,
-            );
+            let _store_token: Token =
+                store_ptr_tko(dst, scaled_values, "weak", "tl_blk", Some(mask), None, None);
         }
     }
 
@@ -1309,7 +1429,8 @@ mod cutile_darknet_kernels {
         let out_ptrs: PointerTile<*mut f32, { [128] }> = out_base.broadcast(const_shape![128]);
 
         let input_len_tile: Tile<i32, { [128] }> = broadcast_scalar(input_len, const_shape![128]);
-        let input_width_tile: Tile<i32, { [128] }> = broadcast_scalar(input_width, const_shape![128]);
+        let input_width_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(input_width, const_shape![128]);
         let input_plane_tile: Tile<i32, { [128] }> =
             broadcast_scalar(input_height * input_width, const_shape![128]);
         let output_width_tile: Tile<i32, { [128] }> =
@@ -1334,15 +1455,8 @@ mod cutile_darknet_kernels {
             let output_offsets =
                 batch_channel * output_plane_tile + output_y * output_width_tile + output_x;
             let src: PointerTile<*mut f32, { [128] }> = in_ptrs.offset_tile(input_idx);
-            let values: (Tile<f32, { [128] }>, Token) = load_ptr_tko(
-                src,
-                "weak",
-                "tl_blk",
-                Some(mask),
-                Some(0.0f32),
-                None,
-                None,
-            );
+            let values: (Tile<f32, { [128] }>, Token) =
+                load_ptr_tko(src, "weak", "tl_blk", Some(mask), Some(0.0f32), None, None);
             let scaled_values: Tile<f32, { [128] }> = values.0 * scale_tile;
             let dst: PointerTile<*mut f32, { [128] }> = out_ptrs.offset_tile(output_offsets);
             let _atomic_token: (Tile<f32, { [128] }>, Token) = atomic_rmw_tko(
@@ -1354,6 +1468,95 @@ mod cutile_darknet_kernels {
                 Some(mask),
                 None,
             );
+        }
+    }
+
+    #[cutile::entry()]
+    unsafe fn maxpool_flat(
+        out_ptr: *mut f32,
+        in_ptr: *mut f32,
+        output_len: i32,
+        input_height: i32,
+        input_width: i32,
+        output_height: i32,
+        output_width: i32,
+        size: i32,
+        stride_x: i32,
+        stride_y: i32,
+        pad_offset: i32,
+    ) {
+        let grid = get_num_tile_blocks();
+        let pid = get_tile_block_id();
+
+        let in_root: PointerTile<*mut f32, { [] }> = pointer_to_tile(in_ptr);
+        let in_base: PointerTile<*mut f32, { [1] }> = in_root.reshape(const_shape![1]);
+        let in_ptrs: PointerTile<*mut f32, { [128] }> = in_base.broadcast(const_shape![128]);
+        let out_root: PointerTile<*mut f32, { [] }> = pointer_to_tile(out_ptr);
+        let out_base: PointerTile<*mut f32, { [1] }> = out_root.reshape(const_shape![1]);
+        let out_ptrs: PointerTile<*mut f32, { [128] }> = out_base.broadcast(const_shape![128]);
+
+        let output_len_tile: Tile<i32, { [128] }> = broadcast_scalar(output_len, const_shape![128]);
+        let output_plane_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(output_height * output_width, const_shape![128]);
+        let output_width_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(output_width, const_shape![128]);
+        let input_plane_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(input_height * input_width, const_shape![128]);
+        let input_width_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(input_width, const_shape![128]);
+        let input_height_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(input_height, const_shape![128]);
+        let zero_i32: Tile<i32, { [128] }> = broadcast_scalar(0i32, const_shape![128]);
+
+        let start: i32 = pid.0 * 128i32;
+        let step: i32 = grid.0 * 128i32;
+        for offset in (start..output_len).step_by(step as usize) {
+            let output_idx: Tile<i32, { [128] }> =
+                iota(const_shape![128]) + broadcast_scalar(offset, const_shape![128]);
+            let output_mask: Tile<bool, { [128] }> = lt_tile(output_idx, output_len_tile);
+            let batch_channel = output_idx / output_plane_tile;
+            let within_plane = output_idx % output_plane_tile;
+            let output_y = within_plane / output_width_tile;
+            let output_x = within_plane % output_width_tile;
+            let mut acc: Tile<f32, { [128] }> = constant(f32::NEG_INFINITY, const_shape![128]);
+
+            for ky in 0i32..size {
+                let ky_tile: Tile<i32, { [128] }> = broadcast_scalar(ky, const_shape![128]);
+                let input_y = output_y * broadcast_scalar(stride_y, const_shape![128]) + ky_tile
+                    - broadcast_scalar(pad_offset, const_shape![128]);
+                for kx in 0i32..size {
+                    let kx_tile: Tile<i32, { [128] }> = broadcast_scalar(kx, const_shape![128]);
+                    let input_x = output_x * broadcast_scalar(stride_x, const_shape![128])
+                        + kx_tile
+                        - broadcast_scalar(pad_offset, const_shape![128]);
+                    let valid = output_mask
+                        & ge_tile(input_y, zero_i32)
+                        & lt_tile(input_y, input_height_tile)
+                        & ge_tile(input_x, zero_i32)
+                        & lt_tile(input_x, input_width_tile);
+                    let input_offsets =
+                        batch_channel * input_plane_tile + input_y * input_width_tile + input_x;
+                    let safe_input_offsets = select(valid, input_offsets, zero_i32);
+                    let src: PointerTile<*mut f32, { [128] }> =
+                        in_ptrs.offset_tile(safe_input_offsets);
+                    let input_tile: (Tile<f32, { [128] }>, Token) = load_ptr_tko(
+                        src,
+                        "weak",
+                        "tl_blk",
+                        Some(valid),
+                        Some(f32::NEG_INFINITY),
+                        None,
+                        None,
+                    );
+                    let values: Tile<f32, { [128] }> = input_tile.0;
+                    let better: Tile<bool, { [128] }> = gt_tile(values, acc);
+                    acc = select(better, values, acc);
+                }
+            }
+
+            let dst: PointerTile<*mut f32, { [128] }> = out_ptrs.offset_tile(output_idx);
+            let _store_token: Token =
+                store_ptr_tko(dst, acc, "weak", "tl_blk", Some(output_mask), None, None);
         }
     }
 
@@ -1389,10 +1592,10 @@ mod cutile_darknet_kernels {
         let input_ptrs: PointerTile<*mut f32, { [128] }> = input_base.broadcast(const_shape![128]);
         let weight_root: PointerTile<*mut f32, { [] }> = pointer_to_tile(weight_ptr);
         let weight_base: PointerTile<*mut f32, { [1] }> = weight_root.reshape(const_shape![1]);
-        let weight_ptrs: PointerTile<*mut f32, { [128] }> = weight_base.broadcast(const_shape![128]);
+        let weight_ptrs: PointerTile<*mut f32, { [128] }> =
+            weight_base.broadcast(const_shape![128]);
 
-        let output_len_tile: Tile<i32, { [128] }> =
-            broadcast_scalar(output_len, const_shape![128]);
+        let output_len_tile: Tile<i32, { [128] }> = broadcast_scalar(output_len, const_shape![128]);
         let output_plane_tile: Tile<i32, { [128] }> =
             broadcast_scalar(output_height * output_width, const_shape![128]);
         let filter_plane_tile: Tile<i32, { [128] }> =
@@ -1431,27 +1634,27 @@ mod cutile_darknet_kernels {
             let mut acc: Tile<f32, { [128] }> = constant(0.0f32, const_shape![128]);
             for ic in 0i32..channels_per_group {
                 let ic_tile: Tile<i32, { [128] }> = broadcast_scalar(ic, const_shape![128]);
-                let input_channel =
-                    group_idx * channels_per_group_tile + ic_tile;
+                let input_channel = group_idx * channels_per_group_tile + ic_tile;
                 for ky in 0i32..kernel_size {
                     let ky_tile: Tile<i32, { [128] }> = broadcast_scalar(ky, const_shape![128]);
-                    let input_y =
-                        output_y * broadcast_scalar(stride_y, const_shape![128])
-                            + ky_tile * broadcast_scalar(dilation, const_shape![128])
-                            - broadcast_scalar(padding, const_shape![128]);
+                    let input_y = output_y * broadcast_scalar(stride_y, const_shape![128])
+                        + ky_tile * broadcast_scalar(dilation, const_shape![128])
+                        - broadcast_scalar(padding, const_shape![128]);
                     for kx in 0i32..kernel_size {
                         let kx_tile: Tile<i32, { [128] }> = broadcast_scalar(kx, const_shape![128]);
-                        let input_x =
-                            output_x * broadcast_scalar(stride_x, const_shape![128])
-                                + kx_tile * broadcast_scalar(dilation, const_shape![128])
-                                - broadcast_scalar(padding, const_shape![128]);
+                        let input_x = output_x * broadcast_scalar(stride_x, const_shape![128])
+                            + kx_tile * broadcast_scalar(dilation, const_shape![128])
+                            - broadcast_scalar(padding, const_shape![128]);
                         let input_valid = output_mask
                             & ge_tile(input_y, zero_i32)
                             & lt_tile(input_y, input_height_tile)
                             & ge_tile(input_x, zero_i32)
                             & lt_tile(input_x, input_width_limit_tile);
                         let input_offsets = batch_idx
-                            * broadcast_scalar(input_channels * input_height * input_width, const_shape![128])
+                            * broadcast_scalar(
+                                input_channels * input_height * input_width,
+                                const_shape![128],
+                            )
                             + input_channel * input_plane_tile
                             + input_y * input_width_tile
                             + input_x;
@@ -1468,12 +1671,11 @@ mod cutile_darknet_kernels {
                             None,
                         );
 
-                        let weight_offsets =
-                            ((filter_idx * channels_per_group_tile + ic_tile)
-                                * broadcast_scalar(kernel_size, const_shape![128])
-                                + ky_tile)
-                                * broadcast_scalar(kernel_size, const_shape![128])
-                                + kx_tile;
+                        let weight_offsets = ((filter_idx * channels_per_group_tile + ic_tile)
+                            * broadcast_scalar(kernel_size, const_shape![128])
+                            + ky_tile)
+                            * broadcast_scalar(kernel_size, const_shape![128])
+                            + kx_tile;
                         let weight_ptrs_offset: PointerTile<*mut f32, { [128] }> =
                             weight_ptrs.offset_tile(weight_offsets);
                         let weight_tile: (Tile<f32, { [128] }>, Token) = load_ptr_tko(
@@ -1492,15 +1694,8 @@ mod cutile_darknet_kernels {
             }
 
             let dst: PointerTile<*mut f32, { [128] }> = out_ptrs.offset_tile(output_idx);
-            let _store_token: Token = store_ptr_tko(
-                dst,
-                acc,
-                "weak",
-                "tl_blk",
-                Some(output_mask),
-                None,
-                None,
-            );
+            let _store_token: Token =
+                store_ptr_tko(dst, acc, "weak", "tl_blk", Some(output_mask), None, None);
         }
     }
 }
@@ -1510,8 +1705,9 @@ mod tests {
     use darknet_cuda::F32ActivationKind;
 
     use super::{
-        validate_conv2d_layout, DEFAULT_TILE_1D, CutileBackendError, grid_1d,
-        validate_bias_add_layout, validate_route_concat_layout, validate_upsample_layout,
+        CutileBackendError, DEFAULT_TILE_1D, grid_1d, validate_bias_add_layout,
+        validate_conv2d_layout, validate_maxpool_layout, validate_route_concat_layout,
+        validate_upsample_layout,
     };
 
     #[test]
@@ -1522,13 +1718,18 @@ mod tests {
 
     #[test]
     fn validates_bias_add_layout_for_batched_channels() {
-        assert_eq!(validate_bias_add_layout(24, 3, 3, 4).expect("valid"), (6, 4));
+        assert_eq!(
+            validate_bias_add_layout(24, 3, 3, 4).expect("valid"),
+            (6, 4)
+        );
     }
 
     #[test]
     fn rejects_bias_length_mismatch() {
         let err = validate_bias_add_layout(12, 2, 3, 4).expect_err("expected mismatch");
-        assert!(matches!(err, CutileBackendError::Shape(message) if message.contains("bias length mismatch")));
+        assert!(
+            matches!(err, CutileBackendError::Shape(message) if message.contains("bias length mismatch"))
+        );
     }
 
     #[test]
@@ -1547,8 +1748,9 @@ mod tests {
 
     #[test]
     fn validates_route_concat_layout() {
-        let layout = validate_route_concat_layout(&[12, 4], &[1, 0], &[2, 1], &[3, 1], &[1, 3, 2, 2], 4)
-            .expect("valid route layout");
+        let layout =
+            validate_route_concat_layout(&[12, 4], &[1, 0], &[2, 1], &[3, 1], &[1, 3, 2, 2], 4)
+                .expect("valid route layout");
         assert_eq!(layout.batch, 1);
         assert_eq!(layout.total_channels, 3);
         assert_eq!(layout.output_len, 12);
@@ -1556,8 +1758,7 @@ mod tests {
 
     #[test]
     fn validates_upsample_layout() {
-        let layout =
-            validate_upsample_layout(4, &[1, 1, 4, 4], 1, 2, 2, 2, false).expect("valid");
+        let layout = validate_upsample_layout(4, &[1, 1, 4, 4], 1, 2, 2, 2, false).expect("valid");
         assert_eq!(layout.output_height, 4);
         assert_eq!(layout.output_width, 4);
         assert_eq!(layout.output_len, 16);
@@ -1572,5 +1773,13 @@ mod tests {
         assert_eq!(layout.output_height, 1);
         assert_eq!(layout.output_width, 2);
         assert_eq!(layout.output_len, 8);
+    }
+
+    #[test]
+    fn validates_maxpool_layout() {
+        let layout = validate_maxpool_layout(16, &[1, 1, 2, 2], 1, 4, 4, 2, 2, 2).expect("valid");
+        assert_eq!(layout.output_height, 2);
+        assert_eq!(layout.output_width, 2);
+        assert_eq!(layout.output_len, 4);
     }
 }

@@ -22,18 +22,21 @@ What works today:
 - load Darknet weights into executable convolutional and connected layers
 - run `forward-dummy` on supported models with zero or loaded weights
 - collect YOLO head tensors during forward execution for later decoding work
+- decode YOLO head tensors into class detections with CPU-side NMS
+- load `.ppm`/`.pgm`/`.pnm` and `.bmp` images for Rust-side preprocessing
+- run end-to-end Rust image inference through the CLI on the CPU runtime
 - construct a backend-generic `GpuExecutableNetwork` for the current GPU layer subset:
-  convolutional, route, shortcut, upsample, and YOLO staging
+  convolutional, maxpool, route, shortcut, upsample, and YOLO staging
+- run a compact GPU forward path for `cfg/yolov4-tiny.cfg` and `cfg/yolov4-tiny-3l.cfg`
+  without retaining every intermediate CPU tensor
 - build the optional `cutile-rs` bridge crate with normal Cargo commands from this repo
 
 What is not finished:
 
-- full detector inference output decoding and NMS
-- image preprocessing and end-to-end image inference
 - training, backward pass, and optimizer support
-- a real GPU execution path for Darknet layers
 - full CUDA parity with original Darknet kernels
 - recurrent and less common Darknet layer types
+- broader image format support in the Rust-only path beyond NetPBM/BMP
 
 ## Workspace Layout
 
@@ -108,6 +111,7 @@ The Rust CLI currently supports:
 - `names <names>`
 - `weights-inspect <cfg> <weights>`
 - `forward-dummy <cfg> [weights]`
+- `detect-image <cfg> <weights> <names> <image> [thresh] [nms] [letterbox|resize]`
 
 Examples:
 
@@ -115,12 +119,18 @@ Examples:
 cargo run -p darknet-cli -- cfg-summary cfg/yolov3-tiny.cfg
 cargo run -p darknet-cli -- weights-inspect cfg/yolov4-tiny.cfg yolov4-tiny.weights
 cargo run -p darknet-cli -- forward-dummy cfg/yolov3-tiny.cfg
+cargo run -p darknet-cli -- detect-image cfg/yolov4-tiny.cfg yolov4-tiny.weights cfg/coco.names frame.ppm
 ```
 
 `forward-dummy` constructs an `ExecutableNetwork`, optionally loads a Darknet
 weights file, feeds a zero input tensor shaped from the `[net]` section, and
 prints the final tensor shape plus any YOLO head tensors encountered during the
 forward pass.
+
+`detect-image` runs the CPU Rust inference path end to end: image load,
+letterbox-or-resize preprocessing, forward execution, YOLO decode, and greedy
+NMS. The current Rust-only image loader supports NetPBM (`.ppm`, `.pgm`,
+`.pnm`) and uncompressed `.bmp`.
 
 ## Optional CUDA Bridge
 
@@ -141,14 +151,16 @@ It currently provides:
 - `shortcut` add on top of the bridge tensor ops
 - fully on-device `route` concatenation and `upsample` pointer kernels
 - a direct `f32` convolution kernel path exposed through `F32TensorOpsBackend`
+- a direct `f32` maxpool kernel path exposed through `F32TensorOpsBackend`
 - a bridge implementation of `darknet_cuda::F32TensorOpsBackend`
 - a smoke example that exercises context creation, kernel launch, and device-to-host copy
+- bridge-side shape validation tests for convolution, maxpool, route, and upsample layouts
 
 What it does not provide yet:
 
-- pooling kernels
-- weight caching for executable GPU layers
-- full YOLO-subset GPU execution for configs such as `cfg/yolov4-tiny.cfg`, which still stop on `maxpool`
+- the remaining pooling family beyond `maxpool`
+- a real detector decode / NMS path after YOLO head staging
+- direct end-to-end image inference from the Rust CLI
 
 ### Requirements
 

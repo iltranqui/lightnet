@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -123,6 +124,12 @@ impl ForwardResult {
     pub fn final_output(&self) -> Option<&Tensor> {
         self.layer_outputs.last()
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GpuForwardSummary {
+    pub final_output: Option<Tensor>,
+    pub yolo_heads: Vec<YoloHeadOutput>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -269,6 +276,13 @@ where
     pub backend: B,
     pub network: Network,
     pub params: Vec<LayerParams>,
+    device_conv_params: RefCell<Vec<Option<GpuConvolutionLayerParams<B::Tensor>>>>,
+}
+
+#[derive(Clone, Debug)]
+struct GpuConvolutionLayerParams<T> {
+    weights: T,
+    biases: T,
 }
 
 impl<B> GpuExecutableNetwork<B>
@@ -282,10 +296,12 @@ where
             .iter()
             .map(default_layer_params)
             .collect::<Vec<_>>();
+        let device_conv_params = RefCell::new(vec![None; network.layers.len()]);
         Self {
             backend,
             network,
             params,
+            device_conv_params,
         }
     }
 
@@ -298,7 +314,10 @@ where
     }
 
     pub fn load_weights_file(&mut self, path: impl AsRef<Path>) -> Result<WeightsHeader> {
-        load_weights_into_params(&self.network, &mut self.params, path)
+        let header = load_weights_into_params(&self.network, &mut self.params, path)?;
+        self.clear_device_conv_params();
+        self.warm_device_conv_params()?;
+        Ok(header)
     }
 
     pub fn forward(&self, input: &Tensor) -> Result<ForwardResult> {
@@ -331,29 +350,17 @@ where
 
             let output_gpu = match (&layer.kind, params) {
                 (LayerKind::Convolutional(spec), LayerParams::Convolutional(conv)) => {
-                    let (folded_biases, folded_weights) =
-                        fold_convolutional_params_for_inference(spec, conv, layer.input_shape.channels)?;
-                    let weights_gpu = self
-                        .backend
-                        .upload_f32(
-                            &[
-                                spec.filters,
-                                layer.input_shape.channels / spec.groups.max(1),
-                                spec.size,
-                                spec.size,
-                            ],
-                            &folded_weights,
-                        )
-                        .map_err(|err| backend_error("upload convolution weights", err))?;
-                    let bias_gpu = self
-                        .backend
-                        .upload_f32(&[spec.filters], &folded_biases)
-                        .map_err(|err| backend_error("upload convolution biases", err))?;
+                    let cached = self.cached_convolution_params(
+                        layer.index,
+                        layer.input_shape.channels,
+                        spec,
+                        conv,
+                    )?;
                     let conv_output = self
                         .backend
                         .conv2d_f32(
                             current_input,
-                            &weights_gpu,
+                            &cached.weights,
                             &tensor_backend_shape(layer.output_shape),
                             layer.input_shape.channels,
                             layer.input_shape.height,
@@ -372,7 +379,7 @@ where
                         .backend
                         .bias_add_f32(
                             &conv_output,
-                            &bias_gpu,
+                            &cached.biases,
                             spec.filters,
                             layer.output_shape.width * layer.output_shape.height,
                             launch_config,
@@ -383,6 +390,28 @@ where
                         .activation_f32(&biased, activation, launch_config)
                         .map_err(|err| backend_error("convolution activation", err))?
                 }
+                (LayerKind::MaxPool(spec), LayerParams::None) => {
+                    if layer.output_shape.channels != layer.input_shape.channels {
+                        return Err(Error::UnsupportedLayer {
+                            layer_index: layer.index,
+                            name: "maxpool_depth".to_owned(),
+                        });
+                    }
+                    self.backend
+                        .maxpool_f32(
+                            current_input,
+                            &tensor_backend_shape(layer.output_shape),
+                            layer.input_shape.channels,
+                            layer.input_shape.height,
+                            layer.input_shape.width,
+                            spec.size,
+                            spec.stride_x,
+                            spec.stride_y,
+                            spec.padding,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("maxpool", err))?
+                }
                 (LayerKind::Route(spec), LayerParams::None) => {
                     let mut route_inputs = Vec::with_capacity(spec.layers.len());
                     let mut route_channel_offsets = Vec::with_capacity(spec.layers.len());
@@ -390,16 +419,20 @@ where
                     let mut route_total_channels = Vec::with_capacity(spec.layers.len());
                     for raw_index in &spec.layers {
                         let source_index = resolve_relative_layer(layer.index, *raw_index)?;
-                        let source = gpu_layer_outputs.get(source_index).ok_or(Error::InvalidRoute {
-                            layer_index: layer.index,
-                            reference: *raw_index,
-                        })?;
-                        let source_layer = self.network.layers.get(source_index).ok_or_else(|| {
-                            Error::InvalidConfig(format!(
-                                "missing source layer #{source_index} for route layer #{}",
-                                layer.index
-                            ))
-                        })?;
+                        let source =
+                            gpu_layer_outputs
+                                .get(source_index)
+                                .ok_or(Error::InvalidRoute {
+                                    layer_index: layer.index,
+                                    reference: *raw_index,
+                                })?;
+                        let source_layer =
+                            self.network.layers.get(source_index).ok_or_else(|| {
+                                Error::InvalidConfig(format!(
+                                    "missing source layer #{source_index} for route layer #{}",
+                                    layer.index
+                                ))
+                            })?;
                         let chunk_channels =
                             source_layer.output_shape.channels / spec.groups.max(1);
                         route_inputs.push(source);
@@ -424,16 +457,20 @@ where
                     let mut accumulated = current_input.clone();
                     for raw_index in &spec.from {
                         let source_index = resolve_relative_layer(layer.index, *raw_index)?;
-                        let source = gpu_layer_outputs.get(source_index).ok_or(Error::InvalidRoute {
-                            layer_index: layer.index,
-                            reference: *raw_index,
-                        })?;
-                        let source_layer = self.network.layers.get(source_index).ok_or_else(|| {
-                            Error::InvalidConfig(format!(
-                                "missing source layer #{source_index} for shortcut layer #{}",
-                                layer.index
-                            ))
-                        })?;
+                        let source =
+                            gpu_layer_outputs
+                                .get(source_index)
+                                .ok_or(Error::InvalidRoute {
+                                    layer_index: layer.index,
+                                    reference: *raw_index,
+                                })?;
+                        let source_layer =
+                            self.network.layers.get(source_index).ok_or_else(|| {
+                                Error::InvalidConfig(format!(
+                                    "missing source layer #{source_index} for shortcut layer #{}",
+                                    layer.index
+                                ))
+                            })?;
                         if source_layer.output_shape != layer.output_shape {
                             return Err(Error::InvalidConfig(format!(
                                 "shortcut layer #{} mixes incompatible shapes {} and {}",
@@ -475,7 +512,6 @@ where
                 | (LayerKind::Sam(_), LayerParams::None)
                 | (LayerKind::Contrastive { .. }, LayerParams::None) => current_input.clone(),
                 (LayerKind::Connected(_), _)
-                | (LayerKind::MaxPool(_), _)
                 | (LayerKind::LocalAvgPool(_), _)
                 | (LayerKind::AvgPool, _)
                 | (LayerKind::Reorg(_), _)
@@ -518,6 +554,277 @@ where
         })
     }
 
+    pub fn forward_compact(&self, input: &Tensor) -> Result<GpuForwardSummary> {
+        let expected = self.network.net.input_shape();
+        if input.shape != expected {
+            return Err(Error::InvalidConfig(format!(
+                "input shape mismatch: expected {expected}, got {}",
+                input.shape
+            )));
+        }
+
+        let launch_config = ElementwiseLaunchConfig::default();
+        let input_gpu = self
+            .backend
+            .upload_f32(&tensor_backend_shape(input.shape), &input.data)
+            .map_err(|err| backend_error("upload input tensor", err))?;
+        let mut gpu_layer_outputs = vec![None; self.network.layers.len()];
+        let mut remaining_uses = gpu_layer_output_use_counts(&self.network)?;
+        let mut final_output = None;
+        let mut yolo_heads = Vec::new();
+
+        for (layer, params) in self.network.layers.iter().zip(&self.params) {
+            let current_input = if layer.index == 0 {
+                Some(&input_gpu)
+            } else if layer_uses_previous_input(&layer.kind) {
+                Some(
+                    gpu_layer_outputs
+                        .get(layer.index - 1)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing previous GPU layer output for layer #{}",
+                                layer.index
+                            ))
+                        })?,
+                )
+            } else {
+                None
+            };
+
+            let output_gpu = match (&layer.kind, params) {
+                (LayerKind::Convolutional(spec), LayerParams::Convolutional(conv)) => {
+                    let cached = self.cached_convolution_params(
+                        layer.index,
+                        layer.input_shape.channels,
+                        spec,
+                        conv,
+                    )?;
+                    let conv_output = self
+                        .backend
+                        .conv2d_f32(
+                            current_input.expect("convolution requires current input"),
+                            &cached.weights,
+                            &tensor_backend_shape(layer.output_shape),
+                            layer.input_shape.channels,
+                            layer.input_shape.height,
+                            layer.input_shape.width,
+                            spec.filters,
+                            spec.size,
+                            spec.stride_x,
+                            spec.stride_y,
+                            spec.dilation,
+                            spec.padding,
+                            spec.groups.max(1),
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("convolution", err))?;
+                    let biased = self
+                        .backend
+                        .bias_add_f32(
+                            &conv_output,
+                            &cached.biases,
+                            spec.filters,
+                            layer.output_shape.width * layer.output_shape.height,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("convolution bias add", err))?;
+                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+                    self.backend
+                        .activation_f32(&biased, activation, launch_config)
+                        .map_err(|err| backend_error("convolution activation", err))?
+                }
+                (LayerKind::MaxPool(spec), LayerParams::None) => {
+                    if layer.output_shape.channels != layer.input_shape.channels {
+                        return Err(Error::UnsupportedLayer {
+                            layer_index: layer.index,
+                            name: "maxpool_depth".to_owned(),
+                        });
+                    }
+                    self.backend
+                        .maxpool_f32(
+                            current_input.expect("maxpool requires current input"),
+                            &tensor_backend_shape(layer.output_shape),
+                            layer.input_shape.channels,
+                            layer.input_shape.height,
+                            layer.input_shape.width,
+                            spec.size,
+                            spec.stride_x,
+                            spec.stride_y,
+                            spec.padding,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("maxpool", err))?
+                }
+                (LayerKind::Route(spec), LayerParams::None) => {
+                    let mut route_inputs = Vec::with_capacity(spec.layers.len());
+                    let mut route_channel_offsets = Vec::with_capacity(spec.layers.len());
+                    let mut route_channels = Vec::with_capacity(spec.layers.len());
+                    let mut route_total_channels = Vec::with_capacity(spec.layers.len());
+                    for raw_index in &spec.layers {
+                        let source_index = resolve_relative_layer(layer.index, *raw_index)?;
+                        let source = gpu_layer_outputs
+                            .get(source_index)
+                            .and_then(Option::as_ref)
+                            .ok_or(Error::InvalidRoute {
+                                layer_index: layer.index,
+                                reference: *raw_index,
+                            })?;
+                        let source_layer =
+                            self.network.layers.get(source_index).ok_or_else(|| {
+                                Error::InvalidConfig(format!(
+                                    "missing source layer #{source_index} for route layer #{}",
+                                    layer.index
+                                ))
+                            })?;
+                        let chunk_channels =
+                            source_layer.output_shape.channels / spec.groups.max(1);
+                        route_inputs.push(source);
+                        route_channel_offsets.push(chunk_channels * spec.group_id);
+                        route_channels.push(chunk_channels);
+                        route_total_channels.push(source_layer.output_shape.channels);
+                    }
+
+                    self.backend
+                        .route_concat_f32(
+                            &route_inputs,
+                            &route_channel_offsets,
+                            &route_channels,
+                            &route_total_channels,
+                            &tensor_backend_shape(layer.output_shape),
+                            layer.output_shape.width * layer.output_shape.height,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("route concat", err))?
+                }
+                (LayerKind::Shortcut(spec), LayerParams::None) => {
+                    let mut accumulated = current_input
+                        .expect("shortcut requires current input")
+                        .clone();
+                    for raw_index in &spec.from {
+                        let source_index = resolve_relative_layer(layer.index, *raw_index)?;
+                        let source = gpu_layer_outputs
+                            .get(source_index)
+                            .and_then(Option::as_ref)
+                            .ok_or(Error::InvalidRoute {
+                                layer_index: layer.index,
+                                reference: *raw_index,
+                            })?;
+                        let source_layer =
+                            self.network.layers.get(source_index).ok_or_else(|| {
+                                Error::InvalidConfig(format!(
+                                    "missing source layer #{source_index} for shortcut layer #{}",
+                                    layer.index
+                                ))
+                            })?;
+                        if source_layer.output_shape != layer.output_shape {
+                            return Err(Error::InvalidConfig(format!(
+                                "shortcut layer #{} mixes incompatible shapes {} and {}",
+                                layer.index, layer.output_shape, source_layer.output_shape
+                            )));
+                        }
+                        accumulated = self
+                            .backend
+                            .shortcut_add_f32(&accumulated, source, launch_config)
+                            .map_err(|err| backend_error("shortcut add", err))?;
+                    }
+
+                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+                    self.backend
+                        .activation_f32(&accumulated, activation, launch_config)
+                        .map_err(|err| backend_error("shortcut activation", err))?
+                }
+                (LayerKind::Upsample(spec), LayerParams::None) => self
+                    .backend
+                    .upsample_f32(
+                        current_input.expect("upsample requires current input"),
+                        &tensor_backend_shape(layer.output_shape),
+                        layer.input_shape.channels,
+                        layer.input_shape.height,
+                        layer.input_shape.width,
+                        spec.stride.unsigned_abs(),
+                        spec.scale,
+                        spec.reverse,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("upsample", err))?,
+                (LayerKind::Yolo(_), LayerParams::None)
+                | (LayerKind::GaussianYolo(_), LayerParams::None)
+                | (LayerKind::Region(_), LayerParams::None)
+                | (LayerKind::Softmax { .. }, LayerParams::None)
+                | (LayerKind::Cost { .. }, LayerParams::None)
+                | (LayerKind::Dropout { .. }, LayerParams::None)
+                | (LayerKind::ScaleChannels(_), LayerParams::None)
+                | (LayerKind::Sam(_), LayerParams::None)
+                | (LayerKind::Contrastive { .. }, LayerParams::None) => current_input
+                    .expect("staging layer requires current input")
+                    .clone(),
+                (LayerKind::Connected(_), _)
+                | (LayerKind::LocalAvgPool(_), _)
+                | (LayerKind::AvgPool, _)
+                | (LayerKind::Reorg(_), _)
+                | (LayerKind::Rnn { .. }, _)
+                | (LayerKind::Lstm { .. }, _)
+                | (LayerKind::Crnn { .. }, _)
+                | (LayerKind::Unsupported(_), _) => {
+                    return Err(Error::UnsupportedLayer {
+                        layer_index: layer.index,
+                        name: layer.kind.name().to_owned(),
+                    });
+                }
+                _ => {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} ({}) and parameter set are inconsistent",
+                        layer.index,
+                        layer.kind.name()
+                    )));
+                }
+            };
+
+            let should_download_final = layer.index + 1 == self.network.layers.len();
+            let should_collect_yolo =
+                matches!(layer.kind, LayerKind::Yolo(_) | LayerKind::GaussianYolo(_));
+            let downloaded = if should_download_final || should_collect_yolo {
+                Some(
+                    self.download_tensor(&output_gpu, layer.output_shape)
+                        .map_err(|err| backend_error("download layer output", err))?,
+                )
+            } else {
+                None
+            };
+
+            if should_collect_yolo {
+                yolo_heads.push(YoloHeadOutput {
+                    layer_index: layer.index,
+                    output: downloaded
+                        .as_ref()
+                        .expect("yolo output should have been downloaded")
+                        .clone(),
+                });
+            }
+            if should_download_final {
+                final_output = downloaded;
+            }
+
+            gpu_layer_outputs[layer.index] = Some(output_gpu);
+            release_gpu_sources_for_layer(
+                layer.index,
+                &layer.kind,
+                &mut remaining_uses,
+                &mut gpu_layer_outputs,
+            )?;
+
+            if remaining_uses[layer.index] == 0 {
+                gpu_layer_outputs[layer.index] = None;
+            }
+        }
+
+        Ok(GpuForwardSummary {
+            final_output,
+            yolo_heads,
+        })
+    }
+
     fn download_tensor(
         &self,
         tensor: &B::Tensor,
@@ -525,6 +832,72 @@ where
     ) -> std::result::Result<Tensor, B::Error> {
         let data = self.backend.download_f32(tensor)?;
         Ok(Tensor { shape, data })
+    }
+
+    fn clear_device_conv_params(&mut self) {
+        for entry in self.device_conv_params.get_mut().iter_mut() {
+            *entry = None;
+        }
+    }
+
+    fn warm_device_conv_params(&self) -> Result<()> {
+        for (layer, params) in self.network.layers.iter().zip(&self.params) {
+            if let (LayerKind::Convolutional(spec), LayerParams::Convolutional(conv)) =
+                (&layer.kind, params)
+            {
+                let _ = self.cached_convolution_params(
+                    layer.index,
+                    layer.input_shape.channels,
+                    spec,
+                    conv,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn cached_convolution_params(
+        &self,
+        layer_index: usize,
+        input_channels: usize,
+        spec: &ConvolutionalSpec,
+        params: &ConvolutionalParams,
+    ) -> Result<GpuConvolutionLayerParams<B::Tensor>> {
+        if let Some(cached) = self.device_conv_params.borrow()[layer_index].clone() {
+            return Ok(cached);
+        }
+
+        let (folded_biases, folded_weights) =
+            fold_convolutional_params_for_inference(spec, params, input_channels)?;
+        let uploaded = GpuConvolutionLayerParams {
+            weights: self
+                .backend
+                .upload_f32(
+                    &[
+                        spec.filters,
+                        input_channels / spec.groups.max(1),
+                        spec.size,
+                        spec.size,
+                    ],
+                    &folded_weights,
+                )
+                .map_err(|err| backend_error("upload convolution weights", err))?,
+            biases: self
+                .backend
+                .upload_f32(&[spec.filters], &folded_biases)
+                .map_err(|err| backend_error("upload convolution biases", err))?,
+        };
+
+        let mut cached = self.device_conv_params.borrow_mut();
+        let entry = cached.get_mut(layer_index).ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "missing cached device params for layer #{layer_index}"
+            ))
+        })?;
+        if entry.is_none() {
+            *entry = Some(uploaded.clone());
+        }
+        Ok(entry.clone().expect("device params were just initialized"))
     }
 }
 
@@ -664,6 +1037,88 @@ fn load_weights_into_params(
 
 fn tensor_backend_shape(shape: TensorShape) -> [usize; 4] {
     [shape.batch, shape.channels, shape.height, shape.width]
+}
+
+fn layer_uses_previous_input(kind: &LayerKind) -> bool {
+    !matches!(kind, LayerKind::Route(_))
+}
+
+fn gpu_layer_output_use_counts(network: &Network) -> Result<Vec<usize>> {
+    let mut use_counts = vec![0usize; network.layers.len()];
+    for layer in &network.layers {
+        if layer.index > 0 && layer_uses_previous_input(&layer.kind) {
+            use_counts[layer.index - 1] += 1;
+        }
+
+        match &layer.kind {
+            LayerKind::Route(spec) => {
+                for raw_index in &spec.layers {
+                    let source_index = resolve_relative_layer(layer.index, *raw_index)?;
+                    use_counts[source_index] += 1;
+                }
+            }
+            LayerKind::Shortcut(spec) => {
+                for raw_index in &spec.from {
+                    let source_index = resolve_relative_layer(layer.index, *raw_index)?;
+                    use_counts[source_index] += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(use_counts)
+}
+
+fn release_gpu_source<T: Clone>(
+    source_index: usize,
+    remaining_uses: &mut [usize],
+    gpu_layer_outputs: &mut [Option<T>],
+) -> Result<()> {
+    let remaining = remaining_uses.get_mut(source_index).ok_or_else(|| {
+        Error::InvalidConfig(format!(
+            "missing GPU use-count entry for source layer #{source_index}"
+        ))
+    })?;
+    if *remaining == 0 {
+        return Err(Error::InvalidConfig(format!(
+            "GPU source layer #{source_index} was released too early"
+        )));
+    }
+    *remaining -= 1;
+    if *remaining == 0 {
+        gpu_layer_outputs[source_index] = None;
+    }
+    Ok(())
+}
+
+fn release_gpu_sources_for_layer<T: Clone>(
+    layer_index: usize,
+    kind: &LayerKind,
+    remaining_uses: &mut [usize],
+    gpu_layer_outputs: &mut [Option<T>],
+) -> Result<()> {
+    if layer_index > 0 && layer_uses_previous_input(kind) {
+        release_gpu_source(layer_index - 1, remaining_uses, gpu_layer_outputs)?;
+    }
+
+    match kind {
+        LayerKind::Route(spec) => {
+            for raw_index in &spec.layers {
+                let source_index = resolve_relative_layer(layer_index, *raw_index)?;
+                release_gpu_source(source_index, remaining_uses, gpu_layer_outputs)?;
+            }
+        }
+        LayerKind::Shortcut(spec) => {
+            for raw_index in &spec.from {
+                let source_index = resolve_relative_layer(layer_index, *raw_index)?;
+                release_gpu_source(source_index, remaining_uses, gpu_layer_outputs)?;
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
 }
 
 fn gpu_activation_kind(layer_index: usize, activation: &Activation) -> Result<F32ActivationKind> {
@@ -1155,12 +1610,18 @@ fn resolve_relative_layer(layer_index: usize, raw_index: isize) -> Result<usize>
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use crate::cfg::ConfigFile;
     use crate::model::{Activation, ConvolutionalSpec, LayerKind, Network, TensorShape};
     use darknet_cuda::{ElementwiseLaunchConfig, F32ActivationKind, F32TensorOpsBackend};
 
-    use super::{ConvolutionalParams, ExecutableNetwork, GpuExecutableNetwork, Tensor};
+    use super::{
+        ConvolutionalParams, ExecutableNetwork, ForwardResult, GpuExecutableNetwork, Tensor,
+    };
 
     fn repo_cfg(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1181,7 +1642,11 @@ mod tests {
         type Error = String;
         type Tensor = FakeTensor;
 
-        fn upload_f32(&self, shape: &[usize], host: &[f32]) -> std::result::Result<Self::Tensor, Self::Error> {
+        fn upload_f32(
+            &self,
+            shape: &[usize],
+            host: &[f32],
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
             let expected = shape.iter().product::<usize>();
             if host.len() != expected {
                 return Err(format!(
@@ -1203,7 +1668,10 @@ mod tests {
             })
         }
 
-        fn download_f32(&self, tensor: &Self::Tensor) -> std::result::Result<Vec<f32>, Self::Error> {
+        fn download_f32(
+            &self,
+            tensor: &Self::Tensor,
+        ) -> std::result::Result<Vec<f32>, Self::Error> {
             Ok(tensor.data.clone())
         }
 
@@ -1397,12 +1865,13 @@ mod tests {
                     for c in 0..channels {
                         for y in 0..input_height {
                             for x_idx in 0..input_width {
-                                let src = ((((b * channels) + c) * input_height) + y) * input_width + x_idx;
+                                let src = ((((b * channels) + c) * input_height) + y) * input_width
+                                    + x_idx;
                                 let dst_y = y / stride;
                                 let dst_x = x_idx / stride;
-                                let dst =
-                                    ((((b * channels) + c) * output_height) + dst_y) * output_width
-                                        + dst_x;
+                                let dst = ((((b * channels) + c) * output_height) + dst_y)
+                                    * output_width
+                                    + dst_x;
                                 out[dst] += scale * x.data[src];
                             }
                         }
@@ -1415,12 +1884,12 @@ mod tests {
                             for x_idx in 0..output_width {
                                 let src_y = y / stride;
                                 let src_x = x_idx / stride;
-                                let src =
-                                    ((((b * channels) + c) * input_height) + src_y) * input_width
-                                        + src_x;
-                                let dst =
-                                    ((((b * channels) + c) * output_height) + y) * output_width
-                                        + x_idx;
+                                let src = ((((b * channels) + c) * input_height) + src_y)
+                                    * input_width
+                                    + src_x;
+                                let dst = ((((b * channels) + c) * output_height) + y)
+                                    * output_width
+                                    + x_idx;
                                 out[dst] = scale * x.data[src];
                             }
                         }
@@ -1431,6 +1900,51 @@ mod tests {
             Ok(FakeTensor {
                 shape: output_shape.to_vec(),
                 data: out,
+            })
+        }
+
+        fn maxpool_f32(
+            &self,
+            x: &Self::Tensor,
+            output_shape: &[usize],
+            channels: usize,
+            input_height: usize,
+            input_width: usize,
+            size: usize,
+            stride_x: usize,
+            stride_y: usize,
+            padding: usize,
+            _config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            let input = Tensor::from_data(
+                TensorShape::new(input_width, input_height, channels, x.shape[0]),
+                x.data.clone(),
+            )
+            .map_err(|err| err.to_string())?;
+            let output_shape = TensorShape::new(
+                output_shape[3],
+                output_shape[2],
+                output_shape[1],
+                output_shape[0],
+            );
+            let output = super::forward_maxpool(
+                size,
+                stride_x,
+                stride_y,
+                padding,
+                &input,
+                output_shape,
+                false,
+            )
+            .map_err(|err| err.to_string())?;
+            Ok(FakeTensor {
+                shape: vec![
+                    output.shape.batch,
+                    output.shape.channels,
+                    output.shape.height,
+                    output.shape.width,
+                ],
+                data: output.data,
             })
         }
 
@@ -1487,6 +2001,380 @@ mod tests {
             F32ActivationKind::Tanh => Activation::Tanh,
         };
         super::activate(activation, value)
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct CountingBackend {
+        uploads: Arc<AtomicUsize>,
+        inner: FakeBackend,
+    }
+
+    impl CountingBackend {
+        fn upload_count(&self) -> usize {
+            self.uploads.load(Ordering::Relaxed)
+        }
+    }
+
+    impl F32TensorOpsBackend for CountingBackend {
+        type Error = String;
+        type Tensor = FakeTensor;
+
+        fn upload_f32(
+            &self,
+            shape: &[usize],
+            host: &[f32],
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.uploads.fetch_add(1, Ordering::Relaxed);
+            self.inner.upload_f32(shape, host)
+        }
+
+        fn zeros_f32(&self, shape: &[usize]) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.inner.zeros_f32(shape)
+        }
+
+        fn download_f32(
+            &self,
+            tensor: &Self::Tensor,
+        ) -> std::result::Result<Vec<f32>, Self::Error> {
+            self.inner.download_f32(tensor)
+        }
+
+        fn bias_add_f32(
+            &self,
+            x: &Self::Tensor,
+            bias: &Self::Tensor,
+            channels: usize,
+            channel_stride: usize,
+            config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.inner
+                .bias_add_f32(x, bias, channels, channel_stride, config)
+        }
+
+        fn activation_f32(
+            &self,
+            x: &Self::Tensor,
+            activation: F32ActivationKind,
+            config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.inner.activation_f32(x, activation, config)
+        }
+
+        fn shortcut_add_f32(
+            &self,
+            x: &Self::Tensor,
+            y: &Self::Tensor,
+            config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.inner.shortcut_add_f32(x, y, config)
+        }
+
+        fn route_concat_f32(
+            &self,
+            inputs: &[&Self::Tensor],
+            input_channel_offsets: &[usize],
+            input_channels: &[usize],
+            input_total_channels: &[usize],
+            output_shape: &[usize],
+            channel_stride: usize,
+            config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.inner.route_concat_f32(
+                inputs,
+                input_channel_offsets,
+                input_channels,
+                input_total_channels,
+                output_shape,
+                channel_stride,
+                config,
+            )
+        }
+
+        fn conv2d_f32(
+            &self,
+            x: &Self::Tensor,
+            weights: &Self::Tensor,
+            output_shape: &[usize],
+            input_channels: usize,
+            input_height: usize,
+            input_width: usize,
+            filters: usize,
+            kernel_size: usize,
+            stride_x: usize,
+            stride_y: usize,
+            dilation: usize,
+            padding: usize,
+            groups: usize,
+            config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.inner.conv2d_f32(
+                x,
+                weights,
+                output_shape,
+                input_channels,
+                input_height,
+                input_width,
+                filters,
+                kernel_size,
+                stride_x,
+                stride_y,
+                dilation,
+                padding,
+                groups,
+                config,
+            )
+        }
+
+        fn maxpool_f32(
+            &self,
+            x: &Self::Tensor,
+            output_shape: &[usize],
+            channels: usize,
+            input_height: usize,
+            input_width: usize,
+            size: usize,
+            stride_x: usize,
+            stride_y: usize,
+            padding: usize,
+            config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.inner.maxpool_f32(
+                x,
+                output_shape,
+                channels,
+                input_height,
+                input_width,
+                size,
+                stride_x,
+                stride_y,
+                padding,
+                config,
+            )
+        }
+
+        fn upsample_f32(
+            &self,
+            x: &Self::Tensor,
+            output_shape: &[usize],
+            channels: usize,
+            input_height: usize,
+            input_width: usize,
+            stride: usize,
+            scale: f32,
+            reverse: bool,
+            config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.inner.upsample_f32(
+                x,
+                output_shape,
+                channels,
+                input_height,
+                input_width,
+                stride,
+                scale,
+                reverse,
+                config,
+            )
+        }
+
+        fn vector_add_f32(
+            &self,
+            x: &Self::Tensor,
+            y: &Self::Tensor,
+            config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.inner.vector_add_f32(x, y, config)
+        }
+
+        fn saxpy_f32(
+            &self,
+            alpha: f32,
+            x: &Self::Tensor,
+            y: &Self::Tensor,
+            config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.inner.saxpy_f32(alpha, x, y, config)
+        }
+    }
+
+    fn assert_same_forward(cpu: &ForwardResult, gpu: &ForwardResult) {
+        assert_eq!(cpu.layer_outputs.len(), gpu.layer_outputs.len());
+        assert_eq!(cpu.yolo_heads.len(), gpu.yolo_heads.len());
+        for (lhs, rhs) in cpu.layer_outputs.iter().zip(&gpu.layer_outputs) {
+            assert_eq!(lhs.shape, rhs.shape);
+            assert_eq!(lhs.data, rhs.data);
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct ShapeOnlyBackend;
+
+    impl F32TensorOpsBackend for ShapeOnlyBackend {
+        type Error = String;
+        type Tensor = FakeTensor;
+
+        fn upload_f32(
+            &self,
+            shape: &[usize],
+            host: &[f32],
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            let expected = shape.iter().product::<usize>();
+            if host.len() != expected {
+                return Err(format!(
+                    "upload_f32 expected {expected} elements for shape {:?}, got {}",
+                    shape,
+                    host.len()
+                ));
+            }
+            Ok(FakeTensor {
+                shape: shape.to_vec(),
+                data: host.to_vec(),
+            })
+        }
+
+        fn zeros_f32(&self, shape: &[usize]) -> std::result::Result<Self::Tensor, Self::Error> {
+            Ok(FakeTensor {
+                shape: shape.to_vec(),
+                data: vec![0.0; shape.iter().product()],
+            })
+        }
+
+        fn download_f32(
+            &self,
+            tensor: &Self::Tensor,
+        ) -> std::result::Result<Vec<f32>, Self::Error> {
+            Ok(tensor.data.clone())
+        }
+
+        fn bias_add_f32(
+            &self,
+            x: &Self::Tensor,
+            _bias: &Self::Tensor,
+            _channels: usize,
+            _channel_stride: usize,
+            _config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            Ok(x.clone())
+        }
+
+        fn activation_f32(
+            &self,
+            x: &Self::Tensor,
+            _activation: F32ActivationKind,
+            _config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            Ok(x.clone())
+        }
+
+        fn shortcut_add_f32(
+            &self,
+            x: &Self::Tensor,
+            y: &Self::Tensor,
+            _config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            if x.shape != y.shape {
+                return Err("shortcut_add_f32 shape mismatch".to_owned());
+            }
+            Ok(FakeTensor {
+                shape: x.shape.clone(),
+                data: vec![0.0; x.data.len()],
+            })
+        }
+
+        fn route_concat_f32(
+            &self,
+            _inputs: &[&Self::Tensor],
+            _input_channel_offsets: &[usize],
+            _input_channels: &[usize],
+            _input_total_channels: &[usize],
+            output_shape: &[usize],
+            _channel_stride: usize,
+            _config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.zeros_f32(output_shape)
+        }
+
+        fn conv2d_f32(
+            &self,
+            _x: &Self::Tensor,
+            _weights: &Self::Tensor,
+            output_shape: &[usize],
+            _input_channels: usize,
+            _input_height: usize,
+            _input_width: usize,
+            _filters: usize,
+            _kernel_size: usize,
+            _stride_x: usize,
+            _stride_y: usize,
+            _dilation: usize,
+            _padding: usize,
+            _groups: usize,
+            _config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.zeros_f32(output_shape)
+        }
+
+        fn maxpool_f32(
+            &self,
+            _x: &Self::Tensor,
+            output_shape: &[usize],
+            _channels: usize,
+            _input_height: usize,
+            _input_width: usize,
+            _size: usize,
+            _stride_x: usize,
+            _stride_y: usize,
+            _padding: usize,
+            _config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.zeros_f32(output_shape)
+        }
+
+        fn upsample_f32(
+            &self,
+            _x: &Self::Tensor,
+            output_shape: &[usize],
+            _channels: usize,
+            _input_height: usize,
+            _input_width: usize,
+            _stride: usize,
+            _scale: f32,
+            _reverse: bool,
+            _config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.zeros_f32(output_shape)
+        }
+
+        fn vector_add_f32(
+            &self,
+            x: &Self::Tensor,
+            y: &Self::Tensor,
+            _config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            if x.shape != y.shape {
+                return Err("vector_add_f32 shape mismatch".to_owned());
+            }
+            Ok(FakeTensor {
+                shape: x.shape.clone(),
+                data: vec![0.0; x.data.len()],
+            })
+        }
+
+        fn saxpy_f32(
+            &self,
+            _alpha: f32,
+            x: &Self::Tensor,
+            y: &Self::Tensor,
+            _config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            if x.shape != y.shape {
+                return Err("saxpy_f32 shape mismatch".to_owned());
+            }
+            Ok(FakeTensor {
+                shape: x.shape.clone(),
+                data: vec![0.0; x.data.len()],
+            })
+        }
     }
 
     #[test]
@@ -1621,8 +2509,14 @@ mod tests {
 
     #[test]
     fn gpu_activation_adapter_maps_expected_variants() {
-        assert_eq!(Activation::Mish.to_cuda_f32_kind(), Some(F32ActivationKind::Mish));
-        assert_eq!(Activation::Other("hard_mish".to_owned()).to_cuda_f32_kind(), None);
+        assert_eq!(
+            Activation::Mish.to_cuda_f32_kind(),
+            Some(F32ActivationKind::Mish)
+        );
+        assert_eq!(
+            Activation::Other("hard_mish".to_owned()).to_cuda_f32_kind(),
+            None
+        );
     }
 
     #[test]
@@ -1650,12 +2544,18 @@ mod tests {
         .expect("cfg should parse");
         let network = Network::from_config(cfg).expect("network should build");
         let executable = GpuExecutableNetwork::new(network, FakeBackend);
-        let input = Tensor::from_data(TensorShape::new(2, 1, 1, 1), vec![1.0, 2.0]).expect("tensor");
-        let result = executable.forward(&input).expect("gpu forward should succeed");
+        let input =
+            Tensor::from_data(TensorShape::new(2, 1, 1, 1), vec![1.0, 2.0]).expect("tensor");
+        let result = executable
+            .forward(&input)
+            .expect("gpu forward should succeed");
         let final_output = result.final_output().expect("final output");
 
         assert_eq!(final_output.shape, TensorShape::new(4, 2, 1, 1));
-        assert_eq!(final_output.data, vec![2.0, 2.0, 4.0, 4.0, 2.0, 2.0, 4.0, 4.0]);
+        assert_eq!(
+            final_output.data,
+            vec![2.0, 2.0, 4.0, 4.0, 2.0, 2.0, 4.0, 4.0]
+        );
     }
 
     #[test]
@@ -1694,7 +2594,9 @@ mod tests {
             .expect("weights should load");
         let input = Tensor::from_data(executable.network.net.input_shape(), vec![1.0, 2.0])
             .expect("tensor");
-        let result = executable.forward(&input).expect("gpu forward should succeed");
+        let result = executable
+            .forward(&input)
+            .expect("gpu forward should succeed");
 
         assert_eq!(
             result.final_output().expect("final output").data,
@@ -1705,34 +2607,263 @@ mod tests {
     }
 
     #[test]
-    fn yolov4_tiny_cfg_matches_current_gpu_coverage_boundary() {
-        let network = Network::from_path(repo_cfg("yolov4-tiny.cfg")).expect("cfg should parse");
-        let _runtime = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+    fn gpu_runtime_runs_maxpool_layer() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                width=4
+                height=4
+                channels=1
 
-        let first_unsupported = network
-            .layers
-            .iter()
-            .find(|layer| {
-                !matches!(
-                    layer.kind,
-                    LayerKind::Convolutional(_)
-                        | LayerKind::Route(_)
-                        | LayerKind::Shortcut(_)
-                        | LayerKind::Upsample(_)
-                        | LayerKind::Yolo(_)
-                        | LayerKind::GaussianYolo(_)
-                        | LayerKind::Region(_)
-                        | LayerKind::Softmax { .. }
-                        | LayerKind::Cost { .. }
-                        | LayerKind::Dropout { .. }
-                        | LayerKind::ScaleChannels(_)
-                        | LayerKind::Sam(_)
-                        | LayerKind::Contrastive { .. }
-                )
-            })
-            .expect("expected at least one unsupported layer");
+                [maxpool]
+                size=2
+                stride=2
+            "#,
+        )
+        .expect("cfg should parse");
+        let network = Network::from_config(cfg).expect("network should build");
+        let executable = GpuExecutableNetwork::new(network, FakeBackend);
+        let input = Tensor::from_data(
+            TensorShape::new(4, 4, 1, 1),
+            vec![
+                1.0, 5.0, 2.0, 4.0, 3.0, 7.0, 6.0, 8.0, 0.0, 9.0, 2.0, 1.0, 4.0, 3.0, 5.0, 6.0,
+            ],
+        )
+        .expect("tensor");
+        let result = executable
+            .forward(&input)
+            .expect("gpu forward should succeed");
 
-        assert_eq!(first_unsupported.index, 9);
-        assert!(matches!(first_unsupported.kind, LayerKind::MaxPool(_)));
+        assert_eq!(
+            result.final_output().expect("final output").data,
+            vec![7.0, 8.0, 9.0, 6.0]
+        );
+    }
+
+    #[test]
+    fn gpu_runtime_reuses_uploaded_conv_params() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                width=2
+                height=1
+                channels=1
+
+                [convolutional]
+                filters=1
+                size=1
+                stride=1
+                activation=linear
+            "#,
+        )
+        .expect("cfg should parse");
+        let network = Network::from_config(cfg).expect("network should build");
+        let backend = CountingBackend::default();
+        let mut executable = GpuExecutableNetwork::new(network, backend.clone());
+
+        let path = PathBuf::from(std::env::temp_dir()).join("darknet-gpu-runtime-cache.weights");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&2i32.to_le_bytes());
+        bytes.extend_from_slice(&5i32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0.5f32.to_le_bytes());
+        bytes.extend_from_slice(&2.0f32.to_le_bytes());
+        fs::write(&path, bytes).expect("weights file should write");
+
+        executable
+            .load_weights_file(&path)
+            .expect("weights should load");
+        assert_eq!(backend.upload_count(), 2);
+
+        let input = Tensor::from_data(executable.network.net.input_shape(), vec![1.0, 2.0])
+            .expect("tensor");
+        executable
+            .forward(&input)
+            .expect("first gpu forward should succeed");
+        executable
+            .forward(&input)
+            .expect("second gpu forward should succeed");
+
+        assert_eq!(backend.upload_count(), 4);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn gpu_runtime_matches_cpu_for_conv_maxpool_slice() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                width=4
+                height=4
+                channels=1
+
+                [convolutional]
+                filters=1
+                size=1
+                stride=1
+                activation=linear
+
+                [maxpool]
+                size=2
+                stride=2
+
+                [upsample]
+                stride=2
+                scale=1
+            "#,
+        )
+        .expect("cfg should parse");
+        let network = Network::from_config(cfg).expect("network should build");
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+
+        let path = PathBuf::from(std::env::temp_dir()).join("darknet-runtime-parity.weights");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&2i32.to_le_bytes());
+        bytes.extend_from_slice(&5i32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0.25f32.to_le_bytes());
+        bytes.extend_from_slice(&1.5f32.to_le_bytes());
+        fs::write(&path, bytes).expect("weights file should write");
+
+        cpu.load_weights_file(&path)
+            .expect("cpu weights should load");
+        gpu.load_weights_file(&path)
+            .expect("gpu weights should load");
+
+        let input = Tensor::from_data(
+            cpu.network.net.input_shape(),
+            vec![
+                1.0, 2.0, 3.0, 4.0, 2.0, 4.0, 6.0, 8.0, 1.0, 3.0, 5.0, 7.0, 0.0, 2.0, 4.0, 6.0,
+            ],
+        )
+        .expect("tensor");
+        let cpu_result = cpu.forward(&input).expect("cpu forward should succeed");
+        let gpu_result = gpu.forward(&input).expect("gpu forward should succeed");
+
+        assert_same_forward(&cpu_result, &gpu_result);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn gpu_forward_compact_matches_full_forward_on_small_network() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                width=2
+                height=2
+                channels=1
+
+                [convolutional]
+                filters=1
+                size=1
+                stride=1
+                activation=linear
+
+                [maxpool]
+                size=2
+                stride=2
+
+                [yolo]
+                mask=0
+                anchors=10,13
+                classes=1
+                num=1
+            "#,
+        )
+        .expect("cfg should parse");
+        let network = Network::from_config(cfg).expect("network should build");
+        let mut executable = GpuExecutableNetwork::new(network, FakeBackend);
+
+        let path = PathBuf::from(std::env::temp_dir()).join("darknet-runtime-compact.weights");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&2i32.to_le_bytes());
+        bytes.extend_from_slice(&5i32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0.5f32.to_le_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        fs::write(&path, bytes).expect("weights file should write");
+
+        executable
+            .load_weights_file(&path)
+            .expect("weights should load");
+        let input = Tensor::from_data(
+            executable.network.net.input_shape(),
+            vec![1.0, 2.0, 3.0, 4.0],
+        )
+        .expect("tensor");
+
+        let full = executable
+            .forward(&input)
+            .expect("full forward should succeed");
+        let compact = executable
+            .forward_compact(&input)
+            .expect("compact forward should succeed");
+
+        assert_eq!(compact.final_output, full.final_output().cloned());
+        assert_eq!(compact.yolo_heads, full.yolo_heads);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn gpu_runtime_runs_primary_yolov4_tiny_targets() {
+        for cfg_name in ["yolov4-tiny.cfg", "yolov4-tiny-3l.cfg"] {
+            let network = Network::from_path(repo_cfg(cfg_name)).expect("cfg should parse");
+            let unsupported = network
+                .layers
+                .iter()
+                .find(|layer| {
+                    !matches!(
+                        layer.kind,
+                        LayerKind::Convolutional(_)
+                            | LayerKind::MaxPool(_)
+                            | LayerKind::Route(_)
+                            | LayerKind::Shortcut(_)
+                            | LayerKind::Upsample(_)
+                            | LayerKind::Yolo(_)
+                            | LayerKind::GaussianYolo(_)
+                            | LayerKind::Region(_)
+                            | LayerKind::Softmax { .. }
+                            | LayerKind::Cost { .. }
+                            | LayerKind::Dropout { .. }
+                            | LayerKind::ScaleChannels(_)
+                            | LayerKind::Sam(_)
+                            | LayerKind::Contrastive { .. }
+                    )
+                })
+                .map(|layer| (layer.index, layer.kind.name().to_owned()));
+
+            assert_eq!(
+                unsupported, None,
+                "{cfg_name} contains an unsupported GPU layer"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_forward_compact_runs_primary_yolov4_tiny_targets() {
+        for (cfg_name, expected_heads) in
+            [("yolov4-tiny.cfg", 2usize), ("yolov4-tiny-3l.cfg", 3usize)]
+        {
+            let network = Network::from_path(repo_cfg(cfg_name)).expect("cfg should parse");
+            let executable = GpuExecutableNetwork::new(network, ShapeOnlyBackend);
+            let input = executable.zero_input();
+            let summary = executable
+                .forward_compact(&input)
+                .expect("compact gpu forward should succeed");
+
+            assert_eq!(summary.yolo_heads.len(), expected_heads);
+            assert!(summary.final_output.is_some());
+        }
     }
 }

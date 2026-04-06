@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use darknet_core::{ExecutableNetwork, Network, inspect_weights_file, load_names_file};
+use darknet_core::{
+    DetectionOptions, ExecutableNetwork, Network, PlanarRgbImage, decode_yolo_detections,
+    inspect_weights_file, load_names_file,
+};
 
 fn main() {
     if let Err(err) = run() {
@@ -94,6 +97,78 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("#{:>3} yolo {}", head.layer_index, head.output.shape);
             }
         }
+        "detect-image" => {
+            let cfg = required_arg(args.next(), "cfg path")?;
+            let weights = required_arg(args.next(), "weights path")?;
+            let names_path = required_arg(args.next(), "names path")?;
+            let image_path = required_arg(args.next(), "image path")?;
+            let threshold = optional_f32(args.next(), 0.25, "confidence threshold")?;
+            let nms = optional_f32(args.next(), 0.45, "nms threshold")?;
+            let preprocess = args.next().unwrap_or_else(|| "letterbox".to_owned());
+            let letterbox = match preprocess.as_str() {
+                "letterbox" => true,
+                "resize" => false,
+                other => {
+                    return Err(format!(
+                        "invalid preprocess mode: {other} (expected letterbox or resize)"
+                    )
+                    .into());
+                }
+            };
+
+            let names = load_names_file(&names_path)?;
+            let mut executable = ExecutableNetwork::from_path(&cfg)?;
+            let header = executable.load_weights_file(&weights)?;
+            println!(
+                "loaded weights {}.{}.{} seen={}",
+                header.major, header.minor, header.revision, header.seen
+            );
+
+            let original = PlanarRgbImage::load(&image_path)?;
+            let prepared = if letterbox {
+                original.letterbox(executable.network.net.width, executable.network.net.height)?
+            } else {
+                original.resize(executable.network.net.width, executable.network.net.height)?
+            };
+            let result = executable.forward(&prepared.clone().into())?;
+            let detections = decode_yolo_detections(
+                &executable.network,
+                &result.yolo_heads,
+                original.shape.width,
+                original.shape.height,
+                DetectionOptions {
+                    confidence_threshold: threshold,
+                    nms_threshold: nms,
+                    letterbox,
+                },
+            )?;
+
+            println!("image {}", image_path);
+            println!(
+                "input {}x{} -> network {}x{} ({})",
+                original.shape.width,
+                original.shape.height,
+                prepared.shape.width,
+                prepared.shape.height,
+                if letterbox { "letterbox" } else { "resize" }
+            );
+            println!("detections {}", detections.len());
+            for detection in detections {
+                let class_name = names
+                    .get(detection.class_id)
+                    .map(String::as_str)
+                    .unwrap_or("<unknown>");
+                println!(
+                    "{:>6.2}% {:<24} left={:>7.2} top={:>7.2} right={:>7.2} bottom={:>7.2}",
+                    detection.confidence * 100.0,
+                    class_name,
+                    detection.bbox.left(),
+                    detection.bbox.top(),
+                    detection.bbox.right(),
+                    detection.bbox.bottom(),
+                );
+            }
+        }
         "help" | "--help" | "-h" => print_usage(),
         other => {
             return Err(format!("unknown command: {other}").into());
@@ -107,6 +182,19 @@ fn required_arg(value: Option<String>, name: &str) -> Result<String, Box<dyn std
     value.ok_or_else(|| format!("missing required argument: {name}").into())
 }
 
+fn optional_f32(
+    value: Option<String>,
+    default: f32,
+    name: &str,
+) -> Result<f32, Box<dyn std::error::Error>> {
+    match value {
+        Some(value) => value
+            .parse()
+            .map_err(|_| format!("invalid {name}: {value}").into()),
+        None => Ok(default),
+    }
+}
+
 fn print_usage() {
     println!("darknet-rs <command> [args]");
     println!("commands:");
@@ -116,6 +204,7 @@ fn print_usage() {
     println!("  names <names>");
     println!("  weights-inspect <cfg> <weights>");
     println!("  forward-dummy <cfg> [weights]");
+    println!("  detect-image <cfg> <weights> <names> <image> [thresh] [nms] [letterbox|resize]");
 }
 
 fn print_network_summary(network: &Network) {

@@ -172,6 +172,8 @@ pub struct YoloSpec {
     pub num: usize,
     pub mask: Vec<usize>,
     pub anchors: Vec<f32>,
+    pub scale_x_y: f32,
+    pub new_coords: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -543,6 +545,8 @@ fn parse_layer_kind(
                 num: mask.len().max(section.get_usize("num", 1)?),
                 mask,
                 anchors: section.get_f32_list("anchors")?,
+                scale_x_y: section.get_f32("scale_x_y", 1.0)?,
+                new_coords: section.get_i64("new_coords", 0)? != 0,
             })
         }
         "gaussian_yolo" => {
@@ -552,6 +556,8 @@ fn parse_layer_kind(
                 num: mask.len().max(section.get_usize("num", 1)?),
                 mask,
                 anchors: section.get_f32_list("anchors")?,
+                scale_x_y: section.get_f32("scale_x_y", 1.0)?,
+                new_coords: section.get_i64("new_coords", 0)? != 0,
             })
         }
         "region" => LayerKind::Region(RegionSpec {

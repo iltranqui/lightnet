@@ -159,6 +159,19 @@ pub trait F32TensorOpsBackend {
         groups: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error>;
+    fn maxpool_f32(
+        &self,
+        x: &Self::Tensor,
+        output_shape: &[usize],
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        padding: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error>;
     fn upsample_f32(
         &self,
         x: &Self::Tensor,

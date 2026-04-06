@@ -1,4 +1,5 @@
 pub mod cfg;
+pub mod detect;
 pub mod error;
 pub mod image;
 pub mod model;
@@ -7,6 +8,7 @@ pub mod runtime;
 pub mod weights;
 
 pub use cfg::{ConfigFile, RawSection};
+pub use detect::{Detection, DetectionBox, DetectionOptions, decode_yolo_detections};
 pub use error::{Error, Result};
 pub use image::PlanarRgbImage;
 pub use model::{
@@ -14,7 +16,8 @@ pub use model::{
 };
 pub use names::load_names_file;
 pub use runtime::{
-    ExecutableNetwork, ForwardResult, GpuExecutableNetwork, LayerParams, Tensor, YoloHeadOutput,
+    ExecutableNetwork, ForwardResult, GpuExecutableNetwork, GpuForwardSummary, LayerParams, Tensor,
+    YoloHeadOutput,
 };
 pub use weights::{WeightsHeader, WeightsInspection, inspect_weights_file};
 
