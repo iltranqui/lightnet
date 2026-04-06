@@ -164,6 +164,58 @@ impl CutileBackend {
         })
     }
 
+    pub fn channel_scale_f32(
+        &self,
+        x: &CutileTensorF32,
+        scale: &CutileTensorF32,
+        channels: usize,
+        channel_stride: usize,
+        tile_len: usize,
+    ) -> Result<CutileTensorF32, CutileBackendError> {
+        let (rows, cols) =
+            validate_bias_add_layout(x.len(), scale.len(), channels, channel_stride)?;
+        let tile_len = tile_len.min(cols).max(1);
+        let x_view = x.arc().try_view_dyn(&[rows, cols])?;
+        let scale_view = scale.arc().try_view_dyn(&[channels])?;
+        let z = api::zeros([rows, cols])
+            .sync_on(&self.stream)?
+            .partition([1, tile_len as i32]);
+        let (z, _, _, _) =
+            cutile_darknet_kernels::channel_scale_2d(z, x_view, scale_view, channels as i32)
+                .grid((rows as u32, grid_1d(cols, tile_len), 1))
+                .sync_on(&self.stream)?;
+        let out: Tensor<f32> = z.unpartition();
+        Ok(CutileTensorF32 {
+            inner: Arc::new(out.reshape_dyn(&x.shape_usize())),
+        })
+    }
+
+    pub fn bias_backward_f32(
+        &self,
+        output_grad: &CutileTensorF32,
+        channels: usize,
+        channel_stride: usize,
+        tile_len: usize,
+    ) -> Result<CutileTensorF32, CutileBackendError> {
+        let _ = tile_len;
+        validate_bias_backward_layout(output_grad.len(), channels, channel_stride)?;
+        let out = api::zeros([channels]).sync_on(&self.stream)?;
+        unsafe {
+            cutile_darknet_kernels::bias_backward_flat(
+                out.device_pointer(),
+                output_grad.arc().device_pointer(),
+                output_grad.len() as i32,
+                channels as i32,
+                channel_stride as i32,
+            )
+        }
+        .grid((grid_1d(output_grad.len(), POINTER_TILE_1D), 1, 1))
+        .sync_on(&self.stream)?;
+        Ok(CutileTensorF32 {
+            inner: Arc::new(out.reshape_dyn(&[channels])),
+        })
+    }
+
     pub fn activation_f32(
         &self,
         x: &CutileTensorF32,
@@ -222,6 +274,79 @@ impl CutileBackend {
         let out: Tensor<f32> = z.unpartition();
         Ok(CutileTensorF32 {
             inner: Arc::new(out.reshape_dyn(&x.shape_usize())),
+        })
+    }
+
+    pub fn activation_backward_f32(
+        &self,
+        activation_input: &CutileTensorF32,
+        delta: &CutileTensorF32,
+        activation: F32ActivationKind,
+        tile_len: usize,
+    ) -> Result<CutileTensorF32, CutileBackendError> {
+        ensure_same_shape(
+            "activation_backward_f32",
+            activation_input.shape(),
+            delta.shape(),
+        )?;
+
+        let len = activation_input.len();
+        let tile_len = tile_len.min(len).max(1);
+        let z = api::zeros([len])
+            .sync_on(&self.stream)?
+            .partition([tile_len as i32]);
+        let (z, _, _) = match activation {
+            F32ActivationKind::Linear => cutile_darknet_kernels::activation_backward_linear(
+                z,
+                activation_input.arc(),
+                delta.arc(),
+            )
+            .grid((grid_1d(len, tile_len), 1, 1))
+            .sync_on(&self.stream)?,
+            F32ActivationKind::Logistic => cutile_darknet_kernels::activation_backward_logistic(
+                z,
+                activation_input.arc(),
+                delta.arc(),
+            )
+            .grid((grid_1d(len, tile_len), 1, 1))
+            .sync_on(&self.stream)?,
+            F32ActivationKind::Relu => {
+                cutile_darknet_kernels::activation_backward_relu(z, activation_input.arc(), delta.arc())
+                    .grid((grid_1d(len, tile_len), 1, 1))
+                    .sync_on(&self.stream)?
+            }
+            F32ActivationKind::Leaky => cutile_darknet_kernels::activation_backward_leaky(
+                z,
+                activation_input.arc(),
+                delta.arc(),
+            )
+            .grid((grid_1d(len, tile_len), 1, 1))
+            .sync_on(&self.stream)?,
+            F32ActivationKind::Mish => cutile_darknet_kernels::activation_backward_mish(
+                z,
+                activation_input.arc(),
+                delta.arc(),
+            )
+            .grid((grid_1d(len, tile_len), 1, 1))
+            .sync_on(&self.stream)?,
+            F32ActivationKind::Swish => cutile_darknet_kernels::activation_backward_swish(
+                z,
+                activation_input.arc(),
+                delta.arc(),
+            )
+            .grid((grid_1d(len, tile_len), 1, 1))
+            .sync_on(&self.stream)?,
+            F32ActivationKind::Tanh => cutile_darknet_kernels::activation_backward_tanh(
+                z,
+                activation_input.arc(),
+                delta.arc(),
+            )
+            .grid((grid_1d(len, tile_len), 1, 1))
+            .sync_on(&self.stream)?,
+        };
+        let out: Tensor<f32> = z.unpartition();
+        Ok(CutileTensorF32 {
+            inner: Arc::new(out.reshape_dyn(&activation_input.shape_usize())),
         })
     }
 
@@ -288,6 +413,66 @@ impl CutileBackend {
         })
     }
 
+    pub fn route_backward_f32(
+        &self,
+        output_grad: &CutileTensorF32,
+        input_shapes: &[Vec<usize>],
+        input_channel_offsets: &[usize],
+        input_channels: &[usize],
+        input_total_channels: &[usize],
+        channel_stride: usize,
+        tile_len: usize,
+    ) -> Result<Vec<CutileTensorF32>, CutileBackendError> {
+        let input_lens = input_shapes
+            .iter()
+            .map(|shape| shape_num_elements(shape))
+            .collect::<Result<Vec<_>, _>>()?;
+        let layout = validate_route_concat_layout(
+            &input_lens,
+            input_channel_offsets,
+            input_channels,
+            input_total_channels,
+            &output_grad.shape_usize(),
+            channel_stride,
+        )?;
+        let _tile_len = tile_len.min(layout.output_len).max(1);
+
+        let mut output_channel_offset = 0usize;
+        let mut input_grads = Vec::with_capacity(input_shapes.len());
+        for (((input_shape, source_channel_offset), src_channels), source_total_channels) in input_shapes
+            .iter()
+            .zip(input_channel_offsets.iter().copied())
+            .zip(input_channels.iter().copied())
+            .zip(input_total_channels.iter().copied())
+        {
+            let input_len = shape_num_elements(input_shape)?;
+            let input_grad = api::zeros([input_len]).sync_on(&self.stream)?;
+            let copy_len = layout.batch * src_channels * channel_stride;
+            unsafe {
+                cutile_darknet_kernels::route_scatter_flat(
+                    input_grad.device_pointer(),
+                    output_grad.arc().device_pointer(),
+                    copy_len as i32,
+                    layout.total_channels as i32,
+                    output_channel_offset as i32,
+                    src_channels as i32,
+                    source_total_channels as i32,
+                    source_channel_offset as i32,
+                    channel_stride as i32,
+                )
+            }
+            .grid((grid_1d(copy_len, POINTER_TILE_1D), 1, 1))
+            .sync_on(&self.stream)?;
+
+            input_grads.push(CutileTensorF32 {
+                inner: Arc::new(input_grad.reshape_dyn(input_shape)),
+            });
+            output_channel_offset += src_channels;
+        }
+
+        Ok(input_grads)
+    }
+
     pub fn conv2d_f32(
         &self,
         x: &CutileTensorF32,
@@ -345,6 +530,135 @@ impl CutileBackend {
 
         Ok(CutileTensorF32 {
             inner: Arc::new(out.reshape_dyn(output_shape)),
+        })
+    }
+
+    pub fn conv2d_backward_input_f32(
+        &self,
+        output_grad: &CutileTensorF32,
+        weights: &CutileTensorF32,
+        input_shape: &[usize],
+        input_channels: usize,
+        input_height: usize,
+        input_width: usize,
+        filters: usize,
+        kernel_size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        dilation: usize,
+        padding: usize,
+        groups: usize,
+        tile_len: usize,
+    ) -> Result<CutileTensorF32, CutileBackendError> {
+        let layout = validate_conv2d_backward_input_layout(
+            output_grad.len(),
+            weights.len(),
+            input_shape,
+            input_channels,
+            input_height,
+            input_width,
+            filters,
+            kernel_size,
+            stride_x,
+            stride_y,
+            dilation,
+            padding,
+            groups,
+        )?;
+        let _tile_len = tile_len.min(layout.input_len).max(1);
+        let input_grad = api::zeros([layout.input_len]).sync_on(&self.stream)?;
+        unsafe {
+            cutile_darknet_kernels::conv2d_backward_input_flat(
+                input_grad.device_pointer(),
+                output_grad.arc().device_pointer(),
+                weights.arc().device_pointer(),
+                layout.input_len as i32,
+                input_channels as i32,
+                input_height as i32,
+                input_width as i32,
+                filters as i32,
+                layout.output_height as i32,
+                layout.output_width as i32,
+                kernel_size as i32,
+                stride_x as i32,
+                stride_y as i32,
+                dilation as i32,
+                padding as i32,
+                groups as i32,
+                layout.channels_per_group as i32,
+                layout.filters_per_group as i32,
+            )
+        }
+        .grid((grid_1d(layout.input_len, POINTER_TILE_1D), 1, 1))
+        .sync_on(&self.stream)?;
+
+        Ok(CutileTensorF32 {
+            inner: Arc::new(input_grad.reshape_dyn(input_shape)),
+        })
+    }
+
+    pub fn conv2d_backward_weights_f32(
+        &self,
+        x: &CutileTensorF32,
+        output_grad: &CutileTensorF32,
+        weight_shape: &[usize],
+        input_channels: usize,
+        input_height: usize,
+        input_width: usize,
+        filters: usize,
+        kernel_size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        dilation: usize,
+        padding: usize,
+        groups: usize,
+        tile_len: usize,
+    ) -> Result<CutileTensorF32, CutileBackendError> {
+        let layout = validate_conv2d_backward_weights_layout(
+            x.len(),
+            output_grad.len(),
+            weight_shape,
+            input_channels,
+            input_height,
+            input_width,
+            filters,
+            kernel_size,
+            stride_x,
+            stride_y,
+            dilation,
+            padding,
+            groups,
+        )?;
+        let _tile_len = tile_len.min(layout.weight_len).max(1);
+        let weight_grad = api::zeros([layout.weight_len]).sync_on(&self.stream)?;
+        unsafe {
+            cutile_darknet_kernels::conv2d_backward_weights_flat(
+                weight_grad.device_pointer(),
+                x.arc().device_pointer(),
+                output_grad.arc().device_pointer(),
+                layout.weight_len as i32,
+                input_channels as i32,
+                input_height as i32,
+                input_width as i32,
+                filters as i32,
+                layout.output_height as i32,
+                layout.output_width as i32,
+                kernel_size as i32,
+                stride_x as i32,
+                stride_y as i32,
+                dilation as i32,
+                padding as i32,
+                groups as i32,
+                layout.batch as i32,
+                layout.channels_per_group as i32,
+                layout.filters_per_group as i32,
+            )
+        }
+        .grid((grid_1d(layout.weight_len, POINTER_TILE_1D), 1, 1))
+        .sync_on(&self.stream)?;
+
+        Ok(CutileTensorF32 {
+            inner: Arc::new(weight_grad.reshape_dyn(weight_shape)),
         })
     }
 
@@ -460,6 +774,56 @@ impl CutileBackend {
         })
     }
 
+    pub fn maxpool_backward_f32(
+        &self,
+        x: &CutileTensorF32,
+        output_grad: &CutileTensorF32,
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        padding: usize,
+        tile_len: usize,
+    ) -> Result<CutileTensorF32, CutileBackendError> {
+        let layout = validate_maxpool_layout(
+            x.len(),
+            &output_grad.shape_usize(),
+            channels,
+            input_height,
+            input_width,
+            size,
+            stride_x,
+            stride_y,
+        )?;
+        let _tile_len = tile_len.min(layout.output_len).max(1);
+        let input_grad = api::zeros([x.len()]).sync_on(&self.stream)?;
+
+        unsafe {
+            cutile_darknet_kernels::maxpool_backward_flat(
+                input_grad.device_pointer(),
+                x.arc().device_pointer(),
+                output_grad.arc().device_pointer(),
+                layout.output_len as i32,
+                input_height as i32,
+                input_width as i32,
+                layout.output_height as i32,
+                layout.output_width as i32,
+                size as i32,
+                stride_x as i32,
+                stride_y as i32,
+                (padding / 2) as i32,
+            )
+        }
+        .grid((grid_1d(layout.output_len, POINTER_TILE_1D), 1, 1))
+        .sync_on(&self.stream)?;
+
+        Ok(CutileTensorF32 {
+            inner: Arc::new(input_grad.reshape_dyn(&x.shape_usize())),
+        })
+    }
+
     pub fn vector_add_f32(
         &self,
         x: &CutileTensorF32,
@@ -530,6 +894,58 @@ impl CutileBackend {
             ),
         })
     }
+
+    pub fn sgd_update_f32(
+        &self,
+        weights: &CutileTensorF32,
+        updates: &CutileTensorF32,
+        lr: f32,
+        momentum: f32,
+        decay: f32,
+        batch: usize,
+        _tile_len: usize,
+    ) -> Result<(CutileTensorF32, CutileTensorF32), CutileBackendError> {
+        ensure_same_shape("sgd_update_f32", weights.shape(), updates.shape())?;
+        let batch = batch.max(1) as f32;
+        unsafe {
+            cutile_darknet_kernels::sgd_update_flat(
+                weights.arc().device_pointer(),
+                updates.arc().device_pointer(),
+                weights.len() as i32,
+                lr / batch,
+                momentum,
+                decay * batch,
+            )
+        }
+        .grid((grid_1d(weights.len(), POINTER_TILE_1D), 1, 1))
+        .sync_on(&self.stream)?;
+
+        Ok((weights.clone(), updates.clone()))
+    }
+
+    pub fn upsample_backward_f32(
+        &self,
+        output_grad: &CutileTensorF32,
+        input_shape: &[usize],
+        channels: usize,
+        output_height: usize,
+        output_width: usize,
+        stride: usize,
+        scale: f32,
+        tile_len: usize,
+    ) -> Result<CutileTensorF32, CutileBackendError> {
+        self.upsample_f32(
+            output_grad,
+            input_shape,
+            channels,
+            output_height,
+            output_width,
+            stride,
+            scale,
+            true,
+            tile_len,
+        )
+    }
 }
 
 impl F32TensorOpsBackend for CutileBackend {
@@ -559,6 +975,33 @@ impl F32TensorOpsBackend for CutileBackend {
         CutileBackend::bias_add_f32(self, x, bias, channels, channel_stride, config.tile_len)
     }
 
+    fn channel_scale_f32(
+        &self,
+        x: &Self::Tensor,
+        scale: &Self::Tensor,
+        channels: usize,
+        channel_stride: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        CutileBackend::channel_scale_f32(self, x, scale, channels, channel_stride, config.tile_len)
+    }
+
+    fn bias_backward_f32(
+        &self,
+        output_grad: &Self::Tensor,
+        channels: usize,
+        channel_stride: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        CutileBackend::bias_backward_f32(
+            self,
+            output_grad,
+            channels,
+            channel_stride,
+            config.tile_len,
+        )
+    }
+
     fn activation_f32(
         &self,
         x: &Self::Tensor,
@@ -566,6 +1009,22 @@ impl F32TensorOpsBackend for CutileBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
         CutileBackend::activation_f32(self, x, activation, config.tile_len)
+    }
+
+    fn activation_backward_f32(
+        &self,
+        activation_input: &Self::Tensor,
+        delta: &Self::Tensor,
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        CutileBackend::activation_backward_f32(
+            self,
+            activation_input,
+            delta,
+            activation,
+            config.tile_len,
+        )
     }
 
     fn shortcut_add_f32(
@@ -594,6 +1053,28 @@ impl F32TensorOpsBackend for CutileBackend {
             input_channels,
             input_total_channels,
             output_shape,
+            channel_stride,
+            config.tile_len,
+        )
+    }
+
+    fn route_backward_f32(
+        &self,
+        output_grad: &Self::Tensor,
+        input_shapes: &[Vec<usize>],
+        input_channel_offsets: &[usize],
+        input_channels: &[usize],
+        input_total_channels: &[usize],
+        channel_stride: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Vec<Self::Tensor>, Self::Error> {
+        CutileBackend::route_backward_f32(
+            self,
+            output_grad,
+            input_shapes,
+            input_channel_offsets,
+            input_channels,
+            input_total_channels,
             channel_stride,
             config.tile_len,
         )
@@ -635,6 +1116,78 @@ impl F32TensorOpsBackend for CutileBackend {
         )
     }
 
+    fn conv2d_backward_input_f32(
+        &self,
+        output_grad: &Self::Tensor,
+        weights: &Self::Tensor,
+        input_shape: &[usize],
+        input_channels: usize,
+        input_height: usize,
+        input_width: usize,
+        filters: usize,
+        kernel_size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        dilation: usize,
+        padding: usize,
+        groups: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        CutileBackend::conv2d_backward_input_f32(
+            self,
+            output_grad,
+            weights,
+            input_shape,
+            input_channels,
+            input_height,
+            input_width,
+            filters,
+            kernel_size,
+            stride_x,
+            stride_y,
+            dilation,
+            padding,
+            groups,
+            config.tile_len,
+        )
+    }
+
+    fn conv2d_backward_weights_f32(
+        &self,
+        x: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        weight_shape: &[usize],
+        input_channels: usize,
+        input_height: usize,
+        input_width: usize,
+        filters: usize,
+        kernel_size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        dilation: usize,
+        padding: usize,
+        groups: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        CutileBackend::conv2d_backward_weights_f32(
+            self,
+            x,
+            output_grad,
+            weight_shape,
+            input_channels,
+            input_height,
+            input_width,
+            filters,
+            kernel_size,
+            stride_x,
+            stride_y,
+            dilation,
+            padding,
+            groups,
+            config.tile_len,
+        )
+    }
+
     fn upsample_f32(
         &self,
         x: &Self::Tensor,
@@ -657,6 +1210,30 @@ impl F32TensorOpsBackend for CutileBackend {
             stride,
             scale,
             reverse,
+            config.tile_len,
+        )
+    }
+
+    fn upsample_backward_f32(
+        &self,
+        output_grad: &Self::Tensor,
+        input_shape: &[usize],
+        channels: usize,
+        output_height: usize,
+        output_width: usize,
+        stride: usize,
+        scale: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        CutileBackend::upsample_backward_f32(
+            self,
+            output_grad,
+            input_shape,
+            channels,
+            output_height,
+            output_width,
+            stride,
+            scale,
             config.tile_len,
         )
     }
@@ -689,6 +1266,34 @@ impl F32TensorOpsBackend for CutileBackend {
         )
     }
 
+    fn maxpool_backward_f32(
+        &self,
+        x: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        padding: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        CutileBackend::maxpool_backward_f32(
+            self,
+            x,
+            output_grad,
+            channels,
+            input_height,
+            input_width,
+            size,
+            stride_x,
+            stride_y,
+            padding,
+            config.tile_len,
+        )
+    }
+
     fn vector_add_f32(
         &self,
         x: &Self::Tensor,
@@ -707,6 +1312,28 @@ impl F32TensorOpsBackend for CutileBackend {
     ) -> Result<Self::Tensor, Self::Error> {
         CutileBackend::saxpy_f32(self, alpha, x, y, config.tile_len)
     }
+
+    fn sgd_update_f32(
+        &self,
+        weights: &Self::Tensor,
+        updates: &Self::Tensor,
+        lr: f32,
+        momentum: f32,
+        decay: f32,
+        batch: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        CutileBackend::sgd_update_f32(
+            self,
+            weights,
+            updates,
+            lr,
+            momentum,
+            decay,
+            batch,
+            config.tile_len,
+        )
+    }
 }
 
 fn ensure_num_elements(shape: &[usize], len: usize) -> Result<(), CutileBackendError> {
@@ -722,6 +1349,19 @@ fn ensure_num_elements(shape: &[usize], len: usize) -> Result<(), CutileBackendE
         )));
     }
 
+    Ok(())
+}
+
+fn ensure_same_shape(
+    op: &str,
+    lhs: &[i32],
+    rhs: &[i32],
+) -> Result<(), CutileBackendError> {
+    if lhs != rhs {
+        return Err(CutileBackendError::Shape(format!(
+            "{op} shape mismatch: {lhs:?} vs {rhs:?}"
+        )));
+    }
     Ok(())
 }
 
@@ -756,6 +1396,37 @@ fn validate_bias_add_layout(
     if rows % channels != 0 {
         return Err(CutileBackendError::Shape(format!(
             "bias_add_f32 rows {rows} are not divisible by channels {channels}"
+        )));
+    }
+
+    Ok((rows, channel_stride))
+}
+
+fn validate_bias_backward_layout(
+    output_grad_len: usize,
+    channels: usize,
+    channel_stride: usize,
+) -> Result<(usize, usize), CutileBackendError> {
+    if channels == 0 {
+        return Err(CutileBackendError::Shape(
+            "bias_backward_f32 requires channels > 0".to_owned(),
+        ));
+    }
+    if channel_stride == 0 {
+        return Err(CutileBackendError::Shape(
+            "bias_backward_f32 requires channel_stride > 0".to_owned(),
+        ));
+    }
+    if output_grad_len % channel_stride != 0 {
+        return Err(CutileBackendError::Shape(format!(
+            "bias_backward_f32 output gradient length {output_grad_len} is not divisible by channel_stride {channel_stride}"
+        )));
+    }
+
+    let rows = output_grad_len / channel_stride;
+    if rows % channels != 0 {
+        return Err(CutileBackendError::Shape(format!(
+            "bias_backward_f32 rows {rows} are not divisible by channels {channels}"
         )));
     }
 
@@ -869,8 +1540,11 @@ fn validate_route_concat_layout(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Conv2dLayout {
+    batch: usize,
     channels_per_group: usize,
     filters_per_group: usize,
+    input_len: usize,
+    weight_len: usize,
     output_height: usize,
     output_width: usize,
     output_len: usize,
@@ -924,6 +1598,7 @@ fn validate_conv2d_layout(
             "conv2d_f32 input length {input_len} is not divisible by input batch stride {input_batch_stride}"
         )));
     }
+    let batch = input_len / input_batch_stride;
 
     let channels_per_group = input_channels / groups;
     let filters_per_group = filters / groups;
@@ -949,11 +1624,133 @@ fn validate_conv2d_layout(
     }
     let output_len = shape_num_elements(output_shape)?;
     Ok(Conv2dLayout {
+        batch,
         channels_per_group,
         filters_per_group,
+        input_len,
+        weight_len,
         output_height: output_shape[output_shape.len() - 2],
         output_width: output_shape[output_shape.len() - 1],
         output_len,
+    })
+}
+
+fn conv_output_dim(
+    input: usize,
+    kernel_size: usize,
+    stride: usize,
+    dilation: usize,
+    padding: usize,
+) -> Result<usize, CutileBackendError> {
+    if stride == 0 || kernel_size == 0 || dilation == 0 {
+        return Err(CutileBackendError::Shape(
+            "conv2d backward requires non-zero kernel, stride, and dilation".to_owned(),
+        ));
+    }
+    let kernel_extent = dilation
+        .checked_mul(kernel_size.saturating_sub(1))
+        .and_then(|v| v.checked_add(1))
+        .ok_or_else(|| CutileBackendError::Shape("conv2d backward kernel extent overflow".to_owned()))?;
+    let padded = input
+        .checked_add(padding.checked_mul(2).ok_or_else(|| {
+            CutileBackendError::Shape("conv2d backward padding overflow".to_owned())
+        })?)
+        .ok_or_else(|| CutileBackendError::Shape("conv2d backward padded input overflow".to_owned()))?;
+    if padded < kernel_extent {
+        return Err(CutileBackendError::Shape(format!(
+            "conv2d backward kernel extent {kernel_extent} exceeds padded input {padded}"
+        )));
+    }
+    Ok((padded - kernel_extent) / stride + 1)
+}
+
+fn validate_conv2d_backward_input_layout(
+    output_grad_len: usize,
+    weight_len: usize,
+    input_shape: &[usize],
+    input_channels: usize,
+    input_height: usize,
+    input_width: usize,
+    filters: usize,
+    kernel_size: usize,
+    stride_x: usize,
+    stride_y: usize,
+    dilation: usize,
+    padding: usize,
+    groups: usize,
+) -> Result<Conv2dLayout, CutileBackendError> {
+    let input_len = shape_num_elements(input_shape)?;
+    let output_height = conv_output_dim(input_height, kernel_size, stride_y, dilation, padding)?;
+    let output_width = conv_output_dim(input_width, kernel_size, stride_x, dilation, padding)?;
+    let batch = input_len
+        / input_channels
+        / input_height
+        / input_width;
+    validate_conv2d_layout(
+        input_len,
+        weight_len,
+        &[batch, filters, output_height, output_width],
+        input_channels,
+        input_height,
+        input_width,
+        filters,
+        kernel_size,
+        groups,
+    )
+    .and_then(|layout| {
+        if output_grad_len != layout.output_len {
+            Err(CutileBackendError::Shape(format!(
+                "conv2d_backward_input_f32 output gradient length mismatch: expected {}, got {output_grad_len}",
+                layout.output_len
+            )))
+        } else {
+            Ok(layout)
+        }
+    })
+}
+
+fn validate_conv2d_backward_weights_layout(
+    input_len: usize,
+    output_grad_len: usize,
+    weight_shape: &[usize],
+    input_channels: usize,
+    input_height: usize,
+    input_width: usize,
+    filters: usize,
+    kernel_size: usize,
+    stride_x: usize,
+    stride_y: usize,
+    dilation: usize,
+    padding: usize,
+    groups: usize,
+) -> Result<Conv2dLayout, CutileBackendError> {
+    let weight_len = shape_num_elements(weight_shape)?;
+    let output_height = conv_output_dim(input_height, kernel_size, stride_y, dilation, padding)?;
+    let output_width = conv_output_dim(input_width, kernel_size, stride_x, dilation, padding)?;
+    let batch = input_len
+        / input_channels
+        / input_height
+        / input_width;
+    validate_conv2d_layout(
+        input_len,
+        weight_len,
+        &[batch, filters, output_height, output_width],
+        input_channels,
+        input_height,
+        input_width,
+        filters,
+        kernel_size,
+        groups,
+    )
+    .and_then(|layout| {
+        if output_grad_len != layout.output_len {
+            Err(CutileBackendError::Shape(format!(
+                "conv2d_backward_weights_f32 output gradient length mismatch: expected {}, got {output_grad_len}",
+                layout.output_len
+            )))
+        } else {
+            Ok(layout)
+        }
     })
 }
 
@@ -1227,6 +2024,115 @@ mod cutile_darknet_kernels {
     }
 
     #[cutile::entry(print_ir = true)]
+    fn channel_scale_2d<const S: [i32; 2]>(
+        z: &mut Tensor<f32, S>,
+        x: &Tensor<f32, { [-1, -1] }>,
+        scale: &Tensor<f32, { [-1] }>,
+        channels: i32,
+    ) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let row_idx = pid.0;
+        let col_idx = pid.1;
+        let channel_idx = row_idx % channels;
+        let tile_x = x.load_tile(const_shape!(S), [row_idx, col_idx]);
+        let scale_scalar = scale.load_tile(const_shape![1], [channel_idx]);
+        let scale_tile = scale_scalar.reshape(const_shape![1, 1]).broadcast(z.shape());
+        z.store(tile_x * scale_tile);
+    }
+
+    #[cutile::entry()]
+    unsafe fn bias_backward_flat(
+        bias_grad_ptr: *mut f32,
+        output_grad_ptr: *mut f32,
+        len: i32,
+        channels: i32,
+        channel_stride: i32,
+    ) {
+        let grid = get_num_tile_blocks();
+        let pid = get_tile_block_id();
+
+        let grad_root: PointerTile<*mut f32, { [] }> = pointer_to_tile(output_grad_ptr);
+        let grad_base: PointerTile<*mut f32, { [1] }> = grad_root.reshape(const_shape![1]);
+        let grad_ptrs: PointerTile<*mut f32, { [128] }> = grad_base.broadcast(const_shape![128]);
+        let bias_root: PointerTile<*mut f32, { [] }> = pointer_to_tile(bias_grad_ptr);
+        let bias_base: PointerTile<*mut f32, { [1] }> = bias_root.reshape(const_shape![1]);
+        let bias_ptrs: PointerTile<*mut f32, { [128] }> = bias_base.broadcast(const_shape![128]);
+
+        let len_tile: Tile<i32, { [128] }> = broadcast_scalar(len, const_shape![128]);
+        let channel_stride_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(channel_stride, const_shape![128]);
+        let channels_tile: Tile<i32, { [128] }> = broadcast_scalar(channels, const_shape![128]);
+
+        let start: i32 = pid.0 * 128i32;
+        let step: i32 = grid.0 * 128i32;
+        for offset in (start..len).step_by(step as usize) {
+            let idx: Tile<i32, { [128] }> =
+                iota(const_shape![128]) + broadcast_scalar(offset, const_shape![128]);
+            let mask: Tile<bool, { [128] }> = lt_tile(idx, len_tile);
+            let channel_idx = (idx / channel_stride_tile) % channels_tile;
+            let grad_src: PointerTile<*mut f32, { [128] }> = grad_ptrs.offset_tile(idx);
+            let grad_tile: (Tile<f32, { [128] }>, Token) =
+                load_ptr_tko(grad_src, "weak", "tl_blk", Some(mask), Some(0.0f32), None, None);
+            let grad_values: Tile<f32, { [128] }> = grad_tile.0;
+            let bias_dst: PointerTile<*mut f32, { [128] }> = bias_ptrs.offset_tile(channel_idx);
+            let _atomic_token: (Tile<f32, { [128] }>, Token) = atomic_rmw_tko(
+                bias_dst,
+                grad_values,
+                "addf",
+                "relaxed",
+                "device",
+                Some(mask),
+                None,
+            );
+        }
+    }
+
+    #[cutile::entry()]
+    unsafe fn sgd_update_flat(
+        weights_ptr: *mut f32,
+        updates_ptr: *mut f32,
+        len: i32,
+        lr_over_batch: f32,
+        momentum: f32,
+        decay_times_batch: f32,
+    ) {
+        let pid = get_tile_block_id();
+        let base_offset = pid.0 * 128i32;
+        let idx: Tile<i32, { [128] }> =
+            iota(const_shape![128]) + broadcast_scalar(base_offset, const_shape![128]);
+        let mask: Tile<bool, { [128] }> = lt_tile(idx, broadcast_scalar(len, const_shape![128]));
+
+        let weight_root: PointerTile<*mut f32, { [] }> = pointer_to_tile(weights_ptr);
+        let weight_base: PointerTile<*mut f32, { [1] }> = weight_root.reshape(const_shape![1]);
+        let weight_ptrs: PointerTile<*mut f32, { [128] }> =
+            weight_base.broadcast(const_shape![128]).offset_tile(idx);
+
+        let update_root: PointerTile<*mut f32, { [] }> = pointer_to_tile(updates_ptr);
+        let update_base: PointerTile<*mut f32, { [1] }> = update_root.reshape(const_shape![1]);
+        let update_ptrs: PointerTile<*mut f32, { [128] }> =
+            update_base.broadcast(const_shape![128]).offset_tile(idx);
+
+        let loaded_weights: (Tile<f32, { [128] }>, Token) =
+            load_ptr_tko(weight_ptrs, "weak", "tl_blk", Some(mask), Some(0.0f32), None, None);
+        let loaded_updates: (Tile<f32, { [128] }>, Token) =
+            load_ptr_tko(update_ptrs, "weak", "tl_blk", Some(mask), Some(0.0f32), None, None);
+
+        let weights_tile = loaded_weights.0;
+        let updates_tile = loaded_updates.0;
+        let decayed_updates =
+            updates_tile - broadcast_scalar(decay_times_batch, const_shape![128]) * weights_tile;
+        let new_weights =
+            weights_tile + broadcast_scalar(lr_over_batch, const_shape![128]) * decayed_updates;
+        let new_updates =
+            broadcast_scalar(momentum, const_shape![128]) * decayed_updates;
+
+        let _store_weights =
+            store_ptr_tko(weight_ptrs, new_weights, "weak", "tl_blk", Some(mask), None, None);
+        let _store_updates =
+            store_ptr_tko(update_ptrs, new_updates, "weak", "tl_blk", Some(mask), None, None);
+    }
+
+    #[cutile::entry(print_ir = true)]
     fn activation_linear<const S: [i32; 1]>(z: &mut Tensor<f32, S>, x: &Tensor<f32, { [-1] }>) {
         let tile_x = load_tile_like_1d(x, z);
         z.store(tile_x);
@@ -1282,6 +2188,116 @@ mod cutile_darknet_kernels {
         z.store(tanh_x);
     }
 
+    #[cutile::entry(print_ir = true)]
+    fn activation_backward_linear<const S: [i32; 1]>(
+        z: &mut Tensor<f32, S>,
+        _x: &Tensor<f32, { [-1] }>,
+        delta: &Tensor<f32, { [-1] }>,
+    ) {
+        let tile_delta = load_tile_like_1d(delta, z);
+        z.store(tile_delta);
+    }
+
+    #[cutile::entry(print_ir = true)]
+    fn activation_backward_logistic<const S: [i32; 1]>(
+        z: &mut Tensor<f32, S>,
+        x: &Tensor<f32, { [-1] }>,
+        delta: &Tensor<f32, { [-1] }>,
+    ) {
+        let tile_x = load_tile_like_1d(x, z);
+        let tile_delta = load_tile_like_1d(delta, z);
+        let one: Tile<f32, S> = constant(1.0f32, z.shape());
+        let neg_x: Tile<f32, S> = negf(tile_x);
+        let exp_neg_x: Tile<f32, S> = exp(neg_x);
+        let sigmoid: Tile<f32, S> = one / (one + exp_neg_x);
+        z.store(tile_delta * sigmoid * (one - sigmoid));
+    }
+
+    #[cutile::entry(print_ir = true)]
+    fn activation_backward_relu<const S: [i32; 1]>(
+        z: &mut Tensor<f32, S>,
+        x: &Tensor<f32, { [-1] }>,
+        delta: &Tensor<f32, { [-1] }>,
+    ) {
+        let tile_x = load_tile_like_1d(x, z);
+        let tile_delta = load_tile_like_1d(delta, z);
+        let zero: Tile<f32, S> = constant(0.0f32, z.shape());
+        let one: Tile<f32, S> = constant(1.0f32, z.shape());
+        let grad = select(gt_tile(tile_x, zero), one, zero);
+        z.store(tile_delta * grad);
+    }
+
+    #[cutile::entry(print_ir = true)]
+    fn activation_backward_leaky<const S: [i32; 1]>(
+        z: &mut Tensor<f32, S>,
+        x: &Tensor<f32, { [-1] }>,
+        delta: &Tensor<f32, { [-1] }>,
+    ) {
+        let tile_x = load_tile_like_1d(x, z);
+        let tile_delta = load_tile_like_1d(delta, z);
+        let zero: Tile<f32, S> = constant(0.0f32, z.shape());
+        let one: Tile<f32, S> = constant(1.0f32, z.shape());
+        let slope: Tile<f32, S> = constant(0.1f32, z.shape());
+        let grad = select(gt_tile(tile_x, zero), one, slope);
+        z.store(tile_delta * grad);
+    }
+
+    #[cutile::entry(print_ir = true)]
+    fn activation_backward_mish<const S: [i32; 1]>(
+        z: &mut Tensor<f32, S>,
+        x: &Tensor<f32, { [-1] }>,
+        delta: &Tensor<f32, { [-1] }>,
+    ) {
+        let tile_x = load_tile_like_1d(x, z);
+        let tile_delta = load_tile_like_1d(delta, z);
+        let one: Tile<f32, S> = constant(1.0f32, z.shape());
+        let threshold: Tile<f32, S> = constant(20.0f32, z.shape());
+        let neg_threshold: Tile<f32, S> = constant(-20.0f32, z.shape());
+        let exp_x: Tile<f32, S> = exp(tile_x);
+        let log_term: Tile<f32, S> = log(one + exp_x);
+        let softplus: Tile<f32, S> = select(
+            gt_tile(tile_x, threshold),
+            tile_x,
+            select(lt_tile(tile_x, neg_threshold), exp_x, log_term),
+        );
+        let neg_softplus: Tile<f32, S> = negf(softplus);
+        let exp_neg_softplus: Tile<f32, S> = exp(neg_softplus);
+        let grad_sp: Tile<f32, S> = one - exp_neg_softplus;
+        let tsp: Tile<f32, S> = tanh(softplus);
+        let grad_tsp: Tile<f32, S> = (one - tsp * tsp) * grad_sp;
+        let grad: Tile<f32, S> = tile_x * grad_tsp + tsp;
+        z.store(tile_delta * grad);
+    }
+
+    #[cutile::entry(print_ir = true)]
+    fn activation_backward_swish<const S: [i32; 1]>(
+        z: &mut Tensor<f32, S>,
+        x: &Tensor<f32, { [-1] }>,
+        delta: &Tensor<f32, { [-1] }>,
+    ) {
+        let tile_x = load_tile_like_1d(x, z);
+        let tile_delta = load_tile_like_1d(delta, z);
+        let one: Tile<f32, S> = constant(1.0f32, z.shape());
+        let neg_x: Tile<f32, S> = negf(tile_x);
+        let exp_neg_x: Tile<f32, S> = exp(neg_x);
+        let sigmoid: Tile<f32, S> = one / (one + exp_neg_x);
+        let grad: Tile<f32, S> = sigmoid + tile_x * sigmoid * (one - sigmoid);
+        z.store(tile_delta * grad);
+    }
+
+    #[cutile::entry(print_ir = true)]
+    fn activation_backward_tanh<const S: [i32; 1]>(
+        z: &mut Tensor<f32, S>,
+        x: &Tensor<f32, { [-1] }>,
+        delta: &Tensor<f32, { [-1] }>,
+    ) {
+        let tile_x = load_tile_like_1d(x, z);
+        let tile_delta = load_tile_like_1d(delta, z);
+        let one: Tile<f32, S> = constant(1.0f32, z.shape());
+        let tanh_x: Tile<f32, S> = tanh(tile_x);
+        z.store(tile_delta * (one - tanh_x * tanh_x));
+    }
+
     #[cutile::entry()]
     unsafe fn route_copy_flat(
         dst_ptr: *mut f32,
@@ -1330,6 +2346,72 @@ mod cutile_darknet_kernels {
             let elem_idx = within_batch % channel_stride_tile;
 
             let src_offsets = batch_idx * source_batch_stride
+                + source_channel_offset_tile
+                + channel_idx * channel_stride_tile
+                + elem_idx;
+            let src: PointerTile<*mut f32, { [128] }> = src_ptrs.offset_tile(src_offsets);
+            let src_values: (Tile<f32, { [128] }>, Token) =
+                load_ptr_tko(src, "weak", "tl_blk", Some(mask), Some(0.0f32), None, None);
+            let src_tile: Tile<f32, { [128] }> = src_values.0;
+
+            let dst_offsets = batch_idx * output_batch_stride
+                + output_channel_offset_tile
+                + channel_idx * channel_stride_tile
+                + elem_idx;
+            let dst: PointerTile<*mut f32, { [128] }> = dst_ptrs.offset_tile(dst_offsets);
+            let _store_token: Token =
+                store_ptr_tko(dst, src_tile, "weak", "tl_blk", Some(mask), None, None);
+        }
+    }
+
+    #[cutile::entry()]
+    unsafe fn route_scatter_flat(
+        dst_ptr: *mut f32,
+        src_ptr: *mut f32,
+        copy_len: i32,
+        source_total_channels: i32,
+        source_channel_offset: i32,
+        source_channels: i32,
+        output_total_channels: i32,
+        output_channel_offset: i32,
+        channel_stride: i32,
+    ) {
+        let grid = get_num_tile_blocks();
+        let pid = get_tile_block_id();
+
+        let src_root: PointerTile<*mut f32, { [] }> = pointer_to_tile(src_ptr);
+        let src_base: PointerTile<*mut f32, { [1] }> = src_root.reshape(const_shape![1]);
+        let src_ptrs: PointerTile<*mut f32, { [128] }> = src_base.broadcast(const_shape![128]);
+        let dst_root: PointerTile<*mut f32, { [] }> = pointer_to_tile(dst_ptr);
+        let dst_base: PointerTile<*mut f32, { [1] }> = dst_root.reshape(const_shape![1]);
+        let dst_ptrs: PointerTile<*mut f32, { [128] }> = dst_base.broadcast(const_shape![128]);
+
+        let copy_len_tile: Tile<i32, { [128] }> = broadcast_scalar(copy_len, const_shape![128]);
+        let source_selected_stride: Tile<i32, { [128] }> =
+            broadcast_scalar(source_channels * channel_stride, const_shape![128]);
+        let source_group_stride: Tile<i32, { [128] }> =
+            broadcast_scalar(source_total_channels * channel_stride, const_shape![128]);
+        let source_channel_offset_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(source_channel_offset * channel_stride, const_shape![128]);
+        let output_batch_stride: Tile<i32, { [128] }> =
+            broadcast_scalar(output_total_channels * channel_stride, const_shape![128]);
+        let output_channel_offset_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(output_channel_offset * channel_stride, const_shape![128]);
+        let channel_stride_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(channel_stride, const_shape![128]);
+
+        let start: i32 = pid.0 * 128i32;
+        let step: i32 = grid.0 * 128i32;
+        for offset in (start..copy_len).step_by(step as usize) {
+            let local_idx: Tile<i32, { [128] }> =
+                iota(const_shape![128]) + broadcast_scalar(offset, const_shape![128]);
+            let mask: Tile<bool, { [128] }> = lt_tile(local_idx, copy_len_tile);
+            let batch_idx = local_idx / source_selected_stride;
+            let within_batch = local_idx % source_selected_stride;
+            let channel_idx = within_batch / channel_stride_tile;
+            let elem_idx = within_batch % channel_stride_tile;
+
+            let src_offsets = batch_idx * source_group_stride
                 + source_channel_offset_tile
                 + channel_idx * channel_stride_tile
                 + elem_idx;
@@ -1561,6 +2643,127 @@ mod cutile_darknet_kernels {
     }
 
     #[cutile::entry()]
+    unsafe fn maxpool_backward_flat(
+        input_grad_ptr: *mut f32,
+        input_ptr: *mut f32,
+        output_grad_ptr: *mut f32,
+        output_len: i32,
+        input_height: i32,
+        input_width: i32,
+        output_height: i32,
+        output_width: i32,
+        size: i32,
+        stride_x: i32,
+        stride_y: i32,
+        pad_offset: i32,
+    ) {
+        let grid = get_num_tile_blocks();
+        let pid = get_tile_block_id();
+
+        let input_root: PointerTile<*mut f32, { [] }> = pointer_to_tile(input_ptr);
+        let input_base: PointerTile<*mut f32, { [1] }> = input_root.reshape(const_shape![1]);
+        let input_ptrs: PointerTile<*mut f32, { [128] }> = input_base.broadcast(const_shape![128]);
+        let output_grad_root: PointerTile<*mut f32, { [] }> = pointer_to_tile(output_grad_ptr);
+        let output_grad_base: PointerTile<*mut f32, { [1] }> =
+            output_grad_root.reshape(const_shape![1]);
+        let output_grad_ptrs: PointerTile<*mut f32, { [128] }> =
+            output_grad_base.broadcast(const_shape![128]);
+        let input_grad_root: PointerTile<*mut f32, { [] }> = pointer_to_tile(input_grad_ptr);
+        let input_grad_base: PointerTile<*mut f32, { [1] }> =
+            input_grad_root.reshape(const_shape![1]);
+        let input_grad_ptrs: PointerTile<*mut f32, { [128] }> =
+            input_grad_base.broadcast(const_shape![128]);
+
+        let output_len_tile: Tile<i32, { [128] }> = broadcast_scalar(output_len, const_shape![128]);
+        let output_plane_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(output_height * output_width, const_shape![128]);
+        let output_width_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(output_width, const_shape![128]);
+        let input_plane_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(input_height * input_width, const_shape![128]);
+        let input_width_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(input_width, const_shape![128]);
+        let input_height_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(input_height, const_shape![128]);
+        let zero_i32: Tile<i32, { [128] }> = broadcast_scalar(0i32, const_shape![128]);
+        let false_tile: Tile<bool, { [128] }> = broadcast_scalar(false, const_shape![128]);
+
+        let start: i32 = pid.0 * 128i32;
+        let step: i32 = grid.0 * 128i32;
+        for offset in (start..output_len).step_by(step as usize) {
+            let output_idx: Tile<i32, { [128] }> =
+                iota(const_shape![128]) + broadcast_scalar(offset, const_shape![128]);
+            let output_mask: Tile<bool, { [128] }> = lt_tile(output_idx, output_len_tile);
+            let batch_channel = output_idx / output_plane_tile;
+            let within_plane = output_idx % output_plane_tile;
+            let output_y = within_plane / output_width_tile;
+            let output_x = within_plane % output_width_tile;
+            let mut best_value: Tile<f32, { [128] }> = constant(f32::NEG_INFINITY, const_shape![128]);
+            let mut best_offset: Tile<i32, { [128] }> = zero_i32;
+            let mut best_found: Tile<bool, { [128] }> = false_tile;
+
+            for ky in 0i32..size {
+                let ky_tile: Tile<i32, { [128] }> = broadcast_scalar(ky, const_shape![128]);
+                let input_y = output_y * broadcast_scalar(stride_y, const_shape![128]) + ky_tile
+                    - broadcast_scalar(pad_offset, const_shape![128]);
+                for kx in 0i32..size {
+                    let kx_tile: Tile<i32, { [128] }> = broadcast_scalar(kx, const_shape![128]);
+                    let input_x = output_x * broadcast_scalar(stride_x, const_shape![128])
+                        + kx_tile
+                        - broadcast_scalar(pad_offset, const_shape![128]);
+                    let valid = output_mask
+                        & ge_tile(input_y, zero_i32)
+                        & lt_tile(input_y, input_height_tile)
+                        & ge_tile(input_x, zero_i32)
+                        & lt_tile(input_x, input_width_tile);
+                    let input_offsets =
+                        batch_channel * input_plane_tile + input_y * input_width_tile + input_x;
+                    let safe_input_offsets = select(valid, input_offsets, zero_i32);
+                    let src: PointerTile<*mut f32, { [128] }> =
+                        input_ptrs.offset_tile(safe_input_offsets);
+                    let input_tile: (Tile<f32, { [128] }>, Token) = load_ptr_tko(
+                        src,
+                        "weak",
+                        "tl_blk",
+                        Some(valid),
+                        Some(f32::NEG_INFINITY),
+                        None,
+                        None,
+                    );
+                    let values: Tile<f32, { [128] }> = input_tile.0;
+                    let better: Tile<bool, { [128] }> = valid & gt_tile(values, best_value);
+                    best_value = select(better, values, best_value);
+                    best_offset = select(better, input_offsets, best_offset);
+                    best_found = select(better, valid, best_found);
+                }
+            }
+
+            let grad_src: PointerTile<*mut f32, { [128] }> = output_grad_ptrs.offset_tile(output_idx);
+            let output_grad_tile: (Tile<f32, { [128] }>, Token) = load_ptr_tko(
+                grad_src,
+                "weak",
+                "tl_blk",
+                Some(output_mask),
+                Some(0.0f32),
+                None,
+                None,
+            );
+            let grad_values: Tile<f32, { [128] }> = output_grad_tile.0;
+            let grad_dst: PointerTile<*mut f32, { [128] }> = input_grad_ptrs.offset_tile(best_offset);
+            let write_mask = output_mask & best_found;
+            let _atomic_token: (Tile<f32, { [128] }>, Token) = atomic_rmw_tko(
+                grad_dst,
+                grad_values,
+                "addf",
+                "relaxed",
+                "device",
+                Some(write_mask),
+                None,
+            );
+        }
+    }
+
+    #[cutile::entry()]
     unsafe fn conv2d_flat(
         out_ptr: *mut f32,
         input_ptr: *mut f32,
@@ -1696,6 +2899,296 @@ mod cutile_darknet_kernels {
             let dst: PointerTile<*mut f32, { [128] }> = out_ptrs.offset_tile(output_idx);
             let _store_token: Token =
                 store_ptr_tko(dst, acc, "weak", "tl_blk", Some(output_mask), None, None);
+        }
+    }
+
+    #[cutile::entry()]
+    unsafe fn conv2d_backward_input_flat(
+        input_grad_ptr: *mut f32,
+        output_grad_ptr: *mut f32,
+        weight_ptr: *mut f32,
+        input_len: i32,
+        input_channels: i32,
+        input_height: i32,
+        input_width: i32,
+        filters: i32,
+        output_height: i32,
+        output_width: i32,
+        kernel_size: i32,
+        stride_x: i32,
+        stride_y: i32,
+        dilation: i32,
+        padding: i32,
+        _groups: i32,
+        channels_per_group: i32,
+        filters_per_group: i32,
+    ) {
+        let grid = get_num_tile_blocks();
+        let pid = get_tile_block_id();
+
+        let input_grad_root: PointerTile<*mut f32, { [] }> = pointer_to_tile(input_grad_ptr);
+        let input_grad_base: PointerTile<*mut f32, { [1] }> = input_grad_root.reshape(const_shape![1]);
+        let input_grad_ptrs: PointerTile<*mut f32, { [128] }> =
+            input_grad_base.broadcast(const_shape![128]);
+        let output_grad_root: PointerTile<*mut f32, { [] }> = pointer_to_tile(output_grad_ptr);
+        let output_grad_base: PointerTile<*mut f32, { [1] }> = output_grad_root.reshape(const_shape![1]);
+        let output_grad_ptrs: PointerTile<*mut f32, { [128] }> =
+            output_grad_base.broadcast(const_shape![128]);
+        let weight_root: PointerTile<*mut f32, { [] }> = pointer_to_tile(weight_ptr);
+        let weight_base: PointerTile<*mut f32, { [1] }> = weight_root.reshape(const_shape![1]);
+        let weight_ptrs: PointerTile<*mut f32, { [128] }> = weight_base.broadcast(const_shape![128]);
+
+        let input_len_tile: Tile<i32, { [128] }> = broadcast_scalar(input_len, const_shape![128]);
+        let input_plane_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(input_height * input_width, const_shape![128]);
+        let input_width_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(input_width, const_shape![128]);
+        let input_channel_plane_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(input_channels * input_height * input_width, const_shape![128]);
+        let output_plane_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(output_height * output_width, const_shape![128]);
+        let output_width_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(output_width, const_shape![128]);
+        let channels_per_group_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(channels_per_group, const_shape![128]);
+        let filters_per_group_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(filters_per_group, const_shape![128]);
+        let kernel_size_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(kernel_size, const_shape![128]);
+        let zero_i32: Tile<i32, { [128] }> = broadcast_scalar(0i32, const_shape![128]);
+
+        let start: i32 = pid.0 * 128i32;
+        let step: i32 = grid.0 * 128i32;
+        for offset in (start..input_len).step_by(step as usize) {
+            let input_idx: Tile<i32, { [128] }> =
+                iota(const_shape![128]) + broadcast_scalar(offset, const_shape![128]);
+            let input_mask: Tile<bool, { [128] }> = lt_tile(input_idx, input_len_tile);
+
+            let batch_idx = input_idx / input_channel_plane_tile;
+            let batch_rem = input_idx % input_channel_plane_tile;
+            let input_channel = batch_rem / input_plane_tile;
+            let within_plane = batch_rem % input_plane_tile;
+            let input_y = within_plane / input_width_tile;
+            let input_x = within_plane % input_width_tile;
+            let group_idx = input_channel / channels_per_group_tile;
+            let input_channel_in_group = input_channel % channels_per_group_tile;
+
+            let mut acc: Tile<f32, { [128] }> = constant(0.0f32, const_shape![128]);
+            for filter_in_group in 0i32..filters_per_group {
+                let filter_in_group_tile: Tile<i32, { [128] }> =
+                    broadcast_scalar(filter_in_group, const_shape![128]);
+                let filter_idx = group_idx * filters_per_group_tile + filter_in_group_tile;
+                for ky in 0i32..kernel_size {
+                    let ky_tile: Tile<i32, { [128] }> = broadcast_scalar(ky, const_shape![128]);
+                    let oy_num = input_y + broadcast_scalar(padding, const_shape![128])
+                        - ky_tile * broadcast_scalar(dilation, const_shape![128]);
+                    let oy_valid = ge_tile(oy_num, zero_i32)
+                        & eq_tile(
+                            oy_num % broadcast_scalar(stride_y, const_shape![128]),
+                            zero_i32,
+                        );
+                    let output_y = oy_num / broadcast_scalar(stride_y, const_shape![128]);
+                    for kx in 0i32..kernel_size {
+                        let kx_tile: Tile<i32, { [128] }> = broadcast_scalar(kx, const_shape![128]);
+                        let ox_num = input_x + broadcast_scalar(padding, const_shape![128])
+                            - kx_tile * broadcast_scalar(dilation, const_shape![128]);
+                        let ox_valid = ge_tile(ox_num, zero_i32)
+                            & eq_tile(
+                                ox_num % broadcast_scalar(stride_x, const_shape![128]),
+                                zero_i32,
+                            );
+                        let output_x = ox_num / broadcast_scalar(stride_x, const_shape![128]);
+                        let valid = input_mask
+                            & oy_valid
+                            & ox_valid
+                            & ge_tile(output_y, zero_i32)
+                            & lt_tile(output_y, broadcast_scalar(output_height, const_shape![128]))
+                            & ge_tile(output_x, zero_i32)
+                            & lt_tile(output_x, broadcast_scalar(output_width, const_shape![128]));
+
+                        let grad_offsets = batch_idx
+                            * broadcast_scalar(filters * output_height * output_width, const_shape![128])
+                            + filter_idx * output_plane_tile
+                            + output_y * output_width_tile
+                            + output_x;
+                        let safe_grad_offsets = select(valid, grad_offsets, zero_i32);
+                        let grad_src: PointerTile<*mut f32, { [128] }> =
+                            output_grad_ptrs.offset_tile(safe_grad_offsets);
+                        let grad_tile: (Tile<f32, { [128] }>, Token) = load_ptr_tko(
+                            grad_src,
+                            "weak",
+                            "tl_blk",
+                            Some(valid),
+                            Some(0.0f32),
+                            None,
+                            None,
+                        );
+
+                        let weight_offsets =
+                            ((filter_idx * channels_per_group_tile + input_channel_in_group)
+                                * kernel_size_tile
+                                + ky_tile)
+                                * kernel_size_tile
+                                + kx_tile;
+                        let weight_src: PointerTile<*mut f32, { [128] }> =
+                            weight_ptrs.offset_tile(weight_offsets);
+                        let weight_tile: (Tile<f32, { [128] }>, Token) = load_ptr_tko(
+                            weight_src,
+                            "weak",
+                            "tl_blk",
+                            Some(input_mask),
+                            Some(0.0f32),
+                            None,
+                            None,
+                        );
+                        acc = acc + grad_tile.0 * weight_tile.0;
+                    }
+                }
+            }
+
+            let dst: PointerTile<*mut f32, { [128] }> = input_grad_ptrs.offset_tile(input_idx);
+            let _store_token: Token =
+                store_ptr_tko(dst, acc, "weak", "tl_blk", Some(input_mask), None, None);
+        }
+    }
+
+    #[cutile::entry()]
+    unsafe fn conv2d_backward_weights_flat(
+        weight_grad_ptr: *mut f32,
+        input_ptr: *mut f32,
+        output_grad_ptr: *mut f32,
+        weight_len: i32,
+        input_channels: i32,
+        input_height: i32,
+        input_width: i32,
+        filters: i32,
+        output_height: i32,
+        output_width: i32,
+        kernel_size: i32,
+        stride_x: i32,
+        stride_y: i32,
+        dilation: i32,
+        padding: i32,
+        _groups: i32,
+        batch: i32,
+        channels_per_group: i32,
+        filters_per_group: i32,
+    ) {
+        let grid = get_num_tile_blocks();
+        let pid = get_tile_block_id();
+
+        let weight_grad_root: PointerTile<*mut f32, { [] }> = pointer_to_tile(weight_grad_ptr);
+        let weight_grad_base: PointerTile<*mut f32, { [1] }> = weight_grad_root.reshape(const_shape![1]);
+        let weight_grad_ptrs: PointerTile<*mut f32, { [128] }> =
+            weight_grad_base.broadcast(const_shape![128]);
+        let input_root: PointerTile<*mut f32, { [] }> = pointer_to_tile(input_ptr);
+        let input_base: PointerTile<*mut f32, { [1] }> = input_root.reshape(const_shape![1]);
+        let input_ptrs: PointerTile<*mut f32, { [128] }> = input_base.broadcast(const_shape![128]);
+        let output_grad_root: PointerTile<*mut f32, { [] }> = pointer_to_tile(output_grad_ptr);
+        let output_grad_base: PointerTile<*mut f32, { [1] }> = output_grad_root.reshape(const_shape![1]);
+        let output_grad_ptrs: PointerTile<*mut f32, { [128] }> =
+            output_grad_base.broadcast(const_shape![128]);
+
+        let weight_len_tile: Tile<i32, { [128] }> = broadcast_scalar(weight_len, const_shape![128]);
+        let input_plane_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(input_height * input_width, const_shape![128]);
+        let input_width_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(input_width, const_shape![128]);
+        let output_plane_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(output_height * output_width, const_shape![128]);
+        let output_width_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(output_width, const_shape![128]);
+        let channels_per_group_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(channels_per_group, const_shape![128]);
+        let filters_per_group_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(filters_per_group, const_shape![128]);
+        let kernel_size_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(kernel_size, const_shape![128]);
+        let input_batch_stride_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(input_channels * input_height * input_width, const_shape![128]);
+        let output_batch_stride_tile: Tile<i32, { [128] }> =
+            broadcast_scalar(filters * output_height * output_width, const_shape![128]);
+        let zero_i32: Tile<i32, { [128] }> = broadcast_scalar(0i32, const_shape![128]);
+
+        let start: i32 = pid.0 * 128i32;
+        let step: i32 = grid.0 * 128i32;
+        for offset in (start..weight_len).step_by(step as usize) {
+            let weight_idx: Tile<i32, { [128] }> =
+                iota(const_shape![128]) + broadcast_scalar(offset, const_shape![128]);
+            let weight_mask: Tile<bool, { [128] }> = lt_tile(weight_idx, weight_len_tile);
+
+            let filter_idx = weight_idx / (channels_per_group_tile * kernel_size_tile * kernel_size_tile);
+            let filter_rem = weight_idx % (channels_per_group_tile * kernel_size_tile * kernel_size_tile);
+            let input_channel_in_group = filter_rem / (kernel_size_tile * kernel_size_tile);
+            let kernel_rem = filter_rem % (kernel_size_tile * kernel_size_tile);
+            let ky = kernel_rem / kernel_size_tile;
+            let kx = kernel_rem % kernel_size_tile;
+            let group_idx = filter_idx / filters_per_group_tile;
+            let input_channel = group_idx * channels_per_group_tile + input_channel_in_group;
+
+            let mut acc: Tile<f32, { [128] }> = constant(0.0f32, const_shape![128]);
+            for batch_idx_scalar in 0i32..batch {
+                let batch_idx: Tile<i32, { [128] }> =
+                    broadcast_scalar(batch_idx_scalar, const_shape![128]);
+                for output_y_scalar in 0i32..output_height {
+                    let output_y: Tile<i32, { [128] }> =
+                        broadcast_scalar(output_y_scalar, const_shape![128]);
+                    let input_y = output_y * broadcast_scalar(stride_y, const_shape![128])
+                        + ky * broadcast_scalar(dilation, const_shape![128])
+                        - broadcast_scalar(padding, const_shape![128]);
+                    let y_valid = ge_tile(input_y, zero_i32)
+                        & lt_tile(input_y, broadcast_scalar(input_height, const_shape![128]));
+                    for output_x_scalar in 0i32..output_width {
+                        let output_x: Tile<i32, { [128] }> =
+                            broadcast_scalar(output_x_scalar, const_shape![128]);
+                        let input_x = output_x * broadcast_scalar(stride_x, const_shape![128])
+                            + kx * broadcast_scalar(dilation, const_shape![128])
+                            - broadcast_scalar(padding, const_shape![128]);
+                        let valid = weight_mask
+                            & y_valid
+                            & ge_tile(input_x, zero_i32)
+                            & lt_tile(input_x, broadcast_scalar(input_width, const_shape![128]));
+
+                        let input_offsets = batch_idx * input_batch_stride_tile
+                            + input_channel * input_plane_tile
+                            + input_y * input_width_tile
+                            + input_x;
+                        let safe_input_offsets = select(valid, input_offsets, zero_i32);
+                        let input_src: PointerTile<*mut f32, { [128] }> =
+                            input_ptrs.offset_tile(safe_input_offsets);
+                        let input_tile: (Tile<f32, { [128] }>, Token) = load_ptr_tko(
+                            input_src,
+                            "weak",
+                            "tl_blk",
+                            Some(valid),
+                            Some(0.0f32),
+                            None,
+                            None,
+                        );
+
+                        let grad_offsets = batch_idx * output_batch_stride_tile
+                            + filter_idx * output_plane_tile
+                            + output_y * output_width_tile
+                            + output_x;
+                        let output_grad_src: PointerTile<*mut f32, { [128] }> =
+                            output_grad_ptrs.offset_tile(grad_offsets);
+                        let grad_tile: (Tile<f32, { [128] }>, Token) = load_ptr_tko(
+                            output_grad_src,
+                            "weak",
+                            "tl_blk",
+                            Some(weight_mask),
+                            Some(0.0f32),
+                            None,
+                            None,
+                        );
+                        acc = acc + input_tile.0 * grad_tile.0;
+                    }
+                }
+            }
+
+            let dst: PointerTile<*mut f32, { [128] }> = weight_grad_ptrs.offset_tile(weight_idx);
+            let _store_token: Token =
+                store_ptr_tko(dst, acc, "weak", "tl_blk", Some(weight_mask), None, None);
         }
     }
 }

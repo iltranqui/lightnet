@@ -1,9 +1,12 @@
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use darknet_core::{
-    DetectionOptions, ExecutableNetwork, Network, PlanarRgbImage, decode_yolo_detections,
-    inspect_weights_file, load_names_file,
+    DataConfig, DetectionOptions, ExecutableNetwork, GpuExecutableNetwork, Network,
+    PlanarRgbImage, Tensor, compute_learning_rate, decode_yolo_detections, inspect_weights_file,
+    load_names_file, load_paths_file, load_training_batch_from_paths, save_weights,
 };
+use darknet_cuda_cutile::CutileBackend;
 
 fn main() {
     if let Err(err) = run() {
@@ -21,6 +24,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     match command.as_str() {
+        "detector" => {
+            let subcommand = required_arg(args.next(), "detector subcommand")?;
+            match subcommand.as_str() {
+                "train" => {
+                    let first_path = required_arg(args.next(), "cfg or data path")?;
+                    let second_path = required_arg(args.next(), "data or cfg path")?;
+                    let (cfg, data) = classify_detector_train_paths(&first_path, &second_path)?;
+                    let mut weights = None;
+                    let mut flags = Vec::new();
+                    for arg in args {
+                        if arg.starts_with('-') {
+                            flags.push(arg);
+                        } else if weights.is_none() {
+                            weights = Some(arg);
+                        } else {
+                            return Err(format!(
+                                "unexpected detector train argument: {arg}"
+                            )
+                            .into());
+                        }
+                    }
+                    run_detector_train(&cfg, &data, weights.as_deref(), &flags)?;
+                }
+                other => {
+                    return Err(format!("unknown detector subcommand: {other}").into());
+                }
+            }
+        }
         "version" => {
             println!("darknet-rs {}", env!("CARGO_PKG_VERSION"));
             println!("cutile reference {}", darknet_cuda::CUTILE_RS_REFERENCE);
@@ -96,6 +127,32 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             for head in &result.yolo_heads {
                 println!("#{:>3} yolo {}", head.layer_index, head.output.shape);
             }
+        }
+        "forward-backward-dummy" => {
+            let cfg = required_arg(args.next(), "cfg path")?;
+            let next_arg = args.next();
+            let (maybe_weights, seed_mode) = match next_arg.as_deref() {
+                Some("auto" | "yolo" | "final") => (None, next_arg.expect("seed mode present")),
+                Some("-") => (
+                    None,
+                    args.next().unwrap_or_else(|| "auto".to_owned()),
+                ),
+                Some(_) => (next_arg, args.next().unwrap_or_else(|| "auto".to_owned())),
+                None => (None, "auto".to_owned()),
+            };
+            let mut executable = ExecutableNetwork::from_path(&cfg)?;
+            if let Some(weights) = maybe_weights {
+                let header = executable.load_weights_file(&weights)?;
+                println!(
+                    "loaded weights {}.{}.{} seen={}",
+                    header.major, header.minor, header.revision, header.seen
+                );
+            } else {
+                println!("running with zero-initialized weights");
+            }
+
+            let input = executable.zero_input();
+            print_forward_backward_summary(&mut executable, &input, &seed_mode)?;
         }
         "detect-image" => {
             let cfg = required_arg(args.next(), "cfg path")?;
@@ -195,15 +252,364 @@ fn optional_f32(
     }
 }
 
+fn classify_detector_train_paths(
+    first_path: &str,
+    second_path: &str,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let first_ext = Path::new(first_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default();
+    let second_ext = Path::new(second_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default();
+
+    match (first_ext, second_ext) {
+        ("cfg", "data") => Ok((first_path.to_owned(), second_path.to_owned())),
+        ("data", "cfg") => Ok((second_path.to_owned(), first_path.to_owned())),
+        _ => Err(format!(
+            "detector train expects one .cfg path and one .data path, got {first_path} and {second_path}"
+        )
+        .into()),
+    }
+}
+
+fn run_detector_train(
+    cfg: &str,
+    data: &str,
+    maybe_weights: Option<&str>,
+    flags: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !Path::new(cfg).exists() {
+        return Err(format!("cfg path does not exist: {cfg}").into());
+    }
+    if !Path::new(data).exists() {
+        return Err(format!("data path does not exist: {data}").into());
+    }
+
+    println!("detector train");
+    println!("cfg {}", cfg);
+    println!("data {}", data);
+    if !flags.is_empty() {
+        println!("flags {}", flags.join(" "));
+    }
+
+    match CutileBackend::new(0) {
+        Ok(backend) => {
+            println!("gpu backend cutile device=0");
+            run_detector_train_gpu(cfg, data, maybe_weights, backend)
+        }
+        Err(err) => {
+            println!("gpu backend unavailable ({err}), falling back to cpu");
+            run_detector_train_cpu(cfg, data, maybe_weights)
+        }
+    }
+}
+
+fn run_detector_train_cpu(
+    cfg: &str,
+    data: &str,
+    maybe_weights: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let data_config = DataConfig::from_path(data)?;
+    let mut executable = ExecutableNetwork::from_path(cfg)?;
+    let mut seen = 0u64;
+    if let Some(weights) = maybe_weights {
+        let header = executable.load_weights_file(weights)?;
+        seen = header.seen;
+        println!(
+            "loaded weights {}.{}.{} seen={}",
+            header.major, header.minor, header.revision, header.seen
+        );
+    } else {
+        println!("running with zero-initialized weights");
+    }
+
+    let mut train_images = load_paths_file(data_config.required_train_list()?)?;
+    println!(
+        "loaded {} images from {}",
+        train_images.len(),
+        data_config.required_train_list()?.display()
+    );
+    println!(
+        "batch={} subdivisions={} max_batches={} lr={:.6} momentum={:.3}",
+        executable.network.net.batch,
+        executable.network.net.subdivisions,
+        executable.network.net.max_batches,
+        executable.network.net.learning_rate,
+        executable.network.net.momentum
+    );
+
+    let backup_dir = data_config
+        .backup
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."));
+    fs::create_dir_all(&backup_dir)?;
+    let base_name = cfg_base_name(cfg);
+    let images_per_iteration =
+        executable.network.net.batch.max(1) * executable.network.net.subdivisions.max(1);
+    let mut batch_num = if images_per_iteration == 0 {
+        0usize
+    } else {
+        (seen as usize) / images_per_iteration
+    };
+    let mut image_cursor = if train_images.is_empty() {
+        0usize
+    } else {
+        (batch_num * images_per_iteration) % train_images.len()
+    };
+
+    while executable.network.net.max_batches == 0 || batch_num < executable.network.net.max_batches
+    {
+        let lr = compute_learning_rate(&executable.network.net, batch_num);
+        for subdivision in 0..executable.network.net.subdivisions.max(1) {
+            let start_index = image_cursor + subdivision * executable.network.net.batch.max(1);
+            let batch = load_training_batch_from_paths(
+                &executable.network,
+                &data_config,
+                &train_images,
+                start_index,
+            )?;
+            let forward = executable.forward(&batch.input)?;
+            let seeds = make_backward_seeds(&executable.network, &forward, "auto")?;
+            executable.backward_accumulate_seeded(&batch.input, &forward, &seeds)?;
+        }
+        executable.update_weights(
+            lr,
+            executable.network.net.momentum,
+            executable.network.net.decay,
+            executable.network.net.batch.max(1),
+        );
+
+        batch_num += 1;
+        seen += images_per_iteration as u64;
+        image_cursor += images_per_iteration;
+        if image_cursor >= train_images.len() {
+            shuffle_paths(&mut train_images, batch_num as u64 + 1);
+            image_cursor %= train_images.len();
+        }
+
+        println!("batch {} lr {:.6} loss N/A", batch_num, lr);
+
+        if batch_num % 1000 == 0 {
+            let checkpoint = backup_dir.join(format!("{base_name}_{batch_num}.weights"));
+            save_weights(&executable.network, &executable.params, &checkpoint, seen)?;
+            println!("saved {}", checkpoint.display());
+        }
+
+        if executable.network.net.max_batches != 0
+            && batch_num >= executable.network.net.max_batches
+        {
+            break;
+        }
+    }
+
+    let final_checkpoint = backup_dir.join(format!("{base_name}_final.weights"));
+    save_weights(&executable.network, &executable.params, &final_checkpoint, seen)?;
+    println!("saved {}", final_checkpoint.display());
+    Ok(())
+}
+
+fn run_detector_train_gpu(
+    cfg: &str,
+    data: &str,
+    maybe_weights: Option<&str>,
+    backend: CutileBackend,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let data_config = DataConfig::from_path(data)?;
+    let mut executable = GpuExecutableNetwork::from_path(cfg, backend)?;
+    let mut seen = 0u64;
+    if let Some(weights) = maybe_weights {
+        let header = executable.load_weights_file(weights)?;
+        seen = header.seen;
+        println!(
+            "loaded weights {}.{}.{} seen={}",
+            header.major, header.minor, header.revision, header.seen
+        );
+    } else {
+        println!("running with zero-initialized weights");
+    }
+    executable.init_train_buffers_gpu()?;
+    println!("allocated GPU params and train buffers");
+
+    let mut train_images = load_paths_file(data_config.required_train_list()?)?;
+    println!(
+        "loaded {} images from {}",
+        train_images.len(),
+        data_config.required_train_list()?.display()
+    );
+    println!(
+        "batch={} subdivisions={} max_batches={} lr={:.6} momentum={:.3}",
+        executable.network.net.batch,
+        executable.network.net.subdivisions,
+        executable.network.net.max_batches,
+        executable.network.net.learning_rate,
+        executable.network.net.momentum
+    );
+
+    let backup_dir = data_config
+        .backup
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."));
+    fs::create_dir_all(&backup_dir)?;
+    let base_name = cfg_base_name(cfg);
+    let images_per_iteration =
+        executable.network.net.batch.max(1) * executable.network.net.subdivisions.max(1);
+    let mut batch_num = if images_per_iteration == 0 {
+        0usize
+    } else {
+        (seen as usize) / images_per_iteration
+    };
+    let mut image_cursor = if train_images.is_empty() {
+        0usize
+    } else {
+        (batch_num * images_per_iteration) % train_images.len()
+    };
+
+    while executable.network.net.max_batches == 0 || batch_num < executable.network.net.max_batches
+    {
+        let lr = compute_learning_rate(&executable.network.net, batch_num);
+        // NOTE: do NOT zero train buffers here. After update_weights_gpu, the buffers
+        // hold momentum * previous_gradient (C++ weight_updates *= momentum). Zeroing
+        // would destroy the momentum carry. init_train_buffers_gpu() above initialises
+        // them to zero only once at startup, which is correct.
+        for subdivision in 0..executable.network.net.subdivisions.max(1) {
+            let start_index = image_cursor + subdivision * executable.network.net.batch.max(1);
+            let batch = load_training_batch_from_paths(
+                &executable.network,
+                &data_config,
+                &train_images,
+                start_index,
+            )?;
+            let forward = executable.forward_with_state(&batch.input)?;
+            let seeds = make_backward_seeds(&executable.network, &forward.cpu_forward, "auto")?;
+            executable.backward_accumulate_seeded_gpu(&forward, &seeds)?;
+        }
+        executable.update_weights_gpu(
+            lr,
+            executable.network.net.momentum,
+            executable.network.net.decay,
+            executable.network.net.batch.max(1),
+        )?;
+
+        batch_num += 1;
+        seen += images_per_iteration as u64;
+        image_cursor += images_per_iteration;
+        if image_cursor >= train_images.len() {
+            shuffle_paths(&mut train_images, batch_num as u64 + 1);
+            image_cursor %= train_images.len();
+        }
+
+        println!("batch {} lr {:.6} loss N/A", batch_num, lr);
+
+        if batch_num % 1000 == 0 {
+            let checkpoint = backup_dir.join(format!("{base_name}_{batch_num}.weights"));
+            save_weights(&executable.network, &executable.params, &checkpoint, seen)?;
+            println!("saved {}", checkpoint.display());
+        }
+
+        if executable.network.net.max_batches != 0
+            && batch_num >= executable.network.net.max_batches
+        {
+            break;
+        }
+    }
+
+    let final_checkpoint = backup_dir.join(format!("{base_name}_final.weights"));
+    save_weights(&executable.network, &executable.params, &final_checkpoint, seen)?;
+    println!("saved {}", final_checkpoint.display());
+    Ok(())
+}
+
+fn print_forward_backward_summary(
+    executable: &mut ExecutableNetwork,
+    input: &Tensor,
+    seed_mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let forward = executable.forward(input)?;
+    let seeds = make_backward_seeds(&executable.network, &forward, seed_mode)?;
+    executable.zero_train_buffers();
+    let backward = executable.backward_accumulate_seeded(input, &forward, &seeds)?;
+    let input_grad_l1 = backward
+        .input_gradient
+        .data
+        .iter()
+        .map(|value| value.abs())
+        .sum::<f32>();
+    let active_seed_layers = seeds.iter().flatten().count();
+    let param_grad_layers = executable
+        .train_buffers
+        .iter()
+        .filter(|params| match params {
+            darknet_core::LayerTrainBuffers::Convolutional(conv) => {
+                conv.bias_updates.iter().any(|value| *value != 0.0)
+                    || conv.weight_updates.iter().any(|value| *value != 0.0)
+                    || conv
+                        .batch_norm
+                        .as_ref()
+                        .is_some_and(|bn| bn.scale_updates.iter().any(|value| *value != 0.0))
+            }
+            darknet_core::LayerTrainBuffers::Connected(connected) => {
+                connected.bias_updates.iter().any(|value| *value != 0.0)
+                    || connected.weight_updates.iter().any(|value| *value != 0.0)
+            }
+            darknet_core::LayerTrainBuffers::None => false,
+        })
+        .count();
+
+    println!("layers executed {}", forward.layer_outputs.len());
+    println!("seeded layers {}", active_seed_layers);
+    println!("yolo heads {}", forward.yolo_heads.len());
+    println!("input gradient {}", backward.input_gradient.shape);
+    println!("input gradient l1 {:.6}", input_grad_l1);
+    println!("parameter-gradient layers {}", param_grad_layers);
+    Ok(())
+}
+
+fn make_backward_seeds(
+    network: &Network,
+    forward: &darknet_core::ForwardResult,
+    seed_mode: &str,
+) -> Result<Vec<Option<Tensor>>, Box<dyn std::error::Error>> {
+    let mut seeds = vec![None; network.layers.len()];
+    match seed_mode {
+        "auto" | "yolo" if !forward.yolo_heads.is_empty() => {
+            for head in &forward.yolo_heads {
+                seeds[head.layer_index] = Some(Tensor::filled(head.output.shape, 1.0));
+            }
+        }
+        "auto" | "final" => {
+            let final_output = forward
+                .final_output()
+                .ok_or("network produced no layer outputs")?;
+            let final_index = network
+                .layers
+                .len()
+                .checked_sub(1)
+                .ok_or("network has no layers")?;
+            seeds[final_index] = Some(Tensor::filled(final_output.shape, 1.0));
+        }
+        other => {
+            return Err(
+                format!("invalid seed mode: {other} (expected auto, yolo, or final)").into(),
+            );
+        }
+    }
+    Ok(seeds)
+}
+
 fn print_usage() {
     println!("darknet-rs <command> [args]");
     println!("commands:");
+    println!("  detector train <cfg|data> <data|cfg> [weights] [flags...]");
     println!("  version");
     println!("  cfg-validate <cfg>");
     println!("  cfg-summary <cfg>");
     println!("  names <names>");
     println!("  weights-inspect <cfg> <weights>");
     println!("  forward-dummy <cfg> [weights]");
+    println!("  forward-backward-dummy <cfg> [weights] [auto|yolo|final]");
     println!("  detect-image <cfg> <weights> <names> <image> [thresh] [nms] [letterbox|resize]");
 }
 
@@ -240,4 +646,57 @@ fn print_network_summary(network: &Network) {
 
 fn display_path(path: &Path) -> String {
     path.display().to_string()
+}
+
+fn cfg_base_name(cfg: &str) -> String {
+    Path::new(cfg)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("darknet")
+        .to_owned()
+}
+
+fn shuffle_paths(paths: &mut [PathBuf], seed: u64) {
+    if paths.len() < 2 {
+        return;
+    }
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+    for i in (1..paths.len()).rev() {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let j = (state.wrapping_mul(0x2545_F491_4F6C_DD1D) as usize) % (i + 1);
+        paths.swap(i, j);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_detector_train_paths;
+
+    #[test]
+    fn detector_train_accepts_cfg_then_data() {
+        let (cfg, data) = classify_detector_train_paths("model.cfg", "dataset.data")
+            .expect("paths should classify");
+        assert_eq!(cfg, "model.cfg");
+        assert_eq!(data, "dataset.data");
+    }
+
+    #[test]
+    fn detector_train_accepts_data_then_cfg() {
+        let (cfg, data) = classify_detector_train_paths("dataset.data", "model.cfg")
+            .expect("paths should classify");
+        assert_eq!(cfg, "model.cfg");
+        assert_eq!(data, "dataset.data");
+    }
+
+    #[test]
+    fn detector_train_rejects_invalid_path_pair() {
+        let err = classify_detector_train_paths("model.cfg", "weights.weights")
+            .expect_err("pair should be rejected");
+        assert!(
+            err.to_string()
+                .contains("expects one .cfg path and one .data path")
+        );
+    }
 }

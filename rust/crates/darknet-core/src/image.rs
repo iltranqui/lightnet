@@ -3,6 +3,10 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 use crate::model::TensorShape;
+use image::imageops::{self, FilterType};
+use image::{ImageReader, Rgb, RgbImage};
+use imageproc::drawing::draw_filled_rect_mut;
+use imageproc::rect::Rect;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlanarRgbImage {
@@ -13,26 +17,18 @@ pub struct PlanarRgbImage {
 impl PlanarRgbImage {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let bytes = fs::read(path)?;
-        let ext = path
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(|value| value.to_ascii_lowercase());
-
-        match ext.as_deref() {
-            Some("ppm") | Some("pnm") | Some("pgm") => {
-                let (width, height, rgb) = decode_netpbm(&bytes)?;
-                Self::from_interleaved_rgb_u8(width, height, &rgb)
-            }
-            Some("bmp") => {
-                let (width, height, rgb) = decode_bmp(&bytes)?;
-                Self::from_interleaved_rgb_u8(width, height, &rgb)
-            }
-            _ => Err(Error::InvalidConfig(format!(
-                "unsupported image format for {}: expected .ppm/.pgm/.pnm or .bmp",
-                path.display()
-            ))),
-        }
+        let image = ImageReader::open(path)?
+            .with_guessed_format()
+            .map_err(|err| Error::InvalidConfig(format!("failed to guess image format for {}: {err}", path.display())))?
+            .decode()
+            .map_err(|err| {
+                Error::InvalidConfig(format!(
+                    "unsupported image format for {}: {err}",
+                    path.display()
+                ))
+            })?
+            .to_rgb8();
+        Self::from_rgb_image(&image)
     }
 
     pub fn from_interleaved_rgb_u8(width: usize, height: usize, bytes: &[u8]) -> Result<Self> {
@@ -76,62 +72,14 @@ impl PlanarRgbImage {
         if self.shape.width == width && self.shape.height == height {
             return Ok(self.clone());
         }
-
-        let channels = self.shape.channels;
-        let width_scale = if width == 1 {
-            0.0
-        } else {
-            (self.shape.width - 1) as f32 / (width - 1) as f32
-        };
-        let height_scale = if height == 1 {
-            0.0
-        } else {
-            (self.shape.height - 1) as f32 / (height - 1) as f32
-        };
-        let mut part = vec![0.0; width * self.shape.height * channels];
-        let mut data = vec![0.0; width * height * channels];
-
-        for channel in 0..channels {
-            for src_y in 0..self.shape.height {
-                for dst_x in 0..width {
-                    let value = if dst_x + 1 == width || self.shape.width == 1 {
-                        self.get(channel, src_y, self.shape.width - 1)
-                    } else {
-                        let sample_x = dst_x as f32 * width_scale;
-                        let ix = sample_x as usize;
-                        let dx = sample_x - ix as f32;
-                        (1.0 - dx) * self.get(channel, src_y, ix)
-                            + dx * self.get(channel, src_y, ix + 1)
-                    };
-                    let idx = channel * width * self.shape.height + src_y * width + dst_x;
-                    part[idx] = value;
-                }
-            }
-        }
-
-        for channel in 0..channels {
-            for dst_y in 0..height {
-                let sample_y = dst_y as f32 * height_scale;
-                let iy = sample_y as usize;
-                let dy = sample_y - iy as f32;
-                for dst_x in 0..width {
-                    let part_idx = channel * width * self.shape.height + iy * width + dst_x;
-                    let mut value = (1.0 - dy) * part[part_idx];
-                    if dst_y + 1 != height && self.shape.height != 1 {
-                        let next_idx =
-                            channel * width * self.shape.height + (iy + 1) * width + dst_x;
-                        value += dy * part[next_idx];
-                    }
-                    let dst_idx = channel * width * height + dst_y * width + dst_x;
-                    data[dst_idx] = value;
-                }
-            }
-        }
-
-        Ok(Self {
-            shape: TensorShape::new(width, height, channels, 1),
-            data,
-        })
+        let rgb = self.to_rgb_image()?;
+        let resized = imageops::resize(
+            &rgb,
+            width as u32,
+            height as u32,
+            FilterType::Triangle,
+        );
+        Self::from_rgb_image(&resized)
     }
 
     pub fn letterbox(&self, width: usize, height: usize) -> Result<Self> {
@@ -144,30 +92,58 @@ impl PlanarRgbImage {
         let (new_width, new_height) =
             fit_inside(self.shape.width, self.shape.height, width, height)?;
         let resized = self.resize(new_width, new_height)?;
-        let mut data = vec![0.5; width * height * self.shape.channels];
+        let resized_rgb = resized.to_rgb_image()?;
+        let mut canvas = RgbImage::new(width as u32, height as u32);
+        draw_filled_rect_mut(
+            &mut canvas,
+            Rect::at(0, 0).of_size(width as u32, height as u32),
+            Rgb([128, 128, 128]),
+        );
         let x_offset = (width - new_width) / 2;
         let y_offset = (height - new_height) / 2;
-
-        for channel in 0..self.shape.channels {
-            for y in 0..new_height {
-                for x in 0..new_width {
-                    let src_idx = channel * new_width * new_height + y * new_width + x;
-                    let dst_idx =
-                        channel * width * height + (y + y_offset) * width + (x + x_offset);
-                    data[dst_idx] = resized.data[src_idx];
-                }
-            }
-        }
-
-        Ok(Self {
-            shape: TensorShape::new(width, height, self.shape.channels, 1),
-            data,
-        })
+        imageops::overlay(&mut canvas, &resized_rgb, x_offset as i64, y_offset as i64);
+        Self::from_rgb_image(&canvas)
     }
 
     pub fn get(&self, channel: usize, y: usize, x: usize) -> f32 {
         let plane = self.shape.width * self.shape.height;
         self.data[channel * plane + y * self.shape.width + x]
+    }
+
+    fn from_rgb_image(image: &RgbImage) -> Result<Self> {
+        Self::from_interleaved_rgb_u8(
+            image.width() as usize,
+            image.height() as usize,
+            image.as_raw(),
+        )
+    }
+
+    fn to_rgb_image(&self) -> Result<RgbImage> {
+        if self.shape.channels != 3 {
+            return Err(Error::InvalidConfig(format!(
+                "expected 3 channels for RGB conversion, got {}",
+                self.shape.channels
+            )));
+        }
+
+        let width = self.shape.width;
+        let height = self.shape.height;
+        let plane = width * height;
+        let mut bytes = vec![0u8; plane * 3];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                let dst = idx * 3;
+                bytes[dst] = (self.data[idx].clamp(0.0, 1.0) * 255.0).round() as u8;
+                bytes[dst + 1] = (self.data[plane + idx].clamp(0.0, 1.0) * 255.0).round() as u8;
+                bytes[dst + 2] =
+                    (self.data[plane * 2 + idx].clamp(0.0, 1.0) * 255.0).round() as u8;
+            }
+        }
+
+        RgbImage::from_raw(width as u32, height as u32, bytes).ok_or_else(|| {
+            Error::InvalidConfig("failed to construct RGB image buffer".to_owned())
+        })
     }
 }
 

@@ -34,13 +34,28 @@ impl Display for TensorShape {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct NetConfig {
     pub width: usize,
     pub height: usize,
     pub channels: usize,
     pub batch: usize,
     pub subdivisions: usize,
+    pub learning_rate: f32,
+    pub momentum: f32,
+    pub decay: f32,
+    pub max_batches: usize,
+    pub burn_in: usize,
+    pub policy: LrPolicy,
+    pub steps: Vec<usize>,
+    pub scales: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LrPolicy {
+    Constant,
+    Steps,
+    Poly,
 }
 
 impl NetConfig {
@@ -63,12 +78,48 @@ impl NetConfig {
             )));
         }
 
+        let policy = match section.get_str("policy", "constant").to_ascii_lowercase().as_str() {
+            "constant" => LrPolicy::Constant,
+            "steps" => LrPolicy::Steps,
+            "poly" => LrPolicy::Poly,
+            other => {
+                return Err(Error::InvalidConfig(format!(
+                    "unsupported learning rate policy {other} in [net]"
+                )));
+            }
+        };
+        let steps = section
+            .get("steps")
+            .map(|_| section.get_usize_list("steps"))
+            .transpose()?
+            .unwrap_or_default();
+        let scales = section
+            .get("scales")
+            .map(|_| section.get_f32_list("scales"))
+            .transpose()?
+            .unwrap_or_default();
+        if matches!(policy, LrPolicy::Steps) && !steps.is_empty() && steps.len() != scales.len() {
+            return Err(Error::InvalidConfig(format!(
+                "[net] steps/scales length mismatch: {} vs {}",
+                steps.len(),
+                scales.len()
+            )));
+        }
+
         Ok(Self {
             width,
             height,
             channels,
             batch: section.get_usize("batch", 1)?,
             subdivisions: section.get_usize("subdivisions", 1)?,
+            learning_rate: section.get_f32("learning_rate", 0.001)?,
+            momentum: section.get_f32("momentum", 0.9)?,
+            decay: section.get_f32("decay", 0.0005)?,
+            max_batches: section.get_usize("max_batches", 0)?,
+            burn_in: section.get_usize("burn_in", 0)?,
+            policy,
+            steps,
+            scales,
         })
     }
 
@@ -126,6 +177,7 @@ pub struct ConvolutionalSpec {
     pub dilation: usize,
     pub padding: usize,
     pub groups: usize,
+    pub share_index: Option<usize>,
     pub batch_normalize: bool,
     pub activation: Activation,
 }
@@ -330,6 +382,9 @@ impl Layer {
     pub fn weights(&self) -> Option<LayerWeights> {
         match &self.kind {
             LayerKind::Convolutional(spec) => {
+                if spec.share_index.is_some() {
+                    return None;
+                }
                 let filters = spec.filters;
                 let kernel_area = spec.size * spec.size;
                 let grouped_channels = self.input_shape.channels / spec.groups.max(1);
@@ -461,6 +516,16 @@ impl Network {
             .map(|weights| weights.parameter_count())
             .sum()
     }
+
+    pub fn with_batch(&self, batch: usize) -> Self {
+        let mut network = self.clone();
+        network.net.batch = batch;
+        for layer in &mut network.layers {
+            layer.input_shape.batch = batch;
+            layer.output_shape.batch = batch;
+        }
+        network
+    }
 }
 
 fn parse_layer_kind(
@@ -480,15 +545,51 @@ fn parse_layer_kind(
             } else {
                 section.get_usize("padding", 0)?
             };
+            let filters = section.get_usize("filters", 1)?;
+            let groups = section.get_usize("groups", 1)?;
+            let share_index = section
+                .get("share_index")
+                .map(|value| {
+                    let raw = value.parse::<isize>().map_err(|_| {
+                        Error::InvalidConfig(format!(
+                            "invalid share_index for convolutional layer #{layer_index}"
+                        ))
+                    })?;
+                    let source_index = resolve_relative_layer(layer_index, raw)?;
+                    let source_layer =
+                        built_layers
+                            .get(source_index)
+                            .ok_or(Error::InvalidRoute {
+                                layer_index,
+                                reference: raw,
+                            })?;
+                    let LayerKind::Convolutional(source_spec) = &source_layer.kind else {
+                        return Err(Error::InvalidConfig(format!(
+                            "convolutional layer #{layer_index} share_index points to non-convolutional layer #{source_index}"
+                        )));
+                    };
+                    if source_spec.filters != filters
+                        || source_spec.size != size
+                        || source_spec.groups != groups
+                        || source_layer.input_shape.channels != current.channels
+                    {
+                        return Err(Error::InvalidConfig(format!(
+                            "convolutional layer #{layer_index} share_index #{source_index} is incompatible with current weights layout"
+                        )));
+                    }
+                    Ok(source_index)
+                })
+                .transpose()?;
 
             LayerKind::Convolutional(ConvolutionalSpec {
-                filters: section.get_usize("filters", 1)?,
+                filters,
                 size,
                 stride_x: section.get_usize("stride_x", stride)?,
                 stride_y: section.get_usize("stride_y", stride)?,
                 dilation: section.get_usize("dilation", 1)?,
                 padding,
-                groups: section.get_usize("groups", 1)?,
+                groups,
+                share_index,
                 batch_normalize: section.get_i64("batch_normalize", 0)? != 0,
                 activation: Activation::parse(&section.get_str("activation", "logistic")),
             })
@@ -816,7 +917,9 @@ fn pool_dim(input: usize, padding: usize, size: usize, stride: usize) -> usize {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{LayerKind, Network};
+    use crate::cfg::ConfigFile;
+
+    use super::{LayerKind, LrPolicy, Network};
 
     fn repo_cfg(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -844,5 +947,49 @@ mod tests {
             .find(|layer| matches!(layer.kind, LayerKind::Route(_)))
             .expect("expected at least one route layer");
         assert!(route.output_shape.channels > 0);
+    }
+
+    #[test]
+    fn parses_net_training_hyperparameters() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "inline.cfg",
+                r#"
+                    [net]
+                    width=32
+                    height=32
+                    channels=3
+                    batch=8
+                    subdivisions=2
+                    learning_rate=0.01
+                    momentum=0.8
+                    decay=0.0001
+                    burn_in=100
+                    max_batches=900
+                    policy=steps
+                    steps=400,800
+                    scales=0.1,0.1
+
+                    [yolo]
+                    mask=0
+                    anchors=10,13
+                    classes=1
+                    num=1
+                "#,
+            )
+            .expect("cfg parses"),
+        )
+        .expect("network builds");
+
+        assert_eq!(network.net.batch, 8);
+        assert_eq!(network.net.subdivisions, 2);
+        assert_eq!(network.net.learning_rate, 0.01);
+        assert_eq!(network.net.momentum, 0.8);
+        assert_eq!(network.net.decay, 0.0001);
+        assert_eq!(network.net.burn_in, 100);
+        assert_eq!(network.net.max_batches, 900);
+        assert_eq!(network.net.policy, LrPolicy::Steps);
+        assert_eq!(network.net.steps, vec![400, 800]);
+        assert_eq!(network.net.scales, vec![0.1, 0.1]);
     }
 }

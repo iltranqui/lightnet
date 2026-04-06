@@ -1,9 +1,13 @@
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use crate::DARKNET_WEIGHTS_VERSION_MAJOR;
+use crate::DARKNET_WEIGHTS_VERSION_MINOR;
+use crate::DARKNET_WEIGHTS_VERSION_PATCH;
 use crate::error::{Error, Result};
-use crate::model::{Layer, Network};
+use crate::model::{Layer, LayerKind, Network};
+use crate::runtime::LayerParams;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WeightsHeader {
@@ -79,6 +83,60 @@ pub fn inspect_weights_file(
     })
 }
 
+pub fn save_weights(
+    network: &Network,
+    params: &[LayerParams],
+    path: impl AsRef<Path>,
+    seen: u64,
+) -> Result<()> {
+    if params.len() != network.layers.len() {
+        return Err(Error::Weights(format!(
+            "weights parameter count mismatch: expected {}, got {}",
+            network.layers.len(),
+            params.len()
+        )));
+    }
+
+    let mut file = File::create(path)?;
+    file.write_all(&DARKNET_WEIGHTS_VERSION_MAJOR.to_le_bytes())?;
+    file.write_all(&DARKNET_WEIGHTS_VERSION_MINOR.to_le_bytes())?;
+    file.write_all(&DARKNET_WEIGHTS_VERSION_PATCH.to_le_bytes())?;
+    file.write_all(&seen.to_le_bytes())?;
+
+    for (layer, params) in network.layers.iter().zip(params) {
+        match (&layer.kind, params) {
+            (LayerKind::Convolutional(_), LayerParams::Convolutional(conv)) => {
+                write_f32_slice(&mut file, &conv.biases)?;
+                if let Some(batch_norm) = conv.batch_norm.as_ref() {
+                    write_f32_slice(&mut file, &batch_norm.scales)?;
+                    write_f32_slice(&mut file, &batch_norm.rolling_mean)?;
+                    write_f32_slice(&mut file, &batch_norm.rolling_variance)?;
+                }
+                write_f32_slice(&mut file, &conv.weights)?;
+            }
+            (LayerKind::Connected(_), LayerParams::Connected(connected)) => {
+                write_f32_slice(&mut file, &connected.biases)?;
+                write_f32_slice(&mut file, &connected.weights)?;
+                if let Some(batch_norm) = connected.batch_norm.as_ref() {
+                    write_f32_slice(&mut file, &batch_norm.scales)?;
+                    write_f32_slice(&mut file, &batch_norm.rolling_mean)?;
+                    write_f32_slice(&mut file, &batch_norm.rolling_variance)?;
+                }
+            }
+            (_, LayerParams::None) => {}
+            _ => {
+                return Err(Error::Weights(format!(
+                    "layer #{} ({}) and parameter set are inconsistent while saving weights",
+                    layer.index,
+                    layer.kind.name()
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn consume_layer_weights(
     file: &mut File,
     cursor: &mut u64,
@@ -150,6 +208,13 @@ fn read_u64(file: &mut File) -> Result<u64> {
     Ok(u64::from_le_bytes(bytes))
 }
 
+fn write_f32_slice(file: &mut File, values: &[f32]) -> Result<()> {
+    for value in values {
+        file.write_all(&value.to_le_bytes())?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -157,8 +222,9 @@ mod tests {
 
     use crate::cfg::ConfigFile;
     use crate::model::Network;
+    use crate::runtime::{ExecutableNetwork, LayerParams};
 
-    use super::inspect_weights_file;
+    use super::{inspect_weights_file, save_weights};
 
     #[test]
     fn inspects_synthetic_weights_file() {
@@ -196,6 +262,50 @@ mod tests {
         let inspection = inspect_weights_file(&network, &path).expect("inspection should succeed");
         assert_eq!(inspection.trailing_bytes, 0);
         assert_eq!(inspection.header.seen, 123);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_load_weights_round_trip() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                width=1
+                height=1
+                channels=1
+
+                [convolutional]
+                filters=2
+                size=1
+                stride=1
+                batch_normalize=1
+                activation=linear
+            "#,
+        )
+        .expect("cfg parses");
+        let network = Network::from_config(cfg).expect("network builds");
+        let mut executable = ExecutableNetwork::new(network.clone());
+        match &mut executable.params[0] {
+            LayerParams::Convolutional(conv) => {
+                conv.biases = vec![0.25, 0.5];
+                conv.weights = vec![1.5, 2.5];
+                let bn = conv.batch_norm.as_mut().expect("bn exists");
+                bn.scales = vec![3.0, 4.0];
+                bn.rolling_mean = vec![5.0, 6.0];
+                bn.rolling_variance = vec![7.0, 8.0];
+            }
+            other => panic!("unexpected params: {other:?}"),
+        }
+
+        let path = PathBuf::from(std::env::temp_dir()).join("darknet-core-save-load.weights");
+        save_weights(&network, &executable.params, &path, 42).expect("weights save");
+
+        let mut reloaded = ExecutableNetwork::new(network);
+        let header = reloaded.load_weights_file(&path).expect("weights load");
+        assert_eq!(header.seen, 42);
+        assert_eq!(reloaded.params, executable.params);
 
         let _ = fs::remove_file(path);
     }

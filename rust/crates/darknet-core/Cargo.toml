@@ -10,3 +10,5 @@ path = "src/lib.rs"
 
 [dependencies]
 darknet-cuda = { path = "../darknet-cuda" }
+image = "0.25.10"
+imageproc = "0.26.1"

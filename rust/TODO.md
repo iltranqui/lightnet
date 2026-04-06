@@ -1,8 +1,8 @@
 # Rust Darknet CUDA TODO
 
-This document is the implementation plan for the next stage of the Rust port:
-move from a working `cutile-rs` bridge to real Darknet tensor operators and
-eventually end-to-end GPU inference.
+This document tracks the next stage of the Rust port:
+move from a working `cutile-rs` bridge to a C++-aligned Darknet runtime with
+usable GPU inference and training.
 
 ## Current Baseline
 
@@ -28,40 +28,73 @@ Already working:
   - upsample
   - reorg
 - YOLO head output collection during CPU forward execution
+- YOLO decode, CPU NMS, image resize/letterbox preprocessing, and CLI image inference
+- CPU backward/runtime support for:
+  - convolutional
+  - maxpool
+  - route
+  - shortcut
+  - upsample
+- CPU training buffers that follow the C++ per-layer update-buffer scheme
+- CPU `detector train` loop with:
+  - `.data` parsing
+  - image-list loading
+  - batch loading
+  - learning-rate scheduling
+  - SGD with momentum and decay
+  - checkpoint save support
 - optional `cutile-rs` bridge crate
 - typed `f32` tensor upload, zero-init, download, vector-add, and saxpy on the bridge
 - bridge implementation of `darknet_cuda::F32TensorOpsBackend`
 - GPU bridge support for:
   - convolutional
+  - activation backward
+  - route backward
+  - maxpool
+  - maxpool backward
   - route
   - shortcut
   - upsample
+  - upsample backward
+  - bias backward
+  - convolution backward input
+  - convolution backward weights
+  - in-place SGD-style parameter update
   - yolo passthrough staging
 - backend-generic `GpuExecutableNetwork`
+- persistent device-side convolution parameter caching
+- compact GPU forward that can run:
+  - `cfg/yolov4-tiny.cfg`
+  - `cfg/yolov4-tiny-3l.cfg`
+- initial GPU training scaffolding:
+  - retained forward state for backward
+  - device-side train buffers for convolution owners
+  - GPU backward accumulation for the supported subset
+  - GPU weight update path
 - workspace tests covering config parsing, weights inspection, and basic runtime execution
 
 Still missing on the CUDA side:
 
-- maxpool and the remaining pooling family
-- weight upload and persistent device parameter storage
-- full-model GPU forward on:
-  - `cfg/yolov4-tiny.cfg`
-  - `cfg/yolov4-tiny-3l.cfg`
-- CPU/GPU parity checks on real model layers
-- detector decoding and post-processing
-- end-to-end image inference
+- a working cutile/CUDA runtime on the target machine
+- detector training with real YOLO loss instead of placeholder output seeds
+- batch-norm training-time running-stat updates
+- momentum-preserving GPU train buffers across iterations
+- a shared C++-style reusable workspace buffer for CPU/GPU training scratch
+- GPU support for the remaining pooling family and unsupported train-time layers
+- CPU/GPU parity checks on more realistic end-to-end detector slices
 
 ## Goal
 
-Build a minimal but real GPU inference path in Rust that can execute the
-practical YOLO-tiny targets for this repo with `cutile-rs`.
+Build a C++-aligned Rust runtime that can execute the practical YOLO-tiny
+targets for this repo on GPU with `cutile-rs`, then extend that path into real
+detector training.
 
 Primary model targets:
 
 - `cfg/yolov4-tiny.cfg`
 - `cfg/yolov4-tiny-3l.cfg`
 
-The first target should be:
+The first complete GPU target should cover:
 
 - convolution
 - bias add
@@ -72,14 +105,25 @@ The first target should be:
 - maxpool
 - yolo output staging
 
+The first complete training target should additionally cover:
+
+- retained activations for backward
+- device-side update buffers with C++ ownership semantics
+- real YOLO target assignment and loss
+- SGD with momentum on GPU
+
 ## Guiding Principles
 
 - Keep the main `rust` workspace independent from `cutile-rs`.
 - Keep the `cutile` bridge in `bridges/darknet-cuda-cutile`.
-- Start with inference-only support.
 - Prefer correctness and debuggability before optimization.
 - Reuse the existing CPU runtime as the reference implementation for behavior.
 - Add layer-by-layer parity tests before trying full-model parity.
+- Follow the C++ memory and ownership scheme closely:
+  - per-layer parameter ownership
+  - `share_layer`-style aliasing
+  - persistent `*_updates` buffers
+  - shared workspace reuse
 
 ## Phase 1: Harden The CUDA Bridge
 
@@ -221,27 +265,29 @@ model semantics.
 
 Status:
 
-- in progress
+- substantially complete for inference
 
 Already done:
 
 - define a backend-generic `GpuExecutableNetwork`
 - mirror CPU dispatch for:
   - convolutional
+  - maxpool
   - route
   - shortcut
   - upsample
   - yolo passthrough staging
 - keep the GPU path structurally aligned with the CPU runtime for the supported subset
-- add a repo-backed `cfg/yolov4-tiny.cfg` test that identifies `maxpool` as the current first unsupported GPU layer
+- retain compact-forward coverage for:
+  - `cfg/yolov4-tiny.cfg`
+  - `cfg/yolov4-tiny-3l.cfg`
+- add parity and runtime tests for supported GPU layer slices
 
 Tasks:
 
-- allocate activation tensors per layer
-- upload all layer weights during model initialization
-- implement layer dispatch for:
-  - maxpool
-- avoid per-forward temporary parameter uploads for supported weighted layers
+- keep extending coverage to the remaining unsupported runtime layers as needed
+- reduce unnecessary host/device round-trips in the training path
+- add explicit workspace allocation/reuse rules
 
 Deliverable:
 
@@ -300,38 +346,49 @@ forward execution is solid on `cfg/yolov4-tiny.cfg` and `cfg/yolov4-tiny-3l.cfg`
 
 Status:
 
-- not started
+- in progress, but not yet usable for real detector training
 
 Hard prerequisite before training work:
 
-- full GPU forward coverage for:
-  - `cfg/yolov4-tiny.cfg`
-  - `cfg/yolov4-tiny-3l.cfg`
-- parity checks for the supported forward path
-- persistent device weight storage and runtime parameter caching
+- keep GPU backend startup working on the target machine
+- keep parity checks passing for the supported forward path
+- maintain persistent device weight storage and runtime parameter caching
 
 Stage 1: Training-Capable Runtime
 
-- define a training runtime or extend `GpuExecutableNetwork` with train/eval modes
+Done or mostly done:
+
+- extend `GpuExecutableNetwork` with retained forward state for backward
 - keep forward activations needed by backward instead of discarding them after each layer
 - define device-side parameter bundles for:
   - weights
   - biases
   - gradients
-  - optimizer state
-- define workspace/lifetime rules for activations, gradients, and scratch buffers
+
+Still missing:
+
+- explicit train/eval mode split where behavior differs
+- optimizer state beyond basic SGD momentum buffers
+- workspace/lifetime rules for activations, gradients, and scratch buffers
+- preserving GPU momentum buffers across iterations the way C++ does
 
 Stage 2: Backward Ops
 
-- implement backward kernels for:
-  - convolutional
-  - activation
-  - shortcut
-  - route
-  - upsample
-  - maxpool
-- define gradient accumulation rules that match Darknet semantics
-- add CPU-reference checks on synthetic tensors before model-level tests
+Done for the currently supported subset:
+
+- convolutional
+- activation
+- shortcut
+- route
+- upsample
+- maxpool
+- CPU-reference checks on synthetic tensors for the supported subset
+
+Still missing:
+
+- broader layer coverage beyond the current subset
+- more end-to-end backward parity on real detector slices
+- batch-norm training semantics beyond folded-scale handling
 
 Stage 3: YOLO Losses And Targets
 
@@ -342,20 +399,42 @@ Stage 3: YOLO Losses And Targets
   - `cfg/yolov4-tiny-3l.cfg`
 - verify loss values and per-head gradients against the CPU/original Darknet path
 
+Current blocker:
+
+- the training loop still seeds backward with placeholder `1.0` output gradients, so this stage is the main gap between “weight updates happen” and “real detector training”
+
 Stage 4: Optimizers And Updates
 
-- implement SGD with momentum first
-- add weight decay, learning-rate scheduling, and EMA only after basic training works
-- decide whether Adam/AdamW are needed, or whether Darknet-compatible SGD is sufficient
-- support mixed host/device bookkeeping for logging without moving parameter tensors back to CPU
+Done:
+
+- CPU SGD with momentum, decay, and LR scheduling
+- GPU SGD-style in-place parameter update primitive
+
+Still missing:
+
+- preserve GPU momentum buffers across iterations instead of recreating them
+- EMA support
+- broader optimizer/state coverage only if needed after Darknet-compatible SGD is correct
+- cleaner mixed host/device bookkeeping for logging and checkpointing
 
 Stage 5: Data And Training Loop
 
-- add dataset loading and label parsing
-- add batching, shuffling, and epoch iteration
-- add training-time resize/letterbox behavior
-- add augmentation only after non-augmented training is correct
-- add CLI support for training runs and checkpoint saves
+Done on CPU:
+
+- dataset loading and label parsing
+- batching, shuffling, and epoch iteration
+- training-time resize/letterbox behavior
+- CLI support for training runs and checkpoint saves
+
+In progress:
+
+- GPU-backed `detector train` entry that attempts to initialize cutile first
+
+Still missing:
+
+- stable GPU execution on the target machine
+- real YOLO loss integration into the train loop
+- augmentation only after non-augmented training is correct
 
 Stage 6: Verification
 
@@ -374,20 +453,18 @@ Deliverable:
 
 Recommended short-term sequence:
 
-1. implement GPU `maxpool`
-2. add persistent device weight storage and a layer-parameter cache
-3. run `cfg/yolov4-tiny.cfg` and `cfg/yolov4-tiny-3l.cfg` through the GPU runtime past the current `maxpool` boundary
-4. add CPU/GPU parity tests for convolution, route, upsample, and the first real YOLOv4-tiny slices
-5. decide whether later convolution work stays pure `cutile` or switches to im2col + GEMM for some shapes
+1. fix cutile/CUDA backend startup on the target machine so `detector train` stays on GPU instead of falling back to CPU
+2. preserve GPU `*_updates` buffers across iterations so momentum matches the C++ training scheme
+3. port real YOLO target assignment and loss instead of using placeholder backward seeds
+4. add training-time batch-norm running mean/variance updates
+5. add explicit shared workspace allocation/reuse rules for CPU/GPU training scratch
 
-This order attacks the current blocking layer first, then removes the obvious runtime inefficiency before expanding coverage on the two target tiny models.
+This order removes the current operational blocker first, then closes the biggest remaining correctness gaps for real detector training.
 
 ## Non-Goals For Now
 
 Do not spend time on these until inference is solid on `yolov4-tiny` and `yolov4-tiny-3l`:
 
-- backward pass
-- optimizer logic
 - data augmentation pipeline
 - multi-GPU training
 - full Darknet feature parity
@@ -400,3 +477,4 @@ Do not spend time on these until inference is solid on `yolov4-tiny` and `yolov4
 - should convolution start as pure `cutile` kernels, or should the first implementation use im2col + GEMM for faster progress?
 - how much operator fusion is worth doing before correctness is proven?
 - should YOLO decode remain CPU-side initially even when the backbone/head run on GPU?
+- how closely should the Rust runtime mirror the C++ `workspace` allocation strategy before optimization work starts?

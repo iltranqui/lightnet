@@ -120,9 +120,31 @@ pub trait F32TensorOpsBackend {
         channel_stride: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error>;
+    fn channel_scale_f32(
+        &self,
+        x: &Self::Tensor,
+        scale: &Self::Tensor,
+        channels: usize,
+        channel_stride: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error>;
+    fn bias_backward_f32(
+        &self,
+        output_grad: &Self::Tensor,
+        channels: usize,
+        channel_stride: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error>;
     fn activation_f32(
         &self,
         x: &Self::Tensor,
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error>;
+    fn activation_backward_f32(
+        &self,
+        activation_input: &Self::Tensor,
+        delta: &Self::Tensor,
         activation: F32ActivationKind,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error>;
@@ -142,11 +164,55 @@ pub trait F32TensorOpsBackend {
         channel_stride: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error>;
+    fn route_backward_f32(
+        &self,
+        output_grad: &Self::Tensor,
+        input_shapes: &[Vec<usize>],
+        input_channel_offsets: &[usize],
+        input_channels: &[usize],
+        input_total_channels: &[usize],
+        channel_stride: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Vec<Self::Tensor>, Self::Error>;
     fn conv2d_f32(
         &self,
         x: &Self::Tensor,
         weights: &Self::Tensor,
         output_shape: &[usize],
+        input_channels: usize,
+        input_height: usize,
+        input_width: usize,
+        filters: usize,
+        kernel_size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        dilation: usize,
+        padding: usize,
+        groups: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error>;
+    fn conv2d_backward_input_f32(
+        &self,
+        output_grad: &Self::Tensor,
+        weights: &Self::Tensor,
+        input_shape: &[usize],
+        input_channels: usize,
+        input_height: usize,
+        input_width: usize,
+        filters: usize,
+        kernel_size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        dilation: usize,
+        padding: usize,
+        groups: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error>;
+    fn conv2d_backward_weights_f32(
+        &self,
+        x: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        weight_shape: &[usize],
         input_channels: usize,
         input_height: usize,
         input_width: usize,
@@ -172,6 +238,19 @@ pub trait F32TensorOpsBackend {
         padding: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error>;
+    fn maxpool_backward_f32(
+        &self,
+        x: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        padding: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error>;
     fn upsample_f32(
         &self,
         x: &Self::Tensor,
@@ -182,6 +261,17 @@ pub trait F32TensorOpsBackend {
         stride: usize,
         scale: f32,
         reverse: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error>;
+    fn upsample_backward_f32(
+        &self,
+        output_grad: &Self::Tensor,
+        input_shape: &[usize],
+        channels: usize,
+        output_height: usize,
+        output_width: usize,
+        stride: usize,
+        scale: f32,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error>;
     fn vector_add_f32(
@@ -197,6 +287,16 @@ pub trait F32TensorOpsBackend {
         y: &Self::Tensor,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error>;
+    fn sgd_update_f32(
+        &self,
+        weights: &Self::Tensor,
+        updates: &Self::Tensor,
+        lr: f32,
+        momentum: f32,
+        decay: f32,
+        batch: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error>;
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
