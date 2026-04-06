@@ -3,15 +3,26 @@ use std::path::{Path, PathBuf};
 
 use darknet_core::{
     DataConfig, DetectionOptions, ExecutableNetwork, GpuExecutableNetwork, Network,
-    PlanarRgbImage, Tensor, compute_learning_rate, decode_yolo_detections, inspect_weights_file,
-    load_names_file, load_paths_file, load_training_batch_from_paths, save_weights,
+    PlanarRgbImage, Tensor, compute_learning_rate, compute_yolo_training_loss,
+    decode_yolo_detections, inspect_weights_file, load_names_file, load_paths_file,
+    load_training_batch_from_paths, save_weights,
 };
 use darknet_cuda_cutile::CutileBackend;
 
 fn main() {
-    if let Err(err) = run() {
-        eprintln!("error: {err}");
-        std::process::exit(1);
+    let handle = std::thread::Builder::new()
+        .name("darknet-cli".to_owned())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            if let Err(err) = run() {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+        })
+        .expect("failed to spawn CLI thread");
+
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
     }
 }
 
@@ -363,6 +374,7 @@ fn run_detector_train_cpu(
     while executable.network.net.max_batches == 0 || batch_num < executable.network.net.max_batches
     {
         let lr = compute_learning_rate(&executable.network.net, batch_num);
+        let mut iter_loss = 0.0f32;
         for subdivision in 0..executable.network.net.subdivisions.max(1) {
             let start_index = image_cursor + subdivision * executable.network.net.batch.max(1);
             let batch = load_training_batch_from_paths(
@@ -372,8 +384,13 @@ fn run_detector_train_cpu(
                 start_index,
             )?;
             let forward = executable.forward(&batch.input)?;
-            let seeds = make_backward_seeds(&executable.network, &forward, "auto")?;
-            executable.backward_accumulate_seeded(&batch.input, &forward, &seeds)?;
+            let yolo = compute_yolo_training_loss(&executable.network, &forward, &batch.labels)?;
+            iter_loss += yolo.loss;
+            executable.backward_accumulate_seeded(
+                &batch.input,
+                &forward,
+                &yolo.layer_output_gradient_seeds,
+            )?;
         }
         executable.update_weights(
             lr,
@@ -390,7 +407,8 @@ fn run_detector_train_cpu(
             image_cursor %= train_images.len();
         }
 
-        println!("batch {} lr {:.6} loss N/A", batch_num, lr);
+        let loss = iter_loss / images_per_iteration.max(1) as f32;
+        println!("batch {} lr {:.6e} loss {:.6}", batch_num, lr, loss);
 
         if batch_num % 1000 == 0 {
             let checkpoint = backup_dir.join(format!("{base_name}_{batch_num}.weights"));
@@ -470,6 +488,7 @@ fn run_detector_train_gpu(
     while executable.network.net.max_batches == 0 || batch_num < executable.network.net.max_batches
     {
         let lr = compute_learning_rate(&executable.network.net, batch_num);
+        let mut iter_loss = 0.0f32;
         // NOTE: do NOT zero train buffers here. After update_weights_gpu, the buffers
         // hold momentum * previous_gradient (C++ weight_updates *= momentum). Zeroing
         // would destroy the momentum carry. init_train_buffers_gpu() above initialises
@@ -483,8 +502,13 @@ fn run_detector_train_gpu(
                 start_index,
             )?;
             let forward = executable.forward_with_state(&batch.input)?;
-            let seeds = make_backward_seeds(&executable.network, &forward.cpu_forward, "auto")?;
-            executable.backward_accumulate_seeded_gpu(&forward, &seeds)?;
+            let yolo = compute_yolo_training_loss(
+                &executable.network,
+                &forward.cpu_forward,
+                &batch.labels,
+            )?;
+            iter_loss += yolo.loss;
+            executable.backward_accumulate_seeded_gpu(&forward, &yolo.layer_output_gradient_seeds)?;
         }
         executable.update_weights_gpu(
             lr,
@@ -501,7 +525,8 @@ fn run_detector_train_gpu(
             image_cursor %= train_images.len();
         }
 
-        println!("batch {} lr {:.6} loss N/A", batch_num, lr);
+        let loss = iter_loss / images_per_iteration.max(1) as f32;
+        println!("batch {} lr {:.6e} loss {:.6}", batch_num, lr, loss);
 
         if batch_num % 1000 == 0 {
             let checkpoint = backup_dir.join(format!("{base_name}_{batch_num}.weights"));

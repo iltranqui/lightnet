@@ -226,6 +226,36 @@ pub struct YoloSpec {
     pub anchors: Vec<f32>,
     pub scale_x_y: f32,
     pub new_coords: bool,
+    pub cls_normalizer: f32,
+    pub obj_normalizer: f32,
+    pub iou_normalizer: f32,
+    pub ignore_thresh: f32,
+    pub truth_thresh: f32,
+    pub iou_loss: YoloIouLoss,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum YoloIouLoss {
+    Mse,
+    Iou,
+    Giou,
+    Diou,
+    Ciou,
+}
+
+impl YoloIouLoss {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "mse" => Ok(Self::Mse),
+            "iou" => Ok(Self::Iou),
+            "giou" => Ok(Self::Giou),
+            "diou" => Ok(Self::Diou),
+            "ciou" => Ok(Self::Ciou),
+            other => Err(Error::InvalidConfig(format!(
+                "unsupported YOLO iou_loss {other}"
+            ))),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -648,6 +678,12 @@ fn parse_layer_kind(
                 anchors: section.get_f32_list("anchors")?,
                 scale_x_y: section.get_f32("scale_x_y", 1.0)?,
                 new_coords: section.get_i64("new_coords", 0)? != 0,
+                cls_normalizer: section.get_f32("cls_normalizer", 1.0)?,
+                obj_normalizer: section.get_f32("obj_normalizer", 1.0)?,
+                iou_normalizer: section.get_f32("iou_normalizer", 0.07)?,
+                ignore_thresh: section.get_f32("ignore_thresh", 0.5)?,
+                truth_thresh: section.get_f32("truth_thresh", 1.0)?,
+                iou_loss: YoloIouLoss::parse(&section.get_str("iou_loss", "mse"))?,
             })
         }
         "gaussian_yolo" => {
@@ -659,6 +695,12 @@ fn parse_layer_kind(
                 anchors: section.get_f32_list("anchors")?,
                 scale_x_y: section.get_f32("scale_x_y", 1.0)?,
                 new_coords: section.get_i64("new_coords", 0)? != 0,
+                cls_normalizer: section.get_f32("cls_normalizer", 1.0)?,
+                obj_normalizer: section.get_f32("obj_normalizer", 1.0)?,
+                iou_normalizer: section.get_f32("iou_normalizer", 0.07)?,
+                ignore_thresh: section.get_f32("ignore_thresh", 0.5)?,
+                truth_thresh: section.get_f32("truth_thresh", 1.0)?,
+                iou_loss: YoloIouLoss::parse(&section.get_str("iou_loss", "mse"))?,
             })
         }
         "region" => LayerKind::Region(RegionSpec {
