@@ -43,6 +43,17 @@ Already working:
   - learning-rate scheduling
   - SGD with momentum and decay
   - checkpoint save support
+- Rust YOLO training-loss parity for:
+  - best-anchor assignment
+  - `truth_thresh` positive matching
+  - extra positive anchors via `iou_thresh` / `iou_thresh_kind`
+  - focal loss
+  - label smoothing
+  - `counters_per_class` -> class multipliers
+  - `map=...` class remapping
+  - objectness smoothing
+  - max-delta clipping
+  - multi-anchor box-delta averaging
 - optional `cutile-rs` bridge crate
 - typed `f32` tensor upload, zero-init, download, vector-add, and saxpy on the bridge
 - bridge implementation of `darknet_cuda::F32TensorOpsBackend`
@@ -83,6 +94,22 @@ Still missing on the CUDA side:
 - GPU support for the remaining pooling family and unsupported train-time layers
 - CPU/GPU parity checks on more realistic end-to-end detector slices
 
+Still missing on the Rust training-parity side:
+
+- the C++ bad-label rejection / equidistant-point filtering logic that depends on persistent cross-iteration rolling delta stats:
+  - `badlabels_rejection_percentage`
+  - `num_sigmas_reject_badlabels`
+  - `equidistant_point`
+  - `delta_rolling_max`
+  - `delta_rolling_avg`
+  - `delta_rolling_std`
+  - `badlabels_reject_threshold`
+- a persistent Rust training-state object equivalent to C++ `state.net` for YOLO-loss post-processing across iterations
+
+Explicitly out of scope for this TODO item:
+
+- C++ adversarial training mode parity
+
 ## Goal
 
 Build a C++-aligned Rust runtime that can execute the practical YOLO-tiny
@@ -110,6 +137,7 @@ The first complete training target should additionally cover:
 - retained activations for backward
 - device-side update buffers with C++ ownership semantics
 - real YOLO target assignment and loss
+- YOLO training-state parity for bad-label rejection and equidistant-point filtering
 - SGD with momentum on GPU
 
 ## Guiding Principles

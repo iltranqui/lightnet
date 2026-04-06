@@ -145,27 +145,6 @@ pub fn compute_yolo_training_loss(
         heads.push((head, spec));
     }
 
-    let mut assignments =
-        BTreeMap::<(usize, usize, usize, usize, usize), Vec<YoloLabel>>::new();
-    for (batch, image_labels) in labels.iter().enumerate() {
-        for label in image_labels {
-            let Some((head_index, anchor_offset, _match_iou)) =
-                best_anchor_assignment(network, &heads, label)?
-            else {
-                continue;
-            };
-            let head = heads[head_index].0;
-            let grid_x = (label.x * head.output.shape.width as f32)
-                .clamp(0.0, head.output.shape.width as f32 - 1.0e-6);
-            let grid_y = (label.y * head.output.shape.height as f32)
-                .clamp(0.0, head.output.shape.height as f32 - 1.0e-6);
-            let col = grid_x.floor() as usize;
-            let row = grid_y.floor() as usize;
-            let key = (batch, head.layer_index, anchor_offset, row, col);
-            assignments.entry(key).or_default().push(label.clone());
-        }
-    }
-
     let mut positive_matches = 0usize;
     let mut ignored_objectness = 0usize;
 
@@ -184,11 +163,6 @@ pub fn compute_yolo_training_loss(
                 let anchor = anchor_pair(spec, spec.mask[anchor_offset])?;
                 for row in 0..grid_height {
                     for col in 0..grid_width {
-                        let slot = (batch, head.layer_index, anchor_offset, row, col);
-                        if assignments.contains_key(&slot) {
-                            continue;
-                        }
-
                         let predicted_bbox = decode_training_bbox(
                             head.output.get(batch, channel_base, row, col),
                             head.output.get(batch, channel_base + 1, row, col),
@@ -204,151 +178,284 @@ pub fn compute_yolo_training_loss(
                             spec.scale_x_y,
                             spec.new_coords,
                         );
-                        let best_iou = labels[batch]
-                            .iter()
-                            .map(|label| bbox_iou(predicted_bbox, bbox_from_label(label)))
-                            .fold(0.0f32, f32::max);
-                        if best_iou > spec.ignore_thresh {
-                            ignored_objectness += 1;
-                            continue;
-                        }
-
                         let objectness = yolo_objectness_output(
                             head.output.get(batch, channel_base + 4, row, col),
                             spec.new_coords,
                         );
-                        seed.set(
+                        let class_base = channel_base + 5;
+                        let class_match = compare_yolo_class_outputs(
+                            &head.output,
                             batch,
-                            channel_base + 4,
+                            class_base,
                             row,
                             col,
-                            spec.obj_normalizer * (0.0 - objectness),
+                            spec.classes,
+                            spec.new_coords,
+                            0.25,
                         );
+                        let mut best_iou = 0.0f32;
+                        let mut best_match_iou = 0.0f32;
+                        let mut best_label: Option<(&YoloLabel, usize)> = None;
+
+                        for label in &labels[batch] {
+                            let class_id = remap_class_id(spec, label.class_id, head.layer_index)?;
+                            let iou = bbox_iou(predicted_bbox, bbox_from_label(label));
+                            if class_match && iou > best_match_iou {
+                                best_match_iou = iou;
+                            }
+                            if iou > best_iou {
+                                best_iou = iou;
+                                best_label = Some((label, class_id));
+                            }
+                        }
+
+                        let mut object_delta = spec.obj_normalizer * (0.0 - objectness);
+                        if best_match_iou > spec.ignore_thresh {
+                            ignored_objectness += 1;
+                            if spec.objectness_smooth {
+                                let smooth = spec.obj_normalizer * (best_match_iou - objectness);
+                                if smooth > object_delta {
+                                    object_delta = smooth;
+                                }
+                            } else {
+                                object_delta = 0.0;
+                            }
+                        }
+                        seed.set(batch, channel_base + 4, row, col, object_delta);
+
+                        if best_iou > spec.truth_thresh {
+                            let Some((label, class_id)) = best_label else {
+                                continue;
+                            };
+                            positive_matches += 1;
+                            let iou_multiplier = best_iou * best_iou;
+                            let positive_objectness = if spec.objectness_smooth {
+                                iou_multiplier
+                            } else {
+                                1.0
+                            };
+                            seed.set(
+                                batch,
+                                channel_base + 4,
+                                row,
+                                col,
+                                spec.obj_normalizer * (positive_objectness - objectness),
+                            );
+                            apply_yolo_class_delta(
+                                &head.output,
+                                seed,
+                                batch,
+                                class_base,
+                                row,
+                                col,
+                                class_id,
+                                spec,
+                            );
+                            if spec.objectness_smooth {
+                                let class_output = yolo_class_output(
+                                    head.output.get(batch, class_base + class_id, row, col),
+                                    spec.new_coords,
+                                );
+                                seed.set(
+                                    batch,
+                                    class_base + class_id,
+                                    row,
+                                    col,
+                                    class_multiplier(spec, class_id)
+                                        * (iou_multiplier - class_output),
+                                );
+                            }
+                            apply_yolo_box_delta(
+                                &head.output,
+                                seed,
+                                batch,
+                                channel_base,
+                                row,
+                                col,
+                                grid_width,
+                                grid_height,
+                                network.net.width,
+                                network.net.height,
+                                anchor,
+                                bbox_from_label(label),
+                                (2.0 - label.w * label.h)
+                                    * spec.iou_normalizer
+                                    * class_multiplier(spec, class_id),
+                                spec,
+                            );
+                        }
                     }
                 }
             }
         }
 
-        for ((batch, layer_index, anchor_offset, row, col), slot_labels) in &assignments {
-            if *layer_index != head.layer_index {
-                continue;
-            }
-            if slot_labels.is_empty() {
-                continue;
-            }
-
-            let channel_base = anchor_offset * entries_per_anchor;
-            let anchor = anchor_pair(spec, spec.mask[*anchor_offset])?;
-            let tx_raw = head.output.get(*batch, channel_base, *row, *col);
-            let ty_raw = head.output.get(*batch, channel_base + 1, *row, *col);
-            let tw_raw = head.output.get(*batch, channel_base + 2, *row, *col);
-            let th_raw = head.output.get(*batch, channel_base + 3, *row, *col);
-            let objectness = yolo_objectness_output(
-                head.output.get(*batch, channel_base + 4, *row, *col),
-                spec.new_coords,
-            );
-            let tx_output = yolo_xy_output(tx_raw, spec.scale_x_y, spec.new_coords);
-            let ty_output = yolo_xy_output(ty_raw, spec.scale_x_y, spec.new_coords);
-            let predicted_bbox = decode_training_bbox(
-                tx_raw,
-                ty_raw,
-                tw_raw,
-                th_raw,
-                *col,
-                *row,
-                grid_width,
-                grid_height,
-                network.net.width,
-                network.net.height,
-                anchor,
-                spec.scale_x_y,
-                spec.new_coords,
-            );
-
-            let mut acc_dx = 0.0f32;
-            let mut acc_dy = 0.0f32;
-            let mut acc_dw = 0.0f32;
-            let mut acc_dh = 0.0f32;
-            let mut class_targets = vec![false; spec.classes];
-
-            for label in slot_labels {
-                if label.class_id >= spec.classes {
-                    return Err(Error::InvalidConfig(format!(
-                        "label class {} exceeds YOLO classes={} for layer #{}",
-                        label.class_id, spec.classes, head.layer_index
-                    )));
+        for (batch, image_labels) in labels.iter().enumerate() {
+            for label in image_labels {
+                let class_id = remap_class_id(spec, label.class_id, head.layer_index)?;
+                let Some((best_head_index, best_anchor_offset, _)) =
+                    best_anchor_assignment(network, &heads, label)?
+                else {
+                    continue;
+                };
+                if heads[best_head_index].0.layer_index != head.layer_index {
+                    continue;
                 }
-                positive_matches += 1;
-                class_targets[label.class_id] = true;
 
                 let grid_x =
                     (label.x * grid_width as f32).clamp(0.0, grid_width as f32 - 1.0e-6);
                 let grid_y =
                     (label.y * grid_height as f32).clamp(0.0, grid_height as f32 - 1.0e-6);
-                let tx_target = grid_x - *col as f32;
-                let ty_target = grid_y - *row as f32;
-                let box_scale = 2.0 - label.w * label.h;
-                let truth_bbox = bbox_from_label(label);
+                let col = grid_x.floor() as usize;
+                let row = grid_y.floor() as usize;
+                let channel_base = best_anchor_offset * entries_per_anchor;
+                let anchor = anchor_pair(spec, spec.mask[best_anchor_offset])?;
+                let objectness = yolo_objectness_output(
+                    head.output.get(batch, channel_base + 4, row, col),
+                    spec.new_coords,
+                );
+                let class_scale =
+                    (2.0 - label.w * label.h) * spec.iou_normalizer * class_multiplier(spec, class_id);
 
-                match spec.iou_loss {
-                    YoloIouLoss::Mse => {
-                        acc_dx += box_scale * (tx_target - tx_output) * spec.iou_normalizer;
-                        acc_dy += box_scale * (ty_target - ty_output) * spec.iou_normalizer;
+                apply_yolo_box_delta(
+                    &head.output,
+                    seed,
+                    batch,
+                    channel_base,
+                    row,
+                    col,
+                    grid_width,
+                    grid_height,
+                    network.net.width,
+                    network.net.height,
+                    anchor,
+                    bbox_from_label(label),
+                    class_scale,
+                    spec,
+                );
+                apply_yolo_positive_objectness(
+                    &head.output,
+                    seed,
+                    batch,
+                    channel_base,
+                    row,
+                    col,
+                    objectness,
+                    class_id,
+                    spec,
+                );
+                apply_yolo_class_delta(
+                    &head.output,
+                    seed,
+                    batch,
+                    channel_base + 5,
+                    row,
+                    col,
+                    class_id,
+                    spec,
+                );
+                positive_matches += 1;
 
-                        let tw_target = width_height_target(
-                            label.w,
-                            network.net.width as f32,
-                            anchor.0,
-                            spec.new_coords,
-                        );
-                        let th_target = width_height_target(
-                            label.h,
-                            network.net.height as f32,
-                            anchor.1,
-                            spec.new_coords,
-                        );
-                        acc_dw += box_scale * (tw_target - tw_raw) * spec.iou_normalizer;
-                        acc_dh += box_scale * (th_target - th_raw) * spec.iou_normalizer;
-                    }
-                    _ => {
-                        let mut box_grad = dx_box_iou(predicted_bbox, truth_bbox, spec.iou_loss);
-                        if !spec.new_coords {
-                            box_grad.dw *= tw_raw.exp();
-                            box_grad.dh *= th_raw.exp();
+                if spec.iou_thresh < 1.0 {
+                    let truth_shift = YoloBox {
+                        x: 0.0,
+                        y: 0.0,
+                        w: label.w,
+                        h: label.h,
+                    };
+                    let best_mask_index = spec.mask[best_anchor_offset];
+                    for (anchor_offset, &mask_index) in spec.mask.iter().enumerate() {
+                        if mask_index == best_mask_index {
+                            continue;
                         }
-                        acc_dx += sanitize_delta(box_grad.dx * spec.iou_normalizer);
-                        acc_dy += sanitize_delta(box_grad.dy * spec.iou_normalizer);
-                        acc_dw += sanitize_delta(box_grad.dw * spec.iou_normalizer);
-                        acc_dh += sanitize_delta(box_grad.dh * spec.iou_normalizer);
+                        let extra_anchor = anchor_pair(spec, mask_index)?;
+                        let anchor_box = YoloBox {
+                            x: 0.0,
+                            y: 0.0,
+                            w: extra_anchor.0 / network.net.width as f32,
+                            h: extra_anchor.1 / network.net.height as f32,
+                        };
+                        if bbox_iou_kind(anchor_box, truth_shift, spec.iou_thresh_kind)
+                            <= spec.iou_thresh
+                        {
+                            continue;
+                        }
+
+                        let extra_channel_base = anchor_offset * entries_per_anchor;
+                        let extra_objectness = yolo_objectness_output(
+                            head.output.get(batch, extra_channel_base + 4, row, col),
+                            spec.new_coords,
+                        );
+                        apply_yolo_box_delta(
+                            &head.output,
+                            seed,
+                            batch,
+                            extra_channel_base,
+                            row,
+                            col,
+                            grid_width,
+                            grid_height,
+                            network.net.width,
+                            network.net.height,
+                            extra_anchor,
+                            bbox_from_label(label),
+                            class_scale,
+                            spec,
+                        );
+                        apply_yolo_positive_objectness(
+                            &head.output,
+                            seed,
+                            batch,
+                            extra_channel_base,
+                            row,
+                            col,
+                            extra_objectness,
+                            class_id,
+                            spec,
+                        );
+                        apply_yolo_class_delta(
+                            &head.output,
+                            seed,
+                            batch,
+                            extra_channel_base + 5,
+                            row,
+                            col,
+                            class_id,
+                            spec,
+                        );
+                        positive_matches += 1;
                     }
                 }
             }
+        }
 
-            seed.set(*batch, channel_base, *row, *col, acc_dx);
-            seed.set(*batch, channel_base + 1, *row, *col, acc_dy);
-            seed.set(*batch, channel_base + 2, *row, *col, acc_dw);
-            seed.set(*batch, channel_base + 3, *row, *col, acc_dh);
-            seed.set(
-                *batch,
-                channel_base + 4,
-                *row,
-                *col,
-                spec.obj_normalizer * (1.0 - objectness),
-            );
-
-            for class_id in 0..spec.classes {
-                let class_output = yolo_objectness_output(
-                    head.output.get(*batch, channel_base + 5 + class_id, *row, *col),
-                    spec.new_coords,
-                );
-                let target = if class_targets[class_id] { 1.0 } else { 0.0 };
-                seed.set(
-                    *batch,
-                    channel_base + 5 + class_id,
-                    *row,
-                    *col,
-                    spec.cls_normalizer * (target - class_output),
-                );
+        if spec.iou_thresh < 1.0 {
+            for batch in 0..batch_size {
+                for anchor_offset in 0..anchors_per_cell {
+                    let channel_base = anchor_offset * entries_per_anchor;
+                    for row in 0..grid_height {
+                        for col in 0..grid_width {
+                            if seed.get(batch, channel_base + 4, row, col) == 0.0 {
+                                continue;
+                            }
+                            let positive_classes = count_positive_class_deltas(
+                                seed,
+                                batch,
+                                channel_base + 5,
+                                row,
+                                col,
+                                spec.classes,
+                            );
+                            if positive_classes > 0 {
+                                let scale = positive_classes as f32;
+                                for box_channel in 0..4 {
+                                    let value = seed.get(batch, channel_base + box_channel, row, col)
+                                        / scale;
+                                    seed.set(batch, channel_base + box_channel, row, col, value);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -366,6 +473,276 @@ pub fn compute_yolo_training_loss(
         positive_matches,
         ignored_objectness,
     })
+}
+
+fn apply_yolo_box_delta(
+    output: &Tensor,
+    seed: &mut Tensor,
+    batch: usize,
+    channel_base: usize,
+    row: usize,
+    col: usize,
+    grid_width: usize,
+    grid_height: usize,
+    net_width: usize,
+    net_height: usize,
+    anchor: (f32, f32),
+    truth_bbox: YoloBox,
+    scale: f32,
+    spec: &YoloSpec,
+) {
+    let tx_raw = output.get(batch, channel_base, row, col);
+    let ty_raw = output.get(batch, channel_base + 1, row, col);
+    let tw_raw = output.get(batch, channel_base + 2, row, col);
+    let th_raw = output.get(batch, channel_base + 3, row, col);
+    let tx_output = yolo_xy_output(tx_raw, spec.scale_x_y, spec.new_coords);
+    let ty_output = yolo_xy_output(ty_raw, spec.scale_x_y, spec.new_coords);
+
+    match spec.iou_loss {
+        YoloIouLoss::Mse => {
+            let tx_target = truth_bbox.x * grid_width as f32 - col as f32;
+            let ty_target = truth_bbox.y * grid_height as f32 - row as f32;
+            let tw_target =
+                width_height_target(truth_bbox.w, net_width as f32, anchor.0, spec.new_coords);
+            let th_target =
+                width_height_target(truth_bbox.h, net_height as f32, anchor.1, spec.new_coords);
+            add_box_delta(seed, batch, channel_base, row, col, 0, scale * (tx_target - tx_output));
+            add_box_delta(seed, batch, channel_base, row, col, 1, scale * (ty_target - ty_output));
+            add_box_delta(seed, batch, channel_base, row, col, 2, scale * (tw_target - tw_raw));
+            add_box_delta(seed, batch, channel_base, row, col, 3, scale * (th_target - th_raw));
+        }
+        _ => {
+            let mut predicted_bbox = decode_training_bbox(
+                tx_raw,
+                ty_raw,
+                tw_raw,
+                th_raw,
+                col,
+                row,
+                grid_width,
+                grid_height,
+                net_width,
+                net_height,
+                anchor,
+                spec.scale_x_y,
+                spec.new_coords,
+            );
+            if predicted_bbox.w == 0.0 {
+                predicted_bbox.w = 1.0;
+            }
+            if predicted_bbox.h == 0.0 {
+                predicted_bbox.h = 1.0;
+            }
+
+            let mut box_grad = dx_box_iou(predicted_bbox, truth_bbox, spec.iou_loss);
+            if !spec.new_coords {
+                box_grad.dw *= tw_raw.exp();
+                box_grad.dh *= th_raw.exp();
+            }
+
+            add_box_delta(
+                seed,
+                batch,
+                channel_base,
+                row,
+                col,
+                0,
+                sanitize_and_clip_delta(box_grad.dx * scale, spec.max_delta),
+            );
+            add_box_delta(
+                seed,
+                batch,
+                channel_base,
+                row,
+                col,
+                1,
+                sanitize_and_clip_delta(box_grad.dy * scale, spec.max_delta),
+            );
+            add_box_delta(
+                seed,
+                batch,
+                channel_base,
+                row,
+                col,
+                2,
+                sanitize_and_clip_delta(box_grad.dw * scale, spec.max_delta),
+            );
+            add_box_delta(
+                seed,
+                batch,
+                channel_base,
+                row,
+                col,
+                3,
+                sanitize_and_clip_delta(box_grad.dh * scale, spec.max_delta),
+            );
+        }
+    }
+}
+
+fn add_box_delta(
+    seed: &mut Tensor,
+    batch: usize,
+    channel_base: usize,
+    row: usize,
+    col: usize,
+    box_channel: usize,
+    delta: f32,
+) {
+    let channel = channel_base + box_channel;
+    let value = seed.get(batch, channel, row, col) + delta;
+    seed.set(batch, channel, row, col, value);
+}
+
+fn apply_yolo_positive_objectness(
+    _output: &Tensor,
+    seed: &mut Tensor,
+    batch: usize,
+    channel_base: usize,
+    row: usize,
+    col: usize,
+    objectness: f32,
+    class_id: usize,
+    spec: &YoloSpec,
+) {
+    let delta = class_multiplier(spec, class_id) * spec.obj_normalizer * (1.0 - objectness);
+    let channel = channel_base + 4;
+    if spec.objectness_smooth {
+        if seed.get(batch, channel, row, col) == 0.0 {
+            seed.set(batch, channel, row, col, delta);
+        }
+    } else {
+        seed.set(batch, channel, row, col, delta);
+    }
+}
+
+fn apply_yolo_class_delta(
+    output: &Tensor,
+    seed: &mut Tensor,
+    batch: usize,
+    class_base: usize,
+    row: usize,
+    col: usize,
+    class_id: usize,
+    spec: &YoloSpec,
+) {
+    if seed.get(batch, class_base + class_id, row, col) != 0.0 {
+        let result_delta = smoothed_target(true, spec.label_smooth_eps)
+            - yolo_class_output(output.get(batch, class_base + class_id, row, col), spec.new_coords);
+        if result_delta.is_finite() {
+            let value = if spec.class_multipliers.is_some() {
+                result_delta * class_multiplier(spec, class_id)
+            } else {
+                result_delta
+            };
+            seed.set(batch, class_base + class_id, row, col, value);
+        }
+        return;
+    }
+
+    if spec.focal_loss {
+        let pt =
+            yolo_class_output(output.get(batch, class_base + class_id, row, col), spec.new_coords)
+                + 1.0e-15;
+        let grad = -(1.0 - pt) * (2.0 * pt * pt.ln() + pt - 1.0);
+        let alpha = 0.5;
+        for class_offset in 0..spec.classes {
+            let target = if class_offset == class_id { 1.0 } else { 0.0 };
+            let class_output = yolo_class_output(
+                output.get(batch, class_base + class_offset, row, col),
+                spec.new_coords,
+            );
+            let delta: f32 = (target - class_output) * alpha * grad;
+            if delta.is_finite() {
+                seed.set(batch, class_base + class_offset, row, col, delta);
+            }
+        }
+        return;
+    }
+
+    for class_offset in 0..spec.classes {
+        let class_output = yolo_class_output(
+            output.get(batch, class_base + class_offset, row, col),
+            spec.new_coords,
+        );
+        let mut delta =
+            smoothed_target(class_offset == class_id, spec.label_smooth_eps) - class_output;
+        if !delta.is_finite() {
+            continue;
+        }
+        if spec.class_multipliers.is_some() && class_offset == class_id {
+            delta *= class_multiplier(spec, class_id) * spec.cls_normalizer;
+        }
+        seed.set(batch, class_base + class_offset, row, col, delta);
+    }
+}
+
+fn remap_class_id(spec: &YoloSpec, raw_class_id: usize, layer_index: usize) -> Result<usize> {
+    let class_id = if let Some(map) = &spec.class_map {
+        *map.get(raw_class_id).ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "label class {} is out of range for YOLO map on layer #{}",
+                raw_class_id, layer_index
+            ))
+        })?
+    } else {
+        raw_class_id
+    };
+
+    if class_id >= spec.classes {
+        return Err(Error::InvalidConfig(format!(
+            "label class {} exceeds YOLO classes={} for layer #{}",
+            class_id, spec.classes, layer_index
+        )));
+    }
+
+    Ok(class_id)
+}
+
+fn class_multiplier(spec: &YoloSpec, class_id: usize) -> f32 {
+    spec.class_multipliers
+        .as_ref()
+        .and_then(|multipliers| multipliers.get(class_id))
+        .copied()
+        .unwrap_or(1.0)
+}
+
+fn compare_yolo_class_outputs(
+    output: &Tensor,
+    batch: usize,
+    class_base: usize,
+    row: usize,
+    col: usize,
+    classes: usize,
+    new_coords: bool,
+    threshold: f32,
+) -> bool {
+    (0..classes).any(|class_offset| {
+        yolo_class_output(output.get(batch, class_base + class_offset, row, col), new_coords)
+            > threshold
+    })
+}
+
+fn count_positive_class_deltas(
+    seed: &Tensor,
+    batch: usize,
+    class_base: usize,
+    row: usize,
+    col: usize,
+    classes: usize,
+) -> usize {
+    (0..classes)
+        .filter(|class_offset| seed.get(batch, class_base + class_offset, row, col) > 0.0)
+        .count()
+}
+
+fn smoothed_target(is_positive: bool, epsilon: f32) -> f32 {
+    let base = if is_positive { 1.0 } else { 0.0 };
+    if epsilon == 0.0 {
+        base
+    } else {
+        base * (1.0 - epsilon) + 0.5 * epsilon
+    }
 }
 
 pub fn load_paths_file(path: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
@@ -767,6 +1144,15 @@ fn box_giou(lhs: YoloBox, rhs: YoloBox) -> f32 {
     iou - (c - u) / c
 }
 
+fn bbox_iou_kind(lhs: YoloBox, rhs: YoloBox, iou_kind: YoloIouLoss) -> f32 {
+    match iou_kind {
+        YoloIouLoss::Iou | YoloIouLoss::Mse => bbox_iou(lhs, rhs),
+        YoloIouLoss::Giou => box_giou(lhs, rhs),
+        YoloIouLoss::Diou => box_diou(lhs, rhs),
+        YoloIouLoss::Ciou => box_ciou(lhs, rhs),
+    }
+}
+
 fn dx_box_iou(pred: YoloBox, truth: YoloBox, iou_loss: YoloIouLoss) -> BoxGrad {
     let pred_tblr = to_tblr(pred);
     let pred_t = pred_tblr.top.min(pred_tblr.bot);
@@ -938,6 +1324,14 @@ fn sanitize_delta(value: f32) -> f32 {
     if value.is_finite() { value } else { 0.0 }
 }
 
+fn sanitize_and_clip_delta(value: f32, max_delta: f32) -> f32 {
+    let mut out = sanitize_delta(value);
+    if max_delta != f32::MAX {
+        out = out.clamp(-max_delta, max_delta);
+    }
+    out
+}
+
 fn sigmoid(value: f32) -> f32 {
     1.0 / (1.0 + (-value).exp())
 }
@@ -948,6 +1342,10 @@ fn yolo_xy_output(raw: f32, scale_x_y: f32, new_coords: bool) -> f32 {
     } else {
         scale_x_y * sigmoid(raw) - 0.5 * (scale_x_y - 1.0)
     }
+}
+
+fn yolo_class_output(raw: f32, new_coords: bool) -> f32 {
+    yolo_objectness_output(raw, new_coords)
 }
 
 fn yolo_objectness_output(raw: f32, new_coords: bool) -> f32 {
@@ -1118,5 +1516,59 @@ mod tests {
             .as_ref()
             .expect("yolo seed exists");
         assert!(seed.data.iter().any(|value| *value != 0.0));
+    }
+
+    #[test]
+    fn yolo_iou_thresh_can_activate_extra_anchors() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                batch=1
+                width=32
+                height=32
+                channels=3
+
+                [convolutional]
+                filters=12
+                size=1
+                stride=1
+                pad=1
+                activation=linear
+
+                [yolo]
+                mask=0,1
+                anchors=10,12,12,14
+                classes=1
+                num=2
+                truth_thresh=1.0
+                iou_thresh=0.5
+            "#,
+        )
+        .expect("cfg parses");
+        let network = Network::from_config(cfg).expect("network builds");
+        let executable = ExecutableNetwork::new(network.clone());
+        let input = executable.zero_input();
+        let forward = executable.forward(&input).expect("forward runs");
+
+        let training = compute_yolo_training_loss(
+            &network,
+            &forward,
+            &[vec![YoloLabel {
+                class_id: 0,
+                x: 0.5,
+                y: 0.5,
+                w: 10.0 / 32.0,
+                h: 12.0 / 32.0,
+            }]],
+        )
+        .expect("training loss computes");
+
+        assert_eq!(training.positive_matches, 2);
+        let seed = training.layer_output_gradient_seeds[1]
+            .as_ref()
+            .expect("yolo seed exists");
+        assert_ne!(seed.get(0, 4, 0, 0), 0.0);
+        assert_ne!(seed.get(0, 10, 0, 0), 0.0);
     }
 }

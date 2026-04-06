@@ -1,5 +1,6 @@
 use std::fmt::{Display, Formatter};
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::cfg::{ConfigFile, RawSection};
 use crate::error::{Error, Result};
@@ -231,7 +232,15 @@ pub struct YoloSpec {
     pub iou_normalizer: f32,
     pub ignore_thresh: f32,
     pub truth_thresh: f32,
+    pub iou_thresh: f32,
     pub iou_loss: YoloIouLoss,
+    pub iou_thresh_kind: YoloIouLoss,
+    pub focal_loss: bool,
+    pub label_smooth_eps: f32,
+    pub objectness_smooth: bool,
+    pub max_delta: f32,
+    pub class_multipliers: Option<Vec<f32>>,
+    pub class_map: Option<Vec<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -511,11 +520,16 @@ impl Network {
         let net = NetConfig::from_section(net_section)?;
         let mut current = net.input_shape();
         let mut layers = Vec::new();
+        let cfg_parent = cfg
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
 
         for (index, section) in cfg.sections.iter().enumerate().skip(1) {
             let layer_index = index - 1;
             let input_shape = current;
-            let kind = parse_layer_kind(section, layer_index, current, &layers)?;
+            let kind = parse_layer_kind(section, layer_index, current, &layers, &cfg_parent)?;
             let output_shape = infer_output_shape(&kind, layer_index, input_shape, &layers)?;
 
             layers.push(Layer {
@@ -563,6 +577,7 @@ fn parse_layer_kind(
     layer_index: usize,
     current: TensorShape,
     built_layers: &[Layer],
+    cfg_parent: &Path,
 ) -> Result<LayerKind> {
     let name = section.name.as_str();
     Ok(match name {
@@ -671,8 +686,10 @@ fn parse_layer_kind(
         }
         "yolo" => {
             let mask = section.get_usize_list("mask")?;
+            let classes = section.get_usize("classes", 20)?;
+            let max_delta = section.get_f32("max_delta", f32::MAX)?;
             LayerKind::Yolo(YoloSpec {
-                classes: section.get_usize("classes", 20)?,
+                classes,
                 num: mask.len().max(section.get_usize("num", 1)?),
                 mask,
                 anchors: section.get_f32_list("anchors")?,
@@ -680,16 +697,26 @@ fn parse_layer_kind(
                 new_coords: section.get_i64("new_coords", 0)? != 0,
                 cls_normalizer: section.get_f32("cls_normalizer", 1.0)?,
                 obj_normalizer: section.get_f32("obj_normalizer", 1.0)?,
-                iou_normalizer: section.get_f32("iou_normalizer", 0.07)?,
+                iou_normalizer: section.get_f32("iou_normalizer", 0.75)?,
                 ignore_thresh: section.get_f32("ignore_thresh", 0.5)?,
                 truth_thresh: section.get_f32("truth_thresh", 1.0)?,
+                iou_thresh: section.get_f32("iou_thresh", 1.0)?,
                 iou_loss: YoloIouLoss::parse(&section.get_str("iou_loss", "mse"))?,
+                iou_thresh_kind: YoloIouLoss::parse(&section.get_str("iou_thresh_kind", "iou"))?,
+                focal_loss: section.get_bool_int("focal_loss", false)?,
+                label_smooth_eps: section.get_f32("label_smooth_eps", 0.0)?,
+                objectness_smooth: section.get_bool_int("objectness_smooth", false)?,
+                max_delta,
+                class_multipliers: parse_class_multipliers(section, classes, max_delta)?,
+                class_map: parse_class_map(section, cfg_parent)?,
             })
         }
         "gaussian_yolo" => {
             let mask = section.get_usize_list("mask")?;
+            let classes = section.get_usize("classes", 20)?;
+            let max_delta = section.get_f32("max_delta", f32::MAX)?;
             LayerKind::GaussianYolo(YoloSpec {
-                classes: section.get_usize("classes", 20)?,
+                classes,
                 num: mask.len().max(section.get_usize("num", 1)?),
                 mask,
                 anchors: section.get_f32_list("anchors")?,
@@ -697,10 +724,18 @@ fn parse_layer_kind(
                 new_coords: section.get_i64("new_coords", 0)? != 0,
                 cls_normalizer: section.get_f32("cls_normalizer", 1.0)?,
                 obj_normalizer: section.get_f32("obj_normalizer", 1.0)?,
-                iou_normalizer: section.get_f32("iou_normalizer", 0.07)?,
+                iou_normalizer: section.get_f32("iou_normalizer", 0.75)?,
                 ignore_thresh: section.get_f32("ignore_thresh", 0.5)?,
                 truth_thresh: section.get_f32("truth_thresh", 1.0)?,
+                iou_thresh: section.get_f32("iou_thresh", 1.0)?,
                 iou_loss: YoloIouLoss::parse(&section.get_str("iou_loss", "mse"))?,
+                iou_thresh_kind: YoloIouLoss::parse(&section.get_str("iou_thresh_kind", "iou"))?,
+                focal_loss: section.get_bool_int("focal_loss", false)?,
+                label_smooth_eps: section.get_f32("label_smooth_eps", 0.0)?,
+                objectness_smooth: section.get_bool_int("objectness_smooth", false)?,
+                max_delta,
+                class_multipliers: parse_class_multipliers(section, classes, max_delta)?,
+                class_map: parse_class_map(section, cfg_parent)?,
             })
         }
         "region" => LayerKind::Region(RegionSpec {
@@ -947,6 +982,80 @@ fn resolve_relative_layer(layer_index: usize, raw_index: isize) -> Result<usize>
     Ok(absolute)
 }
 
+fn parse_class_multipliers(
+    section: &RawSection,
+    classes: usize,
+    max_delta: f32,
+) -> Result<Option<Vec<f32>>> {
+    let mut counters = section.get_usize_list("counters_per_class")?;
+    if counters.is_empty() {
+        return Ok(None);
+    }
+    if counters.len() != classes {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] counters_per_class length {} does not match classes={classes}",
+            section.name,
+            counters.len()
+        )));
+    }
+
+    let mut max_counter = 0usize;
+    for counter in &mut counters {
+        if *counter < 1 {
+            *counter = 1;
+        }
+        max_counter = max_counter.max(*counter);
+    }
+
+    let mut multipliers = Vec::with_capacity(counters.len());
+    for counter in counters {
+        multipliers.push((max_counter as f32 / counter as f32).min(max_delta));
+    }
+    Ok(Some(multipliers))
+}
+
+fn parse_class_map(section: &RawSection, cfg_parent: &Path) -> Result<Option<Vec<usize>>> {
+    let Some(raw_path) = section.get("map") else {
+        return Ok(None);
+    };
+    let path = resolve_cfg_path(cfg_parent, raw_path);
+    let text = fs::read_to_string(&path)?;
+    let mut mapping = Vec::new();
+
+    for (index, raw_line) in text.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let mapped = line.parse::<usize>().map_err(|_| {
+            Error::Parse(format!(
+                "failed to parse {} line {} as class map entry",
+                path.display(),
+                index + 1
+            ))
+        })?;
+        mapping.push(mapped);
+    }
+
+    if mapping.is_empty() {
+        return Err(Error::InvalidConfig(format!(
+            "map file {} did not contain any class ids",
+            path.display()
+        )));
+    }
+
+    Ok(Some(mapping))
+}
+
+fn resolve_cfg_path(parent: &Path, raw: &str) -> PathBuf {
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        parent.join(path)
+    }
+}
+
 fn conv_dim(input: usize, padding: usize, size: usize, stride: usize) -> usize {
     ((input + 2 * padding).saturating_sub(size) / stride.max(1)) + 1
 }
@@ -957,6 +1066,7 @@ fn pool_dim(input: usize, padding: usize, size: usize, stride: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
 
     use crate::cfg::ConfigFile;
@@ -1033,5 +1143,62 @@ mod tests {
         assert_eq!(network.net.policy, LrPolicy::Steps);
         assert_eq!(network.net.steps, vec![400, 800]);
         assert_eq!(network.net.scales, vec![0.1, 0.1]);
+    }
+
+    #[test]
+    fn parses_extended_yolo_training_options() {
+        let dir = std::env::temp_dir().join("darknet-model-yolo-options");
+        let _ = fs::create_dir_all(&dir);
+        let map_path = dir.join("labels.map");
+        let cfg_path = dir.join("sample.cfg");
+        fs::write(&map_path, "1\n0\n").expect("map writes");
+        fs::write(
+            &cfg_path,
+            r#"
+                [net]
+                width=32
+                height=32
+                channels=6
+
+                [yolo]
+                mask=0,1
+                anchors=10,12,12,14
+                classes=2
+                num=2
+                scale_x_y=1.05
+                new_coords=1
+                cls_normalizer=0.8
+                obj_normalizer=1.1
+                iou_normalizer=0.9
+                ignore_thresh=0.4
+                truth_thresh=0.7
+                iou_thresh=0.5
+                iou_loss=ciou
+                iou_thresh_kind=giou
+                focal_loss=1
+                label_smooth_eps=0.05
+                objectness_smooth=1
+                max_delta=3.0
+                counters_per_class=10,5
+                map=labels.map
+            "#,
+        )
+        .expect("cfg writes");
+
+        let network = Network::from_path(&cfg_path).expect("cfg should parse");
+        let LayerKind::Yolo(spec) = &network.layers[0].kind else {
+            panic!("expected yolo layer");
+        };
+
+        assert_eq!(spec.iou_normalizer, 0.9);
+        assert_eq!(spec.iou_thresh, 0.5);
+        assert_eq!(spec.iou_loss, super::YoloIouLoss::Ciou);
+        assert_eq!(spec.iou_thresh_kind, super::YoloIouLoss::Giou);
+        assert!(spec.focal_loss);
+        assert!(spec.objectness_smooth);
+        assert_eq!(spec.label_smooth_eps, 0.05);
+        assert_eq!(spec.max_delta, 3.0);
+        assert_eq!(spec.class_multipliers, Some(vec![1.0, 2.0]));
+        assert_eq!(spec.class_map, Some(vec![1, 0]));
     }
 }

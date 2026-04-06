@@ -18,3 +18,25 @@ __pycache__/
 
 # Visual Studio C++ generated binary of .rc file
 *.aps
+rust/.fastembed_cache
+cutile-rs
+chart.png
+chart_0.png
+chart_1.png
+chart_2.png
+chart_3.png
+chart_4.png
+chart_5.png
+chart_6.png
+chart_7.png
+chart_8.png
+chart_9.png
+chart_center.png
+chart_medium_gear.png
+chart_pin.png
+chart_red_light.png
+chart_small_gear.png
+ciou_surface.csv
+ciou_surface.gnuplot
+ciou_surface.html
+ciou_surface.svg
