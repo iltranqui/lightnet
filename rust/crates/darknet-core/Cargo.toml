@@ -1,0 +1,12 @@
+[package]
+name = "darknet-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "darknet_core"
+path = "src/lib.rs"
+
+[dependencies]
+darknet-cuda = { path = "../darknet-cuda" }

@@ -1,0 +1,14 @@
+[package]
+name = "darknet-cuda-cutile"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+darknet-cuda = { path = "../../crates/darknet-cuda" }
+cutile = { git = "https://github.com/NVlabs/cutile-rs", branch = "main" }
+
+[lib]
+name = "darknet_cuda_cutile"
+path = "src/lib.rs"
+

@@ -1,0 +1,75 @@
+/* Darknet/YOLO:  https://codeberg.org/CCodeRun/darknet
+ * Copyright 2024-2026 Stephane Charette
+ */
+
+#pragma once
+
+#include "darknet_internal.hpp"
+
+
+namespace Darknet
+{
+	enum EColour
+	{
+		kNormal			= 0,
+		kBlack			,
+		kRed			,
+		kGreen			,
+		kBrown			,
+		kBlue			,
+		kMagenta		,
+		kCyan			,
+		kLightGrey		,
+		kDarkGrey		,
+		kBrightRed		,
+		kBrightGreen	,
+		kYellow			,
+		kBrightBlue		,
+		kBrightMagenta	,
+		kBrightCyan		,
+		kBrightWhite	,
+	};
+
+	std::string in_colour(const EColour colour, const int i);
+	std::string in_colour(const EColour colour, const float f);
+	std::string in_colour(const EColour colour, const double d);
+	std::string in_colour(const EColour colour, const std::string & msg);
+	std::string in_colour(const EColour colour);
+
+	/// Format the loss combined with ANSI colours.
+	std::string format_loss(const double & loss);
+
+	/// Format the mAP% accuracy with ANSI colours.  Value should be between @p 0.0 and @p 1.0 as it will be multiplied by 100 prior to display.
+	std::string format_map_accuracy(const float & accuracy);
+
+	std::string format_in_colour(const std::string & str, const EColour & colour, const int & len);
+	std::string format_in_colour(const int & i, const EColour & colour, const size_t & len);
+	std::string format_in_colour(const size_t & st, const EColour & colour, const size_t & len);
+	std::string format_in_colour(const float & f, const EColour & colour, const size_t & len);
+	std::string format_in_colour(const float & f, const size_t & len, const bool inverted = false);
+	std::string format_in_colour(const int & i, const size_t & len);
+	std::string format_percentage(const int & i);
+
+	std::string format_map_ap_row_values(
+			const int class_id,
+			std::string name,
+			const float & average_precision, // 0..1
+			const int & tp,
+			const int & tn,
+			const int & fp,
+			const int & fn,
+			const int & gt,
+			const float & f1,
+			const float &diag_avg_iou); // 0..1 (diagnostic)
+
+	std::string format_layer_summary(
+			const size_t idx,
+			const Darknet::CfgSection & section,
+			const Darknet::Layer & l);
+
+	/// Display the given message in bright red (if colour is enabled).  The message is not linefeed terminated.
+	void display_error_msg(const std::string & msg);
+
+	/// Display the given message in yellow (if colour is enabled).  The message is not linefeed terminated.
+	void display_warning_msg(const std::string & msg);
+}
