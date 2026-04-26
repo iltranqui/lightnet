@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use darknet_core::GpuExecutableNetwork;
 use darknet_core::{
     DataConfig, DetectionOptions, ExecutableNetwork, Network, PlanarRgbImage, Tensor,
-    compute_learning_rate, compute_yolo_training_loss, decode_yolo_detections,
-    inspect_weights_file, load_names_file, load_paths_file, load_training_batch_from_paths,
-    save_weights,
+    YoloTrainingState, compute_learning_rate, compute_yolo_training_loss_with_state,
+    decode_yolo_detections, inspect_weights_file, load_names_file, load_paths_file,
+    load_training_batch_from_paths, save_weights,
 };
 #[cfg(feature = "cutile")]
 use darknet_cuda_cutile::CutileBackend;
@@ -381,6 +381,7 @@ fn run_detector_train_cpu(
     } else {
         (seen as usize) / images_per_iteration
     };
+    let mut yolo_state = YoloTrainingState::default();
     let mut image_cursor = if train_images.is_empty() {
         0usize
     } else {
@@ -400,7 +401,13 @@ fn run_detector_train_cpu(
                 start_index,
             )?;
             let forward = executable.forward(&batch.input)?;
-            let yolo = compute_yolo_training_loss(&executable.network, &forward, &batch.labels)?;
+            let yolo = compute_yolo_training_loss_with_state(
+                &executable.network,
+                &forward,
+                &batch.labels,
+                batch_num,
+                Some(&mut yolo_state),
+            )?;
             iter_loss += yolo.loss;
             executable.backward_accumulate_seeded(
                 &batch.input,
@@ -501,6 +508,7 @@ fn run_detector_train_gpu(
     } else {
         (seen as usize) / images_per_iteration
     };
+    let mut yolo_state = YoloTrainingState::default();
     let mut image_cursor = if train_images.is_empty() {
         0usize
     } else {
@@ -524,10 +532,12 @@ fn run_detector_train_gpu(
                 start_index,
             )?;
             let forward = executable.forward_with_state(&batch.input)?;
-            let yolo = compute_yolo_training_loss(
+            let yolo = compute_yolo_training_loss_with_state(
                 &executable.network,
                 &forward.cpu_forward,
                 &batch.labels,
+                batch_num,
+                Some(&mut yolo_state),
             )?;
             iter_loss += yolo.loss;
             executable

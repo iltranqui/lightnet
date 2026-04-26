@@ -342,16 +342,18 @@ impl ExecutableNetwork {
             };
 
             let (output, activation_input) = match (&layer.kind, params) {
-                (LayerKind::Convolutional(spec), LayerParams::Convolutional(_) | LayerParams::None) => {
-                    let conv = resolve_convolutional_params(&self.network, &self.params, layer.index)?;
+                (
+                    LayerKind::Convolutional(spec),
+                    LayerParams::Convolutional(_) | LayerParams::None,
+                ) => {
+                    let conv =
+                        resolve_convolutional_params(&self.network, &self.params, layer.index)?;
                     forward_convolutional_with_cache(spec, conv, current_input, layer.output_shape)
                 }
-                (LayerKind::Connected(spec), LayerParams::Connected(connected)) => {
-                    (
-                        forward_connected(spec, connected, current_input, layer.output_shape),
-                        None,
-                    )
-                }
+                (LayerKind::Connected(spec), LayerParams::Connected(connected)) => (
+                    forward_connected(spec, connected, current_input, layer.output_shape),
+                    None,
+                ),
                 (LayerKind::MaxPool(spec), LayerParams::None) => forward_maxpool(
                     spec.size,
                     spec.stride_x,
@@ -373,21 +375,17 @@ impl ExecutableNetwork {
                 )
                 .map(|output| (output, None))?,
                 (LayerKind::AvgPool, LayerParams::None) => (forward_avgpool(current_input), None),
-                (LayerKind::Route(spec), LayerParams::None) => {
-                    (
-                        forward_route(spec, layer.index, &layer_outputs, layer.output_shape)?,
-                        None,
-                    )
-                }
+                (LayerKind::Route(spec), LayerParams::None) => (
+                    forward_route(spec, layer.index, &layer_outputs, layer.output_shape)?,
+                    None,
+                ),
                 (LayerKind::Shortcut(spec), LayerParams::None) => {
                     forward_shortcut_with_cache(spec, current_input, layer.index, &layer_outputs)?
                 }
-                (LayerKind::Upsample(spec), LayerParams::None) => {
-                    (
-                        forward_upsample(spec, current_input, layer.output_shape)?,
-                        None,
-                    )
-                }
+                (LayerKind::Upsample(spec), LayerParams::None) => (
+                    forward_upsample(spec, current_input, layer.output_shape)?,
+                    None,
+                ),
                 (LayerKind::Yolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
                 | (LayerKind::Region(_), LayerParams::None)
@@ -399,12 +397,10 @@ impl ExecutableNetwork {
                 | (LayerKind::Contrastive { .. }, LayerParams::None) => {
                     (current_input.clone(), None)
                 }
-                (LayerKind::Reorg(spec), LayerParams::None) => {
-                    (
-                        forward_reorg(spec.stride, spec.reverse, current_input, layer.output_shape)?,
-                        None,
-                    )
-                }
+                (LayerKind::Reorg(spec), LayerParams::None) => (
+                    forward_reorg(spec.stride, spec.reverse, current_input, layer.output_shape)?,
+                    None,
+                ),
                 (LayerKind::Rnn { .. }, _)
                 | (LayerKind::Lstm { .. }, _)
                 | (LayerKind::Crnn { .. }, _) => {
@@ -472,7 +468,12 @@ impl ExecutableNetwork {
         // Allocate a local workspace for this standalone (non-accumulate) backward call.
         // backward_accumulate_seeded reuses the pre-allocated self.workspace instead.
         let mut local_workspace = vec![0.0f32; compute_cpu_workspace_size(&self.network)];
-        self.backward_seeded_core(&mut local_workspace, input, forward, layer_output_gradient_seeds)
+        self.backward_seeded_core(
+            &mut local_workspace,
+            input,
+            forward,
+            layer_output_gradient_seeds,
+        )
     }
 
     fn backward_seeded_core(
@@ -550,8 +551,12 @@ impl ExecutableNetwork {
             };
 
             match (&layer.kind, params) {
-                (LayerKind::Convolutional(spec), LayerParams::Convolutional(_) | LayerParams::None) => {
-                    let conv = resolve_convolutional_params(&self.network, &self.params, layer.index)?;
+                (
+                    LayerKind::Convolutional(spec),
+                    LayerParams::Convolutional(_) | LayerParams::None,
+                ) => {
+                    let conv =
+                        resolve_convolutional_params(&self.network, &self.params, layer.index)?;
                     let (input_grad, layer_param_gradients) = backward_convolutional(
                         spec,
                         conv,
@@ -729,7 +734,8 @@ impl ExecutableNetwork {
         // Pull out the pre-allocated workspace to avoid the borrow-split problem:
         // mem::take replaces self.workspace with an empty Vec, then we restore it after.
         let mut ws = std::mem::take(&mut self.workspace);
-        let result = self.backward_seeded_core(&mut ws, input, forward, layer_output_gradient_seeds)?;
+        let result =
+            self.backward_seeded_core(&mut ws, input, forward, layer_output_gradient_seeds)?;
         self.workspace = ws;
         self.update_convolution_batch_norm_running_stats(input, forward)?;
         self.accumulate_train_buffers(&result.param_gradients)?;
@@ -760,7 +766,8 @@ impl ExecutableNetwork {
                 })?
             };
             let (mean, variance) = {
-                let params = resolve_convolutional_params(&self.network, &self.params, layer.index)?;
+                let params =
+                    resolve_convolutional_params(&self.network, &self.params, layer.index)?;
                 let raw_output =
                     raw_convolution_output(spec, params, current_input, layer.output_shape);
                 channel_mean_variance(&raw_output)
@@ -971,12 +978,7 @@ where
                     let grouped_channels = layer.input_shape.channels / spec.groups.max(1);
                     let weight_updates = self
                         .backend
-                        .zeros_f32(&[
-                            spec.filters,
-                            grouped_channels,
-                            spec.size,
-                            spec.size,
-                        ])
+                        .zeros_f32(&[spec.filters, grouped_channels, spec.size, spec.size])
                         .map_err(|err| backend_error("allocate GPU weight updates", err))?;
                     let bias_updates = self
                         .backend
@@ -1129,8 +1131,12 @@ where
 
             let mut activation_input_gpu = None;
             let output_gpu = match (&layer.kind, params) {
-                (LayerKind::Convolutional(spec), LayerParams::Convolutional(_) | LayerParams::None) => {
-                    let conv = resolve_convolutional_params(&self.network, &self.params, layer.index)?;
+                (
+                    LayerKind::Convolutional(spec),
+                    LayerParams::Convolutional(_) | LayerParams::None,
+                ) => {
+                    let conv =
+                        resolve_convolutional_params(&self.network, &self.params, layer.index)?;
                     let owner = resolve_convolutional_owner(&self.network, layer.index)?;
                     let cached = self.cached_convolution_params(
                         owner,
@@ -1235,16 +1241,20 @@ where
                     let mut route_total_channels = Vec::with_capacity(spec.layers.len());
                     for raw_index in &spec.layers {
                         let source_index = resolve_relative_layer(layer.index, *raw_index)?;
-                        let source = gpu_layer_outputs.get(source_index).ok_or(Error::InvalidRoute {
-                            layer_index: layer.index,
-                            reference: *raw_index,
-                        })?;
-                        let source_layer = self.network.layers.get(source_index).ok_or_else(|| {
-                            Error::InvalidConfig(format!(
-                                "missing source layer #{source_index} for route layer #{}",
-                                layer.index
-                            ))
-                        })?;
+                        let source =
+                            gpu_layer_outputs
+                                .get(source_index)
+                                .ok_or(Error::InvalidRoute {
+                                    layer_index: layer.index,
+                                    reference: *raw_index,
+                                })?;
+                        let source_layer =
+                            self.network.layers.get(source_index).ok_or_else(|| {
+                                Error::InvalidConfig(format!(
+                                    "missing source layer #{source_index} for route layer #{}",
+                                    layer.index
+                                ))
+                            })?;
                         let chunk_channels =
                             source_layer.output_shape.channels / spec.groups.max(1);
                         route_inputs.push(source);
@@ -1269,16 +1279,20 @@ where
                     let mut accumulated = current_input.clone();
                     for raw_index in &spec.from {
                         let source_index = resolve_relative_layer(layer.index, *raw_index)?;
-                        let source = gpu_layer_outputs.get(source_index).ok_or(Error::InvalidRoute {
-                            layer_index: layer.index,
-                            reference: *raw_index,
-                        })?;
-                        let source_layer = self.network.layers.get(source_index).ok_or_else(|| {
-                            Error::InvalidConfig(format!(
-                                "missing source layer #{source_index} for shortcut layer #{}",
-                                layer.index
-                            ))
-                        })?;
+                        let source =
+                            gpu_layer_outputs
+                                .get(source_index)
+                                .ok_or(Error::InvalidRoute {
+                                    layer_index: layer.index,
+                                    reference: *raw_index,
+                                })?;
+                        let source_layer =
+                            self.network.layers.get(source_index).ok_or_else(|| {
+                                Error::InvalidConfig(format!(
+                                    "missing source layer #{source_index} for shortcut layer #{}",
+                                    layer.index
+                                ))
+                            })?;
                         if source_layer.output_shape != layer.output_shape {
                             return Err(Error::InvalidConfig(format!(
                                 "shortcut layer #{} mixes incompatible shapes {} and {}",
@@ -1415,8 +1429,12 @@ where
             };
 
             let output_gpu = match (&layer.kind, params) {
-                (LayerKind::Convolutional(spec), LayerParams::Convolutional(_) | LayerParams::None) => {
-                    let conv = resolve_convolutional_params(&self.network, &self.params, layer.index)?;
+                (
+                    LayerKind::Convolutional(spec),
+                    LayerParams::Convolutional(_) | LayerParams::None,
+                ) => {
+                    let conv =
+                        resolve_convolutional_params(&self.network, &self.params, layer.index)?;
                     let owner = resolve_convolutional_owner(&self.network, layer.index)?;
                     let cached = self.cached_convolution_params(
                         owner,
@@ -1693,7 +1711,11 @@ where
             )));
         }
         if self.device_train_buffers.borrow().len() != self.network.layers.len()
-            || self.device_train_buffers.borrow().iter().all(Option::is_none)
+            || self
+                .device_train_buffers
+                .borrow()
+                .iter()
+                .all(Option::is_none)
         {
             self.init_train_buffers_gpu()?;
         }
@@ -1717,8 +1739,12 @@ where
             };
 
             match (&layer.kind, self.params.get(layer.index)) {
-                (LayerKind::Convolutional(spec), Some(LayerParams::Convolutional(_) | LayerParams::None)) => {
-                    let conv = resolve_convolutional_params(&self.network, &self.params, layer.index)?;
+                (
+                    LayerKind::Convolutional(spec),
+                    Some(LayerParams::Convolutional(_) | LayerParams::None),
+                ) => {
+                    let conv =
+                        resolve_convolutional_params(&self.network, &self.params, layer.index)?;
                     let owner = resolve_convolutional_owner(&self.network, layer.index)?;
                     let cached = self.cached_convolution_params(
                         owner,
@@ -1748,16 +1774,17 @@ where
                             config,
                         )
                         .map_err(|err| backend_error("GPU convolution bias backward", err))?;
-                    let current_input = if layer.index == 0 {
-                        &forward.input_gpu
-                    } else {
-                        forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
+                    let current_input =
+                        if layer.index == 0 {
+                            &forward.input_gpu
+                        } else {
+                            forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
                             Error::InvalidConfig(format!(
                                 "missing previous GPU layer output for convolutional layer #{}",
                                 layer.index
                             ))
                         })?
-                    };
+                        };
                     let scale_grad = if let Some(batch_norm) = conv.batch_norm.as_ref() {
                         let raw_output = self
                             .backend
@@ -1807,12 +1834,7 @@ where
                         .conv2d_backward_weights_f32(
                             current_input,
                             &grad_for_conv,
-                            &[
-                                spec.filters,
-                                grouped_channels,
-                                spec.size,
-                                spec.size,
-                            ],
+                            &[spec.filters, grouped_channels, spec.size, spec.size],
                             layer.input_shape.channels,
                             layer.input_shape.height,
                             layer.input_shape.width,
@@ -1856,12 +1878,15 @@ where
                     let current_input = if layer.index == 0 {
                         &forward.input_gpu
                     } else {
-                        forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
-                            Error::InvalidConfig(format!(
-                                "missing previous GPU layer output for maxpool layer #{}",
-                                layer.index
-                            ))
-                        })?
+                        forward
+                            .gpu_layer_outputs
+                            .get(layer.index - 1)
+                            .ok_or_else(|| {
+                                Error::InvalidConfig(format!(
+                                    "missing previous GPU layer output for maxpool layer #{}",
+                                    layer.index
+                                ))
+                            })?
                     };
                     let input_grad = self
                         .backend
@@ -1932,10 +1957,14 @@ where
                     let mut source_indices = Vec::with_capacity(spec.layers.len());
                     for raw_index in &spec.layers {
                         let source_index = resolve_relative_layer(layer.index, *raw_index)?;
-                        let source_layer = self.network.layers.get(source_index).ok_or(Error::InvalidRoute {
-                            layer_index: layer.index,
-                            reference: *raw_index,
-                        })?;
+                        let source_layer =
+                            self.network
+                                .layers
+                                .get(source_index)
+                                .ok_or(Error::InvalidRoute {
+                                    layer_index: layer.index,
+                                    reference: *raw_index,
+                                })?;
                         let chunk_channels =
                             source_layer.output_shape.channels / spec.groups.max(1);
                         input_shapes.push(tensor_backend_shape(source_layer.output_shape).to_vec());
@@ -2081,18 +2110,33 @@ where
         bias_grad: B::Tensor,
         scale_grad: Option<B::Tensor>,
     ) -> Result<()> {
-        let Some(train) = self.device_train_buffers.borrow().get(owner).and_then(Clone::clone) else {
+        let Some(train) = self
+            .device_train_buffers
+            .borrow()
+            .get(owner)
+            .and_then(Clone::clone)
+        else {
             return Err(Error::InvalidConfig(format!(
                 "missing GPU train buffers for layer #{owner}"
             )));
         };
         let weight_updates = self
             .backend
-            .saxpy_f32(1.0, &weight_grad, &train.weight_updates, ElementwiseLaunchConfig::default())
+            .saxpy_f32(
+                1.0,
+                &weight_grad,
+                &train.weight_updates,
+                ElementwiseLaunchConfig::default(),
+            )
             .map_err(|err| backend_error("GPU weight gradient accumulation", err))?;
         let bias_updates = self
             .backend
-            .saxpy_f32(1.0, &bias_grad, &train.bias_updates, ElementwiseLaunchConfig::default())
+            .saxpy_f32(
+                1.0,
+                &bias_grad,
+                &train.bias_updates,
+                ElementwiseLaunchConfig::default(),
+            )
             .map_err(|err| backend_error("GPU bias gradient accumulation", err))?;
         let scale_updates = match (train.scale_updates, scale_grad) {
             (Some(scale_updates), Some(scale_grad)) => Some(
@@ -2103,7 +2147,9 @@ where
                         &scale_updates,
                         ElementwiseLaunchConfig::default(),
                     )
-                    .map_err(|err| backend_error("GPU batch-norm scale gradient accumulation", err))?,
+                    .map_err(|err| {
+                        backend_error("GPU batch-norm scale gradient accumulation", err)
+                    })?,
             ),
             (None, None) => None,
             (Some(scale_updates), None) => Some(scale_updates),
@@ -2241,9 +2287,10 @@ where
                     "missing cached GPU convolution params for layer #{owner}"
                 ))
             })?;
-        let layer = self.network.layers.get(owner).ok_or_else(|| {
-            Error::InvalidConfig(format!("missing convolutional layer #{owner}"))
-        })?;
+        let layer =
+            self.network.layers.get(owner).ok_or_else(|| {
+                Error::InvalidConfig(format!("missing convolutional layer #{owner}"))
+            })?;
         let LayerKind::Convolutional(spec) = &layer.kind else {
             return Err(Error::InvalidConfig(format!(
                 "layer #{owner} is not convolutional"
@@ -2274,16 +2321,17 @@ where
                 continue;
             }
 
-            let current_input = if layer.index == 0 {
-                &forward.input_gpu
-            } else {
-                forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
+            let current_input =
+                if layer.index == 0 {
+                    &forward.input_gpu
+                } else {
+                    forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
                     Error::InvalidConfig(format!(
                         "missing previous GPU layer output for batch-norm stats at layer #{}",
                         layer.index
                     ))
                 })?
-            };
+                };
             let cached = self
                 .device_conv_params
                 .borrow()
@@ -2354,17 +2402,15 @@ where
 
     fn warm_device_conv_params(&self) -> Result<()> {
         for (layer, params) in self.network.layers.iter().zip(&self.params) {
-            if let (LayerKind::Convolutional(spec), LayerParams::Convolutional(_) | LayerParams::None) =
-                (&layer.kind, params)
+            if let (
+                LayerKind::Convolutional(spec),
+                LayerParams::Convolutional(_) | LayerParams::None,
+            ) = (&layer.kind, params)
             {
                 let conv = resolve_convolutional_params(&self.network, &self.params, layer.index)?;
                 let owner = resolve_convolutional_owner(&self.network, layer.index)?;
-                let _ = self.cached_convolution_params(
-                    owner,
-                    layer.input_shape.channels,
-                    spec,
-                    conv,
-                )?;
+                let _ =
+                    self.cached_convolution_params(owner, layer.input_shape.channels, spec, conv)?;
             }
         }
         Ok(())
@@ -2432,9 +2478,7 @@ where
                         .scales
                         .iter()
                         .zip(&batch_norm.rolling_variance)
-                        .map(|(scale, variance)| {
-                            scale / (variance + BATCH_NORM_EPSILON).sqrt()
-                        })
+                        .map(|(scale, variance)| scale / (variance + BATCH_NORM_EPSILON).sqrt())
                         .collect::<Vec<_>>();
                     self.backend
                         .upload_f32(&[spec.filters], &scales)
@@ -2464,9 +2508,10 @@ where
         bias_updates: B::Tensor,
         scale_updates: Option<B::Tensor>,
     ) -> Result<GpuConvolutionLayerParams<B::Tensor>> {
-        let layer = self.network.layers.get(owner).ok_or_else(|| {
-            Error::InvalidConfig(format!("missing convolutional layer #{owner}"))
-        })?;
+        let layer =
+            self.network.layers.get(owner).ok_or_else(|| {
+                Error::InvalidConfig(format!("missing convolutional layer #{owner}"))
+            })?;
         let LayerKind::Convolutional(spec) = &layer.kind else {
             return Err(Error::InvalidConfig(format!(
                 "layer #{owner} is not convolutional"
@@ -2486,7 +2531,12 @@ where
             batch_norm: params.batch_norm.clone(),
             weights: weights_host,
         };
-        let refreshed = self.cached_convolution_upload(spec, layer.input_shape.channels, &host_params, Some((raw_weights, raw_biases)))?;
+        let refreshed = self.cached_convolution_upload(
+            spec,
+            layer.input_shape.channels,
+            &host_params,
+            Some((raw_weights, raw_biases)),
+        )?;
         self.device_conv_params.borrow_mut()[owner] = Some(refreshed.clone());
         self.device_train_buffers.borrow_mut()[owner] = Some(GpuConvolutionTrainBuffers {
             weight_updates,
@@ -2557,9 +2607,7 @@ where
                         .scales
                         .iter()
                         .zip(&batch_norm.rolling_variance)
-                        .map(|(scale, variance)| {
-                            scale / (variance + BATCH_NORM_EPSILON).sqrt()
-                        })
+                        .map(|(scale, variance)| scale / (variance + BATCH_NORM_EPSILON).sqrt())
                         .collect::<Vec<_>>();
                     self.backend
                         .upload_f32(&[spec.filters], &scales)
@@ -3072,12 +3120,8 @@ fn forward_convolutional_with_cache(
                         }
                     }
 
-                    let biased = normalize_value(
-                        acc,
-                        filter,
-                        &params.biases,
-                        params.batch_norm.as_ref(),
-                    );
+                    let biased =
+                        normalize_value(acc, filter, &params.biases, params.batch_norm.as_ref());
                     activation_input.set(b, filter, oy, ox, biased);
                     output.set(b, filter, oy, ox, activate(spec.activation.clone(), biased));
                 }
@@ -3099,7 +3143,8 @@ fn raw_convolution_output(
         for filter in 0..output_shape.channels {
             for y in 0..output_shape.height {
                 for x in 0..output_shape.width {
-                    let value = convolution_raw_value(spec, &params.weights, input, b, filter, y, x);
+                    let value =
+                        convolution_raw_value(spec, &params.weights, input, b, filter, y, x);
                     output.set(b, filter, y, x, value);
                 }
             }
@@ -3198,12 +3243,7 @@ fn forward_connected(
 
             let value = activate(
                 spec.activation.clone(),
-                normalize_value(
-                acc,
-                out_idx,
-                &params.biases,
-                params.batch_norm.as_ref(),
-                ),
+                normalize_value(acc, out_idx, &params.biases, params.batch_norm.as_ref()),
             );
             output.data[b * spec.output + out_idx] = value;
         }
@@ -3252,11 +3292,14 @@ fn backward_convolutional(
     // Split the workspace into two mutable views used as bias_grad / weight_grad.
     let (bias_grad, weight_grad) = workspace[..needed].split_at_mut(bias_size);
     let mut input_grad = Tensor::zeros(input.shape);
-    let mut batch_norm_grad = params.batch_norm.as_ref().map(|batch_norm| BatchNormParams {
-        scales: vec![0.0; batch_norm.scales.len()],
-        rolling_mean: vec![0.0; batch_norm.rolling_mean.len()],
-        rolling_variance: vec![0.0; batch_norm.rolling_variance.len()],
-    });
+    let mut batch_norm_grad = params
+        .batch_norm
+        .as_ref()
+        .map(|batch_norm| BatchNormParams {
+            scales: vec![0.0; batch_norm.scales.len()],
+            rolling_mean: vec![0.0; batch_norm.rolling_mean.len()],
+            rolling_variance: vec![0.0; batch_norm.rolling_variance.len()],
+        });
 
     for b in 0..input.shape.batch {
         for filter in 0..spec.filters {
@@ -3267,8 +3310,8 @@ fn backward_convolutional(
                     if let Some(batch_norm) = params.batch_norm.as_ref() {
                         let raw_value =
                             convolution_raw_value(spec, &params.weights, input, b, filter, oy, ox);
-                        let inv_std = 1.0
-                            / (batch_norm.rolling_variance[filter] + BATCH_NORM_EPSILON).sqrt();
+                        let inv_std =
+                            1.0 / (batch_norm.rolling_variance[filter] + BATCH_NORM_EPSILON).sqrt();
                         let normalized = (raw_value - batch_norm.rolling_mean[filter]) * inv_std;
                         bias_grad[filter] += grad_value;
                         if let Some(batch_norm_grad) = batch_norm_grad.as_mut() {
@@ -3298,15 +3341,16 @@ fn backward_convolutional(
 
                                 let src_y = src_y as usize;
                                 let src_x = src_x as usize;
-                                let weight_index =
-                                    ((filter * channels_per_group + ic) * spec.size + ky)
-                                        * spec.size
-                                        + kx;
+                                let weight_index = ((filter * channels_per_group + ic) * spec.size
+                                    + ky)
+                                    * spec.size
+                                    + kx;
                                 weight_grad[weight_index] +=
                                     input.get(b, channel, src_y, src_x) * grad_value;
 
                                 let input_index = input.offset(b, channel, src_y, src_x);
-                                input_grad.data[input_index] += params.weights[weight_index] * grad_value;
+                                input_grad.data[input_index] +=
+                                    params.weights[weight_index] * grad_value;
                             }
                         }
                     }
@@ -3457,12 +3501,13 @@ fn backward_route(
         })?;
         let chunk_channels = source_layer.output_shape.channels / spec.groups.max(1);
         let channel_start = chunk_channels * spec.group_id;
-        let source_grad = layer_output_gradients
-            .get_mut(source_index)
-            .ok_or(Error::InvalidRoute {
-                layer_index,
-                reference: *raw_index,
-            })?;
+        let source_grad =
+            layer_output_gradients
+                .get_mut(source_index)
+                .ok_or(Error::InvalidRoute {
+                    layer_index,
+                    reference: *raw_index,
+                })?;
 
         for b in 0..source_layer.output_shape.batch {
             for c in 0..chunk_channels {
@@ -3645,11 +3690,13 @@ fn accumulate_previous_gradient(
         accumulate_tensor(input_gradient, gradient)
     } else {
         accumulate_tensor(
-            layer_output_gradients.get_mut(layer_index - 1).ok_or_else(|| {
-                Error::InvalidConfig(format!(
-                    "missing previous layer gradient slot for layer #{layer_index}"
-                ))
-            })?,
+            layer_output_gradients
+                .get_mut(layer_index - 1)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "missing previous layer gradient slot for layer #{layer_index}"
+                    ))
+                })?,
             gradient,
         )
     }
@@ -4013,7 +4060,9 @@ mod tests {
     };
 
     use crate::cfg::ConfigFile;
-    use crate::model::{Activation, ConvolutionalSpec, LayerKind, LrPolicy, NetConfig, Network, TensorShape};
+    use crate::model::{
+        Activation, ConvolutionalSpec, LayerKind, LrPolicy, NetConfig, Network, TensorShape,
+    };
     use crate::train::{YoloLabel, compute_yolo_training_loss};
     use darknet_cuda::{ElementwiseLaunchConfig, F32ActivationKind, F32TensorOpsBackend};
 
@@ -4140,7 +4189,9 @@ mod tests {
             for b in 0..batch {
                 for (c, slot) in bias_grad.iter_mut().enumerate().take(channels) {
                     let base = (b * channels + c) * channel_stride;
-                    *slot += output_grad.data[base..base + channel_stride].iter().sum::<f32>();
+                    *slot += output_grad.data[base..base + channel_stride]
+                        .iter()
+                        .sum::<f32>();
                 }
             }
             Ok(FakeTensor {
@@ -4287,10 +4338,11 @@ mod tests {
                     for c in 0..src_channels {
                         let src_base =
                             (b * output_grad.shape[1] + output_channel_offset + c) * channel_stride;
-                        let dst_base =
-                            (b * source_total_channels + source_channel_offset + c) * channel_stride;
-                        input_grad[dst_base..dst_base + channel_stride]
-                            .copy_from_slice(&output_grad.data[src_base..src_base + channel_stride]);
+                        let dst_base = (b * source_total_channels + source_channel_offset + c)
+                            * channel_stride;
+                        input_grad[dst_base..dst_base + channel_stride].copy_from_slice(
+                            &output_grad.data[src_base..src_base + channel_stride],
+                        );
                     }
                 }
                 out.push(FakeTensor {
@@ -4424,13 +4476,15 @@ mod tests {
                                             + ky)
                                             * kernel_size
                                             + kx;
-                                        acc += output_grad.data[grad_index] * weights.data[weight_index];
+                                        acc += output_grad.data[grad_index]
+                                            * weights.data[weight_index];
                                     }
                                 }
                             }
-                            let input_index =
-                                ((((b * input_channels) + channel) * input_height) + iy) * input_width
-                                    + ix;
+                            let input_index = ((((b * input_channels) + channel) * input_height)
+                                + iy)
+                                * input_width
+                                + ix;
                             input_grad[input_index] = acc;
                         }
                     }
@@ -4487,7 +4541,8 @@ mod tests {
                                         if src_x < 0 || src_x >= input_width as isize {
                                             continue;
                                         }
-                                        let input_index = ((((b * input_channels) + input_channel)
+                                        let input_index = ((((b * input_channels)
+                                            + input_channel)
                                             * input_height)
                                             + src_y as usize)
                                             * input_width
@@ -4673,7 +4728,8 @@ mod tests {
                             let mut best_index = None;
                             let mut best_value = f32::NEG_INFINITY;
                             for ky in 0..size {
-                                let in_y = oy as isize * stride_y as isize + ky as isize - pad_offset;
+                                let in_y =
+                                    oy as isize * stride_y as isize + ky as isize - pad_offset;
                                 if !(0..input_height as isize).contains(&in_y) {
                                     continue;
                                 }
@@ -4822,8 +4878,8 @@ mod tests {
                     let mut acc = 0.0;
                     for y in 0..input_height {
                         for x_idx in 0..input_width {
-                            let src = ((((b * channels) + c) * input_height) + y) * input_width
-                                + x_idx;
+                            let src =
+                                ((((b * channels) + c) * input_height) + y) * input_width + x_idx;
                             acc += x.data[src];
                         }
                     }
@@ -4853,8 +4909,8 @@ mod tests {
                     let grad = output_grad.data[b * channels + c] / area;
                     for y in 0..input_height {
                         for x_idx in 0..input_width {
-                            let dst = ((((b * channels) + c) * input_height) + y) * input_width
-                                + x_idx;
+                            let dst =
+                                ((((b * channels) + c) * input_height) + y) * input_width + x_idx;
                             input_grad[dst] = grad;
                         }
                     }
@@ -5360,14 +5416,8 @@ mod tests {
             input_width: usize,
             config: ElementwiseLaunchConfig,
         ) -> std::result::Result<Self::Tensor, Self::Error> {
-            self.inner.avgpool_f32(
-                x,
-                output_shape,
-                channels,
-                input_height,
-                input_width,
-                config,
-            )
+            self.inner
+                .avgpool_f32(x, output_shape, channels, input_height, input_width, config)
         }
 
         fn avgpool_backward_f32(
@@ -6209,7 +6259,8 @@ mod tests {
         let network = Network::from_config(cfg).expect("network should build");
         let mut executable = ExecutableNetwork::new(network);
 
-        let path = PathBuf::from(std::env::temp_dir()).join("darknet-runtime-backward-conv.weights");
+        let path =
+            PathBuf::from(std::env::temp_dir()).join("darknet-runtime-backward-conv.weights");
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&0i32.to_le_bytes());
         bytes.extend_from_slice(&2i32.to_le_bytes());
@@ -6265,7 +6316,10 @@ mod tests {
         )
         .expect("tensor");
         let forward = executable.forward(&input).expect("forward should succeed");
-        assert_eq!(forward.final_output().expect("final output").data, vec![2.5]);
+        assert_eq!(
+            forward.final_output().expect("final output").data,
+            vec![2.5]
+        );
 
         let output_gradient =
             Tensor::from_data(TensorShape::new(1, 1, 1, 1), vec![8.0]).expect("tensor");
@@ -6440,8 +6494,8 @@ mod tests {
         executable
             .load_weights_file(&path)
             .expect("weights should load");
-        let input = Tensor::from_data(executable.network.net.input_shape(), vec![3.0])
-            .expect("tensor");
+        let input =
+            Tensor::from_data(executable.network.net.input_shape(), vec![3.0]).expect("tensor");
         let forward = executable.forward(&input).expect("forward should succeed");
         let output_gradient =
             Tensor::from_data(TensorShape::new(1, 1, 1, 1), vec![1.0]).expect("tensor");
@@ -6487,6 +6541,9 @@ mod tests {
             policy: LrPolicy::Constant,
             steps: Vec::new(),
             scales: Vec::new(),
+            equidistant_point: 0,
+            badlabels_rejection_percentage: 0.0,
+            num_sigmas_reject_badlabels: 0.0,
         };
         assert_eq!(compute_learning_rate(&base, 0), 0.0);
         assert!((compute_learning_rate(&base, 5) - 0.000625).abs() < 1e-9);
@@ -6618,8 +6675,8 @@ mod tests {
         executable
             .load_weights_file(&path)
             .expect("weights should load");
-        let input = Tensor::from_data(executable.network.net.input_shape(), vec![3.0])
-            .expect("tensor");
+        let input =
+            Tensor::from_data(executable.network.net.input_shape(), vec![3.0]).expect("tensor");
         let forward = executable.forward(&input).expect("forward should succeed");
         let output_gradient =
             Tensor::from_data(TensorShape::new(1, 1, 1, 1), vec![4.0]).expect("tensor");
@@ -6746,8 +6803,8 @@ mod tests {
         executable
             .load_weights_file(&path)
             .expect("weights should load");
-        let input = Tensor::from_data(executable.network.net.input_shape(), vec![1.0])
-            .expect("tensor");
+        let input =
+            Tensor::from_data(executable.network.net.input_shape(), vec![1.0]).expect("tensor");
         let forward = executable.forward(&input).expect("forward should succeed");
 
         let mut seeds = vec![None; executable.network.layers.len()];
@@ -7311,12 +7368,8 @@ mod tests {
         assert!(training.loss.is_finite());
         assert!(training.positive_matches > 0);
 
-        cpu.backward_accumulate_seeded(
-            &input,
-            &cpu_forward,
-            &training.layer_output_gradient_seeds,
-        )
-        .expect("CPU backward should accumulate");
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &training.layer_output_gradient_seeds)
+            .expect("CPU backward should accumulate");
         gpu.backward_accumulate_seeded_gpu(&gpu_forward, &training.layer_output_gradient_seeds)
             .expect("GPU backward should accumulate");
 
@@ -7327,7 +7380,10 @@ mod tests {
         let gpu_buffers = gpu.device_train_buffers.borrow();
         let gpu_train = gpu_buffers[0].as_ref().expect("GPU train buffers exist");
 
-        assert_eq!(cpu_train.bias_updates.len(), gpu_train.bias_updates.data.len());
+        assert_eq!(
+            cpu_train.bias_updates.len(),
+            gpu_train.bias_updates.data.len()
+        );
         for (cpu_value, gpu_value) in cpu_train
             .bias_updates
             .iter()
@@ -7335,7 +7391,10 @@ mod tests {
         {
             assert!((cpu_value - gpu_value).abs() < 1.0e-5);
         }
-        assert_eq!(cpu_train.weight_updates.len(), gpu_train.weight_updates.data.len());
+        assert_eq!(
+            cpu_train.weight_updates.len(),
+            gpu_train.weight_updates.data.len()
+        );
         for (cpu_value, gpu_value) in cpu_train
             .weight_updates
             .iter()
@@ -7389,8 +7448,7 @@ mod tests {
 
         let mut seeds = vec![None; cpu.network.layers.len()];
         seeds[1] = Some(
-            Tensor::from_data(cpu.network.layers[1].output_shape, vec![8.0])
-                .expect("seed tensor"),
+            Tensor::from_data(cpu.network.layers[1].output_shape, vec![8.0]).expect("seed tensor"),
         );
         cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
             .expect("CPU backward should accumulate");

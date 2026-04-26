@@ -65,10 +65,7 @@ impl DataConfig {
 
     pub fn required_train_list(&self) -> Result<&Path> {
         self.train.as_deref().ok_or_else(|| {
-            Error::InvalidConfig(format!(
-                "{} is missing train=...",
-                self.source.display()
-            ))
+            Error::InvalidConfig(format!("{} is missing train=...", self.source.display()))
         })
     }
 }
@@ -104,12 +101,30 @@ pub struct YoloTrainingLoss {
     pub ignored_objectness: usize,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct YoloTrainingState {
+    pub badlabels_reject_threshold: f32,
+    pub delta_rolling_max: f32,
+    pub delta_rolling_avg: f32,
+    pub delta_rolling_std: f32,
+}
+
 const YOLO_TARGET_EPSILON: f32 = 1.0e-4;
 
 pub fn compute_yolo_training_loss(
     network: &Network,
     forward: &ForwardResult,
     labels: &[Vec<YoloLabel>],
+) -> Result<YoloTrainingLoss> {
+    compute_yolo_training_loss_with_state(network, forward, labels, 0, None)
+}
+
+pub fn compute_yolo_training_loss_with_state(
+    network: &Network,
+    forward: &ForwardResult,
+    labels: &[Vec<YoloLabel>],
+    iteration: usize,
+    mut state: Option<&mut YoloTrainingState>,
 ) -> Result<YoloTrainingLoss> {
     let mut seeds = vec![None; network.layers.len()];
     let batch_size = network.net.batch.max(1);
@@ -301,10 +316,8 @@ pub fn compute_yolo_training_loss(
                     continue;
                 }
 
-                let grid_x =
-                    (label.x * grid_width as f32).clamp(0.0, grid_width as f32 - 1.0e-6);
-                let grid_y =
-                    (label.y * grid_height as f32).clamp(0.0, grid_height as f32 - 1.0e-6);
+                let grid_x = (label.x * grid_width as f32).clamp(0.0, grid_width as f32 - 1.0e-6);
+                let grid_y = (label.y * grid_height as f32).clamp(0.0, grid_height as f32 - 1.0e-6);
                 let col = grid_x.floor() as usize;
                 let row = grid_y.floor() as usize;
                 let channel_base = best_anchor_offset * entries_per_anchor;
@@ -313,8 +326,9 @@ pub fn compute_yolo_training_loss(
                     head.output.get(batch, channel_base + 4, row, col),
                     spec.new_coords,
                 );
-                let class_scale =
-                    (2.0 - label.w * label.h) * spec.iou_normalizer * class_multiplier(spec, class_id);
+                let class_scale = (2.0 - label.w * label.h)
+                    * spec.iou_normalizer
+                    * class_multiplier(spec, class_id);
 
                 apply_yolo_box_delta(
                     &head.output,
@@ -448,8 +462,9 @@ pub fn compute_yolo_training_loss(
                             if positive_classes > 0 {
                                 let scale = positive_classes as f32;
                                 for box_channel in 0..4 {
-                                    let value = seed.get(batch, channel_base + box_channel, row, col)
-                                        / scale;
+                                    let value =
+                                        seed.get(batch, channel_base + box_channel, row, col)
+                                            / scale;
                                     seed.set(batch, channel_base + box_channel, row, col, value);
                                 }
                             }
@@ -458,6 +473,10 @@ pub fn compute_yolo_training_loss(
                 }
             }
         }
+    }
+
+    if let Some(state) = state.as_deref_mut() {
+        apply_yolo_delta_filtering(network, &mut seeds, iteration, state);
     }
 
     let loss = seeds
@@ -473,6 +492,161 @@ pub fn compute_yolo_training_loss(
         positive_matches,
         ignored_objectness,
     })
+}
+
+fn apply_yolo_delta_filtering(
+    network: &Network,
+    seeds: &mut [Option<Tensor>],
+    iteration: usize,
+    state: &mut YoloTrainingState,
+) {
+    let start_point = network.net.max_batches.saturating_mul(3) / 4;
+    let reject_by_percentage =
+        network.net.badlabels_rejection_percentage != 0.0 && start_point < iteration;
+    let reject_by_sigmas =
+        network.net.num_sigmas_reject_badlabels != 0.0 && start_point < iteration;
+    let reject_by_equidistant =
+        network.net.equidistant_point != 0 && network.net.equidistant_point < iteration;
+
+    if !reject_by_percentage && !reject_by_sigmas && !reject_by_equidistant {
+        return;
+    }
+
+    for layer in &network.layers {
+        let (LayerKind::Yolo(spec) | LayerKind::GaussianYolo(spec)) = &layer.kind else {
+            continue;
+        };
+        let Some(seed) = seeds.get_mut(layer.index).and_then(Option::as_mut) else {
+            continue;
+        };
+        apply_yolo_delta_filtering_to_seed(network, spec, seed, iteration, start_point, state);
+    }
+}
+
+fn apply_yolo_delta_filtering_to_seed(
+    network: &Network,
+    spec: &YoloSpec,
+    seed: &mut Tensor,
+    iteration: usize,
+    start_point: usize,
+    state: &mut YoloTrainingState,
+) {
+    let nonzero: Vec<f32> = seed
+        .data
+        .iter()
+        .copied()
+        .filter(|delta| *delta != 0.0)
+        .collect();
+    if nonzero.is_empty() {
+        return;
+    }
+
+    let cur_max = nonzero
+        .iter()
+        .map(|delta| delta.abs())
+        .fold(0.0f32, f32::max);
+    let cur_avg = nonzero.iter().map(|delta| delta.abs()).sum::<f32>() / nonzero.len() as f32;
+
+    if state.delta_rolling_max == 0.0 {
+        state.delta_rolling_max = cur_max;
+    }
+    state.delta_rolling_max = state.delta_rolling_max * 0.99 + cur_max * 0.01;
+    state.delta_rolling_avg = state.delta_rolling_avg * 0.99 + cur_avg * 0.01;
+
+    let mut ep_loss_threshold = equidistant_loss_threshold(network, iteration, state);
+
+    if network.net.num_sigmas_reject_badlabels != 0.0 && start_point < iteration {
+        let rolling_std = state.delta_rolling_std;
+        let rolling_max = state.delta_rolling_max;
+        let rolling_avg = state.delta_rolling_avg;
+        let progress_badlabels = if start_point == 0 {
+            1.0
+        } else {
+            (iteration - start_point) as f32 / start_point as f32
+        };
+
+        let cur_std = (nonzero
+            .iter()
+            .map(|delta| (*delta - rolling_avg).powi(2))
+            .sum::<f32>()
+            / nonzero.len() as f32)
+            .sqrt();
+        state.delta_rolling_std = state.delta_rolling_std * 0.99 + cur_std * 0.01;
+
+        let final_badlabels_threshold =
+            rolling_avg + rolling_std * network.net.num_sigmas_reject_badlabels;
+        let mut badlabels_threshold =
+            rolling_max - progress_badlabels * (rolling_max - final_badlabels_threshold).abs();
+        badlabels_threshold = badlabels_threshold.max(final_badlabels_threshold);
+        zero_deltas_above(seed, badlabels_threshold);
+
+        ep_loss_threshold =
+            final_badlabels_threshold.min(rolling_avg) * equidistant_progress(network, iteration);
+    }
+
+    if network.net.badlabels_rejection_percentage != 0.0 && start_point < iteration {
+        if state.badlabels_reject_threshold == 0.0 {
+            state.badlabels_reject_threshold = state.delta_rolling_max;
+        }
+
+        let counter_all = seed.data.iter().filter(|delta| **delta != 0.0).count();
+        let mut counter_reject = 0usize;
+        if counter_all != 0 {
+            for delta in &mut seed.data {
+                if *delta != 0.0 && delta.abs() > state.badlabels_reject_threshold {
+                    counter_reject += 1;
+                    *delta = 0.0;
+                }
+            }
+
+            let num_deltas_per_anchor = spec.classes + 5;
+            let cur_percent =
+                100.0 * (counter_reject * num_deltas_per_anchor) as f32 / counter_all as f32;
+            if cur_percent > network.net.badlabels_rejection_percentage {
+                state.badlabels_reject_threshold += 0.01;
+            } else if state.badlabels_reject_threshold > 0.01 {
+                state.badlabels_reject_threshold -= 0.01;
+            }
+        }
+    }
+
+    if network.net.equidistant_point != 0 && network.net.equidistant_point < iteration {
+        zero_deltas_below(seed, ep_loss_threshold);
+    }
+}
+
+fn equidistant_loss_threshold(
+    network: &Network,
+    iteration: usize,
+    state: &YoloTrainingState,
+) -> f32 {
+    state.delta_rolling_avg * equidistant_progress(network, iteration) * 1.4
+}
+
+fn equidistant_progress(network: &Network, iteration: usize) -> f32 {
+    let start = network.net.equidistant_point;
+    let denominator = network.net.max_batches.saturating_sub(start);
+    if denominator == 0 || iteration <= start {
+        0.0
+    } else {
+        (iteration - start) as f32 / denominator as f32
+    }
+}
+
+fn zero_deltas_above(seed: &mut Tensor, threshold: f32) {
+    for delta in &mut seed.data {
+        if delta.abs() > threshold {
+            *delta = 0.0;
+        }
+    }
+}
+
+fn zero_deltas_below(seed: &mut Tensor, threshold: f32) {
+    for delta in &mut seed.data {
+        if delta.abs() < threshold {
+            *delta = 0.0;
+        }
+    }
 }
 
 fn apply_yolo_box_delta(
@@ -506,10 +680,42 @@ fn apply_yolo_box_delta(
                 width_height_target(truth_bbox.w, net_width as f32, anchor.0, spec.new_coords);
             let th_target =
                 width_height_target(truth_bbox.h, net_height as f32, anchor.1, spec.new_coords);
-            add_box_delta(seed, batch, channel_base, row, col, 0, scale * (tx_target - tx_output));
-            add_box_delta(seed, batch, channel_base, row, col, 1, scale * (ty_target - ty_output));
-            add_box_delta(seed, batch, channel_base, row, col, 2, scale * (tw_target - tw_raw));
-            add_box_delta(seed, batch, channel_base, row, col, 3, scale * (th_target - th_raw));
+            add_box_delta(
+                seed,
+                batch,
+                channel_base,
+                row,
+                col,
+                0,
+                scale * (tx_target - tx_output),
+            );
+            add_box_delta(
+                seed,
+                batch,
+                channel_base,
+                row,
+                col,
+                1,
+                scale * (ty_target - ty_output),
+            );
+            add_box_delta(
+                seed,
+                batch,
+                channel_base,
+                row,
+                col,
+                2,
+                scale * (tw_target - tw_raw),
+            );
+            add_box_delta(
+                seed,
+                batch,
+                channel_base,
+                row,
+                col,
+                3,
+                scale * (th_target - th_raw),
+            );
         }
         _ => {
             let mut predicted_bbox = decode_training_bbox(
@@ -628,7 +834,10 @@ fn apply_yolo_class_delta(
 ) {
     if seed.get(batch, class_base + class_id, row, col) != 0.0 {
         let result_delta = smoothed_target(true, spec.label_smooth_eps)
-            - yolo_class_output(output.get(batch, class_base + class_id, row, col), spec.new_coords);
+            - yolo_class_output(
+                output.get(batch, class_base + class_id, row, col),
+                spec.new_coords,
+            );
         if result_delta.is_finite() {
             let value = if spec.class_multipliers.is_some() {
                 result_delta * class_multiplier(spec, class_id)
@@ -641,9 +850,10 @@ fn apply_yolo_class_delta(
     }
 
     if spec.focal_loss {
-        let pt =
-            yolo_class_output(output.get(batch, class_base + class_id, row, col), spec.new_coords)
-                + 1.0e-15;
+        let pt = yolo_class_output(
+            output.get(batch, class_base + class_id, row, col),
+            spec.new_coords,
+        ) + 1.0e-15;
         let grad = -(1.0 - pt) * (2.0 * pt * pt.ln() + pt - 1.0);
         let alpha = 0.5;
         for class_offset in 0..spec.classes {
@@ -718,8 +928,10 @@ fn compare_yolo_class_outputs(
     threshold: f32,
 ) -> bool {
     (0..classes).any(|class_offset| {
-        yolo_class_output(output.get(batch, class_base + class_offset, row, col), new_coords)
-            > threshold
+        yolo_class_output(
+            output.get(batch, class_base + class_offset, row, col),
+            new_coords,
+        ) > threshold
     })
 }
 
@@ -776,10 +988,7 @@ pub fn replace_image_to_label(path: impl AsRef<Path>) -> PathBuf {
     out
 }
 
-pub fn load_yolo_labels(
-    path: impl AsRef<Path>,
-    classes: Option<usize>,
-) -> Result<Vec<YoloLabel>> {
+pub fn load_yolo_labels(path: impl AsRef<Path>, classes: Option<usize>) -> Result<Vec<YoloLabel>> {
     let path = path.as_ref();
     let text = fs::read_to_string(path)?;
     let mut labels = Vec::new();
@@ -806,7 +1015,9 @@ pub fn load_yolo_labels(
                 index + 1
             ))
         })?;
-        if let Some(classes) = classes && class_id >= classes {
+        if let Some(classes) = classes
+            && class_id >= classes
+        {
             return Err(Error::InvalidConfig(format!(
                 "class id {} exceeds classes={} in {}",
                 class_id,
@@ -934,7 +1145,9 @@ fn resolve_optional_path(
     parent: &Path,
     key: &str,
 ) -> Option<PathBuf> {
-    options.get(key).map(|value| resolve_path(parent, Path::new(value)))
+    options
+        .get(key)
+        .map(|value| resolve_path(parent, Path::new(value)))
 }
 
 fn resolve_path(parent: &Path, path: &Path) -> PathBuf {
@@ -978,7 +1191,12 @@ fn best_anchor_assignment(
     Ok(best)
 }
 
-fn width_height_target(label_extent: f32, net_extent: f32, anchor_extent: f32, new_coords: bool) -> f32 {
+fn width_height_target(
+    label_extent: f32,
+    net_extent: f32,
+    anchor_extent: f32,
+    new_coords: bool,
+) -> f32 {
     let scaled = (label_extent * net_extent / anchor_extent).max(YOLO_TARGET_EPSILON);
     if new_coords {
         (scaled / 4.0).sqrt()
@@ -1187,10 +1405,26 @@ fn dx_box_iou(pred: YoloBox, truth: YoloBox, iou_loss: YoloIouLoss) -> BoxGrad {
     let du_wrt_l = dx_wrt_l - di_wrt_l;
     let du_wrt_r = dx_wrt_r - di_wrt_r;
 
-    let dc_wrt_t = if pred_t < truth_tblr.top { -giou_cw } else { 0.0 };
-    let dc_wrt_b = if pred_b > truth_tblr.bot { giou_cw } else { 0.0 };
-    let dc_wrt_l = if pred_l < truth_tblr.left { -giou_ch } else { 0.0 };
-    let dc_wrt_r = if pred_r > truth_tblr.right { giou_ch } else { 0.0 };
+    let dc_wrt_t = if pred_t < truth_tblr.top {
+        -giou_cw
+    } else {
+        0.0
+    };
+    let dc_wrt_b = if pred_b > truth_tblr.bot {
+        giou_cw
+    } else {
+        0.0
+    };
+    let dc_wrt_l = if pred_l < truth_tblr.left {
+        -giou_ch
+    } else {
+        0.0
+    };
+    let dc_wrt_r = if pred_r > truth_tblr.right {
+        giou_ch
+    } else {
+        0.0
+    };
 
     let mut p_dt = 0.0;
     let mut p_db = 0.0;
@@ -1204,10 +1438,26 @@ fn dx_box_iou(pred: YoloBox, truth: YoloBox, iou_loss: YoloIouLoss) -> BoxGrad {
     }
 
     let (orig_p_dt, orig_p_db, orig_p_dl, orig_p_dr) = (p_dt, p_db, p_dl, p_dr);
-    p_dt = if pred_tblr.top < pred_tblr.bot { orig_p_dt } else { orig_p_db };
-    p_db = if pred_tblr.top < pred_tblr.bot { orig_p_db } else { orig_p_dt };
-    p_dl = if pred_tblr.left < pred_tblr.right { orig_p_dl } else { orig_p_dr };
-    p_dr = if pred_tblr.left < pred_tblr.right { orig_p_dr } else { orig_p_dl };
+    p_dt = if pred_tblr.top < pred_tblr.bot {
+        orig_p_dt
+    } else {
+        orig_p_db
+    };
+    p_db = if pred_tblr.top < pred_tblr.bot {
+        orig_p_db
+    } else {
+        orig_p_dt
+    };
+    p_dl = if pred_tblr.left < pred_tblr.right {
+        orig_p_dl
+    } else {
+        orig_p_dr
+    };
+    p_dr = if pred_tblr.left < pred_tblr.right {
+        orig_p_dr
+    } else {
+        orig_p_dl
+    };
 
     if iou_loss == YoloIouLoss::Giou {
         if giou_c > 0.0 {
@@ -1271,7 +1521,11 @@ fn dx_box_iou(pred: YoloBox, truth: YoloBox, iou_loss: YoloIouLoss) -> BoxGrad {
         let ar_pred = pred.w / pred.h.max(YOLO_TARGET_EPSILON);
         let ar_loss = 4.0 / (std::f32::consts::PI * std::f32::consts::PI)
             * (ar_gt.atan() - ar_pred.atan()).powi(2);
-        let iou = if union > 0.0 { intersection / union } else { 0.0 };
+        let iou = if union > 0.0 {
+            intersection / union
+        } else {
+            0.0
+        };
         let alpha = ar_loss / (1.0 - iou + ar_loss + 1.0e-6);
         let ar_dw = 8.0 / (std::f32::consts::PI * std::f32::consts::PI)
             * (ar_gt.atan() - ar_pred.atan())
@@ -1349,18 +1603,15 @@ fn yolo_class_output(raw: f32, new_coords: bool) -> f32 {
 }
 
 fn yolo_objectness_output(raw: f32, new_coords: bool) -> f32 {
-    if new_coords {
-        raw
-    } else {
-        sigmoid(raw)
-    }
+    if new_coords { raw } else { sigmoid(raw) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DataConfig, YoloLabel, compute_yolo_training_loss, load_training_batch, load_yolo_labels,
-        replace_image_to_label,
+        DataConfig, YoloLabel, YoloTrainingState, apply_yolo_delta_filtering,
+        compute_yolo_training_loss, compute_yolo_training_loss_with_state, load_training_batch,
+        load_yolo_labels, replace_image_to_label,
     };
     use crate::cfg::ConfigFile;
     use crate::model::Network;
@@ -1385,9 +1636,18 @@ mod tests {
 
         let parsed = DataConfig::from_path(&data_path).expect("data cfg parses");
         assert_eq!(parsed.classes, Some(2));
-        assert_eq!(parsed.train.as_deref(), Some(dir.join("train.txt").as_path()));
-        assert_eq!(parsed.valid.as_deref(), Some(dir.join("valid.txt").as_path()));
-        assert_eq!(parsed.names.as_deref(), Some(dir.join("labels.names").as_path()));
+        assert_eq!(
+            parsed.train.as_deref(),
+            Some(dir.join("train.txt").as_path())
+        );
+        assert_eq!(
+            parsed.valid.as_deref(),
+            Some(dir.join("valid.txt").as_path())
+        );
+        assert_eq!(
+            parsed.names.as_deref(),
+            Some(dir.join("labels.names").as_path())
+        );
         assert_eq!(parsed.backup.as_deref(), Some(dir.join("backup").as_path()));
     }
 
@@ -1425,11 +1685,7 @@ mod tests {
         let image_path = dir.join("sample.ppm");
         let label_path = dir.join("sample.txt");
 
-        fs::write(
-            &image_path,
-            b"P6\n1 1\n255\n\xff\x80\x00",
-        )
-        .expect("ppm writes");
+        fs::write(&image_path, b"P6\n1 1\n255\n\xff\x80\x00").expect("ppm writes");
         fs::write(&label_path, "0 0.5 0.5 0.25 0.25\n").expect("labels write");
         fs::write(&train_list, format!("{}\n", image_path.display())).expect("train list writes");
         fs::write(
@@ -1570,5 +1826,149 @@ mod tests {
             .expect("yolo seed exists");
         assert_ne!(seed.get(0, 4, 0, 0), 0.0);
         assert_ne!(seed.get(0, 10, 0, 0), 0.0);
+    }
+
+    #[test]
+    fn yolo_training_state_filters_low_deltas_after_equidistant_point() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                batch=1
+                width=8
+                height=8
+                channels=3
+                max_batches=4
+                equidistant_point=1
+
+                [convolutional]
+                filters=6
+                size=1
+                stride=1
+                pad=1
+                activation=linear
+
+                [yolo]
+                mask=0
+                anchors=10,13
+                classes=1
+                num=1
+            "#,
+        )
+        .expect("cfg parses");
+        let network = Network::from_config(cfg).expect("network builds");
+        let executable = ExecutableNetwork::new(network.clone());
+        let input = executable.zero_input();
+        let forward = executable.forward(&input).expect("forward runs");
+        let labels = [vec![YoloLabel {
+            class_id: 0,
+            x: 0.5,
+            y: 0.5,
+            w: 0.25,
+            h: 0.25,
+        }]];
+        let baseline = compute_yolo_training_loss(&network, &forward, &labels)
+            .expect("baseline loss computes");
+        assert!(baseline.loss > 0.0);
+
+        let mut state = YoloTrainingState {
+            delta_rolling_avg: 10.0,
+            ..YoloTrainingState::default()
+        };
+        let filtered =
+            compute_yolo_training_loss_with_state(&network, &forward, &labels, 2, Some(&mut state))
+                .expect("filtered loss computes");
+
+        assert_eq!(filtered.loss, 0.0);
+        let seed = filtered.layer_output_gradient_seeds[1]
+            .as_ref()
+            .expect("yolo seed exists");
+        assert!(seed.data.iter().all(|delta| *delta == 0.0));
+        assert!(state.delta_rolling_avg > 0.0);
+    }
+
+    #[test]
+    fn yolo_training_state_rejects_high_deltas_by_percentage() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                batch=1
+                width=1
+                height=1
+                channels=6
+                max_batches=4
+                badlabels_rejection_percentage=0.2
+
+                [yolo]
+                mask=0
+                anchors=10,13
+                classes=1
+                num=1
+            "#,
+        )
+        .expect("cfg parses");
+        let network = Network::from_config(cfg).expect("network builds");
+        let mut seeds = vec![Some(
+            crate::runtime::Tensor::from_data(
+                network.layers[0].output_shape,
+                vec![0.1, 0.2, 5.0, 0.0, 0.0, 0.0],
+            )
+            .expect("seed tensor"),
+        )];
+        let mut state = YoloTrainingState {
+            badlabels_reject_threshold: 1.0,
+            delta_rolling_max: 1.0,
+            ..YoloTrainingState::default()
+        };
+
+        apply_yolo_delta_filtering(&network, &mut seeds, 4, &mut state);
+
+        let seed = seeds[0].as_ref().expect("seed should remain present");
+        assert_eq!(seed.data, vec![0.1, 0.2, 0.0, 0.0, 0.0, 0.0]);
+        assert!((state.badlabels_reject_threshold - 1.01).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn yolo_training_state_rejects_high_deltas_by_sigma_threshold() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                batch=1
+                width=1
+                height=1
+                channels=6
+                max_batches=4
+                num_sigmas_reject_badlabels=1
+
+                [yolo]
+                mask=0
+                anchors=10,13
+                classes=1
+                num=1
+            "#,
+        )
+        .expect("cfg parses");
+        let network = Network::from_config(cfg).expect("network builds");
+        let mut seeds = vec![Some(
+            crate::runtime::Tensor::from_data(
+                network.layers[0].output_shape,
+                vec![0.1, 0.2, 5.0, 0.0, 0.0, 0.0],
+            )
+            .expect("seed tensor"),
+        )];
+        let mut state = YoloTrainingState {
+            delta_rolling_max: 5.0,
+            delta_rolling_avg: 0.1,
+            delta_rolling_std: 0.1,
+            ..YoloTrainingState::default()
+        };
+
+        apply_yolo_delta_filtering(&network, &mut seeds, 4, &mut state);
+
+        let seed = seeds[0].as_ref().expect("seed should remain present");
+        assert_eq!(seed.data, vec![0.1, 0.2, 0.0, 0.0, 0.0, 0.0]);
+        assert!(state.delta_rolling_std > 0.1);
     }
 }

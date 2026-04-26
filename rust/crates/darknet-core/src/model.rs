@@ -50,6 +50,9 @@ pub struct NetConfig {
     pub policy: LrPolicy,
     pub steps: Vec<usize>,
     pub scales: Vec<f32>,
+    pub equidistant_point: usize,
+    pub badlabels_rejection_percentage: f32,
+    pub num_sigmas_reject_badlabels: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,7 +82,11 @@ impl NetConfig {
             )));
         }
 
-        let policy = match section.get_str("policy", "constant").to_ascii_lowercase().as_str() {
+        let policy = match section
+            .get_str("policy", "constant")
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "constant" => LrPolicy::Constant,
             "steps" => LrPolicy::Steps,
             "poly" => LrPolicy::Poly,
@@ -121,6 +128,10 @@ impl NetConfig {
             policy,
             steps,
             scales,
+            equidistant_point: section.get_usize("equidistant_point", 0)?,
+            badlabels_rejection_percentage: section
+                .get_f32("badlabels_rejection_percentage", 0.0)?,
+            num_sigmas_reject_badlabels: section.get_f32("num_sigmas_reject_badlabels", 0.0)?,
         })
     }
 
@@ -1143,6 +1154,9 @@ mod tests {
         assert_eq!(network.net.policy, LrPolicy::Steps);
         assert_eq!(network.net.steps, vec![400, 800]);
         assert_eq!(network.net.scales, vec![0.1, 0.1]);
+        assert_eq!(network.net.equidistant_point, 0);
+        assert_eq!(network.net.badlabels_rejection_percentage, 0.0);
+        assert_eq!(network.net.num_sigmas_reject_badlabels, 0.0);
     }
 
     #[test]
@@ -1159,6 +1173,10 @@ mod tests {
                 width=32
                 height=32
                 channels=6
+                max_batches=100
+                equidistant_point=75
+                badlabels_rejection_percentage=0.2
+                num_sigmas_reject_badlabels=3
 
                 [yolo]
                 mask=0,1
@@ -1186,6 +1204,9 @@ mod tests {
         .expect("cfg writes");
 
         let network = Network::from_path(&cfg_path).expect("cfg should parse");
+        assert_eq!(network.net.equidistant_point, 75);
+        assert_eq!(network.net.badlabels_rejection_percentage, 0.2);
+        assert_eq!(network.net.num_sigmas_reject_badlabels, 3.0);
         let LayerKind::Yolo(spec) = &network.layers[0].kind else {
             panic!("expected yolo layer");
         };
