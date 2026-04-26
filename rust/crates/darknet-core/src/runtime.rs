@@ -594,6 +594,32 @@ impl ExecutableNetwork {
                         &mut layer_output_gradients,
                     )?;
                 }
+                (LayerKind::LocalAvgPool(spec), LayerParams::None) => {
+                    let input_grad = backward_maxpool(
+                        spec.size,
+                        spec.stride_x,
+                        spec.stride_y,
+                        spec.padding,
+                        current_input,
+                        &grad,
+                        true,
+                    )?;
+                    accumulate_previous_gradient(
+                        layer.index,
+                        &input_grad,
+                        &mut input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::AvgPool, LayerParams::None) => {
+                    let input_grad = backward_avgpool(&grad, current_input.shape)?;
+                    accumulate_previous_gradient(
+                        layer.index,
+                        &input_grad,
+                        &mut input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
+                }
                 (LayerKind::Route(spec), LayerParams::None) => {
                     backward_route(
                         spec,
@@ -648,8 +674,6 @@ impl ExecutableNetwork {
                     )?;
                 }
                 (LayerKind::Connected(_), _)
-                | (LayerKind::LocalAvgPool(_), _)
-                | (LayerKind::AvgPool, _)
                 | (LayerKind::Reorg(_), _)
                 | (LayerKind::Rnn { .. }, _)
                 | (LayerKind::Lstm { .. }, _)
@@ -707,8 +731,56 @@ impl ExecutableNetwork {
         let mut ws = std::mem::take(&mut self.workspace);
         let result = self.backward_seeded_core(&mut ws, input, forward, layer_output_gradient_seeds)?;
         self.workspace = ws;
+        self.update_convolution_batch_norm_running_stats(input, forward)?;
         self.accumulate_train_buffers(&result.param_gradients)?;
         Ok(result)
+    }
+
+    fn update_convolution_batch_norm_running_stats(
+        &mut self,
+        input: &Tensor,
+        forward: &ForwardResult,
+    ) -> Result<()> {
+        for layer in &self.network.layers {
+            let LayerKind::Convolutional(spec) = &layer.kind else {
+                continue;
+            };
+            if !spec.batch_normalize || spec.share_index.is_some() {
+                continue;
+            }
+
+            let current_input = if layer.index == 0 {
+                input
+            } else {
+                forward.layer_outputs.get(layer.index - 1).ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "missing previous CPU layer output for batch-norm stats at layer #{}",
+                        layer.index
+                    ))
+                })?
+            };
+            let (mean, variance) = {
+                let params = resolve_convolutional_params(&self.network, &self.params, layer.index)?;
+                let raw_output =
+                    raw_convolution_output(spec, params, current_input, layer.output_shape);
+                channel_mean_variance(&raw_output)
+            };
+
+            let Some(LayerParams::Convolutional(params)) = self.params.get_mut(layer.index) else {
+                return Err(Error::InvalidConfig(format!(
+                    "missing convolutional params for layer #{}",
+                    layer.index
+                )));
+            };
+            let Some(batch_norm) = params.batch_norm.as_mut() else {
+                return Err(Error::InvalidConfig(format!(
+                    "missing batch-norm params for convolutional layer #{}",
+                    layer.index
+                )));
+            };
+            update_batch_norm_running_stats(batch_norm, &mean, &variance, 0.9)?;
+        }
+        Ok(())
     }
 
     fn accumulate_train_buffers(&mut self, param_gradients: &[LayerParams]) -> Result<()> {
@@ -897,11 +969,14 @@ where
             match &layer.kind {
                 LayerKind::Convolutional(spec) if spec.share_index.is_none() => {
                     let grouped_channels = layer.input_shape.channels / spec.groups.max(1);
-                    let weight_count =
-                        spec.filters * grouped_channels * spec.size * spec.size;
                     let weight_updates = self
                         .backend
-                        .zeros_f32(&[weight_count])
+                        .zeros_f32(&[
+                            spec.filters,
+                            grouped_channels,
+                            spec.size,
+                            spec.size,
+                        ])
                         .map_err(|err| backend_error("allocate GPU weight updates", err))?;
                     let bias_updates = self
                         .backend
@@ -996,6 +1071,14 @@ where
                     config,
                 )
                 .map_err(|err| backend_error("GPU bias update", err))?;
+            let scale_updates = self.update_gpu_batch_norm_scales(
+                owner,
+                train.scale_updates,
+                lr,
+                momentum,
+                batch,
+                config,
+            )?;
 
             let refreshed = self.refresh_device_convolution_params(
                 owner,
@@ -1003,7 +1086,7 @@ where
                 raw_biases,
                 weight_updates,
                 bias_updates,
-                train.scale_updates,
+                scale_updates,
             )?;
             self.sync_convolution_owner_from_device(owner, &refreshed)?;
         }
@@ -1112,6 +1195,39 @@ where
                         )
                         .map_err(|err| backend_error("maxpool", err))?
                 }
+                (LayerKind::LocalAvgPool(spec), LayerParams::None) => {
+                    if layer.output_shape.channels != layer.input_shape.channels {
+                        return Err(Error::UnsupportedLayer {
+                            layer_index: layer.index,
+                            name: "local_avgpool_depth".to_owned(),
+                        });
+                    }
+                    self.backend
+                        .local_avgpool_f32(
+                            current_input,
+                            &tensor_backend_shape(layer.output_shape),
+                            layer.input_shape.channels,
+                            layer.input_shape.height,
+                            layer.input_shape.width,
+                            spec.size,
+                            spec.stride_x,
+                            spec.stride_y,
+                            spec.padding,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("local_avgpool", err))?
+                }
+                (LayerKind::AvgPool, LayerParams::None) => self
+                    .backend
+                    .avgpool_f32(
+                        current_input,
+                        &tensor_backend_shape(layer.output_shape),
+                        layer.input_shape.channels,
+                        layer.input_shape.height,
+                        layer.input_shape.width,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("avgpool", err))?,
                 (LayerKind::Route(spec), LayerParams::None) => {
                     let mut route_inputs = Vec::with_capacity(spec.layers.len());
                     let mut route_channel_offsets = Vec::with_capacity(spec.layers.len());
@@ -1205,8 +1321,6 @@ where
                 | (LayerKind::Sam(_), LayerParams::None)
                 | (LayerKind::Contrastive { .. }, LayerParams::None) => current_input.clone(),
                 (LayerKind::Connected(_), _)
-                | (LayerKind::LocalAvgPool(_), _)
-                | (LayerKind::AvgPool, _)
                 | (LayerKind::Reorg(_), _)
                 | (LayerKind::Rnn { .. }, _)
                 | (LayerKind::Lstm { .. }, _)
@@ -1366,6 +1480,39 @@ where
                         )
                         .map_err(|err| backend_error("maxpool", err))?
                 }
+                (LayerKind::LocalAvgPool(spec), LayerParams::None) => {
+                    if layer.output_shape.channels != layer.input_shape.channels {
+                        return Err(Error::UnsupportedLayer {
+                            layer_index: layer.index,
+                            name: "local_avgpool_depth".to_owned(),
+                        });
+                    }
+                    self.backend
+                        .local_avgpool_f32(
+                            current_input.expect("local_avgpool requires current input"),
+                            &tensor_backend_shape(layer.output_shape),
+                            layer.input_shape.channels,
+                            layer.input_shape.height,
+                            layer.input_shape.width,
+                            spec.size,
+                            spec.stride_x,
+                            spec.stride_y,
+                            spec.padding,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("local_avgpool", err))?
+                }
+                (LayerKind::AvgPool, LayerParams::None) => self
+                    .backend
+                    .avgpool_f32(
+                        current_input.expect("avgpool requires current input"),
+                        &tensor_backend_shape(layer.output_shape),
+                        layer.input_shape.channels,
+                        layer.input_shape.height,
+                        layer.input_shape.width,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("avgpool", err))?,
                 (LayerKind::Route(spec), LayerParams::None) => {
                     let mut route_inputs = Vec::with_capacity(spec.layers.len());
                     let mut route_channel_offsets = Vec::with_capacity(spec.layers.len());
@@ -1470,8 +1617,6 @@ where
                     .expect("staging layer requires current input")
                     .clone(),
                 (LayerKind::Connected(_), _)
-                | (LayerKind::LocalAvgPool(_), _)
-                | (LayerKind::AvgPool, _)
                 | (LayerKind::Reorg(_), _)
                 | (LayerKind::Rnn { .. }, _)
                 | (LayerKind::Lstm { .. }, _)
@@ -1603,6 +1748,46 @@ where
                             config,
                         )
                         .map_err(|err| backend_error("GPU convolution bias backward", err))?;
+                    let current_input = if layer.index == 0 {
+                        &forward.input_gpu
+                    } else {
+                        forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing previous GPU layer output for convolutional layer #{}",
+                                layer.index
+                            ))
+                        })?
+                    };
+                    let scale_grad = if let Some(batch_norm) = conv.batch_norm.as_ref() {
+                        let raw_output = self
+                            .backend
+                            .conv2d_f32(
+                                current_input,
+                                &cached.raw_weights,
+                                &tensor_backend_shape(layer.output_shape),
+                                layer.input_shape.channels,
+                                layer.input_shape.height,
+                                layer.input_shape.width,
+                                spec.filters,
+                                spec.size,
+                                spec.stride_x,
+                                spec.stride_y,
+                                spec.dilation,
+                                spec.padding,
+                                spec.groups.max(1),
+                                config,
+                            )
+                            .map_err(|err| backend_error("GPU batch-norm raw convolution", err))?;
+                        let scale_grad = self.batch_norm_scale_gradient_gpu(
+                            &raw_output,
+                            &delta,
+                            batch_norm,
+                            layer.output_shape,
+                        )?;
+                        Some(scale_grad)
+                    } else {
+                        None
+                    };
                     let grad_for_conv = if let Some(scale) = cached.batch_norm_scales.as_ref() {
                         self.backend
                             .channel_scale_f32(
@@ -1615,16 +1800,6 @@ where
                             .map_err(|err| backend_error("GPU batch-norm delta scale", err))?
                     } else {
                         delta.clone()
-                    };
-                    let current_input = if layer.index == 0 {
-                        &forward.input_gpu
-                    } else {
-                        forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
-                            Error::InvalidConfig(format!(
-                                "missing previous GPU layer output for convolutional layer #{}",
-                                layer.index
-                            ))
-                        })?
                     };
                     let grouped_channels = layer.input_shape.channels / spec.groups.max(1);
                     let weight_grad = self
@@ -1670,7 +1845,7 @@ where
                             config,
                         )
                         .map_err(|err| backend_error("GPU convolution input backward", err))?;
-                    self.accumulate_device_train_buffer(owner, weight_grad, bias_grad)?;
+                    self.accumulate_device_train_buffer(owner, weight_grad, bias_grad, scale_grad)?;
                     self.accumulate_previous_gpu_gradient(
                         layer.index,
                         input_grad,
@@ -1703,6 +1878,46 @@ where
                             config,
                         )
                         .map_err(|err| backend_error("GPU maxpool backward", err))?;
+                    self.accumulate_previous_gpu_gradient(
+                        layer.index,
+                        input_grad,
+                        &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::LocalAvgPool(spec), Some(LayerParams::None)) => {
+                    let input_grad = self
+                        .backend
+                        .local_avgpool_backward_f32(
+                            &grad,
+                            &tensor_backend_shape(layer.input_shape),
+                            layer.input_shape.channels,
+                            layer.input_shape.height,
+                            layer.input_shape.width,
+                            spec.size,
+                            spec.stride_x,
+                            spec.stride_y,
+                            spec.padding,
+                            config,
+                        )
+                        .map_err(|err| backend_error("GPU local_avgpool backward", err))?;
+                    self.accumulate_previous_gpu_gradient(
+                        layer.index,
+                        input_grad,
+                        &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::AvgPool, Some(LayerParams::None)) => {
+                    let input_grad = self
+                        .backend
+                        .avgpool_backward_f32(
+                            &grad,
+                            &tensor_backend_shape(layer.input_shape),
+                            layer.input_shape.channels,
+                            layer.input_shape.height,
+                            layer.input_shape.width,
+                            config,
+                        )
+                        .map_err(|err| backend_error("GPU avgpool backward", err))?;
                     self.accumulate_previous_gpu_gradient(
                         layer.index,
                         input_grad,
@@ -1819,6 +2034,7 @@ where
             }
         }
 
+        self.update_gpu_convolution_batch_norm_running_stats_from_forward(forward)?;
         Ok(())
     }
 
@@ -1863,6 +2079,7 @@ where
         owner: usize,
         weight_grad: B::Tensor,
         bias_grad: B::Tensor,
+        scale_grad: Option<B::Tensor>,
     ) -> Result<()> {
         let Some(train) = self.device_train_buffers.borrow().get(owner).and_then(Clone::clone) else {
             return Err(Error::InvalidConfig(format!(
@@ -1877,12 +2094,250 @@ where
             .backend
             .saxpy_f32(1.0, &bias_grad, &train.bias_updates, ElementwiseLaunchConfig::default())
             .map_err(|err| backend_error("GPU bias gradient accumulation", err))?;
+        let scale_updates = match (train.scale_updates, scale_grad) {
+            (Some(scale_updates), Some(scale_grad)) => Some(
+                self.backend
+                    .saxpy_f32(
+                        1.0,
+                        &scale_grad,
+                        &scale_updates,
+                        ElementwiseLaunchConfig::default(),
+                    )
+                    .map_err(|err| backend_error("GPU batch-norm scale gradient accumulation", err))?,
+            ),
+            (None, None) => None,
+            (Some(scale_updates), None) => Some(scale_updates),
+            (None, Some(_)) => {
+                return Err(Error::InvalidConfig(format!(
+                    "GPU batch-norm scale gradient produced for non-BN layer #{owner}"
+                )));
+            }
+        };
         self.device_train_buffers.borrow_mut()[owner] = Some(GpuConvolutionTrainBuffers {
             weight_updates,
             bias_updates,
-            scale_updates: train.scale_updates,
+            scale_updates,
         });
         Ok(())
+    }
+
+    fn batch_norm_scale_gradient_gpu(
+        &self,
+        raw_output: &B::Tensor,
+        delta: &B::Tensor,
+        batch_norm: &BatchNormParams,
+        output_shape: TensorShape,
+    ) -> Result<B::Tensor> {
+        let raw_output = self
+            .backend
+            .download_f32(raw_output)
+            .map_err(|err| backend_error("download GPU batch-norm raw output", err))?;
+        let delta = self
+            .backend
+            .download_f32(delta)
+            .map_err(|err| backend_error("download GPU batch-norm delta", err))?;
+        if raw_output.len() != delta.len() {
+            return Err(Error::InvalidConfig(format!(
+                "GPU batch-norm scale gradient shape mismatch: raw output has {} values, delta has {}",
+                raw_output.len(),
+                delta.len()
+            )));
+        }
+        if batch_norm.rolling_mean.len() != output_shape.channels
+            || batch_norm.rolling_variance.len() != output_shape.channels
+        {
+            return Err(Error::InvalidConfig(format!(
+                "GPU batch-norm rolling stat mismatch: expected {} channels",
+                output_shape.channels
+            )));
+        }
+
+        let channel_stride = output_shape.width * output_shape.height;
+        let mut scale_grad = vec![0.0; output_shape.channels];
+        for b in 0..output_shape.batch {
+            for (channel, grad) in scale_grad.iter_mut().enumerate() {
+                let inv_std =
+                    1.0 / (batch_norm.rolling_variance[channel] + BATCH_NORM_EPSILON).sqrt();
+                let base = (b * output_shape.channels + channel) * channel_stride;
+                for idx in 0..channel_stride {
+                    let offset = base + idx;
+                    let normalized =
+                        (raw_output[offset] - batch_norm.rolling_mean[channel]) * inv_std;
+                    *grad += delta[offset] * normalized;
+                }
+            }
+        }
+
+        let scale_grad = self
+            .backend
+            .upload_f32(&[output_shape.channels], &scale_grad)
+            .map_err(|err| backend_error("upload GPU batch-norm scale gradient", err))?;
+        Ok(scale_grad)
+    }
+
+    fn update_gpu_batch_norm_scales(
+        &mut self,
+        owner: usize,
+        scale_updates: Option<B::Tensor>,
+        lr: f32,
+        momentum: f32,
+        batch: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Option<B::Tensor>> {
+        let Some(scale_updates) = scale_updates else {
+            return Ok(None);
+        };
+        let Some(LayerParams::Convolutional(params)) = self.params.get_mut(owner) else {
+            return Err(Error::InvalidConfig(format!(
+                "missing CPU convolution params for layer #{owner}"
+            )));
+        };
+        let Some(batch_norm) = params.batch_norm.as_mut() else {
+            return Err(Error::InvalidConfig(format!(
+                "GPU batch-norm scale updates exist for non-BN layer #{owner}"
+            )));
+        };
+
+        let scales = self
+            .backend
+            .upload_f32(&[batch_norm.scales.len()], &batch_norm.scales)
+            .map_err(|err| backend_error("upload GPU batch-norm scales", err))?;
+        let (updated_scales, updated_scale_updates) = self
+            .backend
+            .sgd_update_f32(&scales, &scale_updates, lr, momentum, 0.0, batch, config)
+            .map_err(|err| backend_error("GPU batch-norm scale update", err))?;
+        batch_norm.scales = self
+            .backend
+            .download_f32(&updated_scales)
+            .map_err(|err| backend_error("download GPU batch-norm scales", err))?;
+        Ok(Some(updated_scale_updates))
+    }
+
+    fn update_gpu_convolution_batch_norm_running_stats(
+        &mut self,
+        owner: usize,
+        mean: &[f32],
+        variance: &[f32],
+    ) -> Result<()> {
+        let Some(LayerParams::Convolutional(params)) = self.params.get_mut(owner) else {
+            return Err(Error::InvalidConfig(format!(
+                "missing CPU convolution params for layer #{owner}"
+            )));
+        };
+        let Some(batch_norm) = params.batch_norm.as_mut() else {
+            return Err(Error::InvalidConfig(format!(
+                "missing batch-norm params for convolutional layer #{owner}"
+            )));
+        };
+        update_batch_norm_running_stats(batch_norm, mean, variance, 0.9)?;
+
+        let cached = self
+            .device_conv_params
+            .borrow()
+            .get(owner)
+            .and_then(Clone::clone)
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "missing cached GPU convolution params for layer #{owner}"
+                ))
+            })?;
+        let layer = self.network.layers.get(owner).ok_or_else(|| {
+            Error::InvalidConfig(format!("missing convolutional layer #{owner}"))
+        })?;
+        let LayerKind::Convolutional(spec) = &layer.kind else {
+            return Err(Error::InvalidConfig(format!(
+                "layer #{owner} is not convolutional"
+            )));
+        };
+        let params = resolve_convolutional_params(&self.network, &self.params, owner)?;
+        let refreshed = self.cached_convolution_upload(
+            spec,
+            layer.input_shape.channels,
+            params,
+            Some((cached.raw_weights, cached.raw_biases)),
+        )?;
+        self.device_conv_params.borrow_mut()[owner] = Some(refreshed);
+        Ok(())
+    }
+
+    fn update_gpu_convolution_batch_norm_running_stats_from_forward(
+        &mut self,
+        forward: &GpuForwardState<B::Tensor>,
+    ) -> Result<()> {
+        let config = ElementwiseLaunchConfig::default();
+        let mut batch_norm_stats = Vec::new();
+        for layer in &self.network.layers {
+            let LayerKind::Convolutional(spec) = &layer.kind else {
+                continue;
+            };
+            if !spec.batch_normalize || spec.share_index.is_some() {
+                continue;
+            }
+
+            let current_input = if layer.index == 0 {
+                &forward.input_gpu
+            } else {
+                forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "missing previous GPU layer output for batch-norm stats at layer #{}",
+                        layer.index
+                    ))
+                })?
+            };
+            let cached = self
+                .device_conv_params
+                .borrow()
+                .get(layer.index)
+                .and_then(Clone::clone)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "missing cached GPU convolution params for layer #{}",
+                        layer.index
+                    ))
+                })?;
+            let raw_output = self
+                .backend
+                .conv2d_f32(
+                    current_input,
+                    &cached.raw_weights,
+                    &tensor_backend_shape(layer.output_shape),
+                    layer.input_shape.channels,
+                    layer.input_shape.height,
+                    layer.input_shape.width,
+                    spec.filters,
+                    spec.size,
+                    spec.stride_x,
+                    spec.stride_y,
+                    spec.dilation,
+                    spec.padding,
+                    spec.groups.max(1),
+                    config,
+                )
+                .map_err(|err| backend_error("GPU batch-norm raw convolution stats", err))?;
+            let (mean, variance) =
+                self.batch_norm_channel_stats_gpu(&raw_output, layer.output_shape)?;
+            batch_norm_stats.push((layer.index, mean, variance));
+        }
+
+        for (owner, mean, variance) in batch_norm_stats {
+            self.update_gpu_convolution_batch_norm_running_stats(owner, &mean, &variance)?;
+        }
+        Ok(())
+    }
+
+    fn batch_norm_channel_stats_gpu(
+        &self,
+        raw_output: &B::Tensor,
+        output_shape: TensorShape,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let raw_output = self
+            .backend
+            .download_f32(raw_output)
+            .map_err(|err| backend_error("download GPU batch-norm raw output stats", err))?;
+        Ok(channel_mean_variance(&Tensor {
+            shape: output_shape,
+            data: raw_output,
+        }))
     }
 
     fn clear_device_conv_params(&mut self) {
@@ -2633,6 +3088,94 @@ fn forward_convolutional_with_cache(
     (output, Some(activation_input))
 }
 
+fn raw_convolution_output(
+    spec: &ConvolutionalSpec,
+    params: &ConvolutionalParams,
+    input: &Tensor,
+    output_shape: TensorShape,
+) -> Tensor {
+    let mut output = Tensor::zeros(output_shape);
+    for b in 0..output_shape.batch {
+        for filter in 0..output_shape.channels {
+            for y in 0..output_shape.height {
+                for x in 0..output_shape.width {
+                    let value = convolution_raw_value(spec, &params.weights, input, b, filter, y, x);
+                    output.set(b, filter, y, x, value);
+                }
+            }
+        }
+    }
+    output
+}
+
+fn channel_mean_variance(tensor: &Tensor) -> (Vec<f32>, Vec<f32>) {
+    let spatial = tensor.shape.width * tensor.shape.height;
+    let sample_count = tensor.shape.batch * spatial;
+    let mut mean = vec![0.0; tensor.shape.channels];
+    for b in 0..tensor.shape.batch {
+        for (channel, slot) in mean.iter_mut().enumerate() {
+            for idx in 0..spatial {
+                let y = idx / tensor.shape.width;
+                let x = idx % tensor.shape.width;
+                *slot += tensor.get(b, channel, y, x);
+            }
+        }
+    }
+    if sample_count != 0 {
+        let scale = 1.0 / sample_count as f32;
+        for value in &mut mean {
+            *value *= scale;
+        }
+    }
+
+    let mut variance = vec![0.0; tensor.shape.channels];
+    for b in 0..tensor.shape.batch {
+        for (channel, slot) in variance.iter_mut().enumerate() {
+            for idx in 0..spatial {
+                let y = idx / tensor.shape.width;
+                let x = idx % tensor.shape.width;
+                let diff = tensor.get(b, channel, y, x) - mean[channel];
+                *slot += diff * diff;
+            }
+        }
+    }
+    if sample_count > 1 {
+        let scale = 1.0 / (sample_count - 1) as f32;
+        for value in &mut variance {
+            *value *= scale;
+        }
+    }
+
+    (mean, variance)
+}
+
+fn update_batch_norm_running_stats(
+    batch_norm: &mut BatchNormParams,
+    mean: &[f32],
+    variance: &[f32],
+    keep: f32,
+) -> Result<()> {
+    if batch_norm.rolling_mean.len() != mean.len()
+        || batch_norm.rolling_variance.len() != variance.len()
+    {
+        return Err(Error::InvalidConfig(format!(
+            "batch-norm running-stat mismatch: rolling mean {}, rolling variance {}, mean {}, variance {}",
+            batch_norm.rolling_mean.len(),
+            batch_norm.rolling_variance.len(),
+            mean.len(),
+            variance.len()
+        )));
+    }
+    let update = 1.0 - keep;
+    for (dst, src) in batch_norm.rolling_mean.iter_mut().zip(mean) {
+        *dst = keep * *dst + update * *src;
+    }
+    for (dst, src) in batch_norm.rolling_variance.iter_mut().zip(variance) {
+        *dst = keep * *dst + update * *src;
+    }
+    Ok(())
+}
+
 fn forward_connected(
     spec: &ConnectedSpec,
     params: &ConnectedParams,
@@ -3244,6 +3787,31 @@ fn forward_avgpool(input: &Tensor) -> Tensor {
     output
 }
 
+fn backward_avgpool(output_grad: &Tensor, input_shape: TensorShape) -> Result<Tensor> {
+    let expected = TensorShape::new(1, 1, input_shape.channels, input_shape.batch);
+    if output_grad.shape != expected {
+        return Err(Error::InvalidConfig(format!(
+            "avgpool backward gradient shape mismatch: expected {expected}, got {}",
+            output_grad.shape
+        )));
+    }
+
+    let mut input_grad = Tensor::zeros(input_shape);
+    let area = (input_shape.width * input_shape.height) as f32;
+    for b in 0..input_shape.batch {
+        for c in 0..input_shape.channels {
+            let grad = output_grad.data[b * input_shape.channels + c] / area;
+            for y in 0..input_shape.height {
+                for x in 0..input_shape.width {
+                    input_grad.set(b, c, y, x, grad);
+                }
+            }
+        }
+    }
+
+    Ok(input_grad)
+}
+
 fn forward_route(
     spec: &RouteSpec,
     layer_index: usize,
@@ -3446,6 +4014,7 @@ mod tests {
 
     use crate::cfg::ConfigFile;
     use crate::model::{Activation, ConvolutionalSpec, LayerKind, LrPolicy, NetConfig, Network, TensorShape};
+    use crate::train::{YoloLabel, compute_yolo_training_loss};
     use darknet_cuda::{ElementwiseLaunchConfig, F32ActivationKind, F32TensorOpsBackend};
 
     use super::{
@@ -4143,6 +4712,160 @@ mod tests {
             })
         }
 
+        fn local_avgpool_f32(
+            &self,
+            x: &Self::Tensor,
+            output_shape: &[usize],
+            channels: usize,
+            input_height: usize,
+            input_width: usize,
+            size: usize,
+            stride_x: usize,
+            stride_y: usize,
+            padding: usize,
+            _config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            let input = Tensor::from_data(
+                TensorShape::new(input_width, input_height, channels, x.shape[0]),
+                x.data.clone(),
+            )
+            .map_err(|err| err.to_string())?;
+            let output_shape = TensorShape::new(
+                output_shape[3],
+                output_shape[2],
+                output_shape[1],
+                output_shape[0],
+            );
+            let output = super::forward_maxpool(
+                size,
+                stride_x,
+                stride_y,
+                padding,
+                &input,
+                output_shape,
+                true,
+            )
+            .map_err(|err| err.to_string())?;
+            Ok(FakeTensor {
+                shape: vec![
+                    output.shape.batch,
+                    output.shape.channels,
+                    output.shape.height,
+                    output.shape.width,
+                ],
+                data: output.data,
+            })
+        }
+
+        fn local_avgpool_backward_f32(
+            &self,
+            output_grad: &Self::Tensor,
+            input_shape: &[usize],
+            channels: usize,
+            input_height: usize,
+            input_width: usize,
+            size: usize,
+            stride_x: usize,
+            stride_y: usize,
+            padding: usize,
+            _config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            let input = Tensor::zeros(TensorShape::new(
+                input_width,
+                input_height,
+                channels,
+                input_shape[0],
+            ));
+            let output_grad = Tensor::from_data(
+                TensorShape::new(
+                    output_grad.shape[3],
+                    output_grad.shape[2],
+                    output_grad.shape[1],
+                    output_grad.shape[0],
+                ),
+                output_grad.data.clone(),
+            )
+            .map_err(|err| err.to_string())?;
+            let input_grad = super::backward_maxpool(
+                size,
+                stride_x,
+                stride_y,
+                padding,
+                &input,
+                &output_grad,
+                true,
+            )
+            .map_err(|err| err.to_string())?;
+            Ok(FakeTensor {
+                shape: input_shape.to_vec(),
+                data: input_grad.data,
+            })
+        }
+
+        fn avgpool_f32(
+            &self,
+            x: &Self::Tensor,
+            output_shape: &[usize],
+            channels: usize,
+            input_height: usize,
+            input_width: usize,
+            _config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            if output_shape.len() != 4 || output_shape[1] != channels {
+                return Err("avgpool_f32 output shape mismatch".to_owned());
+            }
+            let batch = x.shape[0];
+            let area = (input_height * input_width) as f32;
+            let mut out = vec![0.0; output_shape.iter().product()];
+            for b in 0..batch {
+                for c in 0..channels {
+                    let mut acc = 0.0;
+                    for y in 0..input_height {
+                        for x_idx in 0..input_width {
+                            let src = ((((b * channels) + c) * input_height) + y) * input_width
+                                + x_idx;
+                            acc += x.data[src];
+                        }
+                    }
+                    out[b * channels + c] = acc / area;
+                }
+            }
+            Ok(FakeTensor {
+                shape: output_shape.to_vec(),
+                data: out,
+            })
+        }
+
+        fn avgpool_backward_f32(
+            &self,
+            output_grad: &Self::Tensor,
+            input_shape: &[usize],
+            channels: usize,
+            input_height: usize,
+            input_width: usize,
+            _config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            let batch = input_shape[0];
+            let area = (input_height * input_width) as f32;
+            let mut input_grad = vec![0.0; input_shape.iter().product()];
+            for b in 0..batch {
+                for c in 0..channels {
+                    let grad = output_grad.data[b * channels + c] / area;
+                    for y in 0..input_height {
+                        for x_idx in 0..input_width {
+                            let dst = ((((b * channels) + c) * input_height) + y) * input_width
+                                + x_idx;
+                            input_grad[dst] = grad;
+                        }
+                    }
+                }
+            }
+            Ok(FakeTensor {
+                shape: input_shape.to_vec(),
+                data: input_grad,
+            })
+        }
+
         fn vector_add_f32(
             &self,
             x: &Self::Tensor,
@@ -4574,6 +5297,98 @@ mod tests {
             )
         }
 
+        fn local_avgpool_f32(
+            &self,
+            x: &Self::Tensor,
+            output_shape: &[usize],
+            channels: usize,
+            input_height: usize,
+            input_width: usize,
+            size: usize,
+            stride_x: usize,
+            stride_y: usize,
+            padding: usize,
+            config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.inner.local_avgpool_f32(
+                x,
+                output_shape,
+                channels,
+                input_height,
+                input_width,
+                size,
+                stride_x,
+                stride_y,
+                padding,
+                config,
+            )
+        }
+
+        fn local_avgpool_backward_f32(
+            &self,
+            output_grad: &Self::Tensor,
+            input_shape: &[usize],
+            channels: usize,
+            input_height: usize,
+            input_width: usize,
+            size: usize,
+            stride_x: usize,
+            stride_y: usize,
+            padding: usize,
+            config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.inner.local_avgpool_backward_f32(
+                output_grad,
+                input_shape,
+                channels,
+                input_height,
+                input_width,
+                size,
+                stride_x,
+                stride_y,
+                padding,
+                config,
+            )
+        }
+
+        fn avgpool_f32(
+            &self,
+            x: &Self::Tensor,
+            output_shape: &[usize],
+            channels: usize,
+            input_height: usize,
+            input_width: usize,
+            config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.inner.avgpool_f32(
+                x,
+                output_shape,
+                channels,
+                input_height,
+                input_width,
+                config,
+            )
+        }
+
+        fn avgpool_backward_f32(
+            &self,
+            output_grad: &Self::Tensor,
+            input_shape: &[usize],
+            channels: usize,
+            input_height: usize,
+            input_width: usize,
+            config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.inner.avgpool_backward_f32(
+                output_grad,
+                input_shape,
+                channels,
+                input_height,
+                input_width,
+                config,
+            )
+        }
+
         fn upsample_f32(
             &self,
             x: &Self::Tensor,
@@ -4896,6 +5711,62 @@ mod tests {
             _config: ElementwiseLaunchConfig,
         ) -> std::result::Result<Self::Tensor, Self::Error> {
             self.zeros_f32(&x.shape)
+        }
+
+        fn local_avgpool_f32(
+            &self,
+            _x: &Self::Tensor,
+            output_shape: &[usize],
+            _channels: usize,
+            _input_height: usize,
+            _input_width: usize,
+            _size: usize,
+            _stride_x: usize,
+            _stride_y: usize,
+            _padding: usize,
+            _config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.zeros_f32(output_shape)
+        }
+
+        fn local_avgpool_backward_f32(
+            &self,
+            _output_grad: &Self::Tensor,
+            input_shape: &[usize],
+            _channels: usize,
+            _input_height: usize,
+            _input_width: usize,
+            _size: usize,
+            _stride_x: usize,
+            _stride_y: usize,
+            _padding: usize,
+            _config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.zeros_f32(input_shape)
+        }
+
+        fn avgpool_f32(
+            &self,
+            _x: &Self::Tensor,
+            output_shape: &[usize],
+            _channels: usize,
+            _input_height: usize,
+            _input_width: usize,
+            _config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.zeros_f32(output_shape)
+        }
+
+        fn avgpool_backward_f32(
+            &self,
+            _output_grad: &Self::Tensor,
+            input_shape: &[usize],
+            _channels: usize,
+            _input_height: usize,
+            _input_width: usize,
+            _config: ElementwiseLaunchConfig,
+        ) -> std::result::Result<Self::Tensor, Self::Error> {
+            self.zeros_f32(input_shape)
         }
 
         fn upsample_f32(
@@ -5373,6 +6244,78 @@ mod tests {
     }
 
     #[test]
+    fn backward_runs_avgpool_layer() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                width=2
+                height=2
+                channels=1
+
+                [avgpool]
+            "#,
+        )
+        .expect("cfg should parse");
+        let network = Network::from_config(cfg).expect("network should build");
+        let executable = ExecutableNetwork::new(network);
+        let input = Tensor::from_data(
+            executable.network.net.input_shape(),
+            vec![1.0, 2.0, 3.0, 4.0],
+        )
+        .expect("tensor");
+        let forward = executable.forward(&input).expect("forward should succeed");
+        assert_eq!(forward.final_output().expect("final output").data, vec![2.5]);
+
+        let output_gradient =
+            Tensor::from_data(TensorShape::new(1, 1, 1, 1), vec![8.0]).expect("tensor");
+        let backward = executable
+            .backward(&input, &forward, &output_gradient)
+            .expect("backward should succeed");
+        assert_eq!(backward.input_gradient.data, vec![2.0, 2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn backward_runs_local_avgpool_layer() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                width=2
+                height=2
+                channels=1
+
+                [local_avgpool]
+                size=2
+                stride=1
+            "#,
+        )
+        .expect("cfg should parse");
+        let network = Network::from_config(cfg).expect("network should build");
+        let executable = ExecutableNetwork::new(network);
+        let input = Tensor::from_data(
+            executable.network.net.input_shape(),
+            vec![1.0, 2.0, 3.0, 4.0],
+        )
+        .expect("tensor");
+        let forward = executable.forward(&input).expect("forward should succeed");
+        assert_eq!(
+            forward.final_output().expect("final output").data,
+            vec![2.5, 3.0, 3.5, 4.0]
+        );
+
+        let output_gradient = Tensor::from_data(
+            executable.network.layers[0].output_shape,
+            vec![4.0, 6.0, 8.0, 10.0],
+        )
+        .expect("tensor");
+        let backward = executable
+            .backward(&input, &forward, &output_gradient)
+            .expect("backward should succeed");
+        assert_eq!(backward.input_gradient.data, vec![1.0, 4.0, 5.0, 18.0]);
+    }
+
+    #[test]
     fn backward_route_scatter_matches_cpp_style_delta_flow() {
         let cfg = ConfigFile::parse_str(
             "inline.cfg",
@@ -5703,6 +6646,57 @@ mod tests {
     }
 
     #[test]
+    fn backward_accumulate_updates_batchnorm_running_stats() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                width=2
+                height=1
+                channels=1
+
+                [convolutional]
+                filters=1
+                size=1
+                stride=1
+                batch_normalize=1
+                activation=linear
+            "#,
+        )
+        .expect("cfg should parse");
+        let network = Network::from_config(cfg).expect("network should build");
+        let mut executable = ExecutableNetwork::new(network);
+        match &mut executable.params[0] {
+            LayerParams::Convolutional(params) => {
+                params.weights[0] = 1.0;
+                let batch_norm = params.batch_norm.as_mut().expect("batch norm params");
+                batch_norm.rolling_mean[0] = 10.0;
+                batch_norm.rolling_variance[0] = 20.0;
+            }
+            other => panic!("unexpected params: {other:?}"),
+        }
+
+        let input = Tensor::from_data(executable.network.net.input_shape(), vec![2.0, 4.0])
+            .expect("input tensor");
+        let forward = executable.forward(&input).expect("forward should succeed");
+        let seeds = vec![Some(Tensor::filled(
+            executable.network.layers[0].output_shape,
+            0.0,
+        ))];
+        executable
+            .backward_accumulate_seeded(&input, &forward, &seeds)
+            .expect("backward should update stats");
+
+        let params = match &executable.params[0] {
+            LayerParams::Convolutional(params) => params,
+            other => panic!("unexpected params: {other:?}"),
+        };
+        let batch_norm = params.batch_norm.as_ref().expect("batch norm params");
+        assert!((batch_norm.rolling_mean[0] - 9.3).abs() < 1.0e-6);
+        assert!((batch_norm.rolling_variance[0] - 18.2).abs() < 1.0e-6);
+    }
+
+    #[test]
     fn backward_seeded_accumulates_multiple_yolo_heads() {
         let cfg = ConfigFile::parse_str(
             "inline.cfg",
@@ -5907,6 +6901,67 @@ mod tests {
     }
 
     #[test]
+    fn gpu_runtime_runs_avgpool_layer() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                width=2
+                height=2
+                channels=1
+
+                [avgpool]
+            "#,
+        )
+        .expect("cfg should parse");
+        let network = Network::from_config(cfg).expect("network should build");
+        let executable = GpuExecutableNetwork::new(network, FakeBackend);
+        let input = Tensor::from_data(
+            executable.network.net.input_shape(),
+            vec![1.0, 2.0, 3.0, 4.0],
+        )
+        .expect("tensor");
+        let result = executable
+            .forward(&input)
+            .expect("gpu forward should succeed");
+
+        assert_eq!(result.final_output().expect("final output").data, vec![2.5]);
+    }
+
+    #[test]
+    fn gpu_runtime_runs_local_avgpool_layer() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                width=2
+                height=2
+                channels=1
+
+                [local_avgpool]
+                size=2
+                stride=1
+            "#,
+        )
+        .expect("cfg should parse");
+        let network = Network::from_config(cfg).expect("network should build");
+        let executable = GpuExecutableNetwork::new(network, FakeBackend);
+        let input = Tensor::from_data(
+            executable.network.net.input_shape(),
+            vec![1.0, 2.0, 3.0, 4.0],
+        )
+        .expect("tensor");
+        let result = executable
+            .forward(&input)
+            .expect("gpu forward should succeed");
+
+        assert_eq!(
+            result.final_output().expect("final output").data,
+            vec![2.5, 3.0, 3.5, 4.0]
+        );
+    }
+
+    #[test]
     fn gpu_runtime_reuses_uploaded_conv_params() {
         let cfg = ConfigFile::parse_str(
             "inline.cfg",
@@ -5955,6 +7010,472 @@ mod tests {
         assert_eq!(backend.upload_count(), 4);
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn gpu_weight_updates_preserve_momentum_between_iterations() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                width=1
+                height=1
+                channels=1
+
+                [convolutional]
+                filters=1
+                size=1
+                stride=1
+                activation=linear
+            "#,
+        )
+        .expect("cfg should parse");
+        let network = Network::from_config(cfg).expect("network should build");
+        let mut executable = GpuExecutableNetwork::new(network, FakeBackend);
+        executable
+            .init_train_buffers_gpu()
+            .expect("GPU train buffers should initialize");
+
+        let input = Tensor::from_data(executable.network.net.input_shape(), vec![2.0])
+            .expect("input tensor");
+        let seeds = vec![Some(
+            Tensor::from_data(executable.network.layers[0].output_shape, vec![3.0])
+                .expect("seed tensor"),
+        )];
+
+        for _ in 0..2 {
+            let forward = executable
+                .forward_with_state(&input)
+                .expect("GPU forward should succeed");
+            executable
+                .backward_accumulate_seeded_gpu(&forward, &seeds)
+                .expect("GPU backward should accumulate");
+            executable
+                .update_weights_gpu(0.1, 0.9, 0.0, 1)
+                .expect("GPU update should succeed");
+        }
+
+        let params = match &executable.params[0] {
+            LayerParams::Convolutional(params) => params,
+            other => panic!("unexpected params: {other:?}"),
+        };
+        assert!((params.weights[0] - 1.74).abs() < 1.0e-6);
+        assert!((params.biases[0] - 0.87).abs() < 1.0e-6);
+
+        let train_buffers = executable.device_train_buffers.borrow();
+        let train = train_buffers[0].as_ref().expect("train buffers exist");
+        assert!((train.weight_updates.data[0] - 10.26).abs() < 1.0e-6);
+        assert!((train.bias_updates.data[0] - 5.13).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn gpu_batchnorm_conv_accumulates_and_updates_scale() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                width=1
+                height=1
+                channels=1
+
+                [convolutional]
+                filters=1
+                size=1
+                stride=1
+                batch_normalize=1
+                activation=linear
+            "#,
+        )
+        .expect("cfg should parse");
+        let network = Network::from_config(cfg).expect("network should build");
+        let mut executable = GpuExecutableNetwork::new(network, FakeBackend);
+        match &mut executable.params[0] {
+            LayerParams::Convolutional(params) => {
+                params.weights[0] = 2.0;
+                params.biases[0] = 0.5;
+                let batch_norm = params.batch_norm.as_mut().expect("batch norm params");
+                batch_norm.scales[0] = 1.5;
+                batch_norm.rolling_mean[0] = 1.0;
+                batch_norm.rolling_variance[0] = 4.0 - super::BATCH_NORM_EPSILON;
+            }
+            other => panic!("unexpected params: {other:?}"),
+        }
+        executable
+            .init_train_buffers_gpu()
+            .expect("GPU train buffers should initialize");
+
+        let input = Tensor::from_data(executable.network.net.input_shape(), vec![2.0])
+            .expect("input tensor");
+        let seeds = vec![Some(
+            Tensor::from_data(executable.network.layers[0].output_shape, vec![3.0])
+                .expect("seed tensor"),
+        )];
+        let forward = executable
+            .forward_with_state(&input)
+            .expect("GPU forward should succeed");
+        executable
+            .backward_accumulate_seeded_gpu(&forward, &seeds)
+            .expect("GPU backward should accumulate");
+
+        {
+            let train_buffers = executable.device_train_buffers.borrow();
+            let train = train_buffers[0].as_ref().expect("train buffers exist");
+            let scale_updates = train.scale_updates.as_ref().expect("scale updates exist");
+            assert!((scale_updates.data[0] - 4.5).abs() < 1.0e-6);
+        }
+
+        executable
+            .update_weights_gpu(0.1, 0.0, 0.0, 1)
+            .expect("GPU update should succeed");
+        let params = match &executable.params[0] {
+            LayerParams::Convolutional(params) => params,
+            other => panic!("unexpected params: {other:?}"),
+        };
+        let batch_norm = params.batch_norm.as_ref().expect("batch norm params");
+        assert!((batch_norm.scales[0] - 1.95).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn gpu_batchnorm_conv_updates_running_stats() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                width=2
+                height=1
+                channels=1
+
+                [convolutional]
+                filters=1
+                size=1
+                stride=1
+                batch_normalize=1
+                activation=linear
+            "#,
+        )
+        .expect("cfg should parse");
+        let network = Network::from_config(cfg).expect("network should build");
+        let mut executable = GpuExecutableNetwork::new(network, FakeBackend);
+        match &mut executable.params[0] {
+            LayerParams::Convolutional(params) => {
+                params.weights[0] = 1.0;
+                let batch_norm = params.batch_norm.as_mut().expect("batch norm params");
+                batch_norm.rolling_mean[0] = 10.0;
+                batch_norm.rolling_variance[0] = 20.0;
+            }
+            other => panic!("unexpected params: {other:?}"),
+        }
+        executable
+            .init_train_buffers_gpu()
+            .expect("GPU train buffers should initialize");
+
+        let input = Tensor::from_data(executable.network.net.input_shape(), vec![2.0, 4.0])
+            .expect("input tensor");
+        let seeds = vec![Some(Tensor::filled(
+            executable.network.layers[0].output_shape,
+            0.0,
+        ))];
+        let forward = executable
+            .forward_with_state(&input)
+            .expect("GPU forward should succeed");
+        executable
+            .backward_accumulate_seeded_gpu(&forward, &seeds)
+            .expect("GPU backward should update stats");
+
+        let params = match &executable.params[0] {
+            LayerParams::Convolutional(params) => params,
+            other => panic!("unexpected params: {other:?}"),
+        };
+        let batch_norm = params.batch_norm.as_ref().expect("batch norm params");
+        assert!((batch_norm.rolling_mean[0] - 9.3).abs() < 1.0e-6);
+        assert!((batch_norm.rolling_variance[0] - 18.2).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn gpu_batchnorm_running_stats_update_without_gradient_seed() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                width=2
+                height=1
+                channels=1
+
+                [convolutional]
+                filters=1
+                size=1
+                stride=1
+                batch_normalize=1
+                activation=linear
+            "#,
+        )
+        .expect("cfg should parse");
+        let network = Network::from_config(cfg).expect("network should build");
+        let mut executable = GpuExecutableNetwork::new(network, FakeBackend);
+        match &mut executable.params[0] {
+            LayerParams::Convolutional(params) => {
+                params.weights[0] = 1.0;
+                let batch_norm = params.batch_norm.as_mut().expect("batch norm params");
+                batch_norm.rolling_mean[0] = 10.0;
+                batch_norm.rolling_variance[0] = 20.0;
+            }
+            other => panic!("unexpected params: {other:?}"),
+        }
+        executable
+            .init_train_buffers_gpu()
+            .expect("GPU train buffers should initialize");
+
+        let input = Tensor::from_data(executable.network.net.input_shape(), vec![2.0, 4.0])
+            .expect("input tensor");
+        let seeds = vec![None; executable.network.layers.len()];
+        let forward = executable
+            .forward_with_state(&input)
+            .expect("GPU forward should succeed");
+        executable
+            .backward_accumulate_seeded_gpu(&forward, &seeds)
+            .expect("GPU backward should update stats");
+
+        let params = match &executable.params[0] {
+            LayerParams::Convolutional(params) => params,
+            other => panic!("unexpected params: {other:?}"),
+        };
+        let batch_norm = params.batch_norm.as_ref().expect("batch norm params");
+        assert!((batch_norm.rolling_mean[0] - 9.3).abs() < 1.0e-6);
+        assert!((batch_norm.rolling_variance[0] - 18.2).abs() < 1.0e-6);
+
+        let train_buffers = executable.device_train_buffers.borrow();
+        let train = train_buffers[0].as_ref().expect("train buffers exist");
+        assert_eq!(train.weight_updates.data, vec![0.0]);
+        assert_eq!(train.bias_updates.data, vec![0.0]);
+    }
+
+    #[test]
+    fn gpu_yolo_loss_backward_matches_cpu_train_buffers() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                batch=1
+                width=8
+                height=8
+                channels=1
+
+                [convolutional]
+                filters=6
+                size=1
+                stride=1
+                activation=linear
+
+                [yolo]
+                mask=0
+                anchors=10,13
+                classes=1
+                num=1
+            "#,
+        )
+        .expect("cfg should parse");
+        let network = Network::from_config(cfg).expect("network should build");
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        match &mut cpu.params[0] {
+            LayerParams::Convolutional(params) => {
+                params.weights = vec![0.03, -0.02, 0.05, 0.07, -0.04, 0.01];
+                params.biases = vec![0.2, -0.1, 0.05, -0.15, 0.3, -0.25];
+            }
+            other => panic!("unexpected params: {other:?}"),
+        }
+        gpu.params = cpu.params.clone();
+        gpu.init_train_buffers_gpu()
+            .expect("GPU train buffers should initialize");
+
+        let input = Tensor::from_data(
+            cpu.network.net.input_shape(),
+            (0..64).map(|idx| (idx as f32 + 1.0) / 64.0).collect(),
+        )
+        .expect("input tensor");
+        let cpu_forward = cpu.forward(&input).expect("CPU forward should succeed");
+        let gpu_forward = gpu
+            .forward_with_state(&input)
+            .expect("GPU forward should succeed");
+        assert_same_forward(&cpu_forward, &gpu_forward.cpu_forward);
+
+        let labels = vec![vec![YoloLabel {
+            class_id: 0,
+            x: 0.5,
+            y: 0.5,
+            w: 0.25,
+            h: 0.25,
+        }]];
+        let training =
+            compute_yolo_training_loss(&cpu.network, &cpu_forward, &labels).expect("loss computes");
+        assert!(training.loss.is_finite());
+        assert!(training.positive_matches > 0);
+
+        cpu.backward_accumulate_seeded(
+            &input,
+            &cpu_forward,
+            &training.layer_output_gradient_seeds,
+        )
+        .expect("CPU backward should accumulate");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &training.layer_output_gradient_seeds)
+            .expect("GPU backward should accumulate");
+
+        let cpu_train = match &cpu.train_buffers[0] {
+            LayerTrainBuffers::Convolutional(train) => train,
+            other => panic!("unexpected CPU train buffers: {other:?}"),
+        };
+        let gpu_buffers = gpu.device_train_buffers.borrow();
+        let gpu_train = gpu_buffers[0].as_ref().expect("GPU train buffers exist");
+
+        assert_eq!(cpu_train.bias_updates.len(), gpu_train.bias_updates.data.len());
+        for (cpu_value, gpu_value) in cpu_train
+            .bias_updates
+            .iter()
+            .zip(&gpu_train.bias_updates.data)
+        {
+            assert!((cpu_value - gpu_value).abs() < 1.0e-5);
+        }
+        assert_eq!(cpu_train.weight_updates.len(), gpu_train.weight_updates.data.len());
+        for (cpu_value, gpu_value) in cpu_train
+            .weight_updates
+            .iter()
+            .zip(&gpu_train.weight_updates.data)
+        {
+            assert!((cpu_value - gpu_value).abs() < 1.0e-5);
+        }
+    }
+
+    #[test]
+    fn gpu_avgpool_backward_feeds_previous_convolution() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                width=2
+                height=2
+                channels=1
+
+                [convolutional]
+                filters=1
+                size=1
+                stride=1
+                activation=linear
+
+                [avgpool]
+            "#,
+        )
+        .expect("cfg should parse");
+        let network = Network::from_config(cfg).expect("network should build");
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        match &mut cpu.params[0] {
+            LayerParams::Convolutional(params) => {
+                params.weights[0] = 1.0;
+                params.biases[0] = 0.0;
+            }
+            other => panic!("unexpected params: {other:?}"),
+        }
+        gpu.params = cpu.params.clone();
+        gpu.init_train_buffers_gpu()
+            .expect("GPU train buffers should initialize");
+
+        let input = Tensor::from_data(cpu.network.net.input_shape(), vec![1.0, 2.0, 3.0, 4.0])
+            .expect("input tensor");
+        let cpu_forward = cpu.forward(&input).expect("CPU forward should succeed");
+        let gpu_forward = gpu
+            .forward_with_state(&input)
+            .expect("GPU forward should succeed");
+        assert_same_forward(&cpu_forward, &gpu_forward.cpu_forward);
+
+        let mut seeds = vec![None; cpu.network.layers.len()];
+        seeds[1] = Some(
+            Tensor::from_data(cpu.network.layers[1].output_shape, vec![8.0])
+                .expect("seed tensor"),
+        );
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU backward should accumulate");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("GPU backward should accumulate");
+
+        let cpu_train = match &cpu.train_buffers[0] {
+            LayerTrainBuffers::Convolutional(train) => train,
+            other => panic!("unexpected CPU train buffers: {other:?}"),
+        };
+        let gpu_buffers = gpu.device_train_buffers.borrow();
+        let gpu_train = gpu_buffers[0].as_ref().expect("GPU train buffers exist");
+        assert_eq!(cpu_train.bias_updates, vec![8.0]);
+        assert_eq!(cpu_train.weight_updates, vec![20.0]);
+        assert_eq!(gpu_train.bias_updates.data, cpu_train.bias_updates);
+        assert_eq!(gpu_train.weight_updates.data, cpu_train.weight_updates);
+    }
+
+    #[test]
+    fn gpu_local_avgpool_backward_feeds_previous_convolution() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                width=2
+                height=2
+                channels=1
+
+                [convolutional]
+                filters=1
+                size=1
+                stride=1
+                activation=linear
+
+                [local_avgpool]
+                size=2
+                stride=1
+            "#,
+        )
+        .expect("cfg should parse");
+        let network = Network::from_config(cfg).expect("network should build");
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        match &mut cpu.params[0] {
+            LayerParams::Convolutional(params) => {
+                params.weights[0] = 1.0;
+                params.biases[0] = 0.0;
+            }
+            other => panic!("unexpected params: {other:?}"),
+        }
+        gpu.params = cpu.params.clone();
+        gpu.init_train_buffers_gpu()
+            .expect("GPU train buffers should initialize");
+
+        let input = Tensor::from_data(cpu.network.net.input_shape(), vec![1.0, 2.0, 3.0, 4.0])
+            .expect("input tensor");
+        let cpu_forward = cpu.forward(&input).expect("CPU forward should succeed");
+        let gpu_forward = gpu
+            .forward_with_state(&input)
+            .expect("GPU forward should succeed");
+        assert_same_forward(&cpu_forward, &gpu_forward.cpu_forward);
+
+        let mut seeds = vec![None; cpu.network.layers.len()];
+        seeds[1] = Some(
+            Tensor::from_data(
+                cpu.network.layers[1].output_shape,
+                vec![4.0, 6.0, 8.0, 10.0],
+            )
+            .expect("seed tensor"),
+        );
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU backward should accumulate");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("GPU backward should accumulate");
+
+        let cpu_train = match &cpu.train_buffers[0] {
+            LayerTrainBuffers::Convolutional(train) => train,
+            other => panic!("unexpected CPU train buffers: {other:?}"),
+        };
+        let gpu_buffers = gpu.device_train_buffers.borrow();
+        let gpu_train = gpu_buffers[0].as_ref().expect("GPU train buffers exist");
+        assert_eq!(cpu_train.bias_updates, vec![28.0]);
+        assert_eq!(cpu_train.weight_updates, vec![96.0]);
+        assert_eq!(gpu_train.bias_updates.data, cpu_train.bias_updates);
+        assert_eq!(gpu_train.weight_updates.data, cpu_train.weight_updates);
     }
 
     #[test]

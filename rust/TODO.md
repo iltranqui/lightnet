@@ -32,6 +32,7 @@ Already working:
 - CPU backward/runtime support for:
   - convolutional
   - maxpool
+  - avgpool
   - route
   - shortcut
   - upsample
@@ -63,6 +64,8 @@ Already working:
   - route backward
   - maxpool
   - maxpool backward
+  - avgpool
+  - avgpool backward
   - route
   - shortcut
   - upsample
@@ -82,17 +85,20 @@ Already working:
   - device-side train buffers for convolution owners
   - GPU backward accumulation for the supported subset
   - GPU weight update path
+  - momentum-preserving GPU update buffers across iterations
+  - batch-normalized convolution scale-gradient accumulation and scale updates
+  - batch-norm training-time running-stat updates
+  - GPU batch-norm running-stat updates from retained forward state, independent of gradient-seed reachability
+  - GPU global avgpool forward/backward through the backend trait
+  - CPU/GPU train-buffer parity for a small YOLO-loss detector slice
 - workspace tests covering config parsing, weights inspection, and basic runtime execution
 
 Still missing on the CUDA side:
 
 - a working cutile/CUDA runtime on the target machine
-- detector training with real YOLO loss instead of placeholder output seeds
-- batch-norm training-time running-stat updates
-- momentum-preserving GPU train buffers across iterations
 - a shared C++-style reusable workspace buffer for CPU/GPU training scratch
-- GPU support for the remaining pooling family and unsupported train-time layers
-- CPU/GPU parity checks on more realistic end-to-end detector slices
+- GPU support for `local_avgpool` and other unsupported train-time layers
+- parity checks against the original C Darknet path on realistic end-to-end detector slices
 
 Still missing on the Rust training-parity side:
 
@@ -398,7 +404,6 @@ Still missing:
 - explicit train/eval mode split where behavior differs
 - optimizer state beyond basic SGD momentum buffers
 - workspace/lifetime rules for activations, gradients, and scratch buffers
-- preserving GPU momentum buffers across iterations the way C++ does
 
 Stage 2: Backward Ops
 
@@ -410,26 +415,23 @@ Done for the currently supported subset:
 - route
 - upsample
 - maxpool
+- batch-normalized convolution scale gradients
+- batch-norm training-time running mean/variance updates
 - CPU-reference checks on synthetic tensors for the supported subset
 
 Still missing:
 
 - broader layer coverage beyond the current subset
-- more end-to-end backward parity on real detector slices
-- batch-norm training semantics beyond folded-scale handling
+- backward parity against the original C Darknet path on real detector slices
 
 Stage 3: YOLO Losses And Targets
 
-- port target assignment and anchor matching
-- port objectness, class, and box regression losses
-- support both 2-head and 3-head tiny layouts used by:
+- target assignment and anchor matching are ported on the Rust CPU side
+- objectness, class, and box regression losses are ported on the Rust CPU side
+- both 2-head and 3-head tiny layouts are supported by:
   - `cfg/yolov4-tiny.cfg`
   - `cfg/yolov4-tiny-3l.cfg`
-- verify loss values and per-head gradients against the CPU/original Darknet path
-
-Current blocker:
-
-- the training loop still seeds backward with placeholder `1.0` output gradients, so this stage is the main gap between “weight updates happen” and “real detector training”
+- still verify loss values and per-head gradients against the original Darknet path
 
 Stage 4: Optimizers And Updates
 
@@ -437,10 +439,11 @@ Done:
 
 - CPU SGD with momentum, decay, and LR scheduling
 - GPU SGD-style in-place parameter update primitive
+- GPU convolution update buffers preserve momentum across iterations
+- GPU batch-normalized convolution scales update through the same SGD path
 
 Still missing:
 
-- preserve GPU momentum buffers across iterations instead of recreating them
 - EMA support
 - broader optimizer/state coverage only if needed after Darknet-compatible SGD is correct
 - cleaner mixed host/device bookkeeping for logging and checkpointing
@@ -461,7 +464,6 @@ In progress:
 Still missing:
 
 - stable GPU execution on the target machine
-- real YOLO loss integration into the train loop
 - augmentation only after non-augmented training is correct
 
 Stage 6: Verification
@@ -482,10 +484,9 @@ Deliverable:
 Recommended short-term sequence:
 
 1. fix cutile/CUDA backend startup on the target machine so `detector train` stays on GPU instead of falling back to CPU
-2. preserve GPU `*_updates` buffers across iterations so momentum matches the C++ training scheme
-3. port real YOLO target assignment and loss instead of using placeholder backward seeds
-4. add training-time batch-norm running mean/variance updates
-5. add explicit shared workspace allocation/reuse rules for CPU/GPU training scratch
+2. add explicit shared workspace allocation/reuse rules for CPU/GPU training scratch
+3. verify Rust YOLO-loss gradient seeds against the original Darknet path on realistic detector slices
+4. run short overfit checks once the target machine can keep `detector train` on GPU
 
 This order removes the current operational blocker first, then closes the biggest remaining correctness gaps for real detector training.
 

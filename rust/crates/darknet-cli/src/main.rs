@@ -1,12 +1,15 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "cutile")]
+use darknet_core::GpuExecutableNetwork;
 use darknet_core::{
-    DataConfig, DetectionOptions, ExecutableNetwork, GpuExecutableNetwork, Network,
-    PlanarRgbImage, Tensor, compute_learning_rate, compute_yolo_training_loss,
-    decode_yolo_detections, inspect_weights_file, load_names_file, load_paths_file,
-    load_training_batch_from_paths, save_weights,
+    DataConfig, DetectionOptions, ExecutableNetwork, Network, PlanarRgbImage, Tensor,
+    compute_learning_rate, compute_yolo_training_loss, decode_yolo_detections,
+    inspect_weights_file, load_names_file, load_paths_file, load_training_batch_from_paths,
+    save_weights,
 };
+#[cfg(feature = "cutile")]
 use darknet_cuda_cutile::CutileBackend;
 
 fn main() {
@@ -50,10 +53,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         } else if weights.is_none() {
                             weights = Some(arg);
                         } else {
-                            return Err(format!(
-                                "unexpected detector train argument: {arg}"
-                            )
-                            .into());
+                            return Err(format!("unexpected detector train argument: {arg}").into());
                         }
                     }
                     run_detector_train(&cfg, &data, weights.as_deref(), &flags)?;
@@ -144,10 +144,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let next_arg = args.next();
             let (maybe_weights, seed_mode) = match next_arg.as_deref() {
                 Some("auto" | "yolo" | "final") => (None, next_arg.expect("seed mode present")),
-                Some("-") => (
-                    None,
-                    args.next().unwrap_or_else(|| "auto".to_owned()),
-                ),
+                Some("-") => (None, args.next().unwrap_or_else(|| "auto".to_owned())),
                 Some(_) => (next_arg, args.next().unwrap_or_else(|| "auto".to_owned())),
                 None => (None, "auto".to_owned()),
             };
@@ -306,6 +303,15 @@ fn run_detector_train(
         println!("flags {}", flags.join(" "));
     }
 
+    run_detector_train_preferred_backend(cfg, data, maybe_weights)
+}
+
+#[cfg(feature = "cutile")]
+fn run_detector_train_preferred_backend(
+    cfg: &str,
+    data: &str,
+    maybe_weights: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     match CutileBackend::new(0) {
         Ok(backend) => {
             println!("gpu backend cutile device=0");
@@ -316,6 +322,16 @@ fn run_detector_train(
             run_detector_train_cpu(cfg, data, maybe_weights)
         }
     }
+}
+
+#[cfg(not(feature = "cutile"))]
+fn run_detector_train_preferred_backend(
+    cfg: &str,
+    data: &str,
+    maybe_weights: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("gpu backend disabled at compile time, falling back to cpu");
+    run_detector_train_cpu(cfg, data, maybe_weights)
 }
 
 fn run_detector_train_cpu(
@@ -424,11 +440,17 @@ fn run_detector_train_cpu(
     }
 
     let final_checkpoint = backup_dir.join(format!("{base_name}_final.weights"));
-    save_weights(&executable.network, &executable.params, &final_checkpoint, seen)?;
+    save_weights(
+        &executable.network,
+        &executable.params,
+        &final_checkpoint,
+        seen,
+    )?;
     println!("saved {}", final_checkpoint.display());
     Ok(())
 }
 
+#[cfg(feature = "cutile")]
 fn run_detector_train_gpu(
     cfg: &str,
     data: &str,
@@ -508,7 +530,8 @@ fn run_detector_train_gpu(
                 &batch.labels,
             )?;
             iter_loss += yolo.loss;
-            executable.backward_accumulate_seeded_gpu(&forward, &yolo.layer_output_gradient_seeds)?;
+            executable
+                .backward_accumulate_seeded_gpu(&forward, &yolo.layer_output_gradient_seeds)?;
         }
         executable.update_weights_gpu(
             lr,
@@ -542,7 +565,12 @@ fn run_detector_train_gpu(
     }
 
     let final_checkpoint = backup_dir.join(format!("{base_name}_final.weights"));
-    save_weights(&executable.network, &executable.params, &final_checkpoint, seen)?;
+    save_weights(
+        &executable.network,
+        &executable.params,
+        &final_checkpoint,
+        seen,
+    )?;
     println!("saved {}", final_checkpoint.display());
     Ok(())
 }

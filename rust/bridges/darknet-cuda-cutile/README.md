@@ -9,6 +9,7 @@ It provides:
 - cutile-backed elementwise smoke kernels
 - backend ops for bias add, activation, shortcut add, route concatenation, and upsample
 - a direct convolution kernel path for the Rust GPU runtime
+- global avgpool forward/backward through a host fallback while the device kernel is still pending
 - an implementation of `darknet_cuda::F32TensorOpsBackend`
 
 Build requirements:
@@ -30,4 +31,5 @@ Useful commands:
 Current local status on this machine:
 
 - `/usr/local/cuda-13.2` exists and is a valid candidate for `CUDA_TOOLKIT_PATH`
-- repo-local Cargo config in `.cargo/config.toml` supplies the CUDA and LLVM prefixes for normal Cargo commands
+- LLVM 21, MLIR 21 headers, and Polly static libraries are not currently visible to `./scripts/check-env.sh`
+- set `LLVM_CONFIG_PATH` and `CUDA_TILE_USE_LLVM_INSTALL_DIR` after installing LLVM 21, then rerun `./scripts/check-env.sh`

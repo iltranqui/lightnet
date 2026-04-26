@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::Path;
 
 use crate::error::{Error, Result};
@@ -19,7 +18,12 @@ impl PlanarRgbImage {
         let path = path.as_ref();
         let image = ImageReader::open(path)?
             .with_guessed_format()
-            .map_err(|err| Error::InvalidConfig(format!("failed to guess image format for {}: {err}", path.display())))?
+            .map_err(|err| {
+                Error::InvalidConfig(format!(
+                    "failed to guess image format for {}: {err}",
+                    path.display()
+                ))
+            })?
             .decode()
             .map_err(|err| {
                 Error::InvalidConfig(format!(
@@ -73,12 +77,7 @@ impl PlanarRgbImage {
             return Ok(self.clone());
         }
         let rgb = self.to_rgb_image()?;
-        let resized = imageops::resize(
-            &rgb,
-            width as u32,
-            height as u32,
-            FilterType::Triangle,
-        );
+        let resized = imageops::resize(&rgb, width as u32, height as u32, FilterType::Triangle);
         Self::from_rgb_image(&resized)
     }
 
@@ -136,14 +135,12 @@ impl PlanarRgbImage {
                 let dst = idx * 3;
                 bytes[dst] = (self.data[idx].clamp(0.0, 1.0) * 255.0).round() as u8;
                 bytes[dst + 1] = (self.data[plane + idx].clamp(0.0, 1.0) * 255.0).round() as u8;
-                bytes[dst + 2] =
-                    (self.data[plane * 2 + idx].clamp(0.0, 1.0) * 255.0).round() as u8;
+                bytes[dst + 2] = (self.data[plane * 2 + idx].clamp(0.0, 1.0) * 255.0).round() as u8;
             }
         }
 
-        RgbImage::from_raw(width as u32, height as u32, bytes).ok_or_else(|| {
-            Error::InvalidConfig("failed to construct RGB image buffer".to_owned())
-        })
+        RgbImage::from_raw(width as u32, height as u32, bytes)
+            .ok_or_else(|| Error::InvalidConfig("failed to construct RGB image buffer".to_owned()))
     }
 }
 
@@ -158,147 +155,6 @@ fn fit_inside(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Result<
     } else {
         Ok(((src_w.saturating_mul(dst_h) / src_h).max(1), dst_h.max(1)))
     }
-}
-
-fn decode_netpbm(bytes: &[u8]) -> Result<(usize, usize, Vec<u8>)> {
-    let mut offset = 0usize;
-    let magic = next_pnm_token(bytes, &mut offset)?;
-    let width: usize = next_pnm_token(bytes, &mut offset)?
-        .parse()
-        .map_err(|_| Error::InvalidConfig("invalid NetPBM width".to_owned()))?;
-    let height: usize = next_pnm_token(bytes, &mut offset)?
-        .parse()
-        .map_err(|_| Error::InvalidConfig("invalid NetPBM height".to_owned()))?;
-    let max_value: usize = next_pnm_token(bytes, &mut offset)?
-        .parse()
-        .map_err(|_| Error::InvalidConfig("invalid NetPBM max value".to_owned()))?;
-    if max_value != 255 {
-        return Err(Error::InvalidConfig(format!(
-            "unsupported NetPBM max value {max_value}, expected 255"
-        )));
-    }
-    while offset < bytes.len() && bytes[offset].is_ascii_whitespace() {
-        offset += 1;
-    }
-
-    match magic.as_str() {
-        "P6" => {
-            let expected = width
-                .checked_mul(height)
-                .and_then(|v| v.checked_mul(3))
-                .ok_or_else(|| Error::InvalidConfig("NetPBM dimensions overflow".to_owned()))?;
-            let data = bytes
-                .get(offset..offset + expected)
-                .ok_or_else(|| Error::InvalidConfig("truncated PPM pixel data".to_owned()))?;
-            Ok((width, height, data.to_vec()))
-        }
-        "P5" => {
-            let expected = width
-                .checked_mul(height)
-                .ok_or_else(|| Error::InvalidConfig("NetPBM dimensions overflow".to_owned()))?;
-            let gray = bytes
-                .get(offset..offset + expected)
-                .ok_or_else(|| Error::InvalidConfig("truncated PGM pixel data".to_owned()))?;
-            let mut rgb = Vec::with_capacity(expected * 3);
-            for &value in gray {
-                rgb.extend_from_slice(&[value, value, value]);
-            }
-            Ok((width, height, rgb))
-        }
-        other => Err(Error::InvalidConfig(format!(
-            "unsupported NetPBM magic {other}, expected P6 or P5"
-        ))),
-    }
-}
-
-fn next_pnm_token(bytes: &[u8], offset: &mut usize) -> Result<String> {
-    loop {
-        while *offset < bytes.len() && bytes[*offset].is_ascii_whitespace() {
-            *offset += 1;
-        }
-        if *offset >= bytes.len() {
-            return Err(Error::InvalidConfig(
-                "unexpected EOF while reading NetPBM header".to_owned(),
-            ));
-        }
-        if bytes[*offset] == b'#' {
-            while *offset < bytes.len() && bytes[*offset] != b'\n' {
-                *offset += 1;
-            }
-            continue;
-        }
-        break;
-    }
-
-    let start = *offset;
-    while *offset < bytes.len() && !bytes[*offset].is_ascii_whitespace() {
-        *offset += 1;
-    }
-    let token = std::str::from_utf8(&bytes[start..*offset])
-        .map_err(|_| Error::InvalidConfig("NetPBM header is not valid UTF-8".to_owned()))?;
-    Ok(token.to_owned())
-}
-
-fn decode_bmp(bytes: &[u8]) -> Result<(usize, usize, Vec<u8>)> {
-    if bytes.len() < 54 || &bytes[0..2] != b"BM" {
-        return Err(Error::InvalidConfig("invalid BMP header".to_owned()));
-    }
-
-    let pixel_offset = u32::from_le_bytes(bytes[10..14].try_into().expect("slice")) as usize;
-    let dib_size = u32::from_le_bytes(bytes[14..18].try_into().expect("slice"));
-    if dib_size < 40 {
-        return Err(Error::InvalidConfig(format!(
-            "unsupported BMP DIB header size {dib_size}"
-        )));
-    }
-
-    let width = i32::from_le_bytes(bytes[18..22].try_into().expect("slice"));
-    let height = i32::from_le_bytes(bytes[22..26].try_into().expect("slice"));
-    let planes = u16::from_le_bytes(bytes[26..28].try_into().expect("slice"));
-    let bits_per_pixel = u16::from_le_bytes(bytes[28..30].try_into().expect("slice"));
-    let compression = u32::from_le_bytes(bytes[30..34].try_into().expect("slice"));
-
-    if planes != 1 || compression != 0 {
-        return Err(Error::InvalidConfig(
-            "only uncompressed BMP images with one plane are supported".to_owned(),
-        ));
-    }
-    if bits_per_pixel != 24 && bits_per_pixel != 32 {
-        return Err(Error::InvalidConfig(format!(
-            "unsupported BMP bit depth {bits_per_pixel}, expected 24 or 32"
-        )));
-    }
-    if width <= 0 || height == 0 {
-        return Err(Error::InvalidConfig("invalid BMP dimensions".to_owned()));
-    }
-
-    let width = width as usize;
-    let top_down = height < 0;
-    let height = height.unsigned_abs() as usize;
-    let bytes_per_pixel = usize::from(bits_per_pixel / 8);
-    let row_stride = (width * bytes_per_pixel).div_ceil(4) * 4;
-    let image_size = row_stride
-        .checked_mul(height)
-        .ok_or_else(|| Error::InvalidConfig("BMP dimensions overflow".to_owned()))?;
-    let pixels = bytes
-        .get(pixel_offset..pixel_offset + image_size)
-        .ok_or_else(|| Error::InvalidConfig("truncated BMP pixel data".to_owned()))?;
-
-    let mut rgb = vec![0u8; width * height * 3];
-    for row in 0..height {
-        let src_row = if top_down { row } else { height - 1 - row };
-        let src_base = src_row * row_stride;
-        let dst_base = row * width * 3;
-        for col in 0..width {
-            let src = src_base + col * bytes_per_pixel;
-            let dst = dst_base + col * 3;
-            rgb[dst] = pixels[src + 2];
-            rgb[dst + 1] = pixels[src + 1];
-            rgb[dst + 2] = pixels[src];
-        }
-    }
-
-    Ok((width, height, rgb))
 }
 
 #[cfg(test)]

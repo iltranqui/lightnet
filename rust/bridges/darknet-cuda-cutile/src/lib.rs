@@ -830,6 +830,238 @@ impl CutileBackend {
         })
     }
 
+    pub fn local_avgpool_f32(
+        &self,
+        x: &CutileTensorF32,
+        output_shape: &[usize],
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        padding: usize,
+    ) -> Result<CutileTensorF32, CutileBackendError> {
+        let layout = validate_maxpool_layout(
+            x.len(),
+            output_shape,
+            channels,
+            input_height,
+            input_width,
+            size,
+            stride_x,
+            stride_y,
+        )?;
+        let input = self.download_f32(x)?;
+        let mut out = vec![0.0; layout.output_len];
+        let pad_offset = (padding / 2) as isize;
+        let batch = output_shape[0];
+
+        for b in 0..batch {
+            for c in 0..channels {
+                for oy in 0..layout.output_height {
+                    for ox in 0..layout.output_width {
+                        let mut acc = 0.0;
+                        let mut count = 0usize;
+                        for ky in 0..size {
+                            let in_y = oy as isize * stride_y as isize + ky as isize - pad_offset;
+                            if !(0..input_height as isize).contains(&in_y) {
+                                continue;
+                            }
+                            for kx in 0..size {
+                                let in_x =
+                                    ox as isize * stride_x as isize + kx as isize - pad_offset;
+                                if !(0..input_width as isize).contains(&in_x) {
+                                    continue;
+                                }
+                                let src = ((((b * channels) + c) * input_height) + in_y as usize)
+                                    * input_width
+                                    + in_x as usize;
+                                acc += input[src];
+                                count += 1;
+                            }
+                        }
+                        if count > 0 {
+                            let dst =
+                                ((((b * channels) + c) * layout.output_height) + oy)
+                                    * layout.output_width
+                                    + ox;
+                            out[dst] = acc / count as f32;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.upload_f32(output_shape, &out)
+    }
+
+    pub fn local_avgpool_backward_f32(
+        &self,
+        output_grad: &CutileTensorF32,
+        input_shape: &[usize],
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        padding: usize,
+    ) -> Result<CutileTensorF32, CutileBackendError> {
+        if input_shape.len() != 4
+            || input_shape[1] != channels
+            || input_shape[2] != input_height
+            || input_shape[3] != input_width
+        {
+            return Err(CutileBackendError::Shape(format!(
+                "local_avgpool_backward_f32 input shape mismatch: expected [batch, {channels}, {input_height}, {input_width}], got {input_shape:?}"
+            )));
+        }
+        let output_shape = output_grad.shape_usize();
+        let layout = validate_maxpool_layout(
+            input_shape.iter().product(),
+            &output_shape,
+            channels,
+            input_height,
+            input_width,
+            size,
+            stride_x,
+            stride_y,
+        )?;
+        let output_grad = self.download_f32(output_grad)?;
+        let mut input_grad = vec![0.0; input_shape.iter().product()];
+        let pad_offset = (padding / 2) as isize;
+        let batch = input_shape[0];
+
+        for b in 0..batch {
+            for c in 0..channels {
+                for oy in 0..layout.output_height {
+                    for ox in 0..layout.output_width {
+                        let mut valid = Vec::new();
+                        for ky in 0..size {
+                            let in_y = oy as isize * stride_y as isize + ky as isize - pad_offset;
+                            if !(0..input_height as isize).contains(&in_y) {
+                                continue;
+                            }
+                            for kx in 0..size {
+                                let in_x =
+                                    ox as isize * stride_x as isize + kx as isize - pad_offset;
+                                if !(0..input_width as isize).contains(&in_x) {
+                                    continue;
+                                }
+                                valid.push((in_y as usize, in_x as usize));
+                            }
+                        }
+                        if !valid.is_empty() {
+                            let src =
+                                ((((b * channels) + c) * layout.output_height) + oy)
+                                    * layout.output_width
+                                    + ox;
+                            let share = output_grad[src] / valid.len() as f32;
+                            for (y, x) in valid {
+                                let dst =
+                                    ((((b * channels) + c) * input_height) + y) * input_width + x;
+                                input_grad[dst] += share;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.upload_f32(input_shape, &input_grad)
+    }
+
+    pub fn avgpool_f32(
+        &self,
+        x: &CutileTensorF32,
+        output_shape: &[usize],
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+    ) -> Result<CutileTensorF32, CutileBackendError> {
+        if output_shape.len() != 4 || output_shape[1] != channels || output_shape[2] != 1 || output_shape[3] != 1 {
+            return Err(CutileBackendError::Shape(format!(
+                "avgpool_f32 output shape must be [batch, {channels}, 1, 1], got {output_shape:?}"
+            )));
+        }
+        let batch_stride = channels
+            .checked_mul(input_height)
+            .and_then(|value| value.checked_mul(input_width))
+            .ok_or_else(|| CutileBackendError::Shape("avgpool_f32 input stride overflow".to_owned()))?;
+        if batch_stride == 0 || x.len() % batch_stride != 0 {
+            return Err(CutileBackendError::Shape(format!(
+                "avgpool_f32 input length {} is incompatible with channels={channels}, height={input_height}, width={input_width}",
+                x.len()
+            )));
+        }
+        let batch = x.len() / batch_stride;
+        if output_shape[0] != batch {
+            return Err(CutileBackendError::Shape(format!(
+                "avgpool_f32 output batch mismatch: expected {batch}, got {}",
+                output_shape[0]
+            )));
+        }
+
+        let input = self.download_f32(x)?;
+        let area = (input_height * input_width) as f32;
+        let mut out = vec![0.0; batch * channels];
+        for b in 0..batch {
+            for c in 0..channels {
+                let mut acc = 0.0;
+                for y in 0..input_height {
+                    for x_idx in 0..input_width {
+                        let src = ((((b * channels) + c) * input_height) + y) * input_width + x_idx;
+                        acc += input[src];
+                    }
+                }
+                out[b * channels + c] = acc / area;
+            }
+        }
+
+        self.upload_f32(output_shape, &out)
+    }
+
+    pub fn avgpool_backward_f32(
+        &self,
+        output_grad: &CutileTensorF32,
+        input_shape: &[usize],
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+    ) -> Result<CutileTensorF32, CutileBackendError> {
+        if input_shape.len() != 4 || input_shape[1] != channels || input_shape[2] != input_height || input_shape[3] != input_width {
+            return Err(CutileBackendError::Shape(format!(
+                "avgpool_backward_f32 input shape mismatch: expected [batch, {channels}, {input_height}, {input_width}], got {input_shape:?}"
+            )));
+        }
+        let batch = input_shape[0];
+        if output_grad.len() != batch * channels {
+            return Err(CutileBackendError::Shape(format!(
+                "avgpool_backward_f32 output gradient length mismatch: expected {}, got {}",
+                batch * channels,
+                output_grad.len()
+            )));
+        }
+
+        let output_grad = self.download_f32(output_grad)?;
+        let area = (input_height * input_width) as f32;
+        let mut input_grad = vec![0.0; input_shape.iter().product()];
+        for b in 0..batch {
+            for c in 0..channels {
+                let grad = output_grad[b * channels + c] / area;
+                for y in 0..input_height {
+                    for x_idx in 0..input_width {
+                        let dst = ((((b * channels) + c) * input_height) + y) * input_width + x_idx;
+                        input_grad[dst] = grad;
+                    }
+                }
+            }
+        }
+
+        self.upload_f32(input_shape, &input_grad)
+    }
+
     pub fn vector_add_f32(
         &self,
         x: &CutileTensorF32,
@@ -1330,6 +1562,98 @@ impl F32TensorOpsBackend for CutileBackend {
             stride_y,
             padding,
             config.tile_len,
+        )
+    }
+
+    fn local_avgpool_f32(
+        &self,
+        x: &Self::Tensor,
+        output_shape: &[usize],
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        padding: usize,
+        _config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        CutileBackend::local_avgpool_f32(
+            self,
+            x,
+            output_shape,
+            channels,
+            input_height,
+            input_width,
+            size,
+            stride_x,
+            stride_y,
+            padding,
+        )
+    }
+
+    fn local_avgpool_backward_f32(
+        &self,
+        output_grad: &Self::Tensor,
+        input_shape: &[usize],
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        padding: usize,
+        _config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        CutileBackend::local_avgpool_backward_f32(
+            self,
+            output_grad,
+            input_shape,
+            channels,
+            input_height,
+            input_width,
+            size,
+            stride_x,
+            stride_y,
+            padding,
+        )
+    }
+
+    fn avgpool_f32(
+        &self,
+        x: &Self::Tensor,
+        output_shape: &[usize],
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        _config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        CutileBackend::avgpool_f32(
+            self,
+            x,
+            output_shape,
+            channels,
+            input_height,
+            input_width,
+        )
+    }
+
+    fn avgpool_backward_f32(
+        &self,
+        output_grad: &Self::Tensor,
+        input_shape: &[usize],
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        _config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        CutileBackend::avgpool_backward_f32(
+            self,
+            output_grad,
+            input_shape,
+            channels,
+            input_height,
+            input_width,
         )
     }
 

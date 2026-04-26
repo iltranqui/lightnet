@@ -23,7 +23,7 @@ What works today:
 - run `forward-dummy` on supported models with zero or loaded weights
 - collect YOLO head tensors during forward execution for later decoding work
 - decode YOLO head tensors into class detections with CPU-side NMS
-- load `.ppm`/`.pgm`/`.pnm` and `.bmp` images for Rust-side preprocessing
+- load common image formats through the Rust `image` crate for preprocessing
 - run end-to-end Rust image inference through the CLI on the CPU runtime
 - construct a backend-generic `GpuExecutableNetwork` for the current GPU layer subset:
   convolutional, maxpool, route, shortcut, upsample, and YOLO staging
@@ -36,7 +36,6 @@ What is not finished:
 - training, backward pass, and optimizer support
 - full CUDA parity with original Darknet kernels
 - recurrent and less common Darknet layer types
-- broader image format support in the Rust-only path beyond NetPBM/BMP
 
 ## Workspace Layout
 
@@ -87,10 +86,10 @@ The runtime currently rejects recurrent families such as:
 From the repo root:
 
 ```bash
-cargo check
+cargo check --manifest-path rust/Cargo.toml --workspace
 ```
 
-Equivalent explicit form:
+From this `rust/` directory:
 
 ```bash
 cargo check --workspace
@@ -98,8 +97,8 @@ cargo check --workspace
 
 Verified in this repo:
 
-- `cargo check`
-- `cargo test`
+- `cargo check --workspace --locked`
+- `cargo test --workspace --locked`
 
 ## CLI
 
@@ -122,6 +121,14 @@ cargo run -p darknet-cli -- forward-dummy cfg/yolov3-tiny.cfg
 cargo run -p darknet-cli -- detect-image cfg/yolov4-tiny.cfg yolov4-tiny.weights cfg/coco.names frame.ppm
 ```
 
+The default CLI build does not compile the optional `cutile-rs` CUDA bridge. In
+that mode, `detector train` uses the CPU path. To build the CLI with CUDA bridge
+support, enable the opt-in feature:
+
+```bash
+cargo run -p darknet-cli --features cutile -- detector train cfg/yolov4-tiny.cfg data/train.data
+```
+
 `forward-dummy` constructs an `ExecutableNetwork`, optionally loads a Darknet
 weights file, feeds a zero input tensor shaped from the `[net]` section, and
 prints the final tensor shape plus any YOLO head tensors encountered during the
@@ -129,8 +136,9 @@ forward pass.
 
 `detect-image` runs the CPU Rust inference path end to end: image load,
 letterbox-or-resize preprocessing, forward execution, YOLO decode, and greedy
-NMS. The current Rust-only image loader supports NetPBM (`.ppm`, `.pgm`,
-`.pnm`) and uncompressed `.bmp`.
+NMS. The Rust image loader uses the `image` crate, so common formats such as
+PNG, JPEG, BMP, NetPBM, GIF, TIFF, TGA, WebP, HDR, EXR, QOI, and AVIF go
+through the same preprocessing path.
 
 ## Optional CUDA Bridge
 
@@ -152,13 +160,15 @@ It currently provides:
 - fully on-device `route` concatenation and `upsample` pointer kernels
 - a direct `f32` convolution kernel path exposed through `F32TensorOpsBackend`
 - a direct `f32` maxpool kernel path exposed through `F32TensorOpsBackend`
+- global avgpool forward/backward exposed through `F32TensorOpsBackend` with a conservative host fallback until a device kernel is ported
 - a bridge implementation of `darknet_cuda::F32TensorOpsBackend`
 - a smoke example that exercises context creation, kernel launch, and device-to-host copy
 - bridge-side shape validation tests for convolution, maxpool, route, and upsample layouts
 
 What it does not provide yet:
 
-- the remaining pooling family beyond `maxpool`
+- a direct device kernel for global avgpool
+- `local_avgpool` on the GPU path
 - a real detector decode / NMS path after YOLO head staging
 - direct end-to-end image inference from the Rust CLI
 
@@ -177,7 +187,8 @@ sudo apt install llvm-21 llvm-21-dev libmlir-21-dev mlir-21-tools libpolly-21-de
 
 ### Normal Cargo Usage
 
-The repo-level Cargo config in [`.cargo/config.toml`](/home/helldiver/src/darknet/.cargo/config.toml) supplies the local CUDA and LLVM prefix variables needed by the bridge, so from this repo you can use normal Cargo commands:
+After the CUDA and LLVM environment variables are set, the bridge can be built
+with normal Cargo commands:
 
 ```bash
 cargo check --manifest-path rust/bridges/darknet-cuda-cutile/Cargo.toml
@@ -193,10 +204,11 @@ If the bridge does not build on another machine, run:
 
 For bridge-specific details, see:
 
-- [bridges/darknet-cuda-cutile/README.md](/home/helldiver/src/darknet/rust/bridges/darknet-cuda-cutile/README.md)
+- [bridges/darknet-cuda-cutile/README.md](bridges/darknet-cuda-cutile/README.md)
 
 ## Notes
 
 - The main Rust workspace excludes the `cutile` bridge on purpose. That keeps `cargo check --workspace` fast and independent from the large external CUDA/MLIR dependency graph.
-- The bridge now compiles as a normal Cargo crate, but running GPU examples still depends on real NVIDIA driver and device access in the current shell.
-- The current CPU path is the behavioral reference for the future GPU runtime. The next work is in [TODO.md](/home/helldiver/src/darknet/rust/TODO.md).
+- The CLI's CUDA training path is behind the `cutile` feature for the same reason. The default CLI build falls back to CPU training when `detector train` is used.
+- On this machine, `./rust/bridges/darknet-cuda-cutile/scripts/check-env.sh` finds `/usr/local/cuda-13.2` but does not find LLVM 21, MLIR 21, or Polly. The bridge build remains blocked until those dependencies are installed or exported.
+- The current CPU path is the behavioral reference for the future GPU runtime. The next work is in [TODO.md](TODO.md).

@@ -7,7 +7,11 @@ license.workspace = true
 [dependencies]
 darknet-core = { path = "../darknet-core" }
 darknet-cuda = { path = "../darknet-cuda" }
-darknet-cuda-cutile = { path = "../../bridges/darknet-cuda-cutile" }
+darknet-cuda-cutile = { path = "../../bridges/darknet-cuda-cutile", optional = true }
+
+[features]
+default = []
+cutile = ["dep:darknet-cuda-cutile"]
 
 [[bin]]
 name = "darknet-rs"
