@@ -1,3 +1,9 @@
+//! Errors shared by parsing, execution, I/O, and backend boundaries.
+//!
+//! C++ Darknet reports many failures through fatal logging and process exits.
+//! Rust returns the same validation failures as values so library callers can
+//! choose whether to retry, fall back to CPU, or terminate.
+
 use std::fmt::{Display, Formatter};
 
 pub type Result<T> = std::result::Result<T, Error>;

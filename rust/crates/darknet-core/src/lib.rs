@@ -1,3 +1,15 @@
+//! CPU-first Rust implementation of the Darknet/YOLO runtime.
+//!
+//! The port keeps Darknet's observable contracts—`.cfg` parsing, planar
+//! `B x C x H x W` tensors, layer ordering, `.weights` byte ordering,
+//! detector target assignment, and SGD update semantics—while replacing
+//! pointer-owned C++ objects with explicit Rust values.  Parsing, model
+//! description, execution, training, and post-processing are separate modules
+//! so the CPU executor can remain the correctness reference for GPU backends.
+//!
+//! The public re-exports below form the application-facing API.  The modules
+//! remain public for advanced users extending a specific part of the port.
+
 pub mod cfg;
 pub mod detect;
 pub mod error;
@@ -13,14 +25,16 @@ pub use detect::{Detection, DetectionBox, DetectionOptions, decode_yolo_detectio
 pub use error::{Error, Result};
 pub use image::PlanarRgbImage;
 pub use model::{
-    Activation, Layer, LayerKind, LayerWeights, LrPolicy, NetConfig, Network, TensorShape,
-    WeightsArray, YoloIouLoss,
+    Activation, CrnnSpec, Layer, LayerKind, LayerWeights, LrPolicy, LstmSpec, NetConfig, Network,
+    RnnSpec, TensorShape, WeightsArray, YoloIouLoss,
 };
 pub use names::load_names_file;
 pub use runtime::{
     BackwardResult, BatchNormTrainBuffers, ConnectedTrainBuffers, ConvolutionalTrainBuffers,
-    ExecutableNetwork, ForwardResult, GpuExecutableNetwork, GpuForwardState, GpuForwardSummary,
-    LayerParams, LayerTrainBuffers, Tensor, YoloHeadOutput, compute_learning_rate,
+    CrnnParams, CrnnTrainBuffers, ExecutableNetwork, ForwardResult, GpuExecutableNetwork,
+    GpuForwardState, GpuForwardSummary, LayerParams, LayerTrainBuffers, LstmParams,
+    LstmTrainBuffers, RecurrentForwardCache, RnnParams, RnnTrainBuffers, Tensor, YoloHeadOutput,
+    compute_learning_rate,
 };
 pub use train::{
     DataConfig, TrainingBatch, YoloLabel, YoloTrainingLoss, YoloTrainingState,

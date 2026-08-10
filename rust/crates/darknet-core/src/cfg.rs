@@ -1,3 +1,10 @@
+//! Darknet `.cfg` parsing.
+//!
+//! Darknet configuration files are a sequence of named sections followed by
+//! `key=value` pairs.  This parser preserves the compatibility details that
+//! matter for existing configs: case-insensitive names, comma or whitespace
+//! separated lists, and `#`/`;` inline comments.
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -104,8 +111,13 @@ impl ConfigFile {
         let mut current: Option<RawSection> = None;
 
         for (idx, raw_line) in text.lines().enumerate() {
+            // Remove comments before interpreting a line.  Darknet accepts a
+            // comment after a value, not only on a line by itself.
             let line_number = idx + 1;
-            let line = raw_line.trim();
+            let line = raw_line
+                .split_once('#')
+                .map_or(raw_line, |(value, _)| value);
+            let line = line.split_once(';').map_or(line, |(value, _)| value).trim();
 
             if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
                 continue;
@@ -168,7 +180,7 @@ where
         return Ok(Vec::new());
     };
 
-    raw.split(',')
+    raw.split(|character: char| character == ',' || character.is_ascii_whitespace())
         .map(str::trim)
         .filter(|item| !item.is_empty())
         .map(|item| {
@@ -202,6 +214,8 @@ mod tests {
                 stride=1
                 pad=1
                 activation=leaky
+                # an ordinary comment
+                route_hint=1 ### an inline comment
             "#,
         )
         .expect("cfg should parse");

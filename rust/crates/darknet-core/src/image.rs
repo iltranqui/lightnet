@@ -1,3 +1,9 @@
+//! Image loading and Darknet-compatible tensor preprocessing.
+//!
+//! `PlanarRgbImage` is the boundary between interleaved RGB image memory and
+//! Darknet's contiguous channel-major tensor layout.  Conversion happens once
+//! at this boundary; the runtime never has to guess an image memory layout.
+
 use std::path::Path;
 
 use crate::error::{Error, Result};
@@ -76,7 +82,7 @@ impl PlanarRgbImage {
         if self.shape.width == width && self.shape.height == height {
             return Ok(self.clone());
         }
-        let rgb = self.to_rgb_image()?;
+        let rgb = self.to_rgb8()?;
         let resized = imageops::resize(&rgb, width as u32, height as u32, FilterType::Triangle);
         Self::from_rgb_image(&resized)
     }
@@ -91,7 +97,7 @@ impl PlanarRgbImage {
         let (new_width, new_height) =
             fit_inside(self.shape.width, self.shape.height, width, height)?;
         let resized = self.resize(new_width, new_height)?;
-        let resized_rgb = resized.to_rgb_image()?;
+        let resized_rgb = resized.to_rgb8()?;
         let mut canvas = RgbImage::new(width as u32, height as u32);
         draw_filled_rect_mut(
             &mut canvas,
@@ -117,7 +123,11 @@ impl PlanarRgbImage {
         )
     }
 
-    fn to_rgb_image(&self) -> Result<RgbImage> {
+    /// Convert the planar network image back to an interleaved 8-bit RGB image.
+    ///
+    /// This is public so the Rust example programs can produce the same annotated
+    /// image and video artifacts as the C++ examples.
+    pub fn to_rgb8(&self) -> Result<RgbImage> {
         if self.shape.channels != 3 {
             return Err(Error::InvalidConfig(format!(
                 "expected 3 channels for RGB conversion, got {}",

@@ -1,3 +1,10 @@
+//! Dataset loading, YOLO target assignment, detector loss, and training state.
+//!
+//! Data preparation is kept separate from graph execution.  A
+//! [`TrainingBatch`] owns decoded images and labels; the runtime produces
+//! tensors and gradients; this module creates the same head seeds and loss
+//! bookkeeping used by Darknet's detector loop.
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -124,7 +131,7 @@ pub fn compute_yolo_training_loss_with_state(
     forward: &ForwardResult,
     labels: &[Vec<YoloLabel>],
     iteration: usize,
-    mut state: Option<&mut YoloTrainingState>,
+    state: Option<&mut YoloTrainingState>,
 ) -> Result<YoloTrainingLoss> {
     let mut seeds = vec![None; network.layers.len()];
     let batch_size = network.net.batch.max(1);
@@ -172,7 +179,7 @@ pub fn compute_yolo_training_loss_with_state(
         let grid_width = head.output.shape.width;
         let grid_height = head.output.shape.height;
 
-        for batch in 0..batch_size {
+        for (batch, batch_labels) in labels.iter().enumerate() {
             for anchor_offset in 0..anchors_per_cell {
                 let channel_base = anchor_offset * entries_per_anchor;
                 let anchor = anchor_pair(spec, spec.mask[anchor_offset])?;
@@ -212,7 +219,7 @@ pub fn compute_yolo_training_loss_with_state(
                         let mut best_match_iou = 0.0f32;
                         let mut best_label: Option<(&YoloLabel, usize)> = None;
 
-                        for label in &labels[batch] {
+                        for label in batch_labels {
                             let class_id = remap_class_id(spec, label.class_id, head.layer_index)?;
                             let iou = bbox_iou(predicted_bbox, bbox_from_label(label));
                             if class_match && iou > best_match_iou {
@@ -475,7 +482,7 @@ pub fn compute_yolo_training_loss_with_state(
         }
     }
 
-    if let Some(state) = state.as_deref_mut() {
+    if let Some(state) = state {
         apply_yolo_delta_filtering(network, &mut seeds, iteration, state);
     }
 
@@ -649,6 +656,7 @@ fn zero_deltas_below(seed: &mut Tensor, threshold: f32) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_yolo_box_delta(
     output: &Tensor,
     seed: &mut Tensor,
@@ -800,6 +808,7 @@ fn add_box_delta(
     seed.set(batch, channel, row, col, value);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_yolo_positive_objectness(
     _output: &Tensor,
     seed: &mut Tensor,
@@ -822,6 +831,7 @@ fn apply_yolo_positive_objectness(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_yolo_class_delta(
     output: &Tensor,
     seed: &mut Tensor,
@@ -917,6 +927,7 @@ fn class_multiplier(spec: &YoloSpec, class_id: usize) -> f32 {
         .unwrap_or(1.0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compare_yolo_class_outputs(
     output: &Tensor,
     batch: usize,
@@ -1238,6 +1249,7 @@ fn bbox_from_label(label: &YoloLabel) -> YoloBox {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_training_bbox(
     tx: f32,
     ty: f32,

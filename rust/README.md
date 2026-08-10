@@ -1,214 +1,189 @@
 # Rust Darknet Port
 
-This directory contains the Rust port-in-progress of Darknet.
+Detailed design: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).  Direct
+C++/Rust CPU differential testing: [`docs/CPP_PARITY.md`](docs/CPP_PARITY.md).
 
-It is not a full replacement for the original C/CUDA code yet. The current
-state is:
+This directory contains the Rust implementation of the Darknet runtime and
+CLI. The CPU runtime is the behavioral reference; the GPU runtime uses native
+backend operations where available and a correctness-first CPU-reference
+fallback for operations that do not yet have device kernels.
 
-- Darknet `.cfg` parsing
-- network and layer modeling
-- `.names` loading
-- `.weights` header parsing, layout inspection, and parameter loading into a CPU executable network
-- a CPU execution path for a useful YOLO-style layer subset
-- a Rust CLI for inspection, validation, and dummy forward execution
-- a separate opt-in CUDA bridge built against `cutile-rs`
+## Implemented
 
-## Status
+- Darknet `.cfg`, `.names`, and `.weights` parsing, inspection, loading, and
+  saving, including recurrent nested-layer weight layouts.
+- Effective Darknet mini-batch and `time_steps` handling.
+- Legacy configuration aliases, inline comments, whitespace-separated lists,
+  and Darknet learning-rate policies (`constant`, `step`, `steps`, `poly`,
+  `exp`, `sig`, and `sgdr`).
+- CPU forward and backward execution for:
+  - convolutional layers, grouped convolution, batch normalization, and all
+    supported activations;
+  - connected layers;
+  - maxpool, local average pool, and global average pool;
+  - route, shortcut, upsample, and reorg;
+  - softmax, dropout, scale-channels, and SAM;
+  - RNN, LSTM, and CRNN recurrent layers with cached BPTT;
+  - YOLO/region/gaussian-YOLO/cost/contrastive staging.
+- CPU training buffers, SGD with momentum/decay, learning-rate scheduling,
+  detector target assignment and loss, checkpoint writing, image loading, YOLO
+  decode, and CPU NMS.
+- A backend-generic `GpuExecutableNetwork` with native dispatch for the
+  available convolution, pooling, route, shortcut, upsample, and YOLO paths.
+  Connected, reorg, softmax, dropout, scale-channels, SAM, recurrent layers,
+  and mismatched-shape shortcuts use a CPU-reference bridge while retaining
+  GPU convolution gradients and updates where possible.
+- GPU training-state retention, seeded backward accumulation, batch-norm
+  running-stat updates, and persistent SGD update buffers.
 
-What works today:
-
-- validate and summarize Darknet config files
-- inspect weight files against a parsed network
-- load Darknet weights into executable convolutional and connected layers
-- run `forward-dummy` on supported models with zero or loaded weights
-- collect YOLO head tensors during forward execution for later decoding work
-- decode YOLO head tensors into class detections with CPU-side NMS
-- load common image formats through the Rust `image` crate for preprocessing
-- run end-to-end Rust image inference through the CLI on the CPU runtime
-- construct a backend-generic `GpuExecutableNetwork` for the current GPU layer subset:
-  convolutional, maxpool, route, shortcut, upsample, and YOLO staging
-- run a compact GPU forward path for `cfg/yolov4-tiny.cfg` and `cfg/yolov4-tiny-3l.cfg`
-  without retaining every intermediate CPU tensor
-- build the optional `cutile-rs` bridge crate with normal Cargo commands from this repo
-
-What is not finished:
-
-- training, backward pass, and optimizer support
-- full CUDA parity with original Darknet kernels
-- recurrent and less common Darknet layer types
+The Rust workspace has warning-clean checks and tests. The core crate contains
+69 unit tests plus a direct C++ CPU parity integration test, including explicit
+CPU inference/training forward-backward coverage, recurrent update tests,
+weights round trips, GPU fallback coverage, and an analytical convolution/SGD
+check. That convolution test uses an independent closed-form NCHW reference
+for input, weight, and bias gradients, then verifies that one Darknet-style
+stochastic-gradient update moves the parameters in the expected direction and
+lowers the loss. The parity test compiles the repository's actual
+`src-lib/connected_layer.cpp` and compares Rust/C++ outputs and gradients.
 
 ## Workspace Layout
 
-- `crates/darknet-core`
-  Rust model parsing, tensor/image types, names loading, weights inspection, executable-network construction, and CPU runtime support.
-- `crates/darknet-cuda`
-  Shared CUDA-side abstractions and typed backend traits used by Rust runtimes.
-- `crates/darknet-cli`
-  Command-line entry point exposed as `darknet-rs`.
-- `bridges/darknet-cuda-cutile`
-  Optional `cutile-rs` backend bridge. This is intentionally outside the main Cargo workspace so the git dependency does not affect every workspace build.
+- `crates/darknet-core`: model parsing, tensors, weights, inference, training,
+  and CPU/GPU runtime orchestration.
+- `crates/darknet-cuda`: backend traits and CUDA-facing tensor abstractions.
+- `crates/darknet-cli`: the `darknet-rs` command-line application.
+- `crates/darknet-examples`: Rust equivalents of all 11 programs in
+  ../src-examples, including image, video, JSON, YOLO-label, keypoint,
+  RTSP, and webcam workflows.
+- `bridges/darknet-cuda-cutile`: optional `cutile-rs` backend.
 
-## CPU Runtime Coverage
+## Build and Verify
 
-The current `darknet-core::ExecutableNetwork` can execute:
-
-- `convolutional`
-- `connected`
-- `maxpool`
-- `local_avgpool`
-- `avgpool`
-- `route`
-- `shortcut`
-- `upsample`
-- `reorg`
-
-The runtime currently treats these as pass-through staging layers so configs can
-continue to execute structurally while detector decoding is still missing:
-
-- `yolo`
-- `gaussian_yolo`
-- `region`
-- `softmax`
-- `cost`
-- `dropout`
-- `scale_channels`
-- `sam`
-- `contrastive`
-
-The runtime currently rejects recurrent families such as:
-
-- `rnn`
-- `lstm`
-- `crnn`
-
-## Build
-
-From the repo root:
+From the Darknet repository root:
 
 ```bash
-cargo check --manifest-path rust/Cargo.toml --workspace
+source toolchain.env
+cd rust
+RUSTFLAGS=-Dwarnings cargo check --workspace --all-targets --locked -j 2
+RUSTFLAGS=-Dwarnings cargo test --workspace --all-targets --locked -j 2
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo fmt --all -- --check
+
+# The optional cuTile bridge is checked separately from the main workspace.
+./bridges/darknet-cuda-cutile/scripts/check-env.sh
+RUSTFLAGS=-Dwarnings cargo test \
+  --manifest-path bridges/darknet-cuda-cutile/Cargo.toml --locked --lib
+
+# Require the direct C++/Rust fixture instead of allowing a missing compiler
+# to be reported as a portable-development skip.
+DARKNET_CPP_PARITY_REQUIRED=1 \
+  RUSTFLAGS=-Dwarnings cargo test -p darknet-core --test cpp_parity -- --nocapture
 ```
 
-From this `rust/` directory:
-
-```bash
-cargo check --workspace
-```
-
-Verified in this repo:
-
-- `cargo check --workspace --locked`
-- `cargo test --workspace --locked`
+`toolchain.env` selects the workspace-local Rust 1.97.1 toolchain, Cargo,
+Clippy, rustfmt, and CUDA 12.9 `nvcc`. `nvcc` compilation can be verified
+without a GPU; executing CUDA kernels still requires a compatible GPU.
 
 ## CLI
 
-The Rust CLI currently supports:
-
-- `version`
-- `cfg-validate <cfg>`
-- `cfg-summary <cfg>`
-- `names <names>`
-- `weights-inspect <cfg> <weights>`
-- `forward-dummy <cfg> [weights]`
-- `detect-image <cfg> <weights> <names> <image> [thresh] [nms] [letterbox|resize]`
+```text
+version
+cfg-validate <cfg>
+cfg-summary <cfg>
+names <names>
+weights-inspect <cfg> <weights>
+forward-dummy <cfg> [weights]
+detect-image <cfg> <weights> <names> <image> [threshold] [nms] [letterbox|resize]
+```
 
 Examples:
 
 ```bash
-cargo run -p darknet-cli -- cfg-summary cfg/yolov3-tiny.cfg
-cargo run -p darknet-cli -- weights-inspect cfg/yolov4-tiny.cfg yolov4-tiny.weights
-cargo run -p darknet-cli -- forward-dummy cfg/yolov3-tiny.cfg
-cargo run -p darknet-cli -- detect-image cfg/yolov4-tiny.cfg yolov4-tiny.weights cfg/coco.names frame.ppm
+cargo run -p darknet-cli -- cfg-summary ../cfg/yolov4-tiny.cfg
+cargo run -p darknet-cli -- forward-dummy ../cfg/yolov4-tiny.cfg
+cargo run -p darknet-cli -- detect-image ../cfg/yolov4-tiny.cfg model.weights ../cfg/coco.names frame.ppm
 ```
 
-The default CLI build does not compile the optional `cutile-rs` CUDA bridge. In
-that mode, `detector train` uses the CPU path. To build the CLI with CUDA bridge
-support, enable the opt-in feature:
+The example binaries use explicit model arguments:
+
+    cargo run -p darknet-examples --bin darknet_01_inference_images -- <cfg> <weights|-> <names|-> image...
+    cargo run -p darknet-examples --bin darknet_04_process_videos -- <cfg> <weights|-> <names|-> video...
+    cargo run -p darknet-examples --bin darknet_06_images_to_json -- <cfg> <weights|-> <names|-> image...
+    cargo run -p darknet-examples --bin darknet_11_images_to_yolo -- <cfg> <weights|-> <names|-> image...
+
+All 11 binaries are named after their C++ counterparts. Video, RTSP, and
+webcam equivalents use ffmpeg and ffprobe for media I/O, while display
+variants use ffplay. Model execution, decoding, annotation, and output
+ordering remain in Rust. Common options are --threshold, --nms, --resize,
+--output, and --seconds.
+
+| Darknet C++ example | Rust equivalent |
+| --- | --- |
+| darknet_01_inference_images.cpp | darknet_01_inference_images |
+| darknet_02_display_annotated_images.cpp | darknet_02_display_annotated_images |
+| darknet_03_display_videos.cpp | darknet_03_display_videos |
+| darknet_04_process_videos.cpp | darknet_04_process_videos |
+| darknet_05_process_videos_multithreaded.cpp | darknet_05_process_videos_multithreaded |
+| darknet_06_images_to_json.cpp | darknet_06_images_to_json |
+| darknet_07_display_rtsp_stream.cpp | darknet_07_display_rtsp_stream |
+| darknet_08_display_webcam.cpp | darknet_08_display_webcam |
+| darknet_09_keypoints_images.cpp | darknet_09_keypoints_images |
+| darknet_10_keypoints_videos.cpp | darknet_10_keypoints_videos |
+| darknet_11_images_to_yolo.cpp | darknet_11_images_to_yolo |
+
+## GPU and cuTile
+
+The optional bridge is built separately:
 
 ```bash
-cargo run -p darknet-cli --features cutile -- detector train cfg/yolov4-tiny.cfg data/train.data
+./bridges/darknet-cuda-cutile/scripts/check-env.sh
+cargo check --manifest-path bridges/darknet-cuda-cutile/Cargo.toml --locked
 ```
 
-`forward-dummy` constructs an `ExecutableNetwork`, optionally loads a Darknet
-weights file, feeds a zero input tensor shaped from the `[net]` section, and
-prints the final tensor shape plus any YOLO head tensors encountered during the
-forward pass.
+The bridge is pinned to cutile-rs v0.2.0. Its default JIT path uses the
+pure-Rust cutile-ir, so LLVM/MLIR 21 and Polly are no longer required for the
+normal build. CUDA 13.3 is the upstream-recommended target; CUDA 13.2 or newer
+is appropriate for Ada sm_89. CUDA 12.9 remains useful for compiler-only
+checks but is too old for the current low-precision path. CUDA headers and a
+checks but is too old for the current low-precision path. CUDA, cuRAND, and
+libclang installations are needed by the generated CUDA binding step. The
+workspace setup includes the cuRAND development headers/library alongside the
+compiler-only CUDA tree.
+See the [cuTile Rust repository](https://github.com/NVlabs/cutile-rs) and the
+[v0.2.0 release notes](https://github.com/NVlabs/cutile-rs/releases/tag/v0.2.0).
 
-`detect-image` runs the CPU Rust inference path end to end: image load,
-letterbox-or-resize preprocessing, forward execution, YOLO decode, and greedy
-NMS. The Rust image loader uses the `image` crate, so common formats such as
-PNG, JPEG, BMP, NetPBM, GIF, TIFF, TGA, WebP, HDR, EXR, QOI, and AVIF go
-through the same preprocessing path.
+The cuTile bridge currently exposes device kernels for tensor upload/download,
+elementwise activation, bias and channel scaling, shortcut add, route,
+upsample, convolution, maxpool, and the backend trait. Global/local average
+pooling still include conservative host fallbacks, and detector decoding/NMS
+remains CPU-side.
 
-## Optional CUDA Bridge
-
-The CUDA bridge uses `cutile-rs` as the backend reference and execution path:
-
-- `https://github.com/NVlabs/cutile-rs`
-
-The bridge crate lives at:
-
-- `bridges/darknet-cuda-cutile`
-
-It currently provides:
-
-- a concrete `CutileBackend`
-- typed `f32` upload, zero-init, download, vector-add, and saxpy paths
-- channel-wise `f32` bias add over row-major activation views
-- elementwise `f32` activation kernels for linear, logistic, relu, leaky, mish, swish, and tanh
-- `shortcut` add on top of the bridge tensor ops
-- fully on-device `route` concatenation and `upsample` pointer kernels
-- a direct `f32` convolution kernel path exposed through `F32TensorOpsBackend`
-- a direct `f32` maxpool kernel path exposed through `F32TensorOpsBackend`
-- global avgpool forward/backward exposed through `F32TensorOpsBackend` with a conservative host fallback until a device kernel is ported
-- a bridge implementation of `darknet_cuda::F32TensorOpsBackend`
-- a smoke example that exercises context creation, kernel launch, and device-to-host copy
-- bridge-side shape validation tests for convolution, maxpool, route, and upsample layouts
-
-What it does not provide yet:
-
-- a direct device kernel for global avgpool
-- `local_avgpool` on the GPU path
-- a real detector decode / NMS path after YOLO head staging
-- direct end-to-end image inference from the Rust CLI
-
-### Requirements
-
-- CUDA 13.2
-- LLVM 21
-- MLIR 21 development headers
-- Polly static libraries for LLVM 21
-
-On Debian or Ubuntu that typically means:
+The bridge's default tests validate layout and API contracts without requiring a
+GPU. A real-device differential test compares cuTile convolution forward,
+input/weight/bias backward gradients, and one SGD update against a scalar
+reference. Run it only on a CUDA host with the driver visible:
 
 ```bash
-sudo apt install llvm-21 llvm-21-dev libmlir-21-dev mlir-21-tools libpolly-21-dev libzstd-dev
+export DARKNET_CUTILE_GPU_TEST=1
+RUSTFLAGS=-Dwarnings cargo test \
+  --manifest-path bridges/darknet-cuda-cutile/Cargo.toml --locked --lib \
+  -- --ignored --nocapture
 ```
 
-### Normal Cargo Usage
+## How to extend the port
 
-After the CUDA and LLVM environment variables are set, the bridge can be built
-with normal Cargo commands:
+For a C++ behavior change, update the typed model/parser, shape inference, CPU
+forward, caches, CPU backward, weights order, backend dispatch/fallback, tests,
+and documentation as one change. The CPU implementation is the reference path;
+native CUDA code is an optimization layer and must preserve its tensor layout
+and gradients. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#extension-rules).
 
-```bash
-cargo check --manifest-path rust/bridges/darknet-cuda-cutile/Cargo.toml
-cargo build --manifest-path rust/bridges/darknet-cuda-cutile/Cargo.toml
-cargo run --manifest-path rust/bridges/darknet-cuda-cutile/Cargo.toml --example cutile_smoke
-```
+## Scope Boundary
 
-If the bridge does not build on another machine, run:
-
-```bash
-./rust/bridges/darknet-cuda-cutile/scripts/check-env.sh
-```
-
-For bridge-specific details, see:
-
-- [bridges/darknet-cuda-cutile/README.md](bridges/darknet-cuda-cutile/README.md)
-
-## Notes
-
-- The main Rust workspace excludes the `cutile` bridge on purpose. That keeps `cargo check --workspace` fast and independent from the large external CUDA/MLIR dependency graph.
-- The CLI's CUDA training path is behind the `cutile` feature for the same reason. The default CLI build falls back to CPU training when `detector train` is used.
-- On this machine, `./rust/bridges/darknet-cuda-cutile/scripts/check-env.sh` finds `/usr/local/cuda-13.2` but does not find LLVM 21, MLIR 21, or Polly. The bridge build remains blocked until those dependencies are installed or exported.
-- The current CPU path is the behavioral reference for the future GPU runtime. The next work is in [TODO.md](TODO.md).
+The practical Darknet layer families used by the repository’s standard YOLO,
+ResNet, CSP, EfficientNet, and recurrent configs are modeled and executable.
+Historical/nonstandard config sections outside the current C++ parser’s layer
+set still return `UnsupportedLayer`. Native GPU kernels for every CPU operation
+are also not claimed: the GPU API preserves functional parity through its
+explicit CPU-reference fallback until those kernels and their LLVM/CUDA
+environment are available.

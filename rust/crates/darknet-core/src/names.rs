@@ -1,3 +1,8 @@
+//! `.names` file loading.
+//!
+//! Class names stay outside the model graph.  A network can run without them,
+//! while a CLI or application can attach labels only when it renders results.
+
 use std::fs;
 use std::path::Path;
 

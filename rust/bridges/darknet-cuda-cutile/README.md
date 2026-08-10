@@ -12,24 +12,38 @@ It provides:
 - global avgpool forward/backward through a host fallback while the device kernel is still pending
 - an implementation of `darknet_cuda::F32TensorOpsBackend`
 
-Build requirements:
+The bridge is pinned to cutile-rs v0.2.0. Build requirements:
 
-- CUDA 13.2
-- LLVM 21 with `llvm-config` on `PATH`, or `LLVM_CONFIG_PATH` set to the LLVM 21 binary
-- MLIR 21 development headers, for example `libmlir-21-dev`
-- Polly static libraries for LLVM 21, for example `libpolly-21-dev`
-- `CUDA_TOOLKIT_PATH` set to the CUDA 13.2 install root
-- `CUDA_TILE_USE_LLVM_INSTALL_DIR` set to the LLVM 21 install root
+- CUDA 13.3 is recommended upstream; CUDA 13.2+ is suitable for Ada sm_89.
+- CUDA_TOOLKIT_PATH set to the CUDA installation root.
+- CUDA and cuRAND development headers/libraries, plus libclang for the
+  generated bindings (LIBCLANG_PATH can select a non-system installation).
+
+The v0.2.0 default JIT uses the pure-Rust cutile-ir; LLVM 21, MLIR 21, and
+Polly are not required by the normal path. CUDA 12.9 can be used for limited
+compiler-only checks, but is not the supported target for the current
+low-precision features.
 
 Useful commands:
 
 - `./scripts/check-env.sh`
-- `cargo check --manifest-path rust/bridges/darknet-cuda-cutile/Cargo.toml`
-- `cargo build --manifest-path rust/bridges/darknet-cuda-cutile/Cargo.toml`
-- `cargo run --manifest-path rust/bridges/darknet-cuda-cutile/Cargo.toml --example cutile_smoke`
+- `cargo check --locked`
+- `cargo build --locked`
+- `cargo run --locked --example cutile_smoke`
 
-Current local status on this machine:
+The default library tests validate the bridge without a device. The ignored
+device test exercises the actual convolution kernels, compares forward and
+analytical backward results with an independent scalar reference, and verifies
+a stochastic-gradient update for weights and biases:
 
-- `/usr/local/cuda-13.2` exists and is a valid candidate for `CUDA_TOOLKIT_PATH`
-- LLVM 21, MLIR 21 headers, and Polly static libraries are not currently visible to `./scripts/check-env.sh`
-- set `LLVM_CONFIG_PATH` and `CUDA_TILE_USE_LLVM_INSTALL_DIR` after installing LLVM 21, then rerun `./scripts/check-env.sh`
+```bash
+export DARKNET_CUTILE_GPU_TEST=1
+cargo test --locked --lib -- --ignored --nocapture
+```
+
+It is intentionally ignored on CPU-only machines; `cargo test --lib` still
+reports it so the hardware-dependent coverage is visible.
+
+The bridge cannot execute kernels without a CUDA-capable device. The main
+workspace remains usable without this opt-in crate and retains the documented
+CPU-reference fallback for unsupported native GPU operations.

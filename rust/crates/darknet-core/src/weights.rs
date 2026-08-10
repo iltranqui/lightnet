@@ -1,3 +1,10 @@
+//! Darknet binary `.weights` compatibility.
+//!
+//! Darknet serializes arrays in a fixed order instead of storing a
+//! self-describing tensor graph.  This module centralizes that order for
+//! inspection, loading, and saving so recurrent nested layers and batch-norm
+//! arrays cannot silently drift from the C++ format.
+
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -7,7 +14,7 @@ use crate::DARKNET_WEIGHTS_VERSION_MINOR;
 use crate::DARKNET_WEIGHTS_VERSION_PATCH;
 use crate::error::{Error, Result};
 use crate::model::{Layer, LayerKind, Network};
-use crate::runtime::LayerParams;
+use crate::runtime::{ConnectedParams, ConvolutionalParams, LayerParams};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WeightsHeader {
@@ -115,13 +122,43 @@ pub fn save_weights(
                 write_f32_slice(&mut file, &conv.weights)?;
             }
             (LayerKind::Connected(_), LayerParams::Connected(connected)) => {
-                write_f32_slice(&mut file, &connected.biases)?;
-                write_f32_slice(&mut file, &connected.weights)?;
-                if let Some(batch_norm) = connected.batch_norm.as_ref() {
-                    write_f32_slice(&mut file, &batch_norm.scales)?;
-                    write_f32_slice(&mut file, &batch_norm.rolling_mean)?;
-                    write_f32_slice(&mut file, &batch_norm.rolling_variance)?;
+                write_connected_params(&mut file, connected)?;
+            }
+            (LayerKind::Local(_), LayerParams::Local(local)) => {
+                write_f32_slice(&mut file, &local.biases)?;
+                write_f32_slice(&mut file, &local.weights)?;
+            }
+            (LayerKind::Gru(_), LayerParams::Gru(gru)) => {
+                for params in [
+                    &gru.input_z,
+                    &gru.state_z,
+                    &gru.input_r,
+                    &gru.state_r,
+                    &gru.input_h,
+                    &gru.state_h,
+                ] {
+                    write_connected_params(&mut file, params)?;
                 }
+            }
+            (LayerKind::Rnn(_), LayerParams::Rnn(recurrent)) => {
+                write_connected_params(&mut file, &recurrent.input)?;
+                write_connected_params(&mut file, &recurrent.self_params)?;
+                write_connected_params(&mut file, &recurrent.output)?;
+            }
+            (LayerKind::Lstm(_), LayerParams::Lstm(recurrent)) => {
+                write_connected_params(&mut file, &recurrent.wf)?;
+                write_connected_params(&mut file, &recurrent.wi)?;
+                write_connected_params(&mut file, &recurrent.wg)?;
+                write_connected_params(&mut file, &recurrent.wo)?;
+                write_connected_params(&mut file, &recurrent.uf)?;
+                write_connected_params(&mut file, &recurrent.ui)?;
+                write_connected_params(&mut file, &recurrent.ug)?;
+                write_connected_params(&mut file, &recurrent.uo)?;
+            }
+            (LayerKind::Crnn(_), LayerParams::Crnn(recurrent)) => {
+                write_convolutional_params(&mut file, &recurrent.input)?;
+                write_convolutional_params(&mut file, &recurrent.self_params)?;
+                write_convolutional_params(&mut file, &recurrent.output)?;
             }
             (_, LayerParams::None) => {}
             _ => {
@@ -215,10 +252,31 @@ fn write_f32_slice(file: &mut File, values: &[f32]) -> Result<()> {
     Ok(())
 }
 
+fn write_connected_params(file: &mut File, params: &ConnectedParams) -> Result<()> {
+    write_f32_slice(file, &params.biases)?;
+    write_f32_slice(file, &params.weights)?;
+    if let Some(batch_norm) = params.batch_norm.as_ref() {
+        write_f32_slice(file, &batch_norm.scales)?;
+        write_f32_slice(file, &batch_norm.rolling_mean)?;
+        write_f32_slice(file, &batch_norm.rolling_variance)?;
+    }
+    Ok(())
+}
+
+fn write_convolutional_params(file: &mut File, params: &ConvolutionalParams) -> Result<()> {
+    write_f32_slice(file, &params.biases)?;
+    if let Some(batch_norm) = params.batch_norm.as_ref() {
+        write_f32_slice(file, &batch_norm.scales)?;
+        write_f32_slice(file, &batch_norm.rolling_mean)?;
+        write_f32_slice(file, &batch_norm.rolling_variance)?;
+    }
+    write_f32_slice(file, &params.weights)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
 
     use crate::cfg::ConfigFile;
     use crate::model::Network;
@@ -248,7 +306,7 @@ mod tests {
         .expect("cfg should parse");
         let network = Network::from_config(cfg).expect("network should build");
 
-        let path = PathBuf::from(std::env::temp_dir()).join("darknet-core-test.weights");
+        let path = std::env::temp_dir().join("darknet-core-test.weights");
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&0i32.to_le_bytes());
         bytes.extend_from_slice(&2i32.to_le_bytes());
@@ -299,7 +357,7 @@ mod tests {
             other => panic!("unexpected params: {other:?}"),
         }
 
-        let path = PathBuf::from(std::env::temp_dir()).join("darknet-core-save-load.weights");
+        let path = std::env::temp_dir().join("darknet-core-save-load.weights");
         save_weights(&network, &executable.params, &path, 42).expect("weights save");
 
         let mut reloaded = ExecutableNetwork::new(network);
@@ -308,5 +366,84 @@ mod tests {
         assert_eq!(reloaded.params, executable.params);
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn recurrent_weight_blocks_round_trip_in_darknet_order() {
+        for (name, layer) in [
+            ("rnn", "[rnn]\nhidden=3\noutput=2\nactivation=linear\n"),
+            ("lstm", "[lstm]\noutput=2\n"),
+            (
+                "crnn",
+                "[crnn]\nsize=1\nhidden=2\noutput=2\nactivation=linear\n",
+            ),
+        ] {
+            let cfg_text = if name == "crnn" {
+                format!("[net]\nwidth=2\nheight=2\nchannels=1\nbatch=2\ntime_steps=2\n{layer}")
+            } else {
+                format!("[net]\ninputs=2\nbatch=2\ntime_steps=2\n{layer}")
+            };
+            let network = Network::from_config(
+                ConfigFile::parse_str("recurrent.cfg", &cfg_text).expect("cfg parses"),
+            )
+            .expect("network builds");
+            let mut executable = ExecutableNetwork::new(network.clone());
+            for params in &mut executable.params {
+                match params {
+                    LayerParams::Rnn(recurrent) => {
+                        for nested in [
+                            &mut recurrent.input,
+                            &mut recurrent.self_params,
+                            &mut recurrent.output,
+                        ] {
+                            for value in &mut nested.weights {
+                                *value = 0.25;
+                            }
+                        }
+                    }
+                    LayerParams::Lstm(recurrent) => {
+                        for nested in [
+                            &mut recurrent.wf,
+                            &mut recurrent.wi,
+                            &mut recurrent.wg,
+                            &mut recurrent.wo,
+                            &mut recurrent.uf,
+                            &mut recurrent.ui,
+                            &mut recurrent.ug,
+                            &mut recurrent.uo,
+                        ] {
+                            for value in &mut nested.weights {
+                                *value = 0.25;
+                            }
+                        }
+                    }
+                    LayerParams::Crnn(recurrent) => {
+                        for nested in [
+                            &mut recurrent.input,
+                            &mut recurrent.self_params,
+                            &mut recurrent.output,
+                        ] {
+                            for value in &mut nested.weights {
+                                *value = 0.25;
+                            }
+                        }
+                    }
+                    LayerParams::None
+                    | LayerParams::BatchNorm(_)
+                    | LayerParams::Convolutional(_)
+                    | LayerParams::Connected(_)
+                    | LayerParams::Local(_)
+                    | LayerParams::Gru(_) => {}
+                }
+            }
+            let path = std::env::temp_dir().join(format!("darknet-{name}-roundtrip.weights"));
+            save_weights(&network, &executable.params, &path, 7).expect("weights save");
+            let mut reloaded = ExecutableNetwork::new(network);
+            reloaded
+                .load_weights_file(&path)
+                .expect("recurrent weights load");
+            assert_eq!(reloaded.params, executable.params, "{name} weights differ");
+            let _ = fs::remove_file(path);
+        }
     }
 }

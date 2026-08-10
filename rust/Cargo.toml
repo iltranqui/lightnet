@@ -3,6 +3,7 @@ members = [
     "crates/darknet-cli",
     "crates/darknet-core",
     "crates/darknet-cuda",
+    "crates/darknet-examples",
 ]
 exclude = [
     "bridges/darknet-cuda-cutile",

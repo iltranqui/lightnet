@@ -1,3 +1,10 @@
+//! YOLO output decoding and CPU non-maximum suppression.
+//!
+//! The runtime leaves YOLO heads in Darknet's flat channel-major layout.  This
+//! module converts those tensors to image-space detections and keeps
+//! post-processing separate from neural-network execution, like the C++
+//! `get_yolo_detections()` and NMS helpers.
+
 use crate::error::{Error, Result};
 use crate::model::{LayerKind, Network, YoloSpec};
 use crate::runtime::YoloHeadOutput;
@@ -94,6 +101,7 @@ pub fn decode_yolo_detections(
     Ok(detections)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_yolo_head(
     data: &[f32],
     grid_width: usize,
@@ -127,7 +135,7 @@ fn decode_yolo_head(
         for index in 0..stride {
             let row = index / grid_width;
             let col = index % grid_width;
-            let tx = data[(anchor_base + 0) * stride + index];
+            let tx = data[anchor_base * stride + index];
             let ty = data[(anchor_base + 1) * stride + index];
             let tw = data[(anchor_base + 2) * stride + index];
             let th = data[(anchor_base + 3) * stride + index];
@@ -179,6 +187,7 @@ fn decode_yolo_head(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_bbox(
     tx: f32,
     ty: f32,
@@ -277,8 +286,8 @@ fn apply_nms(detections: &mut Vec<Detection>, threshold: f32) {
     }
 
     let mut keep = 0usize;
-    for idx in 0..detections.len() {
-        if !suppressed[idx] {
+    for (idx, &is_suppressed) in suppressed.iter().enumerate() {
+        if !is_suppressed {
             if keep != idx {
                 detections.swap(keep, idx);
             }

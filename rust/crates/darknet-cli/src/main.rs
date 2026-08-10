@@ -1,5 +1,12 @@
+//! `darknet-rs`, the command-line front end for the Rust port.
+//!
+//! CLI code stays thin: it parses commands, loads models/data, and formats
+//! Darknet-style summaries while `darknet-core` owns graph and training
+//! semantics.
+
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "cutile")]
 use darknet_core::GpuExecutableNetwork;
@@ -182,7 +189,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let names = load_names_file(&names_path)?;
-            let mut executable = ExecutableNetwork::from_path(&cfg)?;
+            let network = Network::from_path(&cfg)?.with_batch(1);
+            let mut executable = ExecutableNetwork::new(network);
             let header = executable.load_weights_file(&weights)?;
             println!(
                 "loaded weights {}.{}.{} seen={}",
@@ -306,6 +314,84 @@ fn run_detector_train(
     run_detector_train_preferred_backend(cfg, data, maybe_weights)
 }
 
+fn print_training_configuration(
+    image_count: usize,
+    batch: usize,
+    subdivisions: usize,
+    max_batches: usize,
+    learning_rate: f32,
+    momentum: f32,
+    decay: f32,
+) {
+    println!("Learning Rate: {learning_rate:.8}");
+    println!("Momentum: {momentum:.8}");
+    println!("Decay: {decay:.8}");
+    println!("Images: {image_count}");
+    println!("Batch: {batch}");
+    println!("Subdivisions: {subdivisions}");
+    println!("Max Batches: {max_batches}");
+}
+
+struct TrainingProgress {
+    started: Instant,
+    first_batch: usize,
+    avg_loss: Option<f32>,
+}
+
+impl TrainingProgress {
+    fn new(first_batch: usize) -> Self {
+        Self {
+            started: Instant::now(),
+            first_batch,
+            avg_loss: None,
+        }
+    }
+
+    fn print(
+        &mut self,
+        batch: usize,
+        loss: f32,
+        learning_rate: f32,
+        images_seen: u64,
+        max_batches: usize,
+        iteration_duration: Duration,
+    ) {
+        let avg_loss = self
+            .avg_loss
+            .map_or(loss, |previous| previous * 0.9 + loss * 0.1);
+        self.avg_loss = Some(avg_loss);
+
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let completed = batch.saturating_sub(self.first_batch).max(1) as f64;
+        let seconds_per_batch = elapsed / completed;
+        let time_remaining = if max_batches > batch {
+            format_seconds(seconds_per_batch * (max_batches - batch) as f64)
+        } else {
+            "unknown".to_owned()
+        };
+
+        // Keep the field names and ordering used by Darknet's detector trainer:
+        // loss, avg loss, rate, elapsed training time, images, and ETA.
+        println!(
+            "{batch}: loss={loss:.6}, avg loss={avg_loss:.6}, rate={learning_rate:.8}, train={:.3} milliseconds, {images_seen} images, time remaining={time_remaining}",
+            iteration_duration.as_secs_f64() * 1000.0,
+        );
+    }
+}
+
+fn format_seconds(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return "unknown".to_owned();
+    }
+    if seconds < 60.0 {
+        format!("{seconds:.0} seconds")
+    } else {
+        let minutes = (seconds / 60.0).floor();
+        let remaining = (seconds - minutes * 60.0).round();
+        format!("{minutes:.0} minutes {remaining:.0} seconds")
+    }
+}
+
 #[cfg(feature = "cutile")]
 fn run_detector_train_preferred_backend(
     cfg: &str,
@@ -359,14 +445,18 @@ fn run_detector_train_cpu(
         train_images.len(),
         data_config.required_train_list()?.display()
     );
-    println!(
-        "batch={} subdivisions={} max_batches={} lr={:.6} momentum={:.3}",
+    print_training_configuration(
+        train_images.len(),
         executable.network.net.batch,
         executable.network.net.subdivisions,
         executable.network.net.max_batches,
         executable.network.net.learning_rate,
-        executable.network.net.momentum
+        executable.network.net.momentum,
+        executable.network.net.decay,
     );
+    if train_images.is_empty() {
+        return Err("training list is empty".into());
+    }
 
     let backup_dir = data_config
         .backup
@@ -376,12 +466,11 @@ fn run_detector_train_cpu(
     let base_name = cfg_base_name(cfg);
     let images_per_iteration =
         executable.network.net.batch.max(1) * executable.network.net.subdivisions.max(1);
-    let mut batch_num = if images_per_iteration == 0 {
-        0usize
-    } else {
-        (seen as usize) / images_per_iteration
-    };
+    let mut batch_num = (seen as usize)
+        .checked_div(images_per_iteration)
+        .unwrap_or(0);
     let mut yolo_state = YoloTrainingState::default();
+    let mut progress = TrainingProgress::new(batch_num);
     let mut image_cursor = if train_images.is_empty() {
         0usize
     } else {
@@ -390,6 +479,7 @@ fn run_detector_train_cpu(
 
     while executable.network.net.max_batches == 0 || batch_num < executable.network.net.max_batches
     {
+        let iteration_start = Instant::now();
         let lr = compute_learning_rate(&executable.network.net, batch_num);
         let mut iter_loss = 0.0f32;
         for subdivision in 0..executable.network.net.subdivisions.max(1) {
@@ -400,7 +490,7 @@ fn run_detector_train_cpu(
                 &train_images,
                 start_index,
             )?;
-            let forward = executable.forward(&batch.input)?;
+            let forward = executable.forward_training(&batch.input)?;
             let yolo = compute_yolo_training_loss_with_state(
                 &executable.network,
                 &forward,
@@ -431,7 +521,14 @@ fn run_detector_train_cpu(
         }
 
         let loss = iter_loss / images_per_iteration.max(1) as f32;
-        println!("batch {} lr {:.6e} loss {:.6}", batch_num, lr, loss);
+        progress.print(
+            batch_num,
+            loss,
+            lr,
+            seen,
+            executable.network.net.max_batches,
+            iteration_start.elapsed(),
+        );
 
         if batch_num % 1000 == 0 {
             let checkpoint = backup_dir.join(format!("{base_name}_{batch_num}.weights"));
@@ -486,14 +583,18 @@ fn run_detector_train_gpu(
         train_images.len(),
         data_config.required_train_list()?.display()
     );
-    println!(
-        "batch={} subdivisions={} max_batches={} lr={:.6} momentum={:.3}",
+    print_training_configuration(
+        train_images.len(),
         executable.network.net.batch,
         executable.network.net.subdivisions,
         executable.network.net.max_batches,
         executable.network.net.learning_rate,
-        executable.network.net.momentum
+        executable.network.net.momentum,
+        executable.network.net.decay,
     );
+    if train_images.is_empty() {
+        return Err("training list is empty".into());
+    }
 
     let backup_dir = data_config
         .backup
@@ -509,6 +610,7 @@ fn run_detector_train_gpu(
         (seen as usize) / images_per_iteration
     };
     let mut yolo_state = YoloTrainingState::default();
+    let mut progress = TrainingProgress::new(batch_num);
     let mut image_cursor = if train_images.is_empty() {
         0usize
     } else {
@@ -517,6 +619,7 @@ fn run_detector_train_gpu(
 
     while executable.network.net.max_batches == 0 || batch_num < executable.network.net.max_batches
     {
+        let iteration_start = Instant::now();
         let lr = compute_learning_rate(&executable.network.net, batch_num);
         let mut iter_loss = 0.0f32;
         // NOTE: do NOT zero train buffers here. After update_weights_gpu, the buffers
@@ -531,7 +634,7 @@ fn run_detector_train_gpu(
                 &train_images,
                 start_index,
             )?;
-            let forward = executable.forward_with_state(&batch.input)?;
+            let forward = executable.forward_training_with_state(&batch.input)?;
             let yolo = compute_yolo_training_loss_with_state(
                 &executable.network,
                 &forward.cpu_forward,
@@ -559,7 +662,14 @@ fn run_detector_train_gpu(
         }
 
         let loss = iter_loss / images_per_iteration.max(1) as f32;
-        println!("batch {} lr {:.6e} loss {:.6}", batch_num, lr, loss);
+        progress.print(
+            batch_num,
+            loss,
+            lr,
+            seen,
+            executable.network.net.max_batches,
+            iteration_start.elapsed(),
+        );
 
         if batch_num % 1000 == 0 {
             let checkpoint = backup_dir.join(format!("{base_name}_{batch_num}.weights"));
@@ -617,6 +727,18 @@ fn print_forward_backward_summary(
                 connected.bias_updates.iter().any(|value| *value != 0.0)
                     || connected.weight_updates.iter().any(|value| *value != 0.0)
             }
+            darknet_core::LayerTrainBuffers::BatchNorm(batch_norm) => {
+                batch_norm.bias_updates.iter().any(|value| *value != 0.0)
+                    || batch_norm.scale_updates.iter().any(|value| *value != 0.0)
+            }
+            darknet_core::LayerTrainBuffers::Local(local) => {
+                local.bias_updates.iter().any(|value| *value != 0.0)
+                    || local.weight_updates.iter().any(|value| *value != 0.0)
+            }
+            darknet_core::LayerTrainBuffers::Gru(_)
+            | darknet_core::LayerTrainBuffers::Rnn(_)
+            | darknet_core::LayerTrainBuffers::Lstm(_)
+            | darknet_core::LayerTrainBuffers::Crnn(_) => true,
             darknet_core::LayerTrainBuffers::None => false,
         })
         .count();

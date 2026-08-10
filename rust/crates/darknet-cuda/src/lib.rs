@@ -1,3 +1,9 @@
+//! Backend-neutral CUDA tensor contracts used by the Rust runtime.
+//!
+//! This crate does not require a CUDA driver for CPU builds.  It defines the
+//! operation traits and tensor metadata needed by the core executor; the
+//! optional cuTile bridge supplies a concrete device implementation.
+
 pub const CUTILE_RS_REFERENCE: &str = "https://github.com/NVlabs/cutile-rs";
 pub const DEFAULT_TILE_1D: usize = 256;
 
@@ -105,6 +111,11 @@ pub trait CudaBackend {
 // `KernelLaunch` describes generic launches, but a real runtime also needs typed
 // device buffers. This trait is the first concrete execution seam for Rust-side
 // tensor ops while larger Darknet kernels are still being ported.
+//
+// The operation signatures intentionally keep the complete Darknet kernel
+// geometry at the call site. Grouping those values into opaque descriptors
+// would make the backend API less explicit and would hide layout mistakes.
+#[allow(clippy::too_many_arguments)]
 pub trait F32TensorOpsBackend {
     type Error;
     type Tensor: Clone;
@@ -295,6 +306,63 @@ pub trait F32TensorOpsBackend {
         input_width: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error>;
+    /// Bilinearly sample an NCHW tensor using one source coordinate pair per
+    /// batch/output pixel. `input_scales` and `input_offsets` contain one
+    /// affine level adjustment per batch and are applied after interpolation.
+    fn crop_bilinear_f32(
+        &self,
+        x: &Self::Tensor,
+        output_shape: &[usize],
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        source_x: &Self::Tensor,
+        source_y: &Self::Tensor,
+        input_scales: &Self::Tensor,
+        input_offsets: &Self::Tensor,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = (
+            x,
+            output_shape,
+            channels,
+            input_height,
+            input_width,
+            source_x,
+            source_y,
+            input_scales,
+            input_offsets,
+            config,
+        );
+        panic!("crop_bilinear_f32 is not implemented by this CUDA backend")
+    }
+    /// Scatter the bilinear crop gradient back into the NCHW input. Out of
+    /// bounds taps are ignored, matching Darknet's zero-padded sampler.
+    fn crop_bilinear_backward_f32(
+        &self,
+        output_grad: &Self::Tensor,
+        input_shape: &[usize],
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        source_x: &Self::Tensor,
+        source_y: &Self::Tensor,
+        input_scales: &Self::Tensor,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = (
+            output_grad,
+            input_shape,
+            channels,
+            input_height,
+            input_width,
+            source_x,
+            source_y,
+            input_scales,
+            config,
+        );
+        panic!("crop_bilinear_backward_f32 is not implemented by this CUDA backend")
+    }
     fn upsample_f32(
         &self,
         x: &Self::Tensor,
