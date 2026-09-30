@@ -4,6 +4,7 @@
 //! Darknet's contiguous channel-major tensor layout.  Conversion happens once
 //! at this boundary; the runtime never has to guess an image memory layout.
 
+use std::io::Cursor;
 use std::path::Path;
 
 use crate::error::{Error, Result};
@@ -22,22 +23,26 @@ pub struct PlanarRgbImage {
 impl PlanarRgbImage {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let image = ImageReader::open(path)?
-            .with_guessed_format()
-            .map_err(|err| {
-                Error::InvalidConfig(format!(
-                    "failed to guess image format for {}: {err}",
-                    path.display()
-                ))
-            })?
-            .decode()
-            .map_err(|err| {
-                Error::InvalidConfig(format!(
-                    "unsupported image format for {}: {err}",
-                    path.display()
-                ))
-            })?
-            .to_rgb8();
+        let bytes = std::fs::read(path)?;
+        let image = match decode_jpeg_libjpeg(&bytes) {
+            Some(image) => image,
+            None => ImageReader::new(Cursor::new(&bytes))
+                .with_guessed_format()
+                .map_err(|err| {
+                    Error::InvalidConfig(format!(
+                        "failed to guess image format for {}: {err}",
+                        path.display()
+                    ))
+                })?
+                .decode()
+                .map_err(|err| {
+                    Error::InvalidConfig(format!(
+                        "unsupported image format for {}: {err}",
+                        path.display()
+                    ))
+                })?
+                .to_rgb8(),
+        };
         Self::from_rgb_image(&image)
     }
 
@@ -154,6 +159,27 @@ impl PlanarRgbImage {
     }
 }
 
+/// Decode a JPEG with libjpeg(-turbo) defaults (ISLOW DCT, fancy upsampling),
+/// which is what OpenCV's `imread` uses in C++ Darknet.  The pure-Rust
+/// `image`/zune decoder differs by up to 4 levels on ~10% of pixels.  Returns
+/// `None` for non-JPEG data or anything libjpeg rejects, so the caller can fall
+/// back to the `image` crate.
+fn decode_jpeg_libjpeg(bytes: &[u8]) -> Option<RgbImage> {
+    if !bytes.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+    // mozjpeg reports fatal libjpeg errors by unwinding.
+    std::panic::catch_unwind(|| {
+        let mut decoder = mozjpeg::Decompress::new_mem(bytes).ok()?.rgb().ok()?;
+        let (width, height) = (decoder.width(), decoder.height());
+        let pixels: Vec<[u8; 3]> = decoder.read_scanlines().ok()?;
+        decoder.finish().ok()?;
+        RgbImage::from_raw(width as u32, height as u32, pixels.into_flattened())
+    })
+    .ok()
+    .flatten()
+}
+
 fn fit_inside(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Result<(usize, usize)> {
     if src_w == 0 || src_h == 0 {
         return Err(Error::InvalidConfig(
@@ -172,6 +198,19 @@ mod tests {
     use std::fs;
 
     use super::PlanarRgbImage;
+
+    /// JPEG must decode bit-identically to OpenCV/libjpeg-turbo (fixture RGB
+    /// produced by `cv2.imread` + BGR->RGB).
+    #[test]
+    fn jpeg_decode_matches_opencv_exactly() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+        let raw = fs::read(format!("{dir}/chroma_420.rgb")).expect("rgb fixture");
+        let image = PlanarRgbImage::load(format!("{dir}/chroma_420.jpg")).expect("load jpeg");
+        let expected =
+            PlanarRgbImage::from_interleaved_rgb_u8(image.shape.width, image.shape.height, &raw)
+                .expect("expected image");
+        assert_eq!(image.data, expected.data);
+    }
 
     #[test]
     fn converts_interleaved_rgb_to_planar() {
