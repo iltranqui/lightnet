@@ -9,10 +9,7 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 use crate::model::TensorShape;
-use image::imageops::{self, FilterType};
-use image::{ImageReader, Rgb, RgbImage};
-use imageproc::drawing::draw_filled_rect_mut;
-use imageproc::rect::Rect;
+use image::{ImageReader, RgbImage};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlanarRgbImage {
@@ -78,7 +75,75 @@ impl PlanarRgbImage {
         })
     }
 
+    /// Darknet's own float bilinear resize (`Darknet::resize_image`,
+    /// src-lib/darknet_image.cpp), used by `darknet detector test`.
+    ///
+    /// Align-corners sampling (`scale = (src - 1) / (dst - 1)`), horizontal pass
+    /// first into an intermediate plane, then vertical; all in `f32` with the
+    /// same operation order as C++, so results are bit-identical.
     pub fn resize(&self, width: usize, height: usize) -> Result<Self> {
+        if width == 0 || height == 0 {
+            return Err(Error::InvalidConfig(
+                "resize dimensions must be non-zero".to_owned(),
+            ));
+        }
+        let (sw, sh, channels) = (self.shape.width, self.shape.height, self.shape.channels);
+        if sw == width && sh == height {
+            return Ok(self.clone());
+        }
+
+        let w_scale = (sw as f32 - 1.0) / (width as f32 - 1.0);
+        let h_scale = (sh as f32 - 1.0) / (height as f32 - 1.0);
+        let src_plane = sw * sh;
+        let mut part = vec![0.0f32; width * sh * channels];
+        let mut out = vec![0.0f32; width * height * channels];
+
+        for ch in 0..channels {
+            for y in 0..sh {
+                let src_row = &self.data[ch * src_plane + y * sw..][..sw];
+                let dst_row = &mut part[(ch * sh + y) * width..][..width];
+                for (c, dst) in dst_row.iter_mut().enumerate() {
+                    *dst = if c == width - 1 || sw == 1 {
+                        src_row[sw - 1]
+                    } else {
+                        let sx = c as f32 * w_scale;
+                        let ix = sx as usize;
+                        let dx = sx - ix as f32;
+                        (1.0 - dx) * src_row[ix] + dx * src_row[ix + 1]
+                    };
+                }
+            }
+            for y in 0..height {
+                let sy = if sh == 1 { 0.0 } else { y as f32 * h_scale };
+                let iy = sy as usize;
+                let dy = sy - iy as f32;
+                let row0 = &part[(ch * sh + iy) * width..][..width];
+                let dst_row = &mut out[(ch * height + y) * width..][..width];
+                for (dst, v) in dst_row.iter_mut().zip(row0) {
+                    *dst = (1.0 - dy) * v;
+                }
+                if y == height - 1 || sh == 1 {
+                    continue;
+                }
+                let row1 = &part[(ch * sh + iy + 1) * width..][..width];
+                for (dst, v) in dst_row.iter_mut().zip(row1) {
+                    *dst += dy * v;
+                }
+            }
+        }
+
+        Ok(Self {
+            shape: TensorShape::new(width, height, channels, 1),
+            data: out,
+        })
+    }
+
+    /// Bit-exact `cv::resize(..., INTER_LINEAR_EXACT)` on 8-bit RGB, as done by
+    /// `Darknet::load_image(path, w, h, c)` (src-lib/darknet_image.cpp), which is
+    /// the path `darknet detector map` uses.  Half-pixel centres, 8 fractional
+    /// bit coefficients, horizontal then vertical fixed-point pass, round at the
+    /// end.  The source is recovered losslessly as `u8` (it was `u8 / 255`).
+    pub fn resize_linear_exact(&self, width: usize, height: usize) -> Result<Self> {
         if width == 0 || height == 0 {
             return Err(Error::InvalidConfig(
                 "resize dimensions must be non-zero".to_owned(),
@@ -88,10 +153,41 @@ impl PlanarRgbImage {
             return Ok(self.clone());
         }
         let rgb = self.to_rgb8()?;
-        let resized = imageops::resize(&rgb, width as u32, height as u32, FilterType::Triangle);
-        Self::from_rgb_image(&resized)
+        let (sw, sh) = (self.shape.width, self.shape.height);
+        let src = rgb.as_raw();
+        let cx = exact_coeffs(sw, width);
+        let cy = exact_coeffs(sh, height);
+
+        // Horizontal pass: units of 1/256.
+        let mut tmp = vec![0u32; sh * width * 3];
+        for y in 0..sh {
+            for (x, &(x0, x1, c0, c1)) in cx.iter().enumerate() {
+                for ch in 0..3 {
+                    tmp[(y * width + x) * 3 + ch] = src[(y * sw + x0) * 3 + ch] as u32 * c0
+                        + src[(y * sw + x1) * 3 + ch] as u32 * c1;
+                }
+            }
+        }
+        // Vertical pass: units of 1/65536, rounded.
+        let mut bytes = vec![0u8; width * height * 3];
+        for (y, &(y0, y1, c0, c1)) in cy.iter().enumerate() {
+            for i in 0..width * 3 {
+                let v = tmp[y0 * width * 3 + i] * c0 + tmp[y1 * width * 3 + i] * c1;
+                bytes[y * width * 3 + i] = ((v + 32768) >> 16) as u8;
+            }
+        }
+        Self::from_interleaved_rgb_u8(width, height, &bytes)
     }
 
+    /// Load an image and resize it with OpenCV `INTER_LINEAR_EXACT` when its
+    /// size differs from `width x height` (mirrors `Darknet::load_image` with
+    /// desired dimensions).
+    pub fn load_resized_exact(path: impl AsRef<Path>, width: usize, height: usize) -> Result<Self> {
+        Self::load(path)?.resize_linear_exact(width, height)
+    }
+
+    /// `Darknet::letterbox_image`: float resize to fit, pad with 0.5, integer
+    /// offsets `(dst - new) / 2`.
     pub fn letterbox(&self, width: usize, height: usize) -> Result<Self> {
         if width == 0 || height == 0 {
             return Err(Error::InvalidConfig(
@@ -102,17 +198,21 @@ impl PlanarRgbImage {
         let (new_width, new_height) =
             fit_inside(self.shape.width, self.shape.height, width, height)?;
         let resized = self.resize(new_width, new_height)?;
-        let resized_rgb = resized.to_rgb8()?;
-        let mut canvas = RgbImage::new(width as u32, height as u32);
-        draw_filled_rect_mut(
-            &mut canvas,
-            Rect::at(0, 0).of_size(width as u32, height as u32),
-            Rgb([128, 128, 128]),
-        );
+        let channels = self.shape.channels;
+        let mut data = vec![0.5f32; width * height * channels];
         let x_offset = (width - new_width) / 2;
         let y_offset = (height - new_height) / 2;
-        imageops::overlay(&mut canvas, &resized_rgb, x_offset as i64, y_offset as i64);
-        Self::from_rgb_image(&canvas)
+        for ch in 0..channels {
+            for y in 0..new_height {
+                let src = &resized.data[(ch * new_height + y) * new_width..][..new_width];
+                let dst = (ch * height + y + y_offset) * width + x_offset;
+                data[dst..dst + new_width].copy_from_slice(src);
+            }
+        }
+        Ok(Self {
+            shape: TensorShape::new(width, height, channels, 1),
+            data,
+        })
     }
 
     pub fn get(&self, channel: usize, y: usize, x: usize) -> f32 {
@@ -180,6 +280,28 @@ fn decode_jpeg_libjpeg(bytes: &[u8]) -> Option<RgbImage> {
     .flatten()
 }
 
+/// OpenCV `INTER_LINEAR_EXACT` taps: `(x0, x1, c0, c1)` with `c0 + c1 == 256`.
+fn exact_coeffs(src: usize, dst: usize) -> Vec<(usize, usize, u32, u32)> {
+    (0..dst)
+        .map(|d| {
+            let fsx = (d as f64 + 0.5) * src as f64 / dst as f64 - 0.5;
+            let mut x0 = fsx.floor();
+            let mut fx = fsx - x0;
+            if x0 < 0.0 {
+                x0 = 0.0;
+                fx = 0.0;
+            }
+            if x0 >= src as f64 - 1.0 {
+                x0 = src as f64 - 1.0;
+                fx = 0.0;
+            }
+            let x0 = x0 as usize;
+            let c1 = (fx * 256.0 + 0.5).floor() as u32;
+            (x0, (x0 + 1).min(src - 1), 256 - c1, c1)
+        })
+        .collect()
+}
+
 fn fit_inside(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Result<(usize, usize)> {
     if src_w == 0 || src_h == 0 {
         return Err(Error::InvalidConfig(
@@ -210,6 +332,70 @@ mod tests {
             PlanarRgbImage::from_interleaved_rgb_u8(image.shape.width, image.shape.height, &raw)
                 .expect("expected image");
         assert_eq!(image.data, expected.data);
+    }
+
+    fn fixture(name: &str) -> Vec<u8> {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+        fs::read(format!("{dir}/{name}")).expect("fixture")
+    }
+
+    fn source(i: usize) -> PlanarRgbImage {
+        PlanarRgbImage::from_interleaved_rgb_u8(96, 72, &fixture(&format!("resize{i}_src_96x72.rgb")))
+            .expect("source")
+    }
+
+    /// `resize_linear_exact` must equal `cv2.resize(INTER_LINEAR_EXACT)` byte
+    /// for byte (fixtures are crops of LegoGears_v2 frames).
+    #[test]
+    fn resize_linear_exact_matches_opencv_bytes() {
+        for i in 0..3 {
+            for (w, h) in [(40, 28), (130, 100)] {
+                let got = source(i).resize_linear_exact(w, h).expect("resize");
+                let expected = PlanarRgbImage::from_interleaved_rgb_u8(
+                    w,
+                    h,
+                    &fixture(&format!("resize{i}_exact_{w}x{h}.rgb")),
+                )
+                .unwrap();
+                assert_eq!(got.data, expected.data, "fixture {i} {w}x{h}");
+            }
+        }
+    }
+
+    /// `resize` is Darknet's float resize; fixtures come from a float32 numpy
+    /// replica of `Darknet::resize_image`.
+    #[test]
+    fn resize_matches_darknet_float_resize() {
+        for i in 0..3 {
+            for (w, h) in [(40, 28), (50, 60)] {
+                let got = source(i).resize(w, h).expect("resize");
+                let raw = fixture(&format!("resize{i}_float_{w}x{h}.f32"));
+                let expected: Vec<f32> = raw
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                assert_eq!(got.data.len(), expected.len());
+                let max = got
+                    .data
+                    .iter()
+                    .zip(&expected)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(max <= 1e-6, "fixture {i} {w}x{h} max diff {max}");
+            }
+        }
+    }
+
+    #[test]
+    fn letterbox_uses_half_gray_and_integer_offsets() {
+        // 96x72 into 50x60: new 50x37, y offset (60-37)/2 = 11.
+        let boxed = source(0).letterbox(50, 60).expect("letterbox");
+        let resized = source(0).resize(50, 37).expect("resize");
+        assert_eq!(boxed.get(0, 0, 0), 0.5);
+        assert_eq!(boxed.get(2, 10, 49), 0.5);
+        assert_eq!(boxed.get(2, 48, 0), 0.5);
+        assert_eq!(boxed.get(1, 11, 7), resized.get(1, 0, 7));
+        assert_eq!(boxed.get(1, 47, 7), resized.get(1, 36, 7));
     }
 
     #[test]

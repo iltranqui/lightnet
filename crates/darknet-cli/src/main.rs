@@ -176,13 +176,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let image_path = required_arg(args.next(), "image path")?;
             let threshold = optional_f32(args.next(), 0.25, "confidence threshold")?;
             let nms = optional_f32(args.next(), 0.45, "nms threshold")?;
-            let preprocess = args.next().unwrap_or_else(|| "letterbox".to_owned());
+            let preprocess = args.next().unwrap_or_else(|| "resize".to_owned());
             let letterbox = match preprocess.as_str() {
                 "letterbox" => true,
-                "resize" => false,
+                "resize" | "resize-exact" => false,
                 other => {
                     return Err(format!(
-                        "invalid preprocess mode: {other} (expected letterbox or resize)"
+                        "invalid preprocess mode: {other} (expected letterbox, resize or resize-exact)"
                     )
                     .into());
                 }
@@ -194,6 +194,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let original = PlanarRgbImage::load(&image_path)?;
             let prepared = if letterbox {
                 original.letterbox(net_w, net_h)?
+            } else if preprocess == "resize-exact" {
+                original.resize_linear_exact(net_w, net_h)?
             } else {
                 original.resize(net_w, net_h)?
             };
@@ -250,7 +252,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 original.shape.height,
                 prepared.shape.width,
                 prepared.shape.height,
-                if letterbox { "letterbox" } else { "resize" }
+                preprocess.as_str()
             );
             println!("detections {}", detections.len());
             let tsv = std::env::var_os("DARKNET_DETECT_TSV").is_some();
@@ -849,7 +851,7 @@ fn print_usage() {
     println!("  weights-inspect <cfg> <weights>");
     println!("  forward-dummy <cfg> [weights]");
     println!("  forward-backward-dummy <cfg> [weights] [auto|yolo|final]");
-    println!("  detect-image <cfg> <weights> <names> <image> [thresh] [nms] [letterbox|resize]");
+    println!("  detect-image <cfg> <weights> <names> <image> [thresh] [nms] [resize|letterbox|resize-exact]");
     println!("env: DARKNET_BACKEND=cpu|oxide, DARKNET_OXIDE_CONV, DARKNET_OXIDE_GEMM, DARKNET_DETECT_TSV=1");
 }
 
