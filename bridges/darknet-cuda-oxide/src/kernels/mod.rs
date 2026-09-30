@@ -9,3 +9,6 @@ pub mod gemm;
 pub mod gemm_mma;
 pub mod im2col;
 pub mod optim;
+pub mod pool;
+pub mod resample;
+pub mod route;

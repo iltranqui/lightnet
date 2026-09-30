@@ -1,0 +1,9 @@
+activation,count,section_types,cfg_count,example_cfg
+leaky,2809,convolutional:2533|shortcut:252|connected:9|rnn:6|crnn:5|local:4,76,cfg/Gaussian_yolov3_BDD.cfg
+mish,2005,convolutional:2005,15,cfg/csdarknet53-omega.cfg
+linear,1348,shortcut:868|convolutional:423|scale_channels:32|sam:13|connected:12,84,cfg/Gaussian_yolov3_BDD.cfg
+swish,674,convolutional:674,7,cfg/efficientnet_b0.cfg
+logistic,94,convolutional:94,20,cfg/cspx-p7-mish.cfg
+relu6,52,convolutional:52,1,cfg/efficientnet-lite3.cfg
+relu,48,convolutional:44|connected:4,4,cfg/unsupported/alexnet.cfg
+ramp,22,convolutional:20|connected:2,1,cfg/unsupported/strided.cfg

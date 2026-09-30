@@ -256,21 +256,32 @@ fn sgd_update_matches_darknet_rule() {
     assert_eq!(b.download_f32(&wt).unwrap(), w);
 }
 
+/// Every trait op now has a kernel; malformed shapes must surface as
+/// `OxideError::Shape`, never a panic or an out-of-bounds launch.
 #[test]
-fn unimplemented_ops_return_error() {
+fn invalid_shapes_return_error() {
     let b = backend();
     let t = b.zeros_f32(&[4]).unwrap();
     let err = b
-        .upsample_f32(&t, &[4], 1, 2, 2, 1, 1.0, false, cfg())
+        .upsample_f32(&t, &[1, 1, 3, 3], 1, 2, 2, 2, 1.0, false, cfg())
         .err()
-        .expect("upsample should be unimplemented");
-    assert!(matches!(err, OxideError::NotImplemented("upsample_f32")));
-    assert!(err.to_string().contains("not yet implemented in oxide backend"));
+        .expect("upsample output shape is wrong");
+    assert!(matches!(err, OxideError::Shape(_)), "{err}");
     let err = b
         .crop_bilinear_f32(&t, &[4], 1, 2, 2, &t, &t, &t, &t, cfg())
         .err()
-        .expect("crop should be unimplemented");
-    assert!(matches!(err, OxideError::NotImplemented(_)));
+        .expect("crop output shape is not NCHW");
+    assert!(matches!(err, OxideError::Shape(_)), "{err}");
+    let err = b
+        .maxpool_f32(&t, &[1, 1, 2, 2], 1, 2, 2, 0, 1, 1, 0, cfg())
+        .err()
+        .expect("zero-sized pooling window");
+    assert!(matches!(err, OxideError::Shape(_)), "{err}");
+    let err = b
+        .route_concat_f32(&[&t], &[0], &[3], &[2], &[1, 3, 2, 1], 2, cfg())
+        .err()
+        .expect("route slice exceeds input channels");
+    assert!(matches!(err, OxideError::Shape(_)), "{err}");
 }
 
 // ---- Finite-difference gradient checks (f64 CPU forward) ----
