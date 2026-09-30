@@ -1,0 +1,22 @@
+[package]
+name = "darknet-cuda-oxide"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[lib]
+name = "darknet_cuda_oxide"
+path = "src/lib.rs"
+
+[dependencies]
+darknet-cuda = { path = "../../crates/darknet-cuda" }
+# Device-side intrinsics (thread indexing, slices, barriers).
+cuda-device = { path = "../../crates/cuda-device" }
+# Host-side launch glue used by `#[cuda_module]`.
+cuda-host = { path = "../../crates/cuda-host" }
+# Host-side CUDA driver wrapper.
+cuda-core = "0.3.1"
+
+# Keep this CUDA bridge independent from the parent CPU workspace: kernels
+# only compile through `cargo oxide` (rustc-codegen-cuda).
+[workspace]
