@@ -1,0 +1,14 @@
+[package]
+name = "libnvvm-sys"
+version = "0.2.1"
+edition.workspace = true
+authors = ["Nihal Pasham <nihalp@nvidia.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/NVlabs/cuda-oxide.git"
+description = "Runtime (dlopen) bindings to NVIDIA libNVVM (ships with the CUDA Toolkit)"
+readme = "README.md"
+
+[dependencies]
+cuda-target-spec = { workspace = true }
+libloading = { workspace = true }
+thiserror = { workspace = true }

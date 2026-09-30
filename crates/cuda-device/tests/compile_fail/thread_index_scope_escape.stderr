@@ -1,0 +1,13 @@
+error[E0716]: temporary value dropped while borrowed
+  --> tests/compile_fail/thread_index_scope_escape.rs:10:1
+   |
+10 | #[device]
+   | ^^^^^^^^^ creates a temporary value which is freed while still in use
+...
+14 |         SAVED = Some(idx);
+   |         ----------------- assignment requires that borrow lasts for `'static`
+15 |     }
+16 | }
+   | - temporary value is freed at the end of this statement
+   |
+   = note: this error originates in the attribute macro `device` (in Nightly builds, run with -Z macro-backtrace for more info)

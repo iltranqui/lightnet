@@ -1,0 +1,9 @@
+error[E0382]: borrow of moved value: `idx`
+  --> tests/compile_fail/thread_index_not_copy.rs:12:13
+   |
+10 |     let idx = cuda_device::thread::index_1d();
+   |         --- move occurs because `idx` has type `ThreadIndex<'_>`, which does not implement the `Copy` trait
+11 |     let _moved = idx;
+   |                  --- value moved here
+12 |     let _ = idx.get();
+   |             ^^^ value borrowed here after move

@@ -1,0 +1,13 @@
+[package]
+name = "ptx-parse"
+version = "0.1.0"
+edition.workspace = true
+authors = ["Nihal Pasham <nihalp@nvidia.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/NVlabs/cuda-oxide.git"
+# Published because cuda-host depends on it (name verified free on crates.io).
+publish = true
+description = "Lossless structural views over PTX source text"
+readme = "README.md"
+
+[dependencies]

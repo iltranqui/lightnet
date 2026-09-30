@@ -1,0 +1,21 @@
+[package]
+name = "darknet-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+darknet-core = { path = "../darknet-core" }
+darknet-cuda = { path = "../darknet-cuda" }
+# cuTile backend disabled: needs the local fork at bridges/cutile-rs-aot, which
+# makes cargo unable to resolve the workspace while missing. To re-enable, restore
+# the checkout and add back:
+#   darknet-cuda-cutile = { path = "../../bridges/darknet-cuda-cutile", optional = true }
+#   [features] cutile = ["dep:darknet-cuda-cutile"]
+
+[features]
+default = []
+
+[[bin]]
+name = "darknet-rs"
+path = "src/main.rs"

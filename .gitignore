@@ -18,7 +18,7 @@ __pycache__/
 
 # Visual Studio C++ generated binary of .rc file
 *.aps
-rust/.fastembed_cache
+.fastembed_cache
 cutile-rs
 chart.png
 chart_0.png
@@ -40,3 +40,12 @@ ciou_surface.csv
 ciou_surface.gnuplot
 ciou_surface.html
 ciou_surface.svg
+/target/
+/bridges/*/target/
+/crates/*/target/
+/crates/rustc-codegen-cuda/examples/*/target/
+# cuda-oxide build outputs
+/bridges/darknet-cuda-oxide/*.ll
+/bridges/darknet-cuda-oxide/*.ptx
+/crates/rustc-codegen-cuda/examples/*/*.ll
+/crates/rustc-codegen-cuda/examples/*/*.ptx

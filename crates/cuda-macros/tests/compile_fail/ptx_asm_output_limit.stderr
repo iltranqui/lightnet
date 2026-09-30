@@ -1,0 +1,5 @@
+error: ptx_asm! supports at most 64 output operands across `out` and `inout`
+  --> tests/compile_fail/ptx_asm_output_limit.rs:75:13
+   |
+75 |             "nop;",
+   |             ^^^^^^

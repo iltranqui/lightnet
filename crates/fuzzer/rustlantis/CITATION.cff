@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+title: Rustlantis
+message: A fuzzer for the Rust compiler
+type: software
+authors:
+  - given-names: Qian (Andy)
+    family-names: Wang
+    orcid: 'https://orcid.org/0009-0006-0779-8651'
+    affiliation: ETH Zürich
+  - given-names: Ralf
+    family-names: Jung
+    orcid: 'https://orcid.org/0000-0001-7669-6348'
+    affiliation: ETH Zürich
+identifiers:
+  - type: doi
+    value: 10.1145/3689780
+repository-code: 'https://github.com/cbeuw/rustlantis'
+keywords:
+  - Compiler testing
+  - Rust
+  - Fuzzing
+license:
+  - Apache-2.0
+  - MIT

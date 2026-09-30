@@ -1,0 +1,13 @@
+[package]
+name = "reserved-oxide-symbols"
+version = "0.2.1"
+description = "INTERNAL: cuda-oxide workspace symbol-name contract. Not a public API."
+readme = "README.md"
+edition.workspace = true
+license = "Apache-2.0"
+authors = ["Nihal Pasham <nihalp@nvidia.com>"]
+repository = "https://github.com/NVlabs/cuda-oxide.git"
+publish = false
+
+[lints.rust]
+missing_docs = { level = "deny" }

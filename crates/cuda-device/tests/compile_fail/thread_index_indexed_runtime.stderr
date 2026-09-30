@@ -1,0 +1,13 @@
+error[E0599]: the method `get_mut_indexed` exists for struct `DisjointSlice<'_, u32, Runtime2DIndex>`, but its trait bounds were not satisfied
+  --> tests/compile_fail/thread_index_indexed_runtime.rs:19:37
+   |
+19 |     if let Some((cell, _idx)) = out.get_mut_indexed() {
+   |                                     ^^^^^^^^^^^^^^^ method cannot be called on `DisjointSlice<'_, u32, Runtime2DIndex>` due to unsatisfied trait bounds
+   |
+  ::: src/thread.rs
+   |
+   | pub enum Runtime2DIndex {}
+   | ----------------------- doesn't satisfy `Runtime2DIndex: IndexFormula`
+   |
+   = note: the following trait bounds were not satisfied:
+           `Runtime2DIndex: IndexFormula`

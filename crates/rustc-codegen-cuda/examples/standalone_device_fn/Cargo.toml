@@ -1,0 +1,23 @@
+[package]
+name = "standalone_device_fn"
+version = "0.1.0"
+edition = "2024"
+authors = ["Nihal Pasham <nihalp@nvidia.com>"]
+license = "Apache-2.0"
+
+# Mark as standalone crate (not part of parent workspace)
+[workspace]
+
+# This example tests standalone #[device] function compilation without kernels.
+# The device functions should be compilable to PTX/LTOIR independently,
+# enabling Rust device libraries consumable from CUDA C++.
+#
+# Build with:
+#   cargo oxide run standalone_device_fn
+
+[dependencies]
+# Device-side intrinsics (thread indexing, barriers, etc.)
+cuda-device = { path = "../../../cuda-device" }
+
+# Host-side utilities (CudaKernel trait, etc.)
+cuda-host = { path = "../../../cuda-host" }

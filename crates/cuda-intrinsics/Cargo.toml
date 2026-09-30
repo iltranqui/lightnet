@@ -1,0 +1,12 @@
+[package]
+name = "cuda-intrinsics"
+version = "0.1.0"
+edition.workspace = true
+authors = ["Nihal Pasham <nihalp@nvidia.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/NVlabs/cuda-oxide.git"
+description = "Generated low-level CUDA intrinsic declarations for cuda-oxide"
+readme = "README.md"
+
+[lib]
+doctest = false
