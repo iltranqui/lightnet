@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "cutile")]
+#[cfg(feature = "oxide")]
 use darknet_core::GpuExecutableNetwork;
 use darknet_core::{
     DataConfig, DetectionOptions, ExecutableNetwork, Network, PlanarRgbImage, Tensor,
@@ -16,8 +16,8 @@ use darknet_core::{
     decode_yolo_detections, inspect_weights_file, load_names_file, load_paths_file,
     load_training_batch_from_paths, save_weights,
 };
-#[cfg(feature = "cutile")]
-use darknet_cuda_cutile::CutileBackend;
+#[cfg(feature = "oxide")]
+use darknet_cuda_oxide::OxideBackend;
 
 fn main() {
     let handle = std::thread::Builder::new()
@@ -190,22 +190,49 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             let names = load_names_file(&names_path)?;
             let network = Network::from_path(&cfg)?.with_batch(1);
-            let mut executable = ExecutableNetwork::new(network);
-            let header = executable.load_weights_file(&weights)?;
-            println!(
-                "loaded weights {}.{}.{} seen={}",
-                header.major, header.minor, header.revision, header.seen
-            );
-
+            let (net_w, net_h) = (network.net.width, network.net.height);
             let original = PlanarRgbImage::load(&image_path)?;
             let prepared = if letterbox {
-                original.letterbox(executable.network.net.width, executable.network.net.height)?
+                original.letterbox(net_w, net_h)?
             } else {
-                original.resize(executable.network.net.width, executable.network.net.height)?
+                original.resize(net_w, net_h)?
             };
-            let result = executable.forward(&prepared.clone().into())?;
+            let input: Tensor = prepared.clone().into();
+            let result = match selected_backend()?.as_str() {
+                "cpu" => {
+                    let mut executable = ExecutableNetwork::new(network.clone());
+                    let header = executable.load_weights_file(&weights)?;
+                    println!(
+                        "loaded weights {}.{}.{} seen={}",
+                        header.major, header.minor, header.revision, header.seen
+                    );
+                    executable.forward(&input)?
+                }
+                #[cfg(feature = "oxide")]
+                "oxide" => {
+                    let backend = OxideBackend::new()?;
+                    println!(
+                        "gpu backend oxide device=0 conv={:?} gemm={:?}",
+                        backend.conv_mode(),
+                        backend.gemm_mode()
+                    );
+                    let mut executable = GpuExecutableNetwork::new(network.clone(), backend);
+                    let header = executable.load_weights_file(&weights)?;
+                    println!(
+                        "loaded weights {}.{}.{} seen={}",
+                        header.major, header.minor, header.revision, header.seen
+                    );
+                    executable.forward(&input)?
+                }
+                other => {
+                    return Err(format!(
+                        "backend {other} is not available in this build (oxide needs `--features oxide` via cargo-oxide)"
+                    )
+                    .into());
+                }
+            };
             let detections = decode_yolo_detections(
-                &executable.network,
+                &network,
                 &result.yolo_heads,
                 original.shape.width,
                 original.shape.height,
@@ -226,11 +253,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if letterbox { "letterbox" } else { "resize" }
             );
             println!("detections {}", detections.len());
+            let tsv = std::env::var_os("DARKNET_DETECT_TSV").is_some();
             for detection in detections {
                 let class_name = names
                     .get(detection.class_id)
                     .map(String::as_str)
                     .unwrap_or("<unknown>");
+                if tsv {
+                    // Full-precision machine-readable line for backend comparisons.
+                    println!(
+                        "det\t{class_name}\t{:.7}\t{:.4}\t{:.4}\t{:.4}\t{:.4}",
+                        detection.confidence,
+                        detection.bbox.left(),
+                        detection.bbox.top(),
+                        detection.bbox.right(),
+                        detection.bbox.bottom(),
+                    );
+                    continue;
+                }
                 println!(
                     "{:>6.2}% {:<24} left={:>7.2} top={:>7.2} right={:>7.2} bottom={:>7.2}",
                     detection.confidence * 100.0,
@@ -249,6 +289,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Execution backend for inference/training: `DARKNET_BACKEND=cpu|oxide`
+/// (default `cpu`). `DARKNET_OXIDE_CONV` / `DARKNET_OXIDE_GEMM` tune oxide.
+fn selected_backend() -> Result<String, Box<dyn std::error::Error>> {
+    let backend = std::env::var("DARKNET_BACKEND").unwrap_or_else(|_| "cpu".to_owned());
+    match backend.as_str() {
+        "cpu" | "oxide" => Ok(backend),
+        other => Err(format!("invalid DARKNET_BACKEND: {other} (expected cpu or oxide)").into()),
+    }
 }
 
 fn required_arg(value: Option<String>, name: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -392,15 +442,19 @@ fn format_seconds(seconds: f64) -> String {
     }
 }
 
-#[cfg(feature = "cutile")]
+#[cfg(feature = "oxide")]
 fn run_detector_train_preferred_backend(
     cfg: &str,
     data: &str,
     maybe_weights: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    match CutileBackend::new(0) {
+    if selected_backend()? != "oxide" {
+        println!("cpu backend (set DARKNET_BACKEND=oxide for the GPU path)");
+        return run_detector_train_cpu(cfg, data, maybe_weights);
+    }
+    match OxideBackend::new() {
         Ok(backend) => {
-            println!("gpu backend cutile device=0");
+            println!("gpu backend oxide device=0");
             run_detector_train_gpu(cfg, data, maybe_weights, backend)
         }
         Err(err) => {
@@ -410,7 +464,7 @@ fn run_detector_train_preferred_backend(
     }
 }
 
-#[cfg(not(feature = "cutile"))]
+#[cfg(not(feature = "oxide"))]
 fn run_detector_train_preferred_backend(
     cfg: &str,
     data: &str,
@@ -554,12 +608,12 @@ fn run_detector_train_cpu(
     Ok(())
 }
 
-#[cfg(feature = "cutile")]
+#[cfg(feature = "oxide")]
 fn run_detector_train_gpu(
     cfg: &str,
     data: &str,
     maybe_weights: Option<&str>,
-    backend: CutileBackend,
+    backend: OxideBackend,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let data_config = DataConfig::from_path(data)?;
     let mut executable = GpuExecutableNetwork::from_path(cfg, backend)?;
@@ -796,6 +850,7 @@ fn print_usage() {
     println!("  forward-dummy <cfg> [weights]");
     println!("  forward-backward-dummy <cfg> [weights] [auto|yolo|final]");
     println!("  detect-image <cfg> <weights> <names> <image> [thresh] [nms] [letterbox|resize]");
+    println!("env: DARKNET_BACKEND=cpu|oxide, DARKNET_OXIDE_CONV, DARKNET_OXIDE_GEMM, DARKNET_DETECT_TSV=1");
 }
 
 fn print_network_summary(network: &Network) {

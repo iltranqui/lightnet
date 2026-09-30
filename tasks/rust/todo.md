@@ -102,10 +102,14 @@ Layers it needs: 21 convolutional (19 with batch_normalize, 3 with `groups=2`, l
 - [ ] Perf: latency/FPS oxide vs C++ CUDA (cuDNN) on this net, interleaved A/B
 
 ## P4 CLI + end to end
-- [ ] `oxide` feature / backend selection in darknet-cli (mirror old cutile wiring at main.rs:395/557; cutile code is cfg-gated on missing feature)
-- [ ] Inference on LegoGears_v2 via darknet-cli (see FINAL TARGET), detections vs CPU within tolerance
+- [x] `oxide` feature / backend selection in darknet-cli: optional dep `darknet-cuda-oxide`, feature `oxide`, `DARKNET_BACKEND=cpu|oxide` (detect-image + detector train); cutile cfg blocks replaced. Build: `RUSTUP_TOOLCHAIN=nightly-2026-08-28 target/debug/cargo-oxide oxide build -- -p darknet-cli --features oxide -j 1`
+- [x] Inference on LegoGears_v2 via darknet-cli (P4a): oxide == Rust CPU (score diff <=5e-7) and matches C++ CUDA on PNG inputs (see report; JPEG decoder differs from OpenCV, up to 7.5e-3 score on raw jpg)
 - [ ] A few SGD steps: loss trajectory vs CPU on same weights (no long training runs)
 - [ ] Interleaved perf A/B conv throughput (laptop noise ~, no JIT startup)
+
+### P4a results (committed): oxide LegoGears_v2 inference == Rust CPU (max score diff 1.9e-6, IoU>=0.99999) == C++ CUDA (max score diff 4.5e-4, same as C++ CPU vs C++ GPU due to cudnn_half) on 40 detecting validation images (thr 0.25 and 0.05, 0 unmatched). Build: `target/debug/cargo-oxide oxide build -- -p darknet-cli --features oxide -j 1` (first build 13 min), run with `DARKNET_BACKEND=oxide` (+ `DARKNET_DETECT_TSV=1` for full-precision boxes).
+- [ ] JPEG decode mismatch: Rust `image` decoder differs from OpenCV/libjpeg (pin score 0.4854 vs 0.4929 on 00000013.jpg; a 0.0507 pin dropped at thr 0.05). Affects mAP on ~half the dataset (.jpg). Fix decoder (or use same libjpeg-turbo settings: fancy upsampling / DCT method) or document tolerance before the mAP step
+- [ ] tf32 detections on LegoGears not yet compared
 
 ## P5 CPU-fallback gaps (trait + runtime.rs)
 - [ ] Extend `F32TensorOpsBackend` with default host impls: softmax, reorg, dropout, scale_channels, connected

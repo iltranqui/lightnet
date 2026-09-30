@@ -2,6 +2,7 @@
 resolver = "3"
 exclude = [
     "bridges/darknet-cuda-cutile",
+    "bridges/darknet-cuda-oxide",
     "crates/rustc-codegen-cuda",
 ]
 members = [
@@ -139,3 +140,8 @@ proc-macro2 = { version = "1.0", features = ["span-locations"] }
 # optimize only SHA-256 so exact content fingerprinting remains inexpensive.
 [profile.dev.package.sha2]
 opt-level = 3
+
+# The oxide bridge needs MIR const-propagation (opt-level >= 1) for its float
+# atomics; its own [profile.dev] is ignored when built as a dependency.
+[profile.dev.package.darknet-cuda-oxide]
+opt-level = 1

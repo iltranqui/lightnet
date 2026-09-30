@@ -49,3 +49,5 @@ ciou_surface.svg
 /bridges/darknet-cuda-oxide/*.ptx
 /crates/rustc-codegen-cuda/examples/*/*.ll
 /crates/rustc-codegen-cuda/examples/*/*.ptx
+/darknet_cuda_oxide*.ll
+/darknet_cuda_oxide*.ptx

@@ -706,6 +706,7 @@ version = "0.1.0"
 dependencies = [
  "darknet-core",
  "darknet-cuda",
+ "darknet-cuda-oxide",
 ]
 
 [[package]]
@@ -720,6 +721,16 @@ dependencies = [
 [[package]]
 name = "darknet-cuda"
 version = "0.1.0"
+
+[[package]]
+name = "darknet-cuda-oxide"
+version = "0.1.0"
+dependencies = [
+ "cuda-core",
+ "cuda-device",
+ "cuda-host",
+ "darknet-cuda",
+]
 
 [[package]]
 name = "darknet-examples"
