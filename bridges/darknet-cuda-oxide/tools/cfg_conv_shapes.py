@@ -311,7 +311,25 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-dir", default=os.path.join(OXIDE, "tests", "data"))
     ap.add_argument("--crosscheck", action="store_true")
+    ap.add_argument("--cfg", help="print the per-layer conv geometries of ONE cfg as CSV "
+                    "(stdout, or --cfg-out FILE) and exit; used for legogears_v2_convs.csv")
+    ap.add_argument("--cfg-out", help="output file for --cfg")
     a = ap.parse_args()
+    if a.cfg:
+        recs = dict(conv=[], unsup=[], maxpool=[], upsample=[], route=[], shortcut=[], act=[])
+        st, msg = propagate(os.path.abspath(a.cfg), recs)
+        if st != "ok":
+            sys.exit("shape propagation failed: %s" % msg)
+        out = open(a.cfg_out, "w", newline="") if a.cfg_out else sys.stdout
+        wr = csv.writer(out)
+        wr.writerow(["layer", "in_c", "in_h", "in_w", "filters", "size", "stride_x", "stride_y",
+                     "dilation", "padding", "groups", "activation", "batch_normalize",
+                     "out_h", "out_w"])
+        for r in recs["conv"]:
+            wr.writerow([r["layer"], r["in_c"], r["in_h"], r["in_w"], r["filters"], r["size"],
+                         r["stride_x"], r["stride_y"], r["dilation"], r["padding"], r["groups"],
+                         r["act"], r["bn"], r["out_h"], r["out_w"]])
+        return
     os.makedirs(a.out_dir, exist_ok=True)
 
     cfgs = find_cfgs()

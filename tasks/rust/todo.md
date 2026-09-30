@@ -25,9 +25,9 @@ Build/test (one command at a time, repo root):
 
 ## Real-cfg shape coverage (scan agent writes tests/data/*.csv; tests added AFTER P3 to avoid concurrent builds)
 - [ ] Scan all cfg/*.cfg (+ LegoGears_v2 cfgs) with shape propagation -> `tests/data/conv_shapes.csv` (+ maxpool/upsample/route CSVs, summary.md) via `tools/cfg_conv_shapes.py`
-- [ ] Test `conv_real_cfg_shapes`: every unique conv geometry, fwd + dgrad + wgrad, direct/gemm/(tf32) vs CPU reference, batch 1 (+ batch 2 sample); heavy layers use capped spatial dims or sampled output windows, documented
-- [ ] Same for maxpool / upsample / route (grouped) geometries found in cfgs
-- [ ] Explicit list of cfg geometries the oxide conv does NOT support (return Err, tested) vs must-support (LegoGears_v2 = hard requirement)
+- [x] Test `conv_real_cfg_shapes`: every unique conv geometry, fwd + dgrad + wgrad, direct/gemm/(tf32) vs CPU reference, batch 1 (+ batch 2 sample); heavy layers use capped spatial dims or sampled output windows, documented -> DONE in `tests/oxide_cfg_shapes.rs`: `cfg_conv_direct`/`cfg_conv_gemm`/`cfg_conv_gemm_tf32` (+ batch 2 every 50th geometry)
+- [x] Same for maxpool / upsample / route (grouped) geometries found in cfgs -> DONE: `cfg_maxpool_shapes`, `cfg_upsample_shapes`, `cfg_route_shapes`, `cfg_shortcut_shapes`
+- [x] Explicit list of cfg geometries the oxide conv does NOT support (return Err, tested) vs must-support (LegoGears_v2 = hard requirement) -> DONE: `cfg_conv_dilated_and_non_rule_geometries` (dilation>1: Err under darknet-core dims, parity with pad*dilation); LegoGears_v2 at real size in every mode test
 - [ ] Re-run with P6 fp16 and P7 bench shapes reusing the same CSV
 
 ### Scan results (done): 101 cfgs, 5845 conv layers, 990 unique geometries; C++ darknet layer table cross-check: 3822 convs, 0 mismatches
@@ -38,15 +38,22 @@ Data: `bridges/darknet-cuda-oxide/tests/data/{conv_shapes,conv_activation_pairs,
 - Activations used: leaky 2809, mish 2005, linear 1348, swish 674, logistic 94, relu6 52 (1 cfg), relu 48, ramp 22 (1 cfg); NOT covered by oxide: relu6, ramp (tanh supported, unused).
 - Test rule: dilation=1 & stride_x==stride_y & padding==size/2 & groups|channels = 984 geoms, batch 1, fwd+dgrad+wgrad; MACs>~50M geoms: keep channels/k/s/p/groups, shrink in_h/in_w to ~32-64; CPU-ref cap a few hundred MMAC/case; 3-5 full-size GPU-only layers vs cuDNN/darknet; mandatory picks per (k,s), depthwise, groups 2/32/odd filters-per-group, dilation 2&3, stem in_c 1/3, large-filters 1x1; cross with activation/BN from conv_activation_pairs.csv (one activation per geom + full coverage on a small set).
 - [ ] 42 cfgs gave no C++ layer table (old cfg/unsupported/*, yolov3-openimages, LegoGears_v2_fp4sim*): not investigated
-- [ ] Implement `conv_real_cfg_shapes` test from the rule above (reads tests/data/conv_shapes.csv)
-- [ ] Add relu6 (+ ramp?) to trait/oxide or assert CPU fallback
-- [ ] Mismatched-shape shortcut decision (30 layers in cfgs)
+- [x] Implement `conv_real_cfg_shapes` test from the rule above (reads tests/data/conv_shapes.csv) -> DONE (`tests/oxide_cfg_shapes.rs`, ~50 s; LegoGears layers from `tests/data/legogears_v2_convs.csv` via `tools/cfg_conv_shapes.py --cfg`)
+- [ ] Add relu6 (+ ramp?) to trait/oxide or assert CPU fallback (test asserts relu6/ramp are NOT expressible via F32ActivationKind; still open: add kernels or keep CPU fallback)
+- [ ] Mismatched-shape shortcut decision (30 layers in cfgs) (tested: `shortcut_add_f32` returns Err for all 30 layers since flat lengths differ, no silent equal-length case in the cfgs; decision still open)
+
+### Findings from real-cfg tests (committed): 1009 conv geoms x {direct, gemm} + 192 tf32 + LegoGears 21 layers real size, 0 failures
+- DILATION: C++/darknet-core output dims ignore dilation; C++ cuDNN pads `pad*dilation`; darknet-core CPU uses plain pad (shifted window, differs from C++ GPU). Oxide uses true dilated extent: called with core convention -> Err; called with `pad*dilation` (cuDNN way) matches. If runtime routes dilated conv to oxide it must pass pad*dilation. Only resnet152_trident uses dilation.
+- Mismatched-shape shortcuts (30 layers): `shortcut_add_f32` returns Err (length mismatch), runtime keeps CPU fallback. Decide in P5.
+- relu(NaN)=0 on oxide vs NaN in C++ (`x*(x>0)`); mish/swish at -inf -> NaN. Decide if matching C++ matters.
+- Large geoms only tested shrunk; full-size only for LegoGears. No cuDNN cross-check yet (P4/P7).
+- darknet-cli main.rs has dead `cfg(feature="cutile")` blocks (unexpected_cfgs warnings) -> clean up in P4 when adding the `oxide` feature.
 
 ## Activation coverage from real cfgs (C++ has ~21 fwd + 21 bwd kernels in activation_kernels.cu; trait `F32ActivationKind` has 7: Linear, Logistic, ReLU, Leaky, Mish, Swish, Tanh)
 - [ ] Scan agent also emits `tests/data/activations.csv`: per activation name, count, which cfgs/layer types (conv/connected/shortcut/yolo/...) use it
 - [ ] Gap list: activations used by any cfg but missing from `F32ActivationKind`/oxide (candidates: loggy, relu6, elu, selu, gelu, hard_mish, hardtan, lhtan, plse, ramp, stair, relie, normalize_channels, normalize_channels_softmax, normalize_channels_softmax_maxval) — decide per item: add to trait+runtime (`gpu_activation_kind` mapping in darknet-core runtime.rs) + oxide kernel, or keep CPU fallback with a test that asserts the fallback is taken
-- [ ] For each supported activation: forward + backward parity vs CPU reference over edge values (0, +-tiny, +-large, Mish/Swish thresholds, NaN/Inf inputs behave like C++), finite-difference check, and C++ parity vs `activate_array`/`gradient_array` semantics (input vs output form, as verified for P1)
-- [ ] Real-cfg activation x conv pairing test: each (activation, conv geometry) combination that occurs in the scanned cfgs runs conv + bias + activation fwd/bwd chain on oxide vs CPU
+- [x] For each supported activation: forward + backward parity vs CPU reference over edge values (0, +-tiny, +-large, Mish/Swish thresholds, NaN/Inf inputs behave like C++), finite-difference check, and C++ parity vs `activate_array`/`gradient_array` semantics (input vs output form, as verified for P1) -> DONE: `cfg_activations_supported_and_unsupported` (edge values, many sizes, NaN/Inf mirror; FD + output-form parity stay in oxide_parity.rs)
+- [x] Real-cfg activation x conv pairing test: each (activation, conv geometry) combination that occurs in the scanned cfgs runs conv + bias + activation fwd/bwd chain on oxide vs CPU -> DONE: `cfg_conv_bias_activation_chain` (123 chains: 60 csv sample, 42 activation x geometry cross, 21 LegoGears real size)
 - [ ] fp16 (P6): same activation set on f16 storage with documented tolerance; TF32/fp16 conv followed by activation
 - [ ] LegoGears_v2 uses leaky (19) + linear (2): those two are hard requirements, everything else best-effort by cfg frequency
 
