@@ -81,11 +81,11 @@ Data: `bridges/darknet-cuda-oxide/tests/data/{conv_shapes,conv_activation_pairs,
 - [x] Parity tests per op
 
 ## P3b YOLO head elementwise (src-lib/yolo_layer.cpp forward_yolo_layer_gpu / backward_yolo_layer_gpu)
-- [ ] Check how `darknet-core` runtime/train.rs applies yolo activation today (CPU? skipped?) and where delta from CPU loss is consumed
-- [ ] Trait method (default host impl) e.g. `yolo_activate_f32(x, batch, anchors, classes, w, h, scale_x_y)`: logistic on x,y and obj+classes slices, scale_x_y = scale*v - 0.5*(scale-1); Gaussian-yolo variant only if the runtime supports it
+- [x] Check how `darknet-core` runtime/train.rs applies yolo activation today (CPU? skipped?) and where delta from CPU loss is consumed -> DONE: head output is RAW logits on CPU+GPU (runtime.rs pass-through); logistic/scale_x_y applied on host in detect.rs:decode_yolo_head/decode_bbox and train.rs yolo_xy_output; delta returned as layer_output_gradient_seeds uploaded in backward_accumulate_seeded_gpu
+- [x] (NOT NEEDED, decision: no trait method) Trait method (default host impl) e.g. `yolo_activate_f32(x, batch, anchors, classes, w, h, scale_x_y)`: logistic on x,y and obj+classes slices, scale_x_y = scale*v - 0.5*(scale-1); Gaussian-yolo variant only if the runtime supports it
 - [ ] Oxide kernel `kernels/yolo.rs` + fwd parity vs CPU and vs C++ head outputs; backward: delta accumulation (axpy * loss_scale * delta_normalizer) into previous-layer delta
-- [ ] Loss/target assignment stays CPU (same as C++: output pulled to host, delta pushed back), keep that D2H/H2D path working with OxideTensor
-- [ ] `mean_alpha` output_avg EMA only if a cfg uses it (LegoGears_v2 check)
+- [x] Loss/target assignment stays CPU (same as C++: output pulled to host, delta pushed back), keep that D2H/H2D path working with OxideTensor
+- [x] `mean_alpha` output_avg EMA only if a cfg uses it (LegoGears_v2 check) -> LegoGears_v2 sets no mean_alpha; not needed
 - [ ] Finite-difference/parity test for activation+scale_x_y backward
 
 ## FINAL TARGET: match LegoGears_v2 (C++/CUDA Darknet inference is the ground truth)
@@ -93,7 +93,7 @@ Network: `DarkSuite/datasets/LegoGears_v2/LegoGears_v2.cfg` (+ `LegoGears.names`
 Layers it needs: 21 convolutional (19 with batch_normalize, 3 with `groups=2`, leaky x19 / linear x2), 11 route (incl. grouped routes), 3 maxpool, 1 upsample, 2 yolo. No softmax/connected/dropout/reorg/avgpool, so P5 is NOT on the critical path for this net.
 - [ ] Confirm BN path for inference on oxide (runtime composes bias_add/channel_scale, or fold BN into conv weights) and that all 19 BN convs work
 - [x] Grouped route (`groups`/`group_id`) supported by `route_concat_f32` (P3)
-- [ ] YOLO layers (2): C++ `forward_yolo_layer_gpu` (src-lib/yolo_layer.cpp:1439) runs on GPU: copy input, logistic on x,y and on objectness+classes per anchor, `scal_add` for scale_x_y, optional `mean_array` (EMA); then pulls output to CPU for decode/targets/loss and pushes delta back; backward = GPU axpy. See P3b. Verify the Rust runtime's head outputs equal C++ (activation applied, scale_x_y); mismatch = blocker
+- [x] YOLO layers (2): C++ `forward_yolo_layer_gpu` (src-lib/yolo_layer.cpp:1439) runs on GPU: copy input, logistic on x,y and on objectness+classes per anchor, `scal_add` for scale_x_y, optional `mean_array` (EMA); then pulls output to CPU for decode/targets/loss and pushes delta back; backward = GPU axpy. See P3b. Verify the Rust runtime's head outputs equal C++ (activation applied, scale_x_y); mismatch = blocker -> equivalent for new_coords=0 at detection/loss level (test gpu_yolo_head_matches_cpu_and_cpp_activated_decode); head tensor is raw, not C++-activated. Caveat: new_coords=1 path (not LegoGears) looks wrong, see report
 - [ ] Layer-by-layer: dump every layer output from C++ darknet (CUDA build, same weights/image) vs Rust oxide, report max abs/rel diff per layer (tolerance 1e-3 fp32 path)
 - [ ] Final detections on a LegoGears_v2 image set: same boxes/classes/scores vs C++ CUDA (box IoU > 0.99, score diff < 1e-3), tolerances documented
 - [ ] mAP on the LegoGears_v2 validation set: Rust oxide == C++ CUDA within run noise (same weights, same thresholds)

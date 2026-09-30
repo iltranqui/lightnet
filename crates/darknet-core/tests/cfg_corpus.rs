@@ -16,7 +16,7 @@ use darknet_core::{ConfigFile, Error, ExecutableNetwork, Network};
 
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
+        .join("../..")
         .canonicalize()
         .expect("the Darknet repository root must exist")
 }

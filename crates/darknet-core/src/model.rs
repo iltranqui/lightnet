@@ -1551,7 +1551,7 @@ mod tests {
 
     fn repo_cfg(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../cfg")
+            .join("../../cfg")
             .join(name)
     }
 

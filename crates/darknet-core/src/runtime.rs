@@ -8986,7 +8986,7 @@ mod tests {
 
     fn repo_cfg(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../cfg")
+            .join("../../cfg")
             .join(name)
     }
 
@@ -12987,6 +12987,136 @@ mod tests {
         let train = train_buffers[0].as_ref().expect("train buffers exist");
         assert_eq!(train.weight_updates.data, vec![0.0]);
         assert_eq!(train.bias_updates.data, vec![0.0]);
+    }
+
+    #[test]
+    fn gpu_yolo_head_matches_cpu_and_cpp_activated_decode() {
+        // Documents P3b: the Rust runtime keeps YOLO head outputs as raw
+        // (pre-activation) logits on both CPU and GPU paths and applies
+        // logistic + scale_x_y on the host inside decode/loss.  C++ applies
+        // them on the device in forward_yolo_layer_gpu before decoding.  For
+        // new_coords=0 (LegoGears_v2) both must yield identical detections.
+        use crate::detect::{DetectionOptions, decode_yolo_detections};
+
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                batch=1
+                width=8
+                height=8
+                channels=1
+
+                [convolutional]
+                filters=7
+                size=1
+                stride=1
+                activation=linear
+
+                [yolo]
+                mask=0
+                anchors=9,12
+                classes=2
+                num=1
+                scale_x_y=1.05
+            "#,
+        )
+        .expect("cfg should parse");
+        let network = Network::from_config(cfg).expect("network should build");
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+        match &mut cpu.params[0] {
+            LayerParams::Convolutional(params) => {
+                params.weights = vec![1.3, -0.9, 0.7, 1.1, 2.5, 1.7, -1.4];
+                params.biases = vec![0.1, -0.2, 0.3, -0.1, -1.5, -0.8, -1.2];
+            }
+            other => panic!("unexpected params: {other:?}"),
+        }
+        gpu.params = cpu.params.clone();
+        let input = Tensor::from_data(
+            cpu.network.net.input_shape(),
+            (0..64).map(|idx| (idx as f32 - 20.0) / 16.0).collect(),
+        )
+        .expect("input tensor");
+
+        let cpu_forward = cpu.forward(&input).expect("CPU forward");
+        let gpu_full = gpu.forward_with_state(&input).expect("GPU forward");
+        let gpu_compact = gpu.forward_compact(&input).expect("GPU compact forward");
+        assert_eq!(cpu_forward.yolo_heads, gpu_full.cpu_forward.yolo_heads);
+        assert_eq!(cpu_forward.yolo_heads, gpu_compact.yolo_heads);
+
+        let options = DetectionOptions {
+            confidence_threshold: 0.1,
+            nms_threshold: 0.45,
+            letterbox: false,
+        };
+        let decode = |heads: &[super::YoloHeadOutput]| {
+            let mut dets = crate::detect::decode_yolo_detections(&network, heads, 8, 8, options)
+                .expect("decode");
+            dets.sort_by(|a, b| a.confidence.total_cmp(&b.confidence));
+            dets
+        };
+        let cpu_dets = decode(&cpu_forward.yolo_heads);
+        let gpu_dets = decode(&gpu_compact.yolo_heads);
+        assert_eq!(cpu_dets, gpu_dets);
+
+        // C++ reference: forward_yolo_layer_gpu activation, then
+        // get_yolo_detections on the activated tensor (before NMS).
+        let spec = match &network.layers[1].kind {
+            LayerKind::Yolo(spec) => spec.clone(),
+            other => panic!("unexpected layer {other:?}"),
+        };
+        let raw = &cpu_forward.yolo_heads[0].output;
+        let sig = |v: f32| 1.0 / (1.0 + (-v).exp());
+        let (w, h, entries) = (8usize, 8usize, spec.classes + 5);
+        let mut reference = Vec::new();
+        for row in 0..h {
+            for col in 0..w {
+                // activated output, C++ layout: x,y logistic then scal_add; obj+cls logistic
+                let x = spec.scale_x_y * sig(raw.get(0, 0, row, col)) - 0.5 * (spec.scale_x_y - 1.0);
+                let y = spec.scale_x_y * sig(raw.get(0, 1, row, col)) - 0.5 * (spec.scale_x_y - 1.0);
+                let obj = sig(raw.get(0, 4, row, col));
+                if obj <= options.confidence_threshold {
+                    continue;
+                }
+                let (bw, bh) = (
+                    raw.get(0, 2, row, col).exp() * 9.0 / 8.0,
+                    raw.get(0, 3, row, col).exp() * 12.0 / 8.0,
+                );
+                for c in 0..spec.classes {
+                    let conf = obj * sig(raw.get(0, 5 + c, row, col));
+                    if conf > options.confidence_threshold {
+                        reference.push((
+                            conf,
+                            (col as f32 + x) / w as f32 * 8.0,
+                            (row as f32 + y) / h as f32 * 8.0,
+                            bw * 8.0,
+                            bh * 8.0,
+                        ));
+                    }
+                }
+            }
+        }
+        assert_eq!(entries, 7);
+        assert!(!reference.is_empty(), "test must exercise detections");
+        reference.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // decode applies NMS; compare the pre-NMS reference against a run with
+        // NMS disabled via an overlap threshold of 1.0.
+        let no_nms = DetectionOptions {
+            nms_threshold: 1.0,
+            ..options
+        };
+        let mut dets = decode_yolo_detections(&network, &cpu_forward.yolo_heads, 8, 8, no_nms)
+            .expect("decode");
+        dets.sort_by(|a, b| a.confidence.total_cmp(&b.confidence));
+        assert_eq!(dets.len(), reference.len());
+        for (d, r) in dets.iter().zip(&reference) {
+            assert!((d.confidence - r.0).abs() < 1e-6);
+            assert!((d.bbox.x - r.1).abs() < 1e-4);
+            assert!((d.bbox.y - r.2).abs() < 1e-4);
+            assert!((d.bbox.w - r.3).abs() < 1e-4);
+            assert!((d.bbox.h - r.4).abs() < 1e-4);
+        }
     }
 
     #[test]
