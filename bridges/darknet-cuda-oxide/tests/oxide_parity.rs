@@ -272,3 +272,162 @@ fn unimplemented_ops_return_error() {
         .expect("crop should be unimplemented");
     assert!(matches!(err, OxideError::NotImplemented(_)));
 }
+
+// ---- Finite-difference gradient checks (f64 CPU forward) ----
+
+fn act64(kind: F32ActivationKind, x: f64) -> f64 {
+    match kind {
+        F32ActivationKind::Linear => x,
+        F32ActivationKind::Logistic => 1.0 / (1.0 + (-x).exp()),
+        F32ActivationKind::Relu => x.max(0.0),
+        F32ActivationKind::Leaky => {
+            if x > 0.0 {
+                x
+            } else {
+                0.1 * x
+            }
+        }
+        F32ActivationKind::Mish => x * (1.0 + x.exp()).ln().tanh(),
+        F32ActivationKind::Swish => x / (1.0 + (-x).exp()),
+        F32ActivationKind::Tanh => x.tanh(),
+    }
+}
+
+#[test]
+fn activation_backward_matches_finite_difference() {
+    let b = backend();
+    let mut rng = Rng(21);
+    let n = 513;
+    // Stay away from the ReLU / Leaky kink at 0 so central differences are valid.
+    let x: Vec<f32> = rng
+        .vec(n, -4.0, 4.0)
+        .into_iter()
+        .map(|v| if v.abs() < 0.05 { v + 0.2 } else { v })
+        .collect();
+    let delta = rng.vec(n, -2.0, 2.0);
+    let xt = b.upload_f32(&[n], &x).unwrap();
+    let dt = b.upload_f32(&[n], &delta).unwrap();
+    let eps = 1e-5f64;
+    for kind in KINDS {
+        let got = b
+            .download_f32(&b.activation_backward_f32(&xt, &dt, kind, cfg()).unwrap())
+            .unwrap();
+        for i in 0..n {
+            let xi = x[i] as f64;
+            let fd = (act64(kind, xi + eps) - act64(kind, xi - eps)) / (2.0 * eps) * delta[i] as f64;
+            let err = (got[i] as f64 - fd).abs();
+            assert!(
+                err <= 1e-3 + 1e-3 * fd.abs(),
+                "{kind:?} dgrad[{i}] x={xi}: got {}, fd {fd}, err {err}",
+                got[i]
+            );
+        }
+    }
+}
+
+/// darknet-core's CPU gradient (`activation_gradient_from_output`) derives
+/// Logistic / Relu / Leaky / Tanh from the activation OUTPUT, the GPU trait
+/// takes the activation INPUT (the runtime passes the biased pre-activation
+/// tensor).  The two are the same function for these kinds: check it.
+#[test]
+fn activation_backward_input_form_equals_core_output_form() {
+    let b = backend();
+    let mut rng = Rng(22);
+    let n = 777;
+    let mut x = rng.vec(n, -5.0, 5.0);
+    x[0] = 0.0;
+    let delta = rng.vec(n, -1.0, 1.0);
+    let xt = b.upload_f32(&[n], &x).unwrap();
+    let dt = b.upload_f32(&[n], &delta).unwrap();
+    for kind in [
+        F32ActivationKind::Linear,
+        F32ActivationKind::Logistic,
+        F32ActivationKind::Relu,
+        F32ActivationKind::Leaky,
+        F32ActivationKind::Tanh,
+    ] {
+        let got = b
+            .download_f32(&b.activation_backward_f32(&xt, &dt, kind, cfg()).unwrap())
+            .unwrap();
+        let want: Vec<f32> = x
+            .iter()
+            .zip(&delta)
+            .map(|(&xi, &d)| {
+                let y = cpu_activate(kind, xi);
+                // Formulas copied from darknet-core `activation_gradient_from_output`.
+                let g = match kind {
+                    F32ActivationKind::Linear => 1.0,
+                    F32ActivationKind::Logistic => y * (1.0 - y),
+                    F32ActivationKind::Relu => (y > 0.0) as i32 as f32,
+                    F32ActivationKind::Leaky => {
+                        if y > 0.0 {
+                            1.0
+                        } else {
+                            0.1
+                        }
+                    }
+                    F32ActivationKind::Tanh => 1.0 - y * y,
+                    _ => unreachable!(),
+                };
+                g * d
+            })
+            .collect();
+        assert_close(&format!("{kind:?} input-vs-output form"), &got, &want);
+    }
+}
+
+#[test]
+fn bias_ops_match_finite_difference() {
+    let b = backend();
+    let mut rng = Rng(23);
+    let (batch, channels, stride) = (3usize, 4usize, 19usize);
+    let n = batch * channels * stride;
+    let x = rng.vec(n, -1.0, 1.0);
+    let bias = rng.vec(channels, -1.0, 1.0);
+    let r = rng.vec(n, -1.0, 1.0); // upstream gradient
+    let xt = b.upload_f32(&[n], &x).unwrap();
+    let rt = b.upload_f32(&[n], &r).unwrap();
+
+    // L(bias) = sum_i r_i * (x_i + bias[c(i)])
+    let loss = |bv: &[f64]| -> f64 {
+        (0..n)
+            .map(|i| r[i] as f64 * (x[i] as f64 + bv[(i / stride) % channels]))
+            .sum()
+    };
+    let bias64: Vec<f64> = bias.iter().map(|&v| v as f64).collect();
+    let eps = 1e-3f64;
+    let fd: Vec<f64> = (0..channels)
+        .map(|c| {
+            let (mut p, mut m) = (bias64.clone(), bias64.clone());
+            p[c] += eps;
+            m[c] -= eps;
+            (loss(&p) - loss(&m)) / (2.0 * eps)
+        })
+        .collect();
+    let got = b
+        .download_f32(&b.bias_backward_f32(&rt, channels, stride, cfg()).unwrap())
+        .unwrap();
+    for c in 0..channels {
+        assert!(
+            (got[c] as f64 - fd[c]).abs() <= 1e-3 + 1e-3 * fd[c].abs(),
+            "bias_backward[{c}]: got {}, fd {}",
+            got[c],
+            fd[c]
+        );
+    }
+
+    // d bias_add / d x is the identity: the upstream gradient passes through.
+    let bt = b.upload_f32(&[channels], &bias).unwrap();
+    let y = b.download_f32(&b.bias_add_f32(&xt, &bt, channels, stride, cfg()).unwrap()).unwrap();
+    let fd_x: Vec<f64> = (0..n)
+        .step_by(37)
+        .map(|i| {
+            let f = |d: f64| (x[i] as f64 + d + bias[(i / stride) % channels] as f64) * r[i] as f64;
+            (f(eps) - f(-eps)) / (2.0 * eps)
+        })
+        .collect();
+    for (j, i) in (0..n).step_by(37).enumerate() {
+        assert!((fd_x[j] - r[i] as f64).abs() <= 1e-3, "bias_add dx[{i}]");
+        assert!((y[i] - (x[i] + bias[(i / stride) % channels])).abs() <= TOL);
+    }
+}

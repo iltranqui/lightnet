@@ -2,18 +2,20 @@
 //! compiled by cuda-oxide (`cargo oxide`).  Build this crate only through
 //! `cargo oxide`; plain `cargo build` cannot compile the device code.
 
+pub mod conv;
 pub mod kernels;
 pub mod launch;
 pub mod tensor;
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DriverError};
 use darknet_cuda::{ElementwiseLaunchConfig, F32ActivationKind, F32TensorOpsBackend};
 
 use kernels::bias_scale::BIAS_BACKWARD_THREADS;
-use kernels::{activations, bias_scale, elementwise, optim};
+use kernels::{activations, bias_scale, conv_direct, elementwise, gemm, im2col, optim};
+pub use conv::ConvMode;
 pub use tensor::OxideTensorF32;
 
 #[derive(Debug)]
@@ -49,6 +51,64 @@ pub struct OxideBackend {
     activations: activations::kernels::LoadedModule,
     bias_scale: bias_scale::kernels::LoadedModule,
     optim: optim::kernels::LoadedModule,
+    gemm: gemm::kernels::LoadedModule,
+    im2col: im2col::kernels::LoadedModule,
+    conv_direct: conv_direct::kernels::LoadedModule,
+    conv_mode: ConvMode,
+    /// im2col / dcol scratch, grown on demand and reused across conv calls.
+    workspace: Mutex<Option<DeviceBuffer<f32>>>,
+}
+
+/// One (batched) GEMM: `C = alpha * op(A) * op(B) + beta * C`, row-major.
+///
+/// `op(A)` is `m x k` (stored `k x m` with leading dim `lda` when `trans_a`),
+/// `op(B)` is `k x n`, `C` is `m x n` with leading dim `ldc`.  `a` / `b` / `c`
+/// are `(base, stride, modulus)`: instance `i < count` starts at
+/// `base + (i % modulus) * stride` elements.  Backends with tensor-core GEMMs
+/// can implement the same description.
+#[derive(Clone, Copy, Debug)]
+pub struct GemmArgs {
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+    pub lda: usize,
+    pub ldb: usize,
+    pub ldc: usize,
+    pub trans_a: bool,
+    pub trans_b: bool,
+    pub alpha: f32,
+    pub beta: f32,
+    pub a: (usize, usize, usize),
+    pub b: (usize, usize, usize),
+    pub c: (usize, usize, usize),
+    pub count: usize,
+}
+
+impl Default for GemmArgs {
+    fn default() -> Self {
+        Self {
+            m: 0,
+            n: 0,
+            k: 0,
+            lda: 0,
+            ldb: 0,
+            ldc: 0,
+            trans_a: false,
+            trans_b: false,
+            alpha: 1.0,
+            beta: 0.0,
+            a: (0, 0, 1),
+            b: (0, 0, 1),
+            c: (0, 0, 1),
+            count: 1,
+        }
+    }
+}
+
+/// Highest element index (+1) touched by a stored `rows x cols` matrix.
+fn extent(base: usize, stride: usize, modulus: usize, count: usize, rows: usize, cols: usize, ld: usize) -> usize {
+    let inst = count.min(modulus).saturating_sub(1);
+    base + inst * stride + (rows - 1) * ld + cols
 }
 
 fn activation_code(kind: F32ActivationKind) -> u32 {
@@ -117,6 +177,12 @@ impl OxideBackend {
             .map_err(|err| OxideError::Shape(format!("load bias_scale module: {err:?}")))?;
         let optim = optim::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load optim module: {err:?}")))?;
+        let gemm = gemm::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load gemm module: {err:?}")))?;
+        let im2col = im2col::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load im2col module: {err:?}")))?;
+        let conv_direct = conv_direct::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load conv_direct module: {err:?}")))?;
         Ok(Self {
             _ctx: ctx,
             stream,
@@ -124,15 +190,131 @@ impl OxideBackend {
             activations,
             bias_scale,
             optim,
+            gemm,
+            im2col,
+            conv_direct,
+            conv_mode: ConvMode::from_env(),
+            workspace: Mutex::new(None),
         })
     }
 
-    fn alloc(&self, len: usize) -> Result<DeviceBuffer<f32>, OxideError> {
+    /// Overrides the conv implementation chosen from `DARKNET_OXIDE_CONV`.
+    pub fn with_conv_mode(mut self, mode: ConvMode) -> Self {
+        self.conv_mode = mode;
+        self
+    }
+
+    pub fn conv_mode(&self) -> ConvMode {
+        self.conv_mode
+    }
+
+    /// Validated GEMM launch.  This is the single seam conv (and later
+    /// `connected`) goes through; alternative kernels plug in here.
+    pub(crate) fn gemm(
+        &self,
+        a: &DeviceBuffer<f32>,
+        b: &DeviceBuffer<f32>,
+        c: &mut DeviceBuffer<f32>,
+        g: &GemmArgs,
+    ) -> Result<(), OxideError> {
+        let bad = |msg: &str| OxideError::Shape(format!("gemm: {msg}"));
+        if g.m == 0 || g.n == 0 || g.k == 0 || g.count == 0 {
+            return Err(bad("m, n, k and count must be > 0"));
+        }
+        if g.a.2 == 0 || g.b.2 == 0 || g.c.2 == 0 {
+            return Err(bad("instance modulus must be > 0"));
+        }
+        let (ar, ac) = if g.trans_a { (g.k, g.m) } else { (g.m, g.k) };
+        let (br, bc) = if g.trans_b { (g.n, g.k) } else { (g.k, g.n) };
+        if g.lda < ac || g.ldb < bc || g.ldc < g.n {
+            return Err(bad("leading dimension smaller than row length"));
+        }
+        if extent(g.a.0, g.a.1, g.a.2, g.count, ar, ac, g.lda) > a.len()
+            || extent(g.b.0, g.b.1, g.b.2, g.count, br, bc, g.ldb) > b.len()
+            || extent(g.c.0, g.c.1, g.c.2, g.count, g.m, g.n, g.ldc) > c.len()
+        {
+            return Err(bad("operand buffer too small for the requested view"));
+        }
+        let tiles = g.m.div_ceil(gemm::BM) * g.n.div_ceil(gemm::BN);
+        // SAFETY: extents validated above; each C element has one owner thread
+        // and instances writing the same `c` slot are not allowed (`c` modulus
+        // >= count at every call site).
+        unsafe {
+            self.gemm.sgemm_tiled(
+                &self.stream,
+                launch::blocks_of(tiles * g.count, gemm::GEMM_THREADS),
+                a,
+                b,
+                c,
+                g.m,
+                g.n,
+                g.k,
+                g.lda,
+                g.ldb,
+                g.ldc,
+                g.trans_a as u32,
+                g.trans_b as u32,
+                g.alpha,
+                g.beta,
+                g.a.0,
+                g.a.1,
+                g.a.2,
+                g.b.0,
+                g.b.1,
+                g.b.2,
+                g.c.0,
+                g.c.1,
+                g.c.2,
+            )
+        }
+        .map_err(launch_err)
+    }
+
+    /// Single dense GEMM on tensors, for tests and future `connected` layers.
+    /// Returns a fresh `m x n` tensor; `c` (read only when `beta != 0`) is
+    /// copied via the host, so this is not a hot path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f32(
+        &self,
+        a: &OxideTensorF32,
+        b: &OxideTensorF32,
+        c: &OxideTensorF32,
+        m: usize,
+        n: usize,
+        k: usize,
+        trans_a: bool,
+        trans_b: bool,
+        alpha: f32,
+        beta: f32,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let mut out = DeviceBuffer::from_host(&self.stream, &c.buf.to_host_vec(&self.stream)?)?;
+        self.gemm(
+            &a.buf,
+            &b.buf,
+            &mut out,
+            &GemmArgs {
+                m,
+                n,
+                k,
+                lda: if trans_a { m } else { k },
+                ldb: if trans_b { k } else { n },
+                ldc: n,
+                trans_a,
+                trans_b,
+                alpha,
+                beta,
+                ..GemmArgs::default()
+            },
+        )?;
+        Ok(OxideTensorF32::new(out, &[m, n]))
+    }
+
+    pub(crate) fn alloc(&self, len: usize) -> Result<DeviceBuffer<f32>, OxideError> {
         Ok(DeviceBuffer::<f32>::zeroed(&self.stream, len)?)
     }
 }
 
-fn launch_err(err: impl fmt::Debug) -> OxideError {
+pub(crate) fn launch_err(err: impl fmt::Debug) -> OxideError {
     OxideError::Shape(format!("kernel launch failed: {err:?}"))
 }
 
@@ -435,62 +617,62 @@ impl F32TensorOpsBackend for OxideBackend {
 
     fn conv2d_f32(
         &self,
-        _x: &Self::Tensor,
-        _weights: &Self::Tensor,
-        _output_shape: &[usize],
-        _input_channels: usize,
-        _input_height: usize,
-        _input_width: usize,
-        _filters: usize,
-        _kernel_size: usize,
-        _stride_x: usize,
-        _stride_y: usize,
-        _dilation: usize,
-        _padding: usize,
-        _groups: usize,
-        _config: ElementwiseLaunchConfig,
+        x: &Self::Tensor,
+        weights: &Self::Tensor,
+        output_shape: &[usize],
+        input_channels: usize,
+        input_height: usize,
+        input_width: usize,
+        filters: usize,
+        kernel_size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        dilation: usize,
+        padding: usize,
+        groups: usize,
+        config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        Err(OxideError::NotImplemented("conv2d_f32"))
+        self.conv_forward(x, weights, output_shape, input_channels, input_height, input_width, filters, kernel_size, stride_x, stride_y, dilation, padding, groups, config)
     }
 
     fn conv2d_backward_input_f32(
         &self,
-        _output_grad: &Self::Tensor,
-        _weights: &Self::Tensor,
-        _input_shape: &[usize],
-        _input_channels: usize,
-        _input_height: usize,
-        _input_width: usize,
-        _filters: usize,
-        _kernel_size: usize,
-        _stride_x: usize,
-        _stride_y: usize,
-        _dilation: usize,
-        _padding: usize,
-        _groups: usize,
-        _config: ElementwiseLaunchConfig,
+        output_grad: &Self::Tensor,
+        weights: &Self::Tensor,
+        input_shape: &[usize],
+        input_channels: usize,
+        input_height: usize,
+        input_width: usize,
+        filters: usize,
+        kernel_size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        dilation: usize,
+        padding: usize,
+        groups: usize,
+        config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        Err(OxideError::NotImplemented("conv2d_backward_input_f32"))
+        self.conv_backward_input(output_grad, weights, input_shape, input_channels, input_height, input_width, filters, kernel_size, stride_x, stride_y, dilation, padding, groups, config)
     }
 
     fn conv2d_backward_weights_f32(
         &self,
-        _x: &Self::Tensor,
-        _output_grad: &Self::Tensor,
-        _weight_shape: &[usize],
-        _input_channels: usize,
-        _input_height: usize,
-        _input_width: usize,
-        _filters: usize,
-        _kernel_size: usize,
-        _stride_x: usize,
-        _stride_y: usize,
-        _dilation: usize,
-        _padding: usize,
-        _groups: usize,
-        _config: ElementwiseLaunchConfig,
+        x: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        weight_shape: &[usize],
+        input_channels: usize,
+        input_height: usize,
+        input_width: usize,
+        filters: usize,
+        kernel_size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        dilation: usize,
+        padding: usize,
+        groups: usize,
+        config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        Err(OxideError::NotImplemented("conv2d_backward_weights_f32"))
+        self.conv_backward_weights(x, output_grad, weight_shape, input_channels, input_height, input_width, filters, kernel_size, stride_x, stride_y, dilation, padding, groups, config)
     }
 
     fn maxpool_f32(

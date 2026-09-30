@@ -3,5 +3,8 @@
 
 pub mod activations;
 pub mod bias_scale;
+pub mod conv_direct;
 pub mod elementwise;
+pub mod gemm;
+pub mod im2col;
 pub mod optim;
