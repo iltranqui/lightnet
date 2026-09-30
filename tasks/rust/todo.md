@@ -24,10 +24,10 @@ Build/test (one command at a time, repo root):
 - [ ] Decide bias_backward block reduction with `SharedArray` (current: 2-stage partials)
 
 ## P2b Tensor-core GEMM (after P2 baseline passes; cuda-device `wmma.rs`/`mma_frag.rs`, sm_80+, works on sm_89)
-- [ ] `kernels/gemm_mma.rs`: mma.sync + ldmatrix GEMM, tf32 (or f16) inputs, f32 accumulate
-- [ ] Flag-gated `DARKNET_OXIDE_GEMM={fp32,tf32,auto}`; default fp32 until accuracy accepted
-- [ ] Parity vs fp32 GEMM and CPU at relaxed tolerance (document it); conv fwd/dgrad/wgrad through it
-- [ ] Interleaved perf A/B vs fp32 tiled GEMM
+- [x] `kernels/gemm_mma.rs`: mma.sync + ldmatrix GEMM, tf32 (or f16) inputs, f32 accumulate
+- [x] Flag-gated `DARKNET_OXIDE_GEMM={fp32,tf32,auto}`; default fp32 until accuracy accepted
+- [x] Parity vs fp32 GEMM and CPU at relaxed tolerance (document it); conv fwd/dgrad/wgrad through it
+- [x] Interleaved perf A/B vs fp32 tiled GEMM
 - [ ] Keep GEMM behind an interface so wgmma (sm_90) / tcgen05 (sm_100 Blackwell) kernels can be added per arch
 
 ## Forward + backward verification (applies to every phase)
@@ -46,9 +46,30 @@ Build/test (one command at a time, repo root):
 - [ ] crop_bilinear fwd/bwd (overridden, trait default panics)
 - [ ] Parity tests per op
 
+## P3b YOLO head elementwise (src-lib/yolo_layer.cpp forward_yolo_layer_gpu / backward_yolo_layer_gpu)
+- [ ] Check how `darknet-core` runtime/train.rs applies yolo activation today (CPU? skipped?) and where delta from CPU loss is consumed
+- [ ] Trait method (default host impl) e.g. `yolo_activate_f32(x, batch, anchors, classes, w, h, scale_x_y)`: logistic on x,y and obj+classes slices, scale_x_y = scale*v - 0.5*(scale-1); Gaussian-yolo variant only if the runtime supports it
+- [ ] Oxide kernel `kernels/yolo.rs` + fwd parity vs CPU and vs C++ head outputs; backward: delta accumulation (axpy * loss_scale * delta_normalizer) into previous-layer delta
+- [ ] Loss/target assignment stays CPU (same as C++: output pulled to host, delta pushed back), keep that D2H/H2D path working with OxideTensor
+- [ ] `mean_alpha` output_avg EMA only if a cfg uses it (LegoGears_v2 check)
+- [ ] Finite-difference/parity test for activation+scale_x_y backward
+
+## FINAL TARGET: match LegoGears_v2 (C++/CUDA Darknet inference is the ground truth)
+Network: `DarkSuite/datasets/LegoGears_v2/LegoGears_v2.cfg` (+ `LegoGears.names`, weights e.g. `LegoGears_augmatch_best.weights`; 224x160x3, batch 16 in cfg, YOLOv4-tiny style).
+Layers it needs: 21 convolutional (19 with batch_normalize, 3 with `groups=2`, leaky x19 / linear x2), 11 route (incl. grouped routes), 3 maxpool, 1 upsample, 2 yolo. No softmax/connected/dropout/reorg/avgpool, so P5 is NOT on the critical path for this net.
+- [ ] Confirm BN path for inference on oxide (runtime composes bias_add/channel_scale, or fold BN into conv weights) and that all 19 BN convs work
+- [ ] Grouped route (`groups`/`group_id`) supported by `route_concat_f32` (P3)
+- [ ] YOLO layers (2): C++ `forward_yolo_layer_gpu` (src-lib/yolo_layer.cpp:1439) runs on GPU: copy input, logistic on x,y and on objectness+classes per anchor, `scal_add` for scale_x_y, optional `mean_array` (EMA); then pulls output to CPU for decode/targets/loss and pushes delta back; backward = GPU axpy. See P3b. Verify the Rust runtime's head outputs equal C++ (activation applied, scale_x_y); mismatch = blocker
+- [ ] Layer-by-layer: dump every layer output from C++ darknet (CUDA build, same weights/image) vs Rust oxide, report max abs/rel diff per layer (tolerance 1e-3 fp32 path)
+- [ ] Final detections on a LegoGears_v2 image set: same boxes/classes/scores vs C++ CUDA (box IoU > 0.99, score diff < 1e-3), tolerances documented
+- [ ] mAP on the LegoGears_v2 validation set: Rust oxide == C++ CUDA within run noise (same weights, same thresholds)
+- [ ] Also run with `DARKNET_OXIDE_GEMM=tf32` and record the delta (must not silently become default)
+- [ ] Watch the predict stream-sync pitfall (memory: A/B same weights across binaries first)
+- [ ] Perf: latency/FPS oxide vs C++ CUDA (cuDNN) on this net, interleaved A/B
+
 ## P4 CLI + end to end
 - [ ] `oxide` feature / backend selection in darknet-cli (mirror old cutile wiring at main.rs:395/557; cutile code is cfg-gated on missing feature)
-- [ ] yolov4-tiny inference: detections vs CPU within tolerance
+- [ ] Inference on LegoGears_v2 via darknet-cli (see FINAL TARGET), detections vs CPU within tolerance
 - [ ] A few SGD steps: loss trajectory vs CPU on same weights (no long training runs)
 - [ ] Interleaved perf A/B conv throughput (laptop noise ~, no JIT startup)
 
@@ -63,6 +84,8 @@ Build/test (one command at a time, repo root):
 - [ ] Re-enable cuTile dep once bridges/cutile-rs-aot is restored (or remove bridge)
 - [ ] Fix rustup `clippy-preview` conflict (run with RUSTUP_TOOLCHAIN until fixed)
 - [ ] `cargo oxide` alias unusable from bridge dir; keep README note in bridges/darknet-cuda-oxide
+- [ ] Build race: `cargo oxide ... -j 4` can SIGBUS in `opt` (lib + lib-test codegen share darknet_cuda_oxide*.ll/.ptx in the crate dir); use -j 1 until fixed (all tests then pass)
+- [ ] TF32 perf: only ~1.2x fp32 on 1024^3 (no cp.async double buffering); conv wgrad ~30% SLOWER with TF32; conv time dominated by im2col/col2im + per-batch launches. Optimize later (pipelined GEMM, batched im2col), not blocking
 - [ ] Commit minimally per phase; add Review section here when done
 
 ## Review

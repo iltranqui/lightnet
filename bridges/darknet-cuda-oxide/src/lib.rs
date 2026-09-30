@@ -14,7 +14,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DriverError};
 use darknet_cuda::{ElementwiseLaunchConfig, F32ActivationKind, F32TensorOpsBackend};
 
 use kernels::bias_scale::BIAS_BACKWARD_THREADS;
-use kernels::{activations, bias_scale, conv_direct, elementwise, gemm, im2col, optim};
+use kernels::{activations, bias_scale, conv_direct, elementwise, gemm, gemm_mma, im2col, optim};
 pub use conv::ConvMode;
 pub use tensor::OxideTensorF32;
 
@@ -52,11 +52,57 @@ pub struct OxideBackend {
     bias_scale: bias_scale::kernels::LoadedModule,
     optim: optim::kernels::LoadedModule,
     gemm: gemm::kernels::LoadedModule,
+    gemm_mma: gemm_mma::kernels::LoadedModule,
+    gemm_mode: GemmMode,
     im2col: im2col::kernels::LoadedModule,
     conv_direct: conv_direct::kernels::LoadedModule,
     conv_mode: ConvMode,
     /// im2col / dcol scratch, grown on demand and reused across conv calls.
     workspace: Mutex<Option<DeviceBuffer<f32>>>,
+}
+
+/// Which GEMM kernel conv / `gemm_f32` use.
+///
+/// * `Fp32`: exact f32 FMA tiled kernel (default).
+/// * `Tf32`: tensor-core `mma.sync` m16n8k8 with TF32 inputs, f32 accumulate
+///   (operands rounded to a 10-bit mantissa).
+/// * `Auto`: `Tf32` when `m * n * k >= AUTO_TF32_MIN_MACS` (2^24, i.e. about
+///   256^3) and `min(m, n) >= 32`, else `Fp32`.  Below that the launch is too
+///   small to fill the GPU or to amortise the 64x64 tile padding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GemmMode {
+    Fp32,
+    Tf32,
+    Auto,
+}
+
+/// Minimum `m * n * k` for `GemmMode::Auto` to pick the TF32 tensor-core kernel.
+pub const AUTO_TF32_MIN_MACS: usize = 1 << 24;
+
+impl GemmMode {
+    /// `DARKNET_OXIDE_GEMM={fp32,tf32,auto}`; unset or unknown means `Fp32`.
+    pub fn from_env() -> Self {
+        match std::env::var("DARKNET_OXIDE_GEMM")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "tf32" => Self::Tf32,
+            "auto" => Self::Auto,
+            _ => Self::Fp32,
+        }
+    }
+
+    fn use_tf32(self, g: &GemmArgs) -> bool {
+        match self {
+            Self::Fp32 => false,
+            Self::Tf32 => true,
+            Self::Auto => {
+                g.m.saturating_mul(g.n).saturating_mul(g.k) >= AUTO_TF32_MIN_MACS
+                    && g.m.min(g.n) >= 32
+            }
+        }
+    }
 }
 
 /// One (batched) GEMM: `C = alpha * op(A) * op(B) + beta * C`, row-major.
@@ -179,6 +225,8 @@ impl OxideBackend {
             .map_err(|err| OxideError::Shape(format!("load optim module: {err:?}")))?;
         let gemm = gemm::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load gemm module: {err:?}")))?;
+        let gemm_mma = gemm_mma::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load gemm_mma module: {err:?}")))?;
         let im2col = im2col::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load im2col module: {err:?}")))?;
         let conv_direct = conv_direct::kernels::load(&ctx)
@@ -191,6 +239,8 @@ impl OxideBackend {
             bias_scale,
             optim,
             gemm,
+            gemm_mma,
+            gemm_mode: GemmMode::from_env(),
             im2col,
             conv_direct,
             conv_mode: ConvMode::from_env(),
@@ -202,6 +252,16 @@ impl OxideBackend {
     pub fn with_conv_mode(mut self, mode: ConvMode) -> Self {
         self.conv_mode = mode;
         self
+    }
+
+    /// Overrides the GEMM kernel chosen from `DARKNET_OXIDE_GEMM`.
+    pub fn with_gemm_mode(mut self, mode: GemmMode) -> Self {
+        self.gemm_mode = mode;
+        self
+    }
+
+    pub fn gemm_mode(&self) -> GemmMode {
+        self.gemm_mode
     }
 
     pub fn conv_mode(&self) -> ConvMode {
@@ -234,6 +294,39 @@ impl OxideBackend {
             || extent(g.c.0, g.c.1, g.c.2, g.count, g.m, g.n, g.ldc) > c.len()
         {
             return Err(bad("operand buffer too small for the requested view"));
+        }
+        if self.gemm_mode.use_tf32(g) {
+            let tiles = g.m.div_ceil(gemm_mma::MMA_BM) * g.n.div_ceil(gemm_mma::MMA_BN);
+            // SAFETY: as for the fp32 kernel below (same ownership/extents).
+            return unsafe {
+                self.gemm_mma.sgemm_tf32_mma(
+                    &self.stream,
+                    launch::blocks_of(tiles * g.count, gemm_mma::MMA_THREADS),
+                    a,
+                    b,
+                    c,
+                    g.m,
+                    g.n,
+                    g.k,
+                    g.lda,
+                    g.ldb,
+                    g.ldc,
+                    g.trans_a as u32,
+                    g.trans_b as u32,
+                    g.alpha,
+                    g.beta,
+                    g.a.0,
+                    g.a.1,
+                    g.a.2,
+                    g.b.0,
+                    g.b.1,
+                    g.b.2,
+                    g.c.0,
+                    g.c.1,
+                    g.c.2,
+                )
+            }
+            .map_err(launch_err);
         }
         let tiles = g.m.div_ceil(gemm::BM) * g.n.div_ceil(gemm::BN);
         // SAFETY: extents validated above; each C element has one owner thread
@@ -307,6 +400,29 @@ impl OxideBackend {
             },
         )?;
         Ok(OxideTensorF32::new(out, &[m, n]))
+    }
+
+    /// Benchmark helper: mean milliseconds per dense NN GEMM (`alpha = 1`,
+    /// `beta = 0`) over `iters` launches after one warm-up, stream-synchronised.
+    pub fn bench_gemm_f32(
+        &self,
+        a: &OxideTensorF32,
+        b: &OxideTensorF32,
+        m: usize,
+        n: usize,
+        k: usize,
+        iters: usize,
+    ) -> Result<f64, OxideError> {
+        let mut c = self.alloc(m * n)?;
+        let g = GemmArgs { m, n, k, lda: k, ldb: n, ldc: n, ..GemmArgs::default() };
+        self.gemm(&a.buf, &b.buf, &mut c, &g)?;
+        self.stream.synchronize()?;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            self.gemm(&a.buf, &b.buf, &mut c, &g)?;
+        }
+        self.stream.synchronize()?;
+        Ok(t.elapsed().as_secs_f64() * 1e3 / iters as f64)
     }
 
     pub(crate) fn alloc(&self, len: usize) -> Result<DeviceBuffer<f32>, OxideError> {
