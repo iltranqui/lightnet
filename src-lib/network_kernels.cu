@@ -62,6 +62,25 @@ void forward_network_gpu(Darknet::Network & net, Darknet::NetworkState state)
 			CHECK_CUDA(cudaStreamSynchronize(get_cuda_stream()));
 		}
 		state.input = l.output_gpu;
+
+		if (not state.train)
+		{
+			// opt-in debugging aid: DARKNET_LAYER_DUMP_DIR=<dir> exports every layer output (raw f32 + layers.tsv)
+			static const char * dump_dir = std::getenv("DARKNET_LAYER_DUMP_DIR");
+			if (dump_dir)
+			{
+				cudaStreamSynchronize(get_cuda_stream());
+				std::vector<float> host(static_cast<size_t>(l.outputs) * l.batch);
+				cuda_pull_array(l.output_gpu, host.data(), host.size());
+				const std::string dir(dump_dir);
+				char name[32];
+				std::snprintf(name, sizeof(name), "/layer_%03d.f32", i);
+				std::ofstream(dir + name, std::ios::binary).write(reinterpret_cast<const char*>(host.data()), host.size() * sizeof(float));
+				std::ofstream meta(dir + "/layers.tsv", i == 0 ? std::ios::trunc : std::ios::app);
+				if (i == 0) meta << "index\ttype\tw\th\tc\tbatch\tcount\n";
+				meta << i << "\t" << static_cast<int>(l.type) << "\t" << l.out_w << "\t" << l.out_h << "\t" << l.out_c << "\t" << l.batch << "\t" << host.size() << "\n";
+			}
+		}
 	}
 
 	if (net.benchmark_layers)
