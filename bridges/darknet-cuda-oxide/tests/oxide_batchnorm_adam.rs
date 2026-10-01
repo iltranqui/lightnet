@@ -2,7 +2,10 @@
 //! independent f64 CPU references, central finite differences through the full
 //! forward, bit-exact determinism, and edge shapes.
 
-use darknet_cuda::{AdamParams, ElementwiseLaunchConfig, F32TensorOpsBackend, NanInfMode};
+use darknet_cuda::{
+    AdamParams, AdamUpdateItem, ElementwiseLaunchConfig, F32ActivationKind, F32TensorOpsBackend, NanInfMode,
+    SgdUpdateItem,
+};
 use darknet_cuda_oxide::OxideBackend;
 
 const TOL: f64 = 2e-4;
@@ -432,5 +435,131 @@ fn batchnorm_fold_matches_the_host_fold() {
         let b = bias[i] - m[i] * s;
         assert!((scale[i] - s).abs() <= 1e-6 * s.abs(), "scale[{i}]: {} vs {s}", scale[i]);
         assert!((folded[i] - b).abs() <= 1e-6 * (1.0 + b.abs()), "bias[{i}]: {} vs {b}", folded[i]);
+    }
+}
+
+/// One layer's tensors for the multi-tensor tests: weights (poisoned, `fix`), then
+/// clean biases / scales; sizes differ so the segment boundaries are exercised.
+fn layer_tensors(be: &OxideBackend, rng: &mut Rng, count: usize) -> Vec<[<OxideBackend as F32TensorOpsBackend>::Tensor; 5]> {
+    [1000usize, 37, 16][..count]
+        .iter()
+        .enumerate()
+        .map(|(k, &n)| {
+            let w = if k == 0 { poisoned(rng, n) } else { rng.vec(n, -1.0, 1.0) };
+            [
+                be.upload_f32(&[n], &w).unwrap(),
+                be.upload_f32(&[n], &poisoned(rng, n)).unwrap(),
+                be.upload_f32(&[n], &rng.vec(n, -1.0, 1.0)).unwrap(),
+                be.upload_f32(&[n], &rng.vec(n, -0.1, 0.1)).unwrap(),
+                be.upload_f32(&[n], &rng.vec(n, 0.0, 0.1)).unwrap(),
+            ]
+        })
+        .collect()
+}
+
+#[test]
+fn multi_tensor_sgd_is_bit_identical_to_per_tensor_calls() {
+    let be = backend();
+    let mut rng = Rng(0x5eed_1234_abcd_0003);
+    for count in 1..=3usize {
+        for pending in [false, true] {
+            let t = layer_tensors(&be, &mut rng, count);
+            let shapes: Vec<[usize; 1]> = t.iter().map(|x| [be.download_f32(&x[0]).unwrap().len()]).collect();
+            let items: Vec<_> = t
+                .iter()
+                .zip(&shapes)
+                .enumerate()
+                .map(|(k, (x, shape))| SgdUpdateItem {
+                    weights: &x[0],
+                    updates: &x[1],
+                    grad: pending.then_some(&x[2]),
+                    shape,
+                    fix_weights: k == 0,
+                    decay: if k == 0 { 5e-4 } else { 0.0 },
+                })
+                .collect();
+            let got = be.sanitized_sgd_update_multi_f32(&items, 0.01, 0.9, 4, cfg()).unwrap();
+            for (k, (x, shape)) in t.iter().zip(&shapes).enumerate() {
+                let u = if pending { be.saxpy_f32(1.0, &x[2], &x[1], cfg()).unwrap() } else { x[1].clone() };
+                let (rw, ru) = be
+                    .sanitized_sgd_update_f32(&x[0], &u, shape, k == 0, 0.01, 0.9, items[k].decay, 4, cfg())
+                    .unwrap();
+                assert_eq!(bits(be.download_f32(&got[k].0).unwrap()), bits(be.download_f32(&rw).unwrap()), "w count={count} k={k} pending={pending}");
+                assert_eq!(bits(be.download_f32(&got[k].1).unwrap()), bits(be.download_f32(&ru).unwrap()), "u count={count} k={k} pending={pending}");
+            }
+        }
+    }
+}
+
+#[test]
+fn multi_tensor_adam_is_bit_identical_to_per_tensor_calls() {
+    let be = backend();
+    let mut rng = Rng(0x5eed_1234_abcd_0004);
+    for decoupled_decay in [false, true] {
+        let p = AdamParams { lr: 1e-3, beta1: 0.9, beta2: 0.999, eps: 1e-7, decay: 5e-4, batch: 2, step: 3, decoupled_decay };
+        for count in 1..=3usize {
+            for pending in [false, true] {
+                let t = layer_tensors(&be, &mut rng, count);
+                let shapes: Vec<[usize; 1]> = t.iter().map(|x| [be.download_f32(&x[0]).unwrap().len()]).collect();
+                let params = |k: usize| {
+                    let mut q = p;
+                    if k != 0 && q.decoupled_decay {
+                        q.decay = 0.0;
+                    }
+                    q
+                };
+                let items: Vec<_> = t
+                    .iter()
+                    .zip(&shapes)
+                    .enumerate()
+                    .map(|(k, (x, shape))| AdamUpdateItem {
+                        weights: &x[0],
+                        updates: &x[1],
+                        grad: pending.then_some(&x[2]),
+                        m: &x[3],
+                        v: &x[4],
+                        shape,
+                        fix_weights: k == 0,
+                        params: params(k),
+                    })
+                    .collect();
+                let got = be.sanitized_adam_update_multi_f32(&items, cfg()).unwrap();
+                for (k, (x, shape)) in t.iter().zip(&shapes).enumerate() {
+                    let u = if pending { be.saxpy_f32(1.0, &x[2], &x[1], cfg()).unwrap() } else { x[1].clone() };
+                    let r = be
+                        .sanitized_adam_update_f32(&x[0], &u, &x[3], &x[4], shape, k == 0, &params(k), cfg())
+                        .unwrap();
+                    let (g, r) = (&got[k], &r);
+                    for (name, a, b) in [("w", &g.0, &r.0), ("m", &g.1, &r.1), ("v", &g.2, &r.2), ("u", &g.3, &r.3)] {
+                        assert_eq!(bits(be.download_f32(a).unwrap()), bits(be.download_f32(b).unwrap()), "{name} count={count} k={k} pending={pending}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fused_bias_activation_is_bit_identical_to_bias_add_then_activation() {
+    let be = backend();
+    let mut rng = Rng(0x5eed_1234_abcd_0005);
+    let (channels, stride) = (6usize, 35usize);
+    let x = be.upload_f32(&[2 * channels * stride], &rng.vec(2 * channels * stride, -4.0, 4.0)).unwrap();
+    let bias = be.upload_f32(&[channels], &rng.vec(channels, -1.0, 1.0)).unwrap();
+    for act in [
+        F32ActivationKind::Linear,
+        F32ActivationKind::Logistic,
+        F32ActivationKind::Relu,
+        F32ActivationKind::Leaky,
+        F32ActivationKind::Mish,
+        F32ActivationKind::Swish,
+        F32ActivationKind::Tanh,
+        F32ActivationKind::Relu6,
+        F32ActivationKind::Ramp,
+    ] {
+        let biased = be.bias_add_f32(&x, &bias, channels, stride, cfg()).unwrap();
+        let want = be.activation_f32(&biased, act, cfg()).unwrap();
+        let got = be.bias_activation_f32(&x, &bias, channels, stride, act, cfg()).unwrap();
+        assert_eq!(bits(be.download_f32(&got).unwrap()), bits(be.download_f32(&want).unwrap()), "{act:?}");
     }
 }

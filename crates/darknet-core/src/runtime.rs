@@ -30,8 +30,8 @@ use crate::model::{
 };
 use crate::weights::WeightsHeader;
 use darknet_cuda::{
-    AdamParams, ElementwiseLaunchConfig, F16TensorOpsBackend, F32ActivationKind, F32TensorOpsBackend,
-    NanInfMode, dropout_unit,
+    AdamParams, AdamUpdateItem, ElementwiseLaunchConfig, F16TensorOpsBackend, F32ActivationKind, F32TensorOpsBackend,
+    NanInfMode, SgdUpdateItem, dropout_unit,
 };
 
 const BATCH_NORM_EPSILON: f32 = 0.000_01;
@@ -2214,21 +2214,29 @@ impl GpuOptimizerStep {
     }
 }
 
-/// Sanitises, then applies one SGD/Adam step to a single parameter tensor
-/// (C++ `update_convolutional_layer_gpu`: `reset_nan_and_inf(updates)`,
+/// One parameter tensor of a layer's optimizer step.
+struct GpuOptimTarget<'a, T> {
+    is_weight: bool,
+    w: &'a T,
+    u: &'a T,
+    /// A pending (not yet accumulated) gradient, see `GpuPendingGrads`.
+    grad: Option<&'a T>,
+    moments: &'a mut Option<GpuMoments<T>>,
+    shape: &'a [usize],
+}
+
+/// Sanitises, then applies one SGD/Adam step to a layer's parameter tensors
+/// (weights, biases, BN scales) in one backend call (C++
+/// `update_convolutional_layer_gpu`: `reset_nan_and_inf(updates)`,
 /// `fix_nan_and_inf(weights)` for weights, then the optimizer).  Returns the
-/// new `(weights, updates)`; Adam zeroes the updates like `adam_update_gpu`.
-#[allow(clippy::too_many_arguments)]
-fn gpu_optimizer_step<B>(
+/// new `(weights, updates)` per target; Adam zeroes the updates like
+/// `adam_update_gpu`.
+fn gpu_optimizer_multi_step<B>(
     backend: &B,
     step: &GpuOptimizerStep,
-    is_weight: bool,
-    w: &B::Tensor,
-    u: &B::Tensor,
-    moments: &mut Option<GpuMoments<B::Tensor>>,
-    shape: &[usize],
+    targets: Vec<GpuOptimTarget<'_, B::Tensor>>,
     config: ElementwiseLaunchConfig,
-) -> Result<(B::Tensor, B::Tensor)>
+) -> Result<Vec<(B::Tensor, B::Tensor)>>
 where
     B: F32TensorOpsBackend,
     B::Error: std::fmt::Display,
@@ -2239,41 +2247,67 @@ where
             momentum,
             decay,
             batch,
-        } => backend
-            .sanitized_sgd_update_f32(
-                w,
-                u,
-                shape,
-                is_weight,
-                *lr,
-                *momentum,
-                if is_weight { *decay } else { 0.0 },
-                *batch,
-                config,
-            )
-            .map_err(|err| backend_error("GPU SGD update", err)),
+        } => {
+            let items: Vec<_> = targets
+                .iter()
+                .map(|t| SgdUpdateItem {
+                    weights: t.w,
+                    updates: t.u,
+                    grad: t.grad,
+                    shape: t.shape,
+                    fix_weights: t.is_weight,
+                    decay: if t.is_weight { *decay } else { 0.0 },
+                })
+                .collect();
+            backend
+                .sanitized_sgd_update_multi_f32(&items, *lr, *momentum, *batch, config)
+                .map_err(|err| backend_error("GPU SGD update", err))
+        }
         GpuOptimizerStep::Adam(params) => {
-            let count = shape.iter().product::<usize>();
-            if moments.is_none() {
-                let zeros = || {
-                    backend
-                        .zeros_f32(&[count])
-                        .map_err(|err| backend_error("allocate GPU Adam moments", err))
-                };
-                *moments = Some((zeros()?, zeros()?));
+            let mut targets = targets;
+            for t in targets.iter_mut() {
+                if t.moments.is_none() {
+                    let count = t.shape.iter().product::<usize>();
+                    let zeros = || {
+                        backend
+                            .zeros_f32(&[count])
+                            .map_err(|err| backend_error("allocate GPU Adam moments", err))
+                    };
+                    *t.moments = Some((zeros()?, zeros()?));
+                }
             }
-            let (m, v) = moments.as_ref().expect("moments allocated above");
-            // C++ decays biases and scales too under coupled Adam; decoupled
-            // (AdamW) decays weights only.
-            let mut params = *params;
-            if !is_weight && params.decoupled_decay {
-                params.decay = 0.0;
-            }
-            let (w, m, v, zeroed_updates) = backend
-                .sanitized_adam_update_f32(w, u, m, v, shape, is_weight, &params, config)
+            let items: Vec<_> = targets
+                .iter()
+                .map(|t| {
+                    let (m, v) = t.moments.as_ref().expect("moments allocated above");
+                    // C++ decays biases and scales too under coupled Adam;
+                    // decoupled (AdamW) decays weights only.
+                    let mut params = *params;
+                    if !t.is_weight && params.decoupled_decay {
+                        params.decay = 0.0;
+                    }
+                    AdamUpdateItem {
+                        weights: t.w,
+                        updates: t.u,
+                        grad: t.grad,
+                        m,
+                        v,
+                        shape: t.shape,
+                        fix_weights: t.is_weight,
+                        params,
+                    }
+                })
+                .collect();
+            let results = backend
+                .sanitized_adam_update_multi_f32(&items, config)
                 .map_err(|err| backend_error("GPU Adam update", err))?;
-            *moments = Some((m, v));
-            Ok((w, zeroed_updates))
+            drop(items);
+            let mut out = Vec::with_capacity(results.len());
+            for (t, (w, m, v, zeroed)) in targets.iter_mut().zip(results) {
+                *t.moments = Some((m, v));
+                out.push((w, zeroed));
+            }
+            Ok(out)
         }
     }
 }
@@ -2310,6 +2344,18 @@ struct GpuConvolutionTrainBuffers<T> {
     weight_updates: T,
     bias_updates: T,
     scale_updates: Option<T>,
+    /// Gradient of the latest backward that is not yet added to the `*_updates`
+    /// accumulators; the next optimizer step folds it in (`updates + grad`, the
+    /// same addition the separate accumulate launch did).  Only set on the
+    /// deferred training path (see `defer_host_sync`).
+    pending: Option<GpuPendingGrads<T>>,
+}
+
+#[derive(Clone, Debug)]
+struct GpuPendingGrads<T> {
+    weights: T,
+    biases: T,
+    scales: Option<T>,
 }
 
 /// f16-storage inference (P6).  Training and every non-inference op stay on
@@ -2671,6 +2717,7 @@ where
                         weight_updates,
                         bias_updates,
                         scale_updates,
+                        pending: None,
                     }));
                 }
                 _ => train_buffers.push(None),
@@ -2854,10 +2901,17 @@ where
                 })?;
 
             let layer_step = step.with_lr_scale(opts.learning_rate_scale);
-            // `grad_centr` (with BN) acts on the sanitised weight updates.
+            // `grad_centr` (with BN) acts on the sanitised, accumulated weight updates.
             let mut weight_grad = train.weight_updates.clone();
+            let pending = train.pending.clone();
             if opts.grad_centr && train.scale_updates.is_some() {
                 let f_size = weight_shape[1] * weight_shape[2] * weight_shape[3];
+                if let Some(p) = pending.as_ref() {
+                    weight_grad = self
+                        .backend
+                        .saxpy_f32(1.0, &p.weights, &weight_grad, config)
+                        .map_err(|err| backend_error("GPU gradient accumulation", err))?;
+                }
                 weight_grad = self
                     .backend
                     .sanitize_nan_inf_f32(&weight_grad, &weight_shape, NanInfMode::Reset, config)
@@ -2867,41 +2921,65 @@ where
                     .gradient_centralization_f32(&weight_grad, &weight_shape, f_size, config)
                     .map_err(|err| backend_error("GPU gradient centralization", err))?;
             }
+            let weights_pending = if opts.grad_centr && train.scale_updates.is_some() {
+                None
+            } else {
+                pending.as_ref().map(|p| &p.weights)
+            };
             let mut moments = self.adam_state[owner].take().unwrap_or_default();
-            let (mut raw_weights, weight_updates) = gpu_optimizer_step(
-                &self.backend,
-                &layer_step,
-                true,
-                &cached.raw_weights,
-                &weight_grad,
-                &mut moments.weights,
-                &weight_shape,
-                config,
-            )?;
+            let scales_input = match (cached.bn.as_ref(), train.scale_updates.as_ref()) {
+                (Some(bn), Some(updates)) => Some((&bn.scales, updates)),
+                (None, Some(_)) => {
+                    return Err(Error::InvalidConfig(
+                        "GPU batch-norm scale updates exist for a layer without device BN state"
+                            .to_owned(),
+                    ));
+                }
+                _ => None,
+            };
+            let filters_shape = [filters];
+            let mut targets = vec![
+                GpuOptimTarget {
+                    is_weight: true,
+                    w: &cached.raw_weights,
+                    u: &weight_grad,
+                    grad: weights_pending,
+                    moments: &mut moments.weights,
+                    shape: &weight_shape,
+                },
+                GpuOptimTarget {
+                    is_weight: false,
+                    w: &cached.raw_biases,
+                    u: &train.bias_updates,
+                    grad: pending.as_ref().map(|p| &p.biases),
+                    moments: &mut moments.biases,
+                    shape: &filters_shape,
+                },
+            ];
+            if let Some((scales, updates)) = scales_input {
+                targets.push(GpuOptimTarget {
+                    is_weight: false,
+                    w: scales,
+                    u: updates,
+                    grad: pending.as_ref().and_then(|p| p.scales.as_ref()),
+                    moments: &mut moments.scales,
+                    shape: &filters_shape,
+                });
+            }
+            let mut stepped = gpu_optimizer_multi_step(&self.backend, &layer_step, targets, config)?
+                .into_iter();
+            let (mut raw_weights, weight_updates) = stepped.next().expect("weights result");
             if opts.clip > 0.0 {
                 raw_weights = self
                     .backend
                     .constrain_f32(&raw_weights, &weight_shape, opts.clip, config)
                     .map_err(|err| backend_error("GPU weight clip", err))?;
             }
-            let (raw_biases, bias_updates) = gpu_optimizer_step(
-                &self.backend,
-                &layer_step,
-                false,
-                &cached.raw_biases,
-                &train.bias_updates,
-                &mut moments.biases,
-                &[filters],
-                config,
-            )?;
-            let (new_scales, scale_updates) = self.update_gpu_batch_norm_scales(
-                cached.bn.as_ref().map(|bn| &bn.scales),
-                filters,
-                train.scale_updates,
-                &layer_step,
-                &mut moments.scales,
-                config,
-            )?;
+            let (raw_biases, bias_updates) = stepped.next().expect("biases result");
+            let (new_scales, scale_updates) = match stepped.next() {
+                Some((w, u)) => (Some(w), Some(u)),
+                None => (None, None),
+            };
             self.adam_state[owner] = Some(moments);
 
             let refreshed = self.refresh_device_convolution_params(
@@ -4031,20 +4109,17 @@ where
                             launch_config,
                         )
                         .map_err(|err| backend_error("convolution", err))?;
-                    let biased = self
-                        .backend
-                        .bias_add_f32(
+                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+                    self.backend
+                        .bias_activation_f32(
                             &conv_output,
                             &cached.biases,
                             spec.filters,
                             layer.output_shape.width * layer.output_shape.height,
+                            activation,
                             launch_config,
                         )
-                        .map_err(|err| backend_error("convolution bias add", err))?;
-                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
-                    self.backend
-                        .activation_f32(&biased, activation, launch_config)
-                        .map_err(|err| backend_error("convolution activation", err))?
+                        .map_err(|err| backend_error("convolution bias + activation", err))?
                 }
                 (LayerKind::MaxPool(spec), LayerParams::None) => {
                     if layer.output_shape.channels != layer.input_shape.channels {
@@ -5099,6 +5174,25 @@ where
                 "missing GPU train buffers for layer #{owner}"
             )));
         };
+        if self.defer_host_sync && scale_grad.is_some() == train.scale_updates.is_some() {
+            // Keep this gradient pending: the optimizer step adds it to the
+            // accumulators in its own launch.  An earlier pending gradient (a
+            // subdivision) is added first, so the summation order is unchanged.
+            let mut train = train;
+            if let Some(pending) = train.pending.take() {
+                let flushed = self.flush_pending_grads(&train, &pending)?;
+                train.weight_updates = flushed.0;
+                train.bias_updates = flushed.1;
+                train.scale_updates = flushed.2;
+            }
+            train.pending = Some(GpuPendingGrads {
+                weights: weight_grad,
+                biases: bias_grad,
+                scales: scale_grad,
+            });
+            self.device_train_buffers.borrow_mut()[owner] = Some(train);
+            return Ok(());
+        }
         let weight_updates = self
             .backend
             .saxpy_f32(
@@ -5142,8 +5236,40 @@ where
             weight_updates,
             bias_updates,
             scale_updates,
+            pending: None,
         });
         Ok(())
+    }
+
+    /// `updates + pending` for every tensor (the accumulate launches the fused
+    /// optimizer step skips).
+    #[allow(clippy::type_complexity)]
+    fn flush_pending_grads(
+        &self,
+        train: &GpuConvolutionTrainBuffers<B::Tensor>,
+        pending: &GpuPendingGrads<B::Tensor>,
+    ) -> Result<(B::Tensor, B::Tensor, Option<B::Tensor>)> {
+        let config = ElementwiseLaunchConfig::default();
+        let add = |grad: &B::Tensor, acc: &B::Tensor| {
+            self.backend
+                .saxpy_f32(1.0, grad, acc, config)
+                .map_err(|err| backend_error("GPU gradient accumulation", err))
+        };
+        let scales = match (&pending.scales, &train.scale_updates) {
+            (Some(g), Some(acc)) => Some(add(g, acc)?),
+            (None, acc) => acc.clone(),
+            (Some(_), None) => {
+                return Err(Error::InvalidConfig(
+                    "pending batch-norm scale gradient for a layer without scale updates"
+                        .to_owned(),
+                ));
+            }
+        };
+        Ok((
+            add(&pending.weights, &train.weight_updates)?,
+            add(&pending.biases, &train.bias_updates)?,
+            scales,
+        ))
     }
 
     fn batch_norm_scale_gradient_gpu(
@@ -5198,40 +5324,6 @@ where
             .upload_f32(&[output_shape.channels], &scale_grad)
             .map_err(|err| backend_error("upload GPU batch-norm scale gradient", err))?;
         Ok(scale_grad)
-    }
-
-    /// Optimizer step of the device-resident BN gamma.  Returns the new gamma
-    /// and the new (accumulated) scale updates; `None` for non-BN layers.
-    fn update_gpu_batch_norm_scales(
-        &self,
-        scales: Option<&B::Tensor>,
-        channels: usize,
-        scale_updates: Option<B::Tensor>,
-        step: &GpuOptimizerStep,
-        moments: &mut Option<GpuMoments<B::Tensor>>,
-        config: ElementwiseLaunchConfig,
-    ) -> Result<(Option<B::Tensor>, Option<B::Tensor>)> {
-        let Some(scale_updates) = scale_updates else {
-            return Ok((None, None));
-        };
-        let Some(scales) = scales else {
-            return Err(Error::InvalidConfig(
-                "GPU batch-norm scale updates exist for a layer without device BN state"
-                    .to_owned(),
-            ));
-        };
-        let shape = [channels];
-        let (updated_scales, updated_scale_updates) = gpu_optimizer_step(
-            &self.backend,
-            step,
-            false,
-            scales,
-            &scale_updates,
-            moments,
-            &shape,
-            config,
-        )?;
-        Ok((Some(updated_scales), Some(updated_scale_updates)))
     }
 
     fn update_gpu_convolution_batch_norm_running_stats(
@@ -5595,6 +5687,7 @@ where
             weight_updates,
             bias_updates,
             scale_updates,
+            pending: None,
         });
         Ok(refreshed)
     }

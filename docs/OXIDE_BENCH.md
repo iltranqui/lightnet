@@ -239,6 +239,31 @@ nsys (13 steps, per step): b1 launches 690 -> 589, cuMemcpyDtoH 80 -> ~2 steady 
 Correctness (no training run): `DARKNET_PARITY_DUMP` of biases, BN gamma / BN bias / rolling mean / rolling variance and weights after steps 1 and 5, batch 2, same init / input / seeds (the step is deterministic: two before runs are byte-identical): before vs after files are byte-identical for f32 and for AMP, and the two yolo head outputs are identical. New tests in `oxide_batchnorm_adam.rs`: fused SGD / Adam bit-identical to the separate launches (with NaN / Inf in updates and weights, `fix_weights` on and off), device BN fold vs the host fold (1e-6). All oxide suites pass individually and in the full run, `cargo test -p darknet-core --lib`: 119 passed.
 Not done: CUDA graph capture. `cuda-core 0.3.1` only exposes raw `cuStreamBeginCapture` / `cuStreamEndCapture` (no instantiate / launch wrapper), and a replayable graph needs static buffer addresses (the step allocates from the pool, downloads the yolo heads for the host loss between forward and backward, and bakes lr / Adam step into kernel arguments), so it is not a cheap change. Next launch cuts if wanted: one multi-tensor update launch per layer (-40 launches, about 0.5 ms), fold of the gradient accumulation (`saxpy`, 61 launches) into the update kernel, a fused conv bias + BN + activation epilogue. Remaining host cost at b1: 589 launches x ~16 us = 9 ms of the 12 ms step.
 
+### 7.4 Multi-tensor update, folded gradient accumulation, fused bias + activation (2026-10-01)
+
+Same driver as 7.1 / 7.3 (`bench-train`, LegoGears_v2, 20 steps after 3 warm-up, 3 interleaved rounds, previous binary vs new binary, oxide f32). Inference: `detect-image` (the command `tools/oxide_bench.py --suites e2e` runs), 100 iterations, 3 interleaved rounds, median of the last 90 iterations per round.
+Changes (all bit-exact, only measured wins kept):
+1. Multi-tensor update: `sanitized_sgd_update_multi_f32` / `sanitized_adam_update_multi_f32` (defaulted trait methods = per-tensor composition) with a oxide override `sanitized_{sgd,adam}_update3`: one launch per layer for weights + biases + BN scales (thread `i` of the concatenation picks its segment; per-segment decay / `fix_weights`; the three outputs are separate tensors, so no copies). 2-3 launches per layer become 1.
+2. Folded gradient accumulation: on the deferred training path the backward no longer runs three `saxpy` per conv layer; the gradient is kept as `pending` in the layer's train buffers and the update kernel computes `u + g` itself (the same addition, so the same bits). A second backward before the update (subdivisions) first flushes the earlier pending gradient with a `saxpy`, so the order is `(u + g1) + g2` as before. `grad_centr` layers flush their weight gradient first. Eager `update_weights_gpu` and every non-deferred reader still see accumulated buffers (nothing is pending there).
+3. Fused inference epilogue: `bias_activation_f32` (default = `bias_add` then `activation`; oxide kernel `bias_activation` does `activate(x + bias[c])`) used by `forward_compact` (BN is already folded into weights / bias there). Saves one launch and one activation-sized allocation per conv layer.
+
+| step (round medians) | before | after |
+|---|---|---|
+| train b1 total | 11.1 (11.1 / 10.8 / 11.5) ms | 9.6 (9.4 / 9.6 / 9.9) ms (-14%) |
+| train b1 update phase | 0.72 ms | 0.35 ms |
+| train b16 total | 63.7 (63.4 / 64.4 / 63.7) ms | 62.4 (60.7 / 65.8 / 62.4) ms (-2%, within the noise of the rounds) |
+| train b16 update phase | 0.9 ms | 0.5 ms |
+| train launches / step (b1, nsys, 13 steps) | 589 | 492.7 (about 97 fewer: -61 saxpy, -36 update); kernel time 5.94 -> 5.73 ms |
+| inference b1 fp32 | 2.27 (2.49 / 2.27 / 2.21) ms | 1.96 (1.96 / 2.03 / 1.91) ms (-14%) |
+| inference b1 tf32 | 2.36 (2.23 / 2.36 / 2.49) ms | 1.95 (2.06 / 1.95 / 1.93) ms (-17%) |
+| inference b16 fp32 | 14.76 (14.68 / 14.84 / 14.76) ms | 14.59 (14.57 / 14.71 / 14.59) ms (-1%) |
+| inference b16 tf32 | 10.72 (10.65 / 11.01 / 10.72) ms | 10.51 (10.51 / 10.49 / 10.58) ms (-2%) |
+| inference device memory delta b1 / b16 | 18 / 208 MB | 16 / 168 MB |
+
+Inference b1 is launch bound, so the saved launches show (about 0.35 ms); b16 is kernel bound and moves by 1-2%. The f16 inference path already had the fused epilogue and is untouched.
+Correctness (no training run): `DARKNET_PARITY_DUMP` after steps 1 and 5, batch 2, same init / input / seeds / deltas, previous binary vs new binary: biases, BN gamma / bias, rolling mean / variance, weights and both yolo head outputs are byte-identical for SGD (f32 GEMM), AMP and Adam (`adam=1`). Detections of the 80 validation images (`tools/oxide_map.py --save-detections`, fp32): mAP 99.6685%, `oxide_det_compare.py` vs `target/oxide_f16/det_fp32.tsv` 155 matched, 0 unmatched, max score diff 0, min IoU 1. New tests in `oxide_batchnorm_adam.rs`: multi-tensor SGD / Adam (1-3 tensors, with and without pending gradient, NaN / Inf inputs, coupled and decoupled decay) bit-identical to the per-tensor calls, fused bias + activation bit-identical for all nine activations. All oxide suites pass individually and in the full run; `cargo test -p darknet-core --lib`: 125 passed.
+Not done: fusing BN apply + activation in the training forward (the backward needs the pre-activation tensor `biased`, so the fused kernel would have to write both outputs, which saves the read but not the launch's second store; BN statistics need their own pass anyway); the conv GEMM epilogue itself (bias + activation inside the f32 GEMM store like the f16 path) was not attempted, the standalone fused pass is already one launch. A subdivision > 1 run was verified only at the kernel level (pending gradient folded in the multi-tensor kernels, flush order by construction), not end to end. CUDA graph capture stays skipped (7.3).
+
 ## Gradient-method shootout (2026-10-01)
 
 Harness: `bridges/darknet-cuda-oxide/tests/oxide_grad_methods.rs` (`grad_method_shootout`, ignored; a tiny-shape version of the same

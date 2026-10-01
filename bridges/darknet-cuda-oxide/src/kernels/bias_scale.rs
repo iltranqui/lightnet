@@ -28,6 +28,24 @@ pub mod kernels {
         }
     }
 
+    /// out[i] = activate(kind, x[i] + bias[channel(i)])  (bias_add + activation fused).
+    #[kernel]
+    pub fn bias_activation(
+        x: &[f32],
+        bias: &[f32],
+        mut out: DisjointSlice<f32>,
+        channels: usize,
+        channel_stride: usize,
+        kind: u32,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = out.get_mut(idx) {
+            let v = x[i] + bias[(i / channel_stride) % channels];
+            *o = crate::kernels::activations::activate(kind, v);
+        }
+    }
+
     /// out[i] = x[i] * scale[channel(i)]
     #[kernel]
     pub fn channel_scale(

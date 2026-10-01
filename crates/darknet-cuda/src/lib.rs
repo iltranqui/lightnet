@@ -40,6 +40,35 @@ pub struct BatchNormTrainForward<T> {
     pub rolling_variance: T,
 }
 
+/// One tensor of a multi-tensor SGD step (see
+/// [`F32TensorOpsBackend::sanitized_sgd_update_multi_f32`]).
+#[derive(Clone, Debug)]
+pub struct SgdUpdateItem<'a, T> {
+    pub weights: &'a T,
+    pub updates: &'a T,
+    /// A not yet accumulated gradient: the step uses `updates + grad`
+    /// (exactly `saxpy_f32(1.0, grad, updates)` first).
+    pub grad: Option<&'a T>,
+    pub shape: &'a [usize],
+    pub fix_weights: bool,
+    /// Weight decay (0 for biases / BN scales).
+    pub decay: f32,
+}
+
+/// One tensor of a multi-tensor Adam step (see
+/// [`F32TensorOpsBackend::sanitized_adam_update_multi_f32`]).
+#[derive(Clone, Debug)]
+pub struct AdamUpdateItem<'a, T> {
+    pub weights: &'a T,
+    pub updates: &'a T,
+    pub grad: Option<&'a T>,
+    pub m: &'a T,
+    pub v: &'a T,
+    pub shape: &'a [usize],
+    pub fix_weights: bool,
+    pub params: AdamParams,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScalarType {
     F16,
@@ -174,6 +203,20 @@ pub trait F32TensorOpsBackend {
         activation: F32ActivationKind,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error>;
+    /// `activation(bias_add(x, bias))` (inference epilogue).  Backends may
+    /// fuse it into one launch; the result must equal the composition below.
+    fn bias_activation_f32(
+        &self,
+        x: &Self::Tensor,
+        bias: &Self::Tensor,
+        channels: usize,
+        channel_stride: usize,
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let biased = self.bias_add_f32(x, bias, channels, channel_stride, config)?;
+        self.activation_f32(&biased, activation, config)
+    }
     fn activation_backward_f32(
         &self,
         activation_input: &Self::Tensor,
@@ -831,6 +874,75 @@ pub trait F32TensorOpsBackend {
         };
         let (w, m, v) = self.adam_update_f32(&w, &u, m, v, params, config)?;
         Ok((w, m, v, self.zeros_f32(shape)?))
+    }
+
+    /// [`Self::sanitized_sgd_update_f32`] over several tensors (one layer's
+    /// weights, biases and BN scales), in the same order as `items`; results
+    /// are bit-identical to per-tensor calls.  Backends may do it in one launch.
+    fn sanitized_sgd_update_multi_f32(
+        &self,
+        items: &[SgdUpdateItem<'_, Self::Tensor>],
+        lr: f32,
+        momentum: f32,
+        batch: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Vec<(Self::Tensor, Self::Tensor)>, Self::Error> {
+        items
+            .iter()
+            .map(|it| {
+                let acc;
+                let updates = match it.grad {
+                    Some(g) => {
+                        acc = self.saxpy_f32(1.0, g, it.updates, config)?;
+                        &acc
+                    }
+                    None => it.updates,
+                };
+                self.sanitized_sgd_update_f32(
+                    it.weights,
+                    updates,
+                    it.shape,
+                    it.fix_weights,
+                    lr,
+                    momentum,
+                    it.decay,
+                    batch,
+                    config,
+                )
+            })
+            .collect()
+    }
+
+    /// [`Self::sanitized_adam_update_f32`] over several tensors; returns
+    /// `(weights', m', v', zeroed updates)` per item.
+    fn sanitized_adam_update_multi_f32(
+        &self,
+        items: &[AdamUpdateItem<'_, Self::Tensor>],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Vec<(Self::Tensor, Self::Tensor, Self::Tensor, Self::Tensor)>, Self::Error> {
+        items
+            .iter()
+            .map(|it| {
+                let acc;
+                let updates = match it.grad {
+                    Some(g) => {
+                        acc = self.saxpy_f32(1.0, g, it.updates, config)?;
+                        &acc
+                    }
+                    None => it.updates,
+                };
+                self.sanitized_adam_update_f32(
+                    it.weights,
+                    updates,
+                    it.m,
+                    it.v,
+                    it.shape,
+                    it.fix_weights,
+                    &it.params,
+                    config,
+                )
+            })
+            .collect()
     }
 
     /// Per-channel inference fold of batch norm: `scale = gamma / sqrt(var + eps)`
