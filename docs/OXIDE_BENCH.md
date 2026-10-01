@@ -469,3 +469,19 @@ RUSTUP_TOOLCHAIN=nightly-2026-08-28 target/debug/cargo-oxide oxide test -- --man
 DARKNET_BACKEND=oxide DARKNET_BENCH_ITERS=30 nsys profile --stats=false -o nsys target/release/darknet-rs detect-image <cfg> <weights> <names> <png> 0.25 0.45 resize-exact
 nsys stats -r cuda_gpu_kern_sum nsys.nsys-rep
 ```
+
+## 9. P9 convergence run (LegoGears_v2, 3000 iterations, 2026-10-02)
+
+Same cfg (batch 16, subdivisions 1, max_batches 3000, burn_in 1000, steps 2400/2700) and the same init weights (`LegoGears_augmatch_best.weights`) for all three runs, each `-clear -seed 42` (C++ `-clear`), isolated backup dirs, the same 80 train / 80 valid images, mAP at conf 0.005 / IoU 0.5 (`-map` in the Rust CLI, `detector map` for C++). Training ran with `DARKNET_BACKEND=oxide`; C++ is the CUDA build (`build/src-cli/darknet`, cuDNN half ENABLED).
+
+| run | build | median step | last loss | final mAP@0.50 |
+| --- | --- | --- | --- | --- |
+| oxide f32 | debug | 129.1 ms | 0.0296 | 100.0000% |
+| oxide AMP (`DARKNET_OXIDE_AMP=1`) | debug | 113.0 ms | 0.0319 | 100.0000% |
+| C++ CUDA (cudnn_half=1) | build/src-cli/darknet | ~40-50 ms train + ~10 ms load | 0.019 | 100.0000% |
+
+Acceptance ("final mAP within ~0.5 mAP") is satisfied: every run reaches 100.0000% mAP@0.50 with all five per-class APs at 100.00. Data order and augmentation RNG are not bit-identical to C++ (deterministic SplitMix64 vs C++ `std::random`; the augmentation geometry/HSV path is validated to 1 LSB against OpenCV), so the loss curves differ in detail (oxide average loss ~0.041 vs C++ ~0.021, both decreasing and ending near zero); the final mAP is identical at the resolution this 80-image set provides.
+
+Step time: oxide debug median 129 ms (f32) / 113 ms (AMP) vs C++ ~50-60 ms including loading. The oxide figure is the debug profile (no release run in this pass) and includes the per-layer host round trips during training described in section 7. This validates the new P9 trainer plumbing end to end: `<name>_loss.csv`, `<name>_map.csv`, `chart.png`, `_last.weights` (with `-save_every`), the Adam resume sidecar `<name>_optimizer.state`, and resume from `_last.weights` (a 30-step run resumed at iteration 31 from `seen=480`).
+
+Deferred from the "go full" scope in this pass (documented in `tasks/rust/todo.md`): mosaic/cutmix, background loader prefetch, weighted shortcut, `reverse`/`deform` conv, device connected/SAM/recurrent backward + Adam with host-fallback layers, adversarial yolo, implicit-GEMM conv, f32 GEMM epilogue.
