@@ -286,6 +286,9 @@ pub struct MaxPoolSpec {
     pub stride_y: usize,
     pub padding: usize,
     pub out_channels: usize,
+    /// C++ `zero_nonmax`: during backward, zero the input delta at every
+    /// position that was not an argmax of the pooling window.
+    pub zero_nonmax: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1147,6 +1150,7 @@ fn parse_layer_kind(
                 stride_y: section.get_usize("stride_y", stride)?,
                 padding: section.get_usize("padding", size.saturating_sub(1))?,
                 out_channels: section.get_usize("out_channels", current.channels)?,
+                zero_nonmax: section.get_bool_int("zero_nonmax", false)?,
             })
         }
         "local_avg" | "local_avgpool" => {
@@ -1158,6 +1162,7 @@ fn parse_layer_kind(
                 stride_y: section.get_usize("stride_y", stride)?,
                 padding: section.get_usize("padding", size.saturating_sub(1))?,
                 out_channels: current.channels,
+                zero_nonmax: false,
             })
         }
         "avg" | "avgpool" => LayerKind::AvgPool,

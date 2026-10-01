@@ -898,6 +898,9 @@ struct TrainOptions {
     map_iou: f32,
     /// Iterations between periodic checkpoints. Also controls `<name>_last.weights`.
     save_every: usize,
+    /// Dynamic loss scaling on the oxide training path: halve on non-finite
+    /// gradients (skipping the step) and double after a long finite streak.
+    dynamic_loss_scale: bool,
 }
 
 impl TrainOptions {
@@ -917,6 +920,7 @@ impl TrainOptions {
             map_thresh: 0.005,
             map_iou: 0.5,
             save_every: 1000,
+            dynamic_loss_scale: false,
         };
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -937,6 +941,7 @@ impl TrainOptions {
                     options.gpu = true;
                 }
                 "-map" => options.map = true,
+                "-dyn_scale" | "--dynamic_loss_scale" => options.dynamic_loss_scale = true,
                 "-save_every" | "--save_every" => {
                     let value = required_arg(args.next(), "save interval")?;
                     let interval = value
@@ -1346,7 +1351,7 @@ fn run_detector_train_cpu(
         println!("-clear: reset seen and iteration");
     }
 
-    let mut train_images = load_paths_file(data_config.required_train_list()?)?;
+    let train_images = load_paths_file(data_config.required_train_list()?)?;
     println!(
         "loaded {} images from {}",
         train_images.len(),
@@ -1389,10 +1394,16 @@ fn run_detector_train_cpu(
     )?;
     let mut yolo_state = YoloTrainingState::default();
     let mut progress = TrainingProgress::new(batch_num);
+    let mut epoch = if train_images.is_empty() {
+        0usize
+    } else {
+        (seen as usize) / train_images.len()
+    };
+    let mut epoch_images = epoch_order(&train_images, options.seed, epoch);
     let mut image_cursor = if train_images.is_empty() {
         0usize
     } else {
-        (batch_num * images_per_iteration) % train_images.len()
+        (seen as usize) % train_images.len()
     };
     let mut loss_log = TrainingLossLog::new(&backup_dir, &base_name)?;
 
@@ -1424,7 +1435,7 @@ fn run_detector_train_cpu(
             let batch = load_augmented_training_batch_from_paths(
                 &executable.network,
                 &data_config,
-                &train_images,
+                &epoch_images,
                 start_index,
                 &augmentation,
                 options.seed,
@@ -1458,7 +1469,8 @@ fn run_detector_train_cpu(
         seen += images_per_iteration as u64;
         image_cursor += images_per_iteration;
         if image_cursor >= train_images.len() {
-            shuffle_paths(&mut train_images, batch_num as u64 + 1);
+            epoch += 1;
+            epoch_images = epoch_order(&train_images, options.seed, epoch);
             image_cursor %= train_images.len();
         }
 
@@ -1575,7 +1587,7 @@ fn run_detector_train_gpu(
     executable.init_train_buffers_gpu()?;
     println!("allocated GPU params and train buffers");
 
-    let mut train_images = load_paths_file(data_config.required_train_list()?)?;
+    let train_images = load_paths_file(data_config.required_train_list()?)?;
     println!(
         "loaded {} images from {}",
         train_images.len(),
@@ -1609,6 +1621,7 @@ fn run_detector_train_gpu(
             optimizer_state_path.display()
         );
     }
+    let mut loss_scale_growth = 0u32;
     let images_per_iteration =
         executable.network.net.batch.max(1) * executable.network.net.subdivisions.max(1);
     let mut batch_num = if images_per_iteration == 0 {
@@ -1629,10 +1642,16 @@ fn run_detector_train_gpu(
     )?;
     let mut yolo_state = YoloTrainingState::default();
     let mut progress = TrainingProgress::new(batch_num);
+    let mut epoch = if train_images.is_empty() {
+        0usize
+    } else {
+        (seen as usize) / train_images.len()
+    };
+    let mut epoch_images = epoch_order(&train_images, options.seed, epoch);
     let mut image_cursor = if train_images.is_empty() {
         0usize
     } else {
-        (batch_num * images_per_iteration) % train_images.len()
+        (seen as usize) % train_images.len()
     };
     let mut loss_log = TrainingLossLog::new(&backup_dir, &base_name)?;
 
@@ -1668,7 +1687,7 @@ fn run_detector_train_gpu(
             let batch = load_augmented_training_batch_from_paths(
                 &executable.network,
                 &data_config,
-                &train_images,
+                &epoch_images,
                 start_index,
                 &augmentation,
                 options.seed,
@@ -1686,20 +1705,39 @@ fn run_detector_train_gpu(
             executable
                 .backward_accumulate_seeded_gpu(&forward, &yolo.layer_output_gradient_seeds)?;
         }
-        executable.update_weights_gpu_deferred(
-            lr,
-            executable.network.net.momentum,
-            executable.network.net.decay,
-            // C++ update_network: batch * subdivisions (gradients are summed
-            // over every subdivision before the step).
-            images_per_iteration,
-        )?;
+        if options.dynamic_loss_scale && executable.gradients_non_finite()? {
+            // Overflow: drop the accumulated gradients, skip the step and
+            // halve the scale so the next backward stays representable.
+            executable.zero_train_buffers_gpu()?;
+            let next = (executable.loss_scale() * 0.5).max(1.0);
+            executable.set_loss_scale(next);
+            loss_scale_growth = 0;
+            println!("{batch_num}: non-finite gradients; loss scale -> {next}");
+        } else {
+            executable.update_weights_gpu_deferred(
+                lr,
+                executable.network.net.momentum,
+                executable.network.net.decay,
+                // C++ update_network: batch * subdivisions (gradients are summed
+                // over every subdivision before the step).
+                images_per_iteration,
+            )?;
+            if options.dynamic_loss_scale {
+                loss_scale_growth += 1;
+                if loss_scale_growth >= 1000 && executable.loss_scale() < 65536.0 {
+                    let next = executable.loss_scale() * 2.0;
+                    executable.set_loss_scale(next);
+                    loss_scale_growth = 0;
+                }
+            }
+        }
 
         batch_num += 1;
         seen += images_per_iteration as u64;
         image_cursor += images_per_iteration;
         if image_cursor >= train_images.len() {
-            shuffle_paths(&mut train_images, batch_num as u64 + 1);
+            epoch += 1;
+            epoch_images = epoch_order(&train_images, options.seed, epoch);
             image_cursor %= train_images.len();
         }
 
@@ -1970,6 +2008,15 @@ fn shuffle_paths(paths: &mut [PathBuf], seed: u64) {
     }
 }
 
+/// Deterministic per-epoch ordering so a resumed run replays the exact sample
+/// order: the permutation depends only on (`seed`, epoch), not on how many
+/// epochs were shuffled before it.
+fn epoch_order(paths: &[PathBuf], seed: u64, epoch: usize) -> Vec<PathBuf> {
+    let mut order = paths.to_vec();
+    shuffle_paths(&mut order, seed ^ (epoch as u64).wrapping_mul(0xD1B5_4A32_D192_ED03));
+    order
+}
+
 #[cfg(test)]
 mod tests {
     use super::{MapSchedule, TrainOptions, classify_detector_train_paths};
@@ -2003,6 +2050,7 @@ mod tests {
                 map_thresh: 0.005,
                 map_iou: 0.5,
                 save_every: 1000,
+                dynamic_loss_scale: false,
             }
         );
         assert_eq!(options(&[]).unwrap().seed, 0);
@@ -2071,6 +2119,20 @@ mod tests {
         assert_eq!(parsed.weights.as_deref(), Some("model.weights"));
         assert!(options(&["-save_every", "0"]).is_err());
         assert!(options(&["-save_every"]).is_err());
+    }
+
+    #[test]
+    fn epoch_order_is_resumable_and_seed_dependent() {
+        use super::epoch_order;
+        let paths: Vec<std::path::PathBuf> = (0..8)
+            .map(|i| std::path::PathBuf::from(format!("{i}.png")))
+            .collect();
+        assert_eq!(epoch_order(&paths, 42, 0), epoch_order(&paths, 42, 0));
+        assert_ne!(epoch_order(&paths, 42, 0), epoch_order(&paths, 42, 1));
+        assert_ne!(epoch_order(&paths, 42, 0), epoch_order(&paths, 7, 0));
+        let mut sorted = epoch_order(&paths, 42, 3);
+        sorted.sort();
+        assert_eq!(sorted, paths);
     }
 
     #[test]

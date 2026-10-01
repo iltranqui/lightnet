@@ -1350,6 +1350,7 @@ impl ExecutableNetwork {
                         current_input,
                         &grad,
                         false,
+                        spec.zero_nonmax,
                     )?;
                     accumulate_previous_gradient(
                         layer.index,
@@ -1367,6 +1368,7 @@ impl ExecutableNetwork {
                         current_input,
                         &grad,
                         true,
+                        false,
                     )?;
                     accumulate_previous_gradient(
                         layer.index,
@@ -2787,6 +2789,68 @@ where
     /// part of the weights file and restart from zero.
     pub fn set_adam_step(&mut self, step: u32) {
         self.adam_step = step;
+    }
+
+    /// Loss scale applied to the yolo seed gradients before backward.
+    pub fn loss_scale(&self) -> f32 {
+        self.network.net.loss_scale
+    }
+
+    /// Update the loss scale (dynamic loss scaling).  Values are applied to the
+    /// next backward and divided back out of the next optimizer step.
+    pub fn set_loss_scale(&mut self, scale: f32) {
+        if scale.is_finite() && scale > 0.0 {
+            self.network.net.loss_scale = scale;
+        }
+    }
+
+    /// True if any device-resident convolution weight/bias/scale gradient is
+    /// non-finite, used by dynamic loss scaling to detect overflow before the
+    /// optimizer step.  Host-fallback layers are not inspected.
+    pub fn gradients_non_finite(&self) -> Result<bool> {
+        for entry in self.device_train_buffers.borrow().iter().flatten() {
+            if self
+                .backend
+                .any_non_finite_f32(&entry.weight_updates)
+                .map_err(|err| backend_error("gradient finiteness check", err))?
+                || self
+                    .backend
+                    .any_non_finite_f32(&entry.bias_updates)
+                    .map_err(|err| backend_error("gradient finiteness check", err))?
+            {
+                return Ok(true);
+            }
+            if let Some(scales) = &entry.scale_updates
+                && self
+                    .backend
+                    .any_non_finite_f32(scales)
+                    .map_err(|err| backend_error("gradient finiteness check", err))?
+            {
+                return Ok(true);
+            }
+            if let Some(pending) = &entry.pending {
+                if self
+                    .backend
+                    .any_non_finite_f32(&pending.weights)
+                    .map_err(|err| backend_error("gradient finiteness check", err))?
+                    || self
+                        .backend
+                        .any_non_finite_f32(&pending.biases)
+                        .map_err(|err| backend_error("gradient finiteness check", err))?
+                {
+                    return Ok(true);
+                }
+                if let Some(scales) = &pending.scales
+                    && self
+                        .backend
+                        .any_non_finite_f32(scales)
+                        .map_err(|err| backend_error("gradient finiteness check", err))?
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Persist the Adam step counter and per-owner moment tensors to a sidecar
@@ -5294,6 +5358,12 @@ where
             if let LayerKind::ScaleChannels(spec) = &layer.kind
                 && spec.activation.to_cuda_f32_kind().is_none()
             {
+                return true;
+            }
+            if let LayerKind::MaxPool(spec) = &layer.kind
+                && spec.zero_nonmax
+            {
+                // No device kernel for the non-argmax zeroing yet.
                 return true;
             }
             false
@@ -10015,8 +10085,10 @@ fn backward_maxpool(
     input: &Tensor,
     output_gradient: &Tensor,
     average: bool,
+    zero_nonmax: bool,
 ) -> Result<Tensor> {
     let mut input_grad = Tensor::zeros(input.shape);
+    let mut is_max = vec![false; input.data.len()];
     for b in 0..input.shape.batch {
         for c in 0..input.shape.channels {
             for oy in 0..output_gradient.shape.height {
@@ -10073,9 +10145,17 @@ fn backward_maxpool(
                         if let Some((y, x)) = best {
                             let idx = input.offset(b, c, y, x);
                             input_grad.data[idx] += grad_value;
+                            is_max[idx] = true;
                         }
                     }
                 }
+            }
+        }
+    }
+    if zero_nonmax && !average {
+        for (index, chosen) in is_max.iter().enumerate() {
+            if !*chosen {
+                input_grad.data[index] = 0.0;
             }
         }
     }
@@ -11677,6 +11757,7 @@ mod tests {
                 &input,
                 &output_grad,
                 true,
+                false,
             )
             .map_err(|err| err.to_string())?;
             Ok(FakeTensor {
@@ -12996,6 +13077,26 @@ mod tests {
             input_grad.data,
             vec![0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0]
         );
+    }
+
+    #[test]
+    fn maxpool_zero_nonmax_zeroes_non_argmax_inputs() {
+        let input = Tensor::from_data(
+            TensorShape::new(3, 3, 1, 1),
+            vec![1.0, 2.0, 1.0, 0.0, 3.0, 0.0, 1.0, 2.0, 1.0],
+        )
+        .expect("input");
+        let mut grad = Tensor::zeros(TensorShape::new(2, 2, 1, 1));
+        for (i, value) in grad.data.iter_mut().enumerate() {
+            *value = (i + 1) as f32;
+        }
+        let exact = super::backward_maxpool(2, 1, 1, 0, &input, &grad, false, false).unwrap();
+        let zeroed = super::backward_maxpool(2, 1, 1, 0, &input, &grad, false, true).unwrap();
+        // Every window's argmax is the centre (1,1) -> flat index 4.
+        assert_eq!(zeroed.data[4], exact.data[4]);
+        for index in [0usize, 1, 2, 3, 5, 6, 7, 8] {
+            assert_eq!(zeroed.data[index], 0.0, "index {index}");
+        }
     }
 
     #[test]
@@ -16548,6 +16649,33 @@ mod tests {
         assert!(w.iter().chain(&b).all(|x| x.is_finite()));
         let train = gpu.device_train_buffers.borrow()[1].clone().expect("train");
         assert!(train.weight_updates.data.iter().chain(&train.bias_updates.data).all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn loss_scale_helpers_and_non_finite_detection() {
+        let mut gpu = optimizer_net("adam=1\nloss_scale=8\n");
+        assert_eq!(gpu.loss_scale(), 8.0);
+        gpu.set_loss_scale(4.0);
+        assert_eq!(gpu.loss_scale(), 4.0);
+        let input = patterned_input(gpu.network.net.input_shape());
+        let forward = gpu.forward_training_with_state(&input).expect("forward");
+        let seeds = optimizer_seeds(&gpu, 1);
+        gpu.backward_accumulate_seeded_gpu(&forward, &seeds)
+            .expect("backward");
+        assert!(!gpu.gradients_non_finite().expect("finite check"));
+        {
+            let mut buffers = gpu.device_train_buffers.borrow_mut();
+            let train = buffers[0].as_mut().expect("train buffer");
+            let mut data = gpu.backend.download_f32(&train.weight_updates).expect("download");
+            data[0] = f32::INFINITY;
+            train.weight_updates = gpu
+                .backend
+                .upload_f32(&[data.len()], &data)
+                .expect("upload");
+        }
+        assert!(gpu.gradients_non_finite().expect("finite check"));
+        gpu.set_loss_scale(0.0);
+        assert_eq!(gpu.loss_scale(), 4.0);
     }
 
     #[test]

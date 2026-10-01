@@ -13,7 +13,7 @@
 //! head): AMP gradients vs f32 gradients, and a few synthetic SGD steps with f32
 //! master weights.  No dataset, no real training.
 
-use darknet_cuda::{ElementwiseLaunchConfig, F32ActivationKind, F32TensorOpsBackend};
+use darknet_cuda::{AdamParams, ElementwiseLaunchConfig, F32ActivationKind, F32TensorOpsBackend};
 use darknet_cuda_oxide::half::{f16_bits_to_f32, f32_to_f16_bits};
 use darknet_cuda_oxide::{GemmMode, OxideBackend, OxideTensorF32};
 
@@ -830,7 +830,6 @@ fn sgd_run(be: &OxideBackend, p0: &Params, x: &[f32], target: &[f32], steps: usi
 /// travelled (per tensor, inf-norm), i.e. the AMP trajectory is the f32
 /// trajectory up to f16 rounding noise.
 const SGD_TRACK_BOUND: f64 = 0.10;
-
 #[test]
 fn amp_sgd_steps_track_f32_master_weights() {
     let amp = amp_backend();
@@ -868,4 +867,140 @@ fn amp_sgd_steps_track_f32_master_weights() {
         worst = worst.max(ratio);
     }
     println!("sgd worst tracking ratio {worst:.3e} (bound {SGD_TRACK_BOUND})");
+}
+
+/// Adam with f32 master weights over `steps` fixed-batch steps.
+fn adam_run(
+    be: &OxideBackend,
+    p0: &Params,
+    x: &[f32],
+    target: &[f32],
+    steps: usize,
+    loss_scale: f32,
+) -> (Vec<Vec<Vec<f32>>>, Vec<f64>) {
+    let cp = |t: &OxideTensorF32| up(be, t.shape(), &down(be, t));
+    let mut p = Params {
+        w: std::array::from_fn(|i| cp(&p0.w[i])),
+        bn_scale: std::array::from_fn(|i| cp(&p0.bn_scale[i])),
+        bn_bias: std::array::from_fn(|i| cp(&p0.bn_bias[i])),
+        rm: std::array::from_fn(|i| cp(&p0.rm[i])),
+        rv: std::array::from_fn(|i| cp(&p0.rv[i])),
+        head_bias: cp(&p0.head_bias),
+    };
+    let mut m_w: [OxideTensorF32; 4] = std::array::from_fn(|i| be.zeros_f32(p.w[i].shape()).unwrap());
+    let mut v_w: [OxideTensorF32; 4] = std::array::from_fn(|i| be.zeros_f32(p.w[i].shape()).unwrap());
+    let mut m_s: [OxideTensorF32; 3] = std::array::from_fn(|_| be.zeros_f32(&[8]).unwrap());
+    let mut v_s: [OxideTensorF32; 3] = std::array::from_fn(|_| be.zeros_f32(&[8]).unwrap());
+    let mut m_b: [OxideTensorF32; 3] = std::array::from_fn(|_| be.zeros_f32(&[8]).unwrap());
+    let mut v_b: [OxideTensorF32; 3] = std::array::from_fn(|_| be.zeros_f32(&[8]).unwrap());
+    let mut m_h = be.zeros_f32(&[6]).unwrap();
+    let mut v_h = be.zeros_f32(&[6]).unwrap();
+    let mut weights = Vec::new();
+    let mut losses = Vec::new();
+    for step in 1..=steps {
+        let (out, g, rolling) = forward_backward(be, &p, x, target, loss_scale);
+        losses.push(
+            out.iter()
+                .zip(target)
+                .map(|(o, t)| ((t - o) as f64).powi(2))
+                .sum::<f64>()
+                / out.len() as f64,
+        );
+        let params = AdamParams {
+            lr: 1e-3,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            decay: 0.0,
+            batch: 1,
+            step: step as u32,
+            decoupled_decay: false,
+        };
+        let step_tensor = |w: &OxideTensorF32,
+                           m: &OxideTensorF32,
+                           v: &OxideTensorF32,
+                           grad: &[f32]| {
+            let grad = up(be, w.shape(), grad);
+            be.adam_update_f32(w, &grad, m, v, &params, cfg()).unwrap()
+        };
+        for i in 0..4 {
+            let (w, m, v) = step_tensor(&p.w[i], &m_w[i], &v_w[i], &g.w[i]);
+            p.w[i] = w;
+            m_w[i] = m;
+            v_w[i] = v;
+        }
+        for i in 0..3 {
+            let (w, m, v) = step_tensor(&p.bn_scale[i], &m_s[i], &v_s[i], &g.bn_scale[i]);
+            p.bn_scale[i] = w;
+            m_s[i] = m;
+            v_s[i] = v;
+            let (w, m, v) = step_tensor(&p.bn_bias[i], &m_b[i], &v_b[i], &g.bn_bias[i]);
+            p.bn_bias[i] = w;
+            m_b[i] = m;
+            v_b[i] = v;
+            p.rm[i] = rolling[i].0.clone();
+            p.rv[i] = rolling[i].1.clone();
+        }
+        let (w, m, v) = step_tensor(&p.head_bias, &m_h, &v_h, &g.head_bias);
+        p.head_bias = w;
+        m_h = m;
+        v_h = v;
+        let mut snap: Vec<Vec<f32>> = p.w.iter().map(|t| down(be, t)).collect();
+        snap.extend(p.bn_scale.iter().map(|t| down(be, t)));
+        snap.extend(p.bn_bias.iter().map(|t| down(be, t)));
+        snap.push(down(be, &p.head_bias));
+        weights.push(snap);
+    }
+    (weights, losses)
+}
+
+/// AMP Adam must stay on the f32 master-weight trajectory (same documented
+/// 10%-of-travel bound as the SGD test).  The runtime's Adam path shares this
+/// kernel, so this covers "Adam under AMP" without a dataset run.
+#[test]
+fn amp_adam_steps_track_f32_master_weights() {
+    let amp = amp_backend();
+    let f32be = f32_backend();
+    let mut rng = Rng(0xad4a_5eed);
+    let p0 = init_params(&f32be, &mut rng);
+    let p0_amp = clone_params(&f32be, &amp, &p0);
+    let (x, target) = make_data(&mut rng);
+    let steps = 4;
+    let (w32, l32) = adam_run(&f32be, &p0, &x, &target, steps, 1.0);
+    let (wamp, lamp) = adam_run(&amp, &p0_amp, &x, &target, steps, 256.0);
+    println!("adam loss f32: {l32:.4?}");
+    println!("adam loss amp: {lamp:.4?}");
+    assert!(l32.last().unwrap() < &l32[0], "f32 Adam loss must decrease");
+    assert!(lamp.last().unwrap() < &lamp[0], "AMP Adam loss must decrease");
+    for (i, (a, b)) in lamp.iter().zip(&l32).enumerate() {
+        assert!(
+            (a - b).abs() <= 0.02 * b.abs().max(1e-6),
+            "step {i}: loss amp {a} vs f32 {b}"
+        );
+    }
+    let init: Vec<Vec<f32>> = {
+        let mut v: Vec<Vec<f32>> = p0.w.iter().map(|t| down(&f32be, t)).collect();
+        v.extend(p0.bn_scale.iter().map(|t| down(&f32be, t)));
+        v.extend(p0.bn_bias.iter().map(|t| down(&f32be, t)));
+        v.push(down(&f32be, &p0.head_bias));
+        v
+    };
+    let names = ["w0", "w1", "w2", "w3", "s0", "s1", "s2", "b0", "b1", "b2", "bh"];
+    for (t, name) in names.iter().enumerate() {
+        let (fin32, finamp) = (&w32[steps - 1][t], &wamp[steps - 1][t]);
+        let travelled = fin32
+            .iter()
+            .zip(&init[t])
+            .fold(0.0f64, |m, (a, b)| m.max((a - b).abs() as f64));
+        let diff = fin32
+            .iter()
+            .zip(finamp)
+            .fold(0.0f64, |m, (a, b)| m.max((a - b).abs() as f64));
+        // Adam barely moves some tensors, so allow the f16 storage rounding
+        // floor (2% of the initial magnitude) on top of the 10%-of-travel term.
+        let scale = init[t].iter().fold(1e-6f64, |m, a| m.max(a.abs() as f64));
+        let bound = 0.10 * travelled + 0.02 * scale;
+        println!("adam {name}: |w_amp - w_f32|inf {diff:.3e} bound {bound:.3e}");
+        assert!(diff <= bound, "adam {name}: {diff:.3e} > {bound:.3e}");
+    }
 }

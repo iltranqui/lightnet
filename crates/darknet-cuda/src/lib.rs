@@ -174,6 +174,11 @@ pub trait F32TensorOpsBackend {
     fn upload_f32(&self, shape: &[usize], host: &[f32]) -> Result<Self::Tensor, Self::Error>;
     fn zeros_f32(&self, shape: &[usize]) -> Result<Self::Tensor, Self::Error>;
     fn download_f32(&self, tensor: &Self::Tensor) -> Result<Vec<f32>, Self::Error>;
+    /// True if any element of `x` is NaN or infinite.  The default downloads
+    /// and scans on the host; backends may override with a device reduction.
+    fn any_non_finite_f32(&self, x: &Self::Tensor) -> Result<bool, Self::Error> {
+        Ok(self.download_f32(x)?.iter().any(|value| !value.is_finite()))
+    }
     fn bias_add_f32(
         &self,
         x: &Self::Tensor,
