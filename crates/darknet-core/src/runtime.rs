@@ -35,9 +35,12 @@ use darknet_cuda::{
 };
 
 const BATCH_NORM_EPSILON: f32 = 0.000_01;
-/// Rolling-stat EMA keep factor of the GPU batch-statistics training path
-/// (same value the host-side running-stat updates use).
-const BATCH_NORM_ROLLING_KEEP: f32 = 0.9;
+/// Rolling-stat EMA keep factor of the GPU batch-statistics training path:
+/// C++ CUDA `scal_ongpu(.99)` + `axpy_ongpu(.01)` / cuDNN factor `.01`.
+const BATCH_NORM_ROLLING_KEEP: f32 = 0.99;
+/// Rolling-stat EMA keep factor of the host (CPU) training path: C++
+/// `forward_batchnorm_layer` uses `scal_cpu(.9)` + `axpy_cpu(.1)`.
+const BATCH_NORM_ROLLING_KEEP_CPU: f32 = 0.9;
 
 /// Backward-pass policy for the few ops where C++ Darknet's hand-written gradient is not the
 /// exact derivative of its forward. `Analytical` (default) is the exact derivative, `Cpp`
@@ -1841,7 +1844,7 @@ impl ExecutableNetwork {
                     layer.index
                 )));
             };
-            update_batch_norm_running_stats(batch_norm, &mean, &variance, 0.9)?;
+            update_batch_norm_running_stats(batch_norm, &mean, &variance, BATCH_NORM_ROLLING_KEEP_CPU)?;
         }
 
         for layer in &self.network.layers {
@@ -1882,7 +1885,7 @@ impl ExecutableNetwork {
                     layer.index
                 )));
             };
-            update_batch_norm_running_stats(batch_norm, &mean, &variance, 0.9)?;
+            update_batch_norm_running_stats(batch_norm, &mean, &variance, BATCH_NORM_ROLLING_KEEP_CPU)?;
         }
 
         for layer in &self.network.layers {
@@ -1909,7 +1912,7 @@ impl ExecutableNetwork {
                     layer.index
                 )));
             };
-            update_batch_norm_running_stats(params, &mean, &variance, 0.9)?;
+            update_batch_norm_running_stats(params, &mean, &variance, BATCH_NORM_ROLLING_KEEP_CPU)?;
         }
         update_recurrent_batch_norm_running_stats(&self.network, &mut self.params, input, forward)?;
         Ok(())
@@ -5252,7 +5255,7 @@ where
                 "missing batch-norm params for convolutional layer #{owner}"
             )));
         };
-        update_batch_norm_running_stats(batch_norm, mean, variance, 0.9)?;
+        update_batch_norm_running_stats(batch_norm, mean, variance, BATCH_NORM_ROLLING_KEEP)?;
         self.refresh_gpu_batch_norm_cache(owner)
     }
 
@@ -6973,7 +6976,7 @@ fn update_connected_batch_norm_from_input(
         return Ok(());
     };
     let (mean, variance) = channel_mean_variance(&raw_output);
-    update_batch_norm_running_stats(batch_norm, &mean, &variance, 0.9)
+    update_batch_norm_running_stats(batch_norm, &mean, &variance, BATCH_NORM_ROLLING_KEEP_CPU)
 }
 
 fn update_convolutional_batch_norm_from_input(
@@ -6987,7 +6990,7 @@ fn update_convolutional_batch_norm_from_input(
         return Ok(());
     };
     let (mean, variance) = channel_mean_variance(&raw_output);
-    update_batch_norm_running_stats(batch_norm, &mean, &variance, 0.9)
+    update_batch_norm_running_stats(batch_norm, &mean, &variance, BATCH_NORM_ROLLING_KEEP_CPU)
 }
 
 fn update_recurrent_batch_norm_running_stats(
@@ -14392,8 +14395,8 @@ mod tests {
             other => panic!("unexpected params: {other:?}"),
         };
         let batch_norm = params.batch_norm.as_ref().expect("batch norm params");
-        assert!((batch_norm.rolling_mean[0] - 9.3).abs() < 1.0e-6);
-        assert!((batch_norm.rolling_variance[0] - 18.2).abs() < 1.0e-6);
+        assert!((batch_norm.rolling_mean[0] - 9.93).abs() < 1.0e-6);
+        assert!((batch_norm.rolling_variance[0] - 19.82).abs() < 1.0e-6);
     }
 
     #[test]
@@ -14445,8 +14448,8 @@ mod tests {
             other => panic!("unexpected params: {other:?}"),
         };
         let batch_norm = params.batch_norm.as_ref().expect("batch norm params");
-        assert!((batch_norm.rolling_mean[0] - 9.3).abs() < 1.0e-6);
-        assert!((batch_norm.rolling_variance[0] - 18.2).abs() < 1.0e-6);
+        assert!((batch_norm.rolling_mean[0] - 9.93).abs() < 1.0e-6);
+        assert!((batch_norm.rolling_variance[0] - 19.82).abs() < 1.0e-6);
 
         let train_buffers = executable.device_train_buffers.borrow();
         let train = train_buffers[0].as_ref().expect("train buffers exist");
@@ -14504,6 +14507,26 @@ mod tests {
         (0..24).map(|i| ((i * 7 % 11) as f32) * 0.37 - 1.5).collect()
     }
 
+    /// Pins the rolling-stat EMA factors to C++: GPU `.99`/`.01` (batchnorm_layer.cpp
+    /// scal_ongpu/axpy_ongpu, cuDNN factor .01), host `.9`/`.1` (scal_cpu/axpy_cpu).
+    #[test]
+    fn batch_norm_rolling_keep_matches_cpp() {
+        assert_eq!(super::BATCH_NORM_ROLLING_KEEP, 0.99);
+        assert_eq!(super::BATCH_NORM_ROLLING_KEEP_CPU, 0.9);
+        let mut bn = super::BatchNormParams {
+            scales: vec![1.0],
+            biases: vec![0.0],
+            rolling_mean: vec![10.0],
+            rolling_variance: vec![20.0],
+        };
+        super::update_batch_norm_running_stats(&mut bn, &[3.0], &[2.0], super::BATCH_NORM_ROLLING_KEEP).unwrap();
+        // .99 * 10 + .01 * 3, .99 * 20 + .01 * 2
+        assert!((bn.rolling_mean[0] - 9.93).abs() < 1.0e-5);
+        assert!((bn.rolling_variance[0] - 19.82).abs() < 1.0e-5);
+        super::update_batch_norm_running_stats(&mut bn, &[3.0], &[2.0], super::BATCH_NORM_ROLLING_KEEP_CPU).unwrap();
+        assert!((bn.rolling_mean[0] - (0.9 * 9.93 + 0.3)).abs() < 1.0e-5);
+    }
+
     #[test]
     fn gpu_training_forward_uses_batch_statistics_and_updates_rolling_stats() {
         let mut gpu = gpu_training_bn_executable(&BN_TRAIN_WEIGHTS, &BN_TRAIN_SCALES, &BN_TRAIN_BIASES);
@@ -14542,7 +14565,7 @@ mod tests {
                 }
             }
             let (rm, rv) = ([0.3, -0.2, 0.5][o], [2.0, 0.5, 3.0][o]);
-            want_rolling[o] = (0.9 * rm + 0.1 * mean, 0.9 * rv + 0.1 * sq / (n - 1.0));
+            want_rolling[o] = (0.99 * rm + 0.01 * mean, 0.99 * rv + 0.01 * sq / (n - 1.0));
         }
         for (g, w) in forward.cpu_forward.layer_outputs[0].data.iter().zip(&want) {
             assert!((*g as f64 - w).abs() < 1.0e-4, "output {g} vs {w}");
