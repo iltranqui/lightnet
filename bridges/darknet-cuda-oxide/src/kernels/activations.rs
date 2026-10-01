@@ -11,6 +11,8 @@ pub const ACT_LEAKY: u32 = 3;
 pub const ACT_MISH: u32 = 4;
 pub const ACT_SWISH: u32 = 5;
 pub const ACT_TANH: u32 = 6;
+pub const ACT_RELU6: u32 = 7;
+pub const ACT_RAMP: u32 = 8;
 
 #[device]
 pub fn activate(kind: u32, x: f32) -> f32 {
@@ -26,6 +28,11 @@ pub fn activate(kind: u32, x: f32) -> f32 {
         x / (1.0 + (-x).exp())
     } else if kind == 6 {
         x.tanh()
+    } else if kind == 7 {
+        x.max(0.0).min(6.0)
+    } else if kind == 8 {
+        // C++ `x*(x>0) + .1f*x` (same rounding as the CPU runtime).
+        (if x > 0.0 { x } else { 0.0 }) + 0.1 * x
     } else {
         x
     }
@@ -59,6 +66,10 @@ pub fn gradient(kind: u32, x: f32) -> f32 {
     } else if kind == 6 {
         let t = x.tanh();
         1.0 - t * t
+    } else if kind == 7 {
+        if x > 0.0 && x < 6.0 { 1.0 } else { 0.0 }
+    } else if kind == 8 {
+        if x > 0.0 { 1.1 } else { 0.1 }
     } else {
         1.0
     }

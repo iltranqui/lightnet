@@ -1,0 +1,592 @@
+//! Host reference implementations behind the default bodies of the layer ops
+//! in [`crate::F32TensorOpsBackend`] (softmax, reorg, dropout, scale_channels,
+//! connected, batch-norm training, Adam).  A backend without a device kernel for one of these ops
+//! round-trips through the host and still produces the exact result a device
+//! kernel must match.
+
+/// Deterministic counter-hash RNG for dropout: a splitmix64 finaliser over
+/// `seed + (index + 1) * golden`, reduced to a uniform f32 in `[0, 1)` with 24
+/// exact bits.  Device kernels reproduce this bit for bit, so a mask depends
+/// only on `(seed, index)`, never on launch geometry.
+pub fn dropout_unit(seed: u64, index: u64) -> f32 {
+    let mut z = seed.wrapping_add(index.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z >> 40) as f32 / 16_777_216.0
+}
+
+/// Softmax over every contiguous `group_size` run of `x`.
+pub fn softmax(x: &[f32], group_size: usize) -> Vec<f32> {
+    assert!(group_size > 0 && x.len() % group_size == 0, "softmax: bad group size");
+    let mut out = vec![0.0f32; x.len()];
+    for (src, dst) in x.chunks(group_size).zip(out.chunks_mut(group_size)) {
+        let max = src.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for (d, v) in dst.iter_mut().zip(src) {
+            *d = (*v - max).exp();
+            sum += *d;
+        }
+        if sum > 0.0 {
+            for d in dst.iter_mut() {
+                *d /= sum;
+            }
+        }
+    }
+    out
+}
+
+/// Darknet's mismatched-shape shortcut layout (`shortcut_multilayer_*`): per
+/// batch sample the flat vector of `x.len() / batch` elements is cropped or
+/// zero-padded to `to_len` elements (`src_i < min(from, to)` is copied).
+/// Adding the result to the layer input is the forward shortcut; applying it
+/// to the layer gradient gives the gradient of the (cropped/padded) source.
+pub fn shortcut_fit(x: &[f32], batch: usize, to_len: usize) -> Vec<f32> {
+    assert!(batch > 0 && x.len() % batch == 0, "shortcut_fit: bad batch");
+    let from_len = x.len() / batch;
+    let copied = from_len.min(to_len);
+    let mut out = vec![0.0f32; batch * to_len];
+    for b in 0..batch {
+        out[b * to_len..b * to_len + copied].copy_from_slice(&x[b * from_len..b * from_len + copied]);
+    }
+    out
+}
+
+/// Softmax Jacobian-vector product: `dx = y * (dy - sum(y * dy))` per group.
+pub fn softmax_backward(y: &[f32], dy: &[f32], group_size: usize) -> Vec<f32> {
+    assert!(
+        group_size > 0 && y.len() == dy.len() && y.len() % group_size == 0,
+        "softmax backward: bad group size"
+    );
+    let mut dx = vec![0.0f32; y.len()];
+    for ((yg, dyg), dxg) in y
+        .chunks(group_size)
+        .zip(dy.chunks(group_size))
+        .zip(dx.chunks_mut(group_size))
+    {
+        let dot: f32 = yg.iter().zip(dyg).map(|(a, b)| a * b).sum();
+        for ((d, a), b) in dxg.iter_mut().zip(yg).zip(dyg) {
+            *d = a * (b - dot);
+        }
+    }
+    dx
+}
+
+/// Geometry of the `[batch, cb, hb, wb]` <-> `[batch, cb*s*s, hs, ws]` reorg
+/// bijection (`hs = hb / s`, `ws = wb / s`, extra border rows/cols unused).
+#[derive(Clone, Copy, Debug)]
+pub struct ReorgDims {
+    pub batch: usize,
+    pub cb: usize,
+    pub hb: usize,
+    pub wb: usize,
+    pub hs: usize,
+    pub ws: usize,
+    pub stride: usize,
+}
+
+impl ReorgDims {
+    pub fn big_len(&self) -> usize {
+        self.batch * self.cb * self.hb * self.wb
+    }
+    pub fn small_len(&self) -> usize {
+        self.batch * self.cb * self.stride * self.stride * self.hs * self.ws
+    }
+}
+
+/// Validates a reorg layer's `[batch, c, h, w]` input/output shapes and returns
+/// the shared bijection geometry.  Non-reverse: input is the big tensor, output
+/// the small one; reverse swaps the roles.
+pub fn reorg_dims(
+    input_shape: &[usize],
+    output_shape: &[usize],
+    stride: usize,
+    reverse: bool,
+) -> Result<ReorgDims, String> {
+    if stride == 0 || input_shape.len() != 4 || output_shape.len() != 4 {
+        return Err(format!(
+            "reorg: bad stride {stride} or shapes {input_shape:?} -> {output_shape:?}"
+        ));
+    }
+    let (big, small) = if reverse { (output_shape, input_shape) } else { (input_shape, output_shape) };
+    let d = ReorgDims {
+        batch: big[0],
+        cb: big[1],
+        hb: big[2],
+        wb: big[3],
+        hs: small[2],
+        ws: small[3],
+        stride,
+    };
+    if small[0] != d.batch
+        || d.cb == 0
+        || small[1] != d.cb * stride * stride
+        || d.hs != d.hb / stride
+        || d.ws != d.wb / stride
+        || d.hs == 0
+        || d.ws == 0
+    {
+        return Err(format!(
+            "reorg: shapes {input_shape:?} -> {output_shape:?} do not match stride {stride} (reverse={reverse})"
+        ));
+    }
+    Ok(d)
+}
+
+/// Index into the big tensor feeding small element `(b, k, j, i)`.
+fn reorg_big_index(d: &ReorgDims, b: usize, k: usize, j: usize, i: usize) -> usize {
+    let c2 = k % d.cb;
+    let off = k / d.cb;
+    let h2 = j * d.stride + off / d.stride;
+    let w2 = i * d.stride + off % d.stride;
+    ((b * d.cb + c2) * d.hb + h2) * d.wb + w2
+}
+
+/// Big -> small (non-reverse reorg forward, reverse reorg backward).
+pub fn reorg_to_small(big: &[f32], d: &ReorgDims) -> Vec<f32> {
+    assert_eq!(big.len(), d.big_len(), "reorg: big tensor length");
+    let cs = d.cb * d.stride * d.stride;
+    let mut small = vec![0.0f32; d.small_len()];
+    for b in 0..d.batch {
+        for k in 0..cs {
+            for j in 0..d.hs {
+                for i in 0..d.ws {
+                    small[((b * cs + k) * d.hs + j) * d.ws + i] = big[reorg_big_index(d, b, k, j, i)];
+                }
+            }
+        }
+    }
+    small
+}
+
+/// Small -> big (reverse reorg forward, non-reverse reorg backward).  Border
+/// elements outside the `hs*s x ws*s` covered area are zero.
+pub fn reorg_to_big(small: &[f32], d: &ReorgDims) -> Vec<f32> {
+    assert_eq!(small.len(), d.small_len(), "reorg: small tensor length");
+    let cs = d.cb * d.stride * d.stride;
+    let mut big = vec![0.0f32; d.big_len()];
+    for b in 0..d.batch {
+        for k in 0..cs {
+            for j in 0..d.hs {
+                for i in 0..d.ws {
+                    big[reorg_big_index(d, b, k, j, i)] = small[((b * cs + k) * d.hs + j) * d.ws + i];
+                }
+            }
+        }
+    }
+    big
+}
+
+/// Element-wise `x * mask` plus the mask itself (`0` below `probability`,
+/// `1 / (1 - probability)` otherwise).
+pub fn dropout(x: &[f32], probability: f32, seed: u64) -> (Vec<f32>, Vec<f32>) {
+    assert!((0.0..1.0).contains(&probability), "dropout: probability must be in [0, 1)");
+    let scale = 1.0 / (1.0 - probability);
+    let mask: Vec<f32> = (0..x.len())
+        .map(|i| if dropout_unit(seed, i as u64) < probability { 0.0 } else { scale })
+        .collect();
+    let out = x.iter().zip(&mask).map(|(v, m)| v * m).collect();
+    (out, mask)
+}
+
+/// DropBlock cell (top-left corner) chosen for one `(sample, channel)` plane,
+/// or `None` when no cell of the plane is below `block_prob`.  C++
+/// `dropblock_fast_kernel`: the cell with the lowest random value (quantised
+/// to 1e-6 like the C++ `atomicMin` int; ties go to the lowest index) is moved
+/// inside the image and expanded to a `block_size` square.  `plane` indexes
+/// `sample * channels + channel`; the random value of cell `i` is
+/// `dropout_unit(seed, plane * h * w + i)`.
+pub fn dropblock_corner(
+    seed: u64,
+    plane: usize,
+    w: usize,
+    h: usize,
+    block_prob: f32,
+    block_size: usize,
+) -> Option<(usize, usize)> {
+    let spatial = w * h;
+    let mut best = 1_000_000i32;
+    let mut cell = None;
+    for i in 0..spatial {
+        let u = dropout_unit(seed, (plane * spatial + i) as u64);
+        if u < block_prob {
+            let q = (u * 1_000_000.0) as i32;
+            if q < best {
+                best = q;
+                cell = Some(i);
+            }
+        }
+    }
+    cell.map(|i| {
+        let (mut bx, mut by) = (i % w, i / w);
+        if bx > w - block_size {
+            bx -= w - block_size;
+        }
+        if by > h - block_size {
+            by -= h - block_size;
+        }
+        (bx.min(w - block_size), by.min(h - block_size))
+    })
+}
+
+/// Per-sample DropBlock rescale `1 / (1 - dropped / outputs)` where `dropped`
+/// is `block_size^2` per plane that received a block (C++
+/// `set_scales_dropblock_kernel`).  `0` when everything would be dropped.
+pub fn dropblock_scale(dropped_cells: f32, outputs: usize) -> f32 {
+    let keep = 1.0 - dropped_cells / outputs as f32;
+    if keep > 0.0 { 1.0 / keep } else { 0.0 }
+}
+
+/// DropBlock forward over an NCHW `shape`: one `block_size` square is zeroed
+/// in every `(sample, channel)` plane with probability-driven selection (see
+/// [`dropblock_corner`]) and each sample is rescaled by [`dropblock_scale`].
+/// Returns `(x * mask, mask)`; `mask` holds the per-element multiplier (`0`
+/// inside blocks, the sample scale elsewhere), so the exact backward is
+/// `dx = dy * mask` like C++ `backward_dropblock_kernel` + scale.
+///
+/// Deviation from C++: the C++ kernel indexes the random values with
+/// `b*spatial*f + f*spatial + i` instead of `(b*filters + f)*spatial + i`
+/// (the planes of later samples share random values).  This reference draws
+/// an independent value per cell.
+pub fn dropblock(
+    x: &[f32],
+    shape: &[usize],
+    block_prob: f32,
+    block_size: usize,
+    seed: u64,
+) -> (Vec<f32>, Vec<f32>) {
+    assert!(shape.len() == 4, "dropblock: shape must be NCHW");
+    let (n, c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
+    assert!(x.len() == n * c * h * w, "dropblock: shape/data mismatch");
+    assert!(
+        block_size >= 1 && block_size <= w.min(h),
+        "dropblock: block_size must be in 1..=min(w, h)"
+    );
+    let spatial = h * w;
+    let mut mask = vec![1.0f32; x.len()];
+    for b in 0..n {
+        let mut dropped = 0.0f32;
+        for ch in 0..c {
+            let plane = b * c + ch;
+            if let Some((bx, by)) = dropblock_corner(seed, plane, w, h, block_prob, block_size) {
+                for y in by..by + block_size {
+                    for xx in bx..bx + block_size {
+                        mask[plane * spatial + y * w + xx] = 0.0;
+                    }
+                }
+                dropped += (block_size * block_size) as f32;
+            }
+        }
+        let scale = dropblock_scale(dropped, c * spatial);
+        for m in &mut mask[b * c * spatial..(b + 1) * c * spatial] {
+            *m *= scale;
+        }
+    }
+    let out = x.iter().zip(&mask).map(|(v, m)| v * m).collect();
+    (out, mask)
+}
+
+/// Darknet `constrain_ongpu`: `min(limit, max(-limit, v))` with C's `fmax`
+/// NaN handling (NaN becomes `-limit`).
+pub fn constrain(x: &[f32], limit: f32) -> Vec<f32> {
+    x.iter()
+        .map(|&v| {
+            let mut v = v;
+            if !(v > -limit) {
+                v = -limit;
+            }
+            if v > limit {
+                v = limit;
+            }
+            v
+        })
+        .collect()
+}
+
+/// Darknet `gradient_centralization_gpu`: subtract the mean of every
+/// contiguous filter of `f_size` values.  Like C++ it only runs when
+/// `f_size % 32 == 0`, otherwise the input is returned unchanged.
+pub fn gradient_centralization(x: &[f32], f_size: usize) -> Vec<f32> {
+    assert!(f_size > 0 && x.len() % f_size == 0, "gradient_centralization: bad filter size");
+    let mut out = x.to_vec();
+    if f_size % 32 != 0 {
+        return out;
+    }
+    for filter in out.chunks_mut(f_size) {
+        let mut sum = 0.0f32;
+        for v in filter.iter() {
+            sum += *v;
+        }
+        let mean = sum / f_size as f32;
+        for v in filter.iter_mut() {
+            *v -= mean;
+        }
+    }
+    out
+}
+
+/// Index of the scale value multiplying element `i` of a `[batch, c, h*w]`
+/// tensor: `[batch, h*w]` when `scale_wh`, else `[batch, c]`.
+fn scale_index(i: usize, channels: usize, hw: usize, scale_wh: bool) -> usize {
+    let b = i / (channels * hw);
+    let r = i % (channels * hw);
+    if scale_wh { b * hw + r % hw } else { b * channels + r / hw }
+}
+
+/// `out = scale (broadcast) * source`.
+pub fn scale_channels(scale: &[f32], source: &[f32], channels: usize, hw: usize, scale_wh: bool) -> Vec<f32> {
+    source
+        .iter()
+        .enumerate()
+        .map(|(i, s)| scale[scale_index(i, channels, hw, scale_wh)] * s)
+        .collect()
+}
+
+/// `(d_scale, d_source)` of [`scale_channels`].
+pub fn scale_channels_backward(
+    delta: &[f32],
+    scale: &[f32],
+    source: &[f32],
+    channels: usize,
+    hw: usize,
+    scale_wh: bool,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut d_scale = vec![0.0f32; scale.len()];
+    let mut d_source = vec![0.0f32; source.len()];
+    for (i, (g, s)) in delta.iter().zip(source).enumerate() {
+        let si = scale_index(i, channels, hw, scale_wh);
+        d_source[i] = g * scale[si];
+        d_scale[si] += g * s;
+    }
+    (d_scale, d_source)
+}
+
+/// `out[b, o] = sum_i x[b, i] * w[o, i] + bias[o]` (weights are `[outputs][inputs]`).
+pub fn connected(x: &[f32], w: &[f32], bias: &[f32], batch: usize, inputs: usize, outputs: usize) -> Vec<f32> {
+    assert!(x.len() == batch * inputs && w.len() == outputs * inputs && bias.len() == outputs);
+    let mut out = vec![0.0f32; batch * outputs];
+    for b in 0..batch {
+        for o in 0..outputs {
+            let mut acc = 0.0f32;
+            for i in 0..inputs {
+                acc += x[b * inputs + i] * w[o * inputs + i];
+            }
+            out[b * outputs + o] = acc + bias[o];
+        }
+    }
+    out
+}
+
+/// `(dx, dw, db)` of [`connected`] for upstream gradient `delta` (`[batch, outputs]`).
+pub fn connected_backward(
+    x: &[f32],
+    w: &[f32],
+    delta: &[f32],
+    batch: usize,
+    inputs: usize,
+    outputs: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    assert!(x.len() == batch * inputs && w.len() == outputs * inputs && delta.len() == batch * outputs);
+    let mut dx = vec![0.0f32; batch * inputs];
+    let mut dw = vec![0.0f32; outputs * inputs];
+    let mut db = vec![0.0f32; outputs];
+    for b in 0..batch {
+        for o in 0..outputs {
+            let g = delta[b * outputs + o];
+            db[o] += g;
+            for i in 0..inputs {
+                dw[o * inputs + i] += g * x[b * inputs + i];
+                dx[b * inputs + i] += g * w[o * inputs + i];
+            }
+        }
+    }
+    (dx, dw, db)
+}
+
+/// Variance epsilon shared with the Rust runtime (`BATCH_NORM_EPSILON`).
+pub const BATCH_NORM_EPSILON: f32 = 0.000_01;
+
+/// Host result of [`batchnorm_train_forward`] (all NCHW-flat / per-channel).
+#[derive(Clone, Debug)]
+pub struct BatchNormTrainHost {
+    pub output: Vec<f32>,
+    pub x_hat: Vec<f32>,
+    pub mean: Vec<f32>,
+    /// Biased batch variance (`sum_sq / n`), the one used to normalise.
+    pub variance: Vec<f32>,
+    pub rolling_mean: Vec<f32>,
+    pub rolling_variance: Vec<f32>,
+}
+
+fn per_channel_sums(x: &[f32], channels: usize, spatial: usize, f: impl Fn(usize, f32) -> f32) -> Vec<f32> {
+    let mut sums = vec![0.0f32; channels];
+    for (i, v) in x.iter().enumerate() {
+        let c = (i / spatial) % channels;
+        sums[c] += f(c, *v);
+    }
+    sums
+}
+
+/// Batch-norm training forward over `[batch, channels, spatial]`: batch mean /
+/// biased variance, `x_hat = (x - mean) / sqrt(var + eps)`, `out = x_hat *
+/// scale + bias`, and the rolling EMA `new = keep * old + (1 - keep) * batch`
+/// (the rolling variance takes the unbiased `sum_sq / (n - 1)`, as the CPU
+/// runtime's `channel_mean_variance` and cuDNN do).
+pub fn batchnorm_train_forward(
+    x: &[f32],
+    scales: &[f32],
+    biases: &[f32],
+    rolling_mean: &[f32],
+    rolling_variance: &[f32],
+    channels: usize,
+    spatial: usize,
+    keep: f32,
+) -> BatchNormTrainHost {
+    assert!(channels > 0 && spatial > 0 && x.len() % (channels * spatial) == 0, "batchnorm: bad layout");
+    assert!(
+        scales.len() == channels
+            && biases.len() == channels
+            && rolling_mean.len() == channels
+            && rolling_variance.len() == channels,
+        "batchnorm: per-channel length mismatch"
+    );
+    let n = (x.len() / channels) as f32;
+    let mean: Vec<f32> = per_channel_sums(x, channels, spatial, |_, v| v)
+        .into_iter()
+        .map(|s| s / n)
+        .collect();
+    let sum_sq = per_channel_sums(x, channels, spatial, |c, v| (v - mean[c]) * (v - mean[c]));
+    let variance: Vec<f32> = sum_sq.iter().map(|s| s / n).collect();
+    let unbiased = 1.0 / (n - 1.0).max(1.0);
+    let update = 1.0 - keep;
+    let mut x_hat = vec![0.0f32; x.len()];
+    let mut output = vec![0.0f32; x.len()];
+    for (i, v) in x.iter().enumerate() {
+        let c = (i / spatial) % channels;
+        x_hat[i] = (v - mean[c]) / (variance[c] + BATCH_NORM_EPSILON).sqrt();
+        output[i] = x_hat[i] * scales[c] + biases[c];
+    }
+    BatchNormTrainHost {
+        output,
+        x_hat,
+        rolling_mean: (0..channels).map(|c| keep * rolling_mean[c] + update * mean[c]).collect(),
+        rolling_variance: (0..channels)
+            .map(|c| keep * rolling_variance[c] + update * (sum_sq[c] * unbiased))
+            .collect(),
+        mean,
+        variance,
+    }
+}
+
+/// `(dx, dscale, dbias)` of [`batchnorm_train_forward`]:
+/// `dx = scale / sqrt(var + eps) / n * (n * dy - sum(dy) - x_hat * sum(dy * x_hat))`.
+pub fn batchnorm_train_backward(
+    dy: &[f32],
+    x_hat: &[f32],
+    variance: &[f32],
+    scales: &[f32],
+    channels: usize,
+    spatial: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    assert!(
+        channels > 0
+            && spatial > 0
+            && dy.len() == x_hat.len()
+            && dy.len() % (channels * spatial) == 0
+            && variance.len() == channels
+            && scales.len() == channels,
+        "batchnorm backward: bad layout"
+    );
+    let n = (dy.len() / channels) as f32;
+    let dbias = per_channel_sums(dy, channels, spatial, |_, v| v);
+    let mut dscale = vec![0.0f32; channels];
+    for (i, (g, h)) in dy.iter().zip(x_hat).enumerate() {
+        dscale[(i / spatial) % channels] += g * h;
+    }
+    let dx = dy
+        .iter()
+        .zip(x_hat)
+        .enumerate()
+        .map(|(i, (g, h))| {
+            let c = (i / spatial) % channels;
+            let inv_std = 1.0 / (variance[c] + BATCH_NORM_EPSILON).sqrt();
+            scales[c] * inv_std / n * (n * g - dbias[c] - h * dscale[c])
+        })
+        .collect();
+    (dx, dscale, dbias)
+}
+
+/// Hyper-parameters of [`adam_update`] (Darknet `adam_update_gpu`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AdamParams {
+    pub lr: f32,
+    pub beta1: f32,
+    pub beta2: f32,
+    pub eps: f32,
+    pub decay: f32,
+    pub batch: usize,
+    /// 1-based step count used for the bias corrections.
+    pub step: u32,
+    /// `false`: C++ semantics, `decay * batch * w` is folded into the update
+    /// before the moments (L2).  `true`: AdamW, `w -= lr * decay * w` outside
+    /// the moments.
+    pub decoupled_decay: bool,
+}
+
+impl AdamParams {
+    /// `(coupled_decay, decoupled_decay, bias_correction1, bias_correction2)`
+    /// kernel scalars; the bias corrections use `powf` like the C++ kernel.
+    pub fn kernel_scalars(&self) -> (f32, f32, f32, f32) {
+        let (coupled, decoupled) = if self.decoupled_decay {
+            (0.0, self.lr * self.decay)
+        } else {
+            (self.decay * self.batch.max(1) as f32, 0.0)
+        };
+        let t = self.step.max(1) as f32;
+        (coupled, decoupled, 1.0 - self.beta1.powf(t), 1.0 - self.beta2.powf(t))
+    }
+}
+
+/// Darknet Adam step (updates `u` point downhill, so `w += lr * mhat / (sqrt(vhat) + eps)`).
+/// Returns `(w', m', v')`; the caller resets `u` to zero like C++.
+pub fn adam_update(w: &[f32], u: &[f32], m: &[f32], v: &[f32], p: &AdamParams) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    assert!(w.len() == u.len() && w.len() == m.len() && w.len() == v.len(), "adam: length mismatch");
+    let (coupled, decoupled, bc1, bc2) = p.kernel_scalars();
+    let mut w_out = vec![0.0f32; w.len()];
+    let mut m_out = vec![0.0f32; w.len()];
+    let mut v_out = vec![0.0f32; w.len()];
+    for i in 0..w.len() {
+        let g = u[i] - coupled * w[i];
+        m_out[i] = p.beta1 * m[i] + (1.0 - p.beta1) * g;
+        v_out[i] = p.beta2 * v[i] + (1.0 - p.beta2) * (g * g);
+        let (mhat, vhat) = (m_out[i] / bc1, v_out[i] / bc2);
+        w_out[i] = w[i] + p.lr * mhat / (vhat.sqrt() + p.eps) - decoupled * w[i];
+    }
+    (w_out, m_out, v_out)
+}
+
+/// Darknet's two device sanitizers (`blas_kernels.cu`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NanInfMode {
+    /// `reset_nan_and_inf`: non-finite -> 0 (used on accumulated updates).
+    Reset,
+    /// `fix_nan_and_inf`: non-finite -> `1 / (|index| + 1)` (used on weights).
+    Fix,
+}
+
+/// Host reference of Darknet `reset_nan_and_inf` / `fix_nan_and_inf`.
+pub fn sanitize_nan_inf(x: &[f32], mode: NanInfMode) -> Vec<f32> {
+    x.iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            if v.is_finite() {
+                v
+            } else {
+                match mode {
+                    NanInfMode::Reset => 0.0,
+                    NanInfMode::Fix => 1.0 / (i as f32 + 1.0),
+                }
+            }
+        })
+        .collect()
+}

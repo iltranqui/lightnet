@@ -42,7 +42,7 @@ fn assert_close(name: &str, got: &[f32], want: &[f32]) {
     }
 }
 
-const KINDS: [F32ActivationKind; 7] = [
+const KINDS: [F32ActivationKind; 9] = [
     F32ActivationKind::Linear,
     F32ActivationKind::Logistic,
     F32ActivationKind::Relu,
@@ -50,6 +50,8 @@ const KINDS: [F32ActivationKind; 7] = [
     F32ActivationKind::Mish,
     F32ActivationKind::Swish,
     F32ActivationKind::Tanh,
+    F32ActivationKind::Relu6,
+    F32ActivationKind::Ramp,
 ];
 
 fn cpu_activate(kind: F32ActivationKind, x: f32) -> f32 {
@@ -67,6 +69,8 @@ fn cpu_activate(kind: F32ActivationKind, x: f32) -> f32 {
         F32ActivationKind::Mish => x * (1.0 + x.exp()).ln().tanh(),
         F32ActivationKind::Swish => x / (1.0 + (-x).exp()),
         F32ActivationKind::Tanh => x.tanh(),
+        F32ActivationKind::Relu6 => x.clamp(0.0, 6.0),
+        F32ActivationKind::Ramp => x * (x > 0.0) as i32 as f32 + 0.1 * x,
     }
 }
 
@@ -105,6 +109,8 @@ fn cpu_gradient(kind: F32ActivationKind, x: f32) -> f32 {
             let t = x.tanh();
             1.0 - t * t
         }
+        F32ActivationKind::Relu6 => (x > 0.0 && x < 6.0) as i32 as f32,
+        F32ActivationKind::Ramp => (x > 0.0) as i32 as f32 + 0.1,
     }
 }
 
@@ -130,10 +136,13 @@ fn activations_forward_and_backward() {
     let mut rng = Rng(2);
     let n = 1237;
     // Include values beyond the Mish +-20 thresholds.
-    let mut x = rng.vec(n, -6.0, 6.0);
+    let mut x = rng.vec(n, -8.0, 8.0);
     x[0] = 25.0;
     x[1] = -25.0;
     x[2] = 0.0;
+    x[3] = 6.0; // ReLU6 upper kink: gradient 0 at exactly 6 (C++ `x < 6`)
+    x[4] = 5.999;
+    x[5] = 6.001;
     let delta = rng.vec(n, -2.0, 2.0);
     let xt = b.upload_f32(&[n], &x).unwrap();
     let dt = b.upload_f32(&[n], &delta).unwrap();
@@ -301,6 +310,8 @@ fn act64(kind: F32ActivationKind, x: f64) -> f64 {
         F32ActivationKind::Mish => x * (1.0 + x.exp()).ln().tanh(),
         F32ActivationKind::Swish => x / (1.0 + (-x).exp()),
         F32ActivationKind::Tanh => x.tanh(),
+        F32ActivationKind::Relu6 => x.clamp(0.0, 6.0),
+        F32ActivationKind::Ramp => x * (x > 0.0) as i32 as f64 + 0.1 * x,
     }
 }
 
@@ -309,11 +320,12 @@ fn activation_backward_matches_finite_difference() {
     let b = backend();
     let mut rng = Rng(21);
     let n = 513;
-    // Stay away from the ReLU / Leaky kink at 0 so central differences are valid.
+    // Stay away from the ReLU / Leaky / ReLU6 kinks at 0 and 6 so central
+    // differences are valid.
     let x: Vec<f32> = rng
-        .vec(n, -4.0, 4.0)
+        .vec(n, -4.0, 8.0)
         .into_iter()
-        .map(|v| if v.abs() < 0.05 { v + 0.2 } else { v })
+        .map(|v| if v.abs() < 0.05 || (v - 6.0).abs() < 0.05 { v + 0.2 } else { v })
         .collect();
     let delta = rng.vec(n, -2.0, 2.0);
     let xt = b.upload_f32(&[n], &x).unwrap();
@@ -356,6 +368,8 @@ fn activation_backward_input_form_equals_core_output_form() {
         F32ActivationKind::Relu,
         F32ActivationKind::Leaky,
         F32ActivationKind::Tanh,
+        F32ActivationKind::Relu6,
+        F32ActivationKind::Ramp,
     ] {
         let got = b
             .download_f32(&b.activation_backward_f32(&xt, &dt, kind, cfg()).unwrap())
@@ -378,6 +392,8 @@ fn activation_backward_input_form_equals_core_output_form() {
                         }
                     }
                     F32ActivationKind::Tanh => 1.0 - y * y,
+                    F32ActivationKind::Relu6 => (y > 0.0 && y < 6.0) as i32 as f32,
+                    F32ActivationKind::Ramp => (y > 0.0) as i32 as f32 + 0.1,
                     _ => unreachable!(),
                 };
                 g * d

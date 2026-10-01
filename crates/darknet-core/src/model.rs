@@ -67,6 +67,21 @@ pub struct NetConfig {
     pub equidistant_point: usize,
     pub badlabels_rejection_percentage: f32,
     pub num_sigmas_reject_badlabels: f32,
+    /// `adam=1` (C++ `net.adam`); SGD with momentum otherwise.
+    pub adam: bool,
+    /// `B1`/`B2`/`eps` (only read when `adam=1`, like C++).
+    pub adam_b1: f32,
+    pub adam_b2: f32,
+    pub adam_eps: f32,
+    /// Rust extension `decoupled_decay=1`: AdamW instead of C++'s L2-in-the-moments.
+    pub decoupled_decay: bool,
+    /// `loss_scale` (C++ default 1): gradients are scaled by this and the
+    /// update divides it back out.
+    pub loss_scale: f32,
+    /// `try_fix_nan=1` (C++ `net.try_fix_nan`): convolution outputs are fixed
+    /// for NaN/Inf, output deltas are clamped to [-1, 1] and input deltas are
+    /// reset for NaN/Inf.
+    pub try_fix_nan: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,6 +166,7 @@ impl NetConfig {
         let time_steps = section.get_usize("time_steps", 1)?.max(1);
         let batch = section.get_usize("batch", 1)? / subdivisions * time_steps;
         let max_batches = section.get_usize("max_batches", 0)?;
+        let adam = section.get_usize("adam", 0)? != 0;
 
         Ok(Self {
             width,
@@ -178,6 +194,13 @@ impl NetConfig {
             badlabels_rejection_percentage: section
                 .get_f32("badlabels_rejection_percentage", 0.0)?,
             num_sigmas_reject_badlabels: section.get_f32("num_sigmas_reject_badlabels", 0.0)?,
+            adam,
+            adam_b1: if adam { section.get_f32("b1", 0.9)? } else { 0.9 },
+            adam_b2: if adam { section.get_f32("b2", 0.999)? } else { 0.999 },
+            adam_eps: if adam { section.get_f32("eps", 0.000001)? } else { 0.000001 },
+            decoupled_decay: section.get_usize("decoupled_decay", 0)? != 0,
+            loss_scale: section.get_f32("loss_scale", 1.0)?,
+            try_fix_nan: section.get_usize("try_fix_nan", 0)? != 0,
         })
     }
 
@@ -196,6 +219,8 @@ pub enum Activation {
     Mish,
     Swish,
     Tanh,
+    Relu6,
+    Ramp,
     Other(String),
 }
 
@@ -210,6 +235,8 @@ impl Activation {
             "mish" => Self::Mish,
             "swish" => Self::Swish,
             "tanh" => Self::Tanh,
+            "relu6" => Self::Relu6,
+            "ramp" => Self::Ramp,
             other => Self::Other(other.to_owned()),
         }
     }
@@ -224,6 +251,8 @@ impl Activation {
             Self::Mish => Some(F32ActivationKind::Mish),
             Self::Swish => Some(F32ActivationKind::Swish),
             Self::Tanh => Some(F32ActivationKind::Tanh),
+            Self::Relu6 => Some(F32ActivationKind::Relu6),
+            Self::Ramp => Some(F32ActivationKind::Ramp),
             Self::Other(_) => None,
         }
     }
@@ -455,7 +484,11 @@ pub enum LayerKind {
     Reorg(ReorgSpec),
     Softmax { groups: usize },
     Cost { kind: String },
-    Dropout { probability: Option<f32> },
+    Dropout {
+        probability: Option<f32>,
+        /// `dropblock=1` selects DropBlock instead of element-wise dropout.
+        dropblock: Option<DropblockSpec>,
+    },
     ScaleChannels(ScaleChannelsSpec),
     Sam(SamSpec),
     Contrastive { classes: usize, yolo_layer: isize },
@@ -546,6 +579,71 @@ impl LayerWeights {
     }
 }
 
+/// DropBlock block size, parsed like C++ `[dropout] dropblock=1`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DropblockSpec {
+    /// `dropblock_size_rel`: block side as a fraction of the layer width/height
+    /// (0 when the absolute size is used).
+    pub size_rel: f32,
+    /// `dropblock_size_abs`: block side in cells (default 7 when neither key is set).
+    pub size_abs: usize,
+}
+
+/// Per-layer training keys that C++ reads for every layer section
+/// (`darknet_cfg.cpp`) and `grad_centr` from the convolutional section.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayerTrainOptions {
+    /// `learning_rate`: per-layer multiplier of the global rate (convolutions).
+    pub learning_rate_scale: f32,
+    /// `dont_update=N`: the layer is only updated once `N < iteration`.
+    pub dont_update: i64,
+    /// `burnin_update=N`: no update while `N * burn_in > iteration`.
+    pub burnin_update: i64,
+    /// `train_only_bn=1`: the update is skipped for this layer and, like C++
+    /// `set_train_only_bn`, for every layer before it.
+    pub train_only_bn: bool,
+    /// `clip=C`: after the update the convolution weights are clamped to [-C, C].
+    pub clip: f32,
+    /// `grad_centr=1`: with batch norm, subtract the per-filter mean from the
+    /// weight updates before the optimizer step.
+    pub grad_centr: bool,
+}
+
+impl Default for LayerTrainOptions {
+    fn default() -> Self {
+        Self {
+            learning_rate_scale: 1.0,
+            dont_update: 0,
+            burnin_update: 0,
+            train_only_bn: false,
+            clip: 0.0,
+            grad_centr: false,
+        }
+    }
+}
+
+impl LayerTrainOptions {
+    fn from_section(section: &RawSection) -> Result<Self> {
+        Ok(Self {
+            learning_rate_scale: section.get_f32("learning_rate", 1.0)?,
+            dont_update: section.get_i64("dont_update", 0)?,
+            burnin_update: section.get_i64("burnin_update", 0)?,
+            train_only_bn: section.get_usize("train_only_bn", 0)? != 0,
+            clip: section.get_f32("clip", 0.0)?,
+            grad_centr: section.get_usize("grad_centr", 0)? != 0,
+        })
+    }
+
+    /// C++ `update_network_gpu` gating: whether a layer is stepped at
+    /// `iteration_num` (completed iterations, `seen / (batch * subdivisions)`).
+    pub fn updates_at(&self, iteration_num: i64, burn_in: usize) -> bool {
+        if self.burnin_update != 0 && self.burnin_update * burn_in as i64 > iteration_num {
+            return false;
+        }
+        !self.train_only_bn && self.dont_update < iteration_num
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Layer {
     pub index: usize,
@@ -553,6 +651,7 @@ pub struct Layer {
     pub input_shape: TensorShape,
     pub output_shape: TensorShape,
     pub kind: LayerKind,
+    pub train: LayerTrainOptions,
 }
 
 impl Layer {
@@ -883,9 +982,18 @@ impl Network {
                 input_shape,
                 output_shape,
                 kind,
+                train: LayerTrainOptions::from_section(section)?,
             });
 
             current = output_shape;
+        }
+
+        // C++ `set_train_only_bn`: the flag of a layer also applies to every
+        // layer before it.
+        let mut train_only_bn = false;
+        for layer in layers.iter_mut().rev() {
+            train_only_bn |= layer.train.train_only_bn;
+            layer.train.train_only_bn = train_only_bn;
         }
 
         Ok(Self {
@@ -1145,6 +1253,23 @@ fn parse_layer_kind(
             probability: section
                 .get("probability")
                 .map(|value| value.parse().unwrap_or(0.5)),
+            dropblock: if section.get_usize("dropblock", 0)? != 0 {
+                // C++ make_dropout_layer / parse_dropout: the absolute size
+                // is capped by the layer size, defaults to 7 when neither key
+                // is set, and wins when both are.
+                let mut size_rel = section.get_f32("dropblock_size_rel", 0.0)?;
+                let mut size_abs = section.get_f32("dropblock_size_abs", 0.0)? as usize;
+                size_abs = size_abs.min(current.width.min(current.height).max(1));
+                if size_rel == 0.0 && size_abs == 0 {
+                    size_abs = 7;
+                }
+                if size_rel != 0.0 && size_abs != 0 {
+                    size_rel = 0.0;
+                }
+                Some(DropblockSpec { size_rel, size_abs })
+            } else {
+                None
+            },
         },
         "scale_channels" => LayerKind::ScaleChannels(ScaleChannelsSpec {
             from: section.get_isize("from", 0)?,
@@ -1619,6 +1744,8 @@ mod tests {
         assert_eq!(network.net.policy, LrPolicy::Steps);
         assert_eq!(network.net.steps, vec![400, 800]);
         assert_eq!(network.net.scales, vec![0.1, 0.1]);
+        assert!(!network.net.adam && !network.net.decoupled_decay);
+        assert_eq!(network.net.loss_scale, 1.0);
         assert_eq!(network.net.equidistant_point, 0);
         assert_eq!(network.net.badlabels_rejection_percentage, 0.0);
         assert_eq!(network.net.num_sigmas_reject_badlabels, 0.0);

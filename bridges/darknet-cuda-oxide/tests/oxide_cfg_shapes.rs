@@ -810,6 +810,61 @@ fn synthetic_grouped() -> Vec<Geom> {
 }
 
 /// Sanity of the selection rule / picks themselves (no GPU).
+/// fp16 (P6) over the real cfg geometries: every 10th in-rule geometry of
+/// `conv_shapes.csv` (shrunk like the fp32 runs) through the fused f16 conv
+/// (f16 storage, f32 accumulate, linear epilogue, zero bias) against the f64
+/// reference computed from the f16-ROUNDED operands.  Tolerance model of
+/// `tests/oxide_half.rs`: `5.2e-4|ref| + 2e-5 * sum|w x| + 1e-7`.
+#[test]
+fn cfg_conv_fp16_sampled() {
+    use darknet_cuda_oxide::half::{f16_bits_to_f32, f32_to_f16_bits};
+    let round16 = |v: &[f32]| -> Vec<f32> { v.iter().map(|&x| f16_bits_to_f32(f32_to_f16_bits(x))).collect() };
+    let (sel, _) = selected();
+    let be = OxideBackend::new().unwrap();
+    let (mut run, mut worst, mut fails) = (0usize, 0.0f64, vec![]);
+    for (n, g) in sel.iter().enumerate().filter(|(n, _)| n % 10 == 0) {
+        let (c, shrunk) = shrink(g, 1, 10_000_000, 16_000_000);
+        let (oh, ow, cpg) = (c.oh(), c.ow(), c.cpg());
+        let kk = cpg * c.k * c.k;
+        let mut rng = Rng(5150 + n as u64);
+        let amp = 1.0 / (kk as f32).sqrt();
+        let x = round16(&rng.vec(c.x_len(), -1.0, 1.0));
+        let w = round16(&rng.vec(c.w_len(), -amp, amp));
+        let (xd, wd) = (f64s(&x), f64s(&w));
+        let (want, _, _) = conv_refs_impl(&c, &xd, &wd, &vec![0.0; c.y_len()]);
+        let (scale, _, _) = conv_refs_impl(&c, &abs64(&x), &abs64(&w), &vec![0.0; c.y_len()]);
+        let xt = be.upload_f16(&[c.b, c.c, c.h, c.w], &x).unwrap();
+        let wt = be.conv_weights_f16(&be.upload_f32(&[w.len()], &w).unwrap(), c.f, kk).unwrap();
+        let bt = be.upload_f32(&[c.f], &vec![0.0; c.f]).unwrap();
+        let res = be.conv2d_bias_act_f16(
+            &xt, &wt, &bt, &[c.b, c.f, oh, ow], c.c, c.h, c.w, c.f, c.k, c.sx, c.sy, c.dil, c.pad, c.groups,
+            F32ActivationKind::Linear, cfg(),
+        );
+        let y = match res.and_then(|y| be.download_f16(&y)) {
+            Ok(y) => y,
+            Err(e) => {
+                fails.push(format!("{}: {e}", label(g, &c, shrunk)));
+                continue;
+            }
+        };
+        let mut worst_here = 0.0f64;
+        for i in 0..y.len() {
+            let err = (y[i] as f64 - want[i]).abs();
+            let tol = 5.2e-4 * want[i].abs() + 2e-5 * scale[i] + 1e-7;
+            worst_here = worst_here.max(err / tol);
+            if !(err <= tol) {
+                fails.push(format!("{} [{i}] got {} want {} err {err:.3e} tol {tol:.3e}", label(g, &c, shrunk), y[i], want[i]));
+                break;
+            }
+        }
+        worst = worst.max(worst_here);
+        run += 1;
+    }
+    println!("==== cfg conv fp16 (sampled) ==== geometries run {run}, worst err/tol {worst:.3}, failed {}", fails.len());
+    assert!(run >= 90, "expected ~98 sampled geometries, ran {run}");
+    assert!(fails.is_empty(), "{}", fails[..fails.len().min(20)].join("\n"));
+}
+
 #[test]
 fn cfg_conv_selection_rule_and_picks() {
     let (sel, other) = selected();
@@ -1275,19 +1330,21 @@ fn parse_chw(s: &str) -> (usize, usize, usize) {
 }
 
 /// Shortcut: same-shape `shortcut_add_f32` forward (and the delta
-/// accumulation used by its backward) against a CPU sum.  Mismatched-shape
-/// shortcuts (30 layers / 18 distinct rows) are NOT expressible: the op
-/// only knows flat lengths.  Recorded behaviour: `Err` when the flat lengths
-/// differ, SILENT flat addition when they happen to be equal (e.g. 512x32x32
-/// vs 256x64x64) - the runtime must therefore check shapes before routing a
-/// shortcut to this op (it currently falls back to the CPU).
+/// accumulation used by its backward) against a CPU sum, plus the 30
+/// mismatched-shape layers (18 distinct rows): Darknet adds a differently
+/// shaped source FLAT per batch sample (`src_i < min(outputs, src_outputs)`,
+/// `shortcut_multilayer_*`), i.e. the source is cropped / zero-padded to the
+/// layer's per-sample length.  `shortcut_fit_f32` implements that resize;
+/// forward = `shortcut_add(x, fit(src))`, source gradient = `fit(delta)`.
+/// Batch 2 so the per-sample strides differ (a flat add over the whole batch
+/// would be wrong).  Reference = independent host loops.
 #[test]
 fn cfg_shortcut_shapes() {
     let t = Table::load("shortcut_shapes.csv");
     let be = OxideBackend::new().unwrap();
     let (mut same, mut mismatched, mut mismatch_layers) = (0usize, 0usize, 0usize);
+    let (mut crop_rows, mut pad_rows, mut equal_flat_rows) = (0usize, 0usize, 0usize);
     let (mut fails, mut worst) = (vec![], 0.0f64);
-    let (mut err_rows, mut silent_rows) = (vec![], vec![]);
     for r in 0..t.rows.len() {
         let cur = parse_chw(t.s(r, "cur_chw"));
         let srcs: Vec<(usize, usize, usize)> = t.s(r, "from_chw_list").split('|').map(parse_chw).collect();
@@ -1314,33 +1371,74 @@ fn cfg_shortcut_shapes() {
         } else {
             mismatched += 1;
             mismatch_layers += count;
-            let xt = be.zeros_f32(&[1, cur.0, cur.1, cur.2]).unwrap();
-            let yt = be.zeros_f32(&[1, from.0, from.1, from.2]).unwrap();
-            let res = be.shortcut_add_f32(&xt, &yt, cfg());
-            let what = format!("{} + {} (x{count})", t.s(r, "cur_chw"), t.s(r, "from_chw_list"));
-            match (xn == yn, res.is_ok()) {
-                (false, false) => err_rows.push(what),
-                (true, true) => silent_rows.push(what),
-                (eq, ok) => fails.push(format!("shortcut mismatched {what}: equal flat len {eq} but ok={ok}")),
+            match yn.cmp(&xn) {
+                std::cmp::Ordering::Less => pad_rows += 1,
+                std::cmp::Ordering::Greater => crop_rows += 1,
+                std::cmp::Ordering::Equal => equal_flat_rows += 1,
             }
+            let what = format!("{} + {} (x{count})", t.s(r, "cur_chw"), t.s(r, "from_chw_list"));
+            let batch = 2usize;
+            let (x, y, d) = (rng.vec(batch * xn, -1.0, 1.0), rng.vec(batch * yn, -1.0, 1.0), rng.vec(batch * xn, -1.0, 1.0));
+            let (xs, ys) = ([batch, cur.0, cur.1, cur.2], [batch, from.0, from.1, from.2]);
+            let (xt, yt, dt) = (
+                be.upload_f32(&xs, &x).unwrap(),
+                be.upload_f32(&ys, &y).unwrap(),
+                be.upload_f32(&xs, &d).unwrap(),
+            );
+            let m = xn.min(yn);
+            // forward: out[b*xn + i] = x + (i < m ? y[b*yn + i] : 0)
+            let mut want = vec![0.0f64; batch * xn];
+            for b in 0..batch {
+                for i in 0..xn {
+                    want[b * xn + i] = x[b * xn + i] as f64 + if i < m { y[b * yn + i] as f64 } else { 0.0 };
+                }
+            }
+            let fitted = be.shortcut_fit_f32(&yt, batch, &xs, cfg()).unwrap();
+            assert_eq!(fitted.shape(), &xs, "{what}: fitted shape");
+            let got = be.download_f32(&be.shortcut_add_f32(&xt, &fitted, cfg()).unwrap()).unwrap();
+            assert_close_report(&format!("shortcut {what} fwd"), &got, &want, 1e-6, &mut fails, &mut worst);
+            // backward: source gradient = delta cropped / zero-padded to the source size
+            let mut want = vec![0.0f64; batch * yn];
+            for b in 0..batch {
+                for i in 0..m {
+                    want[b * yn + i] = d[b * xn + i] as f64;
+                }
+            }
+            let sg = be.shortcut_fit_f32(&dt, batch, &ys, cfg()).unwrap();
+            assert_eq!(sg.shape(), &ys, "{what}: source gradient shape");
+            let got = be.download_f32(&sg).unwrap();
+            assert_close_report(&format!("shortcut {what} bwd source grad"), &got, &want, 0.0, &mut fails, &mut worst);
         }
     }
-    println!("==== cfg shortcut ==== same-shape rows {same} run, max abs err {worst:.2e}; mismatched rows {mismatched} ({mismatch_layers} layers)");
-    println!("  mismatched -> Err (flat length differs): {}", err_rows.len());
-    for w in &err_rows {
-        println!("    {w}");
-    }
-    println!("  mismatched -> SILENT flat add (equal flat length, wrong semantics): {}", silent_rows.len());
-    for w in &silent_rows {
-        println!("    {w}");
-    }
+    println!(
+        "==== cfg shortcut ==== same-shape rows {same}, mismatched rows {mismatched} ({mismatch_layers} layers: {pad_rows} zero-pad, {crop_rows} crop, {equal_flat_rows} equal flat length); max abs err {worst:.2e}"
+    );
     assert_eq!(mismatch_layers, 30, "30 mismatched-shape shortcut layers expected");
     assert!(fails.is_empty(), "{}", fails.join("\n"));
 }
 
+#[test]
+fn shortcut_fit_edge_cases_and_errors() {
+    let be = OxideBackend::new().unwrap();
+    let x: Vec<f32> = (0..6).map(|i| i as f32 + 1.0).collect(); // batch 2 x 3
+    let xt = be.upload_f32(&[2, 3], &x).unwrap();
+    // identity, pad, crop, 1-element crop
+    let run = |len: usize| be.download_f32(&be.shortcut_fit_f32(&xt, 2, &[2, len], cfg()).unwrap()).unwrap();
+    assert_eq!(run(3), x);
+    assert_eq!(run(5), vec![1.0, 2.0, 3.0, 0.0, 0.0, 4.0, 5.0, 6.0, 0.0, 0.0]);
+    assert_eq!(run(2), vec![1.0, 2.0, 4.0, 5.0]);
+    assert_eq!(run(1), vec![1.0, 4.0]);
+    // matches the host default implementation used by backends without a kernel
+    assert_eq!(run(5), darknet_cuda::host_ops::shortcut_fit(&x, 2, 5));
+    // Inconsistent arguments are errors, not panics.
+    assert!(be.shortcut_fit_f32(&xt, 4, &[2, 3], cfg()).is_err(), "output not divisible");
+    assert!(be.shortcut_fit_f32(&xt, 4, &[4, 3], cfg()).is_err(), "source not divisible by batch 4");
+    assert!(be.shortcut_fit_f32(&xt, 0, &[2, 3], cfg()).is_err(), "batch 0");
+}
+
 // -------------------------------------------------------------- activations
 
-const KINDS: [F32ActivationKind; 7] = [
+const KINDS: [F32ActivationKind; 9] = [
     F32ActivationKind::Linear,
     F32ActivationKind::Logistic,
     F32ActivationKind::Relu,
@@ -1348,6 +1446,8 @@ const KINDS: [F32ActivationKind; 7] = [
     F32ActivationKind::Mish,
     F32ActivationKind::Swish,
     F32ActivationKind::Tanh,
+    F32ActivationKind::Relu6,
+    F32ActivationKind::Ramp,
 ];
 
 fn kind_of(name: &str) -> Option<F32ActivationKind> {
@@ -1361,6 +1461,8 @@ fn kind_of(name: &str) -> Option<F32ActivationKind> {
         "mish" => F32ActivationKind::Mish,
         "swish" => F32ActivationKind::Swish,
         "tanh" => F32ActivationKind::Tanh,
+        "relu6" => F32ActivationKind::Relu6,
+        "ramp" => F32ActivationKind::Ramp,
         _ => return None,
     };
     match k {
@@ -1370,7 +1472,9 @@ fn kind_of(name: &str) -> Option<F32ActivationKind> {
         | F32ActivationKind::Leaky
         | F32ActivationKind::Mish
         | F32ActivationKind::Swish
-        | F32ActivationKind::Tanh => {}
+        | F32ActivationKind::Tanh
+        | F32ActivationKind::Relu6
+        | F32ActivationKind::Ramp => {}
     }
     Some(k)
 }
@@ -1387,6 +1491,8 @@ fn act64(kind: F32ActivationKind, x: f64) -> f64 {
         }
         F32ActivationKind::Swish => x / (1.0 + (-x).exp()),
         F32ActivationKind::Tanh => x.tanh(),
+        F32ActivationKind::Relu6 => x.clamp(0.0, 6.0),
+        F32ActivationKind::Ramp => x * (x > 0.0) as i32 as f64 + 0.1 * x,
     }
 }
 
@@ -1404,6 +1510,8 @@ fn grad64(kind: F32ActivationKind, x: f64) -> f64 {
         }
         F32ActivationKind::Swish => sig + x * sig * (1.0 - sig),
         F32ActivationKind::Tanh => 1.0 - x.tanh() * x.tanh(),
+        F32ActivationKind::Relu6 => if x > 0.0 && x < 6.0 { 1.0 } else { 0.0 },
+        F32ActivationKind::Ramp => if x > 0.0 { 1.1 } else { 0.1 },
     }
 }
 
@@ -1417,6 +1525,9 @@ fn act32(kind: F32ActivationKind, x: f32) -> f32 {
         F32ActivationKind::Mish => x * (1.0 + x.exp()).ln().tanh(),
         F32ActivationKind::Swish => x / (1.0 + (-x).exp()),
         F32ActivationKind::Tanh => x.tanh(),
+        // `.max(0).min(6)` (device fmax/fmin): NaN -> 0 like relu.
+        F32ActivationKind::Relu6 => x.max(0.0).min(6.0),
+        F32ActivationKind::Ramp => (if x > 0.0 { x } else { 0.0 }) + 0.1 * x,
     }
 }
 
@@ -1426,7 +1537,7 @@ fn same_f32(a: f32, b: f32) -> bool {
 
 fn edge_values() -> Vec<f32> {
     let mut v = vec![0.0f32, -0.0];
-    for m in [1e-30f32, 1e-6, 0.05, 0.5, 1.0, 2.5, 5.0, 10.0, 19.99, 20.0, 20.01, 25.0, 30.0, 88.0, 89.0, 100.0, 1e4] {
+    for m in [1e-30f32, 1e-6, 0.05, 0.5, 1.0, 2.5, 5.0, 5.999, 6.0, 6.001, 10.0, 19.99, 20.0, 20.01, 25.0, 30.0, 88.0, 89.0, 100.0, 1e4] {
         v.push(m);
         v.push(-m);
     }
@@ -1489,15 +1600,13 @@ fn cfg_activations_supported_and_unsupported() {
         println!("  activation {name:<8} cfg uses {uses:>5}: max abs err fwd {:.2e} bwd {:.2e}; fwd(NaN,+inf,-inf,1) = {:?}", worst[0], worst[1], f);
     }
     println!("==== cfg activations ==== supported+run: {}, failed: {}", supported.len(), fails.len());
+    // relu6 and ramp are now expressible (F32ActivationKind::{Relu6, Ramp}); no
+    // cfg activation may be left without a kind except the ones C++ itself
+    // does not give a Rust CPU path (none occur in activations.csv).
     for (name, uses) in &unsupported {
-        // The backend API takes `F32ActivationKind`, an enum with exactly the
-        // 7 variants matched in `kind_of`; relu6 / ramp have no variant and
-        // therefore cannot be expressed (the runtime must keep its CPU path).
-        assert!(kind_of(name).is_none());
-        println!("  activation {name}: {uses} cfg uses -> NOT expressible via F32ActivationKind (unsupported; CPU fallback required)");
+        println!("  activation {name}: {uses} cfg uses -> NOT expressible via F32ActivationKind (CPU fallback)");
     }
-    let names: BTreeSet<String> = unsupported.iter().map(|u| u.0.clone()).collect();
-    assert_eq!(names, BTreeSet::from(["ramp".to_string(), "relu6".to_string()]), "unsupported activation set changed");
+    assert!(unsupported.is_empty(), "cfg activations without an F32ActivationKind: {unsupported:?}");
     assert!(fails.is_empty(), "{}", fails[..fails.len().min(40)].join("\n"));
 }
 

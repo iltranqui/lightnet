@@ -17,6 +17,11 @@ cuda-host = { path = "../../crates/cuda-host" }
 # Host-side CUDA driver wrapper.
 cuda-core = "0.3.1"
 
+[dev-dependencies]
+# Runtime-level tests: `GpuExecutableNetwork<OxideBackend>` vs the CPU
+# `ExecutableNetwork` (tests/oxide_runtime_chain.rs).
+darknet-core = { path = "../../crates/darknet-core" }
+
 # Keep this CUDA bridge independent from the parent CPU workspace: kernels
 # only compile through `cargo oxide` (rustc-codegen-cuda).
 [workspace]

@@ -5,13 +5,15 @@
 //! semantics.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "oxide")]
 use darknet_core::GpuExecutableNetwork;
 use darknet_core::{
-    DataConfig, DetectionOptions, ExecutableNetwork, Network, PlanarRgbImage, Tensor,
+    DataConfig, DetectionOptions, ExecutableNetwork, LayerKind, LayerParams, Network,
+    PlanarRgbImage, Tensor, YoloLabel,
     YoloTrainingState, compute_learning_rate, compute_yolo_training_loss_with_state,
     decode_yolo_detections, inspect_weights_file, load_names_file, load_paths_file,
     load_training_batch_from_paths, save_weights,
@@ -169,6 +171,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let input = executable.zero_input();
             print_forward_backward_summary(&mut executable, &input, &seed_mode)?;
         }
+        "bench-train" => {
+            let cfg = required_arg(args.next(), "cfg path")?;
+            let steps = args.next().map(|v| v.parse()).transpose()?.unwrap_or(10);
+            let warmup = args.next().map(|v| v.parse()).transpose()?.unwrap_or(2);
+            bench_train(&cfg, steps, warmup)?;
+        }
         "detect-image" => {
             let cfg = required_arg(args.next(), "cfg path")?;
             let weights = required_arg(args.next(), "weights path")?;
@@ -208,6 +216,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "loaded weights {}.{}.{} seen={}",
                         header.major, header.minor, header.revision, header.seen
                     );
+                    if let Some(iters) = std::env::var("DARKNET_BENCH_ITERS")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                    {
+                        let batch = bench_batch();
+                        let mut bench_exec = ExecutableNetwork::new(network.with_batch(batch));
+                        bench_exec.load_weights_file(&weights)?;
+                        let bench_input = replicate_batch(&input, batch);
+                        bench_exec.forward(&bench_input)?;
+                        let mut ms = Vec::with_capacity(iters);
+                        for _ in 0..iters {
+                            let start = Instant::now();
+                            bench_exec.forward(&bench_input)?;
+                            ms.push(start.elapsed().as_secs_f64() * 1e3);
+                        }
+                        print_bench_json("cpu", batch, &ms, "\"threads\":0");
+                    }
                     executable.forward(&input)?
                 }
                 #[cfg(feature = "oxide")]
@@ -224,7 +249,72 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "loaded weights {}.{}.{} seen={}",
                         header.major, header.minor, header.revision, header.seen
                     );
-                    executable.forward(&input)?
+                    if let Some(iters) = std::env::var("DARKNET_BENCH_ITERS")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                    {
+                        // Latency benchmark (`tools/oxide_bench.py`): forward_compact returns
+                        // the yolo heads on the host, so every iteration is fully synchronised.
+                        // DARKNET_BENCH_BATCH replicates the image into a batch (default 1).
+                        let batch = bench_batch();
+                        let bench_net = network.with_batch(batch);
+                        let bench_input = replicate_batch(&input, batch);
+                        let mut bench_exec = GpuExecutableNetwork::new(bench_net, OxideBackend::new()?);
+                        bench_exec.load_weights_file(&weights)?;
+                        let (free0, total) = bench_exec.backend().device_mem_info()?;
+                        let mut peak_used = 0usize;
+                        // DARKNET_OXIDE_GEMM=fp16 runs the f16-storage inference path.
+                        let use_f16 = bench_exec.backend().f16_storage_enabled();
+                        for _ in 0..5 {
+                            if use_f16 {
+                                bench_exec.forward_compact_f16(&bench_input)?;
+                            } else {
+                                bench_exec.forward_compact(&bench_input)?;
+                            }
+                        }
+                        let mut ms = Vec::with_capacity(iters);
+                        for _ in 0..iters {
+                            let start = Instant::now();
+                            if use_f16 {
+                                bench_exec.forward_compact_f16(&bench_input)?;
+                            } else {
+                                bench_exec.forward_compact(&bench_input)?;
+                            }
+                            ms.push(start.elapsed().as_secs_f64() * 1e3);
+                            let (free, _) = bench_exec.backend().device_mem_info()?;
+                            peak_used = peak_used.max(free0.saturating_sub(free));
+                        }
+                        let b = bench_exec.backend();
+                        print_bench_json(
+                            "oxide",
+                            batch,
+                            &ms,
+                            &format!(
+                                "\"device_mem_delta_mb\":{:.1},\"workspace_mb\":{:.2},\"pool_cached_mb\":{:.1},\"device_total_mb\":{:.0},\"conv_mode\":\"{:?}\",\"gemm_mode\":\"{:?}\"",
+                                peak_used as f64 / 1048576.0,
+                                b.workspace_bytes() as f64 / 1048576.0,
+                                b.pool_cached_bytes() as f64 / 1048576.0,
+                                total as f64 / 1048576.0,
+                                b.conv_mode(),
+                                b.gemm_mode()
+                            ),
+                        );
+                    }
+                    if executable.backend().f16_storage_enabled() {
+                        // f16 storage inference (DARKNET_OXIDE_GEMM=fp16): only the
+                        // yolo heads are produced (detections need nothing else).
+                        let summary = executable.forward_compact_f16(&input)?;
+                        darknet_core::ForwardResult {
+                            layer_outputs: Vec::new(),
+                            layer_activation_inputs: Vec::new(),
+                            dropout_masks: Vec::new(),
+                            crop_caches: Vec::new(),
+                            recurrent_caches: Vec::new(),
+                            yolo_heads: summary.yolo_heads,
+                        }
+                    } else {
+                        executable.forward(&input)?
+                    }
                 }
                 other => {
                     return Err(format!(
@@ -233,6 +323,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .into());
                 }
             };
+            if let Some(dump_dir) = std::env::var_os("DARKNET_LAYER_DUMP_DIR") {
+                dump_rust_layer_outputs(
+                    Path::new(&dump_dir),
+                    &network,
+                    &result.layer_outputs,
+                )?;
+            }
             let detections = decode_yolo_detections(
                 &network,
                 &result.yolo_heads,
@@ -264,7 +361,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if tsv {
                     // Full-precision machine-readable line for backend comparisons.
                     println!(
-                        "det\t{class_name}\t{:.7}\t{:.4}\t{:.4}\t{:.4}\t{:.4}",
+                        "det\t{class_name}\t{:.9}\t{:.9}\t{:.9}\t{:.9}\t{:.9}",
                         detection.confidence,
                         detection.bbox.left(),
                         detection.bbox.top(),
@@ -293,6 +390,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn dump_rust_layer_outputs(
+    dump_dir: &Path,
+    network: &Network,
+    layer_outputs: &[Tensor],
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(dump_dir)?;
+    let mut metadata = fs::File::create(dump_dir.join("layers.tsv"))?;
+    writeln!(metadata, "index\ttype\tw\th\tc\tbatch\tcount")?;
+    for (index, (layer, output)) in network.layers.iter().zip(layer_outputs).enumerate() {
+        let mut raw = fs::File::create(dump_dir.join(format!("layer_{index:03}.f32")))?;
+        for value in &output.data {
+            raw.write_all(&value.to_le_bytes())?;
+        }
+        let shape = output.shape;
+        writeln!(
+            metadata,
+            "{index}\t{:?}\t{}\t{}\t{}\t{}\t{}",
+            layer.kind,
+            shape.width,
+            shape.height,
+            shape.channels,
+            shape.batch,
+            output.data.len(),
+        )?;
+    }
+    Ok(())
+}
+
 /// Execution backend for inference/training: `DARKNET_BACKEND=cpu|oxide`
 /// (default `cpu`). `DARKNET_OXIDE_CONV` / `DARKNET_OXIDE_GEMM` tune oxide.
 fn selected_backend() -> Result<String, Box<dyn std::error::Error>> {
@@ -301,6 +426,364 @@ fn selected_backend() -> Result<String, Box<dyn std::error::Error>> {
         "cpu" | "oxide" => Ok(backend),
         other => Err(format!("invalid DARKNET_BACKEND: {other} (expected cpu or oxide)").into()),
     }
+}
+
+/// Deterministic uniform [0, 1) stream for the synthetic benchmark data.
+fn bench_uniform(state: &mut u64) -> f32 {
+    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    ((*state >> 40) as u32) as f32 / 16_777_216.0
+}
+
+/// He-style random weights, unit BN scales/variances, zero biases.
+/// All convolution weights, flattened (for the bench weight-delta dump).
+fn conv_weight_snapshot(params: &[LayerParams]) -> Vec<f32> {
+    let mut v = Vec::new();
+    for p in params {
+        if let LayerParams::Convolutional(conv) = p {
+            v.extend_from_slice(&conv.weights);
+        }
+    }
+    v
+}
+
+/// First-order loss surrogate sum(delta * yolo_output) over all heads.
+fn surrogate(heads: &[darknet_core::YoloHeadOutput], seeds: &[Option<Tensor>]) -> f64 {
+    heads
+        .iter()
+        .filter_map(|h| seeds[h.layer_index].as_ref().map(|d| (h, d)))
+        .map(|(h, d)| h.output.data.iter().zip(&d.data).map(|(o, d)| f64::from(*o) * f64::from(*d)).sum::<f64>())
+        .sum()
+}
+
+/// L2 norm of all yolo output-gradient seeds.
+fn seeds_l2(seeds: &[Option<Tensor>]) -> f64 {
+    seeds
+        .iter()
+        .flatten()
+        .flat_map(|t| t.data.iter())
+        .map(|v| f64::from(*v) * f64::from(*v))
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// Parity dump: per conv layer biases, [bn biases, scales, rolling mean, rolling var], weights
+/// (f32 LE, in that order) to `<prefix>.step<k>.bin`, lengths to `<prefix>.layers` (`layer:nb:nbn:nw`).
+fn dump_parity(prefix: &str, step: usize, params: &[LayerParams]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut bytes = Vec::new();
+    let mut lens = Vec::new();
+    for (idx, p) in params.iter().enumerate() {
+        if let LayerParams::Convolutional(conv) = p {
+            let put = |b: &mut Vec<u8>, v: &[f32]| v.iter().for_each(|x| b.extend(x.to_le_bytes()));
+            put(&mut bytes, &conv.biases);
+            let nbn = conv.batch_norm.as_ref().map_or(0, |bn| bn.scales.len());
+            if let Some(bn) = &conv.batch_norm {
+                put(&mut bytes, &bn.biases);
+                put(&mut bytes, &bn.scales);
+                put(&mut bytes, &bn.rolling_mean);
+                put(&mut bytes, &bn.rolling_variance);
+            }
+            put(&mut bytes, &conv.weights);
+            lens.push(format!("{idx}:{}:{nbn}:{}", conv.biases.len(), conv.weights.len()));
+        }
+    }
+    fs::write(format!("{prefix}.layers"), lens.join(","))?;
+    fs::write(format!("{prefix}.step{step}.bin"), bytes)?;
+    Ok(())
+}
+
+fn init_bench_params(params: &mut [LayerParams], state: &mut u64) {
+    for p in params {
+        if let LayerParams::Convolutional(conv) = p {
+            let fan_in = (conv.weights.len() / conv.biases.len().max(1)).max(1);
+            let bound = (6.0 / fan_in as f32).sqrt();
+            for w in &mut conv.weights {
+                *w = (bench_uniform(state) * 2.0 - 1.0) * bound;
+            }
+            if let Some(bn) = conv.batch_norm.as_mut() {
+                bn.scales.fill(1.0);
+                bn.rolling_variance.fill(1.0);
+            }
+        }
+    }
+}
+
+/// Peak resident host memory of this process in MB (`VmHWM`).
+fn peak_host_rss_mb() -> f64 {
+    fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("VmHWM:"))
+                .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<f64>().ok())
+        })
+        .map_or(0.0, |kb| kb / 1024.0)
+}
+
+/// Synthetic training-step benchmark (no dataset): random input and random
+/// output deltas on every yolo layer stand in for the CPU loss (C++ and Rust
+/// both compute the yolo loss on the host), so a step is
+/// forward-for-training + backward + SGD update, fully synchronised (the GPU
+/// path downloads every layer output after the forward and the updated weights
+/// after the update).  Prints one `BENCH_TRAIN_JSON` line.
+fn bench_train(cfg: &str, steps: usize, warmup: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let mut network = Network::from_path(cfg)?;
+    if let Some(batch) = std::env::var("DARKNET_BENCH_BATCH").ok().and_then(|v| v.parse().ok()) {
+        network = network.with_batch(batch);
+    }
+    let backend = selected_backend()?;
+    let batch = network.net.batch;
+    let lr = std::env::var("DARKNET_BENCH_LR").ok().and_then(|v| v.parse().ok()).unwrap_or(1e-4f32);
+    let (momentum, decay) = (network.net.momentum, network.net.decay);
+    let mut rng = 0x5eed_1234_5678_9abcu64;
+    let shape = network.net.input_shape();
+    let input = Tensor::from_data(
+        shape,
+        (0..batch * shape.element_count()).map(|_| bench_uniform(&mut rng)).collect(),
+    )?;
+    let mut seeds: Vec<Option<Tensor>> = vec![None; network.layers.len()];
+    for layer in &network.layers {
+        if matches!(layer.kind, LayerKind::Yolo(_) | LayerKind::GaussianYolo(_)) {
+            let shape = layer.output_shape;
+            seeds[layer.index] = Some(Tensor::from_data(
+                shape,
+                (0..shape.batch * shape.element_count())
+                    .map(|_| (bench_uniform(&mut rng) - 0.5) * 0.2)
+                    .collect(),
+            )?);
+        }
+    }
+
+    // `DARKNET_BENCH_INPUT=<f32 LE file>` + `DARKNET_BENCH_LABELS=<text, lines "b cls x y w h">`:
+    // fixed real batch + the REAL yolo loss every step (training-parity run, see
+    // docs/OXIDE_BENCH.md section 8). `DARKNET_PARITY_DUMP=<prefix>`,
+    // `DARKNET_PARITY_STEPS=0,1,5` dump all parameters after those steps.
+    let mut input = input;
+    let mut parity_labels: Option<Vec<Vec<YoloLabel>>> = None;
+    let read_f32 = |path: &str| -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        Ok(fs::read(path)?.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    };
+    if let Ok(ip) = std::env::var("DARKNET_BENCH_INPUT") {
+        input = Tensor::from_data(shape, read_f32(&ip)?)?;
+    }
+    // `DARKNET_BENCH_DELTAS=<prefix>`: fixed synthetic yolo output deltas from `<prefix>.<layer>.bin`
+    // (identical files are read by the C++ parity probe); prints a first-order loss surrogate
+    // sum(delta * yolo_output) per step instead of the real loss.
+    let fixed_deltas = if let Ok(prefix) = std::env::var("DARKNET_BENCH_DELTAS") {
+        for layer in &network.layers {
+            if matches!(layer.kind, LayerKind::Yolo(_) | LayerKind::GaussianYolo(_)) {
+                seeds[layer.index] = Some(Tensor::from_data(layer.output_shape, read_f32(&format!("{prefix}.{}.bin", layer.index))?)?);
+            }
+        }
+        true
+    } else {
+        false
+    };
+    if let Ok(lp) = std::env::var("DARKNET_BENCH_LABELS") {
+        let mut labels = vec![Vec::new(); batch];
+        for line in fs::read_to_string(&lp)?.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() == 6 {
+                labels[f[0].parse::<usize>()?].push(YoloLabel {
+                    class_id: f[1].parse()?,
+                    x: f[2].parse()?,
+                    y: f[3].parse()?,
+                    w: f[4].parse()?,
+                    h: f[5].parse()?,
+                });
+            }
+        }
+        parity_labels = Some(labels);
+    }
+    let parity_prefix = std::env::var("DARKNET_PARITY_DUMP").ok();
+    let parity_steps: Vec<usize> = std::env::var("DARKNET_PARITY_STEPS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .collect();
+    let mut yolo_state = YoloTrainingState::default();
+
+    let (mut total, mut fwd, mut bwd, mut upd) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    #[allow(unused_mut)]
+    let mut peak_device = 0usize;
+    #[allow(unused_mut)]
+    let mut device_total = 0usize;
+    match backend.as_str() {
+        "cpu" => {
+            let mut exec = ExecutableNetwork::new(network);
+            init_bench_params(&mut exec.params, &mut rng);
+            if let Ok(path) = std::env::var("DARKNET_BENCH_WEIGHTS") {
+                exec.load_weights_file(&path)?;
+            }
+            if let Some(prefix) = &parity_prefix {
+                if parity_steps.contains(&0) {
+                    dump_parity(prefix, 0, &exec.params)?;
+                }
+            }
+            for step in 0..warmup + steps {
+                let t0 = Instant::now();
+                let forward = exec.forward_training(&input)?;
+                if let Some(labels) = &parity_labels {
+                    let yolo = compute_yolo_training_loss_with_state(
+                        &exec.network, &forward, labels, step, Some(&mut yolo_state))?;
+                    println!("PARITY backend=cpu step={} loss={:.6} delta_l2={:.6}", step + 1, yolo.loss, seeds_l2(&yolo.layer_output_gradient_seeds));
+                    seeds = yolo.layer_output_gradient_seeds;
+                }
+                if fixed_deltas {
+                    println!("PARITY backend=cpu step={} surrogate={:.6}", step + 1, surrogate(&forward.yolo_heads, &seeds));
+                }
+                let t1 = Instant::now();
+                exec.backward_accumulate_seeded(&input, &forward, &seeds)?;
+                let t2 = Instant::now();
+                exec.update_weights(lr, momentum, decay, batch);
+                let t3 = Instant::now();
+                if let Some(prefix) = &parity_prefix {
+                    if parity_steps.contains(&(step + 1)) {
+                        dump_parity(prefix, step + 1, &exec.params)?;
+                    }
+                }
+                if step >= warmup {
+                    let ms = |a: Instant, b: Instant| b.duration_since(a).as_secs_f64() * 1e3;
+                    fwd.push(ms(t0, t1));
+                    bwd.push(ms(t1, t2));
+                    upd.push(ms(t2, t3));
+                    total.push(ms(t0, t3));
+                }
+            }
+        }
+        #[cfg(feature = "oxide")]
+        "oxide" => {
+            let oxide = OxideBackend::new()?;
+            let (free0, total_bytes) = oxide.device_mem_info()?;
+            device_total = total_bytes;
+            let mut exec = GpuExecutableNetwork::new(network, oxide);
+            init_bench_params(&mut exec.params, &mut rng);
+            // Optional trained weights instead of the random init (A/B of precision
+            // modes on a well-conditioned net).
+            if let Ok(path) = std::env::var("DARKNET_BENCH_WEIGHTS") {
+                exec.load_weights_file(&path)?;
+            }
+            let init_weights = conv_weight_snapshot(&exec.params);
+            exec.init_train_buffers_gpu()?;
+            if let Some(prefix) = &parity_prefix {
+                if parity_steps.contains(&0) {
+                    dump_parity(prefix, 0, &exec.params)?;
+                }
+            }
+            for step in 0..warmup + steps {
+                let t0 = Instant::now();
+                let forward = exec.forward_training_device(&input)?;
+                if let Some(labels) = &parity_labels {
+                    let yolo = compute_yolo_training_loss_with_state(
+                        &exec.network, &forward.cpu_forward, labels, step, Some(&mut yolo_state))?;
+                    println!("PARITY backend=oxide step={} loss={:.6} delta_l2={:.6}", step + 1, yolo.loss, seeds_l2(&yolo.layer_output_gradient_seeds));
+                    seeds = yolo.layer_output_gradient_seeds;
+                }
+                if fixed_deltas {
+                    println!("PARITY backend=oxide step={} surrogate={:.6}", step + 1, surrogate(&forward.cpu_forward.yolo_heads, &seeds));
+                }
+                if step == 0 {
+                    if let Some(prefix) = &parity_prefix {
+                        for h in &forward.cpu_forward.yolo_heads {
+                            let b: Vec<u8> = h.output.data.iter().flat_map(|v| v.to_le_bytes()).collect();
+                            fs::write(format!("{prefix}.out.{}.bin", h.layer_index), b)?;
+                        }
+                    }
+                }
+                let t1 = Instant::now();
+                exec.backward_accumulate_seeded_gpu(&forward, &seeds)?;
+                let (free_bwd, _) = exec.backend().device_mem_info()?;
+                let t2 = Instant::now();
+                drop(forward);
+                exec.update_weights_gpu_deferred(lr, momentum, decay, batch)?;
+                let t3 = Instant::now();
+                if let Some(prefix) = &parity_prefix {
+                    if parity_steps.contains(&(step + 1)) {
+                        exec.sync_host_weights_from_device()?;
+                        dump_parity(prefix, step + 1, &exec.params)?;
+                    }
+                }
+                let (free_end, _) = exec.backend().device_mem_info()?;
+                peak_device = peak_device
+                    .max(free0.saturating_sub(free_bwd))
+                    .max(free0.saturating_sub(free_end));
+                if step >= warmup {
+                    let ms = |a: Instant, b: Instant| b.duration_since(a).as_secs_f64() * 1e3;
+                    fwd.push(ms(t0, t1));
+                    bwd.push(ms(t1, t2));
+                    upd.push(ms(t2, t3));
+                    total.push(ms(t0, t3));
+                }
+            }
+            // `DARKNET_BENCH_DUMP=<file>`: conv weight deltas (f32 LE) for A/B of
+            // precision modes (same init / input / seeds), see tools / OXIDE_BENCH.md.
+            if let Ok(path) = std::env::var("DARKNET_BENCH_DUMP") {
+                exec.sync_host_weights_from_device()?;
+                let now = conv_weight_snapshot(&exec.params);
+                let mut bytes = Vec::new();
+                for (a, b) in now.iter().zip(&init_weights) {
+                    bytes.extend((a - b).to_le_bytes());
+                }
+                let lens: Vec<String> = exec
+                    .params
+                    .iter()
+                    .filter_map(|p| match p {
+                        LayerParams::Convolutional(conv) => Some(conv.weights.len().to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                fs::write(format!("{path}.layers"), lens.join(","))?;
+                fs::write(path, bytes)?;
+            }
+        }
+        other => {
+            return Err(format!("backend {other} is not available in this build").into());
+        }
+    }
+    let list = |v: &[f64]| v.iter().map(|x| format!("{x:.3}")).collect::<Vec<_>>().join(",");
+    let median = |v: &[f64]| {
+        let mut s = v.to_vec();
+        s.sort_by(|a, b| a.total_cmp(b));
+        s.get(s.len() / 2).copied().unwrap_or(0.0)
+    };
+    println!(
+        "bench-train backend={backend} batch={batch} steps={steps}: step median {:.2} ms (fwd {:.2} / bwd {:.2} / update {:.2})",
+        median(&total),
+        median(&fwd),
+        median(&bwd),
+        median(&upd)
+    );
+    println!(
+        "BENCH_TRAIN_JSON {{\"backend\":\"{backend}\",\"batch\":{batch},\"steps\":{steps},\"ms\":[{}],\"fwd_ms\":[{}],\"bwd_ms\":[{}],\"update_ms\":[{}],\"device_mem_peak_mb\":{:.1},\"device_total_mb\":{:.0},\"host_rss_peak_mb\":{:.1}}}",
+        list(&total),
+        list(&fwd),
+        list(&bwd),
+        list(&upd),
+        peak_device as f64 / 1048576.0,
+        device_total as f64 / 1048576.0,
+        peak_host_rss_mb()
+    );
+    Ok(())
+}
+
+fn bench_batch() -> usize {
+    std::env::var("DARKNET_BENCH_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1)
+}
+
+/// Tile a batch-1 input into `batch` identical images.
+fn replicate_batch(input: &Tensor, batch: usize) -> Tensor {
+    let mut shape = input.shape;
+    shape.batch = batch;
+    Tensor { shape, data: input.data.repeat(batch) }
+}
+
+/// One machine-readable line for `tools/oxide_bench.py`: per-iteration latencies in ms.
+fn print_bench_json(backend: &str, batch: usize, ms: &[f64], extra: &str) {
+    let list: Vec<String> = ms.iter().map(|v| format!("{v:.4}")).collect();
+    println!(
+        "BENCH_JSON {{\"backend\":\"{backend}\",\"batch\":{batch},\"iters\":{},\"ms\":[{}],{extra}}}",
+        ms.len(),
+        list.join(",")
+    );
 }
 
 fn required_arg(value: Option<String>, name: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -537,6 +1020,7 @@ fn run_detector_train_cpu(
     {
         let iteration_start = Instant::now();
         let lr = compute_learning_rate(&executable.network.net, batch_num);
+        executable.set_train_iteration(batch_num);
         let mut iter_loss = 0.0f32;
         for subdivision in 0..executable.network.net.subdivisions.max(1) {
             let start_index = image_cursor + subdivision * executable.network.net.batch.max(1);
@@ -565,7 +1049,9 @@ fn run_detector_train_cpu(
             lr,
             executable.network.net.momentum,
             executable.network.net.decay,
-            executable.network.net.batch.max(1),
+            // C++ update_network: batch * subdivisions (gradients are summed
+            // over every subdivision before the step).
+            images_per_iteration,
         );
 
         batch_num += 1;
@@ -677,6 +1163,7 @@ fn run_detector_train_gpu(
     {
         let iteration_start = Instant::now();
         let lr = compute_learning_rate(&executable.network.net, batch_num);
+        executable.set_train_iteration(batch_num);
         let mut iter_loss = 0.0f32;
         // NOTE: do NOT zero train buffers here. After update_weights_gpu, the buffers
         // hold momentum * previous_gradient (C++ weight_updates *= momentum). Zeroing
@@ -690,7 +1177,7 @@ fn run_detector_train_gpu(
                 &train_images,
                 start_index,
             )?;
-            let forward = executable.forward_training_with_state(&batch.input)?;
+            let forward = executable.forward_training_device(&batch.input)?;
             let yolo = compute_yolo_training_loss_with_state(
                 &executable.network,
                 &forward.cpu_forward,
@@ -702,11 +1189,13 @@ fn run_detector_train_gpu(
             executable
                 .backward_accumulate_seeded_gpu(&forward, &yolo.layer_output_gradient_seeds)?;
         }
-        executable.update_weights_gpu(
+        executable.update_weights_gpu_deferred(
             lr,
             executable.network.net.momentum,
             executable.network.net.decay,
-            executable.network.net.batch.max(1),
+            // C++ update_network: batch * subdivisions (gradients are summed
+            // over every subdivision before the step).
+            images_per_iteration,
         )?;
 
         batch_num += 1;
@@ -729,6 +1218,7 @@ fn run_detector_train_gpu(
 
         if batch_num % 1000 == 0 {
             let checkpoint = backup_dir.join(format!("{base_name}_{batch_num}.weights"));
+            executable.sync_host_weights_from_device()?;
             save_weights(&executable.network, &executable.params, &checkpoint, seen)?;
             println!("saved {}", checkpoint.display());
         }
@@ -741,6 +1231,7 @@ fn run_detector_train_gpu(
     }
 
     let final_checkpoint = backup_dir.join(format!("{base_name}_final.weights"));
+    executable.sync_host_weights_from_device()?;
     save_weights(
         &executable.network,
         &executable.params,
@@ -851,8 +1342,9 @@ fn print_usage() {
     println!("  weights-inspect <cfg> <weights>");
     println!("  forward-dummy <cfg> [weights]");
     println!("  forward-backward-dummy <cfg> [weights] [auto|yolo|final]");
+    println!("  bench-train <cfg> [steps] [warmup]   (synthetic fwd+bwd+SGD steps, no dataset; DARKNET_BENCH_BATCH, DARKNET_BACKEND)");
     println!("  detect-image <cfg> <weights> <names> <image> [thresh] [nms] [resize|letterbox|resize-exact]");
-    println!("env: DARKNET_BACKEND=cpu|oxide, DARKNET_OXIDE_CONV, DARKNET_OXIDE_GEMM, DARKNET_DETECT_TSV=1");
+    println!("env: DARKNET_BACKEND=cpu|oxide, DARKNET_OXIDE_CONV, DARKNET_OXIDE_GEMM, DARKNET_OXIDE_AMP=1 (mixed-precision training), DARKNET_DETECT_TSV=1");
 }
 
 fn print_network_summary(network: &Network) {

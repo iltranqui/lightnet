@@ -15,7 +15,8 @@ use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
 pub mod kernels {
     use super::*;
 
-    /// `x` is read at `x_base + (c * h + iy) * w + ix`.
+    /// `x` is read at `x_base + image * C*H*W + (c * h + iy) * w + ix`; `images`
+    /// consecutive images are unrolled into consecutive `col_len` blocks.
     #[kernel]
     pub fn im2col(
         x: &[f32],
@@ -31,14 +32,19 @@ pub mod kernels {
         padding: usize,
         out_h: usize,
         out_w: usize,
+        images: usize,
     ) {
         let idx = thread::index_1d();
-        let i = idx.get();
+        let gi = idx.get();
         let ohw = out_h * out_w;
         let kk = ksize * ksize;
-        if i >= channels * kk * ohw {
+        let col_len = channels * kk * ohw;
+        if gi >= images * col_len {
             return;
         }
+        // `col` is `[image][col_len]`; image `m` reads `x` from `x_base + m * C*H*W`.
+        let x_base = x_base + (gi / col_len) * channels * h * w;
+        let i = gi % col_len;
         let r = i / ohw;
         let p = i % ohw;
         let c = r / kk;

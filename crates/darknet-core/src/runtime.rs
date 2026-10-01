@@ -25,13 +25,45 @@ use std::path::Path;
 use crate::error::{Error, Result};
 use crate::image::PlanarRgbImage;
 use crate::model::{
-    Activation, ConnectedSpec, ConvolutionalSpec, CrnnSpec, CropSpec, GruSpec, LayerKind,
-    LocalSpec, LrPolicy, LstmSpec, NetConfig, Network, RnnSpec, RouteSpec, TensorShape,
+    Activation, ConnectedSpec, ConvolutionalSpec, CrnnSpec, CropSpec, DropblockSpec, GruSpec,
+    LayerKind, LocalSpec, LrPolicy, LstmSpec, NetConfig, Network, RnnSpec, RouteSpec, TensorShape,
 };
 use crate::weights::WeightsHeader;
-use darknet_cuda::{ElementwiseLaunchConfig, F32ActivationKind, F32TensorOpsBackend};
+use darknet_cuda::{
+    AdamParams, ElementwiseLaunchConfig, F16TensorOpsBackend, F32ActivationKind, F32TensorOpsBackend,
+    NanInfMode, dropout_unit,
+};
 
 const BATCH_NORM_EPSILON: f32 = 0.000_01;
+/// Rolling-stat EMA keep factor of the GPU batch-statistics training path
+/// (same value the host-side running-stat updates use).
+const BATCH_NORM_ROLLING_KEEP: f32 = 0.9;
+
+/// Backward-pass policy for the few ops where C++ Darknet's hand-written gradient is not the
+/// exact derivative of its forward. `Analytical` (default) is the exact derivative, `Cpp`
+/// reproduces the C++ shortcut for training parity. Selected by `DARKNET_GRAD_MODE=analytical|cpp`
+/// and read at each backward. Affects only: softmax (C++ passes `dy` through; its cost layer
+/// folds the Jacobian in) and `scale_channels` with `scale_wh=1` (C++ divides the scale gradient
+/// by `w*h`). See `tasks/rust/todo.md` "Analytical gradients everywhere" for the full audit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GradMode {
+    #[default]
+    Analytical,
+    Cpp,
+}
+
+impl GradMode {
+    pub fn from_env() -> Self {
+        Self::parse(&std::env::var("DARKNET_GRAD_MODE").unwrap_or_default())
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value.to_ascii_lowercase().as_str() {
+            "cpp" | "c++" => Self::Cpp,
+            _ => Self::Analytical,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tensor {
@@ -388,7 +420,27 @@ where
     pub input_gpu: T,
     pub gpu_layer_outputs: Vec<T>,
     pub gpu_layer_activation_inputs: Vec<Option<T>>,
+    /// Batch-statistics batch-norm state of convolutional layers run by a
+    /// training forward; `None` means rolling statistics were used (inference
+    /// forward, or a network that needs the CPU backward fallback).
+    pub gpu_batch_norm_caches: Vec<Option<GpuBatchNormCache<T>>>,
     pub cpu_forward: ForwardResult,
+}
+
+/// What the batch-norm backward pass and the rolling-stat update need from a
+/// batch-statistics forward.
+#[derive(Clone, Debug)]
+pub struct GpuBatchNormCache<T>
+where
+    T: Clone,
+{
+    scales: T,
+    x_hat: T,
+    /// Biased batch variance.
+    variance: T,
+    /// Updated `(rolling_mean, rolling_variance)`; `None` for shared layers,
+    /// whose owner keeps the statistics.
+    rolling: Option<(T, T)>,
 }
 
 /// Pre-allocate the shared backward scratch buffer.
@@ -422,6 +474,10 @@ pub struct ExecutableNetwork {
     /// Shared scratch buffer for backward pass — avoids per-call Vec allocation.
     /// Equivalent to C++ `net->workspace`. Private; threaded through backward_accumulate paths.
     workspace: Vec<f32>,
+    /// Training iteration in progress (C++ `get_current_iteration`): drives the
+    /// DropBlock ramp and the `dont_update`/`burnin_update` gates (see
+    /// [`ExecutableNetwork::set_train_iteration`]).
+    train_iteration: usize,
 }
 
 impl ExecutableNetwork {
@@ -445,6 +501,7 @@ impl ExecutableNetwork {
             params,
             train_buffers,
             workspace,
+            train_iteration: 0,
         }
     }
 
@@ -458,6 +515,14 @@ impl ExecutableNetwork {
 
     pub fn load_weights_file(&mut self, path: impl AsRef<Path>) -> Result<WeightsHeader> {
         load_weights_into_params(&self.network, &mut self.params, path)
+    }
+
+    /// Sets the 0-based index of the training iteration in progress (the
+    /// CLI's `batch_num`).  The forward pass uses it for the DropBlock ramp;
+    /// the update uses `iteration + 1` (C++ `seen / (batch * subdivisions)`
+    /// after the iteration's batches) for `dont_update` / `burnin_update`.
+    pub fn set_train_iteration(&mut self, iteration: usize) {
+        self.train_iteration = iteration;
     }
 
     pub fn zero_train_buffers(&mut self) {
@@ -478,7 +543,19 @@ impl ExecutableNetwork {
     /// convention is intentional and is shared by the CPU runtime and every
     /// backend implementing [`F32TensorOpsBackend::sgd_update_f32`].
     pub fn update_weights(&mut self, lr: f32, momentum: f32, decay: f32, batch: usize) {
-        for (params, train) in self.params.iter_mut().zip(&mut self.train_buffers) {
+        let iteration_num = self.train_iteration as i64 + 1;
+        let burn_in = self.network.net.burn_in;
+        for (layer_index, (params, train)) in self
+            .params
+            .iter_mut()
+            .zip(&mut self.train_buffers)
+            .enumerate()
+        {
+            // C++ `update_network`: per-layer update gating.
+            let opts = self.network.layers[layer_index].train;
+            if !opts.updates_at(iteration_num, burn_in) {
+                continue;
+            }
             match (params, train) {
                 (LayerParams::BatchNorm(params), LayerTrainBuffers::BatchNorm(train)) => {
                     sgd_update(
@@ -499,6 +576,18 @@ impl ExecutableNetwork {
                     );
                 }
                 (LayerParams::Convolutional(params), LayerTrainBuffers::Convolutional(train)) => {
+                    // Per-layer `learning_rate` scale, `grad_centr` (with BN)
+                    // before the step and `clip` on the weights after it.
+                    let lr = lr * opts.learning_rate_scale;
+                    if opts.grad_centr && params.batch_norm.is_some() {
+                        let f_size = params.weights.len() / params.biases.len().max(1);
+                        if f_size > 0 {
+                            train.weight_updates = darknet_cuda::host_ops::gradient_centralization(
+                                &train.weight_updates,
+                                f_size,
+                            );
+                        }
+                    }
                     sgd_update(
                         &mut params.weights,
                         &mut train.weight_updates,
@@ -526,6 +615,9 @@ impl ExecutableNetwork {
                             0.0,
                             batch,
                         );
+                    }
+                    if opts.clip > 0.0 {
+                        params.weights = darknet_cuda::host_ops::constrain(&params.weights, opts.clip);
                     }
                 }
                 (LayerParams::Connected(params), LayerTrainBuffers::Connected(train)) => {
@@ -962,13 +1054,24 @@ impl ExecutableNetwork {
                 (LayerKind::Softmax { groups }, LayerParams::None) => {
                     (forward_softmax(current_input, *groups)?, None)
                 }
-                (LayerKind::Dropout { probability }, LayerParams::None) => {
-                    let (output, mask) = forward_dropout(
-                        current_input,
-                        probability.unwrap_or(0.5),
-                        training,
-                        &mut rng_state,
-                    )?;
+                (LayerKind::Dropout { probability, dropblock }, LayerParams::None) => {
+                    let (output, mask) = match dropblock {
+                        Some(spec) => forward_dropblock(
+                            current_input,
+                            spec,
+                            probability.unwrap_or(0.5),
+                            training,
+                            &mut rng_state,
+                            self.train_iteration,
+                            self.network.net.max_batches,
+                        )?,
+                        None => forward_dropout(
+                            current_input,
+                            probability.unwrap_or(0.5),
+                            training,
+                            &mut rng_state,
+                        )?,
+                    };
                     dropout_mask = mask;
                     (output, None)
                 }
@@ -1023,6 +1126,18 @@ impl ExecutableNetwork {
                         layer.kind.name()
                     )));
                 }
+            };
+
+            // C++ `try_fix_nan`: convolution outputs are fixed for NaN/Inf.
+            let output = if self.network.net.try_fix_nan
+                && matches!(layer.kind, LayerKind::Convolutional(_))
+            {
+                Tensor {
+                    shape: output.shape,
+                    data: darknet_cuda::host_ops::sanitize_nan_inf(&output.data, NanInfMode::Fix),
+                }
+            } else {
+                output
             };
 
             if matches!(layer.kind, LayerKind::Yolo(_) | LayerKind::GaussianYolo(_)) {
@@ -1181,7 +1296,18 @@ impl ExecutableNetwork {
                 ) => {
                     let conv =
                         resolve_convolutional_params(&self.network, &self.params, layer.index)?;
-                    let (input_grad, layer_param_gradients) = backward_convolutional(
+                    let try_fix_nan = self.network.net.try_fix_nan;
+                    // C++ `try_fix_nan`: clamp the output delta to [-1, 1]
+                    // before the activation gradient, reset the input delta after.
+                    let grad = if try_fix_nan {
+                        Tensor {
+                            shape: grad.shape,
+                            data: darknet_cuda::host_ops::constrain(&grad.data, 1.0),
+                        }
+                    } else {
+                        grad
+                    };
+                    let (mut input_grad, layer_param_gradients) = backward_convolutional(
                         spec,
                         conv,
                         current_input,
@@ -1190,6 +1316,12 @@ impl ExecutableNetwork {
                         forward.layer_activation_inputs[layer.index].as_ref(),
                         workspace,
                     )?;
+                    if try_fix_nan {
+                        input_grad.data = darknet_cuda::host_ops::sanitize_nan_inf(
+                            &input_grad.data,
+                            NanInfMode::Reset,
+                        );
+                    }
                     let owner = resolve_convolutional_owner(&self.network, layer.index)?;
                     accumulate_convolutional_param_gradients(
                         param_gradients.get_mut(owner).ok_or_else(|| {
@@ -1414,7 +1546,12 @@ impl ExecutableNetwork {
                             layer.index
                         ))
                     })?;
-                    let input_grad = backward_softmax(output, &grad, *groups)?;
+                    let input_grad = if GradMode::from_env() == GradMode::Cpp {
+                        // C++ passes dy straight through (cost layer folds the Jacobian in).
+                        grad.clone()
+                    } else {
+                        backward_softmax(output, &grad, *groups)?
+                    };
                     accumulate_previous_gradient(
                         layer.index,
                         &input_grad,
@@ -1448,7 +1585,7 @@ impl ExecutableNetwork {
                             layer.index
                         ))
                     })?;
-                    let (input_grad, source_grad) = backward_scale_channels(
+                    let (mut input_grad, source_grad) = backward_scale_channels(
                         spec,
                         current_input,
                         source,
@@ -1456,6 +1593,12 @@ impl ExecutableNetwork {
                         &grad,
                         forward.layer_activation_inputs[layer.index].as_ref(),
                     )?;
+                    if spec.scale_wh && GradMode::from_env() == GradMode::Cpp {
+                        let channel_size = (output.shape.height * output.shape.width) as f32;
+                        for v in &mut input_grad.data {
+                            *v /= channel_size;
+                        }
+                    }
                     accumulate_previous_gradient(
                         layer.index,
                         &input_grad,
@@ -1991,8 +2134,156 @@ where
     pub network: Network,
     pub params: Vec<LayerParams>,
     device_conv_params: RefCell<Vec<Option<GpuConvolutionLayerParams<B::Tensor>>>>,
+    /// Per-owner-layer f16 conv weights of `forward_compact_f16`, type-erased
+    /// because `B::TensorF16` only exists for `B: F16TensorOpsBackend`.
+    f16_conv_weights: RefCell<Vec<Option<std::rc::Rc<dyn std::any::Any>>>>,
     device_train_buffers: RefCell<Vec<Option<GpuConvolutionTrainBuffers<B::Tensor>>>>,
     cpu_fallback_train_buffers: RefCell<Vec<LayerTrainBuffers>>,
+    /// Per-owner-layer Adam moments (device), created lazily on the first
+    /// Adam update.
+    adam_state: Vec<Option<GpuAdamLayerState<B::Tensor>>>,
+    /// Number of Adam updates applied so far (the 1-based bias-correction `t`).
+    adam_step: u32,
+    /// See [`ExecutableNetwork::set_train_iteration`].
+    train_iteration: usize,
+    /// Host convolution weights lag the device ones (deferred updates).
+    host_weights_stale: bool,
+}
+
+/// First/second moments of one tensor.
+type GpuMoments<T> = (T, T);
+
+#[derive(Clone, Debug)]
+struct GpuAdamLayerState<T> {
+    weights: Option<GpuMoments<T>>,
+    biases: Option<GpuMoments<T>>,
+    scales: Option<GpuMoments<T>>,
+}
+
+impl<T> Default for GpuAdamLayerState<T> {
+    fn default() -> Self {
+        Self {
+            weights: None,
+            biases: None,
+            scales: None,
+        }
+    }
+}
+
+/// One optimizer step shared by every tensor of an update (see
+/// [`GpuExecutableNetwork::update_weights_gpu`]).
+#[derive(Clone, Copy, Debug)]
+enum GpuOptimizerStep {
+    /// `lr` and `decay` are already loss-scale corrected.
+    Sgd {
+        lr: f32,
+        momentum: f32,
+        decay: f32,
+        batch: usize,
+    },
+    Adam(AdamParams),
+}
+
+impl GpuOptimizerStep {
+    /// The step with the learning rate multiplied by a per-layer `learning_rate` scale.
+    fn with_lr_scale(self, scale: f32) -> Self {
+        match self {
+            Self::Sgd {
+                lr,
+                momentum,
+                decay,
+                batch,
+            } => Self::Sgd {
+                lr: lr * scale,
+                momentum,
+                decay,
+                batch,
+            },
+            Self::Adam(mut params) => {
+                params.lr *= scale;
+                Self::Adam(params)
+            }
+        }
+    }
+}
+
+/// Sanitises, then applies one SGD/Adam step to a single parameter tensor
+/// (C++ `update_convolutional_layer_gpu`: `reset_nan_and_inf(updates)`,
+/// `fix_nan_and_inf(weights)` for weights, then the optimizer).  Returns the
+/// new `(weights, updates)`; Adam zeroes the updates like `adam_update_gpu`.
+#[allow(clippy::too_many_arguments)]
+fn gpu_optimizer_step<B>(
+    backend: &B,
+    step: &GpuOptimizerStep,
+    is_weight: bool,
+    w: &B::Tensor,
+    u: &B::Tensor,
+    moments: &mut Option<GpuMoments<B::Tensor>>,
+    shape: &[usize],
+    config: ElementwiseLaunchConfig,
+) -> Result<(B::Tensor, B::Tensor)>
+where
+    B: F32TensorOpsBackend,
+    B::Error: std::fmt::Display,
+{
+    let u = backend
+        .sanitize_nan_inf_f32(u, shape, NanInfMode::Reset, config)
+        .map_err(|err| backend_error("GPU update reset_nan_and_inf", err))?;
+    let w = if is_weight {
+        backend
+            .sanitize_nan_inf_f32(w, shape, NanInfMode::Fix, config)
+            .map_err(|err| backend_error("GPU weight fix_nan_and_inf", err))?
+    } else {
+        w.clone()
+    };
+    match step {
+        GpuOptimizerStep::Sgd {
+            lr,
+            momentum,
+            decay,
+            batch,
+        } => backend
+            .sgd_update_f32(
+                &w,
+                &u,
+                *lr,
+                *momentum,
+                if is_weight { *decay } else { 0.0 },
+                *batch,
+                config,
+            )
+            .map_err(|err| backend_error("GPU SGD update", err)),
+        GpuOptimizerStep::Adam(params) => {
+            let count = shape.iter().product::<usize>();
+            if moments.is_none() {
+                let zeros = || {
+                    backend
+                        .zeros_f32(&[count])
+                        .map_err(|err| backend_error("allocate GPU Adam moments", err))
+                };
+                *moments = Some((zeros()?, zeros()?));
+            }
+            let (m, v) = moments.as_ref().expect("moments allocated above");
+            // C++ decays biases and scales too under coupled Adam; decoupled
+            // (AdamW) decays weights only.
+            let mut params = *params;
+            if !is_weight && params.decoupled_decay {
+                params.decay = 0.0;
+            }
+            let (w, m, v) = backend
+                .adam_update_f32(&w, &u, m, v, &params, config)
+                .map_err(|err| backend_error("GPU Adam update", err))?;
+            *moments = Some((m, v));
+            let zeros = backend
+                .zeros_f32(shape)
+                .map_err(|err| backend_error("zero GPU Adam updates", err))?;
+            Ok((w, zeros))
+        }
+    }
+}
+
+fn net_adam_active(step: &GpuOptimizerStep) -> bool {
+    matches!(step, GpuOptimizerStep::Adam(_))
 }
 
 #[derive(Clone, Debug)]
@@ -2002,6 +2293,10 @@ struct GpuConvolutionLayerParams<T> {
     weights: T,
     biases: T,
     batch_norm_scales: Option<T>,
+    /// The raw weights/BN stats changed since `weights`/`biases`/
+    /// `batch_norm_scales` (the BN-folded inference copies) were built; they
+    /// are re-folded on the device the next time something needs them.
+    folded_stale: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2009,6 +2304,264 @@ struct GpuConvolutionTrainBuffers<T> {
     weight_updates: T,
     bias_updates: T,
     scale_updates: Option<T>,
+}
+
+/// f16-storage inference (P6).  Training and every non-inference op stay on
+/// the f32 path.
+impl<B> GpuExecutableNetwork<B>
+where
+    B: F16TensorOpsBackend,
+    B::Error: std::fmt::Display,
+{
+    /// f16 twin of [`GpuExecutableNetwork::forward_compact`]: weights and
+    /// activations are stored as binary16 on the device (f32 accumulation,
+    /// bias and activation), the yolo heads are widened to f32 on download.
+    /// Supports convolutional, maxpool, route, upsample and yolo-style
+    /// pass-through layers (everything LegoGears-class detectors use); any
+    /// other layer returns `UnsupportedLayer` (use `forward_compact`).
+    pub fn forward_compact_f16(&self, input: &Tensor) -> Result<GpuForwardSummary> {
+        let expected = self.network.net.input_shape();
+        if input.shape != expected {
+            return Err(Error::InvalidConfig(format!(
+                "input shape mismatch: expected {expected}, got {}",
+                input.shape
+            )));
+        }
+        for layer in &self.network.layers {
+            match &layer.kind {
+                LayerKind::Convolutional(_)
+                | LayerKind::MaxPool(_)
+                | LayerKind::Route(_)
+                | LayerKind::Upsample(_)
+                | LayerKind::Yolo(_)
+                | LayerKind::GaussianYolo(_) => {}
+                other => {
+                    return Err(Error::UnsupportedLayer {
+                        layer_index: layer.index,
+                        name: format!("{} (f16 inference)", other.name()),
+                    });
+                }
+            }
+        }
+
+        let launch_config = ElementwiseLaunchConfig::default();
+        let input_gpu = self
+            .backend
+            .upload_f16(&tensor_backend_shape(input.shape), &input.data)
+            .map_err(|err| backend_error("upload f16 input tensor", err))?;
+        let mut gpu_layer_outputs: Vec<Option<B::TensorF16>> = vec![None; self.network.layers.len()];
+        let mut remaining_uses = gpu_layer_output_use_counts(&self.network)?;
+        let mut final_output = None;
+        let mut yolo_heads = Vec::new();
+
+        for (layer, params) in self.network.layers.iter().zip(&self.params) {
+            let current_input = if layer.index == 0 {
+                Some(&input_gpu)
+            } else if layer_uses_previous_input(&layer.kind) {
+                Some(
+                    gpu_layer_outputs
+                        .get(layer.index - 1)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing previous GPU layer output for layer #{}",
+                                layer.index
+                            ))
+                        })?,
+                )
+            } else {
+                None
+            };
+
+            let output_gpu = match (&layer.kind, params) {
+                (
+                    LayerKind::Convolutional(spec),
+                    LayerParams::Convolutional(_) | LayerParams::None,
+                ) => {
+                    let conv =
+                        resolve_convolutional_params(&self.network, &self.params, layer.index)?;
+                    let owner = resolve_convolutional_owner(&self.network, layer.index)?;
+                    let cached = self.cached_convolution_params(
+                        owner,
+                        layer.input_shape.channels,
+                        spec,
+                        conv,
+                    )?;
+                    let groups = spec.groups.max(1);
+                    let cached_w16 = self.f16_conv_weights.borrow()[owner]
+                        .as_ref()
+                        .and_then(|shared| shared.downcast_ref::<B::TensorF16>())
+                        .cloned();
+                    let weights16 = match cached_w16 {
+                        Some(w) => w,
+                        None => {
+                            let per_filter =
+                                layer.input_shape.channels / groups * spec.size * spec.size;
+                            let w = self
+                                .backend
+                                .conv_weights_f16(&cached.weights, spec.filters, per_filter)
+                                .map_err(|err| backend_error("convert conv weights to f16", err))?;
+                            self.f16_conv_weights.borrow_mut()[owner] = Some(std::rc::Rc::new(w.clone()));
+                            w
+                        }
+                    };
+                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+                    self.backend
+                        .conv2d_bias_act_f16(
+                            current_input.expect("convolution requires current input"),
+                            &weights16,
+                            &cached.biases,
+                            &tensor_backend_shape(layer.output_shape),
+                            layer.input_shape.channels,
+                            layer.input_shape.height,
+                            layer.input_shape.width,
+                            spec.filters,
+                            spec.size,
+                            spec.stride_x,
+                            spec.stride_y,
+                            spec.dilation,
+                            spec.padding,
+                            groups,
+                            activation,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("f16 convolution", err))?
+                }
+                (LayerKind::MaxPool(spec), LayerParams::None) => {
+                    if layer.output_shape.channels != layer.input_shape.channels {
+                        return Err(Error::UnsupportedLayer {
+                            layer_index: layer.index,
+                            name: "maxpool_depth".to_owned(),
+                        });
+                    }
+                    self.backend
+                        .maxpool_f16(
+                            current_input.expect("maxpool requires current input"),
+                            &tensor_backend_shape(layer.output_shape),
+                            layer.input_shape.channels,
+                            layer.input_shape.height,
+                            layer.input_shape.width,
+                            spec.size,
+                            spec.stride_x,
+                            spec.stride_y,
+                            spec.padding,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("f16 maxpool", err))?
+                }
+                (LayerKind::Route(spec), LayerParams::None) => {
+                    let mut route_inputs = Vec::with_capacity(spec.layers.len());
+                    let mut route_channel_offsets = Vec::with_capacity(spec.layers.len());
+                    let mut route_channels = Vec::with_capacity(spec.layers.len());
+                    let mut route_total_channels = Vec::with_capacity(spec.layers.len());
+                    for raw_index in &spec.layers {
+                        let source_index = resolve_relative_layer(layer.index, *raw_index)?;
+                        let source = gpu_layer_outputs
+                            .get(source_index)
+                            .and_then(Option::as_ref)
+                            .ok_or(Error::InvalidRoute {
+                                layer_index: layer.index,
+                                reference: *raw_index,
+                            })?;
+                        let source_layer =
+                            self.network.layers.get(source_index).ok_or_else(|| {
+                                Error::InvalidConfig(format!(
+                                    "missing source layer #{source_index} for route layer #{}",
+                                    layer.index
+                                ))
+                            })?;
+                        let chunk_channels =
+                            source_layer.output_shape.channels / spec.groups.max(1);
+                        route_inputs.push(source);
+                        route_channel_offsets.push(chunk_channels * spec.group_id);
+                        route_channels.push(chunk_channels);
+                        route_total_channels.push(source_layer.output_shape.channels);
+                    }
+                    self.backend
+                        .route_concat_f16(
+                            &route_inputs,
+                            &route_channel_offsets,
+                            &route_channels,
+                            &route_total_channels,
+                            &tensor_backend_shape(layer.output_shape),
+                            layer.output_shape.width * layer.output_shape.height,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("f16 route concat", err))?
+                }
+                (LayerKind::Upsample(spec), LayerParams::None) => self
+                    .backend
+                    .upsample_f16(
+                        current_input.expect("upsample requires current input"),
+                        &tensor_backend_shape(layer.output_shape),
+                        layer.input_shape.channels,
+                        layer.input_shape.height,
+                        layer.input_shape.width,
+                        spec.stride.unsigned_abs(),
+                        spec.scale,
+                        spec.reverse,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("f16 upsample", err))?,
+                (LayerKind::Yolo(_), LayerParams::None)
+                | (LayerKind::GaussianYolo(_), LayerParams::None) => current_input
+                    .expect("staging layer requires current input")
+                    .clone(),
+                _ => {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} ({}) and parameter set are inconsistent",
+                        layer.index,
+                        layer.kind.name()
+                    )));
+                }
+            };
+
+            let should_download_final = layer.index + 1 == self.network.layers.len();
+            let should_collect_yolo =
+                matches!(layer.kind, LayerKind::Yolo(_) | LayerKind::GaussianYolo(_));
+            let downloaded = if should_download_final || should_collect_yolo {
+                Some(Tensor {
+                    shape: layer.output_shape,
+                    data: self
+                        .backend
+                        .download_f16(&output_gpu)
+                        .map_err(|err| backend_error("download f16 layer output", err))?,
+                })
+            } else {
+                None
+            };
+
+            if should_collect_yolo {
+                yolo_heads.push(YoloHeadOutput {
+                    layer_index: layer.index,
+                    output: downloaded
+                        .as_ref()
+                        .expect("yolo output should have been downloaded")
+                        .clone(),
+                });
+            }
+            if should_download_final {
+                final_output = downloaded;
+            }
+
+            gpu_layer_outputs[layer.index] = Some(output_gpu);
+            release_gpu_sources_for_layer(
+                layer.index,
+                &layer.kind,
+                &mut remaining_uses,
+                &mut gpu_layer_outputs,
+            )?;
+
+            if remaining_uses[layer.index] == 0 {
+                gpu_layer_outputs[layer.index] = None;
+            }
+        }
+
+        Ok(GpuForwardSummary {
+            final_output,
+            yolo_heads,
+        })
+    }
 }
 
 impl<B> GpuExecutableNetwork<B>
@@ -2023,6 +2576,7 @@ where
             .map(default_layer_params)
             .collect::<Vec<_>>();
         let device_conv_params = RefCell::new(vec![None; network.layers.len()]);
+        let f16_conv_weights = RefCell::new((0..network.layers.len()).map(|_| None).collect());
         let device_train_buffers = RefCell::new(vec![None; network.layers.len()]);
         let cpu_fallback_train_buffers = RefCell::new(
             network
@@ -2036,9 +2590,35 @@ where
             network,
             params,
             device_conv_params,
+            f16_conv_weights,
             device_train_buffers,
             cpu_fallback_train_buffers,
+            adam_state: Vec::new(),
+            adam_step: 0,
+            train_iteration: 0,
+            host_weights_stale: false,
         }
+    }
+
+    /// See [`ExecutableNetwork::set_train_iteration`].
+    pub fn set_train_iteration(&mut self, iteration: usize) {
+        self.train_iteration = iteration;
+    }
+
+    /// Adam updates applied so far (the `t` of the next update is this + 1).
+    pub fn adam_step(&self) -> u32 {
+        self.adam_step
+    }
+
+    /// Restores the Adam step counter (e.g. when resuming); moments are not
+    /// part of the weights file and restart from zero.
+    pub fn set_adam_step(&mut self, step: u32) {
+        self.adam_step = step;
+    }
+
+    /// The tensor backend (for benchmark statistics such as workspace size).
+    pub fn backend(&self) -> &B {
+        &self.backend
     }
 
     pub fn from_path(path: impl AsRef<Path>, backend: B) -> Result<Self> {
@@ -2103,6 +2683,14 @@ where
         self.init_train_buffers_gpu()
     }
 
+    /// One optimizer step over every device-resident convolution (and, for
+    /// SGD, the host-fallback layers).  The optimizer follows `[net]`: SGD with
+    /// momentum by default, Adam with `adam=1` (`B1`/`B2`/`eps`, coupled L2
+    /// decay like C++, or AdamW with `decoupled_decay=1`; `lr`/`decay`/`batch`
+    /// are the same arguments).  `loss_scale` makes the step independent of the
+    /// gradient scale applied in `backward_accumulate_seeded_gpu`: SGD divides
+    /// lr and multiplies decay, Adam scales eps and the coupled decay.  Updates are reset and weights fixed for
+    /// NaN/Inf first (C++ `reset_nan_and_inf` / `fix_nan_and_inf`).
     pub fn update_weights_gpu(
         &mut self,
         lr: f32,
@@ -2110,16 +2698,128 @@ where
         decay: f32,
         batch: usize,
     ) -> Result<()> {
-        let config = ElementwiseLaunchConfig::default();
+        self.update_weights_gpu_impl(lr, momentum, decay, batch, true)
+    }
+
+    /// Like [`Self::update_weights_gpu`] but the convolution weights stay on the
+    /// device: `self.params[..].weights` is stale until
+    /// [`Self::sync_host_weights_from_device`] runs (call it before reading or
+    /// saving `params`).  Biases and BN statistics stay host-synced.  Falls back
+    /// to the eager sync when the CPU backward fallback reads host weights.
+    pub fn update_weights_gpu_deferred(
+        &mut self,
+        lr: f32,
+        momentum: f32,
+        decay: f32,
+        batch: usize,
+    ) -> Result<()> {
+        let eager = self.requires_cpu_backward_fallback();
+        self.update_weights_gpu_impl(lr, momentum, decay, batch, eager)
+    }
+
+    /// Refreshes the host convolution weights after deferred updates.
+    pub fn sync_host_weights_from_device(&mut self) -> Result<()> {
+        if !self.host_weights_stale {
+            return Ok(());
+        }
         for layer_index in 0..self.network.layers.len() {
-            let Some(owner) = (match &self.network.layers[layer_index].kind {
+            let LayerKind::Convolutional(spec) = &self.network.layers[layer_index].kind else {
+                continue;
+            };
+            if spec.share_index.is_some() {
+                continue;
+            }
+            let cached = self.device_conv_params.borrow()[layer_index].clone();
+            if let Some(cached) = cached {
+                self.sync_convolution_weights_from_device(layer_index, &cached)?;
+            }
+        }
+        self.host_weights_stale = false;
+        Ok(())
+    }
+
+    fn update_weights_gpu_impl(
+        &mut self,
+        lr: f32,
+        momentum: f32,
+        decay: f32,
+        batch: usize,
+        sync_host_weights: bool,
+    ) -> Result<()> {
+        let config = ElementwiseLaunchConfig::default();
+        let net = &self.network.net;
+        let loss_scale = if net.loss_scale > 0.0 && net.loss_scale.is_finite() {
+            net.loss_scale
+        } else {
+            1.0
+        };
+        let step = if net.adam {
+            if self.params.iter().any(|params| {
+                !matches!(params, LayerParams::None | LayerParams::Convolutional(_))
+            }) {
+                return Err(Error::InvalidConfig(
+                    "adam=1 on the GPU path supports convolutional layers only (host-fallback \
+                     layers such as connected/batchnorm/rnn have no Adam state)"
+                        .to_string(),
+                ));
+            }
+            self.adam_step += 1;
+            GpuOptimizerStep::Adam(AdamParams {
+                // Adam is invariant to the gradient scale, so lr stays as is
+                // (C++ divides it by loss_scale anyway, which shrinks the
+                // step); eps and the coupled decay scale with the gradients.
+                lr,
+                beta1: net.adam_b1,
+                beta2: net.adam_b2,
+                eps: net.adam_eps * loss_scale,
+                decay: if net.decoupled_decay {
+                    decay
+                } else {
+                    decay * loss_scale
+                },
+                batch,
+                step: self.adam_step,
+                decoupled_decay: net.decoupled_decay,
+            })
+        } else {
+            GpuOptimizerStep::Sgd {
+                lr: lr / loss_scale,
+                momentum,
+                decay: decay * loss_scale,
+                batch,
+            }
+        };
+        if self.adam_state.len() != self.network.layers.len() {
+            self.adam_state = (0..self.network.layers.len()).map(|_| None).collect();
+        }
+        let iteration_num = self.train_iteration as i64 + 1;
+        let burn_in = self.network.net.burn_in;
+        for layer_index in 0..self.network.layers.len() {
+            let opts = self.network.layers[layer_index].train;
+            // C++ `update_network_gpu` gating (`dont_update`, `burnin_update`,
+            // `train_only_bn`): the whole layer is skipped, buffers untouched.
+            if !opts.updates_at(iteration_num, burn_in) {
+                continue;
+            }
+            let (owner, filters, weight_shape) = match &self.network.layers[layer_index].kind {
                 LayerKind::Convolutional(spec) => {
                     let owner = spec.share_index.unwrap_or(layer_index);
-                    (owner == layer_index).then_some(owner)
+                    if owner != layer_index {
+                        continue;
+                    }
+                    (
+                        owner,
+                        spec.filters,
+                        [
+                            spec.filters,
+                            self.network.layers[layer_index].input_shape.channels
+                                / spec.groups.max(1),
+                            spec.size,
+                            spec.size,
+                        ],
+                    )
                 }
-                _ => None,
-            }) else {
-                continue;
+                _ => continue,
             };
 
             let cached = self
@@ -2143,40 +2843,57 @@ where
                     ))
                 })?;
 
-            let (raw_weights, weight_updates) = self
-                .backend
-                .sgd_update_f32(
-                    &cached.raw_weights,
-                    &train.weight_updates,
-                    lr,
-                    momentum,
-                    decay,
-                    batch,
-                    config,
-                )
-                .map_err(|err| backend_error("GPU weight update", err))?;
-            let (raw_biases, bias_updates) = self
-                .backend
-                .sgd_update_f32(
-                    &cached.raw_biases,
-                    &train.bias_updates,
-                    lr,
-                    momentum,
-                    0.0,
-                    batch,
-                    config,
-                )
-                .map_err(|err| backend_error("GPU bias update", err))?;
+            let layer_step = step.with_lr_scale(opts.learning_rate_scale);
+            // `grad_centr` (with BN) acts on the sanitised weight updates.
+            let mut weight_grad = train.weight_updates.clone();
+            if opts.grad_centr && train.scale_updates.is_some() {
+                let f_size = weight_shape[1] * weight_shape[2] * weight_shape[3];
+                weight_grad = self
+                    .backend
+                    .sanitize_nan_inf_f32(&weight_grad, &weight_shape, NanInfMode::Reset, config)
+                    .map_err(|err| backend_error("GPU update reset_nan_and_inf", err))?;
+                weight_grad = self
+                    .backend
+                    .gradient_centralization_f32(&weight_grad, &weight_shape, f_size, config)
+                    .map_err(|err| backend_error("GPU gradient centralization", err))?;
+            }
+            let mut moments = self.adam_state[owner].take().unwrap_or_default();
+            let (mut raw_weights, weight_updates) = gpu_optimizer_step(
+                &self.backend,
+                &layer_step,
+                true,
+                &cached.raw_weights,
+                &weight_grad,
+                &mut moments.weights,
+                &weight_shape,
+                config,
+            )?;
+            if opts.clip > 0.0 {
+                raw_weights = self
+                    .backend
+                    .constrain_f32(&raw_weights, &weight_shape, opts.clip, config)
+                    .map_err(|err| backend_error("GPU weight clip", err))?;
+            }
+            let (raw_biases, bias_updates) = gpu_optimizer_step(
+                &self.backend,
+                &layer_step,
+                false,
+                &cached.raw_biases,
+                &train.bias_updates,
+                &mut moments.biases,
+                &[filters],
+                config,
+            )?;
             let scale_updates = self.update_gpu_batch_norm_scales(
                 owner,
                 train.scale_updates,
-                lr,
-                momentum,
-                batch,
+                &layer_step,
+                &mut moments.scales,
                 config,
             )?;
+            self.adam_state[owner] = Some(moments);
 
-            let refreshed = self.refresh_device_convolution_params(
+            let (refreshed, biases_host) = self.refresh_device_convolution_params(
                 owner,
                 raw_weights,
                 raw_biases,
@@ -2184,13 +2901,27 @@ where
                 bias_updates,
                 scale_updates,
             )?;
-            self.sync_convolution_owner_from_device(owner, &refreshed)?;
+            if let Some(LayerParams::Convolutional(params)) = self.params.get_mut(owner) {
+                params.biases = biases_host;
+            }
+            if sync_host_weights {
+                self.sync_convolution_weights_from_device(owner, &refreshed)?;
+            } else {
+                self.host_weights_stale = true;
+            }
         }
-        self.update_cpu_fallback_weights(lr, momentum, decay, batch);
+        if sync_host_weights {
+            self.host_weights_stale = false;
+        }
+        if !net_adam_active(&step) {
+            self.update_cpu_fallback_weights(lr / loss_scale, momentum, decay * loss_scale, batch);
+        }
         Ok(())
     }
 
     fn update_cpu_fallback_weights(&mut self, lr: f32, momentum: f32, decay: f32, batch: usize) {
+        let iteration_num = self.train_iteration as i64 + 1;
+        let burn_in = self.network.net.burn_in;
         let train_buffers = self.cpu_fallback_train_buffers.get_mut();
         for (layer_index, ((params, train), layer)) in self
             .params
@@ -2200,6 +2931,9 @@ where
             .enumerate()
         {
             if matches!(layer.kind, LayerKind::Convolutional(_)) {
+                continue;
+            }
+            if !layer.train.updates_at(iteration_num, burn_in) {
                 continue;
             }
             match (params, train) {
@@ -2336,6 +3070,50 @@ where
         }
     }
 
+    /// Batch-statistics batch norm of a raw (bias-free) convolution output.
+    /// The shift is the layer's raw biases (the BN biases); the rolling EMA is
+    /// computed on the device and applied to the host params after backward.
+    fn forward_batchnorm_training_gpu(
+        &self,
+        raw_output: &B::Tensor,
+        cached: &GpuConvolutionLayerParams<B::Tensor>,
+        batch_norm: &BatchNormParams,
+        shape: TensorShape,
+        update_rolling: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(B::Tensor, GpuBatchNormCache<B::Tensor>)> {
+        validate_batchnorm_params(batch_norm, shape.channels)?;
+        let upload = |name: &str, host: &[f32]| {
+            self.backend
+                .upload_f32(&[host.len()], host)
+                .map_err(|err| backend_error(name, err))
+        };
+        let scales = upload("upload batch-norm scales", &batch_norm.scales)?;
+        let rolling_mean = upload("upload batch-norm rolling mean", &batch_norm.rolling_mean)?;
+        let rolling_variance =
+            upload("upload batch-norm rolling variance", &batch_norm.rolling_variance)?;
+        let result = self
+            .backend
+            .batchnorm_train_forward_f32(
+                raw_output,
+                &scales,
+                &cached.raw_biases,
+                &rolling_mean,
+                &rolling_variance,
+                &tensor_backend_shape(shape),
+                BATCH_NORM_ROLLING_KEEP,
+                config,
+            )
+            .map_err(|err| backend_error("GPU batch-norm training forward", err))?;
+        let cache = GpuBatchNormCache {
+            scales,
+            x_hat: result.x_hat,
+            variance: result.variance,
+            rolling: update_rolling.then_some((result.rolling_mean, result.rolling_variance)),
+        };
+        Ok((result.output, cache))
+    }
+
     fn forward_batchnorm_inference_gpu(
         &self,
         input: &B::Tensor,
@@ -2388,11 +3166,33 @@ where
         self.forward_with_state_mode(input, true)
     }
 
+    /// Training forward for the GPU backward path: only the yolo head outputs
+    /// (what the host loss reads) are downloaded; every other
+    /// `cpu_forward.layer_outputs` entry is a shape-only tensor with empty data
+    /// and `layer_activation_inputs` is `None`.  Networks that need the CPU
+    /// backward fallback still get the full host copies.
+    pub fn forward_training_device(
+        &self,
+        input: &Tensor,
+    ) -> Result<GpuForwardState<B::Tensor>> {
+        self.forward_with_state_impl(input, true, false)
+    }
+
     fn forward_with_state_mode(
         &self,
         input: &Tensor,
         training: bool,
     ) -> Result<GpuForwardState<B::Tensor>> {
+        self.forward_with_state_impl(input, training, true)
+    }
+
+    fn forward_with_state_impl(
+        &self,
+        input: &Tensor,
+        training: bool,
+        host_copies: bool,
+    ) -> Result<GpuForwardState<B::Tensor>> {
+        let host_copies = host_copies || self.requires_cpu_backward_fallback();
         let expected = self.network.net.input_shape();
         if input.shape != expected {
             return Err(Error::InvalidConfig(format!(
@@ -2414,8 +3214,12 @@ where
         let mut recurrent_caches = Vec::with_capacity(self.network.layers.len());
         let mut dropout_masks = Vec::with_capacity(self.network.layers.len());
         let mut crop_caches = Vec::with_capacity(self.network.layers.len());
+        let mut gpu_batch_norm_caches = Vec::with_capacity(self.network.layers.len());
         let mut yolo_heads = Vec::new();
         let mut rng_state = 0x9e37_79b9_u64;
+        // The CPU backward fallback differentiates with rolling statistics, so
+        // batch statistics are only used when the GPU backward handles the net.
+        let batch_norm_training = training && !self.requires_cpu_backward_fallback();
 
         for (layer, params) in self.network.layers.iter().zip(&self.params) {
             let current_input = if layer.index == 0 {
@@ -2429,6 +3233,7 @@ where
             let mut activation_input_gpu = None;
             let mut dropout_mask = None;
             let mut crop_cache = None;
+            let mut batch_norm_cache = None;
             let output_gpu = match (&layer.kind, params) {
                 (
                     LayerKind::Convolutional(spec),
@@ -2437,17 +3242,33 @@ where
                     let conv =
                         resolve_convolutional_params(&self.network, &self.params, layer.index)?;
                     let owner = resolve_convolutional_owner(&self.network, layer.index)?;
-                    let cached = self.cached_convolution_params(
-                        owner,
-                        layer.input_shape.channels,
-                        spec,
-                        conv,
-                    )?;
+                    let cached = if batch_norm_training && conv.batch_norm.is_some() {
+                        self.cached_convolution_params_raw(
+                            owner,
+                            layer.input_shape.channels,
+                            spec,
+                            conv,
+                        )?
+                    } else {
+                        self.cached_convolution_params(
+                            owner,
+                            layer.input_shape.channels,
+                            spec,
+                            conv,
+                        )?
+                    };
+                    // Batch-norm training convolves with the raw weights; the
+                    // folded (rolling-stat) weights serve inference.
+                    let weights = if batch_norm_training && conv.batch_norm.is_some() {
+                        &cached.raw_weights
+                    } else {
+                        &cached.weights
+                    };
                     let conv_output = self
                         .backend
                         .conv2d_f32(
                             current_input,
-                            &cached.weights,
+                            weights,
                             &tensor_backend_shape(layer.output_shape),
                             layer.input_shape.channels,
                             layer.input_shape.height,
@@ -2462,16 +3283,30 @@ where
                             launch_config,
                         )
                         .map_err(|err| backend_error("convolution", err))?;
-                    let biased = self
-                        .backend
-                        .bias_add_f32(
-                            &conv_output,
-                            &cached.biases,
-                            spec.filters,
-                            layer.output_shape.width * layer.output_shape.height,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("convolution bias add", err))?;
+                    let biased = match conv.batch_norm.as_ref() {
+                        Some(batch_norm) if batch_norm_training => {
+                            let (normalized, cache) = self.forward_batchnorm_training_gpu(
+                                &conv_output,
+                                &cached,
+                                batch_norm,
+                                layer.output_shape,
+                                spec.share_index.is_none(),
+                                launch_config,
+                            )?;
+                            batch_norm_cache = Some(cache);
+                            normalized
+                        }
+                        _ => self
+                            .backend
+                            .bias_add_f32(
+                                &conv_output,
+                                &cached.biases,
+                                spec.filters,
+                                layer.output_shape.width * layer.output_shape.height,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("convolution bias add", err))?,
+                    };
                     let activation = gpu_activation_kind(layer.index, &spec.activation)?;
                     activation_input_gpu = Some(biased.clone());
                     self.backend
@@ -2638,7 +3473,6 @@ where
                 }
                 (LayerKind::Shortcut(spec), LayerParams::None) => {
                     let mut accumulated = current_input.clone();
-                    let mut accumulated_host = None;
                     for raw_index in &spec.from {
                         let source_index = resolve_relative_layer(layer.index, *raw_index)?;
                         let source =
@@ -2661,34 +3495,28 @@ where
                                 layer.index, layer.output_shape, source_layer.output_shape
                             )));
                         }
-                        if let Some(host) = accumulated_host.as_mut() {
-                            let source_host = self
-                                .download_tensor(source, source_layer.output_shape)
-                                .map_err(|err| backend_error("download shortcut source", err))?;
-                            *host = shortcut_add_host(host, &source_host)?;
-                        } else if source_layer.output_shape != layer.output_shape {
-                            let current_host = self
-                                .download_tensor(&accumulated, layer.output_shape)
-                                .map_err(|err| backend_error("download shortcut input", err))?;
-                            let source_host = self
-                                .download_tensor(source, source_layer.output_shape)
-                                .map_err(|err| backend_error("download shortcut source", err))?;
-                            accumulated_host =
-                                Some(shortcut_add_host(&current_host, &source_host)?);
-                        } else {
-                            accumulated = self
+                        // Darknet resizes a mismatched source flat per sample
+                        // (crop / zero-pad), then adds it.
+                        let fitted;
+                        let source = if source_layer.output_shape != layer.output_shape {
+                            fitted = self
                                 .backend
-                                .shortcut_add_f32(&accumulated, source, launch_config)
-                                .map_err(|err| backend_error("shortcut add", err))?;
-                        }
+                                .shortcut_fit_f32(
+                                    source,
+                                    layer.output_shape.batch,
+                                    &tensor_backend_shape(layer.output_shape),
+                                    launch_config,
+                                )
+                                .map_err(|err| backend_error("shortcut resize source", err))?;
+                            &fitted
+                        } else {
+                            source
+                        };
+                        accumulated = self
+                            .backend
+                            .shortcut_add_f32(&accumulated, source, launch_config)
+                            .map_err(|err| backend_error("shortcut add", err))?;
                     }
-                    let accumulated = if let Some(host) = accumulated_host {
-                        self.backend
-                            .upload_f32(&tensor_backend_shape(layer.output_shape), &host.data)
-                            .map_err(|err| backend_error("upload shortcut result", err))?
-                    } else {
-                        accumulated
-                    };
 
                     let activation = gpu_activation_kind(layer.index, &spec.activation)?;
                     activation_input_gpu = Some(accumulated.clone());
@@ -2716,73 +3544,164 @@ where
                 | (LayerKind::Detection(_), LayerParams::None)
                 | (LayerKind::Cost { .. }, LayerParams::None)
                 | (LayerKind::Contrastive { .. }, LayerParams::None) => current_input.clone(),
-                (LayerKind::Dropout { probability }, LayerParams::None) => {
-                    if !training {
+                (LayerKind::Dropout { probability, dropblock }, LayerParams::None) => {
+                    let probability = probability.unwrap_or(0.5);
+                    check_dropout_probability(probability)?;
+                    let block_plan = dropblock.as_ref().map(|spec| {
+                        dropblock_plan(
+                            spec,
+                            probability,
+                            layer.output_shape,
+                            self.train_iteration,
+                            self.network.net.max_batches,
+                        )
+                    });
+                    if !training || probability == 0.0 || matches!(block_plan, Some((p, _)) if p <= 0.0)
+                    {
                         current_input.clone()
+                    } else {
+                        let seed = advance_rng(&mut rng_state);
+                        let (output, mask) = match block_plan {
+                            Some((block_prob, block_size)) => self
+                                .backend
+                                .dropblock_f32(
+                                    current_input,
+                                    &tensor_backend_shape(layer.output_shape),
+                                    block_prob,
+                                    block_size,
+                                    dropblock_seed(seed, self.train_iteration),
+                                    launch_config,
+                                )
+                                .map_err(|err| backend_error("GPU dropblock", err))?,
+                            None => self
+                                .backend
+                                .dropout_f32(
+                                    current_input,
+                                    &tensor_backend_shape(layer.output_shape),
+                                    probability,
+                                    seed,
+                                    launch_config,
+                                )
+                                .map_err(|err| backend_error("GPU dropout", err))?,
+                        };
+                        dropout_mask = Some(
+                            self.download_tensor(&mask, layer.output_shape)
+                                .map_err(|err| backend_error("download dropout mask", err))?,
+                        );
+                        output
+                    }
+                }
+                (LayerKind::Connected(spec), LayerParams::Connected(connected)) => {
+                    let inputs = layer.input_shape.element_count();
+                    if connected.weights.len() != spec.output * inputs
+                        || connected.biases.len() != spec.output
+                    {
+                        return Err(Error::InvalidConfig(format!(
+                            "connected layer #{} expects {} weights and {} biases, got {} and {}",
+                            layer.index,
+                            spec.output * inputs,
+                            spec.output,
+                            connected.weights.len(),
+                            connected.biases.len()
+                        )));
+                    }
+                    if let Some(activation) = spec.activation.to_cuda_f32_kind() {
+                        // Inference batch norm is a per-output affine map, so
+                        // fold it into the uploaded weights and biases.
+                        let (weights, biases) = match connected.batch_norm.as_ref() {
+                            Some(bn) => {
+                                let mut weights = connected.weights.clone();
+                                let mut biases = connected.biases.clone();
+                                for (o, row) in weights.chunks_mut(inputs).enumerate() {
+                                    let k = bn.scales[o]
+                                        / (bn.rolling_variance[o] + BATCH_NORM_EPSILON).sqrt();
+                                    row.iter_mut().for_each(|w| *w *= k);
+                                    biases[o] -= bn.rolling_mean[o] * k;
+                                }
+                                (weights, biases)
+                            }
+                            None => (connected.weights.clone(), connected.biases.clone()),
+                        };
+                        let weights_gpu = self
+                            .backend
+                            .upload_f32(&[spec.output, inputs], &weights)
+                            .map_err(|err| backend_error("upload connected weights", err))?;
+                        let biases_gpu = self
+                            .backend
+                            .upload_f32(&[spec.output], &biases)
+                            .map_err(|err| backend_error("upload connected biases", err))?;
+                        let pre_activation = self
+                            .backend
+                            .connected_f32(
+                                current_input,
+                                &weights_gpu,
+                                &biases_gpu,
+                                layer.input_shape.batch,
+                                inputs,
+                                spec.output,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("connected", err))?;
+                        activation_input_gpu = Some(pre_activation.clone());
+                        self.backend
+                            .activation_f32(&pre_activation, activation, launch_config)
+                            .map_err(|err| backend_error("connected activation", err))?
                     } else {
                         let host_input = self
                             .download_tensor(current_input, layer.input_shape)
-                            .map_err(|err| backend_error("download dropout input", err))?;
-                        let (host_output, mask) = forward_dropout(
+                            .map_err(|err| backend_error("download connected input", err))?;
+                        let (host_output, host_activation_input) = forward_connected_with_cache(
+                            spec,
+                            connected,
                             &host_input,
-                            probability.unwrap_or(0.5),
-                            true,
-                            &mut rng_state,
-                        )?;
-                        dropout_mask = mask;
+                            layer.output_shape,
+                        );
+                        if let Some(activation_input) = host_activation_input {
+                            activation_input_gpu = Some(
+                                self.backend
+                                    .upload_f32(
+                                        &tensor_backend_shape(layer.output_shape),
+                                        &activation_input.data,
+                                    )
+                                    .map_err(|err| {
+                                        backend_error("upload connected activation cache", err)
+                                    })?,
+                            );
+                        }
                         self.backend
                             .upload_f32(
                                 &tensor_backend_shape(layer.output_shape),
                                 &host_output.data,
                             )
-                            .map_err(|err| backend_error("upload dropout output", err))?
+                            .map_err(|err| backend_error("upload connected output", err))?
                     }
-                }
-                (LayerKind::Connected(spec), LayerParams::Connected(connected)) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download connected input", err))?;
-                    let (host_output, host_activation_input) = forward_connected_with_cache(
-                        spec,
-                        connected,
-                        &host_input,
-                        layer.output_shape,
-                    );
-                    if let Some(activation_input) = host_activation_input {
-                        activation_input_gpu = Some(
-                            self.backend
-                                .upload_f32(
-                                    &tensor_backend_shape(layer.output_shape),
-                                    &activation_input.data,
-                                )
-                                .map_err(|err| {
-                                    backend_error("upload connected activation cache", err)
-                                })?,
-                        );
-                    }
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
-                        .map_err(|err| backend_error("upload connected output", err))?
                 }
                 (LayerKind::Reorg(spec), LayerParams::None) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download reorg input", err))?;
-                    let host_output =
-                        forward_reorg(spec.stride, spec.reverse, &host_input, layer.output_shape)?;
+                    if spec.stride == 0 {
+                        return Err(Error::InvalidConfig(
+                            "reorg stride cannot be zero".to_owned(),
+                        ));
+                    }
                     self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
-                        .map_err(|err| backend_error("upload reorg output", err))?
+                        .reorg_f32(
+                            current_input,
+                            &tensor_backend_shape(layer.input_shape),
+                            &tensor_backend_shape(layer.output_shape),
+                            spec.stride,
+                            spec.reverse,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("reorg", err))?
                 }
-                (LayerKind::Softmax { groups }, LayerParams::None) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download softmax input", err))?;
-                    let host_output = forward_softmax(&host_input, *groups)?;
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
-                        .map_err(|err| backend_error("upload softmax output", err))?
-                }
+                (LayerKind::Softmax { groups }, LayerParams::None) => self
+                    .backend
+                    .softmax_f32(
+                        current_input,
+                        &tensor_backend_shape(layer.output_shape),
+                        softmax_group_size(layer.input_shape, *groups)?,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("softmax", err))?,
                 (LayerKind::ScaleChannels(spec), LayerParams::None) => {
                     let source_index = resolve_relative_layer(layer.index, spec.from)?;
                     let source_layer =
@@ -2800,33 +3719,59 @@ where
                                 layer_index: layer.index,
                                 reference: spec.from,
                             })?;
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download scale_channels input", err))?;
-                    let host_source = self
-                        .download_tensor(source_gpu, source_layer.output_shape)
-                        .map_err(|err| backend_error("download scale_channels source", err))?;
-                    let (host_output, host_activation_input) = forward_scale_channels(
-                        spec,
-                        &host_input,
-                        &host_source,
-                        layer.output_shape,
-                    )?;
-                    if let Some(activation_input) = host_activation_input {
-                        activation_input_gpu = Some(
-                            self.backend
-                                .upload_f32(
-                                    &tensor_backend_shape(layer.output_shape),
-                                    &activation_input.data,
-                                )
-                                .map_err(|err| {
-                                    backend_error("upload scale_channels activation cache", err)
-                                })?,
-                        );
+                    if let Some(activation) = spec.activation.to_cuda_f32_kind() {
+                        if source_layer.output_shape != layer.output_shape {
+                            return Err(Error::InvalidConfig(format!(
+                                "scale_channels source/output mismatch: {} vs {}",
+                                source_layer.output_shape, layer.output_shape
+                            )));
+                        }
+                        let pre_activation = self
+                            .backend
+                            .scale_channels_f32(
+                                current_input,
+                                source_gpu,
+                                &tensor_backend_shape(layer.output_shape),
+                                spec.scale_wh,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("scale_channels", err))?;
+                        activation_input_gpu = Some(pre_activation.clone());
+                        self.backend
+                            .activation_f32(&pre_activation, activation, launch_config)
+                            .map_err(|err| backend_error("scale_channels activation", err))?
+                    } else {
+                        let host_input = self
+                            .download_tensor(current_input, layer.input_shape)
+                            .map_err(|err| backend_error("download scale_channels input", err))?;
+                        let host_source = self
+                            .download_tensor(source_gpu, source_layer.output_shape)
+                            .map_err(|err| backend_error("download scale_channels source", err))?;
+                        let (host_output, host_activation_input) = forward_scale_channels(
+                            spec,
+                            &host_input,
+                            &host_source,
+                            layer.output_shape,
+                        )?;
+                        if let Some(activation_input) = host_activation_input {
+                            activation_input_gpu = Some(
+                                self.backend
+                                    .upload_f32(
+                                        &tensor_backend_shape(layer.output_shape),
+                                        &activation_input.data,
+                                    )
+                                    .map_err(|err| {
+                                        backend_error("upload scale_channels activation cache", err)
+                                    })?,
+                            );
+                        }
+                        self.backend
+                            .upload_f32(
+                                &tensor_backend_shape(layer.output_shape),
+                                &host_output.data,
+                            )
+                            .map_err(|err| backend_error("upload scale_channels output", err))?
                     }
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
-                        .map_err(|err| backend_error("upload scale_channels output", err))?
                 }
                 (LayerKind::Sam(spec), LayerParams::None) => {
                     let source_index = resolve_relative_layer(layer.index, spec.from)?;
@@ -2915,15 +3860,42 @@ where
                 }
             };
 
-            let output = self
-                .download_tensor(&output_gpu, layer.output_shape)
-                .map_err(|err| backend_error("download layer output", err))?;
-            let activation_input = match activation_input_gpu.as_ref() {
-                Some(tensor) => Some(
-                    self.download_tensor(tensor, layer.output_shape)
-                        .map_err(|err| backend_error("download activation cache", err))?,
-                ),
-                None => None,
+            // C++ `try_fix_nan`: convolution outputs are fixed for NaN/Inf.
+            let output_gpu = if self.network.net.try_fix_nan
+                && matches!(layer.kind, LayerKind::Convolutional(_))
+            {
+                self.backend
+                    .sanitize_nan_inf_f32(
+                        &output_gpu,
+                        &tensor_backend_shape(layer.output_shape),
+                        NanInfMode::Fix,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("GPU try_fix_nan output fix", err))?
+            } else {
+                output_gpu
+            };
+            let is_yolo = matches!(layer.kind, LayerKind::Yolo(_) | LayerKind::GaussianYolo(_));
+            let (output, activation_input) = if host_copies || is_yolo {
+                let output = self
+                    .download_tensor(&output_gpu, layer.output_shape)
+                    .map_err(|err| backend_error("download layer output", err))?;
+                let activation_input = match activation_input_gpu.as_ref() {
+                    Some(tensor) if host_copies => Some(
+                        self.download_tensor(tensor, layer.output_shape)
+                            .map_err(|err| backend_error("download activation cache", err))?,
+                    ),
+                    _ => None,
+                };
+                (output, activation_input)
+            } else {
+                (
+                    Tensor {
+                        shape: layer.output_shape,
+                        data: Vec::new(),
+                    },
+                    None,
+                )
             };
 
             if matches!(layer.kind, LayerKind::Yolo(_) | LayerKind::GaussianYolo(_)) {
@@ -2939,6 +3911,7 @@ where
             layer_activation_inputs.push(activation_input);
             dropout_masks.push(dropout_mask);
             crop_caches.push(crop_cache);
+            gpu_batch_norm_caches.push(batch_norm_cache);
             if recurrent_caches.len() < layer_outputs.len() {
                 recurrent_caches.push(None);
             }
@@ -2948,6 +3921,7 @@ where
             input_gpu,
             gpu_layer_outputs,
             gpu_layer_activation_inputs,
+            gpu_batch_norm_caches,
             cpu_forward: ForwardResult {
                 layer_outputs,
                 layer_activation_inputs,
@@ -3171,7 +4145,6 @@ where
                     let mut accumulated = current_input
                         .expect("shortcut requires current input")
                         .clone();
-                    let mut accumulated_host = None;
                     for raw_index in &spec.from {
                         let source_index = resolve_relative_layer(layer.index, *raw_index)?;
                         let source = gpu_layer_outputs
@@ -3194,34 +4167,28 @@ where
                                 layer.index, layer.output_shape, source_layer.output_shape
                             )));
                         }
-                        if let Some(host) = accumulated_host.as_mut() {
-                            let source_host = self
-                                .download_tensor(source, source_layer.output_shape)
-                                .map_err(|err| backend_error("download shortcut source", err))?;
-                            *host = shortcut_add_host(host, &source_host)?;
-                        } else if source_layer.output_shape != layer.output_shape {
-                            let current_host = self
-                                .download_tensor(&accumulated, layer.output_shape)
-                                .map_err(|err| backend_error("download shortcut input", err))?;
-                            let source_host = self
-                                .download_tensor(source, source_layer.output_shape)
-                                .map_err(|err| backend_error("download shortcut source", err))?;
-                            accumulated_host =
-                                Some(shortcut_add_host(&current_host, &source_host)?);
-                        } else {
-                            accumulated = self
+                        // Darknet resizes a mismatched source flat per sample
+                        // (crop / zero-pad), then adds it.
+                        let fitted;
+                        let source = if source_layer.output_shape != layer.output_shape {
+                            fitted = self
                                 .backend
-                                .shortcut_add_f32(&accumulated, source, launch_config)
-                                .map_err(|err| backend_error("shortcut add", err))?;
-                        }
+                                .shortcut_fit_f32(
+                                    source,
+                                    layer.output_shape.batch,
+                                    &tensor_backend_shape(layer.output_shape),
+                                    launch_config,
+                                )
+                                .map_err(|err| backend_error("shortcut resize source", err))?;
+                            &fitted
+                        } else {
+                            source
+                        };
+                        accumulated = self
+                            .backend
+                            .shortcut_add_f32(&accumulated, source, launch_config)
+                            .map_err(|err| backend_error("shortcut add", err))?;
                     }
-                    let accumulated = if let Some(host) = accumulated_host {
-                        self.backend
-                            .upload_f32(&tensor_backend_shape(layer.output_shape), &host.data)
-                            .map_err(|err| backend_error("upload shortcut result", err))?
-                    } else {
-                        accumulated
-                    };
 
                     let activation = gpu_activation_kind(layer.index, &spec.activation)?;
                     self.backend
@@ -3318,7 +4285,31 @@ where
         })
     }
 
+    /// Accumulates the layer gradients into the device train buffers.  With
+    /// `loss_scale != 1` every seed is multiplied by it first (the matching
+    /// division happens in `update_weights_gpu`).
     pub fn backward_accumulate_seeded_gpu(
+        &mut self,
+        forward: &GpuForwardState<B::Tensor>,
+        layer_output_gradient_seeds: &[Option<Tensor>],
+    ) -> Result<()> {
+        let loss_scale = self.network.net.loss_scale;
+        if loss_scale == 1.0 || !(loss_scale > 0.0 && loss_scale.is_finite()) {
+            return self.backward_accumulate_gpu_unscaled(forward, layer_output_gradient_seeds);
+        }
+        let scaled: Vec<Option<Tensor>> = layer_output_gradient_seeds
+            .iter()
+            .map(|seed| {
+                seed.as_ref().map(|seed| Tensor {
+                    shape: seed.shape,
+                    data: seed.data.iter().map(|g| g * loss_scale).collect(),
+                })
+            })
+            .collect();
+        self.backward_accumulate_gpu_unscaled(forward, &scaled)
+    }
+
+    fn backward_accumulate_gpu_unscaled(
         &mut self,
         forward: &GpuForwardState<B::Tensor>,
         layer_output_gradient_seeds: &[Option<Tensor>],
@@ -3370,12 +4361,22 @@ where
                     let conv =
                         resolve_convolutional_params(&self.network, &self.params, layer.index)?;
                     let owner = resolve_convolutional_owner(&self.network, layer.index)?;
-                    let cached = self.cached_convolution_params(
-                        owner,
-                        layer.input_shape.channels,
-                        spec,
-                        conv,
-                    )?;
+                    // The batch-statistics BN backward only needs the raw tensors.
+                    let cached = if forward.gpu_batch_norm_caches[layer.index].is_some() {
+                        self.cached_convolution_params_raw(
+                            owner,
+                            layer.input_shape.channels,
+                            spec,
+                            conv,
+                        )?
+                    } else {
+                        self.cached_convolution_params(
+                            owner,
+                            layer.input_shape.channels,
+                            spec,
+                            conv,
+                        )?
+                    };
                     let activation = gpu_activation_kind(layer.index, &spec.activation)?;
                     let activation_input = forward.gpu_layer_activation_inputs[layer.index]
                         .as_ref()
@@ -3385,19 +4386,20 @@ where
                                 layer.index
                             ))
                         })?;
+                    let try_fix_nan = self.network.net.try_fix_nan;
+                    // C++ `try_fix_nan`: clamp the output delta to [-1, 1]
+                    // before the activation gradient.
+                    let grad = if try_fix_nan {
+                        self.backend
+                            .constrain_f32(&grad, &tensor_backend_shape(layer.output_shape), 1.0, config)
+                            .map_err(|err| backend_error("GPU try_fix_nan delta clamp", err))?
+                    } else {
+                        grad
+                    };
                     let delta = self
                         .backend
                         .activation_backward_f32(activation_input, &grad, activation, config)
                         .map_err(|err| backend_error("GPU convolution activation backward", err))?;
-                    let bias_grad = self
-                        .backend
-                        .bias_backward_f32(
-                            &delta,
-                            spec.filters,
-                            layer.output_shape.width * layer.output_shape.height,
-                            config,
-                        )
-                        .map_err(|err| backend_error("GPU convolution bias backward", err))?;
                     let current_input =
                         if layer.index == 0 {
                             &forward.input_gpu
@@ -3409,48 +4411,76 @@ where
                             ))
                         })?
                         };
-                    let scale_grad = if let Some(batch_norm) = conv.batch_norm.as_ref() {
-                        let raw_output = self
+                    let (bias_grad, scale_grad, grad_for_conv) = if let Some(cache) =
+                        forward.gpu_batch_norm_caches[layer.index].as_ref()
+                    {
+                        // Batch-statistics batch norm: exact dx, dscale, dbias.
+                        let (dx, dscale, dbias) = self
                             .backend
-                            .conv2d_f32(
-                                current_input,
-                                &cached.raw_weights,
+                            .batchnorm_train_backward_f32(
+                                &delta,
+                                &cache.x_hat,
+                                &cache.variance,
+                                &cache.scales,
                                 &tensor_backend_shape(layer.output_shape),
-                                layer.input_shape.channels,
-                                layer.input_shape.height,
-                                layer.input_shape.width,
-                                spec.filters,
-                                spec.size,
-                                spec.stride_x,
-                                spec.stride_y,
-                                spec.dilation,
-                                spec.padding,
-                                spec.groups.max(1),
                                 config,
                             )
-                            .map_err(|err| backend_error("GPU batch-norm raw convolution", err))?;
-                        let scale_grad = self.batch_norm_scale_gradient_gpu(
-                            &raw_output,
-                            &delta,
-                            batch_norm,
-                            layer.output_shape,
-                        )?;
-                        Some(scale_grad)
+                            .map_err(|err| backend_error("GPU batch-norm backward", err))?;
+                        (dbias, Some(dscale), dx)
                     } else {
-                        None
-                    };
-                    let grad_for_conv = if let Some(scale) = cached.batch_norm_scales.as_ref() {
-                        self.backend
-                            .channel_scale_f32(
+                        let bias_grad = self
+                            .backend
+                            .bias_backward_f32(
                                 &delta,
-                                scale,
                                 spec.filters,
                                 layer.output_shape.width * layer.output_shape.height,
                                 config,
                             )
-                            .map_err(|err| backend_error("GPU batch-norm delta scale", err))?
-                    } else {
-                        delta.clone()
+                            .map_err(|err| backend_error("GPU convolution bias backward", err))?;
+                        let scale_grad = if let Some(batch_norm) = conv.batch_norm.as_ref() {
+                            let raw_output = self
+                                .backend
+                                .conv2d_f32(
+                                    current_input,
+                                    &cached.raw_weights,
+                                    &tensor_backend_shape(layer.output_shape),
+                                    layer.input_shape.channels,
+                                    layer.input_shape.height,
+                                    layer.input_shape.width,
+                                    spec.filters,
+                                    spec.size,
+                                    spec.stride_x,
+                                    spec.stride_y,
+                                    spec.dilation,
+                                    spec.padding,
+                                    spec.groups.max(1),
+                                    config,
+                                )
+                                .map_err(|err| backend_error("GPU batch-norm raw convolution", err))?;
+                            let scale_grad = self.batch_norm_scale_gradient_gpu(
+                                &raw_output,
+                                &delta,
+                                batch_norm,
+                                layer.output_shape,
+                            )?;
+                            Some(scale_grad)
+                        } else {
+                            None
+                        };
+                        let grad_for_conv = if let Some(scale) = cached.batch_norm_scales.as_ref() {
+                            self.backend
+                                .channel_scale_f32(
+                                    &delta,
+                                    scale,
+                                    spec.filters,
+                                    layer.output_shape.width * layer.output_shape.height,
+                                    config,
+                                )
+                                .map_err(|err| backend_error("GPU batch-norm delta scale", err))?
+                        } else {
+                            delta.clone()
+                        };
+                        (bias_grad, scale_grad, grad_for_conv)
                     };
                     let grouped_channels = layer.input_shape.channels / spec.groups.max(1);
                     let weight_grad = self
@@ -3491,6 +4521,18 @@ where
                             config,
                         )
                         .map_err(|err| backend_error("GPU convolution input backward", err))?;
+                    let input_grad = if try_fix_nan {
+                        self.backend
+                            .sanitize_nan_inf_f32(
+                                &input_grad,
+                                &tensor_backend_shape(layer.input_shape),
+                                NanInfMode::Reset,
+                                config,
+                            )
+                            .map_err(|err| backend_error("GPU try_fix_nan input delta reset", err))?
+                    } else {
+                        input_grad
+                    };
                     self.accumulate_device_train_buffer(owner, weight_grad, bias_grad, scale_grad)?;
                     self.accumulate_previous_gpu_gradient(
                         layer.index,
@@ -3678,9 +4720,32 @@ where
                     )?;
                     for raw_index in &spec.from {
                         let source_index = resolve_relative_layer(layer.index, *raw_index)?;
+                        let source_shape = self
+                            .network
+                            .layers
+                            .get(source_index)
+                            .ok_or(Error::InvalidRoute {
+                                layer_index: layer.index,
+                                reference: *raw_index,
+                            })?
+                            .output_shape;
+                        // Mismatched source: crop / zero-pad the gradient flat
+                        // per sample, like the forward add.
+                        let source_grad = if source_shape != layer.output_shape {
+                            self.backend
+                                .shortcut_fit_f32(
+                                    &accum_grad,
+                                    source_shape.batch,
+                                    &tensor_backend_shape(source_shape),
+                                    config,
+                                )
+                                .map_err(|err| backend_error("GPU shortcut source gradient", err))?
+                        } else {
+                            accum_grad.clone()
+                        };
                         self.accumulate_gpu_gradient(
                             &mut layer_output_gradients[source_index],
-                            accum_grad.clone(),
+                            source_grad,
                         )?;
                     }
                 }
@@ -3704,14 +4769,145 @@ where
                         &mut layer_output_gradients,
                     )?;
                 }
+                (LayerKind::Softmax { groups }, Some(LayerParams::None)) => {
+                    let output = forward.gpu_layer_outputs.get(layer.index).ok_or_else(|| {
+                        Error::InvalidConfig(format!(
+                            "missing GPU softmax output for layer #{}",
+                            layer.index
+                        ))
+                    })?;
+                    let input_grad = if GradMode::from_env() == GradMode::Cpp {
+                        grad.clone()
+                    } else {
+                        self.backend
+                            .softmax_backward_f32(
+                                output,
+                                &grad,
+                                &tensor_backend_shape(layer.output_shape),
+                                softmax_group_size(layer.input_shape, *groups)?,
+                                config,
+                            )
+                            .map_err(|err| backend_error("GPU softmax backward", err))?
+                    };
+                    self.accumulate_previous_gpu_gradient(
+                        layer.index,
+                        input_grad,
+                        &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::Reorg(spec), Some(LayerParams::None)) => {
+                    let input_grad = self
+                        .backend
+                        .reorg_backward_f32(
+                            &grad,
+                            &tensor_backend_shape(layer.input_shape),
+                            &tensor_backend_shape(layer.output_shape),
+                            spec.stride,
+                            spec.reverse,
+                            config,
+                        )
+                        .map_err(|err| backend_error("GPU reorg backward", err))?;
+                    self.accumulate_previous_gpu_gradient(
+                        layer.index,
+                        input_grad,
+                        &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::Dropout { .. }, Some(LayerParams::None)) => {
+                    let input_grad = match forward.cpu_forward.dropout_masks[layer.index].as_ref() {
+                        Some(mask) => {
+                            let mask_gpu = self
+                                .backend
+                                .upload_f32(&tensor_backend_shape(mask.shape), &mask.data)
+                                .map_err(|err| backend_error("upload dropout mask", err))?;
+                            self.backend
+                                .dropout_backward_f32(
+                                    &grad,
+                                    &mask_gpu,
+                                    &tensor_backend_shape(mask.shape),
+                                    config,
+                                )
+                                .map_err(|err| backend_error("GPU dropout backward", err))?
+                        }
+                        None => grad,
+                    };
+                    self.accumulate_previous_gpu_gradient(
+                        layer.index,
+                        input_grad,
+                        &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::ScaleChannels(spec), Some(LayerParams::None)) => {
+                    let source_index = resolve_relative_layer(layer.index, spec.from)?;
+                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+                    let activation_input = forward.gpu_layer_activation_inputs[layer.index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing GPU activation cache for scale_channels layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let delta = self
+                        .backend
+                        .activation_backward_f32(activation_input, &grad, activation, config)
+                        .map_err(|err| {
+                            backend_error("GPU scale_channels activation backward", err)
+                        })?;
+                    let current_input = if layer.index == 0 {
+                        &forward.input_gpu
+                    } else {
+                        &forward.gpu_layer_outputs[layer.index - 1]
+                    };
+                    let source = forward.gpu_layer_outputs.get(source_index).ok_or(
+                        Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.from,
+                        },
+                    )?;
+                    let (mut input_grad, source_grad) = self
+                        .backend
+                        .scale_channels_backward_f32(
+                            &delta,
+                            current_input,
+                            source,
+                            &tensor_backend_shape(layer.output_shape),
+                            spec.scale_wh,
+                            config,
+                        )
+                        .map_err(|err| backend_error("GPU scale_channels backward", err))?;
+                    if spec.scale_wh && GradMode::from_env() == GradMode::Cpp {
+                        let channel_size =
+                            (layer.output_shape.height * layer.output_shape.width) as f32;
+                        let zeros = self
+                            .backend
+                            .zeros_f32(&[
+                                layer.output_shape.batch,
+                                1,
+                                layer.output_shape.height,
+                                layer.output_shape.width,
+                            ])
+                            .map_err(|err| backend_error("GPU scale_channels C++ mode", err))?;
+                        input_grad = self
+                            .backend
+                            .saxpy_f32(1.0 / channel_size, &input_grad, &zeros, config)
+                            .map_err(|err| backend_error("GPU scale_channels C++ mode", err))?;
+                    }
+                    self.accumulate_previous_gpu_gradient(
+                        layer.index,
+                        input_grad,
+                        &mut layer_output_gradients,
+                    )?;
+                    self.accumulate_gpu_gradient(
+                        &mut layer_output_gradients[source_index],
+                        source_grad,
+                    )?;
+                }
                 (LayerKind::Yolo(_), Some(LayerParams::None))
                 | (LayerKind::GaussianYolo(_), Some(LayerParams::None))
                 | (LayerKind::Region(_), Some(LayerParams::None))
                 | (LayerKind::Detection(_), Some(LayerParams::None))
-                | (LayerKind::Softmax { .. }, Some(LayerParams::None))
                 | (LayerKind::Cost { .. }, Some(LayerParams::None))
-                | (LayerKind::Dropout { .. }, Some(LayerParams::None))
-                | (LayerKind::ScaleChannels(_), Some(LayerParams::None))
                 | (LayerKind::Sam(_), Some(LayerParams::None))
                 | (LayerKind::Contrastive { .. }, Some(LayerParams::None)) => {
                     self.accumulate_previous_gpu_gradient(
@@ -3738,10 +4934,6 @@ where
             if matches!(
                 layer.kind,
                 LayerKind::Connected(_)
-                    | LayerKind::Reorg(_)
-                    | LayerKind::Softmax { .. }
-                    | LayerKind::Dropout { .. }
-                    | LayerKind::ScaleChannels(_)
                     | LayerKind::Sam(_)
                     | LayerKind::Rnn(_)
                     | LayerKind::Lstm(_)
@@ -3749,15 +4941,12 @@ where
             ) {
                 return true;
             }
-            let LayerKind::Shortcut(spec) = &layer.kind else {
-                return false;
-            };
-            spec.from.iter().any(|raw_index| {
-                resolve_relative_layer(layer.index, *raw_index)
-                    .ok()
-                    .and_then(|source_index| self.network.layers.get(source_index))
-                    .is_some_and(|source| source.output_shape != layer.output_shape)
-            })
+            if let LayerKind::ScaleChannels(spec) = &layer.kind
+                && spec.activation.to_cuda_f32_kind().is_none()
+            {
+                return true;
+            }
+            false
         })
     }
 
@@ -4007,9 +5196,8 @@ where
         &mut self,
         owner: usize,
         scale_updates: Option<B::Tensor>,
-        lr: f32,
-        momentum: f32,
-        batch: usize,
+        step: &GpuOptimizerStep,
+        moments: &mut Option<GpuMoments<B::Tensor>>,
         config: ElementwiseLaunchConfig,
     ) -> Result<Option<B::Tensor>> {
         let Some(scale_updates) = scale_updates else {
@@ -4026,14 +5214,21 @@ where
             )));
         };
 
+        let shape = [batch_norm.scales.len()];
         let scales = self
             .backend
-            .upload_f32(&[batch_norm.scales.len()], &batch_norm.scales)
+            .upload_f32(&shape, &batch_norm.scales)
             .map_err(|err| backend_error("upload GPU batch-norm scales", err))?;
-        let (updated_scales, updated_scale_updates) = self
-            .backend
-            .sgd_update_f32(&scales, &scale_updates, lr, momentum, 0.0, batch, config)
-            .map_err(|err| backend_error("GPU batch-norm scale update", err))?;
+        let (updated_scales, updated_scale_updates) = gpu_optimizer_step(
+            &self.backend,
+            step,
+            false,
+            &scales,
+            &scale_updates,
+            moments,
+            &shape,
+            config,
+        )?;
         batch_norm.scales = self
             .backend
             .download_f32(&updated_scales)
@@ -4058,7 +5253,40 @@ where
             )));
         };
         update_batch_norm_running_stats(batch_norm, mean, variance, 0.9)?;
+        self.refresh_gpu_batch_norm_cache(owner)
+    }
 
+    /// Stores already-updated rolling statistics (from the device EMA).
+    fn set_gpu_convolution_batch_norm_rolling_stats(
+        &mut self,
+        owner: usize,
+        mean: Vec<f32>,
+        variance: Vec<f32>,
+    ) -> Result<()> {
+        let Some(LayerParams::Convolutional(params)) = self.params.get_mut(owner) else {
+            return Err(Error::InvalidConfig(format!(
+                "missing CPU convolution params for layer #{owner}"
+            )));
+        };
+        let Some(batch_norm) = params.batch_norm.as_mut() else {
+            return Err(Error::InvalidConfig(format!(
+                "missing batch-norm params for convolutional layer #{owner}"
+            )));
+        };
+        if batch_norm.rolling_mean.len() != mean.len()
+            || batch_norm.rolling_variance.len() != variance.len()
+        {
+            return Err(Error::InvalidConfig(format!(
+                "GPU batch-norm rolling stat mismatch at layer #{owner}"
+            )));
+        }
+        batch_norm.rolling_mean = mean;
+        batch_norm.rolling_variance = variance;
+        self.refresh_gpu_batch_norm_cache(owner)
+    }
+
+    /// Marks the folded device params stale after the host rolling stats changed.
+    fn refresh_gpu_batch_norm_cache(&mut self, owner: usize) -> Result<()> {
         let cached = self
             .device_conv_params
             .borrow()
@@ -4069,23 +5297,9 @@ where
                     "missing cached GPU convolution params for layer #{owner}"
                 ))
             })?;
-        let layer =
-            self.network.layers.get(owner).ok_or_else(|| {
-                Error::InvalidConfig(format!("missing convolutional layer #{owner}"))
-            })?;
-        let LayerKind::Convolutional(spec) = &layer.kind else {
-            return Err(Error::InvalidConfig(format!(
-                "layer #{owner} is not convolutional"
-            )));
-        };
-        let params = resolve_convolutional_params(&self.network, &self.params, owner)?;
-        let refreshed = self.cached_convolution_upload(
-            spec,
-            layer.input_shape.channels,
-            params,
-            Some((cached.raw_weights, cached.raw_biases)),
-        )?;
-        self.device_conv_params.borrow_mut()[owner] = Some(refreshed);
+        let mut cached = cached;
+        cached.folded_stale = true;
+        self.device_conv_params.borrow_mut()[owner] = Some(cached);
         Ok(())
     }
 
@@ -4095,11 +5309,24 @@ where
     ) -> Result<()> {
         let config = ElementwiseLaunchConfig::default();
         let mut batch_norm_stats = Vec::new();
+        let mut batch_norm_rolling = Vec::new();
         for layer in &self.network.layers {
             let LayerKind::Convolutional(spec) = &layer.kind else {
                 continue;
             };
             if !spec.batch_normalize || spec.share_index.is_some() {
+                continue;
+            }
+            if let Some(cache) = forward.gpu_batch_norm_caches[layer.index].as_ref() {
+                // Batch-statistics forward: the device already did the EMA.
+                if let Some((mean, variance)) = cache.rolling.as_ref() {
+                    let download = |tensor: &B::Tensor| {
+                        self.backend
+                            .download_f32(tensor)
+                            .map_err(|err| backend_error("download GPU batch-norm rolling stats", err))
+                    };
+                    batch_norm_rolling.push((layer.index, download(mean)?, download(variance)?));
+                }
                 continue;
             }
 
@@ -4152,6 +5379,9 @@ where
         for (owner, mean, variance) in batch_norm_stats {
             self.update_gpu_convolution_batch_norm_running_stats(owner, &mean, &variance)?;
         }
+        for (owner, mean, variance) in batch_norm_rolling {
+            self.set_gpu_convolution_batch_norm_rolling_stats(owner, mean, variance)?;
+        }
         Ok(())
     }
 
@@ -4171,7 +5401,12 @@ where
     }
 
     fn clear_device_conv_params(&mut self) {
+        // Callers replace the host params right before; nothing is stale then.
+        self.host_weights_stale = false;
         for entry in self.device_conv_params.get_mut().iter_mut() {
+            *entry = None;
+        }
+        for entry in self.f16_conv_weights.get_mut().iter_mut() {
             *entry = None;
         }
     }
@@ -4198,7 +5433,32 @@ where
         Ok(())
     }
 
+    /// Cached device params with the BN-folded copies up to date.
     fn cached_convolution_params(
+        &self,
+        layer_index: usize,
+        input_channels: usize,
+        spec: &ConvolutionalSpec,
+        params: &ConvolutionalParams,
+    ) -> Result<GpuConvolutionLayerParams<B::Tensor>> {
+        let cached =
+            self.cached_convolution_params_raw(layer_index, input_channels, spec, params)?;
+        if !cached.folded_stale {
+            return Ok(cached);
+        }
+        let refolded = self.cached_convolution_upload(
+            spec,
+            input_channels,
+            params,
+            Some((cached.raw_weights, cached.raw_biases)),
+        )?;
+        self.device_conv_params.borrow_mut()[layer_index] = Some(refolded.clone());
+        Ok(refolded)
+    }
+
+    /// Cached device params whose raw tensors are current but whose folded
+    /// copies may be stale (training BN forward/backward only read the raw ones).
+    fn cached_convolution_params_raw(
         &self,
         layer_index: usize,
         input_channels: usize,
@@ -4252,6 +5512,7 @@ where
             } else {
                 raw_biases
             },
+            folded_stale: false,
             batch_norm_scales: params
                 .batch_norm
                 .as_ref()
@@ -4289,7 +5550,7 @@ where
         weight_updates: B::Tensor,
         bias_updates: B::Tensor,
         scale_updates: Option<B::Tensor>,
-    ) -> Result<GpuConvolutionLayerParams<B::Tensor>> {
+    ) -> Result<(GpuConvolutionLayerParams<B::Tensor>, Vec<f32>)> {
         let layer =
             self.network.layers.get(owner).ok_or_else(|| {
                 Error::InvalidConfig(format!("missing convolutional layer #{owner}"))
@@ -4299,33 +5560,34 @@ where
                 "layer #{owner} is not convolutional"
             )));
         };
-        let weights_host = self
-            .backend
-            .download_f32(&raw_weights)
-            .map_err(|err| backend_error("download raw convolution weights", err))?;
+        // Weights stay on the device (the BN fold runs there); only the small
+        // bias vector round-trips so the host copy and the fold stay exact.
         let biases_host = self
             .backend
             .download_f32(&raw_biases)
             .map_err(|err| backend_error("download raw convolution biases", err))?;
         let params = resolve_convolutional_params(&self.network, &self.params, owner)?;
-        let host_params = ConvolutionalParams {
-            biases: biases_host,
-            batch_norm: params.batch_norm.clone(),
-            weights: weights_host,
-        };
-        let refreshed = self.cached_convolution_upload(
-            spec,
-            layer.input_shape.channels,
-            &host_params,
-            Some((raw_weights, raw_biases)),
-        )?;
+        let folds = spec.batch_normalize && params.batch_norm.is_some();
+        let mut refreshed = self.device_conv_params.borrow()[owner]
+            .clone()
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!("missing cached device params for layer #{owner}"))
+            })?;
+        refreshed.raw_weights = raw_weights.clone();
+        refreshed.raw_biases = raw_biases.clone();
+        if folds {
+            refreshed.folded_stale = true;
+        } else {
+            refreshed.weights = raw_weights;
+            refreshed.biases = raw_biases;
+        }
         self.device_conv_params.borrow_mut()[owner] = Some(refreshed.clone());
         self.device_train_buffers.borrow_mut()[owner] = Some(GpuConvolutionTrainBuffers {
             weight_updates,
             bias_updates,
             scale_updates,
         });
-        Ok(refreshed)
+        Ok((refreshed, biases_host))
     }
 
     fn cached_convolution_upload(
@@ -4335,52 +5597,105 @@ where
         params: &ConvolutionalParams,
         raw: Option<(B::Tensor, B::Tensor)>,
     ) -> Result<GpuConvolutionLayerParams<B::Tensor>> {
-        let (folded_biases, folded_weights) =
-            fold_convolutional_params_for_inference(spec, params, input_channels)?;
-        let (raw_weights, raw_biases) = match raw {
-            Some(existing) => existing,
-            None => (
-                self.backend
-                    .upload_f32(
-                        &[
-                            spec.filters,
-                            input_channels / spec.groups.max(1),
-                            spec.size,
-                            spec.size,
-                        ],
-                        &params.weights,
-                    )
-                    .map_err(|err| backend_error("upload raw convolution weights", err))?,
-                self.backend
+        let weight_shape = [
+            spec.filters,
+            input_channels / spec.groups.max(1),
+            spec.size,
+            spec.size,
+        ];
+        // With device-resident raw weights the BN fold runs on the device
+        // (`w * gamma / sqrt(var + eps)` per filter, the same arithmetic as
+        // `fold_convolutional_params_for_inference`), so the host weights may
+        // be stale; only `params.biases` and the BN stats are read.
+        let (raw_weights, raw_biases, folded_weights, folded_biases) = match raw {
+            Some((raw_weights, raw_biases)) => {
+                let folded = match params.batch_norm.as_ref().filter(|_| spec.batch_normalize) {
+                    Some(batch_norm) => {
+                        if params.biases.len() != spec.filters
+                            || batch_norm.scales.len() != spec.filters
+                            || batch_norm.rolling_mean.len() != spec.filters
+                            || batch_norm.rolling_variance.len() != spec.filters
+                        {
+                            return Err(Error::InvalidConfig(format!(
+                                "batch norm parameter length mismatch for {} filters",
+                                spec.filters
+                            )));
+                        }
+                        let scales = batch_norm
+                            .scales
+                            .iter()
+                            .zip(&batch_norm.rolling_variance)
+                            .map(|(scale, variance)| scale / (variance + BATCH_NORM_EPSILON).sqrt())
+                            .collect::<Vec<_>>();
+                        let biases = params
+                            .biases
+                            .iter()
+                            .zip(&batch_norm.rolling_mean)
+                            .zip(&scales)
+                            .map(|((bias, mean), scale)| bias - mean * scale)
+                            .collect::<Vec<_>>();
+                        let scales = self
+                            .backend
+                            .upload_f32(&[spec.filters], &scales)
+                            .map_err(|err| backend_error("upload batch-norm fold scales", err))?;
+                        let weights = self
+                            .backend
+                            .channel_scale_f32(
+                                &raw_weights,
+                                &scales,
+                                spec.filters,
+                                weight_shape[1] * spec.size * spec.size,
+                                ElementwiseLaunchConfig::default(),
+                            )
+                            .map_err(|err| backend_error("fold convolution weights", err))?;
+                        Some((weights, biases))
+                    }
+                    None => None,
+                };
+                let (weights, biases) = match folded {
+                    Some((weights, biases)) => (Some(weights), biases),
+                    None => (None, Vec::new()),
+                };
+                (raw_weights, raw_biases, weights, biases)
+            }
+            None => {
+                let (folded_biases, folded_weights) =
+                    fold_convolutional_params_for_inference(spec, params, input_channels)?;
+                let raw_weights = self
+                    .backend
+                    .upload_f32(&weight_shape, &params.weights)
+                    .map_err(|err| backend_error("upload raw convolution weights", err))?;
+                let raw_biases = self
+                    .backend
                     .upload_f32(&[spec.filters], &params.biases)
-                    .map_err(|err| backend_error("upload raw convolution biases", err))?,
-            ),
+                    .map_err(|err| backend_error("upload raw convolution biases", err))?;
+                let folded_weights = if spec.batch_normalize {
+                    Some(
+                        self.backend
+                            .upload_f32(&weight_shape, &folded_weights)
+                            .map_err(|err| {
+                                backend_error("upload folded convolution weights", err)
+                            })?,
+                    )
+                } else {
+                    None
+                };
+                (raw_weights, raw_biases, folded_weights, folded_biases)
+            }
+        };
+        let biases = if folded_weights.is_some() {
+            self.backend
+                .upload_f32(&[spec.filters], &folded_biases)
+                .map_err(|err| backend_error("upload folded convolution biases", err))?
+        } else {
+            raw_biases.clone()
         };
         Ok(GpuConvolutionLayerParams {
             raw_weights: raw_weights.clone(),
-            raw_biases: raw_biases.clone(),
-            weights: if spec.batch_normalize {
-                self.backend
-                    .upload_f32(
-                        &[
-                            spec.filters,
-                            input_channels / spec.groups.max(1),
-                            spec.size,
-                            spec.size,
-                        ],
-                        &folded_weights,
-                    )
-                    .map_err(|err| backend_error("upload folded convolution weights", err))?
-            } else {
-                raw_weights
-            },
-            biases: if spec.batch_normalize {
-                self.backend
-                    .upload_f32(&[spec.filters], &folded_biases)
-                    .map_err(|err| backend_error("upload folded convolution biases", err))?
-            } else {
-                raw_biases
-            },
+            raw_biases,
+            weights: folded_weights.unwrap_or(raw_weights),
+            biases,
+            folded_stale: false,
             batch_norm_scales: params
                 .batch_norm
                 .as_ref()
@@ -4399,7 +5714,8 @@ where
         })
     }
 
-    fn sync_convolution_owner_from_device(
+    /// Copies the device raw weights of one owner convolution to the host params.
+    fn sync_convolution_weights_from_device(
         &mut self,
         owner: usize,
         cached: &GpuConvolutionLayerParams<B::Tensor>,
@@ -4408,17 +5724,12 @@ where
             .backend
             .download_f32(&cached.raw_weights)
             .map_err(|err| backend_error("download synced raw convolution weights", err))?;
-        let raw_biases = self
-            .backend
-            .download_f32(&cached.raw_biases)
-            .map_err(|err| backend_error("download synced raw convolution biases", err))?;
         let Some(LayerParams::Convolutional(params)) = self.params.get_mut(owner) else {
             return Err(Error::InvalidConfig(format!(
                 "missing CPU convolution params for layer #{owner}"
             )));
         };
         params.weights = raw_weights;
-        params.biases = raw_biases;
         Ok(())
     }
 }
@@ -7292,6 +8603,18 @@ fn backward_crnn_layer(
     Ok((input_gradient, gradients))
 }
 
+/// Elements per softmax group in one batch item.
+fn softmax_group_size(shape: TensorShape, groups: usize) -> Result<usize> {
+    let groups = groups.max(1);
+    let per_batch = shape.element_count();
+    if !per_batch.is_multiple_of(groups) {
+        return Err(Error::InvalidConfig(format!(
+            "softmax input size {per_batch} is not divisible by groups {groups}"
+        )));
+    }
+    Ok(per_batch / groups)
+}
+
 fn forward_softmax(input: &Tensor, groups: usize) -> Result<Tensor> {
     let groups = groups.max(1);
     let per_batch = input.shape.element_count();
@@ -7329,46 +8652,143 @@ fn forward_softmax(input: &Tensor, groups: usize) -> Result<Tensor> {
     Ok(output)
 }
 
+fn check_dropout_probability(probability: f32) -> Result<()> {
+    if !(0.0..1.0).contains(&probability) {
+        return Err(Error::InvalidConfig(format!(
+            "dropout probability must be in [0, 1), got {probability}"
+        )));
+    }
+    Ok(())
+}
+
 fn forward_dropout(
     input: &Tensor,
     probability: f32,
     training: bool,
     rng_state: &mut u64,
 ) -> Result<(Tensor, Option<Tensor>)> {
-    if !(0.0..1.0).contains(&probability) {
-        return Err(Error::InvalidConfig(format!(
-            "dropout probability must be in [0, 1), got {probability}"
-        )));
-    }
+    check_dropout_probability(probability)?;
     if !training || probability == 0.0 {
         return Ok((input.clone(), None));
     }
 
+    // One seed per dropout layer, then a counter-hash per element
+    // (`darknet_cuda::dropout_unit`), so a GPU backend reproduces this mask
+    // exactly from the same seed.
+    let seed = advance_rng(rng_state);
     let scale = 1.0 / (1.0 - probability);
     let mut output = Tensor::zeros(input.shape);
     let mut mask = Tensor::zeros(input.shape);
-    for ((out, mask_value), value) in output
+    for (index, ((out, mask_value), value)) in output
         .data
         .iter_mut()
         .zip(mask.data.iter_mut())
         .zip(&input.data)
+        .enumerate()
     {
-        let random = next_random_unit(rng_state);
-        let multiplier = if random < probability { 0.0 } else { scale };
+        let multiplier = if dropout_unit(seed, index as u64) < probability {
+            0.0
+        } else {
+            scale
+        };
         *mask_value = multiplier;
         *out = *value * multiplier;
     }
     Ok((output, Some(mask)))
 }
 
-fn next_random_unit(state: &mut u64) -> f32 {
+/// C++ `forward_dropout_layer_gpu` DropBlock schedule: during the first 85% of
+/// `max_batches` the probability and block size ramp up linearly.  Returns the
+/// per-cell block probability `p * ramp / block_size^2` and the square block
+/// side (`min` of the clamped width/height, >= 1).
+fn dropblock_plan(
+    spec: &DropblockSpec,
+    probability: f32,
+    shape: TensorShape,
+    iteration: usize,
+    max_batches: usize,
+) -> (f32, usize) {
+    let ramp_end = max_batches as f64 * 0.85;
+    let multiplier = if (iteration as f64) < ramp_end {
+        iteration as f32 / ramp_end as f32
+    } else {
+        1.0
+    };
+    let (mut block_width, mut block_height) = (
+        (spec.size_abs as f32 * multiplier) as i64,
+        (spec.size_abs as f32 * multiplier) as i64,
+    );
+    if spec.size_rel != 0.0 {
+        block_width = (spec.size_rel * shape.width as f32 * multiplier) as i64;
+        block_height = (spec.size_rel * shape.height as f32 * multiplier) as i64;
+    }
+    let block_width = block_width.clamp(1, shape.width.max(1) as i64);
+    let block_height = block_height.clamp(1, shape.height.max(1) as i64);
+    let block_size = block_width.min(block_height) as usize;
+    (
+        probability * multiplier / (block_size * block_size) as f32,
+        block_size,
+    )
+}
+
+/// Per-iteration DropBlock seed: the layer seed mixed with the iteration so
+/// every step draws new blocks.
+fn dropblock_seed(layer_seed: u64, iteration: usize) -> u64 {
+    layer_seed ^ (iteration as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// DropBlock forward (see `darknet_cuda::host_ops::dropblock`); like dropout
+/// the returned mask is the per-element multiplier used by the backward.
+fn forward_dropblock(
+    input: &Tensor,
+    spec: &DropblockSpec,
+    probability: f32,
+    training: bool,
+    rng_state: &mut u64,
+    iteration: usize,
+    max_batches: usize,
+) -> Result<(Tensor, Option<Tensor>)> {
+    check_dropout_probability(probability)?;
+    if !training || probability == 0.0 {
+        return Ok((input.clone(), None));
+    }
+    let seed = advance_rng(rng_state);
+    let (block_prob, block_size) = dropblock_plan(spec, probability, input.shape, iteration, max_batches);
+    if block_prob <= 0.0 {
+        return Ok((input.clone(), None));
+    }
+    let shape = tensor_backend_shape(input.shape);
+    let (out, mask) = darknet_cuda::host_ops::dropblock(
+        &input.data,
+        &shape,
+        block_prob,
+        block_size,
+        dropblock_seed(seed, iteration),
+    );
+    Ok((
+        Tensor {
+            shape: input.shape,
+            data: out,
+        },
+        Some(Tensor {
+            shape: input.shape,
+            data: mask,
+        }),
+    ))
+}
+
+fn advance_rng(state: &mut u64) -> u64 {
     // A local generator keeps the core crate dependency-free.  Re-seeding per
     // forward call is intentional: inference remains deterministic and tests
     // can reproduce a training pass exactly.
     *state ^= *state << 13;
     *state ^= *state >> 7;
     *state ^= *state << 17;
-    ((*state >> 40) as u32) as f32 / (u32::MAX as f32 + 1.0)
+    *state
+}
+
+fn next_random_unit(state: &mut u64) -> f32 {
+    ((advance_rng(state) >> 40) as u32) as f32 / (u32::MAX as f32 + 1.0)
 }
 
 fn crop_sample(input: &Tensor, batch: usize, channel: usize, x: isize, y: isize) -> f32 {
@@ -8428,6 +9848,10 @@ fn activation_gradient_from_output(
         Activation::Relu => Ok((output_value > 0.0) as i32 as f32),
         Activation::Leaky => Ok(if output_value > 0.0 { 1.0 } else { 0.1 }),
         Activation::Tanh => Ok(1.0 - output_value * output_value),
+        // relu6(x) is in (0, 6) exactly when x is, so the output form is exact.
+        Activation::Relu6 => Ok((output_value > 0.0 && output_value < 6.0) as i32 as f32),
+        // ramp(x) > 0 exactly when x > 0.
+        Activation::Ramp => Ok((output_value > 0.0) as i32 as f32 + 0.1),
         Activation::Swish => {
             let x = activation_input.ok_or_else(|| {
                 Error::InvalidConfig(format!(
@@ -8531,6 +9955,8 @@ fn activate(activation: Activation, value: f32) -> f32 {
         Activation::Mish => value * (1.0 + value.exp()).ln().tanh(),
         Activation::Swish => value / (1.0 + (-value).exp()),
         Activation::Tanh => value.tanh(),
+        Activation::Relu6 => value.clamp(0.0, 6.0),
+        Activation::Ramp => value * (value > 0.0) as i32 as f32 + 0.1 * value,
         Activation::Other(_) => value,
     }
 }
@@ -8794,28 +10220,6 @@ fn forward_shortcut_compact(
     Ok(output)
 }
 
-fn shortcut_add_host(current: &Tensor, source: &Tensor) -> Result<Tensor> {
-    if current.shape.batch != source.shape.batch {
-        return Err(Error::InvalidConfig(format!(
-            "shortcut tensors have incompatible batch shapes {} and {}",
-            current.shape, source.shape
-        )));
-    }
-
-    let mut output = current.clone();
-    let current_stride = current.shape.element_count();
-    let source_stride = source.shape.element_count();
-    let copied = current_stride.min(source_stride);
-    for batch in 0..current.shape.batch {
-        let current_offset = batch * current_stride;
-        let source_offset = batch * source_stride;
-        for index in 0..copied {
-            output.data[current_offset + index] += source.data[source_offset + index];
-        }
-    }
-    Ok(output)
-}
-
 fn shortcut_source_gradient(output_gradient: &Tensor, source_shape: TensorShape) -> Result<Tensor> {
     if output_gradient.shape.batch != source_shape.batch {
         return Err(Error::InvalidConfig(format!(
@@ -8897,8 +10301,10 @@ fn forward_reorg(
     if reverse {
         for b in 0..input.shape.batch {
             for c in 0..input.shape.channels {
-                let out_c = c / (stride * stride);
-                let offset = c % (stride * stride);
+                // Inverse of the non-reverse mapping below (Darknet reorg_cpu:
+                // small channel k <-> big channel k % out_c, offset k / out_c).
+                let out_c = c % output.shape.channels;
+                let offset = c / output.shape.channels;
                 let dy = offset / stride;
                 let dx = offset % stride;
                 for y in 0..input.shape.height {
@@ -10036,6 +11442,8 @@ mod tests {
             F32ActivationKind::Mish => Activation::Mish,
             F32ActivationKind::Swish => Activation::Swish,
             F32ActivationKind::Tanh => Activation::Tanh,
+            F32ActivationKind::Relu6 => Activation::Relu6,
+            F32ActivationKind::Ramp => Activation::Ramp,
         };
         super::activate(activation, value)
     }
@@ -10077,6 +11485,8 @@ mod tests {
                 let tanh = value.tanh();
                 1.0 - tanh * tanh
             }
+            F32ActivationKind::Relu6 => (value > 0.0 && value < 6.0) as i32 as f32,
+            F32ActivationKind::Ramp => (value > 0.0) as i32 as f32 + 0.1,
         }
     }
 
@@ -12059,6 +13469,13 @@ mod tests {
             equidistant_point: 0,
             badlabels_rejection_percentage: 0.0,
             num_sigmas_reject_badlabels: 0.0,
+            adam: false,
+            adam_b1: 0.9,
+            adam_b2: 0.999,
+            adam_eps: 1e-6,
+            decoupled_decay: false,
+            loss_scale: 1.0,
+            try_fix_nan: false,
         };
         assert_eq!(compute_learning_rate(&base, 0), 0.0);
         assert!((compute_learning_rate(&base, 5) - 0.000625).abs() < 1e-9);
@@ -12876,6 +14293,54 @@ mod tests {
     }
 
     #[test]
+    fn gpu_inference_folds_batchnorm_into_conv_like_cpu() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                width=3
+                height=1
+                channels=2
+
+                [convolutional]
+                filters=3
+                size=1
+                stride=1
+                batch_normalize=1
+                activation=linear
+            "#,
+        )
+        .expect("cfg should parse");
+        let network = Network::from_config(cfg).expect("network should build");
+        let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+        match &mut gpu.params[0] {
+            LayerParams::Convolutional(params) => {
+                params.weights = vec![1.0, -2.0, 0.5, 0.25, -1.0, 3.0];
+                params.biases = vec![0.1, -0.2, 0.3];
+                let bn = params.batch_norm.as_mut().expect("batch norm params");
+                bn.scales = vec![1.5, 0.5, -2.0];
+                bn.rolling_mean = vec![0.2, -0.4, 1.0];
+                bn.rolling_variance = vec![4.0, 0.25, 9.0];
+            }
+            other => panic!("unexpected params: {other:?}"),
+        }
+        let mut cpu = ExecutableNetwork::new(network);
+        cpu.params = gpu.params.clone();
+        let input = Tensor::from_data(
+            gpu.network.net.input_shape(),
+            vec![1.0, 2.0, -1.0, 0.5, -3.0, 4.0],
+        )
+        .expect("input tensor");
+        let want = cpu.forward(&input).expect("CPU forward");
+        let got = gpu.forward(&input).expect("GPU forward");
+        let (w, g) = (&want.layer_outputs[0], &got.layer_outputs[0]);
+        assert_eq!(w.data.len(), g.data.len());
+        for (a, b) in w.data.iter().zip(&g.data) {
+            assert!((a - b).abs() < 1.0e-5, "cpu {a} vs gpu {b}");
+        }
+    }
+
+    #[test]
     fn gpu_batchnorm_conv_updates_running_stats() {
         let cfg = ConfigFile::parse_str(
             "inline.cfg",
@@ -12987,6 +14452,187 @@ mod tests {
         let train = train_buffers[0].as_ref().expect("train buffers exist");
         assert_eq!(train.weight_updates.data, vec![0.0]);
         assert_eq!(train.bias_updates.data, vec![0.0]);
+    }
+
+    fn gpu_training_bn_network() -> Network {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                batch=2
+                width=3
+                height=2
+                channels=2
+
+                [convolutional]
+                filters=3
+                size=1
+                stride=1
+                batch_normalize=1
+                activation=linear
+            "#,
+        )
+        .expect("cfg should parse");
+        Network::from_config(cfg).expect("network should build")
+    }
+
+    fn gpu_training_bn_executable(
+        weights: &[f32],
+        scales: &[f32],
+        biases: &[f32],
+    ) -> GpuExecutableNetwork<FakeBackend> {
+        let mut gpu = GpuExecutableNetwork::new(gpu_training_bn_network(), FakeBackend);
+        match &mut gpu.params[0] {
+            LayerParams::Convolutional(params) => {
+                params.weights = weights.to_vec();
+                params.biases = biases.to_vec();
+                let bn = params.batch_norm.as_mut().expect("batch norm params");
+                bn.scales = scales.to_vec();
+                bn.rolling_mean = vec![0.3, -0.2, 0.5];
+                bn.rolling_variance = vec![2.0, 0.5, 3.0];
+            }
+            other => panic!("unexpected params: {other:?}"),
+        }
+        gpu
+    }
+
+    const BN_TRAIN_WEIGHTS: [f32; 6] = [0.5, -1.0, 0.25, 0.75, -0.5, 1.5];
+    const BN_TRAIN_SCALES: [f32; 3] = [1.5, 0.5, -2.0];
+    const BN_TRAIN_BIASES: [f32; 3] = [0.1, -0.2, 0.3];
+
+    fn bn_train_input() -> Vec<f32> {
+        (0..24).map(|i| ((i * 7 % 11) as f32) * 0.37 - 1.5).collect()
+    }
+
+    #[test]
+    fn gpu_training_forward_uses_batch_statistics_and_updates_rolling_stats() {
+        let mut gpu = gpu_training_bn_executable(&BN_TRAIN_WEIGHTS, &BN_TRAIN_SCALES, &BN_TRAIN_BIASES);
+        gpu.init_train_buffers_gpu().expect("train buffers");
+        let input = Tensor::from_data(gpu.network.net.input_shape(), bn_train_input()).expect("input");
+        let forward = gpu.forward_training_with_state(&input).expect("training forward");
+
+        // f64 reference: 1x1 conv, batch statistics over (batch, h, w).
+        let (batch, spatial, in_c, out_c) = (2usize, 6usize, 2usize, 3usize);
+        let mut raw = vec![0.0f64; batch * out_c * spatial];
+        for b in 0..batch {
+            for o in 0..out_c {
+                for s in 0..spatial {
+                    raw[(b * out_c + o) * spatial + s] = (0..in_c)
+                        .map(|c| {
+                            BN_TRAIN_WEIGHTS[o * in_c + c] as f64
+                                * input.data[(b * in_c + c) * spatial + s] as f64
+                        })
+                        .sum();
+                }
+            }
+        }
+        let n = (batch * spatial) as f64;
+        let mut want = vec![0.0f64; raw.len()];
+        let mut want_rolling = [(0.0f64, 0.0f64); 3];
+        for o in 0..out_c {
+            let at = |b: usize, s: usize| raw[(b * out_c + o) * spatial + s];
+            let mean: f64 = (0..batch).flat_map(|b| (0..spatial).map(move |s| (b, s))).map(|(b, s)| at(b, s)).sum::<f64>() / n;
+            let sq: f64 = (0..batch).flat_map(|b| (0..spatial).map(move |s| (b, s))).map(|(b, s)| (at(b, s) - mean).powi(2)).sum();
+            let var = sq / n;
+            for b in 0..batch {
+                for s in 0..spatial {
+                    want[(b * out_c + o) * spatial + s] = (at(b, s) - mean) / (var + 1.0e-5).sqrt()
+                        * BN_TRAIN_SCALES[o] as f64
+                        + BN_TRAIN_BIASES[o] as f64;
+                }
+            }
+            let (rm, rv) = ([0.3, -0.2, 0.5][o], [2.0, 0.5, 3.0][o]);
+            want_rolling[o] = (0.9 * rm + 0.1 * mean, 0.9 * rv + 0.1 * sq / (n - 1.0));
+        }
+        for (g, w) in forward.cpu_forward.layer_outputs[0].data.iter().zip(&want) {
+            assert!((*g as f64 - w).abs() < 1.0e-4, "output {g} vs {w}");
+        }
+        // Inference forward still uses the rolling statistics.
+        let inference = gpu.forward(&input).expect("inference forward");
+        assert!(
+            inference.layer_outputs[0]
+                .data
+                .iter()
+                .zip(&want)
+                .any(|(g, w)| (*g as f64 - w).abs() > 1.0e-2),
+            "inference must not use batch statistics"
+        );
+
+        let seeds = vec![None; gpu.network.layers.len()];
+        gpu.backward_accumulate_seeded_gpu(&forward, &seeds).expect("backward");
+        let Some(LayerParams::Convolutional(params)) = gpu.params.first() else {
+            panic!("conv params expected");
+        };
+        let bn = params.batch_norm.as_ref().expect("batch norm params");
+        for o in 0..out_c {
+            assert!((bn.rolling_mean[o] as f64 - want_rolling[o].0).abs() < 1.0e-5);
+            assert!((bn.rolling_variance[o] as f64 - want_rolling[o].1).abs() < 1.0e-5);
+        }
+    }
+
+    #[test]
+    fn gpu_training_batch_norm_backward_matches_finite_difference() {
+        let input_data = bn_train_input();
+        let seed_data: Vec<f32> = (0..36).map(|i| ((i * 5 % 7) as f32) * 0.3 - 0.8).collect();
+        // L = sum(seed * output) through the batch-statistics forward.
+        let loss = |weights: &[f32], scales: &[f32], biases: &[f32]| -> f64 {
+            let gpu = gpu_training_bn_executable(weights, scales, biases);
+            let input = Tensor::from_data(gpu.network.net.input_shape(), input_data.clone()).expect("input");
+            let forward = gpu.forward_training_with_state(&input).expect("training forward");
+            forward.cpu_forward.layer_outputs[0]
+                .data
+                .iter()
+                .zip(&seed_data)
+                .map(|(o, s)| *o as f64 * *s as f64)
+                .sum()
+        };
+
+        let mut gpu = gpu_training_bn_executable(&BN_TRAIN_WEIGHTS, &BN_TRAIN_SCALES, &BN_TRAIN_BIASES);
+        gpu.init_train_buffers_gpu().expect("train buffers");
+        let input = Tensor::from_data(gpu.network.net.input_shape(), input_data.clone()).expect("input");
+        let forward = gpu.forward_training_with_state(&input).expect("training forward");
+        let seeds = vec![Some(
+            Tensor::from_data(gpu.network.layers[0].output_shape, seed_data.clone()).expect("seed"),
+        )];
+        gpu.backward_accumulate_seeded_gpu(&forward, &seeds).expect("backward");
+        let (weight_updates, bias_updates, scale_updates) = {
+            let buffers = gpu.device_train_buffers.borrow();
+            let train = buffers[0].as_ref().expect("train buffers");
+            (
+                train.weight_updates.data.clone(),
+                train.bias_updates.data.clone(),
+                train.scale_updates.as_ref().expect("scale updates").data.clone(),
+            )
+        };
+
+        let eps = 1.0e-2f32;
+        let fd = |which: usize, index: usize| -> f64 {
+            let (mut w, mut s, mut b) = (BN_TRAIN_WEIGHTS.to_vec(), BN_TRAIN_SCALES.to_vec(), BN_TRAIN_BIASES.to_vec());
+            let target = match which {
+                0 => &mut w,
+                1 => &mut s,
+                _ => &mut b,
+            };
+            target[index] += eps;
+            let lp = loss(&w, &s, &b);
+            let target = match which {
+                0 => &mut w,
+                1 => &mut s,
+                _ => &mut b,
+            };
+            target[index] -= 2.0 * eps;
+            let lm = loss(&w, &s, &b);
+            (lp - lm) / (2.0 * eps as f64)
+        };
+        for (which, name, got) in [(0, "weight", &weight_updates), (1, "scale", &scale_updates), (2, "bias", &bias_updates)] {
+            for (i, g) in got.iter().enumerate() {
+                let want = fd(which, i);
+                assert!(
+                    (*g as f64 - want).abs() < 2.0e-2 + 2.0e-2 * want.abs(),
+                    "{name} update[{i}]: backward {g} vs finite difference {want}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -13954,5 +15600,1058 @@ mod tests {
             forward.final_output().expect("GRU output").data,
             vec![0.25, 0.25, 0.375, 0.375]
         );
+    }
+
+    fn fill_conv_params(params: &mut [LayerParams]) {
+        for (layer, params) in params.iter_mut().enumerate() {
+            if let LayerParams::Convolutional(conv) = params {
+                for (i, w) in conv.weights.iter_mut().enumerate() {
+                    *w = ((i + 3 * layer) as f32 * 0.7).sin() * 0.6;
+                }
+                for (i, b) in conv.biases.iter_mut().enumerate() {
+                    *b = ((i + layer) as f32 * 1.3).cos() * 0.2;
+                }
+            }
+        }
+    }
+
+    fn patterned_input(shape: TensorShape) -> Tensor {
+        let data = (0..shape.batch * shape.element_count())
+            .map(|i| (i as f32 * 0.37).sin() + 0.1 * (i % 5) as f32)
+            .collect();
+        Tensor::from_data(shape, data).expect("input tensor")
+    }
+
+    /// Runs the same training forward + seeded backward on the CPU network and
+    /// on the GPU network (fake backend, default host layer ops) and compares
+    /// every layer output, dropout mask and convolution gradient.
+    fn assert_gpu_layer_chain_matches_cpu(cfg_text: &str, seed_layer: usize) {
+        let network = Network::from_config(
+            ConfigFile::parse_str("inline.cfg", cfg_text).expect("cfg should parse"),
+        )
+        .expect("network should build");
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        fill_conv_params(&mut cpu.params);
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        gpu.params = cpu.params.clone();
+        gpu.init_train_buffers_gpu()
+            .expect("GPU train buffers should initialize");
+        assert!(
+            !gpu.requires_cpu_backward_fallback(),
+            "chain must use the GPU backward path"
+        );
+
+        let input = patterned_input(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("GPU forward");
+        for (index, (lhs, rhs)) in cpu_forward
+            .layer_outputs
+            .iter()
+            .zip(&gpu_forward.cpu_forward.layer_outputs)
+            .enumerate()
+        {
+            assert_eq!(lhs.shape, rhs.shape);
+            assert_slice_close(&format!("layer {index} output"), &lhs.data, &rhs.data, 1e-5);
+        }
+        assert_eq!(
+            cpu_forward.dropout_masks,
+            gpu_forward.cpu_forward.dropout_masks
+        );
+
+        let mut seeds = vec![None; cpu.network.layers.len()];
+        let seed_shape = cpu.network.layers[seed_layer].output_shape;
+        seeds[seed_layer] = Some(
+            Tensor::from_data(
+                seed_shape,
+                (0..seed_shape.batch * seed_shape.element_count())
+                    .map(|i| (i as f32 * 0.91).cos())
+                    .collect(),
+            )
+            .expect("seed tensor"),
+        );
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("GPU backward");
+
+        let gpu_buffers = gpu.device_train_buffers.borrow();
+        let mut checked = 0;
+        for (index, train) in cpu.train_buffers.iter().enumerate() {
+            let LayerTrainBuffers::Convolutional(cpu_train) = train else {
+                continue;
+            };
+            let gpu_train = gpu_buffers[index].as_ref().expect("GPU train buffers");
+            assert_slice_close(
+                &format!("layer {index} weight gradient"),
+                &cpu_train.weight_updates,
+                &gpu_train.weight_updates.data,
+                1e-4,
+            );
+            assert_slice_close(
+                &format!("layer {index} bias gradient"),
+                &cpu_train.bias_updates,
+                &gpu_train.bias_updates.data,
+                1e-4,
+            );
+            assert!(cpu_train.weight_updates.iter().any(|g| g.abs() > 1e-6));
+            checked += 1;
+        }
+        assert!(checked > 0);
+    }
+
+    #[test]
+    fn grad_mode_parses_analytical_default_and_cpp() {
+        assert_eq!(crate::runtime::GradMode::parse(""), crate::runtime::GradMode::Analytical);
+        assert_eq!(crate::runtime::GradMode::parse("analytical"), crate::runtime::GradMode::Analytical);
+        assert_eq!(crate::runtime::GradMode::parse("garbage"), crate::runtime::GradMode::Analytical);
+        assert_eq!(crate::runtime::GradMode::parse("CPP"), crate::runtime::GradMode::Cpp);
+        assert_eq!(crate::runtime::GradMode::parse("c++"), crate::runtime::GradMode::Cpp);
+    }
+
+    #[test]
+    fn gpu_dropout_reorg_softmax_match_cpu_forward_and_backward() {
+        assert_gpu_layer_chain_matches_cpu(
+            "[net]\nwidth=4\nheight=4\nchannels=2\nbatch=2\n\
+             [convolutional]\nfilters=2\nsize=1\nstride=1\nactivation=linear\n\
+             [dropout]\nprobability=0.4\n\
+             [reorg]\nstride=2\n\
+             [softmax]\ngroups=2\n",
+            3,
+        );
+    }
+
+    #[test]
+    fn gpu_reverse_reorg_matches_cpu_forward_and_backward() {
+        assert_gpu_layer_chain_matches_cpu(
+            "[net]\nwidth=4\nheight=4\nchannels=2\nbatch=2\n\
+             [convolutional]\nfilters=2\nsize=1\nstride=1\nactivation=linear\n\
+             [reorg]\nstride=2\n\
+             [reorg]\nstride=2\nreverse=1\n",
+            2,
+        );
+    }
+
+    #[test]
+    fn gpu_scale_channels_matches_cpu_forward_and_backward() {
+        // per-channel scale (avgpool output) and per-pixel scale (1-filter conv)
+        assert_gpu_layer_chain_matches_cpu(
+            "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=2\n\
+             [convolutional]\nfilters=3\nsize=1\nstride=1\nactivation=linear\n\
+             [avgpool]\n\
+             [scale_channels]\nfrom=-2\nactivation=leaky\n",
+            2,
+        );
+        assert_gpu_layer_chain_matches_cpu(
+            "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=2\n\
+             [convolutional]\nfilters=3\nsize=1\nstride=1\nactivation=linear\n\
+             [convolutional]\nfilters=1\nsize=1\nstride=1\nactivation=linear\n\
+             [scale_channels]\nfrom=-2\nscale_wh=1\nactivation=linear\n",
+            2,
+        );
+    }
+
+    /// Darknet resizes a mismatched shortcut source flat per sample (zero-pad
+    /// when the source is smaller, crop when larger); the GPU path used to fall
+    /// back to the CPU for the whole network.
+    #[test]
+    fn gpu_mismatched_shortcut_matches_cpu_forward_and_backward() {
+        // source smaller than the layer: 2-channel source into a 4-channel input.
+        assert_gpu_layer_chain_matches_cpu(
+            "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=2\n\
+             [convolutional]\nfilters=2\nsize=1\nstride=1\nactivation=linear\n\
+             [convolutional]\nfilters=4\nsize=3\nstride=1\npad=1\nactivation=leaky\n\
+             [shortcut]\nfrom=-2\nactivation=leaky\n\
+             [convolutional]\nfilters=2\nsize=1\nstride=1\nactivation=linear\n",
+            3,
+        );
+        // source larger than the layer: the 4-channel source is cropped.
+        assert_gpu_layer_chain_matches_cpu(
+            "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=2\n\
+             [convolutional]\nfilters=4\nsize=1\nstride=1\nactivation=leaky\n\
+             [convolutional]\nfilters=2\nsize=3\nstride=1\npad=1\nactivation=linear\n\
+             [shortcut]\nfrom=-2\nactivation=linear\n\
+             [convolutional]\nfilters=2\nsize=1\nstride=1\nactivation=linear\n",
+            3,
+        );
+    }
+
+    /// Chained conv + activation stacks (incl. relu6 and ramp): GPU-runtime
+    /// weight/bias gradients equal the CPU `ExecutableNetwork` backward.
+    #[test]
+    fn gpu_activation_chains_match_cpu_forward_and_backward() {
+        for act in ["leaky", "relu6", "ramp", "mish", "swish", "logistic", "relu"] {
+            assert_gpu_layer_chain_matches_cpu(
+                &format!(
+                    "[net]\nwidth=4\nheight=4\nchannels=2\nbatch=2\n\
+                     [convolutional]\nfilters=3\nsize=3\nstride=1\npad=1\nactivation={act}\n\
+                     [convolutional]\nfilters=2\nsize=1\nstride=1\nactivation={act}\n"
+                ),
+                1,
+            );
+        }
+    }
+
+    #[test]
+    fn relu6_and_ramp_follow_cpp_activation_and_gradient() {
+        let relu6 = |x: f32| super::activate(Activation::Relu6, x);
+        assert_eq!([relu6(-1.0), relu6(0.0), relu6(3.0), relu6(6.0), relu6(9.0)], [0.0, 0.0, 3.0, 6.0, 6.0]);
+        let ramp = |x: f32| super::activate(Activation::Ramp, x);
+        assert_eq!(ramp(-2.0), -0.2);
+        assert_eq!(ramp(2.0), 2.0 + 0.2);
+        let grad = |a: &Activation, out: f32| {
+            super::activation_gradient_from_output(a, out, None, "t").expect("gradient")
+        };
+        // output form == C++ input form: (x>0 && x<6) and (x>0)+0.1
+        for x in [-3.0f32, 0.0, 2.0, 5.99, 6.0, 8.0] {
+            assert_eq!(grad(&Activation::Relu6, relu6(x)), (x > 0.0 && x < 6.0) as i32 as f32, "relu6 x={x}");
+            assert_eq!(grad(&Activation::Ramp, ramp(x)), (x > 0.0) as i32 as f32 + 0.1, "ramp x={x}");
+        }
+        for (name, expected) in [("relu6", Activation::Relu6), ("ramp", Activation::Ramp)] {
+            let network = Network::from_config(
+                ConfigFile::parse_str(
+                    "inline.cfg",
+                    &format!("[net]\nwidth=2\nheight=2\nchannels=1\n[convolutional]\nfilters=1\nsize=1\nactivation={name}\n"),
+                )
+                .expect("cfg"),
+            )
+            .expect("network");
+            let LayerKind::Convolutional(spec) = &network.layers[0].kind else {
+                panic!("expected convolution");
+            };
+            assert_eq!(spec.activation, expected);
+            assert!(spec.activation.to_cuda_f32_kind().is_some());
+        }
+    }
+
+    #[test]
+    fn gpu_connected_forward_matches_cpu_with_and_without_batch_norm() {
+        for batch_normalize in [0, 1] {
+            let network = Network::from_config(
+                ConfigFile::parse_str(
+                    "inline.cfg",
+                    &format!(
+                        "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=3\n\
+                         [connected]\noutput=5\nbatch_normalize={batch_normalize}\nactivation=leaky\n"
+                    ),
+                )
+                .expect("cfg should parse"),
+            )
+            .expect("network should build");
+            let mut cpu = ExecutableNetwork::new(network.clone());
+            let LayerParams::Connected(params) = &mut cpu.params[0] else {
+                panic!("expected connected parameters");
+            };
+            for (i, w) in params.weights.iter_mut().enumerate() {
+                *w = (i as f32 * 0.43).sin() * 0.5;
+            }
+            for (i, b) in params.biases.iter_mut().enumerate() {
+                *b = 0.1 * i as f32 - 0.2;
+            }
+            if let Some(bn) = params.batch_norm.as_mut() {
+                bn.scales = vec![1.5, 0.7, -0.4, 1.0, 2.0];
+                bn.rolling_mean = vec![0.1, -0.2, 0.3, 0.0, 0.5];
+                bn.rolling_variance = vec![0.5, 1.5, 2.0, 0.8, 1.2];
+            }
+            assert_eq!(params.batch_norm.is_some(), batch_normalize == 1);
+            let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+            gpu.params = cpu.params.clone();
+            let input = patterned_input(cpu.network.net.input_shape());
+            let cpu_forward = cpu.forward(&input).expect("CPU forward");
+            let gpu_forward = gpu.forward_with_state(&input).expect("GPU forward");
+            assert_slice_close(
+                "connected output",
+                &cpu_forward.layer_outputs[0].data,
+                &gpu_forward.cpu_forward.layer_outputs[0].data,
+                1e-5,
+            );
+            assert_slice_close(
+                "connected activation input",
+                &cpu_forward.layer_activation_inputs[0].as_ref().unwrap().data,
+                &gpu_forward.cpu_forward.layer_activation_inputs[0]
+                    .as_ref()
+                    .unwrap()
+                    .data,
+                1e-5,
+            );
+        }
+    }
+
+    // ---- P8 optimizer wiring: Adam/AdamW, loss scale, NaN/Inf, accumulation ----
+
+    fn optimizer_net(net_extra: &str) -> GpuExecutableNetwork<FakeBackend> {
+        let cfg = format!(
+            "[net]\nwidth=4\nheight=4\nchannels=2\nbatch=2\n{net_extra}\n\
+             [convolutional]\nfilters=3\nsize=3\nstride=1\npad=1\nbatch_normalize=1\nactivation=leaky\n\
+             [convolutional]\nfilters=2\nsize=1\nstride=1\nactivation=linear\n"
+        );
+        let network = Network::from_config(ConfigFile::parse_str("inline.cfg", &cfg).expect("cfg"))
+            .expect("network");
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        fill_conv_params(&mut gpu.params);
+        if let LayerParams::Convolutional(p) = &mut gpu.params[0] {
+            let bn = p.batch_norm.as_mut().expect("bn");
+            bn.scales = vec![1.2, 0.8, -0.6];
+        }
+        gpu.init_train_buffers_gpu().expect("train buffers");
+        gpu
+    }
+
+    fn optimizer_seeds(gpu: &GpuExecutableNetwork<FakeBackend>, step: usize) -> Vec<Option<Tensor>> {
+        let mut seeds = vec![None; gpu.network.layers.len()];
+        let shape = gpu.network.layers[1].output_shape;
+        seeds[1] = Some(
+            Tensor::from_data(
+                shape,
+                (0..shape.batch * shape.element_count())
+                    .map(|i| ((i + 7 * step) as f32 * 0.91).cos() * 0.5)
+                    .collect(),
+            )
+            .expect("seed"),
+        );
+        seeds
+    }
+
+    /// (weights, biases, scales) of the two conv layers as host vectors plus
+    /// the accumulated updates, from the device state.
+    fn optimizer_snapshot(
+        gpu: &GpuExecutableNetwork<FakeBackend>,
+    ) -> Vec<(Vec<f32>, Vec<f32>, Option<Vec<f32>>)> {
+        (0..2)
+            .map(|i| {
+                let train = gpu.device_train_buffers.borrow()[i].clone().expect("train");
+                (
+                    train.weight_updates.data,
+                    train.bias_updates.data,
+                    train.scale_updates.map(|t| t.data),
+                )
+            })
+            .collect()
+    }
+
+    fn host_params(gpu: &GpuExecutableNetwork<FakeBackend>, layer: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let LayerParams::Convolutional(p) = &gpu.params[layer] else {
+            panic!("conv params")
+        };
+        (
+            p.weights.clone(),
+            p.biases.clone(),
+            p.batch_norm.as_ref().map(|b| b.scales.clone()).unwrap_or_default(),
+        )
+    }
+
+    /// f64 Adam / AdamW reference of one tensor (C++ `adam_update_gpu`).
+    #[allow(clippy::too_many_arguments)]
+    fn ref_adam_tensor(
+        w: &mut [f64],
+        m: &mut [f64],
+        v: &mut [f64],
+        u: &[f32],
+        lr: f64,
+        (b1, b2, eps): (f64, f64, f64),
+        decay_batch: f64,
+        decoupled: f64,
+        t: i32,
+    ) {
+        for i in 0..w.len() {
+            let g = u[i] as f64 - decay_batch * w[i];
+            m[i] = b1 * m[i] + (1.0 - b1) * g;
+            v[i] = b2 * v[i] + (1.0 - b2) * g * g;
+            let mhat = m[i] / (1.0 - b1.powi(t));
+            let vhat = v[i] / (1.0 - b2.powi(t));
+            w[i] += lr * mhat / (vhat.sqrt() + eps) - decoupled * w[i];
+        }
+    }
+
+    #[test]
+    fn gpu_adam_and_adamw_match_f64_reference_over_steps() {
+        for decoupled in [false, true] {
+            let mut gpu = optimizer_net(&format!(
+                "adam=1\nB1=0.8\nB2=0.95\neps=0.00001\ndecoupled_decay={}",
+                decoupled as u8
+            ));
+            assert!(gpu.network.net.adam && gpu.network.net.decoupled_decay == decoupled);
+            assert_eq!((gpu.network.net.adam_b1, gpu.network.net.adam_b2), (0.8, 0.95));
+            // reference state: (w, b, s) x (m, v) per layer
+            let ws: Vec<_> = (0..2).map(|l| host_params(&gpu, l)).collect();
+            let mut refw: Vec<[Vec<f64>; 3]> = ws
+                .iter()
+                .map(|(w, b, s)| [w, b, s].map(|x| x.iter().map(|&f| f as f64).collect()))
+                .collect();
+            let mut refm: Vec<[Vec<f64>; 3]> = refw.iter().map(|a| a.clone().map(|x| vec![0.0; x.len()])).collect();
+            let mut refv = refm.clone();
+            let (lr, decay, batch) = (0.01f32, 0.05f32, 2usize);
+            for step in 1..=4 {
+                let input = patterned_input(gpu.network.net.input_shape());
+                let forward = gpu.forward_training_with_state(&input).expect("forward");
+                let seeds = optimizer_seeds(&gpu, step);
+                gpu.backward_accumulate_seeded_gpu(&forward, &seeds).expect("backward");
+                let updates = optimizer_snapshot(&gpu);
+                gpu.update_weights_gpu(lr, 0.9, decay, batch).expect("adam update");
+                assert_eq!(gpu.adam_step() as usize, step);
+                let (coupled, dec) = if decoupled {
+                    (0.0, lr as f64 * decay as f64)
+                } else {
+                    (decay as f64 * batch as f64, 0.0)
+                };
+                for layer in 0..2 {
+                    let (uw, ub, us) = &updates[layer];
+                    for (k, u) in [Some(uw), Some(ub), us.as_ref()].into_iter().enumerate() {
+                        let Some(u) = u else { continue };
+                        // C++ decays bias/scale only for coupled Adam.
+                        let (c, d) = if k == 0 { (coupled, dec) } else if decoupled { (0.0, 0.0) } else { (coupled, 0.0) };
+                        ref_adam_tensor(
+                            &mut refw[layer][k],
+                            &mut refm[layer][k],
+                            &mut refv[layer][k],
+                            u,
+                            lr as f64,
+                            (0.8, 0.95, 1e-5),
+                            c,
+                            d,
+                            step as i32,
+                        );
+                    }
+                    let (w, b, s) = host_params(&gpu, layer);
+                    for (k, got) in [w, b, s].iter().enumerate() {
+                        for (i, g) in got.iter().enumerate() {
+                            let want = refw[layer][k][i];
+                            assert!(
+                                (*g as f64 - want).abs() < 2e-5,
+                                "decoupled={decoupled} step {step} layer {layer} tensor {k}[{i}]: {g} vs {want}"
+                            );
+                        }
+                    }
+                }
+                // Adam zeroes the accumulated updates (C++ adam_update_gpu).
+                for (uw, ub, us) in optimizer_snapshot(&gpu) {
+                    assert!(uw.iter().chain(&ub).chain(us.iter().flatten()).all(|x| *x == 0.0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_gpu_update_matches_eager_after_sync_and_refolds_lazily() {
+        let mut eager = optimizer_net("");
+        let mut lazy = optimizer_net("");
+        let input = Tensor::from_data(
+            eager.network.net.input_shape(),
+            (0..eager.network.net.input_shape().element_count() * 2)
+                .map(|i| (i as f32 * 0.37).sin())
+                .collect(),
+        )
+        .expect("input");
+        for step in 0..3 {
+            for (gpu, deferred) in [(&mut eager, false), (&mut lazy, true)] {
+                let forward = gpu.forward_training_device(&input).expect("forward");
+                let seeds = optimizer_seeds(gpu, step);
+                gpu.backward_accumulate_seeded_gpu(&forward, &seeds).expect("backward");
+                if deferred {
+                    gpu.update_weights_gpu_deferred(0.05, 0.9, 0.001, 2).expect("update");
+                } else {
+                    gpu.update_weights_gpu(0.05, 0.9, 0.001, 2).expect("update");
+                }
+            }
+        }
+        lazy.sync_host_weights_from_device().expect("sync");
+        for layer in 0..2 {
+            assert_eq!(host_params(&eager, layer), host_params(&lazy, layer), "layer {layer}");
+        }
+        // Inference forward (BN-folded weights) agrees after the lazy refold.
+        let want = eager.forward(&input).expect("eager inference");
+        let got = lazy.forward(&input).expect("lazy inference");
+        assert_eq!(want.layer_outputs.len(), got.layer_outputs.len());
+        for (w, g) in want.layer_outputs.iter().zip(&got.layer_outputs) {
+            assert_slice_close("inference", &g.data, &w.data, 1e-5);
+        }
+    }
+
+    #[test]
+    fn gpu_adam_rejects_host_fallback_layers() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "inline.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=1\nbatch=1\nadam=1\n[connected]\noutput=2\nactivation=linear\n",
+            )
+            .expect("cfg"),
+        )
+        .expect("network");
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        gpu.init_train_buffers_gpu().expect("buffers");
+        assert!(gpu.update_weights_gpu(0.01, 0.9, 0.0, 1).is_err());
+    }
+
+    #[test]
+    fn gpu_sgd_is_default_and_loss_scale_is_neutral() {
+        // loss_scale scales the seeds and divides the lr back out: SGD and Adam
+        // results are independent of it (up to rounding).
+        for adam in [0, 1] {
+            let run = |loss_scale: f32| {
+                let mut gpu = optimizer_net(&format!("adam={adam}\nloss_scale={loss_scale}"));
+                assert_eq!(gpu.network.net.loss_scale, loss_scale);
+                for step in 1..=3 {
+                    let input = patterned_input(gpu.network.net.input_shape());
+                    let forward = gpu.forward_training_with_state(&input).expect("forward");
+                    let seeds = optimizer_seeds(&gpu, step);
+                    gpu.backward_accumulate_seeded_gpu(&forward, &seeds).expect("backward");
+                    gpu.update_weights_gpu(0.01, 0.9, 0.0005, 2).expect("update");
+                }
+                (host_params(&gpu, 0), host_params(&gpu, 1))
+            };
+            let (a, b) = (run(1.0), run(256.0));
+            for (x, y) in [(a.0, b.0), (a.1, b.1)] {
+                assert_slice_close("weights", &x.0, &y.0, 2e-5);
+                assert_slice_close("biases", &x.1, &y.1, 2e-5);
+                assert_slice_close("scales", &x.2, &y.2, 2e-5);
+            }
+        }
+        let gpu = optimizer_net("");
+        assert!(!gpu.network.net.adam && gpu.network.net.loss_scale == 1.0 && !gpu.network.net.decoupled_decay);
+    }
+
+    #[test]
+    fn gpu_update_resets_nan_inf_updates_and_fixes_nan_inf_weights() {
+        let mut gpu = optimizer_net("");
+        {
+            let mut cached = gpu.device_conv_params.borrow_mut();
+            let c = cached[1].as_mut().expect("cached params");
+            c.raw_weights.data[1] = f32::INFINITY;
+            c.raw_weights.data[2] = f32::NAN;
+            c.raw_weights.data[0] = 0.25;
+            let mut train = gpu.device_train_buffers.borrow_mut();
+            let t = train[1].as_mut().expect("train");
+            t.weight_updates.data[0] = f32::NAN;
+            t.weight_updates.data[3] = f32::NEG_INFINITY;
+            t.bias_updates.data[0] = f32::NAN;
+        }
+        // lr = 0: weights only change through the sanitizer.
+        gpu.update_weights_gpu(0.0, 0.9, 0.0, 1).expect("update");
+        let (w, b, _) = host_params(&gpu, 1);
+        assert_eq!(w[0], 0.25, "finite weight untouched");
+        assert_eq!(w[1], 1.0 / 2.0, "fix_nan_and_inf: 1/(index+1)");
+        assert_eq!(w[2], 1.0 / 3.0);
+        assert!(w.iter().chain(&b).all(|x| x.is_finite()));
+        let train = gpu.device_train_buffers.borrow()[1].clone().expect("train");
+        assert!(train.weight_updates.data.iter().chain(&train.bias_updates.data).all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn gpu_gradients_accumulate_across_subdivisions() {
+        // Two backward passes into the same buffers == the sum of two fresh passes.
+        let grads = |steps: &[usize]| {
+            let mut gpu = optimizer_net("subdivisions=1");
+            for &step in steps {
+                let input = patterned_input(gpu.network.net.input_shape());
+                let forward = gpu.forward_training_with_state(&input).expect("forward");
+                let seeds = optimizer_seeds(&gpu, step);
+                gpu.backward_accumulate_seeded_gpu(&forward, &seeds).expect("backward");
+            }
+            optimizer_snapshot(&gpu)
+        };
+        let both = grads(&[1, 2]);
+        let (first, second) = (grads(&[1]), grads(&[2]));
+        for layer in 0..2 {
+            let sum = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x + y).collect::<Vec<_>>();
+            assert_slice_close("weight updates", &sum(&first[layer].0, &second[layer].0), &both[layer].0, 1e-5);
+            assert_slice_close("bias updates", &sum(&first[layer].1, &second[layer].1), &both[layer].1, 1e-5);
+        }
+    }
+
+    /// Finite-difference check of the GPU-path backward of dropout (fixed
+    /// mask) and scale_channels (both scale layouts) through a conv.
+    #[test]
+    fn gpu_dropout_and_scale_channels_backward_match_finite_difference() {
+        for cfg_tail in [
+            "[dropout]\nprobability=0.4\n",
+            "[avgpool]\n[scale_channels]\nfrom=-2\nactivation=leaky\n",
+            "[convolutional]\nfilters=1\nsize=1\nstride=1\nactivation=linear\n[scale_channels]\nfrom=-2\nscale_wh=1\nactivation=linear\n",
+        ] {
+            let cfg = format!(
+                "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=2\n\
+                 [convolutional]\nfilters=3\nsize=1\nstride=1\nactivation=linear\n{cfg_tail}"
+            );
+            let build = |weights: &[f32]| {
+                let network = Network::from_config(ConfigFile::parse_str("inline.cfg", &cfg).expect("cfg"))
+                    .expect("network");
+                let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+                fill_conv_params(&mut gpu.params);
+                if let LayerParams::Convolutional(p) = &mut gpu.params[0] {
+                    p.weights = weights.to_vec();
+                }
+                gpu
+            };
+            let base: Vec<f32> = (0..6).map(|i| (i as f32 * 0.7).sin() * 0.6).collect();
+            let last = build(&base).network.layers.len() - 1;
+            let loss = |weights: &[f32]| -> f64 {
+                let gpu = build(weights);
+                let input = patterned_input(gpu.network.net.input_shape());
+                let forward = gpu.forward_training_with_state(&input).expect("forward");
+                let out = &forward.cpu_forward.layer_outputs[last];
+                out.data.iter().enumerate().map(|(i, o)| *o as f64 * (i as f64 * 0.91).cos()).sum()
+            };
+            let mut gpu = build(&base);
+            gpu.init_train_buffers_gpu().expect("buffers");
+            assert!(!gpu.requires_cpu_backward_fallback(), "GPU backward path expected");
+            let input = patterned_input(gpu.network.net.input_shape());
+            let forward = gpu.forward_training_with_state(&input).expect("forward");
+            let shape = gpu.network.layers[last].output_shape;
+            let mut seeds = vec![None; gpu.network.layers.len()];
+            seeds[last] = Some(
+                Tensor::from_data(
+                    shape,
+                    (0..shape.batch * shape.element_count()).map(|i| (i as f32 * 0.91).cos()).collect(),
+                )
+                .expect("seed"),
+            );
+            gpu.backward_accumulate_seeded_gpu(&forward, &seeds).expect("backward");
+            let analytic = gpu.device_train_buffers.borrow()[0].clone().expect("train").weight_updates.data;
+            let h = 1e-3f32;
+            for (i, a) in analytic.iter().enumerate() {
+                let (mut wp, mut wm) = (base.clone(), base.clone());
+                wp[i] += h;
+                wm[i] -= h;
+                let fd = (loss(&wp) - loss(&wm)) / (2.0 * h as f64);
+                assert!(
+                    (*a as f64 - fd).abs() < 2e-3 + 2e-3 * fd.abs(),
+                    "[{cfg_tail:?}] dW[{i}]: analytic {a} vs finite difference {fd}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_reorg_backward_is_the_adjoint_of_forward() {
+        // <reorg(x), y> == <x, reorg_backward(y)> for forward and reverse layers
+        for reverse in [false, true] {
+            let spec = crate::model::ReorgSpec { stride: 2, reverse };
+            let (small, big) = (
+                TensorShape::new(3, 2, 8, 2),
+                TensorShape::new(6, 4, 2, 2),
+            );
+            let (input_shape, output_shape) = if reverse { (small, big) } else { (big, small) };
+            let x = patterned_input(input_shape);
+            let y = patterned_input(output_shape);
+            let fx = super::forward_reorg(spec.stride, spec.reverse, &x, output_shape).unwrap();
+            let bty = super::backward_reorg(&spec, &y, input_shape).unwrap();
+            let lhs: f32 = fx.data.iter().zip(&y.data).map(|(a, b)| a * b).sum();
+            let rhs: f32 = x.data.iter().zip(&bty.data).map(|(a, b)| a * b).sum();
+            assert!((lhs - rhs).abs() < 1e-3, "reverse={reverse}: {lhs} vs {rhs}");
+        }
+    }
+
+    // ---- DropBlock ----
+
+    const DROPBLOCK_CFG: &str = "[net]\nwidth=4\nheight=4\nchannels=2\nbatch=2\n\
+         [convolutional]\nfilters=3\nsize=1\nstride=1\nactivation=linear\n\
+         [dropout]\nprobability=0.9\ndropblock=1\ndropblock_size_abs=2\n";
+
+    #[test]
+    fn dropblock_cfg_parses_like_cpp() {
+        let spec = |tail: &str| {
+            let cfg = format!(
+                "[net]\nwidth=8\nheight=6\nchannels=1\nbatch=1\n[dropout]\nprobability=0.3\n{tail}"
+            );
+            let network = Network::from_config(ConfigFile::parse_str("inline.cfg", &cfg).unwrap()).unwrap();
+            match &network.layers[0].kind {
+                LayerKind::Dropout { probability, dropblock } => {
+                    assert_eq!(*probability, Some(0.3));
+                    *dropblock
+                }
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(spec(""), None);
+        assert_eq!(spec("dropblock=0\ndropblock_size_abs=3\n"), None);
+        // neither key set: C++ defaults to 7 (the cap only applies to an explicit value).
+        assert_eq!(spec("dropblock=1\n"), Some(crate::model::DropblockSpec { size_rel: 0.0, size_abs: 7 }));
+        assert_eq!(spec("dropblock=1\ndropblock_size_abs=20\n"), Some(crate::model::DropblockSpec { size_rel: 0.0, size_abs: 6 }));
+        assert_eq!(spec("dropblock=1\ndropblock_size_rel=0.5\n"), Some(crate::model::DropblockSpec { size_rel: 0.5, size_abs: 0 }));
+        // both set: the absolute size wins
+        assert_eq!(
+            spec("dropblock=1\ndropblock_size_rel=0.5\ndropblock_size_abs=3\n"),
+            Some(crate::model::DropblockSpec { size_rel: 0.0, size_abs: 3 })
+        );
+    }
+
+    #[test]
+    fn dropblock_plan_follows_the_cpp_ramp() {
+        let shape = TensorShape::new(10, 8, 4, 1);
+        let abs = crate::model::DropblockSpec { size_rel: 0.0, size_abs: 7 };
+        // max_batches = 0: no ramp.
+        assert_eq!(super::dropblock_plan(&abs, 0.5, shape, 0, 0), (0.5 / 49.0, 7));
+        // ramp over the first 85% of 100 batches: iteration 0 -> nothing.
+        assert_eq!(super::dropblock_plan(&abs, 0.5, shape, 0, 100), (0.0, 1));
+        // halfway through the ramp: multiplier 0.5 -> int(3.5) = 3.
+        let (p, size) = super::dropblock_plan(&abs, 0.5, shape, 42, 100);
+        assert_eq!(size, 3);
+        assert!((p - 0.5 * (42.0 / 85.0) / 9.0).abs() < 1e-7);
+        // after the ramp, the size is capped by the smaller side (height 8).
+        assert_eq!(super::dropblock_plan(&abs, 0.5, shape, 90, 100), (0.5 / 49.0, 7));
+        let big = crate::model::DropblockSpec { size_rel: 0.0, size_abs: 9 };
+        assert_eq!(super::dropblock_plan(&big, 0.5, shape, 90, 100).1, 8);
+        // relative size uses width/height separately, the square is the smaller one.
+        let rel = crate::model::DropblockSpec { size_rel: 0.5, size_abs: 0 };
+        assert_eq!(super::dropblock_plan(&rel, 0.5, shape, 0, 0).1, 4);
+    }
+
+    #[test]
+    fn dropblock_reference_zeroes_one_square_per_plane_and_rescales_per_sample() {
+        let shape = [2usize, 3, 5, 6];
+        let x: Vec<f32> = (0..shape.iter().product::<usize>()).map(|i| 1.0 + (i % 7) as f32).collect();
+        let bs = 2;
+        // block_prob 1 selects the lowest-random cell of every plane.
+        let (out, mask) = darknet_cuda::host_ops::dropblock(&x, &shape, 1.0, bs, 99);
+        let (c, h, w) = (shape[1], shape[2], shape[3]);
+        for b in 0..shape[0] {
+            let dropped: usize = mask[b * c * h * w..(b + 1) * c * h * w].iter().filter(|m| **m == 0.0).count();
+            assert_eq!(dropped, c * bs * bs, "one {bs}x{bs} block per channel");
+            let scale = 1.0 / (1.0 - dropped as f32 / (c * h * w) as f32);
+            for ch in 0..c {
+                let plane = &mask[(b * c + ch) * h * w..(b * c + ch + 1) * h * w];
+                let zeros: Vec<(usize, usize)> = (0..h * w)
+                    .filter(|i| plane[*i] == 0.0)
+                    .map(|i| (i / w, i % w))
+                    .collect();
+                let (y0, x0) = (zeros.iter().map(|p| p.0).min().unwrap(), zeros.iter().map(|p| p.1).min().unwrap());
+                let expected: Vec<(usize, usize)> =
+                    (0..bs).flat_map(|dy| (0..bs).map(move |dx| (y0 + dy, x0 + dx))).collect();
+                assert_eq!(zeros, expected, "contiguous square inside the plane");
+                for i in 0..h * w {
+                    if plane[i] != 0.0 {
+                        assert_eq!(plane[i], scale);
+                    }
+                }
+            }
+        }
+        for ((o, m), v) in out.iter().zip(&mask).zip(&x) {
+            assert_eq!(*o, v * m);
+        }
+        // probability 0 keeps everything (scale 1)
+        let (out0, mask0) = darknet_cuda::host_ops::dropblock(&x, &shape, 0.0, bs, 99);
+        assert_eq!(out0, x);
+        assert!(mask0.iter().all(|m| *m == 1.0));
+        // deterministic for a seed, different for another
+        assert_eq!(darknet_cuda::host_ops::dropblock(&x, &shape, 1.0, bs, 99).1, mask);
+        assert_ne!(darknet_cuda::host_ops::dropblock(&x, &shape, 1.0, bs, 100).1, mask);
+    }
+
+    #[test]
+    fn gpu_dropblock_matches_cpu_forward_and_backward() {
+        assert_gpu_layer_chain_matches_cpu(DROPBLOCK_CFG, 1);
+        // the mask is not vacuous
+        let network = Network::from_config(ConfigFile::parse_str("inline.cfg", DROPBLOCK_CFG).unwrap()).unwrap();
+        let cpu = ExecutableNetwork::new(network);
+        let forward = cpu.forward_training(&patterned_input(cpu.network.net.input_shape())).unwrap();
+        let mask = forward.dropout_masks[1].as_ref().expect("dropblock mask");
+        assert!(mask.data.iter().any(|m| *m == 0.0) && mask.data.iter().any(|m| *m > 1.0));
+        // inference leaves the input alone
+        let infer = cpu.forward(&patterned_input(cpu.network.net.input_shape())).unwrap();
+        assert!(infer.dropout_masks[1].is_none());
+        assert_eq!(infer.layer_outputs[1], infer.layer_outputs[0]);
+    }
+
+    /// The training iteration changes the DropBlock mask (ramp + seed mix);
+    /// iteration 0 of a ramped schedule drops nothing.
+    #[test]
+    fn dropblock_mask_follows_the_train_iteration() {
+        let cfg = DROPBLOCK_CFG.replace("batch=2\n", "batch=2\nmax_batches=100\n");
+        let network = Network::from_config(ConfigFile::parse_str("inline.cfg", &cfg).unwrap()).unwrap();
+        let mut cpu = ExecutableNetwork::new(network);
+        let input = patterned_input(cpu.network.net.input_shape());
+        cpu.set_train_iteration(0);
+        assert!(cpu.forward_training(&input).unwrap().dropout_masks[1].is_none());
+        cpu.set_train_iteration(60);
+        let a = cpu.forward_training(&input).unwrap().dropout_masks[1].clone().expect("mask");
+        cpu.set_train_iteration(61);
+        let b = cpu.forward_training(&input).unwrap().dropout_masks[1].clone().expect("mask");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn gpu_dropblock_backward_matches_finite_difference() {
+        let cfg = format!(
+            "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=2\n\
+             [convolutional]\nfilters=3\nsize=1\nstride=1\nactivation=linear\n\
+             [dropout]\nprobability=0.9\ndropblock=1\ndropblock_size_abs=2\n"
+        );
+        let build = |weights: &[f32]| {
+            let network = Network::from_config(ConfigFile::parse_str("inline.cfg", &cfg).expect("cfg")).expect("network");
+            let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+            fill_conv_params(&mut gpu.params);
+            if let LayerParams::Convolutional(p) = &mut gpu.params[0] {
+                p.weights = weights.to_vec();
+            }
+            gpu
+        };
+        let base: Vec<f32> = (0..6).map(|i| (i as f32 * 0.7).sin() * 0.6).collect();
+        let last = 1;
+        let loss = |weights: &[f32]| -> f64 {
+            let gpu = build(weights);
+            let input = patterned_input(gpu.network.net.input_shape());
+            let forward = gpu.forward_training_with_state(&input).expect("forward");
+            forward.cpu_forward.layer_outputs[last]
+                .data
+                .iter()
+                .enumerate()
+                .map(|(i, o)| *o as f64 * (i as f64 * 0.91).cos())
+                .sum()
+        };
+        let mut gpu = build(&base);
+        gpu.init_train_buffers_gpu().expect("buffers");
+        assert!(!gpu.requires_cpu_backward_fallback());
+        let input = patterned_input(gpu.network.net.input_shape());
+        let forward = gpu.forward_training_with_state(&input).expect("forward");
+        assert!(forward.cpu_forward.dropout_masks[last].as_ref().expect("mask").data.contains(&0.0));
+        let shape = gpu.network.layers[last].output_shape;
+        let mut seeds = vec![None; gpu.network.layers.len()];
+        seeds[last] = Some(
+            Tensor::from_data(
+                shape,
+                (0..shape.batch * shape.element_count()).map(|i| (i as f32 * 0.91).cos()).collect(),
+            )
+            .unwrap(),
+        );
+        gpu.backward_accumulate_seeded_gpu(&forward, &seeds).expect("backward");
+        let analytic = gpu.device_train_buffers.borrow()[0].clone().unwrap().weight_updates.data;
+        let h = 1e-3f32;
+        for (i, a) in analytic.iter().enumerate() {
+            let (mut wp, mut wm) = (base.clone(), base.clone());
+            wp[i] += h;
+            wm[i] -= h;
+            let fd = (loss(&wp) - loss(&wm)) / (2.0 * h as f64);
+            assert!(
+                (*a as f64 - fd).abs() < 2e-3 + 2e-3 * fd.abs(),
+                "dW[{i}]: analytic {a} vs finite difference {fd}"
+            );
+        }
+    }
+
+    // ---- per-layer update keys and try_fix_nan ----
+
+    /// Two convs (layer 0 with BN, 32-channel input so `grad_centr` applies,
+    /// layer 1 without BN); `l0`/`l1` add keys to the layer sections.
+    fn keyed_cfg(net_extra: &str, l0: &str, l1: &str) -> String {
+        format!(
+            "[net]\nwidth=2\nheight=2\nchannels=32\nbatch=1\n{net_extra}\n\
+             [convolutional]\nfilters=3\nsize=1\nstride=1\nbatch_normalize=1\nactivation=linear\n{l0}\n\
+             [convolutional]\nfilters=2\nsize=1\nstride=1\nactivation=linear\n{l1}\n"
+        )
+    }
+
+    fn keyed_cpu(cfg: &str) -> ExecutableNetwork {
+        let network = Network::from_config(ConfigFile::parse_str("inline.cfg", cfg).unwrap()).unwrap();
+        let mut cpu = ExecutableNetwork::new(network);
+        fill_conv_params(&mut cpu.params);
+        for (layer, train) in cpu.train_buffers.iter_mut().enumerate() {
+            if let LayerTrainBuffers::Convolutional(t) = train {
+                for (i, u) in t.weight_updates.iter_mut().enumerate() {
+                    *u = ((i * 3 + layer) % 11) as f32 * 0.25 - 1.0;
+                }
+                for (i, u) in t.bias_updates.iter_mut().enumerate() {
+                    *u = i as f32 * 0.5 - 0.3;
+                }
+                if let Some(bn) = t.batch_norm.as_mut() {
+                    bn.scale_updates = vec![0.4, -0.2, 0.6];
+                }
+            }
+        }
+        cpu
+    }
+
+    fn keyed_gpu(cfg: &str) -> GpuExecutableNetwork<FakeBackend> {
+        let cpu = keyed_cpu(cfg);
+        let mut gpu = GpuExecutableNetwork::new(cpu.network.clone(), FakeBackend);
+        gpu.params = cpu.params.clone();
+        gpu.init_train_buffers_gpu().unwrap();
+        {
+            let mut train = gpu.device_train_buffers.borrow_mut();
+            for (layer, t) in train.iter_mut().enumerate() {
+                let LayerTrainBuffers::Convolutional(c) = &cpu.train_buffers[layer] else { continue };
+                let t = t.as_mut().unwrap();
+                t.weight_updates.data = c.weight_updates.clone();
+                t.bias_updates.data = c.bias_updates.clone();
+                if let (Some(s), Some(bn)) = (t.scale_updates.as_mut(), c.batch_norm.as_ref()) {
+                    s.data = bn.scale_updates.clone();
+                }
+            }
+        }
+        gpu
+    }
+
+    /// Weights of both layers after one plain step (lr 0.1, momentum 0, no
+    /// decay, batch 1) from the buffers of `keyed_cpu`, on CPU and GPU.
+    fn keyed_step(cfg: &str, iteration: usize) -> [(Vec<f32>, Vec<f32>); 2] {
+        let mut cpu = keyed_cpu(cfg);
+        cpu.set_train_iteration(iteration);
+        cpu.update_weights(0.1, 0.0, 0.0, 1);
+        let mut gpu = keyed_gpu(cfg);
+        gpu.set_train_iteration(iteration);
+        gpu.update_weights_gpu(0.1, 0.0, 0.0, 1).unwrap();
+        let pick = |params: &[LayerParams], i: usize| match &params[i] {
+            LayerParams::Convolutional(p) => (p.weights.clone(), p.biases.clone()),
+            _ => unreachable!(),
+        };
+        for i in 0..2 {
+            let (c, g) = (pick(&cpu.params, i), pick(&gpu.params, i));
+            assert_slice_close("cpu/gpu weights", &c.0, &g.0, 1e-6);
+            assert_slice_close("cpu/gpu biases", &c.1, &g.1, 1e-6);
+        }
+        [pick(&cpu.params, 0), pick(&cpu.params, 1)]
+    }
+
+    #[test]
+    fn layer_train_keys_parse_and_train_only_bn_propagates_backwards() {
+        let net = |l0: &str, l1: &str| {
+            Network::from_config(ConfigFile::parse_str("inline.cfg", &keyed_cfg("", l0, l1)).unwrap()).unwrap()
+        };
+        let n = net("learning_rate=0.5\nclip=2\ngrad_centr=1\nburnin_update=2\n", "dont_update=7\n");
+        assert_eq!(n.layers[0].train.learning_rate_scale, 0.5);
+        assert_eq!((n.layers[0].train.clip, n.layers[0].train.grad_centr, n.layers[0].train.burnin_update), (2.0, true, 2));
+        assert_eq!((n.layers[1].train.dont_update, n.layers[1].train.learning_rate_scale), (7, 1.0));
+        assert!(!n.layers[0].train.train_only_bn && !n.layers[1].train.train_only_bn);
+        // C++ set_train_only_bn: a later layer's flag covers every earlier layer
+        let n = net("", "train_only_bn=1\n");
+        assert!(n.layers[0].train.train_only_bn && n.layers[1].train.train_only_bn);
+        let n = net("train_only_bn=1\n", "");
+        assert!(n.layers[0].train.train_only_bn && !n.layers[1].train.train_only_bn);
+        assert!(!Network::from_config(ConfigFile::parse_str("i.cfg", &keyed_cfg("", "", "")).unwrap()).unwrap().net.try_fix_nan);
+        assert!(Network::from_config(ConfigFile::parse_str("i.cfg", &keyed_cfg("try_fix_nan=1", "", "")).unwrap()).unwrap().net.try_fix_nan);
+    }
+
+    #[test]
+    fn per_layer_learning_rate_scales_only_that_layer_cpu_and_gpu() {
+        let plain = keyed_step(&keyed_cfg("", "", ""), 0);
+        let scaled = keyed_step(&keyed_cfg("", "learning_rate=0.5\n", ""), 0);
+        let base = keyed_cpu(&keyed_cfg("", "", ""));
+        let LayerParams::Convolutional(p0) = &base.params[0] else { unreachable!() };
+        for i in 0..p0.weights.len() {
+            let d_plain = plain[0].0[i] - p0.weights[i];
+            let d_scaled = scaled[0].0[i] - p0.weights[i];
+            assert!((d_scaled - 0.5 * d_plain).abs() < 1e-6, "w[{i}]: {d_scaled} vs half of {d_plain}");
+        }
+        assert!(plain[0].0 != p0.weights);
+        assert_eq!(plain[1], scaled[1], "other layers keep the global rate");
+    }
+
+    #[test]
+    fn dont_update_burnin_update_and_train_only_bn_gate_the_step() {
+        let base = keyed_cpu(&keyed_cfg("", "", ""));
+        let init = |i: usize| match &base.params[i] {
+            LayerParams::Convolutional(p) => (p.weights.clone(), p.biases.clone()),
+            _ => unreachable!(),
+        };
+        // dont_update=3: C++ updates once iteration_num (= iteration + 1) > 3.
+        for (iteration, updated) in [(0, false), (2, false), (3, true)] {
+            let r = keyed_step(&keyed_cfg("", "", "dont_update=3\n"), iteration);
+            assert_eq!(r[1] != init(1), updated, "dont_update at iteration {iteration}");
+            assert!(r[0] != init(0), "layer 0 is not gated");
+        }
+        // burnin_update=2, burn_in=10: skipped while 2*10 > iteration_num.
+        for (iteration, updated) in [(0, false), (18, false), (19, true)] {
+            let r = keyed_step(&keyed_cfg("burn_in=10", "burnin_update=2\n", ""), iteration);
+            assert_eq!(r[0] != init(0), updated, "burnin_update at iteration {iteration}");
+            assert!(r[1] != init(1));
+        }
+        // train_only_bn on layer 1 freezes both layers (C++ skips the update
+        // of every layer up to the flagged one).
+        let r = keyed_step(&keyed_cfg("", "", "train_only_bn=1\n"), 5);
+        assert_eq!(r[0], init(0));
+        assert_eq!(r[1], init(1));
+    }
+
+    #[test]
+    fn clip_clamps_weights_after_the_step() {
+        let free = keyed_step(&keyed_cfg("", "", ""), 0);
+        let clipped = keyed_step(&keyed_cfg("", "clip=0.3\n", ""), 0);
+        assert!(free[0].0.iter().any(|w| w.abs() > 0.3), "test must exceed the clip");
+        let expected: Vec<f32> = free[0].0.iter().map(|w| w.clamp(-0.3, 0.3)).collect();
+        assert_slice_close("clipped weights", &clipped[0].0, &expected, 1e-6);
+        assert_eq!(clipped[0].1, free[0].1, "biases are not clipped");
+        assert_eq!(clipped[1], free[1]);
+    }
+
+    #[test]
+    fn grad_centr_removes_the_per_filter_mean_of_weight_updates() {
+        let base = keyed_cpu(&keyed_cfg("", "", ""));
+        let LayerParams::Convolutional(p0) = &base.params[0] else { unreachable!() };
+        let LayerTrainBuffers::Convolutional(t0) = &base.train_buffers[0] else { unreachable!() };
+        let free = keyed_step(&keyed_cfg("", "", ""), 0);
+        let centred = keyed_step(&keyed_cfg("", "grad_centr=1\n", ""), 0);
+        let f_size = 32;
+        for f in 0..3 {
+            let upd = &t0.weight_updates[f * f_size..(f + 1) * f_size];
+            let mean = upd.iter().sum::<f32>() / f_size as f32;
+            assert!(mean.abs() > 1e-3, "filter {f} needs a non-zero mean");
+            for i in 0..f_size {
+                let idx = f * f_size + i;
+                let expect = p0.weights[idx] + 0.1 * (upd[i] - mean);
+                assert!((centred[0].0[idx] - expect).abs() < 1e-5, "w[{idx}]");
+            }
+        }
+        assert!(free[0].0 != centred[0].0);
+        assert_eq!(free[0].1, centred[0].1, "biases untouched");
+        assert_eq!(free[1], centred[1], "no BN -> no centralisation");
+        // grad_centr without batch norm does nothing (C++ condition)
+        let cfg = keyed_cfg("", "", "grad_centr=1\n");
+        assert_eq!(keyed_step(&cfg, 0)[1], free[1]);
+    }
+
+    #[test]
+    fn try_fix_nan_fixes_conv_outputs_and_clamps_deltas_cpu_and_gpu() {
+        let cfg = |fix: u8| keyed_cfg(&format!("try_fix_nan={fix}"), "", "");
+        let input_of = |shape| patterned_input(shape);
+        // forward: a NaN weight poisons the output unless try_fix_nan is set
+        for fix in [0u8, 1] {
+            let mut cpu = keyed_cpu(&cfg(fix));
+            if let LayerParams::Convolutional(p) = &mut cpu.params[1] {
+                p.weights[0] = f32::NAN;
+            }
+            let mut gpu = GpuExecutableNetwork::new(cpu.network.clone(), FakeBackend);
+            gpu.params = cpu.params.clone();
+            let input = input_of(cpu.network.net.input_shape());
+            let cpu_out = cpu.forward_training(&input).unwrap().layer_outputs[1].clone();
+            let gpu_out = gpu.forward_training_with_state(&input).unwrap().cpu_forward.layer_outputs[1].clone();
+            for out in [&cpu_out, &gpu_out] {
+                assert_eq!(out.data.iter().all(|v| v.is_finite()), fix == 1, "try_fix_nan={fix}");
+            }
+            if fix == 1 {
+                assert_slice_close("fixed output", &cpu_out.data, &gpu_out.data, 1e-6);
+            }
+        }
+        // backward: output deltas are clamped to [-1, 1] (last layer is linear)
+        let big: Vec<f32> = (0..8).map(|i| [5.0, -7.0, 0.25, -0.5, 3.0, -0.1, 9.0, 0.9][i]).collect();
+        let clamped: Vec<f32> = big.iter().map(|v| v.clamp(-1.0, 1.0)).collect();
+        let run = |fix: u8, seed: &[f32]| -> (Vec<f32>, Vec<f32>) {
+            let mut cpu = keyed_cpu(&cfg(fix));
+            for t in &mut cpu.train_buffers {
+                if let LayerTrainBuffers::Convolutional(t) = t {
+                    t.weight_updates.fill(0.0);
+                    t.bias_updates.fill(0.0);
+                }
+            }
+            let mut gpu = GpuExecutableNetwork::new(cpu.network.clone(), FakeBackend);
+            gpu.params = cpu.params.clone();
+            gpu.init_train_buffers_gpu().unwrap();
+            let input = input_of(cpu.network.net.input_shape());
+            let shape = cpu.network.layers[1].output_shape;
+            let mut seeds = vec![None; 2];
+            seeds[1] = Some(Tensor::from_data(shape, seed.to_vec()).unwrap());
+            let f = cpu.forward_training(&input).unwrap();
+            cpu.backward_accumulate_seeded(&input, &f, &seeds).unwrap();
+            let gf = gpu.forward_training_with_state(&input).unwrap();
+            gpu.backward_accumulate_seeded_gpu(&gf, &seeds).unwrap();
+            let LayerTrainBuffers::Convolutional(c) = &cpu.train_buffers[1] else { unreachable!() };
+            let g = gpu.device_train_buffers.borrow()[1].clone().unwrap();
+            assert_slice_close("cpu/gpu layer-1 gradient", &c.weight_updates, &g.weight_updates.data, 1e-4);
+            (c.weight_updates.clone(), c.bias_updates.clone())
+        };
+        let with_fix = run(1, &big);
+        let reference = run(0, &clamped);
+        let unclamped = run(0, &big);
+        assert_slice_close("clamped delta gradient", &with_fix.0, &reference.0, 1e-5);
+        assert_slice_close("clamped bias gradient", &with_fix.1, &reference.1, 1e-5);
+        assert!(with_fix.1 != unclamped.1, "without try_fix_nan the large deltas pass through");
     }
 }

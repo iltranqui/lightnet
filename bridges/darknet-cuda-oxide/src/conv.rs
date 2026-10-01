@@ -39,29 +39,46 @@ impl ConvMode {
     }
 }
 
+/// Upper bound on the im2col column buffer used by the batched forward path
+/// (bytes); larger batches run in chunks of images.
+pub(crate) const COL_CAP_BYTES: usize = 32 << 20;
+
+/// Images per batched im2col + GEMM round, at most (`DARKNET_OXIDE_CONV_CHUNK`,
+/// default unlimited; `1` restores the old one-launch-per-image loop for A/B).
+pub(crate) fn chunk_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("DARKNET_OXIDE_CONV_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(usize::MAX)
+    })
+}
+
 /// Problems below this many multiply-adds run on the direct kernel in `Auto`.
 const TINY_MACS: usize = 1 << 16;
 
 #[derive(Clone, Copy)]
-struct Geom {
-    batch: usize,
-    c: usize,
-    h: usize,
-    w: usize,
-    f: usize,
-    k: usize,
-    sx: usize,
-    sy: usize,
-    dil: usize,
-    pad: usize,
-    groups: usize,
-    oh: usize,
-    ow: usize,
+pub(crate) struct Geom {
+    pub(crate) batch: usize,
+    pub(crate) c: usize,
+    pub(crate) h: usize,
+    pub(crate) w: usize,
+    pub(crate) f: usize,
+    pub(crate) k: usize,
+    pub(crate) sx: usize,
+    pub(crate) sy: usize,
+    pub(crate) dil: usize,
+    pub(crate) pad: usize,
+    pub(crate) groups: usize,
+    pub(crate) oh: usize,
+    pub(crate) ow: usize,
 }
 
 impl Geom {
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    pub(crate) fn new(
         op: &str,
         batch: usize,
         c: usize,
@@ -100,29 +117,29 @@ impl Geom {
         Ok(Self { batch, c, h, w, f, k, sx, sy, dil, pad, groups, oh, ow })
     }
 
-    fn cpg(&self) -> usize {
+    pub(crate) fn cpg(&self) -> usize {
         self.c / self.groups
     }
-    fn fpg(&self) -> usize {
+    pub(crate) fn fpg(&self) -> usize {
         self.f / self.groups
     }
     /// Rows of the per-group column matrix.
-    fn kg(&self) -> usize {
+    pub(crate) fn kg(&self) -> usize {
         self.cpg() * self.k * self.k
     }
-    fn ohw(&self) -> usize {
+    pub(crate) fn ohw(&self) -> usize {
         self.oh * self.ow
     }
-    fn x_len(&self) -> usize {
+    pub(crate) fn x_len(&self) -> usize {
         self.batch * self.c * self.h * self.w
     }
-    fn y_len(&self) -> usize {
+    pub(crate) fn y_len(&self) -> usize {
         self.batch * self.f * self.ohw()
     }
-    fn w_len(&self) -> usize {
+    pub(crate) fn w_len(&self) -> usize {
         self.f * self.kg()
     }
-    fn col_len(&self) -> usize {
+    pub(crate) fn col_len(&self) -> usize {
         self.c * self.k * self.k * self.ohw()
     }
     fn macs(&self) -> usize {
@@ -130,7 +147,7 @@ impl Geom {
     }
 }
 
-fn expect_len(op: &str, what: &str, got: usize, want: usize) -> Result<(), OxideError> {
+pub(crate) fn expect_len(op: &str, what: &str, got: usize, want: usize) -> Result<(), OxideError> {
     if got != want {
         return Err(OxideError::Shape(format!(
             "{op}: {what} length mismatch: expected {want}, got {got}"
@@ -139,7 +156,7 @@ fn expect_len(op: &str, what: &str, got: usize, want: usize) -> Result<(), Oxide
     Ok(())
 }
 
-fn expect_shape(op: &str, what: &str, got: &[usize], want: &[usize]) -> Result<(), OxideError> {
+pub(crate) fn expect_shape(op: &str, what: &str, got: &[usize], want: &[usize]) -> Result<(), OxideError> {
     if got != want {
         return Err(OxideError::Shape(format!(
             "{op}: {what} shape must be {want:?}, got {got:?}"
@@ -158,7 +175,7 @@ impl OxideBackend {
     }
 
     /// Makes sure the cached workspace holds `len` floats and runs `body` on it.
-    fn with_workspace<R>(
+    pub(crate) fn with_workspace<R>(
         &self,
         len: usize,
         body: impl FnOnce(&mut DeviceBuffer<f32>) -> Result<R, OxideError>,
@@ -168,9 +185,33 @@ impl OxideBackend {
             .lock()
             .map_err(|_| OxideError::Shape("conv workspace lock poisoned".into()))?;
         if guard.as_ref().is_none_or(|b| b.len() < len) {
-            *guard = Some(self.alloc(len)?);
+            *guard = Some(DeviceBuffer::<f32>::zeroed(&self.stream, len)?);
         }
         body(guard.as_mut().expect("workspace allocated above"))
+    }
+
+    /// Benchmark helper: mean device ms per single-image im2col launch for a
+    /// `[1, c, h, w]` input (event timed, workspace reused).  Returns
+    /// `(ms, column_bytes_written)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bench_im2col_f32(
+        &self,
+        x: &OxideTensorF32,
+        c: usize,
+        h: usize,
+        w: usize,
+        k: usize,
+        stride: usize,
+        pad: usize,
+        iters: usize,
+    ) -> Result<(f64, usize), OxideError> {
+        let g = Geom::new("bench_im2col", 1, c, h, w, c, k, stride, stride, 1, pad, 1)?;
+        expect_len("bench_im2col", "x", x.len(), g.x_len())?;
+        let config = ElementwiseLaunchConfig::default();
+        let ms = self.with_workspace(g.col_len(), |ws| {
+            self.time_gpu_ms(iters, || self.launch_im2col(&g, &x.buf, ws, 0, 1, config))
+        })?;
+        Ok((ms, g.col_len() * 4))
     }
 
     fn launch_im2col(
@@ -179,14 +220,16 @@ impl OxideBackend {
         x: &DeviceBuffer<f32>,
         col: &mut DeviceBuffer<f32>,
         batch_index: usize,
+        images: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<(), OxideError> {
-        // SAFETY: one thread per column element; `col` holds `col_len` floats
-        // and `x` covers `batch_index` (validated by the callers).
+        // SAFETY: one thread per column element; `col` holds `images * col_len`
+        // floats and `x` covers images `batch_index..batch_index + images`
+        // (validated by the callers).
         unsafe {
             self.im2col.im2col(
                 &self.stream,
-                launch::elementwise(g.col_len(), config),
+                launch::elementwise(images * g.col_len(), config),
                 x,
                 col,
                 batch_index * g.c * g.h * g.w,
@@ -200,6 +243,7 @@ impl OxideBackend {
                 g.pad,
                 g.oh,
                 g.ow,
+                images,
             )
         }
         .map_err(launch_err)
@@ -235,7 +279,7 @@ impl OxideBackend {
         expect_len(OP, "weights", weights.len(), g.w_len())?;
         expect_shape(OP, "output", output_shape, &[g.batch, g.f, g.oh, g.ow])?;
 
-        let mut out = self.alloc(g.y_len())?;
+        let mut out = self.alloc_uninit(g.y_len())?;
         if self.use_direct(&g) {
             // SAFETY: one thread per output element.
             unsafe {
@@ -263,9 +307,15 @@ impl OxideBackend {
             .map_err(launch_err)?;
         } else {
             let (kg, ohw, fpg) = (g.kg(), g.ohw(), g.fpg());
-            self.with_workspace(g.col_len(), |ws| {
-                for b in 0..g.batch {
-                    self.launch_im2col(&g, &x.buf, ws, b, config)?;
+            // One im2col + one GEMM launch per chunk of images (instances =
+            // image x group); the column buffer is bounded by `COL_CAP_BYTES`.
+            let chunk = (COL_CAP_BYTES / 4 / g.col_len()).clamp(1, g.batch).min(chunk_limit());
+            self.with_workspace(chunk * g.col_len(), |ws| {
+                let mut b0 = 0;
+                while b0 < g.batch {
+                    let nb = chunk.min(g.batch - b0);
+                    self.launch_im2col(&g, &x.buf, ws, b0, nb, config)?;
+                    let inst = nb * groups;
                     self.gemm(
                         &weights.buf,
                         ws,
@@ -278,12 +328,13 @@ impl OxideBackend {
                             ldb: ohw,
                             ldc: ohw,
                             a: (0, fpg * kg, groups),
-                            b: (0, kg * ohw, groups),
-                            c: (b * g.f * ohw, fpg * ohw, groups),
-                            count: groups,
+                            b: (0, kg * ohw, inst),
+                            c: (b0 * g.f * ohw, fpg * ohw, inst),
+                            count: inst,
                             ..GemmArgs::default()
                         },
                     )?;
+                    b0 += nb;
                 }
                 Ok(())
             })?;
@@ -459,7 +510,7 @@ impl OxideBackend {
             let (kg, ohw, fpg) = (g.kg(), g.ohw(), g.fpg());
             self.with_workspace(g.col_len(), |ws| {
                 for b in 0..g.batch {
-                    self.launch_im2col(&g, &x.buf, ws, b, config)?;
+                    self.launch_im2col(&g, &x.buf, ws, b, 1, config)?;
                     // dW[g] (fpg x kg) += dy[b, g] (fpg x ohw) * col[g]^T (ohw x kg)
                     self.gemm(
                         &dy.buf,
