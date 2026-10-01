@@ -12,11 +12,11 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "oxide")]
 use darknet_core::GpuExecutableNetwork;
 use darknet_core::{
-    DataConfig, DetectionOptions, ExecutableNetwork, LayerKind, LayerParams, Network,
-    PlanarRgbImage, Tensor, YoloLabel,
-    YoloTrainingState, compute_learning_rate, compute_yolo_training_loss_with_state,
-    decode_yolo_detections, inspect_weights_file, load_names_file, load_paths_file,
-    load_training_batch_from_paths, save_weights,
+    ConfigFile, DataConfig, DetectionOptions, DetectorAugmentation, ExecutableNetwork, LayerKind,
+    LayerParams, Network, PlanarRgbImage, Tensor, YoloLabel, YoloTrainingState,
+    compute_learning_rate, compute_yolo_training_loss_with_state, decode_yolo_detections,
+    initialize_training_params, inspect_weights_file, load_augmented_training_batch_from_paths,
+    load_names_file, load_paths_file, save_weights,
 };
 #[cfg(feature = "oxide")]
 use darknet_cuda_oxide::OxideBackend;
@@ -54,18 +54,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let first_path = required_arg(args.next(), "cfg or data path")?;
                     let second_path = required_arg(args.next(), "data or cfg path")?;
                     let (cfg, data) = classify_detector_train_paths(&first_path, &second_path)?;
-                    let mut weights = None;
-                    let mut flags = Vec::new();
-                    for arg in args {
-                        if arg.starts_with('-') {
-                            flags.push(arg);
-                        } else if weights.is_none() {
-                            weights = Some(arg);
-                        } else {
-                            return Err(format!("unexpected detector train argument: {arg}").into());
-                        }
-                    }
-                    run_detector_train(&cfg, &data, weights.as_deref(), &flags)?;
+                    let options = TrainOptions::parse(args)?;
+                    run_detector_train(&cfg, &data, &options)?;
                 }
                 other => {
                     return Err(format!("unknown detector subcommand: {other}").into());
@@ -259,7 +249,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let batch = bench_batch();
                         let bench_net = network.with_batch(batch);
                         let bench_input = replicate_batch(&input, batch);
-                        let mut bench_exec = GpuExecutableNetwork::new(bench_net, OxideBackend::new()?);
+                        let mut bench_exec =
+                            GpuExecutableNetwork::new(bench_net, OxideBackend::new()?);
                         bench_exec.load_weights_file(&weights)?;
                         let (free0, total) = bench_exec.backend().device_mem_info()?;
                         let mut peak_used = 0usize;
@@ -324,11 +315,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             if let Some(dump_dir) = std::env::var_os("DARKNET_LAYER_DUMP_DIR") {
-                dump_rust_layer_outputs(
-                    Path::new(&dump_dir),
-                    &network,
-                    &result.layer_outputs,
-                )?;
+                dump_rust_layer_outputs(Path::new(&dump_dir), &network, &result.layer_outputs)?;
             }
             let detections = decode_yolo_detections(
                 &network,
@@ -430,7 +417,9 @@ fn selected_backend() -> Result<String, Box<dyn std::error::Error>> {
 
 /// Deterministic uniform [0, 1) stream for the synthetic benchmark data.
 fn bench_uniform(state: &mut u64) -> f32 {
-    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     ((*state >> 40) as u32) as f32 / 16_777_216.0
 }
 
@@ -451,7 +440,14 @@ fn surrogate(heads: &[darknet_core::YoloHeadOutput], seeds: &[Option<Tensor>]) -
     heads
         .iter()
         .filter_map(|h| seeds[h.layer_index].as_ref().map(|d| (h, d)))
-        .map(|(h, d)| h.output.data.iter().zip(&d.data).map(|(o, d)| f64::from(*o) * f64::from(*d)).sum::<f64>())
+        .map(|(h, d)| {
+            h.output
+                .data
+                .iter()
+                .zip(&d.data)
+                .map(|(o, d)| f64::from(*o) * f64::from(*d))
+                .sum::<f64>()
+        })
         .sum()
 }
 
@@ -468,7 +464,11 @@ fn seeds_l2(seeds: &[Option<Tensor>]) -> f64 {
 
 /// Parity dump: per conv layer biases, [bn biases, scales, rolling mean, rolling var], weights
 /// (f32 LE, in that order) to `<prefix>.step<k>.bin`, lengths to `<prefix>.layers` (`layer:nb:nbn:nw`).
-fn dump_parity(prefix: &str, step: usize, params: &[LayerParams]) -> Result<(), Box<dyn std::error::Error>> {
+fn dump_parity(
+    prefix: &str,
+    step: usize,
+    params: &[LayerParams],
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut bytes = Vec::new();
     let mut lens = Vec::new();
     for (idx, p) in params.iter().enumerate() {
@@ -483,7 +483,11 @@ fn dump_parity(prefix: &str, step: usize, params: &[LayerParams]) -> Result<(), 
                 put(&mut bytes, &bn.rolling_variance);
             }
             put(&mut bytes, &conv.weights);
-            lens.push(format!("{idx}:{}:{nbn}:{}", conv.biases.len(), conv.weights.len()));
+            lens.push(format!(
+                "{idx}:{}:{nbn}:{}",
+                conv.biases.len(),
+                conv.weights.len()
+            ));
         }
     }
     fs::write(format!("{prefix}.layers"), lens.join(","))?;
@@ -527,18 +531,26 @@ fn peak_host_rss_mb() -> f64 {
 /// after the update).  Prints one `BENCH_TRAIN_JSON` line.
 fn bench_train(cfg: &str, steps: usize, warmup: usize) -> Result<(), Box<dyn std::error::Error>> {
     let mut network = Network::from_path(cfg)?;
-    if let Some(batch) = std::env::var("DARKNET_BENCH_BATCH").ok().and_then(|v| v.parse().ok()) {
+    if let Some(batch) = std::env::var("DARKNET_BENCH_BATCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
         network = network.with_batch(batch);
     }
     let backend = selected_backend()?;
     let batch = network.net.batch;
-    let lr = std::env::var("DARKNET_BENCH_LR").ok().and_then(|v| v.parse().ok()).unwrap_or(1e-4f32);
+    let lr = std::env::var("DARKNET_BENCH_LR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1e-4f32);
     let (momentum, decay) = (network.net.momentum, network.net.decay);
     let mut rng = 0x5eed_1234_5678_9abcu64;
     let shape = network.net.input_shape();
     let input = Tensor::from_data(
         shape,
-        (0..batch * shape.element_count()).map(|_| bench_uniform(&mut rng)).collect(),
+        (0..batch * shape.element_count())
+            .map(|_| bench_uniform(&mut rng))
+            .collect(),
     )?;
     let mut seeds: Vec<Option<Tensor>> = vec![None; network.layers.len()];
     for layer in &network.layers {
@@ -560,7 +572,10 @@ fn bench_train(cfg: &str, steps: usize, warmup: usize) -> Result<(), Box<dyn std
     let mut input = input;
     let mut parity_labels: Option<Vec<Vec<YoloLabel>>> = None;
     let read_f32 = |path: &str| -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-        Ok(fs::read(path)?.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+        Ok(fs::read(path)?
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
     };
     if let Ok(ip) = std::env::var("DARKNET_BENCH_INPUT") {
         input = Tensor::from_data(shape, read_f32(&ip)?)?;
@@ -571,7 +586,10 @@ fn bench_train(cfg: &str, steps: usize, warmup: usize) -> Result<(), Box<dyn std
     let fixed_deltas = if let Ok(prefix) = std::env::var("DARKNET_BENCH_DELTAS") {
         for layer in &network.layers {
             if matches!(layer.kind, LayerKind::Yolo(_) | LayerKind::GaussianYolo(_)) {
-                seeds[layer.index] = Some(Tensor::from_data(layer.output_shape, read_f32(&format!("{prefix}.{}.bin", layer.index))?)?);
+                seeds[layer.index] = Some(Tensor::from_data(
+                    layer.output_shape,
+                    read_f32(&format!("{prefix}.{}.bin", layer.index))?,
+                )?);
             }
         }
         true
@@ -624,12 +642,26 @@ fn bench_train(cfg: &str, steps: usize, warmup: usize) -> Result<(), Box<dyn std
                 let forward = exec.forward_training(&input)?;
                 if let Some(labels) = &parity_labels {
                     let yolo = compute_yolo_training_loss_with_state(
-                        &exec.network, &forward, labels, step, Some(&mut yolo_state))?;
-                    println!("PARITY backend=cpu step={} loss={:.6} delta_l2={:.6}", step + 1, yolo.loss, seeds_l2(&yolo.layer_output_gradient_seeds));
+                        &exec.network,
+                        &forward,
+                        labels,
+                        step,
+                        Some(&mut yolo_state),
+                    )?;
+                    println!(
+                        "PARITY backend=cpu step={} loss={:.6} delta_l2={:.6}",
+                        step + 1,
+                        yolo.loss,
+                        seeds_l2(&yolo.layer_output_gradient_seeds)
+                    );
                     seeds = yolo.layer_output_gradient_seeds;
                 }
                 if fixed_deltas {
-                    println!("PARITY backend=cpu step={} surrogate={:.6}", step + 1, surrogate(&forward.yolo_heads, &seeds));
+                    println!(
+                        "PARITY backend=cpu step={} surrogate={:.6}",
+                        step + 1,
+                        surrogate(&forward.yolo_heads, &seeds)
+                    );
                 }
                 let t1 = Instant::now();
                 exec.backward_accumulate_seeded(&input, &forward, &seeds)?;
@@ -674,17 +706,32 @@ fn bench_train(cfg: &str, steps: usize, warmup: usize) -> Result<(), Box<dyn std
                 let forward = exec.forward_training_device(&input)?;
                 if let Some(labels) = &parity_labels {
                     let yolo = compute_yolo_training_loss_with_state(
-                        &exec.network, &forward.cpu_forward, labels, step, Some(&mut yolo_state))?;
-                    println!("PARITY backend=oxide step={} loss={:.6} delta_l2={:.6}", step + 1, yolo.loss, seeds_l2(&yolo.layer_output_gradient_seeds));
+                        &exec.network,
+                        &forward.cpu_forward,
+                        labels,
+                        step,
+                        Some(&mut yolo_state),
+                    )?;
+                    println!(
+                        "PARITY backend=oxide step={} loss={:.6} delta_l2={:.6}",
+                        step + 1,
+                        yolo.loss,
+                        seeds_l2(&yolo.layer_output_gradient_seeds)
+                    );
                     seeds = yolo.layer_output_gradient_seeds;
                 }
                 if fixed_deltas {
-                    println!("PARITY backend=oxide step={} surrogate={:.6}", step + 1, surrogate(&forward.cpu_forward.yolo_heads, &seeds));
+                    println!(
+                        "PARITY backend=oxide step={} surrogate={:.6}",
+                        step + 1,
+                        surrogate(&forward.cpu_forward.yolo_heads, &seeds)
+                    );
                 }
                 if step == 0 {
                     if let Some(prefix) = &parity_prefix {
                         for h in &forward.cpu_forward.yolo_heads {
-                            let b: Vec<u8> = h.output.data.iter().flat_map(|v| v.to_le_bytes()).collect();
+                            let b: Vec<u8> =
+                                h.output.data.iter().flat_map(|v| v.to_le_bytes()).collect();
                             fs::write(format!("{prefix}.out.{}.bin", h.layer_index), b)?;
                         }
                     }
@@ -739,7 +786,12 @@ fn bench_train(cfg: &str, steps: usize, warmup: usize) -> Result<(), Box<dyn std
             return Err(format!("backend {other} is not available in this build").into());
         }
     }
-    let list = |v: &[f64]| v.iter().map(|x| format!("{x:.3}")).collect::<Vec<_>>().join(",");
+    let list = |v: &[f64]| {
+        v.iter()
+            .map(|x| format!("{x:.3}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     let median = |v: &[f64]| {
         let mut s = v.to_vec();
         s.sort_by(|a, b| a.total_cmp(b));
@@ -766,14 +818,21 @@ fn bench_train(cfg: &str, steps: usize, warmup: usize) -> Result<(), Box<dyn std
 }
 
 fn bench_batch() -> usize {
-    std::env::var("DARKNET_BENCH_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1)
+    std::env::var("DARKNET_BENCH_BATCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+        .max(1)
 }
 
 /// Tile a batch-1 input into `batch` identical images.
 fn replicate_batch(input: &Tensor, batch: usize) -> Tensor {
     let mut shape = input.shape;
     shape.batch = batch;
-    Tensor { shape, data: input.data.repeat(batch) }
+    Tensor {
+        shape,
+        data: input.data.repeat(batch),
+    }
 }
 
 /// One machine-readable line for `tools/oxide_bench.py`: per-iteration latencies in ms.
@@ -826,11 +885,64 @@ fn classify_detector_train_paths(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct TrainOptions {
+    weights: Option<String>,
+    seed: u64,
+    clear: bool,
+    dont_show: bool,
+    gpu: bool,
+}
+
+impl TrainOptions {
+    fn initial_seen(&self, loaded_seen: u64) -> u64 {
+        if self.clear { 0 } else { loaded_seen }
+    }
+
+    fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut options = Self {
+            weights: None,
+            seed: 0,
+            clear: false,
+            dont_show: false,
+            gpu: false,
+        };
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "-clear" => options.clear = true,
+                "-dont_show" => options.dont_show = true,
+                "-seed" | "--seed" => {
+                    let value = required_arg(args.next(), "seed value")?;
+                    options.seed = value
+                        .parse()
+                        .map_err(|_| format!("invalid seed: {value} (expected u64)"))?;
+                }
+                "-gpus" => {
+                    let value = required_arg(args.next(), "GPU list")?;
+                    if value != "0" {
+                        return Err("only -gpus 0 is supported; multi-GPU/device selection is not implemented".into());
+                    }
+                    options.gpu = true;
+                }
+                "-map" => {
+                    return Err("-map is not implemented yet (P9: mid-training validation)".into());
+                }
+                flag if flag.starts_with('-') => {
+                    return Err(format!("unsupported detector train flag: {flag}").into());
+                }
+                _ if options.weights.is_none() => options.weights = Some(arg),
+                _ => return Err(format!("unexpected detector train argument: {arg}").into()),
+            }
+        }
+        Ok(options)
+    }
+}
+
 fn run_detector_train(
     cfg: &str,
     data: &str,
-    maybe_weights: Option<&str>,
-    flags: &[String],
+    options: &TrainOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !Path::new(cfg).exists() {
         return Err(format!("cfg path does not exist: {cfg}").into());
@@ -839,14 +951,17 @@ fn run_detector_train(
         return Err(format!("data path does not exist: {data}").into());
     }
 
+    if options.gpu && selected_backend()? != "oxide" {
+        return Err("-gpus 0 requires DARKNET_BACKEND=oxide".into());
+    }
     println!("detector train");
     println!("cfg {}", cfg);
     println!("data {}", data);
-    if !flags.is_empty() {
-        println!("flags {}", flags.join(" "));
+    if options.dont_show {
+        println!("-dont_show: headless trainer (no GUI)");
     }
-
-    run_detector_train_preferred_backend(cfg, data, maybe_weights)
+    println!("training seed {}", options.seed);
+    run_detector_train_preferred_backend(cfg, data, options)
 }
 
 fn print_training_configuration(
@@ -931,43 +1046,44 @@ fn format_seconds(seconds: f64) -> String {
 fn run_detector_train_preferred_backend(
     cfg: &str,
     data: &str,
-    maybe_weights: Option<&str>,
+    options: &TrainOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if selected_backend()? != "oxide" {
         println!("cpu backend (set DARKNET_BACKEND=oxide for the GPU path)");
-        return run_detector_train_cpu(cfg, data, maybe_weights);
+        return run_detector_train_cpu(cfg, data, options);
     }
-    match OxideBackend::new() {
-        Ok(backend) => {
-            println!("gpu backend oxide device=0");
-            run_detector_train_gpu(cfg, data, maybe_weights, backend)
-        }
-        Err(err) => {
-            println!("gpu backend unavailable ({err}), falling back to cpu");
-            run_detector_train_cpu(cfg, data, maybe_weights)
-        }
-    }
+    let backend =
+        OxideBackend::new().map_err(|err| format!("requested oxide backend unavailable: {err}"))?;
+    println!("gpu backend oxide device=0");
+    run_detector_train_gpu(cfg, data, options, backend)
 }
 
 #[cfg(not(feature = "oxide"))]
 fn run_detector_train_preferred_backend(
     cfg: &str,
     data: &str,
-    maybe_weights: Option<&str>,
+    options: &TrainOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("gpu backend disabled at compile time, falling back to cpu");
-    run_detector_train_cpu(cfg, data, maybe_weights)
+    if selected_backend()? == "oxide" {
+        return Err(
+            "requested oxide backend is not available; rebuild with --features oxide".into(),
+        );
+    }
+    println!("cpu backend");
+    run_detector_train_cpu(cfg, data, options)
 }
 
 fn run_detector_train_cpu(
     cfg: &str,
     data: &str,
-    maybe_weights: Option<&str>,
+    options: &TrainOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let data_config = DataConfig::from_path(data)?;
+    let augmentation = DetectorAugmentation::from_config(&ConfigFile::parse_file(cfg)?)?;
     let mut executable = ExecutableNetwork::from_path(cfg)?;
+    initialize_training_params(&executable.network, &mut executable.params, options.seed);
     let mut seen = 0u64;
-    if let Some(weights) = maybe_weights {
+    if let Some(weights) = options.weights.as_deref() {
         let header = executable.load_weights_file(weights)?;
         seen = header.seen;
         println!(
@@ -975,7 +1091,11 @@ fn run_detector_train_cpu(
             header.major, header.minor, header.revision, header.seen
         );
     } else {
-        println!("running with zero-initialized weights");
+        println!("running with seeded random weights");
+    }
+    seen = options.initial_seen(seen);
+    if options.clear {
+        println!("-clear: reset seen and iteration");
     }
 
     let mut train_images = load_paths_file(data_config.required_train_list()?)?;
@@ -1024,11 +1144,14 @@ fn run_detector_train_cpu(
         let mut iter_loss = 0.0f32;
         for subdivision in 0..executable.network.net.subdivisions.max(1) {
             let start_index = image_cursor + subdivision * executable.network.net.batch.max(1);
-            let batch = load_training_batch_from_paths(
+            let batch = load_augmented_training_batch_from_paths(
                 &executable.network,
                 &data_config,
                 &train_images,
                 start_index,
+                &augmentation,
+                options.seed,
+                seen + (subdivision * executable.network.net.batch.max(1)) as u64,
             )?;
             let forward = executable.forward_training(&batch.input)?;
             let yolo = compute_yolo_training_loss_with_state(
@@ -1100,13 +1223,15 @@ fn run_detector_train_cpu(
 fn run_detector_train_gpu(
     cfg: &str,
     data: &str,
-    maybe_weights: Option<&str>,
+    options: &TrainOptions,
     backend: OxideBackend,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let data_config = DataConfig::from_path(data)?;
+    let augmentation = DetectorAugmentation::from_config(&ConfigFile::parse_file(cfg)?)?;
     let mut executable = GpuExecutableNetwork::from_path(cfg, backend)?;
+    initialize_training_params(&executable.network, &mut executable.params, options.seed);
     let mut seen = 0u64;
-    if let Some(weights) = maybe_weights {
+    if let Some(weights) = options.weights.as_deref() {
         let header = executable.load_weights_file(weights)?;
         seen = header.seen;
         println!(
@@ -1114,7 +1239,11 @@ fn run_detector_train_gpu(
             header.major, header.minor, header.revision, header.seen
         );
     } else {
-        println!("running with zero-initialized weights");
+        println!("running with seeded random weights");
+    }
+    seen = options.initial_seen(seen);
+    if options.clear {
+        println!("-clear: reset seen and iteration");
     }
     executable.init_train_buffers_gpu()?;
     println!("allocated GPU params and train buffers");
@@ -1171,11 +1300,14 @@ fn run_detector_train_gpu(
         // them to zero only once at startup, which is correct.
         for subdivision in 0..executable.network.net.subdivisions.max(1) {
             let start_index = image_cursor + subdivision * executable.network.net.batch.max(1);
-            let batch = load_training_batch_from_paths(
+            let batch = load_augmented_training_batch_from_paths(
                 &executable.network,
                 &data_config,
                 &train_images,
                 start_index,
+                &augmentation,
+                options.seed,
+                seen + (subdivision * executable.network.net.batch.max(1)) as u64,
             )?;
             let forward = executable.forward_training_device(&batch.input)?;
             let yolo = compute_yolo_training_loss_with_state(
@@ -1334,7 +1466,10 @@ fn make_backward_seeds(
 fn print_usage() {
     println!("darknet-rs <command> [args]");
     println!("commands:");
-    println!("  detector train <cfg|data> <data|cfg> [weights] [flags...]");
+    println!(
+        "  detector train <cfg|data> <data|cfg> [weights] [-clear] [-dont_show] [-seed <u64>] [-gpus 0]"
+    );
+    println!("    seed defaults to 0; -map/unknown flags fail explicitly; -gpus 0 requires oxide");
     println!("  version");
     println!("  cfg-validate <cfg>");
     println!("  cfg-summary <cfg>");
@@ -1342,9 +1477,15 @@ fn print_usage() {
     println!("  weights-inspect <cfg> <weights>");
     println!("  forward-dummy <cfg> [weights]");
     println!("  forward-backward-dummy <cfg> [weights] [auto|yolo|final]");
-    println!("  bench-train <cfg> [steps] [warmup]   (synthetic fwd+bwd+SGD steps, no dataset; DARKNET_BENCH_BATCH, DARKNET_BACKEND)");
-    println!("  detect-image <cfg> <weights> <names> <image> [thresh] [nms] [resize|letterbox|resize-exact]");
-    println!("env: DARKNET_BACKEND=cpu|oxide, DARKNET_OXIDE_CONV, DARKNET_OXIDE_GEMM, DARKNET_OXIDE_AMP=1 (mixed-precision training), DARKNET_DETECT_TSV=1");
+    println!(
+        "  bench-train <cfg> [steps] [warmup]   (synthetic fwd+bwd+SGD steps, no dataset; DARKNET_BENCH_BATCH, DARKNET_BACKEND)"
+    );
+    println!(
+        "  detect-image <cfg> <weights> <names> <image> [thresh] [nms] [resize|letterbox|resize-exact]"
+    );
+    println!(
+        "env: DARKNET_BACKEND=cpu|oxide, DARKNET_OXIDE_CONV, DARKNET_OXIDE_GEMM, DARKNET_OXIDE_AMP=1 (mixed-precision training), DARKNET_DETECT_TSV=1"
+    );
 }
 
 fn print_network_summary(network: &Network) {
@@ -1406,7 +1547,57 @@ fn shuffle_paths(paths: &mut [PathBuf], seed: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::classify_detector_train_paths;
+    use super::{TrainOptions, classify_detector_train_paths};
+
+    fn options(args: &[&str]) -> Result<TrainOptions, Box<dyn std::error::Error>> {
+        TrainOptions::parse(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn training_flags_parse_values_without_consuming_weights() {
+        let parsed = options(&[
+            "-seed",
+            "42",
+            "-gpus",
+            "0",
+            "model.weights",
+            "-clear",
+            "-dont_show",
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed,
+            TrainOptions {
+                weights: Some("model.weights".into()),
+                seed: 42,
+                clear: true,
+                dont_show: true,
+                gpu: true
+            }
+        );
+        assert_eq!(options(&[]).unwrap().seed, 0);
+    }
+
+    #[test]
+    fn clear_resets_seen_but_default_resumes() {
+        assert_eq!(options(&[]).unwrap().initial_seen(512), 512);
+        assert_eq!(options(&["-clear"]).unwrap().initial_seen(512), 0);
+    }
+
+    #[test]
+    fn unsupported_training_flags_and_bad_values_fail() {
+        for args in [
+            vec!["-map"],
+            vec!["-gpus", "0,1"],
+            vec!["-gpus"],
+            vec!["-seed"],
+            vec!["-seed", "-1"],
+            vec!["-thresh", "0.5"],
+            vec!["a.weights", "b.weights"],
+        ] {
+            assert!(options(&args).is_err(), "{args:?}");
+        }
+    }
 
     #[test]
     fn detector_train_accepts_cfg_then_data() {

@@ -723,8 +723,19 @@ fn apply_yolo_box_delta(
     // C++ `all_ious` (iou, giou) of the decoded prediction vs the truth, taken before the
     // `w == 0` fix-up, for the cost / avg_iou statistics.
     let decoded = decode_training_bbox(
-        tx_raw, ty_raw, tw_raw, th_raw, col, row, grid_width, grid_height, net_width, net_height,
-        anchor, spec.scale_x_y, spec.new_coords,
+        tx_raw,
+        ty_raw,
+        tw_raw,
+        th_raw,
+        col,
+        row,
+        grid_width,
+        grid_height,
+        net_width,
+        net_height,
+        anchor,
+        spec.scale_x_y,
+        spec.new_coords,
     );
     let ious = (bbox_iou(decoded, truth_bbox), box_giou(decoded, truth_bbox));
 
@@ -1126,6 +1137,36 @@ pub fn load_training_batch_from_paths(
     image_paths: &[PathBuf],
     start_index: usize,
 ) -> Result<TrainingBatch> {
+    load_training_batch_impl(network, data, image_paths, start_index, None)
+}
+
+/// Training-only augmented loader. Absolute sample ordinals keep random draws
+/// independent of subdivision and background-worker scheduling.
+pub fn load_augmented_training_batch_from_paths(
+    network: &Network,
+    data: &DataConfig,
+    image_paths: &[PathBuf],
+    start_index: usize,
+    augmentation: &crate::augmentation::DetectorAugmentation,
+    seed: u64,
+    sample_start: u64,
+) -> Result<TrainingBatch> {
+    load_training_batch_impl(
+        network,
+        data,
+        image_paths,
+        start_index,
+        Some((augmentation, seed, sample_start)),
+    )
+}
+
+fn load_training_batch_impl(
+    network: &Network,
+    data: &DataConfig,
+    image_paths: &[PathBuf],
+    start_index: usize,
+    augmentation: Option<(&crate::augmentation::DetectorAugmentation, u64, u64)>,
+) -> Result<TrainingBatch> {
     if image_paths.is_empty() {
         return Err(Error::InvalidConfig(
             "training image list is empty".to_owned(),
@@ -1153,7 +1194,18 @@ pub fn load_training_batch_from_paths(
         }
 
         let image = PlanarRgbImage::load(image_path)?;
-        let prepared = image.resize(width, height)?;
+        let labels = load_yolo_labels(&label_path, data.classes)?;
+        let (prepared, labels) = match augmentation {
+            Some((options, seed, sample_start)) => options.apply(
+                &image,
+                &labels,
+                width,
+                height,
+                seed,
+                sample_start.wrapping_add(batch_index as u64),
+            )?,
+            None => (image.resize(width, height)?, labels),
+        };
         if prepared.shape.channels != channels {
             return Err(Error::InvalidConfig(format!(
                 "image {} has {} channels, expected {}",
@@ -1163,7 +1215,6 @@ pub fn load_training_batch_from_paths(
             )));
         }
 
-        let labels = load_yolo_labels(&label_path, data.classes)?;
         let dst = batch_index * per_image;
         input.data[dst..dst + per_image].copy_from_slice(&prepared.data);
         batch_image_paths.push(image_path.clone());
@@ -1732,9 +1783,10 @@ fn yolo_objectness_output(raw: f32, new_coords: bool) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        YoloBox, apply_yolo_box_delta, YoloHeadStats, yolo_head_cost, yolo_xy_output, DataConfig, YoloLabel, YoloTrainingState, apply_yolo_delta_filtering,
-        compute_yolo_training_loss, compute_yolo_training_loss_with_state, load_training_batch,
-        load_yolo_labels, replace_image_to_label,
+        DataConfig, YoloBox, YoloHeadStats, YoloLabel, YoloTrainingState, apply_yolo_box_delta,
+        apply_yolo_delta_filtering, compute_yolo_training_loss,
+        compute_yolo_training_loss_with_state, load_training_batch, load_yolo_labels,
+        replace_image_to_label, yolo_head_cost, yolo_xy_output,
     };
     use crate::cfg::ConfigFile;
     use crate::model::{Network, TensorShape, YoloIouLoss, YoloSpec};
@@ -1926,13 +1978,35 @@ mod tests {
             class_multipliers: None,
             class_map: None,
         };
-        let shape = TensorShape { width: 1, height: 1, channels: 6, batch: 1 };
+        let shape = TensorShape {
+            width: 1,
+            height: 1,
+            channels: 6,
+            batch: 1,
+        };
         let output = Tensor::zeros(shape);
-        let truth = YoloBox { x: 0.6, y: 0.5, w: 0.5, h: 0.5 };
+        let truth = YoloBox {
+            x: 0.6,
+            y: 0.5,
+            w: 0.5,
+            h: 0.5,
+        };
         let mut seed = Tensor::zeros(shape);
         let (iou, giou) = apply_yolo_box_delta(
-            &output, &mut seed, 0, 0, 0, 0, 1, 1, 100, 100, (50.0, 50.0), truth,
-            spec.iou_normalizer, &spec,
+            &output,
+            &mut seed,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            100,
+            100,
+            (50.0, 50.0),
+            truth,
+            spec.iou_normalizer,
+            &spec,
         );
         // I = .2, U = .3, enclosing box = union box -> giou == iou == 2/3.
         assert!((iou - 2.0 / 3.0).abs() < 1.0e-5 && (giou - 2.0 / 3.0).abs() < 1.0e-5);
@@ -1943,11 +2017,26 @@ mod tests {
         }
 
         // MSE keeps the (2 - w*h) scale: (2 - .25) * .5 * (tx - sigmoid(0)), tx = .6*1-0.
-        let mse = YoloSpec { iou_loss: YoloIouLoss::Mse, ..spec };
+        let mse = YoloSpec {
+            iou_loss: YoloIouLoss::Mse,
+            ..spec
+        };
         let mut seed = Tensor::zeros(shape);
         apply_yolo_box_delta(
-            &output, &mut seed, 0, 0, 0, 0, 1, 1, 100, 100, (50.0, 50.0), truth,
-            mse.iou_normalizer, &mse,
+            &output,
+            &mut seed,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            100,
+            100,
+            (50.0, 50.0),
+            truth,
+            mse.iou_normalizer,
+            &mse,
         );
         assert!((seed.get(0, 0, 0, 0) - 1.75 * 0.5 * 0.1).abs() < 1.0e-5);
     }
@@ -1982,16 +2071,32 @@ mod tests {
             class_multipliers: None,
             class_map: None,
         };
-        let shape = TensorShape { width: 1, height: 1, channels: 6, batch: 1 };
+        let shape = TensorShape {
+            width: 1,
+            height: 1,
+            channels: 6,
+            batch: 1,
+        };
         let mut seed = Tensor::zeros(shape);
         for (c, v) in [0.3, 0.4, 0.5, 0.6, 0.2, -0.1].iter().enumerate() {
             seed.set(0, c, 0, 0, *v);
         }
-        let stats = YoloHeadStats { tot_iou: 1.4, tot_iou_loss: 0.6, tot_giou_loss: 1.0, count: 2 };
+        let stats = YoloHeadStats {
+            tot_iou: 1.4,
+            tot_iou_loss: 0.6,
+            tot_giou_loss: 1.0,
+            count: 2,
+        };
         assert!((yolo_head_cost(&seed, &spec, &stats) - 0.25).abs() < 1.0e-6);
-        let giou = YoloSpec { iou_loss: YoloIouLoss::Giou, ..spec.clone() };
+        let giou = YoloSpec {
+            iou_loss: YoloIouLoss::Giou,
+            ..spec.clone()
+        };
         assert!((yolo_head_cost(&seed, &giou, &stats) - 0.35).abs() < 1.0e-6);
-        let mse = YoloSpec { iou_loss: YoloIouLoss::Mse, ..spec.clone() };
+        let mse = YoloSpec {
+            iou_loss: YoloIouLoss::Mse,
+            ..spec.clone()
+        };
         assert!((yolo_head_cost(&seed, &mse, &stats) - 0.91).abs() < 1.0e-6);
         assert!((yolo_head_cost(&seed, &spec, &YoloHeadStats::default()) - 0.1).abs() < 1.0e-6);
     }
@@ -2060,9 +2165,7 @@ mod tests {
         assert_ne!(seed.get(0, 10, 0, 0), 0.0);
     }
 
-    fn forward_two_head_zero_input(
-        yolo_extra: &str,
-    ) -> (Network, crate::runtime::ForwardResult) {
+    fn forward_two_head_zero_input(yolo_extra: &str) -> (Network, crate::runtime::ForwardResult) {
         let cfg = ConfigFile::parse_str(
             "inline.cfg",
             &format!(
@@ -2126,23 +2229,50 @@ mod tests {
     #[test]
     fn yolo_iou_thresh_extra_anchor_in_other_head_like_cpp() {
         let (network, forward) = forward_two_head_zero_input("iou_thresh=0.5");
-        let label = YoloLabel { class_id: 0, x: 0.5, y: 0.5, w: 10.0 / 32.0, h: 12.0 / 32.0 };
+        let label = YoloLabel {
+            class_id: 0,
+            x: 0.5,
+            y: 0.5,
+            w: 10.0 / 32.0,
+            h: 12.0 / 32.0,
+        };
         let training = compute_yolo_training_loss(&network, &forward, &[vec![label]])
             .expect("training loss computes");
         assert_eq!(training.positive_matches, 2);
-        let a = training.layer_output_gradient_seeds[1].as_ref().expect("head A seed");
-        let b = training.layer_output_gradient_seeds[4].as_ref().expect("head B seed");
+        let a = training.layer_output_gradient_seeds[1]
+            .as_ref()
+            .expect("head A seed");
+        let b = training.layer_output_gradient_seeds[4]
+            .as_ref()
+            .expect("head B seed");
         assert!((a.get(0, 4, 16, 16) - 0.5).abs() < 1.0e-6);
-        assert!((b.get(0, 4, 16, 16) - 0.5).abs() < 1.0e-6, "extra anchor objectness");
-        assert!((b.get(0, 5, 16, 16) - 0.5).abs() < 1.0e-6, "extra anchor class delta");
-        assert!((b.get(0, 10, 16, 16) + 0.5).abs() < 1.0e-6, "anchor 2 stays negative");
+        assert!(
+            (b.get(0, 4, 16, 16) - 0.5).abs() < 1.0e-6,
+            "extra anchor objectness"
+        );
+        assert!(
+            (b.get(0, 5, 16, 16) - 0.5).abs() < 1.0e-6,
+            "extra anchor class delta"
+        );
+        assert!(
+            (b.get(0, 10, 16, 16) + 0.5).abs() < 1.0e-6,
+            "anchor 2 stays negative"
+        );
         // without iou_thresh only the primary head is assigned
         let (network, forward) = forward_two_head_zero_input("");
-        let label = YoloLabel { class_id: 0, x: 0.5, y: 0.5, w: 10.0 / 32.0, h: 12.0 / 32.0 };
+        let label = YoloLabel {
+            class_id: 0,
+            x: 0.5,
+            y: 0.5,
+            w: 10.0 / 32.0,
+            h: 12.0 / 32.0,
+        };
         let training = compute_yolo_training_loss(&network, &forward, &[vec![label]])
             .expect("training loss computes");
         assert_eq!(training.positive_matches, 1);
-        let b = training.layer_output_gradient_seeds[4].as_ref().expect("head B seed");
+        let b = training.layer_output_gradient_seeds[4]
+            .as_ref()
+            .expect("head B seed");
         // anchor 1's decoded box (12x14 px) has iou .714 > ignore_thresh with the truth and the
         // class output .5 > .25 matches -> C++ ignores it (delta 0), nothing positive is written
         assert_eq!(b.get(0, 4, 16, 16), 0.0);
@@ -2183,11 +2313,19 @@ mod tests {
         let executable = ExecutableNetwork::new(network.clone());
         let input = executable.zero_input();
         let forward = executable.forward(&input).expect("forward runs");
-        let label = YoloLabel { class_id: 0, x: 0.5, y: 0.5, w: 10.0 / 32.0, h: 12.0 / 32.0 };
+        let label = YoloLabel {
+            class_id: 0,
+            x: 0.5,
+            y: 0.5,
+            w: 10.0 / 32.0,
+            h: 12.0 / 32.0,
+        };
         let training = compute_yolo_training_loss(&network, &forward, &[vec![label]])
             .expect("training loss computes");
         assert_eq!(training.positive_matches, 0);
-        let seed = training.layer_output_gradient_seeds[1].as_ref().expect("seed");
+        let seed = training.layer_output_gradient_seeds[1]
+            .as_ref()
+            .expect("seed");
         assert!((seed.get(0, 4, 16, 16) + 0.5).abs() < 1.0e-6);
         assert_eq!(seed.get(0, 5, 16, 16), 0.0);
         assert_eq!(seed.get(0, 0, 16, 16), 0.0);
@@ -2199,7 +2337,13 @@ mod tests {
     fn yolo_delta_normalizer_scales_seeds_not_loss() {
         let (network, forward) = forward_two_head_zero_input("");
         let (network2, forward2) = forward_two_head_zero_input("delta_normalizer=2.5");
-        let label = YoloLabel { class_id: 0, x: 0.5, y: 0.5, w: 10.0 / 32.0, h: 12.0 / 32.0 };
+        let label = YoloLabel {
+            class_id: 0,
+            x: 0.5,
+            y: 0.5,
+            w: 10.0 / 32.0,
+            h: 12.0 / 32.0,
+        };
         let base = compute_yolo_training_loss(&network, &forward, &[vec![label.clone()]]).unwrap();
         let scaled = compute_yolo_training_loss(&network2, &forward2, &[vec![label]]).unwrap();
         assert_eq!(base.loss, scaled.loss);
@@ -2211,7 +2355,15 @@ mod tests {
                 assert!((x * 2.5 - y).abs() < 1.0e-6);
             }
         }
-        assert!((base.layer_output_gradient_seeds[1].as_ref().unwrap().get(0, 4, 16, 16) - 0.5).abs() < 1.0e-6);
+        assert!(
+            (base.layer_output_gradient_seeds[1]
+                .as_ref()
+                .unwrap()
+                .get(0, 4, 16, 16)
+                - 0.5)
+                .abs()
+                < 1.0e-6
+        );
         assert_eq!(base.class_count, base.box_count);
     }
 
@@ -2242,12 +2394,21 @@ mod tests {
         .expect("cfg parses");
         let network = Network::from_config(cfg).expect("network builds");
         let mut seeds = vec![Some(
-            Tensor::from_data(network.layers[0].output_shape, vec![1.395, 3.0, 0.0, 0.0, 0.0, 0.0])
-                .expect("seed tensor"),
+            Tensor::from_data(
+                network.layers[0].output_shape,
+                vec![1.395, 3.0, 0.0, 0.0, 0.0, 0.0],
+            )
+            .expect("seed tensor"),
         )];
-        let mut state = YoloTrainingState { delta_rolling_avg: 2.0, ..YoloTrainingState::default() };
+        let mut state = YoloTrainingState {
+            delta_rolling_avg: 2.0,
+            ..YoloTrainingState::default()
+        };
         apply_yolo_delta_filtering(&network, &mut seeds, 3, &mut state);
-        assert_eq!(seeds[0].as_ref().unwrap().data, vec![0.0, 3.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(
+            seeds[0].as_ref().unwrap().data,
+            vec![0.0, 3.0, 0.0, 0.0, 0.0, 0.0]
+        );
         // rolling update: avg = 2*.99 + mean(1.395, 3)*.01, max = 3 (first step) * .99 + 3 * .01
         assert!((state.delta_rolling_avg - 2.001_975).abs() < 1.0e-5);
         assert!((state.delta_rolling_max - 3.0).abs() < 1.0e-6);
@@ -2281,8 +2442,11 @@ mod tests {
         .expect("cfg parses");
         let network = Network::from_config(cfg).expect("network builds");
         let mut seeds = vec![Some(
-            Tensor::from_data(network.layers[0].output_shape, vec![5.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-                .expect("seed tensor"),
+            Tensor::from_data(
+                network.layers[0].output_shape,
+                vec![5.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            )
+            .expect("seed tensor"),
         )];
         let mut state = YoloTrainingState {
             badlabels_reject_threshold: 1.0,

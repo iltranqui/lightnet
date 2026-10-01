@@ -10,10 +10,14 @@
 //! The public re-exports below form the application-facing API.  The modules
 //! remain public for advanced users extending a specific part of the port.
 
+pub mod augmentation;
+pub use augmentation::DetectorAugmentation;
 pub mod cfg;
 pub mod detect;
 pub mod error;
 pub mod image;
+pub mod initialize;
+pub use initialize::initialize_training_params;
 pub mod model;
 pub mod names;
 pub mod runtime;
@@ -38,8 +42,9 @@ pub use runtime::{
 };
 pub use train::{
     DataConfig, TrainingBatch, YoloLabel, YoloTrainingLoss, YoloTrainingState,
-    compute_yolo_training_loss, compute_yolo_training_loss_with_state, load_paths_file,
-    load_training_batch, load_training_batch_from_paths, load_yolo_labels, replace_image_to_label,
+    compute_yolo_training_loss, compute_yolo_training_loss_with_state,
+    load_augmented_training_batch_from_paths, load_paths_file, load_training_batch,
+    load_training_batch_from_paths, load_yolo_labels, replace_image_to_label,
 };
 pub use weights::{WeightsHeader, WeightsInspection, inspect_weights_file, save_weights};
 
