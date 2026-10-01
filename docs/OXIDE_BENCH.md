@@ -35,7 +35,7 @@ No training runs were made.
 * fp16 row (added with P6, separate interleaved run of 5 rounds x 100 iters together with oxide fp32/tf32 and both C++ rows; fp32 2.31 / 23.1, tf32 2.33 / 19.6,
   C++ cuDNN fp16 5.06 / 14.0 ms in that run): weights + activations stored as f16, f32 accumulate, bias + activation fused into the GEMM epilogue (no f32 activation
   round trip). Batch 1: 1.29x faster than oxide fp32/tf32 and 2.8x faster than C++ cuDNN fp16; batch 16: 1.27x vs fp32, 1.08x vs tf32, still 1.3x behind C++
-  (the per-image im2col + GEMM loop is unchanged). Device memory delta: b1 +28 MB (f32 weights are kept next to the f16 copies, f16 im2col scratch 0 reported
+  (the per-image im2col + GEMM loop was still in use then; batched since, see 1.1). Device memory delta: b1 +28 MB (f32 weights are kept next to the f16 copies, f16 im2col scratch 0 reported
   because `workspace_mb` only counts the f32 workspace), b16 +86 MB (f32 path +184 MB: f16 activations halve the pool).
 * Batch 1: oxide is ~2x faster than C++ (launch-light, no cuDNN heuristics); round medians are stable (oxide 2.2-2.5 ms).
   Batch 16: C++ is ~1.4-1.6x faster (cuDNN implicit-GEMM vs our per-image im2col + GEMM loop, see hotspots).
@@ -44,6 +44,37 @@ No training runs were made.
 * Rust CPU is the unoptimised reference path (single thread), not a performance target.
 * Memory (MB, device): oxide b1 +18 (workspace 4.9, 12.3 cached in the pool), b16 +184 (workspace 4.9, 150 pool); C++ b1 76, b16 348 (332 with `cudnn_half=0`).
   Pool cap is `DARKNET_OXIDE_POOL_MB` (default 1024).
+
+### 1.1 fp16 inference: batched im2col + one GEMM per chunk, more f16 layers, bf16 GEMM (2026-10-01)
+
+Batched f16 conv (`conv2d_bias_act_f16`: one im2col launch and one GEMM launch per chunk of images, instances = image x group, column buffer capped at 32 MB, 1x1 convs with
+aligned K / H*W skip im2col) was already in the tree when this section was written, so the P6 remark above ("per-image im2col + GEMM loop is unchanged") and the b16 fp16 row
+(18.2 ms) are stale. A/B with the existing switch `DARKNET_OXIDE_CONV_CHUNK=1` (= old one-launch-per-image loop), release `darknet-rs`, LegoGears_v2, interleaved, 5 rounds x 100 iters
+(`tools/oxide_bench.py --suites e2e --batches 1,16 --variants oxide-fp16,oxide-fp16-loop,cpp-cudnn-half`, results in `target/oxide_bench/f16_batched/`):
+
+| variant | batch 1 median / min / p95 ms | FPS | batch 16 median / min / p95 ms | img/s | device MB delta b1 / b16 |
+|---|---|---|---|---|---|
+| oxide fp16, batched (default) | 2.04 / 1.44 / 4.10 | 489 | 9.55 / 9.06 / 10.9 | 1676 | 28 / 110 |
+| oxide fp16, per-image loop (`CONV_CHUNK=1`) | 1.93 / 1.43 / 4.22 | 519 | 19.0 / 16.0 / 22.0 | 842 | 28 / 86 |
+| C++ CUDA, cuDNN fp16 | 5.20 / 3.70 / 8.82 | 192 | 14.8 / 11.3 / 18.4 | 1078 | - |
+
+Batch 16: 2.0x faster than the per-image loop and 1.55x faster than C++ cuDNN fp16 (it was 1.3x behind); batch 1 is unchanged (a single image is one chunk; 2.04 vs 1.93 ms is
+within the ~5% laptop noise, round medians 1.83 - 2.20 vs 1.78 - 2.33). The batched buffer costs +24 MB at b16.
+
+Layers added to the f16 path (so non-LegoGears nets run under `forward_compact_f16` instead of `UnsupportedLayer`): shortcut (same-shaped sources, and the mismatched crop /
+zero-pad source, activation fused into the last add so there is one rounding), global avgpool, local_avgpool, standalone batch norm (folded scale + bias) and standalone
+bias + activation (one `channel_affine_act_f16` kernel), and `reverse` upsample. Still `UnsupportedLayer` in f16: connected,
+reorg, softmax, scale_channels, sam, crop, recurrent layers, shortcut without sources. Accuracy vs the f32 path (`tests/oxide_runtime_f16.rs`, random He-initialised weights and BN
+statistics, scale-normalised max error of the yolo heads / final output): tiny nets 2.8e-4 .. 8.8e-4; yolov3-tiny 1.3e-3, yolov4-tiny 1.3e-3, yolov3 (75 convs, 23 shortcuts, 3 heads, 128x128)
+6.2e-4, resnet101 up to the global avgpool (33 shortcuts, 4 resized) 6.7e-4; tolerance 4e-3 (tiny) / 5e-3 (real cfgs). The element ops are tested against f64 references to
+5.2e-4 |ref| + 1e-7 (one binary16 rounding) in `tests/oxide_half.rs`. LegoGears_v2 detections with `DARKNET_OXIDE_GEMM=fp16` on the 80 validation images are byte-identical to the
+recorded fp16 run (mAP 99.6685%).
+
+bf16 GEMM: `OxideBackend::gemm_bf16` (bf16 operands, f32 accumulate / output, `mma.sync m16n8k16 .bf16`) reuses the f16 kernel through a `bf16` flag; the tensor-core step is
+instantiated twice (macro, branch outside the unrolled k loop). A plain in-loop `if bf16 { mma_bf16 } else { mma_f16 }` cost 40% of the f16 GEMM (4096^3: 5.33 -> 9.18 ms) and was
+dropped; with the macro split 4096^3 is 5.33 -> 5.38 ms (25.8 -> 25.5 TF/s), 2048^3 0.79 -> 0.80 ms, 21 LegoGears conv shapes 0.63 - 0.67 -> 0.66 - 0.68 ms (all within noise,
+`f16_gemm_bench`). bf16 is a GEMM only (no bf16 conv / activations); error model as for f16 (|err| <= 2e-5 S + 1e-6, measured worst err/S 1.3e-7). Not done: 3-stage cp.async
+pipeline / bigger tiles (b16 e2e is now 9.5 ms, GEMM already runs at 25.5 TF/s on 4096^3; no quick measured win expected, so not attempted).
 
 ## 2. Micro-benchmarks (device time, median of 7)
 
@@ -130,13 +161,13 @@ Findings:
 4. GEMM: reduce shared-memory bank conflicts and registers (122 regs caps occupancy at ~30%), make tf32 the default for large problems (`DARKNET_OXIDE_GEMM=auto`),
    keep split-K partials in shared/L2 (an atomics-free two-pass reduce already exists; fuse it into the last block).
 5. Small kernels: block-parallel softmax and global avgpool (14% / 7.5% of bandwidth), tiled maxpool 3x3.
-6. ~~fp16 activations and weights pre-packed per layer~~ done (P6, see the fp16 rows); bf16 only has convert kernels. Next for fp16: batched im2col + one GEMM over the image loop (b16 is still 1.3x behind cuDNN), 3-stage cp.async pipeline, implicit-GEMM conv.
+6. ~~fp16 activations and weights pre-packed per layer~~ done (P6, see the fp16 rows); bf16 only has convert kernels. Batched im2col + one GEMM per chunk is done (1.1: b16 9.5 ms, 1.55x faster than C++ cuDNN fp16), bf16 GEMM exists (1.1); still open: 3-stage cp.async pipeline, implicit-GEMM conv.
 
 ## 6. Not done / caveats
 
 * Training-step time (fwd + bwd + SGD) is now measured with a synthetic driver, see section 7; opt-in mixed-precision training (`DARKNET_OXIDE_AMP=1`) is section 7.2 (no convergence run).
-* fp16 (P6) inference: f16 storage for conv / maxpool / route / upsample (the f16 dgrad/wgrad exist only in the AMP training mode, 7.2), no f16 shortcut/other layers (the CLI errors with `UnsupportedLayer`
-  for such nets under `DARKNET_OXIDE_GEMM=fp16`). Accuracy and detection deltas are in `tasks/rust/todo.md` (P6). cuTile is disabled, so no cuTile column.
+* fp16 (P6) inference: f16 storage for conv / maxpool / route / upsample (the f16 dgrad/wgrad exist only in the AMP training mode, 7.2), f16 shortcut / avgpool / local_avgpool / batch norm / `reverse` upsample were added later (1.1); connected, reorg, softmax, scale_channels, sam, crop and recurrent layers still make the CLI
+  error with `UnsupportedLayer` under `DARKNET_OXIDE_GEMM=fp16`. Accuracy and detection deltas are in `tasks/rust/todo.md` (P6). cuTile is disabled, so no cuTile column.
 * Laptop GPU: clocks at benchmark start were idle (210 MHz, boosting to ~3 GHz under load); sustained clocks and thermals vary between runs, so treat differences below ~5% as noise
   (round medians in `results.json` show the spread, e.g. oxide b1 2.18-2.54 ms).
 * % of roofline uses marketing peaks; fp32 sustained clock may be lower than boost.

@@ -3,6 +3,7 @@
 //! arithmetic happens in f32 after an exact widening, results are rounded back
 //! to nearest even (data movement ops are bit copies).
 
+use super::activations::activate;
 use super::convert::{f16_bits_to_f32, f32_to_f16_bits};
 use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
 
@@ -181,6 +182,165 @@ pub mod kernels {
         // `dst` covers `batch * dst_total * stride` elements.
         unsafe {
             *dst.as_mut_ptr().add(to) = src[from];
+        }
+    }
+
+    /// `out = f16(act(a + b))` (shortcut with a same-shaped source; the sum is
+    /// formed in f32 and rounded once).
+    #[kernel]
+    pub fn shortcut_add_act_f16(a: &[u16], b: &[u16], mut out: DisjointSlice<u16>, kind: u32) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = out.get_mut(idx) {
+            *o = f32_to_f16_bits(activate(kind, f16_bits_to_f32(a[i]) + f16_bits_to_f32(b[i])), 0);
+        }
+    }
+
+    /// `out = f16(act(x * scale[c] + bias[c]))`, `c = (i / stride) % channels`
+    /// (standalone bias + activation and the folded inference batch norm).
+    /// `has_scale == 0` ignores `scale` (any buffer may be passed).
+    #[kernel]
+    pub fn channel_affine_act_f16(
+        x: &[u16],
+        scale: &[f32],
+        bias: &[f32],
+        mut out: DisjointSlice<u16>,
+        channels: usize,
+        stride: usize,
+        has_scale: u32,
+        kind: u32,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = out.get_mut(idx) {
+            let c = (i / stride) % channels;
+            let mut v = f16_bits_to_f32(x[i]);
+            if has_scale != 0 {
+                v *= scale[c];
+            }
+            *o = f32_to_f16_bits(activate(kind, v + bias[c]), 0);
+        }
+    }
+
+    /// Mean over the in-image taps of each window (f32 sum, one rounding).
+    #[kernel]
+    pub fn local_avgpool_f16(
+        x: &[u16],
+        mut out: DisjointSlice<u16>,
+        h: usize,
+        w: usize,
+        out_h: usize,
+        out_w: usize,
+        size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        off: usize,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= out.len() {
+            return;
+        }
+        let oplane = out_h * out_w;
+        let bc = i / oplane;
+        let r = i % oplane;
+        let y0 = ((r / out_w) * stride_y) as i64 - off as i64;
+        let x0 = ((r % out_w) * stride_x) as i64 - off as i64;
+        let mut sum = 0.0f32;
+        let mut count = 0usize;
+        let mut ky = 0usize;
+        while ky < size {
+            let iy = y0 + ky as i64;
+            if iy >= 0 && iy < h as i64 {
+                let mut kx = 0usize;
+                while kx < size {
+                    let ix = x0 + kx as i64;
+                    if ix >= 0 && ix < w as i64 {
+                        sum += f16_bits_to_f32(x[(bc * h + iy as usize) * w + ix as usize]);
+                        count += 1;
+                    }
+                    kx += 1;
+                }
+            }
+            ky += 1;
+        }
+        if let Some(o) = out.get_mut(idx) {
+            *o = f32_to_f16_bits(if count > 0 { sum / count as f32 } else { 0.0 }, 0);
+        }
+    }
+
+    /// Global average, one thread per (batch, channel) plane, f32 sequential sum.
+    #[kernel]
+    pub fn avgpool_f16(x: &[u16], mut out: DisjointSlice<u16>, area: usize) {
+        let idx = thread::index_1d();
+        let bc = idx.get();
+        if bc >= out.len() {
+            return;
+        }
+        let mut sum = 0.0f32;
+        let mut k = 0usize;
+        while k < area {
+            sum += f16_bits_to_f32(x[bc * area + k]);
+            k += 1;
+        }
+        if let Some(o) = out.get_mut(idx) {
+            *o = f32_to_f16_bits(sum / area as f32, 0);
+        }
+    }
+
+    /// `reverse` upsample: each small output pixel sums the `stride x stride`
+    /// block of the big input it covers (taps past the edge skipped).
+    #[kernel]
+    pub fn upsample_reverse_f16(
+        x: &[u16],
+        mut out: DisjointSlice<u16>,
+        in_h: usize,
+        in_w: usize,
+        out_h: usize,
+        out_w: usize,
+        stride: usize,
+        scale: f32,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= out.len() {
+            return;
+        }
+        let oplane = out_h * out_w;
+        let bc = i / oplane;
+        let r = i % oplane;
+        let oy = r / out_w;
+        let ox = r % out_w;
+        let mut sum = 0.0f32;
+        let mut dy = 0usize;
+        while dy < stride {
+            let iy = oy * stride + dy;
+            if iy < in_h {
+                let mut dx = 0usize;
+                while dx < stride {
+                    let ix = ox * stride + dx;
+                    if ix < in_w {
+                        sum += f16_bits_to_f32(x[bc * in_h * in_w + iy * in_w + ix]);
+                    }
+                    dx += 1;
+                }
+            }
+            dy += 1;
+        }
+        if let Some(o) = out.get_mut(idx) {
+            *o = f32_to_f16_bits(scale * sum, 0);
+        }
+    }
+
+    /// Flat per-sample crop / zero-pad of a mismatched shortcut source (bit copy).
+    #[kernel]
+    pub fn shortcut_fit_f16(x: &[u16], mut out: DisjointSlice<u16>, from_len: usize, to_len: usize) {
+        let idx = thread::index_1d();
+        let g = idx.get();
+        if let Some(o) = out.get_mut(idx) {
+            let b = g / to_len;
+            let i = g - b * to_len;
+            *o = if i < from_len { x[b * from_len + i] } else { 0 };
         }
     }
 }

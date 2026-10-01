@@ -1050,6 +1050,58 @@ pub trait F16TensorOpsBackend: F32TensorOpsBackend {
         channel_stride: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error>;
+    /// Mean over the in-image taps of each window.
+    fn local_avgpool_f16(
+        &self,
+        x: &Self::TensorF16,
+        output_shape: &[usize],
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        padding: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error>;
+    /// Global average pool to `[batch, channels, 1, 1]`.
+    fn avgpool_f16(
+        &self,
+        x: &Self::TensorF16,
+        output_shape: &[usize],
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error>;
+    /// Flat per-sample crop / zero-pad of a mismatched shortcut source.
+    fn shortcut_fit_f16(
+        &self,
+        x: &Self::TensorF16,
+        batch: usize,
+        output_shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error>;
+    /// `f16(activation(a + b))`, same shapes (shortcut layer).
+    fn shortcut_add_act_f16(
+        &self,
+        a: &Self::TensorF16,
+        b: &Self::TensorF16,
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error>;
+    /// `f16(activation(x * scale[c] + bias[c]))` per channel (`scale = None`:
+    /// bias + activation only); `scale` / `bias` are f32 `[channels]`.
+    fn channel_affine_act_f16(
+        &self,
+        x: &Self::TensorF16,
+        scale: Option<&Self::Tensor>,
+        bias: &Self::Tensor,
+        channels: usize,
+        channel_stride: usize,
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error>;
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

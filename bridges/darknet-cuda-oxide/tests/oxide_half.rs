@@ -203,6 +203,46 @@ fn gemm_f16_parity_all_transposes_alignments_alpha_beta() {
     println!("gemm_f16 worst err/S = {worst:.3e}");
 }
 
+fn round_bf16(v: &[f32]) -> Vec<f32> {
+    v.iter().map(|&x| bf16_bits_to_f32(f32_to_bf16_bits(x))).collect()
+}
+
+/// bf16 operands (already bf16-exact), f32 accumulation: same error model as
+/// the f16 GEMM (|err| <= 2e-5 * S + 1e-6, f64 reference), every transpose,
+/// alignment, split-K and (alpha, beta) combination of `GEMM_CASES`.
+#[test]
+fn gemm_bf16_parity_all_transposes_alignments_alpha_beta() {
+    let be = backend();
+    let mut rng = Rng(777);
+    let mut worst = 0.0f64;
+    for case in GEMM_CASES {
+        let (m, n, k) = (case.m, case.n, case.k);
+        for &(ta, tb) in &[(false, false), (false, true), (true, false), (true, true)] {
+            for &(alpha, beta) in &[(1.0f32, 0.0f32), (0.75, 0.5), (-1.5, 1.0)] {
+                let a = round_bf16(&rng.vec(m * k, -1.0, 1.0));
+                let b = round_bf16(&rng.vec(k * n, -1.0, 1.0));
+                let c0 = rng.vec(m * n, -1.0, 1.0);
+                let (want, scale) = ref_gemm(&a, &b, &c0, m, n, k, ta, tb, alpha, beta);
+                let at = be.f32_to_bf16(&be.upload_f32(&[a.len()], &a).unwrap()).unwrap();
+                let bt = be.f32_to_bf16(&be.upload_f32(&[b.len()], &b).unwrap()).unwrap();
+                let ct = be.upload_f32(&[m, n], &c0).unwrap();
+                let got = be.download_f32(&be.gemm_bf16(&at, &bt, &ct, m, n, k, ta, tb, alpha, beta).unwrap()).unwrap();
+                for i in 0..m * n {
+                    let err = (got[i] as f64 - want[i]).abs();
+                    let tol = 2e-5 * scale[i] + 1e-6;
+                    worst = worst.max(err / (scale[i] + 1e-30));
+                    assert!(
+                        err <= tol,
+                        "{} ta={ta} tb={tb} alpha={alpha} beta={beta} [{i}]: got {}, want {}, err {err}, tol {tol}",
+                        case.name, got[i], want[i]
+                    );
+                }
+            }
+        }
+    }
+    println!("gemm_bf16 worst err/S = {worst:.3e}");
+}
+
 #[test]
 fn gemm_beta_zero_ignores_nan_in_c_f16() {
     let be = backend();
@@ -537,4 +577,157 @@ fn conv_f16_legogears_v2_real_layer_shapes() {
     }
     assert_eq!(n, 21);
     println!("lego 21 layers worst err/tol = {worst:.3}");
+}
+
+/// |got - ref| <= 5.2e-4 |ref| + 1e-7: one binary16 rounding of the f32/f64
+/// result (u = 2^-11 = 4.88e-4) plus f16 subnormal spacing; the operands are
+/// f16-exact so the f32 arithmetic error (~1e-6 relative) is far below it.
+fn assert_f16_close(name: &str, got: &[f32], want: &[f64]) {
+    assert_eq!(got.len(), want.len(), "{name}: length");
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        let tol = 5.2e-4 * w.abs() + 1e-7;
+        assert!((g as f64 - w).abs() <= tol, "{name}[{i}]: got {g} want {w} (tol {tol})");
+    }
+}
+
+#[test]
+fn f16_shortcut_avgpool_affine_reverse_match_f64_reference() {
+    let be = backend();
+    let mut rng = Rng(21);
+    let acts = [
+        F32ActivationKind::Linear, F32ActivationKind::Leaky, F32ActivationKind::Logistic, F32ActivationKind::Relu,
+        F32ActivationKind::Mish, F32ActivationKind::Swish, F32ActivationKind::Tanh, F32ActivationKind::Relu6,
+        F32ActivationKind::Ramp,
+    ];
+    // shortcut: act(a + b), odd length so the launch tail is exercised.
+    for act in acts {
+        let n = 2 * 5 * 7 * 3 + 1;
+        let a = round16(&rng.vec(n, -5.0, 5.0));
+        let b = round16(&rng.vec(n, -5.0, 5.0));
+        let at = be.upload_f16(&[n], &a).unwrap();
+        let bt = be.upload_f16(&[n], &b).unwrap();
+        let got = be.download_f16(&be.shortcut_add_act_f16(&at, &bt, act, cfg()).unwrap()).unwrap();
+        let want: Vec<f64> = a.iter().zip(&b).map(|(&x, &y)| act_ref(act, x as f64 + y as f64)).collect();
+        assert_f16_close(&format!("shortcut {act:?}"), &got, &want);
+    }
+    // standalone bias + activation and folded BN (scale, bias) per channel.
+    let (b, c, h, w) = (2usize, 5usize, 6usize, 7usize);
+    let x = round16(&rng.vec(b * c * h * w, -4.0, 4.0));
+    let scale = rng.vec(c, 0.3, 1.7);
+    let bias = rng.vec(c, -1.0, 1.0);
+    let xt = be.upload_f16(&[b, c, h, w], &x).unwrap();
+    let st = be_upload(&be, &scale, &[c]);
+    let bt = be_upload(&be, &bias, &[c]);
+    for act in acts {
+        let got = be.download_f16(&be.bias_activation_f16(&xt, &bt, c, h * w, act, cfg()).unwrap()).unwrap();
+        let want: Vec<f64> =
+            x.iter().enumerate().map(|(i, &v)| act_ref(act, v as f64 + bias[(i / (h * w)) % c] as f64)).collect();
+        assert_f16_close(&format!("bias_act {act:?}"), &got, &want);
+        let got = be.download_f16(&be.channel_affine_act_f16(&xt, Some(&st), &bt, c, h * w, act, cfg()).unwrap()).unwrap();
+        let want: Vec<f64> = x
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let ch = (i / (h * w)) % c;
+                act_ref(act, v as f64 * scale[ch] as f64 + bias[ch] as f64)
+            })
+            .collect();
+        assert_f16_close(&format!("affine {act:?}"), &got, &want);
+    }
+    // local avgpool (3x3 s2 pad 2, 2x2 s1 pad 1, 2x2 s2) and global avgpool.
+    for &(size, stride, pad) in &[(3usize, 2usize, 2usize), (2, 1, 1), (2, 2, 0)] {
+        let off = pad / 2;
+        let oh = (h + pad - size) / stride + 1;
+        let ow = (w + pad - size) / stride + 1;
+        let y = be.local_avgpool_f16(&xt, &[b, c, oh, ow], c, h, w, size, stride, stride, pad, cfg()).unwrap();
+        let got = be.download_f16(&y).unwrap();
+        let mut want = Vec::new();
+        for bc in 0..b * c {
+            for oy in 0..oh {
+                for ox in 0..ow {
+                    let (mut s, mut cnt) = (0.0f64, 0usize);
+                    for ky in 0..size {
+                        for kx in 0..size {
+                            let iy = (oy * stride + ky) as i64 - off as i64;
+                            let ix = (ox * stride + kx) as i64 - off as i64;
+                            if iy >= 0 && ix >= 0 && iy < h as i64 && ix < w as i64 {
+                                s += x[(bc * h + iy as usize) * w + ix as usize] as f64;
+                                cnt += 1;
+                            }
+                        }
+                    }
+                    want.push(if cnt > 0 { s / cnt as f64 } else { 0.0 });
+                }
+            }
+        }
+        assert_f16_close(&format!("local_avgpool {size}/{stride}/{pad}"), &got, &want);
+    }
+    let g = be.avgpool_f16(&xt, &[b, c, 1, 1], c, h, w, cfg()).unwrap();
+    let want: Vec<f64> =
+        (0..b * c).map(|bc| x[bc * h * w..(bc + 1) * h * w].iter().map(|&v| v as f64).sum::<f64>() / (h * w) as f64).collect();
+    assert_f16_close("avgpool", &be.download_f16(&g).unwrap(), &want);
+    // reverse upsample: floor-sized (7 / 2 = 3) and exact outputs, with scale.
+    for &(stride, oh, ow, sc) in &[(2usize, 3usize, 3usize, 1.0f32), (2, 3, 4, 0.5), (3, 2, 2, 1.0)] {
+        let (ih, iw) = (6usize, 7usize);
+        let x = round16(&rng.vec(b * c * ih * iw, -3.0, 3.0));
+        let xt = be.upload_f16(&[b, c, ih, iw], &x).unwrap();
+        let y = be.upsample_f16(&xt, &[b, c, oh, ow], c, ih, iw, stride, sc, true, cfg());
+        if oh > ih.div_ceil(stride) || ow > iw.div_ceil(stride) {
+            assert!(y.is_err());
+            continue;
+        }
+        let got = be.download_f16(&y.unwrap()).unwrap();
+        let mut want = Vec::new();
+        for bc in 0..b * c {
+            for oy in 0..oh {
+                for ox in 0..ow {
+                    let mut s = 0.0f64;
+                    for dy in 0..stride {
+                        for dx in 0..stride {
+                            let (iy, ix) = (oy * stride + dy, ox * stride + dx);
+                            if iy < ih && ix < iw {
+                                s += x[(bc * ih + iy) * iw + ix] as f64;
+                            }
+                        }
+                    }
+                    want.push(sc as f64 * s);
+                }
+            }
+        }
+        assert_f16_close(&format!("reverse upsample s{stride}"), &got, &want);
+    }
+    // bad shapes
+    assert!(be.shortcut_add_act_f16(&xt, &be.upload_f16(&[3], &[0.0; 3]).unwrap(), F32ActivationKind::Linear, cfg()).is_err());
+    assert!(be.channel_affine_act_f16(&xt, None, &be_upload(&be, &[0.0; 4], &[4]), c, h * w, F32ActivationKind::Linear, cfg()).is_err());
+    assert!(be.avgpool_f16(&xt, &[b, c, 2, 1], c, h, w, cfg()).is_err());
+}
+
+/// f16 GEMM micro-benchmark (`... -- --ignored --nocapture f16_gemm_bench`):
+/// median over `DARKNET_BENCH_ROUNDS` (default 7) of mean device ms, 2048^3,
+/// 4096^3 and the sum over the 21 LegoGears_v2 conv shapes.
+#[test]
+#[ignore]
+fn f16_gemm_bench() {
+    let be = backend();
+    let rounds: usize = std::env::var("DARKNET_BENCH_ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(7);
+    let lego: [(usize, usize, usize); 21] = [
+        (32, 8960, 27), (64, 2240, 288), (64, 2240, 576), (32, 2240, 288), (32, 2240, 288), (64, 2240, 64),
+        (128, 560, 576), (64, 560, 576), (64, 560, 576), (128, 560, 128), (256, 140, 1152), (128, 140, 1152),
+        (128, 140, 1152), (256, 140, 256), (512, 35, 2304), (256, 35, 512), (512, 35, 2304), (30, 35, 512),
+        (128, 35, 256), (256, 140, 3456), (30, 140, 256),
+    ];
+    let med = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    for &s in &[2048usize, 4096] {
+        let iters = if s == 4096 { 10 } else { 40 };
+        let ms = med((0..rounds).map(|_| be.bench_gemm_f16(s, s, s, iters).unwrap()).collect());
+        println!("BENCH f16 {s}^3: {ms:.4} ms {:.1} TF/s", 2.0 * (s as f64).powi(3) / ms / 1e9);
+    }
+    let total: f64 = lego
+        .iter()
+        .map(|&(m, n, k)| med((0..rounds).map(|_| be.bench_gemm_f16(m, n, k, 100).unwrap()).collect()))
+        .sum();
+    println!("BENCH f16 lego21 total: {total:.4} ms");
 }

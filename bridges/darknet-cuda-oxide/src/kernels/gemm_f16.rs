@@ -23,6 +23,9 @@
 //! path, which pads K and N to multiples of 8), else with a plain element
 //! loop (correct for every shape, slower).
 //!
+//! `bf16 != 0` reads the operands as bfloat16 instead (same tiles and
+//! fragments, `mma.sync ... .bf16.bf16.f32`); only the f32 epilogue is used then.
+//!
 //! Epilogue `epi == 0`: f32 `alpha * acc + beta * C`.  `epi == 1` (inference
 //! conv): `v = alpha * acc + bias[(inst % bias_mod) * bias_stride + row]`, activation `act`,
 //! round to nearest even and store f16 into `c16` (columns `>= n_store`, the
@@ -31,7 +34,9 @@
 use super::unroll::unroll;
 use cuda_device::convert::cvt_f16x2_f32;
 use cuda_device::shared::cvta_generic_to_shared_u32;
-use cuda_device::wmma::{ldmatrix_x4_shared_u32, ldmatrix_x4_trans_shared_u32, mma_m16n8k16_f32_f16};
+use cuda_device::wmma::{
+    ldmatrix_x4_shared_u32, ldmatrix_x4_trans_shared_u32, mma_m16n8k16_f32_bf16, mma_m16n8k16_f32_f16,
+};
 use cuda_device::{DisjointSlice, SharedArray, cuda_module, kernel, thread};
 
 pub const HMMA_BM: usize = 64;
@@ -76,6 +81,7 @@ pub mod kernels {
         act: u32,
         bias_stride: usize,
         bias_mod: usize,
+        bf16: u32,
     ) {
         // 2 stages x 2560 halves (1280 words) per operand.
         static mut AS: SharedArray<u32, 2560, 16> = SharedArray::UNINIT;
@@ -236,6 +242,8 @@ pub mod kernels {
             }
             thread::sync_threads();
 
+            macro_rules! compute_tile {
+                ($mma:ident) => {
             if it > 0 {
                 let so = ((it - 1) & 1) * 2560;
                 unroll!(2, kk, {
@@ -271,7 +279,7 @@ pub mod kernels {
                             let cin = [acc[o], acc[o + 1], acc[o + 2], acc[o + 3]];
                             // SAFETY: all 32 lanes reach this call together;
                             // fragments follow the documented m16n8k16 layout.
-                            let d = unsafe { mma_m16n8k16_f32_f16(cin, af, bf[ni]) };
+                            let d = unsafe { $mma(cin, af, bf[ni]) };
                             acc[o] = d[0];
                             acc[o + 1] = d[1];
                             acc[o + 2] = d[2];
@@ -279,6 +287,13 @@ pub mod kernels {
                         });
                     });
                 });
+            }
+                };
+            }
+            if bf16 == 0 {
+                compute_tile!(mma_m16n8k16_f32_f16);
+            } else {
+                compute_tile!(mma_m16n8k16_f32_bf16);
             }
             // Stage `(it - 1) & 1` is refilled by the next iteration's issue.
             thread::sync_threads();

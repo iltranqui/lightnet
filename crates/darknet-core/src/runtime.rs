@@ -2368,9 +2368,10 @@ where
     /// f16 twin of [`GpuExecutableNetwork::forward_compact`]: weights and
     /// activations are stored as binary16 on the device (f32 accumulation,
     /// bias and activation), the yolo heads are widened to f32 on download.
-    /// Supports convolutional, maxpool, route, upsample and yolo-style
-    /// pass-through layers (everything LegoGears-class detectors use); any
-    /// other layer returns `UnsupportedLayer` (use `forward_compact`).
+    /// Supports convolutional, maxpool, (local) avgpool, standalone batchnorm,
+    /// route, shortcut (mismatched sources are cropped / zero-padded like
+    /// Darknet), upsample (also `reverse`) and yolo-style pass-through layers;
+    /// any other layer returns `UnsupportedLayer` (use `forward_compact`).
     pub fn forward_compact_f16(&self, input: &Tensor) -> Result<GpuForwardSummary> {
         let expected = self.network.net.input_shape();
         if input.shape != expected {
@@ -2383,10 +2384,21 @@ where
             match &layer.kind {
                 LayerKind::Convolutional(_)
                 | LayerKind::MaxPool(_)
+                | LayerKind::LocalAvgPool(_)
+                | LayerKind::AvgPool
+                | LayerKind::BatchNorm(_)
                 | LayerKind::Route(_)
                 | LayerKind::Upsample(_)
                 | LayerKind::Yolo(_)
                 | LayerKind::GaussianYolo(_) => {}
+                LayerKind::Shortcut(spec) => {
+                    if spec.from.is_empty() {
+                        return Err(Error::UnsupportedLayer {
+                            layer_index: layer.index,
+                            name: "shortcut without sources (f16 inference)".to_owned(),
+                        });
+                    }
+                }
                 other => {
                     return Err(Error::UnsupportedLayer {
                         layer_index: layer.index,
@@ -2500,6 +2512,114 @@ where
                             launch_config,
                         )
                         .map_err(|err| backend_error("f16 maxpool", err))?
+                }
+                (LayerKind::LocalAvgPool(spec), LayerParams::None) => {
+                    if layer.output_shape.channels != layer.input_shape.channels {
+                        return Err(Error::UnsupportedLayer {
+                            layer_index: layer.index,
+                            name: "local_avgpool_depth".to_owned(),
+                        });
+                    }
+                    self.backend
+                        .local_avgpool_f16(
+                            current_input.expect("local_avgpool requires current input"),
+                            &tensor_backend_shape(layer.output_shape),
+                            layer.input_shape.channels,
+                            layer.input_shape.height,
+                            layer.input_shape.width,
+                            spec.size,
+                            spec.stride_x,
+                            spec.stride_y,
+                            spec.padding,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("f16 local_avgpool", err))?
+                }
+                (LayerKind::AvgPool, LayerParams::None) => self
+                    .backend
+                    .avgpool_f16(
+                        current_input.expect("avgpool requires current input"),
+                        &tensor_backend_shape(layer.output_shape),
+                        layer.input_shape.channels,
+                        layer.input_shape.height,
+                        layer.input_shape.width,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("f16 avgpool", err))?,
+                (LayerKind::BatchNorm(_), LayerParams::BatchNorm(params)) => {
+                    let shape = layer.input_shape;
+                    let (scales, biases) = folded_batchnorm_inference_params(params, shape.channels)?;
+                    let scales = self
+                        .backend
+                        .upload_f32(&[shape.channels], &scales)
+                        .map_err(|err| backend_error("upload batchnorm inference scales", err))?;
+                    let biases = self
+                        .backend
+                        .upload_f32(&[shape.channels], &biases)
+                        .map_err(|err| backend_error("upload batchnorm inference biases", err))?;
+                    self.backend
+                        .channel_affine_act_f16(
+                            current_input.expect("batchnorm requires current input"),
+                            Some(&scales),
+                            &biases,
+                            shape.channels,
+                            shape.width * shape.height,
+                            F32ActivationKind::Linear,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("f16 batchnorm inference", err))?
+                }
+                (LayerKind::Shortcut(spec), LayerParams::None) => {
+                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+                    let mut accumulated = current_input
+                        .expect("shortcut requires current input")
+                        .clone();
+                    let last = spec.from.len().saturating_sub(1);
+                    for (n, raw_index) in spec.from.iter().enumerate() {
+                        let source_index = resolve_relative_layer(layer.index, *raw_index)?;
+                        let source = gpu_layer_outputs
+                            .get(source_index)
+                            .and_then(Option::as_ref)
+                            .ok_or(Error::InvalidRoute {
+                                layer_index: layer.index,
+                                reference: *raw_index,
+                            })?;
+                        let source_layer = self.network.layers.get(source_index).ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing source layer #{source_index} for shortcut layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                        if source_layer.output_shape.batch != layer.output_shape.batch {
+                            return Err(Error::InvalidConfig(format!(
+                                "shortcut layer #{} mixes incompatible batch shapes {} and {}",
+                                layer.index, layer.output_shape, source_layer.output_shape
+                            )));
+                        }
+                        // Darknet resizes a mismatched source flat per sample.
+                        let fitted;
+                        let source = if source_layer.output_shape != layer.output_shape {
+                            fitted = self
+                                .backend
+                                .shortcut_fit_f16(
+                                    source,
+                                    layer.output_shape.batch,
+                                    &tensor_backend_shape(layer.output_shape),
+                                    launch_config,
+                                )
+                                .map_err(|err| backend_error("f16 shortcut resize source", err))?;
+                            &fitted
+                        } else {
+                            source
+                        };
+                        // The activation rides on the last add (one rounding).
+                        let act = if n == last { activation } else { F32ActivationKind::Linear };
+                        accumulated = self
+                            .backend
+                            .shortcut_add_act_f16(&accumulated, source, act, launch_config)
+                            .map_err(|err| backend_error("f16 shortcut add", err))?;
+                    }
+                    accumulated
                 }
                 (LayerKind::Route(spec), LayerParams::None) => {
                     let mut route_inputs = Vec::with_capacity(spec.layers.len());
