@@ -282,6 +282,12 @@ Final target vs C++ CUDA, LegoGears_v2: detections matched (155/155, score diff 
 Genuinely open / needs user: GPU training-parity run (needs user OK), clippy-preview fix (user runs commands), commits (user decision), training-step launch overhead (fused update, device BN stats, CUDA graph), wgmma/tcgen05 + multi-GPU (later). (relu6/ramp, mismatched-shape shortcut and the yolo-kernel box were resolved 2026-10-01, see their boxes.)
 Stale-box audit (done 2026-10-01, evidence inline on each box): scan-agent CSV items, generic forward/backward + finite-difference boxes, chained test, tf32 detections, bias_backward decision, P6/P7 shape re-run, 42 cfgs, relu6/ramp, mismatched shortcut, gap list, SGD steps, yolo kernel boxes (kernel box closed as not needed; scale_x_y FD box left open as N/A proposal). Still open on purpose: GPU training-parity run on LegoGears_v2 (P8), wgmma/tcgen05 GEMM-interface box, fp16 remainder list, multi-GPU/Blackwell, clippy-preview, commits.
 
+### P9 training-loop pass (2026-10-01, second session; code written, verified)
+Implemented and unit-tested (`cargo test -p darknet-core --lib` 143 pass, `cargo test -p darknet-cli` 8 pass, all 14 cuda-oxide suites pass via `cargo-oxide oxide test`):
+- B: `-save_every N` + `<name>_last.weights`; `<name>_loss.csv`; `chart.png` (new `darknet-core/src/chart.rs`, loss+mAP curves with a built-in 5x7 bitmap font); Adam-step/moment resume sidecar `<name>_optimizer.state` (`GpuExecutableNetwork::{save,load}_optimizer_state`, test `optimizer_state_round_trips_adam_moments`); console parity confirmed (C++ field order already emitted).
+- A: `mixup=1` (`blend_mixup` + per-batch 50% disable, wired into the augmented loader); multi-scale `random=1` (`Network::with_input_size` re-infers shapes, `multi_scale_dimensions` mirrors C++ `train_detector`, both trainer loops resize every 10th iteration).
+Deferred this pass (documented above, not blockers for LegoGears_v2): faithful mosaic/cutmix (needs the single-image crop geometry exposed: pleft/ptop/pright/pbot + corner move), background loader prefetch, resume data-order replay, dynamic loss scale + skip-step, AMP+Adam/dropout test coverage, device connected/sam/recurrent backward, implicit-GEMM conv.
+
 ### Batched im2col + SIGBUS fix verification (2026-10-01)
 - All 8 oxide suites green (conv_parity 12, cfg_shapes 11, half 11, layers_extra 13, batchnorm_adam 7, parity 10, pool_parity 9, gemm_mma 5).
 - Batch 16 e2e (release, 100 iters, 3 interleaved rounds, medians): oxide fp32 23.0 -> 14.7 ms, tf32 19.8 -> 10.8 ms, fp16 18.2 -> 9.6 ms; C++ cuDNN fp16 13.9-15.6 ms (oxide now at/above parity). Batch 1 unchanged (fp32 2.4, tf32 2.5-2.8, fp16 1.7-2.0 ms; C++ 4.9-6.1 ms).
@@ -305,3 +311,69 @@ Stale-box audit (done 2026-10-01, evidence inline on each box): scan-agent CSV i
 - BLOCKED (hardware): wgmma (sm_90) / tcgen05 (sm_100) GEMM kernels, multi-GPU, NVFP4 - cannot be compiled/tested on this sm_89 laptop GPU; the GEMM seam (`GemmArgs` + `GemmMode`) is in place.
 - DONE 2026-10-01 (7.4): multi-tensor update, fused saxpy accumulation, fused inference bias+activation. DEFERRED: training-forward BN+activation fusion, f32 GEMM epilogue, CUDA graph capture (cuda-core 0.3.1 lacks instantiate/launch; step needs static buffers).
 - Left by design: adversarial yolo branch, rewritten_bbox/total_bbox logging, weighted shortcut, elu/selu/gelu/... activations (no cfg uses them), degenerate equidistant cfgs.
+
+## P9 `darknet detector train` completion on oxide (added 2026-10-01 after gap review)
+State: `detector train` already runs on the oxide GPU backend (P4/P8: conv+BN batch stats, SGD/Adam/AdamW, loss scale, AMP, yolo loss == C++ at step 1: 0.1912 vs 0.1911, step time 1.3x b1 / 1.7x b16 of C++). What is left is mostly data-pipeline parity and real-training validation. Goal: same cfg + dataset trains end to end in Rust like `darknet detector train`.
+
+### Startup / command-line handling (completed this pass)
+- [x] Seeded random training initialization (default seed 0, `-seed`/`--seed <u64>`); convolutional/connected weights use C++ uniform bounds `sqrt(2/fan_in)`, BN gamma starts at 1, biases and rolling stats at 0. Initialize before loading weights so unloaded layers are nonzero; ordinary inference cfg construction remains unchanged. RNG is reproducible in Rust, not bit-identical to C++.
+- [x] Explicit flag parser: `-clear` resets seen/iteration without discarding loaded weights; `-dont_show` is an explicit headless no-op; `-gpus 0` requires oxide. Other GPU selections and unknown flags fail clearly instead of being ignored. `-map` is now implemented (see B below). Flags with values no longer consume the weights positional argument.
+- [x] Explicit oxide requests fail when the feature/device is unavailable; no silent CPU fallback.
+- [x] Verification: core 127 + CLI 6 unit tests pass without oxide; oxide CLI tests pass with capped cargo-oxide build (`-j 4`). Includes seeded/grouped-conv/BN initialization, connected save/load override + seen preservation, parsing and clear-counter tests. No real training runs.
+
+### A. Data pipeline parity (biggest gap)
+Original gap: `load_training_batch_from_paths` only decoded/resized images. The trainer now calls `load_augmented_training_batch_from_paths` with `DetectorAugmentation` parsed once from cfg (net color/flip/letter_box keys + final detector head jitter/resize/max). The original public unaugmented loader and inference preprocessing stay unchanged. Audit/evidence: `tasks/rust/augmentation-audit.md`.
+- [x] Diff C++ loader before coding: `tasks/rust/augmentation-audit.md` lists geometry, flip, u8 HSV, truth limits/filtering, mixing/noise/fog/tracking/contrastive/loader keys and source references. Scan of 96 cfgs found random in 28, mosaic in 22, cutmix in 4, blur in 1; none of these active in LegoGears_v2.
+- [x] Jitter + paired resize margins + letter_box aspect adjustment, source-mean padding and u8 OpenCV-style bilinear resize; box clipping/mirror/subpixel filtering + shuffled max-box cap. CPU and oxide CLI share the augmented loader. Fixed OpenCV crop/resize/flip/HSV fixtures: worst difference 1/255 (not claimed bit-identical).
+- [x] Horizontal flip with box mirror. Blur/noise/fog NOT implemented; active settings rejected explicitly. Scan: blur used by efficientnet_b0 (not LegoGears_v2).
+- [x] Parse net hue/saturation/exposure and apply u8 RGB->HSV->RGB distortion like `image_data_augmentation` (including saturating hue addition, not circular shifting). `angle` is not consumed by the C++ detection loader and therefore is not applied.
+- [~] mixup (`[net] mixup=1`) implemented 2026-10-01: `DetectorAugmentation::mixup`, `augmentation::mixup_active` (C++ 50% per-batch disable) and `blend_mixup` (50/50 pixel blend + truth append capped at `max_boxes`); wired into `load_augmented_training_batch_from_paths` with a second image ordinal. Unit test `mixup_blends_pixels_and_appends_labels`. mosaic (`mosaic=1`, mode 3) and cutmix (modes 2/4, which C++ itself rejects) remain rejected by `from_config`; faithful mosaic needs the single-image crop geometry exposed (pleft/ptop/pright/pbot + per-quadrant corner move) and is deferred (LegoGears_v2 sets none of these).
+- [x] Multi-scale `random` implemented 2026-10-01: `Network::with_input_size` re-infers all layer shapes (rejects connected-layer nets), `DetectorAugmentation::{random, resize_step}` parse the max head `random` + `[net] resize_step`, `multi_scale_dimensions` mirrors C++ `train_detector` (rand_scale(1.4 or random), rounded to `resize_step`, max size on first/last-100 iterations, `>= resize_step`), and both trainer loops resize every 10th iteration. Tests `with_input_size_reinfers_all_layer_shapes`, `multi_scale_dimensions_follow_cpp_rounding_and_clamps`.
+- [~] Seeded SplitMix64 per absolute sample ordinal, independent of worker scheduling/subdivisions. Six new tests: clipped/mirrored boxes and subpixel removal, repeatability/different seeds, 20 OpenCV fixtures, letterbox, loader subdivision independence, unsupported/invalid cfg settings. Mosaic stitch tests remain open. RNG is not C++ bit-identical; full resume data-order replay is not yet guaranteed.
+- [ ] Background loader thread(s) + prefetch (C++ uses `n_threads`); GPU step must not wait on decode/augment (measure with bench-train style interleaved A/B)
+
+### B. Training loop features
+Current: periodic/final/_last weights, optional in-process `-map` validation, best weights, mAP CSV, loss/lr CSV, chart.png.
+- [x] `-map` implemented for CPU and oxide. Every check makes exactly one inference per image in the full `valid=` list using an in-memory snapshot of CURRENT training weights/BN statistics (GPU deferred state synced first). Separate batch-one inference graph; no checkpoint reload, random initialization or training-state mutation. VOC precision-envelope AP in `crates/darknet-core/src/evaluate.rs` follows `tools/oxide_map.py`, including strict IoU matching and duplicate false positives. Default cadence = max(100, images/iteration), gated by burn-in, plus final iteration; `-map_every N` overrides cadence. `-thresh` default .005, `-iou_thresh` default .5, NMS .45, resize-exact or configured letter_box. Preflight valid list/labels/classes/names; enabled in `tools/train_legogears_oxide.sh`. Unit tests cover AP, cadence/final, all-images-once and current-weight snapshot without training.
+- [~] `*_best.weights` saved on best/tied mAP (including first zero result, C++ >= policy); periodic `<name>_<iter>.weights`, `_last.weights` and `-save_every N` cadence (default 1000) added 2026-10-01 in both CPU and GTX loops (`TrainingLossLog::save_last`).
+- [x] `<name>_map.csv` appends iteration/seen/IoU/threshold/mAP/best mAP; `<name>_loss.csv` (iteration,seen,loss,avg_loss,learning_rate,milliseconds) and `chart.png` (loss + mAP curves, built-in 5x7 bitmap tick labels) added 2026-10-01 (`crates/darknet-core/src/chart.rs`, `TrainingLossLog`).
+- [x] Resume from `.weights` incl. `seen` and iteration (already present) plus Adam step/moments: `GpuExecutableNetwork::{save,load}_optimizer_state` sidecar (`<name>_optimizer.state`, magic `DNOPT1`, per-owner weights/biases/scales moments + step); the `.weights` format stays C++-compatible. CLI loads it when not `-clear` and saves it with every periodic/final checkpoint. Test `optimizer_state_round_trips_adam_moments`.
+- [x] Console output parity: `TrainingProgress::print` emits `loss`, `avg loss`, `rate`, `train ms`, `images`, `time remaining` in the C++ field order; `<name>_map.csv` line `iteration: mAP@iou = x%, best = y%` matches the C++ format (`main.rs`).
+- [x] `-clear`, `-dont_show`, `-gpus` handled explicitly (see Startup); only device 0 on oxide supported, others rejected. `-map` is now implemented and enabled by the training script.
+
+### C. Training coverage gaps (not hit by LegoGears_v2, needed for other cfgs)
+- [ ] connected / sam / recurrent backward on device (needs device connected params; today CPU fallback)
+- [ ] Adam with host-fallback layers (today returns an error)
+- [ ] weighted shortcut fwd+bwd (`weights_type`, `weights_normalization`), `maxpool_zero_nonmax`, `reverse` conv, `deform`; adversarial yolo branch (left by design, see Final status)
+- [ ] Dynamic loss scale (halve on overflow / grow after N good steps) + skip whole step on overflow (today only non-finite elements are zeroed)
+- [ ] End-to-end `subdivisions>1` check of the pending-gradient flush (kernel-level tested only)
+- [ ] AMP: Adam path and dropout/dropblock nets verified under AMP (only SGD exercised)
+
+### D. Validation (needs user OK, no runs for debugging)
+- [ ] Real convergence run on LegoGears_v2 with oxide f32 (then AMP): loss curve + final mAP vs C++ CUDA from the same init weights, same schedule; acceptance = mAP within run noise (~0.5 mAP). Only after A (augmentation) is in, otherwise the comparison is not like for like
+- [ ] Short interleaved A/B of step time incl. data loading (augmentation on) vs C++
+- [ ] Record results in docs/OXIDE_BENCH.md (git add -f) and a Review line here
+
+### Suggested order
+A (diff + flip/crop/HSV + mixup/multi-scale done, mosaic deferred) -> B (best weights + mAP + saver/CSV/chart/resume done) -> D (convergence run, user approves) -> C only for cfgs the user actually trains.
+
+## C++ parity gap summary (2026-10-01)
+Inference on LegoGears_v2 = DONE (155/155 dets, max score diff 4.5e-4, mAP 99.6685% vs 99.67%, ~2.2 ms vs ~5 ms C++). Training parity is partial. Everything below is open (items already listed above in P8/P9 are cross-referenced, not new).
+
+### Open, by priority (suggested order: A -> B -> D -> C only for cfgs actually trained)
+- A. Data pipeline: mixup + multi-scale `random=1` implemented 2026-10-01 (see A above); mosaic/cutmix (22 / 4 scanned cfgs; LegoGears_v2 none) deferred (needs crop-geometry refactor); blur/noise/fog rejected explicitly; background loader threads + prefetch and resume data-order replay still open; RNG not C++ bit-identical.
+- B. Training loop: `-map` + best weights + mAP CSV + `_last.weights`/`-save_every` + loss/lr CSV + chart.png + full Adam resume sidecar + C++-compatible console output all implemented 2026-10-01 (B above).
+- C. Coverage: connected/sam/recurrent backward on device (CPU fallback today); Adam with host-fallback layers (errors); weighted shortcut, `maxpool_zero_nonmax`, `reverse`/`deform` conv, adversarial yolo; dynamic loss scale + skip-step on overflow; end-to-end `subdivisions>1`; AMP with Adam/dropout/dropblock.
+- D. Validation (needs user OK, no runs for debugging): convergence run oxide f32 then AMP vs C++ from same init (mAP within ~0.5); step-time A/B incl. data loading; record in docs/OXIDE_BENCH.md (git add -f).
+- Perf: CUDA graph capture (cuda-core 0.3.1 lacks instantiate/launch), implicit-GEMM conv, f32 conv epilogue fusion.
+- BLOCKED (hardware, sm_89): wgmma (sm_90), tcgen05 (sm_100), multi-GPU, NVFP4.
+
+### Not implemented by design / no scanned cfg needs it
+- Activations without kernels: loggy, elu, selu, gelu, hard_mish, hardtan, lhtan, plse, stair, relie, normalize_channels*.
+- xnor (74 layers), share_index (54), `new_coords=1` yolo (path looks wrong), antialiasing, conv grad clamps/`try_fix_nan` clamps, rewritten_bbox/total_bbox logging.
+
+### Known small diffs vs C++
+- CPU resize uses `image` Triangle (differs for non-network-size inputs); EXIF orientation ignored.
+- Dilated conv: oxide needs `pad*dilation` (only resnet152_trident); darknet-core output dims ignore dilation.
+- relu/relu6 NaN -> 0 on oxide (C++ NaN); mish/swish at -inf -> NaN.
+- C++ CUDA reference runs cudnn_half=1, so layer dumps differ from pure fp32 by up to 5.7e-3 abs (not an oxide error).

@@ -1196,14 +1196,46 @@ fn load_training_batch_impl(
         let image = PlanarRgbImage::load(image_path)?;
         let labels = load_yolo_labels(&label_path, data.classes)?;
         let (prepared, labels) = match augmentation {
-            Some((options, seed, sample_start)) => options.apply(
-                &image,
-                &labels,
-                width,
-                height,
-                seed,
-                sample_start.wrapping_add(batch_index as u64),
-            )?,
+            Some((options, seed, sample_start)) => {
+                let (primary, primary_labels) = options.apply(
+                    &image,
+                    &labels,
+                    width,
+                    height,
+                    seed,
+                    sample_start.wrapping_add(batch_index as u64),
+                )?;
+                if options.mixup && crate::augmentation::mixup_active(seed, sample_start) {
+                    let mix_path =
+                        &image_paths[(start_index + batch_index + batch_size) % image_paths.len()];
+                    let mix_label_path = replace_image_to_label(mix_path);
+                    if !mix_label_path.exists() {
+                        return Err(Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("missing label file {}", mix_label_path.display()),
+                        )));
+                    }
+                    let mix_image = PlanarRgbImage::load(mix_path)?;
+                    let mix_labels = load_yolo_labels(&mix_label_path, data.classes)?;
+                    let (mix_prepared, mix_labels) = options.apply(
+                        &mix_image,
+                        &mix_labels,
+                        width,
+                        height,
+                        seed,
+                        sample_start.wrapping_add((batch_size + batch_index) as u64),
+                    )?;
+                    crate::augmentation::blend_mixup(
+                        &primary,
+                        &primary_labels,
+                        &mix_prepared,
+                        &mix_labels,
+                        options.max_boxes,
+                    )?
+                } else {
+                    (primary, primary_labels)
+                }
+            }
             None => (image.resize(width, height)?, labels),
         };
         if prepared.shape.channels != channels {

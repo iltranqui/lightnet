@@ -13,6 +13,8 @@
 pub mod augmentation;
 pub use augmentation::DetectorAugmentation;
 pub mod cfg;
+pub mod chart;
+pub use chart::{ChartPoint, write_training_chart};
 pub mod detect;
 pub mod error;
 pub mod evaluate;

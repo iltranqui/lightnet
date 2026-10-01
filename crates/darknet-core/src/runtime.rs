@@ -19,7 +19,7 @@
 
 use std::cell::RefCell;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use crate::error::{Error, Result};
@@ -2787,6 +2787,153 @@ where
     /// part of the weights file and restart from zero.
     pub fn set_adam_step(&mut self, step: u32) {
         self.adam_step = step;
+    }
+
+    /// Persist the Adam step counter and per-owner moment tensors to a sidecar
+    /// file.  The `.weights` format stays C++-compatible and carries only
+    /// parameters plus `seen`; resuming Adam from it would restart the moments,
+    /// so training uses this sidecar to continue the optimizer exactly.
+    pub fn save_optimizer_state(&self, path: impl AsRef<Path>) -> Result<()> {
+        let mut file = File::create(path)?;
+        file.write_all(b"DNOPT1\0\0")?;
+        file.write_all(&self.adam_step.to_le_bytes())?;
+        let entries: Vec<usize> = self
+            .adam_state
+            .iter()
+            .enumerate()
+            .filter_map(|(index, state)| state.as_ref().map(|_| index))
+            .collect();
+        file.write_all(&(entries.len() as u64).to_le_bytes())?;
+        for index in entries {
+            file.write_all(&(index as u64).to_le_bytes())?;
+            let state = self.adam_state[index]
+                .as_ref()
+                .expect("filtered to Some above");
+            let (weight_shape, filter_shape) = self.adam_parameter_shapes(index)?;
+            self.write_moments(&mut file, state.weights.as_ref(), &weight_shape)?;
+            self.write_moments(&mut file, state.biases.as_ref(), &filter_shape)?;
+            self.write_moments(&mut file, state.scales.as_ref(), &filter_shape)?;
+        }
+        file.flush()?;
+        Ok(())
+    }
+
+    /// Restore state written by [`Self::save_optimizer_state`].  Layers absent
+    /// from the sidecar keep `None` moments (Adam will initialise them on the
+    /// next step), and the step counter is restored as stored.
+    pub fn load_optimizer_state(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        let mut file = File::open(path)?;
+        let mut magic = [0u8; 8];
+        file.read_exact(&mut magic)?;
+        if &magic != b"DNOPT1\0\0" {
+            return Err(Error::Weights("bad optimizer state magic".to_owned()));
+        }
+        let mut buf4 = [0u8; 4];
+        file.read_exact(&mut buf4)?;
+        let step = u32::from_le_bytes(buf4);
+        let mut buf8 = [0u8; 8];
+        file.read_exact(&mut buf8)?;
+        let count = u64::from_le_bytes(buf8) as usize;
+        let mut state: Vec<Option<GpuAdamLayerState<B::Tensor>>> =
+            (0..self.network.layers.len()).map(|_| None).collect();
+        for _ in 0..count {
+            file.read_exact(&mut buf8)?;
+            let index = u64::from_le_bytes(buf8) as usize;
+            if index >= self.network.layers.len() {
+                return Err(Error::Weights(
+                    "optimizer state layer index out of range".to_owned(),
+                ));
+            }
+            let (weight_shape, filter_shape) = self.adam_parameter_shapes(index)?;
+            let weights = self.read_moments(&mut file, &weight_shape)?;
+            let biases = self.read_moments(&mut file, &filter_shape)?;
+            let scales = self.read_moments(&mut file, &filter_shape)?;
+            state[index] = Some(GpuAdamLayerState {
+                weights,
+                biases,
+                scales,
+            });
+        }
+        self.adam_state = state;
+        self.adam_step = step;
+        Ok(())
+    }
+
+    fn adam_parameter_shapes(&self, index: usize) -> Result<(Vec<usize>, Vec<usize>)> {
+        let layer = &self.network.layers[index];
+        let LayerKind::Convolutional(spec) = &layer.kind else {
+            return Err(Error::Weights(format!(
+                "optimizer state for non-convolutional layer #{index}"
+            )));
+        };
+        let grouped = layer.input_shape.channels / spec.groups.max(1);
+        Ok((
+            vec![spec.filters, grouped, spec.size, spec.size],
+            vec![spec.filters],
+        ))
+    }
+
+    fn write_moments(
+        &self,
+        file: &mut File,
+        moments: Option<&GpuMoments<B::Tensor>>,
+        shape: &[usize],
+    ) -> Result<()> {
+        match moments {
+            None => {
+                file.write_all(&[0u8])?;
+                Ok(())
+            }
+            Some((first, second)) => {
+                file.write_all(&[1u8])?;
+                for tensor in [first, second] {
+                    let values = self
+                        .backend
+                        .download_f32(tensor)
+                        .map_err(|err| backend_error("download Adam moment", err))?;
+                    if values.len() != shape.iter().product::<usize>() {
+                        return Err(Error::Weights(
+                            "Adam moment length does not match its parameter shape".to_owned(),
+                        ));
+                    }
+                    for value in values {
+                        file.write_all(&value.to_le_bytes())?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn read_moments(
+        &self,
+        file: &mut File,
+        shape: &[usize],
+    ) -> Result<Option<GpuMoments<B::Tensor>>> {
+        let mut flag = [0u8; 1];
+        file.read_exact(&mut flag)?;
+        if flag[0] == 0 {
+            return Ok(None);
+        }
+        let len = shape.iter().product::<usize>();
+        let mut first = vec![0f32; len];
+        let mut second = vec![0f32; len];
+        for buffer in [&mut first, &mut second] {
+            let mut bytes = vec![0u8; len * 4];
+            file.read_exact(&mut bytes)?;
+            for (slot, chunk) in buffer.iter_mut().zip(bytes.chunks_exact(4)) {
+                *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            }
+        }
+        let first = self
+            .backend
+            .upload_f32(shape, &first)
+            .map_err(|err| backend_error("upload Adam moment", err))?;
+        let second = self
+            .backend
+            .upload_f32(shape, &second)
+            .map_err(|err| backend_error("upload Adam moment", err))?;
+        Ok(Some((first, second)))
     }
 
     /// The tensor backend (for benchmark statistics such as workspace size).
@@ -16401,6 +16548,57 @@ mod tests {
         assert!(w.iter().chain(&b).all(|x| x.is_finite()));
         let train = gpu.device_train_buffers.borrow()[1].clone().expect("train");
         assert!(train.weight_updates.data.iter().chain(&train.bias_updates.data).all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn optimizer_state_round_trips_adam_moments() {
+        let dir = std::env::temp_dir().join(format!("darknet-opt-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("opt.state");
+
+        let step = |gpu: &mut GpuExecutableNetwork<FakeBackend>, s: usize| {
+            let input = patterned_input(gpu.network.net.input_shape());
+            let forward = gpu.forward_training_with_state(&input).expect("forward");
+            let seeds = optimizer_seeds(gpu, s);
+            gpu.backward_accumulate_seeded_gpu(&forward, &seeds)
+                .expect("backward");
+            gpu.update_weights_gpu(0.01, 0.9, 0.0, 2).expect("update");
+        };
+
+        let mut original = optimizer_net("adam=1\nloss_scale=1\n");
+        step(&mut original, 1);
+        step(&mut original, 2);
+        let weights_path = dir.join("model.weights");
+        crate::weights::save_weights(&original.network, &original.params, &weights_path, 2)
+            .expect("save weights");
+        original.save_optimizer_state(&path).expect("save");
+        assert_eq!(original.adam_step(), 2);
+
+        // Resume into a fresh network: restore parameters from the weights file
+        // and moments/step from the sidecar.
+        let mut resumed = optimizer_net("adam=1\nloss_scale=1\n");
+        resumed.load_weights_file(&weights_path).expect("load weights");
+        resumed.load_optimizer_state(&path).expect("load");
+        assert_eq!(resumed.adam_step(), 2);
+        let path2 = dir.join("opt2.state");
+        resumed.save_optimizer_state(&path2).expect("resave");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            std::fs::read(&path2).unwrap(),
+            "optimizer state round-trip changed bytes"
+        );
+
+        // The next step must match, which only holds if the moments were restored.
+        step(&mut original, 3);
+        step(&mut resumed, 3);
+        for layer in 0..2 {
+            let (w0, b0, s0) = host_params(&original, layer);
+            let (w1, b1, s1) = host_params(&resumed, layer);
+            assert_slice_close("weights", &w0, &w1, 1e-6);
+            assert_slice_close("biases", &b0, &b1, 1e-6);
+            assert_slice_close("scales", &s0, &s1, 1e-6);
+        }
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

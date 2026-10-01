@@ -896,6 +896,8 @@ struct TrainOptions {
     map_every: Option<usize>,
     map_thresh: f32,
     map_iou: f32,
+    /// Iterations between periodic checkpoints. Also controls `<name>_last.weights`.
+    save_every: usize,
 }
 
 impl TrainOptions {
@@ -914,6 +916,7 @@ impl TrainOptions {
             map_every: None,
             map_thresh: 0.005,
             map_iou: 0.5,
+            save_every: 1000,
         };
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -934,6 +937,16 @@ impl TrainOptions {
                     options.gpu = true;
                 }
                 "-map" => options.map = true,
+                "-save_every" | "--save_every" => {
+                    let value = required_arg(args.next(), "save interval")?;
+                    let interval = value
+                        .parse::<usize>()
+                        .map_err(|_| "invalid -save_every interval")?;
+                    if interval == 0 {
+                        return Err("-save_every must be positive".into());
+                    }
+                    options.save_every = interval;
+                }
                 "-map_every" => {
                     let value = required_arg(args.next(), "validation interval")?;
                     let interval = value
@@ -1232,6 +1245,82 @@ impl TrainingValidation {
     }
 }
 
+/// Appends `<name>_loss.csv` and keeps the points needed for `chart.png`.
+struct TrainingLossLog {
+    log: fs::File,
+    chart_path: PathBuf,
+    points: Vec<darknet_core::ChartPoint>,
+}
+
+impl TrainingLossLog {
+    fn new(backup: &Path, name: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(backup.join(format!("{name}_loss.csv")))?;
+        if log.metadata()?.len() == 0 {
+            writeln!(log, "iteration,seen,loss,avg_loss,learning_rate,milliseconds")?;
+        }
+        Ok(Self {
+            log,
+            chart_path: backup.join("chart.png"),
+            points: Vec::new(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &mut self,
+        iteration: usize,
+        seen: u64,
+        loss: f32,
+        avg_loss: f32,
+        learning_rate: f32,
+        milliseconds: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        writeln!(
+            self.log,
+            "{iteration},{seen},{loss:.6},{avg_loss:.6},{learning_rate:.8},{milliseconds:.3}"
+        )?;
+        self.log.flush()?;
+        let map = self.points.last().and_then(|point| point.map);
+        self.points.push(darknet_core::ChartPoint {
+            iteration,
+            avg_loss,
+            map,
+        });
+        Ok(())
+    }
+
+    /// Attach the mAP measured for the most recent iteration to its chart point.
+    fn set_map(&mut self, map: f64) {
+        if let Some(point) = self.points.last_mut() {
+            point.map = Some(map);
+        }
+    }
+
+    fn write_chart(&self) -> Result<(), Box<dyn std::error::Error>> {
+        darknet_core::write_training_chart(&self.chart_path, &self.points)?;
+        Ok(())
+    }
+
+    /// Persist `_last.weights` (and the chart) after a periodic save.
+    fn save_last(
+        &self,
+        network: &Network,
+        params: &[LayerParams],
+        backup: &Path,
+        name: &str,
+        seen: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let last = backup.join(format!("{name}_last.weights"));
+        save_weights(network, params, &last, seen)?;
+        println!("saved {}", last.display());
+        self.write_chart()?;
+        Ok(())
+    }
+}
+
 fn run_detector_train_cpu(
     cfg: &str,
     data: &str,
@@ -1305,9 +1394,27 @@ fn run_detector_train_cpu(
     } else {
         (batch_num * images_per_iteration) % train_images.len()
     };
+    let mut loss_log = TrainingLossLog::new(&backup_dir, &base_name)?;
+
+    let base_width = executable.network.net.width;
+    let base_height = executable.network.net.height;
+    let mut multi_scale_count = 0usize;
 
     while executable.network.net.max_batches == 0 || batch_num < executable.network.net.max_batches
     {
+        if augmentation.random > 0.0 && multi_scale_count % 10 == 0 {
+            let (dim_w, dim_h) = augmentation.multi_scale_dimensions(
+                base_width,
+                base_height,
+                options.seed,
+                batch_num,
+                executable.network.net.max_batches,
+            );
+            if dim_w != executable.network.net.width || dim_h != executable.network.net.height {
+                executable.network = executable.network.with_input_size(dim_w, dim_h)?;
+            }
+        }
+        multi_scale_count += 1;
         let iteration_start = Instant::now();
         let lr = compute_learning_rate(&executable.network.net, batch_num);
         executable.set_train_iteration(batch_num);
@@ -1364,6 +1471,14 @@ fn run_detector_train_cpu(
             executable.network.net.max_batches,
             iteration_start.elapsed(),
         );
+        loss_log.record(
+            batch_num,
+            seen,
+            loss,
+            progress.avg_loss.unwrap_or(loss),
+            lr,
+            iteration_start.elapsed().as_secs_f64() * 1000.0,
+        )?;
 
         if let Some(validation) = &mut validation {
             if validation
@@ -1384,6 +1499,7 @@ fn run_detector_train_cpu(
                     validation.iou_threshold,
                     |input| Ok(inference.forward(input)?.yolo_heads),
                 )?;
+                loss_log.set_map(report.mean_average_precision);
                 if validation.record(&report, batch_num, seen)? {
                     let checkpoint = backup_dir.join(format!("{base_name}_best.weights"));
                     save_weights(&executable.network, &executable.params, &checkpoint, seen)?;
@@ -1392,10 +1508,17 @@ fn run_detector_train_cpu(
             }
         }
 
-        if batch_num % 1000 == 0 {
+        if options.save_every != 0 && batch_num % options.save_every == 0 {
             let checkpoint = backup_dir.join(format!("{base_name}_{batch_num}.weights"));
             save_weights(&executable.network, &executable.params, &checkpoint, seen)?;
             println!("saved {}", checkpoint.display());
+            loss_log.save_last(
+                &executable.network,
+                &executable.params,
+                &backup_dir,
+                &base_name,
+                seen,
+            )?;
         }
 
         if executable.network.net.max_batches != 0
@@ -1413,6 +1536,13 @@ fn run_detector_train_cpu(
         seen,
     )?;
     println!("saved {}", final_checkpoint.display());
+    loss_log.save_last(
+        &executable.network,
+        &executable.params,
+        &backup_dir,
+        &base_name,
+        seen,
+    )?;
     Ok(())
 }
 
@@ -1470,6 +1600,15 @@ fn run_detector_train_gpu(
         .unwrap_or_else(|| PathBuf::from("."));
     fs::create_dir_all(&backup_dir)?;
     let base_name = cfg_base_name(cfg);
+    let optimizer_state_path = backup_dir.join(format!("{base_name}_optimizer.state"));
+    if !options.clear && optimizer_state_path.exists() {
+        executable.load_optimizer_state(&optimizer_state_path)?;
+        println!(
+            "resumed optimizer state (Adam step {}) from {}",
+            executable.adam_step(),
+            optimizer_state_path.display()
+        );
+    }
     let images_per_iteration =
         executable.network.net.batch.max(1) * executable.network.net.subdivisions.max(1);
     let mut batch_num = if images_per_iteration == 0 {
@@ -1495,9 +1634,27 @@ fn run_detector_train_gpu(
     } else {
         (batch_num * images_per_iteration) % train_images.len()
     };
+    let mut loss_log = TrainingLossLog::new(&backup_dir, &base_name)?;
+
+    let base_width = executable.network.net.width;
+    let base_height = executable.network.net.height;
+    let mut multi_scale_count = 0usize;
 
     while executable.network.net.max_batches == 0 || batch_num < executable.network.net.max_batches
     {
+        if augmentation.random > 0.0 && multi_scale_count % 10 == 0 {
+            let (dim_w, dim_h) = augmentation.multi_scale_dimensions(
+                base_width,
+                base_height,
+                options.seed,
+                batch_num,
+                executable.network.net.max_batches,
+            );
+            if dim_w != executable.network.net.width || dim_h != executable.network.net.height {
+                executable.network = executable.network.with_input_size(dim_w, dim_h)?;
+            }
+        }
+        multi_scale_count += 1;
         let iteration_start = Instant::now();
         let lr = compute_learning_rate(&executable.network.net, batch_num);
         executable.set_train_iteration(batch_num);
@@ -1555,6 +1712,14 @@ fn run_detector_train_gpu(
             executable.network.net.max_batches,
             iteration_start.elapsed(),
         );
+        loss_log.record(
+            batch_num,
+            seen,
+            loss,
+            progress.avg_loss.unwrap_or(loss),
+            lr,
+            iteration_start.elapsed().as_secs_f64() * 1000.0,
+        )?;
 
         if let Some(validation) = &mut validation {
             if validation
@@ -1579,6 +1744,7 @@ fn run_detector_train_gpu(
                     validation.iou_threshold,
                     |input| Ok(inference.forward_compact(input)?.yolo_heads),
                 )?;
+                loss_log.set_map(report.mean_average_precision);
                 if validation.record(&report, batch_num, seen)? {
                     let checkpoint = backup_dir.join(format!("{base_name}_best.weights"));
                     save_weights(&executable.network, &executable.params, &checkpoint, seen)?;
@@ -1587,11 +1753,19 @@ fn run_detector_train_gpu(
             }
         }
 
-        if batch_num % 1000 == 0 {
+        if options.save_every != 0 && batch_num % options.save_every == 0 {
             let checkpoint = backup_dir.join(format!("{base_name}_{batch_num}.weights"));
             executable.sync_host_weights_from_device()?;
             save_weights(&executable.network, &executable.params, &checkpoint, seen)?;
             println!("saved {}", checkpoint.display());
+            loss_log.save_last(
+                &executable.network,
+                &executable.params,
+                &backup_dir,
+                &base_name,
+                seen,
+            )?;
+            executable.save_optimizer_state(&optimizer_state_path)?;
         }
 
         if executable.network.net.max_batches != 0
@@ -1610,6 +1784,14 @@ fn run_detector_train_gpu(
         seen,
     )?;
     println!("saved {}", final_checkpoint.display());
+    loss_log.save_last(
+        &executable.network,
+        &executable.params,
+        &backup_dir,
+        &base_name,
+        seen,
+    )?;
+    executable.save_optimizer_state(&optimizer_state_path)?;
     Ok(())
 }
 
@@ -1820,6 +2002,7 @@ mod tests {
                 map_every: None,
                 map_thresh: 0.005,
                 map_iou: 0.5,
+                save_every: 1000,
             }
         );
         assert_eq!(options(&[]).unwrap().seed, 0);
@@ -1878,6 +2061,16 @@ mod tests {
         ] {
             assert!(options(&args).is_err(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn save_every_parses_and_rejects_zero() {
+        assert_eq!(options(&[]).unwrap().save_every, 1000);
+        let parsed = options(&["model.weights", "-save_every", "250"]).unwrap();
+        assert_eq!(parsed.save_every, 250);
+        assert_eq!(parsed.weights.as_deref(), Some("model.weights"));
+        assert!(options(&["-save_every", "0"]).is_err());
+        assert!(options(&["-save_every"]).is_err());
     }
 
     #[test]

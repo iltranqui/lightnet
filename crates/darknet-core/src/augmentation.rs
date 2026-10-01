@@ -11,6 +11,14 @@ pub struct DetectorAugmentation {
     pub saturation: f32,
     pub exposure: f32,
     pub max_boxes: usize,
+    /// C++ `[net] mixup`: blend two independently augmented samples 50/50
+    /// and concatenate their truth lists (mode 1). Cutmix (2/4) is rejected by
+    /// the C++ detector loader and mosaic (3) is not implemented here yet.
+    pub mixup: bool,
+    /// Max `random` across detector heads (`0` disables multi-scale).
+    pub random: f32,
+    /// C++ `[net] resize_step`; multi-scale dimensions are rounded to it.
+    pub resize_step: usize,
 }
 
 impl DetectorAugmentation {
@@ -24,29 +32,17 @@ impl DetectorAugmentation {
             .rev()
             .find(|s| matches!(s.name.as_str(), "yolo" | "gaussian_yolo" | "region"))
             .ok_or_else(|| invalid("detector augmentation requires a detector head"))?;
-        for key in [
-            "mixup",
-            "mosaic",
-            "cutmix",
-            "blur",
-            "gaussian_noise",
-            "fog",
-            "track",
-            "contrastive",
-        ] {
+        for key in ["mosaic", "cutmix", "blur", "gaussian_noise", "fog", "track", "contrastive"] {
             if net.get_f32(key, 0.0)? != 0.0 {
                 return Err(invalid(&format!(
                     "training augmentation {key} is not implemented yet"
                 )));
             }
         }
+        let mut random = 0.0f32;
         for section in &cfg.sections {
-            if matches!(section.name.as_str(), "yolo" | "gaussian_yolo" | "region")
-                && section.get_f32("random", 0.0)? != 0.0
-            {
-                return Err(invalid(
-                    "random multi-scale training is not implemented yet",
-                ));
+            if matches!(section.name.as_str(), "yolo" | "gaussian_yolo" | "region") {
+                random = random.max(section.get_f32("random", 0.0)?);
             }
         }
         let options = Self {
@@ -58,6 +54,9 @@ impl DetectorAugmentation {
             saturation: net.get_f32("saturation", 1.0)?,
             exposure: net.get_f32("exposure", 1.0)?,
             max_boxes: head.get_usize("max", 200)?,
+            mixup: net.get_f32("mixup", 0.0)? != 0.0,
+            random,
+            resize_step: net.get_usize("resize_step", 32)?,
         };
         options.validate()?;
         Ok(options)
@@ -75,12 +74,56 @@ impl DetectorAugmentation {
             || !self.exposure.is_finite()
             || self.exposure <= 0.0
             || self.max_boxes == 0
+            || !self.random.is_finite()
+            || self.random < 0.0
+            || self.resize_step == 0
         {
             return Err(invalid(
                 "invalid jitter/resize/hue/saturation/exposure/max augmentation settings",
             ));
         }
         Ok(())
+    }
+
+    /// C++ `train_detector` multi-scale: every 10 iterations pick a new size
+    /// derived from `rand_scale(random)` rounded to `resize_step`.  The first
+    /// iteration and the last 100 iterations use the maximum size so rolling
+    /// statistics are measured on a consistent shape.
+    pub fn multi_scale_dimensions(
+        &self,
+        base_width: usize,
+        base_height: usize,
+        seed: u64,
+        iteration: usize,
+        max_batches: usize,
+    ) -> (usize, usize) {
+        if self.random <= 0.0 {
+            return (base_width, base_height);
+        }
+        let rand_coef = if self.random != 1.0 { self.random } else { 1.4 };
+        let step = self.resize_step.max(1);
+        let mut rng = Rng(seed ^ (iteration as u64).wrapping_mul(0x9e3779b97f4a7c15));
+        let random_val = rng.scale(rand_coef);
+        let dim = |base: usize| -> i64 {
+            (random_val * base as f32 / step as f32 + 1.0).round() as i64 * step as i64
+        };
+        let mut dim_w = dim(base_width);
+        let mut dim_h = dim(base_height);
+        if random_val < 1.0 && (dim_w > base_width as i64 || dim_h > base_height as i64) {
+            dim_w = base_width as i64;
+            dim_h = base_height as i64;
+        }
+        let max_dim = |base: usize| -> i64 {
+            (rand_coef * base as f32 / step as f32 + 1.0).round() as i64 * step as i64
+        };
+        if iteration == 0 || (max_batches != 0 && iteration > max_batches.saturating_sub(100)) {
+            dim_w = max_dim(base_width);
+            dim_h = max_dim(base_height);
+        }
+        (
+            dim_w.max(step as i64).max(1) as usize,
+            dim_h.max(step as i64).max(1) as usize,
+        )
     }
 
     /// Independent random stream keyed by seed and absolute sample ordinal.
@@ -186,6 +229,48 @@ impl DetectorAugmentation {
 
 fn invalid(message: &str) -> Error {
     Error::InvalidConfig(message.into())
+}
+
+/// True when this batch should use mixup.  C++ samples `rand_bool()` once per
+/// `load_data_detection` call and disables mixing for the whole batch 50% of
+/// the time.
+pub fn mixup_active(seed: u64, sample_start: u64) -> bool {
+    let mut rng = Rng(seed ^ sample_start.wrapping_mul(0x9e3779b97f4a7c15));
+    rng.unit() >= 0.5
+}
+
+/// C++ `blend_images_cv(a, 0.5, b, 0.5)` + `blend_truth`: 50/50 pixel blend
+/// and append the second truth list after the first, capped at `max_boxes`.
+pub fn blend_mixup(
+    first: &PlanarRgbImage,
+    first_labels: &[YoloLabel],
+    second: &PlanarRgbImage,
+    second_labels: &[YoloLabel],
+    max_boxes: usize,
+) -> Result<(PlanarRgbImage, Vec<YoloLabel>)> {
+    if first.shape.width != second.shape.width
+        || first.shape.height != second.shape.height
+        || first.shape.channels != second.shape.channels
+    {
+        return Err(invalid("mixup requires equal-shaped augmented images"));
+    }
+    let a = first.to_rgb8()?;
+    let b = second.to_rgb8()?;
+    let mut out = vec![0u8; a.as_raw().len()];
+    for ((dst, x), y) in out.iter_mut().zip(a.as_raw()).zip(b.as_raw()) {
+        *dst = ((*x as u32 + *y as u32 + 1) / 2) as u8;
+    }
+    let mut labels = first_labels.to_vec();
+    for label in second_labels {
+        if labels.len() >= max_boxes {
+            break;
+        }
+        labels.push(label.clone());
+    }
+    Ok((
+        PlanarRgbImage::from_interleaved_rgb_u8(first.shape.width, first.shape.height, &out)?,
+        labels,
+    ))
 }
 fn precalc(min: i32, max: i32, unit: f32) -> i32 {
     (unit * (max as f32 - min as f32) + min as f32) as i32
@@ -552,13 +637,53 @@ mod tests {
     }
 
     #[test]
+    fn multi_scale_dimensions_follow_cpp_rounding_and_clamps() {
+        let opts = settings("");
+        assert_eq!(opts.random, 0.0);
+        assert_eq!(opts.multi_scale_dimensions(416, 416, 0, 1, 1000), (416, 416));
+        let cfg = ConfigFile::parse_str("aug.cfg", "[net]\n[yolo]\nrandom=1\n").unwrap();
+        let opts = DetectorAugmentation::from_config(&cfg).unwrap();
+        assert_eq!(opts.resize_step, 32);
+        // rand_coef 1.4 -> round(1.4*416/32 + 1)*32 = 19*32.
+        assert_eq!(opts.multi_scale_dimensions(416, 416, 0, 0, 1000), (608, 608));
+        let (w, h) = opts.multi_scale_dimensions(416, 416, 0, 10, 1000);
+        assert!(w % 32 == 0 && h % 32 == 0 && w >= 32 && h >= 32);
+    }
+
+    #[test]
+    fn mixup_blends_pixels_and_appends_labels() {
+        let a = PlanarRgbImage::from_interleaved_rgb_u8(2, 1, &[10, 20, 30, 40, 50, 60]).unwrap();
+        let b = PlanarRgbImage::from_interleaved_rgb_u8(2, 1, &[30, 40, 50, 60, 70, 80]).unwrap();
+        let la = vec![YoloLabel {
+            class_id: 0,
+            x: 0.25,
+            y: 0.5,
+            w: 0.5,
+            h: 1.0,
+        }];
+        let lb = vec![YoloLabel {
+            class_id: 1,
+            x: 0.75,
+            y: 0.5,
+            w: 0.5,
+            h: 1.0,
+        }];
+        let (blended, labels) = blend_mixup(&a, &la, &b, &lb, 200).unwrap();
+        assert_eq!(blended.data.len(), a.data.len());
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0].class_id, 0);
+        assert_eq!(labels[1].class_id, 1);
+        let (_, capped) = blend_mixup(&a, &la, &b, &lb, 1).unwrap();
+        assert_eq!(capped.len(), 1);
+    }
+
+    #[test]
     fn parser_defaults_and_unsupported_active_options() {
         let opts = settings("");
         assert!(opts.flip);
         assert_eq!(opts.max_boxes, 200);
         for key in [
             "mosaic",
-            "mixup",
             "cutmix",
             "blur",
             "gaussian_noise",
@@ -570,12 +695,16 @@ mod tests {
                 ConfigFile::parse_str("aug.cfg", &format!("[net]\n{key}=1\n[yolo]\n")).unwrap();
             assert!(DetectorAugmentation::from_config(&cfg).is_err());
         }
+        let mixup =
+            ConfigFile::parse_str("aug.cfg", "[net]\nmixup=1\n[yolo]\n").unwrap();
+        assert!(DetectorAugmentation::from_config(&mixup).unwrap().mixup);
         for invalid in ["hue=NaN", "saturation=0", "exposure=inf"] {
             let cfg =
                 ConfigFile::parse_str("aug.cfg", &format!("[net]\n{invalid}\n[yolo]\n")).unwrap();
             assert!(DetectorAugmentation::from_config(&cfg).is_err());
         }
         let cfg = ConfigFile::parse_str("aug.cfg", "[net]\n[yolo]\nrandom=1\n").unwrap();
-        assert!(DetectorAugmentation::from_config(&cfg).is_err());
+        let opts = DetectorAugmentation::from_config(&cfg).unwrap();
+        assert_eq!(opts.random, 1.0);
     }
 }

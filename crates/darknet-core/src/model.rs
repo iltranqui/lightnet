@@ -1026,6 +1026,43 @@ impl Network {
         }
         network
     }
+
+    /// Rebuild the graph for a new input resolution (multi-scale `random`).
+    /// Layer shapes are re-inferred in order so route/shortcut references stay
+    /// consistent; layer specs and weights are unchanged.  Connected layers
+    /// whose weight layout depends on the input size are rejected.
+    pub fn with_input_size(&self, width: usize, height: usize) -> Result<Self> {
+        if width == 0 || height == 0 {
+            return Err(Error::InvalidConfig(
+                "network input size must be non-zero".to_owned(),
+            ));
+        }
+        if self
+            .layers
+            .iter()
+            .any(|layer| matches!(layer.kind, LayerKind::Connected(_)))
+        {
+            return Err(Error::InvalidConfig(
+                "multi-scale resizing is not supported for networks with connected layers"
+                    .to_owned(),
+            ));
+        }
+        let mut network = self.clone();
+        network.net.width = width;
+        network.net.height = height;
+        for index in 0..network.layers.len() {
+            let current = if index == 0 {
+                network.net.input_shape()
+            } else {
+                network.layers[index - 1].output_shape
+            };
+            let kind = network.layers[index].kind.clone();
+            let output = infer_output_shape(&kind, index, current, &network.layers[..index])?;
+            network.layers[index].input_shape = current;
+            network.layers[index].output_shape = output;
+        }
+        Ok(network)
+    }
 }
 
 fn parse_layer_kind(
@@ -1694,6 +1731,21 @@ mod tests {
             network.layers.last().map(|layer| &layer.kind),
             Some(LayerKind::Yolo(_))
         ));
+    }
+
+    #[test]
+    fn with_input_size_reinfers_all_layer_shapes() {
+        let network = Network::from_path(repo_cfg("yolov3-tiny.cfg")).expect("cfg should parse");
+        let resized = network.with_input_size(320, 256).expect("resize");
+        assert_eq!(resized.net.width, 320);
+        assert_eq!(resized.net.height, 256);
+        assert_eq!(resized.layers.len(), network.layers.len());
+        let restored = resized
+            .with_input_size(network.net.width, network.net.height)
+            .expect("restore");
+        for (a, b) in restored.layers.iter().zip(&network.layers) {
+            assert_eq!(a.output_shape, b.output_shape);
+        }
     }
 
     #[test]
