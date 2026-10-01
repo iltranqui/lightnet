@@ -110,6 +110,8 @@ pub struct YoloTrainingLoss {
     pub avg_iou: f32,
     /// Number of box-loss assignments (C++ `count`, summed over heads).
     pub box_count: usize,
+    /// Number of class-delta assignments (C++ `class_count`; incremented together with `count`).
+    pub class_count: usize,
 }
 
 /// Per-head box-loss statistics (C++ `tot_iou`, `tot_iou_loss`, `tot_giou_loss`, `count`).
@@ -370,82 +372,58 @@ pub fn compute_yolo_training_loss_with_state(
             }
         }
 
+        // C++ `process_batch` label loop, run per head: the best anchor is searched over ALL
+        // `total` anchors of the layer (every head carries the full list), the primary
+        // assignment happens only when that anchor is in this head's mask, and the
+        // `iou_thresh` extra anchors are taken from this head's mask independently of it.
+        let total_anchors = spec.num.min(spec.anchors.len() / 2);
         for (batch, image_labels) in labels.iter().enumerate() {
             for label in image_labels {
                 let class_id = remap_class_id(spec, label.class_id, head.layer_index)?;
-                let Some((best_head_index, best_anchor_offset, _)) =
-                    best_anchor_assignment(network, &heads, label)?
-                else {
-                    continue;
+                let truth_shift = YoloBox {
+                    x: 0.0,
+                    y: 0.0,
+                    w: label.w,
+                    h: label.h,
                 };
-                if heads[best_head_index].0.layer_index != head.layer_index {
-                    continue;
-                }
+                let best_n = best_anchor_index(
+                    spec,
+                    total_anchors,
+                    network.net.width,
+                    network.net.height,
+                    truth_shift,
+                )?;
 
                 let grid_x = (label.x * grid_width as f32).clamp(0.0, grid_width as f32 - 1.0e-6);
                 let grid_y = (label.y * grid_height as f32).clamp(0.0, grid_height as f32 - 1.0e-6);
                 let col = grid_x.floor() as usize;
                 let row = grid_y.floor() as usize;
-                let channel_base = best_anchor_offset * entries_per_anchor;
-                let anchor = anchor_pair(spec, spec.mask[best_anchor_offset])?;
-                let objectness = yolo_objectness_output(
-                    head.output.get(batch, channel_base + 4, row, col),
-                    spec.new_coords,
-                );
                 let class_scale = spec.iou_normalizer * class_multiplier(spec, class_id);
 
-                stats.add(apply_yolo_box_delta(
-                    &head.output,
-                    seed,
-                    batch,
-                    channel_base,
-                    row,
-                    col,
-                    grid_width,
-                    grid_height,
-                    network.net.width,
-                    network.net.height,
-                    anchor,
-                    bbox_from_label(label),
-                    class_scale,
-                    spec,
-                ));
-                apply_yolo_positive_objectness(
-                    &head.output,
-                    seed,
-                    batch,
-                    channel_base,
-                    row,
-                    col,
-                    objectness,
-                    class_id,
-                    spec,
-                );
-                apply_yolo_class_delta(
-                    &head.output,
-                    seed,
-                    batch,
-                    channel_base + 5,
-                    row,
-                    col,
-                    class_id,
-                    spec,
-                );
-                positive_matches += 1;
+                if let Some(best_offset) = spec.mask.iter().position(|&m| m == best_n) {
+                    assign_yolo_label_to_anchor(
+                        network,
+                        head,
+                        spec,
+                        seed,
+                        stats,
+                        batch,
+                        best_offset,
+                        row,
+                        col,
+                        label,
+                        class_id,
+                        class_scale,
+                    )?;
+                    positive_matches += 1;
+                }
 
                 if spec.iou_thresh < 1.0 {
-                    let truth_shift = YoloBox {
-                        x: 0.0,
-                        y: 0.0,
-                        w: label.w,
-                        h: label.h,
-                    };
-                    let best_mask_index = spec.mask[best_anchor_offset];
-                    for (anchor_offset, &mask_index) in spec.mask.iter().enumerate() {
-                        if mask_index == best_mask_index {
+                    for (anchor_offset, &mask_n) in spec.mask.iter().enumerate() {
+                        if mask_n == best_n {
                             continue;
                         }
-                        let extra_anchor = anchor_pair(spec, mask_index)?;
+                        let extra_anchor = anchor_pair(spec, mask_n)?;
                         let anchor_box = YoloBox {
                             x: 0.0,
                             y: 0.0,
@@ -457,49 +435,20 @@ pub fn compute_yolo_training_loss_with_state(
                         {
                             continue;
                         }
-
-                        let extra_channel_base = anchor_offset * entries_per_anchor;
-                        let extra_objectness = yolo_objectness_output(
-                            head.output.get(batch, extra_channel_base + 4, row, col),
-                            spec.new_coords,
-                        );
-                        stats.add(apply_yolo_box_delta(
-                            &head.output,
+                        assign_yolo_label_to_anchor(
+                            network,
+                            head,
+                            spec,
                             seed,
+                            stats,
                             batch,
-                            extra_channel_base,
+                            anchor_offset,
                             row,
                             col,
-                            grid_width,
-                            grid_height,
-                            network.net.width,
-                            network.net.height,
-                            extra_anchor,
-                            bbox_from_label(label),
+                            label,
+                            class_id,
                             class_scale,
-                            spec,
-                        ));
-                        apply_yolo_positive_objectness(
-                            &head.output,
-                            seed,
-                            batch,
-                            extra_channel_base,
-                            row,
-                            col,
-                            extra_objectness,
-                            class_id,
-                            spec,
-                        );
-                        apply_yolo_class_delta(
-                            &head.output,
-                            seed,
-                            batch,
-                            extra_channel_base + 5,
-                            row,
-                            col,
-                            class_id,
-                            spec,
-                        );
+                        )?;
                         positive_matches += 1;
                     }
                 }
@@ -566,6 +515,18 @@ pub fn compute_yolo_training_loss_with_state(
         0.0
     };
 
+    // C++ `backward_yolo_layer_gpu`: `delta_normalizer` scales the delta only when it is
+    // propagated (after the cost above has been taken from the unscaled delta).
+    for (head, spec) in &heads {
+        if spec.delta_normalizer != 1.0 {
+            if let Some(seed) = seeds[head.layer_index].as_mut() {
+                for delta in &mut seed.data {
+                    *delta *= spec.delta_normalizer;
+                }
+            }
+        }
+    }
+
     Ok(YoloTrainingLoss {
         loss,
         layer_output_gradient_seeds: seeds,
@@ -573,6 +534,7 @@ pub fn compute_yolo_training_loss_with_state(
         ignored_objectness,
         avg_iou,
         box_count,
+        class_count: box_count,
     })
 }
 
@@ -629,13 +591,14 @@ fn apply_yolo_delta_filtering_to_seed(
         .fold(0.0f32, f32::max);
     let cur_avg = nonzero.iter().map(|delta| delta.abs()).sum::<f32>() / nonzero.len() as f32;
 
+    // C++ takes `ep_loss_threshold` from the rolling average BEFORE this step's update.
+    let mut ep_loss_threshold = equidistant_loss_threshold(network, iteration, state);
+
     if state.delta_rolling_max == 0.0 {
         state.delta_rolling_max = cur_max;
     }
     state.delta_rolling_max = state.delta_rolling_max * 0.99 + cur_max * 0.01;
     state.delta_rolling_avg = state.delta_rolling_avg * 0.99 + cur_avg * 0.01;
-
-    let mut ep_loss_threshold = equidistant_loss_threshold(network, iteration, state);
 
     if network.net.num_sigmas_reject_badlabels != 0.0 && start_point < iteration {
         let rolling_std = state.delta_rolling_std;
@@ -671,24 +634,24 @@ fn apply_yolo_delta_filtering_to_seed(
             state.badlabels_reject_threshold = state.delta_rolling_max;
         }
 
+        // C++ has no empty guard: with no nonzero delta left (e.g. all rejected by the sigma
+        // step) `cur_percent` is NaN, `NaN > pct` is false and the threshold decreases.
         let counter_all = seed.data.iter().filter(|delta| **delta != 0.0).count();
         let mut counter_reject = 0usize;
-        if counter_all != 0 {
-            for delta in &mut seed.data {
-                if *delta != 0.0 && delta.abs() > state.badlabels_reject_threshold {
-                    counter_reject += 1;
-                    *delta = 0.0;
-                }
+        for delta in &mut seed.data {
+            if *delta != 0.0 && delta.abs() > state.badlabels_reject_threshold {
+                counter_reject += 1;
+                *delta = 0.0;
             }
+        }
 
-            let num_deltas_per_anchor = spec.classes + 5;
-            let cur_percent =
-                100.0 * (counter_reject * num_deltas_per_anchor) as f32 / counter_all as f32;
-            if cur_percent > network.net.badlabels_rejection_percentage {
-                state.badlabels_reject_threshold += 0.01;
-            } else if state.badlabels_reject_threshold > 0.01 {
-                state.badlabels_reject_threshold -= 0.01;
-            }
+        let num_deltas_per_anchor = spec.classes + 5;
+        let cur_percent =
+            100.0 * (counter_reject * num_deltas_per_anchor) as f32 / counter_all as f32;
+        if cur_percent > network.net.badlabels_rejection_percentage {
+            state.badlabels_reject_threshold += 0.01;
+        } else if state.badlabels_reject_threshold > 0.01 {
+            state.badlabels_reject_threshold -= 0.01;
         }
     }
 
@@ -1266,26 +1229,95 @@ fn validate_yolo_head_shape(shape: TensorShape, spec: &YoloSpec) -> Result<()> {
     Ok(())
 }
 
-fn best_anchor_assignment(
-    network: &Network,
-    heads: &[(&crate::runtime::YoloHeadOutput, &YoloSpec)],
-    label: &YoloLabel,
-) -> Result<Option<(usize, usize, f32)>> {
-    let label_w = label.w * network.net.width as f32;
-    let label_h = label.h * network.net.height as f32;
-    let mut best: Option<(usize, usize, f32)> = None;
-
-    for (head_index, (_, spec)) in heads.iter().enumerate() {
-        for (anchor_offset, &mask_idx) in spec.mask.iter().enumerate() {
-            let anchor = anchor_pair(spec, mask_idx)?;
-            let iou = wh_iou(label_w, label_h, anchor.0, anchor.1);
-            if best.is_none_or(|(_, _, best_iou)| iou > best_iou) {
-                best = Some((head_index, anchor_offset, iou));
-            }
+/// C++ best-anchor search: over the first `total` anchors in cfg order, normalised sizes,
+/// strict `>` from `best_iou = 0` / `best_n = 0`.
+fn best_anchor_index(
+    spec: &YoloSpec,
+    total: usize,
+    net_width: usize,
+    net_height: usize,
+    truth_shift: YoloBox,
+) -> Result<usize> {
+    let mut best_iou = 0.0f32;
+    let mut best_n = 0usize;
+    for n in 0..total {
+        let anchor = anchor_pair(spec, n)?;
+        let pred = YoloBox {
+            x: 0.0,
+            y: 0.0,
+            w: anchor.0 / net_width as f32,
+            h: anchor.1 / net_height as f32,
+        };
+        let iou = bbox_iou(pred, truth_shift);
+        if iou > best_iou {
+            best_iou = iou;
+            best_n = n;
         }
     }
+    Ok(best_n)
+}
 
-    Ok(best)
+/// Box delta + positive objectness + class delta of one truth on one anchor of a head
+/// (the shared body of the C++ primary and `iou_thresh` extra-anchor assignments).
+#[allow(clippy::too_many_arguments)]
+fn assign_yolo_label_to_anchor(
+    network: &Network,
+    head: &crate::runtime::YoloHeadOutput,
+    spec: &YoloSpec,
+    seed: &mut Tensor,
+    stats: &mut YoloHeadStats,
+    batch: usize,
+    anchor_offset: usize,
+    row: usize,
+    col: usize,
+    label: &YoloLabel,
+    class_id: usize,
+    class_scale: f32,
+) -> Result<()> {
+    let channel_base = anchor_offset * (spec.classes + 5);
+    let anchor = anchor_pair(spec, spec.mask[anchor_offset])?;
+    let objectness = yolo_objectness_output(
+        head.output.get(batch, channel_base + 4, row, col),
+        spec.new_coords,
+    );
+    stats.add(apply_yolo_box_delta(
+        &head.output,
+        seed,
+        batch,
+        channel_base,
+        row,
+        col,
+        head.output.shape.width,
+        head.output.shape.height,
+        network.net.width,
+        network.net.height,
+        anchor,
+        bbox_from_label(label),
+        class_scale,
+        spec,
+    ));
+    apply_yolo_positive_objectness(
+        &head.output,
+        seed,
+        batch,
+        channel_base,
+        row,
+        col,
+        objectness,
+        class_id,
+        spec,
+    );
+    apply_yolo_class_delta(
+        &head.output,
+        seed,
+        batch,
+        channel_base + 5,
+        row,
+        col,
+        class_id,
+        spec,
+    );
+    Ok(())
 }
 
 fn width_height_target(
@@ -1378,12 +1410,6 @@ fn anchor_pair(spec: &YoloSpec, index: usize) -> Result<(f32, f32)> {
         Error::InvalidConfig(format!("missing anchor height for YOLO mask index {index}"))
     })?;
     Ok((width, height))
-}
-
-fn wh_iou(w1: f32, h1: f32, w2: f32, h2: f32) -> f32 {
-    let intersection = w1.min(w2).max(0.0) * h1.min(h2).max(0.0);
-    let union = (w1 * h1 + w2 * h2 - intersection).max(YOLO_TARGET_EPSILON);
-    intersection / union
 }
 
 fn bbox_iou(lhs: YoloBox, rhs: YoloBox) -> f32 {
@@ -1896,6 +1922,7 @@ mod tests {
             label_smooth_eps: 0.0,
             objectness_smooth: false,
             max_delta: f32::MAX,
+            delta_normalizer: 1.0,
             class_multipliers: None,
             class_map: None,
         };
@@ -1951,6 +1978,7 @@ mod tests {
             label_smooth_eps: 0.0,
             objectness_smooth: false,
             max_delta: f32::MAX,
+            delta_normalizer: 1.0,
             class_multipliers: None,
             class_map: None,
         };
@@ -2030,6 +2058,241 @@ mod tests {
             .expect("yolo seed exists");
         assert_ne!(seed.get(0, 4, 0, 0), 0.0);
         assert_ne!(seed.get(0, 10, 0, 0), 0.0);
+    }
+
+    fn forward_two_head_zero_input(
+        yolo_extra: &str,
+    ) -> (Network, crate::runtime::ForwardResult) {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            &format!(
+                r#"
+                [net]
+                batch=1
+                width=32
+                height=32
+                channels=3
+
+                [convolutional]
+                filters=6
+                size=1
+                stride=1
+                pad=1
+                activation=linear
+
+                [yolo]
+                mask=0
+                anchors=10,12,12,14,40,48
+                classes=1
+                num=3
+                truth_thresh=1.0
+                {yolo_extra}
+
+                [route]
+                layers=0
+
+                [convolutional]
+                filters=12
+                size=1
+                stride=1
+                pad=1
+                activation=linear
+
+                [yolo]
+                mask=1,2
+                anchors=10,12,12,14,40,48
+                classes=1
+                num=3
+                truth_thresh=1.0
+                {yolo_extra}
+            "#
+            ),
+        )
+        .expect("cfg parses");
+        let network = Network::from_config(cfg).expect("network builds");
+        let executable = ExecutableNetwork::new(network.clone());
+        let input = executable.zero_input();
+        let forward = executable.forward(&input).expect("forward runs");
+        (network, forward)
+    }
+
+    /// #3/#4 vs C++ `process_batch`: best anchor over ALL `num` anchors (cfg order), primary
+    /// assignment only in the head whose mask holds it, `iou_thresh` extras in every head from
+    /// its own mask. Anchors (10,12) (12,14) (40,48), net 32, truth 10x12 px at the grid
+    /// centre: best_n = 0 (iou 1) -> head A (mask 0) primary; anchor 1 iou = 120/168 = .714 > .5
+    /// -> head B (mask 1,2, offset 0) gets an extra although best_n is not in its mask;
+    /// anchor 2 iou = 120/1920 = .0625 -> no. Zero input -> raw 0 -> objectness .5, so the
+    /// positive objectness delta is obj_normalizer * (1 - .5) = .5 and the negative one -.5.
+    #[test]
+    fn yolo_iou_thresh_extra_anchor_in_other_head_like_cpp() {
+        let (network, forward) = forward_two_head_zero_input("iou_thresh=0.5");
+        let label = YoloLabel { class_id: 0, x: 0.5, y: 0.5, w: 10.0 / 32.0, h: 12.0 / 32.0 };
+        let training = compute_yolo_training_loss(&network, &forward, &[vec![label]])
+            .expect("training loss computes");
+        assert_eq!(training.positive_matches, 2);
+        let a = training.layer_output_gradient_seeds[1].as_ref().expect("head A seed");
+        let b = training.layer_output_gradient_seeds[4].as_ref().expect("head B seed");
+        assert!((a.get(0, 4, 16, 16) - 0.5).abs() < 1.0e-6);
+        assert!((b.get(0, 4, 16, 16) - 0.5).abs() < 1.0e-6, "extra anchor objectness");
+        assert!((b.get(0, 5, 16, 16) - 0.5).abs() < 1.0e-6, "extra anchor class delta");
+        assert!((b.get(0, 10, 16, 16) + 0.5).abs() < 1.0e-6, "anchor 2 stays negative");
+        // without iou_thresh only the primary head is assigned
+        let (network, forward) = forward_two_head_zero_input("");
+        let label = YoloLabel { class_id: 0, x: 0.5, y: 0.5, w: 10.0 / 32.0, h: 12.0 / 32.0 };
+        let training = compute_yolo_training_loss(&network, &forward, &[vec![label]])
+            .expect("training loss computes");
+        assert_eq!(training.positive_matches, 1);
+        let b = training.layer_output_gradient_seeds[4].as_ref().expect("head B seed");
+        // anchor 1's decoded box (12x14 px) has iou .714 > ignore_thresh with the truth and the
+        // class output .5 > .25 matches -> C++ ignores it (delta 0), nothing positive is written
+        assert_eq!(b.get(0, 4, 16, 16), 0.0);
+        assert_eq!(b.get(0, 5, 16, 16), 0.0);
+    }
+
+    /// #4: the best anchor is searched over all `num` anchors, not the head's mask. Single head
+    /// mask=1 (anchor 40x48); truth 10x12 -> best_n = 0, not in the mask -> C++ assigns nothing
+    /// (a union-of-masks search would have picked anchor 1).
+    #[test]
+    fn yolo_best_anchor_search_covers_all_anchors_like_cpp() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                batch=1
+                width=32
+                height=32
+                channels=3
+
+                [convolutional]
+                filters=6
+                size=1
+                stride=1
+                pad=1
+                activation=linear
+
+                [yolo]
+                mask=1
+                anchors=10,12,40,48
+                classes=1
+                num=2
+                truth_thresh=1.0
+            "#,
+        )
+        .expect("cfg parses");
+        let network = Network::from_config(cfg).expect("network builds");
+        let executable = ExecutableNetwork::new(network.clone());
+        let input = executable.zero_input();
+        let forward = executable.forward(&input).expect("forward runs");
+        let label = YoloLabel { class_id: 0, x: 0.5, y: 0.5, w: 10.0 / 32.0, h: 12.0 / 32.0 };
+        let training = compute_yolo_training_loss(&network, &forward, &[vec![label]])
+            .expect("training loss computes");
+        assert_eq!(training.positive_matches, 0);
+        let seed = training.layer_output_gradient_seeds[1].as_ref().expect("seed");
+        assert!((seed.get(0, 4, 16, 16) + 0.5).abs() < 1.0e-6);
+        assert_eq!(seed.get(0, 5, 16, 16), 0.0);
+        assert_eq!(seed.get(0, 0, 16, 16), 0.0);
+        assert_eq!(training.box_count, 0);
+    }
+
+    /// #10: `delta_normalizer` scales only the propagated delta (backward axpy), not the cost.
+    #[test]
+    fn yolo_delta_normalizer_scales_seeds_not_loss() {
+        let (network, forward) = forward_two_head_zero_input("");
+        let (network2, forward2) = forward_two_head_zero_input("delta_normalizer=2.5");
+        let label = YoloLabel { class_id: 0, x: 0.5, y: 0.5, w: 10.0 / 32.0, h: 12.0 / 32.0 };
+        let base = compute_yolo_training_loss(&network, &forward, &[vec![label.clone()]]).unwrap();
+        let scaled = compute_yolo_training_loss(&network2, &forward2, &[vec![label]]).unwrap();
+        assert_eq!(base.loss, scaled.loss);
+        for head in [1, 4] {
+            let a = base.layer_output_gradient_seeds[head].as_ref().unwrap();
+            let b = scaled.layer_output_gradient_seeds[head].as_ref().unwrap();
+            assert!(a.data.iter().any(|v| *v != 0.0));
+            for (x, y) in a.data.iter().zip(&b.data) {
+                assert!((x * 2.5 - y).abs() < 1.0e-6);
+            }
+        }
+        assert!((base.layer_output_gradient_seeds[1].as_ref().unwrap().get(0, 4, 16, 16) - 0.5).abs() < 1.0e-6);
+        assert_eq!(base.class_count, base.box_count);
+    }
+
+    /// #11: C++ takes `ep_loss_threshold = delta_rolling_avg * progress * 1.4` from the rolling
+    /// average BEFORE the update. progress = (3 - 1) / (5 - 1) = .5, avg 2.0 -> threshold 1.4,
+    /// so 1.395 is zeroed and 3.0 kept (the post-update avg 2.001975 would give 1.4014, but a
+    /// post-update ordering with a lower avg, e.g. 1.985, would give 1.3895 and keep 1.395).
+    #[test]
+    fn yolo_equidistant_threshold_uses_pre_update_rolling_avg() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                batch=1
+                width=1
+                height=1
+                channels=6
+                max_batches=5
+                equidistant_point=1
+
+                [yolo]
+                mask=0
+                anchors=10,13
+                classes=1
+                num=1
+            "#,
+        )
+        .expect("cfg parses");
+        let network = Network::from_config(cfg).expect("network builds");
+        let mut seeds = vec![Some(
+            Tensor::from_data(network.layers[0].output_shape, vec![1.395, 3.0, 0.0, 0.0, 0.0, 0.0])
+                .expect("seed tensor"),
+        )];
+        let mut state = YoloTrainingState { delta_rolling_avg: 2.0, ..YoloTrainingState::default() };
+        apply_yolo_delta_filtering(&network, &mut seeds, 3, &mut state);
+        assert_eq!(seeds[0].as_ref().unwrap().data, vec![0.0, 3.0, 0.0, 0.0, 0.0, 0.0]);
+        // rolling update: avg = 2*.99 + mean(1.395, 3)*.01, max = 3 (first step) * .99 + 3 * .01
+        assert!((state.delta_rolling_avg - 2.001_975).abs() < 1.0e-5);
+        assert!((state.delta_rolling_max - 3.0).abs() < 1.0e-6);
+    }
+
+    /// #11: sigma step rejects the only delta, then the percentage step sees no deltas:
+    /// C++ `cur_percent = 0 / 0 = NaN`, `NaN > pct` is false -> threshold decreases by .01.
+    /// Hand: rolling max 5, avg .1 -> .099 + .05 = .149; final = .149 + .1 * 1 = .249;
+    /// progress_badlabels = (4 - 3) / 3; threshold = 5 - (1/3) * 4.751 = 3.416 < 5 -> zeroed.
+    #[test]
+    fn yolo_badlabels_percentage_decreases_when_all_deltas_rejected() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                batch=1
+                width=1
+                height=1
+                channels=6
+                max_batches=4
+                num_sigmas_reject_badlabels=1
+                badlabels_rejection_percentage=0.2
+
+                [yolo]
+                mask=0
+                anchors=10,13
+                classes=1
+                num=1
+            "#,
+        )
+        .expect("cfg parses");
+        let network = Network::from_config(cfg).expect("network builds");
+        let mut seeds = vec![Some(
+            Tensor::from_data(network.layers[0].output_shape, vec![5.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                .expect("seed tensor"),
+        )];
+        let mut state = YoloTrainingState {
+            badlabels_reject_threshold: 1.0,
+            delta_rolling_max: 5.0,
+            delta_rolling_avg: 0.1,
+            delta_rolling_std: 0.1,
+        };
+        apply_yolo_delta_filtering(&network, &mut seeds, 4, &mut state);
+        assert!(seeds[0].as_ref().unwrap().data.iter().all(|v| *v == 0.0));
+        assert!((state.badlabels_reject_threshold - 0.99).abs() < 1.0e-6);
     }
 
     #[test]

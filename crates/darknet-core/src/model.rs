@@ -328,6 +328,9 @@ pub struct YoloSpec {
     pub label_smooth_eps: f32,
     pub objectness_smooth: bool,
     pub max_delta: f32,
+    /// C++ `delta_normalizer`: scales the head delta when it is added to the previous layer's
+    /// delta in backward (GPU path, `backward_yolo_layer_gpu`); cost/loss are unaffected.
+    pub delta_normalizer: f32,
     pub class_multipliers: Option<Vec<f32>>,
     pub class_map: Option<Vec<usize>>,
 }
@@ -1203,6 +1206,7 @@ fn parse_layer_kind(
                 label_smooth_eps: section.get_f32("label_smooth_eps", 0.0)?,
                 objectness_smooth: section.get_bool_int("objectness_smooth", false)?,
                 max_delta,
+                delta_normalizer: section.get_f32("delta_normalizer", 1.0)?,
                 class_multipliers: parse_class_multipliers(section, classes, max_delta)?,
                 class_map: parse_class_map(section, cfg_parent)?,
             })
@@ -1230,6 +1234,7 @@ fn parse_layer_kind(
                 label_smooth_eps: section.get_f32("label_smooth_eps", 0.0)?,
                 objectness_smooth: section.get_bool_int("objectness_smooth", false)?,
                 max_delta,
+                delta_normalizer: section.get_f32("delta_normalizer", 1.0)?,
                 class_multipliers: parse_class_multipliers(section, classes, max_delta)?,
                 class_map: parse_class_map(section, cfg_parent)?,
             })

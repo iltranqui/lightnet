@@ -139,7 +139,7 @@ fn decode_yolo_head(
             let ty = data[(anchor_base + 1) * stride + index];
             let tw = data[(anchor_base + 2) * stride + index];
             let th = data[(anchor_base + 3) * stride + index];
-            let objectness = sigmoid(data[(anchor_base + 4) * stride + index]);
+            let objectness = head_activation(data[(anchor_base + 4) * stride + index], spec.new_coords);
 
             if objectness <= options.confidence_threshold {
                 continue;
@@ -170,7 +170,10 @@ fn decode_yolo_head(
             );
 
             for class_id in 0..spec.classes {
-                let class_prob = sigmoid(data[(anchor_base + 5 + class_id) * stride + index]);
+                let class_prob = head_activation(
+                    data[(anchor_base + 5 + class_id) * stride + index],
+                    spec.new_coords,
+                );
                 let confidence = objectness * class_prob;
                 if confidence > options.confidence_threshold {
                     out.push(Detection {
@@ -203,8 +206,10 @@ fn decode_bbox(
     scale_x_y: f32,
     new_coords: bool,
 ) -> DetectionBox {
-    let bx = (col as f32 + scale_x_y * sigmoid(tx) - 0.5 * (scale_x_y - 1.0)) / grid_width as f32;
-    let by = (row as f32 + scale_x_y * sigmoid(ty) - 0.5 * (scale_x_y - 1.0)) / grid_height as f32;
+    let bx = (col as f32 + scale_x_y * head_activation(tx, new_coords) - 0.5 * (scale_x_y - 1.0))
+        / grid_width as f32;
+    let by = (row as f32 + scale_x_y * head_activation(ty, new_coords) - 0.5 * (scale_x_y - 1.0))
+        / grid_height as f32;
     let (bw, bh) = if new_coords {
         (
             tw * tw * 4.0 * anchor.0 / net_width as f32,
@@ -332,6 +337,14 @@ fn sigmoid(value: f32) -> f32 {
     1.0 / (1.0 + (-value).exp())
 }
 
+/// The runtime leaves the head tensor as the previous layer wrote it. Without `new_coords`
+/// the C++ yolo layer applies the logistic to x, y, objectness and classes in forward;
+/// with `new_coords` it does not (the preceding layer already activated them), so
+/// `get_yolo_detections` reads the values as they are.
+fn head_activation(raw: f32, new_coords: bool) -> f32 {
+    if new_coords { raw } else { sigmoid(raw) }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::cfg::ConfigFile;
@@ -339,6 +352,62 @@ mod tests {
     use crate::runtime::{Tensor, YoloHeadOutput};
 
     use super::{DetectionOptions, decode_yolo_detections};
+
+    /// C++ `get_yolo_detections` + `get_yolo_box` with `new_coords=1`: head values are used as
+    /// stored (already activated), x,y get `scale_x_y*v - 0.5*(scale_x_y-1)`, w = 4*tw^2*anchor/net.
+    /// Grid 1x1, net 32, anchor 10x12, scale_x_y 1.2, tx=.5 ty=.25 tw=.5 th=.25, obj .9, cls .8:
+    /// bx = 1.2*.5 - .1 = .5 -> 16 px; by = 1.2*.25 - .1 = .2 -> 6.4 px;
+    /// w = 4*.25*10 = 10 px; h = 4*.0625*12 = 3 px; confidence = .9*.8 = .72.
+    #[test]
+    fn new_coords_head_is_decoded_without_sigmoid() {
+        let cfg = ConfigFile::parse_str(
+            "inline.cfg",
+            r#"
+                [net]
+                width=32
+                height=32
+                channels=6
+
+                [maxpool]
+                size=32
+                stride=32
+
+                [yolo]
+                mask=0
+                anchors=10,12
+                classes=1
+                num=1
+                scale_x_y=1.2
+                new_coords=1
+            "#,
+        )
+        .expect("cfg should parse");
+        let network = Network::from_config(cfg).expect("network should build");
+        let head = YoloHeadOutput {
+            layer_index: 1,
+            output: Tensor::from_data(
+                network.layers[1].output_shape,
+                vec![0.5, 0.25, 0.5, 0.25, 0.9, 0.8],
+            )
+            .expect("tensor"),
+        };
+        let detections = decode_yolo_detections(
+            &network,
+            &[head],
+            32,
+            32,
+            DetectionOptions { confidence_threshold: 0.25, nms_threshold: 0.45, letterbox: false },
+        )
+        .expect("decode should succeed");
+        assert_eq!(detections.len(), 1);
+        let d = &detections[0];
+        assert!((d.confidence - 0.72).abs() < 1.0e-5, "{}", d.confidence);
+        assert!((d.objectness - 0.9).abs() < 1.0e-6);
+        assert!((d.bbox.x - 16.0).abs() < 1.0e-4, "{}", d.bbox.x);
+        assert!((d.bbox.y - 6.4).abs() < 1.0e-4, "{}", d.bbox.y);
+        assert!((d.bbox.w - 10.0).abs() < 1.0e-4, "{}", d.bbox.w);
+        assert!((d.bbox.h - 3.0).abs() < 1.0e-4, "{}", d.bbox.h);
+    }
 
     #[test]
     fn decodes_single_yolo_detection() {
