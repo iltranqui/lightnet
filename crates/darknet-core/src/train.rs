@@ -300,9 +300,7 @@ pub fn compute_yolo_training_loss_with_state(
                                 network.net.height,
                                 anchor,
                                 bbox_from_label(label),
-                                (2.0 - label.w * label.h)
-                                    * spec.iou_normalizer
-                                    * class_multiplier(spec, class_id),
+                                spec.iou_normalizer * class_multiplier(spec, class_id),
                                 spec,
                             );
                         }
@@ -333,9 +331,7 @@ pub fn compute_yolo_training_loss_with_state(
                     head.output.get(batch, channel_base + 4, row, col),
                     spec.new_coords,
                 );
-                let class_scale = (2.0 - label.w * label.h)
-                    * spec.iou_normalizer
-                    * class_multiplier(spec, class_id);
+                let class_scale = spec.iou_normalizer * class_multiplier(spec, class_id);
 
                 apply_yolo_box_delta(
                     &head.output,
@@ -670,9 +666,12 @@ fn apply_yolo_box_delta(
     net_height: usize,
     anchor: (f32, f32),
     truth_bbox: YoloBox,
-    scale: f32,
+    normalizer: f32,
     spec: &YoloSpec,
 ) {
+    // C++ `delta_yolo_box`: the `(2 - w*h)` scale only enters the MSE branch; the
+    // iou/giou/diou/ciou branches use `iou_normalizer * class_multiplier` alone.
+    let scale = (2.0 - truth_bbox.w * truth_bbox.h) * normalizer;
     let tx_raw = output.get(batch, channel_base, row, col);
     let ty_raw = output.get(batch, channel_base + 1, row, col);
     let tw_raw = output.get(batch, channel_base + 2, row, col);
@@ -761,7 +760,7 @@ fn apply_yolo_box_delta(
                 row,
                 col,
                 0,
-                sanitize_and_clip_delta(box_grad.dx * scale, spec.max_delta),
+                sanitize_and_clip_delta(box_grad.dx * normalizer, spec.max_delta),
             );
             add_box_delta(
                 seed,
@@ -770,7 +769,7 @@ fn apply_yolo_box_delta(
                 row,
                 col,
                 1,
-                sanitize_and_clip_delta(box_grad.dy * scale, spec.max_delta),
+                sanitize_and_clip_delta(box_grad.dy * normalizer, spec.max_delta),
             );
             add_box_delta(
                 seed,
@@ -779,7 +778,7 @@ fn apply_yolo_box_delta(
                 row,
                 col,
                 2,
-                sanitize_and_clip_delta(box_grad.dw * scale, spec.max_delta),
+                sanitize_and_clip_delta(box_grad.dw * normalizer, spec.max_delta),
             );
             add_box_delta(
                 seed,
@@ -788,7 +787,7 @@ fn apply_yolo_box_delta(
                 row,
                 col,
                 3,
-                sanitize_and_clip_delta(box_grad.dh * scale, spec.max_delta),
+                sanitize_and_clip_delta(box_grad.dh * normalizer, spec.max_delta),
             );
         }
     }
@@ -1621,13 +1620,13 @@ fn yolo_objectness_output(raw: f32, new_coords: bool) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DataConfig, YoloLabel, YoloTrainingState, apply_yolo_delta_filtering,
+        YoloBox, apply_yolo_box_delta, DataConfig, YoloLabel, YoloTrainingState, apply_yolo_delta_filtering,
         compute_yolo_training_loss, compute_yolo_training_loss_with_state, load_training_batch,
         load_yolo_labels, replace_image_to_label,
     };
     use crate::cfg::ConfigFile;
-    use crate::model::Network;
-    use crate::runtime::ExecutableNetwork;
+    use crate::model::{Network, TensorShape, YoloIouLoss, YoloSpec};
+    use crate::runtime::{ExecutableNetwork, Tensor};
     use std::fs;
     use std::path::PathBuf;
 
@@ -1784,6 +1783,58 @@ mod tests {
             .as_ref()
             .expect("yolo seed exists");
         assert!(seed.data.iter().any(|value| *value != 0.0));
+    }
+
+    /// C++ `delta_yolo_box` iou branch ignores the `(2 - w*h)` scale: delta =
+    /// d(IoU)/d(box) * iou_normalizer * class_multiplier (only MSE uses the scale).
+    /// Hand computation: pred (.5,.5,.5,.5) vs truth (.6,.5,.5,.5): I=.2, U=.3,
+    /// dx=2.7778, dy=0, dw=.5556, dh=-2.2222 (x exp(0) for w/h), times iou_normalizer .5.
+    #[test]
+    fn yolo_iou_box_delta_has_no_area_scale_like_cpp() {
+        let spec = YoloSpec {
+            classes: 1,
+            num: 1,
+            mask: vec![0],
+            anchors: vec![50.0, 50.0],
+            scale_x_y: 1.0,
+            new_coords: false,
+            cls_normalizer: 1.0,
+            obj_normalizer: 1.0,
+            iou_normalizer: 0.5,
+            ignore_thresh: 0.5,
+            truth_thresh: 1.0,
+            iou_thresh: 1.0,
+            iou_loss: YoloIouLoss::Iou,
+            iou_thresh_kind: YoloIouLoss::Iou,
+            focal_loss: false,
+            label_smooth_eps: 0.0,
+            objectness_smooth: false,
+            max_delta: f32::MAX,
+            class_multipliers: None,
+            class_map: None,
+        };
+        let shape = TensorShape { width: 1, height: 1, channels: 6, batch: 1 };
+        let output = Tensor::zeros(shape);
+        let truth = YoloBox { x: 0.6, y: 0.5, w: 0.5, h: 0.5 };
+        let mut seed = Tensor::zeros(shape);
+        apply_yolo_box_delta(
+            &output, &mut seed, 0, 0, 0, 0, 1, 1, 100, 100, (50.0, 50.0), truth,
+            spec.iou_normalizer, &spec,
+        );
+        let want = [1.388_889, 0.0, 0.277_778, -1.111_111];
+        for (c, w) in want.iter().enumerate() {
+            let got = seed.get(0, c, 0, 0);
+            assert!((got - w).abs() < 1.0e-4, "channel {c}: {got} vs {w}");
+        }
+
+        // MSE keeps the (2 - w*h) scale: (2 - .25) * .5 * (tx - sigmoid(0)), tx = .6*1-0.
+        let mse = YoloSpec { iou_loss: YoloIouLoss::Mse, ..spec };
+        let mut seed = Tensor::zeros(shape);
+        apply_yolo_box_delta(
+            &output, &mut seed, 0, 0, 0, 0, 1, 1, 100, 100, (50.0, 50.0), truth,
+            mse.iou_normalizer, &mse,
+        );
+        assert!((seed.get(0, 0, 0, 0) - 1.75 * 0.5 * 0.1).abs() < 1.0e-5);
     }
 
     #[test]
