@@ -2,6 +2,8 @@
 # Build and train LegoGears_v2 using the Rust oxide backend.
 # Usage: ./tools/train_legogears_oxide.sh [initial.weights] [training flags...]
 # Overrides: CFG, DATA, SEED, DARKNET_OXIDE_AMP=1
+# -map evaluates every valid= image once using the current training weights.
+# Optional: -map_every 100 -thresh 0.005 -iou_thresh 0.5
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -31,4 +33,4 @@ systemd-run --user --scope -p MemoryHigh=3G \
 
 export DARKNET_BACKEND=oxide
 exec target/debug/darknet-rs detector train \
-    "$DATA" "$CFG" -seed "$SEED" -dont_show "$@"
+    "$DATA" "$CFG" -seed "$SEED" -dont_show -map "$@"

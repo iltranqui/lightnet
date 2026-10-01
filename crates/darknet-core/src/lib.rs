@@ -15,6 +15,8 @@ pub use augmentation::DetectorAugmentation;
 pub mod cfg;
 pub mod detect;
 pub mod error;
+pub mod evaluate;
+pub use evaluate::{MapReport, ValidationDataset, detector_map};
 pub mod image;
 pub mod initialize;
 pub use initialize::initialize_training_params;

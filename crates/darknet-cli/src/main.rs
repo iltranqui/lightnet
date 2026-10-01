@@ -885,13 +885,17 @@ fn classify_detector_train_paths(
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 struct TrainOptions {
     weights: Option<String>,
     seed: u64,
     clear: bool,
     dont_show: bool,
     gpu: bool,
+    map: bool,
+    map_every: Option<usize>,
+    map_thresh: f32,
+    map_iou: f32,
 }
 
 impl TrainOptions {
@@ -906,6 +910,10 @@ impl TrainOptions {
             clear: false,
             dont_show: false,
             gpu: false,
+            map: false,
+            map_every: None,
+            map_thresh: 0.005,
+            map_iou: 0.5,
         };
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -925,8 +933,28 @@ impl TrainOptions {
                     }
                     options.gpu = true;
                 }
-                "-map" => {
-                    return Err("-map is not implemented yet (P9: mid-training validation)".into());
+                "-map" => options.map = true,
+                "-map_every" => {
+                    let value = required_arg(args.next(), "validation interval")?;
+                    let interval = value
+                        .parse::<usize>()
+                        .map_err(|_| "invalid -map_every interval")?;
+                    if interval == 0 {
+                        return Err("-map_every must be positive".into());
+                    }
+                    options.map_every = Some(interval);
+                }
+                "-thresh" | "-iou_thresh" => {
+                    let value = required_arg(args.next(), "validation threshold")?;
+                    let value: f32 = value.parse().map_err(|_| "invalid validation threshold")?;
+                    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                        return Err("validation thresholds must be finite and in [0,1]".into());
+                    }
+                    if arg == "-thresh" {
+                        options.map_thresh = value;
+                    } else {
+                        options.map_iou = value;
+                    }
                 }
                 flag if flag.starts_with('-') => {
                     return Err(format!("unsupported detector train flag: {flag}").into());
@@ -934,6 +962,13 @@ impl TrainOptions {
                 _ if options.weights.is_none() => options.weights = Some(arg),
                 _ => return Err(format!("unexpected detector train argument: {arg}").into()),
             }
+        }
+        if !options.map
+            && (options.map_every.is_some()
+                || options.map_thresh != 0.005
+                || options.map_iou != 0.5)
+        {
+            return Err("validation options require -map".into());
         }
         Ok(options)
     }
@@ -1073,6 +1108,130 @@ fn run_detector_train_preferred_backend(
     run_detector_train_cpu(cfg, data, options)
 }
 
+#[derive(Debug)]
+struct MapSchedule {
+    interval: usize,
+    burn_in: usize,
+    last_iteration: usize,
+}
+impl MapSchedule {
+    fn due(&self, iteration: usize, max_batches: usize) -> bool {
+        (max_batches != 0 && iteration == max_batches)
+            || (iteration >= self.burn_in
+                && iteration >= self.last_iteration.saturating_add(self.interval))
+    }
+}
+
+struct TrainingValidation {
+    dataset: darknet_core::ValidationDataset,
+    names: Vec<String>,
+    schedule: MapSchedule,
+    detection_options: DetectionOptions,
+    iou_threshold: f32,
+    best_map: Option<f64>,
+    log: fs::File,
+}
+impl TrainingValidation {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        options: &TrainOptions,
+        network: &Network,
+        data: &DataConfig,
+        letterbox: bool,
+        train_images: usize,
+        images_per_iteration: usize,
+        iteration: usize,
+        backup: &Path,
+        name: &str,
+    ) -> Result<Option<Self>, Box<dyn std::error::Error>> {
+        if !options.map {
+            return Ok(None);
+        }
+        let dataset = darknet_core::ValidationDataset::from_data(network, data)?;
+        let names = if let Some(path) = &data.names {
+            load_names_file(path)?
+        } else {
+            (0..dataset.classes).map(|i| format!("class_{i}")).collect()
+        };
+        if names.len() != dataset.classes {
+            return Err("-map names count differs from cfg classes".into());
+        }
+        let interval = options
+            .map_every
+            .unwrap_or_else(|| (train_images / images_per_iteration.max(1)).max(100));
+        println!(
+            "mAP: {} validation images, every {interval} iterations (after burn-in {}), and at final iteration",
+            dataset.images.len(),
+            network.net.burn_in
+        );
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(backup.join(format!("{name}_map.csv")))?;
+        if log.metadata()?.len() == 0 {
+            writeln!(log, "iteration,seen,iou,threshold,map,best_map")?;
+        }
+        Ok(Some(Self {
+            dataset,
+            names,
+            schedule: MapSchedule {
+                interval,
+                burn_in: network.net.burn_in,
+                last_iteration: iteration,
+            },
+            detection_options: DetectionOptions {
+                confidence_threshold: options.map_thresh,
+                nms_threshold: 0.45,
+                letterbox,
+            },
+            iou_threshold: options.map_iou,
+            best_map: None,
+            log,
+        }))
+    }
+
+    fn record(
+        &mut self,
+        report: &darknet_core::MapReport,
+        iteration: usize,
+        seen: u64,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        for (class, ap) in report.average_precision.iter().enumerate() {
+            println!(
+                "AP {} = {:.4}% (truth={}, detections={})",
+                self.names[class],
+                ap * 100.0,
+                report.ground_truth_counts[class],
+                report.detection_counts[class]
+            );
+        }
+        let improved = self
+            .best_map
+            .is_none_or(|best| report.mean_average_precision >= best);
+        if improved {
+            self.best_map = Some(report.mean_average_precision);
+        }
+        let best = self.best_map.unwrap_or(0.0);
+        println!(
+            "{iteration}: mAP@{:.2} = {:.4}%, best = {:.4}%",
+            self.iou_threshold,
+            report.mean_average_precision * 100.0,
+            best * 100.0
+        );
+        writeln!(
+            self.log,
+            "{iteration},{seen},{},{},{:.8},{:.8}",
+            self.iou_threshold,
+            self.detection_options.confidence_threshold,
+            report.mean_average_precision,
+            best
+        )?;
+        self.log.flush()?;
+        self.schedule.last_iteration = iteration;
+        Ok(improved)
+    }
+}
+
 fn run_detector_train_cpu(
     cfg: &str,
     data: &str,
@@ -1128,6 +1287,17 @@ fn run_detector_train_cpu(
     let mut batch_num = (seen as usize)
         .checked_div(images_per_iteration)
         .unwrap_or(0);
+    let mut validation = TrainingValidation::new(
+        options,
+        &executable.network,
+        &data_config,
+        augmentation.letter_box,
+        train_images.len(),
+        images_per_iteration,
+        batch_num,
+        &backup_dir,
+        &base_name,
+    )?;
     let mut yolo_state = YoloTrainingState::default();
     let mut progress = TrainingProgress::new(batch_num);
     let mut image_cursor = if train_images.is_empty() {
@@ -1194,6 +1364,33 @@ fn run_detector_train_cpu(
             executable.network.net.max_batches,
             iteration_start.elapsed(),
         );
+
+        if let Some(validation) = &mut validation {
+            if validation
+                .schedule
+                .due(batch_num, executable.network.net.max_batches)
+            {
+                println!(
+                    "Validating current training weights on all {} images...",
+                    validation.dataset.images.len()
+                );
+                // Separate batch-one inference graph, same current parameters;
+                // never alter the training graph, caches or momentum buffers.
+                let mut inference = ExecutableNetwork::new(executable.network.with_batch(1));
+                inference.params = executable.params.clone();
+                let report = validation.dataset.evaluate(
+                    &inference.network,
+                    validation.detection_options,
+                    validation.iou_threshold,
+                    |input| Ok(inference.forward(input)?.yolo_heads),
+                )?;
+                if validation.record(&report, batch_num, seen)? {
+                    let checkpoint = backup_dir.join(format!("{base_name}_best.weights"));
+                    save_weights(&executable.network, &executable.params, &checkpoint, seen)?;
+                    println!("saved {}", checkpoint.display());
+                }
+            }
+        }
 
         if batch_num % 1000 == 0 {
             let checkpoint = backup_dir.join(format!("{base_name}_{batch_num}.weights"));
@@ -1280,6 +1477,17 @@ fn run_detector_train_gpu(
     } else {
         (seen as usize) / images_per_iteration
     };
+    let mut validation = TrainingValidation::new(
+        options,
+        &executable.network,
+        &data_config,
+        augmentation.letter_box,
+        train_images.len(),
+        images_per_iteration,
+        batch_num,
+        &backup_dir,
+        &base_name,
+    )?;
     let mut yolo_state = YoloTrainingState::default();
     let mut progress = TrainingProgress::new(batch_num);
     let mut image_cursor = if train_images.is_empty() {
@@ -1347,6 +1555,37 @@ fn run_detector_train_gpu(
             executable.network.net.max_batches,
             iteration_start.elapsed(),
         );
+
+        if let Some(validation) = &mut validation {
+            if validation
+                .schedule
+                .due(batch_num, executable.network.net.max_batches)
+            {
+                println!(
+                    "Validating current training weights on all {} images...",
+                    validation.dataset.images.len()
+                );
+                // Deferred updates make device parameters authoritative. Sync
+                // weights AND BN state, then snapshot for batch-one inference.
+                executable.sync_host_weights_from_device()?;
+                let mut inference = GpuExecutableNetwork::new(
+                    executable.network.with_batch(1),
+                    OxideBackend::new()?,
+                );
+                inference.params = executable.params.clone();
+                let report = validation.dataset.evaluate(
+                    &inference.network,
+                    validation.detection_options,
+                    validation.iou_threshold,
+                    |input| Ok(inference.forward_compact(input)?.yolo_heads),
+                )?;
+                if validation.record(&report, batch_num, seen)? {
+                    let checkpoint = backup_dir.join(format!("{base_name}_best.weights"));
+                    save_weights(&executable.network, &executable.params, &checkpoint, seen)?;
+                    println!("saved {}", checkpoint.display());
+                }
+            }
+        }
 
         if batch_num % 1000 == 0 {
             let checkpoint = backup_dir.join(format!("{base_name}_{batch_num}.weights"));
@@ -1467,9 +1706,13 @@ fn print_usage() {
     println!("darknet-rs <command> [args]");
     println!("commands:");
     println!(
-        "  detector train <cfg|data> <data|cfg> [weights] [-clear] [-dont_show] [-seed <u64>] [-gpus 0]"
+        "  detector train <cfg|data> <data|cfg> [weights] [-clear] [-dont_show] [-seed <u64>] [-gpus 0] [-map]"
     );
-    println!("    seed defaults to 0; -map/unknown flags fail explicitly; -gpus 0 requires oxide");
+    println!(
+        "    -map validates all valid= images; -map_every <N> overrides max(100, epoch) cadence"
+    );
+    println!("    -thresh <0..1> (default .005), -iou_thresh <0..1> (default .5), NMS .45");
+    println!("    seed defaults to 0; unknown flags fail explicitly; -gpus 0 requires oxide");
     println!("  version");
     println!("  cfg-validate <cfg>");
     println!("  cfg-summary <cfg>");
@@ -1547,7 +1790,7 @@ fn shuffle_paths(paths: &mut [PathBuf], seed: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{TrainOptions, classify_detector_train_paths};
+    use super::{MapSchedule, TrainOptions, classify_detector_train_paths};
 
     fn options(args: &[&str]) -> Result<TrainOptions, Box<dyn std::error::Error>> {
         TrainOptions::parse(args.iter().map(|s| s.to_string()))
@@ -1572,10 +1815,46 @@ mod tests {
                 seed: 42,
                 clear: true,
                 dont_show: true,
-                gpu: true
+                gpu: true,
+                map: false,
+                map_every: None,
+                map_thresh: 0.005,
+                map_iou: 0.5,
             }
         );
         assert_eq!(options(&[]).unwrap().seed, 0);
+    }
+
+    #[test]
+    fn map_flags_and_cadence_include_final_iteration() {
+        let parsed = options(&[
+            "model.weights",
+            "-map",
+            "-map_every",
+            "12",
+            "-thresh",
+            "0.01",
+            "-iou_thresh",
+            "0.75",
+        ])
+        .unwrap();
+        assert!(parsed.map);
+        assert_eq!(parsed.map_every, Some(12));
+        assert_eq!(parsed.map_thresh, 0.01);
+        assert_eq!(parsed.map_iou, 0.75);
+        let mut schedule = MapSchedule {
+            interval: 100,
+            burn_in: 200,
+            last_iteration: 0,
+        };
+        assert!(!schedule.due(100, 1000));
+        assert!(schedule.due(200, 1000));
+        schedule.last_iteration = 200;
+        assert!(!schedule.due(299, 1000));
+        assert!(schedule.due(300, 1000));
+        assert!(schedule.due(250, 250));
+        assert!(!schedule.due(250, 0));
+        assert!(options(&["-map"]).is_ok());
     }
 
     #[test]
@@ -1587,7 +1866,9 @@ mod tests {
     #[test]
     fn unsupported_training_flags_and_bad_values_fail() {
         for args in [
-            vec!["-map"],
+            vec!["-map", "-map_every", "0"],
+            vec!["-map", "-thresh", "NaN"],
+            vec!["-map", "-iou_thresh", "2"],
             vec!["-gpus", "0,1"],
             vec!["-gpus"],
             vec!["-seed"],
