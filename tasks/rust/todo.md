@@ -289,10 +289,13 @@ Stale-box audit (done 2026-10-01, evidence inline on each box): scan-agent CSV i
 - [x] BN gamma + rolling stats device-resident, device BN fold kernel, deferred host sync now covers biases/gamma/rolling stats (`sync_host_weights_from_device`)
 - [x] Dropped zero-fills where every element is overwritten (conv dx/dw, full-coverage route grads), fused BN mean fold; DtoH 80 -> ~2/step, syncs 167 -> 24/step, launches 690 -> 589 (b1)
 - [x] Result: b1 20.8 -> 11.9 ms, b16 74.5 -> 63.2 ms (AMP b16 60.8 -> 46.5); weights/BN stats/rolling stats after 1 and 5 steps byte-identical (f32 and AMP); all oxide suites + darknet-core lib (119) green. Nothing committed.
-- [ ] CUDA graph capture: skipped (cuda-core only has raw begin/end capture, no instantiate/launch wrapper; pool addresses are not static, host loss sits between fwd and bwd). Other launch cuts left: multi-tensor update (-40 launches), saxpy grad accumulation fused into the update, conv+BN+act epilogue.
+- [ ] CUDA graph capture: skipped (cuda-core only has raw begin/end capture, no instantiate/launch wrapper; pool addresses are not static, host loss sits between fwd and bwd).
+- [x] Multi-tensor update (one launch per layer for weights + biases + BN scales, `sanitized_{sgd,adam}_update3`) and saxpy gradient accumulation folded into it (pending gradient on the deferred path): b1 11.1 -> 9.6 ms, launches 589 -> 493, byte-identical weights/BN state after 1 and 5 steps (SGD, AMP, Adam), see docs/OXIDE_BENCH.md 7.4. b16 63.7 -> 62.4 ms (within noise).
+- [x] Fused inference bias + activation epilogue (`bias_activation_f32`): inference b1 fp32 2.27 -> 1.96 ms, tf32 2.36 -> 1.95 ms, b16 -1..-2%; detections on the 80 val images identical.
+- [ ] Not done / not a win to attempt: training-forward BN-apply + activation fusion (backward needs the pre-activation), GEMM-epilogue bias/activation for the f32 path, end-to-end subdivision>1 check of the pending-gradient flush (kernel-level tested only).
 
 ### Final status (2026-10-01): remaining open boxes are BLOCKED, not forgotten
 - BLOCKED (user action): rustup `clippy-preview` conflict - user runs the fix commands listed under Housekeeping (nothing is broken now; `cargo clippy` works).
 - BLOCKED (hardware): wgmma (sm_90) / tcgen05 (sm_100) GEMM kernels, multi-GPU, NVFP4 - cannot be compiled/tested on this sm_89 laptop GPU; the GEMM seam (`GemmArgs` + `GemmMode`) is in place.
-- DEFERRED (optional, small gain): multi-tensor update (~0.5 ms), fused saxpy accumulation, fused conv+BN+activation epilogue, CUDA graph capture (cuda-core 0.3.1 lacks instantiate/launch; step needs static buffers).
+- DONE 2026-10-01 (7.4): multi-tensor update, fused saxpy accumulation, fused inference bias+activation. DEFERRED: training-forward BN+activation fusion, f32 GEMM epilogue, CUDA graph capture (cuda-core 0.3.1 lacks instantiate/launch; step needs static buffers).
 - Left by design: adversarial yolo branch, rewritten_bbox/total_bbox logging, weighted shortcut, elu/selu/gelu/... activations (no cfg uses them), degenerate equidistant cfgs.
