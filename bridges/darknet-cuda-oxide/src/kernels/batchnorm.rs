@@ -109,13 +109,20 @@ pub mod kernels {
         }
     }
 
-    /// `mean[c] = sum[c] / n`.
+    /// `mean[c] = (sum of the 256 partials of channel c) / n`: the fixed-order
+    /// fold of `bias_backward_reduce` fused in (same sum, same order).
     #[kernel]
-    pub fn bn_mean_finalize(sum: &[f32], mut mean: DisjointSlice<f32>, inv_n: f32) {
+    pub fn bn_mean_finalize(partial: &[f32], mut mean: DisjointSlice<f32>, inv_n: f32) {
         let idx = thread::index_1d();
         let c = idx.get();
         if let Some(m) = mean.get_mut(idx) {
-            *m = sum[c] * inv_n;
+            let mut sum = 0.0f32;
+            let mut t = 0usize;
+            while t < 256 {
+                sum += partial[c * 256 + t];
+                t += 1;
+            }
+            *m = sum * inv_n;
         }
     }
 

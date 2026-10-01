@@ -371,7 +371,8 @@ impl OxideBackend {
         expect_len(OP, "weights", weights.len(), g.w_len())?;
         expect_len(OP, "output gradient", dy.len(), g.y_len())?;
 
-        let mut dx = self.alloc(g.x_len())?;
+        // Both paths write every element (direct: one thread each; col2im is a per-element gather that stores).
+        let mut dx = self.alloc_uninit(g.x_len())?;
         if self.use_direct(&g) {
             // SAFETY: one thread per input element.
             unsafe {
@@ -479,7 +480,8 @@ impl OxideBackend {
         expect_shape(OP, "weight", weight_shape, &[g.f, g.cpg(), g.k, g.k])?;
         expect_len(OP, "output gradient", dy.len(), g.y_len())?;
 
-        let mut dw = self.alloc(g.w_len())?;
+        // Every element is written (direct: one block each; GEMM: `beta = 0` on the first image).
+        let mut dw = self.alloc_uninit(g.w_len())?;
         if self.use_direct(&g) {
             // SAFETY: one block per weight element, launched for exactly
             // `w_len` blocks of WGRAD_THREADS threads.

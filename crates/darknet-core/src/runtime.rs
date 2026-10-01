@@ -2149,8 +2149,12 @@ where
     adam_step: u32,
     /// See [`ExecutableNetwork::set_train_iteration`].
     train_iteration: usize,
-    /// Host convolution weights lag the device ones (deferred updates).
+    /// Host convolution weights / biases / BN gamma and rolling stats lag the
+    /// device ones (deferred updates, see `sync_host_weights_from_device`).
     host_weights_stale: bool,
+    /// Set by [`Self::update_weights_gpu_deferred`]: the backward pass keeps the
+    /// BN rolling stats on the device instead of downloading them per step.
+    defer_host_sync: bool,
 }
 
 /// First/second moments of one tensor.
@@ -2229,16 +2233,6 @@ where
     B: F32TensorOpsBackend,
     B::Error: std::fmt::Display,
 {
-    let u = backend
-        .sanitize_nan_inf_f32(u, shape, NanInfMode::Reset, config)
-        .map_err(|err| backend_error("GPU update reset_nan_and_inf", err))?;
-    let w = if is_weight {
-        backend
-            .sanitize_nan_inf_f32(w, shape, NanInfMode::Fix, config)
-            .map_err(|err| backend_error("GPU weight fix_nan_and_inf", err))?
-    } else {
-        w.clone()
-    };
     match step {
         GpuOptimizerStep::Sgd {
             lr,
@@ -2246,9 +2240,11 @@ where
             decay,
             batch,
         } => backend
-            .sgd_update_f32(
-                &w,
-                &u,
+            .sanitized_sgd_update_f32(
+                w,
+                u,
+                shape,
+                is_weight,
                 *lr,
                 *momentum,
                 if is_weight { *decay } else { 0.0 },
@@ -2273,14 +2269,11 @@ where
             if !is_weight && params.decoupled_decay {
                 params.decay = 0.0;
             }
-            let (w, m, v) = backend
-                .adam_update_f32(&w, &u, m, v, &params, config)
+            let (w, m, v, zeroed_updates) = backend
+                .sanitized_adam_update_f32(w, u, m, v, shape, is_weight, &params, config)
                 .map_err(|err| backend_error("GPU Adam update", err))?;
             *moments = Some((m, v));
-            let zeros = backend
-                .zeros_f32(shape)
-                .map_err(|err| backend_error("zero GPU Adam updates", err))?;
-            Ok((w, zeros))
+            Ok((w, zeroed_updates))
         }
     }
 }
@@ -2296,10 +2289,20 @@ struct GpuConvolutionLayerParams<T> {
     weights: T,
     biases: T,
     batch_norm_scales: Option<T>,
+    /// Device-resident BN gamma and rolling stats (the source of truth during
+    /// training; the host copies lag when `host_weights_stale`).
+    bn: Option<GpuBatchNormState<T>>,
     /// The raw weights/BN stats changed since `weights`/`biases`/
     /// `batch_norm_scales` (the BN-folded inference copies) were built; they
     /// are re-folded on the device the next time something needs them.
     folded_stale: bool,
+}
+
+#[derive(Clone, Debug)]
+struct GpuBatchNormState<T> {
+    scales: T,
+    rolling_mean: T,
+    rolling_variance: T,
 }
 
 #[derive(Clone, Debug)]
@@ -2600,6 +2603,7 @@ where
             adam_step: 0,
             train_iteration: 0,
             host_weights_stale: false,
+            defer_host_sync: false,
         }
     }
 
@@ -2704,11 +2708,12 @@ where
         self.update_weights_gpu_impl(lr, momentum, decay, batch, true)
     }
 
-    /// Like [`Self::update_weights_gpu`] but the convolution weights stay on the
-    /// device: `self.params[..].weights` is stale until
-    /// [`Self::sync_host_weights_from_device`] runs (call it before reading or
-    /// saving `params`).  Biases and BN statistics stay host-synced.  Falls back
-    /// to the eager sync when the CPU backward fallback reads host weights.
+    /// Like [`Self::update_weights_gpu`] but the convolution weights, biases and
+    /// BN gamma / rolling statistics stay on the device (the following backward
+    /// passes keep the rolling stats there too): `self.params[..]` conv
+    /// parameters are stale until [`Self::sync_host_weights_from_device`] runs
+    /// (call it before reading or saving `params`).  Falls back to the eager
+    /// sync when the CPU backward fallback reads host weights.
     pub fn update_weights_gpu_deferred(
         &mut self,
         lr: f32,
@@ -2720,7 +2725,8 @@ where
         self.update_weights_gpu_impl(lr, momentum, decay, batch, eager)
     }
 
-    /// Refreshes the host convolution weights after deferred updates.
+    /// Refreshes the host convolution weights, biases and BN gamma / rolling
+    /// stats after deferred updates.
     pub fn sync_host_weights_from_device(&mut self) -> Result<()> {
         if !self.host_weights_stale {
             return Ok(());
@@ -2734,7 +2740,7 @@ where
             }
             let cached = self.device_conv_params.borrow()[layer_index].clone();
             if let Some(cached) = cached {
-                self.sync_convolution_weights_from_device(layer_index, &cached)?;
+                self.sync_convolution_params_from_device(layer_index, &cached)?;
             }
         }
         self.host_weights_stale = false;
@@ -2750,6 +2756,7 @@ where
         sync_host_weights: bool,
     ) -> Result<()> {
         let config = ElementwiseLaunchConfig::default();
+        self.defer_host_sync = !sync_host_weights;
         let net = &self.network.net;
         let loss_scale = if net.loss_scale > 0.0 && net.loss_scale.is_finite() {
             net.loss_scale
@@ -2887,8 +2894,9 @@ where
                 &[filters],
                 config,
             )?;
-            let scale_updates = self.update_gpu_batch_norm_scales(
-                owner,
+            let (new_scales, scale_updates) = self.update_gpu_batch_norm_scales(
+                cached.bn.as_ref().map(|bn| &bn.scales),
+                filters,
                 train.scale_updates,
                 &layer_step,
                 &mut moments.scales,
@@ -2896,19 +2904,17 @@ where
             )?;
             self.adam_state[owner] = Some(moments);
 
-            let (refreshed, biases_host) = self.refresh_device_convolution_params(
+            let refreshed = self.refresh_device_convolution_params(
                 owner,
                 raw_weights,
                 raw_biases,
+                new_scales,
                 weight_updates,
                 bias_updates,
                 scale_updates,
             )?;
-            if let Some(LayerParams::Convolutional(params)) = self.params.get_mut(owner) {
-                params.biases = biases_host;
-            }
             if sync_host_weights {
-                self.sync_convolution_weights_from_device(owner, &refreshed)?;
+                self.sync_convolution_params_from_device(owner, &refreshed)?;
             } else {
                 self.host_weights_stale = true;
             }
@@ -3086,15 +3092,14 @@ where
         config: ElementwiseLaunchConfig,
     ) -> Result<(B::Tensor, GpuBatchNormCache<B::Tensor>)> {
         validate_batchnorm_params(batch_norm, shape.channels)?;
-        let upload = |name: &str, host: &[f32]| {
-            self.backend
-                .upload_f32(&[host.len()], host)
-                .map_err(|err| backend_error(name, err))
-        };
-        let scales = upload("upload batch-norm scales", &batch_norm.scales)?;
-        let rolling_mean = upload("upload batch-norm rolling mean", &batch_norm.rolling_mean)?;
-        let rolling_variance =
-            upload("upload batch-norm rolling variance", &batch_norm.rolling_variance)?;
+        let state = cached.bn.as_ref().ok_or_else(|| {
+            Error::InvalidConfig("missing device batch-norm state for a BN layer".to_owned())
+        })?;
+        let (scales, rolling_mean, rolling_variance) = (
+            state.scales.clone(),
+            state.rolling_mean.clone(),
+            state.rolling_variance.clone(),
+        );
         let result = self
             .backend
             .batchnorm_train_forward_f32(
@@ -5195,48 +5200,38 @@ where
         Ok(scale_grad)
     }
 
+    /// Optimizer step of the device-resident BN gamma.  Returns the new gamma
+    /// and the new (accumulated) scale updates; `None` for non-BN layers.
     fn update_gpu_batch_norm_scales(
-        &mut self,
-        owner: usize,
+        &self,
+        scales: Option<&B::Tensor>,
+        channels: usize,
         scale_updates: Option<B::Tensor>,
         step: &GpuOptimizerStep,
         moments: &mut Option<GpuMoments<B::Tensor>>,
         config: ElementwiseLaunchConfig,
-    ) -> Result<Option<B::Tensor>> {
+    ) -> Result<(Option<B::Tensor>, Option<B::Tensor>)> {
         let Some(scale_updates) = scale_updates else {
-            return Ok(None);
+            return Ok((None, None));
         };
-        let Some(LayerParams::Convolutional(params)) = self.params.get_mut(owner) else {
-            return Err(Error::InvalidConfig(format!(
-                "missing CPU convolution params for layer #{owner}"
-            )));
+        let Some(scales) = scales else {
+            return Err(Error::InvalidConfig(
+                "GPU batch-norm scale updates exist for a layer without device BN state"
+                    .to_owned(),
+            ));
         };
-        let Some(batch_norm) = params.batch_norm.as_mut() else {
-            return Err(Error::InvalidConfig(format!(
-                "GPU batch-norm scale updates exist for non-BN layer #{owner}"
-            )));
-        };
-
-        let shape = [batch_norm.scales.len()];
-        let scales = self
-            .backend
-            .upload_f32(&shape, &batch_norm.scales)
-            .map_err(|err| backend_error("upload GPU batch-norm scales", err))?;
+        let shape = [channels];
         let (updated_scales, updated_scale_updates) = gpu_optimizer_step(
             &self.backend,
             step,
             false,
-            &scales,
+            scales,
             &scale_updates,
             moments,
             &shape,
             config,
         )?;
-        batch_norm.scales = self
-            .backend
-            .download_f32(&updated_scales)
-            .map_err(|err| backend_error("download GPU batch-norm scales", err))?;
-        Ok(Some(updated_scale_updates))
+        Ok((Some(updated_scales), Some(updated_scale_updates)))
     }
 
     fn update_gpu_convolution_batch_norm_running_stats(
@@ -5259,36 +5254,40 @@ where
         self.refresh_gpu_batch_norm_cache(owner)
     }
 
-    /// Stores already-updated rolling statistics (from the device EMA).
-    fn set_gpu_convolution_batch_norm_rolling_stats(
+    /// Stores the device-computed rolling statistics of the batch-statistics
+    /// forward.  The host copy is refreshed now unless host syncs are deferred.
+    fn set_device_batch_norm_rolling_stats(
         &mut self,
         owner: usize,
-        mean: Vec<f32>,
-        variance: Vec<f32>,
+        mean: B::Tensor,
+        variance: B::Tensor,
     ) -> Result<()> {
-        let Some(LayerParams::Convolutional(params)) = self.params.get_mut(owner) else {
+        let mut cached = self.device_conv_params.borrow()[owner]
+            .clone()
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "missing cached GPU convolution params for layer #{owner}"
+                ))
+            })?;
+        let Some(bn) = cached.bn.as_mut() else {
             return Err(Error::InvalidConfig(format!(
-                "missing CPU convolution params for layer #{owner}"
+                "missing device batch-norm state for layer #{owner}"
             )));
         };
-        let Some(batch_norm) = params.batch_norm.as_mut() else {
-            return Err(Error::InvalidConfig(format!(
-                "missing batch-norm params for convolutional layer #{owner}"
-            )));
-        };
-        if batch_norm.rolling_mean.len() != mean.len()
-            || batch_norm.rolling_variance.len() != variance.len()
-        {
-            return Err(Error::InvalidConfig(format!(
-                "GPU batch-norm rolling stat mismatch at layer #{owner}"
-            )));
+        bn.rolling_mean = mean;
+        bn.rolling_variance = variance;
+        cached.folded_stale = true;
+        self.device_conv_params.borrow_mut()[owner] = Some(cached.clone());
+        if self.defer_host_sync {
+            self.host_weights_stale = true;
+        } else {
+            self.sync_convolution_params_from_device(owner, &cached)?;
         }
-        batch_norm.rolling_mean = mean;
-        batch_norm.rolling_variance = variance;
-        self.refresh_gpu_batch_norm_cache(owner)
+        Ok(())
     }
 
-    /// Marks the folded device params stale after the host rolling stats changed.
+    /// Marks the folded device params stale after the host BN stats changed and
+    /// re-uploads the host BN state to the device.
     fn refresh_gpu_batch_norm_cache(&mut self, owner: usize) -> Result<()> {
         let cached = self
             .device_conv_params
@@ -5301,6 +5300,13 @@ where
                 ))
             })?;
         let mut cached = cached;
+        if let Some(LayerParams::Convolutional(ConvolutionalParams {
+            batch_norm: Some(batch_norm),
+            ..
+        })) = self.params.get(owner)
+        {
+            cached.bn = Some(self.upload_batch_norm_state(batch_norm)?);
+        }
         cached.folded_stale = true;
         self.device_conv_params.borrow_mut()[owner] = Some(cached);
         Ok(())
@@ -5323,12 +5329,7 @@ where
             if let Some(cache) = forward.gpu_batch_norm_caches[layer.index].as_ref() {
                 // Batch-statistics forward: the device already did the EMA.
                 if let Some((mean, variance)) = cache.rolling.as_ref() {
-                    let download = |tensor: &B::Tensor| {
-                        self.backend
-                            .download_f32(tensor)
-                            .map_err(|err| backend_error("download GPU batch-norm rolling stats", err))
-                    };
-                    batch_norm_rolling.push((layer.index, download(mean)?, download(variance)?));
+                    batch_norm_rolling.push((layer.index, mean.clone(), variance.clone()));
                 }
                 continue;
             }
@@ -5383,7 +5384,7 @@ where
             self.update_gpu_convolution_batch_norm_running_stats(owner, &mean, &variance)?;
         }
         for (owner, mean, variance) in batch_norm_rolling {
-            self.set_gpu_convolution_batch_norm_rolling_stats(owner, mean, variance)?;
+            self.set_device_batch_norm_rolling_stats(owner, mean, variance)?;
         }
         Ok(())
     }
@@ -5453,7 +5454,7 @@ where
             spec,
             input_channels,
             params,
-            Some((cached.raw_weights, cached.raw_biases)),
+            Some((cached.raw_weights, cached.raw_biases, cached.bn)),
         )?;
         self.device_conv_params.borrow_mut()[layer_index] = Some(refolded.clone());
         Ok(refolded)
@@ -5531,6 +5532,11 @@ where
                         .map_err(|err| backend_error("upload batch-norm scales", err))
                 })
                 .transpose()?,
+            bn: params
+                .batch_norm
+                .as_ref()
+                .map(|batch_norm| self.upload_batch_norm_state(batch_norm))
+                .transpose()?,
         };
 
         let mut cached = self.device_conv_params.borrow_mut();
@@ -5545,15 +5551,18 @@ where
         Ok(entry.clone().expect("device params were just initialized"))
     }
 
+    /// Stores the updated raw tensors; the BN-folded copies are re-folded lazily.
+    /// Nothing is copied to the host (see `sync_convolution_params_from_device`).
     fn refresh_device_convolution_params(
         &self,
         owner: usize,
         raw_weights: B::Tensor,
         raw_biases: B::Tensor,
+        scales: Option<B::Tensor>,
         weight_updates: B::Tensor,
         bias_updates: B::Tensor,
         scale_updates: Option<B::Tensor>,
-    ) -> Result<(GpuConvolutionLayerParams<B::Tensor>, Vec<f32>)> {
+    ) -> Result<GpuConvolutionLayerParams<B::Tensor>> {
         let layer =
             self.network.layers.get(owner).ok_or_else(|| {
                 Error::InvalidConfig(format!("missing convolutional layer #{owner}"))
@@ -5563,12 +5572,6 @@ where
                 "layer #{owner} is not convolutional"
             )));
         };
-        // Weights stay on the device (the BN fold runs there); only the small
-        // bias vector round-trips so the host copy and the fold stay exact.
-        let biases_host = self
-            .backend
-            .download_f32(&raw_biases)
-            .map_err(|err| backend_error("download raw convolution biases", err))?;
         let params = resolve_convolutional_params(&self.network, &self.params, owner)?;
         let folds = spec.batch_normalize && params.batch_norm.is_some();
         let mut refreshed = self.device_conv_params.borrow()[owner]
@@ -5578,6 +5581,9 @@ where
             })?;
         refreshed.raw_weights = raw_weights.clone();
         refreshed.raw_biases = raw_biases.clone();
+        if let (Some(scales), Some(bn)) = (scales, refreshed.bn.as_mut()) {
+            bn.scales = scales;
+        }
         if folds {
             refreshed.folded_stale = true;
         } else {
@@ -5590,7 +5596,26 @@ where
             bias_updates,
             scale_updates,
         });
-        Ok((refreshed, biases_host))
+        Ok(refreshed)
+    }
+
+    fn upload_batch_norm_state(
+        &self,
+        batch_norm: &BatchNormParams,
+    ) -> Result<GpuBatchNormState<B::Tensor>> {
+        let upload = |name: &str, host: &[f32]| {
+            self.backend
+                .upload_f32(&[host.len()], host)
+                .map_err(|err| backend_error(name, err))
+        };
+        Ok(GpuBatchNormState {
+            scales: upload("upload batch-norm scales", &batch_norm.scales)?,
+            rolling_mean: upload("upload batch-norm rolling mean", &batch_norm.rolling_mean)?,
+            rolling_variance: upload(
+                "upload batch-norm rolling variance",
+                &batch_norm.rolling_variance,
+            )?,
+        })
     }
 
     fn cached_convolution_upload(
@@ -5598,7 +5623,7 @@ where
         spec: &ConvolutionalSpec,
         input_channels: usize,
         params: &ConvolutionalParams,
-        raw: Option<(B::Tensor, B::Tensor)>,
+        raw: Option<(B::Tensor, B::Tensor, Option<GpuBatchNormState<B::Tensor>>)>,
     ) -> Result<GpuConvolutionLayerParams<B::Tensor>> {
         let weight_shape = [
             spec.filters,
@@ -5606,97 +5631,78 @@ where
             spec.size,
             spec.size,
         ];
-        // With device-resident raw weights the BN fold runs on the device
-        // (`w * gamma / sqrt(var + eps)` per filter, the same arithmetic as
-        // `fold_convolutional_params_for_inference`), so the host weights may
-        // be stale; only `params.biases` and the BN stats are read.
-        let (raw_weights, raw_biases, folded_weights, folded_biases) = match raw {
-            Some((raw_weights, raw_biases)) => {
-                let folded = match params.batch_norm.as_ref().filter(|_| spec.batch_normalize) {
-                    Some(batch_norm) => {
-                        if params.biases.len() != spec.filters
-                            || batch_norm.scales.len() != spec.filters
-                            || batch_norm.rolling_mean.len() != spec.filters
-                            || batch_norm.rolling_variance.len() != spec.filters
-                        {
-                            return Err(Error::InvalidConfig(format!(
-                                "batch norm parameter length mismatch for {} filters",
-                                spec.filters
-                            )));
-                        }
-                        let scales = batch_norm
-                            .scales
-                            .iter()
-                            .zip(&batch_norm.rolling_variance)
-                            .map(|(scale, variance)| scale / (variance + BATCH_NORM_EPSILON).sqrt())
-                            .collect::<Vec<_>>();
-                        let biases = params
-                            .biases
-                            .iter()
-                            .zip(&batch_norm.rolling_mean)
-                            .zip(&scales)
-                            .map(|((bias, mean), scale)| bias - mean * scale)
-                            .collect::<Vec<_>>();
-                        let scales = self
-                            .backend
-                            .upload_f32(&[spec.filters], &scales)
-                            .map_err(|err| backend_error("upload batch-norm fold scales", err))?;
-                        let weights = self
-                            .backend
-                            .channel_scale_f32(
-                                &raw_weights,
-                                &scales,
-                                spec.filters,
-                                weight_shape[1] * spec.size * spec.size,
-                                ElementwiseLaunchConfig::default(),
-                            )
-                            .map_err(|err| backend_error("fold convolution weights", err))?;
-                        Some((weights, biases))
-                    }
-                    None => None,
-                };
-                let (weights, biases) = match folded {
-                    Some((weights, biases)) => (Some(weights), biases),
-                    None => (None, Vec::new()),
-                };
-                (raw_weights, raw_biases, weights, biases)
-            }
-            None => {
-                let (folded_biases, folded_weights) =
-                    fold_convolutional_params_for_inference(spec, params, input_channels)?;
-                let raw_weights = self
+        // With device-resident raw weights and BN state the fold runs on the
+        // device (`scale = gamma / sqrt(var + eps)`, `w * scale` per filter,
+        // `bias - mean * scale`, the same arithmetic as
+        // `fold_convolutional_params_for_inference`), so the host copies may be
+        // stale.
+        if let Some((raw_weights, raw_biases, bn)) = raw {
+            let mut weights = raw_weights.clone();
+            let mut biases = raw_biases.clone();
+            let mut batch_norm_scales = None;
+            if let Some(bn) = bn.as_ref() {
+                let (scales, folded_biases) = self
                     .backend
-                    .upload_f32(&weight_shape, &params.weights)
-                    .map_err(|err| backend_error("upload raw convolution weights", err))?;
-                let raw_biases = self
-                    .backend
-                    .upload_f32(&[spec.filters], &params.biases)
-                    .map_err(|err| backend_error("upload raw convolution biases", err))?;
-                let folded_weights = if spec.batch_normalize {
-                    Some(
-                        self.backend
-                            .upload_f32(&weight_shape, &folded_weights)
-                            .map_err(|err| {
-                                backend_error("upload folded convolution weights", err)
-                            })?,
+                    .batchnorm_fold_f32(
+                        &bn.scales,
+                        &bn.rolling_mean,
+                        &bn.rolling_variance,
+                        &raw_biases,
+                        BATCH_NORM_EPSILON,
+                        ElementwiseLaunchConfig::default(),
                     )
-                } else {
-                    None
-                };
-                (raw_weights, raw_biases, folded_weights, folded_biases)
+                    .map_err(|err| backend_error("fold batch-norm parameters", err))?;
+                if spec.batch_normalize {
+                    weights = self
+                        .backend
+                        .channel_scale_f32(
+                            &raw_weights,
+                            &scales,
+                            spec.filters,
+                            weight_shape[1] * spec.size * spec.size,
+                            ElementwiseLaunchConfig::default(),
+                        )
+                        .map_err(|err| backend_error("fold convolution weights", err))?;
+                    biases = folded_biases;
+                }
+                batch_norm_scales = Some(scales);
             }
-        };
-        let biases = if folded_weights.is_some() {
-            self.backend
-                .upload_f32(&[spec.filters], &folded_biases)
-                .map_err(|err| backend_error("upload folded convolution biases", err))?
+            return Ok(GpuConvolutionLayerParams {
+                raw_weights,
+                raw_biases,
+                weights,
+                biases,
+                folded_stale: false,
+                batch_norm_scales,
+                bn,
+            });
+        }
+        let (folded_biases, folded_weights) =
+            fold_convolutional_params_for_inference(spec, params, input_channels)?;
+        let raw_weights = self
+            .backend
+            .upload_f32(&weight_shape, &params.weights)
+            .map_err(|err| backend_error("upload raw convolution weights", err))?;
+        let raw_biases = self
+            .backend
+            .upload_f32(&[spec.filters], &params.biases)
+            .map_err(|err| backend_error("upload raw convolution biases", err))?;
+        let (weights, biases) = if spec.batch_normalize {
+            (
+                self.backend
+                    .upload_f32(&weight_shape, &folded_weights)
+                    .map_err(|err| backend_error("upload folded convolution weights", err))?,
+                self.backend
+                    .upload_f32(&[spec.filters], &folded_biases)
+                    .map_err(|err| backend_error("upload folded convolution biases", err))?,
+            )
         } else {
-            raw_biases.clone()
+            (raw_weights.clone(), raw_biases.clone())
         };
         Ok(GpuConvolutionLayerParams {
-            raw_weights: raw_weights.clone(),
+            raw_weights,
             raw_biases,
-            weights: folded_weights.unwrap_or(raw_weights),
+            weights,
             biases,
             folded_stale: false,
             batch_norm_scales: params
@@ -5714,25 +5720,49 @@ where
                         .map_err(|err| backend_error("upload batch-norm scales", err))
                 })
                 .transpose()?,
+            bn: params
+                .batch_norm
+                .as_ref()
+                .map(|batch_norm| self.upload_batch_norm_state(batch_norm))
+                .transpose()?,
         })
     }
 
-    /// Copies the device raw weights of one owner convolution to the host params.
-    fn sync_convolution_weights_from_device(
+    /// Copies the device raw weights, biases and BN gamma / rolling stats of one
+    /// owner convolution to the host params.
+    fn sync_convolution_params_from_device(
         &mut self,
         owner: usize,
         cached: &GpuConvolutionLayerParams<B::Tensor>,
     ) -> Result<()> {
-        let raw_weights = self
-            .backend
-            .download_f32(&cached.raw_weights)
-            .map_err(|err| backend_error("download synced raw convolution weights", err))?;
+        let download = |name: &str, tensor: &B::Tensor| {
+            self.backend
+                .download_f32(tensor)
+                .map_err(|err| backend_error(name, err))
+        };
+        let raw_weights = download("download synced raw convolution weights", &cached.raw_weights)?;
+        let raw_biases = download("download synced raw convolution biases", &cached.raw_biases)?;
+        let bn = match cached.bn.as_ref() {
+            Some(bn) => Some((
+                download("download synced batch-norm scales", &bn.scales)?,
+                download("download synced batch-norm rolling mean", &bn.rolling_mean)?,
+                download("download synced batch-norm rolling variance", &bn.rolling_variance)?,
+            )),
+            None => None,
+        };
         let Some(LayerParams::Convolutional(params)) = self.params.get_mut(owner) else {
             return Err(Error::InvalidConfig(format!(
                 "missing CPU convolution params for layer #{owner}"
             )));
         };
         params.weights = raw_weights;
+        params.biases = raw_biases;
+        if let (Some((scales, mean, variance)), Some(batch_norm)) = (bn, params.batch_norm.as_mut())
+        {
+            batch_norm.scales = scales;
+            batch_norm.rolling_mean = mean;
+            batch_norm.rolling_variance = variance;
+        }
         Ok(())
     }
 }

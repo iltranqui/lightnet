@@ -709,10 +709,9 @@ impl OxideBackend {
             )
         }
         .map_err(launch_err)?;
-        let sum = self.fold_partials(&partial, channels)?;
         let mut mean = self.alloc_uninit(channels)?;
         // SAFETY: one thread per channel.
-        unsafe { self.batchnorm.bn_mean_finalize(&self.stream, per_channel, &sum, &mut mean, 1.0 / n) }
+        unsafe { self.batchnorm.bn_mean_finalize(&self.stream, per_channel, &partial, &mut mean, 1.0 / n) }
             .map_err(launch_err)?;
         // SAFETY: as above; every `partial` slot is rewritten.
         unsafe {

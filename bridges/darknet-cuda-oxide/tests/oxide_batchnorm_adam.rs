@@ -338,3 +338,99 @@ fn sanitize_nan_inf_matches_host_reference() {
     }
     assert!(be.sanitize_nan_inf_f32(&t, &[3], NanInfMode::Reset, cfg()).is_err());
 }
+
+fn poisoned(rng: &mut Rng, n: usize) -> Vec<f32> {
+    let mut v = rng.vec(n, -1.0, 1.0);
+    for (i, x) in v.iter_mut().enumerate() {
+        match i % 7 {
+            1 => *x = f32::NAN,
+            3 => *x = f32::INFINITY,
+            5 => *x = f32::NEG_INFINITY,
+            _ => {}
+        }
+    }
+    v
+}
+
+fn bits(v: Vec<f32>) -> Vec<u32> {
+    v.into_iter().map(f32::to_bits).collect()
+}
+
+#[test]
+fn fused_sanitized_sgd_is_bit_identical_to_the_three_launches() {
+    let be = backend();
+    let mut rng = Rng(0x5eed_1234_abcd_0001);
+    for (n, fix_weights, decay) in [(1000usize, true, 5e-4f32), (37, false, 0.0), (1, true, 1e-3)] {
+        let w = be.upload_f32(&[n], &poisoned(&mut rng, n)).unwrap();
+        let u = be.upload_f32(&[n], &poisoned(&mut rng, n)).unwrap();
+        let u_clean = be.sanitize_nan_inf_f32(&u, &[n], NanInfMode::Reset, cfg()).unwrap();
+        let w_clean = if fix_weights {
+            be.sanitize_nan_inf_f32(&w, &[n], NanInfMode::Fix, cfg()).unwrap()
+        } else {
+            w.clone()
+        };
+        let (rw, ru) = be.sgd_update_f32(&w_clean, &u_clean, 0.01, 0.9, decay, 4, cfg()).unwrap();
+        let (fw, fu) = be
+            .sanitized_sgd_update_f32(&w, &u, &[n], fix_weights, 0.01, 0.9, decay, 4, cfg())
+            .unwrap();
+        assert_eq!(bits(be.download_f32(&fw).unwrap()), bits(be.download_f32(&rw).unwrap()), "weights n={n}");
+        assert_eq!(bits(be.download_f32(&fu).unwrap()), bits(be.download_f32(&ru).unwrap()), "updates n={n}");
+    }
+}
+
+#[test]
+fn fused_sanitized_adam_is_bit_identical_to_the_separate_launches() {
+    let be = backend();
+    let mut rng = Rng(0x5eed_1234_abcd_0002);
+    let n = 513;
+    let p = AdamParams {
+        lr: 1e-3,
+        beta1: 0.9,
+        beta2: 0.999,
+        eps: 1e-7,
+        decay: 5e-4,
+        batch: 2,
+        step: 3,
+        decoupled_decay: false,
+    };
+    for fix_weights in [true, false] {
+        let w = be.upload_f32(&[n], &poisoned(&mut rng, n)).unwrap();
+        let u = be.upload_f32(&[n], &poisoned(&mut rng, n)).unwrap();
+        let m = be.upload_f32(&[n], &rng.vec(n, -0.1, 0.1)).unwrap();
+        let v = be.upload_f32(&[n], &rng.vec(n, 0.0, 0.1)).unwrap();
+        let u_clean = be.sanitize_nan_inf_f32(&u, &[n], NanInfMode::Reset, cfg()).unwrap();
+        let w_clean = if fix_weights {
+            be.sanitize_nan_inf_f32(&w, &[n], NanInfMode::Fix, cfg()).unwrap()
+        } else {
+            w.clone()
+        };
+        let (rw, rm, rv) = be.adam_update_f32(&w_clean, &u_clean, &m, &v, &p, cfg()).unwrap();
+        let (fw, fm, fv, fu) = be
+            .sanitized_adam_update_f32(&w, &u, &m, &v, &[n], fix_weights, &p, cfg())
+            .unwrap();
+        for (name, a, b) in [("w", &fw, &rw), ("m", &fm, &rm), ("v", &fv, &rv)] {
+            assert_eq!(bits(be.download_f32(a).unwrap()), bits(be.download_f32(b).unwrap()), "{name}");
+        }
+        assert!(be.download_f32(&fu).unwrap().iter().all(|x| x.to_bits() == 0), "updates zeroed");
+    }
+}
+
+#[test]
+fn batchnorm_fold_matches_the_host_fold() {
+    let be = backend();
+    let mut rng = Rng(0x5eed_1234_abcd_0003);
+    let c = 130;
+    let (g, m, bias) = (rng.vec(c, 0.5, 1.5), rng.vec(c, -1.0, 1.0), rng.vec(c, -1.0, 1.0));
+    let var = rng.vec(c, 0.0, 2.0);
+    let up = |v: &[f32]| be.upload_f32(&[c], v).unwrap();
+    let (scale, folded) = be
+        .batchnorm_fold_f32(&up(&g), &up(&m), &up(&var), &up(&bias), EPS as f32, cfg())
+        .unwrap();
+    let (scale, folded) = (be.download_f32(&scale).unwrap(), be.download_f32(&folded).unwrap());
+    for i in 0..c {
+        let s = g[i] / (var[i] + EPS as f32).sqrt();
+        let b = bias[i] - m[i] * s;
+        assert!((scale[i] - s).abs() <= 1e-6 * s.abs(), "scale[{i}]: {} vs {s}", scale[i]);
+        assert!((folded[i] - b).abs() <= 1e-6 * (1.0 + b.abs()), "bias[{i}]: {} vs {b}", folded[i]);
+    }
+}

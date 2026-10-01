@@ -784,6 +784,78 @@ pub trait F32TensorOpsBackend {
             self.upload_f32(&shape, &v1)?,
         ))
     }
+
+    /// Fused `reset_nan_and_inf(updates)` + (`fix_weights`) `fix_nan_and_inf(weights)`
+    /// + [`Self::sgd_update_f32`] (decay already `0` for biases / BN scales).
+    /// Backends override it to do the three steps in one launch; the result is
+    /// identical to the composition below.
+    fn sanitized_sgd_update_f32(
+        &self,
+        weights: &Self::Tensor,
+        updates: &Self::Tensor,
+        shape: &[usize],
+        fix_weights: bool,
+        lr: f32,
+        momentum: f32,
+        decay: f32,
+        batch: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        let u = self.sanitize_nan_inf_f32(updates, shape, NanInfMode::Reset, config)?;
+        let w = if fix_weights {
+            self.sanitize_nan_inf_f32(weights, shape, NanInfMode::Fix, config)?
+        } else {
+            weights.clone()
+        };
+        self.sgd_update_f32(&w, &u, lr, momentum, decay, batch, config)
+    }
+
+    /// Fused sanitize + [`Self::adam_update_f32`]; returns
+    /// `(weights', m', v', zeroed updates)` (Adam clears the accumulated updates).
+    fn sanitized_adam_update_f32(
+        &self,
+        weights: &Self::Tensor,
+        updates: &Self::Tensor,
+        m: &Self::Tensor,
+        v: &Self::Tensor,
+        shape: &[usize],
+        fix_weights: bool,
+        params: &AdamParams,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let u = self.sanitize_nan_inf_f32(updates, shape, NanInfMode::Reset, config)?;
+        let w = if fix_weights {
+            self.sanitize_nan_inf_f32(weights, shape, NanInfMode::Fix, config)?
+        } else {
+            weights.clone()
+        };
+        let (w, m, v) = self.adam_update_f32(&w, &u, m, v, params, config)?;
+        Ok((w, m, v, self.zeros_f32(shape)?))
+    }
+
+    /// Per-channel inference fold of batch norm: `scale = gamma / sqrt(var + eps)`
+    /// and `bias' = bias - mean * scale`.  Returns `(scale, bias')`.
+    fn batchnorm_fold_f32(
+        &self,
+        gamma: &Self::Tensor,
+        mean: &Self::Tensor,
+        variance: &Self::Tensor,
+        bias: &Self::Tensor,
+        eps: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        let (g, m, v, b) = (
+            self.download_f32(gamma)?,
+            self.download_f32(mean)?,
+            self.download_f32(variance)?,
+            self.download_f32(bias)?,
+        );
+        let scale: Vec<f32> = g.iter().zip(&v).map(|(g, v)| g / (v + eps).sqrt()).collect();
+        let folded: Vec<f32> = b.iter().zip(&m).zip(&scale).map(|((b, m), s)| b - m * s).collect();
+        let shape = [scale.len()];
+        Ok((self.upload_f32(&shape, &scale)?, self.upload_f32(&shape, &folded)?))
+    }
 }
 
 /// Opt-in half-precision (binary16) INFERENCE surface on top of the f32 ops.

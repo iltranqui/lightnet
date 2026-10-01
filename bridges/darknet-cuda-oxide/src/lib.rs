@@ -1303,7 +1303,13 @@ impl F32TensorOpsBackend for OxideBackend {
                     ),
                 ));
             }
-            let mut grad = self.alloc(len)?;
+            // A slice that covers every channel is fully overwritten; otherwise the
+            // untouched channels must read zero.
+            let mut grad = if input_channels[k] == input_total_channels[k] {
+                self.alloc_uninit(len)?
+            } else {
+                self.alloc(len)?
+            };
             let count = batch * input_channels[k] * channel_stride;
             // SAFETY: distinct destination per thread inside `grad`, which
             // covers `batch * input_total_channels[k] * stride` (validated).
@@ -2507,10 +2513,9 @@ impl F32TensorOpsBackend for OxideBackend {
             )
         }
         .map_err(launch_err)?;
-        let sum = self.fold_partials(&partial, channels)?;
         let mut mean = self.alloc_uninit(channels)?;
         // SAFETY: one thread per channel.
-        unsafe { self.batchnorm.bn_mean_finalize(&self.stream, per_channel, &sum, &mut mean, 1.0 / n) }
+        unsafe { self.batchnorm.bn_mean_finalize(&self.stream, per_channel, &partial, &mut mean, 1.0 / n) }
             .map_err(launch_err)?;
 
         // SAFETY: as above; every `partial` slot is rewritten.
@@ -2747,6 +2752,166 @@ impl F32TensorOpsBackend for OxideBackend {
             OxideTensorF32::new(new_weights, weights.shape()),
             OxideTensorF32::new(new_m, weights.shape()),
             OxideTensorF32::new(new_v, weights.shape()),
+        ))
+    }
+
+    fn sanitized_sgd_update_f32(
+        &self,
+        weights: &Self::Tensor,
+        updates: &Self::Tensor,
+        shape: &[usize],
+        fix_weights: bool,
+        lr: f32,
+        momentum: f32,
+        decay: f32,
+        batch: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        let weights_f = self.f32v(weights)?;
+        let weights = &*weights_f;
+        let updates_f = self.f32v(updates)?;
+        let updates = &*updates_f;
+        let op = "sanitized_sgd_update_f32";
+        same_len(op, weights, updates)?;
+        if shape.iter().product::<usize>() != weights.len() {
+            return Err(OxideError::Shape(format!(
+                "{op}: shape {shape:?} does not match {} elements",
+                weights.len()
+            )));
+        }
+        let batch = batch.max(1) as f32;
+        let mut new_weights = self.alloc_uninit(weights.len())?;
+        let mut new_updates = self.alloc_uninit(weights.len())?;
+        // SAFETY: one thread per element; every output slot is written.
+        unsafe {
+            self.optim.sanitized_sgd_update(
+                &self.stream,
+                launch::elementwise(weights.len(), config),
+                &weights.buf,
+                &updates.buf,
+                &mut new_weights,
+                &mut new_updates,
+                lr / batch,
+                momentum,
+                decay * batch,
+                fix_weights as u32,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok((
+            OxideTensorF32::new(new_weights, shape),
+            OxideTensorF32::new(new_updates, shape),
+        ))
+    }
+
+    fn sanitized_adam_update_f32(
+        &self,
+        weights: &Self::Tensor,
+        updates: &Self::Tensor,
+        m: &Self::Tensor,
+        v: &Self::Tensor,
+        shape: &[usize],
+        fix_weights: bool,
+        params: &AdamParams,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let weights_f = self.f32v(weights)?;
+        let weights = &*weights_f;
+        let updates_f = self.f32v(updates)?;
+        let updates = &*updates_f;
+        let m_f = self.f32v(m)?;
+        let m = &*m_f;
+        let v_f = self.f32v(v)?;
+        let v = &*v_f;
+        let op = "sanitized_adam_update_f32";
+        same_len(op, weights, updates)?;
+        same_len(op, weights, m)?;
+        same_len(op, weights, v)?;
+        if shape.iter().product::<usize>() != weights.len() {
+            return Err(OxideError::Shape(format!(
+                "{op}: shape {shape:?} does not match {} elements",
+                weights.len()
+            )));
+        }
+        let (coupled, decoupled, bc1, bc2) = params.kernel_scalars();
+        let mut new_weights = self.alloc_uninit(weights.len())?;
+        let mut new_m = self.alloc_uninit(weights.len())?;
+        let mut new_v = self.alloc_uninit(weights.len())?;
+        let mut new_updates = self.alloc_uninit(weights.len())?;
+        // SAFETY: one thread per element; every output slot is written.
+        unsafe {
+            self.optim.sanitized_adam_update(
+                &self.stream,
+                launch::elementwise(weights.len(), config),
+                &weights.buf,
+                &updates.buf,
+                &m.buf,
+                &v.buf,
+                &mut new_weights,
+                &mut new_m,
+                &mut new_v,
+                &mut new_updates,
+                params.lr,
+                params.beta1,
+                params.beta2,
+                params.eps,
+                coupled,
+                decoupled,
+                bc1,
+                bc2,
+                fix_weights as u32,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok((
+            OxideTensorF32::new(new_weights, shape),
+            OxideTensorF32::new(new_m, shape),
+            OxideTensorF32::new(new_v, shape),
+            OxideTensorF32::new(new_updates, shape),
+        ))
+    }
+
+    fn batchnorm_fold_f32(
+        &self,
+        gamma: &Self::Tensor,
+        mean: &Self::Tensor,
+        variance: &Self::Tensor,
+        bias: &Self::Tensor,
+        eps: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        let gamma_f = self.f32v(gamma)?;
+        let gamma = &*gamma_f;
+        let mean_f = self.f32v(mean)?;
+        let mean = &*mean_f;
+        let variance_f = self.f32v(variance)?;
+        let variance = &*variance_f;
+        let bias_f = self.f32v(bias)?;
+        let bias = &*bias_f;
+        let op = "batchnorm_fold_f32";
+        same_len(op, gamma, mean)?;
+        same_len(op, gamma, variance)?;
+        same_len(op, gamma, bias)?;
+        let mut scale = self.alloc_uninit(gamma.len())?;
+        let mut folded = self.alloc_uninit(gamma.len())?;
+        // SAFETY: one thread per channel; every output slot is written.
+        unsafe {
+            self.optim.bn_fold(
+                &self.stream,
+                launch::elementwise(gamma.len(), config),
+                &gamma.buf,
+                &mean.buf,
+                &variance.buf,
+                &bias.buf,
+                &mut scale,
+                &mut folded,
+                eps,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok((
+            OxideTensorF32::new(scale, gamma.shape()),
+            OxideTensorF32::new(folded, gamma.shape()),
         ))
     }
 }

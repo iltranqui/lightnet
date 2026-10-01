@@ -220,6 +220,25 @@ Accuracy of the mode (no training run, same init / input / seeds, `DARKNET_BENCH
 output deltas (the default synthetic bench, BN gradient explosion) all reduced-precision modes (tf32, fp16 compute, AMP) differ from f32 by 10-30% in the early layers and
 AMP == tf32 there too. Tests: `bridges/darknet-cuda-oxide/tests/oxide_amp.rs` (per-op vs f64, tiny net gradients and SGD tracking).
 
+### 7.3 Training-step host/launch overhead (2026-10-01)
+
+Same driver and conditions as 7.1 (`bench-train`, LegoGears_v2, 20 steps after 3 warm-up, 3 rounds, before/after binaries interleaved per round, oxide f32; AMP rows with `DARKNET_OXIDE_AMP=1`).
+Changes (semantics unchanged):
+1. Fused sanitize + SGD / Adam: `sanitized_sgd_update` / `sanitized_adam_update` kernels (reset_nan_and_inf(updates), optional fix_nan_and_inf(weights), the optimizer, and the zeroed updates for Adam) behind the new defaulted trait methods `sanitized_sgd_update_f32` / `sanitized_adam_update_f32` (default = the old composition, so other backends are untouched). 3 launches + 2 temporaries per tensor become 1 launch.
+2. BN gamma and rolling stats live on the device (`GpuConvolutionLayerParams.bn`): the training forward no longer uploads them, the backward stores the device EMA instead of downloading it, `update_gpu_batch_norm_scales` steps the device gamma, and the inference fold is a device kernel (`batchnorm_fold_f32`: scale and folded bias) instead of a host fold + uploads. The deferred path (`update_weights_gpu_deferred`) now also leaves biases, gamma and rolling stats on the device; `sync_host_weights_from_device` (called before every save, dump and by the bench) copies weights, biases, gamma, mean, variance to the host. The first backward after a fresh `update_weights_gpu` (eager) still downloads the rolling stats; `update_weights_gpu` and the CPU-fallback networks keep the old eager host-visible behaviour.
+3. No zero-fill where every element is overwritten: conv dgrad `dx` (direct kernel and the col2im gather both store), conv wgrad `dw` (direct block per element, GEMM `beta = 0` on the first image, `beta == 0` never reads C), full-coverage route gradients. BN `mean` fold fused into `bn_mean_finalize` (same fixed-order sum). Fusing the variance fold changed the rolling variance by 1 ulp (FMA contraction), so it was reverted to keep bit-exactness.
+
+| step (round medians ms) | before b1 | after b1 | before b16 | after b16 | before AMP b16 | after AMP b16 |
+|---|---|---|---|---|---|---|
+| total | 20.8 (22.3 / 19.8 / 20.8) | 11.9 (11.9 / 11.6 / 12.4) | 74.5 (74.5 / 80.2 / 74.2) | 63.2 (62.9 / 63.2 / 63.6) | 60.8 (59.2 / 62.1 / 60.8) | 46.5 (47.1 / 44.5 / 46.5) |
+| update phase | 5.5 | 0.8 | 5.8 | 1.0 | 6.8 | 0.85 |
+| AMP b1 total | 20.8 | 12.0 | | | | |
+
+b1 is 1.75x faster (now below the C++ cuDNN 15.7 ms of section 7), b16 1.18x (AMP 1.3x; C++ 45.6 ms). The phase split moves because work is no longer forced to complete inside the update (the yolo-head download of the next forward is the sync point), read totals, not phases.
+nsys (13 steps, per step): b1 launches 690 -> 589, cuMemcpyDtoH 80 -> ~0 steady state (121 total, all in the first eager step and the head downloads), cuMemcpyHtoD 87 -> ~1 (195 total), stream syncs 167 -> 24, cuMemsetD8 94 -> ~0 steady state (498 total = the pool fill), kernel time unchanged (5.9 ms). b16: 28 067 -> 26 754 launches, DtoH 1040 -> 121, syncs 2166 -> ~300 total.
+Correctness (no training run): `DARKNET_PARITY_DUMP` of biases, BN gamma / BN bias / rolling mean / rolling variance and weights after steps 1 and 5, batch 2, same init / input / seeds (the step is deterministic: two before runs are byte-identical): before vs after files are byte-identical for f32 and for AMP, and the two yolo head outputs are identical. New tests in `oxide_batchnorm_adam.rs`: fused SGD / Adam bit-identical to the separate launches (with NaN / Inf in updates and weights, `fix_weights` on and off), device BN fold vs the host fold (1e-6). All oxide suites pass individually and in the full run, `cargo test -p darknet-core --lib`: 119 passed.
+Not done: CUDA graph capture. `cuda-core 0.3.1` only exposes raw `cuStreamBeginCapture` / `cuStreamEndCapture` (no instantiate / launch wrapper), and a replayable graph needs static buffer addresses (the step allocates from the pool, downloads the yolo heads for the host loss between forward and backward, and bakes lr / Adam step into kernel arguments), so it is not a cheap change. Next launch cuts if wanted: one multi-tensor update launch per layer (-40 launches, about 0.5 ms), fold of the gradient accumulation (`saxpy`, 61 launches) into the update kernel, a fused conv bias + BN + activation epilogue. Remaining host cost at b1: 589 launches x ~16 us = 9 ms of the 12 ms step.
+
 ## Gradient-method shootout (2026-10-01)
 
 Harness: `bridges/darknet-cuda-oxide/tests/oxide_grad_methods.rs` (`grad_method_shootout`, ignored; a tiny-shape version of the same
