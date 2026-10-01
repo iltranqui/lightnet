@@ -106,6 +106,65 @@ pub struct YoloTrainingLoss {
     pub layer_output_gradient_seeds: Vec<Option<Tensor>>,
     pub positive_matches: usize,
     pub ignored_objectness: usize,
+    /// Mean IoU of the box-loss assignments (C++ `tot_iou / count`, summed over heads).
+    pub avg_iou: f32,
+    /// Number of box-loss assignments (C++ `count`, summed over heads).
+    pub box_count: usize,
+}
+
+/// Per-head box-loss statistics (C++ `tot_iou`, `tot_iou_loss`, `tot_giou_loss`, `count`).
+#[derive(Clone, Copy, Debug, Default)]
+struct YoloHeadStats {
+    tot_iou: f32,
+    tot_iou_loss: f32,
+    tot_giou_loss: f32,
+    count: usize,
+}
+
+impl YoloHeadStats {
+    fn add(&mut self, (iou, giou): (f32, f32)) {
+        self.tot_iou += iou;
+        self.tot_iou_loss += 1.0 - iou;
+        self.tot_giou_loss += 1.0 - giou;
+        self.count += 1;
+    }
+}
+
+/// C++ `forward_yolo_layer` cost (yolo_layer.cpp:1062-1120) of one head from its final deltas:
+/// MSE kind `||delta||^2`; otherwise `iou_normalizer * mean(1 - iou|giou)` plus
+/// `obj_normalizer * ||delta without the 4 box channels||^2`.
+fn yolo_head_cost(seed: &Tensor, spec: &YoloSpec, stats: &YoloHeadStats) -> f32 {
+    let entries = spec.classes + 5;
+    let mut total = 0.0f32;
+    let mut no_box = 0.0f32;
+    for batch in 0..seed.shape.batch {
+        for channel in 0..seed.shape.channels {
+            let is_box = channel % entries < 4;
+            for row in 0..seed.shape.height {
+                for col in 0..seed.shape.width {
+                    let sq = seed.get(batch, channel, row, col).powi(2);
+                    total += sq;
+                    if !is_box {
+                        no_box += sq;
+                    }
+                }
+            }
+        }
+    }
+    if spec.iou_loss == YoloIouLoss::Mse {
+        return total;
+    }
+    let tot = if spec.iou_loss == YoloIouLoss::Giou {
+        stats.tot_giou_loss
+    } else {
+        stats.tot_iou_loss
+    };
+    let avg_iou_loss = if stats.count > 0 {
+        spec.iou_normalizer * (tot / stats.count as f32)
+    } else {
+        0.0
+    };
+    avg_iou_loss + spec.obj_normalizer * no_box
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -166,11 +225,13 @@ pub fn compute_yolo_training_loss_with_state(
         seeds[head.layer_index] = Some(Tensor::zeros(head.output.shape));
         heads.push((head, spec));
     }
+    let mut head_stats = vec![YoloHeadStats::default(); heads.len()];
 
     let mut positive_matches = 0usize;
     let mut ignored_objectness = 0usize;
 
-    for (head, spec) in &heads {
+    for (head_index, (head, spec)) in heads.iter().enumerate() {
+        let stats = &mut head_stats[head_index];
         let seed = seeds[head.layer_index]
             .as_mut()
             .expect("YOLO seed should be initialized");
@@ -287,7 +348,7 @@ pub fn compute_yolo_training_loss_with_state(
                                         * (iou_multiplier - class_output),
                                 );
                             }
-                            apply_yolo_box_delta(
+                            let _ = apply_yolo_box_delta(
                                 &head.output,
                                 seed,
                                 batch,
@@ -333,7 +394,7 @@ pub fn compute_yolo_training_loss_with_state(
                 );
                 let class_scale = spec.iou_normalizer * class_multiplier(spec, class_id);
 
-                apply_yolo_box_delta(
+                stats.add(apply_yolo_box_delta(
                     &head.output,
                     seed,
                     batch,
@@ -348,7 +409,7 @@ pub fn compute_yolo_training_loss_with_state(
                     bbox_from_label(label),
                     class_scale,
                     spec,
-                );
+                ));
                 apply_yolo_positive_objectness(
                     &head.output,
                     seed,
@@ -402,7 +463,7 @@ pub fn compute_yolo_training_loss_with_state(
                             head.output.get(batch, extra_channel_base + 4, row, col),
                             spec.new_coords,
                         );
-                        apply_yolo_box_delta(
+                        stats.add(apply_yolo_box_delta(
                             &head.output,
                             seed,
                             batch,
@@ -417,7 +478,7 @@ pub fn compute_yolo_training_loss_with_state(
                             bbox_from_label(label),
                             class_scale,
                             spec,
-                        );
+                        ));
                         apply_yolo_positive_objectness(
                             &head.output,
                             seed,
@@ -482,18 +543,36 @@ pub fn compute_yolo_training_loss_with_state(
         apply_yolo_delta_filtering(network, &mut seeds, iteration, state);
     }
 
-    let loss = seeds
-        .iter()
-        .flatten()
-        .flat_map(|tensor| tensor.data.iter())
-        .map(|delta| delta * delta)
-        .sum();
+    // C++ `get_network_cost`: mean of the per-yolo-layer `cost`.
+    let loss = if heads.is_empty() {
+        0.0
+    } else {
+        heads
+            .iter()
+            .zip(&head_stats)
+            .map(|((head, spec), stats)| {
+                let seed = seeds[head.layer_index]
+                    .as_ref()
+                    .expect("YOLO seed should be initialized");
+                yolo_head_cost(seed, spec, stats)
+            })
+            .sum::<f32>()
+            / heads.len() as f32
+    };
+    let box_count: usize = head_stats.iter().map(|s| s.count).sum();
+    let avg_iou = if box_count > 0 {
+        head_stats.iter().map(|s| s.tot_iou).sum::<f32>() / box_count as f32
+    } else {
+        0.0
+    };
 
     Ok(YoloTrainingLoss {
         loss,
         layer_output_gradient_seeds: seeds,
         positive_matches,
         ignored_objectness,
+        avg_iou,
+        box_count,
     })
 }
 
@@ -668,7 +747,7 @@ fn apply_yolo_box_delta(
     truth_bbox: YoloBox,
     normalizer: f32,
     spec: &YoloSpec,
-) {
+) -> (f32, f32) {
     // C++ `delta_yolo_box`: the `(2 - w*h)` scale only enters the MSE branch; the
     // iou/giou/diou/ciou branches use `iou_normalizer * class_multiplier` alone.
     let scale = (2.0 - truth_bbox.w * truth_bbox.h) * normalizer;
@@ -678,6 +757,13 @@ fn apply_yolo_box_delta(
     let th_raw = output.get(batch, channel_base + 3, row, col);
     let tx_output = yolo_xy_output(tx_raw, spec.scale_x_y, spec.new_coords);
     let ty_output = yolo_xy_output(ty_raw, spec.scale_x_y, spec.new_coords);
+    // C++ `all_ious` (iou, giou) of the decoded prediction vs the truth, taken before the
+    // `w == 0` fix-up, for the cost / avg_iou statistics.
+    let decoded = decode_training_bbox(
+        tx_raw, ty_raw, tw_raw, th_raw, col, row, grid_width, grid_height, net_width, net_height,
+        anchor, spec.scale_x_y, spec.new_coords,
+    );
+    let ious = (bbox_iou(decoded, truth_bbox), box_giou(decoded, truth_bbox));
 
     match spec.iou_loss {
         YoloIouLoss::Mse => {
@@ -791,6 +877,7 @@ fn apply_yolo_box_delta(
             );
         }
     }
+    ious
 }
 
 fn add_box_delta(
@@ -1602,11 +1689,10 @@ fn sigmoid(value: f32) -> f32 {
 }
 
 fn yolo_xy_output(raw: f32, scale_x_y: f32, new_coords: bool) -> f32 {
-    if new_coords {
-        raw
-    } else {
-        scale_x_y * sigmoid(raw) - 0.5 * (scale_x_y - 1.0)
-    }
+    // C++ `scal_add(scale_x_y, -0.5*(scale_x_y-1))` runs on x,y with and without new_coords
+    // (with new_coords the logistic was already applied by the previous layer).
+    let activated = if new_coords { raw } else { sigmoid(raw) };
+    scale_x_y * activated - 0.5 * (scale_x_y - 1.0)
 }
 
 fn yolo_class_output(raw: f32, new_coords: bool) -> f32 {
@@ -1620,7 +1706,7 @@ fn yolo_objectness_output(raw: f32, new_coords: bool) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        YoloBox, apply_yolo_box_delta, DataConfig, YoloLabel, YoloTrainingState, apply_yolo_delta_filtering,
+        YoloBox, apply_yolo_box_delta, YoloHeadStats, yolo_head_cost, yolo_xy_output, DataConfig, YoloLabel, YoloTrainingState, apply_yolo_delta_filtering,
         compute_yolo_training_loss, compute_yolo_training_loss_with_state, load_training_batch,
         load_yolo_labels, replace_image_to_label,
     };
@@ -1817,10 +1903,12 @@ mod tests {
         let output = Tensor::zeros(shape);
         let truth = YoloBox { x: 0.6, y: 0.5, w: 0.5, h: 0.5 };
         let mut seed = Tensor::zeros(shape);
-        apply_yolo_box_delta(
+        let (iou, giou) = apply_yolo_box_delta(
             &output, &mut seed, 0, 0, 0, 0, 1, 1, 100, 100, (50.0, 50.0), truth,
             spec.iou_normalizer, &spec,
         );
+        // I = .2, U = .3, enclosing box = union box -> giou == iou == 2/3.
+        assert!((iou - 2.0 / 3.0).abs() < 1.0e-5 && (giou - 2.0 / 3.0).abs() < 1.0e-5);
         let want = [1.388_889, 0.0, 0.277_778, -1.111_111];
         for (c, w) in want.iter().enumerate() {
             let got = seed.get(0, c, 0, 0);
@@ -1835,6 +1923,59 @@ mod tests {
             mse.iou_normalizer, &mse,
         );
         assert!((seed.get(0, 0, 0, 0) - 1.75 * 0.5 * 0.1).abs() < 1.0e-5);
+    }
+
+    /// C++ cost (yolo_layer.cpp:1062-1120), hand computed. 1 anchor, 1 class (6 entries),
+    /// deltas box (.3,.4,.5,.6), obj .2, cls -.1; count 2, tot(1-iou) .6, tot(1-giou) 1.0,
+    /// iou_normalizer .5, obj_normalizer 2.
+    /// iou: .5 * (.6/2) + 2 * (.2^2 + .1^2) = .15 + .1 = .25; giou: .5 * (1/2) + .1 = .35;
+    /// mse: .09+.16+.25+.36+.04+.01 = .91; no assignments: avg term 0 -> .1.
+    #[test]
+    fn yolo_head_cost_matches_cpp_formula() {
+        let spec = YoloSpec {
+            classes: 1,
+            num: 1,
+            mask: vec![0],
+            anchors: vec![50.0, 50.0],
+            scale_x_y: 1.0,
+            new_coords: false,
+            cls_normalizer: 1.0,
+            obj_normalizer: 2.0,
+            iou_normalizer: 0.5,
+            ignore_thresh: 0.5,
+            truth_thresh: 1.0,
+            iou_thresh: 1.0,
+            iou_loss: YoloIouLoss::Iou,
+            iou_thresh_kind: YoloIouLoss::Iou,
+            focal_loss: false,
+            label_smooth_eps: 0.0,
+            objectness_smooth: false,
+            max_delta: f32::MAX,
+            class_multipliers: None,
+            class_map: None,
+        };
+        let shape = TensorShape { width: 1, height: 1, channels: 6, batch: 1 };
+        let mut seed = Tensor::zeros(shape);
+        for (c, v) in [0.3, 0.4, 0.5, 0.6, 0.2, -0.1].iter().enumerate() {
+            seed.set(0, c, 0, 0, *v);
+        }
+        let stats = YoloHeadStats { tot_iou: 1.4, tot_iou_loss: 0.6, tot_giou_loss: 1.0, count: 2 };
+        assert!((yolo_head_cost(&seed, &spec, &stats) - 0.25).abs() < 1.0e-6);
+        let giou = YoloSpec { iou_loss: YoloIouLoss::Giou, ..spec.clone() };
+        assert!((yolo_head_cost(&seed, &giou, &stats) - 0.35).abs() < 1.0e-6);
+        let mse = YoloSpec { iou_loss: YoloIouLoss::Mse, ..spec.clone() };
+        assert!((yolo_head_cost(&seed, &mse, &stats) - 0.91).abs() < 1.0e-6);
+        assert!((yolo_head_cost(&seed, &spec, &YoloHeadStats::default()) - 0.1).abs() < 1.0e-6);
+    }
+
+    /// C++ applies `scale_x_y * x - 0.5 * (scale_x_y - 1)` to x,y also with new_coords.
+    #[test]
+    fn yolo_xy_output_scales_with_new_coords_like_cpp() {
+        assert!((yolo_xy_output(0.5, 1.1, true) - 0.5).abs() < 1.0e-6);
+        assert!((yolo_xy_output(0.2, 1.1, true) - 0.17).abs() < 1.0e-6);
+        assert_eq!(yolo_xy_output(0.2, 1.0, true), 0.2);
+        let s = 1.0 / (1.0 + (-0.3f32).exp());
+        assert!((yolo_xy_output(0.3, 1.2, false) - (1.2 * s - 0.1)).abs() < 1.0e-6);
     }
 
     #[test]

@@ -266,7 +266,7 @@ Tools: `darknet-rs bench-train` with `DARKNET_BENCH_WEIGHTS / _INPUT / _LABELS /
 `oxide_bench_cpp <cfg> <weights> 0 0 0 0 parity <input> <truth> <steps> <lr> <dump prefix> <steps csv> [delta prefix]`, comparison `tools/oxide_parity_compare.py <A> <B> <step>`.
 Variants: oxide f32 (`DARKNET_OXIDE_GEMM=fp32`), oxide tf32, oxide AMP (`DARKNET_OXIDE_AMP=1`), Rust CPU (5 steps only, ~26 s/step at b2), C++ CUDA (`train_network_datum_gpu`, cudnn_half=1, BN not fused = batch statistics).
 
-### 8.1 Real loss: not comparable (finding)
+### 8.1 Real loss: not comparable (finding; superseded by 8.6 after the yolo fixes)
 A first run used the real yolo loss on both sides (Rust `compute_yolo_training_loss_with_state` vs C++ `forward_yolo_layer`). Step 1 on the same weights/input: Rust loss 70.78 vs C++ cost 0.191 (different
 normalisation/definition, not comparable), yolo delta L2 8.41 vs 4.25 (x1.98) and the weight deltas after step 1 are uncorrelated (relL2 ~1.0). The Rust loss is a re-implementation, not a line-for-line port
 (e.g. it assigns the truth per cell/anchor with its own rules, whereas C++ ciou/iou_normalizer/ignore handling, `delta_normalizer` and `*cost` differ), so identical real-loss training is NOT achievable without
@@ -339,6 +339,44 @@ at step 1: surrogate on logits 3.41 vs 6.15). The CPU and oxide rolling-mean del
 oxide f32 / tf32 / AMP training follows C++ CUDA step by step to ~1-3e-2 relL2 on weight/bias/scale deltas (heads <1e-3), growing to ~8e-2 by step 20 through chaotic amplification; consistent with the fp16 cuDNN path of C++ and the
 rounding spread between the oxide precision modes themselves. Real findings: (1) rolling-stat EMA keep 0.9 vs C++ 0.99 (x10 too fast), (2) the Rust yolo training loss is not the C++ loss (different value and delta scale), (3) CPU training uses rolling-stat BN (differs from GPU / C++ by design).
 Not done: loss-trajectory parity (needs 2), >20 steps, C++ fp32 reference, batch-stat CPU path, multiple seeds/images.
+
+### 8.6 Re-run after the yolo fixes (2026-10-01): real loss now comparable and matching
+
+Fixes since 8.1/8.3: no `(2-w*h)` scale on iou-kind box deltas, GPU BN rolling keep 0.99, Rust loss output = C++ `cost` (`train.rs` `yolo_head_cost`: per head `iou_normalizer*mean(1-iou)` [giou kind: `1-giou`; MSE kind: `||delta||^2`]
+`+ obj_normalizer*||delta without the 4 box channels||^2`, mean over yolo heads like `get_network_cost`; `YoloTrainingLoss` also carries `avg_iou`/`box_count`; deltas unchanged), `scale_x_y` now applied to x,y with `new_coords` as in C++.
+Same data / commands as section 8 (data regenerated with `tools/oxide_parity_data.py`; release `darknet-rs` rebuilt; one run each: oxide f32 20 steps, Rust CPU 5 steps, C++ CUDA 20 steps; synthetic-delta oxide f32 rerun, the C++ synthetic dump is unchanged).
+
+Real loss (printed `cost` / yolo delta L2), oxide f32 vs C++ (before the fixes: 70.78 vs 0.191 and 8.41 vs 4.25):
+
+| step | oxide loss | C++ cost | oxide delta L2 | C++ delta L2 | | step | oxide loss | C++ cost |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 0.191247 | 0.191136 | 4.254964 | 4.254946 (ratio 1.000004) | | 9 | 0.2035 | 0.1980 |
+| 2 | 0.112967 | 0.112957 | 4.7517 | 4.7506 | | 12 | 0.0296 | 0.0289 |
+| 3 | 0.226005 | 0.226554 | 4.0950 | 4.0960 | | 16 | 0.0337 | 0.0355 |
+| 4 | 0.084476 | 0.084781 | 4.3358 | 4.3360 | | 19 | 0.0317 | 0.0292 |
+| 5 | 0.032052 | 0.032046 | 4.2046 | 4.2080 | | 20 | 0.024089 | 0.024884 |
+
+Step-1 loss agrees to 6e-4 relative, delta L2 to 4e-6; over 20 steps loss within ~0-8% (mean |dev| of steps 1-20 ~3%), same shape (spikes at 3 and 9, plateau ~0.03). Rust CPU (rolling-stat BN forward, 8.4): step 1 loss 0.0790 / delta L2 4.392, steps 2-5 loss 0.156, 0.158, 0.055, 0.044 (differs: different forward).
+
+Parameter deltas vs C++ (relL2 max / mean over the 21 convs; BN-stat columns also the norm ratio of the rolling-stat delta, oxide/C++):
+
+| run | step | conv weights | biases | BN scales | rolling mean (ratio) | rolling var (ratio) |
+|---|---|---|---|---|---|---|
+| real loss, oxide f32 | 1 | 4.2e-2 / 1.5e-2 | 7.0e-2 / 1.9e-2 | 3.6e-2 / 1.3e-2 | 5.7e-3 / 2.0e-3 (1.000-1.001) | 1.1e-3 / 4.0e-4 (1.000) |
+| real loss, oxide f32 | 5 | 6.7e-2 / 3.2e-2 | 7.6e-2 / 3.7e-2 | 3.9e-2 / 2.2e-2 | 5.9e-3 / 2.7e-3 (0.999-1.001) | 2.6e-3 / 1.8e-3 (1.000-1.001) |
+| real loss, oxide f32 | 20 | 8.3e-1 / 2.3e-1 | 8.7e-1 / 2.5e-1 | 4.7e-1 / 1.8e-1 | 5.7e-2 / 3.2e-2 (0.990-1.002) | 2.3e-2 / 1.7e-2 (0.992-1.011) |
+| synthetic deltas, oxide f32 | 1 | 2.6e-2 / 1.4e-2 | 2.8e-2 / 1.4e-2 | 2.1e-2 / 1.1e-2 | 5.7e-3 / 2.0e-3 (1.000-1.001) | 1.1e-3 / 4.0e-4 (1.000) |
+| synthetic deltas, oxide f32 | 5 | 3.1e-2 / 1.8e-2 | 3.1e-2 / 2.0e-2 | 2.4e-2 / 1.5e-2 | 1.7e-2 / 6.2e-3 (0.998-1.001) | 5.6e-3 / 2.7e-3 (0.999-1.001) |
+| synthetic deltas, oxide f32 | 20 | 1.1e-1 / 7.9e-2 | 1.5e-1 / 8.2e-2 | 1.2e-1 / 6.5e-2 | 6.5e-2 / 4.3e-2 (0.992-1.010) | 4.5e-2 / 2.5e-2 (0.990-1.003) |
+| real loss, Rust CPU | 1 | 1.5 / 1.0 | 2.1 / 1.3 | 1.3 / 0.97 | ratio 10.0-172 | ratio 10.0-27.8 |
+| real loss, Rust CPU | 5 | 3.6 / 1.2 | 3.4 / 1.7 | 1.6 / 1.1 | ratio 8.3-79 | ratio 8.0-15.2 |
+
+Reading. (1) Rolling-stat delta ratio is 1.000 at steps 1 and 5 (was 10.00x before the keep fix, 8.3): fixed. (2) The step-1/5 weight deltas under the real loss (1.5e-2 / 3.2e-2 mean) are now as close as with injected deltas
+(1.4e-2 / 1.8e-2), i.e. the previous "uncorrelated, relL2 ~1" of 8.1 was entirely the yolo delta scale/definition. (3) At step 20 the real-loss run diverges more (mean 0.23 vs 0.08 synthetic): with a real loss the deltas depend on the
+weights, so the ~1e-2 fp16-vs-fp32 differences feed back (C++ uses cuDNN fp16 conv, oxide f32); same chaotic amplification as before, now also visible in the loss (steps 8-19 differ by up to 8%), not a systematic bias (step-1 loss and delta L2 agree to 1e-3 / 4e-6).
+(4) Rust CPU remains different on purpose of the older design: its conv+BN training forward uses the ROLLING stats (8.4) so weights/loss differ from C++ from step 1 (loss 0.079 vs 0.191), and its rolling EMA keeps 0.9, which is what the C++ CPU path does (ratio 10x vs the C++ GPU 0.99 is therefore expected).
+Remaining static differences from the todo table that can still move numbers: #3 (iou_thresh extra anchors of another head, inactive here, iou_thresh=1), #4 (best-anchor search over head masks only, same result when masks partition the anchors), the truth_thresh/ignore branches are line-identical.
+The residual 6e-4 on the step-1 loss is the fp16 (C++ cudnn_half) vs f32 forward. Not run: oxide AMP/tf32 real-loss, >20 steps, multiple images.
 
 ## Reproduce
 
