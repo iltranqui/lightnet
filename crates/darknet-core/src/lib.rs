@@ -21,6 +21,7 @@ pub mod evaluate;
 pub use evaluate::{MapReport, ValidationDataset, detector_map};
 pub mod image;
 pub mod initialize;
+pub mod loader_profile;
 pub use initialize::initialize_training_params;
 pub mod model;
 pub mod names;

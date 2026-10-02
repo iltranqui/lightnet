@@ -612,6 +612,18 @@ fn bench_train(cfg: &str, steps: usize, warmup: usize) -> Result<(), Box<dyn std
         }
         parity_labels = Some(labels);
     }
+    let synthetic_labels = (std::env::var("DARKNET_BENCH_YOLO").as_deref() == Ok("1")).then(|| {
+        vec![
+            vec![YoloLabel {
+                class_id: 0,
+                x: 0.5,
+                y: 0.5,
+                w: 0.2,
+                h: 0.2,
+            }];
+            batch
+        ]
+    });
     let parity_prefix = std::env::var("DARKNET_PARITY_DUMP").ok();
     let parity_steps: Vec<usize> = std::env::var("DARKNET_PARITY_STEPS")
         .unwrap_or_default()
@@ -655,6 +667,10 @@ fn bench_train(cfg: &str, steps: usize, warmup: usize) -> Result<(), Box<dyn std
                         seeds_l2(&yolo.layer_output_gradient_seeds)
                     );
                     seeds = yolo.layer_output_gradient_seeds;
+                } else if let Some(labels) = &synthetic_labels {
+                    seeds =
+                        darknet_core::compute_yolo_training_loss(&exec.network, &forward, labels)?
+                            .layer_output_gradient_seeds;
                 }
                 if fixed_deltas {
                     println!(
@@ -719,6 +735,13 @@ fn bench_train(cfg: &str, steps: usize, warmup: usize) -> Result<(), Box<dyn std
                         seeds_l2(&yolo.layer_output_gradient_seeds)
                     );
                     seeds = yolo.layer_output_gradient_seeds;
+                } else if let Some(labels) = &synthetic_labels {
+                    seeds = darknet_core::compute_yolo_training_loss(
+                        &exec.network,
+                        &forward.cpu_forward,
+                        labels,
+                    )?
+                    .layer_output_gradient_seeds;
                 }
                 if fixed_deltas {
                     println!(
@@ -1345,8 +1368,30 @@ struct BatchPrefetcher {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Bounded thread pool for the image loader.
+///
+/// C++ uses `6 * ngpus` loader threads; leave a couple of cores for the
+/// trainer / GPU-feeding thread.  `DARKNET_LOADER_THREADS` overrides the size.
+fn build_loader_pool() -> rayon::ThreadPool {
+    let threads = std::env::var("DARKNET_LOADER_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&threads| threads > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|parallelism| parallelism.get().saturating_sub(2).clamp(1, 6))
+                .unwrap_or(4)
+        });
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|index| format!("darknet-load-{index}"))
+        .build()
+        .expect("build image loader thread pool")
+}
+
 impl BatchPrefetcher {
     fn new(data: DataConfig, augmentation: DetectorAugmentation, seed: u64) -> Self {
+        let pool = build_loader_pool();
         let (requests, request_rx) = std::sync::mpsc::sync_channel(8);
         let (response_tx, responses) = std::sync::mpsc::channel();
         let handle = std::thread::Builder::new()
@@ -1361,16 +1406,21 @@ impl BatchPrefetcher {
                             start_index,
                             sample_start,
                         } => {
-                            let result = load_augmented_training_batch_from_paths(
-                                network.as_ref(),
-                                &data,
-                                &paths,
-                                start_index,
-                                &augmentation,
-                                seed,
-                                sample_start,
-                            )
-                            .map_err(|err| err.to_string());
+                            // Run the decode/augment fan-out on a bounded pool so
+                            // the GPU-feeding thread keeps cores free.
+                            let result = pool
+                                .install(|| {
+                                    load_augmented_training_batch_from_paths(
+                                        network.as_ref(),
+                                        &data,
+                                        &paths,
+                                        start_index,
+                                        &augmentation,
+                                        seed,
+                                        sample_start,
+                                    )
+                                })
+                                .map_err(|err| err.to_string());
                             if response_tx.send(result).is_err() {
                                 break;
                             }
@@ -1505,6 +1555,9 @@ fn run_detector_train_cpu(
     let base_width = executable.network.net.width;
     let base_height = executable.network.net.height;
     let mut multi_scale_count = 0usize;
+    // Shape of the batch that has been requested but not yet consumed. `None`
+    // until the lookahead pipeline is primed.
+    let mut pending_shape: Option<(usize, usize, usize)> = None;
 
     while executable.network.net.max_batches == 0 || batch_num < executable.network.net.max_batches
     {
@@ -1525,18 +1578,43 @@ fn run_detector_train_cpu(
         let lr = compute_learning_rate(&executable.network.net, batch_num);
         executable.set_train_iteration(batch_num);
         let mut iter_loss = 0.0f32;
+        let current_shape = (
+            executable.network.net.width,
+            executable.network.net.height,
+            executable.network.net.batch,
+        );
         if prefetch_network.net.width != executable.network.net.width
             || prefetch_network.net.height != executable.network.net.height
             || prefetch_network.net.batch != executable.network.net.batch
         {
             prefetch_network = std::sync::Arc::new(executable.network.clone());
         }
-        prefetcher.request(
-            prefetch_network.clone(),
-            epoch_images.clone(),
-            image_cursor,
-            seen,
-        );
+        match pending_shape {
+            None => {
+                // Prime the pipeline: request this iteration's first batch.
+                prefetcher.request(
+                    prefetch_network.clone(),
+                    epoch_images.clone(),
+                    image_cursor,
+                    seen,
+                );
+                pending_shape = Some(current_shape);
+            }
+            Some(shape) if shape != current_shape => {
+                // A multi-scale resize invalidated the batch already in flight:
+                // discard it and re-request at the new size (C++ joins and
+                // restarts the loader thread here).
+                let _ = prefetcher.take();
+                prefetcher.request(
+                    prefetch_network.clone(),
+                    epoch_images.clone(),
+                    image_cursor,
+                    seen,
+                );
+                pending_shape = Some(current_shape);
+            }
+            Some(_) => {}
+        }
         for subdivision in 0..executable.network.net.subdivisions.max(1) {
             let batch = prefetcher.take()?;
             if subdivision + 1 < executable.network.net.subdivisions.max(1) {
@@ -1546,7 +1624,25 @@ fn run_detector_train_cpu(
                     image_cursor + (subdivision + 1) * executable.network.net.batch.max(1),
                     seen + ((subdivision + 1) * executable.network.net.batch.max(1)) as u64,
                 );
+            } else {
+                // One-batch lookahead: begin loading the next iteration's first
+                // batch while this iteration is still being trained.
+                let (next_order, next_cursor) = advanced_epoch_images(
+                    &train_images,
+                    options.seed,
+                    epoch,
+                    &epoch_images,
+                    image_cursor,
+                    images_per_iteration,
+                );
+                prefetcher.request(
+                    prefetch_network.clone(),
+                    next_order,
+                    next_cursor,
+                    seen + images_per_iteration as u64,
+                );
             }
+            pending_shape = Some(current_shape);
             let forward = executable.forward_training(&batch.input)?;
             let yolo = compute_yolo_training_loss_with_state(
                 &executable.network,
@@ -1666,6 +1762,38 @@ fn run_detector_train_cpu(
 }
 
 #[cfg(feature = "oxide")]
+fn print_train_profile(samples: &[[f64; 5]], iteration: usize, at_end: bool) {
+    if samples.is_empty() {
+        return;
+    }
+    let phases = [
+        "data_wait",
+        "forward_d2h",
+        "yolo_host",
+        "backward_h2d",
+        "update",
+    ];
+    let summary = phases
+        .iter()
+        .enumerate()
+        .map(|(phase, name)| {
+            let mut values: Vec<f64> = samples.iter().map(|sample| sample[phase]).collect();
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            values.sort_by(f64::total_cmp);
+            let mid = values.len() / 2;
+            let median = (values[(values.len() - 1) / 2] + values[mid]) / 2.0;
+            format!("{name}={median:.3}/{mean:.3}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let end = if at_end { " end" } else { "" };
+    println!(
+        "TRAIN_PROFILE{end} iteration={iteration} window_iters={} ms median/mean: {summary}",
+        samples.len()
+    );
+}
+
+#[cfg(feature = "oxide")]
 fn run_detector_train_gpu(
     cfg: &str,
     data: &str,
@@ -1729,6 +1857,11 @@ fn run_detector_train_gpu(
         );
     }
     let mut loss_scale_growth = 0u32;
+    let mut profile = (std::env::var("DARKNET_TRAIN_PROFILE").as_deref() == Ok("1"))
+        .then(|| Vec::<[f64; 5]>::with_capacity(20));
+    if profile.is_some() {
+        executable.backend().synchronize()?;
+    }
     let images_per_iteration =
         executable.network.net.batch.max(1) * executable.network.net.subdivisions.max(1);
     let mut batch_num = if images_per_iteration == 0 {
@@ -1767,6 +1900,9 @@ fn run_detector_train_gpu(
     let base_width = executable.network.net.width;
     let base_height = executable.network.net.height;
     let mut multi_scale_count = 0usize;
+    // Shape of the batch that has been requested but not yet consumed. `None`
+    // until the lookahead pipeline is primed.
+    let mut pending_shape: Option<(usize, usize, usize)> = None;
 
     while executable.network.net.max_batches == 0 || batch_num < executable.network.net.max_batches
     {
@@ -1787,24 +1923,59 @@ fn run_detector_train_gpu(
         let lr = compute_learning_rate(&executable.network.net, batch_num);
         executable.set_train_iteration(batch_num);
         let mut iter_loss = 0.0f32;
+        let mut phase_ms = [0.0; 5];
+        if let Some(samples) = &mut profile {
+            if samples.len() == 20 {
+                samples.clear();
+            }
+        }
         // NOTE: do NOT zero train buffers here. After update_weights_gpu, the buffers
         // hold momentum * previous_gradient (C++ weight_updates *= momentum). Zeroing
         // would destroy the momentum carry. init_train_buffers_gpu() above initialises
         // them to zero only once at startup, which is correct.
+        let current_shape = (
+            executable.network.net.width,
+            executable.network.net.height,
+            executable.network.net.batch,
+        );
         if prefetch_network.net.width != executable.network.net.width
             || prefetch_network.net.height != executable.network.net.height
             || prefetch_network.net.batch != executable.network.net.batch
         {
             prefetch_network = std::sync::Arc::new(executable.network.clone());
         }
-        prefetcher.request(
-            prefetch_network.clone(),
-            epoch_images.clone(),
-            image_cursor,
-            seen,
-        );
+        match pending_shape {
+            None => {
+                // Prime the pipeline: request this iteration's first batch.
+                prefetcher.request(
+                    prefetch_network.clone(),
+                    epoch_images.clone(),
+                    image_cursor,
+                    seen,
+                );
+                pending_shape = Some(current_shape);
+            }
+            Some(shape) if shape != current_shape => {
+                // A multi-scale resize invalidated the batch already in flight:
+                // discard it and re-request at the new size (C++ joins and
+                // restarts the loader thread here).
+                let _ = prefetcher.take();
+                prefetcher.request(
+                    prefetch_network.clone(),
+                    epoch_images.clone(),
+                    image_cursor,
+                    seen,
+                );
+                pending_shape = Some(current_shape);
+            }
+            Some(_) => {}
+        }
         for subdivision in 0..executable.network.net.subdivisions.max(1) {
+            let start = profile.as_ref().map(|_| Instant::now());
             let batch = prefetcher.take()?;
+            if let Some(start) = start {
+                phase_ms[0] += start.elapsed().as_secs_f64() * 1000.0;
+            }
             if subdivision + 1 < executable.network.net.subdivisions.max(1) {
                 prefetcher.request(
                     prefetch_network.clone(),
@@ -1812,8 +1983,33 @@ fn run_detector_train_gpu(
                     image_cursor + (subdivision + 1) * executable.network.net.batch.max(1),
                     seen + ((subdivision + 1) * executable.network.net.batch.max(1)) as u64,
                 );
+            } else {
+                // One-batch lookahead: begin loading the next iteration's first
+                // batch while this iteration is still being trained.
+                let (next_order, next_cursor) = advanced_epoch_images(
+                    &train_images,
+                    options.seed,
+                    epoch,
+                    &epoch_images,
+                    image_cursor,
+                    images_per_iteration,
+                );
+                prefetcher.request(
+                    prefetch_network.clone(),
+                    next_order,
+                    next_cursor,
+                    seen + images_per_iteration as u64,
+                );
             }
+            pending_shape = Some(current_shape);
+            let start = profile.as_ref().map(|_| Instant::now());
             let forward = executable.forward_training_device(&batch.input)?;
+            if let Some(start) = start {
+                // Head D2H is included; profiling-only sync also covers any trailing GPU work.
+                executable.backend().synchronize()?;
+                phase_ms[1] += start.elapsed().as_secs_f64() * 1000.0;
+            }
+            let start = profile.as_ref().map(|_| Instant::now());
             let yolo = compute_yolo_training_loss_with_state(
                 &executable.network,
                 &forward.cpu_forward,
@@ -1821,10 +2017,21 @@ fn run_detector_train_gpu(
                 batch_num,
                 Some(&mut yolo_state),
             )?;
+            if let Some(start) = start {
+                phase_ms[2] += start.elapsed().as_secs_f64() * 1000.0;
+            }
             iter_loss += yolo.loss;
+            let start = profile.as_ref().map(|_| Instant::now());
             executable
                 .backward_accumulate_seeded_gpu(&forward, &yolo.layer_output_gradient_seeds)?;
+            if let Some(start) = start {
+                // Backward (including seed H2D) and deferred update are asynchronous:
+                // synchronize only in profiling mode so host timings include GPU execution.
+                executable.backend().synchronize()?;
+                phase_ms[3] += start.elapsed().as_secs_f64() * 1000.0;
+            }
         }
+        let start = profile.as_ref().map(|_| Instant::now());
         if options.dynamic_loss_scale && executable.gradients_non_finite()? {
             // Overflow: drop the accumulated gradients, skip the step and
             // halve the scale so the next backward stays representable.
@@ -1851,8 +2058,18 @@ fn run_detector_train_gpu(
                 }
             }
         }
+        if let Some(start) = start {
+            executable.backend().synchronize()?;
+            phase_ms[4] += start.elapsed().as_secs_f64() * 1000.0;
+        }
 
         batch_num += 1;
+        if let Some(samples) = &mut profile {
+            samples.push(phase_ms);
+            if samples.len() == 20 {
+                print_train_profile(samples, batch_num, false);
+            }
+        }
         seen += images_per_iteration as u64;
         image_cursor += images_per_iteration;
         if image_cursor >= train_images.len() {
@@ -1934,6 +2151,9 @@ fn run_detector_train_gpu(
         }
     }
 
+    if let Some(samples) = &profile {
+        print_train_profile(samples, batch_num, true);
+    }
     let final_checkpoint = backup_dir.join(format!("{base_name}_final.weights"));
     executable.sync_host_weights_from_device()?;
     save_weights(
@@ -2138,6 +2358,31 @@ fn epoch_order(paths: &[PathBuf], seed: u64, epoch: usize) -> Vec<PathBuf> {
     order
 }
 
+/// `(epoch_order, cursor)` for the next iteration's first batch, mirroring the
+/// end-of-iteration bookkeeping without mutating the caller's state.  This lets
+/// the trainer request the following batch before the current one is processed.
+///
+/// Assumes `images_per_iteration <= train_images.len()`; the existing trainer
+/// bookkeeping shares that assumption.
+fn advanced_epoch_images(
+    train_images: &[PathBuf],
+    seed: u64,
+    epoch: usize,
+    epoch_images: &std::sync::Arc<Vec<PathBuf>>,
+    image_cursor: usize,
+    images_per_iteration: usize,
+) -> (std::sync::Arc<Vec<PathBuf>>, usize) {
+    let next = image_cursor + images_per_iteration;
+    if next >= train_images.len() {
+        (
+            std::sync::Arc::new(epoch_order(train_images, seed, epoch + 1)),
+            next % train_images.len(),
+        )
+    } else {
+        (epoch_images.clone(), next)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{MapSchedule, TrainOptions, classify_detector_train_paths};
@@ -2254,6 +2499,23 @@ mod tests {
         let mut sorted = epoch_order(&paths, 42, 3);
         sorted.sort();
         assert_eq!(sorted, paths);
+    }
+
+    #[test]
+    fn advanced_epoch_images_matches_iteration_bookkeeping() {
+        use super::{advanced_epoch_images, epoch_order};
+        let paths: Vec<std::path::PathBuf> = (0..8)
+            .map(|i| std::path::PathBuf::from(format!("{i}.png")))
+            .collect();
+        let epoch0 = std::sync::Arc::new(epoch_order(&paths, 42, 0));
+        // Within an epoch the order is reused and the cursor advances.
+        let (order, cursor) = advanced_epoch_images(&paths, 42, 0, &epoch0, 0, 4);
+        assert!(std::sync::Arc::ptr_eq(&order, &epoch0));
+        assert_eq!(cursor, 4);
+        // Crossing the boundary wraps to the next epoch's permutation.
+        let (order, cursor) = advanced_epoch_images(&paths, 42, 0, &epoch0, 4, 4);
+        assert_eq!(cursor, 0);
+        assert_eq!(*order, epoch_order(&paths, 42, 1));
     }
 
     #[test]

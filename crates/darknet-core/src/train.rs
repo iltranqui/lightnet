@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
+
 use crate::error::{Error, Result};
 use crate::image::PlanarRgbImage;
 use crate::model::{LayerKind, Network, TensorShape, YoloIouLoss, YoloSpec};
@@ -1179,116 +1181,148 @@ fn load_training_batch_impl(
     let shape = TensorShape::new(width, height, channels, batch_size);
     let per_image = shape.element_count();
     let mut input = Tensor::zeros(shape);
+    let classes = data.classes;
+    let total = image_paths.len();
+    let profiling = crate::loader_profile::enabled();
+
+    // Decode and augment each image independently.  Each chunk of `input` is
+    // written by exactly one task, and the augmentation RNG is keyed by the
+    // absolute sample ordinal, so the bytes are identical to the sequential
+    // loader (`augmented_loader_sample_stream_is_subdivision_independent`).
+    let prepared_entries: Vec<Result<(Vec<YoloLabel>, PathBuf, PathBuf)>> = input
+        .data
+        .par_chunks_mut(per_image)
+        .enumerate()
+        .map(
+            |(batch_index, chunk)| -> Result<(Vec<YoloLabel>, PathBuf, PathBuf)> {
+                let image_path = &image_paths[(start_index + batch_index) % total];
+                let label_path = replace_image_to_label(image_path);
+                if !label_path.exists() {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("missing label file {}", label_path.display()),
+                    )));
+                }
+
+                let image = PlanarRgbImage::load(image_path)?;
+                let labels_start = std::time::Instant::now();
+                let labels = load_yolo_labels(&label_path, classes)?;
+                let labels_elapsed = labels_start.elapsed();
+                let augment_start = std::time::Instant::now();
+                let (prepared, labels) = match augmentation {
+                    Some((options, seed, sample_start)) if options.mosaic => {
+                        if crate::augmentation::mixup_active(seed, sample_start) {
+                            // C++ `if (rand_bool()) use_mixup = 0;`: half the batches use
+                            // the plain single-image transform.
+                            options.apply(
+                                &image,
+                                &labels,
+                                width,
+                                height,
+                                seed,
+                                sample_start.wrapping_add(batch_index as u64),
+                            )?
+                        } else {
+                            let mut members = vec![(image, labels)];
+                            for member in 1..4 {
+                                let idx = (start_index + batch_index + member * batch_size)
+                                    % image_paths.len();
+                                let path = &image_paths[idx];
+                                let member_label_path = replace_image_to_label(path);
+                                if !member_label_path.exists() {
+                                    return Err(Error::Io(std::io::Error::new(
+                                        std::io::ErrorKind::NotFound,
+                                        format!(
+                                            "missing label file {}",
+                                            member_label_path.display()
+                                        ),
+                                    )));
+                                }
+                                members.push((
+                                    PlanarRgbImage::load(path)?,
+                                    load_yolo_labels(&member_label_path, data.classes)?,
+                                ));
+                            }
+                            options.apply_mosaic(
+                                &members,
+                                width,
+                                height,
+                                seed,
+                                sample_start.wrapping_add(batch_index as u64),
+                            )?
+                        }
+                    }
+                    Some((options, seed, sample_start)) => {
+                        let (primary, primary_labels) = options.apply(
+                            &image,
+                            &labels,
+                            width,
+                            height,
+                            seed,
+                            sample_start.wrapping_add(batch_index as u64),
+                        )?;
+                        if options.mixup && crate::augmentation::mixup_active(seed, sample_start) {
+                            let mix_path = &image_paths
+                                [(start_index + batch_index + batch_size) % image_paths.len()];
+                            let mix_label_path = replace_image_to_label(mix_path);
+                            if !mix_label_path.exists() {
+                                return Err(Error::Io(std::io::Error::new(
+                                    std::io::ErrorKind::NotFound,
+                                    format!("missing label file {}", mix_label_path.display()),
+                                )));
+                            }
+                            let mix_image = PlanarRgbImage::load(mix_path)?;
+                            let mix_labels = load_yolo_labels(&mix_label_path, data.classes)?;
+                            let (mix_prepared, mix_labels) = options.apply(
+                                &mix_image,
+                                &mix_labels,
+                                width,
+                                height,
+                                seed,
+                                sample_start.wrapping_add((batch_size + batch_index) as u64),
+                            )?;
+                            crate::augmentation::blend_mixup(
+                                &primary,
+                                &primary_labels,
+                                &mix_prepared,
+                                &mix_labels,
+                                options.max_boxes,
+                            )?
+                        } else {
+                            (primary, primary_labels)
+                        }
+                    }
+                    None => (image.resize(width, height)?, labels),
+                };
+                if prepared.shape.channels != channels {
+                    return Err(Error::InvalidConfig(format!(
+                        "image {} has {} channels, expected {}",
+                        image_path.display(),
+                        prepared.shape.channels,
+                        channels
+                    )));
+                }
+
+                let augment_elapsed = augment_start.elapsed();
+                let copy_start = std::time::Instant::now();
+                chunk.copy_from_slice(&prepared.data);
+                if profiling {
+                    crate::loader_profile::add_sample();
+                    crate::loader_profile::add_labels(labels_elapsed);
+                    crate::loader_profile::add_augment(augment_elapsed);
+                    crate::loader_profile::add_copy(copy_start.elapsed());
+                }
+                Ok((labels, image_path.clone(), label_path))
+            },
+        )
+        .collect();
+
     let mut batch_image_paths = Vec::with_capacity(batch_size);
     let mut batch_label_paths = Vec::with_capacity(batch_size);
     let mut batch_labels = Vec::with_capacity(batch_size);
-
-    for batch_index in 0..batch_size {
-        let image_path = &image_paths[(start_index + batch_index) % image_paths.len()];
-        let label_path = replace_image_to_label(image_path);
-        if !label_path.exists() {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("missing label file {}", label_path.display()),
-            )));
-        }
-
-        let image = PlanarRgbImage::load(image_path)?;
-        let labels = load_yolo_labels(&label_path, data.classes)?;
-        let (prepared, labels) = match augmentation {
-            Some((options, seed, sample_start)) if options.mosaic => {
-                if crate::augmentation::mixup_active(seed, sample_start) {
-                    // C++ `if (rand_bool()) use_mixup = 0;`: half the batches use
-                    // the plain single-image transform.
-                    options.apply(
-                        &image,
-                        &labels,
-                        width,
-                        height,
-                        seed,
-                        sample_start.wrapping_add(batch_index as u64),
-                    )?
-                } else {
-                    let mut members = vec![(image, labels)];
-                    for member in 1..4 {
-                        let idx =
-                            (start_index + batch_index + member * batch_size) % image_paths.len();
-                        let path = &image_paths[idx];
-                        let member_label_path = replace_image_to_label(path);
-                        if !member_label_path.exists() {
-                            return Err(Error::Io(std::io::Error::new(
-                                std::io::ErrorKind::NotFound,
-                                format!("missing label file {}", member_label_path.display()),
-                            )));
-                        }
-                        members.push((
-                            PlanarRgbImage::load(path)?,
-                            load_yolo_labels(&member_label_path, data.classes)?,
-                        ));
-                    }
-                    options.apply_mosaic(
-                        &members,
-                        width,
-                        height,
-                        seed,
-                        sample_start.wrapping_add(batch_index as u64),
-                    )?
-                }
-            }
-            Some((options, seed, sample_start)) => {
-                let (primary, primary_labels) = options.apply(
-                    &image,
-                    &labels,
-                    width,
-                    height,
-                    seed,
-                    sample_start.wrapping_add(batch_index as u64),
-                )?;
-                if options.mixup && crate::augmentation::mixup_active(seed, sample_start) {
-                    let mix_path =
-                        &image_paths[(start_index + batch_index + batch_size) % image_paths.len()];
-                    let mix_label_path = replace_image_to_label(mix_path);
-                    if !mix_label_path.exists() {
-                        return Err(Error::Io(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            format!("missing label file {}", mix_label_path.display()),
-                        )));
-                    }
-                    let mix_image = PlanarRgbImage::load(mix_path)?;
-                    let mix_labels = load_yolo_labels(&mix_label_path, data.classes)?;
-                    let (mix_prepared, mix_labels) = options.apply(
-                        &mix_image,
-                        &mix_labels,
-                        width,
-                        height,
-                        seed,
-                        sample_start.wrapping_add((batch_size + batch_index) as u64),
-                    )?;
-                    crate::augmentation::blend_mixup(
-                        &primary,
-                        &primary_labels,
-                        &mix_prepared,
-                        &mix_labels,
-                        options.max_boxes,
-                    )?
-                } else {
-                    (primary, primary_labels)
-                }
-            }
-            None => (image.resize(width, height)?, labels),
-        };
-        if prepared.shape.channels != channels {
-            return Err(Error::InvalidConfig(format!(
-                "image {} has {} channels, expected {}",
-                image_path.display(),
-                prepared.shape.channels,
-                channels
-            )));
-        }
-
-        let dst = batch_index * per_image;
-        input.data[dst..dst + per_image].copy_from_slice(&prepared.data);
-        batch_image_paths.push(image_path.clone());
+    for entry in prepared_entries {
+        let (labels, image_path, label_path) = entry?;
+        batch_image_paths.push(image_path);
         batch_label_paths.push(label_path);
         batch_labels.push(labels);
     }

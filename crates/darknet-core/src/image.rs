@@ -20,7 +20,10 @@ pub struct PlanarRgbImage {
 impl PlanarRgbImage {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        let profiling = crate::loader_profile::enabled();
+        let read_start = std::time::Instant::now();
         let bytes = std::fs::read(path)?;
+        let decode_start = std::time::Instant::now();
         let image = match decode_jpeg_libjpeg(&bytes) {
             Some(image) => image,
             None => ImageReader::new(Cursor::new(&bytes))
@@ -40,7 +43,15 @@ impl PlanarRgbImage {
                 })?
                 .to_rgb8(),
         };
-        Self::from_rgb_image(&image)
+        let planar_start = std::time::Instant::now();
+        let planar = Self::from_rgb_image(&image)?;
+        if profiling {
+            crate::loader_profile::add_load();
+            crate::loader_profile::add_read(decode_start - read_start);
+            crate::loader_profile::add_decode(planar_start - decode_start);
+            crate::loader_profile::add_planar(planar_start.elapsed());
+        }
+        Ok(planar)
     }
 
     pub fn from_interleaved_rgb_u8(width: usize, height: usize, bytes: &[u8]) -> Result<Self> {

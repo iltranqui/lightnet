@@ -707,6 +707,7 @@ dependencies = [
  "darknet-core",
  "darknet-cuda",
  "darknet-cuda-oxide",
+ "rayon",
 ]
 
 [[package]]
@@ -717,6 +718,7 @@ dependencies = [
  "image",
  "imageproc",
  "mozjpeg",
+ "rayon",
 ]
 
 [[package]]

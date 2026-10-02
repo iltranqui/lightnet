@@ -318,13 +318,20 @@ impl DetectorAugmentation {
         shuffled.truncate(self.max_boxes); // C++ caps before filtering.
         let labels = crop.labels(&shuffled, ow, oh, width, height);
         let mut out = crop.image(image, width, height)?;
+        let profiling = crate::loader_profile::enabled();
+        let hsv_start = std::time::Instant::now();
         for pixel in out.chunks_exact_mut(3) {
             hsv_distort(pixel, hue, sat, exp);
         }
-        Ok((
-            PlanarRgbImage::from_interleaved_rgb_u8(width, height, &out)?,
-            labels,
-        ))
+        let hsv_elapsed = hsv_start.elapsed();
+        let encode_start = std::time::Instant::now();
+        let encoded = PlanarRgbImage::from_interleaved_rgb_u8(width, height, &out)?;
+        let encode_elapsed = encode_start.elapsed();
+        if profiling {
+            crate::loader_profile::add_hsv(hsv_elapsed);
+            crate::loader_profile::add_encode(encode_elapsed);
+        }
+        Ok((encoded, labels))
     }
 }
 
@@ -459,15 +466,20 @@ impl Crop {
     }
 
     fn image(&self, image: &PlanarRgbImage, nw: usize, nh: usize) -> Result<Vec<u8>> {
+        let profiling = crate::loader_profile::enabled();
+        let to_rgb8_start = std::time::Instant::now();
         let rgb = image.to_rgb8()?;
+        let to_rgb8_elapsed = to_rgb8_start.elapsed();
         let src = rgb.as_raw();
         let (ow, oh) = (image.shape.width, image.shape.height);
+        let mean_start = std::time::Instant::now();
         let mut mean = [0u8; 3];
         for c in 0..3 {
             mean[c] = ((src.chunks_exact(3).map(|p| p[c] as u64).sum::<u64>() as f64)
                 / (ow * oh) as f64)
                 .round_ties_even() as u8;
         }
+        let mean_elapsed = mean_start.elapsed();
         // Virtual mean-padded crop avoids allocating potentially huge crops.
         let at = |x: i32, y: i32, c: usize| {
             let (x, y) = (i64::from(x) + i64::from(self.left), i64::from(y) + i64::from(self.top));
@@ -481,6 +493,7 @@ impl Crop {
             .checked_mul(nh)
             .and_then(|v| v.checked_mul(3))
             .ok_or_else(|| invalid("augmented image size overflow"))?;
+        let resize_start = std::time::Instant::now();
         let mut out = vec![0u8; count];
         for y in 0..nh {
             let (y0, y1, wy) = linear_coeff(y, nh, self.height);
@@ -497,6 +510,11 @@ impl Crop {
                     out[(y * nw + dx) * 3 + c] = value.clamp(0, 255) as u8;
                 }
             }
+        }
+        if profiling {
+            crate::loader_profile::add_to_rgb8(to_rgb8_elapsed);
+            crate::loader_profile::add_mean(mean_elapsed);
+            crate::loader_profile::add_resize(resize_start.elapsed());
         }
         Ok(out)
     }
