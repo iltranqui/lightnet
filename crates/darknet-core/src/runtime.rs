@@ -2147,6 +2147,8 @@ where
     /// Per-owner-layer Adam moments (device), created lazily on the first
     /// Adam update.
     adam_state: Vec<Option<GpuAdamLayerState<B::Tensor>>>,
+    /// Adam moments for host-resident (connected) parameters.
+    host_adam_state: RefCell<Vec<Option<HostAdamLayerState>>>,
     /// Number of Adam updates applied so far (the 1-based bias-correction `t`).
     adam_step: u32,
     /// See [`ExecutableNetwork::set_train_iteration`].
@@ -2161,6 +2163,13 @@ where
 
 /// First/second moments of one tensor.
 type GpuMoments<T> = (T, T);
+
+/// Adam moments of the host-resident parameters of one layer (connected).
+#[derive(Clone, Debug, Default)]
+struct HostAdamLayerState {
+    weights: Option<(Vec<f32>, Vec<f32>)>,
+    biases: Option<(Vec<f32>, Vec<f32>)>,
+}
 
 #[derive(Clone, Debug)]
 struct GpuAdamLayerState<T> {
@@ -2312,10 +2321,6 @@ where
             Ok(out)
         }
     }
-}
-
-fn net_adam_active(step: &GpuOptimizerStep) -> bool {
-    matches!(step, GpuOptimizerStep::Adam(_))
 }
 
 #[derive(Clone, Debug)]
@@ -2768,6 +2773,7 @@ where
             device_train_buffers,
             cpu_fallback_train_buffers,
             adam_state: Vec::new(),
+            host_adam_state: RefCell::new(Vec::new()),
             adam_step: 0,
             train_iteration: 0,
             host_weights_stale: false,
@@ -3143,11 +3149,14 @@ where
         };
         let step = if net.adam {
             if self.params.iter().any(|params| {
-                !matches!(params, LayerParams::None | LayerParams::Convolutional(_))
+                !matches!(
+                    params,
+                    LayerParams::None | LayerParams::Convolutional(_) | LayerParams::Connected(_)
+                )
             }) {
                 return Err(Error::InvalidConfig(
-                    "adam=1 on the GPU path supports convolutional layers only (host-fallback \
-                     layers such as connected/batchnorm/rnn have no Adam state)"
+                    "adam=1 on the GPU path supports convolutional and connected layers only \
+                     (standalone batchnorm / recurrent / local have no Adam state)"
                         .to_string(),
                 ));
             }
@@ -3331,8 +3340,56 @@ where
         if sync_host_weights {
             self.host_weights_stale = false;
         }
-        if !net_adam_active(&step) {
+        if let GpuOptimizerStep::Adam(adam) = step {
+            self.update_cpu_fallback_connected_adam(&adam)?;
+        } else {
             self.update_cpu_fallback_weights(lr / loss_scale, momentum, decay * loss_scale, batch);
+        }
+        Ok(())
+    }
+
+    /// Adam step for host-resident connected parameters (device convolutions are
+    /// handled by the main loop).  Rejects any other host parameter type.
+    fn update_cpu_fallback_connected_adam(&mut self, adam: &AdamParams) -> Result<()> {
+        let iteration_num = self.train_iteration as i64 + 1;
+        let burn_in = self.network.net.burn_in;
+        let mut moments_all = self.host_adam_state.borrow_mut();
+        if moments_all.len() != self.network.layers.len() {
+            *moments_all = (0..self.network.layers.len()).map(|_| None).collect();
+        }
+        let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
+        for (index, layer) in self.network.layers.iter().enumerate() {
+            if matches!(layer.kind, LayerKind::Convolutional(_)) {
+                continue;
+            }
+            if !layer.train.updates_at(iteration_num, burn_in) {
+                continue;
+            }
+            match (&mut self.params[index], &mut buffers[index]) {
+                (LayerParams::Connected(params), LayerTrainBuffers::Connected(train)) => {
+                    let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    apply_host_adam(
+                        &mut params.weights,
+                        &mut train.weight_updates,
+                        &mut moments.weights,
+                        adam,
+                    )?;
+                    apply_host_adam(
+                        &mut params.biases,
+                        &mut train.bias_updates,
+                        &mut moments.biases,
+                        adam,
+                    )?;
+                }
+                (LayerParams::None, _) | (LayerParams::Convolutional(_), _) => {}
+                _ => {
+                    return Err(Error::InvalidConfig(format!(
+                        "adam=1 on the GPU path has no optimizer state for layer #{} ({})",
+                        index,
+                        layer.kind.name()
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -6690,6 +6747,36 @@ fn update_batchnorm_params(
         0.0,
         batch,
     );
+}
+
+/// One Adam step on a host-resident parameter tensor, zeroing the accumulated
+/// update like the device kernel (`adam_update_gpu` clears `weight_updates`).
+fn apply_host_adam(
+    weights: &mut [f32],
+    updates: &mut [f32],
+    moments: &mut Option<(Vec<f32>, Vec<f32>)>,
+    params: &AdamParams,
+) -> Result<()> {
+    if weights.len() != updates.len() {
+        return Err(Error::InvalidConfig(
+            "host Adam weight/update length mismatch".to_owned(),
+        ));
+    }
+    let (m, v) = moments
+        .take()
+        .unwrap_or_else(|| (vec![0.0; weights.len()], vec![0.0; weights.len()]));
+    if m.len() != weights.len() || v.len() != weights.len() {
+        return Err(Error::InvalidConfig(
+            "host Adam moment length mismatch".to_owned(),
+        ));
+    }
+    let (updated, m2, v2) = darknet_cuda::host_ops::adam_update(weights, updates, &m, &v, params);
+    weights.copy_from_slice(&updated);
+    for value in updates.iter_mut() {
+        *value = 0.0;
+    }
+    *moments = Some((m2, v2));
+    Ok(())
 }
 
 fn update_connected_params(
@@ -16693,7 +16780,7 @@ mod tests {
         let network = Network::from_config(
             ConfigFile::parse_str(
                 "inline.cfg",
-                "[net]\nwidth=2\nheight=2\nchannels=1\nbatch=1\nadam=1\n[connected]\noutput=2\nactivation=linear\n",
+                "[net]\nwidth=2\nheight=2\nchannels=1\nbatch=1\nadam=1\n[local]\nfilters=1\nsize=1\nstride=1\nactivation=linear\n",
             )
             .expect("cfg"),
         )
@@ -16701,6 +16788,44 @@ mod tests {
         let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
         gpu.init_train_buffers_gpu().expect("buffers");
         assert!(gpu.update_weights_gpu(0.01, 0.9, 0.0, 1).is_err());
+    }
+
+    #[test]
+    fn gpu_adam_supports_connected_layers() {
+        // Connected parameters stay on the host but now have Adam moments, so a
+        // connected layer trains with `adam=1` on the GPU path.
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "inline.cfg",
+                "[net]\ninputs=2\nbatch=1\nadam=1\n[connected]\noutput=1\nactivation=linear\n",
+            )
+            .expect("cfg"),
+        )
+        .expect("network");
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        let LayerParams::Connected(params) = &mut gpu.params[0] else {
+            panic!("expected connected parameters");
+        };
+        params.weights = vec![2.0, 3.0];
+        params.biases = vec![0.5];
+        let input = Tensor::from_data(gpu.network.net.input_shape(), vec![1.0, 2.0]).expect("input");
+        let forward = gpu.forward_with_state(&input).expect("forward");
+        let seed = vec![Some(Tensor::filled(
+            gpu.network.layers[0].output_shape,
+            1.0,
+        ))];
+        gpu.backward_accumulate_seeded_gpu(&forward, &seed)
+            .expect("backward");
+        gpu.update_weights_gpu(0.1, 0.9, 0.0, 1).expect("adam update");
+        let LayerParams::Connected(params) = &gpu.params[0] else {
+            panic!("expected connected parameters");
+        };
+        // Adam steps by ~lr regardless of gradient magnitude.
+        assert!(
+            params.weights[0] > 2.0 && params.weights[1] > 3.0,
+            "weights should move: {:?}",
+            params.weights
+        );
     }
 
     #[test]
