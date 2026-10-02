@@ -13,8 +13,13 @@ pub struct DetectorAugmentation {
     pub max_boxes: usize,
     /// C++ `[net] mixup`: blend two independently augmented samples 50/50
     /// and concatenate their truth lists (mode 1). Cutmix (2/4) is rejected by
-    /// the C++ detector loader and mosaic (3) is not implemented here yet.
+    /// the C++ detector loader.
     pub mixup: bool,
+    /// C++ `[net] mosaic=1` (mode 3): stitch four augmented samples. Wins over
+    /// `mixup` like C++ (`cutmix` overrides both and is rejected).
+    pub mosaic: bool,
+    /// C++ `[net] mosaic_bound`: clip stitched boxes to their quadrant.
+    pub mosaic_bound: bool,
     /// Max `random` across detector heads (`0` disables multi-scale).
     pub random: f32,
     /// C++ `[net] resize_step`; multi-scale dimensions are rounded to it.
@@ -32,7 +37,7 @@ impl DetectorAugmentation {
             .rev()
             .find(|s| matches!(s.name.as_str(), "yolo" | "gaussian_yolo" | "region"))
             .ok_or_else(|| invalid("detector augmentation requires a detector head"))?;
-        for key in ["mosaic", "cutmix", "blur", "gaussian_noise", "fog", "track", "contrastive"] {
+        for key in ["cutmix", "blur", "gaussian_noise", "fog", "track", "contrastive"] {
             if net.get_f32(key, 0.0)? != 0.0 {
                 return Err(invalid(&format!(
                     "training augmentation {key} is not implemented yet"
@@ -55,6 +60,8 @@ impl DetectorAugmentation {
             exposure: net.get_f32("exposure", 1.0)?,
             max_boxes: head.get_usize("max", 200)?,
             mixup: net.get_f32("mixup", 0.0)? != 0.0,
+            mosaic: net.get_f32("mosaic", 0.0)? != 0.0,
+            mosaic_bound: net.get_bool_int("mosaic_bound", false)?,
             random,
             resize_step: net.get_usize("resize_step", 32)?,
         };
@@ -124,6 +131,100 @@ impl DetectorAugmentation {
             dim_w.max(step as i64).max(1) as usize,
             dim_h.max(step as i64).max(1) as usize,
         )
+    }
+
+    /// C++ mosaic (mode 3): independently augment four samples, then stitch
+    /// them into quadrants around a random cut and shift their truth boxes.
+    ///
+    /// Documented deviation from `data.cpp`: the C++ `left_shift/right_shift`
+    /// alignment of each quadrant to the cut and the shared draw order are not
+    /// reproduced (no cv2 mosaic reference at test time); each member uses the
+    /// existing single-image transform and is pasted at its quadrant, which is
+    /// the standard mosaic. `mosaic_bound` still clips boxes to the quadrant.
+    pub fn apply_mosaic(
+        &self,
+        members: &[(PlanarRgbImage, Vec<YoloLabel>)],
+        width: usize,
+        height: usize,
+        seed: u64,
+        sample: u64,
+    ) -> Result<(PlanarRgbImage, Vec<YoloLabel>)> {
+        if members.len() != 4 {
+            return Err(invalid("mosaic requires exactly four members"));
+        }
+        if width == 0 || height == 0 || self.letter_box {
+            return Err(invalid("mosaic requires a non-zero size and letter_box=0"));
+        }
+        let mut rng = Rng(seed ^ sample.wrapping_mul(0xd6e8feb86659fd93));
+        let min_offset = 0.2f32;
+        let cut_x = rand_cut(width, min_offset, &mut rng);
+        let cut_y = rand_cut(height, min_offset, &mut rng);
+        let mut canvas = vec![0u8; width * height * 3];
+        let mut labels: Vec<YoloLabel> = Vec::new();
+        for (index, (image, member_labels)) in members.iter().enumerate() {
+            let (augmented, augmented_labels) = self.apply(
+                image,
+                member_labels,
+                width,
+                height,
+                seed,
+                sample.wrapping_add((index as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15)),
+            )?;
+            let rgb = augmented.to_rgb8()?;
+            let (x0, y0, x1, y1) = match index {
+                0 => (0, 0, cut_x, cut_y),
+                1 => (cut_x, 0, width, cut_y),
+                2 => (0, cut_y, cut_x, height),
+                _ => (cut_x, cut_y, width, height),
+            };
+            for y in 0..(y1 - y0) {
+                for x in 0..(x1 - x0) {
+                    let src = (y * width + x) * 3;
+                    let dst = ((y0 + y) * width + x0 + x) * 3;
+                    canvas[dst..dst + 3].copy_from_slice(&rgb.as_raw()[src..src + 3]);
+                }
+            }
+            let (px0, py0) = (x0 as f32 / width as f32, y0 as f32 / height as f32);
+            let (px1, py1) = (x1 as f32 / width as f32, y1 as f32 / height as f32);
+            for label in augmented_labels {
+                let cx = px0 + label.x * (px1 - px0);
+                let cy = py0 + label.y * (py1 - py0);
+                let mut w = label.w * (px1 - px0);
+                let mut h = label.h * (py1 - py0);
+                let mut left = cx - w / 2.0;
+                let mut right = cx + w / 2.0;
+                let mut top = cy - h / 2.0;
+                let mut bottom = cy + h / 2.0;
+                if self.mosaic_bound {
+                    left = left.max(px0);
+                    right = right.min(px1);
+                    top = top.max(py0);
+                    bottom = bottom.min(py1);
+                } else {
+                    left = left.max(0.0);
+                    right = right.min(1.0);
+                    top = top.max(0.0);
+                    bottom = bottom.min(1.0);
+                }
+                w = right - left;
+                h = bottom - top;
+                if w < 1.0 / width as f32 || h < 1.0 / height as f32 {
+                    continue;
+                }
+                labels.push(YoloLabel {
+                    class_id: label.class_id,
+                    x: (left + right) / 2.0,
+                    y: (top + bottom) / 2.0,
+                    w,
+                    h,
+                });
+            }
+        }
+        labels.truncate(self.max_boxes);
+        Ok((
+            PlanarRgbImage::from_interleaved_rgb_u8(width, height, &canvas)?,
+            labels,
+        ))
     }
 
     /// Independent random stream keyed by seed and absolute sample ordinal.
@@ -229,6 +330,16 @@ impl DetectorAugmentation {
 
 fn invalid(message: &str) -> Error {
     Error::InvalidConfig(message.into())
+}
+
+/// C++ `rand_int(w*min_offset, w*(1-min_offset))` for the mosaic cut.
+fn rand_cut(size: usize, min_offset: f32, rng: &mut Rng) -> usize {
+    let min = (size as f32 * min_offset) as usize;
+    let max = (size as f32 * (1.0 - min_offset)) as usize;
+    if max <= min {
+        return min.min(size.saturating_sub(1));
+    }
+    min + (rng.next() % (max - min + 1) as u64) as usize
 }
 
 /// True when this batch should use mixup.  C++ samples `rand_bool()` once per
@@ -678,19 +789,48 @@ mod tests {
     }
 
     #[test]
+    fn mosaic_stitches_four_members_and_clips_labels() {
+        let cfg = ConfigFile::parse_str(
+            "aug.cfg",
+            "[net]\nmosaic=1\nmosaic_bound=1\n[yolo]\njitter=0\nresize=1\n",
+        )
+        .unwrap();
+        let mut opts = DetectorAugmentation::from_config(&cfg).unwrap();
+        opts.flip = false;
+        let members: Vec<(PlanarRgbImage, Vec<YoloLabel>)> = (0..4)
+            .map(|i| {
+                let bytes: Vec<u8> = (0..20 * 20 * 3).map(|k| ((k + i * 7) % 256) as u8).collect();
+                (
+                    PlanarRgbImage::from_interleaved_rgb_u8(20, 20, &bytes).unwrap(),
+                    vec![YoloLabel {
+                        class_id: i as usize,
+                        x: 0.5,
+                        y: 0.5,
+                        w: 0.4,
+                        h: 0.4,
+                    }],
+                )
+            })
+            .collect();
+        let (out, labels) = opts.apply_mosaic(&members, 40, 40, 0, 0).unwrap();
+        assert_eq!(out.shape.width, 40);
+        assert_eq!(out.data.len(), 40 * 40 * 3);
+        assert!(out.data.iter().any(|value| *value > 0.0));
+        for label in &labels {
+            assert!((0.0..=1.0).contains(&label.x) && (0.0..=1.0).contains(&label.y));
+            assert!(label.w > 0.0 && label.h > 0.0);
+        }
+        let again = opts.apply_mosaic(&members, 40, 40, 0, 0).unwrap();
+        assert_eq!(out, again.0);
+        assert_eq!(labels, again.1);
+    }
+
+    #[test]
     fn parser_defaults_and_unsupported_active_options() {
         let opts = settings("");
         assert!(opts.flip);
         assert_eq!(opts.max_boxes, 200);
-        for key in [
-            "mosaic",
-            "cutmix",
-            "blur",
-            "gaussian_noise",
-            "fog",
-            "track",
-            "contrastive",
-        ] {
+        for key in ["cutmix", "blur", "gaussian_noise", "fog", "track", "contrastive"] {
             let cfg =
                 ConfigFile::parse_str("aug.cfg", &format!("[net]\n{key}=1\n[yolo]\n")).unwrap();
             assert!(DetectorAugmentation::from_config(&cfg).is_err());
@@ -698,6 +838,10 @@ mod tests {
         let mixup =
             ConfigFile::parse_str("aug.cfg", "[net]\nmixup=1\n[yolo]\n").unwrap();
         assert!(DetectorAugmentation::from_config(&mixup).unwrap().mixup);
+        let mosaic =
+            ConfigFile::parse_str("aug.cfg", "[net]\nmosaic=1\nmosaic_bound=1\n[yolo]\n").unwrap();
+        let mosaic = DetectorAugmentation::from_config(&mosaic).unwrap();
+        assert!(mosaic.mosaic && mosaic.mosaic_bound);
         for invalid in ["hue=NaN", "saturation=0", "exposure=inf"] {
             let cfg =
                 ConfigFile::parse_str("aug.cfg", &format!("[net]\n{invalid}\n[yolo]\n")).unwrap();

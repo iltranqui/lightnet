@@ -1196,6 +1196,45 @@ fn load_training_batch_impl(
         let image = PlanarRgbImage::load(image_path)?;
         let labels = load_yolo_labels(&label_path, data.classes)?;
         let (prepared, labels) = match augmentation {
+            Some((options, seed, sample_start)) if options.mosaic => {
+                if crate::augmentation::mixup_active(seed, sample_start) {
+                    // C++ `if (rand_bool()) use_mixup = 0;`: half the batches use
+                    // the plain single-image transform.
+                    options.apply(
+                        &image,
+                        &labels,
+                        width,
+                        height,
+                        seed,
+                        sample_start.wrapping_add(batch_index as u64),
+                    )?
+                } else {
+                    let mut members = vec![(image, labels)];
+                    for member in 1..4 {
+                        let idx =
+                            (start_index + batch_index + member * batch_size) % image_paths.len();
+                        let path = &image_paths[idx];
+                        let member_label_path = replace_image_to_label(path);
+                        if !member_label_path.exists() {
+                            return Err(Error::Io(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                format!("missing label file {}", member_label_path.display()),
+                            )));
+                        }
+                        members.push((
+                            PlanarRgbImage::load(path)?,
+                            load_yolo_labels(&member_label_path, data.classes)?,
+                        ));
+                    }
+                    options.apply_mosaic(
+                        &members,
+                        width,
+                        height,
+                        seed,
+                        sample_start.wrapping_add(batch_index as u64),
+                    )?
+                }
+            }
             Some((options, seed, sample_start)) => {
                 let (primary, primary_labels) = options.apply(
                     &image,

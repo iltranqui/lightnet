@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use darknet_core::GpuExecutableNetwork;
 use darknet_core::{
     ConfigFile, DataConfig, DetectionOptions, DetectorAugmentation, ExecutableNetwork, LayerKind,
-    LayerParams, Network, PlanarRgbImage, Tensor, YoloLabel, YoloTrainingState,
+    LayerParams, Network, PlanarRgbImage, Tensor, TrainingBatch, YoloLabel, YoloTrainingState,
     compute_learning_rate, compute_yolo_training_loss_with_state, decode_yolo_detections,
     initialize_training_params, inspect_weights_file, load_augmented_training_batch_from_paths,
     load_names_file, load_paths_file, save_weights,
@@ -1326,6 +1326,99 @@ impl TrainingLossLog {
     }
 }
 
+/// Background batch loader: decodes/augments the next batch on a worker thread so
+/// the training step does not wait on it.  The caller drives a one-deep
+/// lookahead by requesting the next subdivision before processing the current.
+enum PrefetchRequest {
+    Load {
+        network: std::sync::Arc<Network>,
+        paths: std::sync::Arc<Vec<PathBuf>>,
+        start_index: usize,
+        sample_start: u64,
+    },
+    Stop,
+}
+
+struct BatchPrefetcher {
+    requests: std::sync::mpsc::SyncSender<PrefetchRequest>,
+    responses: std::sync::mpsc::Receiver<Result<TrainingBatch, String>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BatchPrefetcher {
+    fn new(data: DataConfig, augmentation: DetectorAugmentation, seed: u64) -> Self {
+        let (requests, request_rx) = std::sync::mpsc::sync_channel(8);
+        let (response_tx, responses) = std::sync::mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("darknet-prefetch".to_owned())
+            .spawn(move || {
+                while let Ok(request) = request_rx.recv() {
+                    match request {
+                        PrefetchRequest::Stop => break,
+                        PrefetchRequest::Load {
+                            network,
+                            paths,
+                            start_index,
+                            sample_start,
+                        } => {
+                            let result = load_augmented_training_batch_from_paths(
+                                network.as_ref(),
+                                &data,
+                                &paths,
+                                start_index,
+                                &augmentation,
+                                seed,
+                                sample_start,
+                            )
+                            .map_err(|err| err.to_string());
+                            if response_tx.send(result).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("spawn prefetch worker");
+        Self {
+            requests,
+            responses,
+            handle: Some(handle),
+        }
+    }
+
+    fn request(
+        &self,
+        network: std::sync::Arc<Network>,
+        paths: std::sync::Arc<Vec<PathBuf>>,
+        start_index: usize,
+        sample_start: u64,
+    ) {
+        let _ = self.requests.send(PrefetchRequest::Load {
+            network,
+            paths,
+            start_index,
+            sample_start,
+        });
+    }
+
+    fn take(&self) -> Result<TrainingBatch, Box<dyn std::error::Error>> {
+        match self.responses.recv() {
+            Ok(Ok(batch)) => Ok(batch),
+            Ok(Err(message)) => Err(message.into()),
+            Err(_) => Err("prefetch worker stopped".into()),
+        }
+    }
+}
+
+impl Drop for BatchPrefetcher {
+    fn drop(&mut self) {
+        let _ = self.requests.send(PrefetchRequest::Stop);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 fn run_detector_train_cpu(
     cfg: &str,
     data: &str,
@@ -1399,13 +1492,15 @@ fn run_detector_train_cpu(
     } else {
         (seen as usize) / train_images.len()
     };
-    let mut epoch_images = epoch_order(&train_images, options.seed, epoch);
+    let mut epoch_images = std::sync::Arc::new(epoch_order(&train_images, options.seed, epoch));
     let mut image_cursor = if train_images.is_empty() {
         0usize
     } else {
         (seen as usize) % train_images.len()
     };
     let mut loss_log = TrainingLossLog::new(&backup_dir, &base_name)?;
+    let mut prefetch_network = std::sync::Arc::new(executable.network.clone());
+    let prefetcher = BatchPrefetcher::new(data_config.clone(), augmentation.clone(), options.seed);
 
     let base_width = executable.network.net.width;
     let base_height = executable.network.net.height;
@@ -1430,17 +1525,28 @@ fn run_detector_train_cpu(
         let lr = compute_learning_rate(&executable.network.net, batch_num);
         executable.set_train_iteration(batch_num);
         let mut iter_loss = 0.0f32;
+        if prefetch_network.net.width != executable.network.net.width
+            || prefetch_network.net.height != executable.network.net.height
+            || prefetch_network.net.batch != executable.network.net.batch
+        {
+            prefetch_network = std::sync::Arc::new(executable.network.clone());
+        }
+        prefetcher.request(
+            prefetch_network.clone(),
+            epoch_images.clone(),
+            image_cursor,
+            seen,
+        );
         for subdivision in 0..executable.network.net.subdivisions.max(1) {
-            let start_index = image_cursor + subdivision * executable.network.net.batch.max(1);
-            let batch = load_augmented_training_batch_from_paths(
-                &executable.network,
-                &data_config,
-                &epoch_images,
-                start_index,
-                &augmentation,
-                options.seed,
-                seen + (subdivision * executable.network.net.batch.max(1)) as u64,
-            )?;
+            let batch = prefetcher.take()?;
+            if subdivision + 1 < executable.network.net.subdivisions.max(1) {
+                prefetcher.request(
+                    prefetch_network.clone(),
+                    epoch_images.clone(),
+                    image_cursor + (subdivision + 1) * executable.network.net.batch.max(1),
+                    seen + ((subdivision + 1) * executable.network.net.batch.max(1)) as u64,
+                );
+            }
             let forward = executable.forward_training(&batch.input)?;
             let yolo = compute_yolo_training_loss_with_state(
                 &executable.network,
@@ -1470,7 +1576,8 @@ fn run_detector_train_cpu(
         image_cursor += images_per_iteration;
         if image_cursor >= train_images.len() {
             epoch += 1;
-            epoch_images = epoch_order(&train_images, options.seed, epoch);
+            epoch_images =
+                std::sync::Arc::new(epoch_order(&train_images, options.seed, epoch));
             image_cursor %= train_images.len();
         }
 
@@ -1647,13 +1754,15 @@ fn run_detector_train_gpu(
     } else {
         (seen as usize) / train_images.len()
     };
-    let mut epoch_images = epoch_order(&train_images, options.seed, epoch);
+    let mut epoch_images = std::sync::Arc::new(epoch_order(&train_images, options.seed, epoch));
     let mut image_cursor = if train_images.is_empty() {
         0usize
     } else {
         (seen as usize) % train_images.len()
     };
     let mut loss_log = TrainingLossLog::new(&backup_dir, &base_name)?;
+    let mut prefetch_network = std::sync::Arc::new(executable.network.clone());
+    let prefetcher = BatchPrefetcher::new(data_config.clone(), augmentation.clone(), options.seed);
 
     let base_width = executable.network.net.width;
     let base_height = executable.network.net.height;
@@ -1682,17 +1791,28 @@ fn run_detector_train_gpu(
         // hold momentum * previous_gradient (C++ weight_updates *= momentum). Zeroing
         // would destroy the momentum carry. init_train_buffers_gpu() above initialises
         // them to zero only once at startup, which is correct.
+        if prefetch_network.net.width != executable.network.net.width
+            || prefetch_network.net.height != executable.network.net.height
+            || prefetch_network.net.batch != executable.network.net.batch
+        {
+            prefetch_network = std::sync::Arc::new(executable.network.clone());
+        }
+        prefetcher.request(
+            prefetch_network.clone(),
+            epoch_images.clone(),
+            image_cursor,
+            seen,
+        );
         for subdivision in 0..executable.network.net.subdivisions.max(1) {
-            let start_index = image_cursor + subdivision * executable.network.net.batch.max(1);
-            let batch = load_augmented_training_batch_from_paths(
-                &executable.network,
-                &data_config,
-                &epoch_images,
-                start_index,
-                &augmentation,
-                options.seed,
-                seen + (subdivision * executable.network.net.batch.max(1)) as u64,
-            )?;
+            let batch = prefetcher.take()?;
+            if subdivision + 1 < executable.network.net.subdivisions.max(1) {
+                prefetcher.request(
+                    prefetch_network.clone(),
+                    epoch_images.clone(),
+                    image_cursor + (subdivision + 1) * executable.network.net.batch.max(1),
+                    seen + ((subdivision + 1) * executable.network.net.batch.max(1)) as u64,
+                );
+            }
             let forward = executable.forward_training_device(&batch.input)?;
             let yolo = compute_yolo_training_loss_with_state(
                 &executable.network,
@@ -1737,7 +1857,8 @@ fn run_detector_train_gpu(
         image_cursor += images_per_iteration;
         if image_cursor >= train_images.len() {
             epoch += 1;
-            epoch_images = epoch_order(&train_images, options.seed, epoch);
+            epoch_images =
+                std::sync::Arc::new(epoch_order(&train_images, options.seed, epoch));
             image_cursor %= train_images.len();
         }
 
