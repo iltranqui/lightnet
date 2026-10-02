@@ -295,6 +295,16 @@ Inference b1 is launch bound, so the saved launches show (about 0.35 ms); b16 is
 Correctness (no training run): `DARKNET_PARITY_DUMP` after steps 1 and 5, batch 2, same init / input / seeds / deltas, previous binary vs new binary: biases, BN gamma / bias, rolling mean / variance, weights and both yolo head outputs are byte-identical for SGD (f32 GEMM), AMP and Adam (`adam=1`). Detections of the 80 validation images (`tools/oxide_map.py --save-detections`, fp32): mAP 99.6685%, `oxide_det_compare.py` vs `target/oxide_f16/det_fp32.tsv` 155 matched, 0 unmatched, max score diff 0, min IoU 1. New tests in `oxide_batchnorm_adam.rs`: multi-tensor SGD / Adam (1-3 tensors, with and without pending gradient, NaN / Inf inputs, coupled and decoupled decay) bit-identical to the per-tensor calls, fused bias + activation bit-identical for all nine activations. All oxide suites pass individually and in the full run; `cargo test -p darknet-core --lib`: 125 passed.
 Not done: fusing BN apply + activation in the training forward (the backward needs the pre-activation tensor `biased`, so the fused kernel would have to write both outputs, which saves the read but not the launch's second store; BN statistics need their own pass anyway); the conv GEMM epilogue itself (bias + activation inside the f32 GEMM store like the f16 path) was not attempted, the standalone fused pass is already one launch. A subdivision > 1 run was verified only at the kernel level (pending gradient folded in the multi-tensor kernels, flush order by construction), not end to end. CUDA graph capture stays skipped (7.3).
 
+### 7.5 Batched weight-gradient im2col (2026-10-02)
+`conv_backward_weights` (f32) ran one im2col + one GEMM per image. It now batches the im2col across a chunk (same `COL_CAP_BYTES` cap as the forward) and passes the per-image column offset to the GEMM (`b: (bi*col_len, kg*ohw, groups)`), so im2col launches drop from `batch` to `ceil(batch/chunk)` per conv; the per-image GEMM (accumulating `beta = 1` into `dW`) is unchanged. Interleaved A/B with the release `bench-train`, 3 rounds x 40 steps + 5 warmup, medians (noisy laptop):
+
+| batch | baseline | batched wgrad | delta |
+| --- | --- | --- | --- |
+| 1 | 10.19 ms | 10.05 ms | -1.4% |
+| 16 | 62.88 ms | 60.29 ms | -4.1% |
+
+p10 at b16: 54.13 -> 51.39 ms. Correctness: `oxide_conv_parity` (12), `oxide_cfg_shapes` (13, wgrad over ~1000 geometries), `oxide_amp` (11) and `oxide_runtime_chain` (3) all pass. Note the release build is not faster than the debug build for training (both ~10 ms b1 / ~61 ms b16) because the step is GPU/launch bound, not host-code bound. The remaining per-image GEMM instances (wgrad, and dgrad `W^T * dy_b`) are not batched: the GEMM instance addressing `(base, stride, modulus)` has no second level for the image x group product, so a batched dgrad/wgrad GEMM or implicit-GEMM conv is the next step.
+
 ## Gradient-method shootout (2026-10-01)
 
 Harness: `bridges/darknet-cuda-oxide/tests/oxide_grad_methods.rs` (`grad_method_shootout`, ignored; a tiny-shape version of the same

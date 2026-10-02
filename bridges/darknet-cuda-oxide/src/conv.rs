@@ -510,30 +510,40 @@ impl OxideBackend {
             .map_err(launch_err)?;
         } else {
             let (kg, ohw, fpg) = (g.kg(), g.ohw(), g.fpg());
-            self.with_workspace(g.col_len(), |ws| {
-                for b in 0..g.batch {
-                    self.launch_im2col(&g, &x.buf, ws, b, 1, config)?;
-                    // dW[g] (fpg x kg) += dy[b, g] (fpg x ohw) * col[g]^T (ohw x kg)
-                    self.gemm(
-                        &dy.buf,
-                        ws,
-                        &mut dw,
-                        &GemmArgs {
-                            m: fpg,
-                            n: kg,
-                            k: ohw,
-                            lda: ohw,
-                            ldb: ohw,
-                            ldc: kg,
-                            trans_b: true,
-                            beta: if b == 0 { 0.0 } else { 1.0 },
-                            a: (b * g.f * ohw, fpg * ohw, groups),
-                            b: (0, kg * ohw, groups),
-                            c: (0, fpg * kg, groups),
-                            count: groups,
-                            ..GemmArgs::default()
-                        },
-                    )?;
+            // Batch im2col across the images of a chunk (same cap as the forward
+            // path): one im2col launch per chunk instead of one per image, then
+            // one GEMM per image accumulating into `dw` (`beta = 1`).
+            let chunk = (COL_CAP_BYTES / 4 / g.col_len()).clamp(1, g.batch).min(chunk_limit());
+            self.with_workspace(chunk * g.col_len(), |ws| {
+                let mut b0 = 0;
+                while b0 < g.batch {
+                    let nb = chunk.min(g.batch - b0);
+                    self.launch_im2col(&g, &x.buf, ws, b0, nb, config)?;
+                    for bi in 0..nb {
+                        let image = b0 + bi;
+                        // dW[g] (fpg x kg) += dy[b, g] (fpg x ohw) * col[g]^T (ohw x kg)
+                        self.gemm(
+                            &dy.buf,
+                            ws,
+                            &mut dw,
+                            &GemmArgs {
+                                m: fpg,
+                                n: kg,
+                                k: ohw,
+                                lda: ohw,
+                                ldb: ohw,
+                                ldc: kg,
+                                trans_b: true,
+                                beta: if image == 0 { 0.0 } else { 1.0 },
+                                a: (image * g.f * ohw, fpg * ohw, groups),
+                                b: (bi * g.col_len(), kg * ohw, groups),
+                                c: (0, fpg * kg, groups),
+                                count: groups,
+                                ..GemmArgs::default()
+                            },
+                        )?;
+                    }
+                    b0 += nb;
                 }
                 Ok(())
             })?;
