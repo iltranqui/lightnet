@@ -5317,6 +5317,65 @@ where
                         source_grad,
                     )?;
                 }
+                (
+                    LayerKind::Connected(spec),
+                    Some(LayerParams::Connected(connected)),
+                ) if !spec.batch_normalize && spec.activation.to_cuda_f32_kind().is_some() => {
+                    // The gradient chain stays on the device; only the connected
+                    // GEMM itself runs on the host (`connected_backward_f32`).
+                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+                    let activation_input = forward.gpu_layer_activation_inputs[layer.index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing GPU activation cache for connected layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let delta = self
+                        .backend
+                        .activation_backward_f32(activation_input, &grad, activation, config)
+                        .map_err(|err| backend_error("GPU connected activation backward", err))?;
+                    let current_input = if layer.index == 0 {
+                        &forward.input_gpu
+                    } else {
+                        forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing previous GPU layer output for connected layer #{}",
+                                layer.index
+                            ))
+                        })?
+                    };
+                    let inputs = layer.input_shape.element_count();
+                    let weights_gpu = self
+                        .backend
+                        .upload_f32(&[spec.output, inputs], &connected.weights)
+                        .map_err(|err| backend_error("upload connected weights", err))?;
+                    let (input_grad, weight_grad, bias_grad) = self
+                        .backend
+                        .connected_backward_f32(
+                            current_input,
+                            &weights_gpu,
+                            &delta,
+                            layer.input_shape.batch,
+                            inputs,
+                            spec.output,
+                            config,
+                        )
+                        .map_err(|err| backend_error("GPU connected backward", err))?;
+                    self.accumulate_connected_host_gradients(
+                        layer.index,
+                        &weight_grad,
+                        &bias_grad,
+                        inputs,
+                        spec.output,
+                    )?;
+                    self.accumulate_previous_gpu_gradient(
+                        layer.index,
+                        input_grad,
+                        &mut layer_output_gradients,
+                    )?;
+                }
                 (LayerKind::Yolo(_), Some(LayerParams::None))
                 | (LayerKind::GaussianYolo(_), Some(LayerParams::None))
                 | (LayerKind::Region(_), Some(LayerParams::None))
@@ -5345,15 +5404,19 @@ where
 
     fn requires_cpu_backward_fallback(&self) -> bool {
         self.network.layers.iter().any(|layer| {
-            if matches!(
-                layer.kind,
-                LayerKind::Connected(_)
-                    | LayerKind::Sam(_)
-                    | LayerKind::Rnn(_)
-                    | LayerKind::Lstm(_)
-                    | LayerKind::Crnn(_)
-            ) {
-                return true;
+            match &layer.kind {
+                // Recurrent layers need device sequence state; keep the whole
+                // net on the CPU backward for them.
+                LayerKind::Rnn(_) | LayerKind::Lstm(_) | LayerKind::Crnn(_) => return true,
+                // Connected layers are handled on the GPU path with a host
+                // round trip unless their activation or batch norm
+                // (batch-statistics training) is unsupported.
+                LayerKind::Connected(spec) => {
+                    if spec.batch_normalize || spec.activation.to_cuda_f32_kind().is_none() {
+                        return true;
+                    }
+                }
+                _ => {}
             }
             if let LayerKind::ScaleChannels(spec) = &layer.kind
                 && spec.activation.to_cuda_f32_kind().is_none()
@@ -5477,6 +5540,45 @@ where
             return Ok(());
         }
         self.accumulate_gpu_gradient(&mut layer_output_gradients[layer_index - 1], gradient)
+    }
+
+    /// Accumulate a connected layer's host weight/bias gradient into its
+    /// `LayerTrainBuffers` (the layer's parameters stay on the host; the
+    /// optimizer's `update_cpu_fallback_weights` step consumes them).
+    fn accumulate_connected_host_gradients(
+        &self,
+        layer_index: usize,
+        weight_grad: &B::Tensor,
+        bias_grad: &B::Tensor,
+        inputs: usize,
+        outputs: usize,
+    ) -> Result<()> {
+        let dw = self
+            .backend
+            .download_f32(weight_grad)
+            .map_err(|err| backend_error("download connected weight gradient", err))?;
+        let db = self
+            .backend
+            .download_f32(bias_grad)
+            .map_err(|err| backend_error("download connected bias gradient", err))?;
+        let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
+        let Some(LayerTrainBuffers::Connected(train)) = buffers.get_mut(layer_index) else {
+            return Err(Error::InvalidConfig(format!(
+                "missing connected train buffers for layer #{layer_index}"
+            )));
+        };
+        if train.weight_updates.len() != outputs * inputs || train.bias_updates.len() != outputs {
+            return Err(Error::InvalidConfig(format!(
+                "connected train buffer mismatch for layer #{layer_index}"
+            )));
+        }
+        for (slot, value) in train.weight_updates.iter_mut().zip(dw) {
+            *slot += value;
+        }
+        for (slot, value) in train.bias_updates.iter_mut().zip(db) {
+            *slot += value;
+        }
+        Ok(())
     }
 
     fn accumulate_gpu_gradient(
@@ -11131,7 +11233,7 @@ mod tests {
             activation: F32ActivationKind,
             _config: ElementwiseLaunchConfig,
         ) -> std::result::Result<Self::Tensor, Self::Error> {
-            if activation_input.shape != delta.shape {
+            if activation_input.data.len() != delta.data.len() {
                 return Err("activation_backward_f32 shape mismatch".to_owned());
             }
             Ok(FakeTensor {
@@ -12533,7 +12635,7 @@ mod tests {
             _activation: F32ActivationKind,
             _config: ElementwiseLaunchConfig,
         ) -> std::result::Result<Self::Tensor, Self::Error> {
-            if activation_input.shape != delta.shape {
+            if activation_input.data.len() != delta.data.len() {
                 return Err("activation_backward_f32 shape mismatch".to_owned());
             }
             Ok(delta.clone())
@@ -16007,7 +16109,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_connected_layers_use_the_cpu_reference_fallback_for_training() {
+    fn gpu_connected_layers_train_on_the_gpu_path() {
         let network = Network::from_config(
             ConfigFile::parse_str(
                 "gpu-connected.cfg",
@@ -16024,6 +16126,10 @@ mod tests {
         params.biases = vec![0.5];
         let input = Tensor::from_data(gpu.network.net.input_shape(), vec![1.0, 2.0])
             .expect("connected input should have the expected shape");
+        assert!(
+            !gpu.requires_cpu_backward_fallback(),
+            "connected layers must use the GPU backward path"
+        );
         let forward = gpu
             .forward_with_state(&input)
             .expect("GPU connected forward should succeed");
@@ -16033,7 +16139,7 @@ mod tests {
             1.0,
         ))];
         gpu.backward_accumulate_seeded_gpu(&forward, &seed)
-            .expect("GPU connected backward should use the reference fallback");
+            .expect("GPU connected backward should succeed");
         gpu.update_weights_gpu(0.1, 0.0, 0.0, 1)
             .expect("GPU connected update should succeed");
         let LayerParams::Connected(params) = &gpu.params[0] else {
