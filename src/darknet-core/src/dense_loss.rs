@@ -47,6 +47,14 @@ pub fn compute_dense_training_loss(
             LayerKind::Cost { kind, scale } => elementwise_cost(prev, t, kind, *scale),
             LayerKind::Regression(spec) => elementwise_cost(prev, t, "sse", spec.scale),
             LayerKind::Logistic => logistic_cost(&forward.layer_outputs[layer.index], t),
+            LayerKind::JevCe(spec) => {
+                let result = crate::jev_ce::jev_ce_loss(&prev.data, &t.data, spec, prev.shape.batch);
+                let mut delta = Tensor::from_data(prev.shape, result.delta)?;
+                for v in &mut delta.data {
+                    *v *= spec.scale; // C++ backward: axpy(scale, delta)
+                }
+                (delta, result.mean_ce)
+            }
             other => {
                 return Err(Error::InvalidConfig(format!(
                     "layer #{} ([{}]) is not a dense-truth loss layer",
@@ -153,6 +161,16 @@ mod tests {
         let loss = run(cfg, |e| set_bias(e, vec![1.0, 2.0]), vec![3.0, 1.0], 1);
         assert_eq!(loss.layer_output_gradient_seeds[1].as_ref().unwrap().data, vec![4.0, -2.0]); // 2 * (t - p)
         assert_eq!(loss.loss, 4.0 + 1.0);
+    }
+
+    #[test]
+    fn jev_ce_head_seed_is_scale_times_delta_and_cost_is_mean_ce() {
+        let cfg = "[net]\nwidth=1\nheight=1\nchannels=3\n[connected]\noutput=3\nactivation=linear\n[jev_ce]\ngroups=1\nscale=2\n";
+        let loss = run(cfg, |_| {}, vec![1.0, 0.0, 0.0], 1);
+        let seed = loss.layer_output_gradient_seeds[1].as_ref().unwrap();
+        let third = 1.0f32 / 3.0;
+        assert!((seed.data[0] - 2.0 * (1.0 - third)).abs() < 1e-6);
+        assert!((loss.loss - 3f32.ln()).abs() < 1e-6);
     }
 
     #[test]

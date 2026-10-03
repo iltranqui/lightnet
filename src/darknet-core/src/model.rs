@@ -313,6 +313,18 @@ pub struct RegressionSpec {
     pub scale: f32,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct JevCeSpec {
+    pub groups: usize,
+    pub candidates: usize,
+    pub temperature: f32,
+    pub normalize: bool,
+    pub ignore_empty: bool,
+    pub label_smoothing: f32,
+    pub scale: f32,
+    pub channel_major: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MaxPoolSpec {
     pub size: usize,
@@ -606,6 +618,7 @@ pub enum LayerKind {
     Cost { kind: String, scale: f32 },
     Logistic,
     Regression(RegressionSpec),
+    JevCe(JevCeSpec),
     Dropout {
         probability: Option<f32>,
         /// `dropblock=1` selects DropBlock instead of element-wise dropout.
@@ -647,6 +660,7 @@ impl LayerKind {
             Self::Cost { .. } => "cost",
             Self::Logistic => "logistic",
             Self::Regression(_) => "regression",
+            Self::JevCe(_) => "jev_ce",
             Self::Dropout { .. } => "dropout",
             Self::ScaleChannels(_) => "scale_channels",
             Self::Sam(_) => "sam",
@@ -1522,6 +1536,51 @@ fn parse_layer_kind(
         "regression" => LayerKind::Regression(RegressionSpec {
             scale: section.get_f32("scale", 1.0)?,
         }),
+        "jev_ce" => {
+            let inputs = current.element_count();
+            let groups = section.get_usize("groups", 81)?;
+            let line = section.line;
+            if groups == 0 {
+                return Err(Error::InvalidConfig(format!("[jev_ce] at line {line}: groups must be > 0")));
+            }
+            let mut candidates = section.get_usize("candidates", 0)?;
+            if candidates == 0 {
+                if inputs % groups != 0 {
+                    return Err(Error::InvalidConfig(format!(
+                        "[jev_ce] at line {line}: cannot infer candidates, {inputs} outputs are not divisible by groups={groups}"
+                    )));
+                }
+                candidates = inputs / groups;
+            }
+            if groups * candidates != inputs {
+                return Err(Error::InvalidConfig(format!(
+                    "[jev_ce] at line {line}: inputs ({inputs}) must equal groups*candidates ({groups}*{candidates})"
+                )));
+            }
+            let label_smoothing =
+                section.get_f32("label_smoothing", section.get_f32("smoothing", 0.0)?)?;
+            if !(0.0..1.0).contains(&label_smoothing) {
+                return Err(Error::InvalidConfig(format!("[jev_ce] at line {line}: label_smoothing must be in [0,1)")));
+            }
+            let layout = section.get_str("layout", "group");
+            let channel_major = match layout.as_str() {
+                "channel" | "channel_major" | "cm" | "chw" => true,
+                "group" | "group_major" | "gm" => section.get_usize("channel_major", 0)? != 0,
+                other => {
+                    return Err(Error::InvalidConfig(format!("[jev_ce] at line {line}: unknown layout '{other}' (expected group or channel)")));
+                }
+            };
+            LayerKind::JevCe(JevCeSpec {
+                groups,
+                candidates,
+                temperature: section.get_f32("temperature", section.get_f32("temp", 1.0)?)?,
+                normalize: section.get_usize("normalize", 1)? != 0,
+                ignore_empty: section.get_usize("ignore_empty", 1)? != 0,
+                label_smoothing,
+                scale: section.get_f32("scale", 1.0)?,
+                channel_major,
+            })
+        }
         "dropout" => LayerKind::Dropout {
             probability: section
                 .get("probability")
@@ -1736,6 +1795,7 @@ fn infer_output_shape(
         | LayerKind::Cost { .. }
         | LayerKind::Logistic
         | LayerKind::Regression(_)
+        | LayerKind::JevCe(_)
         | LayerKind::Dropout { .. }
         | LayerKind::Contrastive { .. } => Ok(current),
         LayerKind::ChannelSlice(spec) => {
@@ -2145,6 +2205,21 @@ mod tests {
         assert!(matches!(net.layers[2].kind, LayerKind::Logistic));
         assert!(matches!(&net.layers[3].kind, LayerKind::Regression(r) if r.scale == 3.0));
         assert_eq!(net.layers[3].output_shape, net.layers[2].output_shape);
+    }
+
+    #[test]
+    fn jev_ce_keys_follow_cpp_defaults_and_validation() {
+        let base = "[net]\nwidth=1\nheight=1\nchannels=12\n[connected]\noutput=12\n";
+        let net = build(&format!("{base}[jev_ce]\ngroups=4\ntemp=2\nsmoothing=0.1\nlayout=cm\n")).unwrap();
+        let LayerKind::JevCe(s) = &net.layers[1].kind else { panic!() };
+        assert_eq!((s.groups, s.candidates, s.temperature, s.label_smoothing, s.channel_major), (4, 3, 2.0, 0.1, true));
+        assert!(s.normalize && s.ignore_empty && s.scale == 1.0);
+        assert_eq!(net.layers[1].output_shape, net.layers[0].output_shape);
+        assert!(build(&format!("{base}[jev_ce]\n")).is_err()); // default groups=81 does not divide 12
+        assert!(build(&format!("{base}[jev_ce]\ngroups=5\n")).is_err());
+        assert!(build(&format!("{base}[jev_ce]\ngroups=4\ncandidates=4\n")).is_err()); // 4*4 != 12
+        assert!(build(&format!("{base}[jev_ce]\ngroups=4\nlabel_smoothing=1.0\n")).is_err());
+        assert!(build(&format!("{base}[jev_ce]\ngroups=4\nlayout=zigzag\n")).is_err());
     }
 
     fn repo_cfg(name: &str) -> PathBuf {

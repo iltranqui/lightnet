@@ -26,6 +26,7 @@ pub mod error;
 pub mod evaluate;
 pub use evaluate::{MapReport, REPORT_CONFIDENCE, ValidationDataset, detector_map};
 pub mod image;
+pub(crate) mod jev_ce;
 pub mod initialize;
 pub mod loader_profile;
 pub use initialize::initialize_training_params;

@@ -1092,6 +1092,13 @@ impl ExecutableNetwork {
                     forward_upsample(spec, current_input, layer.output_shape)?,
                     None,
                 ),
+                (LayerKind::JevCe(spec), LayerParams::None) => (
+                    Tensor::from_data(
+                        current_input.shape,
+                        crate::jev_ce::jev_ce_probs(&current_input.data, spec, current_input.shape.batch),
+                    )?,
+                    None,
+                ),
                 (LayerKind::Logistic, LayerParams::None) => {
                     let data = current_input
                         .data
@@ -1833,6 +1840,7 @@ impl ExecutableNetwork {
                 | (LayerKind::Cost { .. }, LayerParams::None)
                 | (LayerKind::Logistic, LayerParams::None)
                 | (LayerKind::Regression(_), LayerParams::None)
+                | (LayerKind::JevCe(_), LayerParams::None)
                 | (LayerKind::Contrastive { .. }, LayerParams::None) => {
                     accumulate_previous_gradient(
                         layer.index,
@@ -4234,6 +4242,16 @@ where
                         launch_config,
                     )
                     .map_err(|err| backend_error("upsample", err))?,
+                (LayerKind::JevCe(spec), LayerParams::None) => {
+                    let host_input = self
+                        .download_tensor(current_input, layer.input_shape)
+                        .map_err(|err| backend_error("download jev_ce input", err))?;
+                    let probs =
+                        crate::jev_ce::jev_ce_probs(&host_input.data, spec, layer.input_shape.batch);
+                    self.backend
+                        .upload_f32(&tensor_backend_shape(layer.output_shape), &probs)
+                        .map_err(|err| backend_error("upload jev_ce output", err))?
+                }
                 (LayerKind::Logistic, LayerParams::None) => self
                     .backend
                     .activation_f32(
@@ -4709,6 +4727,7 @@ where
                     | LayerKind::Softmax { .. }
                     | LayerKind::Logistic
                     | LayerKind::Regression(_)
+                    | LayerKind::JevCe(_)
                     | LayerKind::ScaleChannels(_)
                     | LayerKind::Sam(_)
                     | LayerKind::Rnn(_)
@@ -5772,6 +5791,7 @@ where
                 | (LayerKind::Cost { .. }, Some(LayerParams::None))
                 | (LayerKind::Logistic, Some(LayerParams::None))
                 | (LayerKind::Regression(_), Some(LayerParams::None))
+                | (LayerKind::JevCe(_), Some(LayerParams::None))
                 | (LayerKind::Sam(_), Some(LayerParams::None))
                 | (LayerKind::Contrastive { .. }, Some(LayerParams::None)) => {
                     self.accumulate_previous_gpu_gradient(
@@ -17078,6 +17098,16 @@ mod tests {
         }
         // input-form gradients must refuse to run without the cached pre-activation
         assert!(super::activation_gradient_from_output(&Activation::Gelu, 0.5, None, "t").is_err());
+    }
+
+    #[test]
+    fn gpu_jev_ce_head_matches_cpu_forward() {
+        assert_gpu_layer_chain_matches_cpu(
+            "[net]\nwidth=1\nheight=1\nchannels=4\nbatch=2\n\
+             [convolutional]\nfilters=6\nsize=1\nstride=1\nactivation=linear\n\
+             [jev_ce]\ngroups=2\ntemperature=1.5\n",
+            1,
+        );
     }
 
     #[test]
