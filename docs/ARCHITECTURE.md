@@ -28,17 +28,17 @@ compatibility boundary.
 
 | Rust path | Responsibility | C++ analogue |
 | --- | --- | --- |
-| `crates/darknet-core/src/cfg.rs` | Parse raw sections and key/value pairs | `darknet_cfg.cpp/.hpp`, option parsing |
-| `crates/darknet-core/src/model.rs` | Infer layer shapes and model metadata | network/layer construction in `darknet_cfg.cpp` |
-| `crates/darknet-core/src/runtime.rs` | CPU forward/backward, caches, train buffers, GPU orchestration | layer callbacks and network execution |
-| `crates/darknet-core/src/weights.rs` | Read/write binary weights | `weights.cpp/.hpp` |
-| `crates/darknet-core/src/train.rs` | Dataset paths, labels, target assignment, detector loss | detector/data/training code |
-| `crates/darknet-core/src/detect.rs` | Decode YOLO heads and NMS | YOLO detection helpers |
-| `crates/darknet-core/src/image.rs` | RGB loading and planar preprocessing | image loading/letterbox helpers |
-| `crates/darknet-cuda` | Backend traits and tensor operation contract | CUDA function boundary |
-| `bridges/darknet-cuda-cutile` | cuTile implementation of the backend contract | CUDA kernels exposed as Rust operations |
-| `crates/darknet-cli` | CLI commands and training/inference reporting | `darknet` executable commands |
-| `crates/darknet-examples` | Rust equivalents of the 11 C++ examples | `src-examples/darknet_*.cpp` |
+| `src/darknet-core/src/cfg.rs` | Parse raw sections and key/value pairs | `darknet_cfg.cpp/.hpp`, option parsing |
+| `src/darknet-core/src/model.rs` | Infer layer shapes and model metadata | network/layer construction in `darknet_cfg.cpp` |
+| `src/darknet-core/src/runtime.rs` | CPU forward/backward, caches, train buffers, GPU orchestration | layer callbacks and network execution |
+| `src/darknet-core/src/weights.rs` | Read/write binary weights | `weights.cpp/.hpp` |
+| `src/darknet-core/src/train.rs` | Dataset paths, labels, target assignment, detector loss | detector/data/training code |
+| `src/darknet-core/src/detect.rs` | Decode YOLO heads and NMS | YOLO detection helpers |
+| `src/darknet-core/src/image.rs` | RGB loading and planar preprocessing | image loading/letterbox helpers |
+| `src/darknet-cuda` | Backend traits and tensor operation contract | CUDA function boundary |
+| `src/darknet-cuda-cutile` | cuTile implementation of the backend contract | CUDA kernels exposed as Rust operations |
+| `src/darknet-cli` | CLI commands and training/inference reporting | `darknet` executable commands |
+| `src/darknet-examples` | Rust equivalents of the 11 C++ examples | `src-examples/darknet_*.cpp` |
 
 ## C++ to Rust ownership map
 

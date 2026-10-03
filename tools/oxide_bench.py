@@ -4,7 +4,7 @@
 Suites
   micro  GEMM (square + LegoGears conv shapes), im2col, elementwise, activations, bias, pooling,
          upsample, route, softmax, batch-norm: GFLOP/s or GB/s and % of roofline.
-         Rust side: bridges/darknet-cuda-oxide/tests/oxide_bench.rs (CUDA-event timed).
+         Rust side: src/darknet-cuda-oxide/tests/oxide_bench.rs (CUDA-event timed).
   conv   the 21 LegoGears_v2 conv layers, fwd / dgrad / wgrad, direct vs gemm-fp32 vs gemm-tf32 vs gemm-fp16 (fwd only, native f16 storage + fused epilogue).
   e2e    LegoGears_v2 inference latency/FPS at batch 1 and 16: oxide fp32/tf32/fp16, C++ CUDA Darknet
          (cuDNN fp16 and cuDNN fp32), Rust CPU.  Variants are INTERLEAVED round by round
@@ -87,7 +87,7 @@ def environment() -> dict:
 def run_rust_bench(test: str, extra_env: dict) -> list[dict]:
     env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, **extra_env)
     cmd = CAP + [str(CARGO_OXIDE), "oxide", "test", "--", "--manifest-path",
-                 str(REPO / "bridges/darknet-cuda-oxide/Cargo.toml"), "--release", "--test", "oxide_bench",
+                 str(REPO / "src/darknet-cuda-oxide/Cargo.toml"), "--release", "--test", "oxide_bench",
                  "-j", "1", "--", "--ignored", "--nocapture", "--test-threads=1", test]
     print("+", shlex.join(cmd), flush=True)
     proc = subprocess.run(cmd, cwd=REPO, env=env, capture_output=True, text=True)

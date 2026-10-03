@@ -8,7 +8,7 @@ No training runs were made.
 
 ## Methodology
 
-* Harness: `bridges/darknet-cuda-oxide/tests/oxide_bench.rs` (ignored tests `bench_micro`, `bench_conv`) + `tools/oxide_bench.py` (driver) +
+* Harness: `src/darknet-cuda-oxide/tests/oxide_bench.rs` (ignored tests `bench_micro`, `bench_conv`) + `tools/oxide_bench.py` (driver) +
   `tools/oxide_bench_cpp.cpp` (C++ CUDA Darknet probe linking `build/src-lib/libdarknet.so`; built on demand into `target/oxide_bench/`).
   End-to-end Rust numbers come from `DARKNET_BENCH_ITERS` / `DARKNET_BENCH_BATCH` in `darknet-rs detect-image` (`BENCH_JSON` line).
 * Micro/conv: warm-up launch, then per sample the mean device time of N back-to-back launches measured with CUDA events on the backend
@@ -209,7 +209,7 @@ GPU kernel time was only ~6 ms/step at batch 1 (of 65) and ~52 ms/step at batch 
 b1 = 200 small H2D + 200 D2H copies per step and 5200 stream syncs / 13 steps; b16 = 3.6 GB of D2H in 13 steps (every layer output + activation cache downloaded
 by the training forward: 1.4 s of cuMemcpyDtoH = 51% of the API time), and per BN layer per step a full host fold of the BN weights + 4 uploads (backward rolling-stat refresh and update).
 
-Fixes (all in `crates/darknet-core/src/runtime.rs`, semantics unchanged, GPU-vs-CPU tests untouched):
+Fixes (all in `src/darknet-core/src/runtime.rs`, semantics unchanged, GPU-vs-CPU tests untouched):
 1. `forward_training_device`: the CLI/bench training forward downloads only the yolo head outputs (what the host loss reads). Networks that need the CPU backward fallback keep the full host copies. `forward_training_with_state` still returns everything.
 2. BN fold on the device: after an update the BN-folded inference weights are `channel_scale(raw_w, gamma/sqrt(var+eps))` on the GPU (same arithmetic as the host fold) instead of download + host fold + upload; only the small bias vector round-trips.
 3. Lazy fold: `folded_stale` flag on the cached device params; the update and the rolling-stat refresh only mark the folded copies stale, the training forward/backward use the raw tensors, and the fold runs the next time an inference forward needs it.
@@ -234,7 +234,7 @@ Next: a fused sanitize+SGD kernel (and a single multi-tensor launch), keep BN ro
 
 Opt-in: `DARKNET_OXIDE_AMP=1` (implies the f16 tensor-core GEMM; default stays f32), `OxideBackend::with_amp(true)`. f32 master weights and f32 optimizer state, f16 working copies
 of the conv weights (refreshed per update), f16 activations / gradients, f32 accumulation, BN statistics and reductions in f32, f32 weight / bias / BN-scale gradients; conv fwd /
-dgrad / wgrad on the f16 `mma.sync` GEMM; `[net] loss_scale` as before. Ops without an f16 implementation widen to f32 at the boundary (see `bridges/darknet-cuda-oxide/src/mixed.rs`).
+dgrad / wgrad on the f16 `mma.sync` GEMM; `[net] loss_scale` as before. Ops without an f16 implementation widen to f32 at the boundary (see `src/darknet-cuda-oxide/src/mixed.rs`).
 Same driver and conditions as section 7 (`bench-train`, LegoGears_v2, 20 steps after 3 warm-up, 3 rounds interleaved f32 / AMP, run back to back, medians of the per-round medians):
 
 | variant | b1 step ms (rounds) | b1 fwd / bwd / update | b16 step ms (rounds) | b16 fwd / bwd / update | peak device MB b1 / b16 |
@@ -249,7 +249,7 @@ Accuracy of the mode (no training run, same init / input / seeds, `DARKNET_BENCH
 `LegoGears_augmatch_best.weights` the head conv delta differs from f32 by 8.8e-4 (max-normalised) and the first conv by 3.9e-2, exactly the profile of the TF32 f32-API mode
 (5.8e-4 / 3.0e-2), i.e. the AMP error is operand rounding that already exists in the compute-only modes, not an AMP-specific loss; with random He init + random
 output deltas (the default synthetic bench, BN gradient explosion) all reduced-precision modes (tf32, fp16 compute, AMP) differ from f32 by 10-30% in the early layers and
-AMP == tf32 there too. Tests: `bridges/darknet-cuda-oxide/tests/oxide_amp.rs` (per-op vs f64, tiny net gradients and SGD tracking).
+AMP == tf32 there too. Tests: `src/darknet-cuda-oxide/tests/oxide_amp.rs` (per-op vs f64, tiny net gradients and SGD tracking).
 
 ### 7.3 Training-step host/launch overhead (2026-10-01)
 
@@ -346,7 +346,7 @@ Correctness: `oxide_conv_parity` (13, incl. `conv_parity_implicit`), `oxide_cfg_
 
 ## Gradient-method shootout (2026-10-01)
 
-Harness: `bridges/darknet-cuda-oxide/tests/oxide_grad_methods.rs` (`grad_method_shootout`, ignored; a tiny-shape version of the same
+Harness: `src/darknet-cuda-oxide/tests/oxide_grad_methods.rs` (`grad_method_shootout`, ignored; a tiny-shape version of the same
 cases runs in the normal suite). RTX 4060 Laptop, debug-profile test binary (kernels are the same), no training runs.
 Per cell: median over 5 interleaved rounds of the mean device time (CUDA events, `time_gpu_ms`, launch gaps included) of one
 full gradient `dL/dx` for `L = sum(dy * f(x))`; error = max abs difference to an independent f64 host reference.
@@ -447,7 +447,7 @@ Per-step loss trajectory: with fixed deltas the loss is not defined; the first-o
 ### 8.3 BN rolling statistics: do they follow? Partly, with a real mismatch (diagnosed statically, not fixed)
 The oxide batch-statistics BN training forward matches C++ (same step-1 forward, same deltas). The rolling mean / variance DO follow the batch statistics, but the update is 10x too fast:
 the delta of the rolling mean / variance after step 1 is exactly 10.00x the C++ one in every layer (norm ratio 9.996-10.007 / 9.999-10.002), and oxide/10 matches C++ to 2.0e-3 (mean) / 4.0e-4 (var) relL2.
-Cause: `BATCH_NORM_ROLLING_KEEP = 0.9` in `crates/darknet-core/src/runtime.rs` (EMA keep factor, comment says it mirrors the host updates), whereas C++ conv+BN uses 0.99 / 0.01
+Cause: `BATCH_NORM_ROLLING_KEEP = 0.9` in `src/darknet-core/src/runtime.rs` (EMA keep factor, comment says it mirrors the host updates), whereas C++ conv+BN uses 0.99 / 0.01
 (`scal_ongpu(.99)` in `batchnorm_layer.cpp`, cuDNN factor `.01` in `convolutional_kernels.cu`). The Rust CPU path uses the same 0.9 (CPU/oxide rolling-delta ratio 1.0 in the first layers). Consequence: weights files saved after Rust
 training carry rolling stats that track the last ~10 batches instead of ~100, which changes inference of a short-trained net (noisier) but not training. Fixed afterwards (2026-10-01): GPU path keep factor 0.99 (host/CPU path keeps 0.9, which is what C++ `forward_batchnorm_layer` on the CPU does), pin test `batch_norm_rolling_keep_matches_cpp`; see `tasks/rust/todo.md` P8 follow-up.
 (The "bn_bias" dump column is irrelevant: Rust keeps the BN beta in the conv bias, the BN-struct beta is unused.)
@@ -513,7 +513,7 @@ DARKNET_BACKEND=oxide DARKNET_BENCH_BATCH=16 target/release/darknet-rs bench-tra
 DARKNET_OXIDE_AMP=1 DARKNET_BACKEND=oxide DARKNET_BENCH_BATCH=16 target/release/darknet-rs bench-train ../datasets/LegoGears_v2/LegoGears_v2.cfg 20 3   # AMP (7.2); DARKNET_BENCH_DUMP=<file> / _WEIGHTS / _LR for A/B of weight deltas
 target/oxide_bench/oxide_bench_cpp_train ../datasets/LegoGears_v2/LegoGears_v2.cfg - 16 20 3 0 train   # g++ command as in tools/oxide_bench.py ensure_cpp_probe, source tools/oxide_bench_cpp.cpp
 # gradient-method shootout
-RUSTUP_TOOLCHAIN=nightly-2026-08-28 target/debug/cargo-oxide oxide test -- --manifest-path bridges/darknet-cuda-oxide/Cargo.toml -j 2 --test oxide_grad_methods -- --ignored --nocapture --test-threads=1
+RUSTUP_TOOLCHAIN=nightly-2026-08-28 target/debug/cargo-oxide oxide test -- --manifest-path src/darknet-cuda-oxide/Cargo.toml -j 2 --test oxide_grad_methods -- --ignored --nocapture --test-threads=1
 # profiles
 DARKNET_BACKEND=oxide DARKNET_BENCH_ITERS=30 nsys profile --stats=false -o nsys target/release/darknet-rs detect-image <cfg> <weights> <names> <png> 0.25 0.45 resize-exact
 nsys stats -r cuda_gpu_kern_sum nsys.nsys-rep

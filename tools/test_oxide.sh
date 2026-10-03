@@ -30,5 +30,5 @@ done
 
 exec systemd-run --user --scope -p MemoryHigh="$MEM" \
     target/debug/cargo-oxide oxide test -- \
-    --manifest-path bridges/darknet-cuda-oxide/Cargo.toml -j 2 "${CARGO_ARGS[@]}" \
+    --manifest-path src/darknet-cuda-oxide/Cargo.toml -j 2 "${CARGO_ARGS[@]}" \
     -- --test-threads=1 --nocapture "${TEST_ARGS[@]}"

@@ -27,7 +27,7 @@ for left, top, cw, ch, flip, nw, nh in [(0,0,7,5,0,7,5), (1,1,5,3,1,9,4), (-2,-1
             hsv[:,:,0] = np.clip(np.rint(hsv[:,:,0].astype(np.float32)+179*hue),0,255).astype(np.uint8)
             out = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
         rows.append(','.join(map(str,[left,top,cw,ch,flip,nw,nh,hue,sat,exp]))+','+out.tobytes().hex())
-path = Path(__file__).resolve().parents[1] / 'crates/darknet-core/tests/data/augmentation_opencv.csv'
+path = Path(__file__).resolve().parents[1] / 'src/darknet-core/tests/data/augmentation_opencv.csv'
 path.parent.mkdir(parents=True, exist_ok=True)
 path.write_text('\n'.join(rows)+'\n')
 print(path)

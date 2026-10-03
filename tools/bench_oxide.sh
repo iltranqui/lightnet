@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Kernel benchmarks (ignored tests in bridges/darknet-cuda-oxide/tests/oxide_*bench.rs).
+# Kernel benchmarks (ignored tests in src/darknet-cuda-oxide/tests/oxide_*bench.rs).
 # Usage: ./tools/bench_oxide.sh <micro|conv|gemm-square|gemm-lego|all>
 # Env passed through: DARKNET_BENCH_MODES, DARKNET_BENCH_FILTER, DARKNET_BENCH_ROUNDS,
 #   DARKNET_BENCH_CONV_BATCH, DARKNET_BENCH_TARGET_MS (see tests/oxide_bench.rs header).
@@ -35,7 +35,7 @@ for run in "${RUNS[@]}"; do
     read -r file name <<<"$run"
     systemd-run --user --scope -p MemoryHigh="$MEM" \
         target/debug/cargo-oxide oxide test -- \
-        --manifest-path bridges/darknet-cuda-oxide/Cargo.toml -j 2 --release --test "$file" \
+        --manifest-path src/darknet-cuda-oxide/Cargo.toml -j 2 --release --test "$file" \
         -- --ignored --nocapture --test-threads=1 "$name" 2>&1 | tee -a "$LOG"
 done
 printf 'Saved %s\n' "$LOG" >&2

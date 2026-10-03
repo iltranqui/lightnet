@@ -41,13 +41,13 @@ ciou_surface.gnuplot
 ciou_surface.html
 ciou_surface.svg
 /target/
+/src/*/target/
 /bridges/*/target/
-/crates/*/target/
-/crates/rustc-codegen-cuda/examples/*/target/
+/bridges/rustc-codegen-cuda/examples/*/target/
 # cuda-oxide build outputs
-/bridges/darknet-cuda-oxide/*.ll
-/bridges/darknet-cuda-oxide/*.ptx
-/crates/rustc-codegen-cuda/examples/*/*.ll
-/crates/rustc-codegen-cuda/examples/*/*.ptx
+/src/darknet-cuda-oxide/*.ll
+/src/darknet-cuda-oxide/*.ptx
+/bridges/rustc-codegen-cuda/examples/*/*.ll
+/bridges/rustc-codegen-cuda/examples/*/*.ptx
 /darknet_cuda_oxide*.ll
 /darknet_cuda_oxide*.ptx

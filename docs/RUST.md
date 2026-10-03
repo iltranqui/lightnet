@@ -48,14 +48,14 @@ lowers the loss. The parity test compiles the repository's actual
 
 ## Workspace Layout
 
-- `crates/darknet-core`: model parsing, tensors, weights, inference, training,
+- `src/darknet-core`: model parsing, tensors, weights, inference, training,
   and CPU/GPU runtime orchestration.
-- `crates/darknet-cuda`: backend traits and CUDA-facing tensor abstractions.
-- `crates/darknet-cli`: the `darknet-rs` command-line application.
-- `crates/darknet-examples`: Rust equivalents of all 11 programs in
+- `src/darknet-cuda`: backend traits and CUDA-facing tensor abstractions.
+- `src/darknet-cli`: the `darknet-rs` command-line application.
+- `src/darknet-examples`: Rust equivalents of all 11 programs in
   ../src-examples, including image, video, JSON, YOLO-label, keypoint,
   RTSP, and webcam workflows.
-- `bridges/darknet-cuda-cutile`: optional `cutile-rs` backend.
+- `src/darknet-cuda-cutile`: optional `cutile-rs` backend.
 
 ## Build and Verify
 
@@ -70,9 +70,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
 
 # The optional cuTile bridge is checked separately from the main workspace.
-./bridges/darknet-cuda-cutile/scripts/check-env.sh
+./src/darknet-cuda-cutile/scripts/check-env.sh
 RUSTFLAGS=-Dwarnings cargo test \
-  --manifest-path bridges/darknet-cuda-cutile/Cargo.toml --locked --lib
+  --manifest-path src/darknet-cuda-cutile/Cargo.toml --locked --lib
 
 # Require the direct C++/Rust fixture instead of allowing a missing compiler
 # to be reported as a portable-development skip.
@@ -136,8 +136,8 @@ ordering remain in Rust. Common options are --threshold, --nms, --resize,
 The optional bridge is built separately:
 
 ```bash
-./bridges/darknet-cuda-cutile/scripts/check-env.sh
-cargo check --manifest-path bridges/darknet-cuda-cutile/Cargo.toml --locked
+./src/darknet-cuda-cutile/scripts/check-env.sh
+cargo check --manifest-path src/darknet-cuda-cutile/Cargo.toml --locked
 ```
 
 The bridge is pinned to cutile-rs v0.2.0. Its default JIT path uses the
@@ -166,7 +166,7 @@ reference. Run it only on a CUDA host with the driver visible:
 ```bash
 export DARKNET_CUTILE_GPU_TEST=1
 RUSTFLAGS=-Dwarnings cargo test \
-  --manifest-path bridges/darknet-cuda-cutile/Cargo.toml --locked --lib \
+  --manifest-path src/darknet-cuda-cutile/Cargo.toml --locked --lib \
   -- --ignored --nocapture
 ```
 

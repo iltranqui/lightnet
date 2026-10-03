@@ -13,21 +13,21 @@ here and are therefore not listed below; their licenses are recorded in
 1. Rustlantis
 --------------------------------------------------------------------------------
 
-Location in this repository: crates/fuzzer/rustlantis/
+Location in this repository: bridges/fuzzer/rustlantis/
 Upstream project:            https://github.com/cbeuw/rustlantis
 Copyright:                   (c) ETH Zurich and contributors
 License:                     Apache-2.0 OR MIT (dual-licensed, at your option)
 
 Rustlantis is a fuzzer for the Rust compiler, authored by Qian (Andy) Wang and
 Ralf Jung (ETH Zurich). Its source is embedded in this repository under
-`crates/fuzzer/rustlantis/` and is used to generate randomized MIR programs for
+`bridges/fuzzer/rustlantis/` and is used to generate randomized MIR programs for
 differential testing of the cuda-oxide codegen backend.
 
 The upstream license texts are retained in place at
-`crates/fuzzer/rustlantis/LICENSE-APACHE` and
-`crates/fuzzer/rustlantis/LICENSE-MIT`; the `rangemap` sub-crate carries its
-own identical copies at `crates/fuzzer/rustlantis/rangemap/LICENSE-APACHE` and
-`crates/fuzzer/rustlantis/rangemap/LICENSE-MIT`. The Apache-2.0 text is
+`bridges/fuzzer/rustlantis/LICENSE-APACHE` and
+`bridges/fuzzer/rustlantis/LICENSE-MIT`; the `rangemap` sub-crate carries its
+own identical copies at `bridges/fuzzer/rustlantis/rangemap/LICENSE-APACHE` and
+`bridges/fuzzer/rustlantis/rangemap/LICENSE-MIT`. The Apache-2.0 text is
 identical to the one at the root of this repository (LICENSE). The MIT text is
 reproduced here:
 

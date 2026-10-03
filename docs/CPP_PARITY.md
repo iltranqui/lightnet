@@ -7,7 +7,7 @@ implementation itself.
 
 ## What is compiled
 
-`crates/darknet-core/tests/cpp_parity.rs` copies the repository's real
+`src/darknet-core/tests/cpp_parity.rs` copies the repository's real
 `src-lib/connected_layer.cpp` into a temporary build directory and compiles it
 with:
 
