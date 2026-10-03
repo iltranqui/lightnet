@@ -25,6 +25,7 @@ pub mod initialize;
 pub mod loader_profile;
 pub use initialize::initialize_training_params;
 pub mod model;
+pub(crate) mod maxpool_depth;
 pub mod names;
 pub mod runtime;
 pub mod train;

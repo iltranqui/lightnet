@@ -24,6 +24,7 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 use crate::image::PlanarRgbImage;
+use crate::maxpool_depth::{backward_maxpool_depth, forward_maxpool_depth};
 use crate::model::{
     Activation, ConnectedSpec, ConvolutionalSpec, CrnnSpec, CropSpec, DropblockSpec, GruSpec,
     LayerKind, LocalSpec, LrPolicy, LstmSpec, NetConfig, Network, RnnSpec, RouteSpec, TensorShape,
@@ -826,7 +827,7 @@ impl ExecutableNetwork {
             !matches!(
                 layer.kind,
                 LayerKind::Convolutional(_)
-                    | LayerKind::MaxPool(_)
+                    | LayerKind::MaxPool(crate::model::MaxPoolSpec { depth: false, .. })
                     | LayerKind::AvgPool
                     | LayerKind::Route(_)
                     | LayerKind::Shortcut(_)
@@ -1013,6 +1014,9 @@ impl ExecutableNetwork {
                     )?;
                     crop_cache = Some(cache);
                     (output, None)
+                }
+                (LayerKind::MaxPool(spec), LayerParams::None) if spec.depth => {
+                    forward_maxpool_depth(current_input, layer.output_shape).map(|output| (output, None))?
                 }
                 (LayerKind::MaxPool(spec), LayerParams::None) => forward_maxpool(
                     spec.size,
@@ -1334,6 +1338,15 @@ impl ExecutableNetwork {
                         })?,
                         &layer_param_gradients,
                     )?;
+                    accumulate_previous_gradient(
+                        layer.index,
+                        &input_grad,
+                        &mut input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::MaxPool(spec), LayerParams::None) if spec.depth => {
+                    let input_grad = backward_maxpool_depth(current_input, &grad)?;
                     accumulate_previous_gradient(
                         layer.index,
                         &input_grad,
@@ -2499,7 +2512,7 @@ where
                         .map_err(|err| backend_error("f16 convolution", err))?
                 }
                 (LayerKind::MaxPool(spec), LayerParams::None) => {
-                    if layer.output_shape.channels != layer.input_shape.channels {
+                    if spec.depth {
                         return Err(Error::UnsupportedLayer {
                             layer_index: layer.index,
                             name: "maxpool_depth".to_owned(),
@@ -3786,7 +3799,7 @@ where
                         .map_err(|err| backend_error("convolution activation", err))?
                 }
                 (LayerKind::MaxPool(spec), LayerParams::None) => {
-                    if layer.output_shape.channels != layer.input_shape.channels {
+                    if spec.depth {
                         return Err(Error::UnsupportedLayer {
                             layer_index: layer.index,
                             name: "maxpool_depth".to_owned(),
@@ -4508,7 +4521,7 @@ where
                         .map_err(|err| backend_error("convolution bias + activation", err))?
                 }
                 (LayerKind::MaxPool(spec), LayerParams::None) => {
-                    if layer.output_shape.channels != layer.input_shape.channels {
+                    if spec.depth {
                         return Err(Error::UnsupportedLayer {
                             layer_index: layer.index,
                             name: "maxpool_depth".to_owned(),

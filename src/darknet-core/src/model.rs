@@ -310,6 +310,9 @@ pub struct MaxPoolSpec {
     /// C++ `zero_nonmax`: during backward, zero the input delta at every
     /// position that was not an argmax of the pooling window.
     pub zero_nonmax: bool,
+    /// C++ `maxpool_depth=1`: pool over strided channel groups; w x h unchanged,
+    /// channels = `out_channels`.
+    pub depth: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1198,8 +1201,14 @@ fn parse_layer_kind(
                 stride_x: section.get_usize("stride_x", stride)?,
                 stride_y: section.get_usize("stride_y", stride)?,
                 padding: section.get_usize("padding", size.saturating_sub(1))?,
-                out_channels: section.get_usize("out_channels", current.channels)?,
-                zero_nonmax: section.get_bool_int("zero_nonmax", false)?,
+                // C++ default is 1 and the value only matters with maxpool_depth=1.
+                out_channels: section.get_usize("out_channels", 1)?,
+                // C++ key; the pre-port Rust key `zero_nonmax` is still accepted.
+                zero_nonmax: section.get_bool_int(
+                    "maxpool_zero_nonmax",
+                    section.get_bool_int("zero_nonmax", false)?,
+                )?,
+                depth: section.get_bool_int("maxpool_depth", false)?,
             })
         }
         "local_avg" | "local_avgpool" => {
@@ -1212,6 +1221,7 @@ fn parse_layer_kind(
                 padding: section.get_usize("padding", size.saturating_sub(1))?,
                 out_channels: current.channels,
                 zero_nonmax: false,
+                depth: false,
             })
         }
         "avg" | "avgpool" => LayerKind::AvgPool,
@@ -1459,15 +1469,24 @@ fn infer_output_shape(
             current.batch,
         )),
         LayerKind::MaxPool(spec) | LayerKind::LocalAvgPool(spec) => {
-            let channels = if spec.out_channels == 1 {
-                current.channels
-            } else {
-                spec.out_channels
-            };
+            if spec.depth {
+                if spec.out_channels == 0 || spec.out_channels > current.channels {
+                    return Err(Error::InvalidConfig(format!(
+                        "maxpool_depth layer #{layer_index}: out_channels={} must be in 1..={}",
+                        spec.out_channels, current.channels
+                    )));
+                }
+                return Ok(TensorShape::new(
+                    current.width,
+                    current.height,
+                    spec.out_channels,
+                    current.batch,
+                ));
+            }
             Ok(TensorShape::new(
                 pool_dim(current.width, spec.padding, spec.size, spec.stride_x),
                 pool_dim(current.height, spec.padding, spec.size, spec.stride_y),
-                channels,
+                current.channels,
                 current.batch,
             ))
         }
@@ -1768,7 +1787,7 @@ mod tests {
 
     use crate::cfg::ConfigFile;
 
-    use super::{Activation, LayerKind, LrPolicy, Network};
+    use super::{LayerKind, LrPolicy, Network};
 
     fn build(text: &str) -> crate::error::Result<Network> {
         Network::from_config(ConfigFile::parse_str("t.cfg", text)?)
@@ -1792,6 +1811,27 @@ mod tests {
         // the same check covers shortcut / connected / scale_channels / sam / rnn / crnn / local
         let shortcut = "[net]\nwidth=2\nheight=2\nchannels=1\n[convolutional]\nfilters=1\nsize=1\n[shortcut]\nfrom=-1\nactivation=banana\n";
         assert!(build(shortcut).is_err());
+    }
+
+    #[test]
+    fn maxpool_depth_and_zero_nonmax_keys_follow_cpp() {
+        let net = build(
+            "[net]\nwidth=4\nheight=6\nchannels=4\n\
+             [maxpool]\nsize=2\nstride=2\nmaxpool_depth=1\nout_channels=2\n\
+             [maxpool]\nsize=2\nstride=2\nmaxpool_zero_nonmax=1\n",
+        )
+        .expect("builds");
+        let LayerKind::MaxPool(depth) = &net.layers[0].kind else { panic!() };
+        assert!(depth.depth);
+        // depth pooling keeps w x h and sets the channels to out_channels
+        let s = net.layers[0].output_shape;
+        assert_eq!((s.width, s.height, s.channels), (4, 6, 2));
+        let LayerKind::MaxPool(plain) = &net.layers[1].kind else { panic!() };
+        assert!(plain.zero_nonmax && !plain.depth);
+        let s = net.layers[1].output_shape;
+        assert_eq!((s.width, s.height, s.channels), (2, 3, 2)); // out_channels ignored without depth
+        // out_channels larger than the input channels is rejected
+        assert!(build("[net]\nwidth=4\nheight=4\nchannels=2\n[maxpool]\nmaxpool_depth=1\nout_channels=3\n").is_err());
     }
 
     fn repo_cfg(name: &str) -> PathBuf {
