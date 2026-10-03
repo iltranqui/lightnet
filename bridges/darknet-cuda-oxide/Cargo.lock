@@ -420,6 +420,7 @@ dependencies = [
  "image",
  "imageproc",
  "mozjpeg",
+ "rayon",
 ]
 
 [[package]]

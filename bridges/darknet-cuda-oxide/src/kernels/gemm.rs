@@ -177,23 +177,34 @@ pub mod kernels {
 
             if it > 0 {
                 let ao = ((it - 1) & 1) * 1024;
-                let mut kk = 0usize;
-                while kk < 16 {
-                    let mut ar = [0.0f32; 4];
-                    let mut br = [0.0f32; 4];
+                // 4 k per outer step.  `a[i][r]` is 4 contiguous k of row `i` and
+                // `b[r][j]` is 4 contiguous n of row `g*4+r`, so both become
+                // 128-bit shared loads (the per-thread column tile is `tx*4..+3`).
+                unroll!(4, g, {
+                    let mut a = [[0.0f32; 4]; 4];
+                    let mut b = [[0.0f32; 4]; 4];
                     unroll!(4, i, {
-                        unsafe {
-                            ar[i] = AS[ao + (ty + 16 * i) * 16 + kk];
-                            br[i] = BS[ao + kk * 64 + tx + 16 * i];
-                        }
+                        unroll!(4, r, {
+                            unsafe {
+                                a[i][r] = AS[ao + (ty + 16 * i) * 16 + g * 4 + r];
+                            }
+                        });
+                    });
+                    unroll!(4, r, {
+                        unroll!(4, j, {
+                            unsafe {
+                                b[r][j] = BS[ao + (g * 4 + r) * 64 + tx * 4 + j];
+                            }
+                        });
                     });
                     unroll!(4, i, {
                         unroll!(4, j, {
-                            acc[i * 4 + j] += ar[i] * br[j];
+                            unroll!(4, r, {
+                                acc[i * 4 + j] += a[i][r] * b[r][j];
+                            });
                         });
                     });
-                    kk += 1;
-                }
+                });
             }
             // Stage `(it - 1) & 1` is refilled by the next iteration's issue.
             thread::sync_threads();
@@ -203,7 +214,7 @@ pub mod kernels {
         unroll!(4, i, {
             let gm = row0 + ty + 16 * i;
             unroll!(4, j, {
-                let gn = col0 + tx + 16 * j;
+                let gn = col0 + tx * 4 + j;
                 if gm < m && gn < n {
                     let idx = c_off + gm * ldc + gn;
                     // SAFETY: each (instance, row, col) is owned by exactly

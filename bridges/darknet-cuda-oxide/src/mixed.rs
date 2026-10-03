@@ -34,7 +34,7 @@ use std::sync::{Arc, Weak};
 use cuda_core::DeviceBuffer;
 use darknet_cuda::{BatchNormTrainForward, ElementwiseLaunchConfig, F32ActivationKind};
 
-use crate::conv::{COL_CAP_BYTES, Geom, chunk_limit, expect_len, expect_shape};
+use crate::conv::{Geom, chunk_limit, col_cap_bytes, expect_len, expect_shape};
 use crate::half::HOut;
 use crate::tensor::{PooledBuf, PooledBuf16};
 use crate::{
@@ -223,7 +223,7 @@ impl OxideBackend {
         let wh = self.weights_half(weights, g.f, kg)?;
         let mut dx = self.alloc16_uninit(g.x_len())?;
         let plane = g.c * g.h * g.w;
-        let chunk = (COL_CAP_BYTES / 4 / g.col_len()).clamp(1, g.batch).min(chunk_limit());
+        let chunk = (col_cap_bytes() / 4 / g.col_len()).clamp(1, g.batch).min(chunk_limit());
         self.with_workspace(chunk * g.col_len(), |ws| {
             let mut b0 = 0;
             while b0 < g.batch {
@@ -314,7 +314,7 @@ impl OxideBackend {
         let xh = self.as_half(x)?;
         let dyh = self.as_half(dy)?;
         let mut dw = self.alloc_uninit(g.w_len())?;
-        let chunk = (COL_CAP_BYTES / 2 / img_col).clamp(1, g.batch).min(chunk_limit());
+        let chunk = (col_cap_bytes() / 2 / img_col).clamp(1, g.batch).min(chunk_limit());
         let mut col_guard =
             self.half_col.lock().map_err(|_| shape_err(OP, "f16 workspace lock poisoned".into()))?;
         if col_guard.as_ref().is_none_or(|b| b.len() < chunk * img_col) {

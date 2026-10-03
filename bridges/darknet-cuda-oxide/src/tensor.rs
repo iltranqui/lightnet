@@ -19,21 +19,36 @@ pub(crate) struct BufPool {
 }
 
 impl BufPool {
-    /// `DARKNET_OXIDE_POOL_MB` caps the cached bytes (default 1024, 0 disables).
+    /// `DARKNET_OXIDE_POOL_MB` caps the cached bytes.  Unset means "auto": half
+    /// the free device memory (capped at 4 GiB), which is what batch training
+    /// needs to avoid freeing and re-allocating the whole working set every
+    /// step.  `0` disables caching.
     pub(crate) fn new() -> Arc<Self> {
-        let mb = std::env::var("DARKNET_OXIDE_POOL_MB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(1024);
+        let cap_bytes = match std::env::var("DARKNET_OXIDE_POOL_MB") {
+            Ok(v) => v.parse::<usize>().unwrap_or(1024) << 20,
+            Err(_) => auto_cap_bytes(),
+        };
         Arc::new(Self {
             free: Mutex::new((HashMap::new(), 0)),
             free16: Mutex::new(HashMap::new()),
-            cap_bytes: mb << 20,
+            cap_bytes,
         })
     }
 
     pub(crate) fn cached_bytes(&self) -> usize {
         self.free.lock().map(|g| g.1).unwrap_or(0)
+    }
+
+    /// Drops every cached buffer.  Called before retrying an allocation that
+    /// failed with OOM, since the cache is not in use by any tensor.
+    pub(crate) fn flush(&self) {
+        if let Ok(mut g) = self.free.lock() {
+            g.0.clear();
+            g.1 = 0;
+        }
+        if let Ok(mut g) = self.free16.lock() {
+            g.clear();
+        }
     }
 
     pub(crate) fn take(&self, len: usize) -> Option<DeviceBuffer<f32>> {
@@ -80,6 +95,20 @@ impl BufPool {
             g.0.entry(buf.len()).or_default().push(buf);
         }
         // otherwise `buf` drops here and is freed
+    }
+}
+
+/// Half of the free device memory, capped at 4 GiB; 1 GiB when the query fails
+/// (e.g. no current context on this thread).
+fn auto_cap_bytes() -> usize {
+    let (mut free, mut total) = (0usize, 0usize);
+    // SAFETY: valid out-pointers; a context is current when the backend is
+    // constructed on this thread.
+    let r = unsafe { cuda_core::sys::cuMemGetInfo_v2(&mut free, &mut total) };
+    if r == cuda_core::sys::cudaError_enum_CUDA_SUCCESS && total > 0 {
+        (free / 2).min(4usize << 30)
+    } else {
+        1024 << 20
     }
 }
 

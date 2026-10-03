@@ -14,18 +14,22 @@ use cuda_core::DeviceBuffer;
 use darknet_cuda::ElementwiseLaunchConfig;
 
 use crate::kernels::conv_direct::WGRAD_THREADS;
-use crate::{GemmArgs, OxideBackend, OxideError, OxideTensorF32, launch, launch_err};
+use crate::{
+    GemmArgs, ImplicitConv, OxideBackend, OxideError, OxideTensorF32, launch, launch_err,
+};
 
 /// Which convolution implementation to use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConvMode {
     Direct,
     Gemm,
+    Implicit,
     Auto,
 }
 
 impl ConvMode {
-    /// `DARKNET_OXIDE_CONV={direct,gemm,auto}`; unset or unknown means `Auto`.
+    /// `DARKNET_OXIDE_CONV={direct,gemm,implicit,auto}`; unset or unknown means
+    /// `Auto`.
     pub fn from_env() -> Self {
         match std::env::var("DARKNET_OXIDE_CONV")
             .unwrap_or_default()
@@ -34,14 +38,33 @@ impl ConvMode {
         {
             "direct" => Self::Direct,
             "gemm" => Self::Gemm,
+            "implicit" => Self::Implicit,
             _ => Self::Auto,
         }
     }
 }
 
-/// Upper bound on the im2col column buffer used by the batched forward path
-/// (bytes); larger batches run in chunks of images.
+/// Default cap on the im2col column buffer used by the batched paths (bytes);
+/// larger batches run in chunks of images.  Overridable with
+/// `DARKNET_OXIDE_COL_CAP_MB` (A/B the forward/backward chunk size).
 pub(crate) const COL_CAP_BYTES: usize = 32 << 20;
+
+/// Cap actually used, see [`COL_CAP_BYTES`].
+pub(crate) fn col_cap_bytes() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("DARKNET_OXIDE_COL_CAP_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .map(|v| v << 20)
+            .unwrap_or(COL_CAP_BYTES)
+    })
+}
+
+/// Upper bound on the per-(image, group) weight-gradient partial buffer used by
+/// the batched wgrad path (bytes); larger batches run in chunks of images.
+pub(crate) const PARTIAL_CAP_BYTES: usize = 64 << 20;
 
 /// Images per batched im2col + GEMM round, at most (`DARKNET_OXIDE_CONV_CHUNK`,
 /// default unlimited; `1` restores the old one-launch-per-image loop for A/B).
@@ -169,9 +192,19 @@ impl OxideBackend {
     fn use_direct(&self, g: &Geom) -> bool {
         match self.conv_mode {
             ConvMode::Direct => true,
-            ConvMode::Gemm => false,
+            ConvMode::Gemm | ConvMode::Implicit => false,
             ConvMode::Auto => (g.groups == g.c && g.c == g.f) || g.macs() < TINY_MACS,
         }
+    }
+
+    /// Whether the forward should use the implicit-GEMM kernel.  Measured on
+    /// sm_89 (LegoGears_v2, batch 16): the materialised im2col + GEMM is ~5%
+    /// faster, because the materialised `B` tile is read with 16-byte
+    /// `cp.async` while the implicit tile can only issue 4-byte scalar copies
+    /// (arbitrary input-column alignment).  So it is opt-in via
+    /// `DARKNET_OXIDE_CONV=implicit` and never picked by `Auto`.
+    fn use_implicit(&self, _g: &Geom) -> bool {
+        matches!(self.conv_mode, ConvMode::Implicit)
     }
 
     /// Makes sure the cached workspace holds `len` floats and runs `body` on it.
@@ -223,13 +256,14 @@ impl OxideBackend {
         images: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<(), OxideError> {
-        // SAFETY: one thread per column element; `col` holds `images * col_len`
-        // floats and `x` covers images `batch_index..batch_index + images`
+        // SAFETY: one block per column row (`images * C * k * k` rows), each
+        // sweeping `images * col_len` positions; `col` holds `images *
+        // col_len` floats and `x` covers images `batch_index..+images`
         // (validated by the callers).
         unsafe {
             self.im2col.im2col(
                 &self.stream,
-                launch::elementwise(images * g.col_len(), config),
+                launch::blocks_of(images * g.c * g.k * g.k, launch::block_size(config)),
                 x,
                 col,
                 batch_index * g.c * g.h * g.w,
@@ -305,11 +339,47 @@ impl OxideBackend {
                 )
             }
             .map_err(launch_err)?;
+        } else if self.use_implicit(&g) {
+            // One implicit-GEMM launch for the whole batch (no column buffer to
+            // bound): instances are `(image, group)`, image-major.
+            let (kg, ohw, fpg) = (g.kg(), g.ohw(), g.fpg());
+            let inst = g.batch * groups;
+            self.gemm_conv_implicit(
+                &weights.buf,
+                &x.buf,
+                &mut out,
+                &GemmArgs {
+                    m: fpg,
+                    n: ohw,
+                    k: kg,
+                    lda: kg,
+                    ldc: ohw,
+                    a: (0, fpg * kg, groups),
+                    c: (0, fpg * ohw, inst),
+                    count: inst,
+                    ..GemmArgs::default()
+                },
+                &ImplicitConv {
+                    x_base: 0,
+                    channels: g.c,
+                    in_h: g.h,
+                    in_w: g.w,
+                    cpg: g.cpg(),
+                    groups,
+                    ksize: g.k,
+                    stride_x: g.sx,
+                    stride_y: g.sy,
+                    dilation: g.dil,
+                    padding: g.pad,
+                    out_h: g.oh,
+                    out_w: g.ow,
+                },
+            )?;
         } else {
             let (kg, ohw, fpg) = (g.kg(), g.ohw(), g.fpg());
             // One im2col + one GEMM launch per chunk of images (instances =
-            // image x group); the column buffer is bounded by `COL_CAP_BYTES`.
-            let chunk = (COL_CAP_BYTES / 4 / g.col_len()).clamp(1, g.batch).min(chunk_limit());
+            // image x group); the column buffer is bounded by `col_cap_bytes()`.
+            let chunk = (col_cap_bytes() / 4 / g.col_len()).clamp(1, g.batch).min(chunk_limit());
             self.with_workspace(chunk * g.col_len(), |ws| {
                 let mut b0 = 0;
                 while b0 < g.batch {
@@ -400,9 +470,17 @@ impl OxideBackend {
             .map_err(launch_err)?;
         } else {
             let (kg, ohw, fpg) = (g.kg(), g.ohw(), g.fpg());
-            self.with_workspace(g.col_len(), |ws| {
-                for b in 0..g.batch {
-                    // dcol[g] (kg x ohw) = W[g]^T (kg x fpg) * dy[b, g] (fpg x ohw)
+            // One batched GEMM over a chunk of images (instances = image x
+            // group; the instance index is image-major, so `b` and `c` are
+            // simple strides), then one col2im per image reading its block of
+            // the shared column workspace.
+            let chunk = (col_cap_bytes() / 4 / g.col_len()).clamp(1, g.batch).min(chunk_limit());
+            self.with_workspace(chunk * g.col_len(), |ws| {
+                let mut b0 = 0;
+                while b0 < g.batch {
+                    let nb = chunk.min(g.batch - b0);
+                    let inst = nb * groups;
+                    // dcol[b, g] (kg x ohw) = W[g]^T (kg x fpg) * dy[b, g] (fpg x ohw)
                     self.gemm(
                         &weights.buf,
                         &dy.buf,
@@ -416,33 +494,39 @@ impl OxideBackend {
                             ldc: ohw,
                             trans_a: true,
                             a: (0, fpg * kg, groups),
-                            b: (b * g.f * ohw, fpg * ohw, groups),
-                            c: (0, kg * ohw, groups),
-                            count: groups,
+                            b: (b0 * g.f * ohw, fpg * ohw, inst),
+                            c: (0, kg * ohw, inst),
+                            count: inst,
                             ..GemmArgs::default()
                         },
                     )?;
-                    // SAFETY: one thread per input element of batch `b`.
-                    unsafe {
-                        self.im2col.col2im(
-                            &self.stream,
-                            launch::elementwise(g.c * g.h * g.w, config),
-                            &*ws,
-                            &mut dx,
-                            b * g.c * g.h * g.w,
-                            g.c,
-                            g.h,
-                            g.w,
-                            g.k,
-                            g.sx,
-                            g.sy,
-                            g.dil,
-                            g.pad,
-                            g.oh,
-                            g.ow,
-                        )
+                    for bi in 0..nb {
+                        let image = b0 + bi;
+                        // SAFETY: one thread per input element of batch `image`;
+                        // `bi * col_len` selects that image's column block.
+                        unsafe {
+                            self.im2col.col2im(
+                                &self.stream,
+                                launch::elementwise(g.c * g.h * g.w, config),
+                                &*ws,
+                                &mut dx,
+                                bi * g.col_len(),
+                                image * g.c * g.h * g.w,
+                                g.c,
+                                g.h,
+                                g.w,
+                                g.k,
+                                g.sx,
+                                g.sy,
+                                g.dil,
+                                g.pad,
+                                g.oh,
+                                g.ow,
+                            )
+                        }
+                        .map_err(launch_err)?;
                     }
-                    .map_err(launch_err)?;
+                    b0 += nb;
                 }
                 Ok(())
             })?;
@@ -511,38 +595,63 @@ impl OxideBackend {
         } else {
             let (kg, ohw, fpg) = (g.kg(), g.ohw(), g.fpg());
             // Batch im2col across the images of a chunk (same cap as the forward
-            // path): one im2col launch per chunk instead of one per image, then
-            // one GEMM per image accumulating into `dw` (`beta = 1`).
-            let chunk = (COL_CAP_BYTES / 4 / g.col_len()).clamp(1, g.batch).min(chunk_limit());
+            // path), then one batched GEMM writing per-(image, group) partial
+            // weight gradients into a workspace, reduced over the images in a
+            // fixed order (`gemm_splitk_reduce`, deterministic).  The image
+            // dimension is folded into `splits`, so `dw` accumulates across
+            // chunks with `beta = 1`.
+            let col_chunk = (col_cap_bytes() / 4 / g.col_len()).clamp(1, g.batch).min(chunk_limit());
+            let part_chunk = (PARTIAL_CAP_BYTES / 4 / (g.f * kg).max(1)).clamp(1, g.batch);
+            let chunk = col_chunk.min(part_chunk).min(g.batch);
             self.with_workspace(chunk * g.col_len(), |ws| {
                 let mut b0 = 0;
                 while b0 < g.batch {
                     let nb = chunk.min(g.batch - b0);
                     self.launch_im2col(&g, &x.buf, ws, b0, nb, config)?;
-                    for bi in 0..nb {
-                        let image = b0 + bi;
-                        // dW[g] (fpg x kg) += dy[b, g] (fpg x ohw) * col[g]^T (ohw x kg)
-                        self.gemm(
-                            &dy.buf,
-                            ws,
+                    let inst = nb * groups;
+                    let mut partial = self.alloc_uninit(inst * fpg * kg)?;
+                    // dW_partial[b, g] (fpg x kg) = dy[b, g] (fpg x ohw) * col[b, g]^T (ohw x kg)
+                    self.gemm(
+                        &dy.buf,
+                        ws,
+                        &mut partial,
+                        &GemmArgs {
+                            m: fpg,
+                            n: kg,
+                            k: ohw,
+                            lda: ohw,
+                            ldb: ohw,
+                            ldc: kg,
+                            trans_b: true,
+                            beta: 0.0,
+                            a: (b0 * g.f * ohw, fpg * ohw, inst),
+                            b: (0, kg * ohw, inst),
+                            c: (0, fpg * kg, inst),
+                            count: inst,
+                            ..GemmArgs::default()
+                        },
+                    )?;
+                    // SAFETY: one thread per (group, weight) element; the
+                    // partials hold `nb` image blocks for each of `groups`.
+                    unsafe {
+                        self.gemm.gemm_splitk_reduce(
+                            &self.stream,
+                            launch::elementwise(groups * fpg * kg, config),
+                            &partial,
                             &mut dw,
-                            &GemmArgs {
-                                m: fpg,
-                                n: kg,
-                                k: ohw,
-                                lda: ohw,
-                                ldb: ohw,
-                                ldc: kg,
-                                trans_b: true,
-                                beta: if image == 0 { 0.0 } else { 1.0 },
-                                a: (image * g.f * ohw, fpg * ohw, groups),
-                                b: (bi * g.col_len(), kg * ohw, groups),
-                                c: (0, fpg * kg, groups),
-                                count: groups,
-                                ..GemmArgs::default()
-                            },
-                        )?;
+                            fpg,
+                            kg,
+                            kg,
+                            groups,
+                            nb,
+                            1.0,
+                            if b0 == 0 { 0.0 } else { 1.0 },
+                            0,
+                            fpg * kg,
+                            groups,
+                        )
                     }
+                    .map_err(launch_err)?;
                     b0 += nb;
                 }
                 Ok(())

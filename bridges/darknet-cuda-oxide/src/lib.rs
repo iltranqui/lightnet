@@ -17,7 +17,7 @@ use darknet_cuda::{AdamParams, AdamUpdateItem, SgdUpdateItem, BatchNormTrainForw
 
 use kernels::bias_scale::BIAS_BACKWARD_THREADS;
 use kernels::{
-    activations, amp as amp_k, batchnorm, bias_scale, conv_direct, convert, elementwise, gemm, gemm_f16, gemm_mma, half_ops, im2col,
+    activations, amp as amp_k, batchnorm, bias_scale, conv_direct, conv_implicit, convert, elementwise, gemm, gemm_f16, gemm_mma, half_ops, im2col,
     layers_extra, optim, pool, resample, route,
 };
 pub use conv::ConvMode;
@@ -77,6 +77,7 @@ pub struct OxideBackend {
     gemm_mode: GemmMode,
     im2col: im2col::kernels::LoadedModule,
     conv_direct: conv_direct::kernels::LoadedModule,
+    conv_implicit: conv_implicit::kernels::LoadedModule,
     route: route::kernels::LoadedModule,
     pool: pool::kernels::LoadedModule,
     resample: resample::kernels::LoadedModule,
@@ -248,6 +249,24 @@ fn check_channel_layout(
 }
 
 
+/// Conv geometry for the implicit-GEMM forward ([`OxideBackend::gemm_conv_implicit`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ImplicitConv {
+    pub x_base: usize,
+    pub channels: usize,
+    pub in_h: usize,
+    pub in_w: usize,
+    pub cpg: usize,
+    pub groups: usize,
+    pub ksize: usize,
+    pub stride_x: usize,
+    pub stride_y: usize,
+    pub dilation: usize,
+    pub padding: usize,
+    pub out_h: usize,
+    pub out_w: usize,
+}
+
 fn shape_err(op: &str, msg: String) -> OxideError {
     OxideError::Shape(format!("{op}: {msg}"))
 }
@@ -375,6 +394,8 @@ impl OxideBackend {
             .map_err(|err| OxideError::Shape(format!("load im2col module: {err:?}")))?;
         let conv_direct = conv_direct::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load conv_direct module: {err:?}")))?;
+        let conv_implicit = conv_implicit::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load conv_implicit module: {err:?}")))?;
         let route = route::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load route module: {err:?}")))?;
         let pool = pool::kernels::load(&ctx)
@@ -409,6 +430,7 @@ impl OxideBackend {
             gemm_mode: if amp { GemmMode::Fp16 } else { GemmMode::from_env() },
             im2col,
             conv_direct,
+            conv_implicit,
             route,
             pool,
             resample,
@@ -521,6 +543,83 @@ impl OxideBackend {
         r.map_err(launch_err)?;
         if let Some(w) = ws {
             // SAFETY: one thread per output element; `c` extent validated above.
+            unsafe {
+                self.gemm.gemm_splitk_reduce(
+                    &self.stream,
+                    launch::elementwise(g.count * mn, ElementwiseLaunchConfig::default()),
+                    &w, c, g.m, g.n, g.ldc, g.count, splits, g.alpha, g.beta, g.c.0, g.c.1, g.c.2,
+                )
+            }
+            .map_err(launch_err)?;
+        }
+        Ok(())
+    }
+
+    /// Implicit-GEMM conv forward: same math and instance layout as [`Self::gemm`]
+    /// with `B = col` materialised, but the `B` tile is generated from `x` on
+    /// the fly (fp32 only; callers fall back to the materialised path for
+    /// tf32/fp16 modes).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gemm_conv_implicit(
+        &self,
+        a: &DeviceBuffer<f32>,
+        x: &DeviceBuffer<f32>,
+        c: &mut DeviceBuffer<f32>,
+        g: &GemmArgs,
+        conv: &ImplicitConv,
+    ) -> Result<(), OxideError> {
+        let bad = |msg: &str| OxideError::Shape(format!("gemm_conv_implicit: {msg}"));
+        if g.m == 0 || g.n == 0 || g.k == 0 || g.count == 0 {
+            return Err(bad("m, n, k and count must be > 0"));
+        }
+        if g.trans_a || g.trans_b {
+            return Err(bad("only the NN layout is supported"));
+        }
+        if g.a.2 == 0 || g.c.2 == 0 {
+            return Err(bad("instance modulus must be > 0"));
+        }
+        if g.lda < g.k || g.ldc < g.n {
+            return Err(bad("leading dimension smaller than row length"));
+        }
+        if extent(g.a.0, g.a.1, g.a.2, g.count, g.m, g.k, g.lda) > a.len()
+            || extent(g.c.0, g.c.1, g.c.2, g.count, g.m, g.n, g.ldc) > c.len()
+        {
+            return Err(bad("operand buffer too small for the requested view"));
+        }
+        let (bm, bn) = (conv_implicit::BM, conv_implicit::BN);
+        let tiles = g.m.div_ceil(bm) * g.n.div_ceil(bn) * g.count;
+        let splits = if tiles < SPLITK_TARGET_BLOCKS {
+            SPLITK_TARGET_BLOCKS.div_ceil(tiles).min(g.k / SPLITK_MIN_K).min(SPLITK_MAX).max(1)
+        } else {
+            1
+        };
+        let kchunk = if splits > 1 { g.k.div_ceil(splits).next_multiple_of(16) } else { g.k };
+        let splits = g.k.div_ceil(kchunk); // drop empty trailing splits
+        let mn = g.m * g.n;
+        let mut ws = if splits > 1 { Some(self.alloc_uninit(splits * g.count * mn)?) } else { None };
+        let (alpha, beta, ldc) = if splits > 1 { (1.0, 0.0, g.n) } else { (g.alpha, g.beta, g.ldc) };
+        let (cb, cs, cm) = if splits > 1 { (0, mn, splits * g.count) } else { g.c };
+        let target: &mut DeviceBuffer<f32> = match ws.as_mut() {
+            Some(w) => w,
+            None => c,
+        };
+        let blocks = tiles * splits;
+        // SAFETY: extents validated above; the workspace is sized for every
+        // split, and every C element has one owner thread.
+        unsafe {
+            self.conv_implicit.sgemm_conv_implicit(
+                &self.stream,
+                launch::blocks_of(blocks, conv_implicit::GEMM_THREADS),
+                a, x, target, g.m, g.n, g.k, g.lda, ldc, alpha, beta,
+                g.a.0, g.a.1, g.a.2, cb, cs, cm, g.count, kchunk,
+                conv.x_base, conv.channels, conv.in_h, conv.in_w, conv.cpg, conv.groups,
+                conv.ksize, conv.stride_x, conv.stride_y, conv.dilation, conv.padding,
+                conv.out_h, conv.out_w,
+            )
+        }
+        .map_err(launch_err)?;
+        if let Some(w) = ws {
+            // SAFETY: one thread per output element; extents validated above.
             unsafe {
                 self.gemm.gemm_splitk_reduce(
                     &self.stream,
@@ -661,14 +760,31 @@ impl OxideBackend {
     }
 
     /// Zero-filled output buffer (for kernels that accumulate or only write
-    /// part of it).
+    /// part of it).  If the driver is out of memory the pool is flushed once
+    /// and the allocation retried, so a large cache can never starve a later
+    /// (larger) tensor.
     pub(crate) fn alloc(&self, len: usize) -> Result<PooledBuf, OxideError> {
         match self.bufs.take(len) {
             Some(mut b) => {
                 b.zero_async(&self.stream)?;
                 Ok(PooledBuf::new(b, &self.bufs))
             }
-            None => Ok(PooledBuf::new(DeviceBuffer::<f32>::zeroed(&self.stream, len)?, &self.bufs)),
+            None => self.alloc_zeroed(len),
+        }
+    }
+
+    /// Fresh `len`-element zeroed allocation; flush the pool and retry once on
+    /// OOM (the pool may be holding cached buffers that are not in use).
+    fn alloc_zeroed(&self, len: usize) -> Result<PooledBuf, OxideError> {
+        match DeviceBuffer::<f32>::zeroed(&self.stream, len) {
+            Ok(b) => Ok(PooledBuf::new(b, &self.bufs)),
+            Err(err) => {
+                self.bufs.flush();
+                match DeviceBuffer::<f32>::zeroed(&self.stream, len) {
+                    Ok(b) => Ok(PooledBuf::new(b, &self.bufs)),
+                    Err(_) => Err(OxideError::from(err)),
+                }
+            }
         }
     }
 

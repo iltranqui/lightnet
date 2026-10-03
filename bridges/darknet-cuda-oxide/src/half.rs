@@ -629,7 +629,7 @@ impl OxideBackend {
         // images (bounded by `COL_CAP_BYTES`), so a whole chunk is one im2col
         // launch and one GEMM launch (instances = image x group).
         let img_col = groups * kpad * npad;
-        let chunk = if direct { batch } else { (crate::conv::COL_CAP_BYTES / 2 / img_col).clamp(1, batch) }
+        let chunk = if direct { batch } else { (crate::conv::col_cap_bytes() / 2 / img_col).clamp(1, batch) }
             .min(crate::conv::chunk_limit());
         if !direct {
             let need = chunk * img_col;

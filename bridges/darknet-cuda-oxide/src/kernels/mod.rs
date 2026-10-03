@@ -6,6 +6,7 @@ pub mod amp;
 pub mod batchnorm;
 pub mod bias_scale;
 pub mod conv_direct;
+pub mod conv_implicit;
 pub mod convert;
 pub mod elementwise;
 pub mod gemm;

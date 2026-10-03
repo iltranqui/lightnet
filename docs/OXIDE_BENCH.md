@@ -305,6 +305,45 @@ Not done: fusing BN apply + activation in the training forward (the backward nee
 
 p10 at b16: 54.13 -> 51.39 ms. Correctness: `oxide_conv_parity` (12), `oxide_cfg_shapes` (13, wgrad over ~1000 geometries), `oxide_amp` (11) and `oxide_runtime_chain` (3) all pass. Note the release build is not faster than the debug build for training (both ~10 ms b1 / ~61 ms b16) because the step is GPU/launch bound, not host-code bound. The remaining per-image GEMM instances (wgrad, and dgrad `W^T * dy_b`) are not batched: the GEMM instance addressing `(base, stride, modulus)` has no second level for the image x group product, so a batched dgrad/wgrad GEMM or implicit-GEMM conv is the next step.
 
+### 7.6 Batched dgrad/wgrad GEMM, implicit-GEMM forward (2026-10-05)
+
+Both backward convolutions now run one GEMM per chunk instead of one per image, using the existing batched GEMM kernel and the split-K reduction as a general image-sum, so no new GEMM kernel was needed for the backward.  The implicit-GEMM forward was implemented and validated but is **not** a win on this GPU, so it is opt-in only.
+
+Changes (semantics unchanged, all suites green):
+1. **dgrad**: instances are `(image, group)` image-major (`count = nb * groups`), so `b` (dy) and `c` (dcol workspace) use plain instance strides; then one col2im per image reads its `col_base = bi * col_len` block of the shared workspace.  The f32 `col2im` kernel gained the `col_base` parameter.  Was `batch` GEMMs, now `ceil(batch/chunk)`.
+2. **wgrad**: one batched GEMM writes per-`(image, group)` partial `dW` into a workspace (`PARTIAL_CAP_BYTES = 64 MB`), then `gemm_splitk_reduce` (with `splits = nb`, `count = groups`) sums the images in fixed order into `dw`; across chunks `dw` accumulates with `beta = 1`.  This replaced `batch` GEMMs plus the `beta = 1` chain.
+3. **implicit forward** (`DARKNET_OXIDE_CONV=implicit`, `kernels/conv_implicit.rs`, `OxideBackend::gemm_conv_implicit`): generates the im2col `B` tile from `x` on the fly, removing the column buffer and the im2col launch.  Correctness is covered by the new `conv_parity_implicit` (all 13 parity cases + finite differences).
+4. **im2col** (`kernels/im2col.rs`): was one thread per column element with ~6 integer divisions each; now one block per column row `(image, c, ky, kx)` (`blocks_of(rows, ...)`) with threads sweeping the output positions, so the row decode is uniform per block and only two divisions remain per element.  nsys (13-step profile): im2col 129.8 -> 106.3 ms (~18% faster).
+5. **f32 GEMM shared loads** (`kernels/gemm.rs`): the inner loop now reads 4 contiguous `k` of `A` and 4 contiguous `n` of `B` per outer step (per-thread column tile `tx*4 .. +3`), which the compiler widens to 128-bit shared loads — 8 FMA per shared load instead of 2.
+6. **buffer-pool auto-size + OOM retry** (`tensor.rs`, `alloc`): see 7.7.
+
+A/B (release `bench-train`, LegoGears_v2, 30 steps + 5 warm-up, medians; the "before" baseline is the same binary with `git checkout`-restored sources):
+
+| variant | b1 step ms | b16 step ms | b16 peak device MB |
+| --- | --- | --- | --- |
+| before (per-image dgrad/wgrad GEMM) | 10.82 | 61.74 | 776 |
+| + batched dgrad/wgrad | 11.01 | 54.45 (-12%) | 972 |
+| + streamlined im2col | 10.63 | 52.3-53.2 | 972 |
+| + vectorised GEMM shared loads | 10.63 | **48.99** (-21% vs before) | 972 |
+| implicit forward (opt-in) | – | 57.4-57.7 (+5% vs materialised) | 970 |
+
+Phase attribution shifts because the batched kernel moves the stream sync point, so read the totals.  The implicit forward is slower because the materialised `B` tile is read with 16-byte `cp.async` (`ldb = ohw`, aligned) while the implicit tile can only issue 4-byte scalar copies: the im2col source column is an arbitrary input-column offset and `cp.async` 16-byte requires 16-byte alignment.  It stays behind `DARKNET_OXIDE_CONV=implicit`, is not picked by `Auto`, and did not replace the materialised path.  `DARKNET_OXIDE_CONV=gemm` still selects the (batched) materialised GEMM path.
+
+### 7.7 Batch scaling and the buffer-pool cap (2026-10-05)
+
+`bench-train`, LegoGears_v2, release, medians:
+
+| batch | total ms | fwd | bwd | ms / image | peak device MB |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 10.63 | 4.42 | 5.37 | 10.63 | 204 |
+| 16 | 48.99 | 38.95 | 9.57 | 3.06 | 972 |
+| 32 | 95.77 | 78.11 | 17.56 | 2.99 | 1596 |
+| 64 | 192.43 | 132.32 | 58.78 | 3.01 | 2564 |
+
+Scales linearly (~3.0 ms/image) from batch 16 up.  The `BufPool` cap used to be a fixed 1 GiB (`DARKNET_OXIDE_POOL_MB` default 1024), chosen in the 2026-10-01 allocator fix for inference where peaks were 18/184 MB.  Once the live+free footprint exceeds the cap the pool cannot keep freed buffers, so every step re-`cuMemAlloc`/`cuMemFree`d the working set: batch 32 measured **125.05 ms** instead of 95.77 (~30% slower), batch 64 similar.  It is now auto-sized when `DARKNET_OXIDE_POOL_MB` is unset: half of the free device memory (`cuMemGetInfo`), capped at 4 GiB, with the 1 GiB fallback if the query fails.  Because a generous cache can then starve a later larger allocation, `alloc_zeroed` now flushes the pool and retries once on OOM (`BufPool::flush`); this was caught by `cfg_shortcut_shapes` and is covered by the full suite.
+
+Correctness: `oxide_conv_parity` (13, incl. `conv_parity_implicit`), `oxide_cfg_shapes` (13), `oxide_runtime_chain` (3), `oxide_layers_extra` (17), `oxide_pool_parity` (9), `oxide_parity` (10), `oxide_gemm_mma` (5), `oxide_grad_methods` (2), `oxide_half` (13), `oxide_runtime_f16` (5), `oxide_amp` (11) and `oxide_batchnorm_adam` (13) all pass.
+
 ## Gradient-method shootout (2026-10-01)
 
 Harness: `bridges/darknet-cuda-oxide/tests/oxide_grad_methods.rs` (`grad_method_shootout`, ignored; a tiny-shape version of the same

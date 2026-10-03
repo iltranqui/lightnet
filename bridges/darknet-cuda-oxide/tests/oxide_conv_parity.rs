@@ -268,6 +268,11 @@ fn conv_parity_gemm() {
 }
 
 #[test]
+fn conv_parity_implicit() {
+    parity_for(ConvMode::Implicit);
+}
+
+#[test]
 fn conv_parity_auto() {
     parity_for(ConvMode::Auto);
 }
