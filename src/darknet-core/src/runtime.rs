@@ -178,6 +178,12 @@ pub struct LocalParams {
     pub weights: Vec<f32>,
 }
 
+/// Weighted `[shortcut]` parameters (tasks/rust/layers.md Task 6).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShortcutParams {
+    pub weights: Vec<f32>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RnnParams {
     pub input: ConnectedParams,
@@ -222,6 +228,7 @@ pub enum LayerParams {
     Convolutional(ConvolutionalParams),
     Connected(ConnectedParams),
     Local(LocalParams),
+    Shortcut(ShortcutParams),
     Gru(GruParams),
     Rnn(RnnParams),
     Lstm(LstmParams),
@@ -252,6 +259,11 @@ pub struct ConnectedTrainBuffers {
 #[derive(Clone, Debug, PartialEq)]
 pub struct LocalTrainBuffers {
     pub bias_updates: Vec<f32>,
+    pub weight_updates: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShortcutTrainBuffers {
     pub weight_updates: Vec<f32>,
 }
 
@@ -299,6 +311,7 @@ pub enum LayerTrainBuffers {
     Convolutional(ConvolutionalTrainBuffers),
     Connected(ConnectedTrainBuffers),
     Local(LocalTrainBuffers),
+    Shortcut(ShortcutTrainBuffers),
     Gru(GruTrainBuffers),
     Rnn(RnnTrainBuffers),
     Lstm(LstmTrainBuffers),
@@ -672,6 +685,16 @@ impl ExecutableNetwork {
                         batch,
                     );
                 }
+                (LayerParams::Shortcut(params), LayerTrainBuffers::Shortcut(train)) => {
+                    sgd_update(
+                        &mut params.weights,
+                        &mut train.weight_updates,
+                        lr,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                }
                 (LayerParams::Gru(params), LayerTrainBuffers::Gru(train)) => {
                     for (params, train) in [
                         (&mut params.input_z, &mut train.input_z),
@@ -830,7 +853,7 @@ impl ExecutableNetwork {
                     | LayerKind::MaxPool(crate::model::MaxPoolSpec { depth: false, .. })
                     | LayerKind::AvgPool
                     | LayerKind::Route(_)
-                    | LayerKind::Shortcut(_)
+                    | LayerKind::Shortcut(crate::model::ShortcutSpec { weights_type: crate::model::ShortcutWeightsType::None, .. })
                     | LayerKind::Upsample(_)
                     | LayerKind::Yolo(_)
                     | LayerKind::GaussianYolo(_)
@@ -1043,6 +1066,9 @@ impl ExecutableNetwork {
                     forward_route(spec, layer.index, &layer_outputs, layer.output_shape)?,
                     None,
                 ),
+                (LayerKind::Shortcut(spec), LayerParams::Shortcut(params)) => {
+                    forward_shortcut_weighted(spec, params, current_input, layer.index, &layer_outputs)?
+                }
                 (LayerKind::Shortcut(spec), LayerParams::None) => {
                     forward_shortcut_with_cache(spec, current_input, layer.index, &layer_outputs)?
                 }
@@ -1407,6 +1433,50 @@ impl ExecutableNetwork {
                         &mut layer_output_gradients,
                         &self.network.layers,
                     )?;
+                }
+                (LayerKind::Shortcut(spec), LayerParams::Shortcut(params)) => {
+                    let output = &forward.layer_outputs[layer.index];
+                    let delta = apply_output_activation_gradient(
+                        output,
+                        &grad,
+                        &spec.activation,
+                        "shortcut",
+                        forward.layer_activation_inputs[layer.index].as_ref(),
+                    )?;
+                    let sources = shortcut_sources(spec, layer.index, &forward.layer_outputs, current_input.shape.batch)?;
+                    let slices: Vec<&[f32]> = sources.iter().map(|t| t.data.as_slice()).collect();
+                    let g = crate::shortcut_weights::weighted_backward(
+                        &delta.data,
+                        &current_input.data,
+                        &slices,
+                        current_input.shape.batch,
+                        current_input.shape.element_count(),
+                        &params.weights,
+                        spec.weights_normalization,
+                        spec.weight_slots(current_input.shape.channels),
+                        GradMode::from_env() == GradMode::Cpp,
+                    );
+                    let Some(slot) = param_gradients.get_mut(layer.index) else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing shortcut gradient slot for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    *slot = LayerParams::Shortcut(ShortcutParams { weights: g.weights });
+                    accumulate_previous_gradient(
+                        layer.index,
+                        &Tensor::from_data(current_input.shape, g.input)?,
+                        &mut input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
+                    for (raw_index, source_grad) in spec.from.iter().zip(g.sources) {
+                        let source_index = resolve_relative_layer(layer.index, *raw_index)?;
+                        let shape = forward.layer_outputs[source_index].shape;
+                        accumulate_tensor(
+                            &mut layer_output_gradients[source_index],
+                            &Tensor::from_data(shape, source_grad)?,
+                        )?;
+                    }
                 }
                 (LayerKind::Shortcut(spec), LayerParams::None) => {
                     let accum_grad = backward_shortcut(
@@ -2026,6 +2096,17 @@ impl ExecutableNetwork {
                     };
                     accumulate_vec(&mut train.bias_updates, &local_grad.biases)?;
                     accumulate_vec(&mut train.weight_updates, &local_grad.weights)?;
+                }
+                (LayerKind::Shortcut(_), LayerParams::Shortcut(gradient)) => {
+                    let Some(LayerTrainBuffers::Shortcut(train)) =
+                        self.train_buffers.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing shortcut train buffers for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    accumulate_vec(&mut train.weight_updates, &gradient.weights)?;
                 }
                 (LayerKind::Rnn(_), LayerParams::Rnn(gradient)) => {
                     let Some(LayerTrainBuffers::Rnn(train)) =
@@ -3956,6 +4037,12 @@ where
                         )
                         .map_err(|err| backend_error("route concat", err))?
                 }
+                (LayerKind::Shortcut(spec), LayerParams::Shortcut(_)) => {
+                    return Err(Error::UnsupportedLayer {
+                        layer_index: layer.index,
+                        name: format!("shortcut weights (GPU, from={:?})", spec.from),
+                    });
+                }
                 (LayerKind::Shortcut(spec), LayerParams::None) => {
                     let mut accumulated = current_input.clone();
                     for raw_index in &spec.from {
@@ -4437,6 +4524,11 @@ where
                     | LayerKind::Rnn(_)
                     | LayerKind::Lstm(_)
                     | LayerKind::Crnn(_)
+                    | LayerKind::Shortcut(crate::model::ShortcutSpec {
+                        weights_type:
+                            crate::model::ShortcutWeightsType::PerFeature | crate::model::ShortcutWeightsType::PerChannel,
+                        ..
+                    })
             )
         }) {
             let state = self.forward_with_state(input)?;
@@ -6395,6 +6487,12 @@ fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
             spec.filters,
             spec.size,
         )),
+        LayerKind::Shortcut(spec) => match spec.weight_count(layer.input_shape.channels) {
+            0 => LayerParams::None,
+            len => LayerParams::Shortcut(ShortcutParams {
+                weights: vec![0.0; len],
+            }),
+        },
         LayerKind::Gru(spec) => LayerParams::Gru(default_gru_params(
             layer.input_shape.element_count(),
             spec.output,
@@ -6492,6 +6590,12 @@ fn default_layer_train_buffers(layer: &crate::model::Layer) -> LayerTrainBuffers
             spec.filters,
             spec.size,
         )),
+        LayerKind::Shortcut(spec) => match spec.weight_count(layer.input_shape.channels) {
+            0 => LayerTrainBuffers::None,
+            len => LayerTrainBuffers::Shortcut(ShortcutTrainBuffers {
+                weight_updates: vec![0.0; len],
+            }),
+        },
         LayerKind::Gru(spec) => LayerTrainBuffers::Gru(default_gru_train_buffers(
             layer.input_shape.element_count(),
             spec.output,
@@ -7128,6 +7232,9 @@ fn load_weights_into_params(
             LayerParams::Local(local) => {
                 read_f32_into(&mut file, &mut local.biases)?;
                 read_f32_into(&mut file, &mut local.weights)?;
+            }
+            LayerParams::Shortcut(shortcut) => {
+                read_f32_into(&mut file, &mut shortcut.weights)?;
             }
             LayerParams::Gru(gru) => {
                 let inputs = layer.input_shape.element_count();
@@ -10884,6 +10991,55 @@ fn forward_route_compact(
         out_channel += chunk_channels;
     }
     Ok(output)
+}
+
+fn shortcut_sources<'a>(
+    spec: &crate::model::ShortcutSpec,
+    layer_index: usize,
+    outputs: &'a [Tensor],
+    batch: usize,
+) -> Result<Vec<&'a Tensor>> {
+    spec.from
+        .iter()
+        .map(|raw_index| {
+            let source_index = resolve_relative_layer(layer_index, *raw_index)?;
+            let source = outputs.get(source_index).ok_or(Error::InvalidRoute {
+                layer_index,
+                reference: *raw_index,
+            })?;
+            if source.shape.batch != batch {
+                return Err(Error::InvalidConfig(format!(
+                    "shortcut layer #{layer_index} mixes incompatible batch shapes"
+                )));
+            }
+            Ok(source)
+        })
+        .collect()
+}
+
+fn forward_shortcut_weighted(
+    spec: &crate::model::ShortcutSpec,
+    params: &ShortcutParams,
+    input: &Tensor,
+    layer_index: usize,
+    outputs: &[Tensor],
+) -> Result<(Tensor, Option<Tensor>)> {
+    let sources = shortcut_sources(spec, layer_index, outputs, input.shape.batch)?;
+    let slices: Vec<&[f32]> = sources.iter().map(|t| t.data.as_slice()).collect();
+    let pre = crate::shortcut_weights::weighted_forward(
+        &input.data,
+        &slices,
+        input.shape.batch,
+        input.shape.element_count(),
+        &params.weights,
+        spec.weights_normalization,
+        spec.weight_slots(input.shape.channels),
+    );
+    let output: Vec<f32> = pre.iter().map(|v| activate(spec.activation.clone(), *v)).collect();
+    Ok((
+        Tensor::from_data(input.shape, output)?,
+        Some(Tensor::from_data(input.shape, pre)?),
+    ))
 }
 
 fn forward_shortcut_with_cache(
@@ -16664,6 +16820,56 @@ mod tests {
              [convolutional]\nfilters=2\nsize=1\nstride=1\nactivation=linear\n",
             1,
         );
+    }
+
+    #[test]
+    fn weighted_shortcut_layer_backward_matches_finite_differences_on_its_weights() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "inline.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=2\n\
+                 [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
+                 [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
+                 [shortcut]\nfrom=-2\nweights_type=per_channel\nweights_normalization=relu\nactivation=leaky\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut net = ExecutableNetwork::new(network);
+        fill_conv_params(&mut net.params);
+        let LayerParams::Shortcut(p) = &mut net.params[2] else { panic!() };
+        p.weights = vec![0.9, 0.4, 0.7, 0.6]; // (n+1)=2 inputs x 2 channels
+        let input = patterned_input(net.network.net.input_shape());
+        let seed = Tensor::from_data(
+            net.network.layers[2].output_shape,
+            (0..16).map(|i| (i as f32 * 0.61).cos()).collect(),
+        )
+        .unwrap();
+        let loss = |net: &ExecutableNetwork| -> f32 {
+            let out = net.forward_training(&input).unwrap();
+            out.layer_outputs[2].data.iter().zip(&seed.data).map(|(o, s)| o * s).sum()
+        };
+        let forward = net.forward_training(&input).unwrap();
+        let mut seeds = vec![None; 3];
+        seeds[2] = Some(seed.clone());
+        let backward = net.backward_accumulate_seeded(&input, &forward, &seeds).unwrap();
+        let LayerParams::Shortcut(g) = &backward.param_gradients[2] else { panic!() };
+        for k in 0..4 {
+            let h = 1e-2f32;
+            let (mut np, mut nm) = (net.clone(), net.clone());
+            if let LayerParams::Shortcut(p) = &mut np.params[2] {
+                p.weights[k] += h;
+            }
+            if let LayerParams::Shortcut(p) = &mut nm.params[2] {
+                p.weights[k] -= h;
+            }
+            let fd = (loss(&np) - loss(&nm)) / (2.0 * h);
+            assert!(
+                (fd - g.weights[k]).abs() <= 5e-3 + 5e-3 * fd.abs(),
+                "w[{k}]: fd {fd}, analytic {}",
+                g.weights[k]
+            );
+        }
     }
 
     #[test]

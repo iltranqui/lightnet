@@ -326,6 +326,66 @@ pub struct RouteSpec {
 pub struct ShortcutSpec {
     pub from: Vec<isize>,
     pub activation: Activation,
+    pub weights_type: ShortcutWeightsType,
+    pub weights_normalization: ShortcutWeightsNorm,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShortcutWeightsType {
+    #[default]
+    None,
+    PerFeature,
+    PerChannel,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShortcutWeightsNorm {
+    #[default]
+    None,
+    Relu,
+    Softmax,
+}
+
+impl ShortcutWeightsType {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "per_feature" => Ok(Self::PerFeature),
+            "per_channel" => Ok(Self::PerChannel),
+            other => Err(Error::InvalidConfig(format!("weights type \"{other}\" is not supported"))),
+        }
+    }
+}
+
+impl ShortcutWeightsNorm {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "relu" | "avg_relu" => Ok(Self::Relu),
+            "softmax" => Ok(Self::Softmax),
+            other => Err(Error::InvalidConfig(format!("weights normalization \"{other}\" is not supported"))),
+        }
+    }
+}
+
+impl ShortcutSpec {
+    /// C++ `nweights`: `n+1` (per_feature) or `(n+1)*c` (per_channel), 0 without weights.
+    pub fn weight_count(&self, channels: usize) -> usize {
+        match self.weights_type {
+            ShortcutWeightsType::None => 0,
+            ShortcutWeightsType::PerFeature => self.from.len() + 1,
+            ShortcutWeightsType::PerChannel => (self.from.len() + 1) * channels,
+        }
+    }
+
+    /// Weight slots per input (C++ `layer_step`).
+    pub fn weight_slots(&self, channels: usize) -> usize {
+        match self.weights_type {
+            ShortcutWeightsType::None => 0,
+            ShortcutWeightsType::PerFeature => 1,
+            ShortcutWeightsType::PerChannel => channels,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -772,6 +832,15 @@ impl Layer {
                 }
 
                 Some(LayerWeights { entries })
+            }
+            LayerKind::Shortcut(spec) => {
+                let len = spec.weight_count(self.input_shape.channels);
+                (len > 0).then(|| LayerWeights {
+                    entries: vec![WeightsEntry {
+                        array: WeightsArray::Weights,
+                        len,
+                    }],
+                })
             }
             LayerKind::BatchNorm(_) => Some(LayerWeights {
                 entries: vec![
@@ -1275,6 +1344,10 @@ fn parse_layer_kind(
         "shortcut" => LayerKind::Shortcut(ShortcutSpec {
             from: section.get_isize_list("from")?,
             activation: Activation::parse(&section.get_str("activation", "linear")),
+            weights_type: ShortcutWeightsType::parse(&section.get_str("weights_type", "none"))?,
+            weights_normalization: ShortcutWeightsNorm::parse(
+                &section.get_str("weights_normalization", "none"),
+            )?,
         }),
         "upsample" => {
             let stride = section.get_isize("stride", 2)?;
@@ -1832,6 +1905,22 @@ mod tests {
         assert_eq!((s.width, s.height, s.channels), (2, 3, 2)); // out_channels ignored without depth
         // out_channels larger than the input channels is rejected
         assert!(build("[net]\nwidth=4\nheight=4\nchannels=2\n[maxpool]\nmaxpool_depth=1\nout_channels=3\n").is_err());
+    }
+
+    #[test]
+    fn shortcut_weight_keys_follow_cpp_names_and_counts() {
+        let mk = |extra: &str| {
+            build(&format!(
+                "[net]\nwidth=2\nheight=2\nchannels=3\n[convolutional]\nfilters=3\nsize=1\n[convolutional]\nfilters=3\nsize=1\n[shortcut]\nfrom=-2\n{extra}\n"
+            ))
+        };
+        let n = mk("weights_type=per_feature\nweights_normalization=avg_relu").unwrap();
+        assert_eq!(n.layers[2].weights().unwrap().parameter_count(), 2); // n+1
+        let n = mk("weights_type=per_channel").unwrap();
+        assert_eq!(n.layers[2].weights().unwrap().parameter_count(), 6); // (n+1)*c
+        assert!(mk("").unwrap().layers[2].weights().is_none());
+        assert!(mk("weights_type=banana").is_err());
+        assert!(mk("weights_normalization=banana").is_err());
     }
 
     fn repo_cfg(name: &str) -> PathBuf {

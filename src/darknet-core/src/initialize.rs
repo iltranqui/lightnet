@@ -24,6 +24,8 @@ pub fn initialize_training_params(network: &Network, params: &mut [LayerParams],
                 rng.weights(&mut p.weights, fan);
                 p.biases.fill(0.0);
             }
+            // C++ initialises weighted-shortcut weights to 1.0.
+            LayerParams::Shortcut(p) => p.weights.fill(1.0),
             LayerParams::Rnn(p) => {
                 for p in [&mut p.input, &mut p.self_params, &mut p.output] {
                     connected(p, &mut rng);

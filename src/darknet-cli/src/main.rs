@@ -2362,6 +2362,9 @@ fn print_forward_backward_summary(
                 local.bias_updates.iter().any(|value| *value != 0.0)
                     || local.weight_updates.iter().any(|value| *value != 0.0)
             }
+            darknet_core::LayerTrainBuffers::Shortcut(shortcut) => {
+                shortcut.weight_updates.iter().any(|value| *value != 0.0)
+            }
             darknet_core::LayerTrainBuffers::Gru(_)
             | darknet_core::LayerTrainBuffers::Rnn(_)
             | darknet_core::LayerTrainBuffers::Lstm(_)

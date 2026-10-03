@@ -128,6 +128,9 @@ pub fn save_weights(
                 write_f32_slice(&mut file, &local.biases)?;
                 write_f32_slice(&mut file, &local.weights)?;
             }
+            (LayerKind::Shortcut(_), LayerParams::Shortcut(shortcut)) => {
+                write_f32_slice(&mut file, &shortcut.weights)?;
+            }
             // Rust-only: C++ never writes a standalone [batchnorm]; order mirrors
             // `load_weights_into_params` and the C++ `save_batchnorm_weights` helper.
             (LayerKind::BatchNorm(_), LayerParams::BatchNorm(bn)) => {
@@ -338,6 +341,34 @@ mod tests {
     }
 
     #[test]
+    fn shortcut_weights_round_trip_exact_length() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "sc.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=2\n\
+                 [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
+                 [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
+                 [shortcut]\nfrom=-2\nweights_type=per_channel\nweights_normalization=softmax\nactivation=linear\n",
+            )
+            .expect("cfg"),
+        )
+        .expect("network");
+        // (n+1)*c = 2*2 = 4 shortcut weights after 2 convs of (2 bias + 4 weights)
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let LayerParams::Shortcut(sc) = &mut executable.params[2] else { panic!("shortcut params") };
+        sc.weights = vec![0.5, 1.5, 2.5, 3.5];
+        let path = std::env::temp_dir().join("darknet-shortcut-roundtrip.weights");
+        save_weights(&network, &executable.params, &path, 1).expect("save");
+        assert_eq!(fs::metadata(&path).unwrap().len(), 20 + 4 * (2 * (2 + 4) + 4));
+        let mut reloaded = ExecutableNetwork::new(network.clone());
+        reloaded.load_weights_file(&path).expect("load");
+        assert_eq!(reloaded.params, executable.params);
+        let inspection = inspect_weights_file(&network, &path).expect("inspect");
+        assert_eq!(inspection.trailing_bytes, 0);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn inspects_synthetic_weights_file() {
         let cfg = ConfigFile::parse_str(
             "inline.cfg",
@@ -486,6 +517,7 @@ mod tests {
                     | LayerParams::Convolutional(_)
                     | LayerParams::Connected(_)
                     | LayerParams::Local(_)
+                    | LayerParams::Shortcut(_)
                     | LayerParams::Gru(_) => {}
                 }
             }

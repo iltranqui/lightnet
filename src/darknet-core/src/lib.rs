@@ -28,6 +28,7 @@ pub mod model;
 pub(crate) mod maxpool_depth;
 pub mod names;
 pub mod runtime;
+pub(crate) mod shortcut_weights;
 pub mod train;
 pub mod weights;
 
@@ -37,15 +38,15 @@ pub use error::{Error, Result};
 pub use image::PlanarRgbImage;
 pub use model::{
     Activation, CrnnSpec, Layer, LayerKind, LayerWeights, LrPolicy, LstmSpec, NetConfig, Network,
-    RnnSpec, TensorShape, WeightsArray, YoloIouLoss,
+    RnnSpec, ShortcutWeightsNorm, ShortcutWeightsType, TensorShape, WeightsArray, YoloIouLoss,
 };
 pub use names::load_names_file;
 pub use runtime::{
     BackwardResult, BatchNormTrainBuffers, ConnectedTrainBuffers, ConvolutionalTrainBuffers,
     CrnnParams, CrnnTrainBuffers, ExecutableNetwork, ForwardResult, GpuExecutableNetwork,
     GpuForwardState, GpuForwardSummary, LayerParams, LayerTrainBuffers, LstmParams,
-    LstmTrainBuffers, RecurrentForwardCache, RnnParams, RnnTrainBuffers, Tensor, YoloHeadOutput,
-    compute_learning_rate,
+    LstmTrainBuffers, RecurrentForwardCache, RnnParams, RnnTrainBuffers, ShortcutParams,
+    ShortcutTrainBuffers, Tensor, YoloHeadOutput, compute_learning_rate,
 };
 pub use train::{
     DataConfig, TrainingBatch, YoloLabel, YoloTrainingLoss, YoloTrainingState,
