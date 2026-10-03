@@ -86,6 +86,12 @@ fn unsupported_sections(cfg: &ConfigFile) -> String {
         "rnn",
         "lstm",
         "crnn",
+        "channel_slice",
+        "channel_shuffle",
+        "deconvolutional",
+        "logistic",
+        "regression",
+        "jev_ce",
     ];
     cfg.sections
         .iter()

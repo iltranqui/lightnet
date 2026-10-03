@@ -380,8 +380,18 @@ Inference on LegoGears_v2 = DONE (155/155 dets, max score diff 4.5e-4, mAP 99.66
 - BLOCKED (hardware, sm_89): wgmma (sm_90), tcgen05 (sm_100), multi-GPU, NVFP4.
 
 ### Not implemented by design / no scanned cfg needs it
-- Activations without kernels: loggy, elu, selu, gelu, hard_mish, hardtan, lhtan, plse, stair, relie, normalize_channels*.
+- Activations without kernels: loggy, elu, selu, gelu, hard_mish, hardtan, lhtan, plse, stair, relie, normalize_channels*. (Phase 0 gave all ten a CPU forward + exact derivative; `gelu` also got an oxide kernel, the rest still force the host path. `normalize_channels*` is a config error.)
 - xnor (74 layers), share_index (54), `new_coords=1` yolo (path looks wrong), antialiasing, conv grad clamps/`try_fix_nan` clamps, rewritten_bbox/total_bbox logging.
+
+### Layer-port Phase 0 delivered (2026-10-03)
+- Ten elementwise activations (`gelu elu selu relie plse hardtan lhtan stair hard_mish revleaky`) with exact input-form gradients; unknown activation names are a config error, no longer a silent identity; `gelu` has an oxide kernel.
+- `[maxpool]` reads the C++ key `maxpool_zero_nonmax` and implements `maxpool_depth` (CPU).
+- Standalone `[batchnorm]` can be saved (Rust-only extension; not C++-readable).
+- Weighted `[shortcut]` (`weights_type` / `weights_normalization`) with the exact normalised gradient and its `.weights` block.
+- Layers: `[channel_slice]`, `[channel_shuffle]` (with a host reference op + oxide kernel), `[deconvolutional]` (CPU exact backward, GPU host round trip, conv-layout weights).
+- Dense-truth heads: `[cost]` scale, `[logistic]`, `[regression]`, `[jev_ce]` + the `dense_loss` host API.
+- `see tasks/rust/layers.md` for the remaining phases (1b-4).
+- C++ dump parity: NOT RUN for any Phase 0 layer — no C++ build of the owning branches (`Jev_laya`/`raptor`/`fog`) is available in this environment; all checks are by-construction plus finite differences / CPU-vs-GPU parity.
 
 ### Known small diffs vs C++
 - CPU resize uses `image` Triangle (differs for non-network-size inputs); EXIF orientation ignored.
