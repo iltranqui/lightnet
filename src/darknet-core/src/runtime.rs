@@ -12175,6 +12175,7 @@ mod tests {
             F32ActivationKind::Tanh => Activation::Tanh,
             F32ActivationKind::Relu6 => Activation::Relu6,
             F32ActivationKind::Ramp => Activation::Ramp,
+            F32ActivationKind::Gelu => Activation::Gelu,
         };
         super::activate(activation, value)
     }
@@ -12218,6 +12219,7 @@ mod tests {
             }
             F32ActivationKind::Relu6 => (value > 0.0 && value < 6.0) as i32 as f32,
             F32ActivationKind::Ramp => (value > 0.0) as i32 as f32 + 0.1,
+            F32ActivationKind::Gelu => crate::activation_math::gelu_grad(value),
         }
     }
 
@@ -16639,6 +16641,16 @@ mod tests {
         }
         // input-form gradients must refuse to run without the cached pre-activation
         assert!(super::activation_gradient_from_output(&Activation::Gelu, 0.5, None, "t").is_err());
+    }
+
+    #[test]
+    fn gpu_gelu_convolution_matches_cpu_forward_and_backward() {
+        assert_gpu_layer_chain_matches_cpu(
+            "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=2\n\
+             [convolutional]\nfilters=2\nsize=1\nstride=1\nactivation=gelu\n\
+             [convolutional]\nfilters=2\nsize=1\nstride=1\nactivation=linear\n",
+            1,
+        );
     }
 
     #[test]

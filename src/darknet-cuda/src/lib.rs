@@ -23,6 +23,8 @@ pub enum F32ActivationKind {
     Relu6,
     /// `x*(x>0) + 0.1x`; gradient `(x>0) + 0.1` (C++ `ramp_*`).
     Ramp,
+    /// tanh-approximation GELU `0.5x(1+tanh(0.797885x+0.035677x^3))`; exact derivative (C++ `gelu_*`).
+    Gelu,
 }
 
 /// Outputs of [`F32TensorOpsBackend::batchnorm_train_forward_f32`].

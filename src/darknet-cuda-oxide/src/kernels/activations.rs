@@ -13,6 +13,7 @@ pub const ACT_SWISH: u32 = 5;
 pub const ACT_TANH: u32 = 6;
 pub const ACT_RELU6: u32 = 7;
 pub const ACT_RAMP: u32 = 8;
+pub const ACT_GELU: u32 = 9;
 
 #[device]
 pub fn activate(kind: u32, x: f32) -> f32 {
@@ -33,6 +34,8 @@ pub fn activate(kind: u32, x: f32) -> f32 {
     } else if kind == 8 {
         // C++ `x*(x>0) + .1f*x` (same rounding as the CPU runtime).
         (if x > 0.0 { x } else { 0.0 }) + 0.1 * x
+    } else if kind == 9 {
+        0.5 * x * (1.0 + (0.797885 * x + 0.035677 * x * x * x).tanh())
     } else {
         x
     }
@@ -70,6 +73,9 @@ pub fn gradient(kind: u32, x: f32) -> f32 {
         if x > 0.0 && x < 6.0 { 1.0 } else { 0.0 }
     } else if kind == 8 {
         if x > 0.0 { 1.1 } else { 0.1 }
+    } else if kind == 9 {
+        let t = (0.797885 * x + 0.035677 * x * x * x).tanh();
+        0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * (0.797885 + 3.0 * 0.035677 * x * x)
     } else {
         1.0
     }

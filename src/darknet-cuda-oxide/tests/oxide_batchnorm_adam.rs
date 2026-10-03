@@ -556,6 +556,7 @@ fn fused_bias_activation_is_bit_identical_to_bias_add_then_activation() {
         F32ActivationKind::Tanh,
         F32ActivationKind::Relu6,
         F32ActivationKind::Ramp,
+        F32ActivationKind::Gelu,
     ] {
         let biased = be.bias_add_f32(&x, &bias, channels, stride, cfg()).unwrap();
         let want = be.activation_f32(&biased, act, cfg()).unwrap();
