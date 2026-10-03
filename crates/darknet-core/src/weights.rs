@@ -6,7 +6,7 @@
 //! arrays cannot silently drift from the C++ format.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::DARKNET_WEIGHTS_VERSION_MAJOR;
@@ -104,7 +104,7 @@ pub fn save_weights(
         )));
     }
 
-    let mut file = File::create(path)?;
+    let mut file = BufWriter::with_capacity(1 << 20, File::create(path)?);
     file.write_all(&DARKNET_WEIGHTS_VERSION_MAJOR.to_le_bytes())?;
     file.write_all(&DARKNET_WEIGHTS_VERSION_MINOR.to_le_bytes())?;
     file.write_all(&DARKNET_WEIGHTS_VERSION_PATCH.to_le_bytes())?;
@@ -171,6 +171,7 @@ pub fn save_weights(
         }
     }
 
+    file.flush()?;
     Ok(())
 }
 
@@ -245,14 +246,22 @@ fn read_u64(file: &mut File) -> Result<u64> {
     Ok(u64::from_le_bytes(bytes))
 }
 
-fn write_f32_slice(file: &mut File, values: &[f32]) -> Result<()> {
-    for value in values {
-        file.write_all(&value.to_le_bytes())?;
+/// Write `values` as little-endian f32, encoding in chunks so large tensors
+/// cost a few writes instead of one per element.
+pub(crate) fn write_f32_slice<W: Write>(file: &mut W, values: &[f32]) -> Result<()> {
+    const CHUNK_VALUES: usize = 64 * 1024;
+    let mut bytes = Vec::with_capacity(values.len().min(CHUNK_VALUES) * 4);
+    for chunk in values.chunks(CHUNK_VALUES) {
+        bytes.clear();
+        for value in chunk {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        file.write_all(&bytes)?;
     }
     Ok(())
 }
 
-fn write_connected_params(file: &mut File, params: &ConnectedParams) -> Result<()> {
+fn write_connected_params<W: Write>(file: &mut W, params: &ConnectedParams) -> Result<()> {
     write_f32_slice(file, &params.biases)?;
     write_f32_slice(file, &params.weights)?;
     if let Some(batch_norm) = params.batch_norm.as_ref() {
@@ -263,7 +272,7 @@ fn write_connected_params(file: &mut File, params: &ConnectedParams) -> Result<(
     Ok(())
 }
 
-fn write_convolutional_params(file: &mut File, params: &ConvolutionalParams) -> Result<()> {
+fn write_convolutional_params<W: Write>(file: &mut W, params: &ConvolutionalParams) -> Result<()> {
     write_f32_slice(file, &params.biases)?;
     if let Some(batch_norm) = params.batch_norm.as_ref() {
         write_f32_slice(file, &batch_norm.scales)?;
@@ -282,7 +291,18 @@ mod tests {
     use crate::model::Network;
     use crate::runtime::{ExecutableNetwork, LayerParams};
 
-    use super::{inspect_weights_file, save_weights};
+    use super::{inspect_weights_file, save_weights, write_f32_slice};
+
+    #[test]
+    fn chunked_f32_writer_matches_per_element_encoding() {
+        for len in [0usize, 1, 65_535, 65_536, 65_537, 200_000] {
+            let values: Vec<f32> = (0..len).map(|i| i as f32 * 0.37 - 5.0).collect();
+            let expected: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let mut got = Vec::new();
+            write_f32_slice(&mut got, &values).unwrap();
+            assert_eq!(got, expected, "len {len}");
+        }
+    }
 
     #[test]
     fn inspects_synthetic_weights_file() {

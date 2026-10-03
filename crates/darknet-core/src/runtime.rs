@@ -2864,7 +2864,7 @@ where
     /// parameters plus `seen`; resuming Adam from it would restart the moments,
     /// so training uses this sidecar to continue the optimizer exactly.
     pub fn save_optimizer_state(&self, path: impl AsRef<Path>) -> Result<()> {
-        let mut file = File::create(path)?;
+        let mut file = std::io::BufWriter::with_capacity(1 << 20, File::create(path)?);
         file.write_all(b"DNOPT1\0\0")?;
         file.write_all(&self.adam_step.to_le_bytes())?;
         let entries: Vec<usize> = self
@@ -2945,7 +2945,7 @@ where
 
     fn write_moments(
         &self,
-        file: &mut File,
+        file: &mut impl Write,
         moments: Option<&GpuMoments<B::Tensor>>,
         shape: &[usize],
     ) -> Result<()> {
@@ -2966,9 +2966,7 @@ where
                             "Adam moment length does not match its parameter shape".to_owned(),
                         ));
                     }
-                    for value in values {
-                        file.write_all(&value.to_le_bytes())?;
-                    }
+                    crate::weights::write_f32_slice(file, &values)?;
                 }
                 Ok(())
             }
