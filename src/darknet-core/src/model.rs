@@ -221,6 +221,16 @@ pub enum Activation {
     Tanh,
     Relu6,
     Ramp,
+    Gelu,
+    Elu,
+    Selu,
+    Relie,
+    Plse,
+    Hardtan,
+    Lhtan,
+    Stair,
+    HardMish,
+    Revleaky,
     Other(String),
 }
 
@@ -237,6 +247,16 @@ impl Activation {
             "tanh" => Self::Tanh,
             "relu6" => Self::Relu6,
             "ramp" => Self::Ramp,
+            "gelu" => Self::Gelu,
+            "elu" => Self::Elu,
+            "selu" => Self::Selu,
+            "relie" => Self::Relie,
+            "plse" => Self::Plse,
+            "hardtan" => Self::Hardtan,
+            "lhtan" => Self::Lhtan,
+            "stair" => Self::Stair,
+            "hard_mish" => Self::HardMish,
+            "revleaky" => Self::Revleaky,
             other => Self::Other(other.to_owned()),
         }
     }
@@ -245,7 +265,7 @@ impl Activation {
         match self {
             Self::Linear => Some(F32ActivationKind::Linear),
             Self::Logistic => Some(F32ActivationKind::Logistic),
-            Self::Loggy => None,
+            Self::Loggy | Self::Gelu | Self::Elu | Self::Selu | Self::Relie | Self::Plse | Self::Hardtan | Self::Lhtan | Self::Stair | Self::HardMish | Self::Revleaky => None,
             Self::Relu => Some(F32ActivationKind::Relu),
             Self::Leaky => Some(F32ActivationKind::Leaky),
             Self::Mish => Some(F32ActivationKind::Mish),

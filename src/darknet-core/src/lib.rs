@@ -10,6 +10,7 @@
 //! The public re-exports below form the application-facing API.  The modules
 //! remain public for advanced users extending a specific part of the port.
 
+pub(crate) mod activation_math;
 pub mod augmentation;
 pub use augmentation::DetectorAugmentation;
 pub mod cfg;

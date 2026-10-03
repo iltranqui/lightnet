@@ -10501,8 +10501,7 @@ fn activation_gradient_from_output(
     activation_input: Option<f32>,
     layer_name: &str,
 ) -> Result<f32> {
-    match activation {
-        Activation::Linear => Ok(1.0),
+    match activation {        Activation::Linear => Ok(1.0),
         Activation::Logistic => Ok(output_value * (1.0 - output_value)),
         Activation::Loggy => Ok(0.5 * (1.0 - output_value * output_value)),
         Activation::Relu => Ok((output_value > 0.0) as i32 as f32),
@@ -10542,11 +10541,66 @@ fn activation_gradient_from_output(
             let grad_tsp = (1.0 - tsp * tsp) * grad_sp;
             Ok(x * grad_tsp + tsp)
         }
+        Activation::Gelu => Ok(crate::activation_math::gelu_grad(cached_activation_input(
+            activation,
+            activation_input,
+            layer_name,
+        )?)),
+        Activation::Elu => Ok(crate::activation_math::elu_grad(cached_activation_input(
+            activation,
+            activation_input,
+            layer_name,
+        )?)),
+        Activation::Selu => Ok(crate::activation_math::selu_grad(cached_activation_input(
+            activation,
+            activation_input,
+            layer_name,
+        )?)),
+        Activation::Plse => Ok(crate::activation_math::plse_grad(cached_activation_input(
+            activation,
+            activation_input,
+            layer_name,
+        )?)),
+        Activation::Hardtan => Ok(crate::activation_math::hardtan_grad(cached_activation_input(
+            activation,
+            activation_input,
+            layer_name,
+        )?)),
+        Activation::Lhtan => Ok(crate::activation_math::lhtan_grad(cached_activation_input(
+            activation,
+            activation_input,
+            layer_name,
+        )?)),
+        Activation::Stair => Ok(crate::activation_math::stair_grad(cached_activation_input(
+            activation,
+            activation_input,
+            layer_name,
+        )?)),
+        Activation::HardMish => Ok(crate::activation_math::hard_mish_grad(cached_activation_input(
+            activation,
+            activation_input,
+            layer_name,
+        )?)),
+        // relie / revleaky are leaky-shaped: the output has the sign of the input.
+        Activation::Relie => Ok(if output_value > 0.0 { 1.0 } else { 0.01 }),
+        Activation::Revleaky => Ok(if output_value > 0.0 { 1.0 } else { 0.1 }),
         Activation::Other(name) => Err(Error::UnsupportedLayer {
             layer_index: 0,
             name: format!("{layer_name}_{name}_backward"),
         }),
     }
+}
+
+fn cached_activation_input(
+    activation: &Activation,
+    activation_input: Option<f32>,
+    layer_name: &str,
+) -> Result<f32> {
+    activation_input.ok_or_else(|| {
+        Error::InvalidConfig(format!(
+            "{layer_name} backward requires cached activation_input for {activation:?}"
+        ))
+    })
 }
 
 fn accumulate_previous_gradient(
@@ -10617,6 +10671,22 @@ fn activate(activation: Activation, value: f32) -> f32 {
         Activation::Tanh => value.tanh(),
         Activation::Relu6 => value.clamp(0.0, 6.0),
         Activation::Ramp => value * (value > 0.0) as i32 as f32 + 0.1 * value,
+        Activation::Gelu => crate::activation_math::gelu(value),
+        Activation::Elu => crate::activation_math::elu(value),
+        Activation::Selu => crate::activation_math::selu(value),
+        Activation::Relie => crate::activation_math::relie(value),
+        Activation::Plse => crate::activation_math::plse(value),
+        Activation::Hardtan => crate::activation_math::hardtan(value),
+        Activation::Lhtan => crate::activation_math::lhtan(value),
+        Activation::Stair => crate::activation_math::stair(value),
+        Activation::HardMish => crate::activation_math::hard_mish(value),
+        Activation::Revleaky => {
+            if value > 0.0 {
+                value
+            } else {
+                0.1 * value
+            }
+        }
         Activation::Other(_) => value,
     }
 }
@@ -16528,6 +16598,47 @@ mod tests {
             assert_eq!(spec.activation, expected);
             assert!(spec.activation.to_cuda_f32_kind().is_some());
         }
+    }
+
+    #[test]
+    fn extra_activations_parse_dispatch_and_use_the_exact_input_gradient() {
+        let all = [
+            ("gelu", Activation::Gelu),
+            ("elu", Activation::Elu),
+            ("selu", Activation::Selu),
+            ("relie", Activation::Relie),
+            ("plse", Activation::Plse),
+            ("hardtan", Activation::Hardtan),
+            ("lhtan", Activation::Lhtan),
+            ("stair", Activation::Stair),
+            ("hard_mish", Activation::HardMish),
+            ("revleaky", Activation::Revleaky),
+        ];
+        for (name, expected) in &all {
+            let network = Network::from_config(
+                ConfigFile::parse_str(
+                    "inline.cfg",
+                    &format!("[net]\nwidth=2\nheight=2\nchannels=1\n[convolutional]\nfilters=1\nsize=1\nactivation={name}\n"),
+                )
+                .expect("cfg"),
+            )
+            .expect("network");
+            let LayerKind::Convolutional(spec) = &network.layers[0].kind else {
+                panic!("expected convolution");
+            };
+            assert_eq!(&spec.activation, expected, "{name}");
+            // dispatch -> central difference of `activate` vs the runtime gradient
+            for x in [-1.7f32, -0.6, 0.4, 0.9, 2.3] {
+                let h = 1e-2;
+                let f = |v: f32| super::activate(expected.clone(), v);
+                let fd = (f(x + h) - f(x - h)) / (2.0 * h);
+                let grad = super::activation_gradient_from_output(expected, f(x), Some(x), "t")
+                    .expect("gradient");
+                assert!((fd - grad).abs() <= 3e-3 + 3e-3 * fd.abs(), "{name} x={x}: fd {fd}, grad {grad}");
+            }
+        }
+        // input-form gradients must refuse to run without the cached pre-activation
+        assert!(super::activation_gradient_from_output(&Activation::Gelu, 0.5, None, "t").is_err());
     }
 
     #[test]
