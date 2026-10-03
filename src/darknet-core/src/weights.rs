@@ -128,6 +128,14 @@ pub fn save_weights(
                 write_f32_slice(&mut file, &local.biases)?;
                 write_f32_slice(&mut file, &local.weights)?;
             }
+            // Rust-only: C++ never writes a standalone [batchnorm]; order mirrors
+            // `load_weights_into_params` and the C++ `save_batchnorm_weights` helper.
+            (LayerKind::BatchNorm(_), LayerParams::BatchNorm(bn)) => {
+                write_f32_slice(&mut file, &bn.biases)?;
+                write_f32_slice(&mut file, &bn.scales)?;
+                write_f32_slice(&mut file, &bn.rolling_mean)?;
+                write_f32_slice(&mut file, &bn.rolling_variance)?;
+            }
             (LayerKind::Gru(_), LayerParams::Gru(gru)) => {
                 for params in [
                     &gru.input_z,
@@ -302,6 +310,31 @@ mod tests {
             write_f32_slice(&mut got, &values).unwrap();
             assert_eq!(got, expected, "len {len}");
         }
+    }
+
+    #[test]
+    fn standalone_batchnorm_weights_round_trip_exact_length() {
+        let network = Network::from_config(
+            ConfigFile::parse_str("bn.cfg", "[net]\nwidth=2\nheight=2\nchannels=3\n[batchnorm]\n")
+                .expect("cfg"),
+        )
+        .expect("network");
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let LayerParams::BatchNorm(bn) = &mut executable.params[0] else {
+            panic!("expected batchnorm params");
+        };
+        bn.biases = vec![0.1, 0.2, 0.3];
+        bn.scales = vec![1.0, 2.0, 3.0];
+        bn.rolling_mean = vec![4.0, 5.0, 6.0];
+        bn.rolling_variance = vec![7.0, 8.0, 9.0];
+
+        let path = std::env::temp_dir().join("darknet-batchnorm-roundtrip.weights");
+        save_weights(&network, &executable.params, &path, 3).expect("save must not fail");
+        assert_eq!(fs::metadata(&path).unwrap().len(), 20 + 4 * 12);
+        let mut reloaded = ExecutableNetwork::new(network);
+        reloaded.load_weights_file(&path).expect("load");
+        assert_eq!(reloaded.params, executable.params);
+        let _ = fs::remove_file(path);
     }
 
     #[test]
