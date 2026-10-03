@@ -18,6 +18,8 @@ pub(crate) mod channel_shuffle;
 pub(crate) mod channel_slice;
 pub mod chart;
 pub use chart::{ChartPoint, write_training_chart};
+pub mod dense_loss;
+pub use dense_loss::{DenseTrainingLoss, compute_dense_training_loss};
 pub mod detect;
 pub(crate) mod deconvolutional;
 pub mod error;

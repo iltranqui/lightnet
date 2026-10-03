@@ -1092,11 +1092,20 @@ impl ExecutableNetwork {
                     forward_upsample(spec, current_input, layer.output_shape)?,
                     None,
                 ),
+                (LayerKind::Logistic, LayerParams::None) => {
+                    let data = current_input
+                        .data
+                        .iter()
+                        .map(|v| activate(Activation::Logistic, *v))
+                        .collect();
+                    (Tensor::from_data(current_input.shape, data)?, None)
+                }
                 (LayerKind::Yolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
                 | (LayerKind::Region(_), LayerParams::None)
                 | (LayerKind::Detection(_), LayerParams::None)
                 | (LayerKind::Cost { .. }, LayerParams::None)
+                | (LayerKind::Regression(_), LayerParams::None)
                 | (LayerKind::Contrastive { .. }, LayerParams::None) => {
                     (current_input.clone(), None)
                 }
@@ -1822,6 +1831,8 @@ impl ExecutableNetwork {
                 | (LayerKind::Region(_), LayerParams::None)
                 | (LayerKind::Detection(_), LayerParams::None)
                 | (LayerKind::Cost { .. }, LayerParams::None)
+                | (LayerKind::Logistic, LayerParams::None)
+                | (LayerKind::Regression(_), LayerParams::None)
                 | (LayerKind::Contrastive { .. }, LayerParams::None) => {
                     accumulate_previous_gradient(
                         layer.index,
@@ -4223,11 +4234,20 @@ where
                         launch_config,
                     )
                     .map_err(|err| backend_error("upsample", err))?,
+                (LayerKind::Logistic, LayerParams::None) => self
+                    .backend
+                    .activation_f32(
+                        current_input,
+                        darknet_cuda::F32ActivationKind::Logistic,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("logistic", err))?,
                 (LayerKind::Yolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
                 | (LayerKind::Region(_), LayerParams::None)
                 | (LayerKind::Detection(_), LayerParams::None)
                 | (LayerKind::Cost { .. }, LayerParams::None)
+                | (LayerKind::Regression(_), LayerParams::None)
                 | (LayerKind::Contrastive { .. }, LayerParams::None) => current_input.clone(),
                 (LayerKind::Dropout { probability, dropblock }, LayerParams::None) => {
                     let probability = probability.unwrap_or(0.5);
@@ -4687,6 +4707,8 @@ where
                     | LayerKind::ChannelSlice(_)
                     | LayerKind::ChannelShuffle(_)
                     | LayerKind::Softmax { .. }
+                    | LayerKind::Logistic
+                    | LayerKind::Regression(_)
                     | LayerKind::ScaleChannels(_)
                     | LayerKind::Sam(_)
                     | LayerKind::Rnn(_)
@@ -5748,6 +5770,8 @@ where
                 | (LayerKind::Region(_), Some(LayerParams::None))
                 | (LayerKind::Detection(_), Some(LayerParams::None))
                 | (LayerKind::Cost { .. }, Some(LayerParams::None))
+                | (LayerKind::Logistic, Some(LayerParams::None))
+                | (LayerKind::Regression(_), Some(LayerParams::None))
                 | (LayerKind::Sam(_), Some(LayerParams::None))
                 | (LayerKind::Contrastive { .. }, Some(LayerParams::None)) => {
                     self.accumulate_previous_gpu_gradient(
@@ -17057,8 +17081,17 @@ mod tests {
     }
 
     #[test]
-    fn deconvolutional_layer_trains_on_cpu_and_gpu_fallback_identically() {
-        let network = Network::from_config(
+    fn gpu_logistic_head_matches_cpu_forward_and_passes_the_seed_through() {
+        assert_gpu_layer_chain_matches_cpu(
+            "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=2\n\
+             [convolutional]\nfilters=3\nsize=1\nstride=1\nactivation=linear\n\
+             [logistic]\n",
+            1,
+        );
+    }
+
+    #[test]
+    fn deconvolutional_layer_trains_on_cpu_and_gpu_fallback_identically() {        let network = Network::from_config(
             ConfigFile::parse_str(
                 "inline.cfg",
                 "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=2\n\

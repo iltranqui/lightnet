@@ -308,6 +308,11 @@ pub struct DeconvolutionalSpec {
     pub activation: Activation,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegressionSpec {
+    pub scale: f32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MaxPoolSpec {
     pub size: usize,
@@ -598,7 +603,9 @@ pub enum LayerKind {
     ChannelSlice(ChannelSliceSpec),
     ChannelShuffle(ChannelShuffleSpec),
     Softmax { groups: usize },
-    Cost { kind: String },
+    Cost { kind: String, scale: f32 },
+    Logistic,
+    Regression(RegressionSpec),
     Dropout {
         probability: Option<f32>,
         /// `dropblock=1` selects DropBlock instead of element-wise dropout.
@@ -638,6 +645,8 @@ impl LayerKind {
             Self::ChannelShuffle(_) => "channel_shuffle",
             Self::Softmax { .. } => "softmax",
             Self::Cost { .. } => "cost",
+            Self::Logistic => "logistic",
+            Self::Regression(_) => "regression",
             Self::Dropout { .. } => "dropout",
             Self::ScaleChannels(_) => "scale_channels",
             Self::Sam(_) => "sam",
@@ -1507,7 +1516,12 @@ fn parse_layer_kind(
         },
         "cost" => LayerKind::Cost {
             kind: section.get_str("type", "sse"),
+            scale: section.get_f32("scale", 1.0)?,
         },
+        "logistic" => LayerKind::Logistic,
+        "regression" => LayerKind::Regression(RegressionSpec {
+            scale: section.get_f32("scale", 1.0)?,
+        }),
         "dropout" => LayerKind::Dropout {
             probability: section
                 .get("probability")
@@ -1720,6 +1734,8 @@ fn infer_output_shape(
         }
         LayerKind::Softmax { .. }
         | LayerKind::Cost { .. }
+        | LayerKind::Logistic
+        | LayerKind::Regression(_)
         | LayerKind::Dropout { .. }
         | LayerKind::Contrastive { .. } => Ok(current),
         LayerKind::ChannelSlice(spec) => {
@@ -2116,6 +2132,19 @@ mod tests {
         assert!(matches!(&net.layers[0].kind, LayerKind::Deconvolutional(s) if s.activation == super::Activation::Logistic));
         assert!(build("[net]\nwidth=3\nheight=2\nchannels=2\n[deconvolutional]\nfilters=1\npad=1\n").is_err());
         assert!(build("[net]\nwidth=3\nheight=2\nchannels=2\n[deconvolutional]\nfilters=1\npadding=1\n").is_err());
+    }
+
+    #[test]
+    fn loss_head_sections_parse_with_scale() {
+        let net = build(
+            "[net]\nwidth=1\nheight=1\nchannels=2\n[connected]\noutput=2\n\
+             [cost]\ntype=masked\nscale=0.25\n[logistic]\n[regression]\nscale=3\n",
+        )
+        .unwrap();
+        assert!(matches!(&net.layers[1].kind, LayerKind::Cost { kind, scale } if kind == "masked" && *scale == 0.25));
+        assert!(matches!(net.layers[2].kind, LayerKind::Logistic));
+        assert!(matches!(&net.layers[3].kind, LayerKind::Regression(r) if r.scale == 3.0));
+        assert_eq!(net.layers[3].output_shape, net.layers[2].output_shape);
     }
 
     fn repo_cfg(name: &str) -> PathBuf {
