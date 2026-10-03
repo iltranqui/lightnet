@@ -615,3 +615,31 @@ fn gradient_centralization_matches_reference_and_is_noop_off_warp_sizes() {
     let xt = be.upload_f32(&[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
     assert!(be.gradient_centralization_f32(&xt, &[4], 3, cfg()).is_err());
 }
+
+#[test]
+fn channel_shuffle_matches_reference_and_inverse_round_trips() {
+    let b = backend();
+    let mut rng = Rng(77);
+    for (batch, c, h, w, groups) in [(2usize, 6usize, 3usize, 5usize, 2usize), (1, 12, 2, 2, 3), (3, 8, 1, 7, 4)] {
+        let n = batch * c * h * w;
+        let x = rng.vec(n, -1.0, 1.0);
+        let shape = [batch, c, h, w];
+        let xt = b.upload_f32(&shape, &x).unwrap();
+        let shuffled = b.channel_shuffle_f32(&xt, &shape, groups, false, cfg()).unwrap();
+        // independent reference: output channel j*groups + i takes input channel i*(c/groups) + j
+        let (cols, len) = (c / groups, h * w);
+        let mut want = vec![0.0f64; n];
+        for bb in 0..batch {
+            for i in 0..groups {
+                for j in 0..cols {
+                    for s in 0..len {
+                        want[(bb * c + j * groups + i) * len + s] = x[(bb * c + i * cols + j) * len + s] as f64;
+                    }
+                }
+            }
+        }
+        assert_close("channel_shuffle", &b.download_f32(&shuffled).unwrap(), &want);
+        let back = b.channel_shuffle_f32(&shuffled, &shape, groups, true, cfg()).unwrap();
+        assert_eq!(b.download_f32(&back).unwrap(), x);
+    }
+}

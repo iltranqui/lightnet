@@ -2235,6 +2235,39 @@ impl F32TensorOpsBackend for OxideBackend {
         )
     }
 
+    fn channel_shuffle_f32(
+        &self,
+        x: &Self::Tensor,
+        shape: &[usize],
+        groups: usize,
+        inverse: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        if shape.len() != 4 || groups == 0 || shape[1] % groups != 0 || x.len() != shape.iter().product::<usize>() {
+            return Err(shape_err(
+                "channel_shuffle_f32",
+                format!("bad shape {shape:?} / groups {groups} for {} elements", x.len()),
+            ));
+        }
+        let (rows, cols) = if inverse { (shape[1] / groups, groups) } else { (groups, shape[1] / groups) };
+        let len = shape[2] * shape[3];
+        let mut out = self.alloc_uninit(x.len())?;
+        // SAFETY: one thread per output element; every source index is < x.len() by the shape check.
+        unsafe {
+            self.layers_extra.channel_permute(
+                &self.stream,
+                launch::elementwise(x.len(), config),
+                &x.buf,
+                &mut out,
+                rows,
+                cols,
+                len,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(out, shape))
+    }
+
     fn dropout_f32(
         &self,
         x: &Self::Tensor,
@@ -2243,8 +2276,7 @@ impl F32TensorOpsBackend for OxideBackend {
         seed: u64,
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
-        let x_f = self.f32v(x)?;
-        let x = &*x_f;
+        let x_f = self.f32v(x)?;        let x = &*x_f;
         let op = "dropout_f32";
         if !(0.0..1.0).contains(&probability) || x.is_empty() {
             return Err(shape_err(op, format!("probability {probability} not in [0, 1) or empty input")));

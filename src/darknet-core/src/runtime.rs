@@ -1136,6 +1136,10 @@ impl ExecutableNetwork {
                     })?;
                     (crate::channel_slice::slice_channels(source, spec.start, spec.end)?, None)
                 }
+                (LayerKind::ChannelShuffle(spec), LayerParams::None) => (
+                    crate::channel_shuffle::shuffle_channels(current_input, spec.groups, false)?,
+                    None,
+                ),
                 (LayerKind::Rnn(spec), LayerParams::Rnn(recurrent)) => {
                     let (output, cache) =
                         forward_rnn_layer(spec, recurrent, current_input, layer.output_shape)?;
@@ -1646,6 +1650,16 @@ impl ExecutableNetwork {
                     let source_grad =
                         crate::channel_slice::slice_channels_backward(&grad, source_shape, spec.start)?;
                     accumulate_tensor(&mut layer_output_gradients[source_index], &source_grad)?;
+                }
+                (LayerKind::ChannelShuffle(spec), LayerParams::None) => {
+                    let input_grad =
+                        crate::channel_shuffle::shuffle_channels(&grad, spec.groups, true)?;
+                    accumulate_previous_gradient(
+                        layer.index,
+                        &input_grad,
+                        &mut input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
                 }
                 (LayerKind::Softmax { groups }, LayerParams::None) => {
                     let output = forward.layer_outputs.get(layer.index).ok_or_else(|| {
@@ -4304,6 +4318,16 @@ where
                         )
                         .map_err(|err| backend_error("channel_slice", err))?
                 }
+                (LayerKind::ChannelShuffle(spec), LayerParams::None) => self
+                    .backend
+                    .channel_shuffle_f32(
+                        current_input,
+                        &tensor_backend_shape(layer.input_shape),
+                        spec.groups,
+                        false,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("channel_shuffle", err))?,
                 (LayerKind::Softmax { groups }, LayerParams::None) => self
                     .backend
                     .softmax_f32(
@@ -4558,6 +4582,7 @@ where
                 LayerKind::Connected(_)
                     | LayerKind::Reorg(_)
                     | LayerKind::ChannelSlice(_)
+                    | LayerKind::ChannelShuffle(_)
                     | LayerKind::Softmax { .. }
                     | LayerKind::ScaleChannels(_)
                     | LayerKind::Sam(_)
@@ -5430,6 +5455,23 @@ where
                             source_grad,
                         )?;
                     }
+                }
+                (LayerKind::ChannelShuffle(spec), Some(LayerParams::None)) => {
+                    let input_grad = self
+                        .backend
+                        .channel_shuffle_f32(
+                            &grad,
+                            &tensor_backend_shape(layer.output_shape),
+                            spec.groups,
+                            true,
+                            config,
+                        )
+                        .map_err(|err| backend_error("GPU channel_shuffle backward", err))?;
+                    self.accumulate_previous_gpu_gradient(
+                        layer.index,
+                        input_grad,
+                        &mut layer_output_gradients,
+                    )?;
                 }
                 (LayerKind::Reorg(spec), Some(LayerParams::None)) => {
                     let input_grad = self
@@ -16883,8 +16925,17 @@ mod tests {
     }
 
     #[test]
-    fn gpu_channel_slice_matches_cpu_forward_and_backward() {
+    fn gpu_channel_shuffle_matches_cpu_forward_and_backward() {
         assert_gpu_layer_chain_matches_cpu(
+            "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=2\n\
+             [convolutional]\nfilters=6\nsize=1\nstride=1\nactivation=linear\n\
+             [channel_shuffle]\ngroups=3\n",
+            1,
+        );
+    }
+
+    #[test]
+    fn gpu_channel_slice_matches_cpu_forward_and_backward() {        assert_gpu_layer_chain_matches_cpu(
             "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=2\n\
              [convolutional]\nfilters=4\nsize=1\nstride=1\nactivation=linear\n\
              [channel_slice]\nfrom=-1\nstart=1\nend=3\n",

@@ -461,6 +461,11 @@ pub struct ChannelSliceSpec {
     pub end: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChannelShuffleSpec {
+    pub groups: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScaleChannelsSpec {
     pub from: isize,
@@ -582,6 +587,7 @@ pub enum LayerKind {
     Region(RegionSpec),
     Reorg(ReorgSpec),
     ChannelSlice(ChannelSliceSpec),
+    ChannelShuffle(ChannelShuffleSpec),
     Softmax { groups: usize },
     Cost { kind: String },
     Dropout {
@@ -619,6 +625,7 @@ impl LayerKind {
             Self::Region(_) => "region",
             Self::Reorg(_) => "reorg",
             Self::ChannelSlice(_) => "channel_slice",
+            Self::ChannelShuffle(_) => "channel_shuffle",
             Self::Softmax { .. } => "softmax",
             Self::Cost { .. } => "cost",
             Self::Dropout { .. } => "dropout",
@@ -1382,6 +1389,9 @@ fn parse_layer_kind(
                 end: require_usize(section, "end")?,
             })
         }
+        "channel_shuffle" => LayerKind::ChannelShuffle(ChannelShuffleSpec {
+            groups: section.get_usize("groups", 2)?,
+        }),
         "upsample" => {
             let stride = section.get_isize("stride", 2)?;
             LayerKind::Upsample(UpsampleSpec {
@@ -1683,6 +1693,15 @@ fn infer_output_shape(
                 spec.end - spec.start,
                 source.batch,
             ))
+        }
+        LayerKind::ChannelShuffle(spec) => {
+            if spec.groups == 0 || current.channels % spec.groups != 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "channel_shuffle layer #{layer_index} requires channels={} divisible by groups={}",
+                    current.channels, spec.groups
+                )));
+            }
+            Ok(current)
         }
         LayerKind::ScaleChannels(spec) => {
             let source_index = resolve_relative_layer(layer_index, spec.from)?;
@@ -2017,6 +2036,16 @@ mod tests {
             let cfg = format!("[net]\nwidth=4\nheight=3\nchannels=2\n[convolutional]\nfilters=6\nsize=1\n[convolutional]\nfilters=5\nsize=1\n[channel_slice]\n{bad}\n");
             assert!(build(&cfg).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn channel_shuffle_requires_divisible_channels() {
+        let ok = build("[net]\nwidth=2\nheight=2\nchannels=6\n[channel_shuffle]\ngroups=3\n").unwrap();
+        assert_eq!(ok.layers[0].output_shape.channels, 6);
+        assert!(build("[net]\nwidth=2\nheight=2\nchannels=6\n[channel_shuffle]\ngroups=4\n").is_err());
+        assert!(build("[net]\nwidth=2\nheight=2\nchannels=6\n[channel_shuffle]\ngroups=0\n").is_err());
+        // C++ default groups=2
+        assert!(build("[net]\nwidth=2\nheight=2\nchannels=6\n[channel_shuffle]\n").is_ok());
     }
 
     fn repo_cfg(name: &str) -> PathBuf {

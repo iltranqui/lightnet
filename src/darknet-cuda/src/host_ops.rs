@@ -590,3 +590,41 @@ pub fn sanitize_nan_inf(x: &[f32], mode: NanInfMode) -> Vec<f32> {
         })
         .collect()
 }
+
+/// Channel permutation of `[batch][rows*cols][len]`: output channel `j*rows + i` is input
+/// channel `i*cols + j` (C++ `channel_shuffle_op`). With `rows = groups, cols = c/groups` this is
+/// `[channel_shuffle]`; swapping `rows`/`cols` gives the exact inverse (the backward pass).
+pub fn channel_permute(x: &[f32], batch: usize, rows: usize, cols: usize, len: usize) -> Vec<f32> {
+    let per = rows * cols * len;
+    assert!(per > 0 && x.len() == batch * per, "channel_permute: bad shape");
+    let mut out = vec![0.0f32; x.len()];
+    for b in 0..batch {
+        for i in 0..rows {
+            for j in 0..cols {
+                let src = b * per + (i * cols + j) * len;
+                let dst = b * per + (j * rows + i) * len;
+                out[dst..dst + len].copy_from_slice(&x[src..src + len]);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod channel_permute_tests {
+    use super::*;
+
+    #[test]
+    fn channel_permute_is_the_group_transpose_and_its_inverse() {
+        // 6 channels, groups = 2 -> rows 2, cols 3: out[j*2+i] = in[i*3+j]
+        let x: Vec<f32> = (0..6).map(|v| v as f32).collect();
+        let shuffled = channel_permute(&x, 1, 2, 3, 1);
+        assert_eq!(shuffled, vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0]);
+        assert_eq!(channel_permute(&shuffled, 1, 3, 2, 1), x);
+        // two samples, len 2: whole pixel runs move together
+        let x2: Vec<f32> = (0..24).map(|v| v as f32).collect();
+        let y2 = channel_permute(&x2, 2, 2, 3, 2);
+        assert_eq!(&y2[0..4], &[0.0, 1.0, 6.0, 7.0]); // channels 0 and 3 of sample 0
+        assert_eq!(&y2[12..16], &[12.0, 13.0, 18.0, 19.0]);
+    }
+}

@@ -568,6 +568,27 @@ pub trait F32TensorOpsBackend {
         let dx = if reverse { host_ops::reorg_to_small(&host, &d) } else { host_ops::reorg_to_big(&host, &d) };
         self.upload_f32(input_shape, &dx)
     }
+    /// `[channel_shuffle]` on NCHW `shape` (see [`host_ops::channel_permute`]): forward
+    /// (`inverse = false`) uses rows = groups, cols = c / groups; `inverse = true` is the exact
+    /// adjoint (rows = c / groups, cols = groups) used by the backward pass.
+    fn channel_shuffle_f32(
+        &self,
+        x: &Self::Tensor,
+        shape: &[usize],
+        groups: usize,
+        inverse: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert!(
+            shape.len() == 4 && groups > 0 && shape[1] % groups == 0,
+            "channel_shuffle_f32: bad shape {shape:?} or groups {groups}"
+        );
+        let (rows, cols) = if inverse { (shape[1] / groups, groups) } else { (groups, shape[1] / groups) };
+        let host = self.download_f32(x)?;
+        let out = host_ops::channel_permute(&host, shape[0], rows, cols, shape[2] * shape[3]);
+        self.upload_f32(shape, &out)
+    }
     /// Inverted dropout: element `i` is zeroed when `dropout_unit(seed, i) <
     /// probability`, otherwise scaled by `1 / (1 - probability)`.  Returns
     /// `(output, mask)` where `mask` holds the per-element multiplier.
