@@ -21,6 +21,8 @@ use darknet_core::{
 #[cfg(feature = "oxide")]
 use darknet_cuda_oxide::OxideBackend;
 
+mod colour;
+
 fn main() {
     let handle = std::thread::Builder::new()
         .name("darknet-cli".to_owned())
@@ -924,6 +926,9 @@ struct TrainOptions {
     /// Dynamic loss scaling on the oxide training path: halve on non-finite
     /// gradients (skipping the step) and double after a long finite streak.
     dynamic_loss_scale: bool,
+    /// ANSI colour output: `Some(true)` = `-colour`, `Some(false)` = `-nocolour`,
+    /// `None` = auto (terminal + no `NO_COLOR`).
+    colour: Option<bool>,
 }
 
 impl TrainOptions {
@@ -944,12 +949,15 @@ impl TrainOptions {
             map_iou: 0.5,
             save_every: 1000,
             dynamic_loss_scale: false,
+            colour: None,
         };
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "-clear" => options.clear = true,
                 "-dont_show" => options.dont_show = true,
+                "-colour" | "--colour" => options.colour = Some(true),
+                "-nocolour" | "--nocolour" | "--no-colour" => options.colour = Some(false),
                 "-seed" | "--seed" => {
                     let value = required_arg(args.next(), "seed value")?;
                     options.seed = value
@@ -1027,6 +1035,9 @@ fn run_detector_train(
         return Err(format!("data path does not exist: {data}").into());
     }
 
+    // Colour must be configured before the first formatted training line.
+    colour::configure(options.colour);
+
     if options.gpu && selected_backend()? != "oxide" {
         return Err("-gpus 0 requires DARKNET_BACKEND=oxide".into());
     }
@@ -1097,12 +1108,42 @@ impl TrainingProgress {
         };
 
         // Keep the field names and ordering used by Darknet's detector trainer:
-        // loss, avg loss, rate, elapsed training time, images, and ETA.
+        // loss, avg loss, rate, elapsed training time, images, and ETA.  The
+        // iteration is bright white and `loss` / `avg loss` use the C++
+        // `format_loss` colouring (see src-lib/detector.cpp:608-619).
         println!(
-            "{batch}: loss={loss:.6}, avg loss={avg_loss:.6}, rate={learning_rate:.8}, train={:.3} milliseconds, {images_seen} images, time remaining={time_remaining}",
-            iteration_duration.as_secs_f64() * 1000.0,
+            "{}",
+            format_training_progress_line(
+                batch,
+                loss,
+                avg_loss,
+                learning_rate,
+                images_seen,
+                &time_remaining,
+                iteration_duration.as_secs_f64() * 1000.0,
+            )
         );
     }
+}
+
+/// One `detector train` progress line, formatted like the C++ trainer: the
+/// iteration in bright white and `loss` / `avg loss` coloured by
+/// `Darknet::format_loss` (`src-lib/detector.cpp:608-619`).
+fn format_training_progress_line(
+    batch: usize,
+    loss: f32,
+    avg_loss: f32,
+    learning_rate: f32,
+    images_seen: u64,
+    time_remaining: &str,
+    train_milliseconds: f64,
+) -> String {
+    format!(
+        "{}: loss={}, avg loss={}, rate={learning_rate:.8}, train={train_milliseconds:.3} milliseconds, {images_seen} images, time remaining={time_remaining}",
+        colour::in_colour(colour::EColour::BrightWhite, &batch.to_string()),
+        colour::format_loss(loss as f64),
+        colour::format_loss(avg_loss as f64),
+    )
 }
 
 fn format_seconds(seconds: f64) -> String {
@@ -1254,10 +1295,10 @@ impl TrainingValidation {
         }
         let best = self.best_map.unwrap_or(0.0);
         println!(
-            "{iteration}: mAP@{:.2} = {:.4}%, best = {:.4}%",
+            "{iteration}: mAP@{:.2} = {}, best = {}",
             self.iou_threshold,
-            report.mean_average_precision * 100.0,
-            best * 100.0
+            colour::format_map_accuracy(report.mean_average_precision as f32),
+            colour::format_map_accuracy(best as f32),
         );
         writeln!(
             self.log,
@@ -2267,7 +2308,7 @@ fn print_usage() {
     println!("darknet-rs <command> [args]");
     println!("commands:");
     println!(
-        "  detector train <cfg|data> <data|cfg> [weights] [-clear] [-dont_show] [-seed <u64>] [-gpus 0] [-map]"
+        "  detector train <cfg|data> <data|cfg> [weights] [-clear] [-dont_show] [-seed <u64>] [-gpus 0] [-map] [-colour|-nocolour]"
     );
     println!(
         "    -map validates all valid= images; -map_every <N> overrides max(100, epoch) cadence"
@@ -2417,6 +2458,7 @@ mod tests {
                 map_iou: 0.5,
                 save_every: 1000,
                 dynamic_loss_scale: false,
+                colour: None,
             }
         );
         assert_eq!(options(&[]).unwrap().seed, 0);
@@ -2542,5 +2584,51 @@ mod tests {
             err.to_string()
                 .contains("expects one .cfg path and one .data path")
         );
+    }
+
+    #[test]
+    fn colour_flags_parse() {
+        assert_eq!(options(&["-colour"]).unwrap().colour, Some(true));
+        assert_eq!(options(&["--colour"]).unwrap().colour, Some(true));
+        assert_eq!(options(&["-nocolour"]).unwrap().colour, Some(false));
+        assert_eq!(options(&["--no-colour"]).unwrap().colour, Some(false));
+        // Auto-detect by default (terminal + no NO_COLOR).
+        assert_eq!(options(&[]).unwrap().colour, None);
+    }
+
+    #[test]
+    fn training_line_without_colour_is_plain() {
+        use super::{colour, format_training_progress_line};
+        let _guard = colour::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        colour::configure(Some(false));
+        let line = format_training_progress_line(
+            7,
+            0.4444,
+            0.329,
+            0.000026,
+            383296,
+            "7 seconds",
+            64.424,
+        );
+        assert!(!line.contains('\x1b'), "plain line had escapes: {line:?}");
+        assert_eq!(
+            line,
+            "7: loss=0.444, avg loss=0.329, rate=0.00002600, train=64.424 milliseconds, 383296 images, time remaining=7 seconds"
+        );
+    }
+
+    #[test]
+    fn training_line_colours_iteration_and_loss() {
+        use super::{colour, format_training_progress_line};
+        let _guard = colour::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        colour::configure(Some(true));
+        let line = format_training_progress_line(7, 0.5, 25.0, 0.001, 10, "1 second", 1.0);
+        // Iteration bright white, loss 0.5 bright cyan, avg loss 25.0 red.
+        assert!(line.starts_with("\x1b[1;37m7\x1b[0m: "), "{line:?}");
+        assert!(
+            line.contains("loss=\x1b[1;36m0.500\x1b[0m, avg loss=\x1b[0;31m25.000\x1b[0m"),
+            "{line:?}"
+        );
+        colour::configure(Some(false));
     }
 }
