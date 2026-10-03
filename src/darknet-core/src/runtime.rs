@@ -1128,6 +1128,14 @@ impl ExecutableNetwork {
                     forward_reorg(spec.stride, spec.reverse, current_input, layer.output_shape)?,
                     None,
                 ),
+                (LayerKind::ChannelSlice(spec), LayerParams::None) => {
+                    let source_index = resolve_relative_layer(layer.index, spec.from)?;
+                    let source = layer_outputs.get(source_index).ok_or(Error::InvalidRoute {
+                        layer_index: layer.index,
+                        reference: spec.from,
+                    })?;
+                    (crate::channel_slice::slice_channels(source, spec.start, spec.end)?, None)
+                }
                 (LayerKind::Rnn(spec), LayerParams::Rnn(recurrent)) => {
                     let (output, cache) =
                         forward_rnn_layer(spec, recurrent, current_input, layer.output_shape)?;
@@ -1626,6 +1634,18 @@ impl ExecutableNetwork {
                         &mut input_gradient,
                         &mut layer_output_gradients,
                     )?;
+                }
+                (LayerKind::ChannelSlice(spec), LayerParams::None) => {
+                    let source_index = resolve_relative_layer(layer.index, spec.from)?;
+                    let source_shape = self
+                        .network
+                        .layers
+                        .get(source_index)
+                        .ok_or(Error::InvalidRoute { layer_index: layer.index, reference: spec.from })?
+                        .output_shape;
+                    let source_grad =
+                        crate::channel_slice::slice_channels_backward(&grad, source_shape, spec.start)?;
+                    accumulate_tensor(&mut layer_output_gradients[source_index], &source_grad)?;
                 }
                 (LayerKind::Softmax { groups }, LayerParams::None) => {
                     let output = forward.layer_outputs.get(layer.index).ok_or_else(|| {
@@ -4265,6 +4285,25 @@ where
                         )
                         .map_err(|err| backend_error("reorg", err))?
                 }
+                (LayerKind::ChannelSlice(spec), LayerParams::None) => {
+                    let source_index = resolve_relative_layer(layer.index, spec.from)?;
+                    let source = gpu_layer_outputs.get(source_index).ok_or(Error::InvalidRoute {
+                        layer_index: layer.index,
+                        reference: spec.from,
+                    })?;
+                    let source_channels = self.network.layers[source_index].output_shape.channels;
+                    self.backend
+                        .route_concat_f32(
+                            &[source],
+                            &[spec.start],
+                            &[spec.end - spec.start],
+                            &[source_channels],
+                            &tensor_backend_shape(layer.output_shape),
+                            layer.output_shape.width * layer.output_shape.height,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("channel_slice", err))?
+                }
                 (LayerKind::Softmax { groups }, LayerParams::None) => self
                     .backend
                     .softmax_f32(
@@ -4518,6 +4557,7 @@ where
                 layer.kind,
                 LayerKind::Connected(_)
                     | LayerKind::Reorg(_)
+                    | LayerKind::ChannelSlice(_)
                     | LayerKind::Softmax { .. }
                     | LayerKind::ScaleChannels(_)
                     | LayerKind::Sam(_)
@@ -5368,6 +5408,28 @@ where
                         input_grad,
                         &mut layer_output_gradients,
                     )?;
+                }
+                (LayerKind::ChannelSlice(spec), Some(LayerParams::None)) => {
+                    let source_index = resolve_relative_layer(layer.index, spec.from)?;
+                    let source_layer = &self.network.layers[source_index];
+                    let grads = self
+                        .backend
+                        .route_backward_f32(
+                            &grad,
+                            &[tensor_backend_shape(source_layer.output_shape).to_vec()],
+                            &[spec.start],
+                            &[spec.end - spec.start],
+                            &[source_layer.output_shape.channels],
+                            layer.output_shape.width * layer.output_shape.height,
+                            config,
+                        )
+                        .map_err(|err| backend_error("GPU channel_slice backward", err))?;
+                    for source_grad in grads {
+                        self.accumulate_gpu_gradient(
+                            &mut layer_output_gradients[source_index],
+                            source_grad,
+                        )?;
+                    }
                 }
                 (LayerKind::Reorg(spec), Some(LayerParams::None)) => {
                     let input_grad = self
@@ -7352,7 +7414,7 @@ fn tensor_backend_shape(shape: TensorShape) -> [usize; 4] {
 }
 
 fn layer_uses_previous_input(kind: &LayerKind) -> bool {
-    !matches!(kind, LayerKind::Route(_))
+    !matches!(kind, LayerKind::Route(_) | LayerKind::ChannelSlice(_))
 }
 
 fn gpu_layer_output_use_counts(network: &Network) -> Result<Vec<usize>> {
@@ -7374,6 +7436,10 @@ fn gpu_layer_output_use_counts(network: &Network) -> Result<Vec<usize>> {
                     let source_index = resolve_relative_layer(layer.index, *raw_index)?;
                     use_counts[source_index] += 1;
                 }
+            }
+            LayerKind::ChannelSlice(spec) => {
+                let source_index = resolve_relative_layer(layer.index, spec.from)?;
+                use_counts[source_index] += 1;
             }
             _ => {}
         }
@@ -7426,6 +7492,10 @@ fn release_gpu_sources_for_layer<T: Clone>(
                 let source_index = resolve_relative_layer(layer_index, *raw_index)?;
                 release_gpu_source(source_index, remaining_uses, gpu_layer_outputs)?;
             }
+        }
+        LayerKind::ChannelSlice(spec) => {
+            let source_index = resolve_relative_layer(layer_index, spec.from)?;
+            release_gpu_source(source_index, remaining_uses, gpu_layer_outputs)?;
         }
         _ => {}
     }
@@ -16813,6 +16883,23 @@ mod tests {
     }
 
     #[test]
+    fn gpu_channel_slice_matches_cpu_forward_and_backward() {
+        assert_gpu_layer_chain_matches_cpu(
+            "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=2\n\
+             [convolutional]\nfilters=4\nsize=1\nstride=1\nactivation=linear\n\
+             [channel_slice]\nfrom=-1\nstart=1\nend=3\n",
+            1,
+        );
+        assert_gpu_layer_chain_matches_cpu(
+            "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=2\n\
+             [convolutional]\nfilters=4\nsize=1\nstride=1\nactivation=linear\n\
+             [maxpool]\nsize=2\nstride=2\n\
+             [channel_slice]\nfrom=-2\nstart=0\nend=2\n",
+            2,
+        );
+    }
+
+    #[test]
     fn gpu_gelu_convolution_matches_cpu_forward_and_backward() {
         assert_gpu_layer_chain_matches_cpu(
             "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=2\n\
@@ -16823,8 +16910,7 @@ mod tests {
     }
 
     #[test]
-    fn weighted_shortcut_layer_backward_matches_finite_differences_on_its_weights() {
-        let network = Network::from_config(
+    fn weighted_shortcut_layer_backward_matches_finite_differences_on_its_weights() {        let network = Network::from_config(
             ConfigFile::parse_str(
                 "inline.cfg",
                 "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=2\n\

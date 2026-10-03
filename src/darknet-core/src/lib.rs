@@ -14,6 +14,7 @@ pub(crate) mod activation_math;
 pub mod augmentation;
 pub use augmentation::DetectorAugmentation;
 pub mod cfg;
+pub(crate) mod channel_slice;
 pub mod chart;
 pub use chart::{ChartPoint, write_training_chart};
 pub mod detect;

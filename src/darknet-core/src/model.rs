@@ -452,6 +452,15 @@ pub struct ReorgSpec {
     pub reverse: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChannelSliceSpec {
+    /// Layer whose output is sliced (relative negative or absolute, like route).
+    pub from: isize,
+    pub start: usize,
+    /// Exclusive.
+    pub end: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScaleChannelsSpec {
     pub from: isize,
@@ -572,6 +581,7 @@ pub enum LayerKind {
     GaussianYolo(YoloSpec),
     Region(RegionSpec),
     Reorg(ReorgSpec),
+    ChannelSlice(ChannelSliceSpec),
     Softmax { groups: usize },
     Cost { kind: String },
     Dropout {
@@ -608,6 +618,7 @@ impl LayerKind {
             Self::GaussianYolo(_) => "gaussian_yolo",
             Self::Region(_) => "region",
             Self::Reorg(_) => "reorg",
+            Self::ChannelSlice(_) => "channel_slice",
             Self::Softmax { .. } => "softmax",
             Self::Cost { .. } => "cost",
             Self::Dropout { .. } => "dropout",
@@ -1349,6 +1360,28 @@ fn parse_layer_kind(
                 &section.get_str("weights_normalization", "none"),
             )?,
         }),
+        "channel_slice" => {
+            let from = section
+                .get("from")
+                .and_then(|value| value.trim().parse::<isize>().ok())
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "[channel_slice] at line {} requires an integer from=",
+                        section.line
+                    ))
+                })?;
+            if section.get_usize("axis", 1)? != 1 {
+                return Err(Error::InvalidConfig(format!(
+                    "[channel_slice] at line {}: only axis=1 is supported",
+                    section.line
+                )));
+            }
+            LayerKind::ChannelSlice(ChannelSliceSpec {
+                from,
+                start: require_usize(section, "start")?,
+                end: require_usize(section, "end")?,
+            })
+        }
         "upsample" => {
             let stride = section.get_isize("stride", 2)?;
             LayerKind::Upsample(UpsampleSpec {
@@ -1629,6 +1662,28 @@ fn infer_output_shape(
         | LayerKind::Cost { .. }
         | LayerKind::Dropout { .. }
         | LayerKind::Contrastive { .. } => Ok(current),
+        LayerKind::ChannelSlice(spec) => {
+            let source_index = resolve_relative_layer(layer_index, spec.from)?;
+            let source = built_layers
+                .get(source_index)
+                .ok_or(Error::InvalidRoute {
+                    layer_index,
+                    reference: spec.from,
+                })?
+                .output_shape;
+            if spec.end <= spec.start || spec.end > source.channels {
+                return Err(Error::InvalidConfig(format!(
+                    "channel_slice layer #{layer_index}: range [{}, {}) is invalid for {} channels",
+                    spec.start, spec.end, source.channels
+                )));
+            }
+            Ok(TensorShape::new(
+                source.width,
+                source.height,
+                spec.end - spec.start,
+                source.batch,
+            ))
+        }
         LayerKind::ScaleChannels(spec) => {
             let source_index = resolve_relative_layer(layer_index, spec.from)?;
             let source = built_layers
@@ -1746,8 +1801,23 @@ fn infer_route_shape(
     ))
 }
 
-fn resolve_relative_layer(layer_index: usize, raw_index: isize) -> Result<usize> {
-    let absolute = if raw_index < 0 {
+fn require_usize(section: &RawSection, key: &str) -> Result<usize> {
+    section
+        .get(key)
+        .ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "[{}] at line {} requires {key}=",
+                section.name, section.line
+            ))
+        })?
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| {
+            Error::InvalidConfig(format!("[{}] at line {}: invalid {key}", section.name, section.line))
+        })
+}
+
+fn resolve_relative_layer(layer_index: usize, raw_index: isize) -> Result<usize> {    let absolute = if raw_index < 0 {
         layer_index
             .checked_add_signed(raw_index)
             .ok_or(Error::InvalidRoute {
@@ -1921,6 +1991,32 @@ mod tests {
         assert!(mk("").unwrap().layers[2].weights().is_none());
         assert!(mk("weights_type=banana").is_err());
         assert!(mk("weights_normalization=banana").is_err());
+    }
+
+    #[test]
+    fn channel_slice_shape_comes_from_source_layer_and_feeds_route() {
+        let net = build(
+            "[net]\nwidth=4\nheight=3\nchannels=2\nbatch=2\n\
+             [convolutional]\nfilters=6\nsize=1\n\
+             [convolutional]\nfilters=5\nsize=1\n\
+             [channel_slice]\nfrom=-2\nstart=1\nend=4\n\
+             [route]\nlayers=-1,-2\n",
+        )
+        .unwrap();
+        let s = net.layers[2].output_shape; // 3 channels of layer 0 (6 ch), not of the previous layer (5 ch)
+        assert_eq!((s.width, s.height, s.channels, s.batch), (4, 3, 3, 2));
+        assert_eq!(net.layers[3].output_shape.channels, 3 + 5);
+        for bad in [
+            "from=-2\nstart=2\nend=2",         // C++ default start=end=2: empty slice
+            "from=-2\nstart=0\nend=7",         // beyond the source channels
+            "from=-2\nstart=1",                // end missing
+            "start=1\nend=2",                  // from missing
+            "from=-2\nstart=0\nend=2\naxis=0", // only axis 1
+            "from=5\nstart=0\nend=1",          // not a previous layer
+        ] {
+            let cfg = format!("[net]\nwidth=4\nheight=3\nchannels=2\n[convolutional]\nfilters=6\nsize=1\n[convolutional]\nfilters=5\nsize=1\n[channel_slice]\n{bad}\n");
+            assert!(build(&cfg).is_err(), "{bad}");
+        }
     }
 
     fn repo_cfg(name: &str) -> PathBuf {
