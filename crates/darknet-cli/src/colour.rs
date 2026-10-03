@@ -140,6 +140,52 @@ pub fn format_map_accuracy(accuracy: f32) -> String {
     )
 }
 
+/// Right-aligned integer in a fixed colour (`format_in_colour(int, colour, len)`).
+pub fn format_int(value: usize, colour: EColour, len: usize) -> String {
+    let text = value.to_string();
+    format!(
+        "{}{}",
+        " ".repeat(len.saturating_sub(text.len())),
+        in_colour(colour, &text)
+    )
+}
+
+/// `format_in_colour(float, len)`: 4 decimals, right-aligned, coloured by value
+/// (values > 1 are taken as percentages), as in the C++ mAP table.
+pub fn format_ratio(value: f32, len: usize) -> String {
+    let scale = if value > 1.0 { value / 100.0 } else { value };
+    let colour = if scale > 1.0 {
+        EColour::Normal
+    } else if scale >= 0.85 {
+        EColour::BrightGreen
+    } else if scale >= 0.70 {
+        EColour::BrightCyan
+    } else if scale >= 0.55 {
+        EColour::BrightBlue
+    } else if scale >= 0.40 {
+        EColour::BrightMagenta
+    } else {
+        EColour::BrightRed
+    };
+    let shown = if value.is_normal() { value } else { 0.0 };
+    let text = format!("{shown:.4}");
+    format!(
+        "{}{}",
+        " ".repeat(len.saturating_sub(text.len())),
+        in_colour(colour, &text)
+    )
+}
+
+/// Left-aligned, truncated name (`format_in_colour(string, colour, len)`).
+pub fn format_name(name: &str, colour: EColour, len: usize) -> String {
+    let mut text: String = name.to_owned();
+    if text.chars().count() > len {
+        text = text.chars().take(len - 1).collect::<String>() + "+";
+    }
+    let pad = " ".repeat(len.saturating_sub(text.chars().count()));
+    format!("{}{pad}", in_colour(colour, &text))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

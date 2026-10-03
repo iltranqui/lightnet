@@ -18,7 +18,7 @@ pub use chart::{ChartPoint, write_training_chart};
 pub mod detect;
 pub mod error;
 pub mod evaluate;
-pub use evaluate::{MapReport, ValidationDataset, detector_map};
+pub use evaluate::{MapReport, REPORT_CONFIDENCE, ValidationDataset, detector_map};
 pub mod image;
 pub mod initialize;
 pub mod loader_profile;

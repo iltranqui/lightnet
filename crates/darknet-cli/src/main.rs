@@ -1092,6 +1092,7 @@ impl TrainingProgress {
         images_seen: u64,
         max_batches: usize,
         iteration_duration: Duration,
+        map_fields: &str,
     ) {
         let avg_loss = self
             .avg_loss
@@ -1121,6 +1122,7 @@ impl TrainingProgress {
                 images_seen,
                 &time_remaining,
                 iteration_duration.as_secs_f64() * 1000.0,
+                map_fields,
             )
         );
     }
@@ -1137,9 +1139,10 @@ fn format_training_progress_line(
     images_seen: u64,
     time_remaining: &str,
     train_milliseconds: f64,
+    map_fields: &str,
 ) -> String {
     format!(
-        "{}: loss={}, avg loss={}, rate={learning_rate:.8}, train={train_milliseconds:.3} milliseconds, {images_seen} images, time remaining={time_remaining}",
+        "{}: loss={}, avg loss={}{map_fields}, rate={learning_rate:.8}, train={train_milliseconds:.3} milliseconds, {images_seen} images, time remaining={time_remaining}",
         colour::in_colour(colour::EColour::BrightWhite, &batch.to_string()),
         colour::format_loss(loss as f64),
         colour::format_loss(avg_loss as f64),
@@ -1211,6 +1214,7 @@ struct TrainingValidation {
     detection_options: DetectionOptions,
     iou_threshold: f32,
     best_map: Option<f64>,
+    last_map: Option<f64>,
     log: fs::File,
 }
 impl TrainingValidation {
@@ -1268,6 +1272,7 @@ impl TrainingValidation {
             },
             iou_threshold: options.map_iou,
             best_map: None,
+            last_map: None,
             log,
         }))
     }
@@ -1278,28 +1283,27 @@ impl TrainingValidation {
         iteration: usize,
         seen: u64,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        for (class, ap) in report.average_precision.iter().enumerate() {
-            println!(
-                "AP {} = {:.4}% (truth={}, detections={})",
-                self.names[class],
-                ap * 100.0,
-                report.ground_truth_counts[class],
-                report.detection_counts[class]
-            );
-        }
         let improved = self
             .best_map
             .is_none_or(|best| report.mean_average_precision >= best);
         if improved {
             self.best_map = Some(report.mean_average_precision);
         }
+        self.last_map = Some(report.mean_average_precision);
         let best = self.best_map.unwrap_or(0.0);
+        print!(
+            "{}",
+            format_map_report(report, &self.names, self.iou_threshold)
+        );
         println!(
             "{iteration}: mAP@{:.2} = {}, best = {}",
             self.iou_threshold,
             colour::format_map_accuracy(report.mean_average_precision as f32),
             colour::format_map_accuracy(best as f32),
         );
+        if improved {
+            println!("New best mAP, saving weights!");
+        }
         writeln!(
             self.log,
             "{iteration},{seen},{},{},{:.8},{:.8}",
@@ -1312,6 +1316,107 @@ impl TrainingValidation {
         self.schedule.last_iteration = iteration;
         Ok(improved)
     }
+}
+
+/// The `last=..., best=..., mAP=...` fields of the C++ training line.
+fn map_progress_fields(validation: Option<&TrainingValidation>) -> String {
+    let none = || colour::format_map_accuracy(-1.0);
+    match validation {
+        None => format!(", last={}, best={}, mAP=disabled", none(), none()),
+        Some(v) => {
+            let shown =
+                |m: Option<f64>| m.map_or_else(none, |m| colour::format_map_accuracy(m as f32));
+            let next = v
+                .schedule
+                .burn_in
+                .max(v.schedule.last_iteration + v.schedule.interval);
+            format!(
+                ", last={}, best={}, mAP={next}",
+                shown(v.last_map),
+                shown(v.best_map)
+            )
+        }
+    }
+}
+
+/// C++ `ostream` default float formatting (`%g`, 6 significant digits).
+fn general(value: f64) -> String {
+    if value == 0.0 || !value.is_finite() {
+        return if value == 0.0 {
+            "0".into()
+        } else {
+            value.to_string()
+        };
+    }
+    let decimals = (5 - value.abs().log10().floor() as i32).max(0) as usize;
+    let text = format!("{value:.decimals$}");
+    if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.').to_owned()
+    } else {
+        text
+    }
+}
+
+/// Per-class table and summary lines of `validate_detector_map` (C++
+/// `format_map_ap_row_values` and the `-> ...` summary).
+fn format_map_report(report: &darknet_core::MapReport, names: &[String], iou: f32) -> String {
+    use colour::EColour;
+    let conf = darknet_core::REPORT_CONFIDENCE;
+    let mut out = String::from(
+        "\n\n AP=average precision, TP=true positive, TN=true negative,\n \
+         FP=false positive, FN=false negative, GT=ground truth count\n\n  \
+         Id Name                       AP      TP      FP      FN      GT       F1   AvgIoU\n  \
+         -- -------------------- -------- ------- ------- ------- ------- -------- --------\n",
+    );
+    let (mut tp, mut fp, mut gt, mut iou_sum) = (0usize, 0usize, 0usize, 0.0f64);
+    for class in 0..report.average_precision.len() {
+        out += &format!(
+            "  {} {} {} {} {} {} {} {} {}\n",
+            colour::format_int(class, EColour::Normal, 2),
+            colour::format_name(
+                names.get(class).map_or("", String::as_str),
+                EColour::BrightWhite,
+                20
+            ),
+            colour::format_ratio(100.0 * report.average_precision[class] as f32, 8),
+            colour::format_int(report.true_positives[class], EColour::Normal, 7),
+            colour::format_int(report.false_positives[class], EColour::Normal, 7),
+            colour::format_int(report.false_negatives[class], EColour::Normal, 7),
+            colour::format_int(report.ground_truth_counts[class], EColour::Normal, 7),
+            colour::format_ratio(100.0 * report.f1(class) as f32, 8),
+            colour::format_ratio(100.0 * report.average_iou[class] as f32, 8),
+        );
+        tp += report.true_positives[class];
+        fp += report.false_positives[class];
+        gt += report.ground_truth_counts[class];
+        iou_sum += report.average_iou[class] * report.true_positives[class] as f64;
+    }
+    let precision = if tp + fp > 0 {
+        tp as f64 / (tp + fp) as f64
+    } else {
+        0.0
+    };
+    let recall = if gt > 0 { tp as f64 / gt as f64 } else { 0.0 };
+    let f1 = if precision + recall > 0.0 {
+        2.0 * precision * recall / (precision + recall)
+    } else {
+        0.0
+    };
+    let avg_iou = if tp > 0 { iou_sum / tp as f64 } else { 0.0 };
+    out += &format!(
+        "\n-> for conf_thresh={conf}, precision={}, recall={}, F1 score={}\n\
+         -> for conf_thresh={conf}, TP={tp}, FP={fp}, FN={}, average IoU={}%\n\
+         -> IoU threshold={}%, used area-under-curve for each unique recall\n\
+         -> mean average precision (mAP@{iou:.2})={}\n",
+        general(precision),
+        general(recall),
+        general(f1),
+        gt.saturating_sub(tp),
+        general(avg_iou * 100.0),
+        general(iou as f64 * 100.0),
+        colour::format_map_accuracy(report.mean_average_precision as f32),
+    );
+    out
 }
 
 /// Appends `<name>_loss.csv` and keeps the points needed for `chart.png`.
@@ -1726,6 +1831,7 @@ fn run_detector_train_cpu(
             seen,
             executable.network.net.max_batches,
             iteration_start.elapsed(),
+            &map_progress_fields(validation.as_ref()),
         );
         loss_log.record(
             batch_num,
@@ -2128,6 +2234,7 @@ fn run_detector_train_gpu(
             seen,
             executable.network.net.max_batches,
             iteration_start.elapsed(),
+            &map_progress_fields(validation.as_ref()),
         );
         loss_log.record(
             batch_num,
@@ -2597,6 +2704,40 @@ mod tests {
     }
 
     #[test]
+    fn map_report_block_matches_cpp_layout() {
+        use super::{colour, format_map_report, map_progress_fields};
+        let _guard = colour::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        colour::configure(Some(false));
+        let report = darknet_core::MapReport {
+            average_precision: vec![1.0, 0.5],
+            ground_truth_counts: vec![4, 2],
+            detection_counts: vec![4, 3],
+            mean_average_precision: 0.75,
+            true_positives: vec![4, 1],
+            false_positives: vec![0, 1],
+            false_negatives: vec![0, 1],
+            average_iou: vec![0.9, 0.8],
+        };
+        let text = format_map_report(&report, &["gear".to_owned(), "pin".to_owned()], 0.5);
+        assert!(text.contains(
+            "  Id Name                       AP      TP      FP      FN      GT       F1   AvgIoU"
+        ));
+        assert!(text.contains("   0 gear                 100.0000       4       0       0       4 100.0000  90.0000"), "{text}");
+        assert!(
+            text.contains("-> for conf_thresh=0.25, TP=5, FP=1, FN=1, average IoU=88%"),
+            "{text}"
+        );
+        assert!(
+            text.contains("-> IoU threshold=50%, used area-under-curve for each unique recall")
+        );
+        assert!(text.contains("-> mean average precision (mAP@0.50)=75.00%"));
+        assert_eq!(
+            map_progress_fields(None),
+            ", last=none, best=none, mAP=disabled"
+        );
+    }
+
+    #[test]
     fn training_line_without_colour_is_plain() {
         use super::{colour, format_training_progress_line};
         let _guard = colour::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2609,6 +2750,7 @@ mod tests {
             383296,
             "7 seconds",
             64.424,
+            "",
         );
         assert!(!line.contains('\x1b'), "plain line had escapes: {line:?}");
         assert_eq!(
@@ -2622,7 +2764,7 @@ mod tests {
         use super::{colour, format_training_progress_line};
         let _guard = colour::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         colour::configure(Some(true));
-        let line = format_training_progress_line(7, 0.5, 25.0, 0.001, 10, "1 second", 1.0);
+        let line = format_training_progress_line(7, 0.5, 25.0, 0.001, 10, "1 second", 1.0, "");
         // Iteration bright white, loss 0.5 bright cyan, avg loss 25.0 red.
         assert!(line.starts_with("\x1b[1;37m7\x1b[0m: "), "{line:?}");
         assert!(

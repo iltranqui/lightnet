@@ -13,6 +13,38 @@ pub struct MapReport {
     pub ground_truth_counts: Vec<usize>,
     pub detection_counts: Vec<usize>,
     pub mean_average_precision: f64,
+    /// Per-class TP/FP/FN counted only for detections with confidence >=
+    /// [`REPORT_CONFIDENCE`] (C++ `thresh_calc_avg_iou`); AP above uses all.
+    pub true_positives: Vec<usize>,
+    pub false_positives: Vec<usize>,
+    pub false_negatives: Vec<usize>,
+    /// Mean IoU of the true positives at [`REPORT_CONFIDENCE`] (0 when none).
+    pub average_iou: Vec<f64>,
+}
+
+/// Confidence at which the Darknet mAP table counts TP/FP/FN and F1.
+pub const REPORT_CONFIDENCE: f32 = 0.25;
+
+impl MapReport {
+    /// F1 of one class at [`REPORT_CONFIDENCE`], 0 when undefined.
+    pub fn f1(&self, class: usize) -> f64 {
+        let (tp, fp) = (self.true_positives[class], self.false_positives[class]);
+        let precision = if tp + fp > 0 {
+            tp as f64 / (tp + fp) as f64
+        } else {
+            0.0
+        };
+        let recall = if self.ground_truth_counts[class] > 0 {
+            tp as f64 / self.ground_truth_counts[class] as f64
+        } else {
+            0.0
+        };
+        if precision + recall > 0.0 {
+            2.0 * precision * recall / (precision + recall)
+        } else {
+            0.0
+        }
+    }
 }
 
 /// Preflight validation paths and labels before training begins.
@@ -155,12 +187,17 @@ pub fn detector_map(
         ground_truth_counts: counts,
         detection_counts: predictions.iter().map(Vec::len).collect(),
         mean_average_precision: 0.0,
+        true_positives: vec![0; classes],
+        false_positives: vec![0; classes],
+        false_negatives: vec![0; classes],
+        average_iou: vec![0.0; classes],
     };
     for (class, ranked) in predictions.iter_mut().enumerate() {
         ranked.sort_by(|a, b| b.1.confidence.total_cmp(&a.1.confidence));
         let mut used: Vec<Vec<bool>> = samples.iter().map(|s| vec![false; s.0.len()]).collect();
         let mut points = Vec::with_capacity(ranked.len());
         let (mut tp, mut fp) = (0usize, 0usize);
+        let (mut report_tp, mut report_fp, mut iou_sum) = (0usize, 0usize, 0.0f64);
         for (image, detection) in ranked {
             let mut best = None;
             let mut best_iou = iou_threshold;
@@ -182,11 +219,17 @@ pub fn detector_map(
                     best_iou = overlap;
                 }
             }
+            let counted = detection.confidence >= REPORT_CONFIDENCE;
             if let Some(index) = best.filter(|i| !used[*image][*i]) {
                 used[*image][index] = true;
                 tp += 1;
+                if counted {
+                    report_tp += 1;
+                    iou_sum += best_iou as f64;
+                }
             } else {
                 fp += 1;
+                report_fp += counted as usize;
             }
             let recall = tp as f64 / report.ground_truth_counts[class].max(1) as f64;
             points.push((recall, tp as f64 / (tp + fp) as f64));
@@ -199,6 +242,14 @@ pub fn detector_map(
             area += (points[index].0 - prev_recall) * envelope;
         }
         report.average_precision[class] = area;
+        report.true_positives[class] = report_tp;
+        report.false_positives[class] = report_fp;
+        report.false_negatives[class] = report.ground_truth_counts[class].saturating_sub(report_tp);
+        report.average_iou[class] = if report_tp > 0 {
+            iou_sum / report_tp as f64
+        } else {
+            0.0
+        };
     }
     report.mean_average_precision = report.average_precision.iter().sum::<f64>() / classes as f64;
     Ok(report)
@@ -258,6 +309,12 @@ mod tests {
         assert_eq!(r.average_precision, vec![0.5, 0.0]);
         assert_eq!(r.mean_average_precision, 0.25);
         assert_eq!(r.ground_truth_counts, vec![2, 0]);
+        // At conf >= 0.25: class 0 has 2 TP (the 0.8 and 0.6 hits), FP = the
+        // 0.9 miss + the 0.7 duplicate; class 1 has one FP and no truth.
+        assert_eq!(r.true_positives, vec![2, 0]);
+        assert_eq!(r.false_positives, vec![2, 1]);
+        assert_eq!(r.false_negatives, vec![0, 0]);
+        assert!((r.f1(0) - 2.0 / 3.0).abs() < 1e-12);
         assert_eq!(r.detection_counts, vec![4, 1]);
     }
     #[test]
