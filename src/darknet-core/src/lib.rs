@@ -19,6 +19,7 @@ pub(crate) mod channel_slice;
 pub mod chart;
 pub use chart::{ChartPoint, write_training_chart};
 pub mod detect;
+pub(crate) mod deconvolutional;
 pub mod error;
 pub mod evaluate;
 pub use evaluate::{MapReport, REPORT_CONFIDENCE, ValidationDataset, detector_map};

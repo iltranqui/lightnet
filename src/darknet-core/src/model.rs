@@ -300,6 +300,14 @@ pub struct ConnectedSpec {
     pub activation: Activation,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeconvolutionalSpec {
+    pub filters: usize,
+    pub size: usize,
+    pub stride: usize,
+    pub activation: Activation,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MaxPoolSpec {
     pub size: usize,
@@ -575,6 +583,7 @@ pub struct RegionSpec {
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayerKind {
     Convolutional(ConvolutionalSpec),
+    Deconvolutional(DeconvolutionalSpec),
     Connected(ConnectedSpec),
     MaxPool(MaxPoolSpec),
     LocalAvgPool(MaxPoolSpec),
@@ -613,6 +622,7 @@ impl LayerKind {
     pub fn name(&self) -> &str {
         match self {
             Self::Convolutional(_) => "convolutional",
+            Self::Deconvolutional(_) => "deconvolutional",
             Self::Connected(_) => "connected",
             Self::MaxPool(_) => "maxpool",
             Self::LocalAvgPool(_) => "local_avgpool",
@@ -648,6 +658,7 @@ impl LayerKind {
     pub fn activation(&self) -> Option<&Activation> {
         match self {
             Self::Convolutional(spec) => Some(&spec.activation),
+            Self::Deconvolutional(spec) => Some(&spec.activation),
             Self::Connected(spec) => Some(&spec.activation),
             Self::Shortcut(spec) => Some(&spec.activation),
             Self::ScaleChannels(spec) => Some(&spec.activation),
@@ -860,6 +871,18 @@ impl Layer {
                     }],
                 })
             }
+            LayerKind::Deconvolutional(spec) => Some(LayerWeights {
+                entries: vec![
+                    WeightsEntry {
+                        array: WeightsArray::Biases,
+                        len: spec.filters,
+                    },
+                    WeightsEntry {
+                        array: WeightsArray::Weights,
+                        len: self.input_shape.channels * spec.filters * spec.size * spec.size,
+                    },
+                ],
+            }),
             LayerKind::BatchNorm(_) => Some(LayerWeights {
                 entries: vec![
                     WeightsEntry {
@@ -1280,6 +1303,20 @@ fn parse_layer_kind(
             batch_normalize: section.get_i64("batch_normalize", 0)? != 0,
             activation: Activation::parse(&section.get_str("activation", "logistic")),
         }),
+        "deconvolutional" => {
+            if section.get_usize("pad", 0)? != 0 || section.get_usize("padding", 0)? != 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[deconvolutional] at line {} does not support pad/padding",
+                    section.line
+                )));
+            }
+            LayerKind::Deconvolutional(DeconvolutionalSpec {
+                filters: section.get_usize("filters", 1)?,
+                size: section.get_usize("size", 1)?,
+                stride: section.get_usize("stride", 1)?,
+                activation: Activation::parse(&section.get_str("activation", "logistic")),
+            })
+        }
         "max" | "maxpool" => {
             let stride = section.get_usize("stride", 1)?;
             let size = section.get_usize("size", stride)?;
@@ -1569,6 +1606,19 @@ fn infer_output_shape(
             spec.filters,
             current.batch,
         )),
+        LayerKind::Deconvolutional(spec) => {
+            if spec.filters == 0 || spec.size == 0 || spec.stride == 0 || current.width == 0 || current.height == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "deconvolutional layer #{layer_index} needs filters/size/stride > 0 and a non-empty input"
+                )));
+            }
+            Ok(TensorShape::new(
+                spec.stride * (current.width - 1) + spec.size,
+                spec.stride * (current.height - 1) + spec.size,
+                spec.filters,
+                current.batch,
+            ))
+        }
         LayerKind::Connected(spec) => Ok(TensorShape::new(1, 1, spec.output, current.batch)),
         LayerKind::Gru(spec) => Ok(TensorShape::new(1, 1, spec.output, current.batch)),
         LayerKind::Crop(spec) => Ok(TensorShape::new(
@@ -2046,6 +2096,26 @@ mod tests {
         assert!(build("[net]\nwidth=2\nheight=2\nchannels=6\n[channel_shuffle]\ngroups=0\n").is_err());
         // C++ default groups=2
         assert!(build("[net]\nwidth=2\nheight=2\nchannels=6\n[channel_shuffle]\n").is_ok());
+    }
+
+    #[test]
+    fn deconvolutional_output_is_stride_times_h_minus_one_plus_size() {
+        let net = build(
+            "[net]\nwidth=3\nheight=2\nchannels=2\n\
+             [deconvolutional]\nfilters=4\nsize=3\nstride=2\nactivation=leaky\n",
+        )
+        .unwrap();
+        let s = net.layers[0].output_shape;
+        assert_eq!((s.width, s.height, s.channels), (2 * 2 + 3, 2 * 1 + 3, 4));
+        // weights(): biases[n] then weights[c*n*k*k] (C++ save_deconvolutional_weights order)
+        let w = net.layers[0].weights().unwrap();
+        assert_eq!(w.entries[0].len, 4);
+        assert_eq!(w.entries[1].len, 2 * 4 * 9);
+        // C++ default activation is logistic; pad/padding are rejected
+        let net = build("[net]\nwidth=3\nheight=2\nchannels=2\n[deconvolutional]\nfilters=1\n").unwrap();
+        assert!(matches!(&net.layers[0].kind, LayerKind::Deconvolutional(s) if s.activation == super::Activation::Logistic));
+        assert!(build("[net]\nwidth=3\nheight=2\nchannels=2\n[deconvolutional]\nfilters=1\npad=1\n").is_err());
+        assert!(build("[net]\nwidth=3\nheight=2\nchannels=2\n[deconvolutional]\nfilters=1\npadding=1\n").is_err());
     }
 
     fn repo_cfg(name: &str) -> PathBuf {

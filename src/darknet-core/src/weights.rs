@@ -124,6 +124,10 @@ pub fn save_weights(
             (LayerKind::Connected(_), LayerParams::Connected(connected)) => {
                 write_connected_params(&mut file, connected)?;
             }
+            (LayerKind::Deconvolutional(_), LayerParams::Convolutional(conv)) => {
+                write_f32_slice(&mut file, &conv.biases)?;
+                write_f32_slice(&mut file, &conv.weights)?;
+            }
             (LayerKind::Local(_), LayerParams::Local(local)) => {
                 write_f32_slice(&mut file, &local.biases)?;
                 write_f32_slice(&mut file, &local.weights)?;
@@ -365,6 +369,26 @@ mod tests {
         assert_eq!(reloaded.params, executable.params);
         let inspection = inspect_weights_file(&network, &path).expect("inspect");
         assert_eq!(inspection.trailing_bytes, 0);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn deconvolutional_weights_round_trip_exact_length() {
+        let network = Network::from_config(
+            ConfigFile::parse_str("d.cfg", "[net]\nwidth=2\nheight=2\nchannels=2\n[deconvolutional]\nfilters=3\nsize=2\nstride=2\nactivation=linear\n").expect("cfg"),
+        )
+        .expect("network");
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let LayerParams::Convolutional(p) = &mut executable.params[0] else { panic!("conv-shaped params") };
+        p.biases = vec![0.5, 1.5, 2.5];
+        p.weights = (0..2 * 3 * 4).map(|i| i as f32).collect();
+        let path = std::env::temp_dir().join("darknet-deconv-roundtrip.weights");
+        save_weights(&network, &executable.params, &path, 1).expect("save");
+        assert_eq!(fs::metadata(&path).unwrap().len(), 20 + 4 * (3 + 24));
+        let mut reloaded = ExecutableNetwork::new(network.clone());
+        reloaded.load_weights_file(&path).expect("load");
+        assert_eq!(reloaded.params, executable.params);
+        assert_eq!(inspect_weights_file(&network, &path).unwrap().trailing_bytes, 0);
         let _ = fs::remove_file(path);
     }
 

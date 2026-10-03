@@ -1014,6 +1014,22 @@ impl ExecutableNetwork {
                         resolve_convolutional_params(&self.network, &self.params, layer.index)?;
                     forward_convolutional_with_cache(spec, conv, current_input, layer.output_shape)
                 }
+                (LayerKind::Deconvolutional(spec), LayerParams::Convolutional(p)) => {
+                    let pre = crate::deconvolutional::deconv_forward(
+                        current_input,
+                        &p.weights,
+                        &p.biases,
+                        spec.size,
+                        spec.stride,
+                        layer.output_shape,
+                    );
+                    let data = pre
+                        .data
+                        .iter()
+                        .map(|v| activate(spec.activation.clone(), *v))
+                        .collect();
+                    (Tensor::from_data(pre.shape, data)?, Some(pre))
+                }
                 (LayerKind::Connected(spec), LayerParams::Connected(connected)) => {
                     forward_connected_with_cache(spec, connected, current_input, layer.output_shape)
                 }
@@ -1379,6 +1395,46 @@ impl ExecutableNetwork {
                     accumulate_previous_gradient(
                         layer.index,
                         &input_grad,
+                        &mut input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::Deconvolutional(spec), LayerParams::Convolutional(p)) => {
+                    let delta = apply_output_activation_gradient(
+                        &forward.layer_outputs[layer.index],
+                        &grad,
+                        &spec.activation,
+                        "deconvolutional",
+                        forward.layer_activation_inputs[layer.index].as_ref(),
+                    )?;
+                    // C++ also scales the weight gradient by 1/batch (and the optimizer divides again).
+                    let weight_scale = if GradMode::from_env() == GradMode::Cpp {
+                        1.0 / current_input.shape.batch as f32
+                    } else {
+                        1.0
+                    };
+                    let g = crate::deconvolutional::deconv_backward(
+                        current_input,
+                        &p.weights,
+                        &delta,
+                        spec.size,
+                        spec.stride,
+                        weight_scale,
+                    );
+                    let Some(slot) = param_gradients.get_mut(layer.index) else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing deconvolutional gradient slot for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    *slot = LayerParams::Convolutional(ConvolutionalParams {
+                        biases: g.biases,
+                        batch_norm: None,
+                        weights: g.weights,
+                    });
+                    accumulate_previous_gradient(
+                        layer.index,
+                        &g.input,
                         &mut input_gradient,
                         &mut layer_output_gradients,
                     )?;
@@ -2089,6 +2145,18 @@ impl ExecutableNetwork {
                             )));
                         }
                     }
+                }
+                (LayerKind::Deconvolutional(_), LayerParams::Convolutional(conv_grad)) => {
+                    let Some(LayerTrainBuffers::Convolutional(train)) =
+                        self.train_buffers.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing deconvolutional train buffers for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    accumulate_vec(&mut train.bias_updates, &conv_grad.biases)?;
+                    accumulate_vec(&mut train.weight_updates, &conv_grad.weights)?;
                 }
                 (LayerKind::Connected(_), LayerParams::Connected(connected_grad)) => {
                     let Some(LayerTrainBuffers::Connected(train)) =
@@ -3507,6 +3575,11 @@ where
                         adam,
                     )?;
                 }
+                (LayerParams::Convolutional(_), _) if matches!(layer.kind, LayerKind::Deconvolutional(_)) => {
+                    return Err(Error::InvalidConfig(format!(
+                        "adam=1 on the GPU path has no optimizer state for deconvolutional layer #{index}"
+                    )));
+                }
                 (LayerParams::None, _) | (LayerParams::Convolutional(_), _) => {}
                 _ => {
                     return Err(Error::InvalidConfig(format!(
@@ -3661,6 +3734,12 @@ where
                         decay,
                         batch,
                     );
+                }
+                (LayerParams::Convolutional(params), LayerTrainBuffers::Convolutional(train))
+                    if matches!(layer.kind, LayerKind::Deconvolutional(_)) =>
+                {
+                    sgd_update(&mut params.weights, &mut train.weight_updates, lr, momentum, decay, batch);
+                    sgd_update(&mut params.biases, &mut train.bias_updates, lr, momentum, 0.0, batch);
                 }
                 (LayerParams::None, LayerTrainBuffers::None)
                 | (LayerParams::Convolutional(_), LayerTrainBuffers::Convolutional(_)) => {}
@@ -4447,6 +4526,29 @@ where
                         .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
                         .map_err(|err| backend_error("upload sam output", err))?
                 }
+                (LayerKind::Deconvolutional(spec), LayerParams::Convolutional(p)) => {
+                    let host_input = self
+                        .download_tensor(current_input, layer.input_shape)
+                        .map_err(|err| backend_error("download deconvolutional input", err))?;
+                    let pre = crate::deconvolutional::deconv_forward(
+                        &host_input,
+                        &p.weights,
+                        &p.biases,
+                        spec.size,
+                        spec.stride,
+                        layer.output_shape,
+                    );
+                    activation_input_gpu = Some(
+                        self.backend
+                            .upload_f32(&tensor_backend_shape(layer.output_shape), &pre.data)
+                            .map_err(|err| backend_error("upload deconvolutional activation cache", err))?,
+                    );
+                    let activated: Vec<f32> =
+                        pre.data.iter().map(|v| activate(spec.activation.clone(), *v)).collect();
+                    self.backend
+                        .upload_f32(&tensor_backend_shape(layer.output_shape), &activated)
+                        .map_err(|err| backend_error("upload deconvolutional output", err))?
+                }
                 (LayerKind::Rnn(spec), LayerParams::Rnn(recurrent)) => {
                     let host_input = self
                         .download_tensor(current_input, layer.input_shape)
@@ -4580,6 +4682,7 @@ where
             matches!(
                 layer.kind,
                 LayerKind::Connected(_)
+                    | LayerKind::Deconvolutional(_)
                     | LayerKind::Reorg(_)
                     | LayerKind::ChannelSlice(_)
                     | LayerKind::ChannelShuffle(_)
@@ -5672,6 +5775,9 @@ where
                 // Recurrent layers need device sequence state; keep the whole
                 // net on the CPU backward for them.
                 LayerKind::Rnn(_) | LayerKind::Lstm(_) | LayerKind::Crnn(_) => return true,
+                // Deconvolution is host-resident (no device kernel); run the
+                // whole backward on the CPU.
+                LayerKind::Deconvolutional(_) => return true,
                 // Connected layers are handled on the GPU path with a host
                 // round trip unless their activation or batch norm
                 // (batch-statistics training) is unsupported.
@@ -5746,7 +5852,7 @@ where
             };
             let weight_grad = self
                 .backend
-                .upload_f32(&[train.weight_updates.len()], &train.weight_updates)
+                .upload_f32(&conv_weight_shape(layer), &train.weight_updates)
                 .map_err(|err| backend_error("upload CPU convolution weight gradient", err))?;
             let bias_grad = self
                 .backend
@@ -6563,6 +6669,16 @@ where
     }
 }
 
+fn conv_weight_shape(layer: &crate::model::Layer) -> Vec<usize> {
+    match &layer.kind {
+        LayerKind::Convolutional(spec) => {
+            let grouped_channels = layer.input_shape.channels / spec.groups.max(1);
+            vec![spec.filters, grouped_channels, spec.size, spec.size]
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
     match &layer.kind {
         LayerKind::BatchNorm(_) => {
@@ -6580,6 +6696,13 @@ fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
                 spec.batch_normalize,
             ))
         }
+        LayerKind::Deconvolutional(spec) => LayerParams::Convolutional(default_convolutional_params(
+            layer.input_shape.channels,
+            spec.filters,
+            spec.size,
+            1,
+            false,
+        )),
         LayerKind::Connected(spec) => LayerParams::Connected(default_connected_params(
             layer.input_shape.element_count(),
             spec.output,
@@ -6681,6 +6804,15 @@ fn default_layer_train_buffers(layer: &crate::model::Layer) -> LayerTrainBuffers
                 spec.batch_normalize,
             ))
         }
+        LayerKind::Deconvolutional(spec) => LayerTrainBuffers::Convolutional(
+            default_convolutional_train_buffers(
+                layer.input_shape.channels,
+                spec.filters,
+                spec.size,
+                1,
+                false,
+            ),
+        ),
         LayerKind::Connected(spec) => {
             LayerTrainBuffers::Connected(default_connected_train_buffers(
                 layer.input_shape.element_count(),
@@ -16925,8 +17057,52 @@ mod tests {
     }
 
     #[test]
-    fn gpu_channel_shuffle_matches_cpu_forward_and_backward() {
-        assert_gpu_layer_chain_matches_cpu(
+    fn deconvolutional_layer_trains_on_cpu_and_gpu_fallback_identically() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "inline.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=2\n\
+                 [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
+                 [deconvolutional]\nfilters=3\nsize=2\nstride=2\nactivation=leaky\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        fill_conv_params(&mut cpu.params);
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        gpu.params = cpu.params.clone();
+        gpu.init_train_buffers_gpu().unwrap();
+        assert!(gpu.requires_cpu_backward_fallback(), "deconvolutional trains through the CPU fallback");
+
+        let input = patterned_input(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).unwrap();
+        let gpu_forward = gpu.forward_training_with_state(&input).unwrap();
+        for (i, (a, b)) in cpu_forward.layer_outputs.iter().zip(&gpu_forward.cpu_forward.layer_outputs).enumerate() {
+            assert_slice_close(&format!("layer {i}"), &a.data, &b.data, 1e-5);
+        }
+        let shape = cpu.network.layers[1].output_shape;
+        let mut seeds = vec![None; 2];
+        seeds[1] = Some(Tensor::from_data(shape, (0..2 * shape.element_count()).map(|i| (i as f32 * 0.91).cos()).collect()).unwrap());
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds).unwrap();
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds).unwrap();
+        let LayerTrainBuffers::Convolutional(cpu_train) = &cpu.train_buffers[1] else { panic!() };
+        let fallback = gpu.cpu_fallback_train_buffers.borrow();
+        let LayerTrainBuffers::Convolutional(gpu_train) = &fallback[1] else { panic!() };
+        assert!(cpu_train.weight_updates.iter().any(|g| g.abs() > 1e-6));
+        assert_slice_close("weight_updates", &cpu_train.weight_updates, &gpu_train.weight_updates, 1e-4);
+        assert_slice_close("bias_updates", &cpu_train.bias_updates, &gpu_train.bias_updates, 1e-4);
+        drop(fallback);
+
+        // one SGD step moves the host-resident deconvolution weights on both paths alike
+        cpu.update_weights(0.01, 0.9, 0.0005, 2);
+        gpu.update_weights_gpu(0.01, 0.9, 0.0005, 2).unwrap();
+        let (LayerParams::Convolutional(a), LayerParams::Convolutional(b)) = (&cpu.params[1], &gpu.params[1]) else { panic!() };
+        assert_slice_close("updated weights", &a.weights, &b.weights, 1e-5);
+    }
+
+    #[test]
+    fn gpu_channel_shuffle_matches_cpu_forward_and_backward() {        assert_gpu_layer_chain_matches_cpu(
             "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=2\n\
              [convolutional]\nfilters=6\nsize=1\nstride=1\nactivation=linear\n\
              [channel_shuffle]\ngroups=3\n",
