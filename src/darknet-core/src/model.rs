@@ -561,6 +561,21 @@ impl LayerKind {
             Self::Unsupported(name) => name.as_str(),
         }
     }
+
+    /// The elementwise activation this layer applies, if it has one.
+    pub fn activation(&self) -> Option<&Activation> {
+        match self {
+            Self::Convolutional(spec) => Some(&spec.activation),
+            Self::Connected(spec) => Some(&spec.activation),
+            Self::Shortcut(spec) => Some(&spec.activation),
+            Self::ScaleChannels(spec) => Some(&spec.activation),
+            Self::Sam(spec) => Some(&spec.activation),
+            Self::Local(spec) => Some(&spec.activation),
+            Self::Rnn(spec) => Some(&spec.activation),
+            Self::Crnn(spec) => Some(&spec.activation),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1000,6 +1015,19 @@ impl Network {
                 &cfg_parent,
                 net.time_steps,
             )?;
+            if let Some(Activation::Other(name)) = kind.activation() {
+                let hint = if name.starts_with("normalize_channels") {
+                    " (channel-normalising activations need the layer geometry and are not implemented)"
+                } else if name == "eml" {
+                    " (eml is only used by [eml_convolutional], which is not implemented)"
+                } else {
+                    ""
+                };
+                return Err(Error::InvalidConfig(format!(
+                    "[{}] at line {}: unsupported activation \"{name}\"{hint}; C++ would silently use relu",
+                    section.name, section.line
+                )));
+            }
             let output_shape = infer_output_shape(&kind, layer_index, input_shape, &layers)?;
 
             layers.push(Layer {
@@ -1739,7 +1767,31 @@ mod tests {
 
     use crate::cfg::ConfigFile;
 
-    use super::{LayerKind, LrPolicy, Network};
+    use super::{Activation, LayerKind, LrPolicy, Network};
+
+    fn build(text: &str) -> crate::error::Result<Network> {
+        Network::from_config(ConfigFile::parse_str("t.cfg", text)?)
+    }
+
+    #[test]
+    fn unknown_activation_is_a_config_error_not_identity() {
+        let cfg = |act: &str| {
+            format!("[net]\nwidth=2\nheight=2\nchannels=1\n[convolutional]\nfilters=1\nsize=1\nactivation={act}\n")
+        };
+        for ok in [
+            "linear", "leaky", "mish", "swish", "gelu", "elu", "selu", "relie", "plse",
+            "hardtan", "lhtan", "stair", "hard_mish", "revleaky",
+        ] {
+            assert!(build(&cfg(ok)).is_ok(), "{ok} must parse");
+        }
+        for bad in ["banana", "normalize_channels", "normalize_channels_softmax", "eml"] {
+            let err = build(&cfg(bad)).expect_err(bad).to_string();
+            assert!(err.contains(bad) && err.contains("line"), "{err}");
+        }
+        // the same check covers shortcut / connected / scale_channels / sam / rnn / crnn / local
+        let shortcut = "[net]\nwidth=2\nheight=2\nchannels=1\n[convolutional]\nfilters=1\nsize=1\n[shortcut]\nfrom=-1\nactivation=banana\n";
+        assert!(build(shortcut).is_err());
+    }
 
     fn repo_cfg(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
