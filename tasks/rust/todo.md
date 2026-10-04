@@ -383,6 +383,13 @@ Inference on LegoGears_v2 = DONE (155/155 dets, max score diff 4.5e-4, mAP 99.66
 - Activations without kernels: loggy, elu, selu, gelu, hard_mish, hardtan, lhtan, plse, stair, relie, normalize_channels*. (Phase 0 gave all ten a CPU forward + exact derivative; `gelu` also got an oxide kernel, the rest still force the host path. `normalize_channels*` is a config error.)
 - xnor (74 layers), share_index (54), `new_coords=1` yolo (path looks wrong), antialiasing, conv grad clamps/`try_fix_nan` clamps, rewritten_bbox/total_bbox logging.
 
+### FP8 tensor cores + NVFP4 emulation (2026-10-04)
+- `GemmMode::Fp8` / `Fp8Format::{E4M3,E5M2}`: Ada `mma.sync.aligned.m16n8k32` FP8 GEMM (64x64 tile, BK=32, NN/NT/TN/TT, batched, split-K), per-tensor e4m3 quantiser + amax, `DARKNET_OXIDE_GEMM=fp8`.
+- `GemmMode::Fp4` / `fp4::Fp4Packed`: packed NVFP4 (E2M1 codes + E4M3 block-16 scales + f32 global scale) quantised on device and multiplied with `__dp4a` on the CUDA cores, `DARKNET_OXIDE_GEMM=fp4`. This is an **emulation** (native FP4 `mma` needs sm_120a), bit exact against a CPU i32 reference.
+- The FP8 `mma` fragment layout is pinned on the real GPU by a wiring sweep, not by the docs: see the STATUS block at the end of `tasks/rust/fp8_fp4.md` for the five layout axes and the three format details the plan did not pin (e4m3 bias 7, e5m2 5-bit exponent, NaN sign dropped by `cvt.satfinite`).
+- NOT done: FP8 dgrad/wgrad (Phase B), the f32/tf32/f16/fp8/fp4 TFLOPs table (Phase D), FP8 conv via im2col, LegoGears mAP comparison.
+- C++ parity for the FP8/FP4 numerics: NOT RUN - no C++ build of `v6-dev-fp8` / `raptor-fp4` in this environment. The host references in `darknet_cuda_oxide::fp8` / `::fp4` are ports of the C++ recipes and are checked bit-for-bit against the device kernels.
+
 ### Layer-port Phase 0 delivered (2026-10-03)
 - Ten elementwise activations (`gelu elu selu relie plse hardtan lhtan stair hard_mish revleaky`) with exact input-form gradients; unknown activation names are a config error, no longer a silent identity; `gelu` has an oxide kernel.
 - `[maxpool]` reads the C++ key `maxpool_zero_nonmax` and implements `maxpool_depth` (CPU).

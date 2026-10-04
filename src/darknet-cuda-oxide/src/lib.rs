@@ -3,6 +3,8 @@
 //! `cargo oxide`; plain `cargo build` cannot compile the device code.
 
 pub mod conv;
+pub mod fp4;
+pub mod fp8;
 pub mod half;
 pub mod kernels;
 pub mod launch;
@@ -17,10 +19,12 @@ use darknet_cuda::{AdamParams, AdamUpdateItem, SgdUpdateItem, BatchNormTrainForw
 
 use kernels::bias_scale::BIAS_BACKWARD_THREADS;
 use kernels::{
-    activations, amp as amp_k, batchnorm, bias_scale, conv_direct, conv_implicit, convert, elementwise, gemm, gemm_f16, gemm_mma, half_ops, im2col,
-    layers_extra, optim, pool, resample, route,
+    activations, amp as amp_k, batchnorm, bias_scale, conv_direct, conv_implicit, convert, elementwise, gemm, gemm_f16, gemm_f8, gemm_fp4,
+    gemm_mma, half_ops, im2col, layers_extra, optim, pool, quant_fp4, resample, route,
 };
 pub use conv::ConvMode;
+pub use fp8::Fp8Format;
+pub use fp4::Fp4Packed;
 pub use tensor::{OxideTensorF16, OxideTensorF32};
 use tensor::PooledBuf;
 
@@ -61,6 +65,9 @@ pub struct OxideBackend {
     gemm: gemm::kernels::LoadedModule,
     gemm_mma: gemm_mma::kernels::LoadedModule,
     gemm_f16: gemm_f16::kernels::LoadedModule,
+    gemm_f8: gemm_f8::kernels::LoadedModule,
+    quant_fp4: quant_fp4::kernels::LoadedModule,
+    gemm_fp4: gemm_fp4::kernels::LoadedModule,
     convert: convert::kernels::LoadedModule,
     half_ops: half_ops::kernels::LoadedModule,
     amp_k: amp_k::kernels::LoadedModule,
@@ -106,6 +113,10 @@ pub enum GemmMode {
     Fp32,
     Tf32,
     Fp16,
+    /// Per-tensor e4m3 quantisation followed by `mma.m16n8k32` (sm_89+).
+    Fp8,
+    /// Packed NVFP4 (E2M1 + E4M3 block scales) emulated with `__dp4a`.
+    Fp4,
     Auto,
 }
 
@@ -119,7 +130,13 @@ pub(crate) const SPLITK_MIN_K: usize = 128;
 pub(crate) const SPLITK_MAX: usize = 16;
 
 impl GemmMode {
-    /// `DARKNET_OXIDE_GEMM={fp32,tf32,fp16,auto}`; unset or unknown means `Fp32`.
+    /// `DARKNET_OXIDE_GEMM={fp32,tf32,fp16,fp8,fp4,auto}`; unset or unknown
+    /// means `Fp32`.
+    ///
+    /// `fp8` quantises each operand to e4m3 per tensor (amax / 448) and runs
+    /// the Ada tensor cores; `fp4` uses the packed NVFP4 emulation, which needs
+    /// both operands contiguous along K and silently falls back to `Fp32`
+    /// otherwise (see [`OxideBackend::gemm`]).
     pub fn from_env() -> Self {
         match std::env::var("DARKNET_OXIDE_GEMM")
             .unwrap_or_default()
@@ -128,6 +145,8 @@ impl GemmMode {
         {
             "tf32" => Self::Tf32,
             "fp16" | "f16" | "half" => Self::Fp16,
+            "fp8" | "e4m3" => Self::Fp8,
+            "fp4" | "nvfp4" => Self::Fp4,
             "auto" => Self::Auto,
             _ => Self::Fp32,
         }
@@ -135,7 +154,7 @@ impl GemmMode {
 
     pub(crate) fn use_tf32(self, g: &GemmArgs) -> bool {
         match self {
-            Self::Fp32 | Self::Fp16 => false,
+            Self::Fp32 | Self::Fp16 | Self::Fp8 | Self::Fp4 => false,
             Self::Tf32 => true,
             Self::Auto => {
                 g.m.saturating_mul(g.n).saturating_mul(g.k) >= AUTO_TF32_MIN_MACS
@@ -385,6 +404,12 @@ impl OxideBackend {
             .map_err(|err| OxideError::Shape(format!("load gemm_mma module: {err:?}")))?;
         let gemm_f16 = gemm_f16::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load gemm_f16 module: {err:?}")))?;
+        let gemm_f8 = gemm_f8::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load gemm_f8 module: {err:?}")))?;
+        let quant_fp4 = quant_fp4::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load quant_fp4 module: {err:?}")))?;
+        let gemm_fp4 = gemm_fp4::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load gemm_fp4 module: {err:?}")))?;
         let convert = convert::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load convert module: {err:?}")))?;
         let half_ops = half_ops::kernels::load(&ctx)
@@ -420,6 +445,9 @@ impl OxideBackend {
             gemm,
             gemm_mma,
             gemm_f16,
+            gemm_f8,
+            quant_fp4,
+            gemm_fp4,
             convert,
             half_ops,
             amp_k,
@@ -462,6 +490,150 @@ impl OxideBackend {
         self.conv_mode
     }
 
+    /// Largest finite `|x|` over the first `len` elements of a device buffer,
+    /// and the matching e4m3 quantisation factor `448 / amax`.
+    fn fp8_quant_factor(&self, buf: &DeviceBuffer<f32>, len: usize) -> Result<f32, OxideError> {
+        if len == 0 {
+            return Ok(1.0);
+        }
+        let mut slot = DeviceBuffer::<u32>::zeroed(&self.stream, 1)?;
+        // SAFETY: one thread per element; the single atomic slot is zeroed
+        // above and only read through `fetch_max`.
+        unsafe {
+            self.gemm_f8.fp8_amax_f32_kernel(
+                &self.stream,
+                launch::elementwise(len, ElementwiseLaunchConfig::default()),
+                buf,
+                &mut slot,
+            )
+        }
+        .map_err(launch_err)?;
+        let amax = f32::from_bits(slot.to_host_vec(&self.stream)?[0]);
+        if amax > 0.0 && amax.is_finite() {
+            Ok(amax / Fp8Format::E4M3.max_finite())
+        } else {
+            Ok(1.0)
+        }
+    }
+
+    /// Quantise a device f32 buffer to e4m3 with one multiply factor.
+    fn fp8_quantize_buffer(
+        &self,
+        buf: &DeviceBuffer<f32>,
+        len: usize,
+        factor: f32,
+    ) -> Result<DeviceBuffer<u8>, OxideError> {
+        let mut out = DeviceBuffer::<u8>::zeroed(&self.stream, len)?;
+        // SAFETY: one thread per element; both buffers have `len` elements.
+        unsafe {
+            self.gemm_f8.fp8_quantize_kernel(
+                &self.stream,
+                launch::elementwise(len, ElementwiseLaunchConfig::default()),
+                buf,
+                &mut out,
+                factor,
+                Fp8Format::E4M3.code(),
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(out)
+    }
+
+    /// `C = alpha * op(A) * op(B) + beta * C` with both operands quantised to
+    /// e4m3 per tensor (`amax / 448`), run on the Ada FP8 tensor cores.
+    /// Accumulates in f32; the error is the e4m3 operand rounding (3 mantissa
+    /// bits, <= 2^-4 relative per operand).
+    fn gemm_f32_via_fp8(
+        &self,
+        a: &DeviceBuffer<f32>,
+        b: &DeviceBuffer<f32>,
+        c: &mut DeviceBuffer<f32>,
+        g: &GemmArgs,
+    ) -> Result<(), OxideError> {
+        let (ar, ac) = if g.trans_a { (g.k, g.m) } else { (g.m, g.k) };
+        let (br, bc) = if g.trans_b { (g.n, g.k) } else { (g.k, g.n) };
+        let a_len = extent(g.a.0, g.a.1, g.a.2, g.count, ar, ac, g.lda);
+        let b_len = extent(g.b.0, g.b.1, g.b.2, g.count, br, bc, g.ldb);
+        let fa = self.fp8_quant_factor(a, a_len)?;
+        let fb = self.fp8_quant_factor(b, b_len)?;
+        let aq = self.fp8_quantize_buffer(a, a_len, fa)?;
+        let bq = self.fp8_quantize_buffer(b, b_len, fb)?;
+        self.gemm_fp8_args(&aq, &bq, c, g, Fp8Format::E4M3, Fp8Format::E4M3)
+    }
+
+    /// `C = alpha * op(A) * op(B) + beta * C` with both operands quantised to
+    /// packed NVFP4 (E2M1 codes, one E4M3 scale per 16 elements along K, plus
+    /// an f32 global scale) and multiplied on the CUDA cores with `__dp4a`.
+    ///
+    /// This is an *emulation*: native FP4 `mma` needs sm_120a, so it is slower
+    /// than fp16 by design and exists for parity with the C++ `raptor-fp4`
+    /// reference.  The packed layout is only defined for operands contiguous
+    /// along K, so this path transposes on the host (a full round trip) when a
+    /// caller hands in an N-contiguous operand - acceptable for an emulation
+    /// whose whole purpose is reference parity, not speed.
+    fn gemm_f32_via_fp4(
+        &self,
+        a: &DeviceBuffer<f32>,
+        b: &DeviceBuffer<f32>,
+        c: &mut DeviceBuffer<f32>,
+        g: &GemmArgs,
+    ) -> Result<(), OxideError> {
+        let bad = |msg: &str| OxideError::Shape(format!("gemm_fp4: {msg}"));
+        let (ar, ac) = if g.trans_a { (g.k, g.m) } else { (g.m, g.k) };
+        let (br, bc) = if g.trans_b { (g.n, g.k) } else { (g.k, g.n) };
+        let a_len = extent(g.a.0, g.a.1, g.a.2, g.count, ar, ac, g.lda);
+        let b_len = extent(g.b.0, g.b.1, g.b.2, g.count, br, bc, g.ldb);
+        if a_len < g.m * g.k || b_len < g.n * g.k {
+            return Err(bad("operand buffer smaller than m*k / n*k"));
+        }
+        // Instance 0 only: the packed GEMM has no batched form yet.
+        if g.count > 1 {
+            return Err(bad("the packed NVFP4 path handles a single GEMM instance"));
+        }
+        let a_raw = a.to_host_vec(&self.stream)?;
+        let b_raw = b.to_host_vec(&self.stream)?;
+        // Pack A as [m][k] and B as [n][k], transposing whichever operand the
+        // caller stored N-contiguous.
+        let a_k: Vec<f32> = if g.trans_a {
+            let mut v = vec![0.0f32; g.m * g.k];
+            for p in 0..g.k {
+                for i in 0..g.m {
+                    v[i * g.k + p] = a_raw[g.a.0 + p * g.lda + i];
+                }
+            }
+            v
+        } else {
+            a_raw[g.a.0..g.a.0 + g.m * g.k].to_vec()
+        };
+        let b_k: Vec<f32> = if g.trans_b {
+            b_raw[g.b.0..g.b.0 + g.n * g.k].to_vec()
+        } else {
+            let mut v = vec![0.0f32; g.n * g.k];
+            for p in 0..g.k {
+                for j in 0..g.n {
+                    v[j * g.k + p] = b_raw[g.b.0 + p * g.ldb + j];
+                }
+            }
+            v
+        };
+        let pa = self::fp4::quantize_1x16(&a_k, g.m, g.k);
+        let pb = self::fp4::quantize_1x16(&b_k, g.n, g.k);
+        let c_host = if g.beta == 0.0 { Vec::new() } else { c.to_host_vec(&self.stream)? };
+        let result = self.gemm_fp4(
+            &pa,
+            &pb,
+            if g.beta == 0.0 { None } else { Some(&c_host) },
+            g.m,
+            g.n,
+            g.k,
+            g.alpha,
+            g.beta,
+            false,
+        )?;
+        c.copy_from_host(&self.stream, &result)?;
+        Ok(())
+    }
+
     /// Validated GEMM launch.  This is the single seam conv (and later
     /// `connected`) goes through; alternative kernels plug in here.
     pub(crate) fn gemm(
@@ -491,6 +663,12 @@ impl OxideBackend {
         }
         if self.gemm_mode == GemmMode::Fp16 {
             return self.gemm_f32_operands_as_f16(a, b, c, g);
+        }
+        if self.gemm_mode == GemmMode::Fp8 {
+            return self.gemm_f32_via_fp8(a, b, c, g);
+        }
+        if self.gemm_mode == GemmMode::Fp4 {
+            return self.gemm_f32_via_fp4(a, b, c, g);
         }
         // Split-K: with fewer than `SPLITK_TARGET_BLOCKS` output tiles the GPU is
         // under-filled while each block walks a long K loop (deep, small-spatial
@@ -671,6 +849,581 @@ impl OxideBackend {
             },
         )?;
         Ok(OxideTensorF32::new(out, &[m, n]))
+    }
+
+    // ---- FP8 (e4m3 / e5m2) path -----------------------------------------
+    //
+    // The FP8 GEMM runs on the Ada tensor cores (`mma.m16n8k32` with 8-bit
+    // operands) and needs 8-bit operands, so the host has to quantise first.
+    // `fp8_amax` -> `fp8::amax_to_scale` -> `quantize_f32_to_fp8` is the
+    // recipe of the C++ reference (`v6-dev-fp8`, `fp8_scaling.cpp`); the
+    // scale is applied to the quantised value, so the GEMM itself stays a
+    // plain integer-domain mma with an f32 accumulator.
+
+    /// Largest finite `|x|` over `values`; non-finite entries count as 0.
+    /// Same rule as [`fp8::amax_f32`] and the C++ amax kernels.
+    pub fn fp8_amax(&self, values: &[f32]) -> Result<f32, OxideError> {
+        if values.is_empty() {
+            return Ok(0.0);
+        }
+        let x = DeviceBuffer::<f32>::from_host(&self.stream, values)?;
+        let mut slot = DeviceBuffer::<u32>::zeroed(&self.stream, 1)?;
+        // SAFETY: one thread per input element; the single atomic slot is
+        // zeroed above and only ever read through `fetch_max`.
+        unsafe {
+            self.gemm_f8.fp8_amax_f32_kernel(
+                &self.stream,
+                launch::elementwise(values.len(), ElementwiseLaunchConfig::default()),
+                &x,
+                &mut slot,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(f32::from_bits(slot.to_host_vec(&self.stream)?[0]))
+    }
+
+    /// `bytes[i] = quantize(values[i] * scale, fmt)`.
+    pub fn quantize_f32_to_fp8(
+        &self,
+        values: &[f32],
+        scale: f32,
+        fmt: Fp8Format,
+    ) -> Result<Vec<u8>, OxideError> {
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        let x = DeviceBuffer::<f32>::from_host(&self.stream, values)?;
+        let mut out = DeviceBuffer::<u8>::zeroed(&self.stream, values.len())?;
+        // SAFETY: one thread per element; both buffers have `values.len()`
+        // elements.
+        unsafe {
+            self.gemm_f8.fp8_quantize_kernel(
+                &self.stream,
+                launch::elementwise(values.len(), ElementwiseLaunchConfig::default()),
+                &x,
+                &mut out,
+                scale,
+                fmt.code(),
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(out.to_host_vec(&self.stream)?)
+    }
+
+    /// `out[i] = f32(bytes[i])`; the quantisation scale is *not* reapplied.
+    pub fn dequantize_fp8_to_f32(
+        &self,
+        bytes: &[u8],
+        fmt: Fp8Format,
+    ) -> Result<Vec<f32>, OxideError> {
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let x = DeviceBuffer::<u8>::from_host(&self.stream, bytes)?;
+        let mut out = DeviceBuffer::<f32>::zeroed(&self.stream, bytes.len())?;
+        // SAFETY: one thread per element; both buffers have `bytes.len()`
+        // elements.
+        unsafe {
+            self.gemm_f8.fp8_dequantize_kernel(
+                &self.stream,
+                launch::elementwise(bytes.len(), ElementwiseLaunchConfig::default()),
+                &x,
+                &mut out,
+                fmt.code(),
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(out.to_host_vec(&self.stream)?)
+    }
+
+    /// Control probe with the f16 `mma.m16n8k16`, same harness as
+    /// [`Self::fp8_mma_probe16`] but with 16-bit operands.  One warp of
+    /// `m16n8k16` fragments is 32 x 8 A halves and 32 x 4 B halves.
+    pub fn f16_mma_probe16(&self, a: &[u16], b: &[u16]) -> Result<Vec<f32>, OxideError> {
+        if a.len() < 256 || b.len() < 128 {
+            return Err(shape_err(
+                "f16_mma_probe16",
+                format!("expected 256 A and 128 B halves, got {} and {}", a.len(), b.len()),
+            ));
+        }
+        let da = DeviceBuffer::<u16>::from_host(&self.stream, &a[..256])?;
+        let db = DeviceBuffer::<u16>::from_host(&self.stream, &b[..128])?;
+        let mut out = DeviceBuffer::<f32>::from_host(&self.stream, &vec![-999.0f32; 128])?;
+        // SAFETY: a single warp; every lane's fragments are present and each
+        // output slot has exactly one owner.
+        unsafe {
+            self.gemm_f8.f16_mma_probe16(
+                &self.stream,
+                launch::blocks_of(1, 32),
+                &da,
+                &db,
+                &mut out,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(out.to_host_vec(&self.stream)?)
+    }
+
+    /// Raw-fragment `mma.m16n8k16` probe: one warp of fragments is 32 lanes x
+    /// 8 A bytes and 32 lanes x 4 B bytes; the result is
+    /// `out[i * 32 + lane] = D[lane][i]` for a 16x8 f32 tile.
+    pub fn fp8_mma_probe16(
+        &self,
+        a: &[u8],
+        b: &[u8],
+        fmt_a: Fp8Format,
+        fmt_b: Fp8Format,
+    ) -> Result<Vec<f32>, OxideError> {
+        if a.len() < 256 || b.len() < 128 {
+            return Err(shape_err(
+                "fp8_mma_probe16",
+                format!("fragments must be 256 A bytes and 128 B bytes, got {} and {}", a.len(), b.len()),
+            ));
+        }
+        let da = DeviceBuffer::<u8>::from_host(&self.stream, &a[..256])?;
+        let db = DeviceBuffer::<u8>::from_host(&self.stream, &b[..128])?;
+        let mut out = DeviceBuffer::<f32>::from_host(&self.stream, &vec![-999.0f32; 128])?;
+        // SAFETY: a single warp; every lane's fragments are present and each
+        // of the 128 output slots has exactly one owner.
+        unsafe {
+            self.gemm_f8.fp8_mma_probe16(
+                &self.stream,
+                launch::blocks_of(1, 32),
+                &da,
+                &db,
+                &mut out,
+                fmt_a.code(),
+                fmt_b.code(),
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(out.to_host_vec(&self.stream)?)
+    }
+
+    /// Raw-fragment `mma.m16n8k32` probe: one warp of fragments is 32 lanes x
+    /// 16 A bytes and 32 lanes x 8 B bytes, and the result is
+    /// `out[i * 32 + lane] = D[lane][i]` for a 16x8 f32 tile.  Used by
+    /// `tests/oxide_gemm_f8.rs` to pin the documented fragment layout.
+    pub fn fp8_mma_probe(
+        &self,
+        a: &[u8],
+        b: &[u8],
+        fmt_a: Fp8Format,
+        fmt_b: Fp8Format,
+    ) -> Result<Vec<f32>, OxideError> {
+        if a.len() < 512 || b.len() < 256 {
+            return Err(shape_err(
+                "fp8_mma_probe",
+                format!("fragments must be 512 A bytes and 256 B bytes, got {} and {}", a.len(), b.len()),
+            ));
+        }
+        let da = DeviceBuffer::<u8>::from_host(&self.stream, &a[..512])?;
+        let db = DeviceBuffer::<u8>::from_host(&self.stream, &b[..256])?;
+        // Filled with a sentinel rather than zeros so a lane that fails to
+        // write is distinguishable from a genuine zero result.
+        let mut out = DeviceBuffer::<f32>::from_host(&self.stream, &vec![-999.0f32; 128])?;
+        // SAFETY: a single warp, `a`/`b` cover every lane's fragments, and
+        // each of the 128 output slots has exactly one owner.
+        unsafe {
+            self.gemm_f8.fp8_mma_probe(
+                &self.stream,
+                launch::blocks_of(1, 32),
+                &da,
+                &db,
+                &mut out,
+                fmt_a.code(),
+                fmt_b.code(),
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(out.to_host_vec(&self.stream)?)
+    }
+
+    /// Validated FP8 GEMM launch (8-bit operands, f32 accumulator) with the
+    /// same view, split-K and `beta` semantics as [`Self::gemm`].
+    pub(crate) fn gemm_fp8_args(
+        &self,
+        a: &DeviceBuffer<u8>,
+        b: &DeviceBuffer<u8>,
+        c: &mut DeviceBuffer<f32>,
+        g: &GemmArgs,
+        fmt_a: Fp8Format,
+        fmt_b: Fp8Format,
+    ) -> Result<(), OxideError> {
+        let bad = |msg: &str| OxideError::Shape(format!("gemm_fp8: {msg}"));
+        if g.m == 0 || g.n == 0 || g.k == 0 || g.count == 0 {
+            return Err(bad("m, n, k and count must be > 0"));
+        }
+        if g.a.2 == 0 || g.b.2 == 0 || g.c.2 == 0 {
+            return Err(bad("instance modulus must be > 0"));
+        }
+        let (ar, ac) = if g.trans_a { (g.k, g.m) } else { (g.m, g.k) };
+        let (br, bc) = if g.trans_b { (g.n, g.k) } else { (g.k, g.n) };
+        if g.lda < ac || g.ldb < bc || g.ldc < g.n {
+            return Err(bad("leading dimension smaller than row length"));
+        }
+        // Element extents, in bytes for the 8-bit operands.
+        let a_bytes = extent(g.a.0, g.a.1, g.a.2, g.count, ar, ac, g.lda);
+        let b_bytes = extent(g.b.0, g.b.1, g.b.2, g.count, br, bc, g.ldb);
+        if a_bytes > a.len() || b_bytes > b.len() {
+            return Err(bad("operand buffer too small for the requested view"));
+        }
+        if extent(g.c.0, g.c.1, g.c.2, g.count, g.m, g.n, g.ldc) > c.len() {
+            return Err(bad("output buffer too small for the requested view"));
+        }
+        let (bm, bn) = (gemm_f8::F8_BM, gemm_f8::F8_BN);
+        let tiles = g.m.div_ceil(bm) * g.n.div_ceil(bn) * g.count;
+        let splits = if tiles < SPLITK_TARGET_BLOCKS {
+            SPLITK_TARGET_BLOCKS
+                .div_ceil(tiles)
+                .min(g.k / SPLITK_MIN_K)
+                .min(SPLITK_MAX)
+                .max(1)
+        } else {
+            1
+        };
+        let kchunk = if splits > 1 { g.k.div_ceil(splits).next_multiple_of(16) } else { g.k };
+        let splits = g.k.div_ceil(kchunk);
+        let mn = g.m * g.n;
+        let mut ws = if splits > 1 { Some(self.alloc_uninit(splits * g.count * mn)?) } else { None };
+        let (alpha, beta, ldc) = if splits > 1 { (1.0, 0.0, g.n) } else { (g.alpha, g.beta, g.ldc) };
+        let (cb, cs, cm) = if splits > 1 { (0, mn, splits * g.count) } else { g.c };
+        let target: &mut DeviceBuffer<f32> = match ws.as_mut() {
+            Some(w) => w,
+            None => c,
+        };
+        let blocks = tiles * splits;
+        // SAFETY: extents validated above; each C element has one owner
+        // thread and instances writing the same `c` slot are not allowed.
+        unsafe {
+            self.gemm_f8.sgemm_fp8_mma(
+                &self.stream,
+                launch::blocks_of(blocks, gemm_f8::F8_THREADS),
+                a,
+                b,
+                target,
+                g.m,
+                g.n,
+                g.k,
+                g.lda,
+                g.ldb,
+                ldc,
+                g.trans_a as u32,
+                g.trans_b as u32,
+                alpha,
+                beta,
+                g.a.0,
+                g.a.1,
+                g.a.2,
+                g.b.0,
+                g.b.1,
+                g.b.2,
+                cb,
+                cs,
+                cm,
+                g.count,
+                kchunk,
+                fmt_a.code(),
+                fmt_b.code(),
+            )
+        }
+        .map_err(launch_err)?;
+        if let Some(w) = ws {
+            // SAFETY: one thread per output element; `c` extent validated above.
+            unsafe {
+                self.gemm.gemm_splitk_reduce(
+                    &self.stream,
+                    launch::elementwise(g.count * mn, ElementwiseLaunchConfig::default()),
+                    &w,
+                    c,
+                    g.m,
+                    g.n,
+                    g.ldc,
+                    g.count,
+                    splits,
+                    g.alpha,
+                    g.beta,
+                    g.c.0,
+                    g.c.1,
+                    g.c.2,
+                )
+            }
+            .map_err(launch_err)?;
+        }
+        Ok(())
+    }
+
+    /// Dense `C = alpha * op(A) * op(B)` (no `beta`) on FP8 operands, host
+    /// round trip; `a` is `m x k` (or `k x m` when `trans_a`), `b` is `k x n`
+    /// (or `n x k` when `trans_b`).  Returns a fresh `m x n` f32 tensor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8(
+        &self,
+        a: &[u8],
+        b: &[u8],
+        m: usize,
+        n: usize,
+        k: usize,
+        trans_a: bool,
+        trans_b: bool,
+        alpha: f32,
+        fmt_a: Fp8Format,
+        fmt_b: Fp8Format,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let (ar, ac) = if trans_a { (k, m) } else { (m, k) };
+        let (br, bc) = if trans_b { (n, k) } else { (k, n) };
+        if a.len() < ar * ac || b.len() < br * bc {
+            return Err(shape_err(
+                "gemm_fp8",
+                format!("operands too small: {} A bytes for {ar}x{ac}, {} B bytes for {br}x{bc}", a.len(), b.len()),
+            ));
+        }
+        let da = DeviceBuffer::<u8>::from_host(&self.stream, a)?;
+        let db = DeviceBuffer::<u8>::from_host(&self.stream, b)?;
+        let mut out = self.alloc_uninit(m * n)?;
+        self.gemm_fp8_args(
+            &da,
+            &db,
+            &mut out,
+            &GemmArgs {
+                m,
+                n,
+                k,
+                lda: ac,
+                ldb: bc,
+                ldc: n,
+                trans_a,
+                trans_b,
+                alpha,
+                beta: 0.0,
+                ..GemmArgs::default()
+            },
+            fmt_a,
+            fmt_b,
+        )?;
+        Ok(OxideTensorF32::new(out, &[m, n]))
+    }
+
+    /// Benchmark helper: mean device milliseconds per dense FP8 NN GEMM
+    /// (`alpha = 1`, `beta = 0`) over `iters` launches after one warm-up.
+    pub fn bench_gemm_fp8(
+        &self,
+        a: &DeviceBuffer<u8>,
+        b: &DeviceBuffer<u8>,
+        m: usize,
+        n: usize,
+        k: usize,
+        iters: usize,
+        fmt_a: Fp8Format,
+        fmt_b: Fp8Format,
+    ) -> Result<f64, OxideError> {
+        let mut c = self.alloc(m * n)?;
+        let g = GemmArgs { m, n, k, lda: k, ldb: n, ldc: n, ..GemmArgs::default() };
+        self.time_gpu_ms(iters, || self.gemm_fp8_args(&*a, &*b, &mut c, &g, fmt_a, fmt_b))
+    }
+
+    // ---- FP4 (NVFP4 emulation on the CUDA cores) -------------------------
+    //
+    // Native FP4 `mma` needs sm_120a; on Ada the recipe is emulated with
+    // `__dp4a` over exact i32 block dots.  This is *emulation*, not a tensor
+    // core path: it is slower than FP16 by design and exists for parity with
+    // the `raptor-fp4` C++ reference, not for speed.
+
+    /// Packed NVFP4 quantiser: `[rows, k]` row-major f32 -> E2M1 codes with one
+    /// E4M3 scale per 16 elements along K, plus the f32 global scale.
+    pub fn fp4_quantize_1x16(&self, x: &[f32], rows: usize, k: usize) -> Result<Fp4Packed, OxideError> {
+        if rows == 0 || k == 0 {
+            return Err(shape_err("fp4_quantize_1x16", "rows and k must be > 0".to_string()));
+        }
+        if x.len() != rows * k {
+            return Err(shape_err(
+                "fp4_quantize_1x16",
+                format!("expected {} elements for {rows}x{k}, got {}", rows * k, x.len()),
+            ));
+        }
+        let blocks = k.div_ceil(quant_fp4::BLOCK);
+        let dx = DeviceBuffer::<f32>::from_host(&self.stream, x)?;
+        let mut amax_slot = DeviceBuffer::<u32>::zeroed(&self.stream, 1)?;
+        // SAFETY: one thread per element; the single atomic slot is zeroed
+        // above and only read through `fetch_max`.
+        unsafe {
+            self.quant_fp4.fp4_amax_f32_kernel(
+                &self.stream,
+                launch::elementwise(x.len(), ElementwiseLaunchConfig::default()),
+                &dx,
+                rows,
+                k,
+                &mut amax_slot,
+            )
+        }
+        .map_err(launch_err)?;
+        let amax = f32::from_bits(amax_slot.to_host_vec(&self.stream)?[0]);
+        let amax_slot = DeviceBuffer::<f32>::from_host(&self.stream, &[amax])?;
+        let mut scale = DeviceBuffer::<f32>::zeroed(&self.stream, 1)?;
+        // SAFETY: a single thread writing slot 0 of a one-element buffer.
+        unsafe {
+            self.quant_fp4.fp4_finalize_global_scale_kernel(
+                &self.stream,
+                launch::blocks_of(1, 1),
+                &amax_slot,
+                &mut scale,
+            )
+        }
+        .map_err(launch_err)?;
+        // `scale` now holds `choose_global_scale(amax)` and is the single
+        // device f32 the quantiser divides by (the recipe's global scale).
+        let global_scale = scale.to_host_vec(&self.stream)?[0];
+        let mut codes = DeviceBuffer::<u8>::zeroed(&self.stream, rows * blocks * 8)?;
+        let mut scales = DeviceBuffer::<u8>::zeroed(&self.stream, rows * blocks)?;
+        // SAFETY: one thread per 16-element block; `codes` and `scales` are
+        // sized exactly as the kernel indexes them.
+        unsafe {
+            self.quant_fp4.fp4_quantize_1x16_kernel(
+                &self.stream,
+                launch::elementwise(rows * blocks, ElementwiseLaunchConfig::default()),
+                &dx,
+                rows,
+                k,
+                &scale,
+                &mut codes,
+                &mut scales,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(Fp4Packed {
+            rows,
+            k,
+            codes: codes.to_host_vec(&self.stream)?,
+            scales: scales.to_host_vec(&self.stream)?,
+            global_scale,
+        })
+    }
+
+    /// Dequantises a packed NVFP4 operand back to the `[rows, k]` f32 matrix.
+    pub fn fp4_dequantize_1x16(&self, packed: &Fp4Packed) -> Result<Vec<f32>, OxideError> {
+        let blocks = packed.blocks_per_row();
+        let codes = DeviceBuffer::<u8>::from_host(&self.stream, &packed.codes)?;
+        let scales = DeviceBuffer::<u8>::from_host(&self.stream, &packed.scales)?;
+        let mut out = DeviceBuffer::<f32>::zeroed(&self.stream, packed.rows * packed.k)?;
+        // SAFETY: one thread per element; every code / scale index is derived
+        // from `row`, `kk` and `blocks`, all bounded by the buffer sizes.
+        unsafe {
+            self.quant_fp4.fp4_dequantize_1x16_kernel(
+                &self.stream,
+                launch::elementwise(packed.rows * packed.k, ElementwiseLaunchConfig::default()),
+                &codes,
+                &scales,
+                packed.rows,
+                packed.k,
+                packed.global_scale,
+                &mut out,
+            )
+        }
+        .map_err(launch_err)?;
+        let _ = blocks;
+        Ok(out.to_host_vec(&self.stream)?)
+    }
+
+    /// Packed NVFP4 GEMM, CUDA cores only (`__dp4a`).
+    ///
+    /// `C[M, N] = alpha * gA * gB * sum_blocks dot * 0.25 * sA * sB + beta * C`
+    /// with both operands "NT" (contiguous along K, which is how
+    /// [`Fp4Packed`] stores them).  `reference` picks the one-thread-per-output
+    /// oracle kernel instead of the tiled one.  `c` (read only when
+    /// `beta != 0`) is supplied by the host.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp4(
+        &self,
+        a: &Fp4Packed,
+        b: &Fp4Packed,
+        c: Option<&[f32]>,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        beta: f32,
+        reference: bool,
+    ) -> Result<Vec<f32>, OxideError> {
+        let bad = |msg: &str| OxideError::Shape(format!("gemm_fp4: {msg}"));
+        if m == 0 || n == 0 || k == 0 {
+            return Err(bad("m, n and k must be > 0"));
+        }
+        if a.rows != m || b.rows != n || a.k != k || b.k != k {
+            return Err(bad("packed operand shapes do not match m, n, k"));
+        }
+        if let Some(c) = c {
+            if c.len() < m * n {
+                return Err(bad("c is smaller than m * n"));
+            }
+        }
+        let dca = DeviceBuffer::<u8>::from_host(&self.stream, &a.codes)?;
+        let dsa = DeviceBuffer::<u8>::from_host(&self.stream, &a.scales)?;
+        let dcb = DeviceBuffer::<u8>::from_host(&self.stream, &b.codes)?;
+        let dsb = DeviceBuffer::<u8>::from_host(&self.stream, &b.scales)?;
+        let ga = DeviceBuffer::<f32>::from_host(&self.stream, &[a.global_scale])?;
+        let gb = DeviceBuffer::<f32>::from_host(&self.stream, &[b.global_scale])?;
+        let mut out = DeviceBuffer::<f32>::zeroed(&self.stream, m * n)?;
+        if beta != 0.0 {
+            if let Some(c) = c {
+                out.copy_from_host(&self.stream, c)?;
+            }
+        }
+        let (bm, bn) = (gemm_fp4::FP4_BM, gemm_fp4::FP4_BN);
+        let blocks = m.div_ceil(bm) * n.div_ceil(bn);
+        let grid = if reference {
+            launch::elementwise(m * n, ElementwiseLaunchConfig::default())
+        } else {
+            launch::blocks_of(blocks, gemm_fp4::FP4_THREADS)
+        };
+        // SAFETY: the packed buffers are sized `rows * ceil(k/16) * 8` and
+        // `rows * ceil(k/16)` as the kernels index them; `out` is `m * n` and
+        // each element has exactly one owner thread.
+        unsafe {
+            if reference {
+                self.gemm_fp4.fp4_gemm_nt_packed_reference(
+                    &self.stream, grid, &dca, &dsa, &dcb, &dsb, &mut out,
+                    m, n, k, alpha, beta, n, &ga, &gb,
+                )
+            } else {
+                self.gemm_fp4.fp4_gemm_nt_packed(
+                    &self.stream, grid, &dca, &dsa, &dcb, &dsb, &mut out,
+                    m, n, k, alpha, beta, n, &ga, &gb,
+                )
+            }
+        }
+        .map_err(launch_err)?;
+        Ok(out.to_host_vec(&self.stream)?)
+    }
+
+    /// Benchmark helper: mean device milliseconds per packed NVFP4 GEMM over
+    /// `iters` launches after one warm-up.
+    pub fn bench_gemm_fp4(
+        &self,
+        a: &Fp4Packed,
+        b: &Fp4Packed,
+        m: usize,
+        n: usize,
+        k: usize,
+        iters: usize,
+    ) -> Result<f64, OxideError> {
+        let dca = DeviceBuffer::<u8>::from_host(&self.stream, &a.codes)?;
+        let dsa = DeviceBuffer::<u8>::from_host(&self.stream, &a.scales)?;
+        let dcb = DeviceBuffer::<u8>::from_host(&self.stream, &b.codes)?;
+        let dsb = DeviceBuffer::<u8>::from_host(&self.stream, &b.scales)?;
+        let ga = DeviceBuffer::<f32>::from_host(&self.stream, &[a.global_scale])?;
+        let gb = DeviceBuffer::<f32>::from_host(&self.stream, &[b.global_scale])?;
+        let mut out = DeviceBuffer::<f32>::zeroed(&self.stream, m * n)?;
+        let blocks = m.div_ceil(gemm_fp4::FP4_BM) * n.div_ceil(gemm_fp4::FP4_BN);
+        let grid = launch::blocks_of(blocks, gemm_fp4::FP4_THREADS);
+        // SAFETY: buffers are sized as the kernel indexes them and every
+        // output element has exactly one owner thread.
+        let mut run = || unsafe {
+            self.gemm_fp4.fp4_gemm_nt_packed(
+                &self.stream, grid, &dca, &dsa, &dcb, &dsb, &mut out,
+                m, n, k, 1.0f32, 0.0f32, n, &ga, &gb,
+            )
+        };
+        Ok(self.time_gpu_ms(iters, || run().map_err(launch_err))?)
     }
 
     /// Benchmark helper: mean device milliseconds (CUDA events) per dense NN GEMM
