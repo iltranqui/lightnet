@@ -726,7 +726,7 @@ fn gemm_fp8_subnormal_operands_are_reported() {
 // reference built from the *dequantised* operands, which pins the whole path
 // (including the per-tensor / per-block scale recipe) rather than just the mma.
 
-use darknet_cuda::F32TensorOpsBackend as _;
+use darknet_cuda::{ElementwiseLaunchConfig, F32TensorOpsBackend as _};
 
 fn gemm_f32_reference(a: &[f32], b: &[f32], c0: &[f32], m: usize, n: usize, k: usize, alpha: f32, beta: f32) -> (Vec<f64>, Vec<f64>) {
     let mut out = vec![0.0f64; m * n];
@@ -761,19 +761,30 @@ fn gemm_mode_fp8_selector_matches_the_dequantised_reference() {
         let tc = be.upload_f32(&[m, n], &c0).unwrap();
         let got = download(&be, &be.gemm_f32(&ta, &tb, &tc, m, n, k, false, false, 0.7, 0.3).unwrap());
 
-        // Reference: quantise both operands the way the selector does
-        // (amax / 448 per tensor, saturating) and multiply in f64.
-        let sa = darknet_cuda_oxide::fp8::amax_to_scale(darknet_cuda_oxide::fp8::amax_f32(&a), Fp8Format::E4M3);
-        let sb = darknet_cuda_oxide::fp8::amax_to_scale(darknet_cuda_oxide::fp8::amax_f32(&b), Fp8Format::E4M3);
+        // Reference: quantise both operands exactly as the selector does and
+        // dequantise them again.  `amax_to_scale` is the C++ *divisor*
+        // (`amax / 448`), so the quantiser multiplies by its reciprocal and the
+        // dequantiser multiplies by the divisor.
+        let factor = |v: &[f32]| {
+            let scale = darknet_cuda_oxide::fp8::amax_to_scale(darknet_cuda_oxide::fp8::amax_f32(v), Fp8Format::E4M3);
+            1.0 / scale
+        };
+        let (sa, sb) = (factor(&a), factor(&b));
         let q = |v: &[f32], scale: f32| -> Vec<f32> {
-            v.iter().map(|x| fp8_to_f32(f32_to_fp8(x * scale, Fp8Format::E4M3), Fp8Format::E4M3)).collect()
+            v.iter()
+                .map(|x| fp8_to_f32(f32_to_fp8(x * scale, Fp8Format::E4M3), Fp8Format::E4M3) / scale)
+                .collect()
         };
         let (want, norm) = gemm_f32_reference(&q(&a, sa), &q(&b, sb), &c0, m, n, k, 0.7, 0.3);
         let mut worst = 0.0f64;
         for i in 0..m * n {
             let err = (got[i] as f64 - want[i]).abs();
             worst = worst.max(err / norm[i].max(1e-4));
-            assert!(err <= 1e-3 * norm[i].max(1e-4), "{m}x{n}x{k} [{i}]: got {} want {}", got[i], want[i]);
+            // e4m3 keeps 3 explicit mantissa bits, so each operand carries up to
+            // 2^-4 of relative error and the row norm bounds the sum's error at
+            // about 2^-3.  0.25 is a comfortable factor of three over that and
+            // still far tighter than the ~6% a wrong wiring would produce.
+            assert!(err <= 0.25 * norm[i].max(1e-4), "{m}x{n}x{k} [{i}]: got {} want {}", got[i], want[i]);
         }
         println!("fp8 selector {m}x{n}x{k}: worst err / row norm = {worst:e}");
     }
@@ -839,4 +850,70 @@ fn gemm_mode_from_env_parses_fp8_and_fp4() {
         unsafe { std::env::remove_var("DARKNET_OXIDE_GEMM") };
         assert_eq!(GemmMode::from_env(), GemmMode::Fp32);
     }
+}
+
+// ---------------------------------------------------------------------------
+// FP8 backward (Phase B step 6)
+// ---------------------------------------------------------------------------
+//
+// The C++ recipe (`v6-dev-fp8`) is asymmetric: the forward is e4m3 x e4m3, while
+// dgrad is `W:E4M3 x dy:E5M2` and wgrad is `dy:E5M2 x col:E4M3`.  e5m2 has one
+// mantissa bit less but 128x the dynamic range, which is what gradients need.
+// `with_fp8_backward(Some((E4M3, E5M2)))` (or `DARKNET_OXIDE_GEMM_BWD=fp8`)
+// switches just the two backward GEMMs; the forward keeps its own mode.
+//
+// The checks are against the *device f32* backward (same kernels, fp32 GEMM), so
+// what is measured is exactly the quantisation error of the FP8 pair.
+
+/// Row norm `sum_k |a_ik| |b_kj|` is not directly available for conv, so the
+/// tolerance is scaled by the magnitude of the f32 result's own row: the test
+/// uses data with a positive mean so the dot products do not cancel, and then
+/// bounds the relative error per element.
+fn relative_error(got: &[f32], want: &[f32], label: &str) -> f64 {
+    let mut worst = 0.0f64;
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        let scale = w.abs().max(1e-3) as f64;
+        let err = (*g as f64 - *w as f64).abs() / scale;
+        worst = worst.max(err);
+        assert!(
+            err <= 0.25,
+            "{label}[{i}]: fp8 {g} vs f32 {w}, relative {err:.4}"
+        );
+    }
+    worst
+}
+
+#[test]
+fn fp8_backward_dgrad_and_wgrad_track_the_f32_backward() {
+    let be = OxideBackend::new().expect("backend");
+    let fp8 = OxideBackend::new().expect("backend").with_fp8_backward(Some((Fp8Format::E4M3, Fp8Format::E5M2)));
+    assert_eq!(fp8.fp8_backward_formats(), Some((Fp8Format::E4M3, Fp8Format::E5M2)));
+    assert_eq!(be.fp8_backward_formats(), None, "default stays off");
+
+    let cfg = ElementwiseLaunchConfig::default();
+    let mut rng = Rng(0xdead_beef);
+    // batch 2, c 32 -> f 64 on a 16x16 input, 3x3, stride 2, pad 1.  The
+    // geometry is deliberately above `TINY_MACS` with `groups != c`, so
+    // `ConvMode::Auto` picks the GEMM arm and the backward really goes through
+    // the FP8 GEMM seam rather than the direct elementwise kernel.
+    let (batch, c, h, w, f, k, sx, sy, pad) = (2usize, 32, 16, 16, 64, 3, 2, 2, 1);
+    let oh = (h + 2 * pad - k) / sy + 1;
+    let ow = (w + 2 * pad - k) / sx + 1;
+    let x: Vec<f32> = (0..batch * c * h * w).map(|_| rng.next(0.2, 1.0)).collect();
+    let dy: Vec<f32> = (0..batch * f * oh * ow).map(|_| rng.next(0.2, 1.0)).collect();
+    let wt: Vec<f32> = (0..f * c * k * k).map(|_| rng.next(0.2, 1.0)).collect();
+    let tx = be.upload_f32(&[batch, c, h, w], &x).unwrap();
+    let tdy = be.upload_f32(&[batch, f, oh, ow], &dy).unwrap();
+    let twt = be.upload_f32(&[f, c, k, k], &wt).unwrap();
+
+    let dx32 = download(&be, &be.conv2d_backward_input_f32(&tdy, &twt, &[batch, c, h, w], c, h, w, f, k, sx, sy, 1, pad, 1, cfg).unwrap());
+    let dx8 = download(&fp8, &fp8.conv2d_backward_input_f32(&tdy, &twt, &[batch, c, h, w], c, h, w, f, k, sx, sy, 1, pad, 1, cfg).unwrap());
+    let worst_d = relative_error(&dx8, &dx32, "dgrad");
+    assert!(worst_d > 0.0, "the FP8 dgrad must actually differ from the f32 one");
+
+    let dw32 = download(&be, &be.conv2d_backward_weights_f32(&tx, &tdy, &[f, c, k, k], c, h, w, f, k, sx, sy, 1, pad, 1, cfg).unwrap());
+    let dw8 = download(&fp8, &fp8.conv2d_backward_weights_f32(&tx, &tdy, &[f, c, k, k], c, h, w, f, k, sx, sy, 1, pad, 1, cfg).unwrap());
+    let worst_w = relative_error(&dw8, &dw32, "wgrad");
+    assert!(worst_w > 0.0, "the FP8 wgrad must actually differ from the f32 one");
+    println!("fp8 backward worst relative error: dgrad {worst_d:.4}, wgrad {worst_w:.4}");
 }

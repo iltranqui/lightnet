@@ -88,9 +88,11 @@ Phase D – docs/bench: results table (f32/tf32/f16/fp8/fp4 GEMM TFLOPs on sm_89
 
 # STATUS (2026-10-04)
 
-Phases A (steps 1-4) and C (steps 7-9) are implemented, tested and green on the
-real sm_89 GPU (RTX 4060 Laptop).  Phase B (FP8 backward) and Phase D
-(bench table) are **not** done.  Nothing below changes the default path:
+Phases A (steps 1-4), B (step 6) and C (steps 7-9) and Phase D are implemented,
+tested and green on the real sm_89 GPU (RTX 4060 Laptop).  Step 5 (FP8 conv
+via im2col plus the LegoGears_v2 mAP comparison against the C++ FP8 path) is
+**not** done, and the C++ mAP comparison is not runnable here anyway (no C++
+build of `v6-dev-fp8`).  Nothing below changes the default path:
 `DARKNET_OXIDE_GEMM` still defaults to `fp32`, and the full oxide suite is
 unchanged (`./tools/test_oxide.sh` -> `EXIT=0`, all suites `ok`).
 
@@ -107,8 +109,13 @@ unchanged (`./tools/test_oxide.sh` -> `EXIT=0`, all suites `ok`).
 | C7/C8 packed GEMM + oracle | `kernels/gemm_fp4.rs` `fp4_gemm_nt_packed` (tiled) and `fp4_gemm_nt_packed_reference` (one thread per output) | done |
 | C8 exactness | `oxide_gemm_fp4.rs` - both kernels are **bit exact** against `fp4::gemm_nt_packed`, whose block dot is an i32 `dp4a` sum | done |
 | C9 selector | `GemmMode::Fp4` (`DARKNET_OXIDE_GEMM=fp4`/`nvfp4`), `OxideBackend::gemm_f32_via_fp4` | done |
-| B6 FP8 dgrad / wgrad | - | **not done** |
+FP8 backward (measured against the f32 backward on the same kernels):
+dgrad 3.1% and wgrad 2.2% worst relative error, i.e. exactly what e4m3 x e5m2
+operand rounding predicts - the pass-through is real and bounded.
+
+| B6 FP8 dgrad / wgrad | `OxideBackend::backward_gemm` + `with_fp8_backward` / `DARKNET_OXIDE_GEMM_BWD=fp8`, formats `(e4m3, e5m2)` per the C++ recipe; test `oxide_gemm_f8.rs::fp8_backward_dgrad_and_wgrad_track_the_f32_backward` | done |
 | D bench table | `tests/oxide_gemm_bench.rs` `gemm_bench_low_precision_kernels` + `gemm_bench_precisions`; results in `tasks/rust/todo.md` | done |
+| A5 optional FP8 conv / mAP | - | **not done** |
 
 ## Findings that correct the plan
 
@@ -145,7 +152,17 @@ unchanged (`./tools/test_oxide.sh` -> `EXIT=0`, all suites `ok`).
    the row norm `sum_k |a_k b_k|`) on any comparison with an f64 CPU reference,
    far above `2^-24`.  All FP8 tests compare against that row norm, not against
    `|sum|`, which cancels.
-5. **`__dp4a` couples 4 bytes of a word in lane order 0..3**, exactly as
+5. **The FP8 quantisation factor is the *reciprocal* of the C++ scale.**  `fp8_scaling.cpp`
+   returns `scale = amax / 448` as a *divisor*; the quantiser multiplies, so the
+   factor handed to the kernel is `448 / amax`, and the dequantiser multiplies
+   by the divisor.  Passing `amax / 448` as a multiplier maps every operand onto
+   the bottom of the format's range (an e5m2 typical value lands below `2^-16`
+   and is flushed) and looks plausible because a test that quantises on the host
+   with the same inverted factor still agrees with the device.  The same applies
+   to the dequantisation in the epilogue: the mma accumulates the *scaled*
+   products, so `alpha` is folded with `1 / (fa * fb)` instead of running a
+   second pass over `C`.
+6. **`__dp4a` couples 4 bytes of a word in lane order 0..3**, exactly as
    `fp4simgemm_decode_row_words` in the C++ assumes; the device matches the C++
    bit for bit.  The *host* reference in `src/fp4.rs` initially had an `as i32`
    precedence bug that silently dropped every +-0.5 code - the C++ LUT does not
@@ -155,7 +172,7 @@ unchanged (`./tools/test_oxide.sh` -> `EXIT=0`, all suites `ok`).
 ## How to run
 
 ```
-./tools/test_oxide.sh --test oxide_gemm_f8     # 19 tests
+./tools/test_oxide.sh --test oxide_gemm_f8     # 20 tests
 ./tools/test_oxide.sh --test oxide_gemm_fp4    # 10 tests
 cargo test --manifest-path src/darknet-cuda-oxide/Cargo.toml --lib   # 14 host reference tests
 ./tools/test_oxide.sh --test oxide_gemm_bench -- --ignored gemm_bench_precisions   # Phase D table
@@ -163,8 +180,8 @@ cargo test --manifest-path src/darknet-cuda-oxide/Cargo.toml --lib   # 14 host r
 
 ## Phase D conclusion (worth reading before enabling fp8 for speed)
 
-At 2048^3 the FP8 `mma` reaches 6991 GF/s against 10764 GF/s for the existing
-fp16 `mma.m16n8k16` GEMM and 7763 GF/s for TF32 on this part, and the NVFP4
+At 2048^3 the FP8 `mma` reaches 7020 GF/s against 13485 GF/s for the existing
+fp16 `mma.m16n8k16` GEMM and 9560 GF/s for TF32 on this part, and the NVFP4
 emulation is ~15x slower than fp16.  The fp8 mode is a **numerics** feature
 here, not a speed feature; and because the per-call quantisation dominates
 below ~1024^3, a usable network-level fp8 mode has to hoist the weight

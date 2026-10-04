@@ -90,6 +90,10 @@ pub struct OxideBackend {
     resample: resample::kernels::LoadedModule,
     layers_extra: layers_extra::kernels::LoadedModule,
     conv_mode: ConvMode,
+    /// FP8 formats for the dgrad / wgrad GEMMs when the FP8 backward is
+    /// enabled: `(A format, B format)`, i.e. (weights, dy).  `None` keeps the
+    /// forward's GEMM mode.
+    bwd_fp8: Option<(Fp8Format, Fp8Format)>,
     /// im2col / dcol scratch, grown on demand and reused across conv calls.
     workspace: Mutex<Option<DeviceBuffer<f32>>>,
     bufs: Arc<tensor::BufPool>,
@@ -161,6 +165,21 @@ impl GemmMode {
                     && g.m.min(g.n) >= 32
             }
         }
+    }
+}
+
+/// `DARKNET_OXIDE_GEMM_BWD=fp8` turns the conv dgrad / wgrad GEMMs into FP8
+/// ones with the C++ recipe's asymmetric formats (e4m3 for weights and
+/// activations, e5m2 for the incoming gradient, which is the wider dynamic
+/// range the gradients need).  Unset or anything else keeps the forward mode.
+fn fp8_backward_from_env() -> Option<(Fp8Format, Fp8Format)> {
+    match std::env::var("DARKNET_OXIDE_GEMM_BWD")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "fp8" | "e4m3_e5m2" => Some((Fp8Format::E4M3, Fp8Format::E5M2)),
+        _ => None,
     }
 }
 
@@ -465,6 +484,7 @@ impl OxideBackend {
             resample,
             layers_extra,
             conv_mode: ConvMode::from_env(),
+            bwd_fp8: fp8_backward_from_env(),
             workspace: Mutex::new(None),
             bufs,
         })
@@ -486,13 +506,53 @@ impl OxideBackend {
         self.gemm_mode
     }
 
+    /// Enable (`Some`) or disable (`None`) the FP8 dgrad / wgrad GEMMs with the
+    /// given `(A format, B format)`; see [`fp8_backward_from_env`] for the env
+    /// spelling and the C++ recipe this mirrors.
+    pub fn with_fp8_backward(mut self, formats: Option<(Fp8Format, Fp8Format)>) -> Self {
+        self.bwd_fp8 = formats;
+        self
+    }
+
+    /// The FP8 formats used by the dgrad / wgrad GEMMs, if enabled.
+    pub fn fp8_backward_formats(&self) -> Option<(Fp8Format, Fp8Format)> {
+        self.bwd_fp8
+    }
+
+    /// GEMM seam for the conv backward arms: the forward's [`Self::gemm`] mode,
+    /// unless the FP8 backward is on, in which case the operands are quantised
+    /// to the configured formats (A = weights or column, B = `dy`).
+    pub(crate) fn backward_gemm(
+        &self,
+        a: &DeviceBuffer<f32>,
+        b: &DeviceBuffer<f32>,
+        c: &mut DeviceBuffer<f32>,
+        g: &GemmArgs,
+    ) -> Result<(), OxideError> {
+        match self.bwd_fp8 {
+            Some((fa, fb)) => self.gemm_f32_via_fp8_fmt(a, b, c, g, fa, fb),
+            None => self.gemm(a, b, c, g),
+        }
+    }
+
     pub fn conv_mode(&self) -> ConvMode {
         self.conv_mode
     }
 
     /// Largest finite `|x|` over the first `len` elements of a device buffer,
-    /// and the matching e4m3 quantisation factor `448 / amax`.
-    fn fp8_quant_factor(&self, buf: &DeviceBuffer<f32>, len: usize) -> Result<f32, OxideError> {
+    /// and the matching quantisation factor `max_finite / amax`.
+    ///
+    /// Note the direction: [`fp8::amax_to_scale`] returns the C++ *divisor*
+    /// `amax / max_finite`, and the quantiser multiplies, so the factor passed
+    /// to the kernel is its reciprocal.  Getting this backwards maps every
+    /// operand onto the bottom of the format's range (an e5m2 typical value
+    /// lands below `2^-16` and is flushed) and silently destroys precision.
+    fn fp8_quant_factor(
+        &self,
+        buf: &DeviceBuffer<f32>,
+        len: usize,
+        fmt: Fp8Format,
+    ) -> Result<f32, OxideError> {
         if len == 0 {
             return Ok(1.0);
         }
@@ -510,18 +570,19 @@ impl OxideBackend {
         .map_err(launch_err)?;
         let amax = f32::from_bits(slot.to_host_vec(&self.stream)?[0]);
         if amax > 0.0 && amax.is_finite() {
-            Ok(amax / Fp8Format::E4M3.max_finite())
+            Ok(fmt.max_finite() / amax)
         } else {
             Ok(1.0)
         }
     }
 
-    /// Quantise a device f32 buffer to e4m3 with one multiply factor.
+    /// Quantise a device f32 buffer to `fmt` with one multiply factor.
     fn fp8_quantize_buffer(
         &self,
         buf: &DeviceBuffer<f32>,
         len: usize,
         factor: f32,
+        fmt: Fp8Format,
     ) -> Result<DeviceBuffer<u8>, OxideError> {
         let mut out = DeviceBuffer::<u8>::zeroed(&self.stream, len)?;
         // SAFETY: one thread per element; both buffers have `len` elements.
@@ -532,7 +593,7 @@ impl OxideBackend {
                 buf,
                 &mut out,
                 factor,
-                Fp8Format::E4M3.code(),
+                fmt.code(),
             )
         }
         .map_err(launch_err)?;
@@ -540,9 +601,36 @@ impl OxideBackend {
     }
 
     /// `C = alpha * op(A) * op(B) + beta * C` with both operands quantised to
-    /// e4m3 per tensor (`amax / 448`), run on the Ada FP8 tensor cores.
-    /// Accumulates in f32; the error is the e4m3 operand rounding (3 mantissa
-    /// bits, <= 2^-4 relative per operand).
+    /// `fmt_a` / `fmt_b` per tensor (`amax / max_finite`), run on the Ada FP8
+    /// tensor cores.  Accumulates in f32; the error is the operand rounding
+    /// (<= 2^-4 relative for e4m3, 2^-3 for e5m2, per operand).
+    fn gemm_f32_via_fp8_fmt(
+        &self,
+        a: &DeviceBuffer<f32>,
+        b: &DeviceBuffer<f32>,
+        c: &mut DeviceBuffer<f32>,
+        g: &GemmArgs,
+        fmt_a: Fp8Format,
+        fmt_b: Fp8Format,
+    ) -> Result<(), OxideError> {
+        let (ar, ac) = if g.trans_a { (g.k, g.m) } else { (g.m, g.k) };
+        let (br, bc) = if g.trans_b { (g.n, g.k) } else { (g.k, g.n) };
+        let a_len = extent(g.a.0, g.a.1, g.a.2, g.count, ar, ac, g.lda);
+        let b_len = extent(g.b.0, g.b.1, g.b.2, g.count, br, bc, g.ldb);
+        let fa = self.fp8_quant_factor(a, a_len, fmt_a)?;
+        let fb = self.fp8_quant_factor(b, b_len, fmt_b)?;
+        let aq = self.fp8_quantize_buffer(a, a_len, fa, fmt_a)?;
+        let bq = self.fp8_quantize_buffer(b, b_len, fb, fmt_b)?;
+        // The mma works in the quantised domain, so fold the two dequantisation
+        // scales into `alpha` rather than running a separate pass over `c`:
+        // `acc` holds `sum_k a_q * b_q = fa * fb * sum_k a * b` exactly, and the
+        // two factors are powers of two times one rounding each.
+        let mut scaled = *g;
+        scaled.alpha = g.alpha / (fa * fb);
+        self.gemm_fp8_args(&aq, &bq, c, &scaled, fmt_a, fmt_b)
+    }
+
+    /// e4m3 x e4m3, the forward format pair.
     fn gemm_f32_via_fp8(
         &self,
         a: &DeviceBuffer<f32>,
@@ -550,15 +638,7 @@ impl OxideBackend {
         c: &mut DeviceBuffer<f32>,
         g: &GemmArgs,
     ) -> Result<(), OxideError> {
-        let (ar, ac) = if g.trans_a { (g.k, g.m) } else { (g.m, g.k) };
-        let (br, bc) = if g.trans_b { (g.n, g.k) } else { (g.k, g.n) };
-        let a_len = extent(g.a.0, g.a.1, g.a.2, g.count, ar, ac, g.lda);
-        let b_len = extent(g.b.0, g.b.1, g.b.2, g.count, br, bc, g.ldb);
-        let fa = self.fp8_quant_factor(a, a_len)?;
-        let fb = self.fp8_quant_factor(b, b_len)?;
-        let aq = self.fp8_quantize_buffer(a, a_len, fa)?;
-        let bq = self.fp8_quantize_buffer(b, b_len, fb)?;
-        self.gemm_fp8_args(&aq, &bq, c, g, Fp8Format::E4M3, Fp8Format::E4M3)
+        self.gemm_f32_via_fp8_fmt(a, b, c, g, Fp8Format::E4M3, Fp8Format::E4M3)
     }
 
     /// `C = alpha * op(A) * op(B) + beta * C` with both operands quantised to

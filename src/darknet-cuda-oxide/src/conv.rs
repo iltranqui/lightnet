@@ -481,7 +481,7 @@ impl OxideBackend {
                     let nb = chunk.min(g.batch - b0);
                     let inst = nb * groups;
                     // dcol[b, g] (kg x ohw) = W[g]^T (kg x fpg) * dy[b, g] (fpg x ohw)
-                    self.gemm(
+                    self.backward_gemm(
                         &weights.buf,
                         &dy.buf,
                         ws,
@@ -611,7 +611,7 @@ impl OxideBackend {
                     let inst = nb * groups;
                     let mut partial = self.alloc_uninit(inst * fpg * kg)?;
                     // dW_partial[b, g] (fpg x kg) = dy[b, g] (fpg x ohw) * col[b, g]^T (ohw x kg)
-                    self.gemm(
+                    self.backward_gemm(
                         &dy.buf,
                         ws,
                         &mut partial,
