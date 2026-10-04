@@ -21,6 +21,9 @@ fn modes() -> Vec<(String, GemmMode)> {
             let mode = match m {
                 "tf32" => GemmMode::Tf32,
                 "auto" => GemmMode::Auto,
+                "fp16" | "f16" | "half" => GemmMode::Fp16,
+                "fp8" | "e4m3" => GemmMode::Fp8,
+                "fp4" | "nvfp4" => GemmMode::Fp4,
                 _ => GemmMode::Fp32,
             };
             (m.to_string(), mode)
@@ -79,4 +82,68 @@ fn gemm_bench_square() {
 #[ignore]
 fn gemm_bench_lego() {
     run(&LEGO, "lego");
+}
+
+/// `tasks/rust/fp8_fp4.md` Phase D: the f32 / tf32 / f16 / fp8 / fp4 table.
+/// End-to-end through the GEMM seam, so the fp8 and fp4 columns include their
+/// quantisation (the FP4 column additionally includes the host transpose and
+/// host round trip of the packed path - it is an emulation, not a kernel).
+#[test]
+#[ignore]
+fn gemm_bench_precisions() {
+    run(&[(512, 512, 512), (1024, 1024, 1024), (2048, 2048, 2048)], "prec-sq");
+    run(&LEGO, "prec-lego");
+}
+
+/// Kernel-only numbers for the low-precision paths: the operands are
+/// quantised once up front, so the FP8 column is the tensor-core `mma` alone
+/// and the FP4 column is the `__dp4a` loop alone.  These are the numbers to
+/// compare against each other; `gemm_bench_precisions` is what a network sees.
+#[test]
+#[ignore]
+fn gemm_bench_low_precision_kernels() {
+    use darknet_cuda_oxide::fp8::{f32_to_fp8, Fp8Format};
+    let rounds: usize = std::env::var("DARKNET_BENCH_ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    for &(m, n, k) in &[(512usize, 512usize, 512usize), (1024, 1024, 1024), (2048, 2048, 2048)] {
+        let be = OxideBackend::new().unwrap();
+        let a: Vec<f32> = (0..m * k).map(|i| ((i * 7 % 13) as f32 - 6.0) / 8.0).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i * 5 % 11) as f32 - 5.0) / 8.0).collect();
+        let aq: Vec<u8> = a.iter().map(|v| f32_to_fp8(*v, Fp8Format::E4M3)).collect();
+        let bq: Vec<u8> = b.iter().map(|v| f32_to_fp8(*v, Fp8Format::E4M3)).collect();
+        let flops = 2.0 * (m * n * k) as f64;
+
+        let ta = be.upload_f32(&[m, k], &a).unwrap();
+        let tb = be.upload_f32(&[k, n], &b).unwrap();
+        let iters = ((2e9 / flops) as usize).clamp(20, 400);
+        let mut fp32 = Vec::new();
+        for _ in 0..rounds {
+            fp32.push(be.bench_gemm_f32(&ta, &tb, m, n, k, iters).unwrap());
+        }
+        // Pre-quantised FP8 operands; the upload happens outside the timed loop.
+        let mut dev8_ms = Vec::new();
+        for _ in 0..rounds {
+            let (aq_dev, bq_dev) = (aq.clone(), bq.clone());
+            dev8_ms.push(be.bench_gemm_fp8_host(&aq_dev, &bq_dev, m, n, k, iters, Fp8Format::E4M3, Fp8Format::E4M3).unwrap());
+        }
+        let fp8_med = median(&mut dev8_ms);
+
+        // Packed NVFP4, pre-quantised.
+        let pa4 = darknet_cuda_oxide::fp4::quantize_1x16(&a, m, k);
+        let pb4 = darknet_cuda_oxide::fp4::quantize_1x16(&b, n, k);
+        let mut fp4_ms = Vec::new();
+        for _ in 0..rounds {
+            fp4_ms.push(be.bench_gemm_fp4(&pa4, &pb4, m, n, k, iters).unwrap());
+        }
+        let fp4_med = median(&mut fp4_ms);
+        let fp32_med = median(&mut fp32);
+        println!(
+            "KERNELBENCH m{m} n{n} k{k}: fp32 {:.4} ms {:.0} GF/s | fp8-mma {:.4} ms {:.0} GF/s | fp4-dp4a {:.4} ms {:.0} GF/s",
+            fp32_med,
+            flops / fp32_med / 1e6,
+            fp8_med,
+            flops / fp8_med / 1e6,
+            fp4_med,
+            flops / fp4_med / 1e6
+        );
+    }
 }

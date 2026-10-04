@@ -383,6 +383,51 @@ Inference on LegoGears_v2 = DONE (155/155 dets, max score diff 4.5e-4, mAP 99.66
 - Activations without kernels: loggy, elu, selu, gelu, hard_mish, hardtan, lhtan, plse, stair, relie, normalize_channels*. (Phase 0 gave all ten a CPU forward + exact derivative; `gelu` also got an oxide kernel, the rest still force the host path. `normalize_channels*` is a config error.)
 - xnor (74 layers), share_index (54), `new_coords=1` yolo (path looks wrong), antialiasing, conv grad clamps/`try_fix_nan` clamps, rewritten_bbox/total_bbox logging.
 
+#### GEMM precision table on this sm_89 part (RTX 4060 Laptop, Phase D)
+
+`./tools/test_oxide.sh --test oxide_gemm_bench -- --ignored gemm_bench_low_precision gemm_bench_precisions`
+with `DARKNET_BENCH_ROUNDS=3 DARKNET_BENCH_MODES=fp32,tf32,fp16,fp8,fp4`.
+
+Kernel only (operands pre-quantised, so the timed region is the mma / dp4a loop):
+
+| shape | f32 `sgemm_tiled` | fp8 `mma.m16n8k32` | fp4 `__dp4a` |
+|---|---|---|---|
+| 512^3 | 0.094 ms / 2869 GF/s | 0.101 ms / 2665 GF/s | 1.070 ms / 251 GF/s |
+| 1024^3 | 0.468 ms / 4588 GF/s | 0.452 ms / 4750 GF/s | 7.99 ms / 269 GF/s |
+| 2048^3 | 3.53 ms / 4872 GF/s | 2.46 ms / 6991 GF/s | 55.1 ms / 312 GF/s |
+
+End-to-end through the `DARKNET_OXIDE_GEMM` selector (fp8 and fp4 include their
+quantisation; fp4 additionally includes the host transpose of the packed path):
+
+| shape | f32 | tf32 | fp16 | fp8 | fp4 |
+|---|---|---|---|---|---|
+| 512^3 | 0.890 ms | 0.503 ms | 0.410 ms | 1.712 ms | 55.3 ms |
+| 1024^3 | 2.72 ms | 1.21 ms | 0.984 ms | 4.99 ms | 221 ms |
+| 2048^3 | 4.65 ms | 2.21 ms | 1.596 ms | 6.05 ms | 857 ms |
+| LegoGears_v2 convs, total of 21 | 5.70 ms | 4.58 ms | 3.64 ms | 25.4 ms | 1071 ms |
+
+Read this as three separate facts, not as one ranking:
+
+1. **The FP8 `mma` does not beat the fp16 path on this part.** At 2048^3 the
+   mma reaches 6991 GF/s against 10764 GF/s for the existing fp16
+   `mma.m16n8k16` GEMM and 7763 GF/s for TF32, i.e. ~1.4x TF32 but ~0.65x fp16.
+   The plan's "up to ~2x peak over FP16" is the vendor number for the *dense
+   FP8 datpath*; on a consumer Ada part with only `m16n8k32` available (no
+   `kind::f8f6f4`, no block-scaled mma), the achieved rate is well below it.
+   Conclusion: the fp8 mode is a **numerics** feature here, not a speed feature.
+2. **The NVFP4 emulation costs ~15x fp16** (312 vs ~4700 GF/s kernel-only), and
+   its selector path is dominated by the host transpose and round trip.  It is
+   only useful for parity with the C++ `raptor-fp4` reference.
+3. **The per-call quantisation dominates small GEMMs**: fp8 at 512^3 costs
+   1.71 ms end-to-end against 0.101 ms of kernel time, so the mode only pays off
+   from roughly 1024^3 upward.  A network-level fp8 mode therefore needs the
+   quantiser hoisted (weights once, activations per batch) before it is usable.
+
+Noise caveat: the end-to-end f32 numbers for 512^3 / 1024^3 disagree with the
+kernel-only ones by 5-10x, which is one-time allocation and quantiser warm-up
+inside the first rounds of a short (`ROUNDS=3`) run, not a property of the mode.
+Re-run with `DARKNET_BENCH_ROUNDS=15` before quoting any single number.
+
 ### FP8 tensor cores + NVFP4 emulation (2026-10-04)
 - `GemmMode::Fp8` / `Fp8Format::{E4M3,E5M2}`: Ada `mma.sync.aligned.m16n8k32` FP8 GEMM (64x64 tile, BK=32, NN/NT/TN/TT, batched, split-K), per-tensor e4m3 quantiser + amax, `DARKNET_OXIDE_GEMM=fp8`.
 - `GemmMode::Fp4` / `fp4::Fp4Packed`: packed NVFP4 (E2M1 codes + E4M3 block-16 scales + f32 global scale) quantised on device and multiplied with `__dp4a` on the CUDA cores, `DARKNET_OXIDE_GEMM=fp4`. This is an **emulation** (native FP4 `mma` needs sm_120a), bit exact against a CPU i32 reference.

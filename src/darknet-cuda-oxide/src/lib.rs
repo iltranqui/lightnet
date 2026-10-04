@@ -1222,6 +1222,26 @@ impl OxideBackend {
         self.time_gpu_ms(iters, || self.gemm_fp8_args(&*a, &*b, &mut c, &g, fmt_a, fmt_b))
     }
 
+    /// Like [`Self::bench_gemm_fp8`] but takes host operand slices and uploads
+    /// them once, so the timed region is the `mma` loop alone (the bench table
+    /// in `tests/oxide_gemm_bench.rs` reports the kernel, while
+    /// `DARKNET_OXIDE_GEMM=fp8` additionally pays for the quantisation).
+    pub fn bench_gemm_fp8_host(
+        &self,
+        a: &[u8],
+        b: &[u8],
+        m: usize,
+        n: usize,
+        k: usize,
+        iters: usize,
+        fmt_a: Fp8Format,
+        fmt_b: Fp8Format,
+    ) -> Result<f64, OxideError> {
+        let da = DeviceBuffer::<u8>::from_host(&self.stream, a)?;
+        let db = DeviceBuffer::<u8>::from_host(&self.stream, b)?;
+        self.bench_gemm_fp8(&da, &db, m, n, k, iters, fmt_a, fmt_b)
+    }
+
     // ---- FP4 (NVFP4 emulation on the CUDA cores) -------------------------
     //
     // Native FP4 `mma` needs sm_120a; on Ada the recipe is emulated with

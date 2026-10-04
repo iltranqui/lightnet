@@ -108,7 +108,7 @@ unchanged (`./tools/test_oxide.sh` -> `EXIT=0`, all suites `ok`).
 | C8 exactness | `oxide_gemm_fp4.rs` - both kernels are **bit exact** against `fp4::gemm_nt_packed`, whose block dot is an i32 `dp4a` sum | done |
 | C9 selector | `GemmMode::Fp4` (`DARKNET_OXIDE_GEMM=fp4`/`nvfp4`), `OxideBackend::gemm_f32_via_fp4` | done |
 | B6 FP8 dgrad / wgrad | - | **not done** |
-| D bench table | - | **not done** |
+| D bench table | `tests/oxide_gemm_bench.rs` `gemm_bench_low_precision_kernels` + `gemm_bench_precisions`; results in `tasks/rust/todo.md` | done |
 
 ## Findings that correct the plan
 
@@ -158,4 +158,14 @@ unchanged (`./tools/test_oxide.sh` -> `EXIT=0`, all suites `ok`).
 ./tools/test_oxide.sh --test oxide_gemm_f8     # 19 tests
 ./tools/test_oxide.sh --test oxide_gemm_fp4    # 10 tests
 cargo test --manifest-path src/darknet-cuda-oxide/Cargo.toml --lib   # 14 host reference tests
+./tools/test_oxide.sh --test oxide_gemm_bench -- --ignored gemm_bench_precisions   # Phase D table
 ```
+
+## Phase D conclusion (worth reading before enabling fp8 for speed)
+
+At 2048^3 the FP8 `mma` reaches 6991 GF/s against 10764 GF/s for the existing
+fp16 `mma.m16n8k16` GEMM and 7763 GF/s for TF32 on this part, and the NVFP4
+emulation is ~15x slower than fp16.  The fp8 mode is a **numerics** feature
+here, not a speed feature; and because the per-call quantisation dominates
+below ~1024^3, a usable network-level fp8 mode has to hoist the weight
+quantisation out of the GEMM seam first.  Full table in `tasks/rust/todo.md`.
