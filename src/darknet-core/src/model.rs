@@ -301,6 +301,31 @@ pub struct ConvolutionalSpec {
     pub activation: Activation,
 }
 
+/// `[moe_convolutional]` (Phase 2B of `tasks/rust/layers.md`), ported from
+/// `Jev_laya:src-lib/moe_convolutional_layer.cpp`.
+///
+/// The layer owns `experts` ordinary convolutional layers - `expert` carries each
+/// one's geometry - plus a tiny router that assigns each image a soft gate per
+/// expert.  `top_k == 0` is the soft mixture, `top_k > 0` masks every expert but
+/// the k strongest.  `load_balance` weights the auxiliary penalty
+/// `max(0, experts * sum_e mean_gate[e]^2 - 1)`; `temperature` divides the router
+/// logits before softmax, so larger values give flatter gates.
+///
+/// `expert_dropout` and `debug_interval` are parsed for compatibility with the
+/// cfg keys of the same name; C++ reserves the former and prints gate telemetry
+/// for the latter, and neither changes the output.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MoeSpec {
+    pub experts: usize,
+    pub top_k: usize,
+    pub load_balance: f32,
+    pub temperature: f32,
+    pub expert_dropout: f32,
+    pub debug_interval: usize,
+    /// The shared convolution geometry of every expert.
+    pub expert: ConvolutionalSpec,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConnectedSpec {
     pub output: usize,
@@ -867,6 +892,9 @@ pub enum LayerKind {
     CenterNet(CenterNetSpec),
     /// `[laya_scorer]`, whose weights live in its own blob type.
     LayaScorer(LayaScorerSpec),
+    /// `[moe_convolutional]`: a learned mixture of `MoeSpec::experts`
+    /// convolutional experts gated per image by a small router.
+    Moe(MoeSpec),
     Rnn(RnnSpec),
     Gru(GruSpec),
     Lstm(LstmSpec),
@@ -912,6 +940,7 @@ impl LayerKind {
             Self::Yolonas(_) => "yolonas",
             Self::CenterNet(_) => "centernet",
             Self::LayaScorer(_) => "laya_scorer",
+            Self::Moe(_) => "moe_convolutional",
             Self::Rnn(_) => "rnn",
             Self::Gru(_) => "gru",
             Self::Lstm(_) => "lstm",
@@ -1255,6 +1284,32 @@ impl Layer {
                         spec.batch_normalize,
                     );
                 }
+                Some(LayerWeights { entries })
+            }
+            // `[moe_convolutional]`'s blob order is C++
+            // `save_moe_convolutional_weights`: one complete
+            // `save_convolutional_weights` block per expert, then the router
+            // biases and router weights.
+            LayerKind::Moe(spec) => {
+                let mut entries = Vec::new();
+                for _ in 0..spec.experts {
+                    append_convolutional_weight_entries(
+                        &mut entries,
+                        self.input_shape.channels,
+                        spec.expert.filters,
+                        spec.expert.size,
+                        spec.expert.groups,
+                        spec.expert.batch_normalize,
+                    );
+                }
+                entries.push(WeightsEntry {
+                    array: WeightsArray::Biases,
+                    len: spec.experts,
+                });
+                entries.push(WeightsEntry {
+                    array: WeightsArray::Weights,
+                    len: spec.experts * self.input_shape.channels,
+                });
                 Some(LayerWeights { entries })
             }
             LayerKind::Crnn(spec) => {
@@ -2087,6 +2142,71 @@ fn parse_layer_kind(
             steps: time_steps,
             batch_normalize: section.get_i64("batch_normalize", 0)? != 0,
         }),
+        "moe_convolutional" => {
+            // C++ `parse_moe_convolutional_section`.  The two hard errors it
+            // raises are both about the router, and both must stay errors here:
+            // a silently clamped `experts` or `top_k` would change the
+            // parameter count the `.weights` file is read with.
+            let line = section.line;
+            if current.element_count() == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[moe_convolutional] at line {line}: the preceding layer must output an image"
+                )));
+            }
+            let experts = section.get_usize("experts", 4)?;
+            if experts < 1 {
+                return Err(Error::InvalidConfig(format!(
+                    "[moe_convolutional] at line {line}: experts must be >= 1, got {experts}"
+                )));
+            }
+            let top_k = section.get_usize("top_k", 0)?;
+            if top_k > experts {
+                return Err(Error::InvalidConfig(format!(
+                    "[moe_convolutional] at line {line}: top_k={top_k} is invalid for experts={experts}"
+                )));
+            }
+            let size = section.get_usize("size", 1)?;
+            let mut stride_x = section.get_usize("stride_x", 0)?;
+            let mut stride_y = section.get_usize("stride_y", 0)?;
+            if stride_x == 0 || stride_y == 0 {
+                let stride = section.get_usize("stride", 1)?;
+                if stride_x == 0 {
+                    stride_x = stride;
+                }
+                if stride_y == 0 {
+                    stride_y = stride;
+                }
+            }
+            let padding = if section.get_i64("pad", 0)? != 0 {
+                size / 2
+            } else {
+                section.get_usize("padding", 0)?
+            };
+            // `temperature` is the modern key; `gate_temperature` is the name
+            // used by the shipped cfg and is what C++ falls back to.
+            let temperature = section
+                .get_f32("temperature", section.get_f32("gate_temperature", 1.0)?)?;
+            LayerKind::Moe(MoeSpec {
+                experts,
+                top_k,
+                load_balance: section.get_f32("load_balance", 0.01)?,
+                temperature,
+                expert_dropout: section.get_f32("expert_dropout", 0.0)?,
+                debug_interval: section.get_usize("moe_debug", section.get_usize("debug", 0)?)?,
+                expert: ConvolutionalSpec {
+                    filters: section.get_usize("filters", 1)?,
+                    size,
+                    stride_x,
+                    stride_y,
+                    dilation: if size == 1 { 1 } else { section.get_usize("dilation", 1)? },
+                    padding,
+                    groups: section.get_usize("groups", 1)?.max(1),
+                    share_index: None,
+                    batch_normalize: section.get_i64("batch_normalize", 1)? != 0,
+                    activation: Activation::parse(&section.get_str("activation", "leaky")),
+                },
+            })
+        }
         "crnn" => {
             let size = section.get_usize("size", 3)?;
             let stride = section.get_usize("stride", 1)?;
@@ -2343,6 +2463,14 @@ fn infer_output_shape(
         LayerKind::Rnn(RnnSpec { output, .. }) | LayerKind::Lstm(LstmSpec { output, .. }) => {
             Ok(TensorShape::new(1, 1, *output, current.batch))
         }
+        // `[moe_convolutional]`'s output shape is exactly its experts': the
+        // blend happens per image, so the spatial size is unchanged.
+        LayerKind::Moe(spec) => Ok(TensorShape::new(
+            conv_dim(current.width, spec.expert.padding, spec.expert.size, spec.expert.stride_x),
+            conv_dim(current.height, spec.expert.padding, spec.expert.size, spec.expert.stride_y),
+            spec.expert.filters,
+            current.batch,
+        )),
         LayerKind::Crnn(spec) => Ok(TensorShape::new(
             conv_dim(current.width, spec.padding, spec.size, spec.stride),
             conv_dim(current.height, spec.padding, spec.size, spec.stride),

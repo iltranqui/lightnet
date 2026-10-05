@@ -235,6 +235,21 @@ pub enum LayerParams {
     Crnn(CrnnParams),
     /// `[laya_scorer]`'s six frozen tensors (loaded from its `.weights` blob).
     LayaScorer(crate::laya_scorer::LayaScorerWeights),
+    /// `[moe_convolutional]`: one convolution per expert plus the router's
+    /// `[experts, channels]` weights and `[experts]` biases.
+    Moe(MoeParams),
+}
+
+/// The parameters of one `[moe_convolutional]` layer.
+///
+/// `experts` holds `spec.experts` independent convolutions, so the layer can
+/// reuse the ordinary convolution forward/backward/update verbatim; the router
+/// is the only genuinely new state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MoeParams {
+    pub router_weights: Vec<f32>,
+    pub router_biases: Vec<f32>,
+    pub experts: Vec<ConvolutionalParams>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -267,6 +282,15 @@ pub struct LocalTrainBuffers {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShortcutTrainBuffers {
     pub weight_updates: Vec<f32>,
+}
+
+/// `[moe_convolutional]`'s accumulators: the router's own updates plus one
+/// convolution update set per expert.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MoeTrainBuffers {
+    pub router_weight_updates: Vec<f32>,
+    pub router_bias_updates: Vec<f32>,
+    pub experts: Vec<ConvolutionalTrainBuffers>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -318,6 +342,7 @@ pub enum LayerTrainBuffers {
     Rnn(RnnTrainBuffers),
     Lstm(LstmTrainBuffers),
     Crnn(CrnnTrainBuffers),
+    Moe(MoeTrainBuffers),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -417,6 +442,21 @@ pub struct CropForwardCache {
     pub input_offsets: Vec<f32>,
 }
 
+/// What `[moe_convolutional]`'s backward needs from its forward pass: the
+/// gates the router produced, each expert's output and post-activation input,
+/// and the pooled descriptor the router saw.
+///
+/// Keeping the expert outputs matters because `dL/dgate[b,e]` is a plain dot
+/// product against them, so recomputing every expert would double the cost of
+/// training for no reason.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MoeForwardCache {
+    pub gates: Vec<f32>,
+    pub expert_outputs: Vec<Tensor>,
+    pub expert_activation_inputs: Vec<Option<Tensor>>,
+    pub pooled: Vec<f32>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ForwardResult {
     pub layer_outputs: Vec<Tensor>,
@@ -427,6 +467,10 @@ pub struct ForwardResult {
     pub dropout_masks: Vec<Option<Tensor>>,
     pub crop_caches: Vec<Option<CropForwardCache>>,
     pub recurrent_caches: Vec<Option<RecurrentForwardCache>>,
+    /// `[moe_convolutional]` routers: the per-image gates and each expert's
+    /// output, which the backward pass needs for the gate dot products and for
+    /// the scaled expert gradients.
+    pub moe_caches: Vec<Option<MoeForwardCache>>,
     pub yolo_heads: Vec<YoloHeadOutput>,
     /// The modern anchor-free heads, in layer order.
     pub modern_heads: Vec<ModernHeadOutput>,
@@ -849,6 +893,33 @@ impl ExecutableNetwork {
                         batch,
                     );
                 }
+                // `[moe_convolutional]`: the router is a plain linear layer and
+                // each expert is a plain convolution, so both use the ordinary
+                // SGD rule.  The router's weights are not decayed in C++
+                // (`update_moe_convolutional_layer` calls `axpy_cpu` with
+                // `-decay * batch` only for the experts' offset/collapse
+                // weights), so decay is passed as 0.0 for them.
+                (LayerParams::Moe(moe), LayerTrainBuffers::Moe(train)) => {
+                    sgd_update(
+                        &mut moe.router_biases,
+                        &mut train.router_bias_updates,
+                        lr,
+                        momentum,
+                        0.0,
+                        batch,
+                    );
+                    sgd_update(
+                        &mut moe.router_weights,
+                        &mut train.router_weight_updates,
+                        lr,
+                        momentum,
+                        0.0,
+                        batch,
+                    );
+                    for (expert, updates) in moe.experts.iter_mut().zip(&mut train.experts) {
+                        update_convolutional_params(expert, updates, lr, momentum, decay, batch);
+                    }
+                }
                 _ => {}
             }
         }
@@ -1013,6 +1084,7 @@ impl ExecutableNetwork {
         let mut recurrent_caches = Vec::with_capacity(self.network.layers.len());
         let mut yolo_heads = Vec::new();
         let mut modern_heads = Vec::new();
+        let mut moe_caches = Vec::with_capacity(self.network.layers.len());
         let mut rng_state = 0x9e37_79b9_u64;
 
         for (layer, params) in self.network.layers.iter().zip(&self.params) {
@@ -1030,6 +1102,7 @@ impl ExecutableNetwork {
             let mut dropout_mask = None;
             let mut crop_cache = None;
             let mut recurrent_cache = None;
+            let mut moe_cache = None;
             let (output, activation_input) = match (&layer.kind, params) {
                 (
                     LayerKind::Convolutional(spec),
@@ -1185,6 +1258,70 @@ impl ExecutableNetwork {
                     .map_err(Error::InvalidConfig)?;
                     (Tensor::from_data(layer.output_shape, data)?, None)
                 }
+                // `[moe_convolutional]`: route each image to a soft gate per expert, run
+                // every expert convolution, and blend with those gates.  This
+                // mirrors C++ `forward_moe_convolutional_layer`, which computes
+                // the router first, zeroes `l.output`, then axpys each expert's
+                // output scaled by `l.rand[b * E + e]`.
+                (LayerKind::Moe(spec), LayerParams::Moe(params)) => {
+                    let batch = current_input.shape.batch;
+                    let channels = current_input.shape.channels;
+                    let spatial = current_input.shape.width * current_input.shape.height;
+                    let gates = crate::moe_conv::compute_router(
+                        &current_input.data,
+                        batch,
+                        channels,
+                        spatial,
+                        &params.router_weights,
+                        &params.router_biases,
+                        spec,
+                    );
+                    let mut blended = vec![0.0f32; current_input.data.len().max(
+                        layer.output_shape.element_count() * batch,
+                    )];
+                    let mut cache_entry = MoeForwardCache {
+                        gates,
+                        expert_outputs: Vec::with_capacity(spec.experts),
+                        expert_activation_inputs: Vec::with_capacity(spec.experts),
+                        pooled: crate::moe_conv::pool_for_router(
+                            &current_input.data,
+                            batch,
+                            channels,
+                            spatial,
+                        ),
+                    };
+                    for e in 0..spec.experts {
+                        let expert = params.experts.get(e).ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "layer #{} ([moe_convolutional]) is missing expert {e} of {}",
+                                layer.index, spec.experts
+                            ))
+                        })?;
+                        let (output, activation_input) = forward_convolutional_with_cache(
+                            &spec.expert,
+                            expert,
+                            &current_input,
+                            layer.output_shape,
+                        );
+                        // `TensorShape::element_count()` is per image, which is
+                        // exactly C++'s `O` (l.outputs) and the stride both the
+                        // blend and the gate lookup need.
+                        let per_image = layer.output_shape.element_count();
+                        for b in 0..batch {
+                            let gate = cache_entry.gates[b * spec.experts + e];
+                            let slice = (b * per_image)..((b + 1) * per_image);
+                            for (dst, src) in
+                                blended[slice.clone()].iter_mut().zip(output.data[slice].iter())
+                            {
+                                *dst += gate * src;
+                            }
+                        }
+                        cache_entry.expert_outputs.push(output);
+                        cache_entry.expert_activation_inputs.push(activation_input);
+                    }
+                    moe_cache = Some(cache_entry);
+                    (Tensor::from_data(layer.output_shape, blended)?, None)
+                }
                 // C++ `memcpy(l.output, state.input, ...)` before any loss work.
                 (LayerKind::OmdLoss(_), LayerParams::None) => (current_input.clone(), None),
                 // `[contrastive]` never touches its output either: all of the
@@ -1317,6 +1454,7 @@ impl ExecutableNetwork {
             dropout_masks.push(dropout_mask);
             crop_caches.push(crop_cache);
             recurrent_caches.push(recurrent_cache);
+            moe_caches.push(moe_cache);
         }
 
         Ok(ForwardResult {
@@ -1325,6 +1463,7 @@ impl ExecutableNetwork {
             dropout_masks,
             crop_caches,
             recurrent_caches,
+            moe_caches,
             yolo_heads,
             modern_heads,
         })
@@ -1504,6 +1643,187 @@ impl ExecutableNetwork {
                         &mut layer_output_gradients,
                     )?;
                 }
+                // `[moe_convolutional]`, ported from C++
+                // `backward_moe_convolutional_layer`.  Three gradients meet here:
+                //   1. dL/dgate[b,e] = dot(delta[b], expert_e(x)[b]), seeded with
+                //      the load-balance term;
+                //   2. the softmax/temperature Jacobian turns that into dlogit,
+                //      which feeds both the router parameters and the pooled
+                //      descriptor the router consumed;
+                //   3. each expert sees `gate[b,e] * delta[b]`, because the
+                //      layer output is a gate-weighted sum of the experts.
+                (LayerKind::Moe(spec), LayerParams::Moe(params)) => {
+                    let cache = forward
+                        .moe_caches
+                        .get(layer.index)
+                        .and_then(|slot| slot.as_ref())
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing [moe_convolutional] forward cache for layer #{}; backward needs its gates and expert outputs",
+                                layer.index
+                            ))
+                        })?;
+                    if grad.shape != layer.output_shape {
+                        return Err(Error::InvalidConfig(format!(
+                            "layer #{} ([moe_convolutional]) gradient shape mismatch: expected {}, got {}",
+                            layer.index, layer.output_shape, grad.shape
+                        )));
+                    }
+                    let batch = current_input.shape.batch;
+                    let channels = current_input.shape.channels;
+                    let experts = spec.experts;
+                    let per_image = layer.output_shape.element_count();
+                    if experts == 0 || cache.gates.len() != batch * experts {
+                        return Err(Error::InvalidConfig(format!(
+                            "layer #{} ([moe_convolutional]) cached {} gates for batch {batch} x {experts} experts",
+                            layer.index, cache.gates.len()
+                        )));
+                    }
+
+                    // 1. Load-balance gradient, then the mixture gradient.
+                    let mut raw =
+                        crate::moe_conv::balance_loss_and_raw_grad(&cache.gates, batch, spec).1;
+                    for (index, value) in raw.iter_mut().enumerate() {
+                        let b = index / experts;
+                        let expert = index % experts;
+                        let expert_out = cache.expert_outputs.get(expert).ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "layer #{} ([moe_convolutional]) is missing cached expert {expert}",
+                                layer.index
+                            ))
+                        })?;
+                        let base = b * per_image;
+                        let delta = &grad.data[base..base + per_image];
+                        let out = &expert_out.data[base..base + per_image];
+                        *value += delta.iter().zip(out).map(|(d, o)| d * o).sum::<f32>();
+                    }
+
+                    // 2. Softmax + temperature backward.
+                    let dlogit = crate::moe_conv::router_gate_gradient(&cache.gates, &raw, spec);
+
+                    let Some(slot) = param_gradients.get_mut(layer.index) else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing [moe_convolutional] gradient slot for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    // As everywhere else in this file the gradient slot reuses
+                    // `MoeParams`, so `router_biases`/`router_weights` hold
+                    // gradient deltas here rather than parameter values.
+                    let gradients = match slot {
+                        LayerParams::Moe(gradients) => gradients,
+                        _ => {
+                            return Err(Error::InvalidConfig(format!(
+                                "layer #{} ([moe_convolutional]) gradient slot does not hold MoE parameters",
+                                layer.index
+                            )));
+                        }
+                    };
+                    if gradients.router_biases.len() != experts
+                        || gradients.router_weights.len() != experts * channels
+                    {
+                        return Err(Error::InvalidConfig(format!(
+                            "layer #{} ([moe_convolutional]) router gradient is sized {} x {}, not {experts} x {channels}",
+                            layer.index,
+                            gradients.router_biases.len(),
+                            gradients.router_weights.len() / channels.max(1)
+                        )));
+                    }
+                    for e in 0..experts {
+                        let mut sum = 0.0f32;
+                        for b in 0..batch {
+                            sum += dlogit[b * experts + e];
+                        }
+                        gradients.router_biases[e] += sum;
+                        for c in 0..channels {
+                            let mut sum = 0.0f32;
+                            for b in 0..batch {
+                                sum += dlogit[b * experts + e] * cache.pooled[b * channels + c];
+                            }
+                            gradients.router_weights[e * channels + c] += sum;
+                        }
+                    }
+
+                    // The router reads a global average pool, so its input
+                    // gradient spreads each channel's pooled gradient evenly
+                    // over that channel's spatial positions.
+                    let mut pooled_grad = vec![0.0f32; batch * channels];
+                    for b in 0..batch {
+                        for e in 0..experts {
+                            let value = dlogit[b * experts + e];
+                            for c in 0..channels {
+                                pooled_grad[b * channels + c] += value * params.router_weights[e * channels + c];
+                            }
+                        }
+                    }
+                    let spatial = current_input.shape.width * current_input.shape.height;
+                    if spatial > 0 {
+                        let inv_spatial = 1.0 / spatial as f32;
+                        let mut input_grad = vec![0.0f32; current_input.data.len()];
+                        for b in 0..batch {
+                            for c in 0..channels {
+                                let share = pooled_grad[b * channels + c] * inv_spatial;
+                                let base = b * channels * spatial + c * spatial;
+                                for dst in input_grad[base..base + spatial].iter_mut() {
+                                    *dst += share;
+                                }
+                            }
+                        }
+                        accumulate_previous_gradient(
+                            layer.index,
+                            &Tensor::from_data(current_input.shape, input_grad)?,
+                            &mut input_gradient,
+                            &mut layer_output_gradients,
+                        )?;
+                    }
+
+                    // 3. Scaled expert gradients.
+                    for e in 0..experts {
+                        let expert = params.experts.get(e).ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "layer #{} ([moe_convolutional]) is missing expert {e}",
+                                layer.index
+                            ))
+                        })?;
+                        let mut expert_grad = vec![0.0f32; grad.data.len()];
+                        for b in 0..batch {
+                            let gate = cache.gates[b * experts + e];
+                            let base = b * per_image;
+                            let slice = base..base + per_image;
+                            for (dst, src) in
+                                expert_grad[slice.clone()].iter_mut().zip(grad.data[slice].iter())
+                            {
+                                *dst = gate * src;
+                            }
+                        }
+                        let (expert_input_grad, expert_param_gradients) = backward_convolutional(
+                            &spec.expert,
+                            expert,
+                            current_input,
+                            layer.output_shape,
+                            &Tensor::from_data(layer.output_shape, expert_grad)?,
+                            cache.expert_activation_inputs.get(e).and_then(|t| t.as_ref()),
+                            workspace,
+                        )?;
+                        let LayerParams::Moe(gradients) = slot else {
+                            unreachable!("the slot was matched as MoE above");
+                        };
+                        let Some(expert_gradients) = gradients.experts.get_mut(e) else {
+                            return Err(Error::InvalidConfig(format!(
+                                "layer #{} ([moe_convolutional]) is missing expert {e} gradients",
+                                layer.index
+                            )));
+                        };
+                        accumulate_convolutional_params(expert_gradients, &expert_param_gradients)?;
+                        accumulate_previous_gradient(
+                            layer.index,
+                            &expert_input_grad,
+                            &mut input_gradient,
+                            &mut layer_output_gradients,
+                        )?;
+                    }
+                }
+
                 (LayerKind::Deconvolutional(spec), LayerParams::Convolutional(p)) => {
                     let delta = apply_output_activation_gradient(
                         &forward.layer_outputs[layer.index],
@@ -4047,6 +4367,7 @@ where
         let mut recurrent_caches = Vec::with_capacity(self.network.layers.len());
         let mut dropout_masks = Vec::with_capacity(self.network.layers.len());
         let mut crop_caches = Vec::with_capacity(self.network.layers.len());
+        let mut moe_caches: Vec<Option<MoeForwardCache>> = Vec::new();
         let mut gpu_batch_norm_caches = Vec::with_capacity(self.network.layers.len());
         let mut yolo_heads = Vec::new();
         let mut modern_heads = Vec::new();
@@ -4842,6 +5163,16 @@ where
                         .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
                         .map_err(|err| backend_error("upload CRNN output", err))?
                 }
+                // `[moe_convolutional]` blends `experts` convolutions by a
+                // per-image gate, which no backend primitive covers yet.  Say
+                // so plainly instead of falling into the catch-all below and
+                // reporting an inconsistent parameter set.
+                (LayerKind::Moe(_), _) => {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} ([moe_convolutional]) is only implemented on the CPU backend",
+                        layer.index
+                    )));
+                }
                 (LayerKind::Unsupported(_), _) => {
                     return Err(Error::UnsupportedLayer {
                         layer_index: layer.index,
@@ -4918,6 +5249,9 @@ where
             if recurrent_caches.len() < layer_outputs.len() {
                 recurrent_caches.push(None);
             }
+            if moe_caches.len() < layer_outputs.len() {
+                moe_caches.push(None);
+            }
         }
 
         Ok(GpuForwardState {
@@ -4931,6 +5265,7 @@ where
                 dropout_masks,
                 crop_caches,
                 recurrent_caches,
+                moe_caches,
                 yolo_heads,
                 modern_heads,
             },
@@ -7055,6 +7390,10 @@ fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
         LayerKind::LayaScorer(spec) => {
             LayerParams::LayaScorer(crate::laya_scorer::LayaScorerWeights::zeroed(spec.hidden))
         }
+        LayerKind::Moe(spec) => LayerParams::Moe(default_moe_params(
+            layer.input_shape.channels,
+            spec,
+        )),
         LayerKind::Shortcut(spec) => match spec.weight_count(layer.input_shape.channels) {
             0 => LayerParams::None,
             len => LayerParams::Shortcut(ShortcutParams {
@@ -7240,7 +7579,50 @@ fn default_layer_train_buffers(layer: &crate::model::Layer) -> LayerTrainBuffers
                 spec.batch_normalize,
             ),
         }),
+        LayerKind::Moe(spec) => {
+            LayerTrainBuffers::Moe(default_moe_train_buffers(layer.input_shape.channels, spec))
+        }
         _ => LayerTrainBuffers::None,
+    }
+}
+
+/// `[moe_convolutional]`'s parameters: one ordinary convolution per expert plus
+/// the router's `[experts, channels]` weights and `[experts]` biases.
+fn default_moe_params(input_channels: usize, spec: &crate::model::MoeSpec) -> MoeParams {
+    let expert = &spec.expert;
+    MoeParams {
+        router_weights: vec![0.0; spec.experts * input_channels],
+        router_biases: vec![0.0; spec.experts],
+        experts: (0..spec.experts)
+            .map(|_| {
+                default_convolutional_params(
+                    input_channels,
+                    expert.filters,
+                    expert.size,
+                    expert.groups,
+                    expert.batch_normalize,
+                )
+            })
+            .collect(),
+    }
+}
+
+fn default_moe_train_buffers(input_channels: usize, spec: &crate::model::MoeSpec) -> MoeTrainBuffers {
+    let expert = &spec.expert;
+    MoeTrainBuffers {
+        router_weight_updates: vec![0.0; spec.experts * input_channels],
+        router_bias_updates: vec![0.0; spec.experts],
+        experts: (0..spec.experts)
+            .map(|_| {
+                default_convolutional_train_buffers(
+                    input_channels,
+                    expert.filters,
+                    expert.size,
+                    expert.groups,
+                    expert.batch_normalize,
+                )
+            })
+            .collect(),
     }
 }
 
@@ -7552,6 +7934,16 @@ fn accumulate_convolutional_param_gradients(
             "expected convolutional gradient destination".to_owned(),
         ));
     };
+    accumulate_convolutional_params(dst, src)
+}
+
+/// The same accumulation for a convolution that is nested inside another
+/// layer's parameters - `[moe_convolutional]`'s experts, whose gradient slot is
+/// a plain `ConvolutionalParams` rather than a `LayerParams`.
+fn accumulate_convolutional_params(
+    dst: &mut ConvolutionalParams,
+    src: &ConvolutionalParams,
+) -> Result<()> {
     accumulate_vec(&mut dst.biases, &src.biases)?;
     accumulate_vec(&mut dst.weights, &src.weights)?;
     match (&mut dst.batch_norm, &src.batch_norm) {
@@ -7822,6 +8214,22 @@ fn load_weights_into_params(
             LayerParams::Local(local) => {
                 read_f32_into(&mut file, &mut local.biases)?;
                 read_f32_into(&mut file, &mut local.weights)?;
+            }
+            // C++ `load_moe_convolutional_weights` reads the experts in order
+            // and finishes with the router biases and weights, matching
+            // `Layer::weights()`.
+            LayerParams::Moe(moe) => {
+                for expert in moe.experts.iter_mut() {
+                    read_f32_into(&mut file, &mut expert.biases)?;
+                    if let Some(batch_norm) = expert.batch_norm.as_mut() {
+                        read_f32_into(&mut file, &mut batch_norm.scales)?;
+                        read_f32_into(&mut file, &mut batch_norm.rolling_mean)?;
+                        read_f32_into(&mut file, &mut batch_norm.rolling_variance)?;
+                    }
+                    read_f32_into(&mut file, &mut expert.weights)?;
+                }
+                read_f32_into(&mut file, &mut moe.router_biases)?;
+                read_f32_into(&mut file, &mut moe.router_weights)?;
             }
             LayerParams::Shortcut(shortcut) => {
                 read_f32_into(&mut file, &mut shortcut.weights)?;
@@ -16935,6 +17343,268 @@ mod tests {
             executable.train_buffers[0],
             LayerTrainBuffers::Crnn(_)
         ));
+    }
+
+    /// C++ `parse_moe_convolutional_section` raises two hard errors, and both
+    /// must stay errors here: clamping `experts` or `top_k` would silently
+    /// change the parameter count the `.weights` file is read with.
+    #[test]
+    fn moe_convolutional_rejects_the_configs_cxx_rejects() {
+        let net = "[net]\nchannels=2\nbatch=1\nheight=2\nwidth=2\n";
+        // `experts` must be >= 1.
+        let cfg = format!("{net}[moe_convolutional]\nfilters=2\nsize=1\nexperts=0\n");
+        let error = ConfigFile::parse_str("moe.cfg", &cfg)
+            .err()
+            .or_else(|| Network::from_config(ConfigFile::parse_str("moe.cfg", &cfg).unwrap()).err());
+        assert!(
+            matches!(error, Some(crate::Error::InvalidConfig(ref message)) if message.contains("experts must be >= 1")),
+            "{error:?}"
+        );
+
+        // `top_k` cannot exceed `experts`.
+        let cfg = format!(
+            "{net}[moe_convolutional]\nfilters=2\nsize=1\nexperts=2\ntop_k=3\n"
+        );
+        let error = ConfigFile::parse_str("moe.cfg", &cfg)
+            .err()
+            .or_else(|| Network::from_config(ConfigFile::parse_str("moe.cfg", &cfg).unwrap()).err());
+        assert!(
+            matches!(error, Some(crate::Error::InvalidConfig(ref message)) if message.contains("top_k=3")),
+            "{error:?}"
+        );
+
+        // `top_k = experts` is legal and means "no mask", as in C++.
+        let cfg = format!(
+            "{net}[moe_convolutional]\nfilters=2\nsize=1\nexperts=2\ntop_k=2\n"
+        );
+        assert!(
+            Network::from_config(ConfigFile::parse_str("moe.cfg", &cfg).unwrap()).is_ok(),
+            "top_k=experts must parse"
+        );
+    }
+
+    /// A hand-computed `[moe_convolutional]` forward: one image, two 1x1
+    /// experts, so the blend is exactly the router-weighted sum of the two
+    /// convolutions and can be checked by hand rather than by re-running the
+    /// implementation.
+    #[test]
+    fn cpu_moe_convolutional_blend_matches_a_hand_computation() {
+        let network = Network::from_config(ConfigFile::parse_str(
+            "moe-blend.cfg",
+            "[net]\nchannels=2\nbatch=1\nheight=2\nwidth=2\n\
+             [moe_convolutional]\nfilters=2\nsize=1\nstride=1\nbatch_normalize=0\n\
+             activation=linear\nexperts=2\ntop_k=0\nload_balance=0\ntemperature=1\n",
+        )
+        .expect("moe cfg should parse"))
+        .expect("moe network should build");
+
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::Moe(params) = &mut executable.params[0] else {
+            panic!("expected moe parameters");
+        };
+        // Router picks expert 0 strongly and expert 1 weakly: the pooled input
+        // is 1 in channel 0, so the bias alone decides.
+        params.router_biases = vec![2.0, -1.0];
+        params.router_weights = vec![0.0, 0.0, 0.0, 0.0];
+        // Expert 0 is the identity, expert 1 negates.
+        params.experts[0].weights = vec![1.0, 0.0, 0.0, 1.0];
+        params.experts[0].biases = vec![0.0, 0.0];
+        params.experts[1].weights = vec![-1.0, 0.0, 0.0, -1.0];
+        params.experts[1].biases = vec![0.0, 0.0];
+
+        // Layout [b][c][h][w]: channel 0 carries the signal, channel 1 is zero.
+        let input = Tensor::from_data(
+            executable.network.net.input_shape(),
+            vec![1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0],
+        )
+        .expect("moe input should have the expected shape");
+
+        let forward = executable.forward(&input).expect("moe forward should succeed");
+        let output = forward
+            .layer_outputs
+            .get(0)
+            .expect("moe output should exist");
+
+        // softmax([2, -1]) = [e^3/(e^3+1), 1/(e^3+1)].
+        let e3 = 3.0f32.exp();
+        let gate0 = e3 / (e3 + 1.0);
+        let gate1 = 1.0 / (e3 + 1.0);
+        // Expert 0 is the identity and expert 1 is its negation, so the blend
+        // is (gate0 - gate1) times the input, element by element.
+        let scale = gate0 - gate1;
+        let source = input.data.clone();
+        for (index, value) in output.data.iter().enumerate() {
+            let want = scale * source[index];
+            assert!(
+                (value - want).abs() < 1e-5,
+                "element {index}: {value} vs {want} (gates {gate0}, {gate1})"
+            );
+        }
+
+        // The cached gates must be the distribution the blend used.
+        let cache = forward
+            .moe_caches
+            .get(0)
+            .and_then(|slot| slot.as_ref())
+            .expect("moe forward should cache its router");
+        assert!((cache.gates[0] - gate0).abs() < 1e-6, "{:?}", cache.gates);
+        assert!((cache.gates[0] + cache.gates[1] - 1.0).abs() < 1e-6);
+        assert_eq!(cache.expert_outputs.len(), 2);
+    }
+
+    /// Every parameter of `[moe_convolutional]` - router weights, router biases
+    /// and both experts - must have an analytic gradient equal to a central
+    /// finite difference of the blended output.  The experts reuse the ordinary
+    /// convolution backward, so this also pins the gate-scaling and the router
+    /// chain that are new here.
+    #[test]
+    fn cpu_moe_convolutional_gradients_match_finite_differences() {
+        let cfg = "[net]\nchannels=2\nbatch=2\nheight=2\nwidth=2\n\
+                   [moe_convolutional]\nfilters=2\nsize=3\nstride=1\npad=1\nbatch_normalize=0\n\
+                   activation=leaky\nexperts=3\ntop_k=0\nload_balance=0.05\ntemperature=1.7\n";
+        let build = || {
+            let mut executable = ExecutableNetwork::new(
+                Network::from_config(
+                    ConfigFile::parse_str("moe-grad.cfg", cfg).expect("moe cfg should parse"),
+                )
+                .expect("moe network should build"),
+            );
+            let LayerParams::Moe(params) = &mut executable.params[0] else {
+                panic!("expected moe parameters");
+            };
+            // Distinct values everywhere so a transposed index cannot pass.
+            let mut next = 0.1f32;
+            let mut fill = |len: usize| {
+                let values: Vec<f32> = (0..len)
+                    .map(|_| {
+                        next += 0.037;
+                        next * 0.5
+                    })
+                    .collect();
+                values
+            };
+            params.router_weights = fill(params.router_weights.len());
+            params.router_biases = fill(params.router_biases.len());
+            for expert in &mut params.experts {
+                expert.weights = fill(expert.weights.len());
+                expert.biases = fill(expert.biases.len());
+            }
+            executable
+        };
+
+        let mut executable = build();
+        // A non-uniform input: an all-equal input would make the global average
+        // pool lose the spatial structure and hide most gradient mistakes.
+        let input = Tensor::from_data(
+            executable.network.net.input_shape(),
+            vec![0.3, -0.7, 1.1, 0.9, -0.2, 0.5, 0.8, -1.3, 0.6, 0.4, -0.9, 1.2, 0.7, -0.1, 0.2, 0.9],
+        )
+        .expect("moe input should have the expected shape");
+
+        let loss_of = |executable: &ExecutableNetwork| -> f32 {
+            let forward = executable.forward(&input).expect("moe forward should succeed");
+            let output = forward.layer_outputs[0].data.clone();
+            // A fixed, non-uniform weighting so the gradient is not degenerate.
+            output
+                .iter()
+                .enumerate()
+                .map(|(index, value)| value * (0.1 + 0.03 * (index % 5) as f32))
+                .sum::<f32>()
+        };
+
+        let forward = executable.forward(&input).expect("moe forward should succeed");
+        let seed = Tensor::from_data(
+            forward.layer_outputs[0].shape,
+            (0..forward.layer_outputs[0].data.len())
+                .map(|index| 0.1 + 0.03 * (index % 5) as f32)
+                .collect(),
+        )
+        .expect("seed should have the output shape");
+        let backward = executable
+            .backward(&input, &forward, &seed)
+            .expect("moe backward should succeed");
+        let LayerParams::Moe(gradients) = &backward.param_gradients[0] else {
+            panic!("expected moe parameter gradients");
+        };
+
+        // f32 central differences are only good to about |f| * 1e-7 / eps, so
+        // eps is chosen large enough to keep that noise under 1e-4 and the
+        // tolerance mixes a relative and an absolute term.
+        let eps = 1e-2f32;
+        let check = |name: String, analytic: &[f32], numeric: &[f32]| {
+            assert_eq!(analytic.len(), numeric.len(), "{name}: gradient length mismatch");
+            for (index, (analytic, value)) in analytic.iter().zip(numeric.iter()).enumerate() {
+                assert!(
+                    (analytic - value).abs() <= 5e-2 * value.abs().max(2e-4),
+                    "{name}[{index}]: analytic {analytic} numeric {value}"
+                );
+            }
+        };
+
+        // Router biases.
+        let mut numeric_router_biases = Vec::new();
+        for index in 0..2 + 1 {
+            let mut hi = build();
+            let LayerParams::Moe(params) = &mut hi.params[0] else { unreachable!() };
+            params.router_biases[index] += eps;
+            let mut lo = build();
+            let LayerParams::Moe(params) = &mut lo.params[0] else { unreachable!() };
+            params.router_biases[index] -= eps;
+            numeric_router_biases.push((loss_of(&hi) - loss_of(&lo)) / (2.0 * eps));
+        }
+        check(
+            "router_bias".to_owned(),
+            &gradients.router_biases,
+            &numeric_router_biases,
+        );
+
+        // Router weights (6 = 3 experts x 2 channels).
+        let router_len = gradients.router_weights.len();
+        let mut numeric_router_weights = Vec::new();
+        for index in 0..router_len {
+            let mut hi = build();
+            let LayerParams::Moe(params) = &mut hi.params[0] else { unreachable!() };
+            params.router_weights[index] += eps;
+            let mut lo = build();
+            let LayerParams::Moe(params) = &mut lo.params[0] else { unreachable!() };
+            params.router_weights[index] -= eps;
+            numeric_router_weights.push((loss_of(&hi) - loss_of(&lo)) / (2.0 * eps));
+        }
+        check(
+            "router_weight".to_owned(),
+            &gradients.router_weights,
+            &numeric_router_weights,
+        );
+
+        // Every expert's weights and biases.
+        for e in 0..gradients.experts.len() {
+            for field in ["weights", "biases"] {
+                let (analytic, len) = if field == "weights" {
+                    (gradients.experts[e].weights.clone(), gradients.experts[e].weights.len())
+                } else {
+                    (gradients.experts[e].biases.clone(), gradients.experts[e].biases.len())
+                };
+                let mut numeric = Vec::new();
+                for index in 0..len {
+                    let mut hi = build();
+                    let LayerParams::Moe(params) = &mut hi.params[0] else { unreachable!() };
+                    if field == "weights" {
+                        params.experts[e].weights[index] += eps;
+                    } else {
+                        params.experts[e].biases[index] += eps;
+                    }
+                    let mut lo = build();
+                    let LayerParams::Moe(params) = &mut lo.params[0] else { unreachable!() };
+                    if field == "weights" {
+                        params.experts[e].weights[index] -= eps;
+                    } else {
+                        params.experts[e].biases[index] -= eps;
+                    }
+                    numeric.push((loss_of(&hi) - loss_of(&lo)) / (2.0 * eps));
+                }
+                check(format!("expert{e}.{field}"), &analytic, &numeric);
+            }
+        }
     }
 
     #[test]

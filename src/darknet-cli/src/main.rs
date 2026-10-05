@@ -2384,6 +2384,17 @@ fn print_forward_backward_summary(
             darknet_core::LayerTrainBuffers::Shortcut(shortcut) => {
                 shortcut.weight_updates.iter().any(|value| *value != 0.0)
             }
+            darknet_core::LayerTrainBuffers::Moe(moe) => {
+                moe.router_bias_updates.iter().any(|value| *value != 0.0)
+                    || moe
+                        .router_weight_updates
+                        .iter()
+                        .any(|value| *value != 0.0)
+                    || moe.experts.iter().any(|expert| {
+                        expert.bias_updates.iter().any(|value| *value != 0.0)
+                            || expert.weight_updates.iter().any(|value| *value != 0.0)
+                    })
+            }
             darknet_core::LayerTrainBuffers::Gru(_)
             | darknet_core::LayerTrainBuffers::Rnn(_)
             | darknet_core::LayerTrainBuffers::Lstm(_)

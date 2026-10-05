@@ -175,6 +175,15 @@ pub fn save_weights(
                 write_convolutional_params(&mut file, &recurrent.self_params)?;
                 write_convolutional_params(&mut file, &recurrent.output)?;
             }
+            // C++ `save_moe_convolutional_weights`: every expert's complete
+            // convolution block first, then the router biases and weights.
+            (LayerKind::Moe(_), LayerParams::Moe(moe)) => {
+                for expert in &moe.experts {
+                    write_convolutional_params(&mut file, expert)?;
+                }
+                write_f32_slice(&mut file, &moe.router_biases)?;
+                write_f32_slice(&mut file, &moe.router_weights)?;
+            }
             (_, LayerParams::None) => {}
             _ => {
                 return Err(Error::Weights(format!(
@@ -485,6 +494,13 @@ mod tests {
                 "crnn",
                 "[crnn]\nsize=1\nhidden=2\noutput=2\nactivation=linear\n",
             ),
+            // `[moe_convolutional]`'s block is experts-then-router, which is
+            // exactly what this round trip pins.
+            (
+                "moe_convolutional",
+                "[moe_convolutional]\nfilters=2\nsize=1\nstride=1\nbatch_normalize=0\n\
+                 activation=linear\nexperts=3\n",
+            ),
         ] {
             let cfg_text = if name == "crnn" {
                 format!("[net]\nwidth=2\nheight=2\nchannels=1\nbatch=2\ntime_steps=2\n{layer}")
@@ -501,6 +517,16 @@ mod tests {
                     // The scorer's blob lives at an offset inside a shared file,
                     // so it is never part of this sequential stream.
                     LayerParams::LayaScorer(_) => {}
+                    LayerParams::Moe(moe) => {
+                        for expert in &mut moe.experts {
+                            for value in &mut expert.weights {
+                                *value = 0.25;
+                            }
+                        }
+                        for value in &mut moe.router_weights {
+                            *value = 0.5;
+                        }
+                    }
                     LayerParams::Rnn(recurrent) => {
                         for nested in [
                             &mut recurrent.input,

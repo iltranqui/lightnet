@@ -36,6 +36,7 @@ pub mod evaluate;
 pub use evaluate::{MapReport, REPORT_CONFIDENCE, ValidationDataset, detector_map};
 pub mod image;
 pub mod laya_scorer;
+pub mod moe_conv;
 pub(crate) mod jev_ce;
 pub mod initialize;
 pub mod loader_profile;

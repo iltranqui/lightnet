@@ -30,6 +30,18 @@ pub fn initialize_training_params(network: &Network, params: &mut [LayerParams],
             // `load_laya_scorer_weights` to populate it from the shared blob, so
             // re-randomising it here would be wrong.
             LayerParams::LayaScorer(_) => {}
+            // Every expert is an ordinary convolution, so they get the ordinary
+            // convolution initialisation.  The router's weights use the same
+            // uniform rule over its `channels`-wide input; a zero router would
+            // give every image the same uniform gates and no routing at all.
+            LayerParams::Moe(p) => {
+                let fan_in = p.router_weights.len() / p.router_biases.len().max(1);
+                rng.weights(&mut p.router_weights, fan_in);
+                p.router_biases.fill(0.0);
+                for expert in &mut p.experts {
+                    conv(expert, &mut rng);
+                }
+            }
             LayerParams::Rnn(p) => {
                 for p in [&mut p.input, &mut p.self_params, &mut p.output] {
                     connected(p, &mut rng);
