@@ -54,9 +54,10 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
 
 - [ ] recurrent (rnn/lstm/crnn) device forward + backward (still whole-net CPU
   fallback).
-- [~] Host Adam: connected, standalone batchnorm, local, weighted shortcut,
-  MoE, deconvolutional, and GRU/RNN/LSTM/CRNN host params are implemented with
-  per-layer rate scaling. ViT Adam support remains open/unsupported.
+- [x] Host Adam: connected, standalone batchnorm, local, weighted shortcut,
+  MoE, deconvolutional, GRU/RNN/LSTM/CRNN, and ViT host params use per-layer
+  rate scaling; ViT preserves weight order, decay groups, gradient clipping,
+  and its reduced mHC learning rate.
 - [x] weighted shortcut: per-feature/per-channel oxide forward composes
   channel-scale + add; exact backward and SGD updates use the host-resident CPU
   fallback. Real-device runtime test covers mismatched source fit, forward,

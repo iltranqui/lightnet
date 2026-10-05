@@ -4055,13 +4055,14 @@ where
                         | LayerParams::Connected(_)
                         | LayerParams::Moe(_)
                         | LayerParams::Gru(_)
+                        | LayerParams::Vit(_)
                         | LayerParams::Rnn(_)
                         | LayerParams::Lstm(_)
                         | LayerParams::Crnn(_)
                 )
             }) {
                 return Err(Error::InvalidConfig(
-                    "adam=1 on the GPU path supports convolutional, connected, local, shortcut, MoE, standalone batchnorm, and GRU/RNN/LSTM/CRNN layers"
+                    "adam=1 on the GPU path supports convolutional, connected, local, shortcut, MoE, standalone batchnorm, ViT, and GRU/RNN/LSTM/CRNN layers"
                         .to_string(),
                 ));
             }
@@ -4290,6 +4291,11 @@ where
                 (LayerParams::Connected(params), LayerTrainBuffers::Connected(train)) => {
                     let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
                     apply_host_adam_connected(params, train, moments, adam)?;
+                }
+                (LayerParams::Vit(params), LayerTrainBuffers::Vit(train)) => {
+                    let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    let learned_pos_embed = matches!(layer.kind, LayerKind::Vit(ref spec) if spec.learned_pos_embed);
+                    apply_host_adam_vit(params, train, moments, adam, learned_pos_embed)?;
                 }
                 (LayerParams::Moe(params), LayerTrainBuffers::Moe(train)) => {
                     if params.experts.len() != train.experts.len() {
@@ -9074,6 +9080,54 @@ fn apply_host_adam_convolutional(
                 "convolutional Adam batchnorm state mismatch".to_owned(),
             ));
         }
+    }
+    Ok(())
+}
+
+fn apply_host_adam_vit(
+    params: &mut crate::vit::VitWeights,
+    train: &mut VitTrainBuffers,
+    state: &mut HostAdamLayerState,
+    adam: &AdamParams,
+    learned_pos_embed: bool,
+) -> Result<()> {
+    sanitize_vit_updates(&mut train.updates, learned_pos_embed);
+    let clip_scale = vit_update_clip_scale(&train.updates, 5.0, learned_pos_embed);
+    scale_vit_updates(&mut train.updates, clip_scale);
+    let tensors: [(usize, &mut [f32], &mut [f32], bool); 16] = [
+        (0, &mut params.patch_embed, &mut train.updates.patch_embed, true),
+        (1, &mut params.patch_bias, &mut train.updates.patch_bias, false),
+        (2, &mut params.qkv_bias, &mut train.updates.qkv_bias, false),
+        (3, &mut params.ln1_gamma, &mut train.updates.ln1_gamma, false),
+        (4, &mut params.ln1_beta, &mut train.updates.ln1_beta, false),
+        (5, &mut params.qkv_weight, &mut train.updates.qkv_weight, true),
+        (6, &mut params.wo, &mut train.updates.wo, true),
+        (7, &mut params.wo_bias, &mut train.updates.wo_bias, false),
+        (8, &mut params.ln2_gamma, &mut train.updates.ln2_gamma, false),
+        (9, &mut params.ln2_beta, &mut train.updates.ln2_beta, false),
+        (10, &mut params.ffn_w1, &mut train.updates.ffn_w1, true),
+        (11, &mut params.ffn_b1, &mut train.updates.ffn_b1, false),
+        (12, &mut params.ffn_w2, &mut train.updates.ffn_w2, true),
+        (13, &mut params.ffn_b2, &mut train.updates.ffn_b2, false),
+        (14, &mut params.pos_embed, &mut train.updates.pos_embed, true),
+        (15, &mut params.mhc, &mut train.updates.mhc, false),
+    ];
+    for (index, weights, updates, decay) in tensors {
+        if index == 14 && !learned_pos_embed {
+            continue;
+        }
+        let moments = host_adam_child(state, index);
+        if index == 15 {
+            let mhc_adam = AdamParams { lr: adam.lr * 0.1, decay: 0.0, ..*adam };
+            apply_host_adam(weights, updates, &mut moments.weights, &mhc_adam)?;
+        } else if decay {
+            apply_host_adam(weights, updates, &mut moments.weights, adam)?;
+        } else {
+            apply_host_adam_non_weight(weights, updates, &mut moments.weights, adam)?;
+        }
+    }
+    for value in &mut params.mhc {
+        *value = if value.is_finite() { value.clamp(-8.0, 8.0) } else { 0.0 };
     }
     Ok(())
 }
@@ -21443,6 +21497,151 @@ mod tests {
         let LayerParams::Convolutional(params) = &gpu.params[0] else { unreachable!() };
         assert_slice_close("deconvolutional weights Adam", &expected_weights, &params.weights, 1e-7);
         assert_slice_close("deconvolutional biases Adam", &expected_bias, &params.biases, 1e-7);
+    }
+
+    #[test]
+    fn gpu_adam_updates_vit_parameters_in_cpp_weight_order() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "inline.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=1\nbatch=1\nadam=1\nb1=0.8\nb2=0.95\neps=0.001\ndecoupled_decay=1\n[vit]\ndim=2\nheads=1\npatch_size=1\npatch_stride=1\nmlp_dim=2\npos_embed=learned\nlearning_rate=0.5\n",
+            )
+            .expect("cfg"),
+        )
+        .expect("network");
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        let field_lengths = {
+            let LayerParams::Vit(params) = &mut gpu.params[0] else {
+                panic!("ViT parameters");
+            };
+            let mut value = 0.05;
+            for part in [
+                &mut params.patch_embed,
+                &mut params.patch_bias,
+                &mut params.qkv_bias,
+                &mut params.ln1_gamma,
+                &mut params.ln1_beta,
+                &mut params.qkv_weight,
+                &mut params.wo,
+                &mut params.wo_bias,
+                &mut params.ln2_gamma,
+                &mut params.ln2_beta,
+                &mut params.ffn_w1,
+                &mut params.ffn_b1,
+                &mut params.ffn_w2,
+                &mut params.ffn_b2,
+                &mut params.pos_embed,
+                &mut params.mhc,
+            ] {
+                for weight in part {
+                    *weight = value;
+                    value += 0.01;
+                }
+            }
+            [
+                params.patch_embed.len(),
+                params.patch_bias.len(),
+                params.qkv_bias.len(),
+                params.ln1_gamma.len(),
+                params.ln1_beta.len(),
+                params.qkv_weight.len(),
+                params.wo.len(),
+                params.wo_bias.len(),
+                params.ln2_gamma.len(),
+                params.ln2_beta.len(),
+                params.ffn_w1.len(),
+                params.ffn_b1.len(),
+                params.ffn_w2.len(),
+                params.ffn_b2.len(),
+                params.pos_embed.len(),
+                params.mhc.len(),
+            ]
+        };
+        {
+            let LayerTrainBuffers::Vit(train) = &mut gpu.cpu_fallback_train_buffers.get_mut()[0]
+            else {
+                panic!("ViT train buffers");
+            };
+            let mut value = 1.0;
+            for part in [
+                &mut train.updates.patch_embed,
+                &mut train.updates.patch_bias,
+                &mut train.updates.qkv_bias,
+                &mut train.updates.ln1_gamma,
+                &mut train.updates.ln1_beta,
+                &mut train.updates.qkv_weight,
+                &mut train.updates.wo,
+                &mut train.updates.wo_bias,
+                &mut train.updates.ln2_gamma,
+                &mut train.updates.ln2_beta,
+                &mut train.updates.ffn_w1,
+                &mut train.updates.ffn_b1,
+                &mut train.updates.ffn_w2,
+                &mut train.updates.ffn_b2,
+                &mut train.updates.pos_embed,
+                &mut train.updates.mhc,
+            ] {
+                for update in part {
+                    *update = value;
+                    value += 0.1;
+                }
+            }
+        }
+        let (initial_blob, gradient_blob) = {
+            let LayerParams::Vit(params) = &gpu.params[0] else {
+                unreachable!()
+            };
+            let buffers = gpu.cpu_fallback_train_buffers.borrow();
+            let LayerTrainBuffers::Vit(train) = &buffers[0] else {
+                unreachable!()
+            };
+            let mut updates = train.updates.clone();
+            super::sanitize_vit_updates(&mut updates, true);
+            let clip = super::vit_update_clip_scale(&updates, 5.0, true);
+            assert!(clip < 1.0, "test gradients must exercise ViT clipping");
+            super::scale_vit_updates(&mut updates, clip);
+            (params.to_blob(), updates.to_blob())
+        };
+        let adam = super::AdamParams {
+            lr: 0.005,
+            beta1: 0.8,
+            beta2: 0.95,
+            eps: 0.001,
+            decay: 0.1,
+            batch: 1,
+            step: 1,
+            decoupled_decay: true,
+        };
+        let decay_mask = [
+            true, false, false, false, false, true, true, false, false, false, true, false, true,
+            false, true, false,
+        ];
+        let mut expected = initial_blob;
+        let mut offset = 0;
+        for (index, (&len, &weight_decay)) in field_lengths.iter().zip(&decay_mask).enumerate() {
+            let update_adam = super::AdamParams {
+                lr: if index == 15 { adam.lr * 0.1 } else { adam.lr },
+                decay: if weight_decay { adam.decay } else { 0.0 },
+                ..adam
+            };
+            let zeros = vec![0.0; len];
+            let updated = darknet_cuda::host_ops::adam_update(
+                &expected[offset..offset + len],
+                &gradient_blob[offset..offset + len],
+                &zeros,
+                &zeros,
+                &update_adam,
+            )
+            .0;
+            expected[offset..offset + len].copy_from_slice(&updated);
+            offset += len;
+        }
+        gpu.update_weights_gpu(0.01, 0.0, 0.1, 1)
+            .expect("ViT Adam update");
+        let LayerParams::Vit(params) = &gpu.params[0] else {
+            unreachable!()
+        };
+        assert_slice_close("ViT Adam C++ order", &expected, &params.to_blob(), 1e-7);
     }
 
     #[test]
