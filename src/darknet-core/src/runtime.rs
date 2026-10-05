@@ -16482,6 +16482,56 @@ mod tests {
     }
 
     #[test]
+    fn maxpool_zero_nonmax_backward_matches_finite_differences() {
+        let shape = TensorShape::new(3, 3, 1, 1);
+        let output_shape = TensorShape::new(2, 2, 1, 1);
+        let input = Tensor::from_data(
+            shape,
+            vec![0.1, 0.9, 0.2, 0.8, 0.7, 0.6, 0.3, 0.5, 0.4],
+        )
+        .expect("input");
+        let output_gradient = Tensor::from_data(output_shape, vec![0.2, -0.3, 0.7, 1.1])
+            .expect("output gradient");
+        let loss = |values: &[f32]| {
+            let input = Tensor::from_data(shape, values.to_vec()).expect("perturbed input");
+            let output = super::forward_maxpool(2, 1, 1, 0, &input, output_shape, false)
+                .expect("maxpool forward");
+            output
+                .data
+                .iter()
+                .zip(&output_gradient.data)
+                .map(|(value, grad)| value * grad)
+                .sum::<f32>()
+        };
+        let gradients = [false, true].map(|zero_nonmax| {
+            super::backward_maxpool(
+                2,
+                1,
+                1,
+                0,
+                &input,
+                &output_gradient,
+                false,
+                zero_nonmax,
+            )
+            .expect("maxpool backward")
+        });
+        assert_eq!(gradients[0], gradients[1]);
+        let h = 1e-3;
+        for (index, analytic) in gradients[1].data.iter().enumerate() {
+            let mut plus = input.data.clone();
+            let mut minus = input.data.clone();
+            plus[index] += h;
+            minus[index] -= h;
+            let numeric = (loss(&plus) - loss(&minus)) / (2.0 * h);
+            assert!(
+                (analytic - numeric).abs() < 1e-3,
+                "input[{index}]: analytic {analytic}, numeric {numeric}"
+            );
+        }
+    }
+
+    #[test]
     fn fake_backend_route_backward_scatter_matches_forward_layout() {
         let backend = FakeBackend;
         let output_grad = FakeTensor {
