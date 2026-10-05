@@ -4052,14 +4052,14 @@ where
                         | LayerParams::Local(_)
                         | LayerParams::Convolutional(_)
                         | LayerParams::Connected(_)
+                        | LayerParams::Gru(_)
                         | LayerParams::Rnn(_)
                         | LayerParams::Lstm(_)
                         | LayerParams::Crnn(_)
                 )
             }) {
                 return Err(Error::InvalidConfig(
-                    "adam=1 on the GPU path supports convolutional, connected, local, standalone batchnorm, and RNN/LSTM/CRNN layers \
-                     (GRU host parameters have no Adam state)"
+                    "adam=1 on the GPU path supports convolutional, connected, local, standalone batchnorm, and GRU/RNN/LSTM/CRNN layers"
                         .to_string(),
                 ));
             }
@@ -4296,6 +4296,45 @@ where
                         &mut params.biases,
                         &mut train.bias_updates,
                         &mut moments.biases,
+                        adam,
+                    )?;
+                }
+                (LayerParams::Gru(params), LayerTrainBuffers::Gru(train)) => {
+                    let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    apply_host_adam_connected(
+                        &mut params.input_z,
+                        &mut train.input_z,
+                        host_adam_child(moments, 0),
+                        adam,
+                    )?;
+                    apply_host_adam_connected(
+                        &mut params.state_z,
+                        &mut train.state_z,
+                        host_adam_child(moments, 1),
+                        adam,
+                    )?;
+                    apply_host_adam_connected(
+                        &mut params.input_r,
+                        &mut train.input_r,
+                        host_adam_child(moments, 2),
+                        adam,
+                    )?;
+                    apply_host_adam_connected(
+                        &mut params.state_r,
+                        &mut train.state_r,
+                        host_adam_child(moments, 3),
+                        adam,
+                    )?;
+                    apply_host_adam_connected(
+                        &mut params.input_h,
+                        &mut train.input_h,
+                        host_adam_child(moments, 4),
+                        adam,
+                    )?;
+                    apply_host_adam_connected(
+                        &mut params.state_h,
+                        &mut train.state_h,
+                        host_adam_child(moments, 5),
                         adam,
                     )?;
                 }
@@ -20935,18 +20974,69 @@ mod tests {
     }
 
     #[test]
-    fn gpu_adam_rejects_unimplemented_gru_host_state() {
+    fn gpu_adam_updates_all_gru_parameter_blocks() {
         let network = Network::from_config(
             ConfigFile::parse_str(
                 "inline.cfg",
-                "[net]\nwidth=2\nheight=2\nchannels=1\nbatch=1\nadam=1\n[gru]\noutput=1\n",
+                "[net]\nwidth=1\nheight=1\nchannels=1\nbatch=1\nadam=1\nb1=0.8\nb2=0.95\neps=0.001\n[gru]\noutput=1\n",
             )
             .expect("cfg"),
         )
         .expect("network");
         let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
-        gpu.init_train_buffers_gpu().expect("buffers");
-        assert!(gpu.update_weights_gpu(0.01, 0.9, 0.0, 1).is_err());
+        let adam = super::AdamParams {
+            lr: 0.01,
+            beta1: 0.8,
+            beta2: 0.95,
+            eps: 0.001,
+            decay: 0.0,
+            batch: 1,
+            step: 1,
+            decoupled_decay: false,
+        };
+        let mut expected = Vec::new();
+        {
+            let LayerParams::Gru(params) = &mut gpu.params[0] else { panic!("GRU params") };
+            let LayerTrainBuffers::Gru(train) = &mut gpu.cpu_fallback_train_buffers.get_mut()[0] else {
+                panic!("GRU train buffers");
+            };
+            let blocks = [
+                (&mut params.input_z, &mut train.input_z),
+                (&mut params.state_z, &mut train.state_z),
+                (&mut params.input_r, &mut train.input_r),
+                (&mut params.state_r, &mut train.state_r),
+                (&mut params.input_h, &mut train.input_h),
+                (&mut params.state_h, &mut train.state_h),
+            ];
+            for (index, (params, train)) in blocks.into_iter().enumerate() {
+                params.weights[0] = 0.1 * (index as f32 + 1.0);
+                params.biases[0] = -0.05 * (index as f32 + 1.0);
+                train.weight_updates[0] = 0.03 * (index as f32 + 1.0);
+                train.bias_updates[0] = -0.02 * (index as f32 + 1.0);
+                let zeros = [0.0f32];
+                let weights = darknet_cuda::host_ops::adam_update(
+                    &params.weights, &train.weight_updates, &zeros, &zeros, &adam,
+                ).0;
+                let biases = darknet_cuda::host_ops::adam_update(
+                    &params.biases, &train.bias_updates, &zeros, &zeros, &adam,
+                ).0;
+                expected.push((weights, biases));
+            }
+        }
+        gpu.update_weights_gpu(0.01, 0.0, 0.0, 1).expect("GRU Adam update");
+        let LayerParams::Gru(params) = &gpu.params[0] else { unreachable!() };
+        let blocks = [
+            &params.input_z,
+            &params.state_z,
+            &params.input_r,
+            &params.state_r,
+            &params.input_h,
+            &params.state_h,
+        ];
+        for (index, (weights, biases)) in expected.iter().enumerate() {
+            assert_slice_close("GRU block weights Adam", weights, &blocks[index].weights, 1e-7);
+            assert_slice_close("GRU block biases Adam", biases, &blocks[index].biases, 1e-7);
+        }
     }
 
     #[test]
