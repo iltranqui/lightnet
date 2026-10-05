@@ -43,7 +43,10 @@ any more** — the remaining blockers are evidence gaps only.
 - **Phase 1b `omd_loss`** — `omd_loss.rs`, 14 tests.
 - **1b deferred (c) `contrastive`**, classifier branch — `contrastive.rs`,
   11 tests. The detection branch self-reports as unported.
-- **Phase 2A `yolox`** — `modern_yolo.rs`, 15 tests (see "just landed" below).
+- **Phase 2A `yolox`** — `modern_yolo.rs`, 15 tests.
+- **Phase 1b `[laya_scorer]`** — `laya_scorer.rs`, 14 tests, validated against the
+  real `test_data/laya/laya_english.weights` blob (LayerNorm gamma mean 0.9045,
+  beta rms 0.0425 - a wrong offset or blob order would be arbitrary).
 
 Layers ported follow the Layer Port Contract in `tasks/rust/layers.md`:
 spec + parse + shape in `model.rs`, pure math in its own module, thin CPU
@@ -52,7 +55,10 @@ heads whose truth is not their own output shape.
 
 ## Just landed (verify + commit if still uncommitted)
 
-`[yolox]`: `src/darknet-core/src/modern_yolo.rs` + `ModernYoloSpec`.
+`[laya_scorer]`: `src/darknet-core/src/laya_scorer.rs` + `LayaScorerSpec` +
+`LayerParams::LayaScorer`. Note it needs `#![feature(float_erf)]` in
+`darknet-core` (the erf GELU is not darknet's tanh approximation, and C++ uses
+`std::erf`).
 Evidence: 248 darknet-core unit tests pass, 0 unreachable-pattern warnings,
 `cfg_corpus` green, full oxide suite 18/18 `ok`, and
 `cargo check/build/run -j 4` green. Cfg keys: `classes`(20), `max`(200),
@@ -82,13 +88,14 @@ believing a `cfg_corpus` failure.
 
 ## NEXT (in dependency order, nothing blocked)
 
-1. Phase 1b `laya_*` — unblocked by decision 2. Read
-   `Jev_laya:src-lib/softmax_layer.cpp` / the laya sources first.
-   `laya_marker_gather` (S), `laya_scorer` (S: LayerNorm -> Linear -> GELU ->
-   Linear), `laya_act_head` (S/M), `laya_loss` (M: `ce | rlcd`).
-   Weights: `load_laya_scorer_weights` (`weights.cpp:1705`),
-   `load_laya_act_head_weights` (`:1736`). Needs the shared LayerNorm/GEMM
-   host ops.
+1. Phase 1b `laya_*` — `laya_scorer` is done. Next in the family:
+   `laya_marker_gather` (S, two inputs via `layers=idxA,idxB`, checks
+   `out_c(A)==hidden` and `out_c(B)>=2*max_options`), `laya_act_head` (S/M,
+   three inputs), `laya_loss` (M, `ce | rlcd`).
+   **Order matters:** `[laya_scorer]`'s `weights=` is only usable together with
+   `[laya_encoder]` + `[laya_head]` (the shared-file offset is computed past
+   their blobs), so those two come next even though the plan files them under
+   Phase 4. They also need the Phase 3A prerequisite kernel set.
 2. Phase 2A remainder — `ppyoloe` + `yolonas` (share the DFL decode already
    sketched in `modern_yolo.rs` comments), then `centernet`, plus the
    LegoGears nested-object fix (`class_quality`, smallest-area-wins,

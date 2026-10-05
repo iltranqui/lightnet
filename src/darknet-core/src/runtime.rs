@@ -233,6 +233,8 @@ pub enum LayerParams {
     Rnn(RnnParams),
     Lstm(LstmParams),
     Crnn(CrnnParams),
+    /// `[laya_scorer]`'s six frozen tensors (loaded from its `.weights` blob).
+    LayaScorer(crate::laya_scorer::LayaScorerWeights),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1135,6 +1137,19 @@ impl ExecutableNetwork {
                     }
                     (Tensor::from_data(current_input.shape, data)?, None)
                 }
+                // `[laya_scorer]`: LayerNorm -> Linear -> GELU(erf) -> Linear,
+                // applied independently to each of the `max_options` slots.
+                (LayerKind::LayaScorer(spec), LayerParams::LayaScorer(weights)) => {
+                    let batch = current_input.shape.batch;
+                    let data = crate::laya_scorer::scorer_forward(
+                        &current_input.data,
+                        weights,
+                        spec,
+                        batch,
+                    )
+                    .map_err(Error::InvalidConfig)?;
+                    (Tensor::from_data(layer.output_shape, data)?, None)
+                }
                 // C++ `memcpy(l.output, state.input, ...)` before any loss work.
                 (LayerKind::OmdLoss(_), LayerParams::None) => (current_input.clone(), None),
                 // `[contrastive]` never touches its output either: all of the
@@ -1884,6 +1899,29 @@ impl ExecutableNetwork {
                         &mut layer_output_gradients,
                     )?;
                 }
+                (LayerKind::LayaScorer(spec), LayerParams::LayaScorer(weights)) => {
+                    let current = forward
+                        .layer_outputs
+                        .get(layer.index - 1)
+                        .ok_or_else(|| Error::InvalidConfig(format!(
+                            "missing input for layer #{}",
+                            layer.index
+                        )))?;
+                    let input_grad = crate::laya_scorer::scorer_backward_input(
+                        &current.data,
+                        &grad.data,
+                        weights,
+                        spec,
+                        current.shape.batch,
+                    )
+                    .map_err(Error::InvalidConfig)?;
+                    accumulate_previous_gradient(
+                        layer.index,
+                        &Tensor::from_data(current.shape, input_grad)?,
+                        &mut input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
+                }
                 (LayerKind::Rnn(spec), LayerParams::Rnn(params)) => {
                     let Some(RecurrentForwardCache::Rnn(cache)) = forward
                         .recurrent_caches
@@ -2315,6 +2353,9 @@ impl ExecutableNetwork {
                     accumulate_convolutional_train_buffer(&mut train.output, &gradient.output)?;
                 }
                 (_, LayerParams::None) => {}
+                // `[laya_scorer]` is frozen by default, so it has no train
+                // buffers and contributes no parameter gradient.
+                (_, LayerParams::LayaScorer(_)) => {}
                 _ => {
                     return Err(Error::InvalidConfig(format!(
                         "layer #{} produced gradients incompatible with train buffers",
@@ -4313,10 +4354,32 @@ where
                         .upload_f32(&tensor_backend_shape(layer.output_shape), &out.output)
                         .map_err(|err| backend_error("upload segmentation output", err))?
                 }
-                // `[yolox]` applies the C++ `activate_modern_output` (a sigmoid
-                // on the trailing `1 + classes` entries of every cell), which
-                // is a strided sub-range pass, so it goes through the host for
-                // now like the other host-round-trip heads.
+                // `[laya_scorer]` is LayerNorm + two dense layers, so it runs on
+                // `[laya_scorer]` is LayerNorm + two dense layers, so it runs on
+                // the host for now (same choice as `[contrastive]`).
+                (LayerKind::LayaScorer(spec), LayerParams::LayaScorer(_)) => {
+                    let host_input = self
+                        .download_tensor(current_input, layer.input_shape)
+                        .map_err(|err| backend_error("download laya_scorer input", err))?;
+                    let LayerParams::LayaScorer(weights) = &self.params[layer.index] else {
+                        return Err(Error::InvalidConfig(format!(
+                            "layer #{} ([laya_scorer]) is missing its frozen weights",
+                            layer.index
+                        )));
+                    };
+                    let weights = weights.clone();
+                    let data = crate::laya_scorer::scorer_forward(
+                        &host_input.data,
+                        &weights,
+                        spec,
+                        layer.input_shape.batch,
+                    )
+                    .map_err(Error::InvalidConfig)?;
+                    self.backend
+                        .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
+                        .map_err(|err| backend_error("upload laya_scorer output", err))?
+                }
+                // the host for now (same choice as `[contrastive]`).
                 (LayerKind::Yolox(spec), LayerParams::None) => {
                     let host_input = self
                         .download_tensor(current_input, layer.input_shape)
@@ -5868,6 +5931,42 @@ where
                         &mut layer_output_gradients,
                     )?;
                 }
+                // `[laya_scorer]`: LayerNorm + two dense layers on the host, so
+                // the gradient round-trips too.
+                (
+                    LayerKind::LayaScorer(spec),
+                    Some(LayerParams::LayaScorer(weights)),
+                ) => {
+                    let current = forward.gpu_layer_outputs.get(layer.index - 1).ok_or(
+                        Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: -1,
+                        },
+                    )?;
+                    let host = self
+                        .download_tensor(current, layer.input_shape)
+                        .map_err(|err| backend_error("download laya_scorer input", err))?;
+                    let host_seed = self
+                        .download_tensor(&grad, layer.output_shape)
+                        .map_err(|err| backend_error("download laya_scorer seed", err))?;
+                    let data = crate::laya_scorer::scorer_backward_input(
+                        &host.data,
+                        &host_seed.data,
+                        weights,
+                        spec,
+                        layer.input_shape.batch,
+                    )
+                    .map_err(Error::InvalidConfig)?;
+                    let uploaded = self
+                        .backend
+                        .upload_f32(&tensor_backend_shape(layer.input_shape), &data)
+                        .map_err(|err| backend_error("upload laya_scorer input gradient", err))?;
+                    self.accumulate_previous_gpu_gradient(
+                        layer.index,
+                        uploaded,
+                        &mut layer_output_gradients,
+                    )?;
+                }
                 (LayerKind::Yolo(_), Some(LayerParams::None))
                 | (LayerKind::GaussianYolo(_), Some(LayerParams::None))
                 | (LayerKind::Region(_), Some(LayerParams::None))
@@ -5880,6 +5979,10 @@ where
                 | (LayerKind::Regression(_), Some(LayerParams::None))
                 | (LayerKind::JevCe(_), Some(LayerParams::None))
                 | (LayerKind::Sam(_), Some(LayerParams::None))
+                // `[yolox]` applies the C++ `activate_modern_output` (a sigmoid
+                // on the trailing `1 + classes` entries of every cell), which
+                // is a strided sub-range pass, so it goes through the host for
+                // now like the other host-round-trip heads.
                 | (LayerKind::Yolox(_), Some(LayerParams::None)) => {
                     self.accumulate_previous_gpu_gradient(
                         layer.index,
@@ -6845,6 +6948,9 @@ fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
             spec.filters,
             spec.size,
         )),
+        LayerKind::LayaScorer(spec) => {
+            LayerParams::LayaScorer(crate::laya_scorer::LayaScorerWeights::zeroed(spec.hidden))
+        }
         LayerKind::Shortcut(spec) => match spec.weight_count(layer.input_shape.channels) {
             0 => LayerParams::None,
             len => LayerParams::Shortcut(ShortcutParams {
@@ -7577,6 +7683,19 @@ fn load_weights_into_params(
                 read_f32_into(&mut file, &mut batch_norm.scales)?;
                 read_f32_into(&mut file, &mut batch_norm.rolling_mean)?;
                 read_f32_into(&mut file, &mut batch_norm.rolling_variance)?;
+            }
+            // The scorer blob does **not** live in the sequential stream: C++
+            // seeks past the encoder and head blobs with `laya_open_weights`
+            // (`sc_blob_offset = 20 + skip_floats * 4`) and then calls
+            // `load_laya_scorer_weights`.  Reaching it here means a plain
+            // sequential reader would read the wrong bytes, so it is an error
+            // rather than a silent misread; use `load_laya_scorer_blob`.
+            LayerParams::LayaScorer(_) => {
+                return Err(Error::InvalidConfig(format!(
+                    "layer #{} ([laya_scorer]) must be loaded with `load_laya_scorer_blob`, \
+                     which seeks to its offset in the shared .weights file",
+                    layer.index
+                )));
             }
             LayerParams::Convolutional(conv) => {
                 read_f32_into(&mut file, &mut conv.biases)?;
@@ -17387,6 +17506,84 @@ mod tests {
     /// the GPU chain must match the CPU one for any seed.
     /// `[yolox]` transforms its input (the trailing `1 + classes` entries of
     /// every cell go through a sigmoid) and its seed reaches the previous layer.
+    /// `[laya_scorer]` is LayerNorm + two dense layers, currently a host round
+    /// trip on the GPU path, so its output and its input gradient must match
+    /// the CPU ones exactly.  (The generic `assert_gpu_layer_chain_matches_cpu`
+    /// helper is not used here: it also checks the preceding convolution's
+    /// weight gradient, which cancels out for a 1x1 convolution with this
+    /// narrow a seed.)
+    #[test]
+    fn gpu_laya_scorer_matches_cpu_forward_and_backward() {
+        let cfg = "[net]\nwidth=4\nheight=1\nchannels=4\nbatch=2\n\
+                   [convolutional]\nfilters=4\nsize=1\nstride=1\nactivation=linear\n\
+                   [laya_scorer]\nhidden=4\nmax_options=4\n";
+        let network =
+            Network::from_config(ConfigFile::parse_str("inline.cfg", cfg).expect("cfg parses"))
+                .expect("network builds");
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        fill_conv_params(&mut cpu.params);
+        {
+            // Give the scorer a trained-like gamma and dense fc1 so the seed
+            // actually reaches the convolution.
+            let LayerParams::LayaScorer(weights) = &mut cpu.params[1] else { panic!() };
+            weights.ln_w.fill(1.0);
+            for (i, v) in weights.fc1_w.iter_mut().enumerate() {
+                *v = ((i * 7 % 9) as f32 - 4.0) / 6.0;
+            }
+            for (i, v) in weights.fc2_w.iter_mut().enumerate() {
+                *v = (i as f32 % 3.0) * 0.5 - 0.25;
+            }
+            weights.fc2_b = 0.1;
+        }
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        gpu.params = cpu.params.clone();
+        gpu.init_train_buffers_gpu().expect("GPU train buffers");
+
+        let input = patterned_input(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
+        let gpu_forward = gpu.forward_training_with_state(&input).expect("GPU forward");
+        assert_slice_close(
+            "laya_scorer output",
+            &cpu_forward.layer_outputs[1].data,
+            &gpu_forward.cpu_forward.layer_outputs[1].data,
+            1e-6,
+        );
+
+        let mut seeds = vec![None; cpu.network.layers.len()];
+        let shape = cpu.network.layers[1].output_shape;
+        seeds[1] = Some(
+            Tensor::from_data(
+                shape,
+                (0..shape.batch * shape.element_count())
+                    .map(|i| (i as f32 * 0.91).cos())
+                    .collect(),
+            )
+            .expect("seed tensor"),
+        );
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds).expect("CPU backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds).expect("GPU backward");
+        // The seed's effect on the preceding convolution shows up in its bias
+        // gradient (the plain sum of its output gradient), which is non-zero and
+        // does not cancel for this seed.
+        let LayerTrainBuffers::Convolutional(cpu_train) = &cpu.train_buffers[0] else {
+            panic!("expected convolutional buffers")
+        };
+        let gpu_buffers = gpu.device_train_buffers.borrow();
+        let gpu_train = gpu_buffers[0].as_ref().expect("GPU train buffers");
+
+        assert!(
+            cpu_train.bias_updates.iter().any(|g| g.abs() > 1e-6),
+            "the seed must reach the convolution: {:?}",
+            cpu_train.bias_updates
+        );
+        assert_slice_close(
+            "convolution bias gradient through laya_scorer",
+            &cpu_train.bias_updates,
+            &gpu_train.bias_updates.data,
+            1e-5,
+        );
+    }
+
     #[test]
     fn gpu_yolox_head_matches_cpu_forward_and_backward() {
         assert_gpu_layer_chain_matches_cpu(

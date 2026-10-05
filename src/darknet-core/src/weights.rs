@@ -498,6 +498,9 @@ mod tests {
             let mut executable = ExecutableNetwork::new(network.clone());
             for params in &mut executable.params {
                 match params {
+                    // The scorer's blob lives at an offset inside a shared file,
+                    // so it is never part of this sequential stream.
+                    LayerParams::LayaScorer(_) => {}
                     LayerParams::Rnn(recurrent) => {
                         for nested in [
                             &mut recurrent.input,

@@ -357,6 +357,21 @@ impl SegmentationLoss {
     }
 }
 
+/// `[laya_scorer]`: the LAYA decision-model scorer (Phase 1b, unblocked by
+/// Open Question 2), ported from
+/// `Jev_laya:src-lib/darknet_cfg.cpp::parse_laya_scorer_section`.  The layer
+/// needs `hidden * max_options` frozen weights; see
+/// `src/darknet-core/src/laya_scorer.rs` for the maths and the blob order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayaScorerSpec {
+    /// Width of each option-slot vector; must equal the input channels.
+    pub hidden: usize,
+    /// Number of option slots; must equal the input width.
+    pub max_options: usize,
+    /// LayerNorm epsilon; `<= 0` falls back to `LAYA_LAYERNORM_EPS` (1e-5).
+    pub ln_eps: f32,
+}
+
 /// `[yolox]`: the anchor-free detection head (Phase 2A of `tasks/rust/layers.md`),
 /// ported from `Jev_laya:src-lib/darknet_cfg.cpp::parse_yolox_section`.  The
 /// layer has no weights and no kernels; see
@@ -772,6 +787,8 @@ pub enum LayerKind {
     Contrastive(ContrastiveSpec),
     /// `[yolox]`; the sibling spellings live in [`ModernYoloSpec`].
     Yolox(ModernYoloSpec),
+    /// `[laya_scorer]`, whose weights live in its own blob type.
+    LayaScorer(LayaScorerSpec),
     Rnn(RnnSpec),
     Gru(GruSpec),
     Lstm(LstmSpec),
@@ -813,6 +830,7 @@ impl LayerKind {
             Self::Sam(_) => "sam",
             Self::Contrastive(_) => "contrastive",
             Self::Yolox(_) => "yolox",
+            Self::LayaScorer(_) => "laya_scorer",
             Self::Rnn(_) => "rnn",
             Self::Gru(_) => "gru",
             Self::Lstm(_) => "lstm",
@@ -1890,6 +1908,37 @@ fn parse_layer_kind(
             activation: Activation::parse(&section.get_str("activation", "linear")),
         }),
         "yolox" => LayerKind::Yolox(parse_modern_yolo_spec(&section)?),
+        "laya_scorer" => {
+            // C++ `parse_laya_scorer_section`: the layer is constructed for
+            // `max_options x hidden` and checks the incoming shape against it,
+            // so both come from the section (not from `[net]`).
+            let line = section.line;
+            let hidden = section.get_usize("hidden", LAYA_SCORER_HIDDEN)?;
+            if hidden == 0 {
+                return Err(Error::InvalidConfig(format!("[laya_scorer] at line {line}: hidden must be > 0")));
+            }
+            let max_options = section.get_usize("max_options", current.width)?;
+            if max_options == 0 {
+                return Err(Error::InvalidConfig(format!("[laya_scorer] at line {line}: max_options must be > 0")));
+            }
+            if current.channels != hidden {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_scorer] at line {line}: requires channels=hidden={hidden}, got {}",
+                    current.channels
+                )));
+            }
+            if current.width != max_options {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_scorer] at line {line}: requires width=max_options={max_options}, got {}",
+                    current.width
+                )));
+            }
+            LayerKind::LayaScorer(LayaScorerSpec {
+                hidden,
+                max_options,
+                ln_eps: section.get_f32("ln_eps", crate::laya_scorer::LAYA_LAYERNORM_EPS)?,
+            })
+        }
         "contrastive" => LayerKind::Contrastive(ContrastiveSpec {
             classes: section.get_usize("classes", 1000)?,
             yolo_layer: section.get_isize("yolo_layer", 0)?,
@@ -2083,6 +2132,9 @@ fn infer_output_shape(
         | LayerKind::Dropout { .. }
         | LayerKind::Contrastive(_) => Ok(current),
         | LayerKind::Yolox(_) => Ok(current),
+        // `[laya_scorer]` turns `[batch, hidden, 1, max_options]` into
+        // `[batch, 1, 1, max_options]`.
+        LayerKind::LayaScorer(spec) => Ok(TensorShape::new(spec.max_options, 1, 1, current.batch)),
         LayerKind::ChannelSlice(spec) => {
             let source_index = resolve_relative_layer(layer_index, spec.from)?;
             let source = built_layers
@@ -2348,6 +2400,9 @@ fn resolve_cfg_path(parent: &Path, raw: &str) -> PathBuf {
 fn conv_dim(input: usize, padding: usize, size: usize, stride: usize) -> usize {
     ((input + 2 * padding).saturating_sub(size) / stride.max(1)) + 1
 }
+
+/// C++ `LAYA_SCORER_HIDDEN`, the default `hidden` of `[laya_scorer]`.
+pub const LAYA_SCORER_HIDDEN: usize = 1024;
 
 /// C++ `parse_yolox_section`: `classes`(20), `max`(200), `jitter`(0.2) and
 /// `resize`(1.0).  The PP-YOLOE / YOLO-NAS siblings share the first two keys and

@@ -26,6 +26,10 @@ pub fn initialize_training_params(network: &Network, params: &mut [LayerParams],
             }
             // C++ initialises weighted-shortcut weights to 1.0.
             LayerParams::Shortcut(p) => p.weights.fill(1.0),
+            // C++ zero-initialises the scorer and expects
+            // `load_laya_scorer_weights` to populate it from the shared blob, so
+            // re-randomising it here would be wrong.
+            LayerParams::LayaScorer(_) => {}
             LayerParams::Rnn(p) => {
                 for p in [&mut p.input, &mut p.self_params, &mut p.output] {
                     connected(p, &mut rng);

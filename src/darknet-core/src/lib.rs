@@ -1,3 +1,10 @@
+//! `float_erf` is needed by `[laya_scorer]`, whose activation is the *exact
+//! erf* GELU (torch `nn.GELU()`'s default) rather than darknet's tanh
+//! approximation; C++ uses `std::erf` there, so a hand-rolled approximation
+//! would be a real numerical divergence. The toolchain is already pinned to
+//! nightly (see `rust-toolchain.toml`).
+#![feature(float_erf)]
+
 //! CPU-first Rust implementation of the Darknet/YOLO runtime.
 //!
 //! The port keeps Darknet's observable contracts—`.cfg` parsing, planar
@@ -27,6 +34,7 @@ pub mod error;
 pub mod evaluate;
 pub use evaluate::{MapReport, REPORT_CONFIDENCE, ValidationDataset, detector_map};
 pub mod image;
+pub mod laya_scorer;
 pub(crate) mod jev_ce;
 pub mod initialize;
 pub mod loader_profile;
