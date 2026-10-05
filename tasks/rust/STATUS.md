@@ -47,9 +47,9 @@ Latest increments:
   host routing and CPU backward/SGD fallback; real-device `oxide_runtime_chain`
   parity covers the full forward/backward/update path. Device-native routing and
   backward remain.
-- Host Adam now updates standalone batchnorm, local, and connected params with
-  per-layer moment state; two-step BN coverage and local one-step reference
-  coverage pass. Recurrent Adam remains open.
+- Host Adam now updates standalone batchnorm, local, connected, and RNN/LSTM/CRNN
+  parameters with per-layer/per-block moments. Two-step BN, local, and RNN
+  reference tests pass; GRU host optimizer state remains open.
 - `[vit]` reference path: cfg/shape, C++-ordered header-aware weights, seeded init,
   CPU analytical forward/backward + SGD, and GPU f32 host fallback; 23 focused
   tests pass, targeted package check/build pass with `-j 4`.

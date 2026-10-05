@@ -3038,6 +3038,8 @@ type GpuMoments<T> = (T, T);
 struct HostAdamLayerState {
     weights: Option<(Vec<f32>, Vec<f32>)>,
     biases: Option<(Vec<f32>, Vec<f32>)>,
+    scales: Option<(Vec<f32>, Vec<f32>)>,
+    children: Vec<HostAdamLayerState>,
 }
 
 #[derive(Clone, Debug)]
@@ -4050,11 +4052,14 @@ where
                         | LayerParams::Local(_)
                         | LayerParams::Convolutional(_)
                         | LayerParams::Connected(_)
+                        | LayerParams::Rnn(_)
+                        | LayerParams::Lstm(_)
+                        | LayerParams::Crnn(_)
                 )
             }) {
                 return Err(Error::InvalidConfig(
-                    "adam=1 on the GPU path supports convolutional, connected, local, and standalone batchnorm layers only \
-                     (recurrent layers have no host Adam state)"
+                    "adam=1 on the GPU path supports convolutional, connected, local, standalone batchnorm, and RNN/LSTM/CRNN layers \
+                     (GRU host parameters have no Adam state)"
                         .to_string(),
                 ));
             }
@@ -4241,9 +4246,9 @@ where
         Ok(())
     }
 
-    /// Adam step for host-resident connected, local, and standalone batchnorm
-    /// params (device convolutions are handled by the main loop). Rejects other
-    /// host parameter types until their optimizer state is implemented.
+    /// Adam step for host-resident connected, local, batchnorm, and recurrent
+    /// params. Device convolutions are handled by the main loop; unsupported
+    /// host parameter families are rejected.
     fn update_cpu_fallback_adam(&mut self, adam: &AdamParams) -> Result<()> {
         let iteration_num = self.train_iteration as i64 + 1;
         let burn_in = self.network.net.burn_in;
@@ -4262,13 +4267,13 @@ where
             match (&mut self.params[index], &mut buffers[index]) {
                 (LayerParams::BatchNorm(params), LayerTrainBuffers::BatchNorm(train)) => {
                     let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
-                    apply_host_adam(
+                    apply_host_adam_non_weight(
                         &mut params.scales,
                         &mut train.scale_updates,
-                        &mut moments.weights,
+                        &mut moments.scales,
                         adam,
                     )?;
-                    apply_host_adam(
+                    apply_host_adam_non_weight(
                         &mut params.biases,
                         &mut train.bias_updates,
                         &mut moments.biases,
@@ -4277,18 +4282,7 @@ where
                 }
                 (LayerParams::Connected(params), LayerTrainBuffers::Connected(train)) => {
                     let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
-                    apply_host_adam(
-                        &mut params.weights,
-                        &mut train.weight_updates,
-                        &mut moments.weights,
-                        adam,
-                    )?;
-                    apply_host_adam(
-                        &mut params.biases,
-                        &mut train.bias_updates,
-                        &mut moments.biases,
-                        adam,
-                    )?;
+                    apply_host_adam_connected(params, train, moments, adam)?;
                 }
                 (LayerParams::Local(params), LayerTrainBuffers::Local(train)) => {
                     let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
@@ -4298,11 +4292,71 @@ where
                         &mut moments.weights,
                         adam,
                     )?;
-                    apply_host_adam(
+                    apply_host_adam_non_weight(
                         &mut params.biases,
                         &mut train.bias_updates,
                         &mut moments.biases,
                         adam,
+                    )?;
+                }
+                (LayerParams::Rnn(params), LayerTrainBuffers::Rnn(train)) => {
+                    let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    apply_host_adam_connected(
+                        &mut params.input,
+                        &mut train.input,
+                        host_adam_child(moments, 0),
+                        adam,
+                    )?;
+                    apply_host_adam_connected(
+                        &mut params.self_params,
+                        &mut train.self_params,
+                        host_adam_child(moments, 1),
+                        adam,
+                    )?;
+                    apply_host_adam_connected(
+                        &mut params.output,
+                        &mut train.output,
+                        host_adam_child(moments, 2),
+                        adam,
+                    )?;
+                }
+                (LayerParams::Lstm(params), LayerTrainBuffers::Lstm(train)) => {
+                    let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    apply_host_adam_connected(
+                        &mut params.wf, &mut train.wf, host_adam_child(moments, 0), adam,
+                    )?;
+                    apply_host_adam_connected(
+                        &mut params.wi, &mut train.wi, host_adam_child(moments, 1), adam,
+                    )?;
+                    apply_host_adam_connected(
+                        &mut params.wg, &mut train.wg, host_adam_child(moments, 2), adam,
+                    )?;
+                    apply_host_adam_connected(
+                        &mut params.wo, &mut train.wo, host_adam_child(moments, 3), adam,
+                    )?;
+                    apply_host_adam_connected(
+                        &mut params.uf, &mut train.uf, host_adam_child(moments, 4), adam,
+                    )?;
+                    apply_host_adam_connected(
+                        &mut params.ui, &mut train.ui, host_adam_child(moments, 5), adam,
+                    )?;
+                    apply_host_adam_connected(
+                        &mut params.ug, &mut train.ug, host_adam_child(moments, 6), adam,
+                    )?;
+                    apply_host_adam_connected(
+                        &mut params.uo, &mut train.uo, host_adam_child(moments, 7), adam,
+                    )?;
+                }
+                (LayerParams::Crnn(params), LayerTrainBuffers::Crnn(train)) => {
+                    let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    apply_host_adam_convolutional(
+                        &mut params.input, &mut train.input, host_adam_child(moments, 0), adam,
+                    )?;
+                    apply_host_adam_convolutional(
+                        &mut params.self_params, &mut train.self_params, host_adam_child(moments, 1), adam,
+                    )?;
+                    apply_host_adam_convolutional(
+                        &mut params.output, &mut train.output, host_adam_child(moments, 2), adam,
                     )?;
                 }
                 (LayerParams::Convolutional(_), _) if matches!(layer.kind, LayerKind::Deconvolutional(_)) => {
@@ -8836,6 +8890,94 @@ fn apply_host_adam(
         *value = 0.0;
     }
     *moments = Some((m2, v2));
+    Ok(())
+}
+
+fn apply_host_adam_non_weight(
+    weights: &mut [f32],
+    updates: &mut [f32],
+    moments: &mut Option<(Vec<f32>, Vec<f32>)>,
+    adam: &AdamParams,
+) -> Result<()> {
+    let mut params = *adam;
+    if params.decoupled_decay {
+        params.decay = 0.0;
+    }
+    apply_host_adam(weights, updates, moments, &params)
+}
+
+fn host_adam_child(state: &mut HostAdamLayerState, index: usize) -> &mut HostAdamLayerState {
+    state.children.resize_with(index + 1, HostAdamLayerState::default);
+    &mut state.children[index]
+}
+
+fn apply_host_adam_connected(
+    params: &mut ConnectedParams,
+    train: &mut ConnectedTrainBuffers,
+    state: &mut HostAdamLayerState,
+    adam: &AdamParams,
+) -> Result<()> {
+    apply_host_adam(
+        &mut params.weights,
+        &mut train.weight_updates,
+        &mut state.weights,
+        adam,
+    )?;
+    apply_host_adam_non_weight(
+        &mut params.biases,
+        &mut train.bias_updates,
+        &mut state.biases,
+        adam,
+    )?;
+    match (&mut params.batch_norm, &mut train.batch_norm) {
+        (Some(params_bn), Some(train_bn)) => apply_host_adam_non_weight(
+            &mut params_bn.scales,
+            &mut train_bn.scale_updates,
+            &mut state.scales,
+            adam,
+        )?,
+        (None, None) => {}
+        _ => {
+            return Err(Error::InvalidConfig(
+                "connected Adam batchnorm state mismatch".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn apply_host_adam_convolutional(
+    params: &mut ConvolutionalParams,
+    train: &mut ConvolutionalTrainBuffers,
+    state: &mut HostAdamLayerState,
+    adam: &AdamParams,
+) -> Result<()> {
+    apply_host_adam(
+        &mut params.weights,
+        &mut train.weight_updates,
+        &mut state.weights,
+        adam,
+    )?;
+    apply_host_adam_non_weight(
+        &mut params.biases,
+        &mut train.bias_updates,
+        &mut state.biases,
+        adam,
+    )?;
+    match (&mut params.batch_norm, &mut train.batch_norm) {
+        (Some(params_bn), Some(train_bn)) => apply_host_adam_non_weight(
+            &mut params_bn.scales,
+            &mut train_bn.scale_updates,
+            &mut state.scales,
+            adam,
+        )?,
+        (None, None) => {}
+        _ => {
+            return Err(Error::InvalidConfig(
+                "convolutional Adam batchnorm state mismatch".to_owned(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -20793,11 +20935,11 @@ mod tests {
     }
 
     #[test]
-    fn gpu_adam_rejects_recurrent_host_fallback_layers() {
+    fn gpu_adam_rejects_unimplemented_gru_host_state() {
         let network = Network::from_config(
             ConfigFile::parse_str(
                 "inline.cfg",
-                "[net]\nwidth=2\nheight=2\nchannels=1\nbatch=1\nadam=1\n[rnn]\nhidden=2\noutput=1\n",
+                "[net]\nwidth=2\nheight=2\nchannels=1\nbatch=1\nadam=1\n[gru]\noutput=1\n",
             )
             .expect("cfg"),
         )
@@ -20939,6 +21081,78 @@ mod tests {
         let LayerParams::BatchNorm(params) = &gpu.params[0] else { unreachable!() };
         assert_slice_close("batchnorm scales Adam step 2", &expected_scales, &params.scales, 1e-7);
         assert_slice_close("batchnorm biases Adam step 2", &expected_biases, &params.biases, 1e-7);
+    }
+
+    #[test]
+    fn gpu_adam_updates_all_rnn_parameter_blocks() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "inline.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=1\nbatch=1\nadam=1\nb1=0.8\nb2=0.95\neps=0.001\ndecoupled_decay=1\n[rnn]\nhidden=1\noutput=1\nactivation=linear\n",
+            )
+            .expect("cfg"),
+        )
+        .expect("network");
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        let adam = super::AdamParams {
+            lr: 0.01,
+            beta1: 0.8,
+            beta2: 0.95,
+            eps: 0.001,
+            decay: 0.2,
+            batch: 1,
+            step: 1,
+            decoupled_decay: true,
+        };
+        let no_decay = super::AdamParams { decay: 0.0, ..adam };
+        let mut expected = Vec::new();
+        {
+            let LayerParams::Rnn(params) = &mut gpu.params[0] else { panic!("RNN params") };
+            let LayerTrainBuffers::Rnn(train) = &mut gpu.cpu_fallback_train_buffers.get_mut()[0] else {
+                panic!("RNN train buffers");
+            };
+            let blocks = [
+                (&mut params.input, &mut train.input, 0.2, -0.1),
+                (&mut params.self_params, &mut train.self_params, 0.4, 0.3),
+                (&mut params.output, &mut train.output, -0.5, 0.6),
+            ];
+            for (block_index, (params, train, weight, bias)) in blocks.into_iter().enumerate() {
+                params.weights[0] = weight;
+                params.biases[0] = bias;
+                train.weight_updates[0] = 0.1 * (block_index as f32 + 1.0);
+                train.bias_updates[0] = -0.07 * (block_index as f32 + 1.0);
+                let zeros = [0.0f32];
+                let ew = darknet_cuda::host_ops::adam_update(
+                    &params.weights,
+                    &train.weight_updates,
+                    &zeros,
+                    &zeros,
+                    &adam,
+                )
+                .0;
+                let eb = darknet_cuda::host_ops::adam_update(
+                    &params.biases,
+                    &train.bias_updates,
+                    &zeros,
+                    &zeros,
+                    &no_decay,
+                )
+                .0;
+                expected.push((ew, eb));
+            }
+        }
+        gpu.update_weights_gpu(0.01, 0.0, 0.2, 1)
+            .expect("RNN Adam update");
+        let LayerParams::Rnn(params) = &gpu.params[0] else { unreachable!() };
+        for (block_index, (weights, biases)) in expected.iter().enumerate() {
+            let block = match block_index {
+                0 => &params.input,
+                1 => &params.self_params,
+                _ => &params.output,
+            };
+            assert_slice_close("RNN block weights Adam", weights, &block.weights, 1e-7);
+            assert_slice_close("RNN block biases Adam", biases, &block.biases, 1e-7);
+        }
     }
 
     #[test]
