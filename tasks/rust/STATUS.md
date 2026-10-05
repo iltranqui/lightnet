@@ -36,9 +36,11 @@ and housekeeping — each with its evidence.
 Latest increments:
 - YOLO IoU/GIoU box geometry deltas now have central finite-difference coverage;
   the test records Darknet's legacy 0.5 width/height comparison factor.
-- f16 reverse upsample forward is already implemented and verified by
-  `oxide_half::f16_pool_upsample_route_match_f32_reference` (13 passed,
-  1 ignored) and `oxide_runtime_f16::tiny_net_with_avgpool_local_avgpool_batchnorm_reverse_upsample_matches_f32`.
+- f16 standalone batchnorm (via channel-affine), bias + activation, and reverse
+  upsample forward are already implemented. Verified by
+  `oxide_half::f16_shortcut_avgpool_affine_reverse_match_f64_reference` and
+  `oxide_runtime_f16::tiny_net_with_avgpool_local_avgpool_batchnorm_reverse_upsample_matches_f32`
+  (13 + 5 tests passed; 1 ignored in the half suite).
 - Weighted `[shortcut]` GPU forward composes oxide channel-scale + add; exact
   CPU backward/SGD fallback has real-device runtime parity coverage.
 - AMP runtime with dropout and dropblock now has real-device output/mask/backward/

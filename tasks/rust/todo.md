@@ -32,9 +32,10 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
 
 - [ ] CUDA graph capture: skipped — cuda-core only has raw begin/end capture (no
   instantiate/launch wrapper) and pool addresses are not static.
-- [ ] fp16 remainder: conv dgrad/wgrad on f16, standalone f16 BN / bias +
-  activation kernels, half2 elementwise (not needed). f16 reverse upsample
-  forward is implemented and covered by `oxide_half` plus runtime f16 parity.
+- [ ] fp16 remainder: conv dgrad/wgrad on f16; half2 elementwise (not needed).
+  Standalone f16 batchnorm uses the channel-affine kernel, standalone bias +
+  activation and reverse upsample forward are implemented, and all three have
+  `oxide_half` / runtime f16 parity coverage.
 - [ ] Implicit-GEMM conv as default: implemented (`DARKNET_OXIDE_CONV=implicit`)
   but ~5% slower (materialised B tile uses 16-byte `cp.async`, implicit only
   4-byte scalar copies); stays opt-in, `Auto` keeps the materialised path.
