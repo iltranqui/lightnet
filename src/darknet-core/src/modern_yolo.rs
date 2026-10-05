@@ -452,6 +452,23 @@ fn point_inside_center_radius(l: &ModernLayout, loc: usize, truth: &ModernBox, r
     (gx - tx).abs() <= radius && (gy - ty).abs() <= radius
 }
 
+/// C++ `objectness_for`, exposed for `detect.rs`.
+pub fn modern_objectness(x: &[f32], l: &ModernLayout, b: usize, n: usize, loc: usize) -> f32 {
+    objectness_for(x, l, b, n, loc)
+}
+
+/// C++ `class_score_for`, exposed for `detect.rs`.
+pub fn modern_class_score(
+    x: &[f32],
+    l: &ModernLayout,
+    b: usize,
+    n: usize,
+    loc: usize,
+    class_id: usize,
+) -> f32 {
+    class_score_for(x, l, b, n, loc, class_id)
+}
+
 fn objectness_for(x: &[f32], l: &ModernLayout, b: usize, n: usize, loc: usize) -> f32 {
     finite_or_zero(x[l.obj_index(b, n, loc)]).clamp(0.0, 1.0)
 }

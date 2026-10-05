@@ -299,6 +299,12 @@ pub fn is_local_peak(output: &[f32], l: &CenterNetLayout, batch: usize, class_id
     true
 }
 
+/// The heatmap score of one cell, clamped to `[0, 1]` (the forward already
+/// applied the sigmoid).
+pub fn heatmap_score(output: &[f32], l: &CenterNetLayout, batch: usize, class_id: usize, loc: usize) -> f32 {
+    finite_or_zero(output[ct_index(l, batch, class_id, loc)]).clamp(0.0, 1.0)
+}
+
 /// Net-level knobs (`state.net` in C++, plus the head's own default when the net
 /// does not carry them).
 #[derive(Clone, Debug, PartialEq)]

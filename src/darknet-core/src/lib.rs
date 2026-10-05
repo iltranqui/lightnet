@@ -52,7 +52,9 @@ pub mod train;
 pub mod weights;
 
 pub use cfg::{ConfigFile, RawSection};
-pub use detect::{Detection, DetectionBox, DetectionOptions, decode_yolo_detections};
+pub use detect::{
+    Detection, DetectionBox, DetectionOptions, decode_modern_detections, decode_yolo_detections,
+};
 pub use error::{Error, Result};
 pub use image::PlanarRgbImage;
 pub use model::{

@@ -14,7 +14,8 @@ use darknet_core::GpuExecutableNetwork;
 use darknet_core::{
     ConfigFile, DataConfig, DetectionOptions, DetectorAugmentation, ExecutableNetwork, LayerKind,
     LayerParams, Network, PlanarRgbImage, Tensor, TrainingBatch, YoloLabel, YoloTrainingState,
-    compute_learning_rate, compute_yolo_training_loss_with_state, decode_yolo_detections,
+    compute_learning_rate, compute_yolo_training_loss_with_state, decode_modern_detections,
+    decode_yolo_detections,
     initialize_training_params, inspect_weights_file, load_augmented_training_batch_from_paths,
     load_names_file, load_paths_file, save_weights,
 };
@@ -304,6 +305,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             crop_caches: Vec::new(),
                             recurrent_caches: Vec::new(),
                             yolo_heads: summary.yolo_heads,
+                            modern_heads: summary.modern_heads,
                         }
                     } else {
                         executable.forward(&input)?
@@ -319,7 +321,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(dump_dir) = std::env::var_os("DARKNET_LAYER_DUMP_DIR") {
                 dump_rust_layer_outputs(Path::new(&dump_dir), &network, &result.layer_outputs)?;
             }
-            let detections = decode_yolo_detections(
+            // Both head families decode into the same `Detection`, so a modern
+            // anchor-free cfg reports detections exactly like a yolo one does.
+            let mut detections = decode_yolo_detections(
                 &network,
                 &result.yolo_heads,
                 original.shape.width,
@@ -330,6 +334,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     letterbox,
                 },
             )?;
+            detections.extend(decode_modern_detections(
+                &network,
+                &result.modern_heads,
+                original.shape.width,
+                original.shape.height,
+                DetectionOptions {
+                    confidence_threshold: threshold,
+                    nms_threshold: nms,
+                    letterbox,
+                },
+            )?);
+            // The two families each ran their own NMS; run the merged list through
+            // it once more so a cfg that somehow had both cannot emit an
+            // overlapping cross-family pair.
+            detections.sort_by(|lhs, rhs| rhs.confidence.total_cmp(&lhs.confidence));
 
             println!("image {}", image_path);
             println!(

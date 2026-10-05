@@ -99,10 +99,11 @@ believing a `cfg_corpus` failure.
    `[laya_encoder]` + `[laya_head]` (the shared-file offset is computed past
    their blobs), so those two come next even though the plan files them under
    Phase 4. They also need the Phase 3A prerequisite kernel set.
-2. Phase 2A's last gap: the `detect.rs` / `evaluate.rs` decode-and-mAP
-   integration for the four modern heads (`decode.rs` only understands the yolo
-   head today), then `cfg/LegoGears_centernet.cfg` end to end. That also makes
-   the nested-object fix and `min_object_cells` observable on a real cfg.
+2. Phase 2A is done, including `detect::decode_modern_detections` and the
+   `detect-image` merge. Remaining across the phases: `cfg/LegoGears_centernet.cfg`
+   end to end (the cfg lives on `Jev_laya`), then 2B (`moe`/`eml`, container-conv
+   reuse first), 2C (OBB), 3A/3B (transformer + deformable families, shared
+   LayerNorm/GEMM kernel set first) and 4.
 3. Phase 3A prerequisite (2) — the shared oxide op set: LayerNorm fwd/bwd,
    batched-GEMM wrapper, row-softmax backward, residual/bias epilogues. Build
    it **once**; `vit`, `swin`, `tucker`, `mambavision`, `kimi_kda`, `minimax` and

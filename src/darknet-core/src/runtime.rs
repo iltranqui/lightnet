@@ -389,6 +389,24 @@ pub struct YoloHeadOutput {
     pub output: Tensor,
 }
 
+/// One of the four modern anchor-free heads (`[yolox]`, `[ppyoloe]`,
+/// `[yolonas]`, `[centernet]`) captured by a forward pass so `detect.rs` can
+/// decode it.  Same shape as [`YoloHeadOutput`]; kept separate so the decode
+/// path can dispatch on the layer kind without re-deriving it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModernHeadOutput {
+    pub layer_index: usize,
+    pub output: Tensor,
+}
+
+/// True for the modern anchor-free heads that `detect.rs` can decode.
+pub fn is_modern_head(kind: &LayerKind) -> bool {
+    matches!(
+        kind,
+        LayerKind::Yolox(_) | LayerKind::Ppyoloe(_) | LayerKind::Yolonas(_) | LayerKind::CenterNet(_)
+    )
+}
+
 /// Sampling coordinates captured by a crop forward pass. Coordinates are
 /// shared by every channel in a batch image, matching Darknet's crop kernel.
 #[derive(Clone, Debug, PartialEq)]
@@ -410,6 +428,8 @@ pub struct ForwardResult {
     pub crop_caches: Vec<Option<CropForwardCache>>,
     pub recurrent_caches: Vec<Option<RecurrentForwardCache>>,
     pub yolo_heads: Vec<YoloHeadOutput>,
+    /// The modern anchor-free heads, in layer order.
+    pub modern_heads: Vec<ModernHeadOutput>,
 }
 
 impl ForwardResult {
@@ -429,6 +449,8 @@ pub struct BackwardResult {
 pub struct GpuForwardSummary {
     pub final_output: Option<Tensor>,
     pub yolo_heads: Vec<YoloHeadOutput>,
+    /// The modern anchor-free heads, in layer order.
+    pub modern_heads: Vec<ModernHeadOutput>,
 }
 
 #[derive(Clone, Debug)]
@@ -990,6 +1012,7 @@ impl ExecutableNetwork {
         let mut crop_caches = Vec::with_capacity(self.network.layers.len());
         let mut recurrent_caches = Vec::with_capacity(self.network.layers.len());
         let mut yolo_heads = Vec::new();
+        let mut modern_heads = Vec::new();
         let mut rng_state = 0x9e37_79b9_u64;
 
         for (layer, params) in self.network.layers.iter().zip(&self.params) {
@@ -1282,6 +1305,12 @@ impl ExecutableNetwork {
                     output: output.clone(),
                 });
             }
+            if is_modern_head(&layer.kind) {
+                modern_heads.push(ModernHeadOutput {
+                    layer_index: layer.index,
+                    output: output.clone(),
+                });
+            }
 
             layer_outputs.push(output);
             layer_activation_inputs.push(activation_input);
@@ -1297,6 +1326,7 @@ impl ExecutableNetwork {
             crop_caches,
             recurrent_caches,
             yolo_heads,
+            modern_heads,
         })
     }
 
@@ -2730,6 +2760,7 @@ where
         let mut remaining_uses = gpu_layer_output_use_counts(&self.network)?;
         let mut final_output = None;
         let mut yolo_heads = Vec::new();
+        let mut modern_heads = Vec::new();
 
         for (layer, params) in self.network.layers.iter().zip(&self.params) {
             let current_input = if layer.index == 0 {
@@ -3004,7 +3035,10 @@ where
             let should_download_final = layer.index + 1 == self.network.layers.len();
             let should_collect_yolo =
                 matches!(layer.kind, LayerKind::Yolo(_) | LayerKind::GaussianYolo(_));
-            let downloaded = if should_download_final || should_collect_yolo {
+            // The modern anchor-free heads need the same host round trip so
+            // `detect.rs` can decode them.
+            let should_collect_modern = is_modern_head(&layer.kind);
+            let downloaded = if should_download_final || should_collect_yolo || should_collect_modern {
                 Some(Tensor {
                     shape: layer.output_shape,
                     data: self
@@ -3022,6 +3056,15 @@ where
                     output: downloaded
                         .as_ref()
                         .expect("yolo output should have been downloaded")
+                        .clone(),
+                });
+            }
+            if should_collect_modern {
+                modern_heads.push(ModernHeadOutput {
+                    layer_index: layer.index,
+                    output: downloaded
+                        .as_ref()
+                        .expect("modern head output should have been downloaded")
                         .clone(),
                 });
             }
@@ -3045,6 +3088,7 @@ where
         Ok(GpuForwardSummary {
             final_output,
             yolo_heads,
+            modern_heads,
         })
     }
 }
@@ -4005,6 +4049,7 @@ where
         let mut crop_caches = Vec::with_capacity(self.network.layers.len());
         let mut gpu_batch_norm_caches = Vec::with_capacity(self.network.layers.len());
         let mut yolo_heads = Vec::new();
+        let mut modern_heads = Vec::new();
         let mut rng_state = 0x9e37_79b9_u64;
         // The CPU backward fallback differentiates with rolling statistics, so
         // batch statistics are only used when the GPU backward handles the net.
@@ -4856,6 +4901,12 @@ where
                     output: output.clone(),
                 });
             }
+            if is_modern_head(&layer.kind) {
+                modern_heads.push(ModernHeadOutput {
+                    layer_index: layer.index,
+                    output: output.clone(),
+                });
+            }
 
             gpu_layer_outputs.push(output_gpu);
             gpu_layer_activation_inputs.push(activation_input_gpu);
@@ -4881,6 +4932,7 @@ where
                 crop_caches,
                 recurrent_caches,
                 yolo_heads,
+                modern_heads,
             },
         })
     }
@@ -4924,6 +4976,7 @@ where
             return Ok(GpuForwardSummary {
                 final_output: state.cpu_forward.final_output().cloned(),
                 yolo_heads: state.cpu_forward.yolo_heads,
+                modern_heads: state.cpu_forward.modern_heads,
             });
         }
 
@@ -4936,6 +4989,7 @@ where
         let mut remaining_uses = gpu_layer_output_use_counts(&self.network)?;
         let mut final_output = None;
         let mut yolo_heads = Vec::new();
+        let mut modern_heads = Vec::new();
 
         for (layer, params) in self.network.layers.iter().zip(&self.params) {
             let current_input = if layer.index == 0 {
@@ -5208,7 +5262,10 @@ where
             let should_download_final = layer.index + 1 == self.network.layers.len();
             let should_collect_yolo =
                 matches!(layer.kind, LayerKind::Yolo(_) | LayerKind::GaussianYolo(_));
-            let downloaded = if should_download_final || should_collect_yolo {
+            // The modern anchor-free heads need the same host round trip so
+            // `detect.rs` can decode them.
+            let should_collect_modern = is_modern_head(&layer.kind);
+            let downloaded = if should_download_final || should_collect_yolo || should_collect_modern {
                 Some(
                     self.download_tensor(&output_gpu, layer.output_shape)
                         .map_err(|err| backend_error("download layer output", err))?,
@@ -5223,6 +5280,15 @@ where
                     output: downloaded
                         .as_ref()
                         .expect("yolo output should have been downloaded")
+                        .clone(),
+                });
+            }
+            if should_collect_modern {
+                modern_heads.push(ModernHeadOutput {
+                    layer_index: layer.index,
+                    output: downloaded
+                        .as_ref()
+                        .expect("modern head output should have been downloaded")
                         .clone(),
                 });
             }
@@ -5246,6 +5312,7 @@ where
         Ok(GpuForwardSummary {
             final_output,
             yolo_heads,
+            modern_heads,
         })
     }
 
