@@ -888,3 +888,67 @@ mod residual_bias_tests {
         let _ = residual_bias(&[0.0; 6], &[0.0; 6], Some(&[1.0]), 3, 2);
     }
 }
+
+/// The batched-GEMM wrapper every transformer layer's projections need:
+/// `out[r, n] = sum_k x[r, k] * w[n, k] + b[n]`, i.e. `x @ w^T + b` with the
+/// **torch `nn.Linear` weight layout** (`w` is `[out_features, in_features]`,
+/// row-major) over a flat `rows x in_features` activation.
+///
+/// `rows` is the batch being folded into the GEMM's `m` dimension, which is what
+/// makes one call cover every token of a sequence.  `bias` may be `None` for the
+/// bias-free projections (`[laya_encoder]`'s `Wqkv` / `Wo`, for instance).
+/// Reference for [`crate::F32TensorOpsBackend::linear_f32`].
+pub fn linear(
+    x: &[f32],
+    rows: usize,
+    in_features: usize,
+    out_features: usize,
+    weights: &[f32],
+    bias: Option<&[f32]>,
+) -> Vec<f32> {
+    assert!(rows > 0 && in_features > 0 && out_features > 0, "linear: bad shape");
+    assert!(x.len() >= rows * in_features, "linear: activation too short");
+    assert!(weights.len() >= out_features * in_features, "linear: weights too short");
+    let mut out = vec![0.0f32; rows * out_features];
+    for r in 0..rows {
+        let x_row = &x[r * in_features..(r + 1) * in_features];
+        let o_row = &mut out[r * out_features..(r + 1) * out_features];
+        for (n, dst) in o_row.iter_mut().enumerate() {
+            let w_row = &weights[n * in_features..(n + 1) * in_features];
+            let mut acc = 0.0f32;
+            for k in 0..in_features {
+                acc += x_row[k] * w_row[k];
+            }
+            *dst = acc + bias.map_or(0.0, |b| b[n]);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod linear_tests {
+    use super::*;
+
+    #[test]
+    fn it_is_the_hand_computed_row_dot_product() {
+        // rows = 2, in = 3, out = 2.  w = [[1,2,3],[4,5,6]], b = [10, 20].
+        let x = [1.0f32, 0.0, -1.0, 0.5, 0.5, 0.5];
+        let w = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        // Row 0: [1,0,-1] . [1,2,3] = -2 and . [4,5,6] = -2; with the bias
+        // those become 8 and 18.
+        // Row 1: [0.5,0.5,0.5] . [1,2,3] = 3 and . [4,5,6] = 7.5; biased ->
+        // 13 and 27.5.
+        let out = linear(&x, 2, 3, 2, &w, Some(&[10.0, 20.0]));
+        assert_eq!(out, vec![8.0, 18.0, 13.0, 27.5]);
+        let out = linear(&x, 2, 3, 2, &w, None);
+        assert_eq!(out, vec![-2.0, -2.0, 3.0, 7.5]);
+    }
+
+    #[test]
+    fn every_token_gets_its_own_output_row() {
+        // rows = 4, in = 1, out = 1: the result is the input scaled, one row each.
+        let x = [1.0f32, 2.0, 3.0, 4.0];
+        let out = linear(&x, 4, 1, 1, &[0.5], Some(&[1.0]));
+        assert_eq!(out, vec![1.5, 2.0, 2.5, 3.0]);
+    }
+}

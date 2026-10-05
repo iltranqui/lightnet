@@ -2027,6 +2027,95 @@ impl F32TensorOpsBackend for OxideBackend {
     /// Row-wise LayerNorm, one block (one thread) per row so the reduction needs
     /// no second pass.  `rows * cols` must equal the tensor length and `cols` must
     /// fit [`activations::layernorm::LAYERNORM_MAX_COLS`].
+    /// `out[r, n] = sum_k x[r, k] * w[n, k] + b[n]`, routed into the
+    /// existing fp32 GEMM with `trans_b` so the `[out_features, in_features]`
+    /// weight layout is read as `B^T`.  `rows` becomes the GEMM's `m`, so one
+    /// launch covers every token of a sequence.
+    fn linear_f32(
+        &self,
+        x: &Self::Tensor,
+        weights: &Self::Tensor,
+        bias: Option<&Self::Tensor>,
+        shape: &[usize],
+        rows: usize,
+        in_features: usize,
+        out_features: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        if rows == 0 || in_features == 0 || out_features == 0 {
+            return Err(OxideError::Shape(
+                "linear_f32: rows, in_features and out_features must be > 0".to_owned(),
+            ));
+        }
+        if shape.iter().product::<usize>() != rows * out_features {
+            return Err(OxideError::Shape(format!(
+                "linear_f32: shape {shape:?} must hold rows*out_features = {}",
+                rows * out_features
+            )));
+        }
+        let x_f = self.f32v(x)?.into_owned();
+        let w_f = self.f32v(weights)?.into_owned();
+        if x_f.len() < rows * in_features {
+            return Err(OxideError::Shape(format!(
+                "linear_f32: activation has {} entries, expected {}",
+                x_f.len(),
+                rows * in_features
+            )));
+        }
+        if w_f.len() < out_features * in_features {
+            return Err(OxideError::Shape(format!(
+                "linear_f32: weights have {} entries, expected {}",
+                w_f.len(),
+                out_features * in_features
+            )));
+        }
+        // Fold the bias into a beta-1 accumulator copy of the output, which the
+        // GEMM already accumulates into; that avoids a second epilogue pass.
+        let mut acc = self.alloc_uninit(rows * out_features)?;
+        if let Some(bias) = bias {
+            let b = self.f32v(bias)?.into_owned();
+            if b.len() < out_features {
+                return Err(OxideError::Shape(format!(
+                    "linear_f32: bias has {} entries, expected {out_features}",
+                    b.len()
+                )));
+            }
+            let host = b.buf.to_host_vec(&self.stream)?;
+            let mut values = vec![0.0f32; rows * out_features];
+            for r in 0..rows {
+                values[r * out_features..(r + 1) * out_features].copy_from_slice(&host[..out_features]);
+            }
+            acc.copy_from_host(&self.stream, &values)?;
+        } else {
+            acc.copy_from_host(&self.stream, &vec![0.0f32; rows * out_features])?;
+        }
+        // `gemm` takes a `&mut DeviceBuffer`, so drive it on the pooled buffer
+        // directly and keep the tensor only for the returned shape.
+        let mut acc_raw = acc;
+        self.gemm(
+            &x_f.buf,
+            &w_f.buf,
+            &mut acc_raw,
+            &GemmArgs {
+                m: rows,
+                n: out_features,
+                k: in_features,
+                lda: in_features,
+                // `w` is [out_features, in_features], i.e. B^T of the
+                // [in_features, out_features] matrix the GEMM wants.
+                ldb: in_features,
+                ldc: out_features,
+                trans_a: false,
+                trans_b: true,
+                alpha: 1.0,
+                beta: 1.0,
+                ..GemmArgs::default()
+            },
+        )?;
+        Ok(OxideTensorF32::new(acc_raw, shape))
+    }
+
     /// Fused residual + bias epilogue, one thread per output element:
     /// `out[i] = residual[i] + y[i] + bias[i % cols]`.
     fn residual_bias_f32(

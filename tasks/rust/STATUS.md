@@ -104,13 +104,14 @@ believing a `cfg_corpus` failure.
    end to end (the cfg lives on `Jev_laya`), then 2B (`moe`/`eml`, container-conv
    reuse first), 2C (OBB), 3A/3B (transformer + deformable families, shared
    LayerNorm/GEMM kernel set first) and 4.
-3. Phase 3A prerequisite (2), **two thirds done**: LayerNorm fwd/bwd, the fused
-   residual/bias epilogue and the row-softmax backward are all in with host
-   defaults plus GPU parity tests. Still missing from the shared set: the
-   batched-GEMM wrapper and (per decision 3) the `flash_attention` /
-   `vc_attention` fast paths. `vit`, `swin`/`transformer`, `tucker_attention`,
-   `mambavision`, `kimi_kda`, `minimax_sparse_attention` and the LAYA
-   encoder/head all unblock on the batched-GEMM wrapper.
+3. **Phase 3A prerequisite (2) is complete**: LayerNorm fwd/bwd, the fused
+   residual/bias epilogue, the row-softmax backward and the batched-GEMM wrapper
+   (`linear_f32`) are all in, each with a host default plus GPU parity tests.
+   That unblocks `vit`, `swin`/`transformer`, `tucker_attention`, `mambavision`,
+   `kimi_kda`, `minimax_sparse_attention` and the LAYA encoder/head. Still to
+   decide when writing those layers: whether the `flash_attention` /
+   `vc_attention` fast paths (decision 3) get their own kernels or reuse the
+   reference attention path.
 4. Phase 2B `moe_convolutional` (weights order verified) and
    `eml_convolutional` (an activation, not a `LayerKind`; save order is
    `weights.cpp:775`, still `[report: not re-read]` — re-read it).

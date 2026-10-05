@@ -25,6 +25,7 @@ impl Rng {
     }
 }
 
+/// Elementwise comparison with a relative tolerance.
 fn close(name: &str, got: &[f32], want: &[f32], tolerance: f32) {
     assert_eq!(got.len(), want.len(), "{name}: length");
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
@@ -229,4 +230,70 @@ fn the_residual_bias_epilogue_rejects_a_mismatched_row_count() {
         };
         assert!(format!("{err}").contains("rows*cols"), "{err}");
     }
+}
+
+#[test]
+fn the_batched_gemm_wrapper_matches_the_host() {
+    // This is the piece every transformer projection needs: `rows` is folded
+    // into the GEMM's `m`, so one call covers every token of a sequence.
+    let be = backend();
+    let mut rng = Rng(0x3c3c_3c3c);
+    for &(rows, k, n) in &[(1usize, 1usize, 1usize), (3, 4, 5), (8, 16, 16), (7, 33, 12), (2, 1024, 64)] {
+        let x = rng.vec(rows * k);
+        let w = rng.vec(n * k); // [out_features, in_features], torch nn.Linear
+        let bias = rng.vec(n);
+        let xt = be.upload_f32(&[rows, k], &x).unwrap();
+        let wt = be.upload_f32(&[n, k], &w).unwrap();
+        let bt = be.upload_f32(&[n], &bias).unwrap();
+        let out = be
+            .linear_f32(&xt, &wt, Some(&bt), &[rows, n], rows, k, n, ElementwiseLaunchConfig::default())
+            .unwrap();
+        let got = be.download_f32(&out).unwrap();
+        let want = host_ops::linear(&x, rows, k, n, &w, Some(&bias));
+        // The GEMM accumulates a k-long dot product in its own order, so the
+        // error scales with the row norm of the terms rather than with |out|.
+        // Bound each output by the sum of |x_k * w_nk|, as the existing GEMM
+        // tests do, so a long k does not trip a fixed tolerance.
+        for r in 0..rows {
+            for j in 0..n {
+                let norm: f32 = (0..k)
+                    .map(|t| x[r * k + t].abs() * w[j * k + t].abs())
+                    .sum::<f32>()
+                    + bias[j].abs();
+                let err = (got[r * n + j] - want[r * n + j]).abs();
+                assert!(
+                    err <= 1e-5 * norm.max(1e-3),
+                    "linear {rows}x{k}x{n}[{r},{j}]: got {}, want {}, row norm {norm}, err {err}",
+                    got[r * n + j],
+                    want[r * n + j]
+                );
+            }
+        }
+        // No bias is the bias-free projection variant.
+        let out = be
+            .linear_f32(&xt, &wt, None, &[rows, n], rows, k, n, ElementwiseLaunchConfig::default())
+            .unwrap();
+        let got = be.download_f32(&out).unwrap();
+        let want = host_ops::linear(&x, rows, k, n, &w, None);
+        close(&format!("linear no bias {rows}x{k}x{n}"), &got, &want, 1e-4);
+    }
+}
+
+#[test]
+fn the_batched_gemm_wrapper_rejects_mismatched_shapes() {
+    let be = backend();
+    let xt = be.upload_f32(&[4, 3], &vec![1.0f32; 12]).unwrap();
+    let wt = be.upload_f32(&[5, 3], &vec![1.0f32; 15]).unwrap();
+    // rows * out_features must match the output shape.
+    let err = match be.linear_f32(&xt, &wt, None, &[4, 4], 4, 3, 5, ElementwiseLaunchConfig::default()) {
+        Err(err) => err,
+        Ok(_) => panic!("a mismatched output shape should be rejected"),
+    };
+    assert!(format!("{err}").contains("must hold rows*out_features"), "{err}");
+    // A zero extent is rejected rather than launching an empty grid.
+    let err = match be.linear_f32(&xt, &wt, None, &[0, 0], 0, 3, 5, ElementwiseLaunchConfig::default()) {
+        Err(err) => err,
+        Ok(_) => panic!("rows = 0 should be rejected"),
+    };
+    assert!(format!("{err}").contains("must be > 0"), "{err}");
 }

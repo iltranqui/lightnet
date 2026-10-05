@@ -481,6 +481,13 @@ inside the first rounds of a short run, not a property of the mode.  Re-run with
 - relu/relu6 NaN -> 0 on oxide (C++ NaN); mish/swish at -inf -> NaN.
 - C++ CUDA reference runs cudnn_half=1, so layer dumps differ from pure fp32 by up to 5.7e-3 abs (not an oxide error).
 ### Shared transformer primitives: LayerNorm fwd/bwd on the GPU (2026-10-04)
+- **Batched-GEMM wrapper, the third and last piece**: `host_ops::linear`, `F32TensorOpsBackend::linear_f32` (host default) and an oxide override that routes into the existing fp32 GEMM. Over a flat `rows x in_features` activation it computes `out[r, n] = sum_k x[r, k] * w[n, k] + b[n]` with the **torch `nn.Linear` weight layout** (`w` is `[out_features, in_features]`).
+  - `rows` is folded into the GEMM's `m` dimension, so **one call covers every token of a sequence** - that is the whole point of the wrapper: without it every token would be a separate host round trip.
+  - The bias rides along as the GEMM's `beta = 1` accumulator, so it costs no second epilogue pass. A missing bias is a zero accumulator instead of a separate path.
+  - `trans_b = true` is what makes `[out_features, in_features]` read as `B^T`; getting that backwards is the plausible mistake and it would silently produce a transposed result, so the GPU test compares against the host reference over 5 shapes.
+  - 2 GPU tests (5 shapes with and without bias, plus the shape-rejection paths) bring `oxide_layernorm.rs` to 11, and 2 host tests pin the hand-computed dot products.
+  - Tolerance note: the GEMM accumulates a k-long dot product in its own order, so at `k = 1024` the GPU and host differ by ~2.5e-5 relative. The test therefore bounds each output by the row norm `sum_k |x_k w_nk|`, as the existing GEMM tests do, instead of using a fixed relative tolerance that a long k would trip.
+
 - **Residual / bias epilogue**, the second piece of the same set: `host_ops::residual_bias` plus `F32TensorOpsBackend::residual_bias_f32` (host default) and an oxide kernel in `kernels/layers_extra.rs::residual`. Over a flat `rows x cols` row-major slab it computes `out[i] = residual[i] + y[i] + bias[i % cols]`.
   - The bias is per **column**: the row index is the token, so it must not shift the offset. A test pins that the pattern repeats with period `cols` and not with period 1, which is the mistake a per-row bias would silently make.
   - Fusing matters. The unfused form (`bias_add` then `vector_add`) materialises a full extra temporary *per residual connection*, and a transformer block has two.

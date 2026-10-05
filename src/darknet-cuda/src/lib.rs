@@ -501,6 +501,51 @@ pub trait F32TensorOpsBackend {
         let fitted = host_ops::shortcut_fit(&host, batch, out_len / batch.max(1));
         self.upload_f32(output_shape, &fitted)
     }
+    /// The batched-GEMM wrapper every transformer projection needs:
+    /// `out[r, n] = sum_k x[r, k] * w[n, k] + b[n]` over a flat
+    /// `rows x in_features` activation, with the **torch `nn.Linear` weight
+    /// layout** (`w` is `[out_features, in_features]`, row-major).
+    ///
+    /// `rows` is folded into the GEMM's `m` dimension, so one call covers every
+    /// token of a sequence.  `bias` may be `None` for the bias-free
+    /// projections.  `shape` is the output tensor's shape, normally
+    /// `[rows, out_features]`.
+    ///
+    /// Backends override this to route into their own GEMM; the default is the
+    /// host reference, so `FakeBackend` and any other backend work unchanged.
+    fn linear_f32(
+        &self,
+        x: &Self::Tensor,
+        weights: &Self::Tensor,
+        bias: Option<&Self::Tensor>,
+        shape: &[usize],
+        rows: usize,
+        in_features: usize,
+        out_features: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert!(
+            rows > 0 && in_features > 0 && out_features > 0,
+            "linear_f32: rows, in_features and out_features must be > 0"
+        );
+        let xv = self.download_f32(x)?;
+        assert_eq!(
+            rows * in_features,
+            xv.len(),
+            "linear_f32: activation must be rows x in_features"
+        );
+        let w = self.download_f32(weights)?;
+        let b = match bias {
+            Some(t) => Some(self.download_f32(t)?),
+            None => None,
+        };
+        self.upload_f32(
+            shape,
+            &host_ops::linear(&xv, rows, in_features, out_features, &w, b.as_deref()),
+        )
+    }
+
     /// Fused residual + bias epilogue for a transformer block: over a flat
     /// `rows x cols` row-major slab, `out[i] = residual[i] + y[i] + bias[i % cols]`
     /// with `bias` per **column** (the last dimension, so the row - the token -
