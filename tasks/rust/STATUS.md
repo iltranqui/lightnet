@@ -34,6 +34,9 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- f16 reverse upsample forward is already implemented and verified by
+  `oxide_half::f16_pool_upsample_route_match_f32_reference` (13 passed,
+  1 ignored) and `oxide_runtime_f16::tiny_net_with_avgpool_local_avgpool_batchnorm_reverse_upsample_matches_f32`.
 - Weighted `[shortcut]` GPU forward composes oxide channel-scale + add; exact
   CPU backward/SGD fallback has real-device runtime parity coverage.
 - AMP runtime with dropout and dropblock now has real-device output/mask/backward/
