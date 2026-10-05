@@ -3265,6 +3265,11 @@ Cross-cutting prerequisites: (1) container layers (moe, eml, recursive_block, cl
 - [x] Task 7 channel_slice - [x] Task 8 channel_shuffle - [x] Task 9 deconvolutional - [x] Task 10 dense loss + logistic/regression/cost - [x] Task 11 jev_ce - [x] Task 12 bookkeeping
 - [ ] Phase 1b / 2 / 3 / 4: expand into their own plans (one per bullet group) before starting
 
+Phase 1b progress (the only phase whose items are not blocked on an Open
+Question): `segmentation` and `omd_loss` are done, `contrastive`'s classifier
+branch is done (its detection branch is not, and says so), and `laya_*` waits
+on Open Question 2.
+
 Phase 0 landed in commits `8e4b0f24` .. `be71eb6e`; the `todo.md` block
 "Layer-port Phase 0 delivered" is the bookkeeping (Task 12 Step 2).  Verified
 2026-10-04 by `./tools/test_host.sh` (all green: 189 unit tests plus the
@@ -3281,6 +3286,7 @@ Questions at the end of this document rather than on code:
 | 1b `segmentation` | - | **done 2026-10-04**: `src/darknet-core/src/segmentation.rs` + `SegmentationSpec`, including the C++ correct-pixel gate. The label loader, the `seg_gate` GPU kernel and the cfgs stay open (Open Questions 1 and 5) |
 | 1b `omd_loss` | - | **done 2026-10-04**: `src/darknet-core/src/omd_loss.rs` + `OmdLossSpec`, all three samplers and the metric pair loss. It turned out **not** to need the extra seed on layer `idx-1` the plan assumed: the layer is a plain pass-through in both directions, so its own seed already reaches the previous layer. `show_details` reporting and a real detector cfg are still open |
 | 1b `laya_*` | Open Question 2 | |
+| 1b deferred (c) `contrastive` | - | **partly done 2026-10-04**: classifier branch ported (`src/darknet-core/src/contrastive.rs`). The detection branch needs the yolo head's per-box class ids, so it reports itself as unported. `region` / `detection` decode+loss still open |
 | 2A anchor-free heads | nothing but plan expansion | needs `decode.rs` / `evaluate.rs` work, not just a layer |
 | 2B `moe_convolutional`, `eml_convolutional`, `dcnv3` | container-conv reuse (the cross-cutting prerequisite (1)) | `eml` save order is still `[report: not re-read]` |
 | 2C OBB family | Open Question 4 | XL; also changes data loading, NMS and mAP |

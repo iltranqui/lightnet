@@ -51,7 +51,12 @@ pub fn compute_dense_training_loss_at(
         // output: C++ reads a box table (`batch * max_boxes * truth_size`) or a
         // per-image class vector, so its shape check lives in the module (which
         // falls back to "no samples" when the truth is shorter than it needs).
-        if !matches!(layer.kind, LayerKind::OmdLoss(_)) && t.shape != layer.output_shape {
+        // `[contrastive]` (truth `batch * classes`) and `[omd_loss]` (truth
+        // `batch * max_boxes * truth_size`) are the two heads whose truth is not
+        // their own output; their length checks live in their modules.
+        if !matches!(layer.kind, LayerKind::OmdLoss(_) | LayerKind::Contrastive(_))
+            && t.shape != layer.output_shape
+        {
             return Err(Error::InvalidConfig(format!(
                 "layer #{} ([{}]) truth shape {} != output shape {}",
                 layer.index,
@@ -65,6 +70,32 @@ pub fn compute_dense_training_loss_at(
             LayerKind::Cost { kind, scale } => elementwise_cost(prev, t, kind, *scale),
             LayerKind::Regression(spec) => elementwise_cost(prev, t, "sse", spec.scale),
             LayerKind::Logistic => logistic_cost(&forward.layer_outputs[layer.index], t),
+            LayerKind::Contrastive(spec) => {
+                // The classifier branch wants one embedding per image.
+                let spatial = prev.shape.width * prev.shape.height;
+                if spatial != 1 || prev.shape.channels == 0 {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} ([contrastive]) needs one embedding per image, got {}x{}x{}",
+                        layer.index,
+                        prev.shape.width,
+                        prev.shape.height,
+                        prev.shape.channels
+                    )));
+                }
+                let result = crate::contrastive::contrastive_forward(
+                    &prev.data,
+                    Some(&t.data),
+                    spec,
+                    prev.shape.batch,
+                    prev.shape.channels,
+                    network.net.time_steps,
+                    network.net.adversarial,
+                    network.net.label_smooth_eps,
+                    true,
+                )
+                .map_err(Error::InvalidConfig)?;
+                (Tensor::from_data(prev.shape, result.delta)?, result.cost)
+            }
             LayerKind::OmdLoss(spec) => {
                 // The layer is a pass-through, so the seed it produces is the
                 // metric delta of the *previous* layer's features - which is
@@ -346,6 +377,51 @@ mod tests {
         let mut t = vec![None; exec.network.layers.len()];
         t[1] = Some(Tensor::from_data(TensorShape::new(12, 1, 1, 2), truth).unwrap());
         compute_dense_training_loss(&exec.network, &forward, &input, &t).unwrap()
+    }
+
+    #[test]
+    fn contrastive_head_uses_the_embedding_delta_not_its_own_output() {
+        // A global-average `[convolutional]` hands `[contrastive]` one embedding
+        // vector per image; three images of the same class with spread-out
+        // embeddings must produce a non-zero seed on the *convolution*.
+        let cfg = "[net]\nwidth=1\nheight=1\nchannels=2\nbatch=3\n\
+                   [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
+                   [contrastive]\nclasses=1\ncls_normalizer=1\n";
+        let network = Network::from_config(ConfigFile::parse_str("d.cfg", cfg).unwrap()).unwrap();
+        let mut exec = ExecutableNetwork::new(network);
+        {
+            // Identity 1x1 convolution so the embeddings are the inputs.
+            let LayerParams::Convolutional(p) = &mut exec.params[0] else { panic!() };
+            p.weights = vec![1.0, 0.0, 0.0, 1.0];
+            p.biases = vec![0.0, 0.0];
+        }
+        let shape = exec.network.net.input_shape();
+        let input = Tensor::from_data(shape, vec![1.0, 0.0, 0.0, 1.0, -1.0, 0.0]).unwrap();
+        let forward = exec.forward_training(&input).unwrap();
+        let truth = vec![1.0f32; 3]; // every image is class 0
+        let mut t = vec![None; exec.network.layers.len()];
+        t[1] = Some(Tensor::from_data(TensorShape::new(1, 1, 1, 3), truth.clone()).unwrap());
+        let loss = compute_dense_training_loss(&exec.network, &forward, &input, &t).unwrap();
+        assert!(loss.loss > 0.0, "cost {}", loss.loss);
+        let seed = loss.layer_output_gradient_seeds[1].as_ref().unwrap();
+        assert_eq!(seed.data.len(), 6, "one entry per previous-layer element");
+        assert!(seed.data.iter().any(|d| d.abs() > 1e-6), "{:?}", seed.data);
+    }
+
+    #[test]
+    fn contrastive_detection_branch_reports_itself_as_unported() {
+        let cfg = "[net]\nwidth=1\nheight=1\nchannels=2\n\
+                   [convolutional]\nfilters=2\nsize=1\n[contrastive]\nclasses=1\nyolo_layer=-1\n";
+        let network = Network::from_config(ConfigFile::parse_str("d.cfg", cfg).unwrap()).unwrap();
+        let exec = ExecutableNetwork::new(network);
+        let shape = exec.network.net.input_shape();
+        let input = Tensor::zeros(shape);
+        let forward = exec.forward_training(&input).unwrap();
+        let mut t = vec![None; exec.network.layers.len()];
+        t[1] = Some(Tensor::zeros(TensorShape::new(1, 1, 1, shape.batch)));
+        let err = compute_dense_training_loss(&exec.network, &forward, &input, &t)
+            .expect_err("the detection branch must not pretend to work");
+        assert!(format!("{err}").contains("detection branch"), "{err}");
     }
 
     #[test]

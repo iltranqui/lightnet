@@ -17,6 +17,7 @@ pub mod cfg;
 pub(crate) mod channel_shuffle;
 pub(crate) mod channel_slice;
 pub mod chart;
+pub(crate) mod contrastive;
 pub use chart::{ChartPoint, write_training_chart};
 pub mod dense_loss;
 pub use dense_loss::{DenseTrainingLoss, compute_dense_training_loss, compute_dense_training_loss_at};

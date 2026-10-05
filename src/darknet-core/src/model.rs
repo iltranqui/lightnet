@@ -82,6 +82,12 @@ pub struct NetConfig {
     /// for NaN/Inf, output deltas are clamped to [-1, 1] and input deltas are
     /// reset for NaN/Inf.
     pub try_fix_nan: bool,
+    /// C++ `parms.label_smooth_eps`: `[contrastive]` treats a class probability
+    /// above this as a hard label.
+    pub label_smooth_eps: f32,
+    /// C++ `parms.adversarial`: `[contrastive]` then labels images `b % 2`
+    /// instead of `b / 2`.
+    pub adversarial: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -201,6 +207,8 @@ impl NetConfig {
             decoupled_decay: section.get_usize("decoupled_decay", 0)? != 0,
             loss_scale: section.get_f32("loss_scale", 1.0)?,
             try_fix_nan: section.get_usize("try_fix_nan", 0)? != 0,
+            label_smooth_eps: section.get_f32("label_smooth_eps", 0.0)?,
+            adversarial: section.get_usize("adversarial", 0)? != 0,
         })
     }
 
@@ -347,6 +355,25 @@ impl SegmentationLoss {
     pub fn for_classes(classes: usize) -> Self {
         if classes == 1 { Self::Bce } else { Self::SoftmaxCe }
     }
+}
+
+/// `[contrastive]`: the supervised-contrastive head, classifier branch
+/// (deferred item (c) of `tasks/rust/layers.md` Phase 1b), ported from
+/// `Jev_laya:src-lib/darknet_cfg.cpp::parse_contrastive_section`.  `yolo_layer`
+/// selects the detection branch, which this port does not implement.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContrastiveSpec {
+    /// Class count; the truth is `batch * classes` class probabilities.
+    pub classes: usize,
+    /// C++ `yolo_layer`: a relative index of the `[yolo]` layer to take the
+    /// per-box class ids from, `0` for the classifier branch.
+    pub yolo_layer: isize,
+    pub temperature: f32,
+    pub cls_normalizer: f32,
+    /// Delta clip; the C++ default is `FLT_MAX`.
+    pub max_delta: f32,
+    /// Detection branch only: how many negative partners per positive.
+    pub contrastive_neg_max: usize,
 }
 
 /// `[omd_loss]` (Phase 1b of `tasks/rust/layers.md`), ported from
@@ -726,7 +753,7 @@ pub enum LayerKind {
     },
     ScaleChannels(ScaleChannelsSpec),
     Sam(SamSpec),
-    Contrastive { classes: usize, yolo_layer: isize },
+    Contrastive(ContrastiveSpec),
     Rnn(RnnSpec),
     Gru(GruSpec),
     Lstm(LstmSpec),
@@ -766,7 +793,7 @@ impl LayerKind {
             Self::Dropout { .. } => "dropout",
             Self::ScaleChannels(_) => "scale_channels",
             Self::Sam(_) => "sam",
-            Self::Contrastive { .. } => "contrastive",
+            Self::Contrastive(_) => "contrastive",
             Self::Rnn(_) => "rnn",
             Self::Gru(_) => "gru",
             Self::Lstm(_) => "lstm",
@@ -1843,10 +1870,14 @@ fn parse_layer_kind(
             from: section.get_isize("from", 0)?,
             activation: Activation::parse(&section.get_str("activation", "linear")),
         }),
-        "contrastive" => LayerKind::Contrastive {
+        "contrastive" => LayerKind::Contrastive(ContrastiveSpec {
             classes: section.get_usize("classes", 1000)?,
             yolo_layer: section.get_isize("yolo_layer", 0)?,
-        },
+            temperature: section.get_f32("temperature", 1.0)?,
+            cls_normalizer: section.get_f32("cls_normalizer", 1.0)?,
+            max_delta: section.get_f32("max_delta", f32::MAX)?,
+            contrastive_neg_max: section.get_usize("contrastive_neg_max", 3)?,
+        }),
         "rnn" => LayerKind::Rnn(RnnSpec {
             hidden: section.get_usize("hidden", current.element_count())?,
             output: section.get_usize("output", current.element_count())?,
@@ -2030,7 +2061,7 @@ fn infer_output_shape(
         | LayerKind::Segmentation(_)
         | LayerKind::OmdLoss(_)
         | LayerKind::Dropout { .. }
-        | LayerKind::Contrastive { .. } => Ok(current),
+        | LayerKind::Contrastive(_) => Ok(current),
         LayerKind::ChannelSlice(spec) => {
             let source_index = resolve_relative_layer(layer_index, spec.from)?;
             let source = built_layers
@@ -2525,6 +2556,43 @@ mod tests {
         ] {
             assert!(build(&format!("{base}[segmentation]\n{bad}\n")).is_err(), "accepted {bad}");
         }
+    }
+
+    #[test]
+    fn contrastive_keys_follow_cpp_defaults_and_validation() {
+        // C++ defaults: classes=1000, yolo_layer=0, temperature=1.0,
+        // cls_normalizer=1.0, max_delta=FLT_MAX, contrastive_neg_max=3.
+        let base = "[net]\nwidth=1\nheight=1\nchannels=4\n[convolutional]\nfilters=4\nsize=1\n";
+        let net = build(&format!("{base}[contrastive]\n")).unwrap();
+        let LayerKind::Contrastive(s) = &net.layers[1].kind else { panic!() };
+        assert_eq!(s.classes, 1000);
+        assert_eq!(s.yolo_layer, 0, "0 selects the classifier branch");
+        assert_eq!((s.temperature, s.cls_normalizer, s.max_delta), (1.0, 1.0, f32::MAX));
+        assert_eq!(s.contrastive_neg_max, 3);
+        assert!(net.layers[1].weights().is_none());
+        assert_eq!(net.layers[1].output_shape, net.layers[0].output_shape);
+
+        let net = build(&format!(
+            "{base}[contrastive]\nclasses=3\nyolo_layer=-1\ntemperature=0.5\ncls_normalizer=2\n\
+             max_delta=4\ncontrastive_neg_max=7\n"
+        ))
+        .unwrap();
+        let LayerKind::Contrastive(s) = &net.layers[1].kind else { panic!() };
+        assert_eq!(s.classes, 3);
+        assert_eq!(s.yolo_layer, -1, "a negative index is relative, as in C++");
+        assert_eq!((s.temperature, s.cls_normalizer, s.max_delta, s.contrastive_neg_max), (0.5, 2.0, 4.0, 7));
+
+        // `[net] adversarial` switches the fallback label from `b / 2` to `b % 2`.
+        let net = build(&format!(
+            "[net]\nwidth=1\nheight=1\nchannels=2\nlabel_smooth_eps=0.05\nadversarial=1\n\
+             [convolutional]\nfilters=2\nsize=1\n[contrastive]\n"
+        ))
+        .unwrap();
+        assert!(net.net.adversarial);
+        assert!((net.net.label_smooth_eps - 0.05).abs() < 1e-6);
+        let net = build(&format!("{base}[contrastive]\n")).unwrap();
+        assert!(!net.net.adversarial);
+        assert_eq!(net.net.label_smooth_eps, 0.0);
     }
 
     #[test]

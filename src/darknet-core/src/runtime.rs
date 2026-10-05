@@ -1118,13 +1118,15 @@ impl ExecutableNetwork {
                 }
                 // C++ `memcpy(l.output, state.input, ...)` before any loss work.
                 (LayerKind::OmdLoss(_), LayerParams::None) => (current_input.clone(), None),
+                // `[contrastive]` never touches its output either: all of the
+                // work happens in the delta it derives from the input.
+                (LayerKind::Contrastive(_), LayerParams::None) => (current_input.clone(), None),
                 (LayerKind::Yolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
                 | (LayerKind::Region(_), LayerParams::None)
                 | (LayerKind::Detection(_), LayerParams::None)
                 | (LayerKind::Cost { .. }, LayerParams::None)
-                | (LayerKind::Regression(_), LayerParams::None)
-                | (LayerKind::Contrastive { .. }, LayerParams::None) => {
+                | (LayerKind::Regression(_), LayerParams::None) => {
                     (current_input.clone(), None)
                 }
                 (LayerKind::Softmax { groups }, LayerParams::None) => {
@@ -1852,6 +1854,7 @@ impl ExecutableNetwork {
                 | (LayerKind::Logistic, LayerParams::None)
                 | (LayerKind::Segmentation(_), LayerParams::None)
                 | (LayerKind::OmdLoss(_), LayerParams::None)
+                | (LayerKind::Contrastive(_), LayerParams::None)
                 | (LayerKind::Regression(_), LayerParams::None)
                 | (LayerKind::JevCe(_), LayerParams::None)
                 | (LayerKind::Contrastive { .. }, LayerParams::None) => {
@@ -4762,6 +4765,7 @@ where
                     | LayerKind::Logistic
                     | LayerKind::Segmentation(_)
                     | LayerKind::OmdLoss(_)
+                    | LayerKind::Contrastive(_)
                     | LayerKind::Regression(_)
                     | LayerKind::JevCe(_)
                     | LayerKind::ScaleChannels(_)
@@ -5828,6 +5832,7 @@ where
                 | (LayerKind::Logistic, Some(LayerParams::None))
                 | (LayerKind::Segmentation(_), Some(LayerParams::None))
                 | (LayerKind::OmdLoss(_), Some(LayerParams::None))
+                | (LayerKind::Contrastive(_), Some(LayerParams::None))
                 | (LayerKind::Regression(_), Some(LayerParams::None))
                 | (LayerKind::JevCe(_), Some(LayerParams::None))
                 | (LayerKind::Sam(_), Some(LayerParams::None))
@@ -14698,6 +14703,8 @@ mod tests {
             channels: 1,
             batch: 1,
             time_steps: 1,
+            label_smooth_eps: 0.0,
+            adversarial: false,
             subdivisions: 1,
             learning_rate: 0.01,
             learning_rate_min: 0.00001,
@@ -17330,6 +17337,18 @@ mod tests {
         for (i, g) in train.bias_updates.iter().enumerate() {
             assert!((g - expected).abs() < 1e-4, "bias {i} gradient {g}, expected {expected}");
         }
+    }
+
+    /// `[contrastive]` is a forward pass-through and a backward pass-through, so
+    /// the GPU chain must match the CPU one for any seed.
+    #[test]
+    fn gpu_contrastive_head_matches_cpu_forward_and_backward() {
+        assert_gpu_layer_chain_matches_cpu(
+            "[net]\nwidth=1\nheight=1\nchannels=4\nbatch=2\n\
+             [convolutional]\nfilters=4\nsize=1\nstride=1\nactivation=linear\n\
+             [contrastive]\nclasses=2\ncls_normalizer=0.5\n",
+            1,
+        );
     }
 
     #[test]
