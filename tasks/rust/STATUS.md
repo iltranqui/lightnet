@@ -34,6 +34,8 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- YOLO IoU/GIoU box geometry deltas now have central finite-difference coverage;
+  the test records Darknet's legacy 0.5 width/height comparison factor.
 - f16 reverse upsample forward is already implemented and verified by
   `oxide_half::f16_pool_upsample_route_match_f32_reference` (13 passed,
   1 ignored) and `oxide_runtime_f16::tiny_net_with_avgpool_local_avgpool_batchnorm_reverse_upsample_matches_f32`.

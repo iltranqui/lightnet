@@ -1889,8 +1889,8 @@ fn yolo_objectness_output(raw: f32, new_coords: bool) -> f32 {
 mod tests {
     use super::{
         DataConfig, YoloBox, YoloHeadStats, YoloLabel, YoloTrainingState, apply_yolo_box_delta,
-        apply_yolo_delta_filtering, compute_yolo_training_loss,
-        compute_yolo_training_loss_with_state, load_training_batch, load_yolo_labels,
+        apply_yolo_delta_filtering, bbox_iou_kind, compute_yolo_training_loss,
+        compute_yolo_training_loss_with_state, dx_box_iou, load_training_batch, load_yolo_labels,
         replace_image_to_label, yolo_head_cost, yolo_xy_output,
     };
     use crate::cfg::ConfigFile;
@@ -2144,6 +2144,49 @@ mod tests {
             &mse,
         );
         assert!((seed.get(0, 0, 0, 0) - 1.75 * 0.5 * 0.1).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn yolo_iou_and_giou_box_deltas_match_finite_differences() {
+        let predicted = YoloBox {
+            x: 0.48,
+            y: 0.47,
+            w: 0.36,
+            h: 0.28,
+        };
+        let truth = YoloBox {
+            x: 0.52,
+            y: 0.51,
+            w: 0.30,
+            h: 0.24,
+        };
+        let h = 1e-3;
+        for kind in [YoloIouLoss::Iou, YoloIouLoss::Giou] {
+            let gradient = dx_box_iou(predicted, truth, kind);
+            let analytic = [gradient.dx, gradient.dy, gradient.dw, gradient.dh];
+            for (channel, grad) in analytic.into_iter().enumerate() {
+                let perturb = |step: f32| {
+                    let mut box_value = predicted;
+                    match channel {
+                        0 => box_value.x += step,
+                        1 => box_value.y += step,
+                        2 => box_value.w += step,
+                        3 => box_value.h += step,
+                        _ => unreachable!(),
+                    }
+                    bbox_iou_kind(box_value, truth, kind)
+                };
+                let numeric = (perturb(h) - perturb(-h)) / (2.0 * h);
+                // Darknet's legacy delta uses the full opposing-edge difference for
+                // width/height; its own grad check converts those two deltas by 0.5.
+                let finite_difference_scale = if channel >= 2 { 0.5 } else { 1.0 };
+                let comparable = grad * finite_difference_scale;
+                assert!(
+                    (comparable - numeric).abs() < 2e-3,
+                    "{kind:?} box channel {channel}: scaled delta {comparable}, numeric {numeric}"
+                );
+            }
+        }
     }
 
     /// C++ cost (yolo_layer.cpp:1062-1120), hand computed. 1 anchor, 1 class (6 entries),
