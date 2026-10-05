@@ -99,11 +99,11 @@ Immediately next, in dependency order:
   and host-updated experts invalidate/re-upload their slots. FakeBackend test
   covers slot separation and rewarm. Device-side update/BN refresh remains
   top-level-conv-only until container training leaves the CPU fallback.
-- [~] Phase 2B `moe_convolutional`: real-device forward runs each cached expert
-  convolution on Oxide; router and blend use host round-trips, and exact backward/
-  SGD use the CPU fallback. Verified against CPU in
+- [~] Phase 2B `moe_convolutional`: real-device forward routes on the host,
+  runs each cached expert convolution and per-sample gate blend on Oxide; exact
+  backward/SGD use the CPU fallback. Verified against CPU in
   `oxide_runtime_chain::moe_container_experts_run_oxide_forward_and_cpu_training_fallback_matches`.
-  Fused device routing/blend and device-native backward remain open. CPU path is
+  Device-native routing/backward remain open. CPU path is
   done (`cdf68d00`). `eml_convolutional` not started (save order verified
   2026-10-05).
 - [ ] Phase 2B `dcnv3` blocked: no reference numerics (stub in all five branches).

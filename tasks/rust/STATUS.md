@@ -43,9 +43,10 @@ Latest increments:
 - Device convolution params support per-owner expert slots for container reuse;
   warm-up and host-update invalidation are covered by the
   `container_convolution_cache_is_keyed_by_owner_and_expert_slot` FakeBackend test.
-  MoE now runs expert convolutions on Oxide with host routing/blending and CPU
-  backward/SGD fallback; real-device `oxide_runtime_chain` parity covers the
-  full forward/backward/update path. Device-native routing/blending/backward remain.
+  MoE now runs expert convolutions and per-sample gate blending on Oxide with
+  host routing and CPU backward/SGD fallback; real-device `oxide_runtime_chain`
+  parity covers the full forward/backward/update path. Device-native routing and
+  backward remain.
 - `[vit]` reference path: cfg/shape, C++-ordered header-aware weights, seeded init,
   CPU analytical forward/backward + SGD, and GPU f32 host fallback; 23 focused
   tests pass, targeted package check/build pass with `-j 4`.

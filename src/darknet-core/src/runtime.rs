@@ -5636,7 +5636,7 @@ where
                         spec,
                     );
                     let per_image = layer.output_shape.element_count();
-                    let mut blended = vec![0.0f32; batch * per_image];
+                    let mut blended_gpu = None;
                     let mut cache = MoeForwardCache {
                         gates: experts.clone(),
                         expert_outputs: Vec::with_capacity(spec.experts),
@@ -5690,19 +5690,33 @@ where
                             .backend
                             .activation_f32(&biased, activation, launch_config)
                             .map_err(|err| backend_error("MoE expert activation", err))?;
-                        let host_output = self
-                            .download_tensor(&output_gpu, layer.output_shape)
-                            .map_err(|err| backend_error("download MoE expert output", err))?;
-                        for b in 0..batch {
-                            let gate = experts[b * spec.experts + slot];
-                            let range = b * per_image..(b + 1) * per_image;
-                            for (dst, src) in blended[range.clone()]
-                                .iter_mut()
-                                .zip(&host_output.data[range.clone()])
-                            {
-                                *dst += gate * src;
-                            }
-                        }
+                        let sample_gates = (0..batch)
+                            .map(|b| experts[b * spec.experts + slot])
+                            .collect::<Vec<_>>();
+                        let sample_gates = self
+                            .backend
+                            .upload_f32(&[batch], &sample_gates)
+                            .map_err(|err| backend_error("upload MoE expert gates", err))?;
+                        // Treat each sample as one channel with `per_image`
+                        // elements, applying its scalar gate to the full expert
+                        // output without moving that output back to the host.
+                        let weighted = self
+                            .backend
+                            .channel_scale_f32(
+                                &output_gpu,
+                                &sample_gates,
+                                batch,
+                                per_image,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("scale MoE expert output", err))?;
+                        blended_gpu = Some(match blended_gpu {
+                            Some(accumulated) => self
+                                .backend
+                                .saxpy_f32(1.0, &weighted, &accumulated, launch_config)
+                                .map_err(|err| backend_error("blend MoE expert outputs", err))?,
+                            None => weighted,
+                        });
                         // The CPU fallback backward needs the exact expert
                         // activation cache and host forward tensors.
                         let (cpu_output, activation_input) = forward_convolutional_with_cache(
@@ -5715,9 +5729,12 @@ where
                         cache.expert_activation_inputs.push(activation_input);
                     }
                     moe_cache = Some(cache);
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &blended)
-                        .map_err(|err| backend_error("upload MoE blended output", err))?
+                    blended_gpu.ok_or_else(|| {
+                        Error::InvalidConfig(format!(
+                            "layer #{} ([moe_convolutional]) has no expert outputs",
+                            layer.index
+                        ))
+                    })?
                 }
                 (LayerKind::Moe(_), _) => {
                     return Err(Error::InvalidConfig(format!(
