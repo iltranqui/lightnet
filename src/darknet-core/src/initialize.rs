@@ -2,8 +2,9 @@
 use crate::runtime::{BatchNormParams, ConnectedParams, ConvolutionalParams};
 use crate::{LayerParams, Network};
 
-/// Initialize fresh training parameters using Darknet's uniform
-/// `[-sqrt(2/fan_in), sqrt(2/fan_in)]` weights and unit BN scales.
+/// Initialize fresh training parameters with seeded Rust RNG values, Darknet's
+/// per-layer fan-in/Xavier scales, and unit normalization scales. The ViT arm
+/// mirrors its C++ drop-in patch, QKV, projection, FFN, and position initializers.
 /// The seed is reproducible in Rust, not bit-identical to C++'s RNG.
 /// Call before loading weights and before creating device parameter caches.
 pub fn initialize_training_params(network: &Network, params: &mut [LayerParams], seed: u64) {
@@ -30,6 +31,81 @@ pub fn initialize_training_params(network: &Network, params: &mut [LayerParams],
             // `load_laya_scorer_weights` to populate it from the shared blob, so
             // re-randomising it here would be wrong.
             LayerParams::LayaScorer(_) => {}
+            // Same for `[laya_act_head]`.
+            LayerParams::LayaActHead(_) => {}
+            // The encoder is frozen with a unit-gamma default; its weights come
+            // from the shared blob, not from random init.
+            LayerParams::LayaEncoder(_) => {}
+            LayerParams::LayaHead(_) => {}
+            LayerParams::Vit(p) => {
+                let patch_fan = layer.input_shape.channels
+                    * match &layer.kind {
+                        crate::LayerKind::Vit(spec) => spec.patch_size * spec.patch_size,
+                        _ => unreachable!("ViT parameters require a ViT layer"),
+                    };
+                let hidden = match &layer.kind {
+                    crate::LayerKind::Vit(spec) => spec.dim,
+                    _ => unreachable!("ViT parameters require a ViT layer"),
+                };
+                let mlp = match &layer.kind {
+                    crate::LayerKind::Vit(spec) => spec.mlp_dim,
+                    _ => unreachable!("ViT parameters require a ViT layer"),
+                };
+                let spec = match &layer.kind {
+                    crate::LayerKind::Vit(spec) => spec,
+                    _ => unreachable!("ViT parameters require a ViT layer"),
+                };
+                if hidden == layer.input_shape.channels {
+                    p.patch_embed.fill(0.0);
+                    let same_res_overlap = spec.patch_stride == 1
+                        && spec.patch_size % 2 == 1
+                        && spec.patch_pad == (spec.patch_size - 1) / 2;
+                    if same_res_overlap {
+                        let center = (spec.patch_size / 2) * spec.patch_size + spec.patch_size / 2;
+                        for c in 0..layer.input_shape.channels {
+                            p.patch_embed
+                                [c * patch_fan + center * layer.input_shape.channels + c] = 1.0;
+                        }
+                    } else {
+                        let scale = 1.0 / (spec.patch_size * spec.patch_size) as f32;
+                        for c in 0..layer.input_shape.channels {
+                            for y in 0..spec.patch_size {
+                                for x in 0..spec.patch_size {
+                                    let index = c * patch_fan
+                                        + (y * spec.patch_size + x) * layer.input_shape.channels
+                                        + c;
+                                    p.patch_embed[index] = scale;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    rng.weights_with_scale(
+                        &mut p.patch_embed,
+                        (2.0 / (patch_fan + hidden) as f32).sqrt(),
+                    );
+                }
+                rng.weights_with_scale(&mut p.qkv_weight, (2.0 / (4 * hidden) as f32).sqrt());
+                rng.weights_with_scale(&mut p.wo, (1.0 / hidden as f32).sqrt());
+                rng.weights(&mut p.ffn_w1, hidden);
+                rng.weights(&mut p.ffn_w2, mlp);
+                p.patch_bias.fill(0.0);
+                p.qkv_bias.fill(0.0);
+                p.wo_bias.fill(0.0);
+                p.ln1_gamma.fill(1.0);
+                p.ln1_beta.fill(0.0);
+                p.ln2_gamma.fill(1.0);
+                p.ln2_beta.fill(0.0);
+                p.ffn_b1.fill(0.0);
+                p.ffn_b2.fill(0.0);
+                if spec.learned_pos_embed {
+                    if spec.pos_init_zero {
+                        p.pos_embed.fill(0.0);
+                    } else {
+                        rng.weights_with_scale(&mut p.pos_embed, 0.02);
+                    }
+                }
+            }
             // Every expert is an ordinary convolution, so they get the ordinary
             // convolution initialisation.  The router's weights use the same
             // uniform rule over its `channels`-wide input; a zero router would
@@ -101,7 +177,10 @@ fn connected(p: &mut ConnectedParams, rng: &mut Rng) {
 struct Rng(u64);
 impl Rng {
     fn weights(&mut self, weights: &mut [f32], fan_in: usize) {
-        let scale = (2.0 / fan_in.max(1) as f32).sqrt();
+        self.weights_with_scale(weights, (2.0 / fan_in.max(1) as f32).sqrt());
+    }
+
+    fn weights_with_scale(&mut self, weights: &mut [f32], scale: f32) {
         for weight in weights {
             // SplitMix64: all seeds, including zero, produce a nonconstant stream.
             self.0 = self.0.wrapping_add(0x9e3779b97f4a7c15);
@@ -131,7 +210,8 @@ mod tests {
         initialize_training_params(&network, &mut source.params, 123);
         initialize_training_params(&network, &mut destination.params, 456);
         assert_ne!(source.params, destination.params);
-        let path = std::env::temp_dir().join(format!("darknet-init-{}.weights", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("darknet-init-{}.weights", std::process::id()));
         crate::save_weights(&network, &source.params, &path, 512).unwrap();
         let header = destination.load_weights_file(&path).unwrap();
         std::fs::remove_file(path).unwrap();
@@ -142,6 +222,51 @@ mod tests {
             assert!(p.weights.iter().all(|w| w.abs() <= bound));
             assert_eq!(p.batch_norm.as_ref().unwrap().scales, vec![1.0; 3]);
         }
+    }
+
+    #[test]
+    fn vit_training_initialization_is_seeded_and_respects_position_mode() {
+        let make = |pos_init: &str| {
+            let cfg = ConfigFile::parse_str(
+                "vit-init.cfg",
+                &format!("[net]\nwidth=4\nheight=4\nchannels=1\n[vit]\ndim=4\nheads=2\npatch_size=2\npatch_stride=2\nmlp_dim=4\npos_init={pos_init}\n"),
+            ).unwrap();
+            Network::from_config(cfg).unwrap()
+        };
+        let network = make("random");
+        let mut a = ExecutableNetwork::new(network.clone());
+        let mut b = ExecutableNetwork::new(network.clone());
+        initialize_training_params(&network, &mut a.params, 17);
+        initialize_training_params(&network, &mut b.params, 17);
+        assert_eq!(a.params, b.params);
+        let LayerParams::Vit(w) = &a.params[0] else {
+            panic!("Vit params")
+        };
+        assert!(w.patch_embed.iter().any(|x| *x != 0.0));
+        assert!(w.pos_embed.iter().any(|x| *x != 0.0));
+        assert!(w.pos_embed.iter().all(|x| x.abs() <= 0.02));
+        assert_eq!(w.ln1_gamma, vec![1.0; 4]);
+        assert_eq!(w.ln2_gamma, vec![1.0; 4]);
+
+        let network = make("zeros");
+        let mut zero = ExecutableNetwork::new(network.clone());
+        initialize_training_params(&network, &mut zero.params, 17);
+        let LayerParams::Vit(w) = &zero.params[0] else {
+            panic!("Vit params")
+        };
+        assert_eq!(w.pos_embed, vec![0.0; 16]);
+
+        let cfg = ConfigFile::parse_str(
+            "vit-dropin.cfg",
+            "[net]\nwidth=4\nheight=4\nchannels=1\n[vit]\ndim=1\nheads=1\npatch_size=2\npatch_stride=2\nmlp_dim=2\n",
+        ).unwrap();
+        let network = Network::from_config(cfg).unwrap();
+        let mut dropin = ExecutableNetwork::new(network.clone());
+        initialize_training_params(&network, &mut dropin.params, 5);
+        let LayerParams::Vit(w) = &dropin.params[0] else {
+            panic!("Vit params")
+        };
+        assert_eq!(w.patch_embed, vec![0.25; 4]);
     }
 
     #[test]

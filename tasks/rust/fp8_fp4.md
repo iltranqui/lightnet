@@ -85,89 +85,26 @@ Phase D – docs/bench: results table (f32/tf32/f16/fp8/fp4 GEMM TFLOPs on sm_89
 - Quantization granularity (per-tensor vs per-row) – start per-tensor.
 
 ---
+# STATUS (2026-10-05)
 
-# STATUS (2026-10-04)
+Phases A (steps 1-4), B (step 6), C (steps 7-9) and Phase D are implemented,
+tested and green on the real sm_89 GPU (RTX 4060 Laptop). **The full component
+inventory, the Phase D bench table and the hardware findings are in
+[`implemented.md`](implemented.md) §3.** This section keeps only what a future
+worker needs.
 
-Phases A (steps 1-4), B (step 6) and C (steps 7-9) and Phase D are implemented,
-tested and green on the real sm_89 GPU (RTX 4060 Laptop).  Step 5 (FP8 conv
-via im2col plus the LegoGears_v2 mAP comparison against the C++ FP8 path) is
-**not** done, and the C++ mAP comparison is not runnable here anyway (no C++
-build of `v6-dev-fp8`).  Nothing below changes the default path:
-`DARKNET_OXIDE_GEMM` still defaults to `fp32`, and the full oxide suite is
-unchanged (`./tools/test_oxide.sh` -> `EXIT=0`, all suites `ok`).
-
-## What exists
-
-| Plan item | Where | Status |
-|---|---|---|
-| A1 FP8 fragment-layout smoke test | `src/darknet-cuda-oxide/src/kernels/gemm_f8.rs` `fp8_mma_probe` (m16n8k32) and `fp8_mma_probe16` (m16n8k16), host wrappers `OxideBackend::fp8_mma_probe{,16}`, tests `oxide_gemm_f8.rs::fragment_layout_*` | done |
-| A1 layout sweep over candidate wirings | `oxide_gemm_f8.rs::fragment_layout_sweep_finds_the_documented_wiring` and `::fragment_layout_sweep_k16` | done |
-| A2 quantize + amax | `kernels/gemm_f8.rs` `fp8_amax_f32_kernel`, `fp8_quantize_kernel`, `fp8_dequantize_kernel`; host reference in `src/fp8.rs` | done |
-| A3 tiled FP8 GEMM | `kernels/gemm_f8.rs` `sgemm_fp8_mma` (64x64 tile, BK=32, 128 threads, NN/NT/TN/TT, batched views, split-K from the host) | done |
-| A4 backend selector | `GemmMode::Fp8` (`DARKNET_OXIDE_GEMM=fp8`/`e4m3`), `OxideBackend::gemm_f32_via_fp8` | done |
-| C7 NVFP4 quantiser | `kernels/quant_fp4.rs` (`fp4_quantize_1x16_kernel`, `fp4_amax_f32_kernel`, `fp4_finalize_global_scale_kernel`, `fp4_dequantize_1x16_kernel`); host reference in `src/fp4.rs` | done |
-| C7/C8 packed GEMM + oracle | `kernels/gemm_fp4.rs` `fp4_gemm_nt_packed` (tiled) and `fp4_gemm_nt_packed_reference` (one thread per output) | done |
-| C8 exactness | `oxide_gemm_fp4.rs` - both kernels are **bit exact** against `fp4::gemm_nt_packed`, whose block dot is an i32 `dp4a` sum | done |
-| C9 selector | `GemmMode::Fp4` (`DARKNET_OXIDE_GEMM=fp4`/`nvfp4`), `OxideBackend::gemm_f32_via_fp4` | done |
-FP8 backward (measured against the f32 backward on the same kernels):
-dgrad 3.1% and wgrad 2.2% worst relative error, i.e. exactly what e4m3 x e5m2
-operand rounding predicts - the pass-through is real and bounded.
-
-| B6 FP8 dgrad / wgrad | `OxideBackend::backward_gemm` + `with_fp8_backward` / `DARKNET_OXIDE_GEMM_BWD=fp8`, formats `(e4m3, e5m2)` per the C++ recipe; test `oxide_gemm_f8.rs::fp8_backward_dgrad_and_wgrad_track_the_f32_backward` | done |
-| D bench table | `tests/oxide_gemm_bench.rs` `gemm_bench_low_precision_kernels` + `gemm_bench_precisions`; results in `tasks/rust/todo.md` | done |
-| A5 optional FP8 conv / mAP | - | **not done** |
-
-## Findings that correct the plan
-
-1. **The FP8 `mma` family does work on this sm_89 part**, but the plan's
-   mandatory smoke test was worth having: the *documented* layout in
-   `branches/cuda-device/src/wmma.rs` (int8 `mma_m16n8k32`) has the A fragment's
-   `row` selector as `group` for elements 0-4 and 8-12, `group + 8` for 4-8 and
-   12-16 - **not** "elements >= 8".  Writing it as "elements >= 8" produces a
-   wrong-but-plausible result rather than an obvious failure.  The sweep test
-   now pins all five wiring axes (which register holds row group+8, which K
-   band each register covers, and the byte order inside a register) against an
-   exact host GEMM; the documented wiring is the only k32 candidate that matches
-   (max relative error 0).  `m16n8k16` has additional degenerate candidates
-   (the K band is only 16 wide), also fine because the documented one matches.
-2. **B fragments cannot be read one aligned word at a time from a `[k][n]`
-   shared tile**: an mma B register holds four *K* values of one column, which
-   in the natural `[k][n]` layout sit 32 bytes apart.  The kernel therefore
-   stages B transposed in shared memory (`[n][k]`, stride 40 -> 36), which
-   makes the four bytes consecutive again.  Getting this wrong shows up as
-   `CUDA_ERROR_MISALIGNED_ADDRESS` from `ld.shared.b32`.
-3. **e4m3 / e5m2 details the plan did not pin** (all verified against the
-   hardware by `quantize_matches_the_host_reference_over_a_dense_sweep`):
-   * e4m3's exponent bias is **7**, not `2^(bits-1)-1`, so its smallest subnormal
-     is `2^-9` and the subnormal step is `2^(1-bias-mantissa_bits)`.
-   * e5m2 has a **5-bit** exponent field (bias 15); its largest finite code is
-     `0x7b` (57344), `0x7c` is infinity and `0x7d..0x7f` are NaN.  e4m3 spends
-     the whole top binade on finite values: `0x7e` is 448 and only `0x7f` is NaN.
-   * `cvt.rn.satfinite.<fmt>x2.f32` maps **every** NaN (signed or not) to the
-     *unsigned* NaN code; the sign is dropped.
-   * Round-to-nearest ties go to the even *code*, and saturation has to be
-     applied before the search (`max - x` is flat in f32 far above the grid, so
-     the tie rule would otherwise pick a sub-maximal code).
-4. **Tensor-core accumulation order** puts a floor of about `5e-5` (relative to
-   the row norm `sum_k |a_k b_k|`) on any comparison with an f64 CPU reference,
-   far above `2^-24`.  All FP8 tests compare against that row norm, not against
-   `|sum|`, which cancels.
-5. **The FP8 quantisation factor is the *reciprocal* of the C++ scale.**  `fp8_scaling.cpp`
-   returns `scale = amax / 448` as a *divisor*; the quantiser multiplies, so the
-   factor handed to the kernel is `448 / amax`, and the dequantiser multiplies
-   by the divisor.  Passing `amax / 448` as a multiplier maps every operand onto
-   the bottom of the format's range (an e5m2 typical value lands below `2^-16`
-   and is flushed) and looks plausible because a test that quantises on the host
-   with the same inverted factor still agrees with the device.  The same applies
-   to the dequantisation in the epilogue: the mma accumulates the *scaled*
-   products, so `alpha` is folded with `1 / (fa * fb)` instead of running a
-   second pass over `C`.
-6. **`__dp4a` couples 4 bytes of a word in lane order 0..3**, exactly as
-   `fp4simgemm_decode_row_words` in the C++ assumes; the device matches the C++
-   bit for bit.  The *host* reference in `src/fp4.rs` initially had an `as i32`
-   precedence bug that silently dropped every +-0.5 code - the C++ LUT does not
-   have it, which is why the device and the (buggy) host disagreed only on
-   inputs containing 0.5.  `fp4::tests::block_dot_includes_the_half_codes` pins it.
+- Default path unchanged: `DARKNET_OXIDE_GEMM` still defaults to `fp32`; the
+  full oxide suite is unchanged (`./tools/test_oxide.sh` -> `EXIT=0`, all
+  suites `ok`).
+- **NOT done - step 5**: FP8 conv via im2col plus the LegoGears_v2 mAP
+  comparison against the C++ FP8 path (no C++ build of `v6-dev-fp8` here).
+- C++ parity for the FP8/FP4 numerics is **NOT RUN** (no C++ build of
+  `v6-dev-fp8` / `raptor-fp4`). The host references in
+  `darknet_cuda_oxide::fp8` / `::fp4` are ports of the C++ recipes and are
+  bit-exact against the device kernels.
+- `GemmMode::Fp8` / `Fp8Format::{E4M3,E5M2}`, `GemmMode::Fp4` /
+  `fp4::Fp4Packed`, `DARKNET_OXIDE_GEMM=fp8|e4m3|fp4|nvfp4`, and the FP8
+  backward (`DARKNET_OXIDE_GEMM_BWD=fp8`) are all in.
 
 ## How to run
 
@@ -178,11 +115,11 @@ cargo test --manifest-path src/darknet-cuda-oxide/Cargo.toml --lib   # 14 host r
 ./tools/test_oxide.sh --test oxide_gemm_bench -- --ignored gemm_bench_precisions   # Phase D table
 ```
 
-## Phase D conclusion (worth reading before enabling fp8 for speed)
+## Phase D conclusion (before enabling fp8 for speed)
 
 At 2048^3 the FP8 `mma` reaches 7020 GF/s against 13485 GF/s for the existing
 fp16 `mma.m16n8k16` GEMM and 9560 GF/s for TF32 on this part, and the NVFP4
-emulation is ~15x slower than fp16.  The fp8 mode is a **numerics** feature
+emulation is ~15x slower than fp16. The fp8 mode is a **numerics** feature
 here, not a speed feature; and because the per-call quantisation dominates
 below ~1024^3, a usable network-level fp8 mode has to hoist the weight
-quantisation out of the GEMM seam first.  Full table in `tasks/rust/todo.md`.
+quantisation out of the GEMM seam first. Full table in `implemented.md` §3.

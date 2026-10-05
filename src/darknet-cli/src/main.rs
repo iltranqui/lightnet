@@ -2395,6 +2395,9 @@ fn print_forward_backward_summary(
                             || expert.weight_updates.iter().any(|value| *value != 0.0)
                     })
             }
+            darknet_core::LayerTrainBuffers::Vit(vit) => {
+                vit.updates.to_blob().iter().any(|value| *value != 0.0)
+            }
             darknet_core::LayerTrainBuffers::Gru(_)
             | darknet_core::LayerTrainBuffers::Rnn(_)
             | darknet_core::LayerTrainBuffers::Lstm(_)

@@ -220,6 +220,34 @@ fn bias_backward_reduction() {
 }
 
 #[test]
+fn weighted_shortcut_composition_matches_host_reference() {
+    let b = backend();
+    let batch = 2;
+    let channels = 3;
+    let channel_stride = 4;
+    let per_sample = channels * channel_stride;
+    let host_inputs: Vec<Vec<f32>> = (0..3)
+        .map(|input| (0..batch * per_sample).map(|i| (i as f32 * 0.17 + input as f32).sin()).collect())
+        .collect();
+    let inputs: Vec<_> = host_inputs.iter().map(|data| b.upload_f32(&[batch, channels, 1, channel_stride], data).unwrap()).collect();
+    let refs: Vec<_> = inputs.iter().collect();
+    let weights: Vec<f32> = (0..3 * channels).map(|i| 0.2 + i as f32 * 0.03).collect();
+    let mut expected = vec![0.0; batch * per_sample];
+    for (input_index, host) in host_inputs.iter().enumerate() {
+        for batch_index in 0..batch {
+            for channel in 0..channels {
+                for spatial in 0..channel_stride {
+                    let index = (batch_index * channels + channel) * channel_stride + spatial;
+                    expected[index] += host[index] * weights[input_index * channels + channel];
+                }
+            }
+        }
+    }
+    let got = b.shortcut_weighted_sum_f32(&refs, &weights, channels, channel_stride, cfg()).unwrap();
+    assert_close("weighted shortcut", &b.download_f32(&got).unwrap(), &expected);
+}
+
+#[test]
 fn vector_add_shortcut_saxpy() {
     let b = backend();
     let mut rng = Rng(5);

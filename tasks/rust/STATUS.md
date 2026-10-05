@@ -1,8 +1,9 @@
 # Porting progress — durable state
 
-Read this first after a context compaction. It records what is done, what is
-verified, and what is next. The authoritative plan is
-`tasks/rust/layers.md`; the FP8/FP4 plan is `tasks/rust/fp8_fp4.md`.
+Read this first after a context compaction. It records what is verified and what
+is next. The authoritative plan is `tasks/rust/layers.md`; the FP8/FP4 plan is
+`tasks/rust/fp8_fp4.md`; the **full implemented inventory is
+`tasks/rust/implemented.md`** (this file no longer repeats it).
 
 ## Ground rules (do not violate)
 
@@ -24,55 +25,41 @@ port the whole OBB family, build a dense-truth trainer, keep the legacy layers,
 and let Rust define the swin weights order. **Nothing is blocked on a question
 any more** — the remaining blockers are evidence gaps only.
 
-## DONE and verified
+## Implemented
 
-`tasks/rust/fp8_fp4.md` — every phase except the optional step 5:
-- Phase A: `kernels/gemm_f8.rs` (m16n8k32 e4m3/e5m2 tiled GEMM, NN/NT/TN/TT,
-  batched, split-K), per-tensor quantiser, `GemmMode::Fp8`.
-- Phase B: FP8 dgrad/wgrad with the C++ asymmetric formats (e4m3 weights x
-  e5m2 gradient), `DARKNET_OXIDE_GEMM_BWD=fp8`.
-- Phase C: `kernels/quant_fp4.rs` + `kernels/gemm_fp4.rs` (packed NVFP4,
-  `__dp4a`), **bit exact** against a CPU i32 reference, so no tensor core is
-  on that path. `GemmMode::Fp4`.
-- Phase D: bench table in `tasks/rust/todo.md`.
-- Step 5 (FP8 conv/mAP vs the C++ build) not done: no C++ build available.
+Everything delivered so far is consolidated in
+[`tasks/rust/implemented.md`](implemented.md): the cuda-oxide backend (P0–P9),
+FP8/FP4, layer-port Phases 0 / 1b / 2A / 2B-CPU and the Phase 3A shared
+primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
+and housekeeping — each with its evidence.
 
-`tasks/rust/layers.md`:
-- **Phase 0 (Tasks 1-12)** — commits `8e4b0f24`..`be71eb6e`.
-- **Phase 1b `segmentation`** — `segmentation.rs`, 18 tests.
-- **Phase 1b `omd_loss`** — `omd_loss.rs`, 14 tests.
-- **1b deferred (c) `contrastive`**, classifier branch — `contrastive.rs`,
-  11 tests. The detection branch self-reports as unported.
-- **Phase 2A complete**: `yolox` + `ppyoloe` + `yolonas` (`modern_yolo.rs`, 27
-  tests; the two siblings are 76-line C++ wrappers over the same shared code),
-  `[centernet]` (`centernet.rs`, 13 tests), and the LegoGears nested-object fix
-  (per-slot `class_quality`, smallest-area-wins, `min_object_cells`).
-- **Phase 1b `[laya_scorer]`** — `laya_scorer.rs`, 14 tests, validated against the
-  real `test_data/laya/laya_english.weights` blob (LayerNorm gamma mean 0.9045,
-  beta rms 0.0425 - a wrong offset or blob order would be arbitrary).
-
-Layers ported follow the Layer Port Contract in `tasks/rust/layers.md`:
-spec + parse + shape in `model.rs`, pure math in its own module, thin CPU
-arms + host-round-trip GPU arms in `runtime.rs`, and a `dense_loss` arm for
-heads whose truth is not their own output shape.
-
-## Just landed (verify + commit if still uncommitted)
-
-`[laya_scorer]`: `src/darknet-core/src/laya_scorer.rs` + `LayaScorerSpec` +
-`LayerParams::LayaScorer`. Note it needs `#![feature(float_erf)]` in
-`darknet-core` (the erf GELU is not darknet's tanh approximation, and C++ uses
-`std::erf`).
-Evidence: 248 darknet-core unit tests pass, 0 unreachable-pattern warnings,
-`cfg_corpus` green, full oxide suite 18/18 `ok`, and
-`cargo check/build/run -j 4` green. Cfg keys: `classes`(20), `max`(200),
-`jitter`(0.2), `resize`(1.0) — the C++ parser reads nothing else, so every
-training knob keeps its `set_default_training_params` default.
-
-Two real bugs it caught, both worth remembering:
-- the FP8 quantisation factor was inverted (`amax/max` instead of `max/amax`),
-  which mapped every operand onto the bottom of the format's range;
-- `yolox_train_batch` sized its delta per image but indexed it with whole-batch
-  strides.
+Latest increments:
+- Weighted `[shortcut]` GPU forward composes oxide channel-scale + add; exact
+  CPU backward/SGD fallback has real-device runtime parity coverage.
+- AMP runtime with dropout and dropblock now has real-device output/mask/backward/
+  SGD comparison against f32 (`oxide_runtime_chain` test).
+- Deferred optimizer accumulation has a real-device `subdivisions=2` CPU parity
+  test across two iterations, including pending-gradient flush.
+- Device convolution params support per-owner expert slots for container reuse;
+  warm-up and host-update invalidation are covered by the
+  `container_convolution_cache_is_keyed_by_owner_and_expert_slot` FakeBackend test.
+  MoE now runs expert convolutions on Oxide with host routing/blending and CPU
+  backward/SGD fallback; real-device `oxide_runtime_chain` parity covers the
+  full forward/backward/update path. Device-native routing/blending/backward remain.
+- `[vit]` reference path: cfg/shape, C++-ordered header-aware weights, seeded init,
+  CPU analytical forward/backward + SGD, and GPU f32 host fallback; 23 focused
+  tests pass, targeted package check/build pass with `-j 4`.
+- Host suites: `darknet-core --lib` 380/380 and `darknet-cli` 18/18 pass. The
+  real-device `oxide_runtime_chain` suite now passes all 7 tests.
+  `cfg_corpus` started but the combined host run hit its 30-minute command timeout;
+  this is not evidence of a code failure. Historical `raptor-fp4` C++ commit
+  `ceb7c974` was located for MSA and flash/VC source audit.
+- `[moe_convolutional]` CPU path (commit `cdf68d00`) — 13 tests green.
+- `[laya_marker_gather]` — 10 tests; `[laya_act_head]` — 9 tests;
+  `[laya_loss]` — 11 tests; `[laya_encoder]` — 9 tests; `[laya_head]` — 8 tests;
+  `darknet-core --lib` 354/354.
+- Docs reconciled: `todo.md` now tracks open work only; `eml_convolutional`
+  save order verified; `onnx.md` / `gui_iced_plan.md` marked not started.
 
 ## Verification commands
 
@@ -91,19 +78,21 @@ believing a `cfg_corpus` failure.
 
 ## NEXT (in dependency order, nothing blocked)
 
-1. Phase 1b `laya_*` — `laya_scorer` is done. Next in the family:
-   `laya_marker_gather` (S, two inputs via `layers=idxA,idxB`, checks
-   `out_c(A)==hidden` and `out_c(B)>=2*max_options`), `laya_act_head` (S/M,
-   three inputs), `laya_loss` (M, `ce | rlcd`).
+1. The LAYA family is **complete** (`laya_scorer`, `laya_marker_gather`,
+   `laya_act_head`, `laya_loss`, `laya_encoder`, `laya_head`). The `[vit]`
+   reference path is now wired; remaining Phase 3A work is flash/vc-attention
+   fast paths and `swin`/`transformer`, `tucker_attention`, `mambavision`,
+   `kimi_kda`, `minimax_sparse_attention` on the shared LayerNorm/GEMM set.
    **Order matters:** `[laya_scorer]`'s `weights=` is only usable together with
    `[laya_encoder]` + `[laya_head]` (the shared-file offset is computed past
    their blobs), so those two come next even though the plan files them under
    Phase 4. They also need the Phase 3A prerequisite kernel set.
 2. Phase 2A is done, including `detect::decode_modern_detections` and the
-   `detect-image` merge. Remaining across the phases: `cfg/LegoGears_centernet.cfg`
-   end to end (the cfg lives on `Jev_laya`), then 2B (`moe`/`eml`, container-conv
-   reuse first), 2C (OBB), 3A/3B (transformer + deformable families, shared
-   LayerNorm/GEMM kernel set first) and 4.
+   `detect-image` merge. Phase 2B `moe_convolutional`'s **CPU path is done**
+   (commit `cdf68d00`); its oxide/GPU arm is open. Remaining across the phases:
+   `cfg/LegoGears_centernet.cfg` end to end (the cfg lives on `Jev_laya`), then
+   2B's `eml_convolutional` (+ the `moe` GPU arm), 2C (OBB), 3A/3B (transformer +
+   deformable families, shared LayerNorm/GEMM kernel set first) and 4.
 3. **Phase 3A prerequisite (2) is complete**: LayerNorm fwd/bwd, the fused
    residual/bias epilogue, the row-softmax backward and the batched-GEMM wrapper
    (`linear_f32`) are all in, each with a host default plus GPU parity tests.
@@ -113,9 +102,11 @@ believing a `cfg_corpus` failure.
    `vc_attention` fast paths (decision 3) get their own kernels or reuse the
    reference attention path.
 4. Phase 2B `moe_convolutional` (weights order verified) and
-   `eml_convolutional` (an activation, not a `LayerKind`; save order is
-   `weights.cpp:775`, still `[report: not re-read]` — re-read it).
-   Both need the container-conv reuse prerequisite first.
+   `eml_convolutional` (an activation, not a `LayerKind`; save order **re-read
+   2026-10-05**: `input_layer` then `self_layer`, two full conv blocks).
+   `moe`'s CPU path is done (commit `cdf68d00`); the next step is the
+   container-conv reuse prerequisite (generalise the device conv-param cache
+   to a `(owner, slot)` key), see `tasks/rust/layers.md`.
 5. Phase 3B deformable family — start with `dcnv4` (real C++ forward and
    kernels; weights order `weights.cpp:428`).
 6. Phase 2C OBB, then Phase 4.
@@ -132,4 +123,16 @@ believing a `cfg_corpus` failure.
 - DETR is still broken in C++, so Phase 4's `detr_decoder` also has no
   reference numerics.
 - No C++ build of any owning branch is available here, so C++ dump parity is
-  "NOT RUN" everywhere; it is recorded per layer in `tasks/rust/todo.md`.
+  "NOT RUN" everywhere.
+
+## Task plans not started
+
+Two self-contained task plans in this directory have **no implementation**:
+
+- `tasks/rust/onnx.md` (`darknet-rs export-onnx`): 0/23 task steps done. No
+  `src/darknet-core/src/onnx/` module and no `export-onnx` CLI arm exist.
+- `tasks/rust/gui_iced_plan.md` (iced DarkMark-compatible GUI): 0/84 task
+  steps done. None of `darknet-gui-project` / `darknet-gui-engine` /
+  `darknet-gui` exist, and there is no `detect-server` CLI arm.
+
+Both are greenfield; the layer-port work above does not depend on them.

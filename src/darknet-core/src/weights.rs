@@ -175,6 +175,9 @@ pub fn save_weights(
                 write_convolutional_params(&mut file, &recurrent.self_params)?;
                 write_convolutional_params(&mut file, &recurrent.output)?;
             }
+            (LayerKind::Vit(_), LayerParams::Vit(vit)) => {
+                write_f32_slice(&mut file, &vit.to_blob())?;
+            }
             // C++ `save_moe_convolutional_weights`: every expert's complete
             // convolution block first, then the router biases and weights.
             (LayerKind::Moe(_), LayerParams::Moe(moe)) => {
@@ -184,6 +187,10 @@ pub fn save_weights(
                 write_f32_slice(&mut file, &moe.router_biases)?;
                 write_f32_slice(&mut file, &moe.router_weights)?;
             }
+            // C++ `dontsave`: the frozen LAYA layers load from an external
+            // shared blob, so nothing is written for them in this stream.
+            (LayerKind::LayaEncoder(_), LayerParams::LayaEncoder(_)) => {}
+            (LayerKind::LayaHead(_), LayerParams::LayaHead(_)) => {}
             (_, LayerParams::None) => {}
             _ => {
                 return Err(Error::Weights(format!(
@@ -326,6 +333,66 @@ mod tests {
             write_f32_slice(&mut got, &values).unwrap();
             assert_eq!(got, expected, "len {len}");
         }
+    }
+
+    #[test]
+    fn vit_weights_round_trip_modern_and_legacy_headers() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "vit.cfg",
+                "[net]\nwidth=4\nheight=4\nchannels=1\n\
+                 [vit]\ndim=4\nheads=2\npatch_size=2\npatch_stride=2\nmlp_dim=8\n",
+            ).unwrap(),
+        ).unwrap();
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let blob_len;
+        {
+        let LayerParams::Vit(weights) = &mut executable.params[0] else { panic!("Vit params") };
+        let fill = |v: &mut [f32], start: usize| {
+            for (i, x) in v.iter_mut().enumerate() { *x = start as f32 + i as f32 * 0.01; }
+        };
+        fill(&mut weights.patch_embed, 1);
+        fill(&mut weights.patch_bias, 2);
+        fill(&mut weights.qkv_weight, 3);
+        fill(&mut weights.qkv_bias, 4);
+        fill(&mut weights.ln1_gamma, 5);
+        fill(&mut weights.ln1_beta, 6);
+        fill(&mut weights.wo, 7);
+        fill(&mut weights.wo_bias, 8);
+        fill(&mut weights.ln2_gamma, 9);
+        fill(&mut weights.ln2_beta, 10);
+        fill(&mut weights.ffn_w1, 11);
+        fill(&mut weights.ffn_b1, 12);
+        fill(&mut weights.ffn_w2, 13);
+        fill(&mut weights.ffn_b2, 14);
+        fill(&mut weights.pos_embed, 15);
+        fill(&mut weights.mhc, 16);
+        blob_len = weights.to_blob().len();
+        }
+        let modern_path = std::env::temp_dir().join("darknet-vit-modern-roundtrip.weights");
+        save_weights(&network, &executable.params, &modern_path, 17).unwrap();
+        let expected_len = 20 + blob_len as u64 * 4;
+        assert_eq!(fs::metadata(&modern_path).unwrap().len(), expected_len);
+        let mut modern = ExecutableNetwork::new(network.clone());
+        modern.load_weights_file(&modern_path).unwrap();
+        assert_eq!(modern.params, executable.params);
+        assert_eq!(inspect_weights_file(&network, &modern_path).unwrap().trailing_bytes, 0);
+
+        let legacy_path = std::env::temp_dir().join("darknet-vit-legacy-roundtrip.weights");
+        let mut bytes = fs::read(&modern_path).unwrap();
+        bytes[8..12].copy_from_slice(&4i32.to_le_bytes()); // same header width, before the mHC format revision
+        bytes.truncate(bytes.len() - 12 * 4);
+        fs::write(&legacy_path, bytes).unwrap();
+        assert_eq!(fs::metadata(&legacy_path).unwrap().len(), 20 + (blob_len as u64 - 12) * 4);
+        let mut legacy = ExecutableNetwork::new(network);
+        legacy.load_weights_file(&legacy_path).unwrap();
+        let LayerParams::Vit(legacy_params) = &legacy.params[0] else { panic!("Vit params") };
+        let LayerParams::Vit(modern_params) = &executable.params[0] else { panic!("Vit params") };
+        let mut expected = modern_params.clone();
+        expected.mhc = crate::vit::MHC_DEFAULTS.to_vec();
+        assert_eq!(legacy_params, &expected);
+        let _ = fs::remove_file(modern_path);
+        let _ = fs::remove_file(legacy_path);
     }
 
     #[test]
@@ -517,6 +584,12 @@ mod tests {
                     // The scorer's blob lives at an offset inside a shared file,
                     // so it is never part of this sequential stream.
                     LayerParams::LayaScorer(_) => {}
+                    // Same for the act head.
+                    LayerParams::LayaActHead(_) => {}
+                    // And the encoder.
+                    LayerParams::LayaEncoder(_) => {}
+                    // And the head.
+                    LayerParams::LayaHead(_) => {}
                     LayerParams::Moe(moe) => {
                         for expert in &mut moe.experts {
                             for value in &mut expert.weights {
@@ -571,7 +644,8 @@ mod tests {
                     | LayerParams::Connected(_)
                     | LayerParams::Local(_)
                     | LayerParams::Shortcut(_)
-                    | LayerParams::Gru(_) => {}
+                    | LayerParams::Gru(_)
+                    | LayerParams::Vit(_) => {}
                 }
             }
             let path = std::env::temp_dir().join(format!("darknet-{name}-roundtrip.weights"));

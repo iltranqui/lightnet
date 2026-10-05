@@ -235,6 +235,14 @@ pub enum LayerParams {
     Crnn(CrnnParams),
     /// `[laya_scorer]`'s six frozen tensors (loaded from its `.weights` blob).
     LayaScorer(crate::laya_scorer::LayaScorerWeights),
+    /// `[laya_act_head]`'s four frozen tensors (loaded from its `.weights` blob).
+    LayaActHead(crate::laya_act_head::LayaActHeadWeights),
+    /// `[laya_encoder]`'s frozen ModernBERT weights (loaded from its `.weights` blob).
+    LayaEncoder(crate::laya_encoder::LayaEncoderWeights),
+    /// `[laya_head]`'s frozen decision-head weights (loaded from its `.weights` blob).
+    LayaHead(crate::laya_head::LayaHeadWeights),
+    /// `[vit]` global transformer parameters in the C++ save order.
+    Vit(crate::vit::VitWeights),
     /// `[moe_convolutional]`: one convolution per expert plus the router's
     /// `[experts, channels]` weights and `[experts]` biases.
     Moe(MoeParams),
@@ -329,6 +337,13 @@ pub struct CrnnTrainBuffers {
     pub output: ConvolutionalTrainBuffers,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct VitTrainBuffers {
+    /// Descending update directions (negative mathematical gradients), in
+    /// `VitWeights` block shape/order.
+    pub updates: crate::vit::VitWeights,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayerTrainBuffers {
@@ -343,6 +358,7 @@ pub enum LayerTrainBuffers {
     Lstm(LstmTrainBuffers),
     Crnn(CrnnTrainBuffers),
     Moe(MoeTrainBuffers),
+    Vit(VitTrainBuffers),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -471,6 +487,7 @@ pub struct ForwardResult {
     /// output, which the backward pass needs for the gate dot products and for
     /// the scaled expert gradients.
     pub moe_caches: Vec<Option<MoeForwardCache>>,
+    pub vit_caches: Vec<Option<crate::vit::VitForwardCache>>,
     pub yolo_heads: Vec<YoloHeadOutput>,
     /// The modern anchor-free heads, in layer order.
     pub modern_heads: Vec<ModernHeadOutput>,
@@ -899,6 +916,10 @@ impl ExecutableNetwork {
                 // (`update_moe_convolutional_layer` calls `axpy_cpu` with
                 // `-decay * batch` only for the experts' offset/collapse
                 // weights), so decay is passed as 0.0 for them.
+                (LayerParams::Vit(params), LayerTrainBuffers::Vit(train)) => {
+                    let learned_pos = matches!(self.network.layers[layer_index].kind, LayerKind::Vit(ref spec) if spec.learned_pos_embed);
+                    update_vit_params(params, train, lr * opts.learning_rate_scale, momentum, decay, batch, learned_pos);
+                }
                 (LayerParams::Moe(moe), LayerTrainBuffers::Moe(train)) => {
                     sgd_update(
                         &mut moe.router_biases,
@@ -1016,6 +1037,47 @@ impl ExecutableNetwork {
                 (LayerKind::Route(spec), LayerParams::None) => {
                     forward_route_compact(spec, layer.index, &outputs, layer.output_shape)?
                 }
+                (LayerKind::LayaMarkerGather(spec), LayerParams::None) => {
+                    let a_index = resolve_relative_layer(layer.index, spec.layers[0])?;
+                    let b_index = resolve_relative_layer(layer.index, spec.layers[1])?;
+                    let a = outputs.get(a_index).and_then(Option::as_ref).ok_or(
+                        Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.layers[0],
+                        },
+                    )?;
+                    let b = outputs.get(b_index).and_then(Option::as_ref).ok_or(
+                        Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.layers[1],
+                        },
+                    )?;
+                    laya_marker_gather_forward(spec, a, b, layer.output_shape)?
+                }
+                (LayerKind::LayaActHead(spec), LayerParams::LayaActHead(weights)) => {
+                    let head_index = resolve_relative_layer(layer.index, spec.layers[0])?;
+                    let scorer_index = resolve_relative_layer(layer.index, spec.layers[1])?;
+                    let marker_index = resolve_relative_layer(layer.index, spec.layers[2])?;
+                    let head = outputs.get(head_index).and_then(Option::as_ref).ok_or(
+                        Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.layers[0],
+                        },
+                    )?;
+                    let scorer = outputs.get(scorer_index).and_then(Option::as_ref).ok_or(
+                        Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.layers[1],
+                        },
+                    )?;
+                    let marker = outputs.get(marker_index).and_then(Option::as_ref).ok_or(
+                        Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.layers[2],
+                        },
+                    )?;
+                    laya_act_head_forward(spec, weights, head, scorer, marker, layer.output_shape)?
+                }
                 (LayerKind::Shortcut(spec), LayerParams::None) => forward_shortcut_compact(
                     spec,
                     current_input.expect("shortcut input"),
@@ -1085,6 +1147,7 @@ impl ExecutableNetwork {
         let mut yolo_heads = Vec::new();
         let mut modern_heads = Vec::new();
         let mut moe_caches = Vec::with_capacity(self.network.layers.len());
+        let mut vit_caches = Vec::with_capacity(self.network.layers.len());
         let mut rng_state = 0x9e37_79b9_u64;
 
         for (layer, params) in self.network.layers.iter().zip(&self.params) {
@@ -1103,6 +1166,7 @@ impl ExecutableNetwork {
             let mut crop_cache = None;
             let mut recurrent_cache = None;
             let mut moe_cache = None;
+            let mut vit_cache = None;
             let (output, activation_input) = match (&layer.kind, params) {
                 (
                     LayerKind::Convolutional(spec),
@@ -1180,6 +1244,40 @@ impl ExecutableNetwork {
                     forward_route(spec, layer.index, &layer_outputs, layer.output_shape)?,
                     None,
                 ),
+                (LayerKind::LayaMarkerGather(spec), LayerParams::None) => {
+                    let a_index = resolve_relative_layer(layer.index, spec.layers[0])?;
+                    let b_index = resolve_relative_layer(layer.index, spec.layers[1])?;
+                    let a = layer_outputs.get(a_index).ok_or(Error::InvalidRoute {
+                        layer_index: layer.index,
+                        reference: spec.layers[0],
+                    })?;
+                    let b = layer_outputs.get(b_index).ok_or(Error::InvalidRoute {
+                        layer_index: layer.index,
+                        reference: spec.layers[1],
+                    })?;
+                    (laya_marker_gather_forward(spec, a, b, layer.output_shape)?, None)
+                }
+                (LayerKind::LayaActHead(spec), LayerParams::LayaActHead(weights)) => {
+                    let head_index = resolve_relative_layer(layer.index, spec.layers[0])?;
+                    let scorer_index = resolve_relative_layer(layer.index, spec.layers[1])?;
+                    let marker_index = resolve_relative_layer(layer.index, spec.layers[2])?;
+                    let head = layer_outputs.get(head_index).ok_or(Error::InvalidRoute {
+                        layer_index: layer.index,
+                        reference: spec.layers[0],
+                    })?;
+                    let scorer = layer_outputs.get(scorer_index).ok_or(Error::InvalidRoute {
+                        layer_index: layer.index,
+                        reference: spec.layers[1],
+                    })?;
+                    let marker = layer_outputs.get(marker_index).ok_or(Error::InvalidRoute {
+                        layer_index: layer.index,
+                        reference: spec.layers[2],
+                    })?;
+                    (
+                        laya_act_head_forward(spec, weights, head, scorer, marker, layer.output_shape)?,
+                        None,
+                    )
+                }
                 (LayerKind::Shortcut(spec), LayerParams::Shortcut(params)) => {
                     forward_shortcut_weighted(spec, params, current_input, layer.index, &layer_outputs)?
                 }
@@ -1195,6 +1293,32 @@ impl ExecutableNetwork {
                         current_input.shape,
                         crate::jev_ce::jev_ce_probs(&current_input.data, spec, current_input.shape.batch),
                     )?,
+                    None,
+                ),
+                (LayerKind::LayaLoss(spec), LayerParams::None) => (
+                    Tensor::from_data(
+                        current_input.shape,
+                        crate::laya_loss::laya_probs(
+                            &current_input.data,
+                            current_input.shape.batch,
+                            spec.max_options,
+                        ),
+                    )?,
+                    None,
+                ),
+                (LayerKind::Vit(spec), LayerParams::Vit(weights)) => {
+                    let geometry = vit_geometry(layer, spec);
+                    let (data, cache) = crate::vit::vit_forward(&current_input.data, weights, &geometry)
+                        .map_err(Error::InvalidConfig)?;
+                    vit_cache = Some(cache);
+                    (Tensor::from_data(layer.output_shape, data)?, None)
+                }
+                (LayerKind::LayaEncoder(spec), LayerParams::LayaEncoder(weights)) => (
+                    laya_encoder_forward(spec, weights, current_input, layer.output_shape)?,
+                    None,
+                ),
+                (LayerKind::LayaHead(spec), LayerParams::LayaHead(weights)) => (
+                    laya_head_forward(spec, weights, current_input, layer.output_shape)?,
                     None,
                 ),
                 (LayerKind::Logistic, LayerParams::None) => {
@@ -1455,6 +1579,7 @@ impl ExecutableNetwork {
             crop_caches.push(crop_cache);
             recurrent_caches.push(recurrent_cache);
             moe_caches.push(moe_cache);
+            vit_caches.push(vit_cache);
         }
 
         Ok(ForwardResult {
@@ -1464,6 +1589,7 @@ impl ExecutableNetwork {
             crop_caches,
             recurrent_caches,
             moe_caches,
+            vit_caches,
             yolo_heads,
             modern_heads,
         })
@@ -1927,6 +2053,26 @@ impl ExecutableNetwork {
                         &self.network.layers,
                     )?;
                 }
+                (LayerKind::LayaMarkerGather(spec), LayerParams::None) => {
+                    backward_laya_marker_gather(
+                        spec,
+                        layer.index,
+                        &forward.layer_outputs,
+                        &grad,
+                        &mut layer_output_gradients,
+                        &self.network.layers,
+                    )?;
+                }
+                (LayerKind::LayaActHead(spec), LayerParams::LayaActHead(weights)) => {
+                    backward_laya_act_head(
+                        spec,
+                        weights,
+                        layer.index,
+                        &forward.layer_outputs,
+                        &grad,
+                        &mut layer_output_gradients,
+                    )?;
+                }
                 (LayerKind::Shortcut(spec), LayerParams::Shortcut(params)) => {
                     let output = &forward.layer_outputs[layer.index];
                     let delta = apply_output_activation_gradient(
@@ -2256,13 +2402,49 @@ impl ExecutableNetwork {
                 | (LayerKind::Yolonas(_), LayerParams::None)
                 | (LayerKind::CenterNet(_), LayerParams::None)
                 | (LayerKind::Regression(_), LayerParams::None)
-                | (LayerKind::JevCe(_), LayerParams::None) => {
+                | (LayerKind::JevCe(_), LayerParams::None)
+                | (LayerKind::LayaLoss(_), LayerParams::None) => {
                     accumulate_previous_gradient(
                         layer.index,
                         &grad,
                         &mut input_gradient,
                         &mut layer_output_gradients,
                     )?;
+                }
+                (LayerKind::Vit(_), LayerParams::Vit(weights)) => {
+                    let cache = forward.vit_caches.get(layer.index).and_then(Option::as_ref)
+                        .ok_or_else(|| Error::InvalidConfig(format!("missing [vit] forward cache for layer #{}", layer.index)))?;
+                    let gradients = crate::vit::vit_backward(&grad.data, weights, cache)
+                        .map_err(Error::InvalidConfig)?;
+                    let Some(LayerParams::Vit(slot)) = param_gradients.get_mut(layer.index) else {
+                        return Err(Error::InvalidConfig(format!("missing [vit] gradient slot for layer #{}", layer.index)));
+                    };
+                    *slot = crate::vit::VitWeights {
+                        patch_embed: gradients.patch_embed,
+                        patch_bias: gradients.patch_bias,
+                        qkv_weight: gradients.qkv_weight,
+                        qkv_bias: gradients.qkv_bias,
+                        ln1_gamma: gradients.ln1_gamma,
+                        ln1_beta: gradients.ln1_beta,
+                        wo: gradients.wo,
+                        wo_bias: gradients.wo_bias,
+                        ln2_gamma: gradients.ln2_gamma,
+                        ln2_beta: gradients.ln2_beta,
+                        ffn_w1: gradients.ffn_w1,
+                        ffn_b1: gradients.ffn_b1,
+                        ffn_w2: gradients.ffn_w2,
+                        ffn_b2: gradients.ffn_b2,
+                        pos_embed: gradients.pos_embed,
+                        mhc: gradients.mhc,
+                    };
+                    let input_grad = Tensor::from_data(current_input.shape, gradients.input)?;
+                    accumulate_previous_gradient(
+                        layer.index, &input_grad, &mut input_gradient, &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::LayaEncoder(_), LayerParams::LayaEncoder(_))
+                | (LayerKind::LayaHead(_), LayerParams::LayaHead(_)) => {
+                    // Frozen (`freeze=1`): no gradient flows to the input.
                 }
                 (LayerKind::LayaScorer(spec), LayerParams::LayaScorer(weights)) => {
                     let current = forward
@@ -2717,10 +2899,41 @@ impl ExecutableNetwork {
                     )?;
                     accumulate_convolutional_train_buffer(&mut train.output, &gradient.output)?;
                 }
+                (LayerKind::Moe(_), LayerParams::Moe(gradient)) => {
+                    let Some(LayerTrainBuffers::Moe(train)) =
+                        self.train_buffers.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing MoE train buffers for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    accumulate_vec(&mut train.router_weight_updates, &gradient.router_weights)?;
+                    accumulate_vec(&mut train.router_bias_updates, &gradient.router_biases)?;
+                    if train.experts.len() != gradient.experts.len() {
+                        return Err(Error::InvalidConfig(format!(
+                            "MoE expert train-buffer count mismatch at layer #{}",
+                            layer.index
+                        )));
+                    }
+                    for (train_expert, grad_expert) in
+                        train.experts.iter_mut().zip(&gradient.experts)
+                    {
+                        accumulate_convolutional_train_buffer(train_expert, grad_expert)?;
+                    }
+                }
+                (LayerKind::Vit(_), LayerParams::Vit(gradient)) => {
+                    let Some(LayerTrainBuffers::Vit(train)) = self.train_buffers.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!("missing ViT train buffers for layer #{}", layer.index)));
+                    };
+                    accumulate_vit_updates(&mut train.updates, gradient)?;
+                }
                 (_, LayerParams::None) => {}
                 // `[laya_scorer]` is frozen by default, so it has no train
                 // buffers and contributes no parameter gradient.
                 (_, LayerParams::LayaScorer(_)) => {}
+                (_, LayerParams::LayaActHead(_)) => {}
                 _ => {
                     return Err(Error::InvalidConfig(format!(
                         "layer #{} produced gradients incompatible with train buffers",
@@ -2794,7 +3007,7 @@ where
     pub backend: B,
     pub network: Network,
     pub params: Vec<LayerParams>,
-    device_conv_params: RefCell<Vec<Option<GpuConvolutionLayerParams<B::Tensor>>>>,
+    device_conv_params: RefCell<Vec<Vec<Option<GpuConvolutionLayerParams<B::Tensor>>>>>,
     /// Per-owner-layer f16 conv weights of `forward_compact_f16`, type-erased
     /// because `B::TensorF16` only exists for `B: F16TensorOpsBackend`.
     f16_conv_weights: RefCell<Vec<Option<std::rc::Rc<dyn std::any::Any>>>>,
@@ -3325,6 +3538,18 @@ where
                         )
                         .map_err(|err| backend_error("f16 route concat", err))?
                 }
+                (LayerKind::LayaMarkerGather(spec), LayerParams::None) => {
+                    return Err(Error::UnsupportedLayer {
+                        layer_index: layer.index,
+                        name: format!("laya_marker_gather f16 (hidden={}, max_options={})", spec.hidden, spec.max_options),
+                    });
+                }
+                (LayerKind::LayaActHead(spec), LayerParams::LayaActHead(_)) => {
+                    return Err(Error::UnsupportedLayer {
+                        layer_index: layer.index,
+                        name: format!("laya_act_head f16 (hidden={}, fc_dim={})", spec.hidden, spec.fc_dim),
+                    });
+                }
                 (LayerKind::Upsample(spec), LayerParams::None) => self
                     .backend
                     .upsample_f16(
@@ -3424,7 +3649,8 @@ where
             .iter()
             .map(default_layer_params)
             .collect::<Vec<_>>();
-        let device_conv_params = RefCell::new(vec![None; network.layers.len()]);
+        let device_conv_params =
+            RefCell::new((0..network.layers.len()).map(|_| Vec::new()).collect());
         let f16_conv_weights = RefCell::new((0..network.layers.len()).map(|_| None).collect());
         let device_train_buffers = RefCell::new(vec![None; network.layers.len()]);
         let cpu_fallback_train_buffers = RefCell::new(
@@ -3790,7 +4016,7 @@ where
             if spec.share_index.is_some() {
                 continue;
             }
-            let cached = self.device_conv_params.borrow()[layer_index].clone();
+            let cached = self.device_conv_params_at(layer_index, 0);
             if let Some(cached) = cached {
                 self.sync_convolution_params_from_device(layer_index, &cached)?;
             }
@@ -3887,12 +4113,7 @@ where
                 _ => continue,
             };
 
-            let cached = self
-                .device_conv_params
-                .borrow()
-                .get(owner)
-                .and_then(Clone::clone)
-                .ok_or_else(|| {
+            let cached = self.device_conv_params_at(owner, 0).ok_or_else(|| {
                     Error::InvalidConfig(format!(
                         "missing cached GPU convolution params for layer #{owner}"
                     ))
@@ -4091,6 +4312,34 @@ where
                 (LayerParams::Connected(params), LayerTrainBuffers::Connected(train)) => {
                     update_connected_params(params, train, lr, momentum, decay, batch);
                 }
+                (LayerParams::Shortcut(params), LayerTrainBuffers::Shortcut(train)) => {
+                    sgd_update(&mut params.weights, &mut train.weight_updates, lr, momentum, decay, batch);
+                }
+                (LayerParams::Moe(params), LayerTrainBuffers::Moe(train)) => {
+                    sgd_update(
+                        &mut params.router_biases,
+                        &mut train.router_bias_updates,
+                        lr,
+                        momentum,
+                        0.0,
+                        batch,
+                    );
+                    sgd_update(
+                        &mut params.router_weights,
+                        &mut train.router_weight_updates,
+                        lr,
+                        momentum,
+                        0.0,
+                        batch,
+                    );
+                    for (expert, updates) in params.experts.iter_mut().zip(&mut train.experts) {
+                        update_convolutional_params(expert, updates, lr, momentum, decay, batch);
+                    }
+                }
+                (LayerParams::Vit(params), LayerTrainBuffers::Vit(train)) => {
+                    let learned_pos = matches!(layer.kind, LayerKind::Vit(ref spec) if spec.learned_pos_embed);
+                    update_vit_params(params, train, lr * layer.train.learning_rate_scale, momentum, decay, batch, learned_pos);
+                }
                 (LayerParams::Rnn(params), LayerTrainBuffers::Rnn(train)) => {
                     update_connected_params(
                         &mut params.input,
@@ -4219,6 +4468,17 @@ where
                 | (LayerParams::Convolutional(_), LayerTrainBuffers::Convolutional(_)) => {}
                 _ => {
                     let _ = layer_index;
+                }
+            }
+        }
+        // Container experts are host-updated while backward uses the CPU
+        // fallback. Invalidate their device copies so the next forward reuploads
+        // the just-updated parameters.
+        let mut cache = self.device_conv_params.borrow_mut();
+        for (index, layer) in self.network.layers.iter().enumerate() {
+            if matches!(layer.kind, LayerKind::Moe(_)) {
+                if let Some(slots) = cache.get_mut(index) {
+                    slots.clear();
                 }
             }
         }
@@ -4368,6 +4628,7 @@ where
         let mut dropout_masks = Vec::with_capacity(self.network.layers.len());
         let mut crop_caches = Vec::with_capacity(self.network.layers.len());
         let mut moe_caches: Vec<Option<MoeForwardCache>> = Vec::new();
+        let mut vit_caches: Vec<Option<crate::vit::VitForwardCache>> = Vec::with_capacity(self.network.layers.len());
         let mut gpu_batch_norm_caches = Vec::with_capacity(self.network.layers.len());
         let mut yolo_heads = Vec::new();
         let mut modern_heads = Vec::new();
@@ -4389,6 +4650,8 @@ where
             let mut dropout_mask = None;
             let mut crop_cache = None;
             let mut batch_norm_cache = None;
+            let mut vit_cache = None;
+            let mut moe_cache = None;
             let output_gpu = match (&layer.kind, params) {
                 (
                     LayerKind::Convolutional(spec),
@@ -4626,11 +4889,164 @@ where
                         )
                         .map_err(|err| backend_error("route concat", err))?
                 }
-                (LayerKind::Shortcut(spec), LayerParams::Shortcut(_)) => {
-                    return Err(Error::UnsupportedLayer {
+                (LayerKind::LayaMarkerGather(spec), LayerParams::None) => {
+                    let a_index = resolve_relative_layer(layer.index, spec.layers[0])?;
+                    let b_index = resolve_relative_layer(layer.index, spec.layers[1])?;
+                    let a_layer = self.network.layers.get(a_index).ok_or_else(|| {
+                        Error::InvalidConfig(format!(
+                            "missing source layer #{a_index} for [laya_marker_gather] layer #{}",
+                            layer.index
+                        ))
+                    })?;
+                    let b_layer = self.network.layers.get(b_index).ok_or_else(|| {
+                        Error::InvalidConfig(format!(
+                            "missing source layer #{b_index} for [laya_marker_gather] layer #{}",
+                            layer.index
+                        ))
+                    })?;
+                    let a_source = gpu_layer_outputs.get(a_index).ok_or(Error::InvalidRoute {
                         layer_index: layer.index,
-                        name: format!("shortcut weights (GPU, from={:?})", spec.from),
-                    });
+                        reference: spec.layers[0],
+                    })?;
+                    let b_source = gpu_layer_outputs.get(b_index).ok_or(Error::InvalidRoute {
+                        layer_index: layer.index,
+                        reference: spec.layers[1],
+                    })?;
+                    let host_a = self
+                        .download_tensor(a_source, a_layer.output_shape)
+                        .map_err(|err| backend_error("download laya_marker_gather input A", err))?;
+                    let host_b = self
+                        .download_tensor(b_source, b_layer.output_shape)
+                        .map_err(|err| backend_error("download laya_marker_gather input B", err))?;
+                    let data = crate::laya_marker_gather::forward(
+                        &host_a.data,
+                        &host_b.data,
+                        a_layer.output_shape.batch,
+                        spec.hidden,
+                        spec.max_options,
+                        a_layer.output_shape.width,
+                        b_layer.output_shape.channels,
+                    )
+                    .map_err(Error::InvalidConfig)?;
+                    self.backend
+                        .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
+                        .map_err(|err| backend_error("upload laya_marker_gather output", err))?
+                }
+                (LayerKind::LayaActHead(spec), LayerParams::LayaActHead(weights)) => {
+                    let head_index = resolve_relative_layer(layer.index, spec.layers[0])?;
+                    let scorer_index = resolve_relative_layer(layer.index, spec.layers[1])?;
+                    let marker_index = resolve_relative_layer(layer.index, spec.layers[2])?;
+                    let head_layer = self.network.layers.get(head_index).ok_or_else(|| {
+                        Error::InvalidConfig(format!(
+                            "missing source layer #{head_index} for [laya_act_head] layer #{}",
+                            layer.index
+                        ))
+                    })?;
+                    let scorer_layer = self.network.layers.get(scorer_index).ok_or_else(|| {
+                        Error::InvalidConfig(format!(
+                            "missing source layer #{scorer_index} for [laya_act_head] layer #{}",
+                            layer.index
+                        ))
+                    })?;
+                    let marker_layer = self.network.layers.get(marker_index).ok_or_else(|| {
+                        Error::InvalidConfig(format!(
+                            "missing source layer #{marker_index} for [laya_act_head] layer #{}",
+                            layer.index
+                        ))
+                    })?;
+                    let head_source = gpu_layer_outputs.get(head_index).ok_or(Error::InvalidRoute {
+                        layer_index: layer.index,
+                        reference: spec.layers[0],
+                    })?;
+                    let scorer_source = gpu_layer_outputs.get(scorer_index).ok_or(Error::InvalidRoute {
+                        layer_index: layer.index,
+                        reference: spec.layers[1],
+                    })?;
+                    let marker_source = gpu_layer_outputs.get(marker_index).ok_or(Error::InvalidRoute {
+                        layer_index: layer.index,
+                        reference: spec.layers[2],
+                    })?;
+                    let host_head = self
+                        .download_tensor(head_source, head_layer.output_shape)
+                        .map_err(|err| backend_error("download laya_act_head head input", err))?;
+                    let host_scorer = self
+                        .download_tensor(scorer_source, scorer_layer.output_shape)
+                        .map_err(|err| backend_error("download laya_act_head scorer input", err))?;
+                    let host_marker = self
+                        .download_tensor(marker_source, marker_layer.output_shape)
+                        .map_err(|err| backend_error("download laya_act_head marker input", err))?;
+                    let data = crate::laya_act_head::act_head_forward(
+                        &host_head.data,
+                        &host_scorer.data,
+                        &host_marker.data,
+                        weights,
+                        head_layer.output_shape.batch,
+                        spec.hidden,
+                        spec.max_options,
+                        marker_layer.output_shape.channels,
+                        head_layer.output_shape.width,
+                        marker_layer.output_shape.width,
+                        spec.fc_dim,
+                        spec.n_act,
+                    )
+                    .map_err(Error::InvalidConfig)?;
+                    self.backend
+                        .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
+                        .map_err(|err| backend_error("upload laya_act_head output", err))?
+                }
+                (LayerKind::Shortcut(spec), LayerParams::Shortcut(params)) => {
+                    let mut inputs = Vec::with_capacity(spec.from.len() + 1);
+                    inputs.push(current_input.clone());
+                    for raw_index in &spec.from {
+                        let source_index = resolve_relative_layer(layer.index, *raw_index)?;
+                        let source = gpu_layer_outputs.get(source_index).ok_or(Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: *raw_index,
+                        })?;
+                        let source_layer = self.network.layers.get(source_index).ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing source layer #{source_index} for shortcut layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                        if source_layer.output_shape.batch != layer.output_shape.batch {
+                            return Err(Error::InvalidConfig(format!(
+                                "shortcut layer #{} mixes incompatible batch shapes {} and {}",
+                                layer.index, layer.output_shape, source_layer.output_shape
+                            )));
+                        }
+                        if source_layer.output_shape == layer.output_shape {
+                            inputs.push(source.clone());
+                        } else {
+                            let fitted = self.backend.shortcut_fit_f32(
+                                source,
+                                layer.output_shape.batch,
+                                &tensor_backend_shape(layer.output_shape),
+                                launch_config,
+                            ).map_err(|err| backend_error("weighted shortcut resize source", err))?;
+                            inputs.push(fitted);
+                        }
+                    }
+                    let layer_step = spec.weight_slots(layer.output_shape.channels);
+                    let per_sample = layer.output_shape.element_count();
+                    let effective = crate::shortcut_weights::effective_weights(
+                        &params.weights,
+                        spec.weights_normalization,
+                        layer_step,
+                    );
+                    let refs: Vec<&B::Tensor> = inputs.iter().collect();
+                    let accumulated = self.backend.shortcut_weighted_sum_f32(
+                        &refs,
+                        &effective,
+                        layer_step,
+                        per_sample / layer_step,
+                        launch_config,
+                    ).map_err(|err| backend_error("weighted shortcut sum", err))?;
+                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+                    activation_input_gpu = Some(accumulated.clone());
+                    self.backend
+                        .activation_f32(&accumulated, activation, launch_config)
+                        .map_err(|err| backend_error("weighted shortcut activation", err))?
                 }
                 (LayerKind::Shortcut(spec), LayerParams::None) => {
                     let mut accumulated = current_input.clone();
@@ -4708,6 +5124,48 @@ where
                     self.backend
                         .upload_f32(&tensor_backend_shape(layer.output_shape), &probs)
                         .map_err(|err| backend_error("upload jev_ce output", err))?
+                }
+                (LayerKind::LayaLoss(spec), LayerParams::None) => {
+                    let host_input = self
+                        .download_tensor(current_input, layer.input_shape)
+                        .map_err(|err| backend_error("download laya_loss input", err))?;
+                    let probs = crate::laya_loss::laya_probs(
+                        &host_input.data,
+                        layer.input_shape.batch,
+                        spec.max_options,
+                    );
+                    self.backend
+                        .upload_f32(&tensor_backend_shape(layer.output_shape), &probs)
+                        .map_err(|err| backend_error("upload laya_loss output", err))?
+                }
+                (LayerKind::Vit(spec), LayerParams::Vit(weights)) => {
+                    let host_input = self.download_tensor(current_input, layer.input_shape)
+                        .map_err(|err| backend_error("download vit input", err))?;
+                    let geometry = vit_geometry(layer, spec);
+                    let (data, cache) = crate::vit::vit_forward(&host_input.data, weights, &geometry)
+                        .map_err(Error::InvalidConfig)?;
+                    vit_cache = Some(cache);
+                    self.backend.upload_f32(&tensor_backend_shape(layer.output_shape), &data)
+                        .map_err(|err| backend_error("upload vit output", err))?
+                }
+                (LayerKind::LayaEncoder(spec), LayerParams::LayaEncoder(weights)) => {
+                    let host_input = self
+                        .download_tensor(current_input, layer.input_shape)
+                        .map_err(|err| backend_error("download laya_encoder input", err))?;
+                    let encoded =
+                        laya_encoder_forward(spec, weights, &host_input, layer.output_shape)?;
+                    self.backend
+                        .upload_f32(&tensor_backend_shape(layer.output_shape), &encoded.data)
+                        .map_err(|err| backend_error("upload laya_encoder output", err))?
+                }
+                (LayerKind::LayaHead(spec), LayerParams::LayaHead(weights)) => {
+                    let host_input = self
+                        .download_tensor(current_input, layer.input_shape)
+                        .map_err(|err| backend_error("download laya_head input", err))?;
+                    let decoded = laya_head_forward(spec, weights, &host_input, layer.output_shape)?;
+                    self.backend
+                        .upload_f32(&tensor_backend_shape(layer.output_shape), &decoded.data)
+                        .map_err(|err| backend_error("upload laya_head output", err))?
                 }
                 (LayerKind::Logistic, LayerParams::None) => self
                     .backend
@@ -5163,13 +5621,107 @@ where
                         .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
                         .map_err(|err| backend_error("upload CRNN output", err))?
                 }
-                // `[moe_convolutional]` blends `experts` convolutions by a
-                // per-image gate, which no backend primitive covers yet.  Say
-                // so plainly instead of falling into the catch-all below and
-                // reporting an inconsistent parameter set.
+                (LayerKind::Moe(spec), LayerParams::Moe(moe)) => {
+                    let host_input = self
+                        .download_tensor(current_input, layer.input_shape)
+                        .map_err(|err| backend_error("download MoE router input", err))?;
+                    let batch = layer.input_shape.batch;
+                    let experts = crate::moe_conv::compute_router(
+                        &host_input.data,
+                        batch,
+                        layer.input_shape.channels,
+                        layer.input_shape.width * layer.input_shape.height,
+                        &moe.router_weights,
+                        &moe.router_biases,
+                        spec,
+                    );
+                    let per_image = layer.output_shape.element_count();
+                    let mut blended = vec![0.0f32; batch * per_image];
+                    let mut cache = MoeForwardCache {
+                        gates: experts.clone(),
+                        expert_outputs: Vec::with_capacity(spec.experts),
+                        expert_activation_inputs: Vec::with_capacity(spec.experts),
+                        pooled: crate::moe_conv::pool_for_router(
+                            &host_input.data,
+                            batch,
+                            layer.input_shape.channels,
+                            layer.input_shape.width * layer.input_shape.height,
+                        ),
+                    };
+                    for (slot, expert) in moe.experts.iter().enumerate() {
+                        let cached = self.cached_convolution_params_at(
+                            layer.index,
+                            slot,
+                            layer.input_shape.channels,
+                            &spec.expert,
+                            expert,
+                        )?;
+                        let raw_output = self
+                            .backend
+                            .conv2d_f32(
+                                current_input,
+                                &cached.weights,
+                                &tensor_backend_shape(layer.output_shape),
+                                layer.input_shape.channels,
+                                layer.input_shape.height,
+                                layer.input_shape.width,
+                                spec.expert.filters,
+                                spec.expert.size,
+                                spec.expert.stride_x,
+                                spec.expert.stride_y,
+                                spec.expert.dilation,
+                                spec.expert.padding,
+                                spec.expert.groups.max(1),
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("MoE expert convolution", err))?;
+                        let biased = self
+                            .backend
+                            .bias_add_f32(
+                                &raw_output,
+                                &cached.biases,
+                                spec.expert.filters,
+                                layer.output_shape.width * layer.output_shape.height,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("MoE expert bias", err))?;
+                        let activation = gpu_activation_kind(layer.index, &spec.expert.activation)?;
+                        let output_gpu = self
+                            .backend
+                            .activation_f32(&biased, activation, launch_config)
+                            .map_err(|err| backend_error("MoE expert activation", err))?;
+                        let host_output = self
+                            .download_tensor(&output_gpu, layer.output_shape)
+                            .map_err(|err| backend_error("download MoE expert output", err))?;
+                        for b in 0..batch {
+                            let gate = experts[b * spec.experts + slot];
+                            let range = b * per_image..(b + 1) * per_image;
+                            for (dst, src) in blended[range.clone()]
+                                .iter_mut()
+                                .zip(&host_output.data[range.clone()])
+                            {
+                                *dst += gate * src;
+                            }
+                        }
+                        // The CPU fallback backward needs the exact expert
+                        // activation cache and host forward tensors.
+                        let (cpu_output, activation_input) = forward_convolutional_with_cache(
+                            &spec.expert,
+                            expert,
+                            &host_input,
+                            layer.output_shape,
+                        );
+                        cache.expert_outputs.push(cpu_output);
+                        cache.expert_activation_inputs.push(activation_input);
+                    }
+                    moe_cache = Some(cache);
+                    self.backend
+                        .upload_f32(&tensor_backend_shape(layer.output_shape), &blended)
+                        .map_err(|err| backend_error("upload MoE blended output", err))?
+                }
                 (LayerKind::Moe(_), _) => {
                     return Err(Error::InvalidConfig(format!(
-                        "layer #{} ([moe_convolutional]) is only implemented on the CPU backend",
+                        "layer #{} ([moe_convolutional]) and parameter set are inconsistent",
                         layer.index
                     )));
                 }
@@ -5249,9 +5801,8 @@ where
             if recurrent_caches.len() < layer_outputs.len() {
                 recurrent_caches.push(None);
             }
-            if moe_caches.len() < layer_outputs.len() {
-                moe_caches.push(None);
-            }
+            moe_caches.push(moe_cache);
+            vit_caches.push(vit_cache);
         }
 
         Ok(GpuForwardState {
@@ -5266,6 +5817,7 @@ where
                 crop_caches,
                 recurrent_caches,
                 moe_caches,
+                vit_caches,
                 yolo_heads,
                 modern_heads,
             },
@@ -5295,6 +5847,9 @@ where
                     | LayerKind::Contrastive(_)
                     | LayerKind::Regression(_)
                     | LayerKind::JevCe(_)
+                    | LayerKind::LayaLoss(_)
+                    | LayerKind::LayaEncoder(_)
+                    | LayerKind::LayaHead(_)
                     | LayerKind::ScaleChannels(_)
                     | LayerKind::Sam(_)
                     | LayerKind::Rnn(_)
@@ -5492,6 +6047,126 @@ where
                             launch_config,
                         )
                         .map_err(|err| backend_error("route concat", err))?
+                }
+                (LayerKind::LayaMarkerGather(spec), LayerParams::None) => {
+                    let a_index = resolve_relative_layer(layer.index, spec.layers[0])?;
+                    let b_index = resolve_relative_layer(layer.index, spec.layers[1])?;
+                    let a_layer = self.network.layers.get(a_index).ok_or_else(|| {
+                        Error::InvalidConfig(format!(
+                            "missing source layer #{a_index} for [laya_marker_gather] layer #{}",
+                            layer.index
+                        ))
+                    })?;
+                    let b_layer = self.network.layers.get(b_index).ok_or_else(|| {
+                        Error::InvalidConfig(format!(
+                            "missing source layer #{b_index} for [laya_marker_gather] layer #{}",
+                            layer.index
+                        ))
+                    })?;
+                    let a_source = gpu_layer_outputs
+                        .get(a_index)
+                        .and_then(Option::as_ref)
+                        .ok_or(Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.layers[0],
+                        })?;
+                    let b_source = gpu_layer_outputs
+                        .get(b_index)
+                        .and_then(Option::as_ref)
+                        .ok_or(Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.layers[1],
+                        })?;
+                    let host_a = self
+                        .download_tensor(a_source, a_layer.output_shape)
+                        .map_err(|err| backend_error("download laya_marker_gather input A", err))?;
+                    let host_b = self
+                        .download_tensor(b_source, b_layer.output_shape)
+                        .map_err(|err| backend_error("download laya_marker_gather input B", err))?;
+                    let data = crate::laya_marker_gather::forward(
+                        &host_a.data,
+                        &host_b.data,
+                        a_layer.output_shape.batch,
+                        spec.hidden,
+                        spec.max_options,
+                        a_layer.output_shape.width,
+                        b_layer.output_shape.channels,
+                    )
+                    .map_err(Error::InvalidConfig)?;
+                    self.backend
+                        .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
+                        .map_err(|err| backend_error("upload laya_marker_gather output", err))?
+                }
+                (LayerKind::LayaActHead(spec), LayerParams::LayaActHead(weights)) => {
+                    let head_index = resolve_relative_layer(layer.index, spec.layers[0])?;
+                    let scorer_index = resolve_relative_layer(layer.index, spec.layers[1])?;
+                    let marker_index = resolve_relative_layer(layer.index, spec.layers[2])?;
+                    let head_layer = self.network.layers.get(head_index).ok_or_else(|| {
+                        Error::InvalidConfig(format!(
+                            "missing source layer #{head_index} for [laya_act_head] layer #{}",
+                            layer.index
+                        ))
+                    })?;
+                    let scorer_layer = self.network.layers.get(scorer_index).ok_or_else(|| {
+                        Error::InvalidConfig(format!(
+                            "missing source layer #{scorer_index} for [laya_act_head] layer #{}",
+                            layer.index
+                        ))
+                    })?;
+                    let marker_layer = self.network.layers.get(marker_index).ok_or_else(|| {
+                        Error::InvalidConfig(format!(
+                            "missing source layer #{marker_index} for [laya_act_head] layer #{}",
+                            layer.index
+                        ))
+                    })?;
+                    let head_source = gpu_layer_outputs
+                        .get(head_index)
+                        .and_then(Option::as_ref)
+                        .ok_or(Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.layers[0],
+                        })?;
+                    let scorer_source = gpu_layer_outputs
+                        .get(scorer_index)
+                        .and_then(Option::as_ref)
+                        .ok_or(Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.layers[1],
+                        })?;
+                    let marker_source = gpu_layer_outputs
+                        .get(marker_index)
+                        .and_then(Option::as_ref)
+                        .ok_or(Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.layers[2],
+                        })?;
+                    let host_head = self
+                        .download_tensor(head_source, head_layer.output_shape)
+                        .map_err(|err| backend_error("download laya_act_head head input", err))?;
+                    let host_scorer = self
+                        .download_tensor(scorer_source, scorer_layer.output_shape)
+                        .map_err(|err| backend_error("download laya_act_head scorer input", err))?;
+                    let host_marker = self
+                        .download_tensor(marker_source, marker_layer.output_shape)
+                        .map_err(|err| backend_error("download laya_act_head marker input", err))?;
+                    let data = crate::laya_act_head::act_head_forward(
+                        &host_head.data,
+                        &host_scorer.data,
+                        &host_marker.data,
+                        weights,
+                        head_layer.output_shape.batch,
+                        spec.hidden,
+                        spec.max_options,
+                        marker_layer.output_shape.channels,
+                        head_layer.output_shape.width,
+                        marker_layer.output_shape.width,
+                        spec.fc_dim,
+                        spec.n_act,
+                    )
+                    .map_err(Error::InvalidConfig)?;
+                    self.backend
+                        .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
+                        .map_err(|err| backend_error("upload laya_act_head output", err))?
                 }
                 (LayerKind::Shortcut(spec), LayerParams::None) => {
                     let mut accumulated = current_input
@@ -6065,6 +6740,18 @@ where
                         )?;
                     }
                 }
+                (LayerKind::LayaMarkerGather(_), Some(LayerParams::None)) => {
+                    return Err(Error::UnsupportedLayer {
+                        layer_index: layer.index,
+                        name: "laya_marker_gather GPU backward".to_owned(),
+                    });
+                }
+                (LayerKind::LayaActHead(_), Some(LayerParams::LayaActHead(_))) => {
+                    return Err(Error::UnsupportedLayer {
+                        layer_index: layer.index,
+                        name: "laya_act_head GPU backward".to_owned(),
+                    });
+                }
                 (LayerKind::Shortcut(spec), Some(LayerParams::None)) => {
                     let activation = gpu_activation_kind(layer.index, &spec.activation)?;
                     let activation_input = forward.gpu_layer_activation_inputs[layer.index]
@@ -6414,6 +7101,9 @@ where
                 | (LayerKind::Contrastive(_), Some(LayerParams::None))
                 | (LayerKind::Regression(_), Some(LayerParams::None))
                 | (LayerKind::JevCe(_), Some(LayerParams::None))
+                | (LayerKind::LayaLoss(_), Some(LayerParams::None))
+                | (LayerKind::LayaEncoder(_), Some(LayerParams::LayaEncoder(_)))
+                | (LayerKind::LayaHead(_), Some(LayerParams::LayaHead(_)))
                 | (LayerKind::Sam(_), Some(LayerParams::None))
                 // `[yolox]` applies the C++ `activate_modern_output` (a sigmoid
                 // on the trailing `1 + classes` entries of every cell), which
@@ -6448,9 +7138,22 @@ where
                 // Recurrent layers need device sequence state; keep the whole
                 // net on the CPU backward for them.
                 LayerKind::Rnn(_) | LayerKind::Lstm(_) | LayerKind::Crnn(_) => return true,
+                // MoE expert convolutions run on-device, but router gradients,
+                // expert backward and SGD remain host-resident for now.
+                LayerKind::Moe(_) => return true,
                 // Deconvolution is host-resident (no device kernel); run the
                 // whole backward on the CPU.
                 LayerKind::Deconvolutional(_) => return true,
+                // `[laya_marker_gather]` has no device backward yet; keep the
+                // whole net on the CPU backward (forward uses a host round trip).
+                LayerKind::LayaMarkerGather(_) => return true,
+                // Weighted shortcut parameters remain host-resident; use the
+                // exact CPU derivative while the forward uses oxide primitives.
+                LayerKind::Shortcut(spec)
+                    if spec.weights_type != crate::model::ShortcutWeightsType::None => return true,
+                // Same for `[laya_act_head]` and the ViT transformer until
+                // device backward kernels are available.
+                LayerKind::LayaActHead(_) | LayerKind::Vit(_) => return true,
                 // Connected layers are handled on the GPU path with a host
                 // round trip unless their activation or batch norm
                 // (batch-statistics training) is unsupported.
@@ -6836,9 +7539,7 @@ where
         mean: B::Tensor,
         variance: B::Tensor,
     ) -> Result<()> {
-        let mut cached = self.device_conv_params.borrow()[owner]
-            .clone()
-            .ok_or_else(|| {
+        let mut cached = self.device_conv_params_at(owner, 0).ok_or_else(|| {
                 Error::InvalidConfig(format!(
                     "missing cached GPU convolution params for layer #{owner}"
                 ))
@@ -6851,7 +7552,7 @@ where
         bn.rolling_mean = mean;
         bn.rolling_variance = variance;
         cached.folded_stale = true;
-        self.device_conv_params.borrow_mut()[owner] = Some(cached.clone());
+        self.set_device_conv_params(owner, 0, cached.clone())?;
         if self.defer_host_sync {
             self.host_weights_stale = true;
         } else {
@@ -6863,12 +7564,7 @@ where
     /// Marks the folded device params stale after the host BN stats changed and
     /// re-uploads the host BN state to the device.
     fn refresh_gpu_batch_norm_cache(&mut self, owner: usize) -> Result<()> {
-        let cached = self
-            .device_conv_params
-            .borrow()
-            .get(owner)
-            .and_then(Clone::clone)
-            .ok_or_else(|| {
+        let cached = self.device_conv_params_at(owner, 0).ok_or_else(|| {
                 Error::InvalidConfig(format!(
                     "missing cached GPU convolution params for layer #{owner}"
                 ))
@@ -6882,7 +7578,7 @@ where
             cached.bn = Some(self.upload_batch_norm_state(batch_norm)?);
         }
         cached.folded_stale = true;
-        self.device_conv_params.borrow_mut()[owner] = Some(cached);
+        self.set_device_conv_params(owner, 0, cached)?;
         Ok(())
     }
 
@@ -6919,12 +7615,7 @@ where
                     ))
                 })?
                 };
-            let cached = self
-                .device_conv_params
-                .borrow()
-                .get(layer.index)
-                .and_then(Clone::clone)
-                .ok_or_else(|| {
+            let cached = self.device_conv_params_at(layer.index, 0).ok_or_else(|| {
                     Error::InvalidConfig(format!(
                         "missing cached GPU convolution params for layer #{}",
                         layer.index
@@ -6978,11 +7669,38 @@ where
         }))
     }
 
+    fn device_conv_params_at(
+        &self,
+        owner: usize,
+        slot: usize,
+    ) -> Option<GpuConvolutionLayerParams<B::Tensor>> {
+        self.device_conv_params
+            .borrow()
+            .get(owner)
+            .and_then(|slots| slots.get(slot))
+            .and_then(Clone::clone)
+    }
+
+    fn set_device_conv_params(
+        &self,
+        owner: usize,
+        slot: usize,
+        params: GpuConvolutionLayerParams<B::Tensor>,
+    ) -> Result<()> {
+        let mut cache = self.device_conv_params.borrow_mut();
+        let slots = cache.get_mut(owner).ok_or_else(|| {
+            Error::InvalidConfig(format!("missing device convolution cache owner #{owner}"))
+        })?;
+        slots.resize_with(slot + 1, || None);
+        slots[slot] = Some(params);
+        Ok(())
+    }
+
     fn clear_device_conv_params(&mut self) {
         // Callers replace the host params right before; nothing is stale then.
         self.host_weights_stale = false;
-        for entry in self.device_conv_params.get_mut().iter_mut() {
-            *entry = None;
+        for slots in self.device_conv_params.get_mut().iter_mut() {
+            slots.clear();
         }
         for entry in self.f16_conv_weights.get_mut().iter_mut() {
             *entry = None;
@@ -6997,15 +7715,32 @@ where
 
     fn warm_device_conv_params(&self) -> Result<()> {
         for (layer, params) in self.network.layers.iter().zip(&self.params) {
-            if let (
-                LayerKind::Convolutional(spec),
-                LayerParams::Convolutional(_) | LayerParams::None,
-            ) = (&layer.kind, params)
-            {
-                let conv = resolve_convolutional_params(&self.network, &self.params, layer.index)?;
-                let owner = resolve_convolutional_owner(&self.network, layer.index)?;
-                let _ =
-                    self.cached_convolution_params(owner, layer.input_shape.channels, spec, conv)?;
+            match (&layer.kind, params) {
+                (
+                    LayerKind::Convolutional(spec),
+                    LayerParams::Convolutional(_) | LayerParams::None,
+                ) => {
+                    let conv = resolve_convolutional_params(&self.network, &self.params, layer.index)?;
+                    let owner = resolve_convolutional_owner(&self.network, layer.index)?;
+                    let _ = self.cached_convolution_params(
+                        owner,
+                        layer.input_shape.channels,
+                        spec,
+                        conv,
+                    )?;
+                }
+                (LayerKind::Moe(spec), LayerParams::Moe(moe)) => {
+                    for (slot, expert) in moe.experts.iter().enumerate() {
+                        let _ = self.cached_convolution_params_at(
+                            layer.index,
+                            slot,
+                            layer.input_shape.channels,
+                            &spec.expert,
+                            expert,
+                        )?;
+                    }
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -7019,8 +7754,24 @@ where
         spec: &ConvolutionalSpec,
         params: &ConvolutionalParams,
     ) -> Result<GpuConvolutionLayerParams<B::Tensor>> {
-        let cached =
-            self.cached_convolution_params_raw(layer_index, input_channels, spec, params)?;
+        self.cached_convolution_params_at(layer_index, 0, input_channels, spec, params)
+    }
+
+    fn cached_convolution_params_at(
+        &self,
+        layer_index: usize,
+        slot: usize,
+        input_channels: usize,
+        spec: &ConvolutionalSpec,
+        params: &ConvolutionalParams,
+    ) -> Result<GpuConvolutionLayerParams<B::Tensor>> {
+        let cached = self.cached_convolution_params_raw_at(
+            layer_index,
+            slot,
+            input_channels,
+            spec,
+            params,
+        )?;
         if !cached.folded_stale {
             return Ok(cached);
         }
@@ -7030,7 +7781,7 @@ where
             params,
             Some((cached.raw_weights, cached.raw_biases, cached.bn)),
         )?;
-        self.device_conv_params.borrow_mut()[layer_index] = Some(refolded.clone());
+        self.set_device_conv_params(layer_index, slot, refolded.clone())?;
         Ok(refolded)
     }
 
@@ -7043,7 +7794,18 @@ where
         spec: &ConvolutionalSpec,
         params: &ConvolutionalParams,
     ) -> Result<GpuConvolutionLayerParams<B::Tensor>> {
-        if let Some(cached) = self.device_conv_params.borrow()[layer_index].clone() {
+        self.cached_convolution_params_raw_at(layer_index, 0, input_channels, spec, params)
+    }
+
+    fn cached_convolution_params_raw_at(
+        &self,
+        layer_index: usize,
+        slot: usize,
+        input_channels: usize,
+        spec: &ConvolutionalSpec,
+        params: &ConvolutionalParams,
+    ) -> Result<GpuConvolutionLayerParams<B::Tensor>> {
+        if let Some(cached) = self.device_conv_params_at(layer_index, slot) {
             return Ok(cached);
         }
 
@@ -7113,16 +7875,10 @@ where
                 .transpose()?,
         };
 
-        let mut cached = self.device_conv_params.borrow_mut();
-        let entry = cached.get_mut(layer_index).ok_or_else(|| {
-            Error::InvalidConfig(format!(
-                "missing cached device params for layer #{layer_index}"
-            ))
-        })?;
-        if entry.is_none() {
-            *entry = Some(uploaded.clone());
-        }
-        Ok(entry.clone().expect("device params were just initialized"))
+        self.set_device_conv_params(layer_index, slot, uploaded.clone())?;
+        Ok(self
+            .device_conv_params_at(layer_index, slot)
+            .expect("device params were just initialized"))
     }
 
     /// Stores the updated raw tensors; the BN-folded copies are re-folded lazily.
@@ -7148,11 +7904,9 @@ where
         };
         let params = resolve_convolutional_params(&self.network, &self.params, owner)?;
         let folds = spec.batch_normalize && params.batch_norm.is_some();
-        let mut refreshed = self.device_conv_params.borrow()[owner]
-            .clone()
-            .ok_or_else(|| {
-                Error::InvalidConfig(format!("missing cached device params for layer #{owner}"))
-            })?;
+        let mut refreshed = self.device_conv_params_at(owner, 0).ok_or_else(|| {
+            Error::InvalidConfig(format!("missing cached device params for layer #{owner}"))
+        })?;
         refreshed.raw_weights = raw_weights.clone();
         refreshed.raw_biases = raw_biases.clone();
         if let (Some(scales), Some(bn)) = (scales, refreshed.bn.as_mut()) {
@@ -7164,7 +7918,7 @@ where
             refreshed.weights = raw_weights;
             refreshed.biases = raw_biases;
         }
-        self.device_conv_params.borrow_mut()[owner] = Some(refreshed.clone());
+        self.set_device_conv_params(owner, 0, refreshed.clone())?;
         self.device_train_buffers.borrow_mut()[owner] = Some(GpuConvolutionTrainBuffers {
             weight_updates,
             bias_updates,
@@ -7352,6 +8106,39 @@ fn conv_weight_shape(layer: &crate::model::Layer) -> Vec<usize> {
     }
 }
 
+fn vit_geometry(layer: &crate::model::Layer, spec: &crate::model::VitSpec) -> crate::vit::VitGeometry {
+    crate::vit::VitGeometry {
+        batch: layer.input_shape.batch,
+        channels: layer.input_shape.channels,
+        height: layer.input_shape.height,
+        width: layer.input_shape.width,
+        patch_size: spec.patch_size,
+        patch_stride: spec.patch_stride,
+        patch_pad: spec.patch_pad,
+        hidden: spec.dim,
+        heads: spec.heads,
+        mlp_dim: spec.mlp_dim,
+        ln_eps: 1.0e-5,
+        activation: spec.activation.clone(),
+        learned_pos_embed: spec.learned_pos_embed,
+        pos_init_zero: spec.pos_init_zero,
+        msa: spec.msa_enabled.then_some((spec.msa_block_size, spec.msa_topk)),
+    }
+}
+
+fn zero_vit_weights(weights: &mut crate::vit::VitWeights) {
+    for values in [
+        &mut weights.patch_embed, &mut weights.patch_bias, &mut weights.qkv_weight,
+        &mut weights.qkv_bias, &mut weights.ln1_gamma, &mut weights.ln1_beta,
+        &mut weights.wo, &mut weights.wo_bias, &mut weights.ln2_gamma,
+        &mut weights.ln2_beta, &mut weights.ffn_w1, &mut weights.ffn_b1,
+        &mut weights.ffn_w2, &mut weights.ffn_b2, &mut weights.pos_embed,
+        &mut weights.mhc,
+    ] {
+        values.fill(0.0);
+    }
+}
+
 fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
     match &layer.kind {
         LayerKind::BatchNorm(_) => {
@@ -7390,6 +8177,24 @@ fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
         LayerKind::LayaScorer(spec) => {
             LayerParams::LayaScorer(crate::laya_scorer::LayaScorerWeights::zeroed(spec.hidden))
         }
+        LayerKind::LayaActHead(spec) => LayerParams::LayaActHead(
+            crate::laya_act_head::LayaActHeadWeights::zeroed(spec.hidden, spec.fc_dim, spec.n_act),
+        ),
+        LayerKind::LayaEncoder(spec) => LayerParams::LayaEncoder(
+            crate::laya_encoder::LayaEncoderWeights::zeroed(
+                spec.hidden,
+                spec.n_layers,
+                spec.intermediate,
+                spec.vocab,
+            ),
+        ),
+        LayerKind::LayaHead(spec) => LayerParams::LayaHead(
+            crate::laya_head::LayaHeadWeights::zeroed(spec.hidden, spec.n_layers, spec.ffn_dim),
+        ),
+        LayerKind::Vit(spec) => LayerParams::Vit(
+            crate::vit::VitWeights::zeroed(&vit_geometry(layer, spec), layer.output_shape.height, layer.output_shape.width)
+                .expect("validated ViT layer geometry"),
+        ),
         LayerKind::Moe(spec) => LayerParams::Moe(default_moe_params(
             layer.input_shape.channels,
             spec,
@@ -7582,6 +8387,13 @@ fn default_layer_train_buffers(layer: &crate::model::Layer) -> LayerTrainBuffers
         LayerKind::Moe(spec) => {
             LayerTrainBuffers::Moe(default_moe_train_buffers(layer.input_shape.channels, spec))
         }
+        LayerKind::Vit(spec) => {
+            let mut updates = crate::vit::VitWeights::zeroed(
+                &vit_geometry(layer, spec), layer.output_shape.height, layer.output_shape.width,
+            ).expect("validated ViT layer geometry");
+            zero_vit_weights(&mut updates);
+            LayerTrainBuffers::Vit(VitTrainBuffers { updates })
+        }
         _ => LayerTrainBuffers::None,
     }
 }
@@ -7764,6 +8576,85 @@ fn default_local_train_buffers(
     }
 }
 
+fn accumulate_negative_vec(dst: &mut [f32], src: &[f32]) -> Result<()> {
+    if dst.len() != src.len() {
+        return Err(Error::InvalidConfig(format!(
+            "gradient accumulation length mismatch: expected {}, got {}",
+            dst.len(), src.len()
+        )));
+    }
+    for (dst, src) in dst.iter_mut().zip(src) {
+        *dst -= *src;
+    }
+    Ok(())
+}
+
+fn accumulate_vit_updates(dst: &mut crate::vit::VitWeights, src: &crate::vit::VitWeights) -> Result<()> {
+    accumulate_negative_vec(&mut dst.patch_embed, &src.patch_embed)?;
+    accumulate_negative_vec(&mut dst.patch_bias, &src.patch_bias)?;
+    accumulate_negative_vec(&mut dst.qkv_weight, &src.qkv_weight)?;
+    accumulate_negative_vec(&mut dst.qkv_bias, &src.qkv_bias)?;
+    accumulate_negative_vec(&mut dst.ln1_gamma, &src.ln1_gamma)?;
+    accumulate_negative_vec(&mut dst.ln1_beta, &src.ln1_beta)?;
+    accumulate_negative_vec(&mut dst.wo, &src.wo)?;
+    accumulate_negative_vec(&mut dst.wo_bias, &src.wo_bias)?;
+    accumulate_negative_vec(&mut dst.ln2_gamma, &src.ln2_gamma)?;
+    accumulate_negative_vec(&mut dst.ln2_beta, &src.ln2_beta)?;
+    accumulate_negative_vec(&mut dst.ffn_w1, &src.ffn_w1)?;
+    accumulate_negative_vec(&mut dst.ffn_b1, &src.ffn_b1)?;
+    accumulate_negative_vec(&mut dst.ffn_w2, &src.ffn_w2)?;
+    accumulate_negative_vec(&mut dst.ffn_b2, &src.ffn_b2)?;
+    accumulate_negative_vec(&mut dst.pos_embed, &src.pos_embed)?;
+    accumulate_negative_vec(&mut dst.mhc, &src.mhc)
+}
+
+fn scale_vit_updates(updates: &mut crate::vit::VitWeights, scale: f32) {
+    for values in [
+        &mut updates.patch_embed, &mut updates.patch_bias, &mut updates.qkv_weight,
+        &mut updates.qkv_bias, &mut updates.ln1_gamma, &mut updates.ln1_beta,
+        &mut updates.wo, &mut updates.wo_bias, &mut updates.ln2_gamma,
+        &mut updates.ln2_beta, &mut updates.ffn_w1, &mut updates.ffn_b1,
+        &mut updates.ffn_w2, &mut updates.ffn_b2, &mut updates.pos_embed,
+        &mut updates.mhc,
+    ] {
+        for value in values.iter_mut() { *value *= scale; }
+    }
+}
+
+fn sanitize_vit_updates(updates: &mut crate::vit::VitWeights, learned_pos_embed: bool) {
+    let mut arrays = vec![
+        &mut updates.patch_embed, &mut updates.patch_bias, &mut updates.qkv_weight,
+        &mut updates.qkv_bias, &mut updates.ln1_gamma, &mut updates.ln1_beta,
+        &mut updates.wo, &mut updates.wo_bias, &mut updates.ln2_gamma,
+        &mut updates.ln2_beta, &mut updates.ffn_w1, &mut updates.ffn_b1,
+        &mut updates.ffn_w2, &mut updates.ffn_b2, &mut updates.mhc,
+    ];
+    if learned_pos_embed { arrays.push(&mut updates.pos_embed); }
+    for values in arrays {
+        for value in values.iter_mut() {
+            if !value.is_finite() { *value = 0.0; }
+        }
+    }
+}
+
+fn vit_update_clip_scale(
+    updates: &crate::vit::VitWeights,
+    limit: f32,
+    learned_pos_embed: bool,
+) -> f32 {
+    let mut arrays: Vec<&[f32]> = vec![
+        &updates.patch_embed, &updates.patch_bias, &updates.qkv_weight, &updates.qkv_bias,
+        &updates.ln1_gamma, &updates.ln1_beta, &updates.wo, &updates.wo_bias,
+        &updates.ln2_gamma, &updates.ln2_beta, &updates.ffn_w1, &updates.ffn_b1,
+        &updates.ffn_w2, &updates.ffn_b2, &updates.mhc,
+    ];
+    if learned_pos_embed { arrays.push(&updates.pos_embed); }
+    let norm_sq = arrays.into_iter().flatten()
+        .map(|x| (*x as f64) * (*x as f64)).sum::<f64>();
+    let norm = norm_sq.sqrt() as f32;
+    if norm > limit && norm.is_finite() { limit / norm } else if !norm.is_finite() { 0.0 } else { 1.0 }
+}
+
 fn accumulate_vec(dst: &mut [f32], src: &[f32]) -> Result<()> {
     if dst.len() != src.len() {
         return Err(Error::InvalidConfig(format!(
@@ -7795,6 +8686,49 @@ fn sgd_update(
         *update += -decay * batch * *weight;
         *weight += step * *update;
         *update *= momentum;
+    }
+}
+
+fn update_vit_params(
+    params: &mut crate::vit::VitWeights,
+    train: &mut VitTrainBuffers,
+    lr: f32,
+    momentum: f32,
+    decay: f32,
+    batch: usize,
+    learned_pos_embed: bool,
+) {
+    sanitize_vit_updates(&mut train.updates, learned_pos_embed);
+    let scale = vit_update_clip_scale(&train.updates, 5.0, learned_pos_embed);
+    scale_vit_updates(&mut train.updates, scale);
+    for (weights, updates) in [
+        (&mut params.patch_embed, &mut train.updates.patch_embed),
+        (&mut params.qkv_weight, &mut train.updates.qkv_weight),
+        (&mut params.wo, &mut train.updates.wo),
+        (&mut params.ffn_w1, &mut train.updates.ffn_w1),
+        (&mut params.ffn_w2, &mut train.updates.ffn_w2),
+    ] {
+        sgd_update(weights, updates, lr, momentum, decay, batch);
+    }
+    for (weights, updates) in [
+        (&mut params.patch_bias, &mut train.updates.patch_bias),
+        (&mut params.qkv_bias, &mut train.updates.qkv_bias),
+        (&mut params.ln1_gamma, &mut train.updates.ln1_gamma),
+        (&mut params.ln1_beta, &mut train.updates.ln1_beta),
+        (&mut params.wo_bias, &mut train.updates.wo_bias),
+        (&mut params.ln2_gamma, &mut train.updates.ln2_gamma),
+        (&mut params.ln2_beta, &mut train.updates.ln2_beta),
+        (&mut params.ffn_b1, &mut train.updates.ffn_b1),
+        (&mut params.ffn_b2, &mut train.updates.ffn_b2),
+    ] {
+        sgd_update(weights, updates, lr, momentum, 0.0, batch);
+    }
+    if learned_pos_embed {
+        sgd_update(&mut params.pos_embed, &mut train.updates.pos_embed, lr, momentum, decay, batch);
+    }
+    sgd_update(&mut params.mhc, &mut train.updates.mhc, lr * 0.1, momentum, 0.0, batch);
+    for value in &mut params.mhc {
+        *value = if value.is_finite() { value.clamp(-8.0, 8.0) } else { 0.0 };
     }
 }
 
@@ -8193,6 +9127,27 @@ fn load_weights_into_params(
                     layer.index
                 )));
             }
+            LayerParams::LayaActHead(_) => {
+                return Err(Error::InvalidConfig(format!(
+                    "layer #{} ([laya_act_head]) must be loaded with `load_laya_act_head_blob`, \
+                     which seeks to its offset in the shared .weights file",
+                    layer.index
+                )));
+            }
+            LayerParams::LayaEncoder(_) => {
+                return Err(Error::InvalidConfig(format!(
+                    "layer #{} ([laya_encoder]) must be loaded with `load_laya_encoder_blob`, \
+                     which seeks to its offset in the shared .weights file",
+                    layer.index
+                )));
+            }
+            LayerParams::LayaHead(_) => {
+                return Err(Error::InvalidConfig(format!(
+                    "layer #{} ([laya_head]) must be loaded with `load_laya_head_blob`, \
+                     which seeks to its offset in the shared .weights file",
+                    layer.index
+                )));
+            }
             LayerParams::Convolutional(conv) => {
                 read_f32_into(&mut file, &mut conv.biases)?;
                 if let Some(batch_norm) = conv.batch_norm.as_mut() {
@@ -8339,6 +9294,22 @@ fn load_weights_into_params(
                     groups,
                 )?;
             }
+            LayerParams::Vit(weights) => {
+                let LayerKind::Vit(spec) = &layer.kind else {
+                    return Err(Error::InvalidConfig(format!("layer #{} ViT weights do not match layer kind", layer.index)));
+                };
+                let geometry = vit_geometry(layer, spec);
+                let has_mhc = (header.major, header.minor, header.revision)
+                    >= (crate::DARKNET_WEIGHTS_VERSION_MAJOR, crate::DARKNET_WEIGHTS_VERSION_MINOR, crate::DARKNET_WEIGHTS_VERSION_PATCH);
+                let count = crate::vit::vit_blob_float_count(
+                    &geometry, layer.output_shape.height, layer.output_shape.width, has_mhc,
+                ).map_err(Error::Weights)?;
+                let mut blob = vec![0.0; count];
+                read_f32_into(&mut file, &mut blob)?;
+                *weights = crate::vit::VitWeights::from_blob(
+                    &blob, &geometry, layer.output_shape.height, layer.output_shape.width, has_mhc,
+                ).map_err(Error::Weights)?;
+            }
         }
     }
 
@@ -8350,7 +9321,13 @@ fn tensor_backend_shape(shape: TensorShape) -> [usize; 4] {
 }
 
 fn layer_uses_previous_input(kind: &LayerKind) -> bool {
-    !matches!(kind, LayerKind::Route(_) | LayerKind::ChannelSlice(_))
+    !matches!(
+        kind,
+        LayerKind::Route(_)
+            | LayerKind::ChannelSlice(_)
+            | LayerKind::LayaMarkerGather(_)
+            | LayerKind::LayaActHead(_)
+    )
 }
 
 fn gpu_layer_output_use_counts(network: &Network) -> Result<Vec<usize>> {
@@ -8376,6 +9353,18 @@ fn gpu_layer_output_use_counts(network: &Network) -> Result<Vec<usize>> {
             LayerKind::ChannelSlice(spec) => {
                 let source_index = resolve_relative_layer(layer.index, spec.from)?;
                 use_counts[source_index] += 1;
+            }
+            LayerKind::LayaMarkerGather(spec) => {
+                for raw_index in &spec.layers {
+                    let source_index = resolve_relative_layer(layer.index, *raw_index)?;
+                    use_counts[source_index] += 1;
+                }
+            }
+            LayerKind::LayaActHead(spec) => {
+                for raw_index in &spec.layers {
+                    let source_index = resolve_relative_layer(layer.index, *raw_index)?;
+                    use_counts[source_index] += 1;
+                }
             }
             _ => {}
         }
@@ -8432,6 +9421,18 @@ fn release_gpu_sources_for_layer<T: Clone>(
         LayerKind::ChannelSlice(spec) => {
             let source_index = resolve_relative_layer(layer_index, spec.from)?;
             release_gpu_source(source_index, remaining_uses, gpu_layer_outputs)?;
+        }
+        LayerKind::LayaMarkerGather(spec) => {
+            for raw_index in &spec.layers {
+                let source_index = resolve_relative_layer(layer_index, *raw_index)?;
+                release_gpu_source(source_index, remaining_uses, gpu_layer_outputs)?;
+            }
+        }
+        LayerKind::LayaActHead(spec) => {
+            for raw_index in &spec.layers {
+                let source_index = resolve_relative_layer(layer_index, *raw_index)?;
+                release_gpu_source(source_index, remaining_uses, gpu_layer_outputs)?;
+            }
         }
         _ => {}
     }
@@ -11516,6 +12517,102 @@ fn backward_route(
     Ok(())
 }
 
+/// `[laya_marker_gather]` backward: scatter-add the output gradient into input
+/// A's per-position gradient (the exact adjoint of the forward gather).
+fn backward_laya_marker_gather(
+    spec: &crate::model::LayaMarkerGatherSpec,
+    layer_index: usize,
+    forward_outputs: &[Tensor],
+    output_gradient: &Tensor,
+    layer_output_gradients: &mut [Tensor],
+    layers: &[crate::model::Layer],
+) -> Result<()> {
+    let a_index = resolve_relative_layer(layer_index, spec.layers[0])?;
+    let b_index = resolve_relative_layer(layer_index, spec.layers[1])?;
+    let a_layer = layers.get(a_index).ok_or(Error::InvalidRoute {
+        layer_index,
+        reference: spec.layers[0],
+    })?;
+    let b = forward_outputs.get(b_index).ok_or(Error::InvalidRoute {
+        layer_index,
+        reference: spec.layers[1],
+    })?;
+    let delta_a = crate::laya_marker_gather::backward(
+        &b.data,
+        &output_gradient.data,
+        a_layer.output_shape.batch,
+        spec.hidden,
+        spec.max_options,
+        a_layer.output_shape.width,
+        b.shape.channels,
+    )
+    .map_err(Error::InvalidConfig)?;
+    let a_gradient = layer_output_gradients.get_mut(a_index).ok_or(Error::InvalidRoute {
+        layer_index,
+        reference: spec.layers[0],
+    })?;
+    for (dst, src) in a_gradient.data.iter_mut().zip(delta_a) {
+        *dst += src;
+    }
+    Ok(())
+}
+
+/// `[laya_act_head]` backward: the MLP gradient is computed for its own (frozen)
+/// weights and the pooled-CLS gradient is accumulated into the head source's
+/// output gradient at column 0.  Scorer and marker get no gradient.
+#[allow(clippy::too_many_arguments)]
+fn backward_laya_act_head(
+    spec: &crate::model::LayaActHeadSpec,
+    weights: &crate::laya_act_head::LayaActHeadWeights,
+    layer_index: usize,
+    forward_outputs: &[Tensor],
+    output_gradient: &Tensor,
+    layer_output_gradients: &mut [Tensor],
+) -> Result<()> {
+    let head_index = resolve_relative_layer(layer_index, spec.layers[0])?;
+    let scorer_index = resolve_relative_layer(layer_index, spec.layers[1])?;
+    let marker_index = resolve_relative_layer(layer_index, spec.layers[2])?;
+    let head = forward_outputs.get(head_index).ok_or(Error::InvalidRoute {
+        layer_index,
+        reference: spec.layers[0],
+    })?;
+    let scorer = forward_outputs.get(scorer_index).ok_or(Error::InvalidRoute {
+        layer_index,
+        reference: spec.layers[1],
+    })?;
+    let marker = forward_outputs.get(marker_index).ok_or(Error::InvalidRoute {
+        layer_index,
+        reference: spec.layers[2],
+    })?;
+    let grad = crate::laya_act_head::act_head_backward(
+        &head.data,
+        &scorer.data,
+        &marker.data,
+        weights,
+        &output_gradient.data,
+        head.shape.batch,
+        spec.hidden,
+        spec.max_options,
+        marker.shape.channels,
+        head.shape.width,
+        marker.shape.width,
+        spec.fc_dim,
+        spec.n_act,
+    )
+    .map_err(Error::InvalidConfig)?;
+    let head_grad = layer_output_gradients.get_mut(head_index).ok_or(Error::InvalidRoute {
+        layer_index,
+        reference: spec.layers[0],
+    })?;
+    for b in 0..head.shape.batch {
+        for e in 0..spec.hidden {
+            head_grad.data[(b * spec.hidden + e) * head.shape.width] +=
+                grad.dcls[b * spec.hidden + e];
+        }
+    }
+    Ok(())
+}
+
 fn backward_shortcut(
     spec: &crate::model::ShortcutSpec,
     layer_index: usize,
@@ -11999,6 +13096,119 @@ fn forward_route_compact(
     Ok(output)
 }
 
+/// `[laya_marker_gather]` forward over two already-resolved source tensors:
+/// input A is `[batch, hidden, 1, T]`, input B is `[batch, marker_channels, 1, T]`.
+fn laya_marker_gather_forward(
+    spec: &crate::model::LayaMarkerGatherSpec,
+    a: &Tensor,
+    b: &Tensor,
+    output_shape: TensorShape,
+) -> Result<Tensor> {
+    let data = crate::laya_marker_gather::forward(
+        &a.data,
+        &b.data,
+        a.shape.batch,
+        spec.hidden,
+        spec.max_options,
+        a.shape.width,
+        b.shape.channels,
+    )
+    .map_err(Error::InvalidConfig)?;
+    Tensor::from_data(output_shape, data)
+}
+
+/// `[laya_act_head]` forward over three already-resolved source tensors.
+fn laya_act_head_forward(
+    spec: &crate::model::LayaActHeadSpec,
+    weights: &crate::laya_act_head::LayaActHeadWeights,
+    head: &Tensor,
+    scorer: &Tensor,
+    marker: &Tensor,
+    output_shape: TensorShape,
+) -> Result<Tensor> {
+    let data = crate::laya_act_head::act_head_forward(
+        &head.data,
+        &scorer.data,
+        &marker.data,
+        weights,
+        head.shape.batch,
+        spec.hidden,
+        spec.max_options,
+        marker.shape.channels,
+        head.shape.width,
+        marker.shape.width,
+        spec.fc_dim,
+        spec.n_act,
+    )
+    .map_err(Error::InvalidConfig)?;
+    Tensor::from_data(output_shape, data)
+}
+
+/// `[laya_encoder]` forward: build the geometry from the spec + input shapes and
+/// run the frozen ModernBERT stack on the host.
+fn laya_encoder_forward(
+    spec: &crate::model::LayaEncoderSpec,
+    weights: &crate::laya_encoder::LayaEncoderWeights,
+    input: &Tensor,
+    output_shape: TensorShape,
+) -> Result<Tensor> {
+    let geometry = crate::laya_encoder::LayaEncoderGeometry {
+        batch: input.shape.batch,
+        seq_len: input.shape.width,
+        hidden: spec.hidden,
+        heads: spec.heads,
+        n_layers: spec.n_layers,
+        intermediate: spec.intermediate,
+        vocab: spec.vocab,
+        local_window: if spec.local_window > 0 {
+            spec.local_window
+        } else {
+            crate::model::LAYA_ENCODER_LOCAL_WINDOW
+        },
+        rope_theta_full: if spec.rope_theta_full > 0.0 {
+            spec.rope_theta_full
+        } else {
+            crate::model::LAYA_ENCODER_ROPE_THETA_FULL
+        },
+        rope_theta_local: if spec.rope_theta_local > 0.0 {
+            spec.rope_theta_local
+        } else {
+            crate::model::LAYA_ENCODER_ROPE_THETA_LOCAL
+        },
+        ln_eps: if spec.ln_eps > 0.0 { spec.ln_eps } else { 1.0e-5 },
+    };
+    let data = crate::laya_encoder::encoder_forward(&input.data, weights, &geometry)
+        .map_err(Error::InvalidConfig)?;
+    Tensor::from_data(output_shape, data)
+}
+
+/// `[laya_head]` forward: build the geometry from the spec + input shape and run
+/// the frozen decision head on the host.
+fn laya_head_forward(
+    spec: &crate::model::LayaHeadSpec,
+    weights: &crate::laya_head::LayaHeadWeights,
+    input: &Tensor,
+    output_shape: TensorShape,
+) -> Result<Tensor> {
+    let geometry = crate::laya_head::LayaHeadGeometry {
+        batch: input.shape.batch,
+        seq_len: input.shape.width,
+        hidden: spec.hidden,
+        heads: spec.heads,
+        n_layers: spec.n_layers,
+        ffn_dim: spec.ffn_dim,
+        ln_eps: if spec.ln_eps > 0.0 {
+            spec.ln_eps
+        } else {
+            crate::model::LAYA_LAYERNORM_EPS
+        },
+        qtype: spec.qtype,
+    };
+    let data = crate::laya_head::head_forward(&input.data, weights, &geometry)
+        .map_err(Error::InvalidConfig)?;
+    Tensor::from_data(output_shape, data)
+}
+
 fn shortcut_sources<'a>(
     spec: &crate::model::ShortcutSpec,
     layer_index: usize,
@@ -12299,6 +13509,153 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../cfg")
             .join(name)
+    }
+
+    #[test]
+    fn vit_runtime_forward_backward_matches_input_and_parameter_finite_differences() {
+        let network = Network::from_config(ConfigFile::parse_str(
+            "vit-runtime.cfg",
+            "[net]\nwidth=4\nheight=4\nchannels=1\nbatch=1\n\
+             [vit]\ndim=4\nheads=2\npatch_size=2\npatch_stride=2\nmlp_dim=4\n",
+        ).unwrap()).unwrap();
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::Vit(weights) = &mut executable.params[0] else { panic!("Vit params") };
+        let fill = |v: &mut [f32], scale: f32| {
+            for (i, x) in v.iter_mut().enumerate() { *x = ((i % 7) as f32 - 3.0) * scale; }
+        };
+        fill(&mut weights.patch_embed, 0.025);
+        fill(&mut weights.patch_bias, 0.01);
+        fill(&mut weights.qkv_weight, 0.02);
+        fill(&mut weights.qkv_bias, 0.01);
+        weights.ln1_gamma.fill(1.0);
+        fill(&mut weights.ln1_beta, 0.005);
+        fill(&mut weights.wo, 0.02);
+        fill(&mut weights.wo_bias, 0.01);
+        weights.ln2_gamma.fill(1.0);
+        fill(&mut weights.ln2_beta, 0.005);
+        fill(&mut weights.ffn_w1, 0.02);
+        fill(&mut weights.ffn_b1, 0.01);
+        fill(&mut weights.ffn_w2, 0.02);
+        fill(&mut weights.ffn_b2, 0.01);
+        fill(&mut weights.pos_embed, 0.005);
+        weights.mhc = crate::vit::MHC_DEFAULTS.to_vec();
+
+        let input = Tensor::from_data(TensorShape::new(4, 4, 1, 1),
+            (0..16).map(|i| (i as f32 - 7.0) * 0.07).collect()).unwrap();
+        let forward = executable.forward(&input).unwrap();
+        let output = forward.final_output().unwrap();
+        let seed = Tensor::from_data(output.shape, (0..output.len()).map(|i| (i as f32 + 1.0) * 0.13).collect()).unwrap();
+        let backward = executable.backward(&input, &forward, &seed).unwrap();
+        let objective = |out: &Tensor| out.data.iter().zip(&seed.data).map(|(a, b)| a * b).sum::<f32>();
+        let eps = 1e-3;
+
+        let mut plus_input = input.clone();
+        plus_input.data[5] += eps;
+        let mut minus_input = input.clone();
+        minus_input.data[5] -= eps;
+        let numerical_input = (objective(executable.forward(&plus_input).unwrap().final_output().unwrap())
+            - objective(executable.forward(&minus_input).unwrap().final_output().unwrap())) / (2.0 * eps);
+        assert!((backward.input_gradient.data[5] - numerical_input).abs() < 2e-3,
+            "input gradient: analytic={} numeric={numerical_input}", backward.input_gradient.data[5]);
+
+        let LayerParams::Vit(analytic) = &backward.param_gradients[0] else { panic!("Vit gradients") };
+        let numerical = |mut x: ExecutableNetwork, index: usize, ffn: bool| {
+            {
+                let LayerParams::Vit(w) = &mut x.params[0] else { panic!("Vit params") };
+                let values = if ffn { &mut w.ffn_w1 } else { &mut w.patch_embed };
+                values[index] += eps;
+            }
+            let p = objective(x.forward(&input).unwrap().final_output().unwrap());
+            {
+                let LayerParams::Vit(w) = &mut x.params[0] else { panic!("Vit params") };
+                let values = if ffn { &mut w.ffn_w1 } else { &mut w.patch_embed };
+                values[index] -= 2.0 * eps;
+            }
+            let m = objective(x.forward(&input).unwrap().final_output().unwrap());
+            (p - m) / (2.0 * eps)
+        };
+        for (analytic, numeric, name) in [
+            (analytic.patch_embed[3], numerical(executable.clone(), 3, false), "patch_embed"),
+            (analytic.ffn_w1[2], numerical(executable.clone(), 2, true), "ffn_w1"),
+        ] {
+            assert!((analytic - numeric).abs() < 2e-3,
+                "{name} gradient: analytic={analytic} numeric={numeric}");
+        }
+
+        let pre_update = match &executable.params[0] {
+            LayerParams::Vit(w) => w.patch_embed[3],
+            _ => unreachable!(),
+        };
+        executable.backward_accumulate(&input, &forward, &seed).unwrap();
+        let LayerTrainBuffers::Vit(train) = &executable.train_buffers[0] else { panic!("Vit updates") };
+        let clip_scale = super::vit_update_clip_scale(&train.updates, 5.0, true);
+        assert!((train.updates.patch_embed[3] + analytic.patch_embed[3]).abs() < 1e-6);
+        executable.update_weights(0.01, 0.0, 0.0, 1);
+        let LayerParams::Vit(updated) = &executable.params[0] else { panic!("Vit params") };
+        assert!((updated.patch_embed[3] - (pre_update - 0.01 * analytic.patch_embed[3] * clip_scale)).abs() < 1e-6);
+
+        let mut gpu = GpuExecutableNetwork::new(executable.network.clone(), FakeBackend);
+        gpu.params = executable.params.clone();
+        let gpu_forward = gpu.forward_with_state(&input).unwrap();
+        let gpu_output = gpu_forward.cpu_forward.final_output().unwrap();
+        let cpu_output = executable.forward(&input).unwrap();
+        assert_eq!(gpu_output, cpu_output.final_output().unwrap());
+        assert!(gpu.requires_cpu_backward_fallback());
+    }
+
+    #[test]
+    fn vit_sgd_update_applies_decay_and_reduced_mhc_rate() {
+        let network = Network::from_config(ConfigFile::parse_str(
+            "vit-update.cfg",
+            "[net]\nwidth=4\nheight=4\nchannels=1\n[vit]\ndim=4\nheads=2\npatch_size=2\npatch_stride=2\nmlp_dim=4\n",
+        ).unwrap()).unwrap();
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::Vit(params) = &mut executable.params[0] else { panic!("Vit params") };
+        params.patch_embed[0] = 1.0;
+        params.pos_embed[0] = 1.0;
+        let mhc_before = params.mhc[0];
+        let LayerTrainBuffers::Vit(train) = &mut executable.train_buffers[0] else { panic!("Vit updates") };
+        train.updates.patch_embed[0] = -0.5;
+        train.updates.patch_bias[0] = -0.5;
+        train.updates.mhc[0] = -0.5;
+        executable.update_weights(0.1, 0.0, 0.2, 1);
+        let LayerParams::Vit(params) = &executable.params[0] else { panic!("Vit params") };
+        assert!((params.patch_embed[0] - 0.93).abs() < 1e-6); // matrix decay
+        assert!((params.patch_bias[0] + 0.05).abs() < 1e-6); // no bias decay
+        assert!((params.pos_embed[0] - 0.98).abs() < 1e-6); // learned positions decay
+        assert!((params.mhc[0] - (mhc_before - 0.005)).abs() < 1e-6); // 0.1x LR
+    }
+
+    #[test]
+    fn vit_gpu_host_fallback_matches_a_preceding_convolution_and_backward() {
+        let network = Network::from_config(ConfigFile::parse_str(
+            "vit-chain.cfg",
+            "[net]\nwidth=4\nheight=4\nchannels=1\nbatch=1\n\
+             [convolutional]\nfilters=1\nsize=1\nactivation=linear\n\
+             [vit]\ndim=4\nheads=2\npatch_size=2\npatch_stride=2\nmlp_dim=4\n",
+        ).unwrap()).unwrap();
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        crate::initialize_training_params(&network, &mut cpu.params, 41);
+        let LayerParams::Convolutional(conv) = &mut cpu.params[0] else { panic!("conv params") };
+        conv.weights[0] = 0.7;
+        conv.biases[0] = -0.1;
+        let input = Tensor::from_data(TensorShape::new(4, 4, 1, 1),
+            (0..16).map(|i| (i as f32 - 7.0) * 0.04).collect()).unwrap();
+        let cpu_forward = cpu.forward(&input).unwrap();
+
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        gpu.params = cpu.params.clone();
+        let gpu_forward = gpu.forward_with_state(&input).unwrap();
+        assert_eq!(gpu_forward.cpu_forward.final_output(), cpu_forward.final_output());
+        let output = gpu_forward.cpu_forward.final_output().unwrap();
+        let seed = Tensor::from_data(output.shape, vec![0.2; output.len()]).unwrap();
+        gpu.backward_accumulate_seeded_gpu(
+            &gpu_forward,
+            &[None, Some(seed)],
+        ).unwrap();
+        let fallback = gpu.cpu_fallback_train_buffers.borrow();
+        let LayerTrainBuffers::Vit(vit) = &fallback[1] else { panic!("ViT fallback updates") };
+        assert!(vit.updates.to_blob().iter().any(|value| *value != 0.0));
     }
 
     #[test]
@@ -17345,6 +18702,541 @@ mod tests {
         ));
     }
 
+    /// `[laya_marker_gather]` on the CPU.  Layer 0 is an identity 1x1 conv, so
+    /// input A is exactly the network input; layer 1 gathers one hidden column
+    /// per option at the position read from input channel 0, column 0.
+    fn laya_marker_gather_network() -> ExecutableNetwork {
+        let cfg = "[net]\nchannels=6\nbatch=1\nheight=1\nwidth=3\n\
+                   [convolutional]\nfilters=6\nsize=1\nstride=1\nbatch_normalize=0\nactivation=linear\n\
+                   [laya_marker_gather]\nlayers=0,0\nhidden=6\nmax_options=1\n";
+        let mut executable = ExecutableNetwork::new(
+            Network::from_config(ConfigFile::parse_str("laya-mg.cfg", cfg).expect("cfg"))
+                .expect("network"),
+        );
+        let LayerParams::Convolutional(params) = &mut executable.params[0] else {
+            panic!("expected conv params");
+        };
+        let mut weights = vec![0.0f32; 36];
+        for f in 0..6 {
+            weights[f * 6 + f] = 1.0;
+        }
+        params.weights = weights;
+        params.biases = vec![0.0; 6];
+        executable
+    }
+
+    /// `[b][c][h][w]` = 6 channels x 1 x 3.  Channel 0 column 0 is the marker
+    /// position (2.0 -> column 2); every channel carries a distinct payload.
+    fn laya_marker_gather_input(executable: &ExecutableNetwork) -> Tensor {
+        let channels = [
+            [2.0f32, 0.0, 0.0],
+            [10.0, 11.0, 12.0],
+            [20.0, 21.0, 22.0],
+            [30.0, 31.0, 32.0],
+            [40.0, 41.0, 42.0],
+            [50.0, 51.0, 52.0],
+        ];
+        let mut data = vec![0.0f32; 18];
+        for (c, row) in channels.iter().enumerate() {
+            for (t, value) in row.iter().enumerate() {
+                data[c * 3 + t] = *value;
+            }
+        }
+        Tensor::from_data(executable.network.net.input_shape(), data).expect("input shape")
+    }
+
+    #[test]
+    fn cpu_laya_marker_gather_selects_the_marker_column() {
+        let executable = laya_marker_gather_network();
+        let input = laya_marker_gather_input(&executable);
+        let forward = executable.forward(&input).expect("forward");
+        let output = &forward.layer_outputs[1];
+        // Column 2 of every channel, in channel order.
+        assert_eq!(output.data, vec![0.0, 12.0, 22.0, 32.0, 42.0, 52.0]);
+    }
+
+    #[test]
+    fn cpu_laya_marker_gather_backward_scatters_into_input_a() {
+        let executable = laya_marker_gather_network();
+        let input = laya_marker_gather_input(&executable);
+        let forward = executable.forward(&input).expect("forward");
+        let seed = Tensor::from_data(
+            forward.layer_outputs[1].shape,
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        )
+        .expect("seed");
+        let backward = executable.backward(&input, &forward, &seed).expect("backward");
+        // delta_A[c, 2] = seed[c]; every other column stays zero.
+        let mut want = vec![0.0f32; 18];
+        for c in 0..6 {
+            want[c * 3 + 2] = (c as f32) + 1.0;
+        }
+        assert_eq!(backward.layer_output_gradients[0].data, want);
+    }
+
+    #[test]
+    fn laya_marker_gather_rejects_shape_mismatches() {
+        let net = "[net]\nchannels=6\nbatch=1\nheight=1\nwidth=3\n\
+                   [convolutional]\nfilters=6\nsize=1\nstride=1\nbatch_normalize=0\nactivation=linear\n";
+        let build = |section: &str| {
+            ConfigFile::parse_str("laya-mg.cfg", &format!("{net}{section}"))
+                .map_err(|err| err.to_string())
+                .and_then(|cfg| Network::from_config(cfg).map(|_| ()).map_err(|err| err.to_string()))
+        };
+        // hidden must equal input A's channels (6).
+        assert!(build("[laya_marker_gather]\nlayers=0,0\nhidden=5\nmax_options=1\n").is_err());
+        // input B (6 channels) must have >= 2*max_options channels.
+        assert!(build("[laya_marker_gather]\nlayers=0,0\nhidden=6\nmax_options=4\n").is_err());
+        // exactly two sources.
+        assert!(build("[laya_marker_gather]\nlayers=0\nhidden=6\nmax_options=1\n").is_err());
+        // the valid shape builds.
+        assert!(build("[laya_marker_gather]\nlayers=0,0\nhidden=6\nmax_options=1\n").is_ok());
+    }
+
+    /// `[laya_act_head]` on the CPU.  Three 1x1 convs produce the head (identity),
+    /// marker (all-ones) and scorer (input channel 0) sources, then the act head.
+    fn laya_act_head_network() -> ExecutableNetwork {
+        let cfg = "[net]\nchannels=6\nbatch=1\nheight=1\nwidth=2\n\
+                   [convolutional]\nfilters=6\nsize=1\nstride=1\nbatch_normalize=0\nactivation=linear\n\
+                   [convolutional]\nfilters=1\nsize=1\nstride=1\nbatch_normalize=0\nactivation=linear\n\
+                   [convolutional]\nfilters=4\nsize=1\nstride=1\nbatch_normalize=0\nactivation=linear\n\
+                   [laya_act_head]\nlayers=0,1,2\nhidden=6\nmax_options=2\nfc_dim=3\nn_act=2\n";
+        let mut executable = ExecutableNetwork::new(
+            Network::from_config(ConfigFile::parse_str("laya-ah.cfg", cfg).expect("cfg"))
+                .expect("network"),
+        );
+        // Head source: identity 6x6 1x1 conv.
+        let LayerParams::Convolutional(p) = &mut executable.params[0] else {
+            panic!("expected conv params")
+        };
+        let mut w = vec![0.0f32; 36];
+        for f in 0..6 {
+            w[f * 6 + f] = 1.0;
+        }
+        p.weights = w;
+        p.biases = vec![0.0; 6];
+        // Scorer source: read head channel 0 at each column.
+        let LayerParams::Convolutional(p) = &mut executable.params[1] else {
+            panic!("expected conv params")
+        };
+        let mut w = vec![0.0f32; 6];
+        w[0] = 1.0;
+        p.weights = w;
+        p.biases = vec![0.0; 1];
+        // Marker source: zero weights, bias 1 -> every mask > 0.5 (all valid).
+        let LayerParams::Convolutional(p) = &mut executable.params[2] else {
+            panic!("expected conv params")
+        };
+        p.weights = vec![0.0; 4];
+        p.biases = vec![1.0; 4];
+        // Deterministic act-head weights.
+        let LayerParams::LayaActHead(p) = &mut executable.params[3] else {
+            panic!("expected laya_act_head params")
+        };
+        let input = 6 + crate::laya_act_head::LAYA_ACT_HEAD_N_FEATS;
+        let mut next = 0.0f32;
+        let mut fill = |len: usize| {
+            (0..len)
+                .map(|_| {
+                    next += 0.013;
+                    (next * 0.7).sin() * 0.4
+                })
+                .collect::<Vec<f32>>()
+        };
+        p.fc1_w = fill(3 * input);
+        p.fc1_b = fill(3);
+        p.fc2_w = fill(2 * 3);
+        p.fc2_b = fill(2);
+        executable
+    }
+
+    fn laya_act_head_input(executable: &ExecutableNetwork) -> Tensor {
+        // [b][c][h][w]: channels=6, w=2. Channel 0 carries the scorer logits
+        // [0.5, 2.0]; the rest are the CLS payload.
+        let mut data = vec![0.0f32; 12];
+        data[0] = 0.5;
+        data[1] = 2.0;
+        for c in 1..6 {
+            data[c * 2] = c as f32 * 0.1;
+            data[c * 2 + 1] = -(c as f32) * 0.2;
+        }
+        Tensor::from_data(executable.network.net.input_shape(), data).expect("input shape")
+    }
+
+    #[test]
+    fn cpu_laya_act_head_forward_matches_the_module() {
+        let executable = laya_act_head_network();
+        let input = laya_act_head_input(&executable);
+        let forward = executable.forward(&input).expect("forward");
+        let LayerParams::LayaActHead(weights) = &executable.params[3] else {
+            panic!("expected act_head params")
+        };
+        let head = &forward.layer_outputs[0];
+        let scorer = &forward.layer_outputs[1];
+        let marker = &forward.layer_outputs[2];
+        let want = crate::laya_act_head::act_head_forward(
+            &head.data,
+            &scorer.data,
+            &marker.data,
+            weights,
+            1,
+            6,
+            2,
+            marker.shape.channels,
+            head.shape.width,
+            marker.shape.width,
+            3,
+            2,
+        )
+        .expect("module forward");
+        assert_eq!(forward.layer_outputs[3].data, want);
+    }
+
+    #[test]
+    fn cpu_laya_act_head_backward_scatters_dcls_into_the_head_source() {
+        let executable = laya_act_head_network();
+        let input = laya_act_head_input(&executable);
+        let forward = executable.forward(&input).expect("forward");
+        let seed = Tensor::from_data(forward.layer_outputs[3].shape, vec![1.0, -0.5]).expect("seed");
+        let LayerParams::LayaActHead(weights) = &executable.params[3] else {
+            panic!("expected act_head params")
+        };
+        let head = &forward.layer_outputs[0];
+        let scorer = &forward.layer_outputs[1];
+        let marker = &forward.layer_outputs[2];
+        let grad = crate::laya_act_head::act_head_backward(
+            &head.data,
+            &scorer.data,
+            &marker.data,
+            weights,
+            &seed.data,
+            1,
+            6,
+            2,
+            marker.shape.channels,
+            head.shape.width,
+            marker.shape.width,
+            3,
+            2,
+        )
+        .expect("module backward");
+        let backward = executable.backward(&input, &forward, &seed).expect("backward");
+        let head_grad = &backward.layer_output_gradients[0];
+        // Column 0 gets the pooled-CLS gradient; column 1 stays zero.
+        for e in 0..6 {
+            assert!(
+                (head_grad.data[e * 2] - grad.dcls[e]).abs() < 1e-6,
+                "channel {e}: {} vs {}",
+                head_grad.data[e * 2],
+                grad.dcls[e]
+            );
+            assert!(head_grad.data[e * 2 + 1].abs() < 1e-6, "column 1 must stay zero");
+        }
+    }
+
+    #[test]
+    fn laya_act_head_rejects_shape_mismatches() {
+        let net = "[net]\nchannels=6\nbatch=1\nheight=1\nwidth=2\n\
+                   [convolutional]\nfilters=6\nsize=1\nstride=1\nbatch_normalize=0\nactivation=linear\n\
+                   [convolutional]\nfilters=1\nsize=1\nstride=1\nbatch_normalize=0\nactivation=linear\n\
+                   [convolutional]\nfilters=4\nsize=1\nstride=1\nbatch_normalize=0\nactivation=linear\n";
+        let build = |section: &str| {
+            ConfigFile::parse_str("laya-ah.cfg", &format!("{net}{section}"))
+                .map_err(|err| err.to_string())
+                .and_then(|cfg| {
+                    Network::from_config(cfg)
+                        .map(|_| ())
+                        .map_err(|err| err.to_string())
+                })
+        };
+        // head source must have `hidden` channels.
+        assert!(build("[laya_act_head]\nlayers=0,1,2\nhidden=5\nmax_options=2\n").is_err());
+        // scorer source must be 1 x max_options.
+        assert!(build("[laya_act_head]\nlayers=0,1,2\nhidden=6\nmax_options=3\n").is_err());
+        // marker source must have 2*max_options channels.
+        assert!(build("[laya_act_head]\nlayers=0,1,2\nhidden=6\nmax_options=1\n").is_err());
+        // exactly three sources.
+        assert!(build("[laya_act_head]\nlayers=0,1\nhidden=6\nmax_options=2\n").is_err());
+        // the valid shape builds.
+        assert!(build("[laya_act_head]\nlayers=0,1,2\nhidden=6\nmax_options=2\n").is_ok());
+    }
+
+    fn laya_loss_network(mode: &str) -> ExecutableNetwork {
+        let cfg = format!(
+            "[net]\nchannels=1\nbatch=1\nheight=1\nwidth=2\n\
+             [convolutional]\nfilters=1\nsize=1\nstride=1\nbatch_normalize=0\nactivation=linear\n\
+             [laya_loss]\nmax_options=2\nmode={mode}\n"
+        );
+        let mut executable = ExecutableNetwork::new(
+            Network::from_config(ConfigFile::parse_str("laya-loss.cfg", &cfg).expect("cfg"))
+                .expect("network"),
+        );
+        let LayerParams::Convolutional(p) = &mut executable.params[0] else {
+            panic!("expected conv params")
+        };
+        p.weights = vec![1.0];
+        p.biases = vec![0.0];
+        executable
+    }
+
+    fn laya_loss_truth() -> Tensor {
+        // [target K=2 | valid K=2 | qtype | ep_group | ep_step] -> 7 values.
+        Tensor::from_data(
+            TensorShape::new(7, 1, 1, 1),
+            vec![1.0, 0.0, 1.0, 1.0, 0.0, -1.0, -1.0],
+        )
+        .expect("truth")
+    }
+
+    #[test]
+    fn cpu_laya_loss_ce_forward_and_seed() {
+        let executable = laya_loss_network("ce");
+        let input =
+            Tensor::from_data(executable.network.net.input_shape(), vec![0.5, 2.0]).expect("input");
+        let forward = executable.forward(&input).expect("forward");
+        let probs = &forward.layer_outputs[1];
+        let e1 = (2.0f32 - 0.5).exp();
+        let p = [1.0 / (1.0 + e1), e1 / (1.0 + e1)];
+        assert!((probs.data[0] - p[0]).abs() < 1e-6, "{:?}", probs.data);
+        assert!((probs.data[1] - p[1]).abs() < 1e-6);
+
+        let mut truths = vec![None; executable.network.layers.len()];
+        truths[1] = Some(laya_loss_truth());
+        let loss = crate::dense_loss::compute_dense_training_loss(
+            &executable.network,
+            &forward,
+            &input,
+            &truths,
+        )
+        .expect("dense loss");
+        let seed = loss.layer_output_gradient_seeds[1]
+            .as_ref()
+            .expect("laya_loss seed");
+        // CE delta = y - p.
+        assert!((seed.data[0] - (1.0 - p[0])).abs() < 1e-6, "{:?}", seed.data);
+        assert!((seed.data[1] - (0.0 - p[1])).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cpu_laya_loss_rlcd_runs_and_produces_a_finite_seed() {
+        let executable = laya_loss_network("rlcd");
+        let input =
+            Tensor::from_data(executable.network.net.input_shape(), vec![0.5, 2.0]).expect("input");
+        let forward = executable.forward(&input).expect("forward");
+        let mut truths = vec![None; executable.network.layers.len()];
+        truths[1] = Some(laya_loss_truth());
+        let loss = crate::dense_loss::compute_dense_training_loss_at(
+            &executable.network,
+            &forward,
+            &input,
+            &truths,
+            0,
+        )
+        .expect("dense loss");
+        let seed = loss.layer_output_gradient_seeds[1]
+            .as_ref()
+            .expect("laya_loss seed");
+        assert!(seed.data.iter().all(|v| v.is_finite()), "{:?}", seed.data);
+        assert!(loss.loss.is_finite());
+    }
+
+    #[test]
+    fn laya_loss_rejects_bad_configs() {
+        let net = "[net]\nchannels=1\nbatch=1\nheight=1\nwidth=2\n\
+                   [convolutional]\nfilters=1\nsize=1\nstride=1\nbatch_normalize=0\nactivation=linear\n";
+        let build = |section: &str| {
+            ConfigFile::parse_str("laya-loss.cfg", &format!("{net}{section}"))
+                .map_err(|err| err.to_string())
+                .and_then(|cfg| {
+                    Network::from_config(cfg)
+                        .map(|_| ())
+                        .map_err(|err| err.to_string())
+                })
+        };
+        assert!(build("[laya_loss]\nmax_options=2\nmode=bad\n").is_err());
+        assert!(build("[laya_loss]\nmax_options=3\nmode=ce\n").is_err());
+        assert!(build("[laya_loss]\nmax_options=2\nmode=ce\n").is_ok());
+    }
+
+    fn laya_encoder_network() -> ExecutableNetwork {
+        let cfg = "[net]\nchannels=2\nbatch=1\nheight=1\nwidth=3\n\
+                   [laya_encoder]\nhidden=4\nheads=2\nlayers=2\nintermediate=8\nvocab=10\n";
+        let mut executable = ExecutableNetwork::new(
+            Network::from_config(ConfigFile::parse_str("laya-enc.cfg", cfg).expect("cfg"))
+                .expect("network"),
+        );
+        let LayerParams::LayaEncoder(w) = &mut executable.params[0] else {
+            panic!("expected laya_encoder params")
+        };
+        let mut state = 0x1234_5678u64;
+        let mut fill = |len: usize| {
+            (0..len)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((state >> 40) as f32) / ((1u64 << 24) as f32) - 0.5
+                })
+                .collect::<Vec<f32>>()
+        };
+        *w = crate::laya_encoder::LayaEncoderWeights {
+            tok_embed: fill(10 * 4),
+            embed_norm: fill(4),
+            attn_norm: fill(1 * 4),
+            wqkv: fill(2 * 3 * 4 * 4),
+            wo: fill(2 * 4 * 4),
+            mlp_norm: fill(2 * 4),
+            wi: fill(2 * 2 * 8 * 4),
+            wo_mlp: fill(2 * 4 * 8),
+            final_norm: fill(4),
+        };
+        executable
+    }
+
+    #[test]
+    fn cpu_laya_encoder_forward_matches_the_module() {
+        let executable = laya_encoder_network();
+        // token ids [0,1,2], mask [1,1,0].
+        let input = Tensor::from_data(
+            executable.network.net.input_shape(),
+            vec![0.0, 1.0, 2.0, 1.0, 1.0, 0.0],
+        )
+        .expect("input");
+        let forward = executable.forward(&input).expect("forward");
+        let LayerParams::LayaEncoder(weights) = &executable.params[0] else {
+            panic!("expected laya_encoder params")
+        };
+        let geometry = crate::laya_encoder::LayaEncoderGeometry {
+            batch: 1,
+            seq_len: 3,
+            hidden: 4,
+            heads: 2,
+            n_layers: 2,
+            intermediate: 8,
+            vocab: 10,
+            local_window: crate::model::LAYA_ENCODER_LOCAL_WINDOW,
+            rope_theta_full: crate::model::LAYA_ENCODER_ROPE_THETA_FULL,
+            rope_theta_local: crate::model::LAYA_ENCODER_ROPE_THETA_LOCAL,
+            ln_eps: crate::model::LAYA_LAYERNORM_EPS,
+        };
+        let want = crate::laya_encoder::encoder_forward(&input.data, weights, &geometry)
+            .expect("module forward");
+        assert_eq!(forward.layer_outputs[0].data, want);
+        assert_eq!(forward.layer_outputs[0].data.len(), 4 * 3);
+    }
+
+    #[test]
+    fn laya_encoder_rejects_bad_configs() {
+        let build = |channels: usize, section: &str| {
+            let net = format!("[net]\nchannels={channels}\nbatch=1\nheight=1\nwidth=3\n");
+            ConfigFile::parse_str("laya-enc.cfg", &format!("{net}{section}"))
+                .map_err(|err| err.to_string())
+                .and_then(|cfg| {
+                    Network::from_config(cfg)
+                        .map(|_| ())
+                        .map_err(|err| err.to_string())
+                })
+        };
+        // channels must be 2 (token id + mask).
+        assert!(build(1, "[laya_encoder]\nhidden=2\nheads=1\nlayers=1\nintermediate=2\nvocab=3\n").is_err());
+        // hidden must be divisible by heads.
+        assert!(build(2, "[laya_encoder]\nhidden=3\nheads=2\nlayers=1\nintermediate=2\nvocab=3\n").is_err());
+        // valid.
+        assert!(build(2, "[laya_encoder]\nhidden=2\nheads=1\nlayers=1\nintermediate=2\nvocab=3\n").is_ok());
+    }
+
+    fn laya_head_network() -> ExecutableNetwork {
+        let cfg = "[net]\nchannels=5\nbatch=1\nheight=1\nwidth=3\n\
+                   [laya_head]\nhidden=4\nheads=2\nlayers=2\nffn_dim=4\nqtype=0\n";
+        let mut executable = ExecutableNetwork::new(
+            Network::from_config(ConfigFile::parse_str("laya-head.cfg", cfg).expect("cfg"))
+                .expect("network"),
+        );
+        let LayerParams::LayaHead(w) = &mut executable.params[0] else {
+            panic!("expected laya_head params")
+        };
+        let mut state = 0x9E37_79B9u64;
+        let mut fill = |len: usize| {
+            (0..len)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((state >> 40) as f32) / ((1u64 << 24) as f32) - 0.5
+                })
+                .collect::<Vec<f32>>()
+        };
+        *w = crate::laya_head::LayaHeadWeights {
+            norm1_w: fill(2 * 4),
+            norm1_b: fill(2 * 4),
+            in_proj_w: fill(2 * 3 * 4 * 4),
+            in_proj_b: fill(2 * 3 * 4),
+            out_proj_w: fill(2 * 4 * 4),
+            out_proj_b: fill(2 * 4),
+            norm2_w: fill(2 * 4),
+            norm2_b: fill(2 * 4),
+            linear1_w: fill(2 * 4 * 4),
+            linear1_b: fill(2 * 4),
+            linear2_w: fill(2 * 4 * 4),
+            linear2_b: fill(2 * 4),
+            type_emb: fill(3 * 4),
+        };
+        executable
+    }
+
+    #[test]
+    fn cpu_laya_head_forward_matches_the_module() {
+        let executable = laya_head_network();
+        // [batch, hidden+mask=5, 1, T=3]: hidden states + mask channel.
+        let mut input_data = vec![0.0f32; 5 * 3];
+        for (i, v) in input_data.iter_mut().enumerate() {
+            *v = (i as f32 * 0.17).sin();
+        }
+        for t in 0..3 {
+            input_data[4 * 3 + t] = 1.0; // mask all valid
+        }
+        let input = Tensor::from_data(executable.network.net.input_shape(), input_data.clone())
+            .expect("input");
+        let forward = executable.forward(&input).expect("forward");
+        let LayerParams::LayaHead(weights) = &executable.params[0] else {
+            panic!("expected laya_head params")
+        };
+        let geometry = crate::laya_head::LayaHeadGeometry {
+            batch: 1,
+            seq_len: 3,
+            hidden: 4,
+            heads: 2,
+            n_layers: 2,
+            ffn_dim: 4,
+            ln_eps: crate::model::LAYA_LAYERNORM_EPS,
+            qtype: 0,
+        };
+        let want = crate::laya_head::head_forward(&input_data, weights, &geometry)
+            .expect("module forward");
+        assert_eq!(forward.layer_outputs[0].data, want);
+        assert_eq!(forward.layer_outputs[0].data.len(), 4 * 3);
+    }
+
+    #[test]
+    fn laya_head_rejects_bad_configs() {
+        let build = |channels: usize, section: &str| {
+            let net = format!("[net]\nchannels={channels}\nbatch=1\nheight=1\nwidth=3\n");
+            ConfigFile::parse_str("laya-head.cfg", &format!("{net}{section}"))
+                .map_err(|err| err.to_string())
+                .and_then(|cfg| {
+                    Network::from_config(cfg)
+                        .map(|_| ())
+                        .map_err(|err| err.to_string())
+                })
+        };
+        // channels must be hidden + mask = 5 for qtype=0.
+        assert!(build(4, "[laya_head]\nhidden=4\nheads=2\nlayers=2\nffn_dim=4\nqtype=0\n").is_err());
+        // qtype=-1 adds a channel (6).
+        assert!(build(6, "[laya_head]\nhidden=4\nheads=2\nlayers=2\nffn_dim=4\nqtype=-1\n").is_ok());
+        // qtype out of range.
+        assert!(build(5, "[laya_head]\nhidden=4\nheads=2\nlayers=2\nffn_dim=4\nqtype=3\n").is_err());
+    }
+
     /// C++ `parse_moe_convolutional_section` raises two hard errors, and both
     /// must stay errors here: clamping `experts` or `top_k` would silently
     /// change the parameter count the `.weights` file is read with.
@@ -17702,6 +19594,118 @@ mod tests {
                 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0
             ]
         );
+    }
+
+    #[test]
+    fn container_convolution_cache_is_keyed_by_owner_and_expert_slot() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "gpu-moe-cache.cfg",
+                "[net]\nchannels=2\nbatch=1\nheight=2\nwidth=2\n[moe_convolutional]\nfilters=2\nsize=1\nexperts=3\ntop_k=1\nactivation=linear\n",
+            )
+            .expect("moe cfg"),
+        )
+        .expect("moe network");
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        let LayerParams::Moe(moe) = &mut gpu.params[0] else {
+            panic!("expected moe parameters");
+        };
+        for (slot, expert) in moe.experts.iter_mut().enumerate() {
+            expert.weights.fill(slot as f32 + 1.0);
+        }
+
+        gpu.warm_device_conv_params().expect("warm experts");
+        let cache = gpu.device_conv_params.borrow();
+        assert_eq!(cache[0].len(), 3);
+        for (slot, params) in cache[0].iter().enumerate() {
+            let params = params.as_ref().expect("cached expert slot");
+            assert_eq!(params.raw_weights.shape, vec![2, 2, 1, 1]);
+            assert!(params.raw_weights.data.iter().all(|w| *w == slot as f32 + 1.0));
+        }
+        drop(cache);
+
+        gpu.update_cpu_fallback_weights(0.1, 0.0, 0.0, 1);
+        assert!(gpu.device_conv_params.borrow()[0].is_empty());
+        gpu.warm_device_conv_params().expect("rewarm updated experts");
+        assert_eq!(gpu.device_conv_params.borrow()[0].len(), 3);
+    }
+
+    #[test]
+    fn gpu_moe_expert_forward_and_cpu_training_fallback_match() {
+        let cfg = "[net]\nchannels=2\nbatch=2\nheight=2\nwidth=2\n[moe_convolutional]\nfilters=2\nsize=1\nexperts=3\ntop_k=0\nload_balance=0\ntemperature=1.4\nactivation=leaky\n";
+        let network = Network::from_config(ConfigFile::parse_str("gpu-moe.cfg", cfg).unwrap())
+            .expect("moe network");
+        let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+        let LayerParams::Moe(moe) = &mut gpu.params[0] else {
+            panic!("expected moe parameters");
+        };
+        for (i, weight) in moe.router_weights.iter_mut().enumerate() {
+            *weight = (i as f32 - 2.0) * 0.07;
+        }
+        moe.router_biases.copy_from_slice(&[0.2, -0.1, 0.05]);
+        for (slot, expert) in moe.experts.iter_mut().enumerate() {
+            for (i, weight) in expert.weights.iter_mut().enumerate() {
+                *weight = 0.08 * (1 + slot * 4 + i) as f32;
+            }
+            expert.biases.copy_from_slice(&[slot as f32 * 0.03, -0.02]);
+        }
+        let mut cpu = ExecutableNetwork::new(network);
+        cpu.params = gpu.params.clone();
+        let input = Tensor::from_data(
+            cpu.network.net.input_shape(),
+            (0..16).map(|i| (i as f32 * 0.37).sin()).collect(),
+        )
+        .expect("moe input");
+        let cpu_forward = cpu.forward_training(&input).expect("CPU MoE forward");
+        let gpu_forward = gpu.forward_training_with_state(&input).expect("GPU MoE forward");
+        assert!(gpu.requires_cpu_backward_fallback());
+        assert_slice_close(
+            "MoE forward",
+            &cpu_forward.layer_outputs[0].data,
+            &gpu_forward.cpu_forward.layer_outputs[0].data,
+            2e-5,
+        );
+        assert!(gpu_forward.cpu_forward.moe_caches[0].is_some());
+
+        let seed = Tensor::from_data(
+            cpu_forward.layer_outputs[0].shape,
+            (0..cpu_forward.layer_outputs[0].data.len())
+                .map(|i| (i as f32 * 0.29).cos())
+                .collect(),
+        )
+        .expect("MoE seed");
+        let seeds = vec![Some(seed)];
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu().expect("zero GPU buffers");
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU MoE backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("GPU MoE backward fallback");
+        {
+            let LayerTrainBuffers::Moe(cpu_train) = &cpu.train_buffers[0] else {
+                panic!("CPU MoE train buffers");
+            };
+            let fallback = gpu.cpu_fallback_train_buffers.borrow();
+            let LayerTrainBuffers::Moe(gpu_train) = &fallback[0] else {
+                panic!("GPU MoE fallback train buffers");
+            };
+            assert_slice_close("router weight grads", &cpu_train.router_weight_updates, &gpu_train.router_weight_updates, 2e-5);
+            assert_slice_close("router bias grads", &cpu_train.router_bias_updates, &gpu_train.router_bias_updates, 2e-5);
+            for (cpu_expert, gpu_expert) in cpu_train.experts.iter().zip(&gpu_train.experts) {
+                assert_slice_close("expert weight grads", &cpu_expert.weight_updates, &gpu_expert.weight_updates, 2e-5);
+                assert_slice_close("expert bias grads", &cpu_expert.bias_updates, &gpu_expert.bias_updates, 2e-5);
+            }
+        }
+        cpu.update_weights(0.01, 0.9, 0.001, 2);
+        gpu.update_weights_gpu(0.01, 0.9, 0.001, 2).expect("GPU MoE SGD fallback");
+        let LayerParams::Moe(cpu_params) = &cpu.params[0] else { unreachable!() };
+        let LayerParams::Moe(gpu_params) = &gpu.params[0] else { unreachable!() };
+        assert_slice_close("router weights", &cpu_params.router_weights, &gpu_params.router_weights, 2e-5);
+        assert_slice_close("router biases", &cpu_params.router_biases, &gpu_params.router_biases, 2e-5);
+        for (cpu_expert, gpu_expert) in cpu_params.experts.iter().zip(&gpu_params.experts) {
+            assert_slice_close("expert weights", &cpu_expert.weights, &gpu_expert.weights, 2e-5);
+            assert_slice_close("expert biases", &cpu_expert.biases, &gpu_expert.biases, 2e-5);
+        }
     }
 
     #[test]
@@ -18438,6 +20442,62 @@ mod tests {
     }
 
     #[test]
+    fn gpu_weighted_shortcut_forward_and_cpu_backward_fallback_match_cpu() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "inline.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=2\n\
+                 [convolutional]\nfilters=1\nsize=1\nactivation=linear\n\
+                 [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
+                 [shortcut]\nfrom=-2\nweights_type=per_channel\nweights_normalization=relu\nactivation=leaky\n",
+            ).unwrap(),
+        ).unwrap();
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        fill_conv_params(&mut cpu.params);
+        if let LayerParams::Shortcut(params) = &mut cpu.params[2] {
+            params.weights = vec![0.8, 0.5, 0.6, 0.9];
+        } else {
+            panic!("weighted shortcut parameters expected");
+        }
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        gpu.params = cpu.params.clone();
+        assert!(gpu.requires_cpu_backward_fallback());
+
+        let input = patterned_input(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
+        let gpu_forward = gpu.forward_training_with_state(&input).expect("GPU forward");
+        let device_output = gpu.backend.download_f32(&gpu_forward.gpu_layer_outputs[2]).unwrap();
+        assert_slice_close(
+            "weighted shortcut oxide/fake forward",
+            &cpu_forward.layer_outputs[2].data,
+            &device_output,
+            1e-5,
+        );
+
+        let seed_shape = cpu.network.layers[2].output_shape;
+        let seed = Tensor::from_data(
+            seed_shape,
+            (0..seed_shape.batch * seed_shape.element_count())
+                .map(|i| (i as f32 * 0.53).cos())
+                .collect(),
+        ).unwrap();
+        let mut seeds = vec![None; cpu.network.layers.len()];
+        seeds[2] = Some(seed);
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds).unwrap();
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds).unwrap();
+        let cpu_shortcut = match &cpu.train_buffers[2] {
+            LayerTrainBuffers::Shortcut(buffers) => &buffers.weight_updates,
+            other => panic!("unexpected CPU train buffer {other:?}"),
+        };
+        let fallback_buffers = gpu.cpu_fallback_train_buffers.borrow();
+        let gpu_shortcut = match &fallback_buffers[2] {
+            LayerTrainBuffers::Shortcut(buffers) => &buffers.weight_updates,
+            other => panic!("unexpected fallback train buffer {other:?}"),
+        };
+        assert_slice_close("weighted shortcut fallback weight updates", cpu_shortcut, gpu_shortcut, 1e-6);
+    }
+
+    #[test]
     fn gpu_connected_forward_matches_cpu_with_and_without_batch_norm() {
         for batch_normalize in [0, 1] {
             let network = Network::from_config(
@@ -18766,7 +20826,7 @@ mod tests {
         let mut gpu = optimizer_net("");
         {
             let mut cached = gpu.device_conv_params.borrow_mut();
-            let c = cached[1].as_mut().expect("cached params");
+            let c = cached[1][0].as_mut().expect("cached params");
             c.raw_weights.data[1] = f32::INFINITY;
             c.raw_weights.data[2] = f32::NAN;
             c.raw_weights.data[0] = 0.25;

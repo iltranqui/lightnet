@@ -63,6 +63,7 @@ pub fn compute_dense_training_loss_at(
                 | LayerKind::Ppyoloe(_)
                 | LayerKind::Yolonas(_)
                 | LayerKind::CenterNet(_)
+                | LayerKind::LayaLoss(_)
         ) && t.shape != layer.output_shape
         {
             return Err(Error::InvalidConfig(format!(
@@ -209,6 +210,55 @@ pub fn compute_dense_training_loss_at(
                     *v *= spec.scale; // C++ backward: axpy(scale, delta)
                 }
                 (delta, result.mean_ce)
+            }
+            LayerKind::LayaLoss(spec) => {
+                // C++ `forward_laya_loss_layer` computes the loss from the
+                // previous layer's logits; the truth is `[batch, 2K+3]`.
+                let batch = prev.shape.batch;
+                let expected = batch * (2 * spec.max_options + 3);
+                if t.data.len() != expected {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} ([laya_loss]) truth has {} values, expected batch*(2K+3)={expected}",
+                        layer.index,
+                        t.data.len()
+                    )));
+                }
+                let compact = crate::laya_loss::td_lambda_targets(
+                    &prev.data,
+                    &t.data,
+                    batch,
+                    spec.max_options,
+                    spec.td_lambda,
+                )
+                .map_err(Error::InvalidConfig)?;
+                let sigma = if spec.rlcd {
+                    let max_batches = network.net.max_batches.max(1) as f32;
+                    let frac = (iteration as f32 / max_batches).min(1.0);
+                    spec.sigma_start + (spec.sigma_end - spec.sigma_start) * frac
+                } else {
+                    0.0
+                };
+                let znorm = if spec.rlcd {
+                    Some(crate::laya_loss::gaussian_normals(
+                        spec.seed,
+                        iteration,
+                        spec.group.max(1) * batch * spec.max_options,
+                    ))
+                } else {
+                    None
+                };
+                let result = crate::laya_loss::laya_loss_compute(
+                    &prev.data,
+                    &compact,
+                    batch,
+                    spec.max_options,
+                    spec,
+                    sigma,
+                    znorm.as_deref(),
+                )
+                .map_err(Error::InvalidConfig)?;
+                // C++ `*l.cost = N * laya_loss_compute(...)`.
+                (Tensor::from_data(prev.shape, result.delta)?, result.loss * batch as f32)
             }
             other => {
                 return Err(Error::InvalidConfig(format!(

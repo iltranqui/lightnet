@@ -237,6 +237,32 @@ pub trait F32TensorOpsBackend {
         y: &Self::Tensor,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error>;
+    /// Sum equally-shaped inputs with per-feature/per-channel weights. `weights`
+    /// is `[input][channels]`; each input is scaled with `channel_stride` values
+    /// per weight before the results are added. Caller validates dimensions and
+    /// supplies already-normalized weights.
+    fn shortcut_weighted_sum_f32(
+        &self,
+        inputs: &[&Self::Tensor],
+        weights: &[f32],
+        channels: usize,
+        channel_stride: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let mut accumulated = None;
+        for (index, input) in inputs.iter().enumerate() {
+            let scale = self.upload_f32(
+                &[channels],
+                &weights[index * channels..(index + 1) * channels],
+            )?;
+            let weighted = self.channel_scale_f32(input, &scale, channels, channel_stride, config)?;
+            accumulated = Some(match accumulated {
+                Some(previous) => self.shortcut_add_f32(&previous, &weighted, config)?,
+                None => weighted,
+            });
+        }
+        Ok(accumulated.expect("weighted shortcut requires at least the layer input"))
+    }
     fn route_concat_f32(
         &self,
         inputs: &[&Self::Tensor],

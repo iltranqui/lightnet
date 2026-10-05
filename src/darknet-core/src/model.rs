@@ -397,6 +397,115 @@ pub struct LayaScorerSpec {
     pub ln_eps: f32,
 }
 
+/// `[laya_marker_gather]`: the LAYA per-option marker gather (Phase 1b),
+/// ported from
+/// `Jev_laya:src-lib/darknet_cfg.cpp::parse_laya_marker_gather_section`.  Two
+/// route-style inputs (`layers=idxA,idxB`), no weights; see
+/// `src/darknet-core/src/laya_marker_gather.rs` for the maths.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayaMarkerGatherSpec {
+    /// Exactly two source layers: `[0]` hidden-state (input A), `[1]` marker
+    /// info (input B).  Raw cfg indices; negative values resolve relative to
+    /// this layer at shape-inference time.
+    pub layers: [isize; 2],
+    /// Must equal input A's channel count.
+    pub hidden: usize,
+    /// Number of option slots; input B needs `>= 2 * max_options` channels.
+    pub max_options: usize,
+}
+
+/// `[laya_act_head]`: the LAYA act/escalate head (Phase 1b), ported from
+/// `Jev_laya:src-lib/darknet_cfg.cpp::parse_laya_act_head_section`.  Three
+/// route-style inputs (`layers=head,scorer,marker`); a small frozen MLP over
+/// masked-softmax summary features.  See
+/// `src/darknet-core/src/laya_act_head.rs` for the maths and blob order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayaActHeadSpec {
+    /// Exactly three source layers: `[head, scorer, marker]`.
+    pub layers: [isize; 3],
+    /// Must equal the head source's channel count.
+    pub hidden: usize,
+    /// Number of option slots (`>= 2`); must equal the scorer's width.
+    pub max_options: usize,
+    /// Hidden width of the act head's single hidden layer.
+    pub fc_dim: usize,
+    /// Number of act logits produced.
+    pub n_act: usize,
+}
+
+/// `[laya_loss]`: the LAYA masked soft-target loss over the scorer's K option
+/// logits (Phase 1b), ported from
+/// `Jev_laya:src-lib/darknet_cfg.cpp::parse_laya_loss_section`.  See
+/// `src/darknet-core/src/laya_loss.rs` for the maths.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayaLossSpec {
+    /// Number of option logits (must equal the input's per-sample size).
+    pub max_options: usize,
+    /// `mode=rlcd` (true) vs `mode=ce` (false).
+    pub rlcd: bool,
+    /// RLCD sample group size `G`.
+    pub group: usize,
+    pub sigma_start: f32,
+    pub sigma_end: f32,
+    pub w_sph: f32,
+    pub w_rps: f32,
+    pub w_ce: f32,
+    pub log_floor: f32,
+    pub seed: u64,
+    /// `>= 0` enables TD(lambda) episode targets.
+    pub td_lambda: f32,
+}
+
+/// `[laya_encoder]`: the frozen LAYA ModernBERT-large encoder (Phase 4),
+/// ported from `Jev_laya:src-lib/darknet_cfg.cpp::parse_laya_encoder_section`.
+/// Input is `[batch, 2, 1, seq_len]` (token id + attention mask); see
+/// `src/darknet-core/src/laya_encoder.rs` for the maths and blob order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayaEncoderSpec {
+    pub hidden: usize,
+    pub heads: usize,
+    pub n_layers: usize,
+    pub intermediate: usize,
+    pub vocab: usize,
+    pub ln_eps: f32,
+    pub local_window: usize,
+    pub rope_theta_full: f32,
+    pub rope_theta_local: f32,
+}
+
+/// `[laya_head]`: the frozen LAYA decision head (Phase 4), two plain pre-norm
+/// TransformerEncoderLayers (bias, ReLU FFN) over the encoder hidden states
+/// plus a per-question-type embedding.  See
+/// `src/darknet-core/src/laya_head.rs`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayaHeadSpec {
+    pub hidden: usize,
+    pub heads: usize,
+    pub n_layers: usize,
+    pub ffn_dim: usize,
+    pub ln_eps: f32,
+    /// `0..=2`, or `-1` for a per-sample qtype input channel.
+    pub qtype: i32,
+}
+
+/// `[vit]`: a global vision-transformer block from `Jev_laya`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VitSpec {
+    pub dim: usize,
+    pub patch_size: usize,
+    pub patch_stride: usize,
+    pub patch_pad: usize,
+    pub heads: usize,
+    pub ffn_ratio: usize,
+    pub mlp_dim: usize,
+    pub learned_pos_embed: bool,
+    pub pos_init_zero: bool,
+    pub activation: Activation,
+    pub msa_enabled: bool,
+    pub msa_block_size: usize,
+    pub msa_topk: usize,
+}
+
 /// `[yolox]`: the anchor-free detection head (Phase 2A of `tasks/rust/layers.md`),
 /// ported from `Jev_laya:src-lib/darknet_cfg.cpp::parse_yolox_section`.  The
 /// layer has no weights and no kernels; see
@@ -892,6 +1001,19 @@ pub enum LayerKind {
     CenterNet(CenterNetSpec),
     /// `[laya_scorer]`, whose weights live in its own blob type.
     LayaScorer(LayaScorerSpec),
+    /// `[laya_marker_gather]`: two-input, weightless per-option gather.
+    LayaMarkerGather(LayaMarkerGatherSpec),
+    /// `[laya_act_head]`: three-input act/escalate head over masked-softmax
+    /// summary features.
+    LayaActHead(LayaActHeadSpec),
+    /// `[laya_loss]`: masked soft-target loss (CE or RLCD) over option logits.
+    LayaLoss(LayaLossSpec),
+    /// `[laya_encoder]`: frozen LAYA ModernBERT-large encoder.
+    LayaEncoder(LayaEncoderSpec),
+    /// `[laya_head]`: frozen LAYA decision head.
+    LayaHead(LayaHeadSpec),
+    /// `[vit]`: global vision transformer with learned patch projection.
+    Vit(VitSpec),
     /// `[moe_convolutional]`: a learned mixture of `MoeSpec::experts`
     /// convolutional experts gated per image by a small router.
     Moe(MoeSpec),
@@ -940,6 +1062,12 @@ impl LayerKind {
             Self::Yolonas(_) => "yolonas",
             Self::CenterNet(_) => "centernet",
             Self::LayaScorer(_) => "laya_scorer",
+            Self::LayaMarkerGather(_) => "laya_marker_gather",
+            Self::LayaActHead(_) => "laya_act_head",
+            Self::LayaLoss(_) => "laya_loss",
+            Self::LayaEncoder(_) => "laya_encoder",
+            Self::LayaHead(_) => "laya_head",
+            Self::Vit(_) => "vit",
             Self::Moe(_) => "moe_convolutional",
             Self::Rnn(_) => "rnn",
             Self::Gru(_) => "gru",
@@ -965,6 +1093,7 @@ impl LayerKind {
             Self::Local(spec) => Some(&spec.activation),
             Self::Rnn(spec) => Some(&spec.activation),
             Self::Crnn(spec) => Some(&spec.activation),
+            Self::Vit(spec) => Some(&spec.activation),
             _ => None,
         }
     }
@@ -977,16 +1106,18 @@ pub enum WeightsArray {
     RollingMean,
     RollingVariance,
     Weights,
+    Named(String),
 }
 
 impl WeightsArray {
-    pub fn name(&self) -> &'static str {
+    pub fn name(&self) -> &str {
         match self {
             Self::Biases => "biases",
             Self::Scales => "scales",
             Self::RollingMean => "rolling_mean",
             Self::RollingVariance => "rolling_variance",
             Self::Weights => "weights",
+            Self::Named(name) => name,
         }
     }
 }
@@ -1283,6 +1414,36 @@ impl Layer {
                         layer_outputs,
                         spec.batch_normalize,
                     );
+                }
+                Some(LayerWeights { entries })
+            }
+            LayerKind::Vit(spec) => {
+                let dim = spec.dim;
+                let patch_dim = spec.patch_size * spec.patch_size * self.input_shape.channels;
+                let tokens = self.output_shape.width * self.output_shape.height;
+                let mut entries = Vec::with_capacity(16);
+                for (name, len) in [
+                    ("vit_patch_embed", dim * patch_dim),
+                    ("vit_patch_bias", dim),
+                    ("biases", 3 * dim),
+                    ("vit_ln1_gamma", dim),
+                    ("vit_ln1_beta", dim),
+                    ("weights", 3 * dim * dim),
+                    ("vit_wo", dim * dim),
+                    ("vit_wo_bias", dim),
+                    ("vit_ln2_gamma", dim),
+                    ("vit_ln2_beta", dim),
+                    ("vit_ffn_w1", spec.mlp_dim * dim),
+                    ("vit_ffn_b1", spec.mlp_dim),
+                    ("vit_ffn_w2", dim * spec.mlp_dim),
+                    ("vit_ffn_b2", dim),
+                    ("vit_pos_embed", tokens * dim),
+                    ("scales", 12),
+                ] {
+                    entries.push(WeightsEntry {
+                        array: WeightsArray::Named(name.to_owned()),
+                        len,
+                    });
                 }
                 Some(LayerWeights { entries })
             }
@@ -2084,6 +2245,120 @@ fn parse_layer_kind(
                 ModernYoloKind::Yolonas => LayerKind::Yolonas(spec),
             }
         }
+        "vit" => {
+            let line = section.line;
+            for unsupported in [
+                "flash_attention", "flash_attn", "vc_attention", "vc",
+                "vc_expcast", "expcast", "vc_perm",
+            ] {
+                if section.get(unsupported).is_some() {
+                    return Err(Error::InvalidConfig(format!(
+                        "[vit] at line {line}: {unsupported} is not supported by the Rust reference path yet"
+                    )));
+                }
+            }
+            let has_filters = section.get("filters").is_some();
+            let has_dim = section.get("dim").is_some();
+            let filters = section.get_usize("filters", VIT_DIM_DEFAULT)?;
+            let dim = section.get_usize("dim", filters)?;
+            if has_filters && has_dim && filters != dim {
+                return Err(Error::InvalidConfig(format!(
+                    "[vit] at line {line} has conflicting filters={filters} and dim={dim}; use one embedding width"
+                )));
+            }
+            let dim = if has_dim { dim } else { filters };
+            let patch_size = section.get_usize("patch_size", 1)?;
+            let patch_stride = section.get_usize("patch_stride", patch_size)?;
+            let patch_pad = section.get_usize("patch_pad", 0)?;
+            let heads = section.get_usize("heads", VIT_HEADS_DEFAULT)?;
+            let has_ratio = section.get("ffn_ratio").is_some();
+            let has_mlp = section.get("mlp_dim").is_some();
+            let ffn_ratio = section.get_usize("ffn_ratio", 4)?;
+            let ratio_mlp = dim
+                .checked_mul(ffn_ratio)
+                .ok_or_else(|| Error::InvalidConfig(format!("[vit] at line {line}: dim * ffn_ratio overflows")))?;
+            let mlp_dim = section.get_usize("mlp_dim", ratio_mlp)?;
+            if has_ratio && has_mlp && mlp_dim != ratio_mlp {
+                return Err(Error::InvalidConfig(format!(
+                    "[vit] at line {line} has conflicting ffn_ratio={ffn_ratio} and mlp_dim={mlp_dim} for dim={dim}"
+                )));
+            }
+            if dim == 0 || heads == 0 || dim % heads != 0 || patch_size == 0 || patch_stride == 0 || mlp_dim == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[vit] at line {line}: dim={dim}, heads={heads}, patch_size={patch_size}, patch_stride={patch_stride}, mlp_dim={mlp_dim} invalid"
+                )));
+            }
+            let twice_pad = patch_pad.checked_mul(2).ok_or_else(|| {
+                Error::InvalidConfig(format!("[vit] at line {line}: patch padding overflows"))
+            })?;
+            let effective_h = current
+                .height
+                .checked_add(twice_pad)
+                .and_then(|v| v.checked_sub(patch_size))
+                .ok_or_else(|| Error::InvalidConfig(format!("[vit] at line {line}: input height is too small for the patch")))?;
+            let effective_w = current
+                .width
+                .checked_add(twice_pad)
+                .and_then(|v| v.checked_sub(patch_size))
+                .ok_or_else(|| Error::InvalidConfig(format!("[vit] at line {line}: input width is too small for the patch")))?;
+            if effective_h % patch_stride != 0 || effective_w % patch_stride != 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[vit] at line {line}: effective patch extents {effective_w}x{effective_h} must be divisible by patch_stride={patch_stride}"
+                )));
+            }
+            let pos_embed = section.get_str("pos_embed", "learned").to_ascii_lowercase();
+            let learned_pos_embed = match pos_embed.as_str() {
+                "learned" | "absolute" => true,
+                "sinusoidal" | "2d_sinusoidal" | "simple" => false,
+                _ => return Err(Error::InvalidConfig(format!(
+                    "[vit] at line {line}: pos_embed={pos_embed} must be learned or sinusoidal"
+                ))),
+            };
+            let pos_init = section.get_str("pos_init", "random").to_ascii_lowercase();
+            let pos_init_zero = match pos_init.as_str() {
+                "random" | "small_random" => false,
+                "zero" | "zeros" => true,
+                _ => return Err(Error::InvalidConfig(format!(
+                    "[vit] at line {line}: pos_init={pos_init} must be random or zero"
+                ))),
+            };
+            let activation = Activation::parse(&section.get_str("activation", "gelu"));
+            if let Activation::Other(ref other) = activation {
+                return Err(Error::InvalidConfig(format!(
+                    "[vit] at line {line}: unsupported activation={other}"
+                )));
+            }
+            let msa_enabled = if section.get("msa").is_some() {
+                section.get_bool_int("msa", false)?
+            } else {
+                section.get_bool_int("minimax_sparse_attention", false)?
+            };
+            let msa_block_size = if section.get("msa_block").is_some() {
+                section.get_usize("msa_block", 16)?
+            } else {
+                section.get_usize("msa_block_size", 16)?
+            }.max(1);
+            let msa_topk = if section.get("msa_topk").is_some() {
+                section.get_usize("msa_topk", 4)?
+            } else {
+                section.get_usize("msa_top_blocks", 4)?
+            }.max(1);
+            LayerKind::Vit(VitSpec {
+                dim,
+                patch_size,
+                patch_stride,
+                patch_pad,
+                heads,
+                ffn_ratio,
+                mlp_dim,
+                learned_pos_embed,
+                pos_init_zero,
+                activation,
+                msa_enabled,
+                msa_block_size,
+                msa_topk,
+            })
+        }
         "laya_scorer" => {
             // C++ `parse_laya_scorer_section`: the layer is constructed for
             // `max_options x hidden` and checks the incoming shape against it,
@@ -2113,6 +2388,180 @@ fn parse_layer_kind(
                 hidden,
                 max_options,
                 ln_eps: section.get_f32("ln_eps", crate::laya_scorer::LAYA_LAYERNORM_EPS)?,
+            })
+        }
+        "laya_marker_gather" => {
+            // C++ `parse_laya_marker_gather_section`: exactly two sources via
+            // `layers=idxA,idxB` (route's negative-index convention), `hidden`
+            // (default 1024) and `max_options` (default 4).  The shape checks
+            // against input A/B live in `infer_shape`, where the sources are
+            // known.
+            let line = section.line;
+            let layers = section.get_isize_list("layers")?;
+            let layers: [isize; 2] = layers.try_into().map_err(|_| {
+                Error::InvalidConfig(format!(
+                    "[laya_marker_gather] at line {line} requires exactly 2 input layers via layers=idxA,idxB (hidden-state, marker-info)"
+                ))
+            })?;
+            let hidden = section.get_usize("hidden", LAYA_MARKER_GATHER_HIDDEN)?;
+            if hidden == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_marker_gather] at line {line}: hidden must be > 0"
+                )));
+            }
+            let max_options = section.get_usize("max_options", 4)?;
+            if max_options == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_marker_gather] at line {line}: max_options must be > 0"
+                )));
+            }
+            LayerKind::LayaMarkerGather(LayaMarkerGatherSpec {
+                layers,
+                hidden,
+                max_options,
+            })
+        }
+        "laya_act_head" => {
+            // C++ `parse_laya_act_head_section`: three route-style sources
+            // `layers=head,scorer,marker`, plus hidden/max_options/fc_dim/n_act.
+            // The cross-input shape checks live in `infer_shape`.
+            let line = section.line;
+            let layers = section.get_isize_list("layers")?;
+            let layers: [isize; 3] = layers.try_into().map_err(|_| {
+                Error::InvalidConfig(format!(
+                    "[laya_act_head] at line {line} requires exactly 3 input layers via layers=head,scorer,marker"
+                ))
+            })?;
+            let hidden = section.get_usize("hidden", LAYA_HEAD_HIDDEN)?;
+            let max_options = section.get_usize("max_options", 4)?;
+            let fc_dim = section.get_usize("fc_dim", crate::laya_act_head::LAYA_ACT_HEAD_FC_DIM)?;
+            let n_act = section.get_usize("n_act", crate::laya_act_head::LAYA_ACT_HEAD_N_ACT)?;
+            if hidden == 0 || max_options < 2 || fc_dim == 0 || n_act == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_act_head] at line {line}: hidden={hidden} max_options={max_options} (>=2) fc_dim={fc_dim} n_act={n_act} invalid"
+                )));
+            }
+            LayerKind::LayaActHead(LayaActHeadSpec {
+                layers,
+                hidden,
+                max_options,
+                fc_dim,
+                n_act,
+            })
+        }
+        "laya_loss" => {
+            // C++ `parse_laya_loss_section`: `max_options` defaults to the input
+            // count, `mode` is `ce` (default) or `rlcd`.
+            let line = section.line;
+            let per_sample = current.width * current.height * current.channels;
+            let max_options = section.get_usize("max_options", per_sample)?;
+            let mode = section.get_str("mode", "ce");
+            let rlcd = match mode.trim().to_ascii_lowercase().as_str() {
+                "ce" => false,
+                "rlcd" => true,
+                other => {
+                    return Err(Error::InvalidConfig(format!(
+                        "[laya_loss] at line {line}: mode={other} must be ce or rlcd"
+                    )))
+                }
+            };
+            if per_sample != max_options {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_loss] at line {line}: input has {per_sample} values, expected max_options={max_options}"
+                )));
+            }
+            LayerKind::LayaLoss(LayaLossSpec {
+                max_options,
+                rlcd,
+                group: section.get_usize("group", 4)?,
+                sigma_start: section.get_f32("sigma_start", 0.4)?,
+                sigma_end: section.get_f32("sigma_end", 0.1)?,
+                w_sph: section.get_f32("w_sph", 0.75)?,
+                w_rps: section.get_f32("w_rps", 1.0)?,
+                w_ce: section.get_f32("w_ce", 1.0)?,
+                log_floor: section.get_f32("log_floor", -9.21)?,
+                seed: section.get_usize("seed", 1234)? as u64,
+                td_lambda: section.get_f32("td_lambda", -1.0)?,
+            })
+        }
+        "laya_encoder" => {
+            // C++ `parse_laya_encoder_section`: requires channels=2, height=1.
+            let line = section.line;
+            if current.channels != 2 || current.height != 1 {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_encoder] at line {line} requires channels=2 and height=1 (token id + attention mask), got c={} h={}",
+                    current.channels, current.height
+                )));
+            }
+            let hidden = section.get_usize("hidden", LAYA_ENCODER_HIDDEN)?;
+            let heads = section.get_usize("heads", LAYA_ENCODER_HEADS)?;
+            let n_layers = section.get_usize("layers", LAYA_ENCODER_LAYERS)?;
+            let intermediate = section.get_usize("intermediate", LAYA_ENCODER_INTERMEDIATE)?;
+            let vocab = section.get_usize("vocab", LAYA_ENCODER_VOCAB)?;
+            if hidden == 0 || heads == 0 || hidden % heads != 0 || (hidden / heads) % 2 != 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_encoder] at line {line}: hidden={hidden} must be divisible by heads={heads} with an even head_dim"
+                )));
+            }
+            if n_layers == 0 || intermediate == 0 || vocab == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_encoder] at line {line}: layers={n_layers} intermediate={intermediate} vocab={vocab} must all be >= 1"
+                )));
+            }
+            LayerKind::LayaEncoder(LayaEncoderSpec {
+                hidden,
+                heads,
+                n_layers,
+                intermediate,
+                vocab,
+                ln_eps: section.get_f32("ln_eps", LAYA_LAYERNORM_EPS)?,
+                local_window: section.get_usize("local_window", LAYA_ENCODER_LOCAL_WINDOW)?,
+                rope_theta_full: section
+                    .get_f32("rope_theta_full", LAYA_ENCODER_ROPE_THETA_FULL)?,
+                rope_theta_local: section
+                    .get_f32("rope_theta_local", LAYA_ENCODER_ROPE_THETA_LOCAL)?,
+            })
+        }
+        "laya_head" => {
+            // C++ `parse_laya_head_section`: channels = hidden + mask (+ qtype
+            // channel when qtype=-1); height=1.
+            let line = section.line;
+            if current.height != 1 {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_head] at line {line} requires height=1, got h={}",
+                    current.height
+                )));
+            }
+            let hidden = section.get_usize("hidden", LAYA_HEAD_HIDDEN)?;
+            let heads = section.get_usize("heads", LAYA_HEAD_HEADS)?;
+            let n_layers = section.get_usize("layers", LAYA_HEAD_LAYERS)?;
+            let ffn_dim = section.get_usize("ffn_dim", LAYA_HEAD_FFN_DIM)?;
+            let qtype = section.get_isize("qtype", 0)?;
+            if !(-1..=2).contains(&qtype) {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_head] at line {line}: qtype={qtype} must be in [0,2], or -1"
+                )));
+            }
+            if hidden == 0 || heads == 0 || hidden % heads != 0 || n_layers == 0 || ffn_dim == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_head] at line {line}: hidden={hidden} heads={heads} layers={n_layers} ffn_dim={ffn_dim} invalid"
+                )));
+            }
+            let expected_c = hidden + if qtype < 0 { 2 } else { 1 };
+            if current.channels != expected_c {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_head] at line {line} requires channels={expected_c} (hidden + mask{}), got c={}",
+                    if qtype < 0 { " + qtype" } else { "" },
+                    current.channels
+                )));
+            }
+            LayerKind::LayaHead(LayaHeadSpec {
+                hidden,
+                heads,
+                n_layers,
+                ffn_dim,
+                ln_eps: section.get_f32("ln_eps", LAYA_LAYERNORM_EPS)?,
+                qtype: qtype as i32,
             })
         }
         "contrastive" => LayerKind::Contrastive(ContrastiveSpec {
@@ -2371,7 +2820,60 @@ fn infer_output_shape(
         | LayerKind::Segmentation(_)
         | LayerKind::OmdLoss(_)
         | LayerKind::Dropout { .. }
-        | LayerKind::Contrastive(_) => Ok(current),
+        | LayerKind::Contrastive(_)
+        | LayerKind::LayaLoss(_) => Ok(current),
+        // `[laya_encoder]` turns `[batch, 2, 1, T]` into `[batch, hidden, 1, T]`.
+        LayerKind::LayaEncoder(spec) => {
+            if current.channels != 2 || current.height != 1 {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_encoder] layer #{layer_index} requires channels=2 and height=1, got c={} h={}",
+                    current.channels, current.height
+                )));
+            }
+            if current.width == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_encoder] layer #{layer_index} requires seq_len > 0"
+                )));
+            }
+            Ok(TensorShape::new(current.width, 1, spec.hidden, current.batch))
+        }
+        // `[laya_head]` is a pre-norm transformer over `[batch, hidden+mask, 1, T]`.
+        LayerKind::LayaHead(spec) => {
+            let expected_c = spec.hidden + if spec.qtype < 0 { 2 } else { 1 };
+            if current.channels != expected_c || current.height != 1 {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_head] layer #{layer_index} requires channels={expected_c} and height=1, got c={} h={}",
+                    current.channels, current.height
+                )));
+            }
+            if current.width == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_head] layer #{layer_index} requires seq_len > 0"
+                )));
+            }
+            Ok(TensorShape::new(current.width, 1, spec.hidden, current.batch))
+        }
+        LayerKind::Vit(spec) => {
+            let line = layer_index;
+            let twice_pad = spec.patch_pad.checked_mul(2).ok_or_else(|| {
+                Error::InvalidConfig(format!("[vit] layer #{line}: patch padding overflows"))
+            })?;
+            let eff_h = current.height.checked_add(twice_pad)
+                .and_then(|v| v.checked_sub(spec.patch_size))
+                .ok_or_else(|| Error::InvalidConfig(format!("[vit] layer #{line}: invalid patch height geometry")))?;
+            let eff_w = current.width.checked_add(twice_pad)
+                .and_then(|v| v.checked_sub(spec.patch_size))
+                .ok_or_else(|| Error::InvalidConfig(format!("[vit] layer #{line}: invalid patch width geometry")))?;
+            if spec.patch_stride == 0 || eff_h % spec.patch_stride != 0 || eff_w % spec.patch_stride != 0 {
+                return Err(Error::InvalidConfig(format!("[vit] layer #{line}: patch geometry is not divisible by patch_stride={}", spec.patch_stride)));
+            }
+            Ok(TensorShape::new(
+                eff_w / spec.patch_stride + 1,
+                eff_h / spec.patch_stride + 1,
+                spec.dim,
+                current.batch,
+            ))
+        }
         | LayerKind::Yolox(_)
         | LayerKind::Ppyoloe(_)
         | LayerKind::Yolonas(_) => Ok(current),
@@ -2379,6 +2881,94 @@ fn infer_output_shape(
         // `[laya_scorer]` turns `[batch, hidden, 1, max_options]` into
         // `[batch, 1, 1, max_options]`.
         LayerKind::LayaScorer(spec) => Ok(TensorShape::new(spec.max_options, 1, 1, current.batch)),
+        // `[laya_marker_gather]` gathers one hidden-state column per option, so
+        // it needs both source shapes (route-style).
+        LayerKind::LayaMarkerGather(spec) => {
+            let a_index = resolve_relative_layer(layer_index, spec.layers[0])?;
+            let b_index = resolve_relative_layer(layer_index, spec.layers[1])?;
+            let a = built_layers
+                .get(a_index)
+                .ok_or(Error::InvalidRoute {
+                    layer_index,
+                    reference: spec.layers[0],
+                })?
+                .output_shape;
+            let b = built_layers
+                .get(b_index)
+                .ok_or(Error::InvalidRoute {
+                    layer_index,
+                    reference: spec.layers[1],
+                })?
+                .output_shape;
+            if a.channels != spec.hidden {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_marker_gather] layer #{layer_index}: input A (layer #{a_index}) has {} channels, expected hidden={}",
+                    a.channels, spec.hidden
+                )));
+            }
+            if b.channels < 2 * spec.max_options {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_marker_gather] layer #{layer_index}: input B (layer #{b_index}) has {} channels, needs >= 2*max_options={}",
+                    b.channels,
+                    2 * spec.max_options
+                )));
+            }
+            if a.width != b.width {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_marker_gather] layer #{layer_index}: input A/B sequence lengths differ ({} vs {})",
+                    a.width, b.width
+                )));
+            }
+            if a.width == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_marker_gather] layer #{layer_index}: input A sequence length must be > 0"
+                )));
+            }
+            Ok(TensorShape::new(spec.max_options, 1, spec.hidden, current.batch))
+        }
+        // `[laya_act_head]` reads three source shapes and emits `n_act` logits.
+        LayerKind::LayaActHead(spec) => {
+            let head_index = resolve_relative_layer(layer_index, spec.layers[0])?;
+            let scorer_index = resolve_relative_layer(layer_index, spec.layers[1])?;
+            let marker_index = resolve_relative_layer(layer_index, spec.layers[2])?;
+            let lookup = |index: usize, raw: isize| -> Result<TensorShape> {
+                Ok(built_layers
+                    .get(index)
+                    .ok_or(Error::InvalidRoute {
+                        layer_index,
+                        reference: raw,
+                    })?
+                    .output_shape)
+            };
+            let head = lookup(head_index, spec.layers[0])?;
+            let scorer = lookup(scorer_index, spec.layers[1])?;
+            let marker = lookup(marker_index, spec.layers[2])?;
+            if head.channels != spec.hidden {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_act_head] layer #{layer_index}: head input (layer #{head_index}) has {} channels, expected hidden={}",
+                    head.channels, spec.hidden
+                )));
+            }
+            if scorer.channels != 1 || scorer.width != spec.max_options {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_act_head] layer #{layer_index}: scorer input (layer #{scorer_index}) must be 1 x {} logits, got c={} w={}",
+                    spec.max_options, scorer.channels, scorer.width
+                )));
+            }
+            if marker.channels != 2 * spec.max_options {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_act_head] layer #{layer_index}: marker input (layer #{marker_index}) has {} channels, expected 2*max_options={}",
+                    marker.channels,
+                    2 * spec.max_options
+                )));
+            }
+            if head.width == 0 || marker.width == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_act_head] layer #{layer_index}: head/marker sequence lengths must be > 0"
+                )));
+            }
+            Ok(TensorShape::new(1, 1, spec.n_act, current.batch))
+        }
         LayerKind::ChannelSlice(spec) => {
             let source_index = resolve_relative_layer(layer_index, spec.from)?;
             let source = built_layers
@@ -2656,6 +3246,30 @@ fn conv_dim(input: usize, padding: usize, size: usize, stride: usize) -> usize {
 /// C++ `LAYA_SCORER_HIDDEN`, the default `hidden` of `[laya_scorer]`.
 pub const LAYA_SCORER_HIDDEN: usize = 1024;
 
+/// C++ `LAYA_MARKER_GATHER_HIDDEN`, the default `hidden` of
+/// `[laya_marker_gather]`.
+pub const LAYA_MARKER_GATHER_HIDDEN: usize = 1024;
+
+/// C++ `LAYA_HEAD_HIDDEN`, the default `hidden` of `[laya_act_head]` (and the
+/// LAYA head's own hidden width).
+pub const LAYA_HEAD_HIDDEN: usize = 1024;
+
+/// C++ `LAYA_ENCODER_*` defaults.
+pub const LAYA_ENCODER_HIDDEN: usize = 1024;
+pub const LAYA_ENCODER_HEADS: usize = 16;
+pub const LAYA_ENCODER_LAYERS: usize = 28;
+pub const LAYA_ENCODER_INTERMEDIATE: usize = 2624;
+pub const LAYA_ENCODER_VOCAB: usize = 50368;
+pub const LAYA_ENCODER_LOCAL_WINDOW: usize = 128;
+pub const LAYA_ENCODER_ROPE_THETA_FULL: f32 = 160000.0;
+pub const LAYA_ENCODER_ROPE_THETA_LOCAL: f32 = 10000.0;
+pub const LAYA_HEAD_HEADS: usize = 16;
+pub const LAYA_HEAD_LAYERS: usize = 2;
+pub const LAYA_HEAD_FFN_DIM: usize = 4096;
+pub const VIT_DIM_DEFAULT: usize = 128;
+pub const VIT_HEADS_DEFAULT: usize = 4;
+pub const LAYA_LAYERNORM_EPS: f32 = 1.0e-5;
+
 /// C++ `parse_yolox_section`: `classes`(20), `max`(200), `jitter`(0.2) and
 /// `resize`(1.0).  The PP-YOLOE / YOLO-NAS siblings share the first two keys and
 /// add `reg_max`(16); they are not ported yet.
@@ -2706,6 +3320,83 @@ mod tests {
 
     fn build(text: &str) -> crate::error::Result<Network> {
         Network::from_config(ConfigFile::parse_str("t.cfg", text)?)
+    }
+
+    #[test]
+    fn vit_parses_defaults_aliases_and_patch_grid_shape() {
+        let default = build(
+            "[net]\nwidth=8\nheight=6\nchannels=3\n\
+             [vit]\ndim=8\nheads=2\npatch_size=2\npatch_stride=2\n",
+        ).unwrap();
+        let LayerKind::Vit(spec) = &default.layers[0].kind else { panic!("expected Vit") };
+        assert_eq!((spec.dim, spec.mlp_dim, spec.ffn_ratio), (8, 32, 4));
+        assert!(spec.learned_pos_embed && !spec.pos_init_zero);
+        assert_eq!(spec.activation, super::Activation::Gelu);
+        let shape = default.layers[0].output_shape;
+        assert_eq!((shape.width, shape.height, shape.channels), (4, 3, 8));
+
+        let aliases = build(
+            "[net]\nwidth=8\nheight=6\nchannels=3\n\
+             [vit]\nfilters=8\ndim=8\nheads=2\npatch_size=2\npatch_stride=2\n\
+             ffn_ratio=3\nmlp_dim=24\npos_embed=simple\npos_init=zeros\nactivation=relu\n\
+             minimax_sparse_attention=1\nmsa_block_size=2\nmsa_top_blocks=1\n",
+        ).unwrap();
+        let LayerKind::Vit(spec) = &aliases.layers[0].kind else { panic!("expected Vit") };
+        assert_eq!((spec.dim, spec.mlp_dim, spec.ffn_ratio), (8, 24, 3));
+        assert!(!spec.learned_pos_embed && spec.pos_init_zero);
+        assert!(spec.msa_enabled);
+        assert_eq!((spec.msa_block_size, spec.msa_topk), (2, 1));
+        assert_eq!((aliases.layers[0].output_shape.width, aliases.layers[0].output_shape.height), (4, 3));
+    }
+
+    #[test]
+    fn vit_layer_weights_list_matches_the_cpp_writer_order() {
+        let net = build(
+            "[net]\nwidth=8\nheight=6\nchannels=3\n\
+             [vit]\ndim=8\nheads=2\npatch_size=2\npatch_stride=2\nmlp_dim=32\n",
+        ).unwrap();
+        let layer_weights = net.layers[0].weights().expect("vit has weights");
+        let names: Vec<&str> = layer_weights.entries.iter().map(|entry| entry.array.name()).collect();
+        assert_eq!(names, [
+            "vit_patch_embed", "vit_patch_bias", "biases", "vit_ln1_gamma", "vit_ln1_beta",
+            "weights", "vit_wo", "vit_wo_bias", "vit_ln2_gamma", "vit_ln2_beta",
+            "vit_ffn_w1", "vit_ffn_b1", "vit_ffn_w2", "vit_ffn_b2", "vit_pos_embed", "scales",
+        ]);
+        assert_eq!(layer_weights.entries.iter().map(|entry| entry.len).collect::<Vec<_>>(), [
+            96, 8, 24, 8, 8, 192, 64, 8, 8, 8, 256, 32, 256, 8, 96, 12,
+        ]);
+        assert_eq!(layer_weights.parameter_count(), crate::vit::vit_blob_float_count(
+            &crate::vit::VitGeometry {
+                batch: 1, channels: 3, height: 6, width: 8, patch_size: 2, patch_stride: 2,
+                patch_pad: 0, hidden: 8, heads: 2, mlp_dim: 32, ln_eps: 1e-5,
+                activation: super::Activation::Gelu, learned_pos_embed: true, pos_init_zero: false, msa: None,
+            }, 3, 4, true
+        ).unwrap());
+    }
+
+    #[test]
+    fn vit_rejects_conflicts_invalid_geometry_and_unknown_options() {
+        let cfg = |layer: &str| format!("[net]\nwidth=8\nheight=6\nchannels=3\n[vit]\n{layer}\n");
+        for invalid in [
+            "filters=8\ndim=16",
+            "dim=8\nheads=3",
+            "dim=8\nheads=2\nffn_ratio=2\nmlp_dim=12",
+            "dim=8\nheads=2\npatch_size=0",
+            "dim=8\nheads=2\npatch_size=3\npatch_stride=2",
+            "dim=8\nheads=2\npos_embed=rotary",
+            "dim=8\nheads=2\npos_init=ones",
+            "dim=8\nheads=2\nactivation=unknown_vit_act",
+            "dim=8\nheads=2\nflash_attention=1",
+            "dim=8\nheads=2\nflash_attn=1",
+            "dim=8\nheads=2\nvc_attention=1",
+            "dim=8\nheads=2\nvc=1",
+            "dim=8\nheads=2\nvc_expcast=2",
+            "dim=8\nheads=2\nexpcast=2",
+            "dim=8\nheads=2\nvc_perm=spatial",
+        ] {
+            let err = build(&cfg(invalid)).expect_err(invalid).to_string();
+            assert!(err.contains("vit") || err.contains("activation"), "{invalid}: {err}");
+        }
     }
 
     #[test]
