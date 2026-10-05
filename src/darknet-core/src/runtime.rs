@@ -4248,8 +4248,8 @@ where
         Ok(())
     }
 
-    /// Adam step for host-resident connected, local, batchnorm, and recurrent
-    /// params. Device convolutions are handled by the main loop; unsupported
+    /// Adam step for host-resident parameters, including recurrent and MoE
+    /// sub-blocks. Device convolutions are handled by the main loop; unsupported
     /// host parameter families are rejected.
     fn update_cpu_fallback_adam(&mut self, adam: &AdamParams) -> Result<()> {
         let iteration_num = self.train_iteration as i64 + 1;
@@ -4266,6 +4266,11 @@ where
             if !layer.train.updates_at(iteration_num, burn_in) {
                 continue;
             }
+            let layer_adam = AdamParams {
+                lr: adam.lr * layer.train.learning_rate_scale,
+                ..*adam
+            };
+            let adam = &layer_adam;
             match (&mut self.params[index], &mut buffers[index]) {
                 (LayerParams::BatchNorm(params), LayerTrainBuffers::BatchNorm(train)) => {
                     let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
@@ -21445,7 +21450,7 @@ mod tests {
         let network = Network::from_config(
             ConfigFile::parse_str(
                 "inline.cfg",
-                "[net]\ninputs=2\nbatch=1\nadam=1\nb1=0.8\nb2=0.95\neps=0.001\n[connected]\noutput=2\nactivation=linear\n[shortcut]\nfrom=-1\nweights_type=per_feature\nweights_normalization=none\nactivation=linear\n",
+                "[net]\ninputs=2\nbatch=1\nadam=1\nb1=0.8\nb2=0.95\neps=0.001\n[connected]\noutput=2\nactivation=linear\n[shortcut]\nfrom=-1\nweights_type=per_feature\nweights_normalization=none\nlearning_rate=0.5\nactivation=linear\n",
             )
             .expect("cfg"),
         )
@@ -21462,7 +21467,7 @@ mod tests {
         train.weight_updates.copy_from_slice(&[0.3, -0.1]);
         let updates = train.weight_updates.clone();
         let step = super::AdamParams {
-            lr: 0.01,
+            lr: 0.005,
             beta1: 0.8,
             beta2: 0.95,
             eps: 0.001,

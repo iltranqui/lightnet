@@ -49,8 +49,8 @@ Latest increments:
   backward remain.
 - Host Adam now updates standalone batchnorm, local, connected, weighted
   shortcut, MoE router/experts, deconvolutional, and GRU/RNN/LSTM/CRNN parameters
-  with distinct moment slots. Reference tests cover each family and MoE expert
-  cache reupload; ViT Adam remains unsupported.
+  with distinct moment slots and per-layer rate scaling. Reference tests cover
+  each family and MoE expert cache reupload; ViT Adam remains unsupported.
 - `[vit]` reference path: cfg/shape, C++-ordered header-aware weights, seeded init,
   CPU analytical forward/backward + SGD, and GPU f32 host fallback; 23 focused
   tests pass, targeted package check/build pass with `-j 4`.
