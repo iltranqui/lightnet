@@ -43,8 +43,10 @@ any more** — the remaining blockers are evidence gaps only.
 - **Phase 1b `omd_loss`** — `omd_loss.rs`, 14 tests.
 - **1b deferred (c) `contrastive`**, classifier branch — `contrastive.rs`,
   11 tests. The detection branch self-reports as unported.
-- **Phase 2A `yolox` + `ppyoloe` + `yolonas`** — `modern_yolo.rs`, 25 tests. The two
-  siblings are 76-line C++ wrappers over the same shared code.
+- **Phase 2A complete**: `yolox` + `ppyoloe` + `yolonas` (`modern_yolo.rs`, 27
+  tests; the two siblings are 76-line C++ wrappers over the same shared code),
+  `[centernet]` (`centernet.rs`, 13 tests), and the LegoGears nested-object fix
+  (per-slot `class_quality`, smallest-area-wins, `min_object_cells`).
 - **Phase 1b `[laya_scorer]`** — `laya_scorer.rs`, 14 tests, validated against the
   real `test_data/laya/laya_english.weights` blob (LayerNorm gamma mean 0.9045,
   beta rms 0.0425 - a wrong offset or blob order would be arbitrary).
@@ -97,11 +99,10 @@ believing a `cfg_corpus` failure.
    `[laya_encoder]` + `[laya_head]` (the shared-file offset is computed past
    their blobs), so those two come next even though the plan files them under
    Phase 4. They also need the Phase 3A prerequisite kernel set.
-2. Phase 2A remainder — `[centernet]` (`centernet_layer.cpp`, 857 LOC: focal
-   heatmap + wh + offsets, needs `classes + 4` filters), plus the LegoGears
-   nested-object fix (`class_quality`, smallest-area-wins, min-cell-size gate)
-   that lives in the same C++ file as the modern heads, plus the
-   `detect.rs` / `evaluate.rs` decode-and-mAP integration for all three.
+2. Phase 2A's last gap: the `detect.rs` / `evaluate.rs` decode-and-mAP
+   integration for the four modern heads (`decode.rs` only understands the yolo
+   head today), then `cfg/LegoGears_centernet.cfg` end to end. That also makes
+   the nested-object fix and `min_object_cells` observable on a real cfg.
 3. Phase 3A prerequisite (2) — the shared oxide op set: LayerNorm fwd/bwd,
    batched-GEMM wrapper, row-softmax backward, residual/bias epilogues. Build
    it **once**; `vit`, `swin`, `tucker`, `mambavision`, `kimi_kda`, `minimax` and

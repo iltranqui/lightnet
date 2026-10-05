@@ -57,7 +57,12 @@ pub fn compute_dense_training_loss_at(
         // their own output; their length checks live in their modules.
         if !matches!(
             layer.kind,
-            LayerKind::OmdLoss(_) | LayerKind::Contrastive(_) | LayerKind::Yolox(_)
+            LayerKind::OmdLoss(_)
+                | LayerKind::Contrastive(_)
+                | LayerKind::Yolox(_)
+                | LayerKind::Ppyoloe(_)
+                | LayerKind::Yolonas(_)
+                | LayerKind::CenterNet(_)
         ) && t.shape != layer.output_shape
         {
             return Err(Error::InvalidConfig(format!(
@@ -73,6 +78,41 @@ pub fn compute_dense_training_loss_at(
             LayerKind::Cost { kind, scale } => elementwise_cost(prev, t, kind, *scale),
             LayerKind::Regression(spec) => elementwise_cost(prev, t, "sse", spec.scale),
             LayerKind::Logistic => logistic_cost(&forward.layer_outputs[layer.index], t),
+            LayerKind::CenterNet(spec) => {
+                // `[centernet]`'s truth is `batch * max * truth_size`, and the
+                // head's pixel-space gates need the network size.
+                let layout = crate::centernet::CenterNetLayout::for_spec(
+                    layer.output_shape.batch,
+                    layer.output_shape.width,
+                    layer.output_shape.height,
+                    spec,
+                );
+                if forward.layer_outputs[layer.index].data.len() != layout.len() {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} ([centernet]) needs {} channels per cell but the output has {} entries",
+                        layer.index,
+                        layout.entries(),
+                        forward.layer_outputs[layer.index].data.len()
+                    )));
+                }
+                // `NetConfig` carries no class-multiplier or class-map fields
+                // yet, so those keep their `None` (C++ default) here.
+                let settings = crate::centernet::CenterNetSettings {
+                    truth_size: 6,
+                    net_width: network.net.width,
+                    net_height: network.net.height,
+                    ..crate::centernet::CenterNetSettings::default()
+                };
+                let (delta, cost, _positives) = crate::centernet::centernet_training_delta(
+                    &forward.layer_outputs[layer.index].data,
+                    &t.data,
+                    &layout,
+                    spec,
+                    &settings,
+                )
+                .map_err(|err| Error::InvalidConfig(err.0))?;
+                (Tensor::from_data(layer.output_shape, delta)?, cost)
+            }
             LayerKind::Yolox(spec) | LayerKind::Ppyoloe(spec) | LayerKind::Yolonas(spec) => {
                 // C++ reads the box truth `max_boxes * truth_size` per image.
                 let layout = crate::modern_yolo::ModernLayout::for_spec(

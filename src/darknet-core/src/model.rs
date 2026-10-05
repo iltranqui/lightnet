@@ -390,6 +390,15 @@ pub struct ModernYoloSpec {
     pub jitter: f32,
     /// Ground-truth resize factor used by the data loader.
     pub resize: f32,
+    /// Truths smaller than this in grid cells are skipped by the Task-Aligned
+    /// assignment.  `0` disables the gate (the C++ default).  It exists because
+    /// on a coarse head an object narrower than one cell would otherwise compete
+    /// for cells that belong to properly-scaled objects.
+    pub min_object_cells: f32,
+    /// Varifocal-loss exponent for the per-class targets.  `<= 0` (the default)
+    /// disables the VFL weighting; the nested-object fix's per-class targets are
+    /// applied either way.
+    pub vfl_gamma: f32,
 }
 
 /// `[contrastive]`: the supervised-contrastive head, classifier branch
@@ -409,6 +418,43 @@ pub struct ContrastiveSpec {
     pub max_delta: f32,
     /// Detection branch only: how many negative partners per positive.
     pub contrastive_neg_max: usize,
+}
+
+/// `[centernet]` (Phase 2A of `tasks/rust/layers.md`), ported from
+/// `Jev_laya:src-lib/darknet_cfg.cpp::parse_centernet_section`.  No weights and no
+/// kernels; see `src/darknet-core/src/centernet.rs` for the maths.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CenterNetSpec {
+    pub classes: usize,
+    /// Maximum truth rows per image.
+    pub max_boxes: usize,
+    pub jitter: f32,
+    pub resize: f32,
+    /// Minimum output-heatmap radius, in grid cells.
+    pub center_min_radius: i64,
+    /// 3x3 strict-maximum peak filter at decode time.
+    pub peak_nms: usize,
+    /// 1 = ellipse target, 0 = the original circular one.
+    pub anisotropic_gaussian: usize,
+    /// Legacy diagnostic cutoff in input pixels (no longer a hard boost).
+    pub small_threshold: f32,
+    /// Reference size for the continuous tiny-object multiplier.
+    pub small_ref_size: f32,
+    /// Cap on that multiplier.
+    pub small_boost: f32,
+    /// Optional FPN assignment gate on the largest object side, in pixels.
+    pub scale_min_px: f32,
+    pub scale_max_px: f32,
+    /// CenterNet radius overlap target.
+    pub gaussian_iou: f32,
+    /// Centre-heatmap focal-loss exponents.
+    pub focal_alpha: f32,
+    pub focal_beta: f32,
+    pub hm_normalizer: f32,
+    pub wh_normalizer: f32,
+    pub off_normalizer: f32,
+    pub max_delta: f32,
+    pub delta_normalizer: f32,
 }
 
 /// Which of the three anchor-free heads a `[yolox]` / `[ppyoloe]` /
@@ -817,6 +863,8 @@ pub enum LayerKind {
     Yolox(ModernYoloSpec),
     Ppyoloe(ModernYoloSpec),
     Yolonas(ModernYoloSpec),
+    /// `[centernet]`.
+    CenterNet(CenterNetSpec),
     /// `[laya_scorer]`, whose weights live in its own blob type.
     LayaScorer(LayaScorerSpec),
     Rnn(RnnSpec),
@@ -862,6 +910,7 @@ impl LayerKind {
             Self::Yolox(_) => "yolox",
             Self::Ppyoloe(_) => "ppyoloe",
             Self::Yolonas(_) => "yolonas",
+            Self::CenterNet(_) => "centernet",
             Self::LayaScorer(_) => "laya_scorer",
             Self::Rnn(_) => "rnn",
             Self::Gru(_) => "gru",
@@ -1939,6 +1988,39 @@ fn parse_layer_kind(
             from: section.get_isize("from", 0)?,
             activation: Activation::parse(&section.get_str("activation", "linear")),
         }),
+        "centernet" => {
+            let line = section.line;
+            let classes = section.get_usize("classes", 20)?;
+            if classes == 0 {
+                return Err(Error::InvalidConfig(format!("[centernet] at line {line}: classes must be > 0")));
+            }
+            let max_boxes = section.get_usize("max", 200)?;
+            if max_boxes == 0 {
+                return Err(Error::InvalidConfig(format!("[centernet] at line {line}: max must be > 0")));
+            }
+            LayerKind::CenterNet(CenterNetSpec {
+                classes,
+                max_boxes,
+                jitter: section.get_f32("jitter", 0.2)?,
+                resize: section.get_f32("resize", 1.0)?,
+                center_min_radius: section.get_isize("center_min_radius", 1)?.max(0) as i64,
+                peak_nms: section.get_usize("peak_nms", 1)?,
+                anisotropic_gaussian: section.get_usize("anisotropic_gaussian", 1)?,
+                small_threshold: section.get_f32("small_threshold", 8.0)?,
+                small_ref_size: section.get_f32("small_ref_size", 32.0)?,
+                small_boost: section.get_f32("small_boost", 8.0)?,
+                scale_min_px: section.get_f32("scale_min_px", 0.0)?,
+                scale_max_px: section.get_f32("scale_max_px", f32::MAX)?,
+                gaussian_iou: section.get_f32("gaussian_iou", 0.7)?,
+                focal_alpha: section.get_f32("focal_alpha", 2.0)?,
+                focal_beta: section.get_f32("focal_beta", 4.0)?,
+                hm_normalizer: section.get_f32("hm_normalizer", 1.0)?,
+                wh_normalizer: section.get_f32("wh_normalizer", 0.1)?,
+                off_normalizer: section.get_f32("off_normalizer", 1.0)?,
+                max_delta: section.get_f32("max_delta", 10.0)?,
+                delta_normalizer: section.get_f32("delta_normalizer", 1.0)?,
+            })
+        }
         "yolox" | "ppyoloe" | "yolonas" => {
             let spec = parse_modern_yolo_spec(&section)?;
             match spec.kind {
@@ -2173,6 +2255,7 @@ fn infer_output_shape(
         | LayerKind::Yolox(_)
         | LayerKind::Ppyoloe(_)
         | LayerKind::Yolonas(_) => Ok(current),
+        | LayerKind::CenterNet(_) => Ok(current),
         // `[laya_scorer]` turns `[batch, hidden, 1, max_options]` into
         // `[batch, 1, 1, max_options]`.
         LayerKind::LayaScorer(spec) => Ok(TensorShape::new(spec.max_options, 1, 1, current.batch)),
@@ -2475,6 +2558,8 @@ fn parse_modern_yolo_spec(section: &RawSection) -> Result<ModernYoloSpec> {
         reg_max: section.get_usize("reg_max", 16)?,
         jitter: section.get_f32("jitter", 0.2)?,
         resize: section.get_f32("resize", 1.0)?,
+        min_object_cells: section.get_f32("min_object_cells", 0.0)?,
+        vfl_gamma: section.get_f32("vfl_gamma", 0.0)?,
     })
 }
 
@@ -2489,7 +2574,7 @@ mod tests {
 
     use crate::cfg::ConfigFile;
 
-    use super::{LayerKind, LrPolicy, Network, SegmentationLoss};
+    use super::{LayerKind, LrPolicy, ModernYoloKind, Network, SegmentationLoss};
 
     fn build(text: &str) -> crate::error::Result<Network> {
         Network::from_config(ConfigFile::parse_str("t.cfg", text)?)
@@ -2724,6 +2809,71 @@ mod tests {
         assert!((s.jitter - 0.1).abs() < 1e-6 && (s.resize - 1.5).abs() < 1e-6);
         assert!(build(&format!("{base}[yolox]\nclasses=0\n")).is_err());
         assert!(build(&format!("{base}[yolox]\nmax=0\n")).is_err());
+    }
+
+    #[test]
+    fn centernet_keys_follow_cpp_defaults_and_validation() {
+        // C++ defaults: classes=20, max=200, center_min_radius=1, peak_nms=1,
+        // anisotropic_gaussian=1, small_threshold=8, small_ref_size=32,
+        // small_boost=8, scale_min_px=0, scale_max_px=FLT_MAX, gaussian_iou=0.7,
+        // focal_alpha=2, focal_beta=4, hm/wh/off_normalizer=1/0.1/1,
+        // max_delta=10, delta_normalizer=1.
+        let base = "[net]\nwidth=4\nheight=4\nchannels=3\n[convolutional]\nfilters=3\nsize=1\n";
+        let net = build(&format!("{base}[centernet]\n")).unwrap();
+        let LayerKind::CenterNet(s) = &net.layers[1].kind else { panic!() };
+        assert_eq!((s.classes, s.max_boxes), (20, 200));
+        assert_eq!((s.center_min_radius, s.peak_nms, s.anisotropic_gaussian), (1, 1, 1));
+        assert_eq!((s.small_threshold, s.small_ref_size, s.small_boost), (8.0, 32.0, 8.0));
+        assert_eq!((s.scale_min_px, s.scale_max_px), (0.0, f32::MAX));
+        assert_eq!((s.gaussian_iou, s.focal_alpha, s.focal_beta), (0.7, 2.0, 4.0));
+        assert_eq!((s.hm_normalizer, s.wh_normalizer, s.off_normalizer), (1.0, 0.1, 1.0));
+        assert_eq!((s.max_delta, s.delta_normalizer), (10.0, 1.0));
+        assert!(net.layers[1].weights().is_none(), "the head has no weights");
+        assert_eq!(net.layers[1].output_shape, net.layers[0].output_shape);
+
+        let net = build(&format!(
+            "{base}[centernet]\nclasses=3\nmax=64\ncenter_min_radius=2\npeak_nms=0\n\
+             anisotropic_gaussian=0\nsmall_ref_size=16\nsmall_boost=4\nscale_min_px=4\n\
+             scale_max_px=64\ngaussian_iou=0.5\nfocal_alpha=1.5\nfocal_beta=3\n\
+             hm_normalizer=0.5\nwh_normalizer=0.25\noff_normalizer=2\nmax_delta=5\n\
+             delta_normalizer=0.75\n"
+        ))
+        .unwrap();
+        let LayerKind::CenterNet(s) = &net.layers[1].kind else { panic!() };
+        assert_eq!((s.classes, s.max_boxes, s.center_min_radius, s.peak_nms, s.anisotropic_gaussian), (3, 64, 2, 0, 0));
+        assert_eq!((s.small_ref_size, s.small_boost, s.scale_min_px, s.scale_max_px), (16.0, 4.0, 4.0, 64.0));
+        assert_eq!((s.gaussian_iou, s.focal_alpha, s.focal_beta), (0.5, 1.5, 3.0));
+        assert_eq!((s.hm_normalizer, s.wh_normalizer, s.off_normalizer), (0.5, 0.25, 2.0));
+        assert_eq!((s.max_delta, s.delta_normalizer), (5.0, 0.75));
+
+        assert!(build(&format!("{base}[centernet]\nclasses=0\n")).is_err());
+        assert!(build(&format!("{base}[centernet]\nmax=0\n")).is_err());
+    }
+
+    #[test]
+    fn the_modern_heads_take_reg_max_and_the_nested_object_keys() {
+        let base = "[net]\nwidth=2\nheight=2\nchannels=70\n[convolutional]\nfilters=70\nsize=1\n";
+        let net = build(&format!("{base}[ppyoloe]\nclasses=1\nreg_max=16\n")).unwrap();
+        let LayerKind::Ppyoloe(s) = &net.layers[1].kind else { panic!() };
+        assert_eq!(s.kind, ModernYoloKind::Ppyoloe);
+        assert_eq!(s.coords(), 4 * 17);
+        assert_eq!((s.min_object_cells, s.vfl_gamma), (0.0, 0.0), "both default off");
+        let net = build(&format!("{base}[yolonas]\nclasses=1\nreg_max=8\nmin_object_cells=2\nvfl_gamma=1.5\n")).unwrap();
+        let LayerKind::Yolonas(s) = &net.layers[1].kind else { panic!() };
+        assert_eq!(s.kind, ModernYoloKind::Yolonas);
+        assert_eq!(s.coords(), 4 * 9);
+        assert_eq!((s.min_object_cells, s.vfl_gamma), (2.0, 1.5));
+        // YOLOX ignores `reg_max` and uses four raw box entries.
+        let net = build(
+            "[net]\nwidth=2\nheight=2\nchannels=7\n[convolutional]\nfilters=7\nsize=1\n[yolox]\nclasses=2\nreg_max=16\n",
+        )
+        .unwrap();
+        let LayerKind::Yolox(s) = &net.layers[1].kind else { panic!() };
+        assert_eq!(s.coords(), 4);
+        // Each section reports its own name.
+        assert_eq!(net.layers[1].kind.name(), "yolox");
+        assert!(build(&format!("{base}[ppyoloe]\nclasses=0\n")).is_err());
+        assert!(build(&format!("{base}[ppyoloe]\nmax=0\n")).is_err());
     }
 
     #[test]

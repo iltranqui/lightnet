@@ -95,6 +95,7 @@ fn unsupported_sections(cfg: &ConfigFile) -> String {
         "yolox",
         "ppyoloe",
         "yolonas",
+        "centernet",
         "laya_scorer",
     ];
     cfg.sections

@@ -1137,6 +1137,18 @@ impl ExecutableNetwork {
                     }
                     (Tensor::from_data(current_input.shape, data)?, None)
                 }
+                // `[centernet]` sigmoids the `classes` heatmap entries of
+                // every cell and leaves the four regression entries raw.
+                (LayerKind::CenterNet(spec), LayerParams::None) => {
+                    let layout = crate::centernet::CenterNetLayout::for_spec(
+                        current_input.shape.batch,
+                        current_input.shape.width,
+                        current_input.shape.height,
+                        spec,
+                    );
+                    let data = crate::centernet::centernet_forward(&current_input.data, &layout);
+                    (Tensor::from_data(current_input.shape, data)?, None)
+                }
                 // `[laya_scorer]`: LayerNorm -> Linear -> GELU(erf) -> Linear,
                 // applied independently to each of the `max_options` slots.
                 (LayerKind::LayaScorer(spec), LayerParams::LayaScorer(weights)) => {
@@ -1892,6 +1904,7 @@ impl ExecutableNetwork {
                 | (LayerKind::Yolox(_), LayerParams::None)
                 | (LayerKind::Ppyoloe(_), LayerParams::None)
                 | (LayerKind::Yolonas(_), LayerParams::None)
+                | (LayerKind::CenterNet(_), LayerParams::None)
                 | (LayerKind::Regression(_), LayerParams::None)
                 | (LayerKind::JevCe(_), LayerParams::None) => {
                     accumulate_previous_gradient(
@@ -4381,7 +4394,26 @@ where
                         .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
                         .map_err(|err| backend_error("upload laya_scorer output", err))?
                 }
-                // the host for now (same choice as `[contrastive]`).
+                // `[centernet]`'s sigmoid is a strided channel sub-range, so
+                // it goes through the host like the other modern heads.
+                (LayerKind::CenterNet(spec), LayerParams::None) => {
+                    let host_input = self
+                        .download_tensor(current_input, layer.input_shape)
+                        .map_err(|err| backend_error("download centernet input", err))?;
+                    let layout = crate::centernet::CenterNetLayout::for_spec(
+                        layer.input_shape.batch,
+                        layer.input_shape.width,
+                        layer.input_shape.height,
+                        spec,
+                    );
+                    let data = crate::centernet::centernet_forward(&host_input.data, &layout);
+                    self.backend
+                        .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
+                        .map_err(|err| backend_error("upload centernet output", err))?
+                }
+                // `[yolox]` / `[ppyoloe]` / `[yolonas]` apply the C++
+                // `activate_modern_output`, a strided sub-range pass, so they
+                // go through the host for now (same choice as `[contrastive]`).
                 (LayerKind::Yolox(spec), LayerParams::None)
                 | (LayerKind::Ppyoloe(spec), LayerParams::None)
                 | (LayerKind::Yolonas(spec), LayerParams::None) => {
@@ -5987,7 +6019,8 @@ where
                 // now like the other host-round-trip heads.
                 | (LayerKind::Yolox(_), Some(LayerParams::None))
                 | (LayerKind::Ppyoloe(_), Some(LayerParams::None))
-                | (LayerKind::Yolonas(_), Some(LayerParams::None)) => {
+                | (LayerKind::Yolonas(_), Some(LayerParams::None))
+                | (LayerKind::CenterNet(_), Some(LayerParams::None)) => {
                     self.accumulate_previous_gpu_gradient(
                         layer.index,
                         grad,

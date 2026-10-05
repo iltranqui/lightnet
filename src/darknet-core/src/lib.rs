@@ -23,6 +23,7 @@ pub use augmentation::DetectorAugmentation;
 pub mod cfg;
 pub(crate) mod channel_shuffle;
 pub(crate) mod channel_slice;
+pub mod centernet;
 pub mod chart;
 pub(crate) mod contrastive;
 pub use chart::{ChartPoint, write_training_chart};

@@ -66,6 +66,10 @@ pub const TAL_ALPHA: f32 = 1.0;
 pub const TAL_BETA: f32 = 6.0;
 /// C++ `k_nas_duplicate_decay`: per-rank quality decay for YOLO-NAS duplicates.
 pub const NAS_DUPLICATE_DECAY: f32 = 0.35;
+/// C++ `k_eps` on the `raptor` branch, used for the area tie-break.
+pub const CONFLICT_EPS: f32 = 1e-8;
+/// C++ `k_vfl_alpha`: the Varifocal negative weight coefficient.
+pub const VFL_ALPHA: f32 = 0.75;
 /// Largest finite `f32`, C++ `FLT_MAX`: the default that disables clipping.
 pub const FLT_MAX: f32 = f32::MAX;
 
@@ -560,7 +564,7 @@ pub fn assign_tal_like(
     spec: &ModernYoloSpec,
     settings: &ModernYoloSettings,
     b: usize,
-) -> Result<Vec<Assignment>, ModernYoloError> {
+) -> Result<TalAssignment, ModernYoloError> {
     let truths = spec.max_boxes * settings.truth_size;
     if truth.len() < truths * l.batch {
         return Err(ModernYoloError(format!(
@@ -581,9 +585,18 @@ pub fn assign_tal_like(
             truth: ModernBox::default(),
         })
         .collect();
-    // Per-slot best score: a slot keeps the truth with the highest aligned score,
-    // which is how C++ breaks conflicts (not by cost).
+    // Per-slot conflict keys.  `raptor`'s LegoGears nested-object fix adds
+    // `conflict_area`: when a small object sits fully inside a bigger one and
+    // both have a candidate at the same cell (a Lego pin inside its gear), the
+    // *smaller* truth wins the box regression there, and the score only breaks
+    // ties between similarly-sized truths.
     let mut conflict_score = vec![-1.0f32; assignments.len()];
+    let mut conflict_area = vec![f32::INFINITY; assignments.len()];
+    // `class_quality` is a per-slot row of length `classes` giving each class its
+    // own target.  A truth that loses the shared box-regression assignment still
+    // records its quality on its own channel, so it is not trained toward zero
+    // just because a bigger nested truth won that cell.
+    let mut class_quality = vec![0.0f32; assignments.len() * l.classes];
     for t in 0..spec.max_boxes {
         let box_ = truth_box(truth, settings.truth_size, truths, t, b);
         if box_.x == 0.0 {
@@ -602,20 +615,43 @@ pub fn assign_tal_like(
         if let Some(map) = &settings.class_map {
             class_id = map[class_id];
         }
+        // `min_object_cells`: on a coarse head an object narrower than a cell
+        // has no cell centre of its own, so its candidates would fight over
+        // cells that belong to properly-scaled objects.
+        if spec.min_object_cells > 0.0
+            && ((box_.w * l.w as f32) < spec.min_object_cells
+                || (box_.h * l.h as f32) < spec.min_object_cells)
+        {
+            continue;
+        }
         let mut candidates = collect_candidates(x, l, b, t, class_id, &box_);
         if candidates.is_empty() {
             continue;
         }
-        candidates.sort_by(|a, c| c.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|c, a| c.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        let truth_area = box_.w * box_.h;
         for c in candidates.iter().take(TAL_TOPK.min(candidates.len())) {
             let slot = c.anchor * l.spatial() + c.loc;
-            if c.score > conflict_score[slot] {
+            // Varifocal-style soft quality target from the IoU.
+            let quality = c.iou.clamp(0.05, 1.0);
+            // Always record this truth's classification quality at this slot,
+            // even if it loses the box-regression conflict below to a bigger
+            // nested truth.
+            let cq = &mut class_quality[slot * l.classes + c.class_id];
+            *cq = cq.max(quality);
+            // The LegoGears nested-object rule: the smaller truth wins the box
+            // regression where two truths collide, and the score only breaks
+            // ties between similarly-sized truths.
+            let smaller_truth_wins = truth_area < conflict_area[slot] - CONFLICT_EPS;
+            let tied_area_better_score =
+                (truth_area - conflict_area[slot]).abs() <= CONFLICT_EPS && c.score > conflict_score[slot];
+            if smaller_truth_wins || tied_area_better_score {
+                conflict_area[slot] = truth_area;
                 conflict_score[slot] = c.score;
                 assignments[slot] = Assignment {
                     truth_index: c.truth_index,
                     class_id: c.class_id,
-                    // Varifocal-style soft quality target from the IoU.
-                    quality: c.iou.clamp(0.05, 1.0),
+                    quality,
                     iou: c.iou,
                     truth: c.truth,
                 };
@@ -640,7 +676,17 @@ pub fn assign_tal_like(
             }
         }
     }
-    Ok(assignments)
+    Ok(TalAssignment { assignments, class_quality })
+}
+
+/// What [`assign_tal_like`] returns: the per-slot box-regression owner plus the
+/// per-slot, per-class quality row (empty for YOLOX, which C++ only allocates
+/// for the distribution heads).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TalAssignment {
+    pub assignments: Vec<Assignment>,
+    /// Row-major `[slot * classes + class]`.
+    pub class_quality: Vec<f32>,
 }
 
 /// One truth's claim on one cell, as C++'s `Assignment`.
@@ -812,10 +858,11 @@ pub fn yolox_train_batch(
     settings: &ModernYoloSettings,
     b: usize,
 ) -> Result<ModernYoloBatch, ModernYoloError> {
-    let assignments = match l.kind {
-        ModernYoloKind::Yolox => assign_yolox(x, truth, l, spec, settings, b)?,
+    let (assignments, class_quality) = match l.kind {
+        ModernYoloKind::Yolox => (assign_yolox(x, truth, l, spec, settings, b)?, Vec::new()),
         ModernYoloKind::Ppyoloe | ModernYoloKind::Yolonas => {
-            assign_tal_like(x, truth, l, spec, settings, b)?
+            let tal = assign_tal_like(x, truth, l, spec, settings, b)?;
+            (tal.assignments, tal.class_quality)
         }
     };
     let stride = l.spatial();
@@ -861,17 +908,32 @@ pub fn yolox_train_batch(
                 // soft quality as the class target.
                 push_obj(&mut delta, quality);
             }
-            // class targets
+            // Class targets.  For the distribution heads this is the nested-object
+            // fix's per-class row: every class that had a candidate here keeps its
+            // own soft target, so a truth that lost the box-regression conflict to
+            // a bigger nested object is not trained toward 0 on its own channel.
+            let use_vfl = spec.vfl_gamma > 0.0 && !class_quality.is_empty();
             for c in 0..l.classes {
-                let mut target = if c == a.class_id { quality } else { 0.0 };
-                if settings.label_smooth_eps != 0.0 {
+                let raw_target = if class_quality.is_empty() {
+                    // YOLOX: a single hard one-hot winner.
+                    if c == a.class_id { quality } else { 0.0 }
+                } else {
+                    class_quality[slot * l.classes + c].clamp(0.0, 1.0)
+                };
+                let mut target = raw_target;
+                if settings.label_smooth_eps != 0.0 && !use_vfl {
                     target = target * (1.0 - settings.label_smooth_eps) + 0.5 * settings.label_smooth_eps;
                 }
                 let idx = l.class_index(b, n, loc, c);
-                let mut d = settings.cls_normalizer * (target - finite_or_zero(x[idx]));
+                let p = finite_or_zero(x[idx]).clamp(0.0, 1.0);
+                let mut d = settings.cls_normalizer * (target - p);
+                if use_vfl {
+                    let weight = if target > 0.0 { target } else { VFL_ALPHA * p.powf(spec.vfl_gamma) };
+                    d *= weight;
+                }
                 if let Some(m) = &settings.classes_multipliers {
-                    if c == a.class_id {
-                        d *= m[a.class_id];
+                    if raw_target > 0.0 {
+                        d *= m[c];
                     }
                 }
                 if d.is_finite() {
@@ -1008,12 +1070,23 @@ mod tests {
             reg_max: 16,
             jitter: 0.2,
             resize: 1.0,
+            min_object_cells: 0.0,
+            vfl_gamma: 0.0,
         }
     }
 
     /// A PP-YOLOE / YOLO-NAS spec: `reg_max` decides the distribution width.
     pub(super) fn dfl_spec(kind: ModernYoloKind, classes: usize, reg_max: usize) -> ModernYoloSpec {
-        ModernYoloSpec { kind, classes, max_boxes: 4, reg_max, jitter: 0.2, resize: 1.0 }
+        ModernYoloSpec {
+            kind,
+            classes,
+            max_boxes: 4,
+            reg_max,
+            jitter: 0.2,
+            resize: 1.0,
+            min_object_cells: 0.0,
+            vfl_gamma: 0.0,
+        }
     }
 
     /// 2 classes + 5 channels, 2x2 cells, one image.
@@ -1529,7 +1602,8 @@ mod distribution_heads {
         truth[2] = 1.0;
         truth[3] = 1.0;
         truth[4] = 0.0;
-        let assignments = assign_tal_like(&x, &truth, &l, &spec, &settings, 0).unwrap();
+        let tal = assign_tal_like(&x, &truth, &l, &spec, &settings, 0).unwrap();
+        let assignments = &tal.assignments;
         assert_eq!(assignments.len(), spatial);
         let assigned: Vec<&Assignment> = assignments.iter().filter(|a| a.truth_index != usize::MAX).collect();
         assert!(!assigned.is_empty(), "some cells must be assigned");
@@ -1563,8 +1637,8 @@ mod distribution_heads {
         truth[2] = 1.0;
         truth[3] = 1.0;
         truth[4] = 0.0;
-        let plain = assign_tal_like(&x, &truth, &l_ppyoloe, &spec_ppyoloe, &settings, 0).unwrap();
-        let nas = assign_tal_like(&x, &truth, &l_nas, &spec_nas, &settings, 0).unwrap();
+        let plain = assign_tal_like(&x, &truth, &l_ppyoloe, &spec_ppyoloe, &settings, 0).unwrap().assignments;
+        let nas = assign_tal_like(&x, &truth, &l_nas, &spec_nas, &settings, 0).unwrap().assignments;
         // The same truth claims several cells; PP-YOLOE gives them all the same
         // quality while YOLO-NAS decays by rank.
         // C++ damps per truth: sort that truth's slots by IoU descending and
@@ -1635,13 +1709,97 @@ mod distribution_heads {
             .collect();
         assert!(!assigned.is_empty(), "some cells must be assigned");
         let loc = assigned[0];
-        assert!(delta[l.class_index(0, 0, loc, 0)] > 0.0, "class target is the quality");
         // The regression block for that cell received a non-zero delta.
         let dfl_start = l.entry_index(0, loc, 0);
         assert!(
             delta[dfl_start..dfl_start + 4 * bins].iter().any(|d| d.abs() > 1e-6),
             "the distribution must be trained"
         );
+    }
+
+    /// The nested-object fix: a truth that loses the shared box-regression slot
+    /// to a bigger nested truth still records its own class target.
+    #[test]
+    fn a_nested_truth_keeps_its_own_class_target() {
+        let bins = 4;
+        // Two channels, so the nested truth has a class target of its own.
+        let mut l = dfl_layout(bins, 4, 4, ModernYoloKind::Ppyoloe);
+        l.classes = 2;
+        let spec = dfl_spec(ModernYoloKind::Ppyoloe, 2, bins - 1);
+        let settings = ModernYoloSettings::default();
+        let spatial = l.spatial();
+        let cells: Vec<(usize, Vec<f32>)> =
+            (0..spatial).map(|loc| (loc, vec![0.0; 4 * bins + 1 + l.classes])).collect();
+        let mut x = dfl_head(&l, &cells, spatial);
+        for loc in 0..spatial {
+            x[(4 * bins) * spatial + loc] = 10.0;
+            x[(4 * bins + 1) * spatial + loc] = 10.0; // class 0
+            x[(4 * bins + 2) * spatial + loc] = 10.0; // class 1
+        }
+        // Two truths on the same cell centre: a big one (class 0) and a small
+        // one nested inside it (class 1), both centred on cell 0.
+        let mut truth = vec![0.0f32; spec.max_boxes * 6];
+        truth[0] = 0.375; // cx -> gx = 1.5 -> ix = 1
+        truth[1] = 0.375;
+        truth[2] = 0.75; // the big one
+        truth[3] = 0.75;
+        truth[4] = 0.0;
+        let second = 6;
+        truth[second] = 0.375;
+        truth[second + 1] = 0.375;
+        truth[second + 2] = 0.05; // the small nested one
+        truth[second + 3] = 0.05;
+        truth[second + 4] = 1.0;
+        let tal = assign_tal_like(&x, &truth, &l, &spec, &settings, 0).unwrap();
+        // Both cells that were candidates carry a target on *both* channels.
+        let both: Vec<usize> = tal
+            .class_quality
+            .chunks_exact(l.classes)
+            .enumerate()
+            .filter(|(_, row)| row.iter().any(|q| *q > 0.0) && row.iter().filter(|q| **q > 0.0).count() == 2)
+            .map(|(slot, _)| slot)
+            .collect();
+        assert!(!both.is_empty(), "a slot must keep both nested targets: {:?}", tal.class_quality);
+        // And the *box regression* went to the smaller truth: the smallest-area
+        // rule replaces the big one wherever they collide.
+        let small_wins = tal
+            .assignments
+            .iter()
+            .filter(|a| a.truth_index == usize::MAX)
+            .count();
+        assert!(small_wins > 0, "every candidate slot should be owned");
+        assert!(tal.assignments.iter().any(|a| a.truth_index == 1), "the nested truth wins its slot");
+        assert!(tal.assignments.iter().any(|a| a.truth_index == 0), "the big truth wins its own slots");
+    }
+
+    #[test]
+    fn min_object_cells_drops_truths_narrower_than_a_cell() {
+        let bins = 4;
+        let mut spec_narrow = dfl_spec(ModernYoloKind::Ppyoloe, 1, bins - 1);
+        spec_narrow.min_object_cells = 2.0; // the box must span >= 2 cells
+        let l = dfl_layout(bins, 4, 4, ModernYoloKind::Ppyoloe);
+        let settings = ModernYoloSettings::default();
+        let spatial = l.spatial();
+        let cells: Vec<(usize, Vec<f32>)> =
+            (0..spatial).map(|loc| (loc, vec![0.0; 4 * bins + 1 + l.classes])).collect();
+        let mut x = dfl_head(&l, &cells, spatial);
+        for loc in 0..spatial {
+            x[(4 * bins) * spatial + loc] = 10.0;
+            x[(4 * bins + 1) * spatial + loc] = 10.0;
+        }
+        let mut truth = vec![0.0f32; spec_narrow.max_boxes * 6];
+        truth[0] = 0.5;
+        truth[1] = 0.5;
+        truth[2] = 0.1; // 0.4 cells wide: below the gate
+        truth[3] = 0.1;
+        truth[4] = 0.0;
+        let gated = assign_tal_like(&x, &truth, &l, &spec_narrow, &settings, 0).unwrap();
+        assert!(gated.assignments.iter().all(|a| a.truth_index == usize::MAX), "the gate dropped it");
+        assert!(gated.class_quality.iter().all(|q| *q == 0.0));
+        // With the gate off the same truth is assigned.
+        let open = dfl_spec(ModernYoloKind::Ppyoloe, 1, bins - 1);
+        let ungated = assign_tal_like(&x, &truth, &l, &open, &settings, 0).unwrap();
+        assert!(ungated.assignments.iter().any(|a| a.truth_index == 0));
     }
 
     #[test]
