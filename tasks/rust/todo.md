@@ -54,7 +54,8 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
 
 - [ ] recurrent (rnn/lstm/crnn) device forward + backward (still whole-net CPU
   fallback).
-- [ ] Adam for batchnorm / local / recurrent host params (connected is done).
+- [~] Host Adam: connected, standalone batchnorm, and local params are
+  implemented; recurrent host parameter families remain open.
 - [x] weighted shortcut: per-feature/per-channel oxide forward composes
   channel-scale + add; exact backward and SGD updates use the host-resident CPU
   fallback. Real-device runtime test covers mismatched source fit, forward,

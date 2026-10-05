@@ -4045,12 +4045,16 @@ where
             if self.params.iter().any(|params| {
                 !matches!(
                     params,
-                    LayerParams::None | LayerParams::Convolutional(_) | LayerParams::Connected(_)
+                    LayerParams::None
+                        | LayerParams::BatchNorm(_)
+                        | LayerParams::Local(_)
+                        | LayerParams::Convolutional(_)
+                        | LayerParams::Connected(_)
                 )
             }) {
                 return Err(Error::InvalidConfig(
-                    "adam=1 on the GPU path supports convolutional and connected layers only \
-                     (standalone batchnorm / recurrent / local have no Adam state)"
+                    "adam=1 on the GPU path supports convolutional, connected, local, and standalone batchnorm layers only \
+                     (recurrent layers have no host Adam state)"
                         .to_string(),
                 ));
             }
@@ -4230,16 +4234,17 @@ where
             self.host_weights_stale = false;
         }
         if let GpuOptimizerStep::Adam(adam) = step {
-            self.update_cpu_fallback_connected_adam(&adam)?;
+            self.update_cpu_fallback_adam(&adam)?;
         } else {
             self.update_cpu_fallback_weights(lr / loss_scale, momentum, decay * loss_scale, batch);
         }
         Ok(())
     }
 
-    /// Adam step for host-resident connected parameters (device convolutions are
-    /// handled by the main loop).  Rejects any other host parameter type.
-    fn update_cpu_fallback_connected_adam(&mut self, adam: &AdamParams) -> Result<()> {
+    /// Adam step for host-resident connected, local, and standalone batchnorm
+    /// params (device convolutions are handled by the main loop). Rejects other
+    /// host parameter types until their optimizer state is implemented.
+    fn update_cpu_fallback_adam(&mut self, adam: &AdamParams) -> Result<()> {
         let iteration_num = self.train_iteration as i64 + 1;
         let burn_in = self.network.net.burn_in;
         let mut moments_all = self.host_adam_state.borrow_mut();
@@ -4255,7 +4260,37 @@ where
                 continue;
             }
             match (&mut self.params[index], &mut buffers[index]) {
+                (LayerParams::BatchNorm(params), LayerTrainBuffers::BatchNorm(train)) => {
+                    let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    apply_host_adam(
+                        &mut params.scales,
+                        &mut train.scale_updates,
+                        &mut moments.weights,
+                        adam,
+                    )?;
+                    apply_host_adam(
+                        &mut params.biases,
+                        &mut train.bias_updates,
+                        &mut moments.biases,
+                        adam,
+                    )?;
+                }
                 (LayerParams::Connected(params), LayerTrainBuffers::Connected(train)) => {
+                    let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    apply_host_adam(
+                        &mut params.weights,
+                        &mut train.weight_updates,
+                        &mut moments.weights,
+                        adam,
+                    )?;
+                    apply_host_adam(
+                        &mut params.biases,
+                        &mut train.bias_updates,
+                        &mut moments.biases,
+                        adam,
+                    )?;
+                }
+                (LayerParams::Local(params), LayerTrainBuffers::Local(train)) => {
                     let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
                     apply_host_adam(
                         &mut params.weights,
@@ -20758,11 +20793,11 @@ mod tests {
     }
 
     #[test]
-    fn gpu_adam_rejects_host_fallback_layers() {
+    fn gpu_adam_rejects_recurrent_host_fallback_layers() {
         let network = Network::from_config(
             ConfigFile::parse_str(
                 "inline.cfg",
-                "[net]\nwidth=2\nheight=2\nchannels=1\nbatch=1\nadam=1\n[local]\nfilters=1\nsize=1\nstride=1\nactivation=linear\n",
+                "[net]\nwidth=2\nheight=2\nchannels=1\nbatch=1\nadam=1\n[rnn]\nhidden=2\noutput=1\n",
             )
             .expect("cfg"),
         )
@@ -20808,6 +20843,159 @@ mod tests {
             "weights should move: {:?}",
             params.weights
         );
+    }
+
+    #[test]
+    fn gpu_adam_updates_standalone_batchnorm_host_parameters() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "inline.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=1\nadam=1\nb1=0.8\nb2=0.95\neps=0.001\n[batchnorm]\n",
+            )
+            .expect("cfg"),
+        )
+        .expect("network");
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        let (initial_scales, initial_biases) = {
+            let LayerParams::BatchNorm(params) = &mut gpu.params[0] else {
+                panic!("batchnorm params");
+            };
+            params.scales.copy_from_slice(&[1.2, 0.8]);
+            params.biases.copy_from_slice(&[0.2, -0.1]);
+            (params.scales.clone(), params.biases.clone())
+        };
+        let (scale_updates, bias_updates) = {
+            let LayerTrainBuffers::BatchNorm(train) = &mut gpu.cpu_fallback_train_buffers.get_mut()[0] else {
+                panic!("batchnorm train buffers");
+            };
+            train.scale_updates.copy_from_slice(&[0.2, -0.3]);
+            train.bias_updates.copy_from_slice(&[-0.1, 0.25]);
+            (train.scale_updates.clone(), train.bias_updates.clone())
+        };
+        let step = super::AdamParams {
+            lr: 0.01,
+            beta1: 0.8,
+            beta2: 0.95,
+            eps: 0.001,
+            decay: 0.0,
+            batch: 1,
+            step: 1,
+            decoupled_decay: false,
+        };
+        let zeros = [0.0f32; 2];
+        let (expected_scales, scales_m, scales_v) = darknet_cuda::host_ops::adam_update(
+            &initial_scales,
+            &scale_updates,
+            &zeros,
+            &zeros,
+            &step,
+        );
+        let (expected_biases, biases_m, biases_v) = darknet_cuda::host_ops::adam_update(
+            &initial_biases,
+            &bias_updates,
+            &zeros,
+            &zeros,
+            &step,
+        );
+
+        gpu.update_weights_gpu(0.01, 0.0, 0.0, 1)
+            .expect("standalone batchnorm Adam update");
+        let LayerParams::BatchNorm(params) = &gpu.params[0] else { unreachable!() };
+        assert_slice_close("batchnorm scales Adam", &expected_scales, &params.scales, 1e-7);
+        assert_slice_close("batchnorm biases Adam", &expected_biases, &params.biases, 1e-7);
+        {
+            let fallback = gpu.cpu_fallback_train_buffers.borrow();
+            let LayerTrainBuffers::BatchNorm(train) = &fallback[0] else {
+                panic!("batchnorm train buffers");
+            };
+            assert!(train.scale_updates.iter().chain(&train.bias_updates).all(|u| *u == 0.0));
+        }
+
+        let (scale_updates, bias_updates) = {
+            let LayerTrainBuffers::BatchNorm(train) = &mut gpu.cpu_fallback_train_buffers.get_mut()[0] else {
+                panic!("batchnorm train buffers");
+            };
+            train.scale_updates.copy_from_slice(&[-0.15, 0.12]);
+            train.bias_updates.copy_from_slice(&[0.3, -0.2]);
+            (train.scale_updates.clone(), train.bias_updates.clone())
+        };
+        let step2 = super::AdamParams { step: 2, ..step };
+        let expected_scales = darknet_cuda::host_ops::adam_update(
+            &expected_scales,
+            &scale_updates,
+            &scales_m,
+            &scales_v,
+            &step2,
+        ).0;
+        let expected_biases = darknet_cuda::host_ops::adam_update(
+            &expected_biases,
+            &bias_updates,
+            &biases_m,
+            &biases_v,
+            &step2,
+        ).0;
+        gpu.update_weights_gpu(0.01, 0.0, 0.0, 1)
+            .expect("second standalone batchnorm Adam update");
+        let LayerParams::BatchNorm(params) = &gpu.params[0] else { unreachable!() };
+        assert_slice_close("batchnorm scales Adam step 2", &expected_scales, &params.scales, 1e-7);
+        assert_slice_close("batchnorm biases Adam step 2", &expected_biases, &params.biases, 1e-7);
+    }
+
+    #[test]
+    fn gpu_adam_updates_local_host_parameters() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "inline.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=1\nbatch=1\nadam=1\nb1=0.8\nb2=0.95\neps=0.001\n[local]\nfilters=1\nsize=1\nstride=1\nactivation=linear\n",
+            )
+            .expect("cfg"),
+        )
+        .expect("network");
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        let (initial_weights, initial_biases) = {
+            let LayerParams::Local(params) = &mut gpu.params[0] else { panic!("local params") };
+            params.weights.copy_from_slice(&[0.4, -0.2, 0.7, 0.1]);
+            params.biases.copy_from_slice(&[0.3, -0.5, 0.2, 0.8]);
+            (params.weights.clone(), params.biases.clone())
+        };
+        let (weight_updates, bias_updates) = {
+            let LayerTrainBuffers::Local(train) = &mut gpu.cpu_fallback_train_buffers.get_mut()[0] else {
+                panic!("local train buffers");
+            };
+            train.weight_updates.copy_from_slice(&[0.2, -0.1, 0.3, -0.4]);
+            train.bias_updates.copy_from_slice(&[-0.3, 0.1, 0.2, -0.25]);
+            (train.weight_updates.clone(), train.bias_updates.clone())
+        };
+        let adam = super::AdamParams {
+            lr: 0.01,
+            beta1: 0.8,
+            beta2: 0.95,
+            eps: 0.001,
+            decay: 0.0,
+            batch: 1,
+            step: 1,
+            decoupled_decay: false,
+        };
+        let zeros = [0.0f32; 4];
+        let expected_weights = darknet_cuda::host_ops::adam_update(
+            &initial_weights,
+            &weight_updates,
+            &zeros,
+            &zeros,
+            &adam,
+        ).0;
+        let expected_biases = darknet_cuda::host_ops::adam_update(
+            &initial_biases,
+            &bias_updates,
+            &zeros,
+            &zeros,
+            &adam,
+        ).0;
+        gpu.update_weights_gpu(0.01, 0.0, 0.0, 1)
+            .expect("local Adam update");
+        let LayerParams::Local(params) = &gpu.params[0] else { unreachable!() };
+        assert_slice_close("local weights Adam", &expected_weights, &params.weights, 1e-7);
+        assert_slice_close("local biases Adam", &expected_biases, &params.biases, 1e-7);
     }
 
     #[test]
