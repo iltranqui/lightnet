@@ -4050,6 +4050,7 @@ where
                     LayerParams::None
                         | LayerParams::BatchNorm(_)
                         | LayerParams::Local(_)
+                        | LayerParams::Shortcut(_)
                         | LayerParams::Convolutional(_)
                         | LayerParams::Connected(_)
                         | LayerParams::Gru(_)
@@ -4283,6 +4284,15 @@ where
                 (LayerParams::Connected(params), LayerTrainBuffers::Connected(train)) => {
                     let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
                     apply_host_adam_connected(params, train, moments, adam)?;
+                }
+                (LayerParams::Shortcut(params), LayerTrainBuffers::Shortcut(train)) => {
+                    let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    apply_host_adam(
+                        &mut params.weights,
+                        &mut train.weight_updates,
+                        &mut moments.weights,
+                        adam,
+                    )?;
                 }
                 (LayerParams::Local(params), LayerTrainBuffers::Local(train)) => {
                     let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
@@ -21243,6 +21253,47 @@ mod tests {
             assert_slice_close("RNN block weights Adam", weights, &block.weights, 1e-7);
             assert_slice_close("RNN block biases Adam", biases, &block.biases, 1e-7);
         }
+    }
+
+    #[test]
+    fn gpu_adam_updates_weighted_shortcut_parameters() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "inline.cfg",
+                "[net]\ninputs=2\nbatch=1\nadam=1\nb1=0.8\nb2=0.95\neps=0.001\n[connected]\noutput=2\nactivation=linear\n[shortcut]\nfrom=-1\nweights_type=per_feature\nweights_normalization=none\nactivation=linear\n",
+            )
+            .expect("cfg"),
+        )
+        .expect("network");
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        let LayerParams::Shortcut(params) = &mut gpu.params[1] else {
+            panic!("weighted shortcut parameters");
+        };
+        params.weights.copy_from_slice(&[0.4, -0.2]);
+        let initial = params.weights.clone();
+        let LayerTrainBuffers::Shortcut(train) = &mut gpu.cpu_fallback_train_buffers.get_mut()[1] else {
+            panic!("weighted shortcut train buffers");
+        };
+        train.weight_updates.copy_from_slice(&[0.3, -0.1]);
+        let updates = train.weight_updates.clone();
+        let step = super::AdamParams {
+            lr: 0.01,
+            beta1: 0.8,
+            beta2: 0.95,
+            eps: 0.001,
+            decay: 0.0,
+            batch: 1,
+            step: 1,
+            decoupled_decay: false,
+        };
+        let zeros = [0.0f32; 2];
+        let expected = darknet_cuda::host_ops::adam_update(
+            &initial, &updates, &zeros, &zeros, &step,
+        ).0;
+        gpu.update_weights_gpu(0.01, 0.0, 0.0, 1)
+            .expect("weighted shortcut Adam update");
+        let LayerParams::Shortcut(params) = &gpu.params[1] else { unreachable!() };
+        assert_slice_close("weighted shortcut Adam", &expected, &params.weights, 1e-7);
     }
 
     #[test]
