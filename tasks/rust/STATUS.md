@@ -49,13 +49,14 @@ Latest increments:
   backward remain.
 - Host Adam now updates standalone batchnorm, local, connected, weighted
   shortcut, MoE router/experts, deconvolutional, GRU/RNN/LSTM/CRNN, and ViT
-  parameters with distinct moment slots and per-layer rate scaling. The ViT
-  reference test covers C++ weight order, decay groups, clipping, and reduced
-  mHC rate; each host family has update coverage.
+  parameters with distinct moment slots and per-layer rate scaling. DNOPT2
+  sidecars persist host moments while DNOPT1 remains loadable. The ViT reference
+  test covers C++ weight order, decay groups, clipping, and reduced mHC rate;
+  host resume has a multi-step continuation test.
 - `[vit]` reference path: cfg/shape, C++-ordered header-aware weights, seeded init,
   CPU analytical forward/backward + SGD, and GPU f32 host fallback; 23 focused
   tests pass, targeted package check/build pass with `-j 4`.
-- Host suites: `darknet-core --lib` 387/387 and `darknet-cli` 18/18 pass. The
+- Host suites: `darknet-core --lib` 388/388 and `darknet-cli` 18/18 pass. The
   real-device `oxide_runtime_chain` suite passes all 7 tests.
   `cfg_corpus` started but the combined host run hit its 30-minute command timeout;
   this is not evidence of a code failure. Historical `raptor-fp4` C++ commit

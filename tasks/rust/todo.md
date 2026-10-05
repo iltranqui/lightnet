@@ -56,8 +56,9 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
   fallback).
 - [x] Host Adam: connected, standalone batchnorm, local, weighted shortcut,
   MoE, deconvolutional, GRU/RNN/LSTM/CRNN, and ViT host params use per-layer
-  rate scaling; ViT preserves weight order, decay groups, gradient clipping,
-  and its reduced mHC learning rate.
+  rate scaling and persisted host moments in DNOPT2 optimizer sidecars (DNOPT1
+  remains readable); ViT preserves weight order, decay groups, gradient
+  clipping, and its reduced mHC learning rate.
 - [x] weighted shortcut: per-feature/per-channel oxide forward composes
   channel-scale + add; exact backward and SGD updates use the host-resident CPU
   fallback. Real-device runtime test covers mismatched source fit, forward,

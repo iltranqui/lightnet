@@ -3016,7 +3016,7 @@ where
     /// Per-owner-layer Adam moments (device), created lazily on the first
     /// Adam update.
     adam_state: Vec<Option<GpuAdamLayerState<B::Tensor>>>,
-    /// Adam moments for host-resident (connected) parameters.
+    /// Adam moments for parameters updated by the host fallback.
     host_adam_state: RefCell<Vec<Option<HostAdamLayerState>>>,
     /// Number of Adam updates applied so far (the 1-based bias-correction `t`).
     adam_step: u32,
@@ -3040,6 +3040,210 @@ struct HostAdamLayerState {
     biases: Option<(Vec<f32>, Vec<f32>)>,
     scales: Option<(Vec<f32>, Vec<f32>)>,
     children: Vec<HostAdamLayerState>,
+}
+
+fn connected_parameter_count(params: &ConnectedParams) -> usize {
+    params.weights.len()
+        + params.biases.len()
+        + params
+            .batch_norm
+            .as_ref()
+            .map_or(0, |bn| bn.scales.len() + bn.biases.len())
+}
+
+fn convolutional_parameter_count(params: &ConvolutionalParams) -> usize {
+    params.weights.len()
+        + params.biases.len()
+        + params
+            .batch_norm
+            .as_ref()
+            .map_or(0, |bn| bn.scales.len() + bn.biases.len())
+}
+
+fn host_adam_scalar_capacity(params: &LayerParams) -> usize {
+    match params {
+        LayerParams::BatchNorm(params) => params.scales.len() + params.biases.len(),
+        LayerParams::Convolutional(params) => convolutional_parameter_count(params),
+        LayerParams::Connected(params) => connected_parameter_count(params),
+        LayerParams::Local(params) => params.weights.len() + params.biases.len(),
+        LayerParams::Shortcut(params) => params.weights.len(),
+        LayerParams::Gru(params) => [
+            &params.input_z,
+            &params.state_z,
+            &params.input_r,
+            &params.state_r,
+            &params.input_h,
+            &params.state_h,
+        ]
+        .into_iter()
+        .map(connected_parameter_count)
+        .sum(),
+        LayerParams::Rnn(params) => [&params.input, &params.self_params, &params.output]
+            .into_iter()
+            .map(connected_parameter_count)
+            .sum(),
+        LayerParams::Lstm(params) => [
+            &params.wf, &params.wi, &params.wg, &params.wo, &params.uf, &params.ui, &params.ug,
+            &params.uo,
+        ]
+        .into_iter()
+        .map(connected_parameter_count)
+        .sum(),
+        LayerParams::Crnn(params) => [&params.input, &params.self_params, &params.output]
+            .into_iter()
+            .map(convolutional_parameter_count)
+            .sum(),
+        LayerParams::Vit(params) => [
+            params.patch_embed.len(),
+            params.patch_bias.len(),
+            params.qkv_bias.len(),
+            params.ln1_gamma.len(),
+            params.ln1_beta.len(),
+            params.qkv_weight.len(),
+            params.wo.len(),
+            params.wo_bias.len(),
+            params.ln2_gamma.len(),
+            params.ln2_beta.len(),
+            params.ffn_w1.len(),
+            params.ffn_b1.len(),
+            params.ffn_w2.len(),
+            params.ffn_b2.len(),
+            params.pos_embed.len(),
+            params.mhc.len(),
+        ]
+        .into_iter()
+        .sum(),
+        LayerParams::Moe(params) => {
+            params.router_weights.len()
+                + params.router_biases.len()
+                + params
+                    .experts
+                    .iter()
+                    .map(convolutional_parameter_count)
+                    .sum::<usize>()
+        }
+        LayerParams::None
+        | LayerParams::LayaScorer(_)
+        | LayerParams::LayaActHead(_)
+        | LayerParams::LayaEncoder(_)
+        | LayerParams::LayaHead(_) => 0,
+    }
+}
+
+fn write_host_adam_moments(
+    file: &mut impl Write,
+    moments: &Option<(Vec<f32>, Vec<f32>)>,
+) -> Result<()> {
+    let Some((first, second)) = moments else {
+        file.write_all(&[0])?;
+        return Ok(());
+    };
+    if first.len() != second.len() {
+        return Err(Error::Weights("host Adam moment lengths differ".to_owned()));
+    }
+    file.write_all(&[1])?;
+    file.write_all(&(first.len() as u64).to_le_bytes())?;
+    crate::weights::write_f32_slice(file, first)?;
+    crate::weights::write_f32_slice(file, second)?;
+    Ok(())
+}
+
+fn write_host_adam_state(file: &mut impl Write, state: &HostAdamLayerState) -> Result<()> {
+    write_host_adam_moments(file, &state.weights)?;
+    write_host_adam_moments(file, &state.biases)?;
+    write_host_adam_moments(file, &state.scales)?;
+    file.write_all(&(state.children.len() as u64).to_le_bytes())?;
+    for child in &state.children {
+        write_host_adam_state(file, child)?;
+    }
+    Ok(())
+}
+
+fn read_host_adam_moments(
+    file: &mut File,
+    max_tensor_len: usize,
+    remaining_scalars: &mut usize,
+) -> Result<Option<(Vec<f32>, Vec<f32>)>> {
+    let mut flag = [0; 1];
+    file.read_exact(&mut flag)?;
+    match flag[0] {
+        0 => Ok(None),
+        1 => {
+            let mut len_bytes = [0; 8];
+            file.read_exact(&mut len_bytes)?;
+            let len = usize::try_from(u64::from_le_bytes(len_bytes))
+                .map_err(|_| Error::Weights("host Adam moment is too large".to_owned()))?;
+            let pair_len = len
+                .checked_mul(2)
+                .ok_or_else(|| Error::Weights("host Adam moment is too large".to_owned()))?;
+            if len > max_tensor_len || pair_len > *remaining_scalars {
+                return Err(Error::Weights(
+                    "host Adam moment length exceeds the layer parameter size".to_owned(),
+                ));
+            }
+            *remaining_scalars -= pair_len;
+            let byte_len = len
+                .checked_mul(4)
+                .ok_or_else(|| Error::Weights("host Adam moment is too large".to_owned()))?;
+            let mut read_values = || -> Result<Vec<f32>> {
+                let mut bytes = vec![0; byte_len];
+                file.read_exact(&mut bytes)?;
+                Ok(bytes
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect())
+            };
+            Ok(Some((read_values()?, read_values()?)))
+        }
+        _ => Err(Error::Weights("invalid host Adam moment flag".to_owned())),
+    }
+}
+
+fn read_host_adam_state(file: &mut File, max_tensor_len: usize) -> Result<HostAdamLayerState> {
+    fn read_node(
+        file: &mut File,
+        max_tensor_len: usize,
+        remaining_scalars: &mut usize,
+        depth: usize,
+    ) -> Result<HostAdamLayerState> {
+        if depth > 4 {
+            return Err(Error::Weights(
+                "host Adam state is too deeply nested".to_owned(),
+            ));
+        }
+        let weights = read_host_adam_moments(file, max_tensor_len, remaining_scalars)?;
+        let biases = read_host_adam_moments(file, max_tensor_len, remaining_scalars)?;
+        let scales = read_host_adam_moments(file, max_tensor_len, remaining_scalars)?;
+        let mut count_bytes = [0; 8];
+        file.read_exact(&mut count_bytes)?;
+        let child_count = usize::try_from(u64::from_le_bytes(count_bytes))
+            .map_err(|_| Error::Weights("host Adam child count is too large".to_owned()))?;
+        if child_count > max_tensor_len {
+            return Err(Error::Weights(
+                "host Adam child count exceeds layer capacity".to_owned(),
+            ));
+        }
+        let mut children = Vec::new();
+        for _ in 0..child_count {
+            children.push(read_node(
+                file,
+                max_tensor_len,
+                remaining_scalars,
+                depth + 1,
+            )?);
+        }
+        Ok(HostAdamLayerState {
+            weights,
+            biases,
+            scales,
+            children,
+        })
+    }
+
+    let mut remaining_scalars = max_tensor_len
+        .checked_mul(2)
+        .ok_or_else(|| Error::Weights("host Adam layer is too large".to_owned()))?;
+    read_node(file, max_tensor_len, &mut remaining_scalars, 0)
 }
 
 #[derive(Clone, Debug)]
@@ -3757,13 +3961,12 @@ where
         Ok(false)
     }
 
-    /// Persist the Adam step counter and per-owner moment tensors to a sidecar
-    /// file.  The `.weights` format stays C++-compatible and carries only
-    /// parameters plus `seen`; resuming Adam from it would restart the moments,
-    /// so training uses this sidecar to continue the optimizer exactly.
+    /// Persist the Adam step counter and device/host moment tensors to a sidecar
+    /// file. The `.weights` format stays C++-compatible and carries only
+    /// parameters plus `seen`; this sidecar preserves optimizer state on resume.
     pub fn save_optimizer_state(&self, path: impl AsRef<Path>) -> Result<()> {
         let mut file = std::io::BufWriter::with_capacity(1 << 20, File::create(path)?);
-        file.write_all(b"DNOPT1\0\0")?;
+        file.write_all(b"DNOPT2\0\0")?;
         file.write_all(&self.adam_step.to_le_bytes())?;
         let entries: Vec<usize> = self
             .adam_state
@@ -3782,6 +3985,20 @@ where
             self.write_moments(&mut file, state.biases.as_ref(), &filter_shape)?;
             self.write_moments(&mut file, state.scales.as_ref(), &filter_shape)?;
         }
+        let host_states = self.host_adam_state.borrow();
+        let host_entries: Vec<usize> = host_states
+            .iter()
+            .enumerate()
+            .filter_map(|(index, state)| state.as_ref().map(|_| index))
+            .collect();
+        file.write_all(&(host_entries.len() as u64).to_le_bytes())?;
+        for index in host_entries {
+            file.write_all(&(index as u64).to_le_bytes())?;
+            write_host_adam_state(
+                &mut file,
+                host_states[index].as_ref().expect("filtered to Some above"),
+            )?;
+        }
         file.flush()?;
         Ok(())
     }
@@ -3793,9 +4010,11 @@ where
         let mut file = File::open(path)?;
         let mut magic = [0u8; 8];
         file.read_exact(&mut magic)?;
-        if &magic != b"DNOPT1\0\0" {
-            return Err(Error::Weights("bad optimizer state magic".to_owned()));
-        }
+        let version = match &magic {
+            b"DNOPT1\0\0" => 1,
+            b"DNOPT2\0\0" => 2,
+            _ => return Err(Error::Weights("bad optimizer state magic".to_owned())),
+        };
         let mut buf4 = [0u8; 4];
         file.read_exact(&mut buf4)?;
         let step = u32::from_le_bytes(buf4);
@@ -3822,6 +4041,33 @@ where
                 scales,
             });
         }
+        let mut host_state: Vec<Option<HostAdamLayerState>> =
+            (0..self.network.layers.len()).map(|_| None).collect();
+        if version >= 2 {
+            file.read_exact(&mut buf8)?;
+            let host_count = usize::try_from(u64::from_le_bytes(buf8)).map_err(|_| {
+                Error::Weights("optimizer host layer count is too large".to_owned())
+            })?;
+            if host_count > self.network.layers.len() {
+                return Err(Error::Weights(
+                    "optimizer host layer count exceeds network size".to_owned(),
+                ));
+            }
+            let mut seen = vec![false; self.network.layers.len()];
+            for _ in 0..host_count {
+                file.read_exact(&mut buf8)?;
+                let index = u64::from_le_bytes(buf8) as usize;
+                if index >= self.network.layers.len() || seen[index] {
+                    return Err(Error::Weights(
+                        "optimizer state host layer index is invalid or repeated".to_owned(),
+                    ));
+                }
+                seen[index] = true;
+                let max_scalars = host_adam_scalar_capacity(&self.params[index]);
+                host_state[index] = Some(read_host_adam_state(&mut file, max_scalars)?);
+            }
+        }
+        *self.host_adam_state.get_mut() = host_state;
         self.adam_state = state;
         self.adam_step = step;
         Ok(())
@@ -21871,6 +22117,84 @@ mod tests {
             assert_slice_close("biases", &b0, &b1, 1e-6);
             assert_slice_close("scales", &s0, &s1, 1e-6);
         }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn optimizer_state_round_trips_host_adam_moments_and_reads_v1() {
+        let dir =
+            std::env::temp_dir().join(format!("darknet-host-opt-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("host-opt.state");
+        let cfg = "[net]\ninputs=2\nbatch=1\nadam=1\nb1=0.8\nb2=0.95\neps=0.001\n[connected]\noutput=2\nactivation=linear\n";
+        let build = || {
+            let network =
+                Network::from_config(ConfigFile::parse_str("inline.cfg", cfg).unwrap()).unwrap();
+            GpuExecutableNetwork::new(network, FakeBackend)
+        };
+        let set_grads =
+            |gpu: &mut GpuExecutableNetwork<FakeBackend>, weights: [f32; 4], biases: [f32; 2]| {
+                let LayerTrainBuffers::Connected(train) =
+                    &mut gpu.cpu_fallback_train_buffers.get_mut()[0]
+                else {
+                    panic!("connected train buffers");
+                };
+                train.weight_updates.copy_from_slice(&weights);
+                train.bias_updates.copy_from_slice(&biases);
+            };
+        let mut original = build();
+        set_grads(&mut original, [0.1, -0.2, 0.05, -0.1], [0.05, -0.1]);
+        original
+            .update_weights_gpu(0.01, 0.0, 0.0, 1)
+            .expect("first Adam step");
+        original
+            .save_optimizer_state(&path)
+            .expect("save host optimizer state");
+        let sidecar = std::fs::read(&path).unwrap();
+        assert_eq!(&sidecar[..8], b"DNOPT2\0\0");
+
+        let mut resumed = build();
+        resumed.params.clone_from(&original.params);
+        resumed
+            .load_optimizer_state(&path)
+            .expect("restore host moments");
+        assert_eq!(resumed.adam_step(), 1);
+        set_grads(&mut original, [0.3, 0.05, -0.2, 0.4], [-0.2, 0.4]);
+        set_grads(&mut resumed, [0.3, 0.05, -0.2, 0.4], [-0.2, 0.4]);
+        original
+            .update_weights_gpu(0.01, 0.0, 0.0, 1)
+            .expect("continued Adam step");
+        resumed
+            .update_weights_gpu(0.01, 0.0, 0.0, 1)
+            .expect("resumed Adam step");
+        let (LayerParams::Connected(original_params), LayerParams::Connected(resumed_params)) =
+            (&original.params[0], &resumed.params[0])
+        else {
+            unreachable!()
+        };
+        assert_slice_close(
+            "resumed host Adam weights",
+            &original_params.weights,
+            &resumed_params.weights,
+            1e-7,
+        );
+        assert_slice_close(
+            "resumed host Adam biases",
+            &original_params.biases,
+            &resumed_params.biases,
+            1e-7,
+        );
+
+        let legacy_path = dir.join("legacy-v1.state");
+        let mut legacy = b"DNOPT1\0\0".to_vec();
+        legacy.extend_from_slice(&7u32.to_le_bytes());
+        legacy.extend_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&legacy_path, legacy).unwrap();
+        let mut legacy_network = build();
+        legacy_network
+            .load_optimizer_state(&legacy_path)
+            .expect("load legacy v1 state");
+        assert_eq!(legacy_network.adam_step(), 7);
         std::fs::remove_dir_all(dir).ok();
     }
 
