@@ -47,7 +47,11 @@ pub fn compute_dense_training_loss_at(
     let (mut total, mut count) = (0.0f32, 0usize);
     for layer in &network.layers {
         let Some(t) = truth[layer.index].as_ref() else { continue };
-        if t.shape != layer.output_shape {
+        // `[omd_loss]` is the one dense-truth head whose truth is *not* its own
+        // output: C++ reads a box table (`batch * max_boxes * truth_size`) or a
+        // per-image class vector, so its shape check lives in the module (which
+        // falls back to "no samples" when the truth is shorter than it needs).
+        if !matches!(layer.kind, LayerKind::OmdLoss(_)) && t.shape != layer.output_shape {
             return Err(Error::InvalidConfig(format!(
                 "layer #{} ([{}]) truth shape {} != output shape {}",
                 layer.index,
@@ -61,6 +65,22 @@ pub fn compute_dense_training_loss_at(
             LayerKind::Cost { kind, scale } => elementwise_cost(prev, t, kind, *scale),
             LayerKind::Regression(spec) => elementwise_cost(prev, t, "sse", spec.scale),
             LayerKind::Logistic => logistic_cost(&forward.layer_outputs[layer.index], t),
+            LayerKind::OmdLoss(spec) => {
+                // The layer is a pass-through, so the seed it produces is the
+                // metric delta of the *previous* layer's features - which is
+                // exactly what the pass-through backward then forwards.
+                let (output, result) = crate::omd_loss::omd_loss_forward(
+                    &prev.data,
+                    Some(&t.data),
+                    spec,
+                    &prev.shape,
+                    network.net.width,
+                    network.net.height,
+                    true,
+                );
+                debug_assert_eq!(output, prev.data, "[omd_loss] must be a pass-through");
+                (Tensor::from_data(prev.shape, result.delta)?, result.cost)
+            }
             LayerKind::Segmentation(spec) => {
                 let shape = layer.output_shape;
                 let result = crate::segmentation::segmentation_loss(
@@ -289,6 +309,58 @@ mod tests {
         );
         let seed_before = before.layer_output_gradient_seeds[1].as_ref().unwrap();
         assert_eq!(seed_before.data, vec![0.5, 0.5, -0.5, -0.5], "before the ramp the gate is off");
+    }
+
+    /// `[omd_loss]` with box truth: a 1x1 convolution copies its input, so each
+    /// image's box sample sees that image's own two features.  The two are
+    /// labelled differently, so their pair is negative.
+    fn omd_detection_loss(input: &[f32]) -> DenseTrainingLoss {
+        let cfg = "[net]\nwidth=1\nheight=1\nchannels=2\nbatch=2\n\
+                   [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
+                   [omd_loss]\nclasses=2\nmax_boxes=2\ntruth_size=6\n\
+                   lambda=1\nmargin=0.5\n";
+        let network = Network::from_config(ConfigFile::parse_str("d.cfg", cfg).unwrap()).unwrap();
+        let mut exec = ExecutableNetwork::new(network);
+        {
+            // Identity 1x1 convolution: weights [f0c0, f0c1, f1c0, f1c1], no bias.
+            let LayerParams::Convolutional(p) = &mut exec.params[0] else { panic!() };
+            p.weights = vec![1.0, 0.0, 0.0, 1.0];
+            p.biases = vec![0.0, 0.0];
+        }
+        let shape = exec.network.net.input_shape();
+        let data = input.to_vec();
+        assert_eq!(data.len(), shape.batch * shape.element_count());
+        let input = Tensor::from_data(shape, data).unwrap();
+        let forward = exec.forward_training(&input).unwrap();
+        // Box truth: one box per image, class 0 and class 1.  The layer's truth
+        // is `batch * max_boxes * truth_size`, not its output shape.
+        let mut truth = vec![0.0f32; 2 * 2 * 6];
+        for (b, cls) in [(0usize, 0.0f32), (1, 1.0)] {
+            let base = b * 2 * 6;
+            truth[base] = 0.5;
+            truth[base + 1] = 0.5;
+            truth[base + 2] = 0.5;
+            truth[base + 3] = 0.5;
+            truth[base + 4] = cls;
+        }
+        let mut t = vec![None; exec.network.layers.len()];
+        t[1] = Some(Tensor::from_data(TensorShape::new(12, 1, 1, 2), truth).unwrap());
+        compute_dense_training_loss(&exec.network, &forward, &input, &t).unwrap()
+    }
+
+    #[test]
+    fn omd_loss_head_is_a_pass_through_that_seeds_the_metric_delta() {
+        // Near-identical images with different labels: the negative pair fires.
+        let loss = omd_detection_loss(&[1.0, 0.0, 0.9, 0.1]);
+        assert!(loss.loss > 0.0, "cost {}", loss.loss);
+        let seed = loss.layer_output_gradient_seeds[1].as_ref().unwrap();
+        assert_eq!(seed.data.len(), 4, "one entry per previous-layer element");
+        assert!(seed.data.iter().any(|d| d.abs() > 1e-5), "something must be pulled: {:?}", seed.data);
+        // Orthogonal images with different labels: distance 1, violation
+        // 0.5 - 1 < 0, so the pair is already inside the margin and nothing moves.
+        let relaxed = omd_detection_loss(&[1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(relaxed.loss, 0.0);
+        assert!(relaxed.layer_output_gradient_seeds[1].as_ref().unwrap().data.iter().all(|d| d.abs() < 1e-6));
     }
 
     #[test]

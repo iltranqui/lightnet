@@ -1116,6 +1116,8 @@ impl ExecutableNetwork {
                     );
                     (Tensor::from_data(current_input.shape, out.output)?, None)
                 }
+                // C++ `memcpy(l.output, state.input, ...)` before any loss work.
+                (LayerKind::OmdLoss(_), LayerParams::None) => (current_input.clone(), None),
                 (LayerKind::Yolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
                 | (LayerKind::Region(_), LayerParams::None)
@@ -1849,6 +1851,7 @@ impl ExecutableNetwork {
                 | (LayerKind::Cost { .. }, LayerParams::None)
                 | (LayerKind::Logistic, LayerParams::None)
                 | (LayerKind::Segmentation(_), LayerParams::None)
+                | (LayerKind::OmdLoss(_), LayerParams::None)
                 | (LayerKind::Regression(_), LayerParams::None)
                 | (LayerKind::JevCe(_), LayerParams::None)
                 | (LayerKind::Contrastive { .. }, LayerParams::None) => {
@@ -4288,12 +4291,15 @@ where
                         .upload_f32(&tensor_backend_shape(layer.output_shape), &out.output)
                         .map_err(|err| backend_error("upload segmentation output", err))?
                 }
+                // `[omd_loss]` is a pure pass-through on the forward, exactly as
+                // in C++ (`memcpy(l.output, state.input, ...)`).
                 (LayerKind::Yolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
                 | (LayerKind::Region(_), LayerParams::None)
                 | (LayerKind::Detection(_), LayerParams::None)
                 | (LayerKind::Cost { .. }, LayerParams::None)
                 | (LayerKind::Regression(_), LayerParams::None)
+                | (LayerKind::OmdLoss(_), LayerParams::None)
                 | (LayerKind::Contrastive { .. }, LayerParams::None) => current_input.clone(),
                 (LayerKind::Dropout { probability, dropblock }, LayerParams::None) => {
                     let probability = probability.unwrap_or(0.5);
@@ -4755,6 +4761,7 @@ where
                     | LayerKind::Softmax { .. }
                     | LayerKind::Logistic
                     | LayerKind::Segmentation(_)
+                    | LayerKind::OmdLoss(_)
                     | LayerKind::Regression(_)
                     | LayerKind::JevCe(_)
                     | LayerKind::ScaleChannels(_)
@@ -5820,6 +5827,7 @@ where
                 | (LayerKind::Cost { .. }, Some(LayerParams::None))
                 | (LayerKind::Logistic, Some(LayerParams::None))
                 | (LayerKind::Segmentation(_), Some(LayerParams::None))
+                | (LayerKind::OmdLoss(_), Some(LayerParams::None))
                 | (LayerKind::Regression(_), Some(LayerParams::None))
                 | (LayerKind::JevCe(_), Some(LayerParams::None))
                 | (LayerKind::Sam(_), Some(LayerParams::None))
@@ -17276,6 +17284,49 @@ mod tests {
         // gradient, so an all-ones seed on the head must reach it untouched:
         // every bias gets exactly batch * H * W.
         let expected = (shape.batch * shape.width * shape.height) as f32;
+        for (i, g) in train.bias_updates.iter().enumerate() {
+            assert!((g - expected).abs() < 1e-4, "bias {i} gradient {g}, expected {expected}");
+        }
+    }
+
+    /// `[omd_loss]` is a forward pass-through and a backward pass-through, so
+    /// the GPU chain must match the CPU one exactly for any seed.
+    #[test]
+    fn gpu_omd_loss_head_matches_cpu_forward_and_backward() {
+        assert_gpu_layer_chain_matches_cpu(
+            "[net]\nwidth=2\nheight=2\nchannels=4\nbatch=2\n\
+             [convolutional]\nfilters=4\nsize=1\nstride=1\nactivation=linear\n\
+             [omd_loss]\nclasses=2\nmax_boxes=4\nlambda=0.5\n",
+            1,
+        );
+    }
+
+    /// End-to-end CPU: the layer's output is the previous layer's output, and a
+    /// seed on the head reaches the convolution untouched.
+    #[test]
+    fn omd_loss_layer_forward_and_backward_are_pass_through() {
+        let cfg = "[net]\nwidth=2\nheight=2\nchannels=3\nbatch=2\n\
+                   [convolutional]\nfilters=3\nsize=1\nstride=1\nactivation=linear\n\
+                   [omd_loss]\nclasses=2\nmax_boxes=4\n";
+        let network = Network::from_config(ConfigFile::parse_str("inline.cfg", cfg).unwrap()).unwrap();
+        let mut exec = ExecutableNetwork::new(network);
+        fill_conv_params(&mut exec.params);
+        let input = patterned_input(exec.network.net.input_shape());
+        let forward = exec.forward_training(&input).unwrap();
+        assert_eq!(
+            forward.layer_outputs[1].data,
+            forward.layer_outputs[0].data,
+            "[omd_loss] must be a forward pass-through"
+        );
+
+        let shape = exec.network.layers[1].output_shape;
+        let seed = Tensor::from_data(shape, vec![0.5f32; shape.batch * shape.element_count()]).unwrap();
+        let mut seeds = vec![None; exec.network.layers.len()];
+        seeds[1] = Some(seed);
+        exec.backward_accumulate_seeded(&input, &forward, &seeds).unwrap();
+        let LayerTrainBuffers::Convolutional(train) = &exec.train_buffers[0] else { panic!() };
+        // The 1x1 convolution's bias gradient is the plain sum of the seed.
+        let expected = 0.5 * (shape.batch * shape.width * shape.height) as f32;
         for (i, g) in train.bias_updates.iter().enumerate() {
             assert!((g - expected).abs() < 1e-4, "bias {i} gradient {g}, expected {expected}");
         }

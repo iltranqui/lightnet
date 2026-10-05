@@ -33,6 +33,7 @@ pub use initialize::initialize_training_params;
 pub mod model;
 pub(crate) mod maxpool_depth;
 pub mod names;
+pub(crate) mod omd_loss;
 pub mod runtime;
 pub(crate) mod segmentation;
 pub(crate) mod shortcut_weights;

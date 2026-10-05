@@ -349,6 +349,45 @@ impl SegmentationLoss {
     }
 }
 
+/// `[omd_loss]` (Phase 1b of `tasks/rust/layers.md`), ported from
+/// `Jev_laya:src-lib/darknet_cfg.cpp::parse_omd_loss_section`.  The layer is a
+/// pass-through with no weights; every key below is the C++ one, including its
+/// alias spellings.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OmdLossSpec {
+    /// Class count; `0` disables the class filter on box truth and selects the
+    /// classification sampler when `max_boxes == 0`.
+    pub classes: usize,
+    /// Box truth rows per image; `0` switches to the classification sampler.
+    pub max_boxes: usize,
+    /// Floats per box row; `truth[0] == 0` ends an image's rows.
+    pub truth_size: usize,
+    /// The loss weight (C++ spells it `lambda`, `normalizer` or `cls_normalizer`).
+    pub cls_normalizer: f32,
+    /// Cosine-distance margin in `[0, 2]`.
+    pub margin: f32,
+    pub positive_weight: f32,
+    pub negative_weight: f32,
+    /// Also the per-sample weight of a background sample.
+    pub background_weight: f32,
+    /// Smallest-object side, in pixels of the network input, that gets boosted.
+    pub small_threshold: f32,
+    pub small_boost: f32,
+    /// Sample budget; must be `>= 2`.
+    pub max_samples: usize,
+    /// Extra background samples per image (0 = none).
+    pub background_samples: usize,
+    /// `pool=1` averages each channel over the whole image for the
+    /// classification sampler.
+    pub pool: usize,
+    /// Floor for the squared norm during normalisation.
+    pub eps: f32,
+    /// Delta clip; the C++ default is 10, not `FLT_MAX`.
+    pub max_delta: f32,
+    /// Log the pair statistics every iteration.
+    pub show_details: bool,
+}
+
 /// `[segmentation]` (Phase 1b of `tasks/rust/layers.md`), ported from
 /// `v6-dev-seg:src-lib/darknet_cfg.cpp::parse_segmentation_section`.  The layer
 /// has no weights and passes its shape through unchanged.
@@ -679,6 +718,7 @@ pub enum LayerKind {
     Regression(RegressionSpec),
     JevCe(JevCeSpec),
     Segmentation(SegmentationSpec),
+    OmdLoss(OmdLossSpec),
     Dropout {
         probability: Option<f32>,
         /// `dropblock=1` selects DropBlock instead of element-wise dropout.
@@ -722,6 +762,7 @@ impl LayerKind {
             Self::Regression(_) => "regression",
             Self::JevCe(_) => "jev_ce",
             Self::Segmentation(_) => "segmentation",
+            Self::OmdLoss(_) => "omd_loss",
             Self::Dropout { .. } => "dropout",
             Self::ScaleChannels(_) => "scale_channels",
             Self::Sam(_) => "sam",
@@ -1727,6 +1768,50 @@ fn parse_layer_kind(
                 gate_max_compensation,
             })
         }
+        // `[omd_loss]`: C++ reads several keys under two spellings each
+        // (primary first, alias otherwise), and the loss weight under three.
+        "omd_loss" | "omd" => {
+            let line = section.line;
+            let alias_int = |primary: &str, alias: &str, fallback: usize| -> Result<usize> {
+                if section.get(primary).is_some() { section.get_usize(primary, fallback) } else { section.get_usize(alias, fallback) }
+            };
+            let alias_float = |primary: &str, alias: &str, fallback: f32| -> Result<f32> {
+                if section.get(primary).is_some() { section.get_f32(primary, fallback) } else { section.get_f32(alias, fallback) }
+            };
+            let cls_normalizer = if section.get("lambda").is_some() {
+                section.get_f32("lambda", 0.03)?
+            } else if section.get("normalizer").is_some() {
+                section.get_f32("normalizer", 0.03)?
+            } else {
+                section.get_f32("cls_normalizer", 0.03)?
+            };
+            let max_samples = section.get_usize("max_samples", 128)?;
+            if max_samples < 2 {
+                return Err(Error::InvalidConfig(format!("[omd_loss] at line {line}: max_samples must be >= 2")));
+            }
+            let margin = section.get_f32("margin", 0.5)?;
+            if !(0.0..=2.0).contains(&margin) {
+                return Err(Error::InvalidConfig(format!("[omd_loss] at line {line}: margin must be in [0,2]")));
+            }
+            LayerKind::OmdLoss(OmdLossSpec {
+                classes: section.get_usize("classes", 0)?,
+                max_boxes: alias_int("max_boxes", "max", 200)?,
+                truth_size: section.get_usize("truth_size", 6)?,
+                cls_normalizer,
+                margin,
+                positive_weight: alias_float("positive_weight", "pos_weight", 1.0)?,
+                negative_weight: alias_float("negative_weight", "neg_weight", 1.0)?,
+                background_weight: alias_float("background_weight", "bg_weight", 1.0)?,
+                small_threshold: alias_float("small_threshold", "small_threshold_px", 0.0)?,
+                small_boost: section.get_f32("small_boost", 1.0)?,
+                max_samples,
+                background_samples: alias_int("background_samples", "bg_samples", 0)?,
+                pool: section.get_usize("pool", 0)?,
+                eps: section.get_f32("eps", 1e-6)?,
+                max_delta: section.get_f32("max_delta", 10.0)?,
+                show_details: section.get_usize("show_details", 0)? != 0,
+            })
+        }
         "dropout" => LayerKind::Dropout {
             probability: section
                 .get("probability")
@@ -1943,6 +2028,7 @@ fn infer_output_shape(
         | LayerKind::Regression(_)
         | LayerKind::JevCe(_)
         | LayerKind::Segmentation(_)
+        | LayerKind::OmdLoss(_)
         | LayerKind::Dropout { .. }
         | LayerKind::Contrastive { .. } => Ok(current),
         LayerKind::ChannelSlice(spec) => {
@@ -2439,6 +2525,52 @@ mod tests {
         ] {
             assert!(build(&format!("{base}[segmentation]\n{bad}\n")).is_err(), "accepted {bad}");
         }
+    }
+
+    #[test]
+    fn omd_loss_keys_follow_cpp_defaults_aliases_and_validation() {
+        // C++ defaults: classes=0, max_boxes=200, truth_size=6,
+        // cls_normalizer/lambda=0.03, margin=0.5, the three weights 1.0,
+        // small_threshold=0, small_boost=1, max_samples=128,
+        // background_samples=0, pool=0, eps=1e-6, max_delta=10.
+        let base = "[net]\nwidth=2\nheight=2\nchannels=3\n[convolutional]\nfilters=3\nsize=1\n";
+        let net = build(&format!("{base}[omd_loss]\n")).unwrap();
+        let LayerKind::OmdLoss(s) = &net.layers[1].kind else { panic!() };
+        assert_eq!((s.classes, s.max_boxes, s.truth_size), (0, 200, 6));
+        assert_eq!((s.cls_normalizer, s.margin, s.max_delta), (0.03, 0.5, 10.0));
+        assert_eq!((s.positive_weight, s.negative_weight, s.background_weight), (1.0, 1.0, 1.0));
+        assert_eq!((s.small_threshold, s.small_boost, s.max_samples), (0.0, 1.0, 128));
+        assert_eq!((s.background_samples, s.pool, s.eps), (0, 0, 1e-6));
+        assert!(!s.show_details);
+        assert!(net.layers[1].weights().is_none(), "the layer has no weights");
+        assert_eq!(net.layers[1].output_shape, net.layers[0].output_shape);
+
+        // Primary key wins over its alias; the loss weight has three spellings.
+        for (keys, want) in [
+            ("max_boxes=7\nmax=9", 7usize),
+            ("max=9", 9),
+        ] {
+            let net = build(&format!("{base}[omd_loss]\n{keys}\n")).unwrap();
+            let LayerKind::OmdLoss(s) = &net.layers[1].kind else { panic!() };
+            assert_eq!(s.max_boxes, want, "{keys}");
+        }
+        for (key, want) in [("lambda", 0.03f32), ("normalizer", 0.03), ("cls_normalizer", 0.03)] {
+            let net = build(&format!("{base}[omd_loss]\n{key}=0.5\n")).unwrap();
+            let LayerKind::OmdLoss(s) = &net.layers[1].kind else { panic!() };
+            assert!((s.cls_normalizer - 0.5).abs() < 1e-6, "{key}");
+            let _ = want;
+        }
+        let net = build(&format!("{base}[omd_loss]\npos_weight=2\nbg_samples=4\nsmall_threshold_px=8\n")).unwrap();
+        let LayerKind::OmdLoss(s) = &net.layers[1].kind else { panic!() };
+        assert_eq!(s.positive_weight, 2.0);
+        assert_eq!(s.background_samples, 4);
+        assert_eq!(s.small_threshold, 8.0);
+
+        // C++ validation.
+        assert!(build(&format!("{base}[omd_loss]\nmax_samples=1\n")).is_err());
+        assert!(build(&format!("{base}[omd_loss]\nmargin=-0.1\n")).is_err());
+        assert!(build(&format!("{base}[omd_loss]\nmargin=2.5\n")).is_err());
+        assert!(build(&format!("{base}[omd_loss]\nmargin=2\n")).is_ok(), "2 is inclusive");
     }
 
     #[test]
