@@ -22199,6 +22199,90 @@ mod tests {
     }
 
     #[test]
+    fn optimizer_state_round_trips_nested_moe_moments() {
+        let dir =
+            std::env::temp_dir().join(format!("darknet-moe-opt-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("moe-opt.state");
+        let cfg = "[net]\nwidth=1\nheight=1\nchannels=1\nbatch=1\nadam=1\nb1=0.8\nb2=0.95\neps=0.001\n[moe_convolutional]\nfilters=1\nsize=1\nexperts=2\ntop_k=0\nload_balance=0\nactivation=linear\n";
+        let build = || {
+            let network =
+                Network::from_config(ConfigFile::parse_str("inline.cfg", cfg).unwrap()).unwrap();
+            GpuExecutableNetwork::new(network, FakeBackend)
+        };
+        let set_grads = |gpu: &mut GpuExecutableNetwork<FakeBackend>, step: usize| {
+            let LayerTrainBuffers::Moe(train) = &mut gpu.cpu_fallback_train_buffers.get_mut()[0]
+            else {
+                panic!("MoE train buffers");
+            };
+            let values = if step == 1 {
+                ([0.1, -0.2], [-0.3, 0.4], [0.05, -0.08])
+            } else {
+                ([-0.25, 0.15], [0.2, -0.1], [-0.12, 0.07])
+            };
+            train.router_weight_updates.copy_from_slice(&values.0);
+            train.router_bias_updates.copy_from_slice(&values.1);
+            for (index, expert) in train.experts.iter_mut().enumerate() {
+                expert.weight_updates[0] = values.2[0] * (index as f32 + 1.0);
+                expert.bias_updates[0] = values.2[1] * (index as f32 + 1.0);
+            }
+        };
+        let mut original = build();
+        let LayerParams::Moe(params) = &mut original.params[0] else {
+            unreachable!()
+        };
+        params.router_weights.copy_from_slice(&[0.2, -0.4]);
+        params.router_biases.copy_from_slice(&[0.1, -0.2]);
+        for (index, expert) in params.experts.iter_mut().enumerate() {
+            expert.weights[0] = 0.15 * (index as f32 + 1.0);
+            expert.biases[0] = -0.05 * (index as f32 + 1.0);
+        }
+        set_grads(&mut original, 1);
+        original
+            .update_weights_gpu(0.01, 0.0, 0.0, 1)
+            .expect("first MoE Adam step");
+        original
+            .save_optimizer_state(&path)
+            .expect("save nested moments");
+
+        let mut resumed = build();
+        resumed.params.clone_from(&original.params);
+        resumed
+            .load_optimizer_state(&path)
+            .expect("restore nested moments");
+        set_grads(&mut original, 2);
+        set_grads(&mut resumed, 2);
+        original
+            .update_weights_gpu(0.01, 0.0, 0.0, 1)
+            .expect("continued MoE Adam step");
+        resumed
+            .update_weights_gpu(0.01, 0.0, 0.0, 1)
+            .expect("resumed MoE Adam step");
+        let (LayerParams::Moe(original), LayerParams::Moe(resumed)) =
+            (&original.params[0], &resumed.params[0])
+        else {
+            unreachable!()
+        };
+        assert_slice_close(
+            "resumed MoE router weights",
+            &original.router_weights,
+            &resumed.router_weights,
+            1e-7,
+        );
+        assert_slice_close(
+            "resumed MoE router biases",
+            &original.router_biases,
+            &resumed.router_biases,
+            1e-7,
+        );
+        for (a, b) in original.experts.iter().zip(&resumed.experts) {
+            assert_slice_close("resumed MoE expert weights", &a.weights, &b.weights, 1e-7);
+            assert_slice_close("resumed MoE expert biases", &a.biases, &b.biases, 1e-7);
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn gpu_gradients_accumulate_across_subdivisions() {
         // Two backward passes into the same buffers == the sum of two fresh passes.
         let grads = |steps: &[usize]| {
