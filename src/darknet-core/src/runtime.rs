@@ -4440,10 +4440,11 @@ where
                         &mut params.output, &mut train.output, host_adam_child(moments, 2), adam,
                     )?;
                 }
-                (LayerParams::Convolutional(_), _) if matches!(layer.kind, LayerKind::Deconvolutional(_)) => {
-                    return Err(Error::InvalidConfig(format!(
-                        "adam=1 on the GPU path has no optimizer state for deconvolutional layer #{index}"
-                    )));
+                (LayerParams::Convolutional(params), LayerTrainBuffers::Convolutional(train))
+                    if matches!(layer.kind, LayerKind::Deconvolutional(_)) =>
+                {
+                    let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    apply_host_adam_convolutional(params, train, moments, adam)?;
                 }
                 (LayerParams::None, _) | (LayerParams::Convolutional(_), _) => {}
                 _ => {
@@ -21387,6 +21388,56 @@ mod tests {
             let weights = gpu.backend.download_f32(&cached.raw_weights).expect("download expert weights");
             assert_slice_close("reuploaded MoE expert weights", expected_weights, &weights, 0.0);
         }
+    }
+
+    #[test]
+    fn gpu_adam_updates_deconvolutional_host_parameters() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "inline.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=1\nbatch=1\nadam=1\nb1=0.8\nb2=0.95\neps=0.001\n[deconvolutional]\nfilters=1\nsize=2\nstride=2\nactivation=linear\n",
+            )
+            .expect("cfg"),
+        )
+        .expect("network");
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        let LayerParams::Convolutional(params) = &mut gpu.params[0] else {
+            panic!("deconvolutional parameters");
+        };
+        params.weights.copy_from_slice(&[0.2, -0.3, 0.4, -0.5]);
+        params.biases[0] = 0.1;
+        let initial_weights = params.weights.clone();
+        let initial_biases = params.biases.clone();
+        let LayerTrainBuffers::Convolutional(train) = &mut gpu.cpu_fallback_train_buffers.get_mut()[0] else {
+            panic!("deconvolutional train buffers");
+        };
+        train.weight_updates.copy_from_slice(&[0.03, -0.02, 0.01, -0.04]);
+        train.bias_updates[0] = -0.05;
+        let weight_updates = train.weight_updates.clone();
+        let bias_updates = train.bias_updates.clone();
+        let adam = super::AdamParams {
+            lr: 0.01,
+            beta1: 0.8,
+            beta2: 0.95,
+            eps: 0.001,
+            decay: 0.0,
+            batch: 1,
+            step: 1,
+            decoupled_decay: false,
+        };
+        let zeros_weights = [0.0f32; 4];
+        let zeros_bias = [0.0f32; 1];
+        let expected_weights = darknet_cuda::host_ops::adam_update(
+            &initial_weights, &weight_updates, &zeros_weights, &zeros_weights, &adam,
+        ).0;
+        let expected_bias = darknet_cuda::host_ops::adam_update(
+            &initial_biases, &bias_updates, &zeros_bias, &zeros_bias, &adam,
+        ).0;
+        gpu.update_weights_gpu(0.01, 0.0, 0.0, 1)
+            .expect("deconvolutional Adam update");
+        let LayerParams::Convolutional(params) = &gpu.params[0] else { unreachable!() };
+        assert_slice_close("deconvolutional weights Adam", &expected_weights, &params.weights, 1e-7);
+        assert_slice_close("deconvolutional biases Adam", &expected_bias, &params.biases, 1e-7);
     }
 
     #[test]
