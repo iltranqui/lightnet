@@ -92,6 +92,7 @@ fn unsupported_sections(cfg: &ConfigFile) -> String {
         "logistic",
         "regression",
         "jev_ce",
+        "yolox",
     ];
     cfg.sections
         .iter()

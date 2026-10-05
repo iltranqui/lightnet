@@ -3240,17 +3240,70 @@ Cross-cutting prerequisites: (1) container layers (moe, eml, recursive_block, cl
 
 `fog`'s `[net]` augmentation key; `raptor-dev` augmentation sections `[Brightness] [GaussianBlur] [GaussianNoise] [PepperNoise] [augmatch]` (see `tasks/rust/augmentation-audit.md`); `[net]` keys `obb`, `rotate_obb`, `tf32`, `cudnn_bf16`, `random_init_weights`, `thread_val` (except where a phase above needs them); `raptor-fp4`'s `fp8`/`fp4` keys and `src-fp8` conv path (see `tasks/rust/fp8_fp4.md`); the `flash_attention`/`vc_attention` flags on `[vit]`/`[tucker_attention]` (Open Question 3); `src-jepa`'s standalone I-JEPA trainer.
 
-# Open questions for the user
+# Open questions for the user — RESOLVED 2026-10-04
 
-1. **Which cfgs to ship?** Default: none; tests use inline cfg strings. Memory says the unet_* / Seg_resnet_1head / deconvolutional cfgs were rejected for an earlier C++ port. Say if you want any under `cfg/`.
-2. **Does LAYA belong in Rust at all?** C++ inference and training were already ported on another branch (memory). Default: skip all `laya_*` layers.
-3. **Port `flash_attention` / `vc_attention` variants of vit/tucker?** Default: no; reference attention only.
-4. **OBB scope:** `obb_yolo` only, or also `obb_anchorless`, `yolo_2stage`, `obb_refine`? It also changes data loading, NMS and mAP.
-5. **Where do dense-truth losses plug in?** `detector train` only feeds yolo labels. `dense_loss.rs` needs a trainer (classifier / segmenter command or a generic truth loader) before logistic/regression/cost/jev_ce can train from a CLI. Default: library API only (this plan).
-6. **Rust-only legacy layers** (`gru`, `local`, `crop`, `batchnorm`, `detection`): keep as extensions (Task 5 keeps `batchnorm` saveable) or remove them? No C++ branch has them.
-7. **swin `.weights` order:** no C++ writer exists; OK to define it (vit-like) and make Rust the reference?
+The user answered **all of them yes, and asked for everything to be ported to
+Rust** ("q2, a3, a7: all yes and port everything in rust").  The decisions are
+recorded here so no later step re-opens them; the *consequences* are folded into
+the phase tables above.
 
----
+1. **Which cfgs to ship?** Port everything. Shipping the `unet_*` /
+   `Seg_resnet_1head` / `deconvolutional` cfgs under `cfg/` is now in scope
+   alongside the layer itself (they were previously gated on this question).
+2. **Does LAYA belong in Rust at all? YES.** Unblocks the Phase 1b `laya_*`
+   family (`laya_marker_gather`, `laya_scorer`, `laya_act_head`, `laya_loss`)
+   and Phase 4's `laya_encoder` / `laya_head`.  The plan's note that LAYA
+   training needs AdamW on the C++ side becomes a Rust requirement, not a
+   blocker.
+3. **Port the `flash_attention` / `vc_attention` variants of `vit` / `tucker`?
+   YES.** They are no longer deferred; the shared attention kernel set in the
+   Phase 3A prerequisites must cover the fast paths, not only reference
+   attention.
+4. **OBB scope: port the whole family.** `obb_yolo`, `obb_anchorless`,
+   `yolo_2stage` and `obb_refine` are all in scope, together with the rotated-box
+   data loading, augmentation, NMS and mAP work they imply.
+5. **Where do dense-truth losses plug in? Port a trainer.** `logistic`,
+   `regression`, `cost`, `jev_ce`, `segmentation`, `omd_loss` and `contrastive`
+   currently have a library API only; a CLI trainer (and a segmenter command) is
+   now part of the scope rather than a follow-up.
+6. **Rust-only legacy layers: keep them as extensions.** `batchnorm` stays
+   saveable; `gru`, `local`, `crop`, `detection` and `region` stay supported
+   (with `region` / `detection` decode and loss implemented properly, since
+   22 corpus cfgs use them).
+7. **swin `.weights` order: Rust defines it.** No C++ writer exists, so the
+   vit-like order proposed in this document becomes the reference and is
+   documented in `Layer::weights()`.
+
+## Consequences for the phase tables
+
+Everything above is now unblocked, so the "Blocked on" column only records
+genuine *evidence* gaps rather than questions for the user:
+
+| Phase | Real blocker left | Notes |
+|---|---|---|
+| 1b `segmentation` | - | done 2026-10-04 (label loader, `seg_gate` GPU kernel and the cfgs still open) |
+| 1b `omd_loss` | - | done 2026-10-04 (`show_details` reporting still open) |
+| 1b deferred (c) `contrastive` | - | classifier branch done 2026-10-04; detection branch needs the yolo head's per-box class ids; `region` / `detection` decode + loss still open |
+| 1b `laya_*` | - | unblocked by decision 2; needs the shared LayerNorm/GEMM op set (Phase 3A prerequisite 2) |
+| 2A anchor-free heads | - | `yolox` done 2026-10-04; `ppyoloe` / `yolonas` (shared DFL) and `centernet` to go, plus the LegoGears nested-object fix |
+| 2B `moe` / `eml` | - | need the container-conv reuse prerequisite first; `eml` is an activation, not a `LayerKind` |
+| 2B `dcnv3` | **no reference numerics** | see the finding below - all five branches that carry it have a stub forward/backward/update, so it cannot be a verified port |
+| 2C OBB family | - | unblocked by decision 4; XL, and it also changes data loading, NMS and mAP |
+| 3A transformer family | - | unblocked by decisions 3 and 7; needs the shared kernel set (LayerNorm fwd/bwd, batched GEMM, row-softmax backward, residual/bias epilogues) built once first |
+| 3B conv family | - | `dcnv4` has a real C++ forward; `deform_conv`, `dsconv`, `graph_conv`, `wmhf`, `clifford`, `recursive_block` still to go |
+| 4 foveation / depth / LAYA / DETR | - | unblocked by decision 2; DETR is still broken in C++, so its reference is the paper, like `dcnv3` |
+
+### Finding: `[dcnv3]` has no reference implementation anywhere in this repo
+
+Verified 2026-10-04 on `deform`, `Jev_laya`, `fog`, `jepa` and `depth_3d`:
+`forward_dcnv3_layer`, `backward_dcnv3_layer` and `update_dcnv3_layer` are all
+`display_warning_msg("... not fully implemented")` placeholders, and
+`docs/dcnv3_layer.md` says so explicitly ("**Status**: STUB",
+"1. No CPU implementation yet").  The plan's "[verified]" weights order
+(`save_dcnv3_weights`, confirmed correct) is the only part that can be ported
+against C++; the numerics would have to come from the InternImage reference
+instead, which is a different contract.  `[dcnv4]` (Phase 3B) is the tractable
+deformable target instead: its CPU forward and GPU kernels are real.
 
 # Self-review (writing-plans checklist, run against this document)
 
@@ -3265,10 +3318,11 @@ Cross-cutting prerequisites: (1) container layers (moe, eml, recursive_block, cl
 - [x] Task 7 channel_slice - [x] Task 8 channel_shuffle - [x] Task 9 deconvolutional - [x] Task 10 dense loss + logistic/regression/cost - [x] Task 11 jev_ce - [x] Task 12 bookkeeping
 - [ ] Phase 1b / 2 / 3 / 4: expand into their own plans (one per bullet group) before starting
 
-Phase 1b progress (the only phase whose items are not blocked on an Open
-Question): `segmentation` and `omd_loss` are done, `contrastive`'s classifier
-branch is done (its detection branch is not, and says so), and `laya_*` waits
-on Open Question 2.
+**All Open Questions are resolved** (2026-10-04, "port everything in Rust") -
+see the RESOLVED section below.  Phase 1b progress: `segmentation`, `omd_loss`
+and the `contrastive` classifier branch are done, `yolox` (Phase 2A) is done,
+and `laya_*` is unblocked and next.  A cross-phase status file lives at
+`tasks/rust/STATUS.md`.
 
 Phase 0 landed in commits `8e4b0f24` .. `be71eb6e`; the `todo.md` block
 "Layer-port Phase 0 delivered" is the bookkeeping (Task 12 Step 2).  Verified

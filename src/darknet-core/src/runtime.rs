@@ -861,7 +861,7 @@ impl ExecutableNetwork {
                     | LayerKind::Detection(_)
                     | LayerKind::Softmax { .. }
                     | LayerKind::Cost { .. }
-                    | LayerKind::Contrastive { .. }
+                    | LayerKind::Contrastive(_)
             )
         }) {
             return self
@@ -940,7 +940,7 @@ impl ExecutableNetwork {
                 | (LayerKind::Region(_), LayerParams::None)
                 | (LayerKind::Detection(_), LayerParams::None)
                 | (LayerKind::Cost { .. }, LayerParams::None)
-                | (LayerKind::Contrastive { .. }, LayerParams::None) => {
+                | (LayerKind::Contrastive(_), LayerParams::None) => {
                     current_input.expect("pass-through input").clone()
                 }
                 _ => unreachable!("layer-family preflight must cover compact inference"),
@@ -1115,6 +1115,25 @@ impl ExecutableNetwork {
                         current_input.shape.width * current_input.shape.height,
                     );
                     (Tensor::from_data(current_input.shape, out.output)?, None)
+                }
+                // C++ `memcpy(l.output, state.input, ...)` then
+                // `activate_modern_output`, so the head *does* transform its
+                // input: the last `1 + classes` entries of every cell go
+                // through a sigmoid while the four box entries stay raw.
+                (LayerKind::Yolox(spec), LayerParams::None) => {
+                    let layout = crate::modern_yolo::ModernLayout {
+                        batch: current_input.shape.batch,
+                        n: 1,
+                        w: current_input.shape.width,
+                        h: current_input.shape.height,
+                        classes: spec.classes,
+                        coords: 4,
+                    };
+                    let mut data = current_input.data.clone();
+                    if data.len() == layout.len() {
+                        crate::modern_yolo::activate_modern_output(&mut data, &layout);
+                    }
+                    (Tensor::from_data(current_input.shape, data)?, None)
                 }
                 // C++ `memcpy(l.output, state.input, ...)` before any loss work.
                 (LayerKind::OmdLoss(_), LayerParams::None) => (current_input.clone(), None),
@@ -1855,9 +1874,9 @@ impl ExecutableNetwork {
                 | (LayerKind::Segmentation(_), LayerParams::None)
                 | (LayerKind::OmdLoss(_), LayerParams::None)
                 | (LayerKind::Contrastive(_), LayerParams::None)
+                | (LayerKind::Yolox(_), LayerParams::None)
                 | (LayerKind::Regression(_), LayerParams::None)
-                | (LayerKind::JevCe(_), LayerParams::None)
-                | (LayerKind::Contrastive { .. }, LayerParams::None) => {
+                | (LayerKind::JevCe(_), LayerParams::None) => {
                     accumulate_previous_gradient(
                         layer.index,
                         &grad,
@@ -4294,6 +4313,30 @@ where
                         .upload_f32(&tensor_backend_shape(layer.output_shape), &out.output)
                         .map_err(|err| backend_error("upload segmentation output", err))?
                 }
+                // `[yolox]` applies the C++ `activate_modern_output` (a sigmoid
+                // on the trailing `1 + classes` entries of every cell), which
+                // is a strided sub-range pass, so it goes through the host for
+                // now like the other host-round-trip heads.
+                (LayerKind::Yolox(spec), LayerParams::None) => {
+                    let host_input = self
+                        .download_tensor(current_input, layer.input_shape)
+                        .map_err(|err| backend_error("download yolox input", err))?;
+                    let layout = crate::modern_yolo::ModernLayout {
+                        batch: layer.input_shape.batch,
+                        n: 1,
+                        w: layer.input_shape.width,
+                        h: layer.input_shape.height,
+                        classes: spec.classes,
+                        coords: 4,
+                    };
+                    let mut data = host_input.data;
+                    if data.len() == layout.len() {
+                        crate::modern_yolo::activate_modern_output(&mut data, &layout);
+                    }
+                    self.backend
+                        .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
+                        .map_err(|err| backend_error("upload yolox output", err))?
+                }
                 // `[omd_loss]` is a pure pass-through on the forward, exactly as
                 // in C++ (`memcpy(l.output, state.input, ...)`).
                 (LayerKind::Yolo(_), LayerParams::None)
@@ -4303,7 +4346,7 @@ where
                 | (LayerKind::Cost { .. }, LayerParams::None)
                 | (LayerKind::Regression(_), LayerParams::None)
                 | (LayerKind::OmdLoss(_), LayerParams::None)
-                | (LayerKind::Contrastive { .. }, LayerParams::None) => current_input.clone(),
+                | (LayerKind::Contrastive(_), LayerParams::None) => current_input.clone(),
                 (LayerKind::Dropout { probability, dropblock }, LayerParams::None) => {
                     let probability = probability.unwrap_or(0.5);
                     check_dropout_probability(probability)?;
@@ -5041,7 +5084,8 @@ where
                 | (LayerKind::Dropout { .. }, LayerParams::None)
                 | (LayerKind::ScaleChannels(_), LayerParams::None)
                 | (LayerKind::Sam(_), LayerParams::None)
-                | (LayerKind::Contrastive { .. }, LayerParams::None) => current_input
+                | (LayerKind::Contrastive(_), LayerParams::None)
+                | (LayerKind::Yolox(_), LayerParams::None) => current_input
                     .expect("staging layer requires current input")
                     .clone(),
                 (LayerKind::Connected(_), _)
@@ -5836,7 +5880,7 @@ where
                 | (LayerKind::Regression(_), Some(LayerParams::None))
                 | (LayerKind::JevCe(_), Some(LayerParams::None))
                 | (LayerKind::Sam(_), Some(LayerParams::None))
-                | (LayerKind::Contrastive { .. }, Some(LayerParams::None)) => {
+                | (LayerKind::Yolox(_), Some(LayerParams::None)) => {
                     self.accumulate_previous_gpu_gradient(
                         layer.index,
                         grad,
@@ -16475,7 +16519,7 @@ mod tests {
                             | LayerKind::Dropout { .. }
                             | LayerKind::ScaleChannels(_)
                             | LayerKind::Sam(_)
-                            | LayerKind::Contrastive { .. }
+                            | LayerKind::Contrastive(_)
                     )
                 })
                 .map(|layer| (layer.index, layer.kind.name().to_owned()));
@@ -17341,6 +17385,18 @@ mod tests {
 
     /// `[contrastive]` is a forward pass-through and a backward pass-through, so
     /// the GPU chain must match the CPU one for any seed.
+    /// `[yolox]` transforms its input (the trailing `1 + classes` entries of
+    /// every cell go through a sigmoid) and its seed reaches the previous layer.
+    #[test]
+    fn gpu_yolox_head_matches_cpu_forward_and_backward() {
+        assert_gpu_layer_chain_matches_cpu(
+            "[net]\nwidth=2\nheight=2\nchannels=7\nbatch=2\n\
+             [convolutional]\nfilters=7\nsize=1\nstride=1\nactivation=linear\n\
+             [yolox]\nclasses=2\nmax=4\n",
+            1,
+        );
+    }
+
     #[test]
     fn gpu_contrastive_head_matches_cpu_forward_and_backward() {
         assert_gpu_layer_chain_matches_cpu(

@@ -357,6 +357,22 @@ impl SegmentationLoss {
     }
 }
 
+/// `[yolox]`: the anchor-free detection head (Phase 2A of `tasks/rust/layers.md`),
+/// ported from `Jev_laya:src-lib/darknet_cfg.cpp::parse_yolox_section`.  The
+/// layer has no weights and no kernels; see
+/// `src/darknet-core/src/modern_yolo.rs` for the decode, SimOTA assignment and
+/// deltas.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModernYoloSpec {
+    pub classes: usize,
+    /// Maximum truth rows per image.
+    pub max_boxes: usize,
+    /// Ground-truth jitter used by the data loader.
+    pub jitter: f32,
+    /// Ground-truth resize factor used by the data loader.
+    pub resize: f32,
+}
+
 /// `[contrastive]`: the supervised-contrastive head, classifier branch
 /// (deferred item (c) of `tasks/rust/layers.md` Phase 1b), ported from
 /// `Jev_laya:src-lib/darknet_cfg.cpp::parse_contrastive_section`.  `yolo_layer`
@@ -754,6 +770,8 @@ pub enum LayerKind {
     ScaleChannels(ScaleChannelsSpec),
     Sam(SamSpec),
     Contrastive(ContrastiveSpec),
+    /// `[yolox]`; the sibling spellings live in [`ModernYoloSpec`].
+    Yolox(ModernYoloSpec),
     Rnn(RnnSpec),
     Gru(GruSpec),
     Lstm(LstmSpec),
@@ -794,6 +812,7 @@ impl LayerKind {
             Self::ScaleChannels(_) => "scale_channels",
             Self::Sam(_) => "sam",
             Self::Contrastive(_) => "contrastive",
+            Self::Yolox(_) => "yolox",
             Self::Rnn(_) => "rnn",
             Self::Gru(_) => "gru",
             Self::Lstm(_) => "lstm",
@@ -1870,6 +1889,7 @@ fn parse_layer_kind(
             from: section.get_isize("from", 0)?,
             activation: Activation::parse(&section.get_str("activation", "linear")),
         }),
+        "yolox" => LayerKind::Yolox(parse_modern_yolo_spec(&section)?),
         "contrastive" => LayerKind::Contrastive(ContrastiveSpec {
             classes: section.get_usize("classes", 1000)?,
             yolo_layer: section.get_isize("yolo_layer", 0)?,
@@ -2062,6 +2082,7 @@ fn infer_output_shape(
         | LayerKind::OmdLoss(_)
         | LayerKind::Dropout { .. }
         | LayerKind::Contrastive(_) => Ok(current),
+        | LayerKind::Yolox(_) => Ok(current),
         LayerKind::ChannelSlice(spec) => {
             let source_index = resolve_relative_layer(layer_index, spec.from)?;
             let source = built_layers
@@ -2328,6 +2349,22 @@ fn conv_dim(input: usize, padding: usize, size: usize, stride: usize) -> usize {
     ((input + 2 * padding).saturating_sub(size) / stride.max(1)) + 1
 }
 
+/// C++ `parse_yolox_section`: `classes`(20), `max`(200), `jitter`(0.2) and
+/// `resize`(1.0).  The PP-YOLOE / YOLO-NAS siblings share the first two keys and
+/// add `reg_max`(16); they are not ported yet.
+fn parse_modern_yolo_spec(section: &RawSection) -> Result<ModernYoloSpec> {
+    let line = section.line;
+    let classes = section.get_usize("classes", 20)?;
+    if classes == 0 {
+        return Err(Error::InvalidConfig(format!("[yolox] at line {line}: classes must be > 0")));
+    }
+    let max_boxes = section.get_usize("max", 200)?;
+    if max_boxes == 0 {
+        return Err(Error::InvalidConfig(format!("[yolox] at line {line}: max must be > 0")));
+    }
+    Ok(ModernYoloSpec { classes, max_boxes, jitter: section.get_f32("jitter", 0.2)?, resize: section.get_f32("resize", 1.0)? })
+}
+
 fn pool_dim(input: usize, padding: usize, size: usize, stride: usize) -> usize {
     ((input + padding).saturating_sub(size) / stride.max(1)) + 1
 }
@@ -2556,6 +2593,24 @@ mod tests {
         ] {
             assert!(build(&format!("{base}[segmentation]\n{bad}\n")).is_err(), "accepted {bad}");
         }
+    }
+
+    #[test]
+    fn yolox_keys_follow_cpp_defaults_and_validation() {
+        // C++ `parse_yolox_section`: classes=20, max=200, jitter=0.2, resize=1.0.
+        let base = "[net]\nwidth=4\nheight=4\nchannels=7\n[convolutional]\nfilters=7\nsize=1\n";
+        let net = build(&format!("{base}[yolox]\n")).unwrap();
+        let LayerKind::Yolox(s) = &net.layers[1].kind else { panic!() };
+        assert_eq!((s.classes, s.max_boxes, s.jitter, s.resize), (20, 200, 0.2, 1.0));
+        assert!(net.layers[1].weights().is_none(), "the head has no weights");
+        assert_eq!(net.layers[1].output_shape, net.layers[0].output_shape);
+
+        let net = build(&format!("{base}[yolox]\nclasses=3\nmax=64\njitter=0.1\nresize=1.5\n")).unwrap();
+        let LayerKind::Yolox(s) = &net.layers[1].kind else { panic!() };
+        assert_eq!((s.classes, s.max_boxes), (3, 64));
+        assert!((s.jitter - 0.1).abs() < 1e-6 && (s.resize - 1.5).abs() < 1e-6);
+        assert!(build(&format!("{base}[yolox]\nclasses=0\n")).is_err());
+        assert!(build(&format!("{base}[yolox]\nmax=0\n")).is_err());
     }
 
     #[test]

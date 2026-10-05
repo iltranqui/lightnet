@@ -33,6 +33,7 @@ pub mod loader_profile;
 pub use initialize::initialize_training_params;
 pub mod model;
 pub(crate) mod maxpool_depth;
+pub mod modern_yolo;
 pub mod names;
 pub(crate) mod omd_loss;
 pub mod runtime;

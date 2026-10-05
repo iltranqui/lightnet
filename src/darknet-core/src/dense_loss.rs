@@ -51,11 +51,14 @@ pub fn compute_dense_training_loss_at(
         // output: C++ reads a box table (`batch * max_boxes * truth_size`) or a
         // per-image class vector, so its shape check lives in the module (which
         // falls back to "no samples" when the truth is shorter than it needs).
-        // `[contrastive]` (truth `batch * classes`) and `[omd_loss]` (truth
-        // `batch * max_boxes * truth_size`) are the two heads whose truth is not
+        // `[contrastive]` (truth `batch * classes`), `[yolox]` (truth
+        // `batch * max * truth_size`) and `[omd_loss]` (truth
+        // `batch * max_boxes * truth_size`) are the heads whose truth is not
         // their own output; their length checks live in their modules.
-        if !matches!(layer.kind, LayerKind::OmdLoss(_) | LayerKind::Contrastive(_))
-            && t.shape != layer.output_shape
+        if !matches!(
+            layer.kind,
+            LayerKind::OmdLoss(_) | LayerKind::Contrastive(_) | LayerKind::Yolox(_)
+        ) && t.shape != layer.output_shape
         {
             return Err(Error::InvalidConfig(format!(
                 "layer #{} ([{}]) truth shape {} != output shape {}",
@@ -70,6 +73,42 @@ pub fn compute_dense_training_loss_at(
             LayerKind::Cost { kind, scale } => elementwise_cost(prev, t, kind, *scale),
             LayerKind::Regression(spec) => elementwise_cost(prev, t, "sse", spec.scale),
             LayerKind::Logistic => logistic_cost(&forward.layer_outputs[layer.index], t),
+            LayerKind::Yolox(spec) => {
+                // C++ reads the box truth `max_boxes * truth_size` per image.
+                let layout = crate::modern_yolo::ModernLayout {
+                    batch: layer.output_shape.batch,
+                    n: 1,
+                    w: layer.output_shape.width,
+                    h: layer.output_shape.height,
+                    classes: spec.classes,
+                    coords: 4,
+                };
+                if forward.layer_outputs[layer.index].data.len() != layout.len() {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} ([yolox]) needs {} channels per cell but the output has {} entries",
+                        layer.index,
+                        layout.outputs(),
+                        forward.layer_outputs[layer.index].data.len()
+                    )));
+                }
+                // C++ `parse_yolox_section` reads only `classes`, `max`,
+                // `jitter` and `resize`, so every training knob stays at the
+                // value `set_default_training_params` gives it: normalisers 1,
+                // `ignore_thresh` 0.7, `max_delta` FLT_MAX and no smoothing or
+                // class map.  They are exposed on `ModernYoloSettings` so a
+                // caller can override them once the net-level keys exist.
+                let settings = crate::modern_yolo::ModernYoloSettings::default();
+                let (delta, cost, _positives) =
+                    crate::modern_yolo::yolox_training_delta(
+                        &forward.layer_outputs[layer.index].data,
+                        &t.data,
+                        &layout,
+                        spec,
+                        &settings,
+                    )
+                    .map_err(|err| Error::InvalidConfig(err.0))?;
+                (Tensor::from_data(layer.output_shape, delta)?, cost)
+            }
             LayerKind::Contrastive(spec) => {
                 // The classifier branch wants one embedding per image.
                 let spatial = prev.shape.width * prev.shape.height;
@@ -377,6 +416,42 @@ mod tests {
         let mut t = vec![None; exec.network.layers.len()];
         t[1] = Some(Tensor::from_data(TensorShape::new(12, 1, 1, 2), truth).unwrap());
         compute_dense_training_loss(&exec.network, &forward, &input, &t).unwrap()
+    }
+
+    /// `[yolox]` reads `classes + 5` channels per cell, so a cfg that hands it
+    /// fewer is a config error rather than a silent reinterpretation.
+    #[test]
+    fn yolox_head_checks_its_channel_count_and_produces_a_head_seed() {
+        fn run_yolox(classes: usize, filters: usize) -> crate::error::Result<DenseTrainingLoss> {
+            let cfg = format!(
+                "[net]\nwidth=2\nheight=2\nchannels={filters}\nbatch=2\n\
+                 [convolutional]\nfilters={filters}\nsize=1\n\
+                 [yolox]\nclasses={classes}\nmax=2\n"
+            );
+            let network = Network::from_config(ConfigFile::parse_str("d.cfg", &cfg).unwrap()).unwrap();
+            let exec = ExecutableNetwork::new(network);
+            let shape = exec.network.net.input_shape();
+            let input = Tensor::zeros(shape);
+            let forward = exec.forward_training(&input).unwrap();
+            // Two boxes per image, `truth_size = 6`.
+            let mut truth = vec![0.0f32; 2 * 2 * 6];
+            truth[0] = 0.5;
+            truth[1] = 0.5;
+            truth[2] = 1.0;
+            truth[3] = 1.0;
+            truth[4] = 0.0;
+            let mut t = vec![None; exec.network.layers.len()];
+            t[1] = Some(Tensor::from_data(TensorShape::new(2 * 6, 1, 1, 2), truth).unwrap());
+            compute_dense_training_loss(&exec.network, &forward, &input, &t)
+        }
+        // 2 classes needs 2 + 5 = 7 channels: the head produces a seed.
+        let loss = run_yolox(2, 7).expect("a 7-channel head carries 2 classes");
+        assert!(loss.loss.is_finite());
+        let seed = loss.layer_output_gradient_seeds[1].as_ref().unwrap();
+        assert_eq!(seed.data.len(), 2 * 7 * 4, "one entry per output element");
+        // 9 classes would need 14 channels, so 7 is not enough.
+        let err = run_yolox(9, 7).expect_err("a 7-channel head cannot carry 9 classes");
+        assert!(format!("{err}").contains("channels per cell"), "{err}");
     }
 
     #[test]
