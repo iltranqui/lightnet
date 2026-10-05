@@ -476,3 +476,34 @@ pub mod kernels {
         }
     }
 }
+
+/// Fused residual + bias epilogue for a transformer block:
+/// `out[i] = residual[i] + y[i] + bias[i % cols]`.
+///
+/// The bias is per **column**: the row index is the token, so it must not shift
+/// the offset.  `has_bias = 0` makes it a plain residual add.
+#[cuda_module]
+pub mod residual {
+    use super::*;
+    use cuda_device::{kernel, thread};
+
+    #[kernel]
+    pub fn residual_bias(
+        residual: &[f32],
+        y: &[f32],
+        bias: &[f32],
+        mut out: DisjointSlice<f32>,
+        cols: usize,
+        has_bias: u32,
+    ) {
+        let i = thread::index_1d();
+        let idx = i.get();
+        if idx >= out.len() {
+            return;
+        }
+        let b = if has_bias != 0 { bias[idx % cols] } else { 0.0 };
+        if let Some(slot) = out.get_mut(i) {
+            *slot = residual[idx] + y[idx] + b;
+        }
+    }
+}

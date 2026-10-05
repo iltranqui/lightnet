@@ -178,3 +178,55 @@ fn the_row_softmax_backward_op_matches_the_host() {
         close("softmax backward", &got, &want, 1e-5);
     }
 }
+
+#[test]
+fn the_residual_bias_epilogue_matches_the_host() {
+    let be = backend();
+    let mut rng = Rng(0x2b2b_1d1d);
+    for &(rows, cols) in &[(1usize, 1usize), (3, 4), (8, 16), (17, 33), (4, 1024)] {
+        let residual = rng.vec(rows * cols);
+        let y = rng.vec(rows * cols);
+        let bias = rng.vec(cols);
+        let rt = be.upload_f32(&[rows, cols], &residual).unwrap();
+        let yt = be.upload_f32(&[rows, cols], &y).unwrap();
+        let bt = be.upload_f32(&[cols], &bias).unwrap();
+        let out = be
+            .residual_bias_f32(&rt, &yt, Some(&bt), &[rows, cols], rows, cols, ElementwiseLaunchConfig::default())
+            .unwrap();
+        let got = be.download_f32(&out).unwrap();
+        let want = host_ops::residual_bias(&residual, &y, Some(&bias), rows, cols);
+        close(&format!("residual_bias {rows}x{cols}"), &got, &want, 1e-6);
+    }
+}
+
+#[test]
+fn the_residual_bias_epilogue_without_a_bias_is_a_plain_add() {
+    let be = backend();
+    let mut rng = Rng(0x9e9e_0101);
+    let (rows, cols) = (6usize, 7usize);
+    let residual = rng.vec(rows * cols);
+    let y = rng.vec(rows * cols);
+    let rt = be.upload_f32(&[rows, cols], &residual).unwrap();
+    let yt = be.upload_f32(&[rows, cols], &y).unwrap();
+    let out = be
+        .residual_bias_f32(&rt, &yt, None, &[rows, cols], rows, cols, ElementwiseLaunchConfig::default())
+        .unwrap();
+    let got = be.download_f32(&out).unwrap();
+    let want: Vec<f32> = residual.iter().zip(&y).map(|(a, b)| a + b).collect();
+    close("residual_bias no bias", &got, &want, 1e-6);
+}
+
+#[test]
+fn the_residual_bias_epilogue_rejects_a_mismatched_row_count() {
+    let be = backend();
+    let rt = be.upload_f32(&[4, 4], &vec![1.0f32; 16]).unwrap();
+    for (rows, cols) in [(0usize, 4usize), (4, 0), (3, 4), (9, 9)] {
+        let err = match be.residual_bias_f32(
+            &rt, &rt, None, &[4, 4], rows, cols, ElementwiseLaunchConfig::default(),
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("rows={rows} cols={cols} should be rejected"),
+        };
+        assert!(format!("{err}").contains("rows*cols"), "{err}");
+    }
+}

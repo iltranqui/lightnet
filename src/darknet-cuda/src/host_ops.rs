@@ -823,3 +823,68 @@ mod layernorm_tests {
         assert!((dx3[3] - (5.0 - 7.0)).abs() < 1e-6, "{}", dx3[3]);
     }
 }
+
+/// Fused residual + bias epilogue for a transformer block: over a flat
+/// `rows x cols` row-major slab,
+/// `out[i] = residual[i] + y[i] + bias[i % cols]`.
+///
+/// The bias is per **column** (the last dimension), which is how every ported
+/// attention / FFN output projection is biased - the row index is the token and
+/// must not affect the offset.  `bias` may be `None` for the bias-free
+/// projections.  Reference for
+/// [`crate::F32TensorOpsBackend::residual_bias_f32`].
+///
+/// Doing this in one pass matters: the unfused form
+/// (`bias_add` then `vector_add`) materialises a full extra temporary per
+/// residual connection, and a transformer block has two of them.
+pub fn residual_bias(
+    residual: &[f32],
+    y: &[f32],
+    bias: Option<&[f32]>,
+    rows: usize,
+    cols: usize,
+) -> Vec<f32> {
+    let len = rows * cols;
+    assert!(residual.len() >= len && y.len() >= len, "residual_bias: bad shape");
+    let mut out = vec![0.0f32; len];
+    for i in 0..len {
+        let b = match bias {
+            Some(bias) => {
+                assert!(bias.len() >= cols, "residual_bias: bias must have cols entries");
+                bias[i % cols]
+            }
+            None => 0.0,
+        };
+        out[i] = residual[i] + y[i] + b;
+    }
+    out
+}
+
+#[cfg(test)]
+mod residual_bias_tests {
+    use super::*;
+
+    #[test]
+    fn the_bias_is_per_column_and_not_per_row() {
+        let residual = [1.0f32, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let y = [0.0f32; 6];
+        let bias = [10.0f32, 20.0];
+        // rows = 3, cols = 2 -> the pattern repeats with period `cols`.
+        assert_eq!(residual_bias(&residual, &y, Some(&bias), 3, 2), vec![11.0, 21.0, 11.0, 21.0, 11.0, 21.0]);
+        // No bias is a plain residual add.
+        assert_eq!(residual_bias(&residual, &y, None, 3, 2), residual);
+    }
+
+    #[test]
+    #[should_panic(expected = "residual_bias: bad shape")]
+    fn a_short_buffer_is_rejected() {
+        // rows * cols = 6 but only 4 elements are supplied.
+        let _ = residual_bias(&[0.0; 4], &[0.0; 4], None, 3, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "residual_bias: bias must have cols entries")]
+    fn a_short_bias_is_rejected() {
+        let _ = residual_bias(&[0.0; 6], &[0.0; 6], Some(&[1.0]), 3, 2);
+    }
+}

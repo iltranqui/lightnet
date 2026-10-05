@@ -481,6 +481,12 @@ inside the first rounds of a short run, not a property of the mode.  Re-run with
 - relu/relu6 NaN -> 0 on oxide (C++ NaN); mish/swish at -inf -> NaN.
 - C++ CUDA reference runs cudnn_half=1, so layer dumps differ from pure fp32 by up to 5.7e-3 abs (not an oxide error).
 ### Shared transformer primitives: LayerNorm fwd/bwd on the GPU (2026-10-04)
+- **Residual / bias epilogue**, the second piece of the same set: `host_ops::residual_bias` plus `F32TensorOpsBackend::residual_bias_f32` (host default) and an oxide kernel in `kernels/layers_extra.rs::residual`. Over a flat `rows x cols` row-major slab it computes `out[i] = residual[i] + y[i] + bias[i % cols]`.
+  - The bias is per **column**: the row index is the token, so it must not shift the offset. A test pins that the pattern repeats with period `cols` and not with period 1, which is the mistake a per-row bias would silently make.
+  - Fusing matters. The unfused form (`bias_add` then `vector_add`) materialises a full extra temporary *per residual connection*, and a transformer block has two.
+  - `bias = None` gives a plain residual add via a flag, not a special kernel path.
+  - 3 more GPU tests (with bias across five shapes, without bias, and the shape-rejection path) bring `oxide_layernorm.rs` to 9.
+
 - Phase 3A's first prerequisite ("build it ONCE" in the plan): the shared op set every ported transformer layer needs. The row-softmax backward and its backend op already existed; **LayerNorm did not**, so it is new.
 - `host_ops::layernorm` / `layernorm_backward` are the references: row-wise over a flat `rows x cols` buffer, population variance, caller-supplied `eps`, non-finite inputs counted as 0 (what `[laya_scorer]`'s sanitiser does before normalising), and `gamma` / `beta` optional for the **bias-free** variant that ModernBERT's `attn_norm` / `mlp_norm` and every `[laya_*]` LayerNorm use.
 - The backward returns the input gradient only, recomputing `mean` / `inv_std` from `x` instead of caching them: `dx = g - mean(g) - xhat * mean(g*xhat)` with `g = dy * gamma * inv_std`. Recomputing costs one reduction over a row the kernel already reads and keeps the op's signature to tensors only - no saved state to thread through a layer's forward cache.

@@ -91,6 +91,7 @@ pub struct OxideBackend {
     pool: pool::kernels::LoadedModule,
     resample: resample::kernels::LoadedModule,
     layers_extra: layers_extra::kernels::LoadedModule,
+    residual_epilogue: layers_extra::residual::LoadedModule,
     conv_mode: ConvMode,
     /// FP8 formats for the dgrad / wgrad GEMMs when the FP8 backward is
     /// enabled: `(A format, B format)`, i.e. (weights, dy).  `None` keeps the
@@ -451,6 +452,8 @@ impl OxideBackend {
             .map_err(|err| OxideError::Shape(format!("load pool module: {err:?}")))?;
         let resample = resample::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load resample module: {err:?}")))?;
+        let residual_epilogue = layers_extra::residual::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load residual epilogue module: {err:?}")))?;
         let layers_extra = layers_extra::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load layers_extra module: {err:?}")))?;
         let half_scratch = half::HalfScratch::new(&stream)?;
@@ -488,6 +491,7 @@ impl OxideBackend {
             pool,
             resample,
             layers_extra,
+            residual_epilogue,
             conv_mode: ConvMode::from_env(),
             bwd_fp8: fp8_backward_from_env(),
             workspace: Mutex::new(None),
@@ -2023,6 +2027,54 @@ impl F32TensorOpsBackend for OxideBackend {
     /// Row-wise LayerNorm, one block (one thread) per row so the reduction needs
     /// no second pass.  `rows * cols` must equal the tensor length and `cols` must
     /// fit [`activations::layernorm::LAYERNORM_MAX_COLS`].
+    /// Fused residual + bias epilogue, one thread per output element:
+    /// `out[i] = residual[i] + y[i] + bias[i % cols]`.
+    fn residual_bias_f32(
+        &self,
+        residual: &Self::Tensor,
+        y: &Self::Tensor,
+        bias: Option<&Self::Tensor>,
+        shape: &[usize],
+        rows: usize,
+        cols: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let len = rows.checked_mul(cols).ok_or_else(|| {
+            OxideError::Shape("residual_bias_f32: rows * cols overflowed".to_owned())
+        })?;
+        if rows == 0 || cols == 0 || len != shape.iter().product::<usize>() {
+            return Err(OxideError::Shape(format!(
+                "residual_bias_f32: rows*cols must equal the tensor length ({rows}*{cols} vs {:?})",
+                shape
+            )));
+        }
+        let r = self.f32v(residual)?.into_owned();
+        let yv = self.f32v(y)?.into_owned();
+        // A missing bias is a one-element placeholder the kernel never indexes.
+        let bias_tensor = match bias {
+            Some(t) => self.f32v(t)?.into_owned(),
+            None => OxideTensorF32::new(self.alloc_uninit(1)?, &[1usize]),
+        };
+        let has_bias = u32::from(bias.is_some());
+        let mut out = self.alloc_uninit(len)?;
+        // SAFETY: one thread per element, and the kernel only reads `bias` when
+        // `has_bias` is set (then it has `cols` entries).
+        unsafe {
+            self.residual_epilogue.residual_bias(
+                &self.stream,
+                launch::elementwise(len, config),
+                &r.buf,
+                &yv.buf,
+                &bias_tensor.buf,
+                &mut out,
+                cols,
+                has_bias,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(out, shape))
+    }
+
     fn layernorm_forward_f32(
         &self,
         x: &Self::Tensor,

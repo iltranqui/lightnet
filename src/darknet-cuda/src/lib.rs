@@ -501,6 +501,34 @@ pub trait F32TensorOpsBackend {
         let fitted = host_ops::shortcut_fit(&host, batch, out_len / batch.max(1));
         self.upload_f32(output_shape, &fitted)
     }
+    /// Fused residual + bias epilogue for a transformer block: over a flat
+    /// `rows x cols` row-major slab, `out[i] = residual[i] + y[i] + bias[i % cols]`
+    /// with `bias` per **column** (the last dimension, so the row - the token -
+    /// does not shift the offset).  `bias` may be `None`.
+    ///
+    /// `shape` is the output tensor's shape.  One pass instead of
+    /// `bias_add` + `vector_add`, which would materialise an extra full-size
+    /// temporary per residual connection.
+    fn residual_bias_f32(
+        &self,
+        residual: &Self::Tensor,
+        y: &Self::Tensor,
+        bias: Option<&Self::Tensor>,
+        shape: &[usize],
+        rows: usize,
+        cols: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert!(rows > 0 && cols > 0, "residual_bias_f32: rows and cols must be > 0");
+        let r = self.download_f32(residual)?;
+        let yv = self.download_f32(y)?;
+        let b = match bias {
+            Some(t) => Some(self.download_f32(t)?),
+            None => None,
+        };
+        self.upload_f32(shape, &host_ops::residual_bias(&r, &yv, b.as_deref(), rows, cols))
+    }
     /// Row-wise LayerNorm over a flat `rows x cols` buffer:
     /// `y = gamma * (x - mean) * inv_std + beta`, population variance.
     ///
