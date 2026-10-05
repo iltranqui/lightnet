@@ -4053,6 +4053,7 @@ where
                         | LayerParams::Shortcut(_)
                         | LayerParams::Convolutional(_)
                         | LayerParams::Connected(_)
+                        | LayerParams::Moe(_)
                         | LayerParams::Gru(_)
                         | LayerParams::Rnn(_)
                         | LayerParams::Lstm(_)
@@ -4060,7 +4061,7 @@ where
                 )
             }) {
                 return Err(Error::InvalidConfig(
-                    "adam=1 on the GPU path supports convolutional, connected, local, standalone batchnorm, and GRU/RNN/LSTM/CRNN layers"
+                    "adam=1 on the GPU path supports convolutional, connected, local, shortcut, MoE, standalone batchnorm, and GRU/RNN/LSTM/CRNN layers"
                         .to_string(),
                 ));
             }
@@ -4285,6 +4286,37 @@ where
                     let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
                     apply_host_adam_connected(params, train, moments, adam)?;
                 }
+                (LayerParams::Moe(params), LayerTrainBuffers::Moe(train)) => {
+                    if params.experts.len() != train.experts.len() {
+                        return Err(Error::InvalidConfig(format!(
+                            "MoE Adam expert state mismatch at layer #{index}"
+                        )));
+                    }
+                    let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    let router_adam = AdamParams { decay: 0.0, ..*adam };
+                    apply_host_adam(
+                        &mut params.router_weights,
+                        &mut train.router_weight_updates,
+                        &mut moments.weights,
+                        &router_adam,
+                    )?;
+                    apply_host_adam_non_weight(
+                        &mut params.router_biases,
+                        &mut train.router_bias_updates,
+                        &mut moments.biases,
+                        &router_adam,
+                    )?;
+                    for (expert_index, (expert, updates)) in
+                        params.experts.iter_mut().zip(&mut train.experts).enumerate()
+                    {
+                        apply_host_adam_convolutional(
+                            expert,
+                            updates,
+                            host_adam_child(moments, expert_index),
+                            adam,
+                        )?;
+                    }
+                }
                 (LayerParams::Shortcut(params), LayerTrainBuffers::Shortcut(train)) => {
                     let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
                     apply_host_adam(
@@ -4420,6 +4452,16 @@ where
                         index,
                         layer.kind.name()
                     )));
+                }
+            }
+        }
+        // Host-updated container experts must be uploaded again before the next
+        // Oxide forward pass.
+        let mut cache = self.device_conv_params.borrow_mut();
+        for (index, layer) in self.network.layers.iter().enumerate() {
+            if matches!(layer.kind, LayerKind::Moe(_)) {
+                if let Some(slots) = cache.get_mut(index) {
+                    slots.clear();
                 }
             }
         }
@@ -21252,6 +21294,98 @@ mod tests {
             };
             assert_slice_close("RNN block weights Adam", weights, &block.weights, 1e-7);
             assert_slice_close("RNN block biases Adam", biases, &block.biases, 1e-7);
+        }
+    }
+
+    #[test]
+    fn gpu_adam_updates_moe_router_and_expert_host_parameters() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "inline.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=1\nbatch=1\nadam=1\nb1=0.8\nb2=0.95\neps=0.001\n[moe_convolutional]\nfilters=1\nsize=1\nexperts=2\ntop_k=0\nload_balance=0\nactivation=linear\n",
+            )
+            .expect("cfg"),
+        )
+        .expect("network");
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        let adam = super::AdamParams {
+            lr: 0.01,
+            beta1: 0.8,
+            beta2: 0.95,
+            eps: 0.001,
+            decay: 0.0,
+            batch: 1,
+            step: 1,
+            decoupled_decay: false,
+        };
+        let mut expected_experts = Vec::new();
+        let (expected_router_weights, expected_router_biases) = {
+            let LayerParams::Moe(params) = &mut gpu.params[0] else { panic!("MoE params") };
+            let LayerTrainBuffers::Moe(train) = &mut gpu.cpu_fallback_train_buffers.get_mut()[0] else {
+                panic!("MoE train buffers");
+            };
+            params.router_weights.copy_from_slice(&[0.2, -0.4]);
+            params.router_biases.copy_from_slice(&[0.1, -0.2]);
+            train.router_weight_updates.copy_from_slice(&[0.03, -0.02]);
+            train.router_bias_updates.copy_from_slice(&[-0.01, 0.04]);
+            let zero_router = [0.0f32; 2];
+            let zero_expert = [0.0f32; 1];
+            let no_decay = super::AdamParams { decay: 0.0, ..adam };
+            let router_weights = darknet_cuda::host_ops::adam_update(
+                &params.router_weights,
+                &train.router_weight_updates,
+                &zero_router,
+                &zero_router,
+                &no_decay,
+            ).0;
+            let router_biases = darknet_cuda::host_ops::adam_update(
+                &params.router_biases,
+                &train.router_bias_updates,
+                &zero_router,
+                &zero_router,
+                &no_decay,
+            ).0;
+            for (index, (expert, updates)) in params.experts.iter_mut().zip(&mut train.experts).enumerate() {
+                expert.weights[0] = 0.15 * (index as f32 + 1.0);
+                expert.biases[0] = -0.05 * (index as f32 + 1.0);
+                updates.weight_updates[0] = 0.02 * (index as f32 + 1.0);
+                updates.bias_updates[0] = -0.03 * (index as f32 + 1.0);
+                let weights = darknet_cuda::host_ops::adam_update(
+                    &expert.weights,
+                    &updates.weight_updates,
+                    &zero_expert,
+                    &zero_expert,
+                    &adam,
+                ).0;
+                let biases = darknet_cuda::host_ops::adam_update(
+                    &expert.biases,
+                    &updates.bias_updates,
+                    &zero_expert,
+                    &zero_expert,
+                    &adam,
+                ).0;
+                expected_experts.push((weights, biases));
+            }
+            (router_weights, router_biases)
+        };
+        gpu.warm_device_conv_params().expect("warm experts");
+        assert_eq!(gpu.device_conv_params.borrow()[0].len(), 2);
+        gpu.update_weights_gpu(0.01, 0.0, 0.0, 1).expect("MoE Adam update");
+        let LayerParams::Moe(params) = &gpu.params[0] else { unreachable!() };
+        assert_slice_close("MoE router weights Adam", &expected_router_weights, &params.router_weights, 1e-7);
+        assert_slice_close("MoE router biases Adam", &expected_router_biases, &params.router_biases, 1e-7);
+        for (index, (expected_weights, expected_biases)) in expected_experts.iter().enumerate() {
+            assert_slice_close("MoE expert weights Adam", expected_weights, &params.experts[index].weights, 1e-7);
+            assert_slice_close("MoE expert biases Adam", expected_biases, &params.experts[index].biases, 1e-7);
+        }
+        assert!(gpu.device_conv_params.borrow()[0].is_empty(), "stale expert cache must be invalidated");
+        gpu.warm_device_conv_params().expect("rewarm updated experts");
+        let cache = gpu.device_conv_params.borrow();
+        assert_eq!(cache[0].len(), 2);
+        for (index, (expected_weights, _)) in expected_experts.iter().enumerate() {
+            let cached = cache[0][index].as_ref().expect("expert cache");
+            let weights = gpu.backend.download_f32(&cached.raw_weights).expect("download expert weights");
+            assert_slice_close("reuploaded MoE expert weights", expected_weights, &weights, 0.0);
         }
     }
 

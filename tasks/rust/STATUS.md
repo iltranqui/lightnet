@@ -48,9 +48,9 @@ Latest increments:
   parity covers the full forward/backward/update path. Device-native routing and
   backward remain.
 - Host Adam now updates standalone batchnorm, local, connected, weighted
-  shortcut, and GRU/RNN/LSTM/CRNN parameters with per-layer/per-block moments.
-  Two-step BN and per-family reference tests pass; MoE, ViT, and deconvolutional
-  Adam remain unsupported.
+  shortcut, MoE router/experts, and GRU/RNN/LSTM/CRNN parameters with distinct
+  moment slots. Reference tests cover each family and MoE expert-cache reupload;
+  ViT and deconvolutional Adam remain unsupported.
 - `[vit]` reference path: cfg/shape, C++-ordered header-aware weights, seeded init,
   CPU analytical forward/backward + SGD, and GPU f32 host fallback; 23 focused
   tests pass, targeted package check/build pass with `-j 4`.
