@@ -1122,15 +1122,15 @@ impl ExecutableNetwork {
                 // `activate_modern_output`, so the head *does* transform its
                 // input: the last `1 + classes` entries of every cell go
                 // through a sigmoid while the four box entries stay raw.
-                (LayerKind::Yolox(spec), LayerParams::None) => {
-                    let layout = crate::modern_yolo::ModernLayout {
-                        batch: current_input.shape.batch,
-                        n: 1,
-                        w: current_input.shape.width,
-                        h: current_input.shape.height,
-                        classes: spec.classes,
-                        coords: 4,
-                    };
+                (LayerKind::Yolox(spec), LayerParams::None)
+                | (LayerKind::Ppyoloe(spec), LayerParams::None)
+                | (LayerKind::Yolonas(spec), LayerParams::None) => {
+                    let layout = crate::modern_yolo::ModernLayout::for_spec(
+                        current_input.shape.batch,
+                        current_input.shape.width,
+                        current_input.shape.height,
+                        spec,
+                    );
                     let mut data = current_input.data.clone();
                     if data.len() == layout.len() {
                         crate::modern_yolo::activate_modern_output(&mut data, &layout);
@@ -1890,6 +1890,8 @@ impl ExecutableNetwork {
                 | (LayerKind::OmdLoss(_), LayerParams::None)
                 | (LayerKind::Contrastive(_), LayerParams::None)
                 | (LayerKind::Yolox(_), LayerParams::None)
+                | (LayerKind::Ppyoloe(_), LayerParams::None)
+                | (LayerKind::Yolonas(_), LayerParams::None)
                 | (LayerKind::Regression(_), LayerParams::None)
                 | (LayerKind::JevCe(_), LayerParams::None) => {
                     accumulate_previous_gradient(
@@ -4380,18 +4382,18 @@ where
                         .map_err(|err| backend_error("upload laya_scorer output", err))?
                 }
                 // the host for now (same choice as `[contrastive]`).
-                (LayerKind::Yolox(spec), LayerParams::None) => {
+                (LayerKind::Yolox(spec), LayerParams::None)
+                | (LayerKind::Ppyoloe(spec), LayerParams::None)
+                | (LayerKind::Yolonas(spec), LayerParams::None) => {
                     let host_input = self
                         .download_tensor(current_input, layer.input_shape)
                         .map_err(|err| backend_error("download yolox input", err))?;
-                    let layout = crate::modern_yolo::ModernLayout {
-                        batch: layer.input_shape.batch,
-                        n: 1,
-                        w: layer.input_shape.width,
-                        h: layer.input_shape.height,
-                        classes: spec.classes,
-                        coords: 4,
-                    };
+                    let layout = crate::modern_yolo::ModernLayout::for_spec(
+                        layer.input_shape.batch,
+                        layer.input_shape.width,
+                        layer.input_shape.height,
+                        spec,
+                    );
                     let mut data = host_input.data;
                     if data.len() == layout.len() {
                         crate::modern_yolo::activate_modern_output(&mut data, &layout);
@@ -5983,7 +5985,9 @@ where
                 // on the trailing `1 + classes` entries of every cell), which
                 // is a strided sub-range pass, so it goes through the host for
                 // now like the other host-round-trip heads.
-                | (LayerKind::Yolox(_), Some(LayerParams::None)) => {
+                | (LayerKind::Yolox(_), Some(LayerParams::None))
+                | (LayerKind::Ppyoloe(_), Some(LayerParams::None))
+                | (LayerKind::Yolonas(_), Some(LayerParams::None)) => {
                     self.accumulate_previous_gpu_gradient(
                         layer.index,
                         grad,

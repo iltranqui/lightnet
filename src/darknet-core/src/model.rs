@@ -379,9 +379,13 @@ pub struct LayaScorerSpec {
 /// deltas.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModernYoloSpec {
+    pub kind: ModernYoloKind,
     pub classes: usize,
     /// Maximum truth rows per image.
     pub max_boxes: usize,
+    /// Distribution width for the ltrb heads; C++ clamps it to `[1, 64]` and
+    /// ignores it for YOLOX.  Default 16.
+    pub reg_max: usize,
     /// Ground-truth jitter used by the data loader.
     pub jitter: f32,
     /// Ground-truth resize factor used by the data loader.
@@ -405,6 +409,29 @@ pub struct ContrastiveSpec {
     pub max_delta: f32,
     /// Detection branch only: how many negative partners per positive.
     pub contrastive_neg_max: usize,
+}
+
+/// Which of the three anchor-free heads a `[yolox]` / `[ppyoloe]` /
+/// `[yolonas]` section selects (C++ `ModernYoloHeadKind`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModernYoloKind {
+    /// cxcywh + SimOTA dynamic-k assignment, hard class targets.
+    Yolox,
+    /// ltrb distribution regression + Task-Aligned assignment, soft quality targets.
+    Ppyoloe,
+    /// As PP-YOLOE plus the NMS-aware duplicate down-weighting.
+    Yolonas,
+}
+
+impl ModernYoloSpec {
+    /// C++ `make_modern_yolo_layer`: YOLOX regresses four raw box values, the
+    /// distribution heads regress `4 * (reg_max + 1)` logits.
+    pub fn coords(&self) -> usize {
+        match self.kind {
+            ModernYoloKind::Yolox => 4,
+            _ => 4 * (self.reg_max.clamp(1, 64) + 1),
+        }
+    }
 }
 
 /// `[omd_loss]` (Phase 1b of `tasks/rust/layers.md`), ported from
@@ -785,8 +812,11 @@ pub enum LayerKind {
     ScaleChannels(ScaleChannelsSpec),
     Sam(SamSpec),
     Contrastive(ContrastiveSpec),
-    /// `[yolox]`; the sibling spellings live in [`ModernYoloSpec`].
+    /// `[yolox]`, `[ppyoloe]` and `[yolonas]`; all three share
+    /// [`ModernYoloSpec`] and its `kind`.
     Yolox(ModernYoloSpec),
+    Ppyoloe(ModernYoloSpec),
+    Yolonas(ModernYoloSpec),
     /// `[laya_scorer]`, whose weights live in its own blob type.
     LayaScorer(LayaScorerSpec),
     Rnn(RnnSpec),
@@ -830,6 +860,8 @@ impl LayerKind {
             Self::Sam(_) => "sam",
             Self::Contrastive(_) => "contrastive",
             Self::Yolox(_) => "yolox",
+            Self::Ppyoloe(_) => "ppyoloe",
+            Self::Yolonas(_) => "yolonas",
             Self::LayaScorer(_) => "laya_scorer",
             Self::Rnn(_) => "rnn",
             Self::Gru(_) => "gru",
@@ -1907,7 +1939,14 @@ fn parse_layer_kind(
             from: section.get_isize("from", 0)?,
             activation: Activation::parse(&section.get_str("activation", "linear")),
         }),
-        "yolox" => LayerKind::Yolox(parse_modern_yolo_spec(&section)?),
+        "yolox" | "ppyoloe" | "yolonas" => {
+            let spec = parse_modern_yolo_spec(&section)?;
+            match spec.kind {
+                ModernYoloKind::Yolox => LayerKind::Yolox(spec),
+                ModernYoloKind::Ppyoloe => LayerKind::Ppyoloe(spec),
+                ModernYoloKind::Yolonas => LayerKind::Yolonas(spec),
+            }
+        }
         "laya_scorer" => {
             // C++ `parse_laya_scorer_section`: the layer is constructed for
             // `max_options x hidden` and checks the incoming shape against it,
@@ -2131,7 +2170,9 @@ fn infer_output_shape(
         | LayerKind::OmdLoss(_)
         | LayerKind::Dropout { .. }
         | LayerKind::Contrastive(_) => Ok(current),
-        | LayerKind::Yolox(_) => Ok(current),
+        | LayerKind::Yolox(_)
+        | LayerKind::Ppyoloe(_)
+        | LayerKind::Yolonas(_) => Ok(current),
         // `[laya_scorer]` turns `[batch, hidden, 1, max_options]` into
         // `[batch, 1, 1, max_options]`.
         LayerKind::LayaScorer(spec) => Ok(TensorShape::new(spec.max_options, 1, 1, current.batch)),
@@ -2409,6 +2450,16 @@ pub const LAYA_SCORER_HIDDEN: usize = 1024;
 /// add `reg_max`(16); they are not ported yet.
 fn parse_modern_yolo_spec(section: &RawSection) -> Result<ModernYoloSpec> {
     let line = section.line;
+    let kind = match section.name.as_str() {
+        "yolox" => ModernYoloKind::Yolox,
+        "ppyoloe" => ModernYoloKind::Ppyoloe,
+        "yolonas" => ModernYoloKind::Yolonas,
+        other => {
+            return Err(Error::InvalidConfig(format!(
+                "[{other}] at line {line} is not an anchor-free modern head"
+            )))
+        }
+    };
     let classes = section.get_usize("classes", 20)?;
     if classes == 0 {
         return Err(Error::InvalidConfig(format!("[yolox] at line {line}: classes must be > 0")));
@@ -2417,7 +2468,14 @@ fn parse_modern_yolo_spec(section: &RawSection) -> Result<ModernYoloSpec> {
     if max_boxes == 0 {
         return Err(Error::InvalidConfig(format!("[yolox] at line {line}: max must be > 0")));
     }
-    Ok(ModernYoloSpec { classes, max_boxes, jitter: section.get_f32("jitter", 0.2)?, resize: section.get_f32("resize", 1.0)? })
+    Ok(ModernYoloSpec {
+        kind,
+        classes,
+        max_boxes,
+        reg_max: section.get_usize("reg_max", 16)?,
+        jitter: section.get_f32("jitter", 0.2)?,
+        resize: section.get_f32("resize", 1.0)?,
+    })
 }
 
 fn pool_dim(input: usize, padding: usize, size: usize, stride: usize) -> usize {

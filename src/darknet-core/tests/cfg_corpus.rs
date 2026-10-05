@@ -93,6 +93,8 @@ fn unsupported_sections(cfg: &ConfigFile) -> String {
         "regression",
         "jev_ce",
         "yolox",
+        "ppyoloe",
+        "yolonas",
         "laya_scorer",
     ];
     cfg.sections

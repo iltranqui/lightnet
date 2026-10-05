@@ -73,16 +73,14 @@ pub fn compute_dense_training_loss_at(
             LayerKind::Cost { kind, scale } => elementwise_cost(prev, t, kind, *scale),
             LayerKind::Regression(spec) => elementwise_cost(prev, t, "sse", spec.scale),
             LayerKind::Logistic => logistic_cost(&forward.layer_outputs[layer.index], t),
-            LayerKind::Yolox(spec) => {
+            LayerKind::Yolox(spec) | LayerKind::Ppyoloe(spec) | LayerKind::Yolonas(spec) => {
                 // C++ reads the box truth `max_boxes * truth_size` per image.
-                let layout = crate::modern_yolo::ModernLayout {
-                    batch: layer.output_shape.batch,
-                    n: 1,
-                    w: layer.output_shape.width,
-                    h: layer.output_shape.height,
-                    classes: spec.classes,
-                    coords: 4,
-                };
+                let layout = crate::modern_yolo::ModernLayout::for_spec(
+                    layer.output_shape.batch,
+                    layer.output_shape.width,
+                    layer.output_shape.height,
+                    spec,
+                );
                 if forward.layer_outputs[layer.index].data.len() != layout.len() {
                     return Err(Error::InvalidConfig(format!(
                         "layer #{} ([yolox]) needs {} channels per cell but the output has {} entries",
