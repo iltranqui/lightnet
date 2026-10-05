@@ -22,6 +22,20 @@ pub fn compute_dense_training_loss(
     input: &Tensor,
     truth: &[Option<Tensor>],
 ) -> Result<DenseTrainingLoss> {
+    compute_dense_training_loss_at(network, forward, input, truth, 0)
+}
+
+/// [`compute_dense_training_loss`] with the training iteration, which the
+/// `[segmentation]` correct-pixel gate needs (`gate_strength` is a raised cosine
+/// over `gate_ramp_iters` after `gate_warmup_iters`).  Iteration 0 means "before
+/// the warmup", i.e. the gate contributes nothing.
+pub fn compute_dense_training_loss_at(
+    network: &Network,
+    forward: &ForwardResult,
+    input: &Tensor,
+    truth: &[Option<Tensor>],
+    iteration: usize,
+) -> Result<DenseTrainingLoss> {
     if truth.len() != network.layers.len() {
         return Err(Error::InvalidConfig(format!(
             "dense truth count mismatch: expected {}, got {}",
@@ -47,6 +61,19 @@ pub fn compute_dense_training_loss(
             LayerKind::Cost { kind, scale } => elementwise_cost(prev, t, kind, *scale),
             LayerKind::Regression(spec) => elementwise_cost(prev, t, "sse", spec.scale),
             LayerKind::Logistic => logistic_cost(&forward.layer_outputs[layer.index], t),
+            LayerKind::Segmentation(spec) => {
+                let shape = layer.output_shape;
+                let result = crate::segmentation::segmentation_loss(
+                    &forward.layer_outputs[layer.index].data,
+                    &t.data,
+                    spec,
+                    shape.batch,
+                    shape.width * shape.height,
+                    crate::segmentation::gate_strength(spec, iteration),
+                );
+                let delta = Tensor::from_data(shape, result.delta.unwrap_or_default())?;
+                (delta, result.loss)
+            }
             LayerKind::JevCe(spec) => {
                 let result = crate::jev_ce::jev_ce_loss(&prev.data, &t.data, spec, prev.shape.batch);
                 let mut delta = Tensor::from_data(prev.shape, result.delta)?;
@@ -161,6 +188,107 @@ mod tests {
         let loss = run(cfg, |e| set_bias(e, vec![1.0, 2.0]), vec![3.0, 1.0], 1);
         assert_eq!(loss.layer_output_gradient_seeds[1].as_ref().unwrap().data, vec![4.0, -2.0]); // 2 * (t - p)
         assert_eq!(loss.loss, 4.0 + 1.0);
+    }
+
+    #[test]
+    fn segmentation_binary_head_is_logistic_ce_over_the_sigmoid_output() {
+        // Zero connected params -> logit 0 -> p = 0.5 per pixel, batch 2, 3 pixels.
+        let cfg = "[net]\nwidth=3\nheight=1\nchannels=1\nbatch=2\n\
+                   [convolutional]\nfilters=1\nsize=1\nactivation=linear\n\
+                   [segmentation]\nclasses=1\n";
+        let truth = vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
+        let loss = run(cfg, |_| {}, truth, 1);
+        let seed = loss.layer_output_gradient_seeds[1].as_ref().unwrap();
+        // delta = t - p = +-0.5
+        assert_eq!(seed.data, vec![0.5, -0.5, 0.5, -0.5, 0.5, -0.5]);
+        // cost is per pixel: every pixel costs -t ln p - (1-t) ln(1-p) = ln 2.
+        assert!((loss.loss - std::f32::consts::LN_2).abs() < 1e-6, "{}", loss.loss);
+    }
+
+    #[test]
+    fn segmentation_multiclass_head_is_softmax_ce_over_per_pixel_channels() {
+        // Zero connected params -> every logit 0 -> p = 1/3 per class.
+        let cfg = "[net]\nwidth=2\nheight=1\nchannels=3\n\
+                   [convolutional]\nfilters=3\nsize=1\nactivation=linear\n\
+                   [segmentation]\nclasses=3\n";
+        // NCHW with two pixels: pixel 0 is class 2 and pixel 1 is class 1, so
+        // the one-hot truth is [0,0,1, 0,1,0] (channel-major, spatial stride 2).
+        let loss = run(cfg, |_| {}, vec![0.0, 0.0, 1.0, 0.0, 1.0, 0.0], 1);
+        let seed = loss.layer_output_gradient_seeds[1].as_ref().unwrap();
+        let third = 1.0f32 / 3.0;
+        // delta = t - p, so the two truth channels get 2/3 and the other four
+        // get -1/3.
+        for (i, want) in [0usize, 1, 3, 5].iter().map(|i| (*i, -third)).chain([2usize, 4].iter().map(|i| (*i, 1.0 - third))) {
+            assert!((seed.data[i] - want).abs() < 1e-6, "[{i}]: {} vs {want}", seed.data[i]);
+        }
+        // Two pixels, each costing ln 3, so the per-pixel mean is ln 3.
+        assert!((loss.loss - 3f32.ln()).abs() < 1e-6, "{}", loss.loss);
+    }
+
+    #[test]
+    fn segmentation_head_applies_ce_scale_and_the_gate_needs_the_iteration() {
+        let cfg = |gate: &str| {
+            format!(
+                "[net]\nwidth=2\nheight=1\nchannels=2\n\
+                 [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
+                 [segmentation]\nclasses=2\ncls_normalizer=2\nlambda_ce=0.5\n{gate}"
+            )
+        };
+        // NCHW with two pixels and two classes: pixel 0 -> class 0, pixel 1 -> class 0.
+        let truth = vec![1.0, 1.0, 0.0, 0.0];
+        let network = Network::from_config(ConfigFile::parse_str("d.cfg", &cfg("")).unwrap()).unwrap();
+        let exec = ExecutableNetwork::new(network);
+        let input = Tensor::zeros(exec.network.net.input_shape());
+        let forward = exec.forward_training(&input).unwrap();
+        let shape = exec.network.layers[1].output_shape;
+        let mut t = vec![None; exec.network.layers.len()];
+        t[1] = Some(Tensor::from_data(shape, truth.clone()).unwrap());
+        let plain = compute_dense_training_loss(&exec.network, &forward, &input, &t).unwrap();
+        let scaled = compute_dense_training_loss_at(&exec.network, &forward, &input, &t, 0).unwrap();
+        assert_eq!(plain.loss, scaled.loss, "iteration 0 is before the gate warmup");
+        // ce_scale = lambda_ce * ce_normalizer * cls_normalizer = 0.5 * 1 * 2 = 1.
+        let reference = crate::segmentation::segmentation_loss(
+            &forward.layer_outputs[1].data,
+            &truth,
+            match &exec.network.layers[1].kind {
+                LayerKind::Segmentation(spec) => spec,
+                other => panic!("not segmentation: {}", other.name()),
+            },
+            shape.batch,
+            shape.width * shape.height,
+            0.0,
+        );
+        assert!((plain.loss - reference.loss).abs() < 1e-6, "{} vs {}", plain.loss, reference.loss);
+        assert_eq!(
+            plain.layer_output_gradient_seeds[1].as_ref().unwrap().data,
+            reference.delta.unwrap()
+        );
+
+        // With the gate on and the iteration past the warmup + ramp, the
+        // strength saturates at 1, every already-correct confident pixel is
+        // suppressed, and the survivors are compensated by total/active.
+        let gated_cfg = cfg("gate_enabled=1\ngate_t_correct=0.3\ngate_warmup_iters=0\ngate_ramp_iters=1\n");
+        let network = Network::from_config(ConfigFile::parse_str("d.cfg", &gated_cfg).unwrap()).unwrap();
+        let exec = ExecutableNetwork::new(network);
+        let input = Tensor::zeros(exec.network.net.input_shape());
+        let forward = exec.forward_training(&input).unwrap();
+        let shape = exec.network.layers[1].output_shape;
+        let mut t = vec![None; exec.network.layers.len()];
+        t[1] = Some(Tensor::from_data(shape, truth).unwrap());
+        let at_peak = compute_dense_training_loss_at(&exec.network, &forward, &input, &t, 1).unwrap();
+        let before = compute_dense_training_loss_at(&exec.network, &forward, &input, &t, 0).unwrap();
+        let seed_peak = at_peak.layer_output_gradient_seeds[1].as_ref().unwrap();
+        // The uniform prediction makes class 0 the argmax for both pixels, and
+        // the truth picks class 0, so both pixels are correct with p = 1/2 >=
+        // t_correct.  At strength 1 the gate scales their deltas by 0, no pixel
+        // is left active, so the compensation is skipped and the seeds vanish.
+        assert!(
+            seed_peak.data.iter().all(|v| v.abs() < 1e-6),
+            "fully suppressed pixels have no seed: {:?}",
+            seed_peak.data
+        );
+        let seed_before = before.layer_output_gradient_seeds[1].as_ref().unwrap();
+        assert_eq!(seed_before.data, vec![0.5, 0.5, -0.5, -0.5], "before the ramp the gate is off");
     }
 
     #[test]

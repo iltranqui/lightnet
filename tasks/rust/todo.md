@@ -435,6 +435,16 @@ inside the first rounds of a short run, not a property of the mode.  Re-run with
 - NOT done: FP8 dgrad/wgrad (Phase B), the f32/tf32/f16/fp8/fp4 TFLOPs table (Phase D), FP8 conv via im2col, LegoGears mAP comparison.
 - C++ parity for the FP8/FP4 numerics: NOT RUN - no C++ build of `v6-dev-fp8` / `raptor-fp4` in this environment. The host references in `darknet_cuda_oxide::fp8` / `::fp4` are ports of the C++ recipes and are checked bit-for-bit against the device kernels.
 
+### `[segmentation]` semantic segmentation head (2026-10-04, Phase 1b)
+- New `src/darknet-core/src/segmentation.rs` (pure math) + `SegmentationSpec` / `SegmentationLoss` in `model.rs`, ported from `v6-dev-seg:src-seg/segmentation_layer.cpp`, `seg_gate.cpp` and `logistic_x_ent_cpu` / `softmax_x_ent_cpu`.
+- `classes=1` is binary: sanitise non-finite inputs to 0, sigmoid, logistic cross-entropy. `classes>1` is a per-pixel softmax over the NCHW channel axis (`H*W` stride) plus softmax cross-entropy against a one-hot mask. Both seeds are the plain Darknet descent direction `truth - prediction`, so the layer is a backward pass-through.
+- Full C++ key set with its validation: `classes`(2), `max_delta`(FLT_MAX), `delta_normalizer`, `cls_normalizer`, `loss` (bce/logistic for 1 class, ce/softmax otherwise, mismatch is an error), `lambda_ce`, `ce_normalizer` (alias `loss_normalizer_ce`), `gate_enabled`, `gate_t_correct`(.9), `gate_warmup_iters`(1000), `gate_ramp_iters`(2000), `gate_max_compensation`(10). Both `segmentation` and the `segmenter` alias parse.
+- The correct-pixel gate is ported: a raised cosine over `gate_ramp_iters` after `gate_warmup_iters` scales the delta *and* the per-element loss of pixels that are already correct and confident by `1 - strength`, then scales the whole delta buffer by `min(total/active, gate_max_compensation)`. It needs the training iteration, so `dense_loss` gains `compute_dense_training_loss_at` (the existing `compute_dense_training_loss` is iteration 0, i.e. the gate is off).
+- GPU arm is a host round trip for now (like `sam`), verified against the CPU path by `assert_gpu_layer_chain_matches_cpu` for `classes` 1 and 3.
+- Two findings worth keeping: the reported `loss_ce` must be summed from the loss buffer **after** the gate (summing before it silently ignores the gate's whole point), and C++ keeps `temperature` at 1 because the parser reads no key for it, so the Rust spec carries the field but no cfg key.
+- Not done: a segmentation label loader / dense mask truth in the data pipeline, the `seg_gate` GPU kernel (the CPU gate is used on both paths), the LegoGears `yolov4-tiny-seg*` cfgs (Open Question 1) and a `segmenter` CLI trainer (Open Question 5).
+- C++ dump parity: NOT RUN - no C++ build of `v6-dev-seg` in this environment. The formulas are copied from the named C++ files and covered by finite differences of `L = sum(seed * forward)` for both loss types, plus hand-computed values written out in the tests.
+
 ### Layer-port Phase 0 delivered (2026-10-03)
 - Ten elementwise activations (`gelu elu selu relie plse hardtan lhtan stair hard_mish revleaky`) with exact input-form gradients; unknown activation names are a config error, no longer a silent identity; `gelu` has an oxide kernel.
 - `[maxpool]` reads the C++ key `maxpool_zero_nonmax` and implements `maxpool_depth` (CPU).

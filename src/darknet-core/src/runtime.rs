@@ -1107,6 +1107,15 @@ impl ExecutableNetwork {
                         .collect();
                     (Tensor::from_data(current_input.shape, data)?, None)
                 }
+                (LayerKind::Segmentation(spec), LayerParams::None) => {
+                    let out = crate::segmentation::segmentation_forward(
+                        &current_input.data,
+                        spec,
+                        current_input.shape.batch,
+                        current_input.shape.width * current_input.shape.height,
+                    );
+                    (Tensor::from_data(current_input.shape, out.output)?, None)
+                }
                 (LayerKind::Yolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
                 | (LayerKind::Region(_), LayerParams::None)
@@ -1839,6 +1848,7 @@ impl ExecutableNetwork {
                 | (LayerKind::Detection(_), LayerParams::None)
                 | (LayerKind::Cost { .. }, LayerParams::None)
                 | (LayerKind::Logistic, LayerParams::None)
+                | (LayerKind::Segmentation(_), LayerParams::None)
                 | (LayerKind::Regression(_), LayerParams::None)
                 | (LayerKind::JevCe(_), LayerParams::None)
                 | (LayerKind::Contrastive { .. }, LayerParams::None) => {
@@ -4260,6 +4270,24 @@ where
                         launch_config,
                     )
                     .map_err(|err| backend_error("logistic", err))?,
+                // Host round trip for now: the per-pixel softmax over a
+                // strided channel axis and the binary sanitise+logistic are both
+                // one-elementwise passes until a kernel is written, exactly like
+                // the `sam` head.
+                (LayerKind::Segmentation(spec), LayerParams::None) => {
+                    let host_input = self
+                        .download_tensor(current_input, layer.input_shape)
+                        .map_err(|err| backend_error("download segmentation input", err))?;
+                    let out = crate::segmentation::segmentation_forward(
+                        &host_input.data,
+                        spec,
+                        layer.input_shape.batch,
+                        layer.input_shape.width * layer.input_shape.height,
+                    );
+                    self.backend
+                        .upload_f32(&tensor_backend_shape(layer.output_shape), &out.output)
+                        .map_err(|err| backend_error("upload segmentation output", err))?
+                }
                 (LayerKind::Yolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
                 | (LayerKind::Region(_), LayerParams::None)
@@ -4726,6 +4754,7 @@ where
                     | LayerKind::ChannelShuffle(_)
                     | LayerKind::Softmax { .. }
                     | LayerKind::Logistic
+                    | LayerKind::Segmentation(_)
                     | LayerKind::Regression(_)
                     | LayerKind::JevCe(_)
                     | LayerKind::ScaleChannels(_)
@@ -5790,6 +5819,7 @@ where
                 | (LayerKind::Detection(_), Some(LayerParams::None))
                 | (LayerKind::Cost { .. }, Some(LayerParams::None))
                 | (LayerKind::Logistic, Some(LayerParams::None))
+                | (LayerKind::Segmentation(_), Some(LayerParams::None))
                 | (LayerKind::Regression(_), Some(LayerParams::None))
                 | (LayerKind::JevCe(_), Some(LayerParams::None))
                 | (LayerKind::Sam(_), Some(LayerParams::None))
@@ -17187,6 +17217,68 @@ mod tests {
              [channel_slice]\nfrom=-2\nstart=0\nend=2\n",
             2,
         );
+    }
+
+    /// `[segmentation]` is a pass-through loss head: the GPU forward must match
+    /// the CPU one exactly (the softmax is a host round trip today) and its seed
+    /// must reach the convolution before it unchanged.
+    #[test]
+    fn gpu_segmentation_head_matches_cpu_forward_and_backward() {
+        for classes in [1usize, 3] {
+            assert_gpu_layer_chain_matches_cpu(
+                &format!(
+                    "[net]\nwidth=2\nheight=2\nchannels={classes}\nbatch=2\n\
+                     [convolutional]\nfilters={classes}\nsize=1\nstride=1\nactivation=linear\n\
+                     [segmentation]\nclasses={classes}\n"
+                ),
+                1,
+            );
+        }
+    }
+
+    /// End-to-end CPU: the layer's output, the loss seed and the convolution
+    /// gradient must agree with the module's own numbers.
+    #[test]
+    fn segmentation_layer_forward_and_backward_match_the_module() {
+        let cfg = "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=2\n\
+                   [convolutional]\nfilters=2\nsize=1\nstride=1\nactivation=linear\n\
+                   [segmentation]\nclasses=2\nlambda_ce=0.5\ncls_normalizer=2\n";
+        let network = Network::from_config(ConfigFile::parse_str("inline.cfg", cfg).unwrap()).unwrap();
+        let mut exec = ExecutableNetwork::new(network);
+        fill_conv_params(&mut exec.params);
+        let input = patterned_input(exec.network.net.input_shape());
+        let forward = exec.forward_training(&input).unwrap();
+
+        let spec = match &exec.network.layers[1].kind {
+            LayerKind::Segmentation(spec) => spec.clone(),
+            other => panic!("expected segmentation, got {}", other.name()),
+        };
+        let shape = exec.network.layers[1].output_shape;
+        let spatial = shape.width * shape.height;
+        let expected = crate::segmentation::segmentation_forward(
+            &forward.layer_outputs[0].data,
+            &spec,
+            shape.batch,
+            spatial,
+        );
+        assert_slice_close("segmentation output", &forward.layer_outputs[1].data, &expected.output, 1e-6);
+
+        // A seed of all ones on the head must arrive at the previous layer
+        // unchanged: the layer is a pass-through for the backward.
+        let mut seeds = vec![None; exec.network.layers.len()];
+        seeds[1] = Some(Tensor::from_data(shape, vec![1.0; shape.batch * shape.element_count()]).unwrap());
+        exec.backward_accumulate_seeded(&input, &forward, &seeds).unwrap();
+        let grads = &exec.train_buffers[0];
+        let LayerTrainBuffers::Convolutional(train) = grads else { panic!("expected conv buffers") };
+        assert_eq!(train.bias_updates.len(), shape.channels);
+        // A pure pass-through cannot drive a bias gradient: sum of weights = 1.
+        // A convolution's bias gradient is the plain sum of its output
+        // gradient, so an all-ones seed on the head must reach it untouched:
+        // every bias gets exactly batch * H * W.
+        let expected = (shape.batch * shape.width * shape.height) as f32;
+        for (i, g) in train.bias_updates.iter().enumerate() {
+            assert!((g - expected).abs() < 1e-4, "bias {i} gradient {g}, expected {expected}");
+        }
     }
 
     #[test]

@@ -3278,7 +3278,9 @@ Questions at the end of this document rather than on code:
 
 | Phase | Blocked on | Notes |
 |---|---|---|
-| 1b `segmentation`, `omd_loss` | nothing but plan expansion | both need a dense-truth loader; `laya_*` is gated on Open Question 2, `seg_gate` on reading the C++ first |
+| 1b `segmentation` | - | **done 2026-10-04**: `src/darknet-core/src/segmentation.rs` + `SegmentationSpec`, including the C++ correct-pixel gate. The label loader, the `seg_gate` GPU kernel and the cfgs stay open (Open Questions 1 and 5) |
+| 1b `omd_loss` | plan expansion | needs the previous layer's features plus an extra seed on layer `idx-1`, unlike the Task 10 heads |
+| 1b `laya_*` | Open Question 2 | |
 | 2A anchor-free heads | nothing but plan expansion | needs `decode.rs` / `evaluate.rs` work, not just a layer |
 | 2B `moe_convolutional`, `eml_convolutional`, `dcnv3` | container-conv reuse (the cross-cutting prerequisite (1)) | `eml` save order is still `[report: not re-read]` |
 | 2C OBB family | Open Question 4 | XL; also changes data loading, NMS and mAP |

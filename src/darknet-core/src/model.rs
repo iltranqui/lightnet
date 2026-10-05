@@ -313,6 +313,65 @@ pub struct RegressionSpec {
     pub scale: f32,
 }
 
+/// `[segmentation]` loss: binary logistic cross-entropy (`classes == 1`) or
+/// per-pixel softmax cross-entropy (`classes > 1`).  C++ derives this from the
+/// class count and only lets `loss=bce|logistic` / `loss=ce|softmax` agree with
+/// it, so the enum has no independent choice (`src/darknet-core/src/segmentation.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SegmentationLoss {
+    /// `classes == 1`: sigmoid output, `logistic_x_ent_cpu`.
+    Bce,
+    /// `classes > 1`: per-pixel softmax output, `softmax_x_ent_cpu`.
+    SoftmaxCe,
+}
+
+impl SegmentationLoss {
+    /// The cfg spellings C++ accepts for this loss (`darknet_enums.cpp`).
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "bce" | "logistic" => Some(Self::Bce),
+            "ce" | "softmax" => Some(Self::SoftmaxCe),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Bce => "bce",
+            Self::SoftmaxCe => "ce",
+        }
+    }
+
+    /// C++ `parse_segmentation_section`: the requested loss must be the one the
+    /// class count implies.
+    pub fn for_classes(classes: usize) -> Self {
+        if classes == 1 { Self::Bce } else { Self::SoftmaxCe }
+    }
+}
+
+/// `[segmentation]` (Phase 1b of `tasks/rust/layers.md`), ported from
+/// `v6-dev-seg:src-lib/darknet_cfg.cpp::parse_segmentation_section`.  The layer
+/// has no weights and passes its shape through unchanged.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SegmentationSpec {
+    pub classes: usize,
+    /// Always 1 in C++: `make_segmentation_layer` sets it and the parser reads
+    /// no cfg key.  Kept so the softmax call matches the source.
+    pub temperature: f32,
+    /// Gradient clip; the C++ default is `FLT_MAX`, i.e. no clipping.
+    pub max_delta: f32,
+    pub delta_normalizer: f32,
+    pub cls_normalizer: f32,
+    pub loss: SegmentationLoss,
+    pub lambda_ce: f32,
+    pub ce_normalizer: f32,
+    pub gate_enabled: bool,
+    pub gate_t_correct: f32,
+    pub gate_warmup_iters: usize,
+    pub gate_ramp_iters: usize,
+    pub gate_max_compensation: f32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct JevCeSpec {
     pub groups: usize,
@@ -619,6 +678,7 @@ pub enum LayerKind {
     Logistic,
     Regression(RegressionSpec),
     JevCe(JevCeSpec),
+    Segmentation(SegmentationSpec),
     Dropout {
         probability: Option<f32>,
         /// `dropblock=1` selects DropBlock instead of element-wise dropout.
@@ -661,6 +721,7 @@ impl LayerKind {
             Self::Logistic => "logistic",
             Self::Regression(_) => "regression",
             Self::JevCe(_) => "jev_ce",
+            Self::Segmentation(_) => "segmentation",
             Self::Dropout { .. } => "dropout",
             Self::ScaleChannels(_) => "scale_channels",
             Self::Sam(_) => "sam",
@@ -1581,6 +1642,91 @@ fn parse_layer_kind(
                 channel_major,
             })
         }
+        // C++ accepts both spellings (`darknet_enums.cpp`: "segmenter" and
+        // "segmentation" both map to ELayerType::SEGMENTATION).
+        "segmentation" | "segmenter" => {
+            let line = section.line;
+            let classes = section.get_usize("classes", 2)?;
+            if classes < 1 {
+                return Err(Error::InvalidConfig(format!(
+                    "[segmentation] at line {line}: classes={classes} must be >= 1"
+                )));
+            }
+            // C++ only warns when the input channels do not match `classes`;
+            // keep that (a config it accepts must not become an error here).
+            let max_delta = section.get_f32("max_delta", f32::MAX)?;
+            if !(max_delta > 0.0) {
+                return Err(Error::InvalidConfig(format!(
+                    "[segmentation] at line {line}: max_delta={max_delta} must be > 0"
+                )));
+            }
+            let delta_normalizer = section.get_f32("delta_normalizer", 1.0)?;
+            if !(delta_normalizer > 0.0) {
+                return Err(Error::InvalidConfig(format!(
+                    "[segmentation] at line {line}: delta_normalizer={delta_normalizer} must be > 0"
+                )));
+            }
+            let cls_normalizer = section.get_f32("cls_normalizer", 1.0)?;
+            if !(cls_normalizer > 0.0) {
+                return Err(Error::InvalidConfig(format!(
+                    "[segmentation] at line {line}: cls_normalizer={cls_normalizer} must be > 0"
+                )));
+            }
+            let expected = SegmentationLoss::for_classes(classes);
+            let loss_name = section.get_str("loss", expected.name()).trim().to_ascii_lowercase();
+            let requested = SegmentationLoss::from_name(&loss_name).ok_or_else(|| {
+                Error::InvalidConfig(format!("[segmentation] at line {line}: loss \"{loss_name}\" is not supported"))
+            })?;
+            if requested != expected {
+                let wanted = if classes == 1 { "bce/logistic" } else { "ce/softmax" };
+                return Err(Error::InvalidConfig(format!(
+                    "[segmentation] at line {line}: classes={classes} uses {wanted}, not loss={loss_name}"
+                )));
+            }
+            let lambda_ce = section.get_f32("lambda_ce", 1.0)?;
+            if !(lambda_ce > 0.0) {
+                return Err(Error::InvalidConfig(format!(
+                    "[segmentation] at line {line}: lambda_ce={lambda_ce} must be > 0"
+                )));
+            }
+            let ce_normalizer =
+                section.get_f32("ce_normalizer", section.get_f32("loss_normalizer_ce", 1.0)?)?;
+            if !(ce_normalizer > 0.0) {
+                return Err(Error::InvalidConfig(format!(
+                    "[segmentation] at line {line}: ce_normalizer={ce_normalizer} must be > 0"
+                )));
+            }
+            let gate_enabled = section.get_usize("gate_enabled", 0)? != 0;
+            let gate_t_correct = section.get_f32("gate_t_correct", 0.9)?;
+            if !(0.0..=1.0).contains(&gate_t_correct) {
+                return Err(Error::InvalidConfig(format!(
+                    "[segmentation] at line {line}: gate_t_correct={gate_t_correct} must be in [0, 1]"
+                )));
+            }
+            let gate_warmup_iters = section.get_usize("gate_warmup_iters", 1000)?;
+            let gate_ramp_iters = section.get_usize("gate_ramp_iters", 2000)?;
+            let gate_max_compensation = section.get_f32("gate_max_compensation", 10.0)?;
+            if gate_max_compensation < 1.0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[segmentation] at line {line}: gate_max_compensation={gate_max_compensation} must be >= 1"
+                )));
+            }
+            LayerKind::Segmentation(SegmentationSpec {
+                classes,
+                temperature: 1.0,
+                max_delta,
+                delta_normalizer,
+                cls_normalizer,
+                loss: requested,
+                lambda_ce,
+                ce_normalizer,
+                gate_enabled,
+                gate_t_correct,
+                gate_warmup_iters,
+                gate_ramp_iters,
+                gate_max_compensation,
+            })
+        }
         "dropout" => LayerKind::Dropout {
             probability: section
                 .get("probability")
@@ -1796,6 +1942,7 @@ fn infer_output_shape(
         | LayerKind::Logistic
         | LayerKind::Regression(_)
         | LayerKind::JevCe(_)
+        | LayerKind::Segmentation(_)
         | LayerKind::Dropout { .. }
         | LayerKind::Contrastive { .. } => Ok(current),
         LayerKind::ChannelSlice(spec) => {
@@ -2075,7 +2222,7 @@ mod tests {
 
     use crate::cfg::ConfigFile;
 
-    use super::{LayerKind, LrPolicy, Network};
+    use super::{LayerKind, LrPolicy, Network, SegmentationLoss};
 
     fn build(text: &str) -> crate::error::Result<Network> {
         Network::from_config(ConfigFile::parse_str("t.cfg", text)?)
@@ -2220,6 +2367,91 @@ mod tests {
         assert!(build(&format!("{base}[jev_ce]\ngroups=4\ncandidates=4\n")).is_err()); // 4*4 != 12
         assert!(build(&format!("{base}[jev_ce]\ngroups=4\nlabel_smoothing=1.0\n")).is_err());
         assert!(build(&format!("{base}[jev_ce]\ngroups=4\nlayout=zigzag\n")).is_err());
+    }
+
+    #[test]
+    fn segmentation_keys_follow_cpp_defaults_and_validation() {
+        // C++ defaults (parse_segmentation_section): classes=2, max_delta=FLT_MAX,
+        // delta_normalizer=1, cls_normalizer=1, lambda_ce=1, ce_normalizer=1,
+        // gate_enabled=0, gate_t_correct=0.9, gate_warmup_iters=1000,
+        // gate_ramp_iters=2000, gate_max_compensation=10.
+        let base = "[net]\nwidth=2\nheight=3\nchannels=5\n[convolutional]\nfilters=5\nsize=1\n";
+        let net = build(&format!("{base}[segmentation]\n")).unwrap();
+        let LayerKind::Segmentation(s) = &net.layers[1].kind else { panic!() };
+        assert_eq!(s.classes, 2);
+        assert_eq!(s.loss, SegmentationLoss::SoftmaxCe);
+        assert_eq!(s.max_delta, f32::MAX, "FLT_MAX means no clipping");
+        assert_eq!((s.delta_normalizer, s.cls_normalizer, s.lambda_ce, s.ce_normalizer), (1.0, 1.0, 1.0, 1.0));
+        assert!(!s.gate_enabled);
+        assert_eq!((s.gate_t_correct, s.gate_warmup_iters, s.gate_ramp_iters, s.gate_max_compensation), (0.9, 1000, 2000, 10.0));
+        assert_eq!(s.temperature, 1.0, "C++ never reads a temperature key");
+        // The layer has no weights and passes its shape through unchanged.
+        assert!(net.layers[1].weights().is_none());
+        assert_eq!(net.layers[1].output_shape, net.layers[0].output_shape);
+
+        // Every C++-accepted key round-trips.
+        let net = build(&format!(
+            "{base}[segmentation]\nclasses=3\nmax_delta=2.5\ndelta_normalizer=0.5\ncls_normalizer=2\n\
+             lambda_ce=0.25\nce_normalizer=4\ngate_enabled=1\ngate_t_correct=0.5\ngate_warmup_iters=5\n\
+             gate_ramp_iters=10\ngate_max_compensation=3\nloss=softmax\n"
+        ))
+        .unwrap();
+        let LayerKind::Segmentation(s) = &net.layers[1].kind else { panic!() };
+        assert_eq!(s.classes, 3);
+        assert_eq!((s.max_delta, s.delta_normalizer, s.cls_normalizer), (2.5, 0.5, 2.0));
+        assert_eq!((s.lambda_ce, s.ce_normalizer), (0.25, 4.0));
+        assert!(s.gate_enabled);
+        assert_eq!((s.gate_t_correct, s.gate_warmup_iters, s.gate_ramp_iters, s.gate_max_compensation), (0.5, 5, 10, 3.0));
+        // `loss_normalizer_ce` is the C++ fallback spelling of `ce_normalizer`.
+        let net = build(&format!("{base}[segmentation]\nloss_normalizer_ce=7\n")).unwrap();
+        let LayerKind::Segmentation(s) = &net.layers[1].kind else { panic!() };
+        assert_eq!(s.ce_normalizer, 7.0);
+        // `segmenter` is the C++ alias of `segmentation`.
+        let net = build(&format!("{base}[segmenter]\n")).unwrap();
+        assert_eq!(net.layers[1].kind.name(), "segmentation");
+
+        // classes=1 selects logistic BCE and rejects the softmax spelling.
+        let net = build(&format!("[net]\nwidth=2\nheight=2\nchannels=1\n[convolutional]\nfilters=1\nsize=1\n[segmentation]\nclasses=1\n")).unwrap();
+        let LayerKind::Segmentation(s) = &net.layers[1].kind else { panic!() };
+        assert_eq!(s.loss, SegmentationLoss::Bce);
+        let one = "[net]\nwidth=2\nheight=2\nchannels=1\n[convolutional]\nfilters=1\nsize=1\n[segmentation]\nclasses=1\n";
+        assert!(build(&format!("{one}loss=ce\n")).is_err(), "classes=1 must not take loss=ce");
+        assert!(build(&format!("{one}loss=softmax\n")).is_err());
+        assert!(build(&format!("{one}loss=logistic\n")).is_ok());
+        // classes=2 must not take the logistic spelling.
+        let two = &base[..base.len()];
+        assert!(build(&format!("{two}[segmentation]\nclasses=2\nloss=bce\n")).is_err());
+        assert!(build(&format!("{two}[segmentation]\nclasses=2\nloss=hinge\n")).is_err());
+
+        // C++ validation: every one of these is a fatal error.
+        for bad in [
+            "classes=0",
+            "max_delta=0",
+            "max_delta=-1",
+            "delta_normalizer=0",
+            "cls_normalizer=-0.5",
+            "lambda_ce=0",
+            "ce_normalizer=0",
+            "loss_normalizer_ce=0",
+            "gate_t_correct=-0.1",
+            "gate_t_correct=1.5",
+            "gate_max_compensation=0.5",
+        ] {
+            assert!(build(&format!("{base}[segmentation]\n{bad}\n")).is_err(), "accepted {bad}");
+        }
+    }
+
+    #[test]
+    fn segmentation_classes_one_is_a_single_channel_binary_head() {
+        let net = build(
+            "[net]\nwidth=2\nheight=2\nchannels=1\n[convolutional]\nfilters=1\nsize=1\n\
+             [segmentation]\nclasses=1\n",
+        )
+        .unwrap();
+        // Binary masks are `[batch, 1, H*W]`, so the pass-through shape keeps
+        // exactly one channel: nothing to reshape.
+        assert_eq!(net.layers[1].output_shape.channels, 1);
+        assert_eq!(net.layers[1].output_shape.width * net.layers[1].output_shape.height, 4);
     }
 
     fn repo_cfg(name: &str) -> PathBuf {
