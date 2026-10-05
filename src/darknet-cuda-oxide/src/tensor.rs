@@ -122,6 +122,8 @@ impl PooledBuf {
     pub(crate) fn new(buf: DeviceBuffer<f32>, pool: &Arc<BufPool>) -> Self {
         Self { buf: Some(buf), pool: pool.clone() }
     }
+
+
 }
 
 impl Deref for PooledBuf {

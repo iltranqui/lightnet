@@ -109,3 +109,124 @@ pub mod kernels {
         }
     }
 }
+
+/// Row-wise LayerNorm (`rows x cols`) and its input-gradient, for the
+/// transformer family.  One block per row keeps each row's reduction inside a
+/// single thread group, so no second pass over the data is needed.
+#[cuda_module]
+pub mod layernorm {
+    use super::*;
+    use cuda_device::{kernel, thread};
+
+    /// Longest row this kernel accepts.  The reduction lives in registers (one
+    /// thread per row, one block per row), so the only limit is how much a thread
+    /// can keep live; the host rejects anything longer.
+    pub const LAYERNORM_MAX_COLS: usize = 1024;
+
+    #[kernel]
+    pub fn layernorm_forward(
+        x: &[f32],
+        gamma: &[f32],
+        beta: &[f32],
+        mut out: DisjointSlice<f32>,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        has_gamma: u32,
+        has_beta: u32,
+    ) {
+        let r = thread::blockIdx_x() as usize;
+        if r >= rows {
+            return;
+        }
+        let base = r * cols;
+        let mut mean = 0.0f32;
+        let mut i = 0usize;
+        while i < cols {
+            let v = x[base + i];
+            mean += if v.is_finite() { v } else { 0.0 };
+            i += 1;
+        }
+        mean /= cols as f32;
+        let mut var = 0.0f32;
+        i = 0;
+        while i < cols {
+            let v = x[base + i];
+            let d = (if v.is_finite() { v } else { 0.0 }) - mean;
+            var += d * d;
+            i += 1;
+        }
+        var /= cols as f32;
+        let inv_std = 1.0 / (var + eps).sqrt();
+        i = 0;
+        while i < cols {
+            let v = x[base + i];
+            let normalised = ((if v.is_finite() { v } else { 0.0 }) - mean) * inv_std;
+            let g = if has_gamma != 0 { gamma[i] } else { 1.0 };
+            let b = if has_beta != 0 { beta[i] } else { 0.0 };
+            // SAFETY: block `r` only ever writes `r * cols + i`, and each block
+            // owns a distinct `r`, so the (block, i) pairs cover the output once.
+            unsafe { out.as_mut_ptr().add(base + i).write(g * normalised + b) };
+            i += 1;
+        }
+    }
+
+    #[kernel]
+    pub fn layernorm_backward(
+        dy: &[f32],
+        x: &[f32],
+        gamma: &[f32],
+        mut dx: DisjointSlice<f32>,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        has_gamma: u32,
+    ) {
+        let r = thread::blockIdx_x() as usize;
+        if r >= rows {
+            return;
+        }
+        let base = r * cols;
+        let mut mean = 0.0f32;
+        let mut i = 0usize;
+        while i < cols {
+            let v = x[base + i];
+            mean += if v.is_finite() { v } else { 0.0 };
+            i += 1;
+        }
+        mean /= cols as f32;
+        let mut var = 0.0f32;
+        i = 0;
+        while i < cols {
+            let v = x[base + i];
+            let d = (if v.is_finite() { v } else { 0.0 }) - mean;
+            var += d * d;
+            i += 1;
+        }
+        var /= cols as f32;
+        let inv_std = 1.0 / (var + eps).sqrt();
+        let inv_c = 1.0 / cols as f32;
+        let mut mean_g = 0.0f32;
+        let mut mean_gx = 0.0f32;
+        i = 0;
+        while i < cols {
+            let v = x[base + i];
+            let xhat = ((if v.is_finite() { v } else { 0.0 }) - mean) * inv_std;
+            let g = dy[base + i] * (if has_gamma != 0 { gamma[i] } else { 1.0 }) * inv_std;
+            mean_g += g;
+            mean_gx += g * xhat;
+            i += 1;
+        }
+        mean_g *= inv_c;
+        mean_gx *= inv_c;
+        i = 0;
+        while i < cols {
+            let v = x[base + i];
+            let xhat = ((if v.is_finite() { v } else { 0.0 }) - mean) * inv_std;
+            let g = dy[base + i] * (if has_gamma != 0 { gamma[i] } else { 1.0 }) * inv_std;
+            // SAFETY: as above, one owner per output element.
+            unsafe { dx.as_mut_ptr().add(base + i).write(g - mean_g - xhat * mean_gx) };
+            i += 1;
+        }
+    }
+}

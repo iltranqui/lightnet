@@ -14,6 +14,7 @@ pub mod tensor;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use cuda_core::simt::LaunchConfig;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DriverError};
 use darknet_cuda::{AdamParams, AdamUpdateItem, SgdUpdateItem, BatchNormTrainForward, NanInfMode, ElementwiseLaunchConfig, F32ActivationKind, F32TensorOpsBackend};
 
@@ -59,6 +60,7 @@ pub struct OxideBackend {
     stream: Arc<CudaStream>,
     elementwise: elementwise::kernels::LoadedModule,
     activations: activations::kernels::LoadedModule,
+    layernorm: activations::layernorm::LoadedModule,
     bias_scale: bias_scale::kernels::LoadedModule,
     batchnorm: batchnorm::kernels::LoadedModule,
     optim: optim::kernels::LoadedModule,
@@ -409,6 +411,8 @@ impl OxideBackend {
         // Each `#[cuda_module]` loads the crate's embedded PTX bundle once.
         let elementwise = elementwise::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load elementwise module: {err:?}")))?;
+        let layernorm = activations::layernorm::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load layernorm module: {err:?}")))?;
         let activations = activations::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load activations module: {err:?}")))?;
         let bias_scale = bias_scale::kernels::load(&ctx)
@@ -458,6 +462,7 @@ impl OxideBackend {
             stream,
             elementwise,
             activations,
+            layernorm,
             bias_scale,
             batchnorm,
             optim,
@@ -1801,6 +1806,24 @@ impl OxideBackend {
     }
 }
 
+/// Reject a row count / width the LayerNorm kernels cannot serve before
+/// launching, instead of reading out of bounds.
+fn check_layernorm_shape(op: &str, shape: &[usize], rows: usize, cols: usize) -> Result<(), OxideError> {
+    let total: usize = shape.iter().product();
+    if rows == 0 || cols == 0 || rows.checked_mul(cols) != Some(total) {
+        return Err(OxideError::Shape(format!(
+            "{op}: rows*cols must equal the tensor length ({rows}*{cols} vs {total})"
+        )));
+    }
+    if cols > kernels::activations::layernorm::LAYERNORM_MAX_COLS {
+        return Err(OxideError::Shape(format!(
+            "{op}: cols={cols} exceeds the kernel limit {}",
+            kernels::activations::layernorm::LAYERNORM_MAX_COLS
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn launch_err(err: impl fmt::Debug) -> OxideError {
     OxideError::Shape(format!("kernel launch failed: {err:?}"))
 }
@@ -1995,6 +2018,110 @@ impl F32TensorOpsBackend for OxideBackend {
         }
         .map_err(launch_err)?;
         Ok(OxideTensorF32::new(out, &[channels]))
+    }
+
+    /// Row-wise LayerNorm, one block (one thread) per row so the reduction needs
+    /// no second pass.  `rows * cols` must equal the tensor length and `cols` must
+    /// fit [`activations::layernorm::LAYERNORM_MAX_COLS`].
+    fn layernorm_forward_f32(
+        &self,
+        x: &Self::Tensor,
+        gamma: Option<&Self::Tensor>,
+        beta: Option<&Self::Tensor>,
+        shape: &[usize],
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        check_layernorm_shape("layernorm_forward_f32", shape, rows, cols)?;
+        let x_f = self.f32v(x)?;
+        let x = &*x_f;
+        // A missing gamma / beta becomes a one-element placeholder tensor the
+        // kernel never reads (the flag gates the access), so there is no `cols`
+        // allocation and no extra launch.  Both arms are `OxideTensorF32` so the
+        // borrowed buffer below coerces exactly like every other operand.
+        let gamma_tensor = match gamma {
+            Some(t) => self.f32v(t)?.into_owned(),
+            None => OxideTensorF32::new(self.alloc_uninit(1)?, &[1]),
+        };
+        let beta_tensor = match beta {
+            Some(t) => self.f32v(t)?.into_owned(),
+            None => OxideTensorF32::new(self.alloc_uninit(1)?, &[1]),
+        };
+        let has_gamma = u32::from(gamma.is_some());
+        let has_beta = u32::from(beta.is_some());
+        let mut out = self.alloc_uninit(rows * cols)?;
+        // SAFETY: one thread per row, each writing only its own `cols` outputs.
+        unsafe {
+            self.layernorm.layernorm_forward(
+                &self.stream,
+                LaunchConfig {
+                    grid_dim: (rows as u32, 1, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &x.buf,
+                &gamma_tensor.buf,
+                &beta_tensor.buf,
+                &mut out,
+                rows,
+                cols,
+                eps,
+                has_gamma,
+                has_beta,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(out, shape))
+    }
+
+    /// Row-wise LayerNorm input gradient, same one-thread-per-row reduction.
+    fn layernorm_backward_f32(
+        &self,
+        output_grad: &Self::Tensor,
+        x: &Self::Tensor,
+        gamma: Option<&Self::Tensor>,
+        shape: &[usize],
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        check_layernorm_shape("layernorm_backward_f32", shape, rows, cols)?;
+        let dy_f = self.f32v(output_grad)?;
+        let x_f = self.f32v(x)?;
+        let dy = &*dy_f;
+        let x = &*x_f;
+        let gamma_tensor = match gamma {
+            Some(t) => self.f32v(t)?.into_owned(),
+            None => OxideTensorF32::new(self.alloc_uninit(1)?, &[1]),
+        };
+        let has_gamma = u32::from(gamma.is_some());
+        let mut dx = self.alloc_uninit(rows * cols)?;
+        // SAFETY: one thread per row, each writing only its own `cols` outputs.
+        unsafe {
+            self.layernorm.layernorm_backward(
+                &self.stream,
+                LaunchConfig {
+                    grid_dim: (rows as u32, 1, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &dy.buf,
+                &x.buf,
+                &gamma_tensor.buf,
+                &mut dx,
+                rows,
+                cols,
+                eps,
+                has_gamma,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(dx, shape))
     }
 
     fn activation_f32(

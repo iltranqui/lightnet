@@ -53,6 +53,9 @@ pub fn shortcut_fit(x: &[f32], batch: usize, to_len: usize) -> Vec<f32> {
 }
 
 /// Softmax Jacobian-vector product: `dx = y * (dy - sum(y * dy))` per group.
+///
+/// Reference for [`crate::F32TensorOpsBackend::softmax_backward_f32`]; `y` is the softmax
+/// **output**, so the caller passes the forward's result rather than its logits.
 pub fn softmax_backward(y: &[f32], dy: &[f32], group_size: usize) -> Vec<f32> {
     assert!(
         group_size > 0 && y.len() == dy.len() && y.len() % group_size == 0,
@@ -626,5 +629,197 @@ mod channel_permute_tests {
         let y2 = channel_permute(&x2, 2, 2, 3, 2);
         assert_eq!(&y2[0..4], &[0.0, 1.0, 6.0, 7.0]); // channels 0 and 3 of sample 0
         assert_eq!(&y2[12..16], &[12.0, 13.0, 18.0, 19.0]);
+    }
+}
+
+/// Row-wise LayerNorm over a flat `rows x cols` buffer (reference for
+/// [`crate::F32TensorOpsBackend::layernorm_forward_f32`]).
+///
+/// `y = gamma * (x - mean) * inv_std + beta`, with `inv_std = 1/sqrt(var + eps)`
+/// and `var` the *population* variance (biased, matching torch and the C++ LAYA
+/// and ViT layers).  Non-finite inputs count as 0, which is what the LAYA
+/// scorer's sanitiser does before normalising.
+///
+/// `gamma` and `beta` may be `None` for the bias-free variant (ModernBERT
+/// `attn_norm` / `mlp_norm`, and `[laya_encoder]`, are all bias-free).
+pub fn layernorm(
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    gamma: Option<&[f32]>,
+    beta: Option<&[f32]>,
+    eps: f32,
+) -> Vec<f32> {
+    assert!(rows > 0 && cols > 0 && x.len() >= rows * cols, "layernorm: bad shape");
+    let mut out = vec![0.0f32; rows * cols];
+    let inv_c = 1.0 / cols as f32;
+    for r in 0..rows {
+        let row = &x[r * cols..(r + 1) * cols];
+        let mut mean = 0.0f32;
+        for v in row {
+            mean += if v.is_finite() { *v } else { 0.0 };
+        }
+        mean *= inv_c;
+        let mut var = 0.0f32;
+        for v in row {
+            let d = (if v.is_finite() { *v } else { 0.0 }) - mean;
+            var += d * d;
+        }
+        var *= inv_c;
+        let inv_std = 1.0 / (var + eps).sqrt();
+        for (i, v) in row.iter().enumerate() {
+            let normalised = ((if v.is_finite() { *v } else { 0.0 }) - mean) * inv_std;
+            let g = gamma.map_or(1.0, |g| g[i]);
+            let b = beta.map_or(0.0, |b| b[i]);
+            out[r * cols + i] = g * normalised + b;
+        }
+    }
+    out
+}
+
+/// Row-wise LayerNorm backward over a flat `rows x cols` buffer: the input
+/// gradient only (reference for
+/// [`crate::F32TensorOpsBackend::layernorm_backward_f32`]).
+///
+/// With `xhat = (x - mean) * inv_std`, `g = dy * gamma * inv_std` and
+/// `m = mean(xhat)`:
+///
+/// ```text
+/// dx = g - mean(g) - xhat * mean(g * xhat)
+/// ```
+///
+/// `mean` and `inv_std` are recomputed from `x` rather than cached, so the
+/// backward needs no saved state; that is one extra reduction pass over a row the
+/// kernel is already reading, and it keeps the op's signature to tensors only.
+pub fn layernorm_backward(
+    dy: &[f32],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    gamma: Option<&[f32]>,
+    eps: f32,
+) -> Vec<f32> {
+    assert!(rows > 0 && cols > 0, "layernorm_backward: bad shape");
+    assert!(dy.len() >= rows * cols && x.len() >= rows * cols, "layernorm_backward: bad shape");
+    let mut dx = vec![0.0f32; rows * cols];
+    let inv_c = 1.0 / cols as f32;
+    for r in 0..rows {
+        let row = &x[r * cols..(r + 1) * cols];
+        let grad = &dy[r * cols..(r + 1) * cols];
+        let mut mean = 0.0f32;
+        for v in row {
+            mean += if v.is_finite() { *v } else { 0.0 };
+        }
+        mean *= inv_c;
+        let mut var = 0.0f32;
+        for v in row {
+            let d = (if v.is_finite() { *v } else { 0.0 }) - mean;
+            var += d * d;
+        }
+        var *= inv_c;
+        let inv_std = 1.0 / (var + eps).sqrt();
+        let mut xhat = vec![0.0f32; cols];
+        let mut g = vec![0.0f32; cols];
+        let mut mean_g = 0.0f32;
+        let mut mean_gx = 0.0f32;
+        for i in 0..cols {
+            xhat[i] = ((if row[i].is_finite() { row[i] } else { 0.0 }) - mean) * inv_std;
+            g[i] = grad[i] * gamma.map_or(1.0, |g| g[i]) * inv_std;
+            mean_g += g[i];
+            mean_gx += g[i] * xhat[i];
+        }
+        mean_g *= inv_c;
+        mean_gx *= inv_c;
+        for i in 0..cols {
+            dx[r * cols + i] = g[i] - mean_g - xhat[i] * mean_gx;
+        }
+    }
+    dx
+}
+
+#[cfg(test)]
+mod layernorm_tests {
+    use super::*;
+
+    #[test]
+    fn a_constant_row_normalises_to_the_bias() {
+        let x = [2.0f32, 2.0, 2.0, 2.0];
+        let beta = [0.5f32, -0.5, 0.25, 0.0];
+        assert_eq!(layernorm(&x, 1, 4, None, Some(&beta), 1e-5), beta);
+        // Without bias the whole row collapses to zero.
+        assert_eq!(layernorm(&x, 1, 4, None, None, 1e-5), vec![0.0; 4]);
+    }
+
+    #[test]
+    fn rows_are_normalised_independently_and_gamma_scales_them() {
+        let x = [1.0f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
+        let gamma = [2.0f32; 4];
+        let out = layernorm(&x, 2, 4, Some(&gamma), None, 1e-5);
+        let expect = |v: f32, mean: f32, var: f32| 2.0 * (v - mean) / (var + 1e-5).sqrt();
+        assert!((out[0] - expect(1.0, 2.5, 1.25)).abs() < 1e-5, "{}", out[0]);
+        assert!((out[7] - expect(40.0, 25.0, 125.0)).abs() < 1e-5, "{}", out[7]);
+        // Non-finite inputs are treated as zero.
+        let dirty = [f32::NAN, 1.0, f32::INFINITY, 3.0];
+        let out = layernorm(&dirty, 1, 4, None, None, 1e-5);
+        assert!(out.iter().all(|v| v.is_finite()), "{out:?}");
+    }
+
+    #[test]
+    fn the_backward_is_the_exact_derivative() {
+        // Central finite differences of sum(g * layernorm(x)) against
+        // layernorm_backward, with a non-trivial gamma.
+        let x: Vec<f32> = (0..12).map(|i| ((i * 5 % 7) as f32 - 3.0) / 2.0).collect();
+        let gamma: Vec<f32> = (0..4).map(|i| 0.5 + 0.2 * i as f32).collect();
+        let beta: Vec<f32> = (0..4).map(|i| -0.1 * i as f32).collect();
+        let g: Vec<f32> = (0..12).map(|i| (i as f32 * 0.37 - 0.5).sin()).collect();
+        let (rows, cols) = (3usize, 4usize);
+        let dx = layernorm_backward(&g, &x, rows, cols, Some(&gamma), 1e-5);
+        let eps = 1e-3f32;
+        for i in 0..x.len() {
+            let mut hi = x.clone();
+            hi[i] += eps;
+            let mut lo = x.clone();
+            lo[i] -= eps;
+            let f = |v: &[f32]| -> f32 {
+                let y = layernorm(v, rows, cols, Some(&gamma), Some(&beta), 1e-5);
+                g.iter().zip(&y).map(|(a, b)| a * b).sum()
+            };
+            let numeric = (f(&hi) - f(&lo)) / (2.0 * eps);
+            let slack = 2e-2 * dx[i].abs().max(1e-2);
+            assert!((numeric - dx[i]).abs() <= slack, "i={i}: numeric {numeric} analytic {}", dx[i]);
+        }
+    }
+
+    #[test]
+    fn the_backward_kills_the_all_ones_direction() {
+        // A shift of every element in a row leaves the normalised output
+        // unchanged, so the sum of that row's input gradient must be zero.
+        let x = [1.0f32, 2.0, 3.0, 4.0];
+        let ones = [1.0f32; 4];
+        let dx = layernorm_backward(&ones, &x, 1, 4, None, 1e-5);
+        assert!(dx.iter().sum::<f32>().abs() < 1e-5, "{dx:?}");
+    }
+
+    #[test]
+    fn the_softmax_backward_matches_the_full_jacobian() {
+        // For a uniform group y = 1/n, dy = ones: dx = y - (1/n)*sum(y) ...
+        let y = [0.25f32; 4];
+        let dy = [1.0f32; 4];
+        let dx = softmax_backward(&y, &dy, 4);
+        // dot = sum(y*dy) = 1, so dx = 0.25 * (1 - 1) = 0.
+        assert!(dx.iter().all(|v| v.abs() < 1e-6), "{dx:?}");
+        // With dy = y the gradient is y * (y - sum(y^2)).
+        let dy2 = y.to_vec();
+        let dx2 = softmax_backward(&y, &dy2, 4);
+        let want = 0.25 * (0.25 - 0.25f32);
+        assert!((dx2[0] - want).abs() < 1e-6, "{} vs {want}", dx2[0]);
+        // Multiple groups are independent (a group of 2 plus a group of 1).
+        let y3 = [0.5f32, 0.5, 1.0, 1.0];
+        let dy3 = [1.0f32, 3.0, 2.0, 5.0];
+        let dx3 = softmax_backward(&y3, &dy3, 2);
+        assert!((dx3[0] - 0.5 * (1.0 - 2.0)).abs() < 1e-6, "{}", dx3[0]);
+        // Second group: y = 1, dy = (2, 5) -> dot 7 -> dx = -5 each.
+        assert!((dx3[2] - (2.0 - 7.0)).abs() < 1e-6, "{}", dx3[2]);
+        assert!((dx3[3] - (5.0 - 7.0)).abs() < 1e-6, "{}", dx3[3]);
     }
 }

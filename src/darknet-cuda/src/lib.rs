@@ -501,6 +501,62 @@ pub trait F32TensorOpsBackend {
         let fitted = host_ops::shortcut_fit(&host, batch, out_len / batch.max(1));
         self.upload_f32(output_shape, &fitted)
     }
+    /// Row-wise LayerNorm over a flat `rows x cols` buffer:
+    /// `y = gamma * (x - mean) * inv_std + beta`, population variance.
+    ///
+    /// `gamma` and `beta` may be `None` for the bias-free variant that
+    /// ModernBERT's `attn_norm` / `mlp_norm` and every `[laya_*]` LayerNorm use.
+    /// `shape` is the output tensor's shape.  Shared building block for the
+    /// transformer family (see `tasks/rust/layers.md` Phase 3A prerequisite).
+    fn layernorm_forward_f32(
+        &self,
+        x: &Self::Tensor,
+        gamma: Option<&Self::Tensor>,
+        beta: Option<&Self::Tensor>,
+        shape: &[usize],
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let host = self.download_f32(x)?;
+        let g = match gamma {
+            Some(t) => Some(self.download_f32(t)?),
+            None => None,
+        };
+        let b = match beta {
+            Some(t) => Some(self.download_f32(t)?),
+            None => None,
+        };
+        self.upload_f32(shape, &host_ops::layernorm(&host, rows, cols, g.as_deref(), b.as_deref(), eps))
+    }
+    /// Row-wise LayerNorm backward: the input gradient only, with the reduction
+    /// statistics recomputed from `x` (`dx = g - mean(g) - xhat * mean(g*xhat)`).
+    ///
+    /// `gamma` may be `None`.  Parameter gradients are not produced here: every
+    /// LayerNorm in the ported families is either frozen or trained by a path
+    /// that folds them in separately.
+    fn layernorm_backward_f32(
+        &self,
+        output_grad: &Self::Tensor,
+        x: &Self::Tensor,
+        gamma: Option<&Self::Tensor>,
+        shape: &[usize],
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let dy = self.download_f32(output_grad)?;
+        let host = self.download_f32(x)?;
+        let g = match gamma {
+            Some(t) => Some(self.download_f32(t)?),
+            None => None,
+        };
+        self.upload_f32(shape, &host_ops::layernorm_backward(&dy, &host, rows, cols, g.as_deref(), eps))
+    }
     /// Softmax over every contiguous `group_size` run of `x` (max-subtracted);
     /// `shape` is the tensor shape of `x` and the output.
     fn softmax_f32(
