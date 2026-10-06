@@ -1438,13 +1438,14 @@ fn shortcut_fit_edge_cases_and_errors() {
 
 // -------------------------------------------------------------- activations
 
-const KINDS: [F32ActivationKind; 18] = [
+const KINDS: [F32ActivationKind; 19] = [
     F32ActivationKind::Linear,
     F32ActivationKind::Loggy,
     F32ActivationKind::Hardtan,
     F32ActivationKind::Relie,
     F32ActivationKind::Lhtan,
     F32ActivationKind::Plse,
+    F32ActivationKind::Stair,
     F32ActivationKind::Logistic,
     F32ActivationKind::Relu,
     F32ActivationKind::Leaky,
@@ -1469,6 +1470,7 @@ fn kind_of(name: &str) -> Option<F32ActivationKind> {
         "relie" => F32ActivationKind::Relie,
         "lhtan" => F32ActivationKind::Lhtan,
         "plse" => F32ActivationKind::Plse,
+        "stair" => F32ActivationKind::Stair,
         "logistic" => F32ActivationKind::Logistic,
         "relu" => F32ActivationKind::Relu,
         "leaky" => F32ActivationKind::Leaky,
@@ -1490,6 +1492,7 @@ fn kind_of(name: &str) -> Option<F32ActivationKind> {
         | F32ActivationKind::Relie
         | F32ActivationKind::Lhtan
         | F32ActivationKind::Plse
+        | F32ActivationKind::Stair
         | F32ActivationKind::Logistic
         | F32ActivationKind::Relu
         | F32ActivationKind::Leaky
@@ -1534,6 +1537,15 @@ fn act64(kind: F32ActivationKind, x: f64) -> f64 {
                 0.01 * (x - 4.0) + 1.0
             } else {
                 0.125 * x + 0.5
+            }
+        }
+        F32ActivationKind::Stair => {
+            let n = x.floor() as i32;
+            let half_floor = (x / 2.0).floor();
+            if n % 2 == 0 {
+                half_floor
+            } else {
+                (x - n as f64) + half_floor
             }
         }
         F32ActivationKind::Logistic => 1.0 / (1.0 + (-x).exp()),
@@ -1599,6 +1611,13 @@ fn grad64(kind: F32ActivationKind, x: f64) -> f64 {
                 0.01
             } else {
                 0.125
+            }
+        }
+        F32ActivationKind::Stair => {
+            if (x.floor() as i32).rem_euclid(2) == 1 {
+                1.0
+            } else {
+                0.0
             }
         }
         F32ActivationKind::Logistic => sig * (1.0 - sig),
@@ -1674,6 +1693,15 @@ fn act32(kind: F32ActivationKind, x: f32) -> f32 {
                 0.125 * x + 0.5
             }
         }
+        F32ActivationKind::Stair => {
+            let n = x.floor() as i32;
+            let half_floor = (x / 2.0).floor();
+            if n % 2 == 0 {
+                half_floor
+            } else {
+                (x - n as f32) + half_floor
+            }
+        }
         F32ActivationKind::Logistic => 1.0 / (1.0 + (-x).exp()),
         F32ActivationKind::Relu => x.max(0.0),
         F32ActivationKind::Leaky => if x > 0.0 { x } else { 0.1 * x },
@@ -1716,7 +1744,7 @@ fn same_f32(a: f32, b: f32) -> bool {
 
 fn edge_values() -> Vec<f32> {
     let mut v = vec![0.0f32, -0.0];
-    for m in [1e-30f32, 1e-6, 0.05, 0.5, 0.999, 1.0, 1.001, 2.5, 3.999, 4.0, 4.001, 5.0, 5.999, 6.0, 6.001, 10.0, 19.99, 20.0, 20.01, 25.0, 30.0, 88.0, 89.0, 100.0, 1e4] {
+    for m in [1e-30f32, 1e-6, 0.05, 0.5, 0.999, 1.0, 1.001, 2.0, 2.5, 3.0, 3.999, 4.0, 4.001, 5.0, 5.999, 6.0, 6.001, 10.0, 19.99, 20.0, 20.01, 25.0, 30.0, 88.0, 89.0, 100.0, 1e4] {
         v.push(m);
         v.push(-m);
     }

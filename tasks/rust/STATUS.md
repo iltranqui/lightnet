@@ -34,6 +34,13 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- Added an oxide Stair activation kernel matching Darknet's floor-based
+  alternating-step formula and parity gradient, including negative odd intervals.
+  Verified by the 391-test core library suite, `oxide_parity` (11 passed,
+  including finite differences away from integer discontinuities), `oxide_half`
+  (13 passed, 1 ignored), all 13 `oxide_cfg_shapes` tests (195 convolution-
+  activation pairs), and all 7 real-device `oxide_runtime_chain` tests. Every
+  oxide test target also compiled with `MEM=3G ./tools/test_oxide.sh --no-run`.
 - Added an oxide PLSE activation kernel with the C++ piecewise-linear sigmoid
   and exact ±4 endpoint gradients. Verified by the 391-test core library suite,
   `oxide_parity` (11 passed, including finite differences and input/output

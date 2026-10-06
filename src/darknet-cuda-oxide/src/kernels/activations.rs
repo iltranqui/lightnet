@@ -22,6 +22,7 @@ pub const ACT_HARDTAN: u32 = 14;
 pub const ACT_RELIE: u32 = 15;
 pub const ACT_LHTAN: u32 = 16;
 pub const ACT_PLSE: u32 = 17;
+pub const ACT_STAIR: u32 = 18;
 
 #[device]
 pub fn activate(kind: u32, x: f32) -> f32 {
@@ -91,6 +92,14 @@ pub fn activate(kind: u32, x: f32) -> f32 {
             0.01 * (x - 4.0) + 1.0
         } else {
             0.125 * x + 0.5
+        }
+    } else if kind == 18 {
+        let n = x.floor() as i32;
+        let half_floor = (x / 2.0).floor();
+        if n % 2 == 0 {
+            half_floor
+        } else {
+            (x - n as f32) + half_floor
         }
     } else {
         x
@@ -167,6 +176,9 @@ pub fn gradient(kind: u32, x: f32) -> f32 {
         if x > 0.0 && x < 1.0 { 1.0 } else { 0.001 }
     } else if kind == 17 {
         if x.abs() > 4.0 { 0.01 } else { 0.125 }
+    } else if kind == 18 {
+        let n = x.floor() as i32;
+        if n % 2 != 0 { 1.0 } else { 0.0 }
     } else {
         1.0
     }

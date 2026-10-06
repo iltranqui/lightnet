@@ -115,6 +115,7 @@ fn chained_conv_activation_stacks_match_cpu_backward() {
         "relie",
         "lhtan",
         "plse",
+        "stair",
         "relu6",
         "ramp",
         "mish",

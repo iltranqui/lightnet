@@ -23,6 +23,8 @@ pub enum F32ActivationKind {
     Lhtan,
     /// Piecewise linear saturating sigmoid with 0.01 tails.
     Plse,
+    /// Stair-step function with alternating flat and unit-slope intervals.
+    Stair,
     Logistic,
     Relu,
     Leaky,

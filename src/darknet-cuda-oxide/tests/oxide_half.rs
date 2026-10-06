@@ -340,6 +340,15 @@ fn act_ref(kind: F32ActivationKind, x: f64) -> f64 {
                 0.125 * x + 0.5
             }
         }
+        F32ActivationKind::Stair => {
+            let n = x.floor() as i32;
+            let half_floor = (x / 2.0).floor();
+            if n % 2 == 0 {
+                half_floor
+            } else {
+                (x - n as f64) + half_floor
+            }
+        }
         F32ActivationKind::Leaky => if x > 0.0 { x } else { 0.1 * x },
         F32ActivationKind::Logistic => 1.0 / (1.0 + (-x).exp()),
         F32ActivationKind::Relu => x.max(0.0),
@@ -652,6 +661,7 @@ fn f16_shortcut_avgpool_affine_reverse_match_f64_reference() {
         F32ActivationKind::Relie,
         F32ActivationKind::Lhtan,
         F32ActivationKind::Plse,
+        F32ActivationKind::Stair,
         F32ActivationKind::Leaky,
         F32ActivationKind::Logistic,
         F32ActivationKind::Relu,

@@ -42,13 +42,14 @@ fn assert_close(name: &str, got: &[f32], want: &[f32]) {
     }
 }
 
-const KINDS: [F32ActivationKind; 18] = [
+const KINDS: [F32ActivationKind; 19] = [
     F32ActivationKind::Linear,
     F32ActivationKind::Loggy,
     F32ActivationKind::Hardtan,
     F32ActivationKind::Relie,
     F32ActivationKind::Lhtan,
     F32ActivationKind::Plse,
+    F32ActivationKind::Stair,
     F32ActivationKind::Logistic,
     F32ActivationKind::Relu,
     F32ActivationKind::Leaky,
@@ -91,6 +92,15 @@ fn cpu_activate(kind: F32ActivationKind, x: f32) -> f32 {
                 0.01 * (x - 4.0) + 1.0
             } else {
                 0.125 * x + 0.5
+            }
+        }
+        F32ActivationKind::Stair => {
+            let n = x.floor() as i32;
+            let half_floor = (x / 2.0).floor();
+            if n % 2 == 0 {
+                half_floor
+            } else {
+                (x - n as f32) + half_floor
             }
         }
         F32ActivationKind::Logistic => 1.0 / (1.0 + (-x).exp()),
@@ -161,6 +171,13 @@ fn cpu_gradient(kind: F32ActivationKind, x: f32) -> f32 {
                 0.01
             } else {
                 0.125
+            }
+        }
+        F32ActivationKind::Stair => {
+            if (x.floor() as i32) % 2 != 0 {
+                1.0
+            } else {
+                0.0
             }
         }
         F32ActivationKind::Logistic => {
@@ -262,6 +279,8 @@ fn activations_forward_and_backward() {
     x[9] = 0.0; // Lhtan lower endpoint.
     x[10] = 4.0; // Plse upper transition boundary.
     x[11] = -4.0; // Plse lower transition boundary.
+    x[12] = 3.0; // Stair odd interval.
+    x[13] = -3.0; // Stair negative odd interval.
     let delta = rng.vec(n, -2.0, 2.0);
     let xt = b.upload_f32(&[n], &x).unwrap();
     let dt = b.upload_f32(&[n], &delta).unwrap();
@@ -472,6 +491,15 @@ fn act64(kind: F32ActivationKind, x: f64) -> f64 {
                 0.125 * x + 0.5
             }
         }
+        F32ActivationKind::Stair => {
+            let n = x.floor() as i32;
+            let half_floor = (x / 2.0).floor();
+            if n % 2 == 0 {
+                half_floor
+            } else {
+                (x - n as f64) + half_floor
+            }
+        }
         F32ActivationKind::Logistic => 1.0 / (1.0 + (-x).exp()),
         F32ActivationKind::Relu => x.max(0.0),
         F32ActivationKind::Leaky => {
@@ -518,8 +546,8 @@ fn activation_backward_matches_finite_difference() {
     let b = backend();
     let mut rng = Rng(21);
     let n = 513;
-    // Stay away from the ReLU / Leaky / Lhtan / PLSE / ReLU6 kinks at 0, ±4,
-    // 1, and 6 so central differences are valid.
+    // Stay away from the ReLU / Leaky / Lhtan / PLSE / ReLU6 kinks and Stair
+    // discontinuities at 0, ±4, 1, 6, and every integer.
     let x: Vec<f32> = rng
         .vec(n, -4.0, 8.0)
         .into_iter()
@@ -528,6 +556,7 @@ fn activation_backward_matches_finite_difference() {
                 || (v - 1.0).abs() < 0.05
                 || (v.abs() - 4.0).abs() < 0.05
                 || (v - 6.0).abs() < 0.05
+                || (v - v.round()).abs() < 0.05
             {
                 v + 0.2
             } else {
