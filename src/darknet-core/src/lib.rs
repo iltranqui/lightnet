@@ -31,6 +31,7 @@ pub mod dense_loss;
 pub use dense_loss::{DenseTrainingLoss, compute_dense_training_loss, compute_dense_training_loss_at};
 pub mod detect;
 pub(crate) mod deconvolutional;
+pub(crate) mod eml_conv_math;
 pub mod error;
 pub mod evaluate;
 pub use evaluate::{MapReport, REPORT_CONFIDENCE, ValidationDataset, detector_map};

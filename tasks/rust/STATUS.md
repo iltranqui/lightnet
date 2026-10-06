@@ -34,6 +34,12 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v67: Added `eml_conv_math.rs`, a source-derived pure reference for the
+  `[eml_convolutional]` two-branch combine, stable softplus/sigmoid, optional
+  residual, and exact default branch gradients. Hand-reference, shape/default,
+  strict-boundary, and finite-difference tests passed (4/4). This is only the
+  math prerequisite; cfg/layer/runtime/backend/optimizer support and compiled-C++
+  parity remain open; no compiled-C++ golden was available.
 - v66: Enabled `normalize_channels`, `normalize_channels_softmax`, and
   `normalize_channels_softmax_maxval` on convolution layers in CPU and f32 GPU
   inference/training forward/backward. Exact gradients remain default;

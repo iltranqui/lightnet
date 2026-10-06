@@ -3296,7 +3296,7 @@ genuine *evidence* gaps rather than questions for the user:
 | 1b deferred (c) `contrastive` | - | classifier branch done 2026-10-04; detection branch needs the yolo head's per-box class ids; `region` / `detection` decode + loss still open |
 | 1b `laya_*` | - | **complete 2026-10-05**: `laya_scorer`, `laya_marker_gather`, `laya_act_head`, `laya_loss`, `laya_encoder`, `laya_head` |
 | 2A anchor-free heads | - | `yolox` done 2026-10-04; `ppyoloe` / `yolonas` (shared DFL) and `centernet` to go, plus the LegoGears nested-object fix |
-| 2B `moe` / `eml` | - | `moe_convolutional` CPU done; no-BN Oxide forward/backward and SGD/Adam partial, BN expert backward and SGD/Adam backend paths done; `eml_convolutional` not started (an activation, not a `LayerKind`; save order now verified as `input_layer` then `self_layer`, two full conv blocks) |
+| 2B `moe` / `eml` | - | `moe_convolutional` CPU done; Oxide forward/backward and SGD/Adam paths implemented as detailed above; v67 adds the standalone source-derived EML branch math in `eml_conv_math.rs` (4 host tests), but `eml_convolutional` remains without cfg/layer/runtime/backend integration; save order verified as `input_layer` then `self_layer`, two full conv blocks |
 | 2B `dcnv3` | **no reference numerics** | see the finding below - all five branches that carry it have a stub forward/backward/update, so it cannot be a verified port |
 | 2C OBB family | - | unblocked by decision 4; XL, and it also changes data loading, NMS and mAP |
 | 3A transformer family | - | unblocked by decisions 3 and 7; needs the shared kernel set (LayerNorm fwd/bwd, batched GEMM, row-softmax backward, residual/bias epilogues) built once first |

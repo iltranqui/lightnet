@@ -193,8 +193,10 @@ Immediately next, in dependency order:
   BN Adam parity checks scales, upstream convolution, and deferred host sync.
   FakeBackend optimizer-state tests cover host BN migration and DNOPT4 scale
   round-trip; router-specific soft/tied top-k parity is in `oxide_layers_extra`.
-  CPU path is done (`cdf68d00`). `eml_convolutional` not started (save order
-  verified 2026-10-05).
+  CPU path is done (`cdf68d00`). v67 adds source-derived pure forward/backward
+  math for the EML two-branch combination (`eml_conv_math.rs`, four host tests).
+  `[eml_convolutional]` parsing, layer/runtime integration, backend ops, and
+  optimizer support remain open; its weights order was verified 2026-10-05.
 - [ ] Phase 2B `dcnv3` blocked: no reference numerics (stub in all five branches).
 - [ ] Phase 2C OBB family (unblocked by decision 4; XL — also data loading, NMS,
   mAP).
