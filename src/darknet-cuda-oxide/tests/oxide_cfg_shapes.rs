@@ -1438,11 +1438,12 @@ fn shortcut_fit_edge_cases_and_errors() {
 
 // -------------------------------------------------------------- activations
 
-const KINDS: [F32ActivationKind; 16] = [
+const KINDS: [F32ActivationKind; 17] = [
     F32ActivationKind::Linear,
     F32ActivationKind::Loggy,
     F32ActivationKind::Hardtan,
     F32ActivationKind::Relie,
+    F32ActivationKind::Lhtan,
     F32ActivationKind::Logistic,
     F32ActivationKind::Relu,
     F32ActivationKind::Leaky,
@@ -1465,6 +1466,7 @@ fn kind_of(name: &str) -> Option<F32ActivationKind> {
         "loggy" => F32ActivationKind::Loggy,
         "hardtan" => F32ActivationKind::Hardtan,
         "relie" => F32ActivationKind::Relie,
+        "lhtan" => F32ActivationKind::Lhtan,
         "logistic" => F32ActivationKind::Logistic,
         "relu" => F32ActivationKind::Relu,
         "leaky" => F32ActivationKind::Leaky,
@@ -1484,6 +1486,7 @@ fn kind_of(name: &str) -> Option<F32ActivationKind> {
         | F32ActivationKind::Loggy
         | F32ActivationKind::Hardtan
         | F32ActivationKind::Relie
+        | F32ActivationKind::Lhtan
         | F32ActivationKind::Logistic
         | F32ActivationKind::Relu
         | F32ActivationKind::Leaky
@@ -1510,6 +1513,15 @@ fn act64(kind: F32ActivationKind, x: f64) -> f64 {
                 x
             } else {
                 0.01 * x
+            }
+        }
+        F32ActivationKind::Lhtan => {
+            if x < 0.0 {
+                0.001 * x
+            } else if x > 1.0 {
+                0.001 * (x - 1.0) + 1.0
+            } else {
+                x
             }
         }
         F32ActivationKind::Logistic => 1.0 / (1.0 + (-x).exp()),
@@ -1561,6 +1573,13 @@ fn grad64(kind: F32ActivationKind, x: f64) -> f64 {
                 1.0
             } else {
                 0.01
+            }
+        }
+        F32ActivationKind::Lhtan => {
+            if x > 0.0 && x < 1.0 {
+                1.0
+            } else {
+                0.001
             }
         }
         F32ActivationKind::Logistic => sig * (1.0 - sig),
@@ -1618,6 +1637,15 @@ fn act32(kind: F32ActivationKind, x: f32) -> f32 {
                 0.01 * x
             }
         }
+        F32ActivationKind::Lhtan => {
+            if x < 0.0 {
+                0.001 * x
+            } else if x > 1.0 {
+                0.001 * (x - 1.0) + 1.0
+            } else {
+                x
+            }
+        }
         F32ActivationKind::Logistic => 1.0 / (1.0 + (-x).exp()),
         F32ActivationKind::Relu => x.max(0.0),
         F32ActivationKind::Leaky => if x > 0.0 { x } else { 0.1 * x },
@@ -1660,7 +1688,7 @@ fn same_f32(a: f32, b: f32) -> bool {
 
 fn edge_values() -> Vec<f32> {
     let mut v = vec![0.0f32, -0.0];
-    for m in [1e-30f32, 1e-6, 0.05, 0.5, 1.0, 2.5, 5.0, 5.999, 6.0, 6.001, 10.0, 19.99, 20.0, 20.01, 25.0, 30.0, 88.0, 89.0, 100.0, 1e4] {
+    for m in [1e-30f32, 1e-6, 0.05, 0.5, 0.999, 1.0, 1.001, 2.5, 5.0, 5.999, 6.0, 6.001, 10.0, 19.99, 20.0, 20.01, 25.0, 30.0, 88.0, 89.0, 100.0, 1e4] {
         v.push(m);
         v.push(-m);
     }
@@ -1848,7 +1876,7 @@ fn cfg_conv_bias_activation_chain() {
     }
     let n_csv = pairs.len();
 
-    // (2) every activation (all 7 incl. tanh) x several fixed geometries.
+    // (2) every oxide activation (including cfg-unused variants) x several fixed geometries.
     let mk = |c, h, w, f, k, s, g| Geom {
         row: 0, c, h, w, f, k, sx: s, sy: s, dil: 1, pad: k / 2, groups: g, out_h: 0, out_w: 0, origin: "synthetic".into(),
     };

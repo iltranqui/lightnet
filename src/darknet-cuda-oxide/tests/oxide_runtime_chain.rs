@@ -113,6 +113,7 @@ fn chained_conv_activation_stacks_match_cpu_backward() {
         "loggy",
         "hardtan",
         "relie",
+        "lhtan",
         "relu6",
         "ramp",
         "mish",

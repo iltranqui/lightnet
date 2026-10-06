@@ -42,11 +42,12 @@ fn assert_close(name: &str, got: &[f32], want: &[f32]) {
     }
 }
 
-const KINDS: [F32ActivationKind; 16] = [
+const KINDS: [F32ActivationKind; 17] = [
     F32ActivationKind::Linear,
     F32ActivationKind::Loggy,
     F32ActivationKind::Hardtan,
     F32ActivationKind::Relie,
+    F32ActivationKind::Lhtan,
     F32ActivationKind::Logistic,
     F32ActivationKind::Relu,
     F32ActivationKind::Leaky,
@@ -71,6 +72,15 @@ fn cpu_activate(kind: F32ActivationKind, x: f32) -> f32 {
                 x
             } else {
                 0.01 * x
+            }
+        }
+        F32ActivationKind::Lhtan => {
+            if x < 0.0 {
+                0.001 * x
+            } else if x > 1.0 {
+                0.001 * (x - 1.0) + 1.0
+            } else {
+                x
             }
         }
         F32ActivationKind::Logistic => 1.0 / (1.0 + (-x).exp()),
@@ -127,6 +137,13 @@ fn cpu_gradient(kind: F32ActivationKind, x: f32) -> f32 {
                 1.0
             } else {
                 0.01
+            }
+        }
+        F32ActivationKind::Lhtan => {
+            if x > 0.0 && x < 1.0 {
+                1.0
+            } else {
+                0.001
             }
         }
         F32ActivationKind::Logistic => {
@@ -224,7 +241,8 @@ fn activations_forward_and_backward() {
     x[5] = 6.001;
     x[6] = -2.0; // HardMish lower transition boundary.
     x[7] = -1.0; // Hardtan lower clamp boundary.
-    x[8] = 1.0; // Hardtan upper clamp boundary.
+    x[8] = 1.0; // Hardtan upper clamp boundary and Lhtan upper endpoint.
+    x[9] = 0.0; // Lhtan lower endpoint.
     let delta = rng.vec(n, -2.0, 2.0);
     let xt = b.upload_f32(&[n], &x).unwrap();
     let dt = b.upload_f32(&[n], &delta).unwrap();
@@ -417,6 +435,15 @@ fn act64(kind: F32ActivationKind, x: f64) -> f64 {
                 0.01 * x
             }
         }
+        F32ActivationKind::Lhtan => {
+            if x < 0.0 {
+                0.001 * x
+            } else if x > 1.0 {
+                0.001 * (x - 1.0) + 1.0
+            } else {
+                x
+            }
+        }
         F32ActivationKind::Logistic => 1.0 / (1.0 + (-x).exp()),
         F32ActivationKind::Relu => x.max(0.0),
         F32ActivationKind::Leaky => {
@@ -463,12 +490,18 @@ fn activation_backward_matches_finite_difference() {
     let b = backend();
     let mut rng = Rng(21);
     let n = 513;
-    // Stay away from the ReLU / Leaky / ReLU6 kinks at 0 and 6 so central
-    // differences are valid.
+    // Stay away from the ReLU / Leaky / Lhtan / ReLU6 kinks at 0, 1, and 6
+    // so central differences are valid.
     let x: Vec<f32> = rng
         .vec(n, -4.0, 8.0)
         .into_iter()
-        .map(|v| if v.abs() < 0.05 || (v - 6.0).abs() < 0.05 { v + 0.2 } else { v })
+        .map(|v| {
+            if v.abs() < 0.05 || (v - 1.0).abs() < 0.05 || (v - 6.0).abs() < 0.05 {
+                v + 0.2
+            } else {
+                v
+            }
+        })
         .collect();
     let delta = rng.vec(n, -2.0, 2.0);
     let xt = b.upload_f32(&[n], &x).unwrap();
@@ -492,7 +525,7 @@ fn activation_backward_matches_finite_difference() {
 }
 
 /// darknet-core's CPU gradient (`activation_gradient_from_output`) derives
-/// Logistic / Relu / Leaky / Tanh from the activation OUTPUT, the GPU trait
+/// Logistic / Relu / Leaky / Tanh / Lhtan from the activation OUTPUT, the GPU trait
 /// takes the activation INPUT (the runtime passes the biased pre-activation
 /// tensor).  The two are the same function for these kinds: check it.
 #[test]
@@ -512,6 +545,7 @@ fn activation_backward_input_form_equals_core_output_form() {
         F32ActivationKind::Loggy,
         F32ActivationKind::Hardtan,
         F32ActivationKind::Relie,
+        F32ActivationKind::Lhtan,
         F32ActivationKind::Logistic,
         F32ActivationKind::Relu,
         F32ActivationKind::Leaky,
@@ -537,6 +571,13 @@ fn activation_backward_input_form_equals_core_output_form() {
                             1.0
                         } else {
                             0.01
+                        }
+                    }
+                    F32ActivationKind::Lhtan => {
+                        if y > 0.0 && y < 1.0 {
+                            1.0
+                        } else {
+                            0.001
                         }
                     }
                     F32ActivationKind::Logistic => y * (1.0 - y),

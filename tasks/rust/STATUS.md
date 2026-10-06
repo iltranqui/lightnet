@@ -34,6 +34,13 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- Added an oxide Lhtan activation kernel with its exact 0.001 tail slopes and
+  Darknet's endpoint gradients at 0 and 1. Verified by the 391-test core library
+  suite, `oxide_parity` (11 passed, including finite differences and input/output
+  derivative parity), `oxide_half` (13 passed, 1 ignored), all 13
+  `oxide_cfg_shapes` tests (183 convolution-activation pairs), and all 7
+  real-device `oxide_runtime_chain` tests. Every oxide test target also compiled
+  with `MEM=3G ./tools/test_oxide.sh --no-run`.
 - Added an oxide Relie activation kernel (leaky ReLU with slope 0.01), including
   the exact zero-point derivative. Verified by `oxide_parity` (11 passed,
   including finite differences and input/output derivative parity), `oxide_half`

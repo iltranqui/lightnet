@@ -19,6 +19,8 @@ pub enum F32ActivationKind {
     Hardtan,
     /// Relie: leaky ReLU with Darknet's 0.01 negative slope.
     Relie,
+    /// Leaky hard tanh with unit slope over [0, 1] and 0.001 tails.
+    Lhtan,
     Logistic,
     Relu,
     Leaky,
