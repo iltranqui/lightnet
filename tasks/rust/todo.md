@@ -83,10 +83,12 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
   CPU, including upstream convolution updates. Batch-normalized recurrent layers
   still use CPU backward.
 - [x] Host Adam: connected, standalone batchnorm, local, weighted shortcut,
-  MoE, deconvolutional, GRU/RNN/LSTM/CRNN, and ViT host params use per-layer
-  rate scaling and persisted host moments in DNOPT2 optimizer sidecars (DNOPT1
-  remains readable); ViT preserves weight order, decay groups, gradient
-  clipping, and its reduced mHC learning rate.
+  MoE fallback, deconvolutional, GRU/RNN/LSTM/CRNN, and ViT host params use
+  per-layer rate scaling and persisted host moments. DNOPT3 also persists
+  device MoE Adam moments; DNOPT1/2 remain readable, and legacy DNOPT2 MoE
+  moments migrate to the device on the first no-BN MoE Adam update. ViT
+  preserves weight order, decay groups, gradient clipping, and its reduced mHC
+  learning rate.
 - [~] weighted shortcut: per-feature/per-channel oxide forward composes
   channel-scale + add; input/source gradients use backend elementwise multiply
   and shortcut-fit ops. Oxide reduces raw weight dot products natively, then
@@ -132,11 +134,13 @@ Immediately next, in dependency order:
   owner layer + expert slot; `warm_device_conv_params` warms each MoE expert,
   and host-updated experts invalidate/re-upload their slots. FakeBackend test
   covers slot separation and rewarm. The generic convolution optimizer/BN
-  refresh still handles top-level owners only; no-BN MoE router/expert SGD has
-  a device-side path, using owner/expert slots for convolution experts. Router
-  params sync to host after SGD because
-  the current router forward consumes host params; router gradients/momentum stay
-  device-side. All MoE Adam updates remain host-side.
+  refresh still handles top-level owners only; no-BN MoE router/expert SGD and
+  Adam have device-side paths, using owner/expert slots for convolution experts.
+  Router parameter values sync to host after each update because the current
+  router forward consumes host params; gradients and optimizer moments stay
+  device-side. DNOPT3 persists device MoE Adam moments, while DNOPT1/2 remain
+  readable and DNOPT2 host moments migrate on the first device update. BN expert
+  backward and Adam remain host-side.
 - [~] Phase 2B `moe_convolutional`: real-device forward computes router pooling,
   logits, top-k masking, softmax, expert convolutions, and gate blending. For
   no-BN experts, router connected-backward, gate-column selection and gate-dot
@@ -144,11 +148,12 @@ Immediately next, in dependency order:
   input-gradient broadcast, and expert convolution backward use backend ops;
   gates and pooled/expert activation/output caches remain device-resident, with
   no gate/dot transfers in the normal Oxide training path. Router/expert
-  parameter gradients accumulate on-device across backward calls. For SGD,
-  router and expert updates (including momentum) run on-device without gradient
-  transfers; router parameter values sync to host after each step for the next
-  forward, while expert values support deferred host sync. Adam still transfers
-  router/expert gradients for host updates. The dynamic-loss-scale
+  parameter gradients accumulate on-device across backward calls. For SGD and
+  Adam, no-BN router and expert updates run on-device without gradient transfers;
+  Adam moments persist in DNOPT3, and legacy DNOPT2 host moments migrate on the
+  first device update. Router parameter values sync to host after each step for
+  the next forward, while expert values support deferred host sync. BN expert
+  backward and Adam still use the host fallback. The dynamic-loss-scale
   finiteness check covers dirty router/expert buffers
   (`gpu_moe_device_gradients_participate_in_loss_scale_finiteness_check`); FakeBackend
   parity also checks router momentum residency and `dont_update` gradient
@@ -157,6 +162,7 @@ Immediately next, in dependency order:
   `oxide_runtime_chain::moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu`
   (two backward calls accumulated before the first deferred SGD step, followed
   by a second deferred step, including upstream convolution updates) and
+  `oxide_runtime_chain::moe_adam_updates_router_and_experts_on_oxide_match_cpu_gradients`;
   router-specific soft/tied top-k
   parity coverage in `oxide_layers_extra`.
   CPU path is done (`cdf68d00`). `eml_convolutional` not started (save order

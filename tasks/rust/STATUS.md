@@ -34,6 +34,13 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v53: moved no-BN MoE router/expert Adam updates and moment storage onto the
+  device; DNOPT3 persists those moments, DNOPT1/2 remain readable, and legacy
+  DNOPT2 host moments migrate on the first device update. Fixed host nested-Adam
+  child resizing so later MoE experts retain moments across steps. The focused
+  host MoE suite passed (18/18), host optimizer compatibility passed, and the
+  full real-device `oxide_runtime_chain` suite passed (11/11), including
+  `moe_adam_updates_router_and_experts_on_oxide_match_cpu_gradients`.
 - Added no-BN LSTM device backward: gate derivatives, connected projection
   gradients, and recurrent/input-gradient accumulation use backend ops. The
   training path retains BPTT caches on-device rather than downloading projection,
@@ -146,8 +153,10 @@ Latest increments:
   on-device across backward calls. For SGD, router and expert parameter updates
   plus momentum run on-device without gradient transfers. Router parameter values
   sync to host after each step for the next forward; expert values support
-  deferred host sync. Adam still transfers all MoE gradients for host updates.
-  The dynamic-loss-scale finiteness check covers dirty router/expert buffers. BN experts stay on the CPU fallback. FakeBackend parity and real-device
+  deferred host sync. No-BN MoE Adam updates also run on-device without gradient
+  transfers; DNOPT3 persists the moments and DNOPT2 host moments migrate on first
+  use. BN expert backward and Adam remain on the host fallback. The dynamic-loss-
+  scale finiteness check covers dirty router/expert buffers. BN experts stay on the CPU fallback. FakeBackend parity and real-device
   `moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu`
   pass, including two backward calls accumulated before the first deferred SGD
   step, followed by a second step with upstream convolution updates. The FakeBackend test
@@ -178,12 +187,13 @@ Latest increments:
   and real-device
   `oxide_runtime_chain::lstm_no_batch_norm_forward_and_device_backward_match_cpu`
   compare training updates with CPU, including upstream convolution updates.
-- Host Adam now updates standalone batchnorm, local, connected, weighted
-  shortcut, MoE router/experts, deconvolutional, GRU/RNN/LSTM/CRNN, and ViT
-  parameters with distinct moment slots and per-layer rate scaling. DNOPT2
-  sidecars persist host moments while DNOPT1 remains loadable. The ViT reference
-  test covers C++ weight order, decay groups, clipping, and reduced mHC rate;
-  host resume has a multi-step continuation test.
+- Host Adam updates standalone batchnorm, local, connected, weighted shortcut,
+  MoE fallback, deconvolutional, GRU/RNN/LSTM/CRNN, and ViT parameters with
+  distinct moment slots and per-layer rate scaling. DNOPT3 persists device MoE
+  moments and host moments; DNOPT1/2 remain loadable, with DNOPT2 MoE host moments
+  migrated on first no-BN device update. The ViT reference test covers C++ weight
+  order, decay groups, clipping, and reduced mHC rate; host resume has a
+  multi-step continuation test.
 - `[vit]` reference path: cfg/shape, C++-ordered header-aware weights, seeded init,
   CPU analytical forward/backward + SGD, and GPU f32 host fallback; 23 focused
   tests pass, targeted package check/build pass with `-j 4`.
@@ -227,8 +237,8 @@ believing a `cfg_corpus` failure.
    Phase 4. They also need the Phase 3A prerequisite kernel set.
 2. Phase 2A is done, including `detect::decode_modern_detections` and the
    `detect-image` merge. Phase 2B `moe_convolutional` has a verified CPU path
-   and partial Oxide forward/backward; no-BN expert SGD is now device-side,
-   while MoE Adam and BN expert backward remain host-side.
+   and partial Oxide forward/backward; no-BN router/expert SGD and Adam are now
+   device-side, while BN expert backward and Adam remain on the host fallback.
    Remaining across the phases:
    `cfg/LegoGears_centernet.cfg` end to end (the cfg lives on `Jev_laya`), then
    2B's `eml_convolutional`, 2C (OBB), 3A/3B (transformer + deformable families,
@@ -242,8 +252,8 @@ believing a `cfg_corpus` failure.
    `vc_attention` fast paths (decision 3) get their own kernels or reuse the
    reference attention path.
 4. Phase 2B `moe_convolutional` (weights order verified) has partial Oxide
-   training support; MoE Adam and BN expert backward remain host-side. Then port
-   `eml_convolutional` (an activation, not a `LayerKind`; save order **re-read
+   training support; BN expert backward and Adam fallback remain host-side. Then
+   port `eml_convolutional` (an activation, not a `LayerKind`; save order **re-read
    2026-10-05**: `input_layer` then `self_layer`, two full conv blocks).
 5. Phase 3B deformable family — start with `dcnv4` (real C++ forward and
    kernels; weights order `weights.cpp:428`).
