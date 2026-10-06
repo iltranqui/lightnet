@@ -93,7 +93,7 @@ Latest increments:
   `oxide_runtime_chain::chained_conv_activation_stacks_match_cpu_backward` test.
   `MEM=3G ./tools/test_oxide.sh --no-run` also compiled every oxide test target.
 - YOLO IoU/GIoU box geometry and objectness/class sigmoid-BCE deltas now have
-  central finite-difference coverage; the core library suite passes (393 tests).
+  central finite-difference coverage; the core library suite passes (394 tests).
   The box test records Darknet's legacy 0.5 width/height comparison factor.
   DIoU/CIoU contained-box deltas now have source-derived parity coverage; other
   min/max and disjoint-box branches remain open. The test passes against the
@@ -119,9 +119,15 @@ Latest increments:
   per-sample gate blending on Oxide; exact backward/SGD still use the CPU
   fallback. Router-specific soft/tied top-k parity passes in
   `oxide_layers_extra` (19/19), and the real-device `oxide_runtime_chain`
-  forward/backward/update suite passes (7/7). Device-native backward remains.
+  forward/backward/update suite passes (8/8). Device-native backward remains.
 - Overlapping-window maxpool backward, including `maxpool_zero_nonmax`, now
   matches central finite differences.
+- No-BN RNN inference now computes input/recurrent/output projections, activations,
+  state sums, and optional shortcut on the backend. CPU recurrent caches remain
+  for backward; batchnorm RNN, LSTM/CRNN, and recurrent training still use CPU.
+  FakeBackend parity passes and `oxide_runtime_chain` covers real-device output
+  parity (`rnn_recurrent_projections_run_on_oxide_and_match_cpu_forward`); the
+  full runtime-chain suite now passes 8/8.
 - Host Adam now updates standalone batchnorm, local, connected, weighted
   shortcut, MoE router/experts, deconvolutional, GRU/RNN/LSTM/CRNN, and ViT
   parameters with distinct moment slots and per-layer rate scaling. DNOPT2

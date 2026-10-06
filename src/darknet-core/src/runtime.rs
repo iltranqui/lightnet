@@ -6030,12 +6030,30 @@ where
                     let host_input = self
                         .download_tensor(current_input, layer.input_shape)
                         .map_err(|err| backend_error("download RNN input", err))?;
-                    let (host_output, cache) =
-                        forward_rnn_layer(spec, recurrent, &host_input, layer.output_shape)?;
-                    recurrent_caches.push(Some(RecurrentForwardCache::Rnn(cache)));
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
-                        .map_err(|err| backend_error("upload RNN output", err))?
+                    if !spec.batch_normalize
+                        && recurrent.input.batch_norm.is_none()
+                        && recurrent.self_params.batch_norm.is_none()
+                        && recurrent.output.batch_norm.is_none()
+                    {
+                        let (output, cache) = forward_rnn_layer_device(
+                            &self.backend,
+                            &host_input,
+                            spec,
+                            recurrent,
+                            layer.output_shape,
+                            layer.index,
+                            launch_config,
+                        )?;
+                        recurrent_caches.push(Some(RecurrentForwardCache::Rnn(cache)));
+                        output
+                    } else {
+                        let (host_output, cache) =
+                            forward_rnn_layer(spec, recurrent, &host_input, layer.output_shape)?;
+                        recurrent_caches.push(Some(RecurrentForwardCache::Rnn(cache)));
+                        self.backend
+                            .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
+                            .map_err(|err| backend_error("upload RNN output", err))?
+                    }
                 }
                 (LayerKind::Lstm(spec), LayerParams::Lstm(recurrent)) => {
                     let host_input = self
@@ -11156,6 +11174,217 @@ fn forward_gru_layer(
         previous_state = state;
     }
     Ok(output)
+}
+
+fn recurrent_device_tensor<B: F32TensorOpsBackend>(
+    backend: &B,
+    tensor: &B::Tensor,
+    shape: TensorShape,
+    operation: &str,
+) -> Result<Tensor>
+where
+    B::Error: std::fmt::Display,
+{
+    let data = backend
+        .download_f32(tensor)
+        .map_err(|err| backend_error(operation, err))?;
+    Tensor::from_data(shape, data)
+}
+
+fn forward_rnn_layer_device<B: F32TensorOpsBackend>(
+    backend: &B,
+    input: &Tensor,
+    spec: &RnnSpec,
+    params: &RnnParams,
+    output_shape: TensorShape,
+    layer_index: usize,
+    config: ElementwiseLaunchConfig,
+) -> Result<(B::Tensor, RnnForwardCache)>
+where
+    B::Error: std::fmt::Display,
+{
+    let sequence_batch = recurrent_sequence_batch(input.shape.batch, spec.steps)?;
+    if output_shape.width != 1 || output_shape.height != 1 || output_shape.channels != spec.output {
+        return Err(Error::InvalidConfig(
+            "RNN output shape is inconsistent with its specification".to_owned(),
+        ));
+    }
+    let inputs = input.shape.element_count();
+    if params.input.weights.len() != inputs * spec.hidden
+        || params.self_params.weights.len() != spec.hidden * spec.hidden
+        || params.output.weights.len() != spec.hidden * spec.output
+    {
+        return Err(Error::InvalidConfig(
+            "RNN parameter shapes are inconsistent with its specification".to_owned(),
+        ));
+    }
+
+    let input_weights = backend
+        .upload_f32(&[spec.hidden, inputs], &params.input.weights)
+        .map_err(|err| backend_error("upload RNN input weights", err))?;
+    let input_biases = backend
+        .upload_f32(&[spec.hidden], &params.input.biases)
+        .map_err(|err| backend_error("upload RNN input biases", err))?;
+    let self_weights = backend
+        .upload_f32(&[spec.hidden, spec.hidden], &params.self_params.weights)
+        .map_err(|err| backend_error("upload RNN recurrent weights", err))?;
+    let self_biases = backend
+        .upload_f32(&[spec.hidden], &params.self_params.biases)
+        .map_err(|err| backend_error("upload RNN recurrent biases", err))?;
+    let output_weights = backend
+        .upload_f32(&[spec.output, spec.hidden], &params.output.weights)
+        .map_err(|err| backend_error("upload RNN output weights", err))?;
+    let output_biases = backend
+        .upload_f32(&[spec.output], &params.output.biases)
+        .map_err(|err| backend_error("upload RNN output biases", err))?;
+
+    let input_activation = gpu_activation_kind(layer_index, &spec.activation)?;
+    let self_activation = match spec.logistic {
+        1 => gpu_activation_kind(layer_index, &Activation::Logistic)?,
+        2 => gpu_activation_kind(layer_index, &Activation::Loggy)?,
+        _ => input_activation,
+    };
+    let input_step_shape = TensorShape::new(
+        input.shape.width,
+        input.shape.height,
+        input.shape.channels,
+        sequence_batch,
+    );
+    let hidden_shape = TensorShape::new(1, 1, spec.hidden, sequence_batch);
+    let output_step_shape = TensorShape::new(1, 1, spec.output, sequence_batch);
+    let mut output = Tensor::zeros(output_shape);
+    let mut previous_state = Tensor::zeros(hidden_shape);
+    let mut previous_state_gpu = backend
+        .zeros_f32(&[sequence_batch, spec.hidden])
+        .map_err(|err| backend_error("allocate RNN initial state", err))?;
+    let mut cache = RnnForwardCache {
+        sequence_batch,
+        input_outputs: Vec::with_capacity(spec.steps),
+        input_activation_inputs: Vec::with_capacity(spec.steps),
+        self_outputs: Vec::with_capacity(spec.steps),
+        self_activation_inputs: Vec::with_capacity(spec.steps),
+        previous_states: Vec::with_capacity(spec.steps),
+        states: Vec::with_capacity(spec.steps),
+        output_activation_inputs: Vec::with_capacity(spec.steps),
+        outputs: Vec::with_capacity(spec.steps),
+    };
+
+    for step in 0..spec.steps {
+        let step_input = sequence_slice(input, step, sequence_batch, input_step_shape)?;
+        let step_input_gpu = backend
+            .upload_f32(&[sequence_batch, inputs], &step_input.data)
+            .map_err(|err| backend_error("upload RNN sequence slice", err))?;
+        let input_pre = backend
+            .connected_f32(
+                &step_input_gpu,
+                &input_weights,
+                &input_biases,
+                sequence_batch,
+                inputs,
+                spec.hidden,
+                config,
+            )
+            .map_err(|err| backend_error("RNN input projection", err))?;
+        let input_output_gpu = backend
+            .activation_f32(&input_pre, input_activation, config)
+            .map_err(|err| backend_error("activate RNN input projection", err))?;
+        let self_pre = backend
+            .connected_f32(
+                &previous_state_gpu,
+                &self_weights,
+                &self_biases,
+                sequence_batch,
+                spec.hidden,
+                spec.hidden,
+                config,
+            )
+            .map_err(|err| backend_error("RNN recurrent projection", err))?;
+        let self_output_gpu = backend
+            .activation_f32(&self_pre, self_activation, config)
+            .map_err(|err| backend_error("activate RNN recurrent projection", err))?;
+        let mut state_gpu = backend
+            .vector_add_f32(&input_output_gpu, &self_output_gpu, config)
+            .map_err(|err| backend_error("sum RNN projections", err))?;
+        if spec.shortcut {
+            state_gpu = backend
+                .shortcut_add_f32(&state_gpu, &previous_state_gpu, config)
+                .map_err(|err| backend_error("apply RNN shortcut", err))?;
+        }
+        let output_pre = backend
+            .connected_f32(
+                &state_gpu,
+                &output_weights,
+                &output_biases,
+                sequence_batch,
+                spec.hidden,
+                spec.output,
+                config,
+            )
+            .map_err(|err| backend_error("RNN output projection", err))?;
+        let step_output_gpu = backend
+            .activation_f32(&output_pre, input_activation, config)
+            .map_err(|err| backend_error("activate RNN output projection", err))?;
+
+        let input_output = recurrent_device_tensor(
+            backend,
+            &input_output_gpu,
+            hidden_shape,
+            "download RNN input projection",
+        )?;
+        let input_activation_input = recurrent_device_tensor(
+            backend,
+            &input_pre,
+            hidden_shape,
+            "download RNN input pre-activation",
+        )?;
+        let self_output = recurrent_device_tensor(
+            backend,
+            &self_output_gpu,
+            hidden_shape,
+            "download RNN recurrent projection",
+        )?;
+        let self_activation_input = recurrent_device_tensor(
+            backend,
+            &self_pre,
+            hidden_shape,
+            "download RNN recurrent pre-activation",
+        )?;
+        let state = recurrent_device_tensor(
+            backend,
+            &state_gpu,
+            hidden_shape,
+            "download RNN hidden state",
+        )?;
+        let output_activation_input = recurrent_device_tensor(
+            backend,
+            &output_pre,
+            output_step_shape,
+            "download RNN output pre-activation",
+        )?;
+        let step_output = recurrent_device_tensor(
+            backend,
+            &step_output_gpu,
+            output_step_shape,
+            "download RNN output",
+        )?;
+        sequence_write(&mut output, step, sequence_batch, &step_output)?;
+
+        cache.input_outputs.push(input_output);
+        cache.input_activation_inputs.push(input_activation_input);
+        cache.self_outputs.push(self_output);
+        cache.self_activation_inputs.push(self_activation_input);
+        cache.previous_states.push(previous_state);
+        cache.states.push(state.clone());
+        cache.output_activation_inputs.push(output_activation_input);
+        cache.outputs.push(step_output);
+        previous_state = state;
+        previous_state_gpu = state_gpu;
+    }
+
+    let output_gpu = backend
+        .upload_f32(&tensor_backend_shape(output_shape), &output.data)
+        .map_err(|err| backend_error("upload assembled RNN output", err))?;
+    Ok((output_gpu, cache))
 }
 
 fn forward_rnn_layer(
@@ -19320,6 +19549,59 @@ mod tests {
         assert!(matches!(
             executable.train_buffers[0],
             LayerTrainBuffers::Rnn(_)
+        ));
+    }
+
+    #[test]
+    fn gpu_rnn_forward_projects_and_activates_on_backend_with_host_cache_parity() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "rnn-gpu.cfg",
+                "[net]\ninputs=2\nbatch=2\ntime_steps=2\n[rnn]\nhidden=3\noutput=2\nactivation=tanh\nlogistic=1\nshortcut=1\n",
+            )
+            .expect("RNN cfg should parse"),
+        )
+        .expect("RNN network should build");
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        for params in [&mut cpu.params[0], &mut gpu.params[0]] {
+            let LayerParams::Rnn(params) = params else {
+                panic!("expected RNN parameters");
+            };
+            for (index, value) in params.input.weights.iter_mut().enumerate() {
+                *value = 0.05 + index as f32 * 0.01;
+            }
+            for (index, value) in params.self_params.weights.iter_mut().enumerate() {
+                *value = 0.03 + index as f32 * 0.005;
+            }
+            for (index, value) in params.output.weights.iter_mut().enumerate() {
+                *value = 0.02 + index as f32 * 0.004;
+            }
+        }
+        let input = Tensor::from_data(
+            cpu.network.net.input_shape(),
+            (0..8).map(|index| index as f32 * 0.1 - 0.2).collect(),
+        )
+        .expect("RNN input should have the expected shape");
+        let cpu_forward = cpu.forward(&input).expect("CPU RNN forward should succeed");
+        let gpu_forward = gpu
+            .forward_with_state(&input)
+            .expect("backend RNN forward should succeed");
+        let expected = cpu_forward.final_output().expect("CPU RNN output should exist");
+        let actual = gpu_forward
+            .cpu_forward
+            .final_output()
+            .expect("backend RNN output should exist");
+        assert_eq!(actual.shape, expected.shape);
+        for (index, (actual, expected)) in actual.data.iter().zip(&expected.data).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1e-6,
+                "RNN output {index}: backend {actual}, CPU {expected}"
+            );
+        }
+        assert!(matches!(
+            gpu_forward.cpu_forward.recurrent_caches.first(),
+            Some(Some(super::RecurrentForwardCache::Rnn(_)))
         ));
     }
 

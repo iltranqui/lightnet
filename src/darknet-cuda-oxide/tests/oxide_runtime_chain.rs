@@ -352,6 +352,48 @@ fn chained_mismatched_shortcuts_match_cpu_backward() {
 }
 
 #[test]
+fn rnn_recurrent_projections_run_on_oxide_and_match_cpu_forward() {
+    let net = network(
+        "[net]\ninputs=2\nbatch=2\ntime_steps=2\n\
+         [rnn]\nhidden=3\noutput=2\nactivation=tanh\nlogistic=1\nshortcut=1\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    if let LayerParams::Rnn(params) = &mut cpu.params[0] {
+        for (i, value) in params.input.weights.iter_mut().enumerate() {
+            *value = 0.05 + i as f32 * 0.01;
+        }
+        for (i, value) in params.input.biases.iter_mut().enumerate() {
+            *value = 0.01 * (i + 1) as f32;
+        }
+        for (i, value) in params.self_params.weights.iter_mut().enumerate() {
+            *value = 0.03 + i as f32 * 0.005;
+        }
+        for (i, value) in params.self_params.biases.iter_mut().enumerate() {
+            *value = -0.01 * (i + 1) as f32;
+        }
+        for (i, value) in params.output.weights.iter_mut().enumerate() {
+            *value = 0.02 + i as f32 * 0.004;
+        }
+        for (i, value) in params.output.biases.iter_mut().enumerate() {
+            *value = 0.015 * (i + 1) as f32;
+        }
+    } else {
+        panic!("expected RNN parameters");
+    }
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("oxide backend"));
+    gpu.params = cpu.params.clone();
+    let input = patterned(cpu.network.net.input_shape());
+    let cpu_forward = cpu.forward(&input).expect("CPU RNN forward");
+    let gpu_forward = gpu.forward_with_state(&input).expect("Oxide RNN forward");
+    close(
+        "RNN output",
+        &cpu_forward.final_output().expect("CPU output").data,
+        &gpu_forward.cpu_forward.final_output().expect("Oxide output").data,
+        2e-4,
+    );
+}
+
+#[test]
 fn few_sgd_steps_match_cpu_loss_trajectory_and_weights() {
     let cfg = "[net]\nwidth=6\nheight=6\nchannels=2\nbatch=2\n\
          [convolutional]\nfilters=4\nsize=3\nstride=1\npad=1\nactivation=leaky\n\
