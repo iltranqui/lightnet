@@ -118,11 +118,14 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
 
 ## Data pipeline
 
-- [~] mixup and multi-scale `random` are done. **Faithful mosaic** (needs the
-  single-image crop geometry exposed) and cutmix (which C++ itself rejects) are
-  deferred; blur/noise/fog are rejected explicitly at startup.
-- [~] Resume image-order replay not yet guaranteed; RNG is deterministic Rust
-  SplitMix64, not C++ bit-identical. Mosaic stitch tests remain open.
+- [~] mixup, multi-scale `random`, and source-level faithful mosaic geometry are
+  implemented. Mosaic follows C++ crop alignment, flip-aware quadrant shifts,
+  corner relocation, integer box clipping, and strict filtering; the seeded Rust
+  RNG is not C++-bit-identical and compiled-C++ mosaic parity is not established.
+  Cutmix (which C++ itself rejects), blur/noise/fog remain deferred/rejected.
+- [~] Resume image-order replay is not yet guaranteed; Rust SplitMix64 remains
+  deterministic but not C++-bit-identical. Hand-derived mosaic geometry and
+  single-image OpenCV fixture tests pass.
 
 ## FP8 / FP4 (`fp8_fp4.md`)
 

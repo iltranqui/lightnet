@@ -34,6 +34,12 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v62: Replaced approximate mosaic pasting/box remapping with the source-level
+  C++ quadrant crop alignment, flip-aware shifts, optional corner relocation,
+  integer-pixel box clipping, and strict filtering. Rust RNG remains deterministic
+  but not C++-identical; no compiled-C++ golden claim. Augmentation/loader host
+  filter passed (12/12), including OpenCV single-image fixtures and hand-derived
+  mosaic pixel/box geometry tests.
 - v61: BN RNN/LSTM/CRNN scale-gradient reductions now stay on backend using
   existing centering, channel-scale, pointwise-multiply, and channel-reduction
   ops; Oxide no longer transfers raw projection/convolution outputs and deltas to

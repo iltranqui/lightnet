@@ -133,14 +133,10 @@ impl DetectorAugmentation {
         )
     }
 
-    /// C++ mosaic (mode 3): independently augment four samples, then stitch
-    /// them into quadrants around a random cut and shift their truth boxes.
-    ///
-    /// Documented deviation from `data.cpp`: the C++ `left_shift/right_shift`
-    /// alignment of each quadrant to the cut and the shared draw order are not
-    /// reproduced (no cv2 mosaic reference at test time); each member uses the
-    /// existing single-image transform and is pasted at its quadrant, which is
-    /// the standard mosaic. `mosaic_bound` still clips boxes to the quadrant.
+    /// C++ mosaic (mode 3): independently augment four samples, align their
+    /// crops at the cut, paste the corresponding source quadrants, and shift or
+    /// clip boxes using `data.cpp`'s integer-pixel equations. The deterministic
+    /// Rust RNG stream is not bit-identical to C++ `rand`.
     pub fn apply_mosaic(
         &self,
         members: &[(PlanarRgbImage, Vec<YoloLabel>)],
@@ -155,70 +151,60 @@ impl DetectorAugmentation {
         if width == 0 || height == 0 || self.letter_box {
             return Err(invalid("mosaic requires a non-zero size and letter_box=0"));
         }
+        i32::try_from(width).map_err(|_| invalid("mosaic width overflows C++ geometry"))?;
+        i32::try_from(height).map_err(|_| invalid("mosaic height overflows C++ geometry"))?;
+        let canvas_len = width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(3))
+            .ok_or_else(|| invalid("mosaic image size overflow"))?;
         let mut rng = Rng(seed ^ sample.wrapping_mul(0xd6e8feb86659fd93));
-        let min_offset = 0.2f32;
-        let cut_x = rand_cut(width, min_offset, &mut rng);
-        let cut_y = rand_cut(height, min_offset, &mut rng);
-        let mut canvas = vec![0u8; width * height * 3];
-        let mut labels: Vec<YoloLabel> = Vec::new();
-        for (index, (image, member_labels)) in members.iter().enumerate() {
-            let (augmented, augmented_labels) = self.apply(
+        let cut_x = rand_cut(width, 0.2, &mut rng);
+        let cut_y = rand_cut(height, 0.2, &mut rng);
+        let mut canvas = vec![0u8; canvas_len];
+        let mut labels = Vec::new();
+        for (quadrant, (image, member_labels)) in members.iter().enumerate() {
+            let augmented = self.apply_detailed(
                 image,
                 member_labels,
                 width,
                 height,
                 seed,
-                sample.wrapping_add((index as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15)),
+                sample.wrapping_add((quadrant as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15)),
+                Some(quadrant),
             )?;
-            let rgb = augmented.to_rgb8()?;
-            let (x0, y0, x1, y1) = match index {
-                0 => (0, 0, cut_x, cut_y),
-                1 => (cut_x, 0, width, cut_y),
-                2 => (0, cut_y, cut_x, height),
-                _ => (cut_x, cut_y, width, height),
-            };
-            for y in 0..(y1 - y0) {
-                for x in 0..(x1 - x0) {
-                    let src = (y * width + x) * 3;
-                    let dst = ((y0 + y) * width + x0 + x) * 3;
-                    canvas[dst..dst + 3].copy_from_slice(&rgb.as_raw()[src..src + 3]);
-                }
-            }
-            let (px0, py0) = (x0 as f32 / width as f32, y0 as f32 / height as f32);
-            let (px1, py1) = (x1 as f32 / width as f32, y1 as f32 / height as f32);
-            for label in augmented_labels {
-                let cx = px0 + label.x * (px1 - px0);
-                let cy = py0 + label.y * (py1 - py0);
-                let mut w = label.w * (px1 - px0);
-                let mut h = label.h * (py1 - py0);
-                let mut left = cx - w / 2.0;
-                let mut right = cx + w / 2.0;
-                let mut top = cy - h / 2.0;
-                let mut bottom = cy + h / 2.0;
-                if self.mosaic_bound {
-                    left = left.max(px0);
-                    right = right.min(px1);
-                    top = top.max(py0);
-                    bottom = bottom.min(py1);
-                } else {
-                    left = left.max(0.0);
-                    right = right.min(1.0);
-                    top = top.max(0.0);
-                    bottom = bottom.min(1.0);
-                }
-                w = right - left;
-                h = bottom - top;
-                if w < 1.0 / width as f32 || h < 1.0 / height as f32 {
-                    continue;
-                }
-                labels.push(YoloLabel {
-                    class_id: label.class_id,
-                    x: (left + right) / 2.0,
-                    y: (top + bottom) / 2.0,
-                    w,
-                    h,
-                });
-            }
+            let shifts = mosaic_crop_shifts(
+                augmented.margins,
+                augmented.flip,
+                cut_x,
+                cut_y,
+                width,
+                height,
+                i32::try_from(image.shape.width)
+                    .map_err(|_| invalid("mosaic source width overflows C++ geometry"))?,
+                i32::try_from(image.shape.height)
+                    .map_err(|_| invalid("mosaic source height overflows C++ geometry"))?,
+            )?;
+            let rgb = augmented.image.to_rgb8()?;
+            copy_mosaic_quadrant(
+                &mut canvas,
+                rgb.as_raw(),
+                width,
+                height,
+                cut_x,
+                cut_y,
+                shifts,
+                quadrant,
+            )?;
+            labels.extend(mosaic_transform_labels(
+                &augmented.labels,
+                quadrant,
+                cut_x,
+                cut_y,
+                shifts,
+                width,
+                height,
+                self.mosaic_bound,
+            ));
         }
         labels.truncate(self.max_boxes);
         Ok((
@@ -238,6 +224,20 @@ impl DetectorAugmentation {
         seed: u64,
         sample: u64,
     ) -> Result<(PlanarRgbImage, Vec<YoloLabel>)> {
+        let result = self.apply_detailed(image, labels, width, height, seed, sample, None)?;
+        Ok((result.image, result.labels))
+    }
+
+    fn apply_detailed(
+        &self,
+        image: &PlanarRgbImage,
+        labels: &[YoloLabel],
+        width: usize,
+        height: usize,
+        seed: u64,
+        sample: u64,
+        mosaic_quadrant: Option<usize>,
+    ) -> Result<AugmentedSample> {
         self.validate()?;
         if width == 0
             || height == 0
@@ -290,6 +290,11 @@ impl DetectorAugmentation {
                 margins[1] = (margins[1] as f32 - delta) as i32;
             }
         }
+        if let Some(quadrant) = mosaic_quadrant {
+            if rng.unit() < 0.5 {
+                move_crop_to_mosaic_corner(&mut margins, flip, quadrant)?;
+            }
+        }
         let crop_width = ow
             .checked_sub(margins[0])
             .and_then(|v| v.checked_sub(margins[1]))
@@ -298,6 +303,11 @@ impl DetectorAugmentation {
             .checked_sub(margins[2])
             .and_then(|v| v.checked_sub(margins[3]))
             .ok_or_else(|| invalid("crop height overflow"))?;
+        let (crop_width, crop_height) = if mosaic_quadrant.is_some() {
+            (crop_width.max(1), crop_height.max(1))
+        } else {
+            (crop_width, crop_height)
+        };
         let crop = Crop {
             left: margins[0],
             top: margins[2],
@@ -331,12 +341,256 @@ impl DetectorAugmentation {
             crate::loader_profile::add_hsv(hsv_elapsed);
             crate::loader_profile::add_encode(encode_elapsed);
         }
-        Ok((encoded, labels))
+        Ok(AugmentedSample {
+            image: encoded,
+            labels,
+            margins,
+            flip,
+        })
     }
 }
 
 fn invalid(message: &str) -> Error {
     Error::InvalidConfig(message.into())
+}
+
+fn move_crop_to_mosaic_corner(margins: &mut [i32; 4], flip: bool, quadrant: usize) -> Result<()> {
+    let [left, right, top, bottom] = *margins;
+    let add = |a: i32, b: i32| {
+        a.checked_add(b)
+            .ok_or_else(|| invalid("mosaic corner crop margin overflow"))
+    };
+    *margins = match (flip, quadrant) {
+        (true, 0) => [add(left, right)?, 0, 0, add(bottom, top)?],
+        (true, 1) => [0, add(right, left)?, 0, add(bottom, top)?],
+        (true, 2) => [add(left, right)?, 0, add(top, bottom)?, 0],
+        (true, 3) => [0, add(right, left)?, add(top, bottom)?, 0],
+        (false, 0) => [0, add(right, left)?, 0, add(bottom, top)?],
+        (false, 1) => [add(left, right)?, 0, 0, add(bottom, top)?],
+        (false, 2) => [0, add(right, left)?, add(top, bottom)?, 0],
+        (false, 3) => [add(left, right)?, 0, add(top, bottom)?, 0],
+        _ => return Err(invalid("mosaic quadrant must be in 0..4")),
+    };
+    Ok(())
+}
+
+fn mosaic_crop_shifts(
+    margins: [i32; 4],
+    flip: bool,
+    cut_x: usize,
+    cut_y: usize,
+    width: usize,
+    height: usize,
+    source_width: i32,
+    source_height: i32,
+) -> Result<(usize, usize, usize, usize)> {
+    if width == 0
+        || height == 0
+        || cut_x > width
+        || cut_y > height
+        || source_width <= 0
+        || source_height <= 0
+    {
+        return Err(invalid("mosaic cut or source dimensions are invalid"));
+    }
+    let [mut left, mut right, top, bottom] = margins;
+    if flip {
+        std::mem::swap(&mut left, &mut right);
+    }
+    let shift = |cut: usize, target: usize, margin: i32, source: i32| -> Result<usize> {
+        let target = i64::try_from(target).map_err(|_| invalid("mosaic size overflows i64"))?;
+        let offset = (-i64::from(margin) * target / i64::from(source)).max(0);
+        Ok(cut.min(usize::try_from(offset).map_err(|_| invalid("mosaic shift overflows usize"))?))
+    };
+    Ok((
+        shift(cut_x, width, left, source_width)?,
+        shift(width - cut_x, width, right, source_width)?,
+        shift(cut_y, height, top, source_height)?,
+        shift(height - cut_y, height, bottom, source_height)?,
+    ))
+}
+
+fn copy_mosaic_quadrant(
+    canvas: &mut [u8],
+    source: &[u8],
+    width: usize,
+    height: usize,
+    cut_x: usize,
+    cut_y: usize,
+    shifts: (usize, usize, usize, usize),
+    quadrant: usize,
+) -> Result<()> {
+    let (left_shift, right_shift, top_shift, bottom_shift) = shifts;
+    if cut_x > width
+        || cut_y > height
+        || left_shift > cut_x
+        || right_shift > width - cut_x
+        || top_shift > cut_y
+        || bottom_shift > height - cut_y
+    {
+        return Err(invalid("mosaic cut/shift geometry is out of bounds"));
+    }
+    let (dst_x, dst_y, src_x, src_y, copy_width, copy_height) = match quadrant {
+        0 => (
+            0,
+            0,
+            width - cut_x - right_shift,
+            height - cut_y - bottom_shift,
+            cut_x,
+            cut_y,
+        ),
+        1 => (
+            cut_x,
+            0,
+            left_shift,
+            height - cut_y - bottom_shift,
+            width - cut_x,
+            cut_y,
+        ),
+        2 => (
+            0,
+            cut_y,
+            width - cut_x - right_shift,
+            top_shift,
+            cut_x,
+            height - cut_y,
+        ),
+        3 => (
+            cut_x,
+            cut_y,
+            left_shift,
+            top_shift,
+            width - cut_x,
+            height - cut_y,
+        ),
+        _ => return Err(invalid("mosaic quadrant must be in 0..4")),
+    };
+    let expected = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| invalid("mosaic image size overflow"))?;
+    if canvas.len() != expected || source.len() != expected {
+        return Err(invalid("mosaic image buffer shape mismatch"));
+    }
+    for row in 0..copy_height {
+        let src_start = ((src_y + row) * width + src_x) * 3;
+        let dst_start = ((dst_y + row) * width + dst_x) * 3;
+        let bytes = copy_width * 3;
+        let src = source
+            .get(src_start..src_start + bytes)
+            .ok_or_else(|| invalid("mosaic source crop is out of bounds"))?;
+        let dst = canvas
+            .get_mut(dst_start..dst_start + bytes)
+            .ok_or_else(|| invalid("mosaic destination crop is out of bounds"))?;
+        dst.copy_from_slice(src);
+    }
+    Ok(())
+}
+
+fn mosaic_transform_labels(
+    labels: &[YoloLabel],
+    quadrant: usize,
+    cut_x: usize,
+    cut_y: usize,
+    shifts: (usize, usize, usize, usize),
+    width: usize,
+    height: usize,
+    mosaic_bound: bool,
+) -> Vec<YoloLabel> {
+    let (left_shift, right_shift, top_shift, bottom_shift) = shifts;
+    let (width_i32, height_i32) = (width as i32, height as i32);
+    let mut transformed = Vec::with_capacity(labels.len());
+    for label in labels {
+        let (mut x, mut y, mut w, mut h) = (label.x, label.y, label.w, label.h);
+        match quadrant {
+            0 => {
+                x -= (width - cut_x - right_shift) as f32 / width as f32;
+                y -= (height - cut_y - bottom_shift) as f32 / height as f32;
+            }
+            1 => {
+                x += (cut_x - left_shift) as f32 / width as f32;
+                y -= (height - cut_y - bottom_shift) as f32 / height as f32;
+            }
+            2 => {
+                x -= (width - cut_x - right_shift) as f32 / width as f32;
+                y += (cut_y - top_shift) as f32 / height as f32;
+            }
+            3 => {
+                x += (cut_x - left_shift) as f32 / width as f32;
+                y += (cut_y - top_shift) as f32 / height as f32;
+            }
+            _ => continue,
+        }
+        let mut left = ((x - w / 2.0) * width as f32) as i32;
+        let mut right = ((x + w / 2.0) * width as f32) as i32;
+        let mut top = ((y - h / 2.0) * height as f32) as i32;
+        let mut bottom = ((y + h / 2.0) * height as f32) as i32;
+        if mosaic_bound {
+            let (left_bound, right_bound, top_bound, bottom_bound) = match quadrant {
+                0 => (0, cut_x as i32, 0, cut_y as i32),
+                1 => (cut_x as i32, width_i32, 0, cut_y as i32),
+                2 => (0, cut_x as i32, cut_y as i32, height_i32),
+                _ => (cut_x as i32, width_i32, cut_y as i32, height_i32),
+            };
+            left = left.max(left_bound);
+            right = right.min(right_bound);
+            top = top.max(top_bound);
+            bottom = bottom.min(bottom_bound);
+            x = (right + left) as f32 / 2.0 / width as f32;
+            w = (right - left) as f32 / width as f32;
+            y = (bottom + top) as f32 / 2.0 / height as f32;
+            h = (bottom - top) as f32 / height as f32;
+        } else {
+            if left < 0 {
+                let diff = left as f32 / width as f32;
+                x -= diff / 2.0;
+                w += diff;
+            }
+            if right > width_i32 {
+                let diff = (right - width_i32) as f32 / width as f32;
+                x -= diff / 2.0;
+                w -= diff;
+            }
+            if top < 0 {
+                let diff = top as f32 / height as f32;
+                y -= diff / 2.0;
+                h += diff;
+            }
+            if bottom > height_i32 {
+                let diff = (bottom - height_i32) as f32 / height as f32;
+                y -= diff / 2.0;
+                h -= diff;
+            }
+            left = ((x - w / 2.0) * width as f32) as i32;
+            right = ((x + w / 2.0) * width as f32) as i32;
+            top = ((y - h / 2.0) * height as f32) as i32;
+            bottom = ((y + h / 2.0) * height as f32) as i32;
+        }
+        if left >= 0
+            && right <= width_i32
+            && top >= 0
+            && bottom <= height_i32
+            && w > 0.0
+            && w < 1.0
+            && h > 0.0
+            && h < 1.0
+            && x > 0.0
+            && x < 1.0
+            && y > 0.0
+            && y < 1.0
+            && w > 1.0 / width as f32
+            && h > 1.0 / height as f32
+        {
+            transformed.push(YoloLabel {
+                class_id: label.class_id,
+                x,
+                y,
+                w,
+                h,
+            });
+        }
+    }
+    transformed
 }
 
 /// C++ `rand_int(w*min_offset, w*(1-min_offset))` for the mosaic cut.
@@ -413,6 +667,13 @@ impl Rng {
             1.0 / value
         }
     }
+}
+
+struct AugmentedSample {
+    image: PlanarRgbImage,
+    labels: Vec<YoloLabel>,
+    margins: [i32; 4],
+    flip: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -807,10 +1068,136 @@ mod tests {
     }
 
     #[test]
+    fn mosaic_corner_margin_relocation_matches_cpp_quadrants_and_flip() {
+        let margins = [-3, 5, -2, 4];
+        let cases = [
+            (false, 0, [0, 2, 0, 2]),
+            (false, 1, [2, 0, 0, 2]),
+            (false, 2, [0, 2, 2, 0]),
+            (false, 3, [2, 0, 2, 0]),
+            (true, 0, [2, 0, 0, 2]),
+            (true, 1, [0, 2, 0, 2]),
+            (true, 2, [2, 0, 2, 0]),
+            (true, 3, [0, 2, 2, 0]),
+        ];
+        for (flip, quadrant, expected) in cases {
+            let mut got = margins;
+            move_crop_to_mosaic_corner(&mut got, flip, quadrant).unwrap();
+            assert_eq!(got, expected, "flip={flip}, quadrant={quadrant}");
+        }
+        assert!(move_crop_to_mosaic_corner(&mut [0; 4], false, 4).is_err());
+    }
+
+    #[test]
+    fn mosaic_alignment_copies_cpp_source_quadrants() {
+        let (width, height, cut_x, cut_y) = (8, 6, 4, 3);
+        let shifts = mosaic_crop_shifts([-2, 1, 1, -2], false, cut_x, cut_y, width, height, 8, 6)
+            .unwrap();
+        assert_eq!(shifts, (2, 0, 0, 2));
+        let sources: Vec<Vec<u8>> = (0..4)
+            .map(|quadrant| {
+                (0..height)
+                    .flat_map(|y| {
+                        (0..width).flat_map(move |x| {
+                            let value = (quadrant * 40 + y * width + x) as u8;
+                            [value, value, value]
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut canvas = vec![0; width * height * 3];
+        for quadrant in 0..4 {
+            copy_mosaic_quadrant(
+                &mut canvas,
+                &sources[quadrant],
+                width,
+                height,
+                cut_x,
+                cut_y,
+                shifts,
+                quadrant,
+            )
+            .unwrap();
+        }
+        let mut expected = vec![0; canvas.len()];
+        let source_origins = [(4, 1), (2, 1), (4, 0), (2, 0)];
+        for (quadrant, (src_x, src_y)) in source_origins.into_iter().enumerate() {
+            let (dst_x, dst_y) = match quadrant {
+                0 => (0, 0),
+                1 => (cut_x, 0),
+                2 => (0, cut_y),
+                _ => (cut_x, cut_y),
+            };
+            for y in 0..3 {
+                for x in 0..4 {
+                    let src = ((src_y + y) * width + src_x + x) * 3;
+                    let dst = ((dst_y + y) * width + dst_x + x) * 3;
+                    expected[dst..dst + 3].copy_from_slice(&sources[quadrant][src..src + 3]);
+                }
+            }
+        }
+        assert_eq!(canvas, expected);
+    }
+
+    #[test]
+    fn mosaic_shifts_and_truth_clipping_match_cpp_integer_geometry() {
+        let margins = [-2, 1, 1, -2];
+        assert_eq!(
+            mosaic_crop_shifts(margins, false, 4, 3, 8, 6, 8, 6).unwrap(),
+            (2, 0, 0, 2)
+        );
+        assert_eq!(
+            mosaic_crop_shifts(margins, true, 4, 3, 8, 6, 8, 6).unwrap(),
+            (0, 2, 0, 2)
+        );
+        let label = YoloLabel {
+            class_id: 7,
+            x: 0.5,
+            y: 0.7,
+            w: 0.5,
+            h: 0.8,
+        };
+        let shifts = (0, 0, 0, 0);
+        let bounded = mosaic_transform_labels(&[label.clone()], 0, 4, 3, shifts, 8, 6, true);
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded[0].class_id, 7);
+        assert!((bounded[0].x - 0.125).abs() < 1e-6);
+        assert!((bounded[0].y - 0.25).abs() < 1e-6);
+        assert!((bounded[0].w - 0.25).abs() < 1e-6);
+        assert!((bounded[0].h - 0.5).abs() < 1e-6);
+
+        let unbounded = mosaic_transform_labels(&[label], 0, 4, 3, shifts, 8, 6, false);
+        assert_eq!(unbounded.len(), 1);
+        assert!((unbounded[0].x - 0.125).abs() < 1e-6);
+        assert!((unbounded[0].y - (0.2 + 1.0 / 12.0)).abs() < 1e-6);
+        assert!((unbounded[0].w - 0.25).abs() < 1e-6);
+        assert!((unbounded[0].h - (0.8 - 1.0 / 6.0)).abs() < 1e-6);
+        let threshold_box = YoloLabel {
+            class_id: 1,
+            x: 0.5,
+            y: 0.5,
+            w: 1.0 / 8.0,
+            h: 0.5,
+        };
+        assert!(mosaic_transform_labels(
+            &[threshold_box],
+            3,
+            0,
+            0,
+            shifts,
+            8,
+            8,
+            false
+        )
+        .is_empty());
+    }
+
+    #[test]
     fn mosaic_stitches_four_members_and_clips_labels() {
         let cfg = ConfigFile::parse_str(
             "aug.cfg",
-            "[net]\nmosaic=1\nmosaic_bound=1\n[yolo]\njitter=0\nresize=1\n",
+            "[net]\nmosaic=1\nmosaic_bound=1\n[yolo]\njitter=.2\nresize=1\n",
         )
         .unwrap();
         let mut opts = DetectorAugmentation::from_config(&cfg).unwrap();
