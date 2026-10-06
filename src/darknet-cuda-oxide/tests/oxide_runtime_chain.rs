@@ -114,6 +114,7 @@ fn chained_conv_activation_stacks_match_cpu_backward() {
         "hardtan",
         "relie",
         "lhtan",
+        "plse",
         "relu6",
         "ramp",
         "mish",

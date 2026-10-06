@@ -15297,6 +15297,7 @@ mod tests {
             F32ActivationKind::Hardtan => Activation::Hardtan,
             F32ActivationKind::Relie => Activation::Relie,
             F32ActivationKind::Lhtan => Activation::Lhtan,
+            F32ActivationKind::Plse => Activation::Plse,
             F32ActivationKind::Logistic => Activation::Logistic,
             F32ActivationKind::Relu => Activation::Relu,
             F32ActivationKind::Leaky => Activation::Leaky,
@@ -15326,6 +15327,7 @@ mod tests {
                 }
             }
             F32ActivationKind::Lhtan => crate::activation_math::lhtan_grad(value),
+            F32ActivationKind::Plse => crate::activation_math::plse_grad(value),
             F32ActivationKind::Logistic => {
                 let sigmoid = 1.0 / (1.0 + (-value).exp());
                 sigmoid * (1.0 - sigmoid)
@@ -17898,6 +17900,10 @@ mod tests {
         assert_eq!(
             Activation::Lhtan.to_cuda_f32_kind(),
             Some(F32ActivationKind::Lhtan)
+        );
+        assert_eq!(
+            Activation::Plse.to_cuda_f32_kind(),
+            Some(F32ActivationKind::Plse)
         );
         assert_eq!(
             Activation::Elu.to_cuda_f32_kind(),
@@ -20702,6 +20708,7 @@ mod tests {
             "hardtan",
             "relie",
             "lhtan",
+            "plse",
             "relu6",
             "ramp",
             "mish",

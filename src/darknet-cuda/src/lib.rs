@@ -21,6 +21,8 @@ pub enum F32ActivationKind {
     Relie,
     /// Leaky hard tanh with unit slope over [0, 1] and 0.001 tails.
     Lhtan,
+    /// Piecewise linear saturating sigmoid with 0.01 tails.
+    Plse,
     Logistic,
     Relu,
     Leaky,
