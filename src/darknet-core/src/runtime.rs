@@ -15299,6 +15299,7 @@ mod tests {
             F32ActivationKind::Relu6 => Activation::Relu6,
             F32ActivationKind::Ramp => Activation::Ramp,
             F32ActivationKind::Gelu => Activation::Gelu,
+            F32ActivationKind::Elu => Activation::Elu,
         };
         super::activate(activation, value)
     }
@@ -15343,6 +15344,7 @@ mod tests {
             F32ActivationKind::Relu6 => (value > 0.0 && value < 6.0) as i32 as f32,
             F32ActivationKind::Ramp => (value > 0.0) as i32 as f32 + 0.1,
             F32ActivationKind::Gelu => crate::activation_math::gelu_grad(value),
+            F32ActivationKind::Elu => crate::activation_math::elu_grad(value),
         }
     }
 
@@ -16384,6 +16386,7 @@ mod tests {
             F32ActivationKind::Mish,
             F32ActivationKind::Swish,
             F32ActivationKind::Tanh,
+            F32ActivationKind::Elu,
         ] {
             let actual = backend
                 .activation_backward_f32(&activation_input, &delta, activation, config)
@@ -17856,6 +17859,10 @@ mod tests {
         assert_eq!(
             Activation::Mish.to_cuda_f32_kind(),
             Some(F32ActivationKind::Mish)
+        );
+        assert_eq!(
+            Activation::Elu.to_cuda_f32_kind(),
+            Some(F32ActivationKind::Elu)
         );
         assert_eq!(
             Activation::Other("hard_mish".to_owned()).to_cuda_f32_kind(),
@@ -20642,7 +20649,9 @@ mod tests {
     /// weight/bias gradients equal the CPU `ExecutableNetwork` backward.
     #[test]
     fn gpu_activation_chains_match_cpu_forward_and_backward() {
-        for act in ["leaky", "relu6", "ramp", "mish", "swish", "logistic", "relu"] {
+        for act in [
+            "leaky", "relu6", "ramp", "mish", "swish", "logistic", "relu", "elu",
+        ] {
             assert_gpu_layer_chain_matches_cpu(
                 &format!(
                     "[net]\nwidth=4\nheight=4\nchannels=2\nbatch=2\n\

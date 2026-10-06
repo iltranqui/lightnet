@@ -47,8 +47,9 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
 - [~] Analytical gradients everywhere: the C++-shortcut audit is done and
   `DARKNET_GRAD_MODE=analytical|cpp` gates softmax and scale_channels (see
   `implemented.md` §12). Remaining: a finite-difference / parity test per
-  audited operation still lacking a Rust path: gelu & friends, `NORM_CHAN*`,
-  conv `reverse`/`deform`/`grad_centr`, and YOLO DIoU/CIoU plus objectness/class
+  audited operation still lacking a Rust path: remaining unsupported oxide
+  activations (CPU gradients are covered), `NORM_CHAN*`, conv
+  `reverse`/`deform`/`grad_centr`, and YOLO DIoU/CIoU plus objectness/class
   deltas. YOLO IoU/GIoU box geometry now has finite-difference coverage (with
   Darknet's legacy 0.5 width/height comparison factor). Overlapping-window
   maxpool with `maxpool_zero_nonmax` also has finite-difference coverage.
@@ -141,9 +142,9 @@ Immediately next, in dependency order:
 
 ## Not implemented by design / no scanned cfg needs it
 
-- Activations without kernels: loggy, elu, selu, gelu, hard_mish, hardtan, lhtan,
-  plse, stair, relie, normalize_channels*. All have a CPU forward + exact
-  derivative; `gelu` has an oxide kernel; `normalize_channels*` is a config error.
+- Activations without oxide kernels: loggy, selu, hard_mish, hardtan, lhtan,
+  plse, stair, and relie (CPU forward and exact derivatives exist). `gelu` and
+  `elu` have oxide kernels; `normalize_channels*` remains a config error.
 - xnor (74 layers), share_index (54), `new_coords=1` yolo (path looks wrong),
   antialiasing, conv grad clamps / `try_fix_nan` clamps,
   `rewritten_bbox`/`total_bbox` logging.

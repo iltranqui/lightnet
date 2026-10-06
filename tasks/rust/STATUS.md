@@ -34,6 +34,12 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- Added an oxide ELU activation kernel and exact derivative, enabling native
+  convolution activation execution. Verified by `oxide_parity` (11 passed,
+  including activation finite differences), `oxide_half` (13 passed, 1 ignored,
+  including f16 bias-activation), and the real-device
+  `oxide_runtime_chain::chained_conv_activation_stacks_match_cpu_backward` test.
+  `MEM=3G ./tools/test_oxide.sh --no-run` also compiled every oxide test target.
 - YOLO IoU/GIoU box geometry deltas now have central finite-difference coverage;
   the test records Darknet's legacy 0.5 width/height comparison factor.
 - f16 standalone batchnorm (via channel-affine), bias + activation, and reverse

@@ -322,6 +322,13 @@ fn act_ref(kind: F32ActivationKind, x: f64) -> f64 {
         F32ActivationKind::Relu6 => x.clamp(0.0, 6.0),
         F32ActivationKind::Ramp => x * (x > 0.0) as i32 as f64 + 0.1 * x,
         F32ActivationKind::Gelu => 0.5 * x * (1.0 + (0.797885 * x + 0.035677 * x * x * x).tanh()),
+        F32ActivationKind::Elu => {
+            if x >= 0.0 {
+                x
+            } else {
+                x.exp() - 1.0
+            }
+        }
     }
 }
 
@@ -596,9 +603,17 @@ fn f16_shortcut_avgpool_affine_reverse_match_f64_reference() {
     let be = backend();
     let mut rng = Rng(21);
     let acts = [
-        F32ActivationKind::Linear, F32ActivationKind::Leaky, F32ActivationKind::Logistic, F32ActivationKind::Relu,
-        F32ActivationKind::Mish, F32ActivationKind::Swish, F32ActivationKind::Tanh, F32ActivationKind::Relu6,
-        F32ActivationKind::Ramp, F32ActivationKind::Gelu,
+        F32ActivationKind::Linear,
+        F32ActivationKind::Leaky,
+        F32ActivationKind::Logistic,
+        F32ActivationKind::Relu,
+        F32ActivationKind::Mish,
+        F32ActivationKind::Swish,
+        F32ActivationKind::Tanh,
+        F32ActivationKind::Relu6,
+        F32ActivationKind::Ramp,
+        F32ActivationKind::Gelu,
+        F32ActivationKind::Elu,
     ];
     // shortcut: act(a + b), odd length so the launch tail is exercised.
     for act in acts {

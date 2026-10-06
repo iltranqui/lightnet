@@ -25,6 +25,8 @@ pub enum F32ActivationKind {
     Ramp,
     /// tanh-approximation GELU `0.5x(1+tanh(0.797885x+0.035677x^3))`; exact derivative (C++ `gelu_*`).
     Gelu,
+    /// Exponential linear unit: `x` for nonnegative x, otherwise `exp(x)-1`.
+    Elu,
 }
 
 /// Outputs of [`F32TensorOpsBackend::batchnorm_train_forward_f32`].

@@ -273,7 +273,7 @@ impl Activation {
         match self {
             Self::Linear => Some(F32ActivationKind::Linear),
             Self::Logistic => Some(F32ActivationKind::Logistic),
-            Self::Loggy | Self::Elu | Self::Selu | Self::Relie | Self::Plse | Self::Hardtan | Self::Lhtan | Self::Stair | Self::HardMish | Self::Revleaky => None,
+            Self::Loggy | Self::Selu | Self::Relie | Self::Plse | Self::Hardtan | Self::Lhtan | Self::Stair | Self::HardMish | Self::Revleaky => None,
             Self::Relu => Some(F32ActivationKind::Relu),
             Self::Leaky => Some(F32ActivationKind::Leaky),
             Self::Mish => Some(F32ActivationKind::Mish),
@@ -282,6 +282,7 @@ impl Activation {
             Self::Relu6 => Some(F32ActivationKind::Relu6),
             Self::Ramp => Some(F32ActivationKind::Ramp),
             Self::Gelu => Some(F32ActivationKind::Gelu),
+            Self::Elu => Some(F32ActivationKind::Elu),
             Self::Other(_) => None,
         }
     }

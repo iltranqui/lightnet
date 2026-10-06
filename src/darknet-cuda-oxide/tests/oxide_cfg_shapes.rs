@@ -1438,7 +1438,7 @@ fn shortcut_fit_edge_cases_and_errors() {
 
 // -------------------------------------------------------------- activations
 
-const KINDS: [F32ActivationKind; 10] = [
+const KINDS: [F32ActivationKind; 11] = [
     F32ActivationKind::Linear,
     F32ActivationKind::Logistic,
     F32ActivationKind::Relu,
@@ -1449,6 +1449,7 @@ const KINDS: [F32ActivationKind; 10] = [
     F32ActivationKind::Relu6,
     F32ActivationKind::Ramp,
     F32ActivationKind::Gelu,
+    F32ActivationKind::Elu,
 ];
 
 fn kind_of(name: &str) -> Option<F32ActivationKind> {
@@ -1465,6 +1466,7 @@ fn kind_of(name: &str) -> Option<F32ActivationKind> {
         "relu6" => F32ActivationKind::Relu6,
         "ramp" => F32ActivationKind::Ramp,
         "gelu" => F32ActivationKind::Gelu,
+        "elu" => F32ActivationKind::Elu,
         _ => return None,
     };
     match k {
@@ -1477,7 +1479,8 @@ fn kind_of(name: &str) -> Option<F32ActivationKind> {
         | F32ActivationKind::Tanh
         | F32ActivationKind::Relu6
         | F32ActivationKind::Ramp
-        | F32ActivationKind::Gelu => {}
+        | F32ActivationKind::Gelu
+        | F32ActivationKind::Elu => {}
     }
     Some(k)
 }
@@ -1497,6 +1500,13 @@ fn act64(kind: F32ActivationKind, x: f64) -> f64 {
         F32ActivationKind::Relu6 => x.clamp(0.0, 6.0),
         F32ActivationKind::Ramp => x * (x > 0.0) as i32 as f64 + 0.1 * x,
         F32ActivationKind::Gelu => 0.5 * x * (1.0 + (0.797885 * x + 0.035677 * x * x * x).tanh()),
+        F32ActivationKind::Elu => {
+            if x >= 0.0 {
+                x
+            } else {
+                x.exp() - 1.0
+            }
+        }
     }
 }
 
@@ -1520,6 +1530,13 @@ fn grad64(kind: F32ActivationKind, x: f64) -> f64 {
             let t = (0.797885 * x + 0.035677 * x * x * x).tanh();
             0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * (0.797885 + 3.0 * 0.035677 * x * x)
         }
+        F32ActivationKind::Elu => {
+            if x >= 0.0 {
+                1.0
+            } else {
+                x.exp()
+            }
+        }
     }
 }
 
@@ -1537,6 +1554,13 @@ fn act32(kind: F32ActivationKind, x: f32) -> f32 {
         F32ActivationKind::Relu6 => x.max(0.0).min(6.0),
         F32ActivationKind::Ramp => (if x > 0.0 { x } else { 0.0 }) + 0.1 * x,
         F32ActivationKind::Gelu => 0.5 * x * (1.0 + (0.797885 * x + 0.035677 * x * x * x).tanh()),
+        F32ActivationKind::Elu => {
+            if x >= 0.0 {
+                x
+            } else {
+                x.exp() - 1.0
+            }
+        }
     }
 }
 

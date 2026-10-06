@@ -14,6 +14,7 @@ pub const ACT_TANH: u32 = 6;
 pub const ACT_RELU6: u32 = 7;
 pub const ACT_RAMP: u32 = 8;
 pub const ACT_GELU: u32 = 9;
+pub const ACT_ELU: u32 = 10;
 
 #[device]
 pub fn activate(kind: u32, x: f32) -> f32 {
@@ -36,6 +37,8 @@ pub fn activate(kind: u32, x: f32) -> f32 {
         (if x > 0.0 { x } else { 0.0 }) + 0.1 * x
     } else if kind == 9 {
         0.5 * x * (1.0 + (0.797885 * x + 0.035677 * x * x * x).tanh())
+    } else if kind == 10 {
+        if x >= 0.0 { x } else { x.exp() - 1.0 }
     } else {
         x
     }
@@ -76,6 +79,8 @@ pub fn gradient(kind: u32, x: f32) -> f32 {
     } else if kind == 9 {
         let t = (0.797885 * x + 0.035677 * x * x * x).tanh();
         0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * (0.797885 + 3.0 * 0.035677 * x * x)
+    } else if kind == 10 {
+        if x >= 0.0 { 1.0 } else { x.exp() }
     } else {
         1.0
     }
