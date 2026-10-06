@@ -128,7 +128,8 @@ pub fn decode_yolo_detections(
 
 /// Decode and merge the network's legacy `[obb_yolo]` heads, then run
 /// orientation-aware NMS once across all heads. This API currently supports
-/// batch size one; OBB training and mAP are separate, unimplemented paths.
+/// batch size one. OBB training and network-level mAP remain unsupported;
+/// [`crate::evaluate::obb_detector_map`] only scores caller-provided samples.
 pub fn decode_obb_yolo_detections(
     network: &Network,
     obb_heads: &[YoloHeadOutput],

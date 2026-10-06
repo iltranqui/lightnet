@@ -34,6 +34,12 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v83: added `obb_detector_map` for normalized legacy front-point predictions,
+  using orientation-aware matching and existing AP/report semantics. Five-field
+  labels are treated as axis-aligned truth; CARPN polygon detections are rejected
+  until their truth-vertex encoder is wired. This is a standalone scorer, not
+  network/CLI evaluation. The focused OBB host suite passed 31/31 and all 454
+  `darknet-core` library tests passed; no compiled-C++ parity is claimed.
 - v82: added a separate OBB training-batch type/loader using direct image resize
   and the existing five/seven-field parser. It preserves optional front-point
   state; class IDs are bounded by the smallest OBB head and optional data class

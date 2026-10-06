@@ -1,8 +1,9 @@
 //! Detector validation: one inference per validation image and VOC-style AP.
+use crate::obb_geometry::{BoxObb, box_obb_iou};
 use crate::{
-    DataConfig, Detection, DetectionBox, DetectionOptions, Error, LayerKind, Network,
-    PlanarRgbImage, Result, Tensor, YoloHeadOutput, YoloLabel, decode_yolo_detections,
-    load_paths_file, load_yolo_labels, replace_image_to_label,
+    DataConfig, Detection, DetectionBox, DetectionOptions, Error, LayerKind, Network, ObbDetection,
+    ObbDetectionGeometry, ObbLabel, PlanarRgbImage, Result, Tensor, YoloHeadOutput, YoloLabel,
+    decode_yolo_detections, load_paths_file, load_yolo_labels, replace_image_to_label,
 };
 use std::path::PathBuf;
 
@@ -173,6 +174,93 @@ pub fn detector_map(
     classes: usize,
     iou_threshold: f32,
 ) -> Result<MapReport> {
+    detector_map_by(
+        samples,
+        classes,
+        iou_threshold,
+        |label| label.class_id,
+        |detection| detection.class_id,
+        |detection| detection.confidence,
+        |detection, label| {
+            iou(
+                detection.bbox,
+                DetectionBox {
+                    x: label.x,
+                    y: label.y,
+                    w: label.w,
+                    h: label.h,
+                },
+            )
+        },
+    )
+}
+
+/// Rank normalized legacy front-point OBB detections and report classwise AP.
+/// Five-field labels have no orientation, so their ground-truth rectangle is
+/// treated as axis-aligned. CARPN polygons are rejected; they need their own
+/// ground-truth vertex encoder before mAP can be computed safely.
+pub fn obb_detector_map(
+    samples: &[(Vec<ObbLabel>, Vec<ObbDetection>)],
+    classes: usize,
+    iou_threshold: f32,
+) -> Result<MapReport> {
+    if samples
+        .iter()
+        .flat_map(|sample| &sample.1)
+        .any(|detection| matches!(detection.geometry, ObbDetectionGeometry::CarpnQuad(_)))
+    {
+        return Err(invalid(
+            "CARPN polygon mAP is not implemented for OBB YOLO labels",
+        ));
+    }
+
+    detector_map_by(
+        samples,
+        classes,
+        iou_threshold,
+        |label| label.class_id,
+        |detection| detection.detection.class_id,
+        |detection| detection.detection.confidence,
+        |detection, label| {
+            let (front_x, front_y) = match detection.geometry {
+                ObbDetectionGeometry::FrontPoint { x, y } => (x, y),
+                ObbDetectionGeometry::CarpnQuad(_) => unreachable!("CARPN rejected above"),
+            };
+            let truth_front = if label.has_front {
+                (label.front_x, label.front_y)
+            } else {
+                (label.x, label.y + label.h * 0.5)
+            };
+            box_obb_iou(
+                BoxObb {
+                    bbox: detection.detection.bbox,
+                    front_x,
+                    front_y,
+                },
+                BoxObb {
+                    bbox: DetectionBox {
+                        x: label.x,
+                        y: label.y,
+                        w: label.w,
+                        h: label.h,
+                    },
+                    front_x: truth_front.0,
+                    front_y: truth_front.1,
+                },
+            )
+        },
+    )
+}
+
+fn detector_map_by<L, D>(
+    samples: &[(Vec<L>, Vec<D>)],
+    classes: usize,
+    iou_threshold: f32,
+    truth_class: impl Fn(&L) -> usize,
+    detection_class: impl Fn(&D) -> usize,
+    confidence: impl Fn(&D) -> f32,
+    overlap: impl Fn(&D, &L) -> f32,
+) -> Result<MapReport> {
     if classes == 0 || !iou_threshold.is_finite() || !(0.0..=1.0).contains(&iou_threshold) {
         return Err(invalid("invalid mAP class count or IoU threshold"));
     }
@@ -180,16 +268,18 @@ pub fn detector_map(
     let mut predictions = vec![Vec::new(); classes];
     for (image, (truth, detections)) in samples.iter().enumerate() {
         for label in truth {
-            if label.class_id >= classes {
+            let class = truth_class(label);
+            if class >= classes {
                 return Err(invalid("validation truth class out of range"));
             }
-            counts[label.class_id] += 1;
+            counts[class] += 1;
         }
         for detection in detections {
-            if detection.class_id >= classes || !detection.confidence.is_finite() {
+            let class = detection_class(detection);
+            if class >= classes || !confidence(detection).is_finite() {
                 return Err(invalid("invalid validation detection class/score"));
             }
-            predictions[detection.class_id].push((image, detection));
+            predictions[class].push((image, detection));
         }
     }
     let mut report = MapReport {
@@ -203,8 +293,11 @@ pub fn detector_map(
         average_iou: vec![0.0; classes],
     };
     for (class, ranked) in predictions.iter_mut().enumerate() {
-        ranked.sort_by(|a, b| b.1.confidence.total_cmp(&a.1.confidence));
-        let mut used: Vec<Vec<bool>> = samples.iter().map(|s| vec![false; s.0.len()]).collect();
+        ranked.sort_by(|a, b| confidence(b.1).total_cmp(&confidence(a.1)));
+        let mut used: Vec<Vec<bool>> = samples
+            .iter()
+            .map(|sample| vec![false; sample.0.len()])
+            .collect();
         let mut points = Vec::with_capacity(ranked.len());
         let (mut tp, mut fp) = (0usize, 0usize);
         let (mut report_tp, mut report_fp, mut iou_sum) = (0usize, 0usize, 0.0f64);
@@ -212,25 +305,17 @@ pub fn detector_map(
             let mut best = None;
             let mut best_iou = iou_threshold;
             for (index, label) in samples[*image].0.iter().enumerate() {
-                if label.class_id != class {
+                if truth_class(label) != class {
                     continue;
                 }
-                let overlap = iou(
-                    detection.bbox,
-                    DetectionBox {
-                        x: label.x,
-                        y: label.y,
-                        w: label.w,
-                        h: label.h,
-                    },
-                );
-                if overlap > best_iou {
+                let candidate_iou = overlap(detection, label);
+                if candidate_iou > best_iou {
                     best = Some(index);
-                    best_iou = overlap;
+                    best_iou = candidate_iou;
                 }
             }
-            let counted = detection.confidence >= REPORT_CONFIDENCE;
-            if let Some(index) = best.filter(|i| !used[*image][*i]) {
+            let counted = confidence(detection) >= REPORT_CONFIDENCE;
+            if let Some(index) = best.filter(|index| !used[*image][*index]) {
                 used[*image][index] = true;
                 tp += 1;
                 if counted {
@@ -300,6 +385,96 @@ mod tests {
             },
         }
     }
+    fn obb_truth(class_id: usize, front: Option<[f32; 2]>) -> ObbLabel {
+        ObbLabel {
+            class_id,
+            x: 0.5,
+            y: 0.5,
+            w: 0.6,
+            h: 0.1,
+            left: 0.2,
+            right: 0.8,
+            top: 0.45,
+            bottom: 0.55,
+            front_x: front.map_or(0.5, |point| point[0]),
+            front_y: front.map_or(0.5, |point| point[1]),
+            has_front: front.is_some(),
+        }
+    }
+    fn obb_prediction(class_id: usize, confidence: f32, front: [f32; 2]) -> ObbDetection {
+        ObbDetection {
+            detection: Detection {
+                class_id,
+                confidence,
+                objectness: confidence,
+                bbox: DetectionBox {
+                    x: 0.5,
+                    y: 0.5,
+                    w: 0.6,
+                    h: 0.1,
+                },
+            },
+            geometry: ObbDetectionGeometry::FrontPoint {
+                x: front[0],
+                y: front[1],
+            },
+        }
+    }
+
+    #[test]
+    fn obb_map_uses_orientation_and_preserves_report_matching_rules() {
+        let oriented = vec![(
+            vec![obb_truth(0, Some([0.5, 0.55]))],
+            vec![
+                obb_prediction(0, 0.9, [0.8, 0.5]),
+                obb_prediction(0, 0.8, [0.5, 0.55]),
+            ],
+        )];
+        let report = obb_detector_map(&oriented, 1, 0.5).expect("oriented mAP");
+        assert_eq!(report.average_precision, vec![0.5]);
+        assert_eq!(report.true_positives, vec![1]);
+        assert_eq!(report.false_positives, vec![1]);
+        assert_eq!(report.false_negatives, vec![0]);
+        assert_eq!(report.detection_counts, vec![2]);
+        assert!((report.average_iou[0] - 1.0).abs() < 1e-6);
+
+        let axis_aligned = vec![(
+            vec![obb_truth(0, None)],
+            vec![
+                obb_prediction(0, 0.9, [0.5, 0.55]),
+                obb_prediction(0, 0.8, [0.5, 0.55]),
+            ],
+        )];
+        let report = obb_detector_map(&axis_aligned, 1, 0.5).expect("AABB fallback mAP");
+        assert_eq!(report.average_precision, vec![1.0]);
+        assert_eq!(report.true_positives, vec![1]);
+        assert_eq!(report.false_positives, vec![1]);
+        assert_eq!(report.false_negatives, vec![0]);
+
+        let low_confidence = vec![(
+            vec![obb_truth(0, None)],
+            vec![obb_prediction(0, 0.1, [0.5, 0.55])],
+        )];
+        let report = obb_detector_map(&low_confidence, 1, 0.5).expect("low-confidence mAP");
+        assert_eq!(report.average_precision, vec![1.0]);
+        assert_eq!(report.true_positives, vec![0]);
+        assert_eq!(report.false_positives, vec![0]);
+        assert_eq!(report.false_negatives, vec![1]);
+        assert_eq!(report.average_iou, vec![0.0]);
+    }
+
+    #[test]
+    fn obb_map_rejects_carpn_and_invalid_classes_or_thresholds() {
+        let mut carpn = obb_prediction(0, 0.9, [0.5, 0.55]);
+        carpn.geometry = ObbDetectionGeometry::CarpnQuad([0.0; 8]);
+        assert!(obb_detector_map(&[(vec![obb_truth(0, None)], vec![carpn])], 1, 0.5).is_err());
+
+        let mut bad_truth = obb_truth(0, Some([0.5, 0.55]));
+        bad_truth.class_id = 1;
+        assert!(obb_detector_map(&[(vec![bad_truth], vec![])], 1, 0.5).is_err());
+        assert!(obb_detector_map(&[], 1, f32::NAN).is_err());
+    }
+
     #[test]
     fn obb_networks_are_not_silently_evaluated_with_aabb_map() {
         let network = Network::from_config(
