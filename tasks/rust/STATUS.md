@@ -34,6 +34,14 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v73: EML SGD now accumulates per-branch weight/beta/BN-scale gradients and
+  momentum buffers on-device, applies both branch updates through the backend,
+  and supports deferred host synchronization. Device finiteness checks cover
+  EML branch and BN-scale buffers. Focused host EML tests pass 9/9; the full
+  Oxide `oxide_runtime_chain` suite passes 19/19, including two-step momentum
+  parity, BN/no-BN updates, and deferred sync. Adam remains host-side for EML;
+  no CPU/C++ BN-training parity claim. Device Adam and compiled-C++ golden
+  validation remain open.
 - v72: Batch-normalized EML now stays on native Oxide forward/backward: each
   branch retains batch-stat BN caches, computes exact scale/beta gradients and
   convolution adjoints, and applies device-produced rolling EMA stats to host

@@ -3257,6 +3257,7 @@ where
     f16_conv_weights: RefCell<Vec<Option<std::rc::Rc<dyn std::any::Any>>>>,
     device_train_buffers: RefCell<Vec<Option<GpuConvolutionTrainBuffers<B::Tensor>>>>,
     device_moe_train_buffers: RefCell<Vec<Option<GpuMoeTrainBuffers<B::Tensor>>>>,
+    device_eml_train_buffers: RefCell<Vec<Option<GpuEmlTrainBuffers<B::Tensor>>>>,
     cpu_fallback_train_buffers: RefCell<Vec<LayerTrainBuffers>>,
     /// Per-owner-layer convolution Adam moments (device), created lazily on the
     /// first Adam update.
@@ -3269,8 +3270,8 @@ where
     adam_step: u32,
     /// See [`ExecutableNetwork::set_train_iteration`].
     train_iteration: usize,
-    /// Host convolution weights / biases / BN gamma and rolling stats lag the
-    /// device ones (deferred updates, see `sync_host_weights_from_device`).
+    /// Host convolution/EML weights, biases, BN gamma, and rolling stats lag
+    /// the device ones (deferred updates, see `sync_host_weights_from_device`).
     host_weights_stale: bool,
     /// Set by [`Self::update_weights_gpu_deferred`]: the backward pass keeps the
     /// BN rolling stats on the device instead of downloading them per step.
@@ -3708,6 +3709,13 @@ struct GpuMoeTrainBuffers<T> {
     dirty: bool,
 }
 
+/// Device gradients and SGD momentum for EML's two convolution branches.
+#[derive(Clone, Debug)]
+struct GpuEmlTrainBuffers<T> {
+    input: GpuConvolutionTrainBuffers<T>,
+    self_params: GpuConvolutionTrainBuffers<T>,
+}
+
 /// f16-storage inference (P6).  Training and every non-inference op stay on
 /// the f32 path.
 impl<B> GpuExecutableNetwork<B>
@@ -4135,6 +4143,7 @@ where
         let f16_conv_weights = RefCell::new((0..network.layers.len()).map(|_| None).collect());
         let device_train_buffers = RefCell::new(vec![None; network.layers.len()]);
         let device_moe_train_buffers = RefCell::new(vec![None; network.layers.len()]);
+        let device_eml_train_buffers = RefCell::new(vec![None; network.layers.len()]);
         let cpu_fallback_train_buffers = RefCell::new(
             network
                 .layers
@@ -4152,6 +4161,7 @@ where
             f16_conv_weights,
             device_train_buffers,
             device_moe_train_buffers,
+            device_eml_train_buffers,
             cpu_fallback_train_buffers,
             adam_state: Vec::new(),
             moe_adam_state,
@@ -4192,9 +4202,9 @@ where
         }
     }
 
-    /// True if any device convolution/MoE gradient or connected/recurrent
-    /// gradient buffer is non-finite, for dynamic loss scaling. Other host-only
-    /// layer families are not inspected.
+    /// True if any device convolution/MoE gradient or supported host gradient
+    /// buffer is non-finite, for dynamic loss scaling. Other host-only layer
+    /// families are not inspected.
     pub fn gradients_non_finite(&self) -> Result<bool> {
         for entry in self.device_train_buffers.borrow().iter().flatten() {
             if self
@@ -4280,6 +4290,59 @@ where
                         .map_err(|err| backend_error("MoE gradient finiteness check", err))?
                 {
                     return Ok(true);
+                }
+            }
+        }
+        for train in self
+            .device_eml_train_buffers
+            .borrow()
+            .iter()
+            .flatten()
+        {
+            for branch in [&train.input, &train.self_params] {
+                if self
+                    .backend
+                    .any_non_finite_f32(&branch.weight_updates)
+                    .map_err(|err| backend_error("EML gradient finiteness check", err))?
+                    || self
+                        .backend
+                        .any_non_finite_f32(&branch.bias_updates)
+                        .map_err(|err| backend_error("EML gradient finiteness check", err))?
+                {
+                    return Ok(true);
+                }
+                if let Some(scales) = &branch.scale_updates
+                    && self
+                        .backend
+                        .any_non_finite_f32(scales)
+                        .map_err(|err| backend_error("EML BN gradient finiteness check", err))?
+                {
+                    return Ok(true);
+                }
+                if let Some(pending) = &branch.pending {
+                    if self
+                        .backend
+                        .any_non_finite_f32(&pending.weights)
+                        .map_err(|err| backend_error("EML pending gradient finiteness check", err))?
+                        || self
+                            .backend
+                            .any_non_finite_f32(&pending.biases)
+                            .map_err(|err| {
+                                backend_error("EML pending gradient finiteness check", err)
+                            })?
+                    {
+                        return Ok(true);
+                    }
+                    if let Some(scales) = &pending.scales
+                        && self
+                            .backend
+                            .any_non_finite_f32(scales)
+                            .map_err(|err| {
+                                backend_error("EML pending BN gradient finiteness check", err)
+                            })?
+                    {
+                        return Ok(true);
+                    }
                 }
             }
         }
@@ -4746,6 +4809,40 @@ where
         Ok(header)
     }
 
+    fn allocate_device_conv_train_buffer(
+        &self,
+        spec: &ConvolutionalSpec,
+        input_channels: usize,
+    ) -> Result<GpuConvolutionTrainBuffers<B::Tensor>> {
+        let weight_updates = self
+            .backend
+            .zeros_f32(&[
+                spec.filters,
+                input_channels / spec.groups.max(1),
+                spec.size,
+                spec.size,
+            ])
+            .map_err(|err| backend_error("allocate GPU weight updates", err))?;
+        let bias_updates = self
+            .backend
+            .zeros_f32(&[spec.filters])
+            .map_err(|err| backend_error("allocate GPU bias updates", err))?;
+        let scale_updates = spec
+            .batch_normalize
+            .then(|| {
+                self.backend
+                    .zeros_f32(&[spec.filters])
+                    .map_err(|err| backend_error("allocate GPU scale updates", err))
+            })
+            .transpose()?;
+        Ok(GpuConvolutionTrainBuffers {
+            weight_updates,
+            bias_updates,
+            scale_updates,
+            pending: None,
+        })
+    }
+
     pub fn init_train_buffers_gpu(&mut self) -> Result<()> {
         self.warm_device_conv_params()?;
         let mut train_buffers = Vec::with_capacity(self.network.layers.len());
@@ -4862,6 +4959,44 @@ where
             moe_train_buffers.push(buffers);
         }
         *self.device_moe_train_buffers.get_mut() = moe_train_buffers;
+
+        let mut eml_train_buffers = Vec::with_capacity(self.network.layers.len());
+        for (layer, params) in self.network.layers.iter().zip(&self.params) {
+            let buffers = match (&layer.kind, params) {
+                (
+                    LayerKind::EmlConvolutional(spec),
+                    LayerParams::EmlConvolutional(eml),
+                ) => {
+                    if eml.input.batch_norm.is_some() != spec.branch.batch_normalize
+                        || eml.self_params.batch_norm.is_some() != spec.branch.batch_normalize
+                    {
+                        return Err(Error::InvalidConfig(format!(
+                            "EML branch parameter mismatch while allocating GPU train buffers at layer #{}",
+                            layer.index
+                        )));
+                    }
+                    Some(GpuEmlTrainBuffers {
+                        input: self.allocate_device_conv_train_buffer(
+                            &spec.branch,
+                            layer.input_shape.channels,
+                        )?,
+                        self_params: self.allocate_device_conv_train_buffer(
+                            &spec.branch,
+                            layer.input_shape.channels,
+                        )?,
+                    })
+                }
+                (LayerKind::EmlConvolutional(_), _) => {
+                    return Err(Error::InvalidConfig(format!(
+                        "EML layer #{} has inconsistent parameters while allocating GPU train buffers",
+                        layer.index
+                    )));
+                }
+                _ => None,
+            };
+            eml_train_buffers.push(buffers);
+        }
+        *self.device_eml_train_buffers.get_mut() = eml_train_buffers;
         Ok(())
     }
 
@@ -4875,8 +5010,8 @@ where
         self.init_train_buffers_gpu()
     }
 
-    /// One optimizer step over device convolutions and MoE SGD/Adam, including
-    /// BN scales. For SGD, remaining host-fallback layers are updated too.
+    /// One optimizer step over device convolutions, EML SGD, and MoE SGD/Adam,
+    /// including BN scales. EML Adam and other fallback layers remain host-side.
     /// The optimizer follows `[net]`: SGD with
     /// momentum by default, Adam with `adam=1` (`B1`/`B2`/`eps`, coupled L2
     /// decay like C++, or AdamW with `decoupled_decay=1`; `lr`/`decay`/`batch`
@@ -4894,14 +5029,13 @@ where
         self.update_weights_gpu_impl(lr, momentum, decay, batch, true)
     }
 
-    /// Like [`Self::update_weights_gpu`] but device convolution params and
-    /// supported MoE expert params (SGD/Adam, including BN) can stay on-device.
-    /// MoE router parameters synchronize immediately because the current router
-    /// forward consumes host parameters; device-updated expert parameters remain
-    /// stale until [`Self::sync_host_weights_from_device`] runs (call it before
-    /// reading or
-    /// saving `params`). Falls back to eager sync when CPU backward reads host
-    /// weights.
+    /// Like [`Self::update_weights_gpu`] but device convolution params, EML SGD
+    /// branches, and supported MoE expert params (SGD/Adam, including BN) can
+    /// stay on-device. MoE router parameters synchronize immediately because
+    /// the current router forward consumes host parameters; EML branch and MoE
+    /// expert params remain stale until [`Self::sync_host_weights_from_device`]
+    /// runs (call it before reading or saving `params`). Falls back to eager
+    /// sync when CPU backward reads host weights.
     pub fn update_weights_gpu_deferred(
         &mut self,
         lr: f32,
@@ -4913,8 +5047,8 @@ where
         self.update_weights_gpu_impl(lr, momentum, decay, batch, eager)
     }
 
-    /// Refreshes host convolution params and MoE expert weights/biases/BN stats
-    /// after deferred device updates.
+    /// Refreshes host convolution, EML branch, and MoE expert weights/biases/BN
+    /// stats after deferred device updates.
     pub fn sync_host_weights_from_device(&mut self) -> Result<()> {
         if !self.host_weights_stale {
             return Ok(());
@@ -4946,6 +5080,17 @@ where
                         }
                     }
                 }
+                LayerKind::EmlConvolutional(_) => {
+                    for branch_slot in 0..2 {
+                        if let Some(cached) = self.device_conv_params_at(layer_index, branch_slot) {
+                            self.sync_eml_branch_params_from_device(
+                                layer_index,
+                                branch_slot,
+                                &cached,
+                            )?;
+                        }
+                    }
+                }
                 _ => continue,
             }
         }
@@ -4963,7 +5108,7 @@ where
     ) -> Result<()> {
         let config = ElementwiseLaunchConfig::default();
         self.defer_host_sync = !sync_host_weights;
-        let net = &self.network.net;
+        let net = self.network.net.clone();
         let loss_scale = if net.loss_scale > 0.0 && net.loss_scale.is_finite() {
             net.loss_scale
         } else {
@@ -5165,6 +5310,25 @@ where
                 self.host_weights_stale = true;
             }
         }
+        let device_eml_path = !net.adam && !self.requires_cpu_backward_fallback();
+        let mut preserve_device_eml_params = vec![false; self.network.layers.len()];
+        if device_eml_path {
+            for layer_index in 0..self.network.layers.len() {
+                let layer = &self.network.layers[layer_index];
+                if !matches!(layer.kind, LayerKind::EmlConvolutional(_))
+                    || !layer.train.updates_at(iteration_num, burn_in)
+                {
+                    continue;
+                }
+                preserve_device_eml_params[layer_index] = self.update_device_eml_optimizer(
+                    layer_index,
+                    &step,
+                    sync_host_weights,
+                    config,
+                )?;
+            }
+        }
+
         let device_moe_path = !self.requires_cpu_backward_fallback();
         let mut preserve_device_moe_params = vec![false; self.network.layers.len()];
         if device_moe_path {
@@ -5216,6 +5380,7 @@ where
                 decay * loss_scale,
                 batch,
                 &preserve_device_moe_params,
+                &preserve_device_eml_params,
             );
         }
         Ok(())
@@ -5465,9 +5630,9 @@ where
                 }
             }
         }
-        // Only host-updated container experts need re-uploading. Device
-        // optimizer updates (including BN MoE experts) retain their raw tensors for
-        // deferred synchronization and the next Oxide forward pass.
+        // Host-updated container branches need re-uploading. Device optimizer
+        // updates (including BN MoE experts) retain raw tensors for deferred
+        // synchronization and the next Oxide forward pass.
         let mut cache = self.device_conv_params.borrow_mut();
         for (index, layer) in self.network.layers.iter().enumerate() {
             if matches!(layer.kind, LayerKind::EmlConvolutional(_))
@@ -5489,6 +5654,7 @@ where
         decay: f32,
         batch: usize,
         preserve_device_moe_params: &[bool],
+        preserve_device_eml_params: &[bool],
     ) {
         let iteration_num = self.train_iteration as i64 + 1;
         let burn_in = self.network.net.burn_in;
@@ -5519,7 +5685,10 @@ where
                 (
                     LayerParams::EmlConvolutional(params),
                     LayerTrainBuffers::EmlConvolutional(train),
-                ) => {
+                ) if !preserve_device_eml_params
+                    .get(layer_index)
+                    .copied()
+                    .unwrap_or(false) => {
                     let lr = lr * layer.train.learning_rate_scale;
                     update_convolutional_params(
                         &mut params.input,
@@ -5700,11 +5869,15 @@ where
                 }
             }
         }
-        // EML branches and fallback MoE experts are host-updated. Invalidate
-        // their device copies so the next forward reuploads current parameters.
+        // Host-updated EML branches and fallback MoE experts are reuploaded;
+        // device-updated EML branches keep their refreshed branch slots.
         let mut cache = self.device_conv_params.borrow_mut();
         for (index, layer) in self.network.layers.iter().enumerate() {
-            if matches!(layer.kind, LayerKind::EmlConvolutional(_))
+            if (matches!(layer.kind, LayerKind::EmlConvolutional(_))
+                && !preserve_device_eml_params
+                    .get(index)
+                    .copied()
+                    .unwrap_or(false))
                 || (matches!(layer.kind, LayerKind::Moe(_))
                     && !preserve_device_moe_params
                         .get(index)
@@ -7990,9 +8163,13 @@ where
         let train_buffers_uninitialized = {
             let conv = self.device_train_buffers.borrow();
             let moe = self.device_moe_train_buffers.borrow();
+            let eml = self.device_eml_train_buffers.borrow();
             conv.len() != self.network.layers.len()
                 || moe.len() != self.network.layers.len()
-                || (conv.iter().all(Option::is_none) && moe.iter().all(Option::is_none))
+                || eml.len() != self.network.layers.len()
+                || (conv.iter().all(Option::is_none)
+                    && moe.iter().all(Option::is_none)
+                    && eml.iter().all(Option::is_none))
         };
         if train_buffers_uninitialized {
             self.init_train_buffers_gpu()?;
@@ -9128,13 +9305,23 @@ where
                                 config,
                             )
                             .map_err(|err| backend_error("EML branch input backward", err))?;
-                        self.accumulate_eml_host_gradients(
-                            layer.index,
-                            slot,
-                            &weight_gradient,
-                            &bias_gradient,
-                            scale_gradient.as_ref(),
-                        )?;
+                        if self.network.net.adam {
+                            self.accumulate_eml_host_gradients(
+                                layer.index,
+                                slot,
+                                &weight_gradient,
+                                &bias_gradient,
+                                scale_gradient.as_ref(),
+                            )?;
+                        } else {
+                            self.accumulate_eml_device_gradients(
+                                layer.index,
+                                slot,
+                                weight_gradient,
+                                bias_gradient,
+                                scale_gradient,
+                            )?;
+                        }
                         input_gradient = Some(match input_gradient {
                             Some(accumulated) => self
                                 .backend
@@ -9884,9 +10071,13 @@ where
         let train_buffers_uninitialized = {
             let conv = self.device_train_buffers.borrow();
             let moe = self.device_moe_train_buffers.borrow();
+            let eml = self.device_eml_train_buffers.borrow();
             conv.len() != self.network.layers.len()
                 || moe.len() != self.network.layers.len()
-                || (conv.iter().all(Option::is_none) && moe.iter().all(Option::is_none))
+                || eml.len() != self.network.layers.len()
+                || (conv.iter().all(Option::is_none)
+                    && moe.iter().all(Option::is_none)
+                    && eml.iter().all(Option::is_none))
         };
         if train_buffers_uninitialized {
             self.init_train_buffers_gpu()?;
@@ -10021,6 +10212,93 @@ where
         }
         for (slot, value) in train.bias_updates.iter_mut().zip(db) {
             *slot += value;
+        }
+        Ok(())
+    }
+
+    fn accumulate_eml_device_gradients(
+        &self,
+        layer_index: usize,
+        branch_slot: usize,
+        weight_gradient: B::Tensor,
+        bias_gradient: B::Tensor,
+        scale_gradient: Option<B::Tensor>,
+    ) -> Result<()> {
+        let mut branch = {
+            let buffers = self.device_eml_train_buffers.borrow();
+            let train = buffers
+                .get(layer_index)
+                .and_then(Clone::clone)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "missing GPU EML train buffers for layer #{layer_index}"
+                    ))
+                })?;
+            match branch_slot {
+                0 => train.input,
+                1 => train.self_params,
+                _ => {
+                    return Err(Error::InvalidConfig(format!(
+                        "invalid EML branch slot {branch_slot} at layer #{layer_index}"
+                    )));
+                }
+            }
+        };
+        if branch.scale_updates.is_some() != scale_gradient.is_some() {
+            return Err(Error::InvalidConfig(format!(
+                "EML GPU BN scale-gradient mismatch at layer #{layer_index}, slot {branch_slot}"
+            )));
+        }
+
+        if self.defer_host_sync {
+            if let Some(pending) = branch.pending.take() {
+                let flushed = self.flush_pending_grads(&branch, &pending)?;
+                branch.weight_updates = flushed.0;
+                branch.bias_updates = flushed.1;
+                branch.scale_updates = flushed.2;
+            }
+            branch.pending = Some(GpuPendingGrads {
+                weights: weight_gradient,
+                biases: bias_gradient,
+                scales: scale_gradient,
+            });
+        } else {
+            let config = ElementwiseLaunchConfig::default();
+            branch.weight_updates = self
+                .backend
+                .saxpy_f32(1.0, &weight_gradient, &branch.weight_updates, config)
+                .map_err(|err| backend_error("EML GPU weight-gradient accumulation", err))?;
+            branch.bias_updates = self
+                .backend
+                .saxpy_f32(1.0, &bias_gradient, &branch.bias_updates, config)
+                .map_err(|err| backend_error("EML GPU bias-gradient accumulation", err))?;
+            branch.scale_updates = match (branch.scale_updates, scale_gradient) {
+                (Some(updates), Some(gradient)) => Some(
+                    self.backend
+                        .saxpy_f32(1.0, &gradient, &updates, config)
+                        .map_err(|err| {
+                            backend_error("EML GPU BN scale-gradient accumulation", err)
+                        })?,
+                ),
+                (None, None) => None,
+                (Some(updates), None) => Some(updates),
+                (None, Some(_)) => unreachable!("presence checked above"),
+            };
+            branch.pending = None;
+        }
+        let mut buffers = self.device_eml_train_buffers.borrow_mut();
+        let train = buffers
+            .get_mut(layer_index)
+            .and_then(Option::as_mut)
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "missing GPU EML train buffers for layer #{layer_index}"
+                ))
+            })?;
+        match branch_slot {
+            0 => train.input = branch,
+            1 => train.self_params = branch,
+            _ => unreachable!("branch slot validated above"),
         }
         Ok(())
     }
@@ -10270,6 +10548,194 @@ where
         slot.expert_scale_updates = expert_scale_updates;
         slot.dirty = true;
         Ok(())
+    }
+
+    fn update_device_eml_optimizer(
+        &mut self,
+        layer_index: usize,
+        step: &GpuOptimizerStep,
+        sync_host_weights: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<bool> {
+        let GpuOptimizerStep::Sgd { .. } = step else {
+            return Ok(false);
+        };
+        let (spec, input_shape, train_options) = {
+            let layer =
+                self.network.layers.get(layer_index).ok_or_else(|| {
+                    Error::InvalidConfig(format!("missing EML layer #{layer_index}"))
+                })?;
+            let LayerKind::EmlConvolutional(spec) = &layer.kind else {
+                return Err(Error::InvalidConfig(format!(
+                    "layer #{layer_index} is not an EML layer"
+                )));
+            };
+            (spec.clone(), layer.input_shape, layer.train)
+        };
+        let LayerParams::EmlConvolutional(params) =
+            self.params.get(layer_index).ok_or_else(|| {
+                Error::InvalidConfig(format!("missing EML params for layer #{layer_index}"))
+            })?
+        else {
+            return Err(Error::InvalidConfig(format!(
+                "missing EML params for layer #{layer_index}"
+            )));
+        };
+        let params = params.clone();
+        let mut train = self
+            .device_eml_train_buffers
+            .borrow()
+            .get(layer_index)
+            .and_then(Clone::clone)
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "missing GPU EML train buffers for layer #{layer_index}"
+                ))
+            })?;
+        if params.input.batch_norm.is_some() != spec.branch.batch_normalize
+            || params.self_params.batch_norm.is_some() != spec.branch.batch_normalize
+            || train.input.scale_updates.is_some() != spec.branch.batch_normalize
+            || train.self_params.scale_updates.is_some() != spec.branch.batch_normalize
+        {
+            return Err(Error::InvalidConfig(format!(
+                "EML parameter or train-buffer mismatch during device optimizer at layer #{layer_index}"
+            )));
+        }
+
+        let weight_shape = [
+            spec.branch.filters,
+            input_shape.channels / spec.branch.groups.max(1),
+            spec.branch.size,
+            spec.branch.size,
+        ];
+        let filters_shape = [spec.branch.filters];
+        let layer_step = step.with_lr_scale(train_options.learning_rate_scale);
+        for slot in 0..2 {
+            let branch_train = if slot == 0 {
+                &mut train.input
+            } else {
+                &mut train.self_params
+            };
+            let cached = self.device_conv_params_at(layer_index, slot).ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "missing cached EML convolution params for layer #{layer_index}, slot {slot}"
+                ))
+            })?;
+            if cached.bn.is_some() != spec.branch.batch_normalize {
+                return Err(Error::InvalidConfig(format!(
+                    "EML device BN cache mismatch at layer #{layer_index}, slot {slot}"
+                )));
+            }
+            let pending = branch_train.pending.clone();
+            let mut weight_gradient = branch_train.weight_updates.clone();
+            if train_options.grad_centr && branch_train.scale_updates.is_some() {
+                if let Some(pending) = pending.as_ref() {
+                    weight_gradient = self
+                        .backend
+                        .saxpy_f32(1.0, &pending.weights, &weight_gradient, config)
+                        .map_err(|err| backend_error("EML SGD gradient accumulation", err))?;
+                }
+                let filter_size = weight_shape[1] * weight_shape[2] * weight_shape[3];
+                weight_gradient = self
+                    .backend
+                    .sanitize_nan_inf_f32(
+                        &weight_gradient,
+                        &weight_shape,
+                        NanInfMode::Reset,
+                        config,
+                    )
+                    .map_err(|err| backend_error("EML SGD update reset_nan_and_inf", err))?;
+                weight_gradient = self
+                    .backend
+                    .gradient_centralization_f32(
+                        &weight_gradient,
+                        &weight_shape,
+                        filter_size,
+                        config,
+                    )
+                    .map_err(|err| backend_error("EML SGD gradient centralization", err))?;
+            }
+            let pending_weight = if train_options.grad_centr && branch_train.scale_updates.is_some()
+            {
+                None
+            } else {
+                pending.as_ref().map(|pending| &pending.weights)
+            };
+            let mut moments = GpuAdamLayerState::default();
+            let mut targets = vec![
+                GpuOptimTarget {
+                    is_weight: true,
+                    w: &cached.raw_weights,
+                    u: &weight_gradient,
+                    grad: pending_weight,
+                    moments: &mut moments.weights,
+                    shape: &weight_shape,
+                },
+                GpuOptimTarget {
+                    is_weight: false,
+                    w: &cached.raw_biases,
+                    u: &branch_train.bias_updates,
+                    grad: pending.as_ref().map(|pending| &pending.biases),
+                    moments: &mut moments.biases,
+                    shape: &filters_shape,
+                },
+            ];
+            if let (Some(batch_norm), Some(scale_updates)) =
+                (cached.bn.as_ref(), branch_train.scale_updates.as_ref())
+            {
+                targets.push(GpuOptimTarget {
+                    is_weight: false,
+                    w: &batch_norm.scales,
+                    u: scale_updates,
+                    grad: pending.as_ref().and_then(|pending| pending.scales.as_ref()),
+                    moments: &mut moments.scales,
+                    shape: &filters_shape,
+                });
+            }
+            let mut updates =
+                gpu_optimizer_multi_step(&self.backend, &layer_step, targets, config)?.into_iter();
+            let (mut raw_weights, weight_updates) = updates.next().expect("EML weights result");
+            if train_options.clip > 0.0 {
+                raw_weights = self
+                    .backend
+                    .constrain_f32(&raw_weights, &weight_shape, train_options.clip, config)
+                    .map_err(|err| backend_error("EML GPU weight clip", err))?;
+            }
+            let (raw_biases, bias_updates) = updates.next().expect("EML biases result");
+            let (new_scales, scale_updates) = match updates.next() {
+                Some((scales, updates)) => (Some(scales), Some(updates)),
+                None => (None, None),
+            };
+            if new_scales.is_some() != spec.branch.batch_normalize {
+                return Err(Error::InvalidConfig(format!(
+                    "EML BN optimizer result mismatch at layer #{layer_index}, slot {slot}"
+                )));
+            }
+            let mut refreshed = cached;
+            refreshed.raw_weights = raw_weights.clone();
+            refreshed.raw_biases = raw_biases.clone();
+            if let (Some(scales), Some(batch_norm)) = (new_scales, refreshed.bn.as_mut()) {
+                batch_norm.scales = scales;
+                refreshed.folded_stale = true;
+            } else {
+                refreshed.weights = raw_weights;
+                refreshed.biases = raw_biases;
+                refreshed.folded_stale = false;
+            }
+            self.set_device_conv_params(layer_index, slot, refreshed.clone())?;
+            if sync_host_weights {
+                self.sync_eml_branch_params_from_device(layer_index, slot, &refreshed)?;
+            }
+            branch_train.weight_updates = weight_updates;
+            branch_train.bias_updates = bias_updates;
+            branch_train.scale_updates = scale_updates;
+            branch_train.pending = None;
+        }
+        self.device_eml_train_buffers.borrow_mut()[layer_index] = Some(train);
+        if !sync_host_weights {
+            self.host_weights_stale = true;
+        }
+        Ok(true)
     }
 
     fn update_device_moe_optimizer(
@@ -11090,6 +11556,9 @@ where
         for entry in self.device_moe_train_buffers.get_mut().iter_mut() {
             *entry = None;
         }
+        for entry in self.device_eml_train_buffers.get_mut().iter_mut() {
+            *entry = None;
+        }
     }
 
     fn warm_device_conv_params(&self) -> Result<()> {
@@ -11477,6 +11946,72 @@ where
         params.weights = raw_weights;
         params.biases = raw_biases;
         if let (Some((scales, mean, variance)), Some(batch_norm)) = (bn, params.batch_norm.as_mut())
+        {
+            batch_norm.scales = scales;
+            batch_norm.rolling_mean = mean;
+            batch_norm.rolling_variance = variance;
+        }
+        Ok(())
+    }
+
+    fn sync_eml_branch_params_from_device(
+        &mut self,
+        owner: usize,
+        branch_slot: usize,
+        cached: &GpuConvolutionLayerParams<B::Tensor>,
+    ) -> Result<()> {
+        let raw_weights = self
+            .backend
+            .download_f32(&cached.raw_weights)
+            .map_err(|err| backend_error("download synced EML branch weights", err))?;
+        let raw_biases = self
+            .backend
+            .download_f32(&cached.raw_biases)
+            .map_err(|err| backend_error("download synced EML branch biases", err))?;
+        let batch_norm = cached
+            .bn
+            .as_ref()
+            .map(|bn| -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+                Ok((
+                    self.backend
+                        .download_f32(&bn.scales)
+                        .map_err(|err| backend_error("download synced EML BN scales", err))?,
+                    self.backend
+                        .download_f32(&bn.rolling_mean)
+                        .map_err(|err| {
+                            backend_error("download synced EML BN rolling mean", err)
+                        })?,
+                    self.backend
+                        .download_f32(&bn.rolling_variance)
+                        .map_err(|err| {
+                            backend_error("download synced EML BN rolling variance", err)
+                        })?,
+                ))
+            })
+            .transpose()?;
+        let Some(LayerParams::EmlConvolutional(params)) = self.params.get_mut(owner) else {
+            return Err(Error::InvalidConfig(format!(
+                "missing CPU EML params for layer #{owner}"
+            )));
+        };
+        let branch = match branch_slot {
+            0 => &mut params.input,
+            1 => &mut params.self_params,
+            _ => {
+                return Err(Error::InvalidConfig(format!(
+                    "invalid EML branch slot {branch_slot} at layer #{owner}"
+                )));
+            }
+        };
+        if branch.batch_norm.is_some() != batch_norm.is_some() {
+            return Err(Error::InvalidConfig(format!(
+                "CPU/device BN mismatch for EML branch at layer #{owner}, slot {branch_slot}"
+            )));
+        }
+        branch.weights = raw_weights;
+        branch.biases = raw_biases;
+        if let (Some((scales, mean, variance)), Some(batch_norm)) =
+            (batch_norm, branch.batch_norm.as_mut())
         {
             batch_norm.scales = scales;
             batch_norm.rolling_mean = mean;
@@ -26311,7 +26846,7 @@ mod tests {
     }
 
     #[test]
-    fn eml_convolutional_cpu_math_gradients_and_gpu_host_updates_are_integrated() {
+    fn eml_convolutional_cpu_math_gradients_and_gpu_device_sgd_are_integrated() {
         let cfg = "[net]\nchannels=1\nbatch=1\nheight=1\nwidth=2\n\
                    [eml_convolutional]\nfilters=1\nsize=1\nbatch_normalize=1\nresidual=1\n";
         let build = || {
@@ -26417,9 +26952,7 @@ mod tests {
 
         let mut gpu = GpuExecutableNetwork::new(executable.network.clone(), FakeBackend);
         gpu.params = executable.params.clone();
-        let gpu_forward = gpu
-            .forward_with_state(&input)
-            .expect("EML GPU-host forward");
+        let gpu_forward = gpu.forward_with_state(&input).expect("EML device forward");
         assert_eq!(
             gpu_forward.cpu_forward.final_output(),
             forward.final_output()
@@ -26427,39 +26960,127 @@ mod tests {
         assert!(!gpu.requires_cpu_backward_fallback());
         gpu.zero_train_buffers_gpu().expect("clear GPU buffers");
         gpu.backward_accumulate_seeded_gpu(&gpu_forward, &[Some(seed.clone())])
-            .expect("EML GPU-host backward");
-        let fallback = gpu.cpu_fallback_train_buffers.borrow();
-        let LayerTrainBuffers::EmlConvolutional(train) = &fallback[0] else {
-            panic!("expected EML fallback buffers");
-        };
-        assert!(train.input.weight_updates.iter().any(|value| *value != 0.0));
+            .expect("EML device backward");
+        let device = gpu.device_eml_train_buffers.borrow();
+        let train = device[0].as_ref().expect("EML device train buffers");
+        assert!(
+            train
+                .input
+                .weight_updates
+                .data
+                .iter()
+                .any(|value| *value != 0.0)
+        );
         assert!(
             train
                 .self_params
                 .weight_updates
+                .data
                 .iter()
                 .any(|value| *value != 0.0)
         );
-        drop(fallback);
+        drop(device);
         let before = match &gpu.params[0] {
             LayerParams::EmlConvolutional(params) => params.input.weights[0],
             _ => unreachable!(),
         };
         gpu.update_weights_gpu(0.01, 0.0, 0.0, 1)
-            .expect("EML host SGD update");
+            .expect("EML device SGD update");
         let after = match &gpu.params[0] {
             LayerParams::EmlConvolutional(params) => params.input.weights[0],
             _ => unreachable!(),
         };
-        assert_ne!(
-            before, after,
-            "host fallback optimizer must update EML weights"
-        );
+        assert_ne!(before, after, "device optimizer must update EML weights");
         let LayerParams::EmlConvolutional(cpu_params) = &cpu_optimizer.params[0] else {
             unreachable!()
         };
         assert!((after - cpu_params.input.weights[0]).abs() < 1e-6);
         assert_eq!(&gpu.params[0], &cpu_optimizer.params[0]);
+    }
+
+    #[test]
+    fn eml_sgd_uses_host_optimizer_when_another_layer_requires_cpu_fallback() {
+        let cfg = "[net]\nchannels=1\nbatch=1\nheight=1\nwidth=1\n\
+                   [eml_convolutional]\nfilters=1\nsize=1\nbatch_normalize=0\nresidual=0\n\
+                   [deconvolutional]\nfilters=1\nsize=1\nstride=1\nactivation=linear\n";
+        let network = Network::from_config(
+            ConfigFile::parse_str("eml-fallback.cfg", cfg).expect("fallback cfg parses"),
+        )
+        .expect("fallback network builds");
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        gpu.init_train_buffers_gpu().expect("fallback train buffers");
+        assert!(gpu.requires_cpu_backward_fallback());
+
+        let before = match &gpu.params[0] {
+            LayerParams::EmlConvolutional(params) => (
+                params.input.weights[0],
+                params.self_params.biases[0],
+            ),
+            _ => unreachable!(),
+        };
+        {
+            let mut buffers = gpu.cpu_fallback_train_buffers.borrow_mut();
+            let LayerTrainBuffers::EmlConvolutional(train) = &mut buffers[0] else {
+                panic!("expected EML CPU-fallback buffers");
+            };
+            train.input.weight_updates[0] = 1.0;
+            train.self_params.bias_updates[0] = 2.0;
+        }
+        gpu.update_weights_gpu(0.1, 0.0, 0.0, 1)
+            .expect("host fallback EML SGD update");
+        let after = match &gpu.params[0] {
+            LayerParams::EmlConvolutional(params) => (
+                params.input.weights[0],
+                params.self_params.biases[0],
+            ),
+            _ => unreachable!(),
+        };
+        assert_ne!(before, after, "CPU fallback must update both EML branches");
+        assert!(gpu.device_eml_train_buffers.borrow()[0]
+            .as_ref()
+            .unwrap()
+            .input
+            .weight_updates
+            .data
+            .iter()
+            .all(|value| *value == 0.0));
+    }
+
+    #[test]
+    fn eml_device_gradients_participate_in_loss_scale_finiteness_check() {
+        let cfg = "[net]\nchannels=1\nbatch=1\nheight=1\nwidth=1\n\
+                   [eml_convolutional]\nfilters=1\nsize=1\nbatch_normalize=1\n";
+        let network = Network::from_config(
+            ConfigFile::parse_str("eml-finite.cfg", cfg).expect("EML finite cfg parses"),
+        )
+        .expect("EML finite network builds");
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        gpu.zero_train_buffers_gpu().expect("EML device buffers");
+        gpu.device_eml_train_buffers.borrow_mut()[0]
+            .as_mut()
+            .expect("EML train buffers")
+            .input
+            .weight_updates
+            .data[0] = f32::NAN;
+        assert!(
+            gpu.gradients_non_finite()
+                .expect("check EML weight gradient")
+        );
+
+        gpu.zero_train_buffers_gpu()
+            .expect("reset EML device buffers");
+        gpu.device_eml_train_buffers.borrow_mut()[0]
+            .as_mut()
+            .expect("EML train buffers")
+            .self_params
+            .scale_updates
+            .as_mut()
+            .expect("EML BN scale updates")
+            .data[0] = f32::NAN;
+        assert!(
+            gpu.gradients_non_finite()
+                .expect("check EML BN scale gradient")
+        );
     }
 
     #[test]
@@ -26881,7 +27502,7 @@ mod tests {
         }
         drop(cache);
 
-        gpu.update_cpu_fallback_weights(0.1, 0.0, 0.0, 1, &[]);
+        gpu.update_cpu_fallback_weights(0.1, 0.0, 0.0, 1, &[], &[]);
         assert!(gpu.device_conv_params.borrow()[0].is_empty());
         gpu.warm_device_conv_params().expect("rewarm updated experts");
         assert_eq!(gpu.device_conv_params.borrow()[0].len(), 3);

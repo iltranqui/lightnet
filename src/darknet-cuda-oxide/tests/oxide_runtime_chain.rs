@@ -1901,6 +1901,7 @@ fn eml_two_branch_forward_backward_on_oxide() {
                 .expect("Oxide EML backward");
         }
         assert!(!gpu.gradients_non_finite().expect("EML gradient finiteness"));
+        let params_before_optimizer = gpu.params.clone();
         if let Some(initial) = initial_batch_norm.as_ref() {
             let LayerParams::EmlConvolutional(params) = &gpu.params[0] else {
                 unreachable!();
@@ -1916,10 +1917,60 @@ fn eml_two_branch_forward_backward_on_oxide() {
                 "self-branch rolling mean updated"
             );
         } else {
-            cpu.update_weights(0.01, 0.0, 0.0, 2);
+            cpu.update_weights(0.01, 0.8, 0.0, 2);
         }
-        gpu.update_weights_gpu(0.01, 0.0, 0.0, 2)
-            .expect("EML host optimizer fallback");
+        if batch_normalize {
+            gpu.update_weights_gpu(0.01, 0.8, 0.0, 2)
+                .expect("EML BN device SGD update");
+        } else {
+            gpu.update_weights_gpu_deferred(0.01, 0.8, 0.0, 2)
+                .expect("deferred EML device SGD update");
+            assert_eq!(
+                gpu.params, params_before_optimizer,
+                "deferred EML host sync"
+            );
+            gpu.sync_host_weights_from_device()
+                .expect("sync deferred EML weights");
+            assert_eq!(gpu.params, cpu.params, "no-BN EML SGD parity");
+
+            let cpu_next = cpu.forward_training(&input).expect("next CPU EML forward");
+            let gpu_next = gpu
+                .forward_training_device(&input)
+                .expect("next Oxide EML forward");
+            cpu.backward_accumulate_seeded(&input, &cpu_next, &seeds)
+                .expect("next CPU EML backward");
+            gpu.backward_accumulate_seeded_gpu(&gpu_next, &seeds)
+                .expect("next Oxide EML backward");
+            cpu.update_weights(0.01, 0.8, 0.0, 2);
+            gpu.update_weights_gpu_deferred(0.01, 0.8, 0.0, 2)
+                .expect("second deferred EML SGD update");
+            gpu.sync_host_weights_from_device()
+                .expect("sync second EML SGD update");
+            let (
+                LayerParams::EmlConvolutional(gpu_params),
+                LayerParams::EmlConvolutional(cpu_params),
+            ) = (&gpu.params[0], &cpu.params[0])
+            else {
+                panic!("EML params after momentum update");
+            };
+            for (name, gpu_branch, cpu_branch) in [
+                ("input", &gpu_params.input, &cpu_params.input),
+                ("self", &gpu_params.self_params, &cpu_params.self_params),
+            ] {
+                close(
+                    &format!("EML {name} SGD momentum weights"),
+                    &gpu_branch.weights,
+                    &cpu_branch.weights,
+                    1e-6,
+                );
+                close(
+                    &format!("EML {name} SGD momentum biases"),
+                    &gpu_branch.biases,
+                    &cpu_branch.biases,
+                    1e-6,
+                );
+            }
+        }
         if let Some(initial) = initial_batch_norm.as_ref() {
             let LayerParams::EmlConvolutional(params) = &gpu.params[0] else {
                 unreachable!();

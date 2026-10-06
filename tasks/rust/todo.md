@@ -213,10 +213,15 @@ Immediately next, in dependency order:
   ./tools/test_host.sh eml_convolutional` passes 3/3 and
   `./tools/test_oxide.sh --test oxide_runtime_chain` passes 19/19, including
   BN rolling-stat inference, finite native BN backward, EMA updates, and host
-  optimizer updates. Parameter optimizers remain host-side. CPU EML training
-  still uses rolling rather than batch statistics; no CPU/C++ training parity
-  is claimed. Device-side optimizers and compiled-C++ golden validation remain
-  open.
+  optimizer updates. v73 adds per-branch device gradient/momentum buffers,
+  native SGD for BN and no-BN EML, and deferred synchronization for both branch
+  parameter blocks; SGD accumulation and finiteness checks stay device-side.
+  `MEM=3G PKGS=darknet-core ./tools/test_host.sh eml_` passes 9/9 and
+  `./tools/test_oxide.sh --test oxide_runtime_chain` passes 19/19, including
+  multi-step SGD momentum parity and deferred host sync. EML Adam remains on the
+  host fallback. CPU EML BN training still uses rolling rather than batch
+  statistics; no CPU/C++ training parity is claimed. Device Adam and
+  compiled-C++ golden validation remain open.
 - [ ] Phase 2B `dcnv3` blocked: no reference numerics (stub in all five branches).
 - [ ] Phase 2C OBB family (unblocked by decision 4; XL — also data loading, NMS,
   mAP).
