@@ -34,6 +34,15 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v65: Added shape-aware host-reference and native Oxide primitives for
+  `normalize_channels`, `normalize_channels_softmax`, and
+  `normalize_channels_softmax_maxval`, including exact normalization-chain
+  backward and the legacy C++ CUDA diagonal shortcut when requested. Source
+  inspection found C++ CPU and CUDA gradients differ; `cpp_grad` intentionally
+  follows the CUDA kernels. Direct host finite differences/parity and Oxide
+  forward/backward/C++ tests pass; full `oxide_layers_extra` passed (23/23).
+  Config parsing/runtime integration is still open, so these activations remain
+  explicit config errors and no layer-level support is claimed.
 - v64: Weighted-shortcut backward now assembles per-source `delta * activation`
   products and applies exact None/ReLU/softmax normalization-chain derivatives
   through `F32TensorOpsBackend`; `GradMode::Cpp` still returns raw products.
@@ -205,6 +214,10 @@ Latest increments:
   `oxide_half::f16_shortcut_avgpool_affine_reverse_match_f64_reference` and
   `oxide_runtime_f16::tiny_net_with_avgpool_local_avgpool_batchnorm_reverse_upsample_matches_f32`
   (13 + 5 tests passed; 1 ignored in the half suite).
+- Partial `NORM_CHAN*` backend primitives now implement the three source-defined
+  channel normalizers and exact f32 adjoints; C++ mode matches the inspected CUDA
+  diagonal shortcuts (CPU C++ custom gradients differ). They are not wired into
+  convolution or cfg parsing yet, so user configs remain rejected.
 - Weighted `[shortcut]` GPU forward composes oxide channel-scale + add. Input and
   source gradients use backend elementwise multiply + shortcut-fit ops. Oxide
   assembles raw `delta * source` products and applies exact None/ReLU/softmax

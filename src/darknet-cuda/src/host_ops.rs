@@ -392,6 +392,147 @@ pub fn shortcut_weight_normalized_gradient(
     gradient
 }
 
+/// Host reference for Darknet's channel-wise convolution activations. The
+/// input/output are contiguous NCHW; normalization is independent per batch
+/// and spatial location.
+pub fn normalize_channels(
+    input: &[f32],
+    batch: usize,
+    channels: usize,
+    spatial: usize,
+    normalization: crate::F32ChannelNormalization,
+) -> Vec<f32> {
+    let total = channel_normalization_len(batch, channels, spatial);
+    assert_eq!(input.len(), total);
+    let mut output = vec![0.0f32; total];
+    for b in 0..batch {
+        for position in 0..spatial {
+            let base = b * channels * spatial + position;
+            match normalization {
+                crate::F32ChannelNormalization::Relu => {
+                    let mut sum = 0.0001f32;
+                    for channel in 0..channels {
+                        let value = input[base + channel * spatial];
+                        if value > 0.0 {
+                            sum += value;
+                        }
+                    }
+                    for channel in 0..channels {
+                        let index = base + channel * spatial;
+                        let value = input[index];
+                        output[index] = if value > 0.0 { value / sum } else { 0.0 };
+                    }
+                }
+                crate::F32ChannelNormalization::Softmax
+                | crate::F32ChannelNormalization::SoftmaxMaxval => {
+                    let maximum = if normalization == crate::F32ChannelNormalization::SoftmaxMaxval
+                    {
+                        let mut maximum = -f32::MAX;
+                        for channel in 0..channels {
+                            let value = input[base + channel * spatial];
+                            if value > maximum || channel == 0 {
+                                maximum = value;
+                            }
+                        }
+                        maximum
+                    } else {
+                        0.0
+                    };
+                    let mut sum = 0.0001f32;
+                    for channel in 0..channels {
+                        sum += (input[base + channel * spatial] - maximum).exp();
+                    }
+                    for channel in 0..channels {
+                        let index = base + channel * spatial;
+                        output[index] = (input[index] - maximum).exp() / sum;
+                    }
+                }
+            }
+        }
+    }
+    output
+}
+
+/// Exact normalization-chain derivative, with an opt-in replica of the C++
+/// CUDA kernels' legacy diagonal shortcut (`cpp_grad`).
+pub fn normalize_channels_backward(
+    activation_input: &[f32],
+    output: &[f32],
+    delta: &[f32],
+    batch: usize,
+    channels: usize,
+    spatial: usize,
+    normalization: crate::F32ChannelNormalization,
+    cpp_grad: bool,
+) -> Vec<f32> {
+    let total = channel_normalization_len(batch, channels, spatial);
+    assert_eq!(activation_input.len(), total);
+    assert_eq!(output.len(), total);
+    assert_eq!(delta.len(), total);
+    let mut gradient = vec![0.0f32; total];
+    for b in 0..batch {
+        for position in 0..spatial {
+            let base = b * channels * spatial + position;
+            let mut dot = 0.0f32;
+            for channel in 0..channels {
+                let index = base + channel * spatial;
+                dot += output[index] * delta[index];
+            }
+            if cpp_grad {
+                for channel in 0..channels {
+                    let index = base + channel * spatial;
+                    let y = output[index];
+                    gradient[index] = match normalization {
+                        crate::F32ChannelNormalization::Relu if y > 0.0 => delta[index] * y,
+                        crate::F32ChannelNormalization::Relu => delta[index],
+                        crate::F32ChannelNormalization::Softmax
+                        | crate::F32ChannelNormalization::SoftmaxMaxval => {
+                            let value = delta[index] * y * (1.0 - y);
+                            if value.is_finite() { value } else { 0.0 }
+                        }
+                    };
+                }
+            } else {
+                match normalization {
+                    crate::F32ChannelNormalization::Relu => {
+                        let mut sum = 0.0001f32;
+                        for channel in 0..channels {
+                            let value = activation_input[base + channel * spatial];
+                            if value > 0.0 {
+                                sum += value;
+                            }
+                        }
+                        for channel in 0..channels {
+                            let index = base + channel * spatial;
+                            gradient[index] = if activation_input[index] > 0.0 {
+                                (delta[index] - dot) / sum
+                            } else {
+                                0.0
+                            };
+                        }
+                    }
+                    crate::F32ChannelNormalization::Softmax
+                    | crate::F32ChannelNormalization::SoftmaxMaxval => {
+                        for channel in 0..channels {
+                            let index = base + channel * spatial;
+                            gradient[index] = output[index] * (delta[index] - dot);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    gradient
+}
+
+fn channel_normalization_len(batch: usize, channels: usize, spatial: usize) -> usize {
+    assert!(batch > 0 && channels > 0 && spatial > 0);
+    batch
+        .checked_mul(channels)
+        .and_then(|elements| elements.checked_mul(spatial))
+        .expect("channel-normalization tensor size overflows usize")
+}
+
 /// Index of the scale value multiplying element `i` of a `[batch, c, h*w]`
 /// tensor: `[batch, h*w]` when `scale_wh`, else `[batch, c]`.
 fn scale_index(i: usize, channels: usize, hw: usize, scale_wh: bool) -> usize {

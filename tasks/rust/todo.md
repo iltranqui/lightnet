@@ -46,8 +46,10 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
 
 - [~] Analytical gradients everywhere: the C++-shortcut audit is done and
   `DARKNET_GRAD_MODE=analytical|cpp` gates softmax and scale_channels (see
-  `implemented.md` §12). Remaining parity gaps include `NORM_CHAN*` and conv
-  `reverse`/`deform`. Convolution `grad_centr` matches the C++ BN gate,
+  `implemented.md` §12). v65 added standalone host/Oxide `NORM_CHAN*` forward
+  and backward primitives with exact default derivatives and C++ CUDA shortcuts;
+  convolution activation/runtime integration and cfg acceptance remain open.
+  Other parity gaps include conv `reverse`/`deform`. Convolution `grad_centr` matches the C++ BN gate,
   per-filter mean subtraction, and `f_size % 32` skip;
   `gpu_grad_centr_runtime_matches_cpu_and_respects_batchnorm_gate` and
   `gradient_centralization_matches_reference_and_is_noop_off_warp_sizes` pass
@@ -220,8 +222,9 @@ Immediately next, in dependency order:
 
 - All parsed scalar activations with CPU forward/derivative support now have
   oxide kernels, including `gelu`, `elu`, `selu`, `hard_mish`, `loggy`,
-  `hardtan`, `relie`, `lhtan`, `plse`, and `stair`. `normalize_channels*` remains
-  a config error.
+  `hardtan`, `relie`, `lhtan`, `plse`, and `stair`. Backend f32 primitives for
+  `normalize_channels*` exist, but convolution CPU/GPU integration is incomplete,
+  so those names intentionally remain config errors.
 - xnor (74 layers), share_index (54), `new_coords=1` yolo (path looks wrong),
   antialiasing, conv grad clamps / `try_fix_nan` clamps,
   `rewritten_bbox`/`total_bbox` logging.

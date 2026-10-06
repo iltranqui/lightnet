@@ -18,7 +18,8 @@ use cuda_core::simt::LaunchConfig;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DriverError};
 use darknet_cuda::{
     AdamParams, AdamUpdateItem, BatchNormTrainForward, ElementwiseLaunchConfig, F32ActivationKind,
-    F32ShortcutWeightNormalization, F32TensorOpsBackend, NanInfMode, SgdUpdateItem,
+    F32ChannelNormalization, F32ShortcutWeightNormalization, F32TensorOpsBackend, NanInfMode,
+    SgdUpdateItem,
 };
 
 use kernels::bias_scale::BIAS_BACKWARD_THREADS;
@@ -263,6 +264,44 @@ fn activation_code(kind: F32ActivationKind) -> u32 {
         F32ActivationKind::Plse => activations::ACT_PLSE,
         F32ActivationKind::Stair => activations::ACT_STAIR,
     }
+}
+
+fn channel_normalization_code(normalization: F32ChannelNormalization) -> u32 {
+    match normalization {
+        F32ChannelNormalization::Relu => 0,
+        F32ChannelNormalization::Softmax => 1,
+        F32ChannelNormalization::SoftmaxMaxval => 2,
+    }
+}
+
+fn channel_normalization_size(
+    op: &str,
+    output_shape: &[usize],
+    batch: usize,
+    channels: usize,
+    spatial: usize,
+) -> Result<usize, OxideError> {
+    if batch == 0 || channels == 0 || spatial == 0 {
+        return Err(shape_err(
+            op,
+            "batch, channels, and spatial must be nonzero".to_owned(),
+        ));
+    }
+    let total = batch
+        .checked_mul(channels)
+        .and_then(|elements| elements.checked_mul(spatial))
+        .ok_or_else(|| shape_err(op, "tensor length overflows usize".to_owned()))?;
+    let shape_len = output_shape
+        .iter()
+        .try_fold(1usize, |product, &dim| product.checked_mul(dim))
+        .ok_or_else(|| shape_err(op, "output shape overflows usize".to_owned()))?;
+    if output_shape.is_empty() || shape_len != total {
+        return Err(shape_err(
+            op,
+            format!("output shape {output_shape:?} has {shape_len} elements, expected {total}"),
+        ));
+    }
+    Ok(total)
 }
 
 fn same_len(op: &str, a: &OxideTensorF32, b: &OxideTensorF32) -> Result<(), OxideError> {
@@ -2332,6 +2371,110 @@ impl F32TensorOpsBackend for OxideBackend {
         }
         .map_err(launch_err)?;
         Ok(OxideTensorF32::new(out, activation_input.shape()))
+    }
+
+    fn normalize_channels_f32(
+        &self,
+        input: &Self::Tensor,
+        output_shape: &[usize],
+        batch: usize,
+        channels: usize,
+        spatial: usize,
+        normalization: F32ChannelNormalization,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let op = "normalize_channels_f32";
+        let total = channel_normalization_size(op, output_shape, batch, channels, spatial)?;
+        let input = self.f32v(input)?;
+        let input = &*input;
+        if input.len() != total || input.shape() != output_shape {
+            return Err(shape_err(
+                op,
+                format!(
+                    "input shape/length are {:?}/{}, expected {output_shape:?}/{total}",
+                    input.shape(),
+                    input.len()
+                ),
+            ));
+        }
+        let mut output = self.alloc_uninit(total)?;
+        // SAFETY: one thread writes each output element; shape and dimensions
+        // have been validated and each thread's channel loop stays in bounds.
+        unsafe {
+            self.layers_extra.normalize_channels(
+                &self.stream,
+                launch::elementwise(total, config),
+                &input.buf,
+                &mut output,
+                channels,
+                spatial,
+                channel_normalization_code(normalization),
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, output_shape))
+    }
+
+    fn normalize_channels_backward_f32(
+        &self,
+        activation_input: &Self::Tensor,
+        output: &Self::Tensor,
+        delta: &Self::Tensor,
+        output_shape: &[usize],
+        batch: usize,
+        channels: usize,
+        spatial: usize,
+        normalization: F32ChannelNormalization,
+        cpp_grad: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let op = "normalize_channels_backward_f32";
+        let total = channel_normalization_size(op, output_shape, batch, channels, spatial)?;
+        let activation_input = self.f32v(activation_input)?;
+        let activation_input = &*activation_input;
+        let output = self.f32v(output)?;
+        let output = &*output;
+        let delta = self.f32v(delta)?;
+        let delta = &*delta;
+        if activation_input.len() != total
+            || output.len() != total
+            || delta.len() != total
+            || activation_input.shape() != output_shape
+            || output.shape() != output_shape
+            || delta.shape() != output_shape
+        {
+            return Err(shape_err(
+                op,
+                format!(
+                    "input/output/delta shapes and lengths are {:?}/{}, {:?}/{}, {:?}/{}, expected {output_shape:?}/{total}",
+                    activation_input.shape(),
+                    activation_input.len(),
+                    output.shape(),
+                    output.len(),
+                    delta.shape(),
+                    delta.len()
+                ),
+            ));
+        }
+        let mut gradient = self.alloc_uninit(total)?;
+        // SAFETY: one thread writes each gradient element; all tensor lengths
+        // and nonzero geometry were checked above.
+        unsafe {
+            self.layers_extra.normalize_channels_backward(
+                &self.stream,
+                launch::elementwise(total, config),
+                &activation_input.buf,
+                &output.buf,
+                &delta.buf,
+                &mut gradient,
+                channels,
+                spatial,
+                channel_normalization_code(normalization),
+                cpp_grad as u32,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(gradient, output_shape))
     }
 
     fn lstm_gate_backward_f32(

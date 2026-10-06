@@ -4,7 +4,8 @@
 //! `darknet_cuda::host_ops` (which only serves the dropout RNG bit-match).
 
 use darknet_cuda::{
-    ElementwiseLaunchConfig, F32ShortcutWeightNormalization, F32TensorOpsBackend, dropout_unit,
+    ElementwiseLaunchConfig, F32ChannelNormalization, F32ShortcutWeightNormalization,
+    F32TensorOpsBackend, dropout_unit,
 };
 use darknet_cuda_oxide::OxideBackend;
 
@@ -70,6 +71,51 @@ fn fd_check(name: &str, x: &[f32], dy: &[f32], f: impl Fn(&[f64]) -> Vec<f64>, g
             got[i]
         );
     }
+}
+
+fn cpu_channel_normalization(
+    input: &[f64],
+    batch: usize,
+    channels: usize,
+    spatial: usize,
+    normalization: F32ChannelNormalization,
+) -> Vec<f64> {
+    let mut output = vec![0.0; input.len()];
+    for b in 0..batch {
+        for position in 0..spatial {
+            let base = b * channels * spatial + position;
+            match normalization {
+                F32ChannelNormalization::Relu => {
+                    let sum = 1e-4
+                        + (0..channels)
+                            .map(|channel| input[base + channel * spatial].max(0.0))
+                            .sum::<f64>();
+                    for channel in 0..channels {
+                        let index = base + channel * spatial;
+                        output[index] = input[index].max(0.0) / sum;
+                    }
+                }
+                F32ChannelNormalization::Softmax
+                | F32ChannelNormalization::SoftmaxMaxval => {
+                    let maximum = if normalization == F32ChannelNormalization::SoftmaxMaxval {
+                        (0..channels)
+                            .map(|channel| input[base + channel * spatial])
+                            .fold(f64::NEG_INFINITY, f64::max)
+                    } else {
+                        0.0
+                    };
+                    let exponents: Vec<f64> = (0..channels)
+                        .map(|channel| (input[base + channel * spatial] - maximum).exp())
+                        .collect();
+                    let sum = 1e-4 + exponents.iter().sum::<f64>();
+                    for channel in 0..channels {
+                        output[base + channel * spatial] = exponents[channel] / sum;
+                    }
+                }
+            }
+        }
+    }
+    output
 }
 
 // ---------------------------------------------------------------- softmax
@@ -739,6 +785,153 @@ fn weighted_shortcut_products_and_normalization_gradients_match_reference() {
             );
         }
     }
+}
+
+#[test]
+fn channel_normalization_forward_backward_exact_and_cpp_match_reference() {
+    let be = backend();
+    let (batch, channels, spatial) = (2usize, 3usize, 2usize);
+    let shape = [batch, channels, 1, spatial];
+    let input = [
+        0.2f32, -0.7, 1.1, 0.4, -0.3, 0.8, 0.5, 1.3, -0.8, 0.6, 1.7, -0.2,
+    ];
+    let delta: Vec<f32> = (0..input.len())
+        .map(|i| (i as f32 * 0.61).sin() + 0.2)
+        .collect();
+    let input_gpu = be.upload_f32(&shape, &input).unwrap();
+    let delta_gpu = be.upload_f32(&shape, &delta).unwrap();
+    for normalization in [
+        F32ChannelNormalization::Relu,
+        F32ChannelNormalization::Softmax,
+        F32ChannelNormalization::SoftmaxMaxval,
+    ] {
+        let reference = |values: &[f64]| {
+            cpu_channel_normalization(values, batch, channels, spatial, normalization)
+        };
+        let expected_output = reference(&f64s(&input));
+        let cpu_output = darknet_cuda::host_ops::normalize_channels(
+            &input,
+            batch,
+            channels,
+            spatial,
+            normalization,
+        );
+        assert_close(
+            &format!("host channel normalization {normalization:?}"),
+            &cpu_output,
+            &expected_output,
+        );
+        let output_gpu = be
+            .normalize_channels_f32(
+                &input_gpu,
+                &shape,
+                batch,
+                channels,
+                spatial,
+                normalization,
+                cfg(),
+            )
+            .unwrap();
+        assert_eq!(output_gpu.shape(), shape.as_slice());
+        let output = be.download_f32(&output_gpu).unwrap();
+        assert_close(
+            &format!("oxide channel normalization {normalization:?}"),
+            &output,
+            &expected_output,
+        );
+
+        let cpu_gradient = darknet_cuda::host_ops::normalize_channels_backward(
+            &input,
+            &cpu_output,
+            &delta,
+            batch,
+            channels,
+            spatial,
+            normalization,
+            false,
+        );
+        fd_check(
+            &format!("host channel normalization {normalization:?}"),
+            &input,
+            &delta,
+            reference,
+            &cpu_gradient,
+        );
+        let exact_gpu = be
+            .normalize_channels_backward_f32(
+                &input_gpu,
+                &output_gpu,
+                &delta_gpu,
+                &shape,
+                batch,
+                channels,
+                spatial,
+                normalization,
+                false,
+                cfg(),
+            )
+            .unwrap();
+        assert_eq!(exact_gpu.shape(), shape.as_slice());
+        let exact = be.download_f32(&exact_gpu).unwrap();
+        assert_close(
+            &format!("oxide exact channel gradient {normalization:?}"),
+            &exact,
+            &f64s(&cpu_gradient),
+        );
+        fd_check(
+            &format!("oxide channel normalization {normalization:?}"),
+            &input,
+            &delta,
+            reference,
+            &exact,
+        );
+
+        let cpp_gpu = be
+            .normalize_channels_backward_f32(
+                &input_gpu,
+                &output_gpu,
+                &delta_gpu,
+                &shape,
+                batch,
+                channels,
+                spatial,
+                normalization,
+                true,
+                cfg(),
+            )
+            .unwrap();
+        assert_eq!(cpp_gpu.shape(), shape.as_slice());
+        let cpp = be.download_f32(&cpp_gpu).unwrap();
+        let expected_cpp: Vec<f64> = output
+            .iter()
+            .zip(&delta)
+            .map(|(&y, &dy)| match normalization {
+                F32ChannelNormalization::Relu if y > 0.0 => (dy * y) as f64,
+                F32ChannelNormalization::Relu => dy as f64,
+                F32ChannelNormalization::Softmax | F32ChannelNormalization::SoftmaxMaxval => {
+                    let value = dy * y * (1.0 - y);
+                    if value.is_finite() { value as f64 } else { 0.0 }
+                }
+            })
+            .collect();
+        assert_close(
+            &format!("oxide C++ CUDA channel gradient {normalization:?}"),
+            &cpp,
+            &expected_cpp,
+        );
+    }
+    assert!(
+        be.normalize_channels_f32(
+            &input_gpu,
+            &[batch, channels, 1, spatial + 1],
+            batch,
+            channels,
+            spatial + 1,
+            F32ChannelNormalization::Relu,
+            cfg(),
+        )
+        .is_err()
+    );
 }
 
 #[test]

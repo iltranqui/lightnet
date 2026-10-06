@@ -53,6 +53,14 @@ pub enum F32ShortcutWeightNormalization {
     Softmax,
 }
 
+/// Channel-wise normalization used by the convolution-only `NORM_CHAN*` activations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum F32ChannelNormalization {
+    Relu,
+    Softmax,
+    SoftmaxMaxval,
+}
+
 /// Outputs of [`F32TensorOpsBackend::batchnorm_train_forward_f32`].
 #[derive(Clone, Debug)]
 pub struct BatchNormTrainForward<T> {
@@ -327,6 +335,56 @@ pub trait F32TensorOpsBackend {
         activation: F32ActivationKind,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error>;
+    /// Normalize NCHW activations across channels independently at each
+    /// `(batch, spatial)` position. `spatial` is `height * width`.
+    fn normalize_channels_f32(
+        &self,
+        input: &Self::Tensor,
+        output_shape: &[usize],
+        batch: usize,
+        channels: usize,
+        spatial: usize,
+        normalization: F32ChannelNormalization,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let input = self.download_f32(input)?;
+        let output = host_ops::normalize_channels(&input, batch, channels, spatial, normalization);
+        assert_eq!(output_shape.iter().product::<usize>(), output.len());
+        self.upload_f32(output_shape, &output)
+    }
+    /// Exact derivative of [`Self::normalize_channels_f32`], except when
+    /// `cpp_grad` requests the legacy C++ CUDA diagonal shortcut.
+    fn normalize_channels_backward_f32(
+        &self,
+        activation_input: &Self::Tensor,
+        output: &Self::Tensor,
+        delta: &Self::Tensor,
+        output_shape: &[usize],
+        batch: usize,
+        channels: usize,
+        spatial: usize,
+        normalization: F32ChannelNormalization,
+        cpp_grad: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let activation_input = self.download_f32(activation_input)?;
+        let output = self.download_f32(output)?;
+        let delta = self.download_f32(delta)?;
+        let gradient = host_ops::normalize_channels_backward(
+            &activation_input,
+            &output,
+            &delta,
+            batch,
+            channels,
+            spatial,
+            normalization,
+            cpp_grad,
+        );
+        assert_eq!(output_shape.iter().product::<usize>(), gradient.len());
+        self.upload_f32(output_shape, &gradient)
+    }
     /// LSTM gate derivatives for one sequence step. Returns forget/input/
     /// candidate/output gate gradients and the cell gradient carried to the
     /// preceding step. The default is a host reference; device backends should
