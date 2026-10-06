@@ -6145,7 +6145,10 @@ where
                             forward_crnn_layer(spec, recurrent, &host_input, layer.output_shape)?;
                         recurrent_caches.push(Some(RecurrentForwardCache::Crnn(cache)));
                         self.backend
-                            .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
+                            .upload_f32(
+                                &tensor_backend_shape(layer.output_shape),
+                                &host_output.data,
+                            )
                             .map_err(|err| backend_error("upload CRNN output", err))?
                     }
                 }
@@ -8292,19 +8295,14 @@ where
                             ))
                         })?
                     };
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download CRNN backward input", err))?;
-                    let host_gradient = self
-                        .download_tensor(&grad, layer.output_shape)
-                        .map_err(|err| backend_error("download CRNN output gradient", err))?;
                     let (input_gradient, gradients) = backward_crnn_layer_device(
                         &self.backend,
                         spec,
                         params,
                         cache,
-                        &host_input,
-                        &host_gradient,
+                        current_input,
+                        layer.input_shape,
+                        &grad,
                         layer.index,
                         config,
                     )?;
@@ -14210,8 +14208,9 @@ fn backward_crnn_layer_device<B: F32TensorOpsBackend>(
     spec: &CrnnSpec,
     params: &CrnnParams,
     cache: &CrnnForwardCache,
-    input: &Tensor,
-    output_gradient: &Tensor,
+    input_gpu: &B::Tensor,
+    input_shape: TensorShape,
+    output_gradient: &B::Tensor,
     layer_index: usize,
     config: ElementwiseLaunchConfig,
 ) -> Result<(B::Tensor, CrnnParams)>
@@ -14228,29 +14227,28 @@ where
             name: "batch-normalized CRNN GPU backward".to_owned(),
         });
     }
-    let sequence_batch = recurrent_sequence_batch(input.shape.batch, spec.steps)?;
+    let sequence_batch = recurrent_sequence_batch(input_shape.batch, spec.steps)?;
     if cache.sequence_batch != sequence_batch {
         return Err(Error::InvalidConfig(
             "CRNN forward cache sequence batch mismatch".to_owned(),
         ));
     }
     let input_width =
-        convolution_output_dim(input.shape.width, spec.padding, spec.size, spec.stride);
+        convolution_output_dim(input_shape.width, spec.padding, spec.size, spec.stride);
     let input_height =
-        convolution_output_dim(input.shape.height, spec.padding, spec.size, spec.stride);
+        convolution_output_dim(input_shape.height, spec.padding, spec.size, spec.stride);
     let hidden_shape = TensorShape::new(input_width, input_height, spec.hidden, sequence_batch);
     let output_step_shape =
         TensorShape::new(input_width, input_height, spec.output, sequence_batch);
     let input_step_shape = TensorShape::new(
-        input.shape.width,
-        input.shape.height,
-        input.shape.channels,
+        input_shape.width,
+        input_shape.height,
+        input_shape.channels,
         sequence_batch,
     );
     let expected_output_shape =
-        TensorShape::new(input_width, input_height, spec.output, input.shape.batch);
-    if output_gradient.shape != expected_output_shape
-        || cache.outputs.len() != spec.steps
+        TensorShape::new(input_width, input_height, spec.output, input_shape.batch);
+    if cache.outputs.len() != spec.steps
         || cache.states.len() != spec.steps
         || cache.previous_states.len() != spec.steps
         || cache.input_activation_inputs.len() != spec.steps
@@ -14274,7 +14272,7 @@ where
     };
     let input_weights = upload_weights(
         &params.input,
-        input.shape.channels,
+        input_shape.channels,
         "upload CRNN backward input weights",
     )?;
     let self_weights = upload_weights(
@@ -14288,7 +14286,9 @@ where
         "upload CRNN backward output weights",
     )?;
     let activation = gpu_activation_kind(layer_index, &spec.activation)?;
-    let mut input_gradient = Tensor::zeros(input.shape);
+    let mut input_gradients: Vec<Option<B::Tensor>> = (0..spec.steps).map(|_| None).collect();
+    let mut weight_gradients: Vec<Option<B::Tensor>> = (0..3).map(|_| None).collect();
+    let mut bias_gradients: Vec<Option<B::Tensor>> = (0..3).map(|_| None).collect();
     let mut gradients = CrnnParams {
         input: zero_convolutional_gradient(&params.input),
         self_params: zero_convolutional_gradient(&params.self_params),
@@ -14299,14 +14299,16 @@ where
         .map_err(|err| backend_error("allocate CRNN backward state gradient", err))?;
 
     for step in (0..spec.steps).rev() {
-        let output_gradient_step =
-            sequence_slice(output_gradient, step, sequence_batch, output_step_shape)?;
         let output_gradient_gpu = backend
-            .upload_f32(
+            .sequence_slice_f32(
+                output_gradient,
+                &tensor_backend_shape(expected_output_shape),
+                step,
+                spec.steps,
                 &tensor_backend_shape(output_step_shape),
-                &output_gradient_step.data,
+                config,
             )
-            .map_err(|err| backend_error("upload CRNN output gradient slice", err))?;
+            .map_err(|err| backend_error("slice CRNN output gradient", err))?;
         let output_activation_input = backend
             .upload_f32(
                 &tensor_backend_shape(output_step_shape),
@@ -14353,17 +14355,19 @@ where
                 config,
             )
             .map_err(|err| backend_error("CRNN output bias backward", err))?;
-        accumulate_vec(
-            &mut gradients.output.weights,
-            &backend
-                .download_f32(&output_weight_gradient)
-                .map_err(|err| backend_error("download CRNN output weight gradient", err))?,
+        accumulate_backend_gradient(
+            backend,
+            &mut weight_gradients[2],
+            output_weight_gradient,
+            config,
+            "accumulate CRNN output weight gradient",
         )?;
-        accumulate_vec(
-            &mut gradients.output.biases,
-            &backend
-                .download_f32(&output_bias_gradient)
-                .map_err(|err| backend_error("download CRNN output bias gradient", err))?,
+        accumulate_backend_gradient(
+            backend,
+            &mut bias_gradients[2],
+            output_bias_gradient,
+            config,
+            "accumulate CRNN output bias gradient",
         )?;
         let mut state_gradient = backend
             .conv2d_backward_input_f32(
@@ -14423,17 +14427,19 @@ where
         let self_bias_gradient = backend
             .bias_backward_f32(&self_delta, spec.hidden, input_width * input_height, config)
             .map_err(|err| backend_error("CRNN recurrent bias backward", err))?;
-        accumulate_vec(
-            &mut gradients.self_params.weights,
-            &backend
-                .download_f32(&self_weight_gradient)
-                .map_err(|err| backend_error("download CRNN recurrent weight gradient", err))?,
+        accumulate_backend_gradient(
+            backend,
+            &mut weight_gradients[1],
+            self_weight_gradient,
+            config,
+            "accumulate CRNN recurrent weight gradient",
         )?;
-        accumulate_vec(
-            &mut gradients.self_params.biases,
-            &backend
-                .download_f32(&self_bias_gradient)
-                .map_err(|err| backend_error("download CRNN recurrent bias gradient", err))?,
+        accumulate_backend_gradient(
+            backend,
+            &mut bias_gradients[1],
+            self_bias_gradient,
+            config,
+            "accumulate CRNN recurrent bias gradient",
         )?;
         let mut previous_state_gradient = backend
             .conv2d_backward_input_f32(
@@ -14463,23 +14469,29 @@ where
         let input_delta = backend
             .activation_backward_f32(&input_activation_input, &state_gradient, activation, config)
             .map_err(|err| backend_error("CRNN input activation backward", err))?;
-        let step_input = sequence_slice(input, step, sequence_batch, input_step_shape)?;
         let step_input_gpu = backend
-            .upload_f32(&tensor_backend_shape(input_step_shape), &step_input.data)
-            .map_err(|err| backend_error("upload CRNN backward input slice", err))?;
+            .sequence_slice_f32(
+                input_gpu,
+                &tensor_backend_shape(input_shape),
+                step,
+                spec.steps,
+                &tensor_backend_shape(input_step_shape),
+                config,
+            )
+            .map_err(|err| backend_error("slice CRNN input sequence", err))?;
         let input_weight_gradient = backend
             .conv2d_backward_weights_f32(
                 &step_input_gpu,
                 &input_delta,
                 &[
                     spec.hidden,
-                    input.shape.channels / groups,
+                    input_shape.channels / groups,
                     spec.size,
                     spec.size,
                 ],
-                input.shape.channels,
-                input.shape.height,
-                input.shape.width,
+                input_shape.channels,
+                input_shape.height,
+                input_shape.width,
                 spec.hidden,
                 spec.size,
                 spec.stride,
@@ -14498,26 +14510,28 @@ where
                 config,
             )
             .map_err(|err| backend_error("CRNN input bias backward", err))?;
-        accumulate_vec(
-            &mut gradients.input.weights,
-            &backend
-                .download_f32(&input_weight_gradient)
-                .map_err(|err| backend_error("download CRNN input weight gradient", err))?,
+        accumulate_backend_gradient(
+            backend,
+            &mut weight_gradients[0],
+            input_weight_gradient,
+            config,
+            "accumulate CRNN input weight gradient",
         )?;
-        accumulate_vec(
-            &mut gradients.input.biases,
-            &backend
-                .download_f32(&input_bias_gradient)
-                .map_err(|err| backend_error("download CRNN input bias gradient", err))?,
+        accumulate_backend_gradient(
+            backend,
+            &mut bias_gradients[0],
+            input_bias_gradient,
+            config,
+            "accumulate CRNN input bias gradient",
         )?;
         let step_input_gradient = backend
             .conv2d_backward_input_f32(
                 &input_delta,
                 &input_weights,
                 &tensor_backend_shape(input_step_shape),
-                input.shape.channels,
-                input.shape.height,
-                input.shape.width,
+                input_shape.channels,
+                input_shape.height,
+                input_shape.width,
                 spec.hidden,
                 spec.size,
                 spec.stride,
@@ -14528,18 +14542,7 @@ where
                 config,
             )
             .map_err(|err| backend_error("CRNN input input backward", err))?;
-        let step_input_gradient = recurrent_device_tensor(
-            backend,
-            &step_input_gradient,
-            input_step_shape,
-            "download CRNN input gradient",
-        )?;
-        sequence_write(
-            &mut input_gradient,
-            step,
-            sequence_batch,
-            &step_input_gradient,
-        )?;
+        input_gradients[step] = Some(step_input_gradient);
 
         if spec.shortcut {
             previous_state_gradient = backend
@@ -14551,9 +14554,46 @@ where
         }
     }
 
+    let input_gradient_refs: Vec<_> = input_gradients
+        .iter()
+        .map(|gradient| {
+            gradient.as_ref().ok_or_else(|| {
+                Error::InvalidConfig("missing CRNN input gradient timestep".to_owned())
+            })
+        })
+        .collect::<Result<_>>()?;
     let input_gradient_gpu = backend
-        .upload_f32(&tensor_backend_shape(input.shape), &input_gradient.data)
-        .map_err(|err| backend_error("upload assembled CRNN input gradient", err))?;
+        .sequence_concat_f32(
+            &input_gradient_refs,
+            &tensor_backend_shape(input_shape),
+            sequence_batch * input_step_shape.element_count(),
+            config,
+        )
+        .map_err(|err| backend_error("assemble CRNN input gradient", err))?;
+    for index in 0..3 {
+        let weights = backend
+            .download_f32(weight_gradients[index].as_ref().ok_or_else(|| {
+                Error::InvalidConfig("missing accumulated CRNN weight gradient".to_owned())
+            })?)
+            .map_err(|err| backend_error("download accumulated CRNN weight gradient", err))?;
+        let biases = backend
+            .download_f32(bias_gradients[index].as_ref().ok_or_else(|| {
+                Error::InvalidConfig("missing accumulated CRNN bias gradient".to_owned())
+            })?)
+            .map_err(|err| backend_error("download accumulated CRNN bias gradient", err))?;
+        let gradient = match index {
+            0 => &mut gradients.input,
+            1 => &mut gradients.self_params,
+            _ => &mut gradients.output,
+        };
+        if weights.len() != gradient.weights.len() || biases.len() != gradient.biases.len() {
+            return Err(Error::InvalidConfig(
+                "accumulated CRNN parameter gradient shape mismatch".to_owned(),
+            ));
+        }
+        gradient.weights = weights;
+        gradient.biases = biases;
+    }
     Ok((input_gradient_gpu, gradients))
 }
 
