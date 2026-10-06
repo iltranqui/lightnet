@@ -132,8 +132,8 @@ Immediately next, in dependency order:
   owner layer + expert slot; `warm_device_conv_params` warms each MoE expert,
   and host-updated experts invalidate/re-upload their slots. FakeBackend test
   covers slot separation and rewarm. Device-side parameter update/BN refresh
-  remains top-level-conv-only; container parameter accumulation and SGD remain
-  host-resident.
+  remains top-level-conv-only; MoE parameter gradients now accumulate on-device
+  and transfer to host once per optimizer flush, where SGD/Adam remains.
 - [~] Phase 2B `moe_convolutional`: real-device forward computes router pooling,
   logits, top-k masking, softmax, expert convolutions, and gate blending. For
   no-BN experts, router connected-backward, gate-column selection and gate-dot
@@ -141,11 +141,13 @@ Immediately next, in dependency order:
   input-gradient broadcast, and expert convolution backward use backend ops;
   gates and pooled/expert activation/output caches remain device-resident, with
   no gate/dot transfers in the normal Oxide training path. Router/expert
-  parameter-gradient transfers, accumulation, and SGD remain host-side. BN
-  experts still use CPU backward.
+  parameter gradients accumulate on-device across backward calls; accumulated
+  weight/bias buffers transfer to host only at optimizer flush for SGD/Adam. BN experts
+  still use CPU backward.
   Verified against CPU in
   `oxide_runtime_chain::moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu`
-  (including upstream convolution updates) and router-specific soft/tied top-k
+  (including two accumulated backward calls and upstream convolution updates)
+  and router-specific soft/tied top-k
   parity coverage in `oxide_layers_extra`.
   CPU path is done (`cdf68d00`). `eml_convolutional` not started (save order
   verified 2026-10-05).

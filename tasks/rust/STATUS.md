@@ -142,12 +142,14 @@ Latest increments:
   top-k softmax-Jacobian backward, router-pool input-gradient broadcast, and
   expert convolution backward use backend ops. Gates and pooled/expert
   output/activation caches stay device-resident; no gate/dot values cross the
-  host in normal Oxide training. Router/expert parameter-gradient transfers,
-  accumulation, and SGD remain host-side. BN experts stay on the CPU fallback.
-  FakeBackend parity and real-device
+  host in normal Oxide training. Router/expert parameter gradients accumulate
+  on-device across backward calls; accumulated weight/bias buffers transfer to
+  host only at optimizer flush for SGD/Adam. BN experts stay on the CPU fallback. FakeBackend
+  parity and real-device
   `moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu`
-  pass, including upstream convolution updates. `oxide_layers_extra` verifies
-  soft/tied top-k, pool and pool-backward, non-multiple gate-dot reductions, and
+  pass, including two accumulated backward calls and upstream convolution
+  updates. `oxide_layers_extra` verifies soft/tied top-k, pool and pool-backward,
+  non-multiple gate-dot reductions, and
   router backward parity with load balancing.
 - Overlapping-window maxpool backward, including `maxpool_zero_nonmax`, now
   matches central finite differences.
@@ -219,8 +221,9 @@ believing a `cfg_corpus` failure.
    Phase 4. They also need the Phase 3A prerequisite kernel set.
 2. Phase 2A is done, including `detect::decode_modern_detections` and the
    `detect-image` merge. Phase 2B `moe_convolutional` has a verified CPU path
-   and partial Oxide forward/backward; parameter-gradient transfers, host
-   accumulation/SGD, and BN expert backward remain. Remaining across the phases:
+   and partial Oxide forward/backward; device gradient accumulation is in place,
+   while optimizer-flush transfers, host SGD/Adam, and BN expert backward remain.
+   Remaining across the phases:
    `cfg/LegoGears_centernet.cfg` end to end (the cfg lives on `Jev_laya`), then
    2B's `eml_convolutional`, 2C (OBB), 3A/3B (transformer + deformable families,
    shared LayerNorm/GEMM kernel set first) and 4.
@@ -233,8 +236,8 @@ believing a `cfg_corpus` failure.
    `vc_attention` fast paths (decision 3) get their own kernels or reuse the
    reference attention path.
 4. Phase 2B `moe_convolutional` (weights order verified) has partial Oxide
-   training support; continue reducing host-resident parameter transfers,
-   accumulation/SGD, and add BN expert backward. Then port
+   training support; optimizer-flush parameter transfers, host SGD/Adam, and BN
+   expert backward remain. Then port
    `eml_convolutional` (an activation, not a `LayerKind`; save order **re-read
    2026-10-05**: `input_layer` then `self_layer`, two full conv blocks).
 5. Phase 3B deformable family — start with `dcnv4` (real C++ forward and

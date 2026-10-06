@@ -261,10 +261,15 @@ fn moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu() {
     seeds[1] = Some(seed);
     cpu.zero_train_buffers();
     gpu.zero_train_buffers_gpu().expect("zero train buffers");
-    cpu.backward_accumulate_seeded(&input, &cpu_fwd, &seeds).expect("CPU MoE backward");
-    gpu.backward_accumulate_seeded_gpu(&gpu_fwd, &seeds).expect("Oxide MoE backward");
-    cpu.update_weights(0.01, 0.9, 0.001, 2);
-    gpu.update_weights_gpu(0.01, 0.9, 0.001, 2).expect("MoE SGD");
+    for _ in 0..2 {
+        cpu.backward_accumulate_seeded(&input, &cpu_fwd, &seeds)
+            .expect("CPU MoE backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_fwd, &seeds)
+            .expect("Oxide MoE backward");
+    }
+    cpu.update_weights(0.01, 0.9, 0.001, 4);
+    gpu.update_weights_gpu(0.01, 0.9, 0.001, 4)
+        .expect("MoE SGD");
 
     let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(gpu_conv)) =
         (&cpu.params[0], &gpu.params[0])
