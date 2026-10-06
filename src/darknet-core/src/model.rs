@@ -273,7 +273,7 @@ impl Activation {
         match self {
             Self::Linear => Some(F32ActivationKind::Linear),
             Self::Logistic => Some(F32ActivationKind::Logistic),
-            Self::Loggy | Self::Selu | Self::Relie | Self::Plse | Self::Hardtan | Self::Lhtan | Self::Stair | Self::HardMish | Self::Revleaky => None,
+            Self::Loggy | Self::Relie | Self::Plse | Self::Hardtan | Self::Lhtan | Self::Stair | Self::HardMish | Self::Revleaky => None,
             Self::Relu => Some(F32ActivationKind::Relu),
             Self::Leaky => Some(F32ActivationKind::Leaky),
             Self::Mish => Some(F32ActivationKind::Mish),
@@ -283,6 +283,7 @@ impl Activation {
             Self::Ramp => Some(F32ActivationKind::Ramp),
             Self::Gelu => Some(F32ActivationKind::Gelu),
             Self::Elu => Some(F32ActivationKind::Elu),
+            Self::Selu => Some(F32ActivationKind::Selu),
             Self::Other(_) => None,
         }
     }
@@ -3406,8 +3407,20 @@ mod tests {
             format!("[net]\nwidth=2\nheight=2\nchannels=1\n[convolutional]\nfilters=1\nsize=1\nactivation={act}\n")
         };
         for ok in [
-            "linear", "leaky", "mish", "swish", "gelu", "elu", "selu", "relie", "plse",
-            "hardtan", "lhtan", "stair", "hard_mish", "revleaky",
+            "linear",
+            "leaky",
+            "mish",
+            "swish",
+            "gelu",
+            "elu",
+            "selu",
+            "relie",
+            "plse",
+            "hardtan",
+            "lhtan",
+            "stair",
+            "hard_mish",
+            "revleaky",
         ] {
             assert!(build(&cfg(ok)).is_ok(), "{ok} must parse");
         }

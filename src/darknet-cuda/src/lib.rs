@@ -27,6 +27,8 @@ pub enum F32ActivationKind {
     Gelu,
     /// Exponential linear unit: `x` for nonnegative x, otherwise `exp(x)-1`.
     Elu,
+    /// Scaled exponential linear unit using Darknet's fixed scale and alpha.
+    Selu,
 }
 
 /// Outputs of [`F32TensorOpsBackend::batchnorm_train_forward_f32`].

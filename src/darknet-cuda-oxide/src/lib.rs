@@ -251,6 +251,7 @@ fn activation_code(kind: F32ActivationKind) -> u32 {
         F32ActivationKind::Ramp => activations::ACT_RAMP,
         F32ActivationKind::Gelu => activations::ACT_GELU,
         F32ActivationKind::Elu => activations::ACT_ELU,
+        F32ActivationKind::Selu => activations::ACT_SELU,
     }
 }
 

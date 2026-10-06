@@ -34,6 +34,13 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- Added an oxide SELU activation kernel and exact derivative, enabling native
+  convolution activation execution. Verified by `oxide_parity` (11 passed,
+  including activation finite differences), `oxide_half` (13 passed, 1 ignored,
+  including f16 bias-activation), all 13 `oxide_cfg_shapes` tests (including
+  153 forward/backward convolution-activation pairs), and all 7 real-device
+  `oxide_runtime_chain` tests. `cargo test -j 4 -p darknet-core --lib` passed
+  (391 tests).
 - Added an oxide ELU activation kernel and exact derivative, enabling native
   convolution activation execution. Verified by `oxide_parity` (11 passed,
   including activation finite differences), `oxide_half` (13 passed, 1 ignored,

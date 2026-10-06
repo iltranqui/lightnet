@@ -329,6 +329,13 @@ fn act_ref(kind: F32ActivationKind, x: f64) -> f64 {
                 x.exp() - 1.0
             }
         }
+        F32ActivationKind::Selu => {
+            if x >= 0.0 {
+                1.0507 * x
+            } else {
+                1.0507 * 1.6732 * (x.exp() - 1.0)
+            }
+        }
     }
 }
 
@@ -614,6 +621,7 @@ fn f16_shortcut_avgpool_affine_reverse_match_f64_reference() {
         F32ActivationKind::Ramp,
         F32ActivationKind::Gelu,
         F32ActivationKind::Elu,
+        F32ActivationKind::Selu,
     ];
     // shortcut: act(a + b), odd length so the launch tail is exercised.
     for act in acts {

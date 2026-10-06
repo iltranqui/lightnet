@@ -142,9 +142,9 @@ Immediately next, in dependency order:
 
 ## Not implemented by design / no scanned cfg needs it
 
-- Activations without oxide kernels: loggy, selu, hard_mish, hardtan, lhtan,
-  plse, stair, and relie (CPU forward and exact derivatives exist). `gelu` and
-  `elu` have oxide kernels; `normalize_channels*` remains a config error.
+- Activations without oxide kernels: loggy, hard_mish, hardtan, lhtan, plse,
+  stair, and relie (CPU forward and exact derivatives exist). `gelu`, `elu`, and
+  `selu` have oxide kernels; `normalize_channels*` remains a config error.
 - xnor (74 layers), share_index (54), `new_coords=1` yolo (path looks wrong),
   antialiasing, conv grad clamps / `try_fix_nan` clamps,
   `rewritten_bbox`/`total_bbox` logging.

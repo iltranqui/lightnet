@@ -109,7 +109,7 @@ fn assert_chain(cfg: &str, seed_layer: usize, what: &str) {
 #[test]
 fn chained_conv_activation_stacks_match_cpu_backward() {
     for act in [
-        "leaky", "relu6", "ramp", "mish", "swish", "logistic", "relu", "elu",
+        "leaky", "relu6", "ramp", "mish", "swish", "logistic", "relu", "elu", "selu",
     ] {
         assert_chain(&conv_stack(act), 2, act);
     }
