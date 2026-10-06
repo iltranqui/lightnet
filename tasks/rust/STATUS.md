@@ -34,10 +34,11 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
-- Added no-BN LSTM device backward: connected projection gradients, recurrent
-  and input-gradient accumulation, and parameter-gradient accumulation use
-  backend ops; gate derivatives, sequence/cache handling, per-step input-gradient
-  transfers, and SGD remain host-side. FakeBackend parity and real-device
+- Added no-BN LSTM device backward: gate derivatives, connected projection
+  gradients, and recurrent/input-gradient accumulation use backend ops. The
+  training path retains BPTT caches on-device rather than downloading projection,
+  gate, and cell caches. Sequence slicing, per-step input-gradient transfers,
+  output assembly, and SGD remain host-side. FakeBackend parity and real-device
   `oxide_runtime_chain::lstm_no_batch_norm_forward_and_device_backward_match_cpu`
   pass, including upstream convolution updates.
 - Added an oxide Stair activation kernel matching Darknet's floor-based
@@ -140,12 +141,14 @@ Latest increments:
 - No-BN RNN and CRNN forward/backward use backend ops: RNN projections and
   CRNN recurrent convolutions, activation gradients, state accumulation, and
   shortcuts. No-BN LSTM forward runs gates/cell products through backend ops,
-  including `vector_mul_f32`; its backward now uses backend connected ops for
-  projection gradients, time-accumulated parameters, and recurrent/input
-  gradient accumulation. Gate derivatives, cached-state/sequence slicing,
-  input-gradient transfers, and host-resident SGD still cross the host;
-  batch-normalized recurrent layers remain on CPU backward. FakeBackend parity
-  and real-device `oxide_runtime_chain::lstm_no_batch_norm_forward_and_device_backward_match_cpu`
+  including `vector_mul_f32`; its backward now uses a backend gate-derivative
+  operation plus connected ops for projection gradients, time-accumulated
+  parameters, and recurrent/input-gradient accumulation. Device training keeps
+  BPTT caches resident instead of downloading projection/gate/cell caches.
+  Sequence slicing, per-step input-gradient transfers, output assembly, and
+  host-resident SGD still cross the host; batch-normalized recurrent layers
+  remain on CPU backward. FakeBackend parity and real-device
+  `oxide_runtime_chain::lstm_no_batch_norm_forward_and_device_backward_match_cpu`
   compare training updates with CPU, including upstream convolution updates.
 - Host Adam now updates standalone batchnorm, local, connected, weighted
   shortcut, MoE router/experts, deconvolutional, GRU/RNN/LSTM/CRNN, and ViT

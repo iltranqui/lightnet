@@ -2331,6 +2331,93 @@ impl F32TensorOpsBackend for OxideBackend {
         Ok(OxideTensorF32::new(out, activation_input.shape()))
     }
 
+    fn lstm_gate_backward_f32(
+        &self,
+        hidden_gradient: &Self::Tensor,
+        cell: &Self::Tensor,
+        previous_cell: &Self::Tensor,
+        forget: &Self::Tensor,
+        input_gate: &Self::Tensor,
+        candidate: &Self::Tensor,
+        output_gate: &Self::Tensor,
+        next_cell_gradient: &Self::Tensor,
+        elements: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<
+        (
+            Self::Tensor,
+            Self::Tensor,
+            Self::Tensor,
+            Self::Tensor,
+            Self::Tensor,
+        ),
+        Self::Error,
+    > {
+        let hidden_gradient = self.f32v(hidden_gradient)?;
+        let cell = self.f32v(cell)?;
+        let previous_cell = self.f32v(previous_cell)?;
+        let forget = self.f32v(forget)?;
+        let input_gate = self.f32v(input_gate)?;
+        let candidate = self.f32v(candidate)?;
+        let output_gate = self.f32v(output_gate)?;
+        let next_cell_gradient = self.f32v(next_cell_gradient)?;
+        let op = "lstm_gate_backward_f32";
+        for input in [
+            &*cell,
+            &*previous_cell,
+            &*forget,
+            &*input_gate,
+            &*candidate,
+            &*output_gate,
+            &*next_cell_gradient,
+        ] {
+            same_len(op, &hidden_gradient, input)?;
+        }
+        if hidden_gradient.len() != elements {
+            return Err(shape_err(
+                op,
+                format!(
+                    "expected {elements} elements, got {}",
+                    hidden_gradient.len()
+                ),
+            ));
+        }
+        let mut forget_gradient = self.alloc_uninit(elements)?;
+        let mut input_gate_gradient = self.alloc_uninit(elements)?;
+        let mut candidate_gradient = self.alloc_uninit(elements)?;
+        let mut output_gate_gradient = self.alloc_uninit(elements)?;
+        let mut cell_gradient = self.alloc_uninit(elements)?;
+        // SAFETY: one thread owns the same element across five disjoint outputs.
+        unsafe {
+            self.layers_extra.lstm_gate_backward(
+                &self.stream,
+                launch::elementwise(elements, config),
+                &hidden_gradient.buf,
+                &cell.buf,
+                &previous_cell.buf,
+                &forget.buf,
+                &input_gate.buf,
+                &candidate.buf,
+                &output_gate.buf,
+                &next_cell_gradient.buf,
+                &mut forget_gradient,
+                &mut input_gate_gradient,
+                &mut candidate_gradient,
+                &mut output_gate_gradient,
+                &mut cell_gradient,
+            )
+        }
+        .map_err(launch_err)?;
+        let shape = hidden_gradient.shape();
+        Ok((
+            OxideTensorF32::new(forget_gradient, shape),
+            OxideTensorF32::new(input_gate_gradient, shape),
+            OxideTensorF32::new(candidate_gradient, shape),
+            OxideTensorF32::new(output_gate_gradient, shape),
+            OxideTensorF32::new(cell_gradient, shape),
+        ))
+    }
+
     fn shortcut_add_f32(
         &self,
         x: &Self::Tensor,

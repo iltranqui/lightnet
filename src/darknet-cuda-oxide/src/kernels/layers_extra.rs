@@ -22,6 +22,52 @@ pub fn dropout_unit(seed: u64, index: u64) -> f32 {
 pub mod kernels {
     use super::*;
 
+    /// Exact LSTM cell/gate derivative for one BPTT step. Each thread owns one
+    /// hidden element and writes all gate deltas plus the cell gradient for the
+    /// preceding step.
+    #[kernel]
+    pub fn lstm_gate_backward(
+        hidden_gradient: &[f32],
+        cell: &[f32],
+        previous_cell: &[f32],
+        forget: &[f32],
+        input_gate: &[f32],
+        candidate: &[f32],
+        output_gate: &[f32],
+        next_cell_gradient: &[f32],
+        mut forget_gradient: DisjointSlice<f32>,
+        mut input_gate_gradient: DisjointSlice<f32>,
+        mut candidate_gradient: DisjointSlice<f32>,
+        mut output_gate_gradient: DisjointSlice<f32>,
+        mut cell_gradient_out: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= hidden_gradient.len() {
+            return;
+        }
+        let tanh_cell = cell[i].tanh();
+        let output_delta = hidden_gradient[i] * tanh_cell;
+        let cell_delta = hidden_gradient[i] * output_gate[i] * (1.0 - tanh_cell * tanh_cell)
+            + next_cell_gradient[i];
+        let mut forget_delta = cell_delta * previous_cell[i];
+        let mut input_delta = cell_delta * candidate[i];
+        let mut candidate_delta = cell_delta * input_gate[i];
+        forget_delta *= forget[i] * (1.0 - forget[i]);
+        input_delta *= input_gate[i] * (1.0 - input_gate[i]);
+        candidate_delta *= 1.0 - candidate[i] * candidate[i];
+        let mut output_delta = output_delta;
+        output_delta *= output_gate[i] * (1.0 - output_gate[i]);
+        // SAFETY: each thread writes the matching element in each output.
+        unsafe {
+            *forget_gradient.as_mut_ptr().add(i) = forget_delta;
+            *input_gate_gradient.as_mut_ptr().add(i) = input_delta;
+            *candidate_gradient.as_mut_ptr().add(i) = candidate_delta;
+            *output_gate_gradient.as_mut_ptr().add(i) = output_delta;
+            *cell_gradient_out.as_mut_ptr().add(i) = cell_delta * forget[i];
+        }
+    }
+
     /// Global-average pool followed by the MoE router's affine projection. One
     /// output thread computes one (sample, expert) logit; spatial reductions
     /// follow the same sequential f32 order as the CPU reference.

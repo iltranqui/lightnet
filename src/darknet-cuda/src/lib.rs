@@ -319,6 +319,82 @@ pub trait F32TensorOpsBackend {
         activation: F32ActivationKind,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error>;
+    /// LSTM gate derivatives for one sequence step. Returns forget/input/
+    /// candidate/output gate gradients and the cell gradient carried to the
+    /// preceding step. The default is a host reference; device backends should
+    /// override it to keep BPTT gate math resident on the accelerator.
+    #[allow(clippy::too_many_arguments)]
+    fn lstm_gate_backward_f32(
+        &self,
+        hidden_gradient: &Self::Tensor,
+        cell: &Self::Tensor,
+        previous_cell: &Self::Tensor,
+        forget: &Self::Tensor,
+        input_gate: &Self::Tensor,
+        candidate: &Self::Tensor,
+        output_gate: &Self::Tensor,
+        next_cell_gradient: &Self::Tensor,
+        elements: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<
+        (
+            Self::Tensor,
+            Self::Tensor,
+            Self::Tensor,
+            Self::Tensor,
+            Self::Tensor,
+        ),
+        Self::Error,
+    > {
+        let _ = config;
+        let hidden_gradient = self.download_f32(hidden_gradient)?;
+        let cell = self.download_f32(cell)?;
+        let previous_cell = self.download_f32(previous_cell)?;
+        let forget = self.download_f32(forget)?;
+        let input_gate = self.download_f32(input_gate)?;
+        let candidate = self.download_f32(candidate)?;
+        let output_gate = self.download_f32(output_gate)?;
+        let next_cell_gradient = self.download_f32(next_cell_gradient)?;
+        for values in [
+            &hidden_gradient,
+            &cell,
+            &previous_cell,
+            &forget,
+            &input_gate,
+            &candidate,
+            &output_gate,
+            &next_cell_gradient,
+        ] {
+            assert_eq!(values.len(), elements, "LSTM gate backward tensor size");
+        }
+        let mut forget_gradient = vec![0.0; elements];
+        let mut input_gate_gradient = vec![0.0; elements];
+        let mut candidate_gradient = vec![0.0; elements];
+        let mut output_gate_gradient = vec![0.0; elements];
+        let mut cell_gradient = vec![0.0; elements];
+        for index in 0..elements {
+            let tanh_cell = cell[index].tanh();
+            output_gate_gradient[index] = hidden_gradient[index] * tanh_cell;
+            cell_gradient[index] =
+                hidden_gradient[index] * output_gate[index] * (1.0 - tanh_cell * tanh_cell)
+                    + next_cell_gradient[index];
+            forget_gradient[index] = cell_gradient[index] * previous_cell[index];
+            input_gate_gradient[index] = cell_gradient[index] * candidate[index];
+            candidate_gradient[index] = cell_gradient[index] * input_gate[index];
+            forget_gradient[index] *= forget[index] * (1.0 - forget[index]);
+            input_gate_gradient[index] *= input_gate[index] * (1.0 - input_gate[index]);
+            candidate_gradient[index] *= 1.0 - candidate[index] * candidate[index];
+            output_gate_gradient[index] *= output_gate[index] * (1.0 - output_gate[index]);
+            cell_gradient[index] *= forget[index];
+        }
+        Ok((
+            self.upload_f32(&[elements], &forget_gradient)?,
+            self.upload_f32(&[elements], &input_gate_gradient)?,
+            self.upload_f32(&[elements], &candidate_gradient)?,
+            self.upload_f32(&[elements], &output_gate_gradient)?,
+            self.upload_f32(&[elements], &cell_gradient)?,
+        ))
+    }
     fn shortcut_add_f32(
         &self,
         x: &Self::Tensor,
