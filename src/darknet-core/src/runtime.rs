@@ -1089,6 +1089,7 @@ impl ExecutableNetwork {
                     | LayerKind::Shortcut(crate::model::ShortcutSpec { weights_type: crate::model::ShortcutWeightsType::None, .. })
                     | LayerKind::Upsample(_)
                     | LayerKind::Yolo(_)
+                    | LayerKind::ObbYolo(_)
                     | LayerKind::GaussianYolo(_)
                     | LayerKind::Region(_)
                     | LayerKind::Detection(_)
@@ -1210,6 +1211,7 @@ impl ExecutableNetwork {
                     forward_softmax(current_input.expect("softmax input"), *groups)?
                 }
                 (LayerKind::Yolo(_), LayerParams::None)
+                | (LayerKind::ObbYolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
                 | (LayerKind::Region(_), LayerParams::None)
                 | (LayerKind::Detection(_), LayerParams::None)
@@ -1605,6 +1607,7 @@ impl ExecutableNetwork {
                 // work happens in the delta it derives from the input.
                 (LayerKind::Contrastive(_), LayerParams::None) => (current_input.clone(), None),
                 (LayerKind::Yolo(_), LayerParams::None)
+                | (LayerKind::ObbYolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
                 | (LayerKind::Region(_), LayerParams::None)
                 | (LayerKind::Detection(_), LayerParams::None)
@@ -1713,7 +1716,10 @@ impl ExecutableNetwork {
                 output
             };
 
-            if matches!(layer.kind, LayerKind::Yolo(_) | LayerKind::GaussianYolo(_)) {
+            if matches!(
+                layer.kind,
+                LayerKind::Yolo(_) | LayerKind::ObbYolo(_) | LayerKind::GaussianYolo(_)
+            ) {
                 yolo_heads.push(YoloHeadOutput {
                     layer_index: layer.index,
                     output: output.clone(),
@@ -2618,6 +2624,7 @@ impl ExecutableNetwork {
                     accumulate_tensor(&mut layer_output_gradients[source_index], &source_grad)?;
                 }
                 (LayerKind::Yolo(_), LayerParams::None)
+                | (LayerKind::ObbYolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
                 | (LayerKind::Region(_), LayerParams::None)
                 | (LayerKind::Detection(_), LayerParams::None)
@@ -3772,6 +3779,7 @@ where
                 | LayerKind::Route(_)
                 | LayerKind::Upsample(_)
                 | LayerKind::Yolo(_)
+                | LayerKind::ObbYolo(_)
                 | LayerKind::GaussianYolo(_) => {}
                 LayerKind::Shortcut(spec) => {
                     if spec.from.is_empty() {
@@ -4071,6 +4079,7 @@ where
                     )
                     .map_err(|err| backend_error("f16 upsample", err))?,
                 (LayerKind::Yolo(_), LayerParams::None)
+                | (LayerKind::ObbYolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None) => current_input
                     .expect("staging layer requires current input")
                     .clone(),
@@ -4084,8 +4093,10 @@ where
             };
 
             let should_download_final = layer.index + 1 == self.network.layers.len();
-            let should_collect_yolo =
-                matches!(layer.kind, LayerKind::Yolo(_) | LayerKind::GaussianYolo(_));
+            let should_collect_yolo = matches!(
+                layer.kind,
+                LayerKind::Yolo(_) | LayerKind::ObbYolo(_) | LayerKind::GaussianYolo(_)
+            );
             // The modern anchor-free heads need the same host round trip so
             // `detect.rs` can decode them.
             let should_collect_modern = is_modern_head(&layer.kind);
@@ -6952,6 +6963,7 @@ where
                 // `[omd_loss]` is a pure pass-through on the forward, exactly as
                 // in C++ (`memcpy(l.output, state.input, ...)`).
                 (LayerKind::Yolo(_), LayerParams::None)
+                | (LayerKind::ObbYolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
                 | (LayerKind::Region(_), LayerParams::None)
                 | (LayerKind::Detection(_), LayerParams::None)
@@ -7677,7 +7689,10 @@ where
             } else {
                 output_gpu
             };
-            let is_yolo = matches!(layer.kind, LayerKind::Yolo(_) | LayerKind::GaussianYolo(_));
+            let is_yolo = matches!(
+                layer.kind,
+                LayerKind::Yolo(_) | LayerKind::ObbYolo(_) | LayerKind::GaussianYolo(_)
+            );
             let (output, activation_input) = if host_copies || is_yolo {
                 let output = self
                     .download_tensor(&output_gpu, layer.output_shape)
@@ -7700,7 +7715,7 @@ where
                 )
             };
 
-            if matches!(layer.kind, LayerKind::Yolo(_) | LayerKind::GaussianYolo(_)) {
+            if is_yolo {
                 yolo_heads.push(YoloHeadOutput {
                     layer_index: layer.index,
                     output: output.clone(),
@@ -8198,6 +8213,7 @@ where
                     )
                     .map_err(|err| backend_error("upsample", err))?,
                 (LayerKind::Yolo(_), LayerParams::None)
+                | (LayerKind::ObbYolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
                 | (LayerKind::Region(_), LayerParams::None)
                 | (LayerKind::Detection(_), LayerParams::None)
@@ -8231,8 +8247,10 @@ where
             };
 
             let should_download_final = layer.index + 1 == self.network.layers.len();
-            let should_collect_yolo =
-                matches!(layer.kind, LayerKind::Yolo(_) | LayerKind::GaussianYolo(_));
+            let should_collect_yolo = matches!(
+                layer.kind,
+                LayerKind::Yolo(_) | LayerKind::ObbYolo(_) | LayerKind::GaussianYolo(_)
+            );
             // The modern anchor-free heads need the same host round trip so
             // `detect.rs` can decode them.
             let should_collect_modern = is_modern_head(&layer.kind);
@@ -10110,6 +10128,7 @@ where
                     )?;
                 }
                 (LayerKind::Yolo(_), Some(LayerParams::None))
+                | (LayerKind::ObbYolo(_), Some(LayerParams::None))
                 | (LayerKind::GaussianYolo(_), Some(LayerParams::None))
                 | (LayerKind::Region(_), Some(LayerParams::None))
                 | (LayerKind::Detection(_), Some(LayerParams::None))
@@ -23523,6 +23542,7 @@ mod tests {
             time_steps: 1,
             label_smooth_eps: 0.0,
             adversarial: false,
+            obb: false,
             subdivisions: 1,
             learning_rate: 0.01,
             learning_rate_min: 0.00001,
@@ -25321,6 +25341,7 @@ mod tests {
                             | LayerKind::Shortcut(_)
                             | LayerKind::Upsample(_)
                             | LayerKind::Yolo(_)
+                            | LayerKind::ObbYolo(_)
                             | LayerKind::GaussianYolo(_)
                             | LayerKind::Region(_)
                             | LayerKind::Detection(_)

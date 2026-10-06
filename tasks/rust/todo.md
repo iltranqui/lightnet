@@ -234,9 +234,11 @@ Immediately next, in dependency order:
   v78 adds standalone legacy `[obb_yolo]` six-coordinate per-head decoding with
   source-derived front-point and integer-letterbox transforms; v79 adds a
   standalone five/seven-field OBB label parser preserving the optional front
-  point; v80 adds source-derived label bounds and rotation. Cfg/runtime head
-  integration, image/batch augmentation, truth assignment/losses, NMS-kind
-  wiring, and mAP remain open.
+  point; v80 adds source-derived label bounds and rotation; v81 adds
+  `[net] obb=1` and `[obb_yolo]` parsing, runtime head capture, network-level
+  multi-head OBB decode/NMS, and explicit AABB-training/mAP rejection.
+  Image/batch augmentation, OBB truth assignment/losses, NMS-kind cfg wiring,
+  and OBB mAP implementation remain open.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and
   kernels, weights order `weights.cpp:428`); then `deform_conv`, `dsconv`,
   `graph_conv`, `wmhf`, `clifford`, `recursive_block`.

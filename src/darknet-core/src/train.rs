@@ -196,6 +196,17 @@ pub fn compute_yolo_training_loss_with_state(
     iteration: usize,
     state: Option<&mut YoloTrainingState>,
 ) -> Result<YoloTrainingLoss> {
+    if network.net.obb
+        || network
+            .layers
+            .iter()
+            .any(|layer| matches!(layer.kind, LayerKind::ObbYolo(_)))
+    {
+        return Err(Error::InvalidConfig(
+            "OBB YOLO training loss is not implemented; refusing axis-aligned YOLO assignment"
+                .to_owned(),
+        ));
+    }
     let mut seeds = vec![None; network.layers.len()];
     let batch_size = network.net.batch.max(1);
     if labels.len() != batch_size {
@@ -1902,6 +1913,42 @@ mod tests {
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(name)
+    }
+
+    #[test]
+    fn refuses_axis_aligned_training_loss_for_obb_networks() {
+        let cfg = ConfigFile::parse_str(
+            "obb-train.cfg",
+            "[net]\nwidth=1\nheight=1\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\n",
+        )
+        .expect("cfg parses");
+        let network = Network::from_config(cfg).expect("OBB network builds");
+        let executable = ExecutableNetwork::new(network.clone());
+        let input = Tensor::from_data(network.net.input_shape(), vec![0.0; 8]).expect("input");
+        let forward = executable.forward(&input).expect("forward");
+        let error = compute_yolo_training_loss(&network, &forward, &[Vec::new()])
+            .expect_err("OBB must not be assigned with AABB YOLO loss");
+        assert!(
+            error
+                .to_string()
+                .contains("OBB YOLO training loss is not implemented")
+        );
+
+        let hybrid = Network::from_config(
+            ConfigFile::parse_str(
+                "obb-hybrid-train.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=6\nobb=1\n[yolo]\nallow_obb_truth=1\nclasses=1\nnum=1\nanchors=1,1\n",
+            )
+            .expect("hybrid cfg parses"),
+        )
+        .expect("hybrid cfg builds");
+        let executable = ExecutableNetwork::new(hybrid.clone());
+        let input = Tensor::from_data(hybrid.net.input_shape(), vec![0.0; 6]).expect("input");
+        let forward = executable.forward(&input).expect("forward");
+        assert!(
+            compute_yolo_training_loss(&hybrid, &forward, &[Vec::new()]).is_err(),
+            "allow_obb_truth must not enable the unsupported AABB loss path"
+        );
     }
 
     #[test]

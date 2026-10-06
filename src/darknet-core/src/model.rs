@@ -88,6 +88,8 @@ pub struct NetConfig {
     /// C++ `parms.adversarial`: `[contrastive]` then labels images `b % 2`
     /// instead of `b / 2`.
     pub adversarial: bool,
+    /// C++ `[net] obb=1`: opts the graph into oriented-box detection heads.
+    pub obb: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -173,6 +175,13 @@ impl NetConfig {
         let batch = section.get_usize("batch", 1)? / subdivisions * time_steps;
         let max_batches = section.get_usize("max_batches", 0)?;
         let adam = section.get_usize("adam", 0)? != 0;
+        let obb = section.get_i64("obb", 0)?;
+        if !(0..=1).contains(&obb) {
+            return Err(Error::InvalidConfig(format!(
+                "invalid obb={obb} in [net] on line {}; expected 0 or 1",
+                section.line
+            )));
+        }
 
         Ok(Self {
             width,
@@ -209,6 +218,7 @@ impl NetConfig {
             try_fix_nan: section.get_usize("try_fix_nan", 0)? != 0,
             label_smooth_eps: section.get_f32("label_smooth_eps", 0.0)?,
             adversarial: section.get_usize("adversarial", 0)? != 0,
+            obb: obb != 0,
         })
     }
 
@@ -1010,6 +1020,9 @@ pub enum LayerKind {
     Shortcut(ShortcutSpec),
     Upsample(UpsampleSpec),
     Yolo(YoloSpec),
+    /// Legacy six-coordinate `[obb_yolo]`; inference is decoded separately
+    /// from axis-aligned YOLO and training remains unsupported.
+    ObbYolo(YoloSpec),
     GaussianYolo(YoloSpec),
     Region(RegionSpec),
     Reorg(ReorgSpec),
@@ -1081,6 +1094,7 @@ impl LayerKind {
             Self::Shortcut(_) => "shortcut",
             Self::Upsample(_) => "upsample",
             Self::Yolo(_) => "yolo",
+            Self::ObbYolo(_) => "obb_yolo",
             Self::GaussianYolo(_) => "gaussian_yolo",
             Self::Region(_) => "region",
             Self::Reorg(_) => "reorg",
@@ -1669,6 +1683,7 @@ impl Network {
                 &layers,
                 &cfg_parent,
                 net.time_steps,
+                net.obb,
             )?;
             if let Some(activation) = kind.activation()
                 && let Activation::Other(name) = activation
@@ -1793,6 +1808,7 @@ fn parse_layer_kind(
     built_layers: &[Layer],
     cfg_parent: &Path,
     time_steps: usize,
+    net_obb: bool,
 ) -> Result<LayerKind> {
     let name = section.name.as_str();
     Ok(match name {
@@ -2048,6 +2064,24 @@ fn parse_layer_kind(
             })
         }
         "yolo" => {
+            if net_obb && section.get_i64("allow_obb_truth", 0)? == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[yolo] at line {} is incompatible with [net] obb=1; use [obb_yolo]",
+                    section.line
+                )));
+            }
+            if section.get_i64("obb", 0)? != 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[yolo] at line {} is axis-aligned and requires obb=0; use [obb_yolo]",
+                    section.line
+                )));
+            }
+            if section.get_usize("coords", 4)? != 4 {
+                return Err(Error::InvalidConfig(format!(
+                    "[yolo] at line {} requires coords=4; use [obb_yolo] for oriented boxes",
+                    section.line
+                )));
+            }
             let mask = section.get_usize_list("mask")?;
             let classes = section.get_usize("classes", 20)?;
             let max_delta = section.get_f32("max_delta", f32::MAX)?;
@@ -2073,6 +2107,101 @@ fn parse_layer_kind(
                 delta_normalizer: section.get_f32("delta_normalizer", 1.0)?,
                 class_multipliers: parse_class_multipliers(section, classes, max_delta)?,
                 class_map: parse_class_map(section, cfg_parent)?,
+            })
+        }
+        "obb_yolo" => {
+            if !net_obb {
+                return Err(Error::InvalidConfig(format!(
+                    "[obb_yolo] at line {} requires obb=1 in [net]",
+                    section.line
+                )));
+            }
+            if section.get_i64("obb", 1)? != 1 {
+                return Err(Error::InvalidConfig(format!(
+                    "[obb_yolo] at line {} requires obb=1 or an omitted obb key",
+                    section.line
+                )));
+            }
+            if section.get_usize("coords", 6)? != 6 {
+                return Err(Error::InvalidConfig(format!(
+                    "[obb_yolo] at line {} requires coords=6",
+                    section.line
+                )));
+            }
+            let line = section.line;
+            let classes = section.get_usize("classes", 20)?;
+            let total = section.get_usize("num", 1)?;
+            let max_boxes = section.get_usize("max", 200)?;
+            let mut mask = section.get_usize_list("mask")?;
+            if total == 0 || classes == 0 || max_boxes == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[obb_yolo] at line {line}: num, classes, and max must be > 0"
+                )));
+            }
+            if mask.is_empty() {
+                mask.extend(0..total);
+            }
+            if mask.iter().any(|&index| index >= total) {
+                return Err(Error::InvalidConfig(format!(
+                    "[obb_yolo] at line {line}: mask indices must be less than num={total}"
+                )));
+            }
+            let anchors = section.get_f32_list("anchors")?;
+            let required_anchors = total.checked_mul(2).ok_or_else(|| {
+                Error::InvalidConfig(format!("[obb_yolo] at line {line}: anchor count overflows"))
+            })?;
+            if anchors.len() < required_anchors
+                || anchors[..required_anchors]
+                    .iter()
+                    .any(|&anchor| !anchor.is_finite() || anchor <= 0.0)
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "[obb_yolo] at line {line}: anchors must contain {total} positive finite width/height pairs"
+                )));
+            }
+            let entries = classes.checked_add(7).ok_or_else(|| {
+                Error::InvalidConfig(format!("[obb_yolo] at line {line}: entry count overflows"))
+            })?;
+            let channels = mask.len().checked_mul(entries).ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "[obb_yolo] at line {line}: output channels overflow"
+                ))
+            })?;
+            if current.channels != channels {
+                return Err(Error::InvalidConfig(format!(
+                    "[obb_yolo] at line {line}: preceding layer has {} channels; expected {channels} for {} anchors and {classes} classes",
+                    current.channels,
+                    mask.len()
+                )));
+            }
+            let scale_x_y = section.get_f32("scale_x_y", 1.0)?;
+            if !scale_x_y.is_finite() {
+                return Err(Error::InvalidConfig(format!(
+                    "[obb_yolo] at line {line}: scale_x_y must be finite"
+                )));
+            }
+            LayerKind::ObbYolo(YoloSpec {
+                classes,
+                num: total,
+                mask,
+                anchors,
+                scale_x_y,
+                new_coords: section.get_i64("new_coords", 0)? != 0,
+                cls_normalizer: section.get_f32("cls_normalizer", 1.0)?,
+                obj_normalizer: section.get_f32("obj_normalizer", 1.0)?,
+                iou_normalizer: section.get_f32("iou_normalizer", 0.75)?,
+                ignore_thresh: section.get_f32("ignore_thresh", 0.5)?,
+                truth_thresh: section.get_f32("truth_thresh", 1.0)?,
+                iou_thresh: section.get_f32("iou_thresh", 1.0)?,
+                iou_loss: YoloIouLoss::Mse,
+                iou_thresh_kind: YoloIouLoss::Iou,
+                focal_loss: section.get_i64("focal_loss", 0)? != 0,
+                label_smooth_eps: section.get_f32("label_smooth_eps", 0.0)?,
+                objectness_smooth: section.get_i64("objectness_smooth", 0)? != 0,
+                max_delta: section.get_f32("max_delta", f32::MAX)?,
+                delta_normalizer: section.get_f32("delta_normalizer", 1.0)?,
+                class_multipliers: None,
+                class_map: None,
             })
         }
         "gaussian_yolo" => {
@@ -2946,7 +3075,10 @@ fn infer_output_shape(
                 ))
             }
         }
-        LayerKind::Yolo(_) | LayerKind::GaussianYolo(_) | LayerKind::Region(_) => Ok(current),
+        LayerKind::Yolo(_)
+        | LayerKind::ObbYolo(_)
+        | LayerKind::GaussianYolo(_)
+        | LayerKind::Region(_) => Ok(current),
         LayerKind::Reorg(spec) => {
             if spec.reverse {
                 Ok(TensorShape::new(
@@ -4151,6 +4283,59 @@ mod tests {
              [eml_convolutional]\nfilters=3\nsize=1\ngroups=2\nresidual=0\n",
         );
         assert!(invalid_groups.is_err(), "groups must divide filters");
+    }
+
+    #[test]
+    fn parses_obb_yolo_for_inference_with_source_shape_checks() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "obb.cfg",
+                "[net]\nwidth=4\nheight=2\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\n",
+            )
+            .expect("cfg parses"),
+        )
+        .expect("valid OBB cfg builds");
+        assert!(network.net.obb);
+        assert_eq!(network.layers[0].kind.name(), "obb_yolo");
+        let LayerKind::ObbYolo(spec) = &network.layers[0].kind else {
+            panic!("expected OBB YOLO layer");
+        };
+        assert_eq!(spec.classes, 1);
+        assert_eq!(spec.num, 1);
+        assert_eq!(spec.mask, vec![0]);
+        assert_eq!(spec.anchors, vec![4.0, 2.0]);
+        assert_eq!(network.layers[0].output_shape.channels, 8);
+
+        for cfg in [
+            "[net]\nwidth=4\nheight=2\nchannels=8\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\n",
+            "[net]\nwidth=4\nheight=2\nchannels=8\nobb=1\n[obb_yolo]\ncoords=5\nclasses=1\nnum=1\nanchors=4,2\n",
+            "[net]\nwidth=4\nheight=2\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nmask=1\nanchors=4,2\n",
+            "[net]\nwidth=4\nheight=2\nchannels=7\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\n",
+        ] {
+            assert!(
+                Network::from_config(
+                    ConfigFile::parse_str("bad-obb.cfg", cfg).expect("cfg parses")
+                )
+                .is_err(),
+                "invalid OBB cfg should fail: {cfg}"
+            );
+        }
+    }
+
+    #[test]
+    fn net_obb_flag_is_binary_and_rejects_axis_aligned_yolo() {
+        for cfg in [
+            "[net]\nwidth=1\nheight=1\nchannels=1\nobb=2\n",
+            "[net]\nwidth=1\nheight=1\nchannels=1\nobb=1\n[yolo]\nclasses=1\n",
+        ] {
+            assert!(
+                Network::from_config(
+                    ConfigFile::parse_str("bad-net-obb.cfg", cfg).expect("cfg parses")
+                )
+                .is_err(),
+                "invalid OBB opt-in should fail: {cfg}"
+            );
+        }
     }
 
     #[test]

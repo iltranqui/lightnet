@@ -94,6 +94,12 @@ pub fn decode_yolo_detections(
         })?;
         let spec = match &layer.kind {
             LayerKind::Yolo(spec) | LayerKind::GaussianYolo(spec) => spec,
+            LayerKind::ObbYolo(_) => {
+                return Err(Error::InvalidConfig(format!(
+                    "layer #{} is an OBB head; use decode_obb_yolo_detections",
+                    head.layer_index
+                )));
+            }
             _ => {
                 return Err(Error::InvalidConfig(format!(
                     "layer #{} is not a YOLO head",
@@ -117,6 +123,61 @@ pub fn decode_yolo_detections(
 
     apply_nms(&mut detections, options.nms_threshold);
     detections.sort_by(|lhs, rhs| rhs.confidence.total_cmp(&lhs.confidence));
+    Ok(detections)
+}
+
+/// Decode and merge the network's legacy `[obb_yolo]` heads, then run
+/// orientation-aware NMS once across all heads. This API currently supports
+/// batch size one; OBB training and mAP are separate, unimplemented paths.
+pub fn decode_obb_yolo_detections(
+    network: &Network,
+    obb_heads: &[YoloHeadOutput],
+    image_width: usize,
+    image_height: usize,
+    options: DetectionOptions,
+) -> Result<Vec<ObbDetection>> {
+    let mut detections = Vec::new();
+    for head in obb_heads {
+        let layer = network.layers.get(head.layer_index).ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "missing layer #{} for OBB YOLO head",
+                head.layer_index
+            ))
+        })?;
+        let spec = match &layer.kind {
+            LayerKind::ObbYolo(spec) => spec,
+            _ => {
+                return Err(Error::InvalidConfig(format!(
+                    "layer #{} is not an OBB YOLO head",
+                    head.layer_index
+                )));
+            }
+        };
+        if head.output.shape.batch != 1 {
+            return Err(Error::InvalidConfig(format!(
+                "OBB YOLO decode currently requires batch size one, got {}",
+                head.output.shape.batch
+            )));
+        }
+        detections.extend(decode_obb_yolo_head(
+            &head.output.data,
+            head.output.shape.width,
+            head.output.shape.height,
+            spec,
+            network.net.width,
+            network.net.height,
+            image_width,
+            image_height,
+            options,
+        )?);
+    }
+
+    apply_obb_nms(&mut detections, options.nms_threshold);
+    detections.sort_by(|lhs, rhs| {
+        rhs.detection
+            .confidence
+            .total_cmp(&lhs.detection.confidence)
+    });
     Ok(detections)
 }
 
@@ -1319,6 +1380,66 @@ mod obb_postprocess_tests {
         let mut positive = vec![active, duplicate];
         apply_obb_nms(&mut positive, 0.0);
         assert_eq!(positive.len(), 1, "positive overlap exceeds zero threshold");
+    }
+}
+
+#[cfg(test)]
+mod obb_network_decode_tests {
+    use crate::cfg::ConfigFile;
+    use crate::model::Network;
+    use crate::runtime::{ExecutableNetwork, Tensor};
+
+    use super::{
+        DetectionOptions, ObbDetectionGeometry, decode_obb_yolo_detections, decode_yolo_detections,
+    };
+
+    #[test]
+    fn network_heads_merge_before_orientation_aware_nms() {
+        let cfg = ConfigFile::parse_str(
+            "obb-detect.cfg",
+            "[net]\nwidth=4\nheight=2\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\n",
+        )
+        .expect("cfg parses");
+        let network = Network::from_config(cfg).expect("OBB network builds");
+        let executable = ExecutableNetwork::new(network.clone());
+        let stride = network.net.width * network.net.height;
+        let mut data = vec![0.0; network.net.channels * stride];
+        data[4 * stride] = 0.25; // Raw linear front-point x offset.
+        data[6 * stride] = 2.0; // Objectness logit.
+        data[7 * stride] = 2.0; // Class logit.
+        let input = Tensor::from_data(network.net.input_shape(), data).expect("input tensor");
+        let forward = executable.forward(&input).expect("forward pass");
+        assert_eq!(forward.yolo_heads.len(), 2);
+
+        let detections = decode_obb_yolo_detections(
+            &network,
+            &forward.yolo_heads,
+            4,
+            2,
+            DetectionOptions::default(),
+        )
+        .expect("OBB heads decode");
+        assert_eq!(detections.len(), 1, "duplicate heads should be suppressed");
+        assert!((detections[0].detection.bbox.x - 0.5).abs() < 1e-6);
+        assert!((detections[0].detection.bbox.y - 0.5).abs() < 1e-6);
+        assert!((detections[0].detection.bbox.w - 4.0).abs() < 1e-6);
+        assert!((detections[0].detection.bbox.h - 2.0).abs() < 1e-6);
+        assert!(matches!(
+            detections[0].geometry,
+            ObbDetectionGeometry::FrontPoint { x, y }
+                if (x - 0.25).abs() < 1e-6 && y.abs() < 1e-6
+        ));
+        assert!(
+            decode_yolo_detections(
+                &network,
+                &forward.yolo_heads,
+                4,
+                2,
+                DetectionOptions::default(),
+            )
+            .is_err(),
+            "OBB heads must not enter axis-aligned decode"
+        );
     }
 }
 

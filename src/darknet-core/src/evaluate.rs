@@ -55,6 +55,16 @@ pub struct ValidationDataset {
 }
 impl ValidationDataset {
     pub fn from_data(network: &Network, data: &DataConfig) -> Result<Self> {
+        if network.net.obb
+            || network
+                .layers
+                .iter()
+                .any(|layer| matches!(layer.kind, LayerKind::ObbYolo(_)))
+        {
+            return Err(invalid(
+                "OBB mAP is not implemented; refusing axis-aligned evaluation",
+            ));
+        }
         let heads: Vec<_> = network
             .layers
             .iter()
@@ -290,6 +300,41 @@ mod tests {
             },
         }
     }
+    #[test]
+    fn obb_networks_are_not_silently_evaluated_with_aabb_map() {
+        let network = Network::from_config(
+            crate::cfg::ConfigFile::parse_str(
+                "obb-map.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\n",
+            )
+            .expect("cfg parses"),
+        )
+        .expect("network builds");
+        let data = crate::DataConfig {
+            source: PathBuf::new(),
+            classes: Some(1),
+            train: None,
+            valid: None,
+            names: None,
+            backup: None,
+            options: Default::default(),
+        };
+        let error = ValidationDataset::from_data(&network, &data)
+            .err()
+            .expect("OBB mAP must not fall through to AABB evaluation");
+        assert!(error.to_string().contains("OBB mAP is not implemented"));
+
+        let hybrid = Network::from_config(
+            crate::cfg::ConfigFile::parse_str(
+                "obb-hybrid-map.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=6\nobb=1\n[yolo]\nallow_obb_truth=1\nclasses=1\nnum=1\nanchors=1,1\n",
+            )
+            .expect("cfg parses"),
+        )
+        .expect("hybrid network builds");
+        assert!(ValidationDataset::from_data(&hybrid, &data).is_err());
+    }
+
     #[test]
     fn ap_precision_envelope_duplicates_background_and_missing_classes() {
         // FP then TP then duplicate then another TP: AP=.5*.5+.5*.5=.5.

@@ -34,6 +34,14 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v81: wired `[net] obb=1` and `[obb_yolo]` cfg parsing into a typed
+  six-coordinate head with filter/mask/anchor validation; CPU/runtime head
+  collection feeds a network-level multi-head decoder and orientation-aware
+  NMS. AABB YOLO training and mAP explicitly reject OBB networks rather than
+  silently using axis-aligned semantics. The focused OBB host suite passed
+  26/26, and all 449 `darknet-core` unit tests passed. Batch
+  loading/augmentation, OBB truth assignment/loss, NMS-kind config wiring, and
+  mAP remain open; no compiled-C++ golden/parity claim.
 - v80: extended `ObbLabel` with source-clamped AABB bounds and added a
   source-derived normalized-center label rotation utility. Explicit front points
   rotate oriented rectangle corners while preserving OBB sizes; missing or
@@ -54,9 +62,9 @@ Latest increments:
   points; OBB NMS is deliberately separate. The focused
   `MEM=3G PKGS=darknet-core ./tools/test_host.sh obb` suite passed 12/12,
   covering logistic and `new_coords` decode, letterbox correction, integer
-  resize rounding, malformed shapes, geometry, and NMS. This remains a standalone
-  primitive with no cfg/runtime integration; no compiled-C++ golden or parity
-  claim is available.
+  resize rounding, malformed shapes, geometry, and NMS. At the v78 point this
+  remained a standalone primitive; cfg/runtime integration was added in v81.
+  No compiled-C++ golden or parity claim is available.
 - v77: added an OBB detection wrapper/geometry enum, CARPN-vs-front-point IoU
   dispatch, and classwise greedy OBB NMS with descending per-class confidence,
   exact-zero skip behavior, and strict `IoU > threshold`. The focused
