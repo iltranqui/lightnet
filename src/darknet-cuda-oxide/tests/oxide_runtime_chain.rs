@@ -352,7 +352,7 @@ fn chained_mismatched_shortcuts_match_cpu_backward() {
 }
 
 #[test]
-fn rnn_recurrent_projections_run_on_oxide_and_match_cpu_forward() {
+fn rnn_recurrent_projections_and_training_backward_match_cpu() {
     let net = network(
         "[net]\ninputs=2\nbatch=2\ntime_steps=2\n\
          [rnn]\nhidden=3\noutput=2\nactivation=tanh\nlogistic=1\nshortcut=1\n",
@@ -388,9 +388,78 @@ fn rnn_recurrent_projections_run_on_oxide_and_match_cpu_forward() {
     close(
         "RNN output",
         &cpu_forward.final_output().expect("CPU output").data,
-        &gpu_forward.cpu_forward.final_output().expect("Oxide output").data,
+        &gpu_forward
+            .cpu_forward
+            .final_output()
+            .expect("Oxide output")
+            .data,
         2e-4,
     );
+
+    cpu.zero_train_buffers();
+    gpu.init_train_buffers_gpu().expect("RNN train buffers");
+    gpu.zero_train_buffers_gpu()
+        .expect("clear RNN train buffers");
+    let cpu_training = cpu
+        .forward_training(&input)
+        .expect("CPU RNN training forward");
+    let gpu_training = gpu
+        .forward_training_device(&input)
+        .expect("Oxide RNN training forward");
+    let output_shape = cpu.network.layers[0].output_shape;
+    let seed = Tensor::from_data(
+        output_shape,
+        (0..output_shape.batch * output_shape.element_count())
+            .map(|i| (i as f32 * 0.41).cos() * 0.7)
+            .collect(),
+    )
+    .expect("RNN output gradient");
+    cpu.backward_accumulate_seeded(&input, &cpu_training, &[Some(seed.clone())])
+        .expect("CPU RNN backward");
+    gpu.backward_accumulate_seeded_gpu(&gpu_training, &[Some(seed)])
+        .expect("Oxide RNN backward");
+    cpu.update_weights(0.05, 0.0, 0.0, 2);
+    gpu.update_weights_gpu(0.05, 0.0, 0.0, 2)
+        .expect("Oxide RNN SGD step");
+    let (LayerParams::Rnn(cpu_params), LayerParams::Rnn(gpu_params)) =
+        (&cpu.params[0], &gpu.params[0])
+    else {
+        panic!("expected RNN parameters after training");
+    };
+    for (name, cpu_values, gpu_values) in [
+        (
+            "input weights",
+            &cpu_params.input.weights,
+            &gpu_params.input.weights,
+        ),
+        (
+            "input biases",
+            &cpu_params.input.biases,
+            &gpu_params.input.biases,
+        ),
+        (
+            "self weights",
+            &cpu_params.self_params.weights,
+            &gpu_params.self_params.weights,
+        ),
+        (
+            "self biases",
+            &cpu_params.self_params.biases,
+            &gpu_params.self_params.biases,
+        ),
+        (
+            "output weights",
+            &cpu_params.output.weights,
+            &gpu_params.output.weights,
+        ),
+        (
+            "output biases",
+            &cpu_params.output.biases,
+            &gpu_params.output.biases,
+        ),
+    ] {
+        close(&format!("RNN {name}"), cpu_values, gpu_values, 4e-4);
+    }
 }
 
 #[test]

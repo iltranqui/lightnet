@@ -122,12 +122,13 @@ Latest increments:
   forward/backward/update suite passes (8/8). Device-native backward remains.
 - Overlapping-window maxpool backward, including `maxpool_zero_nonmax`, now
   matches central finite differences.
-- No-BN RNN inference now computes input/recurrent/output projections, activations,
-  state sums, and optional shortcut on the backend. CPU recurrent caches remain
-  for backward; batchnorm RNN, LSTM/CRNN, and recurrent training still use CPU.
-  FakeBackend parity passes and `oxide_runtime_chain` covers real-device output
-  parity (`rnn_recurrent_projections_run_on_oxide_and_match_cpu_forward`); the
-  full runtime-chain suite now passes 8/8.
+- No-BN RNN forward and backward now use backend projections, activation
+  gradients, connected-backward, and state/shortcut gradient ops. Sequence
+  slicing, cached activations/states, parameter-gradient accumulation, and
+  host-resident SGD still cross the host; batchnorm RNN, LSTM/CRNN remain on the
+  CPU fallback. FakeBackend RNN tests pass; the real-device
+  `rnn_recurrent_projections_and_training_backward_match_cpu` test compares
+  training updates with CPU. `oxide_runtime_chain` passes 8/8.
 - Host Adam now updates standalone batchnorm, local, connected, weighted
   shortcut, MoE router/experts, deconvolutional, GRU/RNN/LSTM/CRNN, and ViT
   parameters with distinct moment slots and per-layer rate scaling. DNOPT2
