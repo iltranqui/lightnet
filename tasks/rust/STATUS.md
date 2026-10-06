@@ -34,6 +34,16 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v78: added a source-derived per-head legacy `[obb_yolo]` decoder for six box
+  channels, objectness, class scores, and raw linear front offsets. It handles
+  `new_coords`, `scale_x_y`, strict objectness/class thresholds, output
+  sanitization, integer-rounded C++ letterbox dimensions, and image-pixel front
+  points; OBB NMS is deliberately separate. The focused
+  `MEM=3G PKGS=darknet-core ./tools/test_host.sh obb` suite passed 12/12,
+  covering logistic and `new_coords` decode, letterbox correction, integer
+  resize rounding, malformed shapes, geometry, and NMS. This remains a standalone
+  primitive with no cfg/runtime integration; no compiled-C++ golden or parity
+  claim is available.
 - v77: added an OBB detection wrapper/geometry enum, CARPN-vs-front-point IoU
   dispatch, and classwise greedy OBB NMS with descending per-class confidence,
   exact-zero skip behavior, and strict `IoU > threshold`. The focused

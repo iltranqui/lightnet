@@ -62,7 +62,8 @@ pub mod weights;
 
 pub use cfg::{ConfigFile, RawSection};
 pub use detect::{
-    Detection, DetectionBox, DetectionOptions, decode_modern_detections, decode_yolo_detections,
+    Detection, DetectionBox, DetectionOptions, ObbDetection, ObbDetectionGeometry, apply_obb_nms,
+    decode_modern_detections, decode_obb_yolo_head, decode_yolo_detections,
 };
 pub use error::{Error, Result};
 pub use image::PlanarRgbImage;

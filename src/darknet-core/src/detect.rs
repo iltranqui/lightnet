@@ -120,6 +120,142 @@ pub fn decode_yolo_detections(
     Ok(detections)
 }
 
+/// Decode one six-coordinate legacy OBB YOLO head into per-class detections.
+///
+/// `data` is one image's output in the existing Darknet channel-major layout
+/// with six box channels, one objectness channel, and then `classes` channels
+/// per anchor. The returned front point is letterbox-corrected and expressed in
+/// image pixels, like the
+/// bbox. This per-head helper does not run NMS; merge head outputs first, then
+/// call [`apply_obb_nms`].
+#[allow(clippy::too_many_arguments)]
+pub fn decode_obb_yolo_head(
+    data: &[f32],
+    grid_width: usize,
+    grid_height: usize,
+    spec: &YoloSpec,
+    net_width: usize,
+    net_height: usize,
+    image_width: usize,
+    image_height: usize,
+    options: DetectionOptions,
+) -> Result<Vec<ObbDetection>> {
+    if grid_width == 0
+        || grid_height == 0
+        || net_width == 0
+        || net_height == 0
+        || image_width == 0
+        || image_height == 0
+        || spec.classes == 0
+        || spec.mask.is_empty()
+        || !spec.scale_x_y.is_finite()
+    {
+        return Err(Error::InvalidConfig(
+            "invalid geometry or spec for OBB YOLO decoding".to_owned(),
+        ));
+    }
+
+    let stride = grid_width
+        .checked_mul(grid_height)
+        .ok_or_else(|| Error::InvalidConfig("OBB YOLO grid size overflow".to_owned()))?;
+    let entries_per_anchor = spec
+        .classes
+        .checked_add(7)
+        .ok_or_else(|| Error::InvalidConfig("OBB YOLO entry count overflow".to_owned()))?;
+    let expected = stride
+        .checked_mul(spec.mask.len())
+        .and_then(|size| size.checked_mul(entries_per_anchor))
+        .ok_or_else(|| Error::InvalidConfig("OBB YOLO head size overflow".to_owned()))?;
+    if data.len() != expected {
+        return Err(Error::InvalidConfig(format!(
+            "OBB YOLO head tensor length mismatch: expected {expected}, got {}",
+            data.len()
+        )));
+    }
+
+    let correction = ObbImageCorrection::new(
+        net_width,
+        net_height,
+        image_width,
+        image_height,
+        options.letterbox,
+    )?;
+    let mut detections = Vec::new();
+    for index in 0..stride {
+        let row = index / grid_width;
+        let col = index % grid_width;
+        for (anchor_offset, &mask_idx) in spec.mask.iter().enumerate() {
+            let anchor = anchor_pair(spec, mask_idx)?;
+            if !anchor.0.is_finite() || !anchor.1.is_finite() || anchor.0 <= 0.0 || anchor.1 <= 0.0
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "invalid OBB YOLO anchor for mask index {mask_idx}"
+                )));
+            }
+
+            let anchor_base = anchor_offset * entries_per_anchor;
+            let objectness = finite_or_zero(head_activation(
+                data[(anchor_base + 6) * stride + index],
+                spec.new_coords,
+            ));
+            if objectness <= options.confidence_threshold {
+                continue;
+            }
+
+            let bbox = decode_obb_bbox(
+                data[(anchor_base + 0) * stride + index],
+                data[(anchor_base + 1) * stride + index],
+                data[(anchor_base + 2) * stride + index],
+                data[(anchor_base + 3) * stride + index],
+                col,
+                row,
+                grid_width,
+                grid_height,
+                net_width,
+                net_height,
+                anchor,
+                spec.scale_x_y,
+                spec.new_coords,
+            );
+            let bbox = correction.correct_bbox(bbox, image_width as f32, image_height as f32);
+
+            // Source channels 4/5 are raw, linear, cell-relative front offsets.
+            let front_x = finite_or_zero(data[(anchor_base + 4) * stride + index]);
+            let front_y = finite_or_zero(data[(anchor_base + 5) * stride + index]);
+            let front_x = (col as f32 + front_x) / grid_width as f32;
+            let front_y = (row as f32 + front_y) / grid_height as f32;
+            let [front_x, front_y] = correction.correct_front_point(
+                [front_x, front_y],
+                image_width as f32,
+                image_height as f32,
+            );
+
+            for class_id in 0..spec.classes {
+                let class_probability = finite_or_zero(head_activation(
+                    data[(anchor_base + 7 + class_id) * stride + index],
+                    spec.new_coords,
+                ));
+                let confidence = objectness * class_probability;
+                if confidence > options.confidence_threshold {
+                    detections.push(ObbDetection {
+                        detection: Detection {
+                            class_id,
+                            confidence,
+                            objectness,
+                            bbox,
+                        },
+                        geometry: ObbDetectionGeometry::FrontPoint {
+                            x: front_x,
+                            y: front_y,
+                        },
+                    });
+                }
+            }
+        }
+    }
+    Ok(detections)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_yolo_head(
     data: &[f32],
@@ -429,6 +565,135 @@ fn decode_bbox(
         y: by,
         w: bw,
         h: bh,
+    }
+}
+
+fn decode_obb_bbox(
+    tx: f32,
+    ty: f32,
+    tw: f32,
+    th: f32,
+    col: usize,
+    row: usize,
+    grid_width: usize,
+    grid_height: usize,
+    net_width: usize,
+    net_height: usize,
+    anchor: (f32, f32),
+    scale_x_y: f32,
+    new_coords: bool,
+) -> DetectionBox {
+    let scale_offset = 0.5 * (scale_x_y - 1.0);
+    let tx = finite_or_zero(scale_x_y * head_activation(tx, new_coords) - scale_offset);
+    let ty = finite_or_zero(scale_x_y * head_activation(ty, new_coords) - scale_offset);
+    let tw = finite_or_zero(tw);
+    let th = finite_or_zero(th);
+    let (width, height) = if new_coords {
+        (
+            tw * tw * 4.0 * anchor.0 / net_width as f32,
+            th * th * 4.0 * anchor.1 / net_height as f32,
+        )
+    } else {
+        (
+            tw.clamp(-10.0, 10.0).exp() * anchor.0 / net_width as f32,
+            th.clamp(-10.0, 10.0).exp() * anchor.1 / net_height as f32,
+        )
+    };
+    DetectionBox {
+        x: finite_or_zero((col as f32 + tx) / grid_width as f32),
+        y: finite_or_zero((row as f32 + ty) / grid_height as f32),
+        w: finite_or_zero(width).max(1e-6),
+        h: finite_or_zero(height).max(1e-6),
+    }
+}
+
+fn finite_or_zero(value: f32) -> f32 {
+    if value.is_finite() { value } else { 0.0 }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ObbImageCorrection {
+    delta_width: f32,
+    delta_height: f32,
+    ratio_width: f32,
+    ratio_height: f32,
+    net_width: f32,
+    net_height: f32,
+}
+
+impl ObbImageCorrection {
+    fn new(
+        net_width: usize,
+        net_height: usize,
+        image_width: usize,
+        image_height: usize,
+        letterbox: bool,
+    ) -> Result<Self> {
+        let (new_width, new_height) = if letterbox {
+            if net_width as f32 / (image_width as f32) < net_height as f32 / (image_height as f32) {
+                (
+                    net_width,
+                    image_height.checked_mul(net_width).ok_or_else(|| {
+                        Error::InvalidConfig("OBB letterbox height overflow".to_owned())
+                    })? / image_width,
+                )
+            } else {
+                (
+                    image_width.checked_mul(net_height).ok_or_else(|| {
+                        Error::InvalidConfig("OBB letterbox width overflow".to_owned())
+                    })? / image_height,
+                    net_height,
+                )
+            }
+        } else {
+            (net_width, net_height)
+        };
+        if new_width == 0 || new_height == 0 {
+            return Err(Error::InvalidConfig(
+                "OBB letterbox dimensions collapse to zero".to_owned(),
+            ));
+        }
+
+        let (net_width, net_height) = (net_width as f32, net_height as f32);
+        let (new_width, new_height) = (new_width as f32, new_height as f32);
+        Ok(Self {
+            delta_width: net_width - new_width,
+            delta_height: net_height - new_height,
+            ratio_width: new_width / net_width,
+            ratio_height: new_height / net_height,
+            net_width,
+            net_height,
+        })
+    }
+
+    fn correct_bbox(
+        self,
+        mut bbox: DetectionBox,
+        image_width: f32,
+        image_height: f32,
+    ) -> DetectionBox {
+        bbox.x = (bbox.x - self.delta_width / 2.0 / self.net_width) / self.ratio_width;
+        bbox.y = (bbox.y - self.delta_height / 2.0 / self.net_height) / self.ratio_height;
+        bbox.w /= self.ratio_width;
+        bbox.h /= self.ratio_height;
+        bbox.x *= image_width;
+        bbox.y *= image_height;
+        bbox.w *= image_width;
+        bbox.h *= image_height;
+        bbox
+    }
+
+    fn correct_front_point(
+        self,
+        mut front: [f32; 2],
+        image_width: f32,
+        image_height: f32,
+    ) -> [f32; 2] {
+        front[0] = (front[0] - self.delta_width / 2.0 / self.net_width) / self.ratio_width;
+        front[1] = (front[1] - self.delta_height / 2.0 / self.net_height) / self.ratio_height;
+        front[0] *= image_width;
+        front[1] *= image_height;
+        front
     }
 }
 
@@ -790,6 +1055,163 @@ mod tests {
                 .expect("decode should succeed");
 
         assert_eq!(detections.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod obb_decode_tests {
+    use crate::model::{YoloIouLoss, YoloSpec};
+
+    use super::{DetectionOptions, ObbDetectionGeometry, decode_obb_yolo_head};
+
+    fn spec(new_coords: bool, scale_x_y: f32) -> YoloSpec {
+        YoloSpec {
+            classes: 2,
+            num: 1,
+            mask: vec![0],
+            anchors: vec![10.0, 12.0],
+            scale_x_y,
+            new_coords,
+            cls_normalizer: 1.0,
+            obj_normalizer: 1.0,
+            iou_normalizer: 1.0,
+            ignore_thresh: 0.5,
+            truth_thresh: 1.0,
+            iou_thresh: 1.0,
+            iou_loss: YoloIouLoss::Mse,
+            iou_thresh_kind: YoloIouLoss::Iou,
+            focal_loss: false,
+            label_smooth_eps: 0.0,
+            objectness_smooth: false,
+            max_delta: 5.0,
+            delta_normalizer: 1.0,
+            class_multipliers: None,
+            class_map: None,
+        }
+    }
+
+    fn options(confidence_threshold: f32, letterbox: bool) -> DetectionOptions {
+        DetectionOptions {
+            confidence_threshold,
+            nms_threshold: 0.45,
+            letterbox,
+        }
+    }
+
+    #[test]
+    fn logistic_obb_head_decodes_box_front_and_strict_thresholds() {
+        let outputs = decode_obb_yolo_head(
+            &[0.0, 0.0, 0.0, 0.0, 0.25, 0.5, 0.0, 2.0, -2.0],
+            1,
+            1,
+            &spec(false, 1.2),
+            32,
+            32,
+            32,
+            32,
+            options(0.1, false),
+        )
+        .expect("valid OBB head");
+        assert_eq!(outputs.len(), 1, "only class 0 exceeds the score threshold");
+        let detection = &outputs[0].detection;
+        assert_eq!(detection.class_id, 0);
+        assert!((detection.objectness - 0.5).abs() < 1e-6);
+        assert!((detection.confidence - 0.5 * (1.0 / (1.0 + (-2.0f32).exp()))).abs() < 1e-6);
+        assert!((detection.bbox.x - 16.0).abs() < 1e-6);
+        assert!((detection.bbox.y - 16.0).abs() < 1e-6);
+        assert!((detection.bbox.w - 10.0).abs() < 1e-6);
+        assert!((detection.bbox.h - 12.0).abs() < 1e-6);
+        let ObbDetectionGeometry::FrontPoint { x, y } = outputs[0].geometry else {
+            panic!("legacy front-point output expected");
+        };
+        assert!((x - 8.0).abs() < 1e-6);
+        assert!((y - 16.0).abs() < 1e-6);
+
+        let at_objectness_threshold = decode_obb_yolo_head(
+            &[0.0, 0.0, 0.0, 0.0, 0.25, 0.5, 0.0, 2.0, -2.0],
+            1,
+            1,
+            &spec(false, 1.2),
+            32,
+            32,
+            32,
+            32,
+            options(0.5, false),
+        )
+        .expect("valid OBB head");
+        assert!(
+            at_objectness_threshold.is_empty(),
+            "objectness threshold is strict"
+        );
+    }
+
+    #[test]
+    fn new_coords_obb_head_corrects_front_point_for_letterbox() {
+        let outputs = decode_obb_yolo_head(
+            &[0.5, 0.5, 0.5, 0.5, 0.75, 0.25, 0.9, 0.8, 0.7],
+            1,
+            1,
+            &spec(true, 1.2),
+            32,
+            32,
+            64,
+            32,
+            options(0.7, true),
+        )
+        .expect("valid new-coordinates OBB head");
+        assert_eq!(
+            outputs.len(),
+            1,
+            "NMS is deferred and only class 0 meets threshold"
+        );
+        let detection = &outputs[0].detection;
+        assert_eq!(detection.class_id, 0);
+        assert!((detection.confidence - 0.72).abs() < 1e-6);
+        assert!((detection.bbox.x - 32.0).abs() < 1e-6);
+        assert!((detection.bbox.y - 16.0).abs() < 1e-6);
+        assert!((detection.bbox.w - 20.0).abs() < 1e-6);
+        assert!((detection.bbox.h - 24.0).abs() < 1e-6);
+        let ObbDetectionGeometry::FrontPoint { x, y } = outputs[0].geometry else {
+            panic!("legacy front-point output expected");
+        };
+        assert!((x - 48.0).abs() < 1e-6);
+        assert!(y.abs() < 1e-6);
+    }
+
+    #[test]
+    fn obb_letterbox_uses_integer_resized_dimensions() {
+        let outputs = decode_obb_yolo_head(
+            &[0.5, 0.5, 0.5, 0.5, 0.75, 0.25, 0.9, 0.8, 0.7],
+            1,
+            1,
+            &spec(true, 1.0),
+            32,
+            32,
+            5,
+            3,
+            options(0.7, true),
+        )
+        .expect("valid OBB head");
+        let ObbDetectionGeometry::FrontPoint { x, y } = outputs[0].geometry else {
+            panic!("legacy front-point output expected");
+        };
+        assert!((x - 3.75).abs() < 1e-6);
+        // C++ computes new_h=(3*32)/5 using integer division, so 19/32 is
+        // used instead of the mathematically exact 19.2/32 scale.
+        assert!((y - 0.236_842_1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn obb_yolo_decoder_rejects_bad_tensor_lengths_and_zero_grids() {
+        let spec = spec(false, 1.0);
+        let error =
+            decode_obb_yolo_head(&[0.0; 8], 1, 1, &spec, 32, 32, 32, 32, options(0.1, false))
+                .expect_err("the six-coordinate OBB layout needs nine entries");
+        assert!(format!("{error}").contains("length mismatch"));
+
+        let error = decode_obb_yolo_head(&[], 0, 1, &spec, 32, 32, 32, 32, options(0.1, false))
+            .expect_err("zero grid dimensions are invalid");
+        assert!(format!("{error}").contains("invalid geometry"));
     }
 }
 
