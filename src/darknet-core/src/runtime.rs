@@ -8230,15 +8230,13 @@ where
                             ))
                         })?
                     };
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download LSTM backward input", err))?;
                     let (input_gradient, gradients) = backward_lstm_layer_device(
                         &self.backend,
                         spec,
                         params,
                         cache,
-                        &host_input,
+                        current_input,
+                        layer.input_shape,
                         &grad,
                         layer.index,
                         config,
@@ -12330,12 +12328,6 @@ where
     }
     let inputs = input_shape.element_count();
     let state_shape = TensorShape::new(1, 1, spec.output, sequence_batch);
-    let input_step_shape = TensorShape::new(
-        input_shape.width,
-        input_shape.height,
-        input_shape.channels,
-        sequence_batch,
-    );
     let upload_projection = |projection: &ConnectedParams, input_features: usize, name: &str| {
         if projection.weights.len() != spec.output * input_features
             || projection.biases.len() != spec.output
@@ -12430,7 +12422,7 @@ where
                 &tensor_backend_shape(input_shape),
                 step,
                 spec.steps,
-                &tensor_backend_shape(input_step_shape),
+                &[sequence_batch, inputs],
                 config,
             )
             .map_err(|err| backend_error("slice LSTM input sequence", err))?;
@@ -13486,7 +13478,8 @@ fn backward_lstm_layer_device<B: F32TensorOpsBackend>(
     spec: &LstmSpec,
     params: &LstmParams,
     cache: &GpuLstmBackwardCache<B::Tensor>,
-    input: &Tensor,
+    input_gpu: &B::Tensor,
+    input_shape: TensorShape,
     output_gradient: &B::Tensor,
     layer_index: usize,
     config: ElementwiseLaunchConfig,
@@ -13494,16 +13487,9 @@ fn backward_lstm_layer_device<B: F32TensorOpsBackend>(
 where
     B::Error: std::fmt::Display,
 {
-    let sequence_batch = recurrent_sequence_batch(input.shape.batch, spec.steps)?;
-    let output_shape = TensorShape::new(1, 1, spec.output, input.shape.batch);
-    let state_shape = TensorShape::new(1, 1, spec.output, sequence_batch);
-    let input_step_shape = TensorShape::new(
-        input.shape.width,
-        input.shape.height,
-        input.shape.channels,
-        sequence_batch,
-    );
-    let inputs = input.shape.element_count();
+    let sequence_batch = recurrent_sequence_batch(input_shape.batch, spec.steps)?;
+    let output_shape = TensorShape::new(1, 1, spec.output, input_shape.batch);
+    let inputs = input_shape.element_count();
     if spec.batch_normalize
         || [
             &params.wf, &params.wi, &params.wg, &params.wo, &params.uf, &params.ui, &params.ug,
@@ -13556,17 +13542,7 @@ where
                 .map_err(|err| backend_error("upload LSTM backward weights", err))?,
         );
     }
-    let output_gradient_data = backend
-        .download_f32(output_gradient)
-        .map_err(|err| backend_error("download LSTM output gradient", err))?;
-    if output_gradient_data.len() != output_shape.batch * output_shape.element_count() {
-        return Err(Error::InvalidConfig(format!(
-            "LSTM backward output gradient size mismatch at layer #{layer_index}"
-        )));
-    }
-    let output_gradient_host = Tensor::from_data(output_shape, output_gradient_data)?;
-    let mut input_gradient_data = vec![0.0f32; input.shape.batch * inputs];
-    let input_step_len = sequence_batch * inputs;
+    let mut input_gradients: Vec<Option<B::Tensor>> = (0..spec.steps).map(|_| None).collect();
     let mut next_hidden_gradient = backend
         .zeros_f32(&[sequence_batch, spec.output])
         .map_err(|err| backend_error("allocate LSTM hidden gradient", err))?;
@@ -13578,11 +13554,16 @@ where
     let mut bias_gradients: Vec<Option<B::Tensor>> = (0..projections.len()).map(|_| None).collect();
 
     for step in (0..spec.steps).rev() {
-        let output_gradient_step =
-            sequence_slice(&output_gradient_host, step, sequence_batch, state_shape)?;
         let output_gradient_step_gpu = backend
-            .upload_f32(&[sequence_batch, spec.output], &output_gradient_step.data)
-            .map_err(|err| backend_error("upload LSTM output gradient slice", err))?;
+            .sequence_slice_f32(
+                output_gradient,
+                &tensor_backend_shape(output_shape),
+                step,
+                spec.steps,
+                &[sequence_batch, spec.output],
+                config,
+            )
+            .map_err(|err| backend_error("slice LSTM output gradient", err))?;
         let hidden_gradient = backend
             .vector_add_f32(&output_gradient_step_gpu, &next_hidden_gradient, config)
             .map_err(|err| backend_error("accumulate LSTM hidden gradient", err))?;
@@ -13608,10 +13589,16 @@ where
             .map_err(|err| backend_error("LSTM gate backward", err))?;
         next_cell_gradient = cell_gradient;
         let previous_state_gpu = &cache.previous_states[step];
-        let step_input = sequence_slice(input, step, sequence_batch, input_step_shape)?;
         let step_input_gpu = backend
-            .upload_f32(&[sequence_batch, inputs], &step_input.data)
-            .map_err(|err| backend_error("upload LSTM input slice", err))?;
+            .sequence_slice_f32(
+                input_gpu,
+                &tensor_backend_shape(input_shape),
+                step,
+                spec.steps,
+                &[sequence_batch, inputs],
+                config,
+            )
+            .map_err(|err| backend_error("slice LSTM input sequence", err))?;
         let gate_gradients = [
             forget_gradient,
             input_gate_gradient,
@@ -13678,16 +13665,7 @@ where
                 "missing LSTM input gradient at layer #{layer_index}, step {step}"
             ))
         })?;
-        let step_gradient = backend
-            .download_f32(&step_input_gradient)
-            .map_err(|err| backend_error("download LSTM input gradient slice", err))?;
-        if step_gradient.len() != input_step_len {
-            return Err(Error::InvalidConfig(format!(
-                "LSTM input gradient size mismatch at layer #{layer_index}, step {step}"
-            )));
-        }
-        let start = step * input_step_len;
-        input_gradient_data[start..start + input_step_len].copy_from_slice(&step_gradient);
+        input_gradients[step] = Some(step_input_gradient);
         next_hidden_gradient = previous_hidden_gradient.ok_or_else(|| {
             Error::InvalidConfig(format!(
                 "missing LSTM hidden gradient at layer #{layer_index}, step {step}"
@@ -13695,9 +13673,22 @@ where
         })?;
     }
 
+    let input_gradient_refs: Vec<_> = input_gradients
+        .iter()
+        .map(|gradient| {
+            gradient.as_ref().ok_or_else(|| {
+                Error::InvalidConfig("missing LSTM input gradient timestep".to_owned())
+            })
+        })
+        .collect::<Result<_>>()?;
     let input_gradient = backend
-        .upload_f32(&tensor_backend_shape(input.shape), &input_gradient_data)
-        .map_err(|err| backend_error("upload LSTM input gradient", err))?;
+        .sequence_concat_f32(
+            &input_gradient_refs,
+            &tensor_backend_shape(input_shape),
+            sequence_batch * inputs,
+            config,
+        )
+        .map_err(|err| backend_error("assemble LSTM input gradient", err))?;
     let mut gradients = LstmParams {
         wf: zero_connected_gradient(&params.wf),
         wi: zero_connected_gradient(&params.wi),
