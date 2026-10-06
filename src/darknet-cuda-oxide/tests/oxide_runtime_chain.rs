@@ -922,6 +922,127 @@ fn chained_mismatched_shortcuts_match_cpu_backward() {
 }
 
 #[test]
+fn batch_normalized_rnn_device_backward_matches_cpu_on_oxide() {
+    let net = network(
+        "[net]\ninputs=2\nbatch=2\ntime_steps=2\n\
+         [connected]\noutput=2\nactivation=linear\n\
+         [rnn]\nhidden=3\noutput=2\nactivation=tanh\nlogistic=1\nshortcut=1\nbatch_normalize=1\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let LayerParams::Connected(input) = &mut cpu.params[0] else {
+        panic!("upstream connected params");
+    };
+    input.weights.copy_from_slice(&[0.4, -0.2, 0.1, 0.35]);
+    input.biases.copy_from_slice(&[0.03, -0.04]);
+    let LayerParams::Rnn(rnn) = &mut cpu.params[1] else {
+        panic!("RNN params");
+    };
+    for (slot, projection) in [&mut rnn.input, &mut rnn.self_params, &mut rnn.output]
+        .into_iter()
+        .enumerate()
+    {
+        for (index, weight) in projection.weights.iter_mut().enumerate() {
+            *weight = 0.04 + (slot * 5 + index) as f32 * 0.009;
+        }
+        for (index, bias) in projection.biases.iter_mut().enumerate() {
+            *bias = (slot as f32 - 1.0) * 0.03 + index as f32 * 0.02;
+        }
+        let bn = projection.batch_norm.as_mut().expect("RNN BN params");
+        for feature in 0..bn.scales.len() {
+            bn.scales[feature] = 0.75 + feature as f32 * 0.16;
+            bn.rolling_mean[feature] = -0.12 + feature as f32 * 0.07;
+            bn.rolling_variance[feature] = 0.55 + feature as f32 * 0.19;
+        }
+    }
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("oxide backend"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("GPU BN RNN train buffers");
+    let input = patterned(cpu.network.net.input_shape());
+    let cpu_forward = cpu.forward_training(&input).expect("CPU BN RNN forward");
+    let gpu_forward = gpu
+        .forward_training_device(&input)
+        .expect("Oxide BN RNN forward");
+    for index in 0..2 {
+        close(
+            &format!("BN RNN layer {index} output"),
+            &cpu_forward.layer_outputs[index].data,
+            &gpu_forward.cpu_forward.layer_outputs[index].data,
+            1e-4,
+        );
+    }
+
+    let output_shape = cpu.network.layers[1].output_shape;
+    let seed = Tensor::from_data(
+        output_shape,
+        (0..output_shape.batch * output_shape.element_count())
+            .map(|index| (index as f32 * 0.43).cos() * 0.6)
+            .collect(),
+    )
+    .expect("RNN output gradient");
+    let seeds = vec![None, Some(seed)];
+    cpu.zero_train_buffers();
+    gpu.zero_train_buffers_gpu().expect("zero GPU BN RNN buffers");
+    cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+        .expect("CPU BN RNN backward");
+    gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+        .expect("Oxide BN RNN backward");
+    cpu.update_weights(0.025, 0.0, 0.0, 2);
+    gpu.update_weights_gpu(0.025, 0.0, 0.0, 2)
+        .expect("Oxide BN RNN optimizer step");
+
+    let (LayerParams::Connected(cpu_input), LayerParams::Connected(gpu_input)) =
+        (&cpu.params[0], &gpu.params[0])
+    else {
+        panic!("updated upstream connected params");
+    };
+    close("BN RNN upstream weights", &cpu_input.weights, &gpu_input.weights, 3e-4);
+    close("BN RNN upstream biases", &cpu_input.biases, &gpu_input.biases, 3e-4);
+    let (LayerParams::Rnn(cpu_rnn), LayerParams::Rnn(gpu_rnn)) =
+        (&cpu.params[1], &gpu.params[1])
+    else {
+        panic!("updated RNN params");
+    };
+    for (name, cpu_projection, gpu_projection) in [
+        ("input", &cpu_rnn.input, &gpu_rnn.input),
+        ("recurrent", &cpu_rnn.self_params, &gpu_rnn.self_params),
+        ("output", &cpu_rnn.output, &gpu_rnn.output),
+    ] {
+        close(
+            &format!("BN RNN {name} weights"),
+            &cpu_projection.weights,
+            &gpu_projection.weights,
+            3e-4,
+        );
+        close(
+            &format!("BN RNN {name} beta"),
+            &cpu_projection.biases,
+            &gpu_projection.biases,
+            3e-4,
+        );
+        let cpu_bn = cpu_projection.batch_norm.as_ref().unwrap();
+        let gpu_bn = gpu_projection.batch_norm.as_ref().unwrap();
+        close(
+            &format!("BN RNN {name} scales"),
+            &cpu_bn.scales,
+            &gpu_bn.scales,
+            3e-4,
+        );
+        close(
+            &format!("BN RNN {name} rolling mean"),
+            &cpu_bn.rolling_mean,
+            &gpu_bn.rolling_mean,
+            3e-4,
+        );
+        close(
+            &format!("BN RNN {name} rolling variance"),
+            &cpu_bn.rolling_variance,
+            &gpu_bn.rolling_variance,
+            3e-4,
+        );
+    }
+}
+
+#[test]
 fn rnn_recurrent_projections_and_training_backward_match_cpu() {
     let net = network(
         "[net]\ninputs=2\nbatch=2\ntime_steps=2\n\

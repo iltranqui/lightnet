@@ -81,9 +81,13 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
   now stay on-device for backward, avoiding per-timestep cache downloads and
   re-uploads; host-facing forwards still capture the legacy CPU cache. Device
   parameter-gradient transfers, host accumulation/SGD, and some sequence handling
-  still cross the host. FakeBackend and real Oxide tests compare training updates with
-  CPU, including upstream convolution updates. Batch-normalized recurrent layers
-  still use CPU backward.
+  still cross the host. BN RNN backward now uses backend projection/BPTT ops
+  and rolling-stat affine input/beta derivatives; scale-gradient reductions still
+  transfer raw projections and deltas to host. CPU forward/cache upload and host
+  optimizer remain. FakeBackend and real Oxide parity checks include upstream
+  connected updates and rolling-stat updates. Dynamic loss-scale finiteness
+  checks now include host-buffered connected/recurrent gradients. BN LSTM/CRNN
+  backward still uses the CPU fallback.
 - [x] Host Adam: connected, standalone batchnorm, local, weighted shortcut,
   MoE fallback, deconvolutional, GRU/RNN/LSTM/CRNN, and ViT host params use
   per-layer rate scaling and persisted host moments. DNOPT3 also persists

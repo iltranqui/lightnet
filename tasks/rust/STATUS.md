@@ -34,6 +34,14 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v58: BN RNN backward uses backend projection/BPTT ops and rolling-stat affine
+  input/beta derivatives; scale-gradient reduction still transfers raw projections
+  and deltas to host. Forward/cache capture and optimizer remain host-side; BN
+  LSTM/CRNN still use CPU backward. Dynamic loss-scale checks now inspect
+  host-buffered connected/recurrent gradients. Host RNN tests passed (6/6),
+  including FakeBackend parameter/stat parity; focused real Oxide parity passed
+  (1/1); full `oxide_runtime_chain` passed
+  (15/15).
 - v57: `[maxpool] maxpool_zero_nonmax=1` now stays on the GPU backward path.
   The existing kernel writes gradients only for input argmaxes, so non-argmax
   deltas are already zero. Host maxpool tests passed (8/8); focused real Oxide
@@ -218,11 +226,15 @@ Latest increments:
   slicing and input-gradient assembly also stay on-device, with convolution
   parameter gradients accumulated across steps. Recurrent cache/state and
   parameter-gradient transfers, host accumulation/SGD, and some cache handling
-  still cross the host. Batch-normalized recurrent layers remain on CPU backward.
-  FakeBackend parity
-  and real-device
-  `oxide_runtime_chain::lstm_no_batch_norm_forward_and_device_backward_match_cpu`
-  compare training updates with CPU, including upstream convolution updates.
+  still cross the host. BN RNN backward uses backend projection/BPTT ops and
+  affine input/beta derivatives; scale-gradient reduction transfers raw outputs
+  and deltas to host. Forward/cache capture and optimizer remain host-side.
+  BN LSTM/CRNN backward still uses CPU fallback. FakeBackend and real-device
+  `oxide_runtime_chain::batch_normalized_rnn_device_backward_matches_cpu_on_oxide`
+  compare parameter and rolling-stat updates with CPU, including upstream
+  connected updates. Dynamic loss-scale finiteness checks include host-buffered
+  connected/recurrent gradients. The no-BN LSTM parity test also checks
+  upstream convolution.
 - Host Adam updates standalone batchnorm, local, connected, weighted shortcut,
   MoE fallback, deconvolutional, GRU/RNN/LSTM/CRNN, and ViT parameters with
   distinct moment slots and per-layer rate scaling. DNOPT3 persists no-BN device
