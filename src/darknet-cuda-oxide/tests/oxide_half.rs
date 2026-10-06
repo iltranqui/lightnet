@@ -315,6 +315,13 @@ fn act_ref(kind: F32ActivationKind, x: f64) -> f64 {
         F32ActivationKind::Linear => x,
         F32ActivationKind::Loggy => 2.0 / (1.0 + (-x).exp()) - 1.0,
         F32ActivationKind::Hardtan => x.clamp(-1.0, 1.0),
+        F32ActivationKind::Relie => {
+            if x > 0.0 {
+                x
+            } else {
+                0.01 * x
+            }
+        }
         F32ActivationKind::Leaky => if x > 0.0 { x } else { 0.1 * x },
         F32ActivationKind::Logistic => 1.0 / (1.0 + (-x).exp()),
         F32ActivationKind::Relu => x.max(0.0),
@@ -624,6 +631,7 @@ fn f16_shortcut_avgpool_affine_reverse_match_f64_reference() {
         F32ActivationKind::Linear,
         F32ActivationKind::Loggy,
         F32ActivationKind::Hardtan,
+        F32ActivationKind::Relie,
         F32ActivationKind::Leaky,
         F32ActivationKind::Logistic,
         F32ActivationKind::Relu,

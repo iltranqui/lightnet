@@ -255,6 +255,7 @@ fn activation_code(kind: F32ActivationKind) -> u32 {
         F32ActivationKind::HardMish => activations::ACT_HARD_MISH,
         F32ActivationKind::Loggy => activations::ACT_LOGGY,
         F32ActivationKind::Hardtan => activations::ACT_HARDTAN,
+        F32ActivationKind::Relie => activations::ACT_RELIE,
     }
 }
 

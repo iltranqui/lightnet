@@ -42,10 +42,11 @@ fn assert_close(name: &str, got: &[f32], want: &[f32]) {
     }
 }
 
-const KINDS: [F32ActivationKind; 15] = [
+const KINDS: [F32ActivationKind; 16] = [
     F32ActivationKind::Linear,
     F32ActivationKind::Loggy,
     F32ActivationKind::Hardtan,
+    F32ActivationKind::Relie,
     F32ActivationKind::Logistic,
     F32ActivationKind::Relu,
     F32ActivationKind::Leaky,
@@ -65,6 +66,13 @@ fn cpu_activate(kind: F32ActivationKind, x: f32) -> f32 {
         F32ActivationKind::Linear => x,
         F32ActivationKind::Loggy => 2.0 / (1.0 + (-x).exp()) - 1.0,
         F32ActivationKind::Hardtan => x.clamp(-1.0, 1.0),
+        F32ActivationKind::Relie => {
+            if x > 0.0 {
+                x
+            } else {
+                0.01 * x
+            }
+        }
         F32ActivationKind::Logistic => 1.0 / (1.0 + (-x).exp()),
         F32ActivationKind::Relu => x.max(0.0),
         F32ActivationKind::Leaky => {
@@ -114,6 +122,13 @@ fn cpu_gradient(kind: F32ActivationKind, x: f32) -> f32 {
             2.0 * sigmoid * (1.0 - sigmoid)
         }
         F32ActivationKind::Hardtan => (x > -1.0 && x < 1.0) as i32 as f32,
+        F32ActivationKind::Relie => {
+            if x > 0.0 {
+                1.0
+            } else {
+                0.01
+            }
+        }
         F32ActivationKind::Logistic => {
             let s = 1.0 / (1.0 + (-x).exp());
             s * (1.0 - s)
@@ -395,6 +410,13 @@ fn act64(kind: F32ActivationKind, x: f64) -> f64 {
         F32ActivationKind::Linear => x,
         F32ActivationKind::Loggy => 2.0 / (1.0 + (-x).exp()) - 1.0,
         F32ActivationKind::Hardtan => x.clamp(-1.0, 1.0),
+        F32ActivationKind::Relie => {
+            if x > 0.0 {
+                x
+            } else {
+                0.01 * x
+            }
+        }
         F32ActivationKind::Logistic => 1.0 / (1.0 + (-x).exp()),
         F32ActivationKind::Relu => x.max(0.0),
         F32ActivationKind::Leaky => {
@@ -489,6 +511,7 @@ fn activation_backward_input_form_equals_core_output_form() {
         F32ActivationKind::Linear,
         F32ActivationKind::Loggy,
         F32ActivationKind::Hardtan,
+        F32ActivationKind::Relie,
         F32ActivationKind::Logistic,
         F32ActivationKind::Relu,
         F32ActivationKind::Leaky,
@@ -509,6 +532,13 @@ fn activation_backward_input_form_equals_core_output_form() {
                     F32ActivationKind::Linear => 1.0,
                     F32ActivationKind::Loggy => 0.5 * (1.0 - y * y),
                     F32ActivationKind::Hardtan => (y > -1.0 && y < 1.0) as i32 as f32,
+                    F32ActivationKind::Relie => {
+                        if y > 0.0 {
+                            1.0
+                        } else {
+                            0.01
+                        }
+                    }
                     F32ActivationKind::Logistic => y * (1.0 - y),
                     F32ActivationKind::Relu => (y > 0.0) as i32 as f32,
                     F32ActivationKind::Leaky => {

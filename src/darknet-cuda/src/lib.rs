@@ -17,6 +17,8 @@ pub enum F32ActivationKind {
     Loggy,
     /// Hard tanh, clamped to `[-1, 1]` with zero gradient at the endpoints.
     Hardtan,
+    /// Relie: leaky ReLU with Darknet's 0.01 negative slope.
+    Relie,
     Logistic,
     Relu,
     Leaky,

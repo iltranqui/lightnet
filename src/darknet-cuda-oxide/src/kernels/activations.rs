@@ -19,6 +19,7 @@ pub const ACT_SELU: u32 = 11;
 pub const ACT_HARD_MISH: u32 = 12;
 pub const ACT_LOGGY: u32 = 13;
 pub const ACT_HARDTAN: u32 = 14;
+pub const ACT_RELIE: u32 = 15;
 
 #[device]
 pub fn activate(kind: u32, x: f32) -> f32 {
@@ -66,6 +67,12 @@ pub fn activate(kind: u32, x: f32) -> f32 {
             1.0
         } else {
             x
+        }
+    } else if kind == 15 {
+        if x > 0.0 {
+            x
+        } else {
+            0.01 * x
         }
     } else {
         x
@@ -131,6 +138,12 @@ pub fn gradient(kind: u32, x: f32) -> f32 {
             1.0
         } else {
             0.0
+        }
+    } else if kind == 15 {
+        if x > 0.0 {
+            1.0
+        } else {
+            0.01
         }
     } else {
         1.0
