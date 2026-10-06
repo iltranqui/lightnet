@@ -34,6 +34,13 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v71: No-BN EML GPU backward now uses backend EML adjoints and both branch
+  convolution input/weight-gradient ops, adds the eligible residual gradient,
+  and accumulates parameter gradients into host train buffers for SGD/Adam.
+  BN EML retains the explicit CPU backward fallback; host EML gradients now
+  participate in dynamic-loss-scale finiteness checks. `oxide_runtime_chain`
+  passes 19/19, including two accumulated no-BN backwards and BN fallback.
+  Optimizer updates remain host-side; no C++ parity claim is made.
 - v70: EML f32 GPU forward now runs both branch convolutions, folded rolling-stat
   BN parameters, bias addition, and the combine op through the backend; both
   branch parameter blocks use separate per-owner device-cache slots. CPU branch

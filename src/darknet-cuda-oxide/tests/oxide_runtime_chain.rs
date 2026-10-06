@@ -1820,7 +1820,11 @@ fn eml_two_branch_forward_matches_cpu_on_oxide() {
             &oxide_output,
             2e-4,
         );
-        assert!(gpu_forward.cpu_forward.eml_caches[0].is_some());
+        assert_eq!(
+            gpu_forward.cpu_forward.eml_caches[0].is_some(),
+            batch_normalize,
+            "only the BN CPU-backward fallback needs host branch caches"
+        );
 
         let shape = cpu.network.layers[0].output_shape;
         let seed = Tensor::from_data(
@@ -1833,10 +1837,13 @@ fn eml_two_branch_forward_matches_cpu_on_oxide() {
         let seeds = vec![Some(seed)];
         cpu.zero_train_buffers();
         gpu.zero_train_buffers_gpu().expect("zero EML train buffers");
-        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
-            .expect("CPU EML backward");
-        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
-            .expect("EML backward fallback");
+        for _ in 0..2 {
+            cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+                .expect("CPU EML backward");
+            gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+                .expect("Oxide EML backward");
+        }
+        assert!(!gpu.gradients_non_finite().expect("EML gradient finiteness"));
         cpu.update_weights(0.01, 0.0, 0.0, 2);
         gpu.update_weights_gpu(0.01, 0.0, 0.0, 2)
             .expect("EML host optimizer fallback");

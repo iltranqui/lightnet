@@ -549,6 +549,7 @@ where
     pub(crate) gpu_crnn_caches: Vec<Option<GpuCrnnBackwardCache<T>>>,
     pub(crate) gpu_lstm_caches: Vec<Option<GpuLstmBackwardCache<T>>>,
     pub(crate) gpu_moe_caches: Vec<Option<GpuMoeBackwardCache<T>>>,
+    pub(crate) gpu_eml_caches: Vec<Option<GpuEmlBackwardCache<T>>>,
     pub cpu_forward: ForwardResult,
 }
 
@@ -592,6 +593,16 @@ where
     pooled: T,
     expert_outputs: Vec<T>,
     expert_activation_inputs: Vec<T>,
+}
+
+/// Device-resident branch outputs used by no-BN EML backward.
+#[derive(Clone, Debug)]
+pub struct GpuEmlBackwardCache<T>
+where
+    T: Clone,
+{
+    input_branch_output: T,
+    self_branch_output: T,
 }
 
 /// Device-resident recurrent values retained for LSTM backward, including the
@@ -1271,6 +1282,7 @@ impl ExecutableNetwork {
             let mut crop_cache = None;
             let mut recurrent_cache = None;
             let mut moe_cache = None;
+            let mut eml_cache = None;
             let mut vit_cache = None;
             let (output, activation_input) = match (&layer.kind, params) {
                 (
@@ -4314,6 +4326,10 @@ where
                         || convolutional_non_finite(&train.self_params)
                         || convolutional_non_finite(&train.output)
                 }
+                LayerTrainBuffers::EmlConvolutional(train) => {
+                    convolutional_non_finite(&train.input)
+                        || convolutional_non_finite(&train.self_params)
+                }
                 _ => false,
             };
             if non_finite {
@@ -5852,6 +5868,7 @@ where
         let mut gpu_crnn_caches = Vec::with_capacity(self.network.layers.len());
         let mut gpu_lstm_caches = Vec::with_capacity(self.network.layers.len());
         let mut gpu_moe_caches = Vec::with_capacity(self.network.layers.len());
+        let mut gpu_eml_caches = Vec::with_capacity(self.network.layers.len());
         let mut dropout_masks = Vec::with_capacity(self.network.layers.len());
         let mut crop_caches = Vec::with_capacity(self.network.layers.len());
         let mut moe_caches: Vec<Option<MoeForwardCache>> = Vec::new();
@@ -5883,10 +5900,12 @@ where
             let mut batch_norm_cache = None;
             let mut vit_cache = None;
             let mut moe_cache = None;
+            let mut eml_cache = None;
             let mut gpu_rnn_cache = None;
             let mut gpu_crnn_cache = None;
             let mut gpu_lstm_cache = None;
             let mut gpu_moe_cache = None;
+            let mut gpu_eml_cache = None;
             let output_gpu = match (&layer.kind, params) {
                 (
                     LayerKind::Convolutional(spec),
@@ -7028,6 +7047,10 @@ where
                     let use_residual = spec.residual
                         && layer.input_shape.element_count() == layer.output_shape.element_count();
                     let residual = use_residual.then_some(current_input);
+                    gpu_eml_cache = Some(GpuEmlBackwardCache {
+                        input_branch_output: input_output.clone(),
+                        self_branch_output: self_output.clone(),
+                    });
                     let output = self
                         .backend
                         .eml_convolutional_f32(
@@ -7329,6 +7352,7 @@ where
             gpu_crnn_caches.push(gpu_crnn_cache);
             gpu_lstm_caches.push(gpu_lstm_cache);
             gpu_moe_caches.push(gpu_moe_cache);
+            gpu_eml_caches.push(gpu_eml_cache);
             if recurrent_caches.len() < layer_outputs.len() {
                 recurrent_caches.push(None);
             }
@@ -7346,6 +7370,7 @@ where
             gpu_crnn_caches,
             gpu_lstm_caches,
             gpu_moe_caches,
+            gpu_eml_caches,
             cpu_forward: ForwardResult {
                 layer_outputs,
                 layer_activation_inputs,
@@ -8865,6 +8890,145 @@ where
                         &mut layer_output_gradients,
                     )?;
                 }
+                (
+                    LayerKind::EmlConvolutional(spec),
+                    Some(LayerParams::EmlConvolutional(params)),
+                ) if !spec.branch.batch_normalize => {
+                    if params.input.batch_norm.is_some() || params.self_params.batch_norm.is_some() {
+                        return Err(Error::InvalidConfig(format!(
+                            "EML BN parameters do not match no-BN spec at layer #{}",
+                            layer.index
+                        )));
+                    }
+                    let cache = forward
+                        .gpu_eml_caches
+                        .get(layer.index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing EML device cache for GPU layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let current_input = if layer.index == 0 {
+                        &forward.input_gpu
+                    } else {
+                        forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing previous GPU output for EML layer #{}",
+                                layer.index
+                            ))
+                        })?
+                    };
+                    let (input_delta, self_delta) = self
+                        .backend
+                        .eml_convolutional_backward_f32(
+                            &cache.input_branch_output,
+                            &cache.self_branch_output,
+                            &grad,
+                            &tensor_backend_shape(layer.output_shape),
+                            spec.eml_clamp,
+                            spec.eml_eps,
+                            spec.eml_scale,
+                            config,
+                        )
+                        .map_err(|err| backend_error("EML branch backward", err))?;
+                    let mut input_gradient = None;
+                    for (slot, (branch_params, branch_delta)) in [
+                        (&params.input, input_delta),
+                        (&params.self_params, self_delta),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let cached = self.cached_convolution_params_at(
+                            layer.index,
+                            slot,
+                            layer.input_shape.channels,
+                            &spec.branch,
+                            branch_params,
+                        )?;
+                        let bias_gradient = self
+                            .backend
+                            .bias_backward_f32(
+                                &branch_delta,
+                                spec.branch.filters,
+                                layer.output_shape.width * layer.output_shape.height,
+                                config,
+                            )
+                            .map_err(|err| backend_error("EML branch bias backward", err))?;
+                        let weight_gradient = self
+                            .backend
+                            .conv2d_backward_weights_f32(
+                                current_input,
+                                &branch_delta,
+                                &[
+                                    spec.branch.filters,
+                                    layer.input_shape.channels / spec.branch.groups.max(1),
+                                    spec.branch.size,
+                                    spec.branch.size,
+                                ],
+                                layer.input_shape.channels,
+                                layer.input_shape.height,
+                                layer.input_shape.width,
+                                spec.branch.filters,
+                                spec.branch.size,
+                                spec.branch.stride_x,
+                                spec.branch.stride_y,
+                                spec.branch.dilation,
+                                spec.branch.padding,
+                                spec.branch.groups.max(1),
+                                config,
+                            )
+                            .map_err(|err| backend_error("EML branch weight backward", err))?;
+                        let branch_input_gradient = self
+                            .backend
+                            .conv2d_backward_input_f32(
+                                &branch_delta,
+                                &cached.raw_weights,
+                                &tensor_backend_shape(layer.input_shape),
+                                layer.input_shape.channels,
+                                layer.input_shape.height,
+                                layer.input_shape.width,
+                                spec.branch.filters,
+                                spec.branch.size,
+                                spec.branch.stride_x,
+                                spec.branch.stride_y,
+                                spec.branch.dilation,
+                                spec.branch.padding,
+                                spec.branch.groups.max(1),
+                                config,
+                            )
+                            .map_err(|err| backend_error("EML branch input backward", err))?;
+                        self.accumulate_eml_host_gradients(
+                            layer.index,
+                            slot,
+                            &weight_gradient,
+                            &bias_gradient,
+                        )?;
+                        input_gradient = Some(match input_gradient {
+                            Some(accumulated) => self
+                                .backend
+                                .saxpy_f32(1.0, &branch_input_gradient, &accumulated, config)
+                                .map_err(|err| backend_error("EML input-gradient sum", err))?,
+                            None => branch_input_gradient,
+                        });
+                    }
+                    let mut input_gradient = input_gradient.expect("two EML branches");
+                    if spec.residual
+                        && layer.input_shape.element_count() == layer.output_shape.element_count()
+                    {
+                        input_gradient = self
+                            .backend
+                            .saxpy_f32(1.0, &grad, &input_gradient, config)
+                            .map_err(|err| backend_error("EML residual input gradient", err))?;
+                    }
+                    self.accumulate_previous_gpu_gradient(
+                        layer.index,
+                        input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
+                }
                 (LayerKind::Moe(spec), Some(LayerParams::Moe(params))) => {
                     let cache = forward
                         .gpu_moe_caches
@@ -9554,9 +9718,10 @@ where
                         return true;
                     }
                 }
-                // Deconvolution and EML branch convolutions are host-resident;
-                // run the whole backward on the CPU.
-                LayerKind::Deconvolutional(_) | LayerKind::EmlConvolutional(_) => return true,
+                // Deconvolution has no device backward. BN EML branches stay
+                // on the CPU fallback until batch-stat backward is integrated.
+                LayerKind::Deconvolutional(_) => return true,
+                LayerKind::EmlConvolutional(spec) if spec.branch.batch_normalize => return true,
                 // `[laya_marker_gather]` has no device backward yet; keep the
                 // whole net on the CPU backward (forward uses a host round trip).
                 LayerKind::LayaMarkerGather(_) => return true,
@@ -9729,6 +9894,54 @@ where
         }
         for (slot, value) in train.bias_updates.iter_mut().zip(db) {
             *slot += value;
+        }
+        Ok(())
+    }
+
+    fn accumulate_eml_host_gradients(
+        &self,
+        layer_index: usize,
+        branch_slot: usize,
+        weight_gradient: &B::Tensor,
+        bias_gradient: &B::Tensor,
+    ) -> Result<()> {
+        let weights = self
+            .backend
+            .download_f32(weight_gradient)
+            .map_err(|err| backend_error("download EML branch weight gradient", err))?;
+        let biases = self
+            .backend
+            .download_f32(bias_gradient)
+            .map_err(|err| backend_error("download EML branch bias gradient", err))?;
+        let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
+        let Some(LayerTrainBuffers::EmlConvolutional(train)) = buffers.get_mut(layer_index)
+        else {
+            return Err(Error::InvalidConfig(format!(
+                "missing EML train buffers for layer #{layer_index}"
+            )));
+        };
+        let branch = match branch_slot {
+            0 => &mut train.input,
+            1 => &mut train.self_params,
+            _ => {
+                return Err(Error::InvalidConfig(format!(
+                    "invalid EML branch slot {branch_slot} at layer #{layer_index}"
+                )));
+            }
+        };
+        if branch.batch_norm.is_some()
+            || branch.weight_updates.len() != weights.len()
+            || branch.bias_updates.len() != biases.len()
+        {
+            return Err(Error::InvalidConfig(format!(
+                "EML branch train-buffer mismatch at layer #{layer_index}, slot {branch_slot}"
+            )));
+        }
+        for (update, gradient) in branch.weight_updates.iter_mut().zip(weights) {
+            *update += gradient;
+        }
+        for (update, gradient) in branch.bias_updates.iter_mut().zip(biases) {
+            *update += gradient;
         }
         Ok(())
     }

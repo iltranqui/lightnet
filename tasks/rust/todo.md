@@ -204,10 +204,14 @@ Immediately next, in dependency order:
   EML branch convolutions and the combine through the f32 backend on GPU
   forward, including rolling-stat BN folding; `oxide_runtime_chain` passes
   19/19, including BN/no-BN outputs and cache invalidation after host updates.
-  CPU branch caches
-  still feed the explicit CPU backward/optimizer fallback. Native Oxide backward/
-  optimizer and C++ batch-stat/EMA BN training behavior remain open. No compiled-
-  C++ golden is available; do not claim full C++ parity.
+  CPU branch caches still feed the explicit fallback when needed. v71 adds
+  native Oxide backward for no-BN EML: backend EML adjoints and both convolution
+  input/weight gradients, residual routing, and host accumulation for SGD/Adam.
+  `oxide_runtime_chain` passes 19/19, including two accumulated no-BN backwards;
+  BN EML still uses the CPU backward fallback. Parameter optimizer updates remain
+  host-side. Still open: BN native backward, device-side optimizer, and C++
+  batch-stat/EMA training behavior. No compiled-C++ golden is available; do not
+  claim full C++ parity.
 - [ ] Phase 2B `dcnv3` blocked: no reference numerics (stub in all five branches).
 - [ ] Phase 2C OBB family (unblocked by decision 4; XL — also data loading, NMS,
   mAP).
