@@ -272,8 +272,9 @@ impl Activation {
     pub fn to_cuda_f32_kind(&self) -> Option<F32ActivationKind> {
         match self {
             Self::Linear => Some(F32ActivationKind::Linear),
+            Self::Loggy => Some(F32ActivationKind::Loggy),
             Self::Logistic => Some(F32ActivationKind::Logistic),
-            Self::Loggy | Self::Relie | Self::Plse | Self::Hardtan | Self::Lhtan | Self::Stair | Self::Revleaky => None,
+            Self::Relie | Self::Plse | Self::Hardtan | Self::Lhtan | Self::Stair | Self::Revleaky => None,
             Self::Relu => Some(F32ActivationKind::Relu),
             Self::Leaky => Some(F32ActivationKind::Leaky),
             Self::Mish => Some(F32ActivationKind::Mish),
@@ -3409,6 +3410,7 @@ mod tests {
         };
         for ok in [
             "linear",
+            "loggy",
             "leaky",
             "mish",
             "swish",

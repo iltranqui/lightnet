@@ -13317,7 +13317,10 @@ fn activation_gradient_from_output(
 ) -> Result<f32> {
     match activation {        Activation::Linear => Ok(1.0),
         Activation::Logistic => Ok(output_value * (1.0 - output_value)),
-        Activation::Loggy => Ok(0.5 * (1.0 - output_value * output_value)),
+        Activation::Loggy => Ok(activation_input.map_or_else(
+            || crate::activation_math::loggy_grad_from_output(output_value),
+            crate::activation_math::loggy_grad,
+        )),
         Activation::Relu => Ok((output_value > 0.0) as i32 as f32),
         Activation::Leaky => Ok(if output_value > 0.0 { 1.0 } else { 0.1 }),
         Activation::Tanh => Ok(1.0 - output_value * output_value),
@@ -13471,7 +13474,7 @@ fn activate(activation: Activation, value: f32) -> f32 {
     match activation {
         Activation::Linear => value,
         Activation::Logistic => 1.0 / (1.0 + (-value).exp()),
-        Activation::Loggy => 2.0 / (1.0 + (-value).exp()) - 1.0,
+        Activation::Loggy => crate::activation_math::loggy(value),
         Activation::Relu => value.max(0.0),
         Activation::Leaky => {
             if value > 0.0 {
@@ -15290,6 +15293,7 @@ mod tests {
     fn apply_fake_activation(activation: F32ActivationKind, value: f32) -> f32 {
         let activation = match activation {
             F32ActivationKind::Linear => Activation::Linear,
+            F32ActivationKind::Loggy => Activation::Loggy,
             F32ActivationKind::Logistic => Activation::Logistic,
             F32ActivationKind::Relu => Activation::Relu,
             F32ActivationKind::Leaky => Activation::Leaky,
@@ -15309,6 +15313,7 @@ mod tests {
     fn fake_activation_gradient(activation: F32ActivationKind, value: f32) -> f32 {
         match activation {
             F32ActivationKind::Linear => 1.0,
+            F32ActivationKind::Loggy => crate::activation_math::loggy_grad(value),
             F32ActivationKind::Logistic => {
                 let sigmoid = 1.0 / (1.0 + (-value).exp());
                 sigmoid * (1.0 - sigmoid)
@@ -17865,6 +17870,10 @@ mod tests {
         assert_eq!(
             Activation::Mish.to_cuda_f32_kind(),
             Some(F32ActivationKind::Mish)
+        );
+        assert_eq!(
+            Activation::Loggy.to_cuda_f32_kind(),
+            Some(F32ActivationKind::Loggy)
         );
         assert_eq!(
             Activation::Elu.to_cuda_f32_kind(),
@@ -20665,6 +20674,7 @@ mod tests {
     fn gpu_activation_chains_match_cpu_forward_and_backward() {
         for act in [
             "leaky",
+            "loggy",
             "relu6",
             "ramp",
             "mish",

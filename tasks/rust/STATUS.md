@@ -34,6 +34,13 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- Added an oxide loggy activation kernel and exact derivative, wiring it through
+  cfg parsing, f32/f16 convolution activation paths, and the real-device runtime.
+  Verified by `oxide_parity` (11 passed, including finite differences and
+  input-vs-output derivative parity), `oxide_half` (13 passed, 1 ignored), all 13
+  `oxide_cfg_shapes` tests (165 convolution-activation pairs), all 7 real-device
+  `oxide_runtime_chain` tests, and the 391-test core library suite. The oxide
+  `--no-run` build compiled every test target.
 - Added an oxide Hard Mish activation kernel and exact derivative, including
   Darknet's strict threshold behavior at -2 and 0. Verified by `oxide_parity`
   (11 passed, including finite differences and explicit x=-2), `oxide_half` (13

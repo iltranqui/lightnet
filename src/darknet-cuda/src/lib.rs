@@ -13,6 +13,8 @@ pub const DEFAULT_TILE_1D: usize = 256;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum F32ActivationKind {
     Linear,
+    /// Darknet loggy: `2 * logistic(x) - 1`.
+    Loggy,
     Logistic,
     Relu,
     Leaky,

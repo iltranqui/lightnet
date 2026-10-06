@@ -1438,8 +1438,9 @@ fn shortcut_fit_edge_cases_and_errors() {
 
 // -------------------------------------------------------------- activations
 
-const KINDS: [F32ActivationKind; 13] = [
+const KINDS: [F32ActivationKind; 14] = [
     F32ActivationKind::Linear,
+    F32ActivationKind::Loggy,
     F32ActivationKind::Logistic,
     F32ActivationKind::Relu,
     F32ActivationKind::Leaky,
@@ -1459,6 +1460,7 @@ fn kind_of(name: &str) -> Option<F32ActivationKind> {
     // here, forcing this test (and activations.csv coverage) to be revisited.
     let k = match name {
         "linear" => F32ActivationKind::Linear,
+        "loggy" => F32ActivationKind::Loggy,
         "logistic" => F32ActivationKind::Logistic,
         "relu" => F32ActivationKind::Relu,
         "leaky" => F32ActivationKind::Leaky,
@@ -1475,6 +1477,7 @@ fn kind_of(name: &str) -> Option<F32ActivationKind> {
     };
     match k {
         F32ActivationKind::Linear
+        | F32ActivationKind::Loggy
         | F32ActivationKind::Logistic
         | F32ActivationKind::Relu
         | F32ActivationKind::Leaky
@@ -1494,6 +1497,7 @@ fn kind_of(name: &str) -> Option<F32ActivationKind> {
 fn act64(kind: F32ActivationKind, x: f64) -> f64 {
     match kind {
         F32ActivationKind::Linear => x,
+        F32ActivationKind::Loggy => 2.0 / (1.0 + (-x).exp()) - 1.0,
         F32ActivationKind::Logistic => 1.0 / (1.0 + (-x).exp()),
         F32ActivationKind::Relu => x.max(0.0),
         F32ActivationKind::Leaky => if x > 0.0 { x } else { 0.1 * x },
@@ -1536,6 +1540,7 @@ fn grad64(kind: F32ActivationKind, x: f64) -> f64 {
     let sig = 1.0 / (1.0 + (-x).exp());
     match kind {
         F32ActivationKind::Linear => 1.0,
+        F32ActivationKind::Loggy => 2.0 * sig * (1.0 - sig),
         F32ActivationKind::Logistic => sig * (1.0 - sig),
         F32ActivationKind::Relu => if x > 0.0 { 1.0 } else { 0.0 },
         F32ActivationKind::Leaky => if x > 0.0 { 1.0 } else { 0.1 },
@@ -1582,6 +1587,7 @@ fn grad64(kind: F32ActivationKind, x: f64) -> f64 {
 fn act32(kind: F32ActivationKind, x: f32) -> f32 {
     match kind {
         F32ActivationKind::Linear => x,
+        F32ActivationKind::Loggy => 2.0 / (1.0 + (-x).exp()) - 1.0,
         F32ActivationKind::Logistic => 1.0 / (1.0 + (-x).exp()),
         F32ActivationKind::Relu => x.max(0.0),
         F32ActivationKind::Leaky => if x > 0.0 { x } else { 0.1 * x },

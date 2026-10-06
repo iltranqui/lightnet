@@ -110,6 +110,7 @@ fn assert_chain(cfg: &str, seed_layer: usize, what: &str) {
 fn chained_conv_activation_stacks_match_cpu_backward() {
     for act in [
         "leaky",
+        "loggy",
         "relu6",
         "ramp",
         "mish",

@@ -7,6 +7,19 @@ const GELU_B: f32 = 0.035_677;
 const SELU_SCALE: f32 = 1.0507;
 const SELU_ALPHA: f32 = 1.6732;
 
+pub(crate) fn loggy(x: f32) -> f32 {
+    2.0 / (1.0 + (-x).exp()) - 1.0
+}
+
+pub(crate) fn loggy_grad(x: f32) -> f32 {
+    let sigmoid = 1.0 / (1.0 + (-x).exp());
+    2.0 * sigmoid * (1.0 - sigmoid)
+}
+
+pub(crate) fn loggy_grad_from_output(output: f32) -> f32 {
+    0.5 * (1.0 - output * output)
+}
+
 pub(crate) fn gelu(x: f32) -> f32 {
     0.5 * x * (1.0 + (GELU_A * x + GELU_B * x * x * x).tanh())
 }
@@ -115,6 +128,9 @@ mod tests {
 
     #[test]
     fn forward_values_match_cpp_formulas() {
+        near("loggy(0)", loggy(0.0), 0.0, 0.0);
+        near("loggy(1)", loggy(1.0), 0.462_117_17, 1e-7);
+        near("loggy(-1)", loggy(-1.0), -0.462_117_17, 1e-7);
         near("gelu(0)", gelu(0.0), 0.0, 1e-7);
         near("gelu(1)", gelu(1.0), 0.841_192, 1e-4);
         near("gelu(-1)", gelu(-1.0), -0.158_808, 1e-4);
@@ -143,13 +159,14 @@ mod tests {
         near("hard_mish(2)", hard_mish(2.0), 2.0, 0.0);
     }
 
-    // Away from every kink/discontinuity of the ten functions (kinks at 0, +-1, -2, +-4, integers).
+    // Away from every kink/discontinuity of the functions (kinks at 0, +-1, -2, +-4, integers).
     const POINTS: [f32; 8] = [-5.3, -3.2, -1.7, -0.6, 0.4, 0.9, 2.3, 4.6];
 
     #[test]
     fn analytic_gradients_match_central_differences() {
         let h = 1e-2f32;
-        let cases: [(&str, fn(f32) -> f32, fn(f32) -> f32); 8] = [
+        let cases: [(&str, fn(f32) -> f32, fn(f32) -> f32); 9] = [
+            ("loggy", loggy, loggy_grad),
             ("gelu", gelu, gelu_grad),
             ("elu", elu, elu_grad),
             ("selu", selu, selu_grad),

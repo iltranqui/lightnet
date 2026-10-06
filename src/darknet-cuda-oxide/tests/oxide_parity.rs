@@ -42,8 +42,9 @@ fn assert_close(name: &str, got: &[f32], want: &[f32]) {
     }
 }
 
-const KINDS: [F32ActivationKind; 13] = [
+const KINDS: [F32ActivationKind; 14] = [
     F32ActivationKind::Linear,
+    F32ActivationKind::Loggy,
     F32ActivationKind::Logistic,
     F32ActivationKind::Relu,
     F32ActivationKind::Leaky,
@@ -61,6 +62,7 @@ const KINDS: [F32ActivationKind; 13] = [
 fn cpu_activate(kind: F32ActivationKind, x: f32) -> f32 {
     match kind {
         F32ActivationKind::Linear => x,
+        F32ActivationKind::Loggy => 2.0 / (1.0 + (-x).exp()) - 1.0,
         F32ActivationKind::Logistic => 1.0 / (1.0 + (-x).exp()),
         F32ActivationKind::Relu => x.max(0.0),
         F32ActivationKind::Leaky => {
@@ -105,6 +107,10 @@ fn cpu_activate(kind: F32ActivationKind, x: f32) -> f32 {
 fn cpu_gradient(kind: F32ActivationKind, x: f32) -> f32 {
     match kind {
         F32ActivationKind::Linear => 1.0,
+        F32ActivationKind::Loggy => {
+            let sigmoid = 1.0 / (1.0 + (-x).exp());
+            2.0 * sigmoid * (1.0 - sigmoid)
+        }
         F32ActivationKind::Logistic => {
             let s = 1.0 / (1.0 + (-x).exp());
             s * (1.0 - s)
@@ -382,6 +388,7 @@ fn invalid_shapes_return_error() {
 fn act64(kind: F32ActivationKind, x: f64) -> f64 {
     match kind {
         F32ActivationKind::Linear => x,
+        F32ActivationKind::Loggy => 2.0 / (1.0 + (-x).exp()) - 1.0,
         F32ActivationKind::Logistic => 1.0 / (1.0 + (-x).exp()),
         F32ActivationKind::Relu => x.max(0.0),
         F32ActivationKind::Leaky => {
@@ -472,6 +479,7 @@ fn activation_backward_input_form_equals_core_output_form() {
     let dt = b.upload_f32(&[n], &delta).unwrap();
     for kind in [
         F32ActivationKind::Linear,
+        F32ActivationKind::Loggy,
         F32ActivationKind::Logistic,
         F32ActivationKind::Relu,
         F32ActivationKind::Leaky,
@@ -490,6 +498,7 @@ fn activation_backward_input_form_equals_core_output_form() {
                 // Formulas copied from darknet-core `activation_gradient_from_output`.
                 let g = match kind {
                     F32ActivationKind::Linear => 1.0,
+                    F32ActivationKind::Loggy => 0.5 * (1.0 - y * y),
                     F32ActivationKind::Logistic => y * (1.0 - y),
                     F32ActivationKind::Relu => (y > 0.0) as i32 as f32,
                     F32ActivationKind::Leaky => {

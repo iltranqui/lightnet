@@ -253,6 +253,7 @@ fn activation_code(kind: F32ActivationKind) -> u32 {
         F32ActivationKind::Elu => activations::ACT_ELU,
         F32ActivationKind::Selu => activations::ACT_SELU,
         F32ActivationKind::HardMish => activations::ACT_HARD_MISH,
+        F32ActivationKind::Loggy => activations::ACT_LOGGY,
     }
 }
 
