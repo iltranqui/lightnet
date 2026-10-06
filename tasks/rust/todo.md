@@ -216,12 +216,17 @@ Immediately next, in dependency order:
   optimizer updates. v73 adds per-branch device gradient/momentum buffers,
   native SGD for BN and no-BN EML, and deferred synchronization for both branch
   parameter blocks; SGD accumulation and finiteness checks stay device-side.
-  `MEM=3G PKGS=darknet-core ./tools/test_host.sh eml_` passes 9/9 and
-  `./tools/test_oxide.sh --test oxide_runtime_chain` passes 19/19, including
-  multi-step SGD momentum parity and deferred host sync. EML Adam remains on the
-  host fallback. CPU EML BN training still uses rolling rather than batch
-  statistics; no CPU/C++ training parity is claimed. Device Adam and
-  compiled-C++ golden validation remain open.
+  `MEM=3G PKGS=darknet-core ./tools/test_host.sh eml_` passed 9/9 and
+  `./tools/test_oxide.sh --test oxide_runtime_chain` passed 19/19, including
+  multi-step SGD momentum parity and deferred host sync. v74 adds native Adam
+  for both branches and BN scales, per-branch moments, deferred synchronization,
+  host fallback for CPU-backward networks, and DNOPT5 sidecar persistence while
+  retaining DNOPT1–4 readers and migrating DNOPT3 EML host moments. Host EML
+  tests pass 12/12, optimizer-state tests pass 5/5, and `oxide_runtime_chain`
+  passes 20/20, including no-BN Adam update parity, BN-scale updates, and
+  deferred sync. No compiled-C++ golden is available; CPU EML BN training still
+  uses rolling rather than batch statistics, so no CPU/C++ training parity is
+  claimed.
 - [ ] Phase 2B `dcnv3` blocked: no reference numerics (stub in all five branches).
 - [ ] Phase 2C OBB family (unblocked by decision 4; XL — also data loading, NMS,
   mAP).

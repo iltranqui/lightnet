@@ -3264,6 +3264,8 @@ where
     adam_state: Vec<Option<GpuAdamLayerState<B::Tensor>>>,
     /// Device Adam moments for MoE routers/experts, including BN scales in DNOPT4.
     moe_adam_state: Vec<Option<GpuMoeAdamLayerState<B::Tensor>>>,
+    /// Device Adam moments for EML's two convolution branches, persisted in DNOPT5.
+    eml_adam_state: Vec<Option<GpuEmlAdamLayerState<B::Tensor>>>,
     /// Adam moments for parameters updated by the host fallback.
     host_adam_state: RefCell<Vec<Option<HostAdamLayerState>>>,
     /// Number of Adam updates applied so far (the 1-based bias-correction `t`).
@@ -3511,6 +3513,21 @@ struct GpuMoeAdamLayerState<T> {
     experts: Vec<GpuAdamLayerState<T>>,
 }
 
+#[derive(Clone, Debug)]
+struct GpuEmlAdamLayerState<T> {
+    input: GpuAdamLayerState<T>,
+    self_params: GpuAdamLayerState<T>,
+}
+
+impl<T> Default for GpuEmlAdamLayerState<T> {
+    fn default() -> Self {
+        Self {
+            input: GpuAdamLayerState::default(),
+            self_params: GpuAdamLayerState::default(),
+        }
+    }
+}
+
 impl<T> Default for GpuAdamLayerState<T> {
     fn default() -> Self {
         Self {
@@ -3709,7 +3726,7 @@ struct GpuMoeTrainBuffers<T> {
     dirty: bool,
 }
 
-/// Device gradients and SGD momentum for EML's two convolution branches.
+/// Device gradients and SGD update buffers for EML's two convolution branches.
 #[derive(Clone, Debug)]
 struct GpuEmlTrainBuffers<T> {
     input: GpuConvolutionTrainBuffers<T>,
@@ -4152,6 +4169,7 @@ where
                 .collect(),
         );
         let moe_adam_state = (0..network.layers.len()).map(|_| None).collect();
+        let eml_adam_state = (0..network.layers.len()).map(|_| None).collect();
         let host_adam_state = RefCell::new((0..network.layers.len()).map(|_| None).collect());
         Self {
             backend,
@@ -4165,6 +4183,7 @@ where
             cpu_fallback_train_buffers,
             adam_state: Vec::new(),
             moe_adam_state,
+            eml_adam_state,
             host_adam_state,
             adam_step: 0,
             train_iteration: 0,
@@ -4405,19 +4424,27 @@ where
     }
 
     /// Persist the Adam step counter and device/host moment tensors to a sidecar
-    /// file. DNOPT4 adds device MoE expert BN-scale moments; DNOPT1–3 remain
-    /// readable. The `.weights` format stays C++-compatible and carries only
-    /// parameters plus `seen`; this sidecar preserves optimizer state on resume.
+    /// file. DNOPT4 adds device MoE expert BN-scale moments; DNOPT5 adds EML
+    /// branch moments. DNOPT1–4 remain readable. The `.weights` format stays
+    /// C++-compatible and carries only parameters plus `seen`; this sidecar
+    /// preserves optimizer state on resume.
     pub fn save_optimizer_state(&self, path: impl AsRef<Path>) -> Result<()> {
         let mut file = std::io::BufWriter::with_capacity(1 << 20, File::create(path)?);
         let has_moe_scale_moments = self.moe_adam_state.iter().flatten().any(|state| {
             state.experts.iter().any(|expert| expert.scales.is_some())
         });
-        let version = if has_moe_scale_moments { 4 } else { 3 };
-        file.write_all(if version == 4 {
-            b"DNOPT4\0\0"
+        let has_eml_moments = self.eml_adam_state.iter().any(Option::is_some);
+        let version = if has_eml_moments {
+            5
+        } else if has_moe_scale_moments {
+            4
         } else {
-            b"DNOPT3\0\0"
+            3
+        };
+        file.write_all(match version {
+            5 => b"DNOPT5\0\0",
+            4 => b"DNOPT4\0\0",
+            _ => b"DNOPT3\0\0",
         })?;
         file.write_all(&self.adam_step.to_le_bytes())?;
         let entries: Vec<usize> = self
@@ -4481,6 +4508,27 @@ where
                 }
             }
         }
+        if version >= 5 {
+            let eml_entries: Vec<usize> = self
+                .eml_adam_state
+                .iter()
+                .enumerate()
+                .filter_map(|(index, state)| state.as_ref().map(|_| index))
+                .collect();
+            file.write_all(&(eml_entries.len() as u64).to_le_bytes())?;
+            for index in eml_entries {
+                file.write_all(&(index as u64).to_le_bytes())?;
+                let state = self.eml_adam_state[index]
+                    .as_ref()
+                    .expect("filtered to Some above");
+                let (weight_shape, filter_shape) = self.eml_adam_parameter_shapes(index)?;
+                for branch in [&state.input, &state.self_params] {
+                    self.write_moments(&mut file, branch.weights.as_ref(), &weight_shape)?;
+                    self.write_moments(&mut file, branch.biases.as_ref(), &filter_shape)?;
+                    self.write_moments(&mut file, branch.scales.as_ref(), &filter_shape)?;
+                }
+            }
+        }
         file.flush()?;
         Ok(())
     }
@@ -4497,6 +4545,7 @@ where
             b"DNOPT2\0\0" => 2,
             b"DNOPT3\0\0" => 3,
             b"DNOPT4\0\0" => 4,
+            b"DNOPT5\0\0" => 5,
             _ => return Err(Error::Weights("bad optimizer state magic".to_owned())),
         };
         let mut buf4 = [0u8; 4];
@@ -4605,11 +4654,70 @@ where
                 moe_state[index] = Some(GpuMoeAdamLayerState { router, experts });
             }
         }
+        let mut eml_state: Vec<Option<GpuEmlAdamLayerState<B::Tensor>>> =
+            (0..self.network.layers.len()).map(|_| None).collect();
+        if version >= 5 {
+            file.read_exact(&mut buf8)?;
+            let eml_count = usize::try_from(u64::from_le_bytes(buf8))
+                .map_err(|_| Error::Weights("optimizer EML layer count is too large".to_owned()))?;
+            if eml_count > self.network.layers.len() {
+                return Err(Error::Weights(
+                    "optimizer EML layer count exceeds network size".to_owned(),
+                ));
+            }
+            let mut seen = vec![false; self.network.layers.len()];
+            for _ in 0..eml_count {
+                file.read_exact(&mut buf8)?;
+                let index = usize::try_from(u64::from_le_bytes(buf8)).map_err(|_| {
+                    Error::Weights("optimizer EML layer index is too large".to_owned())
+                })?;
+                if index >= self.network.layers.len() || seen[index] {
+                    return Err(Error::Weights(
+                        "optimizer EML layer index is invalid or repeated".to_owned(),
+                    ));
+                }
+                seen[index] = true;
+                let (weight_shape, filter_shape) = self.eml_adam_parameter_shapes(index)?;
+                let mut read_branch = || -> Result<GpuAdamLayerState<B::Tensor>> {
+                    Ok(GpuAdamLayerState {
+                        weights: self.read_moments(&mut file, &weight_shape)?,
+                        biases: self.read_moments(&mut file, &filter_shape)?,
+                        scales: self.read_moments(&mut file, &filter_shape)?,
+                    })
+                };
+                eml_state[index] = Some(GpuEmlAdamLayerState {
+                    input: read_branch()?,
+                    self_params: read_branch()?,
+                });
+            }
+        }
         *self.host_adam_state.get_mut() = host_state;
         self.adam_state = state;
         self.moe_adam_state = moe_state;
+        self.eml_adam_state = eml_state;
         self.adam_step = step;
         Ok(())
+    }
+
+    fn eml_adam_parameter_shapes(&self, index: usize) -> Result<(Vec<usize>, Vec<usize>)> {
+        let layer = self.network.layers.get(index).ok_or_else(|| {
+            Error::Weights(format!("optimizer EML layer index {index} is out of range"))
+        })?;
+        let LayerKind::EmlConvolutional(spec) = &layer.kind else {
+            return Err(Error::Weights(format!(
+                "optimizer EML state for non-EML layer #{index}"
+            )));
+        };
+        let channels = layer.input_shape.channels / spec.branch.groups.max(1);
+        Ok((
+            vec![
+                spec.branch.filters,
+                channels,
+                spec.branch.size,
+                spec.branch.size,
+            ],
+            vec![spec.branch.filters],
+        ))
     }
 
     fn adam_parameter_shapes(&self, index: usize) -> Result<(Vec<usize>, Vec<usize>)> {
@@ -4666,17 +4774,17 @@ where
         let expected = shape.iter().product::<usize>();
         if first.len() != expected || second.len() != expected {
             return Err(Error::InvalidConfig(
-                "host-to-device MoE Adam moment shape mismatch".to_owned(),
+                "host-to-device Adam moment shape mismatch".to_owned(),
             ));
         }
         let first = self
             .backend
             .upload_f32(shape, &first)
-            .map_err(|err| backend_error("upload restored MoE Adam moment", err))?;
+            .map_err(|err| backend_error("upload restored Adam moment", err))?;
         let second = self
             .backend
             .upload_f32(shape, &second)
-            .map_err(|err| backend_error("upload restored MoE Adam moment", err))?;
+            .map_err(|err| backend_error("upload restored Adam moment", err))?;
         Ok(Some((first, second)))
     }
 
@@ -4723,6 +4831,54 @@ where
                 self.upload_host_adam_moments(host_expert.biases, &expert_biases)?;
             state.experts[expert_index].scales =
                 self.upload_host_adam_moments(host_expert.scales, &expert_biases)?;
+        }
+        Ok(state)
+    }
+
+    fn eml_adam_state_for_update(&self, index: usize) -> Result<GpuEmlAdamLayerState<B::Tensor>> {
+        if let Some(state) = self.eml_adam_state.get(index).and_then(Option::as_ref) {
+            return Ok(state.clone());
+        }
+        let (weight_shape, filter_shape) = self.eml_adam_parameter_shapes(index)?;
+        let LayerKind::EmlConvolutional(spec) = &self.network.layers[index].kind else {
+            unreachable!("EML parameter-shape helper validated layer kind");
+        };
+        let host_state = self
+            .host_adam_state
+            .borrow()
+            .get(index)
+            .and_then(Clone::clone);
+        let mut state = GpuEmlAdamLayerState::default();
+        let Some(host_state) = host_state else {
+            return Ok(state);
+        };
+        if host_state.weights.is_some()
+            || host_state.biases.is_some()
+            || host_state.scales.is_some()
+            || host_state.children.len() > 2
+            || host_state
+                .children
+                .iter()
+                .any(|branch| !branch.children.is_empty())
+        {
+            return Err(Error::InvalidConfig(format!(
+                "restored EML Adam host state shape mismatch at layer #{index}"
+            )));
+        }
+        for (slot, host_branch) in host_state.children.into_iter().enumerate() {
+            if host_branch.scales.is_some() && !spec.branch.batch_normalize {
+                return Err(Error::InvalidConfig(format!(
+                    "restored BN EML Adam state reached no-BN layer #{index}"
+                )));
+            }
+            let branch = if slot == 0 {
+                &mut state.input
+            } else {
+                &mut state.self_params
+            };
+            branch.weights = self.upload_host_adam_moments(host_branch.weights, &weight_shape)?;
+            branch.biases = self.upload_host_adam_moments(host_branch.biases, &filter_shape)?;
+            branch.scales = self.upload_host_adam_moments(host_branch.scales, &filter_shape)?;
         }
         Ok(state)
     }
@@ -5167,6 +5323,9 @@ where
         if self.adam_state.len() != self.network.layers.len() {
             self.adam_state = (0..self.network.layers.len()).map(|_| None).collect();
         }
+        if self.eml_adam_state.len() != self.network.layers.len() {
+            self.eml_adam_state = (0..self.network.layers.len()).map(|_| None).collect();
+        }
         let iteration_num = self.train_iteration as i64 + 1;
         let burn_in = self.network.net.burn_in;
         for layer_index in 0..self.network.layers.len() {
@@ -5310,7 +5469,7 @@ where
                 self.host_weights_stale = true;
             }
         }
-        let device_eml_path = !net.adam && !self.requires_cpu_backward_fallback();
+        let device_eml_path = !self.requires_cpu_backward_fallback();
         let mut preserve_device_eml_params = vec![false; self.network.layers.len()];
         if device_eml_path {
             for layer_index in 0..self.network.layers.len() {
@@ -5372,7 +5531,11 @@ where
         }
         self.flush_device_moe_gradients_to_host(&preserve_device_moe_params)?;
         if let GpuOptimizerStep::Adam(adam) = step {
-            self.update_cpu_fallback_adam(&adam, &preserve_device_moe_params)?;
+            self.update_cpu_fallback_adam(
+                &adam,
+                &preserve_device_moe_params,
+                &preserve_device_eml_params,
+            )?;
         } else {
             self.update_cpu_fallback_weights(
                 lr / loss_scale,
@@ -5393,6 +5556,7 @@ where
         &mut self,
         adam: &AdamParams,
         device_moe_layers: &[bool],
+        device_eml_layers: &[bool],
     ) -> Result<()> {
         let iteration_num = self.train_iteration as i64 + 1;
         let burn_in = self.network.net.burn_in;
@@ -5405,6 +5569,8 @@ where
             if matches!(layer.kind, LayerKind::Convolutional(_))
                 || (matches!(layer.kind, LayerKind::Moe(_))
                     && device_moe_layers.get(index).copied().unwrap_or(false))
+                || (matches!(layer.kind, LayerKind::EmlConvolutional(_))
+                    && device_eml_layers.get(index).copied().unwrap_or(false))
             {
                 continue;
             }
@@ -5631,11 +5797,12 @@ where
             }
         }
         // Host-updated container branches need re-uploading. Device optimizer
-        // updates (including BN MoE experts) retain raw tensors for deferred
-        // synchronization and the next Oxide forward pass.
+        // updates retain raw tensors for deferred synchronization and the next
+        // Oxide forward pass.
         let mut cache = self.device_conv_params.borrow_mut();
         for (index, layer) in self.network.layers.iter().enumerate() {
-            if matches!(layer.kind, LayerKind::EmlConvolutional(_))
+            if (matches!(layer.kind, LayerKind::EmlConvolutional(_))
+                && !device_eml_layers.get(index).copied().unwrap_or(false))
                 || (matches!(layer.kind, LayerKind::Moe(_))
                     && !device_moe_layers.get(index).copied().unwrap_or(false))
             {
@@ -9305,23 +9472,13 @@ where
                                 config,
                             )
                             .map_err(|err| backend_error("EML branch input backward", err))?;
-                        if self.network.net.adam {
-                            self.accumulate_eml_host_gradients(
-                                layer.index,
-                                slot,
-                                &weight_gradient,
-                                &bias_gradient,
-                                scale_gradient.as_ref(),
-                            )?;
-                        } else {
-                            self.accumulate_eml_device_gradients(
-                                layer.index,
-                                slot,
-                                weight_gradient,
-                                bias_gradient,
-                                scale_gradient,
-                            )?;
-                        }
+                        self.accumulate_eml_device_gradients(
+                            layer.index,
+                            slot,
+                            weight_gradient,
+                            bias_gradient,
+                            scale_gradient,
+                        )?;
                         input_gradient = Some(match input_gradient {
                             Some(accumulated) => self
                                 .backend
@@ -10303,68 +10460,6 @@ where
         Ok(())
     }
 
-    fn accumulate_eml_host_gradients(
-        &self,
-        layer_index: usize,
-        branch_slot: usize,
-        weight_gradient: &B::Tensor,
-        bias_gradient: &B::Tensor,
-        scale_gradient: Option<&B::Tensor>,
-    ) -> Result<()> {
-        let weights = self
-            .backend
-            .download_f32(weight_gradient)
-            .map_err(|err| backend_error("download EML branch weight gradient", err))?;
-        let biases = self
-            .backend
-            .download_f32(bias_gradient)
-            .map_err(|err| backend_error("download EML branch bias gradient", err))?;
-        let scales = scale_gradient
-            .map(|gradient| {
-                self.backend
-                    .download_f32(gradient)
-                    .map_err(|err| backend_error("download EML branch BN scale gradient", err))
-            })
-            .transpose()?;
-        let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
-        let Some(LayerTrainBuffers::EmlConvolutional(train)) = buffers.get_mut(layer_index)
-        else {
-            return Err(Error::InvalidConfig(format!(
-                "missing EML train buffers for layer #{layer_index}"
-            )));
-        };
-        let branch = match branch_slot {
-            0 => &mut train.input,
-            1 => &mut train.self_params,
-            _ => {
-                return Err(Error::InvalidConfig(format!(
-                    "invalid EML branch slot {branch_slot} at layer #{layer_index}"
-                )));
-            }
-        };
-        if branch.weight_updates.len() != weights.len()
-            || branch.bias_updates.len() != biases.len()
-            || branch.batch_norm.as_ref().map(|bn| bn.scale_updates.len())
-                != scales.as_ref().map(Vec::len)
-        {
-            return Err(Error::InvalidConfig(format!(
-                "EML branch train-buffer mismatch at layer #{layer_index}, slot {branch_slot}"
-            )));
-        }
-        for (update, gradient) in branch.weight_updates.iter_mut().zip(weights) {
-            *update += gradient;
-        }
-        for (update, gradient) in branch.bias_updates.iter_mut().zip(biases) {
-            *update += gradient;
-        }
-        if let (Some(batch_norm), Some(scales)) = (branch.batch_norm.as_mut(), scales) {
-            for (update, gradient) in batch_norm.scale_updates.iter_mut().zip(scales) {
-                *update += gradient;
-            }
-        }
-        Ok(())
-    }
-
     fn accumulate_gpu_gradient(
         &self,
         slot: &mut Option<B::Tensor>,
@@ -10557,9 +10652,6 @@ where
         sync_host_weights: bool,
         config: ElementwiseLaunchConfig,
     ) -> Result<bool> {
-        let GpuOptimizerStep::Sgd { .. } = step else {
-            return Ok(false);
-        };
         let (spec, input_shape, train_options) = {
             let layer =
                 self.network.layers.get(layer_index).ok_or_else(|| {
@@ -10610,6 +10702,12 @@ where
         ];
         let filters_shape = [spec.branch.filters];
         let layer_step = step.with_lr_scale(train_options.learning_rate_scale);
+        let mut adam_state = match step {
+            GpuOptimizerStep::Adam(_) => self.eml_adam_state_for_update(layer_index)?,
+            GpuOptimizerStep::Sgd { .. } => {
+                self.eml_adam_state[layer_index].clone().unwrap_or_default()
+            }
+        };
         for slot in 0..2 {
             let branch_train = if slot == 0 {
                 &mut train.input
@@ -10633,7 +10731,7 @@ where
                     weight_gradient = self
                         .backend
                         .saxpy_f32(1.0, &pending.weights, &weight_gradient, config)
-                        .map_err(|err| backend_error("EML SGD gradient accumulation", err))?;
+                        .map_err(|err| backend_error("EML optimizer gradient accumulation", err))?;
                 }
                 let filter_size = weight_shape[1] * weight_shape[2] * weight_shape[3];
                 weight_gradient = self
@@ -10644,7 +10742,7 @@ where
                         NanInfMode::Reset,
                         config,
                     )
-                    .map_err(|err| backend_error("EML SGD update reset_nan_and_inf", err))?;
+                    .map_err(|err| backend_error("EML optimizer reset_nan_and_inf", err))?;
                 weight_gradient = self
                     .backend
                     .gradient_centralization_f32(
@@ -10653,7 +10751,7 @@ where
                         filter_size,
                         config,
                     )
-                    .map_err(|err| backend_error("EML SGD gradient centralization", err))?;
+                    .map_err(|err| backend_error("EML optimizer gradient centralization", err))?;
             }
             let pending_weight = if train_options.grad_centr && branch_train.scale_updates.is_some()
             {
@@ -10661,7 +10759,11 @@ where
             } else {
                 pending.as_ref().map(|pending| &pending.weights)
             };
-            let mut moments = GpuAdamLayerState::default();
+            let moments = if slot == 0 {
+                &mut adam_state.input
+            } else {
+                &mut adam_state.self_params
+            };
             let mut targets = vec![
                 GpuOptimTarget {
                     is_weight: true,
@@ -10734,6 +10836,10 @@ where
         self.device_eml_train_buffers.borrow_mut()[layer_index] = Some(train);
         if !sync_host_weights {
             self.host_weights_stale = true;
+        }
+        if matches!(step, GpuOptimizerStep::Adam(_)) {
+            self.eml_adam_state[layer_index] = Some(adam_state);
+            self.host_adam_state.borrow_mut()[layer_index] = None;
         }
         Ok(true)
     }
@@ -19973,8 +20079,9 @@ mod tests {
     use darknet_cuda::{ElementwiseLaunchConfig, F32ActivationKind, F32TensorOpsBackend};
 
     use super::{
-        ConvolutionalParams, ExecutableNetwork, ForwardResult, GpuExecutableNetwork, LayerParams,
-        LayerTrainBuffers, Tensor, compute_learning_rate, sgd_update,
+        ConvolutionalParams, ExecutableNetwork, ForwardResult, GpuExecutableNetwork,
+        HostAdamLayerState, LayerParams, LayerTrainBuffers, Tensor, compute_learning_rate,
+        sgd_update,
     };
 
     fn repo_cfg(name: &str) -> PathBuf {
@@ -27084,7 +27191,7 @@ mod tests {
     }
 
     #[test]
-    fn eml_convolutional_gpu_adam_updates_host_fallback_parameters() {
+    fn eml_convolutional_gpu_adam_updates_device_parameters() {
         let cfg = "[net]\nchannels=1\nbatch=1\nheight=1\nwidth=1\nadam=1\nb1=0.8\nb2=0.95\neps=0.001\n\
                    [eml_convolutional]\nfilters=1\nsize=1\nbatch_normalize=0\nresidual=0\n";
         let network = Network::from_config(
@@ -27100,19 +27207,153 @@ mod tests {
         params.self_params.weights[0] = -0.3;
         params.self_params.biases[0] = 0.2;
         let input = Tensor::from_data(TensorShape::new(1, 1, 1, 1), vec![0.25]).unwrap();
-        let before = params.input.weights[0];
+        let mut cpu = ExecutableNetwork::new(network);
+        cpu.params = gpu.params.clone();
+        let cpu_forward = cpu.forward_training(&input).expect("CPU EML Adam forward");
         let forward = gpu.forward_with_state(&input).expect("EML Adam forward");
-        let output = forward.cpu_forward.final_output().unwrap();
-        let seed = Tensor::filled(output.shape, 1.0);
+        let seed = Tensor::filled(cpu_forward.final_output().unwrap().shape, 1.0);
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &[Some(seed.clone())])
+            .expect("CPU EML Adam backward");
         gpu.backward_accumulate_seeded_gpu(&forward, &[Some(seed)])
             .expect("EML Adam backward");
+        let LayerTrainBuffers::EmlConvolutional(cpu_train) = &cpu.train_buffers[0] else {
+            unreachable!()
+        };
+        let device_train = gpu.device_eml_train_buffers.borrow();
+        let gpu_train = device_train[0].as_ref().unwrap();
+        assert_slice_close(
+            "EML Adam input weight gradient",
+            &cpu_train.input.weight_updates,
+            &gpu_train.input.weight_updates.data,
+            1e-5,
+        );
+        assert_slice_close(
+            "EML Adam self weight gradient",
+            &cpu_train.self_params.weight_updates,
+            &gpu_train.self_params.weight_updates.data,
+            1e-5,
+        );
+        drop(device_train);
+        let adam = darknet_cuda::host_ops::AdamParams {
+            lr: 0.01,
+            beta1: gpu.network.net.adam_b1,
+            beta2: gpu.network.net.adam_b2,
+            eps: gpu.network.net.adam_eps,
+            decay: 0.0,
+            batch: 1,
+            step: 1,
+            decoupled_decay: gpu.network.net.decoupled_decay,
+        };
+        let LayerParams::EmlConvolutional(before) = &gpu.params[0] else {
+            unreachable!()
+        };
+        let expected = |weights: &[f32], updates: &[f32]| {
+            darknet_cuda::host_ops::adam_update(
+                weights,
+                updates,
+                &vec![0.0; weights.len()],
+                &vec![0.0; weights.len()],
+                &adam,
+            )
+            .0
+        };
+        let expected_input_weights =
+            expected(&before.input.weights, &cpu_train.input.weight_updates);
+        let expected_input_biases = expected(&before.input.biases, &cpu_train.input.bias_updates);
+        let expected_self_weights = expected(
+            &before.self_params.weights,
+            &cpu_train.self_params.weight_updates,
+        );
+        let expected_self_biases = expected(
+            &before.self_params.biases,
+            &cpu_train.self_params.bias_updates,
+        );
+        let before = gpu.params.clone();
         gpu.update_weights_gpu(0.01, 0.0, 0.0, 1)
-            .expect("EML host Adam update");
+            .expect("EML device Adam update");
+        let LayerParams::EmlConvolutional(before) = &before[0] else {
+            unreachable!()
+        };
         let LayerParams::EmlConvolutional(updated) = &gpu.params[0] else {
             unreachable!()
         };
-        assert_ne!(before, updated.input.weights[0]);
+        assert_ne!(before.input.weights, updated.input.weights);
+        assert_ne!(before.input.biases, updated.input.biases);
+        assert_ne!(before.self_params.weights, updated.self_params.weights);
+        assert_ne!(before.self_params.biases, updated.self_params.biases);
+        assert_slice_close(
+            "EML Adam updated input weights",
+            &expected_input_weights,
+            &updated.input.weights,
+            1e-5,
+        );
+        assert_slice_close(
+            "EML Adam updated input biases",
+            &expected_input_biases,
+            &updated.input.biases,
+            1e-5,
+        );
+        assert_slice_close(
+            "EML Adam updated self weights",
+            &expected_self_weights,
+            &updated.self_params.weights,
+            1e-5,
+        );
+        assert_slice_close(
+            "EML Adam updated self biases",
+            &expected_self_biases,
+            &updated.self_params.biases,
+            1e-5,
+        );
+        let moments = gpu.eml_adam_state[0]
+            .as_ref()
+            .expect("device EML Adam state");
+        assert!(moments.input.weights.is_some());
+        assert!(moments.input.biases.is_some());
+        assert!(moments.self_params.weights.is_some());
+        assert!(moments.self_params.biases.is_some());
+        assert!(gpu.host_adam_state.borrow()[0].is_none());
+    }
+
+    #[test]
+    fn eml_adam_stays_host_side_when_network_requires_cpu_backward_fallback() {
+        let cfg = "[net]\nchannels=1\nbatch=1\nheight=1\nwidth=1\nadam=1\nb1=0.8\nb2=0.95\neps=0.001\n\
+                   [eml_convolutional]\nfilters=1\nsize=1\nbatch_normalize=0\nresidual=0\n\
+                   [deconvolutional]\nfilters=1\nsize=1\nstride=1\nactivation=linear\n";
+        let network = Network::from_config(
+            ConfigFile::parse_str("eml-adam-fallback.cfg", cfg)
+                .expect("EML Adam fallback cfg parses"),
+        )
+        .expect("EML Adam fallback network builds");
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        gpu.init_train_buffers_gpu()
+            .expect("fallback train buffers");
+        assert!(gpu.requires_cpu_backward_fallback());
+        {
+            let mut buffers = gpu.cpu_fallback_train_buffers.borrow_mut();
+            let LayerTrainBuffers::EmlConvolutional(train) = &mut buffers[0] else {
+                panic!("expected host EML train buffers");
+            };
+            train.input.weight_updates[0] = 1.0;
+            train.self_params.bias_updates[0] = 1.0;
+        }
+        let before = match &gpu.params[0] {
+            LayerParams::EmlConvolutional(params) => {
+                (params.input.weights[0], params.self_params.biases[0])
+            }
+            _ => unreachable!(),
+        };
+        gpu.update_weights_gpu(0.01, 0.0, 0.0, 1)
+            .expect("host fallback Adam update");
+        let after = match &gpu.params[0] {
+            LayerParams::EmlConvolutional(params) => {
+                (params.input.weights[0], params.self_params.biases[0])
+            }
+            _ => unreachable!(),
+        };
+        assert_ne!(before, after);
         assert!(gpu.host_adam_state.borrow()[0].is_some());
+        assert!(gpu.eml_adam_state[0].is_none());
     }
 
     /// C++ `parse_moe_convolutional_section` raises two hard errors, and both
@@ -30041,6 +30282,173 @@ mod tests {
             assert_slice_close("weights", &w0, &w1, 1e-6);
             assert_slice_close("biases", &b0, &b1, 1e-6);
             assert_slice_close("scales", &s0, &s1, 1e-6);
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn eml_adam_migrates_restored_host_moments_from_dnopt3() {
+        let dir = std::env::temp_dir().join(format!("darknet-eml-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy-eml-opt.state");
+        let cfg = "[net]\nchannels=1\nbatch=1\nheight=1\nwidth=1\nadam=1\n\
+                   [eml_convolutional]\nfilters=1\nsize=1\nbatch_normalize=1\n";
+        let build = || {
+            let network = Network::from_config(
+                ConfigFile::parse_str("eml-migrate.cfg", cfg).expect("EML cfg"),
+            )
+            .expect("EML network");
+            GpuExecutableNetwork::new(network, FakeBackend)
+        };
+        let host_branch = |weight_m: f32, bias_m: f32| HostAdamLayerState {
+            weights: Some((vec![weight_m], vec![weight_m + 1.0])),
+            biases: Some((vec![bias_m], vec![bias_m + 1.0])),
+            scales: Some((vec![weight_m + 2.0], vec![weight_m + 3.0])),
+            ..HostAdamLayerState::default()
+        };
+        let original = build();
+        original.host_adam_state.borrow_mut()[0] = Some(HostAdamLayerState {
+            children: vec![host_branch(0.1, 0.2), host_branch(0.3, 0.4)],
+            ..HostAdamLayerState::default()
+        });
+        original
+            .save_optimizer_state(&path)
+            .expect("save legacy sidecar");
+        assert_eq!(&std::fs::read(&path).unwrap()[..8], b"DNOPT3\0\0");
+
+        let mut restored = build();
+        restored
+            .load_optimizer_state(&path)
+            .expect("load legacy EML moments");
+        let state = restored
+            .eml_adam_state_for_update(0)
+            .expect("migrate host EML moments");
+        for (branch, expected_weight_m, expected_bias_m) in
+            [(&state.input, 0.1, 0.2), (&state.self_params, 0.3, 0.4)]
+        {
+            let (weight_m, weight_v) = branch.weights.as_ref().expect("weight moments");
+            assert_eq!(
+                restored.backend.download_f32(weight_m).unwrap(),
+                [expected_weight_m]
+            );
+            assert_eq!(
+                restored.backend.download_f32(weight_v).unwrap(),
+                [expected_weight_m + 1.0]
+            );
+            let (bias_m, bias_v) = branch.biases.as_ref().expect("bias moments");
+            assert_eq!(
+                restored.backend.download_f32(bias_m).unwrap(),
+                [expected_bias_m]
+            );
+            assert_eq!(
+                restored.backend.download_f32(bias_v).unwrap(),
+                [expected_bias_m + 1.0]
+            );
+            let (scale_m, scale_v) = branch.scales.as_ref().expect("scale moments");
+            assert_eq!(
+                restored.backend.download_f32(scale_m).unwrap(),
+                [expected_weight_m + 2.0]
+            );
+            assert_eq!(
+                restored.backend.download_f32(scale_v).unwrap(),
+                [expected_weight_m + 3.0]
+            );
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn optimizer_state_round_trips_eml_adam_moments_dnopt5() {
+        let dir =
+            std::env::temp_dir().join(format!("darknet-eml-opt-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("eml-opt.state");
+        let path2 = dir.join("eml-opt2.state");
+        let cfg = "[net]\nchannels=1\nbatch=2\nheight=1\nwidth=1\nadam=1\nb1=0.8\nb2=0.95\neps=0.001\n\
+                   [eml_convolutional]\nfilters=1\nsize=1\nbatch_normalize=1\nresidual=0\n";
+        let build = || {
+            let network = Network::from_config(
+                ConfigFile::parse_str("eml-opt-state.cfg", cfg).expect("EML cfg"),
+            )
+            .expect("EML network");
+            GpuExecutableNetwork::new(network, FakeBackend)
+        };
+        let step = |gpu: &mut GpuExecutableNetwork<FakeBackend>| {
+            let input = patterned_input(gpu.network.net.input_shape());
+            let forward = gpu
+                .forward_training_with_state(&input)
+                .expect("EML Adam training forward");
+            let output = forward.cpu_forward.final_output().unwrap();
+            let seeds = vec![Some(Tensor::filled(output.shape, 0.7))];
+            gpu.backward_accumulate_seeded_gpu(&forward, &seeds)
+                .expect("EML Adam backward");
+            gpu.update_weights_gpu(0.01, 0.0, 0.0, 2)
+                .expect("EML Adam update");
+        };
+
+        let mut original = build();
+        step(&mut original);
+        assert!(
+            original.eml_adam_state[0]
+                .as_ref()
+                .unwrap()
+                .input
+                .scales
+                .is_some()
+        );
+        assert!(
+            original.eml_adam_state[0]
+                .as_ref()
+                .unwrap()
+                .self_params
+                .scales
+                .is_some()
+        );
+        original.save_optimizer_state(&path).expect("save DNOPT5");
+        assert_eq!(&std::fs::read(&path).unwrap()[..8], b"DNOPT5\0\0");
+
+        let mut resumed = build();
+        resumed.params = original.params.clone();
+        resumed.load_optimizer_state(&path).expect("load DNOPT5");
+        assert_eq!(resumed.adam_step(), 1);
+        resumed.save_optimizer_state(&path2).expect("resave DNOPT5");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            std::fs::read(&path2).unwrap(),
+            "EML optimizer sidecar round-trip changed bytes"
+        );
+
+        step(&mut original);
+        step(&mut resumed);
+        for (expected, actual) in original.params.iter().zip(&resumed.params) {
+            let (LayerParams::EmlConvolutional(expected), LayerParams::EmlConvolutional(actual)) =
+                (expected, actual)
+            else {
+                unreachable!()
+            };
+            for (expected, actual) in [
+                (&expected.input, &actual.input),
+                (&expected.self_params, &actual.self_params),
+            ] {
+                assert_slice_close(
+                    "EML resumed Adam weights",
+                    &expected.weights,
+                    &actual.weights,
+                    1e-6,
+                );
+                assert_slice_close(
+                    "EML resumed Adam biases",
+                    &expected.biases,
+                    &actual.biases,
+                    1e-6,
+                );
+                assert_slice_close(
+                    "EML resumed Adam BN scales",
+                    &expected.batch_norm.as_ref().unwrap().scales,
+                    &actual.batch_norm.as_ref().unwrap().scales,
+                    1e-6,
+                );
+            }
         }
         std::fs::remove_dir_all(dir).ok();
     }
