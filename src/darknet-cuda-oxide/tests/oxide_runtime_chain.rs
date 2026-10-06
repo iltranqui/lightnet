@@ -150,31 +150,66 @@ fn weighted_shortcut_runtime_matches_cpu_forward_backward_and_sgd() {
 
     let input = patterned(cpu.network.net.input_shape());
     let cpu_fwd = cpu.forward_training(&input).expect("cpu forward");
-    let gpu_fwd = gpu.forward_training_with_state(&input).expect("oxide forward");
-    let oxide_output = gpu.backend.download_f32(&gpu_fwd.gpu_layer_outputs[2]).expect("download output");
-    close("weighted shortcut forward", &cpu_fwd.layer_outputs[2].data, &oxide_output, 1e-4);
+    let gpu_fwd = gpu.forward_training_device(&input).expect("oxide forward");
+    let oxide_output = gpu
+        .backend
+        .download_f32(&gpu_fwd.gpu_layer_outputs[2])
+        .expect("download output");
+    close(
+        "weighted shortcut forward",
+        &cpu_fwd.layer_outputs[2].data,
+        &oxide_output,
+        1e-4,
+    );
 
     let shape = cpu.network.layers[2].output_shape;
     let seed = Tensor::from_data(
         shape,
-        (0..shape.batch * shape.element_count()).map(|i| (i as f32 * 0.53).cos()).collect(),
-    ).expect("seed");
+        (0..shape.batch * shape.element_count())
+            .map(|i| (i as f32 * 0.53).cos())
+            .collect(),
+    )
+    .expect("seed");
     let mut seeds = vec![None; cpu.network.layers.len()];
     seeds[2] = Some(seed);
     cpu.zero_train_buffers();
     gpu.zero_train_buffers_gpu().expect("zero gradients");
-    cpu.backward_accumulate_seeded(&input, &cpu_fwd, &seeds).expect("cpu backward");
-    gpu.backward_accumulate_seeded_gpu(&gpu_fwd, &seeds).expect("oxide backward fallback");
+    cpu.backward_accumulate_seeded(&input, &cpu_fwd, &seeds)
+        .expect("cpu backward");
+    gpu.backward_accumulate_seeded_gpu(&gpu_fwd, &seeds)
+        .expect("oxide device backward");
     cpu.update_weights(0.01, 0.0, 0.0, 1);
-    gpu.update_weights_gpu(0.01, 0.0, 0.0, 1).expect("update weights");
+    gpu.update_weights_gpu(0.01, 0.0, 0.0, 1)
+        .expect("update weights");
 
-    let LayerParams::Shortcut(cpu_weights) = &cpu.params[2] else { unreachable!() };
-    let LayerParams::Shortcut(gpu_weights) = &gpu.params[2] else { unreachable!() };
-    close("weighted shortcut SGD", &cpu_weights.weights, &gpu_weights.weights, 1e-6);
+    let LayerParams::Shortcut(cpu_weights) = &cpu.params[2] else {
+        unreachable!()
+    };
+    let LayerParams::Shortcut(gpu_weights) = &gpu.params[2] else {
+        unreachable!()
+    };
+    close(
+        "weighted shortcut SGD",
+        &cpu_weights.weights,
+        &gpu_weights.weights,
+        1e-6,
+    );
     for (index, (cpu_param, gpu_param)) in cpu.params.iter().zip(&gpu.params).enumerate() {
-        if let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(gpu_conv)) = (cpu_param, gpu_param) {
-            close(&format!("conv {index} SGD weights"), &cpu_conv.weights, &gpu_conv.weights, 1e-3);
-            close(&format!("conv {index} SGD biases"), &cpu_conv.biases, &gpu_conv.biases, 1e-3);
+        if let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(gpu_conv)) =
+            (cpu_param, gpu_param)
+        {
+            close(
+                &format!("conv {index} SGD weights"),
+                &cpu_conv.weights,
+                &gpu_conv.weights,
+                1e-3,
+            );
+            close(
+                &format!("conv {index} SGD biases"),
+                &cpu_conv.biases,
+                &gpu_conv.biases,
+                1e-3,
+            );
         }
     }
 }

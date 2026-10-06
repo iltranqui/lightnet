@@ -7292,6 +7292,190 @@ where
                         name: "laya_act_head GPU backward".to_owned(),
                     });
                 }
+                (LayerKind::Shortcut(spec), Some(LayerParams::Shortcut(params))) => {
+                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+                    let activation_input = forward.gpu_layer_activation_inputs[layer.index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing GPU activation cache for weighted shortcut layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let delta = self
+                        .backend
+                        .activation_backward_f32(activation_input, &grad, activation, config)
+                        .map_err(|err| {
+                            backend_error("GPU weighted shortcut activation backward", err)
+                        })?;
+                    if layer.input_shape != layer.output_shape {
+                        return Err(Error::InvalidConfig(format!(
+                            "weighted shortcut layer #{} input/output shapes differ: {} vs {}",
+                            layer.index, layer.input_shape, layer.output_shape
+                        )));
+                    }
+                    let per_sample = layer.output_shape.element_count();
+                    let layer_step = spec.weight_slots(layer.output_shape.channels);
+                    if layer_step == 0
+                        || per_sample % layer_step != 0
+                        || params.weights.len() != spec.weight_count(layer.output_shape.channels)
+                    {
+                        return Err(Error::InvalidConfig(format!(
+                            "weighted shortcut layer #{} has inconsistent weight geometry",
+                            layer.index
+                        )));
+                    }
+                    let slots_per_feature = per_sample / layer_step;
+                    let effective = crate::shortcut_weights::effective_weights(
+                        &params.weights,
+                        spec.weights_normalization,
+                        layer_step,
+                    );
+                    let scale_pattern = |source_slot: usize| {
+                        (0..layer.output_shape.batch * per_sample)
+                            .map(|index| {
+                                let feature = index % per_sample;
+                                effective[feature / slots_per_feature + source_slot * layer_step]
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    let backend_shape = tensor_backend_shape(layer.output_shape);
+                    let input_scales = self
+                        .backend
+                        .upload_f32(&backend_shape, &scale_pattern(0))
+                        .map_err(|err| {
+                            backend_error("upload weighted shortcut input scales", err)
+                        })?;
+                    let input_gradient = self
+                        .backend
+                        .vector_mul_f32(&delta, &input_scales, &backend_shape, config)
+                        .map_err(|err| backend_error("weighted shortcut input gradient", err))?;
+                    self.accumulate_previous_gpu_gradient(
+                        layer.index,
+                        input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
+
+                    let input_gpu = if layer.index == 0 {
+                        &forward.input_gpu
+                    } else {
+                        &forward.gpu_layer_outputs[layer.index - 1]
+                    };
+                    let input = self
+                        .download_tensor(input_gpu, layer.input_shape)
+                        .map_err(|err| {
+                            backend_error("download weighted shortcut input for weight gradient", err)
+                        })?;
+                    let mut source_values = Vec::with_capacity(spec.from.len());
+                    let mut source_shapes = Vec::with_capacity(spec.from.len());
+                    for raw_index in &spec.from {
+                        let source_index = resolve_relative_layer(layer.index, *raw_index)?;
+                        let source_layer = self.network.layers.get(source_index).ok_or(
+                            Error::InvalidRoute {
+                                layer_index: layer.index,
+                                reference: *raw_index,
+                            },
+                        )?;
+                        if source_layer.output_shape.batch != layer.output_shape.batch {
+                            return Err(Error::InvalidConfig(format!(
+                                "weighted shortcut layer #{} mixes incompatible batch shapes",
+                                layer.index
+                            )));
+                        }
+                        let source_gpu = forward.gpu_layer_outputs.get(source_index).ok_or(
+                            Error::InvalidRoute {
+                                layer_index: layer.index,
+                                reference: *raw_index,
+                            },
+                        )?;
+                        source_values.push(
+                            self.download_tensor(source_gpu, source_layer.output_shape)
+                                .map_err(|err| {
+                                    backend_error(
+                                        "download weighted shortcut source for weight gradient",
+                                        err,
+                                    )
+                                })?,
+                        );
+                        source_shapes.push(source_layer.output_shape);
+                    }
+                    let delta_host = self
+                        .download_tensor(&delta, layer.output_shape)
+                        .map_err(|err| {
+                            backend_error("download weighted shortcut delta for weight gradient", err)
+                        })?;
+                    let source_refs: Vec<&[f32]> =
+                        source_values.iter().map(|source| source.data.as_slice()).collect();
+                    let weight_gradient = crate::shortcut_weights::weighted_backward(
+                        &delta_host.data,
+                        &input.data,
+                        &source_refs,
+                        layer.output_shape.batch,
+                        per_sample,
+                        &params.weights,
+                        spec.weights_normalization,
+                        layer_step,
+                        GradMode::from_env() == GradMode::Cpp,
+                    )
+                    .weights;
+                    let mut train_buffers = self.cpu_fallback_train_buffers.borrow_mut();
+                    let Some(LayerTrainBuffers::Shortcut(train)) =
+                        train_buffers.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing weighted shortcut train buffers for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    if train.weight_updates.len() != weight_gradient.len() {
+                        return Err(Error::InvalidConfig(format!(
+                            "weighted shortcut train buffer mismatch for layer #{}",
+                            layer.index
+                        )));
+                    }
+                    for (update, gradient) in
+                        train.weight_updates.iter_mut().zip(weight_gradient)
+                    {
+                        *update += gradient;
+                    }
+                    drop(train_buffers);
+
+                    for (source_slot, (raw_index, source_shape)) in
+                        spec.from.iter().zip(source_shapes).enumerate()
+                    {
+                        let source_scales = self
+                            .backend
+                            .upload_f32(&backend_shape, &scale_pattern(source_slot + 1))
+                            .map_err(|err| {
+                                backend_error("upload weighted shortcut source scales", err)
+                            })?;
+                        let output_gradient = self
+                            .backend
+                            .vector_mul_f32(&delta, &source_scales, &backend_shape, config)
+                            .map_err(|err| {
+                                backend_error("weighted shortcut source gradient", err)
+                            })?;
+                        let source_gradient = if source_shape != layer.output_shape {
+                            self.backend
+                                .shortcut_fit_f32(
+                                    &output_gradient,
+                                    source_shape.batch,
+                                    &tensor_backend_shape(source_shape),
+                                    config,
+                                )
+                                .map_err(|err| {
+                                    backend_error("weighted shortcut source gradient fit", err)
+                                })?
+                        } else {
+                            output_gradient
+                        };
+                        let source_index = resolve_relative_layer(layer.index, *raw_index)?;
+                        self.accumulate_gpu_gradient(
+                            &mut layer_output_gradients[source_index],
+                            source_gradient,
+                        )?;
+                    }
+                }
                 (LayerKind::Shortcut(spec), Some(LayerParams::None)) => {
                     let activation = gpu_activation_kind(layer.index, &spec.activation)?;
                     let activation_input = forward.gpu_layer_activation_inputs[layer.index]
@@ -8147,10 +8331,8 @@ where
                 // `[laya_marker_gather]` has no device backward yet; keep the
                 // whole net on the CPU backward (forward uses a host round trip).
                 LayerKind::LayaMarkerGather(_) => return true,
-                // Weighted shortcut parameters remain host-resident; use the
-                // exact CPU derivative while the forward uses oxide primitives.
-                LayerKind::Shortcut(spec)
-                    if spec.weights_type != crate::model::ShortcutWeightsType::None => return true,
+                // Weighted shortcut parameter reductions stay host-resident,
+                // while input/source gradients use backend elementwise ops.
                 // Same for `[laya_act_head]` and the ViT transformer until
                 // device backward kernels are available.
                 LayerKind::LayaActHead(_) | LayerKind::Vit(_) => return true,
@@ -23543,7 +23725,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_weighted_shortcut_forward_and_cpu_backward_fallback_match_cpu() {
+    fn gpu_weighted_shortcut_device_backward_matches_cpu() {
         let network = Network::from_config(
             ConfigFile::parse_str(
                 "inline.cfg",
@@ -23562,12 +23744,15 @@ mod tests {
         }
         let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
         gpu.params = cpu.params.clone();
-        assert!(gpu.requires_cpu_backward_fallback());
+        assert!(!gpu.requires_cpu_backward_fallback());
 
         let input = patterned_input(cpu.network.net.input_shape());
         let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
-        let gpu_forward = gpu.forward_training_with_state(&input).expect("GPU forward");
-        let device_output = gpu.backend.download_f32(&gpu_forward.gpu_layer_outputs[2]).unwrap();
+        let gpu_forward = gpu.forward_training_device(&input).expect("GPU forward");
+        let device_output = gpu
+            .backend
+            .download_f32(&gpu_forward.gpu_layer_outputs[2])
+            .unwrap();
         assert_slice_close(
             "weighted shortcut oxide/fake forward",
             &cpu_forward.layer_outputs[2].data,
@@ -23581,21 +23766,29 @@ mod tests {
             (0..seed_shape.batch * seed_shape.element_count())
                 .map(|i| (i as f32 * 0.53).cos())
                 .collect(),
-        ).unwrap();
+        )
+        .unwrap();
         let mut seeds = vec![None; cpu.network.layers.len()];
         seeds[2] = Some(seed);
-        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds).unwrap();
-        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds).unwrap();
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .unwrap();
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .unwrap();
         let cpu_shortcut = match &cpu.train_buffers[2] {
             LayerTrainBuffers::Shortcut(buffers) => &buffers.weight_updates,
             other => panic!("unexpected CPU train buffer {other:?}"),
         };
-        let fallback_buffers = gpu.cpu_fallback_train_buffers.borrow();
-        let gpu_shortcut = match &fallback_buffers[2] {
+        let host_buffers = gpu.cpu_fallback_train_buffers.borrow();
+        let gpu_shortcut = match &host_buffers[2] {
             LayerTrainBuffers::Shortcut(buffers) => &buffers.weight_updates,
-            other => panic!("unexpected fallback train buffer {other:?}"),
+            other => panic!("unexpected host train buffer {other:?}"),
         };
-        assert_slice_close("weighted shortcut fallback weight updates", cpu_shortcut, gpu_shortcut, 1e-6);
+        assert_slice_close(
+            "weighted shortcut host weight updates",
+            cpu_shortcut,
+            gpu_shortcut,
+            1e-6,
+        );
     }
 
     #[test]

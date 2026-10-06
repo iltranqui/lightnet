@@ -56,8 +56,10 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
   C++ `box_diou` uses `(d/c)^0.6` while `dx_box_iou` supplies the legacy gradient
   of `d/c`; CIoU similarly uses an approximate `alpha` gradient. Overlapping-window
   maxpool with `maxpool_zero_nonmax` also has finite-difference coverage.
-  Weighted shortcut CPU gradients already have finite-difference
-  coverage; GPU training currently uses the CPU backward fallback.
+  Weighted shortcut CPU gradients have finite-difference coverage; GPU input
+  and source gradients now use backend elementwise multiply/fit operations, while
+  the exact normalized weight reduction still downloads the delta/inputs/sources
+  and the optimizer updates host-resident weights.
 
 ## P8/P9 training follow-ups
 
@@ -72,11 +74,12 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
   rate scaling and persisted host moments in DNOPT2 optimizer sidecars (DNOPT1
   remains readable); ViT preserves weight order, decay groups, gradient
   clipping, and its reduced mHC learning rate.
-- [x] weighted shortcut: per-feature/per-channel oxide forward composes
-  channel-scale + add; exact backward and SGD updates use the host-resident CPU
-  fallback. Real-device runtime test covers mismatched source fit, forward,
-  backward, and SGD. A fused kernel/device weight-gradient reduction is only a
-  future optimization.
+- [~] weighted shortcut: per-feature/per-channel oxide forward composes
+  channel-scale + add; input/source gradients use backend elementwise multiply
+  and shortcut-fit ops. Exact normalized weight reductions still cross the host,
+  and parameters/SGD are host-resident. FakeBackend and real-device runtime tests
+  cover mismatched source fit, forward, backward, and SGD parity. Fused weight
+  reductions/device parameter updates remain future work.
 - [ ] `reverse` conv, `deform`, adversarial yolo branch.
 - [x] End-to-end real-device `subdivisions=2` deferred-gradient flush matches
   CPU weights/biases through two iterations in
