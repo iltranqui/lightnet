@@ -479,6 +479,125 @@ fn rnn_recurrent_projections_and_training_backward_match_cpu() {
 }
 
 #[test]
+fn crnn_recurrent_convolutions_and_training_backward_match_cpu() {
+    let net = network(
+        "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=2\ntime_steps=2\n\
+         [convolutional]\nfilters=2\nsize=1\nstride=1\nbatch_normalize=0\nactivation=linear\n\
+         [crnn]\nhidden=3\noutput=2\nsize=1\nstride=1\nbatch_normalize=0\nactivation=tanh\nshortcut=1\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let LayerParams::Convolutional(input_conv) = &mut cpu.params[0] else {
+        panic!("expected input convolution parameters");
+    };
+    for (index, value) in input_conv.weights.iter_mut().enumerate() {
+        *value = 0.04 + index as f32 * 0.013;
+    }
+    input_conv.biases.copy_from_slice(&[0.015, -0.025]);
+    let LayerParams::Crnn(params) = &mut cpu.params[1] else {
+        panic!("expected CRNN parameters");
+    };
+    for (slot, nested) in [
+        &mut params.input,
+        &mut params.self_params,
+        &mut params.output,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (index, value) in nested.weights.iter_mut().enumerate() {
+            *value = 0.025 + (slot * 3 + index) as f32 * 0.006;
+        }
+        for (index, value) in nested.biases.iter_mut().enumerate() {
+            *value = (slot as f32 - 1.0) * 0.02 + index as f32 * 0.007;
+        }
+    }
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("oxide backend"));
+    gpu.params = cpu.params.clone();
+    let input = patterned(cpu.network.net.input_shape());
+    let cpu_forward = cpu.forward(&input).expect("CPU CRNN forward");
+    let gpu_forward = gpu.forward_with_state(&input).expect("Oxide CRNN forward");
+    close(
+        "CRNN output",
+        &cpu_forward.final_output().expect("CPU output").data,
+        &gpu_forward
+            .cpu_forward
+            .final_output()
+            .expect("Oxide output")
+            .data,
+        2e-4,
+    );
+
+    cpu.zero_train_buffers();
+    gpu.init_train_buffers_gpu().expect("CRNN train buffers");
+    gpu.zero_train_buffers_gpu()
+        .expect("clear CRNN train buffers");
+    let cpu_training = cpu.forward_training(&input).expect("CPU CRNN training");
+    let gpu_training = gpu
+        .forward_training_device(&input)
+        .expect("Oxide CRNN training");
+    let output_shape = cpu.network.layers[1].output_shape;
+    let seed = Tensor::from_data(
+        output_shape,
+        (0..output_shape.batch * output_shape.element_count())
+            .map(|index| (index as f32 * 0.37).cos() * 0.8)
+            .collect(),
+    )
+    .expect("CRNN output gradient");
+    let seeds = vec![None, Some(seed)];
+    cpu.backward_accumulate_seeded(&input, &cpu_training, &seeds)
+        .expect("CPU CRNN backward");
+    gpu.backward_accumulate_seeded_gpu(&gpu_training, &seeds)
+        .expect("Oxide CRNN backward");
+    cpu.update_weights(0.03, 0.0, 0.0, 2);
+    gpu.update_weights_gpu(0.03, 0.0, 0.0, 2)
+        .expect("Oxide CRNN SGD");
+    let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(gpu_conv)) =
+        (&cpu.params[0], &gpu.params[0])
+    else {
+        panic!("expected input convolution parameters after training");
+    };
+    close(
+        "CRNN upstream conv weights",
+        &cpu_conv.weights,
+        &gpu_conv.weights,
+        8e-4,
+    );
+    close(
+        "CRNN upstream conv biases",
+        &cpu_conv.biases,
+        &gpu_conv.biases,
+        8e-4,
+    );
+    let (LayerParams::Crnn(cpu_params), LayerParams::Crnn(gpu_params)) =
+        (&cpu.params[1], &gpu.params[1])
+    else {
+        panic!("expected CRNN parameters after training");
+    };
+    for (name, cpu_conv, gpu_conv) in [
+        ("input", &cpu_params.input, &gpu_params.input),
+        (
+            "recurrent",
+            &cpu_params.self_params,
+            &gpu_params.self_params,
+        ),
+        ("output", &cpu_params.output, &gpu_params.output),
+    ] {
+        close(
+            &format!("CRNN {name} weights"),
+            &cpu_conv.weights,
+            &gpu_conv.weights,
+            8e-4,
+        );
+        close(
+            &format!("CRNN {name} biases"),
+            &cpu_conv.biases,
+            &gpu_conv.biases,
+            8e-4,
+        );
+    }
+}
+
+#[test]
 fn few_sgd_steps_match_cpu_loss_trajectory_and_weights() {
     let cfg = "[net]\nwidth=6\nheight=6\nchannels=2\nbatch=2\n\
          [convolutional]\nfilters=4\nsize=3\nstride=1\npad=1\nactivation=leaky\n\

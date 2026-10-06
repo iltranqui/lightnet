@@ -123,17 +123,19 @@ Latest increments:
   `moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu`
   test compares forward, upstream convolution updates, and router/expert weights
   with CPU. Router
-  soft/tied top-k parity passes in `oxide_layers_extra` (19/19); full
-  `oxide_runtime_chain` suite passes 8/8.
+  soft/tied top-k parity passes in `oxide_layers_extra` (19/19); the full
+  `oxide_runtime_chain` suite passes 9/9 with MoE and CRNN training parity.
 - Overlapping-window maxpool backward, including `maxpool_zero_nonmax`, now
   matches central finite differences.
-- No-BN RNN forward and backward now use backend projections, activation
-  gradients, connected-backward, and state/shortcut gradient ops. Sequence
-  slicing, cached activations/states, parameter-gradient accumulation, and
-  host-resident SGD still cross the host; batchnorm RNN, LSTM/CRNN remain on the
-  CPU fallback. FakeBackend RNN tests pass; the real-device
-  `rnn_recurrent_projections_and_training_backward_match_cpu` test compares
-  training updates with CPU. `oxide_runtime_chain` passes 8/8.
+- No-BN RNN and CRNN forward/backward now use backend ops: RNN projections and
+  CRNN recurrent convolutions, activation gradients, state accumulation, and
+  shortcuts. Sequence slicing, cached activations/states, parameter-gradient
+  accumulation, and host-resident SGD still cross the host; batchnorm RNN/CRNN
+  and LSTM remain on the CPU fallback. FakeBackend CRNN parity compares layer
+  outputs and updates through an upstream convolution. The real-device
+  `crnn_recurrent_convolutions_and_training_backward_match_cpu` test compares
+  forward output plus CRNN and upstream convolution updates with CPU (passed);
+  the pre-existing RNN real-device parity test remains passing.
 - Host Adam now updates standalone batchnorm, local, connected, weighted
   shortcut, MoE router/experts, deconvolutional, GRU/RNN/LSTM/CRNN, and ViT
   parameters with distinct moment slots and per-layer rate scaling. DNOPT2
