@@ -34,6 +34,17 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v69: Integrated `[eml_convolutional]` cfg/shape parsing, two branch-convolution
+  parameter and training-buffer blocks, C++ `input_layer` then `self_layer`
+  `.weights` order, CPU forward/backward, SGD/Adam updates, and an explicit GPU
+  host-fallback path. Focused EML host tests pass 3/3, including finite-difference
+  parameter gradients and FakeBackend CPU/GPU-fallback SGD parity; the EML Adam
+  fallback test passes. The EML weights round-trip is covered by
+  `recurrent_weight_blocks_round_trip_in_darknet_order`. Remaining: native Oxide
+  whole-layer execution and batch-stat/rolling-EMA BN training behavior; the
+  existing host convolution helper uses rolling-stat BN. The standalone full
+  `cfg_corpus` run exceeded a 40-minute timeout without a final result. No
+  compiled-C++ golden is available, so no C++ parity claim is made.
 - v68: Added host-reference and native Oxide f32 EML branch-combine forward
   and backward ops with optional residual, shape checks, exact branch
   derivatives, and the source-derived nonpositive clamp/epsilon defaults.

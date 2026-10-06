@@ -26,8 +26,9 @@ use crate::error::{Error, Result};
 use crate::image::PlanarRgbImage;
 use crate::maxpool_depth::{backward_maxpool_depth, forward_maxpool_depth};
 use crate::model::{
-    Activation, ConnectedSpec, ConvolutionalSpec, CrnnSpec, CropSpec, DropblockSpec, GruSpec,
-    LayerKind, LocalSpec, LrPolicy, LstmSpec, NetConfig, Network, RnnSpec, RouteSpec, TensorShape,
+    Activation, ConnectedSpec, ConvolutionalSpec, CrnnSpec, CropSpec, DropblockSpec,
+    EmlConvolutionalSpec, GruSpec, LayerKind, LocalSpec, LrPolicy, LstmSpec, NetConfig, Network,
+    RnnSpec, RouteSpec, TensorShape,
 };
 use crate::weights::WeightsHeader;
 use darknet_cuda::{
@@ -220,6 +221,12 @@ pub struct CrnnParams {
     pub output: ConvolutionalParams,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct EmlConvolutionalParams {
+    pub input: ConvolutionalParams,
+    pub self_params: ConvolutionalParams,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayerParams {
@@ -246,6 +253,8 @@ pub enum LayerParams {
     /// `[moe_convolutional]`: one convolution per expert plus the router's
     /// `[experts, channels]` weights and `[experts]` biases.
     Moe(MoeParams),
+    /// `[eml_convolutional]`: the `input_layer` and `self_layer` conv blocks.
+    EmlConvolutional(EmlConvolutionalParams),
 }
 
 /// The parameters of one `[moe_convolutional]` layer.
@@ -338,6 +347,12 @@ pub struct CrnnTrainBuffers {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct EmlConvolutionalTrainBuffers {
+    pub input: ConvolutionalTrainBuffers,
+    pub self_params: ConvolutionalTrainBuffers,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct VitTrainBuffers {
     /// Descending update directions (negative mathematical gradients), in
     /// `VitWeights` block shape/order.
@@ -358,6 +373,7 @@ pub enum LayerTrainBuffers {
     Lstm(LstmTrainBuffers),
     Crnn(CrnnTrainBuffers),
     Moe(MoeTrainBuffers),
+    EmlConvolutional(EmlConvolutionalTrainBuffers),
     Vit(VitTrainBuffers),
 }
 
@@ -470,6 +486,12 @@ pub struct MoeForwardCache {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct EmlForwardCache {
+    pub input_branch_output: Tensor,
+    pub self_branch_output: Tensor,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct ForwardResult {
     pub layer_outputs: Vec<Tensor>,
     pub layer_activation_inputs: Vec<Option<Tensor>>,
@@ -483,6 +505,7 @@ pub struct ForwardResult {
     /// output, which the backward pass needs for the gate dot products and for
     /// the scaled expert gradients.
     pub moe_caches: Vec<Option<MoeForwardCache>>,
+    pub eml_caches: Vec<Option<EmlForwardCache>>,
     pub vit_caches: Vec<Option<crate::vit::VitForwardCache>>,
     pub yolo_heads: Vec<YoloHeadOutput>,
     /// The modern anchor-free heads, in layer order.
@@ -979,6 +1002,28 @@ impl ExecutableNetwork {
                     let learned_pos = matches!(self.network.layers[layer_index].kind, LayerKind::Vit(ref spec) if spec.learned_pos_embed);
                     update_vit_params(params, train, lr * opts.learning_rate_scale, momentum, decay, batch, learned_pos);
                 }
+                (
+                    LayerParams::EmlConvolutional(eml),
+                    LayerTrainBuffers::EmlConvolutional(train),
+                ) => {
+                    let layer_lr = lr * opts.learning_rate_scale;
+                    update_convolutional_params(
+                        &mut eml.input,
+                        &mut train.input,
+                        layer_lr,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                    update_convolutional_params(
+                        &mut eml.self_params,
+                        &mut train.self_params,
+                        layer_lr,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                }
                 (LayerParams::Moe(moe), LayerTrainBuffers::Moe(train)) => {
                     sgd_update(
                         &mut moe.router_biases,
@@ -1206,6 +1251,7 @@ impl ExecutableNetwork {
         let mut yolo_heads = Vec::new();
         let mut modern_heads = Vec::new();
         let mut moe_caches = Vec::with_capacity(self.network.layers.len());
+        let mut eml_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches = Vec::with_capacity(self.network.layers.len());
         let mut rng_state = 0x9e37_79b9_u64;
 
@@ -1441,6 +1487,40 @@ impl ExecutableNetwork {
                     .map_err(Error::InvalidConfig)?;
                     (Tensor::from_data(layer.output_shape, data)?, None)
                 }
+                (LayerKind::EmlConvolutional(spec), LayerParams::EmlConvolutional(params)) => {
+                    let (input_branch_output, _) = forward_convolutional_with_cache(
+                        &spec.branch,
+                        &params.input,
+                        current_input,
+                        layer.output_shape,
+                    );
+                    let (self_branch_output, _) = forward_convolutional_with_cache(
+                        &spec.branch,
+                        &params.self_params,
+                        current_input,
+                        layer.output_shape,
+                    );
+                    let use_residual = spec.residual
+                        && layer.input_shape.element_count() == layer.output_shape.element_count();
+                    let residual = use_residual.then_some(current_input.data.as_slice());
+                    let math = crate::eml_conv_math::EmlConvMathParams::from_cpp_values(
+                        spec.eml_clamp,
+                        spec.eml_eps,
+                        spec.eml_scale,
+                    );
+                    let data = crate::eml_conv_math::forward(
+                        &input_branch_output.data,
+                        &self_branch_output.data,
+                        residual,
+                        math,
+                    )
+                    .map_err(|error| Error::InvalidConfig(error.to_owned()))?;
+                    eml_cache = Some(EmlForwardCache {
+                        input_branch_output,
+                        self_branch_output,
+                    });
+                    (Tensor::from_data(layer.output_shape, data)?, None)
+                }
                 // `[moe_convolutional]`: route each image to a soft gate per expert, run
                 // every expert convolution, and blend with those gates.  This
                 // mirrors C++ `forward_moe_convolutional_layer`, which computes
@@ -1638,6 +1718,7 @@ impl ExecutableNetwork {
             crop_caches.push(crop_cache);
             recurrent_caches.push(recurrent_cache);
             moe_caches.push(moe_cache);
+            eml_caches.push(eml_cache);
             vit_caches.push(vit_cache);
         }
 
@@ -1648,6 +1729,7 @@ impl ExecutableNetwork {
             crop_caches,
             recurrent_caches,
             moe_caches,
+            eml_caches,
             vit_caches,
             yolo_heads,
             modern_heads,
@@ -2009,6 +2091,80 @@ impl ExecutableNetwork {
                     }
                 }
 
+                (LayerKind::EmlConvolutional(spec), LayerParams::EmlConvolutional(params)) => {
+                    let cache = forward
+                        .eml_caches
+                        .get(layer.index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing [eml_convolutional] branch cache for layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let math = crate::eml_conv_math::EmlConvMathParams::from_cpp_values(
+                        spec.eml_clamp,
+                        spec.eml_eps,
+                        spec.eml_scale,
+                    );
+                    let use_residual = spec.residual
+                        && layer.input_shape.element_count() == layer.output_shape.element_count();
+                    let branch_grad = crate::eml_conv_math::backward(
+                        &cache.input_branch_output.data,
+                        &cache.self_branch_output.data,
+                        &grad.data,
+                        use_residual.then_some(current_input.data.as_slice()),
+                        math,
+                    )
+                    .map_err(|error| Error::InvalidConfig(error.to_owned()))?;
+                    let x_delta = Tensor::from_data(layer.output_shape, branch_grad.x_branch)?;
+                    let y_delta = Tensor::from_data(layer.output_shape, branch_grad.self_branch)?;
+                    let (mut input_grad, input_param_grad) = backward_convolutional(
+                        &spec.branch,
+                        &params.input,
+                        current_input,
+                        layer.output_shape,
+                        &x_delta,
+                        None,
+                        workspace,
+                    )?;
+                    let (self_input_grad, self_param_grad) = backward_convolutional(
+                        &spec.branch,
+                        &params.self_params,
+                        current_input,
+                        layer.output_shape,
+                        &y_delta,
+                        None,
+                        workspace,
+                    )?;
+                    for (dst, src) in input_grad.data.iter_mut().zip(&self_input_grad.data) {
+                        *dst += src;
+                    }
+                    if let Some(residual_grad) = branch_grad.residual {
+                        for (dst, src) in input_grad.data.iter_mut().zip(residual_grad) {
+                            *dst += src;
+                        }
+                    }
+                    let Some(LayerParams::EmlConvolutional(gradients)) =
+                        param_gradients.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing EML parameter-gradient slot for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    accumulate_convolutional_params(&mut gradients.input, &input_param_grad)?;
+                    accumulate_convolutional_params(
+                        &mut gradients.self_params,
+                        &self_param_grad,
+                    )?;
+                    accumulate_previous_gradient(
+                        layer.index,
+                        &input_grad,
+                        &mut input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
+                }
                 (LayerKind::Deconvolutional(spec), LayerParams::Convolutional(p)) => {
                     let delta = apply_output_activation_gradient(
                         &forward.layer_outputs[layer.index],
@@ -2981,6 +3137,21 @@ impl ExecutableNetwork {
                         accumulate_convolutional_train_buffer(train_expert, grad_expert)?;
                     }
                 }
+                (LayerKind::EmlConvolutional(_), LayerParams::EmlConvolutional(gradient)) => {
+                    let Some(LayerTrainBuffers::EmlConvolutional(train)) =
+                        self.train_buffers.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing EML train buffers for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    accumulate_convolutional_train_buffer(&mut train.input, &gradient.input)?;
+                    accumulate_convolutional_train_buffer(
+                        &mut train.self_params,
+                        &gradient.self_params,
+                    )?;
+                }
                 (LayerKind::Vit(_), LayerParams::Vit(gradient)) => {
                     let Some(LayerTrainBuffers::Vit(train)) = self.train_buffers.get_mut(layer.index)
                     else {
@@ -3183,6 +3354,10 @@ fn host_adam_scalar_capacity(params: &LayerParams) -> usize {
                     .iter()
                     .map(convolutional_parameter_count)
                     .sum::<usize>()
+        }
+        LayerParams::EmlConvolutional(params) => {
+            convolutional_parameter_count(&params.input)
+                + convolutional_parameter_count(&params.self_params)
         }
         LayerParams::None
         | LayerParams::LayaScorer(_)
@@ -4792,6 +4967,7 @@ where
                         | LayerParams::Rnn(_)
                         | LayerParams::Lstm(_)
                         | LayerParams::Crnn(_)
+                        | LayerParams::EmlConvolutional(_)
                 )
             }) {
                 return Err(Error::InvalidConfig(
@@ -5236,6 +5412,25 @@ where
                         &mut params.output, &mut train.output, host_adam_child(moments, 2), adam,
                     )?;
                 }
+                (
+                    LayerParams::EmlConvolutional(params),
+                    LayerTrainBuffers::EmlConvolutional(train),
+                ) => {
+                    let moments =
+                        moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    apply_host_adam_convolutional(
+                        &mut params.input,
+                        &mut train.input,
+                        host_adam_child(moments, 0),
+                        adam,
+                    )?;
+                    apply_host_adam_convolutional(
+                        &mut params.self_params,
+                        &mut train.self_params,
+                        host_adam_child(moments, 1),
+                        adam,
+                    )?;
+                }
                 (LayerParams::Convolutional(params), LayerTrainBuffers::Convolutional(train))
                     if matches!(layer.kind, LayerKind::Deconvolutional(_)) =>
                 {
@@ -5301,6 +5496,28 @@ where
                 }
                 (LayerParams::Shortcut(params), LayerTrainBuffers::Shortcut(train)) => {
                     sgd_update(&mut params.weights, &mut train.weight_updates, lr, momentum, decay, batch);
+                }
+                (
+                    LayerParams::EmlConvolutional(params),
+                    LayerTrainBuffers::EmlConvolutional(train),
+                ) => {
+                    let lr = lr * layer.train.learning_rate_scale;
+                    update_convolutional_params(
+                        &mut params.input,
+                        &mut train.input,
+                        lr,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                    update_convolutional_params(
+                        &mut params.self_params,
+                        &mut train.self_params,
+                        lr,
+                        momentum,
+                        decay,
+                        batch,
+                    );
                 }
                 (LayerParams::Moe(params), LayerTrainBuffers::Moe(train)) => {
                     if !preserve_device_moe_params
@@ -5637,6 +5854,8 @@ where
         let mut dropout_masks = Vec::with_capacity(self.network.layers.len());
         let mut crop_caches = Vec::with_capacity(self.network.layers.len());
         let mut moe_caches: Vec<Option<MoeForwardCache>> = Vec::new();
+        let mut eml_caches: Vec<Option<EmlForwardCache>> =
+            Vec::with_capacity(self.network.layers.len());
         let mut vit_caches: Vec<Option<crate::vit::VitForwardCache>> = Vec::with_capacity(self.network.layers.len());
         let mut gpu_batch_norm_caches = Vec::with_capacity(self.network.layers.len());
         let mut yolo_heads = Vec::new();
@@ -6730,6 +6949,45 @@ where
                             .map_err(|err| backend_error("upload CRNN output", err))?
                     }
                 }
+                (LayerKind::EmlConvolutional(spec), LayerParams::EmlConvolutional(eml)) => {
+                    let host_input = self
+                        .download_tensor(current_input, layer.input_shape)
+                        .map_err(|err| backend_error("download EML input", err))?;
+                    let (input_branch_output, _) = forward_convolutional_with_cache(
+                        &spec.branch,
+                        &eml.input,
+                        &host_input,
+                        layer.output_shape,
+                    );
+                    let (self_branch_output, _) = forward_convolutional_with_cache(
+                        &spec.branch,
+                        &eml.self_params,
+                        &host_input,
+                        layer.output_shape,
+                    );
+                    let math = crate::eml_conv_math::EmlConvMathParams::from_cpp_values(
+                        spec.eml_clamp,
+                        spec.eml_eps,
+                        spec.eml_scale,
+                    );
+                    let use_residual = spec.residual
+                        && layer.input_shape.element_count() == layer.output_shape.element_count();
+                    let data = crate::eml_conv_math::forward(
+                        &input_branch_output.data,
+                        &self_branch_output.data,
+                        use_residual.then_some(host_input.data.as_slice()),
+                        math,
+                    )
+                    .map_err(|error| Error::InvalidConfig(error.to_owned()))?;
+                    eml_cache = Some(EmlForwardCache {
+                        input_branch_output,
+                        self_branch_output,
+                    });
+                    let output = Tensor::from_data(layer.output_shape, data)?;
+                    self.backend
+                        .upload_f32(&tensor_backend_shape(layer.output_shape), &output.data)
+                        .map_err(|err| backend_error("upload EML output", err))?
+                }
                 (LayerKind::Moe(spec), LayerParams::Moe(moe)) => {
                     let host_input = if host_copies {
                         Some(
@@ -6995,6 +7253,7 @@ where
                 recurrent_caches.push(None);
             }
             moe_caches.push(moe_cache);
+            eml_caches.push(eml_cache);
             vit_caches.push(vit_cache);
         }
 
@@ -7014,6 +7273,7 @@ where
                 crop_caches,
                 recurrent_caches,
                 moe_caches,
+                eml_caches,
                 vit_caches,
                 yolo_heads,
                 modern_heads,
@@ -7034,6 +7294,7 @@ where
                 layer.kind,
                 LayerKind::Connected(_)
                     | LayerKind::Deconvolutional(_)
+                    | LayerKind::EmlConvolutional(_)
                     | LayerKind::Reorg(_)
                     | LayerKind::ChannelSlice(_)
                     | LayerKind::ChannelShuffle(_)
@@ -9213,9 +9474,9 @@ where
                         return true;
                     }
                 }
-                // Deconvolution is host-resident (no device kernel); run the
-                // whole backward on the CPU.
-                LayerKind::Deconvolutional(_) => return true,
+                // Deconvolution and EML branch convolutions are host-resident;
+                // run the whole backward on the CPU.
+                LayerKind::Deconvolutional(_) | LayerKind::EmlConvolutional(_) => return true,
                 // `[laya_marker_gather]` has no device backward yet; keep the
                 // whole net on the CPU backward (forward uses a host round trip).
                 LayerKind::LayaMarkerGather(_) => return true,
@@ -10849,6 +11110,9 @@ fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
             layer.input_shape.channels,
             spec,
         )),
+        LayerKind::EmlConvolutional(spec) => LayerParams::EmlConvolutional(
+            default_eml_convolutional_params(layer.input_shape.channels, spec),
+        ),
         LayerKind::Shortcut(spec) => match spec.weight_count(layer.input_shape.channels) {
             0 => LayerParams::None,
             len => LayerParams::Shortcut(ShortcutParams {
@@ -11037,6 +11301,9 @@ fn default_layer_train_buffers(layer: &crate::model::Layer) -> LayerTrainBuffers
         LayerKind::Moe(spec) => {
             LayerTrainBuffers::Moe(default_moe_train_buffers(layer.input_shape.channels, spec))
         }
+        LayerKind::EmlConvolutional(spec) => LayerTrainBuffers::EmlConvolutional(
+            default_eml_convolutional_train_buffers(layer.input_shape.channels, spec),
+        ),
         LayerKind::Vit(spec) => {
             let mut updates = crate::vit::VitWeights::zeroed(
                 &vit_geometry(layer, spec), layer.output_shape.height, layer.output_shape.width,
@@ -11069,6 +11336,26 @@ fn default_moe_params(input_channels: usize, spec: &crate::model::MoeSpec) -> Mo
     }
 }
 
+fn default_eml_convolutional_params(
+    input_channels: usize,
+    spec: &EmlConvolutionalSpec,
+) -> EmlConvolutionalParams {
+    let branch = &spec.branch;
+    let make = || {
+        default_convolutional_params(
+            input_channels,
+            branch.filters,
+            branch.size,
+            branch.groups,
+            branch.batch_normalize,
+        )
+    };
+    EmlConvolutionalParams {
+        input: make(),
+        self_params: make(),
+    }
+}
+
 fn default_moe_train_buffers(input_channels: usize, spec: &crate::model::MoeSpec) -> MoeTrainBuffers {
     let expert = &spec.expert;
     MoeTrainBuffers {
@@ -11085,6 +11372,26 @@ fn default_moe_train_buffers(input_channels: usize, spec: &crate::model::MoeSpec
                 )
             })
             .collect(),
+    }
+}
+
+fn default_eml_convolutional_train_buffers(
+    input_channels: usize,
+    spec: &EmlConvolutionalSpec,
+) -> EmlConvolutionalTrainBuffers {
+    let branch = &spec.branch;
+    let make = || {
+        default_convolutional_train_buffers(
+            input_channels,
+            branch.filters,
+            branch.size,
+            branch.groups,
+            branch.batch_normalize,
+        )
+    };
+    EmlConvolutionalTrainBuffers {
+        input: make(),
+        self_params: make(),
     }
 }
 
@@ -11975,6 +12282,25 @@ fn load_weights_into_params(
                 }
                 read_f32_into(&mut file, &mut moe.router_biases)?;
                 read_f32_into(&mut file, &mut moe.router_weights)?;
+            }
+            LayerParams::EmlConvolutional(eml) => {
+                let LayerKind::EmlConvolutional(spec) = &layer.kind else {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} EML parameters do not match layer kind",
+                        layer.index
+                    )));
+                };
+                let branch = &spec.branch;
+                for params in [&mut eml.input, &mut eml.self_params] {
+                    read_convolutional_params(
+                        &mut file,
+                        params,
+                        layer.input_shape.channels,
+                        branch.filters,
+                        branch.size,
+                        branch.groups,
+                    )?;
+                }
             }
             LayerParams::Shortcut(shortcut) => {
                 read_f32_into(&mut file, &mut shortcut.weights)?;
@@ -25446,6 +25772,190 @@ mod tests {
         assert!(build(6, "[laya_head]\nhidden=4\nheads=2\nlayers=2\nffn_dim=4\nqtype=-1\n").is_ok());
         // qtype out of range.
         assert!(build(5, "[laya_head]\nhidden=4\nheads=2\nlayers=2\nffn_dim=4\nqtype=3\n").is_err());
+    }
+
+    #[test]
+    fn eml_convolutional_cpu_math_gradients_and_gpu_fallback_are_integrated() {
+        let cfg = "[net]\nchannels=1\nbatch=1\nheight=1\nwidth=2\n\
+                   [eml_convolutional]\nfilters=1\nsize=1\nbatch_normalize=1\nresidual=1\n";
+        let build = || {
+            let network = Network::from_config(
+                ConfigFile::parse_str("eml-runtime.cfg", cfg).expect("EML cfg parses"),
+            )
+            .expect("EML network builds");
+            let mut executable = ExecutableNetwork::new(network);
+            let LayerParams::EmlConvolutional(params) = &mut executable.params[0] else {
+                panic!("expected EML parameters");
+            };
+            params.input.weights[0] = 0.4;
+            params.input.biases[0] = 0.1;
+            params.self_params.weights[0] = -0.3;
+            params.self_params.biases[0] = 0.2;
+            let input_bn = params.input.batch_norm.as_mut().expect("input branch BN");
+            input_bn.scales[0] = 0.8;
+            input_bn.rolling_mean[0] = -0.1;
+            input_bn.rolling_variance[0] = 0.9;
+            let self_bn = params
+                .self_params
+                .batch_norm
+                .as_mut()
+                .expect("self branch BN");
+            self_bn.scales[0] = 1.2;
+            self_bn.rolling_mean[0] = 0.05;
+            self_bn.rolling_variance[0] = 1.3;
+            executable
+        };
+        fn perturb(executable: &mut ExecutableNetwork, branch: usize, weight: bool, value: f32) {
+            let LayerParams::EmlConvolutional(params) = &mut executable.params[0] else {
+                unreachable!()
+            };
+            let conv = if branch == 0 {
+                &mut params.input
+            } else {
+                &mut params.self_params
+            };
+            if weight {
+                conv.weights[0] += value;
+            } else {
+                conv.biases[0] += value;
+            }
+        }
+
+        let input =
+            Tensor::from_data(TensorShape::new(2, 1, 1, 1), vec![0.25, -0.4]).expect("input shape");
+        let seed =
+            Tensor::from_data(TensorShape::new(2, 1, 1, 1), vec![0.7, -0.35]).expect("seed shape");
+        let mut executable = build();
+        let forward = executable.forward(&input).expect("EML CPU forward");
+        let objective = |executable: &ExecutableNetwork| {
+            executable
+                .forward(&input)
+                .expect("EML perturbed forward")
+                .final_output()
+                .unwrap()
+                .data
+                .iter()
+                .zip(&seed.data)
+                .map(|(out, delta)| out * delta)
+                .sum::<f32>()
+        };
+        let backward = executable
+            .backward(&input, &forward, &seed)
+            .expect("EML CPU backward");
+        let LayerParams::EmlConvolutional(analytic) = &backward.param_gradients[0] else {
+            panic!("expected EML parameter gradients");
+        };
+        let eps = 1e-3;
+        for branch in 0..2 {
+            for weight in [true, false] {
+                let mut plus = build();
+                perturb(&mut plus, branch, weight, eps);
+                let mut minus = build();
+                perturb(&mut minus, branch, weight, -eps);
+                let numeric = (objective(&plus) - objective(&minus)) / (2.0 * eps);
+                let conv = if branch == 0 {
+                    &analytic.input
+                } else {
+                    &analytic.self_params
+                };
+                let got = if weight {
+                    conv.weights[0]
+                } else {
+                    conv.biases[0]
+                };
+                assert!(
+                    (got - numeric).abs() <= 2e-3 * numeric.abs().max(1.0),
+                    "branch={branch} weight={weight}: analytic={got}, numeric={numeric}"
+                );
+            }
+        }
+
+        let mut cpu_optimizer = build();
+        let cpu_forward = cpu_optimizer
+            .forward(&input)
+            .expect("EML optimizer forward");
+        cpu_optimizer
+            .backward_accumulate_seeded(&input, &cpu_forward, &[Some(seed.clone())])
+            .expect("EML CPU accumulated backward");
+        cpu_optimizer.update_weights(0.01, 0.0, 0.0, 1);
+
+        let mut gpu = GpuExecutableNetwork::new(executable.network.clone(), FakeBackend);
+        gpu.params = executable.params.clone();
+        let gpu_forward = gpu
+            .forward_with_state(&input)
+            .expect("EML GPU-host forward");
+        assert_eq!(
+            gpu_forward.cpu_forward.final_output(),
+            forward.final_output()
+        );
+        assert!(gpu.requires_cpu_backward_fallback());
+        gpu.zero_train_buffers_gpu().expect("clear GPU buffers");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &[Some(seed.clone())])
+            .expect("EML GPU-host backward");
+        let fallback = gpu.cpu_fallback_train_buffers.borrow();
+        let LayerTrainBuffers::EmlConvolutional(train) = &fallback[0] else {
+            panic!("expected EML fallback buffers");
+        };
+        assert!(train.input.weight_updates.iter().any(|value| *value != 0.0));
+        assert!(
+            train
+                .self_params
+                .weight_updates
+                .iter()
+                .any(|value| *value != 0.0)
+        );
+        drop(fallback);
+        let before = match &gpu.params[0] {
+            LayerParams::EmlConvolutional(params) => params.input.weights[0],
+            _ => unreachable!(),
+        };
+        gpu.update_weights_gpu(0.01, 0.0, 0.0, 1)
+            .expect("EML host SGD update");
+        let after = match &gpu.params[0] {
+            LayerParams::EmlConvolutional(params) => params.input.weights[0],
+            _ => unreachable!(),
+        };
+        assert_ne!(
+            before, after,
+            "host fallback optimizer must update EML weights"
+        );
+        let LayerParams::EmlConvolutional(cpu_params) = &cpu_optimizer.params[0] else {
+            unreachable!()
+        };
+        assert!((after - cpu_params.input.weights[0]).abs() < 1e-6);
+        assert_eq!(&gpu.params[0], &cpu_optimizer.params[0]);
+    }
+
+    #[test]
+    fn eml_convolutional_gpu_adam_updates_host_fallback_parameters() {
+        let cfg = "[net]\nchannels=1\nbatch=1\nheight=1\nwidth=1\nadam=1\nb1=0.8\nb2=0.95\neps=0.001\n\
+                   [eml_convolutional]\nfilters=1\nsize=1\nbatch_normalize=0\nresidual=0\n";
+        let network = Network::from_config(
+            ConfigFile::parse_str("eml-adam.cfg", cfg).expect("EML Adam cfg parses"),
+        )
+        .expect("EML Adam network builds");
+        let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+        let LayerParams::EmlConvolutional(params) = &mut gpu.params[0] else {
+            panic!("expected EML params");
+        };
+        params.input.weights[0] = 0.4;
+        params.input.biases[0] = 0.1;
+        params.self_params.weights[0] = -0.3;
+        params.self_params.biases[0] = 0.2;
+        let input = Tensor::from_data(TensorShape::new(1, 1, 1, 1), vec![0.25]).unwrap();
+        let before = params.input.weights[0];
+        let forward = gpu.forward_with_state(&input).expect("EML Adam forward");
+        let output = forward.cpu_forward.final_output().unwrap();
+        let seed = Tensor::filled(output.shape, 1.0);
+        gpu.backward_accumulate_seeded_gpu(&forward, &[Some(seed)])
+            .expect("EML Adam backward");
+        gpu.update_weights_gpu(0.01, 0.0, 0.0, 1)
+            .expect("EML host Adam update");
+        let LayerParams::EmlConvolutional(updated) = &gpu.params[0] else {
+            unreachable!()
+        };
+        assert_ne!(before, updated.input.weights[0]);
+        assert!(gpu.host_adam_state.borrow()[0].is_some());
     }
 
     /// C++ `parse_moe_convolutional_section` raises two hard errors, and both

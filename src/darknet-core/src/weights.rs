@@ -187,6 +187,10 @@ pub fn save_weights(
                 write_f32_slice(&mut file, &moe.router_biases)?;
                 write_f32_slice(&mut file, &moe.router_weights)?;
             }
+            (LayerKind::EmlConvolutional(_), LayerParams::EmlConvolutional(eml)) => {
+                write_convolutional_params(&mut file, &eml.input)?;
+                write_convolutional_params(&mut file, &eml.self_params)?;
+            }
             // C++ `dontsave`: the frozen LAYA layers load from an external
             // shared blob, so nothing is written for them in this stream.
             (LayerKind::LayaEncoder(_), LayerParams::LayaEncoder(_)) => {}
@@ -568,6 +572,10 @@ mod tests {
                 "[moe_convolutional]\nfilters=2\nsize=1\nstride=1\nbatch_normalize=0\n\
                  activation=linear\nexperts=3\n",
             ),
+            (
+                "eml_convolutional",
+                "[eml_convolutional]\nfilters=2\nsize=1\nstride=1\nbatch_normalize=1\nresidual=0\n",
+            ),
         ] {
             let cfg_text = if name == "crnn" {
                 format!("[net]\nwidth=2\nheight=2\nchannels=1\nbatch=2\ntime_steps=2\n{layer}")
@@ -598,6 +606,13 @@ mod tests {
                         }
                         for value in &mut moe.router_weights {
                             *value = 0.5;
+                        }
+                    }
+                    LayerParams::EmlConvolutional(eml) => {
+                        for conv in [&mut eml.input, &mut eml.self_params] {
+                            for value in &mut conv.weights {
+                                *value = 0.25;
+                            }
                         }
                     }
                     LayerParams::Rnn(recurrent) => {

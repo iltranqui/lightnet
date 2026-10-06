@@ -353,6 +353,17 @@ pub struct MoeSpec {
     pub expert: ConvolutionalSpec,
 }
 
+/// `[eml_convolutional]`: two parallel linear convolutions combined by the
+/// source-derived EML branch math. Both branches share this convolution spec.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EmlConvolutionalSpec {
+    pub branch: ConvolutionalSpec,
+    pub eml_clamp: f32,
+    pub eml_eps: f32,
+    pub eml_scale: f32,
+    pub residual: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConnectedSpec {
     pub output: usize,
@@ -1044,6 +1055,8 @@ pub enum LayerKind {
     /// `[moe_convolutional]`: a learned mixture of `MoeSpec::experts`
     /// convolutional experts gated per image by a small router.
     Moe(MoeSpec),
+    /// `[eml_convolutional]`: two parallel convolutions and an EML combine.
+    EmlConvolutional(EmlConvolutionalSpec),
     Rnn(RnnSpec),
     Gru(GruSpec),
     Lstm(LstmSpec),
@@ -1096,6 +1109,7 @@ impl LayerKind {
             Self::LayaHead(_) => "laya_head",
             Self::Vit(_) => "vit",
             Self::Moe(_) => "moe_convolutional",
+            Self::EmlConvolutional(_) => "eml_convolutional",
             Self::Rnn(_) => "rnn",
             Self::Gru(_) => "gru",
             Self::Lstm(_) => "lstm",
@@ -1500,6 +1514,20 @@ impl Layer {
                 });
                 Some(LayerWeights { entries })
             }
+            LayerKind::EmlConvolutional(spec) => {
+                let mut entries = Vec::new();
+                for _ in 0..2 {
+                    append_convolutional_weight_entries(
+                        &mut entries,
+                        self.input_shape.channels,
+                        spec.branch.filters,
+                        spec.branch.size,
+                        spec.branch.groups,
+                        spec.branch.batch_normalize,
+                    );
+                }
+                Some(LayerWeights { entries })
+            }
             LayerKind::Crnn(spec) => {
                 let mut entries = Vec::new();
                 append_convolutional_weight_entries(
@@ -1768,6 +1796,60 @@ fn parse_layer_kind(
 ) -> Result<LayerKind> {
     let name = section.name.as_str();
     Ok(match name {
+        "eml_convolutional" => {
+            let line = section.line;
+            if current.width == 0 || current.height == 0 || current.channels == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[eml_convolutional] at line {line}: preceding layer must output a non-empty image"
+                )));
+            }
+            let filters = section.get_usize("filters", 1)?;
+            let size = section.get_usize("size", 1)?;
+            let groups = section.get_i64("groups", 1)?.max(1) as usize;
+            let stride = section.get_i64("stride", 1)?;
+            let stride_x = section.get_i64("stride_x", -1)?;
+            let stride_y = section.get_i64("stride_y", -1)?;
+            let stride_x = if stride_x < 1 { stride } else { stride_x };
+            let stride_y = if stride_y < 1 { stride } else { stride_y };
+            let stride_x = usize::try_from(stride_x).map_err(|_| {
+                Error::InvalidConfig(format!(
+                    "[eml_convolutional] at line {line}: stride_x must be > 0"
+                ))
+            })?;
+            let stride_y = usize::try_from(stride_y).map_err(|_| {
+                Error::InvalidConfig(format!(
+                    "[eml_convolutional] at line {line}: stride_y must be > 0"
+                ))
+            })?;
+            let padding = if section.get_bool_int("pad", false)? {
+                size / 2
+            } else {
+                section.get_usize("padding", 0)?
+            };
+            let branch = ConvolutionalSpec {
+                filters,
+                size,
+                stride_x,
+                stride_y,
+                dilation: if size == 1 {
+                    1
+                } else {
+                    section.get_usize("dilation", 1)?
+                },
+                padding,
+                groups,
+                share_index: None,
+                batch_normalize: section.get_bool_int("batch_normalize", true)?,
+                activation: Activation::Linear,
+            };
+            LayerKind::EmlConvolutional(EmlConvolutionalSpec {
+                branch,
+                eml_clamp: section.get_f32("eml_clamp", 4.0)?,
+                eml_eps: section.get_f32("eml_eps", 1e-6)?,
+                eml_scale: section.get_f32("eml_scale", 0.1)?,
+                residual: section.get_bool_int("residual", true)?,
+            })
+        }
         "conv" | "convolutional" => {
             let stride = section.get_usize("stride", 1)?;
             let size = section.get_usize("size", 1)?;
@@ -2742,6 +2824,34 @@ fn infer_output_shape(
             spec.filters,
             current.batch,
         )),
+        LayerKind::EmlConvolutional(spec) => {
+            let conv = &spec.branch;
+            if conv.filters == 0
+                || conv.size == 0
+                || conv.stride_x == 0
+                || conv.stride_y == 0
+                || conv.dilation == 0
+                || conv.groups == 0
+                || current.channels % conv.groups != 0
+                || conv.filters % conv.groups != 0
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "[eml_convolutional] layer #{layer_index}: filters, size, strides, dilation, groups must be valid and groups must divide input channels and filters"
+                )));
+            }
+            let output = TensorShape::new(
+                conv_dim(current.width, conv.padding, conv.size, conv.stride_x),
+                conv_dim(current.height, conv.padding, conv.size, conv.stride_y),
+                conv.filters,
+                current.batch,
+            );
+            if output.width == 0 || output.height == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[eml_convolutional] layer #{layer_index}: convolution produces an empty spatial shape"
+                )));
+            }
+            Ok(output)
+        }
         LayerKind::Deconvolutional(spec) => {
             if spec.filters == 0 || spec.size == 0 || spec.stride == 0 || current.width == 0 || current.height == 0 {
                 return Err(Error::InvalidConfig(format!(
@@ -3988,6 +4098,59 @@ mod tests {
         assert_eq!(network.layers[4].output_shape.channels, 11);
         assert_eq!(network.layers[4].output_shape.width, 1);
         assert_eq!(network.layers[4].output_shape.height, 1);
+    }
+
+    #[test]
+    fn eml_convolutional_parses_source_defaults_and_validates_geometry() {
+        let default = build(
+            "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=1\n\
+             [eml_convolutional]\nfilters=2\nsize=1\n",
+        )
+        .expect("default EML config should parse");
+        let LayerKind::EmlConvolutional(spec) = &default.layers[0].kind else {
+            panic!("expected EML convolution");
+        };
+        assert!(spec.branch.batch_normalize);
+        assert_eq!(spec.branch.activation, super::Activation::Linear);
+        assert_eq!(
+            (spec.eml_clamp, spec.eml_eps, spec.eml_scale),
+            (4.0, 1e-6, 0.1)
+        );
+        assert!(spec.residual);
+        assert_eq!(
+            default.layers[0].output_shape,
+            default.layers[0].input_shape
+        );
+
+        let explicit = build(
+            "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=1\n\
+             [eml_convolutional]\nfilters=1\nsize=1\nbatch_normalize=0\nresidual=0\n\
+             eml_clamp=2.5\neml_eps=0.001\neml_scale=0.3\n",
+        )
+        .expect("explicit EML config should parse");
+        let LayerKind::EmlConvolutional(spec) = &explicit.layers[0].kind else {
+            panic!("expected EML convolution");
+        };
+        assert!(!spec.branch.batch_normalize && !spec.residual);
+        assert_eq!(
+            (spec.eml_clamp, spec.eml_eps, spec.eml_scale),
+            (2.5, 0.001, 0.3)
+        );
+
+        let residual_mismatch = build(
+            "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=1\n\
+             [eml_convolutional]\nfilters=1\nsize=1\n",
+        )
+        .expect("C++ skips residual addition when input/output sizes differ");
+        assert!(matches!(
+            residual_mismatch.layers[0].kind,
+            LayerKind::EmlConvolutional(_)
+        ));
+        let invalid_groups = build(
+            "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=1\n\
+             [eml_convolutional]\nfilters=3\nsize=1\ngroups=2\nresidual=0\n",
+        );
+        assert!(invalid_groups.is_err(), "groups must divide filters");
     }
 
     #[test]

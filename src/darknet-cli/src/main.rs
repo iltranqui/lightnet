@@ -2395,6 +2395,16 @@ fn print_forward_backward_summary(
                             || expert.weight_updates.iter().any(|value| *value != 0.0)
                     })
             }
+            darknet_core::LayerTrainBuffers::EmlConvolutional(eml) => {
+                [&eml.input, &eml.self_params].iter().any(|conv| {
+                    conv.bias_updates.iter().any(|value| *value != 0.0)
+                        || conv.weight_updates.iter().any(|value| *value != 0.0)
+                        || conv
+                            .batch_norm
+                            .as_ref()
+                            .is_some_and(|bn| bn.scale_updates.iter().any(|value| *value != 0.0))
+                })
+            }
             darknet_core::LayerTrainBuffers::Vit(vit) => {
                 vit.updates.to_blob().iter().any(|value| *value != 0.0)
             }

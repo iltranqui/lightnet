@@ -89,6 +89,7 @@ fn unsupported_sections(cfg: &ConfigFile) -> String {
         "channel_slice",
         "channel_shuffle",
         "deconvolutional",
+        "eml_convolutional",
         "logistic",
         "regression",
         "jev_ce",

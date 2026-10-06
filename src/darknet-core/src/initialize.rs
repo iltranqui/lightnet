@@ -118,6 +118,10 @@ pub fn initialize_training_params(network: &Network, params: &mut [LayerParams],
                     conv(expert, &mut rng);
                 }
             }
+            LayerParams::EmlConvolutional(p) => {
+                conv(&mut p.input, &mut rng);
+                conv(&mut p.self_params, &mut rng);
+            }
             LayerParams::Rnn(p) => {
                 for p in [&mut p.input, &mut p.self_params, &mut p.output] {
                     connected(p, &mut rng);

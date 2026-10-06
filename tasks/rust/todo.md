@@ -195,12 +195,17 @@ Immediately next, in dependency order:
   round-trip; router-specific soft/tied top-k parity is in `oxide_layers_extra`.
   CPU path is done (`cdf68d00`). v67 adds source-derived pure forward/backward
   math for the EML two-branch combination (`eml_conv_math.rs`, four host tests).
-  v68 adds host-reference and native Oxide f32 forward/backward branch-combine
-  ops, optional identity residual, and the C++ nonpositive clamp/epsilon
-  fallbacks; `darknet-cuda` tests pass 12/12 and `oxide_layers_extra` passes
-  24/24. Per-branch convolution runtime wiring, config/layer integration,
-  parameter loading/updates, and optimizer support remain open. No compiled-C++
-  golden is available; the weights order was verified 2026-10-05.
+  v68 adds host-reference and native Oxide f32 branch-combine ops, optional
+  identity residual, and the C++ nonpositive clamp/epsilon fallbacks. v69 adds
+  `[eml_convolutional]` parsing/shape inference, paired convolution parameters,
+  CPU forward/backward, C++ `input_layer` then `self_layer` weight serialization,
+  SGD/Adam updates, and an explicit GPU host-fallback path. Focused host EML
+  tests pass 3/3; EML weights round-trip passes in
+  `recurrent_weight_blocks_round_trip_in_darknet_order`. Remaining: native
+  Oxide whole-layer execution; CPU/GPU-host BN training still uses the existing
+  convolution helper's rolling-stat semantics rather than C++ batch-stat/EMA
+  behavior, and no compiled-C++ golden is available. Do not claim full C++
+  parity.
 - [ ] Phase 2B `dcnv3` blocked: no reference numerics (stub in all five branches).
 - [ ] Phase 2C OBB family (unblocked by decision 4; XL — also data loading, NMS,
   mAP).
