@@ -6075,9 +6075,6 @@ where
                     }
                 }
                 (LayerKind::Lstm(spec), LayerParams::Lstm(recurrent)) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download LSTM input", err))?;
                     if !spec.batch_normalize
                         && [
                             &recurrent.wf,
@@ -6096,7 +6093,8 @@ where
                             &self.backend,
                             spec,
                             recurrent,
-                            &host_input,
+                            current_input,
+                            layer.input_shape,
                             layer.output_shape,
                             layer.index,
                             host_copies,
@@ -6108,6 +6106,9 @@ where
                         gpu_lstm_cache = Some(device_cache);
                         output
                     } else {
+                        let host_input = self
+                            .download_tensor(current_input, layer.input_shape)
+                            .map_err(|err| backend_error("download LSTM input", err))?;
                         let (host_output, cache) =
                             forward_lstm_layer(spec, recurrent, &host_input, layer.output_shape)?;
                         recurrent_caches.push(Some(RecurrentForwardCache::Lstm(cache)));
@@ -12294,7 +12295,8 @@ fn forward_lstm_layer_device<B: F32TensorOpsBackend>(
     backend: &B,
     spec: &LstmSpec,
     params: &LstmParams,
-    input: &Tensor,
+    input_gpu: &B::Tensor,
+    input_shape: TensorShape,
     output_shape: TensorShape,
     layer_index: usize,
     capture_host_cache: bool,
@@ -12320,18 +12322,18 @@ where
             name: "batch-normalized LSTM GPU forward".to_owned(),
         });
     }
-    let sequence_batch = recurrent_sequence_batch(input.shape.batch, spec.steps)?;
+    let sequence_batch = recurrent_sequence_batch(input_shape.batch, spec.steps)?;
     if output_shape.width != 1 || output_shape.height != 1 || output_shape.channels != spec.output {
         return Err(Error::InvalidConfig(
             "LSTM output shape is inconsistent with its specification".to_owned(),
         ));
     }
-    let inputs = input.shape.element_count();
+    let inputs = input_shape.element_count();
     let state_shape = TensorShape::new(1, 1, spec.output, sequence_batch);
     let input_step_shape = TensorShape::new(
-        input.shape.width,
-        input.shape.height,
-        input.shape.channels,
+        input_shape.width,
+        input_shape.height,
+        input_shape.channels,
         sequence_batch,
     );
     let upload_projection = |projection: &ConnectedParams, input_features: usize, name: &str| {
@@ -12422,10 +12424,16 @@ where
     };
 
     for step in 0..spec.steps {
-        let step_input = sequence_slice(input, step, sequence_batch, input_step_shape)?;
         let step_input_gpu = backend
-            .upload_f32(&tensor_backend_shape(input_step_shape), &step_input.data)
-            .map_err(|err| backend_error("upload LSTM sequence slice", err))?;
+            .sequence_slice_f32(
+                input_gpu,
+                &tensor_backend_shape(input_shape),
+                step,
+                spec.steps,
+                &tensor_backend_shape(input_step_shape),
+                config,
+            )
+            .map_err(|err| backend_error("slice LSTM input sequence", err))?;
         let wf_gpu = project(&previous_state_gpu, &wf_weights, &wf_biases, spec.output)?;
         let wi_gpu = project(&previous_state_gpu, &wi_weights, &wi_biases, spec.output)?;
         let wg_gpu = project(&previous_state_gpu, &wg_weights, &wg_biases, spec.output)?;

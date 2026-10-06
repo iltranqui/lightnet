@@ -395,6 +395,38 @@ pub trait F32TensorOpsBackend {
             self.upload_f32(&[elements], &cell_gradient)?,
         ))
     }
+    /// Extract one contiguous recurrent timestep from a sequence-major tensor.
+    /// The input is split into `steps` equal-sized chunks; shapes describe the
+    /// contiguous storage layout.
+    fn sequence_slice_f32(
+        &self,
+        input: &Self::Tensor,
+        input_shape: &[usize],
+        step_index: usize,
+        steps: usize,
+        output_shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert!(steps > 0, "sequence slice requires at least one step");
+        assert!(step_index < steps, "sequence step index out of range");
+        let input_elements = input_shape.iter().product::<usize>();
+        assert_eq!(
+            input_elements % steps,
+            0,
+            "sequence input size must divide evenly into steps"
+        );
+        let step_elements = input_elements / steps;
+        assert_eq!(
+            output_shape.iter().product::<usize>(),
+            step_elements,
+            "sequence slice output size"
+        );
+        let values = self.download_f32(input)?;
+        assert_eq!(values.len(), input_elements, "sequence input tensor size");
+        let start = step_index * step_elements;
+        self.upload_f32(output_shape, &values[start..start + step_elements])
+    }
     /// Concatenate same-sized recurrent timestep outputs along the sequence
     /// axis. `output_shape` carries the caller's tensor layout; each input has
     /// `step_elements` contiguous values.

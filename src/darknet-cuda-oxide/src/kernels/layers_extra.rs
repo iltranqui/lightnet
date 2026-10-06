@@ -22,6 +22,19 @@ pub fn dropout_unit(seed: u64, index: u64) -> f32 {
 pub mod kernels {
     use super::*;
 
+    /// Copy one contiguous sequence chunk to an independent output tensor.
+    #[kernel]
+    pub fn sequence_slice_step(input: &[f32], mut output: DisjointSlice<f32>, offset: usize) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i < output.len() {
+            // SAFETY: the host validates the timestep range against input.
+            unsafe {
+                *output.as_mut_ptr().add(i) = input[offset + i];
+            }
+        }
+    }
+
     /// Copy one contiguous recurrent timestep into its disjoint output range.
     #[kernel]
     pub fn sequence_concat_step(input: &[f32], mut output: DisjointSlice<f32>, offset: usize) {

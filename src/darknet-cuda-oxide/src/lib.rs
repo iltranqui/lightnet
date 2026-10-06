@@ -2418,6 +2418,71 @@ impl F32TensorOpsBackend for OxideBackend {
         ))
     }
 
+    fn sequence_slice_f32(
+        &self,
+        input: &Self::Tensor,
+        input_shape: &[usize],
+        step_index: usize,
+        steps: usize,
+        output_shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let op = "sequence_slice_f32";
+        if steps == 0 || step_index >= steps {
+            return Err(shape_err(
+                op,
+                "invalid recurrent step index/count".to_owned(),
+            ));
+        }
+        let input_elements = input_shape
+            .iter()
+            .try_fold(1usize, |product, dim| product.checked_mul(*dim))
+            .ok_or_else(|| shape_err(op, "input shape element count overflow".to_owned()))?;
+        if input_elements % steps != 0 {
+            return Err(shape_err(
+                op,
+                format!("input has {input_elements} elements, not divisible by {steps} steps"),
+            ));
+        }
+        let step_elements = input_elements / steps;
+        let output_elements = output_shape
+            .iter()
+            .try_fold(1usize, |product, dim| product.checked_mul(*dim))
+            .ok_or_else(|| shape_err(op, "output shape element count overflow".to_owned()))?;
+        if output_elements != step_elements {
+            return Err(shape_err(
+                op,
+                format!("output has {output_elements} elements, expected {step_elements}"),
+            ));
+        }
+        let input = self.f32v(input)?;
+        if input.len() != input_elements {
+            return Err(shape_err(
+                op,
+                format!(
+                    "input tensor has {} elements, expected {input_elements}",
+                    input.len()
+                ),
+            ));
+        }
+        let offset = step_index
+            .checked_mul(step_elements)
+            .ok_or_else(|| shape_err(op, "sequence input offset overflow".to_owned()))?;
+        let mut output = self.alloc_uninit(step_elements)?;
+        // SAFETY: checked shapes and step index keep this copy within input.
+        unsafe {
+            self.layers_extra.sequence_slice_step(
+                &self.stream,
+                launch::elementwise(step_elements, config),
+                &input.buf,
+                &mut output,
+                offset,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, output_shape))
+    }
+
     fn sequence_concat_f32(
         &self,
         steps: &[&Self::Tensor],
