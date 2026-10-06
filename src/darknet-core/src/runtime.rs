@@ -570,7 +570,8 @@ where
     expert_activation_inputs: Vec<T>,
 }
 
-/// Device-resident recurrent values retained for no-BN LSTM backward.
+/// Device-resident recurrent values retained for LSTM backward, including the
+/// host-forward-cache upload path for batch-normalized LSTMs.
 #[derive(Clone, Debug)]
 pub struct GpuLstmBackwardCache<T>
 where
@@ -5594,11 +5595,13 @@ where
         training: bool,
         host_copies: bool,
     ) -> Result<GpuForwardState<B::Tensor>> {
-        let has_batch_normalized_rnn = self.network.layers.iter().any(|layer| {
+        let has_batch_normalized_recurrent = self.network.layers.iter().any(|layer| {
             matches!(&layer.kind, LayerKind::Rnn(spec) if spec.batch_normalize)
+                || matches!(&layer.kind, LayerKind::Lstm(spec) if spec.batch_normalize)
         });
-        let host_copies =
-            host_copies || self.requires_cpu_backward_fallback() || has_batch_normalized_rnn;
+        let host_copies = host_copies
+            || self.requires_cpu_backward_fallback()
+            || has_batch_normalized_recurrent;
         let expected = self.network.net.input_shape();
         if input.shape != expected {
             return Err(Error::InvalidConfig(format!(
@@ -5630,10 +5633,11 @@ where
         let mut yolo_heads = Vec::new();
         let mut modern_heads = Vec::new();
         let mut rng_state = 0x9e37_79b9_u64;
-        // Keep legacy rolling-stat behavior for networks with BN RNNs while
-        // their recurrent forward still uses the host reference implementation.
-        let batch_norm_training =
-            training && !self.requires_cpu_backward_fallback() && !has_batch_normalized_rnn;
+        // Keep legacy rolling-stat behavior for networks with BN recurrent
+        // layers while their recurrent forward uses the host reference path.
+        let batch_norm_training = training
+            && !self.requires_cpu_backward_fallback()
+            && !has_batch_normalized_recurrent;
 
         for (layer, params) in self.network.layers.iter().zip(&self.params) {
             let current_input = if layer.index == 0 {
@@ -8852,16 +8856,42 @@ where
                     )?;
                 }
                 (LayerKind::Lstm(spec), Some(LayerParams::Lstm(params))) => {
-                    let cache = forward
+                    let has_batch_norm = [
+                        params.wf.batch_norm.is_some(),
+                        params.wi.batch_norm.is_some(),
+                        params.wg.batch_norm.is_some(),
+                        params.wo.batch_norm.is_some(),
+                        params.uf.batch_norm.is_some(),
+                        params.ui.batch_norm.is_some(),
+                        params.ug.batch_norm.is_some(),
+                        params.uo.batch_norm.is_some(),
+                    ];
+                    if has_batch_norm
+                        .iter()
+                        .any(|present| *present != spec.batch_normalize)
+                    {
+                        return Err(Error::InvalidConfig(format!(
+                            "LSTM batch-normalization parameter mismatch at layer #{}",
+                            layer.index
+                        )));
+                    }
+                    let cache = if let Some(cache) = forward
                         .gpu_lstm_caches
                         .get(layer.index)
                         .and_then(Option::as_ref)
-                        .ok_or_else(|| {
-                            Error::InvalidConfig(format!(
-                                "missing LSTM device cache for GPU layer #{}",
+                    {
+                        cache.clone()
+                    } else {
+                        let Some(Some(RecurrentForwardCache::Lstm(cache))) =
+                            forward.cpu_forward.recurrent_caches.get(layer.index)
+                        else {
+                            return Err(Error::InvalidConfig(format!(
+                                "missing LSTM forward cache for GPU layer #{}",
                                 layer.index
-                            ))
-                        })?;
+                            )));
+                        };
+                        upload_lstm_backward_cache(&self.backend, cache)?
+                    };
                     let current_input = if layer.index == 0 {
                         &forward.input_gpu
                     } else {
@@ -8876,7 +8906,7 @@ where
                         &self.backend,
                         spec,
                         params,
-                        cache,
+                        &cache,
                         current_input,
                         layer.input_shape,
                         &grad,
@@ -9046,10 +9076,11 @@ where
         self.update_gpu_convolution_batch_norm_running_stats_from_forward(forward)?;
         if self.network.layers.iter().any(|layer| {
             matches!(&layer.kind, LayerKind::Rnn(spec) if spec.batch_normalize)
+                || matches!(&layer.kind, LayerKind::Lstm(spec) if spec.batch_normalize)
         }) {
             let input = self
                 .download_tensor(&forward.input_gpu, self.network.net.input_shape())
-                .map_err(|err| backend_error("download BN RNN input for rolling stats", err))?;
+                .map_err(|err| backend_error("download BN recurrent input for rolling stats", err))?;
             update_recurrent_batch_norm_running_stats(
                 &self.network,
                 &mut self.params,
@@ -9063,8 +9094,8 @@ where
     fn requires_cpu_backward_fallback(&self) -> bool {
         self.network.layers.iter().any(|layer| {
             match &layer.kind {
-                // RNN backward supports BN through the rolling-stat affine
-                // derivative; BN LSTM/CRNN still use the whole-network fallback.
+                // RNN/LSTM backward supports BN through rolling-stat affine
+                // projection derivatives; BN CRNN still uses whole-network fallback.
                 LayerKind::Rnn(spec) => {
                     if spec.activation.to_cuda_f32_kind().is_none()
                         || (spec.logistic == 2 && Activation::Loggy.to_cuda_f32_kind().is_none())
@@ -9072,11 +9103,7 @@ where
                         return true;
                     }
                 }
-                LayerKind::Lstm(spec) => {
-                    if spec.batch_normalize {
-                        return true;
-                    }
-                }
+                LayerKind::Lstm(_) => {}
                 LayerKind::Crnn(spec) => {
                     if spec.batch_normalize
                         || spec.activation.to_cuda_f32_kind().is_none()
@@ -14561,7 +14588,36 @@ where
     })
 }
 
-fn backward_connected_rnn_projection_device<B: F32TensorOpsBackend>(
+fn upload_lstm_backward_cache<B: F32TensorOpsBackend>(
+    backend: &B,
+    cache: &LstmForwardCache,
+) -> Result<GpuLstmBackwardCache<B::Tensor>>
+where
+    B::Error: std::fmt::Display,
+{
+    let upload = |tensors: &[Tensor], operation: &str| -> Result<Vec<B::Tensor>> {
+        tensors
+            .iter()
+            .map(|tensor| {
+                backend
+                    .upload_f32(&tensor_backend_shape(tensor.shape), &tensor.data)
+                    .map_err(|err| backend_error(operation, err))
+            })
+            .collect()
+    };
+    Ok(GpuLstmBackwardCache {
+        sequence_batch: cache.sequence_batch,
+        previous_states: upload(&cache.previous_states, "upload BN LSTM previous states")?,
+        previous_cells: upload(&cache.previous_cells, "upload BN LSTM previous cells")?,
+        forget: upload(&cache.forget, "upload BN LSTM forget gates")?,
+        input_gate: upload(&cache.input_gate, "upload BN LSTM input gates")?,
+        candidate: upload(&cache.candidate, "upload BN LSTM candidate gates")?,
+        output_gate: upload(&cache.output_gate, "upload BN LSTM output gates")?,
+        cells: upload(&cache.cells, "upload BN LSTM cells")?,
+    })
+}
+
+fn backward_connected_recurrent_projection_device<B: F32TensorOpsBackend>(
     backend: &B,
     input: &B::Tensor,
     weights: &B::Tensor,
@@ -14584,15 +14640,15 @@ where
                 || params.biases.len() != output_features
             {
                 return Err(Error::InvalidConfig(
-                    "BN RNN connected projection parameter shape mismatch".to_owned(),
+                    "BN recurrent projection parameter shape mismatch".to_owned(),
                 ));
             }
             let beta_gradient = backend
                 .bias_backward_f32(delta, output_features, 1, config)
-                .map_err(|err| backend_error("BN RNN beta gradient", err))?;
+                .map_err(|err| backend_error("BN recurrent beta gradient", err))?;
             let zero_biases = backend
                 .zeros_f32(&[output_features])
-                .map_err(|err| backend_error("allocate BN RNN raw projection biases", err))?;
+                .map_err(|err| backend_error("allocate BN recurrent raw projection biases", err))?;
             let raw_output = backend
                 .connected_f32(
                     input,
@@ -14603,18 +14659,18 @@ where
                     output_features,
                     config,
                 )
-                .map_err(|err| backend_error("BN RNN raw connected projection", err))?;
+                .map_err(|err| backend_error("BN recurrent raw connected projection", err))?;
             let raw_values = backend
                 .download_f32(&raw_output)
-                .map_err(|err| backend_error("download BN RNN raw projection", err))?;
+                .map_err(|err| backend_error("download BN recurrent raw projection", err))?;
             let delta_values = backend
                 .download_f32(delta)
-                .map_err(|err| backend_error("download BN RNN affine delta", err))?;
+                .map_err(|err| backend_error("download BN recurrent affine delta", err))?;
             if raw_values.len() != sequence_batch * output_features
                 || delta_values.len() != raw_values.len()
             {
                 return Err(Error::InvalidConfig(
-                    "BN RNN connected projection activation shape mismatch".to_owned(),
+                    "BN recurrent projection activation shape mismatch".to_owned(),
                 ));
             }
             let mut scale_gradient_values = vec![0.0; output_features];
@@ -14632,13 +14688,13 @@ where
             }
             let delta_scale = backend
                 .upload_f32(&[output_features], &delta_scale)
-                .map_err(|err| backend_error("upload BN RNN affine scales", err))?;
+                .map_err(|err| backend_error("upload BN recurrent affine scales", err))?;
             let linear_delta = backend
                 .channel_scale_f32(delta, &delta_scale, output_features, 1, config)
-                .map_err(|err| backend_error("BN RNN rolling-stat delta scale", err))?;
+                .map_err(|err| backend_error("BN recurrent rolling-stat delta scale", err))?;
             let scale_gradient = backend
                 .upload_f32(&[output_features], &scale_gradient_values)
-                .map_err(|err| backend_error("upload BN RNN scale gradient", err))?;
+                .map_err(|err| backend_error("upload BN recurrent scale gradient", err))?;
             (linear_delta, Some(beta_gradient), Some(scale_gradient))
         } else {
             (delta.clone(), None, None)
@@ -14653,7 +14709,7 @@ where
             output_features,
             config,
         )
-        .map_err(|err| backend_error("RNN connected projection backward", err))?;
+        .map_err(|err| backend_error("recurrent connected projection backward", err))?;
     let bias_gradient = beta_gradient.unwrap_or(connected_bias_gradient);
     Ok((input_gradient, weight_gradient, bias_gradient, scale_gradient))
 }
@@ -14745,7 +14801,7 @@ where
             .map_err(|err| backend_error("RNN output activation backward", err))?;
         let state_gpu = cache.states[step].clone();
         let (mut state_gradient, output_weight_gradient, output_bias_gradient, output_scale_gradient) =
-            backward_connected_rnn_projection_device(
+            backward_connected_recurrent_projection_device(
                 backend,
                 &state_gpu,
                 &output_weights,
@@ -14794,7 +14850,7 @@ where
             .map_err(|err| backend_error("RNN recurrent activation backward", err))?;
         let previous_state_gpu = cache.previous_states[step].clone();
         let (mut future_state, self_weight_gradient, self_bias_gradient, self_scale_gradient) =
-            backward_connected_rnn_projection_device(
+            backward_connected_recurrent_projection_device(
                 backend,
                 &previous_state_gpu,
                 &self_weights,
@@ -14849,7 +14905,7 @@ where
             )
             .map_err(|err| backend_error("slice RNN input sequence", err))?;
         let (step_input_gradient, input_weight_gradient, input_bias_gradient, input_scale_gradient) =
-            backward_connected_rnn_projection_device(
+            backward_connected_recurrent_projection_device(
                 backend,
                 &step_input_gpu,
                 &input_weights,
@@ -14991,18 +15047,23 @@ where
     let sequence_batch = recurrent_sequence_batch(input_shape.batch, spec.steps)?;
     let output_shape = TensorShape::new(1, 1, spec.output, input_shape.batch);
     let inputs = input_shape.element_count();
-    if spec.batch_normalize
-        || [
-            &params.wf, &params.wi, &params.wg, &params.wo, &params.uf, &params.ui, &params.ug,
-            &params.uo,
-        ]
+    let has_batch_norm = [
+        params.wf.batch_norm.is_some(),
+        params.wi.batch_norm.is_some(),
+        params.wg.batch_norm.is_some(),
+        params.wo.batch_norm.is_some(),
+        params.uf.batch_norm.is_some(),
+        params.ui.batch_norm.is_some(),
+        params.ug.batch_norm.is_some(),
+        params.uo.batch_norm.is_some(),
+    ];
+    if has_batch_norm
         .iter()
-        .any(|projection| projection.batch_norm.is_some())
+        .any(|present| *present != spec.batch_normalize)
     {
-        return Err(Error::UnsupportedLayer {
-            layer_index,
-            name: "batch-normalized LSTM GPU backward".to_owned(),
-        });
+        return Err(Error::InvalidConfig(format!(
+            "LSTM batch-normalization parameter mismatch at layer #{layer_index}"
+        )));
     }
     if cache.sequence_batch != sequence_batch
         || cache.previous_states.len() != spec.steps
@@ -15053,6 +15114,8 @@ where
     let mut weight_gradients: Vec<Option<B::Tensor>> =
         (0..projections.len()).map(|_| None).collect();
     let mut bias_gradients: Vec<Option<B::Tensor>> = (0..projections.len()).map(|_| None).collect();
+    let mut scale_gradients: Vec<Option<B::Tensor>> =
+        (0..projections.len()).map(|_| None).collect();
 
     for step in (0..spec.steps).rev() {
         let output_gradient_step_gpu = backend
@@ -15118,17 +15181,18 @@ where
             };
             let features = if recurrent { spec.output } else { inputs };
             let gate_gradient_gpu = &gate_gradients[gate_index];
-            let (input_gradient, weight_gradient, bias_gradient) = backend
-                .connected_backward_f32(
+            let (input_gradient, weight_gradient, bias_gradient, scale_gradient) =
+                backward_connected_recurrent_projection_device(
+                    backend,
                     projection_input,
                     &projection_weights[projection_index],
                     gate_gradient_gpu,
+                    projections[projection_index].0,
                     sequence_batch,
                     features,
                     spec.output,
                     config,
-                )
-                .map_err(|err| backend_error("LSTM connected backward", err))?;
+                )?;
             if recurrent {
                 accumulate_backend_gradient(
                     backend,
@@ -15160,6 +15224,15 @@ where
                 config,
                 "accumulate LSTM bias gradient",
             )?;
+            if let Some(scale_gradient) = scale_gradient {
+                accumulate_backend_gradient(
+                    backend,
+                    &mut scale_gradients[projection_index],
+                    scale_gradient,
+                    config,
+                    "accumulate LSTM scale gradient",
+                )?;
+            }
         }
         let step_input_gradient = step_input_gradient.ok_or_else(|| {
             Error::InvalidConfig(format!(
@@ -15228,6 +15301,25 @@ where
         }
         gradient.weights = weights;
         gradient.biases = biases;
+        match (&mut gradient.batch_norm, &scale_gradients[index]) {
+            (Some(batch_norm), Some(scale_gradient)) => {
+                let scales = backend
+                    .download_f32(scale_gradient)
+                    .map_err(|err| backend_error("download LSTM scale gradient", err))?;
+                if scales.len() != batch_norm.scales.len() {
+                    return Err(Error::InvalidConfig(format!(
+                        "LSTM scale gradient shape mismatch at layer #{layer_index}"
+                    )));
+                }
+                batch_norm.scales = scales;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(Error::InvalidConfig(format!(
+                    "LSTM batch-normalization gradient mismatch at layer #{layer_index}"
+                )));
+            }
+        }
     }
     Ok((input_gradient, gradients))
 }
@@ -23971,6 +24063,177 @@ mod tests {
                 2e-5,
             );
         }
+    }
+
+    #[test]
+    fn gpu_batch_normalized_lstm_backward_matches_cpu_and_updates_rolling_stats() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "lstm-bn-gpu.cfg",
+                "[net]\ninputs=2\nbatch=2\ntime_steps=2\n[connected]\noutput=2\nactivation=linear\n[lstm]\noutput=3\nbatch_normalize=1\n",
+            )
+            .expect("LSTM BN cfg should parse"),
+        )
+        .expect("LSTM BN network should build");
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        let LayerParams::Connected(upstream) = &mut cpu.params[0] else {
+            panic!("expected upstream connected parameters");
+        };
+        upstream.weights.copy_from_slice(&[0.31, -0.18, 0.11, 0.27]);
+        upstream.biases.copy_from_slice(&[0.02, -0.035]);
+        let LayerParams::Lstm(params) = &mut cpu.params[1] else {
+            panic!("expected LSTM parameters");
+        };
+        for (slot, projection) in [
+            &mut params.wf,
+            &mut params.wi,
+            &mut params.wg,
+            &mut params.wo,
+            &mut params.uf,
+            &mut params.ui,
+            &mut params.ug,
+            &mut params.uo,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (index, weight) in projection.weights.iter_mut().enumerate() {
+                *weight = 0.015 + (slot * 3 + index) as f32 * 0.004;
+            }
+            for (index, bias) in projection.biases.iter_mut().enumerate() {
+                *bias = (slot as f32 - 3.5) * 0.01 + index as f32 * 0.006;
+            }
+            let batch_norm = projection.batch_norm.as_mut().expect("LSTM BN params");
+            for feature in 0..batch_norm.scales.len() {
+                batch_norm.scales[feature] = 0.72 + feature as f32 * 0.13;
+                batch_norm.rolling_mean[feature] = -0.08 + feature as f32 * 0.05;
+                batch_norm.rolling_variance[feature] = 0.6 + feature as f32 * 0.17;
+            }
+        }
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        gpu.params = cpu.params.clone();
+        assert!(!gpu.requires_cpu_backward_fallback());
+        gpu.init_train_buffers_gpu()
+            .expect("GPU LSTM BN train buffers");
+        let input = Tensor::from_data(
+            cpu.network.net.input_shape(),
+            (0..8).map(|index| (index as f32 * 0.29).sin() * 0.8).collect(),
+        )
+        .expect("LSTM input");
+        let cpu_forward = cpu
+            .forward_training(&input)
+            .expect("CPU LSTM BN forward");
+        let gpu_forward = gpu
+            .forward_training_device(&input)
+            .expect("GPU LSTM BN host-reference forward");
+        assert!(matches!(
+            gpu_forward.cpu_forward.recurrent_caches.get(1),
+            Some(Some(super::RecurrentForwardCache::Lstm(_)))
+        ));
+        assert!(gpu_forward.gpu_lstm_caches[1].is_none());
+        assert_slice_close(
+            "BN LSTM output",
+            &cpu_forward.layer_outputs[1].data,
+            &gpu_forward.cpu_forward.layer_outputs[1].data,
+            1e-6,
+        );
+
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu()
+            .expect("clear GPU LSTM BN train buffers");
+        let output_shape = cpu.network.layers[1].output_shape;
+        let seed = Tensor::from_data(
+            output_shape,
+            (0..output_shape.batch * output_shape.element_count())
+                .map(|index| (index as f32 * 0.41).cos() * 0.55)
+                .collect(),
+        )
+        .expect("LSTM output gradient");
+        let seeds = vec![None, Some(seed)];
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU LSTM BN backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("GPU LSTM BN backward");
+        assert!(!gpu.gradients_non_finite().expect("finite LSTM BN gradients"));
+        cpu.update_weights(0.02, 0.0, 0.0, 2);
+        gpu.update_weights_gpu(0.02, 0.0, 0.0, 2)
+            .expect("GPU LSTM BN host optimizer step");
+
+        let (LayerParams::Connected(cpu_input), LayerParams::Connected(gpu_input)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("upstream connected parameters after update");
+        };
+        assert_slice_close(
+            "BN LSTM upstream weights",
+            &cpu_input.weights,
+            &gpu_input.weights,
+            3e-5,
+        );
+        assert_slice_close(
+            "BN LSTM upstream biases",
+            &cpu_input.biases,
+            &gpu_input.biases,
+            3e-5,
+        );
+        let (LayerParams::Lstm(cpu_lstm), LayerParams::Lstm(gpu_lstm)) =
+            (&cpu.params[1], &gpu.params[1])
+        else {
+            panic!("LSTM parameters after update");
+        };
+        for (name, cpu_projection, gpu_projection) in [
+            ("wf", &cpu_lstm.wf, &gpu_lstm.wf),
+            ("wi", &cpu_lstm.wi, &gpu_lstm.wi),
+            ("wg", &cpu_lstm.wg, &gpu_lstm.wg),
+            ("wo", &cpu_lstm.wo, &gpu_lstm.wo),
+            ("uf", &cpu_lstm.uf, &gpu_lstm.uf),
+            ("ui", &cpu_lstm.ui, &gpu_lstm.ui),
+            ("ug", &cpu_lstm.ug, &gpu_lstm.ug),
+            ("uo", &cpu_lstm.uo, &gpu_lstm.uo),
+        ] {
+            assert_slice_close(
+                &format!("BN LSTM {name} weights"),
+                &cpu_projection.weights,
+                &gpu_projection.weights,
+                3e-5,
+            );
+            assert_slice_close(
+                &format!("BN LSTM {name} beta"),
+                &cpu_projection.biases,
+                &gpu_projection.biases,
+                3e-5,
+            );
+            let cpu_bn = cpu_projection.batch_norm.as_ref().unwrap();
+            let gpu_bn = gpu_projection.batch_norm.as_ref().unwrap();
+            assert_slice_close(
+                &format!("BN LSTM {name} scales"),
+                &cpu_bn.scales,
+                &gpu_bn.scales,
+                3e-5,
+            );
+            assert_slice_close(
+                &format!("BN LSTM {name} rolling mean"),
+                &cpu_bn.rolling_mean,
+                &gpu_bn.rolling_mean,
+                3e-5,
+            );
+            assert_slice_close(
+                &format!("BN LSTM {name} rolling variance"),
+                &cpu_bn.rolling_variance,
+                &gpu_bn.rolling_variance,
+                3e-5,
+            );
+        }
+        {
+            let mut buffers = gpu.cpu_fallback_train_buffers.borrow_mut();
+            let LayerTrainBuffers::Lstm(train) = &mut buffers[1] else {
+                panic!("LSTM host accumulators");
+            };
+            train.wf.batch_norm.as_mut().unwrap().scale_updates[0] = f32::INFINITY;
+        }
+        assert!(gpu
+            .gradients_non_finite()
+            .expect("LSTM BN host scale overflow check"));
     }
 
     #[test]

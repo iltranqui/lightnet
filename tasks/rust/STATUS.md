@@ -34,6 +34,13 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v59: BN LSTM backward now uses backend gate/BPTT and projection operations,
+  with rolling-stat affine input/beta derivatives; CPU forward/cache capture and
+  optimizer remain host-side, and scale-gradient reductions transfer raw
+  projections/deltas to host. BN CRNN remains on CPU backward. Host LSTM tests
+  passed (3/3), host RNN regression tests passed (6/6), and real Oxide
+  `oxide_runtime_chain` passed (16/16), including BN LSTM parameter, rolling-stat,
+  and upstream-convolution parity.
 - v58: BN RNN backward uses backend projection/BPTT ops and rolling-stat affine
   input/beta derivatives; scale-gradient reduction still transfers raw projections
   and deltas to host. Forward/cache capture and optimizer remain host-side; BN
@@ -75,7 +82,8 @@ Latest increments:
   host MoE suite passed (18/18), host optimizer compatibility passed, and the
   full real-device `oxide_runtime_chain` suite passed (11/11), including
   `moe_adam_updates_router_and_experts_on_oxide_match_cpu_gradients`.
-- Added no-BN LSTM device backward: gate derivatives, connected projection
+- Added no-BN LSTM device backward; v59 adds its BN rolling-stat projection
+  derivative path using an uploaded CPU forward cache. Gate derivatives, connected projection
   gradients, and recurrent/input-gradient accumulation use backend ops. The
   training path retains BPTT caches on-device rather than downloading projection,
   gate, and cell caches, and concatenates timestep outputs directly on-device.
@@ -226,15 +234,15 @@ Latest increments:
   slicing and input-gradient assembly also stay on-device, with convolution
   parameter gradients accumulated across steps. Recurrent cache/state and
   parameter-gradient transfers, host accumulation/SGD, and some cache handling
-  still cross the host. BN RNN backward uses backend projection/BPTT ops and
-  affine input/beta derivatives; scale-gradient reduction transfers raw outputs
-  and deltas to host. Forward/cache capture and optimizer remain host-side.
-  BN LSTM/CRNN backward still uses CPU fallback. FakeBackend and real-device
+  still cross the host. BN RNN/LSTM backward uses backend projection/BPTT ops
+  and affine input/beta derivatives; scale-gradient reduction transfers raw
+  outputs and deltas to host. Forward/cache capture and optimizer remain
+  host-side. BN CRNN backward still uses CPU fallback. FakeBackend and real-device
   `oxide_runtime_chain::batch_normalized_rnn_device_backward_matches_cpu_on_oxide`
+  and `oxide_runtime_chain::batch_normalized_lstm_device_backward_matches_cpu_on_oxide`
   compare parameter and rolling-stat updates with CPU, including upstream
-  connected updates. Dynamic loss-scale finiteness checks include host-buffered
-  connected/recurrent gradients. The no-BN LSTM parity test also checks
-  upstream convolution.
+  connected/convolution updates. Dynamic loss-scale finiteness checks include
+  host-buffered connected/recurrent gradients.
 - Host Adam updates standalone batchnorm, local, connected, weighted shortcut,
   MoE fallback, deconvolutional, GRU/RNN/LSTM/CRNN, and ViT parameters with
   distinct moment slots and per-layer rate scaling. DNOPT3 persists no-BN device
