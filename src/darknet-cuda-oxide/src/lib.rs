@@ -3475,6 +3475,136 @@ impl F32TensorOpsBackend for OxideBackend {
         Ok(OxideTensorF32::new(dots, &[batch]))
     }
 
+    fn moe_gate_column_f32(
+        &self,
+        gates: &Self::Tensor,
+        batch: usize,
+        experts: usize,
+        expert: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let gates = self.f32v(gates)?;
+        let op = "moe_gate_column_f32";
+        if batch == 0 || experts == 0 || expert >= experts || gates.len() != batch * experts {
+            return Err(shape_err(
+                op,
+                format!(
+                    "invalid gate shape/slot: batch={batch}, experts={experts}, expert={expert}, len={}",
+                    gates.len()
+                ),
+            ));
+        }
+        let mut column = self.alloc_uninit(batch)?;
+        // SAFETY: one thread per sample reads its gate and writes one column element.
+        unsafe {
+            self.layers_extra.moe_gate_column(
+                &self.stream,
+                launch::elementwise(batch, config),
+                &gates.buf,
+                &mut column,
+                experts,
+                expert,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(column, &[batch]))
+    }
+
+    fn moe_router_backward_f32(
+        &self,
+        gates: &Self::Tensor,
+        output_gradient: &Self::Tensor,
+        expert_outputs: &[Self::Tensor],
+        batch: usize,
+        experts: usize,
+        per_image: usize,
+        load_balance: f32,
+        temperature: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let gates = self.f32v(gates)?;
+        let output_gradient = self.f32v(output_gradient)?;
+        let op = "moe_router_backward_f32";
+        if batch == 0 || experts == 0 || per_image == 0 || expert_outputs.len() != experts {
+            return Err(shape_err(
+                op,
+                format!(
+                    "invalid dimensions or expert count: {batch}x{experts}x{per_image}, {} outputs",
+                    expert_outputs.len()
+                ),
+            ));
+        }
+        let gate_count = batch * experts;
+        let output_count = batch * per_image;
+        if gates.len() != gate_count || output_gradient.len() != output_count {
+            return Err(shape_err(
+                op,
+                format!(
+                    "gate/gradient lengths are {}/{}, expected {gate_count}/{output_count}",
+                    gates.len(),
+                    output_gradient.len()
+                ),
+            ));
+        }
+        let mut partial = self.alloc_uninit(batch * 256)?;
+        let mut dots = self.alloc_uninit(gate_count)?;
+        for (expert, output) in expert_outputs.iter().enumerate() {
+            let output = self.f32v(output)?;
+            if output.len() != output_count {
+                return Err(shape_err(
+                    op,
+                    format!(
+                        "expert {expert} has {} values, expected {output_count}",
+                        output.len()
+                    ),
+                ));
+            }
+            // SAFETY: one thread owns each (sample, reduction-lane) partial. The
+            // workspace is reused on the same stream before folding this expert.
+            unsafe {
+                self.layers_extra.moe_gate_dot_partial(
+                    &self.stream,
+                    launch::elementwise(batch * 256, config),
+                    &output_gradient.buf,
+                    &output.buf,
+                    &mut partial,
+                    per_image,
+                    batch,
+                )
+            }
+            .map_err(launch_err)?;
+            // SAFETY: each expert launch writes a disjoint column of the dots matrix.
+            unsafe {
+                self.layers_extra.moe_gate_dot_reduce_column(
+                    &self.stream,
+                    launch::elementwise(batch, config),
+                    &partial,
+                    &mut dots,
+                    experts,
+                    expert,
+                )
+            }
+            .map_err(launch_err)?;
+        }
+        let mut dlogit = self.alloc_uninit(gate_count)?;
+        // SAFETY: one thread owns one complete batch row of router derivatives.
+        unsafe {
+            self.layers_extra.moe_router_gate_backward(
+                &self.stream,
+                launch::elementwise(batch, config),
+                &gates.buf,
+                &dots,
+                &mut dlogit,
+                batch,
+                experts,
+                load_balance,
+                temperature,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(dlogit, &[batch, experts]))
+    }
+
     fn crop_bilinear_f32(
         &self,
         x: &Self::Tensor,

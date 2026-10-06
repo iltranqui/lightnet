@@ -832,3 +832,89 @@ fn moe_pool_and_gate_dots_match_host_for_non_multiple_reductions() {
         .collect::<Vec<_>>();
     assert_close("moe gate dot", &be.download_f32(&dots).unwrap(), &expected);
 }
+
+#[test]
+fn moe_router_backward_and_gate_columns_match_reference() {
+    let be = backend();
+    let (batch, experts, per_image) = (4usize, 3usize, 73usize);
+    let gates = vec![0.4, 0.6, 0.0, 0.0, 0.3, 0.7, 0.25, 0.0, 0.75, 0.6, 0.4, 0.0];
+    let mut rng = Rng(0x4d4f_455f_4257_445f);
+    let gradient = rng.vec(batch * per_image, -0.8, 0.8);
+    let gate_t = be.upload_f32(&[batch, experts], &gates).unwrap();
+    let gradient_t = be.upload_f32(&[batch, per_image], &gradient).unwrap();
+    let expert_outputs = (0..experts)
+        .map(|_| {
+            let values = rng.vec(batch * per_image, -0.9, 0.9);
+            be.upload_f32(&[batch, per_image], &values).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let expert_values = expert_outputs
+        .iter()
+        .map(|output| be.download_f32(output).unwrap())
+        .collect::<Vec<_>>();
+    for expert in 0..experts {
+        let column = be
+            .moe_gate_column_f32(&gate_t, batch, experts, expert, cfg())
+            .unwrap();
+        let expected = (0..batch)
+            .map(|b| gates[b * experts + expert] as f64)
+            .collect::<Vec<_>>();
+        assert_close(
+            "moe gate column",
+            &be.download_f32(&column).unwrap(),
+            &expected,
+        );
+    }
+
+    let load_balance = 0.03f64;
+    let temperature = 1.7f64;
+    let dlogit = be
+        .moe_router_backward_f32(
+            &gate_t,
+            &gradient_t,
+            &expert_outputs,
+            batch,
+            experts,
+            per_image,
+            load_balance as f32,
+            temperature as f32,
+            cfg(),
+        )
+        .unwrap();
+    let mut raw = vec![0.0f64; batch * experts];
+    for b in 0..batch {
+        for e in 0..experts {
+            let grad_base = b * per_image;
+            raw[b * experts + e] = gradient[grad_base..grad_base + per_image]
+                .iter()
+                .zip(&expert_values[e][grad_base..grad_base + per_image])
+                .map(|(&dy, &y)| dy as f64 * y as f64)
+                .sum();
+        }
+    }
+    for e in 0..experts {
+        let mean_gate = (0..batch)
+            .map(|b| gates[b * experts + e] as f64)
+            .sum::<f64>()
+            / batch as f64;
+        let balance_gradient = load_balance * 2.0 * experts as f64 * mean_gate / batch as f64;
+        for b in 0..batch {
+            raw[b * experts + e] += balance_gradient;
+        }
+    }
+    let mut expected = vec![0.0f64; batch * experts];
+    for b in 0..batch {
+        let base = b * experts;
+        let weighted = (0..experts)
+            .map(|e| gates[base + e] as f64 * raw[base + e])
+            .sum::<f64>();
+        for e in 0..experts {
+            expected[base + e] = gates[base + e] as f64 * (raw[base + e] - weighted) / temperature;
+        }
+    }
+    assert_close(
+        "moe router backward",
+        &be.download_f32(&dlogit).unwrap(),
+        &expected,
+    );
+}

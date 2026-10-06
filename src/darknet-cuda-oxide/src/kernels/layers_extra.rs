@@ -264,6 +264,82 @@ pub mod kernels {
         }
     }
 
+    /// Extract one expert's gate from the row-major `[batch, experts]` tensor.
+    #[kernel]
+    pub fn moe_gate_column(
+        gates: &[f32],
+        mut column: DisjointSlice<f32>,
+        experts: usize,
+        expert: usize,
+    ) {
+        let idx = thread::index_1d();
+        let b = idx.get();
+        if let Some(out) = column.get_mut(idx) {
+            *out = gates[b * experts + expert];
+        }
+    }
+
+    /// Add the exact auxiliary load-balance derivative and top-k softmax Jacobian.
+    /// One thread owns a batch row, preserving the CPU's ordered expert reduction.
+    #[kernel]
+    pub fn moe_router_gate_backward(
+        gates: &[f32],
+        gate_dots: &[f32],
+        mut dlogit: DisjointSlice<f32>,
+        batch: usize,
+        experts: usize,
+        load_balance: f32,
+        temperature: f32,
+    ) {
+        let idx = thread::index_1d();
+        let b = idx.get();
+        if b >= batch {
+            return;
+        }
+        let base = b * experts;
+        let balance_scale = if load_balance <= 0.0 {
+            0.0
+        } else {
+            load_balance * 2.0 * experts as f32 / batch as f32
+        };
+        let temperature = if temperature > 1e-6 {
+            temperature
+        } else {
+            1e-6
+        };
+        let mut weighted = 0.0f32;
+        let mut e = 0usize;
+        while e < experts {
+            let mut mean_gate = 0.0f32;
+            let mut sample = 0usize;
+            while sample < batch {
+                mean_gate += gates[sample * experts + e];
+                sample += 1;
+            }
+            mean_gate /= batch as f32;
+            let raw = gate_dots[base + e] + balance_scale * mean_gate;
+            weighted += gates[base + e] * raw;
+            e += 1;
+        }
+        e = 0;
+        while e < experts {
+            let mut mean_gate = 0.0f32;
+            let mut sample = 0usize;
+            while sample < batch {
+                mean_gate += gates[sample * experts + e];
+                sample += 1;
+            }
+            mean_gate /= batch as f32;
+            let raw = gate_dots[base + e] + balance_scale * mean_gate;
+            // SAFETY: this thread uniquely owns the expert row for batch item `b`.
+            unsafe {
+                *dlogit.as_mut_ptr().add(base + e) =
+                    gates[base + e] * (raw - weighted) / temperature;
+            }
+            e += 1;
+        }
+    }
+
     /// Stage 1 of per-sample gate dot: 256 strided partials per sample.
     #[kernel]
     pub fn moe_gate_dot_partial(
@@ -305,6 +381,33 @@ pub mod kernels {
                 lane += 1;
             }
             *out = sum;
+        }
+    }
+
+    /// Fold 256 gate-dot partials into one expert column of `[batch, experts]`.
+    #[kernel]
+    pub fn moe_gate_dot_reduce_column(
+        partial: &[f32],
+        mut dots: DisjointSlice<f32>,
+        experts: usize,
+        expert: usize,
+    ) {
+        let idx = thread::index_1d();
+        let b = idx.get();
+        let output_index = b * experts + expert;
+        if output_index >= dots.len() {
+            return;
+        }
+        let mut sum = 0.0f32;
+        let mut lane = 0usize;
+        while lane < 256 {
+            sum += partial[b * 256 + lane];
+            lane += 1;
+        }
+        // SAFETY: this launch owns one column element per batch row; callers
+        // launch experts serially and each launch writes a disjoint matrix column.
+        unsafe {
+            *dots.as_mut_ptr().add(output_index) = sum;
         }
     }
 

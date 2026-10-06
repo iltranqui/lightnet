@@ -136,12 +136,13 @@ Immediately next, in dependency order:
   host-resident.
 - [~] Phase 2B `moe_convolutional`: real-device forward computes router pooling,
   logits, top-k masking, softmax, expert convolutions, and gate blending. For
-  no-BN experts, router connected-backward, per-sample expert gate-dot
-  reductions, router-pool input-gradient broadcast, and expert convolution
-  backward use backend ops; pooled and expert activation/output caches remain
-  device-resident. Gate/dot values cross the host for softmax-Jacobian math;
-  router/expert parameter-gradient transfers, accumulation, and SGD remain
-  host-side. BN experts still use CPU backward.
+  no-BN experts, router connected-backward, gate-column selection and gate-dot
+  reductions, load-balance plus top-k softmax-Jacobian backward, router-pool
+  input-gradient broadcast, and expert convolution backward use backend ops;
+  gates and pooled/expert activation/output caches remain device-resident, with
+  no gate/dot transfers in the normal Oxide training path. Router/expert
+  parameter-gradient transfers, accumulation, and SGD remain host-side. BN
+  experts still use CPU backward.
   Verified against CPU in
   `oxide_runtime_chain::moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu`
   (including upstream convolution updates) and router-specific soft/tied top-k

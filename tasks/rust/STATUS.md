@@ -137,15 +137,18 @@ Latest increments:
   warm-up and host-update invalidation are covered by the
   `container_convolution_cache_is_keyed_by_owner_and_expert_slot` FakeBackend test.
   MoE computes router pooling/logits/top-k softmax, expert convolutions, and
-  per-sample gate blending on Oxide. No-BN router connected-backward, expert
-  gate-dot reductions, router-pool input-gradient broadcast, and expert
-  convolution backward use backend ops; pooled and expert output/activation
-  caches stay device-resident. Gate/dot values cross the host for
-  softmax-Jacobian math; parameter-gradient transfers, accumulation, and SGD
-  remain host-side. BN experts stay on the CPU fallback. FakeBackend parity and
-  real-device `moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu`
+  per-sample gate blending on Oxide. No-BN router connected-backward,
+  device-selected gate columns, expert gate-dot reductions, load-balance plus
+  top-k softmax-Jacobian backward, router-pool input-gradient broadcast, and
+  expert convolution backward use backend ops. Gates and pooled/expert
+  output/activation caches stay device-resident; no gate/dot values cross the
+  host in normal Oxide training. Router/expert parameter-gradient transfers,
+  accumulation, and SGD remain host-side. BN experts stay on the CPU fallback.
+  FakeBackend parity and real-device
+  `moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu`
   pass, including upstream convolution updates. `oxide_layers_extra` verifies
-  soft/tied top-k plus pool, pool-backward, and non-multiple gate-dot reductions.
+  soft/tied top-k, pool and pool-backward, non-multiple gate-dot reductions, and
+  router backward parity with load balancing.
 - Overlapping-window maxpool backward, including `maxpool_zero_nonmax`, now
   matches central finite differences.
 - No-BN RNN and CRNN forward/backward use backend ops: RNN projections and
@@ -215,11 +218,12 @@ believing a `cfg_corpus` failure.
    their blobs), so those two come next even though the plan files them under
    Phase 4. They also need the Phase 3A prerequisite kernel set.
 2. Phase 2A is done, including `detect::decode_modern_detections` and the
-   `detect-image` merge. Phase 2B `moe_convolutional`'s **CPU path is done**
-   (commit `cdf68d00`); its oxide/GPU arm is open. Remaining across the phases:
+   `detect-image` merge. Phase 2B `moe_convolutional` has a verified CPU path
+   and partial Oxide forward/backward; parameter-gradient transfers, host
+   accumulation/SGD, and BN expert backward remain. Remaining across the phases:
    `cfg/LegoGears_centernet.cfg` end to end (the cfg lives on `Jev_laya`), then
-   2B's `eml_convolutional` (+ the `moe` GPU arm), 2C (OBB), 3A/3B (transformer +
-   deformable families, shared LayerNorm/GEMM kernel set first) and 4.
+   2B's `eml_convolutional`, 2C (OBB), 3A/3B (transformer + deformable families,
+   shared LayerNorm/GEMM kernel set first) and 4.
 3. **Phase 3A prerequisite (2) is complete**: LayerNorm fwd/bwd, the fused
    residual/bias epilogue, the row-softmax backward and the batched-GEMM wrapper
    (`linear_f32`) are all in, each with a host default plus GPU parity tests.
@@ -228,12 +232,11 @@ believing a `cfg_corpus` failure.
    decide when writing those layers: whether the `flash_attention` /
    `vc_attention` fast paths (decision 3) get their own kernels or reuse the
    reference attention path.
-4. Phase 2B `moe_convolutional` (weights order verified) and
+4. Phase 2B `moe_convolutional` (weights order verified) has partial Oxide
+   training support; continue reducing host-resident parameter transfers,
+   accumulation/SGD, and add BN expert backward. Then port
    `eml_convolutional` (an activation, not a `LayerKind`; save order **re-read
    2026-10-05**: `input_layer` then `self_layer`, two full conv blocks).
-   `moe`'s CPU path is done (commit `cdf68d00`); the next step is the
-   container-conv reuse prerequisite (generalise the device conv-param cache
-   to a `(owner, slot)` key), see `tasks/rust/layers.md`.
 5. Phase 3B deformable family — start with `dcnv4` (real C++ forward and
    kernels; weights order `weights.cpp:428`).
 6. Phase 2C OBB, then Phase 4.

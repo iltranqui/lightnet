@@ -563,7 +563,7 @@ pub struct GpuMoeBackwardCache<T>
 where
     T: Clone,
 {
-    gates: Vec<f32>,
+    gates: T,
     pooled: T,
     expert_outputs: Vec<T>,
     expert_activation_inputs: Vec<T>,
@@ -6237,10 +6237,15 @@ where
                             launch_config,
                         )
                         .map_err(|err| backend_error("compute MoE router gates", err))?;
-                    let experts = self
-                        .backend
-                        .download_f32(&router_gates)
-                        .map_err(|err| backend_error("download MoE router gates", err))?;
+                    let host_experts = if host_copies {
+                        Some(
+                            self.backend
+                                .download_f32(&router_gates)
+                                .map_err(|err| backend_error("download MoE router gates", err))?,
+                        )
+                    } else {
+                        None
+                    };
                     let pooled_gpu = self
                         .backend
                         .moe_router_pool_f32(
@@ -6254,7 +6259,10 @@ where
                     let per_image = layer.output_shape.element_count();
                     let mut blended_gpu = None;
                     let mut host_cache = host_copies.then(|| MoeForwardCache {
-                        gates: experts.clone(),
+                        gates: host_experts
+                            .as_ref()
+                            .expect("host cache requires host gates")
+                            .clone(),
                         expert_outputs: Vec::with_capacity(spec.experts),
                         expert_activation_inputs: Vec::with_capacity(spec.experts),
                         pooled: crate::moe_conv::pool_for_router(
@@ -6311,13 +6319,16 @@ where
                             .backend
                             .activation_f32(&biased, activation, launch_config)
                             .map_err(|err| backend_error("MoE expert activation", err))?;
-                        let sample_gates = (0..batch)
-                            .map(|b| experts[b * spec.experts + slot])
-                            .collect::<Vec<_>>();
                         let sample_gates = self
                             .backend
-                            .upload_f32(&[batch], &sample_gates)
-                            .map_err(|err| backend_error("upload MoE expert gates", err))?;
+                            .moe_gate_column_f32(
+                                &router_gates,
+                                batch,
+                                spec.experts,
+                                slot,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("select MoE expert gates", err))?;
                         // Treat each sample as one channel with `per_image`
                         // elements, applying its scalar gate to the full expert
                         // output without moving that output back to the host.
@@ -6356,7 +6367,7 @@ where
                     }
                     moe_cache = host_cache;
                     gpu_moe_cache = Some(GpuMoeBackwardCache {
-                        gates: experts,
+                        gates: router_gates,
                         pooled: pooled_gpu,
                         expert_outputs: expert_outputs_gpu,
                         expert_activation_inputs: expert_activation_inputs_gpu,
@@ -7957,10 +7968,7 @@ where
                     let experts = spec.experts;
                     let output_spatial = layer.output_shape.width * layer.output_shape.height;
                     let per_image = layer.output_shape.element_count();
-                    if experts == 0
-                        || cache.gates.len() != batch * experts
-                        || cache.expert_outputs.len() != experts
-                        || cache.expert_activation_inputs.len() != experts
+                    if experts == 0 || cache.expert_activation_inputs.len() != experts
                         || params.experts.len() != experts
                         || params.router_weights.len() != experts * channels
                         || params.router_biases.len() != experts
@@ -7980,47 +7988,25 @@ where
                             ))
                         })?
                     };
-                    let mut raw_gate_gradient =
-                        crate::moe_conv::balance_loss_and_raw_grad(&cache.gates, batch, spec).1;
-                    for expert in 0..experts {
-                        let dots = self
-                            .backend
-                            .moe_gate_dot_f32(
-                                &grad,
-                                &cache.expert_outputs[expert],
-                                batch,
-                                per_image,
-                                config,
-                            )
-                            .map_err(|err| backend_error("MoE expert gate-gradient dot", err))?;
-                        let dots = self
-                            .backend
-                            .download_f32(&dots)
-                            .map_err(|err| backend_error("download MoE gate-gradient dots", err))?;
-                        if dots.len() != batch {
-                            return Err(Error::InvalidConfig(format!(
-                                "MoE expert {expert} gate-gradient shape mismatch at layer #{}",
-                                layer.index
-                            )));
-                        }
-                        for (b, dot) in dots.into_iter().enumerate() {
-                            raw_gate_gradient[b * experts + expert] += dot;
-                        }
-                    }
-                    let dlogit = crate::moe_conv::router_gate_gradient(
-                        &cache.gates,
-                        &raw_gate_gradient,
-                        spec,
-                    );
+                    let dlogit = self
+                        .backend
+                        .moe_router_backward_f32(
+                            &cache.gates,
+                            &grad,
+                            &cache.expert_outputs,
+                            batch,
+                            experts,
+                            per_image,
+                            spec.load_balance,
+                            crate::moe_conv::router_temperature(spec),
+                            config,
+                        )
+                        .map_err(|err| backend_error("MoE router backward", err))?;
                     let pooled = cache.pooled.clone();
                     let router_weights = self
                         .backend
                         .upload_f32(&[experts, channels], &params.router_weights)
                         .map_err(|err| backend_error("upload MoE router weights", err))?;
-                    let dlogit = self
-                        .backend
-                        .upload_f32(&[batch, experts], &dlogit)
-                        .map_err(|err| backend_error("upload MoE router logit gradient", err))?;
                     let (pooled_gradient, router_weight_gradient, router_bias_gradient) = self
                         .backend
                         .connected_backward_f32(
@@ -8064,13 +8050,16 @@ where
                         )?;
                         let activation_input =
                             cache.expert_activation_inputs[expert_index].clone();
-                        let sample_gates = (0..batch)
-                            .map(|b| cache.gates[b * experts + expert_index])
-                            .collect::<Vec<_>>();
                         let sample_gates = self
                             .backend
-                            .upload_f32(&[batch], &sample_gates)
-                            .map_err(|err| backend_error("upload MoE backward expert gates", err))?;
+                            .moe_gate_column_f32(
+                                &cache.gates,
+                                batch,
+                                experts,
+                                expert_index,
+                                config,
+                            )
+                            .map_err(|err| backend_error("select MoE backward expert gates", err))?;
                         let gated_gradient = self
                             .backend
                             .channel_scale_f32(&grad, &sample_gates, batch, per_image, config)

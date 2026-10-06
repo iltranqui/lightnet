@@ -761,6 +761,86 @@ pub trait F32TensorOpsBackend {
         }
         self.upload_f32(&[batch], &dots)
     }
+    /// Extract one expert's gate for every batch item from `[batch, experts]`.
+    fn moe_gate_column_f32(
+        &self,
+        gates: &Self::Tensor,
+        batch: usize,
+        experts: usize,
+        expert: usize,
+        _config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        assert!(batch > 0 && experts > 0 && expert < experts);
+        let gates = self.download_f32(gates)?;
+        assert_eq!(gates.len(), batch * experts);
+        let column = (0..batch)
+            .map(|b| gates[b * experts + expert])
+            .collect::<Vec<_>>();
+        self.upload_f32(&[batch], &column)
+    }
+    /// Compute MoE `dlogit` from expert outputs and load-balancing loss. Oxide
+    /// keeps gate-dot reductions and the softmax Jacobian on-device; this default
+    /// method provides the host-reference implementation for other backends.
+    fn moe_router_backward_f32(
+        &self,
+        gates: &Self::Tensor,
+        output_gradient: &Self::Tensor,
+        expert_outputs: &[Self::Tensor],
+        batch: usize,
+        experts: usize,
+        per_image: usize,
+        load_balance: f32,
+        temperature: f32,
+        _config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        assert!(batch > 0 && experts > 0 && per_image > 0);
+        let gates = self.download_f32(gates)?;
+        let output_gradient = self.download_f32(output_gradient)?;
+        assert_eq!(gates.len(), batch * experts);
+        assert_eq!(output_gradient.len(), batch * per_image);
+        assert_eq!(expert_outputs.len(), experts);
+
+        let mut raw = vec![0.0f32; batch * experts];
+        for (e, expert_output) in expert_outputs.iter().enumerate() {
+            let expert_output = self.download_f32(expert_output)?;
+            assert_eq!(expert_output.len(), batch * per_image);
+            for b in 0..batch {
+                let base = b * per_image;
+                raw[b * experts + e] = output_gradient[base..base + per_image]
+                    .iter()
+                    .zip(&expert_output[base..base + per_image])
+                    .map(|(grad, output)| grad * output)
+                    .sum();
+            }
+        }
+        for e in 0..experts {
+            let mean_gate = (0..batch).map(|b| gates[b * experts + e]).sum::<f32>() / batch as f32;
+            let balance_gradient = if load_balance <= 0.0 {
+                0.0
+            } else {
+                load_balance * 2.0 * experts as f32 * mean_gate / batch as f32
+            };
+            for b in 0..batch {
+                raw[b * experts + e] += balance_gradient;
+            }
+        }
+        let temperature = if temperature > 1e-6 {
+            temperature
+        } else {
+            1e-6
+        };
+        let mut dlogit = vec![0.0f32; batch * experts];
+        for b in 0..batch {
+            let base = b * experts;
+            let weighted = (0..experts)
+                .map(|e| gates[base + e] * raw[base + e])
+                .sum::<f32>();
+            for e in 0..experts {
+                dlogit[base + e] = gates[base + e] * (raw[base + e] - weighted) / temperature;
+            }
+        }
+        self.upload_f32(&[batch, experts], &dlogit)
+    }
     /// Bilinearly sample an NCHW tensor using one source coordinate pair per
     /// batch/output pixel. `input_scales` and `input_offsets` contain one
     /// affine level adjustment per batch and are applied after interpolation.
