@@ -34,6 +34,12 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- Added no-BN LSTM device backward: connected projection gradients, recurrent
+  and input-gradient accumulation, and parameter-gradient accumulation use
+  backend ops; gate derivatives, sequence/cache handling, per-step input-gradient
+  transfers, and SGD remain host-side. FakeBackend parity and real-device
+  `oxide_runtime_chain::lstm_no_batch_norm_forward_and_device_backward_match_cpu`
+  pass, including upstream convolution updates.
 - Added an oxide Stair activation kernel matching Darknet's floor-based
   alternating-step formula and parity gradient, including negative odd intervals.
   Verified by the 391-test core library suite, `oxide_parity` (11 passed,
@@ -134,12 +140,13 @@ Latest increments:
 - No-BN RNN and CRNN forward/backward use backend ops: RNN projections and
   CRNN recurrent convolutions, activation gradients, state accumulation, and
   shortcuts. No-BN LSTM forward runs gates/cell products through backend ops,
-  including `vector_mul_f32`; backward remains the CPU fallback. Sequence
-  slicing, cached activations/states, parameter-gradient accumulation, and
-  host-resident SGD still cross the host; batchnorm RNN/CRNN also remain on the
-  CPU fallback. FakeBackend CRNN/LSTM parity compares output and training
-  updates. Real-device `oxide_runtime_chain` passes 10/10, including LSTM
-  forward + fallback-training parity.
+  including `vector_mul_f32`; its backward now uses backend connected ops for
+  projection gradients, time-accumulated parameters, and recurrent/input
+  gradient accumulation. Gate derivatives, cached-state/sequence slicing,
+  input-gradient transfers, and host-resident SGD still cross the host;
+  batch-normalized recurrent layers remain on CPU backward. FakeBackend parity
+  and real-device `oxide_runtime_chain::lstm_no_batch_norm_forward_and_device_backward_match_cpu`
+  compare training updates with CPU, including upstream convolution updates.
 - Host Adam now updates standalone batchnorm, local, connected, weighted
   shortcut, MoE router/experts, deconvolutional, GRU/RNN/LSTM/CRNN, and ViT
   parameters with distinct moment slots and per-layer rate scaling. DNOPT2

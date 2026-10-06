@@ -65,11 +65,13 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
 ## P8/P9 training follow-ups
 
 - [~] Recurrent GPU execution: no-BN RNN projections and CRNN recurrent
-  convolutions use backend forward/backward ops; no-BN LSTM gates and cell
-  products use backend forward ops. Sequence slicing, cached activations/states,
-  parameter-gradient accumulation, and host-resident SGD still cross the host.
-  FakeBackend and real Oxide tests compare training updates with CPU. BN RNN/CRNN
-  and LSTM backward remain on the CPU fallback.
+  convolutions use backend forward/backward ops. No-BN LSTM gates/cell products
+  use backend forward ops; connected backward, time-accumulated parameter
+  gradients, and recurrent/input gradient accumulation also use backend ops.
+  LSTM gate derivatives, cached-state/sequence slicing, input-gradient transfers,
+  and host-resident SGD still cross the host. FakeBackend and real Oxide tests
+  compare training updates with CPU, including upstream convolution updates for
+  LSTM. Batch-normalized recurrent layers still use CPU backward.
 - [x] Host Adam: connected, standalone batchnorm, local, weighted shortcut,
   MoE, deconvolutional, GRU/RNN/LSTM/CRNN, and ViT host params use per-layer
   rate scaling and persisted host moments in DNOPT2 optimizer sidecars (DNOPT1
