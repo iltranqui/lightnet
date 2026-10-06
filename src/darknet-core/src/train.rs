@@ -14,6 +14,7 @@ use rayon::prelude::*;
 use crate::error::{Error, Result};
 use crate::image::PlanarRgbImage;
 use crate::model::{LayerKind, Network, TensorShape, YoloIouLoss, YoloSpec};
+use crate::obb_labels::{ObbLabel, load_obb_labels};
 use crate::runtime::{ForwardResult, Tensor};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,6 +98,22 @@ pub struct TrainingBatch {
 }
 
 impl TrainingBatch {
+    pub fn label_count(&self) -> usize {
+        self.labels.iter().map(Vec::len).sum()
+    }
+}
+
+/// An image batch paired with OBB labels, keeping optional front-point
+/// annotations distinct from the center placeholder used by five-field rows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObbTrainingBatch {
+    pub input: Tensor,
+    pub image_paths: Vec<PathBuf>,
+    pub label_paths: Vec<PathBuf>,
+    pub labels: Vec<Vec<ObbLabel>>,
+}
+
+impl ObbTrainingBatch {
     pub fn label_count(&self) -> usize {
         self.labels.iter().map(Vec::len).sum()
     }
@@ -1153,6 +1170,121 @@ pub fn load_training_batch_from_paths(
     load_training_batch_impl(network, data, image_paths, start_index, None)
 }
 
+/// Load the next configured training batch with OBB labels and direct image
+/// resizing. Augmentation and OBB truth assignment are intentionally separate.
+pub fn load_obb_training_batch(
+    network: &Network,
+    data: &DataConfig,
+    start_index: usize,
+) -> Result<ObbTrainingBatch> {
+    let train_list = data.required_train_list()?;
+    let image_paths = load_paths_file(train_list)?;
+    load_obb_training_batch_from_paths(network, data, &image_paths, start_index)
+}
+
+/// Load an OBB batch from image paths, wrapping at the end of the list like the
+/// ordinary detector loader. Class IDs are bounded by the smallest OBB head
+/// and, when supplied, the data config's class count.
+pub fn load_obb_training_batch_from_paths(
+    network: &Network,
+    data: &DataConfig,
+    image_paths: &[PathBuf],
+    start_index: usize,
+) -> Result<ObbTrainingBatch> {
+    let classes = obb_training_classes(network, data.classes)?;
+    if image_paths.is_empty() {
+        return Err(Error::InvalidConfig(
+            "training image list is empty".to_owned(),
+        ));
+    }
+
+    let batch_size = network.net.batch.max(1);
+    let channels = network.net.channels;
+    let width = network.net.width;
+    let height = network.net.height;
+    let shape = TensorShape::new(width, height, channels, batch_size);
+    let per_image = shape.element_count();
+    let mut input = Tensor::zeros(shape);
+    let total = image_paths.len();
+    let prepared_entries: Vec<Result<(Vec<ObbLabel>, PathBuf, PathBuf)>> = input
+        .data
+        .par_chunks_mut(per_image)
+        .enumerate()
+        .map(
+            |(batch_index, chunk)| -> Result<(Vec<ObbLabel>, PathBuf, PathBuf)> {
+                let image_path = &image_paths[(start_index + batch_index) % total];
+                let label_path = replace_image_to_label(image_path);
+                if !label_path.exists() {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("missing label file {}", label_path.display()),
+                    )));
+                }
+
+                let labels = load_obb_labels(&label_path, Some(classes))?;
+                let image = PlanarRgbImage::load(image_path)?.resize(width, height)?;
+                if image.shape.channels != channels {
+                    return Err(Error::InvalidConfig(format!(
+                        "image {} has {} channels, expected {}",
+                        image_path.display(),
+                        image.shape.channels,
+                        channels
+                    )));
+                }
+                if image.data.len() != chunk.len() {
+                    return Err(Error::InvalidConfig(format!(
+                        "resized image {} has {} values, expected {}",
+                        image_path.display(),
+                        image.data.len(),
+                        chunk.len()
+                    )));
+                }
+                chunk.copy_from_slice(&image.data);
+                Ok((labels, image_path.clone(), label_path))
+            },
+        )
+        .collect();
+
+    let mut batch_image_paths = Vec::with_capacity(batch_size);
+    let mut batch_label_paths = Vec::with_capacity(batch_size);
+    let mut batch_labels = Vec::with_capacity(batch_size);
+    for entry in prepared_entries {
+        let (labels, image_path, label_path) = entry?;
+        batch_image_paths.push(image_path);
+        batch_label_paths.push(label_path);
+        batch_labels.push(labels);
+    }
+
+    Ok(ObbTrainingBatch {
+        input,
+        image_paths: batch_image_paths,
+        label_paths: batch_label_paths,
+        labels: batch_labels,
+    })
+}
+
+fn obb_training_classes(network: &Network, data_classes: Option<usize>) -> Result<usize> {
+    if !network.net.obb {
+        return Err(Error::InvalidConfig(
+            "OBB batch loading requires [net] obb=1".to_owned(),
+        ));
+    }
+    let head_classes = network
+        .layers
+        .iter()
+        .filter_map(|layer| match &layer.kind {
+            LayerKind::ObbYolo(spec) => Some(spec.classes),
+            _ => None,
+        })
+        .min()
+        .ok_or_else(|| {
+            Error::InvalidConfig(
+                "OBB batch loading requires at least one [obb_yolo] head".to_owned(),
+            )
+        })?;
+    Ok(data_classes.map_or(head_classes, |classes| classes.min(head_classes)))
+}
+
 /// Training-only augmented loader. Absolute sample ordinals keep random draws
 /// independent of subdivision and background-worker scheduling.
 pub fn load_augmented_training_batch_from_paths(
@@ -1902,7 +2034,8 @@ mod tests {
         DataConfig, YoloBox, YoloHeadStats, YoloLabel, YoloTrainingState, apply_yolo_box_delta,
         apply_yolo_class_delta, apply_yolo_delta_filtering, apply_yolo_positive_objectness,
         bbox_iou_kind, compute_yolo_training_loss, compute_yolo_training_loss_with_state,
-        dx_box_iou, load_training_batch, load_yolo_labels, replace_image_to_label, yolo_head_cost,
+        dx_box_iou, load_obb_training_batch, load_obb_training_batch_from_paths,
+        load_training_batch, load_yolo_labels, replace_image_to_label, yolo_head_cost,
         yolo_xy_output,
     };
     use crate::cfg::ConfigFile;
@@ -1913,6 +2046,34 @@ mod tests {
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(name)
+    }
+
+    fn obb_test_network(batch: usize) -> Network {
+        obb_test_network_with_classes(batch, 1)
+    }
+
+    fn obb_test_network_with_classes(batch: usize, classes: usize) -> Network {
+        let cfg = ConfigFile::parse_str(
+            "obb-batch.cfg",
+            &format!(
+                "[net]\nwidth=2\nheight=1\nchannels=3\nbatch={batch}\nobb=1\n[convolutional]\nfilters={}\nsize=1\nstride=1\nactivation=linear\n[obb_yolo]\nclasses={classes}\nnum=1\nanchors=1,1\n",
+                classes + 7
+            ),
+        )
+        .expect("cfg parses");
+        Network::from_config(cfg).expect("OBB network builds")
+    }
+
+    fn empty_data_config(classes: Option<usize>) -> DataConfig {
+        DataConfig {
+            source: PathBuf::new(),
+            classes,
+            train: None,
+            valid: None,
+            names: None,
+            backup: None,
+            options: Default::default(),
+        }
     }
 
     #[test]
@@ -2047,6 +2208,105 @@ mod tests {
         assert_eq!(batch.label_paths, vec![label_path]);
         assert_eq!(batch.label_count(), 1);
         assert_eq!(batch.input.shape, network.net.input_shape());
+    }
+
+    #[test]
+    fn obb_batch_loader_resizes_images_and_preserves_front_presence() {
+        let dir = temp_path("darknet-obb-training-batch");
+        let _ = fs::create_dir_all(&dir);
+        let red = dir.join("red.ppm");
+        let blue = dir.join("blue.ppm");
+        let train_list = dir.join("train.txt");
+        let data_path = dir.join("sample.data");
+        fs::write(&red, b"P6\n1 1\n255\n\xff\x00\x00").expect("red image writes");
+        fs::write(&blue, b"P6\n1 1\n255\n\x00\x00\xff").expect("blue image writes");
+        fs::write(dir.join("red.txt"), "0 0.25 0.5 0.5 0.5\n").expect("AABB label writes");
+        fs::write(dir.join("blue.txt"), "0 0.75 0.5 0.25 0.5 0.875 0.5\n")
+            .expect("oriented label writes");
+        fs::write(
+            &train_list,
+            format!("{}\n{}\n", red.display(), blue.display()),
+        )
+        .expect("train list writes");
+        fs::write(
+            &data_path,
+            format!("classes=1\ntrain={}\n", train_list.display()),
+        )
+        .expect("data cfg writes");
+
+        let network = obb_test_network(2);
+        let data = DataConfig::from_path(&data_path).expect("data cfg parses");
+        let batch = load_obb_training_batch(&network, &data, 1).expect("OBB batch loads");
+
+        assert_eq!(batch.image_paths, vec![blue.clone(), red.clone()]);
+        assert_eq!(
+            batch.label_paths,
+            vec![dir.join("blue.txt"), dir.join("red.txt")]
+        );
+        assert_eq!(batch.input.shape, network.net.input_shape());
+        assert_eq!(batch.label_count(), 2);
+        assert!(batch.labels[0][0].has_front);
+        assert!(!batch.labels[1][0].has_front);
+        assert_eq!(batch.labels[1][0].front_x, batch.labels[1][0].x);
+        assert_eq!(batch.labels[1][0].front_y, batch.labels[1][0].y);
+
+        let expected = crate::image::PlanarRgbImage::load(&blue)
+            .expect("image loads")
+            .resize(network.net.width, network.net.height)
+            .expect("image resizes");
+        let image_size = network.net.input_shape().element_count();
+        assert_eq!(
+            &batch.input.data[..image_size],
+            expected.data.as_slice(),
+            "wrapped first sample should contain the resized blue image"
+        );
+    }
+
+    #[test]
+    fn obb_batch_loader_requires_obb_head_and_valid_labels() {
+        let standard = Network::from_config(
+            ConfigFile::parse_str(
+                "standard-batch.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=3\n[yolo]\nclasses=1\nnum=1\nanchors=1,1\n",
+            )
+            .expect("cfg parses"),
+        )
+        .expect("standard network builds");
+        assert!(
+            load_obb_training_batch_from_paths(&standard, &empty_data_config(None), &[], 0)
+                .is_err(),
+            "standard detector graphs must not use the OBB batch API"
+        );
+
+        let network = obb_test_network(1);
+        let dir = temp_path("darknet-obb-training-invalid");
+        let _ = fs::create_dir_all(&dir);
+        let image = dir.join("invalid.ppm");
+        fs::write(dir.join("invalid.txt"), "1 0.5 0.5 0.2 0.2\n")
+            .expect("out-of-range label writes");
+        let data = empty_data_config(Some(1));
+        let error = load_obb_training_batch_from_paths(&network, &data, &[image], 0)
+            .expect_err("class IDs are bounded by the OBB head");
+        assert!(error.to_string().contains("exceeds classes=1"));
+
+        let missing = dir.join("missing.ppm");
+        let error = load_obb_training_batch_from_paths(&network, &data, &[missing], 0)
+            .expect_err("missing labels must fail the OBB loader");
+        assert!(error.to_string().contains("missing label file"));
+    }
+
+    #[test]
+    fn obb_batch_loader_also_respects_data_class_limit() {
+        let network = obb_test_network_with_classes(1, 2);
+        let dir = temp_path("darknet-obb-training-data-class-limit");
+        let _ = fs::create_dir_all(&dir);
+        let image = dir.join("class-one.ppm");
+        fs::write(dir.join("class-one.txt"), "1 0.5 0.5 0.2 0.2\n")
+            .expect("out-of-range label writes");
+        let data = empty_data_config(Some(1));
+        let error = load_obb_training_batch_from_paths(&network, &data, &[image], 0)
+            .expect_err("data class limit applies even when the head has more classes");
+        assert!(error.to_string().contains("exceeds classes=1"));
     }
 
     #[test]

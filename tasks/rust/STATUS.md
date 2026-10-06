@@ -34,6 +34,12 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v82: added a separate OBB training-batch type/loader using direct image resize
+  and the existing five/seven-field parser. It preserves optional front-point
+  state; class IDs are bounded by the smallest OBB head and optional data class
+  count. Augmentation and OBB losses remain unsupported. The focused OBB host
+  suite passed 29/29 and all 452 `darknet-core` unit tests passed; no compiled-C++
+  parity is claimed.
 - v81: wired `[net] obb=1` and `[obb_yolo]` cfg parsing into a typed
   six-coordinate head with filter/mask/anchor validation; CPU/runtime head
   collection feeds a network-level multi-head decoder and orientation-aware
