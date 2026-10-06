@@ -34,6 +34,12 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v87: added public `flip_obb_labels`, an exact horizontal reflection of label
+  centers, front points, and stored bounds that preserves OBB dimensions and
+  absent-front state. The focused OBB suite passed 35/35 and all 458
+  `darknet-core` library tests passed. This is label geometry only: loader
+  integration and crop/mosaic transforms remain open; no compiled-C++ parity is
+  claimed.
 - v86: added typed `[obb_yolo] nms_kind` parsing with source default `obb`,
   case-insensitive explicit `obb`, and an explicit error for unwired alternate
   kinds. The OBB decoder dispatches the configured oriented kind to its

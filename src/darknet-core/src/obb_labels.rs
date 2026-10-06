@@ -228,6 +228,21 @@ pub fn rotate_obb_labels(labels: &mut [ObbLabel], angle_rad: f32) -> Result<()> 
     Ok(())
 }
 
+/// Mirror normalized OBB labels across the vertical image axis.
+///
+/// The center, front-point x coordinate, and stored source bounds are reflected;
+/// dimensions and the `has_front` distinction are preserved. This transforms
+/// label geometry only and does not modify an image or apply cropping.
+pub fn flip_obb_labels(labels: &mut [ObbLabel]) {
+    for label in labels {
+        let left = label.left;
+        label.left = 1.0 - label.right;
+        label.right = 1.0 - left;
+        label.x = 1.0 - label.x;
+        label.front_x = 1.0 - label.front_x;
+    }
+}
+
 fn rotate_point(point: [f32; 2], cosine: f32, sine: f32) -> [f32; 2] {
     let x = point[0] - 0.5;
     let y = point[1] - 0.5;
@@ -251,7 +266,7 @@ fn parse_clamped_coordinate(value: &str, path: &Path, line: usize, field: &str) 
 mod tests {
     use std::{fs, path::Path};
 
-    use super::{ObbLabel, load_obb_labels, parse_obb_labels, rotate_obb_labels};
+    use super::{ObbLabel, flip_obb_labels, load_obb_labels, parse_obb_labels, rotate_obb_labels};
     use crate::error::Error;
 
     fn parse(text: &str, classes: Option<usize>) -> crate::Result<Vec<ObbLabel>> {
@@ -439,5 +454,39 @@ mod tests {
             rotate_obb_labels(&mut labels, f32::NAN),
             Err(Error::InvalidConfig(_))
         ));
+    }
+
+    #[test]
+    fn horizontal_flip_mirrors_explicit_front_and_bounds_and_is_involutive() {
+        let original = label(0.25, 0.375, 0.25, 0.5, [0.125, 0.625], true);
+        let mut labels = [original];
+        flip_obb_labels(&mut labels);
+        let flipped = labels[0];
+        assert_eq!(flipped.x, 0.75);
+        assert_eq!(flipped.y, original.y);
+        assert_eq!(flipped.w, original.w);
+        assert_eq!(flipped.h, original.h);
+        assert_eq!(flipped.left, 0.625);
+        assert_eq!(flipped.right, 0.875);
+        assert_eq!(flipped.top, original.top);
+        assert_eq!(flipped.bottom, original.bottom);
+        assert_eq!(flipped.front_x, 0.875);
+        assert_eq!(flipped.front_y, original.front_y);
+        assert!(flipped.has_front);
+        flip_obb_labels(&mut labels);
+        assert_eq!(labels[0], original);
+    }
+
+    #[test]
+    fn horizontal_flip_mirrors_absent_front_placeholder_without_marking_it_present() {
+        let original = label(0.375, 0.625, 0.25, 0.5, [0.375, 0.625], false);
+        let mut labels = [original];
+        flip_obb_labels(&mut labels);
+        assert_eq!(labels[0].x, 0.625);
+        assert_eq!(labels[0].front_x, labels[0].x);
+        assert_eq!(labels[0].front_y, labels[0].y);
+        assert!(!labels[0].has_front);
+        flip_obb_labels(&mut labels);
+        assert_eq!(labels[0], original);
     }
 }
