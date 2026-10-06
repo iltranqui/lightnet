@@ -7991,44 +7991,34 @@ where
                         &mut layer_output_gradients,
                     )?;
 
-                    let mut source_shapes = Vec::with_capacity(spec.from.len());
-                    let mut raw_weight_products = vec![0.0f32; params.weights.len()];
+                    let num_inputs = spec.from.len() + 1;
+                    let mut raw_weight_products = self
+                        .backend
+                        .zeros_f32(&[num_inputs, layer_step])
+                        .map_err(|err| backend_error("allocate weighted shortcut products", err))?;
                     let input_gpu = if layer.index == 0 {
                         &forward.input_gpu
                     } else {
                         &forward.gpu_layer_outputs[layer.index - 1]
                     };
-                    let input_products = self
+                    raw_weight_products = self
                         .backend
-                        .shortcut_weight_gradient_f32(
+                        .shortcut_weight_gradient_accumulate_f32(
+                            &raw_weight_products,
                             &delta,
                             input_gpu,
                             layer.output_shape.batch,
                             per_sample,
                             layer.input_shape.element_count(),
+                            num_inputs,
                             layer_step,
+                            0,
                             config,
                         )
                         .map_err(|err| {
                             backend_error("weighted shortcut input weight reduction", err)
                         })?;
-                    let input_products = self
-                        .backend
-                        .download_f32(&input_products)
-                        .map_err(|err| {
-                            backend_error("download weighted shortcut input reduction", err)
-                        })?;
-                    if input_products.len() != layer_step {
-                        return Err(Error::InvalidConfig(format!(
-                            "weighted shortcut input reduction at layer #{} has {} slots, expected {}",
-                            layer.index,
-                            input_products.len(),
-                            layer_step
-                        )));
-                    }
-                    for (slot, value) in input_products.into_iter().enumerate() {
-                        raw_weight_products[slot] += value;
-                    }
+                    let mut source_shapes = Vec::with_capacity(spec.from.len());
                     for (source_slot, raw_index) in spec.from.iter().enumerate() {
                         let source_index = resolve_relative_layer(layer.index, *raw_index)?;
                         let source_layer = self.network.layers.get(source_index).ok_or(
@@ -8050,47 +8040,60 @@ where
                                 reference: *raw_index,
                             },
                         )?;
-                        let source_products = self
+                        raw_weight_products = self
                             .backend
-                            .shortcut_weight_gradient_f32(
+                            .shortcut_weight_gradient_accumulate_f32(
+                                &raw_weight_products,
                                 &delta,
                                 source_gpu,
                                 layer.output_shape.batch,
                                 per_sample,
                                 source_shape.element_count(),
+                                num_inputs,
                                 layer_step,
+                                source_slot + 1,
                                 config,
                             )
                             .map_err(|err| {
                                 backend_error("weighted shortcut source weight reduction", err)
                             })?;
-                        let source_products = self
-                            .backend
-                            .download_f32(&source_products)
-                            .map_err(|err| {
-                                backend_error("download weighted shortcut source reduction", err)
-                            })?;
-                        if source_products.len() != layer_step {
-                            return Err(Error::InvalidConfig(format!(
-                                "weighted shortcut source reduction at layer #{} has {} slots, expected {}",
-                                layer.index,
-                                source_products.len(),
-                                layer_step
-                            )));
-                        }
-                        let offset = (source_slot + 1) * layer_step;
-                        for (slot, value) in source_products.into_iter().enumerate() {
-                            raw_weight_products[offset + slot] += value;
-                        }
                         source_shapes.push(source_shape);
                     }
-                    let weight_gradient = crate::shortcut_weights::normalized_weight_gradient(
-                        &params.weights,
-                        spec.weights_normalization,
-                        layer_step,
-                        &raw_weight_products,
-                        GradMode::from_env() == GradMode::Cpp,
-                    );
+                    let raw_weights = self
+                        .backend
+                        .upload_f32(&[num_inputs, layer_step], &params.weights)
+                        .map_err(|err| backend_error("upload weighted shortcut raw weights", err))?;
+                    let normalization = match spec.weights_normalization {
+                        crate::model::ShortcutWeightsNorm::None => {
+                            darknet_cuda::F32ShortcutWeightNormalization::None
+                        }
+                        crate::model::ShortcutWeightsNorm::Relu => {
+                            darknet_cuda::F32ShortcutWeightNormalization::Relu
+                        }
+                        crate::model::ShortcutWeightsNorm::Softmax => {
+                            darknet_cuda::F32ShortcutWeightNormalization::Softmax
+                        }
+                    };
+                    let weight_gradient = self
+                        .backend
+                        .shortcut_weight_normalized_gradient_f32(
+                            &raw_weights,
+                            &raw_weight_products,
+                            num_inputs,
+                            layer_step,
+                            normalization,
+                            GradMode::from_env() == GradMode::Cpp,
+                            config,
+                        )
+                        .map_err(|err| {
+                            backend_error("weighted shortcut normalization derivative", err)
+                        })?;
+                    let weight_gradient = self
+                        .backend
+                        .download_f32(&weight_gradient)
+                        .map_err(|err| {
+                            backend_error("download weighted shortcut weight gradient", err)
+                        })?;
                     let mut train_buffers = self.cpu_fallback_train_buffers.borrow_mut();
                     let Some(LayerTrainBuffers::Shortcut(train)) =
                         train_buffers.get_mut(layer.index)

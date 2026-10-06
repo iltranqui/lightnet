@@ -900,6 +900,117 @@ pub mod kernels {
             *o = sum;
         }
     }
+
+    /// Update one source row of `[input][slot]` `delta * source` products.
+    #[kernel]
+    pub fn shortcut_weight_gradient_accumulate(
+        accumulated: &[f32],
+        delta: &[f32],
+        source: &[f32],
+        mut output: DisjointSlice<f32>,
+        batch: usize,
+        per_sample: usize,
+        source_per_sample: usize,
+        num_inputs: usize,
+        layer_step: usize,
+        source_index: usize,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= output.len() {
+            return;
+        }
+        let mut value = accumulated[i];
+        if i / layer_step == source_index && source_index < num_inputs {
+            let slot = i % layer_step;
+            let span = per_sample / layer_step;
+            let start = slot * span;
+            let end = (start + span).min(per_sample).min(source_per_sample);
+            let mut sum = 0.0f32;
+            let mut b = 0usize;
+            while b < batch {
+                let mut e = start;
+                while e < end {
+                    sum += delta[b * per_sample + e] * source[b * source_per_sample + e];
+                    e += 1;
+                }
+                b += 1;
+            }
+            value += sum;
+        }
+        if let Some(o) = output.get_mut(idx) {
+            *o = value;
+        }
+    }
+
+    /// Exact per-slot normalization chain for shortcut coefficient gradients.
+    /// `normalization`: 0 none, 1 relu, 2 softmax; `cpp_grad` copies raw z.
+    #[kernel]
+    pub fn shortcut_weight_normalized_gradient(
+        raw: &[f32],
+        products: &[f32],
+        mut gradient: DisjointSlice<f32>,
+        num_inputs: usize,
+        layer_step: usize,
+        normalization: u32,
+        cpp_grad: u32,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= gradient.len() {
+            return;
+        }
+        let slot = i % layer_step;
+        let mut value = products[i];
+        if normalization == 1 && cpp_grad == 0 {
+            let mut positive_sum = 0.0f32;
+            let mut dot = 0.0f32;
+            let mut input = 0usize;
+            while input < num_inputs {
+                let j = input * layer_step + slot;
+                let positive = raw[j].max(0.0);
+                positive_sum += positive;
+                dot += products[j] * positive;
+                input += 1;
+            }
+            let sum = 0.0001f32 + positive_sum;
+            value = if raw[i] > 0.0 {
+                products[i] / sum - dot / (sum * sum)
+            } else {
+                0.0
+            };
+        } else if normalization == 2 && cpp_grad == 0 {
+            let mut maximum = f32::NEG_INFINITY;
+            let mut input = 0usize;
+            while input < num_inputs {
+                let raw_value = raw[input * layer_step + slot];
+                if raw_value > maximum || input == 0 {
+                    maximum = raw_value;
+                }
+                input += 1;
+            }
+            let mut exp_sum = 0.0f32;
+            input = 0;
+            while input < num_inputs {
+                exp_sum += (raw[input * layer_step + slot] - maximum).exp();
+                input += 1;
+            }
+            let sum = 0.0001f32 + exp_sum;
+            let mut dot = 0.0f32;
+            input = 0;
+            while input < num_inputs {
+                let j = input * layer_step + slot;
+                let effective = (raw[j] - maximum).exp() / sum;
+                dot += products[j] * effective;
+                input += 1;
+            }
+            let effective = (raw[i] - maximum).exp() / sum;
+            value = effective * (products[i] - dot);
+        }
+        if let Some(o) = gradient.get_mut(idx) {
+            *o = value;
+        }
+    }
 }
 
 /// Fused residual + bias epilogue for a transformer block:

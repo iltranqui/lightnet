@@ -3,7 +3,9 @@
 //! edge shapes.  The references are written independently of
 //! `darknet_cuda::host_ops` (which only serves the dropout RNG bit-match).
 
-use darknet_cuda::{ElementwiseLaunchConfig, F32TensorOpsBackend, dropout_unit};
+use darknet_cuda::{
+    ElementwiseLaunchConfig, F32ShortcutWeightNormalization, F32TensorOpsBackend, dropout_unit,
+};
 use darknet_cuda_oxide::OxideBackend;
 
 const TOL: f32 = 1e-4;
@@ -614,6 +616,129 @@ fn gradient_centralization_matches_reference_and_is_noop_off_warp_sizes() {
     }
     let xt = be.upload_f32(&[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
     assert!(be.gradient_centralization_f32(&xt, &[4], 3, cfg()).is_err());
+}
+
+#[test]
+fn weighted_shortcut_products_and_normalization_gradients_match_reference() {
+    let be = backend();
+    let (batch, per_sample, layer_step) = (2usize, 6usize, 2usize);
+    let sources = [
+        vec![
+            0.2f32, -0.4, 0.6, 0.8, -0.3, 0.1, 0.7, 0.2, -0.5, 0.3, 0.9, -0.6,
+        ],
+        vec![0.5f32, -0.2, 0.4, 0.1, -0.7, 0.8, 0.3, -0.6],
+        vec![-0.1f32, 0.9, 0.4, -0.3],
+    ];
+    let source_lengths = [6usize, 4, 2];
+    let delta: Vec<f32> = (0..batch * per_sample)
+        .map(|i| (i as f32 * 0.71).cos() + 0.2)
+        .collect();
+    let num_inputs = sources.len();
+    let delta_gpu = be.upload_f32(&[batch, per_sample], &delta).unwrap();
+    let mut products_gpu = be.zeros_f32(&[num_inputs, layer_step]).unwrap();
+    let mut products_ref = vec![0.0f32; num_inputs * layer_step];
+    let span = per_sample / layer_step;
+    for (source_index, (source, source_per_sample)) in
+        sources.iter().zip(source_lengths).enumerate()
+    {
+        let source_gpu = be.upload_f32(&[batch, source_per_sample], source).unwrap();
+        products_gpu = be
+            .shortcut_weight_gradient_accumulate_f32(
+                &products_gpu,
+                &delta_gpu,
+                &source_gpu,
+                batch,
+                per_sample,
+                source_per_sample,
+                num_inputs,
+                layer_step,
+                source_index,
+                cfg(),
+            )
+            .unwrap();
+        for b in 0..batch {
+            for e in 0..per_sample.min(source_per_sample) {
+                products_ref[source_index * layer_step + e / span] +=
+                    delta[b * per_sample + e] * source[b * source_per_sample + e];
+            }
+        }
+    }
+    let products = be.download_f32(&products_gpu).unwrap();
+    assert_close(
+        "weighted shortcut products",
+        &products,
+        &f64s(&products_ref),
+    );
+
+    let raw = [1.2f32, -0.4, 0.7, 0.6, -1.0, 1.4];
+    let raw_gpu = be.upload_f32(&[num_inputs, layer_step], &raw).unwrap();
+    let normalizations = [
+        F32ShortcutWeightNormalization::None,
+        F32ShortcutWeightNormalization::Relu,
+        F32ShortcutWeightNormalization::Softmax,
+    ];
+    for normalization in normalizations {
+        for cpp_grad in [false, true] {
+            let got = be
+                .shortcut_weight_normalized_gradient_f32(
+                    &raw_gpu,
+                    &products_gpu,
+                    num_inputs,
+                    layer_step,
+                    normalization,
+                    cpp_grad,
+                    cfg(),
+                )
+                .unwrap();
+            let got = be.download_f32(&got).unwrap();
+            let mut expected = vec![0.0f64; raw.len()];
+            for slot in 0..layer_step {
+                let at = |input: usize| input * layer_step + slot;
+                if cpp_grad || normalization == F32ShortcutWeightNormalization::None {
+                    for input in 0..num_inputs {
+                        expected[at(input)] = products_ref[at(input)] as f64;
+                    }
+                } else if normalization == F32ShortcutWeightNormalization::Relu {
+                    let sum = 1e-4f64
+                        + (0..num_inputs)
+                            .map(|input| (raw[at(input)] as f64).max(0.0))
+                            .sum::<f64>();
+                    let dot = (0..num_inputs)
+                        .map(|input| {
+                            products_ref[at(input)] as f64 * (raw[at(input)] as f64).max(0.0)
+                        })
+                        .sum::<f64>();
+                    for input in 0..num_inputs {
+                        expected[at(input)] = if raw[at(input)] > 0.0 {
+                            products_ref[at(input)] as f64 / sum - dot / (sum * sum)
+                        } else {
+                            0.0
+                        };
+                    }
+                } else {
+                    let maximum = (0..num_inputs)
+                        .map(|input| raw[at(input)] as f64)
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    let exp: Vec<f64> = (0..num_inputs)
+                        .map(|input| (raw[at(input)] as f64 - maximum).exp())
+                        .collect();
+                    let sum = 1e-4f64 + exp.iter().sum::<f64>();
+                    let dot = (0..num_inputs)
+                        .map(|input| products_ref[at(input)] as f64 * exp[input] / sum)
+                        .sum::<f64>();
+                    for input in 0..num_inputs {
+                        let effective = exp[input] / sum;
+                        expected[at(input)] = effective * (products_ref[at(input)] as f64 - dot);
+                    }
+                }
+            }
+            assert_close(
+                &format!("shortcut norm {normalization:?} cpp={cpp_grad}"),
+                &got,
+                &expected,
+            );
+        }
+    }
 }
 
 #[test]

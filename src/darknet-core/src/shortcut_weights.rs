@@ -125,37 +125,18 @@ pub(crate) fn normalized_weight_gradient(
 ) -> Vec<f32> {
     assert!(layer_step > 0 && raw.len().is_multiple_of(layer_step));
     assert_eq!(raw.len(), z.len());
-    let n1 = raw.len() / layer_step;
-    let eff = effective_weights(raw, norm, layer_step);
-    let mut gradient = vec![0.0f32; raw.len()];
-    for slot in 0..layer_step {
-        let at = |i: usize| slot + i * layer_step;
-        match (norm, cpp_grad) {
-            (ShortcutWeightsNorm::None, _) | (_, true) => {
-                for i in 0..n1 {
-                    gradient[at(i)] = z[at(i)];
-                }
-            }
-            (ShortcutWeightsNorm::Relu, false) => {
-                let sum = EPS + (0..n1).map(|i| raw[at(i)].max(0.0)).sum::<f32>();
-                let dot: f32 = (0..n1).map(|i| z[at(i)] * raw[at(i)].max(0.0)).sum();
-                for k in 0..n1 {
-                    gradient[at(k)] = if raw[at(k)] > 0.0 {
-                        z[at(k)] / sum - dot / (sum * sum)
-                    } else {
-                        0.0
-                    };
-                }
-            }
-            (ShortcutWeightsNorm::Softmax, false) => {
-                let dot: f32 = (0..n1).map(|i| z[at(i)] * eff[at(i)]).sum();
-                for k in 0..n1 {
-                    gradient[at(k)] = eff[at(k)] * (z[at(k)] - dot);
-                }
-            }
-        }
-    }
-    gradient
+    let normalization = match norm {
+        ShortcutWeightsNorm::None => darknet_cuda::F32ShortcutWeightNormalization::None,
+        ShortcutWeightsNorm::Relu => darknet_cuda::F32ShortcutWeightNormalization::Relu,
+        ShortcutWeightsNorm::Softmax => darknet_cuda::F32ShortcutWeightNormalization::Softmax,
+    };
+    darknet_cuda::host_ops::shortcut_weight_normalized_gradient(
+        raw,
+        z,
+        layer_step,
+        normalization,
+        cpp_grad,
+    )
 }
 
 #[cfg(test)]
@@ -179,11 +160,25 @@ mod tests {
     #[test]
     fn mismatched_source_adds_only_its_prefix() {
         // per_sample 4, source has 2 elements: elements 2,3 only see the layer input
-        let out = weighted_forward(&[1.0, 1.0, 1.0, 1.0], &[&[10.0, 10.0]], 1, 4, &[1.0, 1.0], NoNorm, 1);
+        let out = weighted_forward(
+            &[1.0, 1.0, 1.0, 1.0],
+            &[&[10.0, 10.0]],
+            1,
+            4,
+            &[1.0, 1.0],
+            NoNorm,
+            1,
+        );
         assert_eq!(out, vec![11.0, 11.0, 1.0, 1.0]);
     }
 
-    fn loss(input: &[f32], sources: &[&[f32]], raw: &[f32], norm: ShortcutWeightsNorm, seed: &[f32]) -> f32 {
+    fn loss(
+        input: &[f32],
+        sources: &[&[f32]],
+        raw: &[f32],
+        norm: ShortcutWeightsNorm,
+        seed: &[f32],
+    ) -> f32 {
         // batch 2, per_sample 6, per_channel with 2 channels (layer_step 2, step 3)
         weighted_forward(input, sources, 2, 6, raw, norm, 2)
             .iter()
@@ -204,25 +199,43 @@ mod tests {
             let g = weighted_backward(&seed, &input, &[&s0, &s1], 2, 6, &raw, norm, 2, false);
             let check = |name: &str, analytic: f32, plus: f32, minus: f32| {
                 let fd = (plus - minus) / (2.0 * h);
-                assert!((fd - analytic).abs() <= 5e-3 + 5e-3 * fd.abs(), "{norm:?} {name}: fd {fd}, analytic {analytic}");
+                assert!(
+                    (fd - analytic).abs() <= 5e-3 + 5e-3 * fd.abs(),
+                    "{norm:?} {name}: fd {fd}, analytic {analytic}"
+                );
             };
             for k in 0..raw.len() {
                 let (mut p, mut m) = (raw.clone(), raw.clone());
                 p[k] += h;
                 m[k] -= h;
-                check(&format!("w[{k}]"), g.weights[k], loss(&input, &[&s0, &s1], &p, norm, &seed), loss(&input, &[&s0, &s1], &m, norm, &seed));
+                check(
+                    &format!("w[{k}]"),
+                    g.weights[k],
+                    loss(&input, &[&s0, &s1], &p, norm, &seed),
+                    loss(&input, &[&s0, &s1], &m, norm, &seed),
+                );
             }
             for k in 0..input.len() {
                 let (mut p, mut m) = (input.clone(), input.clone());
                 p[k] += h;
                 m[k] -= h;
-                check(&format!("x[{k}]"), g.input[k], loss(&p, &[&s0, &s1], &raw, norm, &seed), loss(&m, &[&s0, &s1], &raw, norm, &seed));
+                check(
+                    &format!("x[{k}]"),
+                    g.input[k],
+                    loss(&p, &[&s0, &s1], &raw, norm, &seed),
+                    loss(&m, &[&s0, &s1], &raw, norm, &seed),
+                );
             }
             for k in 0..s1.len() {
                 let (mut p, mut m) = (s1.clone(), s1.clone());
                 p[k] += h;
                 m[k] -= h;
-                check(&format!("s1[{k}]"), g.sources[1][k], loss(&input, &[&s0, &p], &raw, norm, &seed), loss(&input, &[&s0, &m], &raw, norm, &seed));
+                check(
+                    &format!("s1[{k}]"),
+                    g.sources[1][k],
+                    loss(&input, &[&s0, &p], &raw, norm, &seed),
+                    loss(&input, &[&s0, &m], &raw, norm, &seed),
+                );
             }
         }
     }

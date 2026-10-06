@@ -45,6 +45,14 @@ pub enum F32ActivationKind {
     HardMish,
 }
 
+/// Normalization applied to raw weighted-shortcut coefficients.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum F32ShortcutWeightNormalization {
+    None,
+    Relu,
+    Softmax,
+}
+
 /// Outputs of [`F32TensorOpsBackend::batchnorm_train_forward_f32`].
 #[derive(Clone, Debug)]
 pub struct BatchNormTrainForward<T> {
@@ -515,6 +523,75 @@ pub trait F32TensorOpsBackend {
             }
         }
         self.upload_f32(&[layer_step], &gradient)
+    }
+    /// Add one source's `delta * source` reduction into its `[input][slot]`
+    /// row. This allows device backends to compose all source reductions
+    /// without downloading per-source vectors. The source prefix behavior is
+    /// identical to [`Self::shortcut_weight_gradient_f32`].
+    fn shortcut_weight_gradient_accumulate_f32(
+        &self,
+        accumulated: &Self::Tensor,
+        delta: &Self::Tensor,
+        source: &Self::Tensor,
+        batch: usize,
+        per_sample: usize,
+        source_per_sample: usize,
+        num_inputs: usize,
+        layer_step: usize,
+        source_index: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert!(batch > 0 && per_sample > 0 && layer_step > 0);
+        assert_eq!(per_sample % layer_step, 0);
+        assert!(source_index < num_inputs);
+        let mut products = self.download_f32(accumulated)?;
+        let delta = self.download_f32(delta)?;
+        let source = self.download_f32(source)?;
+        assert_eq!(products.len(), num_inputs * layer_step);
+        assert_eq!(delta.len(), batch * per_sample);
+        assert_eq!(source.len(), batch * source_per_sample);
+        let span = per_sample / layer_step;
+        let start = source_index * layer_step;
+        for slot in 0..layer_step {
+            let begin = slot * span;
+            let end = (begin + span).min(per_sample).min(source_per_sample);
+            let mut sum = 0.0f32;
+            for b in 0..batch {
+                for e in begin..end {
+                    sum += delta[b * per_sample + e] * source[b * source_per_sample + e];
+                }
+            }
+            products[start + slot] += sum;
+        }
+        self.upload_f32(&[num_inputs, layer_step], &products)
+    }
+    /// Apply the exact Rust weighted-shortcut normalization derivative, or
+    /// the legacy raw-`z` gradient when `cpp_grad` is true.
+    fn shortcut_weight_normalized_gradient_f32(
+        &self,
+        raw_weights: &Self::Tensor,
+        products: &Self::Tensor,
+        num_inputs: usize,
+        layer_step: usize,
+        normalization: F32ShortcutWeightNormalization,
+        cpp_grad: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert!(num_inputs > 0 && layer_step > 0);
+        let raw_weights = self.download_f32(raw_weights)?;
+        let products = self.download_f32(products)?;
+        assert_eq!(raw_weights.len(), num_inputs * layer_step);
+        assert_eq!(products.len(), raw_weights.len());
+        let gradient = host_ops::shortcut_weight_normalized_gradient(
+            &raw_weights,
+            &products,
+            layer_step,
+            normalization,
+            cpp_grad,
+        );
+        self.upload_f32(&[num_inputs, layer_step], &gradient)
     }
     fn route_concat_f32(
         &self,

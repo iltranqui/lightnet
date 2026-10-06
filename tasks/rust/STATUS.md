@@ -34,6 +34,15 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v64: Weighted-shortcut backward now assembles per-source `delta * activation`
+  products and applies exact None/ReLU/softmax normalization-chain derivatives
+  through `F32TensorOpsBackend`; `GradMode::Cpp` still returns raw products.
+  Oxide transfers only the final per-input/per-slot weight-gradient vector to
+  host train buffers; parameter updates remain host-side. Host finite-difference
+  math passed (4/4), FakeBackend runtime parity passed (1/1), the direct Oxide
+  product/normalization/C++-mode test passed (1/1) and full `oxide_layers_extra`
+  passed (22/22), and real-device runtime forward/backward/SGD parity passed
+  (1/1), including short-source prefixes.
 - v63: Audited convolution `grad_centr` against the C++ GPU update path and
   removed it from the open parity gaps. `gpu_grad_centr_runtime_matches_cpu_and_respects_batchnorm_gate`
   passed (host 1/1), and `gradient_centralization_matches_reference_and_is_noop_off_warp_sizes`
@@ -198,9 +207,11 @@ Latest increments:
   (13 + 5 tests passed; 1 ignored in the half suite).
 - Weighted `[shortcut]` GPU forward composes oxide channel-scale + add. Input and
   source gradients use backend elementwise multiply + shortcut-fit ops. Oxide
-  also reduces raw `delta * source` dot products on-device, transferring only
-  per-input/per-slot results for host normalization-chain derivatives; parameters
-  and SGD remain host-resident. FakeBackend and real-device
+  assembles raw `delta * source` products and applies exact None/ReLU/softmax
+  normalization derivatives on-device, including the `GradMode::Cpp` raw-product
+  behavior. Only the final per-input/per-slot weight-gradient vector transfers
+  to host train buffers; parameter updates/SGD remain host-resident. FakeBackend
+  and real-device
   `weighted_shortcut_runtime_matches_cpu_forward_backward_and_sgd` parity pass.
 - AMP runtime with dropout and dropblock now has real-device output/mask/backward/
   SGD comparison against f32 (`oxide_runtime_chain` test).

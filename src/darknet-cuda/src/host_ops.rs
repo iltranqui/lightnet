@@ -328,6 +328,70 @@ pub fn gradient_centralization(x: &[f32], f_size: usize) -> Vec<f32> {
     out
 }
 
+/// Exact weighted-shortcut normalization-chain derivative from `raw` and
+/// `z = dL/d(effective_weights)`, stored `[input][slot]`.
+pub fn shortcut_weight_normalized_gradient(
+    raw: &[f32],
+    z: &[f32],
+    layer_step: usize,
+    normalization: crate::F32ShortcutWeightNormalization,
+    cpp_grad: bool,
+) -> Vec<f32> {
+    assert!(layer_step > 0 && raw.len().is_multiple_of(layer_step));
+    assert_eq!(raw.len(), z.len());
+    let n_inputs = raw.len() / layer_step;
+    let mut gradient = vec![0.0; raw.len()];
+    for slot in 0..layer_step {
+        let at = |input: usize| input * layer_step + slot;
+        match (normalization, cpp_grad) {
+            (crate::F32ShortcutWeightNormalization::None, _) | (_, true) => {
+                for input in 0..n_inputs {
+                    gradient[at(input)] = z[at(input)];
+                }
+            }
+            (crate::F32ShortcutWeightNormalization::Relu, false) => {
+                let mut positive_sum = 0.0f32;
+                let mut dot = 0.0f32;
+                for input in 0..n_inputs {
+                    let positive = raw[at(input)].max(0.0);
+                    positive_sum += positive;
+                    dot += z[at(input)] * positive;
+                }
+                let sum = 0.0001f32 + positive_sum;
+                for input in 0..n_inputs {
+                    let raw_value = raw[at(input)];
+                    gradient[at(input)] = if raw_value > 0.0 {
+                        z[at(input)] / sum - dot / (sum * sum)
+                    } else {
+                        0.0
+                    };
+                }
+            }
+            (crate::F32ShortcutWeightNormalization::Softmax, false) => {
+                let mut max = f32::NEG_INFINITY;
+                for input in 0..n_inputs {
+                    max = max.max(raw[at(input)]);
+                }
+                let mut exp_sum = 0.0f32;
+                for input in 0..n_inputs {
+                    exp_sum += (raw[at(input)] - max).exp();
+                }
+                let sum = 0.0001f32 + exp_sum;
+                let mut dot = 0.0f32;
+                for input in 0..n_inputs {
+                    let effective = (raw[at(input)] - max).exp() / sum;
+                    dot += z[at(input)] * effective;
+                }
+                for input in 0..n_inputs {
+                    let effective = (raw[at(input)] - max).exp() / sum;
+                    gradient[at(input)] = effective * (z[at(input)] - dot);
+                }
+            }
+        }
+    }
+    gradient
+}
+
 /// Index of the scale value multiplying element `i` of a `[batch, c, h*w]`
 /// tensor: `[batch, h*w]` when `scale_wh`, else `[batch, c]`.
 fn scale_index(i: usize, channels: usize, hw: usize, scale_wh: bool) -> usize {

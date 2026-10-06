@@ -16,7 +16,10 @@ use std::sync::{Arc, Mutex};
 
 use cuda_core::simt::LaunchConfig;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DriverError};
-use darknet_cuda::{AdamParams, AdamUpdateItem, SgdUpdateItem, BatchNormTrainForward, NanInfMode, ElementwiseLaunchConfig, F32ActivationKind, F32TensorOpsBackend};
+use darknet_cuda::{
+    AdamParams, AdamUpdateItem, BatchNormTrainForward, ElementwiseLaunchConfig, F32ActivationKind,
+    F32ShortcutWeightNormalization, F32TensorOpsBackend, NanInfMode, SgdUpdateItem,
+};
 
 use kernels::bias_scale::BIAS_BACKWARD_THREADS;
 use kernels::{
@@ -2739,6 +2742,137 @@ impl F32TensorOpsBackend for OxideBackend {
         }
         .map_err(launch_err)?;
         Ok(OxideTensorF32::new(gradient, &[layer_step]))
+    }
+
+    fn shortcut_weight_gradient_accumulate_f32(
+        &self,
+        accumulated: &Self::Tensor,
+        delta: &Self::Tensor,
+        source: &Self::Tensor,
+        batch: usize,
+        per_sample: usize,
+        source_per_sample: usize,
+        num_inputs: usize,
+        layer_step: usize,
+        source_index: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let op = "shortcut_weight_gradient_accumulate_f32";
+        if batch == 0
+            || per_sample == 0
+            || layer_step == 0
+            || per_sample % layer_step != 0
+            || num_inputs == 0
+            || source_index >= num_inputs
+        {
+            return Err(shape_err(
+                op,
+                "invalid shortcut gradient geometry".to_owned(),
+            ));
+        }
+        let total = num_inputs
+            .checked_mul(layer_step)
+            .ok_or_else(|| shape_err(op, "shortcut weight count overflows usize".to_owned()))?;
+        let accumulated = self.f32v(accumulated)?;
+        let accumulated = &*accumulated;
+        let delta = self.f32v(delta)?;
+        let delta = &*delta;
+        let source = self.f32v(source)?;
+        let source = &*source;
+        if accumulated.len() != total
+            || delta.len() != batch * per_sample
+            || source.len() != batch * source_per_sample
+        {
+            return Err(shape_err(
+                op,
+                format!(
+                    "tensor lengths are {}/{}/{}, expected {}/{}/{}",
+                    accumulated.len(),
+                    delta.len(),
+                    source.len(),
+                    total,
+                    batch * per_sample,
+                    batch * source_per_sample
+                ),
+            ));
+        }
+        let mut out = self.alloc_uninit(total)?;
+        // SAFETY: one thread writes each output coefficient; all input extents
+        // and source-row bounds are validated above.
+        unsafe {
+            self.layers_extra.shortcut_weight_gradient_accumulate(
+                &self.stream,
+                launch::elementwise(total, config),
+                &accumulated.buf,
+                &delta.buf,
+                &source.buf,
+                &mut out,
+                batch,
+                per_sample,
+                source_per_sample,
+                num_inputs,
+                layer_step,
+                source_index,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(out, &[num_inputs, layer_step]))
+    }
+
+    fn shortcut_weight_normalized_gradient_f32(
+        &self,
+        raw_weights: &Self::Tensor,
+        products: &Self::Tensor,
+        num_inputs: usize,
+        layer_step: usize,
+        normalization: F32ShortcutWeightNormalization,
+        cpp_grad: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let op = "shortcut_weight_normalized_gradient_f32";
+        if num_inputs == 0 || layer_step == 0 {
+            return Err(shape_err(op, "empty shortcut weight geometry".to_owned()));
+        }
+        let total = num_inputs
+            .checked_mul(layer_step)
+            .ok_or_else(|| shape_err(op, "shortcut weight count overflows usize".to_owned()))?;
+        let raw_weights = self.f32v(raw_weights)?;
+        let raw_weights = &*raw_weights;
+        let products = self.f32v(products)?;
+        let products = &*products;
+        if raw_weights.len() != total || products.len() != total {
+            return Err(shape_err(
+                op,
+                format!(
+                    "raw/product lengths are {}/{}, expected {total}",
+                    raw_weights.len(),
+                    products.len()
+                ),
+            ));
+        }
+        let normalization_code = match normalization {
+            F32ShortcutWeightNormalization::None => 0,
+            F32ShortcutWeightNormalization::Relu => 1,
+            F32ShortcutWeightNormalization::Softmax => 2,
+        };
+        let mut gradient = self.alloc_uninit(total)?;
+        // SAFETY: one thread owns each result coefficient; input rows and slots
+        // are bounded by the validated total length.
+        unsafe {
+            self.layers_extra.shortcut_weight_normalized_gradient(
+                &self.stream,
+                launch::elementwise(total, config),
+                &raw_weights.buf,
+                &products.buf,
+                &mut gradient,
+                num_inputs,
+                layer_step,
+                normalization_code,
+                cpp_grad as u32,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(gradient, &[num_inputs, layer_step]))
     }
 
     fn route_concat_f32(

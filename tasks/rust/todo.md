@@ -63,10 +63,11 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
   runtime-chain forward/backward/SGD parity coverage; the argmax-only kernel
   inherently writes zero gradients to non-argmax inputs.
   Weighted shortcut CPU gradients have finite-difference coverage; GPU input
-  and source gradients use backend elementwise multiply/fit operations. Raw
-  weight dot products reduce on Oxide and only small per-input/per-slot results
-  cross the host; normalization-chain derivatives and optimizer updates remain
-  host-side.
+  and source gradients use backend elementwise multiply/fit operations. Oxide
+  assembles raw weight dot products and applies exact None/ReLU/softmax
+  normalization-chain derivatives on-device, preserving `GradMode::Cpp` raw-z
+  behavior; only the final per-input/per-slot weight-gradient vector crosses to
+  host train buffers. Parameter/optimizer updates remain host-side.
 
 ## P8/P9 training follow-ups
 
@@ -105,11 +106,11 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
   learning rate.
 - [~] weighted shortcut: per-feature/per-channel oxide forward composes
   channel-scale + add; input/source gradients use backend elementwise multiply
-  and shortcut-fit ops. Oxide reduces raw weight dot products natively, then
-  transfers only per-input/per-slot results for the normalization derivative;
-  parameters/SGD remain host-resident. FakeBackend and real-device runtime tests
-  cover mismatched source fit, forward, backward, and SGD parity. Fully device
-  normalization and parameter updates remain future work.
+  and shortcut-fit ops. Oxide assembles raw weight dot products and applies the
+  exact normalization derivative, including `GradMode::Cpp`; only the final
+  per-input/per-slot gradient transfers to host. Parameter/SGD updates remain
+  host-resident. FakeBackend and real-device runtime tests cover short-source
+  prefixes, forward, backward, and SGD parity.
 - [ ] `reverse` conv, `deform`, adversarial yolo branch.
 - [x] End-to-end real-device `subdivisions=2` deferred-gradient flush matches
   CPU weights/biases through two iterations in
