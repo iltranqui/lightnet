@@ -351,6 +351,38 @@ pub trait F32TensorOpsBackend {
         }
         Ok(accumulated.expect("weighted shortcut requires at least the layer input"))
     }
+    /// Reduce `delta * source` into the weighted-shortcut coefficient slots.
+    /// The source can be shorter than the output per sample; elements outside
+    /// that prefix contribute zero, matching shortcut crop/zero-pad semantics.
+    /// `layer_step` is 1 for per-feature weights or channels for per-channel.
+    /// Backends should return a `[layer_step]` tensor and override this method
+    /// to avoid downloading the full activation tensors.
+    fn shortcut_weight_gradient_f32(
+        &self,
+        delta: &Self::Tensor,
+        source: &Self::Tensor,
+        batch: usize,
+        per_sample: usize,
+        source_per_sample: usize,
+        layer_step: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert!(batch > 0 && layer_step > 0 && per_sample > 0);
+        assert_eq!(per_sample % layer_step, 0);
+        let delta = self.download_f32(delta)?;
+        let source = self.download_f32(source)?;
+        assert_eq!(delta.len(), batch * per_sample);
+        assert_eq!(source.len(), batch * source_per_sample);
+        let span = per_sample / layer_step;
+        let mut gradient = vec![0.0f32; layer_step];
+        for b in 0..batch {
+            for e in 0..per_sample.min(source_per_sample) {
+                gradient[e / span] += delta[b * per_sample + e] * source[b * source_per_sample + e];
+            }
+        }
+        self.upload_f32(&[layer_step], &gradient)
+    }
     fn route_concat_f32(
         &self,
         inputs: &[&Self::Tensor],

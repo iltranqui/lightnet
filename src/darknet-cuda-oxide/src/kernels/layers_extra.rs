@@ -604,6 +604,42 @@ pub mod kernels {
             *o = sum;
         }
     }
+
+    /// One thread per shortcut coefficient slot. Each thread traverses its
+    /// deterministic batch/feature range and reduces `delta * source`; a short
+    /// source contributes only over its available flat prefix.
+    #[kernel]
+    pub fn shortcut_weight_gradient(
+        delta: &[f32],
+        source: &[f32],
+        mut gradient: DisjointSlice<f32>,
+        batch: usize,
+        per_sample: usize,
+        source_per_sample: usize,
+        layer_step: usize,
+    ) {
+        let idx = thread::index_1d();
+        let slot = idx.get();
+        if slot >= layer_step {
+            return;
+        }
+        let span = per_sample / layer_step;
+        let start = slot * span;
+        let end = (start + span).min(per_sample).min(source_per_sample);
+        let mut sum = 0.0f32;
+        let mut b = 0usize;
+        while b < batch {
+            let mut e = start;
+            while e < end {
+                sum += delta[b * per_sample + e] * source[b * source_per_sample + e];
+                e += 1;
+            }
+            b += 1;
+        }
+        if let Some(o) = gradient.get_mut(idx) {
+            *o = sum;
+        }
+    }
 }
 
 /// Fused residual + bias epilogue for a transformer block:

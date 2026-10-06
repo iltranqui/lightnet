@@ -57,9 +57,10 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
   of `d/c`; CIoU similarly uses an approximate `alpha` gradient. Overlapping-window
   maxpool with `maxpool_zero_nonmax` also has finite-difference coverage.
   Weighted shortcut CPU gradients have finite-difference coverage; GPU input
-  and source gradients now use backend elementwise multiply/fit operations, while
-  the exact normalized weight reduction still downloads the delta/inputs/sources
-  and the optimizer updates host-resident weights.
+  and source gradients use backend elementwise multiply/fit operations. Raw
+  weight dot products reduce on Oxide and only small per-input/per-slot results
+  cross the host; normalization-chain derivatives and optimizer updates remain
+  host-side.
 
 ## P8/P9 training follow-ups
 
@@ -76,10 +77,11 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
   clipping, and its reduced mHC learning rate.
 - [~] weighted shortcut: per-feature/per-channel oxide forward composes
   channel-scale + add; input/source gradients use backend elementwise multiply
-  and shortcut-fit ops. Exact normalized weight reductions still cross the host,
-  and parameters/SGD are host-resident. FakeBackend and real-device runtime tests
-  cover mismatched source fit, forward, backward, and SGD parity. Fused weight
-  reductions/device parameter updates remain future work.
+  and shortcut-fit ops. Oxide reduces raw weight dot products natively, then
+  transfers only per-input/per-slot results for the normalization derivative;
+  parameters/SGD remain host-resident. FakeBackend and real-device runtime tests
+  cover mismatched source fit, forward, backward, and SGD parity. Fully device
+  normalization and parameter updates remain future work.
 - [ ] `reverse` conv, `deform`, adversarial yolo branch.
 - [x] End-to-end real-device `subdivisions=2` deferred-gradient flush matches
   CPU weights/biases through two iterations in

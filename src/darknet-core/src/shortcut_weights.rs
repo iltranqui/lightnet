@@ -86,7 +86,6 @@ pub(crate) fn weighted_backward(
     layer_step: usize,
     cpp_grad: bool,
 ) -> WeightedGrad {
-    let n1 = raw.len() / layer_step;
     let eff = effective_weights(raw, norm, layer_step);
     let step = per_sample / layer_step;
     let mut grad = WeightedGrad {
@@ -111,19 +110,37 @@ pub(crate) fn weighted_backward(
             }
         }
     }
+    grad.weights = normalized_weight_gradient(raw, norm, layer_step, &z, cpp_grad);
+    grad
+}
+
+/// Apply the derivative of weight normalization to per-input/per-slot dot
+/// products `z`. This is shared by CPU backward and the GPU reduction path.
+pub(crate) fn normalized_weight_gradient(
+    raw: &[f32],
+    norm: ShortcutWeightsNorm,
+    layer_step: usize,
+    z: &[f32],
+    cpp_grad: bool,
+) -> Vec<f32> {
+    assert!(layer_step > 0 && raw.len().is_multiple_of(layer_step));
+    assert_eq!(raw.len(), z.len());
+    let n1 = raw.len() / layer_step;
+    let eff = effective_weights(raw, norm, layer_step);
+    let mut gradient = vec![0.0f32; raw.len()];
     for slot in 0..layer_step {
         let at = |i: usize| slot + i * layer_step;
         match (norm, cpp_grad) {
             (ShortcutWeightsNorm::None, _) | (_, true) => {
                 for i in 0..n1 {
-                    grad.weights[at(i)] = z[at(i)];
+                    gradient[at(i)] = z[at(i)];
                 }
             }
             (ShortcutWeightsNorm::Relu, false) => {
                 let sum = EPS + (0..n1).map(|i| raw[at(i)].max(0.0)).sum::<f32>();
                 let dot: f32 = (0..n1).map(|i| z[at(i)] * raw[at(i)].max(0.0)).sum();
                 for k in 0..n1 {
-                    grad.weights[at(k)] = if raw[at(k)] > 0.0 {
+                    gradient[at(k)] = if raw[at(k)] > 0.0 {
                         z[at(k)] / sum - dot / (sum * sum)
                     } else {
                         0.0
@@ -133,12 +150,12 @@ pub(crate) fn weighted_backward(
             (ShortcutWeightsNorm::Softmax, false) => {
                 let dot: f32 = (0..n1).map(|i| z[at(i)] * eff[at(i)]).sum();
                 for k in 0..n1 {
-                    grad.weights[at(k)] = eff[at(k)] * (z[at(k)] - dot);
+                    gradient[at(k)] = eff[at(k)] * (z[at(k)] - dot);
                 }
             }
         }
     }
-    grad
+    gradient
 }
 
 #[cfg(test)]

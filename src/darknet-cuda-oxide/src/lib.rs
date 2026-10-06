@@ -2476,6 +2476,59 @@ impl F32TensorOpsBackend for OxideBackend {
         ))
     }
 
+    fn shortcut_weight_gradient_f32(
+        &self,
+        delta: &Self::Tensor,
+        source: &Self::Tensor,
+        batch: usize,
+        per_sample: usize,
+        source_per_sample: usize,
+        layer_step: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let op = "shortcut_weight_gradient_f32";
+        if batch == 0 || per_sample == 0 || layer_step == 0 || per_sample % layer_step != 0 {
+            return Err(shape_err(
+                op,
+                "invalid batch or shortcut slot geometry".to_owned(),
+            ));
+        }
+        let delta = self.f32v(delta)?;
+        let delta = &*delta;
+        let source = self.f32v(source)?;
+        let source = &*source;
+        if delta.len() != batch * per_sample || source.len() != batch * source_per_sample {
+            return Err(shape_err(
+                op,
+                format!(
+                    "delta/source lengths are {}/{}, expected {}/{}",
+                    delta.len(),
+                    source.len(),
+                    batch * per_sample,
+                    batch * source_per_sample
+                ),
+            ));
+        }
+        let mut gradient = self.alloc_uninit(layer_step)?;
+        // SAFETY: one thread owns each coefficient slot and reads only the
+        // validated delta/source extents.
+        unsafe {
+            self.layers_extra.shortcut_weight_gradient(
+                &self.stream,
+                launch::elementwise(layer_step, config),
+                &delta.buf,
+                &source.buf,
+                &mut gradient,
+                batch,
+                per_sample,
+                source_per_sample,
+                layer_step,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(gradient, &[layer_step]))
+    }
+
     fn route_concat_f32(
         &self,
         inputs: &[&Self::Tensor],

@@ -107,11 +107,11 @@ Latest increments:
   `oxide_runtime_f16::tiny_net_with_avgpool_local_avgpool_batchnorm_reverse_upsample_matches_f32`
   (13 + 5 tests passed; 1 ignored in the half suite).
 - Weighted `[shortcut]` GPU forward composes oxide channel-scale + add. Input and
-  source gradients now use backend elementwise multiply + shortcut-fit ops; the
-  exact normalized weight reduction still downloads the delta/input/sources,
-  with host-resident parameters and SGD. FakeBackend backward dispatch and the
-  real-device `weighted_shortcut_runtime_matches_cpu_forward_backward_and_sgd`
-  parity test pass.
+  source gradients use backend elementwise multiply + shortcut-fit ops. Oxide
+  also reduces raw `delta * source` dot products on-device, transferring only
+  per-input/per-slot results for host normalization-chain derivatives; parameters
+  and SGD remain host-resident. FakeBackend and real-device
+  `weighted_shortcut_runtime_matches_cpu_forward_backward_and_sgd` parity pass.
 - AMP runtime with dropout and dropblock now has real-device output/mask/backward/
   SGD comparison against f32 (`oxide_runtime_chain` test).
 - Deferred optimizer accumulation has a real-device `subdivisions=2` CPU parity
