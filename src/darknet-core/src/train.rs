@@ -14,7 +14,7 @@ use rayon::prelude::*;
 use crate::error::{Error, Result};
 use crate::image::PlanarRgbImage;
 use crate::model::{LayerKind, Network, TensorShape, YoloIouLoss, YoloSpec};
-use crate::obb_labels::{ObbLabel, load_obb_labels};
+use crate::obb_labels::{ObbLabel, flip_obb_labels, load_obb_labels};
 use crate::runtime::{ForwardResult, Tensor};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,6 +116,61 @@ pub struct ObbTrainingBatch {
 impl ObbTrainingBatch {
     pub fn label_count(&self) -> usize {
         self.labels.iter().map(Vec::len).sum()
+    }
+
+    /// Horizontally flip selected NCHW samples and their OBB labels together.
+    ///
+    /// `flips` must have one entry per batch sample. This operation acts on the
+    /// already-loaded/resized batch; flip selection remains the caller's policy.
+    pub fn apply_horizontal_flips(&mut self, flips: &[bool]) -> Result<()> {
+        let shape = self.input.shape;
+        if flips.len() != shape.batch || self.labels.len() != shape.batch {
+            return Err(Error::InvalidConfig(format!(
+                "OBB flip mask and labels must match batch size {} (mask {}, labels {})",
+                shape.batch,
+                flips.len(),
+                self.labels.len()
+            )));
+        }
+        if shape.width == 0 || shape.height == 0 || shape.channels == 0 || shape.batch == 0 {
+            return Err(Error::InvalidConfig(
+                "OBB horizontal flip requires non-zero NCHW dimensions".to_owned(),
+            ));
+        }
+        let sample_len = shape
+            .width
+            .checked_mul(shape.height)
+            .and_then(|area| area.checked_mul(shape.channels))
+            .ok_or_else(|| Error::InvalidConfig("OBB flip tensor size overflows".to_owned()))?;
+        let expected_len = sample_len
+            .checked_mul(shape.batch)
+            .ok_or_else(|| Error::InvalidConfig("OBB flip batch size overflows".to_owned()))?;
+        if self.input.data.len() != expected_len {
+            return Err(Error::InvalidConfig(format!(
+                "OBB flip tensor length mismatch: expected {expected_len}, got {}",
+                self.input.data.len()
+            )));
+        }
+
+        let plane_len = shape.width * shape.height;
+        for (sample, &flip) in flips.iter().enumerate() {
+            if !flip {
+                continue;
+            }
+            let sample_start = sample * sample_len;
+            for channel in 0..shape.channels {
+                for y in 0..shape.height {
+                    let row_start = sample_start + channel * plane_len + y * shape.width;
+                    for x in 0..shape.width / 2 {
+                        self.input
+                            .data
+                            .swap(row_start + x, row_start + shape.width - 1 - x);
+                    }
+                }
+            }
+            flip_obb_labels(&mut self.labels[sample]);
+        }
+        Ok(())
     }
 }
 
@@ -2031,15 +2086,16 @@ fn yolo_objectness_output(raw: f32, new_coords: bool) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DataConfig, YoloBox, YoloHeadStats, YoloLabel, YoloTrainingState, apply_yolo_box_delta,
-        apply_yolo_class_delta, apply_yolo_delta_filtering, apply_yolo_positive_objectness,
-        bbox_iou_kind, compute_yolo_training_loss, compute_yolo_training_loss_with_state,
-        dx_box_iou, load_obb_training_batch, load_obb_training_batch_from_paths,
-        load_training_batch, load_yolo_labels, replace_image_to_label, yolo_head_cost,
-        yolo_xy_output,
+        DataConfig, ObbTrainingBatch, YoloBox, YoloHeadStats, YoloLabel, YoloTrainingState,
+        apply_yolo_box_delta, apply_yolo_class_delta, apply_yolo_delta_filtering,
+        apply_yolo_positive_objectness, bbox_iou_kind, compute_yolo_training_loss,
+        compute_yolo_training_loss_with_state, dx_box_iou, load_obb_training_batch,
+        load_obb_training_batch_from_paths, load_training_batch, load_yolo_labels,
+        replace_image_to_label, yolo_head_cost, yolo_xy_output,
     };
     use crate::cfg::ConfigFile;
     use crate::model::{Network, TensorShape, YoloIouLoss, YoloSpec};
+    use crate::obb_labels::ObbLabel;
     use crate::runtime::{ExecutableNetwork, Tensor};
     use std::fs;
     use std::path::PathBuf;
@@ -2208,6 +2264,94 @@ mod tests {
         assert_eq!(batch.label_paths, vec![label_path]);
         assert_eq!(batch.label_count(), 1);
         assert_eq!(batch.input.shape, network.net.input_shape());
+    }
+
+    #[test]
+    fn obb_batch_horizontal_flip_changes_selected_nchw_images_and_labels_together() {
+        let explicit = ObbLabel {
+            class_id: 0,
+            x: 0.25,
+            y: 0.375,
+            w: 0.25,
+            h: 0.5,
+            left: 0.125,
+            right: 0.375,
+            top: 0.125,
+            bottom: 0.625,
+            front_x: 0.125,
+            front_y: 0.625,
+            has_front: true,
+        };
+        let absent = ObbLabel {
+            class_id: 1,
+            x: 0.375,
+            y: 0.625,
+            w: 0.25,
+            h: 0.5,
+            left: 0.25,
+            right: 0.5,
+            top: 0.375,
+            bottom: 0.875,
+            front_x: 0.375,
+            front_y: 0.625,
+            has_front: false,
+        };
+        let untouched = ObbLabel {
+            class_id: 2,
+            x: 0.125,
+            left: 0.0,
+            right: 0.25,
+            front_x: 0.125,
+            ..absent
+        };
+        let mut batch = ObbTrainingBatch {
+            input: Tensor::from_data(
+                TensorShape::new(3, 1, 2, 3),
+                vec![
+                    1.0, 2.0, 3.0, 10.0, 20.0, 30.0, 4.0, 5.0, 6.0, 40.0, 50.0, 60.0, 7.0, 8.0,
+                    9.0, 70.0, 80.0, 90.0,
+                ],
+            )
+            .expect("NCHW batch tensor"),
+            image_paths: Vec::new(),
+            label_paths: Vec::new(),
+            labels: vec![vec![explicit], vec![absent], vec![untouched]],
+        };
+
+        let before = batch.clone();
+        assert!(batch.apply_horizontal_flips(&[true]).is_err());
+        assert_eq!(
+            batch, before,
+            "invalid mask must not partially mutate the batch"
+        );
+
+        batch
+            .apply_horizontal_flips(&[true, true, false])
+            .expect("per-image flips apply");
+        assert_eq!(
+            batch.input.data,
+            vec![
+                3.0, 2.0, 1.0, 30.0, 20.0, 10.0, 6.0, 5.0, 4.0, 60.0, 50.0, 40.0, 7.0, 8.0, 9.0,
+                70.0, 80.0, 90.0
+            ]
+        );
+        let flipped = batch.labels[0][0];
+        assert_eq!(flipped.x, 0.75);
+        assert_eq!(flipped.front_x, 0.875);
+        assert_eq!(flipped.front_y, explicit.front_y);
+        assert_eq!(flipped.left, 0.625);
+        assert_eq!(flipped.right, 0.875);
+        assert!(flipped.has_front);
+
+        let flipped_absent = batch.labels[1][0];
+        assert_eq!(flipped_absent.x, 0.625);
+        assert_eq!(flipped_absent.front_x, flipped_absent.x);
+        assert_eq!(flipped_absent.front_y, flipped_absent.y);
+        assert!(!flipped_absent.has_front);
+        assert_eq!(
+            batch.labels[2][0], untouched,
+            "unselected labels stay unchanged"
+        );
     }
 
     #[test]

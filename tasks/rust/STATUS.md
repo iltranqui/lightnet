@@ -34,6 +34,11 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v88: added `ObbTrainingBatch::apply_horizontal_flips`, which reflects selected
+  NCHW samples and their OBB labels together using a validated per-image mask.
+  The focused OBB suite passed 36/36 and all 459 `darknet-core` library tests
+  passed. Flip selection remains caller-owned; config randomness and crop/mosaic
+  augmentation are still open, with no compiled-C++ parity claim.
 - v87: added public `flip_obb_labels`, an exact horizontal reflection of label
   centers, front points, and stored bounds that preserves OBB dimensions and
   absent-front state. The focused OBB suite passed 35/35 and all 458
