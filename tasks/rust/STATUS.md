@@ -34,6 +34,13 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v77: added an OBB detection wrapper/geometry enum, CARPN-vs-front-point IoU
+  dispatch, and classwise greedy OBB NMS with descending per-class confidence,
+  exact-zero skip behavior, and strict `IoU > threshold`. The focused
+  `MEM=3G PKGS=darknet-core ./tools/test_host.sh obb` suite passed 8/8, including
+  orientation-sensitive suppression, mixed CARPN/front-point dispatch, class
+  isolation, and zero-objectness/zero-score cases. This is not decoder, cfg, or
+  dataset/mAP integration; no compiled-C++ golden or parity claim is available.
 - v76: added host-only CARPN convex-quad IoU for four interleaved vertex pairs,
   reusing the pure-Rust convex clipper and rejecting degenerate/non-finite inputs.
   `MEM=3G PKGS=darknet-core ./tools/test_host.sh carpn_polygon_iou` passed 2/2

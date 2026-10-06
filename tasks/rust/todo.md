@@ -230,8 +230,9 @@ Immediately next, in dependency order:
 - [ ] Phase 2B `dcnv3` blocked: no reference numerics (stub in all five branches).
 - [ ] Phase 2C OBB family (unblocked by decision 4; XL — also data loading, NMS,
   mAP). v75 adds legacy front-point rectangle geometry; v76 adds standalone
-  CARPN convex-quad IoU. Detection dispatch, cfg/layer integration, rotated
-  labels, losses, NMS, and mAP remain open.
+  CARPN convex-quad IoU; v77 adds typed geometry dispatch and an OBB NMS helper.
+  Head decoding, cfg/layer and NMS-kind integration, rotated labels, losses, and
+  mAP remain open.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and
   kernels, weights order `weights.cpp:428`); then `deform_conv`, `dsconv`,
   `graph_conv`, `wmhf`, `clifford`, `recursive_block`.

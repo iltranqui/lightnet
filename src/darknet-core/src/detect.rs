@@ -1,4 +1,5 @@
-//! YOLO output decoding and CPU non-maximum suppression.
+//! YOLO output decoding and CPU non-maximum suppression, with separate OBB
+//! post-processing primitives.
 //!
 //! The runtime leaves YOLO heads in Darknet's flat channel-major layout.  This
 //! module converts those tensors to image-space detections and keeps
@@ -7,6 +8,7 @@
 
 use crate::error::{Error, Result};
 use crate::model::{LayerKind, Network, YoloSpec};
+use crate::obb_geometry::{BoxObb, box_obb_iou, carpn_polygon_iou};
 use crate::runtime::{ModernHeadOutput, YoloHeadOutput};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -41,6 +43,23 @@ pub struct Detection {
     pub confidence: f32,
     pub objectness: f32,
     pub bbox: DetectionBox,
+}
+
+/// Geometry carried by a detection from an OBB head.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ObbDetectionGeometry {
+    /// Legacy Darknet OBB representation: one point on the height axis.
+    FrontPoint { x: f32, y: f32 },
+    /// CARPN representation: four interleaved vertex `(x, y)` pairs.
+    CarpnQuad([f32; 8]),
+}
+
+/// A class-specific detection with OBB geometry, separate from the existing
+/// axis-aligned [`Detection`] API.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObbDetection {
+    pub detection: Detection,
+    pub geometry: ObbDetectionGeometry,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -503,6 +522,94 @@ fn bbox_iou(lhs: DetectionBox, rhs: DetectionBox) -> f32 {
     inter_area / (lhs_area + rhs_area - inter_area)
 }
 
+/// IoU dispatch used by OBB post-processing.
+///
+/// Two CARPN quads use explicit polygon IoU. All other OBB pairs use the first
+/// point pair as the legacy front point, matching `detection_obb_iou` when one
+/// detection is CARPN and the other is not. This helper accepts only OBB records
+/// and never silently falls back to AABB IoU.
+pub fn detection_obb_iou(lhs: &ObbDetection, rhs: &ObbDetection) -> f32 {
+    if let (
+        ObbDetectionGeometry::CarpnQuad(lhs_vertices),
+        ObbDetectionGeometry::CarpnQuad(rhs_vertices),
+    ) = (lhs.geometry, rhs.geometry)
+    {
+        return carpn_polygon_iou(lhs_vertices, rhs_vertices);
+    }
+
+    let front_point = |geometry| match geometry {
+        ObbDetectionGeometry::FrontPoint { x, y } => [x, y],
+        ObbDetectionGeometry::CarpnQuad(vertices) => [vertices[0], vertices[1]],
+    };
+    let [lhs_front_x, lhs_front_y] = front_point(lhs.geometry);
+    let [rhs_front_x, rhs_front_y] = front_point(rhs.geometry);
+    box_obb_iou(
+        BoxObb {
+            bbox: lhs.detection.bbox,
+            front_x: lhs_front_x,
+            front_y: lhs_front_y,
+        },
+        BoxObb {
+            bbox: rhs.detection.bbox,
+            front_x: rhs_front_x,
+            front_y: rhs_front_y,
+        },
+    )
+}
+
+/// Apply classwise greedy OBB NMS, sorting candidates by descending confidence.
+///
+/// `confidence` is the per-class probability for this class-specific record.
+/// Exactly-zero objectness or confidence records remain in the output but do
+/// not participate in suppression, matching `diounms_sort`. Suppression uses a
+/// strict `IoU > threshold` comparison. Equal-score order is stable and defined
+/// here because the C++ sorter does not specify tie order.
+pub fn apply_obb_nms(detections: &mut Vec<ObbDetection>, threshold: f32) {
+    detections.sort_by(|lhs, rhs| {
+        let lhs_inactive = lhs.detection.objectness == 0.0;
+        let rhs_inactive = rhs.detection.objectness == 0.0;
+        lhs_inactive.cmp(&rhs_inactive).then_with(|| {
+            rhs.detection
+                .confidence
+                .total_cmp(&lhs.detection.confidence)
+        })
+    });
+
+    let mut suppressed = vec![false; detections.len()];
+    for i in 0..detections.len() {
+        let keeper = &detections[i];
+        if suppressed[i] || keeper.detection.objectness == 0.0 || keeper.detection.confidence == 0.0
+        {
+            continue;
+        }
+
+        for j in (i + 1)..detections.len() {
+            let candidate = &detections[j];
+            if suppressed[j]
+                || keeper.detection.class_id != candidate.detection.class_id
+                || candidate.detection.objectness == 0.0
+                || candidate.detection.confidence == 0.0
+            {
+                continue;
+            }
+            if detection_obb_iou(keeper, candidate) > threshold {
+                suppressed[j] = true;
+            }
+        }
+    }
+
+    let mut kept = 0usize;
+    for (index, &is_suppressed) in suppressed.iter().enumerate() {
+        if !is_suppressed {
+            if kept != index {
+                detections.swap(kept, index);
+            }
+            kept += 1;
+        }
+    }
+    detections.truncate(kept);
+}
+
 fn anchor_pair(spec: &YoloSpec, index: usize) -> Result<(f32, f32)> {
     let anchor_index = index
         .checked_mul(2)
@@ -683,6 +790,113 @@ mod tests {
                 .expect("decode should succeed");
 
         assert_eq!(detections.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod obb_postprocess_tests {
+    use super::{
+        Detection, DetectionBox, ObbDetection, ObbDetectionGeometry, apply_obb_nms,
+        detection_obb_iou,
+    };
+
+    fn rect_detection(
+        class_id: usize,
+        confidence: f32,
+        objectness: f32,
+        front: [f32; 2],
+    ) -> ObbDetection {
+        ObbDetection {
+            detection: Detection {
+                class_id,
+                confidence,
+                objectness,
+                bbox: DetectionBox {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 4.0,
+                    h: 2.0,
+                },
+            },
+            geometry: ObbDetectionGeometry::FrontPoint {
+                x: front[0],
+                y: front[1],
+            },
+        }
+    }
+
+    #[test]
+    fn detection_iou_dispatches_carpon_and_legacy_front_points() {
+        let horizontal = rect_detection(0, 0.9, 0.9, [0.0, 1.0]);
+        let vertical = rect_detection(0, 0.8, 0.8, [1.0, 0.0]);
+        assert!((detection_obb_iou(&horizontal, &vertical) - 1.0 / 3.0).abs() < 1e-6);
+
+        let square = ObbDetection {
+            detection: horizontal.detection.clone(),
+            geometry: ObbDetectionGeometry::CarpnQuad([0.0, 0.0, 2.0, 0.0, 2.0, 2.0, 0.0, 2.0]),
+        };
+        let diamond = ObbDetection {
+            detection: vertical.detection.clone(),
+            geometry: ObbDetectionGeometry::CarpnQuad([1.0, 0.0, 2.0, 1.0, 1.0, 2.0, 0.0, 1.0]),
+        };
+        assert!((detection_obb_iou(&square, &diamond) - 0.5).abs() < 1e-6);
+
+        // C++ falls through to its legacy path for mixed OBB representations,
+        // using the CARPN mask's first vertex as the front point.
+        let mixed = ObbDetection {
+            detection: vertical.detection.clone(),
+            geometry: ObbDetectionGeometry::CarpnQuad([1.0, 0.0, 2.0, 1.0, 1.0, 2.0, 0.0, 1.0]),
+        };
+        assert!((detection_obb_iou(&horizontal, &mixed) - 1.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn obb_nms_is_classwise_orientation_aware_and_uses_strict_thresholds() {
+        let low = rect_detection(0, 0.8, 0.9, [1.0, 0.0]);
+        let high = rect_detection(0, 0.9, 0.9, [0.0, 1.0]);
+        let other_class = rect_detection(1, 0.7, 0.9, [1.0, 0.0]);
+        let overlap = detection_obb_iou(&low, &high);
+        assert!((overlap - 1.0 / 3.0).abs() < 1e-6);
+
+        let mut orientation_safe = vec![low.clone(), high.clone()];
+        apply_obb_nms(&mut orientation_safe, 0.5);
+        assert_eq!(orientation_safe.len(), 2, "OBB IoU is below AABB IoU");
+
+        let mut below_threshold = vec![low.clone(), other_class.clone(), high.clone()];
+        apply_obb_nms(&mut below_threshold, overlap - 1e-4);
+        assert_eq!(below_threshold.len(), 2);
+        assert_eq!(
+            below_threshold[0].detection.confidence,
+            high.detection.confidence
+        );
+        assert!(below_threshold.iter().any(|d| d.detection.class_id == 1));
+
+        let mut at_threshold = vec![low, high, other_class];
+        apply_obb_nms(&mut at_threshold, overlap);
+        assert_eq!(at_threshold.len(), 3, "IoU equal to threshold is retained");
+    }
+
+    #[test]
+    fn zero_objectness_candidates_never_suppress_or_get_suppressed() {
+        let inactive = rect_detection(0, 0.99, 0.0, [0.0, 1.0]);
+        let active = rect_detection(0, 0.8, 0.9, [0.0, 1.0]);
+        let mut detections = vec![active.clone(), inactive.clone()];
+        apply_obb_nms(&mut detections, 0.0);
+        assert_eq!(detections.len(), 2);
+        assert!(detections.iter().any(|d| d == &inactive));
+        assert!(detections.iter().any(|d| d == &active));
+
+        let zero_probability = rect_detection(0, 0.0, 0.9, [0.0, 1.0]);
+        let active = rect_detection(0, 0.8, 0.9, [0.0, 1.0]);
+        let mut zero_score = vec![active.clone(), zero_probability.clone()];
+        apply_obb_nms(&mut zero_score, 0.0);
+        assert_eq!(zero_score.len(), 2);
+        assert!(zero_score.iter().any(|d| d == &zero_probability));
+
+        let duplicate = rect_detection(0, 0.7, 0.9, [0.0, 1.0]);
+        let mut positive = vec![active, duplicate];
+        apply_obb_nms(&mut positive, 0.0);
+        assert_eq!(positive.len(), 1, "positive overlap exceeds zero threshold");
     }
 }
 
