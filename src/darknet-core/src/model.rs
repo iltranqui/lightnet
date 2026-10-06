@@ -858,6 +858,39 @@ pub struct YoloSpec {
     pub class_map: Option<Vec<usize>>,
 }
 
+/// NMS kind accepted by the legacy OBB decoder. Other source kinds are gated
+/// until their distinct box-scoring semantics are implemented.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObbNmsKind {
+    /// Orientation-aware greedy NMS over legacy front-point detections.
+    Obb,
+}
+
+impl ObbNmsKind {
+    fn parse(value: &str, line: usize) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "obb" => Ok(Self::Obb),
+            other => Err(Error::InvalidConfig(format!(
+                "[obb_yolo] at line {line}: unsupported nms_kind {other:?}; only `obb` is implemented"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObbYoloSpec {
+    pub yolo: YoloSpec,
+    pub nms_kind: ObbNmsKind,
+}
+
+impl std::ops::Deref for ObbYoloSpec {
+    type Target = YoloSpec;
+
+    fn deref(&self) -> &Self::Target {
+        &self.yolo
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum YoloIouLoss {
     Mse,
@@ -1022,7 +1055,7 @@ pub enum LayerKind {
     Yolo(YoloSpec),
     /// Legacy six-coordinate `[obb_yolo]`; inference is decoded separately
     /// from axis-aligned YOLO and training remains unsupported.
-    ObbYolo(YoloSpec),
+    ObbYolo(ObbYoloSpec),
     GaussianYolo(YoloSpec),
     Region(RegionSpec),
     Reorg(ReorgSpec),
@@ -2175,33 +2208,37 @@ fn parse_layer_kind(
                 )));
             }
             let scale_x_y = section.get_f32("scale_x_y", 1.0)?;
+            let nms_kind = ObbNmsKind::parse(&section.get_str("nms_kind", "obb"), line)?;
             if !scale_x_y.is_finite() {
                 return Err(Error::InvalidConfig(format!(
                     "[obb_yolo] at line {line}: scale_x_y must be finite"
                 )));
             }
-            LayerKind::ObbYolo(YoloSpec {
-                classes,
-                num: total,
-                mask,
-                anchors,
-                scale_x_y,
-                new_coords: section.get_i64("new_coords", 0)? != 0,
-                cls_normalizer: section.get_f32("cls_normalizer", 1.0)?,
-                obj_normalizer: section.get_f32("obj_normalizer", 1.0)?,
-                iou_normalizer: section.get_f32("iou_normalizer", 0.75)?,
-                ignore_thresh: section.get_f32("ignore_thresh", 0.5)?,
-                truth_thresh: section.get_f32("truth_thresh", 1.0)?,
-                iou_thresh: section.get_f32("iou_thresh", 1.0)?,
-                iou_loss: YoloIouLoss::Mse,
-                iou_thresh_kind: YoloIouLoss::Iou,
-                focal_loss: section.get_i64("focal_loss", 0)? != 0,
-                label_smooth_eps: section.get_f32("label_smooth_eps", 0.0)?,
-                objectness_smooth: section.get_i64("objectness_smooth", 0)? != 0,
-                max_delta: section.get_f32("max_delta", f32::MAX)?,
-                delta_normalizer: section.get_f32("delta_normalizer", 1.0)?,
-                class_multipliers: None,
-                class_map: None,
+            LayerKind::ObbYolo(ObbYoloSpec {
+                yolo: YoloSpec {
+                    classes,
+                    num: total,
+                    mask,
+                    anchors,
+                    scale_x_y,
+                    new_coords: section.get_i64("new_coords", 0)? != 0,
+                    cls_normalizer: section.get_f32("cls_normalizer", 1.0)?,
+                    obj_normalizer: section.get_f32("obj_normalizer", 1.0)?,
+                    iou_normalizer: section.get_f32("iou_normalizer", 0.75)?,
+                    ignore_thresh: section.get_f32("ignore_thresh", 0.5)?,
+                    truth_thresh: section.get_f32("truth_thresh", 1.0)?,
+                    iou_thresh: section.get_f32("iou_thresh", 1.0)?,
+                    iou_loss: YoloIouLoss::Mse,
+                    iou_thresh_kind: YoloIouLoss::Iou,
+                    focal_loss: section.get_i64("focal_loss", 0)? != 0,
+                    label_smooth_eps: section.get_f32("label_smooth_eps", 0.0)?,
+                    objectness_smooth: section.get_i64("objectness_smooth", 0)? != 0,
+                    max_delta: section.get_f32("max_delta", f32::MAX)?,
+                    delta_normalizer: section.get_f32("delta_normalizer", 1.0)?,
+                    class_multipliers: None,
+                    class_map: None,
+                },
+                nms_kind,
             })
         }
         "gaussian_yolo" => {
@@ -3600,7 +3637,7 @@ mod tests {
 
     use crate::cfg::ConfigFile;
 
-    use super::{LayerKind, LrPolicy, ModernYoloKind, Network, SegmentationLoss};
+    use super::{LayerKind, LrPolicy, ModernYoloKind, Network, ObbNmsKind, SegmentationLoss};
 
     fn build(text: &str) -> crate::error::Result<Network> {
         Network::from_config(ConfigFile::parse_str("t.cfg", text)?)
@@ -4304,13 +4341,28 @@ mod tests {
         assert_eq!(spec.num, 1);
         assert_eq!(spec.mask, vec![0]);
         assert_eq!(spec.anchors, vec![4.0, 2.0]);
+        assert_eq!(spec.nms_kind, ObbNmsKind::Obb);
         assert_eq!(network.layers[0].output_shape.channels, 8);
+
+        let explicit = Network::from_config(
+            ConfigFile::parse_str(
+                "obb-explicit-nms.cfg",
+                "[net]\nwidth=4\nheight=2\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\nnms_kind=OBB\n",
+            )
+            .expect("explicit OBB NMS cfg parses"),
+        )
+        .expect("case-insensitive obb NMS kind is accepted");
+        assert!(matches!(
+            &explicit.layers[0].kind,
+            LayerKind::ObbYolo(spec) if spec.nms_kind == ObbNmsKind::Obb
+        ));
 
         for cfg in [
             "[net]\nwidth=4\nheight=2\nchannels=8\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\n",
             "[net]\nwidth=4\nheight=2\nchannels=8\nobb=1\n[obb_yolo]\ncoords=5\nclasses=1\nnum=1\nanchors=4,2\n",
             "[net]\nwidth=4\nheight=2\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nmask=1\nanchors=4,2\n",
             "[net]\nwidth=4\nheight=2\nchannels=7\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\n",
+            "[net]\nwidth=4\nheight=2\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\nnms_kind=greedynms\n",
         ] {
             assert!(
                 Network::from_config(

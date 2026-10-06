@@ -7,7 +7,7 @@
 //! `get_yolo_detections()` and NMS helpers.
 
 use crate::error::{Error, Result};
-use crate::model::{LayerKind, Network, YoloSpec};
+use crate::model::{LayerKind, Network, ObbNmsKind, YoloSpec};
 use crate::obb_geometry::{BoxObb, box_obb_iou, carpn_polygon_iou};
 use crate::runtime::{ModernHeadOutput, YoloHeadOutput};
 
@@ -138,6 +138,7 @@ pub fn decode_obb_yolo_detections(
     options: DetectionOptions,
 ) -> Result<Vec<ObbDetection>> {
     let mut detections = Vec::new();
+    let mut nms_kind = None;
     for head in obb_heads {
         let layer = network.layers.get(head.layer_index).ok_or_else(|| {
             Error::InvalidConfig(format!(
@@ -160,6 +161,12 @@ pub fn decode_obb_yolo_detections(
                 head.output.shape.batch
             )));
         }
+        if nms_kind.is_some_and(|kind| kind != spec.nms_kind) {
+            return Err(Error::InvalidConfig(
+                "OBB YOLO heads use different NMS kinds".to_owned(),
+            ));
+        }
+        nms_kind = Some(spec.nms_kind);
         detections.extend(decode_obb_yolo_head(
             &head.output.data,
             head.output.shape.width,
@@ -173,7 +180,9 @@ pub fn decode_obb_yolo_detections(
         )?);
     }
 
-    apply_obb_nms(&mut detections, options.nms_threshold);
+    match nms_kind.unwrap_or(ObbNmsKind::Obb) {
+        ObbNmsKind::Obb => apply_obb_nms(&mut detections, options.nms_threshold),
+    }
     detections.sort_by(|lhs, rhs| {
         rhs.detection
             .confidence

@@ -34,6 +34,11 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v86: added typed `[obb_yolo] nms_kind` parsing with source default `obb`,
+  case-insensitive explicit `obb`, and an explicit error for unwired alternate
+  kinds. The OBB decoder dispatches the configured oriented kind to its
+  orientation-aware NMS; focused OBB tests passed 33/33 and all 456 `darknet-core`
+  library tests passed. No compiled-C++ parity is claimed.
 - v85: added a standalone CPU `detector map` command with optional weights,
   confidence/IoU/NMS thresholds, and letterbox preprocessing. It routes standard
   graphs through `ValidationDataset` and OBB graphs through

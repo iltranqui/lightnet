@@ -241,9 +241,10 @@ Immediately next, in dependency order:
   preserved optional-front labels; v83 adds standalone AP matching for normalized
   legacy front-point OBB detections; v84 adds an OBB validation dataset/evaluation
   API with network decode and normalized orientation-aware scoring; v85 adds a CPU
-  `detector map` CLI route for standard and legacy OBB evaluators. OBB augmentation,
-  truth assignment/losses, NMS-kind cfg wiring, training `-map` cadence integration,
-  and CARPN mAP remain open.
+  `detector map` CLI route for standard and legacy OBB evaluators; v86 adds the
+  source-default oriented `nms_kind=obb` path and rejects unsupported alternatives.
+  OBB augmentation, truth assignment/losses, alternate NMS-kind implementations,
+  training `-map` cadence integration, and CARPN mAP remain open.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and
   kernels, weights order `weights.cpp:428`); then `deform_conv`, `dsconv`,
   `graph_conv`, `wmhf`, `clifford`, `recursive_block`.
