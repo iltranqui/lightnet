@@ -34,6 +34,12 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v68: Added host-reference and native Oxide f32 EML branch-combine forward
+  and backward ops with optional residual, shape checks, exact branch
+  derivatives, and the source-derived nonpositive clamp/epsilon defaults.
+  `MEM=3G PKGS=darknet-cuda ./tools/test_host.sh` passed 12/12; real-device
+  `oxide_layers_extra` passed 24/24. Config/layer/runtime/optimizer wiring and
+  compiled-C++ golden parity remain open.
 - v67: Added `eml_conv_math.rs`, a source-derived pure reference for the
   `[eml_convolutional]` two-branch combine, stable softplus/sigmoid, optional
   residual, and exact default branch gradients. Hand-reference, shape/default,

@@ -525,6 +525,84 @@ pub fn normalize_channels_backward(
     gradient
 }
 
+/// Stable softplus used by the source-derived EML convolution branch.
+fn eml_softplus(x: f32) -> f32 {
+    if x > 20.0 {
+        x
+    } else if x < -20.0 {
+        x.exp()
+    } else {
+        x.exp().ln_1p()
+    }
+}
+
+fn eml_sigmoid(x: f32) -> f32 {
+    if x >= 0.0 {
+        let z = (-x).exp();
+        1.0 / (1.0 + z)
+    } else {
+        let z = x.exp();
+        z / (1.0 + z)
+    }
+}
+
+/// Host reference for the EML convolution's two-branch elementwise combine.
+pub fn eml_convolutional_forward(
+    x_branch: &[f32],
+    self_branch: &[f32],
+    residual: Option<&[f32]>,
+    clamp: f32,
+    eps: f32,
+    scale: f32,
+) -> Vec<f32> {
+    let clamp = if clamp > 0.0 { clamp } else { 4.0 };
+    let eps = if eps > 0.0 { eps } else { 1.0e-6 };
+    assert_eq!(x_branch.len(), self_branch.len(), "EML branch lengths differ");
+    if let Some(residual) = residual {
+        assert_eq!(residual.len(), x_branch.len(), "EML residual length differs");
+    }
+    x_branch
+        .iter()
+        .zip(self_branch)
+        .enumerate()
+        .map(|(i, (&x, &y))| {
+            let clamped = x.max(-clamp).min(clamp);
+            let value = scale * (clamped.exp() - (eml_softplus(y) + eps).ln());
+            value + residual.map_or(0.0, |values| values[i])
+        })
+        .collect()
+}
+
+/// Exact EML branch adjoints. The residual path, when present, is the identity
+/// and therefore receives `delta` unchanged.
+pub fn eml_convolutional_backward(
+    x_branch: &[f32],
+    self_branch: &[f32],
+    delta: &[f32],
+    clamp: f32,
+    eps: f32,
+    scale: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let clamp = if clamp > 0.0 { clamp } else { 4.0 };
+    let eps = if eps > 0.0 { eps } else { 1.0e-6 };
+    assert_eq!(x_branch.len(), self_branch.len(), "EML branch lengths differ");
+    assert_eq!(x_branch.len(), delta.len(), "EML delta length differs");
+    let mut x_gradient = Vec::with_capacity(delta.len());
+    let mut self_gradient = Vec::with_capacity(delta.len());
+    for ((&x, &y), &dout) in x_branch.iter().zip(self_branch).zip(delta) {
+        let dx = if x > -clamp && x < clamp {
+            x.max(-clamp).min(clamp).exp()
+        } else {
+            0.0
+        };
+        let dy = -eml_sigmoid(y) / (eml_softplus(y) + eps);
+        let scaled_delta = dout * scale;
+        x_gradient.push(scaled_delta * dx);
+        self_gradient.push(scaled_delta * dy);
+    }
+    (x_gradient, self_gradient)
+}
+
 fn channel_normalization_len(batch: usize, channels: usize, spatial: usize) -> usize {
     assert!(batch > 0 && channels > 0 && spatial > 0);
     batch
@@ -1155,5 +1233,59 @@ mod linear_tests {
         let x = [1.0f32, 2.0, 3.0, 4.0];
         let out = linear(&x, 4, 1, 1, &[0.5], Some(&[1.0]));
         assert_eq!(out, vec![1.5, 2.0, 2.5, 3.0]);
+    }
+}
+
+#[cfg(test)]
+mod eml_convolutional_tests {
+    use super::*;
+
+    #[test]
+    fn branch_forward_and_backward_match_finite_differences() {
+        let (clamp, eps, scale) = (2.5f32, 1e-4f32, 0.7f32);
+        let x = [-3.2f32, -0.8, 0.4, 3.1];
+        let y = [-25.0f32, -1.3, 0.7, 22.0];
+        let residual = [0.2f32, -0.1, 0.3, 0.5];
+        let delta = [0.4f32, -0.3, 0.8, -0.5];
+        let output = eml_convolutional_forward(&x, &y, Some(&residual), clamp, eps, scale);
+        let no_residual = eml_convolutional_forward(&x, &y, None, clamp, eps, scale);
+        assert_eq!(
+            eml_convolutional_forward(&x, &y, None, 0.0, -1.0, scale),
+            eml_convolutional_forward(&x, &y, None, 4.0, 1e-6, scale),
+            "C++ nonpositive clamp/epsilon fallbacks"
+        );
+        for i in 0..output.len() {
+            assert!((output[i] - no_residual[i] - residual[i]).abs() < 3e-7);
+        }
+        let (dx, dy) = eml_convolutional_backward(&x, &y, &delta, clamp, eps, scale);
+        let loss = |xv: &[f32], yv: &[f32]| {
+            eml_convolutional_forward(xv, yv, Some(&residual), clamp, eps, scale)
+                .iter()
+                .zip(delta)
+                .map(|(value, d)| value * d)
+                .sum::<f32>()
+        };
+        let mut xv = x;
+        let mut yv = y;
+        let h = 1e-3;
+        for i in 0..x.len() {
+            let original = xv[i];
+            xv[i] = original + h;
+            let plus = loss(&xv, &yv);
+            xv[i] = original - h;
+            let minus = loss(&xv, &yv);
+            xv[i] = original;
+            let fd_x = (plus - minus) / (2.0 * h);
+            assert!((dx[i] - fd_x).abs() < 3e-3, "dx[{i}]: {} vs {fd_x}", dx[i]);
+
+            let original = yv[i];
+            yv[i] = original + h;
+            let plus = loss(&xv, &yv);
+            yv[i] = original - h;
+            let minus = loss(&xv, &yv);
+            yv[i] = original;
+            let fd_y = (plus - minus) / (2.0 * h);
+            assert!((dy[i] - fd_y).abs() < 3e-3, "dy[{i}]: {} vs {fd_y}", dy[i]);
+        }
     }
 }

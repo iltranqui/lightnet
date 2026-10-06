@@ -385,6 +385,68 @@ pub trait F32TensorOpsBackend {
         assert_eq!(output_shape.iter().product::<usize>(), gradient.len());
         self.upload_f32(output_shape, &gradient)
     }
+    /// EML convolution's two-branch combine:
+    /// `scale * (exp(clamp(x, -c, c)) - ln(softplus(y) + eps)) + residual`.
+    /// `residual` is optional; when supplied, its flattened extent must match
+    /// both branch tensors. Backends should preserve `output_shape` on the result.
+    fn eml_convolutional_f32(
+        &self,
+        x_branch: &Self::Tensor,
+        self_branch: &Self::Tensor,
+        residual: Option<&Self::Tensor>,
+        output_shape: &[usize],
+        clamp: f32,
+        eps: f32,
+        scale: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let x = self.download_f32(x_branch)?;
+        let y = self.download_f32(self_branch)?;
+        let residual = residual.map(|tensor| self.download_f32(tensor)).transpose()?;
+        let output = host_ops::eml_convolutional_forward(
+            &x,
+            &y,
+            residual.as_deref(),
+            clamp,
+            eps,
+            scale,
+        );
+        assert_eq!(output_shape.iter().product::<usize>(), output.len());
+        self.upload_f32(output_shape, &output)
+    }
+    /// Exact branch adjoints of [`Self::eml_convolutional_f32`]. The identity
+    /// residual gradient is the incoming `output_grad` and needs no separate
+    /// kernel; the caller accumulates it on its residual source.
+    fn eml_convolutional_backward_f32(
+        &self,
+        x_branch: &Self::Tensor,
+        self_branch: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        output_shape: &[usize],
+        clamp: f32,
+        eps: f32,
+        scale: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        let x = self.download_f32(x_branch)?;
+        let y = self.download_f32(self_branch)?;
+        let delta = self.download_f32(output_grad)?;
+        let (x_grad, self_grad) = host_ops::eml_convolutional_backward(
+            &x,
+            &y,
+            &delta,
+            clamp,
+            eps,
+            scale,
+        );
+        assert_eq!(output_shape.iter().product::<usize>(), x_grad.len());
+        Ok((
+            self.upload_f32(output_shape, &x_grad)?,
+            self.upload_f32(output_shape, &self_grad)?,
+        ))
+    }
     /// LSTM gate derivatives for one sequence step. Returns forget/input/
     /// candidate/output gate gradients and the cell gradient carried to the
     /// preceding step. The default is a host reference; device backends should

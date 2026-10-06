@@ -935,6 +935,135 @@ fn channel_normalization_forward_backward_exact_and_cpp_match_reference() {
 }
 
 #[test]
+fn eml_convolutional_branch_ops_match_reference_and_finite_differences() {
+    let be = backend();
+    let shape = [1usize, 1, 2, 2];
+    let x = [-3.2f32, -0.8, 0.4, 3.1];
+    let y = [-25.0f32, -1.3, 0.7, 22.0];
+    let residual = [0.2f32, -0.1, 0.3, 0.5];
+    let delta = [0.4f32, -0.3, 0.8, -0.5];
+    let (clamp, eps, scale) = (2.5f32, 1e-4f32, 0.7f32);
+    let xt = be.upload_f32(&shape, &x).unwrap();
+    let yt = be.upload_f32(&shape, &y).unwrap();
+    let rt = be.upload_f32(&shape, &residual).unwrap();
+    let dt = be.upload_f32(&shape, &delta).unwrap();
+
+    let softplus = |v: f64| {
+        if v > 20.0 {
+            v
+        } else if v < -20.0 {
+            v.exp()
+        } else {
+            v.exp().ln_1p()
+        }
+    };
+    let reference = |xv: &[f64], yv: &[f64], rv: Option<&[f64]>| {
+        xv.iter()
+            .zip(yv)
+            .enumerate()
+            .map(|(i, (&x, &y))| {
+                scale as f64
+                    * (x.clamp(-(clamp as f64), clamp as f64).exp()
+                        - (softplus(y) + eps as f64).ln())
+                    + rv.map_or(0.0, |values| values[i])
+            })
+            .collect::<Vec<_>>()
+    };
+    let output = be
+        .eml_convolutional_f32(&xt, &yt, Some(&rt), &shape, clamp, eps, scale, cfg())
+        .unwrap();
+    assert_eq!(output.shape(), shape);
+    let output_values = be.download_f32(&output).unwrap();
+    assert_close(
+        "oxide EML forward with residual",
+        &output_values,
+        &reference(&f64s(&x), &f64s(&y), Some(&f64s(&residual))),
+    );
+    let no_residual = be
+        .eml_convolutional_f32(&xt, &yt, None, &shape, clamp, eps, scale, cfg())
+        .unwrap();
+    assert_close(
+        "oxide EML forward without residual",
+        &be.download_f32(&no_residual).unwrap(),
+        &reference(&f64s(&x), &f64s(&y), None),
+    );
+    let fallback = be
+        .eml_convolutional_f32(&xt, &yt, None, &shape, 0.0, -1.0, scale, cfg())
+        .unwrap();
+    let explicit_defaults = be
+        .eml_convolutional_f32(&xt, &yt, None, &shape, 4.0, 1e-6, scale, cfg())
+        .unwrap();
+    assert_eq!(
+        be.download_f32(&fallback).unwrap(),
+        be.download_f32(&explicit_defaults).unwrap(),
+        "C++ nonpositive clamp/epsilon fallbacks"
+    );
+
+    let (dx, dy) = be
+        .eml_convolutional_backward_f32(&xt, &yt, &dt, &shape, clamp, eps, scale, cfg())
+        .unwrap();
+    assert_eq!(dx.shape(), shape);
+    assert_eq!(dy.shape(), shape);
+    let dx = be.download_f32(&dx).unwrap();
+    let dy = be.download_f32(&dy).unwrap();
+    let loss = |xv: &[f64], yv: &[f64]| {
+        reference(xv, yv, Some(&f64s(&residual)))
+            .iter()
+            .zip(delta)
+            .map(|(value, d)| value * d as f64)
+            .sum::<f64>()
+    };
+    let mut xv = f64s(&x);
+    let mut yv = f64s(&y);
+    let h = 1e-4;
+    for i in 0..x.len() {
+        let original = xv[i];
+        xv[i] = original + h;
+        let plus = loss(&xv, &yv);
+        xv[i] = original - h;
+        let minus = loss(&xv, &yv);
+        xv[i] = original;
+        let fd_x = ((plus - minus) / (2.0 * h)) as f32;
+        assert!(
+            (dx[i] - fd_x).abs() < 3e-3,
+            "dx[{i}]: {} vs {fd_x}",
+            dx[i]
+        );
+
+        let original = yv[i];
+        yv[i] = original + h;
+        let plus = loss(&xv, &yv);
+        yv[i] = original - h;
+        let minus = loss(&xv, &yv);
+        yv[i] = original;
+        let fd_y = ((plus - minus) / (2.0 * h)) as f32;
+        assert!(
+            (dy[i] - fd_y).abs() < 3e-3,
+            "dy[{i}]: {} vs {fd_y}",
+            dy[i]
+        );
+    }
+    assert!(
+        be.eml_convolutional_f32(&xt, &yt, Some(&rt), &[1, 4], clamp, eps, scale, cfg())
+            .is_err()
+    );
+    let wrong_residual = be.upload_f32(&[4], &residual).unwrap();
+    assert!(
+        be.eml_convolutional_f32(
+            &xt,
+            &yt,
+            Some(&wrong_residual),
+            &shape,
+            clamp,
+            eps,
+            scale,
+            cfg()
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn channel_shuffle_matches_reference_and_inverse_round_trips() {
     let b = backend();
     let mut rng = Rng(77);
