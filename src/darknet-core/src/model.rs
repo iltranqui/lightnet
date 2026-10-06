@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cfg::{ConfigFile, RawSection};
 use crate::error::{Error, Result};
-use darknet_cuda::F32ActivationKind;
+use darknet_cuda::{F32ActivationKind, F32ChannelNormalization};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TensorShape {
@@ -238,6 +238,9 @@ pub enum Activation {
     Lhtan,
     Stair,
     HardMish,
+    NormalizeChannels,
+    NormalizeChannelsSoftmax,
+    NormalizeChannelsSoftmaxMaxval,
     Revleaky,
     Other(String),
 }
@@ -264,6 +267,9 @@ impl Activation {
             "lhtan" => Self::Lhtan,
             "stair" => Self::Stair,
             "hard_mish" => Self::HardMish,
+            "normalize_channels" => Self::NormalizeChannels,
+            "normalize_channels_softmax" => Self::NormalizeChannelsSoftmax,
+            "normalize_channels_softmax_maxval" => Self::NormalizeChannelsSoftmaxMaxval,
             "revleaky" => Self::Revleaky,
             other => Self::Other(other.to_owned()),
         }
@@ -291,7 +297,19 @@ impl Activation {
             Self::Elu => Some(F32ActivationKind::Elu),
             Self::Selu => Some(F32ActivationKind::Selu),
             Self::HardMish => Some(F32ActivationKind::HardMish),
-            Self::Other(_) => None,
+            Self::NormalizeChannels
+            | Self::NormalizeChannelsSoftmax
+            | Self::NormalizeChannelsSoftmaxMaxval
+            | Self::Other(_) => None,
+        }
+    }
+
+    pub fn to_channel_normalization(&self) -> Option<F32ChannelNormalization> {
+        match self {
+            Self::NormalizeChannels => Some(F32ChannelNormalization::Relu),
+            Self::NormalizeChannelsSoftmax => Some(F32ChannelNormalization::Softmax),
+            Self::NormalizeChannelsSoftmaxMaxval => Some(F32ChannelNormalization::SoftmaxMaxval),
+            _ => None,
         }
     }
 }
@@ -1624,16 +1642,31 @@ impl Network {
                 &cfg_parent,
                 net.time_steps,
             )?;
-            if let Some(Activation::Other(name)) = kind.activation() {
-                let hint = if name.starts_with("normalize_channels") {
-                    " (channel-normalising activations need the layer geometry and are not implemented)"
-                } else if name == "eml" {
+            if let Some(activation) = kind.activation()
+                && let Activation::Other(name) = activation
+            {
+                let hint = if name == "eml" {
                     " (eml is only used by [eml_convolutional], which is not implemented)"
                 } else {
                     ""
                 };
                 return Err(Error::InvalidConfig(format!(
                     "[{}] at line {}: unsupported activation \"{name}\"{hint}; C++ would silently use relu",
+                    section.name, section.line
+                )));
+            }
+            let channel_normalization = match &kind {
+                LayerKind::Convolutional(spec) => {
+                    spec.activation.to_channel_normalization().is_some()
+                }
+                LayerKind::Moe(spec) => spec.expert.activation.to_channel_normalization().is_some(),
+                _ => kind
+                    .activation()
+                    .is_some_and(|activation| activation.to_channel_normalization().is_some()),
+            };
+            if channel_normalization && !matches!(&kind, LayerKind::Convolutional(_)) {
+                return Err(Error::InvalidConfig(format!(
+                    "[{}] at line {}: channel-normalizing activations are only supported on [convolutional]",
                     section.name, section.line
                 )));
             }
@@ -3432,7 +3465,7 @@ mod tests {
         ] {
             assert!(build(&cfg(ok)).is_ok(), "{ok} must parse");
         }
-        for bad in ["banana", "normalize_channels", "normalize_channels_softmax", "eml"] {
+        for bad in ["banana", "eml"] {
             let err = build(&cfg(bad)).expect_err(bad).to_string();
             assert!(err.contains(bad) && err.contains("line"), "{err}");
         }

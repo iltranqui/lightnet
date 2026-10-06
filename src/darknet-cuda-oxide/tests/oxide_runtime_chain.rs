@@ -71,6 +71,13 @@ fn assert_chain(cfg: &str, seed_layer: usize, what: &str) {
     let input = patterned(cpu.network.net.input_shape());
     let cpu_fwd = cpu.forward_training(&input).expect("cpu forward");
     let gpu_fwd = gpu.forward_training_with_state(&input).expect("oxide forward");
+    let compact = gpu.forward_compact(&input).expect("oxide compact forward");
+    close(
+        &format!("{what} compact final output"),
+        &cpu_fwd.final_output().expect("CPU output").data,
+        &compact.final_output.expect("compact output").data,
+        1e-4,
+    );
     for (i, (a, b)) in cpu_fwd.layer_outputs.iter().zip(&gpu_fwd.cpu_forward.layer_outputs).enumerate() {
         close(&format!("{what} layer {i} output"), &a.data, &b.data, 1e-4);
     }
@@ -128,9 +135,37 @@ fn chained_conv_activation_stacks_match_cpu_backward() {
         "elu",
         "selu",
         "hard_mish",
+        "normalize_channels",
+        "normalize_channels_softmax",
+        "normalize_channels_softmax_maxval",
     ] {
         assert_chain(&conv_stack(act), 2, act);
     }
+}
+
+#[test]
+fn cpp_channel_normalization_shortcut_matches_cpu_runtime() {
+    assert_chain(
+        r#"
+            [net]
+            width=2
+            height=1
+            channels=2
+            batch=1
+
+            [convolutional]
+            filters=3
+            size=1
+            activation=normalize_channels_softmax
+
+            [convolutional]
+            filters=2
+            size=1
+            activation=normalize_channels
+        "#,
+        1,
+        "cpp NORM_CHAN",
+    );
 }
 
 #[test]

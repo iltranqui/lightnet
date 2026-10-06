@@ -179,6 +179,32 @@ fn unsupported_layers_still_error_cleanly() {
 }
 
 #[test]
+fn channel_normalization_f16_inference_is_explicitly_rejected() {
+    let net = network(
+        r#"
+            [net]
+            width=2
+            height=1
+            channels=2
+            batch=1
+
+            [convolutional]
+            filters=3
+            size=1
+            activation=normalize_channels
+        "#,
+    );
+    let exec = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().unwrap());
+    let error = exec
+        .forward_compact_f16(&input_for(&net, 23))
+        .expect_err("f16 channel normalization is not implemented");
+    assert!(matches!(
+        error,
+        Error::UnsupportedLayer { layer_index: 0, name } if name.contains("NORM_CHAN")
+    ));
+}
+
+#[test]
 fn tiny_net_with_mismatched_shortcut_sources_matches_f32() {
     // source with more channels (cropped) and with fewer (zero padded)
     let cfg = "[net]\nwidth=8\nheight=8\nchannels=2\nbatch=2\n\

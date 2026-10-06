@@ -46,9 +46,10 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
 
 - [~] Analytical gradients everywhere: the C++-shortcut audit is done and
   `DARKNET_GRAD_MODE=analytical|cpp` gates softmax and scale_channels (see
-  `implemented.md` §12). v65 added standalone host/Oxide `NORM_CHAN*` forward
-  and backward primitives with exact default derivatives and C++ CUDA shortcuts;
-  convolution activation/runtime integration and cfg acceptance remain open.
+  `implemented.md` §12). v65 added host/Oxide `NORM_CHAN*` primitives and v66
+  integrated them into convolution CPU/f32-GPU forward/backward, with exact
+  default derivatives and explicit C++ CUDA shortcuts. Other layer types and
+  f16 inference reject these activations; no compiled-C++ golden is available.
   Other parity gaps include conv `reverse`/`deform`. Convolution `grad_centr` matches the C++ BN gate,
   per-filter mean subtraction, and `f_size % 32` skip;
   `gpu_grad_centr_runtime_matches_cpu_and_respects_batchnorm_gate` and
@@ -222,9 +223,9 @@ Immediately next, in dependency order:
 
 - All parsed scalar activations with CPU forward/derivative support now have
   oxide kernels, including `gelu`, `elu`, `selu`, `hard_mish`, `loggy`,
-  `hardtan`, `relie`, `lhtan`, `plse`, and `stair`. Backend f32 primitives for
-  `normalize_channels*` exist, but convolution CPU/GPU integration is incomplete,
-  so those names intentionally remain config errors.
+  `hardtan`, `relie`, `lhtan`, `plse`, and `stair`. `normalize_channels*` is
+  supported on `[convolutional]` for CPU and f32 GPU runtimes; the parser rejects
+  other layer types and f16 inference rejects it explicitly.
 - xnor (74 layers), share_index (54), `new_coords=1` yolo (path looks wrong),
   antialiasing, conv grad clamps / `try_fix_nan` clamps,
   `rewritten_bbox`/`total_bbox` logging.

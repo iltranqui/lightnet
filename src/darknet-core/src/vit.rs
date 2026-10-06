@@ -1128,6 +1128,12 @@ fn tensor_activation(activation: &Activation, x: f32) -> Result<f32, String> {
         Lhtan => crate::activation_math::lhtan(x),
         Stair => crate::activation_math::stair(x),
         HardMish => crate::activation_math::hard_mish(x),
+        NormalizeChannels | NormalizeChannelsSoftmax | NormalizeChannelsSoftmaxMaxval => {
+            return Err(
+                "channel-normalizing activations are only supported on convolutional layers"
+                    .to_owned(),
+            );
+        }
         Other(name) => return Err(format!("unsupported [vit] activation `{name}`")),
     })
 }
@@ -1180,6 +1186,12 @@ fn tensor_activation_grad(activation: &Activation, x: f32, y: f32) -> Result<f32
         Lhtan => crate::activation_math::lhtan_grad(x),
         Stair => crate::activation_math::stair_grad(x),
         HardMish => crate::activation_math::hard_mish_grad(x),
+        NormalizeChannels | NormalizeChannelsSoftmax | NormalizeChannelsSoftmaxMaxval => {
+            return Err(
+                "channel-normalizing activations are only supported on convolutional layers"
+                    .to_owned(),
+            );
+        }
         Other(name) => return Err(format!("unsupported [vit] activation gradient `{name}`")),
     })
 }

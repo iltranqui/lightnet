@@ -31,8 +31,8 @@ use crate::model::{
 };
 use crate::weights::WeightsHeader;
 use darknet_cuda::{
-    AdamParams, AdamUpdateItem, ElementwiseLaunchConfig, F16TensorOpsBackend, F32ActivationKind, F32TensorOpsBackend,
-    NanInfMode, SgdUpdateItem, dropout_unit,
+    AdamParams, AdamUpdateItem, ElementwiseLaunchConfig, F16TensorOpsBackend, F32ActivationKind,
+    F32TensorOpsBackend, NanInfMode, SgdUpdateItem, dropout_unit,
 };
 
 const BATCH_NORM_EPSILON: f32 = 0.000_01;
@@ -3543,8 +3543,15 @@ where
         }
         for layer in &self.network.layers {
             match &layer.kind {
-                LayerKind::Convolutional(_)
-                | LayerKind::MaxPool(_)
+                LayerKind::Convolutional(spec) => {
+                    if spec.activation.to_channel_normalization().is_some() {
+                        return Err(Error::UnsupportedLayer {
+                            layer_index: layer.index,
+                            name: "NORM_CHAN* (f16 inference)".to_owned(),
+                        });
+                    }
+                }
+                LayerKind::MaxPool(_)
                 | LayerKind::LocalAvgPool(_)
                 | LayerKind::AvgPool
                 | LayerKind::BatchNorm(_)
@@ -5733,11 +5740,27 @@ where
                             )
                             .map_err(|err| backend_error("convolution bias add", err))?,
                     };
-                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
                     activation_input_gpu = Some(biased.clone());
-                    self.backend
-                        .activation_f32(&biased, activation, launch_config)
-                        .map_err(|err| backend_error("convolution activation", err))?
+                    if let Some(normalization) = spec.activation.to_channel_normalization() {
+                        self.backend
+                            .normalize_channels_f32(
+                                &biased,
+                                &tensor_backend_shape(layer.output_shape),
+                                layer.output_shape.batch,
+                                layer.output_shape.channels,
+                                layer.output_shape.width * layer.output_shape.height,
+                                normalization,
+                                launch_config,
+                            )
+                            .map_err(|err| {
+                                backend_error("convolution channel normalization", err)
+                            })?
+                    } else {
+                        let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+                        self.backend
+                            .activation_f32(&biased, activation, launch_config)
+                            .map_err(|err| backend_error("convolution activation", err))?
+                    }
                 }
                 (LayerKind::MaxPool(spec), LayerParams::None) => {
                     if spec.depth {
@@ -7107,17 +7130,43 @@ where
                             launch_config,
                         )
                         .map_err(|err| backend_error("convolution", err))?;
-                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
-                    self.backend
-                        .bias_activation_f32(
-                            &conv_output,
-                            &cached.biases,
-                            spec.filters,
-                            layer.output_shape.width * layer.output_shape.height,
-                            activation,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("convolution bias + activation", err))?
+                    if let Some(normalization) = spec.activation.to_channel_normalization() {
+                        let biased = self
+                            .backend
+                            .bias_add_f32(
+                                &conv_output,
+                                &cached.biases,
+                                spec.filters,
+                                layer.output_shape.width * layer.output_shape.height,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("convolution bias add", err))?;
+                        self.backend
+                            .normalize_channels_f32(
+                                &biased,
+                                &tensor_backend_shape(layer.output_shape),
+                                layer.output_shape.batch,
+                                layer.output_shape.channels,
+                                layer.output_shape.width * layer.output_shape.height,
+                                normalization,
+                                launch_config,
+                            )
+                            .map_err(|err| {
+                                backend_error("convolution channel normalization", err)
+                            })?
+                    } else {
+                        let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+                        self.backend
+                            .bias_activation_f32(
+                                &conv_output,
+                                &cached.biases,
+                                spec.filters,
+                                layer.output_shape.width * layer.output_shape.height,
+                                activation,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("convolution bias + activation", err))?
+                    }
                 }
                 (LayerKind::MaxPool(spec), LayerParams::None) => {
                     if spec.depth {
@@ -7593,7 +7642,6 @@ where
                             conv,
                         )?
                     };
-                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
                     let activation_input = forward.gpu_layer_activation_inputs[layer.index]
                         .as_ref()
                         .ok_or_else(|| {
@@ -7612,10 +7660,32 @@ where
                     } else {
                         grad
                     };
-                    let delta = self
-                        .backend
-                        .activation_backward_f32(activation_input, &grad, activation, config)
-                        .map_err(|err| backend_error("GPU convolution activation backward", err))?;
+                    let delta = if let Some(normalization) =
+                        spec.activation.to_channel_normalization()
+                    {
+                        let output = &forward.gpu_layer_outputs[layer.index];
+                        self.backend
+                            .normalize_channels_backward_f32(
+                                activation_input,
+                                output,
+                                &grad,
+                                &tensor_backend_shape(layer.output_shape),
+                                layer.output_shape.batch,
+                                layer.output_shape.channels,
+                                layer.output_shape.width * layer.output_shape.height,
+                                normalization,
+                                GradMode::from_env() == GradMode::Cpp,
+                                config,
+                            )
+                            .map_err(|err| {
+                                backend_error("GPU convolution channel-normalization backward", err)
+                            })?
+                    } else {
+                        let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+                        self.backend
+                            .activation_backward_f32(activation_input, &grad, activation, config)
+                            .map_err(|err| backend_error("GPU convolution activation backward", err))?
+                    };
                     let current_input =
                         if layer.index == 0 {
                             &forward.input_gpu
@@ -12288,6 +12358,32 @@ fn convolution_output_dim(input: usize, padding: usize, size: usize, stride: usi
     (input + padding * 2).saturating_sub(size) / stride + 1
 }
 
+fn apply_convolution_channel_normalization(
+    output: &mut Tensor,
+    activation_input: &Tensor,
+    activation: &Activation,
+) {
+    let Some(normalization) = activation.to_channel_normalization() else {
+        return;
+    };
+    assert_eq!(output.shape, activation_input.shape);
+    output.data = darknet_cuda::host_ops::normalize_channels(
+        &activation_input.data,
+        output.shape.batch,
+        output.shape.channels,
+        output.shape.width * output.shape.height,
+        normalization,
+    );
+}
+
+fn activate_convolution_value(activation: &Activation, value: f32) -> f32 {
+    if activation.to_channel_normalization().is_some() {
+        value
+    } else {
+        activate(activation.clone(), value)
+    }
+}
+
 fn forward_convolutional_with_cache(
     spec: &ConvolutionalSpec,
     params: &ConvolutionalParams,
@@ -12316,12 +12412,13 @@ fn forward_convolutional_with_cache(
             for filter in 0..spec.filters {
                 let biased =
                     normalize_value(0.0, filter, &params.biases, params.batch_norm.as_ref());
-                let activated = activate(spec.activation.clone(), biased);
+                let activated = activate_convolution_value(&spec.activation, biased);
                 let start = b * output.batch_stride() + filter * channel_area;
                 activation_input.data[start..start + channel_area].fill(biased);
                 output.data[start..start + channel_area].fill(activated);
             }
         }
+        apply_convolution_channel_normalization(&mut output, &activation_input, &spec.activation);
         return (output, Some(activation_input));
     }
 
@@ -12362,12 +12459,19 @@ fn forward_convolutional_with_cache(
                     let biased =
                         normalize_value(acc, filter, &params.biases, params.batch_norm.as_ref());
                     activation_input.set(b, filter, oy, ox, biased);
-                    output.set(b, filter, oy, ox, activate(spec.activation.clone(), biased));
+                    output.set(
+                        b,
+                        filter,
+                        oy,
+                        ox,
+                        activate_convolution_value(&spec.activation, biased),
+                    );
                 }
             }
         }
     }
 
+    apply_convolution_channel_normalization(&mut output, &activation_input, &spec.activation);
     (output, Some(activation_input))
 }
 
@@ -17179,13 +17283,41 @@ fn backward_convolutional(
     }
 
     let output = forward_convolutional(spec, params, input, output_shape);
-    let delta = apply_output_activation_gradient(
-        &output,
-        output_gradient,
-        &spec.activation,
-        "convolutional",
-        activation_input,
-    )?;
+    let delta = if let Some(normalization) = spec.activation.to_channel_normalization() {
+        let activation_input = activation_input.ok_or_else(|| {
+            Error::InvalidConfig(
+                "convolutional channel-normalizing backward requires cached pre-activation"
+                    .to_owned(),
+            )
+        })?;
+        if activation_input.shape != output_shape {
+            return Err(Error::InvalidConfig(format!(
+                "convolutional channel-normalization cache shape mismatch: expected {output_shape}, got {}",
+                activation_input.shape
+            )));
+        }
+        Tensor {
+            shape: output_shape,
+            data: darknet_cuda::host_ops::normalize_channels_backward(
+                &activation_input.data,
+                &output.data,
+                &output_gradient.data,
+                output_shape.batch,
+                output_shape.channels,
+                output_shape.width * output_shape.height,
+                normalization,
+                GradMode::from_env() == GradMode::Cpp,
+            ),
+        }
+    } else {
+        apply_output_activation_gradient(
+            &output,
+            output_gradient,
+            &spec.activation,
+            "convolutional",
+            activation_input,
+        )?
+    };
 
     let filters_per_group = spec.filters / spec.groups.max(1);
     let channels_per_group = input.shape.channels / spec.groups.max(1);
@@ -17740,6 +17872,11 @@ fn activation_gradient_from_output(
         // relie / revleaky are leaky-shaped: the output has the sign of the input.
         Activation::Relie => Ok(if output_value > 0.0 { 1.0 } else { 0.01 }),
         Activation::Revleaky => Ok(if output_value > 0.0 { 1.0 } else { 0.1 }),
+        Activation::NormalizeChannels
+        | Activation::NormalizeChannelsSoftmax
+        | Activation::NormalizeChannelsSoftmaxMaxval => Err(Error::InvalidConfig(format!(
+            "{layer_name} channel-normalizing gradient requires the tensor-level convolution path"
+        ))),
         Activation::Other(name) => Err(Error::UnsupportedLayer {
             layer_index: 0,
             name: format!("{layer_name}_{name}_backward"),
@@ -17842,6 +17979,11 @@ fn activate(activation: Activation, value: f32) -> f32 {
             } else {
                 0.1 * value
             }
+        }
+        Activation::NormalizeChannels
+        | Activation::NormalizeChannelsSoftmax
+        | Activation::NormalizeChannelsSoftmaxMaxval => {
+            panic!("channel-normalizing activation requires convolution geometry")
         }
         Activation::Other(_) => value,
     }
@@ -21522,6 +21664,119 @@ mod tests {
             &cpu_params.biases,
             &gpu_params.biases,
             1.0e-6,
+        );
+    }
+
+    #[test]
+    fn fake_gpu_channel_normalizing_convolution_matches_cpu_training() {
+        let cfg = ConfigFile::parse_str(
+            "channel-normalization-conv.cfg",
+            r#"
+                [net]
+                width=2
+                height=1
+                channels=2
+                batch=2
+
+                [convolutional]
+                filters=3
+                size=1
+                activation=normalize_channels_softmax_maxval
+            "#,
+        )
+        .expect("channel-normalization config parses");
+        let network = Network::from_config(cfg).expect("channel-normalization net builds");
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        let weights = vec![0.3, -0.2, -0.1, 0.4, 0.15, -0.25];
+        let biases = vec![-0.3, 0.1, 0.25];
+        for params in [&mut cpu.params[0], &mut gpu.params[0]] {
+            let LayerParams::Convolutional(params) = params else {
+                panic!("expected convolutional parameters");
+            };
+            params.weights.clone_from_slice(&weights);
+            params.biases.clone_from_slice(&biases);
+        }
+
+        let input = Tensor::from_data(
+            cpu.network.net.input_shape(),
+            vec![0.2, -0.7, 1.1, 0.4, -0.3, 0.8, 0.5, 1.3],
+        )
+        .expect("input tensor");
+        let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
+        let gpu_forward = gpu.forward_with_state(&input).expect("FakeBackend forward");
+        let cpu_output = cpu_forward.final_output().expect("CPU output");
+        let gpu_output = gpu_forward.cpu_forward.final_output().expect("GPU output");
+        assert_slice_close(
+            "channel-normalization forward",
+            &cpu_output.data,
+            &gpu_output.data,
+            1e-6,
+        );
+        let seed = Tensor::from_data(
+            cpu_output.shape,
+            (0..cpu_output.len())
+                .map(|i| (i as f32 * 0.37).sin())
+                .collect(),
+        )
+        .expect("output seed");
+
+        cpu.zero_train_buffers();
+        cpu.backward_accumulate(&input, &cpu_forward, &seed)
+            .expect("CPU backward");
+        gpu.zero_train_buffers_gpu().expect("GPU buffers");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &[Some(seed)])
+            .expect("FakeBackend backward");
+        cpu.update_weights(1.0e-3, 0.0, 0.0, cpu.network.net.batch);
+        gpu.update_weights_gpu(1.0e-3, 0.0, 0.0, gpu.network.net.batch)
+            .expect("FakeBackend SGD");
+        let (LayerParams::Convolutional(cpu_params), LayerParams::Convolutional(gpu_params)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("expected convolutional parameters after update");
+        };
+        assert_slice_close(
+            "channel-normalization weight update",
+            &cpu_params.weights,
+            &gpu_params.weights,
+            1e-6,
+        );
+        assert_slice_close(
+            "channel-normalization bias update",
+            &cpu_params.biases,
+            &gpu_params.biases,
+            1e-6,
+        );
+    }
+
+    #[test]
+    fn channel_normalization_activation_is_convolution_only() {
+        for activation in [
+            "normalize_channels",
+            "normalize_channels_softmax",
+            "normalize_channels_softmax_maxval",
+        ] {
+            let cfg = ConfigFile::parse_str(
+                "channel-normalization-activation.cfg",
+                &format!(
+                    "[net]\nwidth=2\nheight=1\nchannels=2\n[convolutional]\nfilters=3\nsize=1\nactivation={activation}\n"
+                ),
+            )
+            .expect("config parses");
+            assert!(
+                Network::from_config(cfg).is_ok(),
+                "{activation} convolution"
+            );
+        }
+        let unsupported = ConfigFile::parse_str(
+            "channel-normalization-activation.cfg",
+            "[net]\nwidth=1\nheight=1\nchannels=2\n[connected]\noutput=2\nactivation=normalize_channels\n",
+        )
+        .expect("config parses");
+        let err = Network::from_config(unsupported).expect_err("connected must reject NORM_CHAN");
+        assert!(
+            err.to_string()
+                .contains("only supported on [convolutional]")
         );
     }
 
