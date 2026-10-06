@@ -232,8 +232,10 @@ Immediately next, in dependency order:
   mAP). v75 adds legacy front-point rectangle geometry; v76 adds standalone
   CARPN convex-quad IoU; v77 adds typed geometry dispatch and an OBB NMS helper;
   v78 adds standalone legacy `[obb_yolo]` six-coordinate per-head decoding with
-  source-derived front-point and integer-letterbox transforms. Cfg/runtime head
-  integration and NMS-kind wiring, rotated labels, losses, and mAP remain open.
+  source-derived front-point and integer-letterbox transforms; v79 adds a
+  standalone five/seven-field OBB label parser preserving the optional front
+  point. Cfg/runtime head integration, batch loading/augmentation, truth
+  assignment/losses, NMS-kind wiring, and mAP remain open.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and
   kernels, weights order `weights.cpp:428`); then `deform_conv`, `dsconv`,
   `graph_conv`, `wmhf`, `clifford`, `recursive_block`.

@@ -34,6 +34,12 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v79: added standalone OBB label-file parsing for five-field box rows and
+  seven-field rows with explicit front points. The parser tracks `has_front`,
+  defaults absent front coordinates to the center placeholder, clamps finite
+  fields to `[0,1]`, and validates class bounds and positive dimensions. The
+  focused OBB suite passed 17/17. This is not `TrainingBatch`, augmentation,
+  truth assignment, OBB loss, or mAP integration; no compiled-C++ parity claim.
 - v78: added a source-derived per-head legacy `[obb_yolo]` decoder for six box
   channels, objectness, class scores, and raw linear front offsets. It handles
   `new_coords`, `scale_x_y`, strict objectness/class thresholds, output
