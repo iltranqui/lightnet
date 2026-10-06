@@ -34,6 +34,12 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v60: BN CRNN backward now uses backend convolution/BPTT ops with rolling-stat
+  affine input/beta derivatives; forward/cache capture, scale-gradient reductions,
+  and optimizer remain host-side. FakeBackend covers three projection blocks,
+  scales, rolling stats, upstream convolution updates, and loss-scale overflow;
+  host CRNN tests passed (3/3), host `rnn` filter (7/7), host LSTM tests (3/3),
+  and full real Oxide `oxide_runtime_chain` passed (17/17).
 - v59: BN LSTM backward now uses backend gate/BPTT and projection operations,
   with rolling-stat affine input/beta derivatives; CPU forward/cache capture and
   optimizer remain host-side, and scale-gradient reductions transfer raw
@@ -234,12 +240,14 @@ Latest increments:
   slicing and input-gradient assembly also stay on-device, with convolution
   parameter gradients accumulated across steps. Recurrent cache/state and
   parameter-gradient transfers, host accumulation/SGD, and some cache handling
-  still cross the host. BN RNN/LSTM backward uses backend projection/BPTT ops
-  and affine input/beta derivatives; scale-gradient reduction transfers raw
-  outputs and deltas to host. Forward/cache capture and optimizer remain
-  host-side. BN CRNN backward still uses CPU fallback. FakeBackend and real-device
-  `oxide_runtime_chain::batch_normalized_rnn_device_backward_matches_cpu_on_oxide`
-  and `oxide_runtime_chain::batch_normalized_lstm_device_backward_matches_cpu_on_oxide`
+  still cross the host. BN RNN/LSTM backward uses backend projection/BPTT ops;
+  BN CRNN backward uses convolution/BPTT ops. All use rolling-stat affine
+  input/beta derivatives; scale-gradient reductions transfer raw values/deltas
+  to host. Recurrent BN forward/cache capture and optimizer remain host-side.
+  FakeBackend and real-device
+  `oxide_runtime_chain::batch_normalized_rnn_device_backward_matches_cpu_on_oxide`,
+  `oxide_runtime_chain::batch_normalized_lstm_device_backward_matches_cpu_on_oxide`,
+  and `oxide_runtime_chain::batch_normalized_crnn_device_backward_matches_cpu_on_oxide`
   compare parameter and rolling-stat updates with CPU, including upstream
   connected/convolution updates. Dynamic loss-scale finiteness checks include
   host-buffered connected/recurrent gradients.

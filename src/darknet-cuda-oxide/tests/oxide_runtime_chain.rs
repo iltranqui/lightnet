@@ -1428,6 +1428,141 @@ fn lstm_no_batch_norm_forward_and_device_backward_match_cpu() {
 }
 
 #[test]
+fn batch_normalized_crnn_device_backward_matches_cpu_on_oxide() {
+    let net = network(
+        "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=2\ntime_steps=2\n\
+         [convolutional]\nfilters=2\nsize=1\nstride=1\nbatch_normalize=0\nactivation=linear\n\
+         [crnn]\nhidden=3\noutput=2\nsize=3\nstride=1\npad=1\nbatch_normalize=1\nactivation=tanh\nshortcut=1\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let LayerParams::Convolutional(input_conv) = &mut cpu.params[0] else {
+        panic!("upstream convolution parameters");
+    };
+    for (index, weight) in input_conv.weights.iter_mut().enumerate() {
+        *weight = 0.04 + index as f32 * 0.013;
+    }
+    input_conv.biases.copy_from_slice(&[0.015, -0.025]);
+    let LayerParams::Crnn(crnn) = &mut cpu.params[1] else {
+        panic!("CRNN parameters");
+    };
+    for (slot, projection) in [&mut crnn.input, &mut crnn.self_params, &mut crnn.output]
+        .into_iter()
+        .enumerate()
+    {
+        for (index, weight) in projection.weights.iter_mut().enumerate() {
+            *weight = 0.03 + (slot * 7 + index) as f32 * 0.005;
+        }
+        for (index, bias) in projection.biases.iter_mut().enumerate() {
+            *bias = (slot as f32 - 1.0) * 0.025 + index as f32 * 0.01;
+        }
+        let bn = projection.batch_norm.as_mut().expect("CRNN BN params");
+        for feature in 0..bn.scales.len() {
+            bn.scales[feature] = 0.7 + feature as f32 * 0.14;
+            bn.rolling_mean[feature] = -0.1 + feature as f32 * 0.06;
+            bn.rolling_variance[feature] = 0.58 + feature as f32 * 0.16;
+        }
+    }
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("oxide backend"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("CRNN BN train buffers");
+    let input = patterned(cpu.network.net.input_shape());
+    let cpu_forward = cpu.forward_training(&input).expect("CPU CRNN BN forward");
+    let gpu_forward = gpu
+        .forward_training_device(&input)
+        .expect("Oxide CRNN BN forward");
+    close(
+        "BN CRNN output",
+        &cpu_forward.layer_outputs[1].data,
+        &gpu_forward.cpu_forward.layer_outputs[1].data,
+        2e-4,
+    );
+    assert!(matches!(
+        gpu_forward.cpu_forward.recurrent_caches.get(1),
+        Some(Some(darknet_core::runtime::RecurrentForwardCache::Crnn(_)))
+    ));
+
+    let output_shape = cpu.network.layers[1].output_shape;
+    let seed = Tensor::from_data(
+        output_shape,
+        (0..output_shape.batch * output_shape.element_count())
+            .map(|index| (index as f32 * 0.37).cos() * 0.6)
+            .collect(),
+    )
+    .expect("CRNN output gradient");
+    let seeds = vec![None, Some(seed)];
+    cpu.zero_train_buffers();
+    gpu.zero_train_buffers_gpu().expect("zero CRNN BN buffers");
+    cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+        .expect("CPU CRNN BN backward");
+    gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+        .expect("Oxide CRNN BN backward");
+    cpu.update_weights(0.02, 0.0, 0.0, 2);
+    gpu.update_weights_gpu(0.02, 0.0, 0.0, 2)
+        .expect("Oxide CRNN BN optimizer step");
+
+    let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(gpu_conv)) =
+        (&cpu.params[0], &gpu.params[0])
+    else {
+        panic!("upstream convolution parameters after update");
+    };
+    close(
+        "BN CRNN upstream weights",
+        &cpu_conv.weights,
+        &gpu_conv.weights,
+        8e-4,
+    );
+    close(
+        "BN CRNN upstream biases",
+        &cpu_conv.biases,
+        &gpu_conv.biases,
+        8e-4,
+    );
+    let (LayerParams::Crnn(cpu_crnn), LayerParams::Crnn(gpu_crnn)) =
+        (&cpu.params[1], &gpu.params[1])
+    else {
+        panic!("CRNN parameters after update");
+    };
+    for (name, cpu_projection, gpu_projection) in [
+        ("input", &cpu_crnn.input, &gpu_crnn.input),
+        ("recurrent", &cpu_crnn.self_params, &gpu_crnn.self_params),
+        ("output", &cpu_crnn.output, &gpu_crnn.output),
+    ] {
+        close(
+            &format!("BN CRNN {name} weights"),
+            &cpu_projection.weights,
+            &gpu_projection.weights,
+            8e-4,
+        );
+        close(
+            &format!("BN CRNN {name} beta"),
+            &cpu_projection.biases,
+            &gpu_projection.biases,
+            8e-4,
+        );
+        let cpu_bn = cpu_projection.batch_norm.as_ref().unwrap();
+        let gpu_bn = gpu_projection.batch_norm.as_ref().unwrap();
+        close(
+            &format!("BN CRNN {name} scales"),
+            &cpu_bn.scales,
+            &gpu_bn.scales,
+            8e-4,
+        );
+        close(
+            &format!("BN CRNN {name} rolling mean"),
+            &cpu_bn.rolling_mean,
+            &gpu_bn.rolling_mean,
+            8e-4,
+        );
+        close(
+            &format!("BN CRNN {name} rolling variance"),
+            &cpu_bn.rolling_variance,
+            &gpu_bn.rolling_variance,
+            8e-4,
+        );
+    }
+}
+
+#[test]
 fn crnn_recurrent_convolutions_and_training_backward_match_cpu() {
     let net = network(
         "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=2\ntime_steps=2\n\
