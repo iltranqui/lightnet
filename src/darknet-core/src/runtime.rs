@@ -6046,9 +6046,6 @@ where
                         .map_err(|err| backend_error("upload deconvolutional output", err))?
                 }
                 (LayerKind::Rnn(spec), LayerParams::Rnn(recurrent)) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download RNN input", err))?;
                     if !spec.batch_normalize
                         && recurrent.input.batch_norm.is_none()
                         && recurrent.self_params.batch_norm.is_none()
@@ -6056,7 +6053,8 @@ where
                     {
                         let (output, cache) = forward_rnn_layer_device(
                             &self.backend,
-                            &host_input,
+                            current_input,
+                            layer.input_shape,
                             spec,
                             recurrent,
                             layer.output_shape,
@@ -6066,6 +6064,9 @@ where
                         recurrent_caches.push(Some(RecurrentForwardCache::Rnn(cache)));
                         output
                     } else {
+                        let host_input = self
+                            .download_tensor(current_input, layer.input_shape)
+                            .map_err(|err| backend_error("download RNN input", err))?;
                         let (host_output, cache) =
                             forward_rnn_layer(spec, recurrent, &host_input, layer.output_shape)?;
                         recurrent_caches.push(Some(RecurrentForwardCache::Rnn(cache)));
@@ -8178,15 +8179,13 @@ where
                             ))
                         })?
                     };
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download RNN backward input", err))?;
                     let (input_gradient, gradients) = backward_rnn_layer_device(
                         &self.backend,
                         spec,
                         params,
                         cache,
-                        &host_input,
+                        current_input,
+                        layer.input_shape,
                         &grad,
                         layer.index,
                         config,
@@ -12005,7 +12004,8 @@ where
 
 fn forward_rnn_layer_device<B: F32TensorOpsBackend>(
     backend: &B,
-    input: &Tensor,
+    input_gpu: &B::Tensor,
+    input_shape: TensorShape,
     spec: &RnnSpec,
     params: &RnnParams,
     output_shape: TensorShape,
@@ -12015,13 +12015,13 @@ fn forward_rnn_layer_device<B: F32TensorOpsBackend>(
 where
     B::Error: std::fmt::Display,
 {
-    let sequence_batch = recurrent_sequence_batch(input.shape.batch, spec.steps)?;
+    let sequence_batch = recurrent_sequence_batch(input_shape.batch, spec.steps)?;
     if output_shape.width != 1 || output_shape.height != 1 || output_shape.channels != spec.output {
         return Err(Error::InvalidConfig(
             "RNN output shape is inconsistent with its specification".to_owned(),
         ));
     }
-    let inputs = input.shape.element_count();
+    let inputs = input_shape.element_count();
     if params.input.weights.len() != inputs * spec.hidden
         || params.self_params.weights.len() != spec.hidden * spec.hidden
         || params.output.weights.len() != spec.hidden * spec.output
@@ -12056,15 +12056,9 @@ where
         2 => gpu_activation_kind(layer_index, &Activation::Loggy)?,
         _ => input_activation,
     };
-    let input_step_shape = TensorShape::new(
-        input.shape.width,
-        input.shape.height,
-        input.shape.channels,
-        sequence_batch,
-    );
     let hidden_shape = TensorShape::new(1, 1, spec.hidden, sequence_batch);
     let output_step_shape = TensorShape::new(1, 1, spec.output, sequence_batch);
-    let mut output = Tensor::zeros(output_shape);
+    let mut output_steps = Vec::with_capacity(spec.steps);
     let mut previous_state = Tensor::zeros(hidden_shape);
     let mut previous_state_gpu = backend
         .zeros_f32(&[sequence_batch, spec.hidden])
@@ -12082,10 +12076,16 @@ where
     };
 
     for step in 0..spec.steps {
-        let step_input = sequence_slice(input, step, sequence_batch, input_step_shape)?;
         let step_input_gpu = backend
-            .upload_f32(&[sequence_batch, inputs], &step_input.data)
-            .map_err(|err| backend_error("upload RNN sequence slice", err))?;
+            .sequence_slice_f32(
+                input_gpu,
+                &tensor_backend_shape(input_shape),
+                step,
+                spec.steps,
+                &[sequence_batch, inputs],
+                config,
+            )
+            .map_err(|err| backend_error("slice RNN input sequence", err))?;
         let input_pre = backend
             .connected_f32(
                 &step_input_gpu,
@@ -12179,7 +12179,7 @@ where
             output_step_shape,
             "download RNN output",
         )?;
-        sequence_write(&mut output, step, sequence_batch, &step_output)?;
+        output_steps.push(step_output_gpu.clone());
 
         cache.input_outputs.push(input_output);
         cache.input_activation_inputs.push(input_activation_input);
@@ -12193,9 +12193,15 @@ where
         previous_state_gpu = state_gpu;
     }
 
+    let output_step_refs: Vec<_> = output_steps.iter().collect();
     let output_gpu = backend
-        .upload_f32(&tensor_backend_shape(output_shape), &output.data)
-        .map_err(|err| backend_error("upload assembled RNN output", err))?;
+        .sequence_concat_f32(
+            &output_step_refs,
+            &tensor_backend_shape(output_shape),
+            sequence_batch * spec.output,
+            config,
+        )
+        .map_err(|err| backend_error("assemble RNN output sequence", err))?;
     Ok((output_gpu, cache))
 }
 
@@ -13228,7 +13234,8 @@ fn backward_rnn_layer_device<B: F32TensorOpsBackend>(
     spec: &RnnSpec,
     params: &RnnParams,
     cache: &RnnForwardCache,
-    input: &Tensor,
+    input_gpu: &B::Tensor,
+    input_shape: TensorShape,
     output_gradient: &B::Tensor,
     layer_index: usize,
     config: ElementwiseLaunchConfig,
@@ -13236,14 +13243,13 @@ fn backward_rnn_layer_device<B: F32TensorOpsBackend>(
 where
     B::Error: std::fmt::Display,
 {
-    let sequence_batch = recurrent_sequence_batch(input.shape.batch, spec.steps)?;
+    let sequence_batch = recurrent_sequence_batch(input_shape.batch, spec.steps)?;
     if cache.sequence_batch != sequence_batch {
         return Err(Error::InvalidConfig(
             "RNN forward cache sequence batch mismatch".to_owned(),
         ));
     }
-    let inputs = input.shape.width * input.shape.height * input.shape.channels;
-    let output_step_shape = TensorShape::new(1, 1, spec.output, sequence_batch);
+    let inputs = input_shape.element_count();
     let weights_valid = params.input.weights.len() == inputs * spec.hidden
         && params.self_params.weights.len() == spec.hidden * spec.hidden
         && params.output.weights.len() == spec.hidden * spec.output;
@@ -13275,21 +13281,10 @@ where
         2 => gpu_activation_kind(layer_index, &Activation::Loggy)?,
         _ => input_activation,
     };
-    let output_gradient_data = backend
-        .download_f32(output_gradient)
-        .map_err(|err| backend_error("download RNN output gradient", err))?;
-    let output_gradient = Tensor::from_data(
-        TensorShape::new(1, 1, spec.output, input.shape.batch),
-        output_gradient_data,
-    )?;
-    let input_step_shape = TensorShape::new(
-        input.shape.width,
-        input.shape.height,
-        input.shape.channels,
-        sequence_batch,
-    );
-    let input_step_len = sequence_batch * inputs;
-    let mut input_gradient_data = vec![0.0; input.shape.batch * inputs];
+    let output_gradient_shape = TensorShape::new(1, 1, spec.output, input_shape.batch);
+    let mut input_gradients: Vec<Option<B::Tensor>> = (0..spec.steps).map(|_| None).collect();
+    let mut weight_gradients: Vec<Option<B::Tensor>> = (0..3).map(|_| None).collect();
+    let mut bias_gradients: Vec<Option<B::Tensor>> = (0..3).map(|_| None).collect();
     let mut future_state_gradient = backend
         .zeros_f32(&[sequence_batch, spec.hidden])
         .map_err(|err| backend_error("allocate RNN backward state gradient", err))?;
@@ -13300,11 +13295,16 @@ where
     };
 
     for step in (0..spec.steps).rev() {
-        let output_gradient_step =
-            sequence_slice(&output_gradient, step, sequence_batch, output_step_shape)?;
         let output_gradient_step_gpu = backend
-            .upload_f32(&[sequence_batch, spec.output], &output_gradient_step.data)
-            .map_err(|err| backend_error("upload RNN output gradient slice", err))?;
+            .sequence_slice_f32(
+                output_gradient,
+                &tensor_backend_shape(output_gradient_shape),
+                step,
+                spec.steps,
+                &[sequence_batch, spec.output],
+                config,
+            )
+            .map_err(|err| backend_error("slice RNN output gradient", err))?;
         let output_activation_input = backend
             .upload_f32(
                 &[sequence_batch, spec.output],
@@ -13333,17 +13333,19 @@ where
                 config,
             )
             .map_err(|err| backend_error("RNN output connected backward", err))?;
-        accumulate_vec(
-            &mut gradients.output.weights,
-            &backend
-                .download_f32(&output_weight_gradient)
-                .map_err(|err| backend_error("download RNN output weight gradient", err))?,
+        accumulate_backend_gradient(
+            backend,
+            &mut weight_gradients[2],
+            output_weight_gradient,
+            config,
+            "accumulate RNN output weight gradient",
         )?;
-        accumulate_vec(
-            &mut gradients.output.biases,
-            &backend
-                .download_f32(&output_bias_gradient)
-                .map_err(|err| backend_error("download RNN output bias gradient", err))?,
+        accumulate_backend_gradient(
+            backend,
+            &mut bias_gradients[2],
+            output_bias_gradient,
+            config,
+            "accumulate RNN output bias gradient",
         )?;
         state_gradient = backend
             .vector_add_f32(&state_gradient, &future_state_gradient, config)
@@ -13380,17 +13382,19 @@ where
                 config,
             )
             .map_err(|err| backend_error("RNN recurrent connected backward", err))?;
-        accumulate_vec(
-            &mut gradients.self_params.weights,
-            &backend
-                .download_f32(&self_weight_gradient)
-                .map_err(|err| backend_error("download RNN recurrent weight gradient", err))?,
+        accumulate_backend_gradient(
+            backend,
+            &mut weight_gradients[1],
+            self_weight_gradient,
+            config,
+            "accumulate RNN recurrent weight gradient",
         )?;
-        accumulate_vec(
-            &mut gradients.self_params.biases,
-            &backend
-                .download_f32(&self_bias_gradient)
-                .map_err(|err| backend_error("download RNN recurrent bias gradient", err))?,
+        accumulate_backend_gradient(
+            backend,
+            &mut bias_gradients[1],
+            self_bias_gradient,
+            config,
+            "accumulate RNN recurrent bias gradient",
         )?;
 
         let input_activation_input = backend
@@ -13407,10 +13411,16 @@ where
                 config,
             )
             .map_err(|err| backend_error("RNN input activation backward", err))?;
-        let step_input = sequence_slice(input, step, sequence_batch, input_step_shape)?;
         let step_input_gpu = backend
-            .upload_f32(&[sequence_batch, inputs], &step_input.data)
-            .map_err(|err| backend_error("upload RNN backward input slice", err))?;
+            .sequence_slice_f32(
+                input_gpu,
+                &tensor_backend_shape(input_shape),
+                step,
+                spec.steps,
+                &[sequence_batch, inputs],
+                config,
+            )
+            .map_err(|err| backend_error("slice RNN input sequence", err))?;
         let (step_input_gradient, input_weight_gradient, input_bias_gradient) = backend
             .connected_backward_f32(
                 &step_input_gpu,
@@ -13422,23 +13432,21 @@ where
                 config,
             )
             .map_err(|err| backend_error("RNN input connected backward", err))?;
-        accumulate_vec(
-            &mut gradients.input.weights,
-            &backend
-                .download_f32(&input_weight_gradient)
-                .map_err(|err| backend_error("download RNN input weight gradient", err))?,
+        accumulate_backend_gradient(
+            backend,
+            &mut weight_gradients[0],
+            input_weight_gradient,
+            config,
+            "accumulate RNN input weight gradient",
         )?;
-        accumulate_vec(
-            &mut gradients.input.biases,
-            &backend
-                .download_f32(&input_bias_gradient)
-                .map_err(|err| backend_error("download RNN input bias gradient", err))?,
+        accumulate_backend_gradient(
+            backend,
+            &mut bias_gradients[0],
+            input_bias_gradient,
+            config,
+            "accumulate RNN input bias gradient",
         )?;
-        let step_input_gradient = backend
-            .download_f32(&step_input_gradient)
-            .map_err(|err| backend_error("download RNN input gradient slice", err))?;
-        let start = step * input_step_len;
-        input_gradient_data[start..start + input_step_len].copy_from_slice(&step_input_gradient);
+        input_gradients[step] = Some(step_input_gradient);
 
         if spec.shortcut {
             future_state = backend
@@ -13448,9 +13456,46 @@ where
         future_state_gradient = future_state;
     }
 
+    let input_gradient_refs: Vec<_> = input_gradients
+        .iter()
+        .map(|gradient| {
+            gradient.as_ref().ok_or_else(|| {
+                Error::InvalidConfig("missing RNN input gradient timestep".to_owned())
+            })
+        })
+        .collect::<Result<_>>()?;
     let input_gradient = backend
-        .upload_f32(&tensor_backend_shape(input.shape), &input_gradient_data)
-        .map_err(|err| backend_error("upload RNN input gradient", err))?;
+        .sequence_concat_f32(
+            &input_gradient_refs,
+            &tensor_backend_shape(input_shape),
+            sequence_batch * inputs,
+            config,
+        )
+        .map_err(|err| backend_error("assemble RNN input gradient", err))?;
+    for index in 0..3 {
+        let weights = backend
+            .download_f32(weight_gradients[index].as_ref().ok_or_else(|| {
+                Error::InvalidConfig("missing accumulated RNN weight gradient".to_owned())
+            })?)
+            .map_err(|err| backend_error("download accumulated RNN weight gradient", err))?;
+        let biases = backend
+            .download_f32(bias_gradients[index].as_ref().ok_or_else(|| {
+                Error::InvalidConfig("missing accumulated RNN bias gradient".to_owned())
+            })?)
+            .map_err(|err| backend_error("download accumulated RNN bias gradient", err))?;
+        let gradient = match index {
+            0 => &mut gradients.input,
+            1 => &mut gradients.self_params,
+            _ => &mut gradients.output,
+        };
+        if weights.len() != gradient.weights.len() || biases.len() != gradient.biases.len() {
+            return Err(Error::InvalidConfig(
+                "accumulated RNN parameter gradient shape mismatch".to_owned(),
+            ));
+        }
+        gradient.weights = weights;
+        gradient.biases = biases;
+    }
     Ok((input_gradient, gradients))
 }
 
