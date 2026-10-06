@@ -115,11 +115,16 @@ Latest increments:
 - Device convolution params support per-owner expert slots for container reuse;
   warm-up and host-update invalidation are covered by the
   `container_convolution_cache_is_keyed_by_owner_and_expert_slot` FakeBackend test.
-  MoE now computes router pooling/logits/top-k softmax, expert convolutions, and
-  per-sample gate blending on Oxide; exact backward/SGD still use the CPU
-  fallback. Router-specific soft/tied top-k parity passes in
-  `oxide_layers_extra` (19/19), and the real-device `oxide_runtime_chain`
-  forward/backward/update suite passes (8/8). Device-native backward remains.
+  MoE computes router pooling/logits/top-k softmax, expert convolutions, and
+  per-sample gate blending on Oxide. No-BN router connected-backward and expert
+  convolution backward now use backend ops; router gate-Jacobian math, cache and
+  gradient transfers, and parameter SGD remain host-side. BN experts stay on the
+  CPU fallback. FakeBackend parity passes, and the real-device
+  `moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu`
+  test compares forward, upstream convolution updates, and router/expert weights
+  with CPU. Router
+  soft/tied top-k parity passes in `oxide_layers_extra` (19/19); full
+  `oxide_runtime_chain` suite passes 8/8.
 - Overlapping-window maxpool backward, including `maxpool_zero_nonmax`, now
   matches central finite differences.
 - No-BN RNN forward and backward now use backend projections, activation

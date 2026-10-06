@@ -115,16 +115,20 @@ Immediately next, in dependency order:
 - [x] Container-conv cache prerequisite: device convolution params are keyed by
   owner layer + expert slot; `warm_device_conv_params` warms each MoE expert,
   and host-updated experts invalidate/re-upload their slots. FakeBackend test
-  covers slot separation and rewarm. Device-side update/BN refresh remains
-  top-level-conv-only until container training leaves the CPU fallback.
-- [~] Phase 2B `moe_convolutional`: real-device forward now computes router
-  pooling, logits, top-k masking, softmax, expert convolutions, and per-sample
-  gate blend on Oxide; exact backward/SGD use the CPU fallback. Verified against
-  CPU in `oxide_runtime_chain::moe_container_experts_run_oxide_forward_and_cpu_training_fallback_matches`
-  and router-specific soft/tied top-k parity coverage in `oxide_layers_extra`.
-  Device-native backward remains open. CPU path is
-  done (`cdf68d00`). `eml_convolutional` not started (save order verified
-  2026-10-05).
+  covers slot separation and rewarm. Device-side parameter update/BN refresh
+  remains top-level-conv-only; container parameter accumulation and SGD remain
+  host-resident.
+- [~] Phase 2B `moe_convolutional`: real-device forward computes router pooling,
+  logits, top-k masking, softmax, expert convolutions, and gate blending. For
+  no-BN experts, router connected-backward and expert convolution backward use
+  backend ops; router softmax/gate derivatives, cache transfers, parameter
+  accumulation, and SGD remain host-side. BN experts still use CPU backward.
+  Verified against CPU in
+  `oxide_runtime_chain::moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu`
+  (including upstream convolution updates) and router-specific soft/tied top-k
+  parity coverage in `oxide_layers_extra`.
+  CPU path is done (`cdf68d00`). `eml_convolutional` not started (save order
+  verified 2026-10-05).
 - [ ] Phase 2B `dcnv3` blocked: no reference numerics (stub in all five branches).
 - [ ] Phase 2C OBB family (unblocked by decision 4; XL — also data loading, NMS,
   mAP).

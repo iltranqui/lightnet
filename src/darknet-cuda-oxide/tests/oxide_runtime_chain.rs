@@ -180,33 +180,41 @@ fn weighted_shortcut_runtime_matches_cpu_forward_backward_and_sgd() {
 }
 
 #[test]
-fn moe_container_experts_run_oxide_forward_and_cpu_training_fallback_matches() {
+fn moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu() {
     let net = network(
-        "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=2\n[moe_convolutional]\nfilters=2\nsize=1\nexperts=3\ntop_k=0\nload_balance=0\ntemperature=1.4\nactivation=leaky\n",
+        "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=2\n\
+         [convolutional]\nfilters=2\nsize=1\nbatch_normalize=0\nactivation=linear\n\
+         [moe_convolutional]\nfilters=2\nsize=1\nbatch_normalize=0\nexperts=3\n\
+         top_k=0\nload_balance=0.05\ntemperature=1.4\nactivation=leaky\n",
     );
     let mut cpu = ExecutableNetwork::new(net.clone());
     let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("oxide backend"));
-    let LayerParams::Moe(moe) = &mut gpu.params[0] else { panic!("MoE parameters") };
-    for (i, weight) in moe.router_weights.iter_mut().enumerate() {
-        *weight = (i as f32 - 2.0) * 0.07;
-    }
-    moe.router_biases.copy_from_slice(&[0.2, -0.1, 0.05]);
-    for (slot, expert) in moe.experts.iter_mut().enumerate() {
-        for (i, weight) in expert.weights.iter_mut().enumerate() {
-            *weight = 0.08 * (1 + slot * 4 + i) as f32;
+    let LayerParams::Convolutional(conv) = &mut gpu.params[0] else { panic!("conv parameters") };
+    conv.weights.copy_from_slice(&[1.0, 0.0, 0.0, 1.0]);
+    conv.biases.copy_from_slice(&[0.0, 0.0]);
+    {
+        let LayerParams::Moe(moe) = &mut gpu.params[1] else { panic!("MoE parameters") };
+        for (i, weight) in moe.router_weights.iter_mut().enumerate() {
+            *weight = (i as f32 - 2.0) * 0.07;
         }
-        expert.biases.copy_from_slice(&[slot as f32 * 0.03, -0.02]);
+        moe.router_biases.copy_from_slice(&[0.2, -0.1, 0.05]);
+        for (slot, expert) in moe.experts.iter_mut().enumerate() {
+            for (i, weight) in expert.weights.iter_mut().enumerate() {
+                *weight = 0.08 * (1 + slot * 4 + i) as f32;
+            }
+            expert.biases.copy_from_slice(&[slot as f32 * 0.03, -0.02]);
+        }
     }
     cpu.params = gpu.params.clone();
     gpu.init_train_buffers_gpu().expect("train buffers");
     let input = patterned(cpu.network.net.input_shape());
     let cpu_fwd = cpu.forward_training(&input).expect("CPU MoE forward");
-    let gpu_fwd = gpu.forward_training_with_state(&input).expect("Oxide MoE forward");
-    let output = gpu.backend.download_f32(&gpu_fwd.gpu_layer_outputs[0]).expect("download MoE output");
-    close("MoE expert blend", &cpu_fwd.layer_outputs[0].data, &output, 1e-4);
-    assert!(gpu_fwd.cpu_forward.moe_caches[0].is_some());
+    let gpu_fwd = gpu.forward_training_device(&input).expect("Oxide MoE forward");
+    let output = gpu.backend.download_f32(&gpu_fwd.gpu_layer_outputs[1]).expect("download MoE output");
+    close("MoE expert blend", &cpu_fwd.layer_outputs[1].data, &output, 1e-4);
+    assert!(gpu_fwd.cpu_forward.moe_caches[1].is_some());
 
-    let shape = cpu.network.layers[0].output_shape;
+    let shape = cpu.network.layers[1].output_shape;
     let seed = Tensor::from_data(
         shape,
         (0..shape.batch * shape.element_count())
@@ -214,16 +222,24 @@ fn moe_container_experts_run_oxide_forward_and_cpu_training_fallback_matches() {
             .collect(),
     )
     .expect("seed");
-    let seeds = vec![Some(seed)];
+    let mut seeds = vec![None; 2];
+    seeds[1] = Some(seed);
     cpu.zero_train_buffers();
     gpu.zero_train_buffers_gpu().expect("zero train buffers");
     cpu.backward_accumulate_seeded(&input, &cpu_fwd, &seeds).expect("CPU MoE backward");
-    gpu.backward_accumulate_seeded_gpu(&gpu_fwd, &seeds).expect("Oxide CPU fallback backward");
+    gpu.backward_accumulate_seeded_gpu(&gpu_fwd, &seeds).expect("Oxide MoE backward");
     cpu.update_weights(0.01, 0.9, 0.001, 2);
-    gpu.update_weights_gpu(0.01, 0.9, 0.001, 2).expect("MoE fallback SGD");
+    gpu.update_weights_gpu(0.01, 0.9, 0.001, 2).expect("MoE SGD");
 
-    let LayerParams::Moe(cpu_moe) = &cpu.params[0] else { unreachable!() };
-    let LayerParams::Moe(gpu_moe) = &gpu.params[0] else { unreachable!() };
+    let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(gpu_conv)) =
+        (&cpu.params[0], &gpu.params[0])
+    else {
+        panic!("conv parameters after MoE backward");
+    };
+    close("preceding conv weights", &cpu_conv.weights, &gpu_conv.weights, 1e-4);
+    close("preceding conv biases", &cpu_conv.biases, &gpu_conv.biases, 1e-4);
+    let LayerParams::Moe(cpu_moe) = &cpu.params[1] else { unreachable!() };
+    let LayerParams::Moe(gpu_moe) = &gpu.params[1] else { unreachable!() };
     close("router weights", &cpu_moe.router_weights, &gpu_moe.router_weights, 1e-5);
     close("router biases", &cpu_moe.router_biases, &gpu_moe.router_biases, 1e-5);
     for (cpu_expert, gpu_expert) in cpu_moe.experts.iter().zip(&gpu_moe.experts) {
