@@ -9040,12 +9040,6 @@ where
             {
                 return true;
             }
-            if let LayerKind::MaxPool(spec) = &layer.kind
-                && spec.zero_nonmax
-            {
-                // No device kernel for the non-argmax zeroing yet.
-                return true;
-            }
             false
         })
     }
@@ -20349,6 +20343,23 @@ mod tests {
                 "input[{index}]: analytic {analytic}, numeric {numeric}"
             );
         }
+    }
+
+    #[test]
+    fn maxpool_zero_nonmax_keeps_gpu_backward_eligible() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "inline.cfg",
+                "[net]\nwidth=3\nheight=3\nchannels=1\nbatch=1\n[convolutional]\nfilters=1\nsize=1\nactivation=linear\n[maxpool]\nsize=2\nstride=1\npadding=0\nmaxpool_zero_nonmax=1\n",
+            )
+            .expect("cfg"),
+        )
+        .expect("network");
+        let gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        assert!(
+            !gpu.requires_cpu_backward_fallback(),
+            "argmax-only maxpool backward already zeroes non-argmax deltas"
+        );
     }
 
     #[test]

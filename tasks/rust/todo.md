@@ -55,7 +55,9 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
   DIoU/CIoU deltas to equal naive finite differences:
   C++ `box_diou` uses `(d/c)^0.6` while `dx_box_iou` supplies the legacy gradient
   of `d/c`; CIoU similarly uses an approximate `alpha` gradient. Overlapping-window
-  maxpool with `maxpool_zero_nonmax` also has finite-difference coverage.
+  maxpool with `maxpool_zero_nonmax` also has finite-difference and real Oxide
+  runtime-chain forward/backward/SGD parity coverage; the argmax-only kernel
+  inherently writes zero gradients to non-argmax inputs.
   Weighted shortcut CPU gradients have finite-difference coverage; GPU input
   and source gradients use backend elementwise multiply/fit operations. Raw
   weight dot products reduce on Oxide and only small per-input/per-slot results

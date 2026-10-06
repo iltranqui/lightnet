@@ -34,6 +34,10 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v57: `[maxpool] maxpool_zero_nonmax=1` now stays on the GPU backward path.
+  The existing kernel writes gradients only for input argmaxes, so non-argmax
+  deltas are already zero. Host maxpool tests passed (8/8); focused real Oxide
+  parity passed (1/1), and the full `oxide_runtime_chain` suite passed (14/14).
 - v56: BN MoE router/expert SGD, including BN scale updates and momentum, now
   runs on-device. Deferred sync preserves the expert cache and copies raw params
   plus BN stats to host. FakeBackend MoE tests passed (21/21); the full real-device
@@ -197,8 +201,9 @@ Latest increments:
   retention. `oxide_layers_extra`
   verifies soft/tied top-k, pool and pool-backward, non-multiple gate-dot
   reductions, and router backward parity with load balancing.
-- Overlapping-window maxpool backward, including `maxpool_zero_nonmax`, now
-  matches central finite differences.
+- Overlapping-window maxpool backward, including `maxpool_zero_nonmax`, matches
+  central finite differences; real-device maxpool forward/backward/SGD parity
+  also passes for `maxpool_zero_nonmax=1`.
 - No-BN RNN and CRNN forward/backward use backend ops: RNN projections and
   CRNN recurrent convolutions, activation gradients, state accumulation, and
   shortcuts. No-BN LSTM forward runs gates/cell products through backend ops,

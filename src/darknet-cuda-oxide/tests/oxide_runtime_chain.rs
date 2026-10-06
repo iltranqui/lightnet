@@ -134,6 +134,72 @@ fn chained_conv_activation_stacks_match_cpu_backward() {
 }
 
 #[test]
+fn maxpool_zero_nonmax_forward_backward_and_sgd_match_cpu() {
+    let net = network(
+        "[net]\nwidth=3\nheight=3\nchannels=1\nbatch=1\n\
+         [convolutional]\nfilters=1\nsize=1\nactivation=linear\n\
+         [maxpool]\nsize=2\nstride=1\npadding=0\nmaxpool_zero_nonmax=1\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let LayerParams::Convolutional(cpu_conv) = &mut cpu.params[0] else {
+        panic!("convolution parameters");
+    };
+    cpu_conv.weights[0] = 1.0;
+    cpu_conv.biases[0] = 0.0;
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("oxide backend"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("device train buffers");
+
+    let input = Tensor::from_data(
+        TensorShape::new(3, 3, 1, 1),
+        vec![1.0, 2.0, 1.0, 0.0, 3.0, 0.0, 1.0, 2.0, 1.0],
+    )
+    .expect("input");
+    let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
+    let gpu_forward = gpu
+        .forward_training_with_state(&input)
+        .expect("Oxide forward");
+    for (index, (cpu_output, gpu_output)) in cpu_forward
+        .layer_outputs
+        .iter()
+        .zip(&gpu_forward.cpu_forward.layer_outputs)
+        .enumerate()
+    {
+        close(
+            &format!("maxpool layer {index} output"),
+            &cpu_output.data,
+            &gpu_output.data,
+            1e-6,
+        );
+    }
+    assert_eq!(cpu_forward.layer_outputs[1].data, vec![3.0, 3.0, 3.0, 3.0]);
+
+    let seed = Tensor::from_data(TensorShape::new(2, 2, 1, 1), vec![1.0, 2.0, 3.0, 4.0])
+        .expect("maxpool seed");
+    let mut seeds = vec![None; 2];
+    seeds[1] = Some(seed);
+    cpu.zero_train_buffers();
+    gpu.zero_train_buffers_gpu().expect("zero device buffers");
+    cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+        .expect("CPU backward");
+    gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+        .expect("Oxide backward");
+    cpu.update_weights(1.0, 0.0, 0.0, 1);
+    gpu.update_weights_gpu(1.0, 0.0, 0.0, 1)
+        .expect("Oxide SGD");
+
+    let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(gpu_conv)) =
+        (&cpu.params[0], &gpu.params[0])
+    else {
+        panic!("updated convolution parameters");
+    };
+    close("maxpool zero_nonmax conv weights", &cpu_conv.weights, &gpu_conv.weights, 1e-6);
+    close("maxpool zero_nonmax conv biases", &cpu_conv.biases, &gpu_conv.biases, 1e-6);
+    assert_eq!(cpu_conv.weights, vec![31.0]);
+    assert_eq!(cpu_conv.biases, vec![10.0]);
+}
+
+#[test]
 fn weighted_shortcut_runtime_matches_cpu_forward_backward_and_sgd() {
     let net = network(
         "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=2\n\
