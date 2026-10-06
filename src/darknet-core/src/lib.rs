@@ -51,6 +51,7 @@ pub mod model;
 pub(crate) mod maxpool_depth;
 pub mod modern_yolo;
 pub mod names;
+pub mod obb_geometry;
 pub(crate) mod omd_loss;
 pub mod runtime;
 pub(crate) mod segmentation;

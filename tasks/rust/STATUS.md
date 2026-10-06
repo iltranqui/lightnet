@@ -34,6 +34,13 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v75: added host-only vertices and convex IoU for legacy front-point OBB rectangles,
+  with source-ordered corners and explicit invalid-geometry behavior. The focused
+  `MEM=3G PKGS=darknet-core ./tools/test_host.sh obb_geometry` tests pass 3/3,
+  covering rotated/partial overlaps, containment, disjoint boxes, and malformed
+  inputs. This is only a geometry prerequisite: OBB cfg/layer/data loading,
+  CARPN explicit polygons, losses, NMS, and mAP remain open. No compiled-C++
+  golden or parity claim is available.
 - v74: EML Adam now applies both convolution branches and BN scales on-device,
   retains per-branch moments, and supports deferred host synchronization. Adam
   moments are persisted in additive DNOPT5 sidecars while DNOPT1–4 remain

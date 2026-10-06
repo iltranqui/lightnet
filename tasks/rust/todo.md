@@ -229,7 +229,8 @@ Immediately next, in dependency order:
   claimed.
 - [ ] Phase 2B `dcnv3` blocked: no reference numerics (stub in all five branches).
 - [ ] Phase 2C OBB family (unblocked by decision 4; XL — also data loading, NMS,
-  mAP).
+  mAP). v75 adds only legacy front-point rectangle vertices and IoU geometry;
+  cfg/layer integration, rotated labels, CARPN polygons, losses, NMS, and mAP remain.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and
   kernels, weights order `weights.cpp:428`); then `deform_conv`, `dsconv`,
   `graph_conv`, `wmhf`, `clifford`, `recursive_block`.
