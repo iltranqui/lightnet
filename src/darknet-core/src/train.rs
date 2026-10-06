@@ -2262,6 +2262,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn yolo_diou_and_ciou_deltas_match_the_legacy_cpp_formula() {
+        // Keep the prediction strictly inside the target: the enclosing box is
+        // fixed by truth, making C++ box.cpp's centre/aspect contributions
+        // independently hand-checkable without crossing min/max boundaries.
+        let predicted = YoloBox {
+            x: 0.48,
+            y: 0.47,
+            w: 0.25,
+            h: 0.20,
+        };
+        let truth = YoloBox {
+            x: 0.50,
+            y: 0.50,
+            w: 0.80,
+            h: 0.70,
+        };
+        let enclosing_c = truth.w * truth.w + truth.h * truth.h;
+        let iou = dx_box_iou(predicted, truth, YoloIouLoss::Iou);
+        let center_x = 2.0 * (truth.x - predicted.x) / enclosing_c;
+        let center_y = 2.0 * (truth.y - predicted.y) / enclosing_c;
+
+        // C++ box.cpp's DIOU branch differentiates d/c in dx_box_iou even
+        // though box_diou's forward score uses pow(d/c, 0.6).
+        let diou = dx_box_iou(predicted, truth, YoloIouLoss::Diou);
+        assert!((diou.dx - (iou.dx + center_x)).abs() < 1e-6);
+        assert!((diou.dy - (iou.dy + center_y)).abs() < 1e-6);
+        assert!((diou.dw - iou.dw).abs() < 1e-6);
+        assert!((diou.dh - iou.dh).abs() < 1e-6);
+
+        // C++ CIOU adds the same legacy centre derivative and alpha * d(ar_loss)
+        // to the IoU derivative; alpha itself is not differentiated.
+        let iou_score = bbox_iou_kind(predicted, truth, YoloIouLoss::Iou);
+        let ar_gt = truth.w / truth.h;
+        let ar_pred = predicted.w / predicted.h;
+        let ar_diff = ar_gt.atan() - ar_pred.atan();
+        let ar_loss = 4.0 / (std::f32::consts::PI * std::f32::consts::PI) * ar_diff.powi(2);
+        let alpha = ar_loss / (1.0 - iou_score + ar_loss + 1e-6);
+        let ar_dw = 8.0 / (std::f32::consts::PI * std::f32::consts::PI) * ar_diff * predicted.h;
+        let ar_dh = -8.0 / (std::f32::consts::PI * std::f32::consts::PI) * ar_diff * predicted.w;
+        let ciou = dx_box_iou(predicted, truth, YoloIouLoss::Ciou);
+        assert!((ciou.dx - (iou.dx + center_x)).abs() < 1e-6);
+        assert!((ciou.dy - (iou.dy + center_y)).abs() < 1e-6);
+        assert!((ciou.dw - (iou.dw + alpha * ar_dw)).abs() < 1e-6);
+        assert!((ciou.dh - (iou.dh + alpha * ar_dh)).abs() < 1e-6);
+    }
+
     /// C++ cost (yolo_layer.cpp:1062-1120), hand computed. 1 anchor, 1 class (6 entries),
     /// deltas box (.3,.4,.5,.6), obj .2, cls -.1; count 2, tot(1-iou) .6, tot(1-giou) 1.0,
     /// iou_normalizer .5, obj_normalizer 2.
