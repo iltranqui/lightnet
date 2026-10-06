@@ -40,7 +40,9 @@ Latest increments:
   gate, and cell caches, and concatenates timestep outputs directly on-device.
   LSTM and RNN forward/backward sequence slicing and timestep input-gradient
   assembly stay on-device; RNN projection gradients also accumulate on-device
-  across steps. CRNN forward input slicing and output assembly also stay
+  across steps, and its no-BN training pre-activation/state caches now remain
+  device-resident for backward (the host cache is captured only for host-facing
+  forwards). CRNN forward input slicing and output assembly also stay
   on-device. CRNN backward sequence slicing and input-gradient assembly also
   stay on-device; convolution parameter gradients accumulate on-device across
   steps. Recurrent cache/state and parameter-gradient transfers, host
