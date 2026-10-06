@@ -18,6 +18,7 @@ pub const ACT_ELU: u32 = 10;
 pub const ACT_SELU: u32 = 11;
 pub const ACT_HARD_MISH: u32 = 12;
 pub const ACT_LOGGY: u32 = 13;
+pub const ACT_HARDTAN: u32 = 14;
 
 #[device]
 pub fn activate(kind: u32, x: f32) -> f32 {
@@ -58,6 +59,14 @@ pub fn activate(kind: u32, x: f32) -> f32 {
         }
     } else if kind == 13 {
         2.0 / (1.0 + (-x).exp()) - 1.0
+    } else if kind == 14 {
+        if x < -1.0 {
+            -1.0
+        } else if x > 1.0 {
+            1.0
+        } else {
+            x
+        }
     } else {
         x
     }
@@ -117,6 +126,12 @@ pub fn gradient(kind: u32, x: f32) -> f32 {
     } else if kind == 13 {
         let sigmoid = 1.0 / (1.0 + (-x).exp());
         2.0 * sigmoid * (1.0 - sigmoid)
+    } else if kind == 14 {
+        if x > -1.0 && x < 1.0 {
+            1.0
+        } else {
+            0.0
+        }
     } else {
         1.0
     }

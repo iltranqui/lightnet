@@ -34,6 +34,12 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- Added an oxide HardTanh kernel with Darknet's inclusive clamp and zero
+  derivative at exactly -1 and 1. Verified by `oxide_parity` (11 passed,
+  including finite differences and endpoint parity), `oxide_half` (13 passed, 1
+  ignored), all 13 `oxide_cfg_shapes` tests (171 convolution-activation pairs),
+  the real-device chained-convolution activation test, the 391-test core
+  library suite, and a no-run build of every oxide test target.
 - Added an oxide loggy activation kernel and exact derivative, wiring it through
   cfg parsing, f32/f16 convolution activation paths, and the real-device runtime.
   Verified by `oxide_parity` (11 passed, including finite differences and

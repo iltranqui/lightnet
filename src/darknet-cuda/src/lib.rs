@@ -15,6 +15,8 @@ pub enum F32ActivationKind {
     Linear,
     /// Darknet loggy: `2 * logistic(x) - 1`.
     Loggy,
+    /// Hard tanh, clamped to `[-1, 1]` with zero gradient at the endpoints.
+    Hardtan,
     Logistic,
     Relu,
     Leaky,

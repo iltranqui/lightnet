@@ -15294,6 +15294,7 @@ mod tests {
         let activation = match activation {
             F32ActivationKind::Linear => Activation::Linear,
             F32ActivationKind::Loggy => Activation::Loggy,
+            F32ActivationKind::Hardtan => Activation::Hardtan,
             F32ActivationKind::Logistic => Activation::Logistic,
             F32ActivationKind::Relu => Activation::Relu,
             F32ActivationKind::Leaky => Activation::Leaky,
@@ -15314,6 +15315,7 @@ mod tests {
         match activation {
             F32ActivationKind::Linear => 1.0,
             F32ActivationKind::Loggy => crate::activation_math::loggy_grad(value),
+            F32ActivationKind::Hardtan => crate::activation_math::hardtan_grad(value),
             F32ActivationKind::Logistic => {
                 let sigmoid = 1.0 / (1.0 + (-value).exp());
                 sigmoid * (1.0 - sigmoid)
@@ -17874,6 +17876,10 @@ mod tests {
         assert_eq!(
             Activation::Loggy.to_cuda_f32_kind(),
             Some(F32ActivationKind::Loggy)
+        );
+        assert_eq!(
+            Activation::Hardtan.to_cuda_f32_kind(),
+            Some(F32ActivationKind::Hardtan)
         );
         assert_eq!(
             Activation::Elu.to_cuda_f32_kind(),
@@ -20675,6 +20681,7 @@ mod tests {
         for act in [
             "leaky",
             "loggy",
+            "hardtan",
             "relu6",
             "ramp",
             "mish",

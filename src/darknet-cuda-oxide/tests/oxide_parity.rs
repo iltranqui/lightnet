@@ -42,9 +42,10 @@ fn assert_close(name: &str, got: &[f32], want: &[f32]) {
     }
 }
 
-const KINDS: [F32ActivationKind; 14] = [
+const KINDS: [F32ActivationKind; 15] = [
     F32ActivationKind::Linear,
     F32ActivationKind::Loggy,
+    F32ActivationKind::Hardtan,
     F32ActivationKind::Logistic,
     F32ActivationKind::Relu,
     F32ActivationKind::Leaky,
@@ -63,6 +64,7 @@ fn cpu_activate(kind: F32ActivationKind, x: f32) -> f32 {
     match kind {
         F32ActivationKind::Linear => x,
         F32ActivationKind::Loggy => 2.0 / (1.0 + (-x).exp()) - 1.0,
+        F32ActivationKind::Hardtan => x.clamp(-1.0, 1.0),
         F32ActivationKind::Logistic => 1.0 / (1.0 + (-x).exp()),
         F32ActivationKind::Relu => x.max(0.0),
         F32ActivationKind::Leaky => {
@@ -111,6 +113,7 @@ fn cpu_gradient(kind: F32ActivationKind, x: f32) -> f32 {
             let sigmoid = 1.0 / (1.0 + (-x).exp());
             2.0 * sigmoid * (1.0 - sigmoid)
         }
+        F32ActivationKind::Hardtan => (x > -1.0 && x < 1.0) as i32 as f32,
         F32ActivationKind::Logistic => {
             let s = 1.0 / (1.0 + (-x).exp());
             s * (1.0 - s)
@@ -205,6 +208,8 @@ fn activations_forward_and_backward() {
     x[4] = 5.999;
     x[5] = 6.001;
     x[6] = -2.0; // HardMish lower transition boundary.
+    x[7] = -1.0; // Hardtan lower clamp boundary.
+    x[8] = 1.0; // Hardtan upper clamp boundary.
     let delta = rng.vec(n, -2.0, 2.0);
     let xt = b.upload_f32(&[n], &x).unwrap();
     let dt = b.upload_f32(&[n], &delta).unwrap();
@@ -389,6 +394,7 @@ fn act64(kind: F32ActivationKind, x: f64) -> f64 {
     match kind {
         F32ActivationKind::Linear => x,
         F32ActivationKind::Loggy => 2.0 / (1.0 + (-x).exp()) - 1.0,
+        F32ActivationKind::Hardtan => x.clamp(-1.0, 1.0),
         F32ActivationKind::Logistic => 1.0 / (1.0 + (-x).exp()),
         F32ActivationKind::Relu => x.max(0.0),
         F32ActivationKind::Leaky => {
@@ -474,12 +480,15 @@ fn activation_backward_input_form_equals_core_output_form() {
     let n = 777;
     let mut x = rng.vec(n, -5.0, 5.0);
     x[0] = 0.0;
+    x[1] = -1.0;
+    x[2] = 1.0;
     let delta = rng.vec(n, -1.0, 1.0);
     let xt = b.upload_f32(&[n], &x).unwrap();
     let dt = b.upload_f32(&[n], &delta).unwrap();
     for kind in [
         F32ActivationKind::Linear,
         F32ActivationKind::Loggy,
+        F32ActivationKind::Hardtan,
         F32ActivationKind::Logistic,
         F32ActivationKind::Relu,
         F32ActivationKind::Leaky,
@@ -499,6 +508,7 @@ fn activation_backward_input_form_equals_core_output_form() {
                 let g = match kind {
                     F32ActivationKind::Linear => 1.0,
                     F32ActivationKind::Loggy => 0.5 * (1.0 - y * y),
+                    F32ActivationKind::Hardtan => (y > -1.0 && y < 1.0) as i32 as f32,
                     F32ActivationKind::Logistic => y * (1.0 - y),
                     F32ActivationKind::Relu => (y > 0.0) as i32 as f32,
                     F32ActivationKind::Leaky => {
