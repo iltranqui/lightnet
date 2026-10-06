@@ -3,7 +3,8 @@ use crate::obb_geometry::{BoxObb, box_obb_iou};
 use crate::{
     DataConfig, Detection, DetectionBox, DetectionOptions, Error, LayerKind, Network, ObbDetection,
     ObbDetectionGeometry, ObbLabel, PlanarRgbImage, Result, Tensor, YoloHeadOutput, YoloLabel,
-    decode_yolo_detections, load_paths_file, load_yolo_labels, replace_image_to_label,
+    decode_obb_yolo_detections, decode_yolo_detections, load_obb_labels, load_paths_file,
+    load_yolo_labels, replace_image_to_label,
 };
 use std::path::PathBuf;
 
@@ -117,20 +118,7 @@ impl ValidationDataset {
         iou_threshold: f32,
         mut infer: impl FnMut(&Tensor) -> Result<Vec<YoloHeadOutput>>,
     ) -> Result<MapReport> {
-        if network.net.batch != 1 {
-            return Err(invalid("validation requires a batch-one network"));
-        }
-        if self.classes == 0 || !iou_threshold.is_finite() || !(0.0..=1.0).contains(&iou_threshold)
-        {
-            return Err(invalid("invalid mAP class count or IoU threshold"));
-        }
-        if !options.confidence_threshold.is_finite()
-            || !(0.0..=1.0).contains(&options.confidence_threshold)
-            || !options.nms_threshold.is_finite()
-            || !(0.0..=1.0).contains(&options.nms_threshold)
-        {
-            return Err(invalid("invalid validation confidence/NMS threshold"));
-        }
+        validate_validation_options(network, self.classes, options, iou_threshold)?;
         let mut samples = Vec::with_capacity(self.images.len());
         for (path, labels) in &self.images {
             let image = PlanarRgbImage::load(path)?;
@@ -160,6 +148,159 @@ impl ValidationDataset {
         detector_map(&samples, self.classes, iou_threshold)
     }
 }
+
+/// OBB validation paths and labels, preflighted before evaluation starts.
+pub struct ObbValidationDataset {
+    pub classes: usize,
+    pub images: Vec<(PathBuf, Vec<ObbLabel>)>,
+}
+
+impl ObbValidationDataset {
+    pub fn from_data(network: &Network, data: &DataConfig) -> Result<Self> {
+        let classes = obb_validation_classes(network)?;
+        if data.classes.is_some_and(|configured| configured != classes) {
+            return Err(invalid(
+                "-map class counts must agree in OBB cfg heads and data",
+            ));
+        }
+        let valid = data
+            .valid
+            .as_ref()
+            .ok_or_else(|| invalid("-map requires valid= in the data file"))?;
+        let paths = load_paths_file(valid)?;
+        if paths.is_empty() {
+            return Err(invalid("-map validation list is empty"));
+        }
+
+        let mut images = Vec::with_capacity(paths.len());
+        for path in paths {
+            if !path.is_file() {
+                return Err(invalid(&format!(
+                    "missing validation image {}",
+                    path.display()
+                )));
+            }
+            let labels = load_obb_labels(replace_image_to_label(&path), Some(classes))?;
+            images.push((path, labels));
+        }
+        Ok(Self { classes, images })
+    }
+
+    /// Evaluate with current parameters and exactly one inference callback per
+    /// image. Predictions are normalized before orientation-aware AP matching.
+    pub fn evaluate(
+        &self,
+        network: &Network,
+        options: DetectionOptions,
+        iou_threshold: f32,
+        mut infer: impl FnMut(&Tensor) -> Result<Vec<YoloHeadOutput>>,
+    ) -> Result<MapReport> {
+        validate_validation_options(network, self.classes, options, iou_threshold)?;
+        if obb_validation_classes(network)? != self.classes {
+            return Err(invalid(
+                "validation dataset class count does not match the OBB network",
+            ));
+        }
+
+        let mut samples = Vec::with_capacity(self.images.len());
+        for (path, labels) in &self.images {
+            let image = PlanarRgbImage::load(path)?;
+            let prepared = if options.letterbox {
+                image.letterbox(network.net.width, network.net.height)?
+            } else {
+                image.resize_linear_exact(network.net.width, network.net.height)?
+            };
+            let input = Tensor::from_data(prepared.shape, prepared.data)?;
+            let heads = infer(&input)?;
+            let mut detections = decode_obb_yolo_detections(
+                network,
+                &heads,
+                image.shape.width,
+                image.shape.height,
+                options,
+            )?;
+            for detection in &mut detections {
+                let bbox = &mut detection.detection.bbox;
+                bbox.x /= image.shape.width as f32;
+                bbox.w /= image.shape.width as f32;
+                bbox.y /= image.shape.height as f32;
+                bbox.h /= image.shape.height as f32;
+                match &mut detection.geometry {
+                    ObbDetectionGeometry::FrontPoint { x, y } => {
+                        *x /= image.shape.width as f32;
+                        *y /= image.shape.height as f32;
+                    }
+                    ObbDetectionGeometry::CarpnQuad(vertices) => {
+                        for point in vertices.chunks_exact_mut(2) {
+                            point[0] /= image.shape.width as f32;
+                            point[1] /= image.shape.height as f32;
+                        }
+                    }
+                }
+            }
+            samples.push((labels.clone(), detections));
+        }
+        obb_detector_map(&samples, self.classes, iou_threshold)
+    }
+}
+
+fn obb_validation_classes(network: &Network) -> Result<usize> {
+    if !network.net.obb {
+        return Err(invalid("OBB validation requires [net] obb=1"));
+    }
+
+    let mut classes = None;
+    for layer in &network.layers {
+        match &layer.kind {
+            LayerKind::ObbYolo(spec) => {
+                if classes.is_some_and(|expected| expected != spec.classes) {
+                    return Err(invalid("OBB validation head class counts do not agree"));
+                }
+                classes = Some(spec.classes);
+            }
+            LayerKind::Yolo(_)
+            | LayerKind::GaussianYolo(_)
+            | LayerKind::Region(_)
+            | LayerKind::Yolox(_)
+            | LayerKind::Ppyoloe(_)
+            | LayerKind::Yolonas(_)
+            | LayerKind::CenterNet(_)
+            | LayerKind::Detection(_) => {
+                return Err(invalid(
+                    "OBB validation requires an OBB-only detector graph",
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    classes
+        .filter(|classes| *classes > 0)
+        .ok_or_else(|| invalid("OBB validation requires at least one [obb_yolo] head"))
+}
+
+fn validate_validation_options(
+    network: &Network,
+    classes: usize,
+    options: DetectionOptions,
+    iou_threshold: f32,
+) -> Result<()> {
+    if network.net.batch != 1 {
+        return Err(invalid("validation requires a batch-one network"));
+    }
+    if classes == 0 || !iou_threshold.is_finite() || !(0.0..=1.0).contains(&iou_threshold) {
+        return Err(invalid("invalid mAP class count or IoU threshold"));
+    }
+    if !options.confidence_threshold.is_finite()
+        || !(0.0..=1.0).contains(&options.confidence_threshold)
+        || !options.nms_threshold.is_finite()
+        || !(0.0..=1.0).contains(&options.nms_threshold)
+    {
+        return Err(invalid("invalid validation confidence/NMS threshold"));
+    }
+    Ok(())
+}
+
 fn invalid(message: &str) -> Error {
     Error::InvalidConfig(message.into())
 }
@@ -419,6 +560,115 @@ mod tests {
                 y: front[1],
             },
         }
+    }
+
+    fn obb_validation_network(classes: usize, batch: usize) -> Network {
+        let cfg = crate::cfg::ConfigFile::parse_str(
+            "obb-validation.cfg",
+            &format!(
+                "[net]\nwidth=2\nheight=2\nchannels=3\nbatch={batch}\nobb=1\n[convolutional]\nfilters={}\nsize=1\nstride=1\nactivation=linear\n[obb_yolo]\nclasses={classes}\nnum=1\nanchors=1,1\n",
+                classes + 7
+            ),
+        )
+        .expect("OBB validation cfg parses");
+        Network::from_config(cfg).expect("OBB validation graph builds")
+    }
+
+    #[test]
+    fn obb_validation_dataset_runs_one_decode_per_image_and_normalizes_predictions() {
+        let dir =
+            std::env::temp_dir().join(format!("darknet-obb-validation-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        for name in ["a", "b"] {
+            std::fs::write(
+                dir.join(format!("{name}.ppm")),
+                b"P6\n2 2\n255\n\x80\x40\x20\x80\x40\x20\x80\x40\x20\x80\x40\x20",
+            )
+            .expect("validation image writes");
+            std::fs::write(
+                dir.join(format!("{name}.txt")),
+                "0 0.25 0.25 0.5 0.5 0.25 0.375\n",
+            )
+            .expect("OBB validation label writes");
+        }
+        std::fs::write(dir.join("valid.txt"), "a.ppm\nb.ppm\n").expect("validation list writes");
+        std::fs::write(dir.join("sample.data"), "classes=1\nvalid=valid.txt\n")
+            .expect("data cfg writes");
+
+        let network = obb_validation_network(1, 1);
+        let data = DataConfig::from_path(dir.join("sample.data")).expect("data cfg parses");
+        let dataset = ObbValidationDataset::from_data(&network, &data)
+            .expect("OBB validation dataset preflights");
+        assert_eq!(dataset.classes, 1);
+        assert_eq!(dataset.images.len(), 2);
+        assert!(dataset.images[0].1[0].has_front);
+
+        let mut calls = 0;
+        let report = dataset
+            .evaluate(
+                &network,
+                DetectionOptions {
+                    confidence_threshold: 0.3,
+                    nms_threshold: 0.45,
+                    letterbox: false,
+                },
+                0.5,
+                |input| {
+                    calls += 1;
+                    assert_eq!(input.shape, crate::TensorShape::new(2, 2, 3, 1));
+                    let stride = 4;
+                    let mut output = vec![0.0; 8 * stride];
+                    output[4 * stride] = 0.5;
+                    output[5 * stride] = 0.75;
+                    output[6 * stride] = 2.0;
+                    output[7 * stride] = 2.0;
+                    Ok(vec![YoloHeadOutput {
+                        layer_index: 1,
+                        output: Tensor::from_data(crate::TensorShape::new(2, 2, 8, 1), output)?,
+                    }])
+                },
+            )
+            .expect("OBB validation evaluates");
+        assert_eq!(calls, 2);
+        assert_eq!(report.mean_average_precision, 1.0);
+        assert_eq!(report.ground_truth_counts, vec![2]);
+        assert_eq!(report.detection_counts, vec![2]);
+        std::fs::remove_dir_all(dir).expect("temporary validation data is removed");
+    }
+
+    #[test]
+    fn obb_validation_dataset_rejects_non_obb_graphs_and_class_mismatch() {
+        let network = obb_validation_network(1, 1);
+        let data = DataConfig {
+            source: PathBuf::new(),
+            classes: Some(2),
+            train: None,
+            valid: None,
+            names: None,
+            backup: None,
+            options: Default::default(),
+        };
+        assert!(ObbValidationDataset::from_data(&network, &data).is_err());
+
+        let standard = Network::from_config(
+            crate::cfg::ConfigFile::parse_str(
+                "standard-validation.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=3\n[convolutional]\nfilters=6\nsize=1\n[yolo]\nclasses=1\nnum=1\nanchors=1,1\n",
+            )
+            .expect("standard cfg parses"),
+        )
+        .expect("standard graph builds");
+        assert!(ObbValidationDataset::from_data(&standard, &data).is_err());
+
+        let hybrid = Network::from_config(
+            crate::cfg::ConfigFile::parse_str(
+                "hybrid-validation.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=3\nobb=1\n[yolo]\nallow_obb_truth=1\nclasses=1\nnum=1\nanchors=1,1\n",
+            )
+            .expect("hybrid cfg parses"),
+        )
+        .expect("hybrid graph builds");
+        assert!(ObbValidationDataset::from_data(&hybrid, &data).is_err());
     }
 
     #[test]

@@ -239,9 +239,10 @@ Immediately next, in dependency order:
   multi-head OBB decode/NMS, and explicit AABB-training/mAP rejection; v82 adds
   separate no-augmentation OBB batch loading with direct image resize and
   preserved optional-front labels; v83 adds standalone AP matching for normalized
-  legacy front-point OBB detections. OBB augmentation, truth assignment/losses,
-  NMS-kind cfg wiring, network/dataset/CLI mAP integration, and CARPN mAP remain
-  open.
+  legacy front-point OBB detections; v84 adds an OBB validation dataset/evaluation
+  API with network decode and normalized orientation-aware scoring. OBB augmentation,
+  truth assignment/losses, NMS-kind cfg wiring, CLI `-map` integration, and CARPN
+  mAP remain open.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and
   kernels, weights order `weights.cpp:428`); then `deform_conv`, `dsconv`,
   `graph_conv`, `wmhf`, `clifford`, `recursive_block`.

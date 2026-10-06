@@ -35,7 +35,8 @@ pub(crate) mod eml_conv_math;
 pub mod error;
 pub mod evaluate;
 pub use evaluate::{
-    MapReport, REPORT_CONFIDENCE, ValidationDataset, detector_map, obb_detector_map,
+    MapReport, ObbValidationDataset, REPORT_CONFIDENCE, ValidationDataset, detector_map,
+    obb_detector_map,
 };
 pub mod image;
 pub mod laya_act_head;
