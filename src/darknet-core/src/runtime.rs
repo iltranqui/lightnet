@@ -527,6 +527,7 @@ where
     /// forward, or a network that needs the CPU backward fallback).
     pub gpu_batch_norm_caches: Vec<Option<GpuBatchNormCache<T>>>,
     pub(crate) gpu_rnn_caches: Vec<Option<GpuRnnBackwardCache<T>>>,
+    pub(crate) gpu_crnn_caches: Vec<Option<GpuCrnnBackwardCache<T>>>,
     pub(crate) gpu_lstm_caches: Vec<Option<GpuLstmBackwardCache<T>>>,
     pub cpu_forward: ForwardResult,
 }
@@ -534,6 +535,20 @@ where
 /// Device-resident recurrent values retained for no-BN RNN backward.
 #[derive(Clone, Debug)]
 pub struct GpuRnnBackwardCache<T>
+where
+    T: Clone,
+{
+    sequence_batch: usize,
+    input_activation_inputs: Vec<T>,
+    self_activation_inputs: Vec<T>,
+    output_activation_inputs: Vec<T>,
+    previous_states: Vec<T>,
+    states: Vec<T>,
+}
+
+/// Device-resident recurrent values retained for no-BN CRNN backward.
+#[derive(Clone, Debug)]
+pub struct GpuCrnnBackwardCache<T>
 where
     T: Clone,
 {
@@ -5096,6 +5111,7 @@ where
         let mut layer_activation_inputs = Vec::with_capacity(self.network.layers.len());
         let mut recurrent_caches = Vec::with_capacity(self.network.layers.len());
         let mut gpu_rnn_caches = Vec::with_capacity(self.network.layers.len());
+        let mut gpu_crnn_caches = Vec::with_capacity(self.network.layers.len());
         let mut gpu_lstm_caches = Vec::with_capacity(self.network.layers.len());
         let mut dropout_masks = Vec::with_capacity(self.network.layers.len());
         let mut crop_caches = Vec::with_capacity(self.network.layers.len());
@@ -5125,6 +5141,7 @@ where
             let mut vit_cache = None;
             let mut moe_cache = None;
             let mut gpu_rnn_cache = None;
+            let mut gpu_crnn_cache = None;
             let mut gpu_lstm_cache = None;
             let output_gpu = match (&layer.kind, params) {
                 (
@@ -6144,7 +6161,7 @@ where
                         && recurrent.output.batch_norm.is_none()
                         && spec.activation.to_cuda_f32_kind().is_some()
                     {
-                        let (output, cache) = forward_crnn_layer_device(
+                        let (output, cache, device_cache) = forward_crnn_layer_device(
                             &self.backend,
                             spec,
                             recurrent,
@@ -6152,9 +6169,11 @@ where
                             layer.input_shape,
                             layer.output_shape,
                             layer.index,
+                            host_copies,
                             launch_config,
                         )?;
-                        recurrent_caches.push(Some(RecurrentForwardCache::Crnn(cache)));
+                        recurrent_caches.push(cache.map(RecurrentForwardCache::Crnn));
+                        gpu_crnn_cache = Some(device_cache);
                         output
                     } else {
                         let host_input = self
@@ -6387,6 +6406,7 @@ where
             crop_caches.push(crop_cache);
             gpu_batch_norm_caches.push(batch_norm_cache);
             gpu_rnn_caches.push(gpu_rnn_cache);
+            gpu_crnn_caches.push(gpu_crnn_cache);
             gpu_lstm_caches.push(gpu_lstm_cache);
             if recurrent_caches.len() < layer_outputs.len() {
                 recurrent_caches.push(None);
@@ -6401,6 +6421,7 @@ where
             gpu_layer_activation_inputs,
             gpu_batch_norm_caches,
             gpu_rnn_caches,
+            gpu_crnn_caches,
             gpu_lstm_caches,
             cpu_forward: ForwardResult {
                 layer_outputs,
@@ -8287,17 +8308,12 @@ where
                 }
                 (LayerKind::Crnn(spec), Some(LayerParams::Crnn(params))) => {
                     let cache = forward
-                        .cpu_forward
-                        .recurrent_caches
+                        .gpu_crnn_caches
                         .get(layer.index)
                         .and_then(Option::as_ref)
-                        .and_then(|cache| match cache {
-                            RecurrentForwardCache::Crnn(cache) => Some(cache),
-                            _ => None,
-                        })
                         .ok_or_else(|| {
                             Error::InvalidConfig(format!(
-                                "missing CRNN forward cache for GPU layer #{}",
+                                "missing CRNN device cache for GPU layer #{}",
                                 layer.index
                             ))
                         })?;
@@ -12879,8 +12895,13 @@ fn forward_crnn_layer_device<B: F32TensorOpsBackend>(
     input_shape: TensorShape,
     output_shape: TensorShape,
     layer_index: usize,
+    capture_host_cache: bool,
     config: ElementwiseLaunchConfig,
-) -> Result<(B::Tensor, CrnnForwardCache)>
+) -> Result<(
+    B::Tensor,
+    Option<CrnnForwardCache>,
+    GpuCrnnBackwardCache<B::Tensor>,
+)>
 where
     B::Error: std::fmt::Display,
 {
@@ -12993,11 +13014,11 @@ where
     };
 
     let mut output_steps = Vec::with_capacity(spec.steps);
-    let mut previous_state = Tensor::zeros(hidden_shape);
+    let mut previous_state_host = capture_host_cache.then(|| Tensor::zeros(hidden_shape));
     let mut previous_state_gpu = backend
         .zeros_f32(&tensor_backend_shape(hidden_shape))
         .map_err(|err| backend_error("allocate CRNN initial state", err))?;
-    let mut cache = CrnnForwardCache {
+    let mut host_cache = capture_host_cache.then(|| CrnnForwardCache {
         sequence_batch,
         input_outputs: Vec::with_capacity(spec.steps),
         input_activation_inputs: Vec::with_capacity(spec.steps),
@@ -13007,6 +13028,14 @@ where
         states: Vec::with_capacity(spec.steps),
         output_activation_inputs: Vec::with_capacity(spec.steps),
         outputs: Vec::with_capacity(spec.steps),
+    });
+    let mut device_cache = GpuCrnnBackwardCache {
+        sequence_batch,
+        input_activation_inputs: Vec::with_capacity(spec.steps),
+        self_activation_inputs: Vec::with_capacity(spec.steps),
+        output_activation_inputs: Vec::with_capacity(spec.steps),
+        previous_states: Vec::with_capacity(spec.steps),
+        states: Vec::with_capacity(spec.steps),
     };
 
     for step in 0..spec.steps {
@@ -13059,59 +13088,74 @@ where
             output_step_shape,
         )?;
 
-        let input_output = recurrent_device_tensor(
-            backend,
-            &input_output_gpu,
-            hidden_shape,
-            "download CRNN input projection",
-        )?;
-        let input_activation_input = recurrent_device_tensor(
-            backend,
-            &input_pre,
-            hidden_shape,
-            "download CRNN input pre-activation",
-        )?;
-        let self_output = recurrent_device_tensor(
-            backend,
-            &self_output_gpu,
-            hidden_shape,
-            "download CRNN recurrent projection",
-        )?;
-        let self_activation_input = recurrent_device_tensor(
-            backend,
-            &self_pre,
-            hidden_shape,
-            "download CRNN recurrent pre-activation",
-        )?;
-        let state = recurrent_device_tensor(
-            backend,
-            &state_gpu,
-            hidden_shape,
-            "download CRNN hidden state",
-        )?;
-        let output_activation_input = recurrent_device_tensor(
-            backend,
-            &output_pre,
-            output_step_shape,
-            "download CRNN output pre-activation",
-        )?;
-        let step_output = recurrent_device_tensor(
-            backend,
-            &step_output_gpu,
-            output_step_shape,
-            "download CRNN output",
-        )?;
+        device_cache.input_activation_inputs.push(input_pre.clone());
+        device_cache.self_activation_inputs.push(self_pre.clone());
+        device_cache
+            .output_activation_inputs
+            .push(output_pre.clone());
+        device_cache
+            .previous_states
+            .push(previous_state_gpu.clone());
+        device_cache.states.push(state_gpu.clone());
+        if let Some(cache) = &mut host_cache {
+            let input_output = recurrent_device_tensor(
+                backend,
+                &input_output_gpu,
+                hidden_shape,
+                "download CRNN input projection",
+            )?;
+            let input_activation_input = recurrent_device_tensor(
+                backend,
+                &input_pre,
+                hidden_shape,
+                "download CRNN input pre-activation",
+            )?;
+            let self_output = recurrent_device_tensor(
+                backend,
+                &self_output_gpu,
+                hidden_shape,
+                "download CRNN recurrent projection",
+            )?;
+            let self_activation_input = recurrent_device_tensor(
+                backend,
+                &self_pre,
+                hidden_shape,
+                "download CRNN recurrent pre-activation",
+            )?;
+            let state = recurrent_device_tensor(
+                backend,
+                &state_gpu,
+                hidden_shape,
+                "download CRNN hidden state",
+            )?;
+            let output_activation_input = recurrent_device_tensor(
+                backend,
+                &output_pre,
+                output_step_shape,
+                "download CRNN output pre-activation",
+            )?;
+            let step_output = recurrent_device_tensor(
+                backend,
+                &step_output_gpu,
+                output_step_shape,
+                "download CRNN output",
+            )?;
+            cache.input_outputs.push(input_output);
+            cache.input_activation_inputs.push(input_activation_input);
+            cache.self_outputs.push(self_output);
+            cache.self_activation_inputs.push(self_activation_input);
+            cache.previous_states.push(
+                previous_state_host
+                    .as_ref()
+                    .expect("capturing CRNN host cache")
+                    .clone(),
+            );
+            cache.states.push(state.clone());
+            cache.output_activation_inputs.push(output_activation_input);
+            cache.outputs.push(step_output);
+            previous_state_host = Some(state);
+        }
         output_steps.push(step_output_gpu.clone());
-
-        cache.input_outputs.push(input_output);
-        cache.input_activation_inputs.push(input_activation_input);
-        cache.self_outputs.push(self_output);
-        cache.self_activation_inputs.push(self_activation_input);
-        cache.previous_states.push(previous_state);
-        cache.states.push(state.clone());
-        cache.output_activation_inputs.push(output_activation_input);
-        cache.outputs.push(step_output);
-        previous_state = state;
         previous_state_gpu = state_gpu;
     }
 
@@ -13124,7 +13168,7 @@ where
             config,
         )
         .map_err(|err| backend_error("assemble CRNN output sequence", err))?;
-    Ok((output_gpu, cache))
+    Ok((output_gpu, host_cache, device_cache))
 }
 
 fn forward_crnn_layer(
@@ -14228,7 +14272,7 @@ fn backward_crnn_layer_device<B: F32TensorOpsBackend>(
     backend: &B,
     spec: &CrnnSpec,
     params: &CrnnParams,
-    cache: &CrnnForwardCache,
+    cache: &GpuCrnnBackwardCache<B::Tensor>,
     input_gpu: &B::Tensor,
     input_shape: TensorShape,
     output_gradient: &B::Tensor,
@@ -14269,8 +14313,7 @@ where
     );
     let expected_output_shape =
         TensorShape::new(input_width, input_height, spec.output, input_shape.batch);
-    if cache.outputs.len() != spec.steps
-        || cache.states.len() != spec.steps
+    if cache.states.len() != spec.steps
         || cache.previous_states.len() != spec.steps
         || cache.input_activation_inputs.len() != spec.steps
         || cache.self_activation_inputs.len() != spec.steps
@@ -14330,12 +14373,7 @@ where
                 config,
             )
             .map_err(|err| backend_error("slice CRNN output gradient", err))?;
-        let output_activation_input = backend
-            .upload_f32(
-                &tensor_backend_shape(output_step_shape),
-                &cache.output_activation_inputs[step].data,
-            )
-            .map_err(|err| backend_error("upload CRNN output activation cache", err))?;
+        let output_activation_input = cache.output_activation_inputs[step].clone();
         let output_delta = backend
             .activation_backward_f32(
                 &output_activation_input,
@@ -14344,12 +14382,7 @@ where
                 config,
             )
             .map_err(|err| backend_error("CRNN output activation backward", err))?;
-        let state_gpu = backend
-            .upload_f32(
-                &tensor_backend_shape(hidden_shape),
-                &cache.states[step].data,
-            )
-            .map_err(|err| backend_error("upload CRNN state cache", err))?;
+        let state_gpu = cache.states[step].clone();
         let output_weight_gradient = backend
             .conv2d_backward_weights_f32(
                 &state_gpu,
@@ -14412,21 +14445,11 @@ where
             .vector_add_f32(&state_gradient, &future_state_gradient, config)
             .map_err(|err| backend_error("accumulate CRNN future state gradient", err))?;
 
-        let self_activation_input = backend
-            .upload_f32(
-                &tensor_backend_shape(hidden_shape),
-                &cache.self_activation_inputs[step].data,
-            )
-            .map_err(|err| backend_error("upload CRNN recurrent activation cache", err))?;
+        let self_activation_input = cache.self_activation_inputs[step].clone();
         let self_delta = backend
             .activation_backward_f32(&self_activation_input, &state_gradient, activation, config)
             .map_err(|err| backend_error("CRNN recurrent activation backward", err))?;
-        let previous_state_gpu = backend
-            .upload_f32(
-                &tensor_backend_shape(hidden_shape),
-                &cache.previous_states[step].data,
-            )
-            .map_err(|err| backend_error("upload CRNN previous state cache", err))?;
+        let previous_state_gpu = cache.previous_states[step].clone();
         let self_weight_gradient = backend
             .conv2d_backward_weights_f32(
                 &previous_state_gpu,
@@ -14481,12 +14504,7 @@ where
             )
             .map_err(|err| backend_error("CRNN recurrent input backward", err))?;
 
-        let input_activation_input = backend
-            .upload_f32(
-                &tensor_backend_shape(hidden_shape),
-                &cache.input_activation_inputs[step].data,
-            )
-            .map_err(|err| backend_error("upload CRNN input activation cache", err))?;
+        let input_activation_input = cache.input_activation_inputs[step].clone();
         let input_delta = backend
             .activation_backward_f32(&input_activation_input, &state_gradient, activation, config)
             .map_err(|err| backend_error("CRNN input activation backward", err))?;
@@ -22148,6 +22166,8 @@ mod tests {
         let gpu_training = gpu
             .forward_training_device(&input)
             .expect("backend CRNN training forward");
+        assert!(gpu_training.gpu_crnn_caches[1].is_some());
+        assert!(gpu_training.cpu_forward.recurrent_caches[1].is_none());
         let output_shape = cpu.network.layers[1].output_shape;
         let seed = Tensor::from_data(
             output_shape,

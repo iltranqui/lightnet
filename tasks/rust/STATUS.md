@@ -40,16 +40,17 @@ Latest increments:
   gate, and cell caches, and concatenates timestep outputs directly on-device.
   LSTM and RNN forward/backward sequence slicing and timestep input-gradient
   assembly stay on-device; RNN projection gradients also accumulate on-device
-  across steps, and its no-BN training pre-activation/state caches now remain
-  device-resident for backward (the host cache is captured only for host-facing
-  forwards). CRNN forward input slicing and output assembly also stay
-  on-device. CRNN backward sequence slicing and input-gradient assembly also
-  stay on-device; convolution parameter gradients accumulate on-device across
+  across steps, and no-BN RNN/CRNN training pre-activation/state caches now
+  remain device-resident for backward (the host cache is captured only for
+  host-facing forwards). CRNN forward input slicing and output assembly also
+  stay on-device. CRNN backward sequence slicing and input-gradient assembly
+  also stay on-device; convolution parameter gradients accumulate on-device across
   steps. Recurrent cache/state and parameter-gradient transfers, host
-  accumulation/SGD, and some cache handling remain host-side. FakeBackend parity
-  and real-device
-  `oxide_runtime_chain::lstm_no_batch_norm_forward_and_device_backward_match_cpu`
-  pass, including upstream convolution updates.
+  accumulation/SGD, and some cache handling remain host-side. Targeted host
+  RNN/CRNN tests and real-device `oxide_runtime_chain` tests
+  `rnn_recurrent_projections_and_training_backward_match_cpu` and
+  `crnn_recurrent_convolutions_and_training_backward_match_cpu` pass. LSTM
+  device-backward parity also passes, including upstream convolution updates.
 - Added an oxide Stair activation kernel matching Darknet's floor-based
   alternating-step formula and parity gradient, including negative odd intervals.
   Verified by the 391-test core library suite, `oxide_parity` (11 passed,
