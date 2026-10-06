@@ -48,9 +48,12 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
   `DARKNET_GRAD_MODE=analytical|cpp` gates softmax and scale_channels (see
   `implemented.md` §12). Remaining: a finite-difference / parity test per
   audited operation still lacking a Rust path: `NORM_CHAN*`, conv
-  `reverse`/`deform`/`grad_centr`, and YOLO DIoU/CIoU plus objectness/class
-  deltas. YOLO IoU/GIoU box geometry now has finite-difference coverage (with
-  Darknet's legacy 0.5 width/height comparison factor). Overlapping-window
+  `reverse`/`deform`/`grad_centr`, and YOLO DIoU/CIoU deltas. YOLO IoU/GIoU
+  geometry and objectness/class sigmoid-BCE deltas now have finite-difference
+  coverage; the box test records Darknet's legacy 0.5 width/height comparison
+  factor. Do not force DIoU/CIoU deltas to equal naive finite differences:
+  C++ `box_diou` uses `(d/c)^0.6` while `dx_box_iou` supplies the legacy gradient
+  of `d/c`; CIoU similarly uses an approximate `alpha` gradient. Overlapping-window
   maxpool with `maxpool_zero_nonmax` also has finite-difference coverage.
   Weighted shortcut CPU gradients already have finite-difference
   coverage; GPU training currently uses the CPU backward fallback.

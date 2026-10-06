@@ -92,8 +92,12 @@ Latest increments:
   including f16 bias-activation), and the real-device
   `oxide_runtime_chain::chained_conv_activation_stacks_match_cpu_backward` test.
   `MEM=3G ./tools/test_oxide.sh --no-run` also compiled every oxide test target.
-- YOLO IoU/GIoU box geometry deltas now have central finite-difference coverage;
-  the test records Darknet's legacy 0.5 width/height comparison factor.
+- YOLO IoU/GIoU box geometry and objectness/class sigmoid-BCE deltas now have
+  central finite-difference coverage; the core library suite passes (392 tests).
+  The box test records Darknet's legacy 0.5 width/height comparison factor.
+  DIoU/CIoU need a C++-formula audit rather than naive forward finite differences:
+  `box_diou` uses `(d/c)^0.6`, while `dx_box_iou` implements the legacy derivative
+  of `d/c`; CIoU approximates the `alpha` contribution.
 - f16 standalone batchnorm (via channel-affine), bias + activation, and reverse
   upsample forward are already implemented. Verified by
   `oxide_half::f16_shortcut_avgpool_affine_reverse_match_f64_reference` and

@@ -1889,9 +1889,10 @@ fn yolo_objectness_output(raw: f32, new_coords: bool) -> f32 {
 mod tests {
     use super::{
         DataConfig, YoloBox, YoloHeadStats, YoloLabel, YoloTrainingState, apply_yolo_box_delta,
-        apply_yolo_delta_filtering, bbox_iou_kind, compute_yolo_training_loss,
-        compute_yolo_training_loss_with_state, dx_box_iou, load_training_batch, load_yolo_labels,
-        replace_image_to_label, yolo_head_cost, yolo_xy_output,
+        apply_yolo_class_delta, apply_yolo_delta_filtering, apply_yolo_positive_objectness,
+        bbox_iou_kind, compute_yolo_training_loss, compute_yolo_training_loss_with_state,
+        dx_box_iou, load_training_batch, load_yolo_labels, replace_image_to_label, yolo_head_cost,
+        yolo_xy_output,
     };
     use crate::cfg::ConfigFile;
     use crate::model::{Network, TensorShape, YoloIouLoss, YoloSpec};
@@ -2144,6 +2145,78 @@ mod tests {
             &mse,
         );
         assert!((seed.get(0, 0, 0, 0) - 1.75 * 0.5 * 0.1).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn yolo_objectness_and_class_deltas_match_bce_finite_differences() {
+        let spec = YoloSpec {
+            classes: 3,
+            num: 1,
+            mask: vec![0],
+            anchors: vec![1.0, 1.0],
+            scale_x_y: 1.0,
+            new_coords: false,
+            cls_normalizer: 1.0,
+            obj_normalizer: 1.7,
+            iou_normalizer: 1.0,
+            ignore_thresh: 0.5,
+            truth_thresh: 1.0,
+            iou_thresh: 1.0,
+            iou_loss: YoloIouLoss::Iou,
+            iou_thresh_kind: YoloIouLoss::Iou,
+            focal_loss: false,
+            label_smooth_eps: 0.0,
+            objectness_smooth: false,
+            max_delta: f32::MAX,
+            delta_normalizer: 1.0,
+            class_multipliers: None,
+            class_map: None,
+        };
+        let shape = TensorShape {
+            width: 1,
+            height: 1,
+            channels: 5 + spec.classes,
+            batch: 1,
+        };
+        let step = 1e-3f32;
+        let bce = |raw: f32, target: f32| {
+            let p = 1.0 / (1.0 + (-raw).exp());
+            -target * p.ln() - (1.0 - target) * (1.0 - p).ln()
+        };
+
+        // Positive objectness delta is the negative derivative of BCE-with-logits.
+        let raw_objectness = 0.37f32;
+        let objectness = 1.0 / (1.0 + (-raw_objectness).exp());
+        let mut output = Tensor::zeros(shape);
+        output.set(0, 4, 0, 0, raw_objectness);
+        let mut seed = Tensor::zeros(shape);
+        apply_yolo_positive_objectness(&output, &mut seed, 0, 0, 0, 0, objectness, 1, &spec);
+        let numeric = spec.obj_normalizer
+            * (bce(raw_objectness + step, 1.0) - bce(raw_objectness - step, 1.0))
+            / (2.0 * step);
+        let delta = seed.get(0, 4, 0, 0);
+        assert!(
+            (delta + numeric).abs() < 2e-4,
+            "objectness delta {delta}, finite difference {numeric}"
+        );
+
+        // One positive and the other negative classes each use target-output,
+        // the negative derivative of their independent sigmoid BCE terms.
+        let logits = [0.2f32, -0.4, 0.7];
+        for (class, &logit) in logits.iter().enumerate() {
+            output.set(0, 5 + class, 0, 0, logit);
+        }
+        seed = Tensor::zeros(shape);
+        apply_yolo_class_delta(&output, &mut seed, 0, 5, 0, 0, 1, &spec);
+        for (class, &logit) in logits.iter().enumerate() {
+            let target = if class == 1 { 1.0 } else { 0.0 };
+            let numeric = (bce(logit + step, target) - bce(logit - step, target)) / (2.0 * step);
+            let delta = seed.get(0, 5 + class, 0, 0);
+            assert!(
+                (delta + numeric).abs() < 2e-4,
+                "class {class} delta {delta}, finite difference {numeric}"
+            );
+        }
     }
 
     #[test]
