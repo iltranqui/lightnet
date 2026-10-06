@@ -2309,6 +2309,179 @@ mod tests {
         assert!((ciou.dh - (iou.dh + alpha * ar_dh)).abs() < 1e-6);
     }
 
+    #[test]
+    fn yolo_diou_ciou_edge_and_disjoint_branches_match_cpp_source() {
+        // Reproduce the box.cpp DIoU/CIOU center term's min/max edge selection;
+        // this intentionally does not finite-difference the legacy surrogate.
+        fn legacy_center_gradient(pred: YoloBox, truth: YoloBox) -> [f32; 4] {
+            let ct = (pred.y - pred.h * 0.5).min(truth.y - truth.h * 0.5);
+            let cb = (pred.y + pred.h * 0.5).max(truth.y + truth.h * 0.5);
+            let cl = (pred.x - pred.w * 0.5).min(truth.x - truth.w * 0.5);
+            let cr = (pred.x + pred.w * 0.5).max(truth.x + truth.w * 0.5);
+            let cw = cr - cl;
+            let ch = cb - ct;
+            let c = cw * cw + ch * ch;
+            let pred_t = pred.y - pred.h * 0.5;
+            let pred_b = pred.y + pred.h * 0.5;
+            let pred_l = pred.x - pred.w * 0.5;
+            let pred_r = pred.x + pred.w * 0.5;
+            let truth_t = truth.y - truth.h * 0.5;
+            let truth_b = truth.y + truth.h * 0.5;
+            let truth_l = truth.x - truth.w * 0.5;
+            let truth_r = truth.x + truth.w * 0.5;
+            let dct_dy = if pred_t < truth_t { 1.0 } else { 0.0 };
+            let dct_dh = if pred_t < truth_t { -0.5 } else { 0.0 };
+            let dcb_dy = if pred_b > truth_b { 1.0 } else { 0.0 };
+            let dcb_dh = if pred_b > truth_b { 0.5 } else { 0.0 };
+            let dcl_dx = if pred_l < truth_l { 1.0 } else { 0.0 };
+            let dcl_dw = if pred_l < truth_l { -0.5 } else { 0.0 };
+            let dcr_dx = if pred_r > truth_r { 1.0 } else { 0.0 };
+            let dcr_dw = if pred_r > truth_r { 0.5 } else { 0.0 };
+            let dcw_dx = dcr_dx - dcl_dx;
+            let dcw_dw = dcr_dw - dcl_dw;
+            let dch_dy = dcb_dy - dct_dy;
+            let dch_dh = dcb_dh - dct_dh;
+            let s = (pred.x - truth.x).powi(2) + (pred.y - truth.y).powi(2);
+            [
+                (2.0 * (truth.x - pred.x) * c - (2.0 * cw * dcw_dx + 2.0 * ch * 0.0) * s) / (c * c),
+                (2.0 * (truth.y - pred.y) * c - (2.0 * cw * 0.0 + 2.0 * ch * dch_dy) * s) / (c * c),
+                (2.0 * cw * dcw_dw + 2.0 * ch * 0.0) * s / (c * c),
+                (2.0 * cw * 0.0 + 2.0 * ch * dch_dh) * s / (c * c),
+            ]
+        }
+
+        fn legacy_ciou_aspect_gradient(pred: YoloBox, truth: YoloBox) -> [f32; 2] {
+            let iw = (pred.x + pred.w * 0.5).min(truth.x + truth.w * 0.5)
+                - (pred.x - pred.w * 0.5).max(truth.x - truth.w * 0.5);
+            let ih = (pred.y + pred.h * 0.5).min(truth.y + truth.h * 0.5)
+                - (pred.y - pred.h * 0.5).max(truth.y - truth.h * 0.5);
+            let intersection = iw * ih;
+            let union = pred.w * pred.h + truth.w * truth.h - intersection;
+            let ar_gt = truth.w / truth.h;
+            let ar_pred = pred.w / pred.h;
+            let ar_diff = ar_gt.atan() - ar_pred.atan();
+            let ar_loss = 4.0 / (std::f32::consts::PI * std::f32::consts::PI) * ar_diff.powi(2);
+            // box.cpp uses the unclamped I/U from dx_box_iou and does not
+            // differentiate alpha itself.
+            let alpha = ar_loss / (1.0 - intersection / union + ar_loss + 1.0e-6);
+            [
+                alpha * 8.0 / (std::f32::consts::PI * std::f32::consts::PI) * ar_diff * pred.h,
+                alpha * -8.0 / (std::f32::consts::PI * std::f32::consts::PI) * ar_diff * pred.w,
+            ]
+        }
+
+        let cases = [
+            // Prediction crosses the enclosing box on the right and both y edges.
+            (
+                YoloBox {
+                    x: 0.56,
+                    y: 0.47,
+                    w: 0.70,
+                    h: 0.60,
+                },
+                YoloBox {
+                    x: 0.50,
+                    y: 0.50,
+                    w: 0.60,
+                    h: 0.50,
+                },
+                false,
+            ),
+            // A tied left edge follows box.cpp's strict `<` comparison.
+            (
+                YoloBox {
+                    x: 0.50,
+                    y: 0.50,
+                    w: 0.60,
+                    h: 0.50,
+                },
+                YoloBox {
+                    x: 0.40,
+                    y: 0.50,
+                    w: 0.40,
+                    h: 0.50,
+                },
+                false,
+            ),
+            // Horizontal and vertical separation exercise each `Iw <= 0 || Ih <= 0` override.
+            (
+                YoloBox {
+                    x: 0.20,
+                    y: 0.50,
+                    w: 0.20,
+                    h: 0.40,
+                },
+                YoloBox {
+                    x: 0.70,
+                    y: 0.50,
+                    w: 0.40,
+                    h: 0.20,
+                },
+                true,
+            ),
+            (
+                YoloBox {
+                    x: 0.50,
+                    y: 0.20,
+                    w: 0.40,
+                    h: 0.20,
+                },
+                YoloBox {
+                    x: 0.50,
+                    y: 0.70,
+                    w: 0.20,
+                    h: 0.40,
+                },
+                true,
+            ),
+        ];
+        for (case_index, (pred, truth, disjoint)) in cases.into_iter().enumerate() {
+            let overlap_iou = dx_box_iou(pred, truth, YoloIouLoss::Iou);
+            let center = legacy_center_gradient(pred, truth);
+            let aspect = legacy_ciou_aspect_gradient(pred, truth);
+            let diou = dx_box_iou(pred, truth, YoloIouLoss::Diou);
+            let ciou = dx_box_iou(pred, truth, YoloIouLoss::Ciou);
+            let expected_diou = if disjoint {
+                center
+            } else {
+                [
+                    overlap_iou.dx + center[0],
+                    overlap_iou.dy + center[1],
+                    overlap_iou.dw + center[2],
+                    overlap_iou.dh + center[3],
+                ]
+            };
+            let expected_ciou = if disjoint {
+                [
+                    center[0],
+                    center[1],
+                    center[2] + aspect[0],
+                    center[3] + aspect[1],
+                ]
+            } else {
+                [
+                    overlap_iou.dx + center[0],
+                    overlap_iou.dy + center[1],
+                    overlap_iou.dw + center[2] + aspect[0],
+                    overlap_iou.dh + center[3] + aspect[1],
+                ]
+            };
+            for (name, actual, expected) in [
+                ("DIoU", [diou.dx, diou.dy, diou.dw, diou.dh], expected_diou),
+                ("CIoU", [ciou.dx, ciou.dy, ciou.dw, ciou.dh], expected_ciou),
+            ] {
+                for channel in 0..4 {
+                    assert!(
+                        (actual[channel] - expected[channel]).abs() < 2e-6,
+                        "{name} delta case {case_index}, channel {channel}: {} vs {}",
+                        actual[channel],
+                        expected[channel]
+                    );
+                }
+            }
+        }
+    }
+
     /// C++ cost (yolo_layer.cpp:1062-1120), hand computed. 1 anchor, 1 class (6 entries),
     /// deltas box (.3,.4,.5,.6), obj .2, cls -.1; count 2, tot(1-iou) .6, tot(1-giou) 1.0,
     /// iou_normalizer .5, obj_normalizer 2.
