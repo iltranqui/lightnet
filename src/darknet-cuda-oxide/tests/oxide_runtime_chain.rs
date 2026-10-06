@@ -307,8 +307,10 @@ fn moe_adam_updates_router_and_experts_on_oxide_match_cpu_gradients() {
             )
         })
         .collect();
-    gpu.update_weights_gpu(lr, 0.0, 0.0, 2)
-        .expect("Oxide device MoE Adam");
+    gpu.update_weights_gpu_deferred(lr, 0.0, 0.0, 2)
+        .expect("deferred Oxide device MoE Adam");
+    gpu.sync_host_weights_from_device()
+        .expect("sync deferred Oxide MoE Adam");
     let LayerParams::Moe(gpu_params) = &gpu.params[0] else {
         panic!("updated GPU MoE parameters");
     };
@@ -445,6 +447,154 @@ fn moe_batchnorm_expert_device_backward_matches_cpu_on_oxide() {
             &format!("MoE BN expert {index} scales"),
             &cpu_expert.batch_norm.as_ref().unwrap().scales,
             &gpu_expert.batch_norm.as_ref().unwrap().scales,
+            1e-4,
+        );
+    }
+}
+
+#[test]
+fn moe_batchnorm_adam_updates_experts_on_oxide_match_cpu_gradients() {
+    let net = network(
+        "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=2\nadam=1\nb1=0.8\nb2=0.95\neps=0.001\n[convolutional]\nfilters=2\nsize=1\nbatch_normalize=0\nactivation=linear\n[moe_convolutional]\nfilters=2\nsize=1\nexperts=2\ntop_k=0\nload_balance=0\nactivation=leaky\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("oxide backend"));
+    let LayerParams::Convolutional(conv) = &mut gpu.params[0] else {
+        panic!("conv parameters")
+    };
+    conv.weights.copy_from_slice(&[1.0, 0.0, 0.0, 1.0]);
+    conv.biases.copy_from_slice(&[0.0, 0.0]);
+    {
+        let LayerParams::Moe(moe) = &mut gpu.params[1] else {
+            panic!("MoE parameters")
+        };
+        moe.router_weights.copy_from_slice(&[0.15, -0.25, -0.05, 0.2]);
+        moe.router_biases.copy_from_slice(&[0.03, -0.02]);
+        for (slot, expert) in moe.experts.iter_mut().enumerate() {
+            expert.weights.copy_from_slice(&[
+                0.25 + slot as f32 * 0.1,
+                -0.1,
+                0.05,
+                0.35 - slot as f32 * 0.08,
+            ]);
+            expert.biases.copy_from_slice(&[0.02, -0.04]);
+            let bn = expert.batch_norm.as_mut().expect("MoE BN parameters");
+            bn.scales.copy_from_slice(&[0.8, 1.1]);
+            bn.rolling_mean.copy_from_slice(&[0.1, -0.2]);
+            bn.rolling_variance.copy_from_slice(&[0.7, 1.3]);
+        }
+    }
+    cpu.params.clone_from(&gpu.params);
+    gpu.init_train_buffers_gpu().expect("device train buffers");
+    let input = patterned(cpu.network.net.input_shape());
+    let cpu_fwd = cpu.forward_training(&input).expect("CPU forward");
+    let gpu_fwd = gpu
+        .forward_training_device(&input)
+        .expect("Oxide forward");
+    for layer_index in 0..2 {
+        close(
+            &format!("MoE BN Adam forward {layer_index}"),
+            &cpu_fwd.layer_outputs[layer_index].data,
+            &gpu.backend
+                .download_f32(&gpu_fwd.gpu_layer_outputs[layer_index])
+                .expect("download MoE BN Adam output"),
+            1e-4,
+        );
+    }
+    let shape = cpu.network.layers[1].output_shape;
+    let seed = Tensor::from_data(
+        shape,
+        (0..shape.batch * shape.element_count())
+            .map(|i| (i as f32 * 0.41).sin() - 0.15)
+            .collect(),
+    )
+    .expect("seed");
+    let mut seeds = vec![None; 2];
+    seeds[1] = Some(seed);
+    cpu.zero_train_buffers();
+    gpu.zero_train_buffers_gpu().expect("zero train buffers");
+    cpu.backward_accumulate_seeded(&input, &cpu_fwd, &seeds)
+        .expect("CPU MoE BN backward");
+    gpu.backward_accumulate_seeded_gpu(&gpu_fwd, &seeds)
+        .expect("Oxide MoE BN backward");
+
+    let lr = 0.01;
+    let eps = cpu.network.net.adam_eps;
+    let LayerTrainBuffers::Convolutional(cpu_conv_updates) = &cpu.train_buffers[0] else {
+        panic!("CPU conv gradients")
+    };
+    let LayerParams::Convolutional(cpu_conv_params) = &cpu.params[0] else {
+        panic!("CPU conv params")
+    };
+    let expected_conv_weights = expected_first_adam_step(
+        &cpu_conv_params.weights,
+        &cpu_conv_updates.weight_updates,
+        lr,
+        eps,
+    );
+    let expected_conv_biases = expected_first_adam_step(
+        &cpu_conv_params.biases,
+        &cpu_conv_updates.bias_updates,
+        lr,
+        eps,
+    );
+    let (LayerParams::Moe(cpu_moe_params), LayerTrainBuffers::Moe(cpu_moe_updates)) =
+        (&cpu.params[1], &cpu.train_buffers[1])
+    else {
+        panic!("CPU MoE params/gradients")
+    };
+    let expected_router_weights = expected_first_adam_step(
+        &cpu_moe_params.router_weights,
+        &cpu_moe_updates.router_weight_updates,
+        lr,
+        eps,
+    );
+    let expected_router_biases = expected_first_adam_step(
+        &cpu_moe_params.router_biases,
+        &cpu_moe_updates.router_bias_updates,
+        lr,
+        eps,
+    );
+    let expected_experts: Vec<_> = cpu_moe_params
+        .experts
+        .iter()
+        .zip(&cpu_moe_updates.experts)
+        .map(|(params, updates)| {
+            (
+                expected_first_adam_step(&params.weights, &updates.weight_updates, lr, eps),
+                expected_first_adam_step(&params.biases, &updates.bias_updates, lr, eps),
+                expected_first_adam_step(
+                    &params.batch_norm.as_ref().unwrap().scales,
+                    &updates.batch_norm.as_ref().unwrap().scale_updates,
+                    lr,
+                    eps,
+                ),
+            )
+        })
+        .collect();
+    gpu.update_weights_gpu_deferred(lr, 0.0, 0.0, 2)
+        .expect("deferred Oxide BN MoE Adam");
+    gpu.sync_host_weights_from_device()
+        .expect("sync deferred BN MoE Adam parameters");
+
+    let (LayerParams::Convolutional(gpu_conv), LayerParams::Moe(gpu_moe)) =
+        (&gpu.params[0], &gpu.params[1])
+    else {
+        panic!("updated GPU parameters")
+    };
+    close("BN Adam preceding conv weights", &expected_conv_weights, &gpu_conv.weights, 1e-4);
+    close("BN Adam preceding conv biases", &expected_conv_biases, &gpu_conv.biases, 1e-4);
+    close("BN Adam router weights", &expected_router_weights, &gpu_moe.router_weights, 1e-4);
+    close("BN Adam router biases", &expected_router_biases, &gpu_moe.router_biases, 1e-4);
+    for (index, (expert, (weights, biases, scales))) in
+        gpu_moe.experts.iter().zip(&expected_experts).enumerate()
+    {
+        close(&format!("BN Adam expert {index} weights"), weights, &expert.weights, 1e-4);
+        close(&format!("BN Adam expert {index} biases"), biases, &expert.biases, 1e-4);
+        close(
+            &format!("BN Adam expert {index} scales"),
+            scales,
+            &expert.batch_norm.as_ref().unwrap().scales,
             1e-4,
         );
     }

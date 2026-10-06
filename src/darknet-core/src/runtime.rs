@@ -3073,7 +3073,7 @@ where
     /// Per-owner-layer convolution Adam moments (device), created lazily on the
     /// first Adam update.
     adam_state: Vec<Option<GpuAdamLayerState<B::Tensor>>>,
-    /// Device Adam moments for no-BN MoE routers and experts, saved in DNOPT3.
+    /// Device Adam moments for MoE routers/experts, including BN scales in DNOPT4.
     moe_adam_state: Vec<Option<GpuMoeAdamLayerState<B::Tensor>>>,
     /// Adam moments for parameters updated by the host fallback.
     host_adam_state: RefCell<Vec<Option<HostAdamLayerState>>>,
@@ -4088,11 +4088,20 @@ where
     }
 
     /// Persist the Adam step counter and device/host moment tensors to a sidecar
-    /// file. The `.weights` format stays C++-compatible and carries only
+    /// file. DNOPT4 adds device MoE expert BN-scale moments; DNOPT1–3 remain
+    /// readable. The `.weights` format stays C++-compatible and carries only
     /// parameters plus `seen`; this sidecar preserves optimizer state on resume.
     pub fn save_optimizer_state(&self, path: impl AsRef<Path>) -> Result<()> {
         let mut file = std::io::BufWriter::with_capacity(1 << 20, File::create(path)?);
-        file.write_all(b"DNOPT3\0\0")?;
+        let has_moe_scale_moments = self.moe_adam_state.iter().flatten().any(|state| {
+            state.experts.iter().any(|expert| expert.scales.is_some())
+        });
+        let version = if has_moe_scale_moments { 4 } else { 3 };
+        file.write_all(if version == 4 {
+            b"DNOPT4\0\0"
+        } else {
+            b"DNOPT3\0\0"
+        })?;
         file.write_all(&self.adam_step.to_le_bytes())?;
         let entries: Vec<usize> = self
             .adam_state
@@ -4150,6 +4159,9 @@ where
             for expert in &state.experts {
                 self.write_moments(&mut file, expert.weights.as_ref(), &expert_weights)?;
                 self.write_moments(&mut file, expert.biases.as_ref(), &expert_biases)?;
+                if version >= 4 {
+                    self.write_moments(&mut file, expert.scales.as_ref(), &expert_biases)?;
+                }
             }
         }
         file.flush()?;
@@ -4167,6 +4179,7 @@ where
             b"DNOPT1\0\0" => 1,
             b"DNOPT2\0\0" => 2,
             b"DNOPT3\0\0" => 3,
+            b"DNOPT4\0\0" => 4,
             _ => return Err(Error::Weights("bad optimizer state magic".to_owned())),
         };
         let mut buf4 = [0u8; 4];
@@ -4265,7 +4278,11 @@ where
                     experts.push(GpuAdamLayerState {
                         weights: self.read_moments(&mut file, &expert_weights)?,
                         biases: self.read_moments(&mut file, &expert_biases)?,
-                        scales: None,
+                        scales: if version >= 4 {
+                            self.read_moments(&mut file, &expert_biases)?
+                        } else {
+                            None
+                        },
                     });
                 }
                 moe_state[index] = Some(GpuMoeAdamLayerState { router, experts });
@@ -4352,6 +4369,9 @@ where
         }
         let (router_weights, router_biases, expert_weights, expert_biases, expert_count) =
             self.moe_adam_parameter_shapes(index)?;
+        let LayerKind::Moe(spec) = &self.network.layers[index].kind else {
+            unreachable!("MoE parameter-shape helper validated layer kind");
+        };
         let host_state = self
             .host_adam_state
             .borrow()
@@ -4375,7 +4395,7 @@ where
             self.upload_host_adam_moments(host_state.weights, &router_weights)?;
         state.router.biases = self.upload_host_adam_moments(host_state.biases, &router_biases)?;
         for (expert_index, host_expert) in host_state.children.into_iter().enumerate() {
-            if host_expert.scales.is_some() {
+            if host_expert.scales.is_some() && !spec.expert.batch_normalize {
                 return Err(Error::InvalidConfig(format!(
                     "restored BN MoE Adam state reached no-BN layer #{index}"
                 )));
@@ -4384,6 +4404,8 @@ where
                 self.upload_host_adam_moments(host_expert.weights, &expert_weights)?;
             state.experts[expert_index].biases =
                 self.upload_host_adam_moments(host_expert.biases, &expert_biases)?;
+            state.experts[expert_index].scales =
+                self.upload_host_adam_moments(host_expert.scales, &expert_biases)?;
         }
         Ok(state)
     }
@@ -4599,9 +4621,9 @@ where
         self.init_train_buffers_gpu()
     }
 
-    /// One optimizer step over device convolutions and no-BN MoE router/expert
-    /// parameters (and, for SGD, the remaining host-fallback layers). The
-    /// optimizer follows `[net]`: SGD with
+    /// One optimizer step over device convolutions, no-BN MoE SGD/Adam, and
+    /// BN MoE Adam. For SGD, the remaining host-fallback layers are updated too.
+    /// The optimizer follows `[net]`: SGD with
     /// momentum by default, Adam with `adam=1` (`B1`/`B2`/`eps`, coupled L2
     /// decay like C++, or AdamW with `decoupled_decay=1`; `lr`/`decay`/`batch`
     /// are the same arguments).  `loss_scale` makes the step independent of the
@@ -4618,11 +4640,12 @@ where
         self.update_weights_gpu_impl(lr, momentum, decay, batch, true)
     }
 
-    /// Like [`Self::update_weights_gpu`] but convolution parameters and no-BN
-    /// MoE expert weights/biases stay on the device. MoE router parameters are
-    /// synchronized immediately because the current router forward consumes
-    /// host parameters. Device-updated host parameters are stale until
-    /// [`Self::sync_host_weights_from_device`] runs (call it before reading or
+    /// Like [`Self::update_weights_gpu`] but device convolution params and
+    /// supported MoE expert params (no-BN SGD/Adam, BN Adam) can stay on-device.
+    /// MoE router parameters synchronize immediately because the current router
+    /// forward consumes host parameters; device-updated expert parameters remain
+    /// stale until [`Self::sync_host_weights_from_device`] runs (call it before
+    /// reading or
     /// saving `params`). Falls back to eager sync when CPU backward reads host
     /// weights.
     pub fn update_weights_gpu_deferred(
@@ -4636,7 +4659,7 @@ where
         self.update_weights_gpu_impl(lr, momentum, decay, batch, eager)
     }
 
-    /// Refreshes host convolution params and no-BN MoE expert weights/biases
+    /// Refreshes host convolution params and MoE expert weights/biases/BN stats
     /// after deferred device updates.
     pub fn sync_host_weights_from_device(&mut self) -> Result<()> {
         if !self.host_weights_stale {
@@ -4653,13 +4676,9 @@ where
                         self.sync_convolution_params_from_device(layer_index, &cached)?;
                     }
                 }
-                LayerKind::Moe(spec) if !spec.expert.batch_normalize => {
+                LayerKind::Moe(_) => {
                     let expert_count = match self.params.get(layer_index) {
-                        Some(LayerParams::Moe(params))
-                            if params.experts.iter().all(|expert| expert.batch_norm.is_none()) =>
-                        {
-                            params.experts.len()
-                        }
+                        Some(LayerParams::Moe(params)) => params.experts.len(),
                         _ => continue,
                     };
                     for expert_index in 0..expert_count {
@@ -4896,12 +4915,20 @@ where
         if device_moe_path {
             let buffers = self.device_moe_train_buffers.borrow();
             for (layer_index, layer) in self.network.layers.iter().enumerate() {
-                let no_batch_norm_moe =
-                    matches!(&layer.kind, LayerKind::Moe(spec) if !spec.expert.batch_normalize)
-                        && self.params.get(layer_index).is_some_and(|params| {
-                            matches!(params, LayerParams::Moe(moe) if moe.experts.iter().all(|expert| expert.batch_norm.is_none()))
-                        });
-                if no_batch_norm_moe
+                let supports_device_moe_optimizer =
+                    match (&layer.kind, self.params.get(layer_index)) {
+                        (LayerKind::Moe(spec), Some(LayerParams::Moe(moe))) => {
+                            let bn_matches = moe.experts.len() == spec.experts
+                                && moe.experts.iter().all(|expert| {
+                                    expert.batch_norm.is_some() == spec.expert.batch_normalize
+                                });
+                            bn_matches
+                                && (!spec.expert.batch_normalize
+                                    || matches!(step, GpuOptimizerStep::Adam(_)))
+                        }
+                        _ => false,
+                    };
+                if supports_device_moe_optimizer
                     && buffers.get(layer_index).is_some_and(Option::is_some)
                 {
                     preserve_device_moe_params[layer_index] = true;
@@ -5166,11 +5193,14 @@ where
                 }
             }
         }
-        // Host-updated container experts must be uploaded again before the next
-        // Oxide forward pass.
+        // Only host-updated container experts need re-uploading. Device Adam
+        // updates (including BN MoE experts) retain their raw tensors for
+        // deferred synchronization and the next Oxide forward pass.
         let mut cache = self.device_conv_params.borrow_mut();
         for (index, layer) in self.network.layers.iter().enumerate() {
-            if matches!(layer.kind, LayerKind::Moe(_)) {
+            if matches!(layer.kind, LayerKind::Moe(_))
+                && !device_moe_layers.get(index).copied().unwrap_or(false)
+            {
                 if let Some(slots) = cache.get_mut(index) {
                     slots.clear();
                 }
@@ -9389,19 +9419,22 @@ where
                 "missing MoE params for layer #{layer_index}"
             )));
         };
-        if spec.expert.batch_normalize
-            || params
-                .experts
-                .iter()
-                .any(|expert| expert.batch_norm.is_some())
-        {
+        if spec.expert.batch_normalize && !matches!(step, GpuOptimizerStep::Adam(_)) {
             return Err(Error::InvalidConfig(format!(
-                "batch-normalized MoE expert reached device optimizer at layer #{layer_index}"
+                "batch-normalized MoE SGD reached device optimizer at layer #{layer_index}"
             )));
         }
         if train.expert_weight_updates.len() != spec.experts
             || train.expert_bias_updates.len() != spec.experts
+            || train.expert_scale_updates.len() != spec.experts
             || params.experts.len() != spec.experts
+            || params.experts.iter().any(|expert| {
+                expert.batch_norm.is_some() != spec.expert.batch_normalize
+            })
+            || train
+                .expert_scale_updates
+                .iter()
+                .any(|scales| scales.is_some() != spec.expert.batch_normalize)
             || params.router_weights.len() != spec.experts * layer.input_shape.channels
             || params.router_biases.len() != spec.experts
         {
@@ -9411,6 +9444,8 @@ where
         }
         let router_weights_host = params.router_weights.clone();
         let router_biases_host = params.router_biases.clone();
+        let expert_count = spec.experts;
+        let expert_batch_normalize = spec.expert.batch_normalize;
         let grouped_channels = layer.input_shape.channels / spec.expert.groups.max(1);
         let weight_shape = [
             spec.expert.filters,
@@ -9434,9 +9469,13 @@ where
             },
             GpuOptimizerStep::Adam(_) => self.moe_adam_state_for_update(layer_index)?,
         };
-        if adam_state.experts.len() != spec.experts {
+        if adam_state.experts.len() != spec.experts
+            || adam_state.router.scales.is_some()
+            || (!spec.expert.batch_normalize
+                && adam_state.experts.iter().any(|expert| expert.scales.is_some()))
+        {
             return Err(Error::InvalidConfig(format!(
-                "MoE Adam expert moment count mismatch at layer #{layer_index}"
+                "MoE Adam moment shape mismatch at layer #{layer_index}"
             )));
         }
         let router_weights = self
@@ -9497,21 +9536,22 @@ where
         })?;
 
         self.warm_device_conv_params()?;
-        let mut updated_weight_moments = Vec::with_capacity(spec.experts);
-        let mut updated_bias_moments = Vec::with_capacity(spec.experts);
-        for expert_index in 0..spec.experts {
+        let mut updated_weight_moments = Vec::with_capacity(expert_count);
+        let mut updated_bias_moments = Vec::with_capacity(expert_count);
+        let mut updated_scale_moments = Vec::with_capacity(expert_count);
+        for expert_index in 0..expert_count {
             let cached = self.device_conv_params_at(layer_index, expert_index).ok_or_else(|| {
                 Error::InvalidConfig(format!(
                     "missing cached GPU MoE expert #{expert_index} params for layer #{layer_index}"
                 ))
             })?;
-            if cached.bn.is_some() {
+            if cached.bn.is_some() != expert_batch_normalize {
                 return Err(Error::InvalidConfig(format!(
-                    "batch-normalized MoE expert cache at layer #{layer_index}, expert #{expert_index}"
+                    "batch-normalization cache mismatch at MoE layer #{layer_index}, expert #{expert_index}"
                 )));
             }
             let expert_adam_state = &mut adam_state.experts[expert_index];
-            let targets = vec![
+            let mut targets: Vec<GpuOptimTarget<'_, B::Tensor>> = vec![
                 GpuOptimTarget {
                     is_weight: true,
                     w: &cached.raw_weights,
@@ -9529,16 +9569,47 @@ where
                     shape: &bias_shape,
                 },
             ];
+            if let (Some(batch_norm), Some(scale_updates)) = (
+                cached.bn.as_ref(),
+                train.expert_scale_updates[expert_index].as_ref(),
+            ) {
+                targets.push(GpuOptimTarget {
+                    is_weight: false,
+                    w: &batch_norm.scales,
+                    u: scale_updates,
+                    grad: None,
+                    moments: &mut expert_adam_state.scales,
+                    shape: &bias_shape,
+                });
+            }
             let mut updates =
                 gpu_optimizer_multi_step(&self.backend, &layer_step, targets, config)?.into_iter();
             let (raw_weights, weight_momentum) = updates.next().expect("expert weights result");
             let (raw_biases, bias_momentum) = updates.next().expect("expert biases result");
+            let (updated_scales, scale_momentum) = match updates.next() {
+                Some((scales, momentum)) => (Some(scales), Some(momentum)),
+                None => (None, None),
+            };
+            if expert_batch_normalize != updated_scales.is_some() {
+                return Err(Error::InvalidConfig(format!(
+                    "MoE BN scale update mismatch at layer #{layer_index}, expert #{expert_index}"
+                )));
+            }
             let mut refreshed = cached;
             refreshed.raw_weights = raw_weights.clone();
             refreshed.raw_biases = raw_biases.clone();
-            refreshed.weights = raw_weights;
-            refreshed.biases = raw_biases;
-            refreshed.folded_stale = false;
+            if let Some(scales) = updated_scales {
+                refreshed
+                    .bn
+                    .as_mut()
+                    .expect("BN cache validated above")
+                    .scales = scales;
+                refreshed.folded_stale = true;
+            } else {
+                refreshed.weights = raw_weights;
+                refreshed.biases = raw_biases;
+                refreshed.folded_stale = false;
+            }
             self.set_device_conv_params(layer_index, expert_index, refreshed.clone())?;
             if sync_host_weights {
                 self.sync_moe_expert_params_from_device(layer_index, expert_index, &refreshed)?;
@@ -9547,6 +9618,7 @@ where
             }
             updated_weight_moments.push(weight_momentum);
             updated_bias_moments.push(bias_momentum);
+            updated_scale_moments.push(scale_momentum);
         }
         let Some(LayerParams::Moe(params)) = self.params.get_mut(layer_index) else {
             return Err(Error::InvalidConfig(format!(
@@ -9572,6 +9644,7 @@ where
         slot.router_bias_updates = router_bias_momentum;
         slot.expert_weight_updates = updated_weight_moments;
         slot.expert_bias_updates = updated_bias_moments;
+        slot.expert_scale_updates = updated_scale_moments;
         slot.dirty = false;
         Ok(true)
     }
@@ -10435,11 +10508,6 @@ where
         expert_index: usize,
         cached: &GpuConvolutionLayerParams<B::Tensor>,
     ) -> Result<()> {
-        if cached.bn.is_some() {
-            return Err(Error::InvalidConfig(format!(
-                "cannot sync batch-normalized MoE expert #{expert_index} at layer #{owner} from device"
-            )));
-        }
         let raw_weights = self
             .backend
             .download_f32(&cached.raw_weights)
@@ -10448,6 +10516,23 @@ where
             .backend
             .download_f32(&cached.raw_biases)
             .map_err(|err| backend_error("download synced MoE expert biases", err))?;
+        let bn = cached
+            .bn
+            .as_ref()
+            .map(|bn| -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+                Ok((
+                    self.backend
+                        .download_f32(&bn.scales)
+                        .map_err(|err| backend_error("download synced MoE BN scales", err))?,
+                    self.backend
+                        .download_f32(&bn.rolling_mean)
+                        .map_err(|err| backend_error("download synced MoE BN rolling mean", err))?,
+                    self.backend
+                        .download_f32(&bn.rolling_variance)
+                        .map_err(|err| backend_error("download synced MoE BN rolling variance", err))?,
+                ))
+            })
+            .transpose()?;
         let Some(LayerParams::Moe(params)) = self.params.get_mut(owner) else {
             return Err(Error::InvalidConfig(format!(
                 "missing CPU MoE params for layer #{owner}"
@@ -10458,8 +10543,19 @@ where
                 "missing CPU MoE expert #{expert_index} for layer #{owner}"
             )));
         };
+        if expert.batch_norm.is_some() != bn.is_some() {
+            return Err(Error::InvalidConfig(format!(
+                "CPU/device BN mismatch for MoE expert #{expert_index} at layer #{owner}"
+            )));
+        }
         expert.weights = raw_weights;
         expert.biases = raw_biases;
+        if let (Some((scales, mean, variance)), Some(batch_norm)) = (bn, expert.batch_norm.as_mut())
+        {
+            batch_norm.scales = scales;
+            batch_norm.rolling_mean = mean;
+            batch_norm.rolling_variance = variance;
+        }
         Ok(())
     }
 }
@@ -26270,7 +26366,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_adam_updates_batchnorm_moe_after_device_gradient_flush() {
+    fn gpu_adam_updates_batchnorm_moe_on_device() {
         let network = Network::from_config(
             ConfigFile::parse_str(
                 "inline.cfg",
@@ -26280,7 +26376,6 @@ mod tests {
         )
         .expect("network");
         let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
-        gpu.zero_train_buffers_gpu().expect("device train buffers");
         {
             let LayerParams::Moe(params) = &mut gpu.params[0] else {
                 panic!("MoE parameters");
@@ -26297,6 +26392,7 @@ mod tests {
                     .scales[0] = 0.7 + index as f32 * 0.2;
             }
         }
+        gpu.zero_train_buffers_gpu().expect("device train buffers");
         let adam = super::AdamParams {
             lr: 0.01,
             beta1: 0.8,
@@ -26386,8 +26482,12 @@ mod tests {
             }
             train.dirty = true;
         }
-        gpu.update_weights_gpu(0.01, 0.0, 0.0, 1)
-            .expect("BN MoE Adam after device flush");
+        gpu.update_weights_gpu_deferred(0.01, 0.0, 0.0, 1)
+            .expect("deferred BN MoE Adam");
+        assert!(gpu.host_weights_stale);
+        gpu.sync_host_weights_from_device()
+            .expect("sync deferred BN MoE Adam");
+        assert!(!gpu.host_weights_stale);
         let LayerParams::Moe(params) = &gpu.params[0] else {
             unreachable!();
         };
@@ -26924,6 +27024,159 @@ mod tests {
             .load_optimizer_state(&legacy_path)
             .expect("load legacy v1 state");
         assert_eq!(legacy_network.adam_step(), 7);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn optimizer_state_migrates_and_round_trips_batchnorm_moe_adam_moments() {
+        let dir =
+            std::env::temp_dir().join(format!("darknet-moe-bn-opt-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let host_path = dir.join("host-v3.state");
+        let device_path = dir.join("device-v4.state");
+        let resumed_path = dir.join("resumed-v4.state");
+        let cfg = "[net]\nwidth=1\nheight=1\nchannels=1\nbatch=1\nadam=1\nb1=0.8\nb2=0.95\neps=0.001\n[moe_convolutional]\nfilters=1\nsize=1\nexperts=2\ntop_k=0\nload_balance=0\nactivation=linear\n";
+        let build = || {
+            let network = Network::from_config(ConfigFile::parse_str("inline.cfg", cfg).unwrap())
+                .unwrap();
+            let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+            let LayerParams::Moe(params) = &mut gpu.params[0] else {
+                panic!("MoE parameters");
+            };
+            params.router_weights.copy_from_slice(&[0.2, -0.4]);
+            params.router_biases.copy_from_slice(&[0.1, -0.2]);
+            for (index, expert) in params.experts.iter_mut().enumerate() {
+                expert.weights[0] = 0.15 * (index as f32 + 1.0);
+                expert.biases[0] = -0.05 * (index as f32 + 1.0);
+                expert
+                    .batch_norm
+                    .as_mut()
+                    .expect("MoE BN params")
+                    .scales[0] = 0.7 + index as f32 * 0.2;
+            }
+            gpu
+        };
+        let host_grads = |gpu: &mut GpuExecutableNetwork<FakeBackend>, step: f32| {
+            let LayerTrainBuffers::Moe(train) = &mut gpu.cpu_fallback_train_buffers.get_mut()[0]
+            else {
+                panic!("host MoE train buffers");
+            };
+            train.router_weight_updates.copy_from_slice(&[0.03 * step, -0.02 * step]);
+            train.router_bias_updates.copy_from_slice(&[-0.01 * step, 0.04 * step]);
+            for (index, expert) in train.experts.iter_mut().enumerate() {
+                expert.weight_updates[0] = 0.02 * step * (index as f32 + 1.0);
+                expert.bias_updates[0] = -0.03 * step * (index as f32 + 1.0);
+                expert
+                    .batch_norm
+                    .as_mut()
+                    .expect("host MoE BN train buffers")
+                    .scale_updates[0] = 0.04 * step * (index as f32 + 1.0);
+            }
+        };
+        let device_grads = |gpu: &mut GpuExecutableNetwork<FakeBackend>, step: f32| {
+            let mut buffers = gpu.device_moe_train_buffers.borrow_mut();
+            let train = buffers[0].as_mut().expect("device MoE train buffers");
+            train
+                .router_weight_updates
+                .data
+                .copy_from_slice(&[0.03 * step, -0.02 * step]);
+            train
+                .router_bias_updates
+                .data
+                .copy_from_slice(&[-0.01 * step, 0.04 * step]);
+            for index in 0..2 {
+                train.expert_weight_updates[index].data[0] =
+                    0.02 * step * (index as f32 + 1.0);
+                train.expert_bias_updates[index].data[0] =
+                    -0.03 * step * (index as f32 + 1.0);
+                train.expert_scale_updates[index]
+                    .as_mut()
+                    .expect("device MoE scale updates")
+                    .data[0] = 0.04 * step * (index as f32 + 1.0);
+            }
+            train.dirty = true;
+        };
+        let assert_params_close = |a: &GpuExecutableNetwork<FakeBackend>,
+                                   b: &GpuExecutableNetwork<FakeBackend>| {
+            let (LayerParams::Moe(a), LayerParams::Moe(b)) = (&a.params[0], &b.params[0]) else {
+                panic!("MoE parameters");
+            };
+            assert_slice_close("MoE router weights", &a.router_weights, &b.router_weights, 2e-6);
+            assert_slice_close("MoE router biases", &a.router_biases, &b.router_biases, 2e-6);
+            for (a, b) in a.experts.iter().zip(&b.experts) {
+                assert_slice_close("MoE expert weights", &a.weights, &b.weights, 2e-6);
+                assert_slice_close("MoE expert biases", &a.biases, &b.biases, 2e-6);
+                assert_slice_close(
+                    "MoE BN scales",
+                    &a.batch_norm.as_ref().unwrap().scales,
+                    &b.batch_norm.as_ref().unwrap().scales,
+                    2e-6,
+                );
+            }
+        };
+
+        // Save legacy-format nested host moments, including each BN scale slot.
+        let mut host = build();
+        host_grads(&mut host, 1.0);
+        host.update_weights_gpu(0.01, 0.0, 0.0, 1)
+            .expect("first host BN MoE Adam step");
+        host.save_optimizer_state(&host_path)
+            .expect("save host BN MoE moments");
+        assert_eq!(&std::fs::read(&host_path).unwrap()[..8], b"DNOPT3\0\0");
+
+        let mut host_reference = build();
+        host_reference.params.clone_from(&host.params);
+        host_reference
+            .load_optimizer_state(&host_path)
+            .expect("restore host BN MoE moments");
+        host_grads(&mut host_reference, 2.0);
+        host_reference
+            .update_weights_gpu(0.01, 0.0, 0.0, 1)
+            .expect("second host BN MoE Adam step");
+
+        let mut device = build();
+        device.params.clone_from(&host.params);
+        device.init_train_buffers_gpu().expect("device BN buffers");
+        device
+            .load_optimizer_state(&host_path)
+            .expect("load legacy host moments for BN device migration");
+        device_grads(&mut device, 2.0);
+        device
+            .update_weights_gpu(0.01, 0.0, 0.0, 1)
+            .expect("BN MoE device Adam after migration");
+        assert_params_close(&device, &host_reference);
+        assert!(device.host_adam_state.borrow()[0].is_none());
+        assert!(device.moe_adam_state[0]
+            .as_ref()
+            .unwrap()
+            .experts
+            .iter()
+            .all(|expert| expert.scales.is_some()));
+        device
+            .save_optimizer_state(&device_path)
+            .expect("save DNOPT4 BN moments");
+        let saved = std::fs::read(&device_path).unwrap();
+        assert_eq!(&saved[..8], b"DNOPT4\0\0");
+
+        let mut resumed = build();
+        resumed.params.clone_from(&device.params);
+        resumed.init_train_buffers_gpu().expect("resumed device buffers");
+        resumed
+            .load_optimizer_state(&device_path)
+            .expect("restore DNOPT4 scale moments");
+        resumed
+            .save_optimizer_state(&resumed_path)
+            .expect("resave DNOPT4 moments");
+        assert_eq!(saved, std::fs::read(&resumed_path).unwrap());
+        device_grads(&mut device, 3.0);
+        device_grads(&mut resumed, 3.0);
+        device
+            .update_weights_gpu(0.01, 0.0, 0.0, 1)
+            .expect("continued BN MoE device Adam");
+        resumed
+            .update_weights_gpu(0.01, 0.0, 0.0, 1)
+            .expect("resumed BN MoE device Adam");
+        assert_params_close(&device, &resumed);
         std::fs::remove_dir_all(dir).ok();
     }
 

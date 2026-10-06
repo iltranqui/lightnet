@@ -138,9 +138,10 @@ Immediately next, in dependency order:
   Adam have device-side paths, using owner/expert slots for convolution experts.
   Router parameter values sync to host after each update because the current
   router forward consumes host params; gradients and optimizer moments stay
-  device-side. DNOPT3 persists device MoE Adam moments, while DNOPT1/2 remain
-  readable and DNOPT2 host moments migrate on the first device update. BN expert
-  backward now uses backend ops; BN expert SGD/Adam updates remain host-side.
+  device-side. DNOPT3 persists no-BN device MoE Adam moments; DNOPT4 adds BN
+  expert scale moments and migrates nested host BN moments to device. DNOPT1-3
+  remain readable. BN expert backward uses backend ops; BN MoE Adam updates
+  experts/router and BN scales on-device, while BN expert SGD remains host-side.
 - [~] Phase 2B `moe_convolutional`: real-device forward computes router pooling,
   logits, top-k masking, softmax, expert convolutions, and gate blending. For
   no-BN experts, router connected-backward, gate-column selection and gate-dot
@@ -149,24 +150,27 @@ Immediately next, in dependency order:
   gates and pooled/expert activation/output caches remain device-resident, with
   no gate/dot transfers in the normal Oxide training path. Router/expert
   parameter gradients accumulate on-device across backward calls. For SGD and
-  Adam, no-BN router and expert updates run on-device without gradient transfers;
-  Adam moments persist in DNOPT3, and legacy DNOPT2 host moments migrate on the
-  first device update. Router parameter values sync to host after each step for
-  the next forward, while expert values support deferred host sync. BN expert
-  backward uses backend ops and accumulates scale/beta gradients on device;
-  BN expert SGD/Adam updates remain host-side. The dynamic-loss-scale finiteness
-  check covers dirty router/expert/BN-scale buffers
-  (`gpu_moe_device_gradients_participate_in_loss_scale_finiteness_check`); FakeBackend
+  Adam, no-BN router and expert updates run on-device without gradient transfers.
+  Router parameter values sync to host after each step for the next forward,
+  while expert values support deferred host sync. BN expert backward uses
+  backend ops and accumulates scale/beta gradients on device;
+  BN expert Adam updates weights, beta, and scale on-device, with DNOPT4 scale
+  moments and DNOPT1-3 compatibility. BN expert SGD remains host-side. The
+  dynamic-loss-scale finiteness check covers dirty router/expert/BN-scale
+  buffers (`gpu_moe_device_gradients_participate_in_loss_scale_finiteness_check`);
+  FakeBackend
   parity also checks router momentum residency, `dont_update` gradient
   retention, and BN expert backward/SGD parity.
   Verified against CPU in
   `oxide_runtime_chain::moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu`
   (two backward calls accumulated before the first deferred SGD step, followed
   by a second deferred step, including upstream convolution updates) and
-  `oxide_runtime_chain::moe_adam_updates_router_and_experts_on_oxide_match_cpu_gradients`
-  and `oxide_runtime_chain::moe_batchnorm_expert_device_backward_matches_cpu_on_oxide`;
-  the latter checks BN scales and upstream convolution updates. Router-specific
-  soft/tied top-k parity coverage in `oxide_layers_extra`.
+  `oxide_runtime_chain::moe_adam_updates_router_and_experts_on_oxide_match_cpu_gradients`,
+  `oxide_runtime_chain::moe_batchnorm_expert_device_backward_matches_cpu_on_oxide`,
+  and `oxide_runtime_chain::moe_batchnorm_adam_updates_experts_on_oxide_match_cpu_gradients`;
+  BN Adam parity checks scales, upstream convolution, and deferred host sync.
+  FakeBackend optimizer-state tests cover host BN migration and DNOPT4 scale
+  round-trip; router-specific soft/tied top-k parity is in `oxide_layers_extra`.
   CPU path is done (`cdf68d00`). `eml_convolutional` not started (save order
   verified 2026-10-05).
 - [ ] Phase 2B `dcnv3` blocked: no reference numerics (stub in all five branches).

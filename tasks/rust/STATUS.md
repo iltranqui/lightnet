@@ -34,6 +34,14 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v55: BN MoE router/expert Adam now updates raw weights, beta, and BN scales
+  on-device; scale moments are persisted in DNOPT4 while DNOPT1-3 remain
+  readable, including migration of nested host BN moments from DNOPT3. Deferred
+  sync now retains device-updated BN expert caches and copies raw params plus
+  BN stats back to host. FakeBackend MoE tests passed (20/20), including host-to-
+  device scale-moment migration and v4 resume; optimizer-state compatibility
+  tests passed (4/4). The full real-device `oxide_runtime_chain` suite passed
+  (13/13), including BN Adam parity and deferred synchronization.
 - v54: BN MoE expert backward is no longer routed through whole-network CPU
   fallback. The backend computes BN affine/input/weight derivatives and
   accumulates beta/scale gradients with router/expert gradients on device;
@@ -160,20 +168,24 @@ Latest increments:
   expert convolution backward use backend ops. Gates and pooled/expert
   output/activation caches stay device-resident; no gate/dot values cross the
   host in normal Oxide training. Router/expert parameter gradients accumulate
-  on-device across backward calls. For SGD, router and expert parameter updates
-  plus momentum run on-device without gradient transfers. Router parameter values
+  on-device across backward calls. For SGD, no-BN router/expert parameter
+  updates plus momentum run on-device without gradient transfers. Router values
   sync to host after each step for the next forward; expert values support
   deferred host sync. No-BN MoE Adam updates also run on-device without gradient
-  transfers; DNOPT3 persists the moments and DNOPT2 host moments migrate on first
-  use. BN expert backward now uses backend ops; BN expert SGD/Adam updates remain
-  host-side. The dynamic-loss-scale finiteness check covers dirty router/expert/
-  BN-scale buffers. FakeBackend parity and real-device
+  transfers; DNOPT3 persists their moments and legacy DNOPT2 host moments migrate
+  on first use. DNOPT4 adds BN MoE scale moments; DNOPT1-3 remain readable, and
+  nested host BN moments migrate on the first BN Adam device update. BN expert
+  backward uses backend ops; BN expert Adam runs on-device with DNOPT4 scale
+  moments, while BN expert SGD remains host-side. The dynamic-loss-scale
+  finiteness check covers dirty router/expert/BN-scale buffers. FakeBackend
+  parity and real-device
   `moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu`
   pass, including two backward calls accumulated before the first deferred SGD
   step, followed by a second step with upstream convolution updates. Real-device
   `moe_batchnorm_expert_device_backward_matches_cpu_on_oxide` also checks BN
   expert gradients and updates against CPU, including upstream convolution
-  updates. The FakeBackend test
+  updates. `moe_batchnorm_adam_updates_experts_on_oxide_match_cpu_gradients`
+  checks BN expert/scale Adam and deferred synchronization. The FakeBackend test
   `gpu_moe_device_gradients_participate_in_loss_scale_finiteness_check` verifies
   dirty router/expert/BN-scale accumulators are checked for overflow; FakeBackend
   SGD parity also checks router momentum residency and `dont_update` gradient
@@ -203,9 +215,10 @@ Latest increments:
   compare training updates with CPU, including upstream convolution updates.
 - Host Adam updates standalone batchnorm, local, connected, weighted shortcut,
   MoE fallback, deconvolutional, GRU/RNN/LSTM/CRNN, and ViT parameters with
-  distinct moment slots and per-layer rate scaling. DNOPT3 persists device MoE
-  moments and host moments; DNOPT1/2 remain loadable, with DNOPT2 MoE host moments
-  migrated on first no-BN device update. The ViT reference test covers C++ weight
+  distinct moment slots and per-layer rate scaling. DNOPT3 persists no-BN device
+  MoE moments and host moments; DNOPT4 adds device BN scale moments. DNOPT1-3
+  remain loadable, with nested BN host moments migrating on first BN device Adam
+  update. The ViT reference test covers C++ weight
   order, decay groups, clipping, and reduced mHC rate; host resume has a
   multi-step continuation test.
 - `[vit]` reference path: cfg/shape, C++-ordered header-aware weights, seeded init,
@@ -252,8 +265,8 @@ believing a `cfg_corpus` failure.
 2. Phase 2A is done, including `detect::decode_modern_detections` and the
    `detect-image` merge. Phase 2B `moe_convolutional` has a verified CPU path
    and partial Oxide forward/backward; no-BN router/expert SGD and Adam are now
-   device-side; BN expert backward uses backend ops, while BN expert SGD/Adam
-   remain host-side.
+   device-side; BN expert backward and Adam use backend ops, while BN expert
+   SGD remains host-side.
    Remaining across the phases:
    `cfg/LegoGears_centernet.cfg` end to end (the cfg lives on `Jev_laya`), then
    2B's `eml_convolutional`, 2C (OBB), 3A/3B (transformer + deformable families,
@@ -267,8 +280,8 @@ believing a `cfg_corpus` failure.
    `vc_attention` fast paths (decision 3) get their own kernels or reuse the
    reference attention path.
 4. Phase 2B `moe_convolutional` (weights order verified) has partial Oxide
-   training support; BN backward uses backend ops, while BN expert SGD/Adam
-   remain host-side. Then
+   training support; BN backward/Adam use backend ops, while BN expert SGD
+   remains host-side. Then
    port `eml_convolutional` (an activation, not a `LayerKind`; save order **re-read
    2026-10-05**: `input_layer` then `self_layer`, two full conv blocks).
 5. Phase 3B deformable family — start with `dcnv4` (real C++ forward and
