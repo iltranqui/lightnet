@@ -1438,7 +1438,7 @@ fn shortcut_fit_edge_cases_and_errors() {
 
 // -------------------------------------------------------------- activations
 
-const KINDS: [F32ActivationKind; 12] = [
+const KINDS: [F32ActivationKind; 13] = [
     F32ActivationKind::Linear,
     F32ActivationKind::Logistic,
     F32ActivationKind::Relu,
@@ -1451,6 +1451,7 @@ const KINDS: [F32ActivationKind; 12] = [
     F32ActivationKind::Gelu,
     F32ActivationKind::Elu,
     F32ActivationKind::Selu,
+    F32ActivationKind::HardMish,
 ];
 
 fn kind_of(name: &str) -> Option<F32ActivationKind> {
@@ -1469,6 +1470,7 @@ fn kind_of(name: &str) -> Option<F32ActivationKind> {
         "gelu" => F32ActivationKind::Gelu,
         "elu" => F32ActivationKind::Elu,
         "selu" => F32ActivationKind::Selu,
+        "hard_mish" => F32ActivationKind::HardMish,
         _ => return None,
     };
     match k {
@@ -1483,7 +1485,8 @@ fn kind_of(name: &str) -> Option<F32ActivationKind> {
         | F32ActivationKind::Ramp
         | F32ActivationKind::Gelu
         | F32ActivationKind::Elu
-        | F32ActivationKind::Selu => {}
+        | F32ActivationKind::Selu
+        | F32ActivationKind::HardMish => {}
     }
     Some(k)
 }
@@ -1515,6 +1518,15 @@ fn act64(kind: F32ActivationKind, x: f64) -> f64 {
                 1.0507 * x
             } else {
                 1.0507 * 1.6732 * (x.exp() - 1.0)
+            }
+        }
+        F32ActivationKind::HardMish => {
+            if x > 0.0 {
+                x
+            } else if x > -2.0 {
+                x * x / 2.0 + x
+            } else {
+                0.0
             }
         }
     }
@@ -1554,6 +1566,15 @@ fn grad64(kind: F32ActivationKind, x: f64) -> f64 {
                 1.0507 * 1.6732 * x.exp()
             }
         }
+        F32ActivationKind::HardMish => {
+            if x > 0.0 {
+                1.0
+            } else if x > -2.0 {
+                x + 1.0
+            } else {
+                0.0
+            }
+        }
     }
 }
 
@@ -1583,6 +1604,15 @@ fn act32(kind: F32ActivationKind, x: f32) -> f32 {
                 1.0507 * x
             } else {
                 1.0507 * 1.6732 * (x.exp() - 1.0)
+            }
+        }
+        F32ActivationKind::HardMish => {
+            if x > 0.0 {
+                x
+            } else if x > -2.0 {
+                x * x / 2.0 + x
+            } else {
+                0.0
             }
         }
     }

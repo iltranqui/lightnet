@@ -34,6 +34,12 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- Added an oxide Hard Mish activation kernel and exact derivative, including
+  Darknet's strict threshold behavior at -2 and 0. Verified by `oxide_parity`
+  (11 passed, including finite differences and explicit x=-2), `oxide_half` (13
+  passed, 1 ignored), all 13 `oxide_cfg_shapes` tests (159 forward/backward
+  convolution-activation pairs), and all 7 real-device `oxide_runtime_chain`
+  tests. The core library suite passed (391 tests).
 - Added an oxide SELU activation kernel and exact derivative, enabling native
   convolution activation execution. Verified by `oxide_parity` (11 passed,
   including activation finite differences), `oxide_half` (13 passed, 1 ignored,

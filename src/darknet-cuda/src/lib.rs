@@ -29,6 +29,8 @@ pub enum F32ActivationKind {
     Elu,
     /// Scaled exponential linear unit using Darknet's fixed scale and alpha.
     Selu,
+    /// Hard Mish: `x` above zero, quadratic transition on `(-2, 0]`, else zero.
+    HardMish,
 }
 
 /// Outputs of [`F32TensorOpsBackend::batchnorm_train_forward_f32`].

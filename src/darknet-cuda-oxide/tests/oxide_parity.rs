@@ -42,7 +42,7 @@ fn assert_close(name: &str, got: &[f32], want: &[f32]) {
     }
 }
 
-const KINDS: [F32ActivationKind; 12] = [
+const KINDS: [F32ActivationKind; 13] = [
     F32ActivationKind::Linear,
     F32ActivationKind::Logistic,
     F32ActivationKind::Relu,
@@ -55,6 +55,7 @@ const KINDS: [F32ActivationKind; 12] = [
     F32ActivationKind::Gelu,
     F32ActivationKind::Elu,
     F32ActivationKind::Selu,
+    F32ActivationKind::HardMish,
 ];
 
 fn cpu_activate(kind: F32ActivationKind, x: f32) -> f32 {
@@ -87,6 +88,15 @@ fn cpu_activate(kind: F32ActivationKind, x: f32) -> f32 {
                 1.0507 * x
             } else {
                 1.0507 * 1.6732 * (x.exp() - 1.0)
+            }
+        }
+        F32ActivationKind::HardMish => {
+            if x > 0.0 {
+                x
+            } else if x > -2.0 {
+                x * x / 2.0 + x
+            } else {
+                0.0
             }
         }
     }
@@ -147,6 +157,15 @@ fn cpu_gradient(kind: F32ActivationKind, x: f32) -> f32 {
                 1.0507 * 1.6732 * x.exp()
             }
         }
+        F32ActivationKind::HardMish => {
+            if x > 0.0 {
+                1.0
+            } else if x > -2.0 {
+                x + 1.0
+            } else {
+                0.0
+            }
+        }
     }
 }
 
@@ -179,6 +198,7 @@ fn activations_forward_and_backward() {
     x[3] = 6.0; // ReLU6 upper kink: gradient 0 at exactly 6 (C++ `x < 6`)
     x[4] = 5.999;
     x[5] = 6.001;
+    x[6] = -2.0; // HardMish lower transition boundary.
     let delta = rng.vec(n, -2.0, 2.0);
     let xt = b.upload_f32(&[n], &x).unwrap();
     let dt = b.upload_f32(&[n], &delta).unwrap();
@@ -389,6 +409,15 @@ fn act64(kind: F32ActivationKind, x: f64) -> f64 {
                 1.0507 * x
             } else {
                 1.0507 * 1.6732 * (x.exp() - 1.0)
+            }
+        }
+        F32ActivationKind::HardMish => {
+            if x > 0.0 {
+                x
+            } else if x > -2.0 {
+                x * x / 2.0 + x
+            } else {
+                0.0
             }
         }
     }
