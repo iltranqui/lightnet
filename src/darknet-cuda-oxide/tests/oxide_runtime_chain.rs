@@ -343,6 +343,114 @@ fn moe_adam_updates_router_and_experts_on_oxide_match_cpu_gradients() {
 }
 
 #[test]
+fn moe_batchnorm_expert_device_backward_matches_cpu_on_oxide() {
+    let net = network(
+        "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=2\n\
+         [convolutional]\nfilters=2\nsize=1\nbatch_normalize=0\nactivation=linear\n\
+         [moe_convolutional]\nfilters=2\nsize=1\nexperts=2\n\
+         top_k=0\nload_balance=0\nactivation=leaky\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("oxide backend"));
+    let LayerParams::Convolutional(conv) = &mut gpu.params[0] else {
+        panic!("conv parameters")
+    };
+    conv.weights.copy_from_slice(&[1.0, 0.0, 0.0, 1.0]);
+    conv.biases.copy_from_slice(&[0.0, 0.0]);
+    {
+        let LayerParams::Moe(moe) = &mut gpu.params[1] else {
+            panic!("MoE parameters")
+        };
+        moe.router_weights.copy_from_slice(&[0.15, -0.25, -0.05, 0.2]);
+        moe.router_biases.copy_from_slice(&[0.03, -0.02]);
+        for (slot, expert) in moe.experts.iter_mut().enumerate() {
+            expert.weights.copy_from_slice(&[
+                0.25 + slot as f32 * 0.1,
+                -0.1,
+                0.05,
+                0.35 - slot as f32 * 0.08,
+            ]);
+            expert.biases.copy_from_slice(&[0.02, -0.04]);
+            let bn = expert.batch_norm.as_mut().expect("MoE BN parameters");
+            bn.scales.copy_from_slice(&[0.8, 1.1]);
+            bn.rolling_mean.copy_from_slice(&[0.1, -0.2]);
+            bn.rolling_variance.copy_from_slice(&[0.7, 1.3]);
+        }
+    }
+    cpu.params = gpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("device train buffers");
+    let input = patterned(cpu.network.net.input_shape());
+    let cpu_fwd = cpu.forward_training(&input).expect("CPU MoE forward");
+    let gpu_fwd = gpu
+        .forward_training_device(&input)
+        .expect("Oxide MoE forward");
+    for layer_index in 0..2 {
+        close(
+            &format!("MoE BN forward layer {layer_index}"),
+            &cpu_fwd.layer_outputs[layer_index].data,
+            &gpu.backend
+                .download_f32(&gpu_fwd.gpu_layer_outputs[layer_index])
+                .expect("download MoE BN forward"),
+            1e-4,
+        );
+    }
+    let shape = cpu.network.layers[1].output_shape;
+    let seed = Tensor::from_data(
+        shape,
+        (0..shape.batch * shape.element_count())
+            .map(|i| (i as f32 * 0.29).cos())
+            .collect(),
+    )
+    .expect("seed");
+    let mut seeds = vec![None; 2];
+    seeds[1] = Some(seed);
+    cpu.zero_train_buffers();
+    gpu.zero_train_buffers_gpu().expect("zero train buffers");
+    cpu.backward_accumulate_seeded(&input, &cpu_fwd, &seeds)
+        .expect("CPU MoE BN backward");
+    gpu.backward_accumulate_seeded_gpu(&gpu_fwd, &seeds)
+        .expect("Oxide MoE BN backward");
+    cpu.update_weights(0.01, 0.0, 0.0, 2);
+    gpu.update_weights_gpu(0.01, 0.0, 0.0, 2)
+        .expect("Oxide MoE BN update");
+
+    let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(gpu_conv)) =
+        (&cpu.params[0], &gpu.params[0])
+    else {
+        panic!("conv parameters after BN update")
+    };
+    close("MoE BN preceding conv weights", &cpu_conv.weights, &gpu_conv.weights, 1e-4);
+    close("MoE BN preceding conv biases", &cpu_conv.biases, &gpu_conv.biases, 1e-4);
+    let (LayerParams::Moe(cpu_moe), LayerParams::Moe(gpu_moe)) =
+        (&cpu.params[1], &gpu.params[1])
+    else {
+        panic!("MoE parameters after BN update")
+    };
+    close("MoE BN router weights", &cpu_moe.router_weights, &gpu_moe.router_weights, 1e-4);
+    close("MoE BN router biases", &cpu_moe.router_biases, &gpu_moe.router_biases, 1e-4);
+    for (index, (cpu_expert, gpu_expert)) in cpu_moe.experts.iter().zip(&gpu_moe.experts).enumerate() {
+        close(
+            &format!("MoE BN expert {index} weights"),
+            &cpu_expert.weights,
+            &gpu_expert.weights,
+            1e-4,
+        );
+        close(
+            &format!("MoE BN expert {index} biases"),
+            &cpu_expert.biases,
+            &gpu_expert.biases,
+            1e-4,
+        );
+        close(
+            &format!("MoE BN expert {index} scales"),
+            &cpu_expert.batch_norm.as_ref().unwrap().scales,
+            &gpu_expert.batch_norm.as_ref().unwrap().scales,
+            1e-4,
+        );
+    }
+}
+
+#[test]
 fn moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu() {
     let net = network(
         "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=2\n\

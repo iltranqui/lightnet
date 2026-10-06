@@ -34,6 +34,16 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v54: BN MoE expert backward is no longer routed through whole-network CPU
+  fallback. The backend computes BN affine/input/weight derivatives and
+  accumulates beta/scale gradients with router/expert gradients on device;
+  host-side SGD/Adam consume them after flush. No-BN router/expert optimizer
+  paths remain device-native. FakeBackend MoE tests passed (19/19), including BN
+  gradient/SGD parity, BN Adam host fallback, and BN-scale overflow detection;
+  the full real-device `oxide_runtime_chain` suite passed (12/12). The focused
+  `moe_batchnorm_expert_device_backward_matches_cpu_on_oxide` test passed (1/1),
+  comparing upstream conv, router, expert, and BN scale updates against CPU.
+  BN expert Adam remains host-side.
 - v53: moved no-BN MoE router/expert Adam updates and moment storage onto the
   device; DNOPT3 persists those moments, DNOPT1/2 remain readable, and legacy
   DNOPT2 host moments migrate on the first device update. Fixed host nested-Adam
@@ -155,14 +165,18 @@ Latest increments:
   sync to host after each step for the next forward; expert values support
   deferred host sync. No-BN MoE Adam updates also run on-device without gradient
   transfers; DNOPT3 persists the moments and DNOPT2 host moments migrate on first
-  use. BN expert backward and Adam remain on the host fallback. The dynamic-loss-
-  scale finiteness check covers dirty router/expert buffers. BN experts stay on the CPU fallback. FakeBackend parity and real-device
+  use. BN expert backward now uses backend ops; BN expert SGD/Adam updates remain
+  host-side. The dynamic-loss-scale finiteness check covers dirty router/expert/
+  BN-scale buffers. FakeBackend parity and real-device
   `moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu`
   pass, including two backward calls accumulated before the first deferred SGD
-  step, followed by a second step with upstream convolution updates. The FakeBackend test
+  step, followed by a second step with upstream convolution updates. Real-device
+  `moe_batchnorm_expert_device_backward_matches_cpu_on_oxide` also checks BN
+  expert gradients and updates against CPU, including upstream convolution
+  updates. The FakeBackend test
   `gpu_moe_device_gradients_participate_in_loss_scale_finiteness_check` verifies
-  dirty router/expert accumulators are checked for overflow; FakeBackend SGD
-  parity also checks router momentum residency and `dont_update` gradient
+  dirty router/expert/BN-scale accumulators are checked for overflow; FakeBackend
+  SGD parity also checks router momentum residency and `dont_update` gradient
   retention. `oxide_layers_extra`
   verifies soft/tied top-k, pool and pool-backward, non-multiple gate-dot
   reductions, and router backward parity with load balancing.
@@ -238,7 +252,8 @@ believing a `cfg_corpus` failure.
 2. Phase 2A is done, including `detect::decode_modern_detections` and the
    `detect-image` merge. Phase 2B `moe_convolutional` has a verified CPU path
    and partial Oxide forward/backward; no-BN router/expert SGD and Adam are now
-   device-side, while BN expert backward and Adam remain on the host fallback.
+   device-side; BN expert backward uses backend ops, while BN expert SGD/Adam
+   remain host-side.
    Remaining across the phases:
    `cfg/LegoGears_centernet.cfg` end to end (the cfg lives on `Jev_laya`), then
    2B's `eml_convolutional`, 2C (OBB), 3A/3B (transformer + deformable families,
@@ -252,7 +267,8 @@ believing a `cfg_corpus` failure.
    `vc_attention` fast paths (decision 3) get their own kernels or reuse the
    reference attention path.
 4. Phase 2B `moe_convolutional` (weights order verified) has partial Oxide
-   training support; BN expert backward and Adam fallback remain host-side. Then
+   training support; BN backward uses backend ops, while BN expert SGD/Adam
+   remain host-side. Then
    port `eml_convolutional` (an activation, not a `LayerKind`; save order **re-read
    2026-10-05**: `input_layer` then `self_layer`, two full conv blocks).
 5. Phase 3B deformable family — start with `dcnv4` (real C++ forward and
