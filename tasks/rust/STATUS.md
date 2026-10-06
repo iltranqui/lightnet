@@ -143,16 +143,18 @@ Latest increments:
   expert convolution backward use backend ops. Gates and pooled/expert
   output/activation caches stay device-resident; no gate/dot values cross the
   host in normal Oxide training. Router/expert parameter gradients accumulate
-  on-device across backward calls. For SGD, expert updates remain on-device
-  while router gradients transfer at optimizer flush; Adam still transfers all
-  MoE gradients for host updates. Deferred host sync refreshes no-BN expert
-  weights. The dynamic-loss-scale finiteness check covers dirty router/expert
-  buffers. BN experts stay on the CPU fallback. FakeBackend parity and real-device
+  on-device across backward calls. For SGD, router and expert parameter updates
+  plus momentum run on-device without gradient transfers. Router parameter values
+  sync to host after each step for the next forward; expert values support
+  deferred host sync. Adam still transfers all MoE gradients for host updates.
+  The dynamic-loss-scale finiteness check covers dirty router/expert buffers. BN experts stay on the CPU fallback. FakeBackend parity and real-device
   `moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu`
   pass, including two backward calls accumulated before the first deferred SGD
   step, followed by a second step with upstream convolution updates. The FakeBackend test
   `gpu_moe_device_gradients_participate_in_loss_scale_finiteness_check` verifies
-  dirty router/expert accumulators are checked for overflow. `oxide_layers_extra`
+  dirty router/expert accumulators are checked for overflow; FakeBackend SGD
+  parity also checks router momentum residency and `dont_update` gradient
+  retention. `oxide_layers_extra`
   verifies soft/tied top-k, pool and pool-backward, non-multiple gate-dot
   reductions, and router backward parity with load balancing.
 - Overlapping-window maxpool backward, including `maxpool_zero_nonmax`, now
@@ -226,7 +228,7 @@ believing a `cfg_corpus` failure.
 2. Phase 2A is done, including `detect::decode_modern_detections` and the
    `detect-image` merge. Phase 2B `moe_convolutional` has a verified CPU path
    and partial Oxide forward/backward; no-BN expert SGD is now device-side,
-   while router SGD, MoE Adam, and BN expert backward remain host-side.
+   while MoE Adam and BN expert backward remain host-side.
    Remaining across the phases:
    `cfg/LegoGears_centernet.cfg` end to end (the cfg lives on `Jev_laya`), then
    2B's `eml_convolutional`, 2C (OBB), 3A/3B (transformer + deformable families,
@@ -240,8 +242,7 @@ believing a `cfg_corpus` failure.
    `vc_attention` fast paths (decision 3) get their own kernels or reuse the
    reference attention path.
 4. Phase 2B `moe_convolutional` (weights order verified) has partial Oxide
-   training support; router SGD, MoE Adam, and BN expert backward remain
-   host-side. Then port
+   training support; MoE Adam and BN expert backward remain host-side. Then port
    `eml_convolutional` (an activation, not a `LayerKind`; save order **re-read
    2026-10-05**: `input_layer` then `self_layer`, two full conv blocks).
 5. Phase 3B deformable family — start with `dcnv4` (real C++ forward and

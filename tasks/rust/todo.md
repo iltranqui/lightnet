@@ -132,9 +132,11 @@ Immediately next, in dependency order:
   owner layer + expert slot; `warm_device_conv_params` warms each MoE expert,
   and host-updated experts invalidate/re-upload their slots. FakeBackend test
   covers slot separation and rewarm. The generic convolution optimizer/BN
-  refresh still handles top-level owners only; no-BN MoE expert SGD has a
-  separate slot-aware device update. Router SGD and all MoE Adam updates remain
-  host-side.
+  refresh still handles top-level owners only; no-BN MoE router/expert SGD has
+  a device-side path, using owner/expert slots for convolution experts. Router
+  params sync to host after SGD because
+  the current router forward consumes host params; router gradients/momentum stay
+  device-side. All MoE Adam updates remain host-side.
 - [~] Phase 2B `moe_convolutional`: real-device forward computes router pooling,
   logits, top-k masking, softmax, expert convolutions, and gate blending. For
   no-BN experts, router connected-backward, gate-column selection and gate-dot
@@ -143,12 +145,14 @@ Immediately next, in dependency order:
   gates and pooled/expert activation/output caches remain device-resident, with
   no gate/dot transfers in the normal Oxide training path. Router/expert
   parameter gradients accumulate on-device across backward calls. For SGD,
-  expert parameter updates stay on-device while router gradients transfer at
-  optimizer flush; Adam still transfers router/expert gradients for host updates.
-  Deferred host sync also refreshes no-BN expert weights. The dynamic-loss-scale
+  router and expert updates (including momentum) run on-device without gradient
+  transfers; router parameter values sync to host after each step for the next
+  forward, while expert values support deferred host sync. Adam still transfers
+  router/expert gradients for host updates. The dynamic-loss-scale
   finiteness check covers dirty router/expert buffers
-  (`gpu_moe_device_gradients_participate_in_loss_scale_finiteness_check`). BN
-  experts still use CPU backward.
+  (`gpu_moe_device_gradients_participate_in_loss_scale_finiteness_check`); FakeBackend
+  parity also checks router momentum residency and `dont_update` gradient
+  retention. BN experts still use CPU backward.
   Verified against CPU in
   `oxide_runtime_chain::moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu`
   (two backward calls accumulated before the first deferred SGD step, followed

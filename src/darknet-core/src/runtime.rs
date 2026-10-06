@@ -4390,8 +4390,9 @@ where
         self.init_train_buffers_gpu()
     }
 
-    /// One optimizer step over every device-resident convolution (and, for
-    /// SGD, the host-fallback layers).  The optimizer follows `[net]`: SGD with
+    /// One optimizer step over device convolutions and no-BN MoE router/expert
+    /// parameters (and, for SGD, the remaining host-fallback layers). The
+    /// optimizer follows `[net]`: SGD with
     /// momentum by default, Adam with `adam=1` (`B1`/`B2`/`eps`, coupled L2
     /// decay like C++, or AdamW with `decoupled_decay=1`; `lr`/`decay`/`batch`
     /// are the same arguments).  `loss_scale` makes the step independent of the
@@ -4408,12 +4409,13 @@ where
         self.update_weights_gpu_impl(lr, momentum, decay, batch, true)
     }
 
-    /// Like [`Self::update_weights_gpu`] but the convolution weights, biases and
-    /// BN gamma / rolling statistics stay on the device (the following backward
-    /// passes keep the rolling stats there too): `self.params[..]` conv
-    /// parameters are stale until [`Self::sync_host_weights_from_device`] runs
-    /// (call it before reading or saving `params`).  Falls back to the eager
-    /// sync when the CPU backward fallback reads host weights.
+    /// Like [`Self::update_weights_gpu`] but convolution parameters and no-BN
+    /// MoE expert weights/biases stay on the device. MoE router parameters are
+    /// synchronized immediately because the current router forward consumes
+    /// host parameters. Device-updated host parameters are stale until
+    /// [`Self::sync_host_weights_from_device`] runs (call it before reading or
+    /// saving `params`). Falls back to eager sync when CPU backward reads host
+    /// weights.
     pub fn update_weights_gpu_deferred(
         &mut self,
         lr: f32,
@@ -4689,7 +4691,7 @@ where
                 }
             }
         }
-        if matches!(step, GpuOptimizerStep::Sgd { .. }) {
+        if device_moe_path && matches!(step, GpuOptimizerStep::Sgd { .. }) {
             for layer_index in 0..self.network.layers.len() {
                 let should_update = {
                     let layer = &self.network.layers[layer_index];
@@ -4699,19 +4701,24 @@ where
                 if !should_update {
                     continue;
                 }
-                preserve_device_moe_params[layer_index] |= self.update_device_moe_experts_sgd(
-                    layer_index,
-                    &step,
-                    sync_host_weights,
-                    config,
-                )?;
+                preserve_device_moe_params[layer_index] |=
+                    self.update_device_moe_sgd(layer_index, &step, sync_host_weights, config)?;
             }
         }
         if sync_host_weights {
             self.host_weights_stale = false;
         }
         let include_moe_experts = matches!(step, GpuOptimizerStep::Adam(_));
-        self.flush_device_moe_gradients_to_host(include_moe_experts)?;
+        let preserve_device_moe_gradients =
+            device_moe_path && matches!(step, GpuOptimizerStep::Sgd { .. });
+        self.flush_device_moe_gradients_to_host(
+            include_moe_experts,
+            if preserve_device_moe_gradients {
+                &preserve_device_moe_params
+            } else {
+                &[]
+            },
+        )?;
         if let GpuOptimizerStep::Adam(adam) = step {
             self.update_cpu_fallback_adam(&adam)?;
         } else {
@@ -4992,27 +4999,27 @@ where
                     sgd_update(&mut params.weights, &mut train.weight_updates, lr, momentum, decay, batch);
                 }
                 (LayerParams::Moe(params), LayerTrainBuffers::Moe(train)) => {
-                    sgd_update(
-                        &mut params.router_biases,
-                        &mut train.router_bias_updates,
-                        lr,
-                        momentum,
-                        0.0,
-                        batch,
-                    );
-                    sgd_update(
-                        &mut params.router_weights,
-                        &mut train.router_weight_updates,
-                        lr,
-                        momentum,
-                        0.0,
-                        batch,
-                    );
                     if !preserve_device_moe_params
                         .get(layer_index)
                         .copied()
                         .unwrap_or(false)
                     {
+                        sgd_update(
+                            &mut params.router_biases,
+                            &mut train.router_bias_updates,
+                            lr,
+                            momentum,
+                            0.0,
+                            batch,
+                        );
+                        sgd_update(
+                            &mut params.router_weights,
+                            &mut train.router_weight_updates,
+                            lr,
+                            momentum,
+                            0.0,
+                            batch,
+                        );
                         for (expert, updates) in params.experts.iter_mut().zip(&mut train.experts) {
                             update_convolutional_params(expert, updates, lr, momentum, decay, batch);
                         }
@@ -8991,7 +8998,7 @@ where
         Ok(())
     }
 
-    fn update_device_moe_experts_sgd(
+    fn update_device_moe_sgd(
         &mut self,
         layer_index: usize,
         step: &GpuOptimizerStep,
@@ -9009,9 +9016,6 @@ where
         else {
             return Ok(false);
         };
-        if !train.dirty {
-            return Ok(false);
-        }
         let layer = self.network.layers.get(layer_index).ok_or_else(|| {
             Error::InvalidConfig(format!("missing MoE layer #{layer_index}"))
         })?;
@@ -9037,11 +9041,15 @@ where
         if train.expert_weight_updates.len() != spec.experts
             || train.expert_bias_updates.len() != spec.experts
             || params.experts.len() != spec.experts
+            || params.router_weights.len() != spec.experts * layer.input_shape.channels
+            || params.router_biases.len() != spec.experts
         {
             return Err(Error::InvalidConfig(format!(
-                "MoE expert count mismatch during device SGD at layer #{layer_index}"
+                "MoE parameter or gradient count mismatch during device SGD at layer #{layer_index}"
             )));
         }
+        let router_weights_host = params.router_weights.clone();
+        let router_biases_host = params.router_biases.clone();
         let grouped_channels = layer.input_shape.channels / spec.expert.groups.max(1);
         let weight_shape = [
             spec.expert.filters,
@@ -9050,6 +9058,66 @@ where
             spec.expert.size,
         ];
         let bias_shape = [spec.expert.filters];
+        let router_weight_shape = [spec.experts, layer.input_shape.channels];
+        let router_bias_shape = [spec.experts];
+        let router_weights = self
+            .backend
+            .upload_f32(&router_weight_shape, &router_weights_host)
+            .map_err(|err| backend_error("upload MoE router weights for SGD", err))?;
+        let router_biases = self
+            .backend
+            .upload_f32(&router_bias_shape, &router_biases_host)
+            .map_err(|err| backend_error("upload MoE router biases for SGD", err))?;
+        let mut router_moments = GpuAdamLayerState::default();
+        let router_targets = vec![
+            GpuOptimTarget {
+                is_weight: true,
+                w: &router_weights,
+                u: &train.router_weight_updates,
+                grad: None,
+                moments: &mut router_moments.weights,
+                shape: &router_weight_shape,
+            },
+            GpuOptimTarget {
+                is_weight: false,
+                w: &router_biases,
+                u: &train.router_bias_updates,
+                grad: None,
+                moments: &mut router_moments.biases,
+                shape: &router_bias_shape,
+            },
+        ];
+        let GpuOptimizerStep::Sgd {
+            lr,
+            momentum,
+            batch,
+            ..
+        } = step
+        else {
+            unreachable!("MoE device update is dispatched only for SGD")
+        };
+        let router_step = GpuOptimizerStep::Sgd {
+            lr: *lr,
+            momentum: *momentum,
+            decay: 0.0,
+            batch: *batch,
+        };
+        let mut router_updates =
+            gpu_optimizer_multi_step(&self.backend, &router_step, router_targets, config)?
+                .into_iter();
+        let (router_weights, router_weight_momentum) =
+            router_updates.next().expect("MoE router weights result");
+        let (router_biases, router_bias_momentum) =
+            router_updates.next().expect("MoE router biases result");
+        let router_weights_host = self
+            .backend
+            .download_f32(&router_weights)
+            .map_err(|err| backend_error("download MoE router weights after SGD", err))?;
+        let router_biases_host = self
+            .backend
+            .download_f32(&router_biases)
+            .map_err(|err| backend_error("download MoE router biases after SGD", err))?;
+
         self.warm_device_conv_params()?;
         let mut updated_weight_moments = Vec::with_capacity(spec.experts);
         let mut updated_bias_moments = Vec::with_capacity(spec.experts);
@@ -9102,18 +9170,32 @@ where
             updated_weight_moments.push(weight_momentum);
             updated_bias_moments.push(bias_momentum);
         }
+        let Some(LayerParams::Moe(params)) = self.params.get_mut(layer_index) else {
+            return Err(Error::InvalidConfig(format!(
+                "missing MoE params for layer #{layer_index}"
+            )));
+        };
+        params.router_weights = router_weights_host;
+        params.router_biases = router_biases_host;
         let mut buffers = self.device_moe_train_buffers.borrow_mut();
         let slot = buffers.get_mut(layer_index).and_then(Option::as_mut).ok_or_else(|| {
             Error::InvalidConfig(format!(
                 "missing GPU MoE train buffers for layer #{layer_index}"
             ))
         })?;
+        slot.router_weight_updates = router_weight_momentum;
+        slot.router_bias_updates = router_bias_momentum;
         slot.expert_weight_updates = updated_weight_moments;
         slot.expert_bias_updates = updated_bias_moments;
+        slot.dirty = false;
         Ok(true)
     }
 
-    fn flush_device_moe_gradients_to_host(&mut self, include_experts: bool) -> Result<()> {
+    fn flush_device_moe_gradients_to_host(
+        &mut self,
+        include_experts: bool,
+        keep_device_gradients: &[bool],
+    ) -> Result<()> {
         type HostUpdates<T> = (
             Vec<f32>,
             Vec<f32>,
@@ -9125,6 +9207,14 @@ where
             let buffers = self.device_moe_train_buffers.borrow();
             staged.reserve(buffers.len());
             for (layer_index, maybe_train) in buffers.iter().enumerate() {
+                if keep_device_gradients
+                    .get(layer_index)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    staged.push(None);
+                    continue;
+                }
                 let Some(train) = maybe_train.as_ref().filter(|train| train.dirty) else {
                     staged.push(None);
                     continue;
@@ -24200,6 +24290,31 @@ mod tests {
                     && expert.bias_updates.iter().all(|value| *value == 0.0)
             }));
         }
+        let LayerParams::Moe(cpu_params) = &cpu.params[0] else { unreachable!() };
+        let LayerParams::Moe(gpu_params) = &gpu.params[0] else { unreachable!() };
+        let cpu_router_before = cpu_params.router_weights.clone();
+        let gpu_router_before = gpu_params.router_weights.clone();
+        cpu.network.layers[0].train.dont_update = 2;
+        gpu.network.layers[0].train.dont_update = 2;
+        cpu.update_weights(0.01, 0.9, 0.001, 4);
+        gpu.update_weights_gpu(0.01, 0.9, 0.001, 4)
+            .expect("skip MoE SGD before dont_update expires");
+        let LayerParams::Moe(cpu_params) = &cpu.params[0] else {
+            unreachable!()
+        };
+        let LayerParams::Moe(gpu_params) = &gpu.params[0] else {
+            unreachable!()
+        };
+        assert_eq!(cpu_params.router_weights, cpu_router_before);
+        assert_eq!(gpu_params.router_weights, gpu_router_before);
+        assert!(
+            gpu.device_moe_train_buffers.borrow()[0]
+                .as_ref()
+                .expect("GPU MoE device train buffers")
+                .dirty
+        );
+        cpu.network.layers[0].train.dont_update = 0;
+        gpu.network.layers[0].train.dont_update = 0;
         cpu.update_weights(0.01, 0.9, 0.001, 4);
         gpu.update_weights_gpu(0.01, 0.9, 0.001, 4)
             .expect("GPU MoE SGD");
@@ -24210,13 +24325,74 @@ mod tests {
                 .expect("GPU MoE device train buffers")
                 .dirty
         );
-        let LayerParams::Moe(cpu_params) = &cpu.params[0] else { unreachable!() };
-        let LayerParams::Moe(gpu_params) = &gpu.params[0] else { unreachable!() };
-        assert_slice_close("router weights", &cpu_params.router_weights, &gpu_params.router_weights, 2e-5);
-        assert_slice_close("router biases", &cpu_params.router_biases, &gpu_params.router_biases, 2e-5);
+        let LayerTrainBuffers::Moe(cpu_train) = &cpu.train_buffers[0] else {
+            panic!("CPU MoE train buffers after SGD");
+        };
+        let device_train_buffers = gpu.device_moe_train_buffers.borrow();
+        let gpu_train = device_train_buffers[0]
+            .as_ref()
+            .expect("GPU MoE device train buffers after SGD");
+        assert_slice_close(
+            "router weight momentum",
+            &cpu_train.router_weight_updates,
+            &gpu_train.router_weight_updates.data,
+            2e-5,
+        );
+        assert_slice_close(
+            "router bias momentum",
+            &cpu_train.router_bias_updates,
+            &gpu_train.router_bias_updates.data,
+            2e-5,
+        );
+        let host_fallback = gpu.cpu_fallback_train_buffers.borrow();
+        let LayerTrainBuffers::Moe(host_train) = &host_fallback[0] else {
+            panic!("GPU host-fallback MoE buffers");
+        };
+        assert!(
+            host_train
+                .router_weight_updates
+                .iter()
+                .all(|value| *value == 0.0)
+        );
+        assert!(
+            host_train
+                .router_bias_updates
+                .iter()
+                .all(|value| *value == 0.0)
+        );
+        drop(host_fallback);
+        drop(device_train_buffers);
+        let LayerParams::Moe(cpu_params) = &cpu.params[0] else {
+            unreachable!()
+        };
+        let LayerParams::Moe(gpu_params) = &gpu.params[0] else {
+            unreachable!()
+        };
+        assert_slice_close(
+            "router weights",
+            &cpu_params.router_weights,
+            &gpu_params.router_weights,
+            2e-5,
+        );
+        assert_slice_close(
+            "router biases",
+            &cpu_params.router_biases,
+            &gpu_params.router_biases,
+            2e-5,
+        );
         for (cpu_expert, gpu_expert) in cpu_params.experts.iter().zip(&gpu_params.experts) {
-            assert_slice_close("expert weights", &cpu_expert.weights, &gpu_expert.weights, 2e-5);
-            assert_slice_close("expert biases", &cpu_expert.biases, &gpu_expert.biases, 2e-5);
+            assert_slice_close(
+                "expert weights",
+                &cpu_expert.weights,
+                &gpu_expert.weights,
+                2e-5,
+            );
+            assert_slice_close(
+                "expert biases",
+                &cpu_expert.biases,
+                &gpu_expert.biases,
+                2e-5,
+            );
         }
     }
 
