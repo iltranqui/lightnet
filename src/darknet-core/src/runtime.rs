@@ -603,6 +603,8 @@ where
 {
     input_branch_output: T,
     self_branch_output: T,
+    input_batch_norm: Option<GpuBatchNormCache<T>>,
+    self_batch_norm: Option<GpuBatchNormCache<T>>,
 }
 
 /// Device-resident recurrent values retained for LSTM backward, including the
@@ -5716,6 +5718,85 @@ where
         }
     }
 
+    fn forward_eml_branch_gpu(
+        &self,
+        owner: usize,
+        slot: usize,
+        input: &B::Tensor,
+        input_shape: TensorShape,
+        output_shape: TensorShape,
+        spec: &ConvolutionalSpec,
+        params: &ConvolutionalParams,
+        batch_norm_training: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(B::Tensor, Option<GpuBatchNormCache<B::Tensor>>)> {
+        if spec.batch_normalize != params.batch_norm.is_some() {
+            return Err(Error::InvalidConfig(format!(
+                "EML branch BN parameter mismatch at layer #{owner}, slot {slot}"
+            )));
+        }
+        let use_batch_stats = batch_norm_training && params.batch_norm.is_some();
+        let cached = if use_batch_stats {
+            self.cached_convolution_params_raw_at(
+                owner,
+                slot,
+                input_shape.channels,
+                spec,
+                params,
+            )?
+        } else {
+            self.cached_convolution_params_at(owner, slot, input_shape.channels, spec, params)?
+        };
+        let weights = if use_batch_stats {
+            &cached.raw_weights
+        } else {
+            &cached.weights
+        };
+        let raw_output = self
+            .backend
+            .conv2d_f32(
+                input,
+                weights,
+                &tensor_backend_shape(output_shape),
+                input_shape.channels,
+                input_shape.height,
+                input_shape.width,
+                spec.filters,
+                spec.size,
+                spec.stride_x,
+                spec.stride_y,
+                spec.dilation,
+                spec.padding,
+                spec.groups.max(1),
+                config,
+            )
+            .map_err(|err| backend_error("EML branch convolution", err))?;
+        if let Some(batch_norm) = params.batch_norm.as_ref()
+            && batch_norm_training
+        {
+            let (output, cache) = self.forward_batchnorm_training_gpu(
+                &raw_output,
+                &cached,
+                batch_norm,
+                output_shape,
+                true,
+                config,
+            )?;
+            return Ok((output, Some(cache)));
+        }
+        let output = self
+            .backend
+            .bias_add_f32(
+                &raw_output,
+                &cached.biases,
+                spec.filters,
+                output_shape.width * output_shape.height,
+                config,
+            )
+            .map_err(|err| backend_error("EML branch bias", err))?;
+        Ok((output, None))
+    }
+
     /// Batch-statistics batch norm of a raw (bias-free) convolution output.
     /// The shift is the layer's raw biases (the BN biases); the rolling EMA is
     /// computed on the device and applied to the host params after backward.
@@ -6970,79 +7051,28 @@ where
                     }
                 }
                 (LayerKind::EmlConvolutional(spec), LayerParams::EmlConvolutional(eml)) => {
-                    let input_branch = self.cached_convolution_params_at(
+                    let (input_output, input_batch_norm) = self.forward_eml_branch_gpu(
                         layer.index,
                         0,
-                        layer.input_shape.channels,
+                        current_input,
+                        layer.input_shape,
+                        layer.output_shape,
                         &spec.branch,
                         &eml.input,
+                        batch_norm_training,
+                        launch_config,
                     )?;
-                    let input_raw = self
-                        .backend
-                        .conv2d_f32(
-                            current_input,
-                            &input_branch.weights,
-                            &tensor_backend_shape(layer.output_shape),
-                            layer.input_shape.channels,
-                            layer.input_shape.height,
-                            layer.input_shape.width,
-                            spec.branch.filters,
-                            spec.branch.size,
-                            spec.branch.stride_x,
-                            spec.branch.stride_y,
-                            spec.branch.dilation,
-                            spec.branch.padding,
-                            spec.branch.groups.max(1),
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("EML input branch convolution", err))?;
-                    let input_output = self
-                        .backend
-                        .bias_add_f32(
-                            &input_raw,
-                            &input_branch.biases,
-                            spec.branch.filters,
-                            layer.output_shape.width * layer.output_shape.height,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("EML input branch bias", err))?;
-
-                    let self_branch = self.cached_convolution_params_at(
+                    let (self_output, self_batch_norm) = self.forward_eml_branch_gpu(
                         layer.index,
                         1,
-                        layer.input_shape.channels,
+                        current_input,
+                        layer.input_shape,
+                        layer.output_shape,
                         &spec.branch,
                         &eml.self_params,
+                        batch_norm_training,
+                        launch_config,
                     )?;
-                    let self_raw = self
-                        .backend
-                        .conv2d_f32(
-                            current_input,
-                            &self_branch.weights,
-                            &tensor_backend_shape(layer.output_shape),
-                            layer.input_shape.channels,
-                            layer.input_shape.height,
-                            layer.input_shape.width,
-                            spec.branch.filters,
-                            spec.branch.size,
-                            spec.branch.stride_x,
-                            spec.branch.stride_y,
-                            spec.branch.dilation,
-                            spec.branch.padding,
-                            spec.branch.groups.max(1),
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("EML self branch convolution", err))?;
-                    let self_output = self
-                        .backend
-                        .bias_add_f32(
-                            &self_raw,
-                            &self_branch.biases,
-                            spec.branch.filters,
-                            layer.output_shape.width * layer.output_shape.height,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("EML self branch bias", err))?;
 
                     let use_residual = spec.residual
                         && layer.input_shape.element_count() == layer.output_shape.element_count();
@@ -7050,6 +7080,8 @@ where
                     gpu_eml_cache = Some(GpuEmlBackwardCache {
                         input_branch_output: input_output.clone(),
                         self_branch_output: self_output.clone(),
+                        input_batch_norm,
+                        self_batch_norm,
                     });
                     let output = self
                         .backend
@@ -8893,13 +8925,7 @@ where
                 (
                     LayerKind::EmlConvolutional(spec),
                     Some(LayerParams::EmlConvolutional(params)),
-                ) if !spec.branch.batch_normalize => {
-                    if params.input.batch_norm.is_some() || params.self_params.batch_norm.is_some() {
-                        return Err(Error::InvalidConfig(format!(
-                            "EML BN parameters do not match no-BN spec at layer #{}",
-                            layer.index
-                        )));
-                    }
+                ) => {
                     let cache = forward
                         .gpu_eml_caches
                         .get(layer.index)
@@ -8934,34 +8960,136 @@ where
                         )
                         .map_err(|err| backend_error("EML branch backward", err))?;
                     let mut input_gradient = None;
-                    for (slot, (branch_params, branch_delta)) in [
-                        (&params.input, input_delta),
-                        (&params.self_params, self_delta),
+                    for (slot, (branch_params, branch_delta, bn_cache)) in [
+                        (
+                            &params.input,
+                            input_delta,
+                            cache.input_batch_norm.as_ref(),
+                        ),
+                        (
+                            &params.self_params,
+                            self_delta,
+                            cache.self_batch_norm.as_ref(),
+                        ),
                     ]
                     .into_iter()
                     .enumerate()
                     {
-                        let cached = self.cached_convolution_params_at(
-                            layer.index,
-                            slot,
-                            layer.input_shape.channels,
-                            &spec.branch,
-                            branch_params,
-                        )?;
-                        let bias_gradient = self
-                            .backend
-                            .bias_backward_f32(
-                                &branch_delta,
-                                spec.branch.filters,
-                                layer.output_shape.width * layer.output_shape.height,
-                                config,
-                            )
-                            .map_err(|err| backend_error("EML branch bias backward", err))?;
+                        if branch_params.batch_norm.is_some() != spec.branch.batch_normalize {
+                            return Err(Error::InvalidConfig(format!(
+                                "EML BN parameter mismatch at layer #{}, slot {slot}",
+                                layer.index
+                            )));
+                        }
+                        let cached = if bn_cache.is_some() {
+                            self.cached_convolution_params_raw_at(
+                                layer.index,
+                                slot,
+                                layer.input_shape.channels,
+                                &spec.branch,
+                                branch_params,
+                            )?
+                        } else {
+                            self.cached_convolution_params_at(
+                                layer.index,
+                                slot,
+                                layer.input_shape.channels,
+                                &spec.branch,
+                                branch_params,
+                            )?
+                        };
+                        let (grad_for_conv, bias_gradient, scale_gradient) =
+                            if let Some(bn_cache) = bn_cache {
+                                let (grad_for_conv, scale_gradient, bias_gradient) = self
+                                    .backend
+                                    .batchnorm_train_backward_f32(
+                                        &branch_delta,
+                                        &bn_cache.x_hat,
+                                        &bn_cache.variance,
+                                        &bn_cache.scales,
+                                        &tensor_backend_shape(layer.output_shape),
+                                        config,
+                                    )
+                                    .map_err(|err| {
+                                        backend_error("EML batch-norm backward", err)
+                                    })?;
+                                (grad_for_conv, bias_gradient, Some(scale_gradient))
+                            } else if let Some(batch_norm) = branch_params.batch_norm.as_ref() {
+                                let raw_output = self
+                                    .backend
+                                    .conv2d_f32(
+                                        current_input,
+                                        &cached.raw_weights,
+                                        &tensor_backend_shape(layer.output_shape),
+                                        layer.input_shape.channels,
+                                        layer.input_shape.height,
+                                        layer.input_shape.width,
+                                        spec.branch.filters,
+                                        spec.branch.size,
+                                        spec.branch.stride_x,
+                                        spec.branch.stride_y,
+                                        spec.branch.dilation,
+                                        spec.branch.padding,
+                                        spec.branch.groups.max(1),
+                                        config,
+                                    )
+                                    .map_err(|err| {
+                                        backend_error("EML rolling-BN raw convolution", err)
+                                    })?;
+                                let scale_gradient = self.batch_norm_scale_gradient_gpu(
+                                    &raw_output,
+                                    &branch_delta,
+                                    batch_norm,
+                                    layer.output_shape,
+                                )?;
+                                let bias_gradient = self
+                                    .backend
+                                    .bias_backward_f32(
+                                        &branch_delta,
+                                        spec.branch.filters,
+                                        layer.output_shape.width * layer.output_shape.height,
+                                        config,
+                                    )
+                                    .map_err(|err| {
+                                        backend_error("EML rolling-BN bias backward", err)
+                                    })?;
+                                let grad_for_conv = if let Some(scale) =
+                                    cached.batch_norm_scales.as_ref()
+                                {
+                                    self.backend
+                                        .channel_scale_f32(
+                                            &branch_delta,
+                                            scale,
+                                            spec.branch.filters,
+                                            layer.output_shape.width * layer.output_shape.height,
+                                            config,
+                                        )
+                                        .map_err(|err| {
+                                            backend_error("EML rolling-BN gradient scale", err)
+                                        })?
+                                } else {
+                                    branch_delta.clone()
+                                };
+                                (grad_for_conv, bias_gradient, Some(scale_gradient))
+                            } else {
+                                let bias_gradient = self
+                                    .backend
+                                    .bias_backward_f32(
+                                        &branch_delta,
+                                        spec.branch.filters,
+                                        layer.output_shape.width * layer.output_shape.height,
+                                        config,
+                                    )
+                                    .map_err(|err| {
+                                        backend_error("EML branch bias backward", err)
+                                    })?;
+                                (branch_delta.clone(), bias_gradient, None)
+                            };
                         let weight_gradient = self
                             .backend
                             .conv2d_backward_weights_f32(
                                 current_input,
-                                &branch_delta,
+                                &grad_for_conv,
                                 &[
                                     spec.branch.filters,
                                     layer.input_shape.channels / spec.branch.groups.max(1),
@@ -8984,7 +9112,7 @@ where
                         let branch_input_gradient = self
                             .backend
                             .conv2d_backward_input_f32(
-                                &branch_delta,
+                                &grad_for_conv,
                                 &cached.raw_weights,
                                 &tensor_backend_shape(layer.input_shape),
                                 layer.input_shape.channels,
@@ -9005,6 +9133,7 @@ where
                             slot,
                             &weight_gradient,
                             &bias_gradient,
+                            scale_gradient.as_ref(),
                         )?;
                         input_gradient = Some(match input_gradient {
                             Some(accumulated) => self
@@ -9718,10 +9847,8 @@ where
                         return true;
                     }
                 }
-                // Deconvolution has no device backward. BN EML branches stay
-                // on the CPU fallback until batch-stat backward is integrated.
+                // Deconvolution has no device backward yet.
                 LayerKind::Deconvolutional(_) => return true,
-                LayerKind::EmlConvolutional(spec) if spec.branch.batch_normalize => return true,
                 // `[laya_marker_gather]` has no device backward yet; keep the
                 // whole net on the CPU backward (forward uses a host round trip).
                 LayerKind::LayaMarkerGather(_) => return true,
@@ -9904,6 +10031,7 @@ where
         branch_slot: usize,
         weight_gradient: &B::Tensor,
         bias_gradient: &B::Tensor,
+        scale_gradient: Option<&B::Tensor>,
     ) -> Result<()> {
         let weights = self
             .backend
@@ -9913,6 +10041,13 @@ where
             .backend
             .download_f32(bias_gradient)
             .map_err(|err| backend_error("download EML branch bias gradient", err))?;
+        let scales = scale_gradient
+            .map(|gradient| {
+                self.backend
+                    .download_f32(gradient)
+                    .map_err(|err| backend_error("download EML branch BN scale gradient", err))
+            })
+            .transpose()?;
         let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
         let Some(LayerTrainBuffers::EmlConvolutional(train)) = buffers.get_mut(layer_index)
         else {
@@ -9929,9 +10064,10 @@ where
                 )));
             }
         };
-        if branch.batch_norm.is_some()
-            || branch.weight_updates.len() != weights.len()
+        if branch.weight_updates.len() != weights.len()
             || branch.bias_updates.len() != biases.len()
+            || branch.batch_norm.as_ref().map(|bn| bn.scale_updates.len())
+                != scales.as_ref().map(Vec::len)
         {
             return Err(Error::InvalidConfig(format!(
                 "EML branch train-buffer mismatch at layer #{layer_index}, slot {branch_slot}"
@@ -9942,6 +10078,11 @@ where
         }
         for (update, gradient) in branch.bias_updates.iter_mut().zip(biases) {
             *update += gradient;
+        }
+        if let (Some(batch_norm), Some(scales)) = (branch.batch_norm.as_mut(), scales) {
+            for (update, gradient) in batch_norm.scale_updates.iter_mut().zip(scales) {
+                *update += gradient;
+            }
         }
         Ok(())
     }
@@ -10724,6 +10865,60 @@ where
         Ok(())
     }
 
+    fn set_device_eml_batch_norm_rolling_stats(
+        &mut self,
+        owner: usize,
+        slot: usize,
+        mean: B::Tensor,
+        variance: B::Tensor,
+    ) -> Result<()> {
+        let host_mean = self
+            .backend
+            .download_f32(&mean)
+            .map_err(|err| backend_error("download EML rolling mean", err))?;
+        let host_variance = self
+            .backend
+            .download_f32(&variance)
+            .map_err(|err| backend_error("download EML rolling variance", err))?;
+        let mut cached = self.device_conv_params_at(owner, slot).ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "missing cached EML convolution params for layer #{owner}, slot {slot}"
+            ))
+        })?;
+        let Some(bn) = cached.bn.as_mut() else {
+            return Err(Error::InvalidConfig(format!(
+                "missing device EML batch-norm state for layer #{owner}, slot {slot}"
+            )));
+        };
+        bn.rolling_mean = mean;
+        bn.rolling_variance = variance;
+        cached.folded_stale = true;
+        self.set_device_conv_params(owner, slot, cached)?;
+
+        let Some(LayerParams::EmlConvolutional(params)) = self.params.get_mut(owner) else {
+            return Err(Error::InvalidConfig(format!(
+                "missing CPU EML params for layer #{owner}"
+            )));
+        };
+        let branch = match slot {
+            0 => &mut params.input,
+            1 => &mut params.self_params,
+            _ => {
+                return Err(Error::InvalidConfig(format!(
+                    "invalid EML BN slot {slot} at layer #{owner}"
+                )));
+            }
+        };
+        let Some(batch_norm) = branch.batch_norm.as_mut() else {
+            return Err(Error::InvalidConfig(format!(
+                "missing CPU EML batch-norm params at layer #{owner}, slot {slot}"
+            )));
+        };
+        batch_norm.rolling_mean = host_mean;
+        batch_norm.rolling_variance = host_variance;
+        Ok(())
+    }
+
     fn update_gpu_convolution_batch_norm_running_stats_from_forward(
         &mut self,
         forward: &GpuForwardState<B::Tensor>,
@@ -10731,6 +10926,7 @@ where
         let config = ElementwiseLaunchConfig::default();
         let mut batch_norm_stats = Vec::new();
         let mut batch_norm_rolling = Vec::new();
+        let mut eml_batch_norm_rolling = Vec::new();
         for layer in &self.network.layers {
             let LayerKind::Convolutional(spec) = &layer.kind else {
                 continue;
@@ -10786,12 +10982,48 @@ where
                 self.batch_norm_channel_stats_gpu(&raw_output, layer.output_shape)?;
             batch_norm_stats.push((layer.index, mean, variance));
         }
+        for layer in &self.network.layers {
+            let LayerKind::EmlConvolutional(spec) = &layer.kind else {
+                continue;
+            };
+            if !spec.branch.batch_normalize {
+                continue;
+            }
+            let Some(cache) = forward
+                .gpu_eml_caches
+                .get(layer.index)
+                .and_then(Option::as_ref)
+            else {
+                continue;
+            };
+            for (slot, branch_cache) in [
+                cache.input_batch_norm.as_ref(),
+                cache.self_batch_norm.as_ref(),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if let Some((mean, variance)) =
+                    branch_cache.and_then(|cache| cache.rolling.as_ref())
+                {
+                    eml_batch_norm_rolling.push((
+                        layer.index,
+                        slot,
+                        mean.clone(),
+                        variance.clone(),
+                    ));
+                }
+            }
+        }
 
         for (owner, mean, variance) in batch_norm_stats {
             self.update_gpu_convolution_batch_norm_running_stats(owner, &mean, &variance)?;
         }
         for (owner, mean, variance) in batch_norm_rolling {
             self.set_device_batch_norm_rolling_stats(owner, mean, variance)?;
+        }
+        for (owner, slot, mean, variance) in eml_batch_norm_rolling {
+            self.set_device_eml_batch_norm_rolling_stats(owner, slot, mean, variance)?;
         }
         Ok(())
     }
@@ -26079,7 +26311,7 @@ mod tests {
     }
 
     #[test]
-    fn eml_convolutional_cpu_math_gradients_and_gpu_fallback_are_integrated() {
+    fn eml_convolutional_cpu_math_gradients_and_gpu_host_updates_are_integrated() {
         let cfg = "[net]\nchannels=1\nbatch=1\nheight=1\nwidth=2\n\
                    [eml_convolutional]\nfilters=1\nsize=1\nbatch_normalize=1\nresidual=1\n";
         let build = || {
@@ -26192,7 +26424,7 @@ mod tests {
             gpu_forward.cpu_forward.final_output(),
             forward.final_output()
         );
-        assert!(gpu.requires_cpu_backward_fallback());
+        assert!(!gpu.requires_cpu_backward_fallback());
         gpu.zero_train_buffers_gpu().expect("clear GPU buffers");
         gpu.backward_accumulate_seeded_gpu(&gpu_forward, &[Some(seed.clone())])
             .expect("EML GPU-host backward");

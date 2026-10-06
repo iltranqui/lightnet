@@ -34,6 +34,16 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v72: Batch-normalized EML now stays on native Oxide forward/backward: each
+  branch retains batch-stat BN caches, computes exact scale/beta gradients and
+  convolution adjoints, and applies device-produced rolling EMA stats to host
+  params. Gradients still accumulate into host train buffers and optimizers
+  remain host-side. Focused host EML tests pass 3/3; the real Oxide
+  `oxide_runtime_chain` suite passes 19/19, including both branch EMA updates,
+  finite BN gradients, and host optimizer/cache refresh. CPU EML training still
+  uses rolling statistics while native GPU training uses batch statistics, so
+  CPU/C++ training parity is not claimed. Device optimizers and a compiled-C++
+  golden remain open.
 - v71: No-BN EML GPU backward now uses backend EML adjoints and both branch
   convolution input/weight-gradient ops, adds the eligible residual gradient,
   and accumulates parameter gradients into host train buffers for SGD/Adam.
