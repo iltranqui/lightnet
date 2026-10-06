@@ -34,6 +34,13 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v76: added host-only CARPN convex-quad IoU for four interleaved vertex pairs,
+  reusing the pure-Rust convex clipper and rejecting degenerate/non-finite inputs.
+  `MEM=3G PKGS=darknet-core ./tools/test_host.sh carpn_polygon_iou` passed 2/2
+  for hand-derived overlap, containment, disjoint, diamond, reversed-winding, and
+  invalid cases. This is geometry only; CARPN detection dispatch, OBB NMS/mAP,
+  cfg/layer integration, and losses remain open. No compiled-C++ golden/parity
+  claim is available.
 - v75: added host-only vertices and convex IoU for legacy front-point OBB rectangles,
   with source-ordered corners and explicit invalid-geometry behavior. The focused
   `MEM=3G PKGS=darknet-core ./tools/test_host.sh obb_geometry` tests pass 3/3,

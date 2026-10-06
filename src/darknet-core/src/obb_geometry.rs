@@ -105,6 +105,44 @@ pub fn box_obb_iou(a: BoxObb, b: BoxObb) -> f32 {
     (intersection_area / union_area).clamp(0.0, 1.0)
 }
 
+/// IoU for two CARPN polygons represented as four interleaved `(x, y)` pairs.
+///
+/// Both inputs must be convex quadrilaterals, matching OpenCV's
+/// `intersectConvexConvex` contract used by the source implementation. Invalid,
+/// degenerate, or non-finite geometry returns `0.0` rather than an AABB fallback.
+pub fn carpn_polygon_iou(pred_vertices: [f32; 8], gt_vertices: [f32; 8]) -> f32 {
+    let pred: [Point; 4] =
+        std::array::from_fn(|index| [pred_vertices[2 * index], pred_vertices[2 * index + 1]]);
+    let gt: [Point; 4] =
+        std::array::from_fn(|index| [gt_vertices[2 * index], gt_vertices[2 * index + 1]]);
+    if !pred
+        .iter()
+        .chain(&gt)
+        .flatten()
+        .all(|value| value.is_finite())
+    {
+        return 0.0;
+    }
+
+    let pred_area = polygon_area(&pred);
+    let gt_area = polygon_area(&gt);
+    if !pred_area.is_finite() || pred_area <= 0.0 || !gt_area.is_finite() || gt_area <= 0.0 {
+        return 0.0;
+    }
+
+    let intersection = convex_intersection(&pred, &gt);
+    let intersection_area = polygon_area(&intersection);
+    if !intersection_area.is_finite() || intersection_area <= 0.0 {
+        return 0.0;
+    }
+
+    let union_area = pred_area + gt_area - intersection_area;
+    if !union_area.is_finite() || union_area <= 0.0 {
+        return 0.0;
+    }
+    (intersection_area / union_area).clamp(0.0, 1.0)
+}
+
 fn cross(a: Point, b: Point) -> f32 {
     a[0] * b[1] - a[1] * b[0]
 }
@@ -273,6 +311,41 @@ mod tests {
             0.25,
             1e-6,
         );
+    }
+
+    #[test]
+    fn carpn_polygon_iou_handles_convex_quads_and_both_windings() {
+        let square = [0.0, 0.0, 2.0, 0.0, 2.0, 2.0, 0.0, 2.0];
+        assert_eq!(carpn_polygon_iou(square, square), 1.0);
+        assert_eq!(
+            carpn_polygon_iou(square, [0.0, 2.0, 2.0, 2.0, 2.0, 0.0, 0.0, 0.0]),
+            1.0
+        );
+
+        let partial = [1.0, 0.0, 3.0, 0.0, 3.0, 2.0, 1.0, 2.0];
+        close(carpn_polygon_iou(square, partial), 1.0 / 3.0, 1e-6);
+        close(carpn_polygon_iou(partial, square), 1.0 / 3.0, 1e-6);
+        let contained = [0.5, 0.5, 1.5, 0.5, 1.5, 1.5, 0.5, 1.5];
+        close(carpn_polygon_iou(square, contained), 0.25, 1e-6);
+        let disjoint = [3.0, 0.0, 5.0, 0.0, 5.0, 2.0, 3.0, 2.0];
+        assert_eq!(carpn_polygon_iou(square, disjoint), 0.0);
+
+        // This rotated diamond is a convex polygon, not a front-point rectangle.
+        let diamond = [1.0, 0.0, 2.0, 1.0, 1.0, 2.0, 0.0, 1.0];
+        close(carpn_polygon_iou(square, diamond), 0.5, 1e-6);
+        let reverse_diamond = [0.0, 1.0, 1.0, 2.0, 2.0, 1.0, 1.0, 0.0];
+        assert_eq!(carpn_polygon_iou(diamond, reverse_diamond), 1.0);
+    }
+
+    #[test]
+    fn carpn_polygon_iou_rejects_degenerate_and_non_finite_vertices() {
+        let square = [0.0, 0.0, 2.0, 0.0, 2.0, 2.0, 0.0, 2.0];
+        let collinear = [0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0];
+        assert_eq!(carpn_polygon_iou(square, collinear), 0.0);
+        let non_finite = [0.0, 0.0, 2.0, 0.0, f32::NAN, 2.0, 0.0, 2.0];
+        assert_eq!(carpn_polygon_iou(square, non_finite), 0.0);
+        let infinite = [0.0, 0.0, 2.0, 0.0, f32::INFINITY, 2.0, 0.0, 2.0];
+        assert_eq!(carpn_polygon_iou(infinite, square), 0.0);
     }
 
     #[test]
