@@ -34,6 +34,10 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v56: BN MoE router/expert SGD, including BN scale updates and momentum, now
+  runs on-device. Deferred sync preserves the expert cache and copies raw params
+  plus BN stats to host. FakeBackend MoE tests passed (21/21); the full real-device
+  `oxide_runtime_chain` suite passed (13/13), including BN backward/SGD parity.
 - v55: BN MoE router/expert Adam now updates raw weights, beta, and BN scales
   on-device; scale moments are persisted in DNOPT4 while DNOPT1-3 remain
   readable, including migration of nested host BN moments from DNOPT3. Deferred
@@ -175,9 +179,10 @@ Latest increments:
   transfers; DNOPT3 persists their moments and legacy DNOPT2 host moments migrate
   on first use. DNOPT4 adds BN MoE scale moments; DNOPT1-3 remain readable, and
   nested host BN moments migrate on the first BN Adam device update. BN expert
-  backward uses backend ops; BN expert Adam runs on-device with DNOPT4 scale
-  moments, while BN expert SGD remains host-side. The dynamic-loss-scale
-  finiteness check covers dirty router/expert/BN-scale buffers. FakeBackend
+  backward uses backend ops; BN expert SGD updates weights/beta/scales with
+  device-resident momentum, and BN Adam uses DNOPT4 scale moments. The dynamic-
+  loss-scale finiteness check covers dirty router/expert/BN-scale buffers.
+  FakeBackend
   parity and real-device
   `moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu`
   pass, including two backward calls accumulated before the first deferred SGD
@@ -280,8 +285,7 @@ believing a `cfg_corpus` failure.
    `vc_attention` fast paths (decision 3) get their own kernels or reuse the
    reference attention path.
 4. Phase 2B `moe_convolutional` (weights order verified) has partial Oxide
-   training support; BN backward/Adam use backend ops, while BN expert SGD
-   remains host-side. Then
+   training support; BN backward and SGD/Adam updates use backend ops. Then
    port `eml_convolutional` (an activation, not a `LayerKind`; save order **re-read
    2026-10-05**: `input_layer` then `self_layer`, two full conv blocks).
 5. Phase 3B deformable family — start with `dcnv4` (real C++ forward and

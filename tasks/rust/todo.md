@@ -134,14 +134,14 @@ Immediately next, in dependency order:
   owner layer + expert slot; `warm_device_conv_params` warms each MoE expert,
   and host-updated experts invalidate/re-upload their slots. FakeBackend test
   covers slot separation and rewarm. The generic convolution optimizer/BN
-  refresh still handles top-level owners only; no-BN MoE router/expert SGD and
-  Adam have device-side paths, using owner/expert slots for convolution experts.
+  refresh still handles top-level owners only; MoE router/expert SGD and Adam
+  have device-side paths, including BN scales, using owner/expert convolution slots.
   Router parameter values sync to host after each update because the current
   router forward consumes host params; gradients and optimizer moments stay
   device-side. DNOPT3 persists no-BN device MoE Adam moments; DNOPT4 adds BN
   expert scale moments and migrates nested host BN moments to device. DNOPT1-3
-  remain readable. BN expert backward uses backend ops; BN MoE Adam updates
-  experts/router and BN scales on-device, while BN expert SGD remains host-side.
+  remain readable. BN expert backward uses backend ops; BN MoE SGD/Adam update
+  experts/router and BN scales on-device, with SGD momentum retained in device buffers.
 - [~] Phase 2B `moe_convolutional`: real-device forward computes router pooling,
   logits, top-k masking, softmax, expert convolutions, and gate blending. For
   no-BN experts, router connected-backward, gate-column selection and gate-dot
@@ -154,8 +154,9 @@ Immediately next, in dependency order:
   Router parameter values sync to host after each step for the next forward,
   while expert values support deferred host sync. BN expert backward uses
   backend ops and accumulates scale/beta gradients on device;
-  BN expert Adam updates weights, beta, and scale on-device, with DNOPT4 scale
-  moments and DNOPT1-3 compatibility. BN expert SGD remains host-side. The
+  BN expert SGD/Adam update weights, beta, and scale on-device; SGD momentum
+  stays in device buffers, while Adam scale moments use DNOPT4 (DNOPT1-3 remain
+  compatible). The
   dynamic-loss-scale finiteness check covers dirty router/expert/BN-scale
   buffers (`gpu_moe_device_gradients_participate_in_loss_scale_finiteness_check`);
   FakeBackend

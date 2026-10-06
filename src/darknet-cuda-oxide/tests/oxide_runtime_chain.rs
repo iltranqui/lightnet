@@ -413,8 +413,10 @@ fn moe_batchnorm_expert_device_backward_matches_cpu_on_oxide() {
     gpu.backward_accumulate_seeded_gpu(&gpu_fwd, &seeds)
         .expect("Oxide MoE BN backward");
     cpu.update_weights(0.01, 0.0, 0.0, 2);
-    gpu.update_weights_gpu(0.01, 0.0, 0.0, 2)
-        .expect("Oxide MoE BN update");
+    gpu.update_weights_gpu_deferred(0.01, 0.0, 0.0, 2)
+        .expect("deferred Oxide MoE BN SGD");
+    gpu.sync_host_weights_from_device()
+        .expect("sync deferred Oxide MoE BN SGD");
 
     let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(gpu_conv)) =
         (&cpu.params[0], &gpu.params[0])
