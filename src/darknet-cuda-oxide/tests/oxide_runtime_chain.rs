@@ -268,23 +268,83 @@ fn moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu() {
             .expect("Oxide MoE backward");
     }
     cpu.update_weights(0.01, 0.9, 0.001, 4);
-    gpu.update_weights_gpu(0.01, 0.9, 0.001, 4)
+    gpu.update_weights_gpu_deferred(0.01, 0.9, 0.001, 4)
         .expect("MoE SGD");
+
+    let cpu_fwd = cpu
+        .forward_training(&input)
+        .expect("second CPU MoE forward");
+    let gpu_fwd = gpu
+        .forward_training_device(&input)
+        .expect("second Oxide MoE forward");
+    let second_output = gpu
+        .backend
+        .download_f32(&gpu_fwd.gpu_layer_outputs[1])
+        .expect("download second MoE output");
+    close(
+        "second forward with stale host params",
+        &cpu_fwd.layer_outputs[1].data,
+        &second_output,
+        1e-4,
+    );
+    cpu.backward_accumulate_seeded(&input, &cpu_fwd, &seeds)
+        .expect("second CPU MoE backward");
+    gpu.backward_accumulate_seeded_gpu(&gpu_fwd, &seeds)
+        .expect("second Oxide MoE backward");
+    cpu.update_weights(0.01, 0.9, 0.001, 2);
+    gpu.update_weights_gpu_deferred(0.01, 0.9, 0.001, 2)
+        .expect("second MoE SGD");
+    gpu.sync_host_weights_from_device()
+        .expect("sync second deferred MoE weights");
 
     let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(gpu_conv)) =
         (&cpu.params[0], &gpu.params[0])
     else {
-        panic!("conv parameters after MoE backward");
+        panic!("conv parameters after second MoE backward");
     };
-    close("preceding conv weights", &cpu_conv.weights, &gpu_conv.weights, 1e-4);
-    close("preceding conv biases", &cpu_conv.biases, &gpu_conv.biases, 1e-4);
-    let LayerParams::Moe(cpu_moe) = &cpu.params[1] else { unreachable!() };
-    let LayerParams::Moe(gpu_moe) = &gpu.params[1] else { unreachable!() };
-    close("router weights", &cpu_moe.router_weights, &gpu_moe.router_weights, 1e-5);
-    close("router biases", &cpu_moe.router_biases, &gpu_moe.router_biases, 1e-5);
+    close(
+        "second-step conv weights",
+        &cpu_conv.weights,
+        &gpu_conv.weights,
+        1e-4,
+    );
+    close(
+        "second-step conv biases",
+        &cpu_conv.biases,
+        &gpu_conv.biases,
+        1e-4,
+    );
+    let LayerParams::Moe(cpu_moe) = &cpu.params[1] else {
+        unreachable!()
+    };
+    let LayerParams::Moe(gpu_moe) = &gpu.params[1] else {
+        unreachable!()
+    };
+    close(
+        "second-step router weights",
+        &cpu_moe.router_weights,
+        &gpu_moe.router_weights,
+        1e-5,
+    );
+    close(
+        "second-step router biases",
+        &cpu_moe.router_biases,
+        &gpu_moe.router_biases,
+        1e-5,
+    );
     for (cpu_expert, gpu_expert) in cpu_moe.experts.iter().zip(&gpu_moe.experts) {
-        close("expert weights", &cpu_expert.weights, &gpu_expert.weights, 1e-5);
-        close("expert biases", &cpu_expert.biases, &gpu_expert.biases, 1e-5);
+        close(
+            "second-step expert weights",
+            &cpu_expert.weights,
+            &gpu_expert.weights,
+            1e-5,
+        );
+        close(
+            "second-step expert biases",
+            &cpu_expert.biases,
+            &gpu_expert.biases,
+            1e-5,
+        );
     }
 }
 
