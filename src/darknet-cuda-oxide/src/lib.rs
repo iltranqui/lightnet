@@ -3329,6 +3329,152 @@ impl F32TensorOpsBackend for OxideBackend {
         Ok(OxideTensorF32::new(gates, &[batch, experts]))
     }
 
+    fn moe_router_pool_f32(
+        &self,
+        input: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        spatial: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let input = self.f32v(input)?;
+        let op = "moe_router_pool_f32";
+        if batch == 0 || channels == 0 || spatial == 0 {
+            return Err(shape_err(
+                op,
+                "batch, channels, and spatial must be nonzero".into(),
+            ));
+        }
+        if input.len() != batch * channels * spatial {
+            return Err(shape_err(
+                op,
+                format!(
+                    "input has {} elements, expected {}",
+                    input.len(),
+                    batch * channels * spatial
+                ),
+            ));
+        }
+        let mut pooled = self.alloc_uninit(batch * channels)?;
+        // SAFETY: one thread uniquely writes one sample/channel descriptor.
+        unsafe {
+            self.layers_extra.moe_router_pool(
+                &self.stream,
+                launch::elementwise(batch * channels, config),
+                &input.buf,
+                &mut pooled,
+                channels,
+                spatial,
+                batch,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(pooled, &[batch, channels]))
+    }
+
+    fn moe_router_pool_backward_f32(
+        &self,
+        pooled_gradient: &Self::Tensor,
+        input_shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let pooled_gradient = self.f32v(pooled_gradient)?;
+        let op = "moe_router_pool_backward_f32";
+        if input_shape.len() != 4
+            || input_shape[0] == 0
+            || input_shape[1] == 0
+            || input_shape[2] == 0
+            || input_shape[3] == 0
+        {
+            return Err(shape_err(
+                op,
+                format!("input shape must be nonzero NCHW, got {input_shape:?}"),
+            ));
+        }
+        let (batch, channels) = (input_shape[0], input_shape[1]);
+        let spatial = input_shape[2] * input_shape[3];
+        if pooled_gradient.len() != batch * channels {
+            return Err(shape_err(
+                op,
+                format!(
+                    "pooled gradient has {} elements, expected {}",
+                    pooled_gradient.len(),
+                    batch * channels
+                ),
+            ));
+        }
+        let mut input_gradient = self.alloc_uninit(batch * channels * spatial)?;
+        // SAFETY: one thread uniquely writes one input-gradient element.
+        unsafe {
+            self.layers_extra.moe_router_pool_backward(
+                &self.stream,
+                launch::elementwise(input_gradient.len(), config),
+                &pooled_gradient.buf,
+                &mut input_gradient,
+                spatial,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(input_gradient, input_shape))
+    }
+
+    fn moe_gate_dot_f32(
+        &self,
+        output_gradient: &Self::Tensor,
+        expert_output: &Self::Tensor,
+        batch: usize,
+        per_image: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let output_gradient = self.f32v(output_gradient)?;
+        let expert_output = self.f32v(expert_output)?;
+        let op = "moe_gate_dot_f32";
+        let expected = batch * per_image;
+        if batch == 0 || per_image == 0 {
+            return Err(shape_err(
+                op,
+                "batch and per-image size must be nonzero".into(),
+            ));
+        }
+        if output_gradient.len() != expected || expert_output.len() != expected {
+            return Err(shape_err(
+                op,
+                format!(
+                    "gradient/output lengths are {}/{}, expected {}",
+                    output_gradient.len(),
+                    expert_output.len(),
+                    expected
+                ),
+            ));
+        }
+        let mut partial = self.alloc_uninit(batch * 256)?;
+        // SAFETY: one thread owns each (sample, reduction-lane) partial.
+        unsafe {
+            self.layers_extra.moe_gate_dot_partial(
+                &self.stream,
+                launch::elementwise(batch * 256, config),
+                &output_gradient.buf,
+                &expert_output.buf,
+                &mut partial,
+                per_image,
+                batch,
+            )
+        }
+        .map_err(launch_err)?;
+        let mut dots = self.alloc_uninit(batch)?;
+        // SAFETY: one thread uniquely folds each sample's 256 partial sums.
+        unsafe {
+            self.layers_extra.moe_gate_dot_reduce(
+                &self.stream,
+                launch::elementwise(batch, config),
+                &partial,
+                &mut dots,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(dots, &[batch]))
+    }
+
     fn crop_bilinear_f32(
         &self,
         x: &Self::Tensor,

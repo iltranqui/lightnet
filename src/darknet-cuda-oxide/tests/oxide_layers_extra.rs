@@ -768,3 +768,67 @@ fn moe_router_gates_match_host_for_soft_and_tied_top_k_routes() {
         &uniform,
     );
 }
+
+#[test]
+fn moe_pool_and_gate_dots_match_host_for_non_multiple_reductions() {
+    let be = backend();
+    let (batch, channels, spatial) = (3usize, 4usize, 17usize);
+    let mut rng = Rng(0x4d4f_455f_504f_4f4c);
+    let input = rng.vec(batch * channels * spatial, -1.0, 1.0);
+    let input_t = be.upload_f32(&[batch, channels, spatial], &input).unwrap();
+    let pooled = be
+        .moe_router_pool_f32(&input_t, batch, channels, spatial, cfg())
+        .unwrap();
+    let mut pooled_ref = Vec::with_capacity(batch * channels);
+    for b in 0..batch {
+        for c in 0..channels {
+            let base = (b * channels + c) * spatial;
+            pooled_ref.push(
+                input[base..base + spatial]
+                    .iter()
+                    .map(|&x| x as f64)
+                    .sum::<f64>()
+                    / spatial as f64,
+            );
+        }
+    }
+    assert_close(
+        "moe router pool",
+        &be.download_f32(&pooled).unwrap(),
+        &pooled_ref,
+    );
+    let pooled_gradient = rng.vec(batch * channels, -0.6, 0.6);
+    let pooled_gradient_t = be.upload_f32(&[batch, channels], &pooled_gradient).unwrap();
+    let input_shape = [batch, channels, 1, spatial];
+    let input_gradient = be
+        .moe_router_pool_backward_f32(&pooled_gradient_t, &input_shape, cfg())
+        .unwrap();
+    let input_gradient_ref = (0..batch * channels * spatial)
+        .map(|i| pooled_gradient[i / spatial] as f64 / spatial as f64)
+        .collect::<Vec<_>>();
+    assert_close(
+        "moe router pool backward",
+        &be.download_f32(&input_gradient).unwrap(),
+        &input_gradient_ref,
+    );
+
+    let per_image = 777usize;
+    let gradient = rng.vec(batch * per_image, -0.8, 0.8);
+    let output = rng.vec(batch * per_image, -0.9, 0.9);
+    let gradient_t = be.upload_f32(&[batch, per_image], &gradient).unwrap();
+    let output_t = be.upload_f32(&[batch, per_image], &output).unwrap();
+    let dots = be
+        .moe_gate_dot_f32(&gradient_t, &output_t, batch, per_image, cfg())
+        .unwrap();
+    let expected = (0..batch)
+        .map(|b| {
+            let start = b * per_image;
+            gradient[start..start + per_image]
+                .iter()
+                .zip(&output[start..start + per_image])
+                .map(|(&dy, &y)| dy as f64 * y as f64)
+                .sum::<f64>()
+        })
+        .collect::<Vec<_>>();
+    assert_close("moe gate dot", &be.download_f32(&dots).unwrap(), &expected);
+}

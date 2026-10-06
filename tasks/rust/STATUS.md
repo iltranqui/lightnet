@@ -137,15 +137,15 @@ Latest increments:
   warm-up and host-update invalidation are covered by the
   `container_convolution_cache_is_keyed_by_owner_and_expert_slot` FakeBackend test.
   MoE computes router pooling/logits/top-k softmax, expert convolutions, and
-  per-sample gate blending on Oxide. No-BN router connected-backward and expert
-  convolution backward now use backend ops; router gate-Jacobian math, cache and
-  gradient transfers, and parameter SGD remain host-side. BN experts stay on the
-  CPU fallback. FakeBackend parity passes, and the real-device
-  `moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu`
-  test compares forward, upstream convolution updates, and router/expert weights
-  with CPU. Router
-  soft/tied top-k parity passes in `oxide_layers_extra` (19/19); the full
-  `oxide_runtime_chain` suite passes 9/9 with MoE and CRNN training parity.
+  per-sample gate blending on Oxide. No-BN router connected-backward, expert
+  gate-dot reductions, router-pool input-gradient broadcast, and expert
+  convolution backward use backend ops; pooled and expert output/activation
+  caches stay device-resident. Gate/dot values cross the host for
+  softmax-Jacobian math; parameter-gradient transfers, accumulation, and SGD
+  remain host-side. BN experts stay on the CPU fallback. FakeBackend parity and
+  real-device `moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu`
+  pass, including upstream convolution updates. `oxide_layers_extra` verifies
+  soft/tied top-k plus pool, pool-backward, and non-multiple gate-dot reductions.
 - Overlapping-window maxpool backward, including `maxpool_zero_nonmax`, now
   matches central finite differences.
 - No-BN RNN and CRNN forward/backward use backend ops: RNN projections and

@@ -223,6 +223,91 @@ pub mod kernels {
         }
     }
 
+    /// Global-average pool in NCHW storage to `[batch, channels]`; one thread
+    /// sums the spatial plane for one sample/channel in CPU reference order.
+    #[kernel]
+    pub fn moe_router_pool(
+        input: &[f32],
+        mut pooled: DisjointSlice<f32>,
+        channels: usize,
+        spatial: usize,
+        batch: usize,
+    ) {
+        let idx = thread::index_1d();
+        let linear = idx.get();
+        if linear >= batch * channels {
+            return;
+        }
+        let base = linear * spatial;
+        let mut sum = 0.0f32;
+        let mut s = 0usize;
+        while s < spatial {
+            sum += input[base + s];
+            s += 1;
+        }
+        if let Some(out) = pooled.get_mut(idx) {
+            *out = sum * (1.0 / spatial as f32);
+        }
+    }
+
+    /// Broadcast the derivative of a global-average pooled descriptor.
+    #[kernel]
+    pub fn moe_router_pool_backward(
+        pooled_gradient: &[f32],
+        mut input_gradient: DisjointSlice<f32>,
+        spatial: usize,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(out) = input_gradient.get_mut(idx) {
+            *out = pooled_gradient[i / spatial] * (1.0 / spatial as f32);
+        }
+    }
+
+    /// Stage 1 of per-sample gate dot: 256 strided partials per sample.
+    #[kernel]
+    pub fn moe_gate_dot_partial(
+        output_gradient: &[f32],
+        expert_output: &[f32],
+        mut partial: DisjointSlice<f32>,
+        per_image: usize,
+        batch: usize,
+    ) {
+        let idx = thread::index_1d();
+        let linear = idx.get();
+        let sample = linear / 256;
+        let lane = linear % 256;
+        if sample >= batch {
+            return;
+        }
+        let base = sample * per_image;
+        let mut sum = 0.0f32;
+        let mut i = lane;
+        while i < per_image {
+            sum += output_gradient[base + i] * expert_output[base + i];
+            i += 256;
+        }
+        if let Some(out) = partial.get_mut(idx) {
+            *out = sum;
+        }
+    }
+
+    /// Stage 2: fold 256 partials into one gate derivative per sample.
+    #[kernel]
+    pub fn moe_gate_dot_reduce(partial: &[f32], mut dots: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let sample = idx.get();
+        if let Some(out) = dots.get_mut(idx) {
+            let mut sum = 0.0f32;
+            let mut lane = 0usize;
+            while lane < 256 {
+                sum += partial[sample * 256 + lane];
+                lane += 1;
+            }
+            *out = sum;
+        }
+    }
+
     /// `out[b * to_len + i] = i < min(from_len, to_len) ? x[b * from_len + i] : 0`
     /// (flat per-sample crop / zero-pad, the Darknet mismatched shortcut).
     #[kernel]

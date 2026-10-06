@@ -686,6 +686,81 @@ pub trait F32TensorOpsBackend {
         );
         self.upload_f32(&[batch, experts], &gates)
     }
+    /// Global-average pool an NCHW input to the router descriptor `[batch, channels]`.
+    fn moe_router_pool_f32(
+        &self,
+        input: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        spatial: usize,
+        _config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        assert!(
+            spatial > 0,
+            "MoE router pooling requires nonzero spatial size"
+        );
+        let input = self.download_f32(input)?;
+        assert_eq!(input.len(), batch * channels * spatial);
+        let mut pooled = vec![0.0; batch * channels];
+        for b in 0..batch {
+            for c in 0..channels {
+                let start = (b * channels + c) * spatial;
+                pooled[b * channels + c] =
+                    input[start..start + spatial].iter().sum::<f32>() * (1.0 / spatial as f32);
+            }
+        }
+        self.upload_f32(&[batch, channels], &pooled)
+    }
+    /// Backward of global-average pooling: broadcast each descriptor gradient
+    /// over the spatial plane and divide by its element count.
+    fn moe_router_pool_backward_f32(
+        &self,
+        pooled_gradient: &Self::Tensor,
+        input_shape: &[usize],
+        _config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        assert!(input_shape.len() >= 3, "MoE router input must be NCHW");
+        let batch = input_shape[0];
+        let channels = input_shape[1];
+        let spatial: usize = input_shape[2..].iter().product();
+        assert!(
+            spatial > 0,
+            "MoE router pooling requires nonzero spatial size"
+        );
+        let pooled_gradient = self.download_f32(pooled_gradient)?;
+        assert_eq!(pooled_gradient.len(), batch * channels);
+        let inverse_spatial = 1.0 / spatial as f32;
+        let mut input_gradient = vec![0.0; batch * channels * spatial];
+        for i in 0..input_gradient.len() {
+            input_gradient[i] = pooled_gradient[i / spatial] * inverse_spatial;
+        }
+        self.upload_f32(input_shape, &input_gradient)
+    }
+    /// Per-sample dot products used for `dL/dgate[e]`: sum of output gradient
+    /// times one expert's output over each sample's contiguous output slice.
+    fn moe_gate_dot_f32(
+        &self,
+        output_gradient: &Self::Tensor,
+        expert_output: &Self::Tensor,
+        batch: usize,
+        per_image: usize,
+        _config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let output_gradient = self.download_f32(output_gradient)?;
+        let expert_output = self.download_f32(expert_output)?;
+        assert_eq!(output_gradient.len(), batch * per_image);
+        assert_eq!(expert_output.len(), batch * per_image);
+        let mut dots = vec![0.0; batch];
+        for b in 0..batch {
+            let start = b * per_image;
+            dots[b] = output_gradient[start..start + per_image]
+                .iter()
+                .zip(&expert_output[start..start + per_image])
+                .map(|(grad, output)| grad * output)
+                .sum();
+        }
+        self.upload_f32(&[batch], &dots)
+    }
     /// Bilinearly sample an NCHW tensor using one source coordinate pair per
     /// batch/output pixel. `input_scales` and `input_offsets` contain one
     /// affine level adjustment per batch and are applied after interpolation.

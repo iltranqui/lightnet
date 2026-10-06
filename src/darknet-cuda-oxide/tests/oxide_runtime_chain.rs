@@ -247,7 +247,7 @@ fn moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu() {
     let gpu_fwd = gpu.forward_training_device(&input).expect("Oxide MoE forward");
     let output = gpu.backend.download_f32(&gpu_fwd.gpu_layer_outputs[1]).expect("download MoE output");
     close("MoE expert blend", &cpu_fwd.layer_outputs[1].data, &output, 1e-4);
-    assert!(gpu_fwd.cpu_forward.moe_caches[1].is_some());
+    assert!(gpu_fwd.cpu_forward.moe_caches[1].is_none());
 
     let shape = cpu.network.layers[1].output_shape;
     let seed = Tensor::from_data(

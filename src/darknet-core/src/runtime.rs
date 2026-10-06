@@ -458,13 +458,9 @@ pub struct CropForwardCache {
     pub input_offsets: Vec<f32>,
 }
 
-/// What `[moe_convolutional]`'s backward needs from its forward pass: the
-/// gates the router produced, each expert's output and post-activation input,
-/// and the pooled descriptor the router saw.
-///
-/// Keeping the expert outputs matters because `dL/dgate[b,e]` is a plain dot
-/// product against them, so recomputing every expert would double the cost of
-/// training for no reason.
+/// CPU fallback cache for `[moe_convolutional]` backward. The device path keeps
+/// equivalent tensors in [`GpuMoeBackwardCache`] to avoid per-expert
+/// host/device round trips during training.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MoeForwardCache {
     pub gates: Vec<f32>,
@@ -529,6 +525,7 @@ where
     pub(crate) gpu_rnn_caches: Vec<Option<GpuRnnBackwardCache<T>>>,
     pub(crate) gpu_crnn_caches: Vec<Option<GpuCrnnBackwardCache<T>>>,
     pub(crate) gpu_lstm_caches: Vec<Option<GpuLstmBackwardCache<T>>>,
+    pub(crate) gpu_moe_caches: Vec<Option<GpuMoeBackwardCache<T>>>,
     pub cpu_forward: ForwardResult,
 }
 
@@ -558,6 +555,18 @@ where
     output_activation_inputs: Vec<T>,
     previous_states: Vec<T>,
     states: Vec<T>,
+}
+
+/// Device-resident MoE values retained for no-BN backward.
+#[derive(Clone, Debug)]
+pub struct GpuMoeBackwardCache<T>
+where
+    T: Clone,
+{
+    gates: Vec<f32>,
+    pooled: T,
+    expert_outputs: Vec<T>,
+    expert_activation_inputs: Vec<T>,
 }
 
 /// Device-resident recurrent values retained for no-BN LSTM backward.
@@ -5113,6 +5122,7 @@ where
         let mut gpu_rnn_caches = Vec::with_capacity(self.network.layers.len());
         let mut gpu_crnn_caches = Vec::with_capacity(self.network.layers.len());
         let mut gpu_lstm_caches = Vec::with_capacity(self.network.layers.len());
+        let mut gpu_moe_caches = Vec::with_capacity(self.network.layers.len());
         let mut dropout_masks = Vec::with_capacity(self.network.layers.len());
         let mut crop_caches = Vec::with_capacity(self.network.layers.len());
         let mut moe_caches: Vec<Option<MoeForwardCache>> = Vec::new();
@@ -5143,6 +5153,7 @@ where
             let mut gpu_rnn_cache = None;
             let mut gpu_crnn_cache = None;
             let mut gpu_lstm_cache = None;
+            let mut gpu_moe_cache = None;
             let output_gpu = match (&layer.kind, params) {
                 (
                     LayerKind::Convolutional(spec),
@@ -6191,9 +6202,14 @@ where
                     }
                 }
                 (LayerKind::Moe(spec), LayerParams::Moe(moe)) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download MoE router input", err))?;
+                    let host_input = if host_copies {
+                        Some(
+                            self.download_tensor(current_input, layer.input_shape)
+                                .map_err(|err| backend_error("download MoE router input", err))?,
+                        )
+                    } else {
+                        None
+                    };
                     let batch = layer.input_shape.batch;
                     let router_weights = self
                         .backend
@@ -6225,19 +6241,34 @@ where
                         .backend
                         .download_f32(&router_gates)
                         .map_err(|err| backend_error("download MoE router gates", err))?;
+                    let pooled_gpu = self
+                        .backend
+                        .moe_router_pool_f32(
+                            current_input,
+                            batch,
+                            layer.input_shape.channels,
+                            layer.input_shape.width * layer.input_shape.height,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("pool MoE router input", err))?;
                     let per_image = layer.output_shape.element_count();
                     let mut blended_gpu = None;
-                    let mut cache = MoeForwardCache {
+                    let mut host_cache = host_copies.then(|| MoeForwardCache {
                         gates: experts.clone(),
                         expert_outputs: Vec::with_capacity(spec.experts),
                         expert_activation_inputs: Vec::with_capacity(spec.experts),
                         pooled: crate::moe_conv::pool_for_router(
-                            &host_input.data,
+                            &host_input
+                                .as_ref()
+                                .expect("host cache requires host input")
+                                .data,
                             batch,
                             layer.input_shape.channels,
                             layer.input_shape.width * layer.input_shape.height,
                         ),
-                    };
+                    });
+                    let mut expert_outputs_gpu = Vec::with_capacity(spec.experts);
+                    let mut expert_activation_inputs_gpu = Vec::with_capacity(spec.experts);
                     for (slot, expert) in moe.experts.iter().enumerate() {
                         let cached = self.cached_convolution_params_at(
                             layer.index,
@@ -6307,18 +6338,29 @@ where
                                 .map_err(|err| backend_error("blend MoE expert outputs", err))?,
                             None => weighted,
                         });
-                        // The CPU fallback backward needs the exact expert
-                        // activation cache and host forward tensors.
-                        let (cpu_output, activation_input) = forward_convolutional_with_cache(
-                            &spec.expert,
-                            expert,
-                            &host_input,
-                            layer.output_shape,
-                        );
-                        cache.expert_outputs.push(cpu_output);
-                        cache.expert_activation_inputs.push(activation_input);
+                        expert_outputs_gpu.push(output_gpu.clone());
+                        expert_activation_inputs_gpu.push(biased.clone());
+                        if let Some(cache) = &mut host_cache {
+                            // The CPU fallback needs host expert outputs and
+                            // activation caches. Device backward uses the
+                            // tensors retained above instead.
+                            let (cpu_output, activation_input) = forward_convolutional_with_cache(
+                                &spec.expert,
+                                expert,
+                                host_input.as_ref().expect("host cache requires host input"),
+                                layer.output_shape,
+                            );
+                            cache.expert_outputs.push(cpu_output);
+                            cache.expert_activation_inputs.push(activation_input);
+                        }
                     }
-                    moe_cache = Some(cache);
+                    moe_cache = host_cache;
+                    gpu_moe_cache = Some(GpuMoeBackwardCache {
+                        gates: experts,
+                        pooled: pooled_gpu,
+                        expert_outputs: expert_outputs_gpu,
+                        expert_activation_inputs: expert_activation_inputs_gpu,
+                    });
                     blended_gpu.ok_or_else(|| {
                         Error::InvalidConfig(format!(
                             "layer #{} ([moe_convolutional]) has no expert outputs",
@@ -6408,6 +6450,7 @@ where
             gpu_rnn_caches.push(gpu_rnn_cache);
             gpu_crnn_caches.push(gpu_crnn_cache);
             gpu_lstm_caches.push(gpu_lstm_cache);
+            gpu_moe_caches.push(gpu_moe_cache);
             if recurrent_caches.len() < layer_outputs.len() {
                 recurrent_caches.push(None);
             }
@@ -6423,6 +6466,7 @@ where
             gpu_rnn_caches,
             gpu_crnn_caches,
             gpu_lstm_caches,
+            gpu_moe_caches,
             cpu_forward: ForwardResult {
                 layer_outputs,
                 layer_activation_inputs,
@@ -7899,25 +7943,22 @@ where
                         });
                     }
                     let cache = forward
-                        .cpu_forward
-                        .moe_caches
+                        .gpu_moe_caches
                         .get(layer.index)
                         .and_then(Option::as_ref)
                         .ok_or_else(|| {
                             Error::InvalidConfig(format!(
-                                "missing MoE forward cache for GPU layer #{}",
+                                "missing MoE device cache for GPU layer #{}",
                                 layer.index
                             ))
                         })?;
                     let batch = layer.input_shape.batch;
                     let channels = layer.input_shape.channels;
                     let experts = spec.experts;
-                    let spatial = layer.input_shape.width * layer.input_shape.height;
                     let output_spatial = layer.output_shape.width * layer.output_shape.height;
                     let per_image = layer.output_shape.element_count();
                     if experts == 0
                         || cache.gates.len() != batch * experts
-                        || cache.pooled.len() != batch * channels
                         || cache.expert_outputs.len() != experts
                         || cache.expert_activation_inputs.len() != experts
                         || params.experts.len() != experts
@@ -7939,45 +7980,39 @@ where
                             ))
                         })?
                     };
-                    let host_output_gradient = self
-                        .download_tensor(&grad, layer.output_shape)
-                        .map_err(|err| backend_error("download MoE gate gradient input", err))?;
-                    if host_output_gradient.shape != layer.output_shape {
-                        return Err(Error::InvalidConfig(format!(
-                            "MoE output gradient shape mismatch at layer #{}",
-                            layer.index
-                        )));
-                    }
                     let mut raw_gate_gradient =
                         crate::moe_conv::balance_loss_and_raw_grad(&cache.gates, batch, spec).1;
-                    for (index, raw) in raw_gate_gradient.iter_mut().enumerate() {
-                        let b = index / experts;
-                        let expert = index % experts;
-                        let expert_output = &cache.expert_outputs[expert];
-                        if expert_output.shape != layer.output_shape
-                            || expert_output.data.len() != host_output_gradient.data.len()
-                        {
+                    for expert in 0..experts {
+                        let dots = self
+                            .backend
+                            .moe_gate_dot_f32(
+                                &grad,
+                                &cache.expert_outputs[expert],
+                                batch,
+                                per_image,
+                                config,
+                            )
+                            .map_err(|err| backend_error("MoE expert gate-gradient dot", err))?;
+                        let dots = self
+                            .backend
+                            .download_f32(&dots)
+                            .map_err(|err| backend_error("download MoE gate-gradient dots", err))?;
+                        if dots.len() != batch {
                             return Err(Error::InvalidConfig(format!(
-                                "MoE expert {expert} cache shape mismatch at layer #{}",
+                                "MoE expert {expert} gate-gradient shape mismatch at layer #{}",
                                 layer.index
                             )));
                         }
-                        let start = b * per_image;
-                        *raw += host_output_gradient.data[start..start + per_image]
-                            .iter()
-                            .zip(&expert_output.data[start..start + per_image])
-                            .map(|(delta, output)| delta * output)
-                            .sum::<f32>();
+                        for (b, dot) in dots.into_iter().enumerate() {
+                            raw_gate_gradient[b * experts + expert] += dot;
+                        }
                     }
                     let dlogit = crate::moe_conv::router_gate_gradient(
                         &cache.gates,
                         &raw_gate_gradient,
                         spec,
                     );
-                    let pooled = self
-                        .backend
-                        .upload_f32(&[batch, channels], &cache.pooled)
-                        .map_err(|err| backend_error("upload MoE pooled router input", err))?;
+                    let pooled = cache.pooled.clone();
                     let router_weights = self
                         .backend
                         .upload_f32(&[experts, channels], &params.router_weights)
@@ -8006,29 +8041,14 @@ where
                         .backend
                         .download_f32(&router_bias_gradient)
                         .map_err(|err| backend_error("download MoE router bias gradient", err))?;
-                    let pooled_gradient = self
-                        .backend
-                        .download_f32(&pooled_gradient)
-                        .map_err(|err| backend_error("download MoE pooled input gradient", err))?;
-                    let mut router_input_gradient =
-                        vec![0.0; layer.input_shape.batch * layer.input_shape.element_count()];
-                    if spatial > 0 {
-                        let inv_spatial = 1.0 / spatial as f32;
-                        for b in 0..batch {
-                            for c in 0..channels {
-                                let value = pooled_gradient[b * channels + c] * inv_spatial;
-                                let start = (b * channels + c) * spatial;
-                                router_input_gradient[start..start + spatial].fill(value);
-                            }
-                        }
-                    }
                     let router_input_gradient = self
                         .backend
-                        .upload_f32(
+                        .moe_router_pool_backward_f32(
+                            &pooled_gradient,
                             &tensor_backend_shape(layer.input_shape),
-                            &router_input_gradient,
+                            config,
                         )
-                        .map_err(|err| backend_error("upload MoE router input gradient", err))?;
+                        .map_err(|err| backend_error("MoE router pool backward", err))?;
 
                     let activation = gpu_activation_kind(layer.index, &spec.expert.activation)?;
                     let mut expert_input_gradient = None;
@@ -8042,27 +8062,8 @@ where
                             &spec.expert,
                             expert,
                         )?;
-                        let Some(activation_input) =
-                            cache.expert_activation_inputs[expert_index].as_ref()
-                        else {
-                            return Err(Error::InvalidConfig(format!(
-                                "missing MoE activation cache for expert {expert_index} at layer #{}",
-                                layer.index
-                            )));
-                        };
-                        if activation_input.shape != layer.output_shape {
-                            return Err(Error::InvalidConfig(format!(
-                                "MoE activation cache shape mismatch for expert {expert_index} at layer #{}",
-                                layer.index
-                            )));
-                        }
-                        let activation_input = self
-                            .backend
-                            .upload_f32(
-                                &tensor_backend_shape(layer.output_shape),
-                                &activation_input.data,
-                            )
-                            .map_err(|err| backend_error("upload MoE activation cache", err))?;
+                        let activation_input =
+                            cache.expert_activation_inputs[expert_index].clone();
                         let sample_gates = (0..batch)
                             .map(|b| cache.gates[b * experts + expert_index])
                             .collect::<Vec<_>>();
@@ -23548,7 +23549,8 @@ mod tests {
             &gpu_output,
             2e-5,
         );
-        assert!(gpu_forward.cpu_forward.moe_caches[0].is_some());
+        assert!(gpu_forward.cpu_forward.moe_caches[0].is_none());
+        assert!(gpu_forward.gpu_moe_caches[0].is_some());
 
         let seed = Tensor::from_data(
             cpu_forward.layer_outputs[0].shape,
