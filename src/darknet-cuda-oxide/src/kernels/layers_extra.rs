@@ -22,6 +22,135 @@ pub fn dropout_unit(seed: u64, index: u64) -> f32 {
 pub mod kernels {
     use super::*;
 
+    /// Global-average pool followed by the MoE router's affine projection. One
+    /// output thread computes one (sample, expert) logit; spatial reductions
+    /// follow the same sequential f32 order as the CPU reference.
+    #[kernel]
+    pub fn moe_router_logits(
+        input: &[f32],
+        router_weights: &[f32],
+        router_biases: &[f32],
+        mut logits: DisjointSlice<f32>,
+        channels: usize,
+        spatial: usize,
+        experts: usize,
+        batch: usize,
+        temperature: f32,
+    ) {
+        let idx = thread::index_1d();
+        let linear = idx.get();
+        if linear >= batch * experts {
+            return;
+        }
+        let b = linear / experts;
+        let e = linear % experts;
+        let inv_spatial = 1.0 / spatial as f32;
+        let temperature = if temperature > 1e-6 { temperature } else { 1e-6 };
+        let mut value = router_biases[e];
+        let mut c = 0usize;
+        while c < channels {
+            let base = (b * channels + c) * spatial;
+            let mut sum = 0.0f32;
+            let mut s = 0usize;
+            while s < spatial {
+                sum += input[base + s];
+                s += 1;
+            }
+            let pooled = sum * inv_spatial;
+            value += router_weights[e * channels + c] * pooled;
+            c += 1;
+        }
+        if let Some(out) = logits.get_mut(idx) {
+            *out = value / temperature;
+        }
+    }
+
+    /// Top-k masked softmax. A single thread owns each row; counting strictly
+    /// greater logits reproduces C++'s `v < kth` mask, including ties.
+    #[kernel]
+    pub fn moe_router_softmax_topk(
+        logits: &[f32],
+        mut gates: DisjointSlice<f32>,
+        batch: usize,
+        experts: usize,
+        top_k: usize,
+    ) {
+        let b = thread::index_1d().get();
+        if b >= batch {
+            return;
+        }
+        let base = b * experts;
+        let mut maximum = -f32::MAX;
+        let mut e = 0usize;
+        while e < experts {
+            let value = logits[base + e];
+            let mut keep = true;
+            if top_k > 0 && top_k < experts {
+                let mut greater = 0usize;
+                let mut j = 0usize;
+                while j < experts {
+                    if logits[base + j] > value {
+                        greater += 1;
+                    }
+                    j += 1;
+                }
+                keep = greater < top_k;
+            }
+            let masked = if keep { value } else { -f32::MAX };
+            if masked > maximum {
+                maximum = masked;
+            }
+            e += 1;
+        }
+
+        let mut sum = 0.0f32;
+        e = 0;
+        while e < experts {
+            let value = logits[base + e];
+            let mut keep = true;
+            if top_k > 0 && top_k < experts {
+                let mut greater = 0usize;
+                let mut j = 0usize;
+                while j < experts {
+                    if logits[base + j] > value {
+                        greater += 1;
+                    }
+                    j += 1;
+                }
+                keep = greater < top_k;
+            }
+            let masked = if keep { value } else { -f32::MAX };
+            let exp = if masked <= -f32::MAX * 0.5 { 0.0 } else { (masked - maximum).exp() };
+            // SAFETY: this thread uniquely owns the `experts`-element gate row.
+            unsafe {
+                *gates.as_mut_ptr().add(base + e) = exp;
+            }
+            sum += exp;
+            e += 1;
+        }
+
+        if sum <= 0.0 || !sum.is_finite() {
+            let uniform = 1.0 / experts as f32;
+            e = 0;
+            while e < experts {
+                // SAFETY: this thread uniquely owns the `experts`-element gate row.
+                unsafe {
+                    *gates.as_mut_ptr().add(base + e) = uniform;
+                }
+                e += 1;
+            }
+        } else {
+            e = 0;
+            while e < experts {
+                // SAFETY: this thread uniquely owns the `experts`-element gate row.
+                unsafe {
+                    *gates.as_mut_ptr().add(base + e) /= sum;
+                }
+                e += 1;
+            }
+        }
+    }
+
     /// `out[b * to_len + i] = i < min(from_len, to_len) ? x[b * from_len + i] : 0`
     /// (flat per-sample crop / zero-pad, the Darknet mismatched shortcut).
     #[kernel]

@@ -6064,15 +6064,36 @@ where
                         .download_tensor(current_input, layer.input_shape)
                         .map_err(|err| backend_error("download MoE router input", err))?;
                     let batch = layer.input_shape.batch;
-                    let experts = crate::moe_conv::compute_router(
-                        &host_input.data,
-                        batch,
-                        layer.input_shape.channels,
-                        layer.input_shape.width * layer.input_shape.height,
-                        &moe.router_weights,
-                        &moe.router_biases,
-                        spec,
-                    );
+                    let router_weights = self
+                        .backend
+                        .upload_f32(
+                            &[spec.experts, layer.input_shape.channels],
+                            &moe.router_weights,
+                        )
+                        .map_err(|err| backend_error("upload MoE router weights", err))?;
+                    let router_biases = self
+                        .backend
+                        .upload_f32(&[spec.experts], &moe.router_biases)
+                        .map_err(|err| backend_error("upload MoE router biases", err))?;
+                    let router_gates = self
+                        .backend
+                        .moe_router_gates_f32(
+                            current_input,
+                            &router_weights,
+                            &router_biases,
+                            batch,
+                            layer.input_shape.channels,
+                            layer.input_shape.width * layer.input_shape.height,
+                            spec.experts,
+                            spec.top_k,
+                            crate::moe_conv::router_temperature(spec),
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("compute MoE router gates", err))?;
+                    let experts = self
+                        .backend
+                        .download_f32(&router_gates)
+                        .map_err(|err| backend_error("download MoE router gates", err))?;
                     let per_image = layer.output_shape.element_count();
                     let mut blended_gpu = None;
                     let mut cache = MoeForwardCache {

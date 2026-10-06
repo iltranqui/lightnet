@@ -2952,6 +2952,84 @@ impl F32TensorOpsBackend for OxideBackend {
         Ok(OxideTensorF32::new(dx, input_shape))
     }
 
+    fn moe_router_gates_f32(
+        &self,
+        input: &Self::Tensor,
+        router_weights: &Self::Tensor,
+        router_biases: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        spatial: usize,
+        experts: usize,
+        top_k: usize,
+        temperature: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let input_f = self.f32v(input)?;
+        let input = &*input_f;
+        let router_weights_f = self.f32v(router_weights)?;
+        let router_weights = &*router_weights_f;
+        let router_biases_f = self.f32v(router_biases)?;
+        let router_biases = &*router_biases_f;
+        let op = "moe_router_gates_f32";
+        if batch == 0 || channels == 0 || spatial == 0 || experts == 0 {
+            return Err(shape_err(
+                op,
+                "batch, channels, spatial, and experts must be nonzero".into(),
+            ));
+        }
+        if input.len() != batch * channels * spatial
+            || router_weights.len() != experts * channels
+            || router_biases.len() != experts
+        {
+            return Err(shape_err(
+                op,
+                format!(
+                    "input/weights/biases have lengths {}/{}/{}, expected {}/{}/{}",
+                    input.len(),
+                    router_weights.len(),
+                    router_biases.len(),
+                    batch * channels * spatial,
+                    experts * channels,
+                    experts
+                ),
+            ));
+        }
+        let mut logits = self.alloc_uninit(batch * experts)?;
+        // SAFETY: one thread per (sample, expert) logit, each uniquely written.
+        unsafe {
+            self.layers_extra.moe_router_logits(
+                &self.stream,
+                launch::elementwise(logits.len(), config),
+                &input.buf,
+                &router_weights.buf,
+                &router_biases.buf,
+                &mut logits,
+                channels,
+                spatial,
+                experts,
+                batch,
+                temperature,
+            )
+        }
+        .map_err(launch_err)?;
+        let mut gates = self.alloc_uninit(batch * experts)?;
+        // SAFETY: one thread per batch row, each uniquely writes `experts` gates.
+        unsafe {
+            self.layers_extra.moe_router_softmax_topk(
+                &self.stream,
+                launch::elementwise(batch, config),
+                &logits,
+                &mut gates,
+                batch,
+                experts,
+                top_k,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(gates, &[batch, experts]))
+    }
+
     fn crop_bilinear_f32(
         &self,
         x: &Self::Tensor,

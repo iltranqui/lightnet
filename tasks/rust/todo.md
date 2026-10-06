@@ -47,8 +47,7 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
 - [~] Analytical gradients everywhere: the C++-shortcut audit is done and
   `DARKNET_GRAD_MODE=analytical|cpp` gates softmax and scale_channels (see
   `implemented.md` §12). Remaining: a finite-difference / parity test per
-  audited operation still lacking a Rust path: remaining unsupported oxide
-  activations (CPU gradients are covered), `NORM_CHAN*`, conv
+  audited operation still lacking a Rust path: `NORM_CHAN*`, conv
   `reverse`/`deform`/`grad_centr`, and YOLO DIoU/CIoU plus objectness/class
   deltas. YOLO IoU/GIoU box geometry now has finite-difference coverage (with
   Darknet's legacy 0.5 width/height comparison factor). Overlapping-window
@@ -109,11 +108,12 @@ Immediately next, in dependency order:
   and host-updated experts invalidate/re-upload their slots. FakeBackend test
   covers slot separation and rewarm. Device-side update/BN refresh remains
   top-level-conv-only until container training leaves the CPU fallback.
-- [~] Phase 2B `moe_convolutional`: real-device forward routes on the host,
-  runs each cached expert convolution and per-sample gate blend on Oxide; exact
-  backward/SGD use the CPU fallback. Verified against CPU in
-  `oxide_runtime_chain::moe_container_experts_run_oxide_forward_and_cpu_training_fallback_matches`.
-  Device-native routing/backward remain open. CPU path is
+- [~] Phase 2B `moe_convolutional`: real-device forward now computes router
+  pooling, logits, top-k masking, softmax, expert convolutions, and per-sample
+  gate blend on Oxide; exact backward/SGD use the CPU fallback. Verified against
+  CPU in `oxide_runtime_chain::moe_container_experts_run_oxide_forward_and_cpu_training_fallback_matches`
+  and router-specific soft/tied top-k parity coverage in `oxide_layers_extra`.
+  Device-native backward remains open. CPU path is
   done (`cdf68d00`). `eml_convolutional` not started (save order verified
   2026-10-05).
 - [ ] Phase 2B `dcnv3` blocked: no reference numerics (stub in all five branches).

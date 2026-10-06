@@ -179,6 +179,76 @@ pub trait CudaBackend {
     fn launch(&self, kernel: &CompiledKernel, launch: &KernelLaunch) -> Result<(), Self::Error>;
 }
 
+fn moe_router_gates_host(
+    input: &[f32],
+    router_weights: &[f32],
+    router_biases: &[f32],
+    batch: usize,
+    channels: usize,
+    spatial: usize,
+    experts: usize,
+    top_k: usize,
+    temperature: f32,
+) -> Vec<f32> {
+    assert!(
+        experts > 0 && spatial > 0,
+        "MoE router requires experts and spatial elements"
+    );
+    assert_eq!(input.len(), batch * channels * spatial);
+    assert_eq!(router_weights.len(), experts * channels);
+    assert_eq!(router_biases.len(), experts);
+    let inverse_spatial = 1.0 / spatial as f32;
+    let temperature = temperature.max(1e-6);
+    let mut gates = vec![0.0; batch * experts];
+    let mut logits = vec![0.0; experts];
+    for b in 0..batch {
+        for e in 0..experts {
+            let mut value = router_biases[e];
+            for c in 0..channels {
+                let base = (b * channels + c) * spatial;
+                let mut sum = 0.0f32;
+                for s in 0..spatial {
+                    sum += input[base + s];
+                }
+                let pooled = sum * inverse_spatial;
+                value += router_weights[e * channels + c] * pooled;
+            }
+            logits[e] = value / temperature;
+        }
+
+        let mut masked = logits.clone();
+        if top_k > 0 && top_k < experts {
+            let mut ranked = logits.clone();
+            ranked.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            let kth = ranked[top_k - 1];
+            for value in &mut masked {
+                if *value < kth {
+                    *value = -f32::MAX;
+                }
+            }
+        }
+        let maximum = masked.iter().copied().fold(-f32::MAX, f32::max);
+        let mut sum = 0.0f32;
+        for e in 0..experts {
+            let value = if masked[e] <= -f32::MAX * 0.5 {
+                0.0
+            } else {
+                (masked[e] - maximum).exp()
+            };
+            gates[b * experts + e] = value;
+            sum += value;
+        }
+        if sum <= 0.0 || !sum.is_finite() {
+            gates[b * experts..(b + 1) * experts].fill(1.0 / experts as f32);
+        } else {
+            for gate in &mut gates[b * experts..(b + 1) * experts] {
+                *gate /= sum;
+            }
+        }
+    }
+    gates
+}
+
 // `KernelLaunch` describes generic launches, but a real runtime also needs typed
 // device buffers. This trait is the first concrete execution seam for Rust-side
 // tensor ops while larger Darknet kernels are still being ported.
@@ -422,6 +492,35 @@ pub trait F32TensorOpsBackend {
         input_width: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error>;
+    /// Compute `[moe_convolutional]`'s per-sample router gates. The Oxide backend
+    /// keeps pooling, linear projection, top-k masking, and softmax on device;
+    /// other backends use this exact host fallback.
+    fn moe_router_gates_f32(
+        &self,
+        input: &Self::Tensor,
+        router_weights: &Self::Tensor,
+        router_biases: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        spatial: usize,
+        experts: usize,
+        top_k: usize,
+        temperature: f32,
+        _config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let gates = moe_router_gates_host(
+            &self.download_f32(input)?,
+            &self.download_f32(router_weights)?,
+            &self.download_f32(router_biases)?,
+            batch,
+            channels,
+            spatial,
+            experts,
+            top_k,
+            temperature,
+        );
+        self.upload_f32(&[batch, experts], &gates)
+    }
     /// Bilinearly sample an NCHW tensor using one source coordinate pair per
     /// batch/output pixel. `input_scales` and `input_offsets` contain one
     /// affine level adjustment per batch and are applied after interpolation.

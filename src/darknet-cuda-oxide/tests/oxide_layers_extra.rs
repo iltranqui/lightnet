@@ -643,3 +643,128 @@ fn channel_shuffle_matches_reference_and_inverse_round_trips() {
         assert_eq!(b.download_f32(&back).unwrap(), x);
     }
 }
+
+fn host_moe_router_gates(
+    input: &[f32],
+    weights: &[f32],
+    biases: &[f32],
+    batch: usize,
+    channels: usize,
+    spatial: usize,
+    experts: usize,
+    top_k: usize,
+    temperature: f32,
+) -> Vec<f32> {
+    let inv_spatial = 1.0 / spatial as f32;
+    let mut result = vec![0.0; batch * experts];
+    for b in 0..batch {
+        let mut pooled = vec![0.0; channels];
+        for c in 0..channels {
+            let base = (b * channels + c) * spatial;
+            pooled[c] = input[base..base + spatial].iter().sum::<f32>() * inv_spatial;
+        }
+        let mut logits = (0..experts)
+            .map(|e| {
+                let mut value = biases[e];
+                for c in 0..channels {
+                    value += weights[e * channels + c] * pooled[c];
+                }
+                value / temperature.max(1e-6)
+            })
+            .collect::<Vec<_>>();
+        if top_k > 0 && top_k < experts {
+            let mut ranked = logits.clone();
+            ranked.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            let threshold = ranked[top_k - 1];
+            for value in &mut logits {
+                if *value < threshold {
+                    *value = -f32::MAX;
+                }
+            }
+        }
+        let max = logits.iter().copied().fold(-f32::MAX, f32::max);
+        let mut sum = 0.0f32;
+        for (e, value) in logits.iter().enumerate() {
+            let exp = if *value <= -f32::MAX * 0.5 { 0.0 } else { (*value - max).exp() };
+            result[b * experts + e] = exp;
+            sum += exp;
+        }
+        if sum <= 0.0 || !sum.is_finite() {
+            result[b * experts..(b + 1) * experts].fill(1.0 / experts as f32);
+        } else {
+            for gate in &mut result[b * experts..(b + 1) * experts] {
+                *gate /= sum;
+            }
+        }
+    }
+    result
+}
+
+#[test]
+fn moe_router_gates_match_host_for_soft_and_tied_top_k_routes() {
+    let be = backend();
+    let (batch, channels, spatial, experts) = (3usize, 4usize, 5usize, 4usize);
+    let mut rng = Rng(0x4d4f_455f_524f_5554);
+    let input = rng.vec(batch * channels * spatial, -1.5, 1.5);
+    let weights = rng.vec(experts * channels, -0.7, 0.7);
+    let biases = rng.vec(experts, -0.3, 0.3);
+    let input_t = be.upload_f32(&[batch, channels, spatial], &input).unwrap();
+    let weights_t = be.upload_f32(&[experts, channels], &weights).unwrap();
+    let biases_t = be.upload_f32(&[experts], &biases).unwrap();
+
+    for top_k in [0usize, 1, 2, experts, experts + 2] {
+        let want = host_moe_router_gates(
+            &input, &weights, &biases, batch, channels, spatial, experts, top_k, 1.7,
+        );
+        let got = be
+            .moe_router_gates_f32(
+                &input_t,
+                &weights_t,
+                &biases_t,
+                batch,
+                channels,
+                spatial,
+                experts,
+                top_k,
+                1.7,
+                cfg(),
+            )
+            .unwrap();
+        assert_close(
+            &format!("moe_router top_k={top_k}"),
+            &be.download_f32(&got).unwrap(),
+            &f64s(&want),
+        );
+    }
+
+    // C++ keeps every expert tied with the kth logit instead of arbitrarily
+    // selecting only one of the equal maxima.
+    let tied_biases = vec![2.0; experts];
+    let tied_biases_t = be.upload_f32(&[experts], &tied_biases).unwrap();
+    let tied_weights_t = be
+        .upload_f32(&[experts, channels], &vec![0.0; experts * channels])
+        .unwrap();
+    let tied = be
+        .moe_router_gates_f32(
+            &input_t,
+            &tied_weights_t,
+            &tied_biases_t,
+            batch,
+            channels,
+            spatial,
+            experts,
+            1,
+            1.0,
+            cfg(),
+        )
+        .unwrap();
+    let uniform = vec![0.25; batch * experts]
+        .iter()
+        .map(|&v| v as f64)
+        .collect::<Vec<_>>();
+    assert_close(
+        "moe_router tied top_k",
+        &be.download_f32(&tied).unwrap(),
+        &uniform,
+    );
+}

@@ -108,10 +108,11 @@ Latest increments:
 - Device convolution params support per-owner expert slots for container reuse;
   warm-up and host-update invalidation are covered by the
   `container_convolution_cache_is_keyed_by_owner_and_expert_slot` FakeBackend test.
-  MoE now runs expert convolutions and per-sample gate blending on Oxide with
-  host routing and CPU backward/SGD fallback; real-device `oxide_runtime_chain`
-  parity covers the full forward/backward/update path. Device-native routing and
-  backward remain.
+  MoE now computes router pooling/logits/top-k softmax, expert convolutions, and
+  per-sample gate blending on Oxide; exact backward/SGD still use the CPU
+  fallback. Router-specific soft/tied top-k parity passes in
+  `oxide_layers_extra` (19/19), and the real-device `oxide_runtime_chain`
+  forward/backward/update suite passes (7/7). Device-native backward remains.
 - Overlapping-window maxpool backward, including `maxpool_zero_nonmax`, now
   matches central finite differences.
 - Host Adam now updates standalone batchnorm, local, connected, weighted
