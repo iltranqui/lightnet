@@ -83,10 +83,13 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
   parameter-gradient transfers, host accumulation/SGD, and some sequence handling
   still cross the host. BN RNN/LSTM backward uses backend projection/BPTT ops;
   BN CRNN backward uses backend convolution/BPTT ops with rolling-stat affine
-  input/beta derivatives. Scale-gradient reductions transfer raw projections or
-  convolutions and deltas to host. Recurrent BN forward/cache capture and host
-  optimizer remain. FakeBackend and real Oxide parity cover parameter, rolling-
-  stat, and upstream connected/convolution updates. Dynamic loss-scale finiteness
+  input/beta derivatives. BN scale-gradient reductions now use existing backend
+  centering, channel-scale, pointwise-multiply, and channel-reduction ops; the
+  Oxide path no longer transfers raw projections/convolutions and deltas to host
+  just for dscale.
+  Recurrent BN forward/cache capture, rolling-stat update, and optimizer remain
+  host-side. FakeBackend and real Oxide parity cover parameter, rolling-stat,
+  and upstream connected/convolution updates. Dynamic loss-scale finiteness
   checks include host-buffered connected/recurrent gradients. Unsupported
   recurrent activations still use CPU backward.
 - [x] Host Adam: connected, standalone batchnorm, local, weighted shortcut,

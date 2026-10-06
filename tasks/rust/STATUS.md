@@ -34,6 +34,13 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v61: BN RNN/LSTM/CRNN scale-gradient reductions now stay on backend using
+  existing centering, channel-scale, pointwise-multiply, and channel-reduction
+  ops; Oxide no longer transfers raw projection/convolution outputs and deltas to
+  host just for dscale. Forward/cache, rolling-stat update, and optimizer behavior
+  remain unchanged. Host recurrent filters passed (RNN 7/7, LSTM 3/3, CRNN 3/3),
+  all three real Oxide BN recurrent parity tests passed (3/3), and full real
+  Oxide `oxide_runtime_chain` passed (17/17).
 - v60: BN CRNN backward now uses backend convolution/BPTT ops with rolling-stat
   affine input/beta derivatives; forward/cache capture, scale-gradient reductions,
   and optimizer remain host-side. FakeBackend covers three projection blocks,
@@ -242,8 +249,10 @@ Latest increments:
   parameter-gradient transfers, host accumulation/SGD, and some cache handling
   still cross the host. BN RNN/LSTM backward uses backend projection/BPTT ops;
   BN CRNN backward uses convolution/BPTT ops. All use rolling-stat affine
-  input/beta derivatives; scale-gradient reductions transfer raw values/deltas
-  to host. Recurrent BN forward/cache capture and optimizer remain host-side.
+  input/beta derivatives; scale-gradient reductions use backend centering,
+  channel-scale, multiply, and channel-reduction ops (native on Oxide), so raw
+  recurrent values/deltas no longer return to host for dscale. Recurrent BN
+  forward/cache capture, rolling-stat update, and optimizer remain host-side.
   FakeBackend and real-device
   `oxide_runtime_chain::batch_normalized_rnn_device_backward_matches_cpu_on_oxide`,
   `oxide_runtime_chain::batch_normalized_lstm_device_backward_matches_cpu_on_oxide`,

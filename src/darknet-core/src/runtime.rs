@@ -14675,6 +14675,56 @@ where
     })
 }
 
+fn rolling_batch_norm_scale_gradient_device<B: F32TensorOpsBackend>(
+    backend: &B,
+    raw_output: &B::Tensor,
+    delta: &B::Tensor,
+    batch_norm: &BatchNormParams,
+    output_shape: TensorShape,
+    config: ElementwiseLaunchConfig,
+) -> Result<B::Tensor>
+where
+    B::Error: std::fmt::Display,
+{
+    let channels = output_shape.channels;
+    let channel_stride = output_shape.width * output_shape.height;
+    if channels == 0
+        || channel_stride == 0
+        || batch_norm.rolling_mean.len() != channels
+        || batch_norm.rolling_variance.len() != channels
+    {
+        return Err(Error::InvalidConfig(format!(
+            "BN recurrent rolling-stat shape mismatch: output has {channels} channels"
+        )));
+    }
+
+    let centered_bias: Vec<f32> = batch_norm.rolling_mean.iter().map(|mean| -*mean).collect();
+    let inverse_std: Vec<f32> = batch_norm
+        .rolling_variance
+        .iter()
+        .map(|variance| 1.0 / (variance + BATCH_NORM_EPSILON).sqrt())
+        .collect();
+    let centered_bias = backend
+        .upload_f32(&[channels], &centered_bias)
+        .map_err(|err| backend_error("upload BN recurrent rolling means", err))?;
+    let inverse_std = backend
+        .upload_f32(&[channels], &inverse_std)
+        .map_err(|err| backend_error("upload BN recurrent inverse standard deviations", err))?;
+    let centered = backend
+        .bias_add_f32(raw_output, &centered_bias, channels, channel_stride, config)
+        .map_err(|err| backend_error("center BN recurrent raw output", err))?;
+    let normalized = backend
+        .channel_scale_f32(&centered, &inverse_std, channels, channel_stride, config)
+        .map_err(|err| backend_error("normalize BN recurrent raw output", err))?;
+    let element_shape = tensor_backend_shape(output_shape);
+    let scaled_delta = backend
+        .vector_mul_f32(delta, &normalized, &element_shape, config)
+        .map_err(|err| backend_error("multiply BN recurrent scale-gradient terms", err))?;
+    backend
+        .bias_backward_f32(&scaled_delta, channels, channel_stride, config)
+        .map_err(|err| backend_error("reduce BN recurrent scale gradient", err))
+}
+
 fn backward_connected_recurrent_projection_device<B: F32TensorOpsBackend>(
     backend: &B,
     input: &B::Tensor,
@@ -14718,41 +14768,26 @@ where
                     config,
                 )
                 .map_err(|err| backend_error("BN recurrent raw connected projection", err))?;
-            let raw_values = backend
-                .download_f32(&raw_output)
-                .map_err(|err| backend_error("download BN recurrent raw projection", err))?;
-            let delta_values = backend
-                .download_f32(delta)
-                .map_err(|err| backend_error("download BN recurrent affine delta", err))?;
-            if raw_values.len() != sequence_batch * output_features
-                || delta_values.len() != raw_values.len()
-            {
-                return Err(Error::InvalidConfig(
-                    "BN recurrent projection activation shape mismatch".to_owned(),
-                ));
-            }
-            let mut scale_gradient_values = vec![0.0; output_features];
-            let mut delta_scale = vec![0.0; output_features];
-            for feature in 0..output_features {
-                let inv_std = 1.0
-                    / (batch_norm.rolling_variance[feature] + BATCH_NORM_EPSILON).sqrt();
-                delta_scale[feature] = batch_norm.scales[feature] * inv_std;
-                for batch in 0..sequence_batch {
-                    let index = batch * output_features + feature;
-                    let normalized =
-                        (raw_values[index] - batch_norm.rolling_mean[feature]) * inv_std;
-                    scale_gradient_values[feature] += delta_values[index] * normalized;
-                }
-            }
+            let scale_gradient = rolling_batch_norm_scale_gradient_device(
+                backend,
+                &raw_output,
+                delta,
+                batch_norm,
+                TensorShape::new(1, 1, output_features, sequence_batch),
+                config,
+            )?;
+            let delta_scale: Vec<f32> = batch_norm
+                .scales
+                .iter()
+                .zip(&batch_norm.rolling_variance)
+                .map(|(scale, variance)| scale / (variance + BATCH_NORM_EPSILON).sqrt())
+                .collect();
             let delta_scale = backend
                 .upload_f32(&[output_features], &delta_scale)
                 .map_err(|err| backend_error("upload BN recurrent affine scales", err))?;
             let linear_delta = backend
                 .channel_scale_f32(delta, &delta_scale, output_features, 1, config)
                 .map_err(|err| backend_error("BN recurrent rolling-stat delta scale", err))?;
-            let scale_gradient = backend
-                .upload_f32(&[output_features], &scale_gradient_values)
-                .map_err(|err| backend_error("upload BN recurrent scale gradient", err))?;
             (linear_delta, Some(beta_gradient), Some(scale_gradient))
         } else {
             (delta.clone(), None, None)
@@ -14769,7 +14804,12 @@ where
         )
         .map_err(|err| backend_error("recurrent connected projection backward", err))?;
     let bias_gradient = beta_gradient.unwrap_or(connected_bias_gradient);
-    Ok((input_gradient, weight_gradient, bias_gradient, scale_gradient))
+    Ok((
+        input_gradient,
+        weight_gradient,
+        bias_gradient,
+        scale_gradient,
+    ))
 }
 
 fn backward_rnn_layer_device<B: F32TensorOpsBackend>(
@@ -15860,42 +15900,26 @@ where
                 config,
             )
             .map_err(|err| backend_error("CRNN recurrent raw convolution", err))?;
-        let raw_values = backend
-            .download_f32(&raw_output)
-            .map_err(|err| backend_error("download CRNN recurrent raw output", err))?;
-        let delta_values = backend
-            .download_f32(delta)
-            .map_err(|err| backend_error("download CRNN recurrent BN delta", err))?;
-        let expected_values = output_shape.batch * filters * spatial;
-        if raw_values.len() != expected_values || delta_values.len() != expected_values {
-            return Err(Error::InvalidConfig(format!(
-                "CRNN {projection} batch-norm activation length mismatch at layer #{layer_index}"
-            )));
-        }
-        let mut scale_values = vec![0.0; filters];
-        let mut delta_scales = vec![0.0; filters];
-        for filter in 0..filters {
-            let inv_std = 1.0 / (batch_norm.rolling_variance[filter] + BATCH_NORM_EPSILON).sqrt();
-            delta_scales[filter] = batch_norm.scales[filter] * inv_std;
-            for batch in 0..output_shape.batch {
-                let base = (batch * filters + filter) * spatial;
-                for position in 0..spatial {
-                    let index = base + position;
-                    let normalized =
-                        (raw_values[index] - batch_norm.rolling_mean[filter]) * inv_std;
-                    scale_values[filter] += delta_values[index] * normalized;
-                }
-            }
-        }
+        let scale_gradient = rolling_batch_norm_scale_gradient_device(
+            backend,
+            &raw_output,
+            delta,
+            batch_norm,
+            output_shape,
+            config,
+        )?;
+        let delta_scales: Vec<f32> = batch_norm
+            .scales
+            .iter()
+            .zip(&batch_norm.rolling_variance)
+            .map(|(scale, variance)| scale / (variance + BATCH_NORM_EPSILON).sqrt())
+            .collect();
         let delta_scales = backend
             .upload_f32(&[filters], &delta_scales)
             .map_err(|err| backend_error("upload CRNN recurrent BN scales", err))?;
         let convolution_delta = backend
             .channel_scale_f32(delta, &delta_scales, filters, spatial, config)
             .map_err(|err| backend_error("scale CRNN recurrent BN delta", err))?;
-        let scale_gradient = backend
-            .upload_f32(&[filters], &scale_values)
-            .map_err(|err| backend_error("upload CRNN recurrent BN scale gradient", err))?;
         (convolution_delta, Some(scale_gradient))
     } else {
         (delta.clone(), None)
