@@ -72,11 +72,12 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
   concatenated directly on-device; LSTM backward slices input/output gradients
   and assembles input gradients on-device too. RNN now also slices input/output
   sequences and assembles input gradients on-device, accumulating projection
-  gradients on-device across steps before one transfer per block. CRNN input
-  slicing, recurrent cache/state transfers, parameter-gradient transfers, host
-  accumulation/SGD, and some sequence handling still cross the host. FakeBackend
-  and real Oxide tests compare training updates with CPU, including upstream
-  convolution updates. Batch-normalized recurrent layers still use CPU backward.
+  gradients on-device across steps before one transfer per block. CRNN forward
+  input slicing and output assembly are also on-device; CRNN backward sequence/
+  gradient transfers, recurrent cache/state transfers, parameter-gradient
+  transfers, host accumulation/SGD, and some sequence handling still cross the
+  host. FakeBackend and real Oxide tests compare training updates with CPU,
+  including upstream convolution updates. Batch-normalized recurrent layers still use CPU backward.
 - [x] Host Adam: connected, standalone batchnorm, local, weighted shortcut,
   MoE, deconvolutional, GRU/RNN/LSTM/CRNN, and ViT host params use per-layer
   rate scaling and persisted host moments in DNOPT2 optimizer sidecars (DNOPT1

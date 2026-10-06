@@ -6119,9 +6119,6 @@ where
                     }
                 }
                 (LayerKind::Crnn(spec), LayerParams::Crnn(recurrent)) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download CRNN input", err))?;
                     if !spec.batch_normalize
                         && recurrent.input.batch_norm.is_none()
                         && recurrent.self_params.batch_norm.is_none()
@@ -6132,7 +6129,8 @@ where
                             &self.backend,
                             spec,
                             recurrent,
-                            &host_input,
+                            current_input,
+                            layer.input_shape,
                             layer.output_shape,
                             layer.index,
                             launch_config,
@@ -6140,6 +6138,9 @@ where
                         recurrent_caches.push(Some(RecurrentForwardCache::Crnn(cache)));
                         output
                     } else {
+                        let host_input = self
+                            .download_tensor(current_input, layer.input_shape)
+                            .map_err(|err| backend_error("download CRNN input", err))?;
                         let (host_output, cache) =
                             forward_crnn_layer(spec, recurrent, &host_input, layer.output_shape)?;
                         recurrent_caches.push(Some(RecurrentForwardCache::Crnn(cache)));
@@ -12832,7 +12833,8 @@ fn forward_crnn_layer_device<B: F32TensorOpsBackend>(
     backend: &B,
     spec: &CrnnSpec,
     params: &CrnnParams,
-    input: &Tensor,
+    input_gpu: &B::Tensor,
+    input_shape: TensorShape,
     output_shape: TensorShape,
     layer_index: usize,
     config: ElementwiseLaunchConfig,
@@ -12850,21 +12852,21 @@ where
             name: "batch-normalized CRNN GPU forward".to_owned(),
         });
     }
-    let sequence_batch = recurrent_sequence_batch(input.shape.batch, spec.steps)?;
+    let sequence_batch = recurrent_sequence_batch(input_shape.batch, spec.steps)?;
     let input_width =
-        convolution_output_dim(input.shape.width, spec.padding, spec.size, spec.stride);
+        convolution_output_dim(input_shape.width, spec.padding, spec.size, spec.stride);
     let input_height =
-        convolution_output_dim(input.shape.height, spec.padding, spec.size, spec.stride);
+        convolution_output_dim(input_shape.height, spec.padding, spec.size, spec.stride);
     let hidden_shape = TensorShape::new(input_width, input_height, spec.hidden, sequence_batch);
     let output_step_shape =
         TensorShape::new(input_width, input_height, spec.output, sequence_batch);
     let input_step_shape = TensorShape::new(
-        input.shape.width,
-        input.shape.height,
-        input.shape.channels,
+        input_shape.width,
+        input_shape.height,
+        input_shape.channels,
         sequence_batch,
     );
-    if output_shape != TensorShape::new(input_width, input_height, spec.output, input.shape.batch) {
+    if output_shape != TensorShape::new(input_width, input_height, spec.output, input_shape.batch) {
         return Err(Error::InvalidConfig(
             "CRNN output shape is inconsistent with its specification".to_owned(),
         ));
@@ -12900,7 +12902,7 @@ where
             Ok((weights, biases))
         };
     let (input_weights, input_biases) =
-        upload_conv_params(&params.input, &input_spec, input.shape.channels, "input")?;
+        upload_conv_params(&params.input, &input_spec, input_shape.channels, "input")?;
     let (self_weights, self_biases) =
         upload_conv_params(&params.self_params, &self_spec, spec.hidden, "recurrent")?;
     let (output_weights, output_biases) =
@@ -12948,7 +12950,7 @@ where
         Ok((pre_activation, output))
     };
 
-    let mut output = Tensor::zeros(output_shape);
+    let mut output_steps = Vec::with_capacity(spec.steps);
     let mut previous_state = Tensor::zeros(hidden_shape);
     let mut previous_state_gpu = backend
         .zeros_f32(&tensor_backend_shape(hidden_shape))
@@ -12966,17 +12968,23 @@ where
     };
 
     for step in 0..spec.steps {
-        let step_input = sequence_slice(input, step, sequence_batch, input_step_shape)?;
         let step_input_gpu = backend
-            .upload_f32(&tensor_backend_shape(input_step_shape), &step_input.data)
-            .map_err(|err| backend_error("upload CRNN sequence slice", err))?;
+            .sequence_slice_f32(
+                input_gpu,
+                &tensor_backend_shape(input_shape),
+                step,
+                spec.steps,
+                &tensor_backend_shape(input_step_shape),
+                config,
+            )
+            .map_err(|err| backend_error("slice CRNN input sequence", err))?;
         let (input_pre, input_output_gpu) = conv_forward(
             &step_input_gpu,
             &input_weights,
             &input_biases,
-            input.shape.channels,
-            input.shape.height,
-            input.shape.width,
+            input_shape.channels,
+            input_shape.height,
+            input_shape.width,
             spec.hidden,
             hidden_shape,
         )?;
@@ -13051,7 +13059,7 @@ where
             output_step_shape,
             "download CRNN output",
         )?;
-        sequence_write(&mut output, step, sequence_batch, &step_output)?;
+        output_steps.push(step_output_gpu.clone());
 
         cache.input_outputs.push(input_output);
         cache.input_activation_inputs.push(input_activation_input);
@@ -13065,9 +13073,15 @@ where
         previous_state_gpu = state_gpu;
     }
 
+    let output_step_refs: Vec<_> = output_steps.iter().collect();
     let output_gpu = backend
-        .upload_f32(&tensor_backend_shape(output_shape), &output.data)
-        .map_err(|err| backend_error("upload assembled CRNN output", err))?;
+        .sequence_concat_f32(
+            &output_step_refs,
+            &tensor_backend_shape(output_shape),
+            sequence_batch * output_step_shape.element_count(),
+            config,
+        )
+        .map_err(|err| backend_error("assemble CRNN output sequence", err))?;
     Ok((output_gpu, cache))
 }
 

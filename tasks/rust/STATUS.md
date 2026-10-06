@@ -40,9 +40,10 @@ Latest increments:
   gate, and cell caches, and concatenates timestep outputs directly on-device.
   LSTM and RNN forward/backward sequence slicing and timestep input-gradient
   assembly stay on-device; RNN projection gradients also accumulate on-device
-  across steps. CRNN input slicing, recurrent cache/state transfers, parameter-
-  gradient transfers, host accumulation/SGD, and some cache handling remain
-  host-side. FakeBackend parity and real-device
+  across steps. CRNN forward input slicing and output assembly also stay
+  on-device. CRNN backward sequence/gradient transfers, recurrent cache/state
+  transfers, parameter-gradient transfers, host accumulation/SGD, and some cache
+  handling remain host-side. FakeBackend parity and real-device
   `oxide_runtime_chain::lstm_no_batch_norm_forward_and_device_backward_match_cpu`
   pass, including upstream convolution updates.
 - Added an oxide Stair activation kernel matching Darknet's floor-based
@@ -151,10 +152,11 @@ Latest increments:
   BPTT caches resident instead of downloading projection/gate/cell caches,
   and timestep outputs are concatenated on-device. RNN/LSTM forward/backward
   sequence slicing and timestep input-gradient assembly also stay on-device;
-  RNN projection gradients accumulate on-device across steps. CRNN input
-  slicing, recurrent cache/state transfers, parameter-gradient transfers, host
-  accumulation/SGD, and some cache handling still cross the host. Batch-
-  normalized recurrent layers remain on CPU backward. FakeBackend parity
+  RNN projection gradients accumulate on-device across steps; CRNN forward
+  input slicing and output assembly also stay on-device. CRNN backward sequence/
+  gradient transfers, recurrent cache/state transfers, parameter-gradient
+  transfers, host accumulation/SGD, and some cache handling still cross the host.
+  Batch-normalized recurrent layers remain on CPU backward. FakeBackend parity
   and real-device
   `oxide_runtime_chain::lstm_no_batch_norm_forward_and_device_backward_match_cpu`
   compare training updates with CPU, including upstream convolution updates.
