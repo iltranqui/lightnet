@@ -16,6 +16,11 @@ pub struct ObbLabel {
     pub y: f32,
     pub w: f32,
     pub h: f32,
+    /// Source `read_boxes` bounds, initially clamped to `[0, 1]`.
+    pub left: f32,
+    pub right: f32,
+    pub top: f32,
+    pub bottom: f32,
     /// Front-point placeholder (the box center when `has_front` is false).
     pub front_x: f32,
     /// Front-point placeholder (the box center when `has_front` is false).
@@ -98,6 +103,11 @@ fn parse_obb_labels(text: &str, path: &Path, classes: Option<usize>) -> Result<V
             )));
         }
 
+        let left = (x - w / 2.0).clamp(0.0, 1.0);
+        let right = (x + w / 2.0).clamp(0.0, 1.0);
+        let top = (y - h / 2.0).clamp(0.0, 1.0);
+        let bottom = (y + h / 2.0).clamp(0.0, 1.0);
+
         let has_front = fields.len() == 7;
         let (front_x, front_y) = if has_front {
             (
@@ -113,12 +123,115 @@ fn parse_obb_labels(text: &str, path: &Path, classes: Option<usize>) -> Result<V
             y,
             w,
             h,
+            left,
+            right,
+            top,
+            bottom,
             front_x,
             front_y,
             has_front,
         });
     }
     Ok(labels)
+}
+
+/// Rotate OBB labels around the normalized image center using Darknet's
+/// `rotate_box_labels` convention. Explicit front points define an oriented
+/// rectangle; labels without a front point rotate their stored AABB instead.
+pub fn rotate_obb_labels(labels: &mut [ObbLabel], angle_rad: f32) -> Result<()> {
+    if !angle_rad.is_finite() {
+        return Err(Error::InvalidConfig(
+            "OBB label rotation angle must be finite".to_owned(),
+        ));
+    }
+    if labels.is_empty() || angle_rad.abs() < 1e-6 {
+        return Ok(());
+    }
+
+    let cosine = angle_rad.cos();
+    let sine = angle_rad.sin();
+    for label in labels {
+        let center = rotate_point([label.x, label.y], cosine, sine);
+        let mut front = center;
+        let mut corners = [[0.0; 2]; 4];
+        let mut use_obb_corners = false;
+
+        if label.has_front {
+            front = rotate_point([label.front_x, label.front_y], cosine, sine);
+            let mut axis_height = [front[0] - center[0], front[1] - center[1]];
+            let axis_length =
+                (axis_height[0] * axis_height[0] + axis_height[1] * axis_height[1]).sqrt();
+            if axis_length.is_finite() && axis_length > 1e-6 {
+                axis_height[0] /= axis_length;
+                axis_height[1] /= axis_length;
+                let axis_width = [-axis_height[1], axis_height[0]];
+                let half_width = label.w * 0.5;
+                let half_height = label.h * 0.5;
+                let width = [axis_width[0] * half_width, axis_width[1] * half_width];
+                let height = [axis_height[0] * half_height, axis_height[1] * half_height];
+                corners = [
+                    [
+                        center[0] + width[0] + height[0],
+                        center[1] + width[1] + height[1],
+                    ],
+                    [
+                        center[0] - width[0] + height[0],
+                        center[1] - width[1] + height[1],
+                    ],
+                    [
+                        center[0] - width[0] - height[0],
+                        center[1] - width[1] - height[1],
+                    ],
+                    [
+                        center[0] + width[0] - height[0],
+                        center[1] + width[1] - height[1],
+                    ],
+                ];
+                use_obb_corners = true;
+            }
+        }
+
+        if !use_obb_corners {
+            front = center;
+            corners = [
+                rotate_point([label.left, label.top], cosine, sine),
+                rotate_point([label.right, label.top], cosine, sine),
+                rotate_point([label.right, label.bottom], cosine, sine),
+                rotate_point([label.left, label.bottom], cosine, sine),
+            ];
+        }
+
+        let mut left = corners[0][0];
+        let mut right = corners[0][0];
+        let mut top = corners[0][1];
+        let mut bottom = corners[0][1];
+        for corner in &corners[1..] {
+            left = left.min(corner[0]);
+            right = right.max(corner[0]);
+            top = top.min(corner[1]);
+            bottom = bottom.max(corner[1]);
+        }
+
+        label.x = center[0];
+        label.y = center[1];
+        label.front_x = front[0];
+        label.front_y = front[1];
+        label.left = left;
+        label.right = right;
+        label.top = top;
+        label.bottom = bottom;
+        if !label.has_front {
+            label.w = right - left;
+            label.h = bottom - top;
+        }
+    }
+    Ok(())
+}
+
+fn rotate_point(point: [f32; 2], cosine: f32, sine: f32) -> [f32; 2] {
+    let x = point[0] - 0.5;
+    let y = point[1] - 0.5;
+    [cosine * x + sine * y + 0.5, -sine * x + cosine * y + 0.5]
 }
 
 fn parse_clamped_coordinate(value: &str, path: &Path, line: usize, field: &str) -> Result<f32> {
@@ -138,11 +251,28 @@ fn parse_clamped_coordinate(value: &str, path: &Path, line: usize, field: &str) 
 mod tests {
     use std::{fs, path::Path};
 
-    use super::{ObbLabel, load_obb_labels, parse_obb_labels};
+    use super::{ObbLabel, load_obb_labels, parse_obb_labels, rotate_obb_labels};
     use crate::error::Error;
 
     fn parse(text: &str, classes: Option<usize>) -> crate::Result<Vec<ObbLabel>> {
         parse_obb_labels(text, Path::new("labels.txt"), classes)
+    }
+
+    fn label(x: f32, y: f32, w: f32, h: f32, front: [f32; 2], has_front: bool) -> ObbLabel {
+        ObbLabel {
+            class_id: 0,
+            x,
+            y,
+            w,
+            h,
+            left: (x - w / 2.0).clamp(0.0, 1.0),
+            right: (x + w / 2.0).clamp(0.0, 1.0),
+            top: (y - h / 2.0).clamp(0.0, 1.0),
+            bottom: (y + h / 2.0).clamp(0.0, 1.0),
+            front_x: front[0],
+            front_y: front[1],
+            has_front,
+        }
     }
 
     #[test]
@@ -161,6 +291,10 @@ mod tests {
                     y: 0.25,
                     w: 0.1,
                     h: 0.2,
+                    left: 0.45,
+                    right: 0.55,
+                    top: 0.15,
+                    bottom: 0.35,
                     front_x: 0.6,
                     front_y: 0.3,
                     has_front: true,
@@ -171,6 +305,10 @@ mod tests {
                     y: 0.75,
                     w: 0.2,
                     h: 0.4,
+                    left: 0.15,
+                    right: 0.35,
+                    top: 0.55,
+                    bottom: 0.95,
                     front_x: 0.25,
                     front_y: 0.75,
                     has_front: false,
@@ -187,6 +325,10 @@ mod tests {
         assert_eq!(labels[0].y, 1.0);
         assert_eq!(labels[0].w, 1.0);
         assert_eq!(labels[0].h, 0.5);
+        assert_eq!(labels[0].left, 0.0);
+        assert_eq!(labels[0].right, 0.5);
+        assert_eq!(labels[0].top, 0.75);
+        assert_eq!(labels[0].bottom, 1.0);
         assert_eq!(labels[0].front_x, 0.0);
         assert_eq!(labels[0].front_y, 1.0);
         assert!(labels[0].has_front);
@@ -234,5 +376,68 @@ mod tests {
 
         let missing = path.with_extension("missing");
         assert!(matches!(load_obb_labels(&missing, None), Err(Error::Io(_))));
+    }
+
+    #[test]
+    fn rotates_explicit_front_rectangle_and_preserves_obb_dimensions() {
+        let mut labels = [label(0.5, 0.5, 0.2, 0.4, [0.5, 0.75], true)];
+        rotate_obb_labels(&mut labels, std::f32::consts::FRAC_PI_2).expect("finite rotation");
+        let rotated = labels[0];
+        assert!((rotated.x - 0.5).abs() < 1e-6);
+        assert!((rotated.y - 0.5).abs() < 1e-6);
+        assert!((rotated.front_x - 0.75).abs() < 1e-6);
+        assert!((rotated.front_y - 0.5).abs() < 1e-6);
+        assert!((rotated.w - 0.2).abs() < 1e-6);
+        assert!((rotated.h - 0.4).abs() < 1e-6);
+        assert!((rotated.left - 0.3).abs() < 1e-6);
+        assert!((rotated.right - 0.7).abs() < 1e-6);
+        assert!((rotated.top - 0.4).abs() < 1e-6);
+        assert!((rotated.bottom - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rotates_no_front_axis_aligned_bounds_and_updates_size() {
+        let mut labels = [label(0.5, 0.5, 0.4, 0.2, [0.5, 0.5], false)];
+        rotate_obb_labels(&mut labels, std::f32::consts::FRAC_PI_2).expect("finite rotation");
+        let rotated = labels[0];
+        assert!((rotated.x - 0.5).abs() < 1e-6);
+        assert!((rotated.y - 0.5).abs() < 1e-6);
+        assert!((rotated.front_x - rotated.x).abs() < 1e-6);
+        assert!((rotated.front_y - rotated.y).abs() < 1e-6);
+        assert!((rotated.w - 0.2).abs() < 1e-6);
+        assert!((rotated.h - 0.4).abs() < 1e-6);
+        assert!((rotated.left - 0.4).abs() < 1e-6);
+        assert!((rotated.right - 0.6).abs() < 1e-6);
+        assert!((rotated.top - 0.3).abs() < 1e-6);
+        assert!((rotated.bottom - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn degenerate_front_falls_back_to_bounds_but_keeps_obb_size() {
+        let mut labels = [label(0.25, 0.4, 0.4, 0.2, [0.25, 0.4], true)];
+        rotate_obb_labels(&mut labels, std::f32::consts::FRAC_PI_2).expect("finite rotation");
+        let rotated = labels[0];
+        assert!((rotated.x - 0.4).abs() < 1e-6);
+        assert!((rotated.y - 0.75).abs() < 1e-6);
+        assert!((rotated.front_x - rotated.x).abs() < 1e-6);
+        assert!((rotated.front_y - rotated.y).abs() < 1e-6);
+        assert!((rotated.w - 0.4).abs() < 1e-6);
+        assert!((rotated.h - 0.2).abs() < 1e-6);
+        assert!((rotated.left - 0.3).abs() < 1e-6);
+        assert!((rotated.right - 0.5).abs() < 1e-6);
+        assert!((rotated.top - 0.55).abs() < 1e-6);
+        assert!((rotated.bottom - 0.95).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rotation_below_source_threshold_is_noop_and_non_finite_angle_fails() {
+        let original = label(0.25, 0.4, 0.3, 0.2, [0.3, 0.5], true);
+        let mut labels = [original];
+        rotate_obb_labels(&mut labels, 0.5e-6).expect("finite small rotation");
+        assert_eq!(labels[0], original);
+        assert!(matches!(
+            rotate_obb_labels(&mut labels, f32::NAN),
+            Err(Error::InvalidConfig(_))
+        ));
     }
 }

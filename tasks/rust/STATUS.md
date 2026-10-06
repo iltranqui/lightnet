@@ -34,6 +34,13 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v80: extended `ObbLabel` with source-clamped AABB bounds and added a
+  source-derived normalized-center label rotation utility. Explicit front points
+  rotate oriented rectangle corners while preserving OBB sizes; missing or
+  degenerate front vectors use the source AABB fallback. The focused OBB suite
+  passed 21/21, including both rotation paths and the source no-op threshold.
+  Image augmentation/loader/training integration and compiled-C++ parity remain
+  open.
 - v79: added standalone OBB label-file parsing for five-field box rows and
   seven-field rows with explicit front points. The parser tracks `has_front`,
   defaults absent front coordinates to the center placeholder, clamps finite

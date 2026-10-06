@@ -53,7 +53,7 @@ pub mod modern_yolo;
 pub mod names;
 pub mod obb_geometry;
 pub mod obb_labels;
-pub use obb_labels::{ObbLabel, load_obb_labels};
+pub use obb_labels::{ObbLabel, load_obb_labels, rotate_obb_labels};
 pub(crate) mod omd_loss;
 pub mod runtime;
 pub(crate) mod segmentation;
