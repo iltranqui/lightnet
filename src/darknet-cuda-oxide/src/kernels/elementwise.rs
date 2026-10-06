@@ -16,6 +16,16 @@ pub mod kernels {
         }
     }
 
+    /// out[i] = x[i] * y[i]
+    #[kernel]
+    pub fn vector_mul(x: &[f32], y: &[f32], mut out: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = out.get_mut(idx) {
+            *o = x[i] * y[i];
+        }
+    }
+
     /// out[i] = alpha * x[i] + y[i]
     #[kernel]
     pub fn saxpy(alpha: f32, x: &[f32], y: &[f32], mut out: DisjointSlice<f32>) {

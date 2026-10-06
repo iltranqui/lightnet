@@ -479,6 +479,106 @@ fn rnn_recurrent_projections_and_training_backward_match_cpu() {
 }
 
 #[test]
+fn lstm_no_batch_norm_forward_and_fallback_training_match_cpu() {
+    let net = network(
+        "[net]\ninputs=2\nbatch=2\ntime_steps=2\n\
+         [lstm]\noutput=3\nbatch_normalize=0\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let LayerParams::Lstm(params) = &mut cpu.params[0] else {
+        panic!("expected LSTM parameters");
+    };
+    for (slot, projection) in [
+        &mut params.wf,
+        &mut params.wi,
+        &mut params.wg,
+        &mut params.wo,
+        &mut params.uf,
+        &mut params.ui,
+        &mut params.ug,
+        &mut params.uo,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (index, weight) in projection.weights.iter_mut().enumerate() {
+            *weight = 0.015 + (slot * 3 + index) as f32 * 0.004;
+        }
+        for (index, bias) in projection.biases.iter_mut().enumerate() {
+            *bias = (slot as f32 - 3.5) * 0.01 + index as f32 * 0.006;
+        }
+    }
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("oxide backend"));
+    gpu.params = cpu.params.clone();
+    let input = patterned(cpu.network.net.input_shape());
+    let cpu_forward = cpu.forward(&input).expect("CPU LSTM forward");
+    let gpu_forward = gpu.forward_with_state(&input).expect("Oxide LSTM forward");
+    close(
+        "LSTM output",
+        &cpu_forward.final_output().expect("CPU output").data,
+        &gpu_forward
+            .cpu_forward
+            .final_output()
+            .expect("Oxide output")
+            .data,
+        3e-4,
+    );
+
+    cpu.zero_train_buffers();
+    gpu.init_train_buffers_gpu().expect("LSTM train buffers");
+    gpu.zero_train_buffers_gpu()
+        .expect("clear LSTM train buffers");
+    let cpu_training = cpu.forward_training(&input).expect("CPU LSTM training");
+    let gpu_training = gpu
+        .forward_training_device(&input)
+        .expect("Oxide LSTM training");
+    let output_shape = cpu.network.layers[0].output_shape;
+    let seed = Tensor::from_data(
+        output_shape,
+        (0..output_shape.batch * output_shape.element_count())
+            .map(|index| (index as f32 * 0.43).cos() * 0.6)
+            .collect(),
+    )
+    .expect("LSTM output gradient");
+    let seeds = vec![Some(seed)];
+    cpu.backward_accumulate_seeded(&input, &cpu_training, &seeds)
+        .expect("CPU LSTM backward");
+    gpu.backward_accumulate_seeded_gpu(&gpu_training, &seeds)
+        .expect("LSTM CPU backward fallback");
+    cpu.update_weights(0.02, 0.0, 0.0, 2);
+    gpu.update_weights_gpu(0.02, 0.0, 0.0, 2)
+        .expect("LSTM fallback optimizer step");
+    let (LayerParams::Lstm(cpu_params), LayerParams::Lstm(gpu_params)) =
+        (&cpu.params[0], &gpu.params[0])
+    else {
+        panic!("expected LSTM parameters after training");
+    };
+    for (name, cpu_projection, gpu_projection) in [
+        ("wf", &cpu_params.wf, &gpu_params.wf),
+        ("wi", &cpu_params.wi, &gpu_params.wi),
+        ("wg", &cpu_params.wg, &gpu_params.wg),
+        ("wo", &cpu_params.wo, &gpu_params.wo),
+        ("uf", &cpu_params.uf, &gpu_params.uf),
+        ("ui", &cpu_params.ui, &gpu_params.ui),
+        ("ug", &cpu_params.ug, &gpu_params.ug),
+        ("uo", &cpu_params.uo, &gpu_params.uo),
+    ] {
+        close(
+            &format!("LSTM {name} weights"),
+            &cpu_projection.weights,
+            &gpu_projection.weights,
+            3e-4,
+        );
+        close(
+            &format!("LSTM {name} biases"),
+            &cpu_projection.biases,
+            &gpu_projection.biases,
+            3e-4,
+        );
+    }
+}
+
+#[test]
 fn crnn_recurrent_convolutions_and_training_backward_match_cpu() {
     let net = network(
         "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=2\ntime_steps=2\n\

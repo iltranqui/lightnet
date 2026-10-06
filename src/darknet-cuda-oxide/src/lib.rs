@@ -2373,6 +2373,40 @@ impl F32TensorOpsBackend for OxideBackend {
         Ok(OxideTensorF32::new(out, y.shape()))
     }
 
+    fn vector_mul_f32(
+        &self,
+        x: &Self::Tensor,
+        y: &Self::Tensor,
+        shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let x_f = self.f32v(x)?;
+        let x = &*x_f;
+        let y_f = self.f32v(y)?;
+        let y = &*y_f;
+        same_len("vector_mul_f32", x, y)?;
+        let expected: usize = shape.iter().product();
+        if expected != x.len() {
+            return Err(OxideError::Shape(format!(
+                "vector_mul_f32 output shape has {expected} elements, expected {}",
+                x.len()
+            )));
+        }
+        let mut out = self.alloc_uninit(x.len())?;
+        // SAFETY: one thread per element; buffers cover all accesses.
+        unsafe {
+            self.elementwise.vector_mul(
+                &self.stream,
+                launch::elementwise(x.len(), config),
+                &x.buf,
+                &y.buf,
+                &mut out,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(out, shape))
+    }
+
     fn saxpy_f32(
         &self,
         alpha: f32,

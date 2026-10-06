@@ -6059,12 +6059,39 @@ where
                     let host_input = self
                         .download_tensor(current_input, layer.input_shape)
                         .map_err(|err| backend_error("download LSTM input", err))?;
-                    let (host_output, cache) =
-                        forward_lstm_layer(spec, recurrent, &host_input, layer.output_shape)?;
-                    recurrent_caches.push(Some(RecurrentForwardCache::Lstm(cache)));
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
-                        .map_err(|err| backend_error("upload LSTM output", err))?
+                    if !spec.batch_normalize
+                        && [
+                            &recurrent.wf,
+                            &recurrent.wi,
+                            &recurrent.wg,
+                            &recurrent.wo,
+                            &recurrent.uf,
+                            &recurrent.ui,
+                            &recurrent.ug,
+                            &recurrent.uo,
+                        ]
+                        .iter()
+                        .all(|projection| projection.batch_norm.is_none())
+                    {
+                        let (output, cache) = forward_lstm_layer_device(
+                            &self.backend,
+                            spec,
+                            recurrent,
+                            &host_input,
+                            layer.output_shape,
+                            layer.index,
+                            launch_config,
+                        )?;
+                        recurrent_caches.push(Some(RecurrentForwardCache::Lstm(cache)));
+                        output
+                    } else {
+                        let (host_output, cache) =
+                            forward_lstm_layer(spec, recurrent, &host_input, layer.output_shape)?;
+                        recurrent_caches.push(Some(RecurrentForwardCache::Lstm(cache)));
+                        self.backend
+                            .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
+                            .map_err(|err| backend_error("upload LSTM output", err))?
+                    }
                 }
                 (LayerKind::Crnn(spec), LayerParams::Crnn(recurrent)) => {
                     let host_input = self
@@ -8087,8 +8114,8 @@ where
         self.network.layers.iter().any(|layer| {
             match &layer.kind {
                 // No-batchnorm RNNs and CRNNs have device forward/backward
-                // kernels; batchnorm recurrent layers and LSTM still use the
-                // CPU fallback.
+                // kernels. No-BN LSTM forward is device-side, but LSTM
+                // backward and batchnorm recurrent layers use the CPU fallback.
                 LayerKind::Rnn(spec) => {
                     if spec.batch_normalize
                         || spec.activation.to_cuda_f32_kind().is_none()
@@ -11954,6 +11981,303 @@ fn forward_rnn_layer(
     }
 
     Ok((output, cache))
+}
+
+fn forward_lstm_layer_device<B: F32TensorOpsBackend>(
+    backend: &B,
+    spec: &LstmSpec,
+    params: &LstmParams,
+    input: &Tensor,
+    output_shape: TensorShape,
+    layer_index: usize,
+    config: ElementwiseLaunchConfig,
+) -> Result<(B::Tensor, LstmForwardCache)>
+where
+    B::Error: std::fmt::Display,
+{
+    if spec.batch_normalize
+        || [
+            &params.wf, &params.wi, &params.wg, &params.wo, &params.uf, &params.ui, &params.ug,
+            &params.uo,
+        ]
+        .iter()
+        .any(|projection| projection.batch_norm.is_some())
+    {
+        return Err(Error::UnsupportedLayer {
+            layer_index,
+            name: "batch-normalized LSTM GPU forward".to_owned(),
+        });
+    }
+    let sequence_batch = recurrent_sequence_batch(input.shape.batch, spec.steps)?;
+    if output_shape.width != 1 || output_shape.height != 1 || output_shape.channels != spec.output {
+        return Err(Error::InvalidConfig(
+            "LSTM output shape is inconsistent with its specification".to_owned(),
+        ));
+    }
+    let inputs = input.shape.element_count();
+    let state_shape = TensorShape::new(1, 1, spec.output, sequence_batch);
+    let input_step_shape = TensorShape::new(
+        input.shape.width,
+        input.shape.height,
+        input.shape.channels,
+        sequence_batch,
+    );
+    let upload_projection = |projection: &ConnectedParams, input_features: usize, name: &str| {
+        if projection.weights.len() != spec.output * input_features
+            || projection.biases.len() != spec.output
+        {
+            return Err(Error::InvalidConfig(format!(
+                "LSTM {name} projection parameter shapes are inconsistent with its specification"
+            )));
+        }
+        let weights = backend
+            .upload_f32(&[spec.output, input_features], &projection.weights)
+            .map_err(|err| backend_error("upload LSTM projection weights", err))?;
+        let biases = backend
+            .upload_f32(&[spec.output], &projection.biases)
+            .map_err(|err| backend_error("upload LSTM projection biases", err))?;
+        Ok((weights, biases))
+    };
+    let (wf_weights, wf_biases) = upload_projection(&params.wf, spec.output, "forget recurrent")?;
+    let (wi_weights, wi_biases) = upload_projection(&params.wi, spec.output, "input recurrent")?;
+    let (wg_weights, wg_biases) =
+        upload_projection(&params.wg, spec.output, "candidate recurrent")?;
+    let (wo_weights, wo_biases) = upload_projection(&params.wo, spec.output, "output recurrent")?;
+    let (uf_weights, uf_biases) = upload_projection(&params.uf, inputs, "forget input")?;
+    let (ui_weights, ui_biases) = upload_projection(&params.ui, inputs, "input input")?;
+    let (ug_weights, ug_biases) = upload_projection(&params.ug, inputs, "candidate input")?;
+    let (uo_weights, uo_biases) = upload_projection(&params.uo, inputs, "output input")?;
+    let project = |x: &B::Tensor, weights: &B::Tensor, biases: &B::Tensor, features: usize| {
+        backend
+            .connected_f32(
+                x,
+                weights,
+                biases,
+                sequence_batch,
+                features,
+                spec.output,
+                config,
+            )
+            .map_err(|err| backend_error("LSTM connected projection", err))
+    };
+    let logistic = gpu_activation_kind(layer_index, &Activation::Logistic)?;
+    let tanh = gpu_activation_kind(layer_index, &Activation::Tanh)?;
+    let mut output = Tensor::zeros(output_shape);
+    let mut previous_state = Tensor::zeros(state_shape);
+    let mut previous_state_gpu = backend
+        .zeros_f32(&tensor_backend_shape(state_shape))
+        .map_err(|err| backend_error("allocate LSTM initial state", err))?;
+    let mut previous_cell = Tensor::zeros(state_shape);
+    let mut previous_cell_gpu = backend
+        .zeros_f32(&tensor_backend_shape(state_shape))
+        .map_err(|err| backend_error("allocate LSTM initial cell", err))?;
+    let mut cache = LstmForwardCache {
+        sequence_batch,
+        wf_outputs: Vec::with_capacity(spec.steps),
+        wf_activation_inputs: Vec::with_capacity(spec.steps),
+        wi_outputs: Vec::with_capacity(spec.steps),
+        wi_activation_inputs: Vec::with_capacity(spec.steps),
+        wg_outputs: Vec::with_capacity(spec.steps),
+        wg_activation_inputs: Vec::with_capacity(spec.steps),
+        wo_outputs: Vec::with_capacity(spec.steps),
+        wo_activation_inputs: Vec::with_capacity(spec.steps),
+        uf_outputs: Vec::with_capacity(spec.steps),
+        uf_activation_inputs: Vec::with_capacity(spec.steps),
+        ui_outputs: Vec::with_capacity(spec.steps),
+        ui_activation_inputs: Vec::with_capacity(spec.steps),
+        ug_outputs: Vec::with_capacity(spec.steps),
+        ug_activation_inputs: Vec::with_capacity(spec.steps),
+        uo_outputs: Vec::with_capacity(spec.steps),
+        uo_activation_inputs: Vec::with_capacity(spec.steps),
+        previous_states: Vec::with_capacity(spec.steps),
+        previous_cells: Vec::with_capacity(spec.steps),
+        forget: Vec::with_capacity(spec.steps),
+        input_gate: Vec::with_capacity(spec.steps),
+        candidate: Vec::with_capacity(spec.steps),
+        output_gate: Vec::with_capacity(spec.steps),
+        cells: Vec::with_capacity(spec.steps),
+        states: Vec::with_capacity(spec.steps),
+    };
+
+    for step in 0..spec.steps {
+        let step_input = sequence_slice(input, step, sequence_batch, input_step_shape)?;
+        let step_input_gpu = backend
+            .upload_f32(&tensor_backend_shape(input_step_shape), &step_input.data)
+            .map_err(|err| backend_error("upload LSTM sequence slice", err))?;
+        let wf_gpu = project(&previous_state_gpu, &wf_weights, &wf_biases, spec.output)?;
+        let wi_gpu = project(&previous_state_gpu, &wi_weights, &wi_biases, spec.output)?;
+        let wg_gpu = project(&previous_state_gpu, &wg_weights, &wg_biases, spec.output)?;
+        let wo_gpu = project(&previous_state_gpu, &wo_weights, &wo_biases, spec.output)?;
+        let uf_gpu = project(&step_input_gpu, &uf_weights, &uf_biases, inputs)?;
+        let ui_gpu = project(&step_input_gpu, &ui_weights, &ui_biases, inputs)?;
+        let ug_gpu = project(&step_input_gpu, &ug_weights, &ug_biases, inputs)?;
+        let uo_gpu = project(&step_input_gpu, &uo_weights, &uo_biases, inputs)?;
+        let forget_pre = backend
+            .vector_add_f32(&wf_gpu, &uf_gpu, config)
+            .map_err(|err| backend_error("sum LSTM forget projections", err))?;
+        let input_pre = backend
+            .vector_add_f32(&wi_gpu, &ui_gpu, config)
+            .map_err(|err| backend_error("sum LSTM input projections", err))?;
+        let candidate_pre = backend
+            .vector_add_f32(&wg_gpu, &ug_gpu, config)
+            .map_err(|err| backend_error("sum LSTM candidate projections", err))?;
+        let output_pre = backend
+            .vector_add_f32(&wo_gpu, &uo_gpu, config)
+            .map_err(|err| backend_error("sum LSTM output projections", err))?;
+        let forget_gpu = backend
+            .activation_f32(&forget_pre, logistic, config)
+            .map_err(|err| backend_error("activate LSTM forget gate", err))?;
+        let input_gate_gpu = backend
+            .activation_f32(&input_pre, logistic, config)
+            .map_err(|err| backend_error("activate LSTM input gate", err))?;
+        let candidate_gpu = backend
+            .activation_f32(&candidate_pre, tanh, config)
+            .map_err(|err| backend_error("activate LSTM candidate gate", err))?;
+        let output_gate_gpu = backend
+            .activation_f32(&output_pre, logistic, config)
+            .map_err(|err| backend_error("activate LSTM output gate", err))?;
+        let forgotten_cell = backend
+            .vector_mul_f32(
+                &forget_gpu,
+                &previous_cell_gpu,
+                &tensor_backend_shape(state_shape),
+                config,
+            )
+            .map_err(|err| backend_error("multiply LSTM forget gate", err))?;
+        let input_candidate = backend
+            .vector_mul_f32(
+                &input_gate_gpu,
+                &candidate_gpu,
+                &tensor_backend_shape(state_shape),
+                config,
+            )
+            .map_err(|err| backend_error("multiply LSTM input and candidate gates", err))?;
+        let cell_gpu = backend
+            .vector_add_f32(&forgotten_cell, &input_candidate, config)
+            .map_err(|err| backend_error("sum LSTM cell terms", err))?;
+        let tanh_cell_gpu = backend
+            .activation_f32(&cell_gpu, tanh, config)
+            .map_err(|err| backend_error("activate LSTM cell", err))?;
+        let state_gpu = backend
+            .vector_mul_f32(
+                &output_gate_gpu,
+                &tanh_cell_gpu,
+                &tensor_backend_shape(state_shape),
+                config,
+            )
+            .map_err(|err| backend_error("multiply LSTM output gate", err))?;
+
+        let wf = recurrent_device_tensor(
+            backend,
+            &wf_gpu,
+            state_shape,
+            "download LSTM forget recurrent projection",
+        )?;
+        let wi = recurrent_device_tensor(
+            backend,
+            &wi_gpu,
+            state_shape,
+            "download LSTM input recurrent projection",
+        )?;
+        let wg = recurrent_device_tensor(
+            backend,
+            &wg_gpu,
+            state_shape,
+            "download LSTM candidate recurrent projection",
+        )?;
+        let wo = recurrent_device_tensor(
+            backend,
+            &wo_gpu,
+            state_shape,
+            "download LSTM output recurrent projection",
+        )?;
+        let uf = recurrent_device_tensor(
+            backend,
+            &uf_gpu,
+            state_shape,
+            "download LSTM forget input projection",
+        )?;
+        let ui = recurrent_device_tensor(
+            backend,
+            &ui_gpu,
+            state_shape,
+            "download LSTM input input projection",
+        )?;
+        let ug = recurrent_device_tensor(
+            backend,
+            &ug_gpu,
+            state_shape,
+            "download LSTM candidate input projection",
+        )?;
+        let uo = recurrent_device_tensor(
+            backend,
+            &uo_gpu,
+            state_shape,
+            "download LSTM output input projection",
+        )?;
+        let forget = recurrent_device_tensor(
+            backend,
+            &forget_gpu,
+            state_shape,
+            "download LSTM forget gate",
+        )?;
+        let input_gate = recurrent_device_tensor(
+            backend,
+            &input_gate_gpu,
+            state_shape,
+            "download LSTM input gate",
+        )?;
+        let candidate = recurrent_device_tensor(
+            backend,
+            &candidate_gpu,
+            state_shape,
+            "download LSTM candidate gate",
+        )?;
+        let output_gate = recurrent_device_tensor(
+            backend,
+            &output_gate_gpu,
+            state_shape,
+            "download LSTM output gate",
+        )?;
+        let cell = recurrent_device_tensor(backend, &cell_gpu, state_shape, "download LSTM cell")?;
+        let state =
+            recurrent_device_tensor(backend, &state_gpu, state_shape, "download LSTM state")?;
+        sequence_write(&mut output, step, sequence_batch, &state)?;
+
+        cache.wf_outputs.push(wf.clone());
+        cache.wf_activation_inputs.push(wf);
+        cache.wi_outputs.push(wi.clone());
+        cache.wi_activation_inputs.push(wi);
+        cache.wg_outputs.push(wg.clone());
+        cache.wg_activation_inputs.push(wg);
+        cache.wo_outputs.push(wo.clone());
+        cache.wo_activation_inputs.push(wo);
+        cache.uf_outputs.push(uf.clone());
+        cache.uf_activation_inputs.push(uf);
+        cache.ui_outputs.push(ui.clone());
+        cache.ui_activation_inputs.push(ui);
+        cache.ug_outputs.push(ug.clone());
+        cache.ug_activation_inputs.push(ug);
+        cache.uo_outputs.push(uo.clone());
+        cache.uo_activation_inputs.push(uo);
+        cache.previous_states.push(previous_state);
+        cache.previous_cells.push(previous_cell);
+        cache.forget.push(forget);
+        cache.input_gate.push(input_gate);
+        cache.candidate.push(candidate);
+        cache.output_gate.push(output_gate);
+        cache.cells.push(cell.clone());
+        cache.states.push(state.clone());
+        previous_state = state;
+        previous_state_gpu = state_gpu;
+        previous_cell = cell;
+        previous_cell_gpu = cell_gpu;
+    }
+
+    let output_gpu = backend
+        .upload_f32(&tensor_backend_shape(output_shape), &output.data)
+        .map_err(|err| backend_error("upload assembled LSTM output", err))?;
+    Ok((output_gpu, cache))
 }
 
 fn forward_lstm_layer(
@@ -21172,6 +21496,126 @@ mod tests {
             executable.train_buffers[0],
             LayerTrainBuffers::Lstm(_)
         ));
+    }
+
+    #[test]
+    fn gpu_lstm_no_batch_norm_forward_matches_cpu_and_fallback_training() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "lstm-gpu.cfg",
+                "[net]\ninputs=2\nbatch=2\ntime_steps=2\n[lstm]\noutput=3\nbatch_normalize=0\n",
+            )
+            .expect("LSTM cfg should parse"),
+        )
+        .expect("LSTM network should build");
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        let LayerParams::Lstm(params) = &mut cpu.params[0] else {
+            panic!("expected LSTM parameters");
+        };
+        for (slot, projection) in [
+            &mut params.wf,
+            &mut params.wi,
+            &mut params.wg,
+            &mut params.wo,
+            &mut params.uf,
+            &mut params.ui,
+            &mut params.ug,
+            &mut params.uo,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (index, weight) in projection.weights.iter_mut().enumerate() {
+                *weight = 0.015 + (slot * 3 + index) as f32 * 0.004;
+            }
+            for (index, bias) in projection.biases.iter_mut().enumerate() {
+                *bias = (slot as f32 - 3.5) * 0.01 + index as f32 * 0.006;
+            }
+        }
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        gpu.params = cpu.params.clone();
+        assert!(gpu.requires_cpu_backward_fallback());
+        let input = Tensor::from_data(
+            cpu.network.net.input_shape(),
+            (0..cpu.network.net.input_shape().batch
+                * cpu.network.net.input_shape().element_count())
+                .map(|index| (index as f32 * 0.31).sin() * 0.7)
+                .collect(),
+        )
+        .expect("LSTM input should have the expected shape");
+        let cpu_forward = cpu.forward(&input).expect("CPU LSTM forward");
+        let gpu_forward = gpu
+            .forward_with_state(&input)
+            .expect("backend LSTM forward");
+        assert_slice_close(
+            "LSTM output",
+            &cpu_forward.final_output().expect("CPU output").data,
+            &gpu_forward
+                .cpu_forward
+                .final_output()
+                .expect("backend output")
+                .data,
+            3e-5,
+        );
+        assert!(matches!(
+            gpu_forward.cpu_forward.recurrent_caches.first(),
+            Some(Some(super::RecurrentForwardCache::Lstm(_)))
+        ));
+
+        cpu.zero_train_buffers();
+        gpu.init_train_buffers_gpu().expect("LSTM train buffers");
+        gpu.zero_train_buffers_gpu()
+            .expect("clear LSTM train buffers");
+        let cpu_training = cpu
+            .forward_training(&input)
+            .expect("CPU LSTM training forward");
+        let gpu_training = gpu
+            .forward_training_device(&input)
+            .expect("backend LSTM training forward");
+        let output_shape = cpu.network.layers[0].output_shape;
+        let seed = Tensor::from_data(
+            output_shape,
+            (0..output_shape.batch * output_shape.element_count())
+                .map(|index| (index as f32 * 0.43).cos() * 0.6)
+                .collect(),
+        )
+        .expect("LSTM output gradient");
+        let seeds = vec![Some(seed)];
+        cpu.backward_accumulate_seeded(&input, &cpu_training, &seeds)
+            .expect("CPU LSTM backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_training, &seeds)
+            .expect("LSTM CPU backward fallback");
+        cpu.update_weights(0.02, 0.0, 0.0, 2);
+        gpu.update_weights_gpu(0.02, 0.0, 0.0, 2)
+            .expect("LSTM fallback optimizer step");
+        let (LayerParams::Lstm(cpu_params), LayerParams::Lstm(gpu_params)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            unreachable!();
+        };
+        for (name, cpu_projection, gpu_projection) in [
+            ("wf", &cpu_params.wf, &gpu_params.wf),
+            ("wi", &cpu_params.wi, &gpu_params.wi),
+            ("wg", &cpu_params.wg, &gpu_params.wg),
+            ("wo", &cpu_params.wo, &gpu_params.wo),
+            ("uf", &cpu_params.uf, &gpu_params.uf),
+            ("ui", &cpu_params.ui, &gpu_params.ui),
+            ("ug", &cpu_params.ug, &gpu_params.ug),
+            ("uo", &cpu_params.uo, &gpu_params.uo),
+        ] {
+            assert_slice_close(
+                &format!("LSTM {name} weights"),
+                &cpu_projection.weights,
+                &gpu_projection.weights,
+                2e-5,
+            );
+            assert_slice_close(
+                &format!("LSTM {name} biases"),
+                &cpu_projection.biases,
+                &gpu_projection.biases,
+                2e-5,
+            );
+        }
     }
 
     #[test]

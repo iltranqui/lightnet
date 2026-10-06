@@ -607,6 +607,31 @@ pub trait F32TensorOpsBackend {
         y: &Self::Tensor,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error>;
+    /// Elementwise product with an explicit output shape. The default is a
+    /// host fallback; device backends should override it for native execution.
+    fn vector_mul_f32(
+        &self,
+        x: &Self::Tensor,
+        y: &Self::Tensor,
+        shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let x = self.download_f32(x)?;
+        let y = self.download_f32(y)?;
+        assert_eq!(x.len(), y.len(), "vector_mul_f32: input lengths must match");
+        assert_eq!(
+            shape.iter().product::<usize>(),
+            x.len(),
+            "vector_mul_f32: output shape must match the input length"
+        );
+        let product = x
+            .iter()
+            .zip(y)
+            .map(|(lhs, rhs)| lhs * rhs)
+            .collect::<Vec<_>>();
+        self.upload_f32(shape, &product)
+    }
     fn saxpy_f32(
         &self,
         alpha: f32,
