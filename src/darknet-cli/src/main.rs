@@ -60,6 +60,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let options = TrainOptions::parse(args)?;
                     run_detector_train(&cfg, &data, &options)?;
                 }
+                "map" => {
+                    let cfg = required_arg(args.next(), "cfg path")?;
+                    let data = required_arg(args.next(), "data path")?;
+                    let options = MapOptions::parse(args)?;
+                    run_detector_map(&cfg, &data, &options)?;
+                }
                 other => {
                     return Err(format!("unknown detector subcommand: {other}").into());
                 }
@@ -1040,6 +1046,118 @@ impl TrainOptions {
         }
         Ok(options)
     }
+}
+
+#[derive(Debug, PartialEq)]
+struct MapOptions {
+    weights: Option<String>,
+    confidence_threshold: f32,
+    iou_threshold: f32,
+    nms_threshold: f32,
+    letterbox: bool,
+}
+
+impl MapOptions {
+    fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut options = Self {
+            weights: None,
+            confidence_threshold: 0.005,
+            iou_threshold: 0.5,
+            nms_threshold: 0.45,
+            letterbox: false,
+        };
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "-map" => {}
+                "-letter_box" | "-letterbox" => options.letterbox = true,
+                "-thresh" | "-iou_thresh" | "-nms" => {
+                    let value = required_arg(args.next(), "mAP threshold")?;
+                    let value = value
+                        .parse::<f32>()
+                        .map_err(|_| format!("invalid mAP threshold: {value}"))?;
+                    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                        return Err("mAP thresholds must be finite and in [0,1]".into());
+                    }
+                    match arg.as_str() {
+                        "-thresh" => options.confidence_threshold = value,
+                        "-iou_thresh" => options.iou_threshold = value,
+                        "-nms" => options.nms_threshold = value,
+                        _ => unreachable!(),
+                    }
+                }
+                flag if flag.starts_with('-') => {
+                    return Err(format!("unsupported detector map flag: {flag}").into());
+                }
+                _ if options.weights.is_none() => options.weights = Some(arg),
+                _ => return Err(format!("unexpected detector map argument: {arg}").into()),
+            }
+        }
+        Ok(options)
+    }
+}
+
+fn run_detector_map(
+    cfg: &str,
+    data_path: &str,
+    options: &MapOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut executable = ExecutableNetwork::from_path(cfg)?;
+    if let Some(weights) = &options.weights {
+        let header = executable.load_weights_file(weights)?;
+        println!(
+            "loaded weights {}.{}.{} seen={}",
+            header.major, header.minor, header.revision, header.seen
+        );
+    }
+    let data = DataConfig::from_path(data_path)?;
+    let detection_options = DetectionOptions {
+        confidence_threshold: options.confidence_threshold,
+        nms_threshold: options.nms_threshold,
+        letterbox: options.letterbox,
+    };
+    let (classes, image_count, names, report) = if executable.network.net.obb {
+        let dataset = darknet_core::ObbValidationDataset::from_data(&executable.network, &data)?;
+        let names = map_class_names(&data, dataset.classes)?;
+        let report = dataset.evaluate(
+            &executable.network,
+            detection_options,
+            options.iou_threshold,
+            |input| Ok(executable.forward(input)?.yolo_heads),
+        )?;
+        (dataset.classes, dataset.images.len(), names, report)
+    } else {
+        let dataset = darknet_core::ValidationDataset::from_data(&executable.network, &data)?;
+        let names = map_class_names(&data, dataset.classes)?;
+        let report = dataset.evaluate(
+            &executable.network,
+            detection_options,
+            options.iou_threshold,
+            |input| Ok(executable.forward(input)?.yolo_heads),
+        )?;
+        (dataset.classes, dataset.images.len(), names, report)
+    };
+    println!("mAP: {image_count} validation images, {classes} classes (CPU)");
+    print!(
+        "{}",
+        format_map_report(&report, &names, options.iou_threshold)
+    );
+    Ok(())
+}
+
+fn map_class_names(
+    data: &DataConfig,
+    classes: usize,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let names = if let Some(path) = &data.names {
+        load_names_file(path)?
+    } else {
+        (0..classes).map(|i| format!("class_{i}")).collect()
+    };
+    if names.len() != classes {
+        return Err("-map names count differs from cfg classes".into());
+    }
+    Ok(names)
 }
 
 fn run_detector_train(
@@ -2467,6 +2585,10 @@ fn print_usage() {
         "    -map validates all valid= images; -map_every <N> overrides max(100, epoch) cadence"
     );
     println!("    -thresh <0..1> (default .005), -iou_thresh <0..1> (default .5), NMS .45");
+    println!(
+        "  detector map <cfg> <data> [weights] [-map] [-thresh <0..1>] [-iou_thresh <0..1>] [-nms <0..1>] [-letter_box]"
+    );
+    println!("    -thresh default .005, -iou_thresh default .5, -nms default .45; CPU evaluation");
     println!("    seed defaults to 0; unknown flags fail explicitly; -gpus 0 requires oxide");
     println!("  version");
     println!("  cfg-validate <cfg>");
@@ -2579,7 +2701,7 @@ fn advanced_epoch_images(
 
 #[cfg(test)]
 mod tests {
-    use super::{MapSchedule, TrainOptions, classify_detector_train_paths};
+    use super::{MapOptions, MapSchedule, TrainOptions, classify_detector_train_paths};
 
     fn options(args: &[&str]) -> Result<TrainOptions, Box<dyn std::error::Error>> {
         TrainOptions::parse(args.iter().map(|s| s.to_string()))
@@ -2647,6 +2769,55 @@ mod tests {
         assert!(schedule.due(250, 250));
         assert!(!schedule.due(250, 0));
         assert!(options(&["-map"]).is_ok());
+    }
+
+    #[test]
+    fn standalone_map_options_parse_and_validate() {
+        let parsed = MapOptions::parse(
+            [
+                "weights.weights",
+                "-map",
+                "-thresh",
+                "0.02",
+                "-iou_thresh",
+                "0.7",
+                "-nms",
+                "0.4",
+                "-letter_box",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            MapOptions {
+                weights: Some("weights.weights".into()),
+                confidence_threshold: 0.02,
+                iou_threshold: 0.7,
+                nms_threshold: 0.4,
+                letterbox: true,
+            }
+        );
+        assert_eq!(
+            MapOptions::parse(std::iter::empty()).unwrap(),
+            MapOptions {
+                weights: None,
+                confidence_threshold: 0.005,
+                iou_threshold: 0.5,
+                nms_threshold: 0.45,
+                letterbox: false,
+            }
+        );
+        for args in [
+            vec!["-thresh", "NaN"],
+            vec!["-iou_thresh", "1.1"],
+            vec!["-nms", "-0.1"],
+            vec!["-thresh"],
+            vec!["a.weights", "b.weights"],
+            vec!["-gpus", "0"],
+        ] {
+            assert!(MapOptions::parse(args.into_iter().map(str::to_owned)).is_err());
+        }
     }
 
     #[test]

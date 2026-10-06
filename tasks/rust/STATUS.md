@@ -34,12 +34,19 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v85: added a standalone CPU `detector map` command with optional weights,
+  confidence/IoU/NMS thresholds, and letterbox preprocessing. It routes standard
+  graphs through `ValidationDataset` and OBB graphs through
+  `ObbValidationDataset`; `darknet-cli` tests passed 19/19 and temporary standard
+  and OBB cfg/data command smoke tests both completed. Training `-map` cadence,
+  GPU evaluation, CARPN mAP, and compiled-C++ parity remain out of scope.
 - v84: added `ObbValidationDataset`, including OBB-only head/class validation,
   OBB label preflight, one inference/decode per image, pixel-to-normalized
   conversion for boxes/front points, and orientation-aware AP evaluation. The
-  existing axis-aligned evaluator still refuses OBB graphs; CLI `-map` wiring and
-  CARPN mAP remain open. The focused OBB host suite passed 33/33 and all 456
-  `darknet-core` library tests passed; no compiled-C++ parity is claimed.
+  existing axis-aligned evaluator still refuses OBB graphs; the CPU CLI route was
+  added in v85, while training `-map` cadence and CARPN mAP remain open. The focused
+  OBB host suite passed 33/33 and all 456 `darknet-core` library tests passed; no
+  compiled-C++ parity is claimed.
 - v83: added `obb_detector_map` for normalized legacy front-point predictions,
   using orientation-aware matching and existing AP/report semantics. Five-field
   labels are treated as axis-aligned truth; CARPN polygon detections are rejected
