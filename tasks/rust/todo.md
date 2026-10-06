@@ -47,7 +47,11 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
 - [~] Analytical gradients everywhere: the C++-shortcut audit is done and
   `DARKNET_GRAD_MODE=analytical|cpp` gates softmax and scale_channels (see
   `implemented.md` §12). Remaining parity gaps include `NORM_CHAN*` and conv
-  `reverse`/`deform`/`grad_centr`. YOLO IoU/GIoU geometry and
+  `reverse`/`deform`. Convolution `grad_centr` matches the C++ BN gate,
+  per-filter mean subtraction, and `f_size % 32` skip;
+  `gpu_grad_centr_runtime_matches_cpu_and_respects_batchnorm_gate` and
+  `gradient_centralization_matches_reference_and_is_noop_off_warp_sizes` pass
+  on host/FakeBackend and real Oxide. YOLO IoU/GIoU geometry and
   objectness/class sigmoid-BCE deltas now have finite-difference
   coverage; the box test records Darknet's legacy 0.5 width/height comparison
   factor. DIoU/CIoU deltas have source-derived parity coverage for contained,

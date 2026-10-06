@@ -34,6 +34,11 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v63: Audited convolution `grad_centr` against the C++ GPU update path and
+  removed it from the open parity gaps. `gpu_grad_centr_runtime_matches_cpu_and_respects_batchnorm_gate`
+  passed (host 1/1), and `gradient_centralization_matches_reference_and_is_noop_off_warp_sizes`
+  passed on real Oxide (1/1), covering BN gating, per-filter subtraction, and
+  C++'s non-warp-size skip.
 - v62: Replaced approximate mosaic pasting/box remapping with the source-level
   C++ quadrant crop alignment, flip-aware shifts, optional corner relocation,
   integer-pixel box clipping, and strict filtering. Rust RNG remains deterministic

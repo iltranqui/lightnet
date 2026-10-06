@@ -29134,8 +29134,10 @@ mod tests {
         assert_eq!(clipped[1], free[1]);
     }
 
+    /// `keyed_step` compares CPU and FakeBackend GPU updates: the BN filter
+    /// with 32 weights is centered, while the no-BN layer remains unchanged.
     #[test]
-    fn grad_centr_removes_the_per_filter_mean_of_weight_updates() {
+    fn gpu_grad_centr_runtime_matches_cpu_and_respects_batchnorm_gate() {
         let base = keyed_cpu(&keyed_cfg("", "", ""));
         let LayerParams::Convolutional(p0) = &base.params[0] else { unreachable!() };
         let LayerTrainBuffers::Convolutional(t0) = &base.train_buffers[0] else { unreachable!() };
