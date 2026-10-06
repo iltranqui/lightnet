@@ -142,8 +142,10 @@ Immediately next, in dependency order:
   gates and pooled/expert activation/output caches remain device-resident, with
   no gate/dot transfers in the normal Oxide training path. Router/expert
   parameter gradients accumulate on-device across backward calls; accumulated
-  weight/bias buffers transfer to host only at optimizer flush for SGD/Adam. BN experts
-  still use CPU backward.
+  weight/bias buffers transfer to host only at optimizer flush for SGD/Adam. The
+  dynamic-loss-scale finiteness check covers dirty router/expert buffers
+  (`gpu_moe_device_gradients_participate_in_loss_scale_finiteness_check`). BN
+  experts still use CPU backward.
   Verified against CPU in
   `oxide_runtime_chain::moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu`
   (including two accumulated backward calls and upstream convolution updates)

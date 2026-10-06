@@ -144,13 +144,16 @@ Latest increments:
   output/activation caches stay device-resident; no gate/dot values cross the
   host in normal Oxide training. Router/expert parameter gradients accumulate
   on-device across backward calls; accumulated weight/bias buffers transfer to
-  host only at optimizer flush for SGD/Adam. BN experts stay on the CPU fallback. FakeBackend
-  parity and real-device
+  host only at optimizer flush for SGD/Adam. The dynamic-loss-scale finiteness
+  check covers dirty router/expert buffers. BN experts stay on the CPU fallback.
+  FakeBackend parity and real-device
   `moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu`
   pass, including two accumulated backward calls and upstream convolution
-  updates. `oxide_layers_extra` verifies soft/tied top-k, pool and pool-backward,
-  non-multiple gate-dot reductions, and
-  router backward parity with load balancing.
+  updates. The FakeBackend test
+  `gpu_moe_device_gradients_participate_in_loss_scale_finiteness_check` verifies
+  dirty router/expert accumulators are checked for overflow. `oxide_layers_extra`
+  verifies soft/tied top-k, pool and pool-backward, non-multiple gate-dot
+  reductions, and router backward parity with load balancing.
 - Overlapping-window maxpool backward, including `maxpool_zero_nonmax`, now
   matches central finite differences.
 - No-BN RNN and CRNN forward/backward use backend ops: RNN projections and

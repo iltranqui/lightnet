@@ -3981,9 +3981,9 @@ where
         }
     }
 
-    /// True if any device-resident convolution weight/bias/scale gradient is
-    /// non-finite, used by dynamic loss scaling to detect overflow before the
-    /// optimizer step.  Host-fallback layers are not inspected.
+    /// True if any device-resident convolution or MoE gradient is non-finite,
+    /// used by dynamic loss scaling to detect overflow before the optimizer
+    /// step. Host-fallback layers are not inspected.
     pub fn gradients_non_finite(&self) -> Result<bool> {
         for entry in self.device_train_buffers.borrow().iter().flatten() {
             if self
@@ -4022,6 +4022,42 @@ where
                         .backend
                         .any_non_finite_f32(scales)
                         .map_err(|err| backend_error("gradient finiteness check", err))?
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        for entry in self
+            .device_moe_train_buffers
+            .borrow()
+            .iter()
+            .flatten()
+            .filter(|entry| entry.dirty)
+        {
+            if self
+                .backend
+                .any_non_finite_f32(&entry.router_weight_updates)
+                .map_err(|err| backend_error("MoE gradient finiteness check", err))?
+                || self
+                    .backend
+                    .any_non_finite_f32(&entry.router_bias_updates)
+                    .map_err(|err| backend_error("MoE gradient finiteness check", err))?
+            {
+                return Ok(true);
+            }
+            for (weights, biases) in entry
+                .expert_weight_updates
+                .iter()
+                .zip(&entry.expert_bias_updates)
+            {
+                if self
+                    .backend
+                    .any_non_finite_f32(weights)
+                    .map_err(|err| backend_error("MoE gradient finiteness check", err))?
+                    || self
+                        .backend
+                        .any_non_finite_f32(biases)
+                        .map_err(|err| backend_error("MoE gradient finiteness check", err))?
                 {
                     return Ok(true);
                 }
@@ -23732,6 +23768,38 @@ mod tests {
             assert_slice_close("expert weights", &cpu_expert.weights, &gpu_expert.weights, 2e-5);
             assert_slice_close("expert biases", &cpu_expert.biases, &gpu_expert.biases, 2e-5);
         }
+    }
+
+    #[test]
+    fn gpu_moe_device_gradients_participate_in_loss_scale_finiteness_check() {
+        let cfg = "[net]\nchannels=2\nbatch=1\nheight=1\nwidth=1\n[moe_convolutional]\nfilters=2\nsize=1\nbatch_normalize=0\nexperts=2\ntop_k=0\n";
+        let network =
+            Network::from_config(ConfigFile::parse_str("gpu-moe-overflow.cfg", cfg).unwrap())
+                .expect("MoE network");
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        gpu.zero_train_buffers_gpu()
+            .expect("initialize GPU MoE buffers");
+        assert!(!gpu.gradients_non_finite().expect("finite zero buffers"));
+        {
+            let mut buffers = gpu.device_moe_train_buffers.borrow_mut();
+            let train = buffers[0].as_mut().expect("GPU MoE train buffers");
+            train.dirty = true;
+            train.router_weight_updates.data[0] = f32::NAN;
+        }
+        assert!(
+            gpu.gradients_non_finite()
+                .expect("check non-finite MoE router gradient")
+        );
+        {
+            let mut buffers = gpu.device_moe_train_buffers.borrow_mut();
+            let train = buffers[0].as_mut().expect("GPU MoE train buffers");
+            train.router_weight_updates.data[0] = 0.0;
+            train.expert_bias_updates[0].data[0] = f32::INFINITY;
+        }
+        assert!(
+            gpu.gradients_non_finite()
+                .expect("check non-finite MoE expert gradient")
+        );
     }
 
     #[test]
