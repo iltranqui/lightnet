@@ -5452,8 +5452,9 @@ where
         // deferred synchronization and the next Oxide forward pass.
         let mut cache = self.device_conv_params.borrow_mut();
         for (index, layer) in self.network.layers.iter().enumerate() {
-            if matches!(layer.kind, LayerKind::Moe(_))
-                && !device_moe_layers.get(index).copied().unwrap_or(false)
+            if matches!(layer.kind, LayerKind::EmlConvolutional(_))
+                || (matches!(layer.kind, LayerKind::Moe(_))
+                    && !device_moe_layers.get(index).copied().unwrap_or(false))
             {
                 if let Some(slots) = cache.get_mut(index) {
                     slots.clear();
@@ -5681,16 +5682,16 @@ where
                 }
             }
         }
-        // Container experts are host-updated while backward uses the CPU
-        // fallback. Invalidate their device copies so the next forward reuploads
-        // the just-updated parameters.
+        // EML branches and fallback MoE experts are host-updated. Invalidate
+        // their device copies so the next forward reuploads current parameters.
         let mut cache = self.device_conv_params.borrow_mut();
         for (index, layer) in self.network.layers.iter().enumerate() {
-            if matches!(layer.kind, LayerKind::Moe(_))
-                && !preserve_device_moe_params
-                    .get(index)
-                    .copied()
-                    .unwrap_or(false)
+            if matches!(layer.kind, LayerKind::EmlConvolutional(_))
+                || (matches!(layer.kind, LayerKind::Moe(_))
+                    && !preserve_device_moe_params
+                        .get(index)
+                        .copied()
+                        .unwrap_or(false))
             {
                 if let Some(slots) = cache.get_mut(index) {
                     slots.clear();
@@ -6950,43 +6951,122 @@ where
                     }
                 }
                 (LayerKind::EmlConvolutional(spec), LayerParams::EmlConvolutional(eml)) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download EML input", err))?;
-                    let (input_branch_output, _) = forward_convolutional_with_cache(
+                    let input_branch = self.cached_convolution_params_at(
+                        layer.index,
+                        0,
+                        layer.input_shape.channels,
                         &spec.branch,
                         &eml.input,
-                        &host_input,
-                        layer.output_shape,
-                    );
-                    let (self_branch_output, _) = forward_convolutional_with_cache(
+                    )?;
+                    let input_raw = self
+                        .backend
+                        .conv2d_f32(
+                            current_input,
+                            &input_branch.weights,
+                            &tensor_backend_shape(layer.output_shape),
+                            layer.input_shape.channels,
+                            layer.input_shape.height,
+                            layer.input_shape.width,
+                            spec.branch.filters,
+                            spec.branch.size,
+                            spec.branch.stride_x,
+                            spec.branch.stride_y,
+                            spec.branch.dilation,
+                            spec.branch.padding,
+                            spec.branch.groups.max(1),
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("EML input branch convolution", err))?;
+                    let input_output = self
+                        .backend
+                        .bias_add_f32(
+                            &input_raw,
+                            &input_branch.biases,
+                            spec.branch.filters,
+                            layer.output_shape.width * layer.output_shape.height,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("EML input branch bias", err))?;
+
+                    let self_branch = self.cached_convolution_params_at(
+                        layer.index,
+                        1,
+                        layer.input_shape.channels,
                         &spec.branch,
                         &eml.self_params,
-                        &host_input,
-                        layer.output_shape,
-                    );
-                    let math = crate::eml_conv_math::EmlConvMathParams::from_cpp_values(
-                        spec.eml_clamp,
-                        spec.eml_eps,
-                        spec.eml_scale,
-                    );
+                    )?;
+                    let self_raw = self
+                        .backend
+                        .conv2d_f32(
+                            current_input,
+                            &self_branch.weights,
+                            &tensor_backend_shape(layer.output_shape),
+                            layer.input_shape.channels,
+                            layer.input_shape.height,
+                            layer.input_shape.width,
+                            spec.branch.filters,
+                            spec.branch.size,
+                            spec.branch.stride_x,
+                            spec.branch.stride_y,
+                            spec.branch.dilation,
+                            spec.branch.padding,
+                            spec.branch.groups.max(1),
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("EML self branch convolution", err))?;
+                    let self_output = self
+                        .backend
+                        .bias_add_f32(
+                            &self_raw,
+                            &self_branch.biases,
+                            spec.branch.filters,
+                            layer.output_shape.width * layer.output_shape.height,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("EML self branch bias", err))?;
+
                     let use_residual = spec.residual
                         && layer.input_shape.element_count() == layer.output_shape.element_count();
-                    let data = crate::eml_conv_math::forward(
-                        &input_branch_output.data,
-                        &self_branch_output.data,
-                        use_residual.then_some(host_input.data.as_slice()),
-                        math,
-                    )
-                    .map_err(|error| Error::InvalidConfig(error.to_owned()))?;
-                    eml_cache = Some(EmlForwardCache {
-                        input_branch_output,
-                        self_branch_output,
-                    });
-                    let output = Tensor::from_data(layer.output_shape, data)?;
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &output.data)
-                        .map_err(|err| backend_error("upload EML output", err))?
+                    let residual = use_residual.then_some(current_input);
+                    let output = self
+                        .backend
+                        .eml_convolutional_f32(
+                            &input_output,
+                            &self_output,
+                            residual,
+                            &tensor_backend_shape(layer.output_shape),
+                            spec.eml_clamp,
+                            spec.eml_eps,
+                            spec.eml_scale,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("EML branch combination", err))?;
+
+                    if host_copies {
+                        // The CPU backward fallback consumes the branch outputs,
+                        // but the public forward still runs both branches and
+                        // their combine on the selected tensor backend.
+                        let host_input = self
+                            .download_tensor(current_input, layer.input_shape)
+                            .map_err(|err| backend_error("download EML input for fallback", err))?;
+                        let (input_branch_output, _) = forward_convolutional_with_cache(
+                            &spec.branch,
+                            &eml.input,
+                            &host_input,
+                            layer.output_shape,
+                        );
+                        let (self_branch_output, _) = forward_convolutional_with_cache(
+                            &spec.branch,
+                            &eml.self_params,
+                            &host_input,
+                            layer.output_shape,
+                        );
+                        eml_cache = Some(EmlForwardCache {
+                            input_branch_output,
+                            self_branch_output,
+                        });
+                    }
+                    output
                 }
                 (LayerKind::Moe(spec), LayerParams::Moe(moe)) => {
                     let host_input = if host_copies {
@@ -10591,6 +10671,17 @@ where
                             layer.input_shape.channels,
                             &spec.expert,
                             expert,
+                        )?;
+                    }
+                }
+                (LayerKind::EmlConvolutional(spec), LayerParams::EmlConvolutional(eml)) => {
+                    for (slot, params) in [&eml.input, &eml.self_params].into_iter().enumerate() {
+                        let _ = self.cached_convolution_params_at(
+                            layer.index,
+                            slot,
+                            layer.input_shape.channels,
+                            &spec.branch,
+                            params,
                         )?;
                     }
                 }

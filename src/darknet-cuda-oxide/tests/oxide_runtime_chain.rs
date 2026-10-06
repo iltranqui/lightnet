@@ -1771,3 +1771,83 @@ fn few_sgd_steps_match_cpu_loss_trajectory_and_weights() {
         }
     }
 }
+
+#[test]
+fn eml_two_branch_forward_matches_cpu_on_oxide() {
+    for batch_normalize in [false, true] {
+        let cfg = format!(
+            "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\n[eml_convolutional]\nfilters=2\nsize=1\nresidual=1\nbatch_normalize={}\n",
+            if batch_normalize { 1 } else { 0 }
+        );
+        let net = network(&cfg);
+        let mut cpu = ExecutableNetwork::new(net.clone());
+        let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("oxide backend"));
+        let LayerParams::EmlConvolutional(params) = &mut gpu.params[0] else {
+            panic!("EML parameters");
+        };
+        params.input.weights.copy_from_slice(&[0.4, -0.2, 0.1, 0.3]);
+        params.input.biases.copy_from_slice(&[0.05, -0.1]);
+        params.self_params.weights.copy_from_slice(&[-0.3, 0.25, 0.2, 0.15]);
+        params.self_params.biases.copy_from_slice(&[0.12, 0.03]);
+        for (index, conv) in [&mut params.input, &mut params.self_params]
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(batch_norm) = conv.batch_norm.as_mut() {
+                batch_norm.scales.copy_from_slice(&[0.8 + index as f32 * 0.2, 1.1]);
+                batch_norm.rolling_mean.copy_from_slice(&[-0.1, 0.07]);
+                batch_norm.rolling_variance.copy_from_slice(&[0.9, 1.3]);
+            }
+        }
+        cpu.params = gpu.params.clone();
+
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).expect("CPU EML forward");
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("Oxide EML forward");
+        let oxide_output = gpu
+            .backend
+            .download_f32(&gpu_forward.gpu_layer_outputs[0])
+            .expect("download EML output");
+        close(
+            if batch_normalize {
+                "EML BN Oxide output"
+            } else {
+                "EML Oxide output"
+            },
+            &cpu_forward.layer_outputs[0].data,
+            &oxide_output,
+            2e-4,
+        );
+        assert!(gpu_forward.cpu_forward.eml_caches[0].is_some());
+
+        let shape = cpu.network.layers[0].output_shape;
+        let seed = Tensor::from_data(
+            shape,
+            (0..shape.batch * shape.element_count())
+                .map(|i| (i as f32 * 0.41).cos())
+                .collect(),
+        )
+        .expect("EML seed");
+        let seeds = vec![Some(seed)];
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu().expect("zero EML train buffers");
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU EML backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("EML backward fallback");
+        cpu.update_weights(0.01, 0.0, 0.0, 2);
+        gpu.update_weights_gpu(0.01, 0.0, 0.0, 2)
+            .expect("EML host optimizer fallback");
+
+        let cpu_after = cpu.forward(&input).expect("CPU EML after update");
+        let gpu_after = gpu.forward(&input).expect("Oxide EML after update");
+        close(
+            "EML forward after host update invalidates device branch cache",
+            &cpu_after.layer_outputs[0].data,
+            &gpu_after.layer_outputs[0].data,
+            2e-4,
+        );
+    }
+}

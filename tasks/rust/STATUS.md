@@ -34,6 +34,14 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v70: EML f32 GPU forward now runs both branch convolutions, folded rolling-stat
+  BN parameters, bias addition, and the combine op through the backend; both
+  branch parameter blocks use separate per-owner device-cache slots. CPU branch
+  caches remain available for the explicit CPU backward/optimizer fallback.
+  `./tools/test_oxide.sh --test oxide_runtime_chain` passed 19/19, including BN
+  and no-BN EML outputs plus device-cache invalidation after host updates.
+  Native backward/optimizer and C++ batch-stat/
+  EMA training behavior remain open; this is not a C++ parity claim.
 - v69: Integrated `[eml_convolutional]` cfg/shape parsing, two branch-convolution
   parameter and training-buffer blocks, C++ `input_layer` then `self_layer`
   `.weights` order, CPU forward/backward, SGD/Adam updates, and an explicit GPU
