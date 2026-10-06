@@ -22,6 +22,19 @@ pub fn dropout_unit(seed: u64, index: u64) -> f32 {
 pub mod kernels {
     use super::*;
 
+    /// Copy one contiguous recurrent timestep into its disjoint output range.
+    #[kernel]
+    pub fn sequence_concat_step(input: &[f32], mut output: DisjointSlice<f32>, offset: usize) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i < input.len() {
+            // SAFETY: host-provided offsets partition the output by timestep.
+            unsafe {
+                *output.as_mut_ptr().add(offset + i) = input[i];
+            }
+        }
+    }
+
     /// Exact LSTM cell/gate derivative for one BPTT step. Each thread owns one
     /// hidden element and writes all gate deltas plus the cell gradient for the
     /// preceding step.

@@ -395,6 +395,31 @@ pub trait F32TensorOpsBackend {
             self.upload_f32(&[elements], &cell_gradient)?,
         ))
     }
+    /// Concatenate same-sized recurrent timestep outputs along the sequence
+    /// axis. `output_shape` carries the caller's tensor layout; each input has
+    /// `step_elements` contiguous values.
+    fn sequence_concat_f32(
+        &self,
+        steps: &[&Self::Tensor],
+        output_shape: &[usize],
+        step_elements: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert!(!steps.is_empty(), "sequence concat requires at least one step");
+        assert_eq!(
+            output_shape.iter().product::<usize>(),
+            steps.len() * step_elements,
+            "sequence concat output size"
+        );
+        let mut output = Vec::with_capacity(steps.len() * step_elements);
+        for step in steps {
+            let values = self.download_f32(step)?;
+            assert_eq!(values.len(), step_elements, "sequence step tensor size");
+            output.extend_from_slice(&values);
+        }
+        self.upload_f32(output_shape, &output)
+    }
     fn shortcut_add_f32(
         &self,
         x: &Self::Tensor,

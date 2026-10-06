@@ -12374,7 +12374,7 @@ where
     };
     let logistic = gpu_activation_kind(layer_index, &Activation::Logistic)?;
     let tanh = gpu_activation_kind(layer_index, &Activation::Tanh)?;
-    let mut output = Tensor::zeros(output_shape);
+    let mut state_outputs = Vec::with_capacity(spec.steps);
     let mut previous_state_gpu = backend
         .zeros_f32(&tensor_backend_shape(state_shape))
         .map_err(|err| backend_error("allocate LSTM initial state", err))?;
@@ -12489,9 +12489,17 @@ where
             )
             .map_err(|err| backend_error("multiply LSTM output gate", err))?;
 
-        let state =
-            recurrent_device_tensor(backend, &state_gpu, state_shape, "download LSTM state")?;
-        sequence_write(&mut output, step, sequence_batch, &state)?;
+        let state_host = if host_cache.is_some() {
+            Some(recurrent_device_tensor(
+                backend,
+                &state_gpu,
+                state_shape,
+                "download LSTM state",
+            )?)
+        } else {
+            None
+        };
+        state_outputs.push(state_gpu.clone());
         let cell_host = if host_cache.is_some() {
             Some(recurrent_device_tensor(
                 backend,
@@ -12619,19 +12627,27 @@ where
             cache.candidate.push(candidate);
             cache.output_gate.push(output_gate);
             cache.cells.push(cell.clone());
-            cache.states.push(state.clone());
+            cache
+                .states
+                .push(state_host.as_ref().expect("capturing host cache").clone());
         }
         if host_cache.is_some() {
-            previous_state_host = Some(state.clone());
+            previous_state_host = state_host;
             previous_cell_host = cell_host;
         }
         previous_state_gpu = state_gpu;
         previous_cell_gpu = cell_gpu;
     }
 
+    let state_output_refs: Vec<_> = state_outputs.iter().collect();
     let output_gpu = backend
-        .upload_f32(&tensor_backend_shape(output_shape), &output.data)
-        .map_err(|err| backend_error("upload assembled LSTM output", err))?;
+        .sequence_concat_f32(
+            &state_output_refs,
+            &tensor_backend_shape(output_shape),
+            sequence_batch * spec.output,
+            config,
+        )
+        .map_err(|err| backend_error("assemble LSTM output sequence", err))?;
     Ok((output_gpu, host_cache, device_cache))
 }
 
@@ -22204,6 +22220,14 @@ mod tests {
         let gpu_training = gpu
             .forward_training_device(&input)
             .expect("backend LSTM training forward");
+        assert_slice_close(
+            "LSTM device-training output",
+            &cpu_training.layer_outputs[0].data,
+            &gpu.backend
+                .download_f32(&gpu_training.gpu_layer_outputs[0])
+                .expect("download device-training output"),
+            3e-5,
+        );
         assert!(gpu_training.gpu_lstm_caches[0].is_some());
         assert!(gpu_training.cpu_forward.recurrent_caches[0].is_none());
         let output_shape = cpu.network.layers[0].output_shape;

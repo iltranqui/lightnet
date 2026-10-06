@@ -2418,6 +2418,66 @@ impl F32TensorOpsBackend for OxideBackend {
         ))
     }
 
+    fn sequence_concat_f32(
+        &self,
+        steps: &[&Self::Tensor],
+        output_shape: &[usize],
+        step_elements: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let op = "sequence_concat_f32";
+        if steps.is_empty() {
+            return Err(shape_err(
+                op,
+                "at least one recurrent step is required".to_owned(),
+            ));
+        }
+        let expected = steps
+            .len()
+            .checked_mul(step_elements)
+            .ok_or_else(|| shape_err(op, "output element count overflow".to_owned()))?;
+        let shape_elements = output_shape
+            .iter()
+            .try_fold(1usize, |product, dim| product.checked_mul(*dim))
+            .ok_or_else(|| shape_err(op, "output shape element count overflow".to_owned()))?;
+        if shape_elements != expected {
+            return Err(shape_err(
+                op,
+                format!(
+                    "shape {output_shape:?} has {shape_elements} elements, expected {expected}"
+                ),
+            ));
+        }
+        let mut output = self.alloc_uninit(expected)?;
+        for (step_index, input) in steps.iter().enumerate() {
+            let input = self.f32v(input)?;
+            if input.len() != step_elements {
+                return Err(shape_err(
+                    op,
+                    format!(
+                        "step {step_index} has {} elements, expected {step_elements}",
+                        input.len()
+                    ),
+                ));
+            }
+            let offset = step_index
+                .checked_mul(step_elements)
+                .ok_or_else(|| shape_err(op, "step output offset overflow".to_owned()))?;
+            // SAFETY: each ordered launch writes a distinct output slice.
+            unsafe {
+                self.layers_extra.sequence_concat_step(
+                    &self.stream,
+                    launch::elementwise(step_elements, config),
+                    &input.buf,
+                    &mut output,
+                    offset,
+                )
+            }
+            .map_err(launch_err)?;
+        }
+        Ok(OxideTensorF32::new(output, output_shape))
+    }
+
     fn shortcut_add_f32(
         &self,
         x: &Self::Tensor,

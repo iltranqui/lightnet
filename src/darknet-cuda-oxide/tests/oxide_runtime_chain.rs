@@ -575,6 +575,16 @@ fn lstm_no_batch_norm_forward_and_device_backward_match_cpu() {
     let gpu_training = gpu
         .forward_training_device(&input)
         .expect("Oxide LSTM training");
+    let training_output = gpu
+        .backend
+        .download_f32(&gpu_training.gpu_layer_outputs[1])
+        .expect("download LSTM device-training output");
+    close(
+        "LSTM device-training output",
+        &cpu_training.layer_outputs[1].data,
+        &training_output,
+        3e-4,
+    );
     let output_shape = cpu.network.layers[1].output_shape;
     let seed = Tensor::from_data(
         output_shape,
