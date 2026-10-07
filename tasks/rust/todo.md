@@ -301,7 +301,8 @@ Immediately next, in dependency order:
   Adam/subdivision rejection; v142 accumulates configured subdivisions and applies
   one normalized SGD update; v143 parses OBB `counters_per_class` into
   assignment class multipliers; v144 parses and routes OBB relative class-map
-  files. Still open: full loss scalar, CLI/schedule and
+  files; v145 parses and routes covariance/COBB normalizers and QBBV blending
+  options into per-head scoring. Still open: full loss scalar, CLI/schedule and
   non-SGD optimizer/training-loop integration, remaining cfg/training
   option wiring,
   inference/network decode integration, remaining metric/loss aggregation and

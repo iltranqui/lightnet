@@ -139,6 +139,19 @@ pub fn build_obb_yolo_training_head_config(
     }
     validate_anchor_front_offsets(spec.front_anchor_offsets.as_deref(), spec.num)?;
     let anchors = spec.anchors[..anchor_count].to_vec();
+    let score_config = ObbYoloMatchScoreConfig {
+        covariance_normalizer: spec.covariance_normalizer,
+        cobb_normalizer: spec.cobb_normalizer,
+        covariance_front_length_ratio_k: spec.obb_length_ratio_k,
+        covariance_front_length_weight: 0.35,
+        cobb_loss: ObbCobbLossConfig {
+            box_weight: spec.cobb_box_weight,
+            ratio_weight: spec.cobb_r_weight,
+            score_weight: spec.cobb_s_weight,
+            iou_lambda: spec.cobb_iou_lambda,
+        },
+        viou_weight: spec.obb_viou_weight,
+    };
     let match_config = ObbYoloHeadMatchConfig {
         head_index,
         anchors: anchors.clone(),
@@ -150,7 +163,7 @@ pub fn build_obb_yolo_training_head_config(
         net_height,
         new_coords: spec.new_coords,
         front_anchor_offsets: spec.front_anchor_offsets.clone(),
-        score_config: ObbYoloMatchScoreConfig::default(),
+        score_config,
         ignore_thresh: spec.ignore_thresh,
         truth_thresh: spec.truth_thresh,
         objectness_normalizer: spec.obj_normalizer,
@@ -177,6 +190,7 @@ pub fn build_obb_yolo_training_head_config(
         match_config,
         assignment_config,
         box_delta_config: ObbYoloBoxDeltaConfig {
+            score: score_config,
             iou_normalizer: spec.iou_normalizer,
             max_delta: spec.max_delta,
             ..ObbYoloBoxDeltaConfig::default()

@@ -884,6 +884,18 @@ pub struct ObbYoloSpec {
     pub front_anchor_offsets: Option<Vec<[f32; 2]>>,
     /// Source `front_loss_normalizer`, including its `front_point_normalizer` alias.
     pub front_loss_normalizer: f32,
+    /// Source normalizer selecting covariance-W2 match/regression scoring.
+    pub covariance_normalizer: f32,
+    /// Source normalizer selecting COBB match scoring.
+    pub cobb_normalizer: f32,
+    /// Covariance-W2 front-length ratio factor.
+    pub obb_length_ratio_k: f32,
+    /// QBBV vIoU blend weight, clamped to `[0, 1]` like source cfg parsing.
+    pub obb_viou_weight: f32,
+    pub cobb_box_weight: f32,
+    pub cobb_r_weight: f32,
+    pub cobb_s_weight: f32,
+    pub cobb_iou_lambda: f32,
     pub nms_kind: ObbNmsKind,
 }
 
@@ -2259,6 +2271,14 @@ fn parse_layer_kind(
             LayerKind::ObbYolo(ObbYoloSpec {
                 front_anchor_offsets,
                 front_loss_normalizer,
+                covariance_normalizer: section.get_f32("covariance_normalizer", 0.0)?,
+                cobb_normalizer: section.get_f32("cobb_normalizer", 0.0)?,
+                obb_length_ratio_k: section.get_f32("obb_length_ratio_k", 1.0)?,
+                obb_viou_weight: section.get_f32("obb_viou_weight", 0.0)?.clamp(0.0, 1.0),
+                cobb_box_weight: section.get_f32("cobb_box_weight", 1.0)?,
+                cobb_r_weight: section.get_f32("cobb_r_weight", 1.0)?,
+                cobb_s_weight: section.get_f32("cobb_s_weight", 1.0)?,
+                cobb_iou_lambda: section.get_f32("cobb_iou_lambda", 2.0)?,
                 yolo: YoloSpec {
                     classes,
                     num: total,
@@ -4464,6 +4484,46 @@ mod tests {
             crate::obb_training::build_obb_yolo_training_head_config(spec, 0, 1, 1, 1, 1)
                 .expect("parsed class map routes into training assignment");
         assert_eq!(training.assignment_config.class_map, spec.class_map);
+    }
+
+    #[test]
+    fn obb_yolo_routes_covariance_cobb_and_viou_options() {
+        let network = build(
+            "[net]\nwidth=1\nheight=1\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\ncovariance_normalizer=1.3\ncobb_normalizer=0.4\nobb_length_ratio_k=1.4\nobb_viou_weight=1.5\ncobb_box_weight=1.2\ncobb_r_weight=0.8\ncobb_s_weight=1.4\ncobb_iou_lambda=2.2\n",
+        )
+        .expect("OBB score options parse");
+        let LayerKind::ObbYolo(spec) = &network.layers[0].kind else {
+            panic!("expected OBB YOLO layer");
+        };
+        let training =
+            crate::obb_training::build_obb_yolo_training_head_config(spec, 0, 1, 1, 1, 1)
+                .expect("OBB score options route into training configs");
+        assert_eq!(
+            training.match_config.score_config,
+            training.box_delta_config.score
+        );
+        assert_eq!(
+            training.match_config.score_config.covariance_normalizer,
+            1.3
+        );
+        assert_eq!(training.match_config.score_config.cobb_normalizer, 0.4);
+        assert_eq!(
+            training
+                .match_config
+                .score_config
+                .covariance_front_length_ratio_k,
+            1.4
+        );
+        assert_eq!(training.match_config.score_config.viou_weight, 1.0);
+        assert_eq!(
+            training.match_config.score_config.cobb_loss,
+            crate::obb_geometry::ObbCobbLossConfig {
+                box_weight: 1.2,
+                ratio_weight: 0.8,
+                score_weight: 1.4,
+                iou_lambda: 2.2,
+            }
+        );
     }
 
     #[test]
