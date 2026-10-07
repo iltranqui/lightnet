@@ -34,6 +34,7 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v149: OBB `iou_thresh_kind` now parses to the spec with the source `iou` default; a configured `diou` value is covered by the adapter test. This is config retention; training-threshold semantics remain part of broader integration.
 - v148: standard OBB `iou_loss` values are now retained in the parsed YOLO spec and routed into front-point delta configuration; `ciou_obb` and `ciou_obb_mul` map to CIoU while retaining their OBB score-mode flag. The focused adapter tests and all 113 OBB-filtered host tests passed.
 - v147: the parsed OBB `front_loss_normalizer` now feeds covariance matching-score length weighting instead of a hard-coded 0.35. The focused adapter test and all 113 OBB-filtered host tests passed.
 - v146: `[obb_yolo] iou_loss` now parses CIoU-OBB/CIoU-OBB-mul and standard IoU names; per-head config selects the CIoU-OBB match branch when requested or when covariance/COBB weighting is absent. Unsupported names fail. The focused tests and all 113 OBB-filtered host tests passed; this is score-path coverage, not full loss parity.
