@@ -1,7 +1,7 @@
 //! Source-derived training primitives for legacy front-point OBB YOLO heads.
 //!
 //! This module currently covers direction-free anchor matching, per-truth
-//! head-positive enumeration, per-cell CIoU prediction scoring/match selection,
+//! head-positive enumeration, per-cell OBB score-branch dispatch/match selection,
 //! objectness and class-channel deltas, and source-layout truth-row packing.
 //! It does not implement complete truth assignment, YOLO loss, backward
 //! propagation, or optimizer integration.
@@ -95,6 +95,45 @@ pub struct ObbYoloPredictionMatchContext {
     pub net_height: usize,
     /// Whether box width/height use `[yolo] new_coords` decoding.
     pub new_coords: bool,
+}
+
+/// The active score branch selected by source OBB loss-normalizer priority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObbYoloMatchScoreBranch {
+    Covariance,
+    Cobb,
+    LegacyAngular,
+}
+
+/// Branch settings for source one-cell OBB matching-score dispatch.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObbYoloMatchScoreConfig {
+    pub covariance_normalizer: f32,
+    pub cobb_normalizer: f32,
+    pub covariance_front_length_ratio_k: f32,
+    pub covariance_front_length_weight: f32,
+    pub cobb_loss: ObbCobbLossConfig,
+    pub viou_weight: f32,
+}
+
+impl Default for ObbYoloMatchScoreConfig {
+    fn default() -> Self {
+        Self {
+            covariance_normalizer: 0.0,
+            cobb_normalizer: 0.0,
+            covariance_front_length_ratio_k: 1.0,
+            covariance_front_length_weight: 0.35,
+            cobb_loss: ObbCobbLossConfig::default(),
+            viou_weight: 0.0,
+        }
+    }
+}
+
+/// Result of source single-prediction OBB score-branch selection.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObbYoloMatchScore {
+    pub branch: ObbYoloMatchScoreBranch,
+    pub score: f32,
 }
 
 /// Number of float values in one source OBB YOLO truth row.
@@ -648,6 +687,65 @@ pub fn obb_yolo_cobb_prediction_match_score_with_viou(
     ))
 }
 
+/// Select and compute the source covariance/COBB/legacy-angular score for one
+/// decoded OBB YOLO cell.
+///
+/// Covariance has priority when its normalizer is finite and positive. COBB is
+/// next when its normalizer is finite and positive; otherwise the legacy angular
+/// fallback is selected. This composes per-cell score branches only; it does
+/// not perform multi-truth assignment, batch aggregation, or `ciou_obb` scoring.
+pub fn obb_yolo_match_score(
+    prediction: [f32; 6],
+    truth: &ObbLabel,
+    context: ObbYoloPredictionMatchContext,
+    config: ObbYoloMatchScoreConfig,
+) -> Result<ObbYoloMatchScore> {
+    let covariance_active =
+        config.covariance_normalizer.is_finite() && config.covariance_normalizer > 0.0;
+    if covariance_active {
+        return Ok(ObbYoloMatchScore {
+            branch: ObbYoloMatchScoreBranch::Covariance,
+            score: obb_yolo_covariance_prediction_match_score_with_viou(
+                prediction,
+                truth,
+                context,
+                config.covariance_normalizer,
+                config.covariance_front_length_ratio_k.max(0.05),
+                if config.covariance_front_length_weight.is_finite() {
+                    config.covariance_front_length_weight.max(0.0)
+                } else {
+                    0.0
+                },
+                config.viou_weight,
+            )?,
+        });
+    }
+    let cobb_active = config.cobb_normalizer.is_finite() && config.cobb_normalizer > 0.0;
+    if cobb_active {
+        return Ok(ObbYoloMatchScore {
+            branch: ObbYoloMatchScoreBranch::Cobb,
+            score: obb_yolo_cobb_prediction_match_score_with_viou(
+                prediction,
+                truth,
+                context,
+                config.covariance_normalizer,
+                config.cobb_normalizer,
+                config.cobb_loss,
+                config.viou_weight,
+            )?,
+        });
+    }
+    Ok(ObbYoloMatchScore {
+        branch: ObbYoloMatchScoreBranch::LegacyAngular,
+        score: obb_yolo_angular_prediction_match_score_with_viou(
+            prediction,
+            truth,
+            context,
+            config.viou_weight,
+        )?,
+    })
+}
+
 /// Decode one source YOLO output row and score it against a truth with the
 /// source CIoU-OBB matching metric.
 ///
@@ -984,14 +1082,16 @@ fn validate_truth(truth: &ObbLabel) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloCellTruthMatch, ObbYoloPositiveKind,
+        OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloCellTruthMatch,
+        ObbYoloMatchScoreBranch, ObbYoloMatchScoreConfig, ObbYoloPositiveKind,
         ObbYoloPredictionMatchContext, assign_obb_yolo_anchor, encode_obb_yolo_truth_batch,
         enumerate_obb_yolo_head_positives, match_obb_yolo_cell_prediction,
         obb_yolo_anchor_match_score, obb_yolo_angular_prediction_match_score_with_viou,
         obb_yolo_cell_objectness_delta, obb_yolo_ciou_prediction_match_score,
         obb_yolo_class_deltas, obb_yolo_cobb_prediction_match_score_with_viou,
         obb_yolo_covariance_prediction_match_score,
-        obb_yolo_covariance_prediction_match_score_with_viou, select_obb_yolo_cell_truth_match,
+        obb_yolo_covariance_prediction_match_score_with_viou, obb_yolo_match_score,
+        select_obb_yolo_cell_truth_match,
     };
     use crate::obb_labels::ObbLabel;
 
@@ -1363,6 +1463,89 @@ mod tests {
             0.35,
         )
         .is_err());
+    }
+
+    #[test]
+    fn match_score_dispatch_obeys_covariance_cobb_angular_priority() {
+        let context = ObbYoloPredictionMatchContext {
+            anchor_width: 2.0,
+            anchor_height: 4.0,
+            cell_x: 0,
+            cell_y: 0,
+            grid_width: 1,
+            grid_height: 1,
+            net_width: 1,
+            net_height: 1,
+            new_coords: false,
+        };
+        let mut label = truth(0.5, 0.5, 2.0, 4.0);
+        label.front_x = 0.5;
+        label.front_y = 4.5;
+        label.has_front = true;
+        let prediction = [0.5, 0.5, 0.0, 0.0, 4.5, 0.5];
+
+        let covariance_config = ObbYoloMatchScoreConfig {
+            covariance_normalizer: 1.0,
+            cobb_normalizer: 1.0,
+            viou_weight: 0.2,
+            ..ObbYoloMatchScoreConfig::default()
+        };
+        let covariance =
+            obb_yolo_match_score(prediction, &label, context, covariance_config).unwrap();
+        assert_eq!(covariance.branch, ObbYoloMatchScoreBranch::Covariance);
+        assert_eq!(
+            covariance.score,
+            obb_yolo_covariance_prediction_match_score_with_viou(
+                prediction, &label, context, 1.0, 1.0, 0.35, 0.2,
+            )
+            .unwrap()
+        );
+
+        let cobb_config = ObbYoloMatchScoreConfig {
+            covariance_normalizer: 0.0,
+            cobb_normalizer: 1.0,
+            viou_weight: 0.2,
+            ..ObbYoloMatchScoreConfig::default()
+        };
+        let cobb = obb_yolo_match_score(prediction, &label, context, cobb_config).unwrap();
+        assert_eq!(cobb.branch, ObbYoloMatchScoreBranch::Cobb);
+        assert_eq!(
+            cobb.score,
+            obb_yolo_cobb_prediction_match_score_with_viou(
+                prediction,
+                &label,
+                context,
+                0.0,
+                1.0,
+                crate::obb_geometry::ObbCobbLossConfig::default(),
+                0.2,
+            )
+            .unwrap()
+        );
+
+        let angular_config = ObbYoloMatchScoreConfig {
+            viou_weight: 0.2,
+            ..ObbYoloMatchScoreConfig::default()
+        };
+        let angular = obb_yolo_match_score(prediction, &label, context, angular_config).unwrap();
+        assert_eq!(angular.branch, ObbYoloMatchScoreBranch::LegacyAngular);
+        assert_eq!(
+            angular.score,
+            obb_yolo_angular_prediction_match_score_with_viou(prediction, &label, context, 0.2,)
+                .unwrap()
+        );
+
+        let nonfinite_covariance = ObbYoloMatchScoreConfig {
+            covariance_normalizer: f32::NAN,
+            cobb_normalizer: 1.0,
+            ..ObbYoloMatchScoreConfig::default()
+        };
+        assert_eq!(
+            obb_yolo_match_score(prediction, &label, context, nonfinite_covariance)
+                .unwrap()
+                .branch,
+            ObbYoloMatchScoreBranch::Cobb
+        );
     }
 
     #[test]
