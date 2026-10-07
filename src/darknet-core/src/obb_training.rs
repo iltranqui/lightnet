@@ -187,6 +187,8 @@ pub struct ObbYoloHeadTrainingDeltaStats {
     pub anchor_class_stats: ObbYoloClassDeltaStats,
     /// Best/additional positive assignments that received box deltas.
     pub anchor_box_positive_count: usize,
+    /// Source `net.total_bbox`: threshold cells plus best/additional assignments.
+    pub total_bbox_count: usize,
 }
 
 /// Per-head detail and source-style totals from a multi-head delta dispatch.
@@ -200,6 +202,8 @@ pub struct ObbYoloBatchTrainingDeltaStats {
     pub truth_threshold_positive_cells: usize,
     /// Best/additional positive box assignments across heads.
     pub anchor_box_positive_count: usize,
+    /// Source `net.total_bbox` aggregated across all heads.
+    pub total_bbox_count: usize,
 }
 
 /// Geometry shared by the per-cell prediction-match score calculation.
@@ -2348,11 +2352,15 @@ pub fn apply_obb_yolo_batch_head_training_deltas(
         match_config.new_coords,
         box_delta_config,
     )?;
+    let total_bbox_count = truth_threshold_positive_cells
+        .checked_add(anchor_box_positive_count)
+        .ok_or_else(|| Error::InvalidConfig("OBB bbox-positive count overflows".to_owned()))?;
 
     Ok(ObbYoloHeadTrainingDeltaStats {
         truth_threshold_positive_cells,
         anchor_class_stats,
         anchor_box_positive_count,
+        total_bbox_count,
     })
 }
 
@@ -2445,6 +2453,10 @@ pub fn apply_obb_yolo_batch_multi_head_training_deltas(
             .anchor_box_positive_count
             .checked_add(head_stats.anchor_box_positive_count)
             .ok_or_else(|| Error::InvalidConfig("OBB box-positive count overflows".to_owned()))?;
+        totals.total_bbox_count = totals
+            .total_bbox_count
+            .checked_add(head_stats.total_bbox_count)
+            .ok_or_else(|| Error::InvalidConfig("OBB bbox-positive count overflows".to_owned()))?;
         totals.per_head.push(head_stats);
     }
     Ok(totals)
@@ -3307,6 +3319,10 @@ mod tests {
         );
         assert_eq!(stats.anchor_class_stats, anchor_class_stats);
         assert_eq!(stats.anchor_box_positive_count, anchor_box_positive_count);
+        assert_eq!(
+            stats.total_bbox_count,
+            truth_threshold_positive_cells + anchor_box_positive_count
+        );
     }
 
     #[test]
@@ -3501,11 +3517,13 @@ mod tests {
         assert_eq!(stats.anchor_class_stats.positive_count, 2);
         assert!((stats.anchor_class_stats.class_output_sum - 0.6).abs() < 1e-6);
         assert_eq!(stats.anchor_box_positive_count, 2);
+        assert_eq!(stats.total_bbox_count, 4);
         for head_stats in &stats.per_head {
             assert_eq!(head_stats.truth_threshold_positive_cells, 1);
             assert_eq!(head_stats.anchor_class_stats.positive_count, 1);
             assert_eq!(head_stats.anchor_class_stats.class_output_sum, 0.3);
             assert_eq!(head_stats.anchor_box_positive_count, 1);
+            assert_eq!(head_stats.total_bbox_count, 2);
         }
         for head_delta in deltas {
             assert!((head_delta[6] - 0.6).abs() < 1e-6);
