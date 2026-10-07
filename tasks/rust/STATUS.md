@@ -34,6 +34,14 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v91: added `ObbTrainingBatch::encode_truths` and public seven-float OBB YOLO
+  truth packing in the source `[batch][box-slot][7]` layout. Rows preserve label
+  order, use the center placeholder for absent front points, and zero-pad unused
+  slots; invalid shapes/classes/capacity fail explicitly. Focused OBB tests passed
+  44/44. The package-wide host test attempt timed out after 20 minutes in the
+  existing `laya_scorer::real_weights` test, so its final result is inconclusive.
+  Complete anchor assignment, OBB losses/trainer integration, and compiled-C++
+  parity remain open.
 - v90: `DetectorAugmentation` now accepts `[obb_yolo]` cfg sections and exposes
   a deterministic per-sample horizontal-flip mask matching its existing Rust
   augmentation draw order. Added `load_obb_training_batch_with_flips_from_paths`,

@@ -1,8 +1,8 @@
 //! Source-derived training primitives for legacy front-point OBB YOLO heads.
 //!
-//! This module currently covers direction-free anchor matching and cell
-//! selection only. It does not implement complete truth assignment, YOLO loss,
-//! backward propagation, or optimizer integration.
+//! This module currently covers direction-free anchor matching, cell selection,
+//! and source-layout truth-row packing only. It does not implement complete
+//! truth assignment, YOLO loss, backward propagation, or optimizer integration.
 
 use crate::error::{Error, Result};
 use crate::obb_labels::ObbLabel;
@@ -19,6 +19,91 @@ pub struct ObbYoloAnchorAssignment {
     pub cell_y: usize,
     /// Size IoU used to select the global anchor.
     pub match_score: f32,
+}
+
+pub const OBB_YOLO_TRUTH_SIZE: usize = 7;
+
+/// Source-layout OBB YOLO truth rows, stored as `[batch][box-slot][7]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObbYoloTruthBatch {
+    pub batch_size: usize,
+    pub max_boxes: usize,
+    /// Each row is `[cx, cy, w, h, class, front_x, front_y]`.
+    pub values: Vec<f32>,
+}
+
+/// Encode per-image OBB labels into the seven-float rows consumed by
+/// `obb_yolo_truth_from_state`. Labels are kept in caller order, absent fronts
+/// use the center placeholder, and unused box slots remain all-zero. Overflow
+/// is an error rather than a silent truncation.
+pub fn encode_obb_yolo_truth_batch(
+    labels: &[Vec<ObbLabel>],
+    max_boxes: usize,
+    classes: usize,
+) -> Result<ObbYoloTruthBatch> {
+    if labels.is_empty() || max_boxes == 0 || classes == 0 {
+        return Err(Error::InvalidConfig(
+            "OBB truth encoding requires a nonempty batch, max_boxes, and classes".to_owned(),
+        ));
+    }
+    for (batch_index, image_labels) in labels.iter().enumerate() {
+        if image_labels.len() > max_boxes {
+            return Err(Error::InvalidConfig(format!(
+                "OBB image {batch_index} has {} labels, exceeding max_boxes={max_boxes}",
+                image_labels.len()
+            )));
+        }
+    }
+    let value_count = labels
+        .len()
+        .checked_mul(max_boxes)
+        .and_then(|rows| rows.checked_mul(OBB_YOLO_TRUTH_SIZE))
+        .ok_or_else(|| Error::InvalidConfig("OBB truth tensor size overflows".to_owned()))?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(value_count)
+        .map_err(|_| Error::InvalidConfig("OBB truth tensor allocation failed".to_owned()))?;
+    values.resize(value_count, 0.0);
+
+    for (batch_index, image_labels) in labels.iter().enumerate() {
+        for (box_slot, label) in image_labels.iter().enumerate() {
+            validate_truth(label)?;
+            if label.class_id >= classes {
+                return Err(Error::InvalidConfig(format!(
+                    "OBB class id {} exceeds classes={classes} in image {batch_index}",
+                    label.class_id
+                )));
+            }
+            let class_value = label.class_id as f32;
+            if label.class_id > (1usize << 24) || class_value as usize != label.class_id {
+                return Err(Error::InvalidConfig(format!(
+                    "OBB class id {} cannot be represented exactly in the truth tensor",
+                    label.class_id
+                )));
+            }
+            let front = if label.has_front {
+                [label.front_x, label.front_y]
+            } else {
+                [label.x, label.y]
+            };
+            let row = (batch_index * max_boxes + box_slot) * OBB_YOLO_TRUTH_SIZE;
+            values[row..row + OBB_YOLO_TRUTH_SIZE].copy_from_slice(&[
+                label.x,
+                label.y,
+                label.w,
+                label.h,
+                class_value,
+                front[0],
+                front[1],
+            ]);
+        }
+    }
+
+    Ok(ObbYoloTruthBatch {
+        batch_size: labels.len(),
+        max_boxes,
+        values,
+    })
 }
 
 /// Compute the source's direction-free OBB YOLO anchor-match score.
@@ -135,7 +220,8 @@ fn validate_truth(truth: &ObbLabel) -> Result<()> {
         || truth.h <= 0.0
     {
         return Err(Error::InvalidConfig(
-            "OBB anchor matching requires finite truth coordinates, a normalized center, and positive dimensions".to_owned(),
+            "OBB truth requires finite coordinates, a normalized center, and positive dimensions"
+                .to_owned(),
         ));
     }
     Ok(())
@@ -143,7 +229,10 @@ fn validate_truth(truth: &ObbLabel) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ObbYoloAnchorAssignment, assign_obb_yolo_anchor, obb_yolo_anchor_match_score};
+    use super::{
+        OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, assign_obb_yolo_anchor,
+        encode_obb_yolo_truth_batch, obb_yolo_anchor_match_score,
+    };
     use crate::obb_labels::ObbLabel;
 
     fn truth(x: f32, y: f32, w: f32, h: f32) -> ObbLabel {
@@ -161,6 +250,83 @@ mod tests {
             front_y: y,
             has_front: false,
         }
+    }
+
+    #[test]
+    fn truth_encoder_preserves_batch_slots_and_front_placeholders() {
+        let absent = truth(0.25, 0.5, 0.2, 0.4);
+        let mut explicit = truth(0.75, 0.25, 0.1, 0.2);
+        explicit.class_id = 2;
+        explicit.front_x = 0.8;
+        explicit.front_y = 0.125;
+        explicit.has_front = true;
+        let mut second_image = truth(0.5, 0.75, 0.3, 0.1);
+        second_image.class_id = 1;
+
+        let encoded =
+            encode_obb_yolo_truth_batch(&[vec![absent, explicit], vec![second_image]], 2, 3)
+                .expect("source-layout truth batch");
+        assert_eq!(encoded.batch_size, 2);
+        assert_eq!(encoded.max_boxes, 2);
+        assert_eq!(OBB_YOLO_TRUTH_SIZE, 7);
+        assert_eq!(
+            encoded.values,
+            vec![
+                absent.x,
+                absent.y,
+                absent.w,
+                absent.h,
+                0.0,
+                absent.x,
+                absent.y,
+                explicit.x,
+                explicit.y,
+                explicit.w,
+                explicit.h,
+                2.0,
+                explicit.front_x,
+                explicit.front_y,
+                second_image.x,
+                second_image.y,
+                second_image.w,
+                second_image.h,
+                1.0,
+                second_image.x,
+                second_image.y,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ]
+        );
+    }
+
+    #[test]
+    fn truth_encoder_rejects_invalid_dimensions_classes_and_capacity() {
+        let label = truth(0.5, 0.5, 0.25, 0.25);
+        assert!(encode_obb_yolo_truth_batch(&[], 1, 1).is_err());
+        assert!(encode_obb_yolo_truth_batch(&[vec![label]], 0, 1).is_err());
+        assert!(encode_obb_yolo_truth_batch(&[vec![label]], 1, 0).is_err());
+        assert!(encode_obb_yolo_truth_batch(&[vec![label, label]], 1, 1).is_err());
+
+        let mut invalid_class = label;
+        invalid_class.class_id = 1;
+        assert!(encode_obb_yolo_truth_batch(&[vec![invalid_class]], 1, 1).is_err());
+        let mut imprecise_class = label;
+        imprecise_class.class_id = (1usize << 24) + 1;
+        assert!(
+            encode_obb_yolo_truth_batch(&[vec![imprecise_class]], 1, imprecise_class.class_id + 1)
+                .is_err()
+        );
+        let mut invalid_size = label;
+        invalid_size.w = 0.0;
+        assert!(encode_obb_yolo_truth_batch(&[vec![invalid_size]], 1, 1).is_err());
+        let mut invalid_center = label;
+        invalid_center.x = f32::NAN;
+        assert!(encode_obb_yolo_truth_batch(&[vec![invalid_center]], 1, 1).is_err());
     }
 
     #[test]

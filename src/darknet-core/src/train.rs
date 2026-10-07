@@ -15,6 +15,7 @@ use crate::error::{Error, Result};
 use crate::image::PlanarRgbImage;
 use crate::model::{LayerKind, Network, TensorShape, YoloIouLoss, YoloSpec};
 use crate::obb_labels::{ObbLabel, flip_obb_labels, load_obb_labels};
+use crate::obb_training::{ObbYoloTruthBatch, encode_obb_yolo_truth_batch};
 use crate::runtime::{ForwardResult, Tensor};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,6 +117,11 @@ pub struct ObbTrainingBatch {
 impl ObbTrainingBatch {
     pub fn label_count(&self) -> usize {
         self.labels.iter().map(Vec::len).sum()
+    }
+
+    /// Encode labels into the source OBB YOLO `[batch][box][7]` truth layout.
+    pub fn encode_truths(&self, max_boxes: usize, classes: usize) -> Result<ObbYoloTruthBatch> {
+        encode_obb_yolo_truth_batch(&self.labels, max_boxes, classes)
     }
 
     /// Horizontally flip selected NCHW samples and their OBB labels together.
@@ -2408,6 +2414,16 @@ mod tests {
         );
         assert_eq!(batch.input.shape, network.net.input_shape());
         assert_eq!(batch.label_count(), 2);
+        let truths = batch
+            .encode_truths(1, 1)
+            .expect("labels encode to truth rows");
+        assert_eq!(truths.batch_size, 2);
+        assert_eq!(truths.max_boxes, 1);
+        assert_eq!(
+            &truths.values[..7],
+            &[0.75, 0.5, 0.25, 0.5, 0.0, 0.875, 0.5]
+        );
+        assert_eq!(&truths.values[7..], &[0.25, 0.5, 0.5, 0.5, 0.0, 0.25, 0.5]);
         assert!(batch.labels[0][0].has_front);
         assert!(!batch.labels[1][0].has_front);
         assert_eq!(batch.labels[1][0].front_x, batch.labels[1][0].x);
