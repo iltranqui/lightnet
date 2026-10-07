@@ -317,12 +317,16 @@ Immediately next, in dependency order:
   allows distinct weighted MSE matching and CIoU-OBB regression configs through
   batch dispatch; v158 aggregates source-style MSE and supported non-MSE loss
   costs across heads, with non-MSE box losses counted only for best/additional
-  anchor assignments.
-  Still open: CLI/schedule and non-SGD training-loop integration, remaining
-  cfg/training option wiring, inference/network decode integration, broader
-  metric/loss logging aggregation, crop/resize and mosaic transforms,
-  alternate NMS-kind implementations, training `-map` cadence, and CARPN network
-  decoding/validation integration remain open.
+  anchor assignments; v159 routes `detector train` through a bounded CPU OBB
+  SGD loop with configured subdivisions, direct resize, seeded horizontal flips,
+  checkpoints and loss CSV logging, and explicitly rejects `-map`, Adam, dynamic
+  loss scaling, unsupported augmentation, and OBB GPU training. The CLI test
+  covers one iteration and the `-map` rejection; all 119 OBB-filtered core tests
+  plus the CLI test passed. No compiled-C++ parity is established.
+  Still open: OBB `-map` cadence and broader GPU/optimizer integration, remaining
+  cfg/training option wiring, inference CLI/decode integration, broader
+  metric/loss logging, source-faithful crop/resize and mosaic label transforms,
+  alternate NMS-kind implementations, and CARPN network decoding/validation.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and
   kernels, weights order `weights.cpp:428`); then `deform_conv`, `dsconv`,
   `graph_conv`, `wmhf`, `clifford`, `recursive_block`.

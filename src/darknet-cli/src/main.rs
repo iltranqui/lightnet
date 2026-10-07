@@ -15,9 +15,11 @@ use darknet_core::{
     ConfigFile, DataConfig, DetectionOptions, DetectorAugmentation, ExecutableNetwork, LayerKind,
     LayerParams, Network, PlanarRgbImage, Tensor, TrainingBatch, YoloLabel, YoloTrainingState,
     compute_learning_rate, compute_yolo_training_loss_with_state, decode_modern_detections,
-    decode_yolo_detections,
-    initialize_training_params, inspect_weights_file, load_augmented_training_batch_from_paths,
-    load_names_file, load_paths_file, save_weights,
+    decode_yolo_detections, initialize_training_params, inspect_weights_file,
+    load_augmented_training_batch_from_paths, load_names_file, load_paths_file, save_weights,
+};
+use darknet_core::{
+    compute_obb_yolo_training_deltas, load_obb_training_batch_with_flips_from_paths,
 };
 #[cfg(feature = "oxide")]
 use darknet_cuda_oxide::OxideBackend;
@@ -1759,7 +1761,11 @@ fn run_detector_train_cpu(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let data_config = DataConfig::from_path(data)?;
     let augmentation = DetectorAugmentation::from_config(&ConfigFile::parse_file(cfg)?)?;
-    let mut executable = ExecutableNetwork::from_path(cfg)?;
+    let executable = ExecutableNetwork::from_path(cfg)?;
+    if executable.network.net.obb {
+        return run_detector_train_cpu_obb(cfg, executable, data_config, augmentation, options);
+    }
+    let mut executable = executable;
     initialize_training_params(&executable.network, &mut executable.params, options.seed);
     let mut seen = 0u64;
     if let Some(weights) = options.weights.as_deref() {
@@ -2045,6 +2051,202 @@ fn run_detector_train_cpu(
     Ok(())
 }
 
+fn run_detector_train_cpu_obb(
+    cfg: &str,
+    mut executable: ExecutableNetwork,
+    data_config: DataConfig,
+    augmentation: DetectorAugmentation,
+    options: &TrainOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if options.map {
+        return Err("OBB CLI training -map cadence is not implemented yet".into());
+    }
+    if executable.network.net.adam {
+        return Err("OBB CLI CPU training currently supports SGD, not Adam".into());
+    }
+    if options.dynamic_loss_scale {
+        return Err("OBB CLI dynamic loss scaling requires the Oxide training path".into());
+    }
+    if augmentation.jitter != 0.0
+        || augmentation.resize != 1.0
+        || augmentation.letter_box
+        || augmentation.hue != 0.0
+        || augmentation.saturation != 1.0
+        || augmentation.exposure != 1.0
+        || augmentation.mixup
+        || augmentation.mosaic
+        || augmentation.mosaic_bound
+        || augmentation.random != 0.0
+    {
+        return Err(
+            "OBB CLI training currently supports only direct resize and seeded horizontal flips; disable other augmentation options".into(),
+        );
+    }
+
+    initialize_training_params(&executable.network, &mut executable.params, options.seed);
+    let mut seen = 0u64;
+    if let Some(weights) = options.weights.as_deref() {
+        let header = executable.load_weights_file(weights)?;
+        seen = header.seen;
+        println!(
+            "loaded weights {}.{}.{} seen={}",
+            header.major, header.minor, header.revision, header.seen
+        );
+    } else {
+        println!("running with seeded random weights");
+    }
+    seen = options.initial_seen(seen);
+    if options.clear {
+        println!("-clear: reset seen and iteration");
+    }
+    let train_images = load_paths_file(data_config.required_train_list()?)?;
+    println!(
+        "loaded {} images from {}",
+        train_images.len(),
+        data_config.required_train_list()?.display()
+    );
+    print_training_configuration(
+        train_images.len(),
+        executable.network.net.batch,
+        executable.network.net.subdivisions,
+        executable.network.net.max_batches,
+        executable.network.net.learning_rate,
+        executable.network.net.momentum,
+        executable.network.net.decay,
+    );
+    if train_images.is_empty() {
+        return Err("training list is empty".into());
+    }
+
+    let backup_dir = data_config
+        .backup
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."));
+    fs::create_dir_all(&backup_dir)?;
+    let base_name = cfg_base_name(cfg);
+    let batch_size = executable.network.net.batch.max(1);
+    let subdivisions = executable.network.net.subdivisions.max(1);
+    let images_per_iteration = batch_size
+        .checked_mul(subdivisions)
+        .ok_or_else(|| std::io::Error::other("OBB CLI images-per-iteration count overflow"))?;
+    let mut batch_num = (seen as usize) / images_per_iteration;
+    let mut progress = TrainingProgress::new(batch_num);
+    let mut epoch = (seen as usize) / train_images.len();
+    let mut epoch_images = std::sync::Arc::new(epoch_order(&train_images, options.seed, epoch));
+    let mut image_cursor = (seen as usize) % train_images.len();
+    let mut loss_log = TrainingLossLog::new(&backup_dir, &base_name)?;
+
+    println!("OBB CPU trainer: SGD with direct resize and seeded horizontal flips");
+    while executable.network.net.max_batches == 0 || batch_num < executable.network.net.max_batches
+    {
+        let iteration_start = Instant::now();
+        let learning_rate = compute_learning_rate(&executable.network.net, batch_num);
+        executable.set_train_iteration(batch_num);
+        executable.zero_train_buffers();
+        let mut iteration_loss = 0.0f32;
+        for subdivision in 0..subdivisions {
+            let sample_offset = subdivision.checked_mul(batch_size).ok_or_else(|| {
+                std::io::Error::other("OBB CLI subdivision sample offset overflow")
+            })?;
+            let start_index = image_cursor
+                .checked_add(sample_offset)
+                .ok_or_else(|| std::io::Error::other("OBB CLI image cursor overflow"))?;
+            let sample_start = seen
+                .checked_add(u64::try_from(sample_offset)?)
+                .ok_or_else(|| std::io::Error::other("OBB CLI sample ordinal overflow"))?;
+            let batch = load_obb_training_batch_with_flips_from_paths(
+                &executable.network,
+                &data_config,
+                &epoch_images,
+                start_index,
+                &augmentation,
+                options.seed,
+                sample_start,
+            )?;
+            let forward = executable.forward_training(&batch.input)?;
+            let delta_batch =
+                compute_obb_yolo_training_deltas(&executable.network, &forward, &batch.labels)?;
+            iteration_loss += delta_batch.source_loss_cost / batch_size as f32;
+            if !iteration_loss.is_finite() {
+                return Err("OBB CLI iteration loss became non-finite".into());
+            }
+            executable.backward_accumulate_seeded(
+                &batch.input,
+                &forward,
+                &delta_batch.layer_output_gradient_seeds,
+            )?;
+        }
+        executable.update_weights(
+            learning_rate,
+            executable.network.net.momentum,
+            executable.network.net.decay,
+            images_per_iteration,
+        );
+
+        batch_num += 1;
+        seen += images_per_iteration as u64;
+        image_cursor += images_per_iteration;
+        if image_cursor >= train_images.len() {
+            epoch += 1;
+            epoch_images = std::sync::Arc::new(epoch_order(&train_images, options.seed, epoch));
+            image_cursor %= train_images.len();
+        }
+        let loss = iteration_loss / subdivisions as f32;
+        progress.print(
+            batch_num,
+            loss,
+            learning_rate,
+            seen,
+            executable.network.net.max_batches,
+            iteration_start.elapsed(),
+            &map_progress_fields(None),
+        );
+        loss_log.record(
+            batch_num,
+            seen,
+            loss,
+            progress.avg_loss.unwrap_or(loss),
+            learning_rate,
+            iteration_start.elapsed().as_secs_f64() * 1000.0,
+        )?;
+
+        if options.save_every != 0 && batch_num % options.save_every == 0 {
+            let checkpoint = backup_dir.join(format!("{base_name}_{batch_num}.weights"));
+            save_weights(&executable.network, &executable.params, &checkpoint, seen)?;
+            println!("saved {}", checkpoint.display());
+            loss_log.save_last(
+                &executable.network,
+                &executable.params,
+                &backup_dir,
+                &base_name,
+                seen,
+            )?;
+        }
+        if executable.network.net.max_batches != 0
+            && batch_num >= executable.network.net.max_batches
+        {
+            break;
+        }
+    }
+
+    let final_checkpoint = backup_dir.join(format!("{base_name}_final.weights"));
+    save_weights(
+        &executable.network,
+        &executable.params,
+        &final_checkpoint,
+        seen,
+    )?;
+    println!("saved {}", final_checkpoint.display());
+    loss_log.save_last(
+        &executable.network,
+        &executable.params,
+        &backup_dir,
+        &base_name,
+        seen,
+    )?;
+    Ok(())
+}
+
 #[cfg(feature = "oxide")]
 fn print_train_profile(samples: &[[f64; 5]], iteration: usize, at_end: bool) {
     if samples.is_empty() {
@@ -2087,6 +2289,9 @@ fn run_detector_train_gpu(
     let data_config = DataConfig::from_path(data)?;
     let augmentation = DetectorAugmentation::from_config(&ConfigFile::parse_file(cfg)?)?;
     let mut executable = GpuExecutableNetwork::from_path(cfg, backend)?;
+    if executable.network.net.obb {
+        return Err("OBB detector CLI training is currently CPU-only".into());
+    }
     initialize_training_params(&executable.network, &mut executable.params, options.seed);
     let mut seen = 0u64;
     if let Some(weights) = options.weights.as_deref() {
@@ -2701,7 +2906,10 @@ fn advanced_epoch_images(
 
 #[cfg(test)]
 mod tests {
-    use super::{MapOptions, MapSchedule, TrainOptions, classify_detector_train_paths};
+    use super::{
+        MapOptions, MapSchedule, TrainOptions, classify_detector_train_paths,
+        run_detector_train_cpu,
+    };
 
     fn options(args: &[&str]) -> Result<TrainOptions, Box<dyn std::error::Error>> {
         TrainOptions::parse(args.iter().map(|s| s.to_string()))
@@ -2882,6 +3090,64 @@ mod tests {
         let (order, cursor) = advanced_epoch_images(&paths, 42, 0, &epoch0, 4, 4);
         assert_eq!(cursor, 0);
         assert_eq!(*order, epoch_order(&paths, 42, 1));
+    }
+
+    #[test]
+    fn detector_train_runs_one_cpu_obb_iteration_and_saves_cost_artifacts() {
+        let dir = std::env::temp_dir().join(format!("darknet-obb-cli-{}", std::process::id()));
+        let backup = dir.join("backup");
+        std::fs::create_dir_all(&backup).expect("test backup directory");
+        let image = dir.join("sample.ppm");
+        let labels = dir.join("sample.txt");
+        let train_list = dir.join("train.txt");
+        let cfg = dir.join("obb-cli.cfg");
+        let data = dir.join("obb-cli.data");
+        std::fs::write(&image, b"P6\n2 1\n255\n\xff\x00\x00\x00\xff\x00").expect("PPM image");
+        std::fs::write(&labels, "0 0.5 0.5 0.25 0.5 0.7 0.55\n").expect("OBB label");
+        std::fs::write(&train_list, format!("{}\n", image.display())).expect("train list");
+        std::fs::write(
+            &data,
+            format!(
+                "classes=1\ntrain={}\nbackup={}\n",
+                train_list.display(),
+                backup.display()
+            ),
+        )
+        .expect("data cfg");
+        std::fs::write(
+            &cfg,
+            "[net]\nwidth=2\nheight=1\nchannels=3\nbatch=1\nsubdivisions=2\nmax_batches=1\nlearning_rate=.01\nmomentum=0\ndecay=0\nobb=1\nflip=0\n[convolutional]\nfilters=8\nsize=1\nstride=1\nactivation=linear\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\njitter=0\niou_loss=ciou_obb\n",
+        )
+        .expect("OBB cfg");
+
+        let cfg_path = cfg.to_str().expect("cfg path is UTF-8");
+        let data_path = data.to_str().expect("data path is UTF-8");
+        let map_error = run_detector_train_cpu(
+            cfg_path,
+            data_path,
+            &options(&["-map"]).expect("mAP train options"),
+        )
+        .expect_err("OBB training must not fall into AABB mAP validation");
+        assert!(
+            map_error
+                .to_string()
+                .contains("OBB CLI training -map cadence")
+        );
+
+        run_detector_train_cpu(
+            cfg_path,
+            data_path,
+            &options(&[]).expect("default train options"),
+        )
+        .expect("one OBB CPU iteration");
+
+        assert!(backup.join("obb-cli_final.weights").exists());
+        let loss_log =
+            std::fs::read_to_string(backup.join("obb-cli_loss.csv")).expect("OBB loss log");
+        assert!(
+            loss_log.lines().any(|line| line.starts_with("1,2,")),
+            "{loss_log}"
+        );
     }
 
     #[test]
