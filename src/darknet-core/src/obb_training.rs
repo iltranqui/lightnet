@@ -1802,6 +1802,21 @@ pub fn apply_obb_yolo_batch_head_positive_box_deltas(
         || !delta_config.max_delta.is_finite()
         || delta_config.max_delta < 0.0
         || head_delta.iter().any(|value| !value.is_finite())
+        || assignment.class_map.as_ref().is_some_and(|mapping| {
+            mapping.len() != assignment.classes
+                || mapping
+                    .iter()
+                    .any(|&class_id| class_id >= assignment.classes)
+        })
+        || assignment
+            .class_multipliers
+            .as_ref()
+            .is_some_and(|multipliers| {
+                multipliers.len() != assignment.classes
+                    || multipliers.iter().any(|value| {
+                        !value.is_finite() || !(delta_config.iou_normalizer * value).is_finite()
+                    })
+            })
     {
         return Err(Error::InvalidConfig(
             "OBB batch box deltas require finite normalizers, clipping, and existing deltas"
@@ -1873,12 +1888,23 @@ pub fn apply_obb_yolo_batch_head_positive_box_deltas(
             net_height: assignment.net_height,
             new_coords,
         };
+        let truth = &batch_truths[tagged.batch_index][tagged.positive.truth_index];
+        let class_id = assignment
+            .class_map
+            .as_ref()
+            .map_or(truth.class_id, |mapping| mapping[truth.class_id]);
+        let class_multiplier = assignment
+            .class_multipliers
+            .as_ref()
+            .map_or(1.0, |multipliers| multipliers[class_id]);
+        let mut truth_delta_config = delta_config;
+        truth_delta_config.iou_normalizer *= class_multiplier;
         let deltas = obb_yolo_box_regression_deltas(
             prediction,
             existing,
-            &batch_truths[tagged.batch_index][tagged.positive.truth_index],
+            truth,
             context,
-            delta_config,
+            truth_delta_config,
         )?;
         for (channel, delta) in deltas.into_iter().enumerate() {
             head_delta[base + channel * stride] = delta;
@@ -2547,7 +2573,7 @@ mod tests {
             objectness_normalizer: 1.0,
             objectness_smooth: false,
             class_map: None,
-            class_multipliers: None,
+            class_multipliers: Some(vec![2.0]),
         };
         let mut head_output = vec![0.0; 16];
         head_output[..6].copy_from_slice(&[0.4, 0.6, 0.1, -0.1, 0.7, 0.5]);
@@ -2580,6 +2606,8 @@ mod tests {
         {
             let base = slot * 8;
             let prediction = std::array::from_fn(|channel| head_output[base + channel]);
+            let mut expected_config = delta_config;
+            expected_config.iou_normalizer *= 2.0;
             let expected = obb_yolo_box_regression_deltas(
                 prediction,
                 if slot == 0 {
@@ -2599,7 +2627,7 @@ mod tests {
                     net_height: 100,
                     new_coords: false,
                 },
-                delta_config,
+                expected_config,
             )
             .unwrap();
             for channel in 0..4 {

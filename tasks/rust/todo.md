@@ -279,7 +279,8 @@ Immediately next, in dependency order:
   COBB/legacy box deltas and positive-anchor writeback; v118 ports source
   covariance-W2 analytic geometry gradients; v119 routes those gradients into
   positive-anchor box-delta writeback; v120 reports `avg_cat` contributions
-  from best/additional class assignments. Multi-head trainer integration,
+  from best/additional class assignments; v121 applies mapped class multipliers
+  to box-delta normalization. Multi-head trainer integration,
   truth-threshold metric/loss aggregation, center-front-anchor decode, integrated
   losses and training-loop wiring, crop/resize and mosaic transforms,
   alternate NMS-kind implementations, training `-map` cadence, and CARPN network
