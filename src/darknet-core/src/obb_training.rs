@@ -3,14 +3,13 @@
 //! This module currently covers direction-free anchor matching, per-truth and
 //! batch/multi-head positive enumeration, per-cell and batch-cell OBB score
 //! dispatch/match selection, objectness/class/front-point channel deltas, and
-//! source-layout truth-row packing. Front-point deltas remain standalone and
-//! are not yet routed through positive-anchor writeback or a network trainer.
-//! It does not implement complete truth assignment, YOLO loss, backward
-//! propagation, or optimizer integration.
+//! source-layout truth-row packing. Ordered delta composition remains a helper,
+//! not an integrated network trainer. It does not implement complete truth
+//! assignment, full YOLO loss, backward propagation, or optimizer integration.
 
 use crate::detect::DetectionBox;
 use crate::error::{Error, Result};
-use crate::model::YoloIouLoss;
+use crate::model::{ObbYoloSpec, YoloIouLoss};
 use crate::obb_geometry::{
     BoxObb, ObbCobbLossConfig, blend_obb_score_with_qbbv_viou, box_ciou_angular_quality_score,
     box_ciou_obb_quality_score, box_cobb_obb_quality_score_with_viou,
@@ -100,6 +99,94 @@ pub struct ObbYoloPositiveObjectnessConfig {
     pub objectness_smooth: bool,
     pub class_map: Option<Vec<usize>>,
     pub class_multipliers: Option<Vec<f32>>,
+}
+
+/// Related per-head configuration built from a parsed `[obb_yolo]` spec.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObbYoloTrainingHeadConfig {
+    pub match_config: ObbYoloHeadMatchConfig,
+    pub assignment_config: ObbYoloPositiveObjectnessConfig,
+    pub box_delta_config: ObbYoloBoxDeltaConfig,
+    pub front_point_delta_config: ObbYoloFrontPointDeltaConfig,
+}
+
+/// Bind parsed OBB head options to its runtime grid and network dimensions.
+pub fn build_obb_yolo_training_head_config(
+    spec: &ObbYoloSpec,
+    head_index: usize,
+    grid_width: usize,
+    grid_height: usize,
+    net_width: usize,
+    net_height: usize,
+) -> Result<ObbYoloTrainingHeadConfig> {
+    let anchor_count = spec.num.checked_mul(2).ok_or_else(|| {
+        Error::InvalidConfig("OBB training config anchor count overflows".to_owned())
+    })?;
+    if spec.classes == 0
+        || spec.num == 0
+        || spec.mask.is_empty()
+        || spec.mask.iter().any(|&anchor| anchor >= spec.num)
+        || spec.anchors.len() < anchor_count
+        || grid_width == 0
+        || grid_height == 0
+        || net_width == 0
+        || net_height == 0
+    {
+        return Err(Error::InvalidConfig(
+            "OBB training config needs valid classes, anchors, masks, grids, and network dimensions"
+                .to_owned(),
+        ));
+    }
+    validate_anchor_front_offsets(spec.front_anchor_offsets.as_deref(), spec.num)?;
+    let anchors = spec.anchors[..anchor_count].to_vec();
+    let match_config = ObbYoloHeadMatchConfig {
+        head_index,
+        anchors: anchors.clone(),
+        mask: spec.mask.clone(),
+        grid_width,
+        grid_height,
+        classes: spec.classes,
+        net_width,
+        net_height,
+        new_coords: spec.new_coords,
+        front_anchor_offsets: spec.front_anchor_offsets.clone(),
+        score_config: ObbYoloMatchScoreConfig::default(),
+        ignore_thresh: spec.ignore_thresh,
+        truth_thresh: spec.truth_thresh,
+        objectness_normalizer: spec.obj_normalizer,
+        objectness_smooth: spec.objectness_smooth,
+    };
+    let assignment_config = ObbYoloPositiveObjectnessConfig {
+        head: ObbYoloHeadAssignmentSpec {
+            mask: spec.mask.clone(),
+            grid_width,
+            grid_height,
+        },
+        anchors,
+        classes: spec.classes,
+        net_width,
+        net_height,
+        front_anchor_offsets: spec.front_anchor_offsets.clone(),
+        iou_thresh: spec.iou_thresh,
+        objectness_normalizer: spec.obj_normalizer,
+        objectness_smooth: spec.objectness_smooth,
+        class_map: spec.class_map.clone(),
+        class_multipliers: spec.class_multipliers.clone(),
+    };
+    Ok(ObbYoloTrainingHeadConfig {
+        match_config,
+        assignment_config,
+        box_delta_config: ObbYoloBoxDeltaConfig {
+            iou_normalizer: spec.iou_normalizer,
+            max_delta: spec.max_delta,
+            ..ObbYoloBoxDeltaConfig::default()
+        },
+        front_point_delta_config: ObbYoloFrontPointDeltaConfig {
+            normalizer: spec.front_loss_normalizer,
+            max_delta: spec.max_delta,
+            iou_loss: spec.iou_loss,
+        },
+    })
 }
 
 /// One positive assignment tagged with its batch slot and OBB YOLO head.

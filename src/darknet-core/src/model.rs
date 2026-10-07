@@ -4436,6 +4436,30 @@ mod tests {
             spec.front_anchor_offsets,
             Some(vec![[0.25, -0.5], [-0.4, 0.3]])
         );
+        let training =
+            crate::obb_training::build_obb_yolo_training_head_config(spec, 7, 2, 3, 640, 480)
+                .expect("parsed spec builds matching and assignment configs");
+        assert_eq!(training.match_config.head_index, 7);
+        assert_eq!(
+            (
+                training.match_config.grid_width,
+                training.match_config.grid_height
+            ),
+            (2, 3)
+        );
+        assert_eq!(
+            training.match_config.front_anchor_offsets,
+            spec.front_anchor_offsets
+        );
+        assert_eq!(
+            training.assignment_config.front_anchor_offsets,
+            spec.front_anchor_offsets
+        );
+        assert_eq!(training.front_point_delta_config.normalizer, 0.35);
+        assert_eq!(
+            training.box_delta_config.iou_normalizer,
+            spec.iou_normalizer
+        );
 
         let direction_free =
             build("obb_anchors", "4,2,8,6").expect("two-value source anchors parse");
