@@ -2052,6 +2052,21 @@ pub fn apply_obb_yolo_batch_head_objectness_deltas(
     })
 }
 
+fn obb_match_and_box_delta_scores_compatible(
+    match_score: ObbYoloMatchScoreConfig,
+    box_delta_score: ObbYoloMatchScoreConfig,
+) -> bool {
+    if match_score == box_delta_score {
+        return true;
+    }
+    if match_score.ciou_obb || !box_delta_score.ciou_obb {
+        return false;
+    }
+    let mut matching_options_with_ciou_delta = match_score;
+    matching_options_with_ciou_delta.ciou_obb = true;
+    matching_options_with_ciou_delta == box_delta_score
+}
+
 /// Apply the source `truth_thresh` positive class and box deltas for every cell.
 ///
 /// The complete-head objectness pass must run first; this function leaves entry
@@ -2071,6 +2086,8 @@ pub fn apply_obb_yolo_batch_head_truth_threshold_deltas(
     cls_normalizer: f32,
     box_delta_config: ObbYoloBoxDeltaConfig,
 ) -> Result<usize> {
+    // Matching and regression intentionally use distinct score configs for
+    // source MSE heads with weighted covariance/COBB matching.
     if match_config.anchors != positive_config.anchors
         || match_config.mask != positive_config.head.mask
         || match_config.grid_width != positive_config.head.grid_width
@@ -2081,7 +2098,10 @@ pub fn apply_obb_yolo_batch_head_truth_threshold_deltas(
         || match_config.objectness_normalizer != positive_config.objectness_normalizer
         || match_config.objectness_smooth != positive_config.objectness_smooth
         || match_config.front_anchor_offsets != positive_config.front_anchor_offsets
-        || match_config.score_config != box_delta_config.score
+        || !obb_match_and_box_delta_scores_compatible(
+            match_config.score_config,
+            box_delta_config.score,
+        )
         || !label_smooth_eps.is_finite()
         || !cls_normalizer.is_finite()
         || !box_delta_config.iou_normalizer.is_finite()
@@ -4116,6 +4136,39 @@ mod tests {
                 * 2.5)
                 .clamp(-1.0, 1.0);
         assert!((new_coords_actual[0] - expected_x).abs() < 1e-6);
+    }
+
+    #[test]
+    fn training_score_config_allows_only_ciou_delta_override() {
+        let weighted_match = ObbYoloMatchScoreConfig {
+            covariance_normalizer: 1.0,
+            ..ObbYoloMatchScoreConfig::default()
+        };
+        let ciou_delta = ObbYoloMatchScoreConfig {
+            ciou_obb: true,
+            ..weighted_match
+        };
+        let mismatched_delta = ObbYoloMatchScoreConfig {
+            cobb_normalizer: 0.5,
+            ..ciou_delta
+        };
+
+        assert!(super::obb_match_and_box_delta_scores_compatible(
+            weighted_match,
+            ciou_delta
+        ));
+        assert!(super::obb_match_and_box_delta_scores_compatible(
+            weighted_match,
+            weighted_match
+        ));
+        assert!(!super::obb_match_and_box_delta_scores_compatible(
+            ciou_delta,
+            weighted_match
+        ));
+        assert!(!super::obb_match_and_box_delta_scores_compatible(
+            weighted_match,
+            mismatched_delta
+        ));
     }
 
     #[test]

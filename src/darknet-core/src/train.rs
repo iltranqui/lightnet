@@ -2777,7 +2777,7 @@ mod tests {
         let network = Network::from_config(
             ConfigFile::parse_str(
                 "obb-mse-cost.cfg",
-                "[net]\nwidth=2\nheight=1\nchannels=3\nobb=1\n[convolutional]\nfilters=8\nsize=1\nstride=1\nactivation=linear\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\niou_loss=mse\nobj_normalizer=2.0\n",
+                "[net]\nwidth=2\nheight=1\nchannels=3\nobb=1\n[convolutional]\nfilters=8\nsize=1\nstride=1\nactivation=linear\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\niou_loss=mse\nobj_normalizer=2.0\ncovariance_normalizer=1.0\n",
             )
             .expect("MSE OBB cfg parses"),
         )

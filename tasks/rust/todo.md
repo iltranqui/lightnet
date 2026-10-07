@@ -313,7 +313,9 @@ Immediately next, in dependency order:
   fallback; v153 adds covariance and COBB box-delta contributions independently
   when both weighted branches are active; v154 combines their matching scores by
   configured weights; v155 reports source raw `sum(delta²)` for all-MSE OBB heads;
-  v156 reports the objectness-normalized non-box delta-squared component.
+  v156 reports the objectness-normalized non-box delta-squared component; v157
+  allows distinct weighted MSE matching and CIoU-OBB regression configs through
+  batch dispatch.
   Still open: non-MSE IoU loss scalar,
   CLI/schedule and
   non-SGD optimizer/training-loop integration, remaining cfg/training
