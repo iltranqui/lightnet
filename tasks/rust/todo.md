@@ -292,8 +292,9 @@ Immediately next, in dependency order:
   composes front deltas in the one-head pass order; v133 dispatches that path
   across multiple heads; v134 reports source-normalized front-loss sums/counts
   across those passes and heads; v135 parses source `obb_anchors` pair/quadruple
-  forms and retains per-anchor direction priors. Still open: remaining cfg/training
-  option wiring, inference/network decode integration, network-loop/backprop
+  forms and retains per-anchor direction priors; v136 parses the front-loss
+  normalizer and alias/default. Still open: remaining cfg/training option wiring,
+  inference/network decode integration, network-loop/backprop
   integration, remaining metric/loss aggregation and integrated loss/training-loop
   wiring, crop/resize and mosaic transforms,
   alternate NMS-kind implementations, training `-map` cadence, and CARPN network

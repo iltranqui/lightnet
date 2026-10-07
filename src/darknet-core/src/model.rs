@@ -882,6 +882,8 @@ pub struct ObbYoloSpec {
     pub yolo: YoloSpec,
     /// Optional source `obb_anchors` (u, v) directional prior per global anchor.
     pub front_anchor_offsets: Option<Vec<[f32; 2]>>,
+    /// Source `front_loss_normalizer`, including its `front_point_normalizer` alias.
+    pub front_loss_normalizer: f32,
     pub nms_kind: ObbNmsKind,
 }
 
@@ -2244,6 +2246,9 @@ fn parse_layer_kind(
                 )));
             }
             let scale_x_y = section.get_f32("scale_x_y", 1.0)?;
+            let front_point_normalizer = section.get_f32("front_point_normalizer", 0.35)?;
+            let front_loss_normalizer =
+                section.get_f32("front_loss_normalizer", front_point_normalizer)?;
             let nms_kind = ObbNmsKind::parse(&section.get_str("nms_kind", "obb"), line)?;
             if !scale_x_y.is_finite() {
                 return Err(Error::InvalidConfig(format!(
@@ -2252,6 +2257,7 @@ fn parse_layer_kind(
             }
             LayerKind::ObbYolo(ObbYoloSpec {
                 front_anchor_offsets,
+                front_loss_normalizer,
                 yolo: YoloSpec {
                     classes,
                     num: total,
@@ -4453,6 +4459,35 @@ mod tests {
             .unwrap(),
         );
         assert!(both_keys.is_err(), "ambiguous anchor keys must fail");
+
+        let base = "[net]\nwidth=4\nheight=2\nchannels=16\nobb=1\n[obb_yolo]\nclasses=1\nnum=2\nmask=0,1\nobb_anchors=4,2,8,6\n";
+        let parse_front_normalizer = |options: &str| {
+            let cfg = format!("{base}{options}");
+            Network::from_config(ConfigFile::parse_str("obb-front-loss.cfg", &cfg).unwrap())
+                .unwrap()
+        };
+        let read_front_normalizer = |network: &Network| {
+            let LayerKind::ObbYolo(spec) = &network.layers[0].kind else {
+                panic!("expected OBB YOLO layer");
+            };
+            spec.front_loss_normalizer
+        };
+        assert_eq!(read_front_normalizer(&parse_front_normalizer("")), 0.35);
+        assert_eq!(
+            read_front_normalizer(&parse_front_normalizer("front_point_normalizer=0.8\n")),
+            0.8
+        );
+        assert_eq!(
+            read_front_normalizer(&parse_front_normalizer("front_loss_normalizer=0.6\n")),
+            0.6
+        );
+        assert_eq!(
+            read_front_normalizer(&parse_front_normalizer(
+                "front_point_normalizer=0.8\nfront_loss_normalizer=0.4\n"
+            )),
+            0.4,
+            "front_loss_normalizer takes precedence over its alias"
+        );
     }
 
     #[test]
