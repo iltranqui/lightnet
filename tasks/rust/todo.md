@@ -274,8 +274,9 @@ Immediately next, in dependency order:
   cells with ignore and positive overrides; v114 writes those deltas into entry 6
   of one head's delta tensor without altering other entries; v115 applies
   source best/additional positive-anchor objectness overrides, class mapping and
-  smooth-mode preservation. Multi-head trainer dispatch, COBB regression
-  gradients/deltas, class/box losses and training-loop integration, crop/resize and mosaic transforms,
+  smooth-mode preservation; v116 writes source class-channel deltas at those
+  positives with existing-target behavior. Multi-head integration, class metrics,
+  COBB regression gradients/deltas, box losses and training-loop wiring, crop/resize and mosaic transforms,
   alternate NMS-kind implementations, training `-map` cadence, and CARPN network
   decoding/validation integration remain open.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and

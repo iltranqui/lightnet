@@ -1476,6 +1476,122 @@ pub fn apply_obb_yolo_batch_head_positive_objectness_deltas(
     Ok(())
 }
 
+/// Apply source OBB class-channel deltas for each best/additional positive anchor.
+///
+/// The head output and delta tensors use `[batch][entry][grid-cell]` storage.
+/// Class mapping and multipliers are applied in source order; incoming target
+/// class deltas retain the helper's special positive-delta branch semantics.
+/// Objectness, geometry deltas, and accumulated training metrics are untouched.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_obb_yolo_batch_head_positive_class_deltas(
+    batch_truths: &[Vec<ObbLabel>],
+    head_output: &[f32],
+    head_delta: &mut [f32],
+    config: &ObbYoloPositiveObjectnessConfig,
+    focal_loss: bool,
+    label_smooth_eps: f32,
+    cls_normalizer: f32,
+) -> Result<()> {
+    if config.classes == 0
+        || !label_smooth_eps.is_finite()
+        || !cls_normalizer.is_finite()
+        || config.class_map.as_ref().is_some_and(|mapping| {
+            mapping.len() != config.classes
+                || mapping.iter().any(|&class_id| class_id >= config.classes)
+        })
+        || config
+            .class_multipliers
+            .as_ref()
+            .is_some_and(|multipliers| {
+                multipliers.len() != config.classes
+                    || multipliers.iter().any(|value| !value.is_finite())
+            })
+    {
+        return Err(Error::InvalidConfig(
+            "OBB positive class deltas have invalid class or normalizer settings".to_owned(),
+        ));
+    }
+    let stride = config
+        .head
+        .grid_width
+        .checked_mul(config.head.grid_height)
+        .ok_or_else(|| Error::InvalidConfig("OBB head grid size overflows".to_owned()))?;
+    let entries = config
+        .classes
+        .checked_add(7)
+        .ok_or_else(|| Error::InvalidConfig("OBB head entry count overflows".to_owned()))?;
+    let per_batch = config
+        .head
+        .mask
+        .len()
+        .checked_mul(entries)
+        .and_then(|count| count.checked_mul(stride))
+        .ok_or_else(|| Error::InvalidConfig("OBB head tensor size overflows".to_owned()))?;
+    let expected = batch_truths
+        .len()
+        .checked_mul(per_batch)
+        .ok_or_else(|| Error::InvalidConfig("OBB batch tensor size overflows".to_owned()))?;
+    if head_output.len() != expected || head_delta.len() != expected {
+        return Err(Error::InvalidConfig(format!(
+            "OBB positive-class tensor length mismatch: expected {expected}, output {}, delta {}",
+            head_output.len(),
+            head_delta.len()
+        )));
+    }
+
+    let head_specs = [config.head.clone()];
+    let positives = enumerate_obb_yolo_batch_positives(
+        batch_truths,
+        config.classes,
+        &config.anchors,
+        &head_specs,
+        config.net_width,
+        config.net_height,
+        config.iou_thresh,
+    )?;
+    let mut class_outputs = Vec::new();
+    class_outputs
+        .try_reserve_exact(config.classes)
+        .map_err(|_| Error::InvalidConfig("OBB class-output allocation failed".to_owned()))?;
+    let mut existing_deltas = Vec::new();
+    existing_deltas
+        .try_reserve_exact(config.classes)
+        .map_err(|_| Error::InvalidConfig("OBB class-delta allocation failed".to_owned()))?;
+
+    for tagged in positives {
+        let truth = &batch_truths[tagged.batch_index][tagged.positive.truth_index];
+        let class_id = config
+            .class_map
+            .as_ref()
+            .map_or(truth.class_id, |mapping| mapping[truth.class_id]);
+        let entry_base = tagged.batch_index * per_batch
+            + tagged.positive.assignment.head_anchor_index * entries * stride;
+        let cell_index = tagged.positive.assignment.cell_y * config.head.grid_width
+            + tagged.positive.assignment.cell_x;
+        class_outputs.clear();
+        existing_deltas.clear();
+        for class_index in 0..config.classes {
+            let index = entry_base + (7 + class_index) * stride + cell_index;
+            class_outputs.push(finite_or_zero(head_output[index]));
+            existing_deltas.push(head_delta[index]);
+        }
+        let result = obb_yolo_class_deltas(
+            &class_outputs,
+            &existing_deltas,
+            class_id,
+            focal_loss,
+            label_smooth_eps,
+            config.class_multipliers.as_deref(),
+            cls_normalizer,
+        )?;
+        for (class_index, &delta) in result.deltas.iter().enumerate() {
+            let index = entry_base + (7 + class_index) * stride + cell_index;
+            head_delta[index] = delta;
+        }
+    }
+    Ok(())
+}
+
 fn validate_anchor_assignment_inputs(
     anchors: &[f32],
     mask: &[usize],
@@ -1567,6 +1683,7 @@ mod tests {
         ObbYoloMatchScoreBranch, ObbYoloMatchScoreConfig, ObbYoloPositiveKind,
         ObbYoloPositiveObjectnessConfig, ObbYoloPredictionMatchContext,
         apply_obb_yolo_batch_head_objectness_deltas,
+        apply_obb_yolo_batch_head_positive_class_deltas,
         apply_obb_yolo_batch_head_positive_objectness_deltas, assign_obb_yolo_anchor,
         encode_obb_yolo_truth_batch, enumerate_obb_yolo_batch_positives,
         enumerate_obb_yolo_head_positives, match_obb_yolo_batch_cell_predictions,
@@ -2013,6 +2130,53 @@ mod tests {
         .unwrap();
         assert!((smooth_delta[6] - 4.8).abs() < 1e-6);
         assert_eq!(smooth_delta[15], 0.4);
+    }
+
+    #[test]
+    fn positive_anchor_class_delta_writeback_matches_source_and_preserves_other_entries() {
+        let config = ObbYoloPositiveObjectnessConfig {
+            head: ObbYoloHeadAssignmentSpec {
+                mask: vec![0, 1],
+                grid_width: 1,
+                grid_height: 1,
+            },
+            anchors: vec![10.0, 10.0, 20.0, 20.0],
+            classes: 2,
+            net_width: 100,
+            net_height: 100,
+            iou_thresh: 0.2,
+            objectness_normalizer: 1.0,
+            objectness_smooth: false,
+            class_map: Some(vec![1, 0]),
+            class_multipliers: Some(vec![2.0, 3.0]),
+        };
+        let mut head_output = vec![0.0; 18];
+        head_output[7] = 0.2;
+        head_output[8] = 0.3;
+        head_output[16] = 0.4;
+        head_output[17] = 0.6;
+        let mut head_delta = vec![0.0; 18];
+        head_delta[16] = 0.4;
+        head_delta[17] = 0.1;
+        apply_obb_yolo_batch_head_positive_class_deltas(
+            &[vec![truth(0.5, 0.5, 0.2, 0.2)]],
+            &head_output,
+            &mut head_delta,
+            &config,
+            false,
+            0.1,
+            0.5,
+        )
+        .unwrap();
+        assert!((head_delta[7] + 0.15).abs() < 1e-6);
+        assert!((head_delta[8] - 0.975).abs() < 1e-6);
+        assert_eq!(head_delta[16], 0.4);
+        assert!((head_delta[17] - 1.05).abs() < 1e-6);
+        for index in 0..18 {
+            if ![7, 8, 16, 17].contains(&index) {
+                assert_eq!(head_delta[index], 0.0, "delta entry {index} changed");
+            }
+        }
     }
 
     #[test]

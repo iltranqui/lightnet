@@ -68,6 +68,7 @@ pub use obb_training::{
     ObbYoloPredictionMatchContext, ObbYoloHeadAssignmentSpec,
     ObbYoloHeadMatchConfig, ObbYoloTruthBatch,
     apply_obb_yolo_batch_head_objectness_deltas,
+    apply_obb_yolo_batch_head_positive_class_deltas,
     apply_obb_yolo_batch_head_positive_objectness_deltas, assign_obb_yolo_anchor,
     encode_obb_yolo_truth_batch, enumerate_obb_yolo_batch_positives,
     enumerate_obb_yolo_head_positives,
