@@ -1,5 +1,5 @@
 //! Detector validation: one inference per validation image and VOC-style AP.
-use crate::obb_geometry::{BoxObb, box_obb_iou};
+use crate::obb_geometry::{BoxObb, box_obb_iou, box_obb_vertices, carpn_polygon_iou};
 use crate::{
     DataConfig, Detection, DetectionBox, DetectionOptions, Error, LayerKind, Network, ObbDetection,
     ObbDetectionGeometry, ObbLabel, PlanarRgbImage, Result, Tensor, YoloHeadOutput, YoloLabel,
@@ -336,10 +336,86 @@ pub fn detector_map(
     )
 }
 
+/// Rank normalized CARPN quadrilateral detections using polygon IoU.
+/// Ground-truth labels must include front points so their oriented rectangle
+/// can be reconstructed in the same coordinate space as the predicted vertices.
+pub fn carpn_detector_map(
+    samples: &[(Vec<ObbLabel>, Vec<ObbDetection>)],
+    classes: usize,
+    iou_threshold: f32,
+) -> Result<MapReport> {
+    if samples
+        .iter()
+        .flat_map(|sample| &sample.1)
+        .any(|detection| !matches!(detection.geometry, ObbDetectionGeometry::CarpnQuad(_)))
+    {
+        return Err(invalid("CARPN mAP requires four-vertex CARPN detections"));
+    }
+    if samples
+        .iter()
+        .flat_map(|sample| &sample.0)
+        .any(|label| !label.has_front)
+    {
+        return Err(invalid(
+            "CARPN mAP requires labels with front-point columns",
+        ));
+    }
+
+    detector_map_by(
+        samples,
+        classes,
+        iou_threshold,
+        |label| label.class_id,
+        |detection| detection.detection.class_id,
+        |detection| detection.detection.confidence,
+        |detection, label| {
+            let ObbDetectionGeometry::CarpnQuad(predicted_vertices) = detection.geometry else {
+                unreachable!("CARPN detections were validated above")
+            };
+            carpn_polygon_iou(predicted_vertices, carpn_truth_vertices(label))
+        },
+    )
+}
+
+/// Rebuild the CARPN truth quad using the source BoxOBB corner order. The
+/// source CARPN encoder falls back to the axis-aligned label rectangle when a
+/// front vector is degenerate or non-finite; preserve that fallback here.
+fn carpn_truth_vertices(label: &ObbLabel) -> [f32; 8] {
+    let boxobb = BoxObb {
+        bbox: DetectionBox {
+            x: label.x,
+            y: label.y,
+            w: label.w,
+            h: label.h,
+        },
+        front_x: label.front_x,
+        front_y: label.front_y,
+    };
+    if let Some(vertices) = box_obb_vertices(boxobb) {
+        return std::array::from_fn(|index| {
+            let point = vertices[index / 2];
+            point[index % 2]
+        });
+    }
+
+    let half_width = label.w * 0.5;
+    let half_height = label.h * 0.5;
+    [
+        label.x + half_width,
+        label.y - half_height,
+        label.x + half_width,
+        label.y + half_height,
+        label.x - half_width,
+        label.y + half_height,
+        label.x - half_width,
+        label.y - half_height,
+    ]
+}
+
 /// Rank normalized legacy front-point OBB detections and report classwise AP.
 /// Five-field labels have no orientation, so their ground-truth rectangle is
-/// treated as axis-aligned. CARPN polygons are rejected; they need their own
-/// ground-truth vertex encoder before mAP can be computed safely.
+/// treated as axis-aligned. CARPN polygons are rejected; use
+/// [`carpn_detector_map`] for four-vertex detections.
 pub fn obb_detector_map(
     samples: &[(Vec<ObbLabel>, Vec<ObbDetection>)],
     classes: usize,
@@ -723,6 +799,103 @@ mod tests {
         bad_truth.class_id = 1;
         assert!(obb_detector_map(&[(vec![bad_truth], vec![])], 1, 0.5).is_err());
         assert!(obb_detector_map(&[], 1, f32::NAN).is_err());
+    }
+
+    fn carpn_prediction(class_id: usize, confidence: f32, vertices: [f32; 8]) -> ObbDetection {
+        ObbDetection {
+            detection: Detection {
+                class_id,
+                confidence,
+                objectness: confidence,
+                bbox: DetectionBox {
+                    x: 0.5,
+                    y: 0.5,
+                    w: 0.6,
+                    h: 0.1,
+                },
+            },
+            geometry: ObbDetectionGeometry::CarpnQuad(vertices),
+        }
+    }
+
+    #[test]
+    fn carpn_map_matches_polygon_quads_and_reuses_report_matching_rules() {
+        let label = obb_truth(0, Some([0.5, 0.55]));
+        let vertices = carpn_truth_vertices(&label);
+        let expected_vertices = [0.2, 0.55, 0.8, 0.55, 0.8, 0.45, 0.2, 0.45];
+        for (actual, expected) in vertices.into_iter().zip(expected_vertices) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+        let degenerate = obb_truth(0, Some([0.5, 0.5]));
+        let fallback = carpn_truth_vertices(&degenerate);
+        let expected_fallback = [0.8, 0.45, 0.8, 0.55, 0.2, 0.55, 0.2, 0.45];
+        for (actual, expected) in fallback.into_iter().zip(expected_fallback) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+        let report = carpn_detector_map(
+            &[(
+                vec![label],
+                vec![
+                    carpn_prediction(0, 0.9, vertices),
+                    carpn_prediction(0, 0.8, vertices),
+                ],
+            )],
+            1,
+            0.5,
+        )
+        .expect("CARPN polygon mAP");
+        assert_eq!(report.average_precision, vec![1.0]);
+        assert_eq!(report.true_positives, vec![1]);
+        assert_eq!(report.false_positives, vec![1]);
+        assert_eq!(report.false_negatives, vec![0]);
+        assert_eq!(report.detection_counts, vec![2]);
+        assert!((report.average_iou[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn carpn_map_uses_polygon_iou_for_rotated_truths() {
+        let label = obb_truth(0, Some([0.55, 0.55]));
+        let truth_vertices = carpn_truth_vertices(&label);
+        let min_x = truth_vertices
+            .chunks_exact(2)
+            .map(|point| point[0])
+            .fold(f32::INFINITY, f32::min);
+        let max_x = truth_vertices
+            .chunks_exact(2)
+            .map(|point| point[0])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_y = truth_vertices
+            .chunks_exact(2)
+            .map(|point| point[1])
+            .fold(f32::INFINITY, f32::min);
+        let max_y = truth_vertices
+            .chunks_exact(2)
+            .map(|point| point[1])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let aabb = [min_x, min_y, max_x, min_y, max_x, max_y, min_x, max_y];
+        assert!(carpn_polygon_iou(aabb, truth_vertices) < 0.5);
+
+        let report = carpn_detector_map(
+            &[(vec![label], vec![carpn_prediction(0, 0.9, aabb)])],
+            1,
+            0.5,
+        )
+        .expect("polygon matching rejects the AABB-only overlap");
+        assert_eq!(report.average_precision, vec![0.0]);
+        assert_eq!(report.true_positives, vec![0]);
+        assert_eq!(report.false_positives, vec![1]);
+        assert_eq!(report.false_negatives, vec![1]);
+    }
+
+    #[test]
+    fn carpn_map_requires_quads_and_front_point_labels() {
+        let label = obb_truth(0, Some([0.5, 0.55]));
+        let wrong_geometry = obb_prediction(0, 0.9, [0.5, 0.55]);
+        assert!(carpn_detector_map(&[(vec![label], vec![wrong_geometry])], 1, 0.5).is_err());
+
+        let no_front = obb_truth(0, None);
+        let prediction = carpn_prediction(0, 0.9, [0.0; 8]);
+        assert!(carpn_detector_map(&[(vec![no_front], vec![prediction])], 1, 0.5).is_err());
     }
 
     #[test]

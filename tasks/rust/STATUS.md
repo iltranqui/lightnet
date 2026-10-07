@@ -34,6 +34,13 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v94: added `carpn_detector_map` for normalized CARPN quadrilateral detections
+  and front-point OBB labels. It reuses oriented polygon IoU and the shared AP
+  report/matching policy, rejects non-CARPN predictions and missing-front labels,
+  and reconstructs ground-truth vertices in the source BoxOBB order. The
+  evaluation tests passed 12/12 (including all three CARPN tests); the OBB-focused
+  suite passed 53/53. CARPN network
+  decoding/validation integration and compiled-C++ parity remain open.
 - v93: added `select_obb_yolo_cell_truth_match` for validated single-cell
   selection from precomputed source-style scores. It preserves the first best
   truth, gates ignore matching on any class output strictly above 0.25, and
