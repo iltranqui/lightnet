@@ -256,11 +256,12 @@ Immediately next, in dependency order:
   per-cell objectness deltas from the v93 match gates, including ignore smoothing
   and positive-target override; v97 adds source CIoU-OBB match-quality scoring for
   decoded geometries; v98 decodes one cell's post-YOLO channels for the source
-  CIoU/default score path. Weighted covariance/COBB scoring, class-gated batch
-  matching and positive-assignment integration, class/box losses and deltas,
-  trainer integration, crop/resize and mosaic transforms, alternate NMS-kind
-  implementations, training `-map` cadence, and CARPN network decoding/validation
-  integration remain open.
+  CIoU/default score path; v99 composes those per-truth scores with the source
+  class-gated ignore and positive-threshold selection for one cell. Weighted
+  covariance/COBB scoring, batch and positive-anchor assignment integration,
+  class/box losses and deltas, trainer integration, crop/resize and mosaic
+  transforms, alternate NMS-kind implementations, training `-map` cadence, and
+  CARPN network decoding/validation integration remain open.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and
   kernels, weights order `weights.cpp:428`); then `deform_conv`, `dsconv`,
   `graph_conv`, `wmhf`, `clifford`, `recursive_block`.

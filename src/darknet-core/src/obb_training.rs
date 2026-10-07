@@ -65,6 +65,25 @@ pub struct ObbYoloCellTruthMatch {
     pub ignore_match: bool,
 }
 
+/// Geometry shared by the per-cell prediction-match score calculation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObbYoloPredictionMatchContext {
+    /// Selected anchor dimensions in network pixels.
+    pub anchor_width: f32,
+    pub anchor_height: f32,
+    /// Cell coordinates in the head grid.
+    pub cell_x: usize,
+    pub cell_y: usize,
+    /// Head grid dimensions.
+    pub grid_width: usize,
+    pub grid_height: usize,
+    /// Network input dimensions.
+    pub net_width: usize,
+    pub net_height: usize,
+    /// Whether box width/height use `[yolo] new_coords` decoding.
+    pub new_coords: bool,
+}
+
 /// Number of float values in one source OBB YOLO truth row.
 pub const OBB_YOLO_TRUTH_SIZE: usize = 7;
 
@@ -545,6 +564,49 @@ fn finite_or_zero(value: f32) -> f32 {
     if value.is_finite() { value } else { 0.0 }
 }
 
+/// Compute one cell's source CIoU scores against truths, then apply the source
+/// best-truth, class-gated ignore, and positive-threshold selection.
+///
+/// `prediction` is the six post-YOLO box/front channels for this cell/anchor;
+/// `class_outputs` contains its class channels. Truth rows are visited in order
+/// and matching stops at the source `truth.x == 0` empty-slot sentinel. Scores
+/// are computed independently of class confidence; the selector's strict
+/// thresholds and first-on-tie rule then match the source cell loop. This is a
+/// single-cell CIoU/default-score path, not the batch trainer or weighted
+/// covariance/COBB alternatives.
+pub fn match_obb_yolo_cell_prediction(
+    prediction: [f32; 6],
+    truths: &[ObbLabel],
+    class_outputs: &[f32],
+    context: ObbYoloPredictionMatchContext,
+    ignore_thresh: f32,
+    truth_thresh: f32,
+) -> Result<ObbYoloCellTruthMatch> {
+    let mut scores = Vec::new();
+    scores
+        .try_reserve_exact(truths.len())
+        .map_err(|_| Error::InvalidConfig("OBB cell truth-score allocation failed".to_owned()))?;
+    for truth in truths {
+        if truth.x == 0.0 {
+            break;
+        }
+        scores.push(obb_yolo_ciou_prediction_match_score(
+            prediction,
+            truth,
+            context.anchor_width,
+            context.anchor_height,
+            context.cell_x,
+            context.cell_y,
+            context.grid_width,
+            context.grid_height,
+            context.net_width,
+            context.net_height,
+            context.new_coords,
+        )?);
+    }
+    select_obb_yolo_cell_truth_match(&scores, class_outputs, ignore_thresh, truth_thresh)
+}
+
 fn validate_anchor_assignment_inputs(
     anchors: &[f32],
     mask: &[usize],
@@ -632,7 +694,8 @@ fn validate_truth(truth: &ObbLabel) -> Result<()> {
 mod tests {
     use super::{
         OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloCellTruthMatch, ObbYoloPositiveKind,
-        assign_obb_yolo_anchor, encode_obb_yolo_truth_batch, enumerate_obb_yolo_head_positives,
+        ObbYoloPredictionMatchContext, assign_obb_yolo_anchor, encode_obb_yolo_truth_batch,
+        enumerate_obb_yolo_head_positives, match_obb_yolo_cell_prediction,
         obb_yolo_anchor_match_score, obb_yolo_cell_objectness_delta,
         obb_yolo_ciou_prediction_match_score, select_obb_yolo_cell_truth_match,
     };
@@ -1051,6 +1114,101 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn cell_prediction_match_scores_truths_before_applying_class_ignore_gate() {
+        let mut exact = truth(0.5, 0.5, 0.25, 0.25);
+        exact.front_x = 0.5;
+        exact.front_y = 0.75;
+        exact.has_front = true;
+        let mut distant = truth(0.1, 0.1, 0.25, 0.25);
+        distant.front_x = 0.1;
+        distant.front_y = 0.35;
+        distant.has_front = true;
+        let context = ObbYoloPredictionMatchContext {
+            anchor_width: 25.0,
+            anchor_height: 25.0,
+            cell_x: 0,
+            cell_y: 0,
+            grid_width: 1,
+            grid_height: 1,
+            net_width: 100,
+            net_height: 100,
+            new_coords: false,
+        };
+
+        let not_confident = match_obb_yolo_cell_prediction(
+            [0.5, 0.5, 0.0, 0.0, 0.5, 0.75],
+            &[distant, exact],
+            &[0.25],
+            context,
+            0.5,
+            0.9,
+        )
+        .unwrap();
+        assert_eq!(not_confident.best_truth_index, Some(1));
+        assert_eq!(not_confident.best_score, 1.0);
+        assert_eq!(not_confident.positive_truth_index, Some(1));
+        assert_eq!(not_confident.ignore_match_score, 0.0);
+        assert!(!not_confident.ignore_match);
+
+        let confident = match_obb_yolo_cell_prediction(
+            [0.5, 0.5, 0.0, 0.0, 0.5, 0.75],
+            &[distant, exact],
+            &[0.2501],
+            context,
+            0.5,
+            0.9,
+        )
+        .unwrap();
+        assert_eq!(confident.best_truth_index, Some(1));
+        assert_eq!(confident.ignore_match_score, 1.0);
+        assert!(confident.ignore_match);
+    }
+
+    #[test]
+    fn cell_prediction_match_keeps_first_ties_and_stops_at_empty_truth_sentinel() {
+        let mut exact = truth(0.5, 0.5, 0.25, 0.25);
+        exact.front_x = 0.5;
+        exact.front_y = 0.75;
+        exact.has_front = true;
+        let empty = truth(0.0, 0.5, 0.25, 0.25);
+        let context = ObbYoloPredictionMatchContext {
+            anchor_width: 25.0,
+            anchor_height: 25.0,
+            cell_x: 0,
+            cell_y: 0,
+            grid_width: 1,
+            grid_height: 1,
+            net_width: 100,
+            net_height: 100,
+            new_coords: false,
+        };
+
+        let tied = match_obb_yolo_cell_prediction(
+            [0.5, 0.5, 0.0, 0.0, 0.5, 0.75],
+            &[exact, exact],
+            &[0.3],
+            context,
+            0.5,
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(tied.best_truth_index, Some(0));
+        assert_eq!(tied.positive_truth_index, None);
+
+        let after_sentinel = match_obb_yolo_cell_prediction(
+            [0.5, 0.5, 0.0, 0.0, 0.5, 0.75],
+            &[empty, exact],
+            &[0.3],
+            context,
+            0.5,
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(after_sentinel.best_truth_index, None);
+        assert_eq!(after_sentinel.positive_truth_index, None);
     }
 
     #[test]
