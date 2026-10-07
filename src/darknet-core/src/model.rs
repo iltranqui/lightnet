@@ -2280,7 +2280,7 @@ fn parse_layer_kind(
                     max_delta: section.get_f32("max_delta", f32::MAX)?,
                     delta_normalizer: section.get_f32("delta_normalizer", 1.0)?,
                     class_multipliers: parse_class_multipliers(section, classes, max_delta)?,
-                    class_map: None,
+                    class_map: parse_class_map(section, cfg_parent)?,
                 },
                 nms_kind,
             })
@@ -4440,6 +4440,30 @@ mod tests {
             "[net]\nwidth=1\nheight=1\nchannels=9\nobb=1\n[obb_yolo]\nclasses=2\nnum=1\nanchors=1,1\ncounters_per_class=3\n",
         );
         assert!(invalid.is_err(), "counter cardinality must match classes");
+    }
+
+    #[test]
+    fn obb_yolo_parses_and_routes_class_map_files() {
+        let dir = std::env::temp_dir().join("darknet-model-obb-class-map");
+        let _ = fs::create_dir_all(&dir);
+        let map_path = dir.join("labels.map");
+        let cfg_path = dir.join("obb.cfg");
+        fs::write(&map_path, "1\n0\n").expect("map writes");
+        fs::write(
+            &cfg_path,
+            "[net]\nwidth=1\nheight=1\nchannels=9\nobb=1\n[obb_yolo]\nclasses=2\nnum=1\nanchors=1,1\nmap=labels.map\n",
+        )
+        .expect("cfg writes");
+
+        let network = Network::from_path(&cfg_path).expect("OBB map path resolves");
+        let LayerKind::ObbYolo(spec) = &network.layers[0].kind else {
+            panic!("expected OBB YOLO layer");
+        };
+        assert_eq!(spec.class_map, Some(vec![1, 0]));
+        let training =
+            crate::obb_training::build_obb_yolo_training_head_config(spec, 0, 1, 1, 1, 1)
+                .expect("parsed class map routes into training assignment");
+        assert_eq!(training.assignment_config.class_map, spec.class_map);
     }
 
     #[test]
