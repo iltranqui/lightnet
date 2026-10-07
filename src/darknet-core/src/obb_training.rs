@@ -353,6 +353,7 @@ pub enum ObbYoloMatchScoreBranch {
     CiouObb,
     Covariance,
     Cobb,
+    WeightedCovarianceCobb,
     LegacyAngular,
 }
 
@@ -1068,10 +1069,10 @@ pub fn obb_yolo_cobb_prediction_match_score_with_viou(
 /// Select and compute the source covariance/COBB/legacy-angular score for one
 /// decoded OBB YOLO cell.
 ///
-/// Source CIoU-OBB mode takes priority; otherwise covariance and COBB normalizers
-/// select their score branches before the legacy angular fallback. This composes
-/// per-cell score branches only; it does not perform multi-truth assignment or
-/// batch aggregation.
+/// Source CIoU-OBB mode takes priority; otherwise active covariance and COBB
+/// scores are combined by their configured normalizers before the legacy angular
+/// fallback. This composes per-cell score branches only; it does not perform
+/// multi-truth assignment or batch aggregation.
 pub fn obb_yolo_match_score(
     prediction: [f32; 6],
     truth: &ObbLabel,
@@ -1098,6 +1099,45 @@ pub fn obb_yolo_match_score(
     }
     let covariance_active =
         config.covariance_normalizer.is_finite() && config.covariance_normalizer > 0.0;
+    let cobb_active = config.cobb_normalizer.is_finite() && config.cobb_normalizer > 0.0;
+    if covariance_active && cobb_active {
+        let covariance_score = obb_yolo_covariance_prediction_match_score_with_viou(
+            prediction,
+            truth,
+            context,
+            config.covariance_normalizer,
+            config.covariance_front_length_ratio_k.max(0.05),
+            if config.covariance_front_length_weight.is_finite() {
+                config.covariance_front_length_weight.max(0.0)
+            } else {
+                0.0
+            },
+            config.viou_weight,
+        )?;
+        let cobb_score = obb_yolo_cobb_prediction_match_score_with_viou(
+            prediction,
+            truth,
+            context,
+            0.0,
+            config.cobb_normalizer,
+            config.cobb_loss,
+            config.viou_weight,
+        )?;
+        let covariance_weight = config.covariance_normalizer as f64;
+        let cobb_weight = config.cobb_normalizer as f64;
+        let weight_sum = covariance_weight + cobb_weight;
+        let weighted_score = (covariance_weight * covariance_score as f64
+            + cobb_weight * cobb_score as f64)
+            / weight_sum;
+        return Ok(ObbYoloMatchScore {
+            branch: ObbYoloMatchScoreBranch::WeightedCovarianceCobb,
+            score: if weighted_score.is_finite() {
+                (weighted_score as f32).clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
+        });
+    }
     if covariance_active {
         return Ok(ObbYoloMatchScore {
             branch: ObbYoloMatchScoreBranch::Covariance,
@@ -5789,7 +5829,7 @@ mod tests {
     }
 
     #[test]
-    fn match_score_dispatch_obeys_covariance_cobb_angular_priority() {
+    fn match_score_dispatch_combines_weighted_covariance_and_cobb_scores() {
         let context = ObbYoloPredictionMatchContext {
             anchor_width: 2.0,
             anchor_height: 4.0,
@@ -5834,21 +5874,46 @@ mod tests {
         );
 
         let covariance_config = ObbYoloMatchScoreConfig {
-            covariance_normalizer: 1.0,
+            covariance_normalizer: 2.0,
             cobb_normalizer: 1.0,
             viou_weight: 0.2,
             ..ObbYoloMatchScoreConfig::default()
         };
         let covariance =
             obb_yolo_match_score(prediction, &label, context, covariance_config).unwrap();
-        assert_eq!(covariance.branch, ObbYoloMatchScoreBranch::Covariance);
         assert_eq!(
-            covariance.score,
-            obb_yolo_covariance_prediction_match_score_with_viou(
-                prediction, &label, context, 1.0, 1.0, 0.35, 0.2,
-            )
-            .unwrap()
+            covariance.branch,
+            ObbYoloMatchScoreBranch::WeightedCovarianceCobb
         );
+        let covariance_component = obb_yolo_covariance_prediction_match_score_with_viou(
+            prediction, &label, context, 2.0, 1.0, 0.35, 0.2,
+        )
+        .unwrap();
+        let cobb_component = obb_yolo_cobb_prediction_match_score_with_viou(
+            prediction,
+            &label,
+            context,
+            0.0,
+            1.0,
+            crate::obb_geometry::ObbCobbLossConfig::default(),
+            0.2,
+        )
+        .unwrap();
+        assert!(
+            (covariance.score - (2.0 * covariance_component + cobb_component) / 3.0).abs() < 1e-6
+        );
+        let covariance_only = obb_yolo_match_score(
+            prediction,
+            &label,
+            context,
+            ObbYoloMatchScoreConfig {
+                cobb_normalizer: 0.0,
+                ..covariance_config
+            },
+        )
+        .unwrap();
+        assert_eq!(covariance_only.branch, ObbYoloMatchScoreBranch::Covariance);
+        assert_eq!(covariance_only.score, covariance_component);
 
         let cobb_config = ObbYoloMatchScoreConfig {
             covariance_normalizer: 0.0,

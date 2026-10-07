@@ -311,7 +311,8 @@ Immediately next, in dependency order:
   error mean/threshold counts in front-aware stats across passes and subdivisions;
   v152 separates weighted MSE matching scores from the source CIoU-OBB box-delta
   fallback; v153 adds covariance and COBB box-delta contributions independently
-  when both weighted branches are active. Still open: full loss scalar,
+  when both weighted branches are active; v154 combines their matching scores by
+  configured weights. Still open: full loss scalar,
   CLI/schedule and
   non-SGD optimizer/training-loop integration, remaining cfg/training
   option wiring,
