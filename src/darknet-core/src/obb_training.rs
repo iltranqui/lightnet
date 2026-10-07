@@ -9,8 +9,8 @@
 use crate::detect::DetectionBox;
 use crate::error::{Error, Result};
 use crate::obb_geometry::{
-    BoxObb, blend_obb_score_with_qbbv_viou, box_ciou_obb_quality_score,
-    box_covariance_w2_obb_quality_score,
+    BoxObb, blend_obb_score_with_qbbv_viou, box_ciou_angular_quality_score,
+    box_ciou_obb_quality_score, box_covariance_w2_obb_quality_score,
 };
 use crate::obb_labels::ObbLabel;
 
@@ -567,14 +567,49 @@ pub fn obb_yolo_covariance_prediction_match_score_with_viou(
     ))
 }
 
+/// Decode one source YOLO output row and score it using the source legacy
+/// angular fallback plus its optional QBBV-vIoU blend.
+///
+/// This is used when both covariance and COBB matching branches are disabled;
+/// it is distinct from `ciou_obb` scoring and uses the direct front-channel
+/// decode (not the optional center-front-anchor transform). A direction-free
+/// truth has zero angular score, but a nonzero QBBV weight can still contribute
+/// its source direction-placeholder vIoU.
+pub fn obb_yolo_angular_prediction_match_score_with_viou(
+    prediction: [f32; 6],
+    truth: &ObbLabel,
+    context: ObbYoloPredictionMatchContext,
+    viou_weight: f32,
+) -> Result<f32> {
+    validate_truth(truth)?;
+    let prediction = decode_obb_yolo_prediction(prediction, context)?;
+    let truth = BoxObb {
+        bbox: DetectionBox {
+            x: truth.x,
+            y: truth.y,
+            w: truth.w,
+            h: truth.h,
+        },
+        front_x: truth.front_x,
+        front_y: truth.front_y,
+    };
+    let score = box_ciou_angular_quality_score(prediction, truth);
+    Ok(blend_obb_score_with_qbbv_viou(
+        score,
+        prediction,
+        truth,
+        viou_weight,
+    ))
+}
+
 /// Decode one source YOLO output row and score it against a truth with the
 /// source CIoU-OBB matching metric.
 ///
 /// `prediction` is the six box/front channels from the OBB YOLO layer output:
 /// x/y have already received the source `scale_x_y` transform and, unless
 /// `new_coords`, the logistic activation; front channels remain raw linear
-/// values. Non-finite channels are zeroed as in the source forward. This covers the
-/// source CIoU branch (and its default no-weighted-branch fallback), not the
+/// values. Non-finite channels are zeroed as in the source forward. This covers
+/// the separate `ciou_obb` quality path, not the legacy angular fallback,
 /// covariance/COBB weighted score paths, class confidence gate, or batch loop.
 /// The decoded geometry and truth are normalized to network dimensions.
 #[allow(clippy::too_many_arguments)]
@@ -906,9 +941,9 @@ mod tests {
         OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloCellTruthMatch, ObbYoloPositiveKind,
         ObbYoloPredictionMatchContext, assign_obb_yolo_anchor, encode_obb_yolo_truth_batch,
         enumerate_obb_yolo_head_positives, match_obb_yolo_cell_prediction,
-        obb_yolo_anchor_match_score, obb_yolo_cell_objectness_delta,
-        obb_yolo_ciou_prediction_match_score, obb_yolo_class_deltas,
-        obb_yolo_covariance_prediction_match_score,
+        obb_yolo_anchor_match_score, obb_yolo_angular_prediction_match_score_with_viou,
+        obb_yolo_cell_objectness_delta, obb_yolo_ciou_prediction_match_score,
+        obb_yolo_class_deltas, obb_yolo_covariance_prediction_match_score,
         obb_yolo_covariance_prediction_match_score_with_viou, select_obb_yolo_cell_truth_match,
     };
     use crate::obb_labels::ObbLabel;
@@ -1281,6 +1316,81 @@ mod tests {
             0.35,
         )
         .is_err());
+    }
+
+    #[test]
+    fn angular_prediction_match_decodes_and_blends_with_qbbv_viou() {
+        let context = ObbYoloPredictionMatchContext {
+            anchor_width: 2.0,
+            anchor_height: 4.0,
+            cell_x: 0,
+            cell_y: 0,
+            grid_width: 1,
+            grid_height: 1,
+            net_width: 1,
+            net_height: 1,
+            new_coords: false,
+        };
+        let mut label = truth(0.5, 0.5, 2.0, 4.0);
+        label.front_x = 0.5;
+        label.front_y = 4.5;
+        label.has_front = true;
+        let prediction = [0.5, 0.5, 0.0, 0.0, 4.5, 0.5];
+        let score =
+            obb_yolo_angular_prediction_match_score_with_viou(prediction, &label, context, 0.35)
+                .unwrap();
+
+        let prediction_geometry = crate::obb_geometry::BoxObb {
+            bbox: crate::detect::DetectionBox {
+                x: 0.5,
+                y: 0.5,
+                w: 2.0,
+                h: 4.0,
+            },
+            front_x: 4.5,
+            front_y: 0.5,
+        };
+        let truth_geometry = crate::obb_geometry::BoxObb {
+            bbox: prediction_geometry.bbox,
+            front_x: 0.5,
+            front_y: 4.5,
+        };
+        let base_score = crate::obb_geometry::box_ciou_angular_quality_score(
+            prediction_geometry,
+            truth_geometry,
+        );
+        assert!(base_score < 1.0);
+        assert_eq!(
+            score,
+            crate::obb_geometry::blend_obb_score_with_qbbv_viou(
+                base_score,
+                prediction_geometry,
+                truth_geometry,
+                0.35,
+            )
+        );
+
+        let direction_free = truth(0.5, 0.5, 2.0, 4.0);
+        assert_eq!(
+            obb_yolo_angular_prediction_match_score_with_viou(
+                [0.5, 0.5, 0.0, 0.0, 4.5, 0.5],
+                &direction_free,
+                context,
+                0.0,
+            )
+            .unwrap(),
+            0.0
+        );
+        assert_eq!(
+            obb_yolo_angular_prediction_match_score_with_viou(
+                [0.5, 0.5, 0.0, 0.0, 4.5, 0.5],
+                &direction_free,
+                context,
+                1.0,
+            )
+            .unwrap(),
+            1.0
+        );
     }
 
     #[test]

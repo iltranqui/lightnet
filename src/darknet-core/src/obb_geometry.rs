@@ -1,7 +1,7 @@
 //! Source-derived oriented bounding-box geometry for the legacy front-point OBB contract.
 //!
-//! This module provides geometry for OBB decoding/evaluation, source CIoU and
-//! covariance-W2 match-quality scores, and CARPN's explicit four-vertex polygon
+//! This module provides geometry for OBB decoding/evaluation, source angular,
+//! CIoU, covariance-W2 and QBBV matching scores, and CARPN's explicit polygon
 //! contract. It does not implement a detector layer, rotated-label loading,
 //! complete training losses, or NMS dispatch.
 
@@ -414,6 +414,72 @@ pub fn box_covariance_w2_obb_quality_score(
     }
 }
 
+/// Source legacy angular-OBB matching score for decoded geometry.
+///
+/// This is axis-aligned `box_iou` times the cosine half-angle of the front
+/// directions, unlike the separate CIoU-OBB quality above. An absent/invalid
+/// front direction gives zero angular score.
+pub fn box_ciou_angular_quality_score(pred: BoxObb, truth: BoxObb) -> f32 {
+    let pred_dx = pred.front_x - pred.bbox.x;
+    let pred_dy = pred.front_y - pred.bbox.y;
+    let truth_dx = truth.front_x - truth.bbox.x;
+    let truth_dy = truth.front_y - truth.bbox.y;
+    let pred_length_squared = pred_dx * pred_dx + pred_dy * pred_dy;
+    let truth_length_squared = truth_dx * truth_dx + truth_dy * truth_dy;
+    if !pred_length_squared.is_finite()
+        || !truth_length_squared.is_finite()
+        || pred_length_squared < FRONT_MIN_LENGTH * FRONT_MIN_LENGTH
+        || truth_length_squared < FRONT_MIN_LENGTH * FRONT_MIN_LENGTH
+    {
+        return 0.0;
+    }
+
+    let pred_bbox = pred.bbox;
+    let truth_bbox = truth.bbox;
+    if ![
+        pred_bbox.x,
+        pred_bbox.y,
+        pred_bbox.w,
+        pred_bbox.h,
+        truth_bbox.x,
+        truth_bbox.y,
+        truth_bbox.w,
+        truth_bbox.h,
+    ]
+    .into_iter()
+    .all(f32::is_finite)
+        || pred_bbox.w <= 0.0
+        || pred_bbox.h <= 0.0
+        || truth_bbox.w <= 0.0
+        || truth_bbox.h <= 0.0
+    {
+        return 0.0;
+    }
+
+    let left = (pred_bbox.x - pred_bbox.w * 0.5).max(truth_bbox.x - truth_bbox.w * 0.5);
+    let right = (pred_bbox.x + pred_bbox.w * 0.5).min(truth_bbox.x + truth_bbox.w * 0.5);
+    let top = (pred_bbox.y - pred_bbox.h * 0.5).max(truth_bbox.y - truth_bbox.h * 0.5);
+    let bottom = (pred_bbox.y + pred_bbox.h * 0.5).min(truth_bbox.y + truth_bbox.h * 0.5);
+    let intersection_width = right - left;
+    let intersection_height = bottom - top;
+    if intersection_width <= 0.0 || intersection_height <= 0.0 {
+        return 0.0;
+    }
+    let intersection = intersection_width * intersection_height;
+    let union = pred_bbox.w * pred_bbox.h + truth_bbox.w * truth_bbox.h - intersection;
+    if !intersection.is_finite() || !union.is_finite() || union <= 0.0 {
+        return 0.0;
+    }
+
+    let pred_length = pred_length_squared.sqrt();
+    let truth_length = truth_length_squared.sqrt();
+    let cosine =
+        ((pred_dx * truth_dx + pred_dy * truth_dy) / (pred_length * truth_length)).clamp(-1.0, 1.0);
+    let cosine_half_angle = (0.5 * (cosine + 1.0)).max(0.0).sqrt();
+    let score = (intersection / union) * cosine_half_angle;
+    finite_or(score, 0.0).clamp(0.0, 1.0)
+}
+
 /// Source CIoU-OBB matching quality for two decoded front-point rectangles.
 ///
 /// This is the score returned by `box_ciou_obb_loss_terms`: rotated IoU minus
@@ -683,6 +749,29 @@ mod tests {
             ),
             0.25,
             1e-6,
+        );
+    }
+
+    #[test]
+    fn ciou_angular_quality_score_uses_axis_iou_and_front_half_angle() {
+        let vertical = rect([0.5, 0.5], 0.2, 0.4, [0.5, 0.7]);
+        assert_eq!(box_ciou_angular_quality_score(vertical, vertical), 1.0);
+
+        let horizontal = rect([0.5, 0.5], 0.2, 0.4, [0.7, 0.5]);
+        close(
+            box_ciou_angular_quality_score(horizontal, vertical),
+            std::f32::consts::FRAC_1_SQRT_2,
+            1e-6,
+        );
+        let opposite = rect([0.5, 0.5], 0.2, 0.4, [0.5, 0.3]);
+        assert_eq!(box_ciou_angular_quality_score(opposite, vertical), 0.0);
+
+        let disjoint = rect([0.9, 0.9], 0.2, 0.4, [0.9, 1.1]);
+        assert_eq!(box_ciou_angular_quality_score(disjoint, vertical), 0.0);
+        let direction_free = rect([0.5, 0.5], 0.2, 0.4, [0.5, 0.5]);
+        assert_eq!(
+            box_ciou_angular_quality_score(direction_free, vertical),
+            0.0
         );
     }
 

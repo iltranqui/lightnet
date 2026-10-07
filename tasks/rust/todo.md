@@ -262,8 +262,9 @@ Immediately next, in dependency order:
   covariance-W2 loss terms and an `exp(-loss)` match quality for decoded OBB
   geometry; v102 adds a raw-channel covariance-branch match score for one cell;
   v103 adds the source QBBV heatmap and sampled vIoU metric; v104 adds the
-  source QBBV blend and covariance-branch integration. Multi-branch weighted
-  aggregation and blending across remaining score branches, COBB scoring and decode,
+  source QBBV blend and covariance-branch integration; v105 adds the source
+  legacy angular fallback scorer and one-cell decode/blend. Multi-branch weighted
+  aggregation and QBBV/COBB scoring integration, COBB loss/decode,
   batch and positive-anchor assignment integration, complete class/box
   losses and deltas, trainer integration, crop/resize and mosaic transforms,
   alternate NMS-kind implementations, training `-map` cadence, and CARPN network
