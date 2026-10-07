@@ -273,6 +273,24 @@ pub struct ObbCovarianceW2LossTerms {
     pub front_length: f32,
 }
 
+/// Source analytic covariance-W2 gradients with respect to raw size channels.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ObbCovarianceW2LossGradient {
+    pub dx: f32,
+    pub dy: f32,
+    pub d_raw_w: f32,
+    pub d_raw_h: f32,
+    pub dfx: f32,
+    pub dfy: f32,
+}
+
+/// Covariance-W2 loss terms and analytic gradients for one decoded OBB.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ObbCovarianceW2LossOutput {
+    pub terms: ObbCovarianceW2LossTerms,
+    pub gradient: ObbCovarianceW2LossGradient,
+}
+
 fn valid_covariance_w2_inputs(
     pred: BoxObb,
     truth: BoxObb,
@@ -388,6 +406,167 @@ pub fn box_covariance_w2_obb_loss_terms(
         center: sanitize(center),
         covariance: sanitize(covariance_loss),
         front_length: sanitize(front_length),
+    }
+}
+
+/// Source analytic covariance-W2 loss and gradients for raw YOLO box channels.
+///
+/// `raw_w` and `raw_h` use softplus decoding, matching
+/// `obb_covariance::forward_backward`. The returned size gradients are with
+/// respect to those raw values; coordinate and front gradients are decoded
+/// geometry derivatives. Source-default epsilons and direction weight are used.
+pub fn box_covariance_w2_obb_loss_and_gradient(
+    x: f32,
+    y: f32,
+    raw_w: f32,
+    raw_h: f32,
+    front_x: f32,
+    front_y: f32,
+    truth: BoxObb,
+    front_length_ratio_k: f32,
+    front_length_weight: f32,
+) -> ObbCovarianceW2LossOutput {
+    const EPS_NORM: f32 = 1e-6;
+    const EPS_SPD: f32 = 1e-6;
+    const EPS_SIZE: f32 = 1e-6;
+    const EPS_SMOOTH_MAX: f32 = 1e-6;
+
+    let invalid = ObbCovarianceW2LossOutput::default();
+    if !valid_covariance_w2_inputs(
+        BoxObb {
+            bbox: DetectionBox {
+                x,
+                y,
+                w: 1.0,
+                h: 1.0,
+            },
+            front_x,
+            front_y,
+        },
+        truth,
+        front_length_ratio_k,
+        front_length_weight,
+    ) || !raw_w.is_finite()
+        || !raw_h.is_finite()
+    {
+        return invalid;
+    }
+
+    let ratio_k = front_length_ratio_k.max(0.05);
+    let length_weight = front_length_weight.max(0.0);
+    let softplus = |value: f32| (-value.abs()).exp().ln_1p() + value.max(0.0);
+    let sigmoid = |value: f32| {
+        if value >= 0.0 {
+            1.0 / (1.0 + (-value).exp())
+        } else {
+            let exp = value.exp();
+            exp / (1.0 + exp)
+        }
+    };
+    let width = softplus(raw_w) + EPS_SIZE;
+    let height = softplus(raw_h) + EPS_SIZE;
+    let truth_width = truth.bbox.w.abs() + EPS_SIZE;
+    let truth_height = truth.bbox.h.abs() + EPS_SIZE;
+
+    let dx_front = front_x - x;
+    let dy_front = front_y - y;
+    let norm_front = (dx_front * dx_front + dy_front * dy_front + EPS_NORM).sqrt();
+    let ux = dx_front / norm_front;
+    let uy = dy_front / norm_front;
+    let truth_dx = truth.front_x - truth.bbox.x;
+    let truth_dy = truth.front_y - truth.bbox.y;
+    let truth_norm = (truth_dx * truth_dx + truth_dy * truth_dy + EPS_NORM).sqrt();
+    let truth_ux = truth_dx / truth_norm;
+    let truth_uy = truth_dy / truth_norm;
+
+    let covariance = |w: f32, h: f32, ux: f32, uy: f32| {
+        let a = 0.25 * w * w;
+        let b = 0.25 * h * h;
+        (
+            [
+                a * ux * ux + b * uy * uy,
+                (a - b) * ux * uy,
+                a * uy * uy + b * ux * ux,
+            ],
+            a,
+            b,
+        )
+    };
+    let (pred_cov, a, b) = covariance(width, height, ux, uy);
+    let (truth_cov, _, _) = covariance(truth_width, truth_height, truth_ux, truth_uy);
+    let determinant = |cov: [f32; 3]| cov[0] * cov[2] - cov[1] * cov[1];
+    let trace_pred = pred_cov[0] + pred_cov[2];
+    let trace_truth = truth_cov[0] + truth_cov[2];
+    let trace_product =
+        pred_cov[0] * truth_cov[0] + 2.0 * pred_cov[1] * truth_cov[1] + pred_cov[2] * truth_cov[2];
+    let q = (determinant(pred_cov) * determinant(truth_cov) + EPS_SPD).sqrt();
+    let s = (trace_product + 2.0 * q + EPS_SPD).sqrt();
+    let covariance_loss = trace_pred + trace_truth - 2.0 * s;
+
+    let center_dx = x - truth.bbox.x;
+    let center_dy = y - truth.bbox.y;
+    let center = center_dx * center_dx + center_dy * center_dy;
+
+    let inv_s = 1.0 / s;
+    let det_coeff = determinant(truth_cov) / q;
+    let p00 = truth_cov[0] + det_coeff * pred_cov[2];
+    let p01 = truth_cov[1] - det_coeff * pred_cov[1];
+    let p11 = truth_cov[2] + det_coeff * pred_cov[0];
+    let g00 = 1.0 - p00 * inv_s;
+    let g01 = -p01 * inv_s;
+    let g11 = 1.0 - p11 * inv_s;
+    let d_cov_da = g00 * ux * ux + 2.0 * g01 * ux * uy + g11 * uy * uy;
+    let d_cov_db = g00 * uy * uy - 2.0 * g01 * ux * uy + g11 * ux * ux;
+    let d_cov_dux = 2.0 * a * ux * g00 + 2.0 * (a - b) * uy * g01 + 2.0 * b * ux * g11;
+    let d_cov_duy = 2.0 * b * uy * g00 + 2.0 * (a - b) * ux * g01 + 2.0 * a * uy * g11;
+
+    let mut d_total_dw = d_cov_da * (0.5 * width);
+    let mut d_total_dh = d_cov_db * (0.5 * height);
+    let inv_norm = 1.0 / norm_front;
+    let inv_norm3 = inv_norm * inv_norm * inv_norm;
+    let dot_du = dx_front * d_cov_dux + dy_front * d_cov_duy;
+    let d_cov_ddx = d_cov_dux * inv_norm - dx_front * dot_du * inv_norm3;
+    let d_cov_ddy = d_cov_duy * inv_norm - dy_front * dot_du * inv_norm3;
+    let mut grad_x = 2.0 * center_dx - d_cov_ddx;
+    let mut grad_y = 2.0 * center_dy - d_cov_ddy;
+    let mut grad_fx = d_cov_ddx;
+    let mut grad_fy = d_cov_ddy;
+
+    let diff_wh = width - height;
+    let smooth_wh = (diff_wh * diff_wh + EPS_SMOOTH_MAX).sqrt();
+    let max_wh = 0.5 * (width + height + smooth_wh);
+    let dmax_dw = 0.5 * (1.0 + diff_wh / smooth_wh);
+    let dmax_dh = 0.5 * (1.0 - diff_wh / smooth_wh);
+    let length_residual = norm_front - ratio_k * max_wh;
+    let front_length = length_residual * length_residual;
+    let length_grad_scale = length_weight * 2.0 * length_residual;
+    let dlen_dnorm = length_grad_scale;
+    let dlen_dmax = -ratio_k * length_grad_scale;
+    d_total_dw += dlen_dmax * dmax_dw;
+    d_total_dh += dlen_dmax * dmax_dh;
+    let dlen_ddx = dlen_dnorm * dx_front * inv_norm;
+    let dlen_ddy = dlen_dnorm * dy_front * inv_norm;
+    grad_fx += dlen_ddx;
+    grad_fy += dlen_ddy;
+    grad_x -= dlen_ddx;
+    grad_y -= dlen_ddy;
+
+    let sanitize = |value: f32| finite_or(value, 0.0);
+    ObbCovarianceW2LossOutput {
+        terms: ObbCovarianceW2LossTerms {
+            total: sanitize(center + covariance_loss + length_weight * front_length),
+            center: sanitize(center),
+            covariance: sanitize(covariance_loss),
+            front_length: sanitize(front_length),
+        },
+        gradient: ObbCovarianceW2LossGradient {
+            dx: sanitize(grad_x),
+            dy: sanitize(grad_y),
+            d_raw_w: sanitize(d_total_dw * sigmoid(raw_w)),
+            d_raw_h: sanitize(d_total_dh * sigmoid(raw_h)),
+            dfx: sanitize(grad_fx),
+            dfy: sanitize(grad_fy),
+        },
     }
 }
 
@@ -1329,6 +1508,52 @@ mod tests {
         let front_terms = box_covariance_w2_obb_loss_terms(short_front, identical, 0.05, 0.5);
         close(front_terms.front_length, 0.01, 2e-5);
         close(front_terms.total, front_terms.covariance + 0.005, 2e-5);
+    }
+
+    #[test]
+    fn covariance_w2_analytic_gradients_match_finite_differences() {
+        let truth = rect([0.2, 0.35], 0.2, 0.13, [0.31, 0.39]);
+        let params = [0.42, 0.52, 0.08, -0.23, 0.51, 0.68];
+        let evaluate = |p: [f32; 6]| {
+            box_covariance_w2_obb_loss_and_gradient(
+                p[0], p[1], p[2], p[3], p[4], p[5], truth, 0.8, 0.35,
+            )
+            .terms
+            .total
+        };
+        let output = box_covariance_w2_obb_loss_and_gradient(
+            params[0], params[1], params[2], params[3], params[4], params[5], truth, 0.8, 0.35,
+        );
+        let gradient = [
+            output.gradient.dx,
+            output.gradient.dy,
+            output.gradient.d_raw_w,
+            output.gradient.d_raw_h,
+            output.gradient.dfx,
+            output.gradient.dfy,
+        ];
+        for index in 0..6 {
+            let epsilon = 1e-3 * (params[index].abs() + 1.0);
+            let mut plus = params;
+            let mut minus = params;
+            plus[index] += epsilon;
+            minus[index] -= epsilon;
+            let numeric = (evaluate(plus) - evaluate(minus)) / (2.0 * epsilon);
+            close(gradient[index], numeric, 2e-3);
+        }
+
+        let softplus = |value: f32| (-value.abs()).exp().ln_1p() + value.max(0.0);
+        let decoded = rect(
+            [params[0], params[1]],
+            softplus(params[2]) + 1e-6,
+            softplus(params[3]) + 1e-6,
+            [params[4], params[5]],
+        );
+        let terms = box_covariance_w2_obb_loss_terms(decoded, truth, 0.8, 0.35);
+        close(output.terms.total, terms.total, 2e-5);
+        close(output.terms.center, terms.center, 2e-5);
+        close(output.terms.covariance, terms.covariance, 2e-5);
+        close(output.terms.front_length, terms.front_length, 2e-5);
     }
 
     #[test]

@@ -276,9 +276,10 @@ Immediately next, in dependency order:
   source best/additional positive-anchor objectness overrides, class mapping and
   smooth-mode preservation; v116 writes source class-channel deltas at those
   positives with existing-target behavior; v117 adds source finite-difference
-  COBB/legacy box deltas and positive-anchor writeback. Multi-head trainer
-  integration, class metrics/loss aggregation, covariance analytic gradients,
-  integrated box losses/training-loop wiring, crop/resize and mosaic transforms,
+  COBB/legacy box deltas and positive-anchor writeback; v118 ports source
+  covariance-W2 analytic geometry gradients. Multi-head trainer integration,
+  class metrics/loss aggregation, covariance box-delta writeback, integrated
+  losses/training-loop wiring, crop/resize and mosaic transforms,
   alternate NMS-kind implementations, training `-map` cadence, and CARPN network
   decoding/validation integration remain open.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and
