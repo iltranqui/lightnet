@@ -4504,7 +4504,7 @@ mod tests {
     #[test]
     fn obb_yolo_routes_covariance_cobb_and_viou_options() {
         let network = build(
-            "[net]\nwidth=1\nheight=1\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\niou_loss=mse\ncovariance_normalizer=1.3\ncobb_normalizer=0.4\nobb_length_ratio_k=1.4\nobb_viou_weight=1.5\ncobb_box_weight=1.2\ncobb_r_weight=0.8\ncobb_s_weight=1.4\ncobb_iou_lambda=2.2\n",
+            "[net]\nwidth=1\nheight=1\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\niou_loss=mse\nfront_loss_normalizer=0.7\ncovariance_normalizer=1.3\ncobb_normalizer=0.4\nobb_length_ratio_k=1.4\nobb_viou_weight=1.5\ncobb_box_weight=1.2\ncobb_r_weight=0.8\ncobb_s_weight=1.4\ncobb_iou_lambda=2.2\n",
         )
         .expect("OBB score options parse");
         let LayerKind::ObbYolo(spec) = &network.layers[0].kind else {
@@ -4522,6 +4522,13 @@ mod tests {
             1.3
         );
         assert!(!training.match_config.score_config.ciou_obb);
+        assert_eq!(
+            training
+                .match_config
+                .score_config
+                .covariance_front_length_weight,
+            0.7
+        );
         assert_eq!(training.match_config.score_config.cobb_normalizer, 0.4);
         assert_eq!(
             training

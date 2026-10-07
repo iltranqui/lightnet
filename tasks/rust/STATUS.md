@@ -34,6 +34,7 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v147: the parsed OBB `front_loss_normalizer` now feeds covariance matching-score length weighting instead of a hard-coded 0.35. The focused adapter test and all 113 OBB-filtered host tests passed.
 - v146: `[obb_yolo] iou_loss` now parses CIoU-OBB/CIoU-OBB-mul and standard IoU names; per-head config selects the CIoU-OBB match branch when requested or when covariance/COBB weighting is absent. Unsupported names fail. The focused tests and all 113 OBB-filtered host tests passed; this is score-path coverage, not full loss parity.
 - v145: parsed covariance/COBB normalizers, covariance length ratio, COBB weights, and clamped QBBV vIoU weight now populate both matching and box-delta score configs. The focused parser/adapter test and all 112 OBB-filtered host tests passed.
 - v144: `[obb_yolo] map=` now resolves relative class-map files and routes parsed IDs into the existing assignment config, matching the OBB source loader path. The focused parser/adapter test and all 111 OBB-filtered host tests passed.

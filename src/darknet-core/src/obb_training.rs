@@ -147,7 +147,7 @@ pub fn build_obb_yolo_training_head_config(
         covariance_normalizer: spec.covariance_normalizer,
         cobb_normalizer: spec.cobb_normalizer,
         covariance_front_length_ratio_k: spec.obb_length_ratio_k,
-        covariance_front_length_weight: 0.35,
+        covariance_front_length_weight: spec.front_loss_normalizer,
         cobb_loss: ObbCobbLossConfig {
             box_weight: spec.cobb_box_weight,
             ratio_weight: spec.cobb_r_weight,
