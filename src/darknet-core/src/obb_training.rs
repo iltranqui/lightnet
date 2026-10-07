@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::obb_geometry::{
     BoxObb, ObbCobbLossConfig, blend_obb_score_with_qbbv_viou, box_ciou_angular_quality_score,
     box_ciou_obb_quality_score, box_cobb_obb_quality_score_with_viou,
-    box_covariance_w2_obb_quality_score,
+    box_covariance_w2_obb_loss_and_gradient, box_covariance_w2_obb_quality_score,
 };
 use crate::obb_labels::ObbLabel;
 
@@ -956,12 +956,12 @@ pub fn obb_yolo_ciou_prediction_match_score(
 
 /// Compute source finite-difference box-channel deltas for one OBB positive.
 ///
-/// This covers COBB and the legacy angular score branch, including source
-/// `iou_normalizer`, COBB scaling, sigmoid-chain factors, accumulation, and
-/// clipping. The covariance branch uses an analytic gradient and is rejected;
-/// front-channel gradients are intentionally separate. Direct front-channel
-/// decoding is used, without source `center_front_anchor` correction. Inputs use
-/// the same post-YOLO channel representation as [`obb_yolo_match_score`].
+/// This covers the source covariance analytic-gradient branch and the COBB or
+/// legacy-angular finite-difference branch, including normalizer scaling,
+/// sigmoid-chain factors, accumulation, and clipping. Front-channel gradients
+/// are intentionally separate. Direct front-channel decoding is used, without
+/// source `center_front_anchor` correction. Inputs use the same post-YOLO
+/// channel representation as [`obb_yolo_match_score`].
 pub fn obb_yolo_box_regression_deltas(
     prediction: [f32; 6],
     existing_deltas: [f32; 4],
@@ -972,25 +972,104 @@ pub fn obb_yolo_box_regression_deltas(
     validate_truth(truth)?;
     let covariance_active =
         config.score.covariance_normalizer.is_finite() && config.score.covariance_normalizer > 0.0;
-    if covariance_active
-        || !config.iou_normalizer.is_finite()
+    if !config.iou_normalizer.is_finite()
         || !config.max_delta.is_finite()
         || config.max_delta < 0.0
         || existing_deltas.iter().any(|delta| !delta.is_finite())
     {
         return Err(Error::InvalidConfig(
-            "OBB finite-difference deltas require a non-covariance branch and finite settings"
-                .to_owned(),
+            "OBB box deltas require finite normalizers, clipping, and existing deltas".to_owned(),
         ));
     }
 
-    let evaluate = |channels: [f32; 6]| -> Result<f32> {
-        Ok(obb_yolo_match_score(channels, truth, context, config.score)?.score)
-    };
     let mut deltas = if config.accumulate {
         existing_deltas
     } else {
         [0.0; 4]
+    };
+    let clip = if config.max_delta == f32::MAX {
+        1.0
+    } else {
+        config.max_delta
+    };
+    if covariance_active {
+        let decoded = decode_obb_yolo_prediction(prediction, context)?;
+        let cov_w = (decoded.bbox.w - 1e-6).max(1e-6);
+        let cov_h = (decoded.bbox.h - 1e-6).max(1e-6);
+        let inverse_softplus = |value: f32| {
+            if value > 20.0 {
+                value
+            } else {
+                value.exp_m1().ln()
+            }
+        };
+        let cov = box_covariance_w2_obb_loss_and_gradient(
+            decoded.bbox.x,
+            decoded.bbox.y,
+            inverse_softplus(cov_w),
+            inverse_softplus(cov_h),
+            decoded.front_x,
+            decoded.front_y,
+            BoxObb {
+                bbox: DetectionBox {
+                    x: truth.x,
+                    y: truth.y,
+                    w: truth.w,
+                    h: truth.h,
+                },
+                front_x: truth.front_x,
+                front_y: truth.front_y,
+            },
+            config.score.covariance_front_length_ratio_k.max(0.05),
+            if config.score.covariance_front_length_weight.is_finite() {
+                config.score.covariance_front_length_weight.max(0.0)
+            } else {
+                0.0
+            },
+        );
+        let softplus_grad = |value: f32| (-(-value).exp_m1()).max(1e-6);
+        let d_loss_dw = cov.gradient.d_raw_w / softplus_grad(cov_w);
+        let d_loss_dh = cov.gradient.d_raw_h / softplus_grad(cov_h);
+        let d_pred_w_d_tw = if context.new_coords {
+            8.0 * prediction[2] * context.anchor_width / context.net_width as f32
+        } else {
+            decoded.bbox.w
+        };
+        let d_pred_h_d_th = if context.new_coords {
+            8.0 * prediction[3] * context.anchor_height / context.net_height as f32
+        } else {
+            decoded.bbox.h
+        };
+        let d_loss_dtx = cov.gradient.dx / context.grid_width as f32;
+        let d_loss_dty = cov.gradient.dy / context.grid_height as f32;
+        let sigmoid_deriv_x = if context.new_coords {
+            1.0
+        } else {
+            prediction[0] * (1.0 - prediction[0])
+        };
+        let sigmoid_deriv_y = if context.new_coords {
+            1.0
+        } else {
+            prediction[1] * (1.0 - prediction[1])
+        };
+        let scale = config.iou_normalizer * config.score.covariance_normalizer.max(0.0);
+        let mut updates = [
+            -d_loss_dtx * sigmoid_deriv_x * scale,
+            -d_loss_dty * sigmoid_deriv_y * scale,
+            -d_loss_dw * d_pred_w_d_tw * scale,
+            -d_loss_dh * d_pred_h_d_th * scale,
+        ];
+        for (index, update) in updates.iter_mut().enumerate() {
+            if !update.is_finite() {
+                *update = 0.0;
+            }
+            deltas[index] += update.clamp(-clip, clip);
+        }
+        return Ok(deltas);
+    }
+
+    let evaluate = |channels: [f32; 6]| -> Result<f32> {
+        Ok(obb_yolo_match_score(channels, truth, context, config.score)?.score)
     };
     let scale = config.iou_normalizer
         * if config.score.cobb_normalizer.is_finite() && config.score.cobb_normalizer > 0.0 {
@@ -998,11 +1077,6 @@ pub fn obb_yolo_box_regression_deltas(
         } else {
             1.0
         };
-    let clip = if config.max_delta == f32::MAX {
-        1.0
-    } else {
-        config.max_delta
-    };
     for channel in 0..4 {
         let base = prediction[channel];
         if !base.is_finite() {
@@ -1695,8 +1769,8 @@ pub fn apply_obb_yolo_batch_head_positive_class_deltas(
 ///
 /// Best-anchor and threshold-selected additional positives are processed in
 /// truth order. Only coordinate entries 0..4 are changed; front/objectness/class
-/// deltas are preserved. This routes COBB or legacy angular gradients and does
-/// not implement the covariance branch's analytic gradient or the source
+/// deltas are preserved. This routes covariance analytic gradients or COBB/
+/// legacy angular finite differences, but does not implement the source
 /// `center_front_anchor` decode correction.
 pub fn apply_obb_yolo_batch_head_positive_box_deltas(
     batch_truths: &[Vec<ObbLabel>],
@@ -1706,16 +1780,14 @@ pub fn apply_obb_yolo_batch_head_positive_box_deltas(
     new_coords: bool,
     delta_config: ObbYoloBoxDeltaConfig,
 ) -> Result<usize> {
-    let covariance_active = delta_config.score.covariance_normalizer.is_finite()
-        && delta_config.score.covariance_normalizer > 0.0;
-    if covariance_active
-        || !delta_config.iou_normalizer.is_finite()
+    if !delta_config.iou_normalizer.is_finite()
         || !delta_config.max_delta.is_finite()
         || delta_config.max_delta < 0.0
         || head_delta.iter().any(|value| !value.is_finite())
     {
         return Err(Error::InvalidConfig(
-            "OBB batch box deltas require a non-covariance branch and finite settings".to_owned(),
+            "OBB batch box deltas require finite normalizers, clipping, and existing deltas"
+                .to_owned(),
         ));
     }
     let stride = assignment
@@ -1890,13 +1962,14 @@ mod tests {
         apply_obb_yolo_batch_head_objectness_deltas, apply_obb_yolo_batch_head_positive_box_deltas,
         apply_obb_yolo_batch_head_positive_class_deltas,
         apply_obb_yolo_batch_head_positive_objectness_deltas, assign_obb_yolo_anchor,
-        encode_obb_yolo_truth_batch, enumerate_obb_yolo_batch_positives,
-        enumerate_obb_yolo_head_positives, match_obb_yolo_batch_cell_predictions,
-        match_obb_yolo_cell_prediction, match_obb_yolo_cell_prediction_with_score_config,
-        obb_yolo_anchor_match_score, obb_yolo_angular_prediction_match_score_with_viou,
-        obb_yolo_box_regression_deltas, obb_yolo_cell_objectness_delta,
-        obb_yolo_ciou_prediction_match_score, obb_yolo_class_deltas,
-        obb_yolo_cobb_prediction_match_score_with_viou, obb_yolo_covariance_prediction_match_score,
+        decode_obb_yolo_prediction, encode_obb_yolo_truth_batch,
+        enumerate_obb_yolo_batch_positives, enumerate_obb_yolo_head_positives,
+        match_obb_yolo_batch_cell_predictions, match_obb_yolo_cell_prediction,
+        match_obb_yolo_cell_prediction_with_score_config, obb_yolo_anchor_match_score,
+        obb_yolo_angular_prediction_match_score_with_viou, obb_yolo_box_regression_deltas,
+        obb_yolo_cell_objectness_delta, obb_yolo_ciou_prediction_match_score,
+        obb_yolo_class_deltas, obb_yolo_cobb_prediction_match_score_with_viou,
+        obb_yolo_covariance_prediction_match_score,
         obb_yolo_covariance_prediction_match_score_with_viou, obb_yolo_match_score,
         select_obb_yolo_cell_truth_match, visit_obb_yolo_batch_head_matches,
     };
@@ -2521,12 +2594,71 @@ mod tests {
     }
 
     #[test]
-    fn finite_difference_box_deltas_reject_covariance_branch() {
-        let error = obb_yolo_box_regression_deltas(
-            [0.5; 6],
-            [0.0; 4],
-            &truth(0.5, 0.5, 0.2, 0.1),
-            ObbYoloPredictionMatchContext {
+    fn positive_anchor_covariance_box_delta_writeback_preserves_other_channels() {
+        let assignment = ObbYoloPositiveObjectnessConfig {
+            head: ObbYoloHeadAssignmentSpec {
+                mask: vec![0],
+                grid_width: 1,
+                grid_height: 1,
+            },
+            anchors: vec![20.0, 10.0],
+            classes: 1,
+            net_width: 100,
+            net_height: 100,
+            iou_thresh: 1.0,
+            objectness_normalizer: 1.0,
+            objectness_smooth: false,
+            class_map: None,
+            class_multipliers: None,
+        };
+        let head_output = [0.45, 0.55, 0.2, -0.1, 0.7, 0.5, 0.4, 0.9];
+        let mut head_delta = [0.1, -0.1, 0.05, -0.05, 0.66, 0.67, 0.68, 0.69];
+        let initial = head_delta;
+        let delta_config = ObbYoloBoxDeltaConfig {
+            score: ObbYoloMatchScoreConfig {
+                covariance_normalizer: 1.2,
+                ..ObbYoloMatchScoreConfig::default()
+            },
+            accumulate: false,
+            ..ObbYoloBoxDeltaConfig::default()
+        };
+        let labels = [vec![truth(0.5, 0.5, 0.2, 0.1)]];
+        assert_eq!(
+            apply_obb_yolo_batch_head_positive_box_deltas(
+                &labels,
+                &head_output,
+                &mut head_delta,
+                &assignment,
+                false,
+                delta_config,
+            )
+            .unwrap(),
+            1
+        );
+        assert_ne!(&head_delta[..4], &initial[..4]);
+        assert_eq!(&head_delta[4..], &initial[4..]);
+    }
+
+    #[test]
+    fn covariance_box_deltas_match_source_analytic_chain_and_scale() {
+        let mut label = truth(0.5, 0.5, 0.2, 0.1);
+        label.front_x = 0.68;
+        label.front_y = 0.54;
+        label.has_front = true;
+        let prediction = [0.45, 0.57, 0.1, -0.2, 0.68, 0.54];
+        let existing = [0.1, -0.1, 0.05, -0.05];
+        let delta_config = ObbYoloBoxDeltaConfig {
+            score: ObbYoloMatchScoreConfig {
+                covariance_normalizer: 1.4,
+                covariance_front_length_ratio_k: 0.7,
+                covariance_front_length_weight: 0.4,
+                ..ObbYoloMatchScoreConfig::default()
+            },
+            iou_normalizer: 0.3,
+            ..ObbYoloBoxDeltaConfig::default()
+        };
+        for new_coords in [false, true] {
+            let context = ObbYoloPredictionMatchContext {
                 anchor_width: 20.0,
                 anchor_height: 10.0,
                 cell_x: 0,
@@ -2535,18 +2667,77 @@ mod tests {
                 grid_height: 1,
                 net_width: 100,
                 net_height: 100,
-                new_coords: false,
-            },
-            ObbYoloBoxDeltaConfig {
-                score: ObbYoloMatchScoreConfig {
-                    covariance_normalizer: 1.0,
-                    ..ObbYoloMatchScoreConfig::default()
+                new_coords,
+            };
+            let actual =
+                obb_yolo_box_regression_deltas(prediction, existing, &label, context, delta_config)
+                    .unwrap();
+            let decoded = decode_obb_yolo_prediction(prediction, context).unwrap();
+            let cov_w = (decoded.bbox.w - 1e-6).max(1e-6);
+            let cov_h = (decoded.bbox.h - 1e-6).max(1e-6);
+            let inverse_softplus = |value: f32| {
+                if value > 20.0 {
+                    value
+                } else {
+                    value.exp_m1().ln()
+                }
+            };
+            let gradient = crate::obb_geometry::box_covariance_w2_obb_loss_and_gradient(
+                decoded.bbox.x,
+                decoded.bbox.y,
+                inverse_softplus(cov_w),
+                inverse_softplus(cov_h),
+                decoded.front_x,
+                decoded.front_y,
+                crate::obb_geometry::BoxObb {
+                    bbox: crate::detect::DetectionBox {
+                        x: label.x,
+                        y: label.y,
+                        w: label.w,
+                        h: label.h,
+                    },
+                    front_x: label.front_x,
+                    front_y: label.front_y,
                 },
-                ..ObbYoloBoxDeltaConfig::default()
-            },
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("non-covariance branch"));
+                0.7,
+                0.4,
+            )
+            .gradient;
+            let sp_w = (-(-cov_w).exp_m1()).max(1e-6);
+            let sp_h = (-(-cov_h).exp_m1()).max(1e-6);
+            let width_chain = if new_coords {
+                8.0 * prediction[2] * context.anchor_width / context.net_width as f32
+            } else {
+                decoded.bbox.w
+            };
+            let height_chain = if new_coords {
+                8.0 * prediction[3] * context.anchor_height / context.net_height as f32
+            } else {
+                decoded.bbox.h
+            };
+            let x_chain = if new_coords {
+                1.0
+            } else {
+                prediction[0] * (1.0 - prediction[0])
+            };
+            let y_chain = if new_coords {
+                1.0
+            } else {
+                prediction[1] * (1.0 - prediction[1])
+            };
+            let scale = delta_config.iou_normalizer * 1.4;
+            let updates = [
+                -gradient.dx * x_chain * scale,
+                -gradient.dy * y_chain * scale,
+                -(gradient.d_raw_w / sp_w) * width_chain * scale,
+                -(gradient.d_raw_h / sp_h) * height_chain * scale,
+            ];
+            let expected: [f32; 4] =
+                std::array::from_fn(|index| existing[index] + updates[index].clamp(-1.0, 1.0));
+            for (actual, expected) in actual.into_iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-6);
+            }
+        }
     }
 
     #[test]
