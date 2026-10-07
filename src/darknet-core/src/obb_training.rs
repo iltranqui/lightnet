@@ -1,12 +1,14 @@
 //! Source-derived training primitives for legacy front-point OBB YOLO heads.
 //!
 //! This module currently covers direction-free anchor matching, per-truth
-//! head-positive enumeration, per-cell match selection and its objectness
-//! delta, cell selection, and source-layout truth-row packing only. It does not
-//! implement complete truth assignment, YOLO loss, backward propagation, or
-//! optimizer integration.
+//! head-positive enumeration, per-cell CIoU prediction scoring/match selection
+//! and objectness deltas, cell selection, and source-layout truth-row packing.
+//! It does not implement complete truth assignment, YOLO loss, backward
+//! propagation, or optimizer integration.
 
+use crate::detect::DetectionBox;
 use crate::error::{Error, Result};
+use crate::obb_geometry::{BoxObb, box_ciou_obb_quality_score};
 use crate::obb_labels::ObbLabel;
 
 const OBB_YOLO_CLASS_CONFIDENCE_THRESHOLD: f32 = 0.25;
@@ -454,6 +456,95 @@ pub fn obb_yolo_cell_objectness_delta(
     Ok(if delta.is_finite() { delta } else { 0.0 })
 }
 
+/// Decode one source YOLO output row and score it against a truth with the
+/// source CIoU-OBB matching metric.
+///
+/// `prediction` is the six box/front channels from the OBB YOLO layer output:
+/// x/y have already received the source `scale_x_y` transform and, unless
+/// `new_coords`, the logistic activation; front channels remain raw linear
+/// values. Non-finite channels are zeroed as in the source forward. This covers the
+/// source CIoU branch (and its default no-weighted-branch fallback), not the
+/// covariance/COBB weighted score paths, class confidence gate, or batch loop.
+/// The decoded geometry and truth are normalized to network dimensions.
+#[allow(clippy::too_many_arguments)]
+pub fn obb_yolo_ciou_prediction_match_score(
+    prediction: [f32; 6],
+    truth: &ObbLabel,
+    anchor_width: f32,
+    anchor_height: f32,
+    cell_x: usize,
+    cell_y: usize,
+    grid_width: usize,
+    grid_height: usize,
+    net_width: usize,
+    net_height: usize,
+    new_coords: bool,
+) -> Result<f32> {
+    validate_truth(truth)?;
+    if grid_width == 0
+        || grid_height == 0
+        || net_width == 0
+        || net_height == 0
+        || cell_x >= grid_width
+        || cell_y >= grid_height
+    {
+        return Err(Error::InvalidConfig(
+            "OBB prediction matching requires a valid cell, grid, and network shape".to_owned(),
+        ));
+    }
+    if !anchor_width.is_finite()
+        || !anchor_height.is_finite()
+        || anchor_width <= 0.0
+        || anchor_height <= 0.0
+    {
+        return Err(Error::InvalidConfig(
+            "OBB prediction matching requires positive finite anchors".to_owned(),
+        ));
+    }
+    if !truth.has_front {
+        return Ok(0.0);
+    }
+
+    let prediction = prediction.map(finite_or_zero);
+    let x = finite_or_zero((cell_x as f32 + prediction[0]) / grid_width as f32);
+    let y = finite_or_zero((cell_y as f32 + prediction[1]) / grid_height as f32);
+    let (w, h) = if new_coords {
+        (
+            finite_or_zero(prediction[2] * prediction[2] * 4.0 * anchor_width / net_width as f32)
+                .max(1e-6),
+            finite_or_zero(prediction[3] * prediction[3] * 4.0 * anchor_height / net_height as f32)
+                .max(1e-6),
+        )
+    } else {
+        let tw = finite_or_zero(prediction[2]).clamp(-10.0, 10.0);
+        let th = finite_or_zero(prediction[3]).clamp(-10.0, 10.0);
+        (
+            finite_or_zero(tw.exp() * anchor_width / net_width as f32).max(1e-6),
+            finite_or_zero(th.exp() * anchor_height / net_height as f32).max(1e-6),
+        )
+    };
+    let prediction = BoxObb {
+        bbox: DetectionBox { x, y, w, h },
+        front_x: (cell_x as f32 + prediction[4]) / grid_width as f32,
+        front_y: (cell_y as f32 + prediction[5]) / grid_height as f32,
+    };
+    let truth = BoxObb {
+        bbox: DetectionBox {
+            x: truth.x,
+            y: truth.y,
+            w: truth.w,
+            h: truth.h,
+        },
+        front_x: truth.front_x,
+        front_y: truth.front_y,
+    };
+    Ok(box_ciou_obb_quality_score(prediction, truth))
+}
+
+fn finite_or_zero(value: f32) -> f32 {
+    if value.is_finite() { value } else { 0.0 }
+}
+
 fn validate_anchor_assignment_inputs(
     anchors: &[f32],
     mask: &[usize],
@@ -543,7 +634,7 @@ mod tests {
         OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloCellTruthMatch, ObbYoloPositiveKind,
         assign_obb_yolo_anchor, encode_obb_yolo_truth_batch, enumerate_obb_yolo_head_positives,
         obb_yolo_anchor_match_score, obb_yolo_cell_objectness_delta,
-        select_obb_yolo_cell_truth_match,
+        obb_yolo_ciou_prediction_match_score, select_obb_yolo_cell_truth_match,
     };
     use crate::obb_labels::ObbLabel;
 
@@ -831,6 +922,135 @@ mod tests {
         assert_eq!(selected.positive_truth_index, None);
         assert_eq!(selected.ignore_match_score, 0.5);
         assert!(!selected.ignore_match);
+    }
+
+    #[test]
+    fn ciou_prediction_match_score_decodes_legacy_and_new_coordinate_rows() {
+        let mut label = truth(0.5, 0.5, 0.25, 0.25);
+        label.front_x = 0.5;
+        label.front_y = 0.75;
+        label.has_front = true;
+        assert_eq!(
+            obb_yolo_ciou_prediction_match_score(
+                [0.5, 0.5, 0.0, 0.0, 0.5, 0.75],
+                &label,
+                25.0,
+                25.0,
+                0,
+                0,
+                1,
+                1,
+                100,
+                100,
+                false,
+            )
+            .unwrap(),
+            1.0
+        );
+        assert_eq!(
+            obb_yolo_ciou_prediction_match_score(
+                [0.5, 0.5, 0.5, 0.5, 0.5, 0.75],
+                &label,
+                25.0,
+                25.0,
+                0,
+                0,
+                1,
+                1,
+                100,
+                100,
+                true,
+            )
+            .unwrap(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn ciou_prediction_match_score_preserves_cell_offsets_and_absent_front_behavior() {
+        let mut label = truth(0.5, 0.5, 0.25, 0.25);
+        label.front_x = 0.5;
+        label.front_y = 0.75;
+        label.has_front = true;
+        assert_eq!(
+            obb_yolo_ciou_prediction_match_score(
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.5],
+                &label,
+                25.0,
+                25.0,
+                1,
+                1,
+                2,
+                2,
+                100,
+                100,
+                false,
+            )
+            .unwrap(),
+            1.0
+        );
+        assert_eq!(
+            obb_yolo_ciou_prediction_match_score(
+                [0.0, 0.0, 0.0, 0.0, f32::NAN, 0.5],
+                &label,
+                25.0,
+                25.0,
+                1,
+                1,
+                2,
+                2,
+                100,
+                100,
+                false,
+            )
+            .unwrap(),
+            1.0
+        );
+        label.has_front = false;
+        assert_eq!(
+            obb_yolo_ciou_prediction_match_score(
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.5],
+                &label,
+                25.0,
+                25.0,
+                1,
+                1,
+                2,
+                2,
+                100,
+                100,
+                false,
+            )
+            .unwrap(),
+            0.0
+        );
+    }
+
+    #[test]
+    fn ciou_prediction_match_score_rejects_invalid_shape_and_anchors() {
+        let label = truth(0.5, 0.5, 0.25, 0.25);
+        assert!(
+            obb_yolo_ciou_prediction_match_score(
+                [0.5; 6], &label, 25.0, 25.0, 0, 0, 0, 1, 100, 100, false,
+            )
+            .is_err()
+        );
+        assert!(
+            obb_yolo_ciou_prediction_match_score(
+                [0.5; 6],
+                &label,
+                f32::NAN,
+                25.0,
+                0,
+                0,
+                1,
+                1,
+                100,
+                100,
+                false,
+            )
+            .is_err()
+        );
     }
 
     #[test]
