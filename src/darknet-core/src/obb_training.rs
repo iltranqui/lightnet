@@ -1,8 +1,9 @@
 //! Source-derived training primitives for legacy front-point OBB YOLO heads.
 //!
 //! This module currently covers direction-free anchor matching, per-truth and
-//! batch/multi-head positive enumeration, per-cell OBB score-branch dispatch/match selection,
-//! objectness and class-channel deltas, and source-layout truth-row packing.
+//! batch/multi-head positive enumeration, per-cell and batch-cell OBB score
+//! dispatch/match selection, objectness and class-channel deltas, and source-layout
+//! truth-row packing.
 //! It does not implement complete truth assignment, YOLO loss, backward
 //! propagation, or optimizer integration.
 
@@ -68,6 +69,31 @@ pub struct ObbYoloBatchPositiveAssignment {
     pub head_index: usize,
     /// Truth index remains local to this batch image's label slice.
     pub positive: ObbYoloPositiveAssignment,
+}
+
+/// One caller-selected OBB YOLO cell/anchor prediction in a batch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObbYoloBatchCellPrediction {
+    pub batch_index: usize,
+    pub head_index: usize,
+    pub anchor_index: usize,
+    pub prediction: [f32; 6],
+    pub class_outputs: Vec<f32>,
+    pub context: ObbYoloPredictionMatchContext,
+    pub score_config: ObbYoloMatchScoreConfig,
+    pub ignore_thresh: f32,
+    pub truth_thresh: f32,
+}
+
+/// Prediction-conditioned match gates tagged with their batch/head/cell slot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObbYoloBatchCellMatch {
+    pub batch_index: usize,
+    pub head_index: usize,
+    pub anchor_index: usize,
+    pub cell_x: usize,
+    pub cell_y: usize,
+    pub truth_match: ObbYoloCellTruthMatch,
 }
 
 /// Prediction-match gates for one cell/anchor against its truth candidates.
@@ -1091,6 +1117,49 @@ pub fn match_obb_yolo_cell_prediction_with_score_config(
     select_obb_yolo_cell_truth_match(&scores, class_outputs, ignore_thresh, truth_thresh)
 }
 
+/// Match caller-selected cells against the truth labels for their batch slots.
+///
+/// Input order is preserved, and every cell uses its own head score settings
+/// and prediction context. This composes batch lookup with the source one-cell
+/// matcher; tensor unpacking, positive-anchor loss deltas, and the trainer loop
+/// remain the caller's responsibility.
+pub fn match_obb_yolo_batch_cell_predictions(
+    batch_truths: &[Vec<ObbLabel>],
+    cell_predictions: &[ObbYoloBatchCellPrediction],
+) -> Result<Vec<ObbYoloBatchCellMatch>> {
+    let mut matches = Vec::new();
+    matches
+        .try_reserve_exact(cell_predictions.len())
+        .map_err(|_| Error::InvalidConfig("OBB batch match allocation failed".to_owned()))?;
+    for cell in cell_predictions {
+        let truths = batch_truths.get(cell.batch_index).ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "OBB cell batch index {} exceeds batch size {}",
+                cell.batch_index,
+                batch_truths.len()
+            ))
+        })?;
+        let truth_match = match_obb_yolo_cell_prediction_with_score_config(
+            cell.prediction,
+            truths,
+            &cell.class_outputs,
+            cell.context,
+            cell.score_config,
+            cell.ignore_thresh,
+            cell.truth_thresh,
+        )?;
+        matches.push(ObbYoloBatchCellMatch {
+            batch_index: cell.batch_index,
+            head_index: cell.head_index,
+            anchor_index: cell.anchor_index,
+            cell_x: cell.context.cell_x,
+            cell_y: cell.context.cell_y,
+            truth_match,
+        });
+    }
+    Ok(matches)
+}
+
 fn validate_anchor_assignment_inputs(
     anchors: &[f32],
     mask: &[usize],
@@ -1177,15 +1246,16 @@ fn validate_truth(truth: &ObbLabel) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloCellTruthMatch,
-        ObbYoloHeadAssignmentSpec, ObbYoloMatchScoreBranch, ObbYoloMatchScoreConfig,
-        ObbYoloPositiveKind, ObbYoloPredictionMatchContext, assign_obb_yolo_anchor,
-        encode_obb_yolo_truth_batch, enumerate_obb_yolo_batch_positives,
-        enumerate_obb_yolo_head_positives, match_obb_yolo_cell_prediction,
-        match_obb_yolo_cell_prediction_with_score_config, obb_yolo_anchor_match_score,
-        obb_yolo_angular_prediction_match_score_with_viou, obb_yolo_cell_objectness_delta,
-        obb_yolo_ciou_prediction_match_score, obb_yolo_class_deltas,
-        obb_yolo_cobb_prediction_match_score_with_viou, obb_yolo_covariance_prediction_match_score,
+        OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloBatchCellPrediction,
+        ObbYoloCellTruthMatch, ObbYoloHeadAssignmentSpec, ObbYoloMatchScoreBranch,
+        ObbYoloMatchScoreConfig, ObbYoloPositiveKind, ObbYoloPredictionMatchContext,
+        assign_obb_yolo_anchor, encode_obb_yolo_truth_batch, enumerate_obb_yolo_batch_positives,
+        enumerate_obb_yolo_head_positives, match_obb_yolo_batch_cell_predictions,
+        match_obb_yolo_cell_prediction, match_obb_yolo_cell_prediction_with_score_config,
+        obb_yolo_anchor_match_score, obb_yolo_angular_prediction_match_score_with_viou,
+        obb_yolo_cell_objectness_delta, obb_yolo_ciou_prediction_match_score,
+        obb_yolo_class_deltas, obb_yolo_cobb_prediction_match_score_with_viou,
+        obb_yolo_covariance_prediction_match_score,
         obb_yolo_covariance_prediction_match_score_with_viou, obb_yolo_match_score,
         select_obb_yolo_cell_truth_match,
     };
@@ -1397,6 +1467,92 @@ mod tests {
             enumerate_obb_yolo_batch_positives(&[Vec::new()], 1, &anchors, &[], 10, 10, 1.0,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn batch_cell_matching_uses_each_image_truth_and_preserves_prediction_order() {
+        let first_truth = truth(0.35, 0.35, 0.1, 0.1);
+        let second_truth = truth(1.0, 1.0, 0.1, 0.1);
+        let context = ObbYoloPredictionMatchContext {
+            anchor_width: 10.0,
+            anchor_height: 10.0,
+            cell_x: 3,
+            cell_y: 3,
+            grid_width: 10,
+            grid_height: 10,
+            net_width: 100,
+            net_height: 100,
+            new_coords: false,
+        };
+        let score_config = ObbYoloMatchScoreConfig {
+            covariance_normalizer: 1.0,
+            ..ObbYoloMatchScoreConfig::default()
+        };
+        let prediction = [0.5, 0.5, 0.0, 0.0, 0.5, 0.5];
+        let matches = match_obb_yolo_batch_cell_predictions(
+            &[vec![first_truth], vec![second_truth]],
+            &[
+                ObbYoloBatchCellPrediction {
+                    batch_index: 1,
+                    head_index: 2,
+                    anchor_index: 4,
+                    prediction,
+                    class_outputs: vec![0.9],
+                    context,
+                    score_config,
+                    ignore_thresh: 0.5,
+                    truth_thresh: 0.5,
+                },
+                ObbYoloBatchCellPrediction {
+                    batch_index: 0,
+                    head_index: 1,
+                    anchor_index: 3,
+                    prediction,
+                    class_outputs: vec![0.9],
+                    context,
+                    score_config,
+                    ignore_thresh: 0.5,
+                    truth_thresh: 0.5,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(matches.len(), 2);
+        assert_eq!((matches[0].batch_index, matches[0].head_index), (1, 2));
+        assert_eq!(matches[0].anchor_index, 4);
+        assert!(matches[0].truth_match.best_score < 0.5);
+        assert_eq!(matches[0].truth_match.positive_truth_index, None);
+        assert_eq!((matches[1].batch_index, matches[1].head_index), (0, 1));
+        assert_eq!(matches[1].anchor_index, 3);
+        assert_eq!(matches[1].truth_match.positive_truth_index, Some(0));
+        assert!(matches[1].truth_match.best_score > 0.99);
+    }
+
+    #[test]
+    fn batch_cell_matching_rejects_invalid_batch_indices() {
+        let context = ObbYoloPredictionMatchContext {
+            anchor_width: 10.0,
+            anchor_height: 10.0,
+            cell_x: 0,
+            cell_y: 0,
+            grid_width: 1,
+            grid_height: 1,
+            net_width: 10,
+            net_height: 10,
+            new_coords: false,
+        };
+        let cell = ObbYoloBatchCellPrediction {
+            batch_index: 1,
+            head_index: 0,
+            anchor_index: 0,
+            prediction: [0.0; 6],
+            class_outputs: vec![0.0],
+            context,
+            score_config: ObbYoloMatchScoreConfig::default(),
+            ignore_thresh: 0.5,
+            truth_thresh: 0.5,
+        };
+        assert!(match_obb_yolo_batch_cell_predictions(&[Vec::new()], &[cell]).is_err());
     }
 
     #[test]

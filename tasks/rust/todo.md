@@ -267,9 +267,10 @@ Immediately next, in dependency order:
   COBB loss/quality and QBBV blending; v107 adds raw-channel COBB match decoding
   and source branch gates; v108 adds one-cell covariance-first/COBB/angular
   score dispatch; v109 composes branch scores with per-truth cell gates; v110
-  enumerates primary/additional positives across batch slots and multiple heads.
-  Batch prediction-conditioned matching, COBB regression gradients/deltas, full
-  class/box losses and training-loop integration, crop/resize and mosaic transforms,
+  enumerates primary/additional positives across batch slots and multiple heads;
+  v111 maps caller-selected head/cell predictions to batch-specific truths and
+  returns tagged match gates. Full head-tensor traversal, COBB regression
+  gradients/deltas, class/box losses and training-loop integration, crop/resize and mosaic transforms,
   alternate NMS-kind implementations, training `-map` cadence, and CARPN network
   decoding/validation integration remain open.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and
