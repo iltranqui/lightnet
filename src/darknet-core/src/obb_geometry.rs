@@ -1,9 +1,9 @@
 //! Source-derived oriented bounding-box geometry for the legacy front-point OBB contract.
 //!
-//! This module provides geometry for OBB decoding/evaluation and the source
-//! CIoU-OBB match-quality score. It does not implement a detector layer,
-//! rotated-label loading, training loss, NMS dispatch, or CARPN's explicit
-//! four-vertex polygon contract.
+//! This module provides geometry for OBB decoding/evaluation, source CIoU and
+//! covariance-W2 match-quality scores, and CARPN's explicit four-vertex polygon
+//! contract. It does not implement a detector layer, rotated-label loading,
+//! complete training losses, or NMS dispatch.
 
 use crate::detect::DetectionBox;
 
@@ -104,6 +104,160 @@ pub fn box_obb_iou(a: BoxObb, b: BoxObb) -> f32 {
         return 0.0;
     }
     (intersection_area / union_area).clamp(0.0, 1.0)
+}
+
+/// Source covariance Wasserstein-2 loss components for decoded OBB geometry.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ObbCovarianceW2LossTerms {
+    /// Center + covariance + weighted front-length loss.
+    pub total: f32,
+    /// Squared center displacement.
+    pub center: f32,
+    /// Squared Wasserstein covariance distance.
+    pub covariance: f32,
+    /// Unweighted squared front-length residual.
+    pub front_length: f32,
+}
+
+fn valid_covariance_w2_inputs(
+    pred: BoxObb,
+    truth: BoxObb,
+    front_length_ratio_k: f32,
+    front_length_weight: f32,
+) -> bool {
+    [
+        pred.bbox.x,
+        pred.bbox.y,
+        pred.bbox.w,
+        pred.bbox.h,
+        pred.front_x,
+        pred.front_y,
+        truth.bbox.x,
+        truth.bbox.y,
+        truth.bbox.w,
+        truth.bbox.h,
+        truth.front_x,
+        truth.front_y,
+        front_length_ratio_k,
+        front_length_weight,
+    ]
+    .iter()
+    .all(|value| value.is_finite())
+        && pred.bbox.w > 0.0
+        && pred.bbox.h > 0.0
+        && truth.bbox.w >= 0.0
+        && truth.bbox.h >= 0.0
+}
+
+/// Compute the source covariance-W2 loss terms for already-decoded OBB geometry.
+///
+/// The default source epsilons are used. `front_length_ratio_k` is clamped to at
+/// least 0.05 and `front_length_weight` to at least zero, matching the OBB loss
+/// score configuration. This is not the raw-channel decoder, optional QBBV-vIoU
+/// blend, or training gradient.
+pub fn box_covariance_w2_obb_loss_terms(
+    pred: BoxObb,
+    truth: BoxObb,
+    front_length_ratio_k: f32,
+    front_length_weight: f32,
+) -> ObbCovarianceW2LossTerms {
+    const EPS_NORM: f32 = 1e-6;
+    const EPS_SPD: f32 = 1e-6;
+    const EPS_SIZE: f32 = 1e-6;
+    const EPS_SMOOTH_MAX: f32 = 1e-6;
+
+    if !valid_covariance_w2_inputs(pred, truth, front_length_ratio_k, front_length_weight) {
+        return ObbCovarianceW2LossTerms::default();
+    }
+
+    let front_length_ratio_k = front_length_ratio_k.max(0.05);
+    let front_length_weight = front_length_weight.max(0.0);
+    let decoded_size = |size: f32| {
+        let positive = (size - EPS_SIZE).max(EPS_SIZE);
+        let raw = if positive > 20.0 {
+            positive
+        } else {
+            positive.exp_m1().ln()
+        };
+        (-raw.abs()).exp().ln_1p() + raw.max(0.0) + EPS_SIZE
+    };
+    let width = decoded_size(pred.bbox.w);
+    let height = decoded_size(pred.bbox.h);
+    let truth_width = truth.bbox.w.abs() + EPS_SIZE;
+    let truth_height = truth.bbox.h.abs() + EPS_SIZE;
+
+    let front_dx = pred.front_x - pred.bbox.x;
+    let front_dy = pred.front_y - pred.bbox.y;
+    let front_norm = (front_dx * front_dx + front_dy * front_dy + EPS_NORM).sqrt();
+    let ux = front_dx / front_norm;
+    let uy = front_dy / front_norm;
+    let truth_front_dx = truth.front_x - truth.bbox.x;
+    let truth_front_dy = truth.front_y - truth.bbox.y;
+    let truth_front_norm =
+        (truth_front_dx * truth_front_dx + truth_front_dy * truth_front_dy + EPS_NORM).sqrt();
+    let truth_ux = truth_front_dx / truth_front_norm;
+    let truth_uy = truth_front_dy / truth_front_norm;
+
+    let covariance = |w: f32, h: f32, ux: f32, uy: f32| {
+        let a = 0.25 * w * w;
+        let b = 0.25 * h * h;
+        [
+            a * ux * ux + b * uy * uy,
+            (a - b) * ux * uy,
+            a * uy * uy + b * ux * ux,
+        ]
+    };
+    let pred_cov = covariance(width, height, ux, uy);
+    let truth_cov = covariance(truth_width, truth_height, truth_ux, truth_uy);
+    let determinant = |cov: [f32; 3]| cov[0] * cov[2] - cov[1] * cov[1];
+    let trace_pred = pred_cov[0] + pred_cov[2];
+    let trace_truth = truth_cov[0] + truth_cov[2];
+    let trace_product =
+        pred_cov[0] * truth_cov[0] + 2.0 * pred_cov[1] * truth_cov[1] + pred_cov[2] * truth_cov[2];
+    let q = (determinant(pred_cov) * determinant(truth_cov) + EPS_SPD).sqrt();
+    let s = (trace_product + 2.0 * q + EPS_SPD).sqrt();
+    let covariance_loss = trace_pred + trace_truth - 2.0 * s;
+
+    let center_dx = pred.bbox.x - truth.bbox.x;
+    let center_dy = pred.bbox.y - truth.bbox.y;
+    let center = center_dx * center_dx + center_dy * center_dy;
+    let diff_wh = width - height;
+    let smooth_wh = (diff_wh * diff_wh + EPS_SMOOTH_MAX).sqrt();
+    let max_wh = 0.5 * (width + height + smooth_wh);
+    let length_residual = front_norm - front_length_ratio_k * max_wh;
+    let front_length = length_residual * length_residual;
+    let total = center + covariance_loss + front_length_weight * front_length;
+
+    let sanitize = |value: f32| if value.is_finite() { value } else { 0.0 };
+    ObbCovarianceW2LossTerms {
+        total: sanitize(total),
+        center: sanitize(center),
+        covariance: sanitize(covariance_loss),
+        front_length: sanitize(front_length),
+    }
+}
+
+/// Source covariance-W2 matching quality for decoded OBB geometry.
+///
+/// The matching score is `exp(-total_loss)`, clamped to `[0, 1]`. Optional
+/// QBBV-vIoU blending and raw prediction decoding are separate source paths.
+pub fn box_covariance_w2_obb_quality_score(
+    pred: BoxObb,
+    truth: BoxObb,
+    front_length_ratio_k: f32,
+    front_length_weight: f32,
+) -> f32 {
+    if !valid_covariance_w2_inputs(pred, truth, front_length_ratio_k, front_length_weight) {
+        return 0.0;
+    }
+    let terms =
+        box_covariance_w2_obb_loss_terms(pred, truth, front_length_ratio_k, front_length_weight);
+    let score = (-terms.total).exp();
+    if score.is_finite() {
+        score.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 /// Source CIoU-OBB matching quality for two decoded front-point rectangles.
@@ -393,6 +547,52 @@ mod tests {
             box_ciou_obb_quality_score(shifted, truth),
             1.0 / 3.0 - 1.0 / 13.0,
             2e-6,
+        );
+    }
+
+    #[test]
+    fn covariance_w2_score_tracks_center_shape_and_front_length_terms() {
+        let identical = rect([0.5, 0.5], 2.0, 4.0, [0.5, 4.5]);
+        let identical_terms = box_covariance_w2_obb_loss_terms(identical, identical, 1.0, 0.35);
+        assert_eq!(identical_terms.center, 0.0);
+        assert!(identical_terms.covariance.abs() < 1e-5);
+        assert!(identical_terms.front_length < 1e-8);
+        assert_eq!(
+            box_covariance_w2_obb_quality_score(identical, identical, 1.0, 0.35),
+            1.0
+        );
+
+        let shifted = rect([0.6, 0.5], 2.0, 4.0, [0.6, 4.5]);
+        let shifted_terms = box_covariance_w2_obb_loss_terms(identical, shifted, 1.0, 0.0);
+        close(shifted_terms.center, 0.01, 1e-6);
+        close(
+            box_covariance_w2_obb_quality_score(identical, shifted, 1.0, 0.0),
+            (-0.01f32).exp(),
+            2e-5,
+        );
+
+        let rotated = rect([0.5, 0.5], 2.0, 4.0, [4.5, 0.5]);
+        let orientation_terms = box_covariance_w2_obb_loss_terms(identical, rotated, 1.0, 0.0);
+        assert!(orientation_terms.covariance > 0.0);
+        assert!(box_covariance_w2_obb_quality_score(identical, rotated, 1.0, 0.0) < 1.0);
+
+        let short_front = rect([0.5, 0.5], 2.0, 4.0, [0.5, 0.6]);
+        let front_terms = box_covariance_w2_obb_loss_terms(short_front, identical, 0.05, 0.5);
+        close(front_terms.front_length, 0.01, 2e-5);
+        close(front_terms.total, front_terms.covariance + 0.005, 2e-5);
+    }
+
+    #[test]
+    fn covariance_w2_score_returns_zero_for_invalid_geometry_or_config() {
+        let valid = rect([0.0, 0.0], 2.0, 2.0, [0.0, 1.0]);
+        let invalid = rect([0.0, 0.0], 0.0, 2.0, [0.0, 1.0]);
+        assert_eq!(
+            box_covariance_w2_obb_quality_score(invalid, valid, 1.0, 0.35),
+            0.0
+        );
+        assert_eq!(
+            box_covariance_w2_obb_quality_score(valid, valid, f32::NAN, 0.35),
+            0.0
         );
     }
 
