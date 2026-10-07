@@ -106,6 +106,134 @@ pub fn box_obb_iou(a: BoxObb, b: BoxObb) -> f32 {
     (intersection_area / union_area).clamp(0.0, 1.0)
 }
 
+#[derive(Clone, Copy)]
+struct QbbvFrame {
+    cx: f32,
+    cy: f32,
+    half_w: f32,
+    half_h: f32,
+    ux: f32,
+    uy: f32,
+    vx: f32,
+    vy: f32,
+}
+
+fn qbbv_frame(boxobb: BoxObb) -> QbbvFrame {
+    let mut frame = QbbvFrame {
+        cx: boxobb.bbox.x,
+        cy: boxobb.bbox.y,
+        half_w: (0.5 * boxobb.bbox.w).max(1e-6),
+        half_h: (0.5 * boxobb.bbox.h).max(1e-6),
+        ux: 1.0,
+        uy: 0.0,
+        vx: 0.0,
+        vy: 1.0,
+    };
+    let dir_x = boxobb.front_x - boxobb.bbox.x;
+    let dir_y = boxobb.front_y - boxobb.bbox.y;
+    let dir_len = (dir_x * dir_x + dir_y * dir_y).sqrt();
+    if dir_len.is_finite() && dir_len >= 1e-6 {
+        frame.ux = dir_x / dir_len;
+        frame.uy = dir_y / dir_len;
+    }
+    frame.vx = -frame.uy;
+    frame.vy = frame.ux;
+
+    frame.cx = finite_or(frame.cx, 0.0);
+    frame.cy = finite_or(frame.cy, 0.0);
+    frame.half_w = if frame.half_w.is_finite() {
+        frame.half_w.max(1e-6)
+    } else {
+        1e-6
+    };
+    frame.half_h = if frame.half_h.is_finite() {
+        frame.half_h.max(1e-6)
+    } else {
+        1e-6
+    };
+    frame.ux = finite_or(frame.ux, 1.0);
+    frame.uy = finite_or(frame.uy, 0.0);
+    frame.vx = finite_or(frame.vx, 0.0);
+    frame.vy = finite_or(frame.vy, 1.0);
+    frame
+}
+
+fn finite_or(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() { value } else { fallback }
+}
+
+fn qbbv_heatmap_from_frame(frame: QbbvFrame, x: f32, y: f32) -> f32 {
+    let dx = x - frame.cx;
+    let dy = y - frame.cy;
+    let gx = (dx * frame.ux + dy * frame.uy) / frame.half_w.max(1e-6);
+    let gy = (dx * frame.vx + dy * frame.vy) / frame.half_h.max(1e-6);
+    let hx = (1.0 - gx.abs()).max(0.0);
+    let hy = (1.0 - gy.abs()).max(0.0);
+    finite_or(hx * hy, 0.0)
+}
+
+/// Evaluate the source QBBV tent heatmap for one point and front-point OBB.
+///
+/// A degenerate front vector falls back to the source axis-aligned local frame.
+pub fn obb_qbbv_heatmap_value(boxobb: BoxObb, x: f32, y: f32) -> f32 {
+    qbbv_heatmap_from_frame(qbbv_frame(boxobb), x, y)
+}
+
+/// Approximate source QBBV-vIoU with center-sampled heatmap intersections.
+///
+/// The sample count is clamped to `[4, 128]`. A zero-span or invalid union AABB
+/// returns zero; identical valid boxes return one up to floating-point error.
+pub fn box_obb_qbbv_viou(pred: BoxObb, truth: BoxObb, samples_per_axis: usize) -> f32 {
+    let pred_frame = qbbv_frame(pred);
+    let truth_frame = qbbv_frame(truth);
+    let aabb = |frame: QbbvFrame| {
+        let ext_x = frame.half_w * frame.ux.abs() + frame.half_h * frame.vx.abs();
+        let ext_y = frame.half_w * frame.uy.abs() + frame.half_h * frame.vy.abs();
+        [
+            frame.cx - ext_x,
+            frame.cy - ext_y,
+            frame.cx + ext_x,
+            frame.cy + ext_y,
+        ]
+    };
+    let pred_aabb = aabb(pred_frame);
+    let truth_aabb = aabb(truth_frame);
+    let min_x = pred_aabb[0].min(truth_aabb[0]);
+    let min_y = pred_aabb[1].min(truth_aabb[1]);
+    let max_x = pred_aabb[2].max(truth_aabb[2]);
+    let max_y = pred_aabb[3].max(truth_aabb[3]);
+    let samples = samples_per_axis.clamp(4, 128);
+    let span_x = max_x - min_x;
+    let span_y = max_y - min_y;
+    if !span_x.is_finite() || !span_y.is_finite() || span_x <= 0.0 || span_y <= 0.0 {
+        return 0.0;
+    }
+    let step_x = span_x / samples as f32;
+    let step_y = span_y / samples as f32;
+    if !step_x.is_finite() || !step_y.is_finite() || step_x <= 0.0 || step_y <= 0.0 {
+        return 0.0;
+    }
+
+    let mut numerator = 0.0f64;
+    let mut denominator = 0.0f64;
+    for y_index in 0..samples {
+        let y = min_y + (y_index as f32 + 0.5) * step_y;
+        for x_index in 0..samples {
+            let x = min_x + (x_index as f32 + 0.5) * step_x;
+            let pred_value = qbbv_heatmap_from_frame(pred_frame, x, y);
+            let truth_value = qbbv_heatmap_from_frame(truth_frame, x, y);
+            let pred_squared = pred_value * pred_value;
+            let truth_squared = truth_value * truth_value;
+            numerator += pred_squared.min(truth_squared) as f64;
+            denominator += pred_squared.max(truth_squared) as f64;
+        }
+    }
+    if denominator <= 1e-12 {
+        return 0.0;
+    }
+    finite_or((numerator / denominator) as f32, 0.0).clamp(0.0, 1.0)
+}
+
 /// Source covariance Wasserstein-2 loss components for decoded OBB geometry.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ObbCovarianceW2LossTerms {
@@ -547,6 +675,44 @@ mod tests {
             box_ciou_obb_quality_score(shifted, truth),
             1.0 / 3.0 - 1.0 / 13.0,
             2e-6,
+        );
+    }
+
+    #[test]
+    fn qbbv_heatmap_has_source_center_edge_and_midpoint_values() {
+        let boxobb = rect([0.5, 0.5], 0.4, 0.2, [0.6, 0.5]);
+        assert_eq!(obb_qbbv_heatmap_value(boxobb, 0.5, 0.5), 1.0);
+        close(obb_qbbv_heatmap_value(boxobb, 0.7, 0.5), 0.0, 1e-6);
+        close(obb_qbbv_heatmap_value(boxobb, 0.6, 0.5), 0.5, 1e-6);
+
+        let direction_free = rect([0.5, 0.5], 0.4, 0.2, [0.5, 0.5]);
+        assert_eq!(obb_qbbv_heatmap_value(direction_free, 0.5, 0.5), 1.0);
+    }
+
+    #[test]
+    fn qbbv_viou_handles_identical_disjoint_partial_and_sample_clamping() {
+        let identical = rect([0.5, 0.5], 0.32, 0.16, [0.58, 0.5]);
+        assert_eq!(box_obb_qbbv_viou(identical, identical, 48), 1.0);
+        let disjoint_a = rect([0.2, 0.2], 0.2, 0.1, [0.3, 0.2]);
+        let disjoint_b = rect([0.8, 0.8], 0.2, 0.1, [0.9, 0.8]);
+        assert_eq!(box_obb_qbbv_viou(disjoint_a, disjoint_b, 48), 0.0);
+
+        let partial_a = rect([0.45, 0.5], 0.3, 0.16, [0.53, 0.5]);
+        let partial_b = rect([0.55, 0.5], 0.3, 0.16, [0.63, 0.5]);
+        let partial_score = box_obb_qbbv_viou(partial_a, partial_b, 48);
+        assert!(partial_score > 0.0 && partial_score < 1.0);
+        close(
+            partial_score,
+            box_obb_qbbv_viou(partial_b, partial_a, 48),
+            1e-6,
+        );
+        assert_eq!(
+            box_obb_qbbv_viou(partial_a, partial_b, 0),
+            box_obb_qbbv_viou(partial_a, partial_b, 4)
+        );
+        assert_eq!(
+            box_obb_qbbv_viou(partial_a, partial_b, usize::MAX),
+            box_obb_qbbv_viou(partial_a, partial_b, 128)
         );
     }
 

@@ -34,6 +34,7 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v103: added `obb_qbbv_heatmap_value` and `box_obb_qbbv_viou`, porting the source-oriented tent heatmap and center-sampled squared-heatmap intersection-over-union (sample count clamped to 4–128). Two focused QBBV tests and all 71 OBB-filtered host tests passed; score blending and compiled-C++ parity remain open.
 - v102: added `obb_yolo_covariance_prediction_match_score`, decoding one cell's post-YOLO channels and scoring them against a truth with the covariance-W2 branch. The branch gate, direction-free front placeholder, and anchor/grid decode are covered. One focused test passed; weighted covariance/COBB aggregation, QBBV-vIoU blending, and compiled-C++ parity remain open.
 - v101: added `box_covariance_w2_obb_loss_terms` and `box_covariance_w2_obb_quality_score` for already-decoded OBB geometry, porting the source covariance, center, and front-length terms with source epsilons/clamps. Two focused formula tests passed; raw matching decode, QBBV-vIoU blending, COBB scoring, and compiled-C++ parity remain open.
 - v100: added `obb_yolo_class_deltas`, a source-derived class-channel delta primitive for positive OBB cells, including the existing-delta gate, focal/non-focal branches, label smoothing, optional class weights/normalization, and average-class output. Four focused class-delta tests and all 66 OBB-filtered host tests passed. Full training/loss integration and compiled-C++ parity remain open.
