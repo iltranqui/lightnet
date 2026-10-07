@@ -290,10 +290,11 @@ Immediately next, in dependency order:
   front-point delta primitive; v130 writes those deltas to best/additional positive
   anchor channels; v131 writes them to truth-threshold-positive cells; v132
   composes front deltas in the one-head pass order; v133 dispatches that path
-  across multiple heads. Still open: cfg ingestion and inference/network decode,
+  across multiple heads; v134 reports source-normalized front-loss sums/counts
+  across those passes and heads. Still open: cfg ingestion and inference/network decode,
   network-loop/backprop
-  integration, truth-threshold metric/loss aggregation,
-  integrated losses and training-loop wiring, crop/resize and mosaic transforms,
+  integration, remaining metric/loss aggregation and integrated loss/training-loop
+  wiring, crop/resize and mosaic transforms,
   alternate NMS-kind implementations, training `-map` cadence, and CARPN network
   decoding/validation integration remain open.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and

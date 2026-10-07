@@ -64,6 +64,7 @@ pub use obb_training::{
     ObbYoloBatchCellMatch, ObbYoloBatchCellPrediction, ObbYoloCellTruthMatch,
     ObbYoloBoxDeltaConfig, ObbYoloClassDeltaResult, ObbYoloClassDeltaStats,
     ObbYoloFrontPointDeltaConfig, ObbYoloFrontPointDeltas,
+    ObbYoloFrontPointMetrics,
     ObbYoloBatchTrainingDeltaStats, ObbYoloHeadTrainingDeltaStats,
     ObbYoloPositiveAssignment, ObbYoloPositiveKind,
     ObbYoloPositiveObjectnessConfig,
