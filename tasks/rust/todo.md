@@ -270,8 +270,9 @@ Immediately next, in dependency order:
   enumerates primary/additional positives across batch slots and multiple heads;
   v111 maps caller-selected head/cell predictions to batch-specific truths and
   returns tagged match gates; v112 traverses a full batch-major head tensor in
-  source cell/anchor order. Multi-head trainer dispatch, COBB regression
-  gradients/deltas, class/box losses and training-loop integration, crop/resize and mosaic transforms,
+  source cell/anchor order; v113 emits source objectness deltas for batch/head
+  cells with ignore and positive overrides. Multi-head trainer dispatch, COBB
+  regression gradients/deltas, class/box losses and training-loop integration, crop/resize and mosaic transforms,
   alternate NMS-kind implementations, training `-map` cadence, and CARPN network
   decoding/validation integration remain open.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and

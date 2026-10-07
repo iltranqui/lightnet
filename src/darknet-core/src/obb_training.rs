@@ -77,6 +77,8 @@ pub struct ObbYoloHeadMatchConfig {
     pub score_config: ObbYoloMatchScoreConfig,
     pub ignore_thresh: f32,
     pub truth_thresh: f32,
+    pub objectness_normalizer: f32,
+    pub objectness_smooth: bool,
 }
 
 /// One positive assignment tagged with its batch slot and OBB YOLO head.
@@ -100,6 +102,9 @@ pub struct ObbYoloBatchCellPrediction {
     pub score_config: ObbYoloMatchScoreConfig,
     pub ignore_thresh: f32,
     pub truth_thresh: f32,
+    pub predicted_objectness: f32,
+    pub objectness_normalizer: f32,
+    pub objectness_smooth: bool,
 }
 
 /// Prediction-conditioned match gates tagged with their batch/head/cell slot.
@@ -111,6 +116,7 @@ pub struct ObbYoloBatchCellMatch {
     pub cell_x: usize,
     pub cell_y: usize,
     pub truth_match: ObbYoloCellTruthMatch,
+    pub objectness_delta: f32,
 }
 
 /// Prediction-match gates for one cell/anchor against its truth candidates.
@@ -1165,6 +1171,12 @@ pub fn match_obb_yolo_batch_cell_predictions(
             cell.ignore_thresh,
             cell.truth_thresh,
         )?;
+        let objectness_delta = obb_yolo_cell_objectness_delta(
+            truth_match,
+            cell.predicted_objectness,
+            cell.objectness_normalizer,
+            cell.objectness_smooth,
+        )?;
         matches.push(ObbYoloBatchCellMatch {
             batch_index: cell.batch_index,
             head_index: cell.head_index,
@@ -1172,6 +1184,7 @@ pub fn match_obb_yolo_batch_cell_predictions(
             cell_x: cell.context.cell_x,
             cell_y: cell.context.cell_y,
             truth_match,
+            objectness_delta,
         });
     }
     Ok(matches)
@@ -1271,6 +1284,12 @@ pub fn visit_obb_yolo_batch_head_matches(
                         config.ignore_thresh,
                         config.truth_thresh,
                     )?;
+                    let objectness_delta = obb_yolo_cell_objectness_delta(
+                        truth_match,
+                        channel_value(6),
+                        config.objectness_normalizer,
+                        config.objectness_smooth,
+                    )?;
                     visit(ObbYoloBatchCellMatch {
                         batch_index,
                         head_index: config.head_index,
@@ -1278,6 +1297,7 @@ pub fn visit_obb_yolo_batch_head_matches(
                         cell_x,
                         cell_y,
                         truth_match,
+                        objectness_delta,
                     })?;
                 }
             }
@@ -1628,6 +1648,9 @@ mod tests {
                     score_config,
                     ignore_thresh: 0.5,
                     truth_thresh: 0.5,
+                    predicted_objectness: 0.25,
+                    objectness_normalizer: 1.0,
+                    objectness_smooth: false,
                 },
                 ObbYoloBatchCellPrediction {
                     batch_index: 0,
@@ -1639,6 +1662,9 @@ mod tests {
                     score_config,
                     ignore_thresh: 0.5,
                     truth_thresh: 0.5,
+                    predicted_objectness: 0.25,
+                    objectness_normalizer: 1.0,
+                    objectness_smooth: false,
                 },
             ],
         )
@@ -1648,10 +1674,12 @@ mod tests {
         assert_eq!(matches[0].anchor_index, 4);
         assert!(matches[0].truth_match.best_score < 0.5);
         assert_eq!(matches[0].truth_match.positive_truth_index, None);
+        assert!((matches[0].objectness_delta + 0.25).abs() < 1e-6);
         assert_eq!((matches[1].batch_index, matches[1].head_index), (0, 1));
         assert_eq!(matches[1].anchor_index, 3);
         assert_eq!(matches[1].truth_match.positive_truth_index, Some(0));
         assert!(matches[1].truth_match.best_score > 0.99);
+        assert!((matches[1].objectness_delta - 0.75).abs() < 1e-6);
     }
 
     #[test]
@@ -1677,6 +1705,9 @@ mod tests {
             score_config: ObbYoloMatchScoreConfig::default(),
             ignore_thresh: 0.5,
             truth_thresh: 0.5,
+            predicted_objectness: 0.0,
+            objectness_normalizer: 1.0,
+            objectness_smooth: false,
         };
         assert!(match_obb_yolo_batch_cell_predictions(&[Vec::new()], &[cell]).is_err());
     }
@@ -1703,6 +1734,8 @@ mod tests {
             },
             ignore_thresh: 0.5,
             truth_thresh: 0.99,
+            objectness_normalizer: 1.0,
+            objectness_smooth: false,
         };
         // `[batch][entry][cell]`: box/front, objectness, and one class.
         let head_output = [
@@ -1721,6 +1754,7 @@ mod tests {
         assert_eq!((matches[0].cell_x, matches[0].cell_y), (0, 0));
         assert_eq!(matches[0].truth_match.positive_truth_index, Some(0));
         assert!(matches[0].truth_match.best_score > 0.99);
+        assert!((matches[0].objectness_delta - 0.1).abs() < 1e-6);
         assert_eq!(matches[1].batch_index, 1);
         assert_eq!(matches[1].truth_match.positive_truth_index, None);
         assert!(matches[1].truth_match.best_score < 0.99);
@@ -1741,6 +1775,8 @@ mod tests {
             score_config: ObbYoloMatchScoreConfig::default(),
             ignore_thresh: 0.5,
             truth_thresh: 0.5,
+            objectness_normalizer: 1.0,
+            objectness_smooth: false,
         };
         let head_output = vec![0.0; 32];
         let mut matches = Vec::new();
@@ -1776,6 +1812,8 @@ mod tests {
             score_config: ObbYoloMatchScoreConfig::default(),
             ignore_thresh: 0.5,
             truth_thresh: 0.5,
+            objectness_normalizer: 1.0,
+            objectness_smooth: false,
         };
         assert!(
             visit_obb_yolo_batch_head_matches(&[Vec::new()], &[0.0; 7], &config, |_| Ok(()))
