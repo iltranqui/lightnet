@@ -1563,6 +1563,170 @@ pub fn apply_obb_yolo_batch_head_objectness_deltas(
     })
 }
 
+/// Apply the source `truth_thresh` positive class and box deltas for every cell.
+///
+/// The complete-head objectness pass must run first; this function leaves entry
+/// 6 untouched, matching the source per-cell branch. It applies class smoothing
+/// and the smoothed `best_score²` class target override, then dispatches the
+/// source covariance/COBB/angular box delta with the mapped class multiplier.
+/// These cells do not contribute to `avg_cat` in the source; the return value is
+/// only their positive-cell count. Best/additional anchor passes remain separate.
+pub fn apply_obb_yolo_batch_head_truth_threshold_deltas(
+    batch_truths: &[Vec<ObbLabel>],
+    head_output: &[f32],
+    head_delta: &mut [f32],
+    match_config: &ObbYoloHeadMatchConfig,
+    positive_config: &ObbYoloPositiveObjectnessConfig,
+    focal_loss: bool,
+    label_smooth_eps: f32,
+    cls_normalizer: f32,
+    box_delta_config: ObbYoloBoxDeltaConfig,
+) -> Result<usize> {
+    if match_config.anchors != positive_config.anchors
+        || match_config.mask != positive_config.head.mask
+        || match_config.grid_width != positive_config.head.grid_width
+        || match_config.grid_height != positive_config.head.grid_height
+        || match_config.classes != positive_config.classes
+        || match_config.net_width != positive_config.net_width
+        || match_config.net_height != positive_config.net_height
+        || match_config.objectness_normalizer != positive_config.objectness_normalizer
+        || match_config.objectness_smooth != positive_config.objectness_smooth
+        || match_config.score_config != box_delta_config.score
+        || !label_smooth_eps.is_finite()
+        || !cls_normalizer.is_finite()
+        || !box_delta_config.iou_normalizer.is_finite()
+        || !box_delta_config.max_delta.is_finite()
+        || box_delta_config.max_delta < 0.0
+        || head_delta.iter().any(|delta| !delta.is_finite())
+        || positive_config.class_map.as_ref().is_some_and(|mapping| {
+            mapping.len() != positive_config.classes
+                || mapping
+                    .iter()
+                    .any(|&class_id| class_id >= positive_config.classes)
+        })
+        || positive_config
+            .class_multipliers
+            .as_ref()
+            .is_some_and(|multipliers| {
+                multipliers.len() != positive_config.classes
+                    || multipliers.iter().any(|multiplier| {
+                        !multiplier.is_finite()
+                            || !(box_delta_config.iou_normalizer * multiplier).is_finite()
+                    })
+            })
+    {
+        return Err(Error::InvalidConfig(
+            "OBB truth-threshold training configs or tensor values are invalid".to_owned(),
+        ));
+    }
+    let stride = match_config
+        .grid_width
+        .checked_mul(match_config.grid_height)
+        .ok_or_else(|| Error::InvalidConfig("OBB head grid size overflows".to_owned()))?;
+    let entries = match_config
+        .classes
+        .checked_add(7)
+        .ok_or_else(|| Error::InvalidConfig("OBB head entry count overflows".to_owned()))?;
+    let per_batch = match_config
+        .mask
+        .len()
+        .checked_mul(entries)
+        .and_then(|count| count.checked_mul(stride))
+        .ok_or_else(|| Error::InvalidConfig("OBB head tensor size overflows".to_owned()))?;
+    let expected = batch_truths
+        .len()
+        .checked_mul(per_batch)
+        .ok_or_else(|| Error::InvalidConfig("OBB batch tensor size overflows".to_owned()))?;
+    if head_output.len() != expected || head_delta.len() != expected {
+        return Err(Error::InvalidConfig(format!(
+            "OBB truth-threshold tensor length mismatch: expected {expected}, output {}, delta {}",
+            head_output.len(),
+            head_delta.len()
+        )));
+    }
+    let mut class_outputs = Vec::new();
+    class_outputs
+        .try_reserve_exact(match_config.classes)
+        .map_err(|_| Error::InvalidConfig("OBB class-output allocation failed".to_owned()))?;
+    let mut existing_deltas = Vec::new();
+    existing_deltas
+        .try_reserve_exact(match_config.classes)
+        .map_err(|_| Error::InvalidConfig("OBB class-delta allocation failed".to_owned()))?;
+    let mut positive_count = 0;
+
+    visit_obb_yolo_batch_head_matches(batch_truths, head_output, match_config, |matched| {
+        let Some(truth_index) = matched.truth_match.positive_truth_index else {
+            return Ok(());
+        };
+        let truth = &batch_truths[matched.batch_index][truth_index];
+        let class_id = positive_config
+            .class_map
+            .as_ref()
+            .map_or(truth.class_id, |mapping| mapping[truth.class_id]);
+        let class_multiplier = positive_config
+            .class_multipliers
+            .as_ref()
+            .map_or(1.0, |multipliers| multipliers[class_id]);
+        let cell = matched.cell_y * match_config.grid_width + matched.cell_x;
+        let base =
+            matched.batch_index * per_batch + matched.head_anchor_index * entries * stride + cell;
+        class_outputs.clear();
+        existing_deltas.clear();
+        for class_index in 0..match_config.classes {
+            let index = base + (7 + class_index) * stride;
+            class_outputs.push(finite_or_zero(head_output[index]));
+            existing_deltas.push(head_delta[index]);
+        }
+        let mut class_result = obb_yolo_class_deltas(
+            &class_outputs,
+            &existing_deltas,
+            class_id,
+            focal_loss,
+            label_smooth_eps,
+            positive_config.class_multipliers.as_deref(),
+            cls_normalizer,
+        )?;
+        let iou_multiplier = matched.truth_match.best_score * matched.truth_match.best_score;
+        if match_config.objectness_smooth {
+            class_result.deltas[class_id] =
+                class_multiplier * (iou_multiplier - class_outputs[class_id]);
+        }
+        for (class_index, &delta) in class_result.deltas.iter().enumerate() {
+            let index = base + (7 + class_index) * stride;
+            head_delta[index] = delta;
+        }
+
+        let prediction =
+            std::array::from_fn(|channel| finite_or_zero(head_output[base + channel * stride]));
+        let context = ObbYoloPredictionMatchContext {
+            anchor_width: match_config.anchors[matched.anchor_index * 2],
+            anchor_height: match_config.anchors[matched.anchor_index * 2 + 1],
+            cell_x: matched.cell_x,
+            cell_y: matched.cell_y,
+            grid_width: match_config.grid_width,
+            grid_height: match_config.grid_height,
+            net_width: match_config.net_width,
+            net_height: match_config.net_height,
+            new_coords: match_config.new_coords,
+        };
+        let mut truth_box_delta_config = box_delta_config;
+        truth_box_delta_config.iou_normalizer *= class_multiplier;
+        let box_deltas = obb_yolo_box_regression_deltas(
+            prediction,
+            std::array::from_fn(|channel| head_delta[base + channel * stride]),
+            truth,
+            context,
+            truth_box_delta_config,
+        )?;
+        for (channel, delta) in box_deltas.into_iter().enumerate() {
+            head_delta[base + channel * stride] = delta;
+        }
+        positive_count += 1;
+        Ok(())
+    })?;
+    Ok(positive_count)
+}
+
 /// Apply best-anchor and threshold-selected OBB positive objectness overrides.
 ///
 /// Positives follow source global-anchor selection and mask membership. With
@@ -2005,7 +2169,8 @@ mod tests {
         ObbYoloPositiveKind, ObbYoloPositiveObjectnessConfig, ObbYoloPredictionMatchContext,
         apply_obb_yolo_batch_head_objectness_deltas, apply_obb_yolo_batch_head_positive_box_deltas,
         apply_obb_yolo_batch_head_positive_class_deltas,
-        apply_obb_yolo_batch_head_positive_objectness_deltas, assign_obb_yolo_anchor,
+        apply_obb_yolo_batch_head_positive_objectness_deltas,
+        apply_obb_yolo_batch_head_truth_threshold_deltas, assign_obb_yolo_anchor,
         decode_obb_yolo_prediction, encode_obb_yolo_truth_batch,
         enumerate_obb_yolo_batch_positives, enumerate_obb_yolo_head_positives,
         match_obb_yolo_batch_cell_predictions, match_obb_yolo_cell_prediction,
@@ -2555,6 +2720,116 @@ mod tests {
                 * 2.5)
                 .clamp(-1.0, 1.0);
         assert!((new_coords_actual[0] - expected_x).abs() < 1e-6);
+    }
+
+    #[test]
+    fn truth_threshold_cell_deltas_apply_class_override_and_weighted_box_gradients() {
+        let mut label = truth(0.5, 0.5, 0.2, 0.1);
+        label.front_x = 0.68;
+        label.front_y = 0.55;
+        label.has_front = true;
+        let labels = [vec![label]];
+        let anchors = vec![20.0, 10.0];
+        let head_match = ObbYoloHeadMatchConfig {
+            head_index: 0,
+            anchors: anchors.clone(),
+            mask: vec![0],
+            grid_width: 1,
+            grid_height: 1,
+            classes: 2,
+            net_width: 100,
+            net_height: 100,
+            new_coords: false,
+            score_config: ObbYoloMatchScoreConfig::default(),
+            ignore_thresh: 0.5,
+            truth_thresh: 0.1,
+            objectness_normalizer: 2.0,
+            objectness_smooth: true,
+        };
+        let assignment = ObbYoloPositiveObjectnessConfig {
+            head: ObbYoloHeadAssignmentSpec {
+                mask: vec![0],
+                grid_width: 1,
+                grid_height: 1,
+            },
+            anchors,
+            classes: 2,
+            net_width: 100,
+            net_height: 100,
+            iou_thresh: 1.0,
+            objectness_normalizer: 2.0,
+            objectness_smooth: true,
+            class_map: Some(vec![1, 0]),
+            class_multipliers: Some(vec![2.0, 3.0]),
+        };
+        let output = [0.52, 0.47, 0.1, -0.1, 0.65, 0.55, 0.3, 0.2, 0.4];
+        let mut delta = [0.0; 9];
+        apply_obb_yolo_batch_head_objectness_deltas(&labels, &output, &mut delta, &head_match)
+            .unwrap();
+        let objectness_delta = delta[6];
+        let box_delta_config = ObbYoloBoxDeltaConfig {
+            score: head_match.score_config,
+            iou_normalizer: 0.5,
+            ..ObbYoloBoxDeltaConfig::default()
+        };
+        assert_eq!(
+            apply_obb_yolo_batch_head_truth_threshold_deltas(
+                &labels,
+                &output,
+                &mut delta,
+                &head_match,
+                &assignment,
+                false,
+                0.1,
+                0.5,
+                box_delta_config,
+            )
+            .unwrap(),
+            1
+        );
+        let prediction = [0.52, 0.47, 0.1, -0.1, 0.65, 0.55];
+        let context = ObbYoloPredictionMatchContext {
+            anchor_width: 20.0,
+            anchor_height: 10.0,
+            cell_x: 0,
+            cell_y: 0,
+            grid_width: 1,
+            grid_height: 1,
+            net_width: 100,
+            net_height: 100,
+            new_coords: false,
+        };
+        let match_result = match_obb_yolo_cell_prediction_with_score_config(
+            prediction,
+            &labels[0],
+            &[0.2, 0.4],
+            context,
+            head_match.score_config,
+            head_match.ignore_thresh,
+            head_match.truth_thresh,
+        )
+        .unwrap();
+        assert!(match_result.positive_truth_index.is_some());
+        let iou_multiplier = match_result.best_score * match_result.best_score;
+        assert!((delta[6] - objectness_delta).abs() < 1e-6);
+        assert!((delta[7] + 0.15).abs() < 1e-6);
+        assert!((delta[8] - 3.0 * (iou_multiplier - 0.4)).abs() < 1e-6);
+        let expected_box = obb_yolo_box_regression_deltas(
+            prediction,
+            [0.0; 4],
+            &labels[0][0],
+            context,
+            ObbYoloBoxDeltaConfig {
+                iou_normalizer: 1.5,
+                ..box_delta_config
+            },
+        )
+        .unwrap();
+        for channel in 0..4 {
+            assert!((delta[channel] - expected_box[channel]).abs() < 1e-6);
+        }
+        assert_eq!(delta[4], 0.0);
+        assert_eq!(delta[5], 0.0);
     }
 
     #[test]
