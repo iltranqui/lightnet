@@ -96,6 +96,7 @@ pub struct ObbYoloBatchCellPrediction {
     pub batch_index: usize,
     pub head_index: usize,
     pub anchor_index: usize,
+    pub head_anchor_index: usize,
     pub prediction: [f32; 6],
     pub class_outputs: Vec<f32>,
     pub context: ObbYoloPredictionMatchContext,
@@ -113,6 +114,7 @@ pub struct ObbYoloBatchCellMatch {
     pub batch_index: usize,
     pub head_index: usize,
     pub anchor_index: usize,
+    pub head_anchor_index: usize,
     pub cell_x: usize,
     pub cell_y: usize,
     pub truth_match: ObbYoloCellTruthMatch,
@@ -1181,6 +1183,7 @@ pub fn match_obb_yolo_batch_cell_predictions(
             batch_index: cell.batch_index,
             head_index: cell.head_index,
             anchor_index: cell.anchor_index,
+            head_anchor_index: cell.head_anchor_index,
             cell_x: cell.context.cell_x,
             cell_y: cell.context.cell_y,
             truth_match,
@@ -1294,6 +1297,7 @@ pub fn visit_obb_yolo_batch_head_matches(
                         batch_index,
                         head_index: config.head_index,
                         anchor_index,
+                        head_anchor_index,
                         cell_x,
                         cell_y,
                         truth_match,
@@ -1304,6 +1308,58 @@ pub fn visit_obb_yolo_batch_head_matches(
         }
     }
     Ok(())
+}
+
+/// Write source OBB objectness deltas into one head's `[batch][entry][cell]` delta tensor.
+///
+/// Only entry 6 for each cell/anchor is touched; coordinate, front, and class
+/// deltas are preserved for subsequent training passes. Like the source layer,
+/// objectness deltas are assigned rather than accumulated.
+pub fn apply_obb_yolo_batch_head_objectness_deltas(
+    batch_truths: &[Vec<ObbLabel>],
+    head_output: &[f32],
+    head_delta: &mut [f32],
+    config: &ObbYoloHeadMatchConfig,
+) -> Result<()> {
+    if head_delta.len() != head_output.len() {
+        return Err(Error::InvalidConfig(format!(
+            "OBB head delta length mismatch: expected {}, got {}",
+            head_output.len(),
+            head_delta.len()
+        )));
+    }
+    let stride = config
+        .grid_width
+        .checked_mul(config.grid_height)
+        .ok_or_else(|| Error::InvalidConfig("OBB head grid size overflows".to_owned()))?;
+    let entries = config
+        .classes
+        .checked_add(7)
+        .ok_or_else(|| Error::InvalidConfig("OBB head entry count overflows".to_owned()))?;
+    let per_batch = config
+        .mask
+        .len()
+        .checked_mul(entries)
+        .and_then(|count| count.checked_mul(stride))
+        .ok_or_else(|| Error::InvalidConfig("OBB head tensor size overflows".to_owned()))?;
+    let expected = batch_truths
+        .len()
+        .checked_mul(per_batch)
+        .ok_or_else(|| Error::InvalidConfig("OBB batch tensor size overflows".to_owned()))?;
+    if head_delta.len() != expected {
+        return Err(Error::InvalidConfig(format!(
+            "OBB head delta length mismatch: expected {expected}, got {}",
+            head_delta.len()
+        )));
+    }
+
+    visit_obb_yolo_batch_head_matches(batch_truths, head_output, config, |matched| {
+        let cell_index = matched.cell_y * config.grid_width + matched.cell_x;
+        let channel = matched.head_anchor_index * entries + 6;
+        let index = matched.batch_index * per_batch + channel * stride + cell_index;
+        head_delta[index] = matched.objectness_delta;
+        Ok(())
+    })
 }
 
 fn validate_anchor_assignment_inputs(
@@ -1395,13 +1451,14 @@ mod tests {
         OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloBatchCellPrediction,
         ObbYoloCellTruthMatch, ObbYoloHeadAssignmentSpec, ObbYoloHeadMatchConfig,
         ObbYoloMatchScoreBranch, ObbYoloMatchScoreConfig, ObbYoloPositiveKind,
-        ObbYoloPredictionMatchContext, assign_obb_yolo_anchor, encode_obb_yolo_truth_batch,
-        enumerate_obb_yolo_batch_positives, enumerate_obb_yolo_head_positives,
-        match_obb_yolo_batch_cell_predictions, match_obb_yolo_cell_prediction,
-        match_obb_yolo_cell_prediction_with_score_config, obb_yolo_anchor_match_score,
-        obb_yolo_angular_prediction_match_score_with_viou, obb_yolo_cell_objectness_delta,
-        obb_yolo_ciou_prediction_match_score, obb_yolo_class_deltas,
-        obb_yolo_cobb_prediction_match_score_with_viou, obb_yolo_covariance_prediction_match_score,
+        ObbYoloPredictionMatchContext, apply_obb_yolo_batch_head_objectness_deltas,
+        assign_obb_yolo_anchor, encode_obb_yolo_truth_batch, enumerate_obb_yolo_batch_positives,
+        enumerate_obb_yolo_head_positives, match_obb_yolo_batch_cell_predictions,
+        match_obb_yolo_cell_prediction, match_obb_yolo_cell_prediction_with_score_config,
+        obb_yolo_anchor_match_score, obb_yolo_angular_prediction_match_score_with_viou,
+        obb_yolo_cell_objectness_delta, obb_yolo_ciou_prediction_match_score,
+        obb_yolo_class_deltas, obb_yolo_cobb_prediction_match_score_with_viou,
+        obb_yolo_covariance_prediction_match_score,
         obb_yolo_covariance_prediction_match_score_with_viou, obb_yolo_match_score,
         select_obb_yolo_cell_truth_match, visit_obb_yolo_batch_head_matches,
     };
@@ -1642,6 +1699,7 @@ mod tests {
                     batch_index: 1,
                     head_index: 2,
                     anchor_index: 4,
+                    head_anchor_index: 0,
                     prediction,
                     class_outputs: vec![0.9],
                     context,
@@ -1656,6 +1714,7 @@ mod tests {
                     batch_index: 0,
                     head_index: 1,
                     anchor_index: 3,
+                    head_anchor_index: 0,
                     prediction,
                     class_outputs: vec![0.9],
                     context,
@@ -1672,11 +1731,13 @@ mod tests {
         assert_eq!(matches.len(), 2);
         assert_eq!((matches[0].batch_index, matches[0].head_index), (1, 2));
         assert_eq!(matches[0].anchor_index, 4);
+        assert_eq!(matches[0].head_anchor_index, 0);
         assert!(matches[0].truth_match.best_score < 0.5);
         assert_eq!(matches[0].truth_match.positive_truth_index, None);
         assert!((matches[0].objectness_delta + 0.25).abs() < 1e-6);
         assert_eq!((matches[1].batch_index, matches[1].head_index), (0, 1));
         assert_eq!(matches[1].anchor_index, 3);
+        assert_eq!(matches[1].head_anchor_index, 0);
         assert_eq!(matches[1].truth_match.positive_truth_index, Some(0));
         assert!(matches[1].truth_match.best_score > 0.99);
         assert!((matches[1].objectness_delta - 0.75).abs() < 1e-6);
@@ -1699,6 +1760,7 @@ mod tests {
             batch_index: 1,
             head_index: 0,
             anchor_index: 0,
+            head_anchor_index: 0,
             prediction: [0.0; 6],
             class_outputs: vec![0.0],
             context,
@@ -1710,6 +1772,78 @@ mod tests {
             objectness_smooth: false,
         };
         assert!(match_obb_yolo_batch_cell_predictions(&[Vec::new()], &[cell]).is_err());
+    }
+
+    #[test]
+    fn batch_head_objectness_delta_writeback_preserves_other_entries() {
+        let truths = [vec![truth(0.5, 0.5, 0.2, 0.2)], Vec::new()];
+        let config = ObbYoloHeadMatchConfig {
+            head_index: 0,
+            anchors: vec![10.0, 10.0, 20.0, 20.0],
+            mask: vec![1],
+            grid_width: 1,
+            grid_height: 1,
+            classes: 1,
+            net_width: 100,
+            net_height: 100,
+            new_coords: false,
+            score_config: ObbYoloMatchScoreConfig {
+                covariance_normalizer: 1.0,
+                ..ObbYoloMatchScoreConfig::default()
+            },
+            ignore_thresh: 0.5,
+            truth_thresh: 0.5,
+            objectness_normalizer: 1.0,
+            objectness_smooth: false,
+        };
+        let head_output = [
+            0.5, 0.5, 0.0, 0.0, 0.5, 0.5, 0.9, 0.9, 0.5, 0.5, 0.0, 0.0, 0.5, 0.5, 0.25, 0.9,
+        ];
+        let mut head_delta = vec![7.0; head_output.len()];
+        apply_obb_yolo_batch_head_objectness_deltas(
+            &truths,
+            &head_output,
+            &mut head_delta,
+            &config,
+        )
+        .unwrap();
+        assert!((head_delta[6] - 0.1).abs() < 1e-6);
+        assert!((head_delta[14] + 0.25).abs() < 1e-6);
+        for (index, &value) in head_delta.iter().enumerate() {
+            if index != 6 && index != 14 {
+                assert_eq!(value, 7.0, "delta entry {index} changed");
+            }
+        }
+    }
+
+    #[test]
+    fn batch_head_objectness_delta_writeback_rejects_mismatched_delta_shape() {
+        let config = ObbYoloHeadMatchConfig {
+            head_index: 0,
+            anchors: vec![10.0, 10.0],
+            mask: vec![0],
+            grid_width: 1,
+            grid_height: 1,
+            classes: 1,
+            net_width: 10,
+            net_height: 10,
+            new_coords: false,
+            score_config: ObbYoloMatchScoreConfig::default(),
+            ignore_thresh: 0.5,
+            truth_thresh: 0.5,
+            objectness_normalizer: 1.0,
+            objectness_smooth: false,
+        };
+        let mut head_delta = [0.0; 7];
+        assert!(
+            apply_obb_yolo_batch_head_objectness_deltas(
+                &[Vec::new()],
+                &[0.0; 8],
+                &mut head_delta,
+                &config,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1787,9 +1921,19 @@ mod tests {
         .unwrap();
         let observed: Vec<_> = matches
             .iter()
-            .map(|matched| (matched.anchor_index, matched.cell_x, matched.cell_y))
+            .map(|matched| {
+                (
+                    matched.anchor_index,
+                    matched.head_anchor_index,
+                    matched.cell_x,
+                    matched.cell_y,
+                )
+            })
             .collect();
-        assert_eq!(observed, [(1, 0, 0), (0, 0, 0), (1, 1, 0), (0, 1, 0)]);
+        assert_eq!(
+            observed,
+            [(1, 0, 0, 0), (0, 1, 0, 0), (1, 0, 1, 0), (0, 1, 1, 0)]
+        );
         assert!(
             matches
                 .iter()
