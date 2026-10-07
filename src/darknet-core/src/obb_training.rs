@@ -9,8 +9,9 @@
 use crate::detect::DetectionBox;
 use crate::error::{Error, Result};
 use crate::obb_geometry::{
-    BoxObb, blend_obb_score_with_qbbv_viou, box_ciou_angular_quality_score,
-    box_ciou_obb_quality_score, box_covariance_w2_obb_quality_score,
+    BoxObb, ObbCobbLossConfig, blend_obb_score_with_qbbv_viou, box_ciou_angular_quality_score,
+    box_ciou_obb_quality_score, box_cobb_obb_quality_score_with_viou,
+    box_covariance_w2_obb_quality_score,
 };
 use crate::obb_labels::ObbLabel;
 
@@ -602,6 +603,51 @@ pub fn obb_yolo_angular_prediction_match_score_with_viou(
     ))
 }
 
+/// Decode one source YOLO output row and score it with the gated COBB branch.
+///
+/// The covariance branch takes priority; a positive finite covariance
+/// normalizer, or an inactive COBB normalizer, is rejected. As in the source,
+/// the COBB normalizer gates branch selection but does not scale this score.
+/// The decoded geometry uses the direct front-channel transform; center-front
+/// anchor adjustment and full batch/training integration are not handled here.
+#[allow(clippy::too_many_arguments)]
+pub fn obb_yolo_cobb_prediction_match_score_with_viou(
+    prediction: [f32; 6],
+    truth: &ObbLabel,
+    context: ObbYoloPredictionMatchContext,
+    covariance_normalizer: f32,
+    cobb_normalizer: f32,
+    cobb_config: ObbCobbLossConfig,
+    viou_weight: f32,
+) -> Result<f32> {
+    validate_truth(truth)?;
+    if (covariance_normalizer.is_finite() && covariance_normalizer > 0.0)
+        || !cobb_normalizer.is_finite()
+        || cobb_normalizer <= 0.0
+    {
+        return Err(Error::InvalidConfig(
+            "OBB matching requires an active COBB branch without covariance priority".to_owned(),
+        ));
+    }
+    let prediction = decode_obb_yolo_prediction(prediction, context)?;
+    let truth = BoxObb {
+        bbox: DetectionBox {
+            x: truth.x,
+            y: truth.y,
+            w: truth.w,
+            h: truth.h,
+        },
+        front_x: truth.front_x,
+        front_y: truth.front_y,
+    };
+    Ok(box_cobb_obb_quality_score_with_viou(
+        prediction,
+        truth,
+        cobb_config,
+        viou_weight,
+    ))
+}
+
 /// Decode one source YOLO output row and score it against a truth with the
 /// source CIoU-OBB matching metric.
 ///
@@ -943,7 +989,8 @@ mod tests {
         enumerate_obb_yolo_head_positives, match_obb_yolo_cell_prediction,
         obb_yolo_anchor_match_score, obb_yolo_angular_prediction_match_score_with_viou,
         obb_yolo_cell_objectness_delta, obb_yolo_ciou_prediction_match_score,
-        obb_yolo_class_deltas, obb_yolo_covariance_prediction_match_score,
+        obb_yolo_class_deltas, obb_yolo_cobb_prediction_match_score_with_viou,
+        obb_yolo_covariance_prediction_match_score,
         obb_yolo_covariance_prediction_match_score_with_viou, select_obb_yolo_cell_truth_match,
     };
     use crate::obb_labels::ObbLabel;
@@ -1390,6 +1437,81 @@ mod tests {
             )
             .unwrap(),
             1.0
+        );
+    }
+
+    #[test]
+    fn cobb_prediction_match_decodes_branch_gates_and_qbbv_blend() {
+        let context = ObbYoloPredictionMatchContext {
+            anchor_width: 2.0,
+            anchor_height: 4.0,
+            cell_x: 0,
+            cell_y: 0,
+            grid_width: 1,
+            grid_height: 1,
+            net_width: 1,
+            net_height: 1,
+            new_coords: false,
+        };
+        let mut label = truth(0.5, 0.5, 2.0, 4.0);
+        label.front_x = 0.5;
+        label.front_y = 4.5;
+        label.has_front = true;
+        let config = crate::obb_geometry::ObbCobbLossConfig::default();
+        let exact = [0.5, 0.5, 0.0, 0.0, 0.5, 4.5];
+        assert_eq!(
+            obb_yolo_cobb_prediction_match_score_with_viou(
+                exact, &label, context, 0.0, 1.0, config, 0.2,
+            )
+            .unwrap(),
+            1.0
+        );
+
+        let rotated = [0.5, 0.5, 0.0, 0.0, 4.5, 0.5];
+        let base = obb_yolo_cobb_prediction_match_score_with_viou(
+            rotated, &label, context, 0.0, 1.0, config, 0.0,
+        )
+        .unwrap();
+        assert!(base < 1.0);
+        let blended = obb_yolo_cobb_prediction_match_score_with_viou(
+            rotated, &label, context, 0.0, 1.0, config, 0.35,
+        )
+        .unwrap();
+        let prediction_geometry = crate::obb_geometry::BoxObb {
+            bbox: crate::detect::DetectionBox {
+                x: 0.5,
+                y: 0.5,
+                w: 2.0,
+                h: 4.0,
+            },
+            front_x: 4.5,
+            front_y: 0.5,
+        };
+        let truth_geometry = crate::obb_geometry::BoxObb {
+            bbox: prediction_geometry.bbox,
+            front_x: 0.5,
+            front_y: 4.5,
+        };
+        assert_eq!(
+            blended,
+            crate::obb_geometry::box_cobb_obb_quality_score_with_viou(
+                prediction_geometry,
+                truth_geometry,
+                config,
+                0.35,
+            )
+        );
+        assert!(
+            obb_yolo_cobb_prediction_match_score_with_viou(
+                exact, &label, context, 1.0, 1.0, config, 0.2,
+            )
+            .is_err()
+        );
+        assert!(
+            obb_yolo_cobb_prediction_match_score_with_viou(
+                exact, &label, context, 0.0, 0.0, config, 0.2,
+            )
+            .is_err()
         );
     }
 

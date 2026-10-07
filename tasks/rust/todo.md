@@ -264,10 +264,10 @@ Immediately next, in dependency order:
   v103 adds the source QBBV heatmap and sampled vIoU metric; v104 adds the
   source QBBV blend and covariance-branch integration; v105 adds the source
   legacy angular fallback scorer and one-cell decode/blend; v106 adds decoded
-  COBB loss/quality and QBBV blending. Multi-branch branch selection/aggregation,
-  raw-channel COBB decode and training-loss/delta integration, batch and
-  positive-anchor assignment integration, complete class/box
-  losses and deltas, trainer integration, crop/resize and mosaic transforms,
+  COBB loss/quality and QBBV blending; v107 adds raw-channel COBB match decoding
+  and source branch gates. Multi-branch assignment aggregation, COBB regression
+  gradients/deltas, batch and positive-anchor assignment, remaining integrated
+  class/box losses and training-loop integration, crop/resize and mosaic transforms,
   alternate NMS-kind implementations, training `-map` cadence, and CARPN network
   decoding/validation integration remain open.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and
