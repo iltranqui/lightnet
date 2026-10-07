@@ -174,6 +174,17 @@ impl ObbYoloClassDeltaStats {
     }
 }
 
+/// Counts and class metrics produced by one head's composed OBB delta passes.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ObbYoloHeadTrainingDeltaStats {
+    /// Truth-threshold cell positives (not included in source `avg_cat`).
+    pub truth_threshold_positive_cells: usize,
+    /// `avg_cat` sum/count from best/additional anchor class assignments.
+    pub anchor_class_stats: ObbYoloClassDeltaStats,
+    /// Best/additional positive assignments that received box deltas.
+    pub anchor_box_positive_count: usize,
+}
+
 /// Geometry shared by the per-cell prediction-match score calculation.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ObbYoloPredictionMatchContext {
@@ -2077,6 +2088,87 @@ pub fn apply_obb_yolo_batch_head_positive_box_deltas(
     Ok(positives.len())
 }
 
+/// Dispatch source-ordered training deltas for one complete OBB YOLO head.
+///
+/// The pass order is all-cell objectness, truth-threshold class/box deltas,
+/// best/additional positive objectness, then their class and box deltas. This
+/// composes the existing per-head primitives; it does not run a multi-head
+/// trainer, front-point loss, full metric aggregation, or network backprop.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_obb_yolo_batch_head_training_deltas(
+    batch_truths: &[Vec<ObbLabel>],
+    head_output: &[f32],
+    head_delta: &mut [f32],
+    match_config: &ObbYoloHeadMatchConfig,
+    assignment_config: &ObbYoloPositiveObjectnessConfig,
+    focal_loss: bool,
+    label_smooth_eps: f32,
+    cls_normalizer: f32,
+    box_delta_config: ObbYoloBoxDeltaConfig,
+) -> Result<ObbYoloHeadTrainingDeltaStats> {
+    if match_config.anchors != assignment_config.anchors
+        || match_config.mask != assignment_config.head.mask
+        || match_config.grid_width != assignment_config.head.grid_width
+        || match_config.grid_height != assignment_config.head.grid_height
+        || match_config.classes != assignment_config.classes
+        || match_config.net_width != assignment_config.net_width
+        || match_config.net_height != assignment_config.net_height
+        || match_config.objectness_normalizer != assignment_config.objectness_normalizer
+        || match_config.objectness_smooth != assignment_config.objectness_smooth
+    {
+        return Err(Error::InvalidConfig(
+            "OBB head training passes require matching head and assignment configs".to_owned(),
+        ));
+    }
+
+    apply_obb_yolo_batch_head_objectness_deltas(
+        batch_truths,
+        head_output,
+        head_delta,
+        match_config,
+    )?;
+    let truth_threshold_positive_cells = apply_obb_yolo_batch_head_truth_threshold_deltas(
+        batch_truths,
+        head_output,
+        head_delta,
+        match_config,
+        assignment_config,
+        focal_loss,
+        label_smooth_eps,
+        cls_normalizer,
+        box_delta_config,
+    )?;
+    apply_obb_yolo_batch_head_positive_objectness_deltas(
+        batch_truths,
+        head_output,
+        head_delta,
+        assignment_config,
+    )?;
+    let anchor_class_stats = apply_obb_yolo_batch_head_positive_class_deltas(
+        batch_truths,
+        head_output,
+        head_delta,
+        assignment_config,
+        focal_loss,
+        label_smooth_eps,
+        cls_normalizer,
+    )?;
+    let anchor_box_positive_count = apply_obb_yolo_batch_head_positive_box_deltas(
+        batch_truths,
+        head_output,
+        head_delta,
+        assignment_config,
+        match_config.new_coords,
+        box_delta_config,
+    )?;
+
+    Ok(ObbYoloHeadTrainingDeltaStats {
+        truth_threshold_positive_cells,
+        anchor_class_stats,
+        anchor_box_positive_count,
+    })
+}
+
 fn validate_anchor_assignment_inputs(
     anchors: &[f32],
     mask: &[usize],
@@ -2170,6 +2262,7 @@ mod tests {
         apply_obb_yolo_batch_head_objectness_deltas, apply_obb_yolo_batch_head_positive_box_deltas,
         apply_obb_yolo_batch_head_positive_class_deltas,
         apply_obb_yolo_batch_head_positive_objectness_deltas,
+        apply_obb_yolo_batch_head_training_deltas,
         apply_obb_yolo_batch_head_truth_threshold_deltas, assign_obb_yolo_anchor,
         decode_obb_yolo_prediction, encode_obb_yolo_truth_batch,
         enumerate_obb_yolo_batch_positives, enumerate_obb_yolo_head_positives,
@@ -2830,6 +2923,68 @@ mod tests {
         }
         assert_eq!(delta[4], 0.0);
         assert_eq!(delta[5], 0.0);
+
+        let mut sequenced = [0.0; 9];
+        apply_obb_yolo_batch_head_objectness_deltas(&labels, &output, &mut sequenced, &head_match)
+            .unwrap();
+        let truth_threshold_positive_cells = apply_obb_yolo_batch_head_truth_threshold_deltas(
+            &labels,
+            &output,
+            &mut sequenced,
+            &head_match,
+            &assignment,
+            false,
+            0.1,
+            0.5,
+            box_delta_config,
+        )
+        .unwrap();
+        apply_obb_yolo_batch_head_positive_objectness_deltas(
+            &labels,
+            &output,
+            &mut sequenced,
+            &assignment,
+        )
+        .unwrap();
+        let anchor_class_stats = apply_obb_yolo_batch_head_positive_class_deltas(
+            &labels,
+            &output,
+            &mut sequenced,
+            &assignment,
+            false,
+            0.1,
+            0.5,
+        )
+        .unwrap();
+        let anchor_box_positive_count = apply_obb_yolo_batch_head_positive_box_deltas(
+            &labels,
+            &output,
+            &mut sequenced,
+            &assignment,
+            head_match.new_coords,
+            box_delta_config,
+        )
+        .unwrap();
+        let mut dispatched = [0.0; 9];
+        let stats = apply_obb_yolo_batch_head_training_deltas(
+            &labels,
+            &output,
+            &mut dispatched,
+            &head_match,
+            &assignment,
+            false,
+            0.1,
+            0.5,
+            box_delta_config,
+        )
+        .unwrap();
+        assert_eq!(dispatched, sequenced);
+        assert_eq!(
+            stats.truth_threshold_positive_cells,
+            truth_threshold_positive_cells
+        );
+        assert_eq!(stats.anchor_class_stats, anchor_class_stats);
+        assert_eq!(stats.anchor_box_positive_count, anchor_box_positive_count);
     }
 
     #[test]
