@@ -34,6 +34,7 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v126: routed optional per-anchor front offsets through full-head score matching and truth/positive box deltas, including the covariance center-chain contribution; the focused training test and all 100 OBB-filtered host tests passed. cfg ingestion/inference decode and raw front-channel gradients remain open.
 - v125: added standalone `decode_obb_yolo_front_point` for legacy cell-relative or source directional-anchor-prior decoding, with finite-offset validation. The focused test and all 99 OBB-filtered host tests passed. Config loading and routing these offsets through matcher/trainer/network decode remain open.
 - v124: added multi-head delta dispatch across separate head tensors with shared global anchors/classes/network dimensions and per-head stats; the focused dispatch test and all 98 OBB-filtered host tests passed. Network-loop/backprop integration remains open.
 - v123: composed the one-head delta passes in source order with `apply_obb_yolo_batch_head_training_deltas`, returning the anchor `avg_cat` stats and separate threshold/anchor counts. The focused composition test and all 97 OBB-filtered host tests passed. Multi-head trainer dispatch, front-point deltas, and broader losses/metrics remain open.

@@ -74,6 +74,8 @@ pub struct ObbYoloHeadMatchConfig {
     pub net_width: usize,
     pub net_height: usize,
     pub new_coords: bool,
+    /// Optional source `obb_anchor_offsets` values, indexed by global anchor.
+    pub front_anchor_offsets: Option<Vec<[f32; 2]>>,
     pub score_config: ObbYoloMatchScoreConfig,
     pub ignore_thresh: f32,
     pub truth_thresh: f32,
@@ -89,6 +91,8 @@ pub struct ObbYoloPositiveObjectnessConfig {
     pub classes: usize,
     pub net_width: usize,
     pub net_height: usize,
+    /// Optional source `obb_anchor_offsets` values, indexed by global anchor.
+    pub front_anchor_offsets: Option<Vec<[f32; 2]>>,
     pub iou_thresh: f32,
     pub objectness_normalizer: f32,
     pub objectness_smooth: bool,
@@ -923,6 +927,28 @@ pub fn obb_yolo_match_score(
     })
 }
 
+fn obb_yolo_match_score_with_front_anchor_offset(
+    prediction: [f32; 6],
+    truth: &ObbLabel,
+    context: ObbYoloPredictionMatchContext,
+    config: ObbYoloMatchScoreConfig,
+    front_anchor_offset: Option<[f32; 2]>,
+) -> Result<ObbYoloMatchScore> {
+    let Some(front_anchor_offset) = front_anchor_offset else {
+        return obb_yolo_match_score(prediction, truth, context, config);
+    };
+    let front = decode_obb_yolo_front_point(prediction, context, Some(front_anchor_offset))?;
+    let mut adjusted_prediction = prediction;
+    adjusted_prediction[4] = front[0] * context.grid_width as f32 - context.cell_x as f32;
+    adjusted_prediction[5] = front[1] * context.grid_height as f32 - context.cell_y as f32;
+    if !adjusted_prediction[4].is_finite() || !adjusted_prediction[5].is_finite() {
+        return Err(Error::InvalidConfig(
+            "OBB adjusted front channels are non-finite".to_owned(),
+        ));
+    }
+    obb_yolo_match_score(adjusted_prediction, truth, context, config)
+}
+
 /// Decode one source YOLO output row and score it against a truth with the
 /// source CIoU-OBB matching metric.
 ///
@@ -993,6 +1019,24 @@ pub fn obb_yolo_box_regression_deltas(
     context: ObbYoloPredictionMatchContext,
     config: ObbYoloBoxDeltaConfig,
 ) -> Result<[f32; 4]> {
+    obb_yolo_box_regression_deltas_with_front_anchor_offset(
+        prediction,
+        existing_deltas,
+        truth,
+        context,
+        config,
+        None,
+    )
+}
+
+fn obb_yolo_box_regression_deltas_with_front_anchor_offset(
+    prediction: [f32; 6],
+    existing_deltas: [f32; 4],
+    truth: &ObbLabel,
+    context: ObbYoloPredictionMatchContext,
+    config: ObbYoloBoxDeltaConfig,
+    front_anchor_offset: Option<[f32; 2]>,
+) -> Result<[f32; 4]> {
     validate_truth(truth)?;
     let covariance_active =
         config.score.covariance_normalizer.is_finite() && config.score.covariance_normalizer > 0.0;
@@ -1017,7 +1061,11 @@ pub fn obb_yolo_box_regression_deltas(
         config.max_delta
     };
     if covariance_active {
-        let decoded = decode_obb_yolo_prediction(prediction, context)?;
+        let decoded = decode_obb_yolo_prediction_with_front_anchor_offset(
+            prediction,
+            context,
+            front_anchor_offset,
+        )?;
         let cov_w = (decoded.bbox.w - 1e-6).max(1e-6);
         let cov_h = (decoded.bbox.h - 1e-6).max(1e-6);
         let inverse_softplus = |value: f32| {
@@ -1064,8 +1112,20 @@ pub fn obb_yolo_box_regression_deltas(
         } else {
             decoded.bbox.h
         };
-        let d_loss_dtx = cov.gradient.dx / context.grid_width as f32;
-        let d_loss_dty = cov.gradient.dy / context.grid_height as f32;
+        let d_loss_dtx = (cov.gradient.dx
+            + if front_anchor_offset.is_some() {
+                cov.gradient.dfx
+            } else {
+                0.0
+            })
+            / context.grid_width as f32;
+        let d_loss_dty = (cov.gradient.dy
+            + if front_anchor_offset.is_some() {
+                cov.gradient.dfy
+            } else {
+                0.0
+            })
+            / context.grid_height as f32;
         let sigmoid_deriv_x = if context.new_coords {
             1.0
         } else {
@@ -1093,7 +1153,14 @@ pub fn obb_yolo_box_regression_deltas(
     }
 
     let evaluate = |channels: [f32; 6]| -> Result<f32> {
-        Ok(obb_yolo_match_score(channels, truth, context, config.score)?.score)
+        Ok(obb_yolo_match_score_with_front_anchor_offset(
+            channels,
+            truth,
+            context,
+            config.score,
+            front_anchor_offset,
+        )?
+        .score)
     };
     let scale = config.iou_normalizer
         * if config.score.cobb_normalizer.is_finite() && config.score.cobb_normalizer > 0.0 {
@@ -1232,6 +1299,21 @@ pub fn decode_obb_yolo_front_point(
             "OBB decoded front point is non-finite".to_owned(),
         ))
     }
+}
+
+fn decode_obb_yolo_prediction_with_front_anchor_offset(
+    prediction: [f32; 6],
+    context: ObbYoloPredictionMatchContext,
+    front_anchor_offset: Option<[f32; 2]>,
+) -> Result<BoxObb> {
+    let mut decoded = decode_obb_yolo_prediction(prediction, context)?;
+    if front_anchor_offset.is_some() {
+        let [front_x, front_y] =
+            decode_obb_yolo_front_point(prediction, context, front_anchor_offset)?;
+        decoded.front_x = front_x;
+        decoded.front_y = front_y;
+    }
+    Ok(decoded)
 }
 
 /// Calculate one positive cell's source OBB YOLO class-channel deltas.
@@ -1380,6 +1462,28 @@ pub fn match_obb_yolo_cell_prediction_with_score_config(
     ignore_thresh: f32,
     truth_thresh: f32,
 ) -> Result<ObbYoloCellTruthMatch> {
+    match_obb_yolo_cell_prediction_with_front_anchor_offset(
+        prediction,
+        truths,
+        class_outputs,
+        context,
+        score_config,
+        ignore_thresh,
+        truth_thresh,
+        None,
+    )
+}
+
+fn match_obb_yolo_cell_prediction_with_front_anchor_offset(
+    prediction: [f32; 6],
+    truths: &[ObbLabel],
+    class_outputs: &[f32],
+    context: ObbYoloPredictionMatchContext,
+    score_config: ObbYoloMatchScoreConfig,
+    ignore_thresh: f32,
+    truth_thresh: f32,
+    front_anchor_offset: Option<[f32; 2]>,
+) -> Result<ObbYoloCellTruthMatch> {
     let mut scores = Vec::new();
     scores
         .try_reserve_exact(truths.len())
@@ -1388,7 +1492,16 @@ pub fn match_obb_yolo_cell_prediction_with_score_config(
         if truth.x == 0.0 {
             break;
         }
-        scores.push(obb_yolo_match_score(prediction, truth, context, score_config)?.score);
+        scores.push(
+            obb_yolo_match_score_with_front_anchor_offset(
+                prediction,
+                truth,
+                context,
+                score_config,
+                front_anchor_offset,
+            )?
+            .score,
+        );
     }
     select_obb_yolo_cell_truth_match(&scores, class_outputs, ignore_thresh, truth_thresh)
 }
@@ -1475,6 +1588,10 @@ pub fn visit_obb_yolo_batch_head_matches(
         config.grid_width,
         config.grid_height,
     )?;
+    validate_anchor_front_offsets(
+        config.front_anchor_offsets.as_deref(),
+        config.anchors.len() / 2,
+    )?;
     let stride = config
         .grid_width
         .checked_mul(config.grid_height)
@@ -1529,7 +1646,7 @@ pub fn visit_obb_yolo_batch_head_matches(
                         net_height: config.net_height,
                         new_coords: config.new_coords,
                     };
-                    let truth_match = match_obb_yolo_cell_prediction_with_score_config(
+                    let truth_match = match_obb_yolo_cell_prediction_with_front_anchor_offset(
                         prediction,
                         truths,
                         &class_outputs,
@@ -1537,6 +1654,10 @@ pub fn visit_obb_yolo_batch_head_matches(
                         config.score_config,
                         config.ignore_thresh,
                         config.truth_thresh,
+                        config
+                            .front_anchor_offsets
+                            .as_ref()
+                            .map(|offsets| offsets[anchor_index]),
                     )?;
                     let objectness_delta = obb_yolo_cell_objectness_delta(
                         truth_match,
@@ -1641,6 +1762,7 @@ pub fn apply_obb_yolo_batch_head_truth_threshold_deltas(
         || match_config.net_height != positive_config.net_height
         || match_config.objectness_normalizer != positive_config.objectness_normalizer
         || match_config.objectness_smooth != positive_config.objectness_smooth
+        || match_config.front_anchor_offsets != positive_config.front_anchor_offsets
         || match_config.score_config != box_delta_config.score
         || !label_smooth_eps.is_finite()
         || !cls_normalizer.is_finite()
@@ -1761,12 +1883,16 @@ pub fn apply_obb_yolo_batch_head_truth_threshold_deltas(
         };
         let mut truth_box_delta_config = box_delta_config;
         truth_box_delta_config.iou_normalizer *= class_multiplier;
-        let box_deltas = obb_yolo_box_regression_deltas(
+        let box_deltas = obb_yolo_box_regression_deltas_with_front_anchor_offset(
             prediction,
             std::array::from_fn(|channel| head_delta[base + channel * stride]),
             truth,
             context,
             truth_box_delta_config,
+            match_config
+                .front_anchor_offsets
+                .as_ref()
+                .map(|offsets| offsets[matched.anchor_index]),
         )?;
         for (channel, delta) in box_deltas.into_iter().enumerate() {
             head_delta[base + channel * stride] = delta;
@@ -2037,6 +2163,10 @@ pub fn apply_obb_yolo_batch_head_positive_box_deltas(
                 .to_owned(),
         ));
     }
+    validate_anchor_front_offsets(
+        assignment.front_anchor_offsets.as_deref(),
+        assignment.anchors.len() / 2,
+    )?;
     let stride = assignment
         .head
         .grid_width
@@ -2113,12 +2243,16 @@ pub fn apply_obb_yolo_batch_head_positive_box_deltas(
             .map_or(1.0, |multipliers| multipliers[class_id]);
         let mut truth_delta_config = delta_config;
         truth_delta_config.iou_normalizer *= class_multiplier;
-        let deltas = obb_yolo_box_regression_deltas(
+        let deltas = obb_yolo_box_regression_deltas_with_front_anchor_offset(
             prediction,
             existing,
             truth,
             context,
             truth_delta_config,
+            assignment
+                .front_anchor_offsets
+                .as_ref()
+                .map(|offsets| offsets[anchor_index]),
         )?;
         for (channel, delta) in deltas.into_iter().enumerate() {
             head_delta[base + channel * stride] = delta;
@@ -2154,6 +2288,7 @@ pub fn apply_obb_yolo_batch_head_training_deltas(
         || match_config.net_height != assignment_config.net_height
         || match_config.objectness_normalizer != assignment_config.objectness_normalizer
         || match_config.objectness_smooth != assignment_config.objectness_smooth
+        || match_config.front_anchor_offsets != assignment_config.front_anchor_offsets
     {
         return Err(Error::InvalidConfig(
             "OBB head training passes require matching head and assignment configs".to_owned(),
@@ -2245,6 +2380,7 @@ pub fn apply_obb_yolo_batch_multi_head_training_deltas(
             || assignment.classes != first_assignment.classes
             || assignment.net_width != first_assignment.net_width
             || assignment.net_height != first_assignment.net_height
+            || assignment.front_anchor_offsets != first_assignment.front_anchor_offsets
             || match_configs[..head_index]
                 .iter()
                 .any(|previous| previous.head_index == matching.head_index)
@@ -2274,6 +2410,17 @@ pub fn apply_obb_yolo_batch_multi_head_training_deltas(
         )?);
     }
     Ok(stats)
+}
+
+fn validate_anchor_front_offsets(offsets: Option<&[[f32; 2]]>, anchor_count: usize) -> Result<()> {
+    if offsets.is_some_and(|offsets| {
+        offsets.len() != anchor_count || offsets.iter().flatten().any(|value| !value.is_finite())
+    }) {
+        return Err(Error::InvalidConfig(
+            "OBB front-anchor offsets must be finite and match the anchor list".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_anchor_assignment_inputs(
@@ -2732,6 +2879,7 @@ mod tests {
             net_width: 100,
             net_height: 100,
             new_coords: false,
+            front_anchor_offsets: None,
             score_config: ObbYoloMatchScoreConfig {
                 covariance_normalizer: 1.0,
                 ..ObbYoloMatchScoreConfig::default()
@@ -2773,6 +2921,7 @@ mod tests {
             net_width: 10,
             net_height: 10,
             new_coords: false,
+            front_anchor_offsets: None,
             score_config: ObbYoloMatchScoreConfig::default(),
             ignore_thresh: 0.5,
             truth_thresh: 0.5,
@@ -2804,6 +2953,7 @@ mod tests {
             classes: 2,
             net_width: 100,
             net_height: 100,
+            front_anchor_offsets: None,
             iou_thresh: 0.2,
             objectness_normalizer: 2.0,
             objectness_smooth: false,
@@ -2965,6 +3115,7 @@ mod tests {
             net_width: 100,
             net_height: 100,
             new_coords: false,
+            front_anchor_offsets: None,
             score_config: ObbYoloMatchScoreConfig::default(),
             ignore_thresh: 0.5,
             truth_thresh: 0.1,
@@ -2981,6 +3132,7 @@ mod tests {
             classes: 2,
             net_width: 100,
             net_height: 100,
+            front_anchor_offsets: None,
             iou_thresh: 1.0,
             objectness_normalizer: 2.0,
             objectness_smooth: true,
@@ -3120,6 +3272,118 @@ mod tests {
     }
 
     #[test]
+    fn head_training_routes_directional_anchor_priors_through_matching_and_box_deltas() {
+        let mut label = truth(0.5, 0.5, 0.2, 0.1);
+        label.front_x = 0.68;
+        label.front_y = 0.55;
+        label.has_front = true;
+        let labels = [vec![label]];
+        let anchors = vec![20.0, 10.0];
+        let matching = |offsets| ObbYoloHeadMatchConfig {
+            head_index: 0,
+            anchors: anchors.clone(),
+            mask: vec![0],
+            grid_width: 1,
+            grid_height: 1,
+            classes: 1,
+            net_width: 100,
+            net_height: 100,
+            new_coords: false,
+            front_anchor_offsets: offsets,
+            score_config: ObbYoloMatchScoreConfig {
+                covariance_normalizer: 1.0,
+                ..ObbYoloMatchScoreConfig::default()
+            },
+            ignore_thresh: 0.5,
+            truth_thresh: 0.0,
+            objectness_normalizer: 1.0,
+            objectness_smooth: false,
+        };
+        let assignment = |offsets| ObbYoloPositiveObjectnessConfig {
+            head: ObbYoloHeadAssignmentSpec {
+                mask: vec![0],
+                grid_width: 1,
+                grid_height: 1,
+            },
+            anchors: anchors.clone(),
+            classes: 1,
+            net_width: 100,
+            net_height: 100,
+            front_anchor_offsets: offsets,
+            iou_thresh: 1.0,
+            objectness_normalizer: 1.0,
+            objectness_smooth: false,
+            class_map: None,
+            class_multipliers: None,
+        };
+        let output = [0.55, 0.45, 0.0, 0.0, 0.08, 0.05, 0.4, 0.3];
+        let score = ObbYoloMatchScoreConfig {
+            covariance_normalizer: 1.0,
+            ..ObbYoloMatchScoreConfig::default()
+        };
+        let box_config = ObbYoloBoxDeltaConfig {
+            score,
+            iou_normalizer: 0.5,
+            ..ObbYoloBoxDeltaConfig::default()
+        };
+        let offsets = Some(vec![[0.25, 0.5]]);
+        let mut anchored_delta = [0.0; 8];
+        let stats = apply_obb_yolo_batch_head_training_deltas(
+            &labels,
+            &output,
+            &mut anchored_delta,
+            &matching(offsets.clone()),
+            &assignment(offsets),
+            false,
+            0.0,
+            1.0,
+            box_config,
+        )
+        .unwrap();
+        assert_eq!(stats.truth_threshold_positive_cells, 1);
+        assert_eq!(stats.anchor_class_stats.positive_count, 1);
+        assert_eq!(stats.anchor_box_positive_count, 1);
+        assert!(
+            visit_obb_yolo_batch_head_matches(
+                &labels,
+                &output,
+                &matching(Some(vec![])),
+                |_| Ok(()),
+            )
+            .is_err()
+        );
+        assert!(
+            visit_obb_yolo_batch_head_matches(
+                &labels,
+                &output,
+                &matching(Some(vec![[f32::NAN, 0.0]])),
+                |_| Ok(()),
+            )
+            .is_err()
+        );
+
+        let mut direct_delta = [0.0; 8];
+        apply_obb_yolo_batch_head_training_deltas(
+            &labels,
+            &output,
+            &mut direct_delta,
+            &matching(None),
+            &assignment(None),
+            false,
+            0.0,
+            1.0,
+            box_config,
+        )
+        .unwrap();
+        assert!(
+            anchored_delta[..2]
+                .iter()
+                .zip(&direct_delta[..2])
+                .any(|(anchored, direct)| (anchored - direct).abs() > 1e-5)
+        );
+    }
+
+    #[test]
     fn multi_head_training_dispatches_each_head_and_returns_tagged_metrics() {
         let mut label = truth(0.5, 0.5, 0.2, 0.1);
         label.front_x = 0.68;
@@ -3137,6 +3401,7 @@ mod tests {
             net_width: 100,
             net_height: 100,
             new_coords: false,
+            front_anchor_offsets: None,
             score_config: ObbYoloMatchScoreConfig::default(),
             ignore_thresh: 0.5,
             truth_thresh: 0.1,
@@ -3153,6 +3418,7 @@ mod tests {
             classes: 2,
             net_width: 100,
             net_height: 100,
+            front_anchor_offsets: None,
             iou_thresh: 0.1,
             objectness_normalizer: 1.0,
             objectness_smooth: false,
@@ -3218,6 +3484,7 @@ mod tests {
             classes: 1,
             net_width: 100,
             net_height: 100,
+            front_anchor_offsets: None,
             iou_thresh: 0.2,
             objectness_normalizer: 1.0,
             objectness_smooth: false,
@@ -3300,6 +3567,7 @@ mod tests {
             classes: 1,
             net_width: 100,
             net_height: 100,
+            front_anchor_offsets: None,
             iou_thresh: 1.0,
             objectness_normalizer: 1.0,
             objectness_smooth: false,
@@ -3447,6 +3715,7 @@ mod tests {
             classes: 2,
             net_width: 100,
             net_height: 100,
+            front_anchor_offsets: None,
             iou_thresh: 0.2,
             objectness_normalizer: 1.0,
             objectness_smooth: false,
@@ -3497,6 +3766,7 @@ mod tests {
             classes: 1,
             net_width: 10,
             net_height: 10,
+            front_anchor_offsets: None,
             iou_thresh: 1.0,
             objectness_normalizer: 1.0,
             objectness_smooth: false,
@@ -3533,6 +3803,7 @@ mod tests {
             net_width: 100,
             net_height: 100,
             new_coords: false,
+            front_anchor_offsets: None,
             score_config: ObbYoloMatchScoreConfig {
                 covariance_normalizer: 1.0,
                 ..ObbYoloMatchScoreConfig::default()
@@ -3577,6 +3848,7 @@ mod tests {
             net_width: 20,
             net_height: 10,
             new_coords: false,
+            front_anchor_offsets: None,
             score_config: ObbYoloMatchScoreConfig::default(),
             ignore_thresh: 0.5,
             truth_thresh: 0.5,
@@ -3624,6 +3896,7 @@ mod tests {
             net_width: 10,
             net_height: 10,
             new_coords: false,
+            front_anchor_offsets: None,
             score_config: ObbYoloMatchScoreConfig::default(),
             ignore_thresh: 0.5,
             truth_thresh: 0.5,

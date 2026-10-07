@@ -283,8 +283,9 @@ Immediately next, in dependency order:
   to box-delta normalization; v122 applies truth-threshold cell class and box
   deltas after the all-cell objectness pass; v123 composes ordered delta passes
   for one complete head; v124 dispatches those passes across multiple head
-  tensors; v125 adds a standalone center-front-anchor point decoder. Still open:
-  routing offsets through cfg, matcher, trainer, and network decoding, multi-head
+  tensors; v125 adds a standalone center-front-anchor point decoder; v126 routes
+  optional anchor offsets through head matching and box deltas. Still open: cfg
+  ingestion and inference/network decode, raw front-channel gradients, multi-head
   network-loop/backprop integration, truth-threshold metric/loss aggregation,
   integrated losses and training-loop wiring, crop/resize and mosaic transforms,
   alternate NMS-kind implementations, training `-map` cadence, and CARPN network
