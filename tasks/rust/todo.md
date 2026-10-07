@@ -294,7 +294,8 @@ Immediately next, in dependency order:
   across those passes and heads; v135 parses source `obb_anchors` pair/quadruple
   forms and retains per-anchor direction priors; v136 parses the front-loss
   normalizer and alias/default; v137 builds per-head delta configs from parsed
-  OBB specs plus runtime dimensions. Still open: remaining cfg/training option wiring,
+  OBB specs plus runtime dimensions; v138 supports per-head front-loss configs
+  during multi-head dispatch. Still open: remaining cfg/training option wiring,
   inference/network decode integration, network-loop/backprop
   integration, remaining metric/loss aggregation and integrated loss/training-loop
   wiring, crop/resize and mosaic transforms,
