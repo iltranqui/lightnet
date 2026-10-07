@@ -880,6 +880,8 @@ impl ObbNmsKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ObbYoloSpec {
     pub yolo: YoloSpec,
+    /// Optional source `obb_anchors` (u, v) directional prior per global anchor.
+    pub front_anchor_offsets: Option<Vec<[f32; 2]>>,
     pub nms_kind: ObbNmsKind,
 }
 
@@ -2179,10 +2181,44 @@ fn parse_layer_kind(
                     "[obb_yolo] at line {line}: mask indices must be less than num={total}"
                 )));
             }
-            let anchors = section.get_f32_list("anchors")?;
             let required_anchors = total.checked_mul(2).ok_or_else(|| {
                 Error::InvalidConfig(format!("[obb_yolo] at line {line}: anchor count overflows"))
             })?;
+            let required_directional_anchors = total.checked_mul(4).ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "[obb_yolo] at line {line}: directional anchor count overflows"
+                ))
+            })?;
+            let (anchors, front_anchor_offsets) = if section.get("obb_anchors").is_some() {
+                if section.get("anchors").is_some() {
+                    return Err(Error::InvalidConfig(format!(
+                        "[obb_yolo] at line {line}: use either anchors or obb_anchors, not both"
+                    )));
+                }
+                let configured = section.get_f32_list("obb_anchors")?;
+                if configured.len() == required_anchors {
+                    (configured, None)
+                } else if configured.len() == required_directional_anchors {
+                    let mut anchors = Vec::with_capacity(required_anchors);
+                    let mut offsets = Vec::with_capacity(total);
+                    for anchor in configured.chunks_exact(4) {
+                        anchors.extend_from_slice(&anchor[..2]);
+                        if !anchor[2].is_finite() || !anchor[3].is_finite() {
+                            return Err(Error::InvalidConfig(format!(
+                                "[obb_yolo] at line {line}: directional anchor offsets must be finite"
+                            )));
+                        }
+                        offsets.push([anchor[2], anchor[3]]);
+                    }
+                    (anchors, Some(offsets))
+                } else {
+                    return Err(Error::InvalidConfig(format!(
+                        "[obb_yolo] at line {line}: obb_anchors must contain {total} width/height pairs or quadruples"
+                    )));
+                }
+            } else {
+                (section.get_f32_list("anchors")?, None)
+            };
             if anchors.len() < required_anchors
                 || anchors[..required_anchors]
                     .iter()
@@ -2215,6 +2251,7 @@ fn parse_layer_kind(
                 )));
             }
             LayerKind::ObbYolo(ObbYoloSpec {
+                front_anchor_offsets,
                 yolo: YoloSpec {
                     classes,
                     num: total,
@@ -4372,6 +4409,50 @@ mod tests {
                 "invalid OBB cfg should fail: {cfg}"
             );
         }
+    }
+
+    #[test]
+    fn parses_obb_anchor_pair_and_directional_quadruple_forms() {
+        let build = |anchor_key: &str, anchor_values: &str| {
+            let cfg = format!(
+                "[net]\nwidth=4\nheight=2\nchannels=16\nobb=1\n[obb_yolo]\nclasses=1\nnum=2\nmask=0,1\n{anchor_key}={anchor_values}\n"
+            );
+            Network::from_config(ConfigFile::parse_str("obb-anchor-forms.cfg", &cfg).unwrap())
+        };
+
+        let directional = build("obb_anchors", "4,2,0.25,-0.5,8,6,-0.4,0.3")
+            .expect("four-value source anchors parse");
+        let LayerKind::ObbYolo(spec) = &directional.layers[0].kind else {
+            panic!("expected OBB YOLO layer");
+        };
+        assert_eq!(spec.anchors, vec![4.0, 2.0, 8.0, 6.0]);
+        assert_eq!(
+            spec.front_anchor_offsets,
+            Some(vec![[0.25, -0.5], [-0.4, 0.3]])
+        );
+
+        let direction_free =
+            build("obb_anchors", "4,2,8,6").expect("two-value source anchors parse");
+        let LayerKind::ObbYolo(spec) = &direction_free.layers[0].kind else {
+            panic!("expected OBB YOLO layer");
+        };
+        assert_eq!(spec.anchors, vec![4.0, 2.0, 8.0, 6.0]);
+        assert_eq!(spec.front_anchor_offsets, None);
+
+        for values in [
+            "4,2,0.25",                  // wrong cardinality
+            "4,2,NaN,-0.5,8,6,-0.4,0.3", // non-finite directional offset
+        ] {
+            assert!(build("obb_anchors", values).is_err(), "accepted {values}");
+        }
+        let both_keys = Network::from_config(
+            ConfigFile::parse_str(
+                "obb-anchor-forms.cfg",
+                "[net]\nwidth=4\nheight=2\nchannels=16\nobb=1\n[obb_yolo]\nclasses=1\nnum=2\nmask=0,1\nanchors=4,2,8,6\nobb_anchors=4,2,8,6\n",
+            )
+            .unwrap(),
+        );
+        assert!(both_keys.is_err(), "ambiguous anchor keys must fail");
     }
 
     #[test]
