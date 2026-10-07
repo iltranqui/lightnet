@@ -1,9 +1,10 @@
 //! Source-derived training primitives for legacy front-point OBB YOLO heads.
 //!
 //! This module currently covers direction-free anchor matching, per-truth
-//! head-positive enumeration, per-cell match selection, cell selection, and
-//! source-layout truth-row packing only. It does not implement complete truth
-//! assignment, YOLO loss, backward propagation, or optimizer integration.
+//! head-positive enumeration, per-cell match selection and its objectness
+//! delta, cell selection, and source-layout truth-row packing only. It does not
+//! implement complete truth assignment, YOLO loss, backward propagation, or
+//! optimizer integration.
 
 use crate::error::{Error, Result};
 use crate::obb_labels::ObbLabel;
@@ -395,6 +396,64 @@ pub fn select_obb_yolo_cell_truth_match(
     })
 }
 
+/// Calculate the objectness delta for the source OBB YOLO per-cell matching pass.
+///
+/// This consumes the gates from [`select_obb_yolo_cell_truth_match`], not raw
+/// predictions. Ignore matching first applies the negative-objectness delta;
+/// with objectness smoothing it keeps the larger ignore-target delta, otherwise
+/// it zeros the delta. A positive best-truth match then overrides that result,
+/// using `best_score²` as the smoothed target or `1` without smoothing. The
+/// caller remains responsible for per-truth anchor assignments, class/box
+/// deltas, losses, and trainer integration. Non-finite objectness and final
+/// deltas are zeroed as in the C++ training forward.
+pub fn obb_yolo_cell_objectness_delta(
+    cell_match: ObbYoloCellTruthMatch,
+    predicted_objectness: f32,
+    obj_normalizer: f32,
+    objectness_smooth: bool,
+) -> Result<f32> {
+    if !obj_normalizer.is_finite()
+        || !cell_match.best_score.is_finite()
+        || !(0.0..=1.0).contains(&cell_match.best_score)
+        || !cell_match.ignore_match_score.is_finite()
+        || !(0.0..=1.0).contains(&cell_match.ignore_match_score)
+        || (cell_match.positive_truth_index.is_some() && cell_match.best_truth_index.is_none())
+    {
+        return Err(Error::InvalidConfig(
+            "OBB objectness delta requires valid match scores and a finite normalizer".to_owned(),
+        ));
+    }
+
+    let predicted_objectness = if predicted_objectness.is_finite() {
+        predicted_objectness
+    } else {
+        0.0
+    };
+    let mut delta = obj_normalizer * (0.0 - predicted_objectness);
+    if cell_match.ignore_match {
+        if objectness_smooth {
+            let ignore_delta =
+                obj_normalizer * (cell_match.ignore_match_score - predicted_objectness);
+            if ignore_delta > delta {
+                delta = ignore_delta;
+            }
+        } else {
+            delta = 0.0;
+        }
+    }
+
+    if cell_match.positive_truth_index.is_some() {
+        let target = if objectness_smooth {
+            cell_match.best_score * cell_match.best_score
+        } else {
+            1.0
+        };
+        delta = obj_normalizer * (target - predicted_objectness);
+    }
+
+    Ok(if delta.is_finite() { delta } else { 0.0 })
+}
+
 fn validate_anchor_assignment_inputs(
     anchors: &[f32],
     mask: &[usize],
@@ -483,7 +542,8 @@ mod tests {
     use super::{
         OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloCellTruthMatch, ObbYoloPositiveKind,
         assign_obb_yolo_anchor, encode_obb_yolo_truth_batch, enumerate_obb_yolo_head_positives,
-        obb_yolo_anchor_match_score, select_obb_yolo_cell_truth_match,
+        obb_yolo_anchor_match_score, obb_yolo_cell_objectness_delta,
+        select_obb_yolo_cell_truth_match,
     };
     use crate::obb_labels::ObbLabel;
 
@@ -771,6 +831,60 @@ mod tests {
         assert_eq!(selected.positive_truth_index, None);
         assert_eq!(selected.ignore_match_score, 0.5);
         assert!(!selected.ignore_match);
+    }
+
+    #[test]
+    fn cell_objectness_delta_matches_negative_ignore_and_positive_branches() {
+        let negative = select_obb_yolo_cell_truth_match(&[], &[0.1], 0.5, 0.7).unwrap();
+        assert_eq!(
+            obb_yolo_cell_objectness_delta(negative, 0.2, 3.0, false).unwrap(),
+            -0.6
+        );
+
+        let ignored = select_obb_yolo_cell_truth_match(&[0.6], &[0.3], 0.5, 0.9).unwrap();
+        assert!(ignored.ignore_match);
+        assert_eq!(
+            obb_yolo_cell_objectness_delta(ignored, 0.7, 2.0, false).unwrap(),
+            0.0
+        );
+        assert!(
+            (obb_yolo_cell_objectness_delta(ignored, 0.7, 2.0, true).unwrap() + 0.2).abs() < 1e-6
+        );
+        assert!(
+            (obb_yolo_cell_objectness_delta(ignored, 0.3, 2.0, true).unwrap() - 0.6).abs() < 1e-6
+        );
+
+        let positive = select_obb_yolo_cell_truth_match(&[0.8], &[0.3], 0.5, 0.7).unwrap();
+        assert!(positive.ignore_match);
+        assert!(
+            (obb_yolo_cell_objectness_delta(positive, 0.4, 2.0, true).unwrap() - 0.48).abs() < 1e-6
+        );
+        assert!(
+            (obb_yolo_cell_objectness_delta(positive, 0.4, 2.0, false).unwrap() - 1.2).abs() < 1e-6
+        );
+    }
+
+    #[test]
+    fn cell_objectness_delta_sanitizes_nonfinite_output_and_rejects_invalid_scores() {
+        let negative = select_obb_yolo_cell_truth_match(&[], &[0.1], 0.5, 0.7).unwrap();
+        assert_eq!(
+            obb_yolo_cell_objectness_delta(negative, f32::NAN, 2.0, false).unwrap(),
+            0.0
+        );
+        assert_eq!(
+            obb_yolo_cell_objectness_delta(negative, -f32::MAX, f32::MAX, false).unwrap(),
+            0.0
+        );
+        assert!(obb_yolo_cell_objectness_delta(negative, 0.1, f32::INFINITY, false).is_err());
+
+        let invalid_match = ObbYoloCellTruthMatch {
+            best_truth_index: None,
+            best_score: 1.1,
+            positive_truth_index: None,
+            ignore_match_score: 0.0,
+            ignore_match: false,
+        };
+        assert!(obb_yolo_cell_objectness_delta(invalid_match, 0.1, 1.0, false).is_err());
     }
 
     #[test]
