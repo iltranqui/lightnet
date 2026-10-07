@@ -34,6 +34,7 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v124: added multi-head delta dispatch across separate head tensors with shared global anchors/classes/network dimensions and per-head stats; the focused dispatch test and all 98 OBB-filtered host tests passed. Network-loop/backprop integration remains open.
 - v123: composed the one-head delta passes in source order with `apply_obb_yolo_batch_head_training_deltas`, returning the anchor `avg_cat` stats and separate threshold/anchor counts. The focused composition test and all 97 OBB-filtered host tests passed. Multi-head trainer dispatch, front-point deltas, and broader losses/metrics remain open.
 - v122: added `apply_obb_yolo_batch_head_truth_threshold_deltas` for per-cell truth-threshold positives, applying mapped class deltas (including the source smoothed `best_score²` override) and class-scaled box deltas while leaving the previously emitted objectness entry intact. The focused test and all 97 OBB-filtered host tests passed. Trainer sequencing, front-point deltas, and broader losses/metrics remain open.
 - v121: positive-anchor box-delta writeback now scales `iou_normalizer` by the mapped class multiplier, matching the source `obb_yolo_delta_training` call for COBB and covariance branches. The focused writeback test and all 96 OBB-filtered host tests passed. Multi-head/trainer integration remains open.

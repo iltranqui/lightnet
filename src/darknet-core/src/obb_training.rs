@@ -2169,6 +2169,74 @@ pub fn apply_obb_yolo_batch_head_training_deltas(
     })
 }
 
+/// Dispatch one-head OBB delta passes over separate head tensors in caller order.
+///
+/// Head outputs/deltas and both config slices must use the same ordering and
+/// common global anchor/class/network definitions. Per-head grids, masks, score
+/// branches, and coordinate modes may differ. This is multi-head delta dispatch,
+/// not a network training loop or backward/optimizer integration.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_obb_yolo_batch_multi_head_training_deltas(
+    batch_truths: &[Vec<ObbLabel>],
+    head_outputs: &[Vec<f32>],
+    head_deltas: &mut [Vec<f32>],
+    match_configs: &[ObbYoloHeadMatchConfig],
+    assignment_configs: &[ObbYoloPositiveObjectnessConfig],
+    focal_loss: bool,
+    label_smooth_eps: f32,
+    cls_normalizer: f32,
+    box_delta_configs: &[ObbYoloBoxDeltaConfig],
+) -> Result<Vec<ObbYoloHeadTrainingDeltaStats>> {
+    let head_count = head_outputs.len();
+    if head_count == 0
+        || head_deltas.len() != head_count
+        || match_configs.len() != head_count
+        || assignment_configs.len() != head_count
+        || box_delta_configs.len() != head_count
+    {
+        return Err(Error::InvalidConfig(
+            "OBB multi-head training requires matching nonempty head slices".to_owned(),
+        ));
+    }
+    let first_assignment = &assignment_configs[0];
+    for head_index in 0..head_count {
+        let assignment = &assignment_configs[head_index];
+        let matching = &match_configs[head_index];
+        if assignment.anchors != first_assignment.anchors
+            || assignment.classes != first_assignment.classes
+            || assignment.net_width != first_assignment.net_width
+            || assignment.net_height != first_assignment.net_height
+            || match_configs[..head_index]
+                .iter()
+                .any(|previous| previous.head_index == matching.head_index)
+        {
+            return Err(Error::InvalidConfig(
+                "OBB multi-head training requires shared anchors/classes/network size and unique head ids"
+                    .to_owned(),
+            ));
+        }
+    }
+
+    let mut stats = Vec::new();
+    stats
+        .try_reserve_exact(head_count)
+        .map_err(|_| Error::InvalidConfig("OBB head-stat allocation failed".to_owned()))?;
+    for head_index in 0..head_count {
+        stats.push(apply_obb_yolo_batch_head_training_deltas(
+            batch_truths,
+            &head_outputs[head_index],
+            &mut head_deltas[head_index],
+            &match_configs[head_index],
+            &assignment_configs[head_index],
+            focal_loss,
+            label_smooth_eps,
+            cls_normalizer,
+            box_delta_configs[head_index],
+        )?);
+    }
+    Ok(stats)
+}
+
 fn validate_anchor_assignment_inputs(
     anchors: &[f32],
     mask: &[usize],
@@ -2263,7 +2331,8 @@ mod tests {
         apply_obb_yolo_batch_head_positive_class_deltas,
         apply_obb_yolo_batch_head_positive_objectness_deltas,
         apply_obb_yolo_batch_head_training_deltas,
-        apply_obb_yolo_batch_head_truth_threshold_deltas, assign_obb_yolo_anchor,
+        apply_obb_yolo_batch_head_truth_threshold_deltas,
+        apply_obb_yolo_batch_multi_head_training_deltas, assign_obb_yolo_anchor,
         decode_obb_yolo_prediction, encode_obb_yolo_truth_batch,
         enumerate_obb_yolo_batch_positives, enumerate_obb_yolo_head_positives,
         match_obb_yolo_batch_cell_predictions, match_obb_yolo_cell_prediction,
@@ -2985,6 +3054,93 @@ mod tests {
         );
         assert_eq!(stats.anchor_class_stats, anchor_class_stats);
         assert_eq!(stats.anchor_box_positive_count, anchor_box_positive_count);
+    }
+
+    #[test]
+    fn multi_head_training_dispatches_each_head_and_returns_tagged_metrics() {
+        let mut label = truth(0.5, 0.5, 0.2, 0.1);
+        label.front_x = 0.68;
+        label.front_y = 0.55;
+        label.has_front = true;
+        let labels = [vec![label]];
+        let anchors = vec![20.0, 10.0, 30.0, 15.0];
+        let match_config = |head_index, mask| ObbYoloHeadMatchConfig {
+            head_index,
+            anchors: anchors.clone(),
+            mask: vec![mask],
+            grid_width: 1,
+            grid_height: 1,
+            classes: 2,
+            net_width: 100,
+            net_height: 100,
+            new_coords: false,
+            score_config: ObbYoloMatchScoreConfig::default(),
+            ignore_thresh: 0.5,
+            truth_thresh: 0.1,
+            objectness_normalizer: 1.0,
+            objectness_smooth: false,
+        };
+        let assignment_config = |mask| ObbYoloPositiveObjectnessConfig {
+            head: ObbYoloHeadAssignmentSpec {
+                mask: vec![mask],
+                grid_width: 1,
+                grid_height: 1,
+            },
+            anchors: anchors.clone(),
+            classes: 2,
+            net_width: 100,
+            net_height: 100,
+            iou_thresh: 0.1,
+            objectness_normalizer: 1.0,
+            objectness_smooth: false,
+            class_map: None,
+            class_multipliers: None,
+        };
+        let outputs = vec![
+            vec![0.5, 0.5, 0.0, 0.0, 0.68, 0.55, 0.4, 0.3, 0.2],
+            vec![
+                0.5,
+                0.5,
+                (20.0f32 / 30.0).ln(),
+                (10.0f32 / 15.0).ln(),
+                0.68,
+                0.55,
+                0.4,
+                0.3,
+                0.2,
+            ],
+        ];
+        let matching = [match_config(5, 0), match_config(9, 1)];
+        let assignments = [assignment_config(0), assignment_config(1)];
+        let box_configs = [
+            ObbYoloBoxDeltaConfig::default(),
+            ObbYoloBoxDeltaConfig::default(),
+        ];
+        let mut deltas = vec![vec![0.0; 9], vec![0.0; 9]];
+        let stats = apply_obb_yolo_batch_multi_head_training_deltas(
+            &labels,
+            &outputs,
+            &mut deltas,
+            &matching,
+            &assignments,
+            false,
+            0.0,
+            1.0,
+            &box_configs,
+        )
+        .unwrap();
+        assert_eq!(stats.len(), 2);
+        for head_stats in stats {
+            assert_eq!(head_stats.truth_threshold_positive_cells, 1);
+            assert_eq!(head_stats.anchor_class_stats.positive_count, 1);
+            assert_eq!(head_stats.anchor_class_stats.class_output_sum, 0.3);
+            assert_eq!(head_stats.anchor_box_positive_count, 1);
+        }
+        for head_delta in deltas {
+            assert!((head_delta[6] - 0.6).abs() < 1e-6);
+            assert!((head_delta[7] - 0.7).abs() < 1e-6);
+            assert!((head_delta[8] + 0.2).abs() < 1e-6);
+        }
     }
 
     #[test]

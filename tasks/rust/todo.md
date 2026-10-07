@@ -282,7 +282,8 @@ Immediately next, in dependency order:
   from best/additional class assignments; v121 applies mapped class multipliers
   to box-delta normalization; v122 applies truth-threshold cell class and box
   deltas after the all-cell objectness pass; v123 composes ordered delta passes
-  for one complete head. Multi-head trainer dispatch and network-loop wiring,
+  for one complete head; v124 dispatches those passes across multiple head
+  tensors. Network-loop/backprop integration,
   truth-threshold metric/loss aggregation, center-front-anchor decode, integrated
   losses and training-loop wiring, crop/resize and mosaic transforms,
   alternate NMS-kind implementations, training `-map` cadence, and CARPN network

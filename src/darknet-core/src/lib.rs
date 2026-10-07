@@ -71,6 +71,7 @@ pub use obb_training::{
     ObbYoloHeadMatchConfig, ObbYoloTruthBatch,
     apply_obb_yolo_batch_head_objectness_deltas,
     apply_obb_yolo_batch_head_training_deltas,
+    apply_obb_yolo_batch_multi_head_training_deltas,
     apply_obb_yolo_batch_head_positive_box_deltas,
     apply_obb_yolo_batch_head_truth_threshold_deltas,
     apply_obb_yolo_batch_head_positive_class_deltas,
