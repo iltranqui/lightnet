@@ -180,9 +180,11 @@ pub fn decode_obb_yolo_detections(
         )?);
     }
 
-    match nms_kind.unwrap_or(ObbNmsKind::Obb) {
-        ObbNmsKind::Obb => apply_obb_nms(&mut detections, options.nms_threshold),
-    }
+    apply_obb_nms_by_kind(
+        &mut detections,
+        options.nms_threshold,
+        nms_kind.unwrap_or(ObbNmsKind::Obb),
+    );
     detections.sort_by(|lhs, rhs| {
         rhs.detection
             .confidence
@@ -901,6 +903,25 @@ pub fn detection_obb_iou(lhs: &ObbDetection, rhs: &ObbDetection) -> f32 {
 /// strict `IoU > threshold` comparison. Equal-score order is stable and defined
 /// here because the C++ sorter does not specify tie order.
 pub fn apply_obb_nms(detections: &mut Vec<ObbDetection>, threshold: f32) {
+    apply_obb_nms_by_overlap(detections, threshold, detection_obb_iou);
+}
+
+fn apply_obb_nms_by_kind(detections: &mut Vec<ObbDetection>, threshold: f32, kind: ObbNmsKind) {
+    match kind {
+        ObbNmsKind::Default | ObbNmsKind::Corners => {
+            apply_obb_nms_by_overlap(detections, threshold, |lhs, rhs| {
+                bbox_iou(lhs.detection.bbox, rhs.detection.bbox)
+            })
+        }
+        ObbNmsKind::Obb => apply_obb_nms(detections, threshold),
+    }
+}
+
+fn apply_obb_nms_by_overlap(
+    detections: &mut Vec<ObbDetection>,
+    threshold: f32,
+    overlap: impl Fn(&ObbDetection, &ObbDetection) -> f32,
+) {
     detections.sort_by(|lhs, rhs| {
         let lhs_inactive = lhs.detection.objectness == 0.0;
         let rhs_inactive = rhs.detection.objectness == 0.0;
@@ -928,7 +949,7 @@ pub fn apply_obb_nms(detections: &mut Vec<ObbDetection>, threshold: f32) {
             {
                 continue;
             }
-            if detection_obb_iou(keeper, candidate) > threshold {
+            if overlap(keeper, candidate) > threshold {
                 suppressed[j] = true;
             }
         }
@@ -1288,9 +1309,11 @@ mod obb_decode_tests {
 
 #[cfg(test)]
 mod obb_postprocess_tests {
+    use crate::model::ObbNmsKind;
+
     use super::{
         Detection, DetectionBox, ObbDetection, ObbDetectionGeometry, apply_obb_nms,
-        detection_obb_iou,
+        apply_obb_nms_by_kind, detection_obb_iou,
     };
 
     fn rect_detection(
@@ -1367,6 +1390,23 @@ mod obb_postprocess_tests {
         let mut at_threshold = vec![low, high, other_class];
         apply_obb_nms(&mut at_threshold, overlap);
         assert_eq!(at_threshold.len(), 3, "IoU equal to threshold is retained");
+    }
+
+    #[test]
+    fn source_default_and_corners_nms_use_axis_aligned_box_iou() {
+        let horizontal = rect_detection(0, 0.9, 0.9, [0.0, 1.0]);
+        let vertical = rect_detection(0, 0.8, 0.8, [1.0, 0.0]);
+        assert!((detection_obb_iou(&horizontal, &vertical) - 1.0 / 3.0).abs() < 1e-6);
+
+        for kind in [ObbNmsKind::Default, ObbNmsKind::Corners] {
+            let mut detections = vec![horizontal.clone(), vertical.clone()];
+            apply_obb_nms_by_kind(&mut detections, 0.5, kind);
+            assert_eq!(detections.len(), 1, "{kind:?} uses AABB IoU = 1");
+        }
+
+        let mut oriented = vec![horizontal, vertical];
+        apply_obb_nms_by_kind(&mut oriented, 0.5, ObbNmsKind::Obb);
+        assert_eq!(oriented.len(), 2, "OBB NMS uses orientation-aware IoU");
     }
 
     #[test]

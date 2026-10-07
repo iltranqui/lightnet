@@ -333,13 +333,15 @@ Immediately next, in dependency order:
   `[net] obb=1` outputs through the orientation-aware decoder and prints legacy
   front-point geometry in human and `det_obb` TSV output; mixed OBB/modern heads
   fail explicitly. The focused CLI tests and `detect_` passed 2 CLI tests; `obb_`
-  passed 119 core + 2 CLI tests. CARPN validation remains unsupported; no
-  compiled-C++ parity is established.
+  passed 119 core + 2 CLI tests. v163 accepts source `default` and `cornersnms`
+  OBB NMS kinds with AABB-IoU suppression, retaining orientation-aware `obb` and
+  source aliases; `obb_` passed 120 core + 2 CLI tests. CARPN validation remains
+  unsupported; no compiled-C++ parity is established.
   Still open: broader GPU/optimizer integration, CARPN OBB validation/map,
   remaining cfg/training option wiring, inference integration beyond legacy OBB
   `detect-image`, remaining metric/loss logging, source-faithful crop/resize and
-  mosaic label transforms, alternate NMS-kind implementations, and CARPN network
-  decoding/validation.
+  mosaic label transforms, `greedynms`/`diounms`/weighted OBB NMS, and CARPN
+  network decoding/validation.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and
   kernels, weights order `weights.cpp:428`); then `deform_conv`, `dsconv`,
   `graph_conv`, `wmhf`, `clifford`, `recursive_block`.

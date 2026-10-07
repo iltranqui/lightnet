@@ -858,10 +858,14 @@ pub struct YoloSpec {
     pub class_map: Option<Vec<usize>>,
 }
 
-/// NMS kind accepted by the legacy OBB decoder. Other source kinds are gated
-/// until their distinct box-scoring semantics are implemented.
+/// NMS variants implemented for the legacy OBB decoder. DIoU/greedy and
+/// weighted OBB variants remain gated until their distinct source scoring is ported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObbNmsKind {
+    /// Source default NMS: suppress using the decoded axis-aligned box IoU.
+    Default,
+    /// Source corners NMS also suppresses by decoded axis-aligned box IoU.
+    Corners,
     /// Orientation-aware greedy NMS over legacy front-point detections.
     Obb,
 }
@@ -869,9 +873,11 @@ pub enum ObbNmsKind {
 impl ObbNmsKind {
     fn parse(value: &str, line: usize) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "obb" => Ok(Self::Obb),
+            "default" => Ok(Self::Default),
+            "cornersnms" => Ok(Self::Corners),
+            "obb" | "obb_nms" | "obbnms" => Ok(Self::Obb),
             other => Err(Error::InvalidConfig(format!(
-                "[obb_yolo] at line {line}: unsupported nms_kind {other:?}; only `obb` is implemented"
+                "[obb_yolo] at line {line}: unsupported nms_kind {other:?}; implemented kinds are `default`, `cornersnms`, and `obb`"
             ))),
         }
     }
@@ -4438,6 +4444,24 @@ mod tests {
             &explicit.layers[0].kind,
             LayerKind::ObbYolo(spec) if spec.nms_kind == ObbNmsKind::Obb
         ));
+        for (kind, expected) in [
+            ("default", ObbNmsKind::Default),
+            ("cornersnms", ObbNmsKind::Corners),
+            ("obb_nms", ObbNmsKind::Obb),
+            ("obbnms", ObbNmsKind::Obb),
+        ] {
+            let cfg = format!(
+                "[net]\nwidth=4\nheight=2\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\nnms_kind={kind}\n"
+            );
+            let network = Network::from_config(
+                ConfigFile::parse_str("obb-nms-kind.cfg", &cfg).expect("NMS cfg parses"),
+            )
+            .expect("supported NMS kind builds");
+            assert!(matches!(
+                &network.layers[0].kind,
+                LayerKind::ObbYolo(spec) if spec.nms_kind == expected
+            ));
+        }
 
         for cfg in [
             "[net]\nwidth=4\nheight=2\nchannels=8\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\n",
