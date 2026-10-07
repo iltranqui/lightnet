@@ -179,6 +179,9 @@ pub fn obb_qbbv_heatmap_value(boxobb: BoxObb, x: f32, y: f32) -> f32 {
     qbbv_heatmap_from_frame(qbbv_frame(boxobb), x, y)
 }
 
+/// Default sample count used by source QBBV-vIoU matching.
+pub const QBBV_DEFAULT_SAMPLES_PER_AXIS: usize = 24;
+
 /// Approximate source QBBV-vIoU with center-sampled heatmap intersections.
 ///
 /// The sample count is clamped to `[4, 128]`. A zero-span or invalid union AABB
@@ -232,6 +235,29 @@ pub fn box_obb_qbbv_viou(pred: BoxObb, truth: BoxObb, samples_per_axis: usize) -
         return 0.0;
     }
     finite_or((numerator / denominator) as f32, 0.0).clamp(0.0, 1.0)
+}
+
+/// Blend a base OBB score with source QBBV-vIoU using the configured weight.
+///
+/// The weight is clamped to `[0, 1]`; NaN weights and non-finite scores follow
+/// the source sanitization. The source uses 24 samples per axis here.
+pub fn blend_obb_score_with_qbbv_viou(
+    base_score: f32,
+    pred: BoxObb,
+    truth: BoxObb,
+    viou_weight: f32,
+) -> f32 {
+    let score = finite_or(base_score, 0.0);
+    if viou_weight.is_nan() {
+        return 0.0;
+    }
+    let weight = viou_weight.clamp(0.0, 1.0);
+    if weight <= 0.0 {
+        return score.clamp(0.0, 1.0);
+    }
+    let viou = box_obb_qbbv_viou(pred, truth, QBBV_DEFAULT_SAMPLES_PER_AXIS);
+    let score = (1.0 - weight) * score + weight * viou;
+    finite_or(score, 0.0).clamp(0.0, 1.0)
 }
 
 /// Source covariance Wasserstein-2 loss components for decoded OBB geometry.
@@ -713,6 +739,55 @@ mod tests {
         assert_eq!(
             box_obb_qbbv_viou(partial_a, partial_b, usize::MAX),
             box_obb_qbbv_viou(partial_a, partial_b, 128)
+        );
+    }
+
+    #[test]
+    fn qbbv_blending_clamps_weights_and_sanitizes_nonfinite_inputs() {
+        let boxobb = rect([0.5, 0.5], 0.4, 0.2, [0.6, 0.5]);
+        close(
+            blend_obb_score_with_qbbv_viou(0.4, boxobb, boxobb, 0.25),
+            0.55,
+            1e-6,
+        );
+        assert_eq!(
+            blend_obb_score_with_qbbv_viou(0.0, boxobb, boxobb, 0.0),
+            0.0
+        );
+        assert_eq!(
+            blend_obb_score_with_qbbv_viou(0.0, boxobb, boxobb, 1.0),
+            1.0
+        );
+        assert_eq!(
+            blend_obb_score_with_qbbv_viou(0.4, boxobb, boxobb, -1.0),
+            0.4
+        );
+        assert_eq!(
+            blend_obb_score_with_qbbv_viou(0.4, boxobb, boxobb, 2.0),
+            1.0
+        );
+        assert_eq!(
+            blend_obb_score_with_qbbv_viou(f32::NAN, boxobb, boxobb, 1.0),
+            1.0
+        );
+        assert_eq!(
+            blend_obb_score_with_qbbv_viou(0.4, boxobb, boxobb, f32::INFINITY),
+            1.0
+        );
+        assert_eq!(
+            blend_obb_score_with_qbbv_viou(0.4, boxobb, boxobb, f32::NEG_INFINITY),
+            0.4
+        );
+        assert_eq!(
+            blend_obb_score_with_qbbv_viou(0.4, boxobb, boxobb, f32::NAN),
+            0.0
+        );
+
+        let disjoint = rect([0.8, 0.8], 0.4, 0.2, [0.9, 0.8]);
+        close(
+            blend_obb_score_with_qbbv_viou(0.8, boxobb, disjoint, 0.5),
+            0.4,
+            1e-6,
         );
     }
 

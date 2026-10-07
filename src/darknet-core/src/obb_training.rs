@@ -9,7 +9,8 @@
 use crate::detect::DetectionBox;
 use crate::error::{Error, Result};
 use crate::obb_geometry::{
-    BoxObb, box_ciou_obb_quality_score, box_covariance_w2_obb_quality_score,
+    BoxObb, blend_obb_score_with_qbbv_viou, box_ciou_obb_quality_score,
+    box_covariance_w2_obb_quality_score,
 };
 use crate::obb_labels::ObbLabel;
 
@@ -486,17 +487,10 @@ pub fn obb_yolo_cell_objectness_delta(
     Ok(if delta.is_finite() { delta } else { 0.0 })
 }
 
-/// Decode one source YOLO output row and score it against a truth with the
-/// source covariance-W2 matching metric.
+/// Covariance-W2 raw-channel matching score without QBBV-vIoU blending.
 ///
-/// `prediction` contains the six post-YOLO box/front channels: x/y already
-/// include source activation and `scale_x_y`, while front channels remain raw.
-/// `covariance_normalizer` must be finite and positive to select this branch;
-/// it gates the branch but does not scale its returned score. Call this only
-/// when the source iou-loss selector chooses the covariance branch. This helper
-/// does not combine COBB scores or apply QBBV-vIoU blending. Unlike the CIoU
-/// helper, a direction-free truth retains its finite center placeholder because
-/// the source covariance branch evaluates it rather than short-circuiting.
+/// This is the `viou_weight = 0` form of
+/// [`obb_yolo_covariance_prediction_match_score_with_viou`].
 pub fn obb_yolo_covariance_prediction_match_score(
     prediction: [f32; 6],
     truth: &ObbLabel,
@@ -504,6 +498,38 @@ pub fn obb_yolo_covariance_prediction_match_score(
     covariance_normalizer: f32,
     front_length_ratio_k: f32,
     front_length_weight: f32,
+) -> Result<f32> {
+    obb_yolo_covariance_prediction_match_score_with_viou(
+        prediction,
+        truth,
+        context,
+        covariance_normalizer,
+        front_length_ratio_k,
+        front_length_weight,
+        0.0,
+    )
+}
+
+/// Decode one source YOLO output row and score it with covariance-W2 and the
+/// optional source QBBV-vIoU blend.
+///
+/// `prediction` contains the six post-YOLO box/front channels: x/y already
+/// include source activation and `scale_x_y`, while front channels remain raw.
+/// `covariance_normalizer` must be finite and positive to select this branch;
+/// it gates the branch but does not scale its returned score. Call this only
+/// when the source iou-loss selector chooses the covariance branch. COBB score
+/// computation and multi-branch aggregation are separate. Unlike the CIoU
+/// helper, a direction-free truth retains its finite center placeholder because
+/// the source covariance branch evaluates it rather than short-circuiting.
+#[allow(clippy::too_many_arguments)]
+pub fn obb_yolo_covariance_prediction_match_score_with_viou(
+    prediction: [f32; 6],
+    truth: &ObbLabel,
+    context: ObbYoloPredictionMatchContext,
+    covariance_normalizer: f32,
+    front_length_ratio_k: f32,
+    front_length_weight: f32,
+    viou_weight: f32,
 ) -> Result<f32> {
     validate_truth(truth)?;
     if !covariance_normalizer.is_finite()
@@ -527,11 +553,17 @@ pub fn obb_yolo_covariance_prediction_match_score(
         front_x: truth.front_x,
         front_y: truth.front_y,
     };
-    Ok(box_covariance_w2_obb_quality_score(
+    let score = box_covariance_w2_obb_quality_score(
         prediction,
         truth,
         front_length_ratio_k,
         front_length_weight,
+    );
+    Ok(blend_obb_score_with_qbbv_viou(
+        score,
+        prediction,
+        truth,
+        viou_weight,
     ))
 }
 
@@ -876,7 +908,8 @@ mod tests {
         enumerate_obb_yolo_head_positives, match_obb_yolo_cell_prediction,
         obb_yolo_anchor_match_score, obb_yolo_cell_objectness_delta,
         obb_yolo_ciou_prediction_match_score, obb_yolo_class_deltas,
-        obb_yolo_covariance_prediction_match_score, select_obb_yolo_cell_truth_match,
+        obb_yolo_covariance_prediction_match_score,
+        obb_yolo_covariance_prediction_match_score_with_viou, select_obb_yolo_cell_truth_match,
     };
     use crate::obb_labels::ObbLabel;
 
@@ -1198,6 +1231,34 @@ mod tests {
         )
         .unwrap();
         assert!(rotated_score < 1.0);
+        let blended_score = obb_yolo_covariance_prediction_match_score_with_viou(
+            prediction, &rotated, context, 1.0, 1.0, 0.0, 0.35,
+        )
+        .unwrap();
+        let prediction_geometry = crate::obb_geometry::BoxObb {
+            bbox: crate::detect::DetectionBox {
+                x: 0.5,
+                y: 0.5,
+                w: 2.0,
+                h: 4.0,
+            },
+            front_x: 0.5,
+            front_y: 4.5,
+        };
+        let rotated_geometry = crate::obb_geometry::BoxObb {
+            bbox: prediction_geometry.bbox,
+            front_x: 4.5,
+            front_y: 0.5,
+        };
+        assert_eq!(
+            blended_score,
+            crate::obb_geometry::blend_obb_score_with_qbbv_viou(
+                rotated_score,
+                prediction_geometry,
+                rotated_geometry,
+                0.35,
+            )
+        );
 
         let direction_free = truth(0.5, 0.5, 2.0, 4.0);
         let direction_free_score = obb_yolo_covariance_prediction_match_score(
