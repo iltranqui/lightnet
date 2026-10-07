@@ -34,6 +34,7 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v110: added `ObbYoloHeadAssignmentSpec`, batch/head-tagged positive records, and `enumerate_obb_yolo_batch_positives` in source head-then-batch order. Tests verify primary/additional anchors, local truth indices, per-head masks, order, and empty-input rejection; all 81 OBB-filtered host tests passed. Prediction-conditioned batch matching and full loss/trainer integration remain open.
 - v109: added `match_obb_yolo_cell_prediction_with_score_config`, composing per-truth covariance/COBB/angular branch scores with source best-truth, class-gated ignore, positive thresholds, truth order, and empty-row sentinel for one cell. All 79 OBB-filtered host tests passed. Batch/multi-head assignment and training integration remain open.
 - v108: added `ObbYoloMatchScoreConfig`/`ObbYoloMatchScoreBranch` and `obb_yolo_match_score`, dispatching one cell through covariance-first, then COBB, then legacy-angular source branch priority. All 78 OBB-filtered host tests passed; batch/multi-truth assignment and training integration remain open.
 - v107: added `obb_yolo_cobb_prediction_match_score_with_viou`, decoding one cell's six post-YOLO channels, enforcing covariance-priority/COBB branch gates, and applying the source COBB plus QBBV score. The raw-match test and all 77 OBB-filtered host tests passed. Batch assignment/loss integration and compiled-C++ parity remain open.

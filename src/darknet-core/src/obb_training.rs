@@ -1,7 +1,7 @@
 //! Source-derived training primitives for legacy front-point OBB YOLO heads.
 //!
-//! This module currently covers direction-free anchor matching, per-truth
-//! head-positive enumeration, per-cell OBB score-branch dispatch/match selection,
+//! This module currently covers direction-free anchor matching, per-truth and
+//! batch/multi-head positive enumeration, per-cell OBB score-branch dispatch/match selection,
 //! objectness and class-channel deltas, and source-layout truth-row packing.
 //! It does not implement complete truth assignment, YOLO loss, backward
 //! propagation, or optimizer integration.
@@ -51,6 +51,23 @@ pub struct ObbYoloPositiveAssignment {
     pub kind: ObbYoloPositiveKind,
     /// Anchor slot and grid cell selected on this head.
     pub assignment: ObbYoloAnchorAssignment,
+}
+
+/// Per-head cfg data needed to enumerate source OBB anchor positives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObbYoloHeadAssignmentSpec {
+    pub mask: Vec<usize>,
+    pub grid_width: usize,
+    pub grid_height: usize,
+}
+
+/// One positive assignment tagged with its batch slot and OBB YOLO head.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObbYoloBatchPositiveAssignment {
+    pub batch_index: usize,
+    pub head_index: usize,
+    /// Truth index remains local to this batch image's label slice.
+    pub positive: ObbYoloPositiveAssignment,
 }
 
 /// Prediction-match gates for one cell/anchor against its truth candidates.
@@ -407,6 +424,55 @@ pub fn enumerate_obb_yolo_head_positives(
                     });
                 }
             }
+        }
+    }
+    Ok(assignments)
+}
+
+/// Enumerate primary/additional positives in source head-then-batch order.
+///
+/// Each per-head enumerator selects the global best anchor before applying that
+/// head's mask. Results retain the image-local truth index and are tagged with
+/// the batch and head indices. This ports assignment enumeration only; it does
+/// not read prediction tensors or generate loss deltas.
+pub fn enumerate_obb_yolo_batch_positives(
+    batch_truths: &[Vec<ObbLabel>],
+    classes: usize,
+    anchors: &[f32],
+    heads: &[ObbYoloHeadAssignmentSpec],
+    net_width: usize,
+    net_height: usize,
+    iou_thresh: f32,
+) -> Result<Vec<ObbYoloBatchPositiveAssignment>> {
+    if batch_truths.is_empty() || heads.is_empty() {
+        return Err(Error::InvalidConfig(
+            "OBB batch positive assignment requires a nonempty batch and head list".to_owned(),
+        ));
+    }
+    let mut assignments = Vec::new();
+    for (head_index, head) in heads.iter().enumerate() {
+        for (batch_index, truths) in batch_truths.iter().enumerate() {
+            let positives = enumerate_obb_yolo_head_positives(
+                truths,
+                classes,
+                anchors,
+                &head.mask,
+                net_width,
+                net_height,
+                head.grid_width,
+                head.grid_height,
+                iou_thresh,
+            )?;
+            assignments.try_reserve(positives.len()).map_err(|_| {
+                Error::InvalidConfig("OBB batch positive allocation failed".to_owned())
+            })?;
+            assignments.extend(positives.into_iter().map(|positive| {
+                ObbYoloBatchPositiveAssignment {
+                    batch_index,
+                    head_index,
+                    positive,
+                }
+            }));
         }
     }
     Ok(assignments)
@@ -1112,8 +1178,9 @@ fn validate_truth(truth: &ObbLabel) -> Result<()> {
 mod tests {
     use super::{
         OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloCellTruthMatch,
-        ObbYoloMatchScoreBranch, ObbYoloMatchScoreConfig, ObbYoloPositiveKind,
-        ObbYoloPredictionMatchContext, assign_obb_yolo_anchor, encode_obb_yolo_truth_batch,
+        ObbYoloHeadAssignmentSpec, ObbYoloMatchScoreBranch, ObbYoloMatchScoreConfig,
+        ObbYoloPositiveKind, ObbYoloPredictionMatchContext, assign_obb_yolo_anchor,
+        encode_obb_yolo_truth_batch, enumerate_obb_yolo_batch_positives,
         enumerate_obb_yolo_head_positives, match_obb_yolo_cell_prediction,
         match_obb_yolo_cell_prediction_with_score_config, obb_yolo_anchor_match_score,
         obb_yolo_angular_prediction_match_score_with_viou, obb_yolo_cell_objectness_delta,
@@ -1256,6 +1323,80 @@ mod tests {
         assert_eq!(assignments[1].assignment.cell_x, 2);
         assert_eq!(assignments[1].assignment.cell_y, 1);
         assert!((assignments[1].assignment.match_score - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn batch_positive_enumerator_keeps_head_batch_truth_order_and_masks() {
+        let mut first = truth(0.15, 0.15, 0.1, 0.1);
+        first.class_id = 0;
+        let mut second = truth(0.55, 0.55, 0.2, 0.2);
+        second.class_id = 1;
+        let heads = [
+            ObbYoloHeadAssignmentSpec {
+                mask: vec![0],
+                grid_width: 10,
+                grid_height: 10,
+            },
+            ObbYoloHeadAssignmentSpec {
+                mask: vec![1],
+                grid_width: 10,
+                grid_height: 10,
+            },
+        ];
+        let assigned = enumerate_obb_yolo_batch_positives(
+            &[vec![first], vec![second]],
+            2,
+            &[10.0, 10.0, 20.0, 20.0],
+            &heads,
+            100,
+            100,
+            0.2,
+        )
+        .unwrap();
+        assert_eq!(assigned.len(), 4);
+        let expected = [
+            (0, 0, 0, ObbYoloPositiveKind::BestAnchor, 0, 1),
+            (0, 1, 1, ObbYoloPositiveKind::AdditionalAnchor, 0, 5),
+            (1, 0, 0, ObbYoloPositiveKind::AdditionalAnchor, 1, 1),
+            (1, 1, 1, ObbYoloPositiveKind::BestAnchor, 1, 5),
+        ];
+        for (actual, (head, batch, class_id, kind, anchor, cell)) in assigned.iter().zip(expected) {
+            assert_eq!(actual.head_index, head);
+            assert_eq!(actual.batch_index, batch);
+            assert_eq!(actual.positive.truth_index, 0);
+            assert_eq!(actual.positive.class_id, class_id);
+            assert_eq!(actual.positive.kind, kind);
+            assert_eq!(actual.positive.assignment.anchor_index, anchor);
+            assert_eq!(actual.positive.assignment.head_anchor_index, 0);
+            assert_eq!(actual.positive.assignment.cell_x, cell);
+            assert_eq!(actual.positive.assignment.cell_y, cell);
+        }
+    }
+
+    #[test]
+    fn batch_positive_enumerator_rejects_empty_batch_and_head_lists() {
+        let head = ObbYoloHeadAssignmentSpec {
+            mask: vec![0],
+            grid_width: 1,
+            grid_height: 1,
+        };
+        let anchors = [10.0, 10.0];
+        assert!(
+            enumerate_obb_yolo_batch_positives(
+                &[],
+                1,
+                &anchors,
+                std::slice::from_ref(&head),
+                10,
+                10,
+                1.0,
+            )
+            .is_err()
+        );
+        assert!(
+            enumerate_obb_yolo_batch_positives(&[Vec::new()], 1, &anchors, &[], 10, 10, 1.0,)
+                .is_err()
+        );
     }
 
     #[test]
