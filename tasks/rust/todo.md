@@ -298,8 +298,9 @@ Immediately next, in dependency order:
   during multi-head dispatch; v139 builds network-layer delta seeds from OBB
   forward heads and labels; v140 propagates those seeds through runtime
   backpropagation; v141 adds a one-subdivision CPU SGD batch step with explicit
-  Adam/subdivision rejection. Still open: full loss scalar, CLI/schedule and
-  general optimizer/subdivision training-loop integration, remaining cfg/training
+  Adam/subdivision rejection; v142 accumulates configured subdivisions and applies
+  one normalized SGD update. Still open: full loss scalar, CLI/schedule and
+  non-SGD optimizer/training-loop integration, remaining cfg/training
   option wiring,
   inference/network decode integration, remaining metric/loss aggregation and
   integrated loss/training-loop

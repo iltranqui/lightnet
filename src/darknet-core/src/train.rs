@@ -493,6 +493,196 @@ pub fn train_obb_yolo_batch_step(
     })
 }
 
+fn checked_add_obb_training_count(target: &mut usize, value: usize, field: &str) -> Result<()> {
+    *target = target.checked_add(value).ok_or_else(|| {
+        Error::InvalidConfig(format!("OBB training {field} count overflowed usize"))
+    })?;
+    Ok(())
+}
+
+fn checked_add_obb_training_sum(target: &mut f32, value: f32, field: &str) -> Result<()> {
+    let sum = *target + value;
+    if !sum.is_finite() {
+        return Err(Error::InvalidConfig(format!(
+            "OBB training {field} sum became non-finite"
+        )));
+    }
+    *target = sum;
+    Ok(())
+}
+
+fn merge_obb_training_stats(
+    total: &mut ObbYoloBatchTrainingDeltaStats,
+    next: &ObbYoloBatchTrainingDeltaStats,
+) -> Result<()> {
+    if total.per_head.len() != next.per_head.len() {
+        return Err(Error::InvalidConfig(
+            "OBB subdivision stats have inconsistent head counts".to_owned(),
+        ));
+    }
+    for (total_head, next_head) in total.per_head.iter_mut().zip(&next.per_head) {
+        checked_add_obb_training_count(
+            &mut total_head.truth_threshold_positive_cells,
+            next_head.truth_threshold_positive_cells,
+            "truth-threshold positives",
+        )?;
+        checked_add_obb_training_sum(
+            &mut total_head.anchor_class_stats.class_output_sum,
+            next_head.anchor_class_stats.class_output_sum,
+            "head class output",
+        )?;
+        checked_add_obb_training_count(
+            &mut total_head.anchor_class_stats.positive_count,
+            next_head.anchor_class_stats.positive_count,
+            "head class positives",
+        )?;
+        checked_add_obb_training_count(
+            &mut total_head.anchor_box_positive_count,
+            next_head.anchor_box_positive_count,
+            "head box positives",
+        )?;
+        checked_add_obb_training_count(
+            &mut total_head.total_bbox_count,
+            next_head.total_bbox_count,
+            "head total_bbox",
+        )?;
+        checked_add_obb_training_sum(
+            &mut total_head.front_point_loss.loss_sum,
+            next_head.front_point_loss.loss_sum,
+            "head front-point loss",
+        )?;
+        checked_add_obb_training_count(
+            &mut total_head.front_point_loss.count,
+            next_head.front_point_loss.count,
+            "head front-point loss",
+        )?;
+    }
+    checked_add_obb_training_sum(
+        &mut total.anchor_class_stats.class_output_sum,
+        next.anchor_class_stats.class_output_sum,
+        "class output",
+    )?;
+    checked_add_obb_training_count(
+        &mut total.anchor_class_stats.positive_count,
+        next.anchor_class_stats.positive_count,
+        "class positives",
+    )?;
+    checked_add_obb_training_count(
+        &mut total.truth_threshold_positive_cells,
+        next.truth_threshold_positive_cells,
+        "truth-threshold positives",
+    )?;
+    checked_add_obb_training_count(
+        &mut total.anchor_box_positive_count,
+        next.anchor_box_positive_count,
+        "box positives",
+    )?;
+    checked_add_obb_training_count(
+        &mut total.total_bbox_count,
+        next.total_bbox_count,
+        "total_bbox",
+    )?;
+    checked_add_obb_training_sum(
+        &mut total.front_point_loss.loss_sum,
+        next.front_point_loss.loss_sum,
+        "front-point loss",
+    )?;
+    checked_add_obb_training_count(
+        &mut total.front_point_loss.count,
+        next.front_point_loss.count,
+        "front-point loss",
+    )?;
+    Ok(())
+}
+
+/// Accumulate all configured OBB subdivisions and apply one CPU SGD update.
+///
+/// This remains a delta-driven training primitive: it does not compute the
+/// complete loss scalar or choose the learning-rate schedule. Adam is rejected.
+pub fn train_obb_yolo_subdivisions(
+    executable: &mut ExecutableNetwork,
+    subdivisions: &[ObbTrainingBatch],
+    learning_rate: f32,
+) -> Result<ObbYoloBatchTrainingDeltaStats> {
+    let network = &executable.network;
+    if !network.net.obb {
+        return Err(Error::InvalidConfig(
+            "OBB YOLO subdivision training requires [net] obb=1".to_owned(),
+        ));
+    }
+    if network.net.adam {
+        return Err(Error::InvalidConfig(
+            "OBB CPU subdivision helper currently supports SGD, not Adam".to_owned(),
+        ));
+    }
+    let subdivision_count = network.net.subdivisions.max(1);
+    if subdivisions.len() != subdivision_count {
+        return Err(Error::InvalidConfig(format!(
+            "OBB training requires {subdivision_count} subdivisions, got {}",
+            subdivisions.len()
+        )));
+    }
+    let input_shape = network.net.input_shape();
+    for batch in subdivisions {
+        if batch.input.shape != input_shape {
+            return Err(Error::InvalidConfig(
+                "OBB subdivision tensor shape does not match the network".to_owned(),
+            ));
+        }
+        if batch.labels.len() != batch.input.shape.batch {
+            return Err(Error::InvalidConfig(format!(
+                "OBB subdivision label batch mismatch: expected {}, got {}",
+                batch.input.shape.batch,
+                batch.labels.len()
+            )));
+        }
+    }
+    if !learning_rate.is_finite() || learning_rate < 0.0 {
+        return Err(Error::InvalidConfig(
+            "OBB training learning rate must be finite and non-negative".to_owned(),
+        ));
+    }
+    let update_batch_size = input_shape
+        .batch
+        .checked_mul(subdivision_count)
+        .ok_or_else(|| Error::InvalidConfig("OBB update batch size overflowed usize".to_owned()))?;
+
+    executable.zero_train_buffers();
+    let result = (|| {
+        let mut total_stats = None;
+        for batch in subdivisions {
+            let forward = executable.forward_training(&batch.input)?;
+            let delta_batch =
+                compute_obb_yolo_training_deltas(&executable.network, &forward, &batch.labels)?;
+            executable.backward_accumulate_seeded(
+                &batch.input,
+                &forward,
+                &delta_batch.layer_output_gradient_seeds,
+            )?;
+            if let Some(total) = &mut total_stats {
+                merge_obb_training_stats(total, &delta_batch.stats)?;
+            } else {
+                total_stats = Some(delta_batch.stats);
+            }
+        }
+        Ok(total_stats.expect("the configured subdivision count is nonzero"))
+    })();
+    let stats = match result {
+        Ok(stats) => stats,
+        Err(error) => {
+            executable.zero_train_buffers();
+            return Err(error);
+        }
+    };
+    executable.update_weights(
+        learning_rate,
+        executable.network.net.momentum,
+        executable.network.net.decay,
+        update_batch_size,
+    );
+    Ok(stats)
+}
+
 pub fn compute_yolo_training_loss_with_state(
     network: &Network,
     forward: &ForwardResult,
@@ -2372,7 +2562,7 @@ mod tests {
         compute_yolo_training_loss_with_state, dx_box_iou, load_obb_training_batch,
         load_obb_training_batch_from_paths, load_obb_training_batch_with_flips_from_paths,
         load_training_batch, load_yolo_labels, replace_image_to_label, train_obb_yolo_batch_step,
-        yolo_head_cost, yolo_xy_output,
+        train_obb_yolo_subdivisions, yolo_head_cost, yolo_xy_output,
     };
     use crate::cfg::ConfigFile;
     use crate::model::{Network, TensorShape, YoloIouLoss, YoloSpec};
@@ -2575,6 +2765,41 @@ mod tests {
         let subdivision_error = train_obb_yolo_batch_step(&mut subdivided_executable, &batch, 0.01)
             .expect_err("the single-batch helper must reject subdivisions");
         assert!(subdivision_error.to_string().contains("subdivisions=1"));
+    }
+
+    #[test]
+    fn obb_subdivisions_accumulate_stats_and_update_once() {
+        let mut network = obb_test_network(1);
+        network.net.subdivisions = 2;
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let before = executable.params.clone();
+        let batch = ObbTrainingBatch {
+            input: Tensor::from_data(network.net.input_shape(), vec![1.0; 6]).expect("input"),
+            image_paths: Vec::new(),
+            label_paths: Vec::new(),
+            labels: vec![vec![ObbLabel {
+                class_id: 0,
+                x: 0.5,
+                y: 0.5,
+                w: 0.25,
+                h: 0.5,
+                left: 0.375,
+                right: 0.625,
+                top: 0.25,
+                bottom: 0.75,
+                front_x: 0.7,
+                front_y: 0.55,
+                has_front: true,
+            }]],
+        };
+
+        let stats = train_obb_yolo_subdivisions(&mut executable, &[batch.clone(), batch], 0.01)
+            .expect("OBB subdivisions update");
+        assert_eq!(stats.per_head.len(), 1);
+        assert_eq!(stats.anchor_box_positive_count, 2);
+        assert_eq!(stats.total_bbox_count, 2);
+        assert_eq!(stats.front_point_loss.count, 2);
+        assert_ne!(executable.params, before);
     }
 
     #[test]
