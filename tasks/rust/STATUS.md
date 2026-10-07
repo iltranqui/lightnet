@@ -34,6 +34,7 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v95: audited the fp16 convolution-backward TODO against `mixed.rs` and the real-device `oxide_amp` suite. AMP convolution dgrad uses f16 GEMM with f32 accumulation before f16 storage; wgrad uses f16 inputs with f32 accumulation and returns f32 weight gradients. All 11 `oxide_amp` tests passed, including grouped and multi-chunk convolution. This closes the tracked fp16 dgrad/wgrad follow-up; half2 elementwise remains unnecessary.
 - v94: added `carpn_detector_map` for normalized CARPN quadrilateral detections
   and front-point OBB labels. It reuses oriented polygon IoU and the shared AP
   report/matching policy, rejects non-CARPN predictions and missing-front labels,

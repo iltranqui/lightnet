@@ -32,7 +32,7 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
 
 - [ ] CUDA graph capture: skipped — cuda-core only has raw begin/end capture (no
   instantiate/launch wrapper) and pool addresses are not static.
-- [ ] fp16 remainder: conv dgrad/wgrad on f16; half2 elementwise (not needed).
+- [x] fp16 convolution dgrad/wgrad: Oxide AMP stores convolution inputs/gradients in f16, uses f32 accumulation for dgrad col2im and wgrad, and returns f32 weight gradients. Verified by `MEM=3G ./tools/test_oxide.sh --test oxide_amp` (11/11 passed, including grouped and multi-chunk convolution cases). Half2 elementwise remains unnecessary.
   Standalone f16 batchnorm uses the channel-affine kernel, standalone bias +
   activation and reverse upsample forward are implemented, and all three have
   `oxide_half` / runtime f16 parity coverage.
