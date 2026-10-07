@@ -1,8 +1,9 @@
 //! Source-derived training primitives for legacy front-point OBB YOLO heads.
 //!
-//! This module currently covers direction-free anchor matching, cell selection,
-//! and source-layout truth-row packing only. It does not implement complete
-//! truth assignment, YOLO loss, backward propagation, or optimizer integration.
+//! This module currently covers direction-free anchor matching, per-truth
+//! head-positive enumeration, cell selection, and source-layout truth-row
+//! packing only. It does not implement complete truth assignment, YOLO loss,
+//! backward propagation, or optimizer integration.
 
 use crate::error::{Error, Result};
 use crate::obb_labels::ObbLabel;
@@ -21,6 +22,29 @@ pub struct ObbYoloAnchorAssignment {
     pub match_score: f32,
 }
 
+/// Why a truth-to-head positive match was emitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObbYoloPositiveKind {
+    /// The truth's highest-scoring anchor across all heads.
+    BestAnchor,
+    /// A non-best anchor in this head whose score strictly exceeds `iou_thresh`.
+    AdditionalAnchor,
+}
+
+/// One primary or additional positive anchor match for a truth on one head.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObbYoloPositiveAssignment {
+    /// Index into the input truth slice.
+    pub truth_index: usize,
+    /// Ground-truth class before any optional class mapping.
+    pub class_id: usize,
+    /// Primary-best or threshold-selected additional positive.
+    pub kind: ObbYoloPositiveKind,
+    /// Anchor slot and grid cell selected on this head.
+    pub assignment: ObbYoloAnchorAssignment,
+}
+
+/// Number of float values in one source OBB YOLO truth row.
 pub const OBB_YOLO_TRUTH_SIZE: usize = 7;
 
 /// Source-layout OBB YOLO truth rows, stored as `[batch][box-slot][7]`.
@@ -167,6 +191,143 @@ pub fn assign_obb_yolo_anchor(
     grid_height: usize,
 ) -> Result<Option<ObbYoloAnchorAssignment>> {
     validate_truth(truth)?;
+    validate_anchor_assignment_inputs(
+        anchors,
+        mask,
+        net_width,
+        net_height,
+        grid_width,
+        grid_height,
+    )?;
+    let (best_anchor, best_score) = best_obb_yolo_anchor(truth, anchors, net_width, net_height)?;
+    let Some(head_anchor_index) = mask.iter().position(|&index| index == best_anchor) else {
+        return Ok(None);
+    };
+    let (cell_x, cell_y) = obb_yolo_truth_cell(truth, grid_width, grid_height);
+    Ok(Some(ObbYoloAnchorAssignment {
+        anchor_index: best_anchor,
+        head_anchor_index,
+        cell_x,
+        cell_y,
+        match_score: best_score,
+    }))
+}
+
+/// Enumerate this head's primary and threshold-selected OBB YOLO positive matches.
+///
+/// For each truth, the highest-scoring anchor is selected across the complete
+/// anchor list (first anchor wins ties), and emitted as `BestAnchor` only when
+/// present in `mask`. Other masked anchors are emitted as `AdditionalAnchor`
+/// when `iou_thresh < 1` and their size-IoU is strictly greater than the
+/// threshold. Truth order is preserved; within each truth, the primary match
+/// precedes additional matches, which follow global anchor order. This is only
+/// the source's anchor-positive enumeration, not prediction-conditioned ignore
+/// matching, loss/delta generation, or complete training assignment.
+///
+/// `truths` contains one image's labels; call separately for each image/head.
+pub fn enumerate_obb_yolo_head_positives(
+    truths: &[ObbLabel],
+    classes: usize,
+    anchors: &[f32],
+    mask: &[usize],
+    net_width: usize,
+    net_height: usize,
+    grid_width: usize,
+    grid_height: usize,
+    iou_thresh: f32,
+) -> Result<Vec<ObbYoloPositiveAssignment>> {
+    if classes == 0 || !iou_thresh.is_finite() {
+        return Err(Error::InvalidConfig(
+            "OBB positive assignment requires classes > 0 and a finite iou_thresh".to_owned(),
+        ));
+    }
+    if mask.is_empty() {
+        return Err(Error::InvalidConfig(
+            "OBB positive assignment requires a nonempty head mask".to_owned(),
+        ));
+    }
+    validate_anchor_assignment_inputs(
+        anchors,
+        mask,
+        net_width,
+        net_height,
+        grid_width,
+        grid_height,
+    )?;
+    let max_matches = truths
+        .len()
+        .checked_mul(mask.len())
+        .ok_or_else(|| Error::InvalidConfig("OBB positive assignment size overflows".to_owned()))?;
+    let mut assignments = Vec::new();
+    assignments.try_reserve(max_matches).map_err(|_| {
+        Error::InvalidConfig("OBB positive assignment allocation failed".to_owned())
+    })?;
+
+    for (truth_index, truth) in truths.iter().enumerate() {
+        validate_truth(truth)?;
+        if truth.class_id >= classes {
+            return Err(Error::InvalidConfig(format!(
+                "OBB class id {} exceeds classes={classes} in truth {truth_index}",
+                truth.class_id
+            )));
+        }
+        let (best_anchor, best_score) =
+            best_obb_yolo_anchor(truth, anchors, net_width, net_height)?;
+        let (cell_x, cell_y) = obb_yolo_truth_cell(truth, grid_width, grid_height);
+        if let Some(head_anchor_index) = mask.iter().position(|&index| index == best_anchor) {
+            assignments.push(ObbYoloPositiveAssignment {
+                truth_index,
+                class_id: truth.class_id,
+                kind: ObbYoloPositiveKind::BestAnchor,
+                assignment: ObbYoloAnchorAssignment {
+                    anchor_index: best_anchor,
+                    head_anchor_index,
+                    cell_x,
+                    cell_y,
+                    match_score: best_score,
+                },
+            });
+        }
+
+        if iou_thresh < 1.0 {
+            for (anchor_index, pair) in anchors.chunks_exact(2).enumerate() {
+                if anchor_index == best_anchor {
+                    continue;
+                }
+                let Some(head_anchor_index) = mask.iter().position(|&index| index == anchor_index)
+                else {
+                    continue;
+                };
+                let score =
+                    obb_yolo_anchor_match_score(truth, pair[0], pair[1], net_width, net_height)?;
+                if score > iou_thresh {
+                    assignments.push(ObbYoloPositiveAssignment {
+                        truth_index,
+                        class_id: truth.class_id,
+                        kind: ObbYoloPositiveKind::AdditionalAnchor,
+                        assignment: ObbYoloAnchorAssignment {
+                            anchor_index,
+                            head_anchor_index,
+                            cell_x,
+                            cell_y,
+                            match_score: score,
+                        },
+                    });
+                }
+            }
+        }
+    }
+    Ok(assignments)
+}
+
+fn validate_anchor_assignment_inputs(
+    anchors: &[f32],
+    mask: &[usize],
+    net_width: usize,
+    net_height: usize,
+    grid_width: usize,
+    grid_height: usize,
+) -> Result<()> {
     if anchors.is_empty() || anchors.len() % 2 != 0 {
         return Err(Error::InvalidConfig(
             "OBB anchor list must contain width/height pairs".to_owned(),
@@ -177,12 +338,32 @@ pub fn assign_obb_yolo_anchor(
             "OBB anchor mask index exceeds the anchor list".to_owned(),
         ));
     }
+    if net_width == 0 || net_height == 0 {
+        return Err(Error::InvalidConfig(
+            "OBB anchor assignment requires nonzero network dimensions".to_owned(),
+        ));
+    }
     if grid_width == 0 || grid_height == 0 {
         return Err(Error::InvalidConfig(
             "OBB anchor assignment requires a nonzero grid".to_owned(),
         ));
     }
+    if anchors.chunks_exact(2).any(|pair| {
+        !pair[0].is_finite() || !pair[1].is_finite() || pair[0] <= 0.0 || pair[1] <= 0.0
+    }) {
+        return Err(Error::InvalidConfig(
+            "OBB anchors must have positive finite width and height".to_owned(),
+        ));
+    }
+    Ok(())
+}
 
+fn best_obb_yolo_anchor(
+    truth: &ObbLabel,
+    anchors: &[f32],
+    net_width: usize,
+    net_height: usize,
+) -> Result<(usize, f32)> {
     let mut best_anchor = 0;
     let mut best_score = 0.0;
     for (anchor_index, pair) in anchors.chunks_exact(2).enumerate() {
@@ -192,19 +373,14 @@ pub fn assign_obb_yolo_anchor(
             best_anchor = anchor_index;
         }
     }
+    Ok((best_anchor, best_score))
+}
 
-    let Some(head_anchor_index) = mask.iter().position(|&index| index == best_anchor) else {
-        return Ok(None);
-    };
-    let cell_x = ((truth.x * grid_width as f32) as usize).min(grid_width - 1);
-    let cell_y = ((truth.y * grid_height as f32) as usize).min(grid_height - 1);
-    Ok(Some(ObbYoloAnchorAssignment {
-        anchor_index: best_anchor,
-        head_anchor_index,
-        cell_x,
-        cell_y,
-        match_score: best_score,
-    }))
+fn obb_yolo_truth_cell(truth: &ObbLabel, grid_width: usize, grid_height: usize) -> (usize, usize) {
+    (
+        ((truth.x * grid_width as f32) as usize).min(grid_width - 1),
+        ((truth.y * grid_height as f32) as usize).min(grid_height - 1),
+    )
 }
 
 fn validate_truth(truth: &ObbLabel) -> Result<()> {
@@ -230,8 +406,9 @@ fn validate_truth(truth: &ObbLabel) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, assign_obb_yolo_anchor,
-        encode_obb_yolo_truth_batch, obb_yolo_anchor_match_score,
+        OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloPositiveKind, assign_obb_yolo_anchor,
+        encode_obb_yolo_truth_batch, enumerate_obb_yolo_head_positives,
+        obb_yolo_anchor_match_score,
     };
     use crate::obb_labels::ObbLabel;
 
@@ -327,6 +504,163 @@ mod tests {
         let mut invalid_center = label;
         invalid_center.x = f32::NAN;
         assert!(encode_obb_yolo_truth_batch(&[vec![invalid_center]], 1, 1).is_err());
+    }
+
+    #[test]
+    fn positive_enumerator_emits_primary_then_strictly_qualified_masked_anchors() {
+        let mut label = truth(0.51, 0.39, 0.4, 0.4);
+        label.class_id = 1;
+        let assignments = enumerate_obb_yolo_head_positives(
+            &[label],
+            2,
+            &[40.0, 40.0, 30.0, 40.0, 10.0, 10.0],
+            &[2, 0, 1],
+            100,
+            100,
+            5,
+            4,
+            0.7,
+        )
+        .expect("positive matches");
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0].truth_index, 0);
+        assert_eq!(assignments[0].class_id, 1);
+        assert_eq!(assignments[0].kind, ObbYoloPositiveKind::BestAnchor);
+        assert_eq!(
+            assignments[0].assignment,
+            ObbYoloAnchorAssignment {
+                anchor_index: 0,
+                head_anchor_index: 1,
+                cell_x: 2,
+                cell_y: 1,
+                match_score: 1.0,
+            }
+        );
+        assert_eq!(assignments[1].truth_index, 0);
+        assert_eq!(assignments[1].class_id, 1);
+        assert_eq!(assignments[1].kind, ObbYoloPositiveKind::AdditionalAnchor);
+        assert_eq!(assignments[1].assignment.anchor_index, 1);
+        assert_eq!(assignments[1].assignment.head_anchor_index, 2);
+        assert_eq!(assignments[1].assignment.cell_x, 2);
+        assert_eq!(assignments[1].assignment.cell_y, 1);
+        assert!((assignments[1].assignment.match_score - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn positive_enumerator_preserves_truth_order_across_batch_slots() {
+        let truths = [truth(0.25, 0.25, 0.4, 0.4), truth(0.75, 0.75, 0.1, 0.1)];
+        let assignments = enumerate_obb_yolo_head_positives(
+            &truths,
+            1,
+            &[40.0, 40.0, 30.0, 40.0, 10.0, 10.0],
+            &[2, 0, 1],
+            100,
+            100,
+            4,
+            4,
+            1.0,
+        )
+        .expect("truth order");
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0].truth_index, 0);
+        assert_eq!(assignments[0].assignment.anchor_index, 0);
+        assert_eq!(assignments[0].assignment.cell_x, 1);
+        assert_eq!(assignments[0].assignment.cell_y, 1);
+        assert_eq!(assignments[1].truth_index, 1);
+        assert_eq!(assignments[1].assignment.anchor_index, 2);
+        assert_eq!(assignments[1].assignment.head_anchor_index, 0);
+        assert_eq!(assignments[1].assignment.cell_x, 3);
+        assert_eq!(assignments[1].assignment.cell_y, 3);
+    }
+
+    #[test]
+    fn positive_enumerator_keeps_masked_extras_when_best_anchor_is_elsewhere() {
+        let label = truth(0.5, 0.5, 0.4, 0.4);
+        let assignments = enumerate_obb_yolo_head_positives(
+            &[label],
+            1,
+            &[40.0, 40.0, 30.0, 40.0, 10.0, 10.0],
+            &[1, 2],
+            100,
+            100,
+            5,
+            5,
+            0.7,
+        )
+        .expect("additional match without the global best");
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].kind, ObbYoloPositiveKind::AdditionalAnchor);
+        assert_eq!(assignments[0].assignment.anchor_index, 1);
+        assert_eq!(assignments[0].assignment.head_anchor_index, 0);
+    }
+
+    #[test]
+    fn positive_enumerator_uses_strict_threshold_and_default_disables_extras() {
+        let label = truth(0.5, 0.5, 0.4, 0.4);
+        let args = (
+            &[label][..],
+            1,
+            &[40.0, 40.0, 30.0, 40.0, 10.0, 10.0][..],
+            &[0, 1, 2][..],
+            100,
+            100,
+            5,
+            5,
+        );
+        let boundary = obb_yolo_anchor_match_score(&label, 30.0, 40.0, 100, 100)
+            .expect("matching anchor score");
+        let at_boundary = enumerate_obb_yolo_head_positives(
+            args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, boundary,
+        )
+        .expect("strict threshold");
+        assert_eq!(at_boundary.len(), 1);
+        assert_eq!(at_boundary[0].kind, ObbYoloPositiveKind::BestAnchor);
+        let default_threshold = enumerate_obb_yolo_head_positives(
+            args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, 1.0,
+        )
+        .expect("source default threshold");
+        assert_eq!(default_threshold, at_boundary);
+    }
+
+    #[test]
+    fn positive_enumerator_validates_empty_input_configuration_and_truth_classes() {
+        let anchors = [40.0, 40.0];
+        assert!(
+            enumerate_obb_yolo_head_positives(&[], 1, &anchors, &[0], 100, 100, 5, 5, 1.0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            enumerate_obb_yolo_head_positives(&[], 0, &anchors, &[0], 100, 100, 5, 5, 1.0).is_err()
+        );
+        assert!(
+            enumerate_obb_yolo_head_positives(&[], 1, &anchors, &[0], 100, 100, 5, 5, f32::NAN)
+                .is_err()
+        );
+        assert!(
+            enumerate_obb_yolo_head_positives(&[], 1, &[0.0, 40.0], &[0], 100, 100, 5, 5, 1.0)
+                .is_err()
+        );
+        assert!(
+            enumerate_obb_yolo_head_positives(&[], 1, &anchors, &[], 100, 100, 5, 5, 1.0).is_err()
+        );
+
+        let mut invalid_class = truth(0.5, 0.5, 0.2, 0.2);
+        invalid_class.class_id = 1;
+        assert!(
+            enumerate_obb_yolo_head_positives(
+                &[invalid_class],
+                1,
+                &anchors,
+                &[0],
+                100,
+                100,
+                5,
+                5,
+                1.0
+            )
+            .is_err()
+        );
     }
 
     #[test]

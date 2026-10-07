@@ -34,6 +34,13 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v92: added `enumerate_obb_yolo_head_positives` with typed best-anchor and
+  additional-anchor matches. It preserves truth and global-anchor order, emits
+  extra masked anchors only under the source `iou_thresh < 1` and strict score
+  comparison, and can return qualifying extras even when the global best is not
+  in the head mask. Focused OBB tests passed 49/49. Prediction-conditioned
+  ignore/truth-threshold matching, loss/deltas, trainer integration, and
+  compiled-C++ parity remain open.
 - v91: added `ObbTrainingBatch::encode_truths` and public seven-float OBB YOLO
   truth packing in the source `[batch][box-slot][7]` layout. Rows preserve label
   order, use the center placeholder for absent front points, and zero-pad unused
