@@ -81,6 +81,21 @@ pub struct ObbYoloHeadMatchConfig {
     pub objectness_smooth: bool,
 }
 
+/// Source anchor/class settings for the positive-assignment objectness pass.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObbYoloPositiveObjectnessConfig {
+    pub head: ObbYoloHeadAssignmentSpec,
+    pub anchors: Vec<f32>,
+    pub classes: usize,
+    pub net_width: usize,
+    pub net_height: usize,
+    pub iou_thresh: f32,
+    pub objectness_normalizer: f32,
+    pub objectness_smooth: bool,
+    pub class_map: Option<Vec<usize>>,
+    pub class_multipliers: Option<Vec<f32>>,
+}
+
 /// One positive assignment tagged with its batch slot and OBB YOLO head.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ObbYoloBatchPositiveAssignment {
@@ -1362,6 +1377,105 @@ pub fn apply_obb_yolo_batch_head_objectness_deltas(
     })
 }
 
+/// Apply best-anchor and threshold-selected OBB positive objectness overrides.
+///
+/// Positives follow source global-anchor selection and mask membership. With
+/// objectness smoothing, an existing nonzero delta is preserved; otherwise the
+/// positive target overwrites the earlier negative/ignore objectness delta.
+/// Only objectness entries are changed; class and box training remain separate.
+pub fn apply_obb_yolo_batch_head_positive_objectness_deltas(
+    batch_truths: &[Vec<ObbLabel>],
+    head_output: &[f32],
+    head_delta: &mut [f32],
+    config: &ObbYoloPositiveObjectnessConfig,
+) -> Result<()> {
+    if config.classes == 0
+        || !config.objectness_normalizer.is_finite()
+        || config.class_map.as_ref().is_some_and(|mapping| {
+            mapping.len() != config.classes
+                || mapping.iter().any(|&class_id| class_id >= config.classes)
+        })
+        || config
+            .class_multipliers
+            .as_ref()
+            .is_some_and(|multipliers| {
+                multipliers.len() != config.classes
+                    || multipliers.iter().any(|value| !value.is_finite())
+            })
+    {
+        return Err(Error::InvalidConfig(
+            "OBB positive objectness assignment has invalid class or normalizer settings"
+                .to_owned(),
+        ));
+    }
+    let stride = config
+        .head
+        .grid_width
+        .checked_mul(config.head.grid_height)
+        .ok_or_else(|| Error::InvalidConfig("OBB head grid size overflows".to_owned()))?;
+    let entries = config
+        .classes
+        .checked_add(7)
+        .ok_or_else(|| Error::InvalidConfig("OBB head entry count overflows".to_owned()))?;
+    let per_batch = config
+        .head
+        .mask
+        .len()
+        .checked_mul(entries)
+        .and_then(|count| count.checked_mul(stride))
+        .ok_or_else(|| Error::InvalidConfig("OBB head tensor size overflows".to_owned()))?;
+    let expected = batch_truths
+        .len()
+        .checked_mul(per_batch)
+        .ok_or_else(|| Error::InvalidConfig("OBB batch tensor size overflows".to_owned()))?;
+    if head_output.len() != expected || head_delta.len() != expected {
+        return Err(Error::InvalidConfig(format!(
+            "OBB positive-assignment tensor length mismatch: expected {expected}, output {}, delta {}",
+            head_output.len(),
+            head_delta.len()
+        )));
+    }
+
+    let head_specs = [config.head.clone()];
+    let positives = enumerate_obb_yolo_batch_positives(
+        batch_truths,
+        config.classes,
+        &config.anchors,
+        &head_specs,
+        config.net_width,
+        config.net_height,
+        config.iou_thresh,
+    )?;
+    for tagged in positives {
+        let positive = tagged.positive;
+        let truth = &batch_truths[tagged.batch_index][positive.truth_index];
+        let class_id = config
+            .class_map
+            .as_ref()
+            .map_or(truth.class_id, |mapping| mapping[truth.class_id]);
+        let class_multiplier = config
+            .class_multipliers
+            .as_ref()
+            .map_or(1.0, |multipliers| multipliers[class_id]);
+        let cell_index =
+            positive.assignment.cell_y * config.head.grid_width + positive.assignment.cell_x;
+        let channel = positive.assignment.head_anchor_index * entries + 6;
+        let index = tagged.batch_index * per_batch + channel * stride + cell_index;
+        let predicted_objectness = finite_or_zero(head_output[index]);
+        let positive_delta =
+            class_multiplier * config.objectness_normalizer * (1.0 - predicted_objectness);
+        if !positive_delta.is_finite() {
+            return Err(Error::InvalidConfig(
+                "OBB positive objectness delta is non-finite".to_owned(),
+            ));
+        }
+        if !config.objectness_smooth || head_delta[index] == 0.0 {
+            head_delta[index] = positive_delta;
+        }
+    }
+    Ok(())
+}
+
 fn validate_anchor_assignment_inputs(
     anchors: &[f32],
     mask: &[usize],
@@ -1451,8 +1565,10 @@ mod tests {
         OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloBatchCellPrediction,
         ObbYoloCellTruthMatch, ObbYoloHeadAssignmentSpec, ObbYoloHeadMatchConfig,
         ObbYoloMatchScoreBranch, ObbYoloMatchScoreConfig, ObbYoloPositiveKind,
-        ObbYoloPredictionMatchContext, apply_obb_yolo_batch_head_objectness_deltas,
-        assign_obb_yolo_anchor, encode_obb_yolo_truth_batch, enumerate_obb_yolo_batch_positives,
+        ObbYoloPositiveObjectnessConfig, ObbYoloPredictionMatchContext,
+        apply_obb_yolo_batch_head_objectness_deltas,
+        apply_obb_yolo_batch_head_positive_objectness_deltas, assign_obb_yolo_anchor,
+        encode_obb_yolo_truth_batch, enumerate_obb_yolo_batch_positives,
         enumerate_obb_yolo_head_positives, match_obb_yolo_batch_cell_predictions,
         match_obb_yolo_cell_prediction, match_obb_yolo_cell_prediction_with_score_config,
         obb_yolo_anchor_match_score, obb_yolo_angular_prediction_match_score_with_viou,
@@ -1844,6 +1960,91 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn positive_anchor_objectness_overrides_use_mask_slots_mapping_and_smoothing() {
+        let truth = truth(0.5, 0.5, 0.2, 0.2);
+        let config = ObbYoloPositiveObjectnessConfig {
+            head: ObbYoloHeadAssignmentSpec {
+                mask: vec![0, 1],
+                grid_width: 1,
+                grid_height: 1,
+            },
+            anchors: vec![10.0, 10.0, 20.0, 20.0],
+            classes: 2,
+            net_width: 100,
+            net_height: 100,
+            iou_thresh: 0.2,
+            objectness_normalizer: 2.0,
+            objectness_smooth: false,
+            class_map: Some(vec![1, 0]),
+            class_multipliers: Some(vec![2.0, 3.0]),
+        };
+        let mut head_output = vec![0.0; 18];
+        head_output[6] = 0.2;
+        head_output[15] = 0.3;
+        let mut head_delta = vec![-5.0; 18];
+        apply_obb_yolo_batch_head_positive_objectness_deltas(
+            &[vec![truth]],
+            &head_output,
+            &mut head_delta,
+            &config,
+        )
+        .unwrap();
+        assert!((head_delta[6] - 4.8).abs() < 1e-6);
+        assert!((head_delta[15] - 4.2).abs() < 1e-6);
+        for (index, &value) in head_delta.iter().enumerate() {
+            if index != 6 && index != 15 {
+                assert_eq!(value, -5.0, "delta entry {index} changed");
+            }
+        }
+
+        let mut smooth_config = config;
+        smooth_config.objectness_smooth = true;
+        let mut smooth_delta = vec![0.0; 18];
+        smooth_delta[15] = 0.4;
+        apply_obb_yolo_batch_head_positive_objectness_deltas(
+            &[vec![truth]],
+            &head_output,
+            &mut smooth_delta,
+            &smooth_config,
+        )
+        .unwrap();
+        assert!((smooth_delta[6] - 4.8).abs() < 1e-6);
+        assert_eq!(smooth_delta[15], 0.4);
+    }
+
+    #[test]
+    fn positive_anchor_objectness_rejects_bad_mapping() {
+        let config = ObbYoloPositiveObjectnessConfig {
+            head: ObbYoloHeadAssignmentSpec {
+                mask: vec![0],
+                grid_width: 1,
+                grid_height: 1,
+            },
+            anchors: vec![10.0, 10.0],
+            classes: 1,
+            net_width: 10,
+            net_height: 10,
+            iou_thresh: 1.0,
+            objectness_normalizer: 1.0,
+            objectness_smooth: false,
+            class_map: Some(vec![1]),
+            class_multipliers: None,
+        };
+        let head_output = [0.0; 8];
+        let mut head_delta = [0.0; 8];
+        assert!(
+            apply_obb_yolo_batch_head_positive_objectness_deltas(
+                &[vec![truth(0.5, 0.5, 0.1, 0.1)]],
+                &head_output,
+                &mut head_delta,
+                &config,
+            )
+            .is_err()
+        );
+        assert_eq!(head_delta, [0.0; 8]);
     }
 
     #[test]

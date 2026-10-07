@@ -272,8 +272,10 @@ Immediately next, in dependency order:
   returns tagged match gates; v112 traverses a full batch-major head tensor in
   source cell/anchor order; v113 emits source objectness deltas for batch/head
   cells with ignore and positive overrides; v114 writes those deltas into entry 6
-  of one head's delta tensor without altering other entries. Multi-head trainer
-  dispatch, COBB regression gradients/deltas, class/box losses and training-loop integration, crop/resize and mosaic transforms,
+  of one head's delta tensor without altering other entries; v115 applies
+  source best/additional positive-anchor objectness overrides, class mapping and
+  smooth-mode preservation. Multi-head trainer dispatch, COBB regression
+  gradients/deltas, class/box losses and training-loop integration, crop/resize and mosaic transforms,
   alternate NMS-kind implementations, training `-map` cadence, and CARPN network
   decoding/validation integration remain open.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and

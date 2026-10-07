@@ -63,10 +63,12 @@ pub use obb_training::{
     ObbYoloBatchPositiveAssignment,
     ObbYoloBatchCellMatch, ObbYoloBatchCellPrediction, ObbYoloCellTruthMatch,
     ObbYoloClassDeltaResult, ObbYoloPositiveAssignment, ObbYoloPositiveKind,
+    ObbYoloPositiveObjectnessConfig,
     ObbYoloMatchScore, ObbYoloMatchScoreBranch, ObbYoloMatchScoreConfig,
     ObbYoloPredictionMatchContext, ObbYoloHeadAssignmentSpec,
     ObbYoloHeadMatchConfig, ObbYoloTruthBatch,
-    apply_obb_yolo_batch_head_objectness_deltas, assign_obb_yolo_anchor,
+    apply_obb_yolo_batch_head_objectness_deltas,
+    apply_obb_yolo_batch_head_positive_objectness_deltas, assign_obb_yolo_anchor,
     encode_obb_yolo_truth_batch, enumerate_obb_yolo_batch_positives,
     enumerate_obb_yolo_head_positives,
     match_obb_yolo_batch_cell_predictions, match_obb_yolo_cell_prediction,
@@ -77,7 +79,6 @@ pub use obb_training::{
     obb_yolo_ciou_prediction_match_score, obb_yolo_cobb_prediction_match_score_with_viou,
     obb_yolo_covariance_prediction_match_score,
     obb_yolo_covariance_prediction_match_score_with_viou, select_obb_yolo_cell_truth_match,
-    visit_obb_yolo_batch_head_matches,
     visit_obb_yolo_batch_head_matches,
 };
 pub(crate) mod omd_loss;
