@@ -15,7 +15,11 @@ use crate::error::{Error, Result};
 use crate::image::PlanarRgbImage;
 use crate::model::{LayerKind, Network, TensorShape, YoloIouLoss, YoloSpec};
 use crate::obb_labels::{ObbLabel, flip_obb_labels, load_obb_labels};
-use crate::obb_training::{ObbYoloTruthBatch, encode_obb_yolo_truth_batch};
+use crate::obb_training::{
+    ObbYoloBatchTrainingDeltaStats, ObbYoloTruthBatch,
+    apply_obb_yolo_batch_multi_head_training_deltas_with_front_point_configs,
+    build_obb_yolo_training_head_config, encode_obb_yolo_truth_batch,
+};
 use crate::runtime::{ForwardResult, Tensor};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -265,6 +269,137 @@ pub fn compute_yolo_training_loss(
     labels: &[Vec<YoloLabel>],
 ) -> Result<YoloTrainingLoss> {
     compute_yolo_training_loss_with_state(network, forward, labels, 0, None)
+}
+
+/// Output-channel deltas and per-head stats for one OBB forward pass.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObbYoloTrainingDeltaBatch {
+    /// Gradient seeds indexed by network layer; non-head layers are `None`.
+    pub layer_output_gradient_seeds: Vec<Option<Tensor>>,
+    pub stats: ObbYoloBatchTrainingDeltaStats,
+}
+
+/// Build OBB YOLO output-gradient seeds from parsed heads and a forward pass.
+///
+/// This wires the source-ordered delta helpers to real network head tensors, but
+/// does not calculate the complete OBB loss scalar or run backward/update.
+pub fn compute_obb_yolo_training_deltas(
+    network: &Network,
+    forward: &ForwardResult,
+    labels: &[Vec<ObbLabel>],
+) -> Result<ObbYoloTrainingDeltaBatch> {
+    if !network.net.obb {
+        return Err(Error::InvalidConfig(
+            "OBB YOLO delta generation requires [net] obb=1".to_owned(),
+        ));
+    }
+    let batch_size = network.net.batch.max(1);
+    if labels.len() != batch_size {
+        return Err(Error::InvalidConfig(format!(
+            "OBB training label batch mismatch: expected {batch_size}, got {}",
+            labels.len()
+        )));
+    }
+    let mut expected_heads = vec![false; network.layers.len()];
+    let mut expected_count = 0usize;
+    for (layer_index, layer) in network.layers.iter().enumerate() {
+        if matches!(layer.kind, LayerKind::ObbYolo(_)) {
+            expected_heads[layer_index] = true;
+            expected_count += 1;
+        }
+    }
+    if expected_count == 0 || forward.yolo_heads.len() != expected_count {
+        return Err(Error::InvalidConfig(format!(
+            "OBB forward has {} heads; network requires {expected_count} OBB YOLO heads",
+            forward.yolo_heads.len()
+        )));
+    }
+
+    let mut seen_heads = vec![false; network.layers.len()];
+    let mut head_outputs = Vec::with_capacity(expected_count);
+    let mut head_deltas = Vec::with_capacity(expected_count);
+    let mut match_configs = Vec::with_capacity(expected_count);
+    let mut assignment_configs = Vec::with_capacity(expected_count);
+    let mut box_delta_configs = Vec::with_capacity(expected_count);
+    let mut front_point_delta_configs = Vec::with_capacity(expected_count);
+    let mut training_options = None;
+    for head in &forward.yolo_heads {
+        let layer_index = head.layer_index;
+        if layer_index >= expected_heads.len()
+            || !expected_heads[layer_index]
+            || seen_heads[layer_index]
+        {
+            return Err(Error::InvalidConfig(format!(
+                "OBB forward contains an unexpected or duplicate head at layer #{layer_index}"
+            )));
+        }
+        seen_heads[layer_index] = true;
+        let layer = &network.layers[layer_index];
+        let LayerKind::ObbYolo(spec) = &layer.kind else {
+            unreachable!("head kind was checked above")
+        };
+        if head.output.shape.batch != batch_size {
+            return Err(Error::InvalidConfig(format!(
+                "OBB head batch mismatch: expected {batch_size}, got {}",
+                head.output.shape.batch
+            )));
+        }
+        let options = (spec.focal_loss, spec.label_smooth_eps, spec.cls_normalizer);
+        if training_options.is_some_and(|previous| previous != options) {
+            return Err(Error::InvalidConfig(
+                "OBB multi-head training currently requires shared focal/class loss options"
+                    .to_owned(),
+            ));
+        }
+        training_options = Some(options);
+        let config = build_obb_yolo_training_head_config(
+            spec,
+            layer_index,
+            head.output.shape.width,
+            head.output.shape.height,
+            network.net.width,
+            network.net.height,
+        )?;
+        head_outputs.push(head.output.data.clone());
+        head_deltas.push(vec![0.0; head.output.data.len()]);
+        match_configs.push(config.match_config);
+        assignment_configs.push(config.assignment_config);
+        box_delta_configs.push(config.box_delta_config);
+        front_point_delta_configs.push(config.front_point_delta_config);
+    }
+    if expected_heads
+        .iter()
+        .zip(&seen_heads)
+        .any(|(&expected, &seen)| expected != seen)
+    {
+        return Err(Error::InvalidConfig(
+            "OBB forward omitted a configured YOLO head".to_owned(),
+        ));
+    }
+
+    let (focal_loss, label_smooth_eps, cls_normalizer) =
+        training_options.expect("a nonempty OBB head list was validated");
+    let stats = apply_obb_yolo_batch_multi_head_training_deltas_with_front_point_configs(
+        labels,
+        &head_outputs,
+        &mut head_deltas,
+        &match_configs,
+        &assignment_configs,
+        focal_loss,
+        label_smooth_eps,
+        cls_normalizer,
+        &box_delta_configs,
+        &front_point_delta_configs,
+    )?;
+    let mut layer_output_gradient_seeds = vec![None; network.layers.len()];
+    for (head, deltas) in forward.yolo_heads.iter().zip(head_deltas) {
+        layer_output_gradient_seeds[head.layer_index] =
+            Some(Tensor::from_data(head.output.shape, deltas)?);
+    }
+    Ok(ObbYoloTrainingDeltaBatch {
+        layer_output_gradient_seeds,
+        stats,
+    })
 }
 
 pub fn compute_yolo_training_loss_with_state(
@@ -2141,11 +2276,11 @@ mod tests {
     use super::{
         DataConfig, ObbTrainingBatch, YoloBox, YoloHeadStats, YoloLabel, YoloTrainingState,
         apply_yolo_box_delta, apply_yolo_class_delta, apply_yolo_delta_filtering,
-        apply_yolo_positive_objectness, bbox_iou_kind, compute_yolo_training_loss,
-        compute_yolo_training_loss_with_state, dx_box_iou, load_obb_training_batch,
-        load_obb_training_batch_from_paths, load_obb_training_batch_with_flips_from_paths,
-        load_training_batch, load_yolo_labels, replace_image_to_label, yolo_head_cost,
-        yolo_xy_output,
+        apply_yolo_positive_objectness, bbox_iou_kind, compute_obb_yolo_training_deltas,
+        compute_yolo_training_loss, compute_yolo_training_loss_with_state, dx_box_iou,
+        load_obb_training_batch, load_obb_training_batch_from_paths,
+        load_obb_training_batch_with_flips_from_paths, load_training_batch, load_yolo_labels,
+        replace_image_to_label, yolo_head_cost, yolo_xy_output,
     };
     use crate::cfg::ConfigFile;
     use crate::model::{Network, TensorShape, YoloIouLoss, YoloSpec};
@@ -2220,6 +2355,42 @@ mod tests {
             compute_yolo_training_loss(&hybrid, &forward, &[Vec::new()]).is_err(),
             "allow_obb_truth must not enable the unsupported AABB loss path"
         );
+    }
+
+    #[test]
+    fn obb_training_delta_generation_wires_forward_heads_to_gradient_seeds() {
+        let network = obb_test_network(1);
+        let executable = ExecutableNetwork::new(network.clone());
+        let input = Tensor::from_data(network.net.input_shape(), vec![0.0; 6]).expect("input");
+        let forward = executable.forward(&input).expect("forward");
+        let labels = [vec![ObbLabel {
+            class_id: 0,
+            x: 0.5,
+            y: 0.5,
+            w: 0.25,
+            h: 0.5,
+            left: 0.375,
+            right: 0.625,
+            top: 0.25,
+            bottom: 0.75,
+            front_x: 0.7,
+            front_y: 0.55,
+            has_front: true,
+        }]];
+
+        let result = compute_obb_yolo_training_deltas(&network, &forward, &labels)
+            .expect("OBB head deltas are generated");
+        let head_index = forward.yolo_heads[0].layer_index;
+        let seed = result.layer_output_gradient_seeds[head_index]
+            .as_ref()
+            .expect("OBB head receives an output-gradient seed");
+        assert_eq!(seed.shape, forward.yolo_heads[0].output.shape);
+        assert!(seed.data.iter().any(|delta| delta.abs() > 0.0));
+        assert_eq!(result.stats.per_head.len(), 1);
+        assert_eq!(result.stats.anchor_box_positive_count, 1);
+        assert_eq!(result.stats.total_bbox_count, 1);
+        assert_eq!(result.stats.front_point_loss.count, 1);
+        assert!(result.stats.front_point_loss.loss_sum.is_finite());
     }
 
     #[test]

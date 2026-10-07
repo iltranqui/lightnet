@@ -295,9 +295,11 @@ Immediately next, in dependency order:
   forms and retains per-anchor direction priors; v136 parses the front-loss
   normalizer and alias/default; v137 builds per-head delta configs from parsed
   OBB specs plus runtime dimensions; v138 supports per-head front-loss configs
-  during multi-head dispatch. Still open: remaining cfg/training option wiring,
-  inference/network decode integration, network-loop/backprop
-  integration, remaining metric/loss aggregation and integrated loss/training-loop
+  during multi-head dispatch; v139 builds network-layer delta seeds from OBB
+  forward heads and labels. Still open: full loss scalar, backward/optimizer and
+  training-loop integration, remaining cfg/training option wiring,
+  inference/network decode integration, remaining metric/loss aggregation and
+  integrated loss/training-loop
   wiring, crop/resize and mosaic transforms,
   alternate NMS-kind implementations, training `-map` cadence, and CARPN network
   decoding/validation integration remain open.
