@@ -263,9 +263,10 @@ Immediately next, in dependency order:
   geometry; v102 adds a raw-channel covariance-branch match score for one cell;
   v103 adds the source QBBV heatmap and sampled vIoU metric; v104 adds the
   source QBBV blend and covariance-branch integration; v105 adds the source
-  legacy angular fallback scorer and one-cell decode/blend. Multi-branch weighted
-  aggregation and QBBV/COBB scoring integration, COBB loss/decode,
-  batch and positive-anchor assignment integration, complete class/box
+  legacy angular fallback scorer and one-cell decode/blend; v106 adds decoded
+  COBB loss/quality and QBBV blending. Multi-branch branch selection/aggregation,
+  raw-channel COBB decode and training-loss/delta integration, batch and
+  positive-anchor assignment integration, complete class/box
   losses and deltas, trainer integration, crop/resize and mosaic transforms,
   alternate NMS-kind implementations, training `-map` cadence, and CARPN network
   decoding/validation integration remain open.
