@@ -428,6 +428,71 @@ pub fn backward_obb_yolo_training(
     })
 }
 
+/// Run one SGD update for an OBB batch when `subdivisions=1`.
+///
+/// Callers still own iteration scheduling and the complete loss scalar. This
+/// helper rejects Adam and multi-subdivision networks rather than silently
+/// applying the wrong optimizer or update cadence.
+pub fn train_obb_yolo_batch_step(
+    executable: &mut ExecutableNetwork,
+    batch: &ObbTrainingBatch,
+    learning_rate: f32,
+) -> Result<ObbYoloTrainingBackward> {
+    let network = &executable.network;
+    if !network.net.obb {
+        return Err(Error::InvalidConfig(
+            "OBB YOLO batch training requires [net] obb=1".to_owned(),
+        ));
+    }
+    if network.net.adam {
+        return Err(Error::InvalidConfig(
+            "OBB CPU batch-step helper currently supports SGD, not Adam".to_owned(),
+        ));
+    }
+    if network.net.subdivisions.max(1) != 1 {
+        return Err(Error::InvalidConfig(
+            "OBB CPU batch-step helper requires subdivisions=1".to_owned(),
+        ));
+    }
+    if batch.input.shape != network.net.input_shape() {
+        return Err(Error::InvalidConfig(
+            "OBB training batch tensor shape does not match the network".to_owned(),
+        ));
+    }
+    if batch.labels.len() != batch.input.shape.batch {
+        return Err(Error::InvalidConfig(format!(
+            "OBB training label batch mismatch: expected {}, got {}",
+            batch.input.shape.batch,
+            batch.labels.len()
+        )));
+    }
+    if !learning_rate.is_finite() || learning_rate < 0.0 {
+        return Err(Error::InvalidConfig(
+            "OBB training learning rate must be finite and non-negative".to_owned(),
+        ));
+    }
+
+    executable.zero_train_buffers();
+    let forward = executable.forward_training(&batch.input)?;
+    let delta_batch =
+        compute_obb_yolo_training_deltas(&executable.network, &forward, &batch.labels)?;
+    let backward = executable.backward_accumulate_seeded(
+        &batch.input,
+        &forward,
+        &delta_batch.layer_output_gradient_seeds,
+    )?;
+    executable.update_weights(
+        learning_rate,
+        executable.network.net.momentum,
+        executable.network.net.decay,
+        batch.input.shape.batch,
+    );
+    Ok(ObbYoloTrainingBackward {
+        delta_batch,
+        backward,
+    })
+}
+
 pub fn compute_yolo_training_loss_with_state(
     network: &Network,
     forward: &ForwardResult,
@@ -2306,8 +2371,8 @@ mod tests {
         compute_obb_yolo_training_deltas, compute_yolo_training_loss,
         compute_yolo_training_loss_with_state, dx_box_iou, load_obb_training_batch,
         load_obb_training_batch_from_paths, load_obb_training_batch_with_flips_from_paths,
-        load_training_batch, load_yolo_labels, replace_image_to_label, yolo_head_cost,
-        yolo_xy_output,
+        load_training_batch, load_yolo_labels, replace_image_to_label, train_obb_yolo_batch_step,
+        yolo_head_cost, yolo_xy_output,
     };
     use crate::cfg::ConfigFile;
     use crate::model::{Network, TensorShape, YoloIouLoss, YoloSpec};
@@ -2465,6 +2530,51 @@ mod tests {
             matches!(gradient, LayerParams::Convolutional(params)
                 if params.weights.iter().any(|value| value.abs() > 0.0))
         }));
+    }
+
+    #[test]
+    fn obb_single_batch_step_backpropagates_and_updates_sgd_parameters() {
+        let network = obb_test_network(1);
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let before = executable.params.clone();
+        let batch = ObbTrainingBatch {
+            input: Tensor::from_data(network.net.input_shape(), vec![1.0; 6]).expect("input"),
+            image_paths: Vec::new(),
+            label_paths: Vec::new(),
+            labels: vec![vec![ObbLabel {
+                class_id: 0,
+                x: 0.5,
+                y: 0.5,
+                w: 0.25,
+                h: 0.5,
+                left: 0.375,
+                right: 0.625,
+                top: 0.25,
+                bottom: 0.75,
+                front_x: 0.7,
+                front_y: 0.55,
+                has_front: true,
+            }]],
+        };
+
+        let result =
+            train_obb_yolo_batch_step(&mut executable, &batch, 0.01).expect("OBB SGD batch step");
+        assert_eq!(result.delta_batch.stats.anchor_box_positive_count, 1);
+        assert_ne!(executable.params, before);
+
+        let mut adam_network = network.clone();
+        adam_network.net.adam = true;
+        let mut adam_executable = ExecutableNetwork::new(adam_network);
+        let adam_error = train_obb_yolo_batch_step(&mut adam_executable, &batch, 0.01)
+            .expect_err("the CPU SGD helper must reject Adam");
+        assert!(adam_error.to_string().contains("not Adam"));
+
+        let mut subdivided_network = network;
+        subdivided_network.net.subdivisions = 2;
+        let mut subdivided_executable = ExecutableNetwork::new(subdivided_network);
+        let subdivision_error = train_obb_yolo_batch_step(&mut subdivided_executable, &batch, 0.01)
+            .expect_err("the single-batch helper must reject subdivisions");
+        assert!(subdivision_error.to_string().contains("subdivisions=1"));
     }
 
     #[test]

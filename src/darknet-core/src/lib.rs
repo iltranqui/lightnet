@@ -132,6 +132,7 @@ pub use train::{
     DataConfig, ObbTrainingBatch, TrainingBatch, YoloLabel, YoloTrainingLoss, YoloTrainingState,
     ObbYoloTrainingDeltaBatch, compute_obb_yolo_training_deltas,
     ObbYoloTrainingBackward, backward_obb_yolo_training,
+    train_obb_yolo_batch_step,
     compute_yolo_training_loss, compute_yolo_training_loss_with_state,
     load_augmented_training_batch_from_paths, load_obb_training_batch,
     load_obb_training_batch_from_paths, load_obb_training_batch_with_flips_from_paths,
