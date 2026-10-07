@@ -996,6 +996,35 @@ pub fn match_obb_yolo_cell_prediction(
     select_obb_yolo_cell_truth_match(&scores, class_outputs, ignore_thresh, truth_thresh)
 }
 
+/// Compute source-priority OBB scores against truth rows, then select one
+/// cell's best-truth, ignore, and positive gates.
+///
+/// The covariance/COBB/angular branch dispatcher is run independently for each
+/// truth. Truth order, strict thresholds, class gating, and the `truth.x == 0`
+/// empty-slot sentinel match the source cell loop. Batch/trainer integration and
+/// `ciou_obb` scoring remain separate.
+pub fn match_obb_yolo_cell_prediction_with_score_config(
+    prediction: [f32; 6],
+    truths: &[ObbLabel],
+    class_outputs: &[f32],
+    context: ObbYoloPredictionMatchContext,
+    score_config: ObbYoloMatchScoreConfig,
+    ignore_thresh: f32,
+    truth_thresh: f32,
+) -> Result<ObbYoloCellTruthMatch> {
+    let mut scores = Vec::new();
+    scores
+        .try_reserve_exact(truths.len())
+        .map_err(|_| Error::InvalidConfig("OBB cell truth-score allocation failed".to_owned()))?;
+    for truth in truths {
+        if truth.x == 0.0 {
+            break;
+        }
+        scores.push(obb_yolo_match_score(prediction, truth, context, score_config)?.score);
+    }
+    select_obb_yolo_cell_truth_match(&scores, class_outputs, ignore_thresh, truth_thresh)
+}
+
 fn validate_anchor_assignment_inputs(
     anchors: &[f32],
     mask: &[usize],
@@ -1086,10 +1115,10 @@ mod tests {
         ObbYoloMatchScoreBranch, ObbYoloMatchScoreConfig, ObbYoloPositiveKind,
         ObbYoloPredictionMatchContext, assign_obb_yolo_anchor, encode_obb_yolo_truth_batch,
         enumerate_obb_yolo_head_positives, match_obb_yolo_cell_prediction,
-        obb_yolo_anchor_match_score, obb_yolo_angular_prediction_match_score_with_viou,
-        obb_yolo_cell_objectness_delta, obb_yolo_ciou_prediction_match_score,
-        obb_yolo_class_deltas, obb_yolo_cobb_prediction_match_score_with_viou,
-        obb_yolo_covariance_prediction_match_score,
+        match_obb_yolo_cell_prediction_with_score_config, obb_yolo_anchor_match_score,
+        obb_yolo_angular_prediction_match_score_with_viou, obb_yolo_cell_objectness_delta,
+        obb_yolo_ciou_prediction_match_score, obb_yolo_class_deltas,
+        obb_yolo_cobb_prediction_match_score_with_viou, obb_yolo_covariance_prediction_match_score,
         obb_yolo_covariance_prediction_match_score_with_viou, obb_yolo_match_score,
         select_obb_yolo_cell_truth_match,
     };
@@ -1463,6 +1492,59 @@ mod tests {
             0.35,
         )
         .is_err());
+    }
+
+    #[test]
+    fn configured_cell_matching_scores_all_truths_and_honors_empty_sentinel() {
+        let context = ObbYoloPredictionMatchContext {
+            anchor_width: 2.0,
+            anchor_height: 4.0,
+            cell_x: 0,
+            cell_y: 0,
+            grid_width: 1,
+            grid_height: 1,
+            net_width: 1,
+            net_height: 1,
+            new_coords: false,
+        };
+        let mut matched = truth(0.5, 0.5, 2.0, 4.0);
+        matched.front_x = 0.5;
+        matched.front_y = 4.5;
+        matched.has_front = true;
+        let mut later = matched;
+        later.front_x = 4.5;
+        later.front_y = 0.5;
+        let empty = truth(0.0, 0.5, 2.0, 4.0);
+        let config = ObbYoloMatchScoreConfig {
+            covariance_normalizer: 1.0,
+            viou_weight: 0.0,
+            ..ObbYoloMatchScoreConfig::default()
+        };
+        let matched_cell = match_obb_yolo_cell_prediction_with_score_config(
+            [0.5, 0.5, 0.0, 0.0, 0.5, 4.5],
+            &[matched, later],
+            &[0.9],
+            context,
+            config,
+            0.1,
+            0.5,
+        )
+        .unwrap();
+        assert_eq!(matched_cell.positive_truth_index, Some(0));
+        assert_eq!(matched_cell.best_score, 1.0);
+
+        let after_empty = match_obb_yolo_cell_prediction_with_score_config(
+            [0.5, 0.5, 0.0, 0.0, 0.5, 4.5],
+            &[empty, matched],
+            &[0.9],
+            context,
+            config,
+            0.1,
+            0.5,
+        )
+        .unwrap();
+        assert_eq!(after_empty.best_truth_index, None);
+        assert_eq!(after_empty.best_score, 0.0);
     }
 
     #[test]

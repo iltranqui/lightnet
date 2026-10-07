@@ -266,8 +266,8 @@ Immediately next, in dependency order:
   legacy angular fallback scorer and one-cell decode/blend; v106 adds decoded
   COBB loss/quality and QBBV blending; v107 adds raw-channel COBB match decoding
   and source branch gates; v108 adds one-cell covariance-first/COBB/angular
-  score dispatch. Multi-truth assignment aggregation, COBB regression
-  gradients/deltas, batch and positive-anchor assignment, remaining integrated
+  score dispatch; v109 composes branch scores with per-truth cell gates. Batch
+  and multi-head positive assignment, COBB regression gradients/deltas, remaining integrated
   class/box losses and training-loop integration, crop/resize and mosaic transforms,
   alternate NMS-kind implementations, training `-map` cadence, and CARPN network
   decoding/validation integration remain open.
