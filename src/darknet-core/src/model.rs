@@ -898,6 +898,8 @@ pub struct ObbYoloSpec {
     pub cobb_iou_lambda: f32,
     /// Whether `iou_loss` selects source CIoU-OBB match scoring.
     pub ciou_obb_loss: bool,
+    /// Whether the selected CIoU-OBB variant uses the multiplicative loss.
+    pub ciou_obb_multiplicative_loss: bool,
     pub nms_kind: ObbNmsKind,
 }
 
@@ -2264,7 +2266,8 @@ fn parse_layer_kind(
             let front_point_normalizer = section.get_f32("front_point_normalizer", 0.35)?;
             let front_loss_normalizer =
                 section.get_f32("front_loss_normalizer", front_point_normalizer)?;
-            let (iou_loss, ciou_obb_loss) = parse_obb_iou_loss(section)?;
+            let (iou_loss, ciou_obb_loss, ciou_obb_multiplicative_loss) =
+                parse_obb_iou_loss(section)?;
             let iou_thresh_kind = YoloIouLoss::parse(&section.get_str("iou_thresh_kind", "iou"))?;
             let nms_kind = ObbNmsKind::parse(&section.get_str("nms_kind", "obb"), line)?;
             if !scale_x_y.is_finite() {
@@ -2284,6 +2287,7 @@ fn parse_layer_kind(
                 cobb_s_weight: section.get_f32("cobb_s_weight", 1.0)?,
                 cobb_iou_lambda: section.get_f32("cobb_iou_lambda", 2.0)?,
                 ciou_obb_loss,
+                ciou_obb_multiplicative_loss,
                 yolo: YoloSpec {
                     classes,
                     num: total,
@@ -3555,11 +3559,12 @@ fn resolve_relative_layer(layer_index: usize, raw_index: isize) -> Result<usize>
     Ok(absolute)
 }
 
-fn parse_obb_iou_loss(section: &RawSection) -> Result<(YoloIouLoss, bool)> {
+fn parse_obb_iou_loss(section: &RawSection) -> Result<(YoloIouLoss, bool, bool)> {
     let loss = section.get_str("iou_loss", "ciou_obb");
     match loss.trim().to_ascii_lowercase().as_str() {
-        "ciou_obb" | "ciou_obb_mul" => Ok((YoloIouLoss::Ciou, true)),
-        _ => Ok((YoloIouLoss::parse(&loss)?, false)),
+        "ciou_obb" => Ok((YoloIouLoss::Ciou, true, false)),
+        "ciou_obb_mul" => Ok((YoloIouLoss::Ciou, true, true)),
+        _ => Ok((YoloIouLoss::parse(&loss)?, false, false)),
     }
 }
 
@@ -4577,7 +4582,12 @@ mod tests {
             panic!("expected OBB YOLO layer");
         };
         assert!(spec.ciou_obb_loss);
+        assert!(spec.ciou_obb_multiplicative_loss);
         assert_eq!(spec.iou_loss, super::YoloIouLoss::Ciou);
+        assert!(
+            crate::obb_training::build_obb_yolo_training_head_config(spec, 0, 1, 1, 1, 1).is_err(),
+            "multiplicative CIoU-OBB training must not silently use the additive branch"
+        );
 
         let invalid = build(
             "[net]\nwidth=1\nheight=1\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\niou_loss=unsupported\n",

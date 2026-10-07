@@ -119,6 +119,11 @@ pub fn build_obb_yolo_training_head_config(
     net_width: usize,
     net_height: usize,
 ) -> Result<ObbYoloTrainingHeadConfig> {
+    if spec.ciou_obb_multiplicative_loss {
+        return Err(Error::InvalidConfig(
+            "CIoU-OBB-mul training is not implemented; refusing additive fallback".to_owned(),
+        ));
+    }
     let anchor_count = spec.num.checked_mul(2).ok_or_else(|| {
         Error::InvalidConfig("OBB training config anchor count overflows".to_owned())
     })?;

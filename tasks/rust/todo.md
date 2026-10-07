@@ -306,7 +306,8 @@ Immediately next, in dependency order:
   dispatch; v147 routes the parsed front-loss normalizer into covariance
   match-score weighting; v148 retains standard `iou_loss` choices in the parsed
   spec and routes them to front-point deltas; v149 retains `iou_thresh_kind` in
-  the parsed spec. Still open: full loss scalar, CLI/schedule and
+  the parsed spec; v150 explicitly rejects `ciou_obb_mul` training until its
+  distinct loss/gradient path is implemented. Still open: full loss scalar, CLI/schedule and
   non-SGD optimizer/training-loop integration, remaining cfg/training
   option wiring,
   inference/network decode integration, remaining metric/loss aggregation and
