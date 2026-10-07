@@ -212,6 +212,27 @@ impl Default for ObbYoloMatchScoreConfig {
     }
 }
 
+/// Source configuration for finite-difference OBB box-channel deltas.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObbYoloBoxDeltaConfig {
+    pub score: ObbYoloMatchScoreConfig,
+    pub iou_normalizer: f32,
+    /// `f32::MAX` selects the source default absolute delta clip of 1.0.
+    pub max_delta: f32,
+    pub accumulate: bool,
+}
+
+impl Default for ObbYoloBoxDeltaConfig {
+    fn default() -> Self {
+        Self {
+            score: ObbYoloMatchScoreConfig::default(),
+            iou_normalizer: 1.0,
+            max_delta: f32::MAX,
+            accumulate: true,
+        }
+    }
+}
+
 /// Result of source single-prediction OBB score-branch selection.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ObbYoloMatchScore {
@@ -933,6 +954,84 @@ pub fn obb_yolo_ciou_prediction_match_score(
     Ok(box_ciou_obb_quality_score(prediction, truth))
 }
 
+/// Compute source finite-difference box-channel deltas for one OBB positive.
+///
+/// This covers COBB and the legacy angular score branch, including source
+/// `iou_normalizer`, COBB scaling, sigmoid-chain factors, accumulation, and
+/// clipping. The covariance branch uses an analytic gradient and is rejected;
+/// front-channel gradients are intentionally separate. Direct front-channel
+/// decoding is used, without source `center_front_anchor` correction. Inputs use
+/// the same post-YOLO channel representation as [`obb_yolo_match_score`].
+pub fn obb_yolo_box_regression_deltas(
+    prediction: [f32; 6],
+    existing_deltas: [f32; 4],
+    truth: &ObbLabel,
+    context: ObbYoloPredictionMatchContext,
+    config: ObbYoloBoxDeltaConfig,
+) -> Result<[f32; 4]> {
+    validate_truth(truth)?;
+    let covariance_active =
+        config.score.covariance_normalizer.is_finite() && config.score.covariance_normalizer > 0.0;
+    if covariance_active
+        || !config.iou_normalizer.is_finite()
+        || !config.max_delta.is_finite()
+        || config.max_delta < 0.0
+        || existing_deltas.iter().any(|delta| !delta.is_finite())
+    {
+        return Err(Error::InvalidConfig(
+            "OBB finite-difference deltas require a non-covariance branch and finite settings"
+                .to_owned(),
+        ));
+    }
+
+    let evaluate = |channels: [f32; 6]| -> Result<f32> {
+        Ok(obb_yolo_match_score(channels, truth, context, config.score)?.score)
+    };
+    let mut deltas = if config.accumulate {
+        existing_deltas
+    } else {
+        [0.0; 4]
+    };
+    let scale = config.iou_normalizer
+        * if config.score.cobb_normalizer.is_finite() && config.score.cobb_normalizer > 0.0 {
+            config.score.cobb_normalizer.max(0.0)
+        } else {
+            1.0
+        };
+    let clip = if config.max_delta == f32::MAX {
+        1.0
+    } else {
+        config.max_delta
+    };
+    for channel in 0..4 {
+        let base = prediction[channel];
+        if !base.is_finite() {
+            continue;
+        }
+        let epsilon = 1e-3 * (base.abs() + 1.0);
+        let mut plus = prediction;
+        let mut minus = prediction;
+        plus[channel] = base + epsilon;
+        minus[channel] = base - epsilon;
+        let plus_score = evaluate(plus)?;
+        let minus_score = evaluate(minus)?;
+        let gradient = (plus_score - minus_score) / (2.0 * epsilon);
+        // The source finite-difference branch applies sigmoid derivatives to
+        // x/y unconditionally, including `new_coords` mode.
+        let chain = if channel < 2 {
+            base * (1.0 - base)
+        } else {
+            1.0
+        };
+        let mut delta = gradient * chain * scale;
+        if !delta.is_finite() {
+            delta = 0.0;
+        }
+        deltas[channel] += delta.clamp(-clip, clip);
+    }
+    Ok(deltas)
+}
+
 fn finite_or_zero(value: f32) -> f32 {
     if value.is_finite() { value } else { 0.0 }
 }
@@ -1592,6 +1691,112 @@ pub fn apply_obb_yolo_batch_head_positive_class_deltas(
     Ok(())
 }
 
+/// Apply source finite-difference box regression deltas to one batch/head tensor.
+///
+/// Best-anchor and threshold-selected additional positives are processed in
+/// truth order. Only coordinate entries 0..4 are changed; front/objectness/class
+/// deltas are preserved. This routes COBB or legacy angular gradients and does
+/// not implement the covariance branch's analytic gradient or the source
+/// `center_front_anchor` decode correction.
+pub fn apply_obb_yolo_batch_head_positive_box_deltas(
+    batch_truths: &[Vec<ObbLabel>],
+    head_output: &[f32],
+    head_delta: &mut [f32],
+    assignment: &ObbYoloPositiveObjectnessConfig,
+    new_coords: bool,
+    delta_config: ObbYoloBoxDeltaConfig,
+) -> Result<usize> {
+    let covariance_active = delta_config.score.covariance_normalizer.is_finite()
+        && delta_config.score.covariance_normalizer > 0.0;
+    if covariance_active
+        || !delta_config.iou_normalizer.is_finite()
+        || !delta_config.max_delta.is_finite()
+        || delta_config.max_delta < 0.0
+        || head_delta.iter().any(|value| !value.is_finite())
+    {
+        return Err(Error::InvalidConfig(
+            "OBB batch box deltas require a non-covariance branch and finite settings".to_owned(),
+        ));
+    }
+    let stride = assignment
+        .head
+        .grid_width
+        .checked_mul(assignment.head.grid_height)
+        .ok_or_else(|| Error::InvalidConfig("OBB head grid size overflows".to_owned()))?;
+    let entries = assignment
+        .classes
+        .checked_add(7)
+        .ok_or_else(|| Error::InvalidConfig("OBB head entry count overflows".to_owned()))?;
+    let per_batch = assignment
+        .head
+        .mask
+        .len()
+        .checked_mul(entries)
+        .and_then(|count| count.checked_mul(stride))
+        .ok_or_else(|| Error::InvalidConfig("OBB head tensor size overflows".to_owned()))?;
+    let expected = batch_truths
+        .len()
+        .checked_mul(per_batch)
+        .ok_or_else(|| Error::InvalidConfig("OBB batch tensor size overflows".to_owned()))?;
+    if head_output.len() != expected || head_delta.len() != expected {
+        return Err(Error::InvalidConfig(format!(
+            "OBB positive-box tensor length mismatch: expected {expected}, output {}, delta {}",
+            head_output.len(),
+            head_delta.len()
+        )));
+    }
+    let head_specs = [assignment.head.clone()];
+    let positives = enumerate_obb_yolo_batch_positives(
+        batch_truths,
+        assignment.classes,
+        &assignment.anchors,
+        &head_specs,
+        assignment.net_width,
+        assignment.net_height,
+        assignment.iou_thresh,
+    )?;
+    for tagged in &positives {
+        let anchor_index = tagged.positive.assignment.anchor_index;
+        let anchor_offset = anchor_index
+            .checked_mul(2)
+            .ok_or_else(|| Error::InvalidConfig("OBB anchor index overflows".to_owned()))?;
+        if anchor_offset + 1 >= assignment.anchors.len() {
+            return Err(Error::InvalidConfig(
+                "OBB positive assignment references an invalid anchor".to_owned(),
+            ));
+        }
+        let positive = tagged.positive.assignment;
+        let cell = positive.cell_y * assignment.head.grid_width + positive.cell_x;
+        let base =
+            tagged.batch_index * per_batch + positive.head_anchor_index * entries * stride + cell;
+        let prediction =
+            std::array::from_fn(|channel| finite_or_zero(head_output[base + channel * stride]));
+        let existing = std::array::from_fn(|channel| head_delta[base + channel * stride]);
+        let context = ObbYoloPredictionMatchContext {
+            anchor_width: assignment.anchors[anchor_offset],
+            anchor_height: assignment.anchors[anchor_offset + 1],
+            cell_x: positive.cell_x,
+            cell_y: positive.cell_y,
+            grid_width: assignment.head.grid_width,
+            grid_height: assignment.head.grid_height,
+            net_width: assignment.net_width,
+            net_height: assignment.net_height,
+            new_coords,
+        };
+        let deltas = obb_yolo_box_regression_deltas(
+            prediction,
+            existing,
+            &batch_truths[tagged.batch_index][tagged.positive.truth_index],
+            context,
+            delta_config,
+        )?;
+        for (channel, delta) in deltas.into_iter().enumerate() {
+            head_delta[base + channel * stride] = delta;
+        }
+    }
+    Ok(positives.len())
+}
+
 fn validate_anchor_assignment_inputs(
     anchors: &[f32],
     mask: &[usize],
@@ -1679,19 +1884,19 @@ fn validate_truth(truth: &ObbLabel) -> Result<()> {
 mod tests {
     use super::{
         OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloBatchCellPrediction,
-        ObbYoloCellTruthMatch, ObbYoloHeadAssignmentSpec, ObbYoloHeadMatchConfig,
-        ObbYoloMatchScoreBranch, ObbYoloMatchScoreConfig, ObbYoloPositiveKind,
-        ObbYoloPositiveObjectnessConfig, ObbYoloPredictionMatchContext,
-        apply_obb_yolo_batch_head_objectness_deltas,
+        ObbYoloBoxDeltaConfig, ObbYoloCellTruthMatch, ObbYoloHeadAssignmentSpec,
+        ObbYoloHeadMatchConfig, ObbYoloMatchScoreBranch, ObbYoloMatchScoreConfig,
+        ObbYoloPositiveKind, ObbYoloPositiveObjectnessConfig, ObbYoloPredictionMatchContext,
+        apply_obb_yolo_batch_head_objectness_deltas, apply_obb_yolo_batch_head_positive_box_deltas,
         apply_obb_yolo_batch_head_positive_class_deltas,
         apply_obb_yolo_batch_head_positive_objectness_deltas, assign_obb_yolo_anchor,
         encode_obb_yolo_truth_batch, enumerate_obb_yolo_batch_positives,
         enumerate_obb_yolo_head_positives, match_obb_yolo_batch_cell_predictions,
         match_obb_yolo_cell_prediction, match_obb_yolo_cell_prediction_with_score_config,
         obb_yolo_anchor_match_score, obb_yolo_angular_prediction_match_score_with_viou,
-        obb_yolo_cell_objectness_delta, obb_yolo_ciou_prediction_match_score,
-        obb_yolo_class_deltas, obb_yolo_cobb_prediction_match_score_with_viou,
-        obb_yolo_covariance_prediction_match_score,
+        obb_yolo_box_regression_deltas, obb_yolo_cell_objectness_delta,
+        obb_yolo_ciou_prediction_match_score, obb_yolo_class_deltas,
+        obb_yolo_cobb_prediction_match_score_with_viou, obb_yolo_covariance_prediction_match_score,
         obb_yolo_covariance_prediction_match_score_with_viou, obb_yolo_match_score,
         select_obb_yolo_cell_truth_match, visit_obb_yolo_batch_head_matches,
     };
@@ -2130,6 +2335,218 @@ mod tests {
         .unwrap();
         assert!((smooth_delta[6] - 4.8).abs() < 1e-6);
         assert_eq!(smooth_delta[15], 0.4);
+    }
+
+    #[test]
+    fn finite_difference_box_deltas_match_source_branch_scale_and_accumulation() {
+        let truth = truth(0.5, 0.5, 0.2, 0.1);
+        let context = ObbYoloPredictionMatchContext {
+            anchor_width: 20.0,
+            anchor_height: 10.0,
+            cell_x: 0,
+            cell_y: 0,
+            grid_width: 1,
+            grid_height: 1,
+            net_width: 100,
+            net_height: 100,
+            new_coords: false,
+        };
+        let prediction = [0.35, 0.6, 0.15, -0.1, 0.7, 0.4];
+        let existing = [0.1, -0.2, 0.3, -0.4];
+        let score_config = ObbYoloMatchScoreConfig {
+            cobb_normalizer: 2.5,
+            viou_weight: 0.2,
+            ..ObbYoloMatchScoreConfig::default()
+        };
+        let config = ObbYoloBoxDeltaConfig {
+            score: score_config,
+            iou_normalizer: 0.3,
+            max_delta: f32::MAX,
+            accumulate: true,
+        };
+        let actual =
+            obb_yolo_box_regression_deltas(prediction, existing, &truth, context, config).unwrap();
+        let mut expected = existing;
+        for channel in 0..4 {
+            let base = prediction[channel];
+            let epsilon = 1e-3 * (base.abs() + 1.0);
+            let mut plus = prediction;
+            let mut minus = prediction;
+            plus[channel] += epsilon;
+            minus[channel] -= epsilon;
+            let plus_score = obb_yolo_match_score(plus, &truth, context, score_config)
+                .unwrap()
+                .score;
+            let minus_score = obb_yolo_match_score(minus, &truth, context, score_config)
+                .unwrap()
+                .score;
+            let sigmoid_chain = if channel < 2 {
+                base * (1.0 - base)
+            } else {
+                1.0
+            };
+            let gradient = (plus_score - minus_score) / (2.0 * epsilon);
+            expected[channel] += (gradient * sigmoid_chain * 0.3 * 2.5).clamp(-1.0, 1.0);
+        }
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+
+        let reset_and_clipped = obb_yolo_box_regression_deltas(
+            prediction,
+            existing,
+            &truth,
+            context,
+            ObbYoloBoxDeltaConfig {
+                max_delta: 0.01,
+                accumulate: false,
+                ..config
+            },
+        )
+        .unwrap();
+        assert!(reset_and_clipped.iter().all(|delta| delta.abs() <= 0.01));
+        assert!(reset_and_clipped.iter().any(|delta| *delta != 0.0));
+
+        let new_coords_context = ObbYoloPredictionMatchContext {
+            new_coords: true,
+            ..context
+        };
+        let new_coords_actual = obb_yolo_box_regression_deltas(
+            prediction,
+            existing,
+            &truth,
+            new_coords_context,
+            config,
+        )
+        .unwrap();
+        let epsilon = 1e-3 * (prediction[0].abs() + 1.0);
+        let mut plus = prediction;
+        let mut minus = prediction;
+        plus[0] += epsilon;
+        minus[0] -= epsilon;
+        let plus_score = obb_yolo_match_score(plus, &truth, new_coords_context, score_config)
+            .unwrap()
+            .score;
+        let minus_score = obb_yolo_match_score(minus, &truth, new_coords_context, score_config)
+            .unwrap()
+            .score;
+        let expected_x = existing[0]
+            + (((plus_score - minus_score) / (2.0 * epsilon))
+                * prediction[0]
+                * (1.0 - prediction[0])
+                * 0.3
+                * 2.5)
+                .clamp(-1.0, 1.0);
+        assert!((new_coords_actual[0] - expected_x).abs() < 1e-6);
+    }
+
+    #[test]
+    fn positive_anchor_box_delta_writeback_touches_only_box_channels() {
+        let assignment = ObbYoloPositiveObjectnessConfig {
+            head: ObbYoloHeadAssignmentSpec {
+                mask: vec![0, 1],
+                grid_width: 1,
+                grid_height: 1,
+            },
+            anchors: vec![10.0, 10.0, 20.0, 20.0],
+            classes: 1,
+            net_width: 100,
+            net_height: 100,
+            iou_thresh: 0.2,
+            objectness_normalizer: 1.0,
+            objectness_smooth: false,
+            class_map: None,
+            class_multipliers: None,
+        };
+        let mut head_output = vec![0.0; 16];
+        head_output[..6].copy_from_slice(&[0.4, 0.6, 0.1, -0.1, 0.7, 0.5]);
+        head_output[8..14].copy_from_slice(&[0.55, 0.45, -0.1, 0.2, 0.6, 0.4]);
+        let mut head_delta = vec![0.77; 16];
+        head_delta[0..4].copy_from_slice(&[0.1, -0.2, 0.3, -0.4]);
+        head_delta[8..12].copy_from_slice(&[-0.1, 0.2, -0.3, 0.4]);
+        let delta_config = ObbYoloBoxDeltaConfig {
+            score: ObbYoloMatchScoreConfig {
+                cobb_normalizer: 1.0,
+                ..ObbYoloMatchScoreConfig::default()
+            },
+            iou_normalizer: 0.5,
+            max_delta: 0.03,
+            accumulate: true,
+        };
+        let labels = [vec![truth(0.5, 0.5, 0.2, 0.2)]];
+        let applied = apply_obb_yolo_batch_head_positive_box_deltas(
+            &labels,
+            &head_output,
+            &mut head_delta,
+            &assignment,
+            false,
+            delta_config,
+        )
+        .unwrap();
+        assert_eq!(applied, 2);
+        for (slot, (anchor_width, anchor_height)) in
+            [(10.0, 10.0), (20.0, 20.0)].into_iter().enumerate()
+        {
+            let base = slot * 8;
+            let prediction = std::array::from_fn(|channel| head_output[base + channel]);
+            let expected = obb_yolo_box_regression_deltas(
+                prediction,
+                if slot == 0 {
+                    [0.1, -0.2, 0.3, -0.4]
+                } else {
+                    [-0.1, 0.2, -0.3, 0.4]
+                },
+                &labels[0][0],
+                ObbYoloPredictionMatchContext {
+                    anchor_width,
+                    anchor_height,
+                    cell_x: 0,
+                    cell_y: 0,
+                    grid_width: 1,
+                    grid_height: 1,
+                    net_width: 100,
+                    net_height: 100,
+                    new_coords: false,
+                },
+                delta_config,
+            )
+            .unwrap();
+            for channel in 0..4 {
+                assert!((head_delta[base + channel] - expected[channel]).abs() < 1e-6);
+            }
+            for channel in 4..8 {
+                assert_eq!(head_delta[base + channel], 0.77);
+            }
+        }
+    }
+
+    #[test]
+    fn finite_difference_box_deltas_reject_covariance_branch() {
+        let error = obb_yolo_box_regression_deltas(
+            [0.5; 6],
+            [0.0; 4],
+            &truth(0.5, 0.5, 0.2, 0.1),
+            ObbYoloPredictionMatchContext {
+                anchor_width: 20.0,
+                anchor_height: 10.0,
+                cell_x: 0,
+                cell_y: 0,
+                grid_width: 1,
+                grid_height: 1,
+                net_width: 100,
+                net_height: 100,
+                new_coords: false,
+            },
+            ObbYoloBoxDeltaConfig {
+                score: ObbYoloMatchScoreConfig {
+                    covariance_normalizer: 1.0,
+                    ..ObbYoloMatchScoreConfig::default()
+                },
+                ..ObbYoloBoxDeltaConfig::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("non-covariance branch"));
     }
 
     #[test]
