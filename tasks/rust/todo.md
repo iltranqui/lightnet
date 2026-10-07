@@ -296,8 +296,9 @@ Immediately next, in dependency order:
   normalizer and alias/default; v137 builds per-head delta configs from parsed
   OBB specs plus runtime dimensions; v138 supports per-head front-loss configs
   during multi-head dispatch; v139 builds network-layer delta seeds from OBB
-  forward heads and labels. Still open: full loss scalar, backward/optimizer and
-  training-loop integration, remaining cfg/training option wiring,
+  forward heads and labels; v140 propagates those seeds through runtime
+  backpropagation. Still open: full loss scalar, optimizer and training-loop
+  integration, remaining cfg/training option wiring,
   inference/network decode integration, remaining metric/loss aggregation and
   integrated loss/training-loop
   wiring, crop/resize and mosaic transforms,

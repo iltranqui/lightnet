@@ -20,7 +20,7 @@ use crate::obb_training::{
     apply_obb_yolo_batch_multi_head_training_deltas_with_front_point_configs,
     build_obb_yolo_training_head_config, encode_obb_yolo_truth_batch,
 };
-use crate::runtime::{ForwardResult, Tensor};
+use crate::runtime::{BackwardResult, ExecutableNetwork, ForwardResult, Tensor};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DataConfig {
@@ -279,6 +279,13 @@ pub struct ObbYoloTrainingDeltaBatch {
     pub stats: ObbYoloBatchTrainingDeltaStats,
 }
 
+/// OBB output deltas and their propagated network parameter/input gradients.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObbYoloTrainingBackward {
+    pub delta_batch: ObbYoloTrainingDeltaBatch,
+    pub backward: BackwardResult,
+}
+
 /// Build OBB YOLO output-gradient seeds from parsed heads and a forward pass.
 ///
 /// This wires the source-ordered delta helpers to real network head tensors, but
@@ -399,6 +406,25 @@ pub fn compute_obb_yolo_training_deltas(
     Ok(ObbYoloTrainingDeltaBatch {
         layer_output_gradient_seeds,
         stats,
+    })
+}
+
+/// Backpropagate OBB YOLO output deltas through an executable network.
+///
+/// This stops before optimizer updates and does not define the complete OBB loss
+/// scalar; it connects the implemented head deltas to runtime backpropagation.
+pub fn backward_obb_yolo_training(
+    executable: &ExecutableNetwork,
+    input: &Tensor,
+    forward: &ForwardResult,
+    labels: &[Vec<ObbLabel>],
+) -> Result<ObbYoloTrainingBackward> {
+    let delta_batch = compute_obb_yolo_training_deltas(&executable.network, forward, labels)?;
+    let backward =
+        executable.backward_seeded(input, forward, &delta_batch.layer_output_gradient_seeds)?;
+    Ok(ObbYoloTrainingBackward {
+        delta_batch,
+        backward,
     })
 }
 
@@ -2276,16 +2302,17 @@ mod tests {
     use super::{
         DataConfig, ObbTrainingBatch, YoloBox, YoloHeadStats, YoloLabel, YoloTrainingState,
         apply_yolo_box_delta, apply_yolo_class_delta, apply_yolo_delta_filtering,
-        apply_yolo_positive_objectness, bbox_iou_kind, compute_obb_yolo_training_deltas,
-        compute_yolo_training_loss, compute_yolo_training_loss_with_state, dx_box_iou,
-        load_obb_training_batch, load_obb_training_batch_from_paths,
-        load_obb_training_batch_with_flips_from_paths, load_training_batch, load_yolo_labels,
-        replace_image_to_label, yolo_head_cost, yolo_xy_output,
+        apply_yolo_positive_objectness, backward_obb_yolo_training, bbox_iou_kind,
+        compute_obb_yolo_training_deltas, compute_yolo_training_loss,
+        compute_yolo_training_loss_with_state, dx_box_iou, load_obb_training_batch,
+        load_obb_training_batch_from_paths, load_obb_training_batch_with_flips_from_paths,
+        load_training_batch, load_yolo_labels, replace_image_to_label, yolo_head_cost,
+        yolo_xy_output,
     };
     use crate::cfg::ConfigFile;
     use crate::model::{Network, TensorShape, YoloIouLoss, YoloSpec};
     use crate::obb_labels::ObbLabel;
-    use crate::runtime::{ExecutableNetwork, Tensor};
+    use crate::runtime::{ExecutableNetwork, LayerParams, Tensor};
     use std::fs;
     use std::path::PathBuf;
 
@@ -2391,6 +2418,53 @@ mod tests {
         assert_eq!(result.stats.total_bbox_count, 1);
         assert_eq!(result.stats.front_point_loss.count, 1);
         assert!(result.stats.front_point_loss.loss_sum.is_finite());
+    }
+
+    #[test]
+    fn obb_training_backward_propagates_head_deltas_through_network() {
+        let network = obb_test_network(1);
+        let executable = ExecutableNetwork::new(network.clone());
+        let input = Tensor::from_data(network.net.input_shape(), vec![1.0; 6]).expect("input");
+        let forward = executable.forward(&input).expect("forward");
+        let labels = [vec![ObbLabel {
+            class_id: 0,
+            x: 0.5,
+            y: 0.5,
+            w: 0.25,
+            h: 0.5,
+            left: 0.375,
+            right: 0.625,
+            top: 0.25,
+            bottom: 0.75,
+            front_x: 0.7,
+            front_y: 0.55,
+            has_front: true,
+        }]];
+
+        let result = backward_obb_yolo_training(&executable, &input, &forward, &labels)
+            .expect("OBB output deltas backpropagate");
+        assert_eq!(result.delta_batch.stats.anchor_box_positive_count, 1);
+        assert_eq!(
+            result.backward.input_gradient.shape,
+            network.net.input_shape()
+        );
+        assert!(
+            result
+                .backward
+                .input_gradient
+                .data
+                .iter()
+                .all(|gradient| gradient.is_finite())
+        );
+        assert_eq!(
+            result.backward.layer_output_gradients.len(),
+            network.layers.len()
+        );
+        assert_eq!(result.backward.param_gradients.len(), network.layers.len());
+        assert!(result.backward.param_gradients.iter().any(|gradient| {
+            matches!(gradient, LayerParams::Convolutional(params)
+                if params.weights.iter().any(|value| value.abs() > 0.0))
+        }));
     }
 
     #[test]
