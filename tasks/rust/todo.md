@@ -254,10 +254,12 @@ Immediately next, in dependency order:
   source-style prediction scores; v94 adds a standalone CARPN polygon mAP helper
   for normalized quad detections and front-point labels; v96 adds source-style
   per-cell objectness deltas from the v93 match gates, including ignore smoothing
-  and positive-target override. Raw prediction-score calculation, full integrated
-  truth matching, class/box losses and deltas, trainer integration, crop/resize
-  and mosaic transforms, alternate NMS-kind implementations, training `-map`
-  cadence, and CARPN network decoding/validation integration remain open.
+  and positive-target override; v97 adds source CIoU-OBB match-quality scoring for
+  already-decoded geometries. Raw-channel matching and weighted covariance/COBB
+  score paths, full integrated truth matching, class/box losses and deltas,
+  trainer integration, crop/resize and mosaic transforms, alternate NMS-kind
+  implementations, training `-map` cadence, and CARPN network decoding/validation
+  integration remain open.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and
   kernels, weights order `weights.cpp:428`); then `deform_conv`, `dsconv`,
   `graph_conv`, `wmhf`, `clifford`, `recursive_block`.

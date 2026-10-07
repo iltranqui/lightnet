@@ -1,8 +1,9 @@
 //! Source-derived oriented bounding-box geometry for the legacy front-point OBB contract.
 //!
-//! This module is only the geometric prerequisite used by OBB decoding and
-//! evaluation. It does not implement a detector layer, rotated-label loading,
-//! loss, NMS dispatch, or CARPN's explicit four-vertex polygon contract.
+//! This module provides geometry for OBB decoding/evaluation and the source
+//! CIoU-OBB match-quality score. It does not implement a detector layer,
+//! rotated-label loading, training loss, NMS dispatch, or CARPN's explicit
+//! four-vertex polygon contract.
 
 use crate::detect::DetectionBox;
 
@@ -103,6 +104,70 @@ pub fn box_obb_iou(a: BoxObb, b: BoxObb) -> f32 {
         return 0.0;
     }
     (intersection_area / union_area).clamp(0.0, 1.0)
+}
+
+/// Source CIoU-OBB matching quality for two decoded front-point rectangles.
+///
+/// This is the score returned by `box_ciou_obb_loss_terms`: rotated IoU minus
+/// the center-distance and aspect-ratio CIoU penalties, multiplied by the
+/// cosine half-angle orientation score, then clamped to `[0, 1]`. It is a
+/// matching quality only, not the source's training loss or raw-channel decode.
+/// Invalid/degenerate geometry returns zero.
+pub fn box_ciou_obb_quality_score(pred: BoxObb, truth: BoxObb) -> f32 {
+    if box_obb_vertices(pred).is_none() || box_obb_vertices(truth).is_none() {
+        return 0.0;
+    }
+
+    let rotated_iou = box_obb_iou(pred, truth);
+    let pred_box = pred.bbox;
+    let truth_box = truth.bbox;
+    let left = (pred_box.x - pred_box.w * 0.5).min(truth_box.x - truth_box.w * 0.5);
+    let right = (pred_box.x + pred_box.w * 0.5).max(truth_box.x + truth_box.w * 0.5);
+    let top = (pred_box.y - pred_box.h * 0.5).min(truth_box.y - truth_box.h * 0.5);
+    let bottom = (pred_box.y + pred_box.h * 0.5).max(truth_box.y + truth_box.h * 0.5);
+    let enclosing_width = right - left;
+    let enclosing_height = bottom - top;
+    let enclosing_diagonal_squared =
+        enclosing_width * enclosing_width + enclosing_height * enclosing_height;
+    let ciou = if enclosing_diagonal_squared == 0.0 {
+        rotated_iou
+    } else {
+        let center_dx = pred_box.x - truth_box.x;
+        let center_dy = pred_box.y - truth_box.y;
+        let center_distance =
+            (center_dx * center_dx + center_dy * center_dy) / enclosing_diagonal_squared;
+        let pred_aspect = pred_box.w / pred_box.h;
+        let truth_aspect = truth_box.w / truth_box.h;
+        let aspect_delta = truth_aspect.atan() - pred_aspect.atan();
+        let aspect_loss =
+            4.0 / (std::f32::consts::PI * std::f32::consts::PI) * aspect_delta * aspect_delta;
+        let alpha = aspect_loss / (1.0 - rotated_iou + aspect_loss + 1e-6);
+        rotated_iou - center_distance - alpha * aspect_loss
+    };
+
+    let pred_dx = pred.front_x - pred_box.x;
+    let pred_dy = pred.front_y - pred_box.y;
+    let truth_dx = truth.front_x - truth_box.x;
+    let truth_dy = truth.front_y - truth_box.y;
+    let pred_length_squared = pred_dx * pred_dx + pred_dy * pred_dy;
+    let truth_length_squared = truth_dx * truth_dx + truth_dy * truth_dy;
+    if !pred_length_squared.is_finite()
+        || !truth_length_squared.is_finite()
+        || pred_length_squared < FRONT_MIN_LENGTH * FRONT_MIN_LENGTH
+        || truth_length_squared < FRONT_MIN_LENGTH * FRONT_MIN_LENGTH
+    {
+        return 0.0;
+    }
+    let cosine = ((pred_dx * truth_dx + pred_dy * truth_dy)
+        / (pred_length_squared.sqrt() * truth_length_squared.sqrt()))
+    .clamp(-1.0, 1.0);
+    let cosine_half_angle = (0.5 * (cosine + 1.0)).max(0.0).sqrt();
+    let score = ciou * cosine_half_angle;
+    if score.is_finite() {
+        score.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 /// IoU for two CARPN polygons represented as four interleaved `(x, y)` pairs.
@@ -310,6 +375,37 @@ mod tests {
             ),
             0.25,
             1e-6,
+        );
+    }
+
+    #[test]
+    fn ciou_obb_quality_score_combines_rotated_iou_ciou_penalty_and_orientation() {
+        let truth = rect([0.0, 0.0], 2.0, 2.0, [0.0, 1.0]);
+        assert_eq!(box_ciou_obb_quality_score(truth, truth), 1.0);
+
+        let opposite_front = rect([0.0, 0.0], 2.0, 2.0, [0.0, -1.0]);
+        assert_eq!(box_ciou_obb_quality_score(opposite_front, truth), 0.0);
+
+        // Rotated IoU is 1/3; the equal aspect ratios remove the aspect penalty.
+        // Center distance is 1 and the enclosing AABB diagonal squared is 13.
+        let shifted = rect([1.0, 0.0], 2.0, 2.0, [1.0, 1.0]);
+        close(
+            box_ciou_obb_quality_score(shifted, truth),
+            1.0 / 3.0 - 1.0 / 13.0,
+            2e-6,
+        );
+    }
+
+    #[test]
+    fn ciou_obb_quality_score_returns_zero_for_invalid_or_directionless_geometry() {
+        let valid = rect([0.0, 0.0], 2.0, 2.0, [0.0, 1.0]);
+        assert_eq!(
+            box_ciou_obb_quality_score(rect([0.0, 0.0], 2.0, 2.0, [0.0, 0.0]), valid),
+            0.0
+        );
+        assert_eq!(
+            box_ciou_obb_quality_score(rect([0.0, 0.0], 0.0, 2.0, [0.0, 1.0]), valid),
+            0.0
         );
     }
 

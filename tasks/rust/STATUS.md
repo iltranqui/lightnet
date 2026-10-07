@@ -34,6 +34,7 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v97: added `box_ciou_obb_quality_score`, matching the source `box_ciou_obb_loss_terms` score for already-decoded OBB geometries: rotated IoU, CIoU center/aspect penalties, and the cosine half-angle orientation factor. Two focused source-formula tests passed; raw-channel matching, covariance/COBB scoring, and training integration remain open. No compiled-C++ parity is claimed.
 - v96: added `obb_yolo_cell_objectness_delta` to translate the v93 per-cell match selection into the source OBB YOLO negative, ignore, and positive objectness deltas. It preserves the smoothed ignore max, positive-target override, non-finite output/delta sanitization, and leaves raw score calculation plus class/box loss and trainer integration open. All 55 OBB-filtered host tests passed; no compiled-C++ parity is claimed.
 - v95: audited the fp16 convolution-backward TODO against `mixed.rs` and the real-device `oxide_amp` suite. AMP convolution dgrad uses f16 GEMM with f32 accumulation before f16 storage; wgrad uses f16 inputs with f32 accumulation and returns f32 weight gradients. All 11 `oxide_amp` tests passed, including grouped and multi-chunk convolution. This closes the tracked fp16 dgrad/wgrad follow-up; half2 elementwise remains unnecessary.
 - v94: added `carpn_detector_map` for normalized CARPN quadrilateral detections
