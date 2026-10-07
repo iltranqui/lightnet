@@ -2831,10 +2831,11 @@ pub fn apply_obb_yolo_batch_head_training_deltas_with_front_point(
 ///
 /// Head outputs/deltas and both config slices must use the same ordering and
 /// common global anchor/class/network definitions. Per-head grids, masks, score
-/// branches, and coordinate modes may differ. This is multi-head delta dispatch,
-/// not a network training loop or backward/optimizer integration.
+/// branches, and coordinate modes may differ. Optional front deltas are applied
+/// by each head's source-ordered one-head pass; this is still not a network
+/// training loop or backward/optimizer integration.
 #[allow(clippy::too_many_arguments)]
-pub fn apply_obb_yolo_batch_multi_head_training_deltas(
+fn apply_obb_yolo_batch_multi_head_training_deltas_internal(
     batch_truths: &[Vec<ObbLabel>],
     head_outputs: &[Vec<f32>],
     head_deltas: &mut [Vec<f32>],
@@ -2844,6 +2845,7 @@ pub fn apply_obb_yolo_batch_multi_head_training_deltas(
     label_smooth_eps: f32,
     cls_normalizer: f32,
     box_delta_configs: &[ObbYoloBoxDeltaConfig],
+    front_point_delta_config: Option<ObbYoloFrontPointDeltaConfig>,
 ) -> Result<ObbYoloBatchTrainingDeltaStats> {
     let head_count = head_outputs.len();
     if head_count == 0
@@ -2885,7 +2887,7 @@ pub fn apply_obb_yolo_batch_multi_head_training_deltas(
         .try_reserve_exact(head_count)
         .map_err(|_| Error::InvalidConfig("OBB head-stat allocation failed".to_owned()))?;
     for head_index in 0..head_count {
-        let head_stats = apply_obb_yolo_batch_head_training_deltas(
+        let head_stats = apply_obb_yolo_batch_head_training_deltas_internal(
             batch_truths,
             &head_outputs[head_index],
             &mut head_deltas[head_index],
@@ -2895,6 +2897,7 @@ pub fn apply_obb_yolo_batch_multi_head_training_deltas(
             label_smooth_eps,
             cls_normalizer,
             box_delta_configs[head_index],
+            front_point_delta_config,
         )?;
         totals.truth_threshold_positive_cells = totals
             .truth_threshold_positive_cells
@@ -2923,6 +2926,62 @@ pub fn apply_obb_yolo_batch_multi_head_training_deltas(
         totals.per_head.push(head_stats);
     }
     Ok(totals)
+}
+
+/// Dispatch the existing OBB training passes across multiple heads without
+/// front-point channel updates.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_obb_yolo_batch_multi_head_training_deltas(
+    batch_truths: &[Vec<ObbLabel>],
+    head_outputs: &[Vec<f32>],
+    head_deltas: &mut [Vec<f32>],
+    match_configs: &[ObbYoloHeadMatchConfig],
+    assignment_configs: &[ObbYoloPositiveObjectnessConfig],
+    focal_loss: bool,
+    label_smooth_eps: f32,
+    cls_normalizer: f32,
+    box_delta_configs: &[ObbYoloBoxDeltaConfig],
+) -> Result<ObbYoloBatchTrainingDeltaStats> {
+    apply_obb_yolo_batch_multi_head_training_deltas_internal(
+        batch_truths,
+        head_outputs,
+        head_deltas,
+        match_configs,
+        assignment_configs,
+        focal_loss,
+        label_smooth_eps,
+        cls_normalizer,
+        box_delta_configs,
+        None,
+    )
+}
+
+/// Dispatch one-head front-point training passes across multiple heads.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_obb_yolo_batch_multi_head_training_deltas_with_front_point(
+    batch_truths: &[Vec<ObbLabel>],
+    head_outputs: &[Vec<f32>],
+    head_deltas: &mut [Vec<f32>],
+    match_configs: &[ObbYoloHeadMatchConfig],
+    assignment_configs: &[ObbYoloPositiveObjectnessConfig],
+    focal_loss: bool,
+    label_smooth_eps: f32,
+    cls_normalizer: f32,
+    box_delta_configs: &[ObbYoloBoxDeltaConfig],
+    front_point_delta_config: ObbYoloFrontPointDeltaConfig,
+) -> Result<ObbYoloBatchTrainingDeltaStats> {
+    apply_obb_yolo_batch_multi_head_training_deltas_internal(
+        batch_truths,
+        head_outputs,
+        head_deltas,
+        match_configs,
+        assignment_configs,
+        focal_loss,
+        label_smooth_eps,
+        cls_normalizer,
+        box_delta_configs,
+        Some(front_point_delta_config),
+    )
 }
 
 fn validate_anchor_front_offsets(offsets: Option<&[[f32; 2]]>, anchor_count: usize) -> Result<()> {
@@ -3035,7 +3094,8 @@ mod tests {
         apply_obb_yolo_batch_head_training_deltas_with_front_point,
         apply_obb_yolo_batch_head_truth_threshold_deltas,
         apply_obb_yolo_batch_head_truth_threshold_front_point_deltas,
-        apply_obb_yolo_batch_multi_head_training_deltas, assign_obb_yolo_anchor,
+        apply_obb_yolo_batch_multi_head_training_deltas,
+        apply_obb_yolo_batch_multi_head_training_deltas_with_front_point, assign_obb_yolo_anchor,
         decode_obb_yolo_front_point, decode_obb_yolo_prediction, encode_obb_yolo_truth_batch,
         enumerate_obb_yolo_batch_positives, enumerate_obb_yolo_head_positives,
         match_obb_yolo_batch_cell_predictions, match_obb_yolo_cell_prediction,
@@ -4297,6 +4357,48 @@ mod tests {
             assert!((head_delta[6] - 0.6).abs() < 1e-6);
             assert!((head_delta[7] - 0.7).abs() < 1e-6);
             assert!((head_delta[8] + 0.2).abs() < 1e-6);
+        }
+
+        let mut front_labels = labels.clone();
+        front_labels[0][0].front_x = 0.66;
+        front_labels[0][0].front_y = 0.57;
+        let mut front_matching = matching.clone();
+        for config in &mut front_matching {
+            config.truth_thresh = 0.0;
+        }
+        let mut front_deltas = vec![vec![0.0; 9], vec![0.0; 9]];
+        let front_stats = apply_obb_yolo_batch_multi_head_training_deltas_with_front_point(
+            &front_labels,
+            &outputs,
+            &mut front_deltas,
+            &front_matching,
+            &assignments,
+            false,
+            0.0,
+            1.0,
+            &box_configs,
+            ObbYoloFrontPointDeltaConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(front_stats.per_head.len(), 2);
+        for head_index in 0..2 {
+            let mut single_delta = vec![0.0; 9];
+            let single_stats = apply_obb_yolo_batch_head_training_deltas_with_front_point(
+                &front_labels,
+                &outputs[head_index],
+                &mut single_delta,
+                &front_matching[head_index],
+                &assignments[head_index],
+                false,
+                0.0,
+                1.0,
+                box_configs[head_index],
+                ObbYoloFrontPointDeltaConfig::default(),
+            )
+            .unwrap();
+            assert_eq!(front_deltas[head_index], single_delta);
+            assert_eq!(front_stats.per_head[head_index], single_stats);
+            assert!(front_deltas[head_index][4] != 0.0 || front_deltas[head_index][5] != 0.0);
         }
     }
 
