@@ -260,8 +260,9 @@ Immediately next, in dependency order:
   class-gated ignore and positive-threshold selection for one cell; v100 adds
   source-style class-channel deltas for positive cells; v101 adds standalone
   covariance-W2 loss terms and an `exp(-loss)` match quality for decoded OBB
-  geometry. Raw weighted-score integration and decode, QBBV-vIoU blending, COBB
-  scoring, batch and positive-anchor assignment integration, complete class/box
+  geometry; v102 adds a raw-channel covariance-branch match score for one cell.
+  Multi-branch weighted aggregation, QBBV-vIoU blending, COBB scoring and decode,
+  batch and positive-anchor assignment integration, complete class/box
   losses and deltas, trainer integration, crop/resize and mosaic transforms,
   alternate NMS-kind implementations, training `-map` cadence, and CARPN network
   decoding/validation integration remain open.

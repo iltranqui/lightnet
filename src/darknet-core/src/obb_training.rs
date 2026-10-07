@@ -8,7 +8,9 @@
 
 use crate::detect::DetectionBox;
 use crate::error::{Error, Result};
-use crate::obb_geometry::{BoxObb, box_ciou_obb_quality_score};
+use crate::obb_geometry::{
+    BoxObb, box_ciou_obb_quality_score, box_covariance_w2_obb_quality_score,
+};
 use crate::obb_labels::ObbLabel;
 
 const OBB_YOLO_CLASS_CONFIDENCE_THRESHOLD: f32 = 0.25;
@@ -485,6 +487,55 @@ pub fn obb_yolo_cell_objectness_delta(
 }
 
 /// Decode one source YOLO output row and score it against a truth with the
+/// source covariance-W2 matching metric.
+///
+/// `prediction` contains the six post-YOLO box/front channels: x/y already
+/// include source activation and `scale_x_y`, while front channels remain raw.
+/// `covariance_normalizer` must be finite and positive to select this branch;
+/// it gates the branch but does not scale its returned score. Call this only
+/// when the source iou-loss selector chooses the covariance branch. This helper
+/// does not combine COBB scores or apply QBBV-vIoU blending. Unlike the CIoU
+/// helper, a direction-free truth retains its finite center placeholder because
+/// the source covariance branch evaluates it rather than short-circuiting.
+pub fn obb_yolo_covariance_prediction_match_score(
+    prediction: [f32; 6],
+    truth: &ObbLabel,
+    context: ObbYoloPredictionMatchContext,
+    covariance_normalizer: f32,
+    front_length_ratio_k: f32,
+    front_length_weight: f32,
+) -> Result<f32> {
+    validate_truth(truth)?;
+    if !covariance_normalizer.is_finite()
+        || covariance_normalizer <= 0.0
+        || !front_length_ratio_k.is_finite()
+        || !front_length_weight.is_finite()
+    {
+        return Err(Error::InvalidConfig(
+            "OBB covariance matching requires a positive finite branch and finite score weights"
+                .to_owned(),
+        ));
+    }
+    let prediction = decode_obb_yolo_prediction(prediction, context)?;
+    let truth = BoxObb {
+        bbox: DetectionBox {
+            x: truth.x,
+            y: truth.y,
+            w: truth.w,
+            h: truth.h,
+        },
+        front_x: truth.front_x,
+        front_y: truth.front_y,
+    };
+    Ok(box_covariance_w2_obb_quality_score(
+        prediction,
+        truth,
+        front_length_ratio_k,
+        front_length_weight,
+    ))
+}
+
+/// Decode one source YOLO output row and score it against a truth with the
 /// source CIoU-OBB matching metric.
 ///
 /// `prediction` is the six box/front channels from the OBB YOLO layer output:
@@ -509,6 +560,55 @@ pub fn obb_yolo_ciou_prediction_match_score(
     new_coords: bool,
 ) -> Result<f32> {
     validate_truth(truth)?;
+    let prediction = decode_obb_yolo_prediction(
+        prediction,
+        ObbYoloPredictionMatchContext {
+            anchor_width,
+            anchor_height,
+            cell_x,
+            cell_y,
+            grid_width,
+            grid_height,
+            net_width,
+            net_height,
+            new_coords,
+        },
+    )?;
+    if !truth.has_front {
+        return Ok(0.0);
+    }
+    let truth = BoxObb {
+        bbox: DetectionBox {
+            x: truth.x,
+            y: truth.y,
+            w: truth.w,
+            h: truth.h,
+        },
+        front_x: truth.front_x,
+        front_y: truth.front_y,
+    };
+    Ok(box_ciou_obb_quality_score(prediction, truth))
+}
+
+fn finite_or_zero(value: f32) -> f32 {
+    if value.is_finite() { value } else { 0.0 }
+}
+
+fn decode_obb_yolo_prediction(
+    prediction: [f32; 6],
+    context: ObbYoloPredictionMatchContext,
+) -> Result<BoxObb> {
+    let ObbYoloPredictionMatchContext {
+        anchor_width,
+        anchor_height,
+        cell_x,
+        cell_y,
+        grid_width,
+        grid_height,
+        net_width,
+        net_height,
+        new_coords,
+    } = context;
     if grid_width == 0
         || grid_height == 0
         || net_width == 0
@@ -529,9 +629,6 @@ pub fn obb_yolo_ciou_prediction_match_score(
             "OBB prediction matching requires positive finite anchors".to_owned(),
         ));
     }
-    if !truth.has_front {
-        return Ok(0.0);
-    }
 
     let prediction = prediction.map(finite_or_zero);
     let x = finite_or_zero((cell_x as f32 + prediction[0]) / grid_width as f32);
@@ -551,26 +648,11 @@ pub fn obb_yolo_ciou_prediction_match_score(
             finite_or_zero(th.exp() * anchor_height / net_height as f32).max(1e-6),
         )
     };
-    let prediction = BoxObb {
+    Ok(BoxObb {
         bbox: DetectionBox { x, y, w, h },
         front_x: (cell_x as f32 + prediction[4]) / grid_width as f32,
         front_y: (cell_y as f32 + prediction[5]) / grid_height as f32,
-    };
-    let truth = BoxObb {
-        bbox: DetectionBox {
-            x: truth.x,
-            y: truth.y,
-            w: truth.w,
-            h: truth.h,
-        },
-        front_x: truth.front_x,
-        front_y: truth.front_y,
-    };
-    Ok(box_ciou_obb_quality_score(prediction, truth))
-}
-
-fn finite_or_zero(value: f32) -> f32 {
-    if value.is_finite() { value } else { 0.0 }
+    })
 }
 
 /// Calculate one positive cell's source OBB YOLO class-channel deltas.
@@ -794,7 +876,7 @@ mod tests {
         enumerate_obb_yolo_head_positives, match_obb_yolo_cell_prediction,
         obb_yolo_anchor_match_score, obb_yolo_cell_objectness_delta,
         obb_yolo_ciou_prediction_match_score, obb_yolo_class_deltas,
-        select_obb_yolo_cell_truth_match,
+        obb_yolo_covariance_prediction_match_score, select_obb_yolo_cell_truth_match,
     };
     use crate::obb_labels::ObbLabel;
 
@@ -1082,6 +1164,62 @@ mod tests {
         assert_eq!(selected.positive_truth_index, None);
         assert_eq!(selected.ignore_match_score, 0.5);
         assert!(!selected.ignore_match);
+    }
+
+    #[test]
+    fn covariance_prediction_match_decodes_channels_and_scores_absent_front_truths() {
+        let context = ObbYoloPredictionMatchContext {
+            anchor_width: 200.0,
+            anchor_height: 400.0,
+            cell_x: 0,
+            cell_y: 0,
+            grid_width: 1,
+            grid_height: 1,
+            net_width: 100,
+            net_height: 100,
+            new_coords: false,
+        };
+        let mut exact = truth(0.5, 0.5, 2.0, 4.0);
+        exact.front_x = 0.5;
+        exact.front_y = 4.5;
+        exact.has_front = true;
+        let prediction = [0.5, 0.5, 0.0, 0.0, 0.5, 4.5];
+        assert_eq!(
+            obb_yolo_covariance_prediction_match_score(prediction, &exact, context, 1.0, 1.0, 0.35)
+                .unwrap(),
+            1.0
+        );
+
+        let mut rotated = exact;
+        rotated.front_x = 4.5;
+        rotated.front_y = 0.5;
+        let rotated_score = obb_yolo_covariance_prediction_match_score(
+            prediction, &rotated, context, 1.0, 1.0, 0.0,
+        )
+        .unwrap();
+        assert!(rotated_score < 1.0);
+
+        let direction_free = truth(0.5, 0.5, 2.0, 4.0);
+        let direction_free_score = obb_yolo_covariance_prediction_match_score(
+            prediction,
+            &direction_free,
+            context,
+            1.0,
+            1.0,
+            0.35,
+        )
+        .unwrap();
+        assert!(direction_free_score.is_finite());
+        assert!((0.0..=1.0).contains(&direction_free_score));
+        assert!(obb_yolo_covariance_prediction_match_score(
+            prediction,
+            &exact,
+            context,
+            0.0,
+            1.0,
+            0.35,
+        )
+        .is_err());
     }
 
     #[test]
