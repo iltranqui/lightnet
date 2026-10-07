@@ -161,6 +161,12 @@ pub fn build_obb_yolo_training_head_config(
         },
         viou_weight: spec.obb_viou_weight,
     };
+    // Matching can use a weighted branch for MSE, but source box regression
+    // still falls back to CIoU-OBB unless a non-MSE weighted loss is selected.
+    let box_delta_score_config = ObbYoloMatchScoreConfig {
+        ciou_obb: spec.ciou_obb_loss || spec.iou_loss == YoloIouLoss::Mse || !weighted_score_branch,
+        ..score_config
+    };
     let match_config = ObbYoloHeadMatchConfig {
         head_index,
         anchors: anchors.clone(),
@@ -199,7 +205,7 @@ pub fn build_obb_yolo_training_head_config(
         match_config,
         assignment_config,
         box_delta_config: ObbYoloBoxDeltaConfig {
-            score: score_config,
+            score: box_delta_score_config,
             iou_normalizer: spec.iou_normalizer,
             max_delta: spec.max_delta,
             ..ObbYoloBoxDeltaConfig::default()
@@ -1247,8 +1253,9 @@ fn obb_yolo_box_regression_deltas_with_front_anchor_offset(
     front_anchor_offset: Option<[f32; 2]>,
 ) -> Result<[f32; 4]> {
     validate_truth(truth)?;
-    let covariance_active =
-        config.score.covariance_normalizer.is_finite() && config.score.covariance_normalizer > 0.0;
+    let covariance_active = !config.score.ciou_obb
+        && config.score.covariance_normalizer.is_finite()
+        && config.score.covariance_normalizer > 0.0;
     if !config.iou_normalizer.is_finite()
         || !config.max_delta.is_finite()
         || config.max_delta < 0.0
@@ -4056,6 +4063,55 @@ mod tests {
                 * 2.5)
                 .clamp(-1.0, 1.0);
         assert!((new_coords_actual[0] - expected_x).abs() < 1e-6);
+    }
+
+    #[test]
+    fn explicit_ciou_box_delta_mode_bypasses_covariance_gradient() {
+        let truth = truth(0.5, 0.5, 0.2, 0.1);
+        let context = ObbYoloPredictionMatchContext {
+            anchor_width: 20.0,
+            anchor_height: 10.0,
+            cell_x: 0,
+            cell_y: 0,
+            grid_width: 1,
+            grid_height: 1,
+            net_width: 100,
+            net_height: 100,
+            new_coords: false,
+        };
+        let prediction = [0.35, 0.6, 0.15, -0.1, 0.7, 0.4];
+        let ciou_score = ObbYoloMatchScoreConfig {
+            ciou_obb: true,
+            covariance_normalizer: 1.3,
+            ..ObbYoloMatchScoreConfig::default()
+        };
+        let explicit_ciou = obb_yolo_box_regression_deltas(
+            prediction,
+            [0.0; 4],
+            &truth,
+            context,
+            ObbYoloBoxDeltaConfig {
+                score: ciou_score,
+                ..ObbYoloBoxDeltaConfig::default()
+            },
+        )
+        .unwrap();
+        let ciou_without_covariance = obb_yolo_box_regression_deltas(
+            prediction,
+            [0.0; 4],
+            &truth,
+            context,
+            ObbYoloBoxDeltaConfig {
+                score: ObbYoloMatchScoreConfig {
+                    covariance_normalizer: 0.0,
+                    ..ciou_score
+                },
+                ..ObbYoloBoxDeltaConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(explicit_ciou, ciou_without_covariance);
     }
 
     #[test]

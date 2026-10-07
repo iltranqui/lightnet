@@ -4558,6 +4558,27 @@ mod tests {
     }
 
     #[test]
+    fn obb_yolo_mse_uses_ciou_obb_box_delta_branch_with_weighted_matching() {
+        let network = build(
+            "[net]\nwidth=1\nheight=1\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\niou_loss=mse\ncovariance_normalizer=1.0\n",
+        )
+        .expect("weighted MSE OBB config parses");
+        let LayerKind::ObbYolo(spec) = &network.layers[0].kind else {
+            panic!("expected OBB YOLO layer");
+        };
+        let training =
+            crate::obb_training::build_obb_yolo_training_head_config(spec, 0, 1, 1, 1, 1)
+                .expect("weighted MSE OBB config builds");
+
+        assert!(!training.match_config.score_config.ciou_obb);
+        assert!(training.box_delta_config.score.ciou_obb);
+        assert_eq!(
+            training.match_config.score_config.covariance_normalizer,
+            training.box_delta_config.score.covariance_normalizer
+        );
+    }
+
+    #[test]
     fn obb_yolo_defaults_to_ciou_obb_match_scoring() {
         let network = build(
             "[net]\nwidth=1\nheight=1\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\n",
