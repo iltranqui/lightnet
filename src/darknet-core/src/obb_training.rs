@@ -189,6 +189,19 @@ pub struct ObbYoloHeadTrainingDeltaStats {
     pub anchor_box_positive_count: usize,
 }
 
+/// Per-head detail and source-style totals from a multi-head delta dispatch.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ObbYoloBatchTrainingDeltaStats {
+    /// Results in the same order as the head tensors passed to the dispatcher.
+    pub per_head: Vec<ObbYoloHeadTrainingDeltaStats>,
+    /// `avg_cat` sum/count aggregated across best/additional assignments only.
+    pub anchor_class_stats: ObbYoloClassDeltaStats,
+    /// Truth-threshold cell positives across heads (not included in `avg_cat`).
+    pub truth_threshold_positive_cells: usize,
+    /// Best/additional positive box assignments across heads.
+    pub anchor_box_positive_count: usize,
+}
+
 /// Geometry shared by the per-cell prediction-match score calculation.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ObbYoloPredictionMatchContext {
@@ -2360,7 +2373,7 @@ pub fn apply_obb_yolo_batch_multi_head_training_deltas(
     label_smooth_eps: f32,
     cls_normalizer: f32,
     box_delta_configs: &[ObbYoloBoxDeltaConfig],
-) -> Result<Vec<ObbYoloHeadTrainingDeltaStats>> {
+) -> Result<ObbYoloBatchTrainingDeltaStats> {
     let head_count = head_outputs.len();
     if head_count == 0
         || head_deltas.len() != head_count
@@ -2392,12 +2405,16 @@ pub fn apply_obb_yolo_batch_multi_head_training_deltas(
         }
     }
 
-    let mut stats = Vec::new();
-    stats
+    let mut totals = ObbYoloBatchTrainingDeltaStats {
+        per_head: Vec::new(),
+        ..ObbYoloBatchTrainingDeltaStats::default()
+    };
+    totals
+        .per_head
         .try_reserve_exact(head_count)
         .map_err(|_| Error::InvalidConfig("OBB head-stat allocation failed".to_owned()))?;
     for head_index in 0..head_count {
-        stats.push(apply_obb_yolo_batch_head_training_deltas(
+        let head_stats = apply_obb_yolo_batch_head_training_deltas(
             batch_truths,
             &head_outputs[head_index],
             &mut head_deltas[head_index],
@@ -2407,9 +2424,30 @@ pub fn apply_obb_yolo_batch_multi_head_training_deltas(
             label_smooth_eps,
             cls_normalizer,
             box_delta_configs[head_index],
-        )?);
+        )?;
+        totals.truth_threshold_positive_cells = totals
+            .truth_threshold_positive_cells
+            .checked_add(head_stats.truth_threshold_positive_cells)
+            .ok_or_else(|| Error::InvalidConfig("OBB truth-positive count overflows".to_owned()))?;
+        totals.anchor_class_stats.class_output_sum +=
+            head_stats.anchor_class_stats.class_output_sum;
+        if !totals.anchor_class_stats.class_output_sum.is_finite() {
+            return Err(Error::InvalidConfig(
+                "OBB aggregate class-output sum is non-finite".to_owned(),
+            ));
+        }
+        totals.anchor_class_stats.positive_count = totals
+            .anchor_class_stats
+            .positive_count
+            .checked_add(head_stats.anchor_class_stats.positive_count)
+            .ok_or_else(|| Error::InvalidConfig("OBB class-positive count overflows".to_owned()))?;
+        totals.anchor_box_positive_count = totals
+            .anchor_box_positive_count
+            .checked_add(head_stats.anchor_box_positive_count)
+            .ok_or_else(|| Error::InvalidConfig("OBB box-positive count overflows".to_owned()))?;
+        totals.per_head.push(head_stats);
     }
-    Ok(stats)
+    Ok(totals)
 }
 
 fn validate_anchor_front_offsets(offsets: Option<&[[f32; 2]]>, anchor_count: usize) -> Result<()> {
@@ -3458,8 +3496,12 @@ mod tests {
             &box_configs,
         )
         .unwrap();
-        assert_eq!(stats.len(), 2);
-        for head_stats in stats {
+        assert_eq!(stats.per_head.len(), 2);
+        assert_eq!(stats.truth_threshold_positive_cells, 2);
+        assert_eq!(stats.anchor_class_stats.positive_count, 2);
+        assert!((stats.anchor_class_stats.class_output_sum - 0.6).abs() < 1e-6);
+        assert_eq!(stats.anchor_box_positive_count, 2);
+        for head_stats in &stats.per_head {
             assert_eq!(head_stats.truth_threshold_positive_cells, 1);
             assert_eq!(head_stats.anchor_class_stats.positive_count, 1);
             assert_eq!(head_stats.anchor_class_stats.class_output_sum, 0.3);

@@ -284,7 +284,8 @@ Immediately next, in dependency order:
   deltas after the all-cell objectness pass; v123 composes ordered delta passes
   for one complete head; v124 dispatches those passes across multiple head
   tensors; v125 adds a standalone center-front-anchor point decoder; v126 routes
-  optional anchor offsets through head matching and box deltas. Still open: cfg
+  optional anchor offsets through head matching and box deltas; v127 aggregates
+  multi-head class and positive-assignment metrics. Still open: cfg
   ingestion and inference/network decode, raw front-channel gradients, multi-head
   network-loop/backprop integration, truth-threshold metric/loss aggregation,
   integrated losses and training-loop wiring, crop/resize and mosaic transforms,
