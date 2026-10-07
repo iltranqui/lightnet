@@ -1,8 +1,8 @@
 //! Source-derived training primitives for legacy front-point OBB YOLO heads.
 //!
 //! This module currently covers direction-free anchor matching, per-truth
-//! head-positive enumeration, per-cell CIoU prediction scoring/match selection
-//! and objectness deltas, cell selection, and source-layout truth-row packing.
+//! head-positive enumeration, per-cell CIoU prediction scoring/match selection,
+//! objectness and class-channel deltas, and source-layout truth-row packing.
 //! It does not implement complete truth assignment, YOLO loss, backward
 //! propagation, or optimizer integration.
 
@@ -63,6 +63,15 @@ pub struct ObbYoloCellTruthMatch {
     /// Whether `ignore_match_score > ignore_thresh`; this may coexist with a
     /// positive match, whose source branch later overrides the ignore delta.
     pub ignore_match: bool,
+}
+
+/// Class-channel deltas for one OBB YOLO positive.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObbYoloClassDeltaResult {
+    /// Updated class deltas, preserving incoming values where the source leaves them untouched.
+    pub deltas: Vec<f32>,
+    /// Selected class output, which the caller may add to the source `avg_cat` statistic.
+    pub class_output_for_average: f32,
 }
 
 /// Geometry shared by the per-cell prediction-match score calculation.
@@ -564,6 +573,93 @@ fn finite_or_zero(value: f32) -> f32 {
     if value.is_finite() { value } else { 0.0 }
 }
 
+/// Calculate one positive cell's source OBB YOLO class-channel deltas.
+///
+/// This ports `delta_obb_yolo_class` over channel slices. If the selected
+/// class already has a nonzero delta, the source updates only that class and
+/// applies its multiplier without `cls_normalizer`; otherwise focal loss
+/// ignores smoothing/multipliers, while the non-focal path applies smoothing
+/// and applies `class_multiplier * cls_normalizer` only to the selected class
+/// when multipliers are configured. Inputs are post-YOLO class outputs.
+pub fn obb_yolo_class_deltas(
+    class_outputs: &[f32],
+    existing_deltas: &[f32],
+    class_id: usize,
+    focal_loss: bool,
+    label_smooth_eps: f32,
+    class_multipliers: Option<&[f32]>,
+    cls_normalizer: f32,
+) -> Result<ObbYoloClassDeltaResult> {
+    let classes = class_outputs.len();
+    if classes == 0
+        || existing_deltas.len() != classes
+        || class_id >= classes
+        || !label_smooth_eps.is_finite()
+        || !cls_normalizer.is_finite()
+        || class_outputs.iter().any(|value| !value.is_finite())
+        || existing_deltas.iter().any(|value| !value.is_finite())
+        || class_multipliers.is_some_and(|multipliers| {
+            multipliers.len() != classes || multipliers.iter().any(|value| !value.is_finite())
+        })
+    {
+        return Err(Error::InvalidConfig(
+            "OBB class deltas require matching finite channels and a valid class id".to_owned(),
+        ));
+    }
+
+    let mut deltas = Vec::new();
+    deltas
+        .try_reserve_exact(classes)
+        .map_err(|_| Error::InvalidConfig("OBB class-delta allocation failed".to_owned()))?;
+    deltas.extend_from_slice(existing_deltas);
+
+    if existing_deltas[class_id] != 0.0 {
+        let target = 1.0 * (1.0 - label_smooth_eps) + 0.5 * label_smooth_eps;
+        let result_delta = target - class_outputs[class_id];
+        if result_delta.is_finite() {
+            deltas[class_id] = result_delta;
+        }
+        if let Some(multipliers) = class_multipliers {
+            deltas[class_id] *= multipliers[class_id];
+        }
+        return Ok(ObbYoloClassDeltaResult {
+            deltas,
+            class_output_for_average: class_outputs[class_id],
+        });
+    }
+
+    if focal_loss {
+        let pt = class_outputs[class_id] + 1.0e-15;
+        let grad = -(1.0 - pt) * (2.0 * pt * pt.ln() + pt - 1.0);
+        for (index, (&output, delta)) in class_outputs.iter().zip(&mut deltas).enumerate() {
+            let target = if index == class_id { 1.0 } else { 0.0 };
+            let result_delta = (target - output) * 0.5 * grad;
+            if result_delta.is_finite() {
+                *delta = result_delta;
+            }
+        }
+    } else {
+        for (index, (&output, delta)) in class_outputs.iter().zip(&mut deltas).enumerate() {
+            let target = if index == class_id { 1.0 } else { 0.0 };
+            let target = target * (1.0 - label_smooth_eps) + 0.5 * label_smooth_eps;
+            let result_delta = target - output;
+            if result_delta.is_finite() {
+                *delta = result_delta;
+            }
+            if index == class_id {
+                if let Some(multipliers) = class_multipliers {
+                    *delta *= multipliers[class_id] * cls_normalizer;
+                }
+            }
+        }
+    }
+
+    Ok(ObbYoloClassDeltaResult {
+        deltas,
+        class_output_for_average: class_outputs[class_id],
+    })
+}
+
 /// Compute one cell's source CIoU scores against truths, then apply the source
 /// best-truth, class-gated ignore, and positive-threshold selection.
 ///
@@ -697,7 +793,8 @@ mod tests {
         ObbYoloPredictionMatchContext, assign_obb_yolo_anchor, encode_obb_yolo_truth_batch,
         enumerate_obb_yolo_head_positives, match_obb_yolo_cell_prediction,
         obb_yolo_anchor_match_score, obb_yolo_cell_objectness_delta,
-        obb_yolo_ciou_prediction_match_score, select_obb_yolo_cell_truth_match,
+        obb_yolo_ciou_prediction_match_score, obb_yolo_class_deltas,
+        select_obb_yolo_cell_truth_match,
     };
     use crate::obb_labels::ObbLabel;
 
@@ -1209,6 +1306,71 @@ mod tests {
         .unwrap();
         assert_eq!(after_sentinel.best_truth_index, None);
         assert_eq!(after_sentinel.positive_truth_index, None);
+    }
+
+    #[test]
+    fn class_delta_existing_positive_branch_updates_only_target_without_cls_normalizer() {
+        let result = obb_yolo_class_deltas(
+            &[0.2, 0.7, 0.1],
+            &[0.11, -0.5, -0.4],
+            1,
+            true,
+            0.2,
+            Some(&[10.0, 2.0, 10.0]),
+            3.0,
+        )
+        .unwrap();
+        assert_eq!(result.deltas[0], 0.11);
+        assert!((result.deltas[1] - 0.4).abs() < 1e-6);
+        assert_eq!(result.deltas[2], -0.4);
+        assert_eq!(result.class_output_for_average, 0.7);
+    }
+
+    #[test]
+    fn class_delta_non_focal_branch_smooths_and_scales_only_target() {
+        let result = obb_yolo_class_deltas(
+            &[0.2, 0.7, 0.4],
+            &[0.0; 3],
+            1,
+            false,
+            0.2,
+            Some(&[1.0, 2.0, 1.0]),
+            1.5,
+        )
+        .unwrap();
+        assert!((result.deltas[0] - (-0.1)).abs() < 1e-6);
+        assert!((result.deltas[1] - 0.6).abs() < 1e-6);
+        assert!((result.deltas[2] - (-0.3)).abs() < 1e-6);
+
+        let unweighted =
+            obb_yolo_class_deltas(&[0.2, 0.7], &[0.0; 2], 1, false, 0.0, None, 9.0).unwrap();
+        assert!((unweighted.deltas[0] - (-0.2)).abs() < 1e-6);
+        assert!((unweighted.deltas[1] - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn class_delta_focal_branch_ignores_smoothing_and_multipliers() {
+        let outputs = [0.2, 0.7];
+        let result =
+            obb_yolo_class_deltas(&outputs, &[0.0; 2], 1, true, 0.8, Some(&[11.0, 13.0]), 99.0)
+                .unwrap();
+        let pt = outputs[1] + 1.0e-15;
+        let grad = -(1.0 - pt) * (2.0 * pt * pt.ln() + pt - 1.0);
+        assert!((result.deltas[0] - (-outputs[0] * 0.5 * grad)).abs() < 1e-6);
+        assert!((result.deltas[1] - ((1.0 - outputs[1]) * 0.5 * grad)).abs() < 1e-6);
+        assert_eq!(result.class_output_for_average, outputs[1]);
+
+        let invalid_probability =
+            obb_yolo_class_deltas(&[0.2, -1.0], &[0.3, 0.0], 1, true, 0.0, None, 1.0).unwrap();
+        assert_eq!(invalid_probability.deltas, [0.3, 0.0]);
+    }
+
+    #[test]
+    fn class_delta_rejects_bad_shapes_classes_and_nonfinite_config() {
+        assert!(obb_yolo_class_deltas(&[], &[], 0, false, 0.0, None, 1.0).is_err());
+        assert!(obb_yolo_class_deltas(&[0.2], &[0.0], 1, false, 0.0, None, 1.0).is_err());
+        assert!(obb_yolo_class_deltas(&[0.2], &[0.0], 0, false, 0.0, Some(&[]), 1.0).is_err());
+        assert!(obb_yolo_class_deltas(&[0.2], &[0.0], 0, false, f32::NAN, None, 1.0).is_err());
     }
 
     #[test]

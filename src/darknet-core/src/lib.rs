@@ -59,11 +59,12 @@ pub mod obb_labels;
 pub use obb_labels::{ObbLabel, flip_obb_labels, load_obb_labels, rotate_obb_labels};
 pub mod obb_training;
 pub use obb_training::{
-    OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloCellTruthMatch, ObbYoloPositiveAssignment,
-    ObbYoloPositiveKind, ObbYoloPredictionMatchContext, ObbYoloTruthBatch,
+    OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloCellTruthMatch,
+    ObbYoloClassDeltaResult, ObbYoloPositiveAssignment, ObbYoloPositiveKind,
+    ObbYoloPredictionMatchContext, ObbYoloTruthBatch,
     assign_obb_yolo_anchor, encode_obb_yolo_truth_batch, enumerate_obb_yolo_head_positives,
-    match_obb_yolo_cell_prediction, obb_yolo_anchor_match_score,
-    obb_yolo_cell_objectness_delta, obb_yolo_ciou_prediction_match_score,
+    match_obb_yolo_cell_prediction, obb_yolo_anchor_match_score, obb_yolo_cell_objectness_delta,
+    obb_yolo_class_deltas, obb_yolo_ciou_prediction_match_score,
     select_obb_yolo_cell_truth_match,
 };
 pub(crate) mod omd_loss;
