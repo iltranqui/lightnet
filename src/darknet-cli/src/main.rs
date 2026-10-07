@@ -1346,8 +1346,42 @@ impl MapSchedule {
     }
 }
 
+enum TrainingValidationDataset {
+    AxisAligned(darknet_core::ValidationDataset),
+    Oriented(darknet_core::ObbValidationDataset),
+}
+
+impl TrainingValidationDataset {
+    fn classes(&self) -> usize {
+        match self {
+            Self::AxisAligned(dataset) => dataset.classes,
+            Self::Oriented(dataset) => dataset.classes,
+        }
+    }
+
+    fn image_count(&self) -> usize {
+        match self {
+            Self::AxisAligned(dataset) => dataset.images.len(),
+            Self::Oriented(dataset) => dataset.images.len(),
+        }
+    }
+
+    fn evaluate(
+        &self,
+        network: &Network,
+        options: DetectionOptions,
+        iou_threshold: f32,
+        infer: impl FnMut(&Tensor) -> darknet_core::Result<Vec<darknet_core::YoloHeadOutput>>,
+    ) -> darknet_core::Result<darknet_core::MapReport> {
+        match self {
+            Self::AxisAligned(dataset) => dataset.evaluate(network, options, iou_threshold, infer),
+            Self::Oriented(dataset) => dataset.evaluate(network, options, iou_threshold, infer),
+        }
+    }
+}
+
 struct TrainingValidation {
-    dataset: darknet_core::ValidationDataset,
+    dataset: TrainingValidationDataset,
     names: Vec<String>,
     schedule: MapSchedule,
     detection_options: DetectionOptions,
@@ -1372,21 +1406,22 @@ impl TrainingValidation {
         if !options.map {
             return Ok(None);
         }
-        let dataset = darknet_core::ValidationDataset::from_data(network, data)?;
-        let names = if let Some(path) = &data.names {
-            load_names_file(path)?
+        let dataset = if network.net.obb {
+            TrainingValidationDataset::Oriented(darknet_core::ObbValidationDataset::from_data(
+                network, data,
+            )?)
         } else {
-            (0..dataset.classes).map(|i| format!("class_{i}")).collect()
+            TrainingValidationDataset::AxisAligned(darknet_core::ValidationDataset::from_data(
+                network, data,
+            )?)
         };
-        if names.len() != dataset.classes {
-            return Err("-map names count differs from cfg classes".into());
-        }
+        let names = map_class_names(data, dataset.classes())?;
         let interval = options
             .map_every
             .unwrap_or_else(|| (train_images / images_per_iteration.max(1)).max(100));
         println!(
             "mAP: {} validation images, every {interval} iterations (after burn-in {}), and at final iteration",
-            dataset.images.len(),
+            dataset.image_count(),
             network.net.burn_in
         );
         let mut log = fs::OpenOptions::new()
@@ -2187,7 +2222,7 @@ fn run_detector_train_cpu(
             {
                 println!(
                     "Validating current training weights on all {} images...",
-                    validation.dataset.images.len()
+                    validation.dataset.image_count()
                 );
                 // Separate batch-one inference graph, same current parameters;
                 // never alter the training graph, caches or momentum buffers.
@@ -2253,9 +2288,6 @@ fn run_detector_train_cpu_obb(
     augmentation: DetectorAugmentation,
     options: &TrainOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if options.map {
-        return Err("OBB CLI training -map cadence is not implemented yet".into());
-    }
     if executable.network.net.adam {
         return Err("OBB CLI CPU training currently supports SGD, not Adam".into());
     }
@@ -2325,6 +2357,17 @@ fn run_detector_train_cpu_obb(
         .checked_mul(subdivisions)
         .ok_or_else(|| std::io::Error::other("OBB CLI images-per-iteration count overflow"))?;
     let mut batch_num = (seen as usize) / images_per_iteration;
+    let mut validation = TrainingValidation::new(
+        options,
+        &executable.network,
+        &data_config,
+        augmentation.letter_box,
+        train_images.len(),
+        images_per_iteration,
+        batch_num,
+        &backup_dir,
+        &base_name,
+    )?;
     let mut progress = TrainingProgress::new(batch_num);
     let mut epoch = (seen as usize) / train_images.len();
     let mut epoch_images = std::sync::Arc::new(epoch_order(&train_images, options.seed, epoch));
@@ -2397,7 +2440,7 @@ fn run_detector_train_cpu_obb(
             seen,
             executable.network.net.max_batches,
             iteration_start.elapsed(),
-            &map_progress_fields(None),
+            &map_progress_fields(validation.as_ref()),
         );
         loss_log.record(
             batch_num,
@@ -2408,6 +2451,32 @@ fn run_detector_train_cpu_obb(
             iteration_start.elapsed().as_secs_f64() * 1000.0,
         )?;
         metrics_log.record(batch_num, seen, &iteration_metrics, subdivisions)?;
+
+        if let Some(validation) = &mut validation {
+            if validation
+                .schedule
+                .due(batch_num, executable.network.net.max_batches)
+            {
+                println!(
+                    "Validating current training weights on all {} images...",
+                    validation.dataset.image_count()
+                );
+                let mut inference = ExecutableNetwork::new(executable.network.with_batch(1));
+                inference.params = executable.params.clone();
+                let report = validation.dataset.evaluate(
+                    &inference.network,
+                    validation.detection_options,
+                    validation.iou_threshold,
+                    |input| Ok(inference.forward(input)?.yolo_heads),
+                )?;
+                loss_log.set_map(report.mean_average_precision);
+                if validation.record(&report, batch_num, seen)? {
+                    let checkpoint = backup_dir.join(format!("{base_name}_best.weights"));
+                    save_weights(&executable.network, &executable.params, &checkpoint, seen)?;
+                    println!("saved {}", checkpoint.display());
+                }
+            }
+        }
 
         if options.save_every != 0 && batch_num % options.save_every == 0 {
             let checkpoint = backup_dir.join(format!("{base_name}_{batch_num}.weights"));
@@ -2793,7 +2862,7 @@ fn run_detector_train_gpu(
             {
                 println!(
                     "Validating current training weights on all {} images...",
-                    validation.dataset.images.len()
+                    validation.dataset.image_count()
                 );
                 // Deferred updates make device parameters authoritative. Sync
                 // weights AND BN state, then snapshot for batch-one inference.
@@ -3292,59 +3361,50 @@ mod tests {
     }
 
     #[test]
-    fn detector_train_runs_one_cpu_obb_iteration_and_saves_cost_artifacts() {
+    fn detector_train_runs_cpu_obb_subdivisions_and_map_cadence() {
         let dir = std::env::temp_dir().join(format!("darknet-obb-cli-{}", std::process::id()));
         let backup = dir.join("backup");
         std::fs::create_dir_all(&backup).expect("test backup directory");
         let image = dir.join("sample.ppm");
         let labels = dir.join("sample.txt");
         let train_list = dir.join("train.txt");
+        let valid_list = dir.join("valid.txt");
         let cfg = dir.join("obb-cli.cfg");
         let data = dir.join("obb-cli.data");
         std::fs::write(&image, b"P6\n2 1\n255\n\xff\x00\x00\x00\xff\x00").expect("PPM image");
         std::fs::write(&labels, "0 0.5 0.5 0.25 0.5 0.7 0.55\n").expect("OBB label");
         std::fs::write(&train_list, format!("{}\n", image.display())).expect("train list");
+        std::fs::write(&valid_list, format!("{}\n", image.display())).expect("valid list");
         std::fs::write(
             &data,
             format!(
-                "classes=1\ntrain={}\nbackup={}\n",
+                "classes=1\ntrain={}\nvalid={}\nbackup={}\n",
                 train_list.display(),
+                valid_list.display(),
                 backup.display()
             ),
         )
         .expect("data cfg");
         std::fs::write(
             &cfg,
-            "[net]\nwidth=2\nheight=1\nchannels=3\nbatch=1\nsubdivisions=2\nmax_batches=1\nlearning_rate=.01\nmomentum=0\ndecay=0\nobb=1\nflip=0\n[convolutional]\nfilters=8\nsize=1\nstride=1\nactivation=linear\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\njitter=0\niou_loss=ciou_obb\n",
+            "[net]\nwidth=2\nheight=1\nchannels=3\nbatch=1\nsubdivisions=2\nmax_batches=3\nlearning_rate=.01\nmomentum=0\ndecay=0\nobb=1\nflip=0\n[convolutional]\nfilters=8\nsize=1\nstride=1\nactivation=linear\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\njitter=0\niou_loss=ciou_obb\n",
         )
         .expect("OBB cfg");
 
         let cfg_path = cfg.to_str().expect("cfg path is UTF-8");
         let data_path = data.to_str().expect("data path is UTF-8");
-        let map_error = run_detector_train_cpu(
-            cfg_path,
-            data_path,
-            &options(&["-map"]).expect("mAP train options"),
-        )
-        .expect_err("OBB training must not fall into AABB mAP validation");
-        assert!(
-            map_error
-                .to_string()
-                .contains("OBB CLI training -map cadence")
-        );
-
         run_detector_train_cpu(
             cfg_path,
             data_path,
-            &options(&[]).expect("default train options"),
+            &options(&["-map", "-map_every", "2"]).expect("mAP train options"),
         )
-        .expect("one OBB CPU iteration");
+        .expect("OBB CPU training with periodic/final mAP");
 
         assert!(backup.join("obb-cli_final.weights").exists());
         let loss_log =
             std::fs::read_to_string(backup.join("obb-cli_loss.csv")).expect("OBB loss log");
         assert!(
-            loss_log.lines().any(|line| line.starts_with("1,2,")),
+            loss_log.lines().any(|line| line.starts_with("3,6,")),
             "{loss_log}"
         );
         let metrics_log = std::fs::read_to_string(backup.join("obb-cli_obb_metrics.csv"))
@@ -3354,7 +3414,7 @@ mod tests {
         assert_eq!(metrics_header.split(',').count(), 19);
         let metrics_row = metrics_log
             .lines()
-            .find(|line| line.starts_with("1,2,"))
+            .find(|line| line.starts_with("3,6,"))
             .expect("one OBB metric row");
         let columns: Vec<_> = metrics_row.split(',').collect();
         assert_eq!(columns.len(), 19, "{metrics_row}");
@@ -3366,6 +3426,19 @@ mod tests {
             columns[8], "2",
             "two subdivision class assignments: {metrics_row}"
         );
+        assert!(backup.join("obb-cli_best.weights").exists());
+        let map_log = std::fs::read_to_string(backup.join("obb-cli_map.csv")).expect("mAP log");
+        let map_rows: Vec<_> = map_log
+            .lines()
+            .filter(|line| line.starts_with("2,4,") || line.starts_with("3,6,"))
+            .collect();
+        assert_eq!(
+            map_rows.len(),
+            2,
+            "expected interval and final mAP rows: {map_log}"
+        );
+        assert!(map_rows[0].starts_with("2,4,"), "{map_log}");
+        assert!(map_rows[1].starts_with("3,6,"), "{map_log}");
     }
 
     #[test]

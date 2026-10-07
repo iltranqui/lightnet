@@ -325,10 +325,14 @@ Immediately next, in dependency order:
   plus the CLI test passed. v160 adds a separate subdivision-aggregated OBB
   metrics CSV (average IoU/GIoU, class output, assignment counts, loss components,
   front loss, and orientation accuracy/error buckets); the CLI schema/count test,
-  four detector-train CLI tests, and 119 OBB-filtered core tests pass. No
-  compiled-C++ parity is established.
-  Still open: OBB `-map` cadence and broader GPU/optimizer integration, remaining
-  cfg/training option wiring, inference CLI/decode integration, remaining
+  four detector-train CLI tests, and 119 OBB-filtered core tests pass. v161 routes
+  CPU OBB training `-map` through orientation-aware validation and shared cadence;
+  the test verifies `-map_every 2` and the final-iteration evaluation, best weights,
+  and map log. `detector_train_` passed 4 CLI tests, `map_` passed 4 CLI + 11 core
+  tests, and `obb_` passed 119 core + 1 CLI test. CARPN validation remains
+  unsupported; no compiled-C++ parity is established.
+  Still open: broader GPU/optimizer integration and CARPN OBB validation/map,
+  remaining cfg/training option wiring, inference CLI/decode integration, remaining
   metric/loss logging, source-faithful crop/resize and mosaic label transforms,
   alternate NMS-kind implementations, and CARPN network decoding/validation.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and
