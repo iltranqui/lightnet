@@ -34,6 +34,12 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v93: added `select_obb_yolo_cell_truth_match` for validated single-cell
+  selection from precomputed source-style scores. It preserves the first best
+  truth, gates ignore matching on any class output strictly above 0.25, and
+  reports strict `ignore_thresh` and `truth_thresh` outcomes. Focused OBB tests
+  passed 53/53. Raw prediction-match score math, delta/loss generation, trainer
+  integration, and compiled-C++ parity remain open.
 - v92: added `enumerate_obb_yolo_head_positives` with typed best-anchor and
   additional-anchor matches. It preserves truth and global-anchor order, emits
   extra masked anchors only under the source `iou_thresh < 1` and strict score

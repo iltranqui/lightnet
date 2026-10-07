@@ -59,9 +59,10 @@ pub mod obb_labels;
 pub use obb_labels::{ObbLabel, flip_obb_labels, load_obb_labels, rotate_obb_labels};
 pub mod obb_training;
 pub use obb_training::{
-    OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloPositiveAssignment, ObbYoloPositiveKind,
-    ObbYoloTruthBatch, assign_obb_yolo_anchor, encode_obb_yolo_truth_batch,
+    OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloCellTruthMatch, ObbYoloPositiveAssignment,
+    ObbYoloPositiveKind, ObbYoloTruthBatch, assign_obb_yolo_anchor, encode_obb_yolo_truth_batch,
     enumerate_obb_yolo_head_positives, obb_yolo_anchor_match_score,
+    select_obb_yolo_cell_truth_match,
 };
 pub(crate) mod omd_loss;
 pub mod runtime;

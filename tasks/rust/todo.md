@@ -250,10 +250,11 @@ Immediately next, in dependency order:
   an OBB-specific batch loader; v91 adds seven-float truth-row packing in the
   source batch/box-slot layout with absent-front placeholders and zero padding;
   v92 enumerates primary and strict-threshold additional per-head positive
-  anchors. Prediction-conditioned ignore/truth-threshold matching, losses,
-  deltas, trainer integration, crop/resize and mosaic transforms, alternate
-  NMS-kind implementations, training `-map` cadence integration, and CARPN mAP
-  remain open.
+  anchors; v93 selects best-truth and ignore/positive gates from precomputed
+  source-style prediction scores. Raw prediction-score calculation, integrated
+  ignore/truth-threshold matching, losses, deltas, trainer integration,
+  crop/resize and mosaic transforms, alternate NMS-kind implementations,
+  training `-map` cadence integration, and CARPN mAP remain open.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and
   kernels, weights order `weights.cpp:428`); then `deform_conv`, `dsconv`,
   `graph_conv`, `wmhf`, `clifford`, `recursive_block`.

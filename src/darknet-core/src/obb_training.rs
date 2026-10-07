@@ -1,12 +1,14 @@
 //! Source-derived training primitives for legacy front-point OBB YOLO heads.
 //!
 //! This module currently covers direction-free anchor matching, per-truth
-//! head-positive enumeration, cell selection, and source-layout truth-row
-//! packing only. It does not implement complete truth assignment, YOLO loss,
-//! backward propagation, or optimizer integration.
+//! head-positive enumeration, per-cell match selection, cell selection, and
+//! source-layout truth-row packing only. It does not implement complete truth
+//! assignment, YOLO loss, backward propagation, or optimizer integration.
 
 use crate::error::{Error, Result};
 use crate::obb_labels::ObbLabel;
+
+const OBB_YOLO_CLASS_CONFIDENCE_THRESHOLD: f32 = 0.25;
 
 /// A truth's selected global anchor and its location in one OBB YOLO head.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -42,6 +44,22 @@ pub struct ObbYoloPositiveAssignment {
     pub kind: ObbYoloPositiveKind,
     /// Anchor slot and grid cell selected on this head.
     pub assignment: ObbYoloAnchorAssignment,
+}
+
+/// Prediction-match gates for one cell/anchor against its truth candidates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObbYoloCellTruthMatch {
+    /// First truth with the maximum match score, or `None` when no truths exist.
+    pub best_truth_index: Option<usize>,
+    /// Highest source-style prediction match score (zero for no truths).
+    pub best_score: f32,
+    /// Best truth when `best_score > truth_thresh`; strict comparison.
+    pub positive_truth_index: Option<usize>,
+    /// Best score for ignore matching, or zero unless a class output exceeds 0.25.
+    pub ignore_match_score: f32,
+    /// Whether `ignore_match_score > ignore_thresh`; this may coexist with a
+    /// positive match, whose source branch later overrides the ignore delta.
+    pub ignore_match: bool,
 }
 
 /// Number of float values in one source OBB YOLO truth row.
@@ -320,6 +338,63 @@ pub fn enumerate_obb_yolo_head_positives(
     Ok(assignments)
 }
 
+/// Select the source OBB YOLO best-truth, positive, and ignore gates for one cell.
+///
+/// `prediction_match_scores` contains one already-computed, source-clamped
+/// score in `[0,1]` per truth. `class_outputs` contains this cell/anchor's
+/// finite, source-sanitized class-channel outputs;
+/// the source ignore gate is enabled when *any* output is strictly above 0.25,
+/// including in `new_coords` mode where these channels may be logits. The best
+/// truth is chosen independently of class confidence, and strict score
+/// comparisons preserve the first truth on ties. This function selects gates
+/// only; it does not calculate prediction scores or generate training deltas.
+pub fn select_obb_yolo_cell_truth_match(
+    prediction_match_scores: &[f32],
+    class_outputs: &[f32],
+    ignore_thresh: f32,
+    truth_thresh: f32,
+) -> Result<ObbYoloCellTruthMatch> {
+    if class_outputs.is_empty()
+        || !ignore_thresh.is_finite()
+        || !truth_thresh.is_finite()
+        || class_outputs.iter().any(|value| !value.is_finite())
+    {
+        return Err(Error::InvalidConfig(
+            "OBB cell matching requires finite thresholds and class outputs".to_owned(),
+        ));
+    }
+    if prediction_match_scores
+        .iter()
+        .any(|score| !score.is_finite() || !(0.0..=1.0).contains(score))
+    {
+        return Err(Error::InvalidConfig(
+            "OBB prediction match scores must be finite and within [0, 1]".to_owned(),
+        ));
+    }
+
+    let mut best_truth_index = None;
+    let mut best_score = 0.0;
+    for (truth_index, &score) in prediction_match_scores.iter().enumerate() {
+        if best_truth_index.is_none() || score > best_score {
+            best_truth_index = Some(truth_index);
+            best_score = score;
+        }
+    }
+    let positive_truth_index = best_truth_index.filter(|_| best_score > truth_thresh);
+    let class_confident = class_outputs
+        .iter()
+        .any(|&value| value > OBB_YOLO_CLASS_CONFIDENCE_THRESHOLD);
+    let ignore_match_score = if class_confident { best_score } else { 0.0 };
+
+    Ok(ObbYoloCellTruthMatch {
+        best_truth_index,
+        best_score,
+        positive_truth_index,
+        ignore_match_score,
+        ignore_match: ignore_match_score > ignore_thresh,
+    })
+}
+
 fn validate_anchor_assignment_inputs(
     anchors: &[f32],
     mask: &[usize],
@@ -406,9 +481,9 @@ fn validate_truth(truth: &ObbLabel) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloPositiveKind, assign_obb_yolo_anchor,
-        encode_obb_yolo_truth_batch, enumerate_obb_yolo_head_positives,
-        obb_yolo_anchor_match_score,
+        OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloCellTruthMatch, ObbYoloPositiveKind,
+        assign_obb_yolo_anchor, encode_obb_yolo_truth_batch, enumerate_obb_yolo_head_positives,
+        obb_yolo_anchor_match_score, select_obb_yolo_cell_truth_match,
     };
     use crate::obb_labels::ObbLabel;
 
@@ -661,6 +736,65 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn cell_truth_match_uses_first_best_truth_and_any_confident_class_for_ignore() {
+        let scores = [0.2, 0.8, 0.8];
+        let at_class_boundary = select_obb_yolo_cell_truth_match(&scores, &[0.2, 0.25], 0.5, 0.7)
+            .expect("class confidence boundary");
+        assert_eq!(
+            at_class_boundary,
+            ObbYoloCellTruthMatch {
+                best_truth_index: Some(1),
+                best_score: 0.8,
+                positive_truth_index: Some(1),
+                ignore_match_score: 0.0,
+                ignore_match: false,
+            }
+        );
+
+        let confident = select_obb_yolo_cell_truth_match(&scores, &[0.2501], 0.5, 0.7)
+            .expect("confident class output");
+        assert_eq!(confident.best_truth_index, Some(1));
+        assert_eq!(confident.positive_truth_index, Some(1));
+        assert_eq!(confident.ignore_match_score, 0.8);
+        assert!(confident.ignore_match);
+    }
+
+    #[test]
+    fn cell_truth_match_uses_strict_ignore_and_positive_thresholds() {
+        let selected =
+            select_obb_yolo_cell_truth_match(&[0.5], &[0.3], 0.5, 0.5).expect("threshold equality");
+        assert_eq!(selected.best_truth_index, Some(0));
+        assert_eq!(selected.best_score, 0.5);
+        assert_eq!(selected.positive_truth_index, None);
+        assert_eq!(selected.ignore_match_score, 0.5);
+        assert!(!selected.ignore_match);
+    }
+
+    #[test]
+    fn cell_truth_match_handles_empty_truths_without_fabricating_a_positive() {
+        assert_eq!(
+            select_obb_yolo_cell_truth_match(&[], &[0.9], 0.5, -1.0)
+                .expect("empty truth candidates"),
+            ObbYoloCellTruthMatch {
+                best_truth_index: None,
+                best_score: 0.0,
+                positive_truth_index: None,
+                ignore_match_score: 0.0,
+                ignore_match: false,
+            }
+        );
+    }
+
+    #[test]
+    fn cell_truth_match_rejects_non_finite_or_out_of_range_inputs() {
+        assert!(select_obb_yolo_cell_truth_match(&[f32::NAN], &[0.5], 0.5, 0.5).is_err());
+        assert!(select_obb_yolo_cell_truth_match(&[1.1], &[0.5], 0.5, 0.5).is_err());
+        assert!(select_obb_yolo_cell_truth_match(&[0.5], &[], 0.5, 0.5).is_err());
+        assert!(select_obb_yolo_cell_truth_match(&[0.5], &[f32::INFINITY], 0.5, 0.5).is_err());
+        assert!(select_obb_yolo_cell_truth_match(&[0.5], &[0.5], f32::NAN, 0.5).is_err());
     }
 
     #[test]
