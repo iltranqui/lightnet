@@ -2361,6 +2361,33 @@ pub fn apply_obb_yolo_batch_head_positive_box_deltas(
     Ok(positives.len())
 }
 
+fn accumulate_front_point_channel_deltas(
+    head_delta: &mut [f32],
+    base: usize,
+    stride: usize,
+    front_deltas: ObbYoloFrontPointDeltas,
+) -> Result<()> {
+    let updates = [
+        (base + 4 * stride, front_deltas.front_x),
+        (base + 5 * stride, front_deltas.front_y),
+        (base, front_deltas.center_x),
+        (base + stride, front_deltas.center_y),
+    ];
+    let mut results = [0.0; 4];
+    for (index, (delta_index, update)) in updates.into_iter().enumerate() {
+        results[index] = head_delta[delta_index] + update;
+        if !results[index].is_finite() {
+            return Err(Error::InvalidConfig(
+                "OBB front-point writeback produced a non-finite delta".to_owned(),
+            ));
+        }
+    }
+    for ((delta_index, _), value) in updates.into_iter().zip(results) {
+        head_delta[delta_index] = value;
+    }
+    Ok(())
+}
+
 /// Add standalone front-point deltas to best/additional positive anchor slots.
 ///
 /// This writes front channels and, when directional offsets are configured,
@@ -2492,26 +2519,149 @@ pub fn apply_obb_yolo_batch_head_positive_front_point_deltas(
             truth_delta_config,
             center_front_anchor,
         )?;
-        let updates = [
-            (base + 4 * stride, front_deltas.front_x),
-            (base + 5 * stride, front_deltas.front_y),
-            (base, front_deltas.center_x),
-            (base + stride, front_deltas.center_y),
-        ];
-        let mut results = [0.0; 4];
-        for (index, (delta_index, update)) in updates.into_iter().enumerate() {
-            results[index] = head_delta[delta_index] + update;
-            if !results[index].is_finite() {
-                return Err(Error::InvalidConfig(
-                    "OBB front-point writeback produced a non-finite delta".to_owned(),
-                ));
-            }
-        }
-        for ((delta_index, _), value) in updates.into_iter().zip(results) {
-            head_delta[delta_index] = value;
-        }
+        accumulate_front_point_channel_deltas(head_delta, base, stride, front_deltas)?;
     }
     Ok(positives.len())
+}
+
+/// Add source front-point deltas for every truth-threshold-positive head cell.
+///
+/// The all-cell objectness and truth-threshold class/box passes remain separate;
+/// this function only adds entries 0/1 when center-front priors are configured
+/// and entries 4/5 for explicit-front truths.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_obb_yolo_batch_head_truth_threshold_front_point_deltas(
+    batch_truths: &[Vec<ObbLabel>],
+    head_output: &[f32],
+    head_delta: &mut [f32],
+    match_config: &ObbYoloHeadMatchConfig,
+    assignment: &ObbYoloPositiveObjectnessConfig,
+    delta_config: ObbYoloFrontPointDeltaConfig,
+) -> Result<usize> {
+    if match_config.anchors != assignment.anchors
+        || match_config.mask != assignment.head.mask
+        || match_config.grid_width != assignment.head.grid_width
+        || match_config.grid_height != assignment.head.grid_height
+        || match_config.classes != assignment.classes
+        || match_config.net_width != assignment.net_width
+        || match_config.net_height != assignment.net_height
+        || match_config.front_anchor_offsets != assignment.front_anchor_offsets
+        || !delta_config.normalizer.is_finite()
+        || !delta_config.max_delta.is_finite()
+        || delta_config.max_delta < 0.0
+        || head_delta.len() != head_output.len()
+        || head_delta.iter().any(|value| !value.is_finite())
+        || assignment.class_map.as_ref().is_some_and(|mapping| {
+            mapping.len() != assignment.classes
+                || mapping
+                    .iter()
+                    .any(|&class_id| class_id >= assignment.classes)
+        })
+        || assignment
+            .class_multipliers
+            .as_ref()
+            .is_some_and(|multipliers| {
+                multipliers.len() != assignment.classes
+                    || multipliers.iter().any(|value| {
+                        !value.is_finite() || !(delta_config.normalizer * value).is_finite()
+                    })
+            })
+    {
+        return Err(Error::InvalidConfig(
+            "OBB truth-threshold front-point configs or tensor values are invalid".to_owned(),
+        ));
+    }
+    validate_anchor_front_offsets(
+        match_config.front_anchor_offsets.as_deref(),
+        match_config.anchors.len() / 2,
+    )?;
+    let stride = match_config
+        .grid_width
+        .checked_mul(match_config.grid_height)
+        .ok_or_else(|| Error::InvalidConfig("OBB head grid size overflows".to_owned()))?;
+    let entries = match_config
+        .classes
+        .checked_add(7)
+        .ok_or_else(|| Error::InvalidConfig("OBB head entry count overflows".to_owned()))?;
+    let per_batch = match_config
+        .mask
+        .len()
+        .checked_mul(entries)
+        .and_then(|count| count.checked_mul(stride))
+        .ok_or_else(|| Error::InvalidConfig("OBB head tensor size overflows".to_owned()))?;
+    let expected = batch_truths
+        .len()
+        .checked_mul(per_batch)
+        .ok_or_else(|| Error::InvalidConfig("OBB batch tensor size overflows".to_owned()))?;
+    if head_output.len() != expected {
+        return Err(Error::InvalidConfig(format!(
+            "OBB truth-threshold front-point tensor length mismatch: expected {expected}, output {}, delta {}",
+            head_output.len(),
+            head_delta.len()
+        )));
+    }
+
+    let center_front_anchor = match_config.front_anchor_offsets.is_some();
+    let mut positive_count = 0usize;
+    visit_obb_yolo_batch_head_matches(batch_truths, head_output, match_config, |matched| {
+        let Some(truth_index) = matched.truth_match.positive_truth_index else {
+            return Ok(());
+        };
+        let anchor_offset = matched
+            .anchor_index
+            .checked_mul(2)
+            .ok_or_else(|| Error::InvalidConfig("OBB anchor index overflows".to_owned()))?;
+        if anchor_offset + 1 >= match_config.anchors.len() {
+            return Err(Error::InvalidConfig(
+                "OBB truth-threshold match references an invalid anchor".to_owned(),
+            ));
+        }
+        let cell = matched.cell_y * match_config.grid_width + matched.cell_x;
+        let base =
+            matched.batch_index * per_batch + matched.head_anchor_index * entries * stride + cell;
+        let prediction =
+            std::array::from_fn(|channel| finite_or_zero(head_output[base + channel * stride]));
+        let context = ObbYoloPredictionMatchContext {
+            anchor_width: match_config.anchors[anchor_offset],
+            anchor_height: match_config.anchors[anchor_offset + 1],
+            cell_x: matched.cell_x,
+            cell_y: matched.cell_y,
+            grid_width: match_config.grid_width,
+            grid_height: match_config.grid_height,
+            net_width: match_config.net_width,
+            net_height: match_config.net_height,
+            new_coords: match_config.new_coords,
+        };
+        let truth = &batch_truths[matched.batch_index][truth_index];
+        let class_id = assignment
+            .class_map
+            .as_ref()
+            .map_or(truth.class_id, |mapping| mapping[truth.class_id]);
+        let class_multiplier = assignment
+            .class_multipliers
+            .as_ref()
+            .map_or(1.0, |multipliers| multipliers[class_id]);
+        let mut truth_delta_config = delta_config;
+        truth_delta_config.normalizer *= class_multiplier;
+        if !truth_delta_config.normalizer.is_finite() {
+            return Err(Error::InvalidConfig(
+                "OBB front-point class-scaled normalizer is non-finite".to_owned(),
+            ));
+        }
+        let front_deltas = obb_yolo_front_point_regression_deltas(
+            prediction,
+            truth,
+            context,
+            truth_delta_config,
+            center_front_anchor,
+        )?;
+        accumulate_front_point_channel_deltas(head_delta, base, stride, front_deltas)?;
+        positive_count = positive_count
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidConfig("OBB front-positive count overflows".to_owned()))?;
+        Ok(())
+    })?;
+    Ok(positive_count)
 }
 
 /// Dispatch source-ordered training deltas for one complete OBB YOLO head.
@@ -2806,6 +2956,7 @@ mod tests {
         apply_obb_yolo_batch_head_positive_objectness_deltas,
         apply_obb_yolo_batch_head_training_deltas,
         apply_obb_yolo_batch_head_truth_threshold_deltas,
+        apply_obb_yolo_batch_head_truth_threshold_front_point_deltas,
         apply_obb_yolo_batch_multi_head_training_deltas, assign_obb_yolo_anchor,
         decode_obb_yolo_front_point, decode_obb_yolo_prediction, encode_obb_yolo_truth_batch,
         enumerate_obb_yolo_batch_positives, enumerate_obb_yolo_head_positives,
@@ -3445,6 +3596,100 @@ mod tests {
                 * 2.5)
                 .clamp(-1.0, 1.0);
         assert!((new_coords_actual[0] - expected_x).abs() < 1e-6);
+    }
+
+    #[test]
+    fn truth_threshold_front_point_writeback_updates_only_front_and_center_channels() {
+        let mut label = truth(0.5, 0.5, 0.2, 0.1);
+        label.front_x = 0.66;
+        label.front_y = 0.57;
+        label.has_front = true;
+        let labels = [vec![label]];
+        let anchors = vec![20.0, 10.0];
+        let matching = ObbYoloHeadMatchConfig {
+            head_index: 0,
+            anchors: anchors.clone(),
+            mask: vec![0],
+            grid_width: 1,
+            grid_height: 1,
+            classes: 1,
+            net_width: 100,
+            net_height: 100,
+            new_coords: false,
+            front_anchor_offsets: Some(vec![[0.4, -0.2]]),
+            score_config: ObbYoloMatchScoreConfig::default(),
+            ignore_thresh: 0.5,
+            truth_thresh: 0.0,
+            objectness_normalizer: 1.0,
+            objectness_smooth: false,
+        };
+        let assignment = ObbYoloPositiveObjectnessConfig {
+            head: ObbYoloHeadAssignmentSpec {
+                mask: vec![0],
+                grid_width: 1,
+                grid_height: 1,
+            },
+            anchors,
+            classes: 1,
+            net_width: 100,
+            net_height: 100,
+            front_anchor_offsets: matching.front_anchor_offsets.clone(),
+            iou_thresh: 0.1,
+            objectness_normalizer: 1.0,
+            objectness_smooth: false,
+            class_map: None,
+            class_multipliers: Some(vec![1.5]),
+        };
+        let output = [0.5, 0.5, 0.0, 0.0, 0.68, 0.55, 0.4, 0.3];
+        let initial = [0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8];
+        let mut deltas = initial;
+        let front_config = ObbYoloFrontPointDeltaConfig {
+            normalizer: 1.2,
+            max_delta: 0.5,
+            ..ObbYoloFrontPointDeltaConfig::default()
+        };
+        let context = ObbYoloPredictionMatchContext {
+            anchor_width: 20.0,
+            anchor_height: 10.0,
+            cell_x: 0,
+            cell_y: 0,
+            grid_width: 1,
+            grid_height: 1,
+            net_width: 100,
+            net_height: 100,
+            new_coords: false,
+        };
+        let expected = obb_yolo_front_point_regression_deltas(
+            output[..6].try_into().unwrap(),
+            &labels[0][0],
+            context,
+            ObbYoloFrontPointDeltaConfig {
+                normalizer: front_config.normalizer * 1.5,
+                ..front_config
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            apply_obb_yolo_batch_head_truth_threshold_front_point_deltas(
+                &labels,
+                &output,
+                &mut deltas,
+                &matching,
+                &assignment,
+                front_config,
+            )
+            .unwrap(),
+            1
+        );
+        assert!((deltas[0] - (initial[0] + expected.center_x)).abs() < 1e-6);
+        assert!((deltas[1] - (initial[1] + expected.center_y)).abs() < 1e-6);
+        assert_eq!(deltas[2], initial[2]);
+        assert_eq!(deltas[3], initial[3]);
+        assert!((deltas[4] - (initial[4] + expected.front_x)).abs() < 1e-6);
+        assert!((deltas[5] - (initial[5] + expected.front_y)).abs() < 1e-6);
+        assert_eq!(deltas[6], initial[6]);
+        assert_eq!(deltas[7], initial[7]);
     }
 
     #[test]

@@ -288,8 +288,9 @@ Immediately next, in dependency order:
   multi-head class and positive-assignment metrics; v128 reports source total-bbox
   counts across threshold and anchor assignments; v129 adds a standalone source
   front-point delta primitive; v130 writes those deltas to best/additional positive
-  anchor channels. Still open: cfg ingestion and inference/network decode,
-  truth-threshold front writeback, multi-head
+  anchor channels; v131 writes them to truth-threshold-positive cells. Still open:
+  cfg ingestion and inference/network decode, composed front-point training passes,
+  multi-head
   network-loop/backprop integration, truth-threshold metric/loss aggregation,
   integrated losses and training-loop wiring, crop/resize and mosaic transforms,
   alternate NMS-kind implementations, training `-map` cadence, and CARPN network
