@@ -896,6 +896,8 @@ pub struct ObbYoloSpec {
     pub cobb_r_weight: f32,
     pub cobb_s_weight: f32,
     pub cobb_iou_lambda: f32,
+    /// Whether `iou_loss` selects source CIoU-OBB match scoring.
+    pub ciou_obb_loss: bool,
     pub nms_kind: ObbNmsKind,
 }
 
@@ -2262,6 +2264,7 @@ fn parse_layer_kind(
             let front_point_normalizer = section.get_f32("front_point_normalizer", 0.35)?;
             let front_loss_normalizer =
                 section.get_f32("front_loss_normalizer", front_point_normalizer)?;
+            let ciou_obb_loss = parse_obb_ciou_loss(section)?;
             let nms_kind = ObbNmsKind::parse(&section.get_str("nms_kind", "obb"), line)?;
             if !scale_x_y.is_finite() {
                 return Err(Error::InvalidConfig(format!(
@@ -2279,6 +2282,7 @@ fn parse_layer_kind(
                 cobb_r_weight: section.get_f32("cobb_r_weight", 1.0)?,
                 cobb_s_weight: section.get_f32("cobb_s_weight", 1.0)?,
                 cobb_iou_lambda: section.get_f32("cobb_iou_lambda", 2.0)?,
+                ciou_obb_loss,
                 yolo: YoloSpec {
                     classes,
                     num: total,
@@ -3550,6 +3554,17 @@ fn resolve_relative_layer(layer_index: usize, raw_index: isize) -> Result<usize>
     Ok(absolute)
 }
 
+fn parse_obb_ciou_loss(section: &RawSection) -> Result<bool> {
+    let loss = section.get_str("iou_loss", "ciou_obb");
+    match loss.trim().to_ascii_lowercase().as_str() {
+        "ciou_obb" | "ciou_obb_mul" => Ok(true),
+        _ => {
+            YoloIouLoss::parse(&loss)?;
+            Ok(false)
+        }
+    }
+}
+
 fn parse_class_multipliers(
     section: &RawSection,
     classes: usize,
@@ -4489,7 +4504,7 @@ mod tests {
     #[test]
     fn obb_yolo_routes_covariance_cobb_and_viou_options() {
         let network = build(
-            "[net]\nwidth=1\nheight=1\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\ncovariance_normalizer=1.3\ncobb_normalizer=0.4\nobb_length_ratio_k=1.4\nobb_viou_weight=1.5\ncobb_box_weight=1.2\ncobb_r_weight=0.8\ncobb_s_weight=1.4\ncobb_iou_lambda=2.2\n",
+            "[net]\nwidth=1\nheight=1\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\niou_loss=mse\ncovariance_normalizer=1.3\ncobb_normalizer=0.4\nobb_length_ratio_k=1.4\nobb_viou_weight=1.5\ncobb_box_weight=1.2\ncobb_r_weight=0.8\ncobb_s_weight=1.4\ncobb_iou_lambda=2.2\n",
         )
         .expect("OBB score options parse");
         let LayerKind::ObbYolo(spec) = &network.layers[0].kind else {
@@ -4506,6 +4521,7 @@ mod tests {
             training.match_config.score_config.covariance_normalizer,
             1.3
         );
+        assert!(!training.match_config.score_config.ciou_obb);
         assert_eq!(training.match_config.score_config.cobb_normalizer, 0.4);
         assert_eq!(
             training
@@ -4524,6 +4540,27 @@ mod tests {
                 iou_lambda: 2.2,
             }
         );
+    }
+
+    #[test]
+    fn obb_yolo_defaults_to_ciou_obb_match_scoring() {
+        let network = build(
+            "[net]\nwidth=1\nheight=1\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\n",
+        )
+        .expect("default OBB loss parses");
+        let LayerKind::ObbYolo(spec) = &network.layers[0].kind else {
+            panic!("expected OBB YOLO layer");
+        };
+        assert!(spec.ciou_obb_loss);
+        let training =
+            crate::obb_training::build_obb_yolo_training_head_config(spec, 0, 1, 1, 1, 1)
+                .expect("default OBB score config builds");
+        assert!(training.match_config.score_config.ciou_obb);
+
+        let invalid = build(
+            "[net]\nwidth=1\nheight=1\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\niou_loss=unsupported\n",
+        );
+        assert!(invalid.is_err(), "unsupported OBB iou_loss must fail");
     }
 
     #[test]

@@ -139,7 +139,11 @@ pub fn build_obb_yolo_training_head_config(
     }
     validate_anchor_front_offsets(spec.front_anchor_offsets.as_deref(), spec.num)?;
     let anchors = spec.anchors[..anchor_count].to_vec();
+    let weighted_score_branch = (spec.covariance_normalizer.is_finite()
+        && spec.covariance_normalizer > 0.0)
+        || (spec.cobb_normalizer.is_finite() && spec.cobb_normalizer > 0.0);
     let score_config = ObbYoloMatchScoreConfig {
+        ciou_obb: spec.ciou_obb_loss || !weighted_score_branch,
         covariance_normalizer: spec.covariance_normalizer,
         cobb_normalizer: spec.cobb_normalizer,
         covariance_front_length_ratio_k: spec.obb_length_ratio_k,
@@ -332,9 +336,10 @@ pub struct ObbYoloPredictionMatchContext {
     pub new_coords: bool,
 }
 
-/// The active score branch selected by source OBB loss-normalizer priority.
+/// The active score branch selected by source OBB loss/normalizer dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObbYoloMatchScoreBranch {
+    CiouObb,
     Covariance,
     Cobb,
     LegacyAngular,
@@ -343,6 +348,8 @@ pub enum ObbYoloMatchScoreBranch {
 /// Branch settings for source one-cell OBB matching-score dispatch.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ObbYoloMatchScoreConfig {
+    /// Source `CIOU_OBB`/`CIOU_OBB_MUL` match path.
+    pub ciou_obb: bool,
     pub covariance_normalizer: f32,
     pub cobb_normalizer: f32,
     pub covariance_front_length_ratio_k: f32,
@@ -354,6 +361,7 @@ pub struct ObbYoloMatchScoreConfig {
 impl Default for ObbYoloMatchScoreConfig {
     fn default() -> Self {
         Self {
+            ciou_obb: false,
             covariance_normalizer: 0.0,
             cobb_normalizer: 0.0,
             covariance_front_length_ratio_k: 1.0,
@@ -1036,16 +1044,34 @@ pub fn obb_yolo_cobb_prediction_match_score_with_viou(
 /// Select and compute the source covariance/COBB/legacy-angular score for one
 /// decoded OBB YOLO cell.
 ///
-/// Covariance has priority when its normalizer is finite and positive. COBB is
-/// next when its normalizer is finite and positive; otherwise the legacy angular
-/// fallback is selected. This composes per-cell score branches only; it does
-/// not perform multi-truth assignment, batch aggregation, or `ciou_obb` scoring.
+/// Source CIoU-OBB mode takes priority; otherwise covariance and COBB normalizers
+/// select their score branches before the legacy angular fallback. This composes
+/// per-cell score branches only; it does not perform multi-truth assignment or
+/// batch aggregation.
 pub fn obb_yolo_match_score(
     prediction: [f32; 6],
     truth: &ObbLabel,
     context: ObbYoloPredictionMatchContext,
     config: ObbYoloMatchScoreConfig,
 ) -> Result<ObbYoloMatchScore> {
+    if config.ciou_obb {
+        return Ok(ObbYoloMatchScore {
+            branch: ObbYoloMatchScoreBranch::CiouObb,
+            score: obb_yolo_ciou_prediction_match_score(
+                prediction,
+                truth,
+                context.anchor_width,
+                context.anchor_height,
+                context.cell_x,
+                context.cell_y,
+                context.grid_width,
+                context.grid_height,
+                context.net_width,
+                context.net_height,
+                context.new_coords,
+            )?,
+        });
+    }
     let covariance_active =
         config.covariance_normalizer.is_finite() && config.covariance_normalizer > 0.0;
     if covariance_active {
@@ -1171,8 +1197,8 @@ pub fn obb_yolo_ciou_prediction_match_score(
 
 /// Compute source finite-difference box-channel deltas for one OBB positive.
 ///
-/// This covers the source covariance analytic-gradient branch and the COBB or
-/// legacy-angular finite-difference branch, including normalizer scaling,
+/// This covers the source covariance analytic-gradient branch and finite-
+/// difference CIoU-OBB, COBB, or legacy-angular branches, including scaling,
 /// sigmoid-chain factors, accumulation, and clipping. Front-channel gradients
 /// are intentionally separate. Direct front-channel decoding is used, without
 /// source `center_front_anchor` correction. Inputs use the same post-YOLO
@@ -5488,6 +5514,32 @@ mod tests {
         label.front_y = 4.5;
         label.has_front = true;
         let prediction = [0.5, 0.5, 0.0, 0.0, 4.5, 0.5];
+
+        let ciou_config = ObbYoloMatchScoreConfig {
+            ciou_obb: true,
+            covariance_normalizer: 1.0,
+            cobb_normalizer: 1.0,
+            ..ObbYoloMatchScoreConfig::default()
+        };
+        let ciou = obb_yolo_match_score(prediction, &label, context, ciou_config).unwrap();
+        assert_eq!(ciou.branch, ObbYoloMatchScoreBranch::CiouObb);
+        assert_eq!(
+            ciou.score,
+            obb_yolo_ciou_prediction_match_score(
+                prediction,
+                &label,
+                context.anchor_width,
+                context.anchor_height,
+                context.cell_x,
+                context.cell_y,
+                context.grid_width,
+                context.grid_height,
+                context.net_width,
+                context.net_height,
+                context.new_coords,
+            )
+            .unwrap()
+        );
 
         let covariance_config = ObbYoloMatchScoreConfig {
             covariance_normalizer: 1.0,
