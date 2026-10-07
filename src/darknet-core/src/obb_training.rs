@@ -303,8 +303,12 @@ pub struct ObbYoloHeadTrainingDeltaStats {
     pub truth_threshold_positive_cells: usize,
     /// `avg_cat` sum/count from best/additional anchor class assignments.
     pub anchor_class_stats: ObbYoloClassDeltaStats,
-    /// Best/additional positive assignments that received box deltas.
+    /// Best/additional assignments with box deltas; this is the source IoU denominator.
     pub anchor_box_positive_count: usize,
+    /// Sum of `1 - result.box_ious.iou` over best/additional assignments.
+    pub iou_loss_sum: f64,
+    /// Sum of `1 - result.box_ious.giou` over best/additional assignments.
+    pub giou_loss_sum: f64,
     /// Source `net.total_bbox`: threshold cells plus best/additional assignments.
     pub total_bbox_count: usize,
     /// Weighted `front_point_loss` sum/count for explicit front truths.
@@ -322,6 +326,10 @@ pub struct ObbYoloBatchTrainingDeltaStats {
     pub truth_threshold_positive_cells: usize,
     /// Best/additional positive box assignments across heads.
     pub anchor_box_positive_count: usize,
+    /// Sum of source `1 - box_ious.iou` over best/additional assignments.
+    pub iou_loss_sum: f64,
+    /// Sum of source `1 - box_ious.giou` over best/additional assignments.
+    pub giou_loss_sum: f64,
     /// Source `net.total_bbox` aggregated across all heads.
     pub total_bbox_count: usize,
     /// Weighted `front_point_loss` aggregated across explicit front truths.
@@ -2476,6 +2484,32 @@ pub fn apply_obb_yolo_batch_head_positive_box_deltas(
     new_coords: bool,
     delta_config: ObbYoloBoxDeltaConfig,
 ) -> Result<usize> {
+    apply_obb_yolo_batch_head_positive_box_deltas_with_metrics(
+        batch_truths,
+        head_output,
+        head_delta,
+        assignment,
+        new_coords,
+        delta_config,
+    )
+    .map(|metrics| metrics.positive_count)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ObbYoloPositiveBoxDeltaMetrics {
+    positive_count: usize,
+    iou_loss_sum: f64,
+    giou_loss_sum: f64,
+}
+
+fn apply_obb_yolo_batch_head_positive_box_deltas_with_metrics(
+    batch_truths: &[Vec<ObbLabel>],
+    head_output: &[f32],
+    head_delta: &mut [f32],
+    assignment: &ObbYoloPositiveObjectnessConfig,
+    new_coords: bool,
+    delta_config: ObbYoloBoxDeltaConfig,
+) -> Result<ObbYoloPositiveBoxDeltaMetrics> {
     if !delta_config.iou_normalizer.is_finite()
         || !delta_config.max_delta.is_finite()
         || delta_config.max_delta < 0.0
@@ -2542,6 +2576,10 @@ pub fn apply_obb_yolo_batch_head_positive_box_deltas(
         assignment.net_height,
         assignment.iou_thresh,
     )?;
+    let mut metrics = ObbYoloPositiveBoxDeltaMetrics {
+        positive_count: positives.len(),
+        ..ObbYoloPositiveBoxDeltaMetrics::default()
+    };
     for tagged in &positives {
         let anchor_index = tagged.positive.assignment.anchor_index;
         let anchor_offset = anchor_index
@@ -2571,6 +2609,33 @@ pub fn apply_obb_yolo_batch_head_positive_box_deltas(
             new_coords,
         };
         let truth = &batch_truths[tagged.batch_index][tagged.positive.truth_index];
+        let front_anchor_offset = assignment
+            .front_anchor_offsets
+            .as_ref()
+            .map(|offsets| offsets[anchor_index]);
+        let score = obb_yolo_match_score_with_front_anchor_offset(
+            prediction,
+            truth,
+            context,
+            delta_config.score,
+            front_anchor_offset,
+        )?
+        .score;
+        if !score.is_finite() {
+            return Err(Error::InvalidConfig(
+                "OBB positive box score is non-finite".to_owned(),
+            ));
+        }
+        // Source CIoU and independent OBB branches return this score in both
+        // `box_ious.iou` and `box_ious.giou`.
+        let source_iou_loss = f64::from(1.0 - score);
+        metrics.iou_loss_sum += source_iou_loss;
+        metrics.giou_loss_sum += source_iou_loss;
+        if !metrics.iou_loss_sum.is_finite() || !metrics.giou_loss_sum.is_finite() {
+            return Err(Error::InvalidConfig(
+                "OBB positive box loss sum is non-finite".to_owned(),
+            ));
+        }
         let class_id = assignment
             .class_map
             .as_ref()
@@ -2587,16 +2652,13 @@ pub fn apply_obb_yolo_batch_head_positive_box_deltas(
             truth,
             context,
             truth_delta_config,
-            assignment
-                .front_anchor_offsets
-                .as_ref()
-                .map(|offsets| offsets[anchor_index]),
+            front_anchor_offset,
         )?;
         for (channel, delta) in deltas.into_iter().enumerate() {
             head_delta[base + channel * stride] = delta;
         }
     }
-    Ok(positives.len())
+    Ok(metrics)
 }
 
 fn accumulate_front_point_metrics(
@@ -3110,7 +3172,7 @@ fn apply_obb_yolo_batch_head_training_deltas_internal(
         label_smooth_eps,
         cls_normalizer,
     )?;
-    let anchor_box_positive_count = apply_obb_yolo_batch_head_positive_box_deltas(
+    let anchor_box_metrics = apply_obb_yolo_batch_head_positive_box_deltas_with_metrics(
         batch_truths,
         head_output,
         head_delta,
@@ -3118,6 +3180,7 @@ fn apply_obb_yolo_batch_head_training_deltas_internal(
         match_config.new_coords,
         box_delta_config,
     )?;
+    let anchor_box_positive_count = anchor_box_metrics.positive_count;
     if let Some(front_delta_config) = front_point_delta_config {
         let anchor_front_metrics = apply_obb_yolo_batch_head_positive_front_point_deltas(
             batch_truths,
@@ -3137,6 +3200,8 @@ fn apply_obb_yolo_batch_head_training_deltas_internal(
         truth_threshold_positive_cells,
         anchor_class_stats,
         anchor_box_positive_count,
+        iou_loss_sum: anchor_box_metrics.iou_loss_sum,
+        giou_loss_sum: anchor_box_metrics.giou_loss_sum,
         total_bbox_count,
         front_point_loss,
     })
@@ -3291,6 +3356,13 @@ fn apply_obb_yolo_batch_multi_head_training_deltas_internal(
             .anchor_box_positive_count
             .checked_add(head_stats.anchor_box_positive_count)
             .ok_or_else(|| Error::InvalidConfig("OBB box-positive count overflows".to_owned()))?;
+        totals.iou_loss_sum += head_stats.iou_loss_sum;
+        totals.giou_loss_sum += head_stats.giou_loss_sum;
+        if !totals.iou_loss_sum.is_finite() || !totals.giou_loss_sum.is_finite() {
+            return Err(Error::InvalidConfig(
+                "OBB aggregate box loss sum is non-finite".to_owned(),
+            ));
+        }
         totals.total_bbox_count = totals
             .total_bbox_count
             .checked_add(head_stats.total_bbox_count)

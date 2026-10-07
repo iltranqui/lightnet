@@ -315,14 +315,12 @@ Immediately next, in dependency order:
   configured weights; v155 reports source raw `sum(delta²)` for all-MSE OBB heads;
   v156 reports the objectness-normalized non-box delta-squared component; v157
   allows distinct weighted MSE matching and CIoU-OBB regression configs through
-  batch dispatch.
-  Still open: non-MSE IoU loss scalar,
-  CLI/schedule and
-  non-SGD optimizer/training-loop integration, remaining cfg/training
-  option wiring,
-  inference/network decode integration, remaining metric/loss aggregation and
-  integrated loss/training-loop
-  wiring, crop/resize and mosaic transforms,
+  batch dispatch; v158 aggregates source-style MSE and supported non-MSE loss
+  costs across heads, with non-MSE box losses counted only for best/additional
+  anchor assignments.
+  Still open: CLI/schedule and non-SGD training-loop integration, remaining
+  cfg/training option wiring, inference/network decode integration, broader
+  metric/loss logging aggregation, crop/resize and mosaic transforms,
   alternate NMS-kind implementations, training `-map` cadence, and CARPN network
   decoding/validation integration remain open.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and

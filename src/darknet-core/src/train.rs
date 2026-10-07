@@ -283,6 +283,9 @@ pub struct ObbYoloTrainingDeltaBatch {
     /// Source `obj_normalizer * sum(delta²)` outside the six OBB box channels,
     /// aggregated across heads. This is the classification/objectness component.
     pub classification_loss_component: f32,
+    /// Aggregate source cost: raw `sum(delta²)` for MSE heads, otherwise each
+    /// head's normalized average OBB score loss plus its classification component.
+    pub source_loss_cost: f32,
 }
 
 /// OBB output deltas and their propagated network parameter/input gradients.
@@ -295,9 +298,8 @@ pub struct ObbYoloTrainingBackward {
 /// Build OBB YOLO output-gradient seeds from parsed heads and a forward pass.
 ///
 /// This wires the source-ordered delta helpers to real network head tensors.
-/// It reports source classification/objectness loss for all modes and raw
-/// `sum(delta²)` when all heads use MSE; other modes still lack a complete loss
-/// scalar, and this function does not run backward/update.
+/// It reports the source-style loss cost and classification/objectness
+/// component across heads; this function does not run backward/update.
 pub fn compute_obb_yolo_training_deltas(
     network: &Network,
     forward: &ForwardResult,
@@ -408,8 +410,14 @@ pub fn compute_obb_yolo_training_deltas(
         &box_delta_configs,
         &front_point_delta_configs,
     )?;
+    if stats.per_head.len() != forward.yolo_heads.len() {
+        return Err(Error::InvalidConfig(
+            "OBB loss statistics do not match the forward heads".to_owned(),
+        ));
+    }
     let mut classification_loss_component = 0.0f64;
-    for (head, deltas) in forward.yolo_heads.iter().zip(&head_deltas) {
+    let mut source_loss_cost = 0.0f64;
+    for (head_index, (head, deltas)) in forward.yolo_heads.iter().zip(&head_deltas).enumerate() {
         let LayerKind::ObbYolo(spec) = &network.layers[head.layer_index].kind else {
             unreachable!("forward head kind was checked above")
         };
@@ -437,34 +445,56 @@ pub fn compute_obb_yolo_training_deltas(
                 "OBB loss tensor shape does not match its head configuration".to_owned(),
             ));
         }
-        if !spec.obj_normalizer.is_finite() {
+        if !spec.obj_normalizer.is_finite() || !spec.iou_normalizer.is_finite() {
             return Err(Error::InvalidConfig(
-                "OBB classification loss normalizer is non-finite".to_owned(),
+                "OBB loss normalizer is non-finite".to_owned(),
             ));
         }
         let first_non_box_channel = 6usize.checked_mul(mask_count).ok_or_else(|| {
             Error::InvalidConfig("OBB box channel count overflows usize".to_owned())
         })?;
         let mut non_box_delta_squared = 0.0f64;
+        let mut all_delta_squared = 0.0f64;
         for batch_index in 0..batch_size {
             let batch_base = batch_index * per_batch;
-            for channel in first_non_box_channel..channel_count {
+            for channel in 0..channel_count {
                 let channel_base = batch_base + channel * spatial;
                 for &delta in &deltas[channel_base..channel_base + spatial] {
                     let delta = delta as f64;
-                    non_box_delta_squared += delta * delta;
-                    if !non_box_delta_squared.is_finite() {
+                    all_delta_squared += delta * delta;
+                    if channel >= first_non_box_channel {
+                        non_box_delta_squared += delta * delta;
+                    }
+                    if !all_delta_squared.is_finite() || !non_box_delta_squared.is_finite() {
                         return Err(Error::InvalidConfig(
-                            "OBB classification delta-squared sum became non-finite".to_owned(),
+                            "OBB delta-squared loss sum became non-finite".to_owned(),
                         ));
                     }
                 }
             }
         }
-        classification_loss_component += spec.obj_normalizer as f64 * non_box_delta_squared;
-        if !classification_loss_component.is_finite() {
+        let head_classification_loss = spec.obj_normalizer as f64 * non_box_delta_squared;
+        classification_loss_component += head_classification_loss;
+        if spec.iou_loss == YoloIouLoss::Mse {
+            source_loss_cost += all_delta_squared;
+        } else {
+            let head_stats = &stats.per_head[head_index];
+            let score_loss_sum = if spec.iou_loss == YoloIouLoss::Giou {
+                head_stats.giou_loss_sum
+            } else {
+                head_stats.iou_loss_sum
+            };
+            let average_iou_loss = if head_stats.anchor_box_positive_count == 0 {
+                0.0
+            } else {
+                spec.iou_normalizer as f64 * score_loss_sum
+                    / head_stats.anchor_box_positive_count as f64
+            };
+            source_loss_cost += head_classification_loss + average_iou_loss;
+        }
+        if !classification_loss_component.is_finite() || !source_loss_cost.is_finite() {
             return Err(Error::InvalidConfig(
-                "OBB classification loss component became non-finite".to_owned(),
+                "OBB source loss cost became non-finite".to_owned(),
             ));
         }
     }
@@ -473,26 +503,12 @@ pub fn compute_obb_yolo_training_deltas(
             "OBB classification loss component exceeds f32 range".to_owned(),
         ));
     }
-    let mse_delta_squared_cost = if all_heads_use_mse {
-        let mut squared_cost = 0.0f64;
-        for delta in head_deltas.iter().flatten() {
-            let delta = *delta as f64;
-            squared_cost += delta * delta;
-            if !squared_cost.is_finite() {
-                return Err(Error::InvalidConfig(
-                    "OBB MSE delta-squared cost became non-finite".to_owned(),
-                ));
-            }
-        }
-        if squared_cost > f32::MAX as f64 {
-            return Err(Error::InvalidConfig(
-                "OBB MSE delta-squared cost exceeds f32 range".to_owned(),
-            ));
-        }
-        Some(squared_cost as f32)
-    } else {
-        None
-    };
+    if source_loss_cost.abs() > f32::MAX as f64 {
+        return Err(Error::InvalidConfig(
+            "OBB source loss cost exceeds f32 range".to_owned(),
+        ));
+    }
+    let mse_delta_squared_cost = all_heads_use_mse.then_some(source_loss_cost as f32);
     let mut layer_output_gradient_seeds = vec![None; network.layers.len()];
     for (head, deltas) in forward.yolo_heads.iter().zip(head_deltas) {
         layer_output_gradient_seeds[head.layer_index] =
@@ -503,13 +519,14 @@ pub fn compute_obb_yolo_training_deltas(
         stats,
         mse_delta_squared_cost,
         classification_loss_component: classification_loss_component as f32,
+        source_loss_cost: source_loss_cost as f32,
     })
 }
 
 /// Backpropagate OBB YOLO output deltas through an executable network.
 ///
-/// This stops before optimizer updates and does not define the complete OBB loss
-/// scalar; it connects the implemented head deltas to runtime backpropagation.
+/// This stops before optimizer updates; it connects source-cost-bearing head
+/// deltas to runtime backpropagation.
 pub fn backward_obb_yolo_training(
     executable: &ExecutableNetwork,
     input: &Tensor,
@@ -527,9 +544,8 @@ pub fn backward_obb_yolo_training(
 
 /// Run one SGD update for an OBB batch when `subdivisions=1`.
 ///
-/// The returned delta batch includes the source classification/objectness loss
-/// component and, when all OBB heads use MSE, source `sum(delta²)`. Complete
-/// non-MSE loss integration and iteration scheduling remain with callers. This
+/// The returned delta batch includes source-style `loss_cost` and the
+/// classification/objectness component. Iteration scheduling remains with callers. This
 /// helper rejects Adam and multi-subdivision networks rather than silently
 /// applying the wrong optimizer or update cadence.
 pub fn train_obb_yolo_batch_step(
@@ -610,6 +626,17 @@ fn checked_add_obb_training_sum(target: &mut f32, value: f32, field: &str) -> Re
     Ok(())
 }
 
+fn checked_add_obb_training_sum_f64(target: &mut f64, value: f64, field: &str) -> Result<()> {
+    let sum = *target + value;
+    if !sum.is_finite() {
+        return Err(Error::InvalidConfig(format!(
+            "OBB training {field} sum became non-finite"
+        )));
+    }
+    *target = sum;
+    Ok(())
+}
+
 fn merge_obb_training_stats(
     total: &mut ObbYoloBatchTrainingDeltaStats,
     next: &ObbYoloBatchTrainingDeltaStats,
@@ -639,6 +666,16 @@ fn merge_obb_training_stats(
             &mut total_head.anchor_box_positive_count,
             next_head.anchor_box_positive_count,
             "head box positives",
+        )?;
+        checked_add_obb_training_sum_f64(
+            &mut total_head.iou_loss_sum,
+            next_head.iou_loss_sum,
+            "head IoU loss",
+        )?;
+        checked_add_obb_training_sum_f64(
+            &mut total_head.giou_loss_sum,
+            next_head.giou_loss_sum,
+            "head GIoU loss",
         )?;
         checked_add_obb_training_count(
             &mut total_head.total_bbox_count,
@@ -670,6 +707,8 @@ fn merge_obb_training_stats(
         next.anchor_box_positive_count,
         "box positives",
     )?;
+    checked_add_obb_training_sum_f64(&mut total.iou_loss_sum, next.iou_loss_sum, "IoU loss")?;
+    checked_add_obb_training_sum_f64(&mut total.giou_loss_sum, next.giou_loss_sum, "GIoU loss")?;
     checked_add_obb_training_count(
         &mut total.total_bbox_count,
         next.total_bbox_count,
@@ -2652,7 +2691,7 @@ mod tests {
         train_obb_yolo_subdivisions, yolo_head_cost, yolo_xy_output,
     };
     use crate::cfg::ConfigFile;
-    use crate::model::{Network, TensorShape, YoloIouLoss, YoloSpec};
+    use crate::model::{LayerKind, Network, TensorShape, YoloIouLoss, YoloSpec};
     use crate::obb_labels::ObbLabel;
     use crate::runtime::{ExecutableNetwork, LayerParams, Tensor};
     use std::fs;
@@ -2728,7 +2767,16 @@ mod tests {
 
     #[test]
     fn obb_training_delta_generation_wires_forward_heads_to_gradient_seeds() {
-        let network = obb_test_network(1);
+        let mut network = obb_test_network(1);
+        for layer in &mut network.layers {
+            if let LayerKind::ObbYolo(spec) = &mut layer.kind {
+                spec.yolo.iou_loss = YoloIouLoss::Giou;
+                spec.yolo.iou_normalizer = 1.25;
+                spec.yolo.truth_thresh = -1.0;
+                spec.covariance_normalizer = 1.0;
+                spec.ciou_obb_loss = false;
+            }
+        }
         let executable = ExecutableNetwork::new(network.clone());
         let input = Tensor::from_data(network.net.input_shape(), vec![0.0; 6]).expect("input");
         let forward = executable.forward(&input).expect("forward");
@@ -2756,20 +2804,37 @@ mod tests {
         assert_eq!(seed.shape, forward.yolo_heads[0].output.shape);
         assert!(seed.data.iter().any(|delta| delta.abs() > 0.0));
         assert_eq!(result.stats.per_head.len(), 1);
+        assert_eq!(result.stats.truth_threshold_positive_cells, 2);
         assert_eq!(result.stats.anchor_box_positive_count, 1);
-        assert_eq!(result.stats.total_bbox_count, 1);
-        assert_eq!(result.stats.front_point_loss.count, 1);
+        assert_eq!(result.stats.total_bbox_count, 3);
+        assert_eq!(result.stats.front_point_loss.count, 3);
         assert!(result.stats.front_point_loss.loss_sum.is_finite());
         assert_eq!(result.mse_delta_squared_cost, None);
         let non_box_start = 6 * seed.shape.width * seed.shape.height;
-        let expected_classification = seed.data[non_box_start..]
+        let expected_non_box_delta_squared = seed.data[non_box_start..]
             .iter()
             .map(|delta| (*delta as f64).powi(2))
-            .sum::<f64>() as f32;
+            .sum::<f64>();
+        let LayerKind::ObbYolo(spec) = &network.layers[head_index].kind else {
+            panic!("expected OBB YOLO layer")
+        };
+        let expected_classification =
+            (spec.obj_normalizer as f64 * expected_non_box_delta_squared) as f32;
         assert_eq!(
             result.classification_loss_component,
             expected_classification
         );
+        let head_stats = &result.stats.per_head[0];
+        assert_eq!(head_stats.iou_loss_sum, head_stats.giou_loss_sum);
+        let expected_iou_cost = if head_stats.anchor_box_positive_count == 0 {
+            0.0
+        } else {
+            spec.iou_normalizer as f64 * head_stats.iou_loss_sum
+                / head_stats.anchor_box_positive_count as f64
+        };
+        let expected_source_cost =
+            spec.obj_normalizer as f64 * expected_non_box_delta_squared + expected_iou_cost;
+        assert_eq!(result.source_loss_cost, expected_source_cost as f32);
     }
 
     #[test]
@@ -2818,6 +2883,7 @@ mod tests {
                 .sum::<f64>() as f32;
         assert!(expected.is_finite() && expected > 0.0);
         assert_eq!(result.mse_delta_squared_cost, Some(expected));
+        assert_eq!(result.source_loss_cost, expected);
         assert_eq!(
             result.classification_loss_component,
             expected_classification
@@ -2946,6 +3012,10 @@ mod tests {
             .expect("OBB subdivisions update");
         assert_eq!(stats.per_head.len(), 1);
         assert_eq!(stats.anchor_box_positive_count, 2);
+        assert_eq!(stats.per_head[0].anchor_box_positive_count, 2);
+        assert_eq!(stats.iou_loss_sum, stats.per_head[0].iou_loss_sum);
+        assert_eq!(stats.giou_loss_sum, stats.per_head[0].giou_loss_sum);
+        assert_eq!(stats.iou_loss_sum, stats.giou_loss_sum);
         assert_eq!(stats.total_bbox_count, 2);
         assert_eq!(stats.front_point_loss.count, 2);
         assert!(stats.front_point_loss.angle_count <= stats.front_point_loss.count);

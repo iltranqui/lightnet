@@ -34,6 +34,7 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v158: OBB delta batches now expose source-style loss cost for MSE and supported non-MSE modes. Non-MSE cost uses source best/additional anchor `1 - box_ious` loss averages (truth-threshold-only cells do not enter the count) plus objectness-normalized non-box squared deltas; per-head and subdivision score-loss sums are aggregated. The focused cost tests and all 119 OBB-filtered host tests passed. `ciou_obb_mul` training and CLI/schedule integration remain open; no compiled-C++ parity is established.
 - v157: OBB truth-threshold dispatch now permits distinct matching and box-delta score configs, required for weighted MSE matching with the source CIoU-OBB regression fallback. The MSE weighted end-to-end delta test and all 119 OBB-filtered host tests passed.
 - v156: OBB delta batches now report the source objectness-normalized sum of squared deltas outside the six box channels as the classification/objectness loss component, including non-MSE modes. Coverage checks default and non-unit `obj_normalizer`; all 118 OBB-filtered host tests passed. The remaining non-MSE IoU scalar and CLI/schedule integration are open.
 - v155: OBB delta batches now expose the source raw `sum(delta²)` cost when every OBB YOLO head uses MSE; other loss modes return `None` rather than a misleading partial scalar. The MSE cost test and all 118 OBB-filtered host tests passed. Full non-MSE loss/CLI integration remains open.
