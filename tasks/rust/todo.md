@@ -304,7 +304,8 @@ Immediately next, in dependency order:
   files; v145 parses and routes covariance/COBB normalizers and QBBV blending
   options into per-head scoring; v146 wires parsed `iou_loss` to CIoU-OBB score
   dispatch; v147 routes the parsed front-loss normalizer into covariance
-  match-score weighting. Still open: full loss scalar, CLI/schedule and
+  match-score weighting; v148 retains standard `iou_loss` choices in the parsed
+  spec and routes them to front-point deltas. Still open: full loss scalar, CLI/schedule and
   non-SGD optimizer/training-loop integration, remaining cfg/training
   option wiring,
   inference/network decode integration, remaining metric/loss aggregation and

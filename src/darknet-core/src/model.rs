@@ -2264,7 +2264,7 @@ fn parse_layer_kind(
             let front_point_normalizer = section.get_f32("front_point_normalizer", 0.35)?;
             let front_loss_normalizer =
                 section.get_f32("front_loss_normalizer", front_point_normalizer)?;
-            let ciou_obb_loss = parse_obb_ciou_loss(section)?;
+            let (iou_loss, ciou_obb_loss) = parse_obb_iou_loss(section)?;
             let nms_kind = ObbNmsKind::parse(&section.get_str("nms_kind", "obb"), line)?;
             if !scale_x_y.is_finite() {
                 return Err(Error::InvalidConfig(format!(
@@ -2296,7 +2296,7 @@ fn parse_layer_kind(
                     ignore_thresh: section.get_f32("ignore_thresh", 0.5)?,
                     truth_thresh: section.get_f32("truth_thresh", 1.0)?,
                     iou_thresh: section.get_f32("iou_thresh", 1.0)?,
-                    iou_loss: YoloIouLoss::Mse,
+                    iou_loss,
                     iou_thresh_kind: YoloIouLoss::Iou,
                     focal_loss: section.get_i64("focal_loss", 0)? != 0,
                     label_smooth_eps: section.get_f32("label_smooth_eps", 0.0)?,
@@ -3554,14 +3554,11 @@ fn resolve_relative_layer(layer_index: usize, raw_index: isize) -> Result<usize>
     Ok(absolute)
 }
 
-fn parse_obb_ciou_loss(section: &RawSection) -> Result<bool> {
+fn parse_obb_iou_loss(section: &RawSection) -> Result<(YoloIouLoss, bool)> {
     let loss = section.get_str("iou_loss", "ciou_obb");
     match loss.trim().to_ascii_lowercase().as_str() {
-        "ciou_obb" | "ciou_obb_mul" => Ok(true),
-        _ => {
-            YoloIouLoss::parse(&loss)?;
-            Ok(false)
-        }
+        "ciou_obb" | "ciou_obb_mul" => Ok((YoloIouLoss::Ciou, true)),
+        _ => Ok((YoloIouLoss::parse(&loss)?, false)),
     }
 }
 
@@ -4504,7 +4501,7 @@ mod tests {
     #[test]
     fn obb_yolo_routes_covariance_cobb_and_viou_options() {
         let network = build(
-            "[net]\nwidth=1\nheight=1\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\niou_loss=mse\nfront_loss_normalizer=0.7\ncovariance_normalizer=1.3\ncobb_normalizer=0.4\nobb_length_ratio_k=1.4\nobb_viou_weight=1.5\ncobb_box_weight=1.2\ncobb_r_weight=0.8\ncobb_s_weight=1.4\ncobb_iou_lambda=2.2\n",
+            "[net]\nwidth=1\nheight=1\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\niou_loss=giou\nfront_loss_normalizer=0.7\ncovariance_normalizer=1.3\ncobb_normalizer=0.4\nobb_length_ratio_k=1.4\nobb_viou_weight=1.5\ncobb_box_weight=1.2\ncobb_r_weight=0.8\ncobb_s_weight=1.4\ncobb_iou_lambda=2.2\n",
         )
         .expect("OBB score options parse");
         let LayerKind::ObbYolo(spec) = &network.layers[0].kind else {
@@ -4522,6 +4519,10 @@ mod tests {
             1.3
         );
         assert!(!training.match_config.score_config.ciou_obb);
+        assert_eq!(
+            training.front_point_delta_config.iou_loss,
+            super::YoloIouLoss::Giou
+        );
         assert_eq!(
             training
                 .match_config
@@ -4559,10 +4560,21 @@ mod tests {
             panic!("expected OBB YOLO layer");
         };
         assert!(spec.ciou_obb_loss);
+        assert_eq!(spec.iou_loss, super::YoloIouLoss::Ciou);
         let training =
             crate::obb_training::build_obb_yolo_training_head_config(spec, 0, 1, 1, 1, 1)
                 .expect("default OBB score config builds");
         assert!(training.match_config.score_config.ciou_obb);
+
+        let multiplicative = build(
+            "[net]\nwidth=1\nheight=1\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\niou_loss=ciou_obb_mul\n",
+        )
+        .expect("multiplicative CIoU-OBB parses");
+        let LayerKind::ObbYolo(spec) = &multiplicative.layers[0].kind else {
+            panic!("expected OBB YOLO layer");
+        };
+        assert!(spec.ciou_obb_loss);
+        assert_eq!(spec.iou_loss, super::YoloIouLoss::Ciou);
 
         let invalid = build(
             "[net]\nwidth=1\nheight=1\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\niou_loss=unsupported\n",
