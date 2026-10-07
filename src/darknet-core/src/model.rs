@@ -2167,6 +2167,7 @@ fn parse_layer_kind(
             }
             let line = section.line;
             let classes = section.get_usize("classes", 20)?;
+            let max_delta = section.get_f32("max_delta", f32::MAX)?;
             let total = section.get_usize("num", 1)?;
             let max_boxes = section.get_usize("max", 200)?;
             let mut mask = section.get_usize_list("mask")?;
@@ -2278,7 +2279,7 @@ fn parse_layer_kind(
                     objectness_smooth: section.get_i64("objectness_smooth", 0)? != 0,
                     max_delta: section.get_f32("max_delta", f32::MAX)?,
                     delta_normalizer: section.get_f32("delta_normalizer", 1.0)?,
-                    class_multipliers: None,
+                    class_multipliers: parse_class_multipliers(section, classes, max_delta)?,
                     class_map: None,
                 },
                 nms_kind,
@@ -4415,6 +4416,30 @@ mod tests {
                 "invalid OBB cfg should fail: {cfg}"
             );
         }
+    }
+
+    #[test]
+    fn obb_yolo_parses_class_multipliers_from_per_class_counters() {
+        let network = build(
+            "[net]\nwidth=1\nheight=1\nchannels=9\nobb=1\n[obb_yolo]\nclasses=2\nnum=1\nanchors=1,1\ncounters_per_class=1,4\nmax_delta=1.5\n",
+        )
+        .expect("OBB class counters parse");
+        let LayerKind::ObbYolo(spec) = &network.layers[0].kind else {
+            panic!("expected OBB YOLO layer");
+        };
+        assert_eq!(spec.class_multipliers, Some(vec![1.5, 1.0]));
+        let training =
+            crate::obb_training::build_obb_yolo_training_head_config(spec, 0, 1, 1, 1, 1)
+                .expect("parsed class multipliers route into training assignment");
+        assert_eq!(
+            training.assignment_config.class_multipliers,
+            spec.class_multipliers
+        );
+
+        let invalid = build(
+            "[net]\nwidth=1\nheight=1\nchannels=9\nobb=1\n[obb_yolo]\nclasses=2\nnum=1\nanchors=1,1\ncounters_per_class=3\n",
+        );
+        assert!(invalid.is_err(), "counter cardinality must match classes");
     }
 
     #[test]

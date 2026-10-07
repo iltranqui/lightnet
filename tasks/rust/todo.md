@@ -299,7 +299,8 @@ Immediately next, in dependency order:
   forward heads and labels; v140 propagates those seeds through runtime
   backpropagation; v141 adds a one-subdivision CPU SGD batch step with explicit
   Adam/subdivision rejection; v142 accumulates configured subdivisions and applies
-  one normalized SGD update. Still open: full loss scalar, CLI/schedule and
+  one normalized SGD update; v143 parses OBB `counters_per_class` into
+  assignment class multipliers. Still open: full loss scalar, CLI/schedule and
   non-SGD optimizer/training-loop integration, remaining cfg/training
   option wiring,
   inference/network decode integration, remaining metric/loss aggregation and

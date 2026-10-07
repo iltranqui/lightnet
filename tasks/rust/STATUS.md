@@ -34,6 +34,7 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v143: `[obb_yolo]` now parses `counters_per_class` into bounded class multipliers and routes them through the existing per-head assignment config; malformed class counts are rejected. The focused parser/adapter test and all 110 OBB-filtered host tests passed.
 - v142: added `train_obb_yolo_subdivisions`, which accumulates OBB gradients across all configured subdivisions, merges per-head/source metrics, and applies one SGD update normalized by total images. Tests cover two-subdivision accumulation and update. The focused test and all 109 OBB-filtered host tests passed; no C++ parity is implied.
 - v141: added `train_obb_yolo_batch_step`, a one-subdivision CPU SGD path from an `ObbTrainingBatch` through forward, OBB delta generation, accumulated backprop, and parameter update. It rejects Adam and multi-subdivision configurations rather than silently using incorrect semantics. The focused parameter-update test and all 108 OBB-filtered host tests passed; full loss scalar and CLI/schedule integration remain open.
 - v140: added `backward_obb_yolo_training`, connecting OBB output deltas to `ExecutableNetwork::backward_seeded`; the test verifies finite input gradients and nonzero convolution weight gradients. It still stops before optimizer updates and a complete OBB loss scalar. The focused backward test and all 107 OBB-filtered host tests passed; no compiled-C++ parity is established.
