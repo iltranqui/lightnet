@@ -312,7 +312,8 @@ Immediately next, in dependency order:
   v152 separates weighted MSE matching scores from the source CIoU-OBB box-delta
   fallback; v153 adds covariance and COBB box-delta contributions independently
   when both weighted branches are active; v154 combines their matching scores by
-  configured weights. Still open: full loss scalar,
+  configured weights; v155 reports source raw `sum(delta²)` for all-MSE OBB heads.
+  Still open: full non-MSE loss scalar,
   CLI/schedule and
   non-SGD optimizer/training-loop integration, remaining cfg/training
   option wiring,

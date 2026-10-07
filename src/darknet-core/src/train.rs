@@ -277,6 +277,9 @@ pub struct ObbYoloTrainingDeltaBatch {
     /// Gradient seeds indexed by network layer; non-head layers are `None`.
     pub layer_output_gradient_seeds: Vec<Option<Tensor>>,
     pub stats: ObbYoloBatchTrainingDeltaStats,
+    /// Raw source OBB `MSE` cost, `sum(delta²)` across all OBB heads, when every
+    /// OBB YOLO head uses MSE; `None` for other IoU-loss modes.
+    pub mse_delta_squared_cost: Option<f32>,
 }
 
 /// OBB output deltas and their propagated network parameter/input gradients.
@@ -288,8 +291,9 @@ pub struct ObbYoloTrainingBackward {
 
 /// Build OBB YOLO output-gradient seeds from parsed heads and a forward pass.
 ///
-/// This wires the source-ordered delta helpers to real network head tensors, but
-/// does not calculate the complete OBB loss scalar or run backward/update.
+/// This wires the source-ordered delta helpers to real network head tensors.
+/// All-MSE OBB heads also report source `sum(delta²)`; other modes still lack a
+/// complete loss scalar, and this function does not run backward/update.
 pub fn compute_obb_yolo_training_deltas(
     network: &Network,
     forward: &ForwardResult,
@@ -329,6 +333,7 @@ pub fn compute_obb_yolo_training_deltas(
     let mut assignment_configs = Vec::with_capacity(expected_count);
     let mut box_delta_configs = Vec::with_capacity(expected_count);
     let mut front_point_delta_configs = Vec::with_capacity(expected_count);
+    let mut all_heads_use_mse = true;
     let mut training_options = None;
     for head in &forward.yolo_heads {
         let layer_index = head.layer_index;
@@ -351,6 +356,7 @@ pub fn compute_obb_yolo_training_deltas(
                 head.output.shape.batch
             )));
         }
+        all_heads_use_mse &= spec.iou_loss == YoloIouLoss::Mse;
         let options = (spec.focal_loss, spec.label_smooth_eps, spec.cls_normalizer);
         if training_options.is_some_and(|previous| previous != options) {
             return Err(Error::InvalidConfig(
@@ -398,6 +404,26 @@ pub fn compute_obb_yolo_training_deltas(
         &box_delta_configs,
         &front_point_delta_configs,
     )?;
+    let mse_delta_squared_cost = if all_heads_use_mse {
+        let mut squared_cost = 0.0f64;
+        for delta in head_deltas.iter().flatten() {
+            let delta = *delta as f64;
+            squared_cost += delta * delta;
+            if !squared_cost.is_finite() {
+                return Err(Error::InvalidConfig(
+                    "OBB MSE delta-squared cost became non-finite".to_owned(),
+                ));
+            }
+        }
+        if squared_cost > f32::MAX as f64 {
+            return Err(Error::InvalidConfig(
+                "OBB MSE delta-squared cost exceeds f32 range".to_owned(),
+            ));
+        }
+        Some(squared_cost as f32)
+    } else {
+        None
+    };
     let mut layer_output_gradient_seeds = vec![None; network.layers.len()];
     for (head, deltas) in forward.yolo_heads.iter().zip(head_deltas) {
         layer_output_gradient_seeds[head.layer_index] =
@@ -406,6 +432,7 @@ pub fn compute_obb_yolo_training_deltas(
     Ok(ObbYoloTrainingDeltaBatch {
         layer_output_gradient_seeds,
         stats,
+        mse_delta_squared_cost,
     })
 }
 
@@ -430,9 +457,10 @@ pub fn backward_obb_yolo_training(
 
 /// Run one SGD update for an OBB batch when `subdivisions=1`.
 ///
-/// Callers still own iteration scheduling and the complete loss scalar. This
-/// helper rejects Adam and multi-subdivision networks rather than silently
-/// applying the wrong optimizer or update cadence.
+/// The returned delta batch includes source `sum(delta²)` when all OBB heads use
+/// MSE; complete non-MSE loss integration and iteration scheduling remain with
+/// callers. This helper rejects Adam and multi-subdivision networks rather than
+/// silently applying the wrong optimizer or update cadence.
 pub fn train_obb_yolo_batch_step(
     executable: &mut ExecutableNetwork,
     batch: &ObbTrainingBatch,
@@ -2661,6 +2689,48 @@ mod tests {
         assert_eq!(result.stats.total_bbox_count, 1);
         assert_eq!(result.stats.front_point_loss.count, 1);
         assert!(result.stats.front_point_loss.loss_sum.is_finite());
+        assert_eq!(result.mse_delta_squared_cost, None);
+    }
+
+    #[test]
+    fn obb_mse_training_delta_batch_exposes_source_delta_squared_cost() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "obb-mse-cost.cfg",
+                "[net]\nwidth=2\nheight=1\nchannels=3\nobb=1\n[convolutional]\nfilters=8\nsize=1\nstride=1\nactivation=linear\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\niou_loss=mse\n",
+            )
+            .expect("MSE OBB cfg parses"),
+        )
+        .expect("MSE OBB network builds");
+        let executable = ExecutableNetwork::new(network.clone());
+        let input = Tensor::from_data(network.net.input_shape(), vec![0.0; 6]).expect("input");
+        let forward = executable.forward(&input).expect("forward");
+        let labels = [vec![ObbLabel {
+            class_id: 0,
+            x: 0.5,
+            y: 0.5,
+            w: 0.25,
+            h: 0.5,
+            left: 0.375,
+            right: 0.625,
+            top: 0.25,
+            bottom: 0.75,
+            front_x: 0.7,
+            front_y: 0.55,
+            has_front: true,
+        }]];
+
+        let result = compute_obb_yolo_training_deltas(&network, &forward, &labels)
+            .expect("MSE OBB deltas generate a source delta-squared cost");
+        let expected = result
+            .layer_output_gradient_seeds
+            .iter()
+            .filter_map(Option::as_ref)
+            .flat_map(|seed| seed.data.iter())
+            .map(|delta| (*delta as f64).powi(2))
+            .sum::<f64>() as f32;
+        assert!(expected.is_finite() && expected > 0.0);
+        assert_eq!(result.mse_delta_squared_cost, Some(expected));
     }
 
     #[test]

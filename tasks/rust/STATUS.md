@@ -34,6 +34,7 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v155: OBB delta batches now expose the source raw `sum(delta²)` cost when every OBB YOLO head uses MSE; other loss modes return `None` rather than a misleading partial scalar. The MSE cost test and all 118 OBB-filtered host tests passed. Full non-MSE loss/CLI integration remains open.
 - v154: covariance and COBB matching scores now combine using their configured normalizer weights when both are active, matching the source independent-branch matcher; CIoU-OBB override and single-branch paths are unchanged. The weighted-score test and all 117 OBB-filtered host tests passed. No compiled-C++ parity is established.
 - v153: when covariance and COBB are both active, box regression now adds their independent contributions instead of returning after covariance. A combined-vs-separate gradient test and all 117 OBB-filtered host tests passed. This does not establish compiled-C++ or full-loss parity.
 - v152: separate OBB matching-score and box-delta dispatch for `iou_loss=mse`: weighted covariance/COBB scores still select matches, while box regression follows source CIoU-OBB fallback instead of applying the covariance analytic gradient. Added routing and regression-path tests; all 116 OBB-filtered host tests passed. This does not establish compiled-C++ or full-loss parity.
