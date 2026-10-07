@@ -62,6 +62,23 @@ pub struct ObbYoloHeadAssignmentSpec {
     pub grid_height: usize,
 }
 
+/// Source OBB YOLO metadata for traversing one batch-major head output tensor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObbYoloHeadMatchConfig {
+    pub head_index: usize,
+    pub anchors: Vec<f32>,
+    pub mask: Vec<usize>,
+    pub grid_width: usize,
+    pub grid_height: usize,
+    pub classes: usize,
+    pub net_width: usize,
+    pub net_height: usize,
+    pub new_coords: bool,
+    pub score_config: ObbYoloMatchScoreConfig,
+    pub ignore_thresh: f32,
+    pub truth_thresh: f32,
+}
+
 /// One positive assignment tagged with its batch slot and OBB YOLO head.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ObbYoloBatchPositiveAssignment {
@@ -1160,6 +1177,115 @@ pub fn match_obb_yolo_batch_cell_predictions(
     Ok(matches)
 }
 
+/// Visit all batch/cell/anchor matches in one source OBB YOLO head output.
+///
+/// `head_output` uses source layer layout `[batch][entry][grid-cell]`, where
+/// each masked anchor has seven box/objectness entries followed by class
+/// entries. Its first two coordinates, objectness, and (unless `new_coords`)
+/// classes are the forward-activated/scaled values consumed by the source loss.
+/// The callback keeps the traversal memory-bounded; callback errors stop the
+/// visit and are returned unchanged.
+pub fn visit_obb_yolo_batch_head_matches(
+    batch_truths: &[Vec<ObbLabel>],
+    head_output: &[f32],
+    config: &ObbYoloHeadMatchConfig,
+    mut visit: impl FnMut(ObbYoloBatchCellMatch) -> Result<()>,
+) -> Result<()> {
+    if batch_truths.is_empty()
+        || config.classes == 0
+        || !config.ignore_thresh.is_finite()
+        || !config.truth_thresh.is_finite()
+    {
+        return Err(Error::InvalidConfig(
+            "OBB head matching requires truths, classes, and finite thresholds".to_owned(),
+        ));
+    }
+    validate_anchor_assignment_inputs(
+        &config.anchors,
+        &config.mask,
+        config.net_width,
+        config.net_height,
+        config.grid_width,
+        config.grid_height,
+    )?;
+    let stride = config
+        .grid_width
+        .checked_mul(config.grid_height)
+        .ok_or_else(|| Error::InvalidConfig("OBB head grid size overflows".to_owned()))?;
+    let entries = config
+        .classes
+        .checked_add(7)
+        .ok_or_else(|| Error::InvalidConfig("OBB head entry count overflows".to_owned()))?;
+    let per_batch = config
+        .mask
+        .len()
+        .checked_mul(entries)
+        .and_then(|count| count.checked_mul(stride))
+        .ok_or_else(|| Error::InvalidConfig("OBB head tensor size overflows".to_owned()))?;
+    let expected = batch_truths
+        .len()
+        .checked_mul(per_batch)
+        .ok_or_else(|| Error::InvalidConfig("OBB batch tensor size overflows".to_owned()))?;
+    if head_output.len() != expected {
+        return Err(Error::InvalidConfig(format!(
+            "OBB batch head tensor length mismatch: expected {expected}, got {}",
+            head_output.len()
+        )));
+    }
+
+    let mut class_outputs = Vec::new();
+    class_outputs
+        .try_reserve_exact(config.classes)
+        .map_err(|_| Error::InvalidConfig("OBB class-output allocation failed".to_owned()))?;
+    for (batch_index, truths) in batch_truths.iter().enumerate() {
+        let batch_base = batch_index * per_batch;
+        for cell_y in 0..config.grid_height {
+            for cell_x in 0..config.grid_width {
+                let cell_index = cell_y * config.grid_width + cell_x;
+                for (head_anchor_index, &anchor_index) in config.mask.iter().enumerate() {
+                    let anchor_base = batch_base + head_anchor_index * entries * stride;
+                    let channel_value = |entry: usize| {
+                        finite_or_zero(head_output[anchor_base + entry * stride + cell_index])
+                    };
+                    let prediction = std::array::from_fn(|channel| channel_value(channel));
+                    class_outputs.clear();
+                    class_outputs
+                        .extend((0..config.classes).map(|class_id| channel_value(7 + class_id)));
+                    let context = ObbYoloPredictionMatchContext {
+                        anchor_width: config.anchors[anchor_index * 2],
+                        anchor_height: config.anchors[anchor_index * 2 + 1],
+                        cell_x,
+                        cell_y,
+                        grid_width: config.grid_width,
+                        grid_height: config.grid_height,
+                        net_width: config.net_width,
+                        net_height: config.net_height,
+                        new_coords: config.new_coords,
+                    };
+                    let truth_match = match_obb_yolo_cell_prediction_with_score_config(
+                        prediction,
+                        truths,
+                        &class_outputs,
+                        context,
+                        config.score_config,
+                        config.ignore_thresh,
+                        config.truth_thresh,
+                    )?;
+                    visit(ObbYoloBatchCellMatch {
+                        batch_index,
+                        head_index: config.head_index,
+                        anchor_index,
+                        cell_x,
+                        cell_y,
+                        truth_match,
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_anchor_assignment_inputs(
     anchors: &[f32],
     mask: &[usize],
@@ -1247,17 +1373,17 @@ fn validate_truth(truth: &ObbLabel) -> Result<()> {
 mod tests {
     use super::{
         OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloBatchCellPrediction,
-        ObbYoloCellTruthMatch, ObbYoloHeadAssignmentSpec, ObbYoloMatchScoreBranch,
-        ObbYoloMatchScoreConfig, ObbYoloPositiveKind, ObbYoloPredictionMatchContext,
-        assign_obb_yolo_anchor, encode_obb_yolo_truth_batch, enumerate_obb_yolo_batch_positives,
-        enumerate_obb_yolo_head_positives, match_obb_yolo_batch_cell_predictions,
-        match_obb_yolo_cell_prediction, match_obb_yolo_cell_prediction_with_score_config,
-        obb_yolo_anchor_match_score, obb_yolo_angular_prediction_match_score_with_viou,
-        obb_yolo_cell_objectness_delta, obb_yolo_ciou_prediction_match_score,
-        obb_yolo_class_deltas, obb_yolo_cobb_prediction_match_score_with_viou,
-        obb_yolo_covariance_prediction_match_score,
+        ObbYoloCellTruthMatch, ObbYoloHeadAssignmentSpec, ObbYoloHeadMatchConfig,
+        ObbYoloMatchScoreBranch, ObbYoloMatchScoreConfig, ObbYoloPositiveKind,
+        ObbYoloPredictionMatchContext, assign_obb_yolo_anchor, encode_obb_yolo_truth_batch,
+        enumerate_obb_yolo_batch_positives, enumerate_obb_yolo_head_positives,
+        match_obb_yolo_batch_cell_predictions, match_obb_yolo_cell_prediction,
+        match_obb_yolo_cell_prediction_with_score_config, obb_yolo_anchor_match_score,
+        obb_yolo_angular_prediction_match_score_with_viou, obb_yolo_cell_objectness_delta,
+        obb_yolo_ciou_prediction_match_score, obb_yolo_class_deltas,
+        obb_yolo_cobb_prediction_match_score_with_viou, obb_yolo_covariance_prediction_match_score,
         obb_yolo_covariance_prediction_match_score_with_viou, obb_yolo_match_score,
-        select_obb_yolo_cell_truth_match,
+        select_obb_yolo_cell_truth_match, visit_obb_yolo_batch_head_matches,
     };
     use crate::obb_labels::ObbLabel;
 
@@ -1553,6 +1679,108 @@ mod tests {
             truth_thresh: 0.5,
         };
         assert!(match_obb_yolo_batch_cell_predictions(&[Vec::new()], &[cell]).is_err());
+    }
+
+    #[test]
+    fn batch_head_tensor_traversal_extracts_source_channels_and_tags_matches() {
+        let truths = [
+            vec![truth(0.5, 0.5, 0.2, 0.2)],
+            vec![truth(1.0, 1.0, 0.2, 0.2)],
+        ];
+        let config = ObbYoloHeadMatchConfig {
+            head_index: 3,
+            anchors: vec![10.0, 10.0, 20.0, 20.0],
+            mask: vec![1],
+            grid_width: 1,
+            grid_height: 1,
+            classes: 1,
+            net_width: 100,
+            net_height: 100,
+            new_coords: false,
+            score_config: ObbYoloMatchScoreConfig {
+                covariance_normalizer: 1.0,
+                ..ObbYoloMatchScoreConfig::default()
+            },
+            ignore_thresh: 0.5,
+            truth_thresh: 0.99,
+        };
+        // `[batch][entry][cell]`: box/front, objectness, and one class.
+        let head_output = [
+            0.5, 0.5, 0.0, 0.0, 0.5, 0.5, 0.9, 0.9, 0.5, 0.5, 0.0, 0.0, 0.5, 0.5, 0.9, 0.9,
+        ];
+        let mut matches = Vec::new();
+        visit_obb_yolo_batch_head_matches(&truths, &head_output, &config, |matched| {
+            matches.push(matched);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].batch_index, 0);
+        assert_eq!(matches[0].head_index, 3);
+        assert_eq!(matches[0].anchor_index, 1);
+        assert_eq!((matches[0].cell_x, matches[0].cell_y), (0, 0));
+        assert_eq!(matches[0].truth_match.positive_truth_index, Some(0));
+        assert!(matches[0].truth_match.best_score > 0.99);
+        assert_eq!(matches[1].batch_index, 1);
+        assert_eq!(matches[1].truth_match.positive_truth_index, None);
+        assert!(matches[1].truth_match.best_score < 0.99);
+    }
+
+    #[test]
+    fn batch_head_tensor_traversal_visits_all_cells_and_mask_slots_in_source_order() {
+        let config = ObbYoloHeadMatchConfig {
+            head_index: 4,
+            anchors: vec![10.0, 10.0, 20.0, 20.0],
+            mask: vec![1, 0],
+            grid_width: 2,
+            grid_height: 1,
+            classes: 1,
+            net_width: 20,
+            net_height: 10,
+            new_coords: false,
+            score_config: ObbYoloMatchScoreConfig::default(),
+            ignore_thresh: 0.5,
+            truth_thresh: 0.5,
+        };
+        let head_output = vec![0.0; 32];
+        let mut matches = Vec::new();
+        visit_obb_yolo_batch_head_matches(&[Vec::new()], &head_output, &config, |matched| {
+            matches.push(matched);
+            Ok(())
+        })
+        .unwrap();
+        let observed: Vec<_> = matches
+            .iter()
+            .map(|matched| (matched.anchor_index, matched.cell_x, matched.cell_y))
+            .collect();
+        assert_eq!(observed, [(1, 0, 0), (0, 0, 0), (1, 1, 0), (0, 1, 0)]);
+        assert!(
+            matches
+                .iter()
+                .all(|matched| matched.truth_match.best_truth_index.is_none())
+        );
+    }
+
+    #[test]
+    fn batch_head_tensor_traversal_rejects_wrong_output_length() {
+        let config = ObbYoloHeadMatchConfig {
+            head_index: 0,
+            anchors: vec![10.0, 10.0],
+            mask: vec![0],
+            grid_width: 1,
+            grid_height: 1,
+            classes: 1,
+            net_width: 10,
+            net_height: 10,
+            new_coords: false,
+            score_config: ObbYoloMatchScoreConfig::default(),
+            ignore_thresh: 0.5,
+            truth_thresh: 0.5,
+        };
+        assert!(
+            visit_obb_yolo_batch_head_matches(&[Vec::new()], &[0.0; 7], &config, |_| Ok(()))
+                .is_err()
+        );
     }
 
     #[test]
