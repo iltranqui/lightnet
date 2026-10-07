@@ -2,13 +2,15 @@
 //!
 //! This module currently covers direction-free anchor matching, per-truth and
 //! batch/multi-head positive enumeration, per-cell and batch-cell OBB score
-//! dispatch/match selection, objectness and class-channel deltas, and source-layout
-//! truth-row packing.
+//! dispatch/match selection, objectness/class/front-point channel deltas, and
+//! source-layout truth-row packing. Front-point deltas remain standalone and
+//! are not yet routed through positive-anchor writeback or a network trainer.
 //! It does not implement complete truth assignment, YOLO loss, backward
 //! propagation, or optimizer integration.
 
 use crate::detect::DetectionBox;
 use crate::error::{Error, Result};
+use crate::model::YoloIouLoss;
 use crate::obb_geometry::{
     BoxObb, ObbCobbLossConfig, blend_obb_score_with_qbbv_viou, box_ciou_angular_quality_score,
     box_ciou_obb_quality_score, box_cobb_obb_quality_score_with_viou,
@@ -276,6 +278,38 @@ impl Default for ObbYoloBoxDeltaConfig {
             accumulate: true,
         }
     }
+}
+
+/// Source front-point channel scaling and clipping configuration.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObbYoloFrontPointDeltaConfig {
+    /// `front_loss_normalizer`, already scaled by the source class multiplier.
+    pub normalizer: f32,
+    /// `f32::MAX` selects the source default absolute delta clip of 1.0.
+    pub max_delta: f32,
+    /// Source `MSE` front-box derivative falls back to CIoU.
+    pub iou_loss: YoloIouLoss,
+}
+
+impl Default for ObbYoloFrontPointDeltaConfig {
+    fn default() -> Self {
+        Self {
+            normalizer: 1.0,
+            max_delta: f32::MAX,
+            iou_loss: YoloIouLoss::Mse,
+        }
+    }
+}
+
+/// Raw front-channel deltas and optional center-chain contributions.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ObbYoloFrontPointDeltas {
+    pub front_x: f32,
+    pub front_y: f32,
+    pub center_x: f32,
+    pub center_y: f32,
+    /// `max(0, 1 - front-box CIoU)`, before normalizer scaling.
+    pub loss: f32,
 }
 
 /// Result of source single-prediction OBB score-branch selection.
@@ -1212,6 +1246,55 @@ fn obb_yolo_box_regression_deltas_with_front_anchor_offset(
         deltas[channel] += delta.clamp(-clip, clip);
     }
     Ok(deltas)
+}
+
+/// Compute source front-point deltas for one positive prediction.
+///
+/// The source front-point decoder is cell-relative even when directional
+/// anchor offsets exist; those offsets only signal that the same gradient also
+/// contributes to the box-center channels. Absent-front Rust labels do not
+/// supervise this directional term.
+pub fn obb_yolo_front_point_regression_deltas(
+    prediction: [f32; 6],
+    truth: &ObbLabel,
+    context: ObbYoloPredictionMatchContext,
+    config: ObbYoloFrontPointDeltaConfig,
+    center_front_anchor: bool,
+) -> Result<ObbYoloFrontPointDeltas> {
+    validate_truth(truth)?;
+    if !config.normalizer.is_finite() || !config.max_delta.is_finite() || config.max_delta < 0.0 {
+        return Err(Error::InvalidConfig(
+            "OBB front-point deltas require finite normalization and clipping".to_owned(),
+        ));
+    }
+    if !truth.has_front || config.normalizer <= 0.0 {
+        return Ok(ObbYoloFrontPointDeltas::default());
+    }
+
+    let decoded = decode_obb_yolo_prediction(prediction, context)?;
+    let front_width = (truth.w * 0.25).max(1e-5);
+    let front_height = (truth.h * 0.25).max(1e-5);
+    let (ciou, gradient_x, gradient_y) = crate::train::obb_front_point_ciou_gradient(
+        [decoded.front_x, decoded.front_y, front_width, front_height],
+        [truth.front_x, truth.front_y, front_width, front_height],
+        config.iou_loss,
+    );
+    let clip = if config.max_delta == f32::MAX {
+        1.0
+    } else {
+        config.max_delta
+    };
+    let delta_x = finite_or_zero(gradient_x / context.grid_width as f32 * config.normalizer)
+        .clamp(-clip, clip);
+    let delta_y = finite_or_zero(gradient_y / context.grid_height as f32 * config.normalizer)
+        .clamp(-clip, clip);
+    Ok(ObbYoloFrontPointDeltas {
+        front_x: delta_x,
+        front_y: delta_y,
+        center_x: if center_front_anchor { delta_x } else { 0.0 },
+        center_y: if center_front_anchor { delta_y } else { 0.0 },
+        loss: finite_or_zero((1.0 - ciou).max(0.0)),
+    })
 }
 
 fn finite_or_zero(value: f32) -> f32 {
@@ -2560,10 +2643,11 @@ fn validate_truth(truth: &ObbLabel) -> Result<()> {
 mod tests {
     use super::{
         OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloBatchCellPrediction,
-        ObbYoloBoxDeltaConfig, ObbYoloCellTruthMatch, ObbYoloHeadAssignmentSpec,
-        ObbYoloHeadMatchConfig, ObbYoloMatchScoreBranch, ObbYoloMatchScoreConfig,
-        ObbYoloPositiveKind, ObbYoloPositiveObjectnessConfig, ObbYoloPredictionMatchContext,
-        apply_obb_yolo_batch_head_objectness_deltas, apply_obb_yolo_batch_head_positive_box_deltas,
+        ObbYoloBoxDeltaConfig, ObbYoloCellTruthMatch, ObbYoloFrontPointDeltaConfig,
+        ObbYoloHeadAssignmentSpec, ObbYoloHeadMatchConfig, ObbYoloMatchScoreBranch,
+        ObbYoloMatchScoreConfig, ObbYoloPositiveKind, ObbYoloPositiveObjectnessConfig,
+        ObbYoloPredictionMatchContext, apply_obb_yolo_batch_head_objectness_deltas,
+        apply_obb_yolo_batch_head_positive_box_deltas,
         apply_obb_yolo_batch_head_positive_class_deltas,
         apply_obb_yolo_batch_head_positive_objectness_deltas,
         apply_obb_yolo_batch_head_training_deltas,
@@ -2577,7 +2661,8 @@ mod tests {
         obb_yolo_cell_objectness_delta, obb_yolo_ciou_prediction_match_score,
         obb_yolo_class_deltas, obb_yolo_cobb_prediction_match_score_with_viou,
         obb_yolo_covariance_prediction_match_score,
-        obb_yolo_covariance_prediction_match_score_with_viou, obb_yolo_match_score,
+        obb_yolo_covariance_prediction_match_score_with_viou,
+        obb_yolo_front_point_regression_deltas, obb_yolo_match_score,
         select_obb_yolo_cell_truth_match, visit_obb_yolo_batch_head_matches,
     };
     use crate::obb_labels::ObbLabel;
@@ -3042,6 +3127,67 @@ mod tests {
         .unwrap();
         assert!((smooth_delta[6] - 4.8).abs() < 1e-6);
         assert_eq!(smooth_delta[15], 0.4);
+    }
+
+    #[test]
+    fn front_point_deltas_match_source_chain_and_center_prior_gate() {
+        let mut label = truth(0.5, 0.5, 0.2, 0.1);
+        label.front_x = 0.66;
+        label.front_y = 0.57;
+        label.has_front = true;
+        let prediction = [0.5, 0.5, 0.0, 0.0, 1.2, 0.7];
+        let context = ObbYoloPredictionMatchContext {
+            anchor_width: 20.0,
+            anchor_height: 10.0,
+            cell_x: 1,
+            cell_y: 1,
+            grid_width: 4,
+            grid_height: 3,
+            net_width: 100,
+            net_height: 60,
+            new_coords: false,
+        };
+        let config = ObbYoloFrontPointDeltaConfig {
+            normalizer: 1.4,
+            max_delta: 100.0,
+            ..ObbYoloFrontPointDeltaConfig::default()
+        };
+        let actual =
+            obb_yolo_front_point_regression_deltas(prediction, &label, context, config, true)
+                .unwrap();
+        let decoded = decode_obb_yolo_prediction(prediction, context).unwrap();
+        let front_width = (label.w * 0.25).max(1e-5);
+        let front_height = (label.h * 0.25).max(1e-5);
+        let (ciou, gradient_x, gradient_y) = crate::train::obb_front_point_ciou_gradient(
+            [decoded.front_x, decoded.front_y, front_width, front_height],
+            [label.front_x, label.front_y, front_width, front_height],
+            config.iou_loss,
+        );
+        let expected_x = (gradient_x / context.grid_width as f32 * config.normalizer)
+            .clamp(-config.max_delta, config.max_delta);
+        let expected_y = (gradient_y / context.grid_height as f32 * config.normalizer)
+            .clamp(-config.max_delta, config.max_delta);
+        assert!((actual.front_x - expected_x).abs() < 1e-6);
+        assert!((actual.front_y - expected_y).abs() < 1e-6);
+        assert!((actual.loss - (1.0 - ciou).max(0.0)).abs() < 1e-6);
+        assert!((actual.center_x - actual.front_x).abs() < 1e-7);
+        assert!((actual.center_y - actual.front_y).abs() < 1e-7);
+        assert!(actual.loss.is_finite() && actual.loss >= 0.0);
+
+        let direct =
+            obb_yolo_front_point_regression_deltas(prediction, &label, context, config, false)
+                .unwrap();
+        assert_eq!(direct.center_x, 0.0);
+        assert_eq!(direct.center_y, 0.0);
+        let absent = obb_yolo_front_point_regression_deltas(
+            prediction,
+            &truth(0.5, 0.5, 0.2, 0.1),
+            context,
+            config,
+            true,
+        )
+        .unwrap();
+        assert_eq!(absent, Default::default());
     }
 
     #[test]

@@ -2058,6 +2058,35 @@ fn dx_box_iou(pred: YoloBox, truth: YoloBox, iou_loss: YoloIouLoss) -> BoxGrad {
     }
 }
 
+/// Source `obb_yolo_delta_front_point` needs an AABB CIoU value and the
+/// configured box-IoU x/y derivatives for its fixed-size front-point boxes.
+pub(crate) fn obb_front_point_ciou_gradient(
+    pred: [f32; 4],
+    truth: [f32; 4],
+    iou_loss: YoloIouLoss,
+) -> (f32, f32, f32) {
+    let pred_box = YoloBox {
+        x: pred[0],
+        y: pred[1],
+        w: pred[2],
+        h: pred[3],
+    };
+    let truth_box = YoloBox {
+        x: truth[0],
+        y: truth[1],
+        w: truth[2],
+        h: truth[3],
+    };
+    let ciou = box_ciou(pred_box, truth_box);
+    let derivative_kind = if iou_loss == YoloIouLoss::Mse {
+        YoloIouLoss::Ciou
+    } else {
+        iou_loss
+    };
+    let gradient = dx_box_iou(pred_box, truth_box, derivative_kind);
+    (ciou, gradient.dx, gradient.dy)
+}
+
 fn to_tblr(b: YoloBox) -> BoxAbs {
     BoxAbs {
         top: b.y - b.h * 0.5,

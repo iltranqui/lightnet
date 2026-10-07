@@ -286,8 +286,9 @@ Immediately next, in dependency order:
   tensors; v125 adds a standalone center-front-anchor point decoder; v126 routes
   optional anchor offsets through head matching and box deltas; v127 aggregates
   multi-head class and positive-assignment metrics; v128 reports source total-bbox
-  counts across threshold and anchor assignments. Still open: cfg
-  ingestion and inference/network decode, raw front-channel gradients, multi-head
+  counts across threshold and anchor assignments; v129 adds a standalone source
+  front-point delta primitive. Still open: cfg
+  ingestion and inference/network decode, front-channel batch writeback, multi-head
   network-loop/backprop integration, truth-threshold metric/loss aggregation,
   integrated losses and training-loop wiring, crop/resize and mosaic transforms,
   alternate NMS-kind implementations, training `-map` cadence, and CARPN network
