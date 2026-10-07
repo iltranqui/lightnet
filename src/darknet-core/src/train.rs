@@ -546,15 +546,9 @@ fn merge_obb_training_stats(
             next_head.total_bbox_count,
             "head total_bbox",
         )?;
-        checked_add_obb_training_sum(
-            &mut total_head.front_point_loss.loss_sum,
-            next_head.front_point_loss.loss_sum,
-            "head front-point loss",
-        )?;
-        checked_add_obb_training_count(
-            &mut total_head.front_point_loss.count,
-            next_head.front_point_loss.count,
-            "head front-point loss",
+        crate::obb_training::merge_front_point_metrics(
+            &mut total_head.front_point_loss,
+            next_head.front_point_loss,
         )?;
     }
     checked_add_obb_training_sum(
@@ -582,15 +576,9 @@ fn merge_obb_training_stats(
         next.total_bbox_count,
         "total_bbox",
     )?;
-    checked_add_obb_training_sum(
-        &mut total.front_point_loss.loss_sum,
-        next.front_point_loss.loss_sum,
-        "front-point loss",
-    )?;
-    checked_add_obb_training_count(
-        &mut total.front_point_loss.count,
-        next.front_point_loss.count,
-        "front-point loss",
+    crate::obb_training::merge_front_point_metrics(
+        &mut total.front_point_loss,
+        next.front_point_loss,
     )?;
     Ok(())
 }
@@ -2799,6 +2787,8 @@ mod tests {
         assert_eq!(stats.anchor_box_positive_count, 2);
         assert_eq!(stats.total_bbox_count, 2);
         assert_eq!(stats.front_point_loss.count, 2);
+        assert!(stats.front_point_loss.angle_count <= stats.front_point_loss.count);
+        assert!(stats.front_point_loss.angle_sum_degrees.is_finite());
         assert_ne!(executable.params, before);
     }
 

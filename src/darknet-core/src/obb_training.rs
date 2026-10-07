@@ -430,13 +430,26 @@ pub struct ObbYoloFrontPointDeltas {
     pub loss: f32,
 }
 
-/// Front-point loss accumulated over truth-threshold and anchor assignments.
+/// Front-point loss and orientation metrics accumulated over threshold/anchor assignments.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ObbYoloFrontPointMetrics {
     /// Sum after applying the source front-loss normalizer and class multiplier.
     pub loss_sum: f32,
-    /// Number of explicit-front assignments included in the sum.
+    /// Number of explicit-front assignments included in the loss sum.
     pub count: usize,
+    /// Source mean-angle numerator, in degrees, before division by `angle_count`.
+    pub angle_sum_degrees: f64,
+    /// Assignments with defined nonzero predicted and truth front vectors.
+    pub angle_count: usize,
+    pub angle_below_5: usize,
+    pub angle_below_20: usize,
+    pub angle_above_30: usize,
+}
+
+impl ObbYoloFrontPointMetrics {
+    pub fn mean_orientation_error_degrees(self) -> Option<f64> {
+        (self.angle_count > 0).then(|| self.angle_sum_degrees / self.angle_count as f64)
+    }
 }
 
 /// Result of source single-prediction OBB score-branch selection.
@@ -2511,6 +2524,9 @@ fn accumulate_front_point_metrics(
     truth: &ObbLabel,
     front_deltas: ObbYoloFrontPointDeltas,
     normalizer: f32,
+    prediction: [f32; 6],
+    context: ObbYoloPredictionMatchContext,
+    front_anchor_offset: Option<[f32; 2]>,
 ) -> Result<()> {
     if !truth.has_front {
         return Ok(());
@@ -2526,23 +2542,85 @@ fn accumulate_front_point_metrics(
         .count
         .checked_add(1)
         .ok_or_else(|| Error::InvalidConfig("OBB front-point loss count overflows".to_owned()))?;
+
+    let decoded = decode_obb_yolo_prediction_with_front_anchor_offset(
+        prediction,
+        context,
+        front_anchor_offset,
+    )?;
+    let pred_dx = decoded.front_x - decoded.bbox.x;
+    let pred_dy = decoded.front_y - decoded.bbox.y;
+    let truth_dx = truth.front_x - truth.x;
+    let truth_dy = truth.front_y - truth.y;
+    let pred_norm = (pred_dx * pred_dx + pred_dy * pred_dy).sqrt();
+    let truth_norm = (truth_dx * truth_dx + truth_dy * truth_dy).sqrt();
+    if pred_norm > 1e-9 && truth_norm > 1e-9 {
+        let cos_theta =
+            ((pred_dx * truth_dx + pred_dy * truth_dy) / (pred_norm * truth_norm)).clamp(-1.0, 1.0);
+        let angle_degrees = f64::from(cos_theta).acos().to_degrees();
+        if angle_degrees.is_finite() {
+            metrics.angle_sum_degrees += angle_degrees;
+            if !metrics.angle_sum_degrees.is_finite() {
+                return Err(Error::InvalidConfig(
+                    "OBB orientation-error sum is non-finite".to_owned(),
+                ));
+            }
+            metrics.angle_count = metrics.angle_count.checked_add(1).ok_or_else(|| {
+                Error::InvalidConfig("OBB orientation-error count overflows".to_owned())
+            })?;
+            if angle_degrees < 5.0 {
+                metrics.angle_below_5 = metrics.angle_below_5.checked_add(1).ok_or_else(|| {
+                    Error::InvalidConfig("OBB angle-under-5 count overflows".to_owned())
+                })?;
+            }
+            if angle_degrees < 20.0 {
+                metrics.angle_below_20 =
+                    metrics.angle_below_20.checked_add(1).ok_or_else(|| {
+                        Error::InvalidConfig("OBB angle-under-20 count overflows".to_owned())
+                    })?;
+            }
+            if angle_degrees > 30.0 {
+                metrics.angle_above_30 =
+                    metrics.angle_above_30.checked_add(1).ok_or_else(|| {
+                        Error::InvalidConfig("OBB angle-over-30 count overflows".to_owned())
+                    })?;
+            }
+        }
+    }
     Ok(())
 }
 
-fn merge_front_point_metrics(
+pub(crate) fn merge_front_point_metrics(
     target: &mut ObbYoloFrontPointMetrics,
     source: ObbYoloFrontPointMetrics,
 ) -> Result<()> {
     target.loss_sum += source.loss_sum;
-    if !target.loss_sum.is_finite() {
+    target.angle_sum_degrees += source.angle_sum_degrees;
+    if !target.loss_sum.is_finite() || !target.angle_sum_degrees.is_finite() {
         return Err(Error::InvalidConfig(
-            "OBB aggregate front-point loss is non-finite".to_owned(),
+            "OBB aggregate front-point metrics are non-finite".to_owned(),
         ));
     }
     target.count = target
         .count
         .checked_add(source.count)
         .ok_or_else(|| Error::InvalidConfig("OBB front-point loss count overflows".to_owned()))?;
+    target.angle_count = target
+        .angle_count
+        .checked_add(source.angle_count)
+        .ok_or_else(|| Error::InvalidConfig("OBB orientation-error count overflows".to_owned()))?;
+    target.angle_below_5 = target
+        .angle_below_5
+        .checked_add(source.angle_below_5)
+        .ok_or_else(|| Error::InvalidConfig("OBB angle-under-5 count overflows".to_owned()))?;
+    target.angle_below_20 = target
+        .angle_below_20
+        .checked_add(source.angle_below_20)
+        .ok_or_else(|| Error::InvalidConfig("OBB angle-under-20 count overflows".to_owned()))?;
+    target.angle_above_30 = target
+        .angle_above_30
+        .checked_add(source.angle_above_30)
+        .ok_or_else(|| Error::InvalidConfig("OBB angle-over-30 count overflows".to_owned()))?;
     Ok(())
 }
 
@@ -2712,6 +2790,12 @@ pub fn apply_obb_yolo_batch_head_positive_front_point_deltas(
             truth,
             front_deltas,
             truth_delta_config.normalizer,
+            prediction,
+            context,
+            assignment
+                .front_anchor_offsets
+                .as_ref()
+                .map(|offsets| offsets[positive.anchor_index]),
         )?;
     }
     Ok(metrics)
@@ -2855,6 +2939,12 @@ pub fn apply_obb_yolo_batch_head_truth_threshold_front_point_deltas(
             truth,
             front_deltas,
             truth_delta_config.normalizer,
+            prediction,
+            context,
+            match_config
+                .front_anchor_offsets
+                .as_ref()
+                .map(|offsets| offsets[matched.anchor_index]),
         )?;
         Ok(())
     })?;
@@ -4768,6 +4858,37 @@ mod tests {
     }
 
     #[test]
+    fn front_point_metrics_merge_orientation_error_sums_and_buckets() {
+        let mut total = super::ObbYoloFrontPointMetrics {
+            loss_sum: 1.5,
+            count: 1,
+            angle_sum_degrees: 4.0,
+            angle_count: 1,
+            angle_below_5: 1,
+            angle_below_20: 1,
+            angle_above_30: 0,
+        };
+        let next = super::ObbYoloFrontPointMetrics {
+            loss_sum: 2.5,
+            count: 2,
+            angle_sum_degrees: 90.0,
+            angle_count: 1,
+            angle_below_5: 0,
+            angle_below_20: 0,
+            angle_above_30: 1,
+        };
+        super::merge_front_point_metrics(&mut total, next).unwrap();
+        assert_eq!(total.loss_sum, 4.0);
+        assert_eq!(total.count, 3);
+        assert_eq!(total.angle_sum_degrees, 94.0);
+        assert_eq!(total.angle_count, 2);
+        assert_eq!(total.mean_orientation_error_degrees(), Some(47.0));
+        assert_eq!(total.angle_below_5, 1);
+        assert_eq!(total.angle_below_20, 1);
+        assert_eq!(total.angle_above_30, 1);
+    }
+
+    #[test]
     fn positive_anchor_front_point_delta_writeback_preserves_other_channels() {
         let mut label = truth(0.5, 0.5, 0.2, 0.1);
         label.front_x = 0.66;
@@ -4831,6 +4952,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(metrics.count, 1);
+        assert_eq!(metrics.angle_count, 1);
+        assert_eq!(metrics.angle_below_20, 1);
+        assert_eq!(metrics.angle_below_5, 0);
+        assert_eq!(metrics.angle_above_30, 0);
         assert!((metrics.loss_sum - expected.loss * front_config.normalizer * 1.5).abs() < 1e-6);
         assert!((deltas[0] - (initial[0] + expected.center_x)).abs() < 1e-6);
         assert!((deltas[1] - (initial[1] + expected.center_y)).abs() < 1e-6);
@@ -4856,6 +4981,31 @@ mod tests {
         assert_eq!(direct_deltas[1], initial[1]);
         assert_ne!(direct_deltas[4], initial[4]);
         assert_ne!(direct_deltas[5], initial[5]);
+
+        let mut perpendicular_truth = truth(0.5, 0.5, 0.2, 0.1);
+        perpendicular_truth.front_x = 0.7;
+        perpendicular_truth.front_y = 0.5;
+        perpendicular_truth.has_front = true;
+        let perpendicular_labels = [vec![perpendicular_truth]];
+        let perpendicular_output = [0.5, 0.5, 0.0, 0.0, 0.5, 0.7, 0.4, 0.3];
+        let mut perpendicular_deltas = [0.0; 8];
+        let perpendicular_metrics = apply_obb_yolo_batch_head_positive_front_point_deltas(
+            &perpendicular_labels,
+            &perpendicular_output,
+            &mut perpendicular_deltas,
+            &assignment,
+            false,
+            front_config,
+        )
+        .unwrap();
+        assert_eq!(perpendicular_metrics.angle_count, 1);
+        assert_eq!(perpendicular_metrics.angle_below_5, 0);
+        assert_eq!(perpendicular_metrics.angle_below_20, 0);
+        assert_eq!(perpendicular_metrics.angle_above_30, 1);
+        assert!(
+            (perpendicular_metrics.angle_sum_degrees - 90.0).abs() < 1e-5,
+            "orthogonal predicted/truth front vectors should differ by 90 degrees"
+        );
     }
 
     #[test]

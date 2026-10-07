@@ -34,6 +34,7 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v151: front-aware OBB training stats now aggregate source angle-error mean/buckets (`<5°`, `<20°`, `>30°`) across assignments, heads, and subdivisions, using configured anchor offsets. The focused angle/merge tests and all 114 OBB-filtered host tests passed.
 - v150: `ciou_obb_mul` is distinguished from additive CIoU-OBB during parsing; OBB training config now rejects that unsupported variant instead of silently using the additive path. Focused coverage and all 113 OBB-filtered host tests passed.
 - v149: OBB `iou_thresh_kind` now parses to the spec with the source `iou` default; a configured `diou` value is covered by the adapter test. This is config retention; training-threshold semantics remain part of broader integration.
 - v148: standard OBB `iou_loss` values are now retained in the parsed YOLO spec and routed into front-point delta configuration; `ciou_obb` and `ciou_obb_mul` map to CIoU while retaining their OBB score-mode flag. The focused adapter tests and all 113 OBB-filtered host tests passed.
