@@ -1195,6 +1195,45 @@ fn decode_obb_yolo_prediction(
     })
 }
 
+/// Decode the source front-point channels, optionally using directional anchor priors.
+///
+/// With `Some([u, v])`, this applies the source center-front-anchor formula:
+/// `bbox_center + [u * anchor_width / net_width, v * anchor_height / net_height]`
+/// plus the raw front channels divided by grid dimensions. `None` preserves the
+/// legacy cell-relative decoding. Existing score/training paths do not implicitly
+/// select offsets; callers must pass this decoded point into their chosen path.
+pub fn decode_obb_yolo_front_point(
+    prediction: [f32; 6],
+    context: ObbYoloPredictionMatchContext,
+    front_anchor_offset: Option<[f32; 2]>,
+) -> Result<[f32; 2]> {
+    if front_anchor_offset.is_some_and(|offset| !offset.into_iter().all(f32::is_finite)) {
+        return Err(Error::InvalidConfig(
+            "OBB front-anchor offsets must be finite".to_owned(),
+        ));
+    }
+    let decoded = decode_obb_yolo_prediction(prediction, context)?;
+    let front = if let Some([offset_u, offset_v]) = front_anchor_offset {
+        [
+            decoded.bbox.x
+                + offset_u * context.anchor_width / context.net_width as f32
+                + finite_or_zero(prediction[4]) / context.grid_width as f32,
+            decoded.bbox.y
+                + offset_v * context.anchor_height / context.net_height as f32
+                + finite_or_zero(prediction[5]) / context.grid_height as f32,
+        ]
+    } else {
+        [decoded.front_x, decoded.front_y]
+    };
+    if front.iter().all(|coordinate| coordinate.is_finite()) {
+        Ok(front)
+    } else {
+        Err(Error::InvalidConfig(
+            "OBB decoded front point is non-finite".to_owned(),
+        ))
+    }
+}
+
 /// Calculate one positive cell's source OBB YOLO class-channel deltas.
 ///
 /// This ports `delta_obb_yolo_class` over channel slices. If the selected
@@ -2333,7 +2372,7 @@ mod tests {
         apply_obb_yolo_batch_head_training_deltas,
         apply_obb_yolo_batch_head_truth_threshold_deltas,
         apply_obb_yolo_batch_multi_head_training_deltas, assign_obb_yolo_anchor,
-        decode_obb_yolo_prediction, encode_obb_yolo_truth_batch,
+        decode_obb_yolo_front_point, decode_obb_yolo_prediction, encode_obb_yolo_truth_batch,
         enumerate_obb_yolo_batch_positives, enumerate_obb_yolo_head_positives,
         match_obb_yolo_batch_cell_predictions, match_obb_yolo_cell_prediction,
         match_obb_yolo_cell_prediction_with_score_config, obb_yolo_anchor_match_score,
@@ -2552,6 +2591,30 @@ mod tests {
             enumerate_obb_yolo_batch_positives(&[Vec::new()], 1, &anchors, &[], 10, 10, 1.0,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn front_point_decode_applies_source_directional_anchor_prior() {
+        let context = ObbYoloPredictionMatchContext {
+            anchor_width: 24.0,
+            anchor_height: 12.0,
+            cell_x: 2,
+            cell_y: 1,
+            grid_width: 8,
+            grid_height: 4,
+            net_width: 64,
+            net_height: 32,
+            new_coords: false,
+        };
+        let prediction = [0.5, 0.25, 0.0, 0.0, 0.4, 0.75];
+        let direct = decode_obb_yolo_front_point(prediction, context, None).unwrap();
+        assert!((direct[0] - 0.3).abs() < 1e-6);
+        assert!((direct[1] - 0.4375).abs() < 1e-6);
+        let anchored =
+            decode_obb_yolo_front_point(prediction, context, Some([0.25, -0.5])).unwrap();
+        assert!((anchored[0] - 0.45625).abs() < 1e-6);
+        assert!((anchored[1] - 0.3125).abs() < 1e-6);
+        assert!(decode_obb_yolo_front_point(prediction, context, Some([f32::NAN, 0.0])).is_err());
     }
 
     #[test]

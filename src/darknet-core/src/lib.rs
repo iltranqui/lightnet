@@ -80,6 +80,7 @@ pub use obb_training::{
     enumerate_obb_yolo_head_positives,
     match_obb_yolo_batch_cell_predictions, match_obb_yolo_cell_prediction,
     obb_yolo_anchor_match_score, obb_yolo_cell_objectness_delta,
+    decode_obb_yolo_front_point,
     match_obb_yolo_cell_prediction_with_score_config,
     obb_yolo_match_score,
     obb_yolo_angular_prediction_match_score_with_viou, obb_yolo_box_regression_deltas,
