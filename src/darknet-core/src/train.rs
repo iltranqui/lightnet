@@ -1318,6 +1318,24 @@ pub fn load_obb_training_batch_from_paths(
     })
 }
 
+/// Load an OBB batch by direct resize, then apply configured, seeded
+/// horizontal flips to each image and its labels together. Other augmentation
+/// options are deliberately not applied by this OBB-specific wrapper.
+pub fn load_obb_training_batch_with_flips_from_paths(
+    network: &Network,
+    data: &DataConfig,
+    image_paths: &[PathBuf],
+    start_index: usize,
+    augmentation: &crate::augmentation::DetectorAugmentation,
+    seed: u64,
+    sample_start: u64,
+) -> Result<ObbTrainingBatch> {
+    let mut batch = load_obb_training_batch_from_paths(network, data, image_paths, start_index)?;
+    let flips = augmentation.horizontal_flip_mask(seed, sample_start, batch.input.shape.batch);
+    batch.apply_horizontal_flips(&flips)?;
+    Ok(batch)
+}
+
 fn obb_training_classes(network: &Network, data_classes: Option<usize>) -> Result<usize> {
     if !network.net.obb {
         return Err(Error::InvalidConfig(
@@ -2090,8 +2108,9 @@ mod tests {
         apply_yolo_box_delta, apply_yolo_class_delta, apply_yolo_delta_filtering,
         apply_yolo_positive_objectness, bbox_iou_kind, compute_yolo_training_loss,
         compute_yolo_training_loss_with_state, dx_box_iou, load_obb_training_batch,
-        load_obb_training_batch_from_paths, load_training_batch, load_yolo_labels,
-        replace_image_to_label, yolo_head_cost, yolo_xy_output,
+        load_obb_training_batch_from_paths, load_obb_training_batch_with_flips_from_paths,
+        load_training_batch, load_yolo_labels, replace_image_to_label, yolo_head_cost,
+        yolo_xy_output,
     };
     use crate::cfg::ConfigFile;
     use crate::model::{Network, TensorShape, YoloIouLoss, YoloSpec};
@@ -2404,6 +2423,74 @@ mod tests {
             expected.data.as_slice(),
             "wrapped first sample should contain the resized blue image"
         );
+    }
+
+    #[test]
+    fn obb_batch_loader_applies_configured_seeded_flips_to_images_and_labels() {
+        let dir = temp_path("darknet-obb-flip-loader");
+        let _ = fs::create_dir_all(&dir);
+        let first = dir.join("first.ppm");
+        let second = dir.join("second.ppm");
+        fs::write(&first, b"P6\n2 1\n255\n\xff\x00\x00\x00\x00\xff").expect("first image writes");
+        fs::write(&second, b"P6\n2 1\n255\n\x00\xff\x00\xff\xff\x00").expect("second image writes");
+        fs::write(dir.join("first.txt"), "0 0.25 0.5 0.25 0.5 0.125 0.5\n")
+            .expect("explicit-front label writes");
+        fs::write(dir.join("second.txt"), "0 0.75 0.5 0.25 0.5\n")
+            .expect("absent-front label writes");
+
+        let paths = [first, second];
+        let network = obb_test_network(2);
+        let data = empty_data_config(Some(1));
+        let augmentation_cfg = ConfigFile::parse_str(
+            "obb-flip.cfg",
+            "[net]\nwidth=2\nheight=1\nchannels=3\nobb=1\nflip=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\n",
+        )
+        .expect("OBB augmentation cfg parses");
+        let augmentation =
+            crate::augmentation::DetectorAugmentation::from_config(&augmentation_cfg)
+                .expect("OBB augmentation options parse");
+        let seed = 77;
+        let sample_start = (0..128)
+            .find(|&sample| {
+                augmentation
+                    .horizontal_flip_mask(seed, sample, 2)
+                    .iter()
+                    .any(|flip| *flip)
+            })
+            .expect("some deterministic sample includes a flip");
+        let flips = augmentation.horizontal_flip_mask(seed, sample_start, 2);
+        assert!(flips.iter().any(|flip| *flip));
+
+        let baseline = load_obb_training_batch_from_paths(&network, &data, &paths, 0)
+            .expect("unaugmented OBB batch loads");
+        let mut expected = baseline.clone();
+        expected
+            .apply_horizontal_flips(&flips)
+            .expect("reference mask applies");
+        let actual = load_obb_training_batch_with_flips_from_paths(
+            &network,
+            &data,
+            &paths,
+            0,
+            &augmentation,
+            seed,
+            sample_start,
+        )
+        .expect("flipped OBB batch loads");
+        assert_eq!(actual, expected);
+        let sample_len = network.net.input_shape().element_count();
+        for (sample, flip) in flips.iter().copied().enumerate() {
+            let range = sample * sample_len..(sample + 1) * sample_len;
+            let actual_sample = &actual.input.data[range.clone()];
+            let baseline_sample = &baseline.input.data[range];
+            if flip {
+                assert_ne!(actual_sample, baseline_sample);
+            } else {
+                assert_eq!(actual_sample, baseline_sample);
+            }
+        }
+        assert!(actual.labels[0][0].has_front);
+        assert!(!actual.labels[1][0].has_front);
     }
 
     #[test]

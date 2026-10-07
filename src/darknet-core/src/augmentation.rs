@@ -1,6 +1,8 @@
 //! Seeded detector augmentation matching the C++ crop/box and u8 HSV path.
 use crate::{ConfigFile, Error, PlanarRgbImage, Result, YoloLabel};
 
+const SAMPLE_RNG_MULTIPLIER: u64 = 0xd6e8feb86659fd93;
+
 #[derive(Clone, Debug)]
 pub struct DetectorAugmentation {
     pub jitter: f32,
@@ -35,9 +37,21 @@ impl DetectorAugmentation {
             .sections
             .iter()
             .rev()
-            .find(|s| matches!(s.name.as_str(), "yolo" | "gaussian_yolo" | "region"))
+            .find(|s| {
+                matches!(
+                    s.name.as_str(),
+                    "yolo" | "gaussian_yolo" | "region" | "obb_yolo"
+                )
+            })
             .ok_or_else(|| invalid("detector augmentation requires a detector head"))?;
-        for key in ["cutmix", "blur", "gaussian_noise", "fog", "track", "contrastive"] {
+        for key in [
+            "cutmix",
+            "blur",
+            "gaussian_noise",
+            "fog",
+            "track",
+            "contrastive",
+        ] {
             if net.get_f32(key, 0.0)? != 0.0 {
                 return Err(invalid(&format!(
                     "training augmentation {key} is not implemented yet"
@@ -46,7 +60,10 @@ impl DetectorAugmentation {
         }
         let mut random = 0.0f32;
         for section in &cfg.sections {
-            if matches!(section.name.as_str(), "yolo" | "gaussian_yolo" | "region") {
+            if matches!(
+                section.name.as_str(),
+                "yolo" | "gaussian_yolo" | "region" | "obb_yolo"
+            ) {
                 random = random.max(section.get_f32("random", 0.0)?);
             }
         }
@@ -133,6 +150,28 @@ impl DetectorAugmentation {
         )
     }
 
+    /// Select per-image horizontal flips from the same seeded Rust draw used
+    /// by `apply_detailed` (two resize draws and four jitter draws precede it).
+    /// `sample_start` is an absolute sample ordinal, so the result is independent
+    /// of worker scheduling and batch subdivision. The RNG is deterministic but
+    /// not bit-identical to C++ `rand`.
+    pub fn horizontal_flip_mask(&self, seed: u64, sample_start: u64, count: usize) -> Vec<bool> {
+        (0..count)
+            .map(|offset| {
+                let sample = sample_start.wrapping_add(offset as u64);
+                let mut rng = sample_rng(seed, sample);
+                for _ in 0..6 {
+                    let _ = rng.unit();
+                }
+                self.draw_flip(&mut rng)
+            })
+            .collect()
+    }
+
+    fn draw_flip(&self, rng: &mut Rng) -> bool {
+        self.flip && rng.unit() >= 0.5
+    }
+
     /// C++ mosaic (mode 3): independently augment four samples, align their
     /// crops at the cut, paste the corresponding source quadrants, and shift or
     /// clip boxes using `data.cpp`'s integer-pixel equations. The deterministic
@@ -157,7 +196,7 @@ impl DetectorAugmentation {
             .checked_mul(height)
             .and_then(|pixels| pixels.checked_mul(3))
             .ok_or_else(|| invalid("mosaic image size overflow"))?;
-        let mut rng = Rng(seed ^ sample.wrapping_mul(0xd6e8feb86659fd93));
+        let mut rng = sample_rng(seed, sample);
         let cut_x = rand_cut(width, 0.2, &mut rng);
         let cut_y = rand_cut(height, 0.2, &mut rng);
         let mut canvas = vec![0u8; canvas_len];
@@ -250,11 +289,11 @@ impl DetectorAugmentation {
                 "augmentation requires nonempty single RGB image and output",
             ));
         }
-        let mut rng = Rng(seed ^ sample.wrapping_mul(0xd6e8feb86659fd93));
+        let mut rng = sample_rng(seed, sample);
         // Keep the C++ correlations: same resize draws for x/y margins.
         let rr = [rng.unit(), rng.unit()];
         let jr = [rng.unit(), rng.unit(), rng.unit(), rng.unit()];
-        let flip = self.flip && rng.unit() >= 0.5;
+        let flip = self.draw_flip(&mut rng);
         let hue = (2.0 * rng.unit() - 1.0) * self.hue;
         let sat = rng.scale(self.saturation);
         let exp = rng.scale(self.exposure);
@@ -667,6 +706,10 @@ impl Rng {
             1.0 / value
         }
     }
+}
+
+fn sample_rng(seed: u64, sample: u64) -> Rng {
+    Rng(seed ^ sample.wrapping_mul(SAMPLE_RNG_MULTIPLIER))
 }
 
 struct AugmentedSample {
@@ -1231,11 +1274,58 @@ mod tests {
     }
 
     #[test]
+    fn obb_cfg_flip_mask_matches_seeded_augmentation_draws() {
+        let enabled_cfg = ConfigFile::parse_str(
+            "obb-aug.cfg",
+            "[net]\nwidth=10\nheight=10\nchannels=3\nobb=1\nflip=1\n[obb_yolo]\njitter=.2\nresize=1\nmax=200\nrandom=.5\n",
+        )
+        .unwrap();
+        let enabled =
+            DetectorAugmentation::from_config(&enabled_cfg).expect("OBB YOLO config is accepted");
+        assert_eq!(enabled.random, 0.5);
+
+        let seed = 0x1234_5678;
+        let sample_start = 21;
+        let flips = enabled.horizontal_flip_mask(seed, sample_start, 12);
+        assert_eq!(flips, enabled.horizontal_flip_mask(seed, sample_start, 12));
+        let image = source();
+        for (offset, actual) in flips.iter().copied().enumerate() {
+            let sample = sample_start + offset as u64;
+            let expected = enabled
+                .apply_detailed(&image, &[], 10, 10, seed, sample, None)
+                .expect("augmentation sample")
+                .flip;
+            assert_eq!(actual, expected, "sample ordinal {sample}");
+        }
+
+        let disabled_cfg = ConfigFile::parse_str(
+            "obb-aug-disabled.cfg",
+            "[net]\nwidth=10\nheight=10\nchannels=3\nobb=1\nflip=0\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\n",
+        )
+        .unwrap();
+        let disabled = DetectorAugmentation::from_config(&disabled_cfg)
+            .expect("OBB config with flip disabled is accepted");
+        assert!(
+            disabled
+                .horizontal_flip_mask(seed, sample_start, 12)
+                .iter()
+                .all(|flip| !flip)
+        );
+    }
+
+    #[test]
     fn parser_defaults_and_unsupported_active_options() {
         let opts = settings("");
         assert!(opts.flip);
         assert_eq!(opts.max_boxes, 200);
-        for key in ["cutmix", "blur", "gaussian_noise", "fog", "track", "contrastive"] {
+        for key in [
+            "cutmix",
+            "blur",
+            "gaussian_noise",
+            "fog",
+            "track",
+            "contrastive",
+        ] {
             let cfg =
                 ConfigFile::parse_str("aug.cfg", &format!("[net]\n{key}=1\n[yolo]\n")).unwrap();
             assert!(DetectorAugmentation::from_config(&cfg).is_err());

@@ -93,7 +93,8 @@ pub use train::{
     DataConfig, ObbTrainingBatch, TrainingBatch, YoloLabel, YoloTrainingLoss, YoloTrainingState,
     compute_yolo_training_loss, compute_yolo_training_loss_with_state,
     load_augmented_training_batch_from_paths, load_obb_training_batch,
-    load_obb_training_batch_from_paths, load_paths_file, load_training_batch,
+    load_obb_training_batch_from_paths, load_obb_training_batch_with_flips_from_paths,
+    load_paths_file, load_training_batch,
     load_training_batch_from_paths, load_yolo_labels, replace_image_to_label,
 };
 pub use weights::{WeightsHeader, WeightsInspection, inspect_weights_file, save_weights};

@@ -34,6 +34,13 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v90: `DetectorAugmentation` now accepts `[obb_yolo]` cfg sections and exposes
+  a deterministic per-sample horizontal-flip mask matching its existing Rust
+  augmentation draw order. Added `load_obb_training_batch_with_flips_from_paths`,
+  which applies the configured flips to resized NCHW images and labels together.
+  Crop/resize jitter, HSV, mosaic, training/loss integration, and C++ RNG parity
+  remain unsupported. The focused OBB suite passed 42/42 and all 465
+  `darknet-core` library tests passed.
 - v89: added public direction-free OBB YOLO anchor-match scoring and
   best-anchor/cell assignment primitives in `obb_training.rs`. Matching compares
   normalized anchor size with truth size; global-best selection, first-on-tie
