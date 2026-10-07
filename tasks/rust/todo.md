@@ -244,10 +244,12 @@ Immediately next, in dependency order:
   `detector map` CLI route for standard and legacy OBB evaluators; v86 adds the
   source-default oriented `nms_kind=obb` path and rejects unsupported alternatives;
   v87 adds a standalone horizontal-mirror transform for OBB labels; v88 applies
-  caller-selected per-image flips to OBB batch tensors and labels together. Config-
-  driven flip selection, crop/resize and mosaic transforms, OBB truth assignment/
-  losses, alternate NMS-kind implementations, training `-map` cadence integration,
-  and CARPN mAP remain open.
+  caller-selected per-image flips to OBB batch tensors and labels together; v89
+  adds source-derived direction-free anchor-size matching and best-anchor/cell
+  assignment primitives. Config-driven flip selection, crop/resize and mosaic
+  transforms, complete OBB truth assignment/losses, alternate NMS-kind
+  implementations, training `-map` cadence integration, and CARPN mAP remain
+  open.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and
   kernels, weights order `weights.cpp:428`); then `deform_conv`, `dsconv`,
   `graph_conv`, `wmhf`, `clifford`, `recursive_block`.

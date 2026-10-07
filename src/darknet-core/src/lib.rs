@@ -57,6 +57,10 @@ pub mod names;
 pub mod obb_geometry;
 pub mod obb_labels;
 pub use obb_labels::{ObbLabel, flip_obb_labels, load_obb_labels, rotate_obb_labels};
+pub mod obb_training;
+pub use obb_training::{
+    ObbYoloAnchorAssignment, assign_obb_yolo_anchor, obb_yolo_anchor_match_score,
+};
 pub(crate) mod omd_loss;
 pub mod runtime;
 pub(crate) mod segmentation;

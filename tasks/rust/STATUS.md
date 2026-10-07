@@ -34,6 +34,13 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v89: added public direction-free OBB YOLO anchor-match scoring and
+  best-anchor/cell assignment primitives in `obb_training.rs`. Matching compares
+  normalized anchor size with truth size; global-best selection, first-on-tie
+  ordering, head-mask handling, and cell clamping follow the audited source.
+  This is not a complete OBB truth assignment/loss/training path, and no
+  compiled-C++ parity is claimed. The focused OBB suite passed 40/40 and all 463
+  `darknet-core` library tests passed.
 - v88: added `ObbTrainingBatch::apply_horizontal_flips`, which reflects selected
   NCHW samples and their OBB labels together using a validated per-image mask.
   The focused OBB suite passed 36/36 and all 459 `darknet-core` library tests
