@@ -1634,6 +1634,201 @@ impl TrainingLossLog {
     }
 }
 
+#[derive(Default)]
+struct ObbTrainingMetrics {
+    anchor_class_output_sum: f64,
+    anchor_class_count: usize,
+    anchor_box_count: usize,
+    iou_loss_sum: f64,
+    giou_loss_sum: f64,
+    truth_threshold_positive_cells: usize,
+    total_bbox_count: usize,
+    front_point_loss_sum: f64,
+    front_point_count: usize,
+    angle_sum_degrees: f64,
+    angle_count: usize,
+    angle_below_5: usize,
+    angle_below_20: usize,
+    angle_above_30: usize,
+    classification_loss_per_image_sum: f64,
+    source_cost_per_image_sum: f64,
+}
+
+impl ObbTrainingMetrics {
+    fn add_batch(
+        &mut self,
+        batch: &darknet_core::ObbYoloTrainingDeltaBatch,
+        batch_size: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if batch_size == 0 {
+            return Err("OBB metrics require a nonempty subdivision batch".into());
+        }
+        let stats = &batch.stats;
+        self.anchor_class_output_sum += f64::from(stats.anchor_class_stats.class_output_sum);
+        self.iou_loss_sum += stats.iou_loss_sum;
+        self.giou_loss_sum += stats.giou_loss_sum;
+        self.front_point_loss_sum += f64::from(stats.front_point_loss.loss_sum);
+        let per_image = 1.0 / batch_size as f64;
+        self.classification_loss_per_image_sum +=
+            f64::from(batch.classification_loss_component) * per_image;
+        self.source_cost_per_image_sum += f64::from(batch.source_loss_cost) * per_image;
+
+        for (count, increment, name) in [
+            (
+                &mut self.anchor_class_count,
+                stats.anchor_class_stats.positive_count,
+                "anchor class",
+            ),
+            (
+                &mut self.anchor_box_count,
+                stats.anchor_box_positive_count,
+                "anchor box",
+            ),
+            (
+                &mut self.truth_threshold_positive_cells,
+                stats.truth_threshold_positive_cells,
+                "truth-threshold positive",
+            ),
+            (
+                &mut self.total_bbox_count,
+                stats.total_bbox_count,
+                "total bbox",
+            ),
+            (
+                &mut self.front_point_count,
+                stats.front_point_loss.count,
+                "front-point",
+            ),
+            (
+                &mut self.angle_count,
+                stats.front_point_loss.angle_count,
+                "angle",
+            ),
+            (
+                &mut self.angle_below_5,
+                stats.front_point_loss.angle_below_5,
+                "angle below 5 degrees",
+            ),
+            (
+                &mut self.angle_below_20,
+                stats.front_point_loss.angle_below_20,
+                "angle below 20 degrees",
+            ),
+            (
+                &mut self.angle_above_30,
+                stats.front_point_loss.angle_above_30,
+                "angle above 30 degrees",
+            ),
+        ] {
+            *count = count.checked_add(increment).ok_or_else(|| {
+                std::io::Error::other(format!("OBB {name} metrics count overflow"))
+            })?;
+        }
+        self.angle_sum_degrees += stats.front_point_loss.angle_sum_degrees;
+        if [
+            self.anchor_class_output_sum,
+            self.iou_loss_sum,
+            self.giou_loss_sum,
+            self.front_point_loss_sum,
+            self.classification_loss_per_image_sum,
+            self.source_cost_per_image_sum,
+            self.angle_sum_degrees,
+        ]
+        .into_iter()
+        .any(|sum| !sum.is_finite())
+        {
+            return Err("OBB training metrics became non-finite".into());
+        }
+        Ok(())
+    }
+
+    fn average_iou(&self) -> Option<f64> {
+        (self.anchor_box_count > 0).then(|| 1.0 - self.iou_loss_sum / self.anchor_box_count as f64)
+    }
+
+    fn average_giou(&self) -> Option<f64> {
+        (self.anchor_box_count > 0).then(|| 1.0 - self.giou_loss_sum / self.anchor_box_count as f64)
+    }
+
+    fn average_class_output(&self) -> Option<f64> {
+        (self.anchor_class_count > 0)
+            .then(|| self.anchor_class_output_sum / self.anchor_class_count as f64)
+    }
+
+    fn average_front_point_loss(&self) -> Option<f64> {
+        (self.front_point_count > 0)
+            .then(|| self.front_point_loss_sum / self.front_point_count as f64)
+    }
+
+    fn angle_accuracy_below_20_percent(&self) -> Option<f64> {
+        (self.angle_count > 0).then(|| 100.0 * self.angle_below_20 as f64 / self.angle_count as f64)
+    }
+
+    fn average_angle_error_degrees(&self) -> Option<f64> {
+        (self.angle_count > 0).then(|| self.angle_sum_degrees / self.angle_count as f64)
+    }
+}
+
+fn csv_metric(value: Option<f64>) -> String {
+    value
+        .filter(|value| value.is_finite())
+        .map_or_else(String::new, |value| format!("{value:.6}"))
+}
+
+struct ObbTrainingMetricsLog {
+    log: fs::File,
+}
+
+impl ObbTrainingMetricsLog {
+    fn new(backup: &Path, name: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(backup.join(format!("{name}_obb_metrics.csv")))?;
+        if log.metadata()?.len() == 0 {
+            writeln!(
+                log,
+                "iteration,seen,avg_obb_iou,avg_giou,anchor_box_count,truth_threshold_positive_cells,total_bbox_count,avg_cat,anchor_class_count,classification_loss_per_image,cost_minus_classification_per_image,front_point_loss,front_point_count,angle_accuracy_below_20_percent,mean_angle_error_degrees,angle_count,angle_below_5,angle_below_20,angle_above_30"
+            )?;
+        }
+        Ok(Self { log })
+    }
+
+    fn record(
+        &mut self,
+        iteration: usize,
+        seen: u64,
+        metrics: &ObbTrainingMetrics,
+        subdivisions: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let divisor = subdivisions.max(1) as f64;
+        let classification_loss = metrics.classification_loss_per_image_sum / divisor;
+        let source_cost = metrics.source_cost_per_image_sum / divisor;
+        writeln!(
+            self.log,
+            "{iteration},{seen},{},{},{},{},{},{},{},{classification_loss:.6},{:.6},{},{},{},{},{},{},{},{}",
+            csv_metric(metrics.average_iou()),
+            csv_metric(metrics.average_giou()),
+            metrics.anchor_box_count,
+            metrics.truth_threshold_positive_cells,
+            metrics.total_bbox_count,
+            csv_metric(metrics.average_class_output()),
+            metrics.anchor_class_count,
+            source_cost - classification_loss,
+            csv_metric(metrics.average_front_point_loss()),
+            metrics.front_point_count,
+            csv_metric(metrics.angle_accuracy_below_20_percent()),
+            csv_metric(metrics.average_angle_error_degrees()),
+            metrics.angle_count,
+            metrics.angle_below_5,
+            metrics.angle_below_20,
+            metrics.angle_above_30,
+        )?;
+        self.log.flush()?;
+        Ok(())
+    }
+}
+
 /// Background batch loader: decodes/augments the next batch on a worker thread so
 /// the training step does not wait on it.  The caller drives a one-deep
 /// lookahead by requesting the next subdivision before processing the current.
@@ -2135,6 +2330,7 @@ fn run_detector_train_cpu_obb(
     let mut epoch_images = std::sync::Arc::new(epoch_order(&train_images, options.seed, epoch));
     let mut image_cursor = (seen as usize) % train_images.len();
     let mut loss_log = TrainingLossLog::new(&backup_dir, &base_name)?;
+    let mut metrics_log = ObbTrainingMetricsLog::new(&backup_dir, &base_name)?;
 
     println!("OBB CPU trainer: SGD with direct resize and seeded horizontal flips");
     while executable.network.net.max_batches == 0 || batch_num < executable.network.net.max_batches
@@ -2144,6 +2340,7 @@ fn run_detector_train_cpu_obb(
         executable.set_train_iteration(batch_num);
         executable.zero_train_buffers();
         let mut iteration_loss = 0.0f32;
+        let mut iteration_metrics = ObbTrainingMetrics::default();
         for subdivision in 0..subdivisions {
             let sample_offset = subdivision.checked_mul(batch_size).ok_or_else(|| {
                 std::io::Error::other("OBB CLI subdivision sample offset overflow")
@@ -2166,6 +2363,7 @@ fn run_detector_train_cpu_obb(
             let forward = executable.forward_training(&batch.input)?;
             let delta_batch =
                 compute_obb_yolo_training_deltas(&executable.network, &forward, &batch.labels)?;
+            iteration_metrics.add_batch(&delta_batch, batch_size)?;
             iteration_loss += delta_batch.source_loss_cost / batch_size as f32;
             if !iteration_loss.is_finite() {
                 return Err("OBB CLI iteration loss became non-finite".into());
@@ -2209,6 +2407,7 @@ fn run_detector_train_cpu_obb(
             learning_rate,
             iteration_start.elapsed().as_secs_f64() * 1000.0,
         )?;
+        metrics_log.record(batch_num, seen, &iteration_metrics, subdivisions)?;
 
         if options.save_every != 0 && batch_num % options.save_every == 0 {
             let checkpoint = backup_dir.join(format!("{base_name}_{batch_num}.weights"));
@@ -3147,6 +3346,25 @@ mod tests {
         assert!(
             loss_log.lines().any(|line| line.starts_with("1,2,")),
             "{loss_log}"
+        );
+        let metrics_log = std::fs::read_to_string(backup.join("obb-cli_obb_metrics.csv"))
+            .expect("OBB metrics log");
+        let metrics_header = metrics_log.lines().next().expect("OBB metrics header");
+        assert!(metrics_header.contains("mean_angle_error_degrees"));
+        assert_eq!(metrics_header.split(',').count(), 19);
+        let metrics_row = metrics_log
+            .lines()
+            .find(|line| line.starts_with("1,2,"))
+            .expect("one OBB metric row");
+        let columns: Vec<_> = metrics_row.split(',').collect();
+        assert_eq!(columns.len(), 19, "{metrics_row}");
+        assert_eq!(
+            columns[4], "2",
+            "two subdivision box assignments: {metrics_row}"
+        );
+        assert_eq!(
+            columns[8], "2",
+            "two subdivision class assignments: {metrics_row}"
         );
     }
 

@@ -322,9 +322,13 @@ Immediately next, in dependency order:
   checkpoints and loss CSV logging, and explicitly rejects `-map`, Adam, dynamic
   loss scaling, unsupported augmentation, and OBB GPU training. The CLI test
   covers one iteration and the `-map` rejection; all 119 OBB-filtered core tests
-  plus the CLI test passed. No compiled-C++ parity is established.
+  plus the CLI test passed. v160 adds a separate subdivision-aggregated OBB
+  metrics CSV (average IoU/GIoU, class output, assignment counts, loss components,
+  front loss, and orientation accuracy/error buckets); the CLI schema/count test,
+  four detector-train CLI tests, and 119 OBB-filtered core tests pass. No
+  compiled-C++ parity is established.
   Still open: OBB `-map` cadence and broader GPU/optimizer integration, remaining
-  cfg/training option wiring, inference CLI/decode integration, broader
+  cfg/training option wiring, inference CLI/decode integration, remaining
   metric/loss logging, source-faithful crop/resize and mosaic label transforms,
   alternate NMS-kind implementations, and CARPN network decoding/validation.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and
