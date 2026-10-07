@@ -2361,6 +2361,159 @@ pub fn apply_obb_yolo_batch_head_positive_box_deltas(
     Ok(positives.len())
 }
 
+/// Add standalone front-point deltas to best/additional positive anchor slots.
+///
+/// This writes front channels and, when directional offsets are configured,
+/// their source center-chain contribution. It does not cover truth-threshold
+/// cells or compose the complete head training pass.
+pub fn apply_obb_yolo_batch_head_positive_front_point_deltas(
+    batch_truths: &[Vec<ObbLabel>],
+    head_output: &[f32],
+    head_delta: &mut [f32],
+    assignment: &ObbYoloPositiveObjectnessConfig,
+    new_coords: bool,
+    delta_config: ObbYoloFrontPointDeltaConfig,
+) -> Result<usize> {
+    if assignment.classes == 0
+        || !delta_config.normalizer.is_finite()
+        || !delta_config.max_delta.is_finite()
+        || delta_config.max_delta < 0.0
+        || head_delta.iter().any(|value| !value.is_finite())
+        || assignment.class_map.as_ref().is_some_and(|mapping| {
+            mapping.len() != assignment.classes
+                || mapping
+                    .iter()
+                    .any(|&class_id| class_id >= assignment.classes)
+        })
+        || assignment
+            .class_multipliers
+            .as_ref()
+            .is_some_and(|multipliers| {
+                multipliers.len() != assignment.classes
+                    || multipliers.iter().any(|value| {
+                        !value.is_finite() || !(delta_config.normalizer * value).is_finite()
+                    })
+            })
+    {
+        return Err(Error::InvalidConfig(
+            "OBB front-point writeback requires valid classes, scaling, and deltas".to_owned(),
+        ));
+    }
+    validate_anchor_front_offsets(
+        assignment.front_anchor_offsets.as_deref(),
+        assignment.anchors.len() / 2,
+    )?;
+    let stride = assignment
+        .head
+        .grid_width
+        .checked_mul(assignment.head.grid_height)
+        .ok_or_else(|| Error::InvalidConfig("OBB head grid size overflows".to_owned()))?;
+    let entries = assignment
+        .classes
+        .checked_add(7)
+        .ok_or_else(|| Error::InvalidConfig("OBB head entry count overflows".to_owned()))?;
+    let per_batch = assignment
+        .head
+        .mask
+        .len()
+        .checked_mul(entries)
+        .and_then(|count| count.checked_mul(stride))
+        .ok_or_else(|| Error::InvalidConfig("OBB head tensor size overflows".to_owned()))?;
+    let expected = batch_truths
+        .len()
+        .checked_mul(per_batch)
+        .ok_or_else(|| Error::InvalidConfig("OBB batch tensor size overflows".to_owned()))?;
+    if head_output.len() != expected || head_delta.len() != expected {
+        return Err(Error::InvalidConfig(format!(
+            "OBB front-point tensor length mismatch: expected {expected}, output {}, delta {}",
+            head_output.len(),
+            head_delta.len()
+        )));
+    }
+
+    let head_specs = [assignment.head.clone()];
+    let positives = enumerate_obb_yolo_batch_positives(
+        batch_truths,
+        assignment.classes,
+        &assignment.anchors,
+        &head_specs,
+        assignment.net_width,
+        assignment.net_height,
+        assignment.iou_thresh,
+    )?;
+    let center_front_anchor = assignment.front_anchor_offsets.is_some();
+    for tagged in &positives {
+        let positive = tagged.positive.assignment;
+        let anchor_offset = positive
+            .anchor_index
+            .checked_mul(2)
+            .ok_or_else(|| Error::InvalidConfig("OBB anchor index overflows".to_owned()))?;
+        if anchor_offset + 1 >= assignment.anchors.len() {
+            return Err(Error::InvalidConfig(
+                "OBB positive assignment references an invalid anchor".to_owned(),
+            ));
+        }
+        let cell = positive.cell_y * assignment.head.grid_width + positive.cell_x;
+        let base =
+            tagged.batch_index * per_batch + positive.head_anchor_index * entries * stride + cell;
+        let prediction =
+            std::array::from_fn(|channel| finite_or_zero(head_output[base + channel * stride]));
+        let context = ObbYoloPredictionMatchContext {
+            anchor_width: assignment.anchors[anchor_offset],
+            anchor_height: assignment.anchors[anchor_offset + 1],
+            cell_x: positive.cell_x,
+            cell_y: positive.cell_y,
+            grid_width: assignment.head.grid_width,
+            grid_height: assignment.head.grid_height,
+            net_width: assignment.net_width,
+            net_height: assignment.net_height,
+            new_coords,
+        };
+        let truth = &batch_truths[tagged.batch_index][tagged.positive.truth_index];
+        let class_id = assignment
+            .class_map
+            .as_ref()
+            .map_or(truth.class_id, |mapping| mapping[truth.class_id]);
+        let class_multiplier = assignment
+            .class_multipliers
+            .as_ref()
+            .map_or(1.0, |multipliers| multipliers[class_id]);
+        let mut truth_delta_config = delta_config;
+        truth_delta_config.normalizer *= class_multiplier;
+        if !truth_delta_config.normalizer.is_finite() {
+            return Err(Error::InvalidConfig(
+                "OBB front-point class-scaled normalizer is non-finite".to_owned(),
+            ));
+        }
+        let front_deltas = obb_yolo_front_point_regression_deltas(
+            prediction,
+            truth,
+            context,
+            truth_delta_config,
+            center_front_anchor,
+        )?;
+        let updates = [
+            (base + 4 * stride, front_deltas.front_x),
+            (base + 5 * stride, front_deltas.front_y),
+            (base, front_deltas.center_x),
+            (base + stride, front_deltas.center_y),
+        ];
+        let mut results = [0.0; 4];
+        for (index, (delta_index, update)) in updates.into_iter().enumerate() {
+            results[index] = head_delta[delta_index] + update;
+            if !results[index].is_finite() {
+                return Err(Error::InvalidConfig(
+                    "OBB front-point writeback produced a non-finite delta".to_owned(),
+                ));
+            }
+        }
+        for ((delta_index, _), value) in updates.into_iter().zip(results) {
+            head_delta[delta_index] = value;
+        }
+    }
+    Ok(positives.len())
+}
+
 /// Dispatch source-ordered training deltas for one complete OBB YOLO head.
 ///
 /// The pass order is all-cell objectness, truth-threshold class/box deltas,
@@ -2649,6 +2802,7 @@ mod tests {
         ObbYoloPredictionMatchContext, apply_obb_yolo_batch_head_objectness_deltas,
         apply_obb_yolo_batch_head_positive_box_deltas,
         apply_obb_yolo_batch_head_positive_class_deltas,
+        apply_obb_yolo_batch_head_positive_front_point_deltas,
         apply_obb_yolo_batch_head_positive_objectness_deltas,
         apply_obb_yolo_batch_head_training_deltas,
         apply_obb_yolo_batch_head_truth_threshold_deltas,
@@ -3759,6 +3913,98 @@ mod tests {
                 assert_eq!(head_delta[base + channel], 0.77);
             }
         }
+    }
+
+    #[test]
+    fn positive_anchor_front_point_delta_writeback_preserves_other_channels() {
+        let mut label = truth(0.5, 0.5, 0.2, 0.1);
+        label.front_x = 0.66;
+        label.front_y = 0.57;
+        label.has_front = true;
+        let labels = [vec![label]];
+        let mut assignment = ObbYoloPositiveObjectnessConfig {
+            head: ObbYoloHeadAssignmentSpec {
+                mask: vec![0],
+                grid_width: 1,
+                grid_height: 1,
+            },
+            anchors: vec![20.0, 10.0],
+            classes: 1,
+            net_width: 100,
+            net_height: 100,
+            front_anchor_offsets: Some(vec![[0.4, -0.2]]),
+            iou_thresh: 0.1,
+            objectness_normalizer: 1.0,
+            objectness_smooth: false,
+            class_map: None,
+            class_multipliers: Some(vec![1.5]),
+        };
+        let output = [0.5, 0.5, 0.0, 0.0, 0.68, 0.55, 0.4, 0.3];
+        let initial = [0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8];
+        let mut deltas = initial;
+        let front_config = ObbYoloFrontPointDeltaConfig {
+            normalizer: 1.2,
+            max_delta: 0.5,
+            ..ObbYoloFrontPointDeltaConfig::default()
+        };
+        let context = ObbYoloPredictionMatchContext {
+            anchor_width: 20.0,
+            anchor_height: 10.0,
+            cell_x: 0,
+            cell_y: 0,
+            grid_width: 1,
+            grid_height: 1,
+            net_width: 100,
+            net_height: 100,
+            new_coords: false,
+        };
+        let expected = obb_yolo_front_point_regression_deltas(
+            output[..6].try_into().unwrap(),
+            &labels[0][0],
+            context,
+            ObbYoloFrontPointDeltaConfig {
+                normalizer: front_config.normalizer * 1.5,
+                ..front_config
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            apply_obb_yolo_batch_head_positive_front_point_deltas(
+                &labels,
+                &output,
+                &mut deltas,
+                &assignment,
+                false,
+                front_config,
+            )
+            .unwrap(),
+            1
+        );
+        assert!((deltas[0] - (initial[0] + expected.center_x)).abs() < 1e-6);
+        assert!((deltas[1] - (initial[1] + expected.center_y)).abs() < 1e-6);
+        assert_eq!(deltas[2], initial[2]);
+        assert_eq!(deltas[3], initial[3]);
+        assert!((deltas[4] - (initial[4] + expected.front_x)).abs() < 1e-6);
+        assert!((deltas[5] - (initial[5] + expected.front_y)).abs() < 1e-6);
+        assert_eq!(deltas[6], initial[6]);
+        assert_eq!(deltas[7], initial[7]);
+
+        assignment.front_anchor_offsets = None;
+        let mut direct_deltas = initial;
+        apply_obb_yolo_batch_head_positive_front_point_deltas(
+            &labels,
+            &output,
+            &mut direct_deltas,
+            &assignment,
+            false,
+            front_config,
+        )
+        .unwrap();
+        assert_eq!(direct_deltas[0], initial[0]);
+        assert_eq!(direct_deltas[1], initial[1]);
+        assert_ne!(direct_deltas[4], initial[4]);
+        assert_ne!(direct_deltas[5], initial[5]);
     }
 
     #[test]

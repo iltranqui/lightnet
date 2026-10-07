@@ -34,6 +34,7 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v130: added positive-assignment front-point delta writeback for best/additional anchors, including class-scaled normalization, preserved unrelated channels, and optional center-chain updates when offsets are configured. The focused writeback test and all 102 OBB-filtered host tests passed. Truth-threshold front writeback and composed network-loop integration remain open; no compiled-C++ parity is established.
 - v129: added standalone source front-point CIoU channel deltas with grid chain factors, normalizer/clipping, absent-front gating, and optional center-chain contributions when directional priors are present. The focused test and all 101 OBB-filtered host tests passed. Batch/head writeback and network-loop integration remain open; no compiled-C++ parity is established.
 - v128: one-/multi-head OBB stats now expose source `net.total_bbox` counts by summing truth-threshold cells and best/additional anchor box assignments. The focused composition tests and all 100 OBB-filtered host tests passed. Raw front-channel gradients and full network-loop/loss integration remain open.
 - v127: multi-head OBB delta dispatch now returns both per-head stats and source-style aggregate `avg_cat` sums/counts, threshold-positive counts, and box-positive counts. The focused multi-head test and all 100 OBB-filtered host tests passed. Raw front-channel gradients and full network-loop/loss integration remain open.
