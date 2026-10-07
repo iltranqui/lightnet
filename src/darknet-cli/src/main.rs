@@ -12,9 +12,10 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "oxide")]
 use darknet_core::GpuExecutableNetwork;
 use darknet_core::{
-    ConfigFile, DataConfig, DetectionOptions, DetectorAugmentation, ExecutableNetwork, LayerKind,
-    LayerParams, Network, PlanarRgbImage, Tensor, TrainingBatch, YoloLabel, YoloTrainingState,
-    compute_learning_rate, compute_yolo_training_loss_with_state, decode_modern_detections,
+    ConfigFile, DataConfig, Detection, DetectionOptions, DetectorAugmentation, ExecutableNetwork,
+    ForwardResult, LayerKind, LayerParams, Network, ObbDetection, ObbDetectionGeometry,
+    PlanarRgbImage, Tensor, TrainingBatch, YoloLabel, YoloTrainingState, compute_learning_rate,
+    compute_yolo_training_loss_with_state, decode_modern_detections, decode_obb_yolo_detections,
     decode_yolo_detections, initialize_training_params, inspect_weights_file,
     load_augmented_training_batch_from_paths, load_names_file, load_paths_file, save_weights,
 };
@@ -329,11 +330,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(dump_dir) = std::env::var_os("DARKNET_LAYER_DUMP_DIR") {
                 dump_rust_layer_outputs(Path::new(&dump_dir), &network, &result.layer_outputs)?;
             }
-            // Both head families decode into the same `Detection`, so a modern
-            // anchor-free cfg reports detections exactly like a yolo one does.
-            let mut detections = decode_yolo_detections(
+            let detections = decode_image_detections(
                 &network,
-                &result.yolo_heads,
+                &result,
                 original.shape.width,
                 original.shape.height,
                 DetectionOptions {
@@ -342,21 +341,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     letterbox,
                 },
             )?;
-            detections.extend(decode_modern_detections(
-                &network,
-                &result.modern_heads,
-                original.shape.width,
-                original.shape.height,
-                DetectionOptions {
-                    confidence_threshold: threshold,
-                    nms_threshold: nms,
-                    letterbox,
-                },
-            )?);
-            // The two families each ran their own NMS; run the merged list through
-            // it once more so a cfg that somehow had both cannot emit an
-            // overlapping cross-family pair.
-            detections.sort_by(|lhs, rhs| rhs.confidence.total_cmp(&lhs.confidence));
 
             println!("image {}", image_path);
             println!(
@@ -369,32 +353,45 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
             println!("detections {}", detections.len());
             let tsv = std::env::var_os("DARKNET_DETECT_TSV").is_some();
-            for detection in detections {
-                let class_name = names
-                    .get(detection.class_id)
-                    .map(String::as_str)
-                    .unwrap_or("<unknown>");
-                if tsv {
-                    // Full-precision machine-readable line for backend comparisons.
-                    println!(
-                        "det\t{class_name}\t{:.9}\t{:.9}\t{:.9}\t{:.9}\t{:.9}",
-                        detection.confidence,
-                        detection.bbox.left(),
-                        detection.bbox.top(),
-                        detection.bbox.right(),
-                        detection.bbox.bottom(),
-                    );
-                    continue;
+            match detections {
+                ImageDetections::AxisAligned(detections) => {
+                    for detection in detections {
+                        let class_name = names
+                            .get(detection.class_id)
+                            .map(String::as_str)
+                            .unwrap_or("<unknown>");
+                        if tsv {
+                            // Full-precision machine-readable line for backend comparisons.
+                            println!(
+                                "det\t{class_name}\t{:.9}\t{:.9}\t{:.9}\t{:.9}\t{:.9}",
+                                detection.confidence,
+                                detection.bbox.left(),
+                                detection.bbox.top(),
+                                detection.bbox.right(),
+                                detection.bbox.bottom(),
+                            );
+                            continue;
+                        }
+                        println!(
+                            "{:>6.2}% {:<24} left={:>7.2} top={:>7.2} right={:>7.2} bottom={:>7.2}",
+                            detection.confidence * 100.0,
+                            class_name,
+                            detection.bbox.left(),
+                            detection.bbox.top(),
+                            detection.bbox.right(),
+                            detection.bbox.bottom(),
+                        );
+                    }
                 }
-                println!(
-                    "{:>6.2}% {:<24} left={:>7.2} top={:>7.2} right={:>7.2} bottom={:>7.2}",
-                    detection.confidence * 100.0,
-                    class_name,
-                    detection.bbox.left(),
-                    detection.bbox.top(),
-                    detection.bbox.right(),
-                    detection.bbox.bottom(),
-                );
+                ImageDetections::Oriented(detections) => {
+                    for detection in detections {
+                        let class_name = names
+                            .get(detection.detection.class_id)
+                            .map(String::as_str)
+                            .unwrap_or("<unknown>");
+                        println!("{}", format_obb_detection_line(&detection, class_name, tsv));
+                    }
+                }
             }
         }
         "help" | "--help" | "-h" => print_usage(),
@@ -404,6 +401,115 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ImageDetections {
+    AxisAligned(Vec<Detection>),
+    Oriented(Vec<ObbDetection>),
+}
+
+impl ImageDetections {
+    fn len(&self) -> usize {
+        match self {
+            Self::AxisAligned(detections) => detections.len(),
+            Self::Oriented(detections) => detections.len(),
+        }
+    }
+}
+
+fn decode_image_detections(
+    network: &Network,
+    result: &ForwardResult,
+    image_width: usize,
+    image_height: usize,
+    options: DetectionOptions,
+) -> darknet_core::Result<ImageDetections> {
+    if network.net.obb {
+        if !result.modern_heads.is_empty() {
+            return Err(darknet_core::Error::InvalidConfig(
+                "detect-image cannot combine OBB YOLO and modern detection heads".to_owned(),
+            ));
+        }
+        return Ok(ImageDetections::Oriented(decode_obb_yolo_detections(
+            network,
+            &result.yolo_heads,
+            image_width,
+            image_height,
+            options,
+        )?));
+    }
+
+    let mut detections = decode_yolo_detections(
+        network,
+        &result.yolo_heads,
+        image_width,
+        image_height,
+        options,
+    )?;
+    detections.extend(decode_modern_detections(
+        network,
+        &result.modern_heads,
+        image_width,
+        image_height,
+        options,
+    )?);
+    detections.sort_by(|lhs, rhs| rhs.confidence.total_cmp(&lhs.confidence));
+    Ok(ImageDetections::AxisAligned(detections))
+}
+
+fn format_obb_detection_line(detection: &ObbDetection, class_name: &str, tsv: bool) -> String {
+    let detection_box = detection.detection.bbox;
+    let confidence = detection.detection.confidence;
+    let bounds = (
+        detection_box.left(),
+        detection_box.top(),
+        detection_box.right(),
+        detection_box.bottom(),
+    );
+    match (&detection.geometry, tsv) {
+        (ObbDetectionGeometry::FrontPoint { x, y }, true) => format!(
+            "det_obb\t{class_name}\t{confidence:.9}\t{:.9}\t{:.9}\t{:.9}\t{:.9}\tfront_point\t{x:.9}\t{y:.9}",
+            bounds.0, bounds.1, bounds.2, bounds.3,
+        ),
+        (ObbDetectionGeometry::CarpnQuad(points), true) => format!(
+            "det_obb\t{class_name}\t{confidence:.9}\t{:.9}\t{:.9}\t{:.9}\t{:.9}\tcarpn_quad\t{}",
+            bounds.0,
+            bounds.1,
+            bounds.2,
+            bounds.3,
+            points
+                .iter()
+                .map(|point| format!("{point:.9}"))
+                .collect::<Vec<_>>()
+                .join("\t"),
+        ),
+        (ObbDetectionGeometry::FrontPoint { x, y }, false) => format!(
+            "{:>6.2}% {:<24} left={:>7.2} top={:>7.2} right={:>7.2} bottom={:>7.2} front=({x:.2},{y:.2})",
+            confidence * 100.0,
+            class_name,
+            bounds.0,
+            bounds.1,
+            bounds.2,
+            bounds.3,
+        ),
+        (ObbDetectionGeometry::CarpnQuad(points), false) => {
+            let vertices = points
+                .chunks_exact(2)
+                .map(|vertex| format!("({:.2},{:.2})", vertex[0], vertex[1]))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "{:>6.2}% {:<24} left={:>7.2} top={:>7.2} right={:>7.2} bottom={:>7.2} quad=[{vertices}]",
+                confidence * 100.0,
+                class_name,
+                bounds.0,
+                bounds.1,
+                bounds.2,
+                bounds.3,
+            )
+        }
+    }
 }
 
 fn dump_rust_layer_outputs(
@@ -3079,6 +3185,9 @@ fn print_usage() {
     println!(
         "env: DARKNET_BACKEND=cpu|oxide, DARKNET_OXIDE_CONV, DARKNET_OXIDE_GEMM, DARKNET_OXIDE_AMP=1 (mixed-precision training), DARKNET_DETECT_TSV=1"
     );
+    println!(
+        "  detect TSV emits `det` AABB rows or `det_obb` rows with geometry kind and coordinates"
+    );
 }
 
 fn print_network_summary(network: &Network) {
@@ -3175,12 +3284,83 @@ fn advanced_epoch_images(
 #[cfg(test)]
 mod tests {
     use super::{
-        MapOptions, MapSchedule, TrainOptions, classify_detector_train_paths,
-        run_detector_train_cpu,
+        DetectionOptions, ImageDetections, MapOptions, MapSchedule, ObbDetectionGeometry,
+        TrainOptions, classify_detector_train_paths, decode_image_detections,
+        format_obb_detection_line, run_detector_train_cpu,
     };
 
     fn options(args: &[&str]) -> Result<TrainOptions, Box<dyn std::error::Error>> {
         TrainOptions::parse(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn detect_image_decodes_and_formats_obb_geometry() {
+        use darknet_core::{ConfigFile, ExecutableNetwork, Network, Tensor};
+
+        let cfg = ConfigFile::parse_str(
+            "obb-detect-cli.cfg",
+            "[net]\nwidth=4\nheight=2\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\n",
+        )
+        .expect("OBB cfg parses");
+        let network = Network::from_config(cfg).expect("OBB network builds");
+        let stride = network.net.width * network.net.height;
+        let mut data = vec![0.0; network.net.channels * stride];
+        data[4 * stride] = 0.25;
+        data[6 * stride] = 2.0;
+        data[7 * stride] = 2.0;
+        let input = Tensor::from_data(network.net.input_shape(), data).expect("input tensor");
+        let forward = ExecutableNetwork::new(network.clone())
+            .forward(&input)
+            .expect("forward pass");
+        let decoded =
+            decode_image_detections(&network, &forward, 4, 2, DetectionOptions::default())
+                .expect("CLI OBB decoder");
+        let ImageDetections::Oriented(detections) = decoded else {
+            panic!("OBB cfg must use oriented decoding");
+        };
+        assert_eq!(detections.len(), 1);
+        let line = format_obb_detection_line(&detections[0], "vehicle", true);
+        assert!(line.starts_with("det_obb\tvehicle\t"), "{line}");
+        assert!(
+            line.contains("\tfront_point\t0.250000000\t0.000000000"),
+            "{line}"
+        );
+
+        let mut quad = detections[0].clone();
+        quad.geometry = ObbDetectionGeometry::CarpnQuad([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]);
+        let quad_tsv = format_obb_detection_line(&quad, "vehicle", true);
+        assert_eq!(quad_tsv.split('\t').count(), 16, "{quad_tsv}");
+        assert!(quad_tsv.contains("\tcarpn_quad\t0.000000000\t0.100000001"));
+        let human = format_obb_detection_line(&quad, "vehicle", false);
+        assert!(human.contains("quad=[(0.00,0.10),(0.20,0.30)"), "{human}");
+    }
+
+    #[test]
+    fn detect_image_keeps_axis_aligned_yolo_dispatch() {
+        use darknet_core::{ConfigFile, ExecutableNetwork, Network, Tensor};
+
+        let cfg = ConfigFile::parse_str(
+            "yolo-detect-cli.cfg",
+            "[net]\nwidth=4\nheight=2\nchannels=6\n[yolo]\nclasses=1\nnum=1\nmask=0\nanchors=4,2\n",
+        )
+        .expect("YOLO cfg parses");
+        let network = Network::from_config(cfg).expect("YOLO network builds");
+        let stride = network.net.width * network.net.height;
+        let mut data = vec![0.0; network.net.channels * stride];
+        data[4 * stride] = 2.0;
+        data[5 * stride] = 2.0;
+        let input = Tensor::from_data(network.net.input_shape(), data).expect("input tensor");
+        let forward = ExecutableNetwork::new(network.clone())
+            .forward(&input)
+            .expect("forward pass");
+        let decoded =
+            decode_image_detections(&network, &forward, 4, 2, DetectionOptions::default())
+                .expect("CLI YOLO decoder");
+        let ImageDetections::AxisAligned(detections) = decoded else {
+            panic!("standard YOLO cfg must use axis-aligned decoding");
+        };
+        assert_eq!(detections.len(), 1);
+        assert!(detections[0].confidence > 0.25);
     }
 
     #[test]
