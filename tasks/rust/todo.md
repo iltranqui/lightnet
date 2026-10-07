@@ -278,9 +278,10 @@ Immediately next, in dependency order:
   positives with existing-target behavior; v117 adds source finite-difference
   COBB/legacy box deltas and positive-anchor writeback; v118 ports source
   covariance-W2 analytic geometry gradients; v119 routes those gradients into
-  positive-anchor box-delta writeback. Multi-head trainer integration, class
-  metrics/loss aggregation, center-front-anchor decode, integrated losses and
-  training-loop wiring, crop/resize and mosaic transforms,
+  positive-anchor box-delta writeback; v120 reports `avg_cat` contributions
+  from best/additional class assignments. Multi-head trainer integration,
+  truth-threshold metric/loss aggregation, center-front-anchor decode, integrated
+  losses and training-loop wiring, crop/resize and mosaic transforms,
   alternate NMS-kind implementations, training `-map` cadence, and CARPN network
   decoding/validation integration remain open.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and

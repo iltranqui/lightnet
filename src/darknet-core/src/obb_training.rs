@@ -161,6 +161,19 @@ pub struct ObbYoloClassDeltaResult {
     pub class_output_for_average: f32,
 }
 
+/// `avg_cat` contributions from the best/additional positive-anchor pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ObbYoloClassDeltaStats {
+    pub class_output_sum: f32,
+    pub positive_count: usize,
+}
+
+impl ObbYoloClassDeltaStats {
+    pub fn mean_class_output(self) -> Option<f32> {
+        (self.positive_count > 0).then(|| self.class_output_sum / self.positive_count as f32)
+    }
+}
+
 /// Geometry shared by the per-cell prediction-match score calculation.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ObbYoloPredictionMatchContext {
@@ -1654,7 +1667,8 @@ pub fn apply_obb_yolo_batch_head_positive_objectness_deltas(
 /// The head output and delta tensors use `[batch][entry][grid-cell]` storage.
 /// Class mapping and multipliers are applied in source order; incoming target
 /// class deltas retain the helper's special positive-delta branch semantics.
-/// Objectness, geometry deltas, and accumulated training metrics are untouched.
+/// Returns `avg_cat` sum/count for these anchor assignments; objectness,
+/// geometry deltas, truth-threshold positives, and broader metrics remain separate.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_obb_yolo_batch_head_positive_class_deltas(
     batch_truths: &[Vec<ObbLabel>],
@@ -1664,10 +1678,11 @@ pub fn apply_obb_yolo_batch_head_positive_class_deltas(
     focal_loss: bool,
     label_smooth_eps: f32,
     cls_normalizer: f32,
-) -> Result<()> {
+) -> Result<ObbYoloClassDeltaStats> {
     if config.classes == 0
         || !label_smooth_eps.is_finite()
         || !cls_normalizer.is_finite()
+        || head_delta.iter().any(|delta| !delta.is_finite())
         || config.class_map.as_ref().is_some_and(|mapping| {
             mapping.len() != config.classes
                 || mapping.iter().any(|&class_id| class_id >= config.classes)
@@ -1731,6 +1746,7 @@ pub fn apply_obb_yolo_batch_head_positive_class_deltas(
         .try_reserve_exact(config.classes)
         .map_err(|_| Error::InvalidConfig("OBB class-delta allocation failed".to_owned()))?;
 
+    let mut stats = ObbYoloClassDeltaStats::default();
     for tagged in positives {
         let truth = &batch_truths[tagged.batch_index][tagged.positive.truth_index];
         let class_id = config
@@ -1757,12 +1773,14 @@ pub fn apply_obb_yolo_batch_head_positive_class_deltas(
             config.class_multipliers.as_deref(),
             cls_normalizer,
         )?;
+        stats.class_output_sum += result.class_output_for_average;
+        stats.positive_count += 1;
         for (class_index, &delta) in result.deltas.iter().enumerate() {
             let index = entry_base + (7 + class_index) * stride + cell_index;
             head_delta[index] = delta;
         }
     }
-    Ok(())
+    Ok(stats)
 }
 
 /// Apply source finite-difference box regression deltas to one batch/head tensor.
@@ -2766,7 +2784,7 @@ mod tests {
         let mut head_delta = vec![0.0; 18];
         head_delta[16] = 0.4;
         head_delta[17] = 0.1;
-        apply_obb_yolo_batch_head_positive_class_deltas(
+        let stats = apply_obb_yolo_batch_head_positive_class_deltas(
             &[vec![truth(0.5, 0.5, 0.2, 0.2)]],
             &head_output,
             &mut head_delta,
@@ -2776,6 +2794,9 @@ mod tests {
             0.5,
         )
         .unwrap();
+        assert_eq!(stats.positive_count, 2);
+        assert!((stats.class_output_sum - 0.9).abs() < 1e-6);
+        assert!((stats.mean_class_output().unwrap() - 0.45).abs() < 1e-6);
         assert!((head_delta[7] + 0.15).abs() < 1e-6);
         assert!((head_delta[8] - 0.975).abs() < 1e-6);
         assert_eq!(head_delta[16], 0.4);
