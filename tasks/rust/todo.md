@@ -310,7 +310,9 @@ Immediately next, in dependency order:
   distinct loss/gradient path is implemented; v151 aggregates front-vector angle
   error mean/threshold counts in front-aware stats across passes and subdivisions;
   v152 separates weighted MSE matching scores from the source CIoU-OBB box-delta
-  fallback. Still open: full loss scalar, CLI/schedule and
+  fallback; v153 adds covariance and COBB box-delta contributions independently
+  when both weighted branches are active. Still open: full loss scalar,
+  CLI/schedule and
   non-SGD optimizer/training-loop integration, remaining cfg/training
   option wiring,
   inference/network decode integration, remaining metric/loss aggregation and

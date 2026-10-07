@@ -34,6 +34,7 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v153: when covariance and COBB are both active, box regression now adds their independent contributions instead of returning after covariance. A combined-vs-separate gradient test and all 117 OBB-filtered host tests passed. This does not establish compiled-C++ or full-loss parity.
 - v152: separate OBB matching-score and box-delta dispatch for `iou_loss=mse`: weighted covariance/COBB scores still select matches, while box regression follows source CIoU-OBB fallback instead of applying the covariance analytic gradient. Added routing and regression-path tests; all 116 OBB-filtered host tests passed. This does not establish compiled-C++ or full-loss parity.
 - v151: front-aware OBB training stats now aggregate source angle-error mean/buckets (`<5°`, `<20°`, `>30°`) across assignments, heads, and subdivisions, using configured anchor offsets. The focused angle/merge tests and all 114 OBB-filtered host tests passed.
 - v150: `ciou_obb_mul` is distinguished from additive CIoU-OBB during parsing; OBB training config now rejects that unsupported variant instead of silently using the additive path. Focused coverage and all 113 OBB-filtered host tests passed.

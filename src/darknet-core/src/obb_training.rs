@@ -1256,6 +1256,9 @@ fn obb_yolo_box_regression_deltas_with_front_anchor_offset(
     let covariance_active = !config.score.ciou_obb
         && config.score.covariance_normalizer.is_finite()
         && config.score.covariance_normalizer > 0.0;
+    let cobb_active = !config.score.ciou_obb
+        && config.score.cobb_normalizer.is_finite()
+        && config.score.cobb_normalizer > 0.0;
     if !config.iou_normalizer.is_finite()
         || !config.max_delta.is_finite()
         || config.max_delta < 0.0
@@ -1365,22 +1368,32 @@ fn obb_yolo_box_regression_deltas_with_front_anchor_offset(
             }
             deltas[index] += update.clamp(-clip, clip);
         }
-        return Ok(deltas);
     }
 
+    if covariance_active && !cobb_active {
+        return Ok(deltas);
+    }
+    let finite_difference_score = if covariance_active {
+        ObbYoloMatchScoreConfig {
+            covariance_normalizer: 0.0,
+            ..config.score
+        }
+    } else {
+        config.score
+    };
     let evaluate = |channels: [f32; 6]| -> Result<f32> {
         Ok(obb_yolo_match_score_with_front_anchor_offset(
             channels,
             truth,
             context,
-            config.score,
+            finite_difference_score,
             front_anchor_offset,
         )?
         .score)
     };
     let scale = config.iou_normalizer
-        * if config.score.cobb_normalizer.is_finite() && config.score.cobb_normalizer > 0.0 {
-            config.score.cobb_normalizer.max(0.0)
+        * if cobb_active {
+            config.score.cobb_normalizer
         } else {
             1.0
         };
@@ -4063,6 +4076,74 @@ mod tests {
                 * 2.5)
                 .clamp(-1.0, 1.0);
         assert!((new_coords_actual[0] - expected_x).abs() < 1e-6);
+    }
+
+    #[test]
+    fn covariance_and_cobb_box_deltas_accumulate_independently() {
+        let mut truth = truth(0.5, 0.5, 0.2, 0.1);
+        truth.front_x = 0.65;
+        truth.front_y = 0.53;
+        truth.has_front = true;
+        let context = ObbYoloPredictionMatchContext {
+            anchor_width: 20.0,
+            anchor_height: 10.0,
+            cell_x: 0,
+            cell_y: 0,
+            grid_width: 1,
+            grid_height: 1,
+            net_width: 100,
+            net_height: 100,
+            new_coords: false,
+        };
+        let prediction = [0.35, 0.6, 0.15, -0.1, 0.7, 0.4];
+        let base_score = ObbYoloMatchScoreConfig {
+            covariance_front_length_weight: 0.0,
+            ..ObbYoloMatchScoreConfig::default()
+        };
+        let make_delta_config = |score| ObbYoloBoxDeltaConfig {
+            score,
+            iou_normalizer: 0.4,
+            max_delta: 10.0,
+            accumulate: false,
+        };
+        let covariance = obb_yolo_box_regression_deltas(
+            prediction,
+            [0.0; 4],
+            &truth,
+            context,
+            make_delta_config(ObbYoloMatchScoreConfig {
+                covariance_normalizer: 1.3,
+                ..base_score
+            }),
+        )
+        .unwrap();
+        let cobb = obb_yolo_box_regression_deltas(
+            prediction,
+            [0.0; 4],
+            &truth,
+            context,
+            make_delta_config(ObbYoloMatchScoreConfig {
+                cobb_normalizer: 0.6,
+                ..base_score
+            }),
+        )
+        .unwrap();
+        let combined = obb_yolo_box_regression_deltas(
+            prediction,
+            [0.0; 4],
+            &truth,
+            context,
+            make_delta_config(ObbYoloMatchScoreConfig {
+                covariance_normalizer: 1.3,
+                cobb_normalizer: 0.6,
+                ..base_score
+            }),
+        )
+        .unwrap();
+
+        for ((combined, covariance), cobb) in combined.into_iter().zip(covariance).zip(cobb) {
+            assert!((combined - covariance - cobb).abs() < 1e-5);
+        }
     }
 
     #[test]
