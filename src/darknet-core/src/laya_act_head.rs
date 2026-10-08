@@ -55,14 +55,15 @@ pub fn blob_offset_bytes(
     this_hidden: usize,
     f16: bool,
 ) -> usize {
-    let skip = crate::laya_scorer::encoder_blob_float_count(
-        enc_hidden,
-        enc_layers,
-        enc_intermediate,
-        enc_vocab,
-    ) + crate::laya_scorer::head_blob_float_count(head_hidden, head_layers, head_ffn_dim)
-        + scorer_blob_float_count(this_hidden)
-        + 3;
+    let skip =
+        crate::laya_scorer::encoder_blob_float_count(
+            enc_hidden,
+            enc_layers,
+            enc_intermediate,
+            enc_vocab,
+        ) + crate::laya_scorer::head_blob_float_count(head_hidden, head_layers, head_ffn_dim)
+            + scorer_blob_float_count(this_hidden)
+            + 3;
     20 + skip * if f16 { 2 } else { 4 }
 }
 
@@ -174,7 +175,11 @@ pub fn features_for_sample(
         if valid {
             n_valid += 1;
         }
-        p[j] = if valid { scorer_logits[b * max_options + j] } else { -1.0e4 };
+        p[j] = if valid {
+            scorer_logits[b * max_options + j]
+        } else {
+            -1.0e4
+        };
     }
     // `std::max_element` with no -INFINITY seed (the C++ build uses -Ofast).
     let zmax = p.iter().copied().fold(p[0], f32::max);
@@ -546,7 +551,18 @@ mod tests {
         let marker = marker_data(batch, k, t, &[true, true, false], &[0.0; 3]);
         let w = weights(hidden, fc_dim, n_act);
         let out = act_head_forward(
-            &head, &logits, &marker, &w, batch, hidden, k, 2 * k, t, t, fc_dim, n_act,
+            &head,
+            &logits,
+            &marker,
+            &w,
+            batch,
+            hidden,
+            k,
+            2 * k,
+            t,
+            t,
+            fc_dim,
+            n_act,
         )
         .unwrap();
         // Independent hand computation for sample 0.
@@ -580,20 +596,46 @@ mod tests {
         let w = weights(hidden, fc_dim, n_act);
 
         let grad = act_head_backward(
-            &head, &logits, &marker, &w, &seed, batch, hidden, k, 2 * k, t, t, fc_dim, n_act,
+            &head,
+            &logits,
+            &marker,
+            &w,
+            &seed,
+            batch,
+            hidden,
+            k,
+            2 * k,
+            t,
+            t,
+            fc_dim,
+            n_act,
         )
         .unwrap();
 
         let loss_of = |weights: &LayaActHeadWeights| -> f32 {
             let out = act_head_forward(
-                &head, &logits, &marker, weights, batch, hidden, k, 2 * k, t, t, fc_dim, n_act,
+                &head,
+                &logits,
+                &marker,
+                weights,
+                batch,
+                hidden,
+                k,
+                2 * k,
+                t,
+                t,
+                fc_dim,
+                n_act,
             )
             .unwrap();
             out.iter().zip(&seed).map(|(o, s)| o * s).sum()
         };
 
         let eps = 1e-2f32;
-        let check = |name: &str, analytic: &[f32], base: &[f32], make: &dyn Fn(&mut LayaActHeadWeights, usize, f32)| {
+        let check = |name: &str,
+                     analytic: &[f32],
+                     base: &[f32],
+                     make: &dyn Fn(&mut LayaActHeadWeights, usize, f32)| {
             for i in 0..analytic.len() {
                 let mut hi = w.clone();
                 make(&mut hi, i, eps);
@@ -608,10 +650,18 @@ mod tests {
                 );
             }
         };
-        check("fc1_w", &grad.fc1_w, &w.fc1_w, &|weights, i, d| weights.fc1_w[i] += d);
-        check("fc1_b", &grad.fc1_b, &w.fc1_b, &|weights, i, d| weights.fc1_b[i] += d);
-        check("fc2_w", &grad.fc2_w, &w.fc2_w, &|weights, i, d| weights.fc2_w[i] += d);
-        check("fc2_b", &grad.fc2_b, &w.fc2_b, &|weights, i, d| weights.fc2_b[i] += d);
+        check("fc1_w", &grad.fc1_w, &w.fc1_w, &|weights, i, d| {
+            weights.fc1_w[i] += d
+        });
+        check("fc1_b", &grad.fc1_b, &w.fc1_b, &|weights, i, d| {
+            weights.fc1_b[i] += d
+        });
+        check("fc2_w", &grad.fc2_w, &w.fc2_w, &|weights, i, d| {
+            weights.fc2_w[i] += d
+        });
+        check("fc2_b", &grad.fc2_b, &w.fc2_b, &|weights, i, d| {
+            weights.fc2_b[i] += d
+        });
     }
 
     #[test]
@@ -642,23 +692,52 @@ mod tests {
         let w = weights(hidden, fc_dim, n_act);
         // Wrong marker channel count.
         assert!(
-            act_head_forward(&head, &logits, &marker, &w, batch, hidden, k, k, t, t, fc_dim, n_act)
-                .is_err()
+            act_head_forward(
+                &head, &logits, &marker, &w, batch, hidden, k, k, t, t, fc_dim, n_act
+            )
+            .is_err()
         );
         // Wrong scorer length.
         assert!(
-            act_head_forward(&head, &logits[..1], &marker, &w, batch, hidden, k, 2 * k, t, t, fc_dim, n_act)
-                .is_err()
+            act_head_forward(
+                &head,
+                &logits[..1],
+                &marker,
+                &w,
+                batch,
+                hidden,
+                k,
+                2 * k,
+                t,
+                t,
+                fc_dim,
+                n_act
+            )
+            .is_err()
         );
         // max_options must be >= 2.
         assert!(
-            act_head_forward(&head, &logits, &marker, &w, batch, hidden, 1, 2, t, t, fc_dim, n_act)
-                .is_err()
+            act_head_forward(
+                &head, &logits, &marker, &w, batch, hidden, 1, 2, t, t, fc_dim, n_act
+            )
+            .is_err()
         );
         // Backward needs the output gradient.
         assert!(
             act_head_backward(
-                &head, &logits, &marker, &w, &[], batch, hidden, k, 2 * k, t, t, fc_dim, n_act
+                &head,
+                &logits,
+                &marker,
+                &w,
+                &[],
+                batch,
+                hidden,
+                k,
+                2 * k,
+                t,
+                t,
+                fc_dim,
+                n_act
             )
             .is_err()
         );

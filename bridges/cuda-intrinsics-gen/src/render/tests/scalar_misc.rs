@@ -329,7 +329,9 @@ fn packed_alu_and_conversion_render_exact_pure_inline_ptx_adapters() {
             "LLVM-NVPTX uses typed `llvm.nvvm.ff.to.e4m3x2.rn` with `[high, low]` inputs; libNVVM uses pure `cvt.rn.satfinite.e4m3x2.f32` inline PTX"
         ));
     let outputs = all_outputs(&catalog, "{}\n".into(), "test-hash").unwrap();
-    assert!(outputs.contains_key(&PathBuf::from("bridges/cuda-device/src/generated/bf16x2.rs")));
+    assert!(outputs.contains_key(&PathBuf::from(
+        "bridges/cuda-device/src/generated/bf16x2.rs"
+    )));
     assert!(outputs.contains_key(&PathBuf::from("bridges/cuda-device/src/generated/f16x2.rs")));
     assert!(outputs.contains_key(&PathBuf::from("bridges/cuda-device/src/generated/f32x2.rs")));
     assert!(outputs.contains_key(&PathBuf::from(
@@ -525,7 +527,9 @@ fn packed_atomic_compatibility_preserves_paths_signature_and_safety() {
 
     let outputs = all_outputs(&catalog, "{}\n".into(), "test-hash").unwrap();
     assert_eq!(
-        outputs.get(&PathBuf::from("bridges/cuda-device/src/generated/atomic.rs")),
+        outputs.get(&PathBuf::from(
+            "bridges/cuda-device/src/generated/atomic.rs"
+        )),
         Some(&rendered)
     );
 }

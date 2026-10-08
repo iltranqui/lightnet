@@ -202,7 +202,15 @@ impl LayaHeadWeights {
 
 /// Row-wise LayerNorm **with bias**.  `out` may alias `x` (each row's mean/variance
 /// are computed before any element of the row is overwritten).
-pub fn layernorm(x: &[f32], gamma: &[f32], beta: &[f32], out: &mut [f32], rows: usize, c: usize, eps: f32) {
+pub fn layernorm(
+    x: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    out: &mut [f32],
+    rows: usize,
+    c: usize,
+    eps: f32,
+) {
     let inv_c = 1.0 / c as f32;
     for r in 0..rows {
         let row = &x[r * c..(r + 1) * c];
@@ -216,7 +224,15 @@ pub fn layernorm(x: &[f32], gamma: &[f32], beta: &[f32], out: &mut [f32], rows: 
 }
 
 /// `out[rows, n] = x[rows, k] @ w[n, k]^T`, optionally adding a per-row bias.
-fn linear_nt(x: &[f32], w: &[f32], bias: Option<&[f32]>, rows: usize, k: usize, n: usize, out: &mut [f32]) {
+fn linear_nt(
+    x: &[f32],
+    w: &[f32],
+    bias: Option<&[f32]>,
+    rows: usize,
+    k: usize,
+    n: usize,
+    out: &mut [f32],
+) {
     for r in 0..rows {
         let xr = &x[r * k..(r + 1) * k];
         for j in 0..n {
@@ -234,7 +250,14 @@ fn linear_nt(x: &[f32], w: &[f32], bias: Option<&[f32]>, rows: usize, k: usize, 
 }
 
 /// The per-sample qtype (C++ `laya_head_sample_qtype`).
-pub fn sample_qtype(cfg_qtype: i32, input: &[f32], b: usize, c: usize, hidden: usize, t: usize) -> i32 {
+pub fn sample_qtype(
+    cfg_qtype: i32,
+    input: &[f32],
+    b: usize,
+    c: usize,
+    hidden: usize,
+    t: usize,
+) -> i32 {
     if cfg_qtype >= 0 {
         return cfg_qtype;
     }
@@ -253,22 +276,20 @@ pub fn head_forward(
     weights: &LayaHeadWeights,
     g: &LayaHeadGeometry,
 ) -> Result<Vec<f32>, String> {
-    let (b, t, h, nh, nl, f) = (
-        g.batch,
-        g.seq_len,
-        g.hidden,
-        g.heads,
-        g.n_layers,
-        g.ffn_dim,
-    );
+    let (b, t, h, nh, nl, f) = (g.batch, g.seq_len, g.hidden, g.heads, g.n_layers, g.ffn_dim);
     if b == 0 || t == 0 || h == 0 || nh == 0 || nl == 0 || f == 0 {
         return Err("laya_head: batch/seq/hidden/heads/layers/ffn_dim must be > 0".to_owned());
     }
     if h % nh != 0 {
-        return Err(format!("laya_head: hidden={h} must be divisible by heads={nh}"));
+        return Err(format!(
+            "laya_head: hidden={h} must be divisible by heads={nh}"
+        ));
     }
     if !(-1..=2).contains(&g.qtype) {
-        return Err(format!("laya_head: qtype={} must be in [0,2], or -1", g.qtype));
+        return Err(format!(
+            "laya_head: qtype={} must be in [0,2], or -1",
+            g.qtype
+        ));
     }
     let c = input_channels(h, g.qtype);
     if input.len() != b * c * t {
@@ -377,8 +398,8 @@ pub fn head_forward(
                         if p == 0.0 {
                             continue;
                         }
-                        let vv =
-                            &qkv_b[kj * 3 * h + 2 * h + head * hd..kj * 3 * h + 2 * h + head * hd + hd];
+                        let vv = &qkv_b
+                            [kj * 3 * h + 2 * h + head * hd..kj * 3 * h + 2 * h + head * hd + hd];
                         for d in 0..hd {
                             ar[d] += p * vv[d];
                         }
@@ -430,7 +451,15 @@ pub fn head_forward(
 mod tests {
     use super::*;
 
-    fn geometry(batch: usize, seq_len: usize, hidden: usize, heads: usize, n_layers: usize, ffn_dim: usize, qtype: i32) -> LayaHeadGeometry {
+    fn geometry(
+        batch: usize,
+        seq_len: usize,
+        hidden: usize,
+        heads: usize,
+        n_layers: usize,
+        ffn_dim: usize,
+        qtype: i32,
+    ) -> LayaHeadGeometry {
         LayaHeadGeometry {
             batch,
             seq_len,
@@ -458,7 +487,10 @@ mod tests {
         let mut out = [0.0f32; 2];
         layernorm(&x, &gamma, &beta, &mut out, 1, 2, 1e-5);
         let inv = 1.0 / (1.0f32 + 1e-5).sqrt();
-        assert!((out[0] - (2.0 * (-1.0 * inv) + 0.25)).abs() < 1e-6, "{out:?}");
+        assert!(
+            (out[0] - (2.0 * (-1.0 * inv) + 0.25)).abs() < 1e-6,
+            "{out:?}"
+        );
         assert!((out[1] - (0.5 * (1.0 * inv) - 0.5)).abs() < 1e-6);
     }
 
@@ -500,7 +532,10 @@ mod tests {
         let mut input = vec![0.0f32; 2 * 4 * 1];
         input[(1 * 4 + 3) * 1] = 2.0; // sample 1 qtype channel
         let out = head_forward(&input, &w, &g).unwrap();
-        assert!(out[0].abs() < 1e-6 && out[1].abs() < 1e-6, "sample 0 unshifted {out:?}");
+        assert!(
+            out[0].abs() < 1e-6 && out[1].abs() < 1e-6,
+            "sample 0 unshifted {out:?}"
+        );
         // sample 1 has x = [5,5] -> LN = 0 too, so both are zero; use a
         // non-uniform shift instead to prove the qtype row was selected.
         w.type_emb[2 * 2] = 1.0;
@@ -527,17 +562,23 @@ mod tests {
             w.to_blob(hidden, n_layers, ffn_dim).len(),
             blob_float_count(hidden, n_layers, ffn_dim)
         );
-        let back =
-            LayaHeadWeights::from_blob(&w.to_blob(hidden, n_layers, ffn_dim), hidden, n_layers, ffn_dim)
-                .unwrap();
-        assert_eq!(w, back);
-        assert!(LayaHeadWeights::from_blob(
-            &w.to_blob(hidden, n_layers, ffn_dim)[..3],
+        let back = LayaHeadWeights::from_blob(
+            &w.to_blob(hidden, n_layers, ffn_dim),
             hidden,
             n_layers,
-            ffn_dim
+            ffn_dim,
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(w, back);
+        assert!(
+            LayaHeadWeights::from_blob(
+                &w.to_blob(hidden, n_layers, ffn_dim)[..3],
+                hidden,
+                n_layers,
+                ffn_dim
+            )
+            .is_err()
+        );
     }
 
     #[test]

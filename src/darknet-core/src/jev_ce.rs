@@ -3,7 +3,11 @@
 use crate::model::JevCeSpec;
 
 fn at(spec: &JevCeSpec, base: usize, g: usize, i: usize) -> usize {
-    if spec.channel_major { base + i * spec.groups + g } else { base + g * spec.candidates + i }
+    if spec.channel_major {
+        base + i * spec.groups + g
+    } else {
+        base + g * spec.candidates + i
+    }
 }
 
 /// `softmax(logits / T)` per group (layer output; also the inference output).
@@ -13,7 +17,9 @@ pub(crate) fn jev_ce_probs(logits: &[f32], spec: &JevCeSpec, batch: usize) -> Ve
     for b in 0..batch {
         let base = b * spec.groups * spec.candidates;
         for g in 0..spec.groups {
-            let max = (0..spec.candidates).map(|i| logits[at(spec, base, g, i)]).fold(f32::NEG_INFINITY, f32::max);
+            let max = (0..spec.candidates)
+                .map(|i| logits[at(spec, base, g, i)])
+                .fold(f32::NEG_INFINITY, f32::max);
             let mut sum = 0.0f32;
             for i in 0..spec.candidates {
                 let e = ((logits[at(spec, base, g, i)] - max) / temp).exp();
@@ -36,9 +42,18 @@ pub(crate) struct JevCeLoss {
     pub delta: Vec<f32>,
 }
 
-pub(crate) fn jev_ce_loss(logits: &[f32], truth: &[f32], spec: &JevCeSpec, batch: usize) -> JevCeLoss {
+pub(crate) fn jev_ce_loss(
+    logits: &[f32],
+    truth: &[f32],
+    spec: &JevCeSpec,
+    batch: usize,
+) -> JevCeLoss {
     let temp = spec.temperature.max(1e-6);
-    let eps = if spec.label_smoothing > 0.0 { spec.label_smoothing.min(0.999) } else { 0.0 };
+    let eps = if spec.label_smoothing > 0.0 {
+        spec.label_smoothing.min(0.999)
+    } else {
+        0.0
+    };
     let probs = jev_ce_probs(logits, spec, batch);
     let mut delta = vec![0.0f32; logits.len()];
     let (mut ce_sum, mut active, mut correct) = (0.0f64, 0usize, 0usize);
@@ -46,7 +61,9 @@ pub(crate) fn jev_ce_loss(logits: &[f32], truth: &[f32], spec: &JevCeSpec, batch
         let base = b * spec.groups * spec.candidates;
         let mut sample_active = 0usize;
         for g in 0..spec.groups {
-            let target_sum: f32 = (0..spec.candidates).map(|i| truth[at(spec, base, g, i)]).sum();
+            let target_sum: f32 = (0..spec.candidates)
+                .map(|i| truth[at(spec, base, g, i)])
+                .sum();
             let empty = target_sum <= 1e-8;
             if !empty || !spec.ignore_empty {
                 sample_active += 1;
@@ -65,7 +82,11 @@ pub(crate) fn jev_ce_loss(logits: &[f32], truth: &[f32], spec: &JevCeSpec, batch
             }
             for i in 0..spec.candidates {
                 let idx = at(spec, base, g, i);
-                let mut t = if empty { 1.0 / spec.candidates as f32 } else { truth[idx] / target_sum };
+                let mut t = if empty {
+                    1.0 / spec.candidates as f32
+                } else {
+                    truth[idx] / target_sum
+                };
                 if eps > 0.0 {
                     t = (1.0 - eps) * t + eps / spec.candidates as f32;
                 }
@@ -84,7 +105,11 @@ pub(crate) fn jev_ce_loss(logits: &[f32], truth: &[f32], spec: &JevCeSpec, batch
         }
     }
     JevCeLoss {
-        mean_ce: if active > 0 { (ce_sum / active as f64) as f32 } else { 0.0 },
+        mean_ce: if active > 0 {
+            (ce_sum / active as f64) as f32
+        } else {
+            0.0
+        },
         active_groups: active,
         correct,
         delta,
@@ -97,7 +122,16 @@ mod tests {
     use crate::model::JevCeSpec;
 
     fn spec(groups: usize, candidates: usize) -> JevCeSpec {
-        JevCeSpec { groups, candidates, temperature: 1.0, normalize: true, ignore_empty: true, label_smoothing: 0.0, scale: 1.0, channel_major: false }
+        JevCeSpec {
+            groups,
+            candidates,
+            temperature: 1.0,
+            normalize: true,
+            ignore_empty: true,
+            label_smoothing: 0.0,
+            scale: 1.0,
+            channel_major: false,
+        }
     }
 
     #[test]
@@ -163,7 +197,12 @@ mod tests {
             p[k] += h;
             m[k] -= h;
             let fd = (ce(&p) - ce(&m)) / (2.0 * h);
-            assert!((fd + analytic[k]).abs() < 2e-3, "dz[{k}]: -dCE/dz = {} vs delta {}", -fd, analytic[k]);
+            assert!(
+                (fd + analytic[k]).abs() < 2e-3,
+                "dz[{k}]: -dCE/dz = {} vs delta {}",
+                -fd,
+                analytic[k]
+            );
         }
     }
 }

@@ -1713,7 +1713,10 @@ impl TrainingLossLog {
             .append(true)
             .open(backup.join(format!("{name}_loss.csv")))?;
         if log.metadata()?.len() == 0 {
-            writeln!(log, "iteration,seen,loss,avg_loss,learning_rate,milliseconds")?;
+            writeln!(
+                log,
+                "iteration,seen,loss,avg_loss,learning_rate,milliseconds"
+            )?;
         }
         Ok(Self {
             log,
@@ -2297,8 +2300,7 @@ fn run_detector_train_cpu(
         image_cursor += images_per_iteration;
         if image_cursor >= train_images.len() {
             epoch += 1;
-            epoch_images =
-                std::sync::Arc::new(epoch_order(&train_images, options.seed, epoch));
+            epoch_images = std::sync::Arc::new(epoch_order(&train_images, options.seed, epoch));
             image_cursor %= train_images.len();
         }
 
@@ -2937,8 +2939,7 @@ fn run_detector_train_gpu(
         image_cursor += images_per_iteration;
         if image_cursor >= train_images.len() {
             epoch += 1;
-            epoch_images =
-                std::sync::Arc::new(epoch_order(&train_images, options.seed, epoch));
+            epoch_images = std::sync::Arc::new(epoch_order(&train_images, options.seed, epoch));
             image_cursor %= train_images.len();
         }
 
@@ -3083,10 +3084,7 @@ fn print_forward_backward_summary(
             }
             darknet_core::LayerTrainBuffers::Moe(moe) => {
                 moe.router_bias_updates.iter().any(|value| *value != 0.0)
-                    || moe
-                        .router_weight_updates
-                        .iter()
-                        .any(|value| *value != 0.0)
+                    || moe.router_weight_updates.iter().any(|value| *value != 0.0)
                     || moe.experts.iter().any(|expert| {
                         expert.bias_updates.iter().any(|value| *value != 0.0)
                             || expert.weight_updates.iter().any(|value| *value != 0.0)
@@ -3252,7 +3250,10 @@ fn shuffle_paths(paths: &mut [PathBuf], seed: u64) {
 /// epochs were shuffled before it.
 fn epoch_order(paths: &[PathBuf], seed: u64, epoch: usize) -> Vec<PathBuf> {
     let mut order = paths.to_vec();
-    shuffle_paths(&mut order, seed ^ (epoch as u64).wrapping_mul(0xD1B5_4A32_D192_ED03));
+    shuffle_paths(
+        &mut order,
+        seed ^ (epoch as u64).wrapping_mul(0xD1B5_4A32_D192_ED03),
+    );
     order
 }
 

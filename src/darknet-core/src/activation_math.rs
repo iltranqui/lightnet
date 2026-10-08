@@ -38,11 +38,19 @@ pub(crate) fn elu_grad(x: f32) -> f32 {
 }
 
 pub(crate) fn selu(x: f32) -> f32 {
-    if x >= 0.0 { SELU_SCALE * x } else { SELU_SCALE * SELU_ALPHA * (x.exp() - 1.0) }
+    if x >= 0.0 {
+        SELU_SCALE * x
+    } else {
+        SELU_SCALE * SELU_ALPHA * (x.exp() - 1.0)
+    }
 }
 
 pub(crate) fn selu_grad(x: f32) -> f32 {
-    if x >= 0.0 { SELU_SCALE } else { SELU_SCALE * SELU_ALPHA * x.exp() }
+    if x >= 0.0 {
+        SELU_SCALE
+    } else {
+        SELU_SCALE * SELU_ALPHA * x.exp()
+    }
 }
 
 pub(crate) fn relie(x: f32) -> f32 {
@@ -95,7 +103,11 @@ pub(crate) fn stair(x: f32) -> f32 {
 }
 
 pub(crate) fn stair_grad(x: f32) -> f32 {
-    if (x.floor() as i32).rem_euclid(2) == 1 { 1.0 } else { 0.0 }
+    if (x.floor() as i32).rem_euclid(2) == 1 {
+        1.0
+    } else {
+        0.0
+    }
 }
 
 pub(crate) fn hard_mish(x: f32) -> f32 {

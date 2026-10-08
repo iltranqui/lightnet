@@ -43,7 +43,12 @@ pub struct LayaEncoderWeights {
 }
 
 /// C++ `laya_encoder_blob_float_count(hidden, n_layers, intermediate, vocab)`.
-pub fn blob_float_count(hidden: usize, n_layers: usize, intermediate: usize, vocab: usize) -> usize {
+pub fn blob_float_count(
+    hidden: usize,
+    n_layers: usize,
+    intermediate: usize,
+    vocab: usize,
+) -> usize {
     let mut total = hidden * vocab;
     total += hidden;
     for i in 0..n_layers {
@@ -213,7 +218,14 @@ pub fn gelu_erf(x: f32) -> f32 {
 
 /// Bias-free row-wise LayerNorm (gamma only).  `out` may alias `x`: each row's
 /// mean/variance are computed before any element of the row is overwritten.
-pub fn layernorm_bias_free(x: &[f32], gamma: &[f32], out: &mut [f32], rows: usize, c: usize, eps: f32) {
+pub fn layernorm_bias_free(
+    x: &[f32],
+    gamma: &[f32],
+    out: &mut [f32],
+    rows: usize,
+    c: usize,
+    eps: f32,
+) {
     let inv_c = 1.0 / c as f32;
     for r in 0..rows {
         let row = &x[r * c..(r + 1) * c];
@@ -287,14 +299,20 @@ pub fn encoder_forward(
         g.vocab,
     );
     if b == 0 || t == 0 || h == 0 || nh == 0 || nl == 0 || i == 0 || v == 0 {
-        return Err("laya_encoder: batch/seq/hidden/heads/layers/intermediate/vocab must be > 0".to_owned());
+        return Err(
+            "laya_encoder: batch/seq/hidden/heads/layers/intermediate/vocab must be > 0".to_owned(),
+        );
     }
     if h % nh != 0 {
-        return Err(format!("laya_encoder: hidden={h} must be divisible by heads={nh}"));
+        return Err(format!(
+            "laya_encoder: hidden={h} must be divisible by heads={nh}"
+        ));
     }
     let hd = h / nh;
     if hd % 2 != 0 {
-        return Err(format!("laya_encoder: head_dim={hd} must be even (RoPE pairs)"));
+        return Err(format!(
+            "laya_encoder: head_dim={hd} must be even (RoPE pairs)"
+        ));
     }
     if input.len() != b * 2 * t {
         return Err(format!(
@@ -334,7 +352,14 @@ pub fn encoder_forward(
 
     // 2. embedding LayerNorm (in place).
     let mut embed_ln = vec![0.0f32; b * t * h];
-    layernorm_bias_free(&tokens, &weights.embed_norm, &mut embed_ln, b * t, h, g.ln_eps);
+    layernorm_bias_free(
+        &tokens,
+        &weights.embed_norm,
+        &mut embed_ln,
+        b * t,
+        h,
+        g.ln_eps,
+    );
     tokens.copy_from_slice(&embed_ln);
 
     let scale = 1.0 / (hd as f32).sqrt();
@@ -448,8 +473,8 @@ pub fn encoder_forward(
                         if p == 0.0 {
                             continue;
                         }
-                        let vv =
-                            &qkv_b[kj * 3 * h + 2 * h + head * hd..kj * 3 * h + 2 * h + head * hd + hd];
+                        let vv = &qkv_b
+                            [kj * 3 * h + 2 * h + head * hd..kj * 3 * h + 2 * h + head * hd + hd];
                         for d in 0..hd {
                             ar[d] += p * vv[d];
                         }
@@ -506,7 +531,15 @@ pub fn encoder_forward(
 mod tests {
     use super::*;
 
-    fn geometry(batch: usize, seq_len: usize, hidden: usize, heads: usize, n_layers: usize, intermediate: usize, vocab: usize) -> LayaEncoderGeometry {
+    fn geometry(
+        batch: usize,
+        seq_len: usize,
+        hidden: usize,
+        heads: usize,
+        n_layers: usize,
+        intermediate: usize,
+        vocab: usize,
+    ) -> LayaEncoderGeometry {
         LayaEncoderGeometry {
             batch,
             seq_len,
@@ -522,7 +555,12 @@ mod tests {
         }
     }
 
-    fn weights_with_unit_norms(hidden: usize, n_layers: usize, intermediate: usize, vocab: usize) -> LayaEncoderWeights {
+    fn weights_with_unit_norms(
+        hidden: usize,
+        n_layers: usize,
+        intermediate: usize,
+        vocab: usize,
+    ) -> LayaEncoderWeights {
         let mut w = LayaEncoderWeights::zeroed(hidden, n_layers, intermediate, vocab);
         w.embed_norm.fill(1.0);
         w.final_norm.fill(1.0);
@@ -594,18 +632,25 @@ mod tests {
             w.to_blob(hidden, n_layers, intermediate, vocab).len(),
             blob_float_count(hidden, n_layers, intermediate, vocab)
         );
-        let back =
-            LayaEncoderWeights::from_blob(&w.to_blob(hidden, n_layers, intermediate, vocab), hidden, n_layers, intermediate, vocab)
-                .unwrap();
-        assert_eq!(w, back);
-        assert!(LayaEncoderWeights::from_blob(
-            &w.to_blob(hidden, n_layers, intermediate, vocab)[..5],
+        let back = LayaEncoderWeights::from_blob(
+            &w.to_blob(hidden, n_layers, intermediate, vocab),
             hidden,
             n_layers,
             intermediate,
-            vocab
+            vocab,
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(w, back);
+        assert!(
+            LayaEncoderWeights::from_blob(
+                &w.to_blob(hidden, n_layers, intermediate, vocab)[..5],
+                hidden,
+                n_layers,
+                intermediate,
+                vocab
+            )
+            .is_err()
+        );
     }
 
     #[test]

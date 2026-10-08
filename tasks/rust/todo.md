@@ -18,7 +18,7 @@ systemd-run --user --scope -p MemoryHigh=3G --setenv=RUSTUP_TOOLCHAIN=nightly-20
   target/debug/cargo-oxide oxide test -- --manifest-path src/darknet-cuda-oxide/Cargo.toml -j 4
 ```
 
-`cfg_corpus` needs ~145 s alone; run it on its own before believing a failure.
+Run `cargo test -p darknet-core --test cfg_corpus -j 2` alone before believing a failure. The full isolated corpus run exceeded a 40-minute timeout during v69 with no final result; do not record that as a pass or a test failure.
 
 ## Hardware-blocked (cannot be compiled/tested on this sm_89 GPU)
 
@@ -335,13 +335,16 @@ Immediately next, in dependency order:
   fail explicitly. The focused CLI tests and `detect_` passed 2 CLI tests; `obb_`
   passed 119 core + 2 CLI tests. v163 accepts source `default` and `cornersnms`
   OBB NMS kinds with AABB-IoU suppression, retaining orientation-aware `obb` and
-  source aliases; `obb_` passed 120 core + 2 CLI tests. CARPN validation remains
-  unsupported; no compiled-C++ parity is established.
+  source aliases; `obb_` passed 120 core + 2 CLI tests. v164 implements source
+  `greedynms` (fixed 0.6 DIoU exponent) and `diounms` (`beta_nms`, default 0.6)
+  using AABB box formulas; non-finite betas and mismatched multi-head DIoU betas
+  fail explicitly. The NMS/cfg/multi-head tests and `MEM=3G ./tools/test_host.sh obb_`
+  (122 core + 2 CLI tests) passed. Weighted OBB merge remains unsupported; no
+  compiled-C++ parity is established.
   Still open: broader GPU/optimizer integration, CARPN OBB validation/map,
   remaining cfg/training option wiring, inference integration beyond legacy OBB
   `detect-image`, remaining metric/loss logging, source-faithful crop/resize and
-  mosaic label transforms, `greedynms`/`diounms`/weighted OBB NMS, and CARPN
-  network decoding/validation.
+  mosaic label transforms, weighted OBB NMS, and CARPN network decoding/validation.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and
   kernels, weights order `weights.cpp:428`); then `deform_conv`, `dsconv`,
   `graph_conv`, `wmhf`, `clifford`, `recursive_block`.
@@ -383,3 +386,20 @@ Immediately next, in dependency order:
 - relu/relu6 NaN -> 0 on oxide (C++ NaN); mish/swish at -inf -> NaN.
 - C++ CUDA reference runs `cudnn_half=1`, so layer dumps differ from pure fp32 by
   up to 5.7e-3 abs (not an oxide error).
+
+## Version rewrite v0.0.001 – v0.0.246
+
+- [x] Snapshot main tree (status, index, refs, stash)
+- [x] Backup tag `backup/rust-pre-version` -> `a4c40375` (old tip)
+- [x] Guard: 246 commits `e05545c1..a4c40375`, 0 merges, none reachable from other branches
+- [x] `git rebase --exec` in temp worktree (branch `rust-versioned`); hook checks each replayed tree equals the original before amending
+- [x] Verify: 246/246 rows; parent chain; trees; author + committer name/email/date; raw message bytes after subject; subject sequence `v0.0.001…246`; tip tree == old tip tree; main tree and other refs unchanged
+- [x] Swap `refs/heads/rust`: `a4c40375` -> `d1972af5` (compare-and-swap); temp worktree and branch removed
+- Map (old -> new per index): `tasks/rust/version-map.tsv` (git-excluded)
+
+Review:
+- Only subject lines changed. `rust milestone vN: ` prefix stripped on 163 commits, 83 subjects kept as-is, body bytes identical.
+- Committer identity and date restored from the original commit (the amend would otherwise use the current git config identity).
+- Not pushed. `rust` is now 246 ahead / 7 behind `origin/rust`; updating the remote needs `git push --force-with-lease origin rust` by hand.
+- Left alone: 25 old-hash references in `tasks/rust/` (`implemented.md` 16, `layers.md` 7, `todo.md` 1, `STATUS.md` 1). They still resolve via the backup tag; map above gives replacements.
+- Rollback: `git update-ref refs/heads/rust backup/rust-pre-version`

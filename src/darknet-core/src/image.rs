@@ -351,8 +351,12 @@ mod tests {
     }
 
     fn source(i: usize) -> PlanarRgbImage {
-        PlanarRgbImage::from_interleaved_rgb_u8(96, 72, &fixture(&format!("resize{i}_src_96x72.rgb")))
-            .expect("source")
+        PlanarRgbImage::from_interleaved_rgb_u8(
+            96,
+            72,
+            &fixture(&format!("resize{i}_src_96x72.rgb")),
+        )
+        .expect("source")
     }
 
     /// `resize_linear_exact` must equal `cv2.resize(INTER_LINEAR_EXACT)` byte

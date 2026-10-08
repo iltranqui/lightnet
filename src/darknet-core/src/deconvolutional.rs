@@ -105,7 +105,8 @@ mod tests {
     #[test]
     fn two_by_two_stride_two_scatters_each_input_pixel_into_its_own_block() {
         // c = 1 -> n = 1, k = 2, s = 2: out is 4x4, each input pixel paints a 2x2 block with W
-        let input = Tensor::from_data(TensorShape::new(2, 2, 1, 1), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let input =
+            Tensor::from_data(TensorShape::new(2, 2, 1, 1), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let weights = [1.0, 10.0, 100.0, 1000.0]; // W[0][0][ky][kx]
         let out = deconv_forward(&input, &weights, &[0.5], 2, 2, TensorShape::new(4, 4, 1, 1));
         let row = |y: usize| (0..4).map(|x| out.get(0, 0, y, x)).collect::<Vec<_>>();
@@ -129,37 +130,61 @@ mod tests {
         let (c, n, k, s) = (2usize, 3usize, 3usize, 2usize);
         let ishape = TensorShape::new(3, 2, c, 2);
         let oshape = TensorShape::new(s * (3 - 1) + k, s * (2 - 1) + k, n, 2);
-        let fill = |len: usize, f: f32| (0..len).map(|i| (i as f32 * f).sin()).collect::<Vec<f32>>();
+        let fill =
+            |len: usize, f: f32| (0..len).map(|i| (i as f32 * f).sin()).collect::<Vec<f32>>();
         let input = Tensor::from_data(ishape, fill(2 * ishape.element_count(), 0.37)).unwrap();
         let weights = fill(c * n * k * k, 0.53);
         let biases = fill(n, 1.1);
         let seed = Tensor::from_data(oshape, fill(2 * oshape.element_count(), 0.91)).unwrap();
         let loss = |x: &Tensor, w: &[f32], b: &[f32]| -> f32 {
-            deconv_forward(x, w, b, k, s, oshape).data.iter().zip(&seed.data).map(|(o, g)| o * g).sum()
+            deconv_forward(x, w, b, k, s, oshape)
+                .data
+                .iter()
+                .zip(&seed.data)
+                .map(|(o, g)| o * g)
+                .sum()
         };
         let g = deconv_backward(&input, &weights, &seed, k, s, 1.0);
         let h = 1e-2f32;
         let check = |name: &str, analytic: f32, plus: f32, minus: f32| {
             let fd = (plus - minus) / (2.0 * h);
-            assert!((fd - analytic).abs() <= 5e-3 + 5e-3 * fd.abs(), "{name}: fd {fd}, analytic {analytic}");
+            assert!(
+                (fd - analytic).abs() <= 5e-3 + 5e-3 * fd.abs(),
+                "{name}: fd {fd}, analytic {analytic}"
+            );
         };
         for i in (0..weights.len()).step_by(7) {
             let (mut p, mut m) = (weights.clone(), weights.clone());
             p[i] += h;
             m[i] -= h;
-            check(&format!("w[{i}]"), g.weights[i], loss(&input, &p, &biases), loss(&input, &m, &biases));
+            check(
+                &format!("w[{i}]"),
+                g.weights[i],
+                loss(&input, &p, &biases),
+                loss(&input, &m, &biases),
+            );
         }
         for i in 0..n {
             let (mut p, mut m) = (biases.clone(), biases.clone());
             p[i] += h;
             m[i] -= h;
-            check(&format!("b[{i}]"), g.biases[i], loss(&input, &weights, &p), loss(&input, &weights, &m));
+            check(
+                &format!("b[{i}]"),
+                g.biases[i],
+                loss(&input, &weights, &p),
+                loss(&input, &weights, &m),
+            );
         }
         for i in (0..input.data.len()).step_by(5) {
             let (mut p, mut m) = (input.clone(), input.clone());
             p.data[i] += h;
             m.data[i] -= h;
-            check(&format!("x[{i}]"), g.input.data[i], loss(&p, &weights, &biases), loss(&m, &weights, &biases));
+            check(
+                &format!("x[{i}]"),
+                g.input.data[i],
+                loss(&p, &weights, &biases),
+                loss(&m, &weights, &biases),
+            );
         }
     }
 }

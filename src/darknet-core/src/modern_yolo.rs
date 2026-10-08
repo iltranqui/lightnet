@@ -225,7 +225,11 @@ pub fn box_iou(a: &ModernBox, b: &ModernBox) -> f32 {
         return 0.0;
     }
     let union = a.w.max(0.0) * a.h.max(0.0) + b.w.max(0.0) * b.h.max(0.0) - intersection;
-    if union > 0.0 { intersection / union } else { 0.0 }
+    if union > 0.0 {
+        intersection / union
+    } else {
+        0.0
+    }
 }
 
 /// C++ `valid_truth`: finite, centre inside `[0, 1]` and a positive size.
@@ -276,7 +280,13 @@ pub fn activate_modern_output(output: &mut [f32], l: &ModernLayout) {
 }
 
 /// C++ `dfl_expectation`: the softmax expectation of one side's `bins` logits.
-pub fn dfl_expectation(x: &[f32], l: &ModernLayout, batch: usize, location: usize, side: usize) -> f32 {
+pub fn dfl_expectation(
+    x: &[f32],
+    l: &ModernLayout,
+    batch: usize,
+    location: usize,
+    side: usize,
+) -> f32 {
     let bins = l.dfl_bins();
     let stride = l.spatial();
     let start = l.entry_index(batch, location, side * bins);
@@ -287,7 +297,9 @@ pub fn dfl_expectation(x: &[f32], l: &ModernLayout, batch: usize, location: usiz
     let mut denom = 0.0f32;
     let mut expected = 0.0f32;
     for k in 0..bins {
-        let e = (finite_or_zero(x[start + k * stride]) - max_logit).clamp(-60.0, 60.0).exp();
+        let e = (finite_or_zero(x[start + k * stride]) - max_logit)
+            .clamp(-60.0, 60.0)
+            .exp();
         denom += e;
         expected += k as f32 * e;
     }
@@ -295,7 +307,13 @@ pub fn dfl_expectation(x: &[f32], l: &ModernLayout, batch: usize, location: usiz
 }
 
 /// C++ `dfl_probabilities`: the softmax of one side's `bins` logits.
-pub fn dfl_probabilities(x: &[f32], l: &ModernLayout, batch: usize, location: usize, side: usize) -> Vec<f32> {
+pub fn dfl_probabilities(
+    x: &[f32],
+    l: &ModernLayout,
+    batch: usize,
+    location: usize,
+    side: usize,
+) -> Vec<f32> {
     let bins = l.dfl_bins();
     let stride = l.spatial();
     let start = l.entry_index(batch, location, side * bins);
@@ -306,7 +324,9 @@ pub fn dfl_probabilities(x: &[f32], l: &ModernLayout, batch: usize, location: us
     }
     let mut denom = 0.0f32;
     for (k, p) in probs.iter_mut().enumerate() {
-        *p = (finite_or_zero(x[start + k * stride]) - max_logit).clamp(-60.0, 60.0).exp();
+        *p = (finite_or_zero(x[start + k * stride]) - max_logit)
+            .clamp(-60.0, 60.0)
+            .exp();
         denom += *p;
     }
     let denom = denom.max(EPS);
@@ -341,7 +361,13 @@ fn box_from_corners(left: f32, top: f32, right: f32, bottom: f32) -> ModernBox {
 }
 
 /// C++ `decode_dfl_box`.
-pub fn decode_dfl_box(x: &[f32], l: &ModernLayout, batch: usize, n: usize, loc: usize) -> ModernBox {
+pub fn decode_dfl_box(
+    x: &[f32],
+    l: &ModernLayout,
+    batch: usize,
+    n: usize,
+    loc: usize,
+) -> ModernBox {
     let row = loc / l.w;
     let col = loc % l.w;
     let location = n * l.spatial() + loc;
@@ -360,7 +386,13 @@ pub fn decode_dfl_box(x: &[f32], l: &ModernLayout, batch: usize, n: usize, loc: 
 }
 
 /// C++ `decode_modern_box`: YOLOX cxcywh, otherwise the DFL ltrb expectation.
-pub fn decode_modern_box(x: &[f32], l: &ModernLayout, batch: usize, n: usize, loc: usize) -> ModernBox {
+pub fn decode_modern_box(
+    x: &[f32],
+    l: &ModernLayout,
+    batch: usize,
+    n: usize,
+    loc: usize,
+) -> ModernBox {
     if l.kind == ModernYoloKind::Yolox {
         decode_yolox_box(x, l, batch, n, loc)
     } else {
@@ -442,7 +474,12 @@ pub fn decode_yolox_box(x: &[f32], l: &ModernLayout, b: usize, n: usize, loc: us
 }
 
 /// C++ `point_inside_center_radius`, in feature cells.
-fn point_inside_center_radius(l: &ModernLayout, loc: usize, truth: &ModernBox, radius: f32) -> bool {
+fn point_inside_center_radius(
+    l: &ModernLayout,
+    loc: usize,
+    truth: &ModernBox,
+    radius: f32,
+) -> bool {
     let col = loc % l.w;
     let row = loc / l.w;
     let gx = col as f32 + 0.5;
@@ -473,7 +510,14 @@ fn objectness_for(x: &[f32], l: &ModernLayout, b: usize, n: usize, loc: usize) -
     finite_or_zero(x[l.obj_index(b, n, loc)]).clamp(0.0, 1.0)
 }
 
-fn class_score_for(x: &[f32], l: &ModernLayout, b: usize, n: usize, loc: usize, class_id: usize) -> f32 {
+fn class_score_for(
+    x: &[f32],
+    l: &ModernLayout,
+    b: usize,
+    n: usize,
+    loc: usize,
+    class_id: usize,
+) -> f32 {
     if class_id >= l.classes {
         return 0.0;
     }
@@ -645,7 +689,11 @@ pub fn assign_tal_like(
         if candidates.is_empty() {
             continue;
         }
-        candidates.sort_by(|c, a| c.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|c, a| {
+            c.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let truth_area = box_.w * box_.h;
         for c in candidates.iter().take(TAL_TOPK.min(candidates.len())) {
             let slot = c.anchor * l.spatial() + c.loc;
@@ -660,8 +708,8 @@ pub fn assign_tal_like(
             // regression where two truths collide, and the score only breaks
             // ties between similarly-sized truths.
             let smaller_truth_wins = truth_area < conflict_area[slot] - CONFLICT_EPS;
-            let tied_area_better_score =
-                (truth_area - conflict_area[slot]).abs() <= CONFLICT_EPS && c.score > conflict_score[slot];
+            let tied_area_better_score = (truth_area - conflict_area[slot]).abs() <= CONFLICT_EPS
+                && c.score > conflict_score[slot];
             if smaller_truth_wins || tied_area_better_score {
                 conflict_area[slot] = truth_area;
                 conflict_score[slot] = c.score;
@@ -685,7 +733,12 @@ pub fn assign_tal_like(
             }
         }
         for slots in per_truth.iter_mut() {
-            slots.sort_by(|a, b| assignments[*b].iou.partial_cmp(&assignments[*a].iou).unwrap_or(std::cmp::Ordering::Equal));
+            slots.sort_by(|a, b| {
+                assignments[*b]
+                    .iou
+                    .partial_cmp(&assignments[*a].iou)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             for (rank, slot) in slots.iter().enumerate() {
                 let duplicate_weight = (-NAS_DUPLICATE_DECAY * rank as f32).exp();
                 assignments[*slot].quality =
@@ -693,7 +746,10 @@ pub fn assign_tal_like(
             }
         }
     }
-    Ok(TalAssignment { assignments, class_quality })
+    Ok(TalAssignment {
+        assignments,
+        class_quality,
+    })
 }
 
 /// What [`assign_tal_like`] returns: the per-slot box-regression owner plus the
@@ -805,7 +861,11 @@ pub fn assign_yolox(
             continue;
         }
         let dynamic_k = simota_dynamic_k(&candidates).min(candidates.len());
-        candidates.sort_by(|a, c| a.cost.partial_cmp(&c.cost).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, c| {
+            a.cost
+                .partial_cmp(&c.cost)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         for c in candidates.iter().take(dynamic_k) {
             let slot = c.anchor * l.spatial() + c.loc;
             let a = &mut assignments[slot];
@@ -939,13 +999,18 @@ pub fn yolox_train_batch(
                 };
                 let mut target = raw_target;
                 if settings.label_smooth_eps != 0.0 && !use_vfl {
-                    target = target * (1.0 - settings.label_smooth_eps) + 0.5 * settings.label_smooth_eps;
+                    target = target * (1.0 - settings.label_smooth_eps)
+                        + 0.5 * settings.label_smooth_eps;
                 }
                 let idx = l.class_index(b, n, loc, c);
                 let p = finite_or_zero(x[idx]).clamp(0.0, 1.0);
                 let mut d = settings.cls_normalizer * (target - p);
                 if use_vfl {
-                    let weight = if target > 0.0 { target } else { VFL_ALPHA * p.powf(spec.vfl_gamma) };
+                    let weight = if target > 0.0 {
+                        target
+                    } else {
+                        VFL_ALPHA * p.powf(spec.vfl_gamma)
+                    };
                     d *= weight;
                 }
                 if let Some(m) = &settings.classes_multipliers {
@@ -1003,7 +1068,13 @@ pub fn yolox_train_batch(
             positives += 1;
         }
     }
-    Ok(ModernYoloBatch { delta, sum_iou, sum_iou_loss, positives, class_ids })
+    Ok(ModernYoloBatch {
+        delta,
+        sum_iou,
+        sum_iou_loss,
+        positives,
+        class_ids,
+    })
 }
 
 /// The head's training contribution for the whole batch.  `output` must already
@@ -1048,11 +1119,7 @@ pub struct YoloxDetection {
 /// C++-equivalent decode of the best detection per class: every cell is scored
 /// as `obj * cls`, kept above `threshold`, and NMS-free (the caller applies the
 /// network-wide NMS, exactly like the yolo head's decode path).
-pub fn decode_yolox(
-    output: &[f32],
-    l: &ModernLayout,
-    threshold: f32,
-) -> Vec<YoloxDetection> {
+pub fn decode_yolox(output: &[f32], l: &ModernLayout, threshold: f32) -> Vec<YoloxDetection> {
     let mut out = Vec::new();
     for b in 0..l.batch {
         for n in 0..l.n {
@@ -1108,7 +1175,15 @@ mod tests {
 
     /// 2 classes + 5 channels, 2x2 cells, one image.
     fn layout() -> ModernLayout {
-        ModernLayout { batch: 1, n: 1, w: 2, h: 2, classes: 2, coords: 4, kind: ModernYoloKind::Yolox }
+        ModernLayout {
+            batch: 1,
+            n: 1,
+            w: 2,
+            h: 2,
+            classes: 2,
+            coords: 4,
+            kind: ModernYoloKind::Yolox,
+        }
     }
 
     /// Fill a head with explicit per-cell values: tx, ty, tw, th, obj, cls0, cls1.
@@ -1205,20 +1280,47 @@ mod tests {
 
     #[test]
     fn box_iou_matches_the_cpp_shape() {
-        let a = ModernBox { x: 0.5, y: 0.5, w: 0.5, h: 0.5 };
+        let a = ModernBox {
+            x: 0.5,
+            y: 0.5,
+            w: 0.5,
+            h: 0.5,
+        };
         assert!((box_iou(&a, &a) - 1.0).abs() < 1e-6);
-        let b = ModernBox { x: 1.0, y: 0.5, w: 0.5, h: 0.5 };
+        let b = ModernBox {
+            x: 1.0,
+            y: 0.5,
+            w: 0.5,
+            h: 0.5,
+        };
         // Boxes [0.25, 0.75] and [0.75, 1.25] touch, so the intersection is 0.
         assert_eq!(box_iou(&a, &b), 0.0);
-        let c = ModernBox { x: 0.6, y: 0.5, w: 0.5, h: 0.5 };
+        let c = ModernBox {
+            x: 0.6,
+            y: 0.5,
+            w: 0.5,
+            h: 0.5,
+        };
         // overlap width = 0.75 - 0.35 = 0.4, union = 0.25 + 0.25 - 0.2 = 0.3.
-        assert!((box_iou(&a, &c) - 0.2f32 / 0.3).abs() < 1e-6, "{}", box_iou(&a, &c));
+        assert!(
+            (box_iou(&a, &c) - 0.2f32 / 0.3).abs() < 1e-6,
+            "{}",
+            box_iou(&a, &c)
+        );
         assert_eq!(box_iou(&a, &ModernBox::default()), 0.0, "zero-area box");
     }
 
     #[test]
     fn simota_picks_the_cheapest_cell_and_hard_targets() {
-        let l = ModernLayout { batch: 1, n: 1, w: 4, h: 4, classes: 2, coords: 4, kind: ModernYoloKind::Yolox };
+        let l = ModernLayout {
+            batch: 1,
+            n: 1,
+            w: 4,
+            h: 4,
+            classes: 2,
+            coords: 4,
+            kind: ModernYoloKind::Yolox,
+        };
         let s = spec();
         let settings = ModernYoloSettings::default();
         // One truth covering the top-left quadrant, class 0.
@@ -1264,7 +1366,10 @@ mod tests {
             .filter(|(_, a)| a.truth_index != usize::MAX)
             .map(|(i, _)| i)
             .collect();
-        assert!(assigned.contains(&0), "the exact cell must be taken: {assigned:?}");
+        assert!(
+            assigned.contains(&0),
+            "the exact cell must be taken: {assigned:?}"
+        );
         for slot in assigned {
             assert_eq!(assignments[slot].truth_index, 0);
             assert_eq!(assignments[slot].class_id, 0);
@@ -1287,7 +1392,10 @@ mod tests {
         truth[2] = 0.5;
         truth[3] = 0.5;
         let err = assign_yolox(&x, &truth, &l, &s, &settings, 0).unwrap_err();
-        assert!(format!("{err}").contains("invalid YOLOX truth box"), "{err}");
+        assert!(
+            format!("{err}").contains("invalid YOLOX truth box"),
+            "{err}"
+        );
         // A class id past the end of the head.
         let mut truth = vec![0.0f32; s.max_boxes * settings.truth_size];
         truth[0] = 0.25;
@@ -1304,12 +1412,23 @@ mod tests {
 
     #[test]
     fn an_unassigned_cell_gets_a_zero_objectness_target() {
-        let l = ModernLayout { batch: 1, n: 1, w: 4, h: 4, classes: 1, coords: 4, kind: ModernYoloKind::Yolox };
+        let l = ModernLayout {
+            batch: 1,
+            n: 1,
+            w: 4,
+            h: 4,
+            classes: 1,
+            coords: 4,
+            kind: ModernYoloKind::Yolox,
+        };
         let mut s = dfl_spec(ModernYoloKind::Yolox, 1, 16);
         s.max_boxes = 1; // one truth row, matching the 6-float buffer below
         // `ignore_thresh` above any achievable IoU keeps every unassigned cell
         // on the "push objectness to 0" branch.
-        let settings = ModernYoloSettings { ignore_thresh: 1.1, ..ModernYoloSettings::default() };
+        let settings = ModernYoloSettings {
+            ignore_thresh: 1.1,
+            ..ModernYoloSettings::default()
+        };
         let cells = 16;
         // obj = cls = 0 before activation, so sigmoid(0) = 0.5 everywhere.
         let mut x = vec![0.0f32; cells * 6];
@@ -1332,7 +1451,15 @@ mod tests {
 
     #[test]
     fn the_seeded_cell_gets_objectness_class_and_box_targets() {
-        let l = ModernLayout { batch: 1, n: 1, w: 4, h: 4, classes: 1, coords: 4, kind: ModernYoloKind::Yolox };
+        let l = ModernLayout {
+            batch: 1,
+            n: 1,
+            w: 4,
+            h: 4,
+            classes: 1,
+            coords: 4,
+            kind: ModernYoloKind::Yolox,
+        };
         let mut s = dfl_spec(ModernYoloKind::Yolox, 1, 16);
         let settings = ModernYoloSettings::default();
         let mut truth = vec![0.0f32; s.max_boxes * settings.truth_size];
@@ -1352,7 +1479,8 @@ mod tests {
         }
         let mut x = raw.clone();
         activate_modern_output(&mut x, &l);
-        let (delta, _cost, positives) = yolox_training_delta(&x, &truth, &l, &s, &settings).unwrap();
+        let (delta, _cost, positives) =
+            yolox_training_delta(&x, &truth, &l, &s, &settings).unwrap();
         assert!(positives >= 1);
         // Find an assigned cell and check its three target groups.
         let assigned = (0..cells)
@@ -1372,14 +1500,34 @@ mod tests {
         }
         let col = assigned % 4;
         let row = assigned / 4;
-        assert!((delta[idx] - (0.5 * 4.0 - col as f32)).abs() < 1e-4, "tx delta {}", delta[idx]);
-        assert!((delta[idx + stride] - (0.5 * 4.0 - row as f32)).abs() < 1e-4, "ty delta {}", delta[idx + stride]);
-        assert!((delta[idx + 2 * stride] - 4f32.ln()).abs() < 1e-4, "tw delta {}", delta[idx + 2 * stride]);
+        assert!(
+            (delta[idx] - (0.5 * 4.0 - col as f32)).abs() < 1e-4,
+            "tx delta {}",
+            delta[idx]
+        );
+        assert!(
+            (delta[idx + stride] - (0.5 * 4.0 - row as f32)).abs() < 1e-4,
+            "ty delta {}",
+            delta[idx + stride]
+        );
+        assert!(
+            (delta[idx + 2 * stride] - 4f32.ln()).abs() < 1e-4,
+            "tw delta {}",
+            delta[idx + 2 * stride]
+        );
     }
 
     #[test]
     fn class_map_and_multipliers_are_applied() {
-        let l = ModernLayout { batch: 1, n: 1, w: 4, h: 4, classes: 2, coords: 4, kind: ModernYoloKind::Yolox };
+        let l = ModernLayout {
+            batch: 1,
+            n: 1,
+            w: 4,
+            h: 4,
+            classes: 2,
+            coords: 4,
+            kind: ModernYoloKind::Yolox,
+        };
         let s = dfl_spec(ModernYoloKind::Yolox, 2, 16);
         let mut truth = vec![0.0f32; s.max_boxes * 6];
         truth[0] = 0.5;
@@ -1392,18 +1540,34 @@ mod tests {
         activate_modern_output(&mut x, &l);
         // Without a map, class 0; with map [1, 0] the truth becomes class 1.
         let plain = assign_yolox(&x, &truth, &l, &s, &ModernYoloSettings::default(), 0).unwrap();
-        let plain_class = plain.iter().find(|a| a.truth_index != usize::MAX).map(|a| a.class_id);
+        let plain_class = plain
+            .iter()
+            .find(|a| a.truth_index != usize::MAX)
+            .map(|a| a.class_id);
         assert_eq!(plain_class, Some(0));
-        let settings =
-            ModernYoloSettings { class_map: Some(vec![1, 0]), ..ModernYoloSettings::default() };
+        let settings = ModernYoloSettings {
+            class_map: Some(vec![1, 0]),
+            ..ModernYoloSettings::default()
+        };
         let mapped = assign_yolox(&x, &truth, &l, &s, &settings, 0).unwrap();
-        let mapped_class = mapped.iter().find(|a| a.truth_index != usize::MAX).map(|a| a.class_id);
+        let mapped_class = mapped
+            .iter()
+            .find(|a| a.truth_index != usize::MAX)
+            .map(|a| a.class_id);
         assert_eq!(mapped_class, Some(1), "the class map rewrote the label");
     }
 
     #[test]
     fn no_truth_trains_every_cell_toward_zero_objectness() {
-        let l = ModernLayout { batch: 1, n: 1, w: 4, h: 4, classes: 2, coords: 4, kind: ModernYoloKind::Yolox };
+        let l = ModernLayout {
+            batch: 1,
+            n: 1,
+            w: 4,
+            h: 4,
+            classes: 2,
+            coords: 4,
+            kind: ModernYoloKind::Yolox,
+        };
         let mut s = dfl_spec(ModernYoloKind::Yolox, 2, 16);
         s.max_boxes = 1;
         let truth = vec![0.0f32; 6]; // no boxes
@@ -1416,7 +1580,10 @@ mod tests {
         // obj = sigmoid(0) = 0.5 and the target is 0, so the objectness delta is
         // -0.5 in every cell and nothing else moves.
         for loc in 0..cells {
-            assert!((delta[l.obj_index(0, 0, loc)] + 0.5).abs() < 1e-6, "cell {loc}");
+            assert!(
+                (delta[l.obj_index(0, 0, loc)] + 0.5).abs() < 1e-6,
+                "cell {loc}"
+            );
         }
         assert_eq!(
             delta.iter().filter(|d| **d != 0.0).count(),
@@ -1439,14 +1606,21 @@ mod tests {
         assert_eq!(dets.len(), 1, "{dets:?}");
         assert_eq!(dets[0].class_id, 0);
         let s = 1.0 / (1.0 + (-10f32).exp());
-        assert!((dets[0].score - s * s).abs() < 1e-6, "score {}", dets[0].score);
+        assert!(
+            (dets[0].score - s * s).abs() < 1e-6,
+            "score {}",
+            dets[0].score
+        );
         assert!(dets[0].score > 0.5);
     }
 
     #[test]
     fn default_settings_match_the_cpp_training_defaults() {
         let s = ModernYoloSettings::default();
-        assert_eq!((s.cls_normalizer, s.obj_normalizer, s.iou_normalizer), (1.0, 1.0, 1.0));
+        assert_eq!(
+            (s.cls_normalizer, s.obj_normalizer, s.iou_normalizer),
+            (1.0, 1.0, 1.0)
+        );
         assert_eq!(s.ignore_thresh, 0.7);
         assert_eq!(s.max_delta, FLT_MAX);
         assert_eq!(s.truth_size, 6);
@@ -1456,8 +1630,8 @@ mod tests {
 #[cfg(test)]
 mod distribution_heads {
     //! PP-YOLOE and YOLO-NAS share the DFL decode and Task-Aligned assignment.
-    use super::*;
     use super::tests::{dfl_spec, spec};
+    use super::*;
     use crate::model::LayerKind;
 
     /// A `bins`-wide layout with one class, built from per-entry values.
@@ -1508,7 +1682,13 @@ mod distribution_heads {
 
     #[test]
     fn reg_max_is_clamped_like_cpp() {
-        for (reg_max, want) in [(0usize, 4 * 2), (1, 4 * 2), (16, 4 * 17), (64, 4 * 65), (999, 4 * 65)] {
+        for (reg_max, want) in [
+            (0usize, 4 * 2),
+            (1, 4 * 2),
+            (16, 4 * 17),
+            (64, 4 * 65),
+            (999, 4 * 65),
+        ] {
             let spec = dfl_spec(ModernYoloKind::Ppyoloe, 1, reg_max);
             assert_eq!(spec.coords(), want, "reg_max={reg_max}");
         }
@@ -1526,7 +1706,11 @@ mod distribution_heads {
         // A peaked distribution collapses onto its argmax bin.
         let mut peaked = vec![0.0f32; l.dfl_bins() + 1 + l.classes];
         peaked[2] = 40.0;
-        assert!((dfl_expectation(&peaked, &l, 0, 0, 0) - 2.0).abs() < 1e-4, "{}", dfl_expectation(&peaked, &l, 0, 0, 0));
+        assert!(
+            (dfl_expectation(&peaked, &l, 0, 0, 0) - 2.0).abs() < 1e-4,
+            "{}",
+            dfl_expectation(&peaked, &l, 0, 0, 0)
+        );
         // The probabilities are a softmax and sum to one.
         let probs = dfl_probabilities(&peaked, &l, 0, 0, 0);
         assert_eq!(probs.len(), 4);
@@ -1559,7 +1743,12 @@ mod distribution_heads {
     fn the_ltrb_targets_are_the_truths_distance_in_feature_cells() {
         let l = dfl_layout(4, 4, 4, ModernYoloKind::Ppyoloe);
         // Truth covering the top-left half of a 4x4 map.
-        let truth = ModernBox { x: 0.25, y: 0.25, w: 0.5, h: 0.5 };
+        let truth = ModernBox {
+            x: 0.25,
+            y: 0.25,
+            w: 0.5,
+            h: 0.5,
+        };
         // Cell 0 is (row 0, col 0): cx = cy = 0.5, left = top = 0, right = bottom = 2.
         assert_eq!(target_ltrb_distance(&l, 0, &truth, 0), 0.5, "left");
         assert_eq!(target_ltrb_distance(&l, 0, &truth, 1), 0.5, "top");
@@ -1581,13 +1770,21 @@ mod distribution_heads {
         let start = l.entry_index(0, 0, 0);
         for k in 0..bins {
             let want = (if k == 2 || k == 3 { 0.5 } else { 0.0 }) - 1.0 / bins as f32;
-            assert!((delta[start + k] - want).abs() < 1e-6, "bin {k}: {} vs {want}", delta[start + k]);
+            assert!(
+                (delta[start + k] - want).abs() < 1e-6,
+                "bin {k}: {} vs {want}",
+                delta[start + k]
+            );
         }
         // An integer target distance lands on one bin (right_weight becomes 0),
         // and the clamp keeps a target past the last bin from wrapping.
         let mut delta = vec![0.0f32; l.len()];
         dfl_delta(&mut delta, &x, &l, 0, 0, 0, 0, 3.0, 1.0);
-        assert!((delta[start + 3] - (1.0 - 1.0 / bins as f32)).abs() < 1e-6, "{}", delta[start + 3]);
+        assert!(
+            (delta[start + 3] - (1.0 - 1.0 / bins as f32)).abs() < 1e-6,
+            "{}",
+            delta[start + 3]
+        );
         // Distances past the last bin are clamped, not rejected.
         let mut delta = vec![0.0f32; l.len()];
         dfl_delta(&mut delta, &x, &l, 0, 0, 0, 0, 99.0, 1.0);
@@ -1622,12 +1819,19 @@ mod distribution_heads {
         let tal = assign_tal_like(&x, &truth, &l, &spec, &settings, 0).unwrap();
         let assignments = &tal.assignments;
         assert_eq!(assignments.len(), spatial);
-        let assigned: Vec<&Assignment> = assignments.iter().filter(|a| a.truth_index != usize::MAX).collect();
+        let assigned: Vec<&Assignment> = assignments
+            .iter()
+            .filter(|a| a.truth_index != usize::MAX)
+            .collect();
         assert!(!assigned.is_empty(), "some cells must be assigned");
         for a in &assigned {
             assert_eq!(a.class_id, 0);
             // Varifocal-style quality, floored at 0.05 and at most 1.
-            assert!(a.quality >= 0.05 - 1e-6 && a.quality <= 1.0 + 1e-6, "quality {}", a.quality);
+            assert!(
+                a.quality >= 0.05 - 1e-6 && a.quality <= 1.0 + 1e-6,
+                "quality {}",
+                a.quality
+            );
             assert!((a.quality - a.iou.clamp(0.05, 1.0)).abs() < 1e-6);
         }
     }
@@ -1641,8 +1845,9 @@ mod distribution_heads {
         let spatial = 16;
         let l_ppyoloe = dfl_layout(bins, 4, 4, ModernYoloKind::Ppyoloe);
         let l_nas = dfl_layout(bins, 4, 4, ModernYoloKind::Yolonas);
-        let cells: Vec<(usize, Vec<f32>)> =
-            (0..spatial).map(|loc| (loc, vec![0.0; 4 * bins + 1 + l_ppyoloe.classes])).collect();
+        let cells: Vec<(usize, Vec<f32>)> = (0..spatial)
+            .map(|loc| (loc, vec![0.0; 4 * bins + 1 + l_ppyoloe.classes]))
+            .collect();
         let mut x = dfl_head(&l_ppyoloe, &cells, spatial);
         for loc in 0..spatial {
             x[(4 * bins) * spatial + loc] = 10.0;
@@ -1654,8 +1859,12 @@ mod distribution_heads {
         truth[2] = 1.0;
         truth[3] = 1.0;
         truth[4] = 0.0;
-        let plain = assign_tal_like(&x, &truth, &l_ppyoloe, &spec_ppyoloe, &settings, 0).unwrap().assignments;
-        let nas = assign_tal_like(&x, &truth, &l_nas, &spec_nas, &settings, 0).unwrap().assignments;
+        let plain = assign_tal_like(&x, &truth, &l_ppyoloe, &spec_ppyoloe, &settings, 0)
+            .unwrap()
+            .assignments;
+        let nas = assign_tal_like(&x, &truth, &l_nas, &spec_nas, &settings, 0)
+            .unwrap()
+            .assignments;
         // The same truth claims several cells; PP-YOLOE gives them all the same
         // quality while YOLO-NAS decays by rank.
         // C++ damps per truth: sort that truth's slots by IoU descending and
@@ -1690,7 +1899,10 @@ mod distribution_heads {
             );
             for (rank, (_, iou, q)) in ordered.iter().enumerate() {
                 let want = (iou * (-NAS_DUPLICATE_DECAY * rank as f32).exp()).clamp(0.02, 1.0);
-                assert!((q - want).abs() < 1e-5, "truth {t} rank {rank}: {q} vs {want}");
+                assert!(
+                    (q - want).abs() < 1e-5,
+                    "truth {t} rank {rank}: {q} vs {want}"
+                );
             }
         }
     }
@@ -1702,8 +1914,9 @@ mod distribution_heads {
         let spec = dfl_spec(ModernYoloKind::Ppyoloe, 1, bins - 1);
         let settings = ModernYoloSettings::default();
         let spatial = l.spatial();
-        let cells: Vec<(usize, Vec<f32>)> =
-            (0..spatial).map(|loc| (loc, vec![0.0; 4 * bins + 1 + l.classes])).collect();
+        let cells: Vec<(usize, Vec<f32>)> = (0..spatial)
+            .map(|loc| (loc, vec![0.0; 4 * bins + 1 + l.classes]))
+            .collect();
         let mut x = dfl_head(&l, &cells, spatial);
         for loc in 0..spatial {
             x[(4 * bins) * spatial + loc] = -10.0; // objectness ~ 0
@@ -1715,7 +1928,8 @@ mod distribution_heads {
         truth[2] = 1.0;
         truth[3] = 1.0;
         truth[4] = 0.0;
-        let (delta, cost, positives) = yolox_training_delta(&x, &truth, &l, &spec, &settings).unwrap();
+        let (delta, cost, positives) =
+            yolox_training_delta(&x, &truth, &l, &spec, &settings).unwrap();
         assert!(positives > 0);
         assert!(cost > 0.0);
         // Assigned cells push objectness and the class score up (target quality
@@ -1729,7 +1943,9 @@ mod distribution_heads {
         // The regression block for that cell received a non-zero delta.
         let dfl_start = l.entry_index(0, loc, 0);
         assert!(
-            delta[dfl_start..dfl_start + 4 * bins].iter().any(|d| d.abs() > 1e-6),
+            delta[dfl_start..dfl_start + 4 * bins]
+                .iter()
+                .any(|d| d.abs() > 1e-6),
             "the distribution must be trained"
         );
     }
@@ -1745,8 +1961,9 @@ mod distribution_heads {
         let spec = dfl_spec(ModernYoloKind::Ppyoloe, 2, bins - 1);
         let settings = ModernYoloSettings::default();
         let spatial = l.spatial();
-        let cells: Vec<(usize, Vec<f32>)> =
-            (0..spatial).map(|loc| (loc, vec![0.0; 4 * bins + 1 + l.classes])).collect();
+        let cells: Vec<(usize, Vec<f32>)> = (0..spatial)
+            .map(|loc| (loc, vec![0.0; 4 * bins + 1 + l.classes]))
+            .collect();
         let mut x = dfl_head(&l, &cells, spatial);
         for loc in 0..spatial {
             x[(4 * bins) * spatial + loc] = 10.0;
@@ -1773,10 +1990,16 @@ mod distribution_heads {
             .class_quality
             .chunks_exact(l.classes)
             .enumerate()
-            .filter(|(_, row)| row.iter().any(|q| *q > 0.0) && row.iter().filter(|q| **q > 0.0).count() == 2)
+            .filter(|(_, row)| {
+                row.iter().any(|q| *q > 0.0) && row.iter().filter(|q| **q > 0.0).count() == 2
+            })
             .map(|(slot, _)| slot)
             .collect();
-        assert!(!both.is_empty(), "a slot must keep both nested targets: {:?}", tal.class_quality);
+        assert!(
+            !both.is_empty(),
+            "a slot must keep both nested targets: {:?}",
+            tal.class_quality
+        );
         // And the *box regression* went to the smaller truth: the smallest-area
         // rule replaces the big one wherever they collide.
         let small_wins = tal
@@ -1785,8 +2008,14 @@ mod distribution_heads {
             .filter(|a| a.truth_index == usize::MAX)
             .count();
         assert!(small_wins > 0, "every candidate slot should be owned");
-        assert!(tal.assignments.iter().any(|a| a.truth_index == 1), "the nested truth wins its slot");
-        assert!(tal.assignments.iter().any(|a| a.truth_index == 0), "the big truth wins its own slots");
+        assert!(
+            tal.assignments.iter().any(|a| a.truth_index == 1),
+            "the nested truth wins its slot"
+        );
+        assert!(
+            tal.assignments.iter().any(|a| a.truth_index == 0),
+            "the big truth wins its own slots"
+        );
     }
 
     #[test]
@@ -1797,8 +2026,9 @@ mod distribution_heads {
         let l = dfl_layout(bins, 4, 4, ModernYoloKind::Ppyoloe);
         let settings = ModernYoloSettings::default();
         let spatial = l.spatial();
-        let cells: Vec<(usize, Vec<f32>)> =
-            (0..spatial).map(|loc| (loc, vec![0.0; 4 * bins + 1 + l.classes])).collect();
+        let cells: Vec<(usize, Vec<f32>)> = (0..spatial)
+            .map(|loc| (loc, vec![0.0; 4 * bins + 1 + l.classes]))
+            .collect();
         let mut x = dfl_head(&l, &cells, spatial);
         for loc in 0..spatial {
             x[(4 * bins) * spatial + loc] = 10.0;
@@ -1811,7 +2041,13 @@ mod distribution_heads {
         truth[3] = 0.1;
         truth[4] = 0.0;
         let gated = assign_tal_like(&x, &truth, &l, &spec_narrow, &settings, 0).unwrap();
-        assert!(gated.assignments.iter().all(|a| a.truth_index == usize::MAX), "the gate dropped it");
+        assert!(
+            gated
+                .assignments
+                .iter()
+                .all(|a| a.truth_index == usize::MAX),
+            "the gate dropped it"
+        );
         assert!(gated.class_quality.iter().all(|q| *q == 0.0));
         // With the gate off the same truth is assigned.
         let open = dfl_spec(ModernYoloKind::Ppyoloe, 1, bins - 1);

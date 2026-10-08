@@ -43,7 +43,11 @@ fn masked_softmax(z: &[f32], valid: &[f32], k: usize, p: &mut [f64]) {
     }
     let mut sum = 0.0f64;
     for j in 0..k {
-        p[j] = if valid[j] > 0.5 { (z[j] as f64 - mx).exp() } else { 0.0 };
+        p[j] = if valid[j] > 0.5 {
+            (z[j] as f64 - mx).exp()
+        } else {
+            0.0
+        };
         sum += p[j];
     }
     for value in p.iter_mut().take(k) {
@@ -131,7 +135,7 @@ pub fn laya_loss_compute(
                 return Err(format!(
                     "laya_loss: znorm has {} values, expected G*N*K={needed}",
                     z.len()
-                ))
+                ));
             }
             None => return Err("laya_loss: rlcd mode requires znorm".to_owned()),
         }
@@ -335,10 +339,16 @@ pub fn td_lambda_targets(
     let mut p = vec![0.0f64; k];
     for sample in 0..n {
         let y = &truth[sample * in_stride..sample * in_stride + in_stride];
-        out[sample * out_stride..sample * out_stride + out_stride].copy_from_slice(&y[..out_stride]);
+        out[sample * out_stride..sample * out_stride + out_stride]
+            .copy_from_slice(&y[..out_stride]);
         let group = y[2 * k + 1].round() as i64;
         if group >= 0 && lam >= 0.0 {
-            masked_softmax(&logits[sample * k..(sample + 1) * k], &y[k..2 * k], k, &mut p);
+            masked_softmax(
+                &logits[sample * k..(sample + 1) * k],
+                &y[k..2 * k],
+                k,
+                &mut p,
+            );
             p_true[sample] = p[1.min(k - 1)];
             groups
                 .entry(group)
@@ -410,8 +420,16 @@ mod tests {
 
     #[test]
     fn ce_matches_the_hand_computation() {
-        let out = laya_loss_compute(&[0.0, 0.0], &[1.0, 0.0, 1.0, 1.0, 0.0], 1, 2, &spec(2, false), 0.0, None)
-            .unwrap();
+        let out = laya_loss_compute(
+            &[0.0, 0.0],
+            &[1.0, 0.0, 1.0, 1.0, 0.0],
+            1,
+            2,
+            &spec(2, false),
+            0.0,
+            None,
+        )
+        .unwrap();
         let ln2 = 2.0f32.ln();
         assert!((out.loss - ln2).abs() < 1e-6, "{}", out.loss);
         assert!((out.probs[0] - 0.5).abs() < 1e-6);
@@ -422,8 +440,16 @@ mod tests {
     #[test]
     fn invalid_slots_are_masked() {
         // Only option 0 valid, target 0 -> loss 0, delta 0.
-        let out = laya_loss_compute(&[0.0, 5.0], &[1.0, 0.0, 1.0, 0.0, 0.0], 1, 2, &spec(2, false), 0.0, None)
-            .unwrap();
+        let out = laya_loss_compute(
+            &[0.0, 5.0],
+            &[1.0, 0.0, 1.0, 0.0, 0.0],
+            1,
+            2,
+            &spec(2, false),
+            0.0,
+            None,
+        )
+        .unwrap();
         assert_eq!(out.probs, vec![1.0, 0.0]);
         assert_eq!(out.delta, vec![0.0, 0.0]);
         assert!(out.loss.abs() < 1e-9);
@@ -433,8 +459,16 @@ mod tests {
     fn padding_samples_are_left_out_of_the_mean() {
         // Two samples: the second has no valid option, so only sample 0 counts.
         let truth = [1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let out = laya_loss_compute(&[0.0, 0.0, 3.0, 3.0], &truth, 2, 2, &spec(2, false), 0.0, None)
-            .unwrap();
+        let out = laya_loss_compute(
+            &[0.0, 0.0, 3.0, 3.0],
+            &truth,
+            2,
+            2,
+            &spec(2, false),
+            0.0,
+            None,
+        )
+        .unwrap();
         let ln2 = 2.0f32.ln();
         assert!((out.loss - ln2).abs() < 1e-6, "{}", out.loss);
         assert_eq!(out.delta[2], 0.0);
@@ -453,8 +487,12 @@ mod tests {
             hi[i] += eps;
             let mut lo = logits;
             lo[i] -= eps;
-            let l_hi = laya_loss_compute(&hi, &truth, 1, 3, &spec(3, false), 0.0, None).unwrap().loss;
-            let l_lo = laya_loss_compute(&lo, &truth, 1, 3, &spec(3, false), 0.0, None).unwrap().loss;
+            let l_hi = laya_loss_compute(&hi, &truth, 1, 3, &spec(3, false), 0.0, None)
+                .unwrap()
+                .loss;
+            let l_lo = laya_loss_compute(&lo, &truth, 1, 3, &spec(3, false), 0.0, None)
+                .unwrap()
+                .loss;
             let numeric = -((l_hi - l_lo) / (2.0 * eps));
             assert!(
                 (base.delta[i] - numeric).abs() < 2e-3,
@@ -529,10 +567,10 @@ mod tests {
         let adv = [a0 / (sd + 1e-6), a1 / (sd + 1e-6)];
         let inv_s2 = 1.0 / (sigma as f64 * sigma as f64);
         // Group 0 gradient: a*eps*inv_s2/G; group 1 mirrors with eps1.
-        let want_delta0 = (adv[0] * eps0[0] * inv_s2 / g as f64
-            + adv[1] * eps1[0] * inv_s2 / g as f64) as f32;
-        let want_delta1 = (adv[0] * eps0[1] * inv_s2 / g as f64
-            + adv[1] * eps1[1] * inv_s2 / g as f64) as f32;
+        let want_delta0 =
+            (adv[0] * eps0[0] * inv_s2 / g as f64 + adv[1] * eps1[0] * inv_s2 / g as f64) as f32;
+        let want_delta1 =
+            (adv[0] * eps0[1] * inv_s2 / g as f64 + adv[1] * eps1[1] * inv_s2 / g as f64) as f32;
         // The plus the CE part (w_ce=1): y - p with p = [0.5, 0.5].
         assert!(
             (out.delta[0] - (0.5 + want_delta0)).abs() < 2e-3,
@@ -566,6 +604,17 @@ mod tests {
         assert!(laya_loss_compute(&[0.0], &[0.0], 1, 1, &spec(1, false), 0.0, None).is_err());
         assert!(laya_loss_compute(&[0.0, 0.0], &[0.0], 1, 2, &spec(2, false), 0.0, None).is_err());
         // rlcd needs znorm.
-        assert!(laya_loss_compute(&[0.0, 0.0], &[1.0, 0.0, 1.0, 1.0, 0.0], 1, 2, &spec(2, true), 0.5, None).is_err());
+        assert!(
+            laya_loss_compute(
+                &[0.0, 0.0],
+                &[1.0, 0.0, 1.0, 1.0, 0.0],
+                1,
+                2,
+                &spec(2, true),
+                0.5,
+                None
+            )
+            .is_err()
+        );
     }
 }

@@ -604,7 +604,8 @@ pub trait F32TensorOpsBackend {
                 &[channels],
                 &weights[index * channels..(index + 1) * channels],
             )?;
-            let weighted = self.channel_scale_f32(input, &scale, channels, channel_stride, config)?;
+            let weighted =
+                self.channel_scale_f32(input, &scale, channels, channel_stride, config)?;
             accumulated = Some(match accumulated {
                 Some(previous) => self.shortcut_add_f32(&previous, &weighted, config)?,
                 None => weighted,
@@ -1250,14 +1251,20 @@ pub trait F32TensorOpsBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
         let _ = config;
-        assert!(rows > 0 && cols > 0, "residual_bias_f32: rows and cols must be > 0");
+        assert!(
+            rows > 0 && cols > 0,
+            "residual_bias_f32: rows and cols must be > 0"
+        );
         let r = self.download_f32(residual)?;
         let yv = self.download_f32(y)?;
         let b = match bias {
             Some(t) => Some(self.download_f32(t)?),
             None => None,
         };
-        self.upload_f32(shape, &host_ops::residual_bias(&r, &yv, b.as_deref(), rows, cols))
+        self.upload_f32(
+            shape,
+            &host_ops::residual_bias(&r, &yv, b.as_deref(), rows, cols),
+        )
     }
     /// Row-wise LayerNorm over a flat `rows x cols` buffer:
     /// `y = gamma * (x - mean) * inv_std + beta`, population variance.
@@ -1287,7 +1294,10 @@ pub trait F32TensorOpsBackend {
             Some(t) => Some(self.download_f32(t)?),
             None => None,
         };
-        self.upload_f32(shape, &host_ops::layernorm(&host, rows, cols, g.as_deref(), b.as_deref(), eps))
+        self.upload_f32(
+            shape,
+            &host_ops::layernorm(&host, rows, cols, g.as_deref(), b.as_deref(), eps),
+        )
     }
     /// Row-wise LayerNorm backward: the input gradient only, with the reduction
     /// statistics recomputed from `x` (`dx = g - mean(g) - xhat * mean(g*xhat)`).
@@ -1313,7 +1323,10 @@ pub trait F32TensorOpsBackend {
             Some(t) => Some(self.download_f32(t)?),
             None => None,
         };
-        self.upload_f32(shape, &host_ops::layernorm_backward(&dy, &host, rows, cols, g.as_deref(), eps))
+        self.upload_f32(
+            shape,
+            &host_ops::layernorm_backward(&dy, &host, rows, cols, g.as_deref(), eps),
+        )
     }
     /// Softmax over every contiguous `group_size` run of `x` (max-subtracted);
     /// `shape` is the tensor shape of `x` and the output.
@@ -1361,7 +1374,11 @@ pub trait F32TensorOpsBackend {
         let d = host_ops::reorg_dims(input_shape, output_shape, stride, reverse)
             .unwrap_or_else(|err| panic!("{err}"));
         let host = self.download_f32(x)?;
-        let out = if reverse { host_ops::reorg_to_big(&host, &d) } else { host_ops::reorg_to_small(&host, &d) };
+        let out = if reverse {
+            host_ops::reorg_to_big(&host, &d)
+        } else {
+            host_ops::reorg_to_small(&host, &d)
+        };
         self.upload_f32(output_shape, &out)
     }
     /// Exact adjoint of [`Self::reorg_f32`]: returns the gradient of the layer
@@ -1379,7 +1396,11 @@ pub trait F32TensorOpsBackend {
         let d = host_ops::reorg_dims(input_shape, output_shape, stride, reverse)
             .unwrap_or_else(|err| panic!("{err}"));
         let host = self.download_f32(output_grad)?;
-        let dx = if reverse { host_ops::reorg_to_small(&host, &d) } else { host_ops::reorg_to_big(&host, &d) };
+        let dx = if reverse {
+            host_ops::reorg_to_small(&host, &d)
+        } else {
+            host_ops::reorg_to_big(&host, &d)
+        };
         self.upload_f32(input_shape, &dx)
     }
     /// `[channel_shuffle]` on NCHW `shape` (see [`host_ops::channel_permute`]): forward
@@ -1398,7 +1419,11 @@ pub trait F32TensorOpsBackend {
             shape.len() == 4 && groups > 0 && shape[1] % groups == 0,
             "channel_shuffle_f32: bad shape {shape:?} or groups {groups}"
         );
-        let (rows, cols) = if inverse { (shape[1] / groups, groups) } else { (groups, shape[1] / groups) };
+        let (rows, cols) = if inverse {
+            (shape[1] / groups, groups)
+        } else {
+            (groups, shape[1] / groups)
+        };
         let host = self.download_f32(x)?;
         let out = host_ops::channel_permute(&host, shape[0], rows, cols, shape[2] * shape[3]);
         self.upload_f32(shape, &out)
@@ -1417,7 +1442,10 @@ pub trait F32TensorOpsBackend {
         let _ = config;
         let host = self.download_f32(x)?;
         let (out, mask) = host_ops::dropout(&host, probability, seed);
-        Ok((self.upload_f32(shape, &out)?, self.upload_f32(shape, &mask)?))
+        Ok((
+            self.upload_f32(shape, &out)?,
+            self.upload_f32(shape, &mask)?,
+        ))
     }
     /// `dx = dy * mask`.
     fn dropout_backward_f32(
@@ -1449,7 +1477,10 @@ pub trait F32TensorOpsBackend {
         let _ = config;
         let host = self.download_f32(x)?;
         let (out, mask) = host_ops::dropblock(&host, shape, block_prob, block_size, seed);
-        Ok((self.upload_f32(shape, &out)?, self.upload_f32(shape, &mask)?))
+        Ok((
+            self.upload_f32(shape, &out)?,
+            self.upload_f32(shape, &mask)?,
+        ))
     }
     /// Darknet `constrain_ongpu`: out-of-place `min(limit, max(-limit, x))`.
     fn constrain_f32(
@@ -1507,12 +1538,21 @@ pub trait F32TensorOpsBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
         let _ = config;
-        assert!(shape.len() == 4, "scale_channels_backward_f32: shape must be NCHW");
+        assert!(
+            shape.len() == 4,
+            "scale_channels_backward_f32: shape must be NCHW"
+        );
         let g = self.download_f32(delta)?;
         let s = self.download_f32(scale)?;
         let src = self.download_f32(source)?;
-        let (d_scale, d_source) =
-            host_ops::scale_channels_backward(&g, &s, &src, shape[1], shape[2] * shape[3], scale_wh);
+        let (d_scale, d_source) = host_ops::scale_channels_backward(
+            &g,
+            &s,
+            &src,
+            shape[1],
+            shape[2] * shape[3],
+            scale_wh,
+        );
         let scale_shape = if scale_wh {
             [shape[0], 1, shape[2], shape[3]]
         } else {
@@ -1581,7 +1621,10 @@ pub trait F32TensorOpsBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<BatchNormTrainForward<Self::Tensor>, Self::Error> {
         let _ = config;
-        assert!(shape.len() == 4, "batchnorm_train_forward_f32: shape must be NCHW");
+        assert!(
+            shape.len() == 4,
+            "batchnorm_train_forward_f32: shape must be NCHW"
+        );
         let r = host_ops::batchnorm_train_forward(
             &self.download_f32(x)?,
             &self.download_f32(scales)?,
@@ -1615,7 +1658,10 @@ pub trait F32TensorOpsBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
         let _ = config;
-        assert!(shape.len() == 4, "batchnorm_train_backward_f32: shape must be NCHW");
+        assert!(
+            shape.len() == 4,
+            "batchnorm_train_backward_f32: shape must be NCHW"
+        );
         let (dx, dscale, dbias) = host_ops::batchnorm_train_backward(
             &self.download_f32(output_grad)?,
             &self.download_f32(x_hat)?,
@@ -1805,10 +1851,22 @@ pub trait F32TensorOpsBackend {
             self.download_f32(variance)?,
             self.download_f32(bias)?,
         );
-        let scale: Vec<f32> = g.iter().zip(&v).map(|(g, v)| g / (v + eps).sqrt()).collect();
-        let folded: Vec<f32> = b.iter().zip(&m).zip(&scale).map(|((b, m), s)| b - m * s).collect();
+        let scale: Vec<f32> = g
+            .iter()
+            .zip(&v)
+            .map(|(g, v)| g / (v + eps).sqrt())
+            .collect();
+        let folded: Vec<f32> = b
+            .iter()
+            .zip(&m)
+            .zip(&scale)
+            .map(|((b, m), s)| b - m * s)
+            .collect();
         let shape = [scale.len()];
-        Ok((self.upload_f32(&shape, &scale)?, self.upload_f32(&shape, &folded)?))
+        Ok((
+            self.upload_f32(&shape, &scale)?,
+            self.upload_f32(&shape, &folded)?,
+        ))
     }
 }
 

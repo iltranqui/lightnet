@@ -139,6 +139,7 @@ pub fn decode_obb_yolo_detections(
 ) -> Result<Vec<ObbDetection>> {
     let mut detections = Vec::new();
     let mut nms_kind = None;
+    let mut beta_nms = None;
     for head in obb_heads {
         let layer = network.layers.get(head.layer_index).ok_or_else(|| {
             Error::InvalidConfig(format!(
@@ -166,6 +167,14 @@ pub fn decode_obb_yolo_detections(
                 "OBB YOLO heads use different NMS kinds".to_owned(),
             ));
         }
+        if spec.nms_kind == ObbNmsKind::Diou {
+            if beta_nms.is_some_and(|beta| beta != spec.beta_nms) {
+                return Err(Error::InvalidConfig(
+                    "OBB YOLO heads use different beta_nms values".to_owned(),
+                ));
+            }
+            beta_nms = Some(spec.beta_nms);
+        }
         nms_kind = Some(spec.nms_kind);
         detections.extend(decode_obb_yolo_head(
             &head.output.data,
@@ -184,6 +193,7 @@ pub fn decode_obb_yolo_detections(
         &mut detections,
         options.nms_threshold,
         nms_kind.unwrap_or(ObbNmsKind::Obb),
+        beta_nms.unwrap_or(0.6),
     );
     detections.sort_by(|lhs, rhs| {
         rhs.detection
@@ -367,7 +377,8 @@ fn decode_yolo_head(
             let ty = data[(anchor_base + 1) * stride + index];
             let tw = data[(anchor_base + 2) * stride + index];
             let th = data[(anchor_base + 3) * stride + index];
-            let objectness = head_activation(data[(anchor_base + 4) * stride + index], spec.new_coords);
+            let objectness =
+                head_activation(data[(anchor_base + 4) * stride + index], spec.new_coords);
 
             if objectness <= options.confidence_threshold {
                 continue;
@@ -440,16 +451,22 @@ pub fn decode_modern_detections(
     let mut detections = Vec::new();
     for head in modern_heads {
         let layer = network.layers.get(head.layer_index).ok_or_else(|| {
-            Error::InvalidConfig(format!("missing layer #{} for a modern head", head.layer_index))
+            Error::InvalidConfig(format!(
+                "missing layer #{} for a modern head",
+                head.layer_index
+            ))
         })?;
-        let (w, h, classes) = (head.output.shape.width, head.output.shape.height, head.output.shape.channels);
+        let (w, h, classes) = (
+            head.output.shape.width,
+            head.output.shape.height,
+            head.output.shape.channels,
+        );
         let grid_w = w as f32;
         let grid_h = h as f32;
         match &layer.kind {
             LayerKind::Yolox(spec) => {
-                let layout = crate::modern_yolo::ModernLayout::for_spec(
-                    head.output.shape.batch, w, h, spec,
-                );
+                let layout =
+                    crate::modern_yolo::ModernLayout::for_spec(head.output.shape.batch, w, h, spec);
                 if head.output.data.len() != layout.len() {
                     return Err(Error::InvalidConfig(format!(
                         "yolox head tensor length mismatch: expected {}, got {}",
@@ -461,25 +478,43 @@ pub fn decode_modern_detections(
                 for n in 0..layout.n {
                     for loc in 0..stride {
                         let obj = crate::modern_yolo::modern_objectness(
-                            &head.output.data, &layout, 0, n, loc,
+                            &head.output.data,
+                            &layout,
+                            0,
+                            n,
+                            loc,
                         );
                         for c in 0..layout.classes {
                             let cls = crate::modern_yolo::modern_class_score(
-                                &head.output.data, &layout, 0, n, loc, c,
+                                &head.output.data,
+                                &layout,
+                                0,
+                                n,
+                                loc,
+                                c,
                             );
                             let score = obj * cls;
                             if score <= options.confidence_threshold {
                                 continue;
                             }
                             let box_ = crate::modern_yolo::decode_modern_box(
-                                &head.output.data, &layout, 0, n, loc,
+                                &head.output.data,
+                                &layout,
+                                0,
+                                n,
+                                loc,
                             );
                             detections.push(Detection {
                                 class_id: c,
                                 confidence: score,
                                 objectness: obj,
                                 bbox: correct_bbox(
-                                    DetectionBox { x: box_.x, y: box_.y, w: box_.w, h: box_.h },
+                                    DetectionBox {
+                                        x: box_.x,
+                                        y: box_.y,
+                                        w: box_.w,
+                                        h: box_.h,
+                                    },
                                     image_width as f32,
                                     image_height as f32,
                                     network.net.width as f32,
@@ -492,9 +527,8 @@ pub fn decode_modern_detections(
                 }
             }
             LayerKind::Ppyoloe(spec) | LayerKind::Yolonas(spec) => {
-                let layout = crate::modern_yolo::ModernLayout::for_spec(
-                    head.output.shape.batch, w, h, spec,
-                );
+                let layout =
+                    crate::modern_yolo::ModernLayout::for_spec(head.output.shape.batch, w, h, spec);
                 if head.output.data.len() != layout.len() {
                     return Err(Error::InvalidConfig(format!(
                         "distribution head tensor length mismatch: expected {}, got {}",
@@ -506,11 +540,20 @@ pub fn decode_modern_detections(
                 for n in 0..layout.n {
                     for loc in 0..stride {
                         let obj = crate::modern_yolo::modern_objectness(
-                            &head.output.data, &layout, 0, n, loc,
+                            &head.output.data,
+                            &layout,
+                            0,
+                            n,
+                            loc,
                         );
                         for c in 0..layout.classes {
                             let cls = crate::modern_yolo::modern_class_score(
-                                &head.output.data, &layout, 0, n, loc, c,
+                                &head.output.data,
+                                &layout,
+                                0,
+                                n,
+                                loc,
+                                c,
                             );
                             // The distribution heads gate on the class score, not
                             // on the product, because the objectness logit is
@@ -521,14 +564,23 @@ pub fn decode_modern_detections(
                                 continue;
                             }
                             let box_ = crate::modern_yolo::decode_modern_box(
-                                &head.output.data, &layout, 0, n, loc,
+                                &head.output.data,
+                                &layout,
+                                0,
+                                n,
+                                loc,
                             );
                             detections.push(Detection {
                                 class_id: c,
                                 confidence: score,
                                 objectness: obj,
                                 bbox: correct_bbox(
-                                    DetectionBox { x: box_.x, y: box_.y, w: box_.w, h: box_.h },
+                                    DetectionBox {
+                                        x: box_.x,
+                                        y: box_.y,
+                                        w: box_.w,
+                                        h: box_.h,
+                                    },
                                     image_width as f32,
                                     image_height as f32,
                                     network.net.width as f32,
@@ -542,7 +594,10 @@ pub fn decode_modern_detections(
             }
             LayerKind::CenterNet(spec) => {
                 let layout = crate::centernet::CenterNetLayout::for_spec(
-                    head.output.shape.batch, w, h, spec,
+                    head.output.shape.batch,
+                    w,
+                    h,
+                    spec,
                 );
                 if head.output.data.len() != layout.len() {
                     return Err(Error::InvalidConfig(format!(
@@ -557,25 +612,42 @@ pub fn decode_modern_detections(
                         for loc in 0..stride {
                             if spec.peak_nms != 0
                                 && !crate::centernet::is_local_peak(
-                                    &head.output.data, &layout, n, c, loc,
+                                    &head.output.data,
+                                    &layout,
+                                    n,
+                                    c,
+                                    loc,
                                 )
                             {
                                 continue;
                             }
                             let score = crate::centernet::heatmap_score(
-                                &head.output.data, &layout, n, c, loc,
+                                &head.output.data,
+                                &layout,
+                                n,
+                                c,
+                                loc,
                             );
                             if score <= options.confidence_threshold {
                                 continue;
                             }
-                            let (bx, by, bw, bh) =
-                                crate::centernet::decode_centernet_box(&head.output.data, &layout, n, loc);
+                            let (bx, by, bw, bh) = crate::centernet::decode_centernet_box(
+                                &head.output.data,
+                                &layout,
+                                n,
+                                loc,
+                            );
                             detections.push(Detection {
                                 class_id: c,
                                 confidence: score,
                                 objectness: score,
                                 bbox: correct_bbox(
-                                    DetectionBox { x: bx, y: by, w: bw, h: bh },
+                                    DetectionBox {
+                                        x: bx,
+                                        y: by,
+                                        w: bw,
+                                        h: bh,
+                                    },
                                     image_width as f32,
                                     image_height as f32,
                                     network.net.width as f32,
@@ -860,6 +932,20 @@ fn bbox_iou(lhs: DetectionBox, rhs: DetectionBox) -> f32 {
     inter_area / (lhs_area + rhs_area - inter_area)
 }
 
+/// Source `box_diou`/`box_diounms`: AABB IoU minus `(center_distance² / enclosing_diagonal²)^beta`.
+fn bbox_diou(lhs: DetectionBox, rhs: DetectionBox, beta: f32) -> f32 {
+    let enclosing_width = lhs.right().max(rhs.right()) - lhs.left().min(rhs.left());
+    let enclosing_height = lhs.bottom().max(rhs.bottom()) - lhs.top().min(rhs.top());
+    let enclosing_diagonal_squared =
+        enclosing_width * enclosing_width + enclosing_height * enclosing_height;
+    let iou = bbox_iou(lhs, rhs);
+    if enclosing_diagonal_squared == 0.0 {
+        return iou;
+    }
+    let center_distance_squared = (lhs.x - rhs.x).powi(2) + (lhs.y - rhs.y).powi(2);
+    iou - (center_distance_squared / enclosing_diagonal_squared).powf(beta)
+}
+
 /// IoU dispatch used by OBB post-processing.
 ///
 /// Two CARPN quads use explicit polygon IoU. All other OBB pairs use the first
@@ -906,13 +992,24 @@ pub fn apply_obb_nms(detections: &mut Vec<ObbDetection>, threshold: f32) {
     apply_obb_nms_by_overlap(detections, threshold, detection_obb_iou);
 }
 
-fn apply_obb_nms_by_kind(detections: &mut Vec<ObbDetection>, threshold: f32, kind: ObbNmsKind) {
+fn apply_obb_nms_by_kind(
+    detections: &mut Vec<ObbDetection>,
+    threshold: f32,
+    kind: ObbNmsKind,
+    beta_nms: f32,
+) {
     match kind {
         ObbNmsKind::Default | ObbNmsKind::Corners => {
             apply_obb_nms_by_overlap(detections, threshold, |lhs, rhs| {
                 bbox_iou(lhs.detection.bbox, rhs.detection.bbox)
             })
         }
+        ObbNmsKind::Greedy => apply_obb_nms_by_overlap(detections, threshold, |lhs, rhs| {
+            bbox_diou(lhs.detection.bbox, rhs.detection.bbox, 0.6)
+        }),
+        ObbNmsKind::Diou => apply_obb_nms_by_overlap(detections, threshold, |lhs, rhs| {
+            bbox_diou(lhs.detection.bbox, rhs.detection.bbox, beta_nms)
+        }),
         ObbNmsKind::Obb => apply_obb_nms(detections, threshold),
     }
 }
@@ -1043,7 +1140,11 @@ mod tests {
             &[head],
             32,
             32,
-            DetectionOptions { confidence_threshold: 0.25, nms_threshold: 0.45, letterbox: false },
+            DetectionOptions {
+                confidence_threshold: 0.25,
+                nms_threshold: 0.45,
+                letterbox: false,
+            },
         )
         .expect("decode should succeed");
         assert_eq!(detections.len(), 1);
@@ -1400,13 +1501,30 @@ mod obb_postprocess_tests {
 
         for kind in [ObbNmsKind::Default, ObbNmsKind::Corners] {
             let mut detections = vec![horizontal.clone(), vertical.clone()];
-            apply_obb_nms_by_kind(&mut detections, 0.5, kind);
+            apply_obb_nms_by_kind(&mut detections, 0.5, kind, 0.6);
             assert_eq!(detections.len(), 1, "{kind:?} uses AABB IoU = 1");
         }
 
         let mut oriented = vec![horizontal, vertical];
-        apply_obb_nms_by_kind(&mut oriented, 0.5, ObbNmsKind::Obb);
+        apply_obb_nms_by_kind(&mut oriented, 0.5, ObbNmsKind::Obb, 0.6);
         assert_eq!(oriented.len(), 2, "OBB NMS uses orientation-aware IoU");
+    }
+
+    #[test]
+    fn greedy_and_diou_nms_use_source_distance_penalties() {
+        let first = rect_detection(0, 0.9, 0.9, [0.0, 1.0]);
+        let mut second = rect_detection(0, 0.8, 0.8, [0.0, 1.0]);
+        second.detection.bbox.x = 2.5;
+        let iou = super::bbox_iou(first.detection.bbox, second.detection.bbox);
+        assert!((iou - 3.0 / 13.0).abs() < 1e-6);
+
+        let mut greedy = vec![first.clone(), second.clone()];
+        apply_obb_nms_by_kind(&mut greedy, 0.1, ObbNmsKind::Greedy, 0.6);
+        assert_eq!(greedy.len(), 2, "fixed-power DIoU score is below threshold");
+
+        let mut diou = vec![first, second];
+        apply_obb_nms_by_kind(&mut diou, 0.1, ObbNmsKind::Diou, 2.0);
+        assert_eq!(diou.len(), 1, "beta_nms=2 keeps positive penalized overlap");
     }
 
     #[test]
@@ -1437,7 +1555,7 @@ mod obb_postprocess_tests {
 mod obb_network_decode_tests {
     use crate::cfg::ConfigFile;
     use crate::model::Network;
-    use crate::runtime::{ExecutableNetwork, Tensor};
+    use crate::runtime::{ExecutableNetwork, Tensor, YoloHeadOutput};
 
     use super::{
         DetectionOptions, ObbDetectionGeometry, decode_obb_yolo_detections, decode_yolo_detections,
@@ -1491,6 +1609,27 @@ mod obb_network_decode_tests {
             "OBB heads must not enter axis-aligned decode"
         );
     }
+
+    #[test]
+    fn network_decode_rejects_mismatched_diou_betas_across_heads() {
+        let cfg = ConfigFile::parse_str(
+            "obb-beta-mismatch.cfg",
+            "[net]\nwidth=4\nheight=2\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\nnms_kind=diounms\nbeta_nms=0.6\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\nnms_kind=diounms\nbeta_nms=1.2\n",
+        )
+        .expect("cfg parses");
+        let network = Network::from_config(cfg).expect("OBB network builds");
+        let heads: Vec<_> = network
+            .layers
+            .iter()
+            .map(|layer| YoloHeadOutput {
+                layer_index: layer.index,
+                output: Tensor::zeros(layer.output_shape),
+            })
+            .collect();
+        let error = decode_obb_yolo_detections(&network, &heads, 4, 2, DetectionOptions::default())
+            .expect_err("DIoU heads need one network-wide beta");
+        assert!(error.to_string().contains("different beta_nms values"));
+    }
 }
 
 #[cfg(test)]
@@ -1501,7 +1640,8 @@ mod modern_decode_tests {
     use crate::{ConfigFile, Network, TensorShape};
 
     fn net(text: &str) -> Network {
-        Network::from_config(ConfigFile::parse_str("t.cfg", text).expect("cfg parses")).expect("builds")
+        Network::from_config(ConfigFile::parse_str("t.cfg", text).expect("cfg parses"))
+            .expect("builds")
     }
 
     fn yolox_cfg() -> String {
@@ -1537,7 +1677,11 @@ mod modern_decode_tests {
             &[out],
             16,
             16,
-            DetectionOptions { confidence_threshold: 0.3, nms_threshold: 0.45, letterbox: false },
+            DetectionOptions {
+                confidence_threshold: 0.3,
+                nms_threshold: 0.45,
+                letterbox: false,
+            },
         )
         .unwrap();
         assert_eq!(dets.len(), 1, "{dets:?}");
@@ -1576,7 +1720,11 @@ mod modern_decode_tests {
             std::slice::from_ref(&out),
             16,
             16,
-            DetectionOptions { confidence_threshold: 0.9, nms_threshold: 0.45, letterbox: false },
+            DetectionOptions {
+                confidence_threshold: 0.9,
+                nms_threshold: 0.45,
+                letterbox: false,
+            },
         )
         .unwrap();
         assert_eq!(dets.len(), 1, "NMS merged the overlapping pair: {dets:?}");
@@ -1586,7 +1734,11 @@ mod modern_decode_tests {
             &[out.clone()],
             16,
             16,
-            DetectionOptions { confidence_threshold: 0.995, nms_threshold: 0.45, letterbox: false },
+            DetectionOptions {
+                confidence_threshold: 0.995,
+                nms_threshold: 0.45,
+                letterbox: false,
+            },
         )
         .unwrap();
         assert!(none.is_empty(), "{none:?}");
@@ -1620,7 +1772,11 @@ mod modern_decode_tests {
             &[out],
             16,
             16,
-            DetectionOptions { confidence_threshold: 0.5, nms_threshold: 0.45, letterbox: false },
+            DetectionOptions {
+                confidence_threshold: 0.5,
+                nms_threshold: 0.45,
+                letterbox: false,
+            },
         )
         .unwrap();
         assert_eq!(dets.len(), 1, "only the strict peak survives: {dets:?}");
@@ -1661,7 +1817,11 @@ mod modern_decode_tests {
             &[out],
             16,
             16,
-            DetectionOptions { confidence_threshold: 0.3, nms_threshold: 0.45, letterbox: false },
+            DetectionOptions {
+                confidence_threshold: 0.3,
+                nms_threshold: 0.45,
+                letterbox: false,
+            },
         )
         .unwrap();
         assert_eq!(dets.len(), 1, "{dets:?}");
@@ -1681,12 +1841,19 @@ mod modern_decode_tests {
             layer_index: 0, // the convolution, not a head
             output: Tensor::from_data(
                 network.layers[0].output_shape,
-                vec![0.0; network.layers[0].output_shape.batch * network.layers[0].output_shape.element_count()],
+                vec![
+                    0.0;
+                    network.layers[0].output_shape.batch
+                        * network.layers[0].output_shape.element_count()
+                ],
             )
             .unwrap(),
         };
         let err = decode_modern_detections(&network, &[out], 16, 16, DetectionOptions::default())
             .expect_err("a convolution is not a modern head");
-        assert!(format!("{err}").contains("not a modern anchor-free head"), "{err}");
+        assert!(
+            format!("{err}").contains("not a modern anchor-free head"),
+            "{err}"
+        );
     }
 }

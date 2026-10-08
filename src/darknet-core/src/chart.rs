@@ -52,11 +52,14 @@ pub fn write_training_chart(path: &Path, points: &[ChartPoint]) -> Result<()> {
     let (loss_lo, loss_hi) = range(points.iter().map(|p| p.avg_loss as f64));
     draw_grid_labels(&mut image, loss_lo, loss_hi, plot_h);
 
-    let to_x = |iteration: usize| -> f32 {
-        LEFT as f32 + (iteration as f32 - x0) / (x1 - x0) * plot_w
-    };
+    let to_x =
+        |iteration: usize| -> f32 { LEFT as f32 + (iteration as f32 - x0) / (x1 - x0) * plot_w };
     let to_y = |value: f64, lo: f64, hi: f64| -> f32 {
-        let t = if hi > lo { (value - lo) / (hi - lo) } else { 0.5 };
+        let t = if hi > lo {
+            (value - lo) / (hi - lo)
+        } else {
+            0.5
+        };
         TOP as f32 + (1.0 - t as f32) * plot_h
     };
 
@@ -71,16 +74,33 @@ pub fn write_training_chart(path: &Path, points: &[ChartPoint]) -> Result<()> {
         let (map_lo, map_hi) = range(map_points.iter().filter_map(|p| p.map));
         let map_poly: Vec<(f32, f32)> = map_points
             .iter()
-            .map(|p| (to_x(p.iteration), to_y(p.map.unwrap_or(0.0), map_lo, map_hi)))
+            .map(|p| {
+                (
+                    to_x(p.iteration),
+                    to_y(p.map.unwrap_or(0.0), map_lo, map_hi),
+                )
+            })
             .collect();
         draw_polyline(&mut image, &map_poly, MAP);
     }
 
     // x axis labels: first and last iteration.
-    draw_number(&mut image, LEFT, HEIGHT as i32 - 28, first.to_string().as_str(), 1);
+    draw_number(
+        &mut image,
+        LEFT,
+        HEIGHT as i32 - 28,
+        first.to_string().as_str(),
+        1,
+    );
     let last_label = last.to_string();
     let w = text_width(&last_label, 1);
-    draw_number(&mut image, WIDTH as i32 - RIGHT - w, HEIGHT as i32 - 28, &last_label, 1);
+    draw_number(
+        &mut image,
+        WIDTH as i32 - RIGHT - w,
+        HEIGHT as i32 - 28,
+        &last_label,
+        1,
+    );
     image.save(path).map_err(chart_error)?;
     Ok(())
 }
@@ -156,20 +176,48 @@ fn draw_line(image: &mut RgbaImage, (x0, y0): (f32, f32), (x1, y1): (f32, f32), 
 /// 5x7 glyphs for the characters used by tick labels: digits, `.`, `-`, `e`, `+`.
 fn glyph(c: char) -> [u8; 7] {
     match c {
-        '0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
-        '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-        '2' => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
-        '3' => [0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110],
-        '4' => [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
-        '5' => [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
-        '6' => [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
-        '7' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
-        '8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
-        '9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
-        '.' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100],
-        '-' => [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000],
-        '+' => [0b00000, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00000],
-        'e' => [0b00000, 0b00000, 0b01110, 0b10001, 0b11111, 0b10000, 0b01110],
+        '0' => [
+            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+        ],
+        '1' => [
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        '2' => [
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+        ],
+        '3' => [
+            0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110,
+        ],
+        '4' => [
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ],
+        '5' => [
+            0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110,
+        ],
+        '6' => [
+            0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+        ],
+        '7' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+        ],
+        '8' => [
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ],
+        '9' => [
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100,
+        ],
+        '.' => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100,
+        ],
+        '-' => [
+            0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000,
+        ],
+        '+' => [
+            0b00000, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00000,
+        ],
+        'e' => [
+            0b00000, 0b00000, 0b01110, 0b10001, 0b11111, 0b10000, 0b01110,
+        ],
         _ => [0; 7],
     }
 }
@@ -211,9 +259,21 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("chart.png");
         let points = vec![
-            ChartPoint { iteration: 1, avg_loss: 10.0, map: None },
-            ChartPoint { iteration: 2, avg_loss: 5.0, map: Some(0.1) },
-            ChartPoint { iteration: 3, avg_loss: 2.0, map: Some(0.3) },
+            ChartPoint {
+                iteration: 1,
+                avg_loss: 10.0,
+                map: None,
+            },
+            ChartPoint {
+                iteration: 2,
+                avg_loss: 5.0,
+                map: Some(0.1),
+            },
+            ChartPoint {
+                iteration: 3,
+                avg_loss: 2.0,
+                map: Some(0.3),
+            },
         ];
         write_training_chart(&path, &points).expect("chart");
         let image = image::open(&path).expect("read chart");

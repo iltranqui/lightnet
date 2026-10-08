@@ -141,7 +141,9 @@ fn point_inside_any_box(boxes: &[TruthBox], x: f32, y: f32) -> bool {
 
 fn extract_object_vector(input: &[f32], shape: &TensorShape, sample: &mut OmdSample) {
     sample.raw = (0..shape.channels)
-        .map(|c| finite_or_zero(input[spatial_index(shape, sample.batch, c, sample.row, sample.col)]))
+        .map(|c| {
+            finite_or_zero(input[spatial_index(shape, sample.batch, c, sample.row, sample.col)])
+        })
         .collect();
 }
 
@@ -151,14 +153,19 @@ fn extract_pooled_vector(input: &[f32], shape: &TensorShape, sample: &mut OmdSam
     sample.raw = (0..shape.channels)
         .map(|c| {
             let base = sample.batch * shape.element_count() + c * plane;
-            (0..plane).map(|p| finite_or_zero(input[base + p])).sum::<f32>() * inv_plane
+            (0..plane)
+                .map(|p| finite_or_zero(input[base + p]))
+                .sum::<f32>()
+                * inv_plane
         })
         .collect();
 }
 
 fn extract_image_vector(input: &[f32], shape: &TensorShape, sample: &mut OmdSample) {
     let base = sample.batch * shape.element_count();
-    sample.raw = (0..shape.element_count()).map(|i| finite_or_zero(input[base + i])).collect();
+    sample.raw = (0..shape.element_count())
+        .map(|i| finite_or_zero(input[base + i]))
+        .collect();
 }
 
 /// C++ `normalize_sample`: `z = raw / ||raw||` with the squared norm floored.
@@ -273,7 +280,8 @@ fn collect_background_samples(
             if samples.len() >= max_samples {
                 break;
             }
-            let base = (b as u32).wrapping_mul(1_103_515_245)
+            let base = (b as u32)
+                .wrapping_mul(1_103_515_245)
                 .wrapping_add((s as u32).wrapping_mul(2_654_435_761))
                 .wrapping_add(1_013_904_223);
             for tries in 0..plane as u32 {
@@ -361,10 +369,7 @@ fn collect_classification_samples(
 }
 
 /// C++ `compute_omd_pair_loss`: fills `grad_z` and returns the pair counts.
-fn compute_pair_loss(
-    spec: &OmdLossSpec,
-    samples: &mut [OmdSample],
-) -> (f32, usize, usize, usize) {
+fn compute_pair_loss(spec: &OmdLossSpec, samples: &mut [OmdSample]) -> (f32, usize, usize, usize) {
     let mut total_loss = 0.0f32;
     let (mut positive, mut negative, mut good) = (0usize, 0usize, 0usize);
     for i in 0..samples.len() {
@@ -461,7 +466,11 @@ fn scatter_sample_delta(
         let mut darknet_delta = -normalizer * grad_raw;
         darknet_delta = clip_delta(darknet_delta, max_delta);
         if sample.pooled && spatial {
-            let share = if plane > 0 { darknet_delta / plane as f32 } else { 0.0 };
+            let share = if plane > 0 {
+                darknet_delta / plane as f32
+            } else {
+                0.0
+            };
             let base = sample.batch * shape.element_count() + d * plane;
             for p in 0..plane {
                 delta[base + p] += share;
@@ -502,7 +511,9 @@ pub fn omd_loss_forward(
         negative_pairs: 0,
         good_pairs: 0,
     };
-    let Some(truth) = truth else { return (output, result) };
+    let Some(truth) = truth else {
+        return (output, result);
+    };
     if !training || spec.cls_normalizer <= 0.0 || spec.max_samples <= 1 || truth.is_empty() {
         return (output, result);
     }
@@ -535,10 +546,17 @@ pub fn omd_loss_forward(
 
     let (total_loss, positive, negative, good) = compute_pair_loss(spec, &mut result.samples);
     let active_pairs = positive + negative;
-    let normalizer = if active_pairs > 0 { spec.cls_normalizer / active_pairs as f32 } else { 0.0 };
+    let normalizer = if active_pairs > 0 {
+        spec.cls_normalizer / active_pairs as f32
+    } else {
+        0.0
+    };
     result.cost = total_loss * normalizer;
-    result.accuracy =
-        if active_pairs > 0 { 100.0 * good as f32 / active_pairs as f32 } else { -1.0 };
+    result.accuracy = if active_pairs > 0 {
+        100.0 * good as f32 / active_pairs as f32
+    } else {
+        -1.0
+    };
     result.positive_pairs = positive;
     result.negative_pairs = negative;
     result.good_pairs = good;
@@ -626,7 +644,9 @@ mod tests {
         s.cls_normalizer = 1.0;
         let sh = shape(2, 2, 2, 2);
         // Both images have the same values everywhere (batch 2 x c 2 x 2 x 2 = 16).
-        let input = vec![1.0f32, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0];
+        let input = vec![
+            1.0f32, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0,
+        ];
         let mut truth = vec![0.0f32; 2 * s.max_boxes * s.truth_size];
         for b in 0..2 {
             let base = b * s.max_boxes * s.truth_size;
@@ -643,7 +663,11 @@ mod tests {
         assert_eq!(result.good_pairs, 1, "cos = 1 is inside the margin");
         assert!(result.cost.abs() < 1e-6, "cost {}", result.cost);
         assert!((result.accuracy - 100.0).abs() < 1e-6);
-        assert!(result.delta.iter().all(|d| d.abs() < 1e-6), "a satisfied pair has no pull: {:?}", result.delta);
+        assert!(
+            result.delta.iter().all(|d| d.abs() < 1e-6),
+            "a satisfied pair has no pull: {:?}",
+            result.delta
+        );
     }
 
     #[test]
@@ -673,7 +697,11 @@ mod tests {
         assert!((result.cost - 1.0).abs() < 1e-5, "cost {}", result.cost);
         // The two pixels are pushed apart: the delta is a negative gradient of
         // L w.r.t. the raw value, and each image owns one of them.
-        assert!(result.delta[0] > 0.0 && result.delta[1] < 0.0, "delta {:?}", result.delta);
+        assert!(
+            result.delta[0] > 0.0 && result.delta[1] < 0.0,
+            "delta {:?}",
+            result.delta
+        );
     }
 
     #[test]
@@ -691,13 +719,21 @@ mod tests {
         let (_, pooled) = omd_loss_forward(&input, Some(&truth), &s, &sh, 8, 8, true);
         assert_eq!(pooled.classification_samples, 2);
         assert!(pooled.samples.iter().all(|smp| smp.pooled));
-        assert_eq!(pooled.samples[0].raw.len(), 2, "pooled over H*W per channel");
+        assert_eq!(
+            pooled.samples[0].raw.len(),
+            2,
+            "pooled over H*W per channel"
+        );
         // Whole-image variant.
         let mut s2 = s.clone();
         s2.pool = 0;
         let (_, vector) = omd_loss_forward(&input, Some(&truth), &s2, &sh, 8, 8, true);
         assert!(vector.samples.iter().all(|smp| smp.vector));
-        assert_eq!(vector.samples[0].raw.len(), 8, "one entry per input element");
+        assert_eq!(
+            vector.samples[0].raw.len(),
+            8,
+            "one entry per input element"
+        );
     }
 
     #[test]
@@ -724,7 +760,10 @@ mod tests {
         }
         let (_, result) = omd_loss_forward(&input, Some(&truth), &s, &sh, 8, 8, true);
         assert!(result.object_samples > 0 && result.samples.len() >= 2);
-        assert!(result.delta.iter().any(|d| d.abs() > 1e-6), "the test needs a non-zero delta");
+        assert!(
+            result.delta.iter().any(|d| d.abs() > 1e-6),
+            "the test needs a non-zero delta"
+        );
 
         let eps = 1e-3f32;
         for i in 0..input.len() {
@@ -764,8 +803,15 @@ mod tests {
             truth[base + 4] = cls;
         }
         let (_, result) = omd_loss_forward(&input, Some(&truth), &s, &sh, 8, 8, true);
-        assert!(result.delta.iter().all(|d| d.abs() <= s.max_delta + 1e-6), "{:?}", result.delta);
-        assert!(result.delta.iter().any(|d| d.abs() > 0.0), "and something was injected");
+        assert!(
+            result.delta.iter().all(|d| d.abs() <= s.max_delta + 1e-6),
+            "{:?}",
+            result.delta
+        );
+        assert!(
+            result.delta.iter().any(|d| d.abs() > 0.0),
+            "and something was injected"
+        );
     }
 
     #[test]
@@ -790,11 +836,23 @@ mod tests {
         }
         let (_, result) = omd_loss_forward(&input, Some(&truth), &s, &sh, 8, 8, true);
         assert_eq!(result.samples.len(), 2);
-        assert!(result.samples.iter().all(|smp| (smp.weight - 3.0).abs() < 1e-6), "{:?}", result.samples.iter().map(|s| s.weight).collect::<Vec<_>>());
+        assert!(
+            result
+                .samples
+                .iter()
+                .all(|smp| (smp.weight - 3.0).abs() < 1e-6),
+            "{:?}",
+            result.samples.iter().map(|s| s.weight).collect::<Vec<_>>()
+        );
         // Without the boost the weight stays 1.
         s.small_boost = 1.0;
         let (_, plain) = omd_loss_forward(&input, Some(&truth), &s, &sh, 8, 8, true);
-        assert!(plain.samples.iter().all(|smp| (smp.weight - 1.0).abs() < 1e-6));
+        assert!(
+            plain
+                .samples
+                .iter()
+                .all(|smp| (smp.weight - 1.0).abs() < 1e-6)
+        );
     }
 
     #[test]
@@ -816,7 +874,12 @@ mod tests {
         let (_, result) = omd_loss_forward(&input, Some(&truth), &s, &sh, 8, 8, true);
         assert_eq!(result.object_samples, 1);
         assert_eq!(result.background_samples, 2);
-        let bg: Vec<usize> = result.samples.iter().filter(|s| s.background).map(|s| s.row * 2 + s.col).collect();
+        let bg: Vec<usize> = result
+            .samples
+            .iter()
+            .filter(|s| s.background)
+            .map(|s| s.row * 2 + s.col)
+            .collect();
         assert_eq!(bg.len(), 2);
         for loc in bg {
             let row = loc / 2;
@@ -824,7 +887,10 @@ mod tests {
             let x = (col as f32 + 0.5) / 2.0;
             let y = (row as f32 + 0.5) / 2.0;
             let inside = x >= 0.0 && x <= 0.5 && y >= 0.0 && y <= 0.5;
-            assert!(!inside, "background sample at ({row},{col}) = ({x},{y}) is inside the box");
+            assert!(
+                !inside,
+                "background sample at ({row},{col}) = ({x},{y}) is inside the box"
+            );
         }
     }
 

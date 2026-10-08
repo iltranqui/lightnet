@@ -79,7 +79,12 @@ impl CenterNetLayout {
     }
 
     pub fn for_spec(batch: usize, w: usize, h: usize, spec: &CenterNetSpec) -> Self {
-        Self { batch, w, h, classes: spec.classes }
+        Self {
+            batch,
+            w,
+            h,
+            classes: spec.classes,
+        }
     }
 }
 
@@ -120,7 +125,11 @@ fn safe_log(value: f32) -> f32 {
 /// C++ `smooth_l1_loss`.
 fn smooth_l1_loss(error: f32) -> f32 {
     let abs_error = error.abs();
-    if abs_error < 1.0 { 0.5 * error * error } else { abs_error - 0.5 }
+    if abs_error < 1.0 {
+        0.5 * error * error
+    } else {
+        abs_error - 0.5
+    }
 }
 
 /// C++ `smooth_l1_grad`.
@@ -169,12 +178,10 @@ pub fn continuous_small_weight(spec: &CenterNetSpec, min_side_px: f32) -> f32 {
 }
 
 /// C++ `adaptive_gaussian_radii`: the ellipse axes, with the safety cap.
-pub fn adaptive_gaussian_radii(
-    spec: &CenterNetSpec,
-    w_cells: f32,
-    h_cells: f32,
-) -> (i64, i64) {
-    let base_radius = spec.center_min_radius.max(gaussian_radius(w_cells, h_cells, spec.gaussian_iou));
+pub fn adaptive_gaussian_radii(spec: &CenterNetSpec, w_cells: f32, h_cells: f32) -> (i64, i64) {
+    let base_radius =
+        spec.center_min_radius
+            .max(gaussian_radius(w_cells, h_cells, spec.gaussian_iou));
     if spec.anisotropic_gaussian == 0 {
         return (base_radius, base_radius);
     }
@@ -186,8 +193,14 @@ pub fn adaptive_gaussian_radii(
     radius_x = radius_x.max(spec.center_min_radius);
     radius_y = radius_y.max(spec.center_min_radius);
     // Safety cap so an extremely elongated label cannot write a huge blob.
-    radius_x = radius_x.min(spec.center_min_radius.max((safe_w * 2.0 + 1.0).ceil() as i64));
-    radius_y = radius_y.min(spec.center_min_radius.max((safe_h * 2.0 + 1.0).ceil() as i64));
+    radius_x = radius_x.min(
+        spec.center_min_radius
+            .max((safe_w * 2.0 + 1.0).ceil() as i64),
+    );
+    radius_y = radius_y.min(
+        spec.center_min_radius
+            .max((safe_h * 2.0 + 1.0).ceil() as i64),
+    );
     (radius_x, radius_y)
 }
 
@@ -271,12 +284,23 @@ pub fn decode_centernet_box(
     let y = finite_or_zero((row as f32 + 0.5 + oy) / l.h as f32);
     let w = bounded_exp(raw_w) / l.w as f32;
     let h = bounded_exp(raw_h) / l.h as f32;
-    (x, y, finite_or_zero(w).max(1e-6), finite_or_zero(h).max(1e-6))
+    (
+        x,
+        y,
+        finite_or_zero(w).max(1e-6),
+        finite_or_zero(h).max(1e-6),
+    )
 }
 
 /// C++ `is_local_peak`: a 3x3 strict-maximum test on the heatmap
 /// (`peak_nms = 0` disables it and accepts every cell).
-pub fn is_local_peak(output: &[f32], l: &CenterNetLayout, batch: usize, class_id: usize, loc: usize) -> bool {
+pub fn is_local_peak(
+    output: &[f32],
+    l: &CenterNetLayout,
+    batch: usize,
+    class_id: usize,
+    loc: usize,
+) -> bool {
     let row = loc / l.w;
     let col = loc % l.w;
     let center = output[ct_index(l, batch, class_id, loc)];
@@ -301,7 +325,13 @@ pub fn is_local_peak(output: &[f32], l: &CenterNetLayout, batch: usize, class_id
 
 /// The heatmap score of one cell, clamped to `[0, 1]` (the forward already
 /// applied the sigmoid).
-pub fn heatmap_score(output: &[f32], l: &CenterNetLayout, batch: usize, class_id: usize, loc: usize) -> f32 {
+pub fn heatmap_score(
+    output: &[f32],
+    l: &CenterNetLayout,
+    batch: usize,
+    class_id: usize,
+    loc: usize,
+) -> f32 {
     finite_or_zero(output[ct_index(l, batch, class_id, loc)]).clamp(0.0, 1.0)
 }
 
@@ -433,7 +463,15 @@ pub fn centernet_train_batch(
         let small_weight = continuous_small_weight(spec, min_side_px);
         let (radius_x, radius_y) = adaptive_gaussian_radii(spec, w_cells, h_cells);
         draw_center_gaussian(
-            l, &mut hm_target, &mut hm_weight, b, class_id, ix, iy, radius_x, radius_y,
+            l,
+            &mut hm_target,
+            &mut hm_weight,
+            b,
+            class_id,
+            ix,
+            iy,
+            radius_x,
+            radius_y,
             small_weight,
         );
     }
@@ -503,14 +541,22 @@ pub fn centernet_train_batch(
         let eh = finite_or_zero(output[ct_index(l, b, l.classes + 1, loc)]) - target_log_h;
         let eox = finite_or_zero(output[ct_index(l, b, l.classes + 2, loc)]) - target_off_x;
         let eoy = finite_or_zero(output[ct_index(l, b, l.classes + 3, loc)]) - target_off_y;
-        delta[ct_index(l, b, l.classes, loc)] +=
-            clamp_delta(-spec.wh_normalizer * weight * smooth_l1_grad(ew), spec.max_delta);
-        delta[ct_index(l, b, l.classes + 1, loc)] +=
-            clamp_delta(-spec.wh_normalizer * weight * smooth_l1_grad(eh), spec.max_delta);
-        delta[ct_index(l, b, l.classes + 2, loc)] +=
-            clamp_delta(-spec.off_normalizer * weight * smooth_l1_grad(eox), spec.max_delta);
-        delta[ct_index(l, b, l.classes + 3, loc)] +=
-            clamp_delta(-spec.off_normalizer * weight * smooth_l1_grad(eoy), spec.max_delta);
+        delta[ct_index(l, b, l.classes, loc)] += clamp_delta(
+            -spec.wh_normalizer * weight * smooth_l1_grad(ew),
+            spec.max_delta,
+        );
+        delta[ct_index(l, b, l.classes + 1, loc)] += clamp_delta(
+            -spec.wh_normalizer * weight * smooth_l1_grad(eh),
+            spec.max_delta,
+        );
+        delta[ct_index(l, b, l.classes + 2, loc)] += clamp_delta(
+            -spec.off_normalizer * weight * smooth_l1_grad(eox),
+            spec.max_delta,
+        );
+        delta[ct_index(l, b, l.classes + 3, loc)] += clamp_delta(
+            -spec.off_normalizer * weight * smooth_l1_grad(eoy),
+            spec.max_delta,
+        );
         wh_loss += spec.wh_normalizer * weight * (smooth_l1_loss(ew) + smooth_l1_loss(eh));
         off_loss += spec.off_normalizer * weight * (smooth_l1_loss(eox) + smooth_l1_loss(eoy));
         class_ids[b * spatial + loc] = class_id as i32;
@@ -520,7 +566,11 @@ pub fn centernet_train_batch(
         let inter_h = (py + 0.5 * ph).min(y + 0.5 * h) - (py - 0.5 * ph).max(y - 0.5 * h);
         let intersection = inter_w.max(0.0) * inter_h.max(0.0);
         let union = pw.max(0.0) * ph.max(0.0) + w.max(0.0) * h.max(0.0) - intersection;
-        total_iou += if union > 0.0 { intersection / union } else { 0.0 };
+        total_iou += if union > 0.0 {
+            intersection / union
+        } else {
+            0.0
+        };
         positives += 1;
     }
     for d in delta.iter_mut() {
@@ -528,7 +578,16 @@ pub fn centernet_train_batch(
             *d = 0.0;
         }
     }
-    Ok(CenterNetBatch { delta, hm_loss, wh_loss, off_loss, total_iou, positives, class_ids, labels })
+    Ok(CenterNetBatch {
+        delta,
+        hm_loss,
+        wh_loss,
+        off_loss,
+        total_iou,
+        positives,
+        class_ids,
+        labels,
+    })
 }
 
 /// The whole training contribution.  `output` must be the activated forward
@@ -591,7 +650,12 @@ mod tests {
     }
 
     fn layout(classes: usize, w: usize, h: usize) -> CenterNetLayout {
-        CenterNetLayout { batch: 1, w, h, classes }
+        CenterNetLayout {
+            batch: 1,
+            w,
+            h,
+            classes,
+        }
     }
 
     #[test]
@@ -622,7 +686,11 @@ mod tests {
         // The four regression entries stay raw.
         for entry in l.classes..l.entries() {
             for loc in 0..l.spatial() {
-                assert_eq!(out[ct_index(&l, 0, entry, loc)], 1.0, "entry {entry} must not be squashed");
+                assert_eq!(
+                    out[ct_index(&l, 0, entry, loc)],
+                    1.0,
+                    "entry {entry} must not be squashed"
+                );
             }
         }
         // Non-finite inputs are sanitised after the activation.
@@ -632,8 +700,16 @@ mod tests {
         let out = centernet_forward(&dirty, &l);
         // C++ applies the sigmoid *before* the non-finite sweep, so a NaN
         // becomes sigmoid(NaN) = NaN and is then zeroed (not sigmoid(0)).
-        assert_eq!(out[ct_index(&l, 0, 0, 0)], 0.0, "NaN is zeroed after the sigmoid");
-        assert_eq!(out[ct_index(&l, 0, l.classes, 1)], 0.0, "Inf -> 0 after sanitise");
+        assert_eq!(
+            out[ct_index(&l, 0, 0, 0)],
+            0.0,
+            "NaN is zeroed after the sigmoid"
+        );
+        assert_eq!(
+            out[ct_index(&l, 0, l.classes, 1)],
+            0.0,
+            "Inf -> 0 after sanitise"
+        );
     }
 
     #[test]
@@ -657,9 +733,18 @@ mod tests {
         extreme[ct_index(&l, 0, 4, 5)] = -50.0;
         extreme[ct_index(&l, 0, 1, 5)] = 500.0; // log_w far past the exp clamp
         let (x, y, w, _) = decode_centernet_box(&extreme, &l, 0, 5);
-        assert!((x - (1.0 + 0.5 + 0.75) / 4.0).abs() < 1e-6, "offset clamp: {x}");
-        assert!((y - (1.0 + 0.5 - 0.75) / 4.0).abs() < 1e-6, "offset clamp: {y}");
-        assert!(w <= 20f32.exp() / 4.0, "exp is clamped to [-20, 20], got {w}");
+        assert!(
+            (x - (1.0 + 0.5 + 0.75) / 4.0).abs() < 1e-6,
+            "offset clamp: {x}"
+        );
+        assert!(
+            (y - (1.0 + 0.5 - 0.75) / 4.0).abs() < 1e-6,
+            "offset clamp: {y}"
+        );
+        assert!(
+            w <= 20f32.exp() / 4.0,
+            "exp is clamped to [-20, 20], got {w}"
+        );
         assert!(spatial == 16);
     }
 
@@ -704,7 +789,11 @@ mod tests {
         assert!((continuous_small_weight(&s, 16.0) - 2.0).abs() < 1e-6);
         assert!((continuous_small_weight(&s, 8.0) - 4.0).abs() < 1e-6);
         assert!((continuous_small_weight(&s, 4.0) - 8.0).abs() < 1e-6);
-        assert_eq!(continuous_small_weight(&s, 2.0), 8.0, "capped at small_boost");
+        assert_eq!(
+            continuous_small_weight(&s, 2.0),
+            8.0,
+            "capped at small_boost"
+        );
         assert_eq!(continuous_small_weight(&s, 0.0), 8.0);
     }
 
@@ -718,7 +807,11 @@ mod tests {
         assert!((at(3, 3) - 1.0).abs() < 1e-6, "the centre is exactly 1");
         assert!(at(4, 3) < at(3, 3) && at(4, 3) > 0.0, "a positive halo");
         assert!(at(5, 3) < at(4, 3), "the halo decays outward");
-        assert_eq!(weight[3 * l.w + 3], 8.0, "the tiny weight lands on the blob");
+        assert_eq!(
+            weight[3 * l.w + 3],
+            8.0,
+            "the tiny weight lands on the blob"
+        );
         // A blob that reaches outside the map is clipped, not wrapped.
         draw_center_gaussian(&l, &mut target, &mut weight, 0, 0, 0, 0, 4, 4, 1.0);
         assert!(target.iter().all(|v| *v <= 1.0));
@@ -732,7 +825,10 @@ mod tests {
             *v = 0.0;
         }
         out[ct_index(&l, 0, 0, 1)] = 1.0;
-        assert!(!is_local_peak(&out, &l, 0, 0, 0), "a cell below its neighbour is not a peak");
+        assert!(
+            !is_local_peak(&out, &l, 0, 0, 0),
+            "a cell below its neighbour is not a peak"
+        );
         assert!(is_local_peak(&out, &l, 0, 0, 1), "the maximum is a peak");
         // Equal neighbours do not disqualify (C++ uses a strict `>`).
         out[ct_index(&l, 0, 0, 1)] = 1.0;
@@ -743,11 +839,20 @@ mod tests {
     #[test]
     fn a_true_centre_cell_gets_a_positive_heatmap_gradient() {
         let s = spec(1);
-        let l = CenterNetLayout { batch: 1, w: 4, h: 4, classes: 1 };
+        let l = CenterNetLayout {
+            batch: 1,
+            w: 4,
+            h: 4,
+            classes: 1,
+        };
         let mut out = vec![0.0f32; l.len()];
         // The heatmap is sigmoid(0) = 0.5 everywhere: exact centres still push up.
         let out = centernet_forward(&out, &l);
-        let settings = CenterNetSettings { net_width: 4, net_height: 4, ..CenterNetSettings::default() };
+        let settings = CenterNetSettings {
+            net_width: 4,
+            net_height: 4,
+            ..CenterNetSettings::default()
+        };
         // One box centred on cell (1, 1).
         let mut truth = vec![0.0f32; s.max_boxes * 6];
         truth[0] = 0.4; // cx -> gx = 1.6 -> ix = 1
@@ -755,16 +860,25 @@ mod tests {
         truth[2] = 0.5;
         truth[3] = 0.5;
         truth[4] = 0.0;
-        let (delta, cost, positives) = centernet_training_delta(&out, &truth, &l, &s, &settings).unwrap();
+        let (delta, cost, positives) =
+            centernet_training_delta(&out, &truth, &l, &s, &settings).unwrap();
         assert_eq!(positives, 1);
         assert!(cost > 0.0);
         let ix = 1usize;
         let iy = 1usize;
         let centre = ct_index(&l, 0, 0, iy * l.w + ix);
-        assert!(delta[centre] > 0.0, "the exact centre is pulled up: {}", delta[centre]);
+        assert!(
+            delta[centre] > 0.0,
+            "the exact centre is pulled up: {}",
+            delta[centre]
+        );
         // A far-away cell is a negative and is pushed down.
         let far = ct_index(&l, 0, 0, 0);
-        assert!(delta[far] < 0.0, "the background is pushed down: {}", delta[far]);
+        assert!(
+            delta[far] < 0.0,
+            "the background is pushed down: {}",
+            delta[far]
+        );
         // The regression entries at the centre moved towards the truth.
         assert!(delta[ct_index(&l, 0, 1, iy * l.w + ix)].abs() > 0.0);
     }
@@ -772,7 +886,12 @@ mod tests {
     #[test]
     fn invalid_truth_and_classes_are_errors() {
         let s = spec(1);
-        let l = CenterNetLayout { batch: 1, w: 4, h: 4, classes: 1 };
+        let l = CenterNetLayout {
+            batch: 1,
+            w: 4,
+            h: 4,
+            classes: 1,
+        };
         let out = centernet_forward(&vec![0.0f32; l.len()], &l);
         let settings = CenterNetSettings::default();
         // A short truth buffer.
@@ -803,16 +922,26 @@ mod tests {
         let mut s = spec(1);
         s.scale_min_px = 10.0;
         s.scale_max_px = 1000.0;
-        let l = CenterNetLayout { batch: 1, w: 4, h: 4, classes: 1 };
+        let l = CenterNetLayout {
+            batch: 1,
+            w: 4,
+            h: 4,
+            classes: 1,
+        };
         let out = centernet_forward(&vec![0.0f32; l.len()], &l);
-        let settings = CenterNetSettings { net_width: 100, net_height: 100, ..CenterNetSettings::default() };
+        let settings = CenterNetSettings {
+            net_width: 100,
+            net_height: 100,
+            ..CenterNetSettings::default()
+        };
         let mut truth = vec![0.0f32; s.max_boxes * 6];
         truth[0] = 0.4;
         truth[1] = 0.4;
         truth[2] = 0.02; // 2 px on a 100 px input: below scale_min_px
         truth[3] = 0.02;
         truth[4] = 0.0;
-        let (_delta, _cost, positives) = centernet_training_delta(&out, &truth, &l, &s, &settings).unwrap();
+        let (_delta, _cost, positives) =
+            centernet_training_delta(&out, &truth, &l, &s, &settings).unwrap();
         assert_eq!(positives, 0, "the scale gate dropped the object");
     }
 

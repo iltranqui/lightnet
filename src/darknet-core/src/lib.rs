@@ -20,17 +20,19 @@
 pub(crate) mod activation_math;
 pub mod augmentation;
 pub use augmentation::DetectorAugmentation;
+pub mod centernet;
 pub mod cfg;
 pub(crate) mod channel_shuffle;
 pub(crate) mod channel_slice;
-pub mod centernet;
 pub mod chart;
 pub(crate) mod contrastive;
 pub use chart::{ChartPoint, write_training_chart};
 pub mod dense_loss;
-pub use dense_loss::{DenseTrainingLoss, compute_dense_training_loss, compute_dense_training_loss_at};
-pub mod detect;
+pub use dense_loss::{
+    DenseTrainingLoss, compute_dense_training_loss, compute_dense_training_loss_at,
+};
 pub(crate) mod deconvolutional;
+pub mod detect;
 pub(crate) mod eml_conv_math;
 pub mod error;
 pub mod evaluate;
@@ -39,19 +41,19 @@ pub use evaluate::{
     detector_map, obb_detector_map,
 };
 pub mod image;
+pub mod initialize;
+pub(crate) mod jev_ce;
 pub mod laya_act_head;
 pub mod laya_encoder;
 pub mod laya_head;
 pub mod laya_loss;
 pub mod laya_marker_gather;
 pub mod laya_scorer;
-pub mod moe_conv;
-pub(crate) mod jev_ce;
-pub mod initialize;
 pub mod loader_profile;
+pub mod moe_conv;
 pub use initialize::initialize_training_params;
-pub mod model;
 pub(crate) mod maxpool_depth;
+pub mod model;
 pub mod modern_yolo;
 pub mod names;
 pub mod obb_geometry;
@@ -59,53 +61,41 @@ pub mod obb_labels;
 pub use obb_labels::{ObbLabel, flip_obb_labels, load_obb_labels, rotate_obb_labels};
 pub mod obb_training;
 pub use obb_training::{
-    OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment,
-    ObbYoloBatchPositiveAssignment,
-    ObbYoloBatchCellMatch, ObbYoloBatchCellPrediction, ObbYoloCellTruthMatch,
-    ObbYoloBoxDeltaConfig, ObbYoloClassDeltaResult, ObbYoloClassDeltaStats,
-    ObbYoloFrontPointDeltaConfig, ObbYoloFrontPointDeltas,
-    ObbYoloFrontPointMetrics,
-    ObbYoloBatchTrainingDeltaStats, ObbYoloHeadTrainingDeltaStats,
-    ObbYoloPositiveAssignment, ObbYoloPositiveKind,
-    ObbYoloPositiveObjectnessConfig,
-    ObbYoloMatchScore, ObbYoloMatchScoreBranch, ObbYoloMatchScoreConfig,
-    ObbYoloPredictionMatchContext, ObbYoloHeadAssignmentSpec,
-    ObbYoloHeadMatchConfig, ObbYoloTruthBatch,
-    ObbYoloTrainingHeadConfig,
-    apply_obb_yolo_batch_head_objectness_deltas,
+    OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloBatchCellMatch,
+    ObbYoloBatchCellPrediction, ObbYoloBatchPositiveAssignment, ObbYoloBatchTrainingDeltaStats,
+    ObbYoloBoxDeltaConfig, ObbYoloCellTruthMatch, ObbYoloClassDeltaResult, ObbYoloClassDeltaStats,
+    ObbYoloFrontPointDeltaConfig, ObbYoloFrontPointDeltas, ObbYoloFrontPointMetrics,
+    ObbYoloHeadAssignmentSpec, ObbYoloHeadMatchConfig, ObbYoloHeadTrainingDeltaStats,
+    ObbYoloMatchScore, ObbYoloMatchScoreBranch, ObbYoloMatchScoreConfig, ObbYoloPositiveAssignment,
+    ObbYoloPositiveKind, ObbYoloPositiveObjectnessConfig, ObbYoloPredictionMatchContext,
+    ObbYoloTruthBatch, ObbYoloTrainingHeadConfig, apply_obb_yolo_batch_head_objectness_deltas,
+    apply_obb_yolo_batch_head_positive_box_deltas, apply_obb_yolo_batch_head_positive_class_deltas,
+    apply_obb_yolo_batch_head_positive_front_point_deltas,
+    apply_obb_yolo_batch_head_positive_objectness_deltas,
     apply_obb_yolo_batch_head_training_deltas,
     apply_obb_yolo_batch_head_training_deltas_with_front_point,
+    apply_obb_yolo_batch_head_truth_threshold_deltas,
+    apply_obb_yolo_batch_head_truth_threshold_front_point_deltas,
     apply_obb_yolo_batch_multi_head_training_deltas,
     apply_obb_yolo_batch_multi_head_training_deltas_with_front_point,
     apply_obb_yolo_batch_multi_head_training_deltas_with_front_point_configs,
-    build_obb_yolo_training_head_config,
-    apply_obb_yolo_batch_head_positive_box_deltas,
-    apply_obb_yolo_batch_head_positive_front_point_deltas,
-    apply_obb_yolo_batch_head_truth_threshold_deltas,
-    apply_obb_yolo_batch_head_truth_threshold_front_point_deltas,
-    apply_obb_yolo_batch_head_positive_class_deltas,
-    apply_obb_yolo_batch_head_positive_objectness_deltas, assign_obb_yolo_anchor,
-    encode_obb_yolo_truth_batch, enumerate_obb_yolo_batch_positives,
-    enumerate_obb_yolo_head_positives,
-    match_obb_yolo_batch_cell_predictions, match_obb_yolo_cell_prediction,
-    obb_yolo_anchor_match_score, obb_yolo_cell_objectness_delta,
-    decode_obb_yolo_front_point,
-    match_obb_yolo_cell_prediction_with_score_config,
-    obb_yolo_match_score,
-    obb_yolo_angular_prediction_match_score_with_viou, obb_yolo_box_regression_deltas,
-    obb_yolo_front_point_regression_deltas,
-    obb_yolo_class_deltas,
-    obb_yolo_ciou_prediction_match_score, obb_yolo_cobb_prediction_match_score_with_viou,
-    obb_yolo_covariance_prediction_match_score,
-    obb_yolo_covariance_prediction_match_score_with_viou, select_obb_yolo_cell_truth_match,
-    visit_obb_yolo_batch_head_matches,
+    build_obb_yolo_training_head_config, assign_obb_yolo_anchor,
+    decode_obb_yolo_front_point, encode_obb_yolo_truth_batch, enumerate_obb_yolo_batch_positives,
+    enumerate_obb_yolo_head_positives, match_obb_yolo_batch_cell_predictions,
+    match_obb_yolo_cell_prediction, match_obb_yolo_cell_prediction_with_score_config,
+    obb_yolo_anchor_match_score, obb_yolo_angular_prediction_match_score_with_viou,
+    obb_yolo_box_regression_deltas, obb_yolo_cell_objectness_delta,
+    obb_yolo_ciou_prediction_match_score, obb_yolo_class_deltas,
+    obb_yolo_cobb_prediction_match_score_with_viou, obb_yolo_covariance_prediction_match_score,
+    obb_yolo_covariance_prediction_match_score_with_viou, obb_yolo_front_point_regression_deltas,
+    obb_yolo_match_score, select_obb_yolo_cell_truth_match, visit_obb_yolo_batch_head_matches,
 };
 pub(crate) mod omd_loss;
 pub mod runtime;
 pub(crate) mod segmentation;
-pub(crate) mod vit;
 pub(crate) mod shortcut_weights;
 pub mod train;
+pub(crate) mod vit;
 pub mod weights;
 
 pub use cfg::{ConfigFile, RawSection};
@@ -129,16 +119,15 @@ pub use runtime::{
     ShortcutTrainBuffers, Tensor, YoloHeadOutput, compute_learning_rate,
 };
 pub use train::{
-    DataConfig, ObbTrainingBatch, TrainingBatch, YoloLabel, YoloTrainingLoss, YoloTrainingState,
-    ObbYoloTrainingDeltaBatch, compute_obb_yolo_training_deltas,
-    ObbYoloTrainingBackward, backward_obb_yolo_training,
-    train_obb_yolo_batch_step,
+    DataConfig, ObbTrainingBatch, ObbYoloTrainingDeltaBatch, TrainingBatch, YoloLabel,
+    YoloTrainingLoss, YoloTrainingState, compute_obb_yolo_training_deltas,
+    ObbYoloTrainingBackward, backward_obb_yolo_training, train_obb_yolo_batch_step,
     train_obb_yolo_subdivisions,
     compute_yolo_training_loss, compute_yolo_training_loss_with_state,
     load_augmented_training_batch_from_paths, load_obb_training_batch,
     load_obb_training_batch_from_paths, load_obb_training_batch_with_flips_from_paths,
-    load_paths_file, load_training_batch,
-    load_training_batch_from_paths, load_yolo_labels, replace_image_to_label,
+    load_paths_file, load_training_batch, load_training_batch_from_paths, load_yolo_labels,
+    replace_image_to_label,
 };
 pub use weights::{WeightsHeader, WeightsInspection, inspect_weights_file, save_weights};
 

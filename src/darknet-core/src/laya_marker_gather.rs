@@ -157,7 +157,9 @@ mod tests {
 
     /// Channel-major `[batch, hidden, 1, seq_len]`.
     fn a_data(batch: usize, hidden: usize, seq_len: usize) -> Vec<f32> {
-        (0..batch * hidden * seq_len).map(|i| i as f32 * 0.5 - 1.0).collect()
+        (0..batch * hidden * seq_len)
+            .map(|i| i as f32 * 0.5 - 1.0)
+            .collect()
     }
 
     /// Channel-major `[batch, marker_channels, 1, seq_len]` with per-option
@@ -253,7 +255,16 @@ mod tests {
             .collect();
 
         let out = forward(&a, &b, batch, hidden, max_options, seq_len, marker_channels).unwrap();
-        let grad = backward(&b, &delta, batch, hidden, max_options, seq_len, marker_channels).unwrap();
+        let grad = backward(
+            &b,
+            &delta,
+            batch,
+            hidden,
+            max_options,
+            seq_len,
+            marker_channels,
+        )
+        .unwrap();
 
         // <forward(a), delta> == <a, backward(delta)> for every a.
         let lhs: f32 = out.iter().zip(&delta).map(|(o, d)| o * d).sum();

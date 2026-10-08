@@ -75,12 +75,21 @@ mod tests {
         let source_shape = TensorShape::new(2, 1, 4, 2);
         let x = ramp(source_shape);
         let y_shape = TensorShape::new(2, 1, 2, 2);
-        let y = Tensor::from_data(y_shape, (0..8).map(|i| 0.5 + i as f32 * 0.25).collect()).unwrap();
+        let y =
+            Tensor::from_data(y_shape, (0..8).map(|i| 0.5 + i as f32 * 0.25).collect()).unwrap();
         let sliced = slice_channels(&x, 1, 3).unwrap();
         let back = slice_channels_backward(&y, source_shape, 1).unwrap();
         let lhs: f32 = sliced.data.iter().zip(&y.data).map(|(a, b)| a * b).sum();
         let rhs: f32 = x.data.iter().zip(&back.data).map(|(a, b)| a * b).sum();
-        assert!((lhs - rhs).abs() < 1e-4, "<S x, y> = {lhs}, <x, S^T y> = {rhs}");
-        assert!(back.data[0..2].iter().chain(&back.data[6..8]).all(|v| *v == 0.0)); // channels 0 and 3
+        assert!(
+            (lhs - rhs).abs() < 1e-4,
+            "<S x, y> = {lhs}, <x, S^T y> = {rhs}"
+        );
+        assert!(
+            back.data[0..2]
+                .iter()
+                .chain(&back.data[6..8])
+                .all(|v| *v == 0.0)
+        ); // channels 0 and 3
     }
 }

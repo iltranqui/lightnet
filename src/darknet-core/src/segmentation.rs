@@ -117,7 +117,12 @@ pub fn segmentation_forward(
             }
         }
     }
-    SegmentationOutput { output, delta: None, loss: 0.0, gate: None }
+    SegmentationOutput {
+        output,
+        delta: None,
+        loss: 0.0,
+        gate: None,
+    }
 }
 
 /// Cross-entropy on the activated output: the per-element loss, the
@@ -148,7 +153,14 @@ pub fn segmentation_loss(
                 (-t * pc.ln() - (1.0 - t) * (1.0 - pc).ln(), t - p)
             }
             // `softmax_x_ent_cpu`: only the truth entries contribute.
-            SegmentationLoss::SoftmaxCe => (if t != 0.0 { -p.clamp(1e-12, 1.0).ln() } else { 0.0 }, t - p),
+            SegmentationLoss::SoftmaxCe => (
+                if t != 0.0 {
+                    -p.clamp(1e-12, 1.0).ln()
+                } else {
+                    0.0
+                },
+                t - p,
+            ),
         };
         loss[i] = error;
         delta[i] = d;
@@ -163,7 +175,14 @@ pub fn segmentation_loss(
     let mut gate = None;
     if gate_strength > 0.0 {
         let stats = suppress_correct_pixels(
-            &mut delta, &mut loss, output, truth, batch, spec.classes, spatial, spec.gate_t_correct,
+            &mut delta,
+            &mut loss,
+            output,
+            truth,
+            batch,
+            spec.classes,
+            spatial,
+            spec.gate_t_correct,
             gate_strength,
         );
         // `apply_gate_compensation_cpu`
@@ -196,7 +215,12 @@ pub fn segmentation_loss(
     // *after* the scale, the gate and the sanitise - so a gated pixel really
     // does reduce the reported cost.
     let total_loss: f32 = loss.iter().sum();
-    SegmentationOutput { output: output.to_vec(), delta: Some(delta), loss: total_loss / (batch * spatial) as f32, gate }
+    SegmentationOutput {
+        output: output.to_vec(),
+        delta: Some(delta),
+        loss: total_loss / (batch * spatial) as f32,
+        gate,
+    }
 }
 
 /// Forward plus, when `truth` is given, the loss and seed (C++ `state.truth`).
@@ -210,7 +234,14 @@ pub fn segmentation_forward_loss(
 ) -> SegmentationOutput {
     let fwd = segmentation_forward(input, spec, batch, spatial);
     let Some(truth) = truth else { return fwd };
-    segmentation_loss(&fwd.output, truth, spec, batch, spatial, gate_strength(spec, iteration))
+    segmentation_loss(
+        &fwd.output,
+        truth,
+        spec,
+        batch,
+        spatial,
+        gate_strength(spec, iteration),
+    )
 }
 
 /// C++ `suppress_correct_pixels_cpu`: scale the delta and loss of every channel
@@ -293,7 +324,11 @@ mod tests {
             max_delta: FLT_MAX,
             delta_normalizer: 1.0,
             cls_normalizer: 1.0,
-            loss: if classes == 1 { SegmentationLoss::Bce } else { SegmentationLoss::SoftmaxCe },
+            loss: if classes == 1 {
+                SegmentationLoss::Bce
+            } else {
+                SegmentationLoss::SoftmaxCe
+            },
             lambda_ce: 1.0,
             ce_normalizer: 1.0,
             gate_enabled: false,
@@ -310,8 +345,16 @@ mod tests {
         // 1 -> logistic(1) = 0.73105858, -1 -> 0.26894142, NaN -> logistic(0) = 0.5.
         let input = vec![1.0f32, -1.0, f32::NAN];
         let out = segmentation_forward(&input, &s, 3, 1);
-        assert!((out.output[0] - 0.731_058_6).abs() < 1e-6, "{}", out.output[0]);
-        assert!((out.output[1] - 0.268_941_4).abs() < 1e-6, "{}", out.output[1]);
+        assert!(
+            (out.output[0] - 0.731_058_6).abs() < 1e-6,
+            "{}",
+            out.output[0]
+        );
+        assert!(
+            (out.output[1] - 0.268_941_4).abs() < 1e-6,
+            "{}",
+            out.output[1]
+        );
         assert!((out.output[2] - 0.5).abs() < 1e-7, "{}", out.output[2]);
     }
 
@@ -339,12 +382,19 @@ mod tests {
         let sum = out.output[0] + out.output[1] + out.output[2];
         assert!((sum - 1.0).abs() < 1e-6, "softmax must sum to 1, got {sum}");
         assert!((out.output[1] / out.output[0] - 2.0).abs() < 1e-5);
-        assert!(out.output[2] > out.output[1] && out.output[1] > out.output[0], "the larger logit wins");
+        assert!(
+            out.output[2] > out.output[1] && out.output[1] > out.output[0],
+            "the larger logit wins"
+        );
         // Hand-computed: exp(0-5), exp(ln2-5), exp(0) over the sum.
         let e0 = (-5.0f32).exp();
         let e1 = (std::f32::consts::LN_2 - 5.0).exp();
         let want1 = e1 / (e0 + e1 + 1.0);
-        assert!((out.output[1] - want1).abs() < 1e-6, "{} vs {want1}", out.output[1]);
+        assert!(
+            (out.output[1] - want1).abs() < 1e-6,
+            "{} vs {want1}",
+            out.output[1]
+        );
     }
 
     #[test]
@@ -361,7 +411,11 @@ mod tests {
         // loss = mean over pixels of -t*ln p - (1-t)*ln(1-p), with t = 1 for
         // both pixels: -ln(0.8) and -ln(0.25).
         let want = (-0.8f32.ln() + -0.25f32.ln()) / 2.0;
-        assert!((out.loss - want).abs() < 1e-5, "got {} want {want}", out.loss);
+        assert!(
+            (out.loss - want).abs() < 1e-5,
+            "got {} want {want}",
+            out.loss
+        );
     }
 
     #[test]
@@ -388,7 +442,12 @@ mod tests {
         let truth = vec![1.0f32];
         let scaled = segmentation_loss(&output, &truth, &s, 1, 1, 0.0);
         let base = segmentation_loss(&output, &truth, &plain, 1, 1, 0.0);
-        assert!((scaled.loss - base.loss * 3.0).abs() < 1e-5, "{} vs {}", scaled.loss, base.loss * 3.0);
+        assert!(
+            (scaled.loss - base.loss * 3.0).abs() < 1e-5,
+            "{} vs {}",
+            scaled.loss,
+            base.loss * 3.0
+        );
         let d = scaled.delta.unwrap();
         assert!((d[0] - base.delta.unwrap()[0] * 3.0).abs() < 1e-6);
     }
@@ -402,7 +461,11 @@ mod tests {
         let truth = vec![0.0f32];
         let out = segmentation_loss(&output, &truth, &s, 1, 1, 0.0);
         let d = out.delta.unwrap();
-        assert!((d[0] - (-0.1)).abs() < 1e-6, "clipped to -0.1, got {}", d[0]);
+        assert!(
+            (d[0] - (-0.1)).abs() < 1e-6,
+            "clipped to -0.1, got {}",
+            d[0]
+        );
     }
 
     #[test]
@@ -412,9 +475,20 @@ mod tests {
         assert_eq!(gate_strength(&s, 0), 0.0, "before the warmup");
         assert_eq!(gate_strength(&s, 1000), 0.0, "at the warmup boundary");
         // Halfway through the ramp: 0.5 * (1 - cos(pi/2)) = 0.5.
-        assert!((gate_strength(&s, 2000) - 0.5).abs() < 1e-6, "{}", gate_strength(&s, 2000));
-        assert!((gate_strength(&s, 3000) - 1.0).abs() < 1e-6, "{}", gate_strength(&s, 3000));
-        assert!((gate_strength(&s, 9999) - 1.0).abs() < 1e-6, "saturates at 1");
+        assert!(
+            (gate_strength(&s, 2000) - 0.5).abs() < 1e-6,
+            "{}",
+            gate_strength(&s, 2000)
+        );
+        assert!(
+            (gate_strength(&s, 3000) - 1.0).abs() < 1e-6,
+            "{}",
+            gate_strength(&s, 3000)
+        );
+        assert!(
+            (gate_strength(&s, 9999) - 1.0).abs() < 1e-6,
+            "saturates at 1"
+        );
         s.gate_enabled = false;
         assert_eq!(gate_strength(&s, 3000), 0.0, "disabled gate is always 0");
     }
@@ -437,11 +511,21 @@ mod tests {
         let b = base.delta.unwrap();
         // Pixels 0,1: gated by (1 - 0.5), then the whole buffer is compensated
         // by total/active = 4/2 = 2, so the net factor is 1.
-        assert!((d[0] - b[0]).abs() < 1e-6, "suppressed then compensated: {} vs {}", d[0], b[0]);
+        assert!(
+            (d[0] - b[0]).abs() < 1e-6,
+            "suppressed then compensated: {} vs {}",
+            d[0],
+            b[0]
+        );
         // Pixels 2,3 are wrong, so the gate leaves them alone - but the C++
         // compensation scales the *whole* delta buffer, so they get exactly the
         // 2x too. That is what keeps the mean step size constant.
-        assert!((d[2] - b[2] * 2.0).abs() < 1e-6, "wrong pixel gets only the compensation: {} vs {}", d[2], b[2] * 2.0);
+        assert!(
+            (d[2] - b[2] * 2.0).abs() < 1e-6,
+            "wrong pixel gets only the compensation: {} vs {}",
+            d[2],
+            b[2] * 2.0
+        );
         assert!((d[3] - b[3] * 2.0).abs() < 1e-6);
         // With the compensation disabled the gated pixels really are damped.
         let mut s2 = s.clone();
@@ -449,7 +533,10 @@ mod tests {
         let ungated_total = segmentation_loss(&output, &truth, &s2, 4, 1, 0.0);
         let gated_total = segmentation_loss(&output, &truth, &s2, 4, 1, strength);
         let dt = gated_total.delta.unwrap();
-        assert!((dt[0] - ungated_total.delta.unwrap()[0] * 0.5).abs() < 1e-6, "damped by 1 - strength");
+        assert!(
+            (dt[0] - ungated_total.delta.unwrap()[0] * 0.5).abs() < 1e-6,
+            "damped by 1 - strength"
+        );
         // The loss is gated the same way, so the mean per-pixel loss drops.
         assert!(gated.loss < base.loss, "{} vs {}", gated.loss, base.loss);
     }

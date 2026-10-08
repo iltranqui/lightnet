@@ -41,7 +41,15 @@ pub fn gelu_erf(x: f32) -> f32 {
 /// C++ `sc_layernorm`: row-wise LayerNorm **with bias**, population variance.
 ///
 /// `rows` vectors of length `cols`; `out` may not alias `x`.
-pub fn layer_norm_with_bias(x: &[f32], gamma: &[f32], beta: &[f32], out: &mut [f32], rows: usize, cols: usize, eps: f32) {
+pub fn layer_norm_with_bias(
+    x: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    out: &mut [f32],
+    rows: usize,
+    cols: usize,
+    eps: f32,
+) {
     let inv_c = 1.0 / cols as f32;
     for r in 0..rows {
         let row = &x[r * cols..(r + 1) * cols];
@@ -70,7 +78,12 @@ pub const PARAM_DECAYS: [bool; 6] = [false, false, true, false, true, false];
 /// C++ `laya_encoder_blob_float_count(hidden, n_layers, intermediate, vocab)`:
 /// the number of floats `[laya_encoder]` occupies at the front of the shared
 /// `.weights` file.
-pub fn encoder_blob_float_count(hidden: usize, n_layers: usize, intermediate: usize, vocab: usize) -> usize {
+pub fn encoder_blob_float_count(
+    hidden: usize,
+    n_layers: usize,
+    intermediate: usize,
+    vocab: usize,
+) -> usize {
     let (h, i, nl) = (hidden, intermediate, n_layers);
     let mut total = h * vocab; // tok_embeddings
     total += h; // embeddings.norm
@@ -209,7 +222,14 @@ impl LayaScorerWeights {
         let fc1_b = take(hidden);
         let fc2_w = take(hidden);
         let fc2_b = blob[at];
-        Ok(Self { ln_w, ln_b, fc1_w, fc1_b, fc2_w, fc2_b })
+        Ok(Self {
+            ln_w,
+            ln_b,
+            fc1_w,
+            fc1_b,
+            fc2_w,
+            fc2_b,
+        })
     }
 }
 
@@ -229,13 +249,20 @@ pub fn scorer_forward(
             batch * h * k
         ));
     }
-    if weights.ln_w.len() != h || weights.ln_b.len() != h || weights.fc1_w.len() != h * h || weights.fc1_b.len() != h
+    if weights.ln_w.len() != h
+        || weights.ln_b.len() != h
+        || weights.fc1_w.len() != h * h
+        || weights.fc1_b.len() != h
         || weights.fc2_w.len() != h
     {
         return Err(format!("laya_scorer weights do not match hidden={h}"));
     }
     let rows = batch * k;
-    let eps = if spec.ln_eps > 0.0 { spec.ln_eps } else { LAYA_LAYERNORM_EPS };
+    let eps = if spec.ln_eps > 0.0 {
+        spec.ln_eps
+    } else {
+        LAYA_LAYERNORM_EPS
+    };
     let mut output = vec![0.0f32; rows];
 
     // 1. unpack channel-major [B,H,1,K] -> row-major [B*K, H]
@@ -250,7 +277,15 @@ pub fn scorer_forward(
     }
     // 2. LayerNorm with bias
     let mut xhat = vec![0.0f32; rows * h];
-    layer_norm_with_bias(&tokens, &weights.ln_w, &weights.ln_b, &mut xhat, rows, h, eps);
+    layer_norm_with_bias(
+        &tokens,
+        &weights.ln_w,
+        &weights.ln_b,
+        &mut xhat,
+        rows,
+        h,
+        eps,
+    );
 
     // 3. Linear(H -> H) then the exact-erf GELU
     let mut hidden_buf = vec![0.0f32; rows * h];
@@ -310,9 +345,16 @@ pub fn scorer_backward_input(
         ));
     }
     if seed.len() != rows {
-        return Err(format!("laya_scorer seed has {} entries, expected {rows}", seed.len()));
+        return Err(format!(
+            "laya_scorer seed has {} entries, expected {rows}",
+            seed.len()
+        ));
     }
-    let eps = if spec.ln_eps > 0.0 { spec.ln_eps } else { LAYA_LAYERNORM_EPS };
+    let eps = if spec.ln_eps > 0.0 {
+        spec.ln_eps
+    } else {
+        LAYA_LAYERNORM_EPS
+    };
     let inv_h = 1.0 / h as f32;
 
     // Forward intermediates.
@@ -325,7 +367,11 @@ pub fn scorer_backward_input(
             }
         }
     }
-    let (mut mean, mut inv_std, mut xhat_raw) = (vec![0.0f32; rows], vec![0.0f32; rows], vec![0.0f32; rows * h]);
+    let (mut mean, mut inv_std, mut xhat_raw) = (
+        vec![0.0f32; rows],
+        vec![0.0f32; rows],
+        vec![0.0f32; rows * h],
+    );
     let mut xhat = vec![0.0f32; rows * h];
     for r in 0..rows {
         let row = &tokens[r * h..(r + 1) * h];
@@ -424,12 +470,28 @@ mod tests {
         // factor is 0.6826894921, so the values are -0.15865525 / 0.84134475.
         // (The tanh approximation gives -0.15880801 / 0.84119199, so these two
         // constants also pin that the two GELU variants are not confused.)
-        assert!((gelu_erf(-1.0) + 0.158_655_25).abs() < 1e-6, "{}", gelu_erf(-1.0));
-        assert!((gelu_erf(1.0) - 0.841_344_75).abs() < 1e-6, "{}", gelu_erf(1.0));
-        assert!((gelu_erf(2.0) - 1.954_499_7).abs() < 1e-5, "{}", gelu_erf(2.0));
+        assert!(
+            (gelu_erf(-1.0) + 0.158_655_25).abs() < 1e-6,
+            "{}",
+            gelu_erf(-1.0)
+        );
+        assert!(
+            (gelu_erf(1.0) - 0.841_344_75).abs() < 1e-6,
+            "{}",
+            gelu_erf(1.0)
+        );
+        assert!(
+            (gelu_erf(2.0) - 1.954_499_7).abs() < 1e-5,
+            "{}",
+            gelu_erf(2.0)
+        );
         // The tanh approximation darknet's own gelu uses differs measurably.
         let tanh = crate::activation_math::gelu(1.0);
-        assert!((tanh - gelu_erf(1.0)).abs() > 1e-4, "erf and tanh GELU must differ: {tanh} vs {}", gelu_erf(1.0));
+        assert!(
+            (tanh - gelu_erf(1.0)).abs() > 1e-4,
+            "erf and tanh GELU must differ: {tanh} vs {}",
+            gelu_erf(1.0)
+        );
     }
 
     #[test]
@@ -451,8 +513,16 @@ mod tests {
         let expect = |v: f32, mean: f32, var: f32| (v - mean) / (var + 1e-5).sqrt();
         assert!((out[0] - expect(1.0, 2.5, 1.25)).abs() < 1e-6, "{}", out[0]);
         assert!((out[3] - expect(4.0, 2.5, 1.25)).abs() < 1e-6, "{}", out[3]);
-        assert!((out[4] - expect(10.0, 25.0, 125.0)).abs() < 1e-6, "{}", out[4]);
-        assert!((out[7] - expect(40.0, 25.0, 125.0)).abs() < 1e-6, "{}", out[7]);
+        assert!(
+            (out[4] - expect(10.0, 25.0, 125.0)).abs() < 1e-6,
+            "{}",
+            out[4]
+        );
+        assert!(
+            (out[7] - expect(40.0, 25.0, 125.0)).abs() < 1e-6,
+            "{}",
+            out[7]
+        );
     }
 
     #[test]
@@ -494,7 +564,11 @@ mod tests {
         let a = 1.0f32 / (2.0f32 / 3.0 + 1e-5).sqrt();
         let expect0 = gelu_erf(a) + gelu_erf(0.0) + gelu_erf(-a) + 0.5;
         assert!((got[0] - expect0).abs() < 1e-5, "{} vs {expect0}", got[0]);
-        assert!((got[1] - 0.5).abs() < 1e-6, "slot 1 is constant, got {}", got[1]);
+        assert!(
+            (got[1] - 0.5).abs() < 1e-6,
+            "slot 1 is constant, got {}",
+            got[1]
+        );
     }
 
     #[test]
@@ -534,8 +608,9 @@ mod tests {
             }
             w.fc2_b = 0.45;
             let rows = batch * k;
-            let input: Vec<f32> =
-                (0..rows * hidden).map(|i| ((i * 19 % 17) as f32 - 8.0) / 5.0).collect();
+            let input: Vec<f32> = (0..rows * hidden)
+                .map(|i| ((i * 19 % 17) as f32 - 8.0) / 5.0)
+                .collect();
             let seed: Vec<f32> = (0..rows).map(|i| (i as f32 * 0.37 - 0.5).sin()).collect();
             let analytic = scorer_backward_input(&input, &seed, &w, &s, batch).unwrap();
             let eps = 1e-3f32;
@@ -546,8 +621,10 @@ mod tests {
                 lo[i] -= eps;
                 let l_hi = scorer_forward(&hi, &w, &s, batch).unwrap();
                 let l_lo = scorer_forward(&lo, &w, &s, batch).unwrap();
-                let numeric: f32 =
-                    (0..rows).map(|r| seed[r] * (l_hi[r] - l_lo[r])).sum::<f32>() / (2.0 * eps);
+                let numeric: f32 = (0..rows)
+                    .map(|r| seed[r] * (l_hi[r] - l_lo[r]))
+                    .sum::<f32>()
+                    / (2.0 * eps);
                 let want = analytic[i];
                 let slack = 2e-2 * want.abs().max(1e-2);
                 assert!(
@@ -562,8 +639,16 @@ mod tests {
     fn the_backward_rejects_mismatched_inputs_and_seeds() {
         let s = spec(3, 2);
         let w = LayaScorerWeights::zeroed(3);
-        assert!(scorer_backward_input(&[0.0; 5], &[0.0; 2], &w, &s, 1).unwrap_err().contains("expected 6"));
-        assert!(scorer_backward_input(&[0.0; 6], &[0.0; 1], &w, &s, 1).unwrap_err().contains("seed has 1 entries"));
+        assert!(
+            scorer_backward_input(&[0.0; 5], &[0.0; 2], &w, &s, 1)
+                .unwrap_err()
+                .contains("expected 6")
+        );
+        assert!(
+            scorer_backward_input(&[0.0; 6], &[0.0; 1], &w, &s, 1)
+                .unwrap_err()
+                .contains("seed has 1 entries")
+        );
     }
 
     #[test]
@@ -579,7 +664,11 @@ mod tests {
             };
             let blob = w.to_blob();
             assert_eq!(blob.len(), blob_float_count(hidden), "hidden={hidden}");
-            assert_eq!(LayaScorerWeights::from_blob(&blob).unwrap(), w, "hidden={hidden}");
+            assert_eq!(
+                LayaScorerWeights::from_blob(&blob).unwrap(),
+                w,
+                "hidden={hidden}"
+            );
         }
         // A blob of the wrong length is rejected rather than mis-sliced.
         let err = LayaScorerWeights::from_blob(&[0.0; 7]).unwrap_err();
@@ -589,7 +678,10 @@ mod tests {
     #[test]
     fn blob_float_count_matches_the_cpp_arithmetic() {
         for hidden in [1usize, 8, 1024] {
-            assert_eq!(blob_float_count(hidden), 2 * hidden + hidden * hidden + 2 * hidden + 1);
+            assert_eq!(
+                blob_float_count(hidden),
+                2 * hidden + hidden * hidden + 2 * hidden + 1
+            );
         }
     }
 }
@@ -621,17 +713,20 @@ mod real_weights {
     #[test]
     fn the_default_encoder_and_head_keys_place_the_scorer_blob() {
         let offset = scorer_blob_offset_bytes(
-            1024, // encoder_hidden
-            28,  // encoder_layers
-            2624, // encoder_intermediate
+            1024,  // encoder_hidden
+            28,    // encoder_layers
+            2624,  // encoder_intermediate
             50368, // encoder_vocab
-            1024, // head_hidden
-            2,    // head_layers
-            4096, // head_ffn_dim
+            1024,  // head_hidden
+            2,     // head_layers
+            4096,  // head_ffn_dim
             false,
         );
         let floats = (offset - 20) / 4;
-        assert_eq!(floats, encoder_blob_float_count(1024, 28, 2624, 50368) + head_blob_float_count(1024, 2, 4096));
+        assert_eq!(
+            floats,
+            encoder_blob_float_count(1024, 28, 2624, 50368) + head_blob_float_count(1024, 2, 4096)
+        );
         println!("scorer blob offset: {offset} bytes ({floats} floats past the 20-byte header)");
     }
 
@@ -678,22 +773,37 @@ mod real_weights {
             rms(&w.ln_b)
         );
         assert!(rms(&w.fc1_w) > 1e-3, "fc1_w must not be all zeros");
-        assert!(w.fc2_b.abs() < 10.0, "fc2_b is a single logit bias, got {}", w.fc2_b);
+        assert!(
+            w.fc2_b.abs() < 10.0,
+            "fc2_b is a single logit bias, got {}",
+            w.fc2_b
+        );
 
         // And the forward must run on the real weights over a real-shaped input.
-        let spec = LayaScorerSpec { hidden, max_options: 4, ln_eps: LAYA_LAYERNORM_EPS };
+        let spec = LayaScorerSpec {
+            hidden,
+            max_options: 4,
+            ln_eps: LAYA_LAYERNORM_EPS,
+        };
         let batch = 2;
         // Deliberately asymmetric between the two images: a bug that ignored
         // the image index would silently produce identical logits for both.
         let input: Vec<f32> = (0..batch * hidden * 4)
             .map(|i| {
                 let (image, rest) = (i / (hidden * 4), i % (hidden * 4));
-                if image == 0 { (rest % 17) as f32 * 0.01 - 0.08 } else { (rest % 5) as f32 * 0.2 + 0.5 }
+                if image == 0 {
+                    (rest % 17) as f32 * 0.01 - 0.08
+                } else {
+                    (rest % 5) as f32 * 0.2 + 0.5
+                }
             })
             .collect();
         let out = scorer_forward(&input, &w, &spec, batch).expect("forward");
         assert_eq!(out.len(), batch * 4);
-        assert!(out.iter().all(|v| v.is_finite()), "logits must be finite: {out:?}");
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "logits must be finite: {out:?}"
+        );
         assert!(
             (out[0] - out[4]).abs() > 1e-4,
             "the two images must not score identically: {out:?}"
@@ -708,9 +818,7 @@ mod wiring {
     //! on the CPU and the GPU, and loads its real blob.
 
     use super::*;
-    use crate::{
-        ConfigFile, ExecutableNetwork, LayerParams, Network, Tensor, TensorShape,
-    };
+    use crate::{ConfigFile, ExecutableNetwork, LayerParams, Network, Tensor, TensorShape};
 
     fn cfg(hidden: usize, max_options: usize) -> String {
         format!(
@@ -728,11 +836,19 @@ mod wiring {
         assert_eq!(network.layers[1].input_shape.channels, 4);
         assert_eq!(network.layers[1].input_shape.width, 3);
         let out = network.layers[1].output_shape;
-        assert_eq!((out.channels, out.height, out.width, out.batch), (1, 1, 3, 2));
-        assert!(network.layers[1].weights().is_none(), "the blob is not the sequential stream");
+        assert_eq!(
+            (out.channels, out.height, out.width, out.batch),
+            (1, 1, 3, 2)
+        );
+        assert!(
+            network.layers[1].weights().is_none(),
+            "the blob is not the sequential stream"
+        );
 
         let mut exec = ExecutableNetwork::new(network);
-        let LayerParams::LayaScorer(_) = &exec.params[1] else { panic!("expected scorer params") };
+        let LayerParams::LayaScorer(_) = &exec.params[1] else {
+            panic!("expected scorer params")
+        };
         let input_shape = exec.network.net.input_shape();
         let data: Vec<f32> = (0..input_shape.batch * input_shape.element_count())
             .map(|i| (i % 9) as f32 * 0.1 - 0.4)
@@ -743,7 +859,11 @@ mod wiring {
         assert!(forward.layer_outputs[1].data.iter().all(|v| v.is_finite()));
         // With all-zero weights LayerNorm gives 0, GELU(0) = 0, so the logit is
         // just fc2_b (0.0).
-        assert!(forward.layer_outputs[1].data.iter().all(|v| v.abs() < 1e-6), "{:?}", forward.layer_outputs[1].data);
+        assert!(
+            forward.layer_outputs[1].data.iter().all(|v| v.abs() < 1e-6),
+            "{:?}",
+            forward.layer_outputs[1].data
+        );
     }
 
     #[test]
@@ -754,12 +874,16 @@ mod wiring {
         {
             // The convolution is zero-initialised, which would swallow the
             // gradient before it reaches the network input, so give it content.
-            let LayerParams::Convolutional(conv) = &mut exec.params[0] else { panic!() };
+            let LayerParams::Convolutional(conv) = &mut exec.params[0] else {
+                panic!()
+            };
             for (i, v) in conv.weights.iter_mut().enumerate() {
                 *v = (i % 5) as f32 * 0.1 - 0.2;
             }
             conv.biases.iter_mut().for_each(|b| *b = 0.0);
-            let LayerParams::LayaScorer(weights) = &mut exec.params[1] else { panic!() };
+            let LayerParams::LayaScorer(weights) = &mut exec.params[1] else {
+                panic!()
+            };
             // C++ zero-initialises the scorer and expects the loader to fill
             // it, so the *unloaded* LayerNorm gamma is 0 and the whole chain
             // collapses.  A trained-like gamma (near 1) and a dense fc1 are what
@@ -783,8 +907,11 @@ mod wiring {
         let input = Tensor::from_data(input_shape, data).unwrap();
         let forward = exec.forward_training(&input).unwrap();
         let mut seeds = vec![None; exec.network.layers.len()];
-        seeds[1] = Some(Tensor::from_data(exec.network.layers[1].output_shape, vec![1.0f32; 6]).unwrap());
-        let result = exec.backward_accumulate_seeded(&input, &forward, &seeds).unwrap();
+        seeds[1] =
+            Some(Tensor::from_data(exec.network.layers[1].output_shape, vec![1.0f32; 6]).unwrap());
+        let result = exec
+            .backward_accumulate_seeded(&input, &forward, &seeds)
+            .unwrap();
         assert_eq!(
             result.input_gradient.data.len(),
             input_shape.batch * input_shape.element_count()
@@ -827,11 +954,14 @@ mod wiring {
         // 1x1 convolution stands in here so the test does not need that layer
         // ported first.
         let network =
-            Network::from_config(ConfigFile::parse_str("laya.cfg", &cfg(1024, 4)).unwrap()).unwrap();
+            Network::from_config(ConfigFile::parse_str("laya.cfg", &cfg(1024, 4)).unwrap())
+                .unwrap();
         let mut exec = ExecutableNetwork::new(network);
         let offset = scorer_blob_offset_bytes(1024, 28, 2624, 50368, 1024, 2, 4096, false);
         {
-            let LayerParams::LayaScorer(weights) = &mut exec.params[1] else { panic!() };
+            let LayerParams::LayaScorer(weights) = &mut exec.params[1] else {
+                panic!()
+            };
             let blob = &bytes[offset..offset + 4 * blob_float_count(1024)];
             *weights = LayaScorerWeights::from_blob(
                 &blob

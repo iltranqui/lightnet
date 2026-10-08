@@ -9,7 +9,14 @@ use crate::runtime::Tensor;
 
 /// First maximum over the input channels `g, g + out_c, ...` at one pixel
 /// (C++ `val > max` keeps the first on ties). Returns `(value, input_channel)`.
-fn depth_argmax(input: &Tensor, b: usize, g: usize, out_c: usize, y: usize, x: usize) -> (f32, usize) {
+fn depth_argmax(
+    input: &Tensor,
+    b: usize,
+    g: usize,
+    out_c: usize,
+    y: usize,
+    x: usize,
+) -> (f32, usize) {
     let mut best_channel = g;
     let mut best = input.get(b, g, y, x);
     let mut k = g + out_c;
@@ -88,8 +95,12 @@ mod tests {
         // winners: g0x0 -> ch2, g0x1 -> ch0, g1x0 -> ch1, g1x1 -> ch3
         assert_eq!(dx.data, vec![0.0, 2.0, 3.0, 0.0, 1.0, 0.0, 0.0, 4.0]);
         // tie: the first channel wins (C++ `val > max`)
-        let tie = Tensor::from_data(TensorShape::new(1, 1, 4, 1), vec![7.0, 1.0, 7.0, 1.0]).unwrap();
+        let tie =
+            Tensor::from_data(TensorShape::new(1, 1, 4, 1), vec![7.0, 1.0, 7.0, 1.0]).unwrap();
         let g = Tensor::from_data(TensorShape::new(1, 1, 2, 1), vec![1.0, 1.0]).unwrap();
-        assert_eq!(super::backward_maxpool_depth(&tie, &g).unwrap().data, vec![1.0, 1.0, 0.0, 0.0]);
+        assert_eq!(
+            super::backward_maxpool_depth(&tie, &g).unwrap().data,
+            vec![1.0, 1.0, 0.0, 0.0]
+        );
     }
 }

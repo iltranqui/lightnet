@@ -7,7 +7,11 @@ const EPS: f32 = 0.0001;
 
 /// Per-slot normalised weights. `raw` is laid out `[input i][slot]` with
 /// `layer_step` slots per input (1 for per_feature, C for per_channel).
-pub(crate) fn effective_weights(raw: &[f32], norm: ShortcutWeightsNorm, layer_step: usize) -> Vec<f32> {
+pub(crate) fn effective_weights(
+    raw: &[f32],
+    norm: ShortcutWeightsNorm,
+    layer_step: usize,
+) -> Vec<f32> {
     let n1 = raw.len() / layer_step;
     let mut eff = raw.to_vec();
     for slot in 0..layer_step {
@@ -21,7 +25,9 @@ pub(crate) fn effective_weights(raw: &[f32], norm: ShortcutWeightsNorm, layer_st
                 }
             }
             ShortcutWeightsNorm::Softmax => {
-                let max = (0..n1).map(|i| raw[at(i)]).fold(f32::NEG_INFINITY, f32::max);
+                let max = (0..n1)
+                    .map(|i| raw[at(i)])
+                    .fold(f32::NEG_INFINITY, f32::max);
                 let sum = EPS + (0..n1).map(|i| (raw[at(i)] - max).exp()).sum::<f32>();
                 for i in 0..n1 {
                     eff[at(i)] = (raw[at(i)] - max).exp() / sum;

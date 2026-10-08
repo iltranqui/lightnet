@@ -105,7 +105,9 @@ pub fn contrastive_forward(
     if !training || spec.temperature == 0.0 {
         return Ok(result);
     }
-    let Some(truth) = truth else { return Ok(result) };
+    let Some(truth) = truth else {
+        return Ok(result);
+    };
     if truth.len() < batch * spec.classes {
         return Ok(result);
     }
@@ -114,7 +116,11 @@ pub fn contrastive_forward(
     // class whose truth probability clears the threshold overwrites it.
     let mini_batch = (batch / time_steps.max(1)).max(1);
     for b in 0..batch {
-        result.labels[b] = if adversarial { (b % 2) as i32 } else { (b / 2) as i32 };
+        result.labels[b] = if adversarial {
+            (b % 2) as i32
+        } else {
+            (b / 2) as i32
+        };
         for c in 0..spec.classes {
             if truth[b * spec.classes + c] > truth_thresh {
                 result.labels[b] = c as i32;
@@ -165,8 +171,11 @@ pub fn contrastive_forward(
             }
         }
     }
-    result.accuracy =
-        if all > 0 { 100.0 * good as f32 / all as f32 } else { -1.0 };
+    result.accuracy = if all > 0 {
+        100.0 * good as f32 / all as f32
+    } else {
+        -1.0
+    };
 
     // C++ `P_constrastive(i, j)`: numerator row i, column j; the denominator
     // sums column j over every row except i.
@@ -188,7 +197,11 @@ pub fn contrastive_forward(
             // sanitise after the gradient loops turns that into a zero delta
             // anyway, so 0 is the faithful result and is written explicitly
             // instead of producing a NaN.
-            p_constrastive[i * batch + j] = if denominator != 0.0 { numerator / denominator } else { 0.0 };
+            p_constrastive[i * batch + j] = if denominator != 0.0 {
+                numerator / denominator
+            } else {
+                0.0
+            };
         }
     }
 
@@ -201,7 +214,11 @@ pub fn contrastive_forward(
         if vec_len == 0.0 {
             continue; // C++ treats this as a fatal error; here it means "no pull"
         }
-        let n_same = result.labels.iter().filter(|l| **l == result.labels[i]).count() as f32;
+        let n_same = result
+            .labels
+            .iter()
+            .filter(|l| **l == result.labels[i])
+            .count() as f32;
         if n_same == 0.0 {
             continue;
         }
@@ -274,8 +291,18 @@ mod tests {
     fn the_detection_branch_reports_itself_as_unported() {
         let mut s = spec();
         s.yolo_layer = -1;
-        let err = contrastive_forward(&[1.0, 0.0], Some(&[1.0, 0.0]), &s, 1, 2, 1, false, 0.0, true)
-            .expect_err("the detection branch must not pretend to work");
+        let err = contrastive_forward(
+            &[1.0, 0.0],
+            Some(&[1.0, 0.0]),
+            &s,
+            1,
+            2,
+            1,
+            false,
+            0.0,
+            true,
+        )
+        .expect_err("the detection branch must not pretend to work");
         assert!(err.contains("detection branch"), "{err}");
     }
 
@@ -312,7 +339,8 @@ mod tests {
         // The lone member of its class (image 1) gets no gradient at all: C++
         // would divide by N - 1 = 0 there, which the sanitise turns into zero.
         let alone_truth = vec![1.0f32, 0.0, 0.0, 1.0, 1.0, 0.0];
-        let alone = contrastive_forward(&input, Some(&alone_truth), &s, 3, 2, 1, false, 0.0, true).unwrap();
+        let alone =
+            contrastive_forward(&input, Some(&alone_truth), &s, 3, 2, 1, false, 0.0, true).unwrap();
         assert_eq!(alone.labels, vec![0, 1, 0]);
         assert!(
             alone.delta[2..4].iter().all(|d| d.abs() < 1e-6),
@@ -332,10 +360,22 @@ mod tests {
         let s = spec();
         let input = vec![1.0f32, 0.0, 0.0, 1.0];
         // No truth above `truth_thresh`, so the fallback `b / 2` stands.
-        let r = contrastive_forward(&input, Some(&[0.0f32; 4]), &s, 2, 2, 1, false, 0.1, true).unwrap();
+        let r =
+            contrastive_forward(&input, Some(&[0.0f32; 4]), &s, 2, 2, 1, false, 0.1, true).unwrap();
         assert_eq!(r.labels, vec![0, 0], "`b / 2` gives both images class 0");
         // A truth probability above the threshold sets the label directly.
-        let r = contrastive_forward(&input, Some(&[0.0, 1.0, 1.0, 0.0]), &s, 2, 2, 1, false, 0.1, true).unwrap();
+        let r = contrastive_forward(
+            &input,
+            Some(&[0.0, 1.0, 1.0, 0.0]),
+            &s,
+            2,
+            2,
+            1,
+            false,
+            0.1,
+            true,
+        )
+        .unwrap();
         assert_eq!(r.labels, vec![1, 0]);
         // Adversarial nets use `b % 2` instead of `b / 2`.
         let r = contrastive_forward(&input, Some(&[0.0; 4]), &s, 2, 2, 1, true, 0.1, true).unwrap();
@@ -346,12 +386,24 @@ mod tests {
     fn inference_and_missing_truth_are_silent_no_ops() {
         let s = spec();
         let input = vec![1.0f32, 0.0, -1.0, 0.0];
-        let infer = contrastive_forward(&input, Some(&[1.0, 0.0, 0.0, 1.0]), &s, 2, 2, 1, false, 0.0, false).unwrap();
+        let infer = contrastive_forward(
+            &input,
+            Some(&[1.0, 0.0, 0.0, 1.0]),
+            &s,
+            2,
+            2,
+            1,
+            false,
+            0.0,
+            false,
+        )
+        .unwrap();
         assert_eq!(infer.cost, 0.0);
         assert!(infer.delta.iter().all(|d| *d == 0.0));
         let no_truth = contrastive_forward(&input, None, &s, 2, 2, 1, false, 0.0, true).unwrap();
         assert_eq!(no_truth.cost, 0.0);
-        let short = contrastive_forward(&input, Some(&[1.0, 0.0]), &s, 2, 2, 1, false, 0.0, true).unwrap();
+        let short =
+            contrastive_forward(&input, Some(&[1.0, 0.0]), &s, 2, 2, 1, false, 0.0, true).unwrap();
         assert_eq!(short.cost, 0.0);
     }
 
@@ -367,11 +419,13 @@ mod tests {
         let truth = vec![
             1.0f32, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0,
         ];
-        let split = contrastive_forward(&input, Some(&truth), &s, 6, 2, 2, false, 0.0, true).unwrap();
+        let split =
+            contrastive_forward(&input, Some(&truth), &s, 6, 2, 2, false, 0.0, true).unwrap();
         assert_eq!(split.labels, vec![0, 0, 0, 1, 1, 1]);
         // Joining the two steps (`time_steps = 1`) lets each same-class pair
         // also see the other class through the negative loop.
-        let joined = contrastive_forward(&input, Some(&truth), &s, 6, 2, 1, false, 0.0, true).unwrap();
+        let joined =
+            contrastive_forward(&input, Some(&truth), &s, 6, 2, 1, false, 0.0, true).unwrap();
         assert!(
             joined.cost > split.cost,
             "joining the steps adds cross-class negatives: {} vs {}",
@@ -386,23 +440,39 @@ mod tests {
         s.cls_normalizer = 2.0;
         let input = vec![1.0f32, 0.0, 0.0, 1.0, -1.0, 0.0];
         let truth = vec![1.0f32, 0.0, 1.0, 0.0, 1.0, 0.0];
-        let plain = contrastive_forward(&input, Some(&truth), &spec(), 3, 2, 1, false, 0.0, true).unwrap();
-        let scaled = contrastive_forward(&input, Some(&truth), &s, 3, 2, 1, false, 0.0, true).unwrap();
+        let plain =
+            contrastive_forward(&input, Some(&truth), &spec(), 3, 2, 1, false, 0.0, true).unwrap();
+        let scaled =
+            contrastive_forward(&input, Some(&truth), &s, 3, 2, 1, false, 0.0, true).unwrap();
         for (a, b) in plain.delta.iter().zip(&scaled.delta) {
             assert!((b - 2.0 * a).abs() < 1e-6, "{b} vs {}", 2.0 * a);
         }
-        assert!((scaled.cost - 4.0 * plain.cost).abs() < 1e-4, "{} vs {}", scaled.cost, 4.0 * plain.cost);
+        assert!(
+            (scaled.cost - 4.0 * plain.cost).abs() < 1e-4,
+            "{} vs {}",
+            scaled.cost,
+            4.0 * plain.cost
+        );
         let mut clipped = spec();
         clipped.max_delta = 1e-4;
-        let r = contrastive_forward(&input, Some(&truth), &clipped, 3, 2, 1, false, 0.0, true).unwrap();
-        assert!(r.delta.iter().all(|d| d.abs() <= clipped.max_delta + 1e-9), "{:?}", r.delta);
+        let r =
+            contrastive_forward(&input, Some(&truth), &clipped, 3, 2, 1, false, 0.0, true).unwrap();
+        assert!(
+            r.delta.iter().all(|d| d.abs() <= clipped.max_delta + 1e-9),
+            "{:?}",
+            r.delta
+        );
     }
 
     #[test]
     fn cosine_similarity_and_length_match_the_cpp_helpers() {
         assert!((cosine_similarity(&[3.0, 4.0], &[3.0, 4.0]) - 1.0).abs() < 1e-6);
         assert!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
-        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0, "zero length gives 0");
+        assert_eq!(
+            cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]),
+            0.0,
+            "zero length gives 0"
+        );
         assert!((vector_length(&[3.0, 4.0]) - 5.0).abs() < 1e-6);
     }
 }

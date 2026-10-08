@@ -11,6 +11,9 @@ members = [
     "src/darknet-core",
     "src/darknet-cuda",
     "src/darknet-examples",
+    "src/darknet-gui",
+    "src/darknet-gui-engine",
+    "src/darknet-gui-project",
 
     # cuda-oxide (vendored from NVlabs/cuda-oxide, Apache-2.0)
     # Core crates
@@ -46,6 +49,41 @@ members = [
     "bridges/reserved-oxide-symbols",
     # Differential codegen fuzzer support
     "bridges/fuzzer",
+]
+# Plain `cargo check/test` skips the heavy iced/wgpu GUI; build it with `-p darknet-gui`.
+default-members = [
+    "src/darknet-cli",
+    "src/darknet-core",
+    "src/darknet-cuda",
+    "src/darknet-examples",
+    "bridges/cuda-target-spec",
+    "bridges/cuda-intrinsics",
+    "bridges/cuda-intrinsics-gen",
+    "bridges/ptx-parse",
+    "bridges/ptx-schedule",
+    "bridges/dialect-ptx",
+    "bridges/cuda-device",
+    "bridges/cuda-artifact-finalizer",
+    "bridges/cuda-host",
+    "bridges/cuda-macros",
+    "bridges/llvm-export",
+    "bridges/dialect-mir",
+    "bridges/dialect-iket",
+    "bridges/dialect-nvvm",
+    "bridges/mir-importer",
+    "bridges/cuda-oxide-codegen",
+    "bridges/mir-lower",
+    "bridges/iket-lower",
+    "bridges/mir-transforms",
+    "bridges/nvvm-transforms",
+    "bridges/cargo-oxide",
+    "bridges/oxide-artifacts",
+    "bridges/libnvvm-sys",
+    "bridges/nvjitlink-sys",
+    "bridges/reserved-oxide-symbols",
+    "bridges/fuzzer",
+    "src/darknet-gui-engine",
+    "src/darknet-gui-project",
 ]
 
 [workspace.package]

@@ -786,7 +786,10 @@ impl Crop {
         let mean_elapsed = mean_start.elapsed();
         // Virtual mean-padded crop avoids allocating potentially huge crops.
         let at = |x: i32, y: i32, c: usize| {
-            let (x, y) = (i64::from(x) + i64::from(self.left), i64::from(y) + i64::from(self.top));
+            let (x, y) = (
+                i64::from(x) + i64::from(self.left),
+                i64::from(y) + i64::from(self.top),
+            );
             if x < 0 || y < 0 || x >= ow as i64 || y >= oh as i64 {
                 mean[c]
             } else {
@@ -827,7 +830,11 @@ fn linear_coeff(i: usize, dst: usize, src: i32) -> (i32, i32, i64) {
     let pos = ((i as f64 + 0.5) * src as f64 / dst as f64 - 0.5) as f32;
     let base = pos.floor() as i32;
     let weight = ((pos - base as f32) * 2048.0).round_ties_even() as i64;
-    (base.clamp(0, src - 1), base.saturating_add(1).clamp(0, src - 1), weight)
+    (
+        base.clamp(0, src - 1),
+        base.saturating_add(1).clamp(0, src - 1),
+        weight,
+    )
 }
 fn u8_round(x: f32) -> u8 {
     x.round_ties_even().clamp(0.0, 255.0) as u8
@@ -1073,12 +1080,18 @@ mod tests {
     fn multi_scale_dimensions_follow_cpp_rounding_and_clamps() {
         let opts = settings("");
         assert_eq!(opts.random, 0.0);
-        assert_eq!(opts.multi_scale_dimensions(416, 416, 0, 1, 1000), (416, 416));
+        assert_eq!(
+            opts.multi_scale_dimensions(416, 416, 0, 1, 1000),
+            (416, 416)
+        );
         let cfg = ConfigFile::parse_str("aug.cfg", "[net]\n[yolo]\nrandom=1\n").unwrap();
         let opts = DetectorAugmentation::from_config(&cfg).unwrap();
         assert_eq!(opts.resize_step, 32);
         // rand_coef 1.4 -> round(1.4*416/32 + 1)*32 = 19*32.
-        assert_eq!(opts.multi_scale_dimensions(416, 416, 0, 0, 1000), (608, 608));
+        assert_eq!(
+            opts.multi_scale_dimensions(416, 416, 0, 0, 1000),
+            (608, 608)
+        );
         let (w, h) = opts.multi_scale_dimensions(416, 416, 0, 10, 1000);
         assert!(w % 32 == 0 && h % 32 == 0 && w >= 32 && h >= 32);
     }
@@ -1134,8 +1147,8 @@ mod tests {
     #[test]
     fn mosaic_alignment_copies_cpp_source_quadrants() {
         let (width, height, cut_x, cut_y) = (8, 6, 4, 3);
-        let shifts = mosaic_crop_shifts([-2, 1, 1, -2], false, cut_x, cut_y, width, height, 8, 6)
-            .unwrap();
+        let shifts =
+            mosaic_crop_shifts([-2, 1, 1, -2], false, cut_x, cut_y, width, height, 8, 6).unwrap();
         assert_eq!(shifts, (2, 0, 0, 2));
         let sources: Vec<Vec<u8>> = (0..4)
             .map(|quadrant| {
@@ -1223,17 +1236,7 @@ mod tests {
             w: 1.0 / 8.0,
             h: 0.5,
         };
-        assert!(mosaic_transform_labels(
-            &[threshold_box],
-            3,
-            0,
-            0,
-            shifts,
-            8,
-            8,
-            false
-        )
-        .is_empty());
+        assert!(mosaic_transform_labels(&[threshold_box], 3, 0, 0, shifts, 8, 8, false).is_empty());
     }
 
     #[test]
@@ -1247,7 +1250,9 @@ mod tests {
         opts.flip = false;
         let members: Vec<(PlanarRgbImage, Vec<YoloLabel>)> = (0..4)
             .map(|i| {
-                let bytes: Vec<u8> = (0..20 * 20 * 3).map(|k| ((k + i * 7) % 256) as u8).collect();
+                let bytes: Vec<u8> = (0..20 * 20 * 3)
+                    .map(|k| ((k + i * 7) % 256) as u8)
+                    .collect();
                 (
                     PlanarRgbImage::from_interleaved_rgb_u8(20, 20, &bytes).unwrap(),
                     vec![YoloLabel {
@@ -1330,8 +1335,7 @@ mod tests {
                 ConfigFile::parse_str("aug.cfg", &format!("[net]\n{key}=1\n[yolo]\n")).unwrap();
             assert!(DetectorAugmentation::from_config(&cfg).is_err());
         }
-        let mixup =
-            ConfigFile::parse_str("aug.cfg", "[net]\nmixup=1\n[yolo]\n").unwrap();
+        let mixup = ConfigFile::parse_str("aug.cfg", "[net]\nmixup=1\n[yolo]\n").unwrap();
         assert!(DetectorAugmentation::from_config(&mixup).unwrap().mixup);
         let mosaic =
             ConfigFile::parse_str("aug.cfg", "[net]\nmosaic=1\nmosaic_bound=1\n[yolo]\n").unwrap();

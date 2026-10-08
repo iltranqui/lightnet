@@ -346,32 +346,38 @@ mod tests {
                 "vit.cfg",
                 "[net]\nwidth=4\nheight=4\nchannels=1\n\
                  [vit]\ndim=4\nheads=2\npatch_size=2\npatch_stride=2\nmlp_dim=8\n",
-            ).unwrap(),
-        ).unwrap();
+            )
+            .unwrap(),
+        )
+        .unwrap();
         let mut executable = ExecutableNetwork::new(network.clone());
         let blob_len;
         {
-        let LayerParams::Vit(weights) = &mut executable.params[0] else { panic!("Vit params") };
-        let fill = |v: &mut [f32], start: usize| {
-            for (i, x) in v.iter_mut().enumerate() { *x = start as f32 + i as f32 * 0.01; }
-        };
-        fill(&mut weights.patch_embed, 1);
-        fill(&mut weights.patch_bias, 2);
-        fill(&mut weights.qkv_weight, 3);
-        fill(&mut weights.qkv_bias, 4);
-        fill(&mut weights.ln1_gamma, 5);
-        fill(&mut weights.ln1_beta, 6);
-        fill(&mut weights.wo, 7);
-        fill(&mut weights.wo_bias, 8);
-        fill(&mut weights.ln2_gamma, 9);
-        fill(&mut weights.ln2_beta, 10);
-        fill(&mut weights.ffn_w1, 11);
-        fill(&mut weights.ffn_b1, 12);
-        fill(&mut weights.ffn_w2, 13);
-        fill(&mut weights.ffn_b2, 14);
-        fill(&mut weights.pos_embed, 15);
-        fill(&mut weights.mhc, 16);
-        blob_len = weights.to_blob().len();
+            let LayerParams::Vit(weights) = &mut executable.params[0] else {
+                panic!("Vit params")
+            };
+            let fill = |v: &mut [f32], start: usize| {
+                for (i, x) in v.iter_mut().enumerate() {
+                    *x = start as f32 + i as f32 * 0.01;
+                }
+            };
+            fill(&mut weights.patch_embed, 1);
+            fill(&mut weights.patch_bias, 2);
+            fill(&mut weights.qkv_weight, 3);
+            fill(&mut weights.qkv_bias, 4);
+            fill(&mut weights.ln1_gamma, 5);
+            fill(&mut weights.ln1_beta, 6);
+            fill(&mut weights.wo, 7);
+            fill(&mut weights.wo_bias, 8);
+            fill(&mut weights.ln2_gamma, 9);
+            fill(&mut weights.ln2_beta, 10);
+            fill(&mut weights.ffn_w1, 11);
+            fill(&mut weights.ffn_b1, 12);
+            fill(&mut weights.ffn_w2, 13);
+            fill(&mut weights.ffn_b2, 14);
+            fill(&mut weights.pos_embed, 15);
+            fill(&mut weights.mhc, 16);
+            blob_len = weights.to_blob().len();
         }
         let modern_path = std::env::temp_dir().join("darknet-vit-modern-roundtrip.weights");
         save_weights(&network, &executable.params, &modern_path, 17).unwrap();
@@ -380,18 +386,30 @@ mod tests {
         let mut modern = ExecutableNetwork::new(network.clone());
         modern.load_weights_file(&modern_path).unwrap();
         assert_eq!(modern.params, executable.params);
-        assert_eq!(inspect_weights_file(&network, &modern_path).unwrap().trailing_bytes, 0);
+        assert_eq!(
+            inspect_weights_file(&network, &modern_path)
+                .unwrap()
+                .trailing_bytes,
+            0
+        );
 
         let legacy_path = std::env::temp_dir().join("darknet-vit-legacy-roundtrip.weights");
         let mut bytes = fs::read(&modern_path).unwrap();
         bytes[8..12].copy_from_slice(&4i32.to_le_bytes()); // same header width, before the mHC format revision
         bytes.truncate(bytes.len() - 12 * 4);
         fs::write(&legacy_path, bytes).unwrap();
-        assert_eq!(fs::metadata(&legacy_path).unwrap().len(), 20 + (blob_len as u64 - 12) * 4);
+        assert_eq!(
+            fs::metadata(&legacy_path).unwrap().len(),
+            20 + (blob_len as u64 - 12) * 4
+        );
         let mut legacy = ExecutableNetwork::new(network);
         legacy.load_weights_file(&legacy_path).unwrap();
-        let LayerParams::Vit(legacy_params) = &legacy.params[0] else { panic!("Vit params") };
-        let LayerParams::Vit(modern_params) = &executable.params[0] else { panic!("Vit params") };
+        let LayerParams::Vit(legacy_params) = &legacy.params[0] else {
+            panic!("Vit params")
+        };
+        let LayerParams::Vit(modern_params) = &executable.params[0] else {
+            panic!("Vit params")
+        };
         let mut expected = modern_params.clone();
         expected.mhc = crate::vit::MHC_DEFAULTS.to_vec();
         assert_eq!(legacy_params, &expected);
@@ -402,8 +420,11 @@ mod tests {
     #[test]
     fn standalone_batchnorm_weights_round_trip_exact_length() {
         let network = Network::from_config(
-            ConfigFile::parse_str("bn.cfg", "[net]\nwidth=2\nheight=2\nchannels=3\n[batchnorm]\n")
-                .expect("cfg"),
+            ConfigFile::parse_str(
+                "bn.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=3\n[batchnorm]\n",
+            )
+            .expect("cfg"),
         )
         .expect("network");
         let mut executable = ExecutableNetwork::new(network.clone());
@@ -439,11 +460,16 @@ mod tests {
         .expect("network");
         // (n+1)*c = 2*2 = 4 shortcut weights after 2 convs of (2 bias + 4 weights)
         let mut executable = ExecutableNetwork::new(network.clone());
-        let LayerParams::Shortcut(sc) = &mut executable.params[2] else { panic!("shortcut params") };
+        let LayerParams::Shortcut(sc) = &mut executable.params[2] else {
+            panic!("shortcut params")
+        };
         sc.weights = vec![0.5, 1.5, 2.5, 3.5];
         let path = std::env::temp_dir().join("darknet-shortcut-roundtrip.weights");
         save_weights(&network, &executable.params, &path, 1).expect("save");
-        assert_eq!(fs::metadata(&path).unwrap().len(), 20 + 4 * (2 * (2 + 4) + 4));
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            20 + 4 * (2 * (2 + 4) + 4)
+        );
         let mut reloaded = ExecutableNetwork::new(network.clone());
         reloaded.load_weights_file(&path).expect("load");
         assert_eq!(reloaded.params, executable.params);
@@ -459,7 +485,9 @@ mod tests {
         )
         .expect("network");
         let mut executable = ExecutableNetwork::new(network.clone());
-        let LayerParams::Convolutional(p) = &mut executable.params[0] else { panic!("conv-shaped params") };
+        let LayerParams::Convolutional(p) = &mut executable.params[0] else {
+            panic!("conv-shaped params")
+        };
         p.biases = vec![0.5, 1.5, 2.5];
         p.weights = (0..2 * 3 * 4).map(|i| i as f32).collect();
         let path = std::env::temp_dir().join("darknet-deconv-roundtrip.weights");
@@ -468,7 +496,12 @@ mod tests {
         let mut reloaded = ExecutableNetwork::new(network.clone());
         reloaded.load_weights_file(&path).expect("load");
         assert_eq!(reloaded.params, executable.params);
-        assert_eq!(inspect_weights_file(&network, &path).unwrap().trailing_bytes, 0);
+        assert_eq!(
+            inspect_weights_file(&network, &path)
+                .unwrap()
+                .trailing_bytes,
+            0
+        );
         let _ = fs::remove_file(path);
     }
 

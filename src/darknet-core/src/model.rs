@@ -210,9 +210,21 @@ impl NetConfig {
                 .get_f32("badlabels_rejection_percentage", 0.0)?,
             num_sigmas_reject_badlabels: section.get_f32("num_sigmas_reject_badlabels", 0.0)?,
             adam,
-            adam_b1: if adam { section.get_f32("b1", 0.9)? } else { 0.9 },
-            adam_b2: if adam { section.get_f32("b2", 0.999)? } else { 0.999 },
-            adam_eps: if adam { section.get_f32("eps", 0.000001)? } else { 0.000001 },
+            adam_b1: if adam {
+                section.get_f32("b1", 0.9)?
+            } else {
+                0.9
+            },
+            adam_b2: if adam {
+                section.get_f32("b2", 0.999)?
+            } else {
+                0.999
+            },
+            adam_eps: if adam {
+                section.get_f32("eps", 0.000001)?
+            } else {
+                0.000001
+            },
             decoupled_decay: section.get_usize("decoupled_decay", 0)? != 0,
             loss_scale: section.get_f32("loss_scale", 1.0)?,
             try_fix_nan: section.get_usize("try_fix_nan", 0)? != 0,
@@ -426,7 +438,11 @@ impl SegmentationLoss {
     /// C++ `parse_segmentation_section`: the requested loss must be the one the
     /// class count implies.
     pub fn for_classes(classes: usize) -> Self {
-        if classes == 1 { Self::Bce } else { Self::SoftmaxCe }
+        if classes == 1 {
+            Self::Bce
+        } else {
+            Self::SoftmaxCe
+        }
     }
 }
 
@@ -788,7 +804,9 @@ impl ShortcutWeightsType {
             "none" => Ok(Self::None),
             "per_feature" => Ok(Self::PerFeature),
             "per_channel" => Ok(Self::PerChannel),
-            other => Err(Error::InvalidConfig(format!("weights type \"{other}\" is not supported"))),
+            other => Err(Error::InvalidConfig(format!(
+                "weights type \"{other}\" is not supported"
+            ))),
         }
     }
 }
@@ -799,7 +817,9 @@ impl ShortcutWeightsNorm {
             "none" => Ok(Self::None),
             "relu" | "avg_relu" => Ok(Self::Relu),
             "softmax" => Ok(Self::Softmax),
-            other => Err(Error::InvalidConfig(format!("weights normalization \"{other}\" is not supported"))),
+            other => Err(Error::InvalidConfig(format!(
+                "weights normalization \"{other}\" is not supported"
+            ))),
         }
     }
 }
@@ -858,14 +878,18 @@ pub struct YoloSpec {
     pub class_map: Option<Vec<usize>>,
 }
 
-/// NMS variants implemented for the legacy OBB decoder. DIoU/greedy and
-/// weighted OBB variants remain gated until their distinct source scoring is ported.
+/// NMS variants implemented for the legacy OBB decoder. Weighted OBB merging
+/// remains gated because its geometry-averaging semantics are distinct.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObbNmsKind {
     /// Source default NMS: suppress using the decoded axis-aligned box IoU.
     Default,
     /// Source corners NMS also suppresses by decoded axis-aligned box IoU.
     Corners,
+    /// Source greedy NMS: AABB IoU minus the fixed-power center-distance term.
+    Greedy,
+    /// Source DIoU NMS: AABB IoU minus the configurable center-distance term.
+    Diou,
     /// Orientation-aware greedy NMS over legacy front-point detections.
     Obb,
 }
@@ -875,9 +899,11 @@ impl ObbNmsKind {
         match value.trim().to_ascii_lowercase().as_str() {
             "default" => Ok(Self::Default),
             "cornersnms" => Ok(Self::Corners),
+            "greedynms" => Ok(Self::Greedy),
+            "diounms" => Ok(Self::Diou),
             "obb" | "obb_nms" | "obbnms" => Ok(Self::Obb),
             other => Err(Error::InvalidConfig(format!(
-                "[obb_yolo] at line {line}: unsupported nms_kind {other:?}; implemented kinds are `default`, `cornersnms`, and `obb`"
+                "[obb_yolo] at line {line}: unsupported nms_kind {other:?}; implemented kinds are `default`, `cornersnms`, `greedynms`, `diounms`, and `obb`"
             ))),
         }
     }
@@ -907,6 +933,8 @@ pub struct ObbYoloSpec {
     /// Whether the selected CIoU-OBB variant uses the multiplicative loss.
     pub ciou_obb_multiplicative_loss: bool,
     pub nms_kind: ObbNmsKind,
+    /// Source DIoU-NMS exponent (`beta_nms`, default 0.6).
+    pub beta_nms: f32,
 }
 
 impl std::ops::Deref for ObbYoloSpec {
@@ -1087,8 +1115,13 @@ pub enum LayerKind {
     Reorg(ReorgSpec),
     ChannelSlice(ChannelSliceSpec),
     ChannelShuffle(ChannelShuffleSpec),
-    Softmax { groups: usize },
-    Cost { kind: String, scale: f32 },
+    Softmax {
+        groups: usize,
+    },
+    Cost {
+        kind: String,
+        scale: f32,
+    },
     Logistic,
     Regression(RegressionSpec),
     JevCe(JevCeSpec),
@@ -2276,6 +2309,12 @@ fn parse_layer_kind(
                 parse_obb_iou_loss(section)?;
             let iou_thresh_kind = YoloIouLoss::parse(&section.get_str("iou_thresh_kind", "iou"))?;
             let nms_kind = ObbNmsKind::parse(&section.get_str("nms_kind", "obb"), line)?;
+            let beta_nms = section.get_f32("beta_nms", 0.6)?;
+            if !beta_nms.is_finite() {
+                return Err(Error::InvalidConfig(format!(
+                    "[obb_yolo] at line {line}: beta_nms must be finite"
+                )));
+            }
             if !scale_x_y.is_finite() {
                 return Err(Error::InvalidConfig(format!(
                     "[obb_yolo] at line {line}: scale_x_y must be finite"
@@ -2294,6 +2333,7 @@ fn parse_layer_kind(
                 cobb_iou_lambda: section.get_f32("cobb_iou_lambda", 2.0)?,
                 ciou_obb_loss,
                 ciou_obb_multiplicative_loss,
+                beta_nms,
                 yolo: YoloSpec {
                     classes,
                     num: total,
@@ -2373,7 +2413,9 @@ fn parse_layer_kind(
             let groups = section.get_usize("groups", 81)?;
             let line = section.line;
             if groups == 0 {
-                return Err(Error::InvalidConfig(format!("[jev_ce] at line {line}: groups must be > 0")));
+                return Err(Error::InvalidConfig(format!(
+                    "[jev_ce] at line {line}: groups must be > 0"
+                )));
             }
             let mut candidates = section.get_usize("candidates", 0)?;
             if candidates == 0 {
@@ -2392,14 +2434,18 @@ fn parse_layer_kind(
             let label_smoothing =
                 section.get_f32("label_smoothing", section.get_f32("smoothing", 0.0)?)?;
             if !(0.0..1.0).contains(&label_smoothing) {
-                return Err(Error::InvalidConfig(format!("[jev_ce] at line {line}: label_smoothing must be in [0,1)")));
+                return Err(Error::InvalidConfig(format!(
+                    "[jev_ce] at line {line}: label_smoothing must be in [0,1)"
+                )));
             }
             let layout = section.get_str("layout", "group");
             let channel_major = match layout.as_str() {
                 "channel" | "channel_major" | "cm" | "chw" => true,
                 "group" | "group_major" | "gm" => section.get_usize("channel_major", 0)? != 0,
                 other => {
-                    return Err(Error::InvalidConfig(format!("[jev_ce] at line {line}: unknown layout '{other}' (expected group or channel)")));
+                    return Err(Error::InvalidConfig(format!(
+                        "[jev_ce] at line {line}: unknown layout '{other}' (expected group or channel)"
+                    )));
                 }
             };
             LayerKind::JevCe(JevCeSpec {
@@ -2444,12 +2490,21 @@ fn parse_layer_kind(
                 )));
             }
             let expected = SegmentationLoss::for_classes(classes);
-            let loss_name = section.get_str("loss", expected.name()).trim().to_ascii_lowercase();
+            let loss_name = section
+                .get_str("loss", expected.name())
+                .trim()
+                .to_ascii_lowercase();
             let requested = SegmentationLoss::from_name(&loss_name).ok_or_else(|| {
-                Error::InvalidConfig(format!("[segmentation] at line {line}: loss \"{loss_name}\" is not supported"))
+                Error::InvalidConfig(format!(
+                    "[segmentation] at line {line}: loss \"{loss_name}\" is not supported"
+                ))
             })?;
             if requested != expected {
-                let wanted = if classes == 1 { "bce/logistic" } else { "ce/softmax" };
+                let wanted = if classes == 1 {
+                    "bce/logistic"
+                } else {
+                    "ce/softmax"
+                };
                 return Err(Error::InvalidConfig(format!(
                     "[segmentation] at line {line}: classes={classes} uses {wanted}, not loss={loss_name}"
                 )));
@@ -2503,10 +2558,18 @@ fn parse_layer_kind(
         "omd_loss" | "omd" => {
             let line = section.line;
             let alias_int = |primary: &str, alias: &str, fallback: usize| -> Result<usize> {
-                if section.get(primary).is_some() { section.get_usize(primary, fallback) } else { section.get_usize(alias, fallback) }
+                if section.get(primary).is_some() {
+                    section.get_usize(primary, fallback)
+                } else {
+                    section.get_usize(alias, fallback)
+                }
             };
             let alias_float = |primary: &str, alias: &str, fallback: f32| -> Result<f32> {
-                if section.get(primary).is_some() { section.get_f32(primary, fallback) } else { section.get_f32(alias, fallback) }
+                if section.get(primary).is_some() {
+                    section.get_f32(primary, fallback)
+                } else {
+                    section.get_f32(alias, fallback)
+                }
             };
             let cls_normalizer = if section.get("lambda").is_some() {
                 section.get_f32("lambda", 0.03)?
@@ -2517,11 +2580,15 @@ fn parse_layer_kind(
             };
             let max_samples = section.get_usize("max_samples", 128)?;
             if max_samples < 2 {
-                return Err(Error::InvalidConfig(format!("[omd_loss] at line {line}: max_samples must be >= 2")));
+                return Err(Error::InvalidConfig(format!(
+                    "[omd_loss] at line {line}: max_samples must be >= 2"
+                )));
             }
             let margin = section.get_f32("margin", 0.5)?;
             if !(0.0..=2.0).contains(&margin) {
-                return Err(Error::InvalidConfig(format!("[omd_loss] at line {line}: margin must be in [0,2]")));
+                return Err(Error::InvalidConfig(format!(
+                    "[omd_loss] at line {line}: margin must be in [0,2]"
+                )));
             }
             LayerKind::OmdLoss(OmdLossSpec {
                 classes: section.get_usize("classes", 0)?,
@@ -2577,11 +2644,15 @@ fn parse_layer_kind(
             let line = section.line;
             let classes = section.get_usize("classes", 20)?;
             if classes == 0 {
-                return Err(Error::InvalidConfig(format!("[centernet] at line {line}: classes must be > 0")));
+                return Err(Error::InvalidConfig(format!(
+                    "[centernet] at line {line}: classes must be > 0"
+                )));
             }
             let max_boxes = section.get_usize("max", 200)?;
             if max_boxes == 0 {
-                return Err(Error::InvalidConfig(format!("[centernet] at line {line}: max must be > 0")));
+                return Err(Error::InvalidConfig(format!(
+                    "[centernet] at line {line}: max must be > 0"
+                )));
             }
             LayerKind::CenterNet(CenterNetSpec {
                 classes,
@@ -2617,8 +2688,13 @@ fn parse_layer_kind(
         "vit" => {
             let line = section.line;
             for unsupported in [
-                "flash_attention", "flash_attn", "vc_attention", "vc",
-                "vc_expcast", "expcast", "vc_perm",
+                "flash_attention",
+                "flash_attn",
+                "vc_attention",
+                "vc",
+                "vc_expcast",
+                "expcast",
+                "vc_perm",
             ] {
                 if section.get(unsupported).is_some() {
                     return Err(Error::InvalidConfig(format!(
@@ -2643,16 +2719,22 @@ fn parse_layer_kind(
             let has_ratio = section.get("ffn_ratio").is_some();
             let has_mlp = section.get("mlp_dim").is_some();
             let ffn_ratio = section.get_usize("ffn_ratio", 4)?;
-            let ratio_mlp = dim
-                .checked_mul(ffn_ratio)
-                .ok_or_else(|| Error::InvalidConfig(format!("[vit] at line {line}: dim * ffn_ratio overflows")))?;
+            let ratio_mlp = dim.checked_mul(ffn_ratio).ok_or_else(|| {
+                Error::InvalidConfig(format!("[vit] at line {line}: dim * ffn_ratio overflows"))
+            })?;
             let mlp_dim = section.get_usize("mlp_dim", ratio_mlp)?;
             if has_ratio && has_mlp && mlp_dim != ratio_mlp {
                 return Err(Error::InvalidConfig(format!(
                     "[vit] at line {line} has conflicting ffn_ratio={ffn_ratio} and mlp_dim={mlp_dim} for dim={dim}"
                 )));
             }
-            if dim == 0 || heads == 0 || dim % heads != 0 || patch_size == 0 || patch_stride == 0 || mlp_dim == 0 {
+            if dim == 0
+                || heads == 0
+                || dim % heads != 0
+                || patch_size == 0
+                || patch_stride == 0
+                || mlp_dim == 0
+            {
                 return Err(Error::InvalidConfig(format!(
                     "[vit] at line {line}: dim={dim}, heads={heads}, patch_size={patch_size}, patch_stride={patch_stride}, mlp_dim={mlp_dim} invalid"
                 )));
@@ -2664,12 +2746,20 @@ fn parse_layer_kind(
                 .height
                 .checked_add(twice_pad)
                 .and_then(|v| v.checked_sub(patch_size))
-                .ok_or_else(|| Error::InvalidConfig(format!("[vit] at line {line}: input height is too small for the patch")))?;
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "[vit] at line {line}: input height is too small for the patch"
+                    ))
+                })?;
             let effective_w = current
                 .width
                 .checked_add(twice_pad)
                 .and_then(|v| v.checked_sub(patch_size))
-                .ok_or_else(|| Error::InvalidConfig(format!("[vit] at line {line}: input width is too small for the patch")))?;
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "[vit] at line {line}: input width is too small for the patch"
+                    ))
+                })?;
             if effective_h % patch_stride != 0 || effective_w % patch_stride != 0 {
                 return Err(Error::InvalidConfig(format!(
                     "[vit] at line {line}: effective patch extents {effective_w}x{effective_h} must be divisible by patch_stride={patch_stride}"
@@ -2679,17 +2769,21 @@ fn parse_layer_kind(
             let learned_pos_embed = match pos_embed.as_str() {
                 "learned" | "absolute" => true,
                 "sinusoidal" | "2d_sinusoidal" | "simple" => false,
-                _ => return Err(Error::InvalidConfig(format!(
-                    "[vit] at line {line}: pos_embed={pos_embed} must be learned or sinusoidal"
-                ))),
+                _ => {
+                    return Err(Error::InvalidConfig(format!(
+                        "[vit] at line {line}: pos_embed={pos_embed} must be learned or sinusoidal"
+                    )));
+                }
             };
             let pos_init = section.get_str("pos_init", "random").to_ascii_lowercase();
             let pos_init_zero = match pos_init.as_str() {
                 "random" | "small_random" => false,
                 "zero" | "zeros" => true,
-                _ => return Err(Error::InvalidConfig(format!(
-                    "[vit] at line {line}: pos_init={pos_init} must be random or zero"
-                ))),
+                _ => {
+                    return Err(Error::InvalidConfig(format!(
+                        "[vit] at line {line}: pos_init={pos_init} must be random or zero"
+                    )));
+                }
             };
             let activation = Activation::parse(&section.get_str("activation", "gelu"));
             if let Activation::Other(ref other) = activation {
@@ -2706,12 +2800,14 @@ fn parse_layer_kind(
                 section.get_usize("msa_block", 16)?
             } else {
                 section.get_usize("msa_block_size", 16)?
-            }.max(1);
+            }
+            .max(1);
             let msa_topk = if section.get("msa_topk").is_some() {
                 section.get_usize("msa_topk", 4)?
             } else {
                 section.get_usize("msa_top_blocks", 4)?
-            }.max(1);
+            }
+            .max(1);
             LayerKind::Vit(VitSpec {
                 dim,
                 patch_size,
@@ -2735,11 +2831,15 @@ fn parse_layer_kind(
             let line = section.line;
             let hidden = section.get_usize("hidden", LAYA_SCORER_HIDDEN)?;
             if hidden == 0 {
-                return Err(Error::InvalidConfig(format!("[laya_scorer] at line {line}: hidden must be > 0")));
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_scorer] at line {line}: hidden must be > 0"
+                )));
             }
             let max_options = section.get_usize("max_options", current.width)?;
             if max_options == 0 {
-                return Err(Error::InvalidConfig(format!("[laya_scorer] at line {line}: max_options must be > 0")));
+                return Err(Error::InvalidConfig(format!(
+                    "[laya_scorer] at line {line}: max_options must be > 0"
+                )));
             }
             if current.channels != hidden {
                 return Err(Error::InvalidConfig(format!(
@@ -2831,7 +2931,7 @@ fn parse_layer_kind(
                 other => {
                     return Err(Error::InvalidConfig(format!(
                         "[laya_loss] at line {line}: mode={other} must be ce or rlcd"
-                    )))
+                    )));
                 }
             };
             if per_sample != max_options {
@@ -3002,8 +3102,8 @@ fn parse_layer_kind(
             };
             // `temperature` is the modern key; `gate_temperature` is the name
             // used by the shipped cfg and is what C++ falls back to.
-            let temperature = section
-                .get_f32("temperature", section.get_f32("gate_temperature", 1.0)?)?;
+            let temperature =
+                section.get_f32("temperature", section.get_f32("gate_temperature", 1.0)?)?;
             LayerKind::Moe(MoeSpec {
                 experts,
                 top_k,
@@ -3016,7 +3116,11 @@ fn parse_layer_kind(
                     size,
                     stride_x,
                     stride_y,
-                    dilation: if size == 1 { 1 } else { section.get_usize("dilation", 1)? },
+                    dilation: if size == 1 {
+                        1
+                    } else {
+                        section.get_usize("dilation", 1)?
+                    },
                     padding,
                     groups: section.get_usize("groups", 1)?.max(1),
                     share_index: None,
@@ -3098,7 +3202,12 @@ fn infer_output_shape(
             Ok(output)
         }
         LayerKind::Deconvolutional(spec) => {
-            if spec.filters == 0 || spec.size == 0 || spec.stride == 0 || current.width == 0 || current.height == 0 {
+            if spec.filters == 0
+                || spec.size == 0
+                || spec.stride == 0
+                || current.width == 0
+                || current.height == 0
+            {
                 return Err(Error::InvalidConfig(format!(
                     "deconvolutional layer #{layer_index} needs filters/size/stride > 0 and a non-empty input"
                 )));
@@ -3235,7 +3344,12 @@ fn infer_output_shape(
                     "[laya_encoder] layer #{layer_index} requires seq_len > 0"
                 )));
             }
-            Ok(TensorShape::new(current.width, 1, spec.hidden, current.batch))
+            Ok(TensorShape::new(
+                current.width,
+                1,
+                spec.hidden,
+                current.batch,
+            ))
         }
         // `[laya_head]` is a pre-norm transformer over `[batch, hidden+mask, 1, T]`.
         LayerKind::LayaHead(spec) => {
@@ -3251,21 +3365,44 @@ fn infer_output_shape(
                     "[laya_head] layer #{layer_index} requires seq_len > 0"
                 )));
             }
-            Ok(TensorShape::new(current.width, 1, spec.hidden, current.batch))
+            Ok(TensorShape::new(
+                current.width,
+                1,
+                spec.hidden,
+                current.batch,
+            ))
         }
         LayerKind::Vit(spec) => {
             let line = layer_index;
             let twice_pad = spec.patch_pad.checked_mul(2).ok_or_else(|| {
                 Error::InvalidConfig(format!("[vit] layer #{line}: patch padding overflows"))
             })?;
-            let eff_h = current.height.checked_add(twice_pad)
+            let eff_h = current
+                .height
+                .checked_add(twice_pad)
                 .and_then(|v| v.checked_sub(spec.patch_size))
-                .ok_or_else(|| Error::InvalidConfig(format!("[vit] layer #{line}: invalid patch height geometry")))?;
-            let eff_w = current.width.checked_add(twice_pad)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "[vit] layer #{line}: invalid patch height geometry"
+                    ))
+                })?;
+            let eff_w = current
+                .width
+                .checked_add(twice_pad)
                 .and_then(|v| v.checked_sub(spec.patch_size))
-                .ok_or_else(|| Error::InvalidConfig(format!("[vit] layer #{line}: invalid patch width geometry")))?;
-            if spec.patch_stride == 0 || eff_h % spec.patch_stride != 0 || eff_w % spec.patch_stride != 0 {
-                return Err(Error::InvalidConfig(format!("[vit] layer #{line}: patch geometry is not divisible by patch_stride={}", spec.patch_stride)));
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "[vit] layer #{line}: invalid patch width geometry"
+                    ))
+                })?;
+            if spec.patch_stride == 0
+                || eff_h % spec.patch_stride != 0
+                || eff_w % spec.patch_stride != 0
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "[vit] layer #{line}: patch geometry is not divisible by patch_stride={}",
+                    spec.patch_stride
+                )));
             }
             Ok(TensorShape::new(
                 eff_w / spec.patch_stride + 1,
@@ -3274,10 +3411,8 @@ fn infer_output_shape(
                 current.batch,
             ))
         }
-        | LayerKind::Yolox(_)
-        | LayerKind::Ppyoloe(_)
-        | LayerKind::Yolonas(_) => Ok(current),
-        | LayerKind::CenterNet(_) => Ok(current),
+        LayerKind::Yolox(_) | LayerKind::Ppyoloe(_) | LayerKind::Yolonas(_) => Ok(current),
+        LayerKind::CenterNet(_) => Ok(current),
         // `[laya_scorer]` turns `[batch, hidden, 1, max_options]` into
         // `[batch, 1, 1, max_options]`.
         LayerKind::LayaScorer(spec) => Ok(TensorShape::new(spec.max_options, 1, 1, current.batch)),
@@ -3324,7 +3459,12 @@ fn infer_output_shape(
                     "[laya_marker_gather] layer #{layer_index}: input A sequence length must be > 0"
                 )));
             }
-            Ok(TensorShape::new(spec.max_options, 1, spec.hidden, current.batch))
+            Ok(TensorShape::new(
+                spec.max_options,
+                1,
+                spec.hidden,
+                current.batch,
+            ))
         }
         // `[laya_act_head]` reads three source shapes and emits `n_act` logits.
         LayerKind::LayaActHead(spec) => {
@@ -3456,8 +3596,18 @@ fn infer_output_shape(
         // `[moe_convolutional]`'s output shape is exactly its experts': the
         // blend happens per image, so the spatial size is unchanged.
         LayerKind::Moe(spec) => Ok(TensorShape::new(
-            conv_dim(current.width, spec.expert.padding, spec.expert.size, spec.expert.stride_x),
-            conv_dim(current.height, spec.expert.padding, spec.expert.size, spec.expert.stride_y),
+            conv_dim(
+                current.width,
+                spec.expert.padding,
+                spec.expert.size,
+                spec.expert.stride_x,
+            ),
+            conv_dim(
+                current.height,
+                spec.expert.padding,
+                spec.expert.size,
+                spec.expert.stride_y,
+            ),
             spec.expert.filters,
             current.batch,
         )),
@@ -3537,11 +3687,15 @@ fn require_usize(section: &RawSection, key: &str) -> Result<usize> {
         .trim()
         .parse::<usize>()
         .map_err(|_| {
-            Error::InvalidConfig(format!("[{}] at line {}: invalid {key}", section.name, section.line))
+            Error::InvalidConfig(format!(
+                "[{}] at line {}: invalid {key}",
+                section.name, section.line
+            ))
         })
 }
 
-fn resolve_relative_layer(layer_index: usize, raw_index: isize) -> Result<usize> {    let absolute = if raw_index < 0 {
+fn resolve_relative_layer(layer_index: usize, raw_index: isize) -> Result<usize> {
+    let absolute = if raw_index < 0 {
         layer_index
             .checked_add_signed(raw_index)
             .ok_or(Error::InvalidRoute {
@@ -3691,16 +3845,20 @@ fn parse_modern_yolo_spec(section: &RawSection) -> Result<ModernYoloSpec> {
         other => {
             return Err(Error::InvalidConfig(format!(
                 "[{other}] at line {line} is not an anchor-free modern head"
-            )))
+            )));
         }
     };
     let classes = section.get_usize("classes", 20)?;
     if classes == 0 {
-        return Err(Error::InvalidConfig(format!("[yolox] at line {line}: classes must be > 0")));
+        return Err(Error::InvalidConfig(format!(
+            "[yolox] at line {line}: classes must be > 0"
+        )));
     }
     let max_boxes = section.get_usize("max", 200)?;
     if max_boxes == 0 {
-        return Err(Error::InvalidConfig(format!("[yolox] at line {line}: max must be > 0")));
+        return Err(Error::InvalidConfig(format!(
+            "[yolox] at line {line}: max must be > 0"
+        )));
     }
     Ok(ModernYoloSpec {
         kind,
@@ -3736,8 +3894,11 @@ mod tests {
         let default = build(
             "[net]\nwidth=8\nheight=6\nchannels=3\n\
              [vit]\ndim=8\nheads=2\npatch_size=2\npatch_stride=2\n",
-        ).unwrap();
-        let LayerKind::Vit(spec) = &default.layers[0].kind else { panic!("expected Vit") };
+        )
+        .unwrap();
+        let LayerKind::Vit(spec) = &default.layers[0].kind else {
+            panic!("expected Vit")
+        };
         assert_eq!((spec.dim, spec.mlp_dim, spec.ffn_ratio), (8, 32, 4));
         assert!(spec.learned_pos_embed && !spec.pos_init_zero);
         assert_eq!(spec.activation, super::Activation::Gelu);
@@ -3749,13 +3910,22 @@ mod tests {
              [vit]\nfilters=8\ndim=8\nheads=2\npatch_size=2\npatch_stride=2\n\
              ffn_ratio=3\nmlp_dim=24\npos_embed=simple\npos_init=zeros\nactivation=relu\n\
              minimax_sparse_attention=1\nmsa_block_size=2\nmsa_top_blocks=1\n",
-        ).unwrap();
-        let LayerKind::Vit(spec) = &aliases.layers[0].kind else { panic!("expected Vit") };
+        )
+        .unwrap();
+        let LayerKind::Vit(spec) = &aliases.layers[0].kind else {
+            panic!("expected Vit")
+        };
         assert_eq!((spec.dim, spec.mlp_dim, spec.ffn_ratio), (8, 24, 3));
         assert!(!spec.learned_pos_embed && spec.pos_init_zero);
         assert!(spec.msa_enabled);
         assert_eq!((spec.msa_block_size, spec.msa_topk), (2, 1));
-        assert_eq!((aliases.layers[0].output_shape.width, aliases.layers[0].output_shape.height), (4, 3));
+        assert_eq!(
+            (
+                aliases.layers[0].output_shape.width,
+                aliases.layers[0].output_shape.height
+            ),
+            (4, 3)
+        );
     }
 
     #[test]
@@ -3763,24 +3933,69 @@ mod tests {
         let net = build(
             "[net]\nwidth=8\nheight=6\nchannels=3\n\
              [vit]\ndim=8\nheads=2\npatch_size=2\npatch_stride=2\nmlp_dim=32\n",
-        ).unwrap();
+        )
+        .unwrap();
         let layer_weights = net.layers[0].weights().expect("vit has weights");
-        let names: Vec<&str> = layer_weights.entries.iter().map(|entry| entry.array.name()).collect();
-        assert_eq!(names, [
-            "vit_patch_embed", "vit_patch_bias", "biases", "vit_ln1_gamma", "vit_ln1_beta",
-            "weights", "vit_wo", "vit_wo_bias", "vit_ln2_gamma", "vit_ln2_beta",
-            "vit_ffn_w1", "vit_ffn_b1", "vit_ffn_w2", "vit_ffn_b2", "vit_pos_embed", "scales",
-        ]);
-        assert_eq!(layer_weights.entries.iter().map(|entry| entry.len).collect::<Vec<_>>(), [
-            96, 8, 24, 8, 8, 192, 64, 8, 8, 8, 256, 32, 256, 8, 96, 12,
-        ]);
-        assert_eq!(layer_weights.parameter_count(), crate::vit::vit_blob_float_count(
-            &crate::vit::VitGeometry {
-                batch: 1, channels: 3, height: 6, width: 8, patch_size: 2, patch_stride: 2,
-                patch_pad: 0, hidden: 8, heads: 2, mlp_dim: 32, ln_eps: 1e-5,
-                activation: super::Activation::Gelu, learned_pos_embed: true, pos_init_zero: false, msa: None,
-            }, 3, 4, true
-        ).unwrap());
+        let names: Vec<&str> = layer_weights
+            .entries
+            .iter()
+            .map(|entry| entry.array.name())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "vit_patch_embed",
+                "vit_patch_bias",
+                "biases",
+                "vit_ln1_gamma",
+                "vit_ln1_beta",
+                "weights",
+                "vit_wo",
+                "vit_wo_bias",
+                "vit_ln2_gamma",
+                "vit_ln2_beta",
+                "vit_ffn_w1",
+                "vit_ffn_b1",
+                "vit_ffn_w2",
+                "vit_ffn_b2",
+                "vit_pos_embed",
+                "scales",
+            ]
+        );
+        assert_eq!(
+            layer_weights
+                .entries
+                .iter()
+                .map(|entry| entry.len)
+                .collect::<Vec<_>>(),
+            [96, 8, 24, 8, 8, 192, 64, 8, 8, 8, 256, 32, 256, 8, 96, 12,]
+        );
+        assert_eq!(
+            layer_weights.parameter_count(),
+            crate::vit::vit_blob_float_count(
+                &crate::vit::VitGeometry {
+                    batch: 1,
+                    channels: 3,
+                    height: 6,
+                    width: 8,
+                    patch_size: 2,
+                    patch_stride: 2,
+                    patch_pad: 0,
+                    hidden: 8,
+                    heads: 2,
+                    mlp_dim: 32,
+                    ln_eps: 1e-5,
+                    activation: super::Activation::Gelu,
+                    learned_pos_embed: true,
+                    pos_init_zero: false,
+                    msa: None,
+                },
+                3,
+                4,
+                true
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -3804,14 +4019,19 @@ mod tests {
             "dim=8\nheads=2\nvc_perm=spatial",
         ] {
             let err = build(&cfg(invalid)).expect_err(invalid).to_string();
-            assert!(err.contains("vit") || err.contains("activation"), "{invalid}: {err}");
+            assert!(
+                err.contains("vit") || err.contains("activation"),
+                "{invalid}: {err}"
+            );
         }
     }
 
     #[test]
     fn unknown_activation_is_a_config_error_not_identity() {
         let cfg = |act: &str| {
-            format!("[net]\nwidth=2\nheight=2\nchannels=1\n[convolutional]\nfilters=1\nsize=1\nactivation={act}\n")
+            format!(
+                "[net]\nwidth=2\nheight=2\nchannels=1\n[convolutional]\nfilters=1\nsize=1\nactivation={act}\n"
+            )
         };
         for ok in [
             "linear",
@@ -3849,17 +4069,26 @@ mod tests {
              [maxpool]\nsize=2\nstride=2\nmaxpool_zero_nonmax=1\n",
         )
         .expect("builds");
-        let LayerKind::MaxPool(depth) = &net.layers[0].kind else { panic!() };
+        let LayerKind::MaxPool(depth) = &net.layers[0].kind else {
+            panic!()
+        };
         assert!(depth.depth);
         // depth pooling keeps w x h and sets the channels to out_channels
         let s = net.layers[0].output_shape;
         assert_eq!((s.width, s.height, s.channels), (4, 6, 2));
-        let LayerKind::MaxPool(plain) = &net.layers[1].kind else { panic!() };
+        let LayerKind::MaxPool(plain) = &net.layers[1].kind else {
+            panic!()
+        };
         assert!(plain.zero_nonmax && !plain.depth);
         let s = net.layers[1].output_shape;
         assert_eq!((s.width, s.height, s.channels), (2, 3, 2)); // out_channels ignored without depth
         // out_channels larger than the input channels is rejected
-        assert!(build("[net]\nwidth=4\nheight=4\nchannels=2\n[maxpool]\nmaxpool_depth=1\nout_channels=3\n").is_err());
+        assert!(
+            build(
+                "[net]\nwidth=4\nheight=4\nchannels=2\n[maxpool]\nmaxpool_depth=1\nout_channels=3\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3899,17 +4128,24 @@ mod tests {
             "from=-2\nstart=0\nend=2\naxis=0", // only axis 1
             "from=5\nstart=0\nend=1",          // not a previous layer
         ] {
-            let cfg = format!("[net]\nwidth=4\nheight=3\nchannels=2\n[convolutional]\nfilters=6\nsize=1\n[convolutional]\nfilters=5\nsize=1\n[channel_slice]\n{bad}\n");
+            let cfg = format!(
+                "[net]\nwidth=4\nheight=3\nchannels=2\n[convolutional]\nfilters=6\nsize=1\n[convolutional]\nfilters=5\nsize=1\n[channel_slice]\n{bad}\n"
+            );
             assert!(build(&cfg).is_err(), "{bad}");
         }
     }
 
     #[test]
     fn channel_shuffle_requires_divisible_channels() {
-        let ok = build("[net]\nwidth=2\nheight=2\nchannels=6\n[channel_shuffle]\ngroups=3\n").unwrap();
+        let ok =
+            build("[net]\nwidth=2\nheight=2\nchannels=6\n[channel_shuffle]\ngroups=3\n").unwrap();
         assert_eq!(ok.layers[0].output_shape.channels, 6);
-        assert!(build("[net]\nwidth=2\nheight=2\nchannels=6\n[channel_shuffle]\ngroups=4\n").is_err());
-        assert!(build("[net]\nwidth=2\nheight=2\nchannels=6\n[channel_shuffle]\ngroups=0\n").is_err());
+        assert!(
+            build("[net]\nwidth=2\nheight=2\nchannels=6\n[channel_shuffle]\ngroups=4\n").is_err()
+        );
+        assert!(
+            build("[net]\nwidth=2\nheight=2\nchannels=6\n[channel_shuffle]\ngroups=0\n").is_err()
+        );
         // C++ default groups=2
         assert!(build("[net]\nwidth=2\nheight=2\nchannels=6\n[channel_shuffle]\n").is_ok());
     }
@@ -3928,10 +4164,21 @@ mod tests {
         assert_eq!(w.entries[0].len, 4);
         assert_eq!(w.entries[1].len, 2 * 4 * 9);
         // C++ default activation is logistic; pad/padding are rejected
-        let net = build("[net]\nwidth=3\nheight=2\nchannels=2\n[deconvolutional]\nfilters=1\n").unwrap();
-        assert!(matches!(&net.layers[0].kind, LayerKind::Deconvolutional(s) if s.activation == super::Activation::Logistic));
-        assert!(build("[net]\nwidth=3\nheight=2\nchannels=2\n[deconvolutional]\nfilters=1\npad=1\n").is_err());
-        assert!(build("[net]\nwidth=3\nheight=2\nchannels=2\n[deconvolutional]\nfilters=1\npadding=1\n").is_err());
+        let net =
+            build("[net]\nwidth=3\nheight=2\nchannels=2\n[deconvolutional]\nfilters=1\n").unwrap();
+        assert!(
+            matches!(&net.layers[0].kind, LayerKind::Deconvolutional(s) if s.activation == super::Activation::Logistic)
+        );
+        assert!(
+            build("[net]\nwidth=3\nheight=2\nchannels=2\n[deconvolutional]\nfilters=1\npad=1\n")
+                .is_err()
+        );
+        assert!(
+            build(
+                "[net]\nwidth=3\nheight=2\nchannels=2\n[deconvolutional]\nfilters=1\npadding=1\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3941,7 +4188,9 @@ mod tests {
              [cost]\ntype=masked\nscale=0.25\n[logistic]\n[regression]\nscale=3\n",
         )
         .unwrap();
-        assert!(matches!(&net.layers[1].kind, LayerKind::Cost { kind, scale } if kind == "masked" && *scale == 0.25));
+        assert!(
+            matches!(&net.layers[1].kind, LayerKind::Cost { kind, scale } if kind == "masked" && *scale == 0.25)
+        );
         assert!(matches!(net.layers[2].kind, LayerKind::Logistic));
         assert!(matches!(&net.layers[3].kind, LayerKind::Regression(r) if r.scale == 3.0));
         assert_eq!(net.layers[3].output_shape, net.layers[2].output_shape);
@@ -3950,9 +4199,23 @@ mod tests {
     #[test]
     fn jev_ce_keys_follow_cpp_defaults_and_validation() {
         let base = "[net]\nwidth=1\nheight=1\nchannels=12\n[connected]\noutput=12\n";
-        let net = build(&format!("{base}[jev_ce]\ngroups=4\ntemp=2\nsmoothing=0.1\nlayout=cm\n")).unwrap();
-        let LayerKind::JevCe(s) = &net.layers[1].kind else { panic!() };
-        assert_eq!((s.groups, s.candidates, s.temperature, s.label_smoothing, s.channel_major), (4, 3, 2.0, 0.1, true));
+        let net = build(&format!(
+            "{base}[jev_ce]\ngroups=4\ntemp=2\nsmoothing=0.1\nlayout=cm\n"
+        ))
+        .unwrap();
+        let LayerKind::JevCe(s) = &net.layers[1].kind else {
+            panic!()
+        };
+        assert_eq!(
+            (
+                s.groups,
+                s.candidates,
+                s.temperature,
+                s.label_smoothing,
+                s.channel_major
+            ),
+            (4, 3, 2.0, 0.1, true)
+        );
         assert!(s.normalize && s.ignore_empty && s.scale == 1.0);
         assert_eq!(net.layers[1].output_shape, net.layers[0].output_shape);
         assert!(build(&format!("{base}[jev_ce]\n")).is_err()); // default groups=81 does not divide 12
@@ -3970,13 +4233,31 @@ mod tests {
         // gate_ramp_iters=2000, gate_max_compensation=10.
         let base = "[net]\nwidth=2\nheight=3\nchannels=5\n[convolutional]\nfilters=5\nsize=1\n";
         let net = build(&format!("{base}[segmentation]\n")).unwrap();
-        let LayerKind::Segmentation(s) = &net.layers[1].kind else { panic!() };
+        let LayerKind::Segmentation(s) = &net.layers[1].kind else {
+            panic!()
+        };
         assert_eq!(s.classes, 2);
         assert_eq!(s.loss, SegmentationLoss::SoftmaxCe);
         assert_eq!(s.max_delta, f32::MAX, "FLT_MAX means no clipping");
-        assert_eq!((s.delta_normalizer, s.cls_normalizer, s.lambda_ce, s.ce_normalizer), (1.0, 1.0, 1.0, 1.0));
+        assert_eq!(
+            (
+                s.delta_normalizer,
+                s.cls_normalizer,
+                s.lambda_ce,
+                s.ce_normalizer
+            ),
+            (1.0, 1.0, 1.0, 1.0)
+        );
         assert!(!s.gate_enabled);
-        assert_eq!((s.gate_t_correct, s.gate_warmup_iters, s.gate_ramp_iters, s.gate_max_compensation), (0.9, 1000, 2000, 10.0));
+        assert_eq!(
+            (
+                s.gate_t_correct,
+                s.gate_warmup_iters,
+                s.gate_ramp_iters,
+                s.gate_max_compensation
+            ),
+            (0.9, 1000, 2000, 10.0)
+        );
         assert_eq!(s.temperature, 1.0, "C++ never reads a temperature key");
         // The layer has no weights and passes its shape through unchanged.
         assert!(net.layers[1].weights().is_none());
@@ -3989,15 +4270,30 @@ mod tests {
              gate_ramp_iters=10\ngate_max_compensation=3\nloss=softmax\n"
         ))
         .unwrap();
-        let LayerKind::Segmentation(s) = &net.layers[1].kind else { panic!() };
+        let LayerKind::Segmentation(s) = &net.layers[1].kind else {
+            panic!()
+        };
         assert_eq!(s.classes, 3);
-        assert_eq!((s.max_delta, s.delta_normalizer, s.cls_normalizer), (2.5, 0.5, 2.0));
+        assert_eq!(
+            (s.max_delta, s.delta_normalizer, s.cls_normalizer),
+            (2.5, 0.5, 2.0)
+        );
         assert_eq!((s.lambda_ce, s.ce_normalizer), (0.25, 4.0));
         assert!(s.gate_enabled);
-        assert_eq!((s.gate_t_correct, s.gate_warmup_iters, s.gate_ramp_iters, s.gate_max_compensation), (0.5, 5, 10, 3.0));
+        assert_eq!(
+            (
+                s.gate_t_correct,
+                s.gate_warmup_iters,
+                s.gate_ramp_iters,
+                s.gate_max_compensation
+            ),
+            (0.5, 5, 10, 3.0)
+        );
         // `loss_normalizer_ce` is the C++ fallback spelling of `ce_normalizer`.
         let net = build(&format!("{base}[segmentation]\nloss_normalizer_ce=7\n")).unwrap();
-        let LayerKind::Segmentation(s) = &net.layers[1].kind else { panic!() };
+        let LayerKind::Segmentation(s) = &net.layers[1].kind else {
+            panic!()
+        };
         assert_eq!(s.ce_normalizer, 7.0);
         // `segmenter` is the C++ alias of `segmentation`.
         let net = build(&format!("{base}[segmenter]\n")).unwrap();
@@ -4005,10 +4301,15 @@ mod tests {
 
         // classes=1 selects logistic BCE and rejects the softmax spelling.
         let net = build(&format!("[net]\nwidth=2\nheight=2\nchannels=1\n[convolutional]\nfilters=1\nsize=1\n[segmentation]\nclasses=1\n")).unwrap();
-        let LayerKind::Segmentation(s) = &net.layers[1].kind else { panic!() };
+        let LayerKind::Segmentation(s) = &net.layers[1].kind else {
+            panic!()
+        };
         assert_eq!(s.loss, SegmentationLoss::Bce);
         let one = "[net]\nwidth=2\nheight=2\nchannels=1\n[convolutional]\nfilters=1\nsize=1\n[segmentation]\nclasses=1\n";
-        assert!(build(&format!("{one}loss=ce\n")).is_err(), "classes=1 must not take loss=ce");
+        assert!(
+            build(&format!("{one}loss=ce\n")).is_err(),
+            "classes=1 must not take loss=ce"
+        );
         assert!(build(&format!("{one}loss=softmax\n")).is_err());
         assert!(build(&format!("{one}loss=logistic\n")).is_ok());
         // classes=2 must not take the logistic spelling.
@@ -4030,7 +4331,10 @@ mod tests {
             "gate_t_correct=1.5",
             "gate_max_compensation=0.5",
         ] {
-            assert!(build(&format!("{base}[segmentation]\n{bad}\n")).is_err(), "accepted {bad}");
+            assert!(
+                build(&format!("{base}[segmentation]\n{bad}\n")).is_err(),
+                "accepted {bad}"
+            );
         }
     }
 
@@ -4039,13 +4343,23 @@ mod tests {
         // C++ `parse_yolox_section`: classes=20, max=200, jitter=0.2, resize=1.0.
         let base = "[net]\nwidth=4\nheight=4\nchannels=7\n[convolutional]\nfilters=7\nsize=1\n";
         let net = build(&format!("{base}[yolox]\n")).unwrap();
-        let LayerKind::Yolox(s) = &net.layers[1].kind else { panic!() };
-        assert_eq!((s.classes, s.max_boxes, s.jitter, s.resize), (20, 200, 0.2, 1.0));
+        let LayerKind::Yolox(s) = &net.layers[1].kind else {
+            panic!()
+        };
+        assert_eq!(
+            (s.classes, s.max_boxes, s.jitter, s.resize),
+            (20, 200, 0.2, 1.0)
+        );
         assert!(net.layers[1].weights().is_none(), "the head has no weights");
         assert_eq!(net.layers[1].output_shape, net.layers[0].output_shape);
 
-        let net = build(&format!("{base}[yolox]\nclasses=3\nmax=64\njitter=0.1\nresize=1.5\n")).unwrap();
-        let LayerKind::Yolox(s) = &net.layers[1].kind else { panic!() };
+        let net = build(&format!(
+            "{base}[yolox]\nclasses=3\nmax=64\njitter=0.1\nresize=1.5\n"
+        ))
+        .unwrap();
+        let LayerKind::Yolox(s) = &net.layers[1].kind else {
+            panic!()
+        };
         assert_eq!((s.classes, s.max_boxes), (3, 64));
         assert!((s.jitter - 0.1).abs() < 1e-6 && (s.resize - 1.5).abs() < 1e-6);
         assert!(build(&format!("{base}[yolox]\nclasses=0\n")).is_err());
@@ -4061,13 +4375,27 @@ mod tests {
         // max_delta=10, delta_normalizer=1.
         let base = "[net]\nwidth=4\nheight=4\nchannels=3\n[convolutional]\nfilters=3\nsize=1\n";
         let net = build(&format!("{base}[centernet]\n")).unwrap();
-        let LayerKind::CenterNet(s) = &net.layers[1].kind else { panic!() };
+        let LayerKind::CenterNet(s) = &net.layers[1].kind else {
+            panic!()
+        };
         assert_eq!((s.classes, s.max_boxes), (20, 200));
-        assert_eq!((s.center_min_radius, s.peak_nms, s.anisotropic_gaussian), (1, 1, 1));
-        assert_eq!((s.small_threshold, s.small_ref_size, s.small_boost), (8.0, 32.0, 8.0));
+        assert_eq!(
+            (s.center_min_radius, s.peak_nms, s.anisotropic_gaussian),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            (s.small_threshold, s.small_ref_size, s.small_boost),
+            (8.0, 32.0, 8.0)
+        );
         assert_eq!((s.scale_min_px, s.scale_max_px), (0.0, f32::MAX));
-        assert_eq!((s.gaussian_iou, s.focal_alpha, s.focal_beta), (0.7, 2.0, 4.0));
-        assert_eq!((s.hm_normalizer, s.wh_normalizer, s.off_normalizer), (1.0, 0.1, 1.0));
+        assert_eq!(
+            (s.gaussian_iou, s.focal_alpha, s.focal_beta),
+            (0.7, 2.0, 4.0)
+        );
+        assert_eq!(
+            (s.hm_normalizer, s.wh_normalizer, s.off_normalizer),
+            (1.0, 0.1, 1.0)
+        );
         assert_eq!((s.max_delta, s.delta_normalizer), (10.0, 1.0));
         assert!(net.layers[1].weights().is_none(), "the head has no weights");
         assert_eq!(net.layers[1].output_shape, net.layers[0].output_shape);
@@ -4080,11 +4408,36 @@ mod tests {
              delta_normalizer=0.75\n"
         ))
         .unwrap();
-        let LayerKind::CenterNet(s) = &net.layers[1].kind else { panic!() };
-        assert_eq!((s.classes, s.max_boxes, s.center_min_radius, s.peak_nms, s.anisotropic_gaussian), (3, 64, 2, 0, 0));
-        assert_eq!((s.small_ref_size, s.small_boost, s.scale_min_px, s.scale_max_px), (16.0, 4.0, 4.0, 64.0));
-        assert_eq!((s.gaussian_iou, s.focal_alpha, s.focal_beta), (0.5, 1.5, 3.0));
-        assert_eq!((s.hm_normalizer, s.wh_normalizer, s.off_normalizer), (0.5, 0.25, 2.0));
+        let LayerKind::CenterNet(s) = &net.layers[1].kind else {
+            panic!()
+        };
+        assert_eq!(
+            (
+                s.classes,
+                s.max_boxes,
+                s.center_min_radius,
+                s.peak_nms,
+                s.anisotropic_gaussian
+            ),
+            (3, 64, 2, 0, 0)
+        );
+        assert_eq!(
+            (
+                s.small_ref_size,
+                s.small_boost,
+                s.scale_min_px,
+                s.scale_max_px
+            ),
+            (16.0, 4.0, 4.0, 64.0)
+        );
+        assert_eq!(
+            (s.gaussian_iou, s.focal_alpha, s.focal_beta),
+            (0.5, 1.5, 3.0)
+        );
+        assert_eq!(
+            (s.hm_normalizer, s.wh_normalizer, s.off_normalizer),
+            (0.5, 0.25, 2.0)
+        );
         assert_eq!((s.max_delta, s.delta_normalizer), (5.0, 0.75));
 
         assert!(build(&format!("{base}[centernet]\nclasses=0\n")).is_err());
@@ -4095,12 +4448,23 @@ mod tests {
     fn the_modern_heads_take_reg_max_and_the_nested_object_keys() {
         let base = "[net]\nwidth=2\nheight=2\nchannels=70\n[convolutional]\nfilters=70\nsize=1\n";
         let net = build(&format!("{base}[ppyoloe]\nclasses=1\nreg_max=16\n")).unwrap();
-        let LayerKind::Ppyoloe(s) = &net.layers[1].kind else { panic!() };
+        let LayerKind::Ppyoloe(s) = &net.layers[1].kind else {
+            panic!()
+        };
         assert_eq!(s.kind, ModernYoloKind::Ppyoloe);
         assert_eq!(s.coords(), 4 * 17);
-        assert_eq!((s.min_object_cells, s.vfl_gamma), (0.0, 0.0), "both default off");
-        let net = build(&format!("{base}[yolonas]\nclasses=1\nreg_max=8\nmin_object_cells=2\nvfl_gamma=1.5\n")).unwrap();
-        let LayerKind::Yolonas(s) = &net.layers[1].kind else { panic!() };
+        assert_eq!(
+            (s.min_object_cells, s.vfl_gamma),
+            (0.0, 0.0),
+            "both default off"
+        );
+        let net = build(&format!(
+            "{base}[yolonas]\nclasses=1\nreg_max=8\nmin_object_cells=2\nvfl_gamma=1.5\n"
+        ))
+        .unwrap();
+        let LayerKind::Yolonas(s) = &net.layers[1].kind else {
+            panic!()
+        };
         assert_eq!(s.kind, ModernYoloKind::Yolonas);
         assert_eq!(s.coords(), 4 * 9);
         assert_eq!((s.min_object_cells, s.vfl_gamma), (2.0, 1.5));
@@ -4109,7 +4473,9 @@ mod tests {
             "[net]\nwidth=2\nheight=2\nchannels=7\n[convolutional]\nfilters=7\nsize=1\n[yolox]\nclasses=2\nreg_max=16\n",
         )
         .unwrap();
-        let LayerKind::Yolox(s) = &net.layers[1].kind else { panic!() };
+        let LayerKind::Yolox(s) = &net.layers[1].kind else {
+            panic!()
+        };
         assert_eq!(s.coords(), 4);
         // Each section reports its own name.
         assert_eq!(net.layers[1].kind.name(), "yolox");
@@ -4123,10 +4489,15 @@ mod tests {
         // cls_normalizer=1.0, max_delta=FLT_MAX, contrastive_neg_max=3.
         let base = "[net]\nwidth=1\nheight=1\nchannels=4\n[convolutional]\nfilters=4\nsize=1\n";
         let net = build(&format!("{base}[contrastive]\n")).unwrap();
-        let LayerKind::Contrastive(s) = &net.layers[1].kind else { panic!() };
+        let LayerKind::Contrastive(s) = &net.layers[1].kind else {
+            panic!()
+        };
         assert_eq!(s.classes, 1000);
         assert_eq!(s.yolo_layer, 0, "0 selects the classifier branch");
-        assert_eq!((s.temperature, s.cls_normalizer, s.max_delta), (1.0, 1.0, f32::MAX));
+        assert_eq!(
+            (s.temperature, s.cls_normalizer, s.max_delta),
+            (1.0, 1.0, f32::MAX)
+        );
         assert_eq!(s.contrastive_neg_max, 3);
         assert!(net.layers[1].weights().is_none());
         assert_eq!(net.layers[1].output_shape, net.layers[0].output_shape);
@@ -4136,10 +4507,20 @@ mod tests {
              max_delta=4\ncontrastive_neg_max=7\n"
         ))
         .unwrap();
-        let LayerKind::Contrastive(s) = &net.layers[1].kind else { panic!() };
+        let LayerKind::Contrastive(s) = &net.layers[1].kind else {
+            panic!()
+        };
         assert_eq!(s.classes, 3);
         assert_eq!(s.yolo_layer, -1, "a negative index is relative, as in C++");
-        assert_eq!((s.temperature, s.cls_normalizer, s.max_delta, s.contrastive_neg_max), (0.5, 2.0, 4.0, 7));
+        assert_eq!(
+            (
+                s.temperature,
+                s.cls_normalizer,
+                s.max_delta,
+                s.contrastive_neg_max
+            ),
+            (0.5, 2.0, 4.0, 7)
+        );
 
         // `[net] adversarial` switches the fallback label from `b / 2` to `b % 2`.
         let net = build(&format!(
@@ -4162,33 +4543,54 @@ mod tests {
         // background_samples=0, pool=0, eps=1e-6, max_delta=10.
         let base = "[net]\nwidth=2\nheight=2\nchannels=3\n[convolutional]\nfilters=3\nsize=1\n";
         let net = build(&format!("{base}[omd_loss]\n")).unwrap();
-        let LayerKind::OmdLoss(s) = &net.layers[1].kind else { panic!() };
+        let LayerKind::OmdLoss(s) = &net.layers[1].kind else {
+            panic!()
+        };
         assert_eq!((s.classes, s.max_boxes, s.truth_size), (0, 200, 6));
         assert_eq!((s.cls_normalizer, s.margin, s.max_delta), (0.03, 0.5, 10.0));
-        assert_eq!((s.positive_weight, s.negative_weight, s.background_weight), (1.0, 1.0, 1.0));
-        assert_eq!((s.small_threshold, s.small_boost, s.max_samples), (0.0, 1.0, 128));
+        assert_eq!(
+            (s.positive_weight, s.negative_weight, s.background_weight),
+            (1.0, 1.0, 1.0)
+        );
+        assert_eq!(
+            (s.small_threshold, s.small_boost, s.max_samples),
+            (0.0, 1.0, 128)
+        );
         assert_eq!((s.background_samples, s.pool, s.eps), (0, 0, 1e-6));
         assert!(!s.show_details);
-        assert!(net.layers[1].weights().is_none(), "the layer has no weights");
+        assert!(
+            net.layers[1].weights().is_none(),
+            "the layer has no weights"
+        );
         assert_eq!(net.layers[1].output_shape, net.layers[0].output_shape);
 
         // Primary key wins over its alias; the loss weight has three spellings.
-        for (keys, want) in [
-            ("max_boxes=7\nmax=9", 7usize),
-            ("max=9", 9),
-        ] {
+        for (keys, want) in [("max_boxes=7\nmax=9", 7usize), ("max=9", 9)] {
             let net = build(&format!("{base}[omd_loss]\n{keys}\n")).unwrap();
-            let LayerKind::OmdLoss(s) = &net.layers[1].kind else { panic!() };
+            let LayerKind::OmdLoss(s) = &net.layers[1].kind else {
+                panic!()
+            };
             assert_eq!(s.max_boxes, want, "{keys}");
         }
-        for (key, want) in [("lambda", 0.03f32), ("normalizer", 0.03), ("cls_normalizer", 0.03)] {
+        for (key, want) in [
+            ("lambda", 0.03f32),
+            ("normalizer", 0.03),
+            ("cls_normalizer", 0.03),
+        ] {
             let net = build(&format!("{base}[omd_loss]\n{key}=0.5\n")).unwrap();
-            let LayerKind::OmdLoss(s) = &net.layers[1].kind else { panic!() };
+            let LayerKind::OmdLoss(s) = &net.layers[1].kind else {
+                panic!()
+            };
             assert!((s.cls_normalizer - 0.5).abs() < 1e-6, "{key}");
             let _ = want;
         }
-        let net = build(&format!("{base}[omd_loss]\npos_weight=2\nbg_samples=4\nsmall_threshold_px=8\n")).unwrap();
-        let LayerKind::OmdLoss(s) = &net.layers[1].kind else { panic!() };
+        let net = build(&format!(
+            "{base}[omd_loss]\npos_weight=2\nbg_samples=4\nsmall_threshold_px=8\n"
+        ))
+        .unwrap();
+        let LayerKind::OmdLoss(s) = &net.layers[1].kind else {
+            panic!()
+        };
         assert_eq!(s.positive_weight, 2.0);
         assert_eq!(s.background_samples, 4);
         assert_eq!(s.small_threshold, 8.0);
@@ -4197,7 +4599,10 @@ mod tests {
         assert!(build(&format!("{base}[omd_loss]\nmax_samples=1\n")).is_err());
         assert!(build(&format!("{base}[omd_loss]\nmargin=-0.1\n")).is_err());
         assert!(build(&format!("{base}[omd_loss]\nmargin=2.5\n")).is_err());
-        assert!(build(&format!("{base}[omd_loss]\nmargin=2\n")).is_ok(), "2 is inclusive");
+        assert!(
+            build(&format!("{base}[omd_loss]\nmargin=2\n")).is_ok(),
+            "2 is inclusive"
+        );
     }
 
     #[test]
@@ -4210,7 +4615,10 @@ mod tests {
         // Binary masks are `[batch, 1, H*W]`, so the pass-through shape keeps
         // exactly one channel: nothing to reshape.
         assert_eq!(net.layers[1].output_shape.channels, 1);
-        assert_eq!(net.layers[1].output_shape.width * net.layers[1].output_shape.height, 4);
+        assert_eq!(
+            net.layers[1].output_shape.width * net.layers[1].output_shape.height,
+            4
+        );
     }
 
     fn repo_cfg(name: &str) -> PathBuf {
@@ -4447,6 +4855,8 @@ mod tests {
         for (kind, expected) in [
             ("default", ObbNmsKind::Default),
             ("cornersnms", ObbNmsKind::Corners),
+            ("greedynms", ObbNmsKind::Greedy),
+            ("diounms", ObbNmsKind::Diou),
             ("obb_nms", ObbNmsKind::Obb),
             ("obbnms", ObbNmsKind::Obb),
         ] {
@@ -4462,13 +4872,25 @@ mod tests {
                 LayerKind::ObbYolo(spec) if spec.nms_kind == expected
             ));
         }
+        let beta_cfg = Network::from_config(
+            ConfigFile::parse_str(
+                "obb-beta-nms.cfg",
+                "[net]\nwidth=4\nheight=2\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\nnms_kind=diounms\nbeta_nms=1.25\n",
+            )
+            .expect("DIoU beta cfg parses"),
+        )
+        .expect("DIoU beta cfg builds");
+        assert!(matches!(
+            &beta_cfg.layers[0].kind,
+            LayerKind::ObbYolo(spec) if spec.beta_nms == 1.25
+        ));
 
         for cfg in [
             "[net]\nwidth=4\nheight=2\nchannels=8\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\n",
             "[net]\nwidth=4\nheight=2\nchannels=8\nobb=1\n[obb_yolo]\ncoords=5\nclasses=1\nnum=1\nanchors=4,2\n",
             "[net]\nwidth=4\nheight=2\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nmask=1\nanchors=4,2\n",
             "[net]\nwidth=4\nheight=2\nchannels=7\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\n",
-            "[net]\nwidth=4\nheight=2\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\nnms_kind=greedynms\n",
+            "[net]\nwidth=4\nheight=2\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\nbeta_nms=NaN\n",
         ] {
             assert!(
                 Network::from_config(

@@ -50,7 +50,11 @@ pub fn softmax_topk(logits: &[f32], top_k: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; experts];
     let mut sum = 0.0f32;
     for (e, out) in out.iter_mut().enumerate() {
-        let value = if masked[e] <= -NEG_INF * 0.5 { 0.0 } else { (masked[e] - max_logit).exp() };
+        let value = if masked[e] <= -NEG_INF * 0.5 {
+            0.0
+        } else {
+            (masked[e] - max_logit).exp()
+        };
         *out = value;
         sum += value;
     }
@@ -82,10 +86,26 @@ pub fn compute_router(
     spec: &MoeSpec,
 ) -> Vec<f32> {
     let experts = spec.experts;
-    assert_eq!(router_weights.len(), experts * channels, "router weights must be experts x channels");
-    assert_eq!(router_biases.len(), experts, "router biases must have one entry per expert");
-    assert_eq!(input.len(), batch * channels * spatial, "router input length");
-    let inv_spatial = if spatial > 0 { 1.0 / spatial as f32 } else { 0.0 };
+    assert_eq!(
+        router_weights.len(),
+        experts * channels,
+        "router weights must be experts x channels"
+    );
+    assert_eq!(
+        router_biases.len(),
+        experts,
+        "router biases must have one entry per expert"
+    );
+    assert_eq!(
+        input.len(),
+        batch * channels * spatial,
+        "router input length"
+    );
+    let inv_spatial = if spatial > 0 {
+        1.0 / spatial as f32
+    } else {
+        0.0
+    };
     let temperature = router_temperature(spec);
     let mut gates = vec![0.0f32; batch * experts];
     let mut logits = vec![0.0f32; experts];
@@ -104,8 +124,7 @@ pub fn compute_router(
             }
             logits[e] = v / temperature;
         }
-        gates[b * experts..(b + 1) * experts]
-            .copy_from_slice(&softmax_topk(&logits, spec.top_k));
+        gates[b * experts..(b + 1) * experts].copy_from_slice(&softmax_topk(&logits, spec.top_k));
     }
     gates
 }
@@ -118,11 +137,7 @@ pub fn compute_router(
 /// unclamped expression (C++'s comment says so explicitly): the clamp only stops
 /// a balanced router from being penalised, it must not zero a gradient that
 /// would otherwise pull the router back toward balance.
-pub fn balance_loss_and_raw_grad(
-    gates: &[f32],
-    batch: usize,
-    spec: &MoeSpec,
-) -> (f32, Vec<f32>) {
+pub fn balance_loss_and_raw_grad(gates: &[f32], batch: usize, spec: &MoeSpec) -> (f32, Vec<f32>) {
     let experts = spec.experts;
     let mut raw = vec![0.0f32; batch * experts];
     if spec.load_balance <= 0.0 || batch == 0 {
@@ -171,12 +186,17 @@ pub fn router_gate_gradient(gates: &[f32], raw: &[f32], spec: &MoeSpec) -> Vec<f
 /// C++ `compute_cpu_router`'s pooled descriptor, reused by the backward: the
 /// router's input gradient needs the same pooled vector the forward used.
 pub fn pool_for_router(input: &[f32], batch: usize, channels: usize, spatial: usize) -> Vec<f32> {
-    let inv_spatial = if spatial > 0 { 1.0 / spatial as f32 } else { 0.0 };
+    let inv_spatial = if spatial > 0 {
+        1.0 / spatial as f32
+    } else {
+        0.0
+    };
     let mut pooled = vec![0.0f32; batch * channels];
     for b in 0..batch {
         for c in 0..channels {
             let base = b * channels * spatial + c * spatial;
-            pooled[b * channels + c] = input[base..base + spatial].iter().sum::<f32>() * inv_spatial;
+            pooled[b * channels + c] =
+                input[base..base + spatial].iter().sum::<f32>() * inv_spatial;
         }
     }
     pooled
@@ -240,7 +260,10 @@ mod tests {
         assert_eq!(gates[0] + gates[1], 1.0, "the kept gates renormalise to 1");
         assert!(gates[0] > gates[1]);
         // top_k >= experts and top_k == 0 both mean "no mask".
-        assert_eq!(softmax_topk(&[4.0, 3.0, 2.0, 1.0], 4), softmax_topk(&[4.0, 3.0, 2.0, 1.0], 0));
+        assert_eq!(
+            softmax_topk(&[4.0, 3.0, 2.0, 1.0], 4),
+            softmax_topk(&[4.0, 3.0, 2.0, 1.0], 0)
+        );
         // top_k == 1 keeps a single expert with gate 1.
         let gates = softmax_topk(&[4.0, 3.0, 2.0, 1.0], 1);
         assert_eq!(gates, vec![1.0, 0.0, 0.0, 0.0]);
@@ -312,7 +335,12 @@ mod tests {
         let rb2 = vec![0.0, 0.0];
         let g_hot = compute_router(&input, 1, 1, 2, &rw2, &rb2, &hot);
         let g_cold = compute_router(&input, 1, 1, 2, &rw2, &rb2, &cold);
-        assert!(g_hot[0] > g_cold[0], "a higher temperature must flatten: {} vs {}", g_hot[0], g_cold[0]);
+        assert!(
+            g_hot[0] > g_cold[0],
+            "a higher temperature must flatten: {} vs {}",
+            g_hot[0],
+            g_cold[0]
+        );
     }
 
     #[test]
@@ -338,7 +366,10 @@ mod tests {
         assert!((loss - 0.01 * 3.0).abs() < 1e-6, "{loss}");
         // raw grad = alpha * 2 * E * mean_gate / B, so only expert 0 is pushed.
         for (b, row) in raw.chunks(4).enumerate() {
-            assert!((row[0] - 0.01 * 2.0 * 4.0 * 1.0 / 4.0).abs() < 1e-6, "b={b}: {row:?}");
+            assert!(
+                (row[0] - 0.01 * 2.0 * 4.0 * 1.0 / 4.0).abs() < 1e-6,
+                "b={b}: {row:?}"
+            );
             assert!(
                 row[1..].iter().all(|v| *v == 0.0),
                 "b={b}: unused experts must not move: {row:?}"
@@ -362,7 +393,9 @@ mod tests {
         s.load_balance = 0.7;
         let mut rng = 0u64;
         let mut next = || {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((rng >> 33) as f32 / (1u64 << 31) as f32).clamp(0.01, 0.9)
         };
         let mut gates = vec![0.0f32; batch * experts];
