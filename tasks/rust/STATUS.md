@@ -5,6 +5,16 @@ is next. The authoritative plan is `tasks/rust/layers.md`; the FP8/FP4 plan is
 `tasks/rust/fp8_fp4.md`; the **full implemented inventory is
 `tasks/rust/implemented.md`** (this file no longer repeats it).
 
+## Contents
+
+- [Ground rules](#ground-rules-do-not-violate)
+- [User decisions](#user-decisions-2026-10-04--all-open-questions-answered-yes)
+- [Implemented](#implemented)
+- [Verification commands](#verification-commands)
+- [Next steps](#next-in-dependency-order-nothing-blocked)
+- [Known evidence gaps](#known-evidence-gaps-not-user-questions)
+- [Task plans not started](#task-plans-not-started)
+
 ## Ground rules (do not violate)
 
 - Every cargo command uses `-j 4` or fewer. `tools/test_host.sh` and
@@ -34,6 +44,7 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v0.0.251 (`968c1beb`; gate incomplete): added source-derived OBB weighted NMS. Reference is `raptor:src-lib/box.cpp` (`diounms_sort`, not `yolo_layer.cpp`): `overlap = obb_iou - (d²/c²)^beta_nms`, where `obb_iou = detection_obb_iou(i,j)`, `d²` is center-distance squared, and `c²` is the enclosing AABB diagonal squared; merge weights are `w_i = prob_i[k]` and `w_j = prob_j[k] * obb_iou`, used to average box x/y/w/h and the keeper front point. Source enum spelling is `OBB_W_NMS`; cfg aliases are `obb_w` and `obb_wnms`. The four `weighted_merge_*` tests and the cfg/multi-head-beta tests passed. Direct `cargo test -p darknet-core -p darknet-cli -j 2 -- obb_` (uncapped because `systemd-run` has no user bus) ran 132 core tests: 131 passed, 1 failed; CLI ran 3 passed. The unrelated OBB-training failure is `train::tests::obb_batch_loader_applies_configured_seeded_flips_to_images_and_labels`, which rejects geometric option `jitter`; stop here and resolve/report before advancing T1.4. No compiled-C++ parity is claimed.
 - v164: OBB NMS now supports source `greedynms` (fixed 0.6 DIoU exponent) and `diounms` (configurable `beta_nms`, default 0.6), using the source AABB-based formulas. Multi-head DIoU configs with mismatched betas and non-finite `beta_nms` are rejected. The NMS scoring/cfg/multi-head tests passed; `MEM=3G ./tools/test_host.sh obb_` passed 122 core + 2 CLI tests. Weighted OBB merge remains unsupported; no compiled-C++ parity is claimed.
 - v163: OBB NMS now accepts source `default` and `cornersnms` kinds and routes both through the source AABB-IoU suppression path; existing `obb` remains orientation-aware, and source `obb_nms`/`obbnms` aliases parse. The NMS-kind cfg and overlap tests passed; `MEM=3G ./tools/test_host.sh obb_` passed 120 core + 2 CLI tests. `greedynms`, `diounms`, and weighted OBB NMS remain unsupported; no compiled-C++ parity is claimed.
 - v162: `detect-image` now routes `[net] obb=1` inference through the orientation-aware OBB decoder and reports the legacy front point in human output and full-precision `det_obb` TSV rows; unsupported mixed OBB/modern heads fail explicitly. The dispatch/formatting CLI test passed, `detect_` passed 2 CLI tests, and `obb_` passed 119 core + 2 CLI tests. CARPN network decoding remains unsupported; no compiled-C++ parity is claimed.
