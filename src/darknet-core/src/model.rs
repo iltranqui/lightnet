@@ -5055,9 +5055,14 @@ mod tests {
         assert!(spec.ciou_obb_loss);
         assert!(spec.ciou_obb_multiplicative_loss);
         assert_eq!(spec.iou_loss, super::YoloIouLoss::Ciou);
+        let training =
+            crate::obb_training::build_obb_yolo_training_head_config(spec, 0, 1, 1, 1, 1)
+                .expect("multiplicative CIoU-OBB training config builds");
+        assert!(training.box_delta_config.ciou_obb_multiplicative_loss);
         assert!(
-            crate::obb_training::build_obb_yolo_training_head_config(spec, 0, 1, 1, 1, 1).is_err(),
-            "multiplicative CIoU-OBB training must not silently use the additive branch"
+            training
+                .front_point_delta_config
+                .ciou_obb_multiplicative_loss
         );
 
         let invalid = build(
