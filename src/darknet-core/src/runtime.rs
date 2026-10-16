@@ -516,8 +516,48 @@ pub struct ForwardResult {
 }
 
 impl ForwardResult {
+    /// Build an inference result containing only detector heads and no per-layer caches.
+    pub fn from_heads(
+        yolo_heads: Vec<YoloHeadOutput>,
+        modern_heads: Vec<ModernHeadOutput>,
+    ) -> Self {
+        Self {
+            layer_outputs: Vec::new(),
+            layer_activation_inputs: Vec::new(),
+            dropout_masks: Vec::new(),
+            crop_caches: Vec::new(),
+            recurrent_caches: Vec::new(),
+            moe_caches: Vec::new(),
+            eml_caches: Vec::new(),
+            vit_caches: Vec::new(),
+            yolo_heads,
+            modern_heads,
+        }
+    }
+
     pub fn final_output(&self) -> Option<&Tensor> {
         self.layer_outputs.last()
+    }
+}
+
+#[cfg(test)]
+mod forward_result_from_heads_tests {
+    use super::ForwardResult;
+
+    #[test]
+    fn forward_result_from_heads_has_empty_caches() {
+        let result = ForwardResult::from_heads(Vec::new(), Vec::new());
+        assert!(result.layer_outputs.is_empty());
+        assert!(result.layer_activation_inputs.is_empty());
+        assert!(result.dropout_masks.is_empty());
+        assert!(result.crop_caches.is_empty());
+        assert!(result.recurrent_caches.is_empty());
+        assert!(result.moe_caches.is_empty());
+        assert!(result.eml_caches.is_empty());
+        assert!(result.vit_caches.is_empty());
+        assert!(result.yolo_heads.is_empty());
+        assert!(result.modern_heads.is_empty());
+        assert!(result.final_output().is_none());
     }
 }
 

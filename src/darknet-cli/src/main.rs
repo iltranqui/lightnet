@@ -307,15 +307,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         // f16 storage inference (DARKNET_OXIDE_GEMM=fp16): only the
                         // yolo heads are produced (detections need nothing else).
                         let summary = executable.forward_compact_f16(&input)?;
-                        darknet_core::ForwardResult {
-                            layer_outputs: Vec::new(),
-                            layer_activation_inputs: Vec::new(),
-                            dropout_masks: Vec::new(),
-                            crop_caches: Vec::new(),
-                            recurrent_caches: Vec::new(),
-                            yolo_heads: summary.yolo_heads,
-                            modern_heads: summary.modern_heads,
-                        }
+                        darknet_core::ForwardResult::from_heads(
+                            summary.yolo_heads,
+                            summary.modern_heads,
+                        )
                     } else {
                         executable.forward(&input)?
                     }
