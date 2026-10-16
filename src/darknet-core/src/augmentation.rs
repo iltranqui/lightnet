@@ -67,8 +67,11 @@ impl DetectorAugmentation {
                 random = random.max(section.get_f32("random", 0.0)?);
             }
         }
+        // OBB training currently uses direct resize and rejects geometric jitter;
+        // default it off when omitted while preserving explicit nonzero values as errors.
+        let default_jitter = if head.name == "obb_yolo" { 0.0 } else { 0.2 };
         let options = Self {
-            jitter: head.get_f32("jitter", 0.2)?,
+            jitter: head.get_f32("jitter", default_jitter)?,
             resize: head.get_f32("resize", 1.0)?,
             flip: net.get_bool_int("flip", true)?,
             letter_box: net.get_bool_int("letter_box", false)?,
@@ -1279,6 +1282,18 @@ mod tests {
     }
 
     #[test]
+    fn obb_augmentation_defaults_to_supported_direct_resize() {
+        let cfg = ConfigFile::parse_str(
+            "obb-aug-default.cfg",
+            "[net]\nwidth=10\nheight=10\nchannels=3\nobb=1\nflip=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\n",
+        )
+        .unwrap();
+        let augmentation = DetectorAugmentation::from_config(&cfg).unwrap();
+        assert_eq!(augmentation.jitter, 0.0);
+        assert_eq!(augmentation.resize, 1.0);
+    }
+
+    #[test]
     fn obb_cfg_flip_mask_matches_seeded_augmentation_draws() {
         let enabled_cfg = ConfigFile::parse_str(
             "obb-aug.cfg",
@@ -1321,6 +1336,7 @@ mod tests {
     #[test]
     fn parser_defaults_and_unsupported_active_options() {
         let opts = settings("");
+        assert_eq!(opts.jitter, 0.3);
         assert!(opts.flip);
         assert_eq!(opts.max_boxes, 200);
         for key in [
