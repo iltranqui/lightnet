@@ -7,14 +7,14 @@ oxide = "run --package cargo-oxide --"
 # this only fills the gap that made `cuda-bindings`'s build.rs panic with
 # "CUDA_TOOLKIT_PATH is required but not set".
 [env]
-CUDA_TOOLKIT_PATH = { value = "/usr/local/cuda-13.3", force = false }
-CUDA_HOME = { value = "/usr/local/cuda-13.3", force = false }
-CUDA_PATH = { value = "/usr/local/cuda-13.3", force = false }
+CUDA_TOOLKIT_PATH = { value = "/usr/local/cuda-13.4", force = false }
+CUDA_HOME = { value = "/usr/local/cuda-13.4", force = false }
+CUDA_PATH = { value = "/usr/local/cuda-13.4", force = false }
 
 # cutile-compiler shells out to `tileiras` (the Tile IR assembler) at JIT
 # time via normal PATH lookup by default. On WSL the Windows CUDA install
-# shadows /usr/local/cuda-13.3/bin on $PATH, so point it at the Linux
+# shadows /usr/local/cuda-13.4/bin on $PATH, so point it at the Linux
 # binary explicitly instead of relying on PATH order.
-CUTILE_TILEIRAS_PATH = { value = "/usr/local/cuda-13.3/bin/tileiras", force = false }
+CUTILE_TILEIRAS_PATH = { value = "/usr/local/cuda-13.4/bin/tileiras", force = false }
 
 # libmathdx (only for mathdx_ffi_test); set LIBMATHDX_PATH in your environment.
