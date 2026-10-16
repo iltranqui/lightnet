@@ -718,6 +718,9 @@ pub struct ExecutableNetwork {
     /// DropBlock ramp and the `dont_update`/`burnin_update` gates (see
     /// [`ExecutableNetwork::set_train_iteration`]).
     train_iteration: usize,
+    /// CPU Adam optimizer state, persisted separately from Darknet weights.
+    host_adam_state: Vec<Option<HostAdamLayerState>>,
+    adam_step: u32,
 }
 
 impl ExecutableNetwork {
@@ -736,12 +739,15 @@ impl ExecutableNetwork {
             .map(default_layer_train_buffers)
             .collect::<Vec<_>>();
         let workspace = vec![0.0f32; compute_cpu_workspace_size(&network)];
+        let layer_count = network.layers.len();
         Self {
             network,
             params,
             train_buffers,
             workspace,
             train_iteration: 0,
+            host_adam_state: (0..layer_count).map(|_| None).collect(),
+            adam_step: 0,
         }
     }
 
@@ -755,6 +761,117 @@ impl ExecutableNetwork {
 
     pub fn load_weights_file(&mut self, path: impl AsRef<Path>) -> Result<WeightsHeader> {
         load_weights_into_params(&self.network, &mut self.params, path)
+    }
+
+    /// Adam updates applied so far (the `t` of the next update).
+    pub fn adam_step(&self) -> u32 {
+        self.adam_step
+    }
+
+    /// Restore the Adam bias-correction step counter.
+    pub fn set_adam_step(&mut self, step: u32) {
+        self.adam_step = step;
+    }
+
+    /// Save CPU Adam moments in the shared DNOPT sidecar format.
+    pub fn save_optimizer_state(&self, path: impl AsRef<Path>) -> Result<()> {
+        let mut file = std::io::BufWriter::with_capacity(1 << 20, File::create(path)?);
+        file.write_all(b"DNOPT3\0\0")?;
+        file.write_all(&self.adam_step.to_le_bytes())?;
+        file.write_all(&0u64.to_le_bytes())?; // no device-resident moments
+
+        let entries: Vec<usize> = self
+            .host_adam_state
+            .iter()
+            .enumerate()
+            .filter_map(|(index, state)| state.as_ref().map(|_| index))
+            .collect();
+        file.write_all(&(entries.len() as u64).to_le_bytes())?;
+        for index in entries {
+            file.write_all(&(index as u64).to_le_bytes())?;
+            write_host_adam_state(
+                &mut file,
+                self.host_adam_state[index]
+                    .as_ref()
+                    .expect("filtered to Some above"),
+            )?;
+        }
+        file.write_all(&0u64.to_le_bytes())?; // no device MoE moments
+        file.flush()?;
+        Ok(())
+    }
+
+    /// Restore CPU Adam moments from a host-only DNOPT sidecar.
+    pub fn load_optimizer_state(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        let mut file = File::open(path)?;
+        let mut magic = [0u8; 8];
+        file.read_exact(&mut magic)?;
+        let version = match &magic {
+            b"DNOPT1\0\0" => 1,
+            b"DNOPT2\0\0" => 2,
+            b"DNOPT3\0\0" => 3,
+            b"DNOPT4\0\0" => 4,
+            b"DNOPT5\0\0" => 5,
+            _ => return Err(Error::Weights("bad optimizer state magic".to_owned())),
+        };
+        let mut bytes4 = [0u8; 4];
+        file.read_exact(&mut bytes4)?;
+        let step = u32::from_le_bytes(bytes4);
+        let mut bytes8 = [0u8; 8];
+        file.read_exact(&mut bytes8)?;
+        if u64::from_le_bytes(bytes8) != 0 {
+            return Err(Error::Weights(
+                "CPU optimizer state cannot load device Adam moments".to_owned(),
+            ));
+        }
+
+        let mut host_state: Vec<Option<HostAdamLayerState>> =
+            (0..self.network.layers.len()).map(|_| None).collect();
+        if version >= 2 {
+            file.read_exact(&mut bytes8)?;
+            let count = usize::try_from(u64::from_le_bytes(bytes8)).map_err(|_| {
+                Error::Weights("optimizer host layer count is too large".to_owned())
+            })?;
+            if count > self.network.layers.len() {
+                return Err(Error::Weights(
+                    "optimizer host layer count exceeds network size".to_owned(),
+                ));
+            }
+            let mut seen = vec![false; self.network.layers.len()];
+            for _ in 0..count {
+                file.read_exact(&mut bytes8)?;
+                let index = usize::try_from(u64::from_le_bytes(bytes8)).map_err(|_| {
+                    Error::Weights("optimizer host layer index is too large".to_owned())
+                })?;
+                if index >= self.network.layers.len() || seen[index] {
+                    return Err(Error::Weights(
+                        "optimizer host layer index is invalid or repeated".to_owned(),
+                    ));
+                }
+                seen[index] = true;
+                let capacity = host_adam_scalar_capacity(&self.params[index]);
+                host_state[index] = Some(read_host_adam_state(&mut file, capacity)?);
+            }
+        }
+        if version >= 3 {
+            file.read_exact(&mut bytes8)?;
+            if u64::from_le_bytes(bytes8) != 0 {
+                return Err(Error::Weights(
+                    "CPU optimizer state cannot load device MoE moments".to_owned(),
+                ));
+            }
+        }
+        if version >= 5 {
+            file.read_exact(&mut bytes8)?;
+            if u64::from_le_bytes(bytes8) != 0 {
+                return Err(Error::Weights(
+                    "CPU optimizer state cannot load device EML moments".to_owned(),
+                ));
+            }
+        }
+        self.host_adam_state = host_state;
+        self.adam_step = step;
+        Ok(())
     }
 
     /// Sets the 0-based index of the training iteration in progress (the
@@ -1113,6 +1230,91 @@ impl ExecutableNetwork {
                 _ => {}
             }
         }
+    }
+
+    /// Apply one host-only Adam update to accumulated CPU training buffers.
+    /// The global step advances once for this optimizer update, independent of
+    /// how many subdivisions contributed to the buffers.
+    pub fn update_weights_adam(&mut self, lr: f32, batch: usize) -> Result<()> {
+        if !self.network.net.adam {
+            return Err(Error::InvalidConfig(
+                "CPU Adam update requires [net] adam=1".to_owned(),
+            ));
+        }
+        if !lr.is_finite() || lr < 0.0 {
+            return Err(Error::InvalidConfig(
+                "CPU Adam learning rate must be finite and non-negative".to_owned(),
+            ));
+        }
+        let step = self
+            .adam_step
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidConfig("CPU Adam step counter overflowed".to_owned()))?;
+        let net = self.network.net.clone();
+        let loss_scale = if net.loss_scale > 0.0 && net.loss_scale.is_finite() {
+            net.loss_scale
+        } else {
+            1.0
+        };
+        let adam = AdamParams {
+            lr,
+            beta1: net.adam_b1,
+            beta2: net.adam_b2,
+            eps: net.adam_eps * loss_scale,
+            decay: if net.decoupled_decay {
+                net.decay
+            } else {
+                net.decay * loss_scale
+            },
+            batch,
+            step,
+            decoupled_decay: net.decoupled_decay,
+        };
+        if self.host_adam_state.len() != self.network.layers.len() {
+            self.host_adam_state = (0..self.network.layers.len()).map(|_| None).collect();
+        }
+
+        let iteration_num = self.train_iteration as i64 + 1;
+        let burn_in = self.network.net.burn_in;
+        for index in 0..self.network.layers.len() {
+            let layer = &self.network.layers[index];
+            let options = layer.train;
+            if !options.updates_at(iteration_num, burn_in) {
+                continue;
+            }
+            let layer_adam = AdamParams {
+                lr: lr * options.learning_rate_scale,
+                ..adam
+            };
+            if options.grad_centr
+                && let (LayerParams::Convolutional(params), LayerTrainBuffers::Convolutional(train)) =
+                    (&self.params[index], &mut self.train_buffers[index])
+                && params.batch_norm.is_some()
+            {
+                let filter_size = params.weights.len() / params.biases.len().max(1);
+                if filter_size > 0 {
+                    train.weight_updates = darknet_cuda::host_ops::gradient_centralization(
+                        &train.weight_updates,
+                        filter_size,
+                    );
+                }
+            }
+            let state = self.host_adam_state[index].get_or_insert_with(HostAdamLayerState::default);
+            apply_host_adam_layer(
+                &layer.kind,
+                &mut self.params[index],
+                &mut self.train_buffers[index],
+                state,
+                &layer_adam,
+            )?;
+            if options.clip > 0.0
+                && let LayerParams::Convolutional(params) = &mut self.params[index]
+            {
+                params.weights = darknet_cuda::host_ops::constrain(&params.weights, options.clip);
+            }
+        }
+        self.adam_step = step;
+        Ok(())
     }
 
     pub fn forward(&self, input: &Tensor) -> Result<ForwardResult> {
@@ -3418,7 +3620,7 @@ where
 type GpuMoments<T> = (T, T);
 
 /// Adam moments of the host-resident parameters of one layer (connected).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct HostAdamLayerState {
     weights: Option<(Vec<f32>, Vec<f32>)>,
     biases: Option<(Vec<f32>, Vec<f32>)>,
@@ -13475,6 +13677,164 @@ fn apply_host_adam_vit(
         } else {
             0.0
         };
+    }
+    Ok(())
+}
+
+fn apply_host_adam_layer(
+    kind: &LayerKind,
+    params: &mut LayerParams,
+    train: &mut LayerTrainBuffers,
+    state: &mut HostAdamLayerState,
+    adam: &AdamParams,
+) -> Result<()> {
+    match (params, train) {
+        (LayerParams::BatchNorm(params), LayerTrainBuffers::BatchNorm(train)) => {
+            apply_host_adam_non_weight(
+                &mut params.scales,
+                &mut train.scale_updates,
+                &mut state.scales,
+                adam,
+            )?;
+            apply_host_adam_non_weight(
+                &mut params.biases,
+                &mut train.bias_updates,
+                &mut state.biases,
+                adam,
+            )?;
+        }
+        (LayerParams::Convolutional(params), LayerTrainBuffers::Convolutional(train)) => {
+            apply_host_adam_convolutional(params, train, state, adam)?;
+        }
+        (LayerParams::Connected(params), LayerTrainBuffers::Connected(train)) => {
+            apply_host_adam_connected(params, train, state, adam)?;
+        }
+        (LayerParams::Local(params), LayerTrainBuffers::Local(train)) => {
+            apply_host_adam(
+                &mut params.weights,
+                &mut train.weight_updates,
+                &mut state.weights,
+                adam,
+            )?;
+            apply_host_adam_non_weight(
+                &mut params.biases,
+                &mut train.bias_updates,
+                &mut state.biases,
+                adam,
+            )?;
+        }
+        (LayerParams::Shortcut(params), LayerTrainBuffers::Shortcut(train)) => {
+            apply_host_adam(
+                &mut params.weights,
+                &mut train.weight_updates,
+                &mut state.weights,
+                adam,
+            )?;
+        }
+        (LayerParams::Gru(params), LayerTrainBuffers::Gru(train)) => {
+            for (slot, params, train) in [
+                (0, &mut params.input_z, &mut train.input_z),
+                (1, &mut params.state_z, &mut train.state_z),
+                (2, &mut params.input_r, &mut train.input_r),
+                (3, &mut params.state_r, &mut train.state_r),
+                (4, &mut params.input_h, &mut train.input_h),
+                (5, &mut params.state_h, &mut train.state_h),
+            ] {
+                apply_host_adam_connected(params, train, host_adam_child(state, slot), adam)?;
+            }
+        }
+        (LayerParams::Rnn(params), LayerTrainBuffers::Rnn(train)) => {
+            for (slot, params, train) in [
+                (0, &mut params.input, &mut train.input),
+                (1, &mut params.self_params, &mut train.self_params),
+                (2, &mut params.output, &mut train.output),
+            ] {
+                apply_host_adam_connected(params, train, host_adam_child(state, slot), adam)?;
+            }
+        }
+        (LayerParams::Lstm(params), LayerTrainBuffers::Lstm(train)) => {
+            for (slot, params, train) in [
+                (0, &mut params.wf, &mut train.wf),
+                (1, &mut params.wi, &mut train.wi),
+                (2, &mut params.wg, &mut train.wg),
+                (3, &mut params.wo, &mut train.wo),
+                (4, &mut params.uf, &mut train.uf),
+                (5, &mut params.ui, &mut train.ui),
+                (6, &mut params.ug, &mut train.ug),
+                (7, &mut params.uo, &mut train.uo),
+            ] {
+                apply_host_adam_connected(params, train, host_adam_child(state, slot), adam)?;
+            }
+        }
+        (LayerParams::Crnn(params), LayerTrainBuffers::Crnn(train)) => {
+            for (slot, params, train) in [
+                (0, &mut params.input, &mut train.input),
+                (1, &mut params.self_params, &mut train.self_params),
+                (2, &mut params.output, &mut train.output),
+            ] {
+                apply_host_adam_convolutional(params, train, host_adam_child(state, slot), adam)?;
+            }
+        }
+        (LayerParams::Vit(params), LayerTrainBuffers::Vit(train)) => {
+            let learned_pos_embed = matches!(kind, LayerKind::Vit(spec) if spec.learned_pos_embed);
+            apply_host_adam_vit(params, train, state, adam, learned_pos_embed)?;
+        }
+        (LayerParams::Moe(params), LayerTrainBuffers::Moe(train)) => {
+            if params.experts.len() != train.experts.len() {
+                return Err(Error::InvalidConfig(
+                    "MoE Adam expert state mismatch".to_owned(),
+                ));
+            }
+            let router_adam = AdamParams {
+                decay: 0.0,
+                ..*adam
+            };
+            apply_host_adam(
+                &mut params.router_weights,
+                &mut train.router_weight_updates,
+                &mut state.weights,
+                &router_adam,
+            )?;
+            apply_host_adam_non_weight(
+                &mut params.router_biases,
+                &mut train.router_bias_updates,
+                &mut state.biases,
+                &router_adam,
+            )?;
+            for (slot, (expert, updates)) in params
+                .experts
+                .iter_mut()
+                .zip(&mut train.experts)
+                .enumerate()
+            {
+                apply_host_adam_convolutional(expert, updates, host_adam_child(state, slot), adam)?;
+            }
+        }
+        (LayerParams::EmlConvolutional(params), LayerTrainBuffers::EmlConvolutional(train)) => {
+            apply_host_adam_convolutional(
+                &mut params.input,
+                &mut train.input,
+                host_adam_child(state, 0),
+                adam,
+            )?;
+            apply_host_adam_convolutional(
+                &mut params.self_params,
+                &mut train.self_params,
+                host_adam_child(state, 1),
+                adam,
+            )?;
+        }
+        (LayerParams::None, LayerTrainBuffers::None)
+        | (LayerParams::LayaScorer(_), LayerTrainBuffers::None)
+        | (LayerParams::LayaActHead(_), LayerTrainBuffers::None)
+        | (LayerParams::LayaEncoder(_), LayerTrainBuffers::None)
+        | (LayerParams::LayaHead(_), LayerTrainBuffers::None) => {}
+        _ => {
+            return Err(Error::InvalidConfig(format!(
+                "CPU Adam parameter/train-buffer mismatch for {} layer",
+                kind.name()
+            )));
+        }
     }
     Ok(())
 }

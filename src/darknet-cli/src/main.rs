@@ -2391,9 +2391,6 @@ fn run_detector_train_cpu_obb(
     augmentation: DetectorAugmentation,
     options: &TrainOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if executable.network.net.adam {
-        return Err("OBB CLI CPU training currently supports SGD, not Adam".into());
-    }
     if options.dynamic_loss_scale {
         return Err("OBB CLI dynamic loss scaling requires the Oxide training path".into());
     }
@@ -2454,6 +2451,15 @@ fn run_detector_train_cpu_obb(
         .unwrap_or_else(|| PathBuf::from("."));
     fs::create_dir_all(&backup_dir)?;
     let base_name = cfg_base_name(cfg);
+    let optimizer_state_path = backup_dir.join(format!("{base_name}_optimizer.state"));
+    if executable.network.net.adam && !options.clear && optimizer_state_path.exists() {
+        executable.load_optimizer_state(&optimizer_state_path)?;
+        println!(
+            "resumed optimizer state (Adam step {}) from {}",
+            executable.adam_step(),
+            optimizer_state_path.display()
+        );
+    }
     let batch_size = executable.network.net.batch.max(1);
     let subdivisions = executable.network.net.subdivisions.max(1);
     let images_per_iteration = batch_size
@@ -2478,7 +2484,14 @@ fn run_detector_train_cpu_obb(
     let mut loss_log = TrainingLossLog::new(&backup_dir, &base_name)?;
     let mut metrics_log = ObbTrainingMetricsLog::new(&backup_dir, &base_name)?;
 
-    println!("OBB CPU trainer: SGD with direct resize and seeded horizontal flips");
+    println!(
+        "OBB CPU trainer: {} with direct resize and seeded horizontal flips",
+        if executable.network.net.adam {
+            "Adam"
+        } else {
+            "SGD"
+        }
+    );
     while executable.network.net.max_batches == 0 || batch_num < executable.network.net.max_batches
     {
         let iteration_start = Instant::now();
@@ -2520,12 +2533,16 @@ fn run_detector_train_cpu_obb(
                 &delta_batch.layer_output_gradient_seeds,
             )?;
         }
-        executable.update_weights(
-            learning_rate,
-            executable.network.net.momentum,
-            executable.network.net.decay,
-            images_per_iteration,
-        );
+        if executable.network.net.adam {
+            executable.update_weights_adam(learning_rate, images_per_iteration)?;
+        } else {
+            executable.update_weights(
+                learning_rate,
+                executable.network.net.momentum,
+                executable.network.net.decay,
+                images_per_iteration,
+            );
+        }
 
         batch_num += 1;
         seen += images_per_iteration as u64;
@@ -2592,6 +2609,9 @@ fn run_detector_train_cpu_obb(
                 &base_name,
                 seen,
             )?;
+            if executable.network.net.adam {
+                executable.save_optimizer_state(&optimizer_state_path)?;
+            }
         }
         if executable.network.net.max_batches != 0
             && batch_num >= executable.network.net.max_batches
@@ -2615,6 +2635,9 @@ fn run_detector_train_cpu_obb(
         &base_name,
         seen,
     )?;
+    if executable.network.net.adam {
+        executable.save_optimizer_state(&optimizer_state_path)?;
+    }
     Ok(())
 }
 

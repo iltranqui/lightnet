@@ -559,11 +559,6 @@ pub fn train_obb_yolo_batch_step(
             "OBB YOLO batch training requires [net] obb=1".to_owned(),
         ));
     }
-    if network.net.adam {
-        return Err(Error::InvalidConfig(
-            "OBB CPU batch-step helper currently supports SGD, not Adam".to_owned(),
-        ));
-    }
     if network.net.subdivisions.max(1) != 1 {
         return Err(Error::InvalidConfig(
             "OBB CPU batch-step helper requires subdivisions=1".to_owned(),
@@ -596,12 +591,16 @@ pub fn train_obb_yolo_batch_step(
         &forward,
         &delta_batch.layer_output_gradient_seeds,
     )?;
-    executable.update_weights(
-        learning_rate,
-        executable.network.net.momentum,
-        executable.network.net.decay,
-        batch.input.shape.batch,
-    );
+    if executable.network.net.adam {
+        executable.update_weights_adam(learning_rate, batch.input.shape.batch)?;
+    } else {
+        executable.update_weights(
+            learning_rate,
+            executable.network.net.momentum,
+            executable.network.net.decay,
+            batch.input.shape.batch,
+        );
+    }
     Ok(ObbYoloTrainingBackward {
         delta_batch,
         backward,
@@ -736,11 +735,6 @@ pub fn train_obb_yolo_subdivisions(
             "OBB YOLO subdivision training requires [net] obb=1".to_owned(),
         ));
     }
-    if network.net.adam {
-        return Err(Error::InvalidConfig(
-            "OBB CPU subdivision helper currently supports SGD, not Adam".to_owned(),
-        ));
-    }
     let subdivision_count = network.net.subdivisions.max(1);
     if subdivisions.len() != subdivision_count {
         return Err(Error::InvalidConfig(format!(
@@ -800,12 +794,16 @@ pub fn train_obb_yolo_subdivisions(
             return Err(error);
         }
     };
-    executable.update_weights(
-        learning_rate,
-        executable.network.net.momentum,
-        executable.network.net.decay,
-        update_batch_size,
-    );
+    if executable.network.net.adam {
+        executable.update_weights_adam(learning_rate, update_batch_size)?;
+    } else {
+        executable.update_weights(
+            learning_rate,
+            executable.network.net.momentum,
+            executable.network.net.decay,
+            update_batch_size,
+        );
+    }
     Ok(stats)
 }
 
@@ -2694,6 +2692,7 @@ mod tests {
     use crate::model::{LayerKind, Network, TensorShape, YoloIouLoss, YoloSpec};
     use crate::obb_labels::ObbLabel;
     use crate::runtime::{ExecutableNetwork, LayerParams, Tensor};
+    use darknet_cuda::host_ops::{AdamParams, adam_update};
     use std::fs;
     use std::path::PathBuf;
 
@@ -2715,6 +2714,33 @@ mod tests {
         )
         .expect("cfg parses");
         Network::from_config(cfg).expect("OBB network builds")
+    }
+
+    fn obb_test_batch(network: &Network) -> ObbTrainingBatch {
+        let label = ObbLabel {
+            class_id: 0,
+            x: 0.5,
+            y: 0.5,
+            w: 0.25,
+            h: 0.5,
+            left: 0.375,
+            right: 0.625,
+            top: 0.25,
+            bottom: 0.75,
+            front_x: 0.7,
+            front_y: 0.55,
+            has_front: true,
+        };
+        ObbTrainingBatch {
+            input: Tensor::from_data(
+                network.net.input_shape(),
+                vec![1.0; network.net.input_shape().element_count()],
+            )
+            .expect("input"),
+            image_paths: Vec::new(),
+            label_paths: Vec::new(),
+            labels: vec![vec![label]; network.net.batch.max(1)],
+        }
     }
 
     fn empty_data_config(classes: Option<usize>) -> DataConfig {
@@ -2970,9 +2996,11 @@ mod tests {
         let mut adam_network = network.clone();
         adam_network.net.adam = true;
         let mut adam_executable = ExecutableNetwork::new(adam_network);
-        let adam_error = train_obb_yolo_batch_step(&mut adam_executable, &batch, 0.01)
-            .expect_err("the CPU SGD helper must reject Adam");
-        assert!(adam_error.to_string().contains("not Adam"));
+        let adam_before = adam_executable.params.clone();
+        train_obb_yolo_batch_step(&mut adam_executable, &batch, 0.01)
+            .expect("the CPU batch helper supports Adam");
+        assert_eq!(adam_executable.adam_step(), 1);
+        assert_ne!(adam_executable.params, adam_before);
 
         let mut subdivided_network = network;
         subdivided_network.net.subdivisions = 2;
@@ -3021,6 +3049,115 @@ mod tests {
         assert!(stats.front_point_loss.angle_count <= stats.front_point_loss.count);
         assert!(stats.front_point_loss.angle_sum_degrees.is_finite());
         assert_ne!(executable.params, before);
+    }
+
+    #[test]
+    fn obb_adam_step_changes_weights_and_advances_step_once() {
+        let mut network = obb_test_network(1);
+        network.net.adam = true;
+        network.net.subdivisions = 2;
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let before = executable.params.clone();
+        let batch = obb_test_batch(&network);
+
+        train_obb_yolo_subdivisions(&mut executable, &[batch.clone(), batch], 0.01)
+            .expect("OBB Adam subdivisions update");
+
+        assert_ne!(executable.params, before);
+        assert_eq!(executable.adam_step(), 1);
+    }
+
+    #[test]
+    fn obb_adam_zero_lr_is_a_noop() {
+        let mut network = obb_test_network(1);
+        network.net.adam = true;
+        network.net.subdivisions = 2;
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let before = executable.params.clone();
+        let batch = obb_test_batch(&network);
+
+        train_obb_yolo_subdivisions(&mut executable, &[batch.clone(), batch], 0.0)
+            .expect("zero-lr OBB Adam update");
+
+        assert_eq!(executable.params, before);
+    }
+
+    #[test]
+    fn obb_adam_matches_host_ops_reference() {
+        let mut network = obb_test_network(1);
+        network.net.adam = true;
+        network.net.decay = 0.0;
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let layer_index = network
+            .layers
+            .iter()
+            .position(|layer| matches!(layer.kind, LayerKind::Convolutional(_)))
+            .expect("convolutional layer");
+        let weights = match &executable.params[layer_index] {
+            LayerParams::Convolutional(params) => params.weights.clone(),
+            _ => panic!("expected convolutional params"),
+        };
+        let updates = vec![0.125; weights.len()];
+        match &mut executable.train_buffers[layer_index] {
+            crate::runtime::LayerTrainBuffers::Convolutional(train) => {
+                train.weight_updates.clone_from(&updates);
+            }
+            _ => panic!("expected convolutional train buffers"),
+        }
+        let params = AdamParams {
+            lr: 0.01,
+            beta1: network.net.adam_b1,
+            beta2: network.net.adam_b2,
+            eps: network.net.adam_eps,
+            decay: 0.0,
+            batch: 1,
+            step: 1,
+            decoupled_decay: network.net.decoupled_decay,
+        };
+        let zeros = vec![0.0; weights.len()];
+        let expected = adam_update(&weights, &updates, &zeros, &zeros, &params).0;
+
+        executable
+            .update_weights_adam(0.01, 1)
+            .expect("host Adam update");
+
+        let actual = match &executable.params[layer_index] {
+            LayerParams::Convolutional(params) => &params.weights,
+            _ => panic!("expected convolutional params"),
+        };
+        assert_eq!(actual, &expected);
+    }
+
+    #[test]
+    fn obb_adam_moments_round_trip_through_sidecar() {
+        let mut network = obb_test_network(1);
+        network.net.adam = true;
+        network.net.subdivisions = 2;
+        let batch = obb_test_batch(&network);
+        let mut uninterrupted = ExecutableNetwork::new(network.clone());
+        train_obb_yolo_subdivisions(&mut uninterrupted, &[batch.clone(), batch.clone()], 0.01)
+            .expect("first uninterrupted Adam update");
+        let path = temp_path("darknet-obb-adam-optimizer.state");
+        let _ = fs::remove_file(&path);
+        uninterrupted
+            .save_optimizer_state(&path)
+            .expect("save CPU Adam sidecar");
+
+        let mut resumed = ExecutableNetwork::new(network);
+        resumed.params = uninterrupted.params.clone();
+        resumed
+            .load_optimizer_state(&path)
+            .expect("load CPU Adam sidecar");
+        assert_eq!(resumed.adam_step(), 1);
+
+        let subdivisions = [batch.clone(), batch];
+        train_obb_yolo_subdivisions(&mut uninterrupted, &subdivisions, 0.01)
+            .expect("second uninterrupted Adam update");
+        train_obb_yolo_subdivisions(&mut resumed, &subdivisions, 0.01)
+            .expect("resumed Adam update");
+        assert_eq!(resumed.adam_step(), 2);
+        assert_eq!(resumed.params, uninterrupted.params);
+        let _ = fs::remove_file(path);
     }
 
     #[test]
