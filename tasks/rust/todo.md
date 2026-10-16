@@ -7,6 +7,22 @@ Goal: cuda-oxide backend `src/darknet-cuda-oxide` implementing `F32TensorOpsBack
 > file tracks only open / partial / deferred items. Phase tables live in
 > [`layers.md`](layers.md); the FP8/FP4 plan is [`fp8_fp4.md`](fp8_fp4.md).
 
+## Contents
+
+- [Build/test](#buildtest-one-command-at-a-time-repo-root)
+- [Hardware-blocked](#hardware-blocked-cannot-be-compiledtested-on-this-sm_89-gpu)
+- [Backend / kernel follow-ups](#backend--kernel-follow-ups)
+- [Gradients](#gradients)
+- [P8/P9 training follow-ups](#p8p9-training-follow-ups)
+- [Data pipeline](#data-pipeline)
+- [FP8 / FP4](#fp8--fp4-fp8_fp4md)
+- [Layer port](#layer-port-phases-1b4--see-layersmd-phase-tables)
+- [Two unstarted plans](#two-unstarted-plans)
+- [Known evidence gaps](#known-evidence-gaps-not-user-questions)
+- [Not implemented by design](#not-implemented-by-design--no-scanned-cfg-needs-it)
+- [Known small diffs vs C++](#known-small-diffs-vs-c)
+- [Version rewrite](#version-rewrite-v0001--v000246)
+
 ## Build/test (one command at a time, repo root)
 
 ```
@@ -338,13 +354,17 @@ Immediately next, in dependency order:
   source aliases; `obb_` passed 120 core + 2 CLI tests. v164 implements source
   `greedynms` (fixed 0.6 DIoU exponent) and `diounms` (`beta_nms`, default 0.6)
   using AABB box formulas; non-finite betas and mismatched multi-head DIoU betas
-  fail explicitly. The NMS/cfg/multi-head tests and `MEM=3G ./tools/test_host.sh obb_`
-  (122 core + 2 CLI tests) passed. Weighted OBB merge remains unsupported; no
-  compiled-C++ parity is established.
-  Still open: broader GPU/optimizer integration, CARPN OBB validation/map,
-  remaining cfg/training option wiring, inference integration beyond legacy OBB
-  `detect-image`, remaining metric/loss logging, source-faithful crop/resize and
-  mosaic label transforms, weighted OBB NMS, and CARPN network decoding/validation.
+  fail explicitly. v0.0.249 adds CPU OBB Adam with subdivision-correct updates and
+  DNOPT sidecar moments; v0.0.250 adds photometric augmentation while retaining
+  explicit rejection of unsupported geometry; v0.0.251 adds weighted OBB NMS
+  (`obb_w`/`obb_wnms`); v0.0.252 defaults omitted OBB jitter to zero; v0.0.253
+  implements multiplicative CIoU-OBB loss and its six-coordinate finite-difference
+  gradients. The current direct `cargo test -p darknet-core -p darknet-cli -j 2
+  -- obb_` filter passes 135 core + 3 CLI tests (uncapped; user systemd bus
+  unavailable). No compiled-C++ parity is established.
+  Still open: broader OBB GPU training/validation, CARPN network decode and
+  validation/map integration, remaining cfg/training-option wiring, source-faithful
+  geometric augmentation/label transforms, and any unimplemented OBB source paths.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and
   kernels, weights order `weights.cpp:428`); then `deform_conv`, `dsconv`,
   `graph_conv`, `wmhf`, `clifford`, `recursive_block`.

@@ -11,7 +11,7 @@ is next. The authoritative plan is `tasks/rust/layers.md`; the FP8/FP4 plan is
 - [User decisions](#user-decisions-2026-10-04--all-open-questions-answered-yes)
 - [Implemented](#implemented)
 - [Verification commands](#verification-commands)
-- [Next steps](#next-in-dependency-order-nothing-blocked)
+- [Next steps](#next-general-layer-port-roadmap)
 - [Known evidence gaps](#known-evidence-gaps-not-user-questions)
 - [Task plans not started](#task-plans-not-started)
 
@@ -44,7 +44,10 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
-- v0.0.251 (`968c1beb`; gate incomplete): added source-derived OBB weighted NMS. Reference is `raptor:src-lib/box.cpp` (`diounms_sort`, not `yolo_layer.cpp`): `overlap = obb_iou - (d²/c²)^beta_nms`, where `obb_iou = detection_obb_iou(i,j)`, `d²` is center-distance squared, and `c²` is the enclosing AABB diagonal squared; merge weights are `w_i = prob_i[k]` and `w_j = prob_j[k] * obb_iou`, used to average box x/y/w/h and the keeper front point. Source enum spelling is `OBB_W_NMS`; cfg aliases are `obb_w` and `obb_wnms`. The four `weighted_merge_*` tests and the cfg/multi-head-beta tests passed. Direct `cargo test -p darknet-core -p darknet-cli -j 2 -- obb_` (uncapped because `systemd-run` has no user bus) ran 132 core tests: 131 passed, 1 failed; CLI ran 3 passed. The unrelated OBB-training failure is `train::tests::obb_batch_loader_applies_configured_seeded_flips_to_images_and_labels`, which rejects geometric option `jitter`; stop here and resolve/report before advancing T1.4. No compiled-C++ parity is claimed.
+- v0.0.251 (`968c1beb`; gate incomplete): added source-derived OBB weighted NMS. Reference is `raptor:src-lib/box.cpp` (`diounms_sort`, not `yolo_layer.cpp`): `overlap = obb_iou - (d²/c²)^beta_nms`, where `obb_iou = detection_obb_iou(i,j)`, `d²` is center-distance squared, and `c²` is the enclosing AABB diagonal squared; merge weights are `w_i = prob_i[k]` and `w_j = prob_j[k] * obb_iou`, used to average box x/y/w/h and the keeper front point. Source enum spelling is `OBB_W_NMS`; cfg aliases are `obb_w` and `obb_wnms`. The four `weighted_merge_*` tests and the cfg/multi-head-beta tests passed. Its OBB-filtered run had 131/132 core tests and 3/3 CLI tests pass; the loader failure is resolved by v0.0.252 below. No compiled-C++ parity is claimed.
+- v0.0.252 (`fae49267`): omitted OBB `jitter` now defaults to zero while other detector heads retain their existing default; configured unsupported geometric augmentation remains rejected. The seeded flip/loader tests pass, including the prior `obb_batch_loader_applies_configured_seeded_flips_to_images_and_labels` failure.
+- v0.0.253 (`31219aba`): implemented the parsed `ciou_obb_mul` training route. Source `raptor:src-lib/box.cpp` defines `L = max(0, 1 - S)`, `S = clamp(CIoU_obb * cos_half_theta, 0, 1)`; `raptor:src-lib/yolo_layer_obb.cpp` and `dx_box_ciou_obb_multiplicative_loss` define six decoded-geometry central differences with `eps = 1e-3 * (abs(value) + 1)`, clamping perturbed width/height to at least `1e-6`. Rust chains these gradients through the box/front channels, scales/clips deltas, and routes front-anchor offsets through both passes. The cfg now builds both training configs instead of rejecting the loss. `ciou_obb_mul` tests and direct `cargo test -p darknet-core -p darknet-cli -j 2 -- obb_` passed (135 core + 3 CLI); uncapped because the user systemd bus is unavailable. No compiled-C++ parity is claimed.
+- Full host baseline attempt: direct uncapped `cargo test -p darknet-core -p darknet-cli -j 2` passed 562/562 core unit tests and 23/23 CLI tests; preceding integration targets passed. The `cfg_corpus` integration test failed after 3943.36 s with four entries: `cfg/cspx-p7-mish.cfg` and `cfg/cspx-p7-mish_hp.cfg` report CPU inference failure at child execution with an empty child error; `cfg/lstm.train.cfg` and `cfg/rnn.train.cfg` exceed the 300 s per-cfg CPU inference timeout. The wrapper's `systemd-run --user` memory cap is unavailable. Do not fix these unrelated corpus failures in the OBB task; baseline triage is still open, and later waves remain gated.
 - v164: OBB NMS now supports source `greedynms` (fixed 0.6 DIoU exponent) and `diounms` (configurable `beta_nms`, default 0.6), using the source AABB-based formulas. Multi-head DIoU configs with mismatched betas and non-finite `beta_nms` are rejected. The NMS scoring/cfg/multi-head tests passed; `MEM=3G ./tools/test_host.sh obb_` passed 122 core + 2 CLI tests. Weighted OBB merge remains unsupported; no compiled-C++ parity is claimed.
 - v163: OBB NMS now accepts source `default` and `cornersnms` kinds and routes both through the source AABB-IoU suppression path; existing `obb` remains orientation-aware, and source `obb_nms`/`obbnms` aliases parse. The NMS-kind cfg and overlap tests passed; `MEM=3G ./tools/test_host.sh obb_` passed 120 core + 2 CLI tests. `greedynms`, `diounms`, and weighted OBB NMS remain unsupported; no compiled-C++ parity is claimed.
 - v162: `detect-image` now routes `[net] obb=1` inference through the orientation-aware OBB decoder and reports the legacy front point in human output and full-precision `det_obb` TSV rows; unsupported mixed OBB/modern heads fail explicitly. The dispatch/formatting CLI test passed, `detect_` passed 2 CLI tests, and `obb_` passed 119 core + 2 CLI tests. CARPN network decoding remains unsupported; no compiled-C++ parity is claimed.
@@ -623,7 +626,9 @@ MEM=3G ./tools/test_oxide.sh                      # ~15 min, 18 suites
 per-cfg timeout when the suite shares the machine, so run it on its own before
 believing a `cfg_corpus` failure.
 
-## NEXT (in dependency order, nothing blocked)
+## NEXT (general layer-port roadmap)
+
+**Open-items plan gate:** OBB CPU tasks 1.1–1.4 are complete, but Task 0.2 is not green: the full uncapped host suite reports the `cfg_corpus` failures recorded above. Do not start Wave 2 until those failures are triaged or explicitly accepted. The systemd memory cap is unavailable in this WSL session.
 
 1. The LAYA family is **complete** (`laya_scorer`, `laya_marker_gather`,
    `laya_act_head`, `laya_loss`, `laya_encoder`, `laya_head`). The `[vit]`

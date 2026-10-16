@@ -10,3 +10,4 @@
 - Model naming: user means codex model **gpt-6-luna** (NOT gpt-5.6-luna). Do not translate model names to the skill's listed variants; use exactly what the user types. (2026-09-30)
 - Plan source paths can be stale: use `git grep` on the named reference branch to find moved routines before stopping for a missing reference. The weighted OBB NMS code is in `src-lib/box.cpp`, not `yolo_layer.cpp` (2026-10-16).
 - `f32::NAN` is not equal to itself; NaN-preservation tests should assert `.is_nan()` rather than compare whole values with `PartialEq` (2026-10-16).
+- When splitting one OBB loss across box-channel and front-channel passes, each pass must own only its partial gradient; do not write the same front-anchor center-chain term into both passes (2026-10-16).
