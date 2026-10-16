@@ -878,8 +878,7 @@ pub struct YoloSpec {
     pub class_map: Option<Vec<usize>>,
 }
 
-/// NMS variants implemented for the legacy OBB decoder. Weighted OBB merging
-/// remains gated because its geometry-averaging semantics are distinct.
+/// NMS variants implemented for the legacy OBB decoder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObbNmsKind {
     /// Source default NMS: suppress using the decoded axis-aligned box IoU.
@@ -890,8 +889,10 @@ pub enum ObbNmsKind {
     Greedy,
     /// Source DIoU NMS: AABB IoU minus the configurable center-distance term.
     Diou,
-    /// Orientation-aware greedy NMS over legacy front-point detections.
+    /// Orientation-aware greedy NMS over OBB detections.
     Obb,
+    /// DIoU-penalized OBB suppression with confidence×IoU weighted geometry merge.
+    Weighted,
 }
 
 impl ObbNmsKind {
@@ -902,8 +903,9 @@ impl ObbNmsKind {
             "greedynms" => Ok(Self::Greedy),
             "diounms" => Ok(Self::Diou),
             "obb" | "obb_nms" | "obbnms" => Ok(Self::Obb),
+            "obb_w" | "obb_wnms" => Ok(Self::Weighted),
             other => Err(Error::InvalidConfig(format!(
-                "[obb_yolo] at line {line}: unsupported nms_kind {other:?}; implemented kinds are `default`, `cornersnms`, `greedynms`, `diounms`, and `obb`"
+                "[obb_yolo] at line {line}: unsupported nms_kind {other:?}; implemented kinds are `default`, `cornersnms`, `greedynms`, `diounms`, `obb`, and `obb_w`"
             ))),
         }
     }
@@ -4859,6 +4861,8 @@ mod tests {
             ("diounms", ObbNmsKind::Diou),
             ("obb_nms", ObbNmsKind::Obb),
             ("obbnms", ObbNmsKind::Obb),
+            ("obb_w", ObbNmsKind::Weighted),
+            ("obb_wnms", ObbNmsKind::Weighted),
         ] {
             let cfg = format!(
                 "[net]\nwidth=4\nheight=2\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\nnms_kind={kind}\n"

@@ -167,7 +167,7 @@ pub fn decode_obb_yolo_detections(
                 "OBB YOLO heads use different NMS kinds".to_owned(),
             ));
         }
-        if spec.nms_kind == ObbNmsKind::Diou {
+        if matches!(spec.nms_kind, ObbNmsKind::Diou | ObbNmsKind::Weighted) {
             if beta_nms.is_some_and(|beta| beta != spec.beta_nms) {
                 return Err(Error::InvalidConfig(
                     "OBB YOLO heads use different beta_nms values".to_owned(),
@@ -946,6 +946,21 @@ fn bbox_diou(lhs: DetectionBox, rhs: DetectionBox, beta: f32) -> f32 {
     iou - (center_distance_squared / enclosing_diagonal_squared).powf(beta)
 }
 
+/// Source `box_diou_penalty`, used with rotated polygon IoU in weighted OBB NMS.
+fn bbox_diou_penalty(lhs: DetectionBox, rhs: DetectionBox, beta: f32) -> f32 {
+    let enclosing_width = lhs.right().max(rhs.right()) - lhs.left().min(rhs.left());
+    let enclosing_height = lhs.bottom().max(rhs.bottom()) - lhs.top().min(rhs.top());
+    let enclosing_diagonal_squared =
+        enclosing_width * enclosing_width + enclosing_height * enclosing_height;
+    if enclosing_diagonal_squared <= 0.0 || !enclosing_diagonal_squared.is_finite() {
+        return 0.0;
+    }
+
+    let center_distance_squared = (lhs.x - rhs.x).powi(2) + (lhs.y - rhs.y).powi(2);
+    let penalty = (center_distance_squared / enclosing_diagonal_squared).powf(beta);
+    if penalty.is_finite() { penalty } else { 0.0 }
+}
+
 /// IoU dispatch used by OBB post-processing.
 ///
 /// Two CARPN quads use explicit polygon IoU. All other OBB pairs use the first
@@ -1011,6 +1026,7 @@ fn apply_obb_nms_by_kind(
             bbox_diou(lhs.detection.bbox, rhs.detection.bbox, beta_nms)
         }),
         ObbNmsKind::Obb => apply_obb_nms(detections, threshold),
+        ObbNmsKind::Weighted => apply_obb_weighted_nms(detections, threshold, beta_nms),
     }
 }
 
@@ -1048,6 +1064,154 @@ fn apply_obb_nms_by_overlap(
             }
             if overlap(keeper, candidate) > threshold {
                 suppressed[j] = true;
+            }
+        }
+    }
+
+    let mut kept = 0usize;
+    for (index, &is_suppressed) in suppressed.iter().enumerate() {
+        if !is_suppressed {
+            if kept != index {
+                detections.swap(kept, index);
+            }
+            kept += 1;
+        }
+    }
+    detections.truncate(kept);
+}
+
+fn weighted_nms_active(detection: &ObbDetection) -> bool {
+    detection.detection.objectness.is_finite()
+        && detection.detection.objectness != 0.0
+        && detection.detection.confidence.is_finite()
+        && detection.detection.confidence != 0.0
+}
+
+fn obb_front_point(geometry: ObbDetectionGeometry) -> Option<(f32, f32)> {
+    match geometry {
+        ObbDetectionGeometry::FrontPoint { x, y } => Some((x, y)),
+        ObbDetectionGeometry::CarpnQuad(vertices) => Some((vertices[0], vertices[1])),
+    }
+}
+
+fn set_obb_front_point(geometry: &mut ObbDetectionGeometry, x: f32, y: f32) {
+    match geometry {
+        ObbDetectionGeometry::FrontPoint {
+            x: front_x,
+            y: front_y,
+        } => {
+            *front_x = x;
+            *front_y = y;
+        }
+        ObbDetectionGeometry::CarpnQuad(vertices) => {
+            vertices[0] = x;
+            vertices[1] = y;
+        }
+    }
+}
+
+/// Source `OBB_W_NMS`: DIoU-penalized polygon suppression and confidence×IoU
+/// weighted averaging of box coordinates and the keeper's front point.
+fn apply_obb_weighted_nms(detections: &mut Vec<ObbDetection>, threshold: f32, beta_nms: f32) {
+    detections.sort_by(|lhs, rhs| {
+        let lhs_inactive = !weighted_nms_active(lhs);
+        let rhs_inactive = !weighted_nms_active(rhs);
+        lhs_inactive.cmp(&rhs_inactive).then_with(|| {
+            rhs.detection
+                .confidence
+                .total_cmp(&lhs.detection.confidence)
+        })
+    });
+
+    let mut suppressed = vec![false; detections.len()];
+    for i in 0..detections.len() {
+        if suppressed[i] || !weighted_nms_active(&detections[i]) {
+            continue;
+        }
+
+        // The source accumulates from the unmodified keeper and writes the merge
+        // only after scanning all lower-ranked detections.
+        let keeper = detections[i].clone();
+        let self_weight = keeper.detection.confidence;
+        let mut coordinate_weight_sum = self_weight;
+        let mut x_sum = keeper.detection.bbox.x * self_weight;
+        let mut y_sum = keeper.detection.bbox.y * self_weight;
+        let mut w_sum = keeper.detection.bbox.w * self_weight;
+        let mut h_sum = keeper.detection.bbox.h * self_weight;
+        let keeper_front = obb_front_point(keeper.geometry);
+        let mut front_weight_sum = if keeper_front.is_some() {
+            self_weight
+        } else {
+            0.0
+        };
+        let mut front_x_sum = keeper_front.map_or(0.0, |(x, _)| x * self_weight);
+        let mut front_y_sum = keeper_front.map_or(0.0, |(_, y)| y * self_weight);
+
+        for j in (i + 1)..detections.len() {
+            if suppressed[j]
+                || detections[j].detection.class_id != keeper.detection.class_id
+                || !weighted_nms_active(&detections[j])
+            {
+                continue;
+            }
+
+            let obb_iou = detection_obb_iou(&keeper, &detections[j]);
+            if !obb_iou.is_finite() {
+                continue;
+            }
+            let overlap = obb_iou
+                - bbox_diou_penalty(
+                    keeper.detection.bbox,
+                    detections[j].detection.bbox,
+                    beta_nms,
+                );
+            if overlap > threshold {
+                let candidate_weight = detections[j].detection.confidence * obb_iou;
+                if candidate_weight.is_finite() {
+                    let candidate_box = detections[j].detection.bbox;
+                    coordinate_weight_sum += candidate_weight;
+                    x_sum += candidate_box.x * candidate_weight;
+                    y_sum += candidate_box.y * candidate_weight;
+                    w_sum += candidate_box.w * candidate_weight;
+                    h_sum += candidate_box.h * candidate_weight;
+                    if keeper_front.is_some()
+                        && let Some((front_x, front_y)) = obb_front_point(detections[j].geometry)
+                    {
+                        front_weight_sum += candidate_weight;
+                        front_x_sum += front_x * candidate_weight;
+                        front_y_sum += front_y * candidate_weight;
+                    }
+                }
+                suppressed[j] = true;
+            }
+        }
+
+        if coordinate_weight_sum.is_finite() && coordinate_weight_sum > 0.0 {
+            let merged = [
+                x_sum / coordinate_weight_sum,
+                y_sum / coordinate_weight_sum,
+                w_sum / coordinate_weight_sum,
+                h_sum / coordinate_weight_sum,
+            ];
+            if merged.iter().all(|value| value.is_finite()) {
+                let bbox = &mut detections[i].detection.bbox;
+                bbox.x = merged[0];
+                bbox.y = merged[1];
+                bbox.w = merged[2];
+                bbox.h = merged[3];
+            }
+        }
+        if front_weight_sum.is_finite() && front_weight_sum > 0.0 {
+            let merged_front = [
+                front_x_sum / front_weight_sum,
+                front_y_sum / front_weight_sum,
+            ];
+            if merged_front.iter().all(|value| value.is_finite()) {
+                set_obb_front_point(
+                    &mut detections[i].geometry,
+                    merged_front[0],
+                    merged_front[1],
+                );
             }
         }
     }
@@ -1528,6 +1692,59 @@ mod obb_postprocess_tests {
     }
 
     #[test]
+    fn weighted_merge_two_overlapping_boxes() {
+        let keeper = rect_detection(0, 0.8, 0.9, [0.0, 1.0]);
+        let mut candidate = rect_detection(0, 0.8, 0.9, [1.0, 1.0]);
+        candidate.detection.bbox.x = 1.0;
+
+        // OBB IoU = 0.6; the enclosing AABB has c² = 5² + 2² = 29,
+        // so the DIoU-penalized overlap is 0.6 - (1/29) > 0.55.
+        // Candidate weight = 0.8 × 0.6 = 0.48, giving x = (0×0.8 + 1×0.48)/1.28.
+        let mut detections = vec![keeper, candidate];
+        apply_obb_nms_by_kind(&mut detections, 0.55, ObbNmsKind::Weighted, 1.0);
+
+        assert_eq!(detections.len(), 1);
+        assert!((detections[0].detection.bbox.x - 0.375).abs() < 1e-6);
+        assert!((detections[0].detection.bbox.y).abs() < 1e-6);
+        assert!((detections[0].detection.bbox.w - 4.0).abs() < 1e-6);
+        assert!((detections[0].detection.bbox.h - 2.0).abs() < 1e-6);
+        assert!(matches!(
+            detections[0].geometry,
+            ObbDetectionGeometry::FrontPoint { x, y }
+                if (x - 0.375).abs() < 1e-6 && (y - 1.0).abs() < 1e-6
+        ));
+    }
+
+    #[test]
+    fn weighted_merge_single_box_unchanged() {
+        let original = rect_detection(0, 0.8, 0.9, [0.0, 1.0]);
+        let mut detections = vec![original.clone()];
+        apply_obb_nms_by_kind(&mut detections, 0.5, ObbNmsKind::Weighted, 0.6);
+        assert_eq!(detections, vec![original]);
+    }
+
+    #[test]
+    fn weighted_merge_disjoint_boxes_kept() {
+        let first = rect_detection(0, 0.9, 0.9, [0.0, 1.0]);
+        let mut second = rect_detection(0, 0.8, 0.9, [10.0, 1.0]);
+        second.detection.bbox.x = 10.0;
+        let mut detections = vec![first, second];
+        apply_obb_nms_by_kind(&mut detections, 0.1, ObbNmsKind::Weighted, 0.6);
+        assert_eq!(detections.len(), 2);
+    }
+
+    #[test]
+    fn weighted_merge_nan_score_does_not_panic() {
+        let nan_scored = rect_detection(0, f32::NAN, 0.9, [0.0, 1.0]);
+        let valid = rect_detection(0, 0.8, 0.9, [0.0, 1.0]);
+        let mut detections = vec![nan_scored.clone(), valid.clone()];
+        apply_obb_nms_by_kind(&mut detections, 0.0, ObbNmsKind::Weighted, 0.6);
+        assert_eq!(detections.len(), 2);
+        assert!(detections.iter().any(|d| d.detection.confidence.is_nan()));
+        assert!(detections.iter().any(|d| d == &valid));
+    }
+
+    #[test]
     fn zero_objectness_candidates_never_suppress_or_get_suppressed() {
         let inactive = rect_detection(0, 0.99, 0.0, [0.0, 1.0]);
         let active = rect_detection(0, 0.8, 0.9, [0.0, 1.0]);
@@ -1612,23 +1829,28 @@ mod obb_network_decode_tests {
 
     #[test]
     fn network_decode_rejects_mismatched_diou_betas_across_heads() {
-        let cfg = ConfigFile::parse_str(
-            "obb-beta-mismatch.cfg",
-            "[net]\nwidth=4\nheight=2\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\nnms_kind=diounms\nbeta_nms=0.6\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\nnms_kind=diounms\nbeta_nms=1.2\n",
-        )
-        .expect("cfg parses");
-        let network = Network::from_config(cfg).expect("OBB network builds");
-        let heads: Vec<_> = network
-            .layers
-            .iter()
-            .map(|layer| YoloHeadOutput {
-                layer_index: layer.index,
-                output: Tensor::zeros(layer.output_shape),
-            })
-            .collect();
-        let error = decode_obb_yolo_detections(&network, &heads, 4, 2, DetectionOptions::default())
-            .expect_err("DIoU heads need one network-wide beta");
-        assert!(error.to_string().contains("different beta_nms values"));
+        for nms_kind in ["diounms", "obb_w"] {
+            let cfg = ConfigFile::parse_str(
+                "obb-beta-mismatch.cfg",
+                &format!(
+                    "[net]\nwidth=4\nheight=2\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\nnms_kind={nms_kind}\nbeta_nms=0.6\n[obb_yolo]\nclasses=1\nnum=1\nanchors=4,2\nnms_kind={nms_kind}\nbeta_nms=1.2\n"
+                ),
+            )
+            .expect("cfg parses");
+            let network = Network::from_config(cfg).expect("OBB network builds");
+            let heads: Vec<_> = network
+                .layers
+                .iter()
+                .map(|layer| YoloHeadOutput {
+                    layer_index: layer.index,
+                    output: Tensor::zeros(layer.output_shape),
+                })
+                .collect();
+            let error =
+                decode_obb_yolo_detections(&network, &heads, 4, 2, DetectionOptions::default())
+                    .expect_err("DIoU and weighted OBB heads need one network-wide beta");
+            assert!(error.to_string().contains("different beta_nms values"));
+        }
     }
 }
 
