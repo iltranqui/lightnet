@@ -1864,9 +1864,30 @@ pub fn load_obb_training_batch_from_paths(
     })
 }
 
-/// Load an OBB batch by direct resize, then apply configured, seeded
-/// horizontal flips to each image and its labels together. Other augmentation
-/// options are deliberately not applied by this OBB-specific wrapper.
+/// Validate the geometric options that cannot be applied without transforming
+/// OBB labels. Photometric options and horizontal flips are supported.
+pub fn validate_obb_augmentation(
+    augmentation: &crate::augmentation::DetectorAugmentation,
+) -> Result<()> {
+    let unsupported = [
+        ("jitter", augmentation.jitter != 0.0),
+        ("resize", augmentation.resize != 1.0),
+        ("letter_box", augmentation.letter_box),
+        ("mixup", augmentation.mixup),
+        ("mosaic", augmentation.mosaic),
+        ("mosaic_bound", augmentation.mosaic_bound),
+        ("random", augmentation.random != 0.0),
+    ];
+    if let Some((name, _)) = unsupported.into_iter().find(|(_, active)| *active) {
+        return Err(Error::InvalidConfig(format!(
+            "OBB training does not support geometric augmentation option `{name}`"
+        )));
+    }
+    Ok(())
+}
+
+/// Load an OBB batch by direct resize, apply seeded photometric distortion to
+/// image pixels only, then apply horizontal flips to images and OBB labels.
 pub fn load_obb_training_batch_with_flips_from_paths(
     network: &Network,
     data: &DataConfig,
@@ -1876,7 +1897,41 @@ pub fn load_obb_training_batch_with_flips_from_paths(
     seed: u64,
     sample_start: u64,
 ) -> Result<ObbTrainingBatch> {
+    validate_obb_augmentation(augmentation)?;
     let mut batch = load_obb_training_batch_from_paths(network, data, image_paths, start_index)?;
+    let sample_len = batch.input.shape.element_count();
+    let mut photometric = augmentation.clone();
+    photometric.jitter = 0.0;
+    photometric.resize = 1.0;
+    photometric.flip = false;
+    photometric.letter_box = false;
+    photometric.mixup = false;
+    photometric.mosaic = false;
+    photometric.mosaic_bound = false;
+    photometric.random = 0.0;
+    for sample_index in 0..batch.input.shape.batch {
+        let start = sample_index * sample_len;
+        let end = start + sample_len;
+        let image = PlanarRgbImage {
+            shape: TensorShape::new(
+                batch.input.shape.width,
+                batch.input.shape.height,
+                batch.input.shape.channels,
+                1,
+            ),
+            data: batch.input.data[start..end].to_vec(),
+        };
+        let sample = sample_start.wrapping_add(sample_index as u64);
+        let (augmented, _) = photometric.apply(
+            &image,
+            &[],
+            batch.input.shape.width,
+            batch.input.shape.height,
+            seed,
+            sample,
+        )?;
+        batch.input.data[start..end].copy_from_slice(&augmented.data);
+    }
     let flips = augmentation.horizontal_flip_mask(seed, sample_start, batch.input.shape.batch);
     batch.apply_horizontal_flips(&flips)?;
     Ok(batch)
@@ -2743,6 +2798,29 @@ mod tests {
         }
     }
 
+    fn obb_photometric_fixture(
+        name: &str,
+    ) -> (
+        DataConfig,
+        PathBuf,
+        crate::augmentation::DetectorAugmentation,
+    ) {
+        let dir = temp_path(name);
+        let _ = fs::create_dir_all(&dir);
+        let image_path = dir.join("sample.ppm");
+        fs::write(&image_path, b"P6\n2 1\n255\n\x80\x40\x20\x20\x60\xa0")
+            .expect("photometric image writes");
+        fs::write(dir.join("sample.txt"), "0 0.5 0.5 0.5 1 0.75 0.5\n").expect("OBB label writes");
+        let cfg = ConfigFile::parse_str(
+            "obb-photometric.cfg",
+            "[net]\nwidth=2\nheight=1\nchannels=3\nobb=1\nflip=0\nexposure=1.5\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\njitter=0\n",
+        )
+        .expect("photometric cfg parses");
+        let augmentation = crate::augmentation::DetectorAugmentation::from_config(&cfg)
+            .expect("photometric augmentation parses");
+        (empty_data_config(Some(1)), image_path, augmentation)
+    }
+
     fn empty_data_config(classes: Option<usize>) -> DataConfig {
         DataConfig {
             source: PathBuf::new(),
@@ -3344,6 +3422,58 @@ mod tests {
             batch.labels[2][0], untouched,
             "unselected labels stay unchanged"
         );
+    }
+
+    #[test]
+    fn obb_photometric_changes_pixels_not_labels() {
+        let network = obb_test_network(1);
+        let (data, image_path, augmentation) =
+            obb_photometric_fixture("darknet-obb-photometric-pixels");
+        let paths = [image_path];
+        let original = load_obb_training_batch_from_paths(&network, &data, &paths, 0)
+            .expect("original batch loads");
+        let augmented = load_obb_training_batch_with_flips_from_paths(
+            &network,
+            &data,
+            &paths,
+            0,
+            &augmentation,
+            41,
+            7,
+        )
+        .expect("photometric OBB batch loads");
+        assert_ne!(augmented.input, original.input);
+        assert_eq!(augmented.labels, original.labels);
+    }
+
+    #[test]
+    fn obb_photometric_is_seed_deterministic() {
+        let network = obb_test_network(1);
+        let (data, image_path, augmentation) =
+            obb_photometric_fixture("darknet-obb-photometric-deterministic");
+        let paths = [image_path];
+        let first = load_obb_training_batch_with_flips_from_paths(
+            &network,
+            &data,
+            &paths,
+            0,
+            &augmentation,
+            99,
+            12,
+        )
+        .expect("first seeded batch loads");
+        let second = load_obb_training_batch_with_flips_from_paths(
+            &network,
+            &data,
+            &paths,
+            0,
+            &augmentation,
+            99,
+            12,
+        )
+        .expect("second seeded batch loads");
+        assert_eq!(first.input, second.input);
+        assert_eq!(first.labels, second.labels);
     }
 
     #[test]

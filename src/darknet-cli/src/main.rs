@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "oxide")]
 use darknet_core::GpuExecutableNetwork;
+use darknet_core::train::validate_obb_augmentation;
 use darknet_core::{
     ConfigFile, DataConfig, Detection, DetectionOptions, DetectorAugmentation, ExecutableNetwork,
     ForwardResult, LayerKind, LayerParams, Network, ObbDetection, ObbDetectionGeometry,
@@ -2394,21 +2395,7 @@ fn run_detector_train_cpu_obb(
     if options.dynamic_loss_scale {
         return Err("OBB CLI dynamic loss scaling requires the Oxide training path".into());
     }
-    if augmentation.jitter != 0.0
-        || augmentation.resize != 1.0
-        || augmentation.letter_box
-        || augmentation.hue != 0.0
-        || augmentation.saturation != 1.0
-        || augmentation.exposure != 1.0
-        || augmentation.mixup
-        || augmentation.mosaic
-        || augmentation.mosaic_bound
-        || augmentation.random != 0.0
-    {
-        return Err(
-            "OBB CLI training currently supports only direct resize and seeded horizontal flips; disable other augmentation options".into(),
-        );
-    }
+    validate_obb_augmentation(&augmentation)?;
 
     initialize_training_params(&executable.network, &mut executable.params, options.seed);
     let mut seen = 0u64;
@@ -3305,11 +3292,25 @@ mod tests {
     use super::{
         DetectionOptions, ImageDetections, MapOptions, MapSchedule, ObbDetectionGeometry,
         TrainOptions, classify_detector_train_paths, decode_image_detections,
-        format_obb_detection_line, run_detector_train_cpu,
+        format_obb_detection_line, run_detector_train_cpu, validate_obb_augmentation,
     };
 
     fn options(args: &[&str]) -> Result<TrainOptions, Box<dyn std::error::Error>> {
         TrainOptions::parse(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn obb_cli_still_rejects_mosaic() {
+        use darknet_core::{ConfigFile, DetectorAugmentation};
+
+        let cfg = ConfigFile::parse_str(
+            "obb-mosaic-cli.cfg",
+            "[net]\nwidth=2\nheight=1\nchannels=3\nobb=1\nmosaic=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\njitter=0\n",
+        )
+        .expect("cfg parses");
+        let augmentation = DetectorAugmentation::from_config(&cfg).expect("augmentation parses");
+        let error = validate_obb_augmentation(&augmentation).expect_err("mosaic stays rejected");
+        assert!(error.to_string().contains("`mosaic`"));
     }
 
     #[test]
