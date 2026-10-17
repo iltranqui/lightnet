@@ -100,6 +100,8 @@ pub(crate) mod shortcut_weights;
 pub mod train;
 #[allow(dead_code)] // VC reference helpers are integrated incrementally.
 pub(crate) mod vc_attention;
+#[allow(dead_code)] // Swin host-reference helpers are integrated incrementally.
+pub(crate) mod swin;
 pub(crate) mod vit;
 pub mod weights;
 
