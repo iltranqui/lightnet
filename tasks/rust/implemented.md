@@ -481,6 +481,14 @@ still NOT RUN (no `Jev_laya` build here; `test_data/laya/` has only the shared
   finite E4M3 code round trip, special/subnormal/saturation cases, hand-derived
   ExpCast outputs, and invalid inputs. `MEM=3G ./tools/test_host.sh vc_attention`
   passed 4 tests. Helpers are not wired into cfg/runtime; no compiled-C++ parity.
+- v0.0.262 (`18ad3547`): added the source-style V-Smooth transformation with
+  per-64-token means, global per-channel residual scale, permutation support,
+  E4M3 residual reconstruction, and a piecewise-exact derivative. Backward
+  explicitly errors at E4M3 rounding boundaries and tied/zero scale maxima,
+  where the classical derivative is undefined.
+  `MEM=3G ./tools/test_host.sh vc_attention` passed 7 tests, including central
+  finite differences away from quantization boundaries. This is an isolated math
+  primitive, not an integrated VC attention path or compiled-C++ parity.
 - Earlier focused evidence: full host unit suites pass (`darknet-core` 377,
   `darknet-cli` 18); targeted check/build pass with `-j 4`. The full
   `cfg_corpus` integration run exceeded a 30-minute timeout. C++ dump parity NOT
