@@ -3188,6 +3188,10 @@ fn print_forward_backward_summary(
                 .updates
                 .to_blob()
                 .is_ok_and(|blob| blob.iter().any(|value| *value != 0.0)),
+            darknet_core::LayerTrainBuffers::TuckerAttention(tucker) => {
+                tucker.bias_updates.iter().any(|value| *value != 0.0)
+                    || tucker.weight_updates.iter().any(|value| *value != 0.0)
+            }
             darknet_core::LayerTrainBuffers::Gru(_)
             | darknet_core::LayerTrainBuffers::Rnn(_)
             | darknet_core::LayerTrainBuffers::Lstm(_)

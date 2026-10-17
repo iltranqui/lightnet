@@ -37,6 +37,12 @@ pub fn initialize_training_params(network: &Network, params: &mut [LayerParams],
             // from the shared blob, not from random init.
             LayerParams::LayaEncoder(_) => {}
             LayerParams::LayaHead(_) => {}
+            LayerParams::TuckerAttention(p) => {
+                let channels = layer.input_shape.channels;
+                let bound = (6.0 / (channels as f32 + channels as f32)).sqrt();
+                rng.weights_with_scale(&mut p.weights, bound);
+                p.biases.fill(0.0);
+            }
             LayerParams::Swin(p) => {
                 let input = layer.input_shape.channels;
                 let output = layer.output_shape.channels;
@@ -288,6 +294,30 @@ mod tests {
         assert!(weights.ln1_gamma.iter().all(|value| *value == 1.0));
         assert!(weights.ln2_gamma.iter().all(|value| *value == 1.0));
         assert_eq!(weights.mhc, crate::swin::SWIN_MHC_DEFAULTS);
+    }
+
+    #[test]
+    fn tucker_attention_training_initialization_uses_source_uniform_bound() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "tucker-init.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=8\n[tucker]\nheads=4\nrank=2\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut first = ExecutableNetwork::new(network.clone());
+        let mut second = ExecutableNetwork::new(network.clone());
+        initialize_training_params(&network, &mut first.params, 53);
+        initialize_training_params(&network, &mut second.params, 53);
+        assert_eq!(first.params, second.params);
+        let LayerParams::TuckerAttention(params) = &first.params[0] else {
+            panic!("Tucker attention params")
+        };
+        let bound = (6.0f32 / 16.0).sqrt();
+        assert!(params.weights.iter().any(|weight| *weight != 0.0));
+        assert!(params.weights.iter().all(|weight| weight.abs() <= bound));
+        assert_eq!(params.biases, vec![0.0; 8]);
     }
 
     #[test]

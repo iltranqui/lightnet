@@ -1532,7 +1532,7 @@ pub struct VitGradients {
     pub mhc: Vec<f32>,
 }
 
-fn tensor_activation(activation: &Activation, x: f32) -> Result<f32, String> {
+pub(crate) fn tensor_activation(activation: &Activation, x: f32) -> Result<f32, String> {
     use Activation::*;
     Ok(match activation {
         Linear => x,
@@ -1570,7 +1570,11 @@ fn tensor_activation(activation: &Activation, x: f32) -> Result<f32, String> {
     })
 }
 
-fn tensor_activation_grad(activation: &Activation, x: f32, y: f32) -> Result<f32, String> {
+pub(crate) fn tensor_activation_grad(
+    activation: &Activation,
+    x: f32,
+    y: f32,
+) -> Result<f32, String> {
     use Activation::*;
     Ok(match activation {
         Linear => 1.0,

@@ -595,6 +595,22 @@ pub struct SwinSpec {
     pub activation: Activation,
 }
 
+/// `[tucker]` / `[tucker_attention]` / `[tucker_attn]`: factorized local attention.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TuckerAttentionSpec {
+    pub filters: usize,
+    pub size: usize,
+    pub heads: usize,
+    pub rank_q: usize,
+    pub rank_k: usize,
+    pub rank_v: usize,
+    pub rank_o: usize,
+    pub activation: Activation,
+    pub msa_enabled: bool,
+    pub msa_block_size: usize,
+    pub msa_topk: usize,
+}
+
 /// `[yolox]`: the anchor-free detection head (Phase 2A of `tasks/rust/layers.md`),
 /// ported from `Jev_laya:src-lib/darknet_cfg.cpp::parse_yolox_section`.  The
 /// layer has no weights and no kernels; see
@@ -1223,6 +1239,8 @@ pub enum LayerKind {
     Vit(VitSpec),
     /// `[swin]`, `[swin_block]`, `[transformer]`, `[transformer_block]`.
     Swin(SwinSpec),
+    /// `[tucker]`, `[tucker_attention]`, `[tucker_attn]`.
+    TuckerAttention(TuckerAttentionSpec),
     /// `[moe_convolutional]`: a learned mixture of `MoeSpec::experts`
     /// convolutional experts gated per image by a small router.
     Moe(MoeSpec),
@@ -1282,6 +1300,7 @@ impl LayerKind {
             Self::LayaHead(_) => "laya_head",
             Self::Vit(_) => "vit",
             Self::Swin(_) => "swin",
+            Self::TuckerAttention(_) => "tucker_attention",
             Self::Moe(_) => "moe_convolutional",
             Self::EmlConvolutional(_) => "eml_convolutional",
             Self::Rnn(_) => "rnn",
@@ -1310,6 +1329,7 @@ impl LayerKind {
             Self::Crnn(spec) => Some(&spec.activation),
             Self::Vit(spec) => Some(&spec.activation),
             Self::Swin(spec) => Some(&spec.activation),
+            Self::TuckerAttention(spec) => Some(&spec.activation),
             _ => None,
         }
     }
@@ -1687,6 +1707,30 @@ impl Layer {
                     },
                 ]);
                 Some(LayerWeights { entries })
+            }
+            LayerKind::TuckerAttention(spec) => {
+                let channels = self.input_shape.channels;
+                let weights = crate::tucker_attention::tucker_weight_count(
+                    channels,
+                    spec.heads,
+                    spec.rank_q,
+                    spec.rank_k,
+                    spec.rank_v,
+                    spec.rank_o,
+                )
+                .expect("validated Tucker attention geometry");
+                Some(LayerWeights {
+                    entries: vec![
+                        WeightsEntry {
+                            array: WeightsArray::Biases,
+                            len: channels,
+                        },
+                        WeightsEntry {
+                            array: WeightsArray::Weights,
+                            len: weights,
+                        },
+                    ],
+                })
             }
             LayerKind::Vit(spec) => {
                 let dim = spec.dim;
@@ -2820,6 +2864,9 @@ fn parse_layer_kind(
         "swin" | "swin_block" | "transformer" | "transformer_block" => {
             LayerKind::Swin(parse_swin_spec(&section, current)?)
         }
+        "tucker" | "tucker_attention" | "tucker_attn" => {
+            LayerKind::TuckerAttention(parse_tucker_attention_spec(&section, current)?)
+        }
         "vit" => {
             let line = section.line;
             let has_filters = section.get("filters").is_some();
@@ -3561,6 +3608,20 @@ fn infer_output_shape(
                 spec.filters,
                 current.batch,
             ))
+        }
+        LayerKind::TuckerAttention(spec) => {
+            if current.width == 0 || current.height == 0 || current.channels == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[tucker_attention] layer #{layer_index} requires non-empty image-shaped input"
+                )));
+            }
+            if spec.filters != current.channels {
+                return Err(Error::InvalidConfig(format!(
+                    "[tucker_attention] layer #{layer_index} requires filters={} to preserve residual channels, got {}",
+                    current.channels, spec.filters
+                )));
+            }
+            Ok(current)
         }
         LayerKind::Vit(spec) => {
             let line = layer_index;
@@ -4382,6 +4443,188 @@ fn parse_swin_spec(section: &RawSection, input: TensorShape) -> Result<SwinSpec>
     })
 }
 
+fn parse_tucker_attention_spec(
+    section: &RawSection,
+    input: TensorShape,
+) -> Result<TuckerAttentionSpec> {
+    const ALLOWED: &[&str] = &[
+        "filters",
+        "size",
+        "heads",
+        "rank",
+        "rank_q",
+        "rank_k",
+        "rank_v",
+        "rank_o",
+        "activation",
+        "msa",
+        "minimax_sparse_attention",
+        "msa_block",
+        "msa_block_size",
+        "msa_topk",
+        "msa_top_blocks",
+        "stream",
+        "wait_stream",
+        "learning_rate",
+        "dont_update",
+        "burnin_update",
+        "train_only_bn",
+        "clip",
+        "grad_centr",
+    ];
+    let line = section.line;
+    if let Some(key) = section
+        .values
+        .keys()
+        .find(|key| !ALLOWED.contains(&key.as_str()))
+    {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: unknown option `{key}`",
+            section.name
+        )));
+    }
+    if input.width == 0 || input.height == 0 || input.channels == 0 {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: preceding layer must output a non-empty image",
+            section.name
+        )));
+    }
+    let filters = section.get_usize("filters", input.channels)?;
+    let size = section.get_usize("size", 7)?;
+    let heads = section.get_usize("heads", 4)?;
+    if filters == 0 || size == 0 || heads == 0 {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: filters, size, and heads must be > 0",
+            section.name
+        )));
+    }
+    if filters != input.channels {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: filters={filters} must equal input channels={} for the identity residual",
+            section.name, input.channels
+        )));
+    }
+    if input.channels % heads != 0 {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: input channels={} must be divisible by heads={heads}",
+            section.name, input.channels
+        )));
+    }
+    let common_rank = section.get_i64("rank", 0)?;
+    let common_rank = if common_rank > 0 {
+        Some(usize::try_from(common_rank).map_err(|_| {
+            Error::InvalidConfig(format!(
+                "[{}] at line {line}: rank is too large for this platform",
+                section.name
+            ))
+        })?)
+    } else {
+        None
+    };
+    let default_rank = (input.channels / 8).max(1);
+    let rank_q = section.get_usize("rank_q", common_rank.unwrap_or(default_rank))?;
+    let rank_k = section.get_usize("rank_k", common_rank.unwrap_or(rank_q))?;
+    let rank_v = section.get_usize("rank_v", common_rank.unwrap_or(rank_q))?;
+    let rank_o = section.get_usize("rank_o", common_rank.unwrap_or(rank_q))?;
+    if rank_q == 0 || rank_k == 0 || rank_v == 0 || rank_o == 0 {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: rank_q, rank_k, rank_v, and rank_o must be > 0",
+            section.name
+        )));
+    }
+    for key in ["stream", "wait_stream"] {
+        let stream = section.get_i64(key, -1)?;
+        if stream != -1 {
+            return Err(Error::InvalidConfig(format!(
+                "[{}] at line {line}: {key}={stream} is unsupported by the Rust runtime",
+                section.name
+            )));
+        }
+    }
+    let msa_enabled = if section.get("msa").is_some() {
+        section.get_bool_int("msa", false)?
+    } else {
+        section.get_bool_int("minimax_sparse_attention", false)?
+    };
+    let msa_block_size = if section.get("msa_block").is_some() {
+        section.get_i64("msa_block", 1)?.max(1) as usize
+    } else if section.get("msa_block_size").is_some() {
+        section.get_i64("msa_block_size", 1)?.max(1) as usize
+    } else {
+        size
+    };
+    let msa_topk = if section.get("msa_topk").is_some() {
+        section.get_i64("msa_topk", 2)?.max(1) as usize
+    } else if section.get("msa_top_blocks").is_some() {
+        section.get_i64("msa_top_blocks", 2)?.max(1) as usize
+    } else {
+        2
+    };
+    let activation = Activation::parse(&section.get_str("activation", "linear"));
+    if let Activation::Other(ref other) = activation {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: unsupported activation={other}",
+            section.name
+        )));
+    }
+    if matches!(
+        activation,
+        Activation::NormalizeChannels
+            | Activation::NormalizeChannelsSoftmax
+            | Activation::NormalizeChannelsSoftmaxMaxval
+    ) {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: channel-normalizing activations are unsupported",
+            section.name
+        )));
+    }
+    let weight_count = crate::tucker_attention::tucker_weight_count(
+        input.channels,
+        heads,
+        rank_q,
+        rank_k,
+        rank_v,
+        rank_o,
+    )
+    .map_err(|error| Error::InvalidConfig(format!("[{}] at line {line}: {error}", section.name)))?;
+    input.channels.checked_add(weight_count).ok_or_else(|| {
+        Error::InvalidConfig(format!(
+            "[{}] at line {line}: total parameter count overflows",
+            section.name
+        ))
+    })?;
+    crate::tucker_attention::validate_geometry(&crate::tucker_attention::TuckerGeometry {
+        batch: input.batch,
+        channels: input.channels,
+        height: input.height,
+        width: input.width,
+        size,
+        heads,
+        rank_q,
+        rank_k,
+        rank_v,
+        rank_o,
+        activation: activation.clone(),
+        msa_enabled,
+        msa_block_size,
+        msa_topk,
+    })
+    .map_err(|error| Error::InvalidConfig(format!("[{}] at line {line}: {error}", section.name)))?;
+    Ok(TuckerAttentionSpec {
+        filters,
+        size,
+        heads,
+        rank_q,
+        rank_k,
+        rank_v,
+        rank_o,
+        activation,
+        msa_enabled,
+        msa_block_size,
+        msa_topk,
+    })
+}
+
 /// C++ `parse_yolox_section`: `classes`(20), `max`(200), `jitter`(0.2) and
 /// `resize`(1.0).  The PP-YOLOE / YOLO-NAS siblings share the first two keys and
 /// add `reg_max`(16); they are not ported yet.
@@ -4436,6 +4679,79 @@ mod tests {
 
     fn build(text: &str) -> crate::error::Result<Network> {
         Network::from_config(ConfigFile::parse_str("t.cfg", text)?)
+    }
+
+    #[test]
+    fn tucker_attention_aliases_defaults_weights_and_rank_precedence() {
+        for alias in ["tucker", "tucker_attention", "tucker_attn"] {
+            let network = build(&format!(
+                "[net]\nwidth=3\nheight=2\nchannels=8\n[{alias}]\n"
+            ))
+            .unwrap();
+            let layer = &network.layers[0];
+            let LayerKind::TuckerAttention(spec) = &layer.kind else {
+                panic!("expected Tucker attention for [{alias}]")
+            };
+            assert_eq!(
+                (
+                    spec.filters,
+                    spec.size,
+                    spec.heads,
+                    spec.rank_q,
+                    spec.rank_k,
+                    spec.rank_v,
+                    spec.rank_o,
+                    spec.msa_enabled,
+                    spec.msa_block_size,
+                    spec.msa_topk,
+                ),
+                (8, 7, 4, 1, 1, 1, 1, false, 7, 2)
+            );
+            assert_eq!(spec.activation, super::Activation::Linear);
+            assert_eq!(layer.kind.name(), "tucker_attention");
+            assert_eq!(layer.output_shape, layer.input_shape);
+            let entries = &layer.weights().unwrap().entries;
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].array.name(), "biases");
+            assert_eq!(entries[0].len, 8);
+            assert_eq!(entries[1].array.name(), "weights");
+            assert_eq!(entries[1].len, 64);
+        }
+
+        let network = build(
+            "[net]\nwidth=3\nheight=2\nchannels=8\n\
+             [tucker_attention]\nrank=2\nrank_q=3\nrank_k=4\n\
+             msa=1\nminimax_sparse_attention=0\n\
+             msa_block=4\nmsa_block_size=2\nmsa_topk=5\nmsa_top_blocks=1\n",
+        )
+        .unwrap();
+        let LayerKind::TuckerAttention(spec) = &network.layers[0].kind else {
+            panic!("expected Tucker attention")
+        };
+        assert_eq!(
+            (spec.rank_q, spec.rank_k, spec.rank_v, spec.rank_o),
+            (3, 4, 2, 2)
+        );
+        assert!(spec.msa_enabled);
+        assert_eq!((spec.msa_block_size, spec.msa_topk), (4, 5));
+    }
+
+    #[test]
+    fn tucker_attention_rejects_unknown_and_invalid_geometry() {
+        for options in [
+            "filters=4",
+            "size=0",
+            "heads=0",
+            "heads=3",
+            "rank_q=0",
+            "rank=-1\nrank_q=0",
+            "unknown_option=1",
+            "activation=normalize_channels",
+            "stream=0",
+        ] {
+            let text = format!("[net]\nwidth=3\nheight=2\nchannels=8\n[tucker]\n{options}\n");
+            assert!(build(&text).is_err(), "accepted invalid options: {options}");
+        }
     }
 
     #[test]

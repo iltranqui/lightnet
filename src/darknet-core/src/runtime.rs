@@ -252,6 +252,8 @@ pub enum LayerParams {
     Vit(crate::vit::VitWeights),
     /// `[swin]` parameters in the Rust-defined Swin blob order.
     Swin(crate::swin::SwinWeights),
+    /// `[tucker_attention]`: bias followed by flat Q/K/V/O factor weights.
+    TuckerAttention(crate::tucker_attention::TuckerAttentionParams),
     /// `[moe_convolutional]`: one convolution per expert plus the router's
     /// `[experts, channels]` weights and `[experts]` biases.
     Moe(MoeParams),
@@ -367,6 +369,13 @@ pub struct SwinTrainBuffers {
     pub updates: crate::swin::SwinWeights,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct TuckerAttentionTrainBuffers {
+    /// Accumulated descending update directions for biases and flat weights.
+    pub bias_updates: Vec<f32>,
+    pub weight_updates: Vec<f32>,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayerTrainBuffers {
@@ -384,6 +393,7 @@ pub enum LayerTrainBuffers {
     EmlConvolutional(EmlConvolutionalTrainBuffers),
     Vit(VitTrainBuffers),
     Swin(SwinTrainBuffers),
+    TuckerAttention(TuckerAttentionTrainBuffers),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -520,6 +530,7 @@ pub struct ForwardResult {
     pub eml_caches: Vec<Option<EmlForwardCache>>,
     pub vit_caches: Vec<Option<crate::vit::VitForwardCache>>,
     pub swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>>,
+    pub tucker_attention_caches: Vec<Option<crate::tucker_attention::TuckerAttentionForwardCache>>,
     /// Valid proposal metadata and Stage-2 raw outputs for each `[obb_refine]` layer.
     pub obb_refine_outputs: Vec<crate::carpn::ObbRefineOutput>,
     pub yolo_heads: Vec<YoloHeadOutput>,
@@ -543,6 +554,7 @@ impl ForwardResult {
             eml_caches: Vec::new(),
             vit_caches: Vec::new(),
             swin_caches: Vec::new(),
+            tucker_attention_caches: Vec::new(),
             obb_refine_outputs: Vec::new(),
             yolo_heads,
             modern_heads,
@@ -570,6 +582,7 @@ mod forward_result_from_heads_tests {
         assert!(result.eml_caches.is_empty());
         assert!(result.vit_caches.is_empty());
         assert!(result.swin_caches.is_empty());
+        assert!(result.tucker_attention_caches.is_empty());
         assert!(result.obb_refine_outputs.is_empty());
         assert!(result.yolo_heads.is_empty());
         assert!(result.modern_heads.is_empty());
@@ -1198,6 +1211,19 @@ impl ExecutableNetwork {
                         batch,
                     );
                 }
+                (
+                    LayerParams::TuckerAttention(params),
+                    LayerTrainBuffers::TuckerAttention(train),
+                ) => {
+                    update_tucker_attention_params(
+                        params,
+                        train,
+                        lr * opts.learning_rate_scale,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                }
                 (LayerParams::Vit(params), LayerTrainBuffers::Vit(train)) => {
                     let learned_pos = matches!(self.network.layers[layer_index].kind, LayerKind::Vit(ref spec) if spec.learned_pos_embed);
                     update_vit_params(
@@ -1568,6 +1594,7 @@ impl ExecutableNetwork {
         let mut eml_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches = Vec::with_capacity(self.network.layers.len());
         let mut swin_caches = Vec::with_capacity(self.network.layers.len());
+        let mut tucker_attention_caches = Vec::with_capacity(self.network.layers.len());
         let mut obb_refine_outputs = Vec::new();
         let mut rng_state = 0x9e37_79b9_u64;
 
@@ -1590,6 +1617,7 @@ impl ExecutableNetwork {
             let mut eml_cache = None;
             let mut vit_cache = None;
             let mut swin_cache = None;
+            let mut tucker_attention_cache = None;
             let (output, activation_input) = match (&layer.kind, params) {
                 (
                     LayerKind::Convolutional(spec),
@@ -1787,6 +1815,32 @@ impl ExecutableNetwork {
                         crate::swin_block::swin_forward(&current_input.data, weights, &geometry)
                             .map_err(Error::InvalidConfig)?;
                     swin_cache = Some(cache);
+                    (Tensor::from_data(layer.output_shape, data)?, None)
+                }
+                (LayerKind::TuckerAttention(spec), LayerParams::TuckerAttention(weights)) => {
+                    let geometry = crate::tucker_attention::TuckerGeometry {
+                        batch: current_input.shape.batch,
+                        channels: current_input.shape.channels,
+                        height: current_input.shape.height,
+                        width: current_input.shape.width,
+                        size: spec.size,
+                        heads: spec.heads,
+                        rank_q: spec.rank_q,
+                        rank_k: spec.rank_k,
+                        rank_v: spec.rank_v,
+                        rank_o: spec.rank_o,
+                        activation: spec.activation.clone(),
+                        msa_enabled: spec.msa_enabled,
+                        msa_block_size: spec.msa_block_size,
+                        msa_topk: spec.msa_topk,
+                    };
+                    let (data, cache) = crate::tucker_attention::tucker_attention_forward(
+                        &current_input.data,
+                        weights,
+                        &geometry,
+                    )
+                    .map_err(Error::InvalidConfig)?;
+                    tucker_attention_cache = Some(cache);
                     (Tensor::from_data(layer.output_shape, data)?, None)
                 }
                 (LayerKind::LayaEncoder(spec), LayerParams::LayaEncoder(weights)) => (
@@ -2108,6 +2162,7 @@ impl ExecutableNetwork {
             eml_caches.push(eml_cache);
             vit_caches.push(vit_cache);
             swin_caches.push(swin_cache);
+            tucker_attention_caches.push(tucker_attention_cache);
         }
 
         Ok(ForwardResult {
@@ -2120,6 +2175,7 @@ impl ExecutableNetwork {
             eml_caches,
             vit_caches,
             swin_caches,
+            tucker_attention_caches,
             obb_refine_outputs,
             yolo_heads,
             modern_heads,
@@ -2230,6 +2286,13 @@ impl ExecutableNetwork {
                 "forward Swin cache count mismatch: expected {}, got {}",
                 self.network.layers.len(),
                 forward.swin_caches.len()
+            )));
+        }
+        if forward.tucker_attention_caches.len() != self.network.layers.len() {
+            return Err(Error::InvalidConfig(format!(
+                "forward Tucker attention cache count mismatch: expected {}, got {}",
+                self.network.layers.len(),
+                forward.tucker_attention_caches.len()
             )));
         }
         if layer_output_gradient_seeds.len() != self.network.layers.len() {
@@ -3142,6 +3205,41 @@ impl ExecutableNetwork {
                         &mut layer_output_gradients,
                     )?;
                 }
+                (LayerKind::TuckerAttention(_), LayerParams::TuckerAttention(weights)) => {
+                    let cache = forward
+                        .tucker_attention_caches
+                        .get(layer.index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing [tucker_attention] forward cache for layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let gradients = crate::tucker_attention::tucker_attention_backward(
+                        &grad.data, weights, cache,
+                    )
+                    .map_err(Error::InvalidConfig)?;
+                    let Some(LayerParams::TuckerAttention(slot)) =
+                        param_gradients.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing [tucker_attention] gradient slot for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    let mut gradient_params = weights.clone();
+                    gradient_params.biases = gradients.biases;
+                    gradient_params.weights = gradients.weights;
+                    *slot = gradient_params;
+                    let input_grad = Tensor::from_data(current_input.shape, gradients.input)?;
+                    accumulate_previous_gradient(
+                        layer.index,
+                        &input_grad,
+                        &mut input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
+                }
                 (LayerKind::LayaEncoder(_), LayerParams::LayaEncoder(_))
                 | (LayerKind::LayaHead(_), LayerParams::LayaHead(_)) => {
                     // Frozen (`freeze=1`): no gradient flows to the input.
@@ -3692,6 +3790,17 @@ impl ExecutableNetwork {
                     };
                     accumulate_swin_updates(&mut train.updates, gradient)?;
                 }
+                (LayerKind::TuckerAttention(_), LayerParams::TuckerAttention(gradient)) => {
+                    let Some(LayerTrainBuffers::TuckerAttention(train)) =
+                        self.train_buffers.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing Tucker attention train buffers for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    accumulate_tucker_attention_updates(train, gradient)?;
+                }
                 (_, LayerParams::None) => {}
                 // `[laya_scorer]` is frozen by default, so it has no train
                 // buffers and contributes no parameter gradient.
@@ -3883,6 +3992,7 @@ fn host_adam_scalar_capacity(params: &LayerParams) -> usize {
         .into_iter()
         .sum(),
         LayerParams::Swin(params) => params.parameter_count(),
+        LayerParams::TuckerAttention(params) => params.parameter_count(),
         LayerParams::Moe(params) => {
             params.router_weights.len()
                 + params.router_biases.len()
@@ -5808,6 +5918,7 @@ where
                         | LayerParams::Moe(_)
                         | LayerParams::Gru(_)
                         | LayerParams::Vit(_)
+                        | LayerParams::TuckerAttention(_)
                         | LayerParams::Rnn(_)
                         | LayerParams::Lstm(_)
                         | LayerParams::Crnn(_)
@@ -5815,7 +5926,7 @@ where
                 )
             }) {
                 return Err(Error::InvalidConfig(
-                    "adam=1 on the GPU path supports convolutional, connected, local, shortcut, MoE, standalone batchnorm, ViT, and GRU/RNN/LSTM/CRNN layers"
+                    "adam=1 on the GPU path supports convolutional, connected, local, shortcut, MoE, standalone batchnorm, ViT, Tucker attention, and GRU/RNN/LSTM/CRNN layers"
                         .to_string(),
                 ));
             }
@@ -6144,6 +6255,25 @@ where
                     let moments =
                         moments_all[index].get_or_insert_with(HostAdamLayerState::default);
                     apply_host_adam_swin(params, train, moments, adam)?;
+                }
+                (
+                    LayerParams::TuckerAttention(params),
+                    LayerTrainBuffers::TuckerAttention(train),
+                ) => {
+                    let moments =
+                        moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    apply_host_adam(
+                        &mut params.weights,
+                        &mut train.weight_updates,
+                        &mut moments.weights,
+                        adam,
+                    )?;
+                    apply_host_adam_non_weight(
+                        &mut params.biases,
+                        &mut train.bias_updates,
+                        &mut moments.biases,
+                        adam,
+                    )?;
                 }
                 (LayerParams::Moe(params), LayerTrainBuffers::Moe(train)) => {
                     if params.experts.len() != train.experts.len() {
@@ -6511,6 +6641,19 @@ where
                 }
                 (LayerParams::Swin(params), LayerTrainBuffers::Swin(train)) => {
                     update_swin_params(
+                        params,
+                        train,
+                        lr * layer.train.learning_rate_scale,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                }
+                (
+                    LayerParams::TuckerAttention(params),
+                    LayerTrainBuffers::TuckerAttention(train),
+                ) => {
+                    update_tucker_attention_params(
                         params,
                         train,
                         lr * layer.train.learning_rate_scale,
@@ -6933,6 +7076,9 @@ where
             Vec::with_capacity(self.network.layers.len());
         let mut swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>> =
             Vec::with_capacity(self.network.layers.len());
+        let mut tucker_attention_caches: Vec<
+            Option<crate::tucker_attention::TuckerAttentionForwardCache>,
+        > = Vec::with_capacity(self.network.layers.len());
         let mut gpu_batch_norm_caches = Vec::with_capacity(self.network.layers.len());
         let mut yolo_heads = Vec::new();
         let mut modern_heads = Vec::new();
@@ -6957,6 +7103,7 @@ where
             let mut batch_norm_cache = None;
             let mut vit_cache = None;
             let mut swin_cache = None;
+            let mut tucker_attention_cache = None;
             let mut moe_cache = None;
             let mut eml_cache = None;
             let mut gpu_rnn_cache = None;
@@ -7564,6 +7711,37 @@ where
                     self.backend
                         .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
                         .map_err(|err| backend_error("upload swin output", err))?
+                }
+                (LayerKind::TuckerAttention(spec), LayerParams::TuckerAttention(weights)) => {
+                    let host_input = self
+                        .download_tensor(current_input, layer.input_shape)
+                        .map_err(|err| backend_error("download Tucker attention input", err))?;
+                    let geometry = crate::tucker_attention::TuckerGeometry {
+                        batch: layer.input_shape.batch,
+                        channels: layer.input_shape.channels,
+                        height: layer.input_shape.height,
+                        width: layer.input_shape.width,
+                        size: spec.size,
+                        heads: spec.heads,
+                        rank_q: spec.rank_q,
+                        rank_k: spec.rank_k,
+                        rank_v: spec.rank_v,
+                        rank_o: spec.rank_o,
+                        activation: spec.activation.clone(),
+                        msa_enabled: spec.msa_enabled,
+                        msa_block_size: spec.msa_block_size,
+                        msa_topk: spec.msa_topk,
+                    };
+                    let (data, cache) = crate::tucker_attention::tucker_attention_forward(
+                        &host_input.data,
+                        weights,
+                        &geometry,
+                    )
+                    .map_err(Error::InvalidConfig)?;
+                    tucker_attention_cache = Some(cache);
+                    self.backend
+                        .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
+                        .map_err(|err| backend_error("upload Tucker attention output", err))?
                 }
                 (LayerKind::LayaEncoder(spec), LayerParams::LayaEncoder(weights)) => {
                     let host_input = self
@@ -8483,6 +8661,7 @@ where
             eml_caches.push(eml_cache);
             vit_caches.push(vit_cache);
             swin_caches.push(swin_cache);
+            tucker_attention_caches.push(tucker_attention_cache);
         }
 
         Ok(GpuForwardState {
@@ -8505,6 +8684,7 @@ where
                 eml_caches,
                 vit_caches,
                 swin_caches,
+                tucker_attention_caches,
                 obb_refine_outputs: Vec::new(),
                 yolo_heads,
                 modern_heads,
@@ -10974,7 +11154,10 @@ where
                 // `[laya_act_head]` and the full ViT backward still use the
                 // host fallback; standard-flash dQ/dK/dV dispatches to Oxide
                 // from that fallback when the head dimension is supported.
-                LayerKind::LayaActHead(_) | LayerKind::Vit(_) | LayerKind::Swin(_) => return true,
+                LayerKind::LayaActHead(_)
+                | LayerKind::Vit(_)
+                | LayerKind::Swin(_)
+                | LayerKind::TuckerAttention(_) => return true,
                 // Connected layers are handled on the GPU path with a host
                 // round trip unless their activation or batch norm
                 // (batch-statistics training) is unsupported.
@@ -13181,6 +13364,17 @@ fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
             )
             .expect("validated Swin layer geometry"),
         ),
+        LayerKind::TuckerAttention(spec) => LayerParams::TuckerAttention(
+            crate::tucker_attention::TuckerAttentionParams::zeroed(
+                layer.input_shape.channels,
+                spec.heads,
+                spec.rank_q,
+                spec.rank_k,
+                spec.rank_v,
+                spec.rank_o,
+            )
+            .expect("validated Tucker attention layer geometry"),
+        ),
         LayerKind::Moe(spec) => {
             LayerParams::Moe(default_moe_params(layer.input_shape.channels, spec))
         }
@@ -13378,6 +13572,21 @@ fn default_layer_train_buffers(layer: &crate::model::Layer) -> LayerTrainBuffers
         LayerKind::EmlConvolutional(spec) => LayerTrainBuffers::EmlConvolutional(
             default_eml_convolutional_train_buffers(layer.input_shape.channels, spec),
         ),
+        LayerKind::TuckerAttention(spec) => {
+            let params = crate::tucker_attention::TuckerAttentionParams::zeroed(
+                layer.input_shape.channels,
+                spec.heads,
+                spec.rank_q,
+                spec.rank_k,
+                spec.rank_v,
+                spec.rank_o,
+            )
+            .expect("validated Tucker attention layer geometry");
+            LayerTrainBuffers::TuckerAttention(TuckerAttentionTrainBuffers {
+                bias_updates: vec![0.0; params.biases.len()],
+                weight_updates: vec![0.0; params.weights.len()],
+            })
+        }
         LayerKind::Swin(spec) => {
             let updates = crate::swin::SwinWeights::zeroed_gradients(
                 layer.input_shape.channels,
@@ -13660,6 +13869,14 @@ fn accumulate_vit_updates(
     accumulate_negative_vec(&mut dst.mhc, &src.mhc)
 }
 
+fn accumulate_tucker_attention_updates(
+    dst: &mut TuckerAttentionTrainBuffers,
+    src: &crate::tucker_attention::TuckerAttentionParams,
+) -> Result<()> {
+    accumulate_negative_vec(&mut dst.bias_updates, &src.biases)?;
+    accumulate_negative_vec(&mut dst.weight_updates, &src.weights)
+}
+
 fn accumulate_swin_updates(
     dst: &mut crate::swin::SwinWeights,
     src: &crate::swin::SwinWeights,
@@ -13783,6 +14000,32 @@ fn swin_update_clip_scale(updates: &crate::swin::SwinWeights, max_norm: f64) -> 
     } else {
         1.0
     }
+}
+
+fn update_tucker_attention_params(
+    params: &mut crate::tucker_attention::TuckerAttentionParams,
+    train: &mut TuckerAttentionTrainBuffers,
+    lr: f32,
+    momentum: f32,
+    decay: f32,
+    batch: usize,
+) {
+    sgd_update(
+        &mut params.weights,
+        &mut train.weight_updates,
+        lr,
+        momentum,
+        decay,
+        batch,
+    );
+    sgd_update(
+        &mut params.biases,
+        &mut train.bias_updates,
+        lr,
+        momentum,
+        0.0,
+        batch,
+    );
 }
 
 fn update_swin_params(
@@ -14503,6 +14746,20 @@ fn apply_host_adam_layer(
         (LayerParams::Swin(params), LayerTrainBuffers::Swin(train)) => {
             apply_host_adam_swin(params, train, state, adam)?;
         }
+        (LayerParams::TuckerAttention(params), LayerTrainBuffers::TuckerAttention(train)) => {
+            apply_host_adam(
+                &mut params.weights,
+                &mut train.weight_updates,
+                &mut state.weights,
+                adam,
+            )?;
+            apply_host_adam_non_weight(
+                &mut params.biases,
+                &mut train.bias_updates,
+                &mut state.biases,
+                adam,
+            )?;
+        }
         (LayerParams::Moe(params), LayerTrainBuffers::Moe(train)) => {
             if params.experts.len() != train.experts.len() {
                 return Err(Error::InvalidConfig(
@@ -15164,6 +15421,32 @@ fn load_weights_into_params(
                     spec.heads,
                     spec.size,
                     spec.ffn_ratio,
+                )
+                .map_err(Error::Weights)?;
+            }
+            LayerParams::TuckerAttention(weights) => {
+                let LayerKind::TuckerAttention(spec) = &layer.kind else {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} Tucker attention weights do not match layer kind",
+                        layer.index
+                    )));
+                };
+                let count = layer
+                    .weights()
+                    .ok_or_else(|| {
+                        Error::Weights("Tucker attention layer has no weight metadata".into())
+                    })?
+                    .parameter_count();
+                let mut blob = vec![0.0; count];
+                read_f32_into(&mut file, &mut blob)?;
+                *weights = crate::tucker_attention::TuckerAttentionParams::from_blob(
+                    &blob,
+                    layer.input_shape.channels,
+                    spec.heads,
+                    spec.rank_q,
+                    spec.rank_k,
+                    spec.rank_v,
+                    spec.rank_o,
                 )
                 .map_err(Error::Weights)?;
             }
@@ -21859,6 +22142,126 @@ mod tests {
         assert!((params.patch_bias[0] + 0.05).abs() < 1e-6); // no bias decay
         assert!((params.pos_embed[0] - 0.98).abs() < 1e-6); // learned positions decay
         assert!((params.mhc[0] - (mhc_before - 0.005)).abs() < 1e-6); // 0.1x LR
+    }
+
+    #[test]
+    fn tucker_attention_cpu_and_fake_backend_forward_backward_and_sgd_match() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "tucker-runtime.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=1\n\
+                 [tucker_attention]\nsize=2\nheads=1\nrank=1\nrank_k=2\nrank_o=2\n\
+                 activation=tanh\nmsa=1\nmsa_block=1\nmsa_topk=1\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        let LayerParams::TuckerAttention(params) = &mut cpu.params[0] else {
+            panic!("Tucker attention params")
+        };
+        for (index, weight) in params.weights.iter_mut().enumerate() {
+            *weight = (index as f32 * 0.071).sin() * 0.4 + 0.2;
+        }
+        params.biases.copy_from_slice(&[0.03, -0.02]);
+        let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+        gpu.params = cpu.params.clone();
+        assert!(gpu.requires_cpu_backward_fallback());
+
+        let input = Tensor::from_data(
+            TensorShape::new(2, 2, 2, 1),
+            vec![-0.31, 0.22, 0.48, -0.17, 0.15, 0.33, -0.42, 0.27],
+        )
+        .unwrap();
+        let cpu_forward = cpu.forward(&input).unwrap();
+        assert!(cpu_forward.tucker_attention_caches[0].is_some());
+        let gpu_forward = gpu.forward_training_with_state(&input).unwrap();
+        assert_eq!(
+            gpu_forward.cpu_forward.final_output(),
+            cpu_forward.final_output()
+        );
+        let output = cpu_forward.final_output().unwrap();
+        let seed = Tensor::filled(output.shape, 0.25);
+        let seeds = [Some(seed)];
+        let backward = cpu
+            .backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .unwrap();
+        let LayerParams::TuckerAttention(gradient) = &backward.param_gradients[0] else {
+            panic!("Tucker attention gradients")
+        };
+        assert!(gradient.weights.iter().any(|gradient| *gradient != 0.0));
+        assert!(gradient.biases.iter().any(|gradient| *gradient != 0.0));
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .unwrap();
+        assert_eq!(
+            cpu.train_buffers,
+            gpu.cpu_fallback_train_buffers.borrow().clone()
+        );
+
+        let before = cpu.params[0].clone();
+        cpu.update_weights(0.01, 0.2, 0.1, 1);
+        gpu.update_weights_gpu(0.01, 0.2, 0.1, 1).unwrap();
+        assert_eq!(gpu.params, cpu.params);
+        let LayerParams::TuckerAttention(before) = before else {
+            panic!("Tucker attention params")
+        };
+        let LayerParams::TuckerAttention(after) = &cpu.params[0] else {
+            panic!("Tucker attention params")
+        };
+        assert_ne!(before.weights, after.weights);
+        assert_ne!(before.biases, after.biases);
+    }
+
+    #[test]
+    fn tucker_attention_host_adam_and_fake_backend_updates_match() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "tucker-adam.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=2\nadam=1\ndecay=0.1\n\
+                 [tucker]\nsize=1\nheads=1\nrank=1\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        if let LayerParams::TuckerAttention(params) = &mut cpu.params[0] {
+            params.weights.fill(0.25);
+            params.biases.fill(0.5);
+        } else {
+            panic!("Tucker attention params")
+        }
+        if let LayerTrainBuffers::TuckerAttention(train) = &mut cpu.train_buffers[0] {
+            train.weight_updates.fill(-0.5);
+            train.bias_updates.fill(-0.5);
+        } else {
+            panic!("Tucker attention train buffers")
+        }
+        let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+        gpu.params = cpu.params.clone();
+        *gpu.cpu_fallback_train_buffers.borrow_mut() = cpu.train_buffers.clone();
+
+        cpu.update_weights_adam(0.01, 1).unwrap();
+        gpu.update_weights_gpu(0.01, 0.0, 0.1, 1).unwrap();
+        assert_eq!(gpu.params, cpu.params);
+        assert_eq!(
+            gpu.cpu_fallback_train_buffers.borrow().clone(),
+            cpu.train_buffers
+        );
+
+        let dir = std::env::temp_dir().join(format!("darknet-tucker-adam-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("optimizer.state");
+        cpu.save_optimizer_state(&path).unwrap();
+        let mut restored = ExecutableNetwork::new(network);
+        restored.load_optimizer_state(&path).unwrap();
+        assert_eq!(restored.adam_step(), cpu.adam_step());
+        let round_trip = dir.join("optimizer-round-trip.state");
+        restored.save_optimizer_state(&round_trip).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            std::fs::read(&round_trip).unwrap()
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

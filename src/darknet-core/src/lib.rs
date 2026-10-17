@@ -100,6 +100,7 @@ pub(crate) mod shortcut_weights;
 pub(crate) mod swin;
 pub(crate) mod swin_block;
 pub mod train;
+pub(crate) mod tucker_attention;
 #[allow(dead_code)] // VC reference helpers are integrated incrementally.
 pub(crate) mod vc_attention;
 pub(crate) mod vit;
@@ -117,7 +118,7 @@ pub use image::PlanarRgbImage;
 pub use model::{
     Activation, CrnnSpec, Layer, LayerKind, LayerWeights, LrPolicy, LstmSpec, NetConfig, Network,
     ObbRefineLoss, ObbRefineSpec, RnnSpec, ShortcutWeightsNorm, ShortcutWeightsType, SwinSpec,
-    TensorShape, WeightsArray, YoloIouLoss,
+    TensorShape, TuckerAttentionSpec, WeightsArray, YoloIouLoss,
 };
 pub use names::load_names_file;
 pub use runtime::{
@@ -125,7 +126,8 @@ pub use runtime::{
     CrnnParams, CrnnTrainBuffers, ExecutableNetwork, ForwardResult, GpuExecutableNetwork,
     GpuForwardState, GpuForwardSummary, LayerParams, LayerTrainBuffers, LstmParams,
     LstmTrainBuffers, RecurrentForwardCache, RnnParams, RnnTrainBuffers, ShortcutParams,
-    ShortcutTrainBuffers, Tensor, YoloHeadOutput, compute_learning_rate,
+    ShortcutTrainBuffers, Tensor, TuckerAttentionTrainBuffers, YoloHeadOutput,
+    compute_learning_rate,
 };
 pub use swin::SwinWeights;
 pub use swin_block::SwinForwardCache;
@@ -139,6 +141,7 @@ pub use train::{
     load_obb_training_batch_with_flips_from_paths, load_paths_file, load_training_batch,
     load_training_batch_from_paths, load_yolo_labels, replace_image_to_label,
 };
+pub use tucker_attention::{TuckerAttentionForwardCache, TuckerAttentionParams};
 pub use weights::{WeightsHeader, WeightsInspection, inspect_weights_file, save_weights};
 
 pub const DARKNET_WEIGHTS_VERSION_MAJOR: i32 = 0;

@@ -38,6 +38,7 @@ file is named inline.
 - [7. Layer port — Phase 2B (partial: MoE + EML math)](#7-layer-port--phase-2b-partial-moe--eml-math)
 - [8. Layer port — Phase 3A shared primitives (prerequisite set)](#8-layer-port--phase-3a-shared-primitives-prerequisite-set)
   - [`[vit]` reference layer path (Phase 3A)](#vit-reference-layer-path-phase-3a)
+  - [`[tucker_attention]` reference layer path (Phase 3A)](#tucker_attention-reference-layer-path-phase-3a)
 - [9. Inference parity — LegoGears_v2 (the final target)](#9-inference-parity--legogears_v2-the-final-target)
 - [10. Data augmentation (`augmentation-audit.md`)](#10-data-augmentation-augmentation-auditmd)
 - [11. Housekeeping](#11-housekeeping)
@@ -451,9 +452,11 @@ still NOT RUN (no `Jev_laya` build here; `test_data/laya/` has only the shared
 - Fused residual + per-column bias epilogue (`206accce`).
 - Batched-GEMM wrapper `linear_f32` (torch `nn.Linear` layout, bias as GEMM
   `beta=1`) (`593ea30a`).
-- Row-softmax backward already existed. Unblocks `vit`, `swin`/`transformer`,
-  `tucker_attention`, `mambavision`, `kimi_kda`, `minimax_sparse_attention`,
-  `laya_encoder`/`laya_head`.
+- Row-softmax backward already existed. The shared set supports `vit`,
+  `swin`/`transformer`, and the v0.0.270 Tucker reference. `mambavision` and
+  `kimi_kda` remain open. MiniMax sparse attention is an optional shared utility,
+  not a standalone layer in the audited C++ branch; it is wired into ViT and
+  Tucker.
 
 ### `[vit]` reference layer path (Phase 3A)
 - `model.rs`: cfg aliases/defaults/validation and patch-grid shape inference;
@@ -546,10 +549,30 @@ still NOT RUN (no `Jev_laya` build here; `test_data/laya/` has only the shared
   166, and `weights` passed 29. FakeBackend matches CPU forward/backward and
   updates on a preceding-convolution chain. No native Swin kernel, C++ weights
   writer, or compiled-C++ parity is available.
-- Still open: the other named Phase 3A attention layers—`tucker_attention`,
-  `mambavision`, `kimi_kda`, and `minimax_sparse_attention`—plus separately tracked
-  VC native-kernel/evidence follow-ups; see `todo.md`, `vit_plan.md`, and
-  `swin_plan.md`.
+
+### `[tucker_attention]` reference layer path (Phase 3A)
+
+- v0.0.270: added strict `[tucker]` / `[tucker_attention]` / `[tucker_attn]`
+  parsing, NCHW shape validation, rank/default and MSA alias precedence, and
+  overflow-safe geometry/weight sizing. `Layer::weights()` follows the C++
+  two-block stream: `biases[channels]`, then flat Q/K/V/O factors.
+- Added source-shaped bottom/right zero-padded non-overlapping local windows,
+  Q/K/V low-rank bases and per-head cores, O-core/basis, identity residual,
+  activation, optional MiniMax sparse-row selection, and exact backward of the
+  Rust forward. Backward finite differences cover input, Tanh, MSA routing, and
+  all eight factor blocks; a hand-computed 2×2 window and multi-head derivative
+  are pinned. Seeded init uses the source uniform bound; SGD/Adam update only
+  flat weights with coupled decay, not biases.
+- `weights.rs` writes biases then factors; modern and legacy headers round-trip
+  with exact metadata/trailing-byte checks. GPU f32 uses a host round-trip; no
+  native Tucker kernel exists. `MEM=3G ./tools/test_host.sh tucker_attention`
+  passed 14 tests; `weights` passed 32 and `runtime` 168, including FakeBackend
+  CPU forward/backward/update parity and Adam fallback. Source-derived from
+  `Jev_laya`/`jepa`; no compiled-C++ golden or parity claim.
+- Still open: `mambavision` and `kimi_kda`. MiniMax sparse attention remains a
+  shared option rather than a standalone layer, and its source enablement must
+  be audited in each remaining attention integration. VC native-kernel/evidence
+  follow-ups also remain; see `todo.md`, `vit_plan.md`, and `swin_plan.md`.
 
 ## 9. Inference parity — LegoGears_v2 (the final target)
 

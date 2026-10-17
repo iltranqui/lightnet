@@ -192,6 +192,10 @@ pub fn save_weights(
                 let blob = swin.to_blob().map_err(Error::Weights)?;
                 write_f32_slice(&mut file, &blob)?;
             }
+            (LayerKind::TuckerAttention(_), LayerParams::TuckerAttention(tucker)) => {
+                let blob = tucker.to_blob().map_err(Error::Weights)?;
+                write_f32_slice(&mut file, &blob)?;
+            }
             // C++ `save_moe_convolutional_weights`: every expert's complete
             // convolution block first, then the router biases and weights.
             (LayerKind::Moe(_), LayerParams::Moe(moe)) => {
@@ -661,6 +665,71 @@ mod tests {
     }
 
     #[test]
+    fn tucker_attention_weights_round_trip_bias_then_flat_factors_with_legacy_header() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "tucker-roundtrip.cfg",
+                "[net]\nwidth=3\nheight=2\nchannels=2\n\
+                 [tucker_attention]\nsize=2\nheads=1\nrank=1\nrank_k=2\nrank_o=2\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let LayerParams::TuckerAttention(params) = &mut executable.params[0] else {
+            panic!("Tucker attention params")
+        };
+        params.biases.copy_from_slice(&[0.25, -0.5]);
+        for (index, weight) in params.weights.iter_mut().enumerate() {
+            *weight = index as f32 * 0.125 - 0.25;
+        }
+        let weight_count = params.weights.len();
+
+        let modern_path = std::env::temp_dir().join("darknet-tucker-roundtrip.weights");
+        save_weights(&network, &executable.params, &modern_path, 71).unwrap();
+        let inspection = inspect_weights_file(&network, &modern_path).unwrap();
+        assert_eq!(inspection.trailing_bytes, 0);
+        let arrays = &inspection.layers[0].arrays;
+        assert_eq!(
+            arrays
+                .iter()
+                .map(|array| array.name.as_str())
+                .collect::<Vec<_>>(),
+            ["biases", "weights"]
+        );
+        assert_eq!(
+            arrays.iter().map(|array| array.len).collect::<Vec<_>>(),
+            [2, weight_count]
+        );
+        assert_eq!(arrays[0].byte_offset, 20);
+        assert_eq!(arrays[1].byte_offset, 28);
+        let mut reloaded = ExecutableNetwork::new(network.clone());
+        reloaded.load_weights_file(&modern_path).unwrap();
+        assert_eq!(reloaded.params, executable.params);
+
+        let legacy_path = std::env::temp_dir().join("darknet-tucker-legacy.weights");
+        let modern_bytes = fs::read(&modern_path).unwrap();
+        let mut legacy_bytes = Vec::with_capacity(modern_bytes.len() - 4);
+        legacy_bytes.extend_from_slice(&0i32.to_le_bytes());
+        legacy_bytes.extend_from_slice(&1i32.to_le_bytes());
+        legacy_bytes.extend_from_slice(&0i32.to_le_bytes());
+        legacy_bytes.extend_from_slice(&19u32.to_le_bytes());
+        legacy_bytes.extend_from_slice(&modern_bytes[20..]);
+        fs::write(&legacy_path, legacy_bytes).unwrap();
+        let mut legacy = ExecutableNetwork::new(network);
+        assert_eq!(legacy.load_weights_file(&legacy_path).unwrap().seen, 19);
+        assert_eq!(legacy.params, executable.params);
+        assert_eq!(
+            inspect_weights_file(&legacy.network, &legacy_path)
+                .unwrap()
+                .trailing_bytes,
+            0
+        );
+        let _ = fs::remove_file(modern_path);
+        let _ = fs::remove_file(legacy_path);
+    }
+
+    #[test]
     fn standalone_batchnorm_weights_round_trip_exact_length() {
         let network = Network::from_config(
             ConfigFile::parse_str(
@@ -937,7 +1006,8 @@ mod tests {
                     | LayerParams::Shortcut(_)
                     | LayerParams::Gru(_)
                     | LayerParams::Vit(_)
-                    | LayerParams::Swin(_) => {}
+                    | LayerParams::Swin(_)
+                    | LayerParams::TuckerAttention(_) => {}
                 }
             }
             let path = std::env::temp_dir().join(format!("darknet-{name}-roundtrip.weights"));
