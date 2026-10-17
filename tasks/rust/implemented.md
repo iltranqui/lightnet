@@ -44,6 +44,7 @@ file is named inline.
 - [12. Gradient-shortcut audit (`DARKNET_GRAD_MODE`)](#12-gradient-shortcut-audit-darknet_grad_mode)
 - [13. OBB CPU training gaps (plan-open-items Waves 0–1)](#13-obb-cpu-training-gaps-plan-open-items-waves-01)
 - [14. ONNX export](#14-onnx-export)
+- [15. CARPN sample-level polygon mAP dispatch](#15-carpn-sample-level-polygon-map-dispatch)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -599,9 +600,13 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 - v0.0.256 (`4a0d99e7`): added `export-onnx` CLI parsing, default output path, `--no-fuse`, argument rejection, and usage text. `MEM=3G ./tools/test_host.sh export_onnx_args` and `systemd-run --user --scope -p MemoryHigh=3G cargo build -p darknet-cli -j 2` passed; fused and unfused model exports from a local matching cfg/weights succeeded.
 - v0.0.257 (`778242ab`): added `tools/onnx_check.py`; syntax check passed. ONNX Runtime checks against Rust CPU layer dumps yielded worst relative errors of `3.257e-06` (fused), `3.908e-05` (unfused), and `3.831e-06` (Mish-opset-18 variant), all below `1e-4`. Verified with local cfg/weights/image because the canonical dataset paths are absent. This is Rust-runtime parity; no compiled-C++ golden exists.
 
+## 15. CARPN sample-level polygon mAP dispatch
+
+- v0.0.258 (`7681f478`): `obb_detector_map` now dispatches all-CARPN sample sets to the existing polygon evaluator, rejects mixed front-point/CARPN predictions, and preserves the legacy route for empty prediction sets. `MEM=3G ./tools/test_host.sh obb_map` passed 5 core tests; `MEM=3G ./tools/test_host.sh carpn_polygon_iou` passed 2 core tests. This is caller-provided sample API support only: Rust CARPN network decoding, CLI/training mAP integration, and compiled-C++ parity remain unsupported/not established.
+
 ## Not implemented / open (pointer)
 
 See `tasks/rust/todo.md` for the deduplicated open list (P8/P9 follow-ups,
 fp16 remainder, hardware-blocked wgmma/tcgen05/NVFP4/multi-GPU), `layers.md`
 for Phases 1b–4 (remaining layers), `fp8_fp4.md` for FP8 step 5, and
-`gui_iced_plan.md` for the deferred GUI plan; ONNX export is complete.
+`gui_plan.md` for the deferred GUI plan; ONNX export is complete.

@@ -364,9 +364,11 @@ Immediately next, in dependency order:
   passed 135 core + 4 CLI tests; after systemd scope availability was confirmed,
   `MEM=3G ./tools/test_host.sh obb_` also passed 135 core + 4 CLI tests.
   No compiled-C++ parity is established.
-  Still open: broader OBB GPU training/validation, CARPN network decode and
-  validation/map integration, remaining cfg/training-option wiring, source-faithful
-  geometric augmentation/label transforms, and any unimplemented OBB source paths.
+  v0.0.258 adds sample-level CARPN mAP dispatch through `obb_detector_map`; focused
+  OBB-map and polygon-IoU tests pass. Still open: broader OBB GPU training/validation,
+  CARPN network decode and dataset/CLI/training mAP integration, remaining
+  cfg/training-option wiring, source-faithful geometric augmentation/label transforms,
+  and any unimplemented OBB source paths.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and
   kernels, weights order `weights.cpp:428`); then `deform_conv`, `dsconv`,
   `graph_conv`, `wmhf`, `clifford`, `recursive_block`.
@@ -375,7 +377,8 @@ Immediately next, in dependency order:
 ## Active and unstarted plans
 
 - [x] `onnx.md` — `darknet-rs export-onnx`; all 21 implementation, verification, and bookkeeping steps are complete.
-- [ ] `gui_iced_plan.md` — iced DarkMark-compatible GUI (0/84 steps).
+- [x] `carpn_map_plan.md` — bounded caller-supplied sample dispatch implemented in v0.0.258; end-to-end CARPN network validation remains blocked by missing Rust stage-2 model/decoder.
+- [ ] `gui_plan.md` — egui DarkMark replacement (M0–M6, not started).
 
 ## Known evidence gaps (not user questions)
 
