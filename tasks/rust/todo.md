@@ -9,19 +9,20 @@ Goal: cuda-oxide backend `src/darknet-cuda-oxide` implementing `F32TensorOpsBack
 
 ## Contents
 
-- [Build/test](#buildtest-one-command-at-a-time-repo-root)
-- [Hardware-blocked](#hardware-blocked-cannot-be-compiledtested-on-this-sm_89-gpu)
+- [Build/test (one command at a time, repo root)](#buildtest-one-command-at-a-time-repo-root)
+- [Hardware-blocked (cannot be compiled/tested on this sm_89 GPU)](#hardware-blocked-cannot-be-compiledtested-on-this-sm_89-gpu)
 - [Backend / kernel follow-ups](#backend--kernel-follow-ups)
 - [Gradients](#gradients)
 - [P8/P9 training follow-ups](#p8p9-training-follow-ups)
 - [Data pipeline](#data-pipeline)
-- [FP8 / FP4](#fp8--fp4-fp8_fp4md)
-- [Layer port](#layer-port-phases-1b4--see-layersmd-phase-tables)
-- [Two unstarted plans](#two-unstarted-plans)
-- [Known evidence gaps](#known-evidence-gaps-not-user-questions)
-- [Not implemented by design](#not-implemented-by-design--no-scanned-cfg-needs-it)
+- [FP8 / FP4 (`fp8_fp4.md`)](#fp8--fp4-fp8_fp4md)
+- [Layer port (Phases 1b–4 — see `layers.md` phase tables)](#layer-port-phases-1b4--see-layersmd-phase-tables)
+- [Active and unstarted plans](#active-and-unstarted-plans)
+- [ONNX export](#onnx-export)
+- [Known evidence gaps (not user questions)](#known-evidence-gaps-not-user-questions)
+- [Not implemented by design / no scanned cfg needs it](#not-implemented-by-design--no-scanned-cfg-needs-it)
 - [Known small diffs vs C++](#known-small-diffs-vs-c)
-- [Version rewrite](#version-rewrite-v0001--v000246)
+- [Version rewrite v0.0.001 – v0.0.246](#version-rewrite-v00001--v00246)
 
 ## Build/test (one command at a time, repo root)
 
@@ -359,9 +360,10 @@ Immediately next, in dependency order:
   explicit rejection of unsupported geometry; v0.0.251 adds weighted OBB NMS
   (`obb_w`/`obb_wnms`); v0.0.252 defaults omitted OBB jitter to zero; v0.0.253
   implements multiplicative CIoU-OBB loss and its six-coordinate finite-difference
-  gradients. The current direct `cargo test -p darknet-core -p darknet-cli -j 2
-  -- obb_` filter passes 135 core + 3 CLI tests (uncapped; user systemd bus
-  unavailable). No compiled-C++ parity is established.
+  gradients. The direct `cargo test -p darknet-core -p darknet-cli -j 2 -- obb_` filter
+  passed 135 core + 4 CLI tests; after systemd scope availability was confirmed,
+  `MEM=3G ./tools/test_host.sh obb_` also passed 135 core + 4 CLI tests.
+  No compiled-C++ parity is established.
   Still open: broader OBB GPU training/validation, CARPN network decode and
   validation/map integration, remaining cfg/training-option wiring, source-faithful
   geometric augmentation/label transforms, and any unimplemented OBB source paths.
@@ -370,9 +372,9 @@ Immediately next, in dependency order:
   `graph_conv`, `wmhf`, `clifford`, `recursive_block`.
 - [ ] Phase 4 foveation / depth / DETR. DETR is still broken in C++ (paper only).
 
-## Two unstarted plans
+## Active and unstarted plans
 
-- [ ] `onnx.md` — `darknet-rs export-onnx` (0/23 steps).
+- [x] `onnx.md` — `darknet-rs export-onnx`; all 21 implementation, verification, and bookkeeping steps are complete.
 - [ ] `gui_iced_plan.md` — iced DarkMark-compatible GUI (0/84 steps).
 
 ## Known evidence gaps (not user questions)
@@ -423,3 +425,10 @@ Review:
 - Not pushed. `rust` is now 246 ahead / 7 behind `origin/rust`; updating the remote needs `git push --force-with-lease origin rust` by hand.
 - Left alone: 25 old-hash references in `tasks/rust/` (`implemented.md` 16, `layers.md` 7, `todo.md` 1, `STATUS.md` 1). They still resolve via the backup tag; map above gives replacements.
 - Rollback: `git update-ref refs/heads/rust backup/rust-pre-version`
+
+## ONNX export
+
+- [x] `darknet-rs export-onnx` is implemented: protobuf encoder (`v0.0.254`), supported-layer exporter (`v0.0.255`), CLI (`v0.0.256`), and Rust-runtime checker (`v0.0.257`). Focused results: `MEM=3G ./tools/test_host.sh onnx` passed 11 core tests; `MEM=3G ./tools/test_host.sh export_onnx_args` passed 1 CLI test; `cargo build -p darknet-cli -j 2` passed. The CLI exported both fused and unfused models from `build/logs/verify/lego_cur_cpu/run.cfg` and `run_final.weights`.
+- [x] `python3 -m py_compile tools/onnx_check.py` passed. ONNX Runtime numeric checks against Rust CPU layer dumps passed at tolerance `1e-4`: fused worst relative error `3.257e-06`; unfused `3.908e-05`; Mish-opset-18 variant `3.831e-06`. The Mish test changed Leaky activations to Mish in a temporary cfg while retaining the same real weights; image was `artwork/dog.jpg`.
+- Canonical `/home/kerrigan/src/DarkSuite/datasets/LegoGears_v2` assets are absent in this checkout, so verification used the local matching cfg/weights plus `build/logs/bench/LegoGears.names`; no compiled-C++ parity is claimed. `onnx` Python package is absent, but `onnxruntime`, NumPy, and OpenCV are installed and the emitted models loaded and executed successfully in ONNX Runtime.
+- [x] ONNX plan bookkeeping and verification are complete; version map, `implemented.md`, and `STATUS.md` record the milestone evidence. Follow-ups listed in `tasks/rust/onnx.md` remain out of scope.
