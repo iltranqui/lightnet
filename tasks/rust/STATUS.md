@@ -600,8 +600,9 @@ Latest increments:
   order, decay groups, clipping, and reduced mHC rate; host resume has a
   multi-step continuation test.
 - `[vit]` reference path: cfg/shape, C++-ordered header-aware weights, seeded init,
-  CPU analytical forward/backward + SGD, and GPU f32 host fallback; 23 focused
-  tests pass, targeted package check/build pass with `-j 4`.
+  CPU analytical forward/backward + SGD, and GPU f32 host round-trip with native
+  standard-flash forward/dQKV backward; 28 focused tests pass. Other transformer
+  backward math remains host-side.
 - Host suites: `darknet-core --lib` 390/390 and `darknet-cli` 18/18 pass. The
   real-device `oxide_runtime_chain` suite passes all 7 tests.
   `cfg_corpus` started but the combined host run hit its 30-minute command timeout;
