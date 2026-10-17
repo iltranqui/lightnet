@@ -2060,7 +2060,19 @@ impl Network {
             )));
         };
 
-        let net = NetConfig::from_section(net_section)?;
+        let mut net = NetConfig::from_section(net_section)?;
+        if !net_section.values.contains_key("try_fix_nan") {
+            net.try_fix_nan = cfg.sections.iter().skip(1).any(|section| {
+                matches!(
+                    section.name.as_str(),
+                    "deform_conv"
+                        | "deformable_convolutional"
+                        | "dcnv4"
+                        | "dcnv4_convolutional"
+                        | "dsconv"
+                )
+            });
+        }
         let mut current = net.input_shape();
         let mut layers = Vec::new();
         let cfg_parent = cfg
@@ -5520,6 +5532,33 @@ mod tests {
             ]
         );
         assert_eq!(weights.parameter_count(), 1864);
+    }
+
+    #[test]
+    fn dcnv4_enables_default_try_fix_nan_but_respects_explicit_net_value() {
+        let config = |net_option: &str| {
+            ConfigFile::parse_str(
+                "dcnv4-try-fix-nan.cfg",
+                &format!(
+                    "[net]\nwidth=2\nheight=2\nchannels=1\n{net_option}\n\
+                     [dcnv4]\nsize=1\nactivation=linear\n"
+                ),
+            )
+            .unwrap()
+        };
+        assert!(Network::from_config(config("")).unwrap().net.try_fix_nan);
+        assert!(
+            !Network::from_config(config("try_fix_nan=0"))
+                .unwrap()
+                .net
+                .try_fix_nan
+        );
+        assert!(
+            Network::from_config(config("try_fix_nan=1"))
+                .unwrap()
+                .net
+                .try_fix_nan
+        );
     }
 
     #[test]
