@@ -3211,6 +3211,23 @@ fn print_forward_backward_summary(
                         .as_ref()
                         .is_some_and(|bn| bn.scale_updates.iter().any(|value| *value != 0.0))
             }
+            darknet_core::LayerTrainBuffers::DsConv(dsconv) => {
+                dsconv
+                    .collapse
+                    .bias_updates
+                    .iter()
+                    .any(|value| *value != 0.0)
+                    || dsconv
+                        .collapse
+                        .weight_updates
+                        .iter()
+                        .any(|value| *value != 0.0)
+                    || dsconv
+                        .offset_weight_updates
+                        .iter()
+                        .any(|value| *value != 0.0)
+                    || dsconv.offset_bias_updates.iter().any(|value| *value != 0.0)
+            }
             darknet_core::LayerTrainBuffers::DeformConv(deform) => {
                 deform.main.bias_updates.iter().any(|value| *value != 0.0)
                     || deform.main.weight_updates.iter().any(|value| *value != 0.0)

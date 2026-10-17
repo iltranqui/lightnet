@@ -237,6 +237,12 @@ pub fn save_weights(
                     write_f32_slice(&mut file, biases)?;
                 }
             }
+            (LayerKind::DsConv(_), LayerParams::DsConv(dsconv)) => {
+                write_f32_slice(&mut file, &dsconv.collapse.biases)?;
+                write_f32_slice(&mut file, &dsconv.collapse.weights)?;
+                write_f32_slice(&mut file, &dsconv.offset_weights)?;
+                write_f32_slice(&mut file, &dsconv.offset_biases)?;
+            }
             // C++ `dontsave`: the frozen LAYA layers load from an external
             // shared blob, so nothing is written for them in this stream.
             (LayerKind::LayaEncoder(_), LayerParams::LayaEncoder(_)) => {}
@@ -1018,6 +1024,7 @@ mod tests {
                 "deform_conv",
                 "[deform_conv]\nfilters=2\nsize=1\nbatch_normalize=1\nmask=1\nactivation=linear\n",
             ),
+            ("dsconv", "[dsconv]\nfilters=2\nsize=3\nactivation=linear\n"),
         ] {
             let cfg_text = if name == "crnn" {
                 format!("[net]\nwidth=2\nheight=2\nchannels=1\nbatch=2\ntime_steps=2\n{layer}")
@@ -1062,6 +1069,12 @@ mod tests {
                         dcnv4.dummy_weights.fill(0.2);
                         dcnv4.offset_weights.fill(0.3);
                         dcnv4.offset_biases.fill(0.4);
+                    }
+                    LayerParams::DsConv(dsconv) => {
+                        dsconv.collapse.biases.fill(0.1);
+                        dsconv.collapse.weights.fill(0.25);
+                        dsconv.offset_weights.fill(0.6);
+                        dsconv.offset_biases.fill(0.7);
                     }
                     LayerParams::DeformConv(deform) => {
                         deform.main.biases.fill(0.1);
@@ -1267,6 +1280,66 @@ mod tests {
                 let _ = fs::remove_file(path);
             }
         }
+    }
+
+    #[test]
+    fn dsconv_weights_round_trip_with_exact_source_order_and_file_size() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "dsconv-weights.cfg",
+                "[net]\nwidth=3\nheight=2\nchannels=2\n[dynamic_snake_conv]\nfilters=3\nsize=3\nmorph=2\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let LayerParams::DsConv(params) = &mut executable.params[0] else {
+            panic!("dsconv params")
+        };
+        for (index, value) in params.collapse.biases.iter_mut().enumerate() {
+            *value = 0.1 + index as f32;
+        }
+        for (index, value) in params.collapse.weights.iter_mut().enumerate() {
+            *value = 1.0 + index as f32 * 0.01;
+        }
+        for (index, value) in params.offset_weights.iter_mut().enumerate() {
+            *value = -0.5 + index as f32 * 0.001;
+        }
+        for (index, value) in params.offset_biases.iter_mut().enumerate() {
+            *value = 0.25 + index as f32 * 0.1;
+        }
+        let mut expected = params.collapse.biases.clone();
+        expected.extend_from_slice(&params.collapse.weights);
+        expected.extend_from_slice(&params.offset_weights);
+        expected.extend_from_slice(&params.offset_biases);
+
+        let path = std::env::temp_dir().join(format!(
+            "darknet-dsconv-weights-{}.weights",
+            std::process::id()
+        ));
+        save_weights(&network, &executable.params, &path, 23).expect("weights save");
+        let inspection = inspect_weights_file(&network, &path).expect("weights inspect");
+        let parameter_count = network.layers[0].weights().unwrap().parameter_count();
+        assert_eq!(inspection.file_size, 20 + 4 * parameter_count as u64);
+        assert_eq!(inspection.trailing_bytes, 0);
+        assert_eq!(
+            inspection.layers[0]
+                .arrays
+                .iter()
+                .map(|array| array.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["biases", "weights", "offset_weights", "offset_biases"]
+        );
+        let bytes = fs::read(&path).expect("read weights");
+        let stream = bytes[20..]
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(stream, expected);
+        let mut reloaded = ExecutableNetwork::new(network.clone());
+        reloaded.load_weights_file(&path).expect("weights load");
+        assert_eq!(reloaded.params, executable.params);
+        let _ = fs::remove_file(path);
     }
 
     #[test]

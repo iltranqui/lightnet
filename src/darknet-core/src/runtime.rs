@@ -248,6 +248,14 @@ pub struct DeformConvParams {
     pub mask_biases: Option<Vec<f32>>,
 }
 
+/// `[dsconv]` collapse convolution and its shared offset predictor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DsConvParams {
+    pub collapse: ConvolutionalParams,
+    pub offset_weights: Vec<f32>,
+    pub offset_biases: Vec<f32>,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayerParams {
@@ -286,6 +294,7 @@ pub enum LayerParams {
     EmlConvolutional(EmlConvolutionalParams),
     Dcnv4(Dcnv4Params),
     DeformConv(DeformConvParams),
+    DsConv(DsConvParams),
 }
 
 /// The parameters of one `[moe_convolutional]` layer.
@@ -401,6 +410,13 @@ pub struct DeformConvTrainBuffers {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct DsConvTrainBuffers {
+    pub collapse: ConvolutionalTrainBuffers,
+    pub offset_weight_updates: Vec<f32>,
+    pub offset_bias_updates: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct VitTrainBuffers {
     /// Descending update directions (negative mathematical gradients), in
     /// `VitWeights` block shape/order.
@@ -450,6 +466,7 @@ pub enum LayerTrainBuffers {
     EmlConvolutional(EmlConvolutionalTrainBuffers),
     Dcnv4(Dcnv4TrainBuffers),
     DeformConv(DeformConvTrainBuffers),
+    DsConv(DsConvTrainBuffers),
     Vit(VitTrainBuffers),
     Swin(SwinTrainBuffers),
     TuckerAttention(TuckerAttentionTrainBuffers),
@@ -582,6 +599,11 @@ pub(crate) struct DeformConvRuntimeCache {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DsConvRuntimeCache {
+    pub math: crate::dsconv::DsConvForwardCache,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct ForwardResult {
     pub layer_outputs: Vec<Tensor>,
     pub layer_activation_inputs: Vec<Option<Tensor>>,
@@ -598,6 +620,7 @@ pub struct ForwardResult {
     pub eml_caches: Vec<Option<EmlForwardCache>>,
     pub(crate) dcnv4_caches: Vec<Option<crate::dcnv4::Dcnv4ForwardCache>>,
     pub(crate) deform_conv_caches: Vec<Option<DeformConvRuntimeCache>>,
+    pub(crate) dsconv_caches: Vec<Option<DsConvRuntimeCache>>,
     pub vit_caches: Vec<Option<crate::vit::VitForwardCache>>,
     pub swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>>,
     pub tucker_attention_caches: Vec<Option<crate::tucker_attention::TuckerAttentionForwardCache>>,
@@ -628,6 +651,7 @@ impl ForwardResult {
             eml_caches: Vec::new(),
             dcnv4_caches: Vec::new(),
             deform_conv_caches: Vec::new(),
+            dsconv_caches: Vec::new(),
             vit_caches: Vec::new(),
             swin_caches: Vec::new(),
             tucker_attention_caches: Vec::new(),
@@ -660,6 +684,7 @@ mod forward_result_from_heads_tests {
         assert!(result.eml_caches.is_empty());
         assert!(result.dcnv4_caches.is_empty());
         assert!(result.deform_conv_caches.is_empty());
+        assert!(result.dsconv_caches.is_empty());
         assert!(result.vit_caches.is_empty());
         assert!(result.swin_caches.is_empty());
         assert!(result.tucker_attention_caches.is_empty());
@@ -1383,6 +1408,33 @@ impl ExecutableNetwork {
                         _ => unreachable!("validated deform_conv mask bias buffers"),
                     }
                 }
+                (LayerParams::DsConv(params), LayerTrainBuffers::DsConv(train)) => {
+                    let layer_lr = lr * opts.learning_rate_scale;
+                    update_convolutional_params(
+                        &mut params.collapse,
+                        &mut train.collapse,
+                        layer_lr,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                    sgd_update(
+                        &mut params.offset_weights,
+                        &mut train.offset_weight_updates,
+                        layer_lr * 0.01,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                    sgd_update(
+                        &mut params.offset_biases,
+                        &mut train.offset_bias_updates,
+                        layer_lr * 0.01,
+                        momentum,
+                        0.0,
+                        batch,
+                    );
+                }
                 (LayerParams::Dcnv4(params), LayerTrainBuffers::Dcnv4(train)) => {
                     let layer_lr = lr * opts.learning_rate_scale;
                     sgd_update(
@@ -1829,6 +1881,7 @@ impl ExecutableNetwork {
         let mut eml_caches = Vec::with_capacity(self.network.layers.len());
         let mut dcnv4_caches = Vec::with_capacity(self.network.layers.len());
         let mut deform_conv_caches = Vec::with_capacity(self.network.layers.len());
+        let mut dsconv_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches = Vec::with_capacity(self.network.layers.len());
         let mut swin_caches = Vec::with_capacity(self.network.layers.len());
         let mut tucker_attention_caches = Vec::with_capacity(self.network.layers.len());
@@ -1861,6 +1914,7 @@ impl ExecutableNetwork {
             let mut kimi_kda_cache = None;
             let mut dcnv4_cache = None;
             let mut deform_conv_cache = None;
+            let mut dsconv_cache = None;
             let (output, activation_input) = match (&layer.kind, params) {
                 (
                     LayerKind::Convolutional(spec),
@@ -1874,6 +1928,12 @@ impl ExecutableNetwork {
                     let (output, activation_input, cache) =
                         forward_dcnv4_with_cache(spec, params, current_input, layer.output_shape)?;
                     dcnv4_cache = Some(cache);
+                    (output, Some(activation_input))
+                }
+                (LayerKind::DsConv(spec), LayerParams::DsConv(params)) => {
+                    let (output, activation_input, cache) =
+                        forward_dsconv_with_cache(spec, params, current_input, layer.output_shape)?;
+                    dsconv_cache = Some(cache);
                     (output, Some(activation_input))
                 }
                 (LayerKind::DeformConv(spec), LayerParams::DeformConv(params)) => {
@@ -2445,6 +2505,7 @@ impl ExecutableNetwork {
             eml_caches.push(eml_cache);
             dcnv4_caches.push(dcnv4_cache);
             deform_conv_caches.push(deform_conv_cache);
+            dsconv_caches.push(dsconv_cache);
             vit_caches.push(vit_cache);
             swin_caches.push(swin_cache);
             tucker_attention_caches.push(tucker_attention_cache);
@@ -2462,6 +2523,7 @@ impl ExecutableNetwork {
             eml_caches,
             dcnv4_caches,
             deform_conv_caches,
+            dsconv_caches,
             vit_caches,
             swin_caches,
             tucker_attention_caches,
@@ -2932,6 +2994,81 @@ impl ExecutableNetwork {
                     else {
                         return Err(Error::InvalidConfig(format!(
                             "missing [deform_conv] gradient slot for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    *dst = gradient;
+                    accumulate_previous_gradient(
+                        layer.index,
+                        &Tensor::from_data(current_input.shape, math_gradient.input)?,
+                        &mut input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::DsConv(spec), LayerParams::DsConv(params)) => {
+                    let cache = forward
+                        .dsconv_caches
+                        .get(layer.index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing [dsconv] forward cache for layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let preactivation = forward.layer_activation_inputs[layer.index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing [dsconv] activation cache for layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let delta =
+                        if let Some(normalization) = spec.activation.to_channel_normalization() {
+                            Tensor {
+                                shape: layer.output_shape,
+                                data: darknet_cuda::host_ops::normalize_channels_backward(
+                                    &preactivation.data,
+                                    &forward.layer_outputs[layer.index].data,
+                                    &grad.data,
+                                    layer.output_shape.batch,
+                                    layer.output_shape.channels,
+                                    layer.output_shape.width * layer.output_shape.height,
+                                    normalization,
+                                    GradMode::from_env() == GradMode::Cpp,
+                                ),
+                            }
+                        } else {
+                            apply_output_activation_gradient(
+                                &forward.layer_outputs[layer.index],
+                                &grad,
+                                &spec.activation,
+                                "dsconv",
+                                Some(preactivation),
+                            )?
+                        };
+                    let math_gradient = crate::dsconv::dsconv_backward(
+                        current_input,
+                        spec,
+                        &params.collapse.weights,
+                        &params.offset_weights,
+                        &cache.math,
+                        &delta.data,
+                    )?;
+                    let gradient = DsConvParams {
+                        collapse: ConvolutionalParams {
+                            biases: math_gradient.biases,
+                            batch_norm: None,
+                            weights: math_gradient.weights,
+                        },
+                        offset_weights: math_gradient.offset_weights,
+                        offset_biases: math_gradient.offset_biases,
+                    };
+                    let Some(LayerParams::DsConv(dst)) = param_gradients.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing [dsconv] gradient slot for layer #{}",
                             layer.index
                         )));
                     };
@@ -4489,6 +4626,19 @@ impl ExecutableNetwork {
                         }
                     }
                 }
+                (LayerKind::DsConv(_), LayerParams::DsConv(gradient)) => {
+                    let Some(LayerTrainBuffers::DsConv(train)) =
+                        self.train_buffers.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing dsconv train buffers for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    accumulate_convolutional_train_buffer(&mut train.collapse, &gradient.collapse)?;
+                    accumulate_vec(&mut train.offset_weight_updates, &gradient.offset_weights)?;
+                    accumulate_vec(&mut train.offset_bias_updates, &gradient.offset_biases)?;
+                }
                 (LayerKind::Dcnv4(_), LayerParams::Dcnv4(gradient)) => {
                     let Some(LayerTrainBuffers::Dcnv4(train)) =
                         self.train_buffers.get_mut(layer.index)
@@ -4796,6 +4946,11 @@ fn host_adam_scalar_capacity(params: &LayerParams) -> usize {
                 + params.offset_biases.len()
                 + params.mask_weights.as_ref().map_or(0, Vec::len)
                 + params.mask_biases.as_ref().map_or(0, Vec::len)
+        }
+        LayerParams::DsConv(params) => {
+            convolutional_parameter_count(&params.collapse)
+                + params.offset_weights.len()
+                + params.offset_biases.len()
         }
         LayerParams::None
         | LayerParams::LayaScorer(_)
@@ -6688,6 +6843,17 @@ where
         batch: usize,
         sync_host_weights: bool,
     ) -> Result<()> {
+        if let Some(layer) = self
+            .network
+            .layers
+            .iter()
+            .find(|layer| matches!(layer.kind, LayerKind::DsConv(_)))
+        {
+            return Err(Error::UnsupportedLayer {
+                layer_index: layer.index,
+                name: "[dsconv] GPU updates are not implemented in the Stage-1 CPU port".to_owned(),
+            });
+        }
         let config = ElementwiseLaunchConfig::default();
         self.defer_host_sync = !sync_host_weights;
         let net = self.network.net.clone();
@@ -8062,6 +8228,17 @@ where
                 "input shape mismatch: expected {expected}, got {}",
                 input.shape
             )));
+        }
+        if let Some(layer) = self
+            .network
+            .layers
+            .iter()
+            .find(|layer| matches!(layer.kind, LayerKind::DsConv(_)))
+        {
+            return Err(Error::UnsupportedLayer {
+                layer_index: layer.index,
+                name: "[dsconv] GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path".to_owned(),
+            });
         }
         if let Some(layer) = self
             .network
@@ -9804,6 +9981,7 @@ where
                 eml_caches,
                 dcnv4_caches,
                 deform_conv_caches,
+                dsconv_caches: vec![None; self.network.layers.len()],
                 vit_caches,
                 swin_caches,
                 tucker_attention_caches,
@@ -9846,6 +10024,17 @@ where
                 layer_index: layer.index,
                 name: "[deform_conv] compact GPU execution is unsupported; use f32 forward"
                     .to_owned(),
+            });
+        }
+        if let Some(layer) = self
+            .network
+            .layers
+            .iter()
+            .find(|layer| matches!(layer.kind, LayerKind::DsConv(_)))
+        {
+            return Err(Error::UnsupportedLayer {
+                layer_index: layer.index,
+                name: "[dsconv] GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path".to_owned(),
             });
         }
         if self.network.layers.iter().any(|layer| {
@@ -14547,6 +14736,9 @@ fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
         LayerKind::DeformConv(spec) => {
             LayerParams::DeformConv(default_deform_conv_params(layer.input_shape.channels, spec))
         }
+        LayerKind::DsConv(spec) => {
+            LayerParams::DsConv(default_dsconv_params(layer.input_shape.channels, spec))
+        }
         LayerKind::Shortcut(spec) => match spec.weight_count(layer.input_shape.channels) {
             0 => LayerParams::None,
             len => LayerParams::Shortcut(ShortcutParams {
@@ -14745,6 +14937,10 @@ fn default_layer_train_buffers(layer: &crate::model::Layer) -> LayerTrainBuffers
         LayerKind::DeformConv(spec) => LayerTrainBuffers::DeformConv(
             default_deform_conv_train_buffers(layer.input_shape.channels, spec),
         ),
+        LayerKind::DsConv(spec) => LayerTrainBuffers::DsConv(default_dsconv_train_buffers(
+            layer.input_shape.channels,
+            spec,
+        )),
         LayerKind::TuckerAttention(spec) => {
             let params = crate::tucker_attention::TuckerAttentionParams::zeroed(
                 layer.input_shape.channels,
@@ -14920,6 +15116,42 @@ fn deform_conv_layout_counts(
         0
     };
     (kernel_area, offset_filters, offset_weights, mask_weights)
+}
+
+fn dsconv_layout_counts(input_channels: usize, spec: &crate::model::DsConvSpec) -> (usize, usize) {
+    (
+        spec.filters * input_channels * spec.size,
+        2 * spec.size * input_channels * 9,
+    )
+}
+
+fn default_dsconv_params(input_channels: usize, spec: &crate::model::DsConvSpec) -> DsConvParams {
+    let (weights, offset_weights) = dsconv_layout_counts(input_channels, spec);
+    DsConvParams {
+        collapse: ConvolutionalParams {
+            biases: vec![0.0; spec.filters],
+            batch_norm: None,
+            weights: vec![0.0; weights],
+        },
+        offset_weights: vec![0.0; offset_weights],
+        offset_biases: vec![0.0; 2 * spec.size],
+    }
+}
+
+fn default_dsconv_train_buffers(
+    input_channels: usize,
+    spec: &crate::model::DsConvSpec,
+) -> DsConvTrainBuffers {
+    let (weights, offset_weights) = dsconv_layout_counts(input_channels, spec);
+    DsConvTrainBuffers {
+        collapse: ConvolutionalTrainBuffers {
+            bias_updates: vec![0.0; spec.filters],
+            batch_norm: None,
+            weight_updates: vec![0.0; weights],
+        },
+        offset_weight_updates: vec![0.0; offset_weights],
+        offset_bias_updates: vec![0.0; 2 * spec.size],
+    }
 }
 
 fn default_deform_conv_params(input_channels: usize, spec: &DeformConvSpec) -> DeformConvParams {
@@ -16135,6 +16367,26 @@ fn apply_host_adam_layer(
                 }
             }
         }
+        (LayerParams::DsConv(params), LayerTrainBuffers::DsConv(train)) => {
+            apply_host_adam_convolutional(&mut params.collapse, &mut train.collapse, state, adam)?;
+            let offset_adam = AdamParams {
+                lr: adam.lr * 0.01,
+                ..*adam
+            };
+            let offset_state = host_adam_child(state, 0);
+            apply_host_adam(
+                &mut params.offset_weights,
+                &mut train.offset_weight_updates,
+                &mut offset_state.weights,
+                &offset_adam,
+            )?;
+            apply_host_adam_non_weight(
+                &mut params.offset_biases,
+                &mut train.offset_bias_updates,
+                &mut offset_state.biases,
+                &offset_adam,
+            )?;
+        }
         (LayerParams::Dcnv4(params), LayerTrainBuffers::Dcnv4(train)) => {
             let offset_adam = AdamParams {
                 lr: adam.lr * 0.01,
@@ -16674,6 +16926,18 @@ fn load_weights_into_params(
                 read_f32_into(&mut file, &mut dcnv4.dummy_weights)?;
                 read_f32_into(&mut file, &mut dcnv4.offset_weights)?;
                 read_f32_into(&mut file, &mut dcnv4.offset_biases)?;
+            }
+            LayerParams::DsConv(dsconv) => {
+                let LayerKind::DsConv(_) = &layer.kind else {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} dsconv parameters do not match layer kind",
+                        layer.index
+                    )));
+                };
+                read_f32_into(&mut file, &mut dsconv.collapse.biases)?;
+                read_f32_into(&mut file, &mut dsconv.collapse.weights)?;
+                read_f32_into(&mut file, &mut dsconv.offset_weights)?;
+                read_f32_into(&mut file, &mut dsconv.offset_biases)?;
             }
             LayerParams::DeformConv(deform) => {
                 let LayerKind::DeformConv(spec) = &layer.kind else {
@@ -17236,6 +17500,31 @@ fn activate_convolution_value(activation: &Activation, value: f32) -> f32 {
     } else {
         activate(activation.clone(), value)
     }
+}
+
+fn forward_dsconv_with_cache(
+    spec: &crate::model::DsConvSpec,
+    params: &DsConvParams,
+    input: &Tensor,
+    output_shape: TensorShape,
+) -> Result<(Tensor, Tensor, DsConvRuntimeCache)> {
+    let (raw_output, math) = crate::dsconv::dsconv_forward(
+        input,
+        output_shape,
+        spec,
+        &params.collapse.weights,
+        &params.collapse.biases,
+        &params.offset_weights,
+        &params.offset_biases,
+    )?;
+    let mut activation_input = Tensor::zeros(output_shape);
+    let mut output = Tensor::zeros(output_shape);
+    for (index, raw) in raw_output.data.iter().copied().enumerate() {
+        activation_input.data[index] = raw;
+        output.data[index] = activate_convolution_value(&spec.activation, raw);
+    }
+    apply_convolution_channel_normalization(&mut output, &activation_input, &spec.activation);
+    Ok((output, activation_input, DsConvRuntimeCache { math }))
 }
 
 fn forward_deform_conv_with_cache(
@@ -24230,6 +24519,168 @@ mod tests {
             0.5 * updated * updated < 0.5 * initial * initial,
             "Darknet update should descend: output {initial} -> {updated}"
         );
+    }
+
+    #[test]
+    fn dsconv_runtime_forward_backward_and_gpu_execution_gate() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "dsconv-runtime.cfg",
+                "[net]\nwidth=5\nheight=4\nchannels=1\nbatch=1\n[dsconv]\nfilters=3\nsize=3\nmorph=2\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        let LayerParams::DsConv(params) = &mut cpu.params[0] else {
+            panic!("dsconv params")
+        };
+        for (index, weight) in params.collapse.weights.iter_mut().enumerate() {
+            *weight = 0.04 + index as f32 * 0.013;
+        }
+        params.collapse.biases.fill(0.02);
+        params.offset_weights.fill(0.0);
+        params.offset_biases[0] = -0.12;
+        params.offset_biases[2] = 0.14;
+        params.offset_biases[3] = -0.11;
+        params.offset_biases[5] = 0.13;
+
+        let input = Tensor::from_data(
+            TensorShape::new(5, 4, 1, 1),
+            (0..20)
+                .map(|index| (index * index) as f32 * 0.003 - 0.2)
+                .collect(),
+        )
+        .unwrap();
+        let forward = cpu.forward_training(&input).unwrap();
+        assert!(forward.dsconv_caches[0].is_some());
+        let seed = Tensor::filled(forward.layer_outputs[0].shape, 0.25);
+        let backward = cpu.backward(&input, &forward, &seed).unwrap();
+        let LayerParams::DsConv(gradient) = &backward.param_gradients[0] else {
+            panic!("dsconv gradients")
+        };
+        assert!(gradient.collapse.weights.iter().any(|value| *value != 0.0));
+        assert!(gradient.collapse.biases.iter().any(|value| *value != 0.0));
+        assert!(gradient.offset_weights.iter().any(|value| *value != 0.0));
+        assert!(gradient.offset_biases.iter().any(|value| *value != 0.0));
+        assert!(
+            backward
+                .input_gradient
+                .data
+                .iter()
+                .any(|value| *value != 0.0)
+        );
+
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        let error = gpu
+            .forward(&input)
+            .expect_err("Stage-1 DSConv must reject GPU execution");
+        assert!(
+            error
+                .to_string()
+                .contains("[dsconv] GPU execution is not implemented")
+        );
+        let error = gpu
+            .update_weights_gpu(0.01, 0.9, 0.0, 1)
+            .expect_err("Stage-1 DSConv must reject GPU updates");
+        assert!(
+            error
+                .to_string()
+                .contains("[dsconv] GPU updates are not implemented")
+        );
+    }
+
+    #[test]
+    fn dsconv_sgd_uses_source_rate_groups_and_update_gates() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "dsconv-sgd.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=1\ndecay=0.1\n[dsconv]\nfilters=1\nsize=1\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let LayerParams::DsConv(params) = &mut executable.params[0] else {
+            panic!("dsconv params")
+        };
+        params.collapse.weights[0] = 2.0;
+        params.collapse.biases[0] = 3.0;
+        params.offset_weights[0] = 4.0;
+        params.offset_biases[0] = 5.0;
+        let LayerTrainBuffers::DsConv(train) = &mut executable.train_buffers[0] else {
+            panic!("dsconv train buffers")
+        };
+        train.collapse.weight_updates[0] = 1.0;
+        train.collapse.bias_updates[0] = 1.0;
+        train.offset_weight_updates[0] = 1.0;
+        train.offset_bias_updates[0] = 1.0;
+        executable.update_weights(0.2, 0.0, 0.1, 2);
+        let LayerParams::DsConv(params) = &executable.params[0] else {
+            panic!("dsconv params")
+        };
+        assert!((params.collapse.weights[0] - 2.06).abs() < 1.0e-6);
+        assert!((params.collapse.biases[0] - 3.1).abs() < 1.0e-6);
+        assert!((params.offset_weights[0] - 4.0002).abs() < 1.0e-6);
+        assert!((params.offset_biases[0] - 5.001).abs() < 1.0e-6);
+
+        let frozen_network = Network::from_config(
+            ConfigFile::parse_str(
+                "dsconv-frozen.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=1\ndecay=0.1\n[dsconv]\nfilters=1\nsize=1\ndont_update=1\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut frozen = ExecutableNetwork::new(frozen_network);
+        let LayerParams::DsConv(params) = &mut frozen.params[0] else {
+            panic!("dsconv params")
+        };
+        params.collapse.weights[0] = 2.0;
+        let LayerTrainBuffers::DsConv(train) = &mut frozen.train_buffers[0] else {
+            panic!("dsconv train buffers")
+        };
+        train.collapse.weight_updates[0] = 1.0;
+        let before = frozen.params.clone();
+        frozen.update_weights(0.2, 0.0, 0.1, 1);
+        assert_eq!(frozen.params, before);
+    }
+
+    #[test]
+    fn dsconv_adam_state_round_trips_all_parameter_blocks() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "dsconv-adam.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=1\nadam=1\ndecay=0.05\n[dsconv]\nfilters=1\nsize=1\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let LayerParams::DsConv(params) = &mut executable.params[0] else {
+            panic!("dsconv params")
+        };
+        params.collapse.weights.fill(0.25);
+        params.collapse.biases.fill(0.5);
+        params.offset_weights.fill(0.75);
+        params.offset_biases.fill(1.0);
+        let LayerTrainBuffers::DsConv(train) = &mut executable.train_buffers[0] else {
+            panic!("dsconv train buffers")
+        };
+        train.collapse.weight_updates.fill(-0.2);
+        train.collapse.bias_updates.fill(-0.3);
+        train.offset_weight_updates.fill(-0.4);
+        train.offset_bias_updates.fill(-0.5);
+        executable.update_weights_adam(0.01, 1).unwrap();
+        assert!(executable.host_adam_state[0].is_some());
+        let path =
+            std::env::temp_dir().join(format!("darknet-dsconv-adam-{}.state", std::process::id()));
+        executable.save_optimizer_state(&path).unwrap();
+        let mut restored = ExecutableNetwork::new(network);
+        restored.load_optimizer_state(&path).unwrap();
+        assert_eq!(restored.host_adam_state, executable.host_adam_state);
+        assert_eq!(restored.adam_step, executable.adam_step);
+        let _ = fs::remove_file(path);
     }
 
     #[test]

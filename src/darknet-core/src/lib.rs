@@ -29,6 +29,7 @@ pub mod chart;
 pub(crate) mod contrastive;
 pub(crate) mod dcnv4;
 pub(crate) mod deform_conv;
+pub(crate) mod dsconv;
 pub use chart::{ChartPoint, write_training_chart};
 pub mod dense_loss;
 pub use dense_loss::{
@@ -125,19 +126,20 @@ pub use mambavision::{
     mambavision_backward, mambavision_forward,
 };
 pub use model::{
-    Activation, CrnnSpec, DeformConvSpec, KimiKdaSpec, Layer, LayerKind, LayerWeights, LrPolicy,
-    LstmSpec, MambaVisionSpec, NetConfig, Network, ObbRefineLoss, ObbRefineSpec, RnnSpec,
+    Activation, CrnnSpec, DeformConvSpec, DsConvSpec, KimiKdaSpec, Layer, LayerKind, LayerWeights,
+    LrPolicy, LstmSpec, MambaVisionSpec, NetConfig, Network, ObbRefineLoss, ObbRefineSpec, RnnSpec,
     ShortcutWeightsNorm, ShortcutWeightsType, SwinSpec, TensorShape, TuckerAttentionSpec,
     WeightsArray, YoloIouLoss,
 };
 pub use names::load_names_file;
 pub use runtime::{
     BackwardResult, BatchNormTrainBuffers, ConnectedTrainBuffers, ConvolutionalTrainBuffers,
-    CrnnParams, CrnnTrainBuffers, DeformConvParams, DeformConvTrainBuffers, ExecutableNetwork,
-    ForwardResult, GpuExecutableNetwork, GpuForwardState, GpuForwardSummary, KimiKdaTrainBuffers,
-    LayerParams, LayerTrainBuffers, LstmParams, LstmTrainBuffers, MambaVisionTrainBuffers,
-    RecurrentForwardCache, RnnParams, RnnTrainBuffers, ShortcutParams, ShortcutTrainBuffers,
-    Tensor, TuckerAttentionTrainBuffers, YoloHeadOutput, compute_learning_rate,
+    CrnnParams, CrnnTrainBuffers, DeformConvParams, DeformConvTrainBuffers, DsConvParams,
+    DsConvTrainBuffers, ExecutableNetwork, ForwardResult, GpuExecutableNetwork, GpuForwardState,
+    GpuForwardSummary, KimiKdaTrainBuffers, LayerParams, LayerTrainBuffers, LstmParams,
+    LstmTrainBuffers, MambaVisionTrainBuffers, RecurrentForwardCache, RnnParams, RnnTrainBuffers,
+    ShortcutParams, ShortcutTrainBuffers, Tensor, TuckerAttentionTrainBuffers, YoloHeadOutput,
+    compute_learning_rate,
 };
 pub use swin::SwinWeights;
 pub use swin_block::SwinForwardCache;

@@ -254,6 +254,16 @@ pub fn initialize_training_params(network: &Network, params: &mut [LayerParams],
                     bn(batch_norm);
                 }
             }
+            LayerParams::DsConv(p) => {
+                let crate::LayerKind::DsConv(spec) = &layer.kind else {
+                    unreachable!("dsconv parameters require a dsconv layer");
+                };
+                let fan_in = layer.input_shape.channels * spec.size;
+                rng.weights_with_scale(&mut p.collapse.weights, (1.0 / fan_in as f32).sqrt());
+                p.collapse.biases.fill(0.0);
+                p.offset_weights.fill(0.0);
+                p.offset_biases.fill(0.0);
+            }
             LayerParams::DeformConv(p) => {
                 let crate::LayerKind::DeformConv(_) = &layer.kind else {
                     unreachable!("deform_conv parameters require a deform_conv layer");
@@ -687,6 +697,38 @@ mod tests {
             panic!("Vit params")
         };
         assert_eq!(w.patch_embed, vec![0.25; 4]);
+    }
+
+    #[test]
+    fn dsconv_initialization_is_seeded_and_uses_source_bound() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "dsconv-init.cfg",
+                "[net]\nwidth=3\nheight=2\nchannels=2\n[dsconv]\nfilters=4\nsize=3\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut first = ExecutableNetwork::new(network.clone());
+        let mut second = ExecutableNetwork::new(network.clone());
+        initialize_training_params(&network, &mut first.params, 83);
+        initialize_training_params(&network, &mut second.params, 83);
+        assert_eq!(first.params, second.params);
+        let LayerParams::DsConv(params) = &first.params[0] else {
+            panic!("dsconv params")
+        };
+        let bound = (1.0f32 / (2.0 * 3.0)).sqrt();
+        assert!(
+            params
+                .collapse
+                .weights
+                .iter()
+                .all(|value| value.abs() <= bound)
+        );
+        assert!(params.collapse.weights.iter().any(|value| *value != 0.0));
+        assert_eq!(params.collapse.biases, vec![0.0; 4]);
+        assert!(params.offset_weights.iter().all(|value| *value == 0.0));
+        assert!(params.offset_biases.iter().all(|value| *value == 0.0));
     }
 
     #[test]

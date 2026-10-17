@@ -420,6 +420,20 @@ pub struct DeformConvSpec {
     pub activation: Activation,
 }
 
+/// `[dsconv]` / `[dynamic_snake_conv]`, the single-template Dynamic Snake Conv.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DsConvSpec {
+    pub filters: usize,
+    pub size: usize,
+    pub padding: usize,
+    pub extend_scope: f32,
+    /// 0 = x-snake, 1 = y-snake, 2 = concatenate both axes.
+    pub morph: usize,
+    pub templates: usize,
+    pub drop_prob: f32,
+    pub activation: Activation,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConnectedSpec {
     pub output: usize,
@@ -1318,6 +1332,8 @@ pub enum LayerKind {
     Dcnv4(Dcnv4Spec),
     /// `[deform_conv]` / `[deformable_convolutional]`: DCNv1/2 sampling.
     DeformConv(DeformConvSpec),
+    /// `[dsconv]` / `[dynamic_snake_conv]`: Dynamic Snake Conv.
+    DsConv(DsConvSpec),
     Rnn(RnnSpec),
     Gru(GruSpec),
     Lstm(LstmSpec),
@@ -1379,6 +1395,7 @@ impl LayerKind {
             Self::EmlConvolutional(_) => "eml_convolutional",
             Self::Dcnv4(_) => "dcnv4",
             Self::DeformConv(_) => "deform_conv",
+            Self::DsConv(_) => "dsconv",
             Self::Rnn(_) => "rnn",
             Self::Gru(_) => "gru",
             Self::Lstm(_) => "lstm",
@@ -1397,6 +1414,7 @@ impl LayerKind {
             Self::Convolutional(spec) => Some(&spec.activation),
             Self::Dcnv4(spec) => Some(&spec.activation),
             Self::DeformConv(spec) => Some(&spec.activation),
+            Self::DsConv(spec) => Some(&spec.activation),
             Self::Deconvolutional(spec) => Some(&spec.activation),
             Self::Connected(spec) => Some(&spec.activation),
             Self::Shortcut(spec) => Some(&spec.activation),
@@ -1957,6 +1975,39 @@ impl Layer {
                 ]);
                 Some(LayerWeights { entries })
             }
+            LayerKind::DsConv(spec) => {
+                let channels = self.input_shape.channels;
+                let main_weights = spec
+                    .filters
+                    .checked_mul(channels)
+                    .and_then(|count| count.checked_mul(spec.size))
+                    .expect("validated dsconv collapse weight count");
+                let offset_weights = 2usize
+                    .checked_mul(spec.size)
+                    .and_then(|count| count.checked_mul(channels))
+                    .and_then(|count| count.checked_mul(9))
+                    .expect("validated dsconv offset weight count");
+                Some(LayerWeights {
+                    entries: vec![
+                        WeightsEntry {
+                            array: WeightsArray::Biases,
+                            len: spec.filters,
+                        },
+                        WeightsEntry {
+                            array: WeightsArray::Weights,
+                            len: main_weights,
+                        },
+                        WeightsEntry {
+                            array: WeightsArray::Named("offset_weights".to_owned()),
+                            len: offset_weights,
+                        },
+                        WeightsEntry {
+                            array: WeightsArray::Named("offset_biases".to_owned()),
+                            len: 2 * spec.size,
+                        },
+                    ],
+                })
+            }
             LayerKind::DeformConv(spec) => {
                 let channels = self.input_shape.channels;
                 let kernel_area = spec
@@ -2155,6 +2206,7 @@ impl Network {
                         | "dcnv4"
                         | "dcnv4_convolutional"
                         | "dsconv"
+                        | "dynamic_snake_conv"
                 )
             });
         }
@@ -2311,6 +2363,7 @@ fn parse_layer_kind(
         "deform_conv" | "deformable_convolutional" => {
             LayerKind::DeformConv(parse_deform_conv_spec(section, current)?)
         }
+        "dsconv" | "dynamic_snake_conv" => LayerKind::DsConv(parse_dsconv_spec(section, current)?),
         "eml_convolutional" => {
             let line = section.line;
             if current.width == 0 || current.height == 0 || current.channels == 0 {
@@ -3673,6 +3726,24 @@ fn infer_output_shape(
                 current.batch,
             ))
         }
+        LayerKind::DsConv(spec) => {
+            if current.width == 0 || current.height == 0 || current.channels == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[dsconv] layer #{layer_index}: preceding layer must output a non-empty image"
+                )));
+            }
+            if spec.filters == 0 || spec.size == 0 || spec.padding != spec.size / 2 {
+                return Err(Error::InvalidConfig(format!(
+                    "[dsconv] layer #{layer_index}: filters/size must be positive with same padding"
+                )));
+            }
+            Ok(TensorShape::new(
+                current.width,
+                current.height,
+                spec.filters,
+                current.batch,
+            ))
+        }
         LayerKind::DeformConv(spec) => {
             if current.width == 0 || current.height == 0 || current.channels == 0 {
                 return Err(Error::InvalidConfig(format!(
@@ -4677,6 +4748,136 @@ fn deform_conv_output_dim(
     dilation: usize,
 ) -> Option<usize> {
     dcnv4_output_dim(input, padding, size, stride, dilation)
+}
+
+fn reject_unknown_dsconv_keys(section: &RawSection) -> Result<()> {
+    const ALLOWED: &[&str] = &[
+        "filters",
+        "size",
+        "stride",
+        "stride_x",
+        "stride_y",
+        "pad",
+        "padding",
+        "activation",
+        "extend_scope",
+        "morph",
+        "templates",
+        "drop_prob",
+        "learning_rate",
+        "dont_update",
+        "burnin_update",
+        "train_only_bn",
+        "clip",
+        "grad_centr",
+    ];
+    if let Some(key) = section
+        .values
+        .keys()
+        .find(|key| !ALLOWED.contains(&key.as_str()))
+    {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {}: unknown option `{key}`",
+            section.name, section.line
+        )));
+    }
+    Ok(())
+}
+
+fn parse_dsconv_spec(section: &RawSection, input: TensorShape) -> Result<DsConvSpec> {
+    let line = section.line;
+    reject_unknown_dsconv_keys(section)?;
+    let invalid = |message: &str| {
+        Error::InvalidConfig(format!("[{}] at line {line}: {message}", section.name))
+    };
+    if input.width == 0 || input.height == 0 || input.channels == 0 {
+        return Err(invalid("preceding layer must output a non-empty image"));
+    }
+
+    let filters = section.get_i64("filters", input.channels as i64)?;
+    let raw_size = section.get_i64("size", 9)?;
+    let mut stride_x = section.get_i64("stride_x", -1)?;
+    let mut stride_y = section.get_i64("stride_y", -1)?;
+    if stride_x < 1 || stride_y < 1 {
+        let stride = section.get_i64("stride", 1)?;
+        if stride_x < 1 {
+            stride_x = stride;
+        }
+        if stride_y < 1 {
+            stride_y = stride;
+        }
+    }
+    let mut padding = section.get_i64("padding", -1)?;
+    if section.get_i64("pad", 1)? != 0 {
+        padding = raw_size / 2;
+    }
+    if padding < 0 {
+        padding = 0;
+    }
+    if raw_size % 2 == 0 {
+        return Err(invalid("size must be odd"));
+    }
+    if stride_x != 1 || stride_y != 1 || padding != raw_size / 2 {
+        return Err(invalid(
+            "only stride=1 and same padding (padding=size/2) are supported",
+        ));
+    }
+    if filters <= 0 {
+        return Err(invalid("filters must be positive"));
+    }
+    let size = if raw_size < 1 {
+        1
+    } else {
+        usize::try_from(raw_size).map_err(|_| invalid("size is out of range"))?
+    };
+    let padding = usize::try_from(padding).map_err(|_| invalid("padding must be non-negative"))?;
+    let filters = usize::try_from(filters).map_err(|_| invalid("filters must be positive"))?;
+
+    let extend_scope = section.get_f32("extend_scope", 1.0)?;
+    let mut morph = section.get_i64("morph", 0)?;
+    let mut templates = section.get_i64("templates", 1)?;
+    let mut drop_prob = section.get_f32("drop_prob", 0.0)?;
+    if !extend_scope.is_finite() || !drop_prob.is_finite() {
+        return Err(invalid("extend_scope and drop_prob must be finite"));
+    }
+    if morph < 0 || morph > 2 {
+        morph = 0;
+    }
+    if templates < 1 {
+        templates = 1;
+    }
+    if morph == 2 && filters < 2 {
+        return Err(invalid("morph=2 requires at least two filters"));
+    }
+    if morph == 2 && templates != 1 {
+        templates = 1;
+        drop_prob = 0.0;
+    }
+    drop_prob = drop_prob.clamp(0.0, 1.0);
+    if templates > 1 {
+        return Err(invalid(
+            "templates>1 multi-view execution is not yet supported by the Rust CPU port",
+        ));
+    }
+
+    filters
+        .checked_mul(input.channels)
+        .and_then(|count| count.checked_mul(size))
+        .ok_or_else(|| invalid("collapse weight count overflows"))?;
+    size.checked_mul(2)
+        .and_then(|count| count.checked_mul(input.channels))
+        .and_then(|count| count.checked_mul(9))
+        .ok_or_else(|| invalid("offset weight count overflows"))?;
+    Ok(DsConvSpec {
+        filters,
+        size,
+        padding,
+        extend_scope,
+        morph: morph as usize,
+        templates: templates as usize,
+        drop_prob,
+        activation: Activation::parse(&section.get_str("activation", "relu")),
+    })
 }
 
 fn reject_unknown_deform_conv_keys(section: &RawSection) -> Result<()> {
@@ -8162,5 +8363,112 @@ mod tests {
         assert_eq!(spec.max_delta, 3.0);
         assert_eq!(spec.class_multipliers, Some(vec![1.0, 2.0]));
         assert_eq!(spec.class_map, Some(vec![1, 0]));
+    }
+
+    #[test]
+    fn dsconv_aliases_defaults_shape_and_weights_match_source_contract() {
+        for alias in ["dsconv", "dynamic_snake_conv"] {
+            let network = build(&format!(
+                "[net]\nwidth=5\nheight=4\nchannels=3\n[{alias}]\n"
+            ))
+            .unwrap_or_else(|error| panic!("[{alias}] should parse: {error}"));
+            let layer = &network.layers[0];
+            let LayerKind::DsConv(spec) = &layer.kind else {
+                panic!("expected DSConv for [{alias}]")
+            };
+            assert_eq!(layer.kind.name(), "dsconv");
+            assert_eq!(layer.output_shape, super::TensorShape::new(5, 4, 3, 1));
+            assert_eq!(
+                (
+                    spec.filters,
+                    spec.size,
+                    spec.padding,
+                    spec.extend_scope,
+                    spec.morph,
+                    spec.templates,
+                    spec.drop_prob,
+                ),
+                (3, 9, 4, 1.0, 0, 1, 0.0)
+            );
+            let weights = layer.weights().expect("DSConv weights");
+            assert_eq!(
+                weights
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.array.name(), entry.len))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("biases", 3),
+                    ("weights", 3 * 3 * 9),
+                    ("offset_weights", 2 * 9 * 3 * 9),
+                    ("offset_biases", 2 * 9),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn dsconv_parser_pins_axis_modes_normalization_and_unsupported_options() {
+        let make = |options: &str| {
+            build(&format!(
+                "[net]\nwidth=5\nheight=4\nchannels=2\n[dsconv]\n{options}\n"
+            ))
+        };
+        for (morph, expected) in [("0", 0), ("1", 1), ("2", 2), ("99", 0), ("-1", 0)] {
+            let network = make(&format!("filters=3\nsize=3\nmorph={morph}"))
+                .unwrap_or_else(|error| panic!("morph={morph}: {error}"));
+            let LayerKind::DsConv(spec) = &network.layers[0].kind else {
+                panic!("DSConv layer")
+            };
+            assert_eq!(spec.morph, expected);
+        }
+        let normalized = make("filters=3\nsize=-1\ntemplates=0\ndrop_prob=2")
+            .expect("source-normalized factory options parse");
+        let LayerKind::DsConv(spec) = &normalized.layers[0].kind else {
+            panic!("DSConv layer")
+        };
+        assert_eq!(
+            (spec.size, spec.padding, spec.templates, spec.drop_prob),
+            (1, 0, 1, 1.0)
+        );
+
+        let morph2 = make("filters=3\nsize=3\nmorph=2\ntemplates=4\ndrop_prob=0.4")
+            .expect("morph=2 forces one template");
+        let LayerKind::DsConv(spec) = &morph2.layers[0].kind else {
+            panic!("DSConv layer")
+        };
+        assert_eq!((spec.templates, spec.drop_prob), (1, 0.0));
+
+        for (options, expected_message) in [
+            ("size=2", "size must be odd"),
+            ("stride=2", "only stride=1"),
+            ("filters=1\nsize=3\nmorph=2", "morph=2 requires"),
+            ("templates=2", "templates>1 multi-view"),
+            ("extend_scope=NaN", "must be finite"),
+            ("unknown_option=1", "unknown option"),
+        ] {
+            let error = make(options).expect_err("invalid DSConv cfg should fail");
+            assert!(error.to_string().contains(expected_message), "{error}");
+        }
+    }
+
+    #[test]
+    fn dsconv_try_fix_nan_default_covers_both_aliases_and_respects_override() {
+        for alias in ["dsconv", "dynamic_snake_conv"] {
+            let base = format!("[net]\nwidth=2\nheight=2\nchannels=1\n[{alias}]\nsize=1\n");
+            assert!(build(&base).unwrap().net.try_fix_nan);
+            assert!(
+                !build(&base.replace("[net]", "[net]\ntry_fix_nan=0"))
+                    .unwrap()
+                    .net
+                    .try_fix_nan
+            );
+            assert!(
+                build(&base.replace("[net]", "[net]\ntry_fix_nan=1"))
+                    .unwrap()
+                    .net
+                    .try_fix_nan
+            );
+        }
     }
 }
