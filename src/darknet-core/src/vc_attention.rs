@@ -139,6 +139,55 @@ fn clip_probability_code(value: f32) -> u8 {
 const V_SMOOTH_TILE_SIZE: usize = 64;
 const E4M3_MAX_FINITE_CODE: u8 = 0x7e;
 
+/// Build the source VC permutation: complete 8×8 windows first, followed by
+/// partial edge windows in raster order. The returned entries map each
+/// permuted token position to its original raster-order token index.
+pub(crate) fn spatial8_permutation(grid_h: usize, grid_w: usize) -> Result<Vec<usize>, String> {
+    if grid_h == 0 || grid_w == 0 {
+        return Err("VC spatial permutation requires a nonempty grid".into());
+    }
+    let tokens = grid_h
+        .checked_mul(grid_w)
+        .ok_or("VC spatial permutation size overflow")?;
+    let window = 8;
+    let mut permutation = Vec::with_capacity(tokens);
+
+    if grid_h >= window && grid_w >= window {
+        for window_y in (0..=grid_h - window).step_by(window) {
+            for window_x in (0..=grid_w - window).step_by(window) {
+                for y in window_y..window_y + window {
+                    for x in window_x..window_x + window {
+                        permutation.push(y * grid_w + x);
+                    }
+                }
+            }
+        }
+    }
+    for window_y in (0..grid_h).step_by(window) {
+        let full_h = grid_h - window_y >= window;
+        for window_x in (0..grid_w).step_by(window) {
+            let full_w = grid_w - window_x >= window;
+            if full_h && full_w {
+                continue;
+            }
+            let end_y = window_y.saturating_add(window).min(grid_h);
+            let end_x = window_x.saturating_add(window).min(grid_w);
+            for y in window_y..end_y {
+                for x in window_x..end_x {
+                    permutation.push(y * grid_w + x);
+                }
+            }
+        }
+    }
+    if permutation.len() != tokens {
+        return Err(format!(
+            "VC spatial permutation generated {} tokens for a {grid_h}x{grid_w} grid",
+            permutation.len()
+        ));
+    }
+    Ok(permutation)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct VsmoothCache {
     tokens: usize,
@@ -1100,8 +1149,8 @@ mod tests {
         ExpCastMode, accumulate_qk_scale_gradients, e4m3_encode_bits, e4m3_quantization_boundary,
         e4m3_to_f32, expcast_probability_code, new_qk_scale_gradients, quantize_qk,
         quantized_online_row_backward, quantized_online_row_forward, quantized_qk_log2_scores,
-        quantized_qk_scale_input_backward, vc_head_backward, vc_head_forward, vsmooth_backward,
-        vsmooth_forward,
+        quantized_qk_scale_input_backward, spatial8_permutation, vc_head_backward, vc_head_forward,
+        vsmooth_backward, vsmooth_forward,
     };
 
     #[test]
@@ -1493,6 +1542,22 @@ mod tests {
         let (q_grad, k_grad) = quantized_qk_scale_input_backward(&cache, &scale_grads).unwrap();
         assert!(q_grad.iter().all(|gradient| *gradient == 0.0));
         assert!(k_grad.iter().all(|gradient| *gradient == 0.0));
+    }
+
+    #[test]
+    fn spatial8_permutation_places_full_windows_before_raster_edges() {
+        let permutation = spatial8_permutation(9, 9).unwrap();
+        let full_window: Vec<usize> = (0..8)
+            .flat_map(|y| (0..8).map(move |x| y * 9 + x))
+            .collect();
+        assert_eq!(&permutation[..64], full_window.as_slice());
+        assert_eq!(&permutation[64..72], &[8, 17, 26, 35, 44, 53, 62, 71]);
+        assert_eq!(&permutation[72..80], &(72..80).collect::<Vec<_>>());
+        assert_eq!(permutation[80], 80);
+        let mut sorted = permutation.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..81).collect::<Vec<_>>());
+        assert!(spatial8_permutation(0, 9).is_err());
     }
 
     #[test]

@@ -12940,6 +12940,9 @@ fn vit_geometry(
             .msa_enabled
             .then_some((spec.msa_block_size, spec.msa_topk)),
         flash_attention: spec.flash_attention,
+        vc_attention: spec.vc_attention,
+        vc_expcast: spec.vc_expcast,
+        vc_perm: spec.vc_perm,
     }
 }
 
@@ -21365,6 +21368,50 @@ mod tests {
         let input = Tensor::from_data(
             TensorShape::new(4, 4, 1, 1),
             (0..16).map(|i| (i as f32 - 7.0) * 0.04).collect(),
+        )
+        .unwrap();
+        let cpu_forward = cpu.forward(&input).unwrap();
+
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        gpu.params = cpu.params.clone();
+        let gpu_forward = gpu.forward_with_state(&input).unwrap();
+        assert_eq!(
+            gpu_forward.cpu_forward.final_output(),
+            cpu_forward.final_output()
+        );
+        let output = gpu_forward.cpu_forward.final_output().unwrap();
+        let seed = Tensor::from_data(output.shape, vec![0.2; output.len()]).unwrap();
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &[None, Some(seed)])
+            .unwrap();
+        let fallback = gpu.cpu_fallback_train_buffers.borrow();
+        let LayerTrainBuffers::Vit(vit) = &fallback[1] else {
+            panic!("ViT fallback updates")
+        };
+        assert!(vit.updates.to_blob().iter().any(|value| *value != 0.0));
+    }
+
+    #[test]
+    fn vit_vc_gpu_host_fallback_matches_cpu_forward_and_backward() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "vit-vc-chain.cfg",
+                "[net]\nwidth=4\nheight=4\nchannels=1\nbatch=1\n\
+             [convolutional]\nfilters=1\nsize=1\nactivation=linear\n\
+             [vit]\ndim=16\nheads=1\npatch_size=1\npatch_stride=1\nmlp_dim=16\nflash_attention=1\nvc_attention=1\nvc_expcast=1\nvc_perm=spatial8\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        crate::initialize_training_params(&network, &mut cpu.params, 71);
+        let LayerParams::Convolutional(conv) = &mut cpu.params[0] else {
+            panic!("convolution params")
+        };
+        conv.weights[0] = 0.7;
+        conv.biases[0] = -0.1;
+        let input = Tensor::from_data(
+            TensorShape::new(4, 4, 1, 1),
+            (0..16).map(|index| (index as f32 - 6.0) * 0.07).collect(),
         )
         .unwrap();
         let cpu_forward = cpu.forward(&input).unwrap();

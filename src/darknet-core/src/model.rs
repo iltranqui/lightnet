@@ -552,6 +552,13 @@ pub struct LayaHeadSpec {
     pub qtype: i32,
 }
 
+/// Token ordering used by the historical VC attention path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VitVcPermutation {
+    Sequence,
+    Spatial8,
+}
+
 /// `[vit]`: a global vision-transformer block from `Jev_laya`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VitSpec {
@@ -570,6 +577,11 @@ pub struct VitSpec {
     pub msa_topk: usize,
     /// Selects the online-softmax reference implementation without a T×T cache.
     pub flash_attention: bool,
+    /// Selects the quantized VC reference path, which requires flash attention.
+    pub vc_attention: bool,
+    /// ExpCast mode 0, 1, or 2.
+    pub vc_expcast: u8,
+    pub vc_perm: VitVcPermutation,
 }
 
 /// `[yolox]`: the anchor-free detection head (Phase 2A of `tasks/rust/layers.md`),
@@ -2749,13 +2761,6 @@ fn parse_layer_kind(
         }
         "vit" => {
             let line = section.line;
-            for unsupported in ["vc_attention", "vc", "vc_expcast", "expcast", "vc_perm"] {
-                if section.get(unsupported).is_some() {
-                    return Err(Error::InvalidConfig(format!(
-                        "[vit] at line {line}: {unsupported} is not supported by the Rust reference path yet"
-                    )));
-                }
-            }
             let has_filters = section.get("filters").is_some();
             let has_dim = section.get("dim").is_some();
             let filters = section.get_usize("filters", VIT_DIM_DEFAULT)?;
@@ -2873,6 +2878,42 @@ fn parse_layer_kind(
                     "[vit] at line {line}: flash_attention and msa are mutually exclusive"
                 )));
             }
+            let vc_attention = if section.get("vc_attention").is_some() {
+                section.get_bool_int("vc_attention", false)?
+            } else {
+                section.get_bool_int("vc", false)?
+            };
+            let vc_expcast_value = if section.get("vc_expcast").is_some() {
+                section.get_usize("vc_expcast", 1)?
+            } else {
+                section.get_usize("expcast", 1)?
+            };
+            let vc_expcast = u8::try_from(vc_expcast_value)
+                .ok()
+                .filter(|mode| *mode <= 2)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "[vit] at line {line}: vc_expcast must be 0, 1, or 2"
+                    ))
+                })?;
+            let vc_perm = match section
+                .get_str("vc_perm", "sequence")
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "sequence" => VitVcPermutation::Sequence,
+                "spatial" | "window" | "spatial8" => VitVcPermutation::Spatial8,
+                value => {
+                    return Err(Error::InvalidConfig(format!(
+                        "[vit] at line {line}: vc_perm={value} must be sequence, spatial, window, or spatial8"
+                    )));
+                }
+            };
+            if vc_attention && !flash_attention {
+                return Err(Error::InvalidConfig(format!(
+                    "[vit] at line {line}: vc_attention requires flash_attention"
+                )));
+            }
             LayerKind::Vit(VitSpec {
                 dim,
                 patch_size,
@@ -2888,6 +2929,9 @@ fn parse_layer_kind(
                 msa_block_size,
                 msa_topk,
                 flash_attention,
+                vc_attention,
+                vc_expcast,
+                vc_perm,
             })
         }
         "laya_scorer" => {
@@ -4240,6 +4284,9 @@ mod tests {
                     pos_init_zero: false,
                     msa: None,
                     flash_attention: false,
+                    vc_attention: false,
+                    vc_expcast: 1,
+                    vc_perm: super::VitVcPermutation::Sequence,
                 },
                 3,
                 4,
@@ -4263,15 +4310,63 @@ mod tests {
             "dim=8\nheads=2\nactivation=unknown_vit_act",
             "dim=8\nheads=2\nvc_attention=1",
             "dim=8\nheads=2\nvc=1",
-            "dim=8\nheads=2\nvc_expcast=2",
-            "dim=8\nheads=2\nexpcast=2",
-            "dim=8\nheads=2\nvc_perm=spatial",
+            "dim=8\nheads=2\nvc_expcast=3",
+            "dim=8\nheads=2\nexpcast=3",
+            "dim=8\nheads=2\nvc_perm=spatial_typo",
         ] {
             let err = build(&cfg(invalid)).expect_err(invalid).to_string();
             assert!(
                 err.contains("vit") || err.contains("activation"),
                 "{invalid}: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn vit_vc_attention_aliases_modes_and_permutations_parse_strictly() {
+        let base = "[net]\nwidth=8\nheight=6\nchannels=3\n[vit]\ndim=8\nheads=2\n";
+        let config = |options: &str| format!("{base}{options}\n");
+        let parse = |options: &str| build(&config(options)).unwrap();
+        let LayerKind::Vit(defaults) = &parse("flash_attention=1").layers[0].kind else {
+            panic!("expected Vit")
+        };
+        assert!(!defaults.vc_attention);
+        assert_eq!(defaults.vc_expcast, 1);
+        assert_eq!(defaults.vc_perm, super::VitVcPermutation::Sequence);
+
+        for (options, enabled, mode, permutation) in [
+            (
+                "flash_attention=1\nvc_attention=1\nvc_expcast=0\nvc_perm=sequence",
+                true,
+                0u8,
+                super::VitVcPermutation::Sequence,
+            ),
+            (
+                "flash_attn=1\nvc=1\nexpcast=2\nvc_perm=spatial",
+                true,
+                2u8,
+                super::VitVcPermutation::Spatial8,
+            ),
+            (
+                "flash_attention=1\nvc_attention=0\nvc=1\nvc_expcast=2\nexpcast=0\nvc_perm=window",
+                false,
+                2u8,
+                super::VitVcPermutation::Spatial8,
+            ),
+        ] {
+            let network = parse(options);
+            let LayerKind::Vit(spec) = &network.layers[0].kind else {
+                panic!("expected Vit")
+            };
+            assert_eq!(spec.vc_attention, enabled);
+            assert_eq!(spec.vc_expcast, mode);
+            assert_eq!(spec.vc_perm, permutation);
+        }
+        for invalid in [
+            "flash_attention=1\nvc_expcast=3",
+            "flash_attention=1\nvc_perm=spatial_typo",
+        ] {
+            assert!(build(&config(invalid)).is_err(), "{invalid}");
         }
     }
 

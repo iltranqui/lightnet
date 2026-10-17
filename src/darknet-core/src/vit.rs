@@ -515,7 +515,6 @@ pub fn attention_forward_flash(
 
 /// Source-shaped VC attention over all batch-heads. Each head owns an O(T*C)
 /// reference cache; no B*H*T*T probability tensor is materialized.
-#[allow(dead_code)] // Staged until VC config/runtime dispatch is integrated.
 pub(crate) fn attention_forward_vc(
     qkv: &[f32],
     batch: usize,
@@ -1488,6 +1487,9 @@ pub struct VitGeometry {
     pub pos_init_zero: bool,
     pub msa: Option<(usize, usize)>,
     pub flash_attention: bool,
+    pub vc_attention: bool,
+    pub vc_expcast: u8,
+    pub vc_perm: crate::model::VitVcPermutation,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1703,6 +1705,9 @@ where
     if g.flash_attention && g.msa.is_some() {
         return Err("vit flash attention and MSA are mutually exclusive".into());
     }
+    if g.vc_attention && !g.flash_attention {
+        return Err("vit VC attention requires flash attention".into());
+    }
     let tokens_per_sample = out_h * out_w;
     let rows = g.batch * tokens_per_sample;
     let mut tokens = linear_forward(
@@ -1737,7 +1742,24 @@ where
         g.hidden,
         3 * g.hidden,
     )?;
-    let (context, attention) = if g.flash_attention {
+    let (context, attention) = if g.flash_attention && g.vc_attention {
+        let mode = crate::vc_attention::ExpCastMode::try_from(g.vc_expcast)?;
+        let permutation = match g.vc_perm {
+            crate::model::VitVcPermutation::Sequence => None,
+            crate::model::VitVcPermutation::Spatial8 => {
+                Some(crate::vc_attention::spatial8_permutation(out_h, out_w)?)
+            }
+        };
+        attention_forward_vc(
+            &qkv,
+            g.batch,
+            tokens_per_sample,
+            g.hidden,
+            g.heads,
+            mode,
+            permutation.as_deref(),
+        )?
+    } else if g.flash_attention {
         flash_attention(&qkv, g.batch, tokens_per_sample, g.hidden, g.heads)?
     } else {
         attention_forward(&qkv, g.batch, tokens_per_sample, g.hidden, g.heads, g.msa)?
@@ -1997,6 +2019,9 @@ mod tests {
             pos_init_zero: false,
             msa: None,
             flash_attention: false,
+            vc_attention: false,
+            vc_expcast: 1,
+            vc_perm: crate::model::VitVcPermutation::Sequence,
         };
         let weights = VitWeights {
             patch_embed: vec![0.7, -0.4],
@@ -2291,6 +2316,29 @@ mod tests {
             let fd = (objective(&x, &w, &plus) - objective(&x, &w, &minus)) / (2.0 * eps);
             assert!((db[i] - fd).abs() < 5e-4, "db[{i}] {} != {fd}", db[i]);
         }
+    }
+
+    #[test]
+    fn vit_vc_mode_uses_the_quantized_reference_instead_of_standard_flash_callback() {
+        let (weights, mut geometry, input, _) = tiny_vit_fixture();
+        geometry.flash_attention = true;
+        geometry.vc_attention = true;
+        geometry.vc_expcast = 0;
+        geometry.vc_perm = crate::model::VitVcPermutation::Spatial8;
+        let (expected, expected_cache) =
+            vit_forward(&input, &weights, &geometry).expect("VC reference forward");
+        assert!(expected_cache.attention.vc_heads.is_some());
+
+        let (actual, cache) =
+            vit_forward_with_flash_attention(&input, &weights, &geometry, |_, _, _, _, _| {
+                Err("standard flash callback must be bypassed for VC".into())
+            })
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert!(cache.attention.vc_heads.is_some());
+
+        geometry.flash_attention = false;
+        assert!(vit_forward(&input, &weights, &geometry).is_err());
     }
 
     #[test]
