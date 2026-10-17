@@ -508,6 +508,11 @@ still NOT RUN (no `Jev_laya` build here; `test_data/laya/` has only the shared
   vc_attention` passed 13 tests, including Q/K/V finite differences over 128
   keys with a key permutation. This remains reference math, not cfg/runtime or
   compiled-C++ parity.
+- v0.0.266 (`fc47742d`): added `[B,H]` packing/unpacking around the single
+  batch-head VC reference, storing one O(T*C) cache per head and returning
+  gradients in fused QKV order. `MEM=3G ./tools/test_host.sh vc_attention`
+  passed 14 tests, including B=2/H=2 mapping and cache-shape coverage. Config,
+  runtime, device fallback, and compiled-C++ parity remain open.
 - Earlier focused evidence: full host unit suites pass (`darknet-core` 377,
   `darknet-cli` 18); targeted check/build pass with `-j 4`. The full
   `cfg_corpus` integration run exceeded a 30-minute timeout. C++ dump parity NOT
