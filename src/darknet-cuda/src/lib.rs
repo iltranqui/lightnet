@@ -403,15 +403,11 @@ pub trait F32TensorOpsBackend {
         let _ = config;
         let x = self.download_f32(x_branch)?;
         let y = self.download_f32(self_branch)?;
-        let residual = residual.map(|tensor| self.download_f32(tensor)).transpose()?;
-        let output = host_ops::eml_convolutional_forward(
-            &x,
-            &y,
-            residual.as_deref(),
-            clamp,
-            eps,
-            scale,
-        );
+        let residual = residual
+            .map(|tensor| self.download_f32(tensor))
+            .transpose()?;
+        let output =
+            host_ops::eml_convolutional_forward(&x, &y, residual.as_deref(), clamp, eps, scale);
         assert_eq!(output_shape.iter().product::<usize>(), output.len());
         self.upload_f32(output_shape, &output)
     }
@@ -433,14 +429,8 @@ pub trait F32TensorOpsBackend {
         let x = self.download_f32(x_branch)?;
         let y = self.download_f32(self_branch)?;
         let delta = self.download_f32(output_grad)?;
-        let (x_grad, self_grad) = host_ops::eml_convolutional_backward(
-            &x,
-            &y,
-            &delta,
-            clamp,
-            eps,
-            scale,
-        );
+        let (x_grad, self_grad) =
+            host_ops::eml_convolutional_backward(&x, &y, &delta, clamp, eps, scale);
         assert_eq!(output_shape.iter().product::<usize>(), x_grad.len());
         Ok((
             self.upload_f32(output_shape, &x_grad)?,
@@ -566,7 +556,10 @@ pub trait F32TensorOpsBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
         let _ = config;
-        assert!(!steps.is_empty(), "sequence concat requires at least one step");
+        assert!(
+            !steps.is_empty(),
+            "sequence concat requires at least one step"
+        );
         assert_eq!(
             output_shape.iter().product::<usize>(),
             steps.len() * step_elements,
@@ -1327,6 +1320,102 @@ pub trait F32TensorOpsBackend {
             shape,
             &host_ops::layernorm_backward(&dy, &host, rows, cols, g.as_deref(), eps),
         )
+    }
+    /// Online-softmax attention for fused QKV `[batch, tokens, 3*channels]`.
+    /// Returns context `[batch, tokens, channels]` and natural-log LSE
+    /// `[batch, heads, tokens]`; the reference implementation uses linear
+    /// workspace, not a sequence-length-squared score/probability matrix.
+    fn flash_attention_forward_f32(
+        &self,
+        qkv: &Self::Tensor,
+        output_shape: &[usize],
+        lse_shape: &[usize],
+        batch: usize,
+        tokens: usize,
+        channels: usize,
+        heads: usize,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        assert!(
+            batch > 0 && tokens > 0 && channels > 0 && heads > 0 && channels % heads == 0,
+            "flash_attention_forward_f32: invalid dimensions"
+        );
+        let rows = batch * tokens;
+        let qkv_host = self.download_f32(qkv)?;
+        assert_eq!(
+            qkv_host.len(),
+            rows * 3 * channels,
+            "flash attention QKV shape"
+        );
+        assert_eq!(
+            output_shape,
+            [batch, tokens, channels],
+            "flash attention output shape"
+        );
+        assert_eq!(
+            lse_shape,
+            [batch, heads, tokens],
+            "flash attention LSE shape"
+        );
+        let (output, lse) =
+            host_ops::flash_attention_forward(&qkv_host, batch, tokens, channels, heads);
+        Ok((
+            self.upload_f32(output_shape, &output)?,
+            self.upload_f32(lse_shape, &lse)?,
+        ))
+    }
+    /// Recompute-based derivative of standard online attention. Inputs are
+    /// fused QKV `[B,T,3C]`, context/output gradient `[B,T,C]`, and LSE
+    /// `[B,H,T]`; output is fused dQKV `[B,T,3C]`.
+    fn flash_attention_backward_f32(
+        &self,
+        qkv: &Self::Tensor,
+        context: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        lse: &Self::Tensor,
+        qkv_grad_shape: &[usize],
+        batch: usize,
+        tokens: usize,
+        channels: usize,
+        heads: usize,
+    ) -> Result<Self::Tensor, Self::Error> {
+        assert!(
+            batch > 0 && tokens > 0 && channels > 0 && heads > 0 && channels % heads == 0,
+            "flash_attention_backward_f32: invalid dimensions"
+        );
+        let rows = batch * tokens;
+        let elements = rows * channels;
+        assert_eq!(
+            qkv_grad_shape,
+            [batch, tokens, 3 * channels],
+            "flash attention dQKV shape"
+        );
+        let qkv_host = self.download_f32(qkv)?;
+        let context_host = self.download_f32(context)?;
+        let grad_host = self.download_f32(output_grad)?;
+        let lse_host = self.download_f32(lse)?;
+        assert_eq!(qkv_host.len(), 3 * elements, "flash attention QKV length");
+        assert_eq!(
+            context_host.len(),
+            elements,
+            "flash attention context length"
+        );
+        assert_eq!(grad_host.len(), elements, "flash attention gradient length");
+        assert_eq!(
+            lse_host.len(),
+            batch * heads * tokens,
+            "flash attention LSE length"
+        );
+        let dqkv = host_ops::flash_attention_backward(
+            &qkv_host,
+            &context_host,
+            &grad_host,
+            &lse_host,
+            batch,
+            tokens,
+            channels,
+            heads,
+        );
+        self.upload_f32(qkv_grad_shape, &dqkv)
     }
     /// Softmax over every contiguous `group_size` run of `x` (max-subtracted);
     /// `shape` is the tensor shape of `x` and the output.

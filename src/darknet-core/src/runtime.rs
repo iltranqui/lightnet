@@ -2107,21 +2107,34 @@ impl ExecutableNetwork {
         // Allocate a local workspace for this standalone (non-accumulate) backward call.
         // backward_accumulate_seeded reuses the pre-allocated self.workspace instead.
         let mut local_workspace = vec![0.0f32; compute_cpu_workspace_size(&self.network)];
+        let mut attention_backward =
+            |d_context: &[f32], _: &[f32], attention: &crate::vit::AttentionCache| {
+                crate::vit::attention_backward(d_context, attention)
+            };
         self.backward_seeded_core(
             &mut local_workspace,
             input,
             forward,
             layer_output_gradient_seeds,
+            &mut attention_backward,
         )
     }
 
-    fn backward_seeded_core(
+    fn backward_seeded_core<F>(
         &self,
         workspace: &mut Vec<f32>,
         input: &Tensor,
         forward: &ForwardResult,
         layer_output_gradient_seeds: &[Option<Tensor>],
-    ) -> Result<BackwardResult> {
+        attention_backward: &mut F,
+    ) -> Result<BackwardResult>
+    where
+        F: FnMut(
+            &[f32],
+            &[f32],
+            &crate::vit::AttentionCache,
+        ) -> std::result::Result<Vec<f32>, String>,
+    {
         let expected = self.network.net.input_shape();
         if input.shape != expected {
             return Err(Error::InvalidConfig(format!(
@@ -3007,8 +3020,15 @@ impl ExecutableNetwork {
                                 layer.index
                             ))
                         })?;
-                    let gradients = crate::vit::vit_backward(&grad.data, weights, cache)
-                        .map_err(Error::InvalidConfig)?;
+                    let gradients = crate::vit::vit_backward_with_attention(
+                        &grad.data,
+                        weights,
+                        cache,
+                        |d_context, context, attention| {
+                            attention_backward(d_context, context, attention)
+                        },
+                    )
+                    .map_err(Error::InvalidConfig)?;
                     let Some(LayerParams::Vit(slot)) = param_gradients.get_mut(layer.index) else {
                         return Err(Error::InvalidConfig(format!(
                             "missing [vit] gradient slot for layer #{}",
@@ -3199,11 +3219,38 @@ impl ExecutableNetwork {
         forward: &ForwardResult,
         layer_output_gradient_seeds: &[Option<Tensor>],
     ) -> Result<BackwardResult> {
+        self.backward_accumulate_seeded_with_attention(
+            input,
+            forward,
+            layer_output_gradient_seeds,
+            |d_context, _, attention| crate::vit::attention_backward(d_context, attention),
+        )
+    }
+
+    pub(crate) fn backward_accumulate_seeded_with_attention<F>(
+        &mut self,
+        input: &Tensor,
+        forward: &ForwardResult,
+        layer_output_gradient_seeds: &[Option<Tensor>],
+        mut attention_backward: F,
+    ) -> Result<BackwardResult>
+    where
+        F: FnMut(
+            &[f32],
+            &[f32],
+            &crate::vit::AttentionCache,
+        ) -> std::result::Result<Vec<f32>, String>,
+    {
         // Pull out the pre-allocated workspace to avoid the borrow-split problem:
         // mem::take replaces self.workspace with an empty Vec, then we restore it after.
         let mut ws = std::mem::take(&mut self.workspace);
-        let result =
-            self.backward_seeded_core(&mut ws, input, forward, layer_output_gradient_seeds)?;
+        let result = self.backward_seeded_core(
+            &mut ws,
+            input,
+            forward,
+            layer_output_gradient_seeds,
+            &mut attention_backward,
+        )?;
         self.workspace = ws;
         self.update_convolution_batch_norm_running_stats(input, forward)?;
         self.accumulate_train_buffers(&result.param_gradients)?;
@@ -7337,9 +7384,47 @@ where
                         .download_tensor(current_input, layer.input_shape)
                         .map_err(|err| backend_error("download vit input", err))?;
                     let geometry = vit_geometry(layer, spec);
-                    let (data, cache) =
-                        crate::vit::vit_forward(&host_input.data, weights, &geometry)
-                            .map_err(Error::InvalidConfig)?;
+                    let (data, cache) = crate::vit::vit_forward_with_flash_attention(
+                        &host_input.data,
+                        weights,
+                        &geometry,
+                        |qkv, batch, tokens, channels, heads| {
+                            if channels / heads > 128 {
+                                return crate::vit::attention_forward_flash(
+                                    qkv, batch, tokens, channels, heads,
+                                );
+                            }
+                            let qkv_tensor = self
+                                .backend
+                                .upload_f32(&[batch, tokens, 3 * channels], qkv)
+                                .map_err(|err| format!("upload ViT flash QKV: {err}"))?;
+                            let (context_tensor, lse_tensor) = self
+                                .backend
+                                .flash_attention_forward_f32(
+                                    &qkv_tensor,
+                                    &[batch, tokens, channels],
+                                    &[batch, heads, tokens],
+                                    batch,
+                                    tokens,
+                                    channels,
+                                    heads,
+                                )
+                                .map_err(|err| format!("ViT flash forward: {err}"))?;
+                            let context = self
+                                .backend
+                                .download_f32(&context_tensor)
+                                .map_err(|err| format!("download ViT flash context: {err}"))?;
+                            let lse = self
+                                .backend
+                                .download_f32(&lse_tensor)
+                                .map_err(|err| format!("download ViT flash LSE: {err}"))?;
+                            let attention = crate::vit::attention_flash_cache_from_lse(
+                                qkv, batch, tokens, channels, heads, &lse,
+                            )?;
+                            Ok((context, attention))
+                        },
+                    )
+                    .map_err(Error::InvalidConfig)?;
                     vit_cache = Some(cache);
                     self.backend
                         .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
@@ -10749,8 +10834,9 @@ where
                 LayerKind::LayaMarkerGather(_) => return true,
                 // Weighted shortcut parameter reductions stay host-resident,
                 // while input/source gradients use backend elementwise ops.
-                // Same for `[laya_act_head]` and the ViT transformer until
-                // device backward kernels are available.
+                // `[laya_act_head]` and the full ViT backward still use the
+                // host fallback; standard-flash dQ/dK/dV dispatches to Oxide
+                // from that fallback when the head dimension is supported.
                 LayerKind::LayaActHead(_) | LayerKind::Vit(_) => return true,
                 // Connected layers are handled on the GPU path with a host
                 // round trip unless their activation or batch norm
@@ -10801,7 +10887,85 @@ where
                 *train = default_layer_train_buffers(layer);
             }
         }
-        cpu.backward_accumulate_seeded(&input, &forward.cpu_forward, layer_output_gradient_seeds)?;
+        cpu.backward_accumulate_seeded_with_attention(
+            &input,
+            &forward.cpu_forward,
+            layer_output_gradient_seeds,
+            |d_context, context, attention| {
+                let Some(backward_inputs) = crate::vit::attention_flash_backward_inputs(attention)?
+                else {
+                    return crate::vit::attention_backward(d_context, attention);
+                };
+                if backward_inputs.channels / backward_inputs.heads > 128 {
+                    return crate::vit::attention_backward(d_context, attention);
+                }
+                let qkv = self
+                    .backend
+                    .upload_f32(
+                        &[
+                            backward_inputs.batch,
+                            backward_inputs.tokens,
+                            3 * backward_inputs.channels,
+                        ],
+                        &backward_inputs.qkv,
+                    )
+                    .map_err(|err| format!("upload ViT flash backward QKV: {err}"))?;
+                let context_tensor = self
+                    .backend
+                    .upload_f32(
+                        &[
+                            backward_inputs.batch,
+                            backward_inputs.tokens,
+                            backward_inputs.channels,
+                        ],
+                        context,
+                    )
+                    .map_err(|err| format!("upload ViT flash backward context: {err}"))?;
+                let grad_tensor = self
+                    .backend
+                    .upload_f32(
+                        &[
+                            backward_inputs.batch,
+                            backward_inputs.tokens,
+                            backward_inputs.channels,
+                        ],
+                        d_context,
+                    )
+                    .map_err(|err| format!("upload ViT flash output gradient: {err}"))?;
+                let lse_tensor = self
+                    .backend
+                    .upload_f32(
+                        &[
+                            backward_inputs.batch,
+                            backward_inputs.heads,
+                            backward_inputs.tokens,
+                        ],
+                        &backward_inputs.lse,
+                    )
+                    .map_err(|err| format!("upload ViT flash LSE: {err}"))?;
+                let dqkv = self
+                    .backend
+                    .flash_attention_backward_f32(
+                        &qkv,
+                        &context_tensor,
+                        &grad_tensor,
+                        &lse_tensor,
+                        &[
+                            backward_inputs.batch,
+                            backward_inputs.tokens,
+                            3 * backward_inputs.channels,
+                        ],
+                        backward_inputs.batch,
+                        backward_inputs.tokens,
+                        backward_inputs.channels,
+                        backward_inputs.heads,
+                    )
+                    .map_err(|err| format!("ViT flash backward: {err}"))?;
+                self.backend
+                    .download_f32(&dqkv)
+                    .map_err(|err| format!("download ViT flash dQKV: {err}"))
+            },
+        )?;
 
         let mut device_conv_gradients = Vec::new();
         for (layer, train) in self.network.layers.iter().zip(&cpu.train_buffers) {
@@ -12775,6 +12939,7 @@ fn vit_geometry(
         msa: spec
             .msa_enabled
             .then_some((spec.msa_block_size, spec.msa_topk)),
+        flash_attention: spec.flash_attention,
     }
 }
 
@@ -20994,7 +21159,7 @@ mod tests {
             ConfigFile::parse_str(
                 "vit-runtime.cfg",
                 "[net]\nwidth=4\nheight=4\nchannels=1\nbatch=1\n\
-             [vit]\ndim=4\nheads=2\npatch_size=2\npatch_stride=2\nmlp_dim=4\n",
+             [vit]\ndim=4\nheads=2\npatch_size=2\npatch_stride=2\nmlp_dim=4\nflash_attention=1\n",
             )
             .unwrap(),
         )
@@ -21185,7 +21350,7 @@ mod tests {
                 "vit-chain.cfg",
                 "[net]\nwidth=4\nheight=4\nchannels=1\nbatch=1\n\
              [convolutional]\nfilters=1\nsize=1\nactivation=linear\n\
-             [vit]\ndim=4\nheads=2\npatch_size=2\npatch_stride=2\nmlp_dim=4\n",
+             [vit]\ndim=4\nheads=2\npatch_size=2\npatch_stride=2\nmlp_dim=4\nflash_attention=1\n",
             )
             .unwrap(),
         )

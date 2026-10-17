@@ -568,6 +568,8 @@ pub struct VitSpec {
     pub msa_enabled: bool,
     pub msa_block_size: usize,
     pub msa_topk: usize,
+    /// Selects the online-softmax reference implementation without a T×T cache.
+    pub flash_attention: bool,
 }
 
 /// `[yolox]`: the anchor-free detection head (Phase 2A of `tasks/rust/layers.md`),
@@ -2747,15 +2749,7 @@ fn parse_layer_kind(
         }
         "vit" => {
             let line = section.line;
-            for unsupported in [
-                "flash_attention",
-                "flash_attn",
-                "vc_attention",
-                "vc",
-                "vc_expcast",
-                "expcast",
-                "vc_perm",
-            ] {
+            for unsupported in ["vc_attention", "vc", "vc_expcast", "expcast", "vc_perm"] {
                 if section.get(unsupported).is_some() {
                     return Err(Error::InvalidConfig(format!(
                         "[vit] at line {line}: {unsupported} is not supported by the Rust reference path yet"
@@ -2868,6 +2862,17 @@ fn parse_layer_kind(
                 section.get_usize("msa_top_blocks", 4)?
             }
             .max(1);
+            // Match the source alias precedence: flash_attention overrides flash_attn.
+            let flash_attention = if section.get("flash_attention").is_some() {
+                section.get_bool_int("flash_attention", false)?
+            } else {
+                section.get_bool_int("flash_attn", false)?
+            };
+            if flash_attention && msa_enabled {
+                return Err(Error::InvalidConfig(format!(
+                    "[vit] at line {line}: flash_attention and msa are mutually exclusive"
+                )));
+            }
             LayerKind::Vit(VitSpec {
                 dim,
                 patch_size,
@@ -2882,6 +2887,7 @@ fn parse_layer_kind(
                 msa_enabled,
                 msa_block_size,
                 msa_topk,
+                flash_attention,
             })
         }
         "laya_scorer" => {
@@ -4124,6 +4130,7 @@ mod tests {
         assert_eq!((spec.dim, spec.mlp_dim, spec.ffn_ratio), (8, 32, 4));
         assert!(spec.learned_pos_embed && !spec.pos_init_zero);
         assert_eq!(spec.activation, super::Activation::Gelu);
+        assert!(!spec.flash_attention);
         let shape = default.layers[0].output_shape;
         assert_eq!((shape.width, shape.height, shape.channels), (4, 3, 8));
 
@@ -4148,6 +4155,27 @@ mod tests {
             ),
             (4, 3)
         );
+    }
+
+    #[test]
+    fn vit_flash_attention_aliases_select_online_attention_and_reject_msa() {
+        for option in ["flash_attention=1", "flash_attn=1"] {
+            let net = build(&format!(
+                "[net]\nwidth=4\nheight=1\nchannels=1\n[vit]\ndim=2\nheads=1\n{option}\n"
+            ))
+            .unwrap();
+            let LayerKind::Vit(spec) = &net.layers[0].kind else {
+                panic!("expected Vit")
+            };
+            assert!(spec.flash_attention, "{option}");
+        }
+
+        let error = build(
+            "[net]\nwidth=4\nheight=1\nchannels=1\n[vit]\ndim=2\nheads=1\nflash_attention=1\nmsa=1\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("mutually exclusive"), "{error}");
     }
 
     #[test]
@@ -4211,6 +4239,7 @@ mod tests {
                     learned_pos_embed: true,
                     pos_init_zero: false,
                     msa: None,
+                    flash_attention: false,
                 },
                 3,
                 4,
@@ -4232,8 +4261,6 @@ mod tests {
             "dim=8\nheads=2\npos_embed=rotary",
             "dim=8\nheads=2\npos_init=ones",
             "dim=8\nheads=2\nactivation=unknown_vit_act",
-            "dim=8\nheads=2\nflash_attention=1",
-            "dim=8\nheads=2\nflash_attn=1",
             "dim=8\nheads=2\nvc_attention=1",
             "dim=8\nheads=2\nvc=1",
             "dim=8\nheads=2\nvc_expcast=2",

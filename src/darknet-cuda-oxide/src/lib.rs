@@ -22,16 +22,17 @@ use darknet_cuda::{
     SgdUpdateItem,
 };
 
+pub use conv::ConvMode;
+pub use fp4::Fp4Packed;
+pub use fp8::Fp8Format;
 use kernels::bias_scale::BIAS_BACKWARD_THREADS;
 use kernels::{
-    activations, amp as amp_k, batchnorm, bias_scale, conv_direct, conv_implicit, convert, elementwise, gemm, gemm_f16, gemm_f8, gemm_fp4,
-    gemm_mma, half_ops, im2col, layers_extra, optim, pool, quant_fp4, resample, route,
+    activations, amp as amp_k, batchnorm, bias_scale, conv_direct, conv_implicit, convert,
+    elementwise, gemm, gemm_f8, gemm_f16, gemm_fp4, gemm_mma, half_ops, im2col, layers_extra,
+    optim, pool, quant_fp4, resample, route,
 };
-pub use conv::ConvMode;
-pub use fp8::Fp8Format;
-pub use fp4::Fp4Packed;
-pub use tensor::{OxideTensorF16, OxideTensorF32};
 use tensor::PooledBuf;
+pub use tensor::{OxideTensorF16, OxideTensorF32};
 
 #[derive(Debug)]
 pub enum OxideError {
@@ -237,7 +238,15 @@ impl Default for GemmArgs {
 }
 
 /// Highest element index (+1) touched by a stored `rows x cols` matrix.
-fn extent(base: usize, stride: usize, modulus: usize, count: usize, rows: usize, cols: usize, ld: usize) -> usize {
+fn extent(
+    base: usize,
+    stride: usize,
+    modulus: usize,
+    count: usize,
+    rows: usize,
+    cols: usize,
+    ld: usize,
+) -> usize {
     let inst = count.min(modulus).saturating_sub(1);
     base + inst * stride + (rows - 1) * ld + cols
 }
@@ -341,7 +350,6 @@ fn check_channel_layout(
     Ok(())
 }
 
-
 /// Conv geometry for the implicit-GEMM forward ([`OxideBackend::gemm_conv_implicit`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ImplicitConv {
@@ -410,9 +418,7 @@ fn pool_layout(
     if x_shape_len != batch * channels * in_h * in_w {
         return Err(shape_err(
             op,
-            format!(
-                "input has {x_shape_len} elements, expected {batch}*{channels}*{in_h}*{in_w}"
-            ),
+            format!("input has {x_shape_len} elements, expected {batch}*{channels}*{in_h}*{in_w}"),
         ));
     }
     Ok((batch, out_shape[2], out_shape[3]))
@@ -431,7 +437,10 @@ fn crop_layout(
     adjustments: &[usize],
 ) -> Result<(), OxideError> {
     if channels == 0 || in_h == 0 || in_w == 0 || out_h == 0 || out_w == 0 {
-        return Err(shape_err(op, "channels and spatial dims must be > 0".to_owned()));
+        return Err(shape_err(
+            op,
+            "channels and spatial dims must be > 0".to_owned(),
+        ));
     }
     let expected = batch * out_h * out_w;
     if coords.0 != expected || coords.1 != expected {
@@ -509,7 +518,10 @@ impl OxideBackend {
             .map_err(|err| OxideError::Shape(format!("load layers_extra module: {err:?}")))?;
         let half_scratch = half::HalfScratch::new(&stream)?;
         let bufs = tensor::BufPool::new();
-        let empty_f32 = Arc::new(PooledBuf::new(DeviceBuffer::<f32>::zeroed(&stream, 0)?, &bufs));
+        let empty_f32 = Arc::new(PooledBuf::new(
+            DeviceBuffer::<f32>::zeroed(&stream, 0)?,
+            &bufs,
+        ));
         let amp = mixed::amp_from_env();
         Ok(Self {
             _ctx: ctx,
@@ -534,7 +546,11 @@ impl OxideBackend {
             empty_f32,
             half_scratch: Mutex::new(half_scratch),
             half_col: Mutex::new(None),
-            gemm_mode: if amp { GemmMode::Fp16 } else { GemmMode::from_env() },
+            gemm_mode: if amp {
+                GemmMode::Fp16
+            } else {
+                GemmMode::from_env()
+            },
             im2col,
             conv_direct,
             conv_implicit,
@@ -758,7 +774,11 @@ impl OxideBackend {
         };
         let pa = self::fp4::quantize_1x16(&a_k, g.m, g.k);
         let pb = self::fp4::quantize_1x16(&b_k, g.n, g.k);
-        let c_host = if g.beta == 0.0 { Vec::new() } else { c.to_host_vec(&self.stream)? };
+        let c_host = if g.beta == 0.0 {
+            Vec::new()
+        } else {
+            c.to_host_vec(&self.stream)?
+        };
         let result = self.gemm_fp4(
             &pa,
             &pb,
@@ -815,19 +835,43 @@ impl OxideBackend {
         // convs).  Split K across extra blocks that write dense partial products
         // to a workspace, then reduce them in a fixed order (deterministic).
         let tf32 = self.gemm_mode.use_tf32(g);
-        let (bm, bn) = if tf32 { (gemm_mma::MMA_BM, gemm_mma::MMA_BN) } else { (gemm::BM, gemm::BN) };
+        let (bm, bn) = if tf32 {
+            (gemm_mma::MMA_BM, gemm_mma::MMA_BN)
+        } else {
+            (gemm::BM, gemm::BN)
+        };
         let tiles = g.m.div_ceil(bm) * g.n.div_ceil(bn) * g.count;
         let splits = if tiles < SPLITK_TARGET_BLOCKS {
-            SPLITK_TARGET_BLOCKS.div_ceil(tiles).min(g.k / SPLITK_MIN_K).min(SPLITK_MAX).max(1)
+            SPLITK_TARGET_BLOCKS
+                .div_ceil(tiles)
+                .min(g.k / SPLITK_MIN_K)
+                .min(SPLITK_MAX)
+                .max(1)
         } else {
             1
         };
-        let kchunk = if splits > 1 { g.k.div_ceil(splits).next_multiple_of(16) } else { g.k };
+        let kchunk = if splits > 1 {
+            g.k.div_ceil(splits).next_multiple_of(16)
+        } else {
+            g.k
+        };
         let splits = g.k.div_ceil(kchunk); // drop empty trailing splits
         let mn = g.m * g.n;
-        let mut ws = if splits > 1 { Some(self.alloc_uninit(splits * g.count * mn)?) } else { None };
-        let (alpha, beta, ldc) = if splits > 1 { (1.0, 0.0, g.n) } else { (g.alpha, g.beta, g.ldc) };
-        let (cb, cs, cm) = if splits > 1 { (0, mn, splits * g.count) } else { g.c };
+        let mut ws = if splits > 1 {
+            Some(self.alloc_uninit(splits * g.count * mn)?)
+        } else {
+            None
+        };
+        let (alpha, beta, ldc) = if splits > 1 {
+            (1.0, 0.0, g.n)
+        } else {
+            (g.alpha, g.beta, g.ldc)
+        };
+        let (cb, cs, cm) = if splits > 1 {
+            (0, mn, splits * g.count)
+        } else {
+            g.c
+        };
         let target: &mut DeviceBuffer<f32> = match ws.as_mut() {
             Some(w) => w,
             None => c,
@@ -841,10 +885,30 @@ impl OxideBackend {
                 self.gemm_mma.sgemm_tf32_mma(
                     &self.stream,
                     launch::blocks_of(blocks, gemm_mma::MMA_THREADS),
-                    a, b, target, g.m, g.n, g.k, g.lda, g.ldb, ldc,
-                    g.trans_a as u32, g.trans_b as u32, alpha, beta,
-                    g.a.0, g.a.1, g.a.2, g.b.0, g.b.1, g.b.2, cb, cs, cm,
-                    g.count, kchunk,
+                    a,
+                    b,
+                    target,
+                    g.m,
+                    g.n,
+                    g.k,
+                    g.lda,
+                    g.ldb,
+                    ldc,
+                    g.trans_a as u32,
+                    g.trans_b as u32,
+                    alpha,
+                    beta,
+                    g.a.0,
+                    g.a.1,
+                    g.a.2,
+                    g.b.0,
+                    g.b.1,
+                    g.b.2,
+                    cb,
+                    cs,
+                    cm,
+                    g.count,
+                    kchunk,
                 )
             }
         } else {
@@ -852,10 +916,30 @@ impl OxideBackend {
                 self.gemm.sgemm_tiled(
                     &self.stream,
                     launch::blocks_of(blocks, gemm::GEMM_THREADS),
-                    a, b, target, g.m, g.n, g.k, g.lda, g.ldb, ldc,
-                    g.trans_a as u32, g.trans_b as u32, alpha, beta,
-                    g.a.0, g.a.1, g.a.2, g.b.0, g.b.1, g.b.2, cb, cs, cm,
-                    g.count, kchunk,
+                    a,
+                    b,
+                    target,
+                    g.m,
+                    g.n,
+                    g.k,
+                    g.lda,
+                    g.ldb,
+                    ldc,
+                    g.trans_a as u32,
+                    g.trans_b as u32,
+                    alpha,
+                    beta,
+                    g.a.0,
+                    g.a.1,
+                    g.a.2,
+                    g.b.0,
+                    g.b.1,
+                    g.b.2,
+                    cb,
+                    cs,
+                    cm,
+                    g.count,
+                    kchunk,
                 )
             }
         };
@@ -866,7 +950,18 @@ impl OxideBackend {
                 self.gemm.gemm_splitk_reduce(
                     &self.stream,
                     launch::elementwise(g.count * mn, ElementwiseLaunchConfig::default()),
-                    &w, c, g.m, g.n, g.ldc, g.count, splits, g.alpha, g.beta, g.c.0, g.c.1, g.c.2,
+                    &w,
+                    c,
+                    g.m,
+                    g.n,
+                    g.ldc,
+                    g.count,
+                    splits,
+                    g.alpha,
+                    g.beta,
+                    g.c.0,
+                    g.c.1,
+                    g.c.2,
                 )
             }
             .map_err(launch_err)?;
@@ -908,16 +1003,36 @@ impl OxideBackend {
         let (bm, bn) = (conv_implicit::BM, conv_implicit::BN);
         let tiles = g.m.div_ceil(bm) * g.n.div_ceil(bn) * g.count;
         let splits = if tiles < SPLITK_TARGET_BLOCKS {
-            SPLITK_TARGET_BLOCKS.div_ceil(tiles).min(g.k / SPLITK_MIN_K).min(SPLITK_MAX).max(1)
+            SPLITK_TARGET_BLOCKS
+                .div_ceil(tiles)
+                .min(g.k / SPLITK_MIN_K)
+                .min(SPLITK_MAX)
+                .max(1)
         } else {
             1
         };
-        let kchunk = if splits > 1 { g.k.div_ceil(splits).next_multiple_of(16) } else { g.k };
+        let kchunk = if splits > 1 {
+            g.k.div_ceil(splits).next_multiple_of(16)
+        } else {
+            g.k
+        };
         let splits = g.k.div_ceil(kchunk); // drop empty trailing splits
         let mn = g.m * g.n;
-        let mut ws = if splits > 1 { Some(self.alloc_uninit(splits * g.count * mn)?) } else { None };
-        let (alpha, beta, ldc) = if splits > 1 { (1.0, 0.0, g.n) } else { (g.alpha, g.beta, g.ldc) };
-        let (cb, cs, cm) = if splits > 1 { (0, mn, splits * g.count) } else { g.c };
+        let mut ws = if splits > 1 {
+            Some(self.alloc_uninit(splits * g.count * mn)?)
+        } else {
+            None
+        };
+        let (alpha, beta, ldc) = if splits > 1 {
+            (1.0, 0.0, g.n)
+        } else {
+            (g.alpha, g.beta, g.ldc)
+        };
+        let (cb, cs, cm) = if splits > 1 {
+            (0, mn, splits * g.count)
+        } else {
+            g.c
+        };
         let target: &mut DeviceBuffer<f32> = match ws.as_mut() {
             Some(w) => w,
             None => c,
@@ -929,11 +1044,37 @@ impl OxideBackend {
             self.conv_implicit.sgemm_conv_implicit(
                 &self.stream,
                 launch::blocks_of(blocks, conv_implicit::GEMM_THREADS),
-                a, x, target, g.m, g.n, g.k, g.lda, ldc, alpha, beta,
-                g.a.0, g.a.1, g.a.2, cb, cs, cm, g.count, kchunk,
-                conv.x_base, conv.channels, conv.in_h, conv.in_w, conv.cpg, conv.groups,
-                conv.ksize, conv.stride_x, conv.stride_y, conv.dilation, conv.padding,
-                conv.out_h, conv.out_w,
+                a,
+                x,
+                target,
+                g.m,
+                g.n,
+                g.k,
+                g.lda,
+                ldc,
+                alpha,
+                beta,
+                g.a.0,
+                g.a.1,
+                g.a.2,
+                cb,
+                cs,
+                cm,
+                g.count,
+                kchunk,
+                conv.x_base,
+                conv.channels,
+                conv.in_h,
+                conv.in_w,
+                conv.cpg,
+                conv.groups,
+                conv.ksize,
+                conv.stride_x,
+                conv.stride_y,
+                conv.dilation,
+                conv.padding,
+                conv.out_h,
+                conv.out_w,
             )
         }
         .map_err(launch_err)?;
@@ -943,7 +1084,18 @@ impl OxideBackend {
                 self.gemm.gemm_splitk_reduce(
                     &self.stream,
                     launch::elementwise(g.count * mn, ElementwiseLaunchConfig::default()),
-                    &w, c, g.m, g.n, g.ldc, g.count, splits, g.alpha, g.beta, g.c.0, g.c.1, g.c.2,
+                    &w,
+                    c,
+                    g.m,
+                    g.n,
+                    g.ldc,
+                    g.count,
+                    splits,
+                    g.alpha,
+                    g.beta,
+                    g.c.0,
+                    g.c.1,
+                    g.c.2,
                 )
             }
             .map_err(launch_err)?;
@@ -1083,7 +1235,11 @@ impl OxideBackend {
         if a.len() < 256 || b.len() < 128 {
             return Err(shape_err(
                 "f16_mma_probe16",
-                format!("expected 256 A and 128 B halves, got {} and {}", a.len(), b.len()),
+                format!(
+                    "expected 256 A and 128 B halves, got {} and {}",
+                    a.len(),
+                    b.len()
+                ),
             ));
         }
         let da = DeviceBuffer::<u16>::from_host(&self.stream, &a[..256])?;
@@ -1092,13 +1248,8 @@ impl OxideBackend {
         // SAFETY: a single warp; every lane's fragments are present and each
         // output slot has exactly one owner.
         unsafe {
-            self.gemm_f8.f16_mma_probe16(
-                &self.stream,
-                launch::blocks_of(1, 32),
-                &da,
-                &db,
-                &mut out,
-            )
+            self.gemm_f8
+                .f16_mma_probe16(&self.stream, launch::blocks_of(1, 32), &da, &db, &mut out)
         }
         .map_err(launch_err)?;
         Ok(out.to_host_vec(&self.stream)?)
@@ -1117,7 +1268,11 @@ impl OxideBackend {
         if a.len() < 256 || b.len() < 128 {
             return Err(shape_err(
                 "fp8_mma_probe16",
-                format!("fragments must be 256 A bytes and 128 B bytes, got {} and {}", a.len(), b.len()),
+                format!(
+                    "fragments must be 256 A bytes and 128 B bytes, got {} and {}",
+                    a.len(),
+                    b.len()
+                ),
             ));
         }
         let da = DeviceBuffer::<u8>::from_host(&self.stream, &a[..256])?;
@@ -1154,7 +1309,11 @@ impl OxideBackend {
         if a.len() < 512 || b.len() < 256 {
             return Err(shape_err(
                 "fp8_mma_probe",
-                format!("fragments must be 512 A bytes and 256 B bytes, got {} and {}", a.len(), b.len()),
+                format!(
+                    "fragments must be 512 A bytes and 256 B bytes, got {} and {}",
+                    a.len(),
+                    b.len()
+                ),
             ));
         }
         let da = DeviceBuffer::<u8>::from_host(&self.stream, &a[..512])?;
@@ -1222,12 +1381,28 @@ impl OxideBackend {
         } else {
             1
         };
-        let kchunk = if splits > 1 { g.k.div_ceil(splits).next_multiple_of(16) } else { g.k };
+        let kchunk = if splits > 1 {
+            g.k.div_ceil(splits).next_multiple_of(16)
+        } else {
+            g.k
+        };
         let splits = g.k.div_ceil(kchunk);
         let mn = g.m * g.n;
-        let mut ws = if splits > 1 { Some(self.alloc_uninit(splits * g.count * mn)?) } else { None };
-        let (alpha, beta, ldc) = if splits > 1 { (1.0, 0.0, g.n) } else { (g.alpha, g.beta, g.ldc) };
-        let (cb, cs, cm) = if splits > 1 { (0, mn, splits * g.count) } else { g.c };
+        let mut ws = if splits > 1 {
+            Some(self.alloc_uninit(splits * g.count * mn)?)
+        } else {
+            None
+        };
+        let (alpha, beta, ldc) = if splits > 1 {
+            (1.0, 0.0, g.n)
+        } else {
+            (g.alpha, g.beta, g.ldc)
+        };
+        let (cb, cs, cm) = if splits > 1 {
+            (0, mn, splits * g.count)
+        } else {
+            g.c
+        };
         let target: &mut DeviceBuffer<f32> = match ws.as_mut() {
             Some(w) => w,
             None => c,
@@ -1315,7 +1490,11 @@ impl OxideBackend {
         if a.len() < ar * ac || b.len() < br * bc {
             return Err(shape_err(
                 "gemm_fp8",
-                format!("operands too small: {} A bytes for {ar}x{ac}, {} B bytes for {br}x{bc}", a.len(), b.len()),
+                format!(
+                    "operands too small: {} A bytes for {ar}x{ac}, {} B bytes for {br}x{bc}",
+                    a.len(),
+                    b.len()
+                ),
             ));
         }
         let da = DeviceBuffer::<u8>::from_host(&self.stream, a)?;
@@ -1358,8 +1537,18 @@ impl OxideBackend {
         fmt_b: Fp8Format,
     ) -> Result<f64, OxideError> {
         let mut c = self.alloc(m * n)?;
-        let g = GemmArgs { m, n, k, lda: k, ldb: n, ldc: n, ..GemmArgs::default() };
-        self.time_gpu_ms(iters, || self.gemm_fp8_args(&*a, &*b, &mut c, &g, fmt_a, fmt_b))
+        let g = GemmArgs {
+            m,
+            n,
+            k,
+            lda: k,
+            ldb: n,
+            ldc: n,
+            ..GemmArgs::default()
+        };
+        self.time_gpu_ms(iters, || {
+            self.gemm_fp8_args(&*a, &*b, &mut c, &g, fmt_a, fmt_b)
+        })
     }
 
     /// Like [`Self::bench_gemm_fp8`] but takes host operand slices and uploads
@@ -1391,14 +1580,26 @@ impl OxideBackend {
 
     /// Packed NVFP4 quantiser: `[rows, k]` row-major f32 -> E2M1 codes with one
     /// E4M3 scale per 16 elements along K, plus the f32 global scale.
-    pub fn fp4_quantize_1x16(&self, x: &[f32], rows: usize, k: usize) -> Result<Fp4Packed, OxideError> {
+    pub fn fp4_quantize_1x16(
+        &self,
+        x: &[f32],
+        rows: usize,
+        k: usize,
+    ) -> Result<Fp4Packed, OxideError> {
         if rows == 0 || k == 0 {
-            return Err(shape_err("fp4_quantize_1x16", "rows and k must be > 0".to_string()));
+            return Err(shape_err(
+                "fp4_quantize_1x16",
+                "rows and k must be > 0".to_string(),
+            ));
         }
         if x.len() != rows * k {
             return Err(shape_err(
                 "fp4_quantize_1x16",
-                format!("expected {} elements for {rows}x{k}, got {}", rows * k, x.len()),
+                format!(
+                    "expected {} elements for {rows}x{k}, got {}",
+                    rows * k,
+                    x.len()
+                ),
             ));
         }
         let blocks = k.div_ceil(quant_fp4::BLOCK);
@@ -1541,13 +1742,39 @@ impl OxideBackend {
         unsafe {
             if reference {
                 self.gemm_fp4.fp4_gemm_nt_packed_reference(
-                    &self.stream, grid, &dca, &dsa, &dcb, &dsb, &mut out,
-                    m, n, k, alpha, beta, n, &ga, &gb,
+                    &self.stream,
+                    grid,
+                    &dca,
+                    &dsa,
+                    &dcb,
+                    &dsb,
+                    &mut out,
+                    m,
+                    n,
+                    k,
+                    alpha,
+                    beta,
+                    n,
+                    &ga,
+                    &gb,
                 )
             } else {
                 self.gemm_fp4.fp4_gemm_nt_packed(
-                    &self.stream, grid, &dca, &dsa, &dcb, &dsb, &mut out,
-                    m, n, k, alpha, beta, n, &ga, &gb,
+                    &self.stream,
+                    grid,
+                    &dca,
+                    &dsa,
+                    &dcb,
+                    &dsb,
+                    &mut out,
+                    m,
+                    n,
+                    k,
+                    alpha,
+                    beta,
+                    n,
+                    &ga,
+                    &gb,
                 )
             }
         }
@@ -1579,8 +1806,21 @@ impl OxideBackend {
         // output element has exactly one owner thread.
         let mut run = || unsafe {
             self.gemm_fp4.fp4_gemm_nt_packed(
-                &self.stream, grid, &dca, &dsa, &dcb, &dsb, &mut out,
-                m, n, k, 1.0f32, 0.0f32, n, &ga, &gb,
+                &self.stream,
+                grid,
+                &dca,
+                &dsa,
+                &dcb,
+                &dsb,
+                &mut out,
+                m,
+                n,
+                k,
+                1.0f32,
+                0.0f32,
+                n,
+                &ga,
+                &gb,
             )
         };
         Ok(self.time_gpu_ms(iters, || run().map_err(launch_err))?)
@@ -1602,7 +1842,15 @@ impl OxideBackend {
             return self.bench_gemm_f16(m, n, k, iters);
         }
         let mut c = self.alloc(m * n)?;
-        let g = GemmArgs { m, n, k, lda: k, ldb: n, ldc: n, ..GemmArgs::default() };
+        let g = GemmArgs {
+            m,
+            n,
+            k,
+            lda: k,
+            ldb: n,
+            ldc: n,
+            ..GemmArgs::default()
+        };
         self.time_gpu_ms(iters, || self.gemm(&a.buf, &b.buf, &mut c, &g))
     }
 
@@ -1621,11 +1869,15 @@ impl OxideBackend {
     {
         f()?;
         self.stream.synchronize()?;
-        let start = self.stream.record_event(Some(cuda_core::sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+        let start = self
+            .stream
+            .record_event(Some(cuda_core::sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
         for _ in 0..iters {
             f()?;
         }
-        let end = self.stream.record_event(Some(cuda_core::sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+        let end = self
+            .stream
+            .record_event(Some(cuda_core::sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
         end.synchronize()?;
         Ok(start.elapsed_ms(&end)? as f64 / iters as f64)
     }
@@ -1667,8 +1919,16 @@ impl OxideBackend {
         in_w: usize,
     ) -> Result<(usize, usize), OxideError> {
         let g = grad.shape();
-        if g.len() != 4 || g[1] != channels || in_h * in_w * channels == 0 || x_len % (in_h * in_w * channels) != 0 || g[0] != x_len / (in_h * in_w * channels) {
-            return Err(shape_err(op, format!("gradient shape {g:?} does not match the input")));
+        if g.len() != 4
+            || g[1] != channels
+            || in_h * in_w * channels == 0
+            || x_len % (in_h * in_w * channels) != 0
+            || g[0] != x_len / (in_h * in_w * channels)
+        {
+            return Err(shape_err(
+                op,
+                format!("gradient shape {g:?} does not match the input"),
+            ));
         }
         Ok((g[2], g[3]))
     }
@@ -1740,7 +2000,10 @@ impl OxideBackend {
             (d.small_len(), d.big_len())
         };
         if src.len() != src_len || src_shape.iter().product::<usize>() != src_len {
-            return Err(shape_err(op, format!("input has {} elements, expected {src_len}", src.len())));
+            return Err(shape_err(
+                op,
+                format!("input has {} elements, expected {src_len}", src.len()),
+            ));
         }
         let mut out = self.alloc_uninit(dst_len)?;
         // SAFETY: one thread per output element; source indices are in range
@@ -1787,11 +2050,17 @@ impl OxideBackend {
         per_channel: &[&OxideTensorF32],
     ) -> Result<(usize, usize, usize), OxideError> {
         if shape.len() != 4 || shape.iter().product::<usize>() != len || len == 0 {
-            return Err(shape_err(op, format!("shape {shape:?} does not match {len} elements")));
+            return Err(shape_err(
+                op,
+                format!("shape {shape:?} does not match {len} elements"),
+            ));
         }
         let channels = shape[1];
         if per_channel.iter().any(|t| t.len() != channels) {
-            return Err(shape_err(op, format!("per-channel tensors must have {channels} elements")));
+            return Err(shape_err(
+                op,
+                format!("per-channel tensors must have {channels} elements"),
+            ));
         }
         Ok((channels, shape[2] * shape[3], shape[0]))
     }
@@ -1821,10 +2090,17 @@ impl OxideBackend {
         scale_wh: bool,
     ) -> Result<(usize, usize), OxideError> {
         if shape.len() != 4 || shape.contains(&0) {
-            return Err(shape_err(op, format!("shape {shape:?} is not a non-empty [batch, c, h, w]")));
+            return Err(shape_err(
+                op,
+                format!("shape {shape:?} is not a non-empty [batch, c, h, w]"),
+            ));
         }
         let (batch, channels, hw) = (shape[0], shape[1], shape[2] * shape[3]);
-        let scale_len = if scale_wh { batch * hw } else { batch * channels };
+        let scale_len = if scale_wh {
+            batch * hw
+        } else {
+            batch * channels
+        };
         if source.len() != batch * channels * hw || scale.len() != scale_len {
             return Err(shape_err(
                 op,
@@ -1849,12 +2125,19 @@ impl OxideBackend {
         outputs: usize,
     ) -> Result<(), OxideError> {
         if batch == 0 || inputs == 0 || outputs == 0 {
-            return Err(shape_err(op, "batch, inputs and outputs must be > 0".to_owned()));
+            return Err(shape_err(
+                op,
+                "batch, inputs and outputs must be > 0".to_owned(),
+            ));
         }
         if x_len != batch * inputs || w_len != outputs * inputs {
             return Err(shape_err(
                 op,
-                format!("x has {x_len} (want {}), weights {w_len} (want {})", batch * inputs, outputs * inputs),
+                format!(
+                    "x has {x_len} (want {}), weights {w_len} (want {})",
+                    batch * inputs,
+                    outputs * inputs
+                ),
             ));
         }
         Ok(())
@@ -1863,7 +2146,12 @@ impl OxideBackend {
 
 /// Reject a row count / width the LayerNorm kernels cannot serve before
 /// launching, instead of reading out of bounds.
-fn check_layernorm_shape(op: &str, shape: &[usize], rows: usize, cols: usize) -> Result<(), OxideError> {
+fn check_layernorm_shape(
+    op: &str,
+    shape: &[usize],
+    rows: usize,
+    cols: usize,
+) -> Result<(), OxideError> {
     let total: usize = shape.iter().product();
     if rows == 0 || cols == 0 || rows.checked_mul(cols) != Some(total) {
         return Err(OxideError::Shape(format!(
@@ -2135,7 +2423,8 @@ impl F32TensorOpsBackend for OxideBackend {
             let host = b.buf.to_host_vec(&self.stream)?;
             let mut values = vec![0.0f32; rows * out_features];
             for r in 0..rows {
-                values[r * out_features..(r + 1) * out_features].copy_from_slice(&host[..out_features]);
+                values[r * out_features..(r + 1) * out_features]
+                    .copy_from_slice(&host[..out_features]);
             }
             acc.copy_from_host(&self.stream, &values)?;
         } else {
@@ -2493,7 +2782,10 @@ impl F32TensorOpsBackend for OxideBackend {
         let eps = if eps > 0.0 { eps } else { 1.0e-6 };
         let total: usize = output_shape.iter().product();
         if output_shape.is_empty() || total == 0 {
-            return Err(shape_err(op, format!("invalid output shape {output_shape:?}")));
+            return Err(shape_err(
+                op,
+                format!("invalid output shape {output_shape:?}"),
+            ));
         }
         let x = self.f32v(x_branch)?;
         let y = self.f32v(self_branch)?;
@@ -2506,15 +2798,17 @@ impl F32TensorOpsBackend for OxideBackend {
             || y.len() != total
             || x.shape() != output_shape
             || y.shape() != output_shape
-            || residual.is_some_and(|tensor| {
-                tensor.len() != total || tensor.shape() != output_shape
-            })
+            || residual
+                .is_some_and(|tensor| tensor.len() != total || tensor.shape() != output_shape)
         {
             return Err(shape_err(
                 op,
                 format!(
                     "branch/residual shapes must match {output_shape:?}/{total}; got {:?}/{}, {:?}/{}, {:?}",
-                    x.shape(), x.len(), y.shape(), y.len(),
+                    x.shape(),
+                    x.len(),
+                    y.shape(),
+                    y.len(),
                     residual.map(|tensor| (tensor.shape(), tensor.len()))
                 ),
             ));
@@ -2557,7 +2851,10 @@ impl F32TensorOpsBackend for OxideBackend {
         let eps = if eps > 0.0 { eps } else { 1.0e-6 };
         let total: usize = output_shape.iter().product();
         if output_shape.is_empty() || total == 0 {
-            return Err(shape_err(op, format!("invalid output shape {output_shape:?}")));
+            return Err(shape_err(
+                op,
+                format!("invalid output shape {output_shape:?}"),
+            ));
         }
         let x = self.f32v(x_branch)?;
         let y = self.f32v(self_branch)?;
@@ -2576,7 +2873,12 @@ impl F32TensorOpsBackend for OxideBackend {
                 op,
                 format!(
                     "branch/delta shapes must match {output_shape:?}/{total}; got {:?}/{}, {:?}/{}, {:?}/{}",
-                    x.shape(), x.len(), y.shape(), y.len(), delta.shape(), delta.len()
+                    x.shape(),
+                    x.len(),
+                    y.shape(),
+                    y.len(),
+                    delta.shape(),
+                    delta.len()
                 ),
             ));
         }
@@ -3157,9 +3459,20 @@ impl F32TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
         if inputs.iter().any(|t| t.is_half()) {
-            let halves = inputs.iter().map(|t| self.as_half(t)).collect::<Result<Vec<_>, _>>()?;
+            let halves = inputs
+                .iter()
+                .map(|t| self.as_half(t))
+                .collect::<Result<Vec<_>, _>>()?;
             let refs: Vec<&OxideTensorF16> = halves.iter().collect();
-            let out = self.route_concat_f16(&refs, input_channel_offsets, input_channels, input_total_channels, output_shape, channel_stride, config)?;
+            let out = self.route_concat_f16(
+                &refs,
+                input_channel_offsets,
+                input_channels,
+                input_total_channels,
+                output_shape,
+                channel_stride,
+                config,
+            )?;
             return Ok(self.wrap_half(out));
         }
         let op = "route_concat_f32";
@@ -3169,7 +3482,10 @@ impl F32TensorOpsBackend for OxideBackend {
             || input_channels.len() != n
             || input_total_channels.len() != n
         {
-            return Err(shape_err(op, "needs >= 1 input and equal-length metadata".to_owned()));
+            return Err(shape_err(
+                op,
+                "needs >= 1 input and equal-length metadata".to_owned(),
+            ));
         }
         if channel_stride == 0 {
             return Err(shape_err(op, "channel_stride must be > 0".to_owned()));
@@ -3195,12 +3511,18 @@ impl F32TensorOpsBackend for OxideBackend {
             if inputs[k].len() == 0 || inputs[k].len() % per_batch != 0 {
                 return Err(shape_err(
                     op,
-                    format!("input {k} length {} not a multiple of {per_batch}", inputs[k].len()),
+                    format!(
+                        "input {k} length {} not a multiple of {per_batch}",
+                        inputs[k].len()
+                    ),
                 ));
             }
             let b = inputs[k].len() / per_batch;
             if *batch.get_or_insert(b) != b {
-                return Err(shape_err(op, format!("input {k} batch {b} differs from {batch:?}")));
+                return Err(shape_err(
+                    op,
+                    format!("input {k} batch {b} differs from {batch:?}"),
+                ));
             }
         }
         let batch = batch.unwrap_or(0);
@@ -3252,7 +3574,15 @@ impl F32TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Vec<Self::Tensor>, Self::Error> {
         if output_grad.is_half() {
-            return self.route_backward_amp(output_grad, input_shapes, input_channel_offsets, input_channels, input_total_channels, channel_stride, config);
+            return self.route_backward_amp(
+                output_grad,
+                input_shapes,
+                input_channel_offsets,
+                input_channels,
+                input_total_channels,
+                channel_stride,
+                config,
+            );
         }
         let output_grad_f = self.f32v(output_grad)?;
         let output_grad = &*output_grad_f;
@@ -3263,7 +3593,10 @@ impl F32TensorOpsBackend for OxideBackend {
             || input_channels.len() != n
             || input_total_channels.len() != n
         {
-            return Err(shape_err(op, "needs >= 1 input and equal-length metadata".to_owned()));
+            return Err(shape_err(
+                op,
+                "needs >= 1 input and equal-length metadata".to_owned(),
+            ));
         }
         if channel_stride == 0 {
             return Err(shape_err(op, "channel_stride must be > 0".to_owned()));
@@ -3273,7 +3606,10 @@ impl F32TensorOpsBackend for OxideBackend {
         if per_batch == 0 || output_grad.len() % per_batch != 0 {
             return Err(shape_err(
                 op,
-                format!("gradient length {} not a multiple of {per_batch}", output_grad.len()),
+                format!(
+                    "gradient length {} not a multiple of {per_batch}",
+                    output_grad.len()
+                ),
             ));
         }
         let batch = output_grad.len() / per_batch;
@@ -3346,13 +3682,43 @@ impl F32TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
         if self.amp {
-            return self.conv_forward_amp(x, weights, output_shape, input_channels, input_height, input_width, filters, kernel_size, stride_x, stride_y, dilation, padding, groups, config);
+            return self.conv_forward_amp(
+                x,
+                weights,
+                output_shape,
+                input_channels,
+                input_height,
+                input_width,
+                filters,
+                kernel_size,
+                stride_x,
+                stride_y,
+                dilation,
+                padding,
+                groups,
+                config,
+            );
         }
         let x_f = self.f32v(x)?;
         let x = &*x_f;
         let weights_f = self.f32v(weights)?;
         let weights = &*weights_f;
-        self.conv_forward(x, weights, output_shape, input_channels, input_height, input_width, filters, kernel_size, stride_x, stride_y, dilation, padding, groups, config)
+        self.conv_forward(
+            x,
+            weights,
+            output_shape,
+            input_channels,
+            input_height,
+            input_width,
+            filters,
+            kernel_size,
+            stride_x,
+            stride_y,
+            dilation,
+            padding,
+            groups,
+            config,
+        )
     }
 
     fn conv2d_backward_input_f32(
@@ -3373,13 +3739,43 @@ impl F32TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
         if self.amp {
-            return self.conv_backward_input_amp(output_grad, weights, input_shape, input_channels, input_height, input_width, filters, kernel_size, stride_x, stride_y, dilation, padding, groups, config);
+            return self.conv_backward_input_amp(
+                output_grad,
+                weights,
+                input_shape,
+                input_channels,
+                input_height,
+                input_width,
+                filters,
+                kernel_size,
+                stride_x,
+                stride_y,
+                dilation,
+                padding,
+                groups,
+                config,
+            );
         }
         let output_grad_f = self.f32v(output_grad)?;
         let output_grad = &*output_grad_f;
         let weights_f = self.f32v(weights)?;
         let weights = &*weights_f;
-        self.conv_backward_input(output_grad, weights, input_shape, input_channels, input_height, input_width, filters, kernel_size, stride_x, stride_y, dilation, padding, groups, config)
+        self.conv_backward_input(
+            output_grad,
+            weights,
+            input_shape,
+            input_channels,
+            input_height,
+            input_width,
+            filters,
+            kernel_size,
+            stride_x,
+            stride_y,
+            dilation,
+            padding,
+            groups,
+            config,
+        )
     }
 
     fn conv2d_backward_weights_f32(
@@ -3400,13 +3796,43 @@ impl F32TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
         if self.amp {
-            return self.conv_backward_weights_amp(x, output_grad, weight_shape, input_channels, input_height, input_width, filters, kernel_size, stride_x, stride_y, dilation, padding, groups, config);
+            return self.conv_backward_weights_amp(
+                x,
+                output_grad,
+                weight_shape,
+                input_channels,
+                input_height,
+                input_width,
+                filters,
+                kernel_size,
+                stride_x,
+                stride_y,
+                dilation,
+                padding,
+                groups,
+                config,
+            );
         }
         let x_f = self.f32v(x)?;
         let x = &*x_f;
         let output_grad_f = self.f32v(output_grad)?;
         let output_grad = &*output_grad_f;
-        self.conv_backward_weights(x, output_grad, weight_shape, input_channels, input_height, input_width, filters, kernel_size, stride_x, stride_y, dilation, padding, groups, config)
+        self.conv_backward_weights(
+            x,
+            output_grad,
+            weight_shape,
+            input_channels,
+            input_height,
+            input_width,
+            filters,
+            kernel_size,
+            stride_x,
+            stride_y,
+            dilation,
+            padding,
+            groups,
+            config,
+        )
     }
 
     fn maxpool_f32(
@@ -3424,13 +3850,32 @@ impl F32TensorOpsBackend for OxideBackend {
     ) -> Result<Self::Tensor, Self::Error> {
         if x.is_half() {
             let xh = self.as_half(x)?;
-            let out = self.maxpool_f16(&xh, output_shape, channels, input_height, input_width, size, stride_x, stride_y, padding, config)?;
+            let out = self.maxpool_f16(
+                &xh,
+                output_shape,
+                channels,
+                input_height,
+                input_width,
+                size,
+                stride_x,
+                stride_y,
+                padding,
+                config,
+            )?;
             return Ok(self.wrap_half(out));
         }
         let x_f = self.f32v(x)?;
         let x = &*x_f;
         let (_, out_h, out_w) = pool_layout(
-            "maxpool_f32", x.len(), output_shape, channels, input_height, input_width, size, stride_x, stride_y,
+            "maxpool_f32",
+            x.len(),
+            output_shape,
+            channels,
+            input_height,
+            input_width,
+            size,
+            stride_x,
+            stride_y,
         )?;
         let mut out = self.alloc_uninit(output_shape.iter().product())?;
         // SAFETY: one thread per output element; all input reads are
@@ -3469,15 +3914,41 @@ impl F32TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
         if x.is_half() {
-            return self.maxpool_backward_amp(x, output_grad, channels, input_height, input_width, size, stride_x, stride_y, padding, config);
+            return self.maxpool_backward_amp(
+                x,
+                output_grad,
+                channels,
+                input_height,
+                input_width,
+                size,
+                stride_x,
+                stride_y,
+                padding,
+                config,
+            );
         }
         let x_f = self.f32v(x)?;
         let x = &*x_f;
         let output_grad_f = self.f32v(output_grad)?;
         let output_grad = &*output_grad_f;
-        let (out_h, out_w) = Self::grad_hw("maxpool_backward_f32", output_grad, x.len(), channels, input_height, input_width)?;
+        let (out_h, out_w) = Self::grad_hw(
+            "maxpool_backward_f32",
+            output_grad,
+            x.len(),
+            channels,
+            input_height,
+            input_width,
+        )?;
         pool_layout(
-            "maxpool_backward_f32", x.len(), output_grad.shape(), channels, input_height, input_width, size, stride_x, stride_y,
+            "maxpool_backward_f32",
+            x.len(),
+            output_grad.shape(),
+            channels,
+            input_height,
+            input_width,
+            size,
+            stride_x,
+            stride_y,
         )?;
         let mut dx = self.alloc_uninit(x.len())?;
         // SAFETY: one thread per input element (gather, no atomics); reads are
@@ -3519,7 +3990,15 @@ impl F32TensorOpsBackend for OxideBackend {
         let x_f = self.f32v(x)?;
         let x = &*x_f;
         let (_, out_h, out_w) = pool_layout(
-            "local_avgpool_f32", x.len(), output_shape, channels, input_height, input_width, size, stride_x, stride_y,
+            "local_avgpool_f32",
+            x.len(),
+            output_shape,
+            channels,
+            input_height,
+            input_width,
+            size,
+            stride_x,
+            stride_y,
         )?;
         let mut out = self.alloc_uninit(output_shape.iter().product())?;
         // SAFETY: one thread per output element; reads are bounds-checked.
@@ -3559,10 +4038,32 @@ impl F32TensorOpsBackend for OxideBackend {
         let output_grad_f = self.f32v(output_grad)?;
         let output_grad = &*output_grad_f;
         let op = "local_avgpool_backward_f32";
-        let batch = nchw_batch(op, "input", input_shape, channels, input_height, input_width)?;
-        let (out_h, out_w) = Self::grad_hw(op, output_grad, batch * channels * input_height * input_width, channels, input_height, input_width)?;
+        let batch = nchw_batch(
+            op,
+            "input",
+            input_shape,
+            channels,
+            input_height,
+            input_width,
+        )?;
+        let (out_h, out_w) = Self::grad_hw(
+            op,
+            output_grad,
+            batch * channels * input_height * input_width,
+            channels,
+            input_height,
+            input_width,
+        )?;
         pool_layout(
-            op, input_shape.iter().product(), output_grad.shape(), channels, input_height, input_width, size, stride_x, stride_y,
+            op,
+            input_shape.iter().product(),
+            output_grad.shape(),
+            channels,
+            input_height,
+            input_width,
+            size,
+            stride_x,
+            stride_y,
         )?;
         let mut dx = self.alloc_uninit(input_shape.iter().product())?;
         // SAFETY: one thread per input element (gather); reads bounds-checked.
@@ -3603,7 +4104,10 @@ impl F32TensorOpsBackend for OxideBackend {
         if area == 0 || x.len() != batch * channels * area {
             return Err(shape_err(
                 op,
-                format!("input has {} elements, expected {batch}*{channels}*{area}", x.len()),
+                format!(
+                    "input has {} elements, expected {batch}*{channels}*{area}",
+                    x.len()
+                ),
             ));
         }
         let mut out = self.alloc_uninit(batch * channels)?;
@@ -3633,12 +4137,22 @@ impl F32TensorOpsBackend for OxideBackend {
         let output_grad_f = self.f32v(output_grad)?;
         let output_grad = &*output_grad_f;
         let op = "avgpool_backward_f32";
-        let batch = nchw_batch(op, "input", input_shape, channels, input_height, input_width)?;
+        let batch = nchw_batch(
+            op,
+            "input",
+            input_shape,
+            channels,
+            input_height,
+            input_width,
+        )?;
         let area = input_height * input_width;
         if area == 0 || output_grad.len() != batch * channels {
             return Err(shape_err(
                 op,
-                format!("gradient has {} elements, expected {batch}*{channels}", output_grad.len()),
+                format!(
+                    "gradient has {} elements, expected {batch}*{channels}",
+                    output_grad.len()
+                ),
             ));
         }
         let mut dx = self.alloc_uninit(input_shape.iter().product())?;
@@ -4035,7 +4549,10 @@ impl F32TensorOpsBackend for OxideBackend {
         let input_offsets = &*input_offsets_f;
         let op = "crop_bilinear_f32";
         if output_shape.len() != 4 || output_shape[1] != channels {
-            return Err(shape_err(op, format!("output shape {output_shape:?} is not [batch, {channels}, h, w]")));
+            return Err(shape_err(
+                op,
+                format!("output shape {output_shape:?} is not [batch, {channels}, h, w]"),
+            ));
         }
         let batch = output_shape[0];
         crop_layout(
@@ -4050,7 +4567,13 @@ impl F32TensorOpsBackend for OxideBackend {
             &[input_scales.len(), input_offsets.len()],
         )?;
         if x.len() != batch * channels * input_height * input_width {
-            return Err(shape_err(op, format!("input has {} elements, expected {batch}*{channels}*{input_height}*{input_width}", x.len())));
+            return Err(shape_err(
+                op,
+                format!(
+                    "input has {} elements, expected {batch}*{channels}*{input_height}*{input_width}",
+                    x.len()
+                ),
+            ));
         }
         let mut out = self.alloc_uninit(output_shape.iter().product())?;
         // SAFETY: one thread per output element; taps are bounds-checked and
@@ -4099,7 +4622,10 @@ impl F32TensorOpsBackend for OxideBackend {
         let op = "crop_bilinear_backward_f32";
         let g = output_grad.shape();
         if g.len() != 4 || g[1] != channels {
-            return Err(shape_err(op, format!("gradient shape {g:?} is not [batch, {channels}, h, w]")));
+            return Err(shape_err(
+                op,
+                format!("gradient shape {g:?} is not [batch, {channels}, h, w]"),
+            ));
         }
         let batch = g[0];
         crop_layout(
@@ -4113,8 +4639,24 @@ impl F32TensorOpsBackend for OxideBackend {
             (source_x.len(), source_y.len()),
             &[input_scales.len()],
         )?;
-        nchw_batch(op, "input", input_shape, channels, input_height, input_width)
-            .and_then(|b| if b == batch { Ok(()) } else { Err(shape_err(op, format!("input batch {b} != gradient batch {batch}"))) })?;
+        nchw_batch(
+            op,
+            "input",
+            input_shape,
+            channels,
+            input_height,
+            input_width,
+        )
+        .and_then(|b| {
+            if b == batch {
+                Ok(())
+            } else {
+                Err(shape_err(
+                    op,
+                    format!("input batch {b} != gradient batch {batch}"),
+                ))
+            }
+        })?;
         let dx = self.alloc(input_shape.iter().product())?;
         // SAFETY: `dx` is a live zeroed buffer of the validated extent; the
         // kernel only touches it through in-image atomic adds.
@@ -4152,29 +4694,67 @@ impl F32TensorOpsBackend for OxideBackend {
     ) -> Result<Self::Tensor, Self::Error> {
         if x.is_half() && !reverse {
             let xh = self.as_half(x)?;
-            let out = self.upsample_f16(&xh, output_shape, channels, input_height, input_width, stride, scale, reverse, config)?;
+            let out = self.upsample_f16(
+                &xh,
+                output_shape,
+                channels,
+                input_height,
+                input_width,
+                stride,
+                scale,
+                reverse,
+                config,
+            )?;
             return Ok(self.wrap_half(out));
         }
         let x_f = self.f32v(x)?;
         let x = &*x_f;
         let op = "upsample_f32";
         if stride == 0 || channels == 0 || input_height == 0 || input_width == 0 {
-            return Err(shape_err(op, "channels, spatial dims and stride must be > 0".to_owned()));
+            return Err(shape_err(
+                op,
+                "channels, spatial dims and stride must be > 0".to_owned(),
+            ));
         }
         if output_shape.len() != 4 || output_shape[1] != channels {
-            return Err(shape_err(op, format!("output shape {output_shape:?} is not [batch, {channels}, h, w]")));
+            return Err(shape_err(
+                op,
+                format!("output shape {output_shape:?} is not [batch, {channels}, h, w]"),
+            ));
         }
         let (batch, out_h, out_w) = (output_shape[0], output_shape[2], output_shape[3]);
         if x.len() != batch * channels * input_height * input_width {
-            return Err(shape_err(op, format!("input has {} elements, expected {batch}*{channels}*{input_height}*{input_width}", x.len())));
+            return Err(shape_err(
+                op,
+                format!(
+                    "input has {} elements, expected {batch}*{channels}*{input_height}*{input_width}",
+                    x.len()
+                ),
+            ));
         }
         if reverse {
             // floor (C++) and ceil (cuTile) sized outputs are both accepted.
-            if out_h == 0 || out_w == 0 || out_h > input_height.div_ceil(stride) || out_w > input_width.div_ceil(stride) || out_h < input_height / stride || out_w < input_width / stride {
-                return Err(shape_err(op, format!("reverse output {out_h}x{out_w} incompatible with input {input_height}x{input_width} / stride {stride}")));
+            if out_h == 0
+                || out_w == 0
+                || out_h > input_height.div_ceil(stride)
+                || out_w > input_width.div_ceil(stride)
+                || out_h < input_height / stride
+                || out_w < input_width / stride
+            {
+                return Err(shape_err(
+                    op,
+                    format!(
+                        "reverse output {out_h}x{out_w} incompatible with input {input_height}x{input_width} / stride {stride}"
+                    ),
+                ));
             }
         } else if out_h != input_height * stride || out_w != input_width * stride {
-            return Err(shape_err(op, format!("output {out_h}x{out_w} != input {input_height}x{input_width} * stride {stride}")));
+            return Err(shape_err(
+                op,
+                format!(
+                    "output {out_h}x{out_w} != input {input_height}x{input_width} * stride {stride}"
+                ),
+            ));
         }
         let mut out = self.alloc_uninit(output_shape.iter().product())?;
         // SAFETY: one thread per output element; input reads are in range by
@@ -4232,20 +4812,38 @@ impl F32TensorOpsBackend for OxideBackend {
             && output_height == input_shape[2] * stride
             && output_width == input_shape[3] * stride
         {
-            return self.upsample_backward_amp(output_grad, input_shape, channels, output_height, output_width, stride, scale, config);
+            return self.upsample_backward_amp(
+                output_grad,
+                input_shape,
+                channels,
+                output_height,
+                output_width,
+                stride,
+                scale,
+                config,
+            );
         }
         let output_grad_f = self.f32v(output_grad)?;
         let output_grad = &*output_grad_f;
         let op = "upsample_backward_f32";
         if stride == 0 || input_shape.len() != 4 || input_shape[1] != channels {
-            return Err(shape_err(op, format!("bad stride {stride} or input shape {input_shape:?}")));
+            return Err(shape_err(
+                op,
+                format!("bad stride {stride} or input shape {input_shape:?}"),
+            ));
         }
         let (batch, in_h, in_w) = (input_shape[0], input_shape[2], input_shape[3]);
         if in_h == 0 || in_w == 0 || output_height == 0 || output_width == 0 {
             return Err(shape_err(op, "spatial dims must be > 0".to_owned()));
         }
         if output_grad.len() != batch * channels * output_height * output_width {
-            return Err(shape_err(op, format!("gradient has {} elements, expected {batch}*{channels}*{output_height}*{output_width}", output_grad.len())));
+            return Err(shape_err(
+                op,
+                format!(
+                    "gradient has {} elements, expected {batch}*{channels}*{output_height}*{output_width}",
+                    output_grad.len()
+                ),
+            ));
         }
         let reverse = if output_height == in_h * stride && output_width == in_w * stride {
             false
@@ -4256,7 +4854,12 @@ impl F32TensorOpsBackend for OxideBackend {
         {
             true
         } else {
-            return Err(shape_err(op, format!("output {output_height}x{output_width} fits neither expand nor reverse of input {in_h}x{in_w}, stride {stride}")));
+            return Err(shape_err(
+                op,
+                format!(
+                    "output {output_height}x{output_width} fits neither expand nor reverse of input {in_h}x{in_w}, stride {stride}"
+                ),
+            ));
         };
         let mut dx = self.alloc_uninit(input_shape.iter().product())?;
         // SAFETY: one thread per input element (gather); dy reads are bounds-checked.
@@ -4290,10 +4893,18 @@ impl F32TensorOpsBackend for OxideBackend {
         let x = &*x_f;
         let op = "shortcut_fit_f32";
         let out_len: usize = output_shape.iter().product();
-        if batch == 0 || x.len() % batch != 0 || out_len % batch != 0 || out_len == 0 || x.is_empty() {
+        if batch == 0
+            || x.len() % batch != 0
+            || out_len % batch != 0
+            || out_len == 0
+            || x.is_empty()
+        {
             return Err(shape_err(
                 op,
-                format!("batch {batch}, {} source elements and output shape {output_shape:?} are inconsistent", x.len()),
+                format!(
+                    "batch {batch}, {} source elements and output shape {output_shape:?} are inconsistent",
+                    x.len()
+                ),
             ));
         }
         let (from_len, to_len) = (x.len() / batch, out_len / batch);
@@ -4314,6 +4925,193 @@ impl F32TensorOpsBackend for OxideBackend {
         Ok(OxideTensorF32::new(out, output_shape))
     }
 
+    fn flash_attention_forward_f32(
+        &self,
+        qkv: &Self::Tensor,
+        output_shape: &[usize],
+        lse_shape: &[usize],
+        batch: usize,
+        tokens: usize,
+        channels: usize,
+        heads: usize,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        let op = "flash_attention_forward_f32";
+        if batch == 0 || tokens == 0 || channels == 0 || heads == 0 || channels % heads != 0 {
+            return Err(shape_err(
+                op,
+                "dimensions must be positive and channels divisible by heads".to_owned(),
+            ));
+        }
+        let rows = batch
+            .checked_mul(tokens)
+            .ok_or_else(|| shape_err(op, "row count overflows usize".to_owned()))?;
+        let output_len = rows
+            .checked_mul(channels)
+            .ok_or_else(|| shape_err(op, "output length overflows usize".to_owned()))?;
+        let qkv_len = output_len
+            .checked_mul(3)
+            .ok_or_else(|| shape_err(op, "QKV length overflows usize".to_owned()))?;
+        let lse_len = batch
+            .checked_mul(heads)
+            .and_then(|n| n.checked_mul(tokens))
+            .ok_or_else(|| shape_err(op, "LSE length overflows usize".to_owned()))?;
+        if output_shape != [batch, tokens, channels] {
+            return Err(shape_err(
+                op,
+                format!("output shape {output_shape:?} must be [batch, tokens, channels]"),
+            ));
+        }
+        if lse_shape != [batch, heads, tokens] {
+            return Err(shape_err(
+                op,
+                format!("LSE shape {lse_shape:?} must be [batch, heads, tokens]"),
+            ));
+        }
+        let qkv_f = self.f32v(qkv)?;
+        let qkv = &*qkv_f;
+        if qkv.len() != qkv_len {
+            return Err(shape_err(
+                op,
+                format!("QKV has {} values, expected {qkv_len}", qkv.len()),
+            ));
+        }
+        let head_dim = channels / heads;
+        if head_dim > 128 {
+            return Err(shape_err(
+                op,
+                format!("head dimension {head_dim} exceeds the kernel limit 128"),
+            ));
+        }
+        let mut out = self.alloc_uninit(output_len)?;
+        let mut lse = self.alloc_uninit(lse_len)?;
+        // SAFETY: one query thread writes its unique head-channel interval in
+        // `out` and its unique flattened query index in `lse`.
+        unsafe {
+            self.layers_extra.flash_attention_forward(
+                &self.stream,
+                launch::elementwise(lse_len, ElementwiseLaunchConfig::default()),
+                &qkv.buf,
+                &mut out,
+                &mut lse,
+                batch,
+                tokens,
+                channels,
+                heads,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok((
+            OxideTensorF32::new(out, output_shape),
+            OxideTensorF32::new(lse, lse_shape),
+        ))
+    }
+
+    fn flash_attention_backward_f32(
+        &self,
+        qkv: &Self::Tensor,
+        context: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        lse: &Self::Tensor,
+        qkv_grad_shape: &[usize],
+        batch: usize,
+        tokens: usize,
+        channels: usize,
+        heads: usize,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let op = "flash_attention_backward_f32";
+        if batch == 0 || tokens == 0 || channels == 0 || heads == 0 || channels % heads != 0 {
+            return Err(shape_err(
+                op,
+                "dimensions must be positive and channels divisible by heads".to_owned(),
+            ));
+        }
+        let rows = batch
+            .checked_mul(tokens)
+            .ok_or_else(|| shape_err(op, "row count overflows usize".to_owned()))?;
+        let elements = rows
+            .checked_mul(channels)
+            .ok_or_else(|| shape_err(op, "attention size overflows usize".to_owned()))?;
+        let qkv_len = elements
+            .checked_mul(3)
+            .ok_or_else(|| shape_err(op, "QKV length overflows usize".to_owned()))?;
+        let lse_len = batch
+            .checked_mul(heads)
+            .and_then(|n| n.checked_mul(tokens))
+            .ok_or_else(|| shape_err(op, "LSE length overflows usize".to_owned()))?;
+        if qkv_grad_shape != [batch, tokens, 3 * channels] {
+            return Err(shape_err(
+                op,
+                format!("dQKV shape {qkv_grad_shape:?} must be [batch, tokens, 3*channels]"),
+            ));
+        }
+        let qkv_f = self.f32v(qkv)?;
+        let context_f = self.f32v(context)?;
+        let grad_f = self.f32v(output_grad)?;
+        let lse_f = self.f32v(lse)?;
+        if qkv_f.len() != qkv_len
+            || context_f.len() != elements
+            || grad_f.len() != elements
+            || lse_f.len() != lse_len
+        {
+            return Err(shape_err(
+                op,
+                format!(
+                    "QKV/context/gradient/LSE lengths are {}/{}/{}/{}, expected {qkv_len}/{elements}/{elements}/{lse_len}",
+                    qkv_f.len(),
+                    context_f.len(),
+                    grad_f.len(),
+                    lse_f.len()
+                ),
+            ));
+        }
+        let head_dim = channels / heads;
+        if head_dim > 128 {
+            return Err(shape_err(
+                op,
+                format!("head dimension {head_dim} exceeds the kernel limit 128"),
+            ));
+        }
+        let mut dqkv = self.alloc_uninit(qkv_len)?;
+        let mut row_dot = self.alloc_uninit(lse_len)?;
+        // SAFETY: each query/head thread writes its Q row and D_i scalar.
+        unsafe {
+            self.layers_extra.flash_attention_backward_dq(
+                &self.stream,
+                launch::elementwise(lse_len, ElementwiseLaunchConfig::default()),
+                &qkv_f.buf,
+                &context_f.buf,
+                &grad_f.buf,
+                &lse_f.buf,
+                &mut dqkv,
+                &mut row_dot,
+                batch,
+                tokens,
+                channels,
+                heads,
+            )
+        }
+        .map_err(launch_err)?;
+        // SAFETY: each key/head thread writes its K and V rows, disjoint from dQ
+        // and from every other key/head row in the fused gradient buffer.
+        unsafe {
+            self.layers_extra.flash_attention_backward_dkdv(
+                &self.stream,
+                launch::elementwise(lse_len, ElementwiseLaunchConfig::default()),
+                &qkv_f.buf,
+                &grad_f.buf,
+                &lse_f.buf,
+                &row_dot,
+                &mut dqkv,
+                batch,
+                tokens,
+                channels,
+                heads,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(dqkv, qkv_grad_shape))
+    }
+
     fn softmax_f32(
         &self,
         x: &Self::Tensor,
@@ -4325,10 +5123,19 @@ impl F32TensorOpsBackend for OxideBackend {
         let x = &*x_f;
         let op = "softmax_f32";
         if shape.iter().product::<usize>() != x.len() {
-            return Err(shape_err(op, format!("shape {shape:?} does not match {} elements", x.len())));
+            return Err(shape_err(
+                op,
+                format!("shape {shape:?} does not match {} elements", x.len()),
+            ));
         }
         if group_size == 0 || x.is_empty() || x.len() % group_size != 0 {
-            return Err(shape_err(op, format!("length {} is not a multiple of group size {group_size}", x.len())));
+            return Err(shape_err(
+                op,
+                format!(
+                    "length {} is not a multiple of group size {group_size}",
+                    x.len()
+                ),
+            ));
         }
         let n_groups = x.len() / group_size;
         let mut out = self.alloc_uninit(x.len())?;
@@ -4362,10 +5169,19 @@ impl F32TensorOpsBackend for OxideBackend {
         let op = "softmax_backward_f32";
         same_len(op, output, output_grad)?;
         if shape.iter().product::<usize>() != output.len() {
-            return Err(shape_err(op, format!("shape {shape:?} does not match {} elements", output.len())));
+            return Err(shape_err(
+                op,
+                format!("shape {shape:?} does not match {} elements", output.len()),
+            ));
         }
         if group_size == 0 || output.is_empty() || output.len() % group_size != 0 {
-            return Err(shape_err(op, format!("length {} is not a multiple of group size {group_size}", output.len())));
+            return Err(shape_err(
+                op,
+                format!(
+                    "length {} is not a multiple of group size {group_size}",
+                    output.len()
+                ),
+            ));
         }
         let n_groups = output.len() / group_size;
         let mut dx = self.alloc_uninit(output.len())?;
@@ -4396,7 +5212,16 @@ impl F32TensorOpsBackend for OxideBackend {
     ) -> Result<Self::Tensor, Self::Error> {
         let x_f = self.f32v(x)?;
         let x = &*x_f;
-        self.reorg_launch("reorg_f32", x, input_shape, output_shape, stride, reverse, false, config)
+        self.reorg_launch(
+            "reorg_f32",
+            x,
+            input_shape,
+            output_shape,
+            stride,
+            reverse,
+            false,
+            config,
+        )
     }
 
     fn reorg_backward_f32(
@@ -4431,13 +5256,24 @@ impl F32TensorOpsBackend for OxideBackend {
         inverse: bool,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        if shape.len() != 4 || groups == 0 || shape[1] % groups != 0 || x.len() != shape.iter().product::<usize>() {
+        if shape.len() != 4
+            || groups == 0
+            || shape[1] % groups != 0
+            || x.len() != shape.iter().product::<usize>()
+        {
             return Err(shape_err(
                 "channel_shuffle_f32",
-                format!("bad shape {shape:?} / groups {groups} for {} elements", x.len()),
+                format!(
+                    "bad shape {shape:?} / groups {groups} for {} elements",
+                    x.len()
+                ),
             ));
         }
-        let (rows, cols) = if inverse { (shape[1] / groups, groups) } else { (groups, shape[1] / groups) };
+        let (rows, cols) = if inverse {
+            (shape[1] / groups, groups)
+        } else {
+            (groups, shape[1] / groups)
+        };
         let len = shape[2] * shape[3];
         let mut out = self.alloc_uninit(x.len())?;
         // SAFETY: one thread per output element; every source index is < x.len() by the shape check.
@@ -4464,13 +5300,20 @@ impl F32TensorOpsBackend for OxideBackend {
         seed: u64,
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
-        let x_f = self.f32v(x)?;        let x = &*x_f;
+        let x_f = self.f32v(x)?;
+        let x = &*x_f;
         let op = "dropout_f32";
         if !(0.0..1.0).contains(&probability) || x.is_empty() {
-            return Err(shape_err(op, format!("probability {probability} not in [0, 1) or empty input")));
+            return Err(shape_err(
+                op,
+                format!("probability {probability} not in [0, 1) or empty input"),
+            ));
         }
         if shape.iter().product::<usize>() != x.len() {
-            return Err(shape_err(op, format!("shape {shape:?} does not match {} elements", x.len())));
+            return Err(shape_err(
+                op,
+                format!("shape {shape:?} does not match {} elements", x.len()),
+            ));
         }
         let mut out = self.alloc_uninit(x.len())?;
         let mut mask = self.alloc_uninit(x.len())?;
@@ -4488,7 +5331,10 @@ impl F32TensorOpsBackend for OxideBackend {
             )
         }
         .map_err(launch_err)?;
-        Ok((OxideTensorF32::new(out, shape), OxideTensorF32::new(mask, shape)))
+        Ok((
+            OxideTensorF32::new(out, shape),
+            OxideTensorF32::new(mask, shape),
+        ))
     }
 
     fn dropout_backward_f32(
@@ -4504,7 +5350,10 @@ impl F32TensorOpsBackend for OxideBackend {
         let mask = &*mask_f;
         same_len("dropout_backward_f32", output_grad, mask)?;
         if shape.iter().product::<usize>() != mask.len() {
-            return Err(shape_err("dropout_backward_f32", format!("shape {shape:?} does not match {} elements", mask.len())));
+            return Err(shape_err(
+                "dropout_backward_f32",
+                format!("shape {shape:?} does not match {} elements", mask.len()),
+            ));
         }
         let mut dx = self.alloc_uninit(output_grad.len())?;
         // SAFETY: one thread per element.
@@ -4534,13 +5383,19 @@ impl F32TensorOpsBackend for OxideBackend {
         let x = &*x_f;
         let op = "dropblock_f32";
         if shape.len() != 4 || shape.iter().product::<usize>() != x.len() || x.is_empty() {
-            return Err(shape_err(op, format!("shape {shape:?} is not NCHW of {} elements", x.len())));
+            return Err(shape_err(
+                op,
+                format!("shape {shape:?} is not NCHW of {} elements", x.len()),
+            ));
         }
         let (n, c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
         if block_size == 0 || block_size > w.min(h) || !(0.0..=1.0).contains(&block_prob) {
             return Err(shape_err(
                 op,
-                format!("block_size {block_size} must be in 1..={} and prob {block_prob} in [0, 1]", w.min(h)),
+                format!(
+                    "block_size {block_size} must be in 1..={} and prob {block_prob} in [0, 1]",
+                    w.min(h)
+                ),
             ));
         }
         let planes = n * c;
@@ -4591,7 +5446,10 @@ impl F32TensorOpsBackend for OxideBackend {
             )
         }
         .map_err(launch_err)?;
-        Ok((OxideTensorF32::new(out, shape), OxideTensorF32::new(mask, shape)))
+        Ok((
+            OxideTensorF32::new(out, shape),
+            OxideTensorF32::new(mask, shape),
+        ))
     }
 
     fn constrain_f32(
@@ -4604,12 +5462,21 @@ impl F32TensorOpsBackend for OxideBackend {
         let x_f = self.f32v(x)?;
         let x = &*x_f;
         if shape.iter().product::<usize>() != x.len() {
-            return Err(shape_err("constrain_f32", format!("shape {shape:?} does not match {} elements", x.len())));
+            return Err(shape_err(
+                "constrain_f32",
+                format!("shape {shape:?} does not match {} elements", x.len()),
+            ));
         }
         let mut out = self.alloc_uninit(x.len())?;
         // SAFETY: one thread per element writes its own slot.
         unsafe {
-            self.layers_extra.constrain(&self.stream, launch::elementwise(x.len(), config), &x.buf, &mut out, limit)
+            self.layers_extra.constrain(
+                &self.stream,
+                launch::elementwise(x.len(), config),
+                &x.buf,
+                &mut out,
+                limit,
+            )
         }
         .map_err(launch_err)?;
         Ok(OxideTensorF32::new(out, shape))
@@ -4626,7 +5493,10 @@ impl F32TensorOpsBackend for OxideBackend {
         let x = &*x_f;
         let op = "gradient_centralization_f32";
         if f_size == 0 || x.len() % f_size != 0 || shape.iter().product::<usize>() != x.len() {
-            return Err(shape_err(op, format!("filter size {f_size} does not divide {} elements", x.len())));
+            return Err(shape_err(
+                op,
+                format!("filter size {f_size} does not divide {} elements", x.len()),
+            ));
         }
         let filters = x.len() / f_size;
         let mut out = self.alloc_uninit(x.len())?;
@@ -4659,7 +5529,8 @@ impl F32TensorOpsBackend for OxideBackend {
         let scale = &*scale_f;
         let source_f = self.f32v(source)?;
         let source = &*source_f;
-        let (channels, hw) = self.scale_channels_layout("scale_channels_f32", scale, source, shape, scale_wh)?;
+        let (channels, hw) =
+            self.scale_channels_layout("scale_channels_f32", scale, source, shape, scale_wh)?;
         let mut out = self.alloc_uninit(source.len())?;
         // SAFETY: one thread per output element; scale index is in range by
         // the layout check.
@@ -4727,7 +5598,10 @@ impl F32TensorOpsBackend for OxideBackend {
             )
         }
         .map_err(launch_err)?;
-        Ok((OxideTensorF32::new(d_scale, scale.shape()), OxideTensorF32::new(d_src, shape)))
+        Ok((
+            OxideTensorF32::new(d_scale, scale.shape()),
+            OxideTensorF32::new(d_src, shape),
+        ))
     }
 
     fn connected_f32(
@@ -4749,7 +5623,10 @@ impl F32TensorOpsBackend for OxideBackend {
         let op = "connected_f32";
         self.connected_layout(op, x.len(), weights.len(), batch, inputs, outputs)?;
         if biases.len() != outputs {
-            return Err(shape_err(op, format!("expected {outputs} biases, got {}", biases.len())));
+            return Err(shape_err(
+                op,
+                format!("expected {outputs} biases, got {}", biases.len()),
+            ));
         }
         let mut raw = self.alloc_uninit(batch * outputs)?;
         // out[b, o] = x[b, :] . w[o, :]  (NT GEMM; beta = 0 writes every element)
@@ -4804,7 +5681,14 @@ impl F32TensorOpsBackend for OxideBackend {
         let op = "connected_backward_f32";
         self.connected_layout(op, x.len(), weights.len(), batch, inputs, outputs)?;
         if delta.len() != batch * outputs {
-            return Err(shape_err(op, format!("expected {} delta elements, got {}", batch * outputs, delta.len())));
+            return Err(shape_err(
+                op,
+                format!(
+                    "expected {} delta elements, got {}",
+                    batch * outputs,
+                    delta.len()
+                ),
+            ));
         }
         // dx = delta . W  (NN GEMM)
         let mut dx = self.alloc_uninit(batch * inputs)?;
@@ -4859,7 +5743,16 @@ impl F32TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<BatchNormTrainForward<Self::Tensor>, Self::Error> {
         if x.is_half() {
-            return self.batchnorm_train_forward_amp(x, scales, biases, rolling_mean, rolling_variance, shape, keep, config);
+            return self.batchnorm_train_forward_amp(
+                x,
+                scales,
+                biases,
+                rolling_mean,
+                rolling_variance,
+                shape,
+                keep,
+                config,
+            );
         }
         let x_f = self.f32v(x)?;
         let x = &*x_f;
@@ -4872,8 +5765,12 @@ impl F32TensorOpsBackend for OxideBackend {
         let rolling_variance_f = self.f32v(rolling_variance)?;
         let rolling_variance = &*rolling_variance_f;
         let op = "batchnorm_train_forward_f32";
-        let (channels, stride, row_groups) =
-            Self::batchnorm_layout(op, shape, x.len(), &[scales, biases, rolling_mean, rolling_variance])?;
+        let (channels, stride, row_groups) = Self::batchnorm_layout(
+            op,
+            shape,
+            x.len(),
+            &[scales, biases, rolling_mean, rolling_variance],
+        )?;
         let n = (row_groups * stride) as f32;
         let block = BIAS_BACKWARD_THREADS as u32;
         let per_channel = launch::elementwise(channels, config);
@@ -4894,8 +5791,11 @@ impl F32TensorOpsBackend for OxideBackend {
         .map_err(launch_err)?;
         let mut mean = self.alloc_uninit(channels)?;
         // SAFETY: one thread per channel.
-        unsafe { self.batchnorm.bn_mean_finalize(&self.stream, per_channel, &partial, &mut mean, 1.0 / n) }
-            .map_err(launch_err)?;
+        unsafe {
+            self.batchnorm
+                .bn_mean_finalize(&self.stream, per_channel, &partial, &mut mean, 1.0 / n)
+        }
+        .map_err(launch_err)?;
 
         // SAFETY: as above; every `partial` slot is rewritten.
         unsafe {
@@ -4974,7 +5874,14 @@ impl F32TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
         if x_hat.is_half() {
-            return self.batchnorm_train_backward_amp(output_grad, x_hat, variance, scales, shape, config);
+            return self.batchnorm_train_backward_amp(
+                output_grad,
+                x_hat,
+                variance,
+                scales,
+                shape,
+                config,
+            );
         }
         let output_grad_f = self.f32v(output_grad)?;
         let output_grad = &*output_grad_f;
@@ -5309,25 +6216,53 @@ impl F32TensorOpsBackend for OxideBackend {
             None => &u_f[seg(k)].buf,
         };
         let hg = |k: usize| (k < items.len() && g_f[k].is_some()) as u32;
-        let decay = |k: usize| if k < items.len() { items[k].decay * batch } else { 0.0 };
+        let decay = |k: usize| {
+            if k < items.len() {
+                items[k].decay * batch
+            } else {
+                0.0
+            }
+        };
         let total = n(0) + n(1) + n(2);
-        let [wo0, wo1, wo2] = &mut *w_out else { unreachable!() };
-        let [uo0, uo1, uo2] = &mut *u_out else { unreachable!() };
+        let [wo0, wo1, wo2] = &mut *w_out else {
+            unreachable!()
+        };
+        let [uo0, uo1, uo2] = &mut *u_out else {
+            unreachable!()
+        };
         // SAFETY: one thread per element of the concatenation; every output
         // slot of every used segment is written.
         unsafe {
             self.optim.sanitized_sgd_update3(
                 &self.stream,
                 launch::elementwise(total, config),
-                &w_f[0].buf, &u_f[0].buf, gbuf(0), wo0, uo0,
-                &w_f[seg(1)].buf, &u_f[seg(1)].buf, gbuf(1), wo1, uo1,
-                &w_f[seg(2)].buf, &u_f[seg(2)].buf, gbuf(2), wo2, uo2,
-                n(0), n(1), n(2),
-                hg(0), hg(1), hg(2),
+                &w_f[0].buf,
+                &u_f[0].buf,
+                gbuf(0),
+                wo0,
+                uo0,
+                &w_f[seg(1)].buf,
+                &u_f[seg(1)].buf,
+                gbuf(1),
+                wo1,
+                uo1,
+                &w_f[seg(2)].buf,
+                &u_f[seg(2)].buf,
+                gbuf(2),
+                wo2,
+                uo2,
+                n(0),
+                n(1),
+                n(2),
+                hg(0),
+                hg(1),
+                hg(2),
                 items[0].fix_weights as u32,
                 lr / batch,
                 momentum,
-                decay(0), decay(1), decay(2),
+                decay(0),
+                decay(1),
+                decay(2),
             )
         }
         .map_err(launch_err)?;
@@ -5418,20 +6353,56 @@ impl F32TensorOpsBackend for OxideBackend {
         let p0 = items[0].params;
         let (_, _, bc1, bc2) = p0.kernel_scalars();
         let total = n(0) + n(1) + n(2);
-        let [wo0, wo1, wo2] = &mut *w_out else { unreachable!() };
-        let [mo0, mo1, mo2] = &mut *m_out else { unreachable!() };
-        let [vo0, vo1, vo2] = &mut *v_out else { unreachable!() };
-        let [uo0, uo1, uo2] = &mut *u_out else { unreachable!() };
+        let [wo0, wo1, wo2] = &mut *w_out else {
+            unreachable!()
+        };
+        let [mo0, mo1, mo2] = &mut *m_out else {
+            unreachable!()
+        };
+        let [vo0, vo1, vo2] = &mut *v_out else {
+            unreachable!()
+        };
+        let [uo0, uo1, uo2] = &mut *u_out else {
+            unreachable!()
+        };
         // SAFETY: as in `sanitized_sgd_update_multi_f32`.
         unsafe {
             self.optim.sanitized_adam_update3(
                 &self.stream,
                 launch::elementwise(total, config),
-                &w_f[0].buf, &u_f[0].buf, gbuf(0), &m_f[0].buf, &v_f[0].buf, wo0, mo0, vo0, uo0,
-                &w_f[seg(1)].buf, &u_f[seg(1)].buf, gbuf(1), &m_f[seg(1)].buf, &v_f[seg(1)].buf, wo1, mo1, vo1, uo1,
-                &w_f[seg(2)].buf, &u_f[seg(2)].buf, gbuf(2), &m_f[seg(2)].buf, &v_f[seg(2)].buf, wo2, mo2, vo2, uo2,
-                n(0), n(1), n(2),
-                hg(0), hg(1), hg(2),
+                &w_f[0].buf,
+                &u_f[0].buf,
+                gbuf(0),
+                &m_f[0].buf,
+                &v_f[0].buf,
+                wo0,
+                mo0,
+                vo0,
+                uo0,
+                &w_f[seg(1)].buf,
+                &u_f[seg(1)].buf,
+                gbuf(1),
+                &m_f[seg(1)].buf,
+                &v_f[seg(1)].buf,
+                wo1,
+                mo1,
+                vo1,
+                uo1,
+                &w_f[seg(2)].buf,
+                &u_f[seg(2)].buf,
+                gbuf(2),
+                &m_f[seg(2)].buf,
+                &v_f[seg(2)].buf,
+                wo2,
+                mo2,
+                vo2,
+                uo2,
+                n(0),
+                n(1),
+                n(2),
+                hg(0),
+                hg(1),
+                hg(2),
                 items[0].fix_weights as u32,
                 p0.lr,
                 p0.beta1,
@@ -5439,9 +6410,12 @@ impl F32TensorOpsBackend for OxideBackend {
                 p0.eps,
                 bc1,
                 bc2,
-                scalars(0).0, scalars(0).1,
-                scalars(1).0, scalars(1).1,
-                scalars(2).0, scalars(2).1,
+                scalars(0).0,
+                scalars(0).1,
+                scalars(1).0,
+                scalars(1).1,
+                scalars(2).0,
+                scalars(2).1,
             )
         }
         .map_err(launch_err)?;

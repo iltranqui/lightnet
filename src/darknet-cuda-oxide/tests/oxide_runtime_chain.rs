@@ -45,7 +45,10 @@ fn close(name: &str, a: &[f32], b: &[f32], tol: f32) {
     assert_eq!(a.len(), b.len(), "{name}: length");
     let scale = a.iter().chain(b).fold(1.0f32, |m, v| m.max(v.abs()));
     for (i, (x, y)) in a.iter().zip(b).enumerate() {
-        assert!((x - y).abs() <= tol * scale, "{name}[{i}]: cpu {x} vs oxide {y} (scale {scale})");
+        assert!(
+            (x - y).abs() <= tol * scale,
+            "{name}[{i}]: cpu {x} vs oxide {y} (scale {scale})"
+        );
     }
 }
 
@@ -70,7 +73,9 @@ fn assert_chain(cfg: &str, seed_layer: usize, what: &str) {
 
     let input = patterned(cpu.network.net.input_shape());
     let cpu_fwd = cpu.forward_training(&input).expect("cpu forward");
-    let gpu_fwd = gpu.forward_training_with_state(&input).expect("oxide forward");
+    let gpu_fwd = gpu
+        .forward_training_with_state(&input)
+        .expect("oxide forward");
     let compact = gpu.forward_compact(&input).expect("oxide compact forward");
     close(
         &format!("{what} compact final output"),
@@ -78,39 +83,66 @@ fn assert_chain(cfg: &str, seed_layer: usize, what: &str) {
         &compact.final_output.expect("compact output").data,
         1e-4,
     );
-    for (i, (a, b)) in cpu_fwd.layer_outputs.iter().zip(&gpu_fwd.cpu_forward.layer_outputs).enumerate() {
+    for (i, (a, b)) in cpu_fwd
+        .layer_outputs
+        .iter()
+        .zip(&gpu_fwd.cpu_forward.layer_outputs)
+        .enumerate()
+    {
         close(&format!("{what} layer {i} output"), &a.data, &b.data, 1e-4);
     }
 
     let shape = cpu.network.layers[seed_layer].output_shape;
     let seed = Tensor::from_data(
         shape,
-        (0..shape.batch * shape.element_count()).map(|i| (i as f32 * 0.91).cos()).collect(),
+        (0..shape.batch * shape.element_count())
+            .map(|i| (i as f32 * 0.91).cos())
+            .collect(),
     )
     .expect("seed");
     let mut seeds = vec![None; cpu.network.layers.len()];
     seeds[seed_layer] = Some(seed);
     cpu.zero_train_buffers();
-    cpu.backward_accumulate_seeded(&input, &cpu_fwd, &seeds).expect("cpu backward");
+    cpu.backward_accumulate_seeded(&input, &cpu_fwd, &seeds)
+        .expect("cpu backward");
     gpu.zero_train_buffers_gpu().expect("zero");
-    gpu.backward_accumulate_seeded_gpu(&gpu_fwd, &seeds).expect("oxide backward");
+    gpu.backward_accumulate_seeded_gpu(&gpu_fwd, &seeds)
+        .expect("oxide backward");
 
     // Gradients are read through one SGD step with lr 1, no momentum / decay:
     // w_new = w_old + updates (Darknet adds the accumulated delta products).
     let before = cpu.params.clone();
     cpu.update_weights(1.0, 0.0, 0.0, 1);
-    gpu.update_weights_gpu(1.0, 0.0, 0.0, 1).expect("oxide update");
+    gpu.update_weights_gpu(1.0, 0.0, 0.0, 1)
+        .expect("oxide update");
     let mut checked = 0;
-    for (i, (b, (c, g))) in before.iter().zip(cpu.params.iter().zip(&gpu.params)).enumerate() {
-        let (LayerParams::Convolutional(b), LayerParams::Convolutional(c), LayerParams::Convolutional(g)) = (b, c, g)
+    for (i, (b, (c, g))) in before
+        .iter()
+        .zip(cpu.params.iter().zip(&gpu.params))
+        .enumerate()
+    {
+        let (
+            LayerParams::Convolutional(b),
+            LayerParams::Convolutional(c),
+            LayerParams::Convolutional(g),
+        ) = (b, c, g)
         else {
             continue;
         };
-        let delta = |a: &[f32], o: &[f32]| a.iter().zip(o).map(|(x, y)| x - y).collect::<Vec<f32>>();
+        let delta =
+            |a: &[f32], o: &[f32]| a.iter().zip(o).map(|(x, y)| x - y).collect::<Vec<f32>>();
         let (cw, gw) = (delta(&c.weights, &b.weights), delta(&g.weights, &b.weights));
-        assert!(cw.iter().any(|v| v.abs() > 1e-6), "{what} layer {i}: CPU weight gradient is all zero");
+        assert!(
+            cw.iter().any(|v| v.abs() > 1e-6),
+            "{what} layer {i}: CPU weight gradient is all zero"
+        );
         close(&format!("{what} layer {i} weight gradient"), &cw, &gw, 1e-3);
-        close(&format!("{what} layer {i} bias gradient"), &delta(&c.biases, &b.biases), &delta(&g.biases, &b.biases), 1e-3);
+        close(
+            &format!("{what} layer {i} bias gradient"),
+            &delta(&c.biases, &b.biases),
+            &delta(&g.biases, &b.biases),
+            1e-3,
+        );
         checked += 1;
     }
     assert!(checked >= 2, "{what}: expected several convolution layers");
@@ -141,6 +173,136 @@ fn chained_conv_activation_stacks_match_cpu_backward() {
     ] {
         assert_chain(&conv_stack(act), 2, act);
     }
+}
+
+#[test]
+fn vit_flash_attention_runtime_uses_native_forward_and_backward_and_matches_cpu() {
+    let net = network(
+        r#"
+            [net]
+            width=4
+            height=4
+            channels=1
+            batch=1
+
+            [convolutional]
+            filters=2
+            size=1
+            activation=linear
+
+            [vit]
+            dim=4
+            heads=2
+            patch_size=2
+            patch_stride=2
+            mlp_dim=8
+            flash_attention=1
+        "#,
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    darknet_core::initialize_training_params(&net, &mut cpu.params, 17);
+    let input = patterned(net.net.input_shape());
+    let cpu_forward = cpu.forward_training(&input).expect("CPU ViT forward");
+
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("Oxide backend"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("ViT train buffers");
+    let gpu_forward = gpu
+        .forward_training_with_state(&input)
+        .expect("Oxide ViT forward");
+    for (index, (cpu_output, oxide_output)) in cpu_forward
+        .layer_outputs
+        .iter()
+        .zip(&gpu_forward.cpu_forward.layer_outputs)
+        .enumerate()
+    {
+        close(
+            &format!("ViT flash chain layer {index}"),
+            &cpu_output.data,
+            &oxide_output.data,
+            2e-4,
+        );
+    }
+
+    let output = cpu_forward.final_output().expect("ViT output");
+    let seed = Tensor::filled(output.shape, 0.1);
+    let mut seeds = vec![None; cpu.network.layers.len()];
+    seeds[1] = Some(seed);
+    cpu.zero_train_buffers();
+    gpu.zero_train_buffers_gpu()
+        .expect("zero ViT train buffers");
+    // The rest of the transformer backward remains on the host fallback; this
+    // flash-attention dQ/dK/dV derivative dispatches through Oxide's native kernels.
+    cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+        .expect("CPU ViT backward");
+    gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+        .expect("Oxide ViT backward fallback");
+    cpu.update_weights(1e-4, 0.0, 0.0, 1);
+    gpu.update_weights_gpu(1e-4, 0.0, 0.0, 1)
+        .expect("Oxide fallback update");
+
+    let (LayerParams::Vit(cpu_vit), LayerParams::Vit(oxide_vit)) = (&cpu.params[1], &gpu.params[1])
+    else {
+        panic!("ViT parameter layouts");
+    };
+    close(
+        "ViT flash patch gradient/update",
+        &cpu_vit.patch_embed,
+        &oxide_vit.patch_embed,
+        2e-4,
+    );
+    close(
+        "ViT flash QKV gradient/update",
+        &cpu_vit.qkv_weight,
+        &oxide_vit.qkv_weight,
+        2e-4,
+    );
+    close(
+        "ViT flash attention projection update",
+        &cpu_vit.wo,
+        &oxide_vit.wo,
+        2e-4,
+    );
+}
+
+#[test]
+fn vit_flash_attention_unsupported_head_dim_uses_host_reference() {
+    let net = network(
+        r#"
+            [net]
+            width=2
+            height=2
+            channels=1
+            batch=1
+
+            [vit]
+            dim=129
+            heads=1
+            patch_size=1
+            patch_stride=1
+            mlp_dim=129
+            flash_attention=1
+        "#,
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    darknet_core::initialize_training_params(&net, &mut cpu.params, 23);
+    let input = patterned(net.net.input_shape());
+    let cpu_forward = cpu.forward(&input).expect("CPU ViT forward");
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("Oxide backend"));
+    gpu.params = cpu.params.clone();
+    let oxide_forward = gpu
+        .forward_with_state(&input)
+        .expect("host fallback forward");
+    close(
+        "ViT flash unsupported head-dim fallback",
+        &cpu_forward.final_output().expect("CPU output").data,
+        &oxide_forward
+            .cpu_forward
+            .final_output()
+            .expect("Oxide output")
+            .data,
+        2e-4,
+    );
 }
 
 #[test]
@@ -220,16 +382,25 @@ fn maxpool_zero_nonmax_forward_backward_and_sgd_match_cpu() {
     gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
         .expect("Oxide backward");
     cpu.update_weights(1.0, 0.0, 0.0, 1);
-    gpu.update_weights_gpu(1.0, 0.0, 0.0, 1)
-        .expect("Oxide SGD");
+    gpu.update_weights_gpu(1.0, 0.0, 0.0, 1).expect("Oxide SGD");
 
     let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(gpu_conv)) =
         (&cpu.params[0], &gpu.params[0])
     else {
         panic!("updated convolution parameters");
     };
-    close("maxpool zero_nonmax conv weights", &cpu_conv.weights, &gpu_conv.weights, 1e-6);
-    close("maxpool zero_nonmax conv biases", &cpu_conv.biases, &gpu_conv.biases, 1e-6);
+    close(
+        "maxpool zero_nonmax conv weights",
+        &cpu_conv.weights,
+        &gpu_conv.weights,
+        1e-6,
+    );
+    close(
+        "maxpool zero_nonmax conv biases",
+        &cpu_conv.biases,
+        &gpu_conv.biases,
+        1e-6,
+    );
     assert_eq!(cpu_conv.weights, vec![31.0]);
     assert_eq!(cpu_conv.biases, vec![10.0]);
 }
@@ -464,7 +635,8 @@ fn moe_batchnorm_expert_device_backward_matches_cpu_on_oxide() {
         let LayerParams::Moe(moe) = &mut gpu.params[1] else {
             panic!("MoE parameters")
         };
-        moe.router_weights.copy_from_slice(&[0.15, -0.25, -0.05, 0.2]);
+        moe.router_weights
+            .copy_from_slice(&[0.15, -0.25, -0.05, 0.2]);
         moe.router_biases.copy_from_slice(&[0.03, -0.02]);
         for (slot, expert) in moe.experts.iter_mut().enumerate() {
             expert.weights.copy_from_slice(&[
@@ -524,16 +696,37 @@ fn moe_batchnorm_expert_device_backward_matches_cpu_on_oxide() {
     else {
         panic!("conv parameters after BN update")
     };
-    close("MoE BN preceding conv weights", &cpu_conv.weights, &gpu_conv.weights, 1e-4);
-    close("MoE BN preceding conv biases", &cpu_conv.biases, &gpu_conv.biases, 1e-4);
-    let (LayerParams::Moe(cpu_moe), LayerParams::Moe(gpu_moe)) =
-        (&cpu.params[1], &gpu.params[1])
+    close(
+        "MoE BN preceding conv weights",
+        &cpu_conv.weights,
+        &gpu_conv.weights,
+        1e-4,
+    );
+    close(
+        "MoE BN preceding conv biases",
+        &cpu_conv.biases,
+        &gpu_conv.biases,
+        1e-4,
+    );
+    let (LayerParams::Moe(cpu_moe), LayerParams::Moe(gpu_moe)) = (&cpu.params[1], &gpu.params[1])
     else {
         panic!("MoE parameters after BN update")
     };
-    close("MoE BN router weights", &cpu_moe.router_weights, &gpu_moe.router_weights, 1e-4);
-    close("MoE BN router biases", &cpu_moe.router_biases, &gpu_moe.router_biases, 1e-4);
-    for (index, (cpu_expert, gpu_expert)) in cpu_moe.experts.iter().zip(&gpu_moe.experts).enumerate() {
+    close(
+        "MoE BN router weights",
+        &cpu_moe.router_weights,
+        &gpu_moe.router_weights,
+        1e-4,
+    );
+    close(
+        "MoE BN router biases",
+        &cpu_moe.router_biases,
+        &gpu_moe.router_biases,
+        1e-4,
+    );
+    for (index, (cpu_expert, gpu_expert)) in
+        cpu_moe.experts.iter().zip(&gpu_moe.experts).enumerate()
+    {
         close(
             &format!("MoE BN expert {index} weights"),
             &cpu_expert.weights,
@@ -571,7 +764,8 @@ fn moe_batchnorm_adam_updates_experts_on_oxide_match_cpu_gradients() {
         let LayerParams::Moe(moe) = &mut gpu.params[1] else {
             panic!("MoE parameters")
         };
-        moe.router_weights.copy_from_slice(&[0.15, -0.25, -0.05, 0.2]);
+        moe.router_weights
+            .copy_from_slice(&[0.15, -0.25, -0.05, 0.2]);
         moe.router_biases.copy_from_slice(&[0.03, -0.02]);
         for (slot, expert) in moe.experts.iter_mut().enumerate() {
             expert.weights.copy_from_slice(&[
@@ -591,9 +785,7 @@ fn moe_batchnorm_adam_updates_experts_on_oxide_match_cpu_gradients() {
     gpu.init_train_buffers_gpu().expect("device train buffers");
     let input = patterned(cpu.network.net.input_shape());
     let cpu_fwd = cpu.forward_training(&input).expect("CPU forward");
-    let gpu_fwd = gpu
-        .forward_training_device(&input)
-        .expect("Oxide forward");
+    let gpu_fwd = gpu.forward_training_device(&input).expect("Oxide forward");
     for layer_index in 0..2 {
         close(
             &format!("MoE BN Adam forward {layer_index}"),
@@ -685,15 +877,45 @@ fn moe_batchnorm_adam_updates_experts_on_oxide_match_cpu_gradients() {
     else {
         panic!("updated GPU parameters")
     };
-    close("BN Adam preceding conv weights", &expected_conv_weights, &gpu_conv.weights, 1e-4);
-    close("BN Adam preceding conv biases", &expected_conv_biases, &gpu_conv.biases, 1e-4);
-    close("BN Adam router weights", &expected_router_weights, &gpu_moe.router_weights, 1e-4);
-    close("BN Adam router biases", &expected_router_biases, &gpu_moe.router_biases, 1e-4);
+    close(
+        "BN Adam preceding conv weights",
+        &expected_conv_weights,
+        &gpu_conv.weights,
+        1e-4,
+    );
+    close(
+        "BN Adam preceding conv biases",
+        &expected_conv_biases,
+        &gpu_conv.biases,
+        1e-4,
+    );
+    close(
+        "BN Adam router weights",
+        &expected_router_weights,
+        &gpu_moe.router_weights,
+        1e-4,
+    );
+    close(
+        "BN Adam router biases",
+        &expected_router_biases,
+        &gpu_moe.router_biases,
+        1e-4,
+    );
     for (index, (expert, (weights, biases, scales))) in
         gpu_moe.experts.iter().zip(&expected_experts).enumerate()
     {
-        close(&format!("BN Adam expert {index} weights"), weights, &expert.weights, 1e-4);
-        close(&format!("BN Adam expert {index} biases"), biases, &expert.biases, 1e-4);
+        close(
+            &format!("BN Adam expert {index} weights"),
+            weights,
+            &expert.weights,
+            1e-4,
+        );
+        close(
+            &format!("BN Adam expert {index} biases"),
+            biases,
+            &expert.biases,
+            1e-4,
+        );
         close(
             &format!("BN Adam expert {index} scales"),
             scales,
@@ -713,11 +935,15 @@ fn moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu() {
     );
     let mut cpu = ExecutableNetwork::new(net.clone());
     let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("oxide backend"));
-    let LayerParams::Convolutional(conv) = &mut gpu.params[0] else { panic!("conv parameters") };
+    let LayerParams::Convolutional(conv) = &mut gpu.params[0] else {
+        panic!("conv parameters")
+    };
     conv.weights.copy_from_slice(&[1.0, 0.0, 0.0, 1.0]);
     conv.biases.copy_from_slice(&[0.0, 0.0]);
     {
-        let LayerParams::Moe(moe) = &mut gpu.params[1] else { panic!("MoE parameters") };
+        let LayerParams::Moe(moe) = &mut gpu.params[1] else {
+            panic!("MoE parameters")
+        };
         for (i, weight) in moe.router_weights.iter_mut().enumerate() {
             *weight = (i as f32 - 2.0) * 0.07;
         }
@@ -733,9 +959,19 @@ fn moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu() {
     gpu.init_train_buffers_gpu().expect("train buffers");
     let input = patterned(cpu.network.net.input_shape());
     let cpu_fwd = cpu.forward_training(&input).expect("CPU MoE forward");
-    let gpu_fwd = gpu.forward_training_device(&input).expect("Oxide MoE forward");
-    let output = gpu.backend.download_f32(&gpu_fwd.gpu_layer_outputs[1]).expect("download MoE output");
-    close("MoE expert blend", &cpu_fwd.layer_outputs[1].data, &output, 1e-4);
+    let gpu_fwd = gpu
+        .forward_training_device(&input)
+        .expect("Oxide MoE forward");
+    let output = gpu
+        .backend
+        .download_f32(&gpu_fwd.gpu_layer_outputs[1])
+        .expect("download MoE output");
+    close(
+        "MoE expert blend",
+        &cpu_fwd.layer_outputs[1].data,
+        &output,
+        1e-4,
+    );
     assert!(gpu_fwd.cpu_forward.moe_caches[1].is_none());
 
     let shape = cpu.network.layers[1].output_shape;
@@ -856,28 +1092,56 @@ fn amp_dropout_and_dropblock_runtime_chain_matches_f32_reference() {
     gpu.init_train_buffers_gpu().expect("train buffers");
     let input = patterned(cpu.network.net.input_shape());
     let cpu_fwd = cpu.forward_training(&input).expect("f32 training forward");
-    let gpu_fwd = gpu.forward_training_with_state(&input).expect("AMP training forward");
+    let gpu_fwd = gpu
+        .forward_training_with_state(&input)
+        .expect("AMP training forward");
 
     assert_eq!(cpu_fwd.dropout_masks, gpu_fwd.cpu_forward.dropout_masks);
     for layer_index in [0, 1, 2, 3] {
-        let oxide = gpu.backend.download_f32(&gpu_fwd.gpu_layer_outputs[layer_index]).expect("download AMP layer");
-        close(&format!("AMP dropout chain layer {layer_index}"), &cpu_fwd.layer_outputs[layer_index].data, &oxide, 8e-3);
+        let oxide = gpu
+            .backend
+            .download_f32(&gpu_fwd.gpu_layer_outputs[layer_index])
+            .expect("download AMP layer");
+        close(
+            &format!("AMP dropout chain layer {layer_index}"),
+            &cpu_fwd.layer_outputs[layer_index].data,
+            &oxide,
+            8e-3,
+        );
     }
     let shape = cpu.network.layers[3].output_shape;
     let seed = Tensor::from_data(
         shape,
-        (0..shape.batch * shape.element_count()).map(|i| (i as f32 * 0.71).cos()).collect(),
-    ).expect("seed");
+        (0..shape.batch * shape.element_count())
+            .map(|i| (i as f32 * 0.71).cos())
+            .collect(),
+    )
+    .expect("seed");
     let mut seeds = vec![None; cpu.network.layers.len()];
     seeds[3] = Some(seed);
-    cpu.backward_accumulate_seeded(&input, &cpu_fwd, &seeds).expect("f32 backward");
-    gpu.backward_accumulate_seeded_gpu(&gpu_fwd, &seeds).expect("AMP backward");
+    cpu.backward_accumulate_seeded(&input, &cpu_fwd, &seeds)
+        .expect("f32 backward");
+    gpu.backward_accumulate_seeded_gpu(&gpu_fwd, &seeds)
+        .expect("AMP backward");
     cpu.update_weights(1e-4, 0.0, 0.0, 2);
-    gpu.update_weights_gpu(1e-4, 0.0, 0.0, 2).expect("AMP SGD update");
+    gpu.update_weights_gpu(1e-4, 0.0, 0.0, 2)
+        .expect("AMP SGD update");
     for (layer_index, (cpu_param, gpu_param)) in cpu.params.iter().zip(&gpu.params).enumerate() {
-        if let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(gpu_conv)) = (cpu_param, gpu_param) {
-            close(&format!("AMP dropout chain layer {layer_index} weights"), &cpu_conv.weights, &gpu_conv.weights, 2e-2);
-            close(&format!("AMP dropout chain layer {layer_index} biases"), &cpu_conv.biases, &gpu_conv.biases, 2e-2);
+        if let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(gpu_conv)) =
+            (cpu_param, gpu_param)
+        {
+            close(
+                &format!("AMP dropout chain layer {layer_index} weights"),
+                &cpu_conv.weights,
+                &gpu_conv.weights,
+                2e-2,
+            );
+            close(
+                &format!("AMP dropout chain layer {layer_index} biases"),
+                &cpu_conv.biases,
+                &gpu_conv.biases,
+                2e-2,
+            );
         }
     }
 }
@@ -903,31 +1167,59 @@ fn subdivisions_deferred_gradient_flush_matches_cpu() {
                 (0..cpu.network.net.input_shape().element_count())
                     .map(|i| ((i + iteration * 17 + subdivision * 7) as f32 * 0.23).sin())
                     .collect(),
-            ).expect("input");
+            )
+            .expect("input");
             let cpu_fwd = cpu.forward_training(&input).expect("cpu forward");
-            let gpu_fwd = gpu.forward_training_with_state(&input).expect("oxide forward");
-            let output = gpu.backend.download_f32(&gpu_fwd.gpu_layer_outputs[1]).expect("download output");
-            close("subdivision forward", &cpu_fwd.layer_outputs[1].data, &output, 2e-4);
+            let gpu_fwd = gpu
+                .forward_training_with_state(&input)
+                .expect("oxide forward");
+            let output = gpu
+                .backend
+                .download_f32(&gpu_fwd.gpu_layer_outputs[1])
+                .expect("download output");
+            close(
+                "subdivision forward",
+                &cpu_fwd.layer_outputs[1].data,
+                &output,
+                2e-4,
+            );
             let shape = cpu.network.layers[1].output_shape;
             let seed = Tensor::from_data(
                 shape,
                 (0..shape.element_count())
                     .map(|i| ((i + iteration * 13 + subdivision * 5) as f32 * 0.31).cos())
                     .collect(),
-            ).expect("seed");
+            )
+            .expect("seed");
             let mut seeds = vec![None; cpu.network.layers.len()];
             seeds[1] = Some(seed);
-            cpu.backward_accumulate_seeded(&input, &cpu_fwd, &seeds).expect("cpu backward");
-            gpu.backward_accumulate_seeded_gpu(&gpu_fwd, &seeds).expect("oxide backward");
+            cpu.backward_accumulate_seeded(&input, &cpu_fwd, &seeds)
+                .expect("cpu backward");
+            gpu.backward_accumulate_seeded_gpu(&gpu_fwd, &seeds)
+                .expect("oxide backward");
         }
         cpu.update_weights(lr, 0.9, 5e-4, 2);
-        gpu.update_weights_gpu_deferred(lr, 0.9, 5e-4, 2).expect("deferred update");
+        gpu.update_weights_gpu_deferred(lr, 0.9, 5e-4, 2)
+            .expect("deferred update");
     }
-    gpu.sync_host_weights_from_device().expect("sync final weights");
+    gpu.sync_host_weights_from_device()
+        .expect("sync final weights");
     for (index, (cpu_param, gpu_param)) in cpu.params.iter().zip(&gpu.params).enumerate() {
-        if let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(gpu_conv)) = (cpu_param, gpu_param) {
-            close(&format!("subdivision layer {index} weights"), &cpu_conv.weights, &gpu_conv.weights, 2e-3);
-            close(&format!("subdivision layer {index} biases"), &cpu_conv.biases, &gpu_conv.biases, 2e-3);
+        if let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(gpu_conv)) =
+            (cpu_param, gpu_param)
+        {
+            close(
+                &format!("subdivision layer {index} weights"),
+                &cpu_conv.weights,
+                &gpu_conv.weights,
+                2e-3,
+            );
+            close(
+                &format!("subdivision layer {index} biases"),
+                &cpu_conv.biases,
+                &gpu_conv.biases,
+                2e-3,
+            );
         }
     }
 }
@@ -991,7 +1283,8 @@ fn batch_normalized_rnn_device_backward_matches_cpu_on_oxide() {
     }
     let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("oxide backend"));
     gpu.params = cpu.params.clone();
-    gpu.init_train_buffers_gpu().expect("GPU BN RNN train buffers");
+    gpu.init_train_buffers_gpu()
+        .expect("GPU BN RNN train buffers");
     let input = patterned(cpu.network.net.input_shape());
     let cpu_forward = cpu.forward_training(&input).expect("CPU BN RNN forward");
     let gpu_forward = gpu
@@ -1016,7 +1309,8 @@ fn batch_normalized_rnn_device_backward_matches_cpu_on_oxide() {
     .expect("RNN output gradient");
     let seeds = vec![None, Some(seed)];
     cpu.zero_train_buffers();
-    gpu.zero_train_buffers_gpu().expect("zero GPU BN RNN buffers");
+    gpu.zero_train_buffers_gpu()
+        .expect("zero GPU BN RNN buffers");
     cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
         .expect("CPU BN RNN backward");
     gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
@@ -1030,10 +1324,19 @@ fn batch_normalized_rnn_device_backward_matches_cpu_on_oxide() {
     else {
         panic!("updated upstream connected params");
     };
-    close("BN RNN upstream weights", &cpu_input.weights, &gpu_input.weights, 3e-4);
-    close("BN RNN upstream biases", &cpu_input.biases, &gpu_input.biases, 3e-4);
-    let (LayerParams::Rnn(cpu_rnn), LayerParams::Rnn(gpu_rnn)) =
-        (&cpu.params[1], &gpu.params[1])
+    close(
+        "BN RNN upstream weights",
+        &cpu_input.weights,
+        &gpu_input.weights,
+        3e-4,
+    );
+    close(
+        "BN RNN upstream biases",
+        &cpu_input.biases,
+        &gpu_input.biases,
+        3e-4,
+    );
+    let (LayerParams::Rnn(cpu_rnn), LayerParams::Rnn(gpu_rnn)) = (&cpu.params[1], &gpu.params[1])
     else {
         panic!("updated RNN params");
     };
@@ -1275,8 +1578,18 @@ fn batch_normalized_lstm_device_backward_matches_cpu_on_oxide() {
     else {
         panic!("upstream convolution parameters after update");
     };
-    close("BN LSTM upstream weights", &cpu_conv.weights, &gpu_conv.weights, 3e-4);
-    close("BN LSTM upstream biases", &cpu_conv.biases, &gpu_conv.biases, 3e-4);
+    close(
+        "BN LSTM upstream weights",
+        &cpu_conv.weights,
+        &gpu_conv.weights,
+        3e-4,
+    );
+    close(
+        "BN LSTM upstream biases",
+        &cpu_conv.biases,
+        &gpu_conv.biases,
+        3e-4,
+    );
     let (LayerParams::Lstm(cpu_lstm), LayerParams::Lstm(gpu_lstm)) =
         (&cpu.params[1], &gpu.params[1])
     else {
@@ -1732,7 +2045,9 @@ fn few_sgd_steps_match_cpu_loss_trajectory_and_weights() {
 
     let input = patterned(cpu.network.net.input_shape());
     let out_shape = cpu.network.layers[3].output_shape;
-    let target: Vec<f32> = (0..out_shape.batch * out_shape.element_count()).map(|i| 0.03 * i as f32 - 0.5).collect();
+    let target: Vec<f32> = (0..out_shape.batch * out_shape.element_count())
+        .map(|i| 0.03 * i as f32 - 0.5)
+        .collect();
     let (lr, momentum, decay, batch) = (2.0e-4f32, 0.9f32, 5.0e-4f32, 2usize);
     let seed_and_loss = |out: &Tensor| -> (Tensor, f32) {
         let diff: Vec<f32> = target.iter().zip(&out.data).map(|(t, o)| t - o).collect();
@@ -1747,23 +2062,34 @@ fn few_sgd_steps_match_cpu_loss_trajectory_and_weights() {
         cpu_loss.push(loss);
         let mut seeds = vec![None; 4];
         seeds[3] = Some(seed);
-        cpu.backward_accumulate_seeded(&input, &fwd, &seeds).expect("cpu backward");
+        cpu.backward_accumulate_seeded(&input, &fwd, &seeds)
+            .expect("cpu backward");
         cpu.update_weights(lr, momentum, decay, batch);
 
         gpu.zero_train_buffers_gpu().expect("zero");
-        let fwd = gpu.forward_training_with_state(&input).expect("oxide forward");
+        let fwd = gpu
+            .forward_training_with_state(&input)
+            .expect("oxide forward");
         let (seed, loss) = seed_and_loss(fwd.cpu_forward.final_output().expect("output"));
         gpu_loss.push(loss);
         let mut seeds = vec![None; 4];
         seeds[3] = Some(seed);
-        gpu.backward_accumulate_seeded_gpu(&fwd, &seeds).expect("oxide backward");
-        gpu.update_weights_gpu(lr, momentum, decay, batch).expect("oxide update");
+        gpu.backward_accumulate_seeded_gpu(&fwd, &seeds)
+            .expect("oxide backward");
+        gpu.update_weights_gpu(lr, momentum, decay, batch)
+            .expect("oxide update");
     }
     println!("loss trajectory cpu  {cpu_loss:?}\nloss trajectory oxide {gpu_loss:?}");
     for (step, (c, g)) in cpu_loss.iter().zip(&gpu_loss).enumerate() {
-        assert!((c - g).abs() <= 1e-3 * c.abs().max(1.0), "step {step}: cpu loss {c} vs oxide {g}");
+        assert!(
+            (c - g).abs() <= 1e-3 * c.abs().max(1.0),
+            "step {step}: cpu loss {c} vs oxide {g}"
+        );
     }
-    assert!(cpu_loss.last() < cpu_loss.first(), "loss must go down: {cpu_loss:?}");
+    assert!(
+        cpu_loss.last() < cpu_loss.first(),
+        "loss must go down: {cpu_loss:?}"
+    );
     for (i, (c, g)) in cpu.params.iter().zip(&gpu.params).enumerate() {
         if let (LayerParams::Convolutional(c), LayerParams::Convolutional(g)) = (c, g) {
             close(&format!("layer {i} weights"), &c.weights, &g.weights, 1e-3);

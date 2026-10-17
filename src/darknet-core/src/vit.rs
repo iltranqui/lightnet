@@ -390,6 +390,98 @@ pub struct AttentionCache {
     k_active: Vec<bool>,
     probabilities: Vec<f32>,
     score_active: Vec<bool>,
+    flash_lse: Option<Vec<f32>>,
+}
+
+pub(crate) struct FlashAttentionBackwardInputs {
+    pub qkv: Vec<f32>,
+    pub lse: Vec<f32>,
+    pub batch: usize,
+    pub tokens: usize,
+    pub channels: usize,
+    pub heads: usize,
+}
+
+/// Build backend inputs from the forward cache without retaining raw QKV. The
+/// synthetic NaN placeholders preserve the forward's non-finite-to-zero value
+/// and zero clamp derivative; saturated finite values are represented by ±128.
+pub(crate) fn attention_flash_backward_inputs(
+    cache: &AttentionCache,
+) -> Result<Option<FlashAttentionBackwardInputs>, String> {
+    let Some(lse) = &cache.flash_lse else {
+        return Ok(None);
+    };
+    let elements = cache
+        .batch
+        .checked_mul(cache.tokens)
+        .and_then(|n| n.checked_mul(cache.channels))
+        .ok_or_else(|| "vit flash backward cache size overflow".to_owned())?;
+    if cache.q.len() != elements
+        || cache.k.len() != elements
+        || cache.v.len() != elements
+        || cache.q_active.len() != elements
+        || cache.k_active.len() != elements
+        || lse.len() != cache.batch * cache.heads * cache.tokens
+    {
+        return Err("vit flash backward cache tensors have inconsistent lengths".into());
+    }
+    let mut qkv = vec![0.0; elements * 3];
+    for i in 0..elements {
+        let raw_q = if cache.q_active[i] {
+            cache.q[i]
+        } else if cache.q[i].abs() < 128.0 {
+            f32::NAN
+        } else {
+            cache.q[i]
+        };
+        let raw_k = if cache.k_active[i] {
+            cache.k[i]
+        } else if cache.k[i].abs() < 128.0 {
+            f32::NAN
+        } else {
+            cache.k[i]
+        };
+        let row = i / cache.channels;
+        let channel = i % cache.channels;
+        qkv[row * 3 * cache.channels + channel] = raw_q;
+        qkv[row * 3 * cache.channels + cache.channels + channel] = raw_k;
+        qkv[row * 3 * cache.channels + 2 * cache.channels + channel] = cache.v[i];
+    }
+    Ok(Some(FlashAttentionBackwardInputs {
+        qkv,
+        lse: lse.clone(),
+        batch: cache.batch,
+        tokens: cache.tokens,
+        channels: cache.channels,
+        heads: cache.heads,
+    }))
+}
+
+fn attention_score(
+    q: &[f32],
+    k: &[f32],
+    query_row: usize,
+    key_row: usize,
+    channels: usize,
+    head_start: usize,
+    head_dim: usize,
+    scale: f32,
+) -> (f32, bool) {
+    let mut dot = 0.0;
+    for d in 0..head_dim {
+        let c = head_start + d;
+        dot += q[query_row * channels + c] * k[key_row * channels + c];
+    }
+    let raw = dot * scale;
+    let active = raw.is_finite() && raw.abs() < 10.0;
+    let score = if raw.is_nan() {
+        0.0
+    } else if raw.is_infinite() {
+        if raw.is_sign_positive() { 10.0 } else { -10.0 }
+    } else {
+        raw.clamp(-10.0, 10.0)
+    };
+    (score, active)
 }
 
 /// Global multi-head attention for fused per-token QKV `[B,T,3N]`. When
@@ -404,10 +496,112 @@ pub fn attention_forward(
     heads: usize,
     sparse_blocks: Option<(usize, usize)>,
 ) -> Result<(Vec<f32>, AttentionCache), String> {
+    attention_forward_impl(qkv, batch, tokens, channels, heads, sparse_blocks, false)
+}
+
+/// Online-softmax attention using O(B*T*channels) cached intermediates rather
+/// than materializing the O(B*heads*T*T) probability matrix. Backward recomputes
+/// each probability from the saved row log-sum-exp.
+pub fn attention_forward_flash(
+    qkv: &[f32],
+    batch: usize,
+    tokens: usize,
+    channels: usize,
+    heads: usize,
+) -> Result<(Vec<f32>, AttentionCache), String> {
+    attention_forward_impl(qkv, batch, tokens, channels, heads, None, true)
+}
+
+/// Construct the analytical-backward cache for a context/LSE pair produced by
+/// a native online-attention forward. Q/K clamp masks are rebuilt from the
+/// original fused QKV; score probabilities remain implicit in row LSE.
+pub fn attention_flash_cache_from_lse(
+    qkv: &[f32],
+    batch: usize,
+    tokens: usize,
+    channels: usize,
+    heads: usize,
+    lse: &[f32],
+) -> Result<AttentionCache, String> {
+    if batch == 0 || tokens == 0 || channels == 0 || heads == 0 || channels % heads != 0 {
+        return Err(
+            "vit flash cache requires positive dimensions and channels divisible by heads".into(),
+        );
+    }
+    let rows = batch
+        .checked_mul(tokens)
+        .ok_or("vit flash-cache row count overflow")?;
+    let qkv_width = channels.checked_mul(3).ok_or("vit QKV width overflow")?;
+    let expected_qkv = rows.checked_mul(qkv_width).ok_or("vit QKV size overflow")?;
+    if qkv.len() != expected_qkv {
+        return Err(format!(
+            "vit QKV has {} values, expected {expected_qkv}",
+            qkv.len()
+        ));
+    }
+    let lse_len = batch
+        .checked_mul(heads)
+        .and_then(|n| n.checked_mul(tokens))
+        .ok_or("vit flash-cache LSE size overflow")?;
+    if lse.len() != lse_len {
+        return Err(format!(
+            "vit flash LSE has {} values, expected {lse_len}",
+            lse.len()
+        ));
+    }
+    let q_len = rows
+        .checked_mul(channels)
+        .ok_or("vit QKV component size overflow")?;
+    let mut q = vec![0.0; q_len];
+    let mut k = vec![0.0; q_len];
+    let mut v = vec![0.0; q_len];
+    let mut q_active = vec![false; q_len];
+    let mut k_active = vec![false; q_len];
+    for row in 0..rows {
+        for c in 0..channels {
+            let raw_q = qkv[row * 3 * channels + c];
+            let raw_k = qkv[row * 3 * channels + channels + c];
+            let i = row * channels + c;
+            q_active[i] = raw_q.is_finite() && raw_q.abs() < 128.0;
+            k_active[i] = raw_k.is_finite() && raw_k.abs() < 128.0;
+            q[i] = clamp_feature(raw_q, 128.0);
+            k[i] = clamp_feature(raw_k, 128.0);
+            v[i] = qkv[row * 3 * channels + 2 * channels + c];
+        }
+    }
+    Ok(AttentionCache {
+        batch,
+        tokens,
+        channels,
+        heads,
+        head_dim: channels / heads,
+        q,
+        k,
+        v,
+        q_active,
+        k_active,
+        probabilities: Vec::new(),
+        score_active: Vec::new(),
+        flash_lse: Some(lse.to_vec()),
+    })
+}
+
+fn attention_forward_impl(
+    qkv: &[f32],
+    batch: usize,
+    tokens: usize,
+    channels: usize,
+    heads: usize,
+    sparse_blocks: Option<(usize, usize)>,
+    flash: bool,
+) -> Result<(Vec<f32>, AttentionCache), String> {
     if batch == 0 || tokens == 0 || channels == 0 || heads == 0 || channels % heads != 0 {
         return Err(
             "vit attention requires positive dimensions and channels divisible by heads".into(),
         );
+    }
+    if flash && sparse_blocks.is_some() {
+        return Err("vit flash attention and MSA are mutually exclusive".into());
     }
     let rows = batch
         .checked_mul(tokens)
@@ -421,13 +615,12 @@ pub fn attention_forward(
         ));
     }
     let head_dim = channels / heads;
-    let qkv_rows = rows;
-    let mut q = vec![0.0; qkv_rows * channels];
-    let mut k = vec![0.0; qkv_rows * channels];
-    let mut v = vec![0.0; qkv_rows * channels];
-    let mut q_active = vec![false; qkv_rows * channels];
-    let mut k_active = vec![false; qkv_rows * channels];
-    for row in 0..qkv_rows {
+    let mut q = vec![0.0; rows * channels];
+    let mut k = vec![0.0; rows * channels];
+    let mut v = vec![0.0; rows * channels];
+    let mut q_active = vec![false; rows * channels];
+    let mut k_active = vec![false; rows * channels];
+    for row in 0..rows {
         for c in 0..channels {
             let q_raw = qkv[row * 3 * channels + c];
             let k_raw = qkv[row * 3 * channels + channels + c];
@@ -443,53 +636,99 @@ pub fn attention_forward(
         .checked_mul(heads)
         .and_then(|v| v.checked_mul(tokens))
         .ok_or("vit attention head-row count overflow")?;
-    let score_count = rows_per_head
-        .checked_mul(tokens)
-        .ok_or("vit attention score size overflow")?;
+    let score_count = if flash {
+        0
+    } else {
+        rows_per_head
+            .checked_mul(tokens)
+            .ok_or("vit attention score size overflow")?
+    };
     let output_len = rows
         .checked_mul(channels)
         .ok_or("vit attention output size overflow")?;
     let mut probabilities = vec![0.0; score_count];
     let mut score_active = vec![false; score_count];
+    let mut flash_lse = if flash {
+        vec![0.0; rows_per_head]
+    } else {
+        Vec::new()
+    };
     let mut output = vec![0.0; output_len];
     let scale = 1.0 / (head_dim as f32).sqrt();
     for b in 0..batch {
         for h in 0..heads {
-            let head_offset = (b * heads + h) * tokens * tokens;
+            let head_row = b * heads + h;
+            let dense_head_offset = if flash { 0 } else { head_row * tokens * tokens };
             for tq in 0..tokens {
-                let row_idx = head_offset + tq * tokens;
-                let mut scores = vec![0.0; tokens];
-                for tk in 0..tokens {
-                    let mut dot = 0.0;
+                let dense_row_offset = if flash {
+                    0
+                } else {
+                    dense_head_offset + tq * tokens
+                };
+                let query_row = b * tokens + tq;
+                if flash {
+                    let mut running_max = f32::NEG_INFINITY;
+                    let mut running_sum = 0.0;
+                    let mut acc = vec![0.0; head_dim];
+                    for tk in 0..tokens {
+                        let key_row = b * tokens + tk;
+                        let (score, _) = attention_score(
+                            &q,
+                            &k,
+                            query_row,
+                            key_row,
+                            channels,
+                            h * head_dim,
+                            head_dim,
+                            scale,
+                        );
+                        let new_max = running_max.max(score);
+                        let correction = (running_max - new_max).exp();
+                        let p = (score - new_max).exp();
+                        running_sum = running_sum * correction + p;
+                        for d in 0..head_dim {
+                            let c = h * head_dim + d;
+                            acc[d] = acc[d] * correction + p * v[key_row * channels + c];
+                        }
+                        running_max = new_max;
+                    }
+                    let lse = running_max + running_sum.ln();
+                    flash_lse[head_row * tokens + tq] = lse;
                     for d in 0..head_dim {
                         let c = h * head_dim + d;
-                        let qr = q[(b * tokens + tq) * channels + c];
-                        let kr = k[(b * tokens + tk) * channels + c];
-                        dot += qr * kr;
+                        output[query_row * channels + c] = acc[d] / running_sum;
                     }
-                    let raw = dot * scale;
-                    score_active[row_idx + tk] = raw.is_finite() && raw.abs() < 10.0;
-                    scores[tk] = if raw.is_nan() {
-                        0.0
-                    } else if raw.is_infinite() {
-                        if raw.is_sign_positive() { 10.0 } else { -10.0 }
-                    } else {
-                        raw.clamp(-10.0, 10.0)
-                    };
-                }
-                let probs = if let Some((block, topk)) = sparse_blocks {
-                    sparse_softmax_row(&scores, tq, block, topk, 10.0)?
                 } else {
-                    vit_dense_softmax(&scores)
-                };
-                probabilities[row_idx..row_idx + tokens].copy_from_slice(&probs);
-                for d in 0..head_dim {
-                    let c = h * head_dim + d;
-                    let mut context = 0.0;
+                    let mut scores = vec![0.0; tokens];
                     for tk in 0..tokens {
-                        context += probs[tk] * v[(b * tokens + tk) * channels + c];
+                        let (score, active) = attention_score(
+                            &q,
+                            &k,
+                            query_row,
+                            b * tokens + tk,
+                            channels,
+                            h * head_dim,
+                            head_dim,
+                            scale,
+                        );
+                        score_active[dense_row_offset + tk] = active;
+                        scores[tk] = score;
                     }
-                    output[(b * tokens + tq) * channels + c] = context;
+                    let probs = if let Some((block, topk)) = sparse_blocks {
+                        sparse_softmax_row(&scores, tq, block, topk, 10.0)?
+                    } else {
+                        vit_dense_softmax(&scores)
+                    };
+                    probabilities[dense_row_offset..dense_row_offset + tokens]
+                        .copy_from_slice(&probs);
+                    for d in 0..head_dim {
+                        let c = h * head_dim + d;
+                        let mut context = 0.0;
+                        for tk in 0..tokens {
+                            context += probs[tk] * v[(b * tokens + tk) * channels + c];
+                        }
+                        output[query_row * channels + c] = context;
+                    }
                 }
             }
         }
@@ -507,13 +746,14 @@ pub fn attention_forward(
         k_active,
         probabilities,
         score_active,
+        flash_lse: if flash { Some(flash_lse) } else { None },
     };
     Ok((output, cache))
 }
 
-/// Exact analytical input derivative of [`attention_forward`], returned in
-/// fused `[B,T,3N]` QKV order. The sparse block-selection decision is treated as
-/// fixed for the local derivative; unselected probabilities have zero gradient.
+/// Exact analytical input derivative of dense or online attention, returned in
+/// fused `[B,T,3N]` QKV order. The sparse block-selection decision is fixed for
+/// the local derivative; unselected probabilities have zero gradient.
 pub fn attention_backward(output_grad: &[f32], cache: &AttentionCache) -> Result<Vec<f32>, String> {
     let AttentionCache {
         batch,
@@ -528,6 +768,7 @@ pub fn attention_backward(output_grad: &[f32], cache: &AttentionCache) -> Result
         k_active,
         probabilities,
         score_active,
+        flash_lse,
     } = cache;
     let expected = batch * tokens * channels;
     if output_grad.len() != expected {
@@ -542,15 +783,46 @@ pub fn attention_backward(output_grad: &[f32], cache: &AttentionCache) -> Result
     let scale = 1.0 / (*head_dim as f32).sqrt();
     for b in 0..*batch {
         for h in 0..*heads {
-            let head_offset = (b * *heads + h) * *tokens * *tokens;
+            let head_row = b * *heads + h;
+            let dense_head_offset = if flash_lse.is_some() {
+                0
+            } else {
+                head_row * *tokens * *tokens
+            };
             for tq in 0..*tokens {
-                let row_idx = head_offset + tq * *tokens;
+                let dense_row_offset = if flash_lse.is_some() {
+                    0
+                } else {
+                    dense_head_offset + tq * *tokens
+                };
+                let query_row = b * *tokens + tq;
                 let mut dprob = vec![0.0; *tokens];
+                let mut row_probabilities = vec![0.0; *tokens];
+                let mut row_score_active = vec![false; *tokens];
                 for tk in 0..*tokens {
-                    let p = probabilities[row_idx + tk];
+                    let (p, active) = if let Some(lse) = flash_lse {
+                        let (score, active) = attention_score(
+                            q,
+                            k,
+                            query_row,
+                            b * *tokens + tk,
+                            *channels,
+                            h * *head_dim,
+                            *head_dim,
+                            scale,
+                        );
+                        ((score - lse[head_row * *tokens + tq]).exp(), active)
+                    } else {
+                        (
+                            probabilities[dense_row_offset + tk],
+                            score_active[dense_row_offset + tk],
+                        )
+                    };
+                    row_probabilities[tk] = p;
+                    row_score_active[tk] = active;
                     for d in 0..*head_dim {
                         let c = h * *head_dim + d;
-                        let dy = output_grad[(b * *tokens + tq) * *channels + c];
+                        let dy = output_grad[query_row * *channels + c];
                         let vi = (b * *tokens + tk) * *channels + c;
                         dprob[tk] += dy * v[vi];
                         dv[vi] += p * dy;
@@ -558,17 +830,17 @@ pub fn attention_backward(output_grad: &[f32], cache: &AttentionCache) -> Result
                 }
                 let dot: f32 = dprob
                     .iter()
-                    .enumerate()
-                    .map(|(tk, g)| g * probabilities[row_idx + tk])
+                    .zip(&row_probabilities)
+                    .map(|(g, p)| g * p)
                     .sum();
                 for tk in 0..*tokens {
-                    let dscore = probabilities[row_idx + tk] * (dprob[tk] - dot);
-                    if !score_active[row_idx + tk] || dscore == 0.0 {
+                    let dscore = row_probabilities[tk] * (dprob[tk] - dot);
+                    if !row_score_active[tk] || dscore == 0.0 {
                         continue;
                     }
                     for d in 0..*head_dim {
                         let c = h * *head_dim + d;
-                        let qi = (b * *tokens + tq) * *channels + c;
+                        let qi = query_row * *channels + c;
                         let ki = (b * *tokens + tk) * *channels + c;
                         dq[qi] += dscore * k[ki] * scale;
                         dk[ki] += dscore * q[qi] * scale;
@@ -1058,6 +1330,7 @@ pub struct VitGeometry {
     pub learned_pos_embed: bool,
     pub pos_init_zero: bool,
     pub msa: Option<(usize, usize)>,
+    pub flash_attention: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1237,6 +1510,22 @@ pub fn vit_forward(
     weights: &VitWeights,
     g: &VitGeometry,
 ) -> Result<(Vec<f32>, VitForwardCache), String> {
+    vit_forward_with_flash_attention(input, weights, g, attention_forward_flash)
+}
+
+/// ViT forward with an injectable standard-flash implementation. The callback
+/// is used only when `g.flash_attention` is true; normal CPU callers use
+/// [`attention_forward_flash`], while runtime backends may provide native
+/// context/LSE and build the same exact analytical-backward cache.
+pub fn vit_forward_with_flash_attention<F>(
+    input: &[f32],
+    weights: &VitWeights,
+    g: &VitGeometry,
+    mut flash_attention: F,
+) -> Result<(Vec<f32>, VitForwardCache), String>
+where
+    F: FnMut(&[f32], usize, usize, usize, usize) -> Result<(Vec<f32>, AttentionCache), String>,
+{
     let (out_h, out_w, patches) = patchify_nchw(
         input,
         g.batch,
@@ -1253,6 +1542,9 @@ pub fn vit_forward(
     }
     if !g.ln_eps.is_finite() || g.ln_eps <= 0.0 {
         return Err("vit ln_eps must be positive and finite".into());
+    }
+    if g.flash_attention && g.msa.is_some() {
+        return Err("vit flash attention and MSA are mutually exclusive".into());
     }
     let tokens_per_sample = out_h * out_w;
     let rows = g.batch * tokens_per_sample;
@@ -1288,8 +1580,11 @@ pub fn vit_forward(
         g.hidden,
         3 * g.hidden,
     )?;
-    let (context, attention) =
-        attention_forward(&qkv, g.batch, tokens_per_sample, g.hidden, g.heads, g.msa)?;
+    let (context, attention) = if g.flash_attention {
+        flash_attention(&qkv, g.batch, tokens_per_sample, g.hidden, g.heads)?
+    } else {
+        attention_forward(&qkv, g.batch, tokens_per_sample, g.hidden, g.heads, g.msa)?
+    };
     let projection = linear_forward(
         &context,
         &weights.wo,
@@ -1365,6 +1660,23 @@ pub fn vit_backward(
     weights: &VitWeights,
     cache: &VitForwardCache,
 ) -> Result<VitGradients, String> {
+    vit_backward_with_attention(output_grad, weights, cache, |d_context, _, attention| {
+        attention_backward(d_context, attention)
+    })
+}
+
+/// ViT backward with an injectable attention derivative. This permits a GPU
+/// backend to compute dQ/dK/dV while the remaining transformer derivative stays
+/// on the exact Rust host path.
+pub fn vit_backward_with_attention<F>(
+    output_grad: &[f32],
+    weights: &VitWeights,
+    cache: &VitForwardCache,
+    mut attention_backward_fn: F,
+) -> Result<VitGradients, String>
+where
+    F: FnMut(&[f32], &[f32], &AttentionCache) -> Result<Vec<f32>, String>,
+{
     let g = &cache.geometry;
     let t = cache.attention.tokens;
     let rows = g.batch * t;
@@ -1438,7 +1750,7 @@ pub fn vit_backward(
         g.hidden,
         g.hidden,
     )?;
-    let d_qkv = attention_backward(&d_context, &cache.attention)?;
+    let d_qkv = attention_backward_fn(&d_context, &cache.context, &cache.attention)?;
     let (d_ln1_output, qkv_weight, qkv_bias) = linear_backward(
         &cache.ln1_output,
         &weights.qkv_weight,
@@ -1527,6 +1839,7 @@ mod tests {
             learned_pos_embed: true,
             pos_init_zero: false,
             msa: None,
+            flash_attention: false,
         };
         let weights = VitWeights {
             patch_embed: vec![0.7, -0.4],
@@ -1579,6 +1892,38 @@ mod tests {
             VitWeights::from_blob(&modern[..modern.len() - 1], &geometry, out_h, out_w, true)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn full_vit_flash_path_matches_input_finite_differences() {
+        let (weights, mut geometry, input, seed) = tiny_vit_fixture();
+        geometry.flash_attention = true;
+        let (_, cache) = vit_forward(&input, &weights, &geometry).unwrap();
+        assert!(cache.attention.probabilities.is_empty());
+        assert!(cache.attention.score_active.is_empty());
+        let grad = vit_backward(&seed, &weights, &cache).unwrap();
+        let loss = |x: &[f32]| {
+            vit_forward(x, &weights, &geometry)
+                .unwrap()
+                .0
+                .iter()
+                .zip(&seed)
+                .map(|(y, dy)| y * dy)
+                .sum::<f32>()
+        };
+        let eps = 1e-3;
+        for i in 0..input.len() {
+            let mut plus = input.clone();
+            let mut minus = input.clone();
+            plus[i] += eps;
+            minus[i] -= eps;
+            let fd = (loss(&plus) - loss(&minus)) / (2.0 * eps);
+            assert!(
+                (grad.input[i] - fd).abs() < 2e-3,
+                "flash input[{i}] {} != {fd}",
+                grad.input[i]
+            );
+        }
     }
 
     #[test]
@@ -1832,6 +2177,96 @@ mod tests {
                 analytic[i]
             );
         }
+    }
+
+    #[test]
+    fn online_attention_matches_dense_and_recomputes_exact_gradients() {
+        let qkv: Vec<f32> = (0..36).map(|i| ((i as f32) * 0.17).sin() * 0.6).collect();
+        let upstream: Vec<f32> = (0..12).map(|i| ((i as f32) * 0.31).cos() * 0.8).collect();
+        let (dense_out, dense_cache) = attention_forward(&qkv, 1, 3, 4, 2, None).unwrap();
+        let (flash_out, flash_cache) = attention_forward_flash(&qkv, 1, 3, 4, 2).unwrap();
+        for (i, (dense, flash)) in dense_out.iter().zip(&flash_out).enumerate() {
+            assert!((dense - flash).abs() < 2e-6, "out[{i}]: {dense} != {flash}");
+        }
+        assert!(flash_cache.probabilities.is_empty());
+        assert!(flash_cache.score_active.is_empty());
+        assert_eq!(flash_cache.flash_lse.as_ref().unwrap().len(), 6);
+
+        let dense_grad = attention_backward(&upstream, &dense_cache).unwrap();
+        let flash_grad = attention_backward(&upstream, &flash_cache).unwrap();
+        for (i, (dense, flash)) in dense_grad.iter().zip(&flash_grad).enumerate() {
+            assert!(
+                (dense - flash).abs() < 3e-6,
+                "dqkv[{i}]: {dense} != {flash}"
+            );
+        }
+
+        let loss = |values: &[f32]| {
+            attention_forward_flash(values, 1, 3, 4, 2)
+                .unwrap()
+                .0
+                .iter()
+                .zip(&upstream)
+                .map(|(y, dy)| y * dy)
+                .sum::<f32>()
+        };
+        let eps = 1e-3;
+        for i in 0..qkv.len() {
+            let mut plus = qkv.clone();
+            let mut minus = qkv.clone();
+            plus[i] += eps;
+            minus[i] -= eps;
+            let fd = (loss(&plus) - loss(&minus)) / (2.0 * eps);
+            assert!(
+                (flash_grad[i] - fd).abs() < 2e-4,
+                "flash qkv[{i}] {} != {fd}",
+                flash_grad[i]
+            );
+        }
+    }
+
+    #[test]
+    fn flash_backend_inputs_preserve_nonfinite_and_saturated_qk_semantics() {
+        let qkv = [
+            200.0,
+            f32::NAN,
+            -200.0,
+            f32::INFINITY,
+            1.0,
+            2.0,
+            0.0,
+            128.0,
+            f32::NEG_INFINITY,
+            0.5,
+            3.0,
+            4.0,
+        ];
+        let (_, original_cache) = attention_forward_flash(&qkv, 1, 2, 2, 1).unwrap();
+        let backend_inputs = attention_flash_backward_inputs(&original_cache)
+            .unwrap()
+            .expect("flash cache");
+        let reconstructed_cache = attention_flash_cache_from_lse(
+            &backend_inputs.qkv,
+            backend_inputs.batch,
+            backend_inputs.tokens,
+            backend_inputs.channels,
+            backend_inputs.heads,
+            &backend_inputs.lse,
+        )
+        .unwrap();
+        assert!(backend_inputs.qkv[1].is_nan());
+        assert!(backend_inputs.qkv[3].is_nan());
+        assert_eq!(backend_inputs.qkv[0], 128.0);
+        assert_eq!(backend_inputs.qkv[2], -128.0);
+        assert_eq!(backend_inputs.qkv[7], 128.0);
+        assert_eq!(backend_inputs.qkv[4], 1.0);
+        assert_eq!(backend_inputs.qkv[5], 2.0);
+        assert_eq!(backend_inputs.qkv[10], 3.0);
+        assert_eq!(backend_inputs.qkv[11], 4.0);
+        let upstream = [0.2, -0.3, 0.4, 0.1];
+        let original_grad = attention_backward(&upstream, &original_cache).unwrap();
+        let reconstructed_grad = attention_backward(&upstream, &reconstructed_cache).unwrap();
+        assert_eq!(original_grad, reconstructed_grad);
     }
 
     #[test]

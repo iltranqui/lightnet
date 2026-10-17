@@ -18,7 +18,10 @@ pub fn dropout_unit(seed: u64, index: u64) -> f32 {
 
 /// Softmax over every contiguous `group_size` run of `x`.
 pub fn softmax(x: &[f32], group_size: usize) -> Vec<f32> {
-    assert!(group_size > 0 && x.len() % group_size == 0, "softmax: bad group size");
+    assert!(
+        group_size > 0 && x.len() % group_size == 0,
+        "softmax: bad group size"
+    );
     let mut out = vec![0.0f32; x.len()];
     for (src, dst) in x.chunks(group_size).zip(out.chunks_mut(group_size)) {
         let max = src.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -36,6 +39,234 @@ pub fn softmax(x: &[f32], group_size: usize) -> Vec<f32> {
     out
 }
 
+/// Online-softmax attention for fused QKV `[batch, tokens, 3*channels]`.
+/// Returns context `[batch, tokens, channels]` and natural-log LSE
+/// `[batch, heads, tokens]`; no score/probability matrix is materialized.
+pub fn flash_attention_forward(
+    qkv: &[f32],
+    batch: usize,
+    tokens: usize,
+    channels: usize,
+    heads: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    assert!(
+        batch > 0 && tokens > 0 && channels > 0 && heads > 0 && channels % heads == 0,
+        "flash_attention_forward: invalid dimensions"
+    );
+    let rows = batch * tokens;
+    let head_dim = channels / heads;
+    assert_eq!(
+        qkv.len(),
+        rows * 3 * channels,
+        "flash_attention_forward: QKV length"
+    );
+    let mut output = vec![0.0f32; rows * channels];
+    let mut lse = vec![0.0f32; batch * heads * tokens];
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    for b in 0..batch {
+        for h in 0..heads {
+            let head_start = h * head_dim;
+            for tq in 0..tokens {
+                let query_row = b * tokens + tq;
+                let q_base = query_row * 3 * channels + head_start;
+                let mut q = vec![0.0f32; head_dim];
+                for d in 0..head_dim {
+                    let raw = qkv[q_base + d];
+                    q[d] = if raw.is_finite() {
+                        raw.clamp(-128.0, 128.0)
+                    } else {
+                        0.0
+                    };
+                }
+                let mut running_max = f32::NEG_INFINITY;
+                let mut running_sum = 0.0f32;
+                let mut acc = vec![0.0f32; head_dim];
+                for tk in 0..tokens {
+                    let key_row = b * tokens + tk;
+                    let k_base = key_row * 3 * channels + channels + head_start;
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        let raw = qkv[k_base + d];
+                        let k = if raw.is_finite() {
+                            raw.clamp(-128.0, 128.0)
+                        } else {
+                            0.0
+                        };
+                        dot += q[d] * k;
+                    }
+                    let raw_score = dot * scale;
+                    let score = if raw_score.is_nan() {
+                        0.0
+                    } else if raw_score > 10.0 {
+                        10.0
+                    } else if raw_score < -10.0 {
+                        -10.0
+                    } else {
+                        raw_score
+                    };
+                    let new_max = running_max.max(score);
+                    let correction = (running_max - new_max).exp();
+                    let p = (score - new_max).exp();
+                    running_sum = running_sum * correction + p;
+                    let v_base = key_row * 3 * channels + 2 * channels + head_start;
+                    for d in 0..head_dim {
+                        acc[d] = acc[d] * correction + p * qkv[v_base + d];
+                    }
+                    running_max = new_max;
+                }
+                for d in 0..head_dim {
+                    output[query_row * channels + head_start + d] = acc[d] / running_sum;
+                }
+                lse[(b * heads + h) * tokens + tq] = running_max + running_sum.ln();
+            }
+        }
+    }
+    (output, lse)
+}
+
+/// Recompute-based derivative of [`flash_attention_forward`] in fused
+/// `[batch, tokens, 3*channels]` QKV order. `context` and `lse` are the forward
+/// results; probabilities and the score matrix are not retained.
+pub fn flash_attention_backward(
+    qkv: &[f32],
+    context: &[f32],
+    output_grad: &[f32],
+    lse: &[f32],
+    batch: usize,
+    tokens: usize,
+    channels: usize,
+    heads: usize,
+) -> Vec<f32> {
+    assert!(
+        batch > 0 && tokens > 0 && channels > 0 && heads > 0 && channels % heads == 0,
+        "flash_attention_backward: invalid dimensions"
+    );
+    let rows = batch * tokens;
+    let elements = rows * channels;
+    assert_eq!(
+        qkv.len(),
+        elements * 3,
+        "flash_attention_backward: QKV length"
+    );
+    assert_eq!(
+        context.len(),
+        elements,
+        "flash_attention_backward: context length"
+    );
+    assert_eq!(
+        output_grad.len(),
+        elements,
+        "flash_attention_backward: gradient length"
+    );
+    assert_eq!(
+        lse.len(),
+        batch * heads * tokens,
+        "flash_attention_backward: LSE length"
+    );
+    let head_dim = channels / heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut dq = vec![0.0f32; elements];
+    let mut dk = vec![0.0f32; elements];
+    let mut dv = vec![0.0f32; elements];
+
+    for b in 0..batch {
+        for h in 0..heads {
+            let head_start = h * head_dim;
+            for tq in 0..tokens {
+                let query_row = b * tokens + tq;
+                let q_base = query_row * 3 * channels + head_start;
+                let do_base = query_row * channels + head_start;
+                let mut row_dot = 0.0f32;
+                for d in 0..head_dim {
+                    row_dot += output_grad[do_base + d] * context[do_base + d];
+                }
+                let mut q = vec![0.0f32; head_dim];
+                for d in 0..head_dim {
+                    let raw = qkv[q_base + d];
+                    q[d] = if raw.is_finite() {
+                        raw.clamp(-128.0, 128.0)
+                    } else {
+                        0.0
+                    };
+                }
+                for tk in 0..tokens {
+                    let key_row = b * tokens + tk;
+                    let k_base = key_row * 3 * channels + channels + head_start;
+                    let v_base = key_row * 3 * channels + 2 * channels + head_start;
+                    let kv_base = key_row * channels + head_start;
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        let raw = qkv[k_base + d];
+                        let k = if raw.is_finite() {
+                            raw.clamp(-128.0, 128.0)
+                        } else {
+                            0.0
+                        };
+                        dot += q[d] * k;
+                    }
+                    let raw_score = dot * scale;
+                    let score_active = raw_score.is_finite() && raw_score.abs() < 10.0;
+                    let score = if raw_score.is_nan() {
+                        0.0
+                    } else if raw_score > 10.0 {
+                        10.0
+                    } else if raw_score < -10.0 {
+                        -10.0
+                    } else {
+                        raw_score
+                    };
+                    let row_index = (b * heads + h) * tokens + tq;
+                    let p = (score - lse[row_index]).exp();
+                    let mut dprob = 0.0f32;
+                    for d in 0..head_dim {
+                        dprob += output_grad[do_base + d] * qkv[v_base + d];
+                    }
+                    let dscore = p * (dprob - row_dot);
+                    for d in 0..head_dim {
+                        dv[kv_base + d] += p * output_grad[do_base + d];
+                        if score_active {
+                            let raw_q = qkv[q_base + d];
+                            let raw_k = qkv[k_base + d];
+                            if raw_q.is_finite() && raw_q.abs() < 128.0 {
+                                let k = if raw_k.is_finite() {
+                                    raw_k.clamp(-128.0, 128.0)
+                                } else {
+                                    0.0
+                                };
+                                dq[query_row * channels + head_start + d] += dscore * k * scale;
+                            }
+                            if raw_k.is_finite() && raw_k.abs() < 128.0 {
+                                dk[kv_base + d] += dscore * q[d] * scale;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut dqkv = vec![0.0f32; elements * 3];
+    for row in 0..rows {
+        for c in 0..channels {
+            let raw_q = qkv[row * 3 * channels + c];
+            let raw_k = qkv[row * 3 * channels + channels + c];
+            let i = row * channels + c;
+            dqkv[row * 3 * channels + c] = if raw_q.is_finite() && raw_q.abs() < 128.0 {
+                dq[i]
+            } else {
+                0.0
+            };
+            dqkv[row * 3 * channels + channels + c] = if raw_k.is_finite() && raw_k.abs() < 128.0 {
+                dk[i]
+            } else {
+                0.0
+            };
+            dqkv[row * 3 * channels + 2 * channels + c] = dv[i];
+        }
+    }
+    dqkv
+}
+
 /// Darknet's mismatched-shape shortcut layout (`shortcut_multilayer_*`): per
 /// batch sample the flat vector of `x.len() / batch` elements is cropped or
 /// zero-padded to `to_len` elements (`src_i < min(from, to)` is copied).
@@ -47,7 +278,8 @@ pub fn shortcut_fit(x: &[f32], batch: usize, to_len: usize) -> Vec<f32> {
     let copied = from_len.min(to_len);
     let mut out = vec![0.0f32; batch * to_len];
     for b in 0..batch {
-        out[b * to_len..b * to_len + copied].copy_from_slice(&x[b * from_len..b * from_len + copied]);
+        out[b * to_len..b * to_len + copied]
+            .copy_from_slice(&x[b * from_len..b * from_len + copied]);
     }
     out
 }
@@ -111,7 +343,11 @@ pub fn reorg_dims(
             "reorg: bad stride {stride} or shapes {input_shape:?} -> {output_shape:?}"
         ));
     }
-    let (big, small) = if reverse { (output_shape, input_shape) } else { (input_shape, output_shape) };
+    let (big, small) = if reverse {
+        (output_shape, input_shape)
+    } else {
+        (input_shape, output_shape)
+    };
     let d = ReorgDims {
         batch: big[0],
         cb: big[1],
@@ -154,7 +390,8 @@ pub fn reorg_to_small(big: &[f32], d: &ReorgDims) -> Vec<f32> {
         for k in 0..cs {
             for j in 0..d.hs {
                 for i in 0..d.ws {
-                    small[((b * cs + k) * d.hs + j) * d.ws + i] = big[reorg_big_index(d, b, k, j, i)];
+                    small[((b * cs + k) * d.hs + j) * d.ws + i] =
+                        big[reorg_big_index(d, b, k, j, i)];
                 }
             }
         }
@@ -172,7 +409,8 @@ pub fn reorg_to_big(small: &[f32], d: &ReorgDims) -> Vec<f32> {
         for k in 0..cs {
             for j in 0..d.hs {
                 for i in 0..d.ws {
-                    big[reorg_big_index(d, b, k, j, i)] = small[((b * cs + k) * d.hs + j) * d.ws + i];
+                    big[reorg_big_index(d, b, k, j, i)] =
+                        small[((b * cs + k) * d.hs + j) * d.ws + i];
                 }
             }
         }
@@ -183,10 +421,19 @@ pub fn reorg_to_big(small: &[f32], d: &ReorgDims) -> Vec<f32> {
 /// Element-wise `x * mask` plus the mask itself (`0` below `probability`,
 /// `1 / (1 - probability)` otherwise).
 pub fn dropout(x: &[f32], probability: f32, seed: u64) -> (Vec<f32>, Vec<f32>) {
-    assert!((0.0..1.0).contains(&probability), "dropout: probability must be in [0, 1)");
+    assert!(
+        (0.0..1.0).contains(&probability),
+        "dropout: probability must be in [0, 1)"
+    );
     let scale = 1.0 / (1.0 - probability);
     let mask: Vec<f32> = (0..x.len())
-        .map(|i| if dropout_unit(seed, i as u64) < probability { 0.0 } else { scale })
+        .map(|i| {
+            if dropout_unit(seed, i as u64) < probability {
+                0.0
+            } else {
+                scale
+            }
+        })
         .collect();
     let out = x.iter().zip(&mask).map(|(v, m)| v * m).collect();
     (out, mask)
@@ -310,7 +557,10 @@ pub fn constrain(x: &[f32], limit: f32) -> Vec<f32> {
 /// contiguous filter of `f_size` values.  Like C++ it only runs when
 /// `f_size % 32 == 0`, otherwise the input is returned unchanged.
 pub fn gradient_centralization(x: &[f32], f_size: usize) -> Vec<f32> {
-    assert!(f_size > 0 && x.len() % f_size == 0, "gradient_centralization: bad filter size");
+    assert!(
+        f_size > 0 && x.len() % f_size == 0,
+        "gradient_centralization: bad filter size"
+    );
     let mut out = x.to_vec();
     if f_size % 32 != 0 {
         return out;
@@ -557,9 +807,17 @@ pub fn eml_convolutional_forward(
 ) -> Vec<f32> {
     let clamp = if clamp > 0.0 { clamp } else { 4.0 };
     let eps = if eps > 0.0 { eps } else { 1.0e-6 };
-    assert_eq!(x_branch.len(), self_branch.len(), "EML branch lengths differ");
+    assert_eq!(
+        x_branch.len(),
+        self_branch.len(),
+        "EML branch lengths differ"
+    );
     if let Some(residual) = residual {
-        assert_eq!(residual.len(), x_branch.len(), "EML residual length differs");
+        assert_eq!(
+            residual.len(),
+            x_branch.len(),
+            "EML residual length differs"
+        );
     }
     x_branch
         .iter()
@@ -585,7 +843,11 @@ pub fn eml_convolutional_backward(
 ) -> (Vec<f32>, Vec<f32>) {
     let clamp = if clamp > 0.0 { clamp } else { 4.0 };
     let eps = if eps > 0.0 { eps } else { 1.0e-6 };
-    assert_eq!(x_branch.len(), self_branch.len(), "EML branch lengths differ");
+    assert_eq!(
+        x_branch.len(),
+        self_branch.len(),
+        "EML branch lengths differ"
+    );
     assert_eq!(x_branch.len(), delta.len(), "EML delta length differs");
     let mut x_gradient = Vec::with_capacity(delta.len());
     let mut self_gradient = Vec::with_capacity(delta.len());
@@ -616,11 +878,21 @@ fn channel_normalization_len(batch: usize, channels: usize, spatial: usize) -> u
 fn scale_index(i: usize, channels: usize, hw: usize, scale_wh: bool) -> usize {
     let b = i / (channels * hw);
     let r = i % (channels * hw);
-    if scale_wh { b * hw + r % hw } else { b * channels + r / hw }
+    if scale_wh {
+        b * hw + r % hw
+    } else {
+        b * channels + r / hw
+    }
 }
 
 /// `out = scale (broadcast) * source`.
-pub fn scale_channels(scale: &[f32], source: &[f32], channels: usize, hw: usize, scale_wh: bool) -> Vec<f32> {
+pub fn scale_channels(
+    scale: &[f32],
+    source: &[f32],
+    channels: usize,
+    hw: usize,
+    scale_wh: bool,
+) -> Vec<f32> {
     source
         .iter()
         .enumerate()
@@ -648,7 +920,14 @@ pub fn scale_channels_backward(
 }
 
 /// `out[b, o] = sum_i x[b, i] * w[o, i] + bias[o]` (weights are `[outputs][inputs]`).
-pub fn connected(x: &[f32], w: &[f32], bias: &[f32], batch: usize, inputs: usize, outputs: usize) -> Vec<f32> {
+pub fn connected(
+    x: &[f32],
+    w: &[f32],
+    bias: &[f32],
+    batch: usize,
+    inputs: usize,
+    outputs: usize,
+) -> Vec<f32> {
     assert!(x.len() == batch * inputs && w.len() == outputs * inputs && bias.len() == outputs);
     let mut out = vec![0.0f32; batch * outputs];
     for b in 0..batch {
@@ -672,7 +951,9 @@ pub fn connected_backward(
     inputs: usize,
     outputs: usize,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    assert!(x.len() == batch * inputs && w.len() == outputs * inputs && delta.len() == batch * outputs);
+    assert!(
+        x.len() == batch * inputs && w.len() == outputs * inputs && delta.len() == batch * outputs
+    );
     let mut dx = vec![0.0f32; batch * inputs];
     let mut dw = vec![0.0f32; outputs * inputs];
     let mut db = vec![0.0f32; outputs];
@@ -704,7 +985,12 @@ pub struct BatchNormTrainHost {
     pub rolling_variance: Vec<f32>,
 }
 
-fn per_channel_sums(x: &[f32], channels: usize, spatial: usize, f: impl Fn(usize, f32) -> f32) -> Vec<f32> {
+fn per_channel_sums(
+    x: &[f32],
+    channels: usize,
+    spatial: usize,
+    f: impl Fn(usize, f32) -> f32,
+) -> Vec<f32> {
     let mut sums = vec![0.0f32; channels];
     for (i, v) in x.iter().enumerate() {
         let c = (i / spatial) % channels;
@@ -728,7 +1014,10 @@ pub fn batchnorm_train_forward(
     spatial: usize,
     keep: f32,
 ) -> BatchNormTrainHost {
-    assert!(channels > 0 && spatial > 0 && x.len() % (channels * spatial) == 0, "batchnorm: bad layout");
+    assert!(
+        channels > 0 && spatial > 0 && x.len() % (channels * spatial) == 0,
+        "batchnorm: bad layout"
+    );
     assert!(
         scales.len() == channels
             && biases.len() == channels
@@ -755,7 +1044,9 @@ pub fn batchnorm_train_forward(
     BatchNormTrainHost {
         output,
         x_hat,
-        rolling_mean: (0..channels).map(|c| keep * rolling_mean[c] + update * mean[c]).collect(),
+        rolling_mean: (0..channels)
+            .map(|c| keep * rolling_mean[c] + update * mean[c])
+            .collect(),
         rolling_variance: (0..channels)
             .map(|c| keep * rolling_variance[c] + update * (sum_sq[c] * unbiased))
             .collect(),
@@ -829,14 +1120,28 @@ impl AdamParams {
             (self.decay * self.batch.max(1) as f32, 0.0)
         };
         let t = self.step.max(1) as f32;
-        (coupled, decoupled, 1.0 - self.beta1.powf(t), 1.0 - self.beta2.powf(t))
+        (
+            coupled,
+            decoupled,
+            1.0 - self.beta1.powf(t),
+            1.0 - self.beta2.powf(t),
+        )
     }
 }
 
 /// Darknet Adam step (updates `u` point downhill, so `w += lr * mhat / (sqrt(vhat) + eps)`).
 /// Returns `(w', m', v')`; the caller resets `u` to zero like C++.
-pub fn adam_update(w: &[f32], u: &[f32], m: &[f32], v: &[f32], p: &AdamParams) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    assert!(w.len() == u.len() && w.len() == m.len() && w.len() == v.len(), "adam: length mismatch");
+pub fn adam_update(
+    w: &[f32],
+    u: &[f32],
+    m: &[f32],
+    v: &[f32],
+    p: &AdamParams,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    assert!(
+        w.len() == u.len() && w.len() == m.len() && w.len() == v.len(),
+        "adam: length mismatch"
+    );
     let (coupled, decoupled, bc1, bc2) = p.kernel_scalars();
     let mut w_out = vec![0.0f32; w.len()];
     let mut m_out = vec![0.0f32; w.len()];
@@ -882,7 +1187,10 @@ pub fn sanitize_nan_inf(x: &[f32], mode: NanInfMode) -> Vec<f32> {
 /// `[channel_shuffle]`; swapping `rows`/`cols` gives the exact inverse (the backward pass).
 pub fn channel_permute(x: &[f32], batch: usize, rows: usize, cols: usize, len: usize) -> Vec<f32> {
     let per = rows * cols * len;
-    assert!(per > 0 && x.len() == batch * per, "channel_permute: bad shape");
+    assert!(
+        per > 0 && x.len() == batch * per,
+        "channel_permute: bad shape"
+    );
     let mut out = vec![0.0f32; x.len()];
     for b in 0..batch {
         for i in 0..rows {
@@ -933,7 +1241,10 @@ pub fn layernorm(
     beta: Option<&[f32]>,
     eps: f32,
 ) -> Vec<f32> {
-    assert!(rows > 0 && cols > 0 && x.len() >= rows * cols, "layernorm: bad shape");
+    assert!(
+        rows > 0 && cols > 0 && x.len() >= rows * cols,
+        "layernorm: bad shape"
+    );
     let mut out = vec![0.0f32; rows * cols];
     let inv_c = 1.0 / cols as f32;
     for r in 0..rows {
@@ -983,7 +1294,10 @@ pub fn layernorm_backward(
     eps: f32,
 ) -> Vec<f32> {
     assert!(rows > 0 && cols > 0, "layernorm_backward: bad shape");
-    assert!(dy.len() >= rows * cols && x.len() >= rows * cols, "layernorm_backward: bad shape");
+    assert!(
+        dy.len() >= rows * cols && x.len() >= rows * cols,
+        "layernorm_backward: bad shape"
+    );
     let mut dx = vec![0.0f32; rows * cols];
     let inv_c = 1.0 / cols as f32;
     for r in 0..rows {
@@ -1040,7 +1354,11 @@ mod layernorm_tests {
         let out = layernorm(&x, 2, 4, Some(&gamma), None, 1e-5);
         let expect = |v: f32, mean: f32, var: f32| 2.0 * (v - mean) / (var + 1e-5).sqrt();
         assert!((out[0] - expect(1.0, 2.5, 1.25)).abs() < 1e-5, "{}", out[0]);
-        assert!((out[7] - expect(40.0, 25.0, 125.0)).abs() < 1e-5, "{}", out[7]);
+        assert!(
+            (out[7] - expect(40.0, 25.0, 125.0)).abs() < 1e-5,
+            "{}",
+            out[7]
+        );
         // Non-finite inputs are treated as zero.
         let dirty = [f32::NAN, 1.0, f32::INFINITY, 3.0];
         let out = layernorm(&dirty, 1, 4, None, None, 1e-5);
@@ -1069,7 +1387,11 @@ mod layernorm_tests {
             };
             let numeric = (f(&hi) - f(&lo)) / (2.0 * eps);
             let slack = 2e-2 * dx[i].abs().max(1e-2);
-            assert!((numeric - dx[i]).abs() <= slack, "i={i}: numeric {numeric} analytic {}", dx[i]);
+            assert!(
+                (numeric - dx[i]).abs() <= slack,
+                "i={i}: numeric {numeric} analytic {}",
+                dx[i]
+            );
         }
     }
 
@@ -1128,12 +1450,18 @@ pub fn residual_bias(
     cols: usize,
 ) -> Vec<f32> {
     let len = rows * cols;
-    assert!(residual.len() >= len && y.len() >= len, "residual_bias: bad shape");
+    assert!(
+        residual.len() >= len && y.len() >= len,
+        "residual_bias: bad shape"
+    );
     let mut out = vec![0.0f32; len];
     for i in 0..len {
         let b = match bias {
             Some(bias) => {
-                assert!(bias.len() >= cols, "residual_bias: bias must have cols entries");
+                assert!(
+                    bias.len() >= cols,
+                    "residual_bias: bias must have cols entries"
+                );
                 bias[i % cols]
             }
             None => 0.0,
@@ -1153,7 +1481,10 @@ mod residual_bias_tests {
         let y = [0.0f32; 6];
         let bias = [10.0f32, 20.0];
         // rows = 3, cols = 2 -> the pattern repeats with period `cols`.
-        assert_eq!(residual_bias(&residual, &y, Some(&bias), 3, 2), vec![11.0, 21.0, 11.0, 21.0, 11.0, 21.0]);
+        assert_eq!(
+            residual_bias(&residual, &y, Some(&bias), 3, 2),
+            vec![11.0, 21.0, 11.0, 21.0, 11.0, 21.0]
+        );
         // No bias is a plain residual add.
         assert_eq!(residual_bias(&residual, &y, None, 3, 2), residual);
     }
@@ -1189,9 +1520,18 @@ pub fn linear(
     weights: &[f32],
     bias: Option<&[f32]>,
 ) -> Vec<f32> {
-    assert!(rows > 0 && in_features > 0 && out_features > 0, "linear: bad shape");
-    assert!(x.len() >= rows * in_features, "linear: activation too short");
-    assert!(weights.len() >= out_features * in_features, "linear: weights too short");
+    assert!(
+        rows > 0 && in_features > 0 && out_features > 0,
+        "linear: bad shape"
+    );
+    assert!(
+        x.len() >= rows * in_features,
+        "linear: activation too short"
+    );
+    assert!(
+        weights.len() >= out_features * in_features,
+        "linear: weights too short"
+    );
     let mut out = vec![0.0f32; rows * out_features];
     for r in 0..rows {
         let x_row = &x[r * in_features..(r + 1) * in_features];
