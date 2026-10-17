@@ -56,6 +56,7 @@ file is named inline.
 - [21. WMHF Stage-1 CPU reference](#21-wmhf-stage-1-cpu-reference)
 - [22. CPU Muon hybrid optimizer](#22-cpu-muon-hybrid-optimizer)
 - [23. Clifford Stage-1 CPU reference](#23-clifford-stage-1-cpu-reference)
+- [24. Recursive-block Stage-1 CPU reference](#24-recursive-block-stage-1-cpu-reference)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -806,6 +807,13 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 - Added seeded source-scale initialization; exact source-order `.weights` load/save; training forward/backward with internal depthwise BN and rolling-stat updates; SGD, AdamW, and Muon matrix mappings (with AdamW fallback for non-matrix parameters). DNOPT host-Adam/Muon state round trips validate nested state; GPU full/compact execution and updates reject explicitly in Stage 1.
 - Verification: `MEM=3G ./tools/test_host.sh clifford_` passed 13 tests, `weights` passed 44, and `runtime` passed 208. The Clifford tests cover finite differences for input and trainable parameters across avgpool+DropPath, Fourier, inner/abs/local, and wedge/global modes; exact weight bytes/round-trip; seeded initialization; optimizer updates/state; BN stats; and GPU rejection. Targeted Rustfmt and `git diff --check` passed. No training, Oxide tests, or `cfg_corpus` run.
 - Evidence boundary: no compiled-C++ golden exists and no compiled-C++ parity is claimed. Clifford is Stage-1 CPU-only; `recursive_block` remains open and native GPU support/GPU Muon belong to Stage 2.
+
+## 24. Recursive-block Stage-1 CPU reference
+
+- v0.1.007 (`94513d426c190ab8b7fb012ee3bf0b5f68ff5e55`): integrated `[recursive_block]` / `[recurrent_block]` with nested body-section consumption, strict option/shape validation, deterministic initialization, per-pass body tapes/dropout masks, and nested BN rolling-stat updates. CPU forward covers static recurrence, controller-gated `ouroboros=1`, and lattice projection; backward is exact for the Rust forward across the full unrolled recurrence, controller, and lattice. SGD, AdamW, Muon traversal/state validation, body-only C++ `.weights` order, and explicit GPU/compact/update rejection are included.
+- C++ `.weights` omits controller weights/biases (and LoRA values), so controller learning is not restored by Darknet checkpoints. Stage-1 rejects `ouroboros=2` and every explicit `lora_*` option. Rust full BPTT and lattice derivatives intentionally differ from C++ truncated k=1 backward and stop-gradient lattice behavior.
+- Verification: `MEM=3G ./tools/test_host.sh recursive_block` passed 11 core tests, `weights` passed 45 core + 2 CLI tests, `runtime` passed 219 core tests, and `MEM=3G cargo check -p darknet-core -j 4` passed. Tests include all-trainable finite differences for static/controller/lattice branches, dropout mask reproducibility/independence, nested BN running stats, exact body-only weight bytes, optimizer state validation, Muon matrix ordering, and GPU rejection. Targeted rustfmt and `git diff --check` passed. No training, Oxide tests, or feature-specific `cfg_corpus` run; the full host baseline/cfg-corpus status remains non-green/unverified under the memory cap (see `STATUS.md`).
+- Evidence boundary: hand-derived from `Jev_laya`; there is no compiled-C++ golden/parity. CPU-only Stage-1 support is complete for this layer; native GPU and GPU Muon remain Stage 2.
 
 ## Not implemented / open (pointer)
 
