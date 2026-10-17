@@ -304,6 +304,33 @@ pub fn initialize_training_params(network: &Network, params: &mut [LayerParams],
                 p.scan_weights[channels..2 * channels].fill(1.0);
                 p.scan_weights[2 * channels..3 * channels].fill(1.0);
             }
+            LayerParams::Clifford(p) => {
+                let crate::LayerKind::Clifford(spec) = &layer.kind else {
+                    unreachable!("Clifford parameters require a Clifford layer");
+                };
+                let channels = layer.input_shape.channels;
+                p.layer_norm_gamma.fill(1.0);
+                p.layer_norm_beta.fill(0.0);
+                p.determinant_biases.fill(0.0);
+                rng.weights_with_scale(
+                    &mut p.determinant_weights,
+                    (2.0 / (2 * channels).max(1) as f32).sqrt(),
+                );
+                for conv_params in &mut p.depthwise {
+                    conv(conv_params, &mut rng);
+                }
+                initialize_clifford_branch(&mut p.local, channels, spec, &mut rng);
+                p.layer_scale.fill(spec.layerscale_init);
+                if let Some(global) = &mut p.global {
+                    initialize_clifford_branch(global, channels, spec, &mut rng);
+                }
+                if let Some(fourier) = &mut p.fourier {
+                    let modes = spec.fno_modes_h * spec.fno_modes_w;
+                    let scale = (2.0 / (modes + channels).max(1) as f32).sqrt();
+                    rng.weights_with_scale(&mut fourier.real, scale);
+                    rng.weights_with_scale(&mut fourier.imaginary, scale);
+                }
+            }
             LayerParams::DeformConv(p) => {
                 let crate::LayerKind::DeformConv(_) = &layer.kind else {
                     unreachable!("deform_conv parameters require a deform_conv layer");
@@ -374,6 +401,20 @@ fn connected(p: &mut ConnectedParams, rng: &mut Rng) {
         bn(p);
     }
 }
+fn initialize_clifford_branch(
+    branch: &mut crate::clifford::CliffordBranchParams,
+    channels: usize,
+    spec: &crate::model::CliffordSpec,
+    rng: &mut Rng,
+) {
+    let raw_channels = crate::clifford::raw_channels(spec, channels);
+    let projection_scale = (2.0 / (raw_channels + channels).max(1) as f32).sqrt();
+    rng.weights_with_scale(&mut branch.projection_weights, projection_scale);
+    branch.projection_biases.fill(0.0);
+    let gate_scale = (2.0 / (3 * channels).max(1) as f32).sqrt();
+    rng.weights_with_scale(&mut branch.gate_weights, gate_scale);
+    branch.gate_biases.fill(0.0);
+}
 struct Rng(u64);
 impl Rng {
     fn weights(&mut self, weights: &mut [f32], fan_in: usize) {
@@ -400,7 +441,82 @@ impl Rng {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ConfigFile, ExecutableNetwork};
+    use crate::{ConfigFile, ExecutableNetwork, LayerParams, Network};
+
+    #[test]
+    fn clifford_initialization_is_seeded_and_uses_source_scales() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "clifford-init.cfg",
+                r#"[net]
+width=2
+height=2
+channels=3
+[clifford]
+filters=3
+shifts=1,2
+cli_mode=full
+gffn_mode=hybrid
+global_op=fourier
+fno_modes_h=2
+fno_modes_w=2
+dwconv_size=1
+num_dwconv=1
+layerscale=0.01
+"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut first = ExecutableNetwork::new(network.clone());
+        let mut second = ExecutableNetwork::new(network.clone());
+        initialize_training_params(&network, &mut first.params, 29);
+        initialize_training_params(&network, &mut second.params, 29);
+        assert_eq!(first.params, second.params);
+        let LayerParams::Clifford(params) = &first.params[0] else {
+            panic!("Clifford parameters")
+        };
+        initialize_training_params(&network, &mut second.params, 30);
+        let LayerParams::Clifford(other_seed) = &second.params[0] else {
+            unreachable!()
+        };
+        assert_ne!(params.determinant_weights, other_seed.determinant_weights);
+        assert_eq!(params.layer_norm_gamma, vec![1.0; 3]);
+        assert_eq!(params.layer_norm_beta, vec![0.0; 3]);
+        assert_eq!(params.layer_scale, vec![0.01; 3]);
+        let spec = match &network.layers[0].kind {
+            crate::LayerKind::Clifford(spec) => spec,
+            _ => unreachable!(),
+        };
+        let raw_channels = crate::clifford::raw_channels(spec, 3);
+        let det_scale = (2.0f32 / 6.0).sqrt();
+        let projection_scale = (2.0f32 / (raw_channels + 3) as f32).sqrt();
+        let gate_scale = (2.0f32 / 9.0).sqrt();
+        let fourier_scale = (2.0f32 / 7.0).sqrt();
+        for (weights, scale) in [
+            (&params.determinant_weights, det_scale),
+            (&params.local.projection_weights, projection_scale),
+            (&params.local.gate_weights, gate_scale),
+            (
+                &params.global.as_ref().unwrap().projection_weights,
+                projection_scale,
+            ),
+            (&params.global.as_ref().unwrap().gate_weights, gate_scale),
+            (&params.fourier.as_ref().unwrap().real, fourier_scale),
+            (&params.fourier.as_ref().unwrap().imaginary, fourier_scale),
+        ] {
+            assert!(weights.iter().all(|weight| weight.abs() <= scale));
+            assert!(weights.iter().any(|weight| *weight != 0.0));
+        }
+        let conv = &params.depthwise[0];
+        assert!(conv.biases.iter().all(|value| *value == 0.0));
+        assert!(conv.weights.iter().any(|value| *value != 0.0));
+        let bn = conv.batch_norm.as_ref().unwrap();
+        assert_eq!(bn.scales, vec![1.0; 3]);
+        assert_eq!(bn.rolling_mean, vec![0.0; 3]);
+        assert_eq!(bn.rolling_variance, vec![0.0; 3]);
+    }
+
     #[test]
     fn dcnv4_initialization_zeros_projection_and_sets_mask_prior() {
         for (softmax, expected_mask) in [(false, 1.0), (true, 0.0)] {

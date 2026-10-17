@@ -22,6 +22,10 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
+use crate::clifford::{
+    CliffordBranchParams, CliffordBranchTrainBuffers, CliffordParams, CliffordRuntimeCache,
+    CliffordTrainBuffers,
+};
 use crate::error::{Error, Result};
 use crate::image::PlanarRgbImage;
 use crate::maxpool_depth::{backward_maxpool_depth, forward_maxpool_depth};
@@ -322,6 +326,7 @@ pub enum LayerParams {
     DeformConv(DeformConvParams),
     DsConv(DsConvParams),
     Wmhf(WmhfParams),
+    Clifford(CliffordParams),
 }
 
 /// The parameters of one `[moe_convolutional]` layer.
@@ -516,6 +521,7 @@ pub enum LayerTrainBuffers {
     DeformConv(DeformConvTrainBuffers),
     DsConv(DsConvTrainBuffers),
     Wmhf(WmhfTrainBuffers),
+    Clifford(CliffordTrainBuffers),
     Vit(VitTrainBuffers),
     Swin(SwinTrainBuffers),
     TuckerAttention(TuckerAttentionTrainBuffers),
@@ -699,6 +705,7 @@ pub struct ForwardResult {
     pub(crate) dsconv_caches: Vec<Option<DsConvRuntimeCache>>,
     pub(crate) graph_conv_caches: Vec<Option<GraphConvRuntimeCache>>,
     pub(crate) wmhf_caches: Vec<Option<WmhfRuntimeCache>>,
+    pub(crate) clifford_caches: Vec<Option<CliffordRuntimeCache>>,
     pub vit_caches: Vec<Option<crate::vit::VitForwardCache>>,
     pub swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>>,
     pub tucker_attention_caches: Vec<Option<crate::tucker_attention::TuckerAttentionForwardCache>>,
@@ -732,6 +739,7 @@ impl ForwardResult {
             dsconv_caches: Vec::new(),
             graph_conv_caches: Vec::new(),
             wmhf_caches: Vec::new(),
+            clifford_caches: Vec::new(),
             vit_caches: Vec::new(),
             swin_caches: Vec::new(),
             tucker_attention_caches: Vec::new(),
@@ -1655,6 +1663,20 @@ impl ExecutableNetwork {
                         batch,
                     );
                 }
+                (LayerParams::Clifford(params), LayerTrainBuffers::Clifford(train)) => {
+                    let LayerKind::Clifford(spec) = &self.network.layers[layer_index].kind else {
+                        unreachable!("Clifford params are owned by a Clifford layer");
+                    };
+                    update_clifford_params(
+                        spec,
+                        params,
+                        train,
+                        lr * opts.learning_rate_scale,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                }
                 (LayerParams::GraphConv(params), LayerTrainBuffers::GraphConv(train)) => {
                     let layer_lr = lr * opts.learning_rate_scale;
                     update_convolutional_params(
@@ -2250,6 +2272,7 @@ impl ExecutableNetwork {
         let mut dsconv_caches = Vec::with_capacity(self.network.layers.len());
         let mut graph_conv_caches = Vec::with_capacity(self.network.layers.len());
         let mut wmhf_caches = Vec::with_capacity(self.network.layers.len());
+        let mut clifford_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches = Vec::with_capacity(self.network.layers.len());
         let mut swin_caches = Vec::with_capacity(self.network.layers.len());
         let mut tucker_attention_caches = Vec::with_capacity(self.network.layers.len());
@@ -2285,6 +2308,7 @@ impl ExecutableNetwork {
             let mut dsconv_cache = None;
             let mut graph_conv_cache = None;
             let mut wmhf_cache = None;
+            let mut clifford_cache = None;
             let (output, activation_input) = match (&layer.kind, params) {
                 (
                     LayerKind::Convolutional(spec),
@@ -2327,6 +2351,33 @@ impl ExecutableNetwork {
                     )?;
                     wmhf_cache = Some(cache);
                     (output, Some(activation_input))
+                }
+                (LayerKind::Clifford(spec), LayerParams::Clifford(params)) => {
+                    let drop_mask = if training && spec.drop_path > 0.0 {
+                        let keep_probability = 1.0 - spec.drop_path;
+                        Some(
+                            (0..current_input.shape.batch)
+                                .map(|_| {
+                                    if next_random_unit(&mut rng_state) < keep_probability {
+                                        1.0 / keep_probability
+                                    } else {
+                                        0.0
+                                    }
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    } else {
+                        None
+                    };
+                    let (output, cache) = crate::clifford::forward(
+                        spec,
+                        params,
+                        current_input,
+                        training,
+                        drop_mask.as_deref(),
+                    )?;
+                    clifford_cache = Some(cache);
+                    (output, None)
                 }
                 (LayerKind::DeformConv(spec), LayerParams::DeformConv(params)) => {
                     let (output, activation_input, cache) = forward_deform_conv_with_cache(
@@ -2900,6 +2951,7 @@ impl ExecutableNetwork {
             dsconv_caches.push(dsconv_cache);
             graph_conv_caches.push(graph_conv_cache);
             wmhf_caches.push(wmhf_cache);
+            clifford_caches.push(clifford_cache);
             vit_caches.push(vit_cache);
             swin_caches.push(swin_cache);
             tucker_attention_caches.push(tucker_attention_cache);
@@ -2920,6 +2972,7 @@ impl ExecutableNetwork {
             dsconv_caches,
             graph_conv_caches,
             wmhf_caches,
+            clifford_caches,
             vit_caches,
             swin_caches,
             tucker_attention_caches,
@@ -3070,6 +3123,13 @@ impl ExecutableNetwork {
                 "forward [wmhf] cache count mismatch: expected {}, got {}",
                 self.network.layers.len(),
                 forward.wmhf_caches.len()
+            )));
+        }
+        if forward.clifford_caches.len() != self.network.layers.len() {
+            return Err(Error::InvalidConfig(format!(
+                "forward [clifford] cache count mismatch: expected {}, got {}",
+                self.network.layers.len(),
+                forward.clifford_caches.len()
             )));
         }
         if layer_output_gradient_seeds.len() != self.network.layers.len() {
@@ -3864,6 +3924,35 @@ impl ExecutableNetwork {
                     accumulate_previous_gradient(
                         layer.index,
                         &pre_input_gradient,
+                        &mut input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::Clifford(spec), LayerParams::Clifford(params)) => {
+                    let cache = forward
+                        .clifford_caches
+                        .get(layer.index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing [clifford] forward cache for layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let (input_grad, parameter_grad) =
+                        crate::clifford::backward(spec, params, cache, &grad)?;
+                    let Some(LayerParams::Clifford(destination)) =
+                        param_gradients.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing [clifford] gradient slot for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    *destination = parameter_grad;
+                    accumulate_previous_gradient(
+                        layer.index,
+                        &input_grad,
                         &mut input_gradient,
                         &mut layer_output_gradients,
                     )?;
@@ -5191,6 +5280,54 @@ impl ExecutableNetwork {
         }
 
         for layer in &self.network.layers {
+            let LayerKind::Clifford(_) = &layer.kind else {
+                continue;
+            };
+            let cache = forward
+                .clifford_caches
+                .get(layer.index)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "missing [clifford] forward cache for BN stats at layer #{}",
+                        layer.index
+                    ))
+                })?;
+            if !cache.training {
+                continue;
+            }
+            let Some(LayerParams::Clifford(params)) = self.params.get_mut(layer.index) else {
+                return Err(Error::InvalidConfig(format!(
+                    "missing [clifford] params for BN stats at layer #{}",
+                    layer.index
+                )));
+            };
+            if let Some(local) = &cache.local {
+                if params.depthwise.len() != local.depthwise.len() {
+                    return Err(Error::InvalidConfig(format!(
+                        "[clifford] depthwise cache count mismatch at layer #{}",
+                        layer.index
+                    )));
+                }
+                for (conv, subcache) in params.depthwise.iter_mut().zip(&local.depthwise) {
+                    let Some(batch_norm) = conv.batch_norm.as_mut() else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing [clifford] depthwise BN at layer #{}",
+                            layer.index
+                        )));
+                    };
+                    let (mean, variance) = batchnorm_channel_stats(&subcache.raw_output);
+                    update_batch_norm_running_stats(
+                        batch_norm,
+                        &mean,
+                        &variance,
+                        BATCH_NORM_ROLLING_KEEP_CPU,
+                    )?;
+                }
+            }
+        }
+
+        for layer in &self.network.layers {
             let LayerKind::Connected(spec) = &layer.kind else {
                 continue;
             };
@@ -5536,6 +5673,66 @@ impl ExecutableNetwork {
                         accumulate_convolutional_train_buffer(train, gradient)?;
                     }
                     accumulate_vec(&mut train.scan_weight_updates, &gradient.scan_weights)?;
+                }
+                (LayerKind::Clifford(_), LayerParams::Clifford(gradient)) => {
+                    let Some(LayerTrainBuffers::Clifford(train)) =
+                        self.train_buffers.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing [clifford] train buffers for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    accumulate_vec(
+                        &mut train.layer_norm_gamma_updates,
+                        &gradient.layer_norm_gamma,
+                    )?;
+                    accumulate_vec(
+                        &mut train.layer_norm_beta_updates,
+                        &gradient.layer_norm_beta,
+                    )?;
+                    accumulate_vec(
+                        &mut train.determinant_weight_updates,
+                        &gradient.determinant_weights,
+                    )?;
+                    accumulate_vec(
+                        &mut train.determinant_bias_updates,
+                        &gradient.determinant_biases,
+                    )?;
+                    accumulate_vec(&mut train.layer_scale_updates, &gradient.layer_scale)?;
+                    if train.depthwise.len() != gradient.depthwise.len() {
+                        return Err(Error::InvalidConfig(format!(
+                            "[clifford] depthwise gradient count mismatch at layer #{}",
+                            layer.index
+                        )));
+                    }
+                    for (updates, gradient) in train.depthwise.iter_mut().zip(&gradient.depthwise) {
+                        accumulate_convolutional_train_buffer(updates, gradient)?;
+                    }
+                    accumulate_clifford_branch(&mut train.local, &gradient.local)?;
+                    match (&mut train.global, &gradient.global) {
+                        (Some(train), Some(gradient)) => {
+                            accumulate_clifford_branch(train, gradient)?;
+                        }
+                        (None, None) => {}
+                        _ => {
+                            return Err(Error::InvalidConfig(
+                                "[clifford] global gradient mismatch".to_owned(),
+                            ));
+                        }
+                    }
+                    match (&mut train.fourier, &gradient.fourier) {
+                        (Some(train), Some(gradient)) => {
+                            accumulate_vec(&mut train.real_updates, &gradient.real)?;
+                            accumulate_vec(&mut train.imaginary_updates, &gradient.imaginary)?;
+                        }
+                        (None, None) => {}
+                        _ => {
+                            return Err(Error::InvalidConfig(
+                                "[clifford] Fourier gradient mismatch".to_owned(),
+                            ));
+                        }
+                    }
                 }
                 (LayerKind::GraphConv(_), LayerParams::GraphConv(gradient)) => {
                     let Some(LayerTrainBuffers::GraphConv(train)) =
@@ -5906,6 +6103,32 @@ fn host_adam_scalar_capacity(params: &LayerParams) -> usize {
                 + convolutional_parameter_count(&params.hf_gate)
                 + convolutional_parameter_count(&params.fuse)
                 + params.scan_weights.len()
+        }
+        LayerParams::Clifford(params) => {
+            params.layer_norm_gamma.len()
+                + params.layer_norm_beta.len()
+                + params.determinant_weights.len()
+                + params.determinant_biases.len()
+                + params
+                    .depthwise
+                    .iter()
+                    .map(convolutional_parameter_count)
+                    .sum::<usize>()
+                + params.local.projection_weights.len()
+                + params.local.projection_biases.len()
+                + params.local.gate_weights.len()
+                + params.local.gate_biases.len()
+                + params.layer_scale.len()
+                + params.global.as_ref().map_or(0, |global| {
+                    global.projection_weights.len()
+                        + global.projection_biases.len()
+                        + global.gate_weights.len()
+                        + global.gate_biases.len()
+                })
+                + params
+                    .fourier
+                    .as_ref()
+                    .map_or(0, |fno| fno.real.len() + fno.imaginary.len())
         }
         LayerParams::None
         | LayerParams::LayaScorer(_)
@@ -7917,6 +8140,18 @@ where
                 name: "[wmhf] GPU updates are not implemented in the Stage-1 CPU port".to_owned(),
             });
         }
+        if let Some(layer) = self
+            .network
+            .layers
+            .iter()
+            .find(|layer| matches!(layer.kind, LayerKind::Clifford(_)))
+        {
+            return Err(Error::UnsupportedLayer {
+                layer_index: layer.index,
+                name: "[clifford] GPU updates are not implemented in the Stage-1 CPU port"
+                    .to_owned(),
+            });
+        }
         let config = ElementwiseLaunchConfig::default();
         self.defer_host_sync = !sync_host_weights;
         let net = self.network.net.clone();
@@ -9323,6 +9558,17 @@ where
             return Err(Error::UnsupportedLayer {
                 layer_index: layer.index,
                 name: "[wmhf] GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path".to_owned(),
+            });
+        }
+        if let Some(layer) = self
+            .network
+            .layers
+            .iter()
+            .find(|layer| matches!(layer.kind, LayerKind::Clifford(_)))
+        {
+            return Err(Error::UnsupportedLayer {
+                layer_index: layer.index,
+                name: "[clifford] GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path".to_owned(),
             });
         }
         if let Some(layer) = self
@@ -11069,6 +11315,7 @@ where
                 dsconv_caches: vec![None; self.network.layers.len()],
                 graph_conv_caches: vec![None; self.network.layers.len()],
                 wmhf_caches: vec![None; self.network.layers.len()],
+                clifford_caches: vec![None; self.network.layers.len()],
                 vit_caches,
                 swin_caches,
                 tucker_attention_caches,
@@ -11144,6 +11391,17 @@ where
             return Err(Error::UnsupportedLayer {
                 layer_index: layer.index,
                 name: "[wmhf] compact GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path".to_owned(),
+            });
+        }
+        if let Some(layer) = self
+            .network
+            .layers
+            .iter()
+            .find(|layer| matches!(layer.kind, LayerKind::Clifford(_)))
+        {
+            return Err(Error::UnsupportedLayer {
+                layer_index: layer.index,
+                name: "[clifford] compact GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path".to_owned(),
             });
         }
         if self.network.layers.iter().any(|layer| {
@@ -15923,6 +16181,9 @@ fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
         LayerKind::Wmhf(spec) => {
             LayerParams::Wmhf(default_wmhf_params(layer.input_shape.channels, spec))
         }
+        LayerKind::Clifford(spec) => {
+            LayerParams::Clifford(CliffordParams::zeroed(layer.input_shape.channels, spec))
+        }
         _ => LayerParams::None,
     }
 }
@@ -16062,6 +16323,10 @@ fn default_layer_train_buffers(layer: &crate::model::Layer) -> LayerTrainBuffers
         LayerKind::Wmhf(spec) => {
             LayerTrainBuffers::Wmhf(default_wmhf_train_buffers(layer.input_shape.channels, spec))
         }
+        LayerKind::Clifford(spec) => LayerTrainBuffers::Clifford(CliffordTrainBuffers::zeroed(
+            layer.input_shape.channels,
+            spec,
+        )),
         LayerKind::TuckerAttention(spec) => {
             let params = crate::tucker_attention::TuckerAttentionParams::zeroed(
                 layer.input_shape.channels,
@@ -17673,6 +17938,119 @@ fn apply_host_adam_layer(
                 &offset_adam,
             )?;
         }
+        (LayerParams::Clifford(params), LayerTrainBuffers::Clifford(train)) => {
+            let LayerKind::Clifford(spec) = kind else {
+                return Err(Error::InvalidConfig(
+                    "Clifford parameters do not match layer kind during Adam update".to_owned(),
+                ));
+            };
+            let mut next_slot = 0;
+            if crate::clifford::has_local(spec) {
+                apply_host_adam(
+                    &mut params.determinant_weights,
+                    &mut train.determinant_weight_updates,
+                    &mut state.weights,
+                    adam,
+                )?;
+                apply_host_adam_non_weight(
+                    &mut params.determinant_biases,
+                    &mut train.determinant_bias_updates,
+                    &mut state.biases,
+                    adam,
+                )?;
+                if params.depthwise.len() != train.depthwise.len() {
+                    return Err(Error::InvalidConfig(
+                        "[clifford] Adam depthwise parameter/update mismatch".to_owned(),
+                    ));
+                }
+                for (conv, updates) in params.depthwise.iter_mut().zip(&mut train.depthwise) {
+                    apply_host_adam_convolutional(
+                        conv,
+                        updates,
+                        host_adam_child(state, next_slot),
+                        adam,
+                    )?;
+                    next_slot += 1;
+                }
+                apply_host_adam_clifford_branch(
+                    &mut params.local,
+                    &mut train.local,
+                    host_adam_child(state, next_slot),
+                    adam,
+                )?;
+                next_slot += 1;
+            }
+            match (
+                crate::clifford::has_global(spec),
+                &mut params.global,
+                &mut train.global,
+            ) {
+                (true, Some(params), Some(train)) => {
+                    apply_host_adam_clifford_branch(
+                        params,
+                        train,
+                        host_adam_child(state, next_slot),
+                        adam,
+                    )?;
+                    next_slot += 1;
+                }
+                (false, None, None) => {}
+                _ => {
+                    return Err(Error::InvalidConfig(
+                        "[clifford] Adam global parameter mismatch".to_owned(),
+                    ));
+                }
+            }
+            {
+                let norm_state = host_adam_child(state, next_slot);
+                apply_host_adam_non_weight(
+                    &mut params.layer_norm_gamma,
+                    &mut train.layer_norm_gamma_updates,
+                    &mut norm_state.scales,
+                    adam,
+                )?;
+                apply_host_adam_non_weight(
+                    &mut params.layer_norm_beta,
+                    &mut train.layer_norm_beta_updates,
+                    &mut norm_state.biases,
+                    adam,
+                )?;
+            }
+            next_slot += 1;
+            apply_host_adam_non_weight(
+                &mut params.layer_scale,
+                &mut train.layer_scale_updates,
+                &mut host_adam_child(state, next_slot).biases,
+                adam,
+            )?;
+            next_slot += 1;
+            match (
+                crate::clifford::has_fourier(spec),
+                &mut params.fourier,
+                &mut train.fourier,
+            ) {
+                (true, Some(params), Some(train)) => {
+                    apply_host_adam(
+                        &mut params.real,
+                        &mut train.real_updates,
+                        &mut host_adam_child(state, next_slot).weights,
+                        adam,
+                    )?;
+                    apply_host_adam(
+                        &mut params.imaginary,
+                        &mut train.imaginary_updates,
+                        &mut host_adam_child(state, next_slot + 1).weights,
+                        adam,
+                    )?;
+                }
+                (false, None, None) => {}
+                _ => {
+                    return Err(Error::InvalidConfig(
+                        "[clifford] Adam Fourier parameter mismatch".to_owned(),
+                    ));
+                }
+            }
+        }
         (LayerParams::Wmhf(params), LayerTrainBuffers::Wmhf(train)) => {
             apply_host_adam_convolutional(&mut params.pre, &mut train.pre, state, adam)?;
             for (slot, params, train) in [
@@ -17792,6 +18170,39 @@ fn apply_host_adam_layer(
     Ok(())
 }
 
+fn apply_host_adam_clifford_branch(
+    params: &mut CliffordBranchParams,
+    train: &mut CliffordBranchTrainBuffers,
+    state: &mut HostAdamLayerState,
+    adam: &AdamParams,
+) -> Result<()> {
+    apply_host_adam(
+        &mut params.projection_weights,
+        &mut train.projection_weight_updates,
+        &mut state.weights,
+        adam,
+    )?;
+    apply_host_adam_non_weight(
+        &mut params.projection_biases,
+        &mut train.projection_bias_updates,
+        &mut state.biases,
+        adam,
+    )?;
+    let gate_state = host_adam_child(state, 0);
+    apply_host_adam(
+        &mut params.gate_weights,
+        &mut train.gate_weight_updates,
+        &mut gate_state.weights,
+        adam,
+    )?;
+    apply_host_adam_non_weight(
+        &mut params.gate_biases,
+        &mut train.gate_bias_updates,
+        &mut gate_state.biases,
+        adam,
+    )
+}
+
 fn update_connected_params(
     params: &mut ConnectedParams,
     train: &mut ConnectedTrainBuffers,
@@ -17823,6 +18234,140 @@ fn update_connected_params(
             lr,
             momentum,
             0.0,
+            batch,
+        );
+    }
+}
+
+fn update_clifford_branch(
+    params: &mut CliffordBranchParams,
+    train: &mut CliffordBranchTrainBuffers,
+    lr: f32,
+    momentum: f32,
+    decay: f32,
+    batch: usize,
+) {
+    sgd_update(
+        &mut params.projection_weights,
+        &mut train.projection_weight_updates,
+        lr,
+        momentum,
+        decay,
+        batch,
+    );
+    sgd_update(
+        &mut params.projection_biases,
+        &mut train.projection_bias_updates,
+        lr,
+        momentum,
+        0.0,
+        batch,
+    );
+    sgd_update(
+        &mut params.gate_weights,
+        &mut train.gate_weight_updates,
+        lr,
+        momentum,
+        decay,
+        batch,
+    );
+    sgd_update(
+        &mut params.gate_biases,
+        &mut train.gate_bias_updates,
+        lr,
+        momentum,
+        0.0,
+        batch,
+    );
+}
+
+fn update_clifford_params(
+    spec: &crate::model::CliffordSpec,
+    params: &mut CliffordParams,
+    train: &mut CliffordTrainBuffers,
+    lr: f32,
+    momentum: f32,
+    decay: f32,
+    batch: usize,
+) {
+    if crate::clifford::has_local(spec) {
+        sgd_update(
+            &mut params.determinant_weights,
+            &mut train.determinant_weight_updates,
+            lr,
+            momentum,
+            decay,
+            batch,
+        );
+        sgd_update(
+            &mut params.determinant_biases,
+            &mut train.determinant_bias_updates,
+            lr,
+            momentum,
+            0.0,
+            batch,
+        );
+        update_clifford_branch(
+            &mut params.local,
+            &mut train.local,
+            lr,
+            momentum,
+            decay,
+            batch,
+        );
+        for (params, train) in params.depthwise.iter_mut().zip(&mut train.depthwise) {
+            update_convolutional_params(params, train, lr, momentum, decay, batch);
+        }
+    }
+    sgd_update(
+        &mut params.layer_norm_gamma,
+        &mut train.layer_norm_gamma_updates,
+        lr,
+        momentum,
+        0.0,
+        batch,
+    );
+    sgd_update(
+        &mut params.layer_norm_beta,
+        &mut train.layer_norm_beta_updates,
+        lr,
+        momentum,
+        0.0,
+        batch,
+    );
+    sgd_update(
+        &mut params.layer_scale,
+        &mut train.layer_scale_updates,
+        lr,
+        momentum,
+        0.0,
+        batch,
+    );
+    if crate::clifford::has_global(spec) {
+        if let (Some(params), Some(train)) = (&mut params.global, &mut train.global) {
+            update_clifford_branch(params, train, lr, momentum, decay, batch);
+        }
+    }
+    // FNO coefficients are trainable elementwise spectral multipliers. The
+    // guarded C++ backward accumulates them, although its update callback omits
+    // them; the Rust CPU path applies the ordinary decayed weight update.
+    if crate::clifford::has_fourier(spec)
+        && let (Some(params), Some(train)) = (&mut params.fourier, &mut train.fourier)
+    {
+        sgd_update(
+            &mut params.real,
+            &mut train.real_updates,
+            lr,
+            momentum,
+            decay,
+            batch,
+        );
+        sgd_update(
+            &mut params.imaginary,
+            &mut train.imaginary_updates,
+            lr,
+            momentum,
+            decay,
             batch,
         );
     }
@@ -17862,6 +18407,22 @@ fn update_convolutional_params(
             batch,
         );
     }
+}
+
+fn accumulate_clifford_branch(
+    train: &mut CliffordBranchTrainBuffers,
+    gradient: &CliffordBranchParams,
+) -> Result<()> {
+    accumulate_vec(
+        &mut train.projection_weight_updates,
+        &gradient.projection_weights,
+    )?;
+    accumulate_vec(
+        &mut train.projection_bias_updates,
+        &gradient.projection_biases,
+    )?;
+    accumulate_vec(&mut train.gate_weight_updates, &gradient.gate_weights)?;
+    accumulate_vec(&mut train.gate_bias_updates, &gradient.gate_biases)
 }
 
 fn accumulate_convolutional_param_gradients(
@@ -18343,6 +18904,60 @@ fn load_weights_into_params(
                     )?;
                 }
                 read_f32_into(&mut file, &mut wmhf.scan_weights)?;
+            }
+            LayerParams::Clifford(clifford) => {
+                let LayerKind::Clifford(spec) = &layer.kind else {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} [clifford] parameters do not match layer kind",
+                        layer.index
+                    )));
+                };
+                read_f32_into(&mut file, &mut clifford.layer_norm_gamma)?;
+                read_f32_into(&mut file, &mut clifford.layer_norm_beta)?;
+                read_f32_into(&mut file, &mut clifford.determinant_weights)?;
+                read_f32_into(&mut file, &mut clifford.determinant_biases)?;
+                for conv in &mut clifford.depthwise {
+                    read_convolutional_params(
+                        &mut file,
+                        conv,
+                        layer.input_shape.channels,
+                        layer.input_shape.channels,
+                        spec.dwconv_size,
+                        layer.input_shape.channels,
+                    )?;
+                }
+                read_clifford_branch(&mut file, &mut clifford.local)?;
+                read_f32_into(&mut file, &mut clifford.layer_scale)?;
+                match (
+                    spec.gffn_mode != crate::model::CliffordGffnMode::Local,
+                    &mut clifford.global,
+                ) {
+                    (true, Some(global)) => read_clifford_branch(&mut file, global)?,
+                    (false, None) => {}
+                    _ => {
+                        return Err(Error::InvalidConfig(format!(
+                            "layer #{} [clifford] global parameter layout does not match config",
+                            layer.index
+                        )));
+                    }
+                }
+                if spec.gffn_mode != crate::model::CliffordGffnMode::Local
+                    && spec.global_op == crate::model::CliffordGlobalOp::Fourier
+                {
+                    let fourier = clifford.fourier.as_mut().ok_or_else(|| {
+                        Error::InvalidConfig(format!(
+                            "layer #{} [clifford] Fourier parameters are missing",
+                            layer.index
+                        ))
+                    })?;
+                    read_f32_into(&mut file, &mut fourier.real)?;
+                    read_f32_into(&mut file, &mut fourier.imaginary)?;
+                } else if clifford.fourier.is_some() {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} [clifford] has unexpected Fourier parameters",
+                        layer.index
+                    )));
+                }
             }
             LayerParams::DeformConv(deform) => {
                 let LayerKind::DeformConv(spec) = &layer.kind else {
@@ -18867,6 +19482,13 @@ fn read_convolutional_params(
     Ok(())
 }
 
+fn read_clifford_branch(file: &mut File, branch: &mut CliffordBranchParams) -> Result<()> {
+    read_f32_into(file, &mut branch.projection_weights)?;
+    read_f32_into(file, &mut branch.projection_biases)?;
+    read_f32_into(file, &mut branch.gate_weights)?;
+    read_f32_into(file, &mut branch.gate_biases)
+}
+
 fn forward_convolutional(
     spec: &ConvolutionalSpec,
     params: &ConvolutionalParams,
@@ -19000,7 +19622,7 @@ fn wmhf_internal_convolution_spec(
     }
 }
 
-fn forward_wmhf_convolution(
+pub(crate) fn forward_wmhf_convolution(
     spec: &ConvolutionalSpec,
     params: &ConvolutionalParams,
     input: &Tensor,
@@ -19040,7 +19662,7 @@ fn forward_wmhf_convolution(
     })
 }
 
-fn backward_wmhf_convolution(
+pub(crate) fn backward_wmhf_convolution(
     spec: &ConvolutionalSpec,
     params: &ConvolutionalParams,
     cache: &WmhfConvRuntimeCache,
@@ -27261,6 +27883,328 @@ mod tests {
             assert!(conv.weight_updates.iter().any(|value| *value != 0.0));
             assert!(conv.bias_updates.iter().any(|value| *value != 0.0));
         }
+    }
+
+    fn clifford_test_network(optimizer: &str) -> Network {
+        Network::from_config(
+            ConfigFile::parse_str(
+                "clifford-runtime.cfg",
+                &format!(
+                    r#"[net]
+width=2
+height=1
+channels=2
+batch=2
+{optimizer}
+[clifford]
+filters=2
+shifts=1
+ctx_mode=diff
+gffn_mode=hybrid
+global_op=avgpool
+dwconv_size=1
+num_dwconv=1
+activation=swish
+"#
+                ),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn run_clifford_backward(executable: &mut ExecutableNetwork) -> ForwardResult {
+        let input = Tensor::from_data(
+            TensorShape::new(2, 1, 2, 2),
+            vec![0.13, -0.21, 0.31, 0.07, -0.17, 0.23, 0.09, -0.29],
+        )
+        .unwrap();
+        let forward = executable.forward_training(&input).unwrap();
+        let seed = Tensor::from_data(
+            input.shape,
+            vec![0.3, -0.2, 0.5, 0.1, -0.4, 0.25, 0.15, -0.35],
+        )
+        .unwrap();
+        executable
+            .backward_accumulate(&input, &forward, &seed)
+            .unwrap();
+        forward
+    }
+
+    #[test]
+    fn clifford_runtime_sgd_adam_and_muon_update_cpu_parameters() {
+        let cases = [("", 0), ("adam=1", 1), ("muon=1", 2)];
+        for (optimizer, mode) in cases {
+            let network = clifford_test_network(optimizer);
+            let mut executable = ExecutableNetwork::new(network.clone());
+            crate::initialize::initialize_training_params(&network, &mut executable.params, 41);
+            let initial_params = executable.params.clone();
+            let forward = run_clifford_backward(&mut executable);
+            assert!(forward.clifford_caches[0].is_some());
+            let LayerTrainBuffers::Clifford(train) = &executable.train_buffers[0] else {
+                panic!("Clifford train buffers")
+            };
+            assert!(
+                train
+                    .determinant_weight_updates
+                    .iter()
+                    .any(|value| *value != 0.0)
+            );
+            assert!(
+                train
+                    .local
+                    .projection_weight_updates
+                    .iter()
+                    .any(|value| *value != 0.0)
+            );
+            assert!(
+                train
+                    .local
+                    .gate_weight_updates
+                    .iter()
+                    .any(|value| *value != 0.0)
+            );
+            assert!(
+                train.depthwise[0]
+                    .weight_updates
+                    .iter()
+                    .any(|value| *value != 0.0)
+            );
+            assert!(
+                train
+                    .global
+                    .as_ref()
+                    .unwrap()
+                    .gate_weight_updates
+                    .iter()
+                    .any(|value| *value != 0.0)
+            );
+
+            let cache = forward.clifford_caches[0].as_ref().unwrap();
+            let expected_stats = super::batchnorm_channel_stats(
+                &cache.local.as_ref().unwrap().depthwise[0].raw_output,
+            );
+            let (initial_mean, initial_variance) = {
+                let LayerParams::Clifford(params) = &initial_params[0] else {
+                    unreachable!()
+                };
+                let bn = params.depthwise[0].batch_norm.as_ref().unwrap();
+                (bn.rolling_mean.clone(), bn.rolling_variance.clone())
+            };
+            // The backward-accumulate call above performs the existing running
+            // statistic update as part of the CPU training path.
+            let LayerParams::Clifford(after_backward) = &executable.params[0] else {
+                unreachable!()
+            };
+            let bn = after_backward.depthwise[0].batch_norm.as_ref().unwrap();
+            for channel in 0..2 {
+                assert!(
+                    (bn.rolling_mean[channel]
+                        - (0.9 * initial_mean[channel] + 0.1 * expected_stats.0[channel]))
+                        .abs()
+                        < 1.0e-5
+                );
+                assert!(
+                    (bn.rolling_variance[channel]
+                        - (0.9 * initial_variance[channel] + 0.1 * expected_stats.1[channel]))
+                        .abs()
+                        < 1.0e-5
+                );
+            }
+
+            let params_before_update = executable.params.clone();
+            match mode {
+                0 => executable.update_weights(0.01, 0.2, 0.01, 2),
+                1 => executable.update_weights_adam(0.01, 2).unwrap(),
+                2 => executable.update_weights_muon(0.01, 2).unwrap(),
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                executable.params, params_before_update,
+                "{optimizer} update changed no parameters"
+            );
+            if mode == 1 {
+                let path = std::env::temp_dir().join(format!(
+                    "darknet-clifford-adam-{}.state",
+                    std::process::id()
+                ));
+                executable.save_optimizer_state(&path).unwrap();
+                let mut restored = ExecutableNetwork::new(network.clone());
+                restored.load_optimizer_state(&path).unwrap();
+                assert_eq!(restored.host_adam_state, executable.host_adam_state);
+                assert_eq!(restored.adam_step(), executable.adam_step());
+                let _ = fs::remove_file(path);
+            }
+            if mode == 2 {
+                let state = executable.muon_state[0].as_ref().unwrap();
+                assert_eq!(state.matrices.len(), 7);
+                assert_eq!(
+                    crate::muon_runtime::matrix_shapes(
+                        &network.layers[0].kind,
+                        network.layers[0].input_shape,
+                        network.layers[0].output_shape,
+                        &mut executable.params[0].clone(),
+                        &mut executable.train_buffers[0].clone(),
+                    )
+                    .unwrap(),
+                    vec![(2, 2), (1, 1), (1, 1), (2, 4), (2, 4), (2, 4), (2, 4)]
+                );
+                let path = std::env::temp_dir().join(format!(
+                    "darknet-clifford-muon-{}.state",
+                    std::process::id()
+                ));
+                executable.save_optimizer_state(&path).unwrap();
+                let mut restored = ExecutableNetwork::new(network.clone());
+                restored.load_optimizer_state(&path).unwrap();
+                assert_eq!(restored.muon_state, executable.muon_state);
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
+    #[test]
+    fn clifford_global_only_skips_unused_local_training_and_decay() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "clifford-global-only.cfg",
+                r#"[net]
+width=2
+height=1
+channels=2
+batch=2
+adam=1
+decay=0.5
+decoupled_decay=1
+[clifford]
+filters=2
+shifts=1
+gffn_mode=global
+global_op=avgpool
+dwconv_size=1
+num_dwconv=1
+"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network.clone());
+        crate::initialize::initialize_training_params(&network, &mut executable.params, 19);
+        let (local_before, depthwise_before, determinant_before) = {
+            let LayerParams::Clifford(params) = &executable.params[0] else {
+                panic!("Clifford parameters")
+            };
+            (
+                params.local.clone(),
+                params.depthwise.clone(),
+                params.determinant_weights.clone(),
+            )
+        };
+        let input = Tensor::from_data(
+            TensorShape::new(2, 1, 2, 2),
+            vec![0.13, -0.21, 0.31, 0.07, -0.17, 0.23, 0.09, -0.29],
+        )
+        .unwrap();
+        let forward = executable.forward_training(&input).unwrap();
+        assert!(forward.clifford_caches[0].as_ref().unwrap().local.is_none());
+        let seed = Tensor::from_data(input.shape, vec![0.3; input.data.len()]).unwrap();
+        executable
+            .backward_accumulate(&input, &forward, &seed)
+            .unwrap();
+        let LayerTrainBuffers::Clifford(train) = &executable.train_buffers[0] else {
+            unreachable!()
+        };
+        assert!(
+            train.depthwise[0]
+                .weight_updates
+                .iter()
+                .all(|value| *value == 0.0)
+        );
+        assert!(
+            train
+                .local
+                .projection_weight_updates
+                .iter()
+                .all(|value| *value == 0.0)
+        );
+        executable.update_weights_adam(0.01, 2).unwrap();
+        let LayerParams::Clifford(params) = &executable.params[0] else {
+            unreachable!()
+        };
+        assert_eq!(params.local, local_before);
+        assert_eq!(params.depthwise, depthwise_before);
+        assert_eq!(params.determinant_weights, determinant_before);
+    }
+
+    #[test]
+    fn clifford_adam_updates_fourier_multipliers() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "clifford-fourier-adam.cfg",
+                r#"[net]
+width=2
+height=1
+channels=2
+batch=2
+adam=1
+decay=0.1
+[clifford]
+filters=2
+shifts=1
+gffn_mode=hybrid
+global_op=fourier
+fno_modes_h=1
+fno_modes_w=2
+dwconv_size=1
+num_dwconv=1
+"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network.clone());
+        crate::initialize::initialize_training_params(&network, &mut executable.params, 73);
+        let before = {
+            let LayerParams::Clifford(params) = &executable.params[0] else {
+                panic!("Clifford parameters")
+            };
+            params.fourier.clone().unwrap()
+        };
+        run_clifford_backward(&mut executable);
+        executable.update_weights_adam(0.01, 2).unwrap();
+        let LayerParams::Clifford(params) = &executable.params[0] else {
+            unreachable!()
+        };
+        let after = params.fourier.as_ref().unwrap();
+        assert_ne!(after.real, before.real);
+        assert_ne!(after.imaginary, before.imaginary);
+    }
+
+    #[test]
+    fn clifford_gpu_execution_compact_and_updates_reject_explicitly() {
+        let network = clifford_test_network("");
+        let gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        let input = Tensor::from_data(TensorShape::new(2, 1, 2, 2), vec![0.1; 8]).unwrap();
+        assert!(
+            gpu.forward(&input)
+                .unwrap_err()
+                .to_string()
+                .contains("[clifford] GPU execution is not implemented in the Stage-1 CPU port")
+        );
+        assert!(
+            gpu.forward_compact(&input)
+                .unwrap_err()
+                .to_string()
+                .contains(
+                    "[clifford] compact GPU execution is not implemented in the Stage-1 CPU port"
+                )
+        );
+        let mut gpu = GpuExecutableNetwork::new(clifford_test_network(""), FakeBackend);
+        assert!(
+            gpu.update_weights_gpu(0.01, 0.9, 0.0, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("[clifford] GPU updates are not implemented in the Stage-1 CPU port")
+        );
     }
 
     #[test]

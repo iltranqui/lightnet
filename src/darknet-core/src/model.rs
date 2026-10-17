@@ -529,6 +529,59 @@ pub struct WmhfSpec {
     pub activation: Activation,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CliffordContextMode {
+    Abs,
+    Diff,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CliffordInteractionMode {
+    Inner,
+    Wedge,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CliffordGffnMode {
+    Local,
+    Global,
+    Hybrid,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CliffordHigherMode {
+    Off,
+    VectorBivector,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CliffordGlobalOp {
+    AvgPool,
+    Fourier,
+}
+
+/// Source-derived `[clifford]` geometric feature mixer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CliffordSpec {
+    pub filters: usize,
+    /// Normalized modulo `filters`; order and duplicates are significant.
+    pub wedge_shifts: Vec<usize>,
+    /// Normalized modulo `filters`; equal schedules share the wedge schedule.
+    pub inner_shifts: Vec<usize>,
+    pub context_mode: CliffordContextMode,
+    pub interaction_mode: CliffordInteractionMode,
+    pub gffn_mode: CliffordGffnMode,
+    pub higher_mode: CliffordHigherMode,
+    pub global_op: CliffordGlobalOp,
+    pub fno_modes_h: usize,
+    pub fno_modes_w: usize,
+    pub dwconv_size: usize,
+    pub num_dwconv: usize,
+    pub drop_path: f32,
+    pub layerscale_init: f32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConnectedSpec {
     pub output: usize,
@@ -1433,6 +1486,8 @@ pub enum LayerKind {
     DsConv(DsConvSpec),
     /// `[wmhf]` / wavelet-Mamba High-frequency Fusion.
     Wmhf(WmhfSpec),
+    /// `[clifford]` geometric feature mixer.
+    Clifford(CliffordSpec),
     Rnn(RnnSpec),
     Gru(GruSpec),
     Lstm(LstmSpec),
@@ -1497,6 +1552,7 @@ impl LayerKind {
             Self::DeformConv(_) => "deform_conv",
             Self::DsConv(_) => "dsconv",
             Self::Wmhf(_) => "wmhf",
+            Self::Clifford(_) => "clifford",
             Self::Rnn(_) => "rnn",
             Self::Gru(_) => "gru",
             Self::Lstm(_) => "lstm",
@@ -2217,6 +2273,94 @@ impl Layer {
                 });
                 Some(LayerWeights { entries })
             }
+            LayerKind::Clifford(spec) => {
+                let channels = self.input_shape.channels;
+                let raw_channels = crate::clifford::raw_channels(spec, channels);
+                let mut entries = vec![
+                    WeightsEntry {
+                        array: WeightsArray::Named("ln_gamma".to_owned()),
+                        len: channels,
+                    },
+                    WeightsEntry {
+                        array: WeightsArray::Named("ln_beta".to_owned()),
+                        len: channels,
+                    },
+                    WeightsEntry {
+                        array: WeightsArray::Named("w_det".to_owned()),
+                        len: channels * channels,
+                    },
+                    WeightsEntry {
+                        array: WeightsArray::Named("b_det".to_owned()),
+                        len: channels,
+                    },
+                ];
+                for _ in 0..spec.num_dwconv {
+                    append_convolutional_weight_entries(
+                        &mut entries,
+                        channels,
+                        channels,
+                        spec.dwconv_size,
+                        channels,
+                        true,
+                    );
+                }
+                entries.extend([
+                    WeightsEntry {
+                        array: WeightsArray::Named("w_proj".to_owned()),
+                        len: channels * raw_channels,
+                    },
+                    WeightsEntry {
+                        array: WeightsArray::Named("b_proj".to_owned()),
+                        len: channels,
+                    },
+                    WeightsEntry {
+                        array: WeightsArray::Named("w_gate".to_owned()),
+                        len: channels * 2 * channels,
+                    },
+                    WeightsEntry {
+                        array: WeightsArray::Named("b_gate".to_owned()),
+                        len: channels,
+                    },
+                    WeightsEntry {
+                        array: WeightsArray::Named("layer_scale".to_owned()),
+                        len: channels,
+                    },
+                ]);
+                if spec.gffn_mode != CliffordGffnMode::Local {
+                    entries.extend([
+                        WeightsEntry {
+                            array: WeightsArray::Named("w_proj_g".to_owned()),
+                            len: channels * raw_channels,
+                        },
+                        WeightsEntry {
+                            array: WeightsArray::Named("b_proj_g".to_owned()),
+                            len: channels,
+                        },
+                        WeightsEntry {
+                            array: WeightsArray::Named("w_gate_g".to_owned()),
+                            len: channels * 2 * channels,
+                        },
+                        WeightsEntry {
+                            array: WeightsArray::Named("b_gate_g".to_owned()),
+                            len: channels,
+                        },
+                    ]);
+                    if spec.global_op == CliffordGlobalOp::Fourier {
+                        let fourier_weights = channels * spec.fno_modes_h * spec.fno_modes_w;
+                        entries.extend([
+                            WeightsEntry {
+                                array: WeightsArray::Named("fno_w_re".to_owned()),
+                                len: fourier_weights,
+                            },
+                            WeightsEntry {
+                                array: WeightsArray::Named("fno_w_im".to_owned()),
+                                len: fourier_weights,
+                            },
+                        ]);
+                    }
+                }
+                Some(LayerWeights { entries })
+            }
             LayerKind::DeformConv(spec) => {
                 let channels = self.input_shape.channels;
                 let kernel_area = spec
@@ -2568,6 +2712,7 @@ fn parse_layer_kind(
 ) -> Result<LayerKind> {
     let name = section.name.as_str();
     Ok(match name {
+        "clifford" => LayerKind::Clifford(parse_clifford_spec(section, current)?),
         "graph_conv" | "graph_convolutional" => {
             LayerKind::GraphConv(parse_graph_conv_spec(section, current)?)
         }
@@ -3986,6 +4131,19 @@ fn infer_output_shape(
                 current.batch,
             ))
         }
+        LayerKind::Clifford(spec) => {
+            if current.batch == 0
+                || current.width == 0
+                || current.height == 0
+                || current.channels == 0
+                || spec.filters != current.channels
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "[clifford] layer #{layer_index}: input must be a non-empty NCHW image and filters must equal input channels"
+                )));
+            }
+            Ok(current)
+        }
         LayerKind::Wmhf(spec) => {
             if current.width == 0
                 || current.height == 0
@@ -5229,6 +5387,267 @@ fn parse_graph_conv_spec(section: &RawSection, input: TensorShape) -> Result<Gra
         use_self,
         batch_normalize,
         activation,
+    })
+}
+
+fn reject_unknown_clifford_keys(section: &RawSection) -> Result<()> {
+    const ALLOWED: &[&str] = &[
+        "filters",
+        "shifts",
+        "shifts_wedge",
+        "shifts_inner",
+        "ctx_mode",
+        "cli_mode",
+        "gffn_mode",
+        "cli_higher_mode",
+        "global_op",
+        "fno_modes_h",
+        "fno_modes_w",
+        "dwconv_size",
+        "num_dwconv",
+        "activation",
+        "drop_path",
+        "layerscale",
+        "learning_rate",
+        "dont_update",
+        "burnin_update",
+        "train_only_bn",
+        "clip",
+        "grad_centr",
+        "stream",
+        "wait_stream",
+    ];
+    if let Some(key) = section
+        .values
+        .keys()
+        .find(|key| !ALLOWED.contains(&key.as_str()))
+    {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {}: unknown option `{key}`",
+            section.name, section.line
+        )));
+    }
+    Ok(())
+}
+
+fn parse_clifford_spec(section: &RawSection, input: TensorShape) -> Result<CliffordSpec> {
+    let line = section.line;
+    reject_unknown_clifford_keys(section)?;
+    let invalid =
+        |message: &str| Error::InvalidConfig(format!("[clifford] at line {line}: {message}"));
+    if input.batch == 0 || input.width == 0 || input.height == 0 || input.channels == 0 {
+        return Err(invalid(
+            "preceding layer must output a non-empty NCHW image",
+        ));
+    }
+    let default_filters = i64::try_from(input.channels)
+        .map_err(|_| invalid("input channel count exceeds the supported range"))?;
+    let filters = section.get_i64("filters", default_filters)?;
+    if filters <= 0 || usize::try_from(filters).ok() != Some(input.channels) {
+        return Err(invalid("filters must be positive and equal input channels"));
+    }
+
+    let mut shifts = section.get_isize_list("shifts")?;
+    let mut wedge_shifts = section.get_isize_list("shifts_wedge")?;
+    let mut inner_shifts = section.get_isize_list("shifts_inner")?;
+    if shifts.is_empty() && wedge_shifts.is_empty() && inner_shifts.is_empty() {
+        shifts = vec![1, 2];
+    }
+    if wedge_shifts.is_empty() {
+        wedge_shifts = if shifts.is_empty() {
+            inner_shifts.clone()
+        } else {
+            shifts.clone()
+        };
+    }
+    if inner_shifts.is_empty() {
+        if shifts.is_empty() {
+            inner_shifts = wedge_shifts.clone();
+        } else if wedge_shifts != shifts {
+            inner_shifts = shifts.clone();
+        }
+    }
+    if wedge_shifts.is_empty() {
+        return Err(invalid("at least one shift is required"));
+    }
+    let channels = isize::try_from(input.channels)
+        .map_err(|_| invalid("input channel count exceeds the supported shift range"))?;
+    let normalize = |value: isize| value.rem_euclid(channels) as usize;
+    let wedge_shifts = wedge_shifts.into_iter().map(normalize).collect::<Vec<_>>();
+    let inner_shifts = if inner_shifts.is_empty() {
+        wedge_shifts.clone()
+    } else {
+        inner_shifts.into_iter().map(normalize).collect::<Vec<_>>()
+    };
+
+    let context_mode = match section.get_str("ctx_mode", "diff").as_str() {
+        "abs" => CliffordContextMode::Abs,
+        "diff" => CliffordContextMode::Diff,
+        other => return Err(invalid(&format!("unsupported ctx_mode `{other}`"))),
+    };
+    let interaction_mode = match section.get_str("cli_mode", "full").as_str() {
+        "inner" => CliffordInteractionMode::Inner,
+        "wedge" => CliffordInteractionMode::Wedge,
+        "full" => CliffordInteractionMode::Full,
+        other => return Err(invalid(&format!("unsupported cli_mode `{other}`"))),
+    };
+    let gffn_mode = match section.get_str("gffn_mode", "local").as_str() {
+        "local" => CliffordGffnMode::Local,
+        "global" => CliffordGffnMode::Global,
+        "hybrid" => CliffordGffnMode::Hybrid,
+        other => return Err(invalid(&format!("unsupported gffn_mode `{other}`"))),
+    };
+    let higher_mode = match section.get_str("cli_higher_mode", "off").as_str() {
+        "off" => CliffordHigherMode::Off,
+        "vb" => CliffordHigherMode::VectorBivector,
+        other => return Err(invalid(&format!("unsupported cli_higher_mode `{other}`"))),
+    };
+    let global_op = match section.get_str("global_op", "avgpool").as_str() {
+        "avgpool" => CliffordGlobalOp::AvgPool,
+        "fourier" => CliffordGlobalOp::Fourier,
+        other => return Err(invalid(&format!("unsupported global_op `{other}`"))),
+    };
+    let fno_modes_h_raw = section.get_i64("fno_modes_h", 4)?;
+    let fno_modes_w_raw = section.get_i64("fno_modes_w", 4)?;
+    let (fno_modes_h, fno_modes_w) = if global_op == CliffordGlobalOp::Fourier {
+        if fno_modes_h_raw < 1 || fno_modes_w_raw < 1 {
+            return Err(invalid(
+                "Fourier global_op requires positive fno_modes_h and fno_modes_w",
+            ));
+        }
+        (
+            usize::try_from(fno_modes_h_raw).map_err(|_| invalid("fno_modes_h is out of range"))?,
+            usize::try_from(fno_modes_w_raw).map_err(|_| invalid("fno_modes_w is out of range"))?,
+        )
+    } else {
+        (0, 0)
+    };
+    let dwconv_size = section.get_i64("dwconv_size", 3)?;
+    if dwconv_size < 1 || dwconv_size % 2 == 0 {
+        return Err(invalid("dwconv_size must be a positive odd integer"));
+    }
+    let dwconv_size =
+        usize::try_from(dwconv_size).map_err(|_| invalid("dwconv_size is out of range"))?;
+    let num_dwconv = usize::try_from(section.get_i64("num_dwconv", 1)?.max(1))
+        .map_err(|_| invalid("num_dwconv is out of range"))?;
+    let activation = Activation::parse(&section.get_str("activation", "swish"));
+    if activation != Activation::Swish {
+        return Err(invalid("only activation=swish is supported"));
+    }
+    let drop_path = section.get_f32("drop_path", 0.0)?;
+    if !drop_path.is_finite() || !(0.0..1.0).contains(&drop_path) {
+        return Err(invalid("drop_path must be finite and in [0, 1)"));
+    }
+    let layerscale_init = section.get_f32("layerscale", 0.0001)?;
+    if !layerscale_init.is_finite() {
+        return Err(invalid("layerscale must be finite"));
+    }
+    let learning_rate = section.get_f32("learning_rate", 1.0)?;
+    if !learning_rate.is_finite() {
+        return Err(invalid("learning_rate must be finite"));
+    }
+    if section.get_f32("clip", 0.0)? != 0.0 {
+        return Err(invalid("clip is not supported for clifford"));
+    }
+    if section.get_i64("grad_centr", 0)? != 0 {
+        return Err(invalid("grad_centr is not supported for clifford"));
+    }
+    if section.get_i64("stream", -1)? != -1 || section.get_i64("wait_stream", -1)? != -1 {
+        return Err(invalid(
+            "non-default stream scheduling is GPU-only and unsupported by the CPU port",
+        ));
+    }
+
+    let raw_shift_count = match interaction_mode {
+        CliffordInteractionMode::Inner => inner_shifts.len(),
+        CliffordInteractionMode::Wedge => wedge_shifts.len(),
+        CliffordInteractionMode::Full => wedge_shifts
+            .len()
+            .checked_add(inner_shifts.len())
+            .ok_or_else(|| invalid("interaction channel count overflows"))?,
+    };
+    let raw_channels = raw_shift_count
+        .checked_mul(input.channels)
+        .ok_or_else(|| invalid("interaction channel count overflows"))?;
+    let channels = input.channels;
+    let channels_squared = channels
+        .checked_mul(channels)
+        .ok_or_else(|| invalid("parameter count overflows"))?;
+    let gate_weights = channels_squared
+        .checked_mul(2)
+        .ok_or_else(|| invalid("gate parameter count overflows"))?;
+    let kernel_area = dwconv_size
+        .checked_mul(dwconv_size)
+        .ok_or_else(|| invalid("depthwise-convolution kernel size overflows"))?;
+    let dwconv_parameters = channels
+        .checked_mul(
+            4usize
+                .checked_add(kernel_area)
+                .ok_or_else(|| invalid("depthwise-convolution parameter count overflows"))?,
+        )
+        .and_then(|count| count.checked_mul(num_dwconv))
+        .ok_or_else(|| invalid("depthwise-convolution parameter count overflows"))?;
+    let projection_weights = channels
+        .checked_mul(raw_channels)
+        .ok_or_else(|| invalid("projection parameter count overflows"))?;
+    let mut parameter_count = 0usize;
+    for count in [
+        channels
+            .checked_mul(2)
+            .ok_or_else(|| invalid("parameter count overflows"))?,
+        channels_squared,
+        channels,
+        dwconv_parameters,
+        projection_weights,
+        channels,
+        gate_weights,
+        channels,
+        channels,
+    ] {
+        parameter_count = parameter_count
+            .checked_add(count)
+            .ok_or_else(|| invalid("parameter count overflows"))?;
+    }
+    if gffn_mode != CliffordGffnMode::Local {
+        for count in [projection_weights, channels, gate_weights, channels] {
+            parameter_count = parameter_count
+                .checked_add(count)
+                .ok_or_else(|| invalid("global parameter count overflows"))?;
+        }
+        if global_op == CliffordGlobalOp::Fourier {
+            let fourier_count = channels
+                .checked_mul(fno_modes_h)
+                .and_then(|count| count.checked_mul(fno_modes_w))
+                .and_then(|count| count.checked_mul(2))
+                .ok_or_else(|| invalid("Fourier parameter count overflows"))?;
+            parameter_count = parameter_count
+                .checked_add(fourier_count)
+                .ok_or_else(|| invalid("parameter count overflows"))?;
+        }
+    }
+    let _ = parameter_count;
+    input
+        .width
+        .checked_mul(input.height)
+        .and_then(|area| area.checked_mul(input.channels))
+        .and_then(|count| count.checked_mul(input.batch))
+        .ok_or_else(|| invalid("tensor element count overflows"))?;
+
+    Ok(CliffordSpec {
+        filters: input.channels,
+        wedge_shifts,
+        inner_shifts,
+        context_mode,
+        interaction_mode,
+        gffn_mode,
+        higher_mode,
+        global_op,
+        fno_modes_h,
+        fno_modes_w,
+        dwconv_size,
+        num_dwconv,
+        drop_path,
+        layerscale_init,
     })
 }
 
@@ -6617,7 +7036,11 @@ mod tests {
 
     use crate::cfg::ConfigFile;
 
-    use super::{LayerKind, LrPolicy, ModernYoloKind, Network, ObbNmsKind, SegmentationLoss};
+    use super::{
+        CliffordContextMode, CliffordGffnMode, CliffordGlobalOp, CliffordHigherMode,
+        CliffordInteractionMode, LayerKind, LrPolicy, ModernYoloKind, Network, ObbNmsKind,
+        SegmentationLoss, TensorShape,
+    };
 
     fn build(text: &str) -> crate::error::Result<Network> {
         Network::from_config(ConfigFile::parse_str("t.cfg", text)?)
@@ -9203,6 +9626,129 @@ output=2
         ] {
             let error = make(options).expect_err("invalid WMHF config should fail");
             assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn clifford_defaults_shape_and_weight_order_match_source_contract() {
+        let network = build("[net]\nwidth=5\nheight=3\nchannels=4\nbatch=2\n[clifford]\n")
+            .expect("default Clifford config");
+        let layer = &network.layers[0];
+        let LayerKind::Clifford(spec) = &layer.kind else {
+            panic!("expected Clifford layer");
+        };
+        assert_eq!(layer.output_shape, TensorShape::new(5, 3, 4, 2));
+        assert_eq!(
+            (spec.filters, &spec.wedge_shifts, &spec.inner_shifts),
+            (4, &vec![1, 2], &vec![1, 2])
+        );
+        assert_eq!(spec.context_mode, CliffordContextMode::Diff);
+        assert_eq!(spec.interaction_mode, CliffordInteractionMode::Full);
+        assert_eq!(spec.gffn_mode, CliffordGffnMode::Local);
+        assert_eq!(spec.higher_mode, CliffordHigherMode::Off);
+        assert_eq!(spec.global_op, CliffordGlobalOp::AvgPool);
+        assert_eq!((spec.dwconv_size, spec.num_dwconv), (3, 1));
+        assert_eq!(spec.drop_path, 0.0);
+        assert_eq!(spec.layerscale_init, 0.0001);
+        let entries = layer.weights().expect("Clifford weights").entries;
+        assert_eq!(
+            entries.iter().map(|entry| entry.len).collect::<Vec<_>>(),
+            vec![4, 4, 16, 4, 4, 4, 4, 4, 36, 64, 4, 32, 4, 4]
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.array.name())
+                .collect::<Vec<_>>(),
+            vec![
+                "ln_gamma",
+                "ln_beta",
+                "w_det",
+                "b_det",
+                "biases",
+                "scales",
+                "rolling_mean",
+                "rolling_variance",
+                "weights",
+                "w_proj",
+                "b_proj",
+                "w_gate",
+                "b_gate",
+                "layer_scale",
+            ]
+        );
+    }
+
+    #[test]
+    fn clifford_modes_shift_normalization_and_global_weight_layout_are_pinned() {
+        let network = build(
+            "[net]\nwidth=7\nheight=3\nchannels=4\n[clifford]\nfilters=4\nshifts=1,2\nshifts_wedge=-1,2\nshifts_inner=2,1\nctx_mode=abs\ncli_mode=full\ngffn_mode=hybrid\ncli_higher_mode=vb\nglobal_op=fourier\nfno_modes_h=2\nfno_modes_w=3\ndwconv_size=1\nnum_dwconv=2\nactivation=swish\ndrop_path=0.25\nlayerscale=0.01\n",
+        )
+        .expect("full-mode Clifford config");
+        let layer = &network.layers[0];
+        let LayerKind::Clifford(spec) = &layer.kind else {
+            panic!("expected Clifford layer");
+        };
+        assert_eq!(spec.wedge_shifts, vec![3, 2]);
+        assert_eq!(spec.inner_shifts, vec![2, 1]);
+        assert_eq!(spec.context_mode, CliffordContextMode::Abs);
+        assert_eq!(spec.interaction_mode, CliffordInteractionMode::Full);
+        assert_eq!(spec.gffn_mode, CliffordGffnMode::Hybrid);
+        assert_eq!(spec.higher_mode, CliffordHigherMode::VectorBivector);
+        assert_eq!(spec.global_op, CliffordGlobalOp::Fourier);
+        assert_eq!((spec.fno_modes_h, spec.fno_modes_w), (2, 3));
+        assert_eq!((spec.dwconv_size, spec.num_dwconv), (1, 2));
+        assert_eq!(spec.drop_path, 0.25);
+        assert_eq!(spec.layerscale_init, 0.01);
+        let entries = layer.weights().expect("Clifford weights").entries;
+        assert_eq!(entries[0].array.name(), "ln_gamma");
+        assert_eq!(entries[4].array.name(), "biases");
+        assert_eq!(entries[4].len, 4);
+        assert_eq!(entries[9].array.name(), "biases");
+        assert_eq!(entries[9].len, 4);
+        assert_eq!(entries[14].array.name(), "w_proj");
+        assert_eq!(entries[14].len, 4 * 16);
+        assert_eq!(entries[18].array.name(), "layer_scale");
+        assert_eq!(entries[19].array.name(), "w_proj_g");
+        assert_eq!(entries[23].array.name(), "fno_w_re");
+        assert_eq!(entries[23].len, 4 * 2 * 3);
+        assert_eq!(entries[24].array.name(), "fno_w_im");
+        assert_eq!(layer.output_shape, TensorShape::new(7, 3, 4, 1));
+    }
+
+    #[test]
+    fn clifford_rejects_unknown_or_unsupported_config_and_invalid_shapes() {
+        let make = |options: &str| {
+            build(&format!(
+                "[net]\nwidth=5\nheight=3\nchannels=4\n[clifford]\n{options}\n"
+            ))
+        };
+        for (options, expected) in [
+            (
+                "filters=3",
+                "filters must be positive and equal input channels",
+            ),
+            ("activation=relu", "only activation=swish is supported"),
+            ("ctx_mode=typo", "unsupported ctx_mode"),
+            ("cli_mode=typo", "unsupported cli_mode"),
+            ("gffn_mode=typo", "unsupported gffn_mode"),
+            ("cli_higher_mode=typo", "unsupported cli_higher_mode"),
+            ("global_op=typo", "unsupported global_op"),
+            (
+                "global_op=fourier\nfno_modes_h=0",
+                "requires positive fno_modes_h",
+            ),
+            ("dwconv_size=2", "positive odd integer"),
+            ("drop_path=1", "drop_path must be finite and in [0, 1)"),
+            ("drop_path=NaN", "drop_path must be finite and in [0, 1)"),
+            ("layerscale=inf", "layerscale must be finite"),
+            ("clip=0.1", "clip is not supported"),
+            ("grad_centr=1", "grad_centr is not supported"),
+            ("stream=0", "non-default stream scheduling"),
+            ("unknown_option=1", "unknown option"),
+        ] {
+            let error = make(options).expect_err("invalid Clifford config should fail");
+            assert!(error.to_string().contains(expected), "{options}: {error}");
         }
     }
 

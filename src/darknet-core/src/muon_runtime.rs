@@ -168,6 +168,31 @@ fn visit_conv_range(
     Ok(())
 }
 
+fn visit_clifford_branch(
+    params: &mut crate::clifford::CliffordBranchParams,
+    train: &mut crate::clifford::CliffordBranchTrainBuffers,
+    channels: usize,
+    raw_channels: usize,
+    visitor: &mut MatrixVisitor<'_>,
+) -> Result<()> {
+    visit_matrix(
+        &mut params.projection_weights,
+        &mut train.projection_weight_updates,
+        channels,
+        raw_channels,
+        1.0,
+        visitor,
+    )?;
+    visit_matrix(
+        &mut params.gate_weights,
+        &mut train.gate_weight_updates,
+        channels,
+        2 * channels,
+        1.0,
+        visitor,
+    )
+}
+
 /// Visit the eligible trainable matrices of one layer in deterministic order.
 pub(crate) fn visit_muon_matrices(
     kind: &LayerKind,
@@ -810,6 +835,61 @@ pub(crate) fn visit_muon_matrices(
                 0.01,
                 visitor,
             )
+        }
+        (
+            LayerKind::Clifford(spec),
+            LayerParams::Clifford(params),
+            LayerTrainBuffers::Clifford(train),
+        ) => {
+            let channels = input_shape.channels;
+            let raw_channels = crate::clifford::raw_channels(spec, channels);
+            if crate::clifford::has_local(spec) {
+                visit_matrix(
+                    &mut params.determinant_weights,
+                    &mut train.determinant_weight_updates,
+                    channels,
+                    channels,
+                    1.0,
+                    visitor,
+                )?;
+                if params.depthwise.len() != train.depthwise.len() {
+                    return Err(Error::InvalidConfig(
+                        "Muon Clifford depthwise parameter/update count mismatch".to_owned(),
+                    ));
+                }
+                for (params, train) in params.depthwise.iter_mut().zip(&mut train.depthwise) {
+                    visit_grouped_convolution(
+                        params,
+                        train,
+                        channels,
+                        channels,
+                        spec.dwconv_size,
+                        channels,
+                        1.0,
+                        visitor,
+                    )?;
+                }
+                visit_clifford_branch(
+                    &mut params.local,
+                    &mut train.local,
+                    channels,
+                    raw_channels,
+                    visitor,
+                )?;
+            }
+            match (
+                crate::clifford::has_global(spec),
+                &mut params.global,
+                &mut train.global,
+            ) {
+                (true, Some(params), Some(train)) => {
+                    visit_clifford_branch(params, train, channels, raw_channels, visitor)
+                }
+                (false, None, None) => Ok(()),
+                _ => Err(Error::InvalidConfig(
+                    "Muon Clifford global parameter/update mismatch".to_owned(),
+                )),
+            }
         }
         (LayerKind::Wmhf(spec), LayerParams::Wmhf(params), LayerTrainBuffers::Wmhf(train)) => {
             let local = spec.local_channels;

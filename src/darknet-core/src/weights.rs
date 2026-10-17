@@ -283,7 +283,48 @@ pub fn save_weights(
                 }
                 write_f32_slice(&mut file, &wmhf.scan_weights)?;
             }
-            // C++ `dontsave`: the frozen LAYA layers load from an external
+            (LayerKind::Clifford(spec), LayerParams::Clifford(clifford)) => {
+                write_f32_slice(&mut file, &clifford.layer_norm_gamma)?;
+                write_f32_slice(&mut file, &clifford.layer_norm_beta)?;
+                write_f32_slice(&mut file, &clifford.determinant_weights)?;
+                write_f32_slice(&mut file, &clifford.determinant_biases)?;
+                for conv in &clifford.depthwise {
+                    write_convolutional_params(&mut file, conv)?;
+                }
+                write_clifford_branch(&mut file, &clifford.local)?;
+                write_f32_slice(&mut file, &clifford.layer_scale)?;
+                match (
+                    spec.gffn_mode != crate::model::CliffordGffnMode::Local,
+                    &clifford.global,
+                ) {
+                    (true, Some(global)) => write_clifford_branch(&mut file, global)?,
+                    (false, None) => {}
+                    _ => {
+                        return Err(Error::Weights(format!(
+                            "layer #{} ([clifford]) global parameter layout does not match config",
+                            layer.index
+                        )));
+                    }
+                }
+                if spec.gffn_mode != crate::model::CliffordGffnMode::Local
+                    && spec.global_op == crate::model::CliffordGlobalOp::Fourier
+                {
+                    let fourier = clifford.fourier.as_ref().ok_or_else(|| {
+                        Error::Weights(format!(
+                            "layer #{} ([clifford]) is missing Fourier weights",
+                            layer.index
+                        ))
+                    })?;
+                    write_f32_slice(&mut file, &fourier.real)?;
+                    write_f32_slice(&mut file, &fourier.imaginary)?;
+                } else if clifford.fourier.is_some() {
+                    return Err(Error::Weights(format!(
+                        "layer #{} ([clifford]) has unexpected Fourier weights",
+                        layer.index
+                    )));
+                }
+            }
+            // C++ `dontsave": the frozen LAYA layers load from an external
             // shared blob, so nothing is written for them in this stream.
             (LayerKind::LayaEncoder(_), LayerParams::LayaEncoder(_)) => {}
             (LayerKind::LayaHead(_), LayerParams::LayaHead(_)) => {}
@@ -410,6 +451,16 @@ fn write_convolutional_params<W: Write>(file: &mut W, params: &ConvolutionalPara
     Ok(())
 }
 
+fn write_clifford_branch<W: Write>(
+    file: &mut W,
+    branch: &crate::clifford::CliffordBranchParams,
+) -> Result<()> {
+    write_f32_slice(file, &branch.projection_weights)?;
+    write_f32_slice(file, &branch.projection_biases)?;
+    write_f32_slice(file, &branch.gate_weights)?;
+    write_f32_slice(file, &branch.gate_biases)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -429,6 +480,120 @@ mod tests {
             write_f32_slice(&mut got, &values).unwrap();
             assert_eq!(got, expected, "len {len}");
         }
+    }
+
+    #[test]
+    fn clifford_weights_round_trip_and_match_source_byte_order() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "clifford-weights.cfg",
+                r#"[net]
+width=2
+height=1
+channels=2
+[clifford]
+filters=2
+shifts=1
+gffn_mode=hybrid
+global_op=fourier
+fno_modes_h=1
+fno_modes_w=2
+dwconv_size=1
+num_dwconv=2
+"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let LayerParams::Clifford(params) = &mut executable.params[0] else {
+            panic!("Clifford parameters");
+        };
+        let mut next = 1.0f32;
+        let fill = |values: &mut [f32], next: &mut f32| {
+            for value in values {
+                *value = *next;
+                *next += 1.0;
+            }
+        };
+        fill(&mut params.layer_norm_gamma, &mut next);
+        fill(&mut params.layer_norm_beta, &mut next);
+        fill(&mut params.determinant_weights, &mut next);
+        fill(&mut params.determinant_biases, &mut next);
+        for conv in &mut params.depthwise {
+            fill(&mut conv.biases, &mut next);
+            let bn = conv.batch_norm.as_mut().unwrap();
+            fill(&mut bn.scales, &mut next);
+            fill(&mut bn.rolling_mean, &mut next);
+            fill(&mut bn.rolling_variance, &mut next);
+            fill(&mut conv.weights, &mut next);
+        }
+        let fill_branch = |branch: &mut crate::clifford::CliffordBranchParams, next: &mut f32| {
+            fill(&mut branch.projection_weights, next);
+            fill(&mut branch.projection_biases, next);
+            fill(&mut branch.gate_weights, next);
+            fill(&mut branch.gate_biases, next);
+        };
+        fill_branch(&mut params.local, &mut next);
+        fill(&mut params.layer_scale, &mut next);
+        fill_branch(params.global.as_mut().unwrap(), &mut next);
+        let fourier = params.fourier.as_mut().unwrap();
+        fill(&mut fourier.real, &mut next);
+        fill(&mut fourier.imaginary, &mut next);
+
+        let params_before = executable.params.clone();
+        let LayerParams::Clifford(params) = &params_before[0] else {
+            unreachable!();
+        };
+        fn append(values: &mut Vec<f32>, slice: &[f32]) {
+            values.extend_from_slice(slice);
+        }
+        fn append_branch(values: &mut Vec<f32>, branch: &crate::clifford::CliffordBranchParams) {
+            append(values, &branch.projection_weights);
+            append(values, &branch.projection_biases);
+            append(values, &branch.gate_weights);
+            append(values, &branch.gate_biases);
+        }
+        let mut expected_values = Vec::new();
+        append(&mut expected_values, &params.layer_norm_gamma);
+        append(&mut expected_values, &params.layer_norm_beta);
+        append(&mut expected_values, &params.determinant_weights);
+        append(&mut expected_values, &params.determinant_biases);
+        for conv in &params.depthwise {
+            append(&mut expected_values, &conv.biases);
+            let bn = conv.batch_norm.as_ref().unwrap();
+            append(&mut expected_values, &bn.scales);
+            append(&mut expected_values, &bn.rolling_mean);
+            append(&mut expected_values, &bn.rolling_variance);
+            append(&mut expected_values, &conv.weights);
+        }
+        append_branch(&mut expected_values, &params.local);
+        append(&mut expected_values, &params.layer_scale);
+        append_branch(&mut expected_values, params.global.as_ref().unwrap());
+        let fourier = params.fourier.as_ref().unwrap();
+        append(&mut expected_values, &fourier.real);
+        append(&mut expected_values, &fourier.imaginary);
+        let expected_bytes: Vec<u8> = expected_values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+
+        let path = std::env::temp_dir().join(format!(
+            "darknet-clifford-weights-{}.weights",
+            std::process::id()
+        ));
+        save_weights(&network, &executable.params, &path, 17).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let inspection = inspect_weights_file(&network, &path).unwrap();
+        assert_eq!(inspection.trailing_bytes, 0);
+        assert_eq!(
+            &bytes[inspection.header.header_bytes as usize..],
+            expected_bytes.as_slice()
+        );
+        let mut reloaded = ExecutableNetwork::new(network);
+        reloaded.load_weights_file(&path).unwrap();
+        assert_eq!(reloaded.params, params_before);
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -1321,7 +1486,8 @@ mod tests {
                     | LayerParams::TuckerAttention(_)
                     | LayerParams::MambaVision(_)
                     | LayerParams::GraphConv(_)
-                    | LayerParams::Wmhf(_) => {}
+                    | LayerParams::Wmhf(_)
+                    | LayerParams::Clifford(_) => {}
                 }
             }
             let path = std::env::temp_dir().join(format!("darknet-{name}-roundtrip.weights"));

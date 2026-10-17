@@ -26,12 +26,14 @@ pub mod cfg;
 pub(crate) mod channel_shuffle;
 pub(crate) mod channel_slice;
 pub mod chart;
+pub mod clifford;
 pub(crate) mod contrastive;
 pub(crate) mod dcnv4;
 pub(crate) mod deform_conv;
 pub(crate) mod dsconv;
 pub(crate) mod graph_conv;
 pub use chart::{ChartPoint, write_training_chart};
+pub use clifford::{CliffordBranchTrainBuffers, CliffordParams, CliffordTrainBuffers};
 pub mod dense_loss;
 pub use dense_loss::{
     DenseTrainingLoss, compute_dense_training_loss, compute_dense_training_loss_at,
@@ -130,10 +132,11 @@ pub use mambavision::{
     mambavision_backward, mambavision_forward,
 };
 pub use model::{
-    Activation, CrnnSpec, DeformConvSpec, DsConvSpec, KimiKdaSpec, Layer, LayerKind, LayerWeights,
-    LrPolicy, LstmSpec, MambaVisionSpec, NetConfig, Network, ObbRefineLoss, ObbRefineSpec, RnnSpec,
-    ShortcutWeightsNorm, ShortcutWeightsType, SwinSpec, TensorShape, TuckerAttentionSpec,
-    WeightsArray, WmhfSpec, YoloIouLoss,
+    Activation, CliffordContextMode, CliffordGffnMode, CliffordGlobalOp, CliffordHigherMode,
+    CliffordInteractionMode, CliffordSpec, CrnnSpec, DeformConvSpec, DsConvSpec, KimiKdaSpec,
+    Layer, LayerKind, LayerWeights, LrPolicy, LstmSpec, MambaVisionSpec, NetConfig, Network,
+    ObbRefineLoss, ObbRefineSpec, RnnSpec, ShortcutWeightsNorm, ShortcutWeightsType, SwinSpec,
+    TensorShape, TuckerAttentionSpec, WeightsArray, WmhfSpec, YoloIouLoss,
 };
 pub use names::load_names_file;
 pub use runtime::{

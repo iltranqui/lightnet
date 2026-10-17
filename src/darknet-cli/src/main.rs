@@ -3315,6 +3315,56 @@ fn print_forward_backward_summary(
                             .is_some_and(|bn| bn.scale_updates.iter().any(|value| *value != 0.0))
                 }) || wmhf.scan_weight_updates.iter().any(|value| *value != 0.0)
             }
+            darknet_core::LayerTrainBuffers::Clifford(clifford) => {
+                let branch_has_updates = |branch: &darknet_core::CliffordBranchTrainBuffers| {
+                    branch
+                        .projection_weight_updates
+                        .iter()
+                        .any(|value| *value != 0.0)
+                        || branch
+                            .projection_bias_updates
+                            .iter()
+                            .any(|value| *value != 0.0)
+                        || branch.gate_weight_updates.iter().any(|value| *value != 0.0)
+                        || branch.gate_bias_updates.iter().any(|value| *value != 0.0)
+                };
+                let convolution_has_updates = |conv: &darknet_core::ConvolutionalTrainBuffers| {
+                    conv.bias_updates.iter().any(|value| *value != 0.0)
+                        || conv.weight_updates.iter().any(|value| *value != 0.0)
+                        || conv.batch_norm.as_ref().is_some_and(|bn| {
+                            bn.scale_updates.iter().any(|value| *value != 0.0)
+                                || bn.mean_delta.iter().any(|value| *value != 0.0)
+                                || bn.variance_delta.iter().any(|value| *value != 0.0)
+                        })
+                };
+                clifford
+                    .layer_norm_gamma_updates
+                    .iter()
+                    .any(|value| *value != 0.0)
+                    || clifford
+                        .layer_norm_beta_updates
+                        .iter()
+                        .any(|value| *value != 0.0)
+                    || clifford
+                        .determinant_weight_updates
+                        .iter()
+                        .any(|value| *value != 0.0)
+                    || clifford
+                        .determinant_bias_updates
+                        .iter()
+                        .any(|value| *value != 0.0)
+                    || clifford
+                        .layer_scale_updates
+                        .iter()
+                        .any(|value| *value != 0.0)
+                    || clifford.depthwise.iter().any(convolution_has_updates)
+                    || branch_has_updates(&clifford.local)
+                    || clifford.global.as_ref().is_some_and(branch_has_updates)
+                    || clifford.fourier.as_ref().is_some_and(|fourier| {
+                        fourier.real_updates.iter().any(|value| *value != 0.0)
+                            || fourier.imaginary_updates.iter().any(|value| *value != 0.0)
+                    })
+            }
             darknet_core::LayerTrainBuffers::DeformConv(deform) => {
                 deform.main.bias_updates.iter().any(|value| *value != 0.0)
                     || deform.main.weight_updates.iter().any(|value| *value != 0.0)
