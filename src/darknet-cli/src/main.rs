@@ -3642,6 +3642,62 @@ mod tests {
     }
 
     #[test]
+    fn detector_train_runs_cpu_obb_adam_with_exposure_for_two_iterations() {
+        let dir = std::env::temp_dir().join(format!(
+            "darknet-obb-adam-exposure-cli-{}",
+            std::process::id()
+        ));
+        let backup = dir.join("backup");
+        std::fs::create_dir_all(&backup).expect("test backup directory");
+        let image = dir.join("sample.ppm");
+        let labels = dir.join("sample.txt");
+        let train_list = dir.join("train.txt");
+        let cfg = dir.join("obb-adam-exposure-cli.cfg");
+        let data = dir.join("obb-adam-exposure-cli.data");
+        std::fs::write(&image, b"P6\n2 1\n255\n\xff\x00\x00\x00\xff\x00").expect("PPM image");
+        std::fs::write(&labels, "0 0.5 0.5 0.25 0.5 0.7 0.55\n").expect("OBB label");
+        std::fs::write(&train_list, format!("{}\n", image.display())).expect("train list");
+        std::fs::write(
+            &data,
+            format!(
+                "classes=1\ntrain={}\nbackup={}\n",
+                train_list.display(),
+                backup.display()
+            ),
+        )
+        .expect("data cfg");
+        std::fs::write(
+            &cfg,
+            "[net]\nwidth=2\nheight=1\nchannels=3\nbatch=1\nsubdivisions=2\nmax_batches=2\nlearning_rate=.01\nmomentum=0\ndecay=0\nadam=1\nobb=1\nflip=0\nexposure=1.5\n[convolutional]\nfilters=8\nsize=1\nstride=1\nactivation=linear\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\njitter=0\niou_loss=ciou_obb\n",
+        )
+        .expect("OBB Adam cfg");
+
+        run_detector_train_cpu(
+            cfg.to_str().expect("cfg path is UTF-8"),
+            data.to_str().expect("data path is UTF-8"),
+            &options(&["-seed", "7"]).expect("seeded train options"),
+        )
+        .expect("OBB CPU Adam training with exposure augmentation");
+
+        assert!(backup.join("obb-adam-exposure-cli_final.weights").exists());
+        let optimizer_state = backup.join("obb-adam-exposure-cli_optimizer.state");
+        assert!(
+            optimizer_state.metadata().is_ok(),
+            "Adam state was not saved"
+        );
+        let loss_log = std::fs::read_to_string(backup.join("obb-adam-exposure-cli_loss.csv"))
+            .expect("OBB loss log");
+        assert!(
+            loss_log.lines().any(|line| line.starts_with("1,2,")),
+            "{loss_log}"
+        );
+        assert!(
+            loss_log.lines().any(|line| line.starts_with("2,4,")),
+            "{loss_log}"
+        );
+    }
+
+    #[test]
     fn detector_train_accepts_cfg_then_data() {
         let (cfg, data) = classify_detector_train_paths("model.cfg", "dataset.data")
             .expect("paths should classify");
