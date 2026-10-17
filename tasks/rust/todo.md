@@ -411,7 +411,7 @@ Immediately next, in dependency order:
 - [x] `onnx.md` — `darknet-rs export-onnx`; all 21 implementation, verification, and bookkeeping steps are complete.
 - [x] `carpn_map_plan.md` — bounded caller-supplied sample dispatch implemented in v0.0.258.
 - [x] `carpn_network_map_plan.md` — v0.0.259 completes CPU network inference, `detect-image`, and direct `detector map`; CARPN training/`detector train -map` remain explicitly deferred.
-- [x] `dcnv4_plan.md` — source-audited CPU/reference + GPU f32 host-fallback implementation completed in v0.0.273; no native kernel or compiled-C++ parity.
+- [x] `dcnv4_plan.md` — source-audited CPU/reference + GPU f32 host-fallback implementation completed in v0.0.273; v0.0.274 matches the deformable-layer `try_fix_nan` config default. No native kernel or compiled-C++ parity.
 - [ ] `gui_plan.md` — egui DarkMark replacement (M0–M6, not started).
 
 ## Known evidence gaps (not user questions)
