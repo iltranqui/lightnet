@@ -2470,3 +2470,100 @@ fn eml_adam_updates_both_device_branches_with_deferred_sync() {
         }
     }
 }
+
+#[test]
+fn dcnv4_f32_host_fallback_matches_cpu_chain_and_updates() {
+    let net = network(
+        "[net]\nwidth=4\nheight=4\nchannels=1\nbatch=1\n\
+         [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
+         [dcnv4]\nsize=1\npadding=0\nd_stride=2\nsoftmax=0\
+         \noffset_scale=0.6\nactivation=linear\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    darknet_core::initialize_training_params(&net, &mut cpu.params, 73);
+    fill_params(&mut cpu.params);
+    let LayerParams::Dcnv4(params) = &mut cpu.params[1] else {
+        panic!("DCNv4 parameters")
+    };
+    for (index, weight) in params.offset_weights.iter_mut().enumerate() {
+        *weight = ((index as f32 * 0.37).sin()) * 0.001;
+    }
+    params.offset_biases[0] = 0.13;
+    params.offset_biases[1] = 0.19;
+    params.offset_biases[2] = 0.8;
+
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("Oxide backend"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("DCNv4 train buffers");
+    let input = patterned(cpu.network.net.input_shape());
+    let cpu_forward = cpu.forward_training(&input).expect("CPU DCNv4 forward");
+    let oxide_forward = gpu
+        .forward_training_with_state(&input)
+        .expect("Oxide DCNv4 host-fallback forward");
+    for (index, (cpu_output, oxide_output)) in cpu_forward
+        .layer_outputs
+        .iter()
+        .zip(&oxide_forward.cpu_forward.layer_outputs)
+        .enumerate()
+    {
+        close(
+            &format!("DCNv4 host fallback layer {index}"),
+            &cpu_output.data,
+            &oxide_output.data,
+            2e-4,
+        );
+    }
+
+    let seed = Tensor::filled(cpu.network.layers[1].output_shape, 0.17);
+    let mut seeds = vec![None; cpu.network.layers.len()];
+    seeds[1] = Some(seed);
+    cpu.zero_train_buffers();
+    gpu.zero_train_buffers_gpu()
+        .expect("zero DCNv4 train buffers");
+    cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+        .expect("CPU DCNv4 backward");
+    gpu.backward_accumulate_seeded_gpu(&oxide_forward, &seeds)
+        .expect("Oxide DCNv4 host-fallback backward");
+    let before = cpu.params.clone();
+    cpu.update_weights(1e-3, 0.0, 0.0, 1);
+    gpu.update_weights_gpu(1e-3, 0.0, 0.0, 1)
+        .expect("Oxide DCNv4 host-fallback update");
+
+    let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(oxide_conv)) =
+        (&cpu.params[0], &gpu.params[0])
+    else {
+        panic!("preceding convolution parameters")
+    };
+    close(
+        "DCNv4 chain convolution weights",
+        &cpu_conv.weights,
+        &oxide_conv.weights,
+        5e-4,
+    );
+    close(
+        "DCNv4 chain convolution biases",
+        &cpu_conv.biases,
+        &oxide_conv.biases,
+        5e-4,
+    );
+    let (LayerParams::Dcnv4(old), LayerParams::Dcnv4(cpu_dcn), LayerParams::Dcnv4(oxide_dcn)) =
+        (&before[1], &cpu.params[1], &gpu.params[1])
+    else {
+        panic!("DCNv4 parameters")
+    };
+    close(
+        "DCNv4 offset weights",
+        &cpu_dcn.offset_weights,
+        &oxide_dcn.offset_weights,
+        5e-4,
+    );
+    close(
+        "DCNv4 offset biases",
+        &cpu_dcn.offset_biases,
+        &oxide_dcn.offset_biases,
+        5e-4,
+    );
+    assert_ne!(old.offset_weights, cpu_dcn.offset_weights);
+    assert_eq!(old.dummy_weights, cpu_dcn.dummy_weights);
+    assert_eq!(cpu_dcn.dummy_weights, oxide_dcn.dummy_weights);
+}

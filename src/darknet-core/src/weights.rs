@@ -217,6 +217,17 @@ pub fn save_weights(
                 write_convolutional_params(&mut file, &eml.input)?;
                 write_convolutional_params(&mut file, &eml.self_params)?;
             }
+            (LayerKind::Dcnv4(_), LayerParams::Dcnv4(dcnv4)) => {
+                write_f32_slice(&mut file, &dcnv4.biases)?;
+                if let Some(batch_norm) = &dcnv4.batch_norm {
+                    write_f32_slice(&mut file, &batch_norm.scales)?;
+                    write_f32_slice(&mut file, &batch_norm.rolling_mean)?;
+                    write_f32_slice(&mut file, &batch_norm.rolling_variance)?;
+                }
+                write_f32_slice(&mut file, &dcnv4.dummy_weights)?;
+                write_f32_slice(&mut file, &dcnv4.offset_weights)?;
+                write_f32_slice(&mut file, &dcnv4.offset_biases)?;
+            }
             // C++ `dontsave`: the frozen LAYA layers load from an external
             // shared blob, so nothing is written for them in this stream.
             (LayerKind::LayaEncoder(_), LayerParams::LayaEncoder(_)) => {}
@@ -1033,6 +1044,12 @@ mod tests {
                             }
                         }
                     }
+                    LayerParams::Dcnv4(dcnv4) => {
+                        dcnv4.biases.fill(0.1);
+                        dcnv4.dummy_weights.fill(0.2);
+                        dcnv4.offset_weights.fill(0.3);
+                        dcnv4.offset_biases.fill(0.4);
+                    }
                     LayerParams::Rnn(recurrent) => {
                         for nested in [
                             &mut recurrent.input,
@@ -1095,6 +1112,72 @@ mod tests {
                 .load_weights_file(&path)
                 .expect("recurrent weights load");
             assert_eq!(reloaded.params, executable.params, "{name} weights differ");
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn dcnv4_weights_round_trip_with_source_order_and_exact_file_size() {
+        for batch_normalize in [false, true] {
+            let cfg = ConfigFile::parse_str(
+                "dcnv4-weights.cfg",
+                &format!(
+                    "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=1\n\
+                     [dcnv4]\nsize=3\npadding=1\ngroups=2\nremove_center=1\
+                     \nd_stride=2\nsoftmax=1\nbatch_normalize={}\nactivation=linear\n",
+                    usize::from(batch_normalize)
+                ),
+            )
+            .expect("cfg parses");
+            let network = Network::from_config(cfg).expect("network builds");
+            let mut executable = ExecutableNetwork::new(network.clone());
+            let LayerParams::Dcnv4(params) = &mut executable.params[0] else {
+                panic!("DCNv4 params")
+            };
+            params.biases.fill(0.11);
+            params.dummy_weights.fill(0.22);
+            params.offset_weights.fill(0.33);
+            params.offset_biases.fill(0.44);
+            if let Some(batch_norm) = &mut params.batch_norm {
+                batch_norm.scales.fill(0.55);
+                batch_norm.rolling_mean.fill(0.66);
+                batch_norm.rolling_variance.fill(0.77);
+            }
+
+            let path = std::env::temp_dir().join(format!(
+                "darknet-dcnv4-weights-{}-{batch_normalize}.weights",
+                std::process::id()
+            ));
+            save_weights(&network, &executable.params, &path, 19).expect("weights save");
+            let inspection = inspect_weights_file(&network, &path).expect("weights inspect");
+            let parameter_count = network.layers[0].weights().unwrap().parameter_count();
+            assert_eq!(inspection.file_size, 20 + 4 * parameter_count as u64);
+            assert_eq!(inspection.trailing_bytes, 0);
+            let arrays = &inspection.layers[0].arrays;
+            let expected_names = if batch_normalize {
+                vec![
+                    "biases",
+                    "scales",
+                    "rolling_mean",
+                    "rolling_variance",
+                    "weights",
+                    "offset_weights",
+                    "offset_biases",
+                ]
+            } else {
+                vec!["biases", "weights", "offset_weights", "offset_biases"]
+            };
+            assert_eq!(
+                arrays
+                    .iter()
+                    .map(|array| array.name.as_str())
+                    .collect::<Vec<_>>(),
+                expected_names
+            );
+
+            let mut reloaded = ExecutableNetwork::new(network);
+            reloaded.load_weights_file(&path).expect("weights load");
+            assert_eq!(reloaded.params, executable.params);
             let _ = fs::remove_file(path);
         }
     }

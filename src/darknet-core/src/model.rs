@@ -386,6 +386,25 @@ pub struct EmlConvolutionalSpec {
     pub residual: bool,
 }
 
+/// `[dcnv4]` deformable spatial aggregation, sourced from `Jev_laya`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Dcnv4Spec {
+    pub filters: usize,
+    pub groups: usize,
+    pub size: usize,
+    pub stride_x: usize,
+    pub stride_y: usize,
+    pub dilation: usize,
+    pub padding: usize,
+    pub batch_normalize: bool,
+    pub offset_scale: f32,
+    pub remove_center: bool,
+    pub d_stride: usize,
+    pub block_thread: usize,
+    pub softmax: bool,
+    pub activation: Activation,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConnectedSpec {
     pub output: usize,
@@ -1280,6 +1299,8 @@ pub enum LayerKind {
     Moe(MoeSpec),
     /// `[eml_convolutional]`: two parallel convolutions and an EML combine.
     EmlConvolutional(EmlConvolutionalSpec),
+    /// `[dcnv4]` / `[dcnv4_convolutional]`: channel-preserving deformable aggregation.
+    Dcnv4(Dcnv4Spec),
     Rnn(RnnSpec),
     Gru(GruSpec),
     Lstm(LstmSpec),
@@ -1339,6 +1360,7 @@ impl LayerKind {
             Self::KimiKda(_) => "kimi_kda",
             Self::Moe(_) => "moe_convolutional",
             Self::EmlConvolutional(_) => "eml_convolutional",
+            Self::Dcnv4(_) => "dcnv4",
             Self::Rnn(_) => "rnn",
             Self::Gru(_) => "gru",
             Self::Lstm(_) => "lstm",
@@ -1355,6 +1377,7 @@ impl LayerKind {
     pub fn activation(&self) -> Option<&Activation> {
         match self {
             Self::Convolutional(spec) => Some(&spec.activation),
+            Self::Dcnv4(spec) => Some(&spec.activation),
             Self::Deconvolutional(spec) => Some(&spec.activation),
             Self::Connected(spec) => Some(&spec.activation),
             Self::Shortcut(spec) => Some(&spec.activation),
@@ -1874,6 +1897,47 @@ impl Layer {
                 }
                 Some(LayerWeights { entries })
             }
+            LayerKind::Dcnv4(spec) => {
+                let channels = self.input_shape.channels;
+                let (dummy_weights, offset_weights, offset_dim) =
+                    dcnv4_parameter_layout(channels, spec)
+                        .expect("validated DCNv4 parameter geometry");
+                let mut entries = vec![WeightsEntry {
+                    array: WeightsArray::Biases,
+                    len: channels,
+                }];
+                if spec.batch_normalize {
+                    entries.extend([
+                        WeightsEntry {
+                            array: WeightsArray::Scales,
+                            len: channels,
+                        },
+                        WeightsEntry {
+                            array: WeightsArray::RollingMean,
+                            len: channels,
+                        },
+                        WeightsEntry {
+                            array: WeightsArray::RollingVariance,
+                            len: channels,
+                        },
+                    ]);
+                }
+                entries.extend([
+                    WeightsEntry {
+                        array: WeightsArray::Weights,
+                        len: dummy_weights,
+                    },
+                    WeightsEntry {
+                        array: WeightsArray::Named("offset_weights".to_owned()),
+                        len: offset_weights,
+                    },
+                    WeightsEntry {
+                        array: WeightsArray::Named("offset_biases".to_owned()),
+                        len: offset_dim,
+                    },
+                ]);
+                Some(LayerWeights { entries })
+            }
             LayerKind::Crnn(spec) => {
                 let mut entries = Vec::new();
                 append_convolutional_weight_entries(
@@ -2039,7 +2103,9 @@ impl Network {
                     .activation()
                     .is_some_and(|activation| activation.to_channel_normalization().is_some()),
             };
-            if channel_normalization && !matches!(&kind, LayerKind::Convolutional(_)) {
+            if channel_normalization
+                && !matches!(&kind, LayerKind::Convolutional(_) | LayerKind::Dcnv4(_))
+            {
                 return Err(Error::InvalidConfig(format!(
                     "[{}] at line {}: channel-normalizing activations are only supported on [convolutional]",
                     section.name, section.line
@@ -2144,6 +2210,7 @@ fn parse_layer_kind(
 ) -> Result<LayerKind> {
     let name = section.name.as_str();
     Ok(match name {
+        "dcnv4" | "dcnv4_convolutional" => LayerKind::Dcnv4(parse_dcnv4_spec(section, current)?),
         "eml_convolutional" => {
             let line = section.line;
             if current.width == 0 || current.height == 0 || current.channels == 0 {
@@ -3469,6 +3536,43 @@ fn infer_output_shape(
             spec.filters,
             current.batch,
         )),
+        LayerKind::Dcnv4(spec) => {
+            if current.channels == 0 || spec.groups == 0 || current.channels % spec.groups != 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[dcnv4] layer #{layer_index}: groups must be positive and divide input channels"
+                )));
+            }
+            let width = dcnv4_output_dim(
+                current.width,
+                spec.padding,
+                spec.size,
+                spec.stride_x,
+                spec.dilation,
+            )
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "[dcnv4] layer #{layer_index}: invalid or empty output width"
+                ))
+            })?;
+            let height = dcnv4_output_dim(
+                current.height,
+                spec.padding,
+                spec.size,
+                spec.stride_y,
+                spec.dilation,
+            )
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "[dcnv4] layer #{layer_index}: invalid or empty output height"
+                ))
+            })?;
+            Ok(TensorShape::new(
+                width,
+                height,
+                current.channels,
+                current.batch,
+            ))
+        }
         LayerKind::EmlConvolutional(spec) => {
             let conv = &spec.branch;
             if conv.filters == 0
@@ -4348,6 +4452,170 @@ pub const VIT_DIM_DEFAULT: usize = 128;
 pub const VIT_HEADS_DEFAULT: usize = 4;
 pub const LAYA_LAYERNORM_EPS: f32 = 1.0e-5;
 
+fn reject_unknown_dcnv4_keys(section: &RawSection) -> Result<()> {
+    const ALLOWED: &[&str] = &[
+        "filters",
+        "groups",
+        "size",
+        "stride",
+        "stride_x",
+        "stride_y",
+        "dilation",
+        "pad",
+        "padding",
+        "activation",
+        "batch_normalize",
+        "offset_scale",
+        "remove_center",
+        "d_stride",
+        "block_thread",
+        "softmax",
+        "learning_rate",
+        "dont_update",
+        "burnin_update",
+        "train_only_bn",
+        "clip",
+        "grad_centr",
+    ];
+    if let Some(key) = section
+        .values
+        .keys()
+        .find(|key| !ALLOWED.contains(&key.as_str()))
+    {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {}: unknown option `{key}`",
+            section.name, section.line
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn dcnv4_parameter_layout(
+    channels: usize,
+    spec: &Dcnv4Spec,
+) -> Option<(usize, usize, usize)> {
+    let area = spec.size.checked_mul(spec.size)?;
+    let points = area.checked_sub(usize::from(spec.remove_center))?;
+    let raw_offset_dim = spec.groups.checked_mul(points)?.checked_mul(3)?;
+    let offset_dim = raw_offset_dim
+        .checked_add(7)?
+        .checked_div(8)?
+        .checked_mul(8)?;
+    let dummy_weights = channels
+        .checked_div(spec.groups)?
+        .checked_mul(spec.filters)?
+        .checked_mul(area)?;
+    let offset_weights = offset_dim.checked_mul(channels)?.checked_mul(area)?;
+    Some((dummy_weights, offset_weights, offset_dim))
+}
+
+fn dcnv4_output_dim(
+    input: usize,
+    padding: usize,
+    size: usize,
+    stride: usize,
+    dilation: usize,
+) -> Option<usize> {
+    if stride == 0 || size == 0 || dilation == 0 {
+        return None;
+    }
+    let padded = input.checked_add(padding.checked_mul(2)?)?;
+    let kernel_extent = dilation.checked_mul(size.checked_sub(1)?)?;
+    padded
+        .checked_sub(kernel_extent)?
+        .checked_sub(1)?
+        .checked_div(stride)?
+        .checked_add(1)
+}
+
+fn parse_dcnv4_spec(section: &RawSection, input: TensorShape) -> Result<Dcnv4Spec> {
+    let line = section.line;
+    reject_unknown_dcnv4_keys(section)?;
+    let invalid = |message: &str| {
+        Error::InvalidConfig(format!("[{}] at line {line}: {message}", section.name))
+    };
+
+    // C++ forces filters to the input channel count, but still parses the cfg key.
+    let _configured_filters = section.get_i64("filters", 1)?;
+    let groups = section.get_i64("groups", 1)?.max(1) as usize;
+    let size = section.get_i64("size", 1)?.max(1) as usize;
+    let stride = section.get_i64("stride", 1)?.max(1) as usize;
+    let stride_x = section.get_i64("stride_x", -1)?;
+    let stride_y = section.get_i64("stride_y", -1)?;
+    let stride_x = if stride_x < 1 {
+        stride
+    } else {
+        stride_x as usize
+    };
+    let stride_y = if stride_y < 1 {
+        stride
+    } else {
+        stride_y as usize
+    };
+    let dilation = section.get_i64("dilation", 1)?.max(1) as usize;
+    let padding = if section.get_i64("pad", 0)? != 0 {
+        size / 2
+    } else {
+        section.get_usize("padding", 0)?
+    };
+    let batch_normalize = section.get_bool_int("batch_normalize", false)?;
+    let offset_scale = section.get_f32("offset_scale", 1.0)?;
+    let remove_center = section.get_bool_int("remove_center", false)?;
+    let d_stride = section.get_i64("d_stride", 8)?.max(1) as usize;
+    let block_thread = section.get_i64("block_thread", 256)?.max(1) as usize;
+    let block_thread = if block_thread >= 1024 {
+        1024
+    } else {
+        block_thread.next_power_of_two()
+    };
+    let softmax = section.get_bool_int("softmax", false)?;
+    let activation = Activation::parse(&section.get_str("activation", "logistic"));
+
+    if input.width == 0 || input.height == 0 || input.channels == 0 {
+        return Err(invalid("preceding layer must output a non-empty image"));
+    }
+    if groups == 0 || input.channels % groups != 0 {
+        return Err(invalid(&format!(
+            "groups={groups} must evenly divide input channels={}",
+            input.channels
+        )));
+    }
+    let area = size
+        .checked_mul(size)
+        .ok_or_else(|| invalid("kernel area overflows"))?;
+    if remove_center && area <= 1 {
+        return Err(invalid("remove_center=1 leaves no active kernel points"));
+    }
+    if !offset_scale.is_finite() {
+        return Err(invalid("offset_scale must be finite"));
+    }
+    let spec = Dcnv4Spec {
+        filters: input.channels,
+        groups,
+        size,
+        stride_x,
+        stride_y,
+        dilation,
+        padding,
+        batch_normalize,
+        offset_scale,
+        remove_center,
+        d_stride,
+        block_thread,
+        softmax,
+        activation,
+    };
+    if dcnv4_parameter_layout(input.channels, &spec).is_none() {
+        return Err(invalid("parameter dimensions overflow"));
+    }
+    if dcnv4_output_dim(input.width, padding, size, stride_x, dilation).is_none()
+        || dcnv4_output_dim(input.height, padding, size, stride_y, dilation).is_none()
+    {
+        return Err(invalid("invalid or empty output geometry"));
+    }
+    Ok(spec)
+}
+
 fn reject_unknown_swin_keys(section: &RawSection) -> Result<()> {
     const ALLOWED: &[&str] = &[
         "filters",
@@ -5148,6 +5416,146 @@ mod tests {
 
     fn build(text: &str) -> crate::error::Result<Network> {
         Network::from_config(ConfigFile::parse_str("t.cfg", text)?)
+    }
+
+    #[test]
+    fn dcnv4_aliases_defaults_and_weight_metadata() {
+        for alias in ["dcnv4", "dcnv4_convolutional"] {
+            let network = build(&format!(
+                "[net]\nwidth=5\nheight=4\nchannels=8\n[{alias}]\n"
+            ))
+            .unwrap_or_else(|error| panic!("[{alias}] should parse: {error}"));
+            let layer = &network.layers[0];
+            let LayerKind::Dcnv4(spec) = &layer.kind else {
+                panic!("expected DCNv4 for [{alias}]")
+            };
+            assert_eq!(layer.kind.name(), "dcnv4");
+            assert_eq!(layer.output_shape, super::TensorShape::new(5, 4, 8, 1));
+            assert_eq!(
+                (
+                    spec.filters,
+                    spec.groups,
+                    spec.size,
+                    spec.stride_x,
+                    spec.stride_y,
+                    spec.dilation,
+                    spec.padding,
+                    spec.batch_normalize,
+                    spec.offset_scale,
+                ),
+                (8, 1, 1, 1, 1, 1, 0, false, 1.0)
+            );
+            assert_eq!(
+                (
+                    spec.remove_center,
+                    spec.d_stride,
+                    spec.block_thread,
+                    spec.softmax,
+                    &spec.activation,
+                ),
+                (false, 8, 256, false, &super::Activation::Logistic)
+            );
+            let weights = layer.weights().expect("DCNv4 has serialized parameters");
+            assert_eq!(
+                weights
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.array.name(), entry.len))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("biases", 8),
+                    ("weights", 64),
+                    ("offset_weights", 64),
+                    ("offset_biases", 8),
+                ]
+            );
+            assert_eq!(weights.parameter_count(), 144);
+        }
+    }
+
+    #[test]
+    fn dcnv4_preserves_channels_and_matches_padding_stride_semantics() {
+        let network = build(
+            "[net]\nwidth=8\nheight=7\nchannels=4\n\
+             [dcnv4]\nfilters=9\ngroups=2\nsize=3\nstride=1\n\
+             stride_x=2\nstride_y=3\ndilation=1\npadding=2\npad=1\nblock_thread=3\n",
+        )
+        .expect("DCNv4 geometry should parse");
+        let LayerKind::Dcnv4(spec) = &network.layers[0].kind else {
+            panic!("expected DCNv4")
+        };
+        assert_eq!(
+            network.layers[0].output_shape,
+            super::TensorShape::new(4, 3, 4, 1)
+        );
+        assert_eq!(
+            (spec.filters, spec.groups, spec.padding, spec.block_thread),
+            (4, 2, 1, 4)
+        );
+    }
+
+    #[test]
+    fn dcnv4_batchnorm_weight_blocks_match_darknet_order() {
+        let network = build(
+            "[net]\nwidth=5\nheight=4\nchannels=4\n\
+             [dcnv4]\nfilters=4\ngroups=2\nsize=3\nremove_center=1\n\
+             batch_normalize=1\nsoftmax=1\n",
+        )
+        .expect("valid DCNv4 BN config should parse");
+        let weights = network.layers[0].weights().unwrap();
+        assert_eq!(
+            weights
+                .entries
+                .iter()
+                .map(|entry| (entry.array.name(), entry.len))
+                .collect::<Vec<_>>(),
+            vec![
+                ("biases", 4),
+                ("scales", 4),
+                ("rolling_mean", 4),
+                ("rolling_variance", 4),
+                ("weights", 72),
+                ("offset_weights", 1728),
+                ("offset_biases", 48),
+            ]
+        );
+        assert_eq!(weights.parameter_count(), 1864);
+    }
+
+    #[test]
+    fn dcnv4_rejects_unknown_options_and_invalid_geometry() {
+        for (cfg, expected) in [
+            (
+                "[net]\nwidth=4\nheight=4\nchannels=4\n[dcnv4]\nmystery=1\n",
+                "unknown option `mystery`",
+            ),
+            (
+                "[net]\nwidth=4\nheight=4\nchannels=4\n[dcnv4]\ngroups=3\n",
+                "groups=3",
+            ),
+            (
+                "[net]\nwidth=4\nheight=4\nchannels=4\n[dcnv4]\nsize=1\nremove_center=1\n",
+                "remove_center",
+            ),
+            (
+                "[net]\nwidth=4\nheight=4\nchannels=4\n[dcnv4]\nactivation=unknown\n",
+                "unsupported activation",
+            ),
+            (
+                "[net]\nwidth=4\nheight=4\nchannels=4\n[dcnv4]\noffset_scale=nan\n",
+                "offset_scale must be finite",
+            ),
+            (
+                "[net]\nwidth=2\nheight=2\nchannels=4\n[dcnv4]\nsize=5\n",
+                "output",
+            ),
+        ] {
+            let error = build(cfg).expect_err("invalid DCNv4 config must fail");
+            assert!(
+                error.to_string().contains(expected),
+                "expected error containing {expected:?}, got {error}"
+            );
+        }
     }
 
     #[test]

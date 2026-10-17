@@ -26,7 +26,7 @@ use crate::error::{Error, Result};
 use crate::image::PlanarRgbImage;
 use crate::maxpool_depth::{backward_maxpool_depth, forward_maxpool_depth};
 use crate::model::{
-    Activation, ConnectedSpec, ConvolutionalSpec, CrnnSpec, CropSpec, DropblockSpec,
+    Activation, ConnectedSpec, ConvolutionalSpec, CrnnSpec, CropSpec, Dcnv4Spec, DropblockSpec,
     EmlConvolutionalSpec, GruSpec, LayerKind, LocalSpec, LrPolicy, LstmSpec, NetConfig, Network,
     RnnSpec, RouteSpec, TensorShape,
 };
@@ -227,6 +227,17 @@ pub struct EmlConvolutionalParams {
     pub self_params: ConvolutionalParams,
 }
 
+/// `[dcnv4]` parameters. `dummy_weights` are compatibility-only; the offset
+/// projection is the learned spatial parameter block.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Dcnv4Params {
+    pub biases: Vec<f32>,
+    pub batch_norm: Option<BatchNormParams>,
+    pub dummy_weights: Vec<f32>,
+    pub offset_weights: Vec<f32>,
+    pub offset_biases: Vec<f32>,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayerParams {
@@ -263,6 +274,7 @@ pub enum LayerParams {
     Moe(MoeParams),
     /// `[eml_convolutional]`: the `input_layer` and `self_layer` conv blocks.
     EmlConvolutional(EmlConvolutionalParams),
+    Dcnv4(Dcnv4Params),
 }
 
 /// The parameters of one `[moe_convolutional]` layer.
@@ -361,6 +373,14 @@ pub struct EmlConvolutionalTrainBuffers {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct Dcnv4TrainBuffers {
+    pub bias_updates: Vec<f32>,
+    pub batch_norm: Option<BatchNormTrainBuffers>,
+    pub offset_weight_updates: Vec<f32>,
+    pub offset_bias_updates: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct VitTrainBuffers {
     /// Descending update directions (negative mathematical gradients), in
     /// `VitWeights` block shape/order.
@@ -408,6 +428,7 @@ pub enum LayerTrainBuffers {
     Crnn(CrnnTrainBuffers),
     Moe(MoeTrainBuffers),
     EmlConvolutional(EmlConvolutionalTrainBuffers),
+    Dcnv4(Dcnv4TrainBuffers),
     Vit(VitTrainBuffers),
     Swin(SwinTrainBuffers),
     TuckerAttention(TuckerAttentionTrainBuffers),
@@ -547,6 +568,7 @@ pub struct ForwardResult {
     /// the scaled expert gradients.
     pub moe_caches: Vec<Option<MoeForwardCache>>,
     pub eml_caches: Vec<Option<EmlForwardCache>>,
+    pub(crate) dcnv4_caches: Vec<Option<crate::dcnv4::Dcnv4ForwardCache>>,
     pub vit_caches: Vec<Option<crate::vit::VitForwardCache>>,
     pub swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>>,
     pub tucker_attention_caches: Vec<Option<crate::tucker_attention::TuckerAttentionForwardCache>>,
@@ -575,6 +597,7 @@ impl ForwardResult {
             recurrent_caches: Vec::new(),
             moe_caches: Vec::new(),
             eml_caches: Vec::new(),
+            dcnv4_caches: Vec::new(),
             vit_caches: Vec::new(),
             swin_caches: Vec::new(),
             tucker_attention_caches: Vec::new(),
@@ -605,6 +628,7 @@ mod forward_result_from_heads_tests {
         assert!(result.recurrent_caches.is_empty());
         assert!(result.moe_caches.is_empty());
         assert!(result.eml_caches.is_empty());
+        assert!(result.dcnv4_caches.is_empty());
         assert!(result.vit_caches.is_empty());
         assert!(result.swin_caches.is_empty());
         assert!(result.tucker_attention_caches.is_empty());
@@ -1287,6 +1311,46 @@ impl ExecutableNetwork {
                         batch,
                     );
                 }
+                (LayerParams::Dcnv4(params), LayerTrainBuffers::Dcnv4(train)) => {
+                    let layer_lr = lr * opts.learning_rate_scale;
+                    sgd_update(
+                        &mut params.offset_weights,
+                        &mut train.offset_weight_updates,
+                        layer_lr * 0.01,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                    sgd_update(
+                        &mut params.offset_biases,
+                        &mut train.offset_bias_updates,
+                        layer_lr * 0.01,
+                        momentum,
+                        0.0,
+                        batch,
+                    );
+                    if let (Some(params_bn), Some(train_bn)) =
+                        (&mut params.batch_norm, &mut train.batch_norm)
+                    {
+                        sgd_update(
+                            &mut params_bn.scales,
+                            &mut train_bn.scale_updates,
+                            layer_lr,
+                            momentum,
+                            0.0,
+                            batch,
+                        );
+                    } else {
+                        sgd_update(
+                            &mut params.biases,
+                            &mut train.bias_updates,
+                            layer_lr,
+                            momentum,
+                            0.0,
+                            batch,
+                        );
+                    }
+                }
                 (LayerParams::Vit(params), LayerTrainBuffers::Vit(train)) => {
                     let learned_pos = matches!(self.network.layers[layer_index].kind, LayerKind::Vit(ref spec) if spec.learned_pos_embed);
                     update_vit_params(
@@ -1691,6 +1755,7 @@ impl ExecutableNetwork {
         let mut modern_heads = Vec::new();
         let mut moe_caches = Vec::with_capacity(self.network.layers.len());
         let mut eml_caches = Vec::with_capacity(self.network.layers.len());
+        let mut dcnv4_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches = Vec::with_capacity(self.network.layers.len());
         let mut swin_caches = Vec::with_capacity(self.network.layers.len());
         let mut tucker_attention_caches = Vec::with_capacity(self.network.layers.len());
@@ -1721,6 +1786,7 @@ impl ExecutableNetwork {
             let mut tucker_attention_cache = None;
             let mut mambavision_cache = None;
             let mut kimi_kda_cache = None;
+            let mut dcnv4_cache = None;
             let (output, activation_input) = match (&layer.kind, params) {
                 (
                     LayerKind::Convolutional(spec),
@@ -1729,6 +1795,12 @@ impl ExecutableNetwork {
                     let conv =
                         resolve_convolutional_params(&self.network, &self.params, layer.index)?;
                     forward_convolutional_with_cache(spec, conv, current_input, layer.output_shape)
+                }
+                (LayerKind::Dcnv4(spec), LayerParams::Dcnv4(params)) => {
+                    let (output, activation_input, cache) =
+                        forward_dcnv4_with_cache(spec, params, current_input, layer.output_shape)?;
+                    dcnv4_cache = Some(cache);
+                    (output, Some(activation_input))
                 }
                 (LayerKind::Deconvolutional(spec), LayerParams::Convolutional(p)) => {
                     let pre = crate::deconvolutional::deconv_forward(
@@ -2287,6 +2359,7 @@ impl ExecutableNetwork {
             recurrent_caches.push(recurrent_cache);
             moe_caches.push(moe_cache);
             eml_caches.push(eml_cache);
+            dcnv4_caches.push(dcnv4_cache);
             vit_caches.push(vit_cache);
             swin_caches.push(swin_cache);
             tucker_attention_caches.push(tucker_attention_cache);
@@ -2302,6 +2375,7 @@ impl ExecutableNetwork {
             recurrent_caches,
             moe_caches,
             eml_caches,
+            dcnv4_caches,
             vit_caches,
             swin_caches,
             tucker_attention_caches,
@@ -2535,6 +2609,112 @@ impl ExecutableNetwork {
                     accumulate_previous_gradient(
                         layer.index,
                         &input_grad,
+                        &mut input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::Dcnv4(spec), LayerParams::Dcnv4(params)) => {
+                    let cache = forward
+                        .dcnv4_caches
+                        .get(layer.index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing [dcnv4] forward cache for layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let preactivation = forward.layer_activation_inputs[layer.index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing [dcnv4] activation cache for layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let output = &forward.layer_outputs[layer.index];
+                    let delta =
+                        if let Some(normalization) = spec.activation.to_channel_normalization() {
+                            Tensor {
+                                shape: layer.output_shape,
+                                data: darknet_cuda::host_ops::normalize_channels_backward(
+                                    &preactivation.data,
+                                    &output.data,
+                                    &grad.data,
+                                    layer.output_shape.batch,
+                                    layer.output_shape.channels,
+                                    layer.output_shape.width * layer.output_shape.height,
+                                    normalization,
+                                    GradMode::from_env() == GradMode::Cpp,
+                                ),
+                            }
+                        } else {
+                            apply_output_activation_gradient(
+                                output,
+                                &grad,
+                                &spec.activation,
+                                "dcnv4",
+                                Some(preactivation),
+                            )?
+                        };
+                    let mut aggregation_gradient = delta.data.clone();
+                    let mut biases_gradient = vec![0.0; params.biases.len()];
+                    let mut batch_norm_gradient =
+                        params.batch_norm.as_ref().map(|bn| BatchNormParams {
+                            biases: vec![0.0; bn.biases.len()],
+                            scales: vec![0.0; bn.scales.len()],
+                            rolling_mean: vec![0.0; bn.rolling_mean.len()],
+                            rolling_variance: vec![0.0; bn.rolling_variance.len()],
+                        });
+                    let spatial = layer.output_shape.width * layer.output_shape.height;
+                    for b in 0..layer.output_shape.batch {
+                        for channel in 0..layer.output_shape.channels {
+                            for q in 0..spatial {
+                                let index =
+                                    (b * layer.output_shape.channels + channel) * spatial + q;
+                                if let Some(bn) = params.batch_norm.as_ref() {
+                                    let inv_std = 1.0
+                                        / (bn.rolling_variance[channel] + BATCH_NORM_EPSILON)
+                                            .sqrt();
+                                    let normalized = (cache.raw_output[index]
+                                        - bn.rolling_mean[channel])
+                                        * inv_std;
+                                    batch_norm_gradient
+                                        .as_mut()
+                                        .expect("batch-norm gradient exists")
+                                        .scales[channel] += delta.data[index] * normalized;
+                                    aggregation_gradient[index] *= bn.scales[channel] * inv_std;
+                                } else {
+                                    biases_gradient[channel] += delta.data[index];
+                                }
+                            }
+                        }
+                    }
+                    let math_gradient = crate::dcnv4::dcnv4_backward(
+                        &current_input.data,
+                        current_input.shape,
+                        spec,
+                        &params.offset_weights,
+                        cache,
+                        &aggregation_gradient,
+                    )?;
+                    let gradients = Dcnv4Params {
+                        biases: biases_gradient,
+                        batch_norm: batch_norm_gradient,
+                        dummy_weights: vec![0.0; params.dummy_weights.len()],
+                        offset_weights: math_gradient.offset_weights,
+                        offset_biases: math_gradient.offset_biases,
+                    };
+                    let Some(LayerParams::Dcnv4(dst)) = param_gradients.get_mut(layer.index) else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing [dcnv4] parameter-gradient slot for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    *dst = gradients;
+                    accumulate_previous_gradient(
+                        layer.index,
+                        &Tensor::from_data(current_input.shape, math_gradient.input)?,
                         &mut input_gradient,
                         &mut layer_output_gradients,
                     )?;
@@ -3696,6 +3876,45 @@ impl ExecutableNetwork {
         }
 
         for layer in &self.network.layers {
+            let LayerKind::Dcnv4(spec) = &layer.kind else {
+                continue;
+            };
+            if !spec.batch_normalize {
+                continue;
+            }
+            let cache = forward
+                .dcnv4_caches
+                .get(layer.index)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "missing [dcnv4] forward cache for BN stats at layer #{}",
+                        layer.index
+                    ))
+                })?;
+            let raw = Tensor::from_data(layer.output_shape, cache.raw_output.clone())?;
+            let (mean, variance) = channel_mean_variance(&raw);
+            let Some(LayerParams::Dcnv4(params)) = self.params.get_mut(layer.index) else {
+                return Err(Error::InvalidConfig(format!(
+                    "missing [dcnv4] params for BN stats at layer #{}",
+                    layer.index
+                )));
+            };
+            let Some(batch_norm) = params.batch_norm.as_mut() else {
+                return Err(Error::InvalidConfig(format!(
+                    "missing [dcnv4] batch-norm params at layer #{}",
+                    layer.index
+                )));
+            };
+            update_batch_norm_running_stats(
+                batch_norm,
+                &mean,
+                &variance,
+                BATCH_NORM_ROLLING_KEEP_CPU,
+            )?;
+        }
+
+        for layer in &self.network.layers {
             let LayerKind::Connected(spec) = &layer.kind else {
                 continue;
             };
@@ -3976,6 +4195,35 @@ impl ExecutableNetwork {
                         &gradient.self_params,
                     )?;
                 }
+                (LayerKind::Dcnv4(_), LayerParams::Dcnv4(gradient)) => {
+                    let Some(LayerTrainBuffers::Dcnv4(train)) =
+                        self.train_buffers.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing DCNv4 train buffers for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    accumulate_vec(&mut train.bias_updates, &gradient.biases)?;
+                    accumulate_vec(&mut train.offset_weight_updates, &gradient.offset_weights)?;
+                    accumulate_vec(&mut train.offset_bias_updates, &gradient.offset_biases)?;
+                    match (&mut train.batch_norm, &gradient.batch_norm) {
+                        (Some(train_bn), Some(gradient_bn)) => {
+                            accumulate_vec(&mut train_bn.scale_updates, &gradient_bn.scales)?;
+                            accumulate_vec(&mut train_bn.mean_delta, &gradient_bn.rolling_mean)?;
+                            accumulate_vec(
+                                &mut train_bn.variance_delta,
+                                &gradient_bn.rolling_variance,
+                            )?;
+                        }
+                        (None, None) => {}
+                        _ => {
+                            return Err(Error::InvalidConfig(
+                                "DCNv4 train-buffer batchnorm mismatch".to_owned(),
+                            ));
+                        }
+                    }
+                }
                 (LayerKind::Vit(_), LayerParams::Vit(gradient)) => {
                     let Some(LayerTrainBuffers::Vit(train)) =
                         self.train_buffers.get_mut(layer.index)
@@ -4238,6 +4486,15 @@ fn host_adam_scalar_capacity(params: &LayerParams) -> usize {
         LayerParams::EmlConvolutional(params) => {
             convolutional_parameter_count(&params.input)
                 + convolutional_parameter_count(&params.self_params)
+        }
+        LayerParams::Dcnv4(params) => {
+            params.biases.len()
+                + params.offset_weights.len()
+                + params.offset_biases.len()
+                + params
+                    .batch_norm
+                    .as_ref()
+                    .map_or(0, |bn| bn.scales.len() + bn.biases.len())
         }
         LayerParams::None
         | LayerParams::LayaScorer(_)
@@ -6159,10 +6416,11 @@ where
                         | LayerParams::Lstm(_)
                         | LayerParams::Crnn(_)
                         | LayerParams::EmlConvolutional(_)
+                        | LayerParams::Dcnv4(_)
                 )
             }) {
                 return Err(Error::InvalidConfig(
-                    "adam=1 on the GPU path supports convolutional, connected, local, shortcut, MoE, standalone batchnorm, ViT, Swin, Tucker attention, MambaVision, Kimi KDA, and GRU/RNN/LSTM/CRNN layers"
+                    "adam=1 on the GPU path supports convolutional, connected, local, shortcut, DCNv4, MoE, standalone batchnorm, ViT, Swin, Tucker attention, MambaVision, Kimi KDA, and GRU/RNN/LSTM/CRNN layers"
                         .to_string(),
                 ));
             }
@@ -6531,6 +6789,48 @@ where
                         &mut moments.biases,
                         adam,
                     )?;
+                }
+                (LayerParams::Dcnv4(params), LayerTrainBuffers::Dcnv4(train)) => {
+                    let moments =
+                        moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    let offset_adam = AdamParams {
+                        lr: adam.lr * 0.01,
+                        ..*adam
+                    };
+                    apply_host_adam(
+                        &mut params.offset_weights,
+                        &mut train.offset_weight_updates,
+                        &mut moments.weights,
+                        &offset_adam,
+                    )?;
+                    apply_host_adam_non_weight(
+                        &mut params.offset_biases,
+                        &mut train.offset_bias_updates,
+                        &mut host_adam_child(moments, 0).biases,
+                        &offset_adam,
+                    )?;
+                    if params.batch_norm.is_none() {
+                        apply_host_adam_non_weight(
+                            &mut params.biases,
+                            &mut train.bias_updates,
+                            &mut moments.biases,
+                            adam,
+                        )?;
+                    }
+                    match (&mut params.batch_norm, &mut train.batch_norm) {
+                        (Some(params_bn), Some(train_bn)) => apply_host_adam_non_weight(
+                            &mut params_bn.scales,
+                            &mut train_bn.scale_updates,
+                            &mut moments.scales,
+                            adam,
+                        )?,
+                        (None, None) => {}
+                        _ => {
+                            return Err(Error::InvalidConfig(
+                                "DCNv4 Adam batchnorm mismatch".to_owned(),
+                            ));
+                        }
+                    }
                 }
                 (LayerParams::Moe(params), LayerTrainBuffers::Moe(train)) => {
                     if params.experts.len() != train.experts.len() {
@@ -6953,6 +7253,46 @@ where
                         batch,
                     );
                 }
+                (LayerParams::Dcnv4(params), LayerTrainBuffers::Dcnv4(train)) => {
+                    let layer_lr = lr * layer.train.learning_rate_scale;
+                    sgd_update(
+                        &mut params.offset_weights,
+                        &mut train.offset_weight_updates,
+                        layer_lr * 0.01,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                    sgd_update(
+                        &mut params.offset_biases,
+                        &mut train.offset_bias_updates,
+                        layer_lr * 0.01,
+                        momentum,
+                        0.0,
+                        batch,
+                    );
+                    if let (Some(params_bn), Some(train_bn)) =
+                        (&mut params.batch_norm, &mut train.batch_norm)
+                    {
+                        sgd_update(
+                            &mut params_bn.scales,
+                            &mut train_bn.scale_updates,
+                            layer_lr,
+                            momentum,
+                            0.0,
+                            batch,
+                        );
+                    } else {
+                        sgd_update(
+                            &mut params.biases,
+                            &mut train.bias_updates,
+                            layer_lr,
+                            momentum,
+                            0.0,
+                            batch,
+                        );
+                    }
+                }
                 (LayerParams::Rnn(params), LayerTrainBuffers::Rnn(train)) => {
                     update_connected_params(
                         &mut params.input,
@@ -7363,6 +7703,7 @@ where
         let mut moe_caches: Vec<Option<MoeForwardCache>> = Vec::new();
         let mut eml_caches: Vec<Option<EmlForwardCache>> =
             Vec::with_capacity(self.network.layers.len());
+        let mut dcnv4_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches: Vec<Option<crate::vit::VitForwardCache>> =
             Vec::with_capacity(self.network.layers.len());
         let mut swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>> =
@@ -7401,6 +7742,7 @@ where
             let mut tucker_attention_cache = None;
             let mut mambavision_cache = None;
             let mut kimi_kda_cache = None;
+            let mut dcnv4_cache = None;
             let mut moe_cache = None;
             let mut eml_cache = None;
             let mut gpu_rnn_cache = None;
@@ -7933,6 +8275,25 @@ where
                     self.backend
                         .upload_f32(&tensor_backend_shape(layer.output_shape), &probs)
                         .map_err(|err| backend_error("upload laya_loss output", err))?
+                }
+                (LayerKind::Dcnv4(spec), LayerParams::Dcnv4(params)) => {
+                    let host_input = self
+                        .download_tensor(current_input, layer.input_shape)
+                        .map_err(|err| backend_error("download DCNv4 input", err))?;
+                    let (host_output, host_activation, cache) =
+                        forward_dcnv4_with_cache(spec, params, &host_input, layer.output_shape)?;
+                    dcnv4_cache = Some(cache);
+                    activation_input_gpu = Some(
+                        self.backend
+                            .upload_f32(
+                                &tensor_backend_shape(layer.output_shape),
+                                &host_activation.data,
+                            )
+                            .map_err(|err| backend_error("upload DCNv4 activation cache", err))?,
+                    );
+                    self.backend
+                        .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
+                        .map_err(|err| backend_error("upload DCNv4 output", err))?
                 }
                 (LayerKind::Vit(spec), LayerParams::Vit(weights)) => {
                     let host_input = self
@@ -8989,6 +9350,7 @@ where
             }
             moe_caches.push(moe_cache);
             eml_caches.push(eml_cache);
+            dcnv4_caches.push(dcnv4_cache);
             vit_caches.push(vit_cache);
             swin_caches.push(swin_cache);
             tucker_attention_caches.push(tucker_attention_cache);
@@ -9014,6 +9376,7 @@ where
                 recurrent_caches,
                 moe_caches,
                 eml_caches,
+                dcnv4_caches,
                 vit_caches,
                 swin_caches,
                 tucker_attention_caches,
@@ -9052,6 +9415,7 @@ where
                 LayerKind::Connected(_)
                     | LayerKind::Deconvolutional(_)
                     | LayerKind::EmlConvolutional(_)
+                    | LayerKind::Dcnv4(_)
                     | LayerKind::Reorg(_)
                     | LayerKind::ChannelSlice(_)
                     | LayerKind::ChannelShuffle(_)
@@ -11493,7 +11857,8 @@ where
                 | LayerKind::Swin(_)
                 | LayerKind::TuckerAttention(_)
                 | LayerKind::MambaVision(_)
-                | LayerKind::KimiKda(_) => return true,
+                | LayerKind::KimiKda(_)
+                | LayerKind::Dcnv4(_) => return true,
                 // Connected layers are handled on the GPU path with a host
                 // round trip unless their activation or batch norm
                 // (batch-statistics training) is unsupported.
@@ -13737,6 +14102,9 @@ fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
         LayerKind::EmlConvolutional(spec) => LayerParams::EmlConvolutional(
             default_eml_convolutional_params(layer.input_shape.channels, spec),
         ),
+        LayerKind::Dcnv4(spec) => {
+            LayerParams::Dcnv4(default_dcnv4_params(layer.input_shape.channels, spec))
+        }
         LayerKind::Shortcut(spec) => match spec.weight_count(layer.input_shape.channels) {
             0 => LayerParams::None,
             len => LayerParams::Shortcut(ShortcutParams {
@@ -13928,6 +14296,10 @@ fn default_layer_train_buffers(layer: &crate::model::Layer) -> LayerTrainBuffers
         LayerKind::EmlConvolutional(spec) => LayerTrainBuffers::EmlConvolutional(
             default_eml_convolutional_train_buffers(layer.input_shape.channels, spec),
         ),
+        LayerKind::Dcnv4(spec) => LayerTrainBuffers::Dcnv4(default_dcnv4_train_buffers(
+            layer.input_shape.channels,
+            spec,
+        )),
         LayerKind::TuckerAttention(spec) => {
             let params = crate::tucker_attention::TuckerAttentionParams::zeroed(
                 layer.input_shape.channels,
@@ -14016,6 +14388,21 @@ fn default_moe_params(input_channels: usize, spec: &crate::model::MoeSpec) -> Mo
     }
 }
 
+fn default_dcnv4_params(input_channels: usize, spec: &Dcnv4Spec) -> Dcnv4Params {
+    let (dummy_count, offset_weight_count, offset_dim) =
+        crate::model::dcnv4_parameter_layout(input_channels, spec)
+            .expect("validated DCNv4 parameter geometry");
+    Dcnv4Params {
+        biases: vec![0.0; spec.filters],
+        batch_norm: spec
+            .batch_normalize
+            .then(|| default_batchnorm_params(spec.filters)),
+        dummy_weights: vec![0.0; dummy_count],
+        offset_weights: vec![0.0; offset_weight_count],
+        offset_biases: vec![0.0; offset_dim],
+    }
+}
+
 fn default_eml_convolutional_params(
     input_channels: usize,
     spec: &EmlConvolutionalSpec,
@@ -14055,6 +14442,22 @@ fn default_moe_train_buffers(
                 )
             })
             .collect(),
+    }
+}
+
+fn default_dcnv4_train_buffers(input_channels: usize, spec: &Dcnv4Spec) -> Dcnv4TrainBuffers {
+    let (_, offset_weight_count, offset_dim) =
+        crate::model::dcnv4_parameter_layout(input_channels, spec)
+            .expect("validated DCNv4 parameter geometry");
+    Dcnv4TrainBuffers {
+        bias_updates: vec![0.0; spec.filters],
+        batch_norm: spec.batch_normalize.then(|| BatchNormTrainBuffers {
+            scale_updates: vec![0.0; spec.filters],
+            mean_delta: vec![0.0; spec.filters],
+            variance_delta: vec![0.0; spec.filters],
+        }),
+        offset_weight_updates: vec![0.0; offset_weight_count],
+        offset_bias_updates: vec![0.0; offset_dim],
     }
 }
 
@@ -15184,6 +15587,46 @@ fn apply_host_adam_layer(
                 adam,
             )?;
         }
+        (LayerParams::Dcnv4(params), LayerTrainBuffers::Dcnv4(train)) => {
+            let offset_adam = AdamParams {
+                lr: adam.lr * 0.01,
+                ..*adam
+            };
+            apply_host_adam(
+                &mut params.offset_weights,
+                &mut train.offset_weight_updates,
+                &mut state.weights,
+                &offset_adam,
+            )?;
+            apply_host_adam_non_weight(
+                &mut params.offset_biases,
+                &mut train.offset_bias_updates,
+                &mut host_adam_child(state, 0).biases,
+                &offset_adam,
+            )?;
+            if params.batch_norm.is_none() {
+                apply_host_adam_non_weight(
+                    &mut params.biases,
+                    &mut train.bias_updates,
+                    &mut state.biases,
+                    adam,
+                )?;
+            }
+            match (&mut params.batch_norm, &mut train.batch_norm) {
+                (Some(params_bn), Some(train_bn)) => apply_host_adam_non_weight(
+                    &mut params_bn.scales,
+                    &mut train_bn.scale_updates,
+                    &mut state.scales,
+                    adam,
+                )?,
+                (None, None) => {}
+                _ => {
+                    return Err(Error::InvalidConfig(
+                        "DCNv4 Adam batchnorm mismatch".to_owned(),
+                    ));
+                }
+            }
+        }
         (LayerParams::Moe(params), LayerTrainBuffers::Moe(train)) => {
             if params.experts.len() != train.experts.len() {
                 return Err(Error::InvalidConfig(
@@ -15672,6 +16115,17 @@ fn load_weights_into_params(
                         branch.groups,
                     )?;
                 }
+            }
+            LayerParams::Dcnv4(dcnv4) => {
+                read_f32_into(&mut file, &mut dcnv4.biases)?;
+                if let Some(batch_norm) = dcnv4.batch_norm.as_mut() {
+                    read_f32_into(&mut file, &mut batch_norm.scales)?;
+                    read_f32_into(&mut file, &mut batch_norm.rolling_mean)?;
+                    read_f32_into(&mut file, &mut batch_norm.rolling_variance)?;
+                }
+                read_f32_into(&mut file, &mut dcnv4.dummy_weights)?;
+                read_f32_into(&mut file, &mut dcnv4.offset_weights)?;
+                read_f32_into(&mut file, &mut dcnv4.offset_biases)?;
             }
             LayerParams::Shortcut(shortcut) => {
                 read_f32_into(&mut file, &mut shortcut.weights)?;
@@ -16204,6 +16658,44 @@ fn activate_convolution_value(activation: &Activation, value: f32) -> f32 {
     } else {
         activate(activation.clone(), value)
     }
+}
+
+fn forward_dcnv4_with_cache(
+    spec: &Dcnv4Spec,
+    params: &Dcnv4Params,
+    input: &Tensor,
+    output_shape: TensorShape,
+) -> Result<(Tensor, Tensor, crate::dcnv4::Dcnv4ForwardCache)> {
+    let (raw_output, cache) = crate::dcnv4::dcnv4_forward(
+        &input.data,
+        input.shape,
+        spec,
+        &params.offset_weights,
+        &params.offset_biases,
+    )?;
+    let spatial = output_shape.width * output_shape.height;
+    let mut activation_input = Tensor::zeros(output_shape);
+    let mut output = Tensor::zeros(output_shape);
+    for b in 0..output_shape.batch {
+        for channel in 0..output_shape.channels {
+            let bn = params.batch_norm.as_ref();
+            let inv_std =
+                bn.map(|bn| 1.0 / (bn.rolling_variance[channel] + BATCH_NORM_EPSILON).sqrt());
+            for q in 0..spatial {
+                let index = (b * output_shape.channels + channel) * spatial + q;
+                let raw = raw_output[index];
+                let preactivation = if let (Some(bn), Some(inv_std)) = (bn, inv_std) {
+                    (raw - bn.rolling_mean[channel]) * inv_std * bn.scales[channel]
+                } else {
+                    raw + params.biases[channel]
+                };
+                activation_input.data[index] = preactivation;
+                output.data[index] = activate_convolution_value(&spec.activation, preactivation);
+            }
+        }
+    }
+    apply_convolution_channel_normalization(&mut output, &activation_input, &spec.activation);
+    Ok((output, activation_input, cache))
 }
 
 fn forward_convolutional_with_cache(
@@ -22744,6 +23236,259 @@ mod tests {
         cpu.update_weights(0.01, 0.2, 0.1, 1);
         gpu.update_weights_gpu(0.01, 0.2, 0.1, 1).unwrap();
         assert_eq!(gpu.params, cpu.params);
+    }
+
+    #[test]
+    fn dcnv4_runtime_backward_and_fake_backend_host_fallback_match() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "dcnv4-runtime.cfg",
+                "[net]\nwidth=4\nheight=4\nchannels=1\nbatch=1\n\
+                 [dcnv4]\nsize=1\npadding=0\nd_stride=2\nsoftmax=0\
+                 \noffset_scale=0.6\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        let LayerParams::Dcnv4(params) = &mut cpu.params[0] else {
+            panic!("DCNv4 params")
+        };
+        params.offset_weights[0] = 0.002;
+        params.offset_weights[1] = 0.003;
+        params.offset_weights[2] = 0.001;
+        params.offset_biases[0] = 0.13;
+        params.offset_biases[1] = 0.19;
+        params.offset_biases[2] = 0.8;
+        params.biases[0] = 0.07;
+        let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+        gpu.params = cpu.params.clone();
+        assert!(gpu.requires_cpu_backward_fallback());
+
+        let input = Tensor::from_data(
+            TensorShape::new(4, 4, 1, 1),
+            (0..16).map(|index| 0.3 + index as f32 * 0.037).collect(),
+        )
+        .unwrap();
+        let cpu_forward = cpu.forward_training(&input).unwrap();
+        assert!(cpu_forward.dcnv4_caches[0].is_some());
+        let gpu_forward = gpu.forward_training_with_state(&input).unwrap();
+        assert_eq!(
+            gpu_forward.cpu_forward.final_output(),
+            cpu_forward.final_output()
+        );
+        assert_eq!(
+            gpu_forward.cpu_forward.dcnv4_caches,
+            cpu_forward.dcnv4_caches
+        );
+
+        let seed = Tensor::from_data(
+            TensorShape::new(4, 4, 1, 1),
+            (0..16)
+                .map(|index| ((index % 5) as f32 - 2.0) * 0.21)
+                .collect(),
+        )
+        .unwrap();
+        let seeds = [Some(seed.clone())];
+        let backward = cpu
+            .backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .unwrap();
+        let LayerParams::Dcnv4(gradient) = &backward.param_gradients[0] else {
+            panic!("DCNv4 gradients")
+        };
+        let objective = |input: &Tensor, params: &[LayerParams]| {
+            let mut executable = ExecutableNetwork::new(network.clone());
+            executable.params = params.to_vec();
+            let output = executable
+                .forward(input)
+                .unwrap()
+                .final_output()
+                .unwrap()
+                .clone();
+            output
+                .data
+                .iter()
+                .zip(&seed.data)
+                .map(|(value, grad)| value * grad)
+                .sum::<f32>()
+        };
+        let epsilon = 1.0e-3;
+        // Check input, offset projection, offset bias, and ordinary channel bias.
+        let mut plus_input = input.clone();
+        plus_input.data[5] += epsilon;
+        let mut minus_input = input.clone();
+        minus_input.data[5] -= epsilon;
+        let numerical_input = (objective(&plus_input, &cpu.params)
+            - objective(&minus_input, &cpu.params))
+            / (2.0 * epsilon);
+        assert!((backward.input_gradient.data[5] - numerical_input).abs() < 3.0e-3);
+        for (actual, block, index) in [
+            (gradient.offset_weights[0], 0, 0),
+            (gradient.offset_biases[0], 1, 0),
+            (gradient.biases[0], 2, 0),
+        ] {
+            let mut plus = cpu.params.clone();
+            let mut minus = cpu.params.clone();
+            let perturb = |params: &mut [LayerParams], delta: f32| {
+                let LayerParams::Dcnv4(dcnv4) = &mut params[0] else {
+                    panic!("DCNv4 params")
+                };
+                match block {
+                    0 => dcnv4.offset_weights[index] += delta,
+                    1 => dcnv4.offset_biases[index] += delta,
+                    _ => dcnv4.biases[index] += delta,
+                }
+            };
+            perturb(&mut plus, epsilon);
+            perturb(&mut minus, -epsilon);
+            let fd = (objective(&input, &plus) - objective(&input, &minus)) / (2.0 * epsilon);
+            assert!(
+                (actual - fd).abs() < 3.0e-3,
+                "gradient mismatch: {actual} vs {fd}"
+            );
+        }
+
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .unwrap();
+        assert_eq!(
+            cpu.train_buffers,
+            gpu.cpu_fallback_train_buffers.borrow().clone()
+        );
+        cpu.update_weights(0.01, 0.2, 0.1, 1);
+        gpu.update_weights_gpu(0.01, 0.2, 0.1, 1).unwrap();
+        assert_eq!(gpu.params, cpu.params);
+        let LayerParams::Dcnv4(after) = &cpu.params[0] else {
+            panic!("DCNv4 params")
+        };
+        assert!(after.dummy_weights.iter().all(|value| *value == 0.0));
+    }
+
+    #[test]
+    fn dcnv4_batchnorm_scale_derivative_and_rolling_stats_use_host_fallback() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "dcnv4-bn-runtime.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=1\nbatch=1\n\
+                 [dcnv4]\nsize=1\npadding=0\nbatch_normalize=1\
+                 \nd_stride=1\nsoftmax=0\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        let LayerParams::Dcnv4(params) = &mut cpu.params[0] else {
+            panic!("DCNv4 params")
+        };
+        params.offset_biases[2] = 1.0;
+        params.biases[0] = 7.0; // C++ DCNv4's BN path does not add ordinary biases.
+        let batch_norm = params.batch_norm.as_mut().unwrap();
+        batch_norm.scales[0] = 1.3;
+        batch_norm.rolling_mean[0] = 0.2;
+        batch_norm.rolling_variance[0] = 0.7;
+
+        let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+        gpu.params = cpu.params.clone();
+        let input =
+            Tensor::from_data(TensorShape::new(2, 2, 1, 1), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let cpu_forward = cpu.forward_training(&input).unwrap();
+        let expected = input
+            .data
+            .iter()
+            .map(|value| (value - 0.2) / (0.7 + super::BATCH_NORM_EPSILON).sqrt() * 1.3)
+            .collect::<Vec<_>>();
+        for (actual, expected) in cpu_forward
+            .final_output()
+            .unwrap()
+            .data
+            .iter()
+            .zip(expected)
+        {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
+        let gpu_forward = gpu.forward_training_with_state(&input).unwrap();
+        assert_eq!(
+            gpu_forward.cpu_forward.final_output(),
+            cpu_forward.final_output()
+        );
+        let seed = Tensor::filled(TensorShape::new(2, 2, 1, 1), 0.5);
+        let seeds = [Some(seed)];
+        let backward = cpu
+            .backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .unwrap();
+        let LayerParams::Dcnv4(gradient) = &backward.param_gradients[0] else {
+            panic!("DCNv4 gradients")
+        };
+        let expected_scale_gradient = input
+            .data
+            .iter()
+            .map(|value| 0.5 * (value - 0.2) / (0.7 + super::BATCH_NORM_EPSILON).sqrt())
+            .sum::<f32>();
+        assert!(
+            (gradient.batch_norm.as_ref().unwrap().scales[0] - expected_scale_gradient).abs()
+                < 1.0e-5,
+            "actual scale gradient {}, expected {expected_scale_gradient}",
+            gradient.batch_norm.as_ref().unwrap().scales[0]
+        );
+        assert_eq!(gradient.biases, vec![0.0]);
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .unwrap();
+        assert_eq!(cpu.params, gpu.params);
+        assert_eq!(
+            cpu.train_buffers,
+            gpu.cpu_fallback_train_buffers.borrow().clone()
+        );
+        let LayerParams::Dcnv4(params) = &cpu.params[0] else {
+            panic!("DCNv4 params")
+        };
+        let batch_norm = params.batch_norm.as_ref().unwrap();
+        assert!((batch_norm.rolling_mean[0] - 0.43).abs() < 1.0e-6);
+        assert!((batch_norm.rolling_variance[0] - 0.796_666_7).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn dcnv4_host_adam_and_optimizer_state_round_trip() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "dcnv4-adam.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=1\nadam=1\ndecay=0.05\n\
+                 [dcnv4]\nsize=1\npadding=0\nsoftmax=0\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        let LayerParams::Dcnv4(params) = &mut cpu.params[0] else {
+            panic!("DCNv4 params")
+        };
+        params.offset_weights.fill(0.25);
+        params.offset_biases.fill(0.5);
+        params.biases.fill(0.75);
+        let LayerTrainBuffers::Dcnv4(train) = &mut cpu.train_buffers[0] else {
+            panic!("DCNv4 train buffers")
+        };
+        train.offset_weight_updates.fill(-0.5);
+        train.offset_bias_updates.fill(-0.25);
+        train.bias_updates.fill(-0.75);
+
+        let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+        gpu.params = cpu.params.clone();
+        *gpu.cpu_fallback_train_buffers.borrow_mut() = cpu.train_buffers.clone();
+        cpu.update_weights_adam(0.01, 1).unwrap();
+        gpu.update_weights_gpu(0.01, 0.0, 0.05, 1).unwrap();
+        assert_eq!(gpu.params, cpu.params);
+        assert_eq!(
+            gpu.cpu_fallback_train_buffers.borrow().clone(),
+            cpu.train_buffers
+        );
+
+        let path =
+            std::env::temp_dir().join(format!("darknet-dcnv4-adam-{}.state", std::process::id()));
+        cpu.save_optimizer_state(&path).unwrap();
+        let mut restored = ExecutableNetwork::new(network);
+        restored.load_optimizer_state(&path).unwrap();
+        assert_eq!(restored.host_adam_state, cpu.host_adam_state);
+        assert_eq!(restored.adam_step, cpu.adam_step);
+        let _ = fs::remove_file(path);
     }
 
     #[test]

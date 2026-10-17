@@ -235,6 +235,25 @@ pub fn initialize_training_params(network: &Network, params: &mut [LayerParams],
                 conv(&mut p.input, &mut rng);
                 conv(&mut p.self_params, &mut rng);
             }
+            LayerParams::Dcnv4(p) => {
+                let crate::LayerKind::Dcnv4(spec) = &layer.kind else {
+                    unreachable!("DCNv4 parameters require a DCNv4 layer");
+                };
+                p.biases.fill(0.0);
+                p.dummy_weights.fill(0.0);
+                p.offset_weights.fill(0.0);
+                p.offset_biases.fill(0.0);
+                let points = spec.size * spec.size - usize::from(spec.remove_center);
+                for group in 0..spec.groups {
+                    for point in 0..points {
+                        p.offset_biases[group * points * 3 + 2 * points + point] =
+                            if spec.softmax { 0.0 } else { 1.0 };
+                    }
+                }
+                if let Some(batch_norm) = &mut p.batch_norm {
+                    bn(batch_norm);
+                }
+            }
             LayerParams::Rnn(p) => {
                 for p in [&mut p.input, &mut p.self_params, &mut p.output] {
                     connected(p, &mut rng);
@@ -318,6 +337,35 @@ impl Rng {
 mod tests {
     use super::*;
     use crate::{ConfigFile, ExecutableNetwork};
+    #[test]
+    fn dcnv4_initialization_zeros_projection_and_sets_mask_prior() {
+        for (softmax, expected_mask) in [(false, 1.0), (true, 0.0)] {
+            let cfg = ConfigFile::parse_str(
+                "dcnv4-init.cfg",
+                &format!(
+                    "[net]\nwidth=1\nheight=1\nchannels=2\n\
+                     [dcnv4]\nsize=1\nbatch_normalize=1\nsoftmax={}\n",
+                    usize::from(softmax)
+                ),
+            )
+            .unwrap();
+            let network = Network::from_config(cfg).unwrap();
+            let mut executable = ExecutableNetwork::new(network.clone());
+            initialize_training_params(&network, &mut executable.params, 9);
+            let LayerParams::Dcnv4(params) = &executable.params[0] else {
+                panic!("DCNv4 params")
+            };
+            assert!(params.dummy_weights.iter().all(|value| *value == 0.0));
+            assert!(params.offset_weights.iter().all(|value| *value == 0.0));
+            assert_eq!(params.offset_biases[2], expected_mask);
+            assert_eq!(params.biases, vec![0.0, 0.0]);
+            let batch_norm = params.batch_norm.as_ref().unwrap();
+            assert_eq!(batch_norm.scales, vec![1.0, 1.0]);
+            assert_eq!(batch_norm.rolling_mean, vec![0.0, 0.0]);
+            assert_eq!(batch_norm.rolling_variance, vec![0.0, 0.0]);
+        }
+    }
+
     #[test]
     fn loading_weights_overrides_initialization_and_preserves_seen() {
         let cfg = ConfigFile::parse_str("init.cfg", "[net]\nwidth=1\nheight=1\nchannels=4\n[connected]\noutput=3\nbatch_normalize=1\nactivation=linear\n").unwrap();

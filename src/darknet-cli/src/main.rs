@@ -3199,6 +3199,18 @@ fn print_forward_backward_summary(
                 kimi.bias_updates.iter().any(|value| *value != 0.0)
                     || kimi.weight_updates.iter().any(|value| *value != 0.0)
             }
+            darknet_core::LayerTrainBuffers::Dcnv4(dcnv4) => {
+                dcnv4.bias_updates.iter().any(|value| *value != 0.0)
+                    || dcnv4.offset_bias_updates.iter().any(|value| *value != 0.0)
+                    || dcnv4
+                        .offset_weight_updates
+                        .iter()
+                        .any(|value| *value != 0.0)
+                    || dcnv4
+                        .batch_norm
+                        .as_ref()
+                        .is_some_and(|bn| bn.scale_updates.iter().any(|value| *value != 0.0))
+            }
             darknet_core::LayerTrainBuffers::Gru(_)
             | darknet_core::LayerTrainBuffers::Rnn(_)
             | darknet_core::LayerTrainBuffers::Lstm(_)
