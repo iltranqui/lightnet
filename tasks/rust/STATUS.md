@@ -656,10 +656,10 @@ believing a `cfg_corpus` failure.
    residual/bias epilogue, the row-softmax backward and the batched-GEMM wrapper
    (`linear_f32`) are all in, each with a host default plus GPU parity tests.
    That unblocks `vit`, `swin`/`transformer`, `tucker_attention`, `mambavision`,
-   `kimi_kda`, `minimax_sparse_attention` and the LAYA encoder/head. Still to
-   decide when writing those layers: whether the `flash_attention` /
-   `vc_attention` fast paths (decision 3) get their own kernels or reuse the
-   reference attention path.
+   `kimi_kda`, `minimax_sparse_attention` and the LAYA encoder/head. Standard
+   `flash_attention` now has native Oxide forward/backward primitives. VC remains
+   gated on resolving its quantized-forward derivative and source-level LSE risks;
+   see `vit_plan.md` and `vit_notes.md`.
 4. Phase 2B `moe_convolutional` (weights order verified) has partial Oxide
    training support; BN backward and SGD/Adam updates use backend ops. Then
    port `eml_convolutional` (an activation, not a `LayerKind`; save order **re-read
