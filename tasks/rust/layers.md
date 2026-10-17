@@ -3330,7 +3330,7 @@ genuine *evidence* gaps rather than questions for the user:
 | 2B `dcnv3` | **no reference numerics** | see the finding below - all five branches that carry it have a stub forward/backward/update, so it cannot be a verified port |
 | 2C OBB family | - | unblocked by decision 4; XL, and it also changes data loading, NMS and mAP |
 | 3A transformer family | - | unblocked by decisions 3 and 7; needs the shared kernel set (LayerNorm fwd/bwd, batched GEMM, row-softmax backward, residual/bias epilogues) built once first |
-| 3B conv family | - | DCNv1/2 CPU reference integrated in v0.1.001; bounded single-template DSConv CPU support integrated in v0.1.002 (multi-template modes remain open); graph-conv in v0.1.003; WMHF in v0.1.004. `deform_conv` and `dcnv4` remain host fallback pending Stage-2 native GPU. `clifford`, `recursive_block`, and cross-cutting CPU Muon remain Stage-1 work. |
+| 3B conv family | - | DCNv1/2 CPU reference integrated in v0.1.001; bounded single-template DSConv CPU support integrated in v0.1.002 (multi-template modes remain open); graph-conv in v0.1.003; WMHF in v0.1.004; cross-cutting CPU Muon in v0.1.005. `deform_conv` and `dcnv4` remain host fallback pending Stage-2 native GPU. `clifford` and `recursive_block` remain Stage-1 CPU work. |
 | 4 foveation / depth / LAYA / DETR | - | unblocked by decision 2; DETR is still broken in C++, so its reference is the paper, like `dcnv3` |
 
 ### Finding: `[dcnv3]` has no reference implementation anywhere in this repo

@@ -53,6 +53,8 @@ file is named inline.
 - [18. DCNv1 and DCNv2 CPU reference and GPU f32 host fallback](#18-dcnv1-and-dcnv2-cpu-reference-and-gpu-f32-host-fallback)
 - [19. DSConv single-template Stage-1 CPU reference](#19-dsconv-single-template-stage-1-cpu-reference)
 - [20. Graph-convolution Stage-1 CPU reference](#20-graph-convolution-stage-1-cpu-reference)
+- [21. WMHF Stage-1 CPU reference](#21-wmhf-stage-1-cpu-reference)
+- [22. CPU Muon hybrid optimizer](#22-cpu-muon-hybrid-optimizer)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -770,30 +772,37 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 
 - v0.1.001 (`8f5a9a94495cbc376f0b91cbf12f5123fe7ee42c`): integrated both `[deform_conv]` aliases with strict source-derived cfg/shape validation, parameter metadata, deterministic initialization, exact source-order weights, grouped NCHW sampling, offsets and optional sigmoid masks, per-image conditional offset normalization, and exact backward of the Rust forward. Runtime covers bias/BN/activation, rolling statistics, SGD source-rate groups, Adam with persisted moments, update gates, loss scaling, CPU/FakeBackend parity, and GPU f32 host fallback; compact execution rejects explicitly. Unsupported modes, f16/compact paths, and undefined clamp boundaries reject explicitly.
 - Verification: `MEM=3G ./tools/test_host.sh deform_conv` passed 23 core tests; `weights` passed 38 core tests; `runtime` passed 184 runtime tests; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- deform_conv_f32_host_fallback_matches_cpu_chain_and_updates` passed 1 Oxide test. Named coverage includes NCHW/group/kernel-axis hand math, zero-padded boundary sampling, all-trainable-block/input finite differences (including conditional normalization and masked grouped sampling), BN scale finite differences and rolling stats, source-order byte layouts, SGD/Adam updates and state round trip, accumulation/gates/loss-scale neutrality, and CPU/FakeBackend/Oxide host fallback. Targeted Rustfmt and `git diff --check` passed.
-- Source contract: hand-derived from `Jev_laya`; no compiled-C++ golden/parity. No training run or native Oxide kernel. GPU status is host fallback only. CPU Muon remains a cross-cutting Stage-1 requirement, so this feature commit does not complete v0.1.
+- Source contract: hand-derived from `Jev_laya`; no compiled-C++ golden/parity. No training run or native Oxide kernel. GPU status is host fallback only. CPU Muon was delivered separately in v0.1.005; this bounded DSConv port still does not complete Phase 3B.
 
 ## 19. DSConv single-template Stage-1 CPU reference
 
 - v0.1.002 (`f49cfc56f571329c14f6b43224d635199b6cca1b`): integrated `[dsconv]` / `[dynamic_snake_conv]` with strict source-derived config/shape handling, source-order weights, seeded initialization, NCHW CPU forward for `morph=0/1/2`, exact backward of the Rust forward, activation handling, SGD source-rate groups, and Adam with persisted moments. Multi-template `morph=0/1` explicitly rejects; `morph=2` follows the source normalization to one template.
 - Verification: `MEM=3G ./tools/test_host.sh dsconv` passed 12 core tests, `weights` passed 40 core tests, and `runtime` passed 187 runtime tests. Coverage includes named hand-computed NCHW axes, finite differences for input and every parameter block across all morphs, integer/border derivative conventions, exact source-order bytes/file length, seeded initialization, update rates/gates, optimizer-state round trip, and explicit GPU rejection. Targeted `rustfmt --check --edition 2024` and `git diff --check` passed. No training or Oxide tests were run.
-- Source contract: hand-derived from `Jev_laya`; no compiled-C++ golden/parity. Stage-1 CPU only: no GPU path, no full multi-template/drop-mask gradients, and CPU Muon remains a cross-cutting requirement. Do not claim full DSConv parity or v0.1 completion.
+- Source contract: hand-derived from `Jev_laya`; no compiled-C++ golden/parity. Stage-1 CPU only: no GPU path or full multi-template/drop-mask gradients. CPU Muon was delivered separately in v0.1.005. Do not claim full DSConv parity or v0.1 completion.
 
 ## 20. Graph-convolution Stage-1 CPU reference
 
 - v0.1.003 (`f9a90bd5940f0dfce40e4e2ded0d7c1838f50e11`): integrated `[graph_conv]` / `[graph_convolutional]` with strict source-derived config/shape validation, grouped NCHW projections, uniform valid-neighbor means or learned masked-softmax edges, optional center projection, source-order weights, seeded initialization, BN/activation, exact backward of the Rust forward, SGD, and Adam with persisted moments. GPU execution and updates reject explicitly.
 - Verification: `MEM=3G ./tools/test_host.sh graph_conv` passed 14 tests; `weights` passed 42; `runtime` passed 192. Coverage includes non-square NCHW hand math, grouped projection and learned-edge finite differences across input and all trainable blocks, uniform-mode border finite differences and zero upstream, finite-difference bias, preceding-convolution gradient accumulation, BN/rolling statistics, every optional weight-block combination with exact file size/trailing-byte checks, optimizer updates/state round trip, and GPU rejection. Targeted Rustfmt and `git diff --check` passed. No Oxide tests, training, or `cfg_corpus` run.
-- Source contract: hand-derived from `Jev_laya`; `LAYER_GRAPH_CONV` is disabled in the source branch and there is no compiled-C++ golden, so no compiled-C++ parity is claimed. Adam is a Rust extension; CBN uses ordinary CPU BN semantics. Stage-1 CPU only; native GPU paths and GPU Muon belong to Stage 2, and CPU Muon remains a cross-cutting Stage-1 requirement.
+- Source contract: hand-derived from `Jev_laya`; `LAYER_GRAPH_CONV` is disabled in the source branch and there is no compiled-C++ golden, so no compiled-C++ parity is claimed. Adam is a Rust extension; CBN uses ordinary CPU BN semantics. Stage-1 CPU only; native GPU paths and GPU Muon belong to Stage 2. CPU Muon was delivered separately in v0.1.005.
 
 ## 21. WMHF Stage-1 CPU reference
 
 - v0.1.004 (`49ce73ccfc03d76c9a79e53389d283198d5d788e`): integrated the strict `[wmhf]`, `[wavelet_mamba_hf]`, and `[wavelet_mamba_high_frequency]` config paths, seeded initialization, seven source-order convolution blocks plus four scan vectors, Haar DWT/IWT and four-direction EMA scan CPU forward, exact backward, batch-stat BN with rolling-stat updates, SGD, Adam with persistent moments, and exact `.weights` serialization. GPU execution and updates reject explicitly; no GPU fallback or kernels were added.
 - Verification: `MEM=3G ./tools/test_host.sh wmhf_` passed 17 tests; `weights` passed 43; `runtime` passed 198. Coverage includes hand-computed full forward, zero-upstream and finite-difference input/parameter gradients across all blocks, preceding-convolution accumulation, odd-edge Haar adjoints, BN/rolling statistics, SGD and GPU rejection, Adam-state persistence, initialization, strict config, and exact source-order file length. Targeted Rustfmt checks on modified core files and `git diff --check` passed. No training, Oxide tests, or `cfg_corpus` run.
-- Source contract: hand-derived from `Jev_laya`; `LAYER_WMHF` is disabled and guarded tests are not a numerical oracle, so no compiled-C++ golden/parity is claimed. WMHF is Stage-1 CPU-only. CPU Muon, `clifford`, and `recursive_block` remain open; do not claim Phase 3B/Stage 1 complete.
+- Source contract: hand-derived from `Jev_laya`; `LAYER_WMHF` is disabled and guarded tests are not a numerical oracle, so no compiled-C++ golden/parity is claimed. WMHF is Stage-1 CPU-only. `clifford` and `recursive_block` remain open; do not claim Phase 3B/Stage 1 complete.
+
+## 22. CPU Muon hybrid optimizer
+
+- v0.1.005 (`2674f5741405e33371448bb9a664d482ffa02e8d`): added opt-in `[net] muon=1` hybrid CPU updates. Eligible dense matrix blocks use arXiv:2502.16982's additive momentum/Nesterov lookahead, five Newton–Schulz iterations with `(3.4445,-4.7750,2.0315)`, scale `0.2*sqrt(max(rows,cols))`, and decoupled decay. Explicit per-layer matrix mappings cover convolution/recurrent/attention families; other trainable parameters use AdamW fallback. Conflicting/unsupported config rejects.
+- CPU trainer dispatch covers general and OBB CLI training, direct OBB batch helpers, and the benchmark update step. DNOPT6 persists shape-checked Muon momentum and retains DNOPT1–5 reads; loading old state in Muon mode starts fresh Muon/AdamW state. GPU execution/updates and GPU optimizer-state save/load reject explicitly.
+- Verification: `MEM=3G ./tools/test_host.sh muon_` passed 13 tests, `weights` passed 43, and `runtime` passed 204, including `train_only_bn` gating. Core-file `rustfmt --check --edition 2024` and `git diff --check` passed. No training or Oxide tests were run.
+- Evidence boundary: update is paper-derived plus hand-computed/runtime tests. There is no compiled-C++ Muon implementation or golden, so no compiled-C++ parity is claimed. Stage 1 remains open for `clifford` and `recursive_block`; GPU Muon belongs to Stage 2.
 
 ## Not implemented / open (pointer)
 
 See `tasks/rust/todo.md` for the deduplicated open list (P8/P9 follow-ups,
-fp16 remainder, hardware-blocked wgmma/tcgen05/NVFP4/multi-GPU, and the CPU/GPU
-Muon spec and implementation), `layers.md` for Phases 1b–4 (remaining layers),
+fp16 remainder, hardware-blocked wgmma/tcgen05/NVFP4/multi-GPU, and Stage-2 GPU
+Muon), `layers.md` for Phases 1b–4 (remaining layers),
 `fp8_fp4.md` for FP8 step 5, and `gui_plan.md` for the deferred GUI plan; ONNX
 export is complete.

@@ -694,9 +694,9 @@ believing a `cfg_corpus` failure.
    (GPU is host fallback only); bounded single-template DSConv CPU support is
    integrated in v0.1.002 (`morph=0/1/2`), while multi-template morph 0/1
    remains open; graph-conv CPU support is integrated in v0.1.003 and WMHF in
-   v0.1.004. Next are `clifford` and `recursive_block`. Cross-cutting CPU Muon
-   is still open and must be specified before Stage 1 can close. `dcnv4` and
-   `deform_conv` need native Oxide paths later in Stage 2.
+   v0.1.004. CPU Muon is integrated in v0.1.005. Next are `clifford` and
+   `recursive_block`; those CPU ports still precede Stage-2 native GPU work for
+   `dcnv4` and `deform_conv`.
 6. Phase 2C OBB, then Phase 4.
 
 ## Known evidence gaps (not user questions)
@@ -724,3 +724,7 @@ Two self-contained task plans in this directory have **no implementation**:
   `darknet-gui` exist, and there is no `detect-server` CLI arm.
 
 Both are greenfield; the layer-port work above does not depend on them.
+
+## Current Muon optimizer status
+
+- v0.1.005 (`2674f5741405e33371448bb9a664d482ffa02e8d`) delivers the opt-in Stage-1 CPU Muon/AdamW hybrid and DNOPT6 momentum persistence. `muon_` passed 13 tests, `weights` 43, and `runtime` 204, including `train_only_bn` gating. No training, Oxide tests, or compiled-C++ golden/parity were run. `clifford` and `recursive_block` remain Stage-1 CPU work; GPU Muon is Stage 2.

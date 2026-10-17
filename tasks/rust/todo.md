@@ -404,17 +404,20 @@ Immediately next, in dependency order:
 - [ ] Phase 3B CPU family (remaining): `graph_conv` is integrated in v0.1.003
   (`implemented.md` §20) and WMHF in v0.1.004 (`implemented.md` §21), both
   hand-derived from `Jev_laya` with no compiled-C++ golden and no GPU path.
-  Next are `clifford` and `recursive_block`; cross-cutting CPU Muon remains
-  open before Stage 1 can close. `dsconv` is integrated in v0.1.002
+  CPU Muon is integrated in v0.1.005 (`implemented.md` §22). Next are
+  `clifford` and `recursive_block`. `dsconv` is integrated in v0.1.002
   (`implemented.md` §19) for single-template `morph=0/1/2`; multi-template
   `morph=0/1` remains open. DCNv1/2 CPU reference is integrated in v0.1.001
   (`implemented.md` §18); its GPU path is still host fallback. `[dcnv4]` is
   integrated in v0.0.273–v0.0.274 (`implemented.md` §17), also host fallback.
-  Native GPU support belongs to Stage 2 after all Stage-1 CPU layers are done.
-- [ ] CPU Muon: write the update-rule/spec first (Newton–Schulz coefficients and
-  iterations, update scale, eligible matrix blocks, and persisted state), then
-  implement for eligible 2D parameters across Stage-1 layers. Hand-derived from
-  the paper; there is no C++ reference. GPU Muon belongs to Stage 2.
+  Native GPU support and GPU Muon belong to Stage 2 after all Stage-1 CPU
+  layers are done.
+- [x] CPU Muon: spec and Stage-1 hybrid implementation complete in v0.1.005
+  (`implemented.md` §22). Eligible matrices use paper-derived Muon; other
+  trainable parameters use AdamW fallback. DNOPT6 persists shape-checked
+  momentum while DNOPT1–5 remain readable. `muon_` (13), `weights` (43), and
+  `runtime` (204) host tests passed. No training, Oxide tests, or compiled-C++
+  golden/parity. GPU Muon is deferred to Stage 2.
 - [ ] Phase 4 foveation / depth / DETR. DETR is still broken in C++ (paper only).
 
 ## Active and unstarted plans
@@ -423,10 +426,11 @@ Immediately next, in dependency order:
 - [x] `carpn_map_plan.md` — bounded caller-supplied sample dispatch implemented in v0.0.258.
 - [x] `carpn_network_map_plan.md` — v0.0.259 completes CPU network inference, `detect-image`, and direct `detector map`; CARPN training/`detector train -map` remain explicitly deferred.
 - [x] `dcnv4_plan.md` — source-audited CPU/reference + GPU f32 host-fallback implementation completed in v0.0.273; v0.0.274 matches the deformable-layer `try_fix_nan` config default. No native kernel or compiled-C++ parity.
-- [x] `deform_conv_plan.md` — bounded DCNv1/2 CPU reference and f32 host-fallback implementation completed in v0.1.001. No native kernel or compiled-C++ parity; CPU Muon remains a cross-cutting Stage-1 item.
-- [x] `dsconv_plan.md` — bounded single-template CPU implementation completed in v0.1.002; multi-template modes and CPU Muon remain open. No native kernel or compiled-C++ parity.
-- [x] `graph_conv_plan.md` — Stage-1 CPU implementation completed in v0.1.003; CPU Muon remains open and native GPU support is Stage 2. No compiled-C++ parity.
-- [x] `wmhf_plan.md` — bounded Stage-1 CPU implementation completed in v0.1.004; source/config/backward/weights audit is in `wmhf_notes.md`. CPU Muon and other Stage-1 layers remain open; no compiled-C++ golden.
+- [x] `deform_conv_plan.md` — bounded DCNv1/2 CPU reference and f32 host-fallback implementation completed in v0.1.001. No native kernel or compiled-C++ parity; CPU Muon was added separately in v0.1.005.
+- [x] `dsconv_plan.md` — bounded single-template CPU implementation completed in v0.1.002; multi-template modes remain open. CPU Muon was added separately in v0.1.005. No native kernel or compiled-C++ parity.
+- [x] `graph_conv_plan.md` — Stage-1 CPU implementation completed in v0.1.003; CPU Muon was added separately in v0.1.005 and native GPU support remains Stage 2. No compiled-C++ parity.
+- [x] `wmhf_plan.md` — bounded Stage-1 CPU implementation completed in v0.1.004; source/config/backward/weights audit is in `wmhf_notes.md`. CPU Muon was added in v0.1.005; `clifford` and `recursive_block` remain open. No compiled-C++ golden.
+- [x] `muon_plan.md` — Stage-1 CPU hybrid Muon implementation and focused verification completed in v0.1.005. GPU Muon remains Stage 2; no compiled-C++ golden/parity.
 - [ ] `gui_plan.md` — egui DarkMark replacement (M0–M6, not started).
 
 ## Known evidence gaps (not user questions)
