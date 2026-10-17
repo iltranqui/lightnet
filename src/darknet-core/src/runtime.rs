@@ -265,6 +265,20 @@ pub struct DsConvParams {
     pub offset_biases: Vec<f32>,
 }
 
+/// `[wmhf]`: seven independent convolution blocks followed by four scan
+/// vectors (`raw_A`, `B`, `C`, `D`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WmhfParams {
+    pub pre: ConvolutionalParams,
+    pub local_dw3: ConvolutionalParams,
+    pub local_dw5: ConvolutionalParams,
+    pub local_dw7: ConvolutionalParams,
+    pub local_mix: ConvolutionalParams,
+    pub hf_gate: ConvolutionalParams,
+    pub fuse: ConvolutionalParams,
+    pub scan_weights: Vec<f32>,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayerParams {
@@ -305,6 +319,7 @@ pub enum LayerParams {
     GraphConv(GraphConvParams),
     DeformConv(DeformConvParams),
     DsConv(DsConvParams),
+    Wmhf(WmhfParams),
 }
 
 /// The parameters of one `[moe_convolutional]` layer.
@@ -435,6 +450,18 @@ pub struct DsConvTrainBuffers {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct WmhfTrainBuffers {
+    pub pre: ConvolutionalTrainBuffers,
+    pub local_dw3: ConvolutionalTrainBuffers,
+    pub local_dw5: ConvolutionalTrainBuffers,
+    pub local_dw7: ConvolutionalTrainBuffers,
+    pub local_mix: ConvolutionalTrainBuffers,
+    pub hf_gate: ConvolutionalTrainBuffers,
+    pub fuse: ConvolutionalTrainBuffers,
+    pub scan_weight_updates: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct VitTrainBuffers {
     /// Descending update directions (negative mathematical gradients), in
     /// `VitWeights` block shape/order.
@@ -486,6 +513,7 @@ pub enum LayerTrainBuffers {
     GraphConv(GraphConvTrainBuffers),
     DeformConv(DeformConvTrainBuffers),
     DsConv(DsConvTrainBuffers),
+    Wmhf(WmhfTrainBuffers),
     Vit(VitTrainBuffers),
     Swin(SwinTrainBuffers),
     TuckerAttention(TuckerAttentionTrainBuffers),
@@ -629,6 +657,27 @@ pub(crate) struct GraphConvRuntimeCache {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) struct WmhfConvRuntimeCache {
+    pub input: Tensor,
+    pub raw_output: Tensor,
+    pub activation_input: Tensor,
+    pub output: Tensor,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct WmhfRuntimeCache {
+    pub pre: WmhfConvRuntimeCache,
+    pub local_dw3: WmhfConvRuntimeCache,
+    pub local_dw5: WmhfConvRuntimeCache,
+    pub local_dw7: WmhfConvRuntimeCache,
+    pub local_mix: WmhfConvRuntimeCache,
+    pub hf_gate: WmhfConvRuntimeCache,
+    pub fuse: WmhfConvRuntimeCache,
+    pub dwt: crate::wmhf::HaarCoefficients,
+    pub training: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct ForwardResult {
     pub layer_outputs: Vec<Tensor>,
     pub layer_activation_inputs: Vec<Option<Tensor>>,
@@ -647,6 +696,7 @@ pub struct ForwardResult {
     pub(crate) deform_conv_caches: Vec<Option<DeformConvRuntimeCache>>,
     pub(crate) dsconv_caches: Vec<Option<DsConvRuntimeCache>>,
     pub(crate) graph_conv_caches: Vec<Option<GraphConvRuntimeCache>>,
+    pub(crate) wmhf_caches: Vec<Option<WmhfRuntimeCache>>,
     pub vit_caches: Vec<Option<crate::vit::VitForwardCache>>,
     pub swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>>,
     pub tucker_attention_caches: Vec<Option<crate::tucker_attention::TuckerAttentionForwardCache>>,
@@ -679,6 +729,7 @@ impl ForwardResult {
             deform_conv_caches: Vec::new(),
             dsconv_caches: Vec::new(),
             graph_conv_caches: Vec::new(),
+            wmhf_caches: Vec::new(),
             vit_caches: Vec::new(),
             swin_caches: Vec::new(),
             tucker_attention_caches: Vec::new(),
@@ -713,6 +764,7 @@ mod forward_result_from_heads_tests {
         assert!(result.deform_conv_caches.is_empty());
         assert!(result.dsconv_caches.is_empty());
         assert!(result.graph_conv_caches.is_empty());
+        assert!(result.wmhf_caches.is_empty());
         assert!(result.vit_caches.is_empty());
         assert!(result.swin_caches.is_empty());
         assert!(result.tucker_attention_caches.is_empty());
@@ -1463,6 +1515,27 @@ impl ExecutableNetwork {
                         batch,
                     );
                 }
+                (LayerParams::Wmhf(params), LayerTrainBuffers::Wmhf(train)) => {
+                    for (conv, updates) in [
+                        (&mut params.pre, &mut train.pre),
+                        (&mut params.local_dw3, &mut train.local_dw3),
+                        (&mut params.local_dw5, &mut train.local_dw5),
+                        (&mut params.local_dw7, &mut train.local_dw7),
+                        (&mut params.local_mix, &mut train.local_mix),
+                        (&mut params.hf_gate, &mut train.hf_gate),
+                        (&mut params.fuse, &mut train.fuse),
+                    ] {
+                        update_convolutional_params(conv, updates, lr, momentum, decay, batch);
+                    }
+                    sgd_update(
+                        &mut params.scan_weights,
+                        &mut train.scan_weight_updates,
+                        lr * opts.learning_rate_scale,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                }
                 (LayerParams::GraphConv(params), LayerTrainBuffers::GraphConv(train)) => {
                     let layer_lr = lr * opts.learning_rate_scale;
                     update_convolutional_params(
@@ -1943,6 +2016,7 @@ impl ExecutableNetwork {
         let mut deform_conv_caches = Vec::with_capacity(self.network.layers.len());
         let mut dsconv_caches = Vec::with_capacity(self.network.layers.len());
         let mut graph_conv_caches = Vec::with_capacity(self.network.layers.len());
+        let mut wmhf_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches = Vec::with_capacity(self.network.layers.len());
         let mut swin_caches = Vec::with_capacity(self.network.layers.len());
         let mut tucker_attention_caches = Vec::with_capacity(self.network.layers.len());
@@ -1977,6 +2051,7 @@ impl ExecutableNetwork {
             let mut deform_conv_cache = None;
             let mut dsconv_cache = None;
             let mut graph_conv_cache = None;
+            let mut wmhf_cache = None;
             let (output, activation_input) = match (&layer.kind, params) {
                 (
                     LayerKind::Convolutional(spec),
@@ -2007,6 +2082,17 @@ impl ExecutableNetwork {
                     let (output, activation_input, cache) =
                         forward_dsconv_with_cache(spec, params, current_input, layer.output_shape)?;
                     dsconv_cache = Some(cache);
+                    (output, Some(activation_input))
+                }
+                (LayerKind::Wmhf(spec), LayerParams::Wmhf(params)) => {
+                    let (output, activation_input, cache) = forward_wmhf_with_cache(
+                        spec,
+                        params,
+                        current_input,
+                        layer.output_shape,
+                        training,
+                    )?;
+                    wmhf_cache = Some(cache);
                     (output, Some(activation_input))
                 }
                 (LayerKind::DeformConv(spec), LayerParams::DeformConv(params)) => {
@@ -2580,6 +2666,7 @@ impl ExecutableNetwork {
             deform_conv_caches.push(deform_conv_cache);
             dsconv_caches.push(dsconv_cache);
             graph_conv_caches.push(graph_conv_cache);
+            wmhf_caches.push(wmhf_cache);
             vit_caches.push(vit_cache);
             swin_caches.push(swin_cache);
             tucker_attention_caches.push(tucker_attention_cache);
@@ -2599,6 +2686,7 @@ impl ExecutableNetwork {
             deform_conv_caches,
             dsconv_caches,
             graph_conv_caches,
+            wmhf_caches,
             vit_caches,
             swin_caches,
             tucker_attention_caches,
@@ -2742,6 +2830,13 @@ impl ExecutableNetwork {
                 "forward deform_conv cache count mismatch: expected {}, got {}",
                 self.network.layers.len(),
                 forward.deform_conv_caches.len()
+            )));
+        }
+        if forward.wmhf_caches.len() != self.network.layers.len() {
+            return Err(Error::InvalidConfig(format!(
+                "forward [wmhf] cache count mismatch: expected {}, got {}",
+                self.network.layers.len(),
+                forward.wmhf_caches.len()
             )));
         }
         if layer_output_gradient_seeds.len() != self.network.layers.len() {
@@ -3258,6 +3353,284 @@ impl ExecutableNetwork {
                     accumulate_previous_gradient(
                         layer.index,
                         &Tensor::from_data(current_input.shape, math_gradient.input)?,
+                        &mut input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::Wmhf(spec), LayerParams::Wmhf(params)) => {
+                    let cache = forward
+                        .wmhf_caches
+                        .get(layer.index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing [wmhf] forward cache for layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let preactivation = forward.layer_activation_inputs[layer.index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing [wmhf] activation cache for layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let delta = apply_output_activation_gradient(
+                        &forward.layer_outputs[layer.index],
+                        &grad,
+                        &spec.activation,
+                        "wmhf",
+                        Some(preactivation),
+                    )?;
+                    let use_shortcut = spec.shortcut
+                        && current_input.shape.channels == spec.filters
+                        && current_input.shape == layer.output_shape;
+                    let gate_gradient = crate::wmhf::apply_gate_backward(
+                        &delta.data,
+                        &cache.hf_gate.output.data,
+                        &cache.pre.output.data,
+                        use_shortcut,
+                        spec.freq_scale,
+                    )?;
+                    let spatial = layer.output_shape.width * layer.output_shape.height;
+                    let mut pre_gradient = Tensor::zeros(layer.output_shape);
+                    crate::wmhf::insert_channels(
+                        &gate_gradient.projected,
+                        &mut pre_gradient.data,
+                        layer.output_shape.batch,
+                        spec.filters,
+                        spec.filters,
+                        spatial,
+                        0,
+                        1.0,
+                    )?;
+
+                    let fuse_spec = wmhf_internal_convolution_spec(
+                        spec.filters,
+                        1,
+                        1,
+                        spec.batch_normalize,
+                        Activation::Linear,
+                    );
+                    let (fuse_input_gradient, fuse_param_gradient) = backward_wmhf_convolution(
+                        &fuse_spec,
+                        &params.fuse,
+                        &cache.fuse,
+                        &Tensor::from_data(layer.output_shape, gate_gradient.fuse)?,
+                        cache.training,
+                    )?;
+                    let fuse_parts = crate::wmhf::split_fuse_gradient(
+                        &fuse_input_gradient.data,
+                        layer.output_shape.batch,
+                        spec.filters,
+                        spec.identity_channels,
+                        spec.local_channels,
+                        spatial,
+                    )?;
+                    crate::wmhf::insert_channels(
+                        &fuse_parts.projected,
+                        &mut pre_gradient.data,
+                        layer.output_shape.batch,
+                        spec.filters,
+                        spec.filters,
+                        spatial,
+                        0,
+                        1.0,
+                    )?;
+
+                    let gate_spec = wmhf_internal_convolution_spec(
+                        spec.filters,
+                        1,
+                        1,
+                        false,
+                        Activation::Logistic,
+                    );
+                    let (energy_gradient, gate_param_gradient) = backward_wmhf_convolution(
+                        &gate_spec,
+                        &params.hf_gate,
+                        &cache.hf_gate,
+                        &Tensor::from_data(layer.output_shape, gate_gradient.gate)?,
+                        cache.training,
+                    )?;
+
+                    let local_shape = cache.local_mix.output.shape;
+                    let local_mix_spec = wmhf_internal_convolution_spec(
+                        spec.local_channels,
+                        1,
+                        1,
+                        spec.batch_normalize,
+                        Activation::Linear,
+                    );
+                    let (local_cat_gradient, local_mix_param_gradient) = backward_wmhf_convolution(
+                        &local_mix_spec,
+                        &params.local_mix,
+                        &cache.local_mix,
+                        &Tensor::from_data(local_shape, fuse_parts.local)?,
+                        cache.training,
+                    )?;
+                    let (dw3_gradient, dw5_gradient, dw7_gradient) =
+                        crate::wmhf::split_local_gradient(
+                            &local_cat_gradient.data,
+                            local_shape.batch,
+                            spec.local_channels,
+                            spatial,
+                        )?;
+                    let dw3_spec = wmhf_internal_convolution_spec(
+                        spec.local_channels,
+                        3,
+                        spec.local_channels,
+                        false,
+                        Activation::Linear,
+                    );
+                    let dw5_spec = wmhf_internal_convolution_spec(
+                        spec.local_channels,
+                        5,
+                        spec.local_channels,
+                        false,
+                        Activation::Linear,
+                    );
+                    let dw7_spec = wmhf_internal_convolution_spec(
+                        spec.local_channels,
+                        7,
+                        spec.local_channels,
+                        false,
+                        Activation::Linear,
+                    );
+                    let (mut local_input_gradient, dw3_param_gradient) = backward_wmhf_convolution(
+                        &dw3_spec,
+                        &params.local_dw3,
+                        &cache.local_dw3,
+                        &Tensor::from_data(local_shape, dw3_gradient)?,
+                        cache.training,
+                    )?;
+                    let (dw5_input_gradient, dw5_param_gradient) = backward_wmhf_convolution(
+                        &dw5_spec,
+                        &params.local_dw5,
+                        &cache.local_dw5,
+                        &Tensor::from_data(local_shape, dw5_gradient)?,
+                        cache.training,
+                    )?;
+                    let (dw7_input_gradient, dw7_param_gradient) = backward_wmhf_convolution(
+                        &dw7_spec,
+                        &params.local_dw7,
+                        &cache.local_dw7,
+                        &Tensor::from_data(local_shape, dw7_gradient)?,
+                        cache.training,
+                    )?;
+                    for (dst, src) in local_input_gradient
+                        .data
+                        .iter_mut()
+                        .zip(dw5_input_gradient.data.iter().zip(&dw7_input_gradient.data))
+                    {
+                        *dst += src.0 + src.1;
+                    }
+                    crate::wmhf::insert_channels(
+                        &local_input_gradient.data,
+                        &mut pre_gradient.data,
+                        layer.output_shape.batch,
+                        spec.filters,
+                        spec.local_channels,
+                        spatial,
+                        spec.identity_channels,
+                        1.0,
+                    )?;
+
+                    let wavelet_output_gradient = crate::wmhf::haar_iwt_backward(
+                        &fuse_parts.global,
+                        layer.output_shape.batch,
+                        spec.global_channels,
+                        layer.output_shape.height,
+                        layer.output_shape.width,
+                    )?;
+                    let energy_coeff_gradient = crate::wmhf::high_frequency_energy_backward(
+                        &energy_gradient.data,
+                        &cache.dwt,
+                    )?;
+                    let mut dwt_output_gradient = wavelet_output_gradient;
+                    for (dst, src) in dwt_output_gradient
+                        .lh
+                        .iter_mut()
+                        .zip(&energy_coeff_gradient.lh)
+                    {
+                        *dst += *src;
+                    }
+                    for (dst, src) in dwt_output_gradient
+                        .hl
+                        .iter_mut()
+                        .zip(&energy_coeff_gradient.hl)
+                    {
+                        *dst += *src;
+                    }
+                    for (dst, src) in dwt_output_gradient
+                        .hh
+                        .iter_mut()
+                        .zip(&energy_coeff_gradient.hh)
+                    {
+                        *dst += *src;
+                    }
+                    let (scan_input_gradient, scan_weight_gradient) = crate::wmhf::scan4_backward(
+                        &cache.dwt.ll,
+                        &dwt_output_gradient.ll,
+                        &params.scan_weights,
+                        layer.output_shape.batch,
+                        spec.global_channels,
+                        cache.dwt.height2,
+                        cache.dwt.width2,
+                    )?;
+                    dwt_output_gradient.ll = scan_input_gradient;
+                    let global_input_gradient =
+                        crate::wmhf::haar_dwt_backward(&dwt_output_gradient)?;
+                    crate::wmhf::insert_channels(
+                        &global_input_gradient,
+                        &mut pre_gradient.data,
+                        layer.output_shape.batch,
+                        spec.filters,
+                        spec.global_channels,
+                        spatial,
+                        spec.identity_channels + spec.local_channels,
+                        1.0,
+                    )?;
+
+                    let pre_spec = wmhf_internal_convolution_spec(
+                        spec.filters,
+                        1,
+                        1,
+                        spec.batch_normalize,
+                        Activation::Linear,
+                    );
+                    let (mut pre_input_gradient, pre_param_gradient) = backward_wmhf_convolution(
+                        &pre_spec,
+                        &params.pre,
+                        &cache.pre,
+                        &pre_gradient,
+                        cache.training,
+                    )?;
+                    if use_shortcut {
+                        for (dst, src) in pre_input_gradient.data.iter_mut().zip(&delta.data) {
+                            *dst += *src;
+                        }
+                    }
+                    let gradient = WmhfParams {
+                        pre: pre_param_gradient,
+                        local_dw3: dw3_param_gradient,
+                        local_dw5: dw5_param_gradient,
+                        local_dw7: dw7_param_gradient,
+                        local_mix: local_mix_param_gradient,
+                        hf_gate: gate_param_gradient,
+                        fuse: fuse_param_gradient,
+                        scan_weights: scan_weight_gradient,
+                    };
+                    let Some(LayerParams::Wmhf(dst)) = param_gradients.get_mut(layer.index) else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing [wmhf] gradient slot for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    *dst = gradient;
+                    accumulate_previous_gradient(
+                        layer.index,
+                        &pre_input_gradient,
                         &mut input_gradient,
                         &mut layer_output_gradients,
                     )?;
@@ -4538,6 +4911,53 @@ impl ExecutableNetwork {
         }
 
         for layer in &self.network.layers {
+            let LayerKind::Wmhf(spec) = &layer.kind else {
+                continue;
+            };
+            if !spec.batch_normalize {
+                continue;
+            }
+            let cache = forward
+                .wmhf_caches
+                .get(layer.index)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "missing [wmhf] forward cache for BN stats at layer #{}",
+                        layer.index
+                    ))
+                })?;
+            if !cache.training {
+                continue;
+            }
+            let Some(LayerParams::Wmhf(params)) = self.params.get_mut(layer.index) else {
+                return Err(Error::InvalidConfig(format!(
+                    "missing [wmhf] params for BN stats at layer #{}",
+                    layer.index
+                )));
+            };
+            for (conv, raw) in [
+                (&mut params.pre, &cache.pre.raw_output),
+                (&mut params.local_mix, &cache.local_mix.raw_output),
+                (&mut params.fuse, &cache.fuse.raw_output),
+            ] {
+                let Some(batch_norm) = conv.batch_norm.as_mut() else {
+                    return Err(Error::InvalidConfig(format!(
+                        "missing [wmhf] BN parameters for layer #{}",
+                        layer.index
+                    )));
+                };
+                let (mean, variance) = batchnorm_channel_stats(raw);
+                update_batch_norm_running_stats(
+                    batch_norm,
+                    &mean,
+                    &variance,
+                    BATCH_NORM_ROLLING_KEEP_CPU,
+                )?;
+            }
+        }
+
+        for layer in &self.network.layers {
             let LayerKind::Connected(spec) = &layer.kind else {
                 continue;
             };
@@ -4861,6 +5281,28 @@ impl ExecutableNetwork {
                     accumulate_convolutional_train_buffer(&mut train.collapse, &gradient.collapse)?;
                     accumulate_vec(&mut train.offset_weight_updates, &gradient.offset_weights)?;
                     accumulate_vec(&mut train.offset_bias_updates, &gradient.offset_biases)?;
+                }
+                (LayerKind::Wmhf(_), LayerParams::Wmhf(gradient)) => {
+                    let Some(LayerTrainBuffers::Wmhf(train)) =
+                        self.train_buffers.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing [wmhf] train buffers for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    for (train, gradient) in [
+                        (&mut train.pre, &gradient.pre),
+                        (&mut train.local_dw3, &gradient.local_dw3),
+                        (&mut train.local_dw5, &gradient.local_dw5),
+                        (&mut train.local_dw7, &gradient.local_dw7),
+                        (&mut train.local_mix, &gradient.local_mix),
+                        (&mut train.hf_gate, &gradient.hf_gate),
+                        (&mut train.fuse, &gradient.fuse),
+                    ] {
+                        accumulate_convolutional_train_buffer(train, gradient)?;
+                    }
+                    accumulate_vec(&mut train.scan_weight_updates, &gradient.scan_weights)?;
                 }
                 (LayerKind::GraphConv(_), LayerParams::GraphConv(gradient)) => {
                     let Some(LayerTrainBuffers::GraphConv(train)) =
@@ -5221,6 +5663,16 @@ fn host_adam_scalar_capacity(params: &LayerParams) -> usize {
             convolutional_parameter_count(&params.collapse)
                 + params.offset_weights.len()
                 + params.offset_biases.len()
+        }
+        LayerParams::Wmhf(params) => {
+            convolutional_parameter_count(&params.pre)
+                + convolutional_parameter_count(&params.local_dw3)
+                + convolutional_parameter_count(&params.local_dw5)
+                + convolutional_parameter_count(&params.local_dw7)
+                + convolutional_parameter_count(&params.local_mix)
+                + convolutional_parameter_count(&params.hf_gate)
+                + convolutional_parameter_count(&params.fuse)
+                + params.scan_weights.len()
         }
         LayerParams::None
         | LayerParams::LayaScorer(_)
@@ -7136,6 +7588,17 @@ where
                 name: "[dsconv] GPU updates are not implemented in the Stage-1 CPU port".to_owned(),
             });
         }
+        if let Some(layer) = self
+            .network
+            .layers
+            .iter()
+            .find(|layer| matches!(layer.kind, LayerKind::Wmhf(_)))
+        {
+            return Err(Error::UnsupportedLayer {
+                layer_index: layer.index,
+                name: "[wmhf] GPU updates are not implemented in the Stage-1 CPU port".to_owned(),
+            });
+        }
         let config = ElementwiseLaunchConfig::default();
         self.defer_host_sync = !sync_host_weights;
         let net = self.network.net.clone();
@@ -8531,6 +8994,17 @@ where
             return Err(Error::UnsupportedLayer {
                 layer_index: layer.index,
                 name: "[dsconv] GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path".to_owned(),
+            });
+        }
+        if let Some(layer) = self
+            .network
+            .layers
+            .iter()
+            .find(|layer| matches!(layer.kind, LayerKind::Wmhf(_)))
+        {
+            return Err(Error::UnsupportedLayer {
+                layer_index: layer.index,
+                name: "[wmhf] GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path".to_owned(),
             });
         }
         if let Some(layer) = self
@@ -10276,6 +10750,7 @@ where
                 deform_conv_caches,
                 dsconv_caches: vec![None; self.network.layers.len()],
                 graph_conv_caches: vec![None; self.network.layers.len()],
+                wmhf_caches: vec![None; self.network.layers.len()],
                 vit_caches,
                 swin_caches,
                 tucker_attention_caches,
@@ -10340,6 +10815,17 @@ where
             return Err(Error::UnsupportedLayer {
                 layer_index: layer.index,
                 name: "[dsconv] GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path".to_owned(),
+            });
+        }
+        if let Some(layer) = self
+            .network
+            .layers
+            .iter()
+            .find(|layer| matches!(layer.kind, LayerKind::Wmhf(_)))
+        {
+            return Err(Error::UnsupportedLayer {
+                layer_index: layer.index,
+                name: "[wmhf] compact GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path".to_owned(),
             });
         }
         if self.network.layers.iter().any(|layer| {
@@ -15116,6 +15602,9 @@ fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
                 spec.batch_normalize,
             ),
         }),
+        LayerKind::Wmhf(spec) => {
+            LayerParams::Wmhf(default_wmhf_params(layer.input_shape.channels, spec))
+        }
         _ => LayerParams::None,
     }
 }
@@ -15252,6 +15741,9 @@ fn default_layer_train_buffers(layer: &crate::model::Layer) -> LayerTrainBuffers
             layer.input_shape.channels,
             spec,
         )),
+        LayerKind::Wmhf(spec) => {
+            LayerTrainBuffers::Wmhf(default_wmhf_train_buffers(layer.input_shape.channels, spec))
+        }
         LayerKind::TuckerAttention(spec) => {
             let params = crate::tucker_attention::TuckerAttentionParams::zeroed(
                 layer.input_shape.channels,
@@ -15394,6 +15886,57 @@ fn default_moe_train_buffers(
                 )
             })
             .collect(),
+    }
+}
+
+fn default_wmhf_params(input_channels: usize, spec: &crate::model::WmhfSpec) -> WmhfParams {
+    let local = spec.local_channels;
+    let global = spec.global_channels;
+    WmhfParams {
+        pre: default_convolutional_params(input_channels, spec.filters, 1, 1, spec.batch_normalize),
+        local_dw3: default_convolutional_params(local, local, 3, local, false),
+        local_dw5: default_convolutional_params(local, local, 5, local, false),
+        local_dw7: default_convolutional_params(local, local, 7, local, false),
+        local_mix: default_convolutional_params(3 * local, local, 1, 1, spec.batch_normalize),
+        hf_gate: default_convolutional_params(global, spec.filters, 1, 1, false),
+        fuse: default_convolutional_params(spec.filters, spec.filters, 1, 1, spec.batch_normalize),
+        scan_weights: vec![0.0; 4 * global],
+    }
+}
+
+fn default_wmhf_train_buffers(
+    input_channels: usize,
+    spec: &crate::model::WmhfSpec,
+) -> WmhfTrainBuffers {
+    let local = spec.local_channels;
+    let global = spec.global_channels;
+    WmhfTrainBuffers {
+        pre: default_convolutional_train_buffers(
+            input_channels,
+            spec.filters,
+            1,
+            1,
+            spec.batch_normalize,
+        ),
+        local_dw3: default_convolutional_train_buffers(local, local, 3, local, false),
+        local_dw5: default_convolutional_train_buffers(local, local, 5, local, false),
+        local_dw7: default_convolutional_train_buffers(local, local, 7, local, false),
+        local_mix: default_convolutional_train_buffers(
+            3 * local,
+            local,
+            1,
+            1,
+            spec.batch_normalize,
+        ),
+        hf_gate: default_convolutional_train_buffers(global, spec.filters, 1, 1, false),
+        fuse: default_convolutional_train_buffers(
+            spec.filters,
+            spec.filters,
+            1,
+            1,
+            spec.batch_normalize,
+        ),
+        scan_weight_updates: vec![0.0; 4 * global],
     }
 }
 
@@ -16779,6 +17322,25 @@ fn apply_host_adam_layer(
                 &offset_adam,
             )?;
         }
+        (LayerParams::Wmhf(params), LayerTrainBuffers::Wmhf(train)) => {
+            apply_host_adam_convolutional(&mut params.pre, &mut train.pre, state, adam)?;
+            for (slot, params, train) in [
+                (0, &mut params.local_dw3, &mut train.local_dw3),
+                (1, &mut params.local_dw5, &mut train.local_dw5),
+                (2, &mut params.local_dw7, &mut train.local_dw7),
+                (3, &mut params.local_mix, &mut train.local_mix),
+                (4, &mut params.hf_gate, &mut train.hf_gate),
+                (5, &mut params.fuse, &mut train.fuse),
+            ] {
+                apply_host_adam_convolutional(params, train, host_adam_child(state, slot), adam)?;
+            }
+            apply_host_adam(
+                &mut params.scan_weights,
+                &mut train.scan_weight_updates,
+                &mut host_adam_child(state, 6).weights,
+                adam,
+            )?;
+        }
         (LayerParams::Dcnv4(params), LayerTrainBuffers::Dcnv4(train)) => {
             let offset_adam = AdamParams {
                 lr: adam.lr * 0.01,
@@ -17373,6 +17935,63 @@ fn load_weights_into_params(
                 read_f32_into(&mut file, &mut dsconv.collapse.weights)?;
                 read_f32_into(&mut file, &mut dsconv.offset_weights)?;
                 read_f32_into(&mut file, &mut dsconv.offset_biases)?;
+            }
+            LayerParams::Wmhf(wmhf) => {
+                let LayerKind::Wmhf(spec) = &layer.kind else {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} [wmhf] parameters do not match layer kind",
+                        layer.index
+                    )));
+                };
+                for (conv, input_channels, filters, size, groups) in [
+                    (
+                        &mut wmhf.pre,
+                        layer.input_shape.channels,
+                        spec.filters,
+                        1,
+                        1,
+                    ),
+                    (
+                        &mut wmhf.local_dw3,
+                        spec.local_channels,
+                        spec.local_channels,
+                        3,
+                        spec.local_channels,
+                    ),
+                    (
+                        &mut wmhf.local_dw5,
+                        spec.local_channels,
+                        spec.local_channels,
+                        5,
+                        spec.local_channels,
+                    ),
+                    (
+                        &mut wmhf.local_dw7,
+                        spec.local_channels,
+                        spec.local_channels,
+                        7,
+                        spec.local_channels,
+                    ),
+                    (
+                        &mut wmhf.local_mix,
+                        3 * spec.local_channels,
+                        spec.local_channels,
+                        1,
+                        1,
+                    ),
+                    (&mut wmhf.hf_gate, spec.global_channels, spec.filters, 1, 1),
+                    (&mut wmhf.fuse, spec.filters, spec.filters, 1, 1),
+                ] {
+                    read_convolutional_params(
+                        &mut file,
+                        conv,
+                        input_channels,
+                        filters,
+                        size,
+                        groups,
+                    )?;
+                }
+                read_f32_into(&mut file, &mut wmhf.scan_weights)?;
             }
             LayerParams::DeformConv(deform) => {
                 let LayerKind::DeformConv(spec) = &layer.kind else {
@@ -18007,6 +18626,368 @@ fn forward_graph_conv_with_cache(
     // cache; backward needs both tensors for activation and BN derivatives.
     let runtime_cache = GraphConvRuntimeCache { math, training };
     Ok((output, activation_input, runtime_cache))
+}
+
+fn wmhf_internal_convolution_spec(
+    filters: usize,
+    size: usize,
+    groups: usize,
+    batch_normalize: bool,
+    activation: Activation,
+) -> ConvolutionalSpec {
+    ConvolutionalSpec {
+        filters,
+        size,
+        stride_x: 1,
+        stride_y: 1,
+        dilation: 1,
+        padding: size / 2,
+        groups,
+        share_index: None,
+        batch_normalize,
+        activation,
+    }
+}
+
+fn forward_wmhf_convolution(
+    spec: &ConvolutionalSpec,
+    params: &ConvolutionalParams,
+    input: &Tensor,
+    output_shape: TensorShape,
+    training: bool,
+) -> Result<WmhfConvRuntimeCache> {
+    let raw_output = raw_convolution_output(spec, params, input, output_shape);
+    let activation_input = if let Some(batch_norm) = &params.batch_norm {
+        let mut effective_bn = batch_norm.clone();
+        effective_bn.biases.clone_from(&params.biases);
+        forward_batchnorm_with_cache(&effective_bn, &raw_output, training)?.0
+    } else {
+        let mut biased = raw_output.clone();
+        for b in 0..output_shape.batch {
+            for channel in 0..output_shape.channels {
+                let start = (b * output_shape.channels + channel)
+                    * output_shape.height
+                    * output_shape.width;
+                for value in
+                    &mut biased.data[start..start + output_shape.height * output_shape.width]
+                {
+                    *value += params.biases[channel];
+                }
+            }
+        }
+        biased
+    };
+    let mut output = Tensor::zeros(output_shape);
+    for (value, preactivation) in output.data.iter_mut().zip(&activation_input.data) {
+        *value = activate_convolution_value(&spec.activation, *preactivation);
+    }
+    Ok(WmhfConvRuntimeCache {
+        input: input.clone(),
+        raw_output,
+        activation_input,
+        output,
+    })
+}
+
+fn backward_wmhf_convolution(
+    spec: &ConvolutionalSpec,
+    params: &ConvolutionalParams,
+    cache: &WmhfConvRuntimeCache,
+    output_gradient: &Tensor,
+    training: bool,
+) -> Result<(Tensor, ConvolutionalParams)> {
+    let output_shape = cache.output.shape;
+    let delta = apply_output_activation_gradient(
+        &cache.output,
+        output_gradient,
+        &spec.activation,
+        "wmhf sub-convolution",
+        Some(&cache.activation_input),
+    )?;
+    let (raw_gradient, bias_gradient, batch_norm_gradient) =
+        if let Some(batch_norm) = &params.batch_norm {
+            let mut effective_bn = batch_norm.clone();
+            effective_bn.biases.clone_from(&params.biases);
+            let (raw_gradient, mut batch_norm_gradient) =
+                backward_batchnorm(&effective_bn, &cache.raw_output, &delta, training)?;
+            let bias_gradient = std::mem::take(&mut batch_norm_gradient.biases);
+            (raw_gradient, bias_gradient, Some(batch_norm_gradient))
+        } else {
+            let mut bias_gradient = vec![0.0; output_shape.channels];
+            for b in 0..output_shape.batch {
+                for channel in 0..output_shape.channels {
+                    for y in 0..output_shape.height {
+                        for x in 0..output_shape.width {
+                            bias_gradient[channel] += delta.get(b, channel, y, x);
+                        }
+                    }
+                }
+            }
+            (delta, bias_gradient, None)
+        };
+
+    let filters_per_group = spec.filters / spec.groups.max(1);
+    let channels_per_group = cache.input.shape.channels / spec.groups.max(1);
+    let mut input_gradient = Tensor::zeros(cache.input.shape);
+    let mut weight_gradient = vec![0.0; params.weights.len()];
+    for b in 0..cache.input.shape.batch {
+        for filter in 0..spec.filters {
+            let group = filter / filters_per_group.max(1);
+            for oy in 0..output_shape.height {
+                for ox in 0..output_shape.width {
+                    let grad_value = raw_gradient.get(b, filter, oy, ox);
+                    for ic in 0..channels_per_group {
+                        let channel = group * channels_per_group + ic;
+                        for ky in 0..spec.size {
+                            for kx in 0..spec.size {
+                                let src_y = (oy * spec.stride_y + ky * spec.dilation) as isize
+                                    - spec.padding as isize;
+                                let src_x = (ox * spec.stride_x + kx * spec.dilation) as isize
+                                    - spec.padding as isize;
+                                if src_y < 0
+                                    || src_y >= cache.input.shape.height as isize
+                                    || src_x < 0
+                                    || src_x >= cache.input.shape.width as isize
+                                {
+                                    continue;
+                                }
+                                let weight_index = ((filter * channels_per_group + ic) * spec.size
+                                    + ky)
+                                    * spec.size
+                                    + kx;
+                                let src_y = src_y as usize;
+                                let src_x = src_x as usize;
+                                weight_gradient[weight_index] +=
+                                    cache.input.get(b, channel, src_y, src_x) * grad_value;
+                                let input_index = cache.input.offset(b, channel, src_y, src_x);
+                                input_gradient.data[input_index] +=
+                                    params.weights[weight_index] * grad_value;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok((
+        input_gradient,
+        ConvolutionalParams {
+            biases: bias_gradient,
+            batch_norm: batch_norm_gradient,
+            weights: weight_gradient,
+        },
+    ))
+}
+
+fn forward_wmhf_with_cache(
+    spec: &crate::model::WmhfSpec,
+    params: &WmhfParams,
+    input: &Tensor,
+    output_shape: TensorShape,
+    training: bool,
+) -> Result<(Tensor, Tensor, WmhfRuntimeCache)> {
+    let batch = input.shape.batch;
+    let spatial = input.shape.height * input.shape.width;
+    let projected_shape = output_shape;
+    let local_shape = TensorShape {
+        batch,
+        channels: spec.local_channels,
+        height: input.shape.height,
+        width: input.shape.width,
+    };
+    let global_shape = TensorShape {
+        batch,
+        channels: spec.global_channels,
+        height: input.shape.height,
+        width: input.shape.width,
+    };
+    let mut pre_spec = wmhf_internal_convolution_spec(
+        spec.filters,
+        1,
+        1,
+        spec.batch_normalize,
+        Activation::Linear,
+    );
+    pre_spec.padding = 0;
+    let pre = forward_wmhf_convolution(&pre_spec, &params.pre, input, projected_shape, training)?;
+
+    let local_input = Tensor::from_data(
+        local_shape,
+        crate::wmhf::split_channels(
+            &pre.output.data,
+            batch,
+            spec.filters,
+            spatial,
+            spec.identity_channels,
+            spec.local_channels,
+        )?,
+    )?;
+    let global_input = Tensor::from_data(
+        global_shape,
+        crate::wmhf::split_channels(
+            &pre.output.data,
+            batch,
+            spec.filters,
+            spatial,
+            spec.identity_channels + spec.local_channels,
+            spec.global_channels,
+        )?,
+    )?;
+
+    let dw3_spec = wmhf_internal_convolution_spec(
+        spec.local_channels,
+        3,
+        spec.local_channels,
+        false,
+        Activation::Linear,
+    );
+    let dw5_spec = wmhf_internal_convolution_spec(
+        spec.local_channels,
+        5,
+        spec.local_channels,
+        false,
+        Activation::Linear,
+    );
+    let dw7_spec = wmhf_internal_convolution_spec(
+        spec.local_channels,
+        7,
+        spec.local_channels,
+        false,
+        Activation::Linear,
+    );
+    let local_dw3 = forward_wmhf_convolution(
+        &dw3_spec,
+        &params.local_dw3,
+        &local_input,
+        local_shape,
+        training,
+    )?;
+    let local_dw5 = forward_wmhf_convolution(
+        &dw5_spec,
+        &params.local_dw5,
+        &local_input,
+        local_shape,
+        training,
+    )?;
+    let local_dw7 = forward_wmhf_convolution(
+        &dw7_spec,
+        &params.local_dw7,
+        &local_input,
+        local_shape,
+        training,
+    )?;
+    let local_cat = Tensor::from_data(
+        TensorShape {
+            channels: 3 * spec.local_channels,
+            ..local_shape
+        },
+        crate::wmhf::concat_local(
+            &local_dw3.output.data,
+            &local_dw5.output.data,
+            &local_dw7.output.data,
+            batch,
+            spec.local_channels,
+            spatial,
+        )?,
+    )?;
+    let local_mix_spec = wmhf_internal_convolution_spec(
+        spec.local_channels,
+        1,
+        1,
+        spec.batch_normalize,
+        Activation::Linear,
+    );
+    let local_mix = forward_wmhf_convolution(
+        &local_mix_spec,
+        &params.local_mix,
+        &local_cat,
+        local_shape,
+        training,
+    )?;
+
+    let mut dwt = crate::wmhf::haar_dwt(
+        &global_input.data,
+        batch,
+        spec.global_channels,
+        input.shape.height,
+        input.shape.width,
+    )?;
+    let scan_output = crate::wmhf::scan4_forward(
+        &dwt.ll,
+        &params.scan_weights,
+        batch,
+        spec.global_channels,
+        dwt.height2,
+        dwt.width2,
+    )?;
+    let mut inverse_coeffs = dwt.clone();
+    inverse_coeffs.ll.clone_from(&scan_output);
+    let global_values = crate::wmhf::haar_iwt(&inverse_coeffs)?;
+    let energy = Tensor::from_data(
+        global_shape,
+        crate::wmhf::high_frequency_energy_upsample(&dwt)?,
+    )?;
+    let gate_spec = wmhf_internal_convolution_spec(spec.filters, 1, 1, false, Activation::Logistic);
+    let hf_gate = forward_wmhf_convolution(
+        &gate_spec,
+        &params.hf_gate,
+        &energy,
+        projected_shape,
+        training,
+    )?;
+    let fuse_input = Tensor::from_data(
+        projected_shape,
+        crate::wmhf::concat_fuse(
+            &pre.output.data,
+            &local_mix.output.data,
+            &global_values,
+            batch,
+            spec.filters,
+            spec.identity_channels,
+            spec.local_channels,
+            spatial,
+        )?,
+    )?;
+    let fuse_spec = wmhf_internal_convolution_spec(
+        spec.filters,
+        1,
+        1,
+        spec.batch_normalize,
+        Activation::Linear,
+    );
+    let fuse = forward_wmhf_convolution(
+        &fuse_spec,
+        &params.fuse,
+        &fuse_input,
+        output_shape,
+        training,
+    )?;
+    let use_shortcut = spec.shortcut && input.shape.channels == spec.filters;
+    let mut activation_input = fuse.output.clone();
+    let mut output = Tensor::zeros(output_shape);
+    for index in 0..output.data.len() {
+        activation_input.data[index] +=
+            spec.freq_scale * hf_gate.output.data[index] * pre.output.data[index];
+        if use_shortcut {
+            activation_input.data[index] += input.data[index];
+        }
+        output.data[index] = activate(spec.activation.clone(), activation_input.data[index]);
+    }
+    Ok((
+        output,
+        activation_input,
+        WmhfRuntimeCache {
+            pre,
+            local_dw3,
+            local_dw5,
+            local_dw7,
+            local_mix,
+            hf_gate,
+            fuse,
+            dwt,
+            training,
+        },
+    ))
 }
 
 fn forward_deform_conv_with_cache(
@@ -24326,6 +25307,100 @@ mod tests {
         sgd_update,
     };
 
+    fn fill_wmhf_test_params(executable: &mut ExecutableNetwork) {
+        let LayerParams::Wmhf(params) = &mut executable.params[0] else {
+            panic!("wmhf params")
+        };
+        for (block, conv) in [
+            &mut params.pre,
+            &mut params.local_dw3,
+            &mut params.local_dw5,
+            &mut params.local_dw7,
+            &mut params.local_mix,
+            &mut params.hf_gate,
+            &mut params.fuse,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (index, value) in conv.weights.iter_mut().enumerate() {
+                *value = 0.025 + block as f32 * 0.004 + (index % 9) as f32 * 0.001;
+            }
+            for (index, value) in conv.biases.iter_mut().enumerate() {
+                *value = 0.03 + block as f32 * 0.006 + index as f32 * 0.002;
+            }
+            if let Some(batch_norm) = &mut conv.batch_norm {
+                batch_norm.scales.fill(0.8 + block as f32 * 0.015);
+                batch_norm.rolling_mean.fill(0.23);
+                batch_norm.rolling_variance.fill(1.3);
+            }
+        }
+        let global = params.scan_weights.len() / 4;
+        params.scan_weights[..global].fill(0.17);
+        params.scan_weights[global..2 * global].fill(0.4);
+        params.scan_weights[2 * global..3 * global].fill(0.7);
+        params.scan_weights[3 * global..].fill(-0.2);
+    }
+
+    fn wmhf_test_input(batch: usize) -> Tensor {
+        Tensor::from_data(
+            TensorShape::new(3, 3, 2, batch),
+            (0..18 * batch)
+                .map(|index| {
+                    0.17 + ((index * 7 + index / 5) % 19) as f32 * 0.071
+                        + (index / 9) as f32 * 0.013
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn wmhf_test_seed(shape: TensorShape) -> Tensor {
+        Tensor::from_data(
+            shape,
+            (0..shape.element_count() * shape.batch)
+                .map(|index| ((index % 7) as f32 - 2.5) * 0.11 + 0.07)
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn wmhf_objective(executable: &ExecutableNetwork, input: &Tensor, seed: &Tensor) -> f32 {
+        executable
+            .forward_training(input)
+            .unwrap()
+            .final_output()
+            .unwrap()
+            .data
+            .iter()
+            .zip(&seed.data)
+            .map(|(output, upstream)| output * upstream)
+            .sum()
+    }
+
+    fn check_wmhf_scalar_finite_difference(
+        executable: &mut ExecutableNetwork,
+        input: &Tensor,
+        seed: &Tensor,
+        name: &str,
+        original: f32,
+        analytical: f32,
+        mut set: impl FnMut(&mut ExecutableNetwork, f32),
+    ) {
+        let eps = 1.5e-3;
+        set(executable, original + eps);
+        let plus = wmhf_objective(executable, input, seed);
+        set(executable, original - eps);
+        let minus = wmhf_objective(executable, input, seed);
+        set(executable, original);
+        let numerical = (plus - minus) / (2.0 * eps);
+        let tolerance = 4.0e-3 + 2.5e-2 * numerical.abs().max(analytical.abs());
+        assert!(
+            (analytical - numerical).abs() <= tolerance,
+            "[wmhf] {name}: analytical {analytical}, numerical {numerical}, tolerance {tolerance}"
+        );
+    }
+
     fn repo_cfg(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../cfg")
@@ -25466,6 +26541,508 @@ mod tests {
         restored.load_optimizer_state(&path).unwrap();
         assert_eq!(restored.host_adam_state, executable.host_adam_state);
         assert_eq!(restored.adam_step, executable.adam_step);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn wmhf_cpu_full_forward_matches_hand_computation() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "wmhf-hand-forward.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=2\n[wmhf]\nfilters=4\nbatch_normalize=0\nfreq_scale=0.25\nshortcut=0\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::Wmhf(params) = &mut executable.params[0] else {
+            panic!("wmhf params")
+        };
+        params
+            .pre
+            .weights
+            .copy_from_slice(&[1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0]);
+        params.pre.biases.fill(0.0);
+        for conv in [
+            &mut params.local_dw3,
+            &mut params.local_dw5,
+            &mut params.local_dw7,
+            &mut params.local_mix,
+            &mut params.hf_gate,
+        ] {
+            conv.weights.fill(0.0);
+            conv.biases.fill(0.0);
+        }
+        params.fuse.weights.fill(0.0);
+        params.fuse.biases.fill(0.0);
+        for channel in 0..4 {
+            params.fuse.weights[channel * 4 + channel] = 1.0;
+        }
+        params.scan_weights.fill(0.0);
+        let input = Tensor::from_data(
+            TensorShape::new(2, 2, 2, 1),
+            vec![1.0, 2.0, 3.0, 5.0, 0.0, 0.0, 0.0, 0.0],
+        )
+        .unwrap();
+        let forward = executable.forward(&input).unwrap();
+        assert_eq!(
+            forward.final_output().unwrap().data,
+            vec![
+                1.125, 2.25, 3.375, 5.625, 0.25, 0.5, 0.75, 1.25, 0.375, 0.75, 1.125, 1.875, -6.5,
+                -2.0, 2.5, 11.5,
+            ]
+        );
+    }
+
+    #[test]
+    fn wmhf_cpu_backward_matches_finite_differences_across_all_blocks() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "wmhf-finite-difference.cfg",
+                "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=1\n[wmhf]\nfilters=4\nbatch_normalize=0\nfreq_scale=0.31\nshortcut=1\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network);
+        fill_wmhf_test_params(&mut executable);
+        let input = wmhf_test_input(1);
+        let forward = executable.forward_training(&input).unwrap();
+        assert!(forward.wmhf_caches[0].is_some());
+        let seed = wmhf_test_seed(forward.layer_outputs[0].shape);
+        let backward = executable.backward(&input, &forward, &seed).unwrap();
+        let zero_seed = Tensor::filled(seed.shape, 0.0);
+        let zero_backward = executable.backward(&input, &forward, &zero_seed).unwrap();
+        assert!(
+            zero_backward
+                .input_gradient
+                .data
+                .iter()
+                .all(|value| *value == 0.0)
+        );
+        let LayerParams::Wmhf(zero_gradient) = &zero_backward.param_gradients[0] else {
+            panic!("wmhf zero gradient")
+        };
+        assert!(zero_gradient.scan_weights.iter().all(|value| *value == 0.0));
+        let LayerParams::Wmhf(gradient) = &backward.param_gradients[0] else {
+            panic!("wmhf gradient")
+        };
+        macro_rules! check_conv {
+            ($field:ident, $weight_index:expr, $bias_index:expr) => {{
+                let (weight, weight_grad, bias, bias_grad) = {
+                    let LayerParams::Wmhf(params) = &executable.params[0] else {
+                        panic!("wmhf params")
+                    };
+                    (
+                        params.$field.weights[$weight_index],
+                        gradient.$field.weights[$weight_index],
+                        params.$field.biases[$bias_index],
+                        gradient.$field.biases[$bias_index],
+                    )
+                };
+                check_wmhf_scalar_finite_difference(
+                    &mut executable,
+                    &input,
+                    &seed,
+                    stringify!($field),
+                    weight,
+                    weight_grad,
+                    |exe, value| {
+                        let LayerParams::Wmhf(params) = &mut exe.params[0] else {
+                            panic!("wmhf params")
+                        };
+                        params.$field.weights[$weight_index] = value;
+                    },
+                );
+                check_wmhf_scalar_finite_difference(
+                    &mut executable,
+                    &input,
+                    &seed,
+                    stringify!($field),
+                    bias,
+                    bias_grad,
+                    |exe, value| {
+                        let LayerParams::Wmhf(params) = &mut exe.params[0] else {
+                            panic!("wmhf params")
+                        };
+                        params.$field.biases[$bias_index] = value;
+                    },
+                );
+            }};
+        }
+        check_conv!(pre, 1, 0);
+        check_conv!(local_dw3, 4, 1);
+        check_conv!(local_dw5, 23, 0);
+        check_conv!(local_dw7, 61, 1);
+        check_conv!(local_mix, 5, 0);
+        check_conv!(hf_gate, 0, 2);
+        check_conv!(fuse, 7, 1);
+        for index in 0..4 {
+            let (weight, analytical) = {
+                let LayerParams::Wmhf(params) = &executable.params[0] else {
+                    panic!("wmhf params")
+                };
+                (params.scan_weights[index], gradient.scan_weights[index])
+            };
+            check_wmhf_scalar_finite_difference(
+                &mut executable,
+                &input,
+                &seed,
+                "scan_weights",
+                weight,
+                analytical,
+                |exe, value| {
+                    let LayerParams::Wmhf(params) = &mut exe.params[0] else {
+                        panic!("wmhf params")
+                    };
+                    params.scan_weights[index] = value;
+                },
+            );
+        }
+        let index = 5;
+        let eps = 1.5e-3;
+        let mut plus = input.clone();
+        plus.data[index] += eps;
+        let mut minus = input.clone();
+        minus.data[index] -= eps;
+        let numerical = (wmhf_objective(&executable, &plus, &seed)
+            - wmhf_objective(&executable, &minus, &seed))
+            / (2.0 * eps);
+        let analytical = backward.input_gradient.data[index];
+        let tolerance = 4.0e-3 + 2.5e-2 * numerical.abs().max(analytical.abs());
+        assert!(
+            (analytical - numerical).abs() <= tolerance,
+            "[wmhf] input gradient: analytical {analytical}, numerical {numerical}, tolerance {tolerance}"
+        );
+    }
+
+    #[test]
+    fn wmhf_backward_accumulates_into_preceding_convolution() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "wmhf-preceding-conv.cfg",
+                "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=1\n[convolutional]\nfilters=2\nsize=1\nbatch_normalize=0\nactivation=linear\n[wmhf]\nfilters=4\nbatch_normalize=0\nshortcut=0\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::Convolutional(conv) = &mut executable.params[0] else {
+            panic!("preceding convolution params")
+        };
+        conv.weights.copy_from_slice(&[0.7, -0.2, 0.1, 0.8]);
+        conv.biases.copy_from_slice(&[0.03, -0.02]);
+        let LayerParams::Wmhf(params) = &mut executable.params[1] else {
+            panic!("wmhf params")
+        };
+        for conv in [
+            &mut params.pre,
+            &mut params.local_dw3,
+            &mut params.local_dw5,
+            &mut params.local_dw7,
+            &mut params.local_mix,
+            &mut params.hf_gate,
+            &mut params.fuse,
+        ] {
+            conv.weights.fill(0.04);
+            conv.biases.fill(0.02);
+        }
+        params.scan_weights.fill(0.2);
+        params.scan_weights[1] = 0.5;
+        params.scan_weights[2] = 0.7;
+        let input = wmhf_test_input(1);
+        let forward = executable.forward_training(&input).unwrap();
+        assert!(forward.wmhf_caches[1].is_some());
+        let seed = wmhf_test_seed(forward.layer_outputs[1].shape);
+        let backward = executable.backward(&input, &forward, &seed).unwrap();
+        let LayerParams::Convolutional(gradient) = &backward.param_gradients[0] else {
+            panic!("preceding convolution gradient")
+        };
+        assert!(gradient.weights.iter().any(|value| *value != 0.0));
+        assert!(
+            backward
+                .input_gradient
+                .data
+                .iter()
+                .any(|value| *value != 0.0)
+        );
+        let value = match &executable.params[0] {
+            LayerParams::Convolutional(params) => params.weights[0],
+            _ => unreachable!(),
+        };
+        check_wmhf_scalar_finite_difference(
+            &mut executable,
+            &input,
+            &seed,
+            "preceding convolution weight",
+            value,
+            gradient.weights[0],
+            |exe, value| {
+                let LayerParams::Convolutional(params) = &mut exe.params[0] else {
+                    panic!("preceding convolution params")
+                };
+                params.weights[0] = value;
+            },
+        );
+    }
+
+    #[test]
+    fn wmhf_training_batchnorm_backward_and_rolling_stats_match_forward() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "wmhf-batchnorm.cfg",
+                "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=2\n[wmhf]\nfilters=4\nbatch_normalize=1\nshortcut=0\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network);
+        fill_wmhf_test_params(&mut executable);
+        let input = wmhf_test_input(2);
+        let forward = executable.forward_training(&input).unwrap();
+        assert!(forward.wmhf_caches[0].as_ref().unwrap().training);
+        let inference = executable.forward(&input).unwrap();
+        assert_ne!(
+            forward.layer_outputs[0].data,
+            inference.layer_outputs[0].data
+        );
+        let seed = wmhf_test_seed(forward.layer_outputs[0].shape);
+        let backward = executable.backward(&input, &forward, &seed).unwrap();
+        let LayerParams::Wmhf(gradient) = &backward.param_gradients[0] else {
+            panic!("wmhf gradient")
+        };
+        macro_rules! check_bn {
+            ($field:ident) => {{
+                let (beta, beta_grad, scale, scale_grad) = {
+                    let LayerParams::Wmhf(params) = &executable.params[0] else {
+                        panic!("wmhf params")
+                    };
+                    (
+                        params.$field.biases[0],
+                        gradient.$field.biases[0],
+                        params.$field.batch_norm.as_ref().unwrap().scales[0],
+                        gradient.$field.batch_norm.as_ref().unwrap().scales[0],
+                    )
+                };
+                check_wmhf_scalar_finite_difference(
+                    &mut executable,
+                    &input,
+                    &seed,
+                    stringify!($field),
+                    beta,
+                    beta_grad,
+                    |exe, value| {
+                        let LayerParams::Wmhf(params) = &mut exe.params[0] else {
+                            panic!("wmhf params")
+                        };
+                        params.$field.biases[0] = value;
+                    },
+                );
+                check_wmhf_scalar_finite_difference(
+                    &mut executable,
+                    &input,
+                    &seed,
+                    stringify!($field),
+                    scale,
+                    scale_grad,
+                    |exe, value| {
+                        let LayerParams::Wmhf(params) = &mut exe.params[0] else {
+                            panic!("wmhf params")
+                        };
+                        params.$field.batch_norm.as_mut().unwrap().scales[0] = value;
+                    },
+                );
+            }};
+        }
+        check_bn!(pre);
+        check_bn!(local_mix);
+        check_bn!(fuse);
+
+        let cache = forward.wmhf_caches[0].as_ref().unwrap();
+        let expected_stats = [
+            super::batchnorm_channel_stats(&cache.pre.raw_output),
+            super::batchnorm_channel_stats(&cache.local_mix.raw_output),
+            super::batchnorm_channel_stats(&cache.fuse.raw_output),
+        ];
+        let initial_stats = {
+            let LayerParams::Wmhf(params) = &executable.params[0] else {
+                panic!("wmhf params")
+            };
+            [&params.pre, &params.local_mix, &params.fuse].map(|conv| {
+                let bn = conv.batch_norm.as_ref().unwrap();
+                (bn.rolling_mean.clone(), bn.rolling_variance.clone())
+            })
+        };
+        executable
+            .backward_accumulate(&input, &forward, &seed)
+            .unwrap();
+        let LayerParams::Wmhf(params) = &executable.params[0] else {
+            panic!("wmhf params")
+        };
+        for (index, conv) in [&params.pre, &params.local_mix, &params.fuse]
+            .into_iter()
+            .enumerate()
+        {
+            let bn = conv.batch_norm.as_ref().unwrap();
+            for channel in 0..bn.scales.len() {
+                let mean =
+                    0.9 * initial_stats[index].0[channel] + 0.1 * expected_stats[index].0[channel];
+                let variance =
+                    0.9 * initial_stats[index].1[channel] + 0.1 * expected_stats[index].1[channel];
+                assert!((bn.rolling_mean[channel] - mean).abs() < 1.0e-5);
+                assert!((bn.rolling_variance[channel] - variance).abs() < 1.0e-5);
+            }
+        }
+        let LayerTrainBuffers::Wmhf(train) = &executable.train_buffers[0] else {
+            panic!("wmhf train buffers")
+        };
+        assert!(train.scan_weight_updates.iter().any(|value| *value != 0.0));
+        for conv in [
+            &train.pre,
+            &train.local_dw3,
+            &train.local_dw5,
+            &train.local_dw7,
+            &train.local_mix,
+            &train.hf_gate,
+            &train.fuse,
+        ] {
+            assert!(conv.weight_updates.iter().any(|value| *value != 0.0));
+            assert!(conv.bias_updates.iter().any(|value| *value != 0.0));
+        }
+    }
+
+    #[test]
+    fn wmhf_sgd_updates_every_block_and_gpu_paths_reject() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "wmhf-sgd.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=2\ndecay=0.1\n[wmhf]\nfilters=4\nbatch_normalize=1\nlearning_rate=0.25\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let LayerParams::Wmhf(params) = &mut executable.params[0] else {
+            panic!("wmhf params")
+        };
+        for conv in [
+            &mut params.pre,
+            &mut params.local_dw3,
+            &mut params.local_dw5,
+            &mut params.local_dw7,
+            &mut params.local_mix,
+            &mut params.hf_gate,
+            &mut params.fuse,
+        ] {
+            conv.weights.fill(2.0);
+            conv.biases.fill(3.0);
+            if let Some(bn) = &mut conv.batch_norm {
+                bn.scales.fill(1.0);
+            }
+        }
+        params.scan_weights.fill(2.0);
+        let LayerTrainBuffers::Wmhf(train) = &mut executable.train_buffers[0] else {
+            panic!("wmhf train buffers")
+        };
+        for conv in [
+            &mut train.pre,
+            &mut train.local_dw3,
+            &mut train.local_dw5,
+            &mut train.local_dw7,
+            &mut train.local_mix,
+            &mut train.hf_gate,
+            &mut train.fuse,
+        ] {
+            conv.weight_updates.fill(1.0);
+            conv.bias_updates.fill(1.0);
+            if let Some(bn) = &mut conv.batch_norm {
+                bn.scale_updates.fill(1.0);
+            }
+        }
+        train.scan_weight_updates.fill(1.0);
+        executable.update_weights(0.2, 0.5, 0.1, 2);
+        let LayerParams::Wmhf(params) = &executable.params[0] else {
+            panic!("wmhf params")
+        };
+        for conv in [
+            &params.pre,
+            &params.local_dw3,
+            &params.local_dw5,
+            &params.local_dw7,
+            &params.local_mix,
+            &params.hf_gate,
+            &params.fuse,
+        ] {
+            assert!((conv.weights[0] - 2.06).abs() < 1.0e-6);
+            assert!((conv.biases[0] - 3.1).abs() < 1.0e-6);
+            if let Some(bn) = &conv.batch_norm {
+                assert!((bn.scales[0] - 1.1).abs() < 1.0e-6);
+            }
+        }
+        assert!((params.scan_weights[0] - 2.015).abs() < 1.0e-6);
+
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        let input = Tensor::from_data(TensorShape::new(1, 1, 2, 1), vec![0.1, 0.2]).unwrap();
+        assert!(
+            gpu.forward(&input)
+                .unwrap_err()
+                .to_string()
+                .contains("[wmhf] GPU execution is not implemented")
+        );
+        assert!(
+            gpu.forward_compact(&input)
+                .unwrap_err()
+                .to_string()
+                .contains("[wmhf] compact GPU execution is not implemented")
+        );
+        assert!(
+            gpu.update_weights_gpu(0.01, 0.9, 0.0, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("[wmhf] GPU updates are not implemented")
+        );
+    }
+
+    #[test]
+    fn wmhf_adam_state_round_trips_all_parameter_blocks() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "wmhf-adam.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=2\nadam=1\ndecay=0.05\n[wmhf]\nfilters=4\nbatch_normalize=1\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network.clone());
+        fill_wmhf_test_params(&mut executable);
+        let LayerTrainBuffers::Wmhf(train) = &mut executable.train_buffers[0] else {
+            panic!("wmhf train buffers")
+        };
+        for conv in [
+            &mut train.pre,
+            &mut train.local_dw3,
+            &mut train.local_dw5,
+            &mut train.local_dw7,
+            &mut train.local_mix,
+            &mut train.hf_gate,
+            &mut train.fuse,
+        ] {
+            conv.weight_updates.fill(0.2);
+            conv.bias_updates.fill(0.3);
+            if let Some(bn) = &mut conv.batch_norm {
+                bn.scale_updates.fill(0.4);
+            }
+        }
+        train.scan_weight_updates.fill(0.5);
+        executable.update_weights_adam(0.01, 1).unwrap();
+        assert_eq!(executable.adam_step(), 1);
+        let path =
+            std::env::temp_dir().join(format!("darknet-wmhf-adam-{}.state", std::process::id()));
+        executable.save_optimizer_state(&path).unwrap();
+        let mut restored = ExecutableNetwork::new(network);
+        restored.load_optimizer_state(&path).unwrap();
+        assert_eq!(restored.host_adam_state, executable.host_adam_state);
+        assert_eq!(restored.adam_step(), executable.adam_step());
         let _ = fs::remove_file(path);
     }
 

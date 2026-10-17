@@ -284,6 +284,26 @@ pub fn initialize_training_params(network: &Network, params: &mut [LayerParams],
                 p.offset_weights.fill(0.0);
                 p.offset_biases.fill(0.0);
             }
+            LayerParams::Wmhf(p) => {
+                let crate::LayerKind::Wmhf(spec) = &layer.kind else {
+                    unreachable!("WMHF parameters require a WMHF layer");
+                };
+                for conv_params in [
+                    &mut p.pre,
+                    &mut p.local_dw3,
+                    &mut p.local_dw5,
+                    &mut p.local_dw7,
+                    &mut p.local_mix,
+                    &mut p.hf_gate,
+                    &mut p.fuse,
+                ] {
+                    conv(conv_params, &mut rng);
+                }
+                p.scan_weights.fill(0.0);
+                let channels = spec.global_channels;
+                p.scan_weights[channels..2 * channels].fill(1.0);
+                p.scan_weights[2 * channels..3 * channels].fill(1.0);
+            }
             LayerParams::DeformConv(p) => {
                 let crate::LayerKind::DeformConv(_) = &layer.kind else {
                     unreachable!("deform_conv parameters require a deform_conv layer");
@@ -806,6 +826,61 @@ mod tests {
         assert_eq!(params.collapse.biases, vec![0.0; 4]);
         assert!(params.offset_weights.iter().all(|value| *value == 0.0));
         assert!(params.offset_biases.iter().all(|value| *value == 0.0));
+    }
+
+    #[test]
+    fn wmhf_initialization_is_seeded_and_sets_scan_priors() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "wmhf-init.cfg",
+                "[net]\nwidth=3\nheight=3\nchannels=2\n[wmhf]\nfilters=4\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut first = ExecutableNetwork::new(network.clone());
+        let mut second = ExecutableNetwork::new(network.clone());
+        initialize_training_params(&network, &mut first.params, 83);
+        initialize_training_params(&network, &mut second.params, 83);
+        assert_eq!(first.params, second.params);
+        let LayerParams::Wmhf(params) = &first.params[0] else {
+            panic!("wmhf params")
+        };
+        assert!(params.pre.weights.iter().any(|value| *value != 0.0));
+        assert!(params.local_dw3.weights.iter().any(|value| *value != 0.0));
+        assert!(params.local_dw5.weights.iter().any(|value| *value != 0.0));
+        assert!(params.local_dw7.weights.iter().any(|value| *value != 0.0));
+        assert!(params.local_mix.weights.iter().any(|value| *value != 0.0));
+        assert!(params.hf_gate.weights.iter().any(|value| *value != 0.0));
+        assert!(params.fuse.weights.iter().any(|value| *value != 0.0));
+        assert_eq!(params.pre.batch_norm.as_ref().unwrap().scales, vec![1.0; 4]);
+        assert!(params.local_dw3.batch_norm.is_none());
+        assert!(params.local_dw5.batch_norm.is_none());
+        assert!(params.local_dw7.batch_norm.is_none());
+        assert_eq!(
+            params.local_mix.batch_norm.as_ref().unwrap().scales.len(),
+            2
+        );
+        assert!(params.hf_gate.batch_norm.is_none());
+        assert_eq!(params.fuse.batch_norm.as_ref().unwrap().scales.len(), 4);
+        let channels = network.layers[0]
+            .weights()
+            .unwrap()
+            .entries
+            .last()
+            .unwrap()
+            .len
+            / 4;
+        assert_eq!(&params.scan_weights[..channels], vec![0.0; channels]);
+        assert_eq!(
+            &params.scan_weights[channels..2 * channels],
+            vec![1.0; channels]
+        );
+        assert_eq!(
+            &params.scan_weights[2 * channels..3 * channels],
+            vec![1.0; channels]
+        );
+        assert_eq!(&params.scan_weights[3 * channels..], vec![0.0; channels]);
     }
 
     #[test]

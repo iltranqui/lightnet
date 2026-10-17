@@ -451,6 +451,20 @@ pub struct DsConvSpec {
     pub activation: Activation,
 }
 
+/// `[wmhf]`: identity/local/global channel partition for the wavelet-Mamba
+/// high-frequency fusion layer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WmhfSpec {
+    pub filters: usize,
+    pub identity_channels: usize,
+    pub local_channels: usize,
+    pub global_channels: usize,
+    pub freq_scale: f32,
+    pub shortcut: bool,
+    pub batch_normalize: bool,
+    pub activation: Activation,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConnectedSpec {
     pub output: usize,
@@ -1353,6 +1367,8 @@ pub enum LayerKind {
     DeformConv(DeformConvSpec),
     /// `[dsconv]` / `[dynamic_snake_conv]`: Dynamic Snake Conv.
     DsConv(DsConvSpec),
+    /// `[wmhf]` / wavelet-Mamba High-frequency Fusion.
+    Wmhf(WmhfSpec),
     Rnn(RnnSpec),
     Gru(GruSpec),
     Lstm(LstmSpec),
@@ -1416,6 +1432,7 @@ impl LayerKind {
             Self::Dcnv4(_) => "dcnv4",
             Self::DeformConv(_) => "deform_conv",
             Self::DsConv(_) => "dsconv",
+            Self::Wmhf(_) => "wmhf",
             Self::Rnn(_) => "rnn",
             Self::Gru(_) => "gru",
             Self::Lstm(_) => "lstm",
@@ -1436,6 +1453,7 @@ impl LayerKind {
             Self::Dcnv4(spec) => Some(&spec.activation),
             Self::DeformConv(spec) => Some(&spec.activation),
             Self::DsConv(spec) => Some(&spec.activation),
+            Self::Wmhf(spec) => Some(&spec.activation),
             Self::Deconvolutional(spec) => Some(&spec.activation),
             Self::Connected(spec) => Some(&spec.activation),
             Self::Shortcut(spec) => Some(&spec.activation),
@@ -2076,6 +2094,65 @@ impl Layer {
                     ],
                 })
             }
+            LayerKind::Wmhf(spec) => {
+                let channels = self.input_shape.channels;
+                let local_mix_channels = spec
+                    .local_channels
+                    .checked_mul(3)
+                    .expect("validated WMHF local mixer channels");
+                let scan_parameter_count = spec
+                    .global_channels
+                    .checked_mul(4)
+                    .expect("validated WMHF scan parameter count");
+                let mut entries = Vec::new();
+                append_convolutional_weight_entries(
+                    &mut entries,
+                    channels,
+                    spec.filters,
+                    1,
+                    1,
+                    spec.batch_normalize,
+                );
+                for size in [3, 5, 7] {
+                    append_convolutional_weight_entries(
+                        &mut entries,
+                        spec.local_channels,
+                        spec.local_channels,
+                        size,
+                        spec.local_channels,
+                        false,
+                    );
+                }
+                append_convolutional_weight_entries(
+                    &mut entries,
+                    local_mix_channels,
+                    spec.local_channels,
+                    1,
+                    1,
+                    spec.batch_normalize,
+                );
+                append_convolutional_weight_entries(
+                    &mut entries,
+                    spec.global_channels,
+                    spec.filters,
+                    1,
+                    1,
+                    false,
+                );
+                append_convolutional_weight_entries(
+                    &mut entries,
+                    spec.filters,
+                    spec.filters,
+                    1,
+                    1,
+                    spec.batch_normalize,
+                );
+                entries.push(WeightsEntry {
+                    array: WeightsArray::Named("scan_weights".to_owned()),
+                    len: scan_parameter_count,
+                });
+                Some(LayerWeights { entries })
+            }
             LayerKind::DeformConv(spec) => {
                 let channels = self.input_shape.channels;
                 let kernel_area = spec
@@ -2435,6 +2512,9 @@ fn parse_layer_kind(
             LayerKind::DeformConv(parse_deform_conv_spec(section, current)?)
         }
         "dsconv" | "dynamic_snake_conv" => LayerKind::DsConv(parse_dsconv_spec(section, current)?),
+        "wmhf" | "wavelet_mamba_hf" | "wavelet_mamba_high_frequency" => {
+            LayerKind::Wmhf(parse_wmhf_spec(section, current)?)
+        }
         "eml_convolutional" => {
             let line = section.line;
             if current.width == 0 || current.height == 0 || current.channels == 0 {
@@ -3842,6 +3922,48 @@ fn infer_output_shape(
                 current.batch,
             ))
         }
+        LayerKind::Wmhf(spec) => {
+            if current.width == 0
+                || current.height == 0
+                || current.channels == 0
+                || current.batch == 0
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "[wmhf] layer #{layer_index}: preceding layer must output a non-empty image"
+                )));
+            }
+            let split_sum = spec
+                .identity_channels
+                .checked_add(spec.local_channels)
+                .and_then(|count| count.checked_add(spec.global_channels));
+            if spec.filters < 4
+                || spec.local_channels == 0
+                || spec.global_channels == 0
+                || split_sum != Some(spec.filters)
+                || !spec.freq_scale.is_finite()
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "[wmhf] layer #{layer_index}: invalid channel split or frequency scale"
+                )));
+            }
+            current
+                .channels
+                .checked_mul(spec.filters)
+                .and_then(|_| current.width.checked_mul(current.height))
+                .and_then(|area| area.checked_mul(current.batch))
+                .and_then(|count| count.checked_mul(spec.filters))
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "[wmhf] layer #{layer_index}: output element count overflows"
+                    ))
+                })?;
+            Ok(TensorShape::new(
+                current.width,
+                current.height,
+                spec.filters,
+                current.batch,
+            ))
+        }
         LayerKind::DeformConv(spec) => {
             if current.width == 0 || current.height == 0 || current.channels == 0 {
                 return Err(Error::InvalidConfig(format!(
@@ -5041,6 +5163,189 @@ fn parse_graph_conv_spec(section: &RawSection, input: TensorShape) -> Result<Gra
         padding,
         edge_mode: edge_mode as usize,
         use_self,
+        batch_normalize,
+        activation,
+    })
+}
+
+fn reject_unknown_wmhf_keys(section: &RawSection) -> Result<()> {
+    const ALLOWED: &[&str] = &[
+        "filters",
+        "identity_ratio",
+        "local_ratio",
+        "freq_scale",
+        "shortcut",
+        "batch_normalize",
+        "activation",
+        "learning_rate",
+        "dont_update",
+        "burnin_update",
+        "train_only_bn",
+        "clip",
+        "grad_centr",
+    ];
+    if let Some(key) = section
+        .values
+        .keys()
+        .find(|key| !ALLOWED.contains(&key.as_str()))
+    {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {}: unknown option `{key}`",
+            section.name, section.line
+        )));
+    }
+    Ok(())
+}
+
+fn parse_wmhf_spec(section: &RawSection, input: TensorShape) -> Result<WmhfSpec> {
+    let line = section.line;
+    reject_unknown_wmhf_keys(section)?;
+    let invalid = |message: &str| {
+        Error::InvalidConfig(format!("[{}] at line {line}: {message}", section.name))
+    };
+    if input.batch == 0 || input.width == 0 || input.height == 0 || input.channels == 0 {
+        return Err(invalid("preceding layer must output a non-empty image"));
+    }
+    let default_filters = i64::try_from(input.channels)
+        .map_err(|_| invalid("input channels exceed the supported range"))?;
+    let filters = section.get_i64("filters", default_filters)?;
+    let identity_ratio = section.get_f32("identity_ratio", 0.25)?;
+    let local_ratio = section.get_f32("local_ratio", 0.375)?;
+    let freq_scale = section.get_f32("freq_scale", 0.25)?;
+    let shortcut = section.get_i64("shortcut", 1)? != 0;
+    let batch_normalize = section.get_i64("batch_normalize", 1)? != 0;
+    let activation = Activation::parse(&section.get_str("activation", "leaky"));
+    if !identity_ratio.is_finite() || !local_ratio.is_finite() {
+        return Err(invalid("identity_ratio and local_ratio must be finite"));
+    }
+    if !freq_scale.is_finite() {
+        return Err(invalid("freq_scale must be finite"));
+    }
+    if matches!(activation, Activation::Other(_)) {
+        return Err(invalid("activation name is unsupported"));
+    }
+    if filters < 4 {
+        return Err(invalid("filters must be at least 4"));
+    }
+    if section.get_f32("clip", 0.0)? != 0.0 {
+        return Err(invalid("clip is unsupported for wmhf"));
+    }
+    if section.get_i64("grad_centr", 0)? != 0 {
+        return Err(invalid("grad_centr is unsupported for wmhf"));
+    }
+
+    let round_ratio = |ratio: f32, name: &str| -> Result<i64> {
+        let scaled = filters as f32 * ratio;
+        let rounded = scaled.round();
+        if !scaled.is_finite()
+            || !rounded.is_finite()
+            || rounded < i64::MIN as f32
+            || rounded >= i64::MAX as f32
+        {
+            return Err(invalid(&format!(
+                "{name} produces an out-of-range channel split"
+            )));
+        }
+        Ok(rounded as i64)
+    };
+    let mut identity = round_ratio(identity_ratio, "identity_ratio")?.max(0);
+    let mut local = round_ratio(local_ratio, "local_ratio")?.max(1);
+    if identity.saturating_add(local) > filters - 1 {
+        local = filters
+            .checked_sub(identity)
+            .and_then(|remaining| remaining.checked_sub(1))
+            .unwrap_or(i64::MIN)
+            .max(1);
+    }
+    let mut global = filters
+        .checked_sub(identity)
+        .and_then(|remaining| remaining.checked_sub(local))
+        .unwrap_or(-1);
+    if global < 1 {
+        global = 1;
+        if local > 1 {
+            local -= 1;
+        } else if identity > 0 {
+            identity -= 1;
+        }
+    }
+    if identity < 0
+        || local < 1
+        || global < 1
+        || identity
+            .checked_add(local)
+            .and_then(|sum| sum.checked_add(global))
+            != Some(filters)
+    {
+        return Err(invalid(
+            "channel split cannot produce positive local and global groups",
+        ));
+    }
+    let filters = usize::try_from(filters).map_err(|_| invalid("filters is out of range"))?;
+    let identity_channels =
+        usize::try_from(identity).map_err(|_| invalid("identity channel count is out of range"))?;
+    let local_channels =
+        usize::try_from(local).map_err(|_| invalid("local channel count is out of range"))?;
+    let global_channels =
+        usize::try_from(global).map_err(|_| invalid("global channel count is out of range"))?;
+
+    let mut parameter_count = 0usize;
+    let mut add_conv = |input_channels: usize,
+                        output_channels: usize,
+                        kernel: usize,
+                        groups: usize,
+                        batch_norm: bool|
+     -> Result<()> {
+        let weights = output_channels
+            .checked_mul(input_channels / groups)
+            .and_then(|count| count.checked_mul(kernel))
+            .and_then(|count| count.checked_mul(kernel))
+            .ok_or_else(|| invalid("convolution parameter count overflows"))?;
+        let arrays = output_channels
+            .checked_mul(if batch_norm { 4 } else { 1 })
+            .ok_or_else(|| invalid("convolution parameter count overflows"))?;
+        parameter_count = parameter_count
+            .checked_add(weights)
+            .and_then(|count| count.checked_add(arrays))
+            .ok_or_else(|| invalid("parameter count overflows"))?;
+        Ok(())
+    };
+    let local_mix_channels = local_channels
+        .checked_mul(3)
+        .ok_or_else(|| invalid("local mixer channel count overflows"))?;
+    let scan_parameter_count = global_channels
+        .checked_mul(4)
+        .ok_or_else(|| invalid("scan parameter count overflows"))?;
+    add_conv(input.channels, filters, 1, 1, batch_normalize)?;
+    for kernel in [3, 5, 7] {
+        add_conv(
+            local_channels,
+            local_channels,
+            kernel,
+            local_channels,
+            false,
+        )?;
+    }
+    add_conv(local_mix_channels, local_channels, 1, 1, batch_normalize)?;
+    add_conv(global_channels, filters, 1, 1, false)?;
+    add_conv(filters, filters, 1, 1, batch_normalize)?;
+    parameter_count
+        .checked_add(scan_parameter_count)
+        .ok_or_else(|| invalid("parameter count overflows"))?;
+    input
+        .width
+        .checked_mul(input.height)
+        .and_then(|area| area.checked_mul(input.batch))
+        .and_then(|count| count.checked_mul(filters))
+        .ok_or_else(|| invalid("output element count overflows"))?;
+
+    Ok(WmhfSpec {
+        filters,
+        identity_channels,
+        local_channels,
+        global_channels,
+        freq_scale,
+        shortcut,
         batch_normalize,
         activation,
     })
@@ -8659,6 +8964,136 @@ mod tests {
         assert_eq!(spec.max_delta, 3.0);
         assert_eq!(spec.class_multipliers, Some(vec![1.0, 2.0]));
         assert_eq!(spec.class_map, Some(vec![1, 0]));
+    }
+
+    #[test]
+    fn wmhf_aliases_defaults_split_shape_and_source_weight_layout() {
+        for alias in ["wmhf", "wavelet_mamba_hf", "wavelet_mamba_high_frequency"] {
+            let network = build(&format!(
+                "[net]\nwidth=5\nheight=3\nchannels=4\n[{alias}]\n"
+            ))
+            .unwrap_or_else(|error| panic!("[{alias}] should parse: {error}"));
+            let layer = &network.layers[0];
+            let LayerKind::Wmhf(spec) = &layer.kind else {
+                panic!("expected WMHF for [{alias}]");
+            };
+            assert_eq!(layer.kind.name(), "wmhf");
+            assert_eq!(layer.output_shape, super::TensorShape::new(5, 3, 4, 1));
+            assert_eq!(
+                (
+                    spec.filters,
+                    spec.identity_channels,
+                    spec.local_channels,
+                    spec.global_channels,
+                    spec.freq_scale,
+                    spec.shortcut,
+                    spec.batch_normalize,
+                    spec.activation.clone(),
+                ),
+                (4, 1, 2, 1, 0.25, true, true, super::Activation::Leaky)
+            );
+            let entries = layer.weights().expect("WMHF weights").entries;
+            assert_eq!(
+                entries.iter().map(|entry| entry.len).collect::<Vec<_>>(),
+                vec![
+                    4, 4, 4, 4, 16, // pre: bias, BN arrays, weights
+                    2, 18, // depthwise 3x3
+                    2, 50, // depthwise 5x5
+                    2, 98, // depthwise 7x7
+                    2, 2, 2, 2, 12, // local mix: bias, BN arrays, weights
+                    4, 4, // high-frequency gate
+                    4, 4, 4, 4, 16, // final fuse
+                    4,  // four scan vectors
+                ]
+            );
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|entry| entry.array.name())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "biases",
+                    "scales",
+                    "rolling_mean",
+                    "rolling_variance",
+                    "weights",
+                    "biases",
+                    "weights",
+                    "biases",
+                    "weights",
+                    "biases",
+                    "weights",
+                    "biases",
+                    "scales",
+                    "rolling_mean",
+                    "rolling_variance",
+                    "weights",
+                    "biases",
+                    "weights",
+                    "biases",
+                    "scales",
+                    "rolling_mean",
+                    "rolling_variance",
+                    "weights",
+                    "scan_weights",
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn wmhf_split_normalization_and_strict_config_are_pinned() {
+        let make = |options: &str| {
+            build(&format!(
+                "[net]\nwidth=5\nheight=3\nchannels=4\n[wmhf]\n{options}\n"
+            ))
+        };
+        let normalized =
+            make("filters=5\nidentity_ratio=0.4\nlocal_ratio=0\nshortcut=0\nbatch_normalize=0")
+                .expect("finite source-normalized split");
+        let LayerKind::Wmhf(spec) = &normalized.layers[0].kind else {
+            panic!("WMHF layer");
+        };
+        assert_eq!(
+            (
+                spec.identity_channels,
+                spec.local_channels,
+                spec.global_channels
+            ),
+            (2, 1, 2)
+        );
+        assert!(!spec.shortcut && !spec.batch_normalize);
+        assert_eq!(
+            normalized.layers[0]
+                .weights()
+                .unwrap()
+                .entries
+                .iter()
+                .map(|entry| entry.array.name())
+                .filter(|name| *name == "scales"
+                    || *name == "rolling_mean"
+                    || *name == "rolling_variance")
+                .count(),
+            0
+        );
+
+        for (options, expected) in [
+            ("filters=3", "filters must be at least 4"),
+            ("freq_scale=NaN", "freq_scale must be finite"),
+            (
+                "identity_ratio=inf",
+                "identity_ratio and local_ratio must be finite",
+            ),
+            ("identity_ratio=2\nlocal_ratio=2", "channel split"),
+            ("unknown_option=1", "unknown option"),
+            (
+                "activation=not_an_activation",
+                "activation name is unsupported",
+            ),
+        ] {
+            let error = make(options).expect_err("invalid WMHF config should fail");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]

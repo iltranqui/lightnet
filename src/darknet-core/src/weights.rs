@@ -269,6 +269,20 @@ pub fn save_weights(
                 write_f32_slice(&mut file, &dsconv.offset_weights)?;
                 write_f32_slice(&mut file, &dsconv.offset_biases)?;
             }
+            (LayerKind::Wmhf(_), LayerParams::Wmhf(wmhf)) => {
+                for conv in [
+                    &wmhf.pre,
+                    &wmhf.local_dw3,
+                    &wmhf.local_dw5,
+                    &wmhf.local_dw7,
+                    &wmhf.local_mix,
+                    &wmhf.hf_gate,
+                    &wmhf.fuse,
+                ] {
+                    write_convolutional_params(&mut file, conv)?;
+                }
+                write_f32_slice(&mut file, &wmhf.scan_weights)?;
+            }
             // C++ `dontsave`: the frozen LAYA layers load from an external
             // shared blob, so nothing is written for them in this stream.
             (LayerKind::LayaEncoder(_), LayerParams::LayaEncoder(_)) => {}
@@ -1306,7 +1320,8 @@ mod tests {
                     | LayerParams::Swin(_)
                     | LayerParams::TuckerAttention(_)
                     | LayerParams::MambaVision(_)
-                    | LayerParams::GraphConv(_) => {}
+                    | LayerParams::GraphConv(_)
+                    | LayerParams::Wmhf(_) => {}
                 }
             }
             let path = std::env::temp_dir().join(format!("darknet-{name}-roundtrip.weights"));
@@ -1318,6 +1333,100 @@ mod tests {
             assert_eq!(reloaded.params, executable.params, "{name} weights differ");
             let _ = fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn wmhf_weights_round_trip_in_source_order_with_exact_length() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "wmhf-weights.cfg",
+                "[net]\nwidth=3\nheight=3\nchannels=2\n[wmhf]\nfilters=4\nbatch_normalize=1\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let LayerParams::Wmhf(params) = &mut executable.params[0] else {
+            panic!("wmhf parameters")
+        };
+        for (block, conv) in [
+            &mut params.pre,
+            &mut params.local_dw3,
+            &mut params.local_dw5,
+            &mut params.local_dw7,
+            &mut params.local_mix,
+            &mut params.hf_gate,
+            &mut params.fuse,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            conv.biases.fill(0.1 + block as f32);
+            conv.weights.fill(0.2 + block as f32);
+            if let Some(batch_norm) = &mut conv.batch_norm {
+                batch_norm.scales.fill(0.3 + block as f32);
+                batch_norm.rolling_mean.fill(0.4 + block as f32);
+                batch_norm.rolling_variance.fill(0.5 + block as f32);
+            }
+        }
+        params.scan_weights.fill(0.875);
+        let parameter_count = network.layers[0].weights().unwrap().parameter_count();
+        let path = std::env::temp_dir().join(format!(
+            "darknet-wmhf-roundtrip-{}.weights",
+            std::process::id()
+        ));
+        save_weights(&network, &executable.params, &path, 17).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            20 + parameter_count as u64 * 4
+        );
+        let inspection = inspect_weights_file(&network, &path).unwrap();
+        assert_eq!(inspection.trailing_bytes, 0);
+        assert_eq!(
+            inspection.layers[0]
+                .arrays
+                .iter()
+                .map(|a| a.len)
+                .sum::<usize>(),
+            parameter_count
+        );
+        assert_eq!(
+            inspection.layers[0]
+                .arrays
+                .iter()
+                .map(|array| (array.name.as_str(), array.len))
+                .collect::<Vec<_>>(),
+            [
+                ("biases", 4),
+                ("scales", 4),
+                ("rolling_mean", 4),
+                ("rolling_variance", 4),
+                ("weights", 8),
+                ("biases", 2),
+                ("weights", 18),
+                ("biases", 2),
+                ("weights", 50),
+                ("biases", 2),
+                ("weights", 98),
+                ("biases", 2),
+                ("scales", 2),
+                ("rolling_mean", 2),
+                ("rolling_variance", 2),
+                ("weights", 12),
+                ("biases", 4),
+                ("weights", 4),
+                ("biases", 4),
+                ("scales", 4),
+                ("rolling_mean", 4),
+                ("rolling_variance", 4),
+                ("weights", 16),
+                ("scan_weights", 4),
+            ]
+        );
+        let mut reloaded = ExecutableNetwork::new(network);
+        reloaded.load_weights_file(&path).unwrap();
+        assert_eq!(reloaded.params, executable.params);
+        let _ = fs::remove_file(path);
     }
 
     #[test]

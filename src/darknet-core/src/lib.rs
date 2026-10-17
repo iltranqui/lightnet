@@ -111,6 +111,7 @@ pub(crate) mod tucker_attention;
 pub(crate) mod vc_attention;
 pub(crate) mod vit;
 pub mod weights;
+pub(crate) mod wmhf;
 
 pub use carpn::{ObbRefineOutput, ObbRefineProposal};
 pub use cfg::{ConfigFile, RawSection};
@@ -130,7 +131,7 @@ pub use model::{
     Activation, CrnnSpec, DeformConvSpec, DsConvSpec, KimiKdaSpec, Layer, LayerKind, LayerWeights,
     LrPolicy, LstmSpec, MambaVisionSpec, NetConfig, Network, ObbRefineLoss, ObbRefineSpec, RnnSpec,
     ShortcutWeightsNorm, ShortcutWeightsType, SwinSpec, TensorShape, TuckerAttentionSpec,
-    WeightsArray, YoloIouLoss,
+    WeightsArray, WmhfSpec, YoloIouLoss,
 };
 pub use names::load_names_file;
 pub use runtime::{
@@ -139,8 +140,8 @@ pub use runtime::{
     DsConvTrainBuffers, ExecutableNetwork, ForwardResult, GpuExecutableNetwork, GpuForwardState,
     GpuForwardSummary, KimiKdaTrainBuffers, LayerParams, LayerTrainBuffers, LstmParams,
     LstmTrainBuffers, MambaVisionTrainBuffers, RecurrentForwardCache, RnnParams, RnnTrainBuffers,
-    ShortcutParams, ShortcutTrainBuffers, Tensor, TuckerAttentionTrainBuffers, YoloHeadOutput,
-    compute_learning_rate,
+    ShortcutParams, ShortcutTrainBuffers, Tensor, TuckerAttentionTrainBuffers, WmhfParams,
+    WmhfTrainBuffers, YoloHeadOutput, compute_learning_rate,
 };
 pub use swin::SwinWeights;
 pub use swin_block::SwinForwardCache;
