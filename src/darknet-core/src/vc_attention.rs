@@ -793,6 +793,113 @@ pub(crate) fn quantized_qk_scale_input_backward(
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct VcHeadCache {
+    tokens: usize,
+    channels: usize,
+    qk: QuantizedQkCache,
+    v_smooth: VsmoothCache,
+    smooth_values: Vec<f32>,
+    attention_scale: f32,
+    score_clamp: f32,
+    mode: ExpCastMode,
+}
+
+/// Complete CPU reference forward for one batch-head. It keeps only O(T*C)
+/// state; each query row's O(T) online probability codes are discarded and
+/// recomputed by backward. Returned natural-log LSE values describe the
+/// centered Q/K score rows (after the configured clamp), not ordinary
+/// uncentered QK logits.
+pub(crate) fn vc_head_forward(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    tokens: usize,
+    channels: usize,
+    attention_scale: f32,
+    score_clamp: f32,
+    mode: ExpCastMode,
+    permutation: Option<&[usize]>,
+) -> Result<(Vec<f32>, Vec<f32>, VcHeadCache), String> {
+    if !attention_scale.is_finite() || !score_clamp.is_finite() {
+        return Err("VC head attention scales must be finite".into());
+    }
+    let qk = quantize_qk(q, k, tokens, channels, permutation)?;
+    let (smooth_values, v_smooth) = vsmooth_forward(v, tokens, channels, permutation)?;
+    let output_len = tokens
+        .checked_mul(channels)
+        .ok_or("VC head output size overflow")?;
+    let mut context = vec![0.0; output_len];
+    let mut lse = vec![0.0; tokens];
+    for query in 0..tokens {
+        let scores = quantized_qk_log2_scores(&qk, query, attention_scale, score_clamp)?;
+        let (row_context, row_lse, _) =
+            quantized_online_row_forward(&scores, &smooth_values, channels, mode)?;
+        context[query * channels..(query + 1) * channels].copy_from_slice(&row_context);
+        lse[query] = row_lse;
+    }
+    Ok((
+        context,
+        lse,
+        VcHeadCache {
+            tokens,
+            channels,
+            qk,
+            v_smooth,
+            smooth_values,
+            attention_scale,
+            score_clamp,
+            mode,
+        },
+    ))
+}
+
+/// Exact piecewise input derivative of [`vc_head_forward`]. The auxiliary LSE
+/// is not a network output and therefore has no loss gradient here.
+pub(crate) fn vc_head_backward(
+    output_grad: &[f32],
+    cache: &VcHeadCache,
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), String> {
+    let expected = cache
+        .tokens
+        .checked_mul(cache.channels)
+        .ok_or("VC head gradient size overflow")?;
+    if output_grad.len() != expected {
+        return Err(format!(
+            "VC head output gradient has {} entries, expected {expected}",
+            output_grad.len()
+        ));
+    }
+    let mut scale_gradients = new_qk_scale_gradients(&cache.qk);
+    let mut smooth_values_grad = vec![0.0; expected];
+    for query in 0..cache.tokens {
+        let scores =
+            quantized_qk_log2_scores(&cache.qk, query, cache.attention_scale, cache.score_clamp)?;
+        let (_, _, row_cache) = quantized_online_row_forward(
+            &scores,
+            &cache.smooth_values,
+            cache.channels,
+            cache.mode,
+        )?;
+        let row_grad = &output_grad[query * cache.channels..(query + 1) * cache.channels];
+        let (score_grad, values_grad) = quantized_online_row_backward(row_grad, &row_cache)?;
+        accumulate_qk_scale_gradients(
+            &cache.qk,
+            query,
+            &score_grad,
+            cache.attention_scale,
+            cache.score_clamp,
+            &mut scale_gradients,
+        )?;
+        for index in 0..expected {
+            smooth_values_grad[index] += values_grad[index];
+        }
+    }
+    let (q_grad, k_grad) = quantized_qk_scale_input_backward(&cache.qk, &scale_gradients)?;
+    let v_grad = vsmooth_backward(&smooth_values_grad, &cache.v_smooth)?;
+    Ok((q_grad, k_grad, v_grad))
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct QuantizedOnlineRowCache {
     tokens: usize,
     channels: usize,
@@ -993,7 +1100,8 @@ mod tests {
         ExpCastMode, accumulate_qk_scale_gradients, e4m3_encode_bits, e4m3_quantization_boundary,
         e4m3_to_f32, expcast_probability_code, new_qk_scale_gradients, quantize_qk,
         quantized_online_row_backward, quantized_online_row_forward, quantized_qk_log2_scores,
-        quantized_qk_scale_input_backward, vsmooth_backward, vsmooth_forward,
+        quantized_qk_scale_input_backward, vc_head_backward, vc_head_forward, vsmooth_backward,
+        vsmooth_forward,
     };
 
     #[test]
@@ -1385,5 +1493,282 @@ mod tests {
         let (q_grad, k_grad) = quantized_qk_scale_input_backward(&cache, &scale_grads).unwrap();
         assert!(q_grad.iter().all(|gradient| *gradient == 0.0));
         assert!(k_grad.iter().all(|gradient| *gradient == 0.0));
+    }
+
+    #[test]
+    fn vc_head_composes_exact_piecewise_qkv_derivative_without_t_squared_cache() {
+        let tokens = 128;
+        let channels = 32;
+        let permutation: Vec<usize> = (0..tokens)
+            .map(|position| (position * 37 + 7) % tokens)
+            .collect();
+        let q: Vec<f32> = (0..tokens)
+            .flat_map(|token| {
+                (0..channels).map(move |channel| {
+                    let index = token * channels + channel;
+                    ((index as f32 * 0.618_034 + 1.7).sin()) * 0.9
+                })
+            })
+            .collect();
+        let k: Vec<f32> = (0..tokens)
+            .flat_map(|token| {
+                (0..channels).map(move |channel| {
+                    let index = token * channels + channel;
+                    ((index as f32 * 0.414_214 + 3.1).cos()) * 0.9
+                })
+            })
+            .collect();
+        let v: Vec<f32> = (0..tokens)
+            .flat_map(|token| {
+                (0..channels).map(move |channel| {
+                    let index = token * channels + channel;
+                    ((index as f32 * 0.754_878 + 2.3).sin()) * 0.42
+                        + token as f32 * 0.004
+                        + channel as f32 * 0.009
+                })
+            })
+            .collect();
+        let attention_scale = 1.0 / (channels as f32).sqrt();
+        let score_clamp = 10.0;
+        let (context, lse, cache) = vc_head_forward(
+            &q,
+            &k,
+            &v,
+            tokens,
+            channels,
+            attention_scale,
+            score_clamp,
+            ExpCastMode::Order0,
+            Some(&permutation),
+        )
+        .unwrap();
+        assert_eq!(context.len(), tokens * channels);
+        assert_eq!(lse.len(), tokens);
+        assert!(context.iter().all(|value| value.is_finite()));
+        assert!(lse.iter().all(|value| value.is_finite()));
+        assert!(cache.qk.q_codes.len() < tokens * tokens);
+        assert!(cache.qk.k_codes.len() < tokens * tokens);
+        assert!(cache.v_smooth.residual_codes.len() < tokens * tokens);
+
+        let output_grad: Vec<f32> = (0..context.len())
+            .map(|index| (index as f32 * 0.23).cos() * 0.7)
+            .collect();
+        let (q_grad, k_grad, v_grad) = vc_head_backward(&output_grad, &cache).unwrap();
+        assert!(q_grad.iter().any(|gradient| gradient.abs() > 1.0e-6));
+        assert!(k_grad.iter().any(|gradient| gradient.abs() > 1.0e-6));
+        assert!(v_grad.iter().all(|gradient| gradient.is_finite()));
+
+        let row_signature = |head: &super::VcHeadCache| {
+            let mut signature = Vec::with_capacity(tokens);
+            for query in 0..tokens {
+                let scores =
+                    quantized_qk_log2_scores(&head.qk, query, attention_scale, score_clamp)
+                        .unwrap();
+                let (_, _, row) = quantized_online_row_forward(
+                    &scores,
+                    &head.smooth_values,
+                    channels,
+                    ExpCastMode::Order0,
+                )
+                .unwrap();
+                signature.push((row.probability_codes, row.prefix_owners, row.prefix_ties));
+            }
+            signature
+        };
+        let base_signature = row_signature(&cache);
+        let objective = |q_values: &[f32], k_values: &[f32], v_values: &[f32]| {
+            let (output, _, _) = vc_head_forward(
+                q_values,
+                k_values,
+                v_values,
+                tokens,
+                channels,
+                attention_scale,
+                score_clamp,
+                ExpCastMode::Order0,
+                Some(&permutation),
+            )
+            .unwrap();
+            output
+                .iter()
+                .zip(&output_grad)
+                .map(|(value, grad)| value * grad)
+                .sum::<f32>()
+        };
+        let epsilon = 1.0e-6;
+        let q_index = q_grad
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.abs().total_cmp(&right.1.abs()))
+            .unwrap()
+            .0;
+        let mut q_plus = q.clone();
+        let mut q_minus = q.clone();
+        q_plus[q_index] += epsilon;
+        q_minus[q_index] -= epsilon;
+        let (_, _, q_plus_cache) = vc_head_forward(
+            &q_plus,
+            &k,
+            &v,
+            tokens,
+            channels,
+            attention_scale,
+            score_clamp,
+            ExpCastMode::Order0,
+            Some(&permutation),
+        )
+        .unwrap();
+        let (_, _, q_minus_cache) = vc_head_forward(
+            &q_minus,
+            &k,
+            &v,
+            tokens,
+            channels,
+            attention_scale,
+            score_clamp,
+            ExpCastMode::Order0,
+            Some(&permutation),
+        )
+        .unwrap();
+        assert_eq!(q_plus_cache.qk.q_codes, cache.qk.q_codes);
+        assert_eq!(q_minus_cache.qk.q_codes, cache.qk.q_codes);
+        assert_eq!(
+            q_plus_cache.qk.q_scale_max_channels,
+            cache.qk.q_scale_max_channels
+        );
+        assert_eq!(
+            q_minus_cache.qk.q_scale_max_channels,
+            cache.qk.q_scale_max_channels
+        );
+        assert_eq!(row_signature(&q_plus_cache), base_signature);
+        assert_eq!(row_signature(&q_minus_cache), base_signature);
+        let q_numeric =
+            (objective(&q_plus, &k, &v) - objective(&q_minus, &k, &v)) / (2.0 * epsilon);
+        assert!(
+            (q_grad[q_index] - q_numeric).abs() <= 0.04 + 0.15 * q_numeric.abs(),
+            "Q gradient {q_index}: analytic {}, numeric {q_numeric}",
+            q_grad[q_index]
+        );
+
+        let k_index = k_grad
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.abs().total_cmp(&right.1.abs()))
+            .unwrap()
+            .0;
+        let mut k_plus = k.clone();
+        let mut k_minus = k.clone();
+        k_plus[k_index] += epsilon;
+        k_minus[k_index] -= epsilon;
+        let (_, _, k_plus_cache) = vc_head_forward(
+            &q,
+            &k_plus,
+            &v,
+            tokens,
+            channels,
+            attention_scale,
+            score_clamp,
+            ExpCastMode::Order0,
+            Some(&permutation),
+        )
+        .unwrap();
+        let (_, _, k_minus_cache) = vc_head_forward(
+            &q,
+            &k_minus,
+            &v,
+            tokens,
+            channels,
+            attention_scale,
+            score_clamp,
+            ExpCastMode::Order0,
+            Some(&permutation),
+        )
+        .unwrap();
+        assert_eq!(k_plus_cache.qk.k_codes, cache.qk.k_codes);
+        assert_eq!(k_minus_cache.qk.k_codes, cache.qk.k_codes);
+        assert_eq!(
+            k_plus_cache.qk.k_scale_max_position,
+            cache.qk.k_scale_max_position
+        );
+        assert_eq!(
+            k_minus_cache.qk.k_scale_max_position,
+            cache.qk.k_scale_max_position
+        );
+        assert_eq!(
+            k_plus_cache.qk.k_scale_max_channel,
+            cache.qk.k_scale_max_channel
+        );
+        assert_eq!(
+            k_minus_cache.qk.k_scale_max_channel,
+            cache.qk.k_scale_max_channel
+        );
+        assert_eq!(row_signature(&k_plus_cache), base_signature);
+        assert_eq!(row_signature(&k_minus_cache), base_signature);
+        let k_numeric =
+            (objective(&q, &k_plus, &v) - objective(&q, &k_minus, &v)) / (2.0 * epsilon);
+        assert!(
+            (k_grad[k_index] - k_numeric).abs() <= 0.04 + 0.15 * k_numeric.abs(),
+            "K gradient {k_index}: analytic {}, numeric {k_numeric}",
+            k_grad[k_index]
+        );
+
+        let v_index = v_grad
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.abs().total_cmp(&right.1.abs()))
+            .unwrap()
+            .0;
+        let v_epsilon = 1.0e-4;
+        let mut v_plus = v.clone();
+        let mut v_minus = v.clone();
+        v_plus[v_index] += v_epsilon;
+        v_minus[v_index] -= v_epsilon;
+        let (_, _, v_plus_cache) = vc_head_forward(
+            &q,
+            &k,
+            &v_plus,
+            tokens,
+            channels,
+            attention_scale,
+            score_clamp,
+            ExpCastMode::Order0,
+            Some(&permutation),
+        )
+        .unwrap();
+        let (_, _, v_minus_cache) = vc_head_forward(
+            &q,
+            &k,
+            &v_minus,
+            tokens,
+            channels,
+            attention_scale,
+            score_clamp,
+            ExpCastMode::Order0,
+            Some(&permutation),
+        )
+        .unwrap();
+        assert_eq!(
+            v_plus_cache.v_smooth.residual_codes,
+            cache.v_smooth.residual_codes
+        );
+        assert_eq!(
+            v_minus_cache.v_smooth.residual_codes,
+            cache.v_smooth.residual_codes
+        );
+        assert_eq!(
+            v_plus_cache.v_smooth.scale_max_positions,
+            cache.v_smooth.scale_max_positions
+        );
+        assert_eq!(
+            v_minus_cache.v_smooth.scale_max_positions,
+            cache.v_smooth.scale_max_positions
+        );
+        let v_numeric =
+            (objective(&q, &k, &v_plus) - objective(&q, &k, &v_minus)) / (2.0 * v_epsilon);
+        assert!(
+            (v_grad[v_index] - v_numeric).abs() <= 0.015 + 0.08 * v_numeric.abs(),
+            "V gradient {v_index}: analytic {}, numeric {v_numeric}",
+            v_grad[v_index]
+        );
     }
 }
