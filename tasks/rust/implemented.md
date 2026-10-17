@@ -489,6 +489,12 @@ still NOT RUN (no `Jev_laya` build here; `test_data/laya/` has only the shared
   `MEM=3G ./tools/test_host.sh vc_attention` passed 7 tests, including central
   finite differences away from quantization boundaries. This is an isolated math
   primitive, not an integrated VC attention path or compiled-C++ parity.
+- v0.0.263 (`8792f7b9`): added a source-shaped one-query online ExpCast row
+  forward/backward. The cache is O(T + T*C); its exact score derivative includes
+  continuous inter-tile prefix-max rescaling, while code transitions and prefix
+  max ties return an explicit error. `MEM=3G ./tools/test_host.sh vc_attention`
+  passed 10 tests, including two-tile finite differences and the single-tile
+  zero-score-gradient case. Still isolated math; no cfg/runtime or C++ parity.
 - Earlier focused evidence: full host unit suites pass (`darknet-core` 377,
   `darknet-cli` 18); targeted check/build pass with `-j 4`. The full
   `cfg_corpus` integration run exceeded a 30-minute timeout. C++ dump parity NOT

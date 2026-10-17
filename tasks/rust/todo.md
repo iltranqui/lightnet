@@ -168,9 +168,10 @@ Immediately next, in dependency order:
   attention now has native Oxide forward and dQ/dK/dV primitives inside the
   whole-network CPU fallback (see `implemented.md` §8). VC source audit confirmed
   the key-centering/LSE mismatch and padded-query `sq` read risk. v0.0.261 adds
-  host E4M3/ExpCast primitives; v0.0.262 adds standalone V-Smooth forward and
-  its exact piecewise derivative. Full VC attention forward/cache, the Q/K/P
-  derivative contract, and cfg/runtime integration remain open. Also open:
+  host E4M3/ExpCast primitives; v0.0.262 adds standalone V-Smooth math and
+  v0.0.263 adds the online quantized-row derivative, including inter-tile alpha
+  rescaling. Full head/batch forward/cache, chaining score gradients through
+  Q/K scales, and cfg/runtime integration remain open. Also open:
   `swin`/`transformer`, `tucker_attention`, `mambavision`, `kimi_kda`, and
   `minimax_sparse_attention` on the shared LayerNorm/GEMM set (already built).
 - [x] Container-conv cache prerequisite: device convolution params are keyed by
