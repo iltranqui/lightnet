@@ -180,7 +180,7 @@ Immediately next, in dependency order:
   SGD/Adam, and GPU f32 host fallback are covered. `MEM=3G
   ./tools/test_host.sh swin` passed 25 tests, `runtime` passed 166, and `weights`
   passed 29. No native Swin kernel, C++ weights writer, or compiled-C++ parity is
-  available; see `swin_plan.md`. v0.0.270 completes `[tucker_attention]` on the
+  available; see `swin_plan.md`. v0.0.270 (`ecd4e54e`) completes `[tucker_attention]` on the
   host reference path; `MEM=3G ./tools/test_host.sh tucker_attention` passes 14
   tests, `weights` 32, and `runtime` 168. Remaining attention layers are
   `mambavision` and `kimi_kda`. MiniMax sparse attention is a shared option, not

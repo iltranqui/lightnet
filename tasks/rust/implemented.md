@@ -552,7 +552,7 @@ still NOT RUN (no `Jev_laya` build here; `test_data/laya/` has only the shared
 
 ### `[tucker_attention]` reference layer path (Phase 3A)
 
-- v0.0.270: added strict `[tucker]` / `[tucker_attention]` / `[tucker_attn]`
+- v0.0.270 (`ecd4e54e`): added strict `[tucker]` / `[tucker_attention]` / `[tucker_attn]`
   parsing, NCHW shape validation, rank/default and MSA alias precedence, and
   overflow-safe geometry/weight sizing. `Layer::weights()` follows the C++
   two-block stream: `biases[channels]`, then flat Q/K/V/O factors.
