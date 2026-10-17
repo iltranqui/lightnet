@@ -44,7 +44,7 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
-- v0.0.268 (`0bd26bda`): added source-derived Swin geometry, masks, mHC, and one-window attention helpers; `MEM=3G ./tools/test_host.sh swin` passed 10 tests including finite differences and adjoints. Model/config/weights/runtime integration remains open; hand-derived from `jepa`, no compiled-C++ golden.
+- v0.0.269 (`4addcb07`): integrated strict Swin/transformer aliases, Rust-defined weights and modern save/load, seeded initialization, exact CPU block forward/backward, runtime accumulation and SGD/Adam, optimizer-state serialization, and GPU f32 host fallback. `MEM=3G ./tools/test_host.sh swin` passed 25 tests, `runtime` 166, and `weights` 29; FakeBackend/CPU output, gradient, and update parity includes a preceding-convolution chain. No native Swin kernel, C++ weights writer, or compiled-C++ golden. v0.0.268 (`0bd26bda`) added the source-derived reference helpers before this integration.
 - v0.0.258 (`7681f478`): `obb_detector_map` dispatches all-CARPN sample sets to the existing polygon evaluator, rejects mixed front-point/CARPN geometry, and preserves legacy behavior for empty prediction sets. `MEM=3G ./tools/test_host.sh obb_map` passed 5 core tests, `MEM=3G ./tools/test_host.sh carpn_map` passed 3, and `MEM=3G ./tools/test_host.sh carpn_polygon_iou` passed 2. Caller-supplied sample API only; network decode/CLI validation remains unsupported and is planned in `carpn_network_map_plan.md`; CARPN training/`train -map` remains deferred. No compiled-C++ parity is claimed.
 - v0.0.259 (`29889c5c`): added CPU `[obb_refine]` forward, CARPN quadrilateral decoding/NMS, `detect-image`, full-forward validation, and direct cfg/weights-backed `detector map`. Focused config, weights, forward, decoder, proposal, map, CLI, and explicit training-rejection tests passed; `obb_` passed 138 core + 4 CLI. Scoped CLI build, targeted formatting check, and `git diff --check` passed. Workspace-wide `cargo fmt --check` remains blocked by pre-existing unrelated ONNX/CUDA formatting differences. Hand-derived from `raptor`; no compiled-C++ or canonical dataset parity.
 - v0.0.260 (`16e95d9a`): standard flash attention now has recompute-based native Oxide dQ/dK/dV and runtime dispatch inside ViT's whole-network CPU backward fallback. `MEM=3G ./tools/test_host.sh vit` passed 28 tests; `MEM=3G ./tools/test_oxide.sh --test oxide_layernorm` passed 14; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain` passed 22, including CPU-matched parameter updates; `MEM=3G ./tools/test_host.sh runtime` passed 161 runtime tests. This is Rust backend evidence, not compiled-C++ parity; VC attention remains open.
@@ -647,9 +647,9 @@ believing a `cfg_corpus` failure.
    reference path, standard flash primitives, and VC config/runtime reference
    dispatch are wired. VC uses its Rust reference on CPU and GPU host-round-trip
    paths; native VC device kernels and compiled-C++ parity are unavailable.
-   Remaining Phase 3A work is `swin`/`transformer`, `tucker_attention`,
-   `mambavision`, `kimi_kda`, and `minimax_sparse_attention` on the shared
-   LayerNorm/GEMM set.
+   Swin/transformer is now integrated in the Rust reference runtime. Remaining
+   Phase 3A work is `tucker_attention`, `mambavision`, `kimi_kda`, and
+   `minimax_sparse_attention` on the shared LayerNorm/GEMM set.
    **Order matters:** `[laya_scorer]`'s `weights=` is only usable together with
    `[laya_encoder]` + `[laya_head]` (the shared-file offset is computed past
    their blobs), so those two come next even though the plan files them under
@@ -661,13 +661,14 @@ believing a `cfg_corpus` failure.
    SGD remains host-side.
    Remaining across the phases:
    `cfg/LegoGears_centernet.cfg` end to end (the cfg lives on `Jev_laya`), then
-   2B's `eml_convolutional`, 2C (OBB), 3A/3B (transformer + deformable families,
-   shared LayerNorm/GEMM kernel set first) and 4.
+   2B's `eml_convolutional`, 2C (OBB), remaining 3A/3B attention and deformable
+   families (shared LayerNorm/GEMM kernel set first), and 4.
 3. **Phase 3A prerequisite (2) is complete**: LayerNorm fwd/bwd, the fused
    residual/bias epilogue, the row-softmax backward and the batched-GEMM wrapper
    (`linear_f32`) are all in, each with a host default plus GPU parity tests.
-   That unblocks `vit`, `swin`/`transformer`, `tucker_attention`, `mambavision`,
-   `kimi_kda`, `minimax_sparse_attention` and the LAYA encoder/head. Standard
+   That unblocks `vit`, `tucker_attention`, `mambavision`, `kimi_kda`,
+   `minimax_sparse_attention` and the LAYA encoder/head; Swin/transformer now has
+   its Rust reference integration. Standard
    `flash_attention` has native Oxide forward/backward primitives. VC now has
    strict config/runtime integration and uses its centered/clamped-score Rust
    LSE contract with exact piecewise backward; GPU execution intentionally falls

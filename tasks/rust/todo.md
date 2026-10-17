@@ -174,11 +174,15 @@ Immediately next, in dependency order:
   cfg aliases/modes/permutations and CPU/GPU host-reference forward/backward;
   `vc_attention` (16 filtered tests) and `vit` (32) pass. GPU VC deliberately
   falls back to the Rust host reference on all devices/head sizes; no native VC
-  kernel or compiled-C++ parity is claimed. Swin's source-derived geometry,
-  mask, mHC, and one-window attention helpers now have 10 focused passing tests;
-  model/config/weights/runtime integration remains open in `swin_plan.md`. Also
-  open: `swin`/`transformer`, `tucker_attention`, `mambavision`, `kimi_kda`, and
-  `minimax_sparse_attention` on the shared LayerNorm/GEMM set (already built).
+  kernel or compiled-C++ parity is claimed. Swin/transformer integration is
+  complete in `model.rs`, `swin.rs`, `swin_block.rs`, `runtime.rs`, and
+  `weights.rs`; all four aliases, CPU exact backward, Rust-defined weights,
+  SGD/Adam, and GPU f32 host fallback are covered. `MEM=3G
+  ./tools/test_host.sh swin` passed 25 tests, `runtime` passed 166, and `weights`
+  passed 29. No native Swin kernel, C++ weights writer, or compiled-C++ parity is
+  available; see `swin_plan.md`. Still open: `tucker_attention`, `mambavision`,
+  `kimi_kda`, and `minimax_sparse_attention` on the shared LayerNorm/GEMM set
+  (already built).
 - [x] Container-conv cache prerequisite: device convolution params are keyed by
   owner layer + expert slot; `warm_device_conv_params` warms each MoE expert,
   and host-updated experts invalidate/re-upload their slots. FakeBackend test

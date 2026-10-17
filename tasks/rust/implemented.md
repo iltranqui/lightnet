@@ -529,16 +529,27 @@ still NOT RUN (no `Jev_laya` build here; `test_data/laya/` has only the shared
   `darknet-cli` 18); targeted check/build pass with `-j 4`. The full
   `cfg_corpus` integration run exceeded a 30-minute timeout. C++ dump parity NOT
   RUN (no owning-branch executable).
-- v0.0.268 (`0bd26bda`): added an unintegrated Swin host-reference module for
-  padded NCHW geometry, cyclic shift, window partitioning, source mask and
-  relative-position indexing, mHC, and one-window attention with its analytical
-  derivative. `MEM=3G ./tools/test_host.sh swin` passed 10 focused tests covering
-  hand attention, attention/mHC finite differences, source padded-key leakage,
-  and rectangular pad/crop/shift/partition adjoints. Hand-derived from
-  `jepa:swin_layer.cpp`; no compiled-C++ golden. Model/config/weights/runtime
-  integration remains open.
-- Still open: VC quantized attention/source-contract resolution and the other
-  named Phase 3A attention layers; see `todo.md`/`vit_plan.md`/`swin_plan.md`.
+- v0.0.268 (`0bd26bda`): added source-derived Swin geometry, masks, mHC, and
+  one-window attention helpers with analytical derivatives. `MEM=3G
+  ./tools/test_host.sh swin` passed 10 focused tests covering hand attention,
+  finite differences, source padded-key leakage, and rectangular pad/crop/shift/
+  partition adjoints. Hand-derived from `jepa:swin_layer.cpp`; no compiled-C++
+  golden.
+- v0.0.269 (`4addcb07`): integrated the complete Rust Swin/transformer layer. `model.rs`
+  strictly parses all four aliases, infers shape, and records the Rust-owned
+  weight order; initialization and modern-header weights save/load are covered.
+  `swin_block.rs` implements full CPU forward/backward and exact derivatives of
+  that Rust forward; `runtime.rs` adds gradient buffers, accumulation, SGD/Adam,
+  optimizer-state round-trip, and GPU f32 host fallback. Masks and relative
+  indices are built once per block forward, with indices shared across window
+  caches. `MEM=3G ./tools/test_host.sh swin` passed 25 tests, `runtime` passed
+  166, and `weights` passed 29. FakeBackend matches CPU forward/backward and
+  updates on a preceding-convolution chain. No native Swin kernel, C++ weights
+  writer, or compiled-C++ parity is available.
+- Still open: the other named Phase 3A attention layers—`tucker_attention`,
+  `mambavision`, `kimi_kda`, and `minimax_sparse_attention`—plus separately tracked
+  VC native-kernel/evidence follow-ups; see `todo.md`, `vit_plan.md`, and
+  `swin_plan.md`.
 
 ## 9. Inference parity — LegoGears_v2 (the final target)
 
