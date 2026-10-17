@@ -139,7 +139,7 @@ fn clip_probability_code(value: f32) -> u8 {
 const V_SMOOTH_TILE_SIZE: usize = 64;
 const E4M3_MAX_FINITE_CODE: u8 = 0x7e;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct VsmoothCache {
     tokens: usize,
     channels: usize,
@@ -399,7 +399,7 @@ fn probability_code_boundary(u: f32, mode: ExpCastMode) -> bool {
 const VC_QK_CLAMP: f32 = 128.0;
 const VC_LOG2_E: f32 = 1.4426950408889634;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct QuantizedQkCache {
     tokens: usize,
     channels: usize,
@@ -792,7 +792,7 @@ pub(crate) fn quantized_qk_scale_input_backward(
     Ok((q_grad, k_grad))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct VcHeadCache {
     tokens: usize,
     channels: usize,

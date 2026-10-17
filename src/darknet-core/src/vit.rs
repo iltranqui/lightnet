@@ -391,6 +391,7 @@ pub struct AttentionCache {
     probabilities: Vec<f32>,
     score_active: Vec<bool>,
     flash_lse: Option<Vec<f32>>,
+    vc_heads: Option<Vec<crate::vc_attention::VcHeadCache>>,
 }
 
 pub(crate) struct FlashAttentionBackwardInputs {
@@ -512,6 +513,107 @@ pub fn attention_forward_flash(
     attention_forward_impl(qkv, batch, tokens, channels, heads, None, true)
 }
 
+/// Source-shaped VC attention over all batch-heads. Each head owns an O(T*C)
+/// reference cache; no B*H*T*T probability tensor is materialized.
+#[allow(dead_code)] // Staged until VC config/runtime dispatch is integrated.
+pub(crate) fn attention_forward_vc(
+    qkv: &[f32],
+    batch: usize,
+    tokens: usize,
+    channels: usize,
+    heads: usize,
+    mode: crate::vc_attention::ExpCastMode,
+    permutation: Option<&[usize]>,
+) -> Result<(Vec<f32>, AttentionCache), String> {
+    if batch == 0 || tokens == 0 || channels == 0 || heads == 0 || channels % heads != 0 {
+        return Err(
+            "vit VC attention requires positive dimensions and channels divisible by heads".into(),
+        );
+    }
+    let rows = batch
+        .checked_mul(tokens)
+        .ok_or("vit VC row count overflow")?;
+    let qkv_width = channels.checked_mul(3).ok_or("vit VC QKV width overflow")?;
+    let expected = rows
+        .checked_mul(qkv_width)
+        .ok_or("vit VC QKV size overflow")?;
+    if qkv.len() != expected {
+        return Err(format!(
+            "vit VC QKV has {} values, expected {expected}",
+            qkv.len()
+        ));
+    }
+    let head_dim = channels / heads;
+    let head_elements = tokens
+        .checked_mul(head_dim)
+        .ok_or("vit VC head size overflow")?;
+    let output_len = rows
+        .checked_mul(channels)
+        .ok_or("vit VC output size overflow")?;
+    let mut context = vec![0.0; output_len];
+    let head_count = batch
+        .checked_mul(heads)
+        .ok_or("vit VC batch-head count overflow")?;
+    let mut vc_heads = Vec::with_capacity(head_count);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    for b in 0..batch {
+        for h in 0..heads {
+            let channel_offset = h * head_dim;
+            let mut q = vec![0.0; head_elements];
+            let mut k = vec![0.0; head_elements];
+            let mut v = vec![0.0; head_elements];
+            for token in 0..tokens {
+                let source = (b * tokens + token) * qkv_width;
+                for d in 0..head_dim {
+                    let c = channel_offset + d;
+                    let target = token * head_dim + d;
+                    q[target] = qkv[source + c];
+                    k[target] = qkv[source + channels + c];
+                    v[target] = qkv[source + 2 * channels + c];
+                }
+            }
+            let (head_context, _head_lse, head_cache) = crate::vc_attention::vc_head_forward(
+                &q,
+                &k,
+                &v,
+                tokens,
+                head_dim,
+                scale,
+                10.0,
+                mode,
+                permutation,
+            )?;
+            for token in 0..tokens {
+                for d in 0..head_dim {
+                    let c = channel_offset + d;
+                    context[(b * tokens + token) * channels + c] =
+                        head_context[token * head_dim + d];
+                }
+            }
+            vc_heads.push(head_cache);
+        }
+    }
+    Ok((
+        context,
+        AttentionCache {
+            batch,
+            tokens,
+            channels,
+            heads,
+            head_dim,
+            q: Vec::new(),
+            k: Vec::new(),
+            v: Vec::new(),
+            q_active: Vec::new(),
+            k_active: Vec::new(),
+            probabilities: Vec::new(),
+            score_active: Vec::new(),
+            flash_lse: None,
+            vc_heads: Some(vc_heads),
+        },
+    ))
+}
+
 /// Construct the analytical-backward cache for a context/LSE pair produced by
 /// a native online-attention forward. Q/K clamp masks are rebuilt from the
 /// original fused QKV; score probabilities remain implicit in row LSE.
@@ -583,6 +685,7 @@ pub fn attention_flash_cache_from_lse(
         probabilities: Vec::new(),
         score_active: Vec::new(),
         flash_lse: Some(lse.to_vec()),
+        vc_heads: None,
     })
 }
 
@@ -747,6 +850,7 @@ fn attention_forward_impl(
         probabilities,
         score_active,
         flash_lse: if flash { Some(flash_lse) } else { None },
+        vc_heads: None,
     };
     Ok((output, cache))
 }
@@ -755,6 +859,58 @@ fn attention_forward_impl(
 /// fused `[B,T,3N]` QKV order. The sparse block-selection decision is fixed for
 /// the local derivative; unselected probabilities have zero gradient.
 pub fn attention_backward(output_grad: &[f32], cache: &AttentionCache) -> Result<Vec<f32>, String> {
+    if let Some(vc_heads) = &cache.vc_heads {
+        let expected = cache
+            .batch
+            .checked_mul(cache.tokens)
+            .and_then(|rows| rows.checked_mul(cache.channels))
+            .ok_or("vit VC output-gradient size overflow")?;
+        if output_grad.len() != expected {
+            return Err(format!(
+                "vit VC output gradient has {} values, expected {expected}",
+                output_grad.len()
+            ));
+        }
+        let head_count = cache
+            .batch
+            .checked_mul(cache.heads)
+            .ok_or("vit VC batch-head count overflow")?;
+        if vc_heads.len() != head_count {
+            return Err("vit VC head-cache count mismatch".into());
+        }
+        let fused_len = expected
+            .checked_mul(3)
+            .ok_or("vit VC QKV gradient size overflow")?;
+        let mut fused_grad = vec![0.0; fused_len];
+        for b in 0..cache.batch {
+            for h in 0..cache.heads {
+                let head_index = b * cache.heads + h;
+                let mut head_output_grad = vec![0.0; cache.tokens * cache.head_dim];
+                for token in 0..cache.tokens {
+                    for d in 0..cache.head_dim {
+                        let channel = h * cache.head_dim + d;
+                        head_output_grad[token * cache.head_dim + d] =
+                            output_grad[(b * cache.tokens + token) * cache.channels + channel];
+                    }
+                }
+                let (dq, dk, dv) = crate::vc_attention::vc_head_backward(
+                    &head_output_grad,
+                    &vc_heads[head_index],
+                )?;
+                for token in 0..cache.tokens {
+                    for d in 0..cache.head_dim {
+                        let channel = h * cache.head_dim + d;
+                        let destination = (b * cache.tokens + token) * 3 * cache.channels;
+                        let source = token * cache.head_dim + d;
+                        fused_grad[destination + channel] = dq[source];
+                        fused_grad[destination + cache.channels + channel] = dk[source];
+                        fused_grad[destination + 2 * cache.channels + channel] = dv[source];
+                    }
+                }
+            }
+        }
+        return Ok(fused_grad);
+    }
     let AttentionCache {
         batch,
         tokens,
@@ -769,6 +925,7 @@ pub fn attention_backward(output_grad: &[f32], cache: &AttentionCache) -> Result
         probabilities,
         score_active,
         flash_lse,
+        vc_heads: _,
     } = cache;
     let expected = batch * tokens * channels;
     if output_grad.len() != expected {
@@ -2223,6 +2380,89 @@ mod tests {
                 flash_grad[i]
             );
         }
+    }
+
+    #[test]
+    fn vc_attention_dispatches_batch_heads_and_packs_qkv_gradients() {
+        let (batch, tokens, channels, heads) = (2, 4, 8, 2);
+        let head_dim = channels / heads;
+        let qkv: Vec<f32> = (0..batch * tokens * 3 * channels)
+            .map(|index| (index as f32 * 0.173 + 0.21).sin() * 0.65)
+            .collect();
+        let output_grad: Vec<f32> = (0..batch * tokens * channels)
+            .map(|index| (index as f32 * 0.37 + 0.1).cos() * 0.8)
+            .collect();
+        let permutation: Vec<usize> = (0..tokens).rev().collect();
+        let mode = crate::vc_attention::ExpCastMode::Order0;
+        let (context, cache) = attention_forward_vc(
+            &qkv,
+            batch,
+            tokens,
+            channels,
+            heads,
+            mode,
+            Some(&permutation),
+        )
+        .unwrap();
+        assert_eq!(context.len(), batch * tokens * channels);
+        assert_eq!(cache.vc_heads.as_ref().unwrap().len(), batch * heads);
+        assert!(cache.q.is_empty() && cache.k.is_empty() && cache.v.is_empty());
+        assert!(cache.probabilities.is_empty() && cache.score_active.is_empty());
+
+        let actual_gradient = attention_backward(&output_grad, &cache).unwrap();
+        assert_eq!(actual_gradient.len(), batch * tokens * 3 * channels);
+        assert!(actual_gradient.iter().all(|gradient| gradient.is_finite()));
+
+        let mut expected_context = vec![0.0; context.len()];
+        let mut expected_gradient = vec![0.0; actual_gradient.len()];
+        for b in 0..batch {
+            for h in 0..heads {
+                let mut q = vec![0.0; tokens * head_dim];
+                let mut k = vec![0.0; tokens * head_dim];
+                let mut v = vec![0.0; tokens * head_dim];
+                let mut head_output_grad = vec![0.0; tokens * head_dim];
+                for token in 0..tokens {
+                    for d in 0..head_dim {
+                        let channel = h * head_dim + d;
+                        let row = (b * tokens + token) * 3 * channels;
+                        let target = token * head_dim + d;
+                        q[target] = qkv[row + channel];
+                        k[target] = qkv[row + channels + channel];
+                        v[target] = qkv[row + 2 * channels + channel];
+                        head_output_grad[target] =
+                            output_grad[(b * tokens + token) * channels + channel];
+                    }
+                }
+                let (head_context, _, head_cache) = crate::vc_attention::vc_head_forward(
+                    &q,
+                    &k,
+                    &v,
+                    tokens,
+                    head_dim,
+                    1.0 / (head_dim as f32).sqrt(),
+                    10.0,
+                    mode,
+                    Some(&permutation),
+                )
+                .unwrap();
+                let (dq, dk, dv) =
+                    crate::vc_attention::vc_head_backward(&head_output_grad, &head_cache).unwrap();
+                for token in 0..tokens {
+                    for d in 0..head_dim {
+                        let channel = h * head_dim + d;
+                        let row = (b * tokens + token) * channels;
+                        let fused_row = (b * tokens + token) * 3 * channels;
+                        let source = token * head_dim + d;
+                        expected_context[row + channel] = head_context[source];
+                        expected_gradient[fused_row + channel] = dq[source];
+                        expected_gradient[fused_row + channels + channel] = dk[source];
+                        expected_gradient[fused_row + 2 * channels + channel] = dv[source];
+                    }
+                }
+            }
+        }
+        assert_eq!(context, expected_context);
+        assert_eq!(actual_gradient, expected_gradient);
     }
 
     #[test]
