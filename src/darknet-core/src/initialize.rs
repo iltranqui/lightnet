@@ -43,6 +43,80 @@ pub fn initialize_training_params(network: &Network, params: &mut [LayerParams],
                 rng.weights_with_scale(&mut p.weights, bound);
                 p.biases.fill(0.0);
             }
+            LayerParams::MambaVision(p) => {
+                let crate::LayerKind::MambaVision(spec) = &layer.kind else {
+                    unreachable!("MambaVision parameters require a MambaVision layer");
+                };
+                let channels = layer.input_shape.channels;
+                let filters = spec.filters;
+                let d = filters / 2;
+                let rank = spec.dt_rank;
+                let state = spec.state;
+                let hidden = filters * spec.ffn_ratio;
+                p.values.fill(0.0);
+                let blocks = crate::mambavision::mambavision_param_blocks(p)
+                    .expect("validated MambaVision parameter geometry");
+                let range = |name: &str| {
+                    blocks
+                        .iter()
+                        .find(|block| block.name == name)
+                        .expect("MambaVision parameter block exists")
+                        .range
+                        .clone()
+                };
+                let input = range("mambavision_in_proj_weights");
+                rng.weights_with_scale(
+                    &mut p.values[input],
+                    (6.0 / (channels + filters) as f32).sqrt(),
+                );
+                let x_conv = range("mambavision_conv_x");
+                rng.weights_with_scale(&mut p.values[x_conv], (2.0 / spec.conv_size as f32).sqrt());
+                let z_conv = range("mambavision_conv_z");
+                rng.weights_with_scale(&mut p.values[z_conv], (2.0 / spec.conv_size as f32).sqrt());
+                let x_proj = range("mambavision_x_proj");
+                let projected = rank + 2 * state;
+                rng.weights_with_scale(
+                    &mut p.values[x_proj],
+                    (6.0 / (d + projected) as f32).sqrt(),
+                );
+                let dt_proj = range("mambavision_dt_proj");
+                rng.weights_with_scale(&mut p.values[dt_proj], (rank as f32).powf(-0.5));
+                let dt_bias = range("mambavision_dt_bias");
+                for index in 0..d {
+                    let log_dt = 0.001f32.ln() + rng.next_unit() * (0.1f32.ln() - 0.001f32.ln());
+                    let dt = log_dt.exp();
+                    p.values[dt_bias.start + index] = dt + (-(-dt).exp_m1()).ln();
+                }
+                let a_log = range("mambavision_A_log");
+                for channel in 0..d {
+                    for state_index in 0..state {
+                        p.values[a_log.start + channel * state + state_index] =
+                            ((state_index + 1) as f32).ln();
+                    }
+                }
+                p.values[range("mambavision_D")].fill(1.0);
+                let out_proj = range("mambavision_out_proj");
+                rng.weights_with_scale(
+                    &mut p.values[out_proj],
+                    (6.0 / (filters + filters) as f32).sqrt(),
+                );
+                if let Some(block) = blocks
+                    .iter()
+                    .find(|block| block.name == "mambavision_res_proj")
+                {
+                    let res_proj = block.range.clone();
+                    rng.weights_with_scale(
+                        &mut p.values[res_proj],
+                        (6.0 / (channels + filters) as f32).sqrt(),
+                    );
+                }
+                p.values[range("mambavision_ln1_gamma")].fill(1.0);
+                p.values[range("mambavision_ln2_gamma")].fill(1.0);
+                let ffn1 = range("mambavision_ffn_w1");
+                rng.weights_with_scale(&mut p.values[ffn1], (6.0 / filters as f32).sqrt());
+                let ffn2 = range("mambavision_ffn_w2");
+                rng.weights_with_scale(&mut p.values[ffn2], (6.0 / hidden as f32).sqrt());
+            }
             LayerParams::Swin(p) => {
                 let input = layer.input_shape.channels;
                 let output = layer.output_shape.channels;
@@ -217,16 +291,19 @@ impl Rng {
         self.weights_with_scale(weights, (2.0 / fan_in.max(1) as f32).sqrt());
     }
 
+    fn next_unit(&mut self) -> f32 {
+        // SplitMix64: all seeds, including zero, produce a nonconstant stream.
+        self.0 = self.0.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^= z >> 31;
+        (z >> 40) as f32 / 16777216.0
+    }
+
     fn weights_with_scale(&mut self, weights: &mut [f32], scale: f32) {
         for weight in weights {
-            // SplitMix64: all seeds, including zero, produce a nonconstant stream.
-            self.0 = self.0.wrapping_add(0x9e3779b97f4a7c15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-            z ^= z >> 31;
-            let unit = (z >> 40) as f32 / 16777216.0;
-            *weight = (2.0 * unit - 1.0) * scale;
+            *weight = (2.0 * self.next_unit() - 1.0) * scale;
         }
     }
 }
@@ -318,6 +395,75 @@ mod tests {
         assert!(params.weights.iter().any(|weight| *weight != 0.0));
         assert!(params.weights.iter().all(|weight| weight.abs() <= bound));
         assert_eq!(params.biases, vec![0.0; 8]);
+    }
+
+    #[test]
+    fn mambavision_training_initialization_is_seeded_and_uses_source_bounds() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "mambavision-init.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=4\n\
+                 [mambavision]\nfilters=6\nstate=3\nconv_size=3\ndt_rank=2\nffn_ratio=2\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut first = ExecutableNetwork::new(network.clone());
+        let mut second = ExecutableNetwork::new(network.clone());
+        initialize_training_params(&network, &mut first.params, 107);
+        initialize_training_params(&network, &mut second.params, 107);
+        assert_eq!(first.params, second.params);
+        let LayerParams::MambaVision(params) = &first.params[0] else {
+            panic!("MambaVision params")
+        };
+        let blocks = crate::mambavision::mambavision_param_blocks(params).unwrap();
+        let within = |name: &str, bound: f32| {
+            let block = blocks.iter().find(|block| block.name == name).unwrap();
+            params.values[block.range.clone()]
+                .iter()
+                .all(|value| value.abs() <= bound)
+        };
+        assert!(within(
+            "mambavision_in_proj_weights",
+            (6.0f32 / 10.0).sqrt()
+        ));
+        assert!(within("mambavision_conv_x", (2.0f32 / 3.0).sqrt()));
+        assert!(within("mambavision_conv_z", (2.0f32 / 3.0).sqrt()));
+        assert!(within("mambavision_x_proj", (6.0f32 / 11.0).sqrt()));
+        assert!(within("mambavision_dt_proj", (0.5f32).sqrt()));
+        assert!(within("mambavision_out_proj", (6.0f32 / 12.0).sqrt()));
+        assert!(within("mambavision_res_proj", (6.0f32 / 10.0).sqrt()));
+        assert!(within("mambavision_ffn_w1", 1.0));
+        assert!(within("mambavision_ffn_w2", (6.0f32 / 12.0).sqrt()));
+        let a_log = blocks
+            .iter()
+            .find(|block| block.name == "mambavision_A_log")
+            .unwrap();
+        assert_eq!(
+            &params.values[a_log.range.clone()],
+            &[
+                0.0, 0.6931472, 1.0986123, 0.0, 0.6931472, 1.0986123, 0.0, 0.6931472, 1.0986123,
+            ]
+        );
+        let skip = blocks
+            .iter()
+            .find(|block| block.name == "mambavision_D")
+            .unwrap();
+        assert_eq!(&params.values[skip.range.clone()], &[1.0; 3]);
+        let gamma = blocks
+            .iter()
+            .find(|block| block.name == "mambavision_ln1_gamma")
+            .unwrap();
+        assert_eq!(&params.values[gamma.range.clone()], &[1.0; 4]);
+        let dt = blocks
+            .iter()
+            .find(|block| block.name == "mambavision_dt_bias")
+            .unwrap();
+        assert!(
+            params.values[dt.range.clone()]
+                .iter()
+                .all(|value| (-7.0..-2.2).contains(value))
+        );
     }
 
     #[test]

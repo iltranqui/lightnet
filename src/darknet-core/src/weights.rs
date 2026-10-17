@@ -196,6 +196,10 @@ pub fn save_weights(
                 let blob = tucker.to_blob().map_err(Error::Weights)?;
                 write_f32_slice(&mut file, &blob)?;
             }
+            (LayerKind::MambaVision(_), LayerParams::MambaVision(mamba)) => {
+                let blob = mamba.to_blob().map_err(Error::Weights)?;
+                write_f32_slice(&mut file, &blob)?;
+            }
             // C++ `save_moe_convolutional_weights`: every expert's complete
             // convolution block first, then the router biases and weights.
             (LayerKind::Moe(_), LayerParams::Moe(moe)) => {
@@ -730,6 +734,67 @@ mod tests {
     }
 
     #[test]
+    fn mambavision_weights_round_trip_in_source_order_with_exact_length() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "mambavision-roundtrip.cfg",
+                "[net]\nwidth=2\nheight=1\nchannels=2\n\
+                 [mambavision]\nfilters=4\nstate=1\nconv_size=1\ndt_rank=1\nffn_ratio=1\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let LayerParams::MambaVision(params) = &mut executable.params[0] else {
+            panic!("MambaVision params")
+        };
+        for (index, value) in params.values.iter_mut().enumerate() {
+            *value = index as f32 * 0.03125 - 0.25;
+        }
+        let count = params.parameter_count();
+        let path = std::env::temp_dir().join("darknet-mambavision-roundtrip.weights");
+        save_weights(&network, &executable.params, &path, 31).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), 20 + count as u64 * 4);
+        let inspection = inspect_weights_file(&network, &path).unwrap();
+        assert_eq!(inspection.trailing_bytes, 0);
+        assert_eq!(
+            inspection.layers[0]
+                .arrays
+                .iter()
+                .map(|array| array.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "mambavision_in_proj_weights",
+                "mambavision_in_proj_bias",
+                "mambavision_conv_x",
+                "mambavision_conv_x_bias",
+                "mambavision_conv_z",
+                "mambavision_conv_z_bias",
+                "mambavision_x_proj",
+                "mambavision_dt_proj",
+                "mambavision_dt_bias",
+                "mambavision_A_log",
+                "mambavision_D",
+                "mambavision_out_proj",
+                "mambavision_out_bias",
+                "mambavision_res_proj",
+                "mambavision_ln1_gamma",
+                "mambavision_ln1_beta",
+                "mambavision_ln2_gamma",
+                "mambavision_ln2_beta",
+                "mambavision_ffn_w1",
+                "mambavision_ffn_b1",
+                "mambavision_ffn_w2",
+                "mambavision_ffn_b2",
+            ]
+        );
+        let mut loaded = ExecutableNetwork::new(network);
+        loaded.load_weights_file(&path).unwrap();
+        assert_eq!(loaded.params, executable.params);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn standalone_batchnorm_weights_round_trip_exact_length() {
         let network = Network::from_config(
             ConfigFile::parse_str(
@@ -1007,7 +1072,8 @@ mod tests {
                     | LayerParams::Gru(_)
                     | LayerParams::Vit(_)
                     | LayerParams::Swin(_)
-                    | LayerParams::TuckerAttention(_) => {}
+                    | LayerParams::TuckerAttention(_)
+                    | LayerParams::MambaVision(_) => {}
                 }
             }
             let path = std::env::temp_dir().join(format!("darknet-{name}-roundtrip.weights"));

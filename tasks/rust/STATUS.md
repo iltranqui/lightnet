@@ -44,6 +44,7 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v0.0.271: integrated the source-derived MambaVision reference path: strict cfg/shape handling, explicit per-layer recurrent-state API, exact CPU forward/backward, seeded initialization, SGD/Adam, source-order `.weights`, optimizer-state persistence, and GPU f32 host fallback. `MEM=3G ./tools/test_host.sh mambavision` passed 16 tests, `runtime` 171, and `weights` 33; coverage includes input/all-parameter/state finite differences, causal convolution, MSA clipping, initialization bounds, optimizer decay/persistence, serialization, and FakeBackend parity. No native MambaVision kernel or compiled-C++ golden/parity.
 - v0.0.270 (`ecd4e54e`): added source-derived Tucker local attention with strict cfg aliases/defaults, rank and MSA parsing, zero-padded window forward and exact backward, seeded initialization, SGD/Adam, `.weights` save/load, and GPU f32 host fallback. `MEM=3G ./tools/test_host.sh tucker_attention` passed 14 tests, `weights` 32, and `runtime` 168; coverage includes finite differences for all factor blocks/input/Tanh/MSA, a hand-computed 2×2 window, multi-head math, legacy-header round trip, and FakeBackend CPU forward/backward/update parity. MiniMax sparse attention is a shared option rather than a standalone layer in the audited C++ branch; it is wired for ViT and Tucker. No native Tucker kernel or compiled-C++ golden/parity.
 - v0.0.269 (`4addcb07`): integrated strict Swin/transformer aliases, Rust-defined weights and modern save/load, seeded initialization, exact CPU block forward/backward, runtime accumulation and SGD/Adam, optimizer-state serialization, and GPU f32 host fallback. `MEM=3G ./tools/test_host.sh swin` passed 25 tests, `runtime` 166, and `weights` 29; FakeBackend/CPU output, gradient, and update parity includes a preceding-convolution chain. No native Swin kernel, C++ weights writer, or compiled-C++ golden. v0.0.268 (`0bd26bda`) added the source-derived reference helpers before this integration.
 - v0.0.258 (`7681f478`): `obb_detector_map` dispatches all-CARPN sample sets to the existing polygon evaluator, rejects mixed front-point/CARPN geometry, and preserves legacy behavior for empty prediction sets. `MEM=3G ./tools/test_host.sh obb_map` passed 5 core tests, `MEM=3G ./tools/test_host.sh carpn_map` passed 3, and `MEM=3G ./tools/test_host.sh carpn_polygon_iou` passed 2. Caller-supplied sample API only; network decode/CLI validation remains unsupported and is planned in `carpn_network_map_plan.md`; CARPN training/`train -map` remains deferred. No compiled-C++ parity is claimed.
@@ -649,10 +650,11 @@ believing a `cfg_corpus` failure.
    dispatch are wired. VC uses its Rust reference on CPU and GPU host-round-trip
    paths; native VC device kernels and compiled-C++ parity are unavailable.
    Swin/transformer and Tucker attention are now integrated in the Rust
-   reference runtime. Remaining Phase 3A layers are `mambavision` and `kimi_kda`.
-   MiniMax sparse attention is an auxiliary utility/config option, not a
-   standalone C++ layer; Rust wires it into ViT and Tucker, with remaining
-   attention callers to be audited alongside their layer ports.
+   reference runtime. MambaVision is now integrated in v0.0.271; `kimi_kda`
+   remains the next open Phase 3A layer. MiniMax sparse attention is an auxiliary
+   utility/config option, not a standalone C++ layer; Rust wires it into ViT,
+   Tucker, and MambaVision, with remaining attention callers audited alongside
+   their layer ports.
    **Order matters:** `[laya_scorer]`'s `weights=` is only usable together with
    `[laya_encoder]` + `[laya_head]` (the shared-file offset is computed past
    their blobs), so those two come next even though the plan files them under
@@ -669,8 +671,8 @@ believing a `cfg_corpus` failure.
 3. **Phase 3A prerequisite (2) is complete**: LayerNorm fwd/bwd, the fused
    residual/bias epilogue, the row-softmax backward and the batched-GEMM wrapper
    (`linear_f32`) are all in, each with a host default plus GPU parity tests.
-   It supports the ViT, Swin/transformer, and Tucker reference paths plus the
-   remaining MambaVision/Kimi ports and LAYA encoder/head. MiniMax sparse
+   It supports the ViT, Swin/transformer, Tucker, and MambaVision reference paths,
+   plus the remaining Kimi KDA port and LAYA encoder/head. MiniMax sparse
    attention is a shared utility, not a standalone layer. Standard
    `flash_attention` has native Oxide forward/backward primitives. VC now has
    strict config/runtime integration and uses its centered/clamped-score Rust

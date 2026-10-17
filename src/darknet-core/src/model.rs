@@ -611,6 +611,22 @@ pub struct TuckerAttentionSpec {
     pub msa_topk: usize,
 }
 
+/// `[mambavision]` / `[mambavision_block]`: selective-scan vision mixer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MambaVisionSpec {
+    pub filters: usize,
+    pub state: usize,
+    pub conv_size: usize,
+    pub dt_rank: usize,
+    pub ffn_ratio: usize,
+    pub activation: Activation,
+    pub msa_enabled: bool,
+    pub msa_block_size: usize,
+    pub msa_topk: usize,
+    pub msa_heads: usize,
+    pub causal: bool,
+}
+
 /// `[yolox]`: the anchor-free detection head (Phase 2A of `tasks/rust/layers.md`),
 /// ported from `Jev_laya:src-lib/darknet_cfg.cpp::parse_yolox_section`.  The
 /// layer has no weights and no kernels; see
@@ -1241,6 +1257,8 @@ pub enum LayerKind {
     Swin(SwinSpec),
     /// `[tucker]`, `[tucker_attention]`, `[tucker_attn]`.
     TuckerAttention(TuckerAttentionSpec),
+    /// `[mambavision]` / `[mambavision_block]` selective-scan vision mixer.
+    MambaVision(MambaVisionSpec),
     /// `[moe_convolutional]`: a learned mixture of `MoeSpec::experts`
     /// convolutional experts gated per image by a small router.
     Moe(MoeSpec),
@@ -1301,6 +1319,7 @@ impl LayerKind {
             Self::Vit(_) => "vit",
             Self::Swin(_) => "swin",
             Self::TuckerAttention(_) => "tucker_attention",
+            Self::MambaVision(_) => "mambavision",
             Self::Moe(_) => "moe_convolutional",
             Self::EmlConvolutional(_) => "eml_convolutional",
             Self::Rnn(_) => "rnn",
@@ -1330,6 +1349,7 @@ impl LayerKind {
             Self::Vit(spec) => Some(&spec.activation),
             Self::Swin(spec) => Some(&spec.activation),
             Self::TuckerAttention(spec) => Some(&spec.activation),
+            Self::MambaVision(spec) => Some(&spec.activation),
             _ => None,
         }
     }
@@ -1732,6 +1752,19 @@ impl Layer {
                     ],
                 })
             }
+            LayerKind::MambaVision(spec) => Some(LayerWeights {
+                entries: crate::mambavision::mambavision_weight_blocks(
+                    self.input_shape.channels,
+                    spec,
+                )
+                .expect("validated MambaVision geometry")
+                .into_iter()
+                .map(|block| WeightsEntry {
+                    array: WeightsArray::Named(block.name.to_owned()),
+                    len: block.range.len(),
+                })
+                .collect(),
+            }),
             LayerKind::Vit(spec) => {
                 let dim = spec.dim;
                 let patch_dim = spec.patch_size * spec.patch_size * self.input_shape.channels;
@@ -2867,6 +2900,9 @@ fn parse_layer_kind(
         "tucker" | "tucker_attention" | "tucker_attn" => {
             LayerKind::TuckerAttention(parse_tucker_attention_spec(&section, current)?)
         }
+        "mambavision" | "mambavision_block" => {
+            LayerKind::MambaVision(parse_mambavision_spec(&section, current)?)
+        }
         "vit" => {
             let line = section.line;
             let has_filters = section.get("filters").is_some();
@@ -3622,6 +3658,19 @@ fn infer_output_shape(
                 )));
             }
             Ok(current)
+        }
+        LayerKind::MambaVision(spec) => {
+            if current.width == 0 || current.height == 0 || current.channels == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[mambavision] layer #{layer_index} requires non-empty image-shaped input"
+                )));
+            }
+            Ok(TensorShape::new(
+                current.width,
+                current.height,
+                spec.filters,
+                current.batch,
+            ))
         }
         LayerKind::Vit(spec) => {
             let line = layer_index;
@@ -4628,6 +4677,175 @@ fn parse_tucker_attention_spec(
 /// C++ `parse_yolox_section`: `classes`(20), `max`(200), `jitter`(0.2) and
 /// `resize`(1.0).  The PP-YOLOE / YOLO-NAS siblings share the first two keys and
 /// add `reg_max`(16); they are not ported yet.
+fn parse_mambavision_spec(section: &RawSection, input: TensorShape) -> Result<MambaVisionSpec> {
+    const ALLOWED: &[&str] = &[
+        "filters",
+        "state",
+        "d_state",
+        "conv_size",
+        "size",
+        "dt_rank",
+        "ffn_ratio",
+        "activation",
+        "msa",
+        "minimax_sparse_attention",
+        "msa_block",
+        "msa_block_size",
+        "msa_topk",
+        "msa_top_blocks",
+        "msa_heads",
+        "causal",
+        "stream",
+        "wait_stream",
+        "learning_rate",
+        "dont_update",
+        "burnin_update",
+        "train_only_bn",
+        "clip",
+        "grad_centr",
+    ];
+    let line = section.line;
+    if let Some(key) = section
+        .values
+        .keys()
+        .find(|key| !ALLOWED.contains(&key.as_str()))
+    {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: unknown option `{key}`",
+            section.name
+        )));
+    }
+    if input.width == 0 || input.height == 0 || input.channels == 0 {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: preceding layer must output a non-empty image",
+            section.name
+        )));
+    }
+    let filters = section.get_usize("filters", input.channels)?;
+    let state = if section.get("state").is_some() {
+        section.get_usize("state", 8)?
+    } else {
+        section.get_usize("d_state", 8)?
+    };
+    let conv_size = if section.get("conv_size").is_some() {
+        section.get_usize("conv_size", 3)?
+    } else {
+        section.get_usize("size", 3)?
+    };
+    let dt_rank_raw = section.get_i64("dt_rank", 0)?;
+    let dt_rank = if dt_rank_raw > 0 {
+        usize::try_from(dt_rank_raw).map_err(|_| {
+            Error::InvalidConfig(format!(
+                "[{}] at line {line}: dt_rank is too large",
+                section.name
+            ))
+        })?
+    } else {
+        filters.checked_add(15).ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "[{}] at line {line}: default dt_rank overflows",
+                section.name
+            ))
+        })? / 16
+    };
+    let ffn_ratio = section.get_usize("ffn_ratio", 4)?;
+    if filters < 2 || filters % 2 != 0 {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: filters must be even and >= 2, got {filters}",
+            section.name
+        )));
+    }
+    if state == 0 || conv_size == 0 || conv_size % 2 == 0 || ffn_ratio == 0 || dt_rank == 0 {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: state, dt_rank, ffn_ratio, and odd conv_size must be positive",
+            section.name
+        )));
+    }
+    let msa_enabled = if section.get("msa").is_some() {
+        section.get_i64("msa", 0)? != 0
+    } else {
+        section.get_i64("minimax_sparse_attention", 0)? != 0
+    };
+    let msa_block_value = if section.get("msa_block").is_some() {
+        section.get_i64("msa_block", 16)?
+    } else if section.get("msa_block_size").is_some() {
+        section.get_i64("msa_block_size", 16)?
+    } else {
+        16
+    };
+    let msa_topk_value = if section.get("msa_topk").is_some() {
+        section.get_i64("msa_topk", 4)?
+    } else if section.get("msa_top_blocks").is_some() {
+        section.get_i64("msa_top_blocks", 4)?
+    } else {
+        4
+    };
+    let msa_heads_value = section.get_i64("msa_heads", 1)?.max(1);
+    let mut msa_heads = usize::try_from(msa_heads_value).map_err(|_| {
+        Error::InvalidConfig(format!(
+            "[{}] at line {line}: msa_heads is too large",
+            section.name
+        ))
+    })?;
+    if filters % msa_heads != 0 {
+        msa_heads = 1;
+    }
+    for key in ["stream", "wait_stream"] {
+        let stream = section.get_i64(key, -1)?;
+        if stream != -1 {
+            return Err(Error::InvalidConfig(format!(
+                "[{}] at line {line}: {key}={stream} is unsupported by the Rust runtime",
+                section.name
+            )));
+        }
+    }
+    let activation = Activation::parse(&section.get_str("activation", "gelu"));
+    if let Activation::Other(ref other) = activation {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: unsupported activation={other}",
+            section.name
+        )));
+    }
+    if matches!(
+        activation,
+        Activation::NormalizeChannels
+            | Activation::NormalizeChannelsSoftmax
+            | Activation::NormalizeChannelsSoftmaxMaxval
+    ) {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: channel-normalizing activations are unsupported",
+            section.name
+        )));
+    }
+    let spec = MambaVisionSpec {
+        filters,
+        state,
+        conv_size,
+        dt_rank,
+        ffn_ratio,
+        activation,
+        msa_enabled,
+        msa_block_size: usize::try_from(msa_block_value.max(1)).map_err(|_| {
+            Error::InvalidConfig(format!(
+                "[{}] at line {line}: msa_block is too large",
+                section.name
+            ))
+        })?,
+        msa_topk: usize::try_from(msa_topk_value.max(1)).map_err(|_| {
+            Error::InvalidConfig(format!(
+                "[{}] at line {line}: msa_topk is too large",
+                section.name
+            ))
+        })?,
+        msa_heads,
+        causal: section.get_i64("causal", 0)? != 0,
+    };
+    crate::mambavision::validate_geometry(input, &spec).map_err(|error| {
+        Error::InvalidConfig(format!("[{}] at line {line}: {error}", section.name))
+    })?;
+    Ok(spec)
+}
+
 fn parse_modern_yolo_spec(section: &RawSection) -> Result<ModernYoloSpec> {
     let line = section.line;
     let kind = match section.name.as_str() {
@@ -4679,6 +4897,105 @@ mod tests {
 
     fn build(text: &str) -> crate::error::Result<Network> {
         Network::from_config(ConfigFile::parse_str("t.cfg", text)?)
+    }
+
+    #[test]
+    fn mambavision_aliases_defaults_shape_and_weight_metadata() {
+        for alias in ["mambavision", "mambavision_block"] {
+            let network = build(&format!(
+                "[net]\nwidth=3\nheight=2\nchannels=8\n[{alias}]\n"
+            ))
+            .unwrap();
+            let layer = &network.layers[0];
+            let LayerKind::MambaVision(spec) = &layer.kind else {
+                panic!("expected MambaVision for [{alias}]")
+            };
+            assert_eq!(
+                (
+                    spec.filters,
+                    spec.state,
+                    spec.conv_size,
+                    spec.dt_rank,
+                    spec.ffn_ratio,
+                    spec.msa_enabled,
+                    spec.msa_block_size,
+                    spec.msa_topk,
+                    spec.msa_heads,
+                    spec.causal,
+                ),
+                (8, 8, 3, 1, 4, false, 16, 4, 1, false)
+            );
+            assert_eq!(spec.activation, super::Activation::Gelu);
+            assert_eq!(layer.kind.name(), "mambavision");
+            assert_eq!(layer.output_shape, super::TensorShape::new(3, 2, 8, 1));
+            let weights = layer.weights().unwrap();
+            assert_eq!(
+                weights.entries.first().unwrap().array.name(),
+                "mambavision_in_proj_weights"
+            );
+            assert_eq!(
+                weights.entries.last().unwrap().array.name(),
+                "mambavision_ffn_b2"
+            );
+            assert_eq!(
+                weights.parameter_count(),
+                crate::mambavision::MambaVisionParams::zeroed(8, 8, 8, 3, 1, 4)
+                    .unwrap()
+                    .parameter_count()
+            );
+        }
+
+        let network = build(
+            "[net]\nwidth=4\nheight=2\nchannels=8\n\
+             [mambavision]\nfilters=10\nstate=4\nd_state=5\nconv_size=5\nsize=7\n\
+             dt_rank=2\nffn_ratio=2\nactivation=linear\nmsa=0\nminimax_sparse_attention=1\n\
+             msa_block=6\nmsa_block_size=3\nmsa_topk=5\nmsa_top_blocks=2\nmsa_heads=3\ncausal=1\n",
+        )
+        .unwrap();
+        let LayerKind::MambaVision(spec) = &network.layers[0].kind else {
+            panic!("expected MambaVision")
+        };
+        assert_eq!(
+            (
+                spec.filters,
+                spec.state,
+                spec.conv_size,
+                spec.dt_rank,
+                spec.ffn_ratio
+            ),
+            (10, 4, 5, 2, 2)
+        );
+        assert_eq!(
+            (
+                spec.msa_enabled,
+                spec.msa_block_size,
+                spec.msa_topk,
+                spec.msa_heads,
+                spec.causal
+            ),
+            (false, 6, 5, 1, true)
+        );
+        assert_eq!(spec.activation, super::Activation::Linear);
+    }
+
+    #[test]
+    fn mambavision_rejects_unknown_options_and_invalid_geometry() {
+        for options in [
+            "mystery=1",
+            "filters=3",
+            "state=0",
+            "conv_size=2",
+            "ffn_ratio=0",
+            "dt_rank=bad",
+            "activation=unknown",
+            "stream=0",
+        ] {
+            let cfg = format!("[net]\nwidth=2\nheight=2\nchannels=4\n[mambavision]\n{options}\n");
+            assert!(
+                build(&cfg).is_err(),
+                "accepted invalid MambaVision option: {options}"
+            );
+        }
     }
 
     #[test]

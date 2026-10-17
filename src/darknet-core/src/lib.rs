@@ -53,6 +53,7 @@ pub mod laya_scorer;
 pub mod loader_profile;
 pub mod moe_conv;
 pub use initialize::initialize_training_params;
+pub mod mambavision;
 pub(crate) mod maxpool_depth;
 pub mod model;
 pub mod modern_yolo;
@@ -71,7 +72,7 @@ pub use obb_training::{
     ObbYoloHeadAssignmentSpec, ObbYoloHeadMatchConfig, ObbYoloHeadTrainingDeltaStats,
     ObbYoloMatchScore, ObbYoloMatchScoreBranch, ObbYoloMatchScoreConfig, ObbYoloPositiveAssignment,
     ObbYoloPositiveKind, ObbYoloPositiveObjectnessConfig, ObbYoloPredictionMatchContext,
-    ObbYoloTruthBatch, ObbYoloTrainingHeadConfig, apply_obb_yolo_batch_head_objectness_deltas,
+    ObbYoloTrainingHeadConfig, ObbYoloTruthBatch, apply_obb_yolo_batch_head_objectness_deltas,
     apply_obb_yolo_batch_head_positive_box_deltas, apply_obb_yolo_batch_head_positive_class_deltas,
     apply_obb_yolo_batch_head_positive_front_point_deltas,
     apply_obb_yolo_batch_head_positive_objectness_deltas,
@@ -82,8 +83,8 @@ pub use obb_training::{
     apply_obb_yolo_batch_multi_head_training_deltas,
     apply_obb_yolo_batch_multi_head_training_deltas_with_front_point,
     apply_obb_yolo_batch_multi_head_training_deltas_with_front_point_configs,
-    build_obb_yolo_training_head_config, assign_obb_yolo_anchor,
-    decode_obb_yolo_front_point, encode_obb_yolo_truth_batch, enumerate_obb_yolo_batch_positives,
+    assign_obb_yolo_anchor, build_obb_yolo_training_head_config, decode_obb_yolo_front_point,
+    encode_obb_yolo_truth_batch, enumerate_obb_yolo_batch_positives,
     enumerate_obb_yolo_head_positives, match_obb_yolo_batch_cell_predictions,
     match_obb_yolo_cell_prediction, match_obb_yolo_cell_prediction_with_score_config,
     obb_yolo_anchor_match_score, obb_yolo_angular_prediction_match_score_with_viou,
@@ -115,31 +116,35 @@ pub use detect::{
 };
 pub use error::{Error, Result};
 pub use image::PlanarRgbImage;
+pub use mambavision::{
+    MambaVisionForward, MambaVisionGradients, MambaVisionParams, MambaVisionState,
+    mambavision_backward, mambavision_forward,
+};
 pub use model::{
-    Activation, CrnnSpec, Layer, LayerKind, LayerWeights, LrPolicy, LstmSpec, NetConfig, Network,
-    ObbRefineLoss, ObbRefineSpec, RnnSpec, ShortcutWeightsNorm, ShortcutWeightsType, SwinSpec,
-    TensorShape, TuckerAttentionSpec, WeightsArray, YoloIouLoss,
+    Activation, CrnnSpec, Layer, LayerKind, LayerWeights, LrPolicy, LstmSpec, MambaVisionSpec,
+    NetConfig, Network, ObbRefineLoss, ObbRefineSpec, RnnSpec, ShortcutWeightsNorm,
+    ShortcutWeightsType, SwinSpec, TensorShape, TuckerAttentionSpec, WeightsArray, YoloIouLoss,
 };
 pub use names::load_names_file;
 pub use runtime::{
     BackwardResult, BatchNormTrainBuffers, ConnectedTrainBuffers, ConvolutionalTrainBuffers,
     CrnnParams, CrnnTrainBuffers, ExecutableNetwork, ForwardResult, GpuExecutableNetwork,
     GpuForwardState, GpuForwardSummary, LayerParams, LayerTrainBuffers, LstmParams,
-    LstmTrainBuffers, RecurrentForwardCache, RnnParams, RnnTrainBuffers, ShortcutParams,
-    ShortcutTrainBuffers, Tensor, TuckerAttentionTrainBuffers, YoloHeadOutput,
+    LstmTrainBuffers, MambaVisionTrainBuffers, RecurrentForwardCache, RnnParams, RnnTrainBuffers,
+    ShortcutParams, ShortcutTrainBuffers, Tensor, TuckerAttentionTrainBuffers, YoloHeadOutput,
     compute_learning_rate,
 };
 pub use swin::SwinWeights;
 pub use swin_block::SwinForwardCache;
 pub use train::{
-    DataConfig, ObbTrainingBatch, ObbYoloTrainingDeltaBatch, TrainingBatch, YoloLabel,
-    YoloTrainingLoss, YoloTrainingState, compute_obb_yolo_training_deltas,
-    ObbYoloTrainingBackward, backward_obb_yolo_training, train_obb_yolo_batch_step,
-    train_obb_yolo_subdivisions, compute_yolo_training_loss,
+    DataConfig, ObbTrainingBatch, ObbYoloTrainingBackward, ObbYoloTrainingDeltaBatch,
+    TrainingBatch, YoloLabel, YoloTrainingLoss, YoloTrainingState, backward_obb_yolo_training,
+    compute_obb_yolo_training_deltas, compute_yolo_training_loss,
     compute_yolo_training_loss_with_state, load_augmented_training_batch_from_paths,
     load_obb_training_batch, load_obb_training_batch_from_paths,
     load_obb_training_batch_with_flips_from_paths, load_paths_file, load_training_batch,
     load_training_batch_from_paths, load_yolo_labels, replace_image_to_label,
+    train_obb_yolo_batch_step, train_obb_yolo_subdivisions,
 };
 pub use tucker_attention::{TuckerAttentionForwardCache, TuckerAttentionParams};
 pub use weights::{WeightsHeader, WeightsInspection, inspect_weights_file, save_weights};

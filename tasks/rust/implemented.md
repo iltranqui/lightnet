@@ -39,6 +39,7 @@ file is named inline.
 - [8. Layer port — Phase 3A shared primitives (prerequisite set)](#8-layer-port--phase-3a-shared-primitives-prerequisite-set)
   - [`[vit]` reference layer path (Phase 3A)](#vit-reference-layer-path-phase-3a)
   - [`[tucker_attention]` reference layer path (Phase 3A)](#tucker_attention-reference-layer-path-phase-3a)
+  - [`[mambavision]` reference layer path (Phase 3A)](#mambavision-reference-layer-path-phase-3a)
 - [9. Inference parity — LegoGears_v2 (the final target)](#9-inference-parity--legogears_v2-the-final-target)
 - [10. Data augmentation (`augmentation-audit.md`)](#10-data-augmentation-augmentation-auditmd)
 - [11. Housekeeping](#11-housekeeping)
@@ -453,10 +454,10 @@ still NOT RUN (no `Jev_laya` build here; `test_data/laya/` has only the shared
 - Batched-GEMM wrapper `linear_f32` (torch `nn.Linear` layout, bias as GEMM
   `beta=1`) (`593ea30a`).
 - Row-softmax backward already existed. The shared set supports `vit`,
-  `swin`/`transformer`, and the v0.0.270 Tucker reference. `mambavision` and
-  `kimi_kda` remain open. MiniMax sparse attention is an optional shared utility,
-  not a standalone layer in the audited C++ branch; it is wired into ViT and
-  Tucker.
+  `swin`/`transformer`, Tucker, and MambaVision reference paths; `kimi_kda`
+  remains open. MiniMax sparse attention is an optional shared utility, not a
+  standalone layer in the audited C++ branch; it is wired into ViT, Tucker, and
+  MambaVision.
 
 ### `[vit]` reference layer path (Phase 3A)
 - `model.rs`: cfg aliases/defaults/validation and patch-grid shape inference;
@@ -569,10 +570,34 @@ still NOT RUN (no `Jev_laya` build here; `test_data/laya/` has only the shared
   passed 14 tests; `weights` passed 32 and `runtime` 168, including FakeBackend
   CPU forward/backward/update parity and Adam fallback. Source-derived from
   `Jev_laya`/`jepa`; no compiled-C++ golden or parity claim.
-- Still open: `mambavision` and `kimi_kda`. MiniMax sparse attention remains a
-  shared option rather than a standalone layer, and its source enablement must
-  be audited in each remaining attention integration. VC native-kernel/evidence
-  follow-ups also remain; see `todo.md`, `vit_plan.md`, and `swin_plan.md`.
+- `kimi_kda` remains open. MiniMax sparse attention is a shared option rather
+  than a standalone layer, and its source enablement must be audited in each
+  future attention integration. VC native-kernel/evidence follow-ups also
+  remain; see `todo.md`, `vit_plan.md`, and `swin_plan.md`.
+
+### `[mambavision]` reference layer path (Phase 3A)
+
+- v0.0.271: added strict `[mambavision]` / `[mambavision_block]` parsing,
+  shape/geometry checks, source-ordered flat parameters, deterministic seeded
+  initialization, and an explicit per-layer recurrent-state API. The source
+  recurrence, causal/noncausal depthwise convolution, post-scan identity-QKV MSA,
+  residual, LayerNorm, and FFN are implemented in `mambavision.rs`.
+- CPU backward differentiates the Rust forward exactly, including scan clamp
+  masks, MSA score clipping, and incoming `[batch, filters/2, state]` gradients;
+  top-k selection is held fixed and undefined boundary derivatives error.
+  Runtime accumulation, per-block SGD decay, host Adam, and optimizer-state
+  serialization are integrated. GPU f32 uses the host reference/fallback.
+- `.weights` metadata and load/save follow the audited C++ block order, including
+  the optional residual projection only when input channels differ from filters.
+  Tests cover aliases/defaults/errors, seeded initialization bounds, input and
+  every parameter-block finite differences, incoming-state finite differences,
+  causal-convolution finite differences, conv-size-1 streaming, MSA clipping,
+  exact-length weight round trips, optimizer-state persistence, SGD decay groups,
+  and CPU/FakeBackend forward/backward/update parity.
+- Evidence: `MEM=3G ./tools/test_host.sh mambavision` — 16 pass;
+  `MEM=3G ./tools/test_host.sh runtime` — 171 pass;
+  `MEM=3G ./tools/test_host.sh weights` — 33 pass. No native MambaVision
+  kernel or owning-branch compiled-C++ golden/parity.
 
 ## 9. Inference parity — LegoGears_v2 (the final target)
 

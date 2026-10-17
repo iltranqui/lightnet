@@ -254,6 +254,8 @@ pub enum LayerParams {
     Swin(crate::swin::SwinWeights),
     /// `[tucker_attention]`: bias followed by flat Q/K/V/O factor weights.
     TuckerAttention(crate::tucker_attention::TuckerAttentionParams),
+    /// `[mambavision]`: all trainable tensors in source `.weights` order.
+    MambaVision(crate::mambavision::MambaVisionParams),
     /// `[moe_convolutional]`: one convolution per expert plus the router's
     /// `[experts, channels]` weights and `[experts]` biases.
     Moe(MoeParams),
@@ -376,6 +378,12 @@ pub struct TuckerAttentionTrainBuffers {
     pub weight_updates: Vec<f32>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct MambaVisionTrainBuffers {
+    /// Accumulated update directions in the MambaVision source blob order.
+    pub updates: Vec<f32>,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayerTrainBuffers {
@@ -394,6 +402,7 @@ pub enum LayerTrainBuffers {
     Vit(VitTrainBuffers),
     Swin(SwinTrainBuffers),
     TuckerAttention(TuckerAttentionTrainBuffers),
+    MambaVision(MambaVisionTrainBuffers),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -531,6 +540,8 @@ pub struct ForwardResult {
     pub vit_caches: Vec<Option<crate::vit::VitForwardCache>>,
     pub swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>>,
     pub tucker_attention_caches: Vec<Option<crate::tucker_attention::TuckerAttentionForwardCache>>,
+    /// Forward tapes include the explicit recurrent scan state for MambaVision.
+    pub mambavision_caches: Vec<Option<crate::mambavision::MambaVisionForward>>,
     /// Valid proposal metadata and Stage-2 raw outputs for each `[obb_refine]` layer.
     pub obb_refine_outputs: Vec<crate::carpn::ObbRefineOutput>,
     pub yolo_heads: Vec<YoloHeadOutput>,
@@ -555,6 +566,7 @@ impl ForwardResult {
             vit_caches: Vec::new(),
             swin_caches: Vec::new(),
             tucker_attention_caches: Vec::new(),
+            mambavision_caches: Vec::new(),
             obb_refine_outputs: Vec::new(),
             yolo_heads,
             modern_heads,
@@ -583,6 +595,7 @@ mod forward_result_from_heads_tests {
         assert!(result.vit_caches.is_empty());
         assert!(result.swin_caches.is_empty());
         assert!(result.tucker_attention_caches.is_empty());
+        assert!(result.mambavision_caches.is_empty());
         assert!(result.obb_refine_outputs.is_empty());
         assert!(result.yolo_heads.is_empty());
         assert!(result.modern_heads.is_empty());
@@ -595,6 +608,8 @@ pub struct BackwardResult {
     pub input_gradient: Tensor,
     pub layer_output_gradients: Vec<Tensor>,
     pub param_gradients: Vec<LayerParams>,
+    /// Incoming scan-state derivatives for each MambaVision layer.
+    pub mambavision_state_gradients: Vec<Option<crate::mambavision::MambaVisionState>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1224,6 +1239,21 @@ impl ExecutableNetwork {
                         batch,
                     );
                 }
+                (LayerParams::MambaVision(params), LayerTrainBuffers::MambaVision(train)) => {
+                    let layer_lr = lr * opts.learning_rate_scale;
+                    let blocks = crate::mambavision::mambavision_param_blocks(params)
+                        .expect("validated MambaVision parameter geometry");
+                    for block in blocks {
+                        sgd_update(
+                            &mut params.values[block.range.clone()],
+                            &mut train.updates[block.range],
+                            layer_lr,
+                            momentum,
+                            if block.decay { decay } else { 0.0 },
+                            batch,
+                        );
+                    }
+                }
                 (LayerParams::Vit(params), LayerTrainBuffers::Vit(train)) => {
                     let learned_pos = matches!(self.network.layers[layer_index].kind, LayerKind::Vit(ref spec) if spec.learned_pos_embed);
                     update_vit_params(
@@ -1371,6 +1401,26 @@ impl ExecutableNetwork {
 
     pub fn forward(&self, input: &Tensor) -> Result<ForwardResult> {
         self.forward_with_mode(input, false)
+    }
+
+    /// Run inference with optional per-layer MambaVision recurrent states.
+    /// Pass an empty slice to initialize every MambaVision layer with zeros;
+    /// otherwise the slice must have one entry per network layer.
+    pub fn forward_with_mambavision_states(
+        &self,
+        input: &Tensor,
+        states: &[Option<crate::mambavision::MambaVisionState>],
+    ) -> Result<ForwardResult> {
+        self.forward_with_mode_and_states(input, false, states)
+    }
+
+    /// Training counterpart to `forward_with_mambavision_states`.
+    pub fn forward_training_with_mambavision_states(
+        &self,
+        input: &Tensor,
+        states: &[Option<crate::mambavision::MambaVisionState>],
+    ) -> Result<ForwardResult> {
+        self.forward_with_mode_and_states(input, true, states)
     }
 
     /// Execute an inference-only graph while retaining tensors only until their
@@ -1559,6 +1609,22 @@ impl ExecutableNetwork {
     }
 
     fn forward_with_mode(&self, input: &Tensor, training: bool) -> Result<ForwardResult> {
+        self.forward_with_mode_and_states(input, training, &[])
+    }
+
+    fn forward_with_mode_and_states(
+        &self,
+        input: &Tensor,
+        training: bool,
+        mambavision_states: &[Option<crate::mambavision::MambaVisionState>],
+    ) -> Result<ForwardResult> {
+        if !mambavision_states.is_empty() && mambavision_states.len() != self.network.layers.len() {
+            return Err(Error::InvalidConfig(format!(
+                "MambaVision state list has {} entries, expected {} network layers",
+                mambavision_states.len(),
+                self.network.layers.len()
+            )));
+        }
         let expected = self.network.net.input_shape();
         if input.shape != expected {
             return Err(Error::InvalidConfig(format!(
@@ -1595,6 +1661,7 @@ impl ExecutableNetwork {
         let mut vit_caches = Vec::with_capacity(self.network.layers.len());
         let mut swin_caches = Vec::with_capacity(self.network.layers.len());
         let mut tucker_attention_caches = Vec::with_capacity(self.network.layers.len());
+        let mut mambavision_caches = Vec::with_capacity(self.network.layers.len());
         let mut obb_refine_outputs = Vec::new();
         let mut rng_state = 0x9e37_79b9_u64;
 
@@ -1618,6 +1685,7 @@ impl ExecutableNetwork {
             let mut vit_cache = None;
             let mut swin_cache = None;
             let mut tucker_attention_cache = None;
+            let mut mambavision_cache = None;
             let (output, activation_input) = match (&layer.kind, params) {
                 (
                     LayerKind::Convolutional(spec),
@@ -1842,6 +1910,19 @@ impl ExecutableNetwork {
                     .map_err(Error::InvalidConfig)?;
                     tucker_attention_cache = Some(cache);
                     (Tensor::from_data(layer.output_shape, data)?, None)
+                }
+                (LayerKind::MambaVision(spec), LayerParams::MambaVision(weights)) => {
+                    let forward = crate::mambavision::mambavision_forward(
+                        &current_input.data,
+                        current_input.shape,
+                        spec,
+                        weights,
+                        mambavision_states.get(layer.index).and_then(Option::as_ref),
+                    )
+                    .map_err(Error::InvalidConfig)?;
+                    let output = Tensor::from_data(layer.output_shape, forward.output.clone())?;
+                    mambavision_cache = Some(forward);
+                    (output, None)
                 }
                 (LayerKind::LayaEncoder(spec), LayerParams::LayaEncoder(weights)) => (
                     laya_encoder_forward(spec, weights, current_input, layer.output_shape)?,
@@ -2163,6 +2244,7 @@ impl ExecutableNetwork {
             vit_caches.push(vit_cache);
             swin_caches.push(swin_cache);
             tucker_attention_caches.push(tucker_attention_cache);
+            mambavision_caches.push(mambavision_cache);
         }
 
         Ok(ForwardResult {
@@ -2176,6 +2258,7 @@ impl ExecutableNetwork {
             vit_caches,
             swin_caches,
             tucker_attention_caches,
+            mambavision_caches,
             obb_refine_outputs,
             yolo_heads,
             modern_heads,
@@ -2295,6 +2378,13 @@ impl ExecutableNetwork {
                 forward.tucker_attention_caches.len()
             )));
         }
+        if forward.mambavision_caches.len() != self.network.layers.len() {
+            return Err(Error::InvalidConfig(format!(
+                "forward MambaVision cache count mismatch: expected {}, got {}",
+                self.network.layers.len(),
+                forward.mambavision_caches.len()
+            )));
+        }
         if layer_output_gradient_seeds.len() != self.network.layers.len() {
             return Err(Error::InvalidConfig(format!(
                 "backward seed count mismatch: expected {}, got {}",
@@ -2304,6 +2394,7 @@ impl ExecutableNetwork {
         }
 
         let mut input_gradient = Tensor::zeros(input.shape);
+        let mut mambavision_state_gradients = vec![None; self.network.layers.len()];
         let mut layer_output_gradients = self
             .network
             .layers
@@ -3240,6 +3331,37 @@ impl ExecutableNetwork {
                         &mut layer_output_gradients,
                     )?;
                 }
+                (LayerKind::MambaVision(_), LayerParams::MambaVision(weights)) => {
+                    let cache = forward
+                        .mambavision_caches
+                        .get(layer.index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing [mambavision] forward cache for layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let gradients =
+                        crate::mambavision::mambavision_backward(&grad.data, weights, cache, None)
+                            .map_err(Error::InvalidConfig)?;
+                    let Some(LayerParams::MambaVision(slot)) = param_gradients.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing [mambavision] gradient slot for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    slot.values = gradients.params;
+                    mambavision_state_gradients[layer.index] = Some(gradients.state_in);
+                    let input_grad = Tensor::from_data(current_input.shape, gradients.input)?;
+                    accumulate_previous_gradient(
+                        layer.index,
+                        &input_grad,
+                        &mut input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
+                }
                 (LayerKind::LayaEncoder(_), LayerParams::LayaEncoder(_))
                 | (LayerKind::LayaHead(_), LayerParams::LayaHead(_)) => {
                     // Frozen (`freeze=1`): no gradient flows to the input.
@@ -3370,6 +3492,7 @@ impl ExecutableNetwork {
             input_gradient,
             layer_output_gradients,
             param_gradients,
+            mambavision_state_gradients,
         })
     }
 
@@ -3801,6 +3924,17 @@ impl ExecutableNetwork {
                     };
                     accumulate_tucker_attention_updates(train, gradient)?;
                 }
+                (LayerKind::MambaVision(_), LayerParams::MambaVision(gradient)) => {
+                    let Some(LayerTrainBuffers::MambaVision(train)) =
+                        self.train_buffers.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing MambaVision train buffers for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    accumulate_vec(&mut train.updates, &gradient.values)?;
+                }
                 (_, LayerParams::None) => {}
                 // `[laya_scorer]` is frozen by default, so it has no train
                 // buffers and contributes no parameter gradient.
@@ -3993,6 +4127,7 @@ fn host_adam_scalar_capacity(params: &LayerParams) -> usize {
         .sum(),
         LayerParams::Swin(params) => params.parameter_count(),
         LayerParams::TuckerAttention(params) => params.parameter_count(),
+        LayerParams::MambaVision(params) => params.parameter_count(),
         LayerParams::Moe(params) => {
             params.router_weights.len()
                 + params.router_biases.len()
@@ -5918,7 +6053,9 @@ where
                         | LayerParams::Moe(_)
                         | LayerParams::Gru(_)
                         | LayerParams::Vit(_)
+                        | LayerParams::Swin(_)
                         | LayerParams::TuckerAttention(_)
+                        | LayerParams::MambaVision(_)
                         | LayerParams::Rnn(_)
                         | LayerParams::Lstm(_)
                         | LayerParams::Crnn(_)
@@ -5926,7 +6063,7 @@ where
                 )
             }) {
                 return Err(Error::InvalidConfig(
-                    "adam=1 on the GPU path supports convolutional, connected, local, shortcut, MoE, standalone batchnorm, ViT, Tucker attention, and GRU/RNN/LSTM/CRNN layers"
+                    "adam=1 on the GPU path supports convolutional, connected, local, shortcut, MoE, standalone batchnorm, ViT, Swin, Tucker attention, MambaVision, and GRU/RNN/LSTM/CRNN layers"
                         .to_string(),
                 ));
             }
@@ -6274,6 +6411,11 @@ where
                         &mut moments.biases,
                         adam,
                     )?;
+                }
+                (LayerParams::MambaVision(params), LayerTrainBuffers::MambaVision(train)) => {
+                    let moments =
+                        moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    apply_host_adam_mambavision(params, train, moments, adam)?;
                 }
                 (LayerParams::Moe(params), LayerTrainBuffers::Moe(train)) => {
                     if params.experts.len() != train.experts.len() {
@@ -6661,6 +6803,21 @@ where
                         decay,
                         batch,
                     );
+                }
+                (LayerParams::MambaVision(params), LayerTrainBuffers::MambaVision(train)) => {
+                    let layer_lr = lr * layer.train.learning_rate_scale;
+                    let blocks = crate::mambavision::mambavision_param_blocks(params)
+                        .expect("validated MambaVision parameter geometry");
+                    for block in blocks {
+                        sgd_update(
+                            &mut params.values[block.range.clone()],
+                            &mut train.updates[block.range],
+                            layer_lr,
+                            momentum,
+                            if block.decay { decay } else { 0.0 },
+                            batch,
+                        );
+                    }
                 }
                 (LayerParams::Rnn(params), LayerTrainBuffers::Rnn(train)) => {
                     update_connected_params(
@@ -7079,6 +7236,8 @@ where
         let mut tucker_attention_caches: Vec<
             Option<crate::tucker_attention::TuckerAttentionForwardCache>,
         > = Vec::with_capacity(self.network.layers.len());
+        let mut mambavision_caches: Vec<Option<crate::mambavision::MambaVisionForward>> =
+            Vec::with_capacity(self.network.layers.len());
         let mut gpu_batch_norm_caches = Vec::with_capacity(self.network.layers.len());
         let mut yolo_heads = Vec::new();
         let mut modern_heads = Vec::new();
@@ -7104,6 +7263,7 @@ where
             let mut vit_cache = None;
             let mut swin_cache = None;
             let mut tucker_attention_cache = None;
+            let mut mambavision_cache = None;
             let mut moe_cache = None;
             let mut eml_cache = None;
             let mut gpu_rnn_cache = None;
@@ -7742,6 +7902,23 @@ where
                     self.backend
                         .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
                         .map_err(|err| backend_error("upload Tucker attention output", err))?
+                }
+                (LayerKind::MambaVision(spec), LayerParams::MambaVision(weights)) => {
+                    let host_input = self
+                        .download_tensor(current_input, layer.input_shape)
+                        .map_err(|err| backend_error("download MambaVision input", err))?;
+                    let forward = crate::mambavision::mambavision_forward(
+                        &host_input.data,
+                        host_input.shape,
+                        spec,
+                        weights,
+                        None,
+                    )
+                    .map_err(Error::InvalidConfig)?;
+                    mambavision_cache = Some(forward.clone());
+                    self.backend
+                        .upload_f32(&tensor_backend_shape(layer.output_shape), &forward.output)
+                        .map_err(|err| backend_error("upload MambaVision output", err))?
                 }
                 (LayerKind::LayaEncoder(spec), LayerParams::LayaEncoder(weights)) => {
                     let host_input = self
@@ -8662,6 +8839,7 @@ where
             vit_caches.push(vit_cache);
             swin_caches.push(swin_cache);
             tucker_attention_caches.push(tucker_attention_cache);
+            mambavision_caches.push(mambavision_cache);
         }
 
         Ok(GpuForwardState {
@@ -8685,6 +8863,7 @@ where
                 vit_caches,
                 swin_caches,
                 tucker_attention_caches,
+                mambavision_caches,
                 obb_refine_outputs: Vec::new(),
                 yolo_heads,
                 modern_heads,
@@ -11157,7 +11336,8 @@ where
                 LayerKind::LayaActHead(_)
                 | LayerKind::Vit(_)
                 | LayerKind::Swin(_)
-                | LayerKind::TuckerAttention(_) => return true,
+                | LayerKind::TuckerAttention(_)
+                | LayerKind::MambaVision(_) => return true,
                 // Connected layers are handled on the GPU path with a host
                 // round trip unless their activation or batch norm
                 // (batch-statistics training) is unsupported.
@@ -13375,6 +13555,17 @@ fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
             )
             .expect("validated Tucker attention layer geometry"),
         ),
+        LayerKind::MambaVision(spec) => LayerParams::MambaVision(
+            crate::mambavision::MambaVisionParams::zeroed(
+                layer.input_shape.channels,
+                spec.filters,
+                spec.state,
+                spec.conv_size,
+                spec.dt_rank,
+                spec.ffn_ratio,
+            )
+            .expect("validated MambaVision layer geometry"),
+        ),
         LayerKind::Moe(spec) => {
             LayerParams::Moe(default_moe_params(layer.input_shape.channels, spec))
         }
@@ -13585,6 +13776,20 @@ fn default_layer_train_buffers(layer: &crate::model::Layer) -> LayerTrainBuffers
             LayerTrainBuffers::TuckerAttention(TuckerAttentionTrainBuffers {
                 bias_updates: vec![0.0; params.biases.len()],
                 weight_updates: vec![0.0; params.weights.len()],
+            })
+        }
+        LayerKind::MambaVision(spec) => {
+            let params = crate::mambavision::MambaVisionParams::zeroed(
+                layer.input_shape.channels,
+                spec.filters,
+                spec.state,
+                spec.conv_size,
+                spec.dt_rank,
+                spec.ffn_ratio,
+            )
+            .expect("validated MambaVision layer geometry");
+            LayerTrainBuffers::MambaVision(MambaVisionTrainBuffers {
+                updates: vec![0.0; params.parameter_count()],
             })
         }
         LayerKind::Swin(spec) => {
@@ -14645,6 +14850,30 @@ fn apply_host_adam_swin(
     Ok(())
 }
 
+fn apply_host_adam_mambavision(
+    params: &mut crate::mambavision::MambaVisionParams,
+    train: &mut MambaVisionTrainBuffers,
+    state: &mut HostAdamLayerState,
+    adam: &AdamParams,
+) -> Result<()> {
+    let blocks =
+        crate::mambavision::mambavision_param_blocks(params).map_err(Error::InvalidConfig)?;
+    for (slot, block) in blocks.into_iter().enumerate() {
+        let block_adam = AdamParams {
+            decay: if block.decay { adam.decay } else { 0.0 },
+            ..*adam
+        };
+        let child = host_adam_child(state, slot);
+        apply_host_adam(
+            &mut params.values[block.range.clone()],
+            &mut train.updates[block.range],
+            &mut child.weights,
+            &block_adam,
+        )?;
+    }
+    Ok(())
+}
+
 fn apply_host_adam_layer(
     kind: &LayerKind,
     params: &mut LayerParams,
@@ -14759,6 +14988,9 @@ fn apply_host_adam_layer(
                 &mut state.biases,
                 adam,
             )?;
+        }
+        (LayerParams::MambaVision(params), LayerTrainBuffers::MambaVision(train)) => {
+            apply_host_adam_mambavision(params, train, state, adam)?;
         }
         (LayerParams::Moe(params), LayerTrainBuffers::Moe(train)) => {
             if params.experts.len() != train.experts.len() {
@@ -15447,6 +15679,32 @@ fn load_weights_into_params(
                     spec.rank_k,
                     spec.rank_v,
                     spec.rank_o,
+                )
+                .map_err(Error::Weights)?;
+            }
+            LayerParams::MambaVision(weights) => {
+                let LayerKind::MambaVision(spec) = &layer.kind else {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} MambaVision weights do not match layer kind",
+                        layer.index
+                    )));
+                };
+                let count = layer
+                    .weights()
+                    .ok_or_else(|| {
+                        Error::Weights("MambaVision layer has no weight metadata".into())
+                    })?
+                    .parameter_count();
+                let mut blob = vec![0.0; count];
+                read_f32_into(&mut file, &mut blob)?;
+                *weights = crate::mambavision::MambaVisionParams::from_blob(
+                    &blob,
+                    layer.input_shape.channels,
+                    spec.filters,
+                    spec.state,
+                    spec.conv_size,
+                    spec.dt_rank,
+                    spec.ffn_ratio,
                 )
                 .map_err(Error::Weights)?;
             }
@@ -22210,6 +22468,155 @@ mod tests {
         };
         assert_ne!(before.weights, after.weights);
         assert_ne!(before.biases, after.biases);
+    }
+
+    #[test]
+    fn mambavision_runtime_and_fake_backend_host_fallback_match() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "mambavision-runtime.cfg",
+                "[net]\nwidth=2\nheight=1\nchannels=2\nbatch=1\n\
+                 [mambavision]\nstate=1\nconv_size=1\ndt_rank=1\nffn_ratio=1\nactivation=tanh\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        crate::initialize_training_params(&network, &mut cpu.params, 107);
+        let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+        gpu.params = cpu.params.clone();
+        assert!(gpu.requires_cpu_backward_fallback());
+
+        let input =
+            Tensor::from_data(TensorShape::new(2, 1, 2, 1), vec![0.21, -0.31, 0.47, 0.16]).unwrap();
+        let cpu_forward = cpu.forward_training(&input).unwrap();
+        assert!(cpu_forward.mambavision_caches[0].is_some());
+        let incoming_state = crate::MambaVisionState { values: vec![0.19] };
+        let state_list = [Some(incoming_state.clone())];
+        let stateful = cpu
+            .forward_with_mambavision_states(&input, &state_list)
+            .unwrap();
+        assert_eq!(
+            stateful.mambavision_caches[0]
+                .as_ref()
+                .unwrap()
+                .state_out
+                .values
+                .len(),
+            1
+        );
+        let gpu_forward = gpu.forward_training_with_state(&input).unwrap();
+        assert_eq!(
+            gpu_forward.cpu_forward.final_output(),
+            cpu_forward.final_output()
+        );
+        let seed = Tensor::filled(cpu_forward.final_output().unwrap().shape, 0.25);
+        let seeds = [Some(seed)];
+        let backward = cpu
+            .backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .unwrap();
+        assert!(backward.mambavision_state_gradients[0].is_some());
+        let LayerParams::MambaVision(gradient) = &backward.param_gradients[0] else {
+            panic!("MambaVision gradients")
+        };
+        assert!(gradient.values.iter().any(|value| *value != 0.0));
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .unwrap();
+        assert_eq!(
+            cpu.train_buffers,
+            gpu.cpu_fallback_train_buffers.borrow().clone()
+        );
+
+        cpu.update_weights(0.01, 0.2, 0.1, 1);
+        gpu.update_weights_gpu(0.01, 0.2, 0.1, 1).unwrap();
+        assert_eq!(gpu.params, cpu.params);
+    }
+
+    #[test]
+    fn mambavision_sgd_decay_applies_only_to_source_weight_blocks() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "mambavision-sgd.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=2\n\
+                 [mambavision]\nfilters=4\nstate=1\nconv_size=1\ndt_rank=1\nffn_ratio=1\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::MambaVision(params) = &mut executable.params[0] else {
+            panic!("MambaVision params")
+        };
+        params.values.fill(1.0);
+        let LayerTrainBuffers::MambaVision(train) = &mut executable.train_buffers[0] else {
+            panic!("MambaVision train buffers")
+        };
+        train.updates.fill(0.0);
+        executable.update_weights(0.1, 0.0, 0.2, 1);
+        let LayerParams::MambaVision(params) = &executable.params[0] else {
+            panic!("MambaVision params")
+        };
+        let blocks = crate::mambavision::mambavision_param_blocks(params).unwrap();
+        for block in blocks {
+            let expected = if block.decay { 0.98 } else { 1.0 };
+            assert!(
+                params.values[block.range.clone()]
+                    .iter()
+                    .all(|value| (*value - expected).abs() < 1.0e-6),
+                "unexpected decay behavior for {}",
+                block.name
+            );
+        }
+    }
+
+    #[test]
+    fn mambavision_host_adam_updates_match_fake_backend() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "mambavision-adam.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=2\nadam=1\ndecay=0.1\n\
+                 [mambavision]\nstate=1\nconv_size=1\ndt_rank=1\nffn_ratio=1\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        if let LayerParams::MambaVision(params) = &mut cpu.params[0] {
+            params.values.fill(0.25);
+        } else {
+            panic!("MambaVision params")
+        }
+        if let LayerTrainBuffers::MambaVision(train) = &mut cpu.train_buffers[0] {
+            train.updates.fill(-0.5);
+        } else {
+            panic!("MambaVision train buffers")
+        }
+        let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+        gpu.params = cpu.params.clone();
+        *gpu.cpu_fallback_train_buffers.borrow_mut() = cpu.train_buffers.clone();
+        cpu.update_weights_adam(0.01, 1).unwrap();
+        gpu.update_weights_gpu(0.01, 0.0, 0.1, 1).unwrap();
+        assert_eq!(gpu.params, cpu.params);
+        assert_eq!(
+            gpu.cpu_fallback_train_buffers.borrow().clone(),
+            cpu.train_buffers
+        );
+        let path = std::env::temp_dir().join(format!(
+            "darknet-mambavision-adam-{}.state",
+            std::process::id()
+        ));
+        cpu.save_optimizer_state(&path).unwrap();
+        let mut restored = ExecutableNetwork::new(network);
+        restored.load_optimizer_state(&path).unwrap();
+        assert_eq!(restored.adam_step(), cpu.adam_step());
+        let round_trip = path.with_extension("round-trip.state");
+        restored.save_optimizer_state(&round_trip).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            std::fs::read(&round_trip).unwrap()
+        );
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(round_trip);
     }
 
     #[test]
