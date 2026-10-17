@@ -412,23 +412,29 @@ fn carpn_truth_vertices(label: &ObbLabel) -> [f32; 8] {
     ]
 }
 
-/// Rank normalized legacy front-point OBB detections and report classwise AP.
-/// Five-field labels have no orientation, so their ground-truth rectangle is
-/// treated as axis-aligned. CARPN polygons are rejected; use
-/// [`carpn_detector_map`] for four-vertex detections.
+/// Rank normalized OBB detections and report classwise AP. Front-point geometry
+/// uses OBB IoU; CARPN quads use polygon IoU. Mixed geometry is rejected. With
+/// no detections, the representation cannot be inferred and the legacy route is
+/// retained; use [`carpn_detector_map`] when explicit CARPN mode is required.
 pub fn obb_detector_map(
     samples: &[(Vec<ObbLabel>, Vec<ObbDetection>)],
     classes: usize,
     iou_threshold: f32,
 ) -> Result<MapReport> {
-    if samples
-        .iter()
-        .flat_map(|sample| &sample.1)
-        .any(|detection| matches!(detection.geometry, ObbDetectionGeometry::CarpnQuad(_)))
-    {
+    let (mut has_front_point, mut has_carpn) = (false, false);
+    for detection in samples.iter().flat_map(|sample| &sample.1) {
+        match detection.geometry {
+            ObbDetectionGeometry::FrontPoint { .. } => has_front_point = true,
+            ObbDetectionGeometry::CarpnQuad(_) => has_carpn = true,
+        }
+    }
+    if has_front_point && has_carpn {
         return Err(invalid(
-            "CARPN polygon mAP is not implemented for OBB YOLO labels",
+            "OBB mAP cannot mix CARPN and front-point detections",
         ));
+    }
+    if has_carpn {
+        return carpn_detector_map(samples, classes, iou_threshold);
     }
 
     detector_map_by(
@@ -790,7 +796,7 @@ mod tests {
     }
 
     #[test]
-    fn obb_map_rejects_carpn_and_invalid_classes_or_thresholds() {
+    fn obb_map_rejects_carpn_without_front_and_invalid_classes_or_thresholds() {
         let mut carpn = obb_prediction(0, 0.9, [0.5, 0.55]);
         carpn.geometry = ObbDetectionGeometry::CarpnQuad([0.0; 8]);
         assert!(obb_detector_map(&[(vec![obb_truth(0, None)], vec![carpn])], 1, 0.5).is_err());
@@ -850,6 +856,105 @@ mod tests {
         assert_eq!(report.false_negatives, vec![0]);
         assert_eq!(report.detection_counts, vec![2]);
         assert!((report.average_iou[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn obb_map_dispatches_carpn_samples_to_polygon_map() {
+        let label = obb_truth(0, Some([0.5, 0.55]));
+        let vertices = carpn_truth_vertices(&label);
+        let rotated_label = obb_truth(0, Some([0.55, 0.55]));
+        let rotated_vertices = carpn_truth_vertices(&rotated_label);
+        let min_x = rotated_vertices
+            .chunks_exact(2)
+            .map(|point| point[0])
+            .fold(f32::INFINITY, f32::min);
+        let max_x = rotated_vertices
+            .chunks_exact(2)
+            .map(|point| point[0])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_y = rotated_vertices
+            .chunks_exact(2)
+            .map(|point| point[1])
+            .fold(f32::INFINITY, f32::min);
+        let max_y = rotated_vertices
+            .chunks_exact(2)
+            .map(|point| point[1])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let rotated_aabb = [min_x, min_y, max_x, min_y, max_x, max_y, min_x, max_y];
+        assert!(carpn_polygon_iou(rotated_aabb, rotated_vertices) < 0.5);
+        let samples = vec![
+            (
+                vec![label],
+                vec![
+                    carpn_prediction(0, 0.9, vertices),
+                    carpn_prediction(0, 0.8, vertices),
+                ],
+            ),
+            (
+                vec![rotated_label],
+                vec![carpn_prediction(0, 0.7, rotated_aabb)],
+            ),
+        ];
+        let direct = carpn_detector_map(&samples, 1, 0.5).expect("direct CARPN mAP");
+        let dispatched = obb_detector_map(&samples, 1, 0.5).expect("dispatched CARPN mAP");
+
+        assert_eq!(dispatched.average_precision, direct.average_precision);
+        assert_eq!(dispatched.ground_truth_counts, direct.ground_truth_counts);
+        assert_eq!(dispatched.detection_counts, direct.detection_counts);
+        assert_eq!(dispatched.mean_average_precision, direct.mean_average_precision);
+        assert_eq!(dispatched.true_positives, direct.true_positives);
+        assert_eq!(dispatched.false_positives, direct.false_positives);
+        assert_eq!(dispatched.false_negatives, direct.false_negatives);
+        assert_eq!(dispatched.average_iou, direct.average_iou);
+        assert_eq!(dispatched.true_positives, vec![1]);
+        assert_eq!(dispatched.false_positives, vec![2]);
+        assert_eq!(dispatched.false_negatives, vec![1]);
+    }
+
+    #[test]
+    fn obb_map_rejects_mixed_front_point_and_carpn_geometry() {
+        let label = obb_truth(0, Some([0.5, 0.55]));
+        let vertices = carpn_truth_vertices(&label);
+        let carpn = carpn_prediction(0, 0.9, vertices);
+        let front_point = obb_prediction(0, 0.8, [0.5, 0.55]);
+
+        let mixed_within_image = obb_detector_map(
+            &[(vec![label], vec![carpn.clone(), front_point.clone()])],
+            1,
+            0.5,
+        )
+        .expect_err("mixed geometry in one image must fail");
+        assert!(mixed_within_image.to_string().contains("cannot mix"));
+
+        let mixed_across_images = obb_detector_map(
+            &[
+                (vec![obb_truth(0, Some([0.5, 0.55]))], vec![carpn]),
+                (
+                    vec![obb_truth(0, Some([0.5, 0.55]))],
+                    vec![front_point],
+                ),
+            ],
+            1,
+            0.5,
+        )
+        .expect_err("mixed geometry across images must fail");
+        assert!(mixed_across_images.to_string().contains("cannot mix"));
+    }
+
+    #[test]
+    fn obb_map_empty_detections_keep_legacy_mode_but_carpn_entry_is_explicit() {
+        let with_front = obb_truth(0, Some([0.5, 0.55]));
+        let legacy = obb_detector_map(&[(vec![with_front], vec![])], 1, 0.5)
+            .expect("empty predictions use legacy mode");
+        let explicit_carpn = carpn_detector_map(&[(vec![with_front], vec![])], 1, 0.5)
+            .expect("empty predictions can explicitly use CARPN mode");
+        assert_eq!(legacy.false_negatives, vec![1]);
+        assert_eq!(legacy.average_precision, explicit_carpn.average_precision);
+        assert!(carpn_detector_map(&[(vec![obb_truth(0, None)], vec![])], 1, 0.5).is_err());
+
+        let legacy_without_front = obb_detector_map(&[(vec![obb_truth(0, None)], vec![])], 1, 0.5)
+            .expect("legacy empty predictions retain five-field label behavior");
+        assert_eq!(legacy_without_front.false_negatives, vec![1]);
     }
 
     #[test]
