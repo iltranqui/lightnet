@@ -136,9 +136,250 @@ fn clip_probability_code(value: f32) -> u8 {
     }
 }
 
+const V_SMOOTH_TILE_SIZE: usize = 64;
+const E4M3_MAX_FINITE_CODE: u8 = 0x7e;
+
+#[derive(Clone, Debug)]
+pub(crate) struct VsmoothCache {
+    tokens: usize,
+    channels: usize,
+    permutation: Vec<usize>,
+    means: Vec<f32>,
+    residual_codes: Vec<u8>,
+    normalized_residuals: Vec<f32>,
+    scale_max_positions: Vec<usize>,
+    scale_max_signs: Vec<f32>,
+    scale_ties: Vec<bool>,
+    zero_scales: Vec<bool>,
+}
+
+/// Apply source-style V-Smooth to one batch-head tensor. The permutation maps
+/// each new position to its original token; `None` uses sequence order.
+pub(crate) fn vsmooth_forward(
+    values: &[f32],
+    tokens: usize,
+    channels: usize,
+    permutation: Option<&[usize]>,
+) -> Result<(Vec<f32>, VsmoothCache), String> {
+    if tokens == 0 || channels == 0 {
+        return Err("VC V-Smooth requires positive token and channel counts".into());
+    }
+    let expected = tokens
+        .checked_mul(channels)
+        .ok_or("VC V-Smooth tensor size overflow")?;
+    if values.len() != expected {
+        return Err(format!(
+            "VC V-Smooth input has {} values, expected {expected}",
+            values.len()
+        ));
+    }
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err("VC V-Smooth input must contain only finite values".into());
+    }
+    let permutation = match permutation {
+        Some(permutation) => {
+            if permutation.len() != tokens {
+                return Err(format!(
+                    "VC V-Smooth permutation has {} entries, expected {tokens}",
+                    permutation.len()
+                ));
+            }
+            let mut seen = vec![false; tokens];
+            for &token in permutation {
+                if token >= tokens || seen[token] {
+                    return Err("VC V-Smooth permutation is not a token bijection".into());
+                }
+                seen[token] = true;
+            }
+            permutation.to_vec()
+        }
+        None => (0..tokens).collect(),
+    };
+
+    let tile_count = tokens.div_ceil(V_SMOOTH_TILE_SIZE);
+    let mut means = vec![0.0; tile_count * channels];
+    for tile in 0..tile_count {
+        let begin = tile * V_SMOOTH_TILE_SIZE;
+        let end = (begin + V_SMOOTH_TILE_SIZE).min(tokens);
+        let rows = (end - begin) as f32;
+        for channel in 0..channels {
+            let mut sum = 0.0;
+            for position in begin..end {
+                sum += values[permutation[position] * channels + channel];
+            }
+            means[tile * channels + channel] = sum / rows;
+        }
+    }
+
+    let mut scales = vec![1.0; channels];
+    let mut scale_max_positions = vec![0; channels];
+    let mut scale_max_signs = vec![0.0; channels];
+    let mut scale_ties = vec![false; channels];
+    let mut zero_scales = vec![false; channels];
+    for channel in 0..channels {
+        let mut maximum = 0.0f32;
+        let mut maximum_position = 0;
+        let mut maxima = 0usize;
+        for position in 0..tokens {
+            let tile = position / V_SMOOTH_TILE_SIZE;
+            let value = values[permutation[position] * channels + channel];
+            let residual = value - means[tile * channels + channel];
+            let magnitude = residual.abs();
+            if magnitude > maximum {
+                maximum = magnitude;
+                maximum_position = position;
+                maxima = 1;
+            } else if magnitude == maximum {
+                maxima += 1;
+            }
+        }
+        if maximum == 0.0 {
+            zero_scales[channel] = true;
+        } else {
+            scales[channel] = maximum / 448.0;
+            scale_max_positions[channel] = maximum_position;
+            let tile = maximum_position / V_SMOOTH_TILE_SIZE;
+            let value = values[permutation[maximum_position] * channels + channel];
+            scale_max_signs[channel] = (value - means[tile * channels + channel]).signum();
+            scale_ties[channel] = maxima > 1;
+        }
+    }
+
+    let mut residual_codes = vec![0; expected];
+    let mut normalized_residuals = vec![0.0; expected];
+    let mut output = vec![0.0; expected];
+    for position in 0..tokens {
+        let tile = position / V_SMOOTH_TILE_SIZE;
+        for channel in 0..channels {
+            let value = values[permutation[position] * channels + channel];
+            let residual = value - means[tile * channels + channel];
+            let normalized = residual / scales[channel];
+            let index = position * channels + channel;
+            let code = e4m3_encode_bits(normalized);
+            residual_codes[index] = code;
+            normalized_residuals[index] = normalized;
+            output[index] = means[tile * channels + channel] + scales[channel] * e4m3_to_f32(code);
+        }
+    }
+
+    Ok((
+        output,
+        VsmoothCache {
+            tokens,
+            channels,
+            permutation,
+            means,
+            residual_codes,
+            normalized_residuals,
+            scale_max_positions,
+            scale_max_signs,
+            scale_ties,
+            zero_scales,
+        },
+    ))
+}
+
+/// Exact piecewise derivative of V-Smooth at points where its E4M3 codes and
+/// unique nonzero residual-scale maxima are locally stable. Returns an error
+/// where the classical derivative is undefined.
+pub(crate) fn vsmooth_backward(
+    output_grad: &[f32],
+    cache: &VsmoothCache,
+) -> Result<Vec<f32>, String> {
+    let expected = cache
+        .tokens
+        .checked_mul(cache.channels)
+        .ok_or("VC V-Smooth gradient size overflow")?;
+    if output_grad.len() != expected {
+        return Err(format!(
+            "VC V-Smooth output gradient has {} values, expected {expected}",
+            output_grad.len()
+        ));
+    }
+    for channel in 0..cache.channels {
+        if cache.zero_scales[channel] {
+            return Err(format!(
+                "VC V-Smooth scale derivative is undefined for zero-residual channel {channel}"
+            ));
+        }
+        if cache.scale_ties[channel] {
+            return Err(format!(
+                "VC V-Smooth scale derivative is undefined for tied maxima in channel {channel}"
+            ));
+        }
+    }
+    if cache
+        .normalized_residuals
+        .iter()
+        .copied()
+        .any(e4m3_quantization_boundary)
+    {
+        return Err("VC V-Smooth derivative is undefined at an E4M3 rounding boundary".into());
+    }
+
+    let tile_count = cache.means.len() / cache.channels;
+    let mut input_grad = vec![0.0; expected];
+    for channel in 0..cache.channels {
+        let mut scale_grad = 0.0;
+        for position in 0..cache.tokens {
+            let index = position * cache.channels + channel;
+            scale_grad += output_grad[index] * e4m3_to_f32(cache.residual_codes[index]);
+        }
+
+        for tile in 0..tile_count {
+            let begin = tile * V_SMOOTH_TILE_SIZE;
+            let end = (begin + V_SMOOTH_TILE_SIZE).min(cache.tokens);
+            let mut mean_grad = 0.0;
+            for position in begin..end {
+                mean_grad += output_grad[position * cache.channels + channel];
+            }
+            let contribution = mean_grad / (end - begin) as f32;
+            for position in begin..end {
+                let original_token = cache.permutation[position];
+                input_grad[original_token * cache.channels + channel] += contribution;
+            }
+        }
+
+        let maximum_position = cache.scale_max_positions[channel];
+        let maximum_tile = maximum_position / V_SMOOTH_TILE_SIZE;
+        let tile_begin = maximum_tile * V_SMOOTH_TILE_SIZE;
+        let tile_end = (tile_begin + V_SMOOTH_TILE_SIZE).min(cache.tokens);
+        let mean_derivative = 1.0 / (tile_end - tile_begin) as f32;
+        let scale_derivative = cache.scale_max_signs[channel] / 448.0;
+        for position in 0..cache.tokens {
+            let direct = if position == maximum_position {
+                1.0
+            } else {
+                0.0
+            };
+            let centered_mean = if position >= tile_begin && position < tile_end {
+                mean_derivative
+            } else {
+                0.0
+            };
+            let original_token = cache.permutation[position];
+            input_grad[original_token * cache.channels + channel] +=
+                scale_grad * scale_derivative * (direct - centered_mean);
+        }
+    }
+    Ok(input_grad)
+}
+
+fn e4m3_quantization_boundary(value: f32) -> bool {
+    let magnitude = value.abs();
+    let code = e4m3_encode_bits(magnitude).min(E4M3_MAX_FINITE_CODE);
+    let lower_boundary = code > 0 && magnitude == (e4m3_to_f32(code - 1) + e4m3_to_f32(code)) * 0.5;
+    let upper_boundary = code < E4M3_MAX_FINITE_CODE
+        && magnitude == (e4m3_to_f32(code) + e4m3_to_f32(code + 1)) * 0.5;
+    lower_boundary || upper_boundary
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ExpCastMode, e4m3_encode_bits, e4m3_to_f32, expcast_probability_code};
+    use super::{
+        ExpCastMode, e4m3_encode_bits, e4m3_quantization_boundary, e4m3_to_f32,
+        expcast_probability_code, vsmooth_backward, vsmooth_forward,
+    };
 
     #[test]
     fn e4m3_decoded_codes_roundtrip_except_reserved_nan_codes() {
@@ -201,5 +442,97 @@ mod tests {
         assert!(ExpCastMode::try_from(3).is_err());
         assert!(expcast_probability_code(f32::NAN, ExpCastMode::Order0).is_err());
         assert!(expcast_probability_code(f32::INFINITY, ExpCastMode::E4M3).is_err());
+    }
+
+    #[test]
+    fn e4m3_boundary_detector_finds_rounding_midpoints() {
+        let boundary = 2.0_f32.powi(-10);
+        assert!(e4m3_quantization_boundary(boundary));
+        assert!(!e4m3_quantization_boundary(f32::from_bits(
+            boundary.to_bits() + 1
+        )));
+        assert!(e4m3_quantization_boundary(432.0));
+        assert!(!e4m3_quantization_boundary(448.0));
+    }
+
+    #[test]
+    fn vsmooth_backward_matches_finite_differences_away_from_quantization_edges() {
+        let tokens = 70;
+        let channels = 2;
+        let values: Vec<f32> = (0..tokens)
+            .flat_map(|token| {
+                let t = token as f32;
+                [
+                    (t * 0.173).sin() * 0.73 + t * 0.011,
+                    (t * 0.119).cos() * 0.41 - t * 0.007,
+                ]
+            })
+            .collect();
+        let permutation: Vec<usize> = (0..tokens)
+            .map(|position| (position + 23) % tokens)
+            .collect();
+        let (output, cache) =
+            vsmooth_forward(&values, tokens, channels, Some(&permutation)).unwrap();
+        let output_grad: Vec<f32> = (0..output.len())
+            .map(|index| (index as f32 * 0.37).cos())
+            .collect();
+        let analytic = vsmooth_backward(&output_grad, &cache).unwrap();
+        let objective = |input: &[f32]| {
+            let (output, _) = vsmooth_forward(input, tokens, channels, Some(&permutation)).unwrap();
+            output
+                .iter()
+                .zip(&output_grad)
+                .map(|(value, grad)| value * grad)
+                .sum::<f32>()
+        };
+        let epsilon = 1.0e-5;
+        let mut checked = 0;
+        for index in 0..values.len() {
+            let mut plus = values.clone();
+            let mut minus = values.clone();
+            plus[index] += epsilon;
+            minus[index] -= epsilon;
+            let (_, plus_cache) =
+                vsmooth_forward(&plus, tokens, channels, Some(&permutation)).unwrap();
+            let (_, minus_cache) =
+                vsmooth_forward(&minus, tokens, channels, Some(&permutation)).unwrap();
+            if plus_cache.residual_codes != cache.residual_codes
+                || minus_cache.residual_codes != cache.residual_codes
+                || plus_cache.scale_max_positions != cache.scale_max_positions
+                || minus_cache.scale_max_positions != cache.scale_max_positions
+            {
+                continue;
+            }
+            let numeric = (objective(&plus) - objective(&minus)) / (2.0 * epsilon);
+            let error = (analytic[index] - numeric).abs();
+            assert!(
+                error <= 0.015 + 0.025 * numeric.abs(),
+                "gradient {index}: analytic {}, numeric {numeric}, error {error}",
+                analytic[index]
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 80,
+            "only {checked} stable coordinates were checked"
+        );
+    }
+
+    #[test]
+    fn vsmooth_backward_rejects_undefined_scale_derivatives() {
+        let grad = vec![1.0; 64];
+        let tied: Vec<f32> = (0..64)
+            .map(|position| match position {
+                0 => 1.0,
+                1 => -1.0,
+                _ => 0.0,
+            })
+            .collect();
+        let (_, tied_cache) = vsmooth_forward(&tied, 64, 1, None).unwrap();
+        assert!(vsmooth_backward(&grad, &tied_cache).is_err());
+
+        let constant = vec![2.0; 64];
+        let (_, constant_cache) = vsmooth_forward(&constant, 64, 1, None).unwrap();
+        assert!(vsmooth_backward(&grad, &constant_cache).is_err());
     }
 }
