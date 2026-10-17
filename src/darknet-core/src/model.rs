@@ -584,6 +584,17 @@ pub struct VitSpec {
     pub vc_perm: VitVcPermutation,
 }
 
+/// `[swin]`/`[transformer]`: source-shaped windowed attention block.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwinSpec {
+    pub filters: usize,
+    pub size: usize,
+    pub heads: usize,
+    pub shift: bool,
+    pub ffn_ratio: usize,
+    pub activation: Activation,
+}
+
 /// `[yolox]`: the anchor-free detection head (Phase 2A of `tasks/rust/layers.md`),
 /// ported from `Jev_laya:src-lib/darknet_cfg.cpp::parse_yolox_section`.  The
 /// layer has no weights and no kernels; see
@@ -1210,6 +1221,8 @@ pub enum LayerKind {
     LayaHead(LayaHeadSpec),
     /// `[vit]`: global vision transformer with learned patch projection.
     Vit(VitSpec),
+    /// `[swin]`, `[swin_block]`, `[transformer]`, `[transformer_block]`.
+    Swin(SwinSpec),
     /// `[moe_convolutional]`: a learned mixture of `MoeSpec::experts`
     /// convolutional experts gated per image by a small router.
     Moe(MoeSpec),
@@ -1268,6 +1281,7 @@ impl LayerKind {
             Self::LayaEncoder(_) => "laya_encoder",
             Self::LayaHead(_) => "laya_head",
             Self::Vit(_) => "vit",
+            Self::Swin(_) => "swin",
             Self::Moe(_) => "moe_convolutional",
             Self::EmlConvolutional(_) => "eml_convolutional",
             Self::Rnn(_) => "rnn",
@@ -1295,6 +1309,7 @@ impl LayerKind {
             Self::Rnn(spec) => Some(&spec.activation),
             Self::Crnn(spec) => Some(&spec.activation),
             Self::Vit(spec) => Some(&spec.activation),
+            Self::Swin(spec) => Some(&spec.activation),
             _ => None,
         }
     }
@@ -1628,6 +1643,49 @@ impl Layer {
                         spec.batch_normalize,
                     );
                 }
+                Some(LayerWeights { entries })
+            }
+            LayerKind::Swin(spec) => {
+                let input_channels = self.input_shape.channels;
+                let output_channels = self.output_shape.channels;
+                let hidden = output_channels * spec.ffn_ratio;
+                let bias_table_len = (2 * spec.size - 1) * (2 * spec.size - 1);
+                let mut entries = Vec::with_capacity(16);
+                for (name, len) in [
+                    ("swin_qkv_weights", 3 * input_channels * input_channels),
+                    ("swin_qkv_bias", 3 * input_channels),
+                    ("swin_wo", output_channels * input_channels),
+                    ("swin_wo_bias", output_channels),
+                    ("swin_ln1_gamma", input_channels),
+                    ("swin_ln1_beta", input_channels),
+                    ("swin_ln2_gamma", output_channels),
+                    ("swin_ln2_beta", output_channels),
+                    ("swin_ffn_w1", hidden * output_channels),
+                    ("swin_ffn_b1", hidden),
+                    ("swin_ffn_w2", output_channels * hidden),
+                    ("swin_ffn_b2", output_channels),
+                ] {
+                    entries.push(WeightsEntry {
+                        array: WeightsArray::Named(name.to_owned()),
+                        len,
+                    });
+                }
+                if input_channels != output_channels {
+                    entries.push(WeightsEntry {
+                        array: WeightsArray::Named("swin_res_proj".to_owned()),
+                        len: output_channels * input_channels,
+                    });
+                }
+                entries.extend([
+                    WeightsEntry {
+                        array: WeightsArray::Named("swin_rel_pos_bias".to_owned()),
+                        len: spec.heads * bias_table_len,
+                    },
+                    WeightsEntry {
+                        array: WeightsArray::Named("swin_mhc_scales".to_owned()),
+                        len: 12,
+                    },
+                ]);
                 Some(LayerWeights { entries })
             }
             LayerKind::Vit(spec) => {
@@ -2759,6 +2817,9 @@ fn parse_layer_kind(
                 ModernYoloKind::Yolonas => LayerKind::Yolonas(spec),
             }
         }
+        "swin" | "swin_block" | "transformer" | "transformer_block" => {
+            LayerKind::Swin(parse_swin_spec(&section, current)?)
+        }
         "vit" => {
             let line = section.line;
             let has_filters = section.get("filters").is_some();
@@ -3488,6 +3549,19 @@ fn infer_output_shape(
                 current.batch,
             ))
         }
+        LayerKind::Swin(spec) => {
+            if current.width == 0 || current.height == 0 || current.channels == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[swin] layer #{layer_index} requires non-empty image-shaped input"
+                )));
+            }
+            Ok(TensorShape::new(
+                current.width,
+                current.height,
+                spec.filters,
+                current.batch,
+            ))
+        }
         LayerKind::Vit(spec) => {
             let line = layer_index;
             let twice_pad = spec.patch_pad.checked_mul(2).ok_or_else(|| {
@@ -4105,6 +4179,209 @@ pub const VIT_DIM_DEFAULT: usize = 128;
 pub const VIT_HEADS_DEFAULT: usize = 4;
 pub const LAYA_LAYERNORM_EPS: f32 = 1.0e-5;
 
+fn reject_unknown_swin_keys(section: &RawSection) -> Result<()> {
+    const ALLOWED: &[&str] = &[
+        "filters",
+        "size",
+        "heads",
+        "shift",
+        "ffn_ratio",
+        "activation",
+        "stream",
+        "wait_stream",
+        "learning_rate",
+        "dont_update",
+        "burnin_update",
+        "train_only_bn",
+        "clip",
+        "grad_centr",
+    ];
+    if let Some(key) = section
+        .values
+        .keys()
+        .find(|key| !ALLOWED.contains(&key.as_str()))
+    {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {}: unknown option `{key}`",
+            section.name, section.line
+        )));
+    }
+    Ok(())
+}
+
+fn parse_swin_spec(section: &RawSection, input: TensorShape) -> Result<SwinSpec> {
+    let line = section.line;
+    reject_unknown_swin_keys(section)?;
+    if input.width == 0 || input.height == 0 || input.channels == 0 {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: preceding layer must output a non-empty image",
+            section.name
+        )));
+    }
+    let filters = section.get_usize("filters", 128)?;
+    let size = section.get_usize("size", 7)?;
+    let heads = section.get_usize("heads", 4)?;
+    let shift = section.get_i64("shift", 0)?;
+    let ffn_ratio = section.get_usize("ffn_ratio", 4)?;
+    if filters == 0 || size == 0 || heads == 0 || ffn_ratio == 0 {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: filters, size, heads, and ffn_ratio must be > 0",
+            section.name
+        )));
+    }
+    if input.channels % heads != 0 {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: input channels={} must be divisible by heads={heads}",
+            section.name, input.channels
+        )));
+    }
+    let shift = match shift {
+        0 => false,
+        1 => true,
+        value => {
+            return Err(Error::InvalidConfig(format!(
+                "[{}] at line {line}: shift must be 0 or 1, got {value}",
+                section.name
+            )));
+        }
+    };
+    for key in ["stream", "wait_stream"] {
+        let stream = section.get_i64(key, -1)?;
+        if stream != -1 {
+            return Err(Error::InvalidConfig(format!(
+                "[{}] at line {line}: {key}={stream} is unsupported by the Rust runtime",
+                section.name
+            )));
+        }
+    }
+    let (padded_height, padded_width) = crate::swin::padded_shape(input.height, input.width, size)
+        .map_err(|error| {
+            Error::InvalidConfig(format!("[{}] at line {line}: {error}", section.name))
+        })?;
+    let hidden = filters.checked_mul(ffn_ratio).ok_or_else(|| {
+        Error::InvalidConfig(format!(
+            "[{}] at line {line}: filters * ffn_ratio overflows",
+            section.name
+        ))
+    })?;
+    let table_width = size
+        .checked_mul(2)
+        .and_then(|value| value.checked_sub(1))
+        .ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "[{}] at line {line}: relative-bias width overflows",
+                section.name
+            ))
+        })?;
+    let table_len = table_width.checked_mul(table_width).ok_or_else(|| {
+        Error::InvalidConfig(format!(
+            "[{}] at line {line}: relative-bias table overflows",
+            section.name
+        ))
+    })?;
+    let tokens = size.checked_mul(size).ok_or_else(|| {
+        Error::InvalidConfig(format!(
+            "[{}] at line {line}: window token count overflows",
+            section.name
+        ))
+    })?;
+    let _ = tokens.checked_mul(tokens).ok_or_else(|| {
+        Error::InvalidConfig(format!(
+            "[{}] at line {line}: attention matrix size overflows",
+            section.name
+        ))
+    })?;
+    let windows = [input.batch, padded_height / size, padded_width / size]
+        .into_iter()
+        .try_fold(1usize, |product, factor| {
+            product.checked_mul(factor).ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "[{}] at line {line}: padded window count overflows",
+                    section.name
+                ))
+            })
+        })?;
+    let mut total_parameters = 0usize;
+    for (what, factors) in [
+        ("QKV weights", vec![3, input.channels, input.channels]),
+        ("QKV bias", vec![3, input.channels]),
+        ("output projection", vec![filters, input.channels]),
+        ("output bias", vec![filters]),
+        ("LayerNorm 1 parameters", vec![2, input.channels]),
+        ("LayerNorm 2 parameters", vec![2, filters]),
+        ("FFN weights", vec![hidden, filters]),
+        ("FFN hidden bias", vec![hidden]),
+        ("FFN output bias", vec![filters]),
+        (
+            "residual projection",
+            if input.channels == filters {
+                vec![0]
+            } else {
+                vec![filters, input.channels]
+            },
+        ),
+        ("relative-position bias", vec![heads, table_len]),
+        ("mHC parameters", vec![12]),
+    ] {
+        let block_size = factors.into_iter().try_fold(1usize, |product, factor| {
+            product.checked_mul(factor).ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "[{}] at line {line}: {what} size overflows",
+                    section.name
+                ))
+            })
+        })?;
+        total_parameters = total_parameters.checked_add(block_size).ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "[{}] at line {line}: total parameter count overflows",
+                section.name
+            ))
+        })?;
+    }
+    for (what, factors) in [
+        ("windowed input", vec![windows, tokens, input.channels]),
+        ("windowed output", vec![windows, tokens, filters]),
+        ("attention scores", vec![windows, heads, tokens, tokens]),
+        ("FFN workspace", vec![windows, tokens, hidden]),
+    ] {
+        factors.into_iter().try_fold(1usize, |product, factor| {
+            product.checked_mul(factor).ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "[{}] at line {line}: {what} size overflows",
+                    section.name
+                ))
+            })
+        })?;
+    }
+    debug_assert!(total_parameters > 0);
+    let activation = Activation::parse(&section.get_str("activation", "gelu"));
+    if let Activation::Other(ref other) = activation {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: unsupported activation={other}",
+            section.name
+        )));
+    }
+    if matches!(
+        activation,
+        Activation::NormalizeChannels
+            | Activation::NormalizeChannelsSoftmax
+            | Activation::NormalizeChannelsSoftmaxMaxval
+    ) {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: channel-normalizing activations are unsupported",
+            section.name
+        )));
+    }
+    Ok(SwinSpec {
+        filters,
+        size,
+        heads,
+        shift,
+        ffn_ratio,
+        activation,
+    })
+}
+
 /// C++ `parse_yolox_section`: `classes`(20), `max`(200), `jitter`(0.2) and
 /// `resize`(1.0).  The PP-YOLOE / YOLO-NAS siblings share the first two keys and
 /// add `reg_max`(16); they are not ported yet.
@@ -4159,6 +4436,141 @@ mod tests {
 
     fn build(text: &str) -> crate::error::Result<Network> {
         Network::from_config(ConfigFile::parse_str("t.cfg", text)?)
+    }
+
+    #[test]
+    fn swin_aliases_parse_defaults_and_preserve_spatial_shape() {
+        for alias in ["swin", "swin_block", "transformer", "transformer_block"] {
+            let network = build(&format!(
+                "[net]\nwidth=5\nheight=3\nchannels=8\n[{alias}]\n"
+            ))
+            .unwrap();
+            let layer = &network.layers[0];
+            let LayerKind::Swin(spec) = &layer.kind else {
+                panic!("expected Swin for [{alias}]")
+            };
+            assert_eq!(
+                (
+                    spec.filters,
+                    spec.size,
+                    spec.heads,
+                    spec.shift,
+                    spec.ffn_ratio
+                ),
+                (128, 7, 4, false, 4)
+            );
+            assert_eq!(spec.activation, super::Activation::Gelu);
+            assert_eq!(layer.kind.name(), "swin");
+            assert_eq!(
+                (
+                    layer.output_shape.width,
+                    layer.output_shape.height,
+                    layer.output_shape.channels
+                ),
+                (5, 3, 128)
+            );
+        }
+    }
+
+    #[test]
+    fn swin_config_and_rust_weight_order_are_strict_and_shape_aware() {
+        let network = build(
+            "[net]\nwidth=5\nheight=3\nchannels=4\n\
+             [swin]\nfilters=6\nsize=2\nheads=2\nshift=1\nffn_ratio=3\nactivation=relu\n",
+        )
+        .unwrap();
+        let layer = &network.layers[0];
+        let LayerKind::Swin(spec) = &layer.kind else {
+            panic!("expected Swin")
+        };
+        assert_eq!(
+            (
+                spec.filters,
+                spec.size,
+                spec.heads,
+                spec.shift,
+                spec.ffn_ratio
+            ),
+            (6, 2, 2, true, 3)
+        );
+        assert_eq!(spec.activation, super::Activation::Relu);
+        let weights = layer.weights().expect("Swin has trainable parameters");
+        let names: Vec<&str> = weights
+            .entries
+            .iter()
+            .map(|entry| entry.array.name())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "swin_qkv_weights",
+                "swin_qkv_bias",
+                "swin_wo",
+                "swin_wo_bias",
+                "swin_ln1_gamma",
+                "swin_ln1_beta",
+                "swin_ln2_gamma",
+                "swin_ln2_beta",
+                "swin_ffn_w1",
+                "swin_ffn_b1",
+                "swin_ffn_w2",
+                "swin_ffn_b2",
+                "swin_res_proj",
+                "swin_rel_pos_bias",
+                "swin_mhc_scales",
+            ]
+        );
+        assert_eq!(
+            weights
+                .entries
+                .iter()
+                .map(|entry| entry.len)
+                .collect::<Vec<_>>(),
+            [48, 12, 24, 6, 4, 4, 6, 6, 108, 18, 108, 6, 24, 18, 12]
+        );
+
+        let equal_channels = build(
+            "[net]\nwidth=4\nheight=4\nchannels=4\n\
+             [transformer]\nfilters=4\nheads=2\nsize=2\n",
+        )
+        .unwrap();
+        let equal_weights = equal_channels.layers[0].weights().unwrap();
+        assert!(
+            !equal_weights
+                .entries
+                .iter()
+                .any(|entry| entry.array.name() == "swin_res_proj")
+        );
+
+        for (options, expected) in [
+            (
+                "filters=0",
+                "filters, size, heads, and ffn_ratio must be > 0",
+            ),
+            ("size=0", "filters, size, heads, and ffn_ratio must be > 0"),
+            ("heads=0", "filters, size, heads, and ffn_ratio must be > 0"),
+            (
+                "ffn_ratio=0",
+                "filters, size, heads, and ffn_ratio must be > 0",
+            ),
+            ("shift=2", "shift must be 0 or 1"),
+            ("shift=-1", "shift must be 0 or 1"),
+            ("heads=3", "input channels=4 must be divisible by heads=3"),
+            ("activation=unknown", "unsupported activation=unknown"),
+            (
+                "activation=normalize_channels",
+                "channel-normalizing activations are unsupported",
+            ),
+            ("mystery=1", "unknown option `mystery`"),
+            ("stream=0", "stream=0 is unsupported"),
+        ] {
+            let error = build(&format!(
+                "[net]\nwidth=4\nheight=3\nchannels=4\n[swin]\n{options}\n"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{options}: {error}");
+        }
     }
 
     #[test]

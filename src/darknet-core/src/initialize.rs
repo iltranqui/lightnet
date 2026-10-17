@@ -37,6 +37,33 @@ pub fn initialize_training_params(network: &Network, params: &mut [LayerParams],
             // from the shared blob, not from random init.
             LayerParams::LayaEncoder(_) => {}
             LayerParams::LayaHead(_) => {}
+            LayerParams::Swin(p) => {
+                let input = layer.input_shape.channels;
+                let output = layer.output_shape.channels;
+                let hidden = match &layer.kind {
+                    crate::LayerKind::Swin(spec) => output * spec.ffn_ratio,
+                    _ => unreachable!("Swin parameters require a Swin layer"),
+                };
+                let xavier_qkv = (6.0 / (input + 3 * input) as f32).sqrt();
+                rng.weights_with_scale(&mut p.qkv_weight, xavier_qkv);
+                let xavier_projection = (6.0 / (input + output) as f32).sqrt();
+                rng.weights_with_scale(&mut p.wo, xavier_projection);
+                rng.weights_with_scale(&mut p.ffn_w1, (6.0 / output as f32).sqrt());
+                rng.weights_with_scale(&mut p.ffn_w2, (6.0 / hidden as f32).sqrt());
+                if let Some(res_proj) = &mut p.res_proj {
+                    rng.weights_with_scale(res_proj, xavier_projection);
+                }
+                rng.weights_with_scale(&mut p.relative_position_bias, 0.02);
+                p.qkv_bias.fill(0.0);
+                p.wo_bias.fill(0.0);
+                p.ln1_gamma.fill(1.0);
+                p.ln1_beta.fill(0.0);
+                p.ln2_gamma.fill(1.0);
+                p.ln2_beta.fill(0.0);
+                p.ffn_b1.fill(0.0);
+                p.ffn_b2.fill(0.0);
+                p.mhc.copy_from_slice(&crate::swin::SWIN_MHC_DEFAULTS);
+            }
             LayerParams::Vit(p) => {
                 let patch_fan = layer.input_shape.channels
                     * match &layer.kind {
@@ -226,6 +253,41 @@ mod tests {
             assert!(p.weights.iter().all(|w| w.abs() <= bound));
             assert_eq!(p.batch_norm.as_ref().unwrap().scales, vec![1.0; 3]);
         }
+    }
+
+    #[test]
+    fn swin_training_initialization_is_seeded_and_uses_audited_parameter_bounds() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "swin-init.cfg",
+                "[net]\nwidth=4\nheight=3\nchannels=4\n\
+                 [swin]\nfilters=6\nsize=2\nheads=2\nffn_ratio=3\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut first = crate::ExecutableNetwork::new(network.clone());
+        let mut second = crate::ExecutableNetwork::new(network.clone());
+        initialize_training_params(&network, &mut first.params, 29);
+        initialize_training_params(&network, &mut second.params, 29);
+        assert_eq!(first.params, second.params);
+        let LayerParams::Swin(weights) = &first.params[0] else {
+            panic!("Swin params")
+        };
+        let within = |values: &[f32], bound: f32| values.iter().all(|value| value.abs() <= bound);
+        assert!(within(&weights.qkv_weight, (6.0f32 / 16.0).sqrt()));
+        assert!(within(&weights.wo, (6.0f32 / 10.0).sqrt()));
+        assert!(within(&weights.ffn_w1, (6.0f32 / 6.0).sqrt()));
+        assert!(within(&weights.ffn_w2, (6.0f32 / 18.0).sqrt()));
+        assert!(within(
+            weights.res_proj.as_ref().unwrap(),
+            (6.0f32 / 10.0).sqrt()
+        ));
+        assert!(within(&weights.relative_position_bias, 0.02));
+        assert!(weights.qkv_bias.iter().all(|value| *value == 0.0));
+        assert!(weights.ln1_gamma.iter().all(|value| *value == 1.0));
+        assert!(weights.ln2_gamma.iter().all(|value| *value == 1.0));
+        assert_eq!(weights.mhc, crate::swin::SWIN_MHC_DEFAULTS);
     }
 
     #[test]

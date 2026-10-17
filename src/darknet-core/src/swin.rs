@@ -5,6 +5,8 @@
 //! verified independently. The source-derived CPU contract is in
 //! `tasks/rust/swin_plan.md`.
 
+use std::sync::Arc;
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WindowAttentionCache {
     tokens: usize,
@@ -19,7 +21,7 @@ pub(crate) struct WindowAttentionCache {
     k_active: Vec<bool>,
     probabilities: Vec<f32>,
     score_active: Vec<bool>,
-    relative_position_indices: Vec<usize>,
+    relative_position_indices: Arc<[usize]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -28,6 +30,349 @@ pub(crate) struct WindowAttentionGradients {
     pub qkv: Vec<f32>,
     /// Accumulated gradients in `[heads,(2*window-1)^2]` order.
     pub relative_position_bias: Vec<f32>,
+}
+
+pub const SWIN_MHC_DEFAULTS: [f32; 12] = [
+    4.0, -4.0, -4.0, 4.0, 0.0, -8.0, 4.0, -4.0, -4.0, 4.0, 0.0, -8.0,
+];
+
+/// Rust-owned Swin parameters. `to_blob` defines this Rust-only serialized
+/// order because the audited C++ branch has no Swin weights writer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwinWeights {
+    pub qkv_weight: Vec<f32>,
+    pub qkv_bias: Vec<f32>,
+    pub wo: Vec<f32>,
+    pub wo_bias: Vec<f32>,
+    pub ln1_gamma: Vec<f32>,
+    pub ln1_beta: Vec<f32>,
+    pub ln2_gamma: Vec<f32>,
+    pub ln2_beta: Vec<f32>,
+    pub ffn_w1: Vec<f32>,
+    pub ffn_b1: Vec<f32>,
+    pub ffn_w2: Vec<f32>,
+    pub ffn_b2: Vec<f32>,
+    pub res_proj: Option<Vec<f32>>,
+    pub relative_position_bias: Vec<f32>,
+    pub mhc: Vec<f32>,
+    input_channels: usize,
+    output_channels: usize,
+    heads: usize,
+    window: usize,
+    ffn_ratio: usize,
+}
+
+fn swin_weight_sizes(
+    input_channels: usize,
+    output_channels: usize,
+    heads: usize,
+    window: usize,
+    ffn_ratio: usize,
+) -> Result<Vec<usize>, String> {
+    if input_channels == 0
+        || output_channels == 0
+        || heads == 0
+        || window == 0
+        || ffn_ratio == 0
+        || input_channels % heads != 0
+    {
+        return Err("Swin weight geometry requires positive dimensions and input channels divisible by heads".into());
+    }
+    let hidden = output_channels
+        .checked_mul(ffn_ratio)
+        .ok_or("Swin FFN hidden size overflow")?;
+    let table_width = window
+        .checked_mul(2)
+        .and_then(|value| value.checked_sub(1))
+        .ok_or("Swin relative-position table width overflow")?;
+    let table_len = checked_product(&[table_width, table_width], "relative-position table")?;
+    let mut sizes = vec![
+        checked_product(&[3, input_channels, input_channels], "QKV weights")?,
+        checked_product(&[3, input_channels], "QKV bias")?,
+        checked_product(&[output_channels, input_channels], "output projection")?,
+        output_channels,
+        input_channels,
+        input_channels,
+        output_channels,
+        output_channels,
+        checked_product(&[hidden, output_channels], "FFN input weights")?,
+        hidden,
+        checked_product(&[output_channels, hidden], "FFN output weights")?,
+        output_channels,
+    ];
+    if input_channels != output_channels {
+        sizes.push(checked_product(
+            &[output_channels, input_channels],
+            "residual projection",
+        )?);
+    }
+    sizes.push(checked_product(
+        &[heads, table_len],
+        "relative-position bias",
+    )?);
+    sizes.push(SWIN_MHC_DEFAULTS.len());
+    sizes
+        .iter()
+        .try_fold(0usize, |sum, &size| sum.checked_add(size))
+        .ok_or_else(|| String::from("Swin total weight count overflow"))?;
+    Ok(sizes)
+}
+
+impl SwinWeights {
+    pub(crate) fn matches_geometry(
+        &self,
+        input_channels: usize,
+        output_channels: usize,
+        heads: usize,
+        window: usize,
+        ffn_ratio: usize,
+    ) -> bool {
+        self.input_channels == input_channels
+            && self.output_channels == output_channels
+            && self.heads == heads
+            && self.window == window
+            && self.ffn_ratio == ffn_ratio
+    }
+
+    pub fn parameter_count(&self) -> usize {
+        self.qkv_weight.len()
+            + self.qkv_bias.len()
+            + self.wo.len()
+            + self.wo_bias.len()
+            + self.ln1_gamma.len()
+            + self.ln1_beta.len()
+            + self.ln2_gamma.len()
+            + self.ln2_beta.len()
+            + self.ffn_w1.len()
+            + self.ffn_b1.len()
+            + self.ffn_w2.len()
+            + self.ffn_b2.len()
+            + self.res_proj.as_ref().map_or(0, Vec::len)
+            + self.relative_position_bias.len()
+            + self.mhc.len()
+    }
+
+    /// Shape-correct zero defaults with unit LayerNorm gamma and identity-like mHC.
+    pub fn zeroed(
+        input_channels: usize,
+        output_channels: usize,
+        heads: usize,
+        window: usize,
+        ffn_ratio: usize,
+    ) -> Result<Self, String> {
+        let sizes = swin_weight_sizes(input_channels, output_channels, heads, window, ffn_ratio)?;
+        let take = |len: usize| vec![0.0; len];
+        let qkv_weight = take(sizes[0]);
+        let qkv_bias = take(sizes[1]);
+        let wo = take(sizes[2]);
+        let wo_bias = take(sizes[3]);
+        let mut ln1_gamma = take(sizes[4]);
+        ln1_gamma.fill(1.0);
+        let ln1_beta = take(sizes[5]);
+        let mut ln2_gamma = take(sizes[6]);
+        ln2_gamma.fill(1.0);
+        let ln2_beta = take(sizes[7]);
+        let ffn_w1 = take(sizes[8]);
+        let ffn_b1 = take(sizes[9]);
+        let ffn_w2 = take(sizes[10]);
+        let ffn_b2 = take(sizes[11]);
+        let res_proj = (input_channels != output_channels).then(|| take(sizes[12]));
+        let bias_index = if input_channels != output_channels {
+            13
+        } else {
+            12
+        };
+        let relative_position_bias = take(sizes[bias_index]);
+        let mhc = SWIN_MHC_DEFAULTS.to_vec();
+        Ok(Self {
+            qkv_weight,
+            qkv_bias,
+            wo,
+            wo_bias,
+            ln1_gamma,
+            ln1_beta,
+            ln2_gamma,
+            ln2_beta,
+            ffn_w1,
+            ffn_b1,
+            ffn_w2,
+            ffn_b2,
+            res_proj,
+            relative_position_bias,
+            mhc,
+            input_channels,
+            output_channels,
+            heads,
+            window,
+            ffn_ratio,
+        })
+    }
+
+    pub fn zeroed_gradients(
+        input_channels: usize,
+        output_channels: usize,
+        heads: usize,
+        window: usize,
+        ffn_ratio: usize,
+    ) -> Result<Self, String> {
+        let mut gradients =
+            Self::zeroed(input_channels, output_channels, heads, window, ffn_ratio)?;
+        for values in [
+            &mut gradients.qkv_weight,
+            &mut gradients.qkv_bias,
+            &mut gradients.wo,
+            &mut gradients.wo_bias,
+            &mut gradients.ln1_gamma,
+            &mut gradients.ln1_beta,
+            &mut gradients.ln2_gamma,
+            &mut gradients.ln2_beta,
+            &mut gradients.ffn_w1,
+            &mut gradients.ffn_b1,
+            &mut gradients.ffn_w2,
+            &mut gradients.ffn_b2,
+            &mut gradients.relative_position_bias,
+            &mut gradients.mhc,
+        ] {
+            values.fill(0.0);
+        }
+        if let Some(res_proj) = &mut gradients.res_proj {
+            res_proj.fill(0.0);
+        }
+        Ok(gradients)
+    }
+
+    /// Serialize in the Rust-defined block order recorded by `Layer::weights()`.
+    pub fn to_blob(&self) -> Result<Vec<f32>, String> {
+        let sizes = swin_weight_sizes(
+            self.input_channels,
+            self.output_channels,
+            self.heads,
+            self.window,
+            self.ffn_ratio,
+        )?;
+        let mut actual = vec![
+            self.qkv_weight.len(),
+            self.qkv_bias.len(),
+            self.wo.len(),
+            self.wo_bias.len(),
+            self.ln1_gamma.len(),
+            self.ln1_beta.len(),
+            self.ln2_gamma.len(),
+            self.ln2_beta.len(),
+            self.ffn_w1.len(),
+            self.ffn_b1.len(),
+            self.ffn_w2.len(),
+            self.ffn_b2.len(),
+        ];
+        if let Some(res_proj) = &self.res_proj {
+            actual.push(res_proj.len());
+        }
+        actual.push(self.relative_position_bias.len());
+        actual.push(self.mhc.len());
+        if actual != sizes {
+            return Err(format!(
+                "Swin parameter arrays have lengths {actual:?}, expected {sizes:?}"
+            ));
+        }
+        let mut blob = Vec::new();
+        for values in [
+            &self.qkv_weight,
+            &self.qkv_bias,
+            &self.wo,
+            &self.wo_bias,
+            &self.ln1_gamma,
+            &self.ln1_beta,
+            &self.ln2_gamma,
+            &self.ln2_beta,
+            &self.ffn_w1,
+            &self.ffn_b1,
+            &self.ffn_w2,
+            &self.ffn_b2,
+        ] {
+            blob.extend_from_slice(values);
+        }
+        if let Some(res_proj) = &self.res_proj {
+            blob.extend_from_slice(res_proj);
+        }
+        blob.extend_from_slice(&self.relative_position_bias);
+        blob.extend_from_slice(&self.mhc);
+        Ok(blob)
+    }
+
+    /// Parse the Rust-defined Swin blob. Old Darknet header versions do not
+    /// describe Swin and are never interpreted as a legacy layout.
+    pub fn from_blob(
+        blob: &[f32],
+        input_channels: usize,
+        output_channels: usize,
+        heads: usize,
+        window: usize,
+        ffn_ratio: usize,
+    ) -> Result<Self, String> {
+        let sizes = swin_weight_sizes(input_channels, output_channels, heads, window, ffn_ratio)?;
+        let expected = sizes.iter().try_fold(0usize, |sum, &size| {
+            sum.checked_add(size)
+                .ok_or("Swin total weight count overflow")
+        })?;
+        if blob.len() != expected {
+            return Err(format!(
+                "Swin blob has {} floats, expected {expected}",
+                blob.len()
+            ));
+        }
+        let mut at = 0;
+        let mut take = |len: usize| {
+            let values = blob[at..at + len].to_vec();
+            at += len;
+            values
+        };
+        let qkv_weight = take(sizes[0]);
+        let qkv_bias = take(sizes[1]);
+        let wo = take(sizes[2]);
+        let wo_bias = take(sizes[3]);
+        let ln1_gamma = take(sizes[4]);
+        let ln1_beta = take(sizes[5]);
+        let ln2_gamma = take(sizes[6]);
+        let ln2_beta = take(sizes[7]);
+        let ffn_w1 = take(sizes[8]);
+        let ffn_b1 = take(sizes[9]);
+        let ffn_w2 = take(sizes[10]);
+        let ffn_b2 = take(sizes[11]);
+        let res_proj = if input_channels != output_channels {
+            Some(take(sizes[12]))
+        } else {
+            None
+        };
+        let bias_index = if input_channels != output_channels {
+            13
+        } else {
+            12
+        };
+        let relative_position_bias = take(sizes[bias_index]);
+        let mhc = take(sizes[bias_index + 1]);
+        Ok(Self {
+            qkv_weight,
+            qkv_bias,
+            wo,
+            wo_bias,
+            ln1_gamma,
+            ln1_beta,
+            ln2_gamma,
+            ln2_beta,
+            ffn_w1,
+            ffn_b1,
+            ffn_w2,
+            ffn_b2,
+            res_proj,
+            relative_position_bias,
+            mhc,
+            input_channels,
+            output_channels,
+            heads,
+            window,
+            ffn_ratio,
+        })
+    }
 }
 
 fn checked_product(values: &[usize], what: &str) -> Result<usize, String> {
@@ -531,6 +876,7 @@ fn source_softmax_row(values: &mut [f32]) {
 
 /// One-window, multi-head attention using the source C++ score clamps, relative
 /// bias, additive mask, and stabilized row softmax. `qkv` is `[T,3C]`.
+#[cfg(test)]
 pub(crate) fn window_attention_forward(
     qkv: &[f32],
     window: usize,
@@ -538,6 +884,27 @@ pub(crate) fn window_attention_forward(
     heads: usize,
     relative_position_bias: &[f32],
     mask: &[f32],
+) -> Result<(Vec<f32>, WindowAttentionCache), String> {
+    let relative_position_indices: Arc<[usize]> = relative_position_indices(window)?.into();
+    window_attention_forward_with_indices(
+        qkv,
+        window,
+        channels,
+        heads,
+        relative_position_bias,
+        mask,
+        relative_position_indices,
+    )
+}
+
+pub(crate) fn window_attention_forward_with_indices(
+    qkv: &[f32],
+    window: usize,
+    channels: usize,
+    heads: usize,
+    relative_position_bias: &[f32],
+    mask: &[f32],
+    relative_position_indices: Arc<[usize]>,
 ) -> Result<(Vec<f32>, WindowAttentionCache), String> {
     if window == 0 || channels == 0 || heads == 0 || channels % heads != 0 {
         return Err(
@@ -571,7 +938,12 @@ pub(crate) fn window_attention_forward(
             relative_position_bias.len()
         ));
     }
-    let relative_position_indices = relative_position_indices(window)?;
+    if relative_position_indices.len() != matrix_len {
+        return Err(format!(
+            "Swin relative-position indices have {} values, expected {matrix_len}",
+            relative_position_indices.len()
+        ));
+    }
     let head_dim = channels / heads;
     let head_elements = checked_product(&[tokens, channels], "attention head")?;
     let all_head_elements = checked_product(&[heads, head_elements], "attention heads")?;
@@ -747,11 +1119,43 @@ pub(crate) fn window_attention_backward(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_attention_mask, crop_nchw, cyclic_shift_nchw, mhc_residual_backward,
+        SwinWeights, build_attention_mask, crop_nchw, cyclic_shift_nchw, mhc_residual_backward,
         mhc_residual_forward, pad_nchw, padded_shape, relative_position_indices,
         window_attention_backward, window_attention_forward, window_partition_nchw,
         window_unpartition_nchw,
     };
+
+    #[test]
+    fn swin_rust_weight_blob_round_trips_with_and_without_residual_projection() {
+        for (input_channels, output_channels) in [(4, 6), (4, 4)] {
+            let weights = SwinWeights::zeroed(input_channels, output_channels, 2, 2, 3).unwrap();
+            let blob: Vec<f32> = (0..weights.parameter_count())
+                .map(|index| index as f32 * 0.01 - 0.2)
+                .collect();
+            let weights =
+                SwinWeights::from_blob(&blob, input_channels, output_channels, 2, 2, 3).unwrap();
+            assert_eq!(weights.to_blob().unwrap(), blob);
+            assert_eq!(weights.parameter_count(), blob.len());
+            assert_eq!(weights.ln1_gamma.len(), input_channels);
+            assert_eq!(weights.ln2_gamma.len(), output_channels);
+            assert_eq!(
+                weights.res_proj.is_some(),
+                input_channels != output_channels
+            );
+            assert_eq!(weights.mhc.len(), crate::swin::SWIN_MHC_DEFAULTS.len());
+            assert!(
+                SwinWeights::from_blob(
+                    &blob[..blob.len() - 1],
+                    input_channels,
+                    output_channels,
+                    2,
+                    2,
+                    3,
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn padding_partition_and_unpartition_preserve_nchw_order() {
@@ -962,6 +1366,34 @@ mod tests {
         assert!(parameter_gradient[..4].iter().all(|&value| value == 0.0));
         assert_eq!(parameter_gradient[4], 0.0);
         assert!(parameter_gradient[5].is_finite());
+    }
+
+    #[test]
+    fn attention_qk_and_score_clamp_boundaries_have_zero_derivatives() {
+        let mut qkv = vec![
+            256.0, 1.0, 0.1, 0.2, 0.5, 0.8, -0.4, -0.3, 1.3, 0.1, 0.2, -0.7,
+        ];
+        let bias = vec![0.0; 9];
+        let mask = vec![0.0; 16];
+        let (_, score_clamped_cache) =
+            window_attention_forward(&qkv, 2, 1, 1, &bias, &mask).unwrap();
+        assert!(!score_clamped_cache.q_active[0]);
+        assert!(!score_clamped_cache.score_active[0]);
+        let context_gradient = [0.4, -0.7, 0.2, 0.3];
+        let score_clamped_gradient =
+            window_attention_backward(&context_gradient, &score_clamped_cache).unwrap();
+        assert_eq!(score_clamped_gradient.qkv[0], 0.0);
+
+        qkv[1] = 0.01;
+        qkv[4] = 0.02;
+        qkv[7] = -0.01;
+        qkv[10] = 0.015;
+        let (_, qk_clamped_cache) = window_attention_forward(&qkv, 2, 1, 1, &bias, &mask).unwrap();
+        assert!(!qk_clamped_cache.q_active[0]);
+        assert!(qk_clamped_cache.score_active[0]);
+        let qk_clamped_gradient =
+            window_attention_backward(&context_gradient, &qk_clamped_cache).unwrap();
+        assert_eq!(qk_clamped_gradient.qkv[0], 0.0);
     }
 
     #[test]

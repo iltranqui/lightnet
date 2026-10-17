@@ -97,11 +97,11 @@ pub(crate) mod omd_loss;
 pub mod runtime;
 pub(crate) mod segmentation;
 pub(crate) mod shortcut_weights;
+pub(crate) mod swin;
+pub(crate) mod swin_block;
 pub mod train;
 #[allow(dead_code)] // VC reference helpers are integrated incrementally.
 pub(crate) mod vc_attention;
-#[allow(dead_code)] // Swin host-reference helpers are integrated incrementally.
-pub(crate) mod swin;
 pub(crate) mod vit;
 pub mod weights;
 
@@ -116,8 +116,8 @@ pub use error::{Error, Result};
 pub use image::PlanarRgbImage;
 pub use model::{
     Activation, CrnnSpec, Layer, LayerKind, LayerWeights, LrPolicy, LstmSpec, NetConfig, Network,
-    ObbRefineLoss, ObbRefineSpec, RnnSpec, ShortcutWeightsNorm, ShortcutWeightsType, TensorShape,
-    WeightsArray, YoloIouLoss,
+    ObbRefineLoss, ObbRefineSpec, RnnSpec, ShortcutWeightsNorm, ShortcutWeightsType, SwinSpec,
+    TensorShape, WeightsArray, YoloIouLoss,
 };
 pub use names::load_names_file;
 pub use runtime::{
@@ -127,6 +127,8 @@ pub use runtime::{
     LstmTrainBuffers, RecurrentForwardCache, RnnParams, RnnTrainBuffers, ShortcutParams,
     ShortcutTrainBuffers, Tensor, YoloHeadOutput, compute_learning_rate,
 };
+pub use swin::SwinWeights;
+pub use swin_block::SwinForwardCache;
 pub use train::{
     DataConfig, ObbTrainingBatch, ObbYoloTrainingDeltaBatch, TrainingBatch, YoloLabel,
     YoloTrainingLoss, YoloTrainingState, compute_obb_yolo_training_deltas,

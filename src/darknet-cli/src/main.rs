@@ -3184,6 +3184,10 @@ fn print_forward_backward_summary(
             darknet_core::LayerTrainBuffers::Vit(vit) => {
                 vit.updates.to_blob().iter().any(|value| *value != 0.0)
             }
+            darknet_core::LayerTrainBuffers::Swin(swin) => swin
+                .updates
+                .to_blob()
+                .is_ok_and(|blob| blob.iter().any(|value| *value != 0.0)),
             darknet_core::LayerTrainBuffers::Gru(_)
             | darknet_core::LayerTrainBuffers::Rnn(_)
             | darknet_core::LayerTrainBuffers::Lstm(_)

@@ -250,6 +250,8 @@ pub enum LayerParams {
     LayaHead(crate::laya_head::LayaHeadWeights),
     /// `[vit]` global transformer parameters in the C++ save order.
     Vit(crate::vit::VitWeights),
+    /// `[swin]` parameters in the Rust-defined Swin blob order.
+    Swin(crate::swin::SwinWeights),
     /// `[moe_convolutional]`: one convolution per expert plus the router's
     /// `[experts, channels]` weights and `[experts]` biases.
     Moe(MoeParams),
@@ -359,6 +361,12 @@ pub struct VitTrainBuffers {
     pub updates: crate::vit::VitWeights,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwinTrainBuffers {
+    /// Accumulated descending update directions in the Rust Swin blob order.
+    pub updates: crate::swin::SwinWeights,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayerTrainBuffers {
@@ -375,6 +383,7 @@ pub enum LayerTrainBuffers {
     Moe(MoeTrainBuffers),
     EmlConvolutional(EmlConvolutionalTrainBuffers),
     Vit(VitTrainBuffers),
+    Swin(SwinTrainBuffers),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -510,6 +519,7 @@ pub struct ForwardResult {
     pub moe_caches: Vec<Option<MoeForwardCache>>,
     pub eml_caches: Vec<Option<EmlForwardCache>>,
     pub vit_caches: Vec<Option<crate::vit::VitForwardCache>>,
+    pub swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>>,
     /// Valid proposal metadata and Stage-2 raw outputs for each `[obb_refine]` layer.
     pub obb_refine_outputs: Vec<crate::carpn::ObbRefineOutput>,
     pub yolo_heads: Vec<YoloHeadOutput>,
@@ -532,6 +542,7 @@ impl ForwardResult {
             moe_caches: Vec::new(),
             eml_caches: Vec::new(),
             vit_caches: Vec::new(),
+            swin_caches: Vec::new(),
             obb_refine_outputs: Vec::new(),
             yolo_heads,
             modern_heads,
@@ -558,6 +569,7 @@ mod forward_result_from_heads_tests {
         assert!(result.moe_caches.is_empty());
         assert!(result.eml_caches.is_empty());
         assert!(result.vit_caches.is_empty());
+        assert!(result.swin_caches.is_empty());
         assert!(result.obb_refine_outputs.is_empty());
         assert!(result.yolo_heads.is_empty());
         assert!(result.modern_heads.is_empty());
@@ -1176,6 +1188,16 @@ impl ExecutableNetwork {
                 // (`update_moe_convolutional_layer` calls `axpy_cpu` with
                 // `-decay * batch` only for the experts' offset/collapse
                 // weights), so decay is passed as 0.0 for them.
+                (LayerParams::Swin(params), LayerTrainBuffers::Swin(train)) => {
+                    update_swin_params(
+                        params,
+                        train,
+                        lr * opts.learning_rate_scale,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                }
                 (LayerParams::Vit(params), LayerTrainBuffers::Vit(train)) => {
                     let learned_pos = matches!(self.network.layers[layer_index].kind, LayerKind::Vit(ref spec) if spec.learned_pos_embed);
                     update_vit_params(
@@ -1545,6 +1567,7 @@ impl ExecutableNetwork {
         let mut moe_caches = Vec::with_capacity(self.network.layers.len());
         let mut eml_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches = Vec::with_capacity(self.network.layers.len());
+        let mut swin_caches = Vec::with_capacity(self.network.layers.len());
         let mut obb_refine_outputs = Vec::new();
         let mut rng_state = 0x9e37_79b9_u64;
 
@@ -1566,6 +1589,7 @@ impl ExecutableNetwork {
             let mut moe_cache = None;
             let mut eml_cache = None;
             let mut vit_cache = None;
+            let mut swin_cache = None;
             let (output, activation_input) = match (&layer.kind, params) {
                 (
                     LayerKind::Convolutional(spec),
@@ -1744,6 +1768,25 @@ impl ExecutableNetwork {
                         crate::vit::vit_forward(&current_input.data, weights, &geometry)
                             .map_err(Error::InvalidConfig)?;
                     vit_cache = Some(cache);
+                    (Tensor::from_data(layer.output_shape, data)?, None)
+                }
+                (LayerKind::Swin(spec), LayerParams::Swin(weights)) => {
+                    let geometry = crate::swin_block::SwinGeometry {
+                        batch: current_input.shape.batch,
+                        channels: current_input.shape.channels,
+                        height: current_input.shape.height,
+                        width: current_input.shape.width,
+                        filters: spec.filters,
+                        heads: spec.heads,
+                        window: spec.size,
+                        shift: spec.shift,
+                        ffn_ratio: spec.ffn_ratio,
+                        activation: spec.activation.clone(),
+                    };
+                    let (data, cache) =
+                        crate::swin_block::swin_forward(&current_input.data, weights, &geometry)
+                            .map_err(Error::InvalidConfig)?;
+                    swin_cache = Some(cache);
                     (Tensor::from_data(layer.output_shape, data)?, None)
                 }
                 (LayerKind::LayaEncoder(spec), LayerParams::LayaEncoder(weights)) => (
@@ -2064,6 +2107,7 @@ impl ExecutableNetwork {
             moe_caches.push(moe_cache);
             eml_caches.push(eml_cache);
             vit_caches.push(vit_cache);
+            swin_caches.push(swin_cache);
         }
 
         Ok(ForwardResult {
@@ -2075,6 +2119,7 @@ impl ExecutableNetwork {
             moe_caches,
             eml_caches,
             vit_caches,
+            swin_caches,
             obb_refine_outputs,
             yolo_heads,
             modern_heads,
@@ -2178,6 +2223,13 @@ impl ExecutableNetwork {
                 "forward crop cache count mismatch: expected {}, got {}",
                 self.network.layers.len(),
                 forward.crop_caches.len()
+            )));
+        }
+        if forward.swin_caches.len() != self.network.layers.len() {
+            return Err(Error::InvalidConfig(format!(
+                "forward Swin cache count mismatch: expected {}, got {}",
+                self.network.layers.len(),
+                forward.swin_caches.len()
             )));
         }
         if layer_output_gradient_seeds.len() != self.network.layers.len() {
@@ -3061,6 +3113,35 @@ impl ExecutableNetwork {
                         &mut layer_output_gradients,
                     )?;
                 }
+                (LayerKind::Swin(_), LayerParams::Swin(weights)) => {
+                    let cache = forward
+                        .swin_caches
+                        .get(layer.index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing [swin] forward cache for layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let (gradients, input_grad) =
+                        crate::swin_block::swin_backward(&grad.data, weights, cache)
+                            .map_err(Error::InvalidConfig)?;
+                    let Some(LayerParams::Swin(slot)) = param_gradients.get_mut(layer.index) else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing [swin] gradient slot for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    *slot = gradients;
+                    let input_grad = Tensor::from_data(current_input.shape, input_grad)?;
+                    accumulate_previous_gradient(
+                        layer.index,
+                        &input_grad,
+                        &mut input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
+                }
                 (LayerKind::LayaEncoder(_), LayerParams::LayaEncoder(_))
                 | (LayerKind::LayaHead(_), LayerParams::LayaHead(_)) => {
                     // Frozen (`freeze=1`): no gradient flows to the input.
@@ -3600,6 +3681,17 @@ impl ExecutableNetwork {
                     };
                     accumulate_vit_updates(&mut train.updates, gradient)?;
                 }
+                (LayerKind::Swin(_), LayerParams::Swin(gradient)) => {
+                    let Some(LayerTrainBuffers::Swin(train)) =
+                        self.train_buffers.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing Swin train buffers for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    accumulate_swin_updates(&mut train.updates, gradient)?;
+                }
                 (_, LayerParams::None) => {}
                 // `[laya_scorer]` is frozen by default, so it has no train
                 // buffers and contributes no parameter gradient.
@@ -3790,6 +3882,7 @@ fn host_adam_scalar_capacity(params: &LayerParams) -> usize {
         ]
         .into_iter()
         .sum(),
+        LayerParams::Swin(params) => params.parameter_count(),
         LayerParams::Moe(params) => {
             params.router_weights.len()
                 + params.router_biases.len()
@@ -6047,6 +6140,11 @@ where
                         matches!(layer.kind, LayerKind::Vit(ref spec) if spec.learned_pos_embed);
                     apply_host_adam_vit(params, train, moments, adam, learned_pos_embed)?;
                 }
+                (LayerParams::Swin(params), LayerTrainBuffers::Swin(train)) => {
+                    let moments =
+                        moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    apply_host_adam_swin(params, train, moments, adam)?;
+                }
                 (LayerParams::Moe(params), LayerTrainBuffers::Moe(train)) => {
                     if params.experts.len() != train.experts.len() {
                         return Err(Error::InvalidConfig(format!(
@@ -6409,6 +6507,16 @@ where
                         decay,
                         batch,
                         learned_pos,
+                    );
+                }
+                (LayerParams::Swin(params), LayerTrainBuffers::Swin(train)) => {
+                    update_swin_params(
+                        params,
+                        train,
+                        lr * layer.train.learning_rate_scale,
+                        momentum,
+                        decay,
+                        batch,
                     );
                 }
                 (LayerParams::Rnn(params), LayerTrainBuffers::Rnn(train)) => {
@@ -6823,6 +6931,8 @@ where
             Vec::with_capacity(self.network.layers.len());
         let mut vit_caches: Vec<Option<crate::vit::VitForwardCache>> =
             Vec::with_capacity(self.network.layers.len());
+        let mut swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>> =
+            Vec::with_capacity(self.network.layers.len());
         let mut gpu_batch_norm_caches = Vec::with_capacity(self.network.layers.len());
         let mut yolo_heads = Vec::new();
         let mut modern_heads = Vec::new();
@@ -6846,6 +6956,7 @@ where
             let mut crop_cache = None;
             let mut batch_norm_cache = None;
             let mut vit_cache = None;
+            let mut swin_cache = None;
             let mut moe_cache = None;
             let mut eml_cache = None;
             let mut gpu_rnn_cache = None;
@@ -7429,6 +7540,30 @@ where
                     self.backend
                         .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
                         .map_err(|err| backend_error("upload vit output", err))?
+                }
+                (LayerKind::Swin(spec), LayerParams::Swin(weights)) => {
+                    let host_input = self
+                        .download_tensor(current_input, layer.input_shape)
+                        .map_err(|err| backend_error("download swin input", err))?;
+                    let geometry = crate::swin_block::SwinGeometry {
+                        batch: layer.input_shape.batch,
+                        channels: layer.input_shape.channels,
+                        height: layer.input_shape.height,
+                        width: layer.input_shape.width,
+                        filters: spec.filters,
+                        heads: spec.heads,
+                        window: spec.size,
+                        shift: spec.shift,
+                        ffn_ratio: spec.ffn_ratio,
+                        activation: spec.activation.clone(),
+                    };
+                    let (data, cache) =
+                        crate::swin_block::swin_forward(&host_input.data, weights, &geometry)
+                            .map_err(Error::InvalidConfig)?;
+                    swin_cache = Some(cache);
+                    self.backend
+                        .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
+                        .map_err(|err| backend_error("upload swin output", err))?
                 }
                 (LayerKind::LayaEncoder(spec), LayerParams::LayaEncoder(weights)) => {
                     let host_input = self
@@ -8347,6 +8482,7 @@ where
             moe_caches.push(moe_cache);
             eml_caches.push(eml_cache);
             vit_caches.push(vit_cache);
+            swin_caches.push(swin_cache);
         }
 
         Ok(GpuForwardState {
@@ -8368,6 +8504,7 @@ where
                 moe_caches,
                 eml_caches,
                 vit_caches,
+                swin_caches,
                 obb_refine_outputs: Vec::new(),
                 yolo_heads,
                 modern_heads,
@@ -10837,7 +10974,7 @@ where
                 // `[laya_act_head]` and the full ViT backward still use the
                 // host fallback; standard-flash dQ/dK/dV dispatches to Oxide
                 // from that fallback when the head dimension is supported.
-                LayerKind::LayaActHead(_) | LayerKind::Vit(_) => return true,
+                LayerKind::LayaActHead(_) | LayerKind::Vit(_) | LayerKind::Swin(_) => return true,
                 // Connected layers are handled on the GPU path with a host
                 // round trip unless their activation or batch norm
                 // (batch-statistics training) is unsupported.
@@ -13034,6 +13171,16 @@ fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
             )
             .expect("validated ViT layer geometry"),
         ),
+        LayerKind::Swin(spec) => LayerParams::Swin(
+            crate::swin::SwinWeights::zeroed(
+                layer.input_shape.channels,
+                spec.filters,
+                spec.heads,
+                spec.size,
+                spec.ffn_ratio,
+            )
+            .expect("validated Swin layer geometry"),
+        ),
         LayerKind::Moe(spec) => {
             LayerParams::Moe(default_moe_params(layer.input_shape.channels, spec))
         }
@@ -13231,6 +13378,17 @@ fn default_layer_train_buffers(layer: &crate::model::Layer) -> LayerTrainBuffers
         LayerKind::EmlConvolutional(spec) => LayerTrainBuffers::EmlConvolutional(
             default_eml_convolutional_train_buffers(layer.input_shape.channels, spec),
         ),
+        LayerKind::Swin(spec) => {
+            let updates = crate::swin::SwinWeights::zeroed_gradients(
+                layer.input_shape.channels,
+                spec.filters,
+                spec.heads,
+                spec.size,
+                spec.ffn_ratio,
+            )
+            .expect("validated Swin layer geometry");
+            LayerTrainBuffers::Swin(SwinTrainBuffers { updates })
+        }
         LayerKind::Vit(spec) => {
             let mut updates = crate::vit::VitWeights::zeroed(
                 &vit_geometry(layer, spec),
@@ -13500,6 +13658,179 @@ fn accumulate_vit_updates(
     accumulate_negative_vec(&mut dst.ffn_b2, &src.ffn_b2)?;
     accumulate_negative_vec(&mut dst.pos_embed, &src.pos_embed)?;
     accumulate_negative_vec(&mut dst.mhc, &src.mhc)
+}
+
+fn accumulate_swin_updates(
+    dst: &mut crate::swin::SwinWeights,
+    src: &crate::swin::SwinWeights,
+) -> Result<()> {
+    accumulate_negative_vec(&mut dst.qkv_weight, &src.qkv_weight)?;
+    accumulate_negative_vec(&mut dst.qkv_bias, &src.qkv_bias)?;
+    accumulate_negative_vec(&mut dst.wo, &src.wo)?;
+    accumulate_negative_vec(&mut dst.wo_bias, &src.wo_bias)?;
+    accumulate_negative_vec(&mut dst.ln1_gamma, &src.ln1_gamma)?;
+    accumulate_negative_vec(&mut dst.ln1_beta, &src.ln1_beta)?;
+    accumulate_negative_vec(&mut dst.ln2_gamma, &src.ln2_gamma)?;
+    accumulate_negative_vec(&mut dst.ln2_beta, &src.ln2_beta)?;
+    accumulate_negative_vec(&mut dst.ffn_w1, &src.ffn_w1)?;
+    accumulate_negative_vec(&mut dst.ffn_b1, &src.ffn_b1)?;
+    accumulate_negative_vec(&mut dst.ffn_w2, &src.ffn_w2)?;
+    accumulate_negative_vec(&mut dst.ffn_b2, &src.ffn_b2)?;
+    match (&mut dst.res_proj, &src.res_proj) {
+        (Some(dst), Some(src)) => accumulate_negative_vec(dst, src)?,
+        (None, None) => {}
+        _ => {
+            return Err(Error::InvalidConfig(
+                "Swin residual projection gradient mismatch".into(),
+            ));
+        }
+    }
+    accumulate_negative_vec(&mut dst.relative_position_bias, &src.relative_position_bias)?;
+    accumulate_negative_vec(&mut dst.mhc, &src.mhc)
+}
+
+fn scale_swin_updates(updates: &mut crate::swin::SwinWeights, scale: f32) {
+    for values in [
+        &mut updates.qkv_weight,
+        &mut updates.qkv_bias,
+        &mut updates.wo,
+        &mut updates.wo_bias,
+        &mut updates.ln1_gamma,
+        &mut updates.ln1_beta,
+        &mut updates.ln2_gamma,
+        &mut updates.ln2_beta,
+        &mut updates.ffn_w1,
+        &mut updates.ffn_b1,
+        &mut updates.ffn_w2,
+        &mut updates.ffn_b2,
+        &mut updates.relative_position_bias,
+        &mut updates.mhc,
+    ] {
+        for value in values.iter_mut() {
+            *value *= scale;
+        }
+    }
+    if let Some(res_proj) = &mut updates.res_proj {
+        for value in res_proj {
+            *value *= scale;
+        }
+    }
+}
+
+fn sanitize_swin_updates(updates: &mut crate::swin::SwinWeights) {
+    for values in [
+        &mut updates.qkv_weight,
+        &mut updates.qkv_bias,
+        &mut updates.wo,
+        &mut updates.wo_bias,
+        &mut updates.ln1_gamma,
+        &mut updates.ln1_beta,
+        &mut updates.ln2_gamma,
+        &mut updates.ln2_beta,
+        &mut updates.ffn_w1,
+        &mut updates.ffn_b1,
+        &mut updates.ffn_w2,
+        &mut updates.ffn_b2,
+        &mut updates.relative_position_bias,
+        &mut updates.mhc,
+    ] {
+        for value in values.iter_mut() {
+            if !value.is_finite() {
+                *value = 0.0;
+            }
+        }
+    }
+    if let Some(res_proj) = &mut updates.res_proj {
+        for value in res_proj {
+            if !value.is_finite() {
+                *value = 0.0;
+            }
+        }
+    }
+}
+
+fn swin_update_clip_scale(updates: &crate::swin::SwinWeights, max_norm: f64) -> f32 {
+    let mut norm_sq = 0.0f64;
+    let mut arrays: Vec<&[f32]> = vec![
+        &updates.qkv_weight,
+        &updates.qkv_bias,
+        &updates.wo,
+        &updates.wo_bias,
+        &updates.ln1_gamma,
+        &updates.ln1_beta,
+        &updates.ln2_gamma,
+        &updates.ln2_beta,
+        &updates.ffn_w1,
+        &updates.ffn_b1,
+        &updates.ffn_w2,
+        &updates.ffn_b2,
+        &updates.relative_position_bias,
+        &updates.mhc,
+    ];
+    if let Some(res_proj) = &updates.res_proj {
+        arrays.push(res_proj);
+    }
+    for values in arrays {
+        for &value in values {
+            norm_sq += (value as f64) * (value as f64);
+        }
+    }
+    let norm = norm_sq.sqrt();
+    if !norm.is_finite() {
+        0.0
+    } else if norm > max_norm {
+        (max_norm / norm) as f32
+    } else {
+        1.0
+    }
+}
+
+fn update_swin_params(
+    params: &mut crate::swin::SwinWeights,
+    train: &mut SwinTrainBuffers,
+    lr: f32,
+    momentum: f32,
+    decay: f32,
+    batch: usize,
+) {
+    sanitize_swin_updates(&mut train.updates);
+    let clip_scale = swin_update_clip_scale(&train.updates, 5.0);
+    scale_swin_updates(&mut train.updates, clip_scale);
+    for (weights, updates) in [
+        (&mut params.qkv_weight, &mut train.updates.qkv_weight),
+        (&mut params.wo, &mut train.updates.wo),
+        (&mut params.ffn_w1, &mut train.updates.ffn_w1),
+        (&mut params.ffn_w2, &mut train.updates.ffn_w2),
+    ] {
+        sgd_update(weights, updates, lr, momentum, decay, batch);
+    }
+    if let (Some(weights), Some(updates)) = (&mut params.res_proj, &mut train.updates.res_proj) {
+        sgd_update(weights, updates, lr, momentum, decay, batch);
+    }
+    for (weights, updates) in [
+        (&mut params.qkv_bias, &mut train.updates.qkv_bias),
+        (&mut params.wo_bias, &mut train.updates.wo_bias),
+        (&mut params.ln1_gamma, &mut train.updates.ln1_gamma),
+        (&mut params.ln1_beta, &mut train.updates.ln1_beta),
+        (&mut params.ln2_gamma, &mut train.updates.ln2_gamma),
+        (&mut params.ln2_beta, &mut train.updates.ln2_beta),
+        (&mut params.ffn_b1, &mut train.updates.ffn_b1),
+        (&mut params.ffn_b2, &mut train.updates.ffn_b2),
+        (
+            &mut params.relative_position_bias,
+            &mut train.updates.relative_position_bias,
+        ),
+        (&mut params.mhc, &mut train.updates.mhc),
+    ] {
+        sgd_update(weights, updates, lr, momentum, 0.0, batch);
+    }
+    for value in &mut params.mhc {
+        *value = if value.is_finite() {
+            value.clamp(-8.0, 8.0)
+        } else {
+            0.0
+        };
+    }
 }
 
 fn scale_vit_updates(updates: &mut crate::vit::VitWeights, scale: f32) {
@@ -13925,6 +14256,152 @@ fn apply_host_adam_vit(
     Ok(())
 }
 
+fn apply_host_adam_swin_tensor(
+    weights: &mut [f32],
+    updates: &mut [f32],
+    state: &mut HostAdamLayerState,
+    slot: usize,
+    decay: bool,
+    adam: &AdamParams,
+) -> Result<()> {
+    let moments = &mut host_adam_child(state, slot).weights;
+    if decay {
+        apply_host_adam(weights, updates, moments, adam)
+    } else {
+        apply_host_adam_non_weight(weights, updates, moments, adam)
+    }
+}
+
+fn apply_host_adam_swin(
+    params: &mut crate::swin::SwinWeights,
+    train: &mut SwinTrainBuffers,
+    state: &mut HostAdamLayerState,
+    adam: &AdamParams,
+) -> Result<()> {
+    sanitize_swin_updates(&mut train.updates);
+    let clip_scale = swin_update_clip_scale(&train.updates, 5.0);
+    scale_swin_updates(&mut train.updates, clip_scale);
+    apply_host_adam_swin_tensor(
+        &mut params.qkv_weight,
+        &mut train.updates.qkv_weight,
+        state,
+        0,
+        true,
+        adam,
+    )?;
+    apply_host_adam_swin_tensor(
+        &mut params.qkv_bias,
+        &mut train.updates.qkv_bias,
+        state,
+        1,
+        false,
+        adam,
+    )?;
+    apply_host_adam_swin_tensor(&mut params.wo, &mut train.updates.wo, state, 2, true, adam)?;
+    apply_host_adam_swin_tensor(
+        &mut params.wo_bias,
+        &mut train.updates.wo_bias,
+        state,
+        3,
+        false,
+        adam,
+    )?;
+    apply_host_adam_swin_tensor(
+        &mut params.ln1_gamma,
+        &mut train.updates.ln1_gamma,
+        state,
+        4,
+        false,
+        adam,
+    )?;
+    apply_host_adam_swin_tensor(
+        &mut params.ln1_beta,
+        &mut train.updates.ln1_beta,
+        state,
+        5,
+        false,
+        adam,
+    )?;
+    apply_host_adam_swin_tensor(
+        &mut params.ln2_gamma,
+        &mut train.updates.ln2_gamma,
+        state,
+        6,
+        false,
+        adam,
+    )?;
+    apply_host_adam_swin_tensor(
+        &mut params.ln2_beta,
+        &mut train.updates.ln2_beta,
+        state,
+        7,
+        false,
+        adam,
+    )?;
+    apply_host_adam_swin_tensor(
+        &mut params.ffn_w1,
+        &mut train.updates.ffn_w1,
+        state,
+        8,
+        true,
+        adam,
+    )?;
+    apply_host_adam_swin_tensor(
+        &mut params.ffn_b1,
+        &mut train.updates.ffn_b1,
+        state,
+        9,
+        false,
+        adam,
+    )?;
+    apply_host_adam_swin_tensor(
+        &mut params.ffn_w2,
+        &mut train.updates.ffn_w2,
+        state,
+        10,
+        true,
+        adam,
+    )?;
+    apply_host_adam_swin_tensor(
+        &mut params.ffn_b2,
+        &mut train.updates.ffn_b2,
+        state,
+        11,
+        false,
+        adam,
+    )?;
+    let mut slot = 12;
+    if let (Some(weights), Some(updates)) = (&mut params.res_proj, &mut train.updates.res_proj) {
+        apply_host_adam_swin_tensor(weights, updates, state, slot, true, adam)?;
+        slot += 1;
+    }
+    apply_host_adam_swin_tensor(
+        &mut params.relative_position_bias,
+        &mut train.updates.relative_position_bias,
+        state,
+        slot,
+        false,
+        adam,
+    )?;
+    slot += 1;
+    apply_host_adam_swin_tensor(
+        &mut params.mhc,
+        &mut train.updates.mhc,
+        state,
+        slot,
+        false,
+        adam,
+    )?;
+    for value in &mut params.mhc {
+        *value = if value.is_finite() {
+            value.clamp(-8.0, 8.0)
+        } else {
+            0.0
+        };
+    }
+    Ok(())
+}
+
 fn apply_host_adam_layer(
     kind: &LayerKind,
     params: &mut LayerParams,
@@ -14022,6 +14499,9 @@ fn apply_host_adam_layer(
         (LayerParams::Vit(params), LayerTrainBuffers::Vit(train)) => {
             let learned_pos_embed = matches!(kind, LayerKind::Vit(spec) if spec.learned_pos_embed);
             apply_host_adam_vit(params, train, state, adam, learned_pos_embed)?;
+        }
+        (LayerParams::Swin(params), LayerTrainBuffers::Swin(train)) => {
+            apply_host_adam_swin(params, train, state, adam)?;
         }
         (LayerParams::Moe(params), LayerTrainBuffers::Moe(train)) => {
             if params.experts.len() != train.experts.len() {
@@ -14649,6 +15129,41 @@ fn load_weights_into_params(
                     layer.output_shape.height,
                     layer.output_shape.width,
                     has_mhc,
+                )
+                .map_err(Error::Weights)?;
+            }
+            LayerParams::Swin(weights) => {
+                let LayerKind::Swin(spec) = &layer.kind else {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} Swin weights do not match layer kind",
+                        layer.index
+                    )));
+                };
+                let modern_header = (header.major, header.minor, header.revision)
+                    >= (
+                        crate::DARKNET_WEIGHTS_VERSION_MAJOR,
+                        crate::DARKNET_WEIGHTS_VERSION_MINOR,
+                        crate::DARKNET_WEIGHTS_VERSION_PATCH,
+                    );
+                if !modern_header {
+                    return Err(Error::Weights(format!(
+                        "layer #{} ([swin]) requires the Rust-defined modern weights layout",
+                        layer.index
+                    )));
+                }
+                let count = layer
+                    .weights()
+                    .ok_or_else(|| Error::Weights("Swin layer has no weight metadata".into()))?
+                    .parameter_count();
+                let mut blob = vec![0.0; count];
+                read_f32_into(&mut file, &mut blob)?;
+                *weights = crate::swin::SwinWeights::from_blob(
+                    &blob,
+                    layer.input_shape.channels,
+                    spec.filters,
+                    spec.heads,
+                    spec.size,
+                    spec.ffn_ratio,
                 )
                 .map_err(Error::Weights)?;
             }
@@ -21344,6 +21859,246 @@ mod tests {
         assert!((params.patch_bias[0] + 0.05).abs() < 1e-6); // no bias decay
         assert!((params.pos_embed[0] - 0.98).abs() < 1e-6); // learned positions decay
         assert!((params.mhc[0] - (mhc_before - 0.005)).abs() < 1e-6); // 0.1x LR
+    }
+
+    #[test]
+    fn swin_cpu_runtime_backward_accumulates_and_updates_parameters() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "swin-runtime-chain.cfg",
+                "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=1\n\
+             [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
+             [swin]\nfilters=3\nsize=2\nheads=1\nshift=1\nffn_ratio=2\nactivation=gelu\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network.clone());
+        crate::initialize_training_params(&network, &mut executable.params, 91);
+        let LayerParams::Convolutional(conv) = &mut executable.params[0] else {
+            panic!("preceding convolution params")
+        };
+        conv.weights.copy_from_slice(&[0.7, -0.25, 0.2, 0.6]);
+        conv.biases.copy_from_slice(&[0.1, -0.05]);
+        let LayerParams::Swin(swin) = &mut executable.params[1] else {
+            panic!("Swin params")
+        };
+        swin.mhc.copy_from_slice(&[
+            0.3, -0.2, 0.1, 0.4, 0.2, -0.1, -0.3, 0.1, 0.25, 0.2, -0.15, 0.3,
+        ]);
+        let input = Tensor::from_data(
+            TensorShape::new(3, 2, 2, 1),
+            (0..12).map(|index| (index as f32 - 5.0) * 0.07).collect(),
+        )
+        .unwrap();
+        let forward = executable.forward(&input).unwrap();
+        let output = forward.final_output().unwrap();
+        assert_eq!(output.shape, TensorShape::new(3, 2, 3, 1));
+        let seed = Tensor::from_data(
+            output.shape,
+            (0..output.len())
+                .map(|index| (index as f32 * 0.31 + 0.2).sin() * 0.2)
+                .collect(),
+        )
+        .unwrap();
+        let backward = executable.backward(&input, &forward, &seed).unwrap();
+        let LayerParams::Swin(swin_gradient) = &backward.param_gradients[1] else {
+            panic!("Swin parameter gradient")
+        };
+        let parameter_index = 0;
+        let epsilon = 1.0e-3;
+        let objective = |model: &ExecutableNetwork, x: &Tensor| {
+            model
+                .forward(x)
+                .unwrap()
+                .final_output()
+                .unwrap()
+                .data
+                .iter()
+                .zip(&seed.data)
+                .map(|(value, gradient)| value * gradient)
+                .sum::<f32>()
+        };
+        let mut plus = executable.clone();
+        let mut minus = executable.clone();
+        let LayerParams::Swin(weights) = &mut plus.params[1] else {
+            unreachable!()
+        };
+        weights.ffn_w2[parameter_index] += epsilon;
+        let LayerParams::Swin(weights) = &mut minus.params[1] else {
+            unreachable!()
+        };
+        weights.ffn_w2[parameter_index] -= epsilon;
+        let numerical = (objective(&plus, &input) - objective(&minus, &input)) / (2.0 * epsilon);
+        let analytic = swin_gradient.ffn_w2[parameter_index];
+        assert!(
+            (analytic - numerical).abs() < 3.0e-3 + 3.0e-2 * analytic.abs().max(numerical.abs()),
+            "runtime ffn_w2 gradient: analytic={analytic} numeric={numerical}"
+        );
+
+        let before = match &executable.params[1] {
+            LayerParams::Swin(weights) => weights.clone(),
+            _ => unreachable!(),
+        };
+        executable.zero_train_buffers();
+        executable
+            .backward_accumulate(&input, &forward, &seed)
+            .unwrap();
+        let LayerTrainBuffers::Swin(train) = &executable.train_buffers[1] else {
+            panic!("Swin train buffers")
+        };
+        assert!(
+            train
+                .updates
+                .to_blob()
+                .unwrap()
+                .iter()
+                .any(|value| *value != 0.0)
+        );
+        executable.update_weights(0.005, 0.4, 0.0, 1);
+        let LayerParams::Swin(after) = &executable.params[1] else {
+            panic!("Swin params")
+        };
+        assert_ne!(*after, before);
+    }
+
+    #[test]
+    fn swin_sgd_update_clips_then_decays_only_matrix_parameters() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "swin-update.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=2\n\
+             [swin]\nfilters=3\nsize=1\nheads=1\nffn_ratio=1\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::Swin(params) = &mut executable.params[0] else {
+            panic!("Swin params")
+        };
+        params.qkv_weight[0] = 1.0;
+        params.mhc[0] = 7.99;
+        let LayerTrainBuffers::Swin(train) = &mut executable.train_buffers[0] else {
+            panic!("Swin train buffers")
+        };
+        train.updates.qkv_weight[0] = -0.5;
+        train.updates.qkv_bias[0] = -0.5;
+        train.updates.mhc[0] = 1.0;
+        executable.update_weights(0.1, 0.0, 0.2, 1);
+        let LayerParams::Swin(params) = &executable.params[0] else {
+            panic!("Swin params")
+        };
+        assert!((params.qkv_weight[0] - 0.93).abs() < 1.0e-6);
+        assert!((params.qkv_bias[0] + 0.05).abs() < 1.0e-6);
+        assert_eq!(params.mhc[0], 8.0);
+    }
+
+    #[test]
+    fn swin_adam_updates_and_optimizer_state_round_trip() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "swin-adam.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=2\nadam=1\n\
+             [swin]\nfilters=2\nsize=1\nheads=1\nffn_ratio=1\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let LayerParams::Swin(params) = &mut executable.params[0] else {
+            panic!("Swin params")
+        };
+        params.qkv_weight[0] = 0.25;
+        params.relative_position_bias[0] = 0.1;
+        let LayerTrainBuffers::Swin(train) = &mut executable.train_buffers[0] else {
+            panic!("Swin train buffers")
+        };
+        train.updates.qkv_weight[0] = -0.2;
+        train.updates.qkv_bias[0] = -0.1;
+        train.updates.relative_position_bias[0] = -0.15;
+        train.updates.mhc[0] = -0.05;
+        executable.update_weights_adam(0.01, 1).unwrap();
+        assert_eq!(executable.adam_step(), 1);
+        let LayerParams::Swin(updated) = &executable.params[0] else {
+            unreachable!()
+        };
+        assert_ne!(updated.qkv_weight[0], 0.25);
+        assert_ne!(updated.relative_position_bias[0], 0.1);
+
+        let path = std::env::temp_dir().join("darknet-swin-adam-roundtrip.dnopt");
+        executable.save_optimizer_state(&path).unwrap();
+        let mut restored = ExecutableNetwork::new(network);
+        restored.load_optimizer_state(&path).unwrap();
+        assert_eq!(restored.adam_step(), 1);
+        assert_eq!(restored.host_adam_state, executable.host_adam_state);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn swin_gpu_host_round_trip_matches_cpu_chain_and_backward_updates() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "swin-fake-backend-chain.cfg",
+                "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=1\n\
+             [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
+             [swin]\nfilters=3\nsize=2\nheads=1\nshift=1\nffn_ratio=2\nactivation=gelu\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        crate::initialize_training_params(&network, &mut cpu.params, 107);
+        let input = Tensor::from_data(
+            TensorShape::new(3, 2, 2, 1),
+            (0..12).map(|index| (index as f32 - 4.0) * 0.06).collect(),
+        )
+        .unwrap();
+        let cpu_forward = cpu.forward(&input).unwrap();
+        let output = cpu_forward.final_output().unwrap();
+        let seeds = vec![
+            None,
+            Some(Tensor::from_data(output.shape, vec![0.2; output.len()]).unwrap()),
+        ];
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        gpu.params = cpu.params.clone();
+        let gpu_forward = gpu.forward_with_state(&input).unwrap();
+        assert_eq!(
+            gpu_forward.cpu_forward.final_output(),
+            cpu_forward.final_output()
+        );
+        assert!(gpu.requires_cpu_backward_fallback());
+        let cpu_backward = cpu.backward_seeded(&input, &cpu_forward, &seeds).unwrap();
+        let fake_backend_backward = cpu
+            .backward_seeded(&input, &gpu_forward.cpu_forward, &seeds)
+            .unwrap();
+        assert_eq!(
+            fake_backend_backward.input_gradient,
+            cpu_backward.input_gradient
+        );
+        assert_eq!(
+            fake_backend_backward.param_gradients,
+            cpu_backward.param_gradients
+        );
+        cpu.zero_train_buffers();
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .unwrap();
+        gpu.zero_train_buffers_gpu().unwrap();
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .unwrap();
+        assert_eq!(
+            cpu.train_buffers[1],
+            gpu.cpu_fallback_train_buffers.borrow()[1]
+        );
+        cpu.update_weights(0.003, 0.4, 0.0, 1);
+        gpu.update_weights_gpu(0.003, 0.4, 0.0, 1).unwrap();
+        let LayerParams::Swin(cpu_swin) = &cpu.params[1] else {
+            unreachable!()
+        };
+        let LayerParams::Swin(gpu_swin) = &gpu.params[1] else {
+            unreachable!()
+        };
+        assert_eq!(gpu_swin, cpu_swin);
     }
 
     #[test]

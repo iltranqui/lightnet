@@ -188,6 +188,10 @@ pub fn save_weights(
             (LayerKind::Vit(_), LayerParams::Vit(vit)) => {
                 write_f32_slice(&mut file, &vit.to_blob())?;
             }
+            (LayerKind::Swin(_), LayerParams::Swin(swin)) => {
+                let blob = swin.to_blob().map_err(Error::Weights)?;
+                write_f32_slice(&mut file, &blob)?;
+            }
             // C++ `save_moe_convolutional_weights`: every expert's complete
             // convolution block first, then the router biases and weights.
             (LayerKind::Moe(_), LayerParams::Moe(moe)) => {
@@ -456,6 +460,126 @@ mod tests {
         );
         let _ = fs::remove_file(modern_path);
         let _ = fs::remove_file(legacy_path);
+    }
+
+    #[test]
+    fn swin_weights_round_trip_rust_blob_order_and_reject_old_headers() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "swin-roundtrip.cfg",
+                "[net]\nwidth=4\nheight=3\nchannels=4\n\
+                 [swin]\nfilters=6\nsize=2\nheads=2\nshift=1\nffn_ratio=3\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let expected_blob_len;
+        {
+            let LayerParams::Swin(weights) = &mut executable.params[0] else {
+                panic!("Swin params")
+            };
+            let fill = |values: &mut [f32], start: usize| {
+                for (index, value) in values.iter_mut().enumerate() {
+                    *value = start as f32 + index as f32 * 0.01;
+                }
+            };
+            fill(&mut weights.qkv_weight, 1);
+            fill(&mut weights.qkv_bias, 2);
+            fill(&mut weights.wo, 3);
+            fill(&mut weights.wo_bias, 4);
+            fill(&mut weights.ln1_gamma, 5);
+            fill(&mut weights.ln1_beta, 6);
+            fill(&mut weights.ln2_gamma, 7);
+            fill(&mut weights.ln2_beta, 8);
+            fill(&mut weights.ffn_w1, 9);
+            fill(&mut weights.ffn_b1, 10);
+            fill(&mut weights.ffn_w2, 11);
+            fill(&mut weights.ffn_b2, 12);
+            fill(weights.res_proj.as_mut().unwrap(), 13);
+            fill(&mut weights.relative_position_bias, 14);
+            fill(&mut weights.mhc, 15);
+            expected_blob_len = weights.to_blob().unwrap().len();
+        }
+        let path = std::env::temp_dir().join("darknet-swin-rust-roundtrip.weights");
+        save_weights(&network, &executable.params, &path, 23).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            20 + expected_blob_len as u64 * 4
+        );
+        let inspection = inspect_weights_file(&network, &path).unwrap();
+        assert_eq!(inspection.trailing_bytes, 0);
+        assert_eq!(
+            inspection
+                .layers
+                .iter()
+                .flat_map(|layer| layer.arrays.iter())
+                .map(|array| array.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "swin_qkv_weights",
+                "swin_qkv_bias",
+                "swin_wo",
+                "swin_wo_bias",
+                "swin_ln1_gamma",
+                "swin_ln1_beta",
+                "swin_ln2_gamma",
+                "swin_ln2_beta",
+                "swin_ffn_w1",
+                "swin_ffn_b1",
+                "swin_ffn_w2",
+                "swin_ffn_b2",
+                "swin_res_proj",
+                "swin_rel_pos_bias",
+                "swin_mhc_scales",
+            ]
+        );
+        let mut loaded = ExecutableNetwork::new(network.clone());
+        loaded.load_weights_file(&path).unwrap();
+        assert_eq!(loaded.params, executable.params);
+
+        let old_path = std::env::temp_dir().join("darknet-swin-old-header.weights");
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[8..12].copy_from_slice(&4i32.to_le_bytes());
+        fs::write(&old_path, bytes).unwrap();
+        let mut old = ExecutableNetwork::new(network);
+        assert!(old.load_weights_file(&old_path).is_err());
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(old_path);
+    }
+
+    #[test]
+    fn swin_weights_round_trip_without_residual_projection() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "swin-equal-channels.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=2\n\
+                 [swin]\nfilters=2\nsize=1\nheads=1\nffn_ratio=2\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let LayerParams::Swin(weights) = &mut executable.params[0] else {
+            panic!("Swin params")
+        };
+        assert!(weights.res_proj.is_none());
+        weights.qkv_weight.fill(0.125);
+        weights.relative_position_bias.fill(-0.25);
+        let path = std::env::temp_dir().join("darknet-swin-equal-roundtrip.weights");
+        save_weights(&network, &executable.params, &path, 29).unwrap();
+        let mut loaded = ExecutableNetwork::new(network.clone());
+        loaded.load_weights_file(&path).unwrap();
+        assert_eq!(loaded.params, executable.params);
+        let inspection = inspect_weights_file(&network, &path).unwrap();
+        assert_eq!(inspection.trailing_bytes, 0);
+        assert!(
+            !inspection.layers[0]
+                .arrays
+                .iter()
+                .any(|array| array.name == "swin_res_proj")
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -812,7 +936,8 @@ mod tests {
                     | LayerParams::Local(_)
                     | LayerParams::Shortcut(_)
                     | LayerParams::Gru(_)
-                    | LayerParams::Vit(_) => {}
+                    | LayerParams::Vit(_)
+                    | LayerParams::Swin(_) => {}
                 }
             }
             let path = std::env::temp_dir().join(format!("darknet-{name}-roundtrip.weights"));
