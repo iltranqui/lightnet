@@ -55,6 +55,7 @@ file is named inline.
 - [20. Graph-convolution Stage-1 CPU reference](#20-graph-convolution-stage-1-cpu-reference)
 - [21. WMHF Stage-1 CPU reference](#21-wmhf-stage-1-cpu-reference)
 - [22. CPU Muon hybrid optimizer](#22-cpu-muon-hybrid-optimizer)
+- [23. Clifford Stage-1 CPU reference](#23-clifford-stage-1-cpu-reference)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -790,14 +791,21 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 
 - v0.1.004 (`49ce73ccfc03d76c9a79e53389d283198d5d788e`): integrated the strict `[wmhf]`, `[wavelet_mamba_hf]`, and `[wavelet_mamba_high_frequency]` config paths, seeded initialization, seven source-order convolution blocks plus four scan vectors, Haar DWT/IWT and four-direction EMA scan CPU forward, exact backward, batch-stat BN with rolling-stat updates, SGD, Adam with persistent moments, and exact `.weights` serialization. GPU execution and updates reject explicitly; no GPU fallback or kernels were added.
 - Verification: `MEM=3G ./tools/test_host.sh wmhf_` passed 17 tests; `weights` passed 43; `runtime` passed 198. Coverage includes hand-computed full forward, zero-upstream and finite-difference input/parameter gradients across all blocks, preceding-convolution accumulation, odd-edge Haar adjoints, BN/rolling statistics, SGD and GPU rejection, Adam-state persistence, initialization, strict config, and exact source-order file length. Targeted Rustfmt checks on modified core files and `git diff --check` passed. No training, Oxide tests, or `cfg_corpus` run.
-- Source contract: hand-derived from `Jev_laya`; `LAYER_WMHF` is disabled and guarded tests are not a numerical oracle, so no compiled-C++ golden/parity is claimed. WMHF is Stage-1 CPU-only. `clifford` and `recursive_block` remain open; do not claim Phase 3B/Stage 1 complete.
+- Source contract: hand-derived from `Jev_laya`; `LAYER_WMHF` is disabled and guarded tests are not a numerical oracle, so no compiled-C++ golden/parity is claimed. WMHF is Stage-1 CPU-only. `recursive_block` remains open; do not claim Phase 3B/Stage 1 complete.
 
 ## 22. CPU Muon hybrid optimizer
 
 - v0.1.005 (`2674f5741405e33371448bb9a664d482ffa02e8d`): added opt-in `[net] muon=1` hybrid CPU updates. Eligible dense matrix blocks use arXiv:2502.16982's additive momentum/Nesterov lookahead, five Newton–Schulz iterations with `(3.4445,-4.7750,2.0315)`, scale `0.2*sqrt(max(rows,cols))`, and decoupled decay. Explicit per-layer matrix mappings cover convolution/recurrent/attention families; other trainable parameters use AdamW fallback. Conflicting/unsupported config rejects.
 - CPU trainer dispatch covers general and OBB CLI training, direct OBB batch helpers, and the benchmark update step. DNOPT6 persists shape-checked Muon momentum and retains DNOPT1–5 reads; loading old state in Muon mode starts fresh Muon/AdamW state. GPU execution/updates and GPU optimizer-state save/load reject explicitly.
 - Verification: `MEM=3G ./tools/test_host.sh muon_` passed 13 tests, `weights` passed 43, and `runtime` passed 204, including `train_only_bn` gating. Core-file `rustfmt --check --edition 2024` and `git diff --check` passed. No training or Oxide tests were run.
-- Evidence boundary: update is paper-derived plus hand-computed/runtime tests. There is no compiled-C++ Muon implementation or golden, so no compiled-C++ parity is claimed. Stage 1 remains open for `clifford` and `recursive_block`; GPU Muon belongs to Stage 2.
+- Evidence boundary: update is paper-derived plus hand-computed/runtime tests. There is no compiled-C++ Muon implementation or golden, so no compiled-C++ parity is claimed. Stage 1 remains open for `recursive_block`; GPU Muon belongs to Stage 2.
+
+## 23. Clifford Stage-1 CPU reference
+
+- v0.1.006 (`1cc80d92b06a7b4fcbd90bea0f6a38931bb0d0ed`): integrated `[clifford]` as an ordinary source-derived NCHW layer, not a nested config container. CPU support covers local/global/hybrid branches, avgpool/Fourier global context, inner/wedge/full interaction schedules, abs/diff context, higher vector-bivector mode, and cached DropPath. The guarded C++ `LAYER_CLIFFORD` macro is disabled, so this is hand-derived from `Jev_laya`, not compiled-C++ parity.
+- Added seeded source-scale initialization; exact source-order `.weights` load/save; training forward/backward with internal depthwise BN and rolling-stat updates; SGD, AdamW, and Muon matrix mappings (with AdamW fallback for non-matrix parameters). DNOPT host-Adam/Muon state round trips validate nested state; GPU full/compact execution and updates reject explicitly in Stage 1.
+- Verification: `MEM=3G ./tools/test_host.sh clifford_` passed 13 tests, `weights` passed 44, and `runtime` passed 208. The Clifford tests cover finite differences for input and trainable parameters across avgpool+DropPath, Fourier, inner/abs/local, and wedge/global modes; exact weight bytes/round-trip; seeded initialization; optimizer updates/state; BN stats; and GPU rejection. Targeted Rustfmt and `git diff --check` passed. No training, Oxide tests, or `cfg_corpus` run.
+- Evidence boundary: no compiled-C++ golden exists and no compiled-C++ parity is claimed. Clifford is Stage-1 CPU-only; `recursive_block` remains open and native GPU support/GPU Muon belong to Stage 2.
 
 ## Not implemented / open (pointer)
 

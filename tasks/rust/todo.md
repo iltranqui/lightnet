@@ -402,16 +402,16 @@ Immediately next, in dependency order:
   option wiring, source-faithful geometric augmentation/label transforms, and any
   unimplemented OBB source paths.
 - [ ] Phase 3B CPU family (remaining): `graph_conv` is integrated in v0.1.003
-  (`implemented.md` §20) and WMHF in v0.1.004 (`implemented.md` §21), both
-  hand-derived from `Jev_laya` with no compiled-C++ golden and no GPU path.
-  CPU Muon is integrated in v0.1.005 (`implemented.md` §22). Next are
-  `clifford` and `recursive_block`. `dsconv` is integrated in v0.1.002
-  (`implemented.md` §19) for single-template `morph=0/1/2`; multi-template
-  `morph=0/1` remains open. DCNv1/2 CPU reference is integrated in v0.1.001
-  (`implemented.md` §18); its GPU path is still host fallback. `[dcnv4]` is
-  integrated in v0.0.273–v0.0.274 (`implemented.md` §17), also host fallback.
-  Native GPU support and GPU Muon belong to Stage 2 after all Stage-1 CPU
-  layers are done.
+  (`implemented.md` §20), WMHF in v0.1.004 (`implemented.md` §21), and
+  Clifford in v0.1.006 (`implemented.md` §23); these are hand-derived from
+  `Jev_laya` with no compiled-C++ golden or GPU path. CPU Muon is integrated in
+  v0.1.005 (`implemented.md` §22). `recursive_block` is the remaining XL layer.
+  `dsconv` is integrated in v0.1.002 (`implemented.md` §19) for single-template
+  `morph=0/1/2`; multi-template `morph=0/1` remains open. DCNv1/2 CPU reference
+  is integrated in v0.1.001 (`implemented.md` §18); its GPU path is still host
+  fallback. `[dcnv4]` is integrated in v0.0.273–v0.0.274 (`implemented.md` §17),
+  also host fallback. Native GPU support and GPU Muon belong to Stage 2 after all
+  Stage-1 CPU layers are done.
 - [x] CPU Muon: spec and Stage-1 hybrid implementation complete in v0.1.005
   (`implemented.md` §22). Eligible matrices use paper-derived Muon; other
   trainable parameters use AdamW fallback. DNOPT6 persists shape-checked
@@ -429,7 +429,8 @@ Immediately next, in dependency order:
 - [x] `deform_conv_plan.md` — bounded DCNv1/2 CPU reference and f32 host-fallback implementation completed in v0.1.001. No native kernel or compiled-C++ parity; CPU Muon was added separately in v0.1.005.
 - [x] `dsconv_plan.md` — bounded single-template CPU implementation completed in v0.1.002; multi-template modes remain open. CPU Muon was added separately in v0.1.005. No native kernel or compiled-C++ parity.
 - [x] `graph_conv_plan.md` — Stage-1 CPU implementation completed in v0.1.003; CPU Muon was added separately in v0.1.005 and native GPU support remains Stage 2. No compiled-C++ parity.
-- [x] `wmhf_plan.md` — bounded Stage-1 CPU implementation completed in v0.1.004; source/config/backward/weights audit is in `wmhf_notes.md`. CPU Muon was added in v0.1.005; `clifford` and `recursive_block` remain open. No compiled-C++ golden.
+- [x] `wmhf_plan.md` — bounded Stage-1 CPU implementation completed in v0.1.004; source/config/backward/weights audit is in `wmhf_notes.md`. CPU Muon was added in v0.1.005; `recursive_block` remains open. No compiled-C++ golden.
+- [x] `clifford_plan.md` — source-derived Stage-1 CPU implementation and focused verification completed in v0.1.006; no compiled-C++ golden/parity. Native GPU is Stage 2.
 - [x] `muon_plan.md` — Stage-1 CPU hybrid Muon implementation and focused verification completed in v0.1.005. GPU Muon remains Stage 2; no compiled-C++ golden/parity.
 - [ ] `gui_plan.md` — egui DarkMark replacement (M0–M6, not started).
 
