@@ -44,6 +44,7 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v0.1.001 (`8f5a9a94495cbc376f0b91cbf12f5123fe7ee42c`): added the source-derived DCNv1/2 CPU reference/runtime and f32 GPU host fallback, including config/shape, source-order weights, seeded initialization, exact backward, BN, SGD/Adam persistence, optimizer gates, and explicit compact rejection. `MEM=3G ./tools/test_host.sh deform_conv` passed 23 core tests, `weights` passed 38, `runtime` passed 184, and the targeted Oxide runtime-chain fallback test passed 1. No native kernel or compiled-C++ golden/parity; CPU Muon remains a cross-cutting Stage-1 requirement.
 - v0.0.274 (`e24d7625`): matched `Jev_laya`'s config-side `try_fix_nan` default: deformable-sampling configs enable it when `[net]` omits the key, while explicit `try_fix_nan=0/1` is preserved. `MEM=3G ./tools/test_host.sh dcnv4` passed 16 tests. This closes a source-contract gap found in the DCNv4 audit; no compiled-C++ parity is claimed.
 - v0.0.273 (`cb96aa49`): integrated `[dcnv4]` / `[dcnv4_convolutional]` with strict config/shape handling, source-order weights, seeded initialization, CPU reference forward and exact backward, BN, SGD/Adam with optimizer-state persistence, and GPU f32 host fallback. The focused `dcnv4`, `weights`, and `runtime` host filters and the targeted `oxide_runtime_chain` host-fallback test passed (test counts were not retained in the audit output). Coverage includes finite differences for input/offset projection, BN/optimizer behavior, exact-size round trips, and CPU/FakeBackend/Oxide runtime paths. No native kernel, training run, or compiled-C++ golden/parity.
 - v0.0.271: integrated the source-derived MambaVision reference path: strict cfg/shape handling, explicit per-layer recurrent-state API, exact CPU forward/backward, seeded initialization, SGD/Adam, source-order `.weights`, optimizer-state persistence, and GPU f32 host fallback. `MEM=3G ./tools/test_host.sh mambavision` passed 16 tests, `runtime` 171, and `weights` 33; coverage includes input/all-parameter/state finite differences, causal convolution, MSA clipping, initialization bounds, optimizer decay/persistence, serialization, and FakeBackend parity. No native MambaVision kernel or compiled-C++ golden/parity.
@@ -686,9 +687,11 @@ believing a `cfg_corpus` failure.
    training support; BN backward and SGD/Adam updates use backend ops. Then
    port `eml_convolutional` (an activation, not a `LayerKind`; save order **re-read
    2026-10-05**: `input_layer` then `self_layer`, two full conv blocks).
-5. Phase 3B deformable family — `dcnv4` is integrated in v0.0.273; remaining
-   work starts with `deform_conv`, then `dsconv`, `graph_conv`, `wmhf`,
-   `clifford`, and `recursive_block`.
+5. Phase 3B CPU family — DCNv1/2 CPU reference is integrated in v0.1.001
+   (SGD/Adam; GPU is host fallback only); next are `dsconv`, `graph_conv`,
+   `wmhf`, `clifford`, and `recursive_block`. Cross-cutting CPU Muon is still
+   open and must be specified before Stage 1 can close. `dcnv4` and `deform_conv`
+   need native Oxide paths later in Stage 2.
 6. Phase 2C OBB, then Phase 4.
 
 ## Known evidence gaps (not user questions)

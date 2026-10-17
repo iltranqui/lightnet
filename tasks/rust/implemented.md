@@ -50,6 +50,7 @@ file is named inline.
 - [15. CARPN sample-level polygon mAP dispatch](#15-carpn-sample-level-polygon-map-dispatch)
 - [16. CARPN CPU network inference and direct mAP](#16-carpn-cpu-network-inference-and-direct-map)
 - [17. DCNv4 CPU reference and GPU f32 host fallback](#17-dcnv4-cpu-reference-and-gpu-f32-host-fallback)
+- [18. DCNv1 and DCNv2 CPU reference and GPU f32 host fallback](#18-dcnv1-and-dcnv2-cpu-reference-and-gpu-f32-host-fallback)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -763,9 +764,16 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 - v0.0.273 (`cb96aa49`): integrated strict `[dcnv4]` / `[dcnv4_convolutional]` config and shape support, C++ source-order `.weights`, deterministic initialization, grouped deformable sampling, coarse `d_stride` offset projection and interpolation, optional softmax masks/center removal, and the exact derivative of the Rust forward. Runtime support includes bias/BN/activation, SGD and Adam, persisted optimizer state, and GPU f32 execution through the host fallback. Compatibility dummy weights serialize but are never differentiated or updated; offsets use the source-derived 0.01 learning-rate scale.
 - Verification: `MEM=3G ./tools/test_host.sh dcnv4`, `weights`, and `runtime` passed; the targeted `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_f32_host_fallback_matches_cpu_chain_and_updates` passed. Output counts were not retained. Tests cover hand-computed sampling/grouping/masks, finite differences for input and offset parameters across standard and coarse-stride cases, BN/optimizer behavior, exact-length BN/non-BN weight round trips, and CPU/FakeBackend/Oxide host-fallback parity. Targeted Rustfmt and `git diff --check` passed. No training was run, no native Oxide kernel was added, and no compiled-C++ golden/parity is claimed.
 
+## 18. DCNv1 and DCNv2 CPU reference and GPU f32 host fallback
+
+- v0.1.001 (`8f5a9a94495cbc376f0b91cbf12f5123fe7ee42c`): integrated both `[deform_conv]` aliases with strict source-derived cfg/shape validation, parameter metadata, deterministic initialization, exact source-order weights, grouped NCHW sampling, offsets and optional sigmoid masks, per-image conditional offset normalization, and exact backward of the Rust forward. Runtime covers bias/BN/activation, rolling statistics, SGD source-rate groups, Adam with persisted moments, update gates, loss scaling, CPU/FakeBackend parity, and GPU f32 host fallback; compact execution rejects explicitly. Unsupported modes, f16/compact paths, and undefined clamp boundaries reject explicitly.
+- Verification: `MEM=3G ./tools/test_host.sh deform_conv` passed 23 core tests; `weights` passed 38 core tests; `runtime` passed 184 runtime tests; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- deform_conv_f32_host_fallback_matches_cpu_chain_and_updates` passed 1 Oxide test. Named coverage includes NCHW/group/kernel-axis hand math, zero-padded boundary sampling, all-trainable-block/input finite differences (including conditional normalization and masked grouped sampling), BN scale finite differences and rolling stats, source-order byte layouts, SGD/Adam updates and state round trip, accumulation/gates/loss-scale neutrality, and CPU/FakeBackend/Oxide host fallback. Targeted Rustfmt and `git diff --check` passed.
+- Source contract: hand-derived from `Jev_laya`; no compiled-C++ golden/parity. No training run or native Oxide kernel. GPU status is host fallback only. CPU Muon remains a cross-cutting Stage-1 requirement, so this feature commit does not complete v0.1.
+
 ## Not implemented / open (pointer)
 
 See `tasks/rust/todo.md` for the deduplicated open list (P8/P9 follow-ups,
-fp16 remainder, hardware-blocked wgmma/tcgen05/NVFP4/multi-GPU), `layers.md`
-for Phases 1b–4 (remaining layers), `fp8_fp4.md` for FP8 step 5, and
-`gui_plan.md` for the deferred GUI plan; ONNX export is complete.
+fp16 remainder, hardware-blocked wgmma/tcgen05/NVFP4/multi-GPU, and the CPU/GPU
+Muon spec and implementation), `layers.md` for Phases 1b–4 (remaining layers),
+`fp8_fp4.md` for FP8 step 5, and `gui_plan.md` for the deferred GUI plan; ONNX
+export is complete.
