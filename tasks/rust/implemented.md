@@ -473,7 +473,8 @@ still NOT RUN (no `Jev_laya` build here; `test_data/laya/` has only the shared
   `MEM=3G ./tools/test_oxide.sh --test oxide_layernorm` — 14 pass, including
   host/Oxide backward parity, central finite differences, and clamp masks;
   `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain` — 22 pass, including
-  CPU-matched ViT parameter updates after native attention backward dispatch.
+  CPU-matched ViT parameter updates after native attention backward dispatch;
+  `MEM=3G ./tools/test_host.sh runtime` — 161 runtime tests pass.
   This is Rust backend evidence, not performance or compiled-C++ parity.
 - Earlier focused evidence: full host unit suites pass (`darknet-core` 377,
   `darknet-cli` 18); targeted check/build pass with `-j 4`. The full
