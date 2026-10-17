@@ -374,11 +374,229 @@ fn e4m3_quantization_boundary(value: f32) -> bool {
     lower_boundary || upper_boundary
 }
 
+fn probability_code_boundary(u: f32, mode: ExpCastMode) -> bool {
+    match mode {
+        ExpCastMode::E4M3 => e4m3_quantization_boundary(u.exp2() * 256.0),
+        ExpCastMode::Order0 => {
+            let raw = 8.0 * u + 120.0 - 0.35;
+            let lower = raw.floor();
+            lower >= 0.0 && lower < 120.0 && raw - lower == 0.5
+        }
+        ExpCastMode::Order2 => {
+            if u <= -15.0 || u >= 0.0 {
+                return false;
+            }
+            let exponent = u.floor();
+            let fraction = u - exponent;
+            let correction = fraction * (0.6565 + 0.3435 * fraction) * 8.0;
+            let lower = correction.floor();
+            let base = (exponent + 15.0) * 8.0;
+            base + lower >= 0.0 && base + lower < 120.0 && correction - lower == 0.5
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct QuantizedOnlineRowCache {
+    tokens: usize,
+    channels: usize,
+    scores_log2: Vec<f32>,
+    values: Vec<f32>,
+    context: Vec<f32>,
+    probability_codes: Vec<u8>,
+    prefix_maxes: Vec<f32>,
+    prefix_owners: Vec<usize>,
+    prefix_ties: Vec<bool>,
+    mode: ExpCastMode,
+}
+
+/// Source-shaped online ExpCast attention for one query row. Scores are
+/// finite log2 logits after score clamping; values are the dequantized V-Smooth
+/// rows in KV permutation order. The retained row state is O(T + T*C).
+pub(crate) fn quantized_online_row_forward(
+    scores_log2: &[f32],
+    values: &[f32],
+    channels: usize,
+    mode: ExpCastMode,
+) -> Result<(Vec<f32>, f32, QuantizedOnlineRowCache), String> {
+    let tokens = scores_log2.len();
+    if tokens == 0 || channels == 0 {
+        return Err("VC online attention requires positive token and channel counts".into());
+    }
+    let expected_values = tokens
+        .checked_mul(channels)
+        .ok_or("VC online attention value size overflow")?;
+    if values.len() != expected_values {
+        return Err(format!(
+            "VC online attention values have {} entries, expected {expected_values}",
+            values.len()
+        ));
+    }
+    if scores_log2.iter().any(|score| !score.is_finite())
+        || values.iter().any(|value| !value.is_finite())
+    {
+        return Err("VC online attention requires finite scores and values".into());
+    }
+
+    let tile_count = tokens.div_ceil(V_SMOOTH_TILE_SIZE);
+    let mut prefix_maxes = vec![0.0; tile_count];
+    let mut prefix_owners = vec![0; tile_count];
+    let mut prefix_ties = vec![false; tile_count];
+    let mut probability_codes = vec![0; tokens];
+    let mut running_max = f32::NEG_INFINITY;
+    let mut running_owner = 0;
+    let mut running_tie = false;
+
+    for tile in 0..tile_count {
+        let begin = tile * V_SMOOTH_TILE_SIZE;
+        let end = (begin + V_SMOOTH_TILE_SIZE).min(tokens);
+        let mut tile_max = f32::NEG_INFINITY;
+        let mut tile_owner = begin;
+        let mut tile_max_count = 0usize;
+        for position in begin..end {
+            let score = scores_log2[position];
+            if score > tile_max {
+                tile_max = score;
+                tile_owner = position;
+                tile_max_count = 1;
+            } else if score == tile_max {
+                tile_max_count += 1;
+            }
+        }
+        if tile_max > running_max {
+            running_max = tile_max;
+            running_owner = tile_owner;
+            running_tie = tile_max_count > 1;
+        } else if tile_max == running_max {
+            running_tie = true;
+        }
+        prefix_maxes[tile] = running_max;
+        prefix_owners[tile] = running_owner;
+        prefix_ties[tile] = running_tie;
+        for position in begin..end {
+            let u = scores_log2[position] - running_max;
+            probability_codes[position] = expcast_probability_code(u, mode)?;
+        }
+    }
+
+    let final_max = prefix_maxes[tile_count - 1];
+    let mut normalizer = 0.0;
+    for position in 0..tokens {
+        let tile = position / V_SMOOTH_TILE_SIZE;
+        let prefix_scale = (prefix_maxes[tile] - final_max).exp2();
+        normalizer += e4m3_to_f32(probability_codes[position]) * prefix_scale;
+    }
+    if !(normalizer > 0.0 && normalizer.is_finite()) {
+        return Err("VC online attention produced an invalid probability sum".into());
+    }
+    let mut context = vec![0.0; channels];
+    for position in 0..tokens {
+        let tile = position / V_SMOOTH_TILE_SIZE;
+        let prefix_scale = (prefix_maxes[tile] - final_max).exp2();
+        let weight = e4m3_to_f32(probability_codes[position]) * prefix_scale / normalizer;
+        for channel in 0..channels {
+            context[channel] += weight * values[position * channels + channel];
+        }
+    }
+    let lse = (final_max + normalizer.log2() - 8.0) * 0.6931471805599453;
+    Ok((
+        context.clone(),
+        lse,
+        QuantizedOnlineRowCache {
+            tokens,
+            channels,
+            scores_log2: scores_log2.to_vec(),
+            values: values.to_vec(),
+            context,
+            probability_codes,
+            prefix_maxes,
+            prefix_owners,
+            prefix_ties,
+            mode,
+        },
+    ))
+}
+
+/// Exact context derivative of the quantized online row away from ExpCast
+/// transitions and prefix-max ties. Probability codes are held fixed, but the
+/// online inter-tile rescaling through prefix maxima remains differentiable.
+pub(crate) fn quantized_online_row_backward(
+    output_grad: &[f32],
+    cache: &QuantizedOnlineRowCache,
+) -> Result<(Vec<f32>, Vec<f32>), String> {
+    if output_grad.len() != cache.channels {
+        return Err(format!(
+            "VC online attention output gradient has {} entries, expected {}",
+            output_grad.len(),
+            cache.channels
+        ));
+    }
+    if cache.prefix_ties.iter().any(|&tied| tied) {
+        return Err("VC online attention derivative is undefined at a prefix-max tie".into());
+    }
+    if (0..cache.tokens).any(|position| {
+        let tile = position / V_SMOOTH_TILE_SIZE;
+        probability_code_boundary(
+            cache.scores_log2[position] - cache.prefix_maxes[tile],
+            cache.mode,
+        )
+    }) {
+        return Err("VC online attention derivative is undefined at an ExpCast boundary".into());
+    }
+
+    let tile_count = cache.prefix_maxes.len();
+    let final_max = cache.prefix_maxes[tile_count - 1];
+    let mut tile_sums = vec![0.0; tile_count];
+    let mut tile_values = vec![vec![0.0; cache.channels]; tile_count];
+    let mut normalizer = 0.0;
+    for position in 0..cache.tokens {
+        let tile = position / V_SMOOTH_TILE_SIZE;
+        let probability = e4m3_to_f32(cache.probability_codes[position]);
+        let prefix_scale = (cache.prefix_maxes[tile] - final_max).exp2();
+        tile_sums[tile] += probability;
+        normalizer += probability * prefix_scale;
+        for channel in 0..cache.channels {
+            tile_values[tile][channel] +=
+                probability * cache.values[position * cache.channels + channel];
+        }
+    }
+
+    let mut values_grad = vec![0.0; cache.tokens * cache.channels];
+    let mut prefix_max_grad = vec![0.0; tile_count];
+    for tile in 0..tile_count {
+        let prefix_scale = (cache.prefix_maxes[tile] - final_max).exp2();
+        let mut centered_context_dot = 0.0;
+        for channel in 0..cache.channels {
+            centered_context_dot += output_grad[channel]
+                * (tile_values[tile][channel] - cache.context[channel] * tile_sums[tile]);
+        }
+        prefix_max_grad[tile] =
+            0.6931471805599453 * prefix_scale * centered_context_dot / normalizer;
+        let begin = tile * V_SMOOTH_TILE_SIZE;
+        let end = (begin + V_SMOOTH_TILE_SIZE).min(cache.tokens);
+        for position in begin..end {
+            let weight = e4m3_to_f32(cache.probability_codes[position]) * prefix_scale / normalizer;
+            for channel in 0..cache.channels {
+                values_grad[position * cache.channels + channel] = weight * output_grad[channel];
+            }
+        }
+    }
+
+    let total_prefix_grad: f32 = prefix_max_grad.iter().sum();
+    prefix_max_grad[tile_count - 1] -= total_prefix_grad;
+    let mut scores_grad = vec![0.0; cache.tokens];
+    for (tile, &owner) in cache.prefix_owners.iter().enumerate() {
+        scores_grad[owner] += prefix_max_grad[tile];
+    }
+    Ok((scores_grad, values_grad))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ExpCastMode, e4m3_encode_bits, e4m3_quantization_boundary, e4m3_to_f32,
-        expcast_probability_code, vsmooth_backward, vsmooth_forward,
+        expcast_probability_code, quantized_online_row_backward, quantized_online_row_forward,
+        vsmooth_backward, vsmooth_forward,
     };
 
     #[test]
@@ -534,5 +752,123 @@ mod tests {
         let constant = vec![2.0; 64];
         let (_, constant_cache) = vsmooth_forward(&constant, 64, 1, None).unwrap();
         assert!(vsmooth_backward(&grad, &constant_cache).is_err());
+    }
+
+    #[test]
+    fn online_expcast_backward_matches_finite_differences_through_alpha() {
+        let tokens = 70;
+        let channels = 2;
+        let mut scores: Vec<f32> = (0..tokens)
+            .map(|position| -2.17 - (position % 13) as f32 * 0.293)
+            .collect();
+        scores[0] = 0.237;
+        scores[64] = 0.713;
+        let values: Vec<f32> = (0..tokens)
+            .flat_map(|position| {
+                if position < 64 {
+                    [1.0 + position as f32 * 0.001, -0.5]
+                } else {
+                    [-0.8, 1.3 + position as f32 * 0.001]
+                }
+            })
+            .collect();
+        let (context, _, cache) =
+            quantized_online_row_forward(&scores, &values, channels, ExpCastMode::Order0).unwrap();
+        let output_grad = [0.8, -0.45];
+        let (scores_grad, values_grad) =
+            quantized_online_row_backward(&output_grad, &cache).unwrap();
+        assert!(
+            scores_grad[0].abs() > 1.0e-5,
+            "old prefix max must affect alpha"
+        );
+        assert!(
+            scores_grad[64].abs() > 1.0e-5,
+            "final max must affect alpha"
+        );
+        assert_eq!(cache.probability_codes.len(), tokens);
+        assert_eq!(cache.prefix_maxes.len(), tokens.div_ceil(64));
+
+        let objective = |row_scores: &[f32], row_values: &[f32]| {
+            let (output, _, _) =
+                quantized_online_row_forward(row_scores, row_values, channels, ExpCastMode::Order0)
+                    .unwrap();
+            output
+                .iter()
+                .zip(output_grad)
+                .map(|(value, grad)| value * grad)
+                .sum::<f32>()
+        };
+        let epsilon = 1.0e-4;
+        let mut checked_scores = 0;
+        for index in 0..tokens {
+            let mut plus = scores.clone();
+            let mut minus = scores.clone();
+            plus[index] += epsilon;
+            minus[index] -= epsilon;
+            let (_, _, plus_cache) =
+                quantized_online_row_forward(&plus, &values, channels, ExpCastMode::Order0)
+                    .unwrap();
+            let (_, _, minus_cache) =
+                quantized_online_row_forward(&minus, &values, channels, ExpCastMode::Order0)
+                    .unwrap();
+            if plus_cache.probability_codes != cache.probability_codes
+                || minus_cache.probability_codes != cache.probability_codes
+                || plus_cache.prefix_owners != cache.prefix_owners
+                || minus_cache.prefix_owners != cache.prefix_owners
+            {
+                continue;
+            }
+            let numeric =
+                (objective(&plus, &values) - objective(&minus, &values)) / (2.0 * epsilon);
+            let error = (scores_grad[index] - numeric).abs();
+            assert!(
+                error <= 0.02 + 0.04 * numeric.abs(),
+                "score gradient {index}: analytic {}, numeric {numeric}, error {error}",
+                scores_grad[index]
+            );
+            checked_scores += 1;
+        }
+        assert!(
+            checked_scores > 60,
+            "only {checked_scores} score entries checked"
+        );
+
+        let mut checked_values = 0;
+        for index in 0..values.len() {
+            let mut plus = values.clone();
+            let mut minus = values.clone();
+            plus[index] += epsilon;
+            minus[index] -= epsilon;
+            let numeric =
+                (objective(&scores, &plus) - objective(&scores, &minus)) / (2.0 * epsilon);
+            let error = (values_grad[index] - numeric).abs();
+            assert!(
+                error <= 0.005,
+                "value gradient {index}: analytic {}, numeric {numeric}, error {error}",
+                values_grad[index]
+            );
+            checked_values += 1;
+        }
+        assert_eq!(checked_values, values.len());
+        assert!(context.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn online_expcast_score_derivative_is_zero_for_a_single_kv_tile() {
+        let scores = [0.237, -1.13, -2.71, -3.19];
+        let values = [0.1, 0.7, -0.3, 1.4];
+        let (_, _, cache) =
+            quantized_online_row_forward(&scores, &values, 1, ExpCastMode::Order0).unwrap();
+        let (scores_grad, _) = quantized_online_row_backward(&[1.0], &cache).unwrap();
+        assert_eq!(scores_grad, vec![0.0; scores.len()]);
+    }
+
+    #[test]
+    fn online_expcast_backward_rejects_prefix_max_ties() {
+        let scores = [0.0, 0.0];
+        let values = [1.0, -1.0];
+        let (_, _, cache) =
+            quantized_online_row_forward(&scores, &values, 1, ExpCastMode::Order0).unwrap();
+        assert!(quantized_online_row_backward(&[1.0], &cache).is_err());
     }
 }
