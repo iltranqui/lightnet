@@ -122,6 +122,19 @@ pub fn save_weights(
                     write_f32_slice(&mut file, &hf.pred_b2)?;
                 }
             }
+            (LayerKind::FoveationFilm(spec), LayerParams::FoveationFilm(film)) => {
+                crate::runtime::validate_foveation_film_param_layout(
+                    spec,
+                    layer.input_shape.channels,
+                    film,
+                )?;
+                write_f32_slice(&mut file, &film.w_embed)?;
+                write_f32_slice(&mut file, &film.b_embed)?;
+                write_f32_slice(&mut file, &film.w_gamma)?;
+                write_f32_slice(&mut file, &film.b_gamma)?;
+                write_f32_slice(&mut file, &film.w_beta)?;
+                write_f32_slice(&mut file, &film.b_beta)?;
+            }
             (LayerKind::RecursiveBlock(spec), LayerParams::RecursiveBlock(recursive)) => {
                 write_recursive_body_weights(&mut file, &spec.body, &recursive.body)?
             }
@@ -1541,7 +1554,8 @@ num_dwconv=2
                     | LayerParams::Wmhf(_)
                     | LayerParams::Clifford(_)
                     | LayerParams::RecursiveBlock(_)
-                    | LayerParams::HyperbolicFoveation(_) => {}
+                    | LayerParams::HyperbolicFoveation(_)
+                    | LayerParams::FoveationFilm(_) => {}
                 }
             }
             let path = std::env::temp_dir().join(format!("darknet-{name}-roundtrip.weights"));

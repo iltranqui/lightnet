@@ -1417,6 +1417,17 @@ pub enum HfWarpSource {
     NetworkInput,
 }
 
+/// `[foveation_film]` / `[hf_film]`: per-channel affine conditioning from an earlier HF layer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FoveationFilmSpec {
+    /// Resolved absolute index of the selected preceding HF layer.
+    pub hf_layer: usize,
+    pub param_count: usize,
+    pub embed_dim: usize,
+    pub backprop_to_hf: bool,
+    pub film_init_scale: f32,
+}
+
 /// `[hyperbolic_foveation]` / `[hf]`: learnable radial image warp.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HyperbolicFoveationSpec {
@@ -1491,6 +1502,7 @@ pub struct RecursiveBlockSpec {
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayerKind {
     RecursiveBlock(RecursiveBlockSpec),
+    FoveationFilm(FoveationFilmSpec),
     HyperbolicFoveation(HyperbolicFoveationSpec),
     Convolutional(ConvolutionalSpec),
     Deconvolutional(DeconvolutionalSpec),
@@ -1594,6 +1606,7 @@ impl LayerKind {
     pub fn name(&self) -> &str {
         match self {
             Self::RecursiveBlock(_) => "recursive_block",
+            Self::FoveationFilm(_) => "foveation_film",
             Self::HyperbolicFoveation(_) => "hyperbolic_foveation",
             Self::Convolutional(_) => "convolutional",
             Self::Deconvolutional(_) => "deconvolutional",
@@ -1847,6 +1860,34 @@ impl Layer {
                 }
                 Some(LayerWeights { entries })
             }
+            LayerKind::FoveationFilm(spec) => Some(LayerWeights {
+                entries: vec![
+                    WeightsEntry {
+                        array: WeightsArray::Named("w_embed".to_owned()),
+                        len: spec.embed_dim * spec.param_count,
+                    },
+                    WeightsEntry {
+                        array: WeightsArray::Named("b_embed".to_owned()),
+                        len: spec.embed_dim,
+                    },
+                    WeightsEntry {
+                        array: WeightsArray::Named("w_gamma".to_owned()),
+                        len: self.input_shape.channels * spec.embed_dim,
+                    },
+                    WeightsEntry {
+                        array: WeightsArray::Named("b_gamma".to_owned()),
+                        len: self.input_shape.channels,
+                    },
+                    WeightsEntry {
+                        array: WeightsArray::Named("w_beta".to_owned()),
+                        len: self.input_shape.channels * spec.embed_dim,
+                    },
+                    WeightsEntry {
+                        array: WeightsArray::Named("b_beta".to_owned()),
+                        len: self.input_shape.channels,
+                    },
+                ],
+            }),
             LayerKind::Convolutional(spec) => {
                 if spec.share_index.is_some() {
                     return None;
@@ -3237,6 +3278,12 @@ fn parse_layer_kind(
     let name = section.name.as_str();
     Ok(match name {
         "clifford" => LayerKind::Clifford(parse_clifford_spec(section, current)?),
+        "foveation_film" | "hf_film" => LayerKind::FoveationFilm(parse_foveation_film_spec(
+            section,
+            layer_index,
+            current,
+            built_layers,
+        )?),
         "hyperbolic_foveation" | "hf" => LayerKind::HyperbolicFoveation(
             parse_hyperbolic_foveation_spec(section, layer_index, current, built_layers)?,
         ),
@@ -4590,6 +4637,7 @@ fn infer_output_shape(
             }
             Ok(current)
         }
+        LayerKind::FoveationFilm(_) => Ok(current),
         LayerKind::HyperbolicFoveation(spec) => match spec.warp_source {
             HfWarpSource::Previous => Ok(current),
             HfWarpSource::NetworkInput => Ok(built_layers
@@ -5743,6 +5791,118 @@ fn deform_conv_output_dim(
     dilation: usize,
 ) -> Option<usize> {
     dcnv4_output_dim(input, padding, size, stride, dilation)
+}
+
+fn parse_foveation_film_spec(
+    section: &RawSection,
+    layer_index: usize,
+    input: TensorShape,
+    built_layers: &[Layer],
+) -> Result<FoveationFilmSpec> {
+    let line = section.line;
+    let invalid = |message: &str| {
+        Error::InvalidConfig(format!("[{}] at line {line}: {message}", section.name))
+    };
+    reject_section_keys(
+        section,
+        &[
+            "hf_layer",
+            "embed_dim",
+            "backprop_to_hf",
+            "film_init_scale",
+            "learning_rate",
+            "dont_update",
+            "burnin_update",
+            "train_only_bn",
+            "clip",
+            "grad_centr",
+            "batch_normalize",
+            "cbn",
+            "stream",
+            "wait_stream",
+        ],
+    )?;
+    if input.batch == 0 || input.width == 0 || input.height == 0 || input.channels == 0 {
+        return Err(invalid(
+            "preceding layer must output a non-empty NCHW tensor",
+        ));
+    }
+
+    let hf_layer_raw = section.get_isize("hf_layer", -1)?;
+    let hf_layer = if hf_layer_raw == -1 {
+        built_layers
+            .iter()
+            .rposition(|layer| matches!(layer.kind, LayerKind::HyperbolicFoveation(_)))
+            .ok_or_else(|| invalid("requires a preceding [hyperbolic_foveation] layer"))?
+    } else {
+        let resolved = if hf_layer_raw < -1 {
+            layer_index.checked_add_signed(hf_layer_raw)
+        } else {
+            usize::try_from(hf_layer_raw).ok()
+        }
+        .ok_or_else(|| invalid(&format!("invalid hf_layer={hf_layer_raw}")))?;
+        if resolved >= layer_index || resolved >= built_layers.len() {
+            return Err(invalid("hf_layer must reference an earlier layer"));
+        }
+        resolved
+    };
+    let selected_hf = built_layers
+        .get(hf_layer)
+        .ok_or_else(|| invalid("selected hf_layer does not exist"))?;
+    let param_count = match &selected_hf.kind {
+        LayerKind::HyperbolicFoveation(spec) => spec.param_count(),
+        _ => return Err(invalid("hf_layer must reference [hyperbolic_foveation]")),
+    };
+
+    let embed_dim_raw = section.get_i64("embed_dim", 256)?;
+    let embed_dim =
+        usize::try_from(embed_dim_raw.max(1)).map_err(|_| invalid("embed_dim is out of range"))?;
+    let backprop_to_hf = section.get_i64("backprop_to_hf", 1)? != 0;
+    let film_init_scale = section.get_f32("film_init_scale", 0.0)?;
+    if !film_init_scale.is_finite() {
+        return Err(invalid("film_init_scale must be finite"));
+    }
+    let learning_rate = section.get_f32("learning_rate", 1.0)?;
+    if !learning_rate.is_finite() || learning_rate < 0.0 {
+        return Err(invalid("learning_rate must be finite and non-negative"));
+    }
+    if section.get_i64("batch_normalize", 0)? != 0 || section.get_i64("cbn", 0)? != 0 {
+        return Err(invalid("batch normalization is unsupported"));
+    }
+    if section.get_f32("clip", 0.0)? != 0.0 || section.get_i64("grad_centr", 0)? != 0 {
+        return Err(invalid("clip and grad_centr are unsupported"));
+    }
+    if section.get_i64("stream", -1)? != -1 || section.get_i64("wait_stream", -1)? != -1 {
+        return Err(invalid(
+            "GPU stream options are unsupported in Stage-1 CPU support",
+        ));
+    }
+
+    embed_dim
+        .checked_mul(param_count)
+        .and_then(|value| value.checked_add(embed_dim))
+        .and_then(|value| {
+            input
+                .channels
+                .checked_mul(embed_dim)
+                .and_then(|c| c.checked_mul(2))
+                .and_then(|c| value.checked_add(c))
+        })
+        .and_then(|value| {
+            input
+                .channels
+                .checked_mul(2)
+                .and_then(|c| value.checked_add(c))
+        })
+        .ok_or_else(|| invalid("parameter count overflows"))?;
+
+    Ok(FoveationFilmSpec {
+        hf_layer,
+        param_count,
+        embed_dim,
+        backprop_to_hf,
+        film_init_scale,
+    })
 }
 
 fn reject_unknown_hyperbolic_foveation_keys(section: &RawSection) -> Result<()> {
@@ -10708,6 +10868,103 @@ output=2
                     .unwrap()
                     .net
                     .try_fix_nan
+            );
+        }
+    }
+
+    #[test]
+    fn foveation_film_alias_defaults_shape_and_source_order_weights() {
+        for alias in ["foveation_film", "hf_film"] {
+            let network = build(&format!(
+                "[net]\nwidth=5\nheight=3\nchannels=2\nbatch=2\n[hf]\nradius_mode=anisotropic\n[{alias}]\n"
+            ))
+            .unwrap_or_else(|error| panic!("[{alias}] should parse: {error}"));
+            let layer = &network.layers[1];
+            let super::LayerKind::FoveationFilm(spec) = &layer.kind else {
+                panic!("expected foveation film for [{alias}]");
+            };
+            assert_eq!(layer.kind.name(), "foveation_film");
+            assert_eq!(spec.hf_layer, 0);
+            assert_eq!(spec.param_count, 5);
+            assert_eq!(spec.embed_dim, 256);
+            assert!(spec.backprop_to_hf);
+            assert_eq!(spec.film_init_scale, 0.0);
+            assert_eq!(layer.output_shape, layer.input_shape);
+            assert_eq!(layer.output_shape, super::TensorShape::new(5, 3, 2, 2));
+            assert_eq!(
+                layer
+                    .weights()
+                    .unwrap()
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.array.name(), entry.len))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("w_embed", 256 * 5),
+                    ("b_embed", 256),
+                    ("w_gamma", 2 * 256),
+                    ("b_gamma", 2),
+                    ("w_beta", 2 * 256),
+                    ("b_beta", 2),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn foveation_film_resolves_nearest_absolute_and_relative_hf_layers() {
+        let config = |hf_layer: &str| {
+            build(&format!(
+                "[net]\nwidth=4\nheight=3\nchannels=1\n[hf]\nradius_mode=isotropic\n[convolutional]\nfilters=1\nsize=1\nactivation=linear\n[hf]\nradius_mode=anisotropic\n[convolutional]\nfilters=1\nsize=1\nactivation=linear\n[hf_film]\n{hf_layer}\n"
+            ))
+        };
+        for (option, expected_index, expected_params) in
+            [("", 2, 5), ("hf_layer=0", 0, 4), ("hf_layer=-4", 0, 4)]
+        {
+            let network = config(option).unwrap();
+            let super::LayerKind::FoveationFilm(spec) = &network.layers[4].kind else {
+                panic!("expected foveation film");
+            };
+            assert_eq!(
+                (spec.hf_layer, spec.param_count),
+                (expected_index, expected_params)
+            );
+        }
+    }
+
+    #[test]
+    fn foveation_film_rejects_unknown_options_and_invalid_hf_sources() {
+        let make = |extra: &str, layers: &str| {
+            build(&format!(
+                "[net]\nwidth=4\nheight=3\nchannels=1\n{layers}\n[foveation_film]\n{extra}\n"
+            ))
+        };
+        for (extra, layers, expected) in [
+            ("unknown=1", "[hf]", "unknown or unsupported option"),
+            (
+                "hf_layer=0",
+                "[convolutional]\nfilters=1\nsize=1",
+                "must reference [hyperbolic_foveation]",
+            ),
+            ("hf_layer=4", "[hf]", "must reference an earlier layer"),
+            ("hf_layer=-9", "[hf]", "invalid hf_layer"),
+            ("", "", "requires a preceding [hyperbolic_foveation] layer"),
+            (
+                "film_init_scale=NaN",
+                "[hf]",
+                "film_init_scale must be finite",
+            ),
+            (
+                "learning_rate=-1",
+                "[hf]",
+                "learning_rate must be finite and non-negative",
+            ),
+            ("stream=0", "[hf]", "GPU stream options are unsupported"),
+        ] {
+            let error = make(extra, layers).expect_err("invalid FiLM config must fail");
+            assert!(
+                error.to_string().contains(expected),
+                "{extra} {layers}: {error}"
             );
         }
     }

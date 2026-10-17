@@ -31,6 +31,7 @@ pub(crate) mod contrastive;
 pub(crate) mod dcnv4;
 pub(crate) mod deform_conv;
 pub(crate) mod dsconv;
+pub(crate) mod foveation_film;
 pub(crate) mod graph_conv;
 pub(crate) mod hyperbolic_foveation;
 pub use chart::{ChartPoint, write_training_chart};

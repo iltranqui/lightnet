@@ -3398,6 +3398,14 @@ fn print_forward_backward_summary(
                     || hf.pred_w2_updates.iter().any(|value| *value != 0.0)
                     || hf.pred_b2_updates.iter().any(|value| *value != 0.0)
             }
+            darknet_core::LayerTrainBuffers::FoveationFilm(film) => {
+                film.w_embed_updates.iter().any(|value| *value != 0.0)
+                    || film.b_embed_updates.iter().any(|value| *value != 0.0)
+                    || film.w_gamma_updates.iter().any(|value| *value != 0.0)
+                    || film.b_gamma_updates.iter().any(|value| *value != 0.0)
+                    || film.w_beta_updates.iter().any(|value| *value != 0.0)
+                    || film.b_beta_updates.iter().any(|value| *value != 0.0)
+            }
             darknet_core::LayerTrainBuffers::RecursiveBlock(recursive) => {
                 recursive
                     .controller_weight_updates

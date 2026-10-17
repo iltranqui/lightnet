@@ -36,6 +36,19 @@ pub fn initialize_training_params(network: &Network, params: &mut [LayerParams],
                     }
                 }
             }
+            LayerParams::FoveationFilm(p) => {
+                let crate::LayerKind::FoveationFilm(spec) = &layer.kind else {
+                    unreachable!("foveation-film parameters require a foveation-film layer");
+                };
+                rng.weights(&mut p.w_embed, spec.param_count);
+                p.b_embed.fill(0.0);
+                let projection_scale =
+                    (2.0 / spec.embed_dim.max(1) as f32).sqrt() * spec.film_init_scale;
+                rng.weights_with_scale(&mut p.w_gamma, projection_scale);
+                rng.weights_with_scale(&mut p.w_beta, projection_scale);
+                p.b_gamma.fill(0.0);
+                p.b_beta.fill(0.0);
+            }
             LayerParams::HyperbolicFoveation(p) => {
                 let crate::LayerKind::HyperbolicFoveation(spec) = &layer.kind else {
                     unreachable!("hyperbolic-foveation parameters require matching layer kind");

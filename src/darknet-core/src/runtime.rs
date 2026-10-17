@@ -77,15 +77,17 @@ impl GradMode {
 }
 
 fn reject_gpu_hyperbolic_foveation(network: &Network, operation: &str) -> Result<()> {
-    if let Some(layer) = network
-        .layers
-        .iter()
-        .find(|layer| matches!(layer.kind, LayerKind::HyperbolicFoveation(_)))
-    {
+    if let Some(layer) = network.layers.iter().find(|layer| {
+        matches!(
+            layer.kind,
+            LayerKind::HyperbolicFoveation(_) | LayerKind::FoveationFilm(_)
+        )
+    }) {
         return Err(Error::UnsupportedLayer {
             layer_index: layer.index,
             name: format!(
-                "[hyperbolic_foveation] GPU {operation} is not implemented in Stage-1 CPU support"
+                "[{}] GPU {operation} is not implemented in Stage-1 CPU support",
+                layer.kind.name()
             ),
         });
     }
@@ -319,6 +321,27 @@ pub struct HyperbolicFoveationParams {
     pub pred_b2: Vec<f32>,
 }
 
+/// `[foveation_film]`'s embedding and per-channel affine projection parameters.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FoveationFilmParams {
+    pub w_embed: Vec<f32>,
+    pub b_embed: Vec<f32>,
+    pub w_gamma: Vec<f32>,
+    pub b_gamma: Vec<f32>,
+    pub w_beta: Vec<f32>,
+    pub b_beta: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FoveationFilmTrainBuffers {
+    pub w_embed_updates: Vec<f32>,
+    pub b_embed_updates: Vec<f32>,
+    pub w_gamma_updates: Vec<f32>,
+    pub b_gamma_updates: Vec<f32>,
+    pub w_beta_updates: Vec<f32>,
+    pub b_beta_updates: Vec<f32>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct HyperbolicFoveationTrainBuffers {
     pub hf_param_updates: Vec<f32>,
@@ -340,6 +363,7 @@ pub struct RecursiveBlockTrainBuffers {
 pub enum LayerParams {
     None,
     RecursiveBlock(RecursiveBlockParams),
+    FoveationFilm(FoveationFilmParams),
     HyperbolicFoveation(HyperbolicFoveationParams),
     BatchNorm(BatchNormParams),
     Convolutional(ConvolutionalParams),
@@ -558,6 +582,7 @@ pub struct KimiKdaTrainBuffers {
 pub enum LayerTrainBuffers {
     None,
     RecursiveBlock(RecursiveBlockTrainBuffers),
+    FoveationFilm(FoveationFilmTrainBuffers),
     HyperbolicFoveation(HyperbolicFoveationTrainBuffers),
     BatchNorm(StandaloneBatchNormTrainBuffers),
     Convolutional(ConvolutionalTrainBuffers),
@@ -783,6 +808,7 @@ pub struct ForwardResult {
     pub(crate) clifford_caches: Vec<Option<CliffordRuntimeCache>>,
     pub(crate) recursive_block_caches: Vec<Option<RecursiveBlockForwardCache>>,
     pub(crate) hyperbolic_foveation_caches: Vec<Option<HyperbolicFoveationForwardCache>>,
+    pub(crate) foveation_film_caches: Vec<Option<crate::foveation_film::FoveationFilmForwardCache>>,
     pub vit_caches: Vec<Option<crate::vit::VitForwardCache>>,
     pub swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>>,
     pub tucker_attention_caches: Vec<Option<crate::tucker_attention::TuckerAttentionForwardCache>>,
@@ -819,6 +845,7 @@ impl ForwardResult {
             clifford_caches: Vec::new(),
             recursive_block_caches: Vec::new(),
             hyperbolic_foveation_caches: Vec::new(),
+            foveation_film_caches: Vec::new(),
             vit_caches: Vec::new(),
             swin_caches: Vec::new(),
             tucker_attention_caches: Vec::new(),
@@ -855,6 +882,7 @@ mod forward_result_from_heads_tests {
         assert!(result.graph_conv_caches.is_empty());
         assert!(result.wmhf_caches.is_empty());
         assert!(result.hyperbolic_foveation_caches.is_empty());
+        assert!(result.foveation_film_caches.is_empty());
         assert!(result.vit_caches.is_empty());
         assert!(result.swin_caches.is_empty());
         assert!(result.tucker_attention_caches.is_empty());
@@ -1273,6 +1301,11 @@ impl ExecutableNetwork {
                         &self.params[index],
                         state,
                     )?,
+                    LayerKind::FoveationFilm(_) => validate_foveation_film_adam_state(
+                        &self.network.layers[index],
+                        &self.params[index],
+                        state,
+                    )?,
                     _ => {}
                 }
             }
@@ -1390,6 +1423,21 @@ impl ExecutableNetwork {
             {
                 update_hyperbolic_foveation_sgd(
                     spec,
+                    params,
+                    train,
+                    lr * opts.learning_rate_scale,
+                    momentum,
+                    batch,
+                );
+                continue;
+            }
+            if let (
+                LayerKind::FoveationFilm(_),
+                LayerParams::FoveationFilm(params),
+                LayerTrainBuffers::FoveationFilm(train),
+            ) = (&layer.kind, &mut *params, &mut *train)
+            {
+                update_foveation_film_sgd(
                     params,
                     train,
                     lr * opts.learning_rate_scale,
@@ -2423,7 +2471,9 @@ impl ExecutableNetwork {
         let mut wmhf_caches = Vec::with_capacity(self.network.layers.len());
         let mut clifford_caches = Vec::with_capacity(self.network.layers.len());
         let mut recursive_block_caches = Vec::with_capacity(self.network.layers.len());
-        let mut hyperbolic_foveation_caches = Vec::with_capacity(self.network.layers.len());
+        let mut hyperbolic_foveation_caches: Vec<Option<HyperbolicFoveationForwardCache>> =
+            Vec::with_capacity(self.network.layers.len());
+        let mut foveation_film_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches = Vec::with_capacity(self.network.layers.len());
         let mut swin_caches = Vec::with_capacity(self.network.layers.len());
         let mut tucker_attention_caches = Vec::with_capacity(self.network.layers.len());
@@ -2462,6 +2512,7 @@ impl ExecutableNetwork {
             let mut clifford_cache = None;
             let mut recursive_block_cache = None;
             let mut hyperbolic_foveation_cache = None;
+            let mut foveation_film_cache = None;
             let (output, activation_input) = match (&layer.kind, params) {
                 (
                     LayerKind::HyperbolicFoveation(spec),
@@ -2478,6 +2529,30 @@ impl ExecutableNetwork {
                     )?;
                     hyperbolic_foveation_cache = Some(cache);
                     (output, None)
+                }
+                (LayerKind::FoveationFilm(spec), LayerParams::FoveationFilm(params)) => {
+                    let hf_cache = hyperbolic_foveation_caches
+                        .get(spec.hf_layer)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "[foveation_film] selected HF layer #{} has no forward cache",
+                                spec.hf_layer
+                            ))
+                        })?;
+                    let (output, cache) = crate::foveation_film::forward_nchw(
+                        &current_input.data,
+                        &hf_cache.params_per_batch,
+                        layer.input_shape.batch,
+                        layer.input_shape.channels,
+                        layer.input_shape.height,
+                        layer.input_shape.width,
+                        spec.param_count,
+                        spec.embed_dim,
+                        params,
+                    )?;
+                    foveation_film_cache = Some(cache);
+                    (Tensor::from_data(layer.output_shape, output)?, None)
                 }
                 (LayerKind::RecursiveBlock(spec), LayerParams::RecursiveBlock(params)) => {
                     let (output, cache) = forward_recursive_block(
@@ -3136,6 +3211,7 @@ impl ExecutableNetwork {
             clifford_caches.push(clifford_cache);
             recursive_block_caches.push(recursive_block_cache);
             hyperbolic_foveation_caches.push(hyperbolic_foveation_cache);
+            foveation_film_caches.push(foveation_film_cache);
             vit_caches.push(vit_cache);
             swin_caches.push(swin_cache);
             tucker_attention_caches.push(tucker_attention_cache);
@@ -3159,6 +3235,7 @@ impl ExecutableNetwork {
             clifford_caches,
             recursive_block_caches,
             hyperbolic_foveation_caches,
+            foveation_film_caches,
             vit_caches,
             swin_caches,
             tucker_attention_caches,
@@ -3327,6 +3404,13 @@ impl ExecutableNetwork {
                 forward.recursive_block_caches.len()
             )));
         }
+        if forward.foveation_film_caches.len() != self.network.layers.len() {
+            return Err(Error::InvalidConfig(format!(
+                "forward [foveation_film] cache count mismatch: expected {}, got {}",
+                self.network.layers.len(),
+                forward.foveation_film_caches.len()
+            )));
+        }
         if layer_output_gradient_seeds.len() != self.network.layers.len() {
             return Err(Error::InvalidConfig(format!(
                 "backward seed count mismatch: expected {}, got {}",
@@ -3349,6 +3433,8 @@ impl ExecutableNetwork {
             .iter()
             .map(default_layer_params)
             .collect::<Vec<_>>();
+        let mut foveation_hf_auxiliary_gradients: Vec<Option<Vec<f32>>> =
+            vec![None; self.network.layers.len()];
         for gradient in &mut param_gradients {
             if let LayerParams::HyperbolicFoveation(gradient) = gradient {
                 gradient.hf_params.fill(0.0);
@@ -3401,9 +3487,26 @@ impl ExecutableNetwork {
                         crate::model::HfWarpSource::Previous => current_input,
                         crate::model::HfWarpSource::NetworkInput => input,
                     };
-                    let auxiliary_gradient = hf_auxiliary_param_gradients
+                    let mut auxiliary_gradient = hf_auxiliary_param_gradients
                         .and_then(|gradients| gradients.get(layer.index))
-                        .and_then(Option::as_deref);
+                        .and_then(Option::as_ref)
+                        .cloned();
+                    if let Some(film_gradient) = foveation_hf_auxiliary_gradients
+                        .get(layer.index)
+                        .and_then(Option::as_ref)
+                    {
+                        let combined = auxiliary_gradient
+                            .get_or_insert_with(|| vec![0.0; film_gradient.len()]);
+                        if combined.len() != film_gradient.len() {
+                            return Err(Error::InvalidConfig(format!(
+                                "[foveation_film] HF auxiliary gradient layout mismatch at layer #{}",
+                                layer.index
+                            )));
+                        }
+                        for (combined, film) in combined.iter_mut().zip(film_gradient) {
+                            *combined += *film;
+                        }
+                    }
                     let (warp_gradient, predictor_gradient, param_gradient) =
                         backward_hyperbolic_foveation(
                             spec,
@@ -3411,7 +3514,7 @@ impl ExecutableNetwork {
                             warp_input,
                             &grad,
                             cache,
-                            auxiliary_gradient,
+                            auxiliary_gradient.as_deref(),
                         )?;
                     let Some(slot) = param_gradients.get_mut(layer.index) else {
                         return Err(Error::InvalidConfig(format!(
@@ -3449,6 +3552,77 @@ impl ExecutableNetwork {
                             )?;
                         }
                     }
+                }
+                (LayerKind::FoveationFilm(spec), LayerParams::FoveationFilm(params)) => {
+                    let film_cache = forward
+                        .foveation_film_caches
+                        .get(layer.index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing [foveation_film] forward cache for layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let hf_cache = forward
+                        .hyperbolic_foveation_caches
+                        .get(spec.hf_layer)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "[foveation_film] selected HF layer #{} has no forward cache",
+                                spec.hf_layer
+                            ))
+                        })?;
+                    let gradients = crate::foveation_film::backward_nchw(
+                        &current_input.data,
+                        &grad.data,
+                        &hf_cache.params_per_batch,
+                        layer.input_shape.batch,
+                        layer.input_shape.channels,
+                        layer.input_shape.height,
+                        layer.input_shape.width,
+                        spec.param_count,
+                        spec.embed_dim,
+                        params,
+                        film_cache,
+                    )?;
+                    if spec.backprop_to_hf {
+                        let Some(slot) = foveation_hf_auxiliary_gradients.get_mut(spec.hf_layer)
+                        else {
+                            return Err(Error::InvalidConfig(format!(
+                                "[foveation_film] selected HF layer #{} is unavailable during backward",
+                                spec.hf_layer
+                            )));
+                        };
+                        if let Some(existing) = slot {
+                            if existing.len() != gradients.hf_params.len() {
+                                return Err(Error::InvalidConfig(format!(
+                                    "[foveation_film] selected HF layer #{} gradient layout mismatch",
+                                    spec.hf_layer
+                                )));
+                            }
+                            for (sum, value) in existing.iter_mut().zip(&gradients.hf_params) {
+                                *sum += *value;
+                            }
+                        } else {
+                            *slot = Some(gradients.hf_params.clone());
+                        }
+                    }
+                    let Some(slot) = param_gradients.get_mut(layer.index) else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing [foveation_film] parameter-gradient slot for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    *slot = LayerParams::FoveationFilm(gradients.params);
+                    let layer_input_gradient = Tensor::from_data(layer.input_shape, gradients.input)?;
+                    accumulate_previous_gradient(
+                        layer.index,
+                        &layer_input_gradient,
+                        &mut input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
                 }
                 (LayerKind::RecursiveBlock(spec), LayerParams::RecursiveBlock(params)) => {
                     let cache = forward
@@ -5810,6 +5984,25 @@ impl ExecutableNetwork {
                     accumulate_vec(&mut train.pred_w2_updates, &gradient.pred_w2)?;
                     accumulate_vec(&mut train.pred_b2_updates, &gradient.pred_b2)?;
                 }
+                (
+                    LayerKind::FoveationFilm(_),
+                    LayerParams::FoveationFilm(gradient),
+                ) => {
+                    let Some(LayerTrainBuffers::FoveationFilm(train)) =
+                        self.train_buffers.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing [foveation_film] train buffers for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    accumulate_vec(&mut train.w_embed_updates, &gradient.w_embed)?;
+                    accumulate_vec(&mut train.b_embed_updates, &gradient.b_embed)?;
+                    accumulate_vec(&mut train.w_gamma_updates, &gradient.w_gamma)?;
+                    accumulate_vec(&mut train.b_gamma_updates, &gradient.b_gamma)?;
+                    accumulate_vec(&mut train.w_beta_updates, &gradient.w_beta)?;
+                    accumulate_vec(&mut train.b_beta_updates, &gradient.b_beta)?;
+                }
                 (LayerKind::BatchNorm(_), LayerParams::BatchNorm(gradient)) => {
                     let Some(LayerTrainBuffers::BatchNorm(train)) =
                         self.train_buffers.get_mut(layer.index)
@@ -7017,6 +7210,14 @@ fn host_adam_scalar_capacity(params: &LayerParams) -> usize {
                     .map(host_adam_scalar_capacity)
                     .sum::<usize>()
         }
+        LayerParams::FoveationFilm(params) => {
+            params.w_embed.len()
+                + params.b_embed.len()
+                + params.w_gamma.len()
+                + params.b_gamma.len()
+                + params.w_beta.len()
+                + params.b_beta.len()
+        }
         LayerParams::HyperbolicFoveation(params) => {
             if params.pred_b1.is_empty() {
                 params.hf_params.len()
@@ -7265,6 +7466,46 @@ fn validate_hyperbolic_foveation_adam_slot(
             "hyperbolic-foveation Adam {name} moments are missing (expected {expected_len})"
         ))),
     }
+}
+
+fn validate_foveation_film_adam_state(
+    layer: &crate::model::Layer,
+    params: &LayerParams,
+    state: &HostAdamLayerState,
+) -> Result<()> {
+    let (LayerKind::FoveationFilm(spec), LayerParams::FoveationFilm(params)) =
+        (&layer.kind, params)
+    else {
+        return Err(Error::Weights(
+            "[foveation_film] Adam state does not match layer parameters".to_owned(),
+        ));
+    };
+    validate_foveation_film_param_layout(spec, layer.input_shape.channels, params)
+        .map_err(|error| Error::Weights(error.to_string()))?;
+    validate_host_adam_slot("embedding weight", &state.weights, params.w_embed.len())?;
+    validate_host_adam_slot("embedding bias", &state.biases, params.b_embed.len())?;
+    validate_host_adam_slot("projection scale", &state.scales, 0)?;
+    if state.children.len() != 2 {
+        return Err(Error::Weights(format!(
+            "[foveation_film] Adam projection state has {} children, expected 2",
+            state.children.len()
+        )));
+    }
+    for (index, child) in state.children.iter().enumerate() {
+        if !child.children.is_empty() || child.scales.is_some() {
+            return Err(Error::Weights(format!(
+                "[foveation_film] Adam projection child {index} has unexpected nested state"
+            )));
+        }
+        let (weights, biases) = if index == 0 {
+            (params.w_gamma.len(), params.b_gamma.len())
+        } else {
+            (params.w_beta.len(), params.b_beta.len())
+        };
+        validate_host_adam_slot("projection weight", &child.weights, weights)?;
+        validate_host_adam_slot("projection bias", &child.biases, biases)?;
+    }
+    Ok(())
 }
 
 fn validate_hyperbolic_foveation_adam_state(
@@ -12601,6 +12842,7 @@ where
                 clifford_caches: vec![None; self.network.layers.len()],
                 recursive_block_caches: vec![None; self.network.layers.len()],
                 hyperbolic_foveation_caches: vec![None; self.network.layers.len()],
+                foveation_film_caches: vec![None; self.network.layers.len()],
                 vit_caches,
                 swin_caches,
                 tucker_attention_caches,
@@ -17286,6 +17528,14 @@ fn zero_vit_weights(weights: &mut crate::vit::VitWeights) {
 
 fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
     match &layer.kind {
+        LayerKind::FoveationFilm(spec) => LayerParams::FoveationFilm(FoveationFilmParams {
+            w_embed: vec![0.0; spec.embed_dim * spec.param_count],
+            b_embed: vec![0.0; spec.embed_dim],
+            w_gamma: vec![0.0; layer.input_shape.channels * spec.embed_dim],
+            b_gamma: vec![0.0; layer.input_shape.channels],
+            w_beta: vec![0.0; layer.input_shape.channels * spec.embed_dim],
+            b_beta: vec![0.0; layer.input_shape.channels],
+        }),
         LayerKind::RecursiveBlock(spec) => {
             let controller_outputs = if spec.ouroboros == 1 {
                 layer.input_shape.channels * 2
@@ -17530,6 +17780,16 @@ fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
 
 fn default_layer_train_buffers(layer: &crate::model::Layer) -> LayerTrainBuffers {
     match &layer.kind {
+        LayerKind::FoveationFilm(spec) => {
+            LayerTrainBuffers::FoveationFilm(FoveationFilmTrainBuffers {
+                w_embed_updates: vec![0.0; spec.embed_dim * spec.param_count],
+                b_embed_updates: vec![0.0; spec.embed_dim],
+                w_gamma_updates: vec![0.0; layer.input_shape.channels * spec.embed_dim],
+                b_gamma_updates: vec![0.0; layer.input_shape.channels],
+                w_beta_updates: vec![0.0; layer.input_shape.channels * spec.embed_dim],
+                b_beta_updates: vec![0.0; layer.input_shape.channels],
+            })
+        }
         LayerKind::RecursiveBlock(spec) => {
             let controller_outputs = if spec.ouroboros == 1 {
                 layer.input_shape.channels * 2
@@ -17814,6 +18074,42 @@ fn clamp_hyperbolic_foveation_params(
     }
     let strength = params.hf_params.len() - 1;
     params.hf_params[strength] = params.hf_params[strength].clamp(0.0, 1.0);
+}
+
+pub(crate) fn validate_foveation_film_param_layout(
+    spec: &crate::model::FoveationFilmSpec,
+    channels: usize,
+    params: &FoveationFilmParams,
+) -> Result<()> {
+    let embed_weights = spec
+        .embed_dim
+        .checked_mul(spec.param_count)
+        .ok_or_else(|| Error::InvalidConfig("[foveation_film] embedding size overflows".to_owned()))?;
+    let channel_weights = channels
+        .checked_mul(spec.embed_dim)
+        .ok_or_else(|| Error::InvalidConfig("[foveation_film] channel size overflows".to_owned()))?;
+    let actual = (
+        params.w_embed.len(),
+        params.b_embed.len(),
+        params.w_gamma.len(),
+        params.b_gamma.len(),
+        params.w_beta.len(),
+        params.b_beta.len(),
+    );
+    let expected = (
+        embed_weights,
+        spec.embed_dim,
+        channel_weights,
+        channels,
+        channel_weights,
+        channels,
+    );
+    if spec.param_count == 0 || spec.embed_dim == 0 || channels == 0 || actual != expected {
+        return Err(Error::InvalidConfig(format!(
+            "[foveation_film] parameter layout mismatch: expected {expected:?}, got {actual:?}"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_hyperbolic_foveation_param_layout(
@@ -19635,6 +19931,53 @@ fn apply_host_adam_layer(
             }
             clamp_hyperbolic_foveation_params(spec, params);
         }
+        (LayerParams::FoveationFilm(params), LayerTrainBuffers::FoveationFilm(train)) => {
+            let LayerKind::FoveationFilm(spec) = kind else {
+                return Err(Error::InvalidConfig(
+                    "[foveation_film] parameters do not match layer kind during Adam update"
+                        .to_owned(),
+                ));
+            };
+            validate_foveation_film_param_layout(spec, params.b_gamma.len(), params)?;
+            apply_host_adam(
+                &mut params.w_embed,
+                &mut train.w_embed_updates,
+                &mut state.weights,
+                adam,
+            )?;
+            apply_host_adam_non_weight(
+                &mut params.b_embed,
+                &mut train.b_embed_updates,
+                &mut state.biases,
+                adam,
+            )?;
+            let gamma = host_adam_child(state, 0);
+            apply_host_adam(
+                &mut params.w_gamma,
+                &mut train.w_gamma_updates,
+                &mut gamma.weights,
+                adam,
+            )?;
+            apply_host_adam_non_weight(
+                &mut params.b_gamma,
+                &mut train.b_gamma_updates,
+                &mut gamma.biases,
+                adam,
+            )?;
+            let beta = host_adam_child(state, 1);
+            apply_host_adam(
+                &mut params.w_beta,
+                &mut train.w_beta_updates,
+                &mut beta.weights,
+                adam,
+            )?;
+            apply_host_adam_non_weight(
+                &mut params.b_beta,
+                &mut train.b_beta_updates,
+                &mut beta.biases,
+                adam,
+            )?;
+        }
         (LayerParams::RecursiveBlock(params), LayerTrainBuffers::RecursiveBlock(train)) => {
             let LayerKind::RecursiveBlock(spec) = kind else {
                 return Err(Error::InvalidConfig(
@@ -20344,6 +20687,27 @@ fn update_clifford_params(
     }
 }
 
+fn update_foveation_film_sgd(
+    params: &mut FoveationFilmParams,
+    train: &mut FoveationFilmTrainBuffers,
+    lr: f32,
+    momentum: f32,
+    batch: usize,
+) {
+    for (weights, updates) in [
+        (&mut params.w_embed, &mut train.w_embed_updates),
+        (&mut params.w_gamma, &mut train.w_gamma_updates),
+        (&mut params.w_beta, &mut train.w_beta_updates),
+        (&mut params.b_embed, &mut train.b_embed_updates),
+        (&mut params.b_gamma, &mut train.b_gamma_updates),
+        (&mut params.b_beta, &mut train.b_beta_updates),
+    ] {
+        // C++'s decay argument is unused for this layer; preserve the Rust
+        // runtime's downhill-update sign convention and do not decay biases.
+        sgd_update(weights, updates, lr, momentum, 0.0, batch);
+    }
+}
+
 fn update_hyperbolic_foveation_sgd(
     spec: &crate::model::HyperbolicFoveationSpec,
     params: &mut HyperbolicFoveationParams,
@@ -20821,6 +21185,21 @@ fn load_weights_into_params(
                     read_f32_into(&mut file, &mut hf.pred_w2)?;
                     read_f32_into(&mut file, &mut hf.pred_b2)?;
                 }
+            }
+            LayerParams::FoveationFilm(film) => {
+                let LayerKind::FoveationFilm(spec) = &layer.kind else {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} foveation-film parameters do not match layer kind",
+                        layer.index
+                    )));
+                };
+                validate_foveation_film_param_layout(spec, layer.input_shape.channels, film)?;
+                read_f32_into(&mut file, &mut film.w_embed)?;
+                read_f32_into(&mut file, &mut film.b_embed)?;
+                read_f32_into(&mut file, &mut film.w_gamma)?;
+                read_f32_into(&mut file, &mut film.b_gamma)?;
+                read_f32_into(&mut file, &mut film.w_beta)?;
+                read_f32_into(&mut file, &mut film.b_beta)?;
             }
             LayerParams::RecursiveBlock(recursive) => {
                 let LayerKind::RecursiveBlock(spec) = &layer.kind else {
@@ -44623,4 +45002,6 @@ probability=0.5
 
     #[path = "hyperbolic_foveation_runtime_tests.rs"]
     mod hyperbolic_foveation_runtime_tests;
+    #[path = "foveation_film_runtime_tests.rs"]
+    mod foveation_film_runtime_tests;
 }

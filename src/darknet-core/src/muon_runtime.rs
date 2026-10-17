@@ -208,6 +208,41 @@ pub(crate) fn visit_muon_matrices(
     }
     match (kind, params, train) {
         (
+            LayerKind::FoveationFilm(spec),
+            LayerParams::FoveationFilm(params),
+            LayerTrainBuffers::FoveationFilm(train),
+        ) => {
+            crate::runtime::validate_foveation_film_param_layout(
+                spec,
+                input_shape.channels,
+                params,
+            )?;
+            visit_matrix(
+                &mut params.w_embed,
+                &mut train.w_embed_updates,
+                spec.embed_dim,
+                spec.param_count,
+                1.0,
+                visitor,
+            )?;
+            visit_matrix(
+                &mut params.w_gamma,
+                &mut train.w_gamma_updates,
+                input_shape.channels,
+                spec.embed_dim,
+                1.0,
+                visitor,
+            )?;
+            visit_matrix(
+                &mut params.w_beta,
+                &mut train.w_beta_updates,
+                input_shape.channels,
+                spec.embed_dim,
+                1.0,
+                visitor,
+            )
+        }
+        (
             LayerKind::HyperbolicFoveation(spec),
             LayerParams::HyperbolicFoveation(params),
             LayerTrainBuffers::HyperbolicFoveation(train),
