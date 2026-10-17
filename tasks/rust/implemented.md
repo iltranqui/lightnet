@@ -58,6 +58,7 @@ file is named inline.
 - [23. Clifford Stage-1 CPU reference](#23-clifford-stage-1-cpu-reference)
 - [24. Recursive-block Stage-1 CPU reference](#24-recursive-block-stage-1-cpu-reference)
 - [25. Hyperbolic-foveation Stage-1 CPU reference](#25-hyperbolic-foveation-stage-1-cpu-reference)
+- [26. Foveation FiLM Stage-1 CPU reference](#26-foveation-film-stage-1-cpu-reference)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -821,7 +822,13 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 - v0.1.008 (`f7b044bc84c6b19ed5b99cc97633fd859724db74`): integrated strict `[hyperbolic_foveation]` / `[hf]` config and shape handling, source-derived NCHW warp and learned predictor, deterministic init, source-order weights, exact finite-iteration inverse derivatives, alternate predictor/network-input fan-in, label-driven tiny-box/strength regularizers, SGD/AdamW/Muon updates and state validation, and axis-aligned/OBB/CARPN detection plus mAP reprojection.
 - Full and compact GPU execution, f16 inference, GPU backward and optimizer updates explicitly reject this Stage-1 CPU-only layer. No CUDA/Oxide fallback or kernel was added.
 - Verification: `MEM=3G ./tools/test_host.sh hyperbolic_foveation` passed 30 core tests; `runtime` passed 231; `weights` passed 47 core + 2 CLI; `detect` passed 36 core + 10 CLI. Targeted Rustfmt and `git diff --check` passed. No training, Oxide tests, or feature-specific `cfg_corpus` run.
-- Evidence boundary: source-derived from `Jev_laya`; its layer macro is disabled and no compiled-C++ golden/parity is available. `foveation_film`, native GPU support, and the other Phase 4 layers remain open.
+- Evidence boundary: source-derived from `Jev_laya`; its layer macro is disabled and no compiled-C++ golden/parity is available. `foveation_film` Stage-1 CPU support is tracked in §26; native GPU support and the other Phase 4 layers remain open.
+
+## 26. Foveation FiLM Stage-1 CPU reference
+
+- v0.1.009 (`51e381b8a94ae4e23ecc8054f6045a128f87fc8f`): integrated `[foveation_film]` / `[hf_film]` with strict HF-source resolution, source-order six-block parameters, deterministic initialization, NCHW CPU forward, exact backward, additive HF parameter gradients, learned-predictor/source-feature fan-in, SGD/AdamW/Muon updates, and optimizer state validation/persistence. Full/compact/f16 GPU inference, backward, and optimizer updates reject explicitly; no CUDA/Oxide or host fallback was added.
+- Verification: `MEM=3G ./tools/test_host.sh foveation_film` passed 12 core tests; `runtime` passed 237; `weights` passed 49 core + 2 CLI. Coverage includes NCHW hand math and finite differences, predictor/source finite differences, detached and additive HF gradients, multiple FiLM sources, train-buffer accumulation, initialization identity/seed reproducibility, exact source-order bytes/file size, optimizer state persistence/gating, and GPU rejection. Rustfmt check passed for new math/runtime-test files; `git diff --check` passed. No training, Oxide tests, or feature-specific `cfg_corpus` run.
+- Evidence boundary: hand-derived from `Jev_laya`; `LAYER_FOVEATION_FILM` is disabled, so no compiled-C++ golden/parity is available. C++ SGD has a different sign convention; Rust uses the established downhill-update convention and makes no update-parity claim. Stage-1 CPU only; native GPU support and GPU Muon remain Stage 2. Depth-Anything/DPT, YOLO-3D, and DETR remain open, so the overall roadmap is not complete.
 
 ## Not implemented / open (pointer)
 
