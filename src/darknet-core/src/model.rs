@@ -1400,7 +1400,28 @@ pub struct RegionSpec {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct RecursiveBlockSpec {
+    pub loops: usize,
+    pub injection: bool,
+    pub body_scale: f32,
+    pub residual_scale: f32,
+    pub injection_scale: f32,
+    /// 0: static blend; 1: controller-gated Ouroboros recurrence.
+    pub ouroboros: usize,
+    pub gate_bias: f32,
+    pub gamma_clip: f32,
+    pub gate_clip: f32,
+    pub lattice_group: usize,
+    pub lattice_threshold: f32,
+    pub lattice_temperature: f32,
+    pub lattice_mix: f32,
+    /// Consumed nested body layers, in cfg source order.
+    pub body: Vec<Layer>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum LayerKind {
+    RecursiveBlock(RecursiveBlockSpec),
     Convolutional(ConvolutionalSpec),
     Deconvolutional(DeconvolutionalSpec),
     Connected(ConnectedSpec),
@@ -1502,6 +1523,7 @@ pub enum LayerKind {
 impl LayerKind {
     pub fn name(&self) -> &str {
         match self {
+            Self::RecursiveBlock(_) => "recursive_block",
             Self::Convolutional(_) => "convolutional",
             Self::Deconvolutional(_) => "deconvolutional",
             Self::Connected(_) => "connected",
@@ -1568,6 +1590,7 @@ impl LayerKind {
     /// The elementwise activation this layer applies, if it has one.
     pub fn activation(&self) -> Option<&Activation> {
         match self {
+            Self::RecursiveBlock(_) => None,
             Self::Convolutional(spec) => Some(&spec.activation),
             Self::GraphConv(spec) => Some(&spec.activation),
             Self::Dcnv4(spec) => Some(&spec.activation),
@@ -1714,6 +1737,15 @@ pub struct Layer {
 impl Layer {
     pub fn weights(&self) -> Option<LayerWeights> {
         match &self.kind {
+            LayerKind::RecursiveBlock(spec) => {
+                let entries = spec
+                    .body
+                    .iter()
+                    .filter_map(Layer::weights)
+                    .flat_map(|weights| weights.entries)
+                    .collect::<Vec<_>>();
+                (!entries.is_empty()).then_some(LayerWeights { entries })
+            }
             LayerKind::Convolutional(spec) => {
                 if spec.share_index.is_some() {
                     return None;
@@ -2571,18 +2603,37 @@ impl Network {
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
 
-        for (index, section) in cfg.sections.iter().enumerate().skip(1) {
-            let layer_index = index - 1;
+        let mut section_index = 1;
+        while let Some(section) = cfg.sections.get(section_index) {
+            let layer_index = layers.len();
             let input_shape = current;
-            let kind = parse_layer_kind(
-                section,
-                layer_index,
-                current,
-                &layers,
-                &cfg_parent,
-                net.time_steps,
-                net.obb,
-            )?;
+            let (kind, consumed_body_sections) =
+                if matches!(section.name.as_str(), "recursive_block" | "recurrent_block") {
+                    let spec = parse_recursive_block_spec(
+                        section,
+                        &cfg.sections,
+                        section_index,
+                        current,
+                        &cfg_parent,
+                        net.time_steps,
+                        net.obb,
+                    )?;
+                    let consumed = spec.body.len();
+                    (LayerKind::RecursiveBlock(spec), consumed)
+                } else {
+                    (
+                        parse_layer_kind(
+                            section,
+                            layer_index,
+                            current,
+                            &layers,
+                            &cfg_parent,
+                            net.time_steps,
+                            net.obb,
+                        )?,
+                        0,
+                    )
+                };
             if let Some(activation) = kind.activation()
                 && let Activation::Other(name) = activation
             {
@@ -2625,6 +2676,7 @@ impl Network {
             });
 
             current = output_shape;
+            section_index += consumed_body_sections + 1;
         }
 
         // C++ `set_train_only_bn`: the flag of a layer also applies to every
@@ -2657,8 +2709,7 @@ impl Network {
         let mut network = self.clone();
         network.net.batch = batch;
         for layer in &mut network.layers {
-            layer.input_shape.batch = batch;
-            layer.output_shape.batch = batch;
+            set_layer_batch(layer, batch);
         }
         network
     }
@@ -2673,11 +2724,7 @@ impl Network {
                 "network input size must be non-zero".to_owned(),
             ));
         }
-        if self
-            .layers
-            .iter()
-            .any(|layer| matches!(layer.kind, LayerKind::Connected(_)))
-        {
+        if self.layers.iter().any(layer_contains_connected) {
             return Err(Error::InvalidConfig(
                 "multi-scale resizing is not supported for networks with connected layers"
                     .to_owned(),
@@ -2692,13 +2739,389 @@ impl Network {
             } else {
                 network.layers[index - 1].output_shape
             };
-            let kind = network.layers[index].kind.clone();
+            let mut kind = network.layers[index].kind.clone();
+            if let LayerKind::RecursiveBlock(spec) = &mut kind {
+                reshape_recursive_body(spec, current, index)?;
+            }
             let output = infer_output_shape(&kind, index, current, &network.layers[..index])?;
+            network.layers[index].kind = kind;
             network.layers[index].input_shape = current;
             network.layers[index].output_shape = output;
         }
         Ok(network)
     }
+}
+
+fn set_layer_batch(layer: &mut Layer, batch: usize) {
+    layer.input_shape.batch = batch;
+    layer.output_shape.batch = batch;
+    if let LayerKind::RecursiveBlock(spec) = &mut layer.kind {
+        for body_layer in &mut spec.body {
+            set_layer_batch(body_layer, batch);
+        }
+    }
+}
+
+fn layer_contains_connected(layer: &Layer) -> bool {
+    match &layer.kind {
+        LayerKind::Connected(_) => true,
+        LayerKind::RecursiveBlock(spec) => spec.body.iter().any(layer_contains_connected),
+        _ => false,
+    }
+}
+
+fn reshape_recursive_body(
+    spec: &mut RecursiveBlockSpec,
+    input_shape: TensorShape,
+    parent_index: usize,
+) -> Result<()> {
+    let mut current = input_shape;
+    let mut built = Vec::with_capacity(spec.body.len());
+    for index in 0..spec.body.len() {
+        let mut kind = spec.body[index].kind.clone();
+        if let LayerKind::RecursiveBlock(nested) = &mut kind {
+            reshape_recursive_body(nested, current, index)?;
+        }
+        let output = infer_output_shape(&kind, index, current, &built)?;
+        spec.body[index].kind = kind;
+        spec.body[index].index = index;
+        spec.body[index].input_shape = current;
+        spec.body[index].output_shape = output;
+        built.push(spec.body[index].clone());
+        current = output;
+    }
+    if current.width != input_shape.width
+        || current.height != input_shape.height
+        || current.channels != input_shape.channels
+    {
+        return Err(Error::InvalidConfig(format!(
+            "[recursive_block] layer #{parent_index}: resized body output {} must match input {}",
+            current, input_shape
+        )));
+    }
+    Ok(())
+}
+
+fn parse_recursive_block_spec(
+    section: &RawSection,
+    sections: &[RawSection],
+    section_index: usize,
+    input_shape: TensorShape,
+    cfg_parent: &Path,
+    time_steps: usize,
+    net_obb: bool,
+) -> Result<RecursiveBlockSpec> {
+    const PARENT_KEYS: &[&str] = &[
+        "loops",
+        "injection",
+        "body",
+        "body_scale",
+        "residual_scale",
+        "injection_scale",
+        "ouroboros",
+        "gate_bias",
+        "gamma_clip",
+        "gate_clip",
+        "lora_rank",
+        "lora_alpha",
+        "lora_freeze_base",
+        "lora_diag_clip",
+        "lora_diag_init",
+        "lattice_group",
+        "lattice_threshold",
+        "lattice_temperature",
+        "lattice_mix",
+        "learning_rate",
+        "dont_update",
+        "burnin_update",
+        "train_only_bn",
+        "clip",
+        "grad_centr",
+    ];
+    reject_section_keys(section, PARENT_KEYS)?;
+    let clip = section.get_f32("clip", 0.0)?;
+    let grad_centr = section.get_usize("grad_centr", 0)?;
+    if !clip.is_finite() || clip < 0.0 {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {}: clip must be finite and non-negative",
+            section.name, section.line
+        )));
+    }
+    if clip > 0.0 || grad_centr != 0 {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {}: recursive-block clip/grad_centr updates are unsupported",
+            section.name, section.line
+        )));
+    }
+
+    if let Some(key) = section.values.keys().find(|key| key.starts_with("lora_")) {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {}: `{key}` is a Stage-2 Conv-LoRA option and is unsupported in the Stage-1 CPU port",
+            section.name, section.line
+        )));
+    }
+
+    let line = section.line;
+    let loops = section.get_usize("loops", 4)?;
+    if loops == 0 {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: loops must be >= 1",
+            section.name
+        )));
+    }
+    let injection_value = section.get_i64("injection", 1)?;
+    if !matches!(injection_value, 0 | 1) {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: injection must be 0 or 1, got {injection_value}",
+            section.name
+        )));
+    }
+    let injection = injection_value != 0;
+    let body_count = section.get_usize("body", 1)?;
+    if body_count == 0 {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: body must be >= 1",
+            section.name
+        )));
+    }
+    let end = section_index
+        .checked_add(body_count)
+        .ok_or_else(|| Error::InvalidConfig("recursive_block body range overflows".to_owned()))?;
+    if end >= sections.len() {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: body={body_count} but not enough sections follow",
+            section.name
+        )));
+    }
+
+    let body_scale = section.get_f32("body_scale", if injection { 1.0 / 3.0 } else { 0.5 })?;
+    let residual_scale =
+        section.get_f32("residual_scale", if injection { 1.0 / 3.0 } else { 0.5 })?;
+    let injection_scale =
+        section.get_f32("injection_scale", if injection { 1.0 / 3.0 } else { 0.0 })?;
+    for (name, value) in [
+        ("body_scale", body_scale),
+        ("residual_scale", residual_scale),
+        ("injection_scale", injection_scale),
+    ] {
+        if !value.is_finite() {
+            return Err(Error::InvalidConfig(format!(
+                "[{}] at line {line}: {name} must be finite",
+                section.name
+            )));
+        }
+    }
+
+    let ouroboros_value = section.get_i64("ouroboros", 0)?;
+    if !matches!(ouroboros_value, 0 | 1) {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: ouroboros must be 0 or 1 in the Stage-1 CPU port; mode 2 (Conv-LoRA) is Stage 2",
+            section.name
+        )));
+    }
+    let ouroboros = ouroboros_value as usize;
+    if ouroboros == 1 {
+        let channels = input_shape.channels;
+        let outputs = channels.checked_mul(2).ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "[{}] at line {line}: controller output size overflows",
+                section.name
+            ))
+        })?;
+        let inputs = channels.checked_add(1).ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "[{}] at line {line}: controller input size overflows",
+                section.name
+            ))
+        })?;
+        outputs.checked_mul(inputs).ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "[{}] at line {line}: controller weight count overflows",
+                section.name
+            ))
+        })?;
+    }
+    let has_controller_option = ["gate_bias", "gamma_clip", "gate_clip"]
+        .iter()
+        .any(|key| section.get(key).is_some());
+    if ouroboros == 0 && has_controller_option {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: gate_bias/gamma_clip/gate_clip require ouroboros=1",
+            section.name
+        )));
+    }
+    let gate_bias = section.get_f32("gate_bias", -2.0)?;
+    let gamma_clip = section.get_f32("gamma_clip", 4.0)?;
+    let gate_clip = section.get_f32("gate_clip", 30.0)?;
+    if ouroboros == 1
+        && [gate_bias, gamma_clip, gate_clip]
+            .into_iter()
+            .any(|value| !value.is_finite())
+    {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: controller bias and clip values must be finite",
+            section.name
+        )));
+    }
+
+    let lattice_group = section.get_usize("lattice_group", 0)?;
+    let lattice_threshold = section.get_f32("lattice_threshold", 0.10)?;
+    let lattice_temperature = section.get_f32("lattice_temperature", 1.0)?;
+    let lattice_mix = section.get_f32("lattice_mix", 0.0)?;
+    if !lattice_threshold.is_finite()
+        || !(0.0..=1.0).contains(&lattice_threshold)
+        || !lattice_mix.is_finite()
+        || !(0.0..=1.0).contains(&lattice_mix)
+        || !lattice_temperature.is_finite()
+        || lattice_temperature <= 0.0
+    {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: lattice threshold/mix must be in [0,1] and temperature must be finite and positive",
+            section.name
+        )));
+    }
+    if lattice_group > 1 && input_shape.channels % lattice_group != 0 {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: lattice_group={lattice_group} must divide input channels={}",
+            section.name, input_shape.channels
+        )));
+    }
+
+    let mut body = Vec::with_capacity(body_count);
+    let mut body_input = input_shape;
+    for body_index in 0..body_count {
+        let body_section = &sections[section_index + body_index + 1];
+        validate_recursive_body_keys(body_section)?;
+        if body_section.get("share_index").is_some() {
+            return Err(Error::InvalidConfig(format!(
+                "[{}] at line {}: shared convolution parameters are unsupported inside [recursive_block]",
+                body_section.name, body_section.line
+            )));
+        }
+        let kind = parse_layer_kind(
+            body_section,
+            body_index,
+            body_input,
+            &body,
+            cfg_parent,
+            time_steps,
+            net_obb,
+        )?;
+        if let Some(Activation::Other(name)) = kind.activation() {
+            return Err(Error::InvalidConfig(format!(
+                "[{}] at line {}: unsupported activation `{name}` in recursive body",
+                body_section.name, body_section.line
+            )));
+        }
+        let output_shape = infer_output_shape(&kind, body_index, body_input, &body)?;
+        body.push(Layer {
+            index: body_index,
+            line: body_section.line,
+            input_shape: body_input,
+            output_shape,
+            kind,
+            train: LayerTrainOptions::default(),
+        });
+        body_input = output_shape;
+    }
+    if body_input.width != input_shape.width
+        || body_input.height != input_shape.height
+        || body_input.channels != input_shape.channels
+    {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: body changes dimensions from {} to {}; body output must match input",
+            section.name, input_shape, body_input
+        )));
+    }
+
+    Ok(RecursiveBlockSpec {
+        loops,
+        injection,
+        body_scale,
+        residual_scale,
+        injection_scale,
+        ouroboros,
+        gate_bias,
+        gamma_clip,
+        gate_clip,
+        lattice_group,
+        lattice_threshold,
+        lattice_temperature,
+        lattice_mix,
+        body,
+    })
+}
+
+fn reject_section_keys(section: &RawSection, allowed: &[&str]) -> Result<()> {
+    if let Some(key) = section
+        .values
+        .keys()
+        .find(|key| !allowed.contains(&key.as_str()))
+    {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {}: unknown or unsupported option `{key}`",
+            section.name, section.line
+        )));
+    }
+    Ok(())
+}
+
+fn validate_recursive_body_keys(section: &RawSection) -> Result<()> {
+    let keys: &[&str] = match section.name.as_str() {
+        "conv" | "convolutional" => &[
+            "filters",
+            "groups",
+            "size",
+            "stride",
+            "stride_x",
+            "stride_y",
+            "dilation",
+            "pad",
+            "padding",
+            "activation",
+            "batch_normalize",
+            "share_index",
+        ],
+        "max" | "maxpool" => &[
+            "stride",
+            "stride_x",
+            "stride_y",
+            "size",
+            "padding",
+            "out_channels",
+            "maxpool_zero_nonmax",
+            "zero_nonmax",
+            "maxpool_depth",
+        ],
+        "avg" | "avgpool" => &[],
+        "local_avg" | "local_avgpool" => &["stride", "stride_x", "stride_y", "size", "padding"],
+        "upsample" => &["stride", "scale"],
+        "channel_shuffle" => &["groups"],
+        "conn" | "connected" => &["output", "batch_normalize", "activation"],
+        "dropout" => &[
+            "probability",
+            "dropblock",
+            "dropblock_size_rel",
+            "dropblock_size_abs",
+        ],
+        _ => {
+            return Err(Error::InvalidConfig(format!(
+                "[{}] at line {}: unsupported layer kind in [recursive_block] body",
+                section.name, section.line
+            )));
+        }
+    };
+    reject_section_keys(section, keys)?;
+    if section.name == "dropout" {
+        let probability = section.get_f32("probability", 0.2)?;
+        if !(0.0..1.0).contains(&probability) {
+            return Err(Error::InvalidConfig(format!(
+                "[dropout] at line {}: probability must be in [0,1)",
+                section.line
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn parse_layer_kind(
@@ -3438,9 +3861,11 @@ fn parse_layer_kind(
             })
         }
         "dropout" => LayerKind::Dropout {
-            probability: section
-                .get("probability")
-                .map(|value| value.parse().unwrap_or(0.5)),
+            probability: if section.get("probability").is_some() {
+                Some(section.get_f32("probability", 0.2)?)
+            } else {
+                None
+            },
             dropblock: if section.get_usize("dropblock", 0)? != 0 {
                 // C++ make_dropout_layer / parse_dropout: the absolute size
                 // is capped by the layer size, defaults to 7 when neither key
@@ -4043,6 +4468,24 @@ fn infer_output_shape(
     built_layers: &[Layer],
 ) -> Result<TensorShape> {
     match kind {
+        LayerKind::RecursiveBlock(spec) => {
+            let Some(last) = spec.body.last() else {
+                return Err(Error::InvalidConfig(format!(
+                    "[recursive_block] layer #{layer_index} requires a non-empty body"
+                )));
+            };
+            let output = last.output_shape;
+            if output.width != current.width
+                || output.height != current.height
+                || output.channels != current.channels
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "[recursive_block] layer #{layer_index}: body output {} must match input {}",
+                    output, current
+                )));
+            }
+            Ok(current)
+        }
         LayerKind::Convolutional(spec) => Ok(TensorShape::new(
             conv_dim(current.width, spec.padding, spec.size, spec.stride_x),
             conv_dim(current.height, spec.padding, spec.size, spec.stride_y),

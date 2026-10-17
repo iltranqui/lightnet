@@ -135,8 +135,9 @@ pub use model::{
     Activation, CliffordContextMode, CliffordGffnMode, CliffordGlobalOp, CliffordHigherMode,
     CliffordInteractionMode, CliffordSpec, CrnnSpec, DeformConvSpec, DsConvSpec, KimiKdaSpec,
     Layer, LayerKind, LayerWeights, LrPolicy, LstmSpec, MambaVisionSpec, NetConfig, Network,
-    ObbRefineLoss, ObbRefineSpec, RnnSpec, ShortcutWeightsNorm, ShortcutWeightsType, SwinSpec,
-    TensorShape, TuckerAttentionSpec, WeightsArray, WmhfSpec, YoloIouLoss,
+    ObbRefineLoss, ObbRefineSpec, RecursiveBlockSpec, RnnSpec, ShortcutWeightsNorm,
+    ShortcutWeightsType, SwinSpec, TensorShape, TuckerAttentionSpec, WeightsArray, WmhfSpec,
+    YoloIouLoss,
 };
 pub use names::load_names_file;
 pub use runtime::{
@@ -144,9 +145,10 @@ pub use runtime::{
     CrnnParams, CrnnTrainBuffers, DeformConvParams, DeformConvTrainBuffers, DsConvParams,
     DsConvTrainBuffers, ExecutableNetwork, ForwardResult, GpuExecutableNetwork, GpuForwardState,
     GpuForwardSummary, KimiKdaTrainBuffers, LayerParams, LayerTrainBuffers, LstmParams,
-    LstmTrainBuffers, MambaVisionTrainBuffers, RecurrentForwardCache, RnnParams, RnnTrainBuffers,
-    ShortcutParams, ShortcutTrainBuffers, Tensor, TuckerAttentionTrainBuffers, WmhfParams,
-    WmhfTrainBuffers, YoloHeadOutput, compute_learning_rate,
+    LstmTrainBuffers, MambaVisionTrainBuffers, RecurrentForwardCache, RecursiveBlockForwardCache,
+    RecursiveBlockParams, RecursiveBlockTrainBuffers, RnnParams, RnnTrainBuffers, ShortcutParams,
+    ShortcutTrainBuffers, Tensor, TuckerAttentionTrainBuffers, WmhfParams, WmhfTrainBuffers,
+    YoloHeadOutput, compute_learning_rate,
 };
 pub use swin::SwinWeights;
 pub use swin_block::SwinForwardCache;

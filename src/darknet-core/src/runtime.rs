@@ -285,10 +285,27 @@ pub struct WmhfParams {
     pub scan_weights: Vec<f32>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecursiveBlockParams {
+    pub body: Vec<LayerParams>,
+    /// Ouroboros controller dense matrix; omitted from Darknet `.weights` by C++.
+    pub controller_weights: Vec<f32>,
+    /// Controller gamma/gate biases; omitted from Darknet `.weights` by C++.
+    pub controller_biases: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecursiveBlockTrainBuffers {
+    pub body: Vec<LayerTrainBuffers>,
+    pub controller_weight_updates: Vec<f32>,
+    pub controller_bias_updates: Vec<f32>,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayerParams {
     None,
+    RecursiveBlock(RecursiveBlockParams),
     BatchNorm(BatchNormParams),
     Convolutional(ConvolutionalParams),
     Connected(ConnectedParams),
@@ -505,6 +522,7 @@ pub struct KimiKdaTrainBuffers {
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayerTrainBuffers {
     None,
+    RecursiveBlock(RecursiveBlockTrainBuffers),
     BatchNorm(StandaloneBatchNormTrainBuffers),
     Convolutional(ConvolutionalTrainBuffers),
     Connected(ConnectedTrainBuffers),
@@ -686,6 +704,19 @@ pub(crate) struct WmhfRuntimeCache {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct RecursiveBlockForwardCache {
+    /// Body-network tapes, one per shared-weight recurrence pass.
+    pub body_passes: Vec<ForwardResult>,
+    /// Hidden inputs h_0..h_{N-1}; h_0 is the outer layer input.
+    pub hidden_inputs: Vec<Tensor>,
+    /// Controller input/output vectors per pass; empty for static recurrence.
+    pub controller_inputs: Vec<Vec<f32>>,
+    pub controller_outputs: Vec<Vec<f32>>,
+    /// Raw recurrence outputs before between-pass lattice projection.
+    pub lattice_inputs: Vec<Option<Tensor>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct ForwardResult {
     pub layer_outputs: Vec<Tensor>,
     pub layer_activation_inputs: Vec<Option<Tensor>>,
@@ -706,6 +737,7 @@ pub struct ForwardResult {
     pub(crate) graph_conv_caches: Vec<Option<GraphConvRuntimeCache>>,
     pub(crate) wmhf_caches: Vec<Option<WmhfRuntimeCache>>,
     pub(crate) clifford_caches: Vec<Option<CliffordRuntimeCache>>,
+    pub(crate) recursive_block_caches: Vec<Option<RecursiveBlockForwardCache>>,
     pub vit_caches: Vec<Option<crate::vit::VitForwardCache>>,
     pub swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>>,
     pub tucker_attention_caches: Vec<Option<crate::tucker_attention::TuckerAttentionForwardCache>>,
@@ -740,6 +772,7 @@ impl ForwardResult {
             graph_conv_caches: Vec::new(),
             wmhf_caches: Vec::new(),
             clifford_caches: Vec::new(),
+            recursive_block_caches: Vec::new(),
             vit_caches: Vec::new(),
             swin_caches: Vec::new(),
             tucker_attention_caches: Vec::new(),
@@ -958,11 +991,20 @@ impl ExecutableNetwork {
         // Preserve one parameter/train-buffer slot per graph layer.  Layers
         // without weights use `None`, which keeps Rust indices aligned with
         // Darknet's C++ layer indices used by route and shortcut references.
-        let params = network
+        let mut params = network
             .layers
             .iter()
             .map(default_layer_params)
             .collect::<Vec<_>>();
+        for (layer, params) in network.layers.iter().zip(&mut params) {
+            if let (LayerKind::RecursiveBlock(spec), LayerParams::RecursiveBlock(params)) =
+                (&layer.kind, params)
+                && spec.ouroboros == 1
+            {
+                let channels = layer.input_shape.channels;
+                params.controller_biases[channels..2 * channels].fill(spec.gate_bias);
+            }
+        }
         let train_buffers = network
             .layers
             .iter()
@@ -1171,6 +1213,20 @@ impl ExecutableNetwork {
                 muon_state[index] = Some(read_muon_layer_state(&mut file, capacity)?);
             }
         }
+        for (index, state) in host_state.iter().enumerate() {
+            if let Some(state) = state
+                && matches!(
+                    self.network.layers[index].kind,
+                    LayerKind::RecursiveBlock(_)
+                )
+            {
+                validate_recursive_block_adam_state(
+                    &self.network.layers[index],
+                    &self.params[index],
+                    state,
+                )?;
+            }
+        }
         if !self.network.net.muon
             && muon_state
                 .iter()
@@ -1254,8 +1310,26 @@ impl ExecutableNetwork {
             .enumerate()
         {
             // C++ `update_network`: per-layer update gating.
-            let opts = self.network.layers[layer_index].train;
+            let layer = &self.network.layers[layer_index];
+            let opts = layer.train;
             if !opts.updates_at(iteration_num, burn_in) {
+                continue;
+            }
+            if let (
+                LayerKind::RecursiveBlock(spec),
+                LayerParams::RecursiveBlock(params),
+                LayerTrainBuffers::RecursiveBlock(train),
+            ) = (&layer.kind, &mut *params, &mut *train)
+            {
+                update_recursive_block_sgd(
+                    spec,
+                    params,
+                    train,
+                    lr * opts.learning_rate_scale,
+                    momentum,
+                    decay,
+                    batch,
+                );
                 continue;
             }
             match (params, train) {
@@ -2020,7 +2094,7 @@ impl ExecutableNetwork {
         input: &Tensor,
         states: &[Option<crate::mambavision::MambaVisionState>],
     ) -> Result<ForwardResult> {
-        self.forward_with_mode_and_states(input, false, states)
+        self.forward_with_mode_and_states(input, false, states, 0x9e37_79b9_u64)
     }
 
     /// Training counterpart to `forward_with_mambavision_states`.
@@ -2029,7 +2103,7 @@ impl ExecutableNetwork {
         input: &Tensor,
         states: &[Option<crate::mambavision::MambaVisionState>],
     ) -> Result<ForwardResult> {
-        self.forward_with_mode_and_states(input, true, states)
+        self.forward_with_mode_and_states(input, true, states, 0x9e37_79b9_u64)
     }
 
     /// Execute an inference-only graph while retaining tensors only until their
@@ -2218,7 +2292,15 @@ impl ExecutableNetwork {
     }
 
     fn forward_with_mode(&self, input: &Tensor, training: bool) -> Result<ForwardResult> {
-        self.forward_with_mode_and_states(input, training, &[])
+        self.forward_with_mode_and_states(input, training, &[], 0x9e37_79b9_u64)
+    }
+
+    fn forward_training_with_rng_seed(
+        &self,
+        input: &Tensor,
+        rng_seed: u64,
+    ) -> Result<ForwardResult> {
+        self.forward_with_mode_and_states(input, true, &[], rng_seed)
     }
 
     fn forward_with_mode_and_states(
@@ -2226,6 +2308,7 @@ impl ExecutableNetwork {
         input: &Tensor,
         training: bool,
         mambavision_states: &[Option<crate::mambavision::MambaVisionState>],
+        rng_seed: u64,
     ) -> Result<ForwardResult> {
         if !mambavision_states.is_empty() && mambavision_states.len() != self.network.layers.len() {
             return Err(Error::InvalidConfig(format!(
@@ -2273,13 +2356,14 @@ impl ExecutableNetwork {
         let mut graph_conv_caches = Vec::with_capacity(self.network.layers.len());
         let mut wmhf_caches = Vec::with_capacity(self.network.layers.len());
         let mut clifford_caches = Vec::with_capacity(self.network.layers.len());
+        let mut recursive_block_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches = Vec::with_capacity(self.network.layers.len());
         let mut swin_caches = Vec::with_capacity(self.network.layers.len());
         let mut tucker_attention_caches = Vec::with_capacity(self.network.layers.len());
         let mut mambavision_caches = Vec::with_capacity(self.network.layers.len());
         let mut kimi_kda_caches = Vec::with_capacity(self.network.layers.len());
         let mut obb_refine_outputs = Vec::new();
-        let mut rng_state = 0x9e37_79b9_u64;
+        let mut rng_state = rng_seed;
 
         for (layer, params) in self.network.layers.iter().zip(&self.params) {
             // This match is the Rust equivalent of dispatching a C++ layer's
@@ -2309,7 +2393,21 @@ impl ExecutableNetwork {
             let mut graph_conv_cache = None;
             let mut wmhf_cache = None;
             let mut clifford_cache = None;
+            let mut recursive_block_cache = None;
             let (output, activation_input) = match (&layer.kind, params) {
+                (LayerKind::RecursiveBlock(spec), LayerParams::RecursiveBlock(params)) => {
+                    let (output, cache) = forward_recursive_block(
+                        &self.network,
+                        self.train_iteration,
+                        layer,
+                        spec,
+                        params,
+                        current_input,
+                        training,
+                    )?;
+                    recursive_block_cache = Some(cache);
+                    (output, None)
+                }
                 (
                     LayerKind::Convolutional(spec),
                     LayerParams::Convolutional(_) | LayerParams::None,
@@ -2827,7 +2925,7 @@ impl ExecutableNetwork {
                         Some(spec) => forward_dropblock(
                             current_input,
                             spec,
-                            probability.unwrap_or(0.5),
+                            probability.unwrap_or(0.2),
                             training,
                             &mut rng_state,
                             self.train_iteration,
@@ -2835,7 +2933,7 @@ impl ExecutableNetwork {
                         )?,
                         None => forward_dropout(
                             current_input,
-                            probability.unwrap_or(0.5),
+                            probability.unwrap_or(0.2),
                             training,
                             &mut rng_state,
                         )?,
@@ -2952,6 +3050,7 @@ impl ExecutableNetwork {
             graph_conv_caches.push(graph_conv_cache);
             wmhf_caches.push(wmhf_cache);
             clifford_caches.push(clifford_cache);
+            recursive_block_caches.push(recursive_block_cache);
             vit_caches.push(vit_cache);
             swin_caches.push(swin_cache);
             tucker_attention_caches.push(tucker_attention_cache);
@@ -2973,6 +3072,7 @@ impl ExecutableNetwork {
             graph_conv_caches,
             wmhf_caches,
             clifford_caches,
+            recursive_block_caches,
             vit_caches,
             swin_caches,
             tucker_attention_caches,
@@ -3132,6 +3232,13 @@ impl ExecutableNetwork {
                 forward.clifford_caches.len()
             )));
         }
+        if forward.recursive_block_caches.len() != self.network.layers.len() {
+            return Err(Error::InvalidConfig(format!(
+                "forward [recursive_block] cache count mismatch: expected {}, got {}",
+                self.network.layers.len(),
+                forward.recursive_block_caches.len()
+            )));
+        }
         if layer_output_gradient_seeds.len() != self.network.layers.len() {
             return Err(Error::InvalidConfig(format!(
                 "backward seed count mismatch: expected {}, got {}",
@@ -3183,6 +3290,41 @@ impl ExecutableNetwork {
             };
 
             match (&layer.kind, params) {
+                (LayerKind::RecursiveBlock(spec), LayerParams::RecursiveBlock(params)) => {
+                    let cache = forward
+                        .recursive_block_caches
+                        .get(layer.index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing [recursive_block] forward cache for layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let (layer_input_gradient, layer_param_gradient) = backward_recursive_block(
+                        &self.network,
+                        self.train_iteration,
+                        layer,
+                        spec,
+                        params,
+                        current_input,
+                        &grad,
+                        cache,
+                    )?;
+                    let Some(slot) = param_gradients.get_mut(layer.index) else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing [recursive_block] parameter-gradient slot for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    *slot = layer_param_gradient;
+                    accumulate_previous_gradient(
+                        layer.index,
+                        &layer_input_gradient,
+                        &mut input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
+                }
                 (
                     LayerKind::Convolutional(spec),
                     LayerParams::Convolutional(_) | LayerParams::None,
@@ -5399,6 +5541,28 @@ impl ExecutableNetwork {
             };
             update_batch_norm_running_stats(params, &mean, &variance, BATCH_NORM_ROLLING_KEEP_CPU)?;
         }
+        for layer in &self.network.layers {
+            let LayerKind::RecursiveBlock(spec) = &layer.kind else {
+                continue;
+            };
+            let cache = forward
+                .recursive_block_caches
+                .get(layer.index)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "missing [recursive_block] forward cache for BN stats at layer #{}",
+                        layer.index
+                    ))
+                })?;
+            let Some(LayerParams::RecursiveBlock(params)) = self.params.get_mut(layer.index) else {
+                return Err(Error::InvalidConfig(format!(
+                    "missing [recursive_block] parameters for BN stats at layer #{}",
+                    layer.index
+                )));
+            };
+            update_recursive_body_batch_norm_running_stats(layer, spec, params, cache)?;
+        }
         update_recurrent_batch_norm_running_stats(&self.network, &mut self.params, input, forward)?;
         Ok(())
     }
@@ -5414,6 +5578,17 @@ impl ExecutableNetwork {
 
         for (layer, gradient) in self.network.layers.iter().zip(param_gradients) {
             match (&layer.kind, gradient) {
+                (LayerKind::RecursiveBlock(spec), LayerParams::RecursiveBlock(gradient)) => {
+                    let Some(LayerTrainBuffers::RecursiveBlock(train)) =
+                        self.train_buffers.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing recursive-block train buffers for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    accumulate_recursive_block_train_buffers(spec, train, gradient)?;
+                }
                 (LayerKind::BatchNorm(_), LayerParams::BatchNorm(gradient)) => {
                     let Some(LayerTrainBuffers::BatchNorm(train)) =
                         self.train_buffers.get_mut(layer.index)
@@ -5878,6 +6053,618 @@ impl ExecutableNetwork {
     }
 }
 
+fn recursive_body_executable(
+    network: &Network,
+    layer: &crate::model::Layer,
+    spec: &crate::model::RecursiveBlockSpec,
+    params: &RecursiveBlockParams,
+    train_iteration: usize,
+) -> Result<ExecutableNetwork> {
+    if spec.body.len() != params.body.len() {
+        return Err(Error::InvalidConfig(format!(
+            "[recursive_block] layer #{} body parameter count mismatch: expected {}, got {}",
+            layer.index,
+            spec.body.len(),
+            params.body.len()
+        )));
+    }
+    let mut body_network = Network {
+        source: network.source.clone(),
+        net: network.net.clone(),
+        layers: spec.body.clone(),
+    };
+    body_network.net.width = layer.input_shape.width;
+    body_network.net.height = layer.input_shape.height;
+    body_network.net.channels = layer.input_shape.channels;
+    body_network.net.batch = layer.input_shape.batch;
+    let mut executable = ExecutableNetwork::new(body_network);
+    executable.params.clone_from(&params.body);
+    executable.train_iteration = train_iteration;
+    Ok(executable)
+}
+
+fn recursive_body_rng_seed(train_iteration: usize, layer_index: usize, step: usize) -> u64 {
+    let mut value = 0x9e37_79b9_7f4a_7c15_u64
+        ^ (train_iteration as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9)
+        ^ (layer_index as u64).wrapping_mul(0x94d0_49bb_1331_11eb)
+        ^ (step as u64).wrapping_mul(0x369d_ea0f_31a5_3f85);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    if value == 0 { 0x9e37_79b9_u64 } else { value }
+}
+
+fn recursive_controller_values(
+    hidden: &Tensor,
+    spec: &crate::model::RecursiveBlockSpec,
+    params: &RecursiveBlockParams,
+    step: usize,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    if spec.ouroboros == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let channels = hidden.shape.channels;
+    let inputs = channels
+        .checked_add(1)
+        .ok_or_else(|| Error::InvalidConfig("recursive controller input overflows".to_owned()))?;
+    let outputs = channels
+        .checked_mul(2)
+        .ok_or_else(|| Error::InvalidConfig("recursive controller output overflows".to_owned()))?;
+    let weight_count = inputs
+        .checked_mul(outputs)
+        .ok_or_else(|| Error::InvalidConfig("recursive controller weights overflow".to_owned()))?;
+    if params.controller_weights.len() != weight_count || params.controller_biases.len() != outputs
+    {
+        return Err(Error::InvalidConfig(
+            "[recursive_block] controller parameter layout does not match channel count".to_owned(),
+        ));
+    }
+    let batch = hidden.shape.batch;
+    let area = hidden.shape.width * hidden.shape.height;
+    let step_value = if spec.loops > 1 {
+        step as f32 / (spec.loops - 1) as f32
+    } else {
+        0.0
+    };
+    let mut controller_inputs = vec![0.0; batch * inputs];
+    let mut controller_outputs = vec![0.0; batch * outputs];
+    for b in 0..batch {
+        let in_offset = b * inputs;
+        let batch_offset = b * channels * area;
+        for c in 0..channels {
+            let channel_offset = batch_offset + c * area;
+            let sum = hidden.data[channel_offset..channel_offset + area]
+                .iter()
+                .sum::<f32>();
+            controller_inputs[in_offset + c] = sum / area.max(1) as f32;
+        }
+        controller_inputs[in_offset + channels] = step_value;
+        let out_offset = b * outputs;
+        for o in 0..outputs {
+            let weight_offset = o * inputs;
+            let mut value = params.controller_biases[o];
+            for i in 0..inputs {
+                value +=
+                    params.controller_weights[weight_offset + i] * controller_inputs[in_offset + i];
+            }
+            controller_outputs[out_offset + o] = value;
+        }
+    }
+    Ok((controller_inputs, controller_outputs))
+}
+
+fn recursive_clip(value: f32, limit: f32) -> f32 {
+    if limit > 0.0 {
+        value.clamp(-limit, limit)
+    } else {
+        value
+    }
+}
+
+fn recursive_sigmoid(value: f32) -> f32 {
+    let clipped = value.clamp(-30.0, 30.0);
+    1.0 / (1.0 + (-clipped).exp())
+}
+
+fn recursive_alive_probability(value: f32, temperature: f32) -> (f32, f32) {
+    if !value.is_finite() {
+        return (0.0, 0.0);
+    }
+    if (0.0..=1.0).contains(&value) {
+        return (value, 1.0);
+    }
+    let scaled = value / temperature.max(1e-6);
+    let clipped = scaled.clamp(-30.0, 30.0);
+    let alive = 1.0 / (1.0 + (-clipped).exp());
+    let derivative = if scaled > -30.0 && scaled < 30.0 {
+        alive * (1.0 - alive) / temperature.max(1e-6)
+    } else {
+        0.0
+    };
+    (alive, derivative)
+}
+
+fn recursive_lattice_project(
+    previous: &Tensor,
+    raw_state: &Tensor,
+    spec: &crate::model::RecursiveBlockSpec,
+) -> Result<Tensor> {
+    if previous.shape != raw_state.shape {
+        return Err(Error::InvalidConfig(
+            "[recursive_block] lattice input shape mismatch".to_owned(),
+        ));
+    }
+    let blend = spec.lattice_mix;
+    if blend == 0.0 {
+        return Ok(raw_state.clone());
+    }
+    let channels = raw_state.shape.channels;
+    let area = raw_state.shape.width * raw_state.shape.height;
+    let batch = raw_state.shape.batch;
+    let group = if spec.lattice_group > 1 {
+        spec.lattice_group
+    } else {
+        1
+    };
+    let groups_per_cell = channels / group;
+    let mut output = raw_state.clone();
+    for b in 0..batch {
+        for spatial in 0..area {
+            for group_index in 0..groups_per_cell {
+                let start_channel = group_index * group;
+                let mut projected = vec![0.0; group];
+                let mut best_alive = -1.0f32;
+                let mut best_index = 0usize;
+                let mut any_alive = false;
+                for (offset, projected_value) in projected.iter_mut().enumerate() {
+                    let channel = start_channel + offset;
+                    let index = b * channels * area + channel * area + spatial;
+                    let (previous_alive, _) =
+                        recursive_alive_probability(previous.data[index], spec.lattice_temperature);
+                    let (step_alive, _) = recursive_alive_probability(
+                        raw_state.data[index],
+                        spec.lattice_temperature,
+                    );
+                    let alive = previous_alive.min(step_alive);
+                    if alive > best_alive {
+                        best_alive = alive;
+                        best_index = offset;
+                    }
+                    if alive < spec.lattice_threshold {
+                        *projected_value = 0.0;
+                    } else {
+                        any_alive = true;
+                        *projected_value = alive;
+                    }
+                }
+                if group > 1 && !any_alive && best_alive > 0.0 {
+                    projected[best_index] = best_alive;
+                }
+                for (offset, projected_value) in projected.iter().enumerate() {
+                    let channel = start_channel + offset;
+                    let index = b * channels * area + channel * area + spatial;
+                    output.data[index] =
+                        (1.0 - blend) * raw_state.data[index] + blend * projected_value;
+                }
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn recursive_lattice_backward(
+    previous: &Tensor,
+    raw_state: &Tensor,
+    output_gradient: &Tensor,
+    spec: &crate::model::RecursiveBlockSpec,
+) -> Result<(Tensor, Tensor)> {
+    if previous.shape != raw_state.shape || output_gradient.shape != raw_state.shape {
+        return Err(Error::InvalidConfig(
+            "[recursive_block] lattice backward shape mismatch".to_owned(),
+        ));
+    }
+    let mut previous_gradient = Tensor::zeros(previous.shape);
+    let mut raw_gradient = Tensor::zeros(raw_state.shape);
+    let blend = spec.lattice_mix;
+    if blend == 0.0 {
+        raw_gradient.data.copy_from_slice(&output_gradient.data);
+        return Ok((previous_gradient, raw_gradient));
+    }
+    let channels = raw_state.shape.channels;
+    let area = raw_state.shape.width * raw_state.shape.height;
+    let batch = raw_state.shape.batch;
+    let group = if spec.lattice_group > 1 {
+        spec.lattice_group
+    } else {
+        1
+    };
+    let groups_per_cell = channels / group;
+    for b in 0..batch {
+        for spatial in 0..area {
+            for group_index in 0..groups_per_cell {
+                let start_channel = group_index * group;
+                let mut previous_alive = vec![0.0; group];
+                let mut previous_slope = vec![0.0; group];
+                let mut step_alive = vec![0.0; group];
+                let mut step_slope = vec![0.0; group];
+                let mut met = vec![0.0; group];
+                let mut survives = vec![false; group];
+                let mut best_alive = -1.0f32;
+                let mut best_index = 0usize;
+                let mut any_alive = false;
+                for offset in 0..group {
+                    let channel = start_channel + offset;
+                    let index = b * channels * area + channel * area + spatial;
+                    (previous_alive[offset], previous_slope[offset]) =
+                        recursive_alive_probability(previous.data[index], spec.lattice_temperature);
+                    (step_alive[offset], step_slope[offset]) = recursive_alive_probability(
+                        raw_state.data[index],
+                        spec.lattice_temperature,
+                    );
+                    met[offset] = previous_alive[offset].min(step_alive[offset]);
+                    if met[offset] > best_alive {
+                        best_alive = met[offset];
+                        best_index = offset;
+                    }
+                    survives[offset] = met[offset] >= spec.lattice_threshold;
+                    any_alive |= survives[offset];
+                }
+                let rescue = group > 1 && !any_alive && best_alive > 0.0;
+                for offset in 0..group {
+                    let channel = start_channel + offset;
+                    let index = b * channels * area + channel * area + spatial;
+                    let dy = output_gradient.data[index];
+                    raw_gradient.data[index] += dy * (1.0 - blend);
+                    let projected_gradient = dy * blend;
+                    let active = if rescue {
+                        offset == best_index
+                    } else {
+                        survives[offset]
+                    };
+                    if active {
+                        if previous_alive[offset] <= step_alive[offset] {
+                            previous_gradient.data[index] +=
+                                projected_gradient * previous_slope[offset];
+                        } else {
+                            raw_gradient.data[index] += projected_gradient * step_slope[offset];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok((previous_gradient, raw_gradient))
+}
+
+fn accumulate_recursive_body_param_gradients(
+    spec: &crate::model::RecursiveBlockSpec,
+    destination: &mut [LayerParams],
+    source: &[LayerParams],
+) -> Result<()> {
+    if spec.body.len() != destination.len() || spec.body.len() != source.len() {
+        return Err(Error::InvalidConfig(
+            "recursive-block body parameter-gradient count mismatch".to_owned(),
+        ));
+    }
+    for ((layer, destination), source) in spec.body.iter().zip(destination).zip(source) {
+        match (&layer.kind, destination, source) {
+            (LayerKind::Convolutional(_), destination, LayerParams::Convolutional(source)) => {
+                accumulate_convolutional_param_gradients(destination, source)?;
+            }
+            (LayerKind::Connected(_), destination, LayerParams::Connected(source)) => {
+                accumulate_connected_param_gradients(destination, source)?;
+            }
+            (
+                LayerKind::MaxPool(_)
+                | LayerKind::LocalAvgPool(_)
+                | LayerKind::AvgPool
+                | LayerKind::Upsample(_)
+                | LayerKind::ChannelShuffle(_)
+                | LayerKind::Dropout { .. },
+                LayerParams::None,
+                LayerParams::None,
+            ) => {}
+            _ => {
+                return Err(Error::InvalidConfig(format!(
+                    "unsupported recursive-block parameter-gradient layout for body layer #{} ({})",
+                    layer.index,
+                    layer.kind.name()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn backward_recursive_block(
+    network: &Network,
+    train_iteration: usize,
+    layer: &crate::model::Layer,
+    spec: &crate::model::RecursiveBlockSpec,
+    params: &RecursiveBlockParams,
+    input: &Tensor,
+    output_gradient: &Tensor,
+    cache: &RecursiveBlockForwardCache,
+) -> Result<(Tensor, LayerParams)> {
+    if output_gradient.shape != layer.output_shape
+        || cache.body_passes.len() != spec.loops
+        || cache.hidden_inputs.len() != spec.loops
+        || cache.controller_inputs.len() != spec.loops
+        || cache.controller_outputs.len() != spec.loops
+        || cache.lattice_inputs.len() != spec.loops
+    {
+        return Err(Error::InvalidConfig(format!(
+            "[recursive_block] layer #{} forward/backward tape layout mismatch",
+            layer.index
+        )));
+    }
+    let body = recursive_body_executable(network, layer, spec, params, train_iteration)?;
+    let mut input_gradient = Tensor::zeros(input.shape);
+    let mut hidden_gradient = output_gradient.clone();
+    let mut parameter_gradient = default_layer_params(layer);
+    let LayerParams::RecursiveBlock(parameter_gradient) = &mut parameter_gradient else {
+        unreachable!("recursive-block layer requires recursive-block gradients");
+    };
+    let channels = input.shape.channels;
+    let area = input.shape.width * input.shape.height;
+    let batch = input.shape.batch;
+
+    for step in (0..spec.loops).rev() {
+        let hidden = &cache.hidden_inputs[step];
+        let mut hidden_previous_gradient = Tensor::zeros(hidden.shape);
+        let (lattice_previous_gradient, mut recurrence_gradient) = if step + 1 < spec.loops {
+            if let Some(raw_state) = &cache.lattice_inputs[step] {
+                recursive_lattice_backward(hidden, raw_state, &hidden_gradient, spec)?
+            } else {
+                (Tensor::zeros(hidden.shape), hidden_gradient.clone())
+            }
+        } else {
+            (Tensor::zeros(hidden.shape), hidden_gradient.clone())
+        };
+        hidden_previous_gradient
+            .data
+            .copy_from_slice(&lattice_previous_gradient.data);
+
+        if spec.injection {
+            for (dst, dy) in input_gradient
+                .data
+                .iter_mut()
+                .zip(&recurrence_gradient.data)
+            {
+                *dst += spec.injection_scale * dy;
+            }
+        }
+
+        let body_output = cache.body_passes[step].final_output().ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "[recursive_block] layer #{} body tape has no output",
+                layer.index
+            ))
+        })?;
+        let mut body_gradient = Tensor::zeros(body_output.shape);
+        if spec.ouroboros == 0 {
+            for index in 0..recurrence_gradient.data.len() {
+                body_gradient.data[index] = spec.body_scale * recurrence_gradient.data[index];
+                hidden_previous_gradient.data[index] +=
+                    spec.residual_scale * recurrence_gradient.data[index];
+            }
+        } else {
+            let outputs = channels * 2;
+            let controller_inputs = channels + 1;
+            let input_values = &cache.controller_inputs[step];
+            let output_values = &cache.controller_outputs[step];
+            if input_values.len() != batch * controller_inputs
+                || output_values.len() != batch * outputs
+            {
+                return Err(Error::InvalidConfig(
+                    "[recursive_block] controller forward tape size mismatch".to_owned(),
+                ));
+            }
+            let mut controller_gradient = vec![0.0; batch * outputs];
+            for b in 0..batch {
+                let controller_offset = b * outputs;
+                for channel in 0..channels {
+                    let gamma_raw = output_values[controller_offset + channel];
+                    let gate_raw = output_values[controller_offset + channels + channel];
+                    let gamma = recursive_clip(gamma_raw, spec.gamma_clip);
+                    let clipped_gate = recursive_clip(gate_raw, spec.gate_clip);
+                    let gate_input = clipped_gate.clamp(-30.0, 30.0);
+                    let gate = recursive_sigmoid(clipped_gate);
+                    let gamma_derivative =
+                        spec.gamma_clip <= 0.0 || gamma_raw.abs() < spec.gamma_clip;
+                    let gate_clip_derivative =
+                        spec.gate_clip <= 0.0 || gate_raw.abs() < spec.gate_clip;
+                    let sigmoid_derivative = gate_input.abs() < 30.0;
+                    let mut gamma_gradient = 0.0;
+                    let mut gate_gradient = 0.0;
+                    for spatial in 0..area {
+                        let index = b * channels * area + channel * area + spatial;
+                        let dy = recurrence_gradient.data[index];
+                        let candidate = spec.body_scale * body_output.data[index];
+                        body_gradient.data[index] += dy * spec.body_scale * gate * (1.0 + gamma);
+                        hidden_previous_gradient.data[index] += dy * (1.0 - gate);
+                        gamma_gradient += dy * gate * candidate;
+                        gate_gradient += dy * (candidate * (1.0 + gamma) - hidden.data[index]);
+                    }
+                    if gamma_derivative {
+                        controller_gradient[controller_offset + channel] = gamma_gradient;
+                    }
+                    if gate_clip_derivative && sigmoid_derivative {
+                        controller_gradient[controller_offset + channels + channel] =
+                            gate_gradient * gate * (1.0 - gate);
+                    }
+                }
+            }
+            let controller_weight_count = outputs * controller_inputs;
+            if parameter_gradient.controller_weights.len() != controller_weight_count
+                || parameter_gradient.controller_biases.len() != outputs
+            {
+                return Err(Error::InvalidConfig(
+                    "[recursive_block] controller gradient layout mismatch".to_owned(),
+                ));
+            }
+            for b in 0..batch {
+                let input_offset = b * controller_inputs;
+                let output_offset = b * outputs;
+                let mut controller_input_gradient = vec![0.0; controller_inputs];
+                for o in 0..outputs {
+                    let d = controller_gradient[output_offset + o];
+                    parameter_gradient.controller_biases[o] += d;
+                    let weight_offset = o * controller_inputs;
+                    for i in 0..controller_inputs {
+                        parameter_gradient.controller_weights[weight_offset + i] +=
+                            d * input_values[input_offset + i];
+                        controller_input_gradient[i] +=
+                            d * params.controller_weights[weight_offset + i];
+                    }
+                }
+                let hidden_offset = b * channels * area;
+                for channel in 0..channels {
+                    let spatial_gradient = controller_input_gradient[channel] / area.max(1) as f32;
+                    let channel_offset = hidden_offset + channel * area;
+                    for spatial in 0..area {
+                        hidden_previous_gradient.data[channel_offset + spatial] += spatial_gradient;
+                    }
+                }
+            }
+        }
+
+        let body_backward = body.backward(hidden, &cache.body_passes[step], &body_gradient)?;
+        for (dst, src) in hidden_previous_gradient
+            .data
+            .iter_mut()
+            .zip(body_backward.input_gradient.data)
+        {
+            *dst += src;
+        }
+        accumulate_recursive_body_param_gradients(
+            spec,
+            &mut parameter_gradient.body,
+            &body_backward.param_gradients,
+        )?;
+        hidden_gradient = hidden_previous_gradient;
+        recurrence_gradient.data.clear();
+    }
+    for (dst, recurrent) in input_gradient.data.iter_mut().zip(hidden_gradient.data) {
+        *dst += recurrent;
+    }
+    Ok((
+        input_gradient,
+        LayerParams::RecursiveBlock(parameter_gradient.clone()),
+    ))
+}
+
+fn forward_recursive_block(
+    network: &Network,
+    train_iteration: usize,
+    layer: &crate::model::Layer,
+    spec: &crate::model::RecursiveBlockSpec,
+    params: &RecursiveBlockParams,
+    input: &Tensor,
+    training: bool,
+) -> Result<(Tensor, RecursiveBlockForwardCache)> {
+    if input.shape != layer.input_shape || layer.output_shape != layer.input_shape {
+        return Err(Error::InvalidConfig(format!(
+            "[recursive_block] layer #{} requires a size-preserving input, got {} -> {}",
+            layer.index, layer.input_shape, layer.output_shape
+        )));
+    }
+    let body = recursive_body_executable(network, layer, spec, params, train_iteration)?;
+    let mut hidden = input.clone();
+    let mut body_passes = Vec::with_capacity(spec.loops);
+    let mut hidden_inputs = Vec::with_capacity(spec.loops);
+    let mut controller_inputs = Vec::with_capacity(spec.loops);
+    let mut controller_outputs = Vec::with_capacity(spec.loops);
+    let mut lattice_inputs = Vec::with_capacity(spec.loops);
+
+    for step in 0..spec.loops {
+        hidden_inputs.push(hidden.clone());
+        let (controller_input, controller_output) =
+            recursive_controller_values(&hidden, spec, params, step)?;
+        let body_forward = if training {
+            body.forward_training_with_rng_seed(
+                &hidden,
+                recursive_body_rng_seed(train_iteration, layer.index, step),
+            )?
+        } else {
+            body.forward(&hidden)?
+        };
+        let body_output = body_forward.final_output().ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "[recursive_block] layer #{} body produced no output",
+                layer.index
+            ))
+        })?;
+        if body_output.shape != layer.output_shape {
+            return Err(Error::InvalidConfig(format!(
+                "[recursive_block] layer #{} body output shape mismatch: expected {}, got {}",
+                layer.index, layer.output_shape, body_output.shape
+            )));
+        }
+        let channels = input.shape.channels;
+        let area = input.shape.width * input.shape.height;
+        let controller_channels = channels * 2;
+        let mut next = Tensor::zeros(layer.output_shape);
+        for b in 0..input.shape.batch {
+            for channel in 0..channels {
+                let controller_offset = b * controller_channels;
+                let gamma = if spec.ouroboros == 1 {
+                    recursive_clip(
+                        controller_output[controller_offset + channel],
+                        spec.gamma_clip,
+                    )
+                } else {
+                    0.0
+                };
+                let gate = if spec.ouroboros == 1 {
+                    recursive_sigmoid(recursive_clip(
+                        controller_output[controller_offset + channels + channel],
+                        spec.gate_clip,
+                    ))
+                } else {
+                    0.0
+                };
+                for spatial in 0..area {
+                    let index = b * channels * area + channel * area + spatial;
+                    let candidate = spec.body_scale * body_output.data[index];
+                    let value = if spec.ouroboros == 1 {
+                        gate * candidate * (1.0 + gamma) + (1.0 - gate) * hidden.data[index]
+                    } else {
+                        candidate + spec.residual_scale * hidden.data[index]
+                    };
+                    next.data[index] = value
+                        + if spec.injection {
+                            spec.injection_scale * input.data[index]
+                        } else {
+                            0.0
+                        };
+                }
+            }
+        }
+        body_passes.push(body_forward);
+        controller_inputs.push(controller_input);
+        controller_outputs.push(controller_output);
+        if step + 1 < spec.loops && spec.lattice_mix > 0.0 {
+            let projected = recursive_lattice_project(&hidden, &next, spec)?;
+            lattice_inputs.push(Some(next));
+            hidden = projected;
+        } else {
+            lattice_inputs.push(None);
+            hidden = next;
+        }
+    }
+    Ok((
+        hidden,
+        RecursiveBlockForwardCache {
+            body_passes,
+            hidden_inputs,
+            controller_inputs,
+            controller_outputs,
+            lattice_inputs,
+        },
+    ))
+}
+
 pub fn compute_learning_rate(net: &NetConfig, batch_num: usize) -> f32 {
     let mut lr = net.learning_rate;
 
@@ -5999,6 +6786,16 @@ fn convolutional_parameter_count(params: &ConvolutionalParams) -> usize {
 
 fn host_adam_scalar_capacity(params: &LayerParams) -> usize {
     match params {
+        LayerParams::RecursiveBlock(params) => {
+            params.controller_weights.len()
+                + params.controller_biases.len()
+                + params.body.len()
+                + params
+                    .body
+                    .iter()
+                    .map(host_adam_scalar_capacity)
+                    .sum::<usize>()
+        }
         LayerParams::BatchNorm(params) => params.scales.len() + params.biases.len(),
         LayerParams::Convolutional(params) => convolutional_parameter_count(params),
         LayerParams::Connected(params) => connected_parameter_count(params),
@@ -6136,6 +6933,133 @@ fn host_adam_scalar_capacity(params: &LayerParams) -> usize {
         | LayerParams::LayaEncoder(_)
         | LayerParams::LayaHead(_) => 0,
     }
+}
+
+fn validate_host_adam_slot(
+    name: &str,
+    moments: &Option<(Vec<f32>, Vec<f32>)>,
+    expected_len: usize,
+) -> Result<()> {
+    match moments {
+        Some((first, second)) if first.len() == expected_len && second.len() == expected_len => {
+            Ok(())
+        }
+        Some((first, second)) => Err(Error::Weights(format!(
+            "recursive-block Adam {name} moments have lengths {}/{}, expected {expected_len}",
+            first.len(),
+            second.len()
+        ))),
+        None if expected_len == 0 => Ok(()),
+        None => Err(Error::Weights(format!(
+            "recursive-block Adam {name} moments are missing (expected {expected_len})"
+        ))),
+    }
+}
+
+fn validate_recursive_body_adam_state(
+    layer: &crate::model::Layer,
+    params: &LayerParams,
+    state: &HostAdamLayerState,
+) -> Result<()> {
+    if !state.children.is_empty() {
+        return Err(Error::Weights(format!(
+            "recursive-block Adam leaf layer #{} has unexpected child states",
+            layer.index
+        )));
+    }
+    match (&layer.kind, params) {
+        (LayerKind::Convolutional(_), LayerParams::Convolutional(params)) => {
+            validate_host_adam_slot(
+                "body convolution weight",
+                &state.weights,
+                params.weights.len(),
+            )?;
+            validate_host_adam_slot("body convolution bias", &state.biases, params.biases.len())?;
+            validate_host_adam_slot(
+                "body convolution scale",
+                &state.scales,
+                params.batch_norm.as_ref().map_or(0, |bn| bn.scales.len()),
+            )
+        }
+        (LayerKind::Connected(_), LayerParams::Connected(params)) => {
+            validate_host_adam_slot(
+                "body connected weight",
+                &state.weights,
+                params.weights.len(),
+            )?;
+            validate_host_adam_slot("body connected bias", &state.biases, params.biases.len())?;
+            validate_host_adam_slot(
+                "body connected scale",
+                &state.scales,
+                params.batch_norm.as_ref().map_or(0, |bn| bn.scales.len()),
+            )
+        }
+        (
+            LayerKind::MaxPool(_)
+            | LayerKind::LocalAvgPool(_)
+            | LayerKind::AvgPool
+            | LayerKind::Upsample(_)
+            | LayerKind::ChannelShuffle(_)
+            | LayerKind::Dropout { .. },
+            LayerParams::None,
+        ) => {
+            validate_host_adam_slot("body non-parameter weight", &state.weights, 0)?;
+            validate_host_adam_slot("body non-parameter bias", &state.biases, 0)?;
+            validate_host_adam_slot("body non-parameter scale", &state.scales, 0)
+        }
+        _ => Err(Error::Weights(format!(
+            "recursive-block Adam state does not match body layer #{} ({})",
+            layer.index,
+            layer.kind.name()
+        ))),
+    }
+}
+
+fn validate_recursive_block_adam_state(
+    layer: &crate::model::Layer,
+    params: &LayerParams,
+    state: &HostAdamLayerState,
+) -> Result<()> {
+    let (LayerKind::RecursiveBlock(spec), LayerParams::RecursiveBlock(params)) =
+        (&layer.kind, params)
+    else {
+        return Err(Error::Weights(
+            "recursive-block Adam state does not match layer parameters".to_owned(),
+        ));
+    };
+    validate_host_adam_slot(
+        "controller weight",
+        &state.weights,
+        if spec.ouroboros == 1 {
+            params.controller_weights.len()
+        } else {
+            0
+        },
+    )?;
+    validate_host_adam_slot(
+        "controller bias",
+        &state.biases,
+        if spec.ouroboros == 1 {
+            params.controller_biases.len()
+        } else {
+            0
+        },
+    )?;
+    validate_host_adam_slot("controller scale", &state.scales, 0)?;
+    if state.children.len() != spec.body.len() || params.body.len() != spec.body.len() {
+        return Err(Error::Weights(format!(
+            "recursive-block Adam body has {} states and {} parameters, expected {}",
+            state.children.len(),
+            params.body.len(),
+            spec.body.len()
+        )));
+    }
+    for ((body_layer, body_params), body_state) in
+        spec.body.iter().zip(&params.body).zip(&state.children)
+    {
+        validate_recursive_body_adam_state(body_layer, body_params, body_state)?;
+    }
+    Ok(())
 }
 
 fn write_host_adam_moments(
@@ -7442,6 +8366,20 @@ where
                 host_state[index] = Some(read_host_adam_state(&mut file, max_scalars)?);
             }
         }
+        for (index, state) in host_state.iter().enumerate() {
+            if let Some(state) = state
+                && matches!(
+                    self.network.layers[index].kind,
+                    LayerKind::RecursiveBlock(_)
+                )
+            {
+                validate_recursive_block_adam_state(
+                    &self.network.layers[index],
+                    &self.params[index],
+                    state,
+                )?;
+            }
+        }
         let mut moe_state: Vec<Option<GpuMoeAdamLayerState<B::Tensor>>> =
             (0..self.network.layers.len()).map(|_| None).collect();
         if version >= 3 {
@@ -8138,6 +9076,18 @@ where
             return Err(Error::UnsupportedLayer {
                 layer_index: layer.index,
                 name: "[wmhf] GPU updates are not implemented in the Stage-1 CPU port".to_owned(),
+            });
+        }
+        if let Some(layer) = self
+            .network
+            .layers
+            .iter()
+            .find(|layer| matches!(layer.kind, LayerKind::RecursiveBlock(_)))
+        {
+            return Err(Error::UnsupportedLayer {
+                layer_index: layer.index,
+                name: "[recursive_block] GPU updates are not implemented in the Stage-1 CPU port"
+                    .to_owned(),
             });
         }
         if let Some(layer) = self
@@ -9564,6 +10514,18 @@ where
             .network
             .layers
             .iter()
+            .find(|layer| matches!(layer.kind, LayerKind::RecursiveBlock(_)))
+        {
+            return Err(Error::UnsupportedLayer {
+                layer_index: layer.index,
+                name: "[recursive_block] GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path"
+                    .to_owned(),
+            });
+        }
+        if let Some(layer) = self
+            .network
+            .layers
+            .iter()
             .find(|layer| matches!(layer.kind, LayerKind::Clifford(_)))
         {
             return Err(Error::UnsupportedLayer {
@@ -10496,7 +11458,7 @@ where
                     },
                     LayerParams::None,
                 ) => {
-                    let probability = probability.unwrap_or(0.5);
+                    let probability = probability.unwrap_or(0.2);
                     check_dropout_probability(probability)?;
                     let block_plan = dropblock.as_ref().map(|spec| {
                         dropblock_plan(
@@ -11316,6 +12278,7 @@ where
                 graph_conv_caches: vec![None; self.network.layers.len()],
                 wmhf_caches: vec![None; self.network.layers.len()],
                 clifford_caches: vec![None; self.network.layers.len()],
+                recursive_block_caches: vec![None; self.network.layers.len()],
                 vit_caches,
                 swin_caches,
                 tucker_attention_caches,
@@ -11391,6 +12354,18 @@ where
             return Err(Error::UnsupportedLayer {
                 layer_index: layer.index,
                 name: "[wmhf] compact GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path".to_owned(),
+            });
+        }
+        if let Some(layer) = self
+            .network
+            .layers
+            .iter()
+            .find(|layer| matches!(layer.kind, LayerKind::RecursiveBlock(_)))
+        {
+            return Err(Error::UnsupportedLayer {
+                layer_index: layer.index,
+                name: "[recursive_block] compact GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path"
+                    .to_owned(),
             });
         }
         if let Some(layer) = self
@@ -15987,6 +16962,23 @@ fn zero_vit_weights(weights: &mut crate::vit::VitWeights) {
 
 fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
     match &layer.kind {
+        LayerKind::RecursiveBlock(spec) => {
+            let controller_outputs = if spec.ouroboros == 1 {
+                layer.input_shape.channels * 2
+            } else {
+                0
+            };
+            let controller_inputs = if spec.ouroboros == 1 {
+                layer.input_shape.channels + 1
+            } else {
+                0
+            };
+            LayerParams::RecursiveBlock(RecursiveBlockParams {
+                body: spec.body.iter().map(default_layer_params).collect(),
+                controller_weights: vec![0.0; controller_outputs.saturating_mul(controller_inputs)],
+                controller_biases: vec![0.0; controller_outputs],
+            })
+        }
         LayerKind::BatchNorm(_) => {
             LayerParams::BatchNorm(default_batchnorm_params(layer.input_shape.channels))
         }
@@ -16190,6 +17182,26 @@ fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
 
 fn default_layer_train_buffers(layer: &crate::model::Layer) -> LayerTrainBuffers {
     match &layer.kind {
+        LayerKind::RecursiveBlock(spec) => {
+            let controller_outputs = if spec.ouroboros == 1 {
+                layer.input_shape.channels * 2
+            } else {
+                0
+            };
+            let controller_inputs = if spec.ouroboros == 1 {
+                layer.input_shape.channels + 1
+            } else {
+                0
+            };
+            LayerTrainBuffers::RecursiveBlock(RecursiveBlockTrainBuffers {
+                body: spec.body.iter().map(default_layer_train_buffers).collect(),
+                controller_weight_updates: vec![
+                    0.0;
+                    controller_outputs.saturating_mul(controller_inputs)
+                ],
+                controller_bias_updates: vec![0.0; controller_outputs],
+            })
+        }
         LayerKind::BatchNorm(_) => LayerTrainBuffers::BatchNorm(default_batchnorm_train_buffers(
             layer.input_shape.channels,
         )),
@@ -17706,6 +18718,48 @@ fn apply_host_adam_layer(
     adam: &AdamParams,
 ) -> Result<()> {
     match (params, train) {
+        (LayerParams::RecursiveBlock(params), LayerTrainBuffers::RecursiveBlock(train)) => {
+            let LayerKind::RecursiveBlock(spec) = kind else {
+                return Err(Error::InvalidConfig(
+                    "recursive-block parameters do not match layer kind during Adam update"
+                        .to_owned(),
+                ));
+            };
+            if spec.body.len() != params.body.len() || spec.body.len() != train.body.len() {
+                return Err(Error::InvalidConfig(
+                    "recursive-block Adam body parameter/update count mismatch".to_owned(),
+                ));
+            }
+            for (index, ((layer, params), train)) in spec
+                .body
+                .iter()
+                .zip(&mut params.body)
+                .zip(&mut train.body)
+                .enumerate()
+            {
+                apply_host_adam_layer(
+                    &layer.kind,
+                    params,
+                    train,
+                    host_adam_child(state, index),
+                    adam,
+                )?;
+            }
+            if spec.ouroboros == 1 {
+                apply_host_adam(
+                    &mut params.controller_weights,
+                    &mut train.controller_weight_updates,
+                    &mut state.weights,
+                    adam,
+                )?;
+                apply_host_adam_non_weight(
+                    &mut params.controller_biases,
+                    &mut train.controller_bias_updates,
+                    &mut state.biases,
+                    adam,
+                )?;
+            }
+        }
         (LayerParams::BatchNorm(params), LayerTrainBuffers::BatchNorm(train)) => {
             apply_host_adam_non_weight(
                 &mut params.scales,
@@ -18373,6 +19427,60 @@ fn update_clifford_params(
     }
 }
 
+fn update_recursive_block_sgd(
+    spec: &crate::model::RecursiveBlockSpec,
+    params: &mut RecursiveBlockParams,
+    train: &mut RecursiveBlockTrainBuffers,
+    lr: f32,
+    momentum: f32,
+    decay: f32,
+    batch: usize,
+) {
+    for ((layer, params), train) in spec.body.iter().zip(&mut params.body).zip(&mut train.body) {
+        match (&layer.kind, params, train) {
+            (
+                LayerKind::Convolutional(_),
+                LayerParams::Convolutional(params),
+                LayerTrainBuffers::Convolutional(train),
+            ) => update_convolutional_params(params, train, lr, momentum, decay, batch),
+            (
+                LayerKind::Connected(_),
+                LayerParams::Connected(params),
+                LayerTrainBuffers::Connected(train),
+            ) => update_connected_params(params, train, lr, momentum, decay, batch),
+            (
+                LayerKind::MaxPool(_)
+                | LayerKind::LocalAvgPool(_)
+                | LayerKind::AvgPool
+                | LayerKind::Upsample(_)
+                | LayerKind::ChannelShuffle(_)
+                | LayerKind::Dropout { .. },
+                LayerParams::None,
+                LayerTrainBuffers::None,
+            ) => {}
+            _ => {}
+        }
+    }
+    if spec.ouroboros == 1 {
+        sgd_update(
+            &mut params.controller_weights,
+            &mut train.controller_weight_updates,
+            lr,
+            momentum,
+            decay,
+            batch,
+        );
+        sgd_update(
+            &mut params.controller_biases,
+            &mut train.controller_bias_updates,
+            lr,
+            momentum,
+            0.0,
+            batch,
+        );
+    }
+}
+
 fn update_convolutional_params(
     params: &mut ConvolutionalParams,
     train: &mut ConvolutionalTrainBuffers,
@@ -18571,6 +19679,57 @@ fn accumulate_convolutional_train_buffer(
     Ok(())
 }
 
+fn accumulate_recursive_block_train_buffers(
+    spec: &crate::model::RecursiveBlockSpec,
+    train: &mut RecursiveBlockTrainBuffers,
+    gradient: &RecursiveBlockParams,
+) -> Result<()> {
+    if spec.body.len() != train.body.len() || spec.body.len() != gradient.body.len() {
+        return Err(Error::InvalidConfig(
+            "recursive-block body gradient/update count mismatch".to_owned(),
+        ));
+    }
+    for ((layer, train), gradient) in spec.body.iter().zip(&mut train.body).zip(&gradient.body) {
+        match (&layer.kind, train, gradient) {
+            (
+                LayerKind::Convolutional(_),
+                LayerTrainBuffers::Convolutional(train),
+                LayerParams::Convolutional(gradient),
+            ) => accumulate_convolutional_train_buffer(train, gradient)?,
+            (
+                LayerKind::Connected(_),
+                LayerTrainBuffers::Connected(train),
+                LayerParams::Connected(gradient),
+            ) => accumulate_connected_train_buffer(train, gradient)?,
+            (
+                LayerKind::MaxPool(_)
+                | LayerKind::LocalAvgPool(_)
+                | LayerKind::AvgPool
+                | LayerKind::Upsample(_)
+                | LayerKind::ChannelShuffle(_)
+                | LayerKind::Dropout { .. },
+                LayerTrainBuffers::None,
+                LayerParams::None,
+            ) => {}
+            _ => {
+                return Err(Error::InvalidConfig(format!(
+                    "unsupported recursive-block gradient layout for body layer #{} ({})",
+                    layer.index,
+                    layer.kind.name()
+                )));
+            }
+        }
+    }
+    accumulate_vec(
+        &mut train.controller_weight_updates,
+        &gradient.controller_weights,
+    )?;
+    accumulate_vec(
+        &mut train.controller_bias_updates,
+        &gradient.controller_biases,
+    )
+}
+
 fn resolve_convolutional_owner(network: &Network, layer_index: usize) -> Result<usize> {
     let Some(layer) = network.layers.get(layer_index) else {
         return Err(Error::InvalidConfig(format!(
@@ -18674,6 +19833,15 @@ fn load_weights_into_params(
     for (layer, params) in network.layers.iter().zip(params.iter_mut()) {
         match params {
             LayerParams::None => {}
+            LayerParams::RecursiveBlock(recursive) => {
+                let LayerKind::RecursiveBlock(spec) = &layer.kind else {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} recursive-block parameters do not match layer kind",
+                        layer.index
+                    )));
+                };
+                read_recursive_body_weights(&mut file, &spec.body, &mut recursive.body)?;
+            }
             LayerParams::BatchNorm(batch_norm) => {
                 read_f32_into(&mut file, &mut batch_norm.biases)?;
                 read_f32_into(&mut file, &mut batch_norm.scales)?;
@@ -19425,6 +20593,57 @@ fn read_u64(file: &mut File) -> Result<u64> {
     let mut bytes = [0u8; 8];
     file.read_exact(&mut bytes)?;
     Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_recursive_body_weights(
+    file: &mut File,
+    body: &[crate::model::Layer],
+    params: &mut [LayerParams],
+) -> Result<()> {
+    if body.len() != params.len() {
+        return Err(Error::InvalidConfig(
+            "recursive-block body weight parameter count mismatch".to_owned(),
+        ));
+    }
+    for (layer, params) in body.iter().zip(params) {
+        match (&layer.kind, params) {
+            (LayerKind::Convolutional(_), LayerParams::Convolutional(conv)) => {
+                read_f32_into(file, &mut conv.biases)?;
+                if let Some(batch_norm) = conv.batch_norm.as_mut() {
+                    read_f32_into(file, &mut batch_norm.scales)?;
+                    read_f32_into(file, &mut batch_norm.rolling_mean)?;
+                    read_f32_into(file, &mut batch_norm.rolling_variance)?;
+                }
+                read_f32_into(file, &mut conv.weights)?;
+            }
+            (LayerKind::Connected(_), LayerParams::Connected(connected)) => {
+                read_connected_params(
+                    file,
+                    connected,
+                    layer.input_shape.element_count(),
+                    connected.biases.len(),
+                    false,
+                )?;
+            }
+            (
+                LayerKind::MaxPool(_)
+                | LayerKind::LocalAvgPool(_)
+                | LayerKind::AvgPool
+                | LayerKind::Upsample(_)
+                | LayerKind::ChannelShuffle(_)
+                | LayerKind::Dropout { .. },
+                LayerParams::None,
+            ) => {}
+            _ => {
+                return Err(Error::InvalidConfig(format!(
+                    "unsupported recursive-block weight layout for body layer #{} ({})",
+                    layer.index,
+                    layer.kind.name()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read_connected_params(
@@ -20271,6 +21490,90 @@ fn update_convolutional_batch_norm_from_input(
     };
     let (mean, variance) = channel_mean_variance(&raw_output);
     update_batch_norm_running_stats(batch_norm, &mean, &variance, BATCH_NORM_ROLLING_KEEP_CPU)
+}
+
+fn update_recursive_body_batch_norm_running_stats(
+    outer_layer: &crate::model::Layer,
+    spec: &crate::model::RecursiveBlockSpec,
+    params: &mut RecursiveBlockParams,
+    cache: &RecursiveBlockForwardCache,
+) -> Result<()> {
+    if cache.body_passes.len() != spec.loops
+        || cache.hidden_inputs.len() != spec.loops
+        || params.body.len() != spec.body.len()
+    {
+        return Err(Error::InvalidConfig(format!(
+            "[recursive_block] layer #{} body BN cache/parameter layout mismatch",
+            outer_layer.index
+        )));
+    }
+    for step in 0..spec.loops {
+        let body_forward = &cache.body_passes[step];
+        for (body_layer, body_params) in spec.body.iter().zip(&mut params.body) {
+            if body_layer.index >= body_forward.layer_outputs.len() {
+                return Err(Error::InvalidConfig(format!(
+                    "[recursive_block] layer #{} body pass {step} lacks output for nested layer #{}",
+                    outer_layer.index, body_layer.index
+                )));
+            }
+            let body_input = if body_layer.index == 0 {
+                &cache.hidden_inputs[step]
+            } else {
+                body_forward.layer_outputs.get(body_layer.index - 1).ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "[recursive_block] layer #{} body pass {step} lacks input for nested layer #{}",
+                        outer_layer.index, body_layer.index
+                    ))
+                })?
+            };
+            match (&body_layer.kind, body_params) {
+                (LayerKind::Convolutional(body_spec), LayerParams::Convolutional(body_params))
+                    if body_spec.batch_normalize =>
+                {
+                    let raw = raw_convolution_output(
+                        body_spec,
+                        body_params,
+                        body_input,
+                        body_layer.output_shape,
+                    );
+                    let (mean, variance) = channel_mean_variance(&raw);
+                    let Some(batch_norm) = body_params.batch_norm.as_mut() else {
+                        return Err(Error::InvalidConfig(format!(
+                            "[recursive_block] layer #{} nested conv #{} has no batch-norm state",
+                            outer_layer.index, body_layer.index
+                        )));
+                    };
+                    update_batch_norm_running_stats(
+                        batch_norm,
+                        &mean,
+                        &variance,
+                        BATCH_NORM_ROLLING_KEEP_CPU,
+                    )?;
+                }
+                (LayerKind::Connected(body_spec), LayerParams::Connected(body_params))
+                    if body_spec.batch_normalize =>
+                {
+                    let raw =
+                        raw_connected_output(body_params, body_input, body_layer.output_shape);
+                    let (mean, variance) = channel_mean_variance(&raw);
+                    let Some(batch_norm) = body_params.batch_norm.as_mut() else {
+                        return Err(Error::InvalidConfig(format!(
+                            "[recursive_block] layer #{} nested connected #{} has no batch-norm state",
+                            outer_layer.index, body_layer.index
+                        )));
+                    };
+                    update_batch_norm_running_stats(
+                        batch_norm,
+                        &mean,
+                        &variance,
+                        BATCH_NORM_ROLLING_KEEP_CPU,
+                    )?;
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 fn update_recurrent_batch_norm_running_stats(
@@ -41477,6 +42780,855 @@ activation=linear
         assert!(
             with_fix.1 != unclamped.1,
             "without try_fix_nan the large deltas pass through"
+        );
+    }
+
+    fn recursive_test_network(
+        channels: usize,
+        body_count: usize,
+        parent_options: &str,
+        body_sections: &str,
+        net_options: &str,
+    ) -> Network {
+        let cfg = format!(
+            "[net]\nwidth=2\nheight=1\nchannels={channels}\nbatch=1\n{net_options}\n\
+             [recursive_block]\nbody={body_count}\n{parent_options}\n{body_sections}"
+        );
+        Network::from_config(ConfigFile::parse_str("recursive-block-test.cfg", &cfg).unwrap())
+            .unwrap()
+    }
+
+    fn recursive_objective(executable: &ExecutableNetwork, input: &Tensor, seed: &Tensor) -> f32 {
+        executable
+            .forward_training(input)
+            .unwrap()
+            .final_output()
+            .unwrap()
+            .data
+            .iter()
+            .zip(&seed.data)
+            .map(|(output, upstream)| output * upstream)
+            .sum()
+    }
+
+    fn check_recursive_scalar_finite_difference(
+        executable: &mut ExecutableNetwork,
+        input: &Tensor,
+        seed: &Tensor,
+        name: &str,
+        original: f32,
+        analytical: f32,
+        mut set: impl FnMut(&mut ExecutableNetwork, f32),
+    ) {
+        let eps = 5.0e-4;
+        set(executable, original + eps);
+        let plus = recursive_objective(executable, input, seed);
+        set(executable, original - eps);
+        let minus = recursive_objective(executable, input, seed);
+        set(executable, original);
+        let numerical = (plus - minus) / (2.0 * eps);
+        let tolerance = 2.0e-3 + 2.0e-2 * analytical.abs().max(numerical.abs());
+        assert!(
+            (analytical - numerical).abs() <= tolerance,
+            "[recursive_block] {name}: analytic {analytical}, numerical {numerical}, tolerance {tolerance}"
+        );
+    }
+
+    fn check_recursive_input_gradients(
+        executable: &ExecutableNetwork,
+        input: &Tensor,
+        seed: &Tensor,
+        analytic: &Tensor,
+    ) {
+        for index in 0..input.data.len() {
+            let eps = 5.0e-4;
+            let mut plus = input.clone();
+            let mut minus = input.clone();
+            plus.data[index] += eps;
+            minus.data[index] -= eps;
+            let numerical = (recursive_objective(executable, &plus, seed)
+                - recursive_objective(executable, &minus, seed))
+                / (2.0 * eps);
+            let tolerance = 2.0e-3 + 2.0e-2 * analytic.data[index].abs().max(numerical.abs());
+            assert!(
+                (analytic.data[index] - numerical).abs() <= tolerance,
+                "[recursive_block] input[{index}]: analytic {}, numerical {numerical}, tolerance {tolerance}",
+                analytic.data[index]
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_block_consumes_body_sections_without_shifting_top_level_indices() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "recursive-index.cfg",
+                "[net]\nwidth=2\nheight=1\nchannels=1\n\
+                 [convolutional]\nfilters=1\nsize=1\nactivation=linear\n\
+                 [recurrent_block]\nloops=2\nbody=1\n\
+                 [convolutional]\nfilters=1\nsize=1\nactivation=linear\n\
+                 [convolutional]\nfilters=1\nsize=1\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(network.layers.len(), 3);
+        assert_eq!(
+            network
+                .layers
+                .iter()
+                .map(|layer| layer.index)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        let LayerKind::RecursiveBlock(spec) = &network.layers[1].kind else {
+            panic!("recursive block layer")
+        };
+        assert_eq!(spec.body.len(), 1);
+        assert_eq!(spec.body[0].index, 0);
+        assert_eq!(spec.loops, 2);
+        assert_eq!(
+            network.layers[1].output_shape,
+            network.layers[1].input_shape
+        );
+    }
+
+    #[test]
+    fn recursive_block_rejects_unsupported_and_malformed_options() {
+        let valid_body = "[convolutional]\nfilters=1\nsize=1\nactivation=linear\n";
+        let invalid = [
+            ("loops=0\n", valid_body, "loops must be >= 1"),
+            ("ouroboros=2\n", valid_body, "ouroboros must be 0 or 1"),
+            ("lora_rank=0\n", valid_body, "Stage-2 Conv-LoRA"),
+            ("mystery=1\n", valid_body, "unknown or unsupported option"),
+            ("", "[route]\nlayers=-1\n", "unsupported layer kind"),
+            (
+                "",
+                "[convolutional]\nfilters=1\nsize=3\nactivation=linear\n",
+                "body changes dimensions",
+            ),
+            (
+                "",
+                "[convolutional]\nfilters=1\nsize=1\nactivation=linear\nmystery=1\n",
+                "unknown or unsupported option",
+            ),
+        ];
+        for (options, body, expected) in invalid {
+            let cfg = format!(
+                "[net]\nwidth=2\nheight=1\nchannels=1\n[recursive_block]\nbody=1\n{options}{body}"
+            );
+            let error =
+                Network::from_config(ConfigFile::parse_str("invalid-recursive.cfg", &cfg).unwrap())
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                error.contains(expected),
+                "{error} did not contain `{expected}`"
+            );
+        }
+        let valid = recursive_test_network(1, 1, "loops=1\n", valid_body, "");
+        assert_eq!(valid.layers.len(), 1);
+    }
+
+    #[test]
+    fn recursive_block_dropout_masks_are_independent_and_reproducible_per_pass() {
+        let default_network = Network::from_config(
+            ConfigFile::parse_str(
+                "recursive-dropout-default.cfg",
+                r#"[net]
+width=2
+height=1
+channels=1
+[recursive_block]
+body=1
+[dropout]
+"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let LayerKind::RecursiveBlock(spec) = &default_network.layers[0].kind else {
+            panic!("recursive-block layer")
+        };
+        assert!(matches!(
+            spec.body[0].kind,
+            LayerKind::Dropout {
+                probability: None,
+                ..
+            }
+        ));
+
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "recursive-dropout.cfg",
+                r#"[net]
+width=64
+height=1
+channels=1
+batch=1
+[recursive_block]
+loops=4
+injection=0
+body=1
+[dropout]
+probability=0.5
+"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let executable = ExecutableNetwork::new(network.clone());
+        let input = Tensor::from_data(network.net.input_shape(), vec![1.0; 64]).unwrap();
+        let first = executable.forward_training(&input).unwrap();
+        let second = executable.forward_training(&input).unwrap();
+        let first_cache = first.recursive_block_caches[0].as_ref().unwrap();
+        let second_cache = second.recursive_block_caches[0].as_ref().unwrap();
+        let masks = first_cache
+            .body_passes
+            .iter()
+            .map(|pass| pass.dropout_masks[0].as_ref().unwrap().data.clone())
+            .collect::<Vec<_>>();
+        let repeated_masks = second_cache
+            .body_passes
+            .iter()
+            .map(|pass| pass.dropout_masks[0].as_ref().unwrap().data.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(masks, repeated_masks);
+        assert!(masks.windows(2).any(|pair| pair[0] != pair[1]));
+    }
+
+    #[test]
+    fn recursive_block_static_full_bptt_matches_input_and_parameter_differences() {
+        let network = recursive_test_network(
+            1,
+            1,
+            "loops=3\ninjection=1\nbody_scale=0.3\nresidual_scale=0.4\ninjection_scale=0.2\n",
+            "[convolutional]\nfilters=1\nsize=1\nactivation=linear\n",
+            "",
+        );
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::RecursiveBlock(params) = &mut executable.params[0] else {
+            panic!("recursive-block parameters")
+        };
+        let LayerParams::Convolutional(body) = &mut params.body[0] else {
+            panic!("body convolution parameters")
+        };
+        body.weights[0] = 0.7;
+        body.biases[0] = 0.1;
+        let input =
+            Tensor::from_data(executable.network.net.input_shape(), vec![0.3, 0.8]).unwrap();
+        let forward = executable.forward_training(&input).unwrap();
+        let output = forward.final_output().unwrap();
+        for (got, source) in output.data.iter().zip(&input.data) {
+            let mut expected = *source;
+            for _ in 0..3 {
+                expected = 0.3 * (0.7 * expected + 0.1) + 0.4 * expected + 0.2 * source;
+            }
+            assert!((got - expected).abs() < 1e-6, "{got} != {expected}");
+        }
+        let seed = Tensor::from_data(output.shape, vec![0.7, -0.4]).unwrap();
+        let backward = executable.backward(&input, &forward, &seed).unwrap();
+        check_recursive_input_gradients(&executable, &input, &seed, &backward.input_gradient);
+        let LayerParams::RecursiveBlock(gradient) = &backward.param_gradients[0] else {
+            panic!("recursive-block parameter gradients")
+        };
+        let LayerParams::Convolutional(body_gradient) = &gradient.body[0] else {
+            panic!("body convolution gradients")
+        };
+        let weight = match &executable.params[0] {
+            LayerParams::RecursiveBlock(params) => match &params.body[0] {
+                LayerParams::Convolutional(body) => body.weights[0],
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+        check_recursive_scalar_finite_difference(
+            &mut executable,
+            &input,
+            &seed,
+            "body weight",
+            weight,
+            body_gradient.weights[0],
+            |exe, value| {
+                let LayerParams::RecursiveBlock(params) = &mut exe.params[0] else {
+                    unreachable!()
+                };
+                let LayerParams::Convolutional(body) = &mut params.body[0] else {
+                    unreachable!()
+                };
+                body.weights[0] = value;
+            },
+        );
+        let bias = match &executable.params[0] {
+            LayerParams::RecursiveBlock(params) => match &params.body[0] {
+                LayerParams::Convolutional(body) => body.biases[0],
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+        check_recursive_scalar_finite_difference(
+            &mut executable,
+            &input,
+            &seed,
+            "body bias",
+            bias,
+            body_gradient.biases[0],
+            |exe, value| {
+                let LayerParams::RecursiveBlock(params) = &mut exe.params[0] else {
+                    unreachable!()
+                };
+                let LayerParams::Convolutional(body) = &mut params.body[0] else {
+                    unreachable!()
+                };
+                body.biases[0] = value;
+            },
+        );
+    }
+
+    #[test]
+    fn recursive_block_ouroboros_controller_and_shared_body_match_finite_differences() {
+        let network = recursive_test_network(
+            1,
+            1,
+            "loops=3\ninjection=1\ninjection_scale=0.2\nbody_scale=0.8\n\
+             ouroboros=1\ngate_bias=-0.2\ngamma_clip=2\ngate_clip=2\n",
+            "[convolutional]\nfilters=1\nsize=1\nactivation=linear\n",
+            "",
+        );
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::RecursiveBlock(params) = &mut executable.params[0] else {
+            panic!("recursive-block parameters")
+        };
+        let LayerParams::Convolutional(body) = &mut params.body[0] else {
+            panic!("body convolution parameters")
+        };
+        body.weights[0] = 0.6;
+        body.biases[0] = 0.08;
+        params
+            .controller_weights
+            .copy_from_slice(&[0.05, -0.03, -0.04, 0.02]);
+        params.controller_biases.copy_from_slice(&[0.1, -0.2]);
+        let input =
+            Tensor::from_data(executable.network.net.input_shape(), vec![0.2, 0.7]).unwrap();
+        let forward = executable.forward_training(&input).unwrap();
+        let seed =
+            Tensor::from_data(forward.final_output().unwrap().shape, vec![0.7, -0.4]).unwrap();
+        let backward = executable.backward(&input, &forward, &seed).unwrap();
+        check_recursive_input_gradients(&executable, &input, &seed, &backward.input_gradient);
+        let LayerParams::RecursiveBlock(gradient) = &backward.param_gradients[0] else {
+            panic!("recursive-block parameter gradients")
+        };
+        let LayerParams::Convolutional(body_gradient) = &gradient.body[0] else {
+            panic!("body convolution gradients")
+        };
+        for (name, index, original, analytic) in [
+            (
+                "controller weight",
+                0,
+                match &executable.params[0] {
+                    LayerParams::RecursiveBlock(params) => params.controller_weights[0],
+                    _ => unreachable!(),
+                },
+                gradient.controller_weights[0],
+            ),
+            (
+                "controller gamma bias",
+                0,
+                match &executable.params[0] {
+                    LayerParams::RecursiveBlock(params) => params.controller_biases[0],
+                    _ => unreachable!(),
+                },
+                gradient.controller_biases[0],
+            ),
+            (
+                "controller gate bias",
+                1,
+                match &executable.params[0] {
+                    LayerParams::RecursiveBlock(params) => params.controller_biases[1],
+                    _ => unreachable!(),
+                },
+                gradient.controller_biases[1],
+            ),
+        ] {
+            check_recursive_scalar_finite_difference(
+                &mut executable,
+                &input,
+                &seed,
+                name,
+                original,
+                analytic,
+                move |exe, value| {
+                    let LayerParams::RecursiveBlock(params) = &mut exe.params[0] else {
+                        unreachable!()
+                    };
+                    if name == "controller weight" {
+                        params.controller_weights[index] = value;
+                    } else {
+                        params.controller_biases[index] = value;
+                    }
+                },
+            );
+        }
+        for index in 1..3 {
+            let original = match &executable.params[0] {
+                LayerParams::RecursiveBlock(params) => params.controller_weights[index],
+                _ => unreachable!(),
+            };
+            check_recursive_scalar_finite_difference(
+                &mut executable,
+                &input,
+                &seed,
+                "controller weight",
+                original,
+                gradient.controller_weights[index],
+                move |exe, value| {
+                    let LayerParams::RecursiveBlock(params) = &mut exe.params[0] else {
+                        unreachable!()
+                    };
+                    params.controller_weights[index] = value;
+                },
+            );
+        }
+        let original_body_weight = match &executable.params[0] {
+            LayerParams::RecursiveBlock(params) => match &params.body[0] {
+                LayerParams::Convolutional(body) => body.weights[0],
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+        check_recursive_scalar_finite_difference(
+            &mut executable,
+            &input,
+            &seed,
+            "shared body weight",
+            original_body_weight,
+            body_gradient.weights[0],
+            |exe, value| {
+                let LayerParams::RecursiveBlock(params) = &mut exe.params[0] else {
+                    unreachable!()
+                };
+                let LayerParams::Convolutional(body) = &mut params.body[0] else {
+                    unreachable!()
+                };
+                body.weights[0] = value;
+            },
+        );
+        let original_body_bias = match &executable.params[0] {
+            LayerParams::RecursiveBlock(params) => match &params.body[0] {
+                LayerParams::Convolutional(body) => body.biases[0],
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+        check_recursive_scalar_finite_difference(
+            &mut executable,
+            &input,
+            &seed,
+            "shared body bias",
+            original_body_bias,
+            body_gradient.biases[0],
+            |exe, value| {
+                let LayerParams::RecursiveBlock(params) = &mut exe.params[0] else {
+                    unreachable!()
+                };
+                let LayerParams::Convolutional(body) = &mut params.body[0] else {
+                    unreachable!()
+                };
+                body.biases[0] = value;
+            },
+        );
+        let original_controller_weight = match &executable.params[0] {
+            LayerParams::RecursiveBlock(params) => params.controller_weights[3],
+            _ => unreachable!(),
+        };
+        check_recursive_scalar_finite_difference(
+            &mut executable,
+            &input,
+            &seed,
+            "controller step-input weight",
+            original_controller_weight,
+            gradient.controller_weights[3],
+            |exe, value| {
+                let LayerParams::RecursiveBlock(params) = &mut exe.params[0] else {
+                    unreachable!()
+                };
+                params.controller_weights[3] = value;
+            },
+        );
+    }
+
+    #[test]
+    fn recursive_block_lattice_projection_backward_matches_finite_differences() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "recursive-lattice.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=2\nbatch=1\n\
+                 [recursive_block]\nloops=2\ninjection=0\nbody_scale=1\n\
+                 residual_scale=0\nlattice_group=2\nlattice_threshold=0.1\n\
+                 lattice_temperature=1\nlattice_mix=0.3\nbody=1\n\
+                 [convolutional]\nfilters=2\nsize=1\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::RecursiveBlock(params) = &mut executable.params[0] else {
+            panic!("recursive-block parameters")
+        };
+        let LayerParams::Convolutional(body) = &mut params.body[0] else {
+            panic!("body convolution parameters")
+        };
+        body.weights.copy_from_slice(&[1.2, 0.1, -0.02, 1.375]);
+        body.biases.copy_from_slice(&[0.0, 0.0]);
+        let input =
+            Tensor::from_data(executable.network.net.input_shape(), vec![0.35, 0.8]).unwrap();
+        let forward = executable.forward_training(&input).unwrap();
+        let seed =
+            Tensor::from_data(forward.final_output().unwrap().shape, vec![0.7, -0.4]).unwrap();
+        let backward = executable.backward(&input, &forward, &seed).unwrap();
+        check_recursive_input_gradients(&executable, &input, &seed, &backward.input_gradient);
+        let LayerParams::RecursiveBlock(gradient) = &backward.param_gradients[0] else {
+            panic!("recursive-block parameter gradients")
+        };
+        let LayerParams::Convolutional(body_gradient) = &gradient.body[0] else {
+            panic!("body convolution gradients")
+        };
+        for index in 0..4 {
+            let original = match &executable.params[0] {
+                LayerParams::RecursiveBlock(params) => match &params.body[0] {
+                    LayerParams::Convolutional(body) => body.weights[index],
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            };
+            check_recursive_scalar_finite_difference(
+                &mut executable,
+                &input,
+                &seed,
+                "lattice body weight",
+                original,
+                body_gradient.weights[index],
+                move |exe, value| {
+                    let LayerParams::RecursiveBlock(params) = &mut exe.params[0] else {
+                        unreachable!()
+                    };
+                    let LayerParams::Convolutional(body) = &mut params.body[0] else {
+                        unreachable!()
+                    };
+                    body.weights[index] = value;
+                },
+            );
+        }
+        for index in 0..2 {
+            let original = match &executable.params[0] {
+                LayerParams::RecursiveBlock(params) => match &params.body[0] {
+                    LayerParams::Convolutional(body) => body.biases[index],
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            };
+            check_recursive_scalar_finite_difference(
+                &mut executable,
+                &input,
+                &seed,
+                "lattice body bias",
+                original,
+                body_gradient.biases[index],
+                move |exe, value| {
+                    let LayerParams::RecursiveBlock(params) = &mut exe.params[0] else {
+                        unreachable!()
+                    };
+                    let LayerParams::Convolutional(body) = &mut params.body[0] else {
+                        unreachable!()
+                    };
+                    body.biases[index] = value;
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_block_initialization_and_weights_follow_body_only_source_order() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "recursive-weights.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=1\nbatch=1\n\
+                 [recursive_block]\nloops=2\nouroboros=1\nbody=2\n\
+                 [convolutional]\nbatch_normalize=1\nfilters=1\nsize=1\nactivation=linear\n\
+                 [connected]\noutput=1\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut first = ExecutableNetwork::new(network.clone());
+        let mut second = ExecutableNetwork::new(network.clone());
+        crate::initialize::initialize_training_params(&network, &mut first.params, 77);
+        crate::initialize::initialize_training_params(&network, &mut second.params, 77);
+        assert_eq!(first.params, second.params);
+        let LayerParams::RecursiveBlock(params) = &first.params[0] else {
+            panic!("recursive-block parameters")
+        };
+        assert!(params.controller_weights.iter().all(|value| *value == 0.0));
+        assert_eq!(params.controller_biases, [0.0, -2.0]);
+        assert_eq!(network.layers[0].weights().unwrap().parameter_count(), 7);
+
+        let LayerParams::RecursiveBlock(params) = &mut first.params[0] else {
+            panic!("recursive-block parameters")
+        };
+        let LayerParams::Convolutional(conv) = &mut params.body[0] else {
+            panic!("body convolution parameters")
+        };
+        conv.biases[0] = 1.0;
+        conv.weights[0] = 5.0;
+        let batch_norm = conv.batch_norm.as_mut().unwrap();
+        batch_norm.scales[0] = 2.0;
+        batch_norm.rolling_mean[0] = 3.0;
+        batch_norm.rolling_variance[0] = 4.0;
+        let LayerParams::Connected(connected) = &mut params.body[1] else {
+            panic!("body connected parameters")
+        };
+        connected.biases[0] = 6.0;
+        connected.weights[0] = 7.0;
+        params.controller_weights.fill(9.0);
+        params.controller_biases.copy_from_slice(&[8.0, 7.0]);
+        let path = std::env::temp_dir().join(format!(
+            "darknet-recursive-block-{}.weights",
+            std::process::id()
+        ));
+        crate::weights::save_weights(&network, &first.params, &path, 0).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let expected_payload = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(&bytes[20..], expected_payload);
+        assert_eq!(bytes.len(), 20 + 7 * 4);
+
+        let mut restored = ExecutableNetwork::new(network.clone());
+        if let LayerParams::RecursiveBlock(params) = &mut restored.params[0] {
+            params.controller_weights.fill(5.0);
+        }
+        restored.load_weights_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        let LayerParams::RecursiveBlock(params) = &restored.params[0] else {
+            panic!("recursive-block parameters")
+        };
+        let LayerParams::Convolutional(conv) = &params.body[0] else {
+            panic!("body convolution parameters")
+        };
+        assert_eq!(conv.biases, [1.0]);
+        assert_eq!(conv.weights, [5.0]);
+        let batch_norm = conv.batch_norm.as_ref().unwrap();
+        assert_eq!(batch_norm.scales, [2.0]);
+        assert_eq!(batch_norm.rolling_mean, [3.0]);
+        assert_eq!(batch_norm.rolling_variance, [4.0]);
+        let LayerParams::Connected(connected) = &params.body[1] else {
+            panic!("body connected parameters")
+        };
+        assert_eq!(connected.biases, [6.0]);
+        assert_eq!(connected.weights, [7.0]);
+        assert_eq!(params.controller_weights, [5.0; 4]);
+        assert_eq!(params.controller_biases, [0.0, -2.0]);
+    }
+
+    #[test]
+    fn recursive_block_training_updates_nested_batchnorm_statistics_per_pass() {
+        let network = recursive_test_network(
+            1,
+            1,
+            "loops=2\ninjection=0\nbody_scale=1\nresidual_scale=0\n",
+            "[convolutional]\nbatch_normalize=1\nfilters=1\nsize=1\nactivation=linear\n",
+            "",
+        );
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let LayerParams::RecursiveBlock(params) = &mut executable.params[0] else {
+            panic!("recursive-block parameters")
+        };
+        let LayerParams::Convolutional(body) = &mut params.body[0] else {
+            panic!("body convolution parameters")
+        };
+        body.weights[0] = 1.0;
+        body.batch_norm.as_mut().unwrap().scales[0] = 1.0;
+        body.batch_norm.as_mut().unwrap().rolling_variance[0] = 1.0;
+        let input = Tensor::from_data(network.net.input_shape(), vec![0.2, 0.6]).unwrap();
+        let forward = executable.forward_training(&input).unwrap();
+        let seed =
+            Tensor::from_data(forward.final_output().unwrap().shape, vec![0.3, -0.2]).unwrap();
+        executable
+            .backward_accumulate_seeded(&input, &forward, &[Some(seed)])
+            .unwrap();
+        let LayerParams::RecursiveBlock(params) = &executable.params[0] else {
+            unreachable!()
+        };
+        let LayerParams::Convolutional(body) = &params.body[0] else {
+            unreachable!()
+        };
+        let batch_norm = body.batch_norm.as_ref().unwrap();
+        assert!(batch_norm.rolling_mean[0] > 0.0);
+        assert!(batch_norm.rolling_variance[0] < 1.0);
+    }
+
+    #[test]
+    fn recursive_block_sgd_updates_controller_and_shared_body_with_parent_rate() {
+        let network = recursive_test_network(
+            1,
+            1,
+            "loops=2\nouroboros=1\nlearning_rate=0.5\n",
+            "[convolutional]\nfilters=1\nsize=1\nactivation=linear\n",
+            "",
+        );
+        let mut executable = ExecutableNetwork::new(network);
+        if let LayerParams::RecursiveBlock(params) = &mut executable.params[0] {
+            params.controller_weights.fill(0.05);
+            params.controller_biases.fill(0.1);
+            let LayerParams::Convolutional(body) = &mut params.body[0] else {
+                panic!("body convolution parameters")
+            };
+            body.weights[0] = 0.5;
+            body.biases[0] = 0.1;
+        }
+        if let LayerTrainBuffers::RecursiveBlock(train) = &mut executable.train_buffers[0] {
+            train.controller_weight_updates.fill(0.1);
+            train.controller_bias_updates.fill(0.2);
+            let LayerTrainBuffers::Convolutional(body) = &mut train.body[0] else {
+                panic!("body convolution train buffers")
+            };
+            body.weight_updates[0] = 0.3;
+            body.bias_updates[0] = 0.4;
+        }
+        executable.update_weights(0.2, 0.0, 0.0, 1);
+        let LayerParams::RecursiveBlock(params) = &executable.params[0] else {
+            unreachable!()
+        };
+        let LayerParams::Convolutional(body) = &params.body[0] else {
+            unreachable!()
+        };
+        assert!((body.weights[0] - 0.53).abs() < 1e-6);
+        assert!((body.biases[0] - 0.14).abs() < 1e-6);
+        assert!((params.controller_weights[0] - 0.06).abs() < 1e-6);
+        assert!((params.controller_biases[0] - 0.12).abs() < 1e-6);
+    }
+
+    #[test]
+    fn recursive_block_adam_state_round_trips_and_rejects_wrong_body_shapes() {
+        let network = recursive_test_network(
+            1,
+            1,
+            "loops=2\nouroboros=1\n",
+            "[convolutional]\nbatch_normalize=1\nfilters=1\nsize=1\nactivation=linear\n",
+            "adam=1\n",
+        );
+        let mut executable = ExecutableNetwork::new(network.clone());
+        if let LayerParams::RecursiveBlock(params) = &mut executable.params[0] {
+            params.controller_weights.fill(0.05);
+            params.controller_biases.copy_from_slice(&[0.1, -0.2]);
+            let LayerParams::Convolutional(body) = &mut params.body[0] else {
+                panic!("body convolution parameters")
+            };
+            body.weights[0] = 0.5;
+            body.biases[0] = 0.1;
+            body.batch_norm.as_mut().unwrap().scales[0] = 1.0;
+        }
+        if let LayerTrainBuffers::RecursiveBlock(train) = &mut executable.train_buffers[0] {
+            train.controller_weight_updates.fill(0.2);
+            train.controller_bias_updates.fill(0.1);
+            let LayerTrainBuffers::Convolutional(body) = &mut train.body[0] else {
+                panic!("body convolution train buffers")
+            };
+            body.weight_updates[0] = 0.3;
+            body.bias_updates[0] = 0.4;
+            body.batch_norm.as_mut().unwrap().scale_updates[0] = 0.5;
+        }
+        executable.update_weights_adam(0.01, 1).unwrap();
+        assert!(executable.host_adam_state[0].is_some());
+
+        let path =
+            std::env::temp_dir().join(format!("darknet-recursive-adam-{}.opt", std::process::id()));
+        executable.save_optimizer_state(&path).unwrap();
+        let mut restored = ExecutableNetwork::new(network.clone());
+        restored.load_optimizer_state(&path).unwrap();
+        assert_eq!(restored.host_adam_state, executable.host_adam_state);
+
+        let mut malformed = executable.host_adam_state[0].clone().unwrap();
+        malformed.children[0].weights = Some((Vec::new(), Vec::new()));
+        executable.host_adam_state[0] = Some(malformed);
+        let malformed_path = std::env::temp_dir().join(format!(
+            "darknet-recursive-adam-bad-{}.opt",
+            std::process::id()
+        ));
+        executable.save_optimizer_state(&malformed_path).unwrap();
+        let error = restored
+            .load_optimizer_state(&malformed_path)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("recursive-block Adam body convolution weight"),
+            "{error}"
+        );
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(malformed_path);
+    }
+
+    #[test]
+    fn recursive_block_muon_maps_controller_and_body_matrices_and_rejects_gpu() {
+        let network = recursive_test_network(
+            1,
+            1,
+            "loops=2\nouroboros=1\n",
+            "[convolutional]\nfilters=1\nsize=1\nactivation=linear\n",
+            "muon=1\ndecoupled_decay=1\n",
+        );
+        let mut executable = ExecutableNetwork::new(network.clone());
+        if let LayerTrainBuffers::RecursiveBlock(train) = &mut executable.train_buffers[0] {
+            train.controller_weight_updates.fill(0.1);
+            train.controller_bias_updates.fill(0.1);
+            let LayerTrainBuffers::Convolutional(body) = &mut train.body[0] else {
+                panic!("body convolution train buffers")
+            };
+            body.weight_updates[0] = 0.2;
+            body.bias_updates[0] = 0.1;
+        }
+        executable.update_weights_muon(0.01, 1).unwrap();
+        let matrices = &executable.muon_state[0].as_ref().unwrap().matrices;
+        assert_eq!(
+            matrices
+                .iter()
+                .map(|matrix| (matrix.rows, matrix.cols))
+                .collect::<Vec<_>>(),
+            [(2, 2), (1, 1)]
+        );
+
+        let path =
+            std::env::temp_dir().join(format!("darknet-recursive-muon-{}.opt", std::process::id()));
+        executable.save_optimizer_state(&path).unwrap();
+        let mut restored = ExecutableNetwork::new(network.clone());
+        restored.load_optimizer_state(&path).unwrap();
+        assert_eq!(restored.muon_state, executable.muon_state);
+        let _ = fs::remove_file(path);
+
+        let gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+        let input = Tensor::from_data(network.net.input_shape(), vec![0.1; 2]).unwrap();
+        assert!(gpu.forward(&input).unwrap_err().to_string().contains(
+            "[recursive_block] GPU execution is not implemented in the Stage-1 CPU port"
+        ));
+        assert!(gpu.forward_compact(&input).unwrap_err().to_string().contains(
+            "[recursive_block] compact GPU execution is not implemented in the Stage-1 CPU port"
+        ));
+        let gpu_update_network = recursive_test_network(
+            1,
+            1,
+            "loops=2\nouroboros=1\n",
+            "[convolutional]\nfilters=1\nsize=1\nactivation=linear\n",
+            "",
+        );
+        let mut gpu = GpuExecutableNetwork::new(gpu_update_network, FakeBackend);
+        assert!(
+            gpu.update_weights_gpu(0.01, 0.9, 0.0, 1)
+                .unwrap_err()
+                .to_string()
+                .contains(
+                    "[recursive_block] GPU updates are not implemented in the Stage-1 CPU port"
+                )
         );
     }
 }

@@ -208,6 +208,41 @@ pub(crate) fn visit_muon_matrices(
     }
     match (kind, params, train) {
         (
+            LayerKind::RecursiveBlock(spec),
+            LayerParams::RecursiveBlock(params),
+            LayerTrainBuffers::RecursiveBlock(train),
+        ) => {
+            if spec.body.len() != params.body.len() || spec.body.len() != train.body.len() {
+                return Err(Error::InvalidConfig(
+                    "Muon recursive-block body parameter/update count mismatch".to_owned(),
+                ));
+            }
+            if spec.ouroboros == 1 {
+                let channels = input_shape.channels;
+                visit_matrix(
+                    &mut params.controller_weights,
+                    &mut train.controller_weight_updates,
+                    channels * 2,
+                    channels + 1,
+                    1.0,
+                    visitor,
+                )?;
+            }
+            for ((layer, params), train) in
+                spec.body.iter().zip(&mut params.body).zip(&mut train.body)
+            {
+                visit_muon_matrices(
+                    &layer.kind,
+                    layer.input_shape,
+                    layer.output_shape,
+                    params,
+                    train,
+                    visitor,
+                )?;
+            }
+            Ok(())
+        }
+        (
             LayerKind::Convolutional(spec),
             LayerParams::Convolutional(params),
             LayerTrainBuffers::Convolutional(train),

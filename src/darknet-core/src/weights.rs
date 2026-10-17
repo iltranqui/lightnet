@@ -112,6 +112,9 @@ pub fn save_weights(
 
     for (layer, params) in network.layers.iter().zip(params) {
         match (&layer.kind, params) {
+            (LayerKind::RecursiveBlock(spec), LayerParams::RecursiveBlock(recursive)) => {
+                write_recursive_body_weights(&mut file, &spec.body, &recursive.body)?
+            }
             (LayerKind::Convolutional(_), LayerParams::Convolutional(conv)) => {
                 write_f32_slice(&mut file, &conv.biases)?;
                 if let Some(batch_norm) = conv.batch_norm.as_ref() {
@@ -425,6 +428,45 @@ pub(crate) fn write_f32_slice<W: Write>(file: &mut W, values: &[f32]) -> Result<
             bytes.extend_from_slice(&value.to_le_bytes());
         }
         file.write_all(&bytes)?;
+    }
+    Ok(())
+}
+
+fn write_recursive_body_weights<W: Write>(
+    file: &mut W,
+    body: &[Layer],
+    params: &[LayerParams],
+) -> Result<()> {
+    if body.len() != params.len() {
+        return Err(Error::Weights(
+            "recursive-block body weight parameter count mismatch".to_owned(),
+        ));
+    }
+    for (layer, params) in body.iter().zip(params) {
+        match (&layer.kind, params) {
+            (LayerKind::Convolutional(_), LayerParams::Convolutional(conv)) => {
+                write_convolutional_params(file, conv)?;
+            }
+            (LayerKind::Connected(_), LayerParams::Connected(connected)) => {
+                write_connected_params(file, connected)?;
+            }
+            (
+                LayerKind::MaxPool(_)
+                | LayerKind::LocalAvgPool(_)
+                | LayerKind::AvgPool
+                | LayerKind::Upsample(_)
+                | LayerKind::ChannelShuffle(_)
+                | LayerKind::Dropout { .. },
+                LayerParams::None,
+            ) => {}
+            _ => {
+                return Err(Error::Weights(format!(
+                    "unsupported recursive-block weight layout for body layer #{} ({})",
+                    layer.index,
+                    layer.kind.name()
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -1487,7 +1529,8 @@ num_dwconv=2
                     | LayerParams::MambaVision(_)
                     | LayerParams::GraphConv(_)
                     | LayerParams::Wmhf(_)
-                    | LayerParams::Clifford(_) => {}
+                    | LayerParams::Clifford(_)
+                    | LayerParams::RecursiveBlock(_) => {}
                 }
             }
             let path = std::env::temp_dir().join(format!("darknet-{name}-roundtrip.weights"));

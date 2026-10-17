@@ -12,6 +12,30 @@ pub fn initialize_training_params(network: &Network, params: &mut [LayerParams],
     for (layer, params) in network.layers.iter().zip(params) {
         match params {
             LayerParams::None => {}
+            LayerParams::RecursiveBlock(p) => {
+                let crate::LayerKind::RecursiveBlock(spec) = &layer.kind else {
+                    unreachable!("recursive-block parameters require a recursive-block layer");
+                };
+                let mut body_net = Network {
+                    source: network.source.clone(),
+                    net: network.net.clone(),
+                    layers: spec.body.clone(),
+                };
+                body_net.net.width = layer.input_shape.width;
+                body_net.net.height = layer.input_shape.height;
+                body_net.net.channels = layer.input_shape.channels;
+                body_net.net.batch = layer.input_shape.batch;
+                let body_seed = u64::from(rng.next_unit().to_bits());
+                initialize_training_params(&body_net, &mut p.body, body_seed);
+                p.controller_weights.fill(0.0);
+                p.controller_biases.fill(0.0);
+                if spec.ouroboros == 1 {
+                    let channels = layer.input_shape.channels;
+                    for gate in &mut p.controller_biases[channels..2 * channels] {
+                        *gate = spec.gate_bias;
+                    }
+                }
+            }
             LayerParams::BatchNorm(p) => bn(p),
             LayerParams::Convolutional(p) => conv(p, &mut rng),
             LayerParams::Connected(p) => connected(p, &mut rng),

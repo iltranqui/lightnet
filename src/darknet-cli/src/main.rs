@@ -3387,6 +3387,33 @@ fn print_forward_backward_summary(
                         .as_ref()
                         .is_some_and(|updates| updates.iter().any(|value| *value != 0.0))
             }
+            darknet_core::LayerTrainBuffers::RecursiveBlock(recursive) => {
+                recursive
+                    .controller_weight_updates
+                    .iter()
+                    .any(|value| *value != 0.0)
+                    || recursive
+                        .controller_bias_updates
+                        .iter()
+                        .any(|value| *value != 0.0)
+                    || recursive.body.iter().any(|child| match child {
+                        darknet_core::LayerTrainBuffers::Convolutional(conv) => {
+                            conv.bias_updates.iter().any(|value| *value != 0.0)
+                                || conv.weight_updates.iter().any(|value| *value != 0.0)
+                                || conv.batch_norm.as_ref().is_some_and(|bn| {
+                                    bn.scale_updates.iter().any(|value| *value != 0.0)
+                                })
+                        }
+                        darknet_core::LayerTrainBuffers::Connected(connected) => {
+                            connected.bias_updates.iter().any(|value| *value != 0.0)
+                                || connected.weight_updates.iter().any(|value| *value != 0.0)
+                                || connected.batch_norm.as_ref().is_some_and(|bn| {
+                                    bn.scale_updates.iter().any(|value| *value != 0.0)
+                                })
+                        }
+                        _ => false,
+                    })
+            }
             darknet_core::LayerTrainBuffers::Gru(_)
             | darknet_core::LayerTrainBuffers::Rnn(_)
             | darknet_core::LayerTrainBuffers::Lstm(_)
