@@ -174,8 +174,10 @@ Immediately next, in dependency order:
   cfg aliases/modes/permutations and CPU/GPU host-reference forward/backward;
   `vc_attention` (16 filtered tests) and `vit` (32) pass. GPU VC deliberately
   falls back to the Rust host reference on all devices/head sizes; no native VC
-  kernel or compiled-C++ parity is claimed. Also open:
-  `swin`/`transformer`, `tucker_attention`, `mambavision`, `kimi_kda`, and
+  kernel or compiled-C++ parity is claimed. Swin's source-derived geometry,
+  mask, mHC, and one-window attention helpers now have 10 focused passing tests;
+  model/config/weights/runtime integration remains open in `swin_plan.md`. Also
+  open: `swin`/`transformer`, `tucker_attention`, `mambavision`, `kimi_kda`, and
   `minimax_sparse_attention` on the shared LayerNorm/GEMM set (already built).
 - [x] Container-conv cache prerequisite: device convolution params are keyed by
   owner layer + expert slot; `warm_device_conv_params` warms each MoE expert,
