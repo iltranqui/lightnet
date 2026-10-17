@@ -627,6 +627,20 @@ pub struct MambaVisionSpec {
     pub causal: bool,
 }
 
+/// `[kimi_kda]` / `[kimi_delta_attention]`: low-rank causal delta-rule mixer
+/// followed by one shared MLP and top-k routed experts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KimiKdaSpec {
+    pub filters: usize,
+    pub rank: usize,
+    pub experts: usize,
+    pub top_k: usize,
+    pub hidden: usize,
+    pub temperature: f32,
+    pub load_balance: f32,
+    pub activation: Activation,
+}
+
 /// `[yolox]`: the anchor-free detection head (Phase 2A of `tasks/rust/layers.md`),
 /// ported from `Jev_laya:src-lib/darknet_cfg.cpp::parse_yolox_section`.  The
 /// layer has no weights and no kernels; see
@@ -1259,6 +1273,8 @@ pub enum LayerKind {
     TuckerAttention(TuckerAttentionSpec),
     /// `[mambavision]` / `[mambavision_block]` selective-scan vision mixer.
     MambaVision(MambaVisionSpec),
+    /// `[kimi_kda]` / `[kimi_delta_attention]` causal delta-rule/MoE mixer.
+    KimiKda(KimiKdaSpec),
     /// `[moe_convolutional]`: a learned mixture of `MoeSpec::experts`
     /// convolutional experts gated per image by a small router.
     Moe(MoeSpec),
@@ -1320,6 +1336,7 @@ impl LayerKind {
             Self::Swin(_) => "swin",
             Self::TuckerAttention(_) => "tucker_attention",
             Self::MambaVision(_) => "mambavision",
+            Self::KimiKda(_) => "kimi_kda",
             Self::Moe(_) => "moe_convolutional",
             Self::EmlConvolutional(_) => "eml_convolutional",
             Self::Rnn(_) => "rnn",
@@ -1350,6 +1367,7 @@ impl LayerKind {
             Self::Swin(spec) => Some(&spec.activation),
             Self::TuckerAttention(spec) => Some(&spec.activation),
             Self::MambaVision(spec) => Some(&spec.activation),
+            Self::KimiKda(spec) => Some(&spec.activation),
             _ => None,
         }
     }
@@ -1765,6 +1783,27 @@ impl Layer {
                 })
                 .collect(),
             }),
+            LayerKind::KimiKda(spec) => {
+                let (biases, weights) = crate::kimi_kda::kimi_kda_parameter_counts(
+                    self.input_shape.channels,
+                    spec.rank,
+                    spec.experts,
+                    spec.hidden,
+                )
+                .expect("validated Kimi KDA geometry");
+                Some(LayerWeights {
+                    entries: vec![
+                        WeightsEntry {
+                            array: WeightsArray::Biases,
+                            len: biases,
+                        },
+                        WeightsEntry {
+                            array: WeightsArray::Weights,
+                            len: weights,
+                        },
+                    ],
+                })
+            }
             LayerKind::Vit(spec) => {
                 let dim = spec.dim;
                 let patch_dim = spec.patch_size * spec.patch_size * self.input_shape.channels;
@@ -2903,6 +2942,9 @@ fn parse_layer_kind(
         "mambavision" | "mambavision_block" => {
             LayerKind::MambaVision(parse_mambavision_spec(&section, current)?)
         }
+        "kimi_kda" | "kimi_delta_attention" => {
+            LayerKind::KimiKda(parse_kimi_kda_spec(&section, current)?)
+        }
         "vit" => {
             let line = section.line;
             let has_filters = section.get("filters").is_some();
@@ -3671,6 +3713,23 @@ fn infer_output_shape(
                 spec.filters,
                 current.batch,
             ))
+        }
+        LayerKind::KimiKda(spec) => {
+            if current.width == 0 || current.height == 0 || current.channels == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[kimi_kda] layer #{layer_index} requires non-empty image-shaped input"
+                )));
+            }
+            if spec.filters != current.channels {
+                return Err(Error::InvalidConfig(format!(
+                    "[kimi_kda] layer #{layer_index} requires filters={} to preserve residual channels, got {}",
+                    current.channels, spec.filters
+                )));
+            }
+            crate::kimi_kda::validate_geometry(current, spec).map_err(|error| {
+                Error::InvalidConfig(format!("[kimi_kda] layer #{layer_index}: {error}"))
+            })?;
+            Ok(current)
         }
         LayerKind::Vit(spec) => {
             let line = layer_index;
@@ -4846,6 +4905,198 @@ fn parse_mambavision_spec(section: &RawSection, input: TensorShape) -> Result<Ma
     Ok(spec)
 }
 
+fn parse_kimi_kda_spec(section: &RawSection, input: TensorShape) -> Result<KimiKdaSpec> {
+    const ALLOWED: &[&str] = &[
+        "filters",
+        "rank",
+        "experts",
+        "top_k",
+        "hidden",
+        "ffn_ratio",
+        "temperature",
+        "load_balance",
+        "activation",
+        "kimi_debug",
+        "stream",
+        "wait_stream",
+        "learning_rate",
+        "dont_update",
+        "burnin_update",
+        "train_only_bn",
+        "clip",
+        "grad_centr",
+    ];
+    let line = section.line;
+    if let Some(key) = section
+        .values
+        .keys()
+        .find(|key| !ALLOWED.contains(&key.as_str()))
+    {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: unknown option `{key}`",
+            section.name
+        )));
+    }
+    if input.width == 0 || input.height == 0 || input.channels == 0 || input.batch == 0 {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: preceding layer must output a non-empty image",
+            section.name
+        )));
+    }
+    let filters = section.get_usize("filters", input.channels)?;
+    if filters != input.channels {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: filters={filters} must equal input channels={} in v1",
+            section.name, input.channels
+        )));
+    }
+    let requested_rank = section.get_i64("rank", 0)?;
+    let rank = if requested_rank > 0 {
+        usize::try_from(requested_rank).map_err(|_| {
+            Error::InvalidConfig(format!(
+                "[{}] at line {line}: rank is too large",
+                section.name
+            ))
+        })?
+    } else {
+        64.min((input.channels / 4).max(1))
+    }
+    .min(input.channels);
+    if rank == 0 || rank > 64 {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: effective rank must be in 1..=min(channels,64), got {rank}",
+            section.name
+        )));
+    }
+    let experts_raw = section.get_i64("experts", 4)?.max(1);
+    let experts = usize::try_from(experts_raw).map_err(|_| {
+        Error::InvalidConfig(format!(
+            "[{}] at line {line}: experts is too large",
+            section.name
+        ))
+    })?;
+    if experts > 64 {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: experts must be <= 64, got {experts}",
+            section.name
+        )));
+    }
+    let top_k_raw = section.get_i64("top_k", 2)?;
+    if top_k_raw < 0 {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: top_k must be in 0..={experts}, got {top_k_raw}",
+            section.name
+        )));
+    }
+    let top_k = usize::try_from(top_k_raw).map_err(|_| {
+        Error::InvalidConfig(format!(
+            "[{}] at line {line}: top_k is too large",
+            section.name
+        ))
+    })?;
+    if top_k > experts {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: top_k must be in 0..={experts}, got {top_k}",
+            section.name
+        )));
+    }
+    let ffn_ratio_raw = section.get_i64("ffn_ratio", 2)?;
+    let ffn_ratio = if ffn_ratio_raw < 1 {
+        2
+    } else {
+        usize::try_from(ffn_ratio_raw).map_err(|_| {
+            Error::InvalidConfig(format!(
+                "[{}] at line {line}: ffn_ratio is too large",
+                section.name
+            ))
+        })?
+    };
+    let hidden_raw = section.get_i64("hidden", 0)?;
+    let hidden = if hidden_raw < 1 {
+        input
+            .channels
+            .checked_mul(ffn_ratio)
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "[{}] at line {line}: channels * ffn_ratio overflows",
+                    section.name
+                ))
+            })?
+            .max(1)
+    } else {
+        usize::try_from(hidden_raw).map_err(|_| {
+            Error::InvalidConfig(format!(
+                "[{}] at line {line}: hidden is too large",
+                section.name
+            ))
+        })?
+    };
+    let temperature = section.get_f32("temperature", 1.0)?;
+    if !temperature.is_finite() {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: temperature must be finite",
+            section.name
+        )));
+    }
+    let temperature = if temperature <= 0.0 { 1.0 } else { temperature };
+    let load_balance = section.get_f32("load_balance", 0.01)?;
+    if !load_balance.is_finite() {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: load_balance must be finite",
+            section.name
+        )));
+    }
+    let load_balance = load_balance.max(0.0);
+    let activation = Activation::parse(&section.get_str("activation", "gelu"));
+    if let Activation::Other(ref other) = activation {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: unsupported activation={other}",
+            section.name
+        )));
+    }
+    if matches!(
+        activation,
+        Activation::NormalizeChannels
+            | Activation::NormalizeChannelsSoftmax
+            | Activation::NormalizeChannelsSoftmaxMaxval
+    ) {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: channel-normalizing activations are unsupported",
+            section.name
+        )));
+    }
+    let debug_interval = section.get_i64("kimi_debug", 0)?;
+    if debug_interval != 0 {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {line}: kimi_debug={debug_interval} is unsupported by the Rust runtime",
+            section.name
+        )));
+    }
+    for key in ["stream", "wait_stream"] {
+        let stream = section.get_i64(key, -1)?;
+        if stream != -1 {
+            return Err(Error::InvalidConfig(format!(
+                "[{}] at line {line}: {key}={stream} is unsupported by the Rust runtime",
+                section.name
+            )));
+        }
+    }
+    let spec = KimiKdaSpec {
+        filters,
+        rank,
+        experts,
+        top_k,
+        hidden,
+        temperature,
+        load_balance,
+        activation,
+    };
+    crate::kimi_kda::validate_geometry(input, &spec).map_err(|error| {
+        Error::InvalidConfig(format!("[{}] at line {line}: {error}", section.name))
+    })?;
+    Ok(spec)
+}
+
 fn parse_modern_yolo_spec(section: &RawSection) -> Result<ModernYoloSpec> {
     let line = section.line;
     let kind = match section.name.as_str() {
@@ -4897,6 +5148,88 @@ mod tests {
 
     fn build(text: &str) -> crate::error::Result<Network> {
         Network::from_config(ConfigFile::parse_str("t.cfg", text)?)
+    }
+
+    #[test]
+    fn kimi_kda_aliases_defaults_identity_shape_and_weight_metadata() {
+        for alias in ["kimi_kda", "kimi_delta_attention"] {
+            let network = build(&format!(
+                "[net]\nwidth=3\nheight=2\nchannels=8\n[{alias}]\n"
+            ))
+            .unwrap();
+            let layer = &network.layers[0];
+            let LayerKind::KimiKda(spec) = &layer.kind else {
+                panic!("expected Kimi KDA for [{alias}]")
+            };
+            assert_eq!(
+                (
+                    spec.filters,
+                    spec.rank,
+                    spec.experts,
+                    spec.top_k,
+                    spec.hidden,
+                    spec.temperature,
+                    spec.load_balance,
+                ),
+                (8, 2, 4, 2, 16, 1.0, 0.01)
+            );
+            assert_eq!(spec.activation, super::Activation::Gelu);
+            assert_eq!(layer.kind.name(), "kimi_kda");
+            assert_eq!(layer.output_shape, super::TensorShape::new(3, 2, 8, 1));
+            let weights = layer.weights().unwrap();
+            assert_eq!(weights.entries.len(), 2);
+            assert_eq!(weights.entries[0].array.name(), "biases");
+            assert_eq!(weights.entries[1].array.name(), "weights");
+            let params = crate::KimiKdaParams::zeroed(8, 2, 4, 16).unwrap();
+            assert_eq!(weights.parameter_count(), params.parameter_count());
+        }
+    }
+
+    #[test]
+    fn kimi_kda_matches_source_fallback_defaults_and_rejects_unsupported_options() {
+        let network = build(
+            "[net]\nwidth=2\nheight=2\nchannels=6\n[kimi_kda]\n\
+             rank=-1\nexperts=0\ntop_k=0\nffn_ratio=0\nhidden=0\n\
+             temperature=0\nload_balance=-0.5\nkimi_debug=0\nstream=-1\nwait_stream=-1\n",
+        )
+        .unwrap();
+        let LayerKind::KimiKda(spec) = &network.layers[0].kind else {
+            panic!("expected Kimi KDA")
+        };
+        assert_eq!(
+            (
+                spec.filters,
+                spec.rank,
+                spec.experts,
+                spec.top_k,
+                spec.hidden,
+                spec.temperature,
+                spec.load_balance,
+            ),
+            (6, 1, 1, 0, 12, 1.0, 0.0)
+        );
+        for options in [
+            "mystery=1",
+            "filters=7",
+            "rank=65",
+            "experts=65",
+            "top_k=-1",
+            "top_k=5",
+            "activation=unknown",
+            "activation=normalize_channels",
+            "kimi_debug=1",
+            "stream=0",
+            "temperature=nan",
+            "load_balance=nan",
+        ] {
+            let channels = if options == "rank=65" { 128 } else { 8 };
+            let cfg =
+                format!("[net]\nwidth=2\nheight=2\nchannels={channels}\n[kimi_kda]\n{options}\n");
+            assert!(
+                build(&cfg).is_err(),
+                "accepted invalid Kimi KDA option: {options}"
+            );
+        }
     }
 
     #[test]

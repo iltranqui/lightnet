@@ -200,6 +200,10 @@ pub fn save_weights(
                 let blob = mamba.to_blob().map_err(Error::Weights)?;
                 write_f32_slice(&mut file, &blob)?;
             }
+            (LayerKind::KimiKda(_), LayerParams::KimiKda(kimi)) => {
+                let blob = kimi.to_blob().map_err(Error::Weights)?;
+                write_f32_slice(&mut file, &blob)?;
+            }
             // C++ `save_moe_convolutional_weights`: every expert's complete
             // convolution block first, then the router biases and weights.
             (LayerKind::Moe(_), LayerParams::Moe(moe)) => {
@@ -986,6 +990,10 @@ mod tests {
                 "eml_convolutional",
                 "[eml_convolutional]\nfilters=2\nsize=1\nstride=1\nbatch_normalize=1\nresidual=0\n",
             ),
+            (
+                "kimi_kda",
+                "[kimi_kda]\nrank=1\nexperts=2\ntop_k=1\nhidden=3\n",
+            ),
         ] {
             let cfg_text = if name == "crnn" {
                 format!("[net]\nwidth=2\nheight=2\nchannels=1\nbatch=2\ntime_steps=2\n{layer}")
@@ -1062,6 +1070,10 @@ mod tests {
                                 *value = 0.25;
                             }
                         }
+                    }
+                    LayerParams::KimiKda(kimi) => {
+                        kimi.biases.fill(0.1);
+                        kimi.weights.fill(0.25);
                     }
                     LayerParams::None
                     | LayerParams::BatchNorm(_)

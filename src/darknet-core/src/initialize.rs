@@ -43,6 +43,12 @@ pub fn initialize_training_params(network: &Network, params: &mut [LayerParams],
                 rng.weights_with_scale(&mut p.weights, bound);
                 p.biases.fill(0.0);
             }
+            LayerParams::KimiKda(p) => {
+                crate::kimi_kda::initialize_kimi_kda_params(p, |values, bound| {
+                    rng.weights_with_scale(values, bound)
+                })
+                .expect("validated Kimi KDA parameter geometry");
+            }
             LayerParams::MambaVision(p) => {
                 let crate::LayerKind::MambaVision(spec) = &layer.kind else {
                     unreachable!("MambaVision parameters require a MambaVision layer");
@@ -464,6 +470,54 @@ mod tests {
                 .iter()
                 .all(|value| (-7.0..-2.2).contains(value))
         );
+    }
+
+    #[test]
+    fn kimi_kda_training_initialization_is_seeded_and_uses_source_bounds() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "kimi-init.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=8\n\
+                 [kimi_kda]\nrank=2\nexperts=2\ntop_k=1\nhidden=4\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut first = ExecutableNetwork::new(network.clone());
+        let mut second = ExecutableNetwork::new(network.clone());
+        initialize_training_params(&network, &mut first.params, 131);
+        initialize_training_params(&network, &mut second.params, 131);
+        assert_eq!(first.params, second.params);
+        let LayerParams::KimiKda(params) = &first.params[0] else {
+            panic!("Kimi KDA params")
+        };
+        let blocks = crate::kimi_kda::kimi_kda_weight_blocks(8, 2, 2, 4).unwrap();
+        let within = |name: &str, bound: f32| {
+            let block = blocks.iter().find(|block| block.name == name).unwrap();
+            params.weights[block.range.clone()]
+                .iter()
+                .all(|value| value.abs() <= bound)
+        };
+        let qk_bound = (6.0f32 / 10.0).sqrt();
+        assert!(within("q", qk_bound));
+        assert!(within("k", qk_bound));
+        assert!(within("beta", qk_bound));
+        assert!(within("decay", qk_bound));
+        assert!(within("v", (6.0f32 / 16.0).sqrt()));
+        assert!(within("router", qk_bound * 0.05));
+        assert!(within("expert_w1", (6.0f32 / 12.0).sqrt()));
+        for name in ["o", "expert_w2"] {
+            let block = blocks.iter().find(|block| block.name == name).unwrap();
+            assert!(
+                params.weights[block.range.clone()]
+                    .iter()
+                    .all(|value| *value == 0.0)
+            );
+        }
+        assert_eq!(&params.biases[..8], &[1.0; 8]);
+        assert_eq!(&params.biases[16..24], &[1.0; 8]);
+        assert_eq!(&params.biases[44..46], &[-2.0; 2]);
+        assert_eq!(&params.biases[46..48], &[2.0; 2]);
     }
 
     #[test]

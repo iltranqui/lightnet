@@ -44,6 +44,7 @@ pub use evaluate::{
 pub mod image;
 pub mod initialize;
 pub(crate) mod jev_ce;
+pub mod kimi_kda;
 pub mod laya_act_head;
 pub mod laya_encoder;
 pub mod laya_head;
@@ -116,23 +117,25 @@ pub use detect::{
 };
 pub use error::{Error, Result};
 pub use image::PlanarRgbImage;
+pub use kimi_kda::{KimiKdaForwardCache, KimiKdaParams};
 pub use mambavision::{
     MambaVisionForward, MambaVisionGradients, MambaVisionParams, MambaVisionState,
     mambavision_backward, mambavision_forward,
 };
 pub use model::{
-    Activation, CrnnSpec, Layer, LayerKind, LayerWeights, LrPolicy, LstmSpec, MambaVisionSpec,
-    NetConfig, Network, ObbRefineLoss, ObbRefineSpec, RnnSpec, ShortcutWeightsNorm,
-    ShortcutWeightsType, SwinSpec, TensorShape, TuckerAttentionSpec, WeightsArray, YoloIouLoss,
+    Activation, CrnnSpec, KimiKdaSpec, Layer, LayerKind, LayerWeights, LrPolicy, LstmSpec,
+    MambaVisionSpec, NetConfig, Network, ObbRefineLoss, ObbRefineSpec, RnnSpec,
+    ShortcutWeightsNorm, ShortcutWeightsType, SwinSpec, TensorShape, TuckerAttentionSpec,
+    WeightsArray, YoloIouLoss,
 };
 pub use names::load_names_file;
 pub use runtime::{
     BackwardResult, BatchNormTrainBuffers, ConnectedTrainBuffers, ConvolutionalTrainBuffers,
     CrnnParams, CrnnTrainBuffers, ExecutableNetwork, ForwardResult, GpuExecutableNetwork,
-    GpuForwardState, GpuForwardSummary, LayerParams, LayerTrainBuffers, LstmParams,
-    LstmTrainBuffers, MambaVisionTrainBuffers, RecurrentForwardCache, RnnParams, RnnTrainBuffers,
-    ShortcutParams, ShortcutTrainBuffers, Tensor, TuckerAttentionTrainBuffers, YoloHeadOutput,
-    compute_learning_rate,
+    GpuForwardState, GpuForwardSummary, KimiKdaTrainBuffers, LayerParams, LayerTrainBuffers,
+    LstmParams, LstmTrainBuffers, MambaVisionTrainBuffers, RecurrentForwardCache, RnnParams,
+    RnnTrainBuffers, ShortcutParams, ShortcutTrainBuffers, Tensor, TuckerAttentionTrainBuffers,
+    YoloHeadOutput, compute_learning_rate,
 };
 pub use swin::SwinWeights;
 pub use swin_block::SwinForwardCache;

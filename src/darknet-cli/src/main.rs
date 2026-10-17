@@ -3195,6 +3195,10 @@ fn print_forward_backward_summary(
             darknet_core::LayerTrainBuffers::MambaVision(mamba) => {
                 mamba.updates.iter().any(|value| *value != 0.0)
             }
+            darknet_core::LayerTrainBuffers::KimiKda(kimi) => {
+                kimi.bias_updates.iter().any(|value| *value != 0.0)
+                    || kimi.weight_updates.iter().any(|value| *value != 0.0)
+            }
             darknet_core::LayerTrainBuffers::Gru(_)
             | darknet_core::LayerTrainBuffers::Rnn(_)
             | darknet_core::LayerTrainBuffers::Lstm(_)

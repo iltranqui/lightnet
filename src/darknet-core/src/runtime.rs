@@ -256,6 +256,8 @@ pub enum LayerParams {
     TuckerAttention(crate::tucker_attention::TuckerAttentionParams),
     /// `[mambavision]`: all trainable tensors in source `.weights` order.
     MambaVision(crate::mambavision::MambaVisionParams),
+    /// `[kimi_kda]`: contiguous source-order biases followed by flat weights.
+    KimiKda(crate::kimi_kda::KimiKdaParams),
     /// `[moe_convolutional]`: one convolution per expert plus the router's
     /// `[experts, channels]` weights and `[experts]` biases.
     Moe(MoeParams),
@@ -384,6 +386,13 @@ pub struct MambaVisionTrainBuffers {
     pub updates: Vec<f32>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct KimiKdaTrainBuffers {
+    /// Descending update directions; weights and biases retain separate decay behavior.
+    pub bias_updates: Vec<f32>,
+    pub weight_updates: Vec<f32>,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayerTrainBuffers {
@@ -403,6 +412,7 @@ pub enum LayerTrainBuffers {
     Swin(SwinTrainBuffers),
     TuckerAttention(TuckerAttentionTrainBuffers),
     MambaVision(MambaVisionTrainBuffers),
+    KimiKda(KimiKdaTrainBuffers),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -542,6 +552,8 @@ pub struct ForwardResult {
     pub tucker_attention_caches: Vec<Option<crate::tucker_attention::TuckerAttentionForwardCache>>,
     /// Forward tapes include the explicit recurrent scan state for MambaVision.
     pub mambavision_caches: Vec<Option<crate::mambavision::MambaVisionForward>>,
+    /// Kimi KDA per-layer forward tape; its cache also exposes the auxiliary router cost.
+    pub kimi_kda_caches: Vec<Option<crate::kimi_kda::KimiKdaForwardCache>>,
     /// Valid proposal metadata and Stage-2 raw outputs for each `[obb_refine]` layer.
     pub obb_refine_outputs: Vec<crate::carpn::ObbRefineOutput>,
     pub yolo_heads: Vec<YoloHeadOutput>,
@@ -567,6 +579,7 @@ impl ForwardResult {
             swin_caches: Vec::new(),
             tucker_attention_caches: Vec::new(),
             mambavision_caches: Vec::new(),
+            kimi_kda_caches: Vec::new(),
             obb_refine_outputs: Vec::new(),
             yolo_heads,
             modern_heads,
@@ -596,6 +609,7 @@ mod forward_result_from_heads_tests {
         assert!(result.swin_caches.is_empty());
         assert!(result.tucker_attention_caches.is_empty());
         assert!(result.mambavision_caches.is_empty());
+        assert!(result.kimi_kda_caches.is_empty());
         assert!(result.obb_refine_outputs.is_empty());
         assert!(result.yolo_heads.is_empty());
         assert!(result.modern_heads.is_empty());
@@ -1254,6 +1268,25 @@ impl ExecutableNetwork {
                         );
                     }
                 }
+                (LayerParams::KimiKda(params), LayerTrainBuffers::KimiKda(train)) => {
+                    let layer_lr = lr * opts.learning_rate_scale;
+                    sgd_update(
+                        &mut params.weights,
+                        &mut train.weight_updates,
+                        layer_lr,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                    sgd_update(
+                        &mut params.biases,
+                        &mut train.bias_updates,
+                        layer_lr,
+                        momentum,
+                        0.0,
+                        batch,
+                    );
+                }
                 (LayerParams::Vit(params), LayerTrainBuffers::Vit(train)) => {
                     let learned_pos = matches!(self.network.layers[layer_index].kind, LayerKind::Vit(ref spec) if spec.learned_pos_embed);
                     update_vit_params(
@@ -1662,6 +1695,7 @@ impl ExecutableNetwork {
         let mut swin_caches = Vec::with_capacity(self.network.layers.len());
         let mut tucker_attention_caches = Vec::with_capacity(self.network.layers.len());
         let mut mambavision_caches = Vec::with_capacity(self.network.layers.len());
+        let mut kimi_kda_caches = Vec::with_capacity(self.network.layers.len());
         let mut obb_refine_outputs = Vec::new();
         let mut rng_state = 0x9e37_79b9_u64;
 
@@ -1686,6 +1720,7 @@ impl ExecutableNetwork {
             let mut swin_cache = None;
             let mut tucker_attention_cache = None;
             let mut mambavision_cache = None;
+            let mut kimi_kda_cache = None;
             let (output, activation_input) = match (&layer.kind, params) {
                 (
                     LayerKind::Convolutional(spec),
@@ -1923,6 +1958,17 @@ impl ExecutableNetwork {
                     let output = Tensor::from_data(layer.output_shape, forward.output.clone())?;
                     mambavision_cache = Some(forward);
                     (output, None)
+                }
+                (LayerKind::KimiKda(spec), LayerParams::KimiKda(weights)) => {
+                    let (data, cache) = crate::kimi_kda::kimi_kda_forward(
+                        &current_input.data,
+                        current_input.shape,
+                        spec,
+                        weights,
+                    )
+                    .map_err(Error::InvalidConfig)?;
+                    kimi_kda_cache = Some(cache);
+                    (Tensor::from_data(layer.output_shape, data)?, None)
                 }
                 (LayerKind::LayaEncoder(spec), LayerParams::LayaEncoder(weights)) => (
                     laya_encoder_forward(spec, weights, current_input, layer.output_shape)?,
@@ -2245,6 +2291,7 @@ impl ExecutableNetwork {
             swin_caches.push(swin_cache);
             tucker_attention_caches.push(tucker_attention_cache);
             mambavision_caches.push(mambavision_cache);
+            kimi_kda_caches.push(kimi_kda_cache);
         }
 
         Ok(ForwardResult {
@@ -2259,6 +2306,7 @@ impl ExecutableNetwork {
             swin_caches,
             tucker_attention_caches,
             mambavision_caches,
+            kimi_kda_caches,
             obb_refine_outputs,
             yolo_heads,
             modern_heads,
@@ -2383,6 +2431,13 @@ impl ExecutableNetwork {
                 "forward MambaVision cache count mismatch: expected {}, got {}",
                 self.network.layers.len(),
                 forward.mambavision_caches.len()
+            )));
+        }
+        if forward.kimi_kda_caches.len() != self.network.layers.len() {
+            return Err(Error::InvalidConfig(format!(
+                "forward Kimi KDA cache count mismatch: expected {}, got {}",
+                self.network.layers.len(),
+                forward.kimi_kda_caches.len()
             )));
         }
         if layer_output_gradient_seeds.len() != self.network.layers.len() {
@@ -3362,6 +3417,36 @@ impl ExecutableNetwork {
                         &mut layer_output_gradients,
                     )?;
                 }
+                (LayerKind::KimiKda(_), LayerParams::KimiKda(weights)) => {
+                    let cache = forward
+                        .kimi_kda_caches
+                        .get(layer.index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing [kimi_kda] forward cache for layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let gradients = crate::kimi_kda::kimi_kda_backward(&grad.data, weights, cache)
+                        .map_err(Error::InvalidConfig)?;
+                    let Some(LayerParams::KimiKda(slot)) = param_gradients.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing [kimi_kda] gradient slot for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    slot.biases = gradients.biases;
+                    slot.weights = gradients.weights;
+                    let input_grad = Tensor::from_data(current_input.shape, gradients.input)?;
+                    accumulate_previous_gradient(
+                        layer.index,
+                        &input_grad,
+                        &mut input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
+                }
                 (LayerKind::LayaEncoder(_), LayerParams::LayaEncoder(_))
                 | (LayerKind::LayaHead(_), LayerParams::LayaHead(_)) => {
                     // Frozen (`freeze=1`): no gradient flows to the input.
@@ -3935,6 +4020,18 @@ impl ExecutableNetwork {
                     };
                     accumulate_vec(&mut train.updates, &gradient.values)?;
                 }
+                (LayerKind::KimiKda(_), LayerParams::KimiKda(gradient)) => {
+                    let Some(LayerTrainBuffers::KimiKda(train)) =
+                        self.train_buffers.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing Kimi KDA train buffers for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    accumulate_negative_vec(&mut train.bias_updates, &gradient.biases)?;
+                    accumulate_negative_vec(&mut train.weight_updates, &gradient.weights)?;
+                }
                 (_, LayerParams::None) => {}
                 // `[laya_scorer]` is frozen by default, so it has no train
                 // buffers and contributes no parameter gradient.
@@ -4128,6 +4225,7 @@ fn host_adam_scalar_capacity(params: &LayerParams) -> usize {
         LayerParams::Swin(params) => params.parameter_count(),
         LayerParams::TuckerAttention(params) => params.parameter_count(),
         LayerParams::MambaVision(params) => params.parameter_count(),
+        LayerParams::KimiKda(params) => params.parameter_count(),
         LayerParams::Moe(params) => {
             params.router_weights.len()
                 + params.router_biases.len()
@@ -6056,6 +6154,7 @@ where
                         | LayerParams::Swin(_)
                         | LayerParams::TuckerAttention(_)
                         | LayerParams::MambaVision(_)
+                        | LayerParams::KimiKda(_)
                         | LayerParams::Rnn(_)
                         | LayerParams::Lstm(_)
                         | LayerParams::Crnn(_)
@@ -6063,7 +6162,7 @@ where
                 )
             }) {
                 return Err(Error::InvalidConfig(
-                    "adam=1 on the GPU path supports convolutional, connected, local, shortcut, MoE, standalone batchnorm, ViT, Swin, Tucker attention, MambaVision, and GRU/RNN/LSTM/CRNN layers"
+                    "adam=1 on the GPU path supports convolutional, connected, local, shortcut, MoE, standalone batchnorm, ViT, Swin, Tucker attention, MambaVision, Kimi KDA, and GRU/RNN/LSTM/CRNN layers"
                         .to_string(),
                 ));
             }
@@ -6416,6 +6515,22 @@ where
                     let moments =
                         moments_all[index].get_or_insert_with(HostAdamLayerState::default);
                     apply_host_adam_mambavision(params, train, moments, adam)?;
+                }
+                (LayerParams::KimiKda(params), LayerTrainBuffers::KimiKda(train)) => {
+                    let moments =
+                        moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    apply_host_adam(
+                        &mut params.weights,
+                        &mut train.weight_updates,
+                        &mut moments.weights,
+                        adam,
+                    )?;
+                    apply_host_adam_non_weight(
+                        &mut params.biases,
+                        &mut train.bias_updates,
+                        &mut moments.biases,
+                        adam,
+                    )?;
                 }
                 (LayerParams::Moe(params), LayerTrainBuffers::Moe(train)) => {
                     if params.experts.len() != train.experts.len() {
@@ -6818,6 +6933,25 @@ where
                             batch,
                         );
                     }
+                }
+                (LayerParams::KimiKda(params), LayerTrainBuffers::KimiKda(train)) => {
+                    let layer_lr = lr * layer.train.learning_rate_scale;
+                    sgd_update(
+                        &mut params.weights,
+                        &mut train.weight_updates,
+                        layer_lr,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                    sgd_update(
+                        &mut params.biases,
+                        &mut train.bias_updates,
+                        layer_lr,
+                        momentum,
+                        0.0,
+                        batch,
+                    );
                 }
                 (LayerParams::Rnn(params), LayerTrainBuffers::Rnn(train)) => {
                     update_connected_params(
@@ -7238,6 +7372,8 @@ where
         > = Vec::with_capacity(self.network.layers.len());
         let mut mambavision_caches: Vec<Option<crate::mambavision::MambaVisionForward>> =
             Vec::with_capacity(self.network.layers.len());
+        let mut kimi_kda_caches: Vec<Option<crate::kimi_kda::KimiKdaForwardCache>> =
+            Vec::with_capacity(self.network.layers.len());
         let mut gpu_batch_norm_caches = Vec::with_capacity(self.network.layers.len());
         let mut yolo_heads = Vec::new();
         let mut modern_heads = Vec::new();
@@ -7264,6 +7400,7 @@ where
             let mut swin_cache = None;
             let mut tucker_attention_cache = None;
             let mut mambavision_cache = None;
+            let mut kimi_kda_cache = None;
             let mut moe_cache = None;
             let mut eml_cache = None;
             let mut gpu_rnn_cache = None;
@@ -7919,6 +8056,22 @@ where
                     self.backend
                         .upload_f32(&tensor_backend_shape(layer.output_shape), &forward.output)
                         .map_err(|err| backend_error("upload MambaVision output", err))?
+                }
+                (LayerKind::KimiKda(spec), LayerParams::KimiKda(weights)) => {
+                    let host_input = self
+                        .download_tensor(current_input, layer.input_shape)
+                        .map_err(|err| backend_error("download Kimi KDA input", err))?;
+                    let (data, cache) = crate::kimi_kda::kimi_kda_forward(
+                        &host_input.data,
+                        host_input.shape,
+                        spec,
+                        weights,
+                    )
+                    .map_err(Error::InvalidConfig)?;
+                    kimi_kda_cache = Some(cache);
+                    self.backend
+                        .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
+                        .map_err(|err| backend_error("upload Kimi KDA output", err))?
                 }
                 (LayerKind::LayaEncoder(spec), LayerParams::LayaEncoder(weights)) => {
                     let host_input = self
@@ -8840,6 +8993,7 @@ where
             swin_caches.push(swin_cache);
             tucker_attention_caches.push(tucker_attention_cache);
             mambavision_caches.push(mambavision_cache);
+            kimi_kda_caches.push(kimi_kda_cache);
         }
 
         Ok(GpuForwardState {
@@ -8864,6 +9018,7 @@ where
                 swin_caches,
                 tucker_attention_caches,
                 mambavision_caches,
+                kimi_kda_caches,
                 obb_refine_outputs: Vec::new(),
                 yolo_heads,
                 modern_heads,
@@ -11337,7 +11492,8 @@ where
                 | LayerKind::Vit(_)
                 | LayerKind::Swin(_)
                 | LayerKind::TuckerAttention(_)
-                | LayerKind::MambaVision(_) => return true,
+                | LayerKind::MambaVision(_)
+                | LayerKind::KimiKda(_) => return true,
                 // Connected layers are handled on the GPU path with a host
                 // round trip unless their activation or batch norm
                 // (batch-statistics training) is unsupported.
@@ -13566,6 +13722,15 @@ fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
             )
             .expect("validated MambaVision layer geometry"),
         ),
+        LayerKind::KimiKda(spec) => LayerParams::KimiKda(
+            crate::kimi_kda::KimiKdaParams::zeroed(
+                layer.input_shape.channels,
+                spec.rank,
+                spec.experts,
+                spec.hidden,
+            )
+            .expect("validated Kimi KDA layer geometry"),
+        ),
         LayerKind::Moe(spec) => {
             LayerParams::Moe(default_moe_params(layer.input_shape.channels, spec))
         }
@@ -13790,6 +13955,19 @@ fn default_layer_train_buffers(layer: &crate::model::Layer) -> LayerTrainBuffers
             .expect("validated MambaVision layer geometry");
             LayerTrainBuffers::MambaVision(MambaVisionTrainBuffers {
                 updates: vec![0.0; params.parameter_count()],
+            })
+        }
+        LayerKind::KimiKda(spec) => {
+            let params = crate::kimi_kda::KimiKdaParams::zeroed(
+                layer.input_shape.channels,
+                spec.rank,
+                spec.experts,
+                spec.hidden,
+            )
+            .expect("validated Kimi KDA layer geometry");
+            LayerTrainBuffers::KimiKda(KimiKdaTrainBuffers {
+                bias_updates: vec![0.0; params.biases.len()],
+                weight_updates: vec![0.0; params.weights.len()],
             })
         }
         LayerKind::Swin(spec) => {
@@ -14992,6 +15170,20 @@ fn apply_host_adam_layer(
         (LayerParams::MambaVision(params), LayerTrainBuffers::MambaVision(train)) => {
             apply_host_adam_mambavision(params, train, state, adam)?;
         }
+        (LayerParams::KimiKda(params), LayerTrainBuffers::KimiKda(train)) => {
+            apply_host_adam(
+                &mut params.weights,
+                &mut train.weight_updates,
+                &mut state.weights,
+                adam,
+            )?;
+            apply_host_adam_non_weight(
+                &mut params.biases,
+                &mut train.bias_updates,
+                &mut state.biases,
+                adam,
+            )?;
+        }
         (LayerParams::Moe(params), LayerTrainBuffers::Moe(train)) => {
             if params.experts.len() != train.experts.len() {
                 return Err(Error::InvalidConfig(
@@ -15705,6 +15897,28 @@ fn load_weights_into_params(
                     spec.conv_size,
                     spec.dt_rank,
                     spec.ffn_ratio,
+                )
+                .map_err(Error::Weights)?;
+            }
+            LayerParams::KimiKda(weights) => {
+                let LayerKind::KimiKda(spec) = &layer.kind else {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} Kimi KDA weights do not match layer kind",
+                        layer.index
+                    )));
+                };
+                let count = layer
+                    .weights()
+                    .ok_or_else(|| Error::Weights("Kimi KDA layer has no weight metadata".into()))?
+                    .parameter_count();
+                let mut blob = vec![0.0; count];
+                read_f32_into(&mut file, &mut blob)?;
+                *weights = crate::kimi_kda::KimiKdaParams::from_blob(
+                    &blob,
+                    layer.input_shape.channels,
+                    spec.rank,
+                    spec.experts,
+                    spec.hidden,
                 )
                 .map_err(Error::Weights)?;
             }
@@ -22530,6 +22744,108 @@ mod tests {
         cpu.update_weights(0.01, 0.2, 0.1, 1);
         gpu.update_weights_gpu(0.01, 0.2, 0.1, 1).unwrap();
         assert_eq!(gpu.params, cpu.params);
+    }
+
+    #[test]
+    fn kimi_kda_runtime_and_fake_backend_host_fallback_match() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "kimi-runtime.cfg",
+                "[net]\nwidth=2\nheight=1\nchannels=2\nbatch=1\n\
+                 [kimi_kda]\nrank=1\nexperts=2\ntop_k=0\nhidden=2\nload_balance=0.03\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        crate::initialize_training_params(&network, &mut cpu.params, 137);
+        let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+        gpu.params = cpu.params.clone();
+        assert!(gpu.requires_cpu_backward_fallback());
+
+        let input =
+            Tensor::from_data(TensorShape::new(2, 1, 2, 1), vec![0.21, -0.31, 0.47, 0.16]).unwrap();
+        let cpu_forward = cpu.forward_training(&input).unwrap();
+        let cache = cpu_forward.kimi_kda_caches[0].as_ref().unwrap();
+        assert!(cache.load_balance_cost.is_finite());
+        assert!(cache.load_balance_cost >= 0.0);
+        let gpu_forward = gpu.forward_training_with_state(&input).unwrap();
+        assert_eq!(
+            gpu_forward.cpu_forward.final_output(),
+            cpu_forward.final_output()
+        );
+        assert_eq!(
+            gpu_forward.cpu_forward.kimi_kda_caches,
+            cpu_forward.kimi_kda_caches
+        );
+
+        let seed = Tensor::filled(cpu_forward.final_output().unwrap().shape, 0.25);
+        let seeds = [Some(seed)];
+        let backward = cpu
+            .backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .unwrap();
+        let LayerParams::KimiKda(gradient) = &backward.param_gradients[0] else {
+            panic!("Kimi KDA gradients")
+        };
+        assert!(gradient.weights.iter().any(|value| *value != 0.0));
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .unwrap();
+        assert_eq!(
+            cpu.train_buffers,
+            gpu.cpu_fallback_train_buffers.borrow().clone()
+        );
+
+        cpu.update_weights(0.01, 0.2, 0.1, 1);
+        gpu.update_weights_gpu(0.01, 0.2, 0.1, 1).unwrap();
+        assert_eq!(gpu.params, cpu.params);
+    }
+
+    #[test]
+    fn kimi_kda_host_adam_updates_match_fake_backend_and_persist_state() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "kimi-adam.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=2\nadam=1\ndecay=0.1\n\
+                 [kimi_kda]\nrank=1\nexperts=2\nhidden=2\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        if let LayerParams::KimiKda(params) = &mut cpu.params[0] {
+            params.weights.fill(0.25);
+            params.biases.fill(0.5);
+        } else {
+            panic!("Kimi KDA params")
+        }
+        if let LayerTrainBuffers::KimiKda(train) = &mut cpu.train_buffers[0] {
+            train.weight_updates.fill(-0.5);
+            train.bias_updates.fill(-0.5);
+        } else {
+            panic!("Kimi KDA train buffers")
+        }
+        let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+        gpu.params = cpu.params.clone();
+        *gpu.cpu_fallback_train_buffers.borrow_mut() = cpu.train_buffers.clone();
+        cpu.update_weights_adam(0.01, 1).unwrap();
+        gpu.update_weights_gpu(0.01, 0.0, 0.1, 1).unwrap();
+        assert_eq!(gpu.params, cpu.params);
+        assert_eq!(
+            gpu.cpu_fallback_train_buffers.borrow().clone(),
+            cpu.train_buffers
+        );
+
+        let path =
+            std::env::temp_dir().join(format!("darknet-kimi-adam-{}.state", std::process::id()));
+        cpu.save_optimizer_state(&path).unwrap();
+        let mut restored = ExecutableNetwork::new(network);
+        restored.load_optimizer_state(&path).unwrap();
+        assert_eq!(restored.adam_step(), cpu.adam_step());
+        let round_trip = path.with_extension("round-trip.state");
+        restored.save_optimizer_state(&round_trip).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), fs::read(&round_trip).unwrap());
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(round_trip);
     }
 
     #[test]
