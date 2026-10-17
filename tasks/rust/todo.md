@@ -401,9 +401,10 @@ Immediately next, in dependency order:
   deferred. Still open: broader OBB GPU training/validation, remaining cfg/training-
   option wiring, source-faithful geometric augmentation/label transforms, and any
   unimplemented OBB source paths.
-- [ ] Phase 3B deformable family (remaining): `deform_conv`, `dsconv`,
-  `graph_conv`, `wmhf`, `clifford`, `recursive_block`. `[dcnv4]` is implemented
-  in v0.0.273; see `implemented.md` §17.
+- [ ] Phase 3B deformable family (remaining): next `[deform_conv]` (bounded plan:
+  `deform_conv_plan.md`), then `dsconv`, `graph_conv`, `wmhf`, `clifford`, and
+  `recursive_block`. `[dcnv4]` is implemented in v0.0.273–v0.0.274; see
+  `implemented.md` §17.
 - [ ] Phase 4 foveation / depth / DETR. DETR is still broken in C++ (paper only).
 
 ## Active and unstarted plans
@@ -412,6 +413,7 @@ Immediately next, in dependency order:
 - [x] `carpn_map_plan.md` — bounded caller-supplied sample dispatch implemented in v0.0.258.
 - [x] `carpn_network_map_plan.md` — v0.0.259 completes CPU network inference, `detect-image`, and direct `detector map`; CARPN training/`detector train -map` remain explicitly deferred.
 - [x] `dcnv4_plan.md` — source-audited CPU/reference + GPU f32 host-fallback implementation completed in v0.0.273; v0.0.274 matches the deformable-layer `try_fix_nan` config default. No native kernel or compiled-C++ parity.
+- [ ] `deform_conv_plan.md` — DCNv1/2 source audit and bounded implementation plan complete; implementation not started.
 - [ ] `gui_plan.md` — egui DarkMark replacement (M0–M6, not started).
 
 ## Known evidence gaps (not user questions)
