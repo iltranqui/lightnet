@@ -56,6 +56,7 @@ pub(crate) mod maxpool_depth;
 pub mod model;
 pub mod modern_yolo;
 pub mod names;
+pub mod onnx;
 pub mod obb_geometry;
 pub mod obb_labels;
 pub use obb_labels::{ObbLabel, flip_obb_labels, load_obb_labels, rotate_obb_labels};
