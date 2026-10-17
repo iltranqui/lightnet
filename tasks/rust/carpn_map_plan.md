@@ -54,7 +54,7 @@ Out of scope:
 - [x] 2. Add mixed-geometry rejection tests, including CARPN predictions split across separate image samples and mixed predictions within one sample. Require a clear invalid-input error.
 - [x] 3. Preserve and test legacy front-point behavior and the no-prediction ambiguity. Keep explicit `carpn_detector_map` tests for empty CARPN predictions and missing-front labels if its current behavior is intended.
 - [x] 4. Implement only the `obb_detector_map` dispatch/validation needed to satisfy the tests; reuse `carpn_detector_map` and `detector_map_by` rather than copy matching/AP logic.
-- [x] 5. Run `MEM=3G ./tools/test_host.sh obb_map`, then separately `MEM=3G ./tools/test_host.sh carpn_polygon_iou`; never run build/test commands in parallel. Results: 5 core tests passed for `obb_map`; 2 core tests passed for `carpn_polygon_iou`.
+- [x] 5. Run `MEM=3G ./tools/test_host.sh obb_map`, `MEM=3G ./tools/test_host.sh carpn_map`, and `MEM=3G ./tools/test_host.sh carpn_polygon_iou` separately; never run build/test commands in parallel. Results: 5 core tests passed for `obb_map`, 3 for direct CARPN mAP, and 2 for polygon IoU.
 - [x] 6. Review `git diff` for accidental changes to `ObbValidationDataset`, CLI routing, or training `-map`; those changes would wrongly imply network-level support in this task.
 - [x] 7. Record implementation evidence in the ledgers and task docs, with task-named code commit `7681f478` (`v0.0.258`). `version-map.tsv`, `implemented.md`, `todo.md`, and `STATUS.md` reflect the evidence; unrelated user edits are not included.
 

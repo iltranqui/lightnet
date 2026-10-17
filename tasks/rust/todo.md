@@ -365,7 +365,7 @@ Immediately next, in dependency order:
   `MEM=3G ./tools/test_host.sh obb_` also passed 135 core + 4 CLI tests.
   No compiled-C++ parity is established.
   v0.0.258 adds sample-level CARPN mAP dispatch through `obb_detector_map`; focused
-  OBB-map and polygon-IoU tests pass. Still open: broader OBB GPU training/validation,
+  `obb_map` (5 core), `carpn_map` (3), and `carpn_polygon_iou` (2) host filters pass. Still open: broader OBB GPU training/validation,
   CARPN network decode and dataset/CLI/training mAP integration, remaining
   cfg/training-option wiring, source-faithful geometric augmentation/label transforms,
   and any unimplemented OBB source paths.
