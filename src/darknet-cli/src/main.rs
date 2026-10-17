@@ -45,6 +45,45 @@ fn main() {
     }
 }
 
+struct ExportOnnxArgs {
+    cfg: String,
+    weights: String,
+    out: PathBuf,
+    fuse: bool,
+}
+
+fn parse_export_onnx_args(args: Vec<String>) -> Result<ExportOnnxArgs, String> {
+    let mut positional = Vec::new();
+    let mut fuse = true;
+    for arg in args {
+        match arg.as_str() {
+            "--no-fuse" | "-dontfuse" => fuse = false,
+            other if other.starts_with('-') => {
+                return Err(format!("unknown export-onnx flag: {other}"));
+            }
+            _ => positional.push(arg),
+        }
+    }
+    if !(2..=3).contains(&positional.len()) {
+        return Err(format!(
+            "export-onnx requires cfg, weights, and optionally output path (got {} positional arguments)",
+            positional.len()
+        ));
+    }
+    let cfg = positional.remove(0);
+    let weights = positional.remove(0);
+    let out = positional
+        .pop()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(&cfg).with_extension("onnx"));
+    Ok(ExportOnnxArgs {
+        cfg,
+        weights,
+        out,
+        fuse,
+    })
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args();
     let _bin = args.next();
@@ -389,6 +428,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+        }
+        "export-onnx" => {
+            let parsed = parse_export_onnx_args(args.collect())?;
+            let network = Network::from_path(&parsed.cfg)?.with_batch(1);
+            let mut executable = ExecutableNetwork::new(network);
+            executable.load_weights_file(&parsed.weights)?;
+            let bytes = darknet_core::export_onnx(
+                &executable.network,
+                &executable.params,
+                &darknet_core::OnnxOptions {
+                    fuse_batch_norm: parsed.fuse,
+                },
+            )?;
+            fs::write(&parsed.out, &bytes)?;
+            println!(
+                "wrote {} ({} bytes, batch_norm {})",
+                parsed.out.display(),
+                bytes.len(),
+                if parsed.fuse { "fused" } else { "separate" }
+            );
         }
         "help" | "--help" | "-h" => print_usage(),
         other => {
@@ -3185,6 +3244,7 @@ fn print_usage() {
     println!(
         "  detect-image <cfg> <weights> <names> <image> [thresh] [nms] [resize|letterbox|resize-exact]"
     );
+    println!("  export-onnx <cfg> <weights> [out.onnx] [--no-fuse]");
     println!(
         "env: DARKNET_BACKEND=cpu|oxide, DARKNET_OXIDE_CONV, DARKNET_OXIDE_GEMM, DARKNET_OXIDE_AMP=1 (mixed-precision training), DARKNET_DETECT_TSV=1"
     );
@@ -3292,8 +3352,39 @@ mod tests {
     use super::{
         DetectionOptions, ImageDetections, MapOptions, MapSchedule, ObbDetectionGeometry,
         TrainOptions, classify_detector_train_paths, decode_image_detections,
+        parse_export_onnx_args,
         format_obb_detection_line, run_detector_train_cpu, validate_obb_augmentation,
     };
+
+    #[test]
+    fn export_onnx_args_parse_defaults_and_flags() {
+        let a = parse_export_onnx_args(vec!["m.cfg".into(), "m.weights".into()]).unwrap();
+        assert_eq!(a.out, std::path::PathBuf::from("m.onnx"));
+        assert!(a.fuse);
+        let b = parse_export_onnx_args(vec![
+            "m.cfg".into(),
+            "m.weights".into(),
+            "o.onnx".into(),
+            "--no-fuse".into(),
+        ])
+        .unwrap();
+        assert_eq!(b.out, std::path::PathBuf::from("o.onnx"));
+        assert!(!b.fuse);
+        assert!(parse_export_onnx_args(vec!["m.cfg".into()]).is_err());
+        assert!(parse_export_onnx_args(vec![
+            "a.cfg".into(),
+            "b.weights".into(),
+            "--bogus".into(),
+        ])
+        .is_err());
+        assert!(parse_export_onnx_args(vec![
+            "a.cfg".into(),
+            "b.weights".into(),
+            "c.onnx".into(),
+            "d.onnx".into(),
+        ])
+        .is_err());
+    }
 
     fn options(args: &[&str]) -> Result<TrainOptions, Box<dyn std::error::Error>> {
         TrainOptions::parse(args.iter().map(|s| s.to_string()))
