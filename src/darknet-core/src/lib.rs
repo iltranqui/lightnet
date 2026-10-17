@@ -32,6 +32,7 @@ pub(crate) mod dcnv4;
 pub(crate) mod deform_conv;
 pub(crate) mod dsconv;
 pub(crate) mod graph_conv;
+pub(crate) mod hyperbolic_foveation;
 pub use chart::{ChartPoint, write_training_chart};
 pub use clifford::{CliffordBranchTrainBuffers, CliffordParams, CliffordTrainBuffers};
 pub mod dense_loss;
@@ -121,8 +122,8 @@ pub use carpn::{ObbRefineOutput, ObbRefineProposal};
 pub use cfg::{ConfigFile, RawSection};
 pub use detect::{
     Detection, DetectionBox, DetectionOptions, ObbDetection, ObbDetectionGeometry, apply_obb_nms,
-    decode_modern_detections, decode_obb_network_detections, decode_obb_yolo_detections,
-    decode_obb_yolo_head, decode_yolo_detections,
+    decode_modern_detections, decode_network_detections, decode_obb_network_detections,
+    decode_obb_yolo_detections, decode_obb_yolo_head, decode_yolo_detections,
 };
 pub use error::{Error, Result};
 pub use image::PlanarRgbImage;
@@ -133,19 +134,20 @@ pub use mambavision::{
 };
 pub use model::{
     Activation, CliffordContextMode, CliffordGffnMode, CliffordGlobalOp, CliffordHigherMode,
-    CliffordInteractionMode, CliffordSpec, CrnnSpec, DeformConvSpec, DsConvSpec, KimiKdaSpec,
-    Layer, LayerKind, LayerWeights, LrPolicy, LstmSpec, MambaVisionSpec, NetConfig, Network,
-    ObbRefineLoss, ObbRefineSpec, RecursiveBlockSpec, RnnSpec, ShortcutWeightsNorm,
-    ShortcutWeightsType, SwinSpec, TensorShape, TuckerAttentionSpec, WeightsArray, WmhfSpec,
-    YoloIouLoss,
+    CliffordInteractionMode, CliffordSpec, CrnnSpec, DeformConvSpec, DsConvSpec, HfInverseMethod,
+    HfRadiusMode, HfWarpSource, HyperbolicFoveationSpec, KimiKdaSpec, Layer, LayerKind,
+    LayerWeights, LrPolicy, LstmSpec, MambaVisionSpec, NetConfig, Network, ObbRefineLoss,
+    ObbRefineSpec, RecursiveBlockSpec, RnnSpec, ShortcutWeightsNorm, ShortcutWeightsType, SwinSpec,
+    TensorShape, TuckerAttentionSpec, WeightsArray, WmhfSpec, YoloIouLoss,
 };
 pub use names::load_names_file;
 pub use runtime::{
     BackwardResult, BatchNormTrainBuffers, ConnectedTrainBuffers, ConvolutionalTrainBuffers,
     CrnnParams, CrnnTrainBuffers, DeformConvParams, DeformConvTrainBuffers, DsConvParams,
     DsConvTrainBuffers, ExecutableNetwork, ForwardResult, GpuExecutableNetwork, GpuForwardState,
-    GpuForwardSummary, KimiKdaTrainBuffers, LayerParams, LayerTrainBuffers, LstmParams,
-    LstmTrainBuffers, MambaVisionTrainBuffers, RecurrentForwardCache, RecursiveBlockForwardCache,
+    GpuForwardSummary, HyperbolicFoveationParams, HyperbolicFoveationTrainBuffers,
+    KimiKdaTrainBuffers, LayerParams, LayerTrainBuffers, LstmParams, LstmTrainBuffers,
+    MambaVisionTrainBuffers, RecurrentForwardCache, RecursiveBlockForwardCache,
     RecursiveBlockParams, RecursiveBlockTrainBuffers, RnnParams, RnnTrainBuffers, ShortcutParams,
     ShortcutTrainBuffers, Tensor, TuckerAttentionTrainBuffers, WmhfParams, WmhfTrainBuffers,
     YoloHeadOutput, compute_learning_rate,

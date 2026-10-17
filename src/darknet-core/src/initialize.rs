@@ -36,6 +36,36 @@ pub fn initialize_training_params(network: &Network, params: &mut [LayerParams],
                     }
                 }
             }
+            LayerParams::HyperbolicFoveation(p) => {
+                let crate::LayerKind::HyperbolicFoveation(spec) = &layer.kind else {
+                    unreachable!("hyperbolic-foveation parameters require matching layer kind");
+                };
+                let param_count = spec.param_count();
+                p.hf_params[0] = spec.init_cx;
+                p.hf_params[1] = spec.init_cy;
+                match spec.radius_mode {
+                    crate::model::HfRadiusMode::Isotropic => p.hf_params[2] = spec.init_radius,
+                    crate::model::HfRadiusMode::Anisotropic => {
+                        p.hf_params[2] = spec.init_radius_x;
+                        p.hf_params[3] = spec.init_radius_y;
+                    }
+                }
+                p.hf_params[param_count - 1] = spec.init_strength;
+                if spec.pred_hidden > 0 {
+                    let input_dim = spec
+                        .predictor_input_dim()
+                        .expect("validated hyperbolic-foveation predictor dimensions");
+                    rng.weights_with_scale(&mut p.pred_w1, (2.0 / input_dim.max(1) as f32).sqrt());
+                    rng.weights_with_scale(
+                        &mut p.pred_w2,
+                        (2.0 / spec.pred_hidden.max(1) as f32).sqrt(),
+                    );
+                    p.pred_b1.fill(0.0);
+                    p.pred_b2.copy_from_slice(
+                        &crate::runtime::hyperbolic_foveation_predictor_initial_biases(spec),
+                    );
+                }
+            }
             LayerParams::BatchNorm(p) => bn(p),
             LayerParams::Convolutional(p) => conv(p, &mut rng),
             LayerParams::Connected(p) => connected(p, &mut rng),

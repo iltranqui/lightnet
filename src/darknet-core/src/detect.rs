@@ -8,9 +8,12 @@
 
 use crate::carpn::{ObbRefineOutput, ObbRefineProposal};
 use crate::error::{Error, Result};
-use crate::model::{LayerKind, Network, ObbNmsKind, ObbRefineSpec, YoloSpec};
+use crate::model::{
+    HfRadiusMode, HyperbolicFoveationSpec, LayerKind, Network, ObbNmsKind, ObbRefineSpec,
+    TensorShape, YoloSpec,
+};
 use crate::obb_geometry::{BoxObb, box_obb_iou, carpn_polygon_iou};
-use crate::runtime::{ForwardResult, ModernHeadOutput, YoloHeadOutput};
+use crate::runtime::{ForwardResult, ModernHeadOutput, Tensor, YoloHeadOutput};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DetectionBox {
@@ -127,6 +130,275 @@ pub fn decode_yolo_detections(
     Ok(detections)
 }
 
+/// Decode all axis-aligned heads for one batch item and invert the last
+/// hyperbolic-foveation layer using that item's cached parameters.
+pub fn decode_network_detections(
+    network: &Network,
+    forward: &ForwardResult,
+    batch_index: usize,
+    image_width: usize,
+    image_height: usize,
+    options: DetectionOptions,
+) -> Result<Vec<Detection>> {
+    if image_width == 0 || image_height == 0 {
+        return Err(Error::InvalidConfig(
+            "image dimensions must be positive for network detection decoding".to_owned(),
+        ));
+    }
+    let mut head_options = options;
+    head_options.nms_threshold = 1.0;
+    let mut yolo_heads = Vec::with_capacity(forward.yolo_heads.len());
+    for head in &forward.yolo_heads {
+        let layer = network.layers.get(head.layer_index).ok_or_else(|| {
+            Error::InvalidConfig(format!("missing layer #{} for YOLO head", head.layer_index))
+        })?;
+        let spec = match &layer.kind {
+            LayerKind::Yolo(spec) | LayerKind::GaussianYolo(spec) => spec,
+            _ => {
+                return Err(Error::InvalidConfig(format!(
+                    "layer #{} is not a YOLO head",
+                    head.layer_index
+                )));
+            }
+        };
+        if batch_index >= head.output.shape.batch {
+            return Err(Error::InvalidConfig(format!(
+                "batch index {batch_index} is outside YOLO head batch {}",
+                head.output.shape.batch
+            )));
+        }
+        let sample_len = head
+            .output
+            .shape
+            .width
+            .checked_mul(head.output.shape.height)
+            .and_then(|value| value.checked_mul(spec.mask.len()))
+            .and_then(|value| value.checked_mul(spec.classes + 5))
+            .ok_or_else(|| Error::InvalidConfig("YOLO head size overflow".to_owned()))?;
+        let expected_len = sample_len
+            .checked_mul(head.output.shape.batch)
+            .ok_or_else(|| Error::InvalidConfig("YOLO head batch size overflow".to_owned()))?;
+        if head.output.data.len() != expected_len {
+            return Err(Error::InvalidConfig(format!(
+                "YOLO head tensor length mismatch: expected {expected_len}, got {}",
+                head.output.data.len()
+            )));
+        }
+        let start = batch_index
+            .checked_mul(sample_len)
+            .ok_or_else(|| Error::InvalidConfig("YOLO head batch offset overflow".to_owned()))?;
+        let output = Tensor::from_data(
+            TensorShape::new(
+                head.output.shape.width,
+                head.output.shape.height,
+                head.output.shape.channels,
+                1,
+            ),
+            head.output.data[start..start + sample_len].to_vec(),
+        )?;
+        yolo_heads.push(YoloHeadOutput {
+            layer_index: head.layer_index,
+            output,
+        });
+    }
+    let mut modern_heads = Vec::with_capacity(forward.modern_heads.len());
+    for head in &forward.modern_heads {
+        if batch_index >= head.output.shape.batch {
+            return Err(Error::InvalidConfig(format!(
+                "batch index {batch_index} is outside modern head batch {}",
+                head.output.shape.batch
+            )));
+        }
+        let sample_len = head.output.shape.element_count();
+        let expected_len = sample_len
+            .checked_mul(head.output.shape.batch)
+            .ok_or_else(|| Error::InvalidConfig("modern head batch size overflow".to_owned()))?;
+        if head.output.data.len() != expected_len {
+            return Err(Error::InvalidConfig(format!(
+                "modern head tensor length mismatch: expected {expected_len}, got {}",
+                head.output.data.len()
+            )));
+        }
+        let start = batch_index
+            .checked_mul(sample_len)
+            .ok_or_else(|| Error::InvalidConfig("modern head batch offset overflow".to_owned()))?;
+        let output = Tensor::from_data(
+            TensorShape::new(
+                head.output.shape.width,
+                head.output.shape.height,
+                head.output.shape.channels,
+                1,
+            ),
+            head.output.data[start..start + sample_len].to_vec(),
+        )?;
+        modern_heads.push(ModernHeadOutput {
+            layer_index: head.layer_index,
+            output,
+        });
+    }
+
+    let mut detections = decode_yolo_detections(
+        network,
+        &yolo_heads,
+        image_width,
+        image_height,
+        head_options,
+    )?;
+    detections.extend(decode_modern_detections(
+        network,
+        &modern_heads,
+        image_width,
+        image_height,
+        head_options,
+    )?);
+    inverse_hyperbolic_foveation_detections(
+        network,
+        forward,
+        batch_index,
+        image_width,
+        image_height,
+        &mut detections,
+    )?;
+    apply_nms(&mut detections, options.nms_threshold);
+    detections.sort_by(|lhs, rhs| rhs.confidence.total_cmp(&lhs.confidence));
+    Ok(detections)
+}
+
+fn inverse_hyperbolic_foveation_detections(
+    network: &Network,
+    forward: &ForwardResult,
+    batch_index: usize,
+    image_width: usize,
+    image_height: usize,
+    detections: &mut [Detection],
+) -> Result<()> {
+    let Some((spec, params)) =
+        hyperbolic_foveation_detection_params(network, forward, batch_index)?
+    else {
+        return Ok(());
+    };
+    for detection in detections {
+        let normalized = [
+            detection.bbox.x / image_width as f32,
+            detection.bbox.y / image_height as f32,
+            detection.bbox.w / image_width as f32,
+            detection.bbox.h / image_height as f32,
+        ];
+        let transformed = crate::hyperbolic_foveation::transform_box_with_jacobian(
+            normalized,
+            params,
+            true,
+            spec.inverse_method,
+            spec.nr_iters,
+            spec.nr_eta,
+        );
+        detection.bbox = DetectionBox {
+            x: transformed[0] * image_width as f32,
+            y: transformed[1] * image_height as f32,
+            w: transformed[2] * image_width as f32,
+            h: transformed[3] * image_height as f32,
+        };
+    }
+    Ok(())
+}
+
+fn hyperbolic_foveation_detection_params(
+    network: &Network,
+    forward: &ForwardResult,
+    batch_index: usize,
+) -> Result<
+    Option<(
+        HyperbolicFoveationSpec,
+        crate::hyperbolic_foveation::HfParams,
+    )>,
+> {
+    let Some(layer) = network
+        .layers
+        .iter()
+        .rev()
+        .find(|layer| matches!(layer.kind, LayerKind::HyperbolicFoveation(_)))
+    else {
+        return Ok(None);
+    };
+    let LayerKind::HyperbolicFoveation(spec) = &layer.kind else {
+        unreachable!("filtered hyperbolic-foveation layer")
+    };
+    let cache = forward
+        .hyperbolic_foveation_caches
+        .get(layer.index)
+        .and_then(Option::as_ref)
+        .ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "missing [hyperbolic_foveation] detection cache for layer #{}",
+                layer.index
+            ))
+        })?;
+    let param_count = spec.param_count();
+    let start = batch_index.checked_mul(param_count).ok_or_else(|| {
+        Error::InvalidConfig("hyperbolic-foveation detection batch offset overflow".to_owned())
+    })?;
+    let end = start.checked_add(param_count).ok_or_else(|| {
+        Error::InvalidConfig("hyperbolic-foveation detection range overflow".to_owned())
+    })?;
+    let values = cache.params_per_batch.get(start..end).ok_or_else(|| {
+        Error::InvalidConfig(format!(
+            "hyperbolic-foveation detection cache has no parameters for batch {batch_index}"
+        ))
+    })?;
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(Error::InvalidConfig(
+            "hyperbolic-foveation detection parameters are non-finite".to_owned(),
+        ));
+    }
+    let (radius_x, radius_y, strength_index) = match spec.radius_mode {
+        HfRadiusMode::Isotropic => (values[2], values[2], 3),
+        HfRadiusMode::Anisotropic => (values[2], values[3], 4),
+    };
+    let params = crate::hyperbolic_foveation::HfParams {
+        center_x: values[0].clamp(-0.9, 0.9),
+        center_y: values[1].clamp(-0.9, 0.9),
+        radius_x: radius_x.clamp(0.1, 2.0),
+        radius_y: radius_y.clamp(0.1, 2.0),
+        strength: values[strength_index].clamp(0.0, 1.0),
+        alpha: spec.alpha,
+        p_exp: spec.p_exp,
+        radius_mode: spec.radius_mode,
+    };
+    Ok(Some((spec.clone(), params)))
+}
+
+fn inverse_hyperbolic_foveation_point(
+    network: &Network,
+    forward: &ForwardResult,
+    batch_index: usize,
+    image_width: usize,
+    image_height: usize,
+    point: [f32; 2],
+) -> Result<[f32; 2]> {
+    let Some((spec, params)) =
+        hyperbolic_foveation_detection_params(network, forward, batch_index)?
+    else {
+        return Ok(point);
+    };
+    let normalized = [
+        point[0] / image_width as f32,
+        point[1] / image_height as f32,
+    ];
+    let poincare = [2.0 * normalized[0] - 1.0, 2.0 * normalized[1] - 1.0];
+    let restored = crate::hyperbolic_foveation::inverse_point(
+        poincare,
+        params,
+        spec.inverse_method,
+        spec.nr_iters,
+        spec.nr_eta,
+    )
+    .point;
+    Ok([
+        (0.5 * (restored[0] + 1.0)) * image_width as f32,
+        (0.5 * (restored[1] + 1.0)) * image_height as f32,
+    ])
+}
+
 /// Decode and merge the network's legacy `[obb_yolo]` heads, then run
 /// orientation-aware NMS once across all heads. This API currently supports
 /// batch size one. OBB training and network-level mAP remain unsupported;
@@ -137,6 +409,24 @@ pub fn decode_obb_yolo_detections(
     image_width: usize,
     image_height: usize,
     options: DetectionOptions,
+) -> Result<Vec<ObbDetection>> {
+    decode_obb_yolo_detections_internal(
+        network,
+        obb_heads,
+        image_width,
+        image_height,
+        options,
+        None,
+    )
+}
+
+fn decode_obb_yolo_detections_internal(
+    network: &Network,
+    obb_heads: &[YoloHeadOutput],
+    image_width: usize,
+    image_height: usize,
+    options: DetectionOptions,
+    foveation_forward: Option<&ForwardResult>,
 ) -> Result<Vec<ObbDetection>> {
     let mut detections = Vec::new();
     let mut nms_kind = None;
@@ -190,6 +480,15 @@ pub fn decode_obb_yolo_detections(
         )?);
     }
 
+    if let Some(forward) = foveation_forward {
+        inverse_hyperbolic_foveation_obb_detections(
+            network,
+            forward,
+            image_width,
+            image_height,
+            &mut detections,
+        )?;
+    }
     apply_obb_nms_by_kind(
         &mut detections,
         options.nms_threshold,
@@ -207,7 +506,7 @@ pub fn decode_obb_yolo_detections(
 /// Decode OBB detections from a complete network forward pass.
 ///
 /// Networks with `[obb_refine]` use only typed Stage-2 outputs and return CARPN
-/// quadrilaterals; legacy networks delegate to [`decode_obb_yolo_detections`].
+/// quadrilaterals; legacy networks use the shared OBB YOLO head decoder.
 /// This CPU decoder currently supports batch size one.
 pub fn decode_obb_network_detections(
     network: &Network,
@@ -216,24 +515,25 @@ pub fn decode_obb_network_detections(
     image_height: usize,
     options: DetectionOptions,
 ) -> Result<Vec<ObbDetection>> {
+    if image_width == 0 || image_height == 0 || network.net.width == 0 || network.net.height == 0 {
+        return Err(Error::InvalidConfig(
+            "invalid image or network geometry for OBB decoding".to_owned(),
+        ));
+    }
     let refine_layers = network
         .layers
         .iter()
         .filter(|layer| matches!(layer.kind, LayerKind::ObbRefine(_)))
         .collect::<Vec<_>>();
     if refine_layers.is_empty() {
-        return decode_obb_yolo_detections(
+        return decode_obb_yolo_detections_internal(
             network,
             &forward.yolo_heads,
             image_width,
             image_height,
             options,
+            Some(forward),
         );
-    }
-    if image_width == 0 || image_height == 0 || network.net.width == 0 || network.net.height == 0 {
-        return Err(Error::InvalidConfig(
-            "invalid image or network geometry for CARPN decoding".to_owned(),
-        ));
     }
     if forward.obb_refine_outputs.len() != refine_layers.len() {
         return Err(Error::InvalidConfig(format!(
@@ -305,6 +605,13 @@ pub fn decode_obb_network_detections(
         }
     }
 
+    inverse_hyperbolic_foveation_obb_detections(
+        network,
+        forward,
+        image_width,
+        image_height,
+        &mut detections,
+    )?;
     apply_obb_nms_by_kind(
         &mut detections,
         options.nms_threshold,
@@ -317,6 +624,59 @@ pub fn decode_obb_network_detections(
             .total_cmp(&lhs.detection.confidence)
     });
     Ok(detections)
+}
+
+fn inverse_hyperbolic_foveation_obb_detections(
+    network: &Network,
+    forward: &ForwardResult,
+    image_width: usize,
+    image_height: usize,
+    detections: &mut [ObbDetection],
+) -> Result<()> {
+    let mut axis_aligned = detections
+        .iter()
+        .map(|detection| detection.detection.clone())
+        .collect::<Vec<_>>();
+    inverse_hyperbolic_foveation_detections(
+        network,
+        forward,
+        0,
+        image_width,
+        image_height,
+        &mut axis_aligned,
+    )?;
+    for (detection, transformed) in detections.iter_mut().zip(axis_aligned) {
+        detection.detection.bbox = transformed.bbox;
+        match &mut detection.geometry {
+            ObbDetectionGeometry::FrontPoint { x, y } => {
+                let point = inverse_hyperbolic_foveation_point(
+                    network,
+                    forward,
+                    0,
+                    image_width,
+                    image_height,
+                    [*x, *y],
+                )?;
+                *x = point[0];
+                *y = point[1];
+            }
+            ObbDetectionGeometry::CarpnQuad(vertices) => {
+                for vertex in 0..4 {
+                    let point = inverse_hyperbolic_foveation_point(
+                        network,
+                        forward,
+                        0,
+                        image_width,
+                        image_height,
+                        [vertices[2 * vertex], vertices[2 * vertex + 1]],
+                    )?;
+                    vertices[2 * vertex] = point[0];
+                    vertices[2 * vertex + 1] = point[1];
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_refine_output(
@@ -2373,11 +2733,121 @@ mod carpn_decode_tests {
         (executable.network, forward)
     }
 
+    fn tiny_carpn_forward_with_hyperbolic_foveation(objectness: f32) -> (Network, ForwardResult) {
+        let cfg = "[net]\nwidth=2\nheight=1\nchannels=1\nbatch=1\nobb=1\n\
+            [convolutional]\nfilters=2\nsize=1\nbatch_normalize=0\nactivation=linear\n\
+            [hyperbolic_foveation]\nparams=fixed\ninit_cx=0.15\ninit_cy=-0.1\ninit_radius=0.8\ninit_strength=0.6\n\
+            [convolutional]\nfilters=8\nsize=1\nbatch_normalize=0\nactivation=linear\n\
+            [obb_yolo]\nclasses=1\nnum=1\nmask=0\nanchors=1,1\nnew_coords=1\nmax=1\n\
+            [obb_refine]\nfrom=0\nproposal_from=3\nproposal_topk_train=1\nproposal_topk_infer=1\nproposal_capacity=1\nsample_grid=1\nfront_range=1\n";
+        let network =
+            Network::from_config(ConfigFile::parse_str("carpn-hf-decode.cfg", cfg).expect("cfg"))
+                .expect("network");
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::Convolutional(feature) = &mut executable.params[0] else {
+            panic!("feature convolution");
+        };
+        feature.weights.copy_from_slice(&[2.0, 3.0]);
+        let LayerParams::Convolutional(head) = &mut executable.params[2] else {
+            panic!("proposal convolution");
+        };
+        head.weights.fill(0.0);
+        head.biases
+            .copy_from_slice(&[0.9, 0.4, 0.5, 0.5, 0.0, 0.0, objectness, 0.8]);
+        let input =
+            Tensor::from_data(executable.network.net.input_shape(), vec![1.0, 2.0]).expect("input");
+        let forward = executable.forward(&input).expect("forward");
+        (executable.network, forward)
+    }
+
     fn options(confidence_threshold: f32, nms_threshold: f32, letterbox: bool) -> DetectionOptions {
         DetectionOptions {
             confidence_threshold,
             nms_threshold,
             letterbox,
+        }
+    }
+
+    #[test]
+    fn carpn_hyperbolic_foveation_reprojects_aabb_and_every_quad_vertex() {
+        let (network, forward) = tiny_carpn_forward_with_hyperbolic_foveation(0.9);
+        let detections =
+            decode_obb_network_detections(&network, &forward, 2, 1, options(0.1, 0.0, false))
+                .expect("CARPN foveated detections");
+        assert_eq!(detections.len(), 1);
+        let LayerKind::HyperbolicFoveation(hf_spec) = &network.layers[1].kind else {
+            panic!("hyperbolic-foveation layer");
+        };
+        let params = crate::hyperbolic_foveation::HfParams {
+            center_x: 0.15,
+            center_y: -0.1,
+            radius_x: 0.8,
+            radius_y: 0.8,
+            strength: 0.6,
+            alpha: hf_spec.alpha,
+            p_exp: hf_spec.p_exp,
+            radius_mode: hf_spec.radius_mode,
+        };
+        let LayerKind::ObbRefine(refine_spec) = &network.layers[4].kind else {
+            panic!("CARPN refine layer");
+        };
+        let proposal = &forward.obb_refine_outputs[0].proposals[0];
+        let correction = ObbImageCorrection::new(2, 1, 2, 1, false).expect("correction");
+        let unwarped = decode_carpn_proposal(
+            refine_spec,
+            proposal,
+            proposal.raw_regression,
+            2,
+            1,
+            correction,
+            0.1,
+        )
+        .expect("base decode")
+        .expect("base proposal");
+        let expected_box = crate::hyperbolic_foveation::transform_box_with_jacobian(
+            [
+                unwarped.detection.bbox.x / 2.0,
+                unwarped.detection.bbox.y,
+                unwarped.detection.bbox.w / 2.0,
+                unwarped.detection.bbox.h,
+            ],
+            params,
+            true,
+            hf_spec.inverse_method,
+            hf_spec.nr_iters,
+            hf_spec.nr_eta,
+        );
+        let actual_box = detections[0].detection.bbox;
+        for (actual, expected) in [
+            (actual_box.x / 2.0, expected_box[0]),
+            (actual_box.y, expected_box[1]),
+            (actual_box.w / 2.0, expected_box[2]),
+            (actual_box.h, expected_box[3]),
+        ] {
+            assert!((actual - expected).abs() < 1.0e-5);
+        }
+        let (
+            ObbDetectionGeometry::CarpnQuad(actual_vertices),
+            ObbDetectionGeometry::CarpnQuad(unwarped_vertices),
+        ) = (&detections[0].geometry, &unwarped.geometry)
+        else {
+            panic!("CARPN detection must carry a quad");
+        };
+        for vertex in 0..4 {
+            let source = [
+                2.0 * (unwarped_vertices[2 * vertex] / 2.0) - 1.0,
+                2.0 * unwarped_vertices[2 * vertex + 1] - 1.0,
+            ];
+            let expected = crate::hyperbolic_foveation::inverse_point(
+                source,
+                params,
+                hf_spec.inverse_method,
+                hf_spec.nr_iters,
+                hf_spec.nr_eta,
+            )
+            .point;
+            assert!((actual_vertices[2 * vertex] / 2.0 - 0.5 * (expected[0] + 1.0)).abs() < 1e-5);
+            assert!((actual_vertices[2 * vertex + 1] - 0.5 * (expected[1] + 1.0)).abs() < 1e-5);
         }
     }
 

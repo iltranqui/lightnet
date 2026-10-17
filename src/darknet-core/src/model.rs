@@ -1399,6 +1399,75 @@ pub struct RegionSpec {
     pub coords: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HfRadiusMode {
+    Isotropic,
+    Anisotropic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HfInverseMethod {
+    Newton,
+    FixedPoint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HfWarpSource {
+    Previous,
+    NetworkInput,
+}
+
+/// `[hyperbolic_foveation]` / `[hf]`: learnable radial image warp.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HyperbolicFoveationSpec {
+    pub init_cx: f32,
+    pub init_cy: f32,
+    pub init_radius: f32,
+    pub init_radius_x: f32,
+    pub init_radius_y: f32,
+    pub init_strength: f32,
+    pub small_box_px: f32,
+    pub small_box_strength: f32,
+    pub strength_loss: f32,
+    pub tiny_center_loss: f32,
+    pub tiny_radius_loss: f32,
+    pub tiny_strength_loss: f32,
+    pub strength_zero_loss: f32,
+    pub hf_lr_mult: f32,
+    pub alpha: f32,
+    pub p_exp: f32,
+    pub downsample: usize,
+    pub pred_hidden: usize,
+    pub nr_iters: usize,
+    pub nr_eta: f32,
+    pub inverse_method: HfInverseMethod,
+    /// `None` means the previous-layer input; `Some(i)` selects layer i's output.
+    pub pred_source_layer: Option<usize>,
+    pub pred_input_shape: TensorShape,
+    pub warp_source: HfWarpSource,
+    pub radius_mode: HfRadiusMode,
+    pub debug: bool,
+    pub debug_interval: usize,
+}
+
+impl HyperbolicFoveationSpec {
+    pub const fn param_count(&self) -> usize {
+        match self.radius_mode {
+            HfRadiusMode::Isotropic => 4,
+            HfRadiusMode::Anisotropic => 5,
+        }
+    }
+
+    pub fn predictor_input_dim(&self) -> Option<usize> {
+        let height = (self.pred_input_shape.height / self.downsample).max(1);
+        let width = (self.pred_input_shape.width / self.downsample).max(1);
+        self.pred_input_shape
+            .channels
+            .checked_mul(height)?
+            .checked_mul(width)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecursiveBlockSpec {
     pub loops: usize,
@@ -1422,6 +1491,7 @@ pub struct RecursiveBlockSpec {
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayerKind {
     RecursiveBlock(RecursiveBlockSpec),
+    HyperbolicFoveation(HyperbolicFoveationSpec),
     Convolutional(ConvolutionalSpec),
     Deconvolutional(DeconvolutionalSpec),
     Connected(ConnectedSpec),
@@ -1524,6 +1594,7 @@ impl LayerKind {
     pub fn name(&self) -> &str {
         match self {
             Self::RecursiveBlock(_) => "recursive_block",
+            Self::HyperbolicFoveation(_) => "hyperbolic_foveation",
             Self::Convolutional(_) => "convolutional",
             Self::Deconvolutional(_) => "deconvolutional",
             Self::Connected(_) => "connected",
@@ -1745,6 +1816,36 @@ impl Layer {
                     .flat_map(|weights| weights.entries)
                     .collect::<Vec<_>>();
                 (!entries.is_empty()).then_some(LayerWeights { entries })
+            }
+            LayerKind::HyperbolicFoveation(spec) => {
+                let mut entries = vec![WeightsEntry {
+                    array: WeightsArray::Named("hf_params".to_owned()),
+                    len: spec.param_count(),
+                }];
+                if spec.pred_hidden > 0 {
+                    let input_dim = spec
+                        .predictor_input_dim()
+                        .expect("validated hyperbolic-foveation predictor dimensions");
+                    entries.extend([
+                        WeightsEntry {
+                            array: WeightsArray::Named("hf_pred_w1".to_owned()),
+                            len: spec.pred_hidden * input_dim,
+                        },
+                        WeightsEntry {
+                            array: WeightsArray::Named("hf_pred_b1".to_owned()),
+                            len: spec.pred_hidden,
+                        },
+                        WeightsEntry {
+                            array: WeightsArray::Named("hf_pred_w2".to_owned()),
+                            len: spec.param_count() * spec.pred_hidden,
+                        },
+                        WeightsEntry {
+                            array: WeightsArray::Named("hf_pred_b2".to_owned()),
+                            len: spec.param_count(),
+                        },
+                    ]);
+                }
+                Some(LayerWeights { entries })
             }
             LayerKind::Convolutional(spec) => {
                 if spec.share_index.is_some() {
@@ -3136,6 +3237,9 @@ fn parse_layer_kind(
     let name = section.name.as_str();
     Ok(match name {
         "clifford" => LayerKind::Clifford(parse_clifford_spec(section, current)?),
+        "hyperbolic_foveation" | "hf" => LayerKind::HyperbolicFoveation(
+            parse_hyperbolic_foveation_spec(section, layer_index, current, built_layers)?,
+        ),
         "graph_conv" | "graph_convolutional" => {
             LayerKind::GraphConv(parse_graph_conv_spec(section, current)?)
         }
@@ -4486,6 +4590,12 @@ fn infer_output_shape(
             }
             Ok(current)
         }
+        LayerKind::HyperbolicFoveation(spec) => match spec.warp_source {
+            HfWarpSource::Previous => Ok(current),
+            HfWarpSource::NetworkInput => Ok(built_layers
+                .first()
+                .map_or(current, |first| first.input_shape)),
+        },
         LayerKind::Convolutional(spec) => Ok(TensorShape::new(
             conv_dim(current.width, spec.padding, spec.size, spec.stride_x),
             conv_dim(current.height, spec.padding, spec.size, spec.stride_y),
@@ -5633,6 +5743,306 @@ fn deform_conv_output_dim(
     dilation: usize,
 ) -> Option<usize> {
     dcnv4_output_dim(input, padding, size, stride, dilation)
+}
+
+fn reject_unknown_hyperbolic_foveation_keys(section: &RawSection) -> Result<()> {
+    const ALLOWED: &[&str] = &[
+        "init_cx",
+        "init_cy",
+        "init_radius",
+        "init_radius_x",
+        "init_radius_y",
+        "init_strength",
+        "small_box_px",
+        "small_box_strength",
+        "strength_loss",
+        "tiny_center_loss",
+        "tiny_radius_loss",
+        "tiny_strength_loss",
+        "strength_zero_loss",
+        "hf_lr_mult",
+        "alpha",
+        "p_exp",
+        "downsample",
+        "params",
+        "pred_hidden",
+        "nr_iters",
+        "nr_eta",
+        "inverse_method",
+        "warp_source",
+        "radius_mode",
+        "pred_source_layer",
+        "debug",
+        "debug_interval",
+        "batch_normalize",
+        "cbn",
+        "stream",
+        "wait_stream",
+        "learning_rate",
+        "dont_update",
+        "burnin_update",
+        "train_only_bn",
+        "clip",
+        "grad_centr",
+    ];
+    if let Some(key) = section
+        .values
+        .keys()
+        .find(|key| !ALLOWED.contains(&key.as_str()))
+    {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {}: unknown option `{key}`",
+            section.name, section.line
+        )));
+    }
+    Ok(())
+}
+
+fn parse_hyperbolic_foveation_spec(
+    section: &RawSection,
+    layer_index: usize,
+    input: TensorShape,
+    built_layers: &[Layer],
+) -> Result<HyperbolicFoveationSpec> {
+    let line = section.line;
+    let invalid = |message: &str| {
+        Error::InvalidConfig(format!("[{}] at line {line}: {message}", section.name))
+    };
+    reject_unknown_hyperbolic_foveation_keys(section)?;
+    if input.batch == 0 || input.width == 0 || input.height == 0 || input.channels == 0 {
+        return Err(invalid(
+            "preceding layer must output a non-empty NCHW tensor",
+        ));
+    }
+
+    let init_cx = section.get_f32("init_cx", 0.0)?;
+    let init_cy = section.get_f32("init_cy", 0.0)?;
+    let init_radius = section.get_f32("init_radius", 0.75)?;
+    let init_radius_x = section.get_f32("init_radius_x", init_radius)?;
+    let init_radius_y = section.get_f32("init_radius_y", init_radius)?;
+    let init_strength = section.get_f32("init_strength", 0.05)?;
+    let small_box_px = section.get_f32("small_box_px", 14.0)?;
+    let small_box_strength = section.get_f32("small_box_strength", 0.85)?;
+    let strength_loss = section.get_f32("strength_loss", 1.0)?;
+    let tiny_center_loss = section.get_f32("tiny_center_loss", strength_loss)?;
+    let tiny_radius_loss = section.get_f32("tiny_radius_loss", 0.25 * strength_loss)?;
+    let tiny_strength_loss = section.get_f32("tiny_strength_loss", strength_loss)?;
+    let strength_zero_loss = section.get_f32("strength_zero_loss", 0.0)?;
+    let hf_lr_mult = section.get_f32("hf_lr_mult", 1.0)?;
+    let alpha = section.get_f32("alpha", 2.0)?;
+    let p_exp = section.get_f32("p_exp", 2.0)?;
+
+    let params_mode = section.get_str("params", "");
+    let mut pred_hidden_raw = section.get_i64("pred_hidden", 0)?;
+    match params_mode.as_str() {
+        "learned" => {
+            if pred_hidden_raw <= 0 {
+                pred_hidden_raw = 64;
+            }
+        }
+        "fixed" => pred_hidden_raw = 0,
+        "" | "trainable" | "global" => {}
+        other => return Err(invalid(&format!("unsupported params mode `{other}`"))),
+    }
+    if pred_hidden_raw < 0 {
+        return Err(invalid("pred_hidden must be non-negative"));
+    }
+    let pred_hidden =
+        usize::try_from(pred_hidden_raw).map_err(|_| invalid("pred_hidden is out of range"))?;
+
+    let downsample_raw = section.get_i64("downsample", 8)?;
+    if downsample_raw <= 0 {
+        return Err(invalid("downsample must be positive"));
+    }
+    let downsample =
+        usize::try_from(downsample_raw).map_err(|_| invalid("downsample is out of range"))?;
+    let nr_iters_raw = section.get_i64("nr_iters", 10)?;
+    if nr_iters_raw <= 0 {
+        return Err(invalid("nr_iters must be positive"));
+    }
+    let nr_iters =
+        usize::try_from(nr_iters_raw).map_err(|_| invalid("nr_iters is out of range"))?;
+    let nr_eta = section.get_f32("nr_eta", 0.5)?;
+    if !nr_eta.is_finite() || !(0.05..=1.0).contains(&nr_eta) {
+        return Err(invalid("nr_eta must be finite and in [0.05, 1]"));
+    }
+
+    let inverse_method = match section.get_str("inverse_method", "newton").as_str() {
+        "newton" => HfInverseMethod::Newton,
+        "fixed_point" | "fixed-point" => HfInverseMethod::FixedPoint,
+        other => return Err(invalid(&format!("unsupported inverse_method `{other}`"))),
+    };
+    let warp_source = match section.get_str("warp_source", "previous").as_str() {
+        "previous" => HfWarpSource::Previous,
+        "network_input" => HfWarpSource::NetworkInput,
+        other => return Err(invalid(&format!("unsupported warp_source `{other}`"))),
+    };
+    let radius_mode = match section.get_str("radius_mode", "isotropic").as_str() {
+        "isotropic" => HfRadiusMode::Isotropic,
+        "anisotropic" => HfRadiusMode::Anisotropic,
+        other => return Err(invalid(&format!("unsupported radius_mode `{other}`"))),
+    };
+
+    let pred_source_raw = section.get_isize("pred_source_layer", -1)?;
+    let pred_source_layer = if pred_source_raw == -1 {
+        None
+    } else {
+        let source_index = if pred_source_raw < -1 {
+            layer_index.checked_add_signed(pred_source_raw)
+        } else {
+            usize::try_from(pred_source_raw).ok()
+        }
+        .ok_or_else(|| invalid(&format!("invalid pred_source_layer={pred_source_raw}")))?;
+        if source_index >= layer_index {
+            return Err(invalid("pred_source_layer must reference an earlier layer"));
+        }
+        if source_index >= built_layers.len() {
+            return Err(invalid("pred_source_layer does not exist"));
+        }
+        Some(source_index)
+    };
+    let pred_input_shape = pred_source_layer
+        .map(|source_index| built_layers[source_index].output_shape)
+        .unwrap_or(input);
+    if pred_input_shape.batch != input.batch
+        || pred_input_shape.width == 0
+        || pred_input_shape.height == 0
+        || pred_input_shape.channels == 0
+    {
+        return Err(invalid(
+            "predictor source must output a non-empty compatible NCHW tensor",
+        ));
+    }
+
+    for (name, value) in [
+        ("init_cx", init_cx),
+        ("init_cy", init_cy),
+        ("init_radius", init_radius),
+        ("init_radius_x", init_radius_x),
+        ("init_radius_y", init_radius_y),
+        ("init_strength", init_strength),
+        ("small_box_px", small_box_px),
+        ("small_box_strength", small_box_strength),
+        ("strength_loss", strength_loss),
+        ("tiny_center_loss", tiny_center_loss),
+        ("tiny_radius_loss", tiny_radius_loss),
+        ("tiny_strength_loss", tiny_strength_loss),
+        ("strength_zero_loss", strength_zero_loss),
+        ("hf_lr_mult", hf_lr_mult),
+        ("alpha", alpha),
+        ("p_exp", p_exp),
+    ] {
+        if !value.is_finite() {
+            return Err(invalid(&format!("{name} must be finite")));
+        }
+    }
+    if !(-1.0..=1.0).contains(&init_cx) || !(-1.0..=1.0).contains(&init_cy) {
+        return Err(invalid("initial center coordinates must be in [-1, 1]"));
+    }
+    if init_radius <= 0.0 || init_radius_x <= 0.0 || init_radius_y <= 0.0 {
+        return Err(invalid("initial radii must be positive"));
+    }
+    if !(0.0..=1.0).contains(&init_strength)
+        || small_box_px < 0.0
+        || !(0.0..=1.0).contains(&small_box_strength)
+        || strength_loss < 0.0
+        || tiny_center_loss < 0.0
+        || tiny_radius_loss < 0.0
+        || tiny_strength_loss < 0.0
+        || strength_zero_loss < 0.0
+        || hf_lr_mult < 0.0
+        || alpha <= 0.0
+        || p_exp <= 0.0
+    {
+        return Err(invalid(
+            "strengths, losses, lr multiplier, alpha, or p_exp are outside their supported ranges",
+        ));
+    }
+    if section.get_i64("batch_normalize", 0)? != 0 || section.get_i64("cbn", 0)? != 0 {
+        return Err(invalid("batch normalization is unsupported"));
+    }
+    if section.get_i64("grad_centr", 0)? != 0 || section.get_f32("clip", 0.0)? != 0.0 {
+        return Err(invalid("grad_centr and clip are unsupported"));
+    }
+    let learning_rate = section.get_f32("learning_rate", 1.0)?;
+    if !learning_rate.is_finite() || learning_rate < 0.0 {
+        return Err(invalid("learning_rate must be finite and non-negative"));
+    }
+    if section.get_i64("stream", -1)? != -1 || section.get_i64("wait_stream", -1)? != -1 {
+        return Err(invalid(
+            "GPU stream options are unsupported in the Stage-1 CPU port",
+        ));
+    }
+    let debug = section.get_i64("debug", 0)? != 0;
+    let debug_interval_raw = section.get_i64("debug_interval", 100)?;
+    if debug {
+        return Err(invalid(
+            "debug summaries are unsupported in the Stage-1 CPU port",
+        ));
+    }
+    if debug_interval_raw <= 0 {
+        return Err(invalid("debug_interval must be positive"));
+    }
+    if section.get("debug_interval").is_some() && debug_interval_raw != 100 {
+        return Err(invalid(
+            "custom debug_interval is unsupported without debug summaries",
+        ));
+    }
+    let debug_interval = usize::try_from(debug_interval_raw)
+        .map_err(|_| invalid("debug_interval is out of range"))?;
+
+    let input_dim = pred_input_shape
+        .channels
+        .checked_mul((pred_input_shape.height / downsample).max(1))
+        .and_then(|value| value.checked_mul((pred_input_shape.width / downsample).max(1)))
+        .ok_or_else(|| invalid("predictor input dimension overflows"))?;
+    if pred_hidden > 0 {
+        let param_count = match radius_mode {
+            HfRadiusMode::Isotropic => 4usize,
+            HfRadiusMode::Anisotropic => 5usize,
+        };
+        pred_hidden
+            .checked_mul(input_dim)
+            .and_then(|value| value.checked_add(pred_hidden))
+            .and_then(|value| {
+                param_count
+                    .checked_mul(pred_hidden)
+                    .and_then(|x| x.checked_add(value))
+            })
+            .and_then(|value| value.checked_add(param_count))
+            .and_then(|value| value.checked_add(param_count))
+            .ok_or_else(|| invalid("predictor parameter count overflows"))?;
+    }
+
+    Ok(HyperbolicFoveationSpec {
+        init_cx,
+        init_cy,
+        init_radius,
+        init_radius_x,
+        init_radius_y,
+        init_strength,
+        small_box_px,
+        small_box_strength,
+        strength_loss,
+        tiny_center_loss,
+        tiny_radius_loss,
+        tiny_strength_loss,
+        strength_zero_loss,
+        hf_lr_mult,
+        alpha,
+        p_exp,
+        downsample,
+        pred_hidden,
+        nr_iters,
+        nr_eta,
+        inverse_method,
+        pred_source_layer,
+        pred_input_shape,
+        warp_source,
+        radius_mode,
+        debug,
+        debug_interval,
+    })
 }
 
 fn reject_unknown_graph_conv_keys(section: &RawSection) -> Result<()> {
@@ -10299,6 +10709,188 @@ output=2
                     .net
                     .try_fix_nan
             );
+        }
+    }
+
+    #[test]
+    fn hyperbolic_foveation_aliases_defaults_shape_and_weights() {
+        for alias in ["hyperbolic_foveation", "hf"] {
+            let network = build(&format!(
+                "[net]\nwidth=5\nheight=3\nchannels=2\nbatch=2\n[{alias}]\n"
+            ))
+            .unwrap_or_else(|error| panic!("[{alias}] should parse: {error}"));
+            let layer = &network.layers[0];
+            let super::LayerKind::HyperbolicFoveation(spec) = &layer.kind else {
+                panic!("expected hyperbolic foveation for [{alias}]");
+            };
+            assert_eq!(layer.kind.name(), "hyperbolic_foveation");
+            assert_eq!(layer.output_shape, super::TensorShape::new(5, 3, 2, 2));
+            assert_eq!(
+                (
+                    spec.init_cx,
+                    spec.init_cy,
+                    spec.init_radius,
+                    spec.init_radius_x,
+                    spec.init_radius_y,
+                    spec.init_strength,
+                ),
+                (0.0, 0.0, 0.75, 0.75, 0.75, 0.05)
+            );
+            assert_eq!(
+                (
+                    spec.alpha,
+                    spec.p_exp,
+                    spec.downsample,
+                    spec.pred_hidden,
+                    spec.nr_iters,
+                    spec.nr_eta,
+                ),
+                (2.0, 2.0, 8, 0, 10, 0.5)
+            );
+            assert_eq!(spec.radius_mode, super::HfRadiusMode::Isotropic);
+            assert_eq!(spec.inverse_method, super::HfInverseMethod::Newton);
+            assert_eq!(spec.warp_source, super::HfWarpSource::Previous);
+            assert_eq!(spec.pred_source_layer, None);
+            assert_eq!(spec.pred_input_shape, super::TensorShape::new(5, 3, 2, 2));
+            let weights = layer.weights().expect("hyperbolic foveation weights");
+            assert_eq!(
+                weights
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.array.name(), entry.len))
+                    .collect::<Vec<_>>(),
+                vec![("hf_params", 4)]
+            );
+        }
+    }
+
+    #[test]
+    fn hyperbolic_foveation_resolves_predictor_edges_and_network_input_shape() {
+        for source in ["-2", "0"] {
+            let network = build(&format!(
+                "[net]\nwidth=8\nheight=6\nchannels=2\nbatch=2\n\
+                 [convolutional]\nfilters=4\nsize=1\nactivation=linear\n\
+                 [convolutional]\nfilters=5\nsize=1\nactivation=linear\n\
+                 [hf]\nparams=learned\npred_hidden=3\ndownsample=2\n\
+                 pred_source_layer={source}\nwarp_source=network_input\nradius_mode=anisotropic\n"
+            ))
+            .unwrap_or_else(|error| panic!("pred_source_layer={source}: {error}"));
+            let layer = &network.layers[2];
+            let super::LayerKind::HyperbolicFoveation(spec) = &layer.kind else {
+                panic!("expected hyperbolic foveation");
+            };
+            assert_eq!(spec.pred_source_layer, Some(0));
+            assert_eq!(spec.pred_input_shape, super::TensorShape::new(8, 6, 4, 2));
+            assert_eq!(spec.predictor_input_dim(), Some(4 * 3 * 4));
+            assert_eq!(spec.param_count(), 5);
+            assert_eq!(
+                layer.output_shape,
+                super::TensorShape::new(8, 6, 2, 2),
+                "network_input warp uses the original input shape"
+            );
+            assert_eq!(
+                layer
+                    .weights()
+                    .unwrap()
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.array.name(), entry.len))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("hf_params", 5),
+                    ("hf_pred_w1", 3 * 48),
+                    ("hf_pred_b1", 3),
+                    ("hf_pred_w2", 5 * 3),
+                    ("hf_pred_b2", 5),
+                ]
+            );
+        }
+
+        let previous = build(
+            "[net]\nwidth=4\nheight=3\nchannels=1\n\
+             [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
+             [hf]\n",
+        )
+        .expect("previous-source output shape");
+        assert_eq!(
+            previous.layers[1].output_shape,
+            previous.layers[1].input_shape
+        );
+    }
+
+    #[test]
+    fn hyperbolic_foveation_accepts_params_and_inverse_aliases() {
+        for (mode, explicit_hidden, expected_hidden) in [
+            ("fixed", "pred_hidden=3\n", 0),
+            ("trainable", "pred_hidden=3\n", 3),
+            ("global", "pred_hidden=3\n", 3),
+            ("learned", "pred_hidden=0\n", 64),
+        ] {
+            let network = build(&format!(
+                "[net]\nwidth=4\nheight=3\nchannels=1\n[hf]\nparams={mode}\n{explicit_hidden}"
+            ))
+            .expect("supported hyperbolic-foveation params mode");
+            let super::LayerKind::HyperbolicFoveation(spec) = &network.layers[0].kind else {
+                panic!("expected hyperbolic foveation");
+            };
+            assert_eq!(spec.pred_hidden, expected_hidden, "params={mode}");
+        }
+        for inverse in ["fixed_point", "fixed-point"] {
+            let network = build(&format!(
+                "[net]\nwidth=4\nheight=3\nchannels=1\n[hf]\ninverse_method={inverse}\nwarp_source=network_input\nradius_mode=anisotropic\n"
+            ))
+            .expect("supported fixed-point inverse alias");
+            let super::LayerKind::HyperbolicFoveation(spec) = &network.layers[0].kind else {
+                panic!("expected hyperbolic foveation");
+            };
+            assert_eq!(spec.inverse_method, super::HfInverseMethod::FixedPoint);
+            assert_eq!(spec.warp_source, super::HfWarpSource::NetworkInput);
+            assert_eq!(spec.radius_mode, super::HfRadiusMode::Anisotropic);
+        }
+    }
+
+    #[test]
+    fn hyperbolic_foveation_rejects_unknown_or_unsupported_options() {
+        let make = |options: &str| {
+            build(&format!(
+                "[net]\nwidth=4\nheight=3\nchannels=1\n[hf]\n{options}\n"
+            ))
+        };
+        for (options, expected) in [
+            ("unknown_option=1", "unknown option"),
+            ("params=adaptive", "unsupported params mode"),
+            ("inverse_method=bad", "unsupported inverse_method"),
+            ("warp_source=bad", "unsupported warp_source"),
+            ("radius_mode=bad", "unsupported radius_mode"),
+            ("nr_eta=2", "nr_eta must be finite"),
+            ("downsample=0", "downsample must be positive"),
+            ("debug=1", "debug summaries are unsupported"),
+            ("debug_interval=200", "custom debug_interval is unsupported"),
+            ("batch_normalize=1", "batch normalization is unsupported"),
+            ("stream=0", "GPU stream options are unsupported"),
+            ("pred_hidden=-1", "pred_hidden must be non-negative"),
+            (
+                "init_cx=1.1",
+                "initial center coordinates must be in [-1, 1]",
+            ),
+            (
+                "learning_rate=-1",
+                "learning_rate must be finite and non-negative",
+            ),
+            ("init_strength=NaN", "init_strength must be finite"),
+        ] {
+            let error = make(options).expect_err("unsupported hyperbolic-foveation cfg must fail");
+            assert!(error.to_string().contains(expected), "{options}: {error}");
+        }
+
+        for source in ["1", "-3"] {
+            let error = build(&format!(
+                "[net]\nwidth=4\nheight=3\nchannels=1\n\
+                 [convolutional]\nfilters=2\nsize=1\n\
+                 [hf]\npred_source_layer={source}\n"
+            ))
+            .expect_err("predictor source must be earlier and valid");
+            assert!(error.to_string().contains("pred_source_layer"), "{error}");
         }
     }
 

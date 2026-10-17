@@ -3,7 +3,7 @@ use crate::obb_geometry::{BoxObb, box_obb_iou, box_obb_vertices, carpn_polygon_i
 use crate::{
     DataConfig, Detection, DetectionBox, DetectionOptions, Error, ForwardResult, LayerKind,
     Network, ObbDetection, ObbDetectionGeometry, ObbLabel, PlanarRgbImage, Result, Tensor,
-    YoloHeadOutput, YoloLabel, decode_obb_network_detections, decode_yolo_detections,
+    YoloHeadOutput, YoloLabel, decode_network_detections, decode_obb_network_detections,
     load_obb_labels, load_paths_file, load_yolo_labels, replace_image_to_label,
 };
 use std::path::PathBuf;
@@ -118,6 +118,20 @@ impl ValidationDataset {
         iou_threshold: f32,
         mut infer: impl FnMut(&Tensor) -> Result<Vec<YoloHeadOutput>>,
     ) -> Result<MapReport> {
+        self.evaluate_with_forward(network, options, iou_threshold, |input| {
+            Ok(ForwardResult::from_heads(infer(input)?, Vec::new()))
+        })
+    }
+
+    /// Full-forward variant required when the prediction heads depend on
+    /// hyperbolic-foveation parameters cached by the runtime.
+    pub fn evaluate_with_forward(
+        &self,
+        network: &Network,
+        options: DetectionOptions,
+        iou_threshold: f32,
+        mut infer: impl FnMut(&Tensor) -> Result<ForwardResult>,
+    ) -> Result<MapReport> {
         validate_validation_options(network, self.classes, options, iou_threshold)?;
         let mut samples = Vec::with_capacity(self.images.len());
         for (path, labels) in &self.images {
@@ -129,10 +143,11 @@ impl ValidationDataset {
                 image.resize_linear_exact(network.net.width, network.net.height)?
             };
             let input = Tensor::from_data(prepared.shape, prepared.data)?;
-            let heads = infer(&input)?;
-            let mut detections = decode_yolo_detections(
+            let forward = infer(&input)?;
+            let mut detections = decode_network_detections(
                 network,
-                &heads,
+                &forward,
+                0,
                 image.shape.width,
                 image.shape.height,
                 options,

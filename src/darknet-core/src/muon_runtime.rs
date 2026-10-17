@@ -208,6 +208,37 @@ pub(crate) fn visit_muon_matrices(
     }
     match (kind, params, train) {
         (
+            LayerKind::HyperbolicFoveation(spec),
+            LayerParams::HyperbolicFoveation(params),
+            LayerTrainBuffers::HyperbolicFoveation(train),
+        ) => {
+            crate::runtime::validate_hyperbolic_foveation_param_layout(spec, params)?;
+            if spec.pred_hidden == 0 {
+                return Ok(());
+            }
+            let input_dim = spec.predictor_input_dim().ok_or_else(|| {
+                Error::InvalidConfig(
+                    "Muon hyperbolic-foveation predictor input dimension overflows".to_owned(),
+                )
+            })?;
+            visit_matrix(
+                &mut params.pred_w1,
+                &mut train.pred_w1_updates,
+                spec.pred_hidden,
+                input_dim,
+                spec.hf_lr_mult,
+                visitor,
+            )?;
+            visit_matrix(
+                &mut params.pred_w2,
+                &mut train.pred_w2_updates,
+                spec.param_count(),
+                spec.pred_hidden,
+                spec.hf_lr_mult,
+                visitor,
+            )
+        }
+        (
             LayerKind::RecursiveBlock(spec),
             LayerParams::RecursiveBlock(params),
             LayerTrainBuffers::RecursiveBlock(train),

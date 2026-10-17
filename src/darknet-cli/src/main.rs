@@ -16,8 +16,8 @@ use darknet_core::{
     ConfigFile, DataConfig, Detection, DetectionOptions, DetectorAugmentation, ExecutableNetwork,
     ForwardResult, LayerKind, LayerParams, Network, ObbDetection, ObbDetectionGeometry,
     PlanarRgbImage, Tensor, TrainingBatch, YoloLabel, YoloTrainingState, compute_learning_rate,
-    compute_yolo_training_loss_with_state, decode_modern_detections, decode_obb_network_detections,
-    decode_yolo_detections, initialize_training_params, inspect_weights_file,
+    compute_yolo_training_loss_with_state, decode_network_detections,
+    decode_obb_network_detections, initialize_training_params, inspect_weights_file,
     load_augmented_training_batch_from_paths, load_names_file, load_paths_file, save_weights,
 };
 use darknet_core::{
@@ -495,21 +495,8 @@ fn decode_image_detections(
         )?));
     }
 
-    let mut detections = decode_yolo_detections(
-        network,
-        &result.yolo_heads,
-        image_width,
-        image_height,
-        options,
-    )?;
-    detections.extend(decode_modern_detections(
-        network,
-        &result.modern_heads,
-        image_width,
-        image_height,
-        options,
-    )?);
-    detections.sort_by(|lhs, rhs| rhs.confidence.total_cmp(&lhs.confidence));
+    let detections =
+        decode_network_detections(network, result, 0, image_width, image_height, options)?;
     Ok(ImageDetections::AxisAligned(detections))
 }
 
@@ -870,7 +857,13 @@ fn bench_train(cfg: &str, steps: usize, warmup: usize) -> Result<(), Box<dyn std
                     );
                 }
                 let t1 = Instant::now();
-                exec.backward_accumulate_seeded(&input, &forward, &seeds)?;
+                if let Some(labels) = parity_labels.as_ref().or(synthetic_labels.as_ref()) {
+                    exec.backward_accumulate_seeded_with_hf_auxiliary_gradients(
+                        &input, &forward, &seeds, labels,
+                    )?;
+                } else {
+                    exec.backward_accumulate_seeded(&input, &forward, &seeds)?;
+                }
                 let t2 = Instant::now();
                 if exec.network.net.muon {
                     exec.update_weights_muon(lr, batch)?;
@@ -1313,11 +1306,11 @@ fn evaluate_detector_map(
     } else {
         let dataset = darknet_core::ValidationDataset::from_data(&executable.network, &data)?;
         let names = map_class_names(&data, dataset.classes)?;
-        let report = dataset.evaluate(
+        let report = dataset.evaluate_with_forward(
             &executable.network,
             detection_options,
             options.iou_threshold,
-            |input| Ok(executable.forward(input)?.yolo_heads),
+            |input| executable.forward(input),
         )?;
         Ok((dataset.classes, dataset.images.len(), names, report))
     }
@@ -1555,11 +1548,15 @@ impl TrainingValidationDataset {
         network: &Network,
         options: DetectionOptions,
         iou_threshold: f32,
-        infer: impl FnMut(&Tensor) -> darknet_core::Result<Vec<darknet_core::YoloHeadOutput>>,
+        infer: impl FnMut(&Tensor) -> darknet_core::Result<ForwardResult>,
     ) -> darknet_core::Result<darknet_core::MapReport> {
         match self {
-            Self::AxisAligned(dataset) => dataset.evaluate(network, options, iou_threshold, infer),
-            Self::Oriented(dataset) => dataset.evaluate(network, options, iou_threshold, infer),
+            Self::AxisAligned(dataset) => {
+                dataset.evaluate_with_forward(network, options, iou_threshold, infer)
+            }
+            Self::Oriented(dataset) => {
+                dataset.evaluate_with_forward(network, options, iou_threshold, infer)
+            }
         }
     }
 }
@@ -2367,10 +2364,11 @@ fn run_detector_train_cpu(
                 Some(&mut yolo_state),
             )?;
             iter_loss += yolo.loss;
-            executable.backward_accumulate_seeded(
+            executable.backward_accumulate_seeded_with_hf_auxiliary_gradients(
                 &batch.input,
                 &forward,
                 &yolo.layer_output_gradient_seeds,
+                &batch.labels,
             )?;
         }
         if executable.network.net.muon {
@@ -2431,7 +2429,7 @@ fn run_detector_train_cpu(
                     &inference.network,
                     validation.detection_options,
                     validation.iou_threshold,
-                    |input| Ok(inference.forward(input)?.yolo_heads),
+                    |input| inference.forward(input),
                 )?;
                 loss_log.set_map(report.mean_average_precision);
                 if validation.record(&report, batch_num, seen)? {
@@ -2685,7 +2683,7 @@ fn run_detector_train_cpu_obb(
                     &inference.network,
                     validation.detection_options,
                     validation.iou_threshold,
-                    |input| Ok(inference.forward(input)?.yolo_heads),
+                    |input| inference.forward(input),
                 )?;
                 loss_log.set_map(report.mean_average_precision);
                 if validation.record(&report, batch_num, seen)? {
@@ -3102,7 +3100,13 @@ fn run_detector_train_gpu(
                     &inference.network,
                     validation.detection_options,
                     validation.iou_threshold,
-                    |input| Ok(inference.forward_compact(input)?.yolo_heads),
+                    |input| {
+                        let summary = inference.forward_compact(input)?;
+                        Ok(ForwardResult::from_heads(
+                            summary.yolo_heads,
+                            summary.modern_heads,
+                        ))
+                    },
                 )?;
                 loss_log.set_map(report.mean_average_precision);
                 if validation.record(&report, batch_num, seen)? {
@@ -3386,6 +3390,13 @@ fn print_forward_backward_summary(
                         .mask_bias_updates
                         .as_ref()
                         .is_some_and(|updates| updates.iter().any(|value| *value != 0.0))
+            }
+            darknet_core::LayerTrainBuffers::HyperbolicFoveation(hf) => {
+                hf.hf_param_updates.iter().any(|value| *value != 0.0)
+                    || hf.pred_w1_updates.iter().any(|value| *value != 0.0)
+                    || hf.pred_b1_updates.iter().any(|value| *value != 0.0)
+                    || hf.pred_w2_updates.iter().any(|value| *value != 0.0)
+                    || hf.pred_b2_updates.iter().any(|value| *value != 0.0)
             }
             darknet_core::LayerTrainBuffers::RecursiveBlock(recursive) => {
                 recursive

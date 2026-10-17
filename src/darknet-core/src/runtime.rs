@@ -76,6 +76,22 @@ impl GradMode {
     }
 }
 
+fn reject_gpu_hyperbolic_foveation(network: &Network, operation: &str) -> Result<()> {
+    if let Some(layer) = network
+        .layers
+        .iter()
+        .find(|layer| matches!(layer.kind, LayerKind::HyperbolicFoveation(_)))
+    {
+        return Err(Error::UnsupportedLayer {
+            layer_index: layer.index,
+            name: format!(
+                "[hyperbolic_foveation] GPU {operation} is not implemented in Stage-1 CPU support"
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tensor {
     pub shape: TensorShape,
@@ -295,6 +311,24 @@ pub struct RecursiveBlockParams {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct HyperbolicFoveationParams {
+    pub hf_params: Vec<f32>,
+    pub pred_w1: Vec<f32>,
+    pub pred_b1: Vec<f32>,
+    pub pred_w2: Vec<f32>,
+    pub pred_b2: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HyperbolicFoveationTrainBuffers {
+    pub hf_param_updates: Vec<f32>,
+    pub pred_w1_updates: Vec<f32>,
+    pub pred_b1_updates: Vec<f32>,
+    pub pred_w2_updates: Vec<f32>,
+    pub pred_b2_updates: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct RecursiveBlockTrainBuffers {
     pub body: Vec<LayerTrainBuffers>,
     pub controller_weight_updates: Vec<f32>,
@@ -306,6 +340,7 @@ pub struct RecursiveBlockTrainBuffers {
 pub enum LayerParams {
     None,
     RecursiveBlock(RecursiveBlockParams),
+    HyperbolicFoveation(HyperbolicFoveationParams),
     BatchNorm(BatchNormParams),
     Convolutional(ConvolutionalParams),
     Connected(ConnectedParams),
@@ -523,6 +558,7 @@ pub struct KimiKdaTrainBuffers {
 pub enum LayerTrainBuffers {
     None,
     RecursiveBlock(RecursiveBlockTrainBuffers),
+    HyperbolicFoveation(HyperbolicFoveationTrainBuffers),
     BatchNorm(StandaloneBatchNormTrainBuffers),
     Convolutional(ConvolutionalTrainBuffers),
     Connected(ConnectedTrainBuffers),
@@ -717,6 +753,14 @@ pub struct RecursiveBlockForwardCache {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) struct HyperbolicFoveationForwardCache {
+    pub grid: Vec<f32>,
+    /// Raw global or constrained predictor values per batch item.
+    pub params_per_batch: Vec<f32>,
+    pub predictor: Option<crate::hyperbolic_foveation::PredictorForwardCache>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct ForwardResult {
     pub layer_outputs: Vec<Tensor>,
     pub layer_activation_inputs: Vec<Option<Tensor>>,
@@ -738,6 +782,7 @@ pub struct ForwardResult {
     pub(crate) wmhf_caches: Vec<Option<WmhfRuntimeCache>>,
     pub(crate) clifford_caches: Vec<Option<CliffordRuntimeCache>>,
     pub(crate) recursive_block_caches: Vec<Option<RecursiveBlockForwardCache>>,
+    pub(crate) hyperbolic_foveation_caches: Vec<Option<HyperbolicFoveationForwardCache>>,
     pub vit_caches: Vec<Option<crate::vit::VitForwardCache>>,
     pub swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>>,
     pub tucker_attention_caches: Vec<Option<crate::tucker_attention::TuckerAttentionForwardCache>>,
@@ -773,6 +818,7 @@ impl ForwardResult {
             wmhf_caches: Vec::new(),
             clifford_caches: Vec::new(),
             recursive_block_caches: Vec::new(),
+            hyperbolic_foveation_caches: Vec::new(),
             vit_caches: Vec::new(),
             swin_caches: Vec::new(),
             tucker_attention_caches: Vec::new(),
@@ -808,6 +854,7 @@ mod forward_result_from_heads_tests {
         assert!(result.dsconv_caches.is_empty());
         assert!(result.graph_conv_caches.is_empty());
         assert!(result.wmhf_caches.is_empty());
+        assert!(result.hyperbolic_foveation_caches.is_empty());
         assert!(result.vit_caches.is_empty());
         assert!(result.swin_caches.is_empty());
         assert!(result.tucker_attention_caches.is_empty());
@@ -1214,17 +1261,20 @@ impl ExecutableNetwork {
             }
         }
         for (index, state) in host_state.iter().enumerate() {
-            if let Some(state) = state
-                && matches!(
-                    self.network.layers[index].kind,
-                    LayerKind::RecursiveBlock(_)
-                )
-            {
-                validate_recursive_block_adam_state(
-                    &self.network.layers[index],
-                    &self.params[index],
-                    state,
-                )?;
+            if let Some(state) = state {
+                match self.network.layers[index].kind {
+                    LayerKind::RecursiveBlock(_) => validate_recursive_block_adam_state(
+                        &self.network.layers[index],
+                        &self.params[index],
+                        state,
+                    )?,
+                    LayerKind::HyperbolicFoveation(_) => validate_hyperbolic_foveation_adam_state(
+                        &self.network.layers[index],
+                        &self.params[index],
+                        state,
+                    )?,
+                    _ => {}
+                }
             }
         }
         if !self.network.net.muon
@@ -1328,6 +1378,22 @@ impl ExecutableNetwork {
                     lr * opts.learning_rate_scale,
                     momentum,
                     decay,
+                    batch,
+                );
+                continue;
+            }
+            if let (
+                LayerKind::HyperbolicFoveation(spec),
+                LayerParams::HyperbolicFoveation(params),
+                LayerTrainBuffers::HyperbolicFoveation(train),
+            ) = (&layer.kind, &mut *params, &mut *train)
+            {
+                update_hyperbolic_foveation_sgd(
+                    spec,
+                    params,
+                    train,
+                    lr * opts.learning_rate_scale,
+                    momentum,
                     batch,
                 );
                 continue;
@@ -2357,6 +2423,7 @@ impl ExecutableNetwork {
         let mut wmhf_caches = Vec::with_capacity(self.network.layers.len());
         let mut clifford_caches = Vec::with_capacity(self.network.layers.len());
         let mut recursive_block_caches = Vec::with_capacity(self.network.layers.len());
+        let mut hyperbolic_foveation_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches = Vec::with_capacity(self.network.layers.len());
         let mut swin_caches = Vec::with_capacity(self.network.layers.len());
         let mut tucker_attention_caches = Vec::with_capacity(self.network.layers.len());
@@ -2394,7 +2461,24 @@ impl ExecutableNetwork {
             let mut wmhf_cache = None;
             let mut clifford_cache = None;
             let mut recursive_block_cache = None;
+            let mut hyperbolic_foveation_cache = None;
             let (output, activation_input) = match (&layer.kind, params) {
+                (
+                    LayerKind::HyperbolicFoveation(spec),
+                    LayerParams::HyperbolicFoveation(params),
+                ) => {
+                    let (output, cache) = forward_hyperbolic_foveation(
+                        &self.network,
+                        layer,
+                        spec,
+                        params,
+                        input,
+                        current_input,
+                        &layer_outputs,
+                    )?;
+                    hyperbolic_foveation_cache = Some(cache);
+                    (output, None)
+                }
                 (LayerKind::RecursiveBlock(spec), LayerParams::RecursiveBlock(params)) => {
                     let (output, cache) = forward_recursive_block(
                         &self.network,
@@ -3051,6 +3135,7 @@ impl ExecutableNetwork {
             wmhf_caches.push(wmhf_cache);
             clifford_caches.push(clifford_cache);
             recursive_block_caches.push(recursive_block_cache);
+            hyperbolic_foveation_caches.push(hyperbolic_foveation_cache);
             vit_caches.push(vit_cache);
             swin_caches.push(swin_cache);
             tucker_attention_caches.push(tucker_attention_cache);
@@ -3073,6 +3158,7 @@ impl ExecutableNetwork {
             wmhf_caches,
             clifford_caches,
             recursive_block_caches,
+            hyperbolic_foveation_caches,
             vit_caches,
             swin_caches,
             tucker_attention_caches,
@@ -3119,6 +3205,7 @@ impl ExecutableNetwork {
             input,
             forward,
             layer_output_gradient_seeds,
+            None,
             &mut attention_backward,
         )
     }
@@ -3129,6 +3216,7 @@ impl ExecutableNetwork {
         input: &Tensor,
         forward: &ForwardResult,
         layer_output_gradient_seeds: &[Option<Tensor>],
+        hf_auxiliary_param_gradients: Option<&[Option<Vec<f32>>]>,
         attention_backward: &mut F,
     ) -> Result<BackwardResult>
     where
@@ -3261,6 +3349,11 @@ impl ExecutableNetwork {
             .iter()
             .map(default_layer_params)
             .collect::<Vec<_>>();
+        for gradient in &mut param_gradients {
+            if let LayerParams::HyperbolicFoveation(gradient) = gradient {
+                gradient.hf_params.fill(0.0);
+            }
+        }
         for (layer, seed) in self.network.layers.iter().zip(layer_output_gradient_seeds) {
             if let Some(seed) = seed {
                 if seed.shape != layer.output_shape {
@@ -3290,6 +3383,73 @@ impl ExecutableNetwork {
             };
 
             match (&layer.kind, params) {
+                (
+                    LayerKind::HyperbolicFoveation(spec),
+                    LayerParams::HyperbolicFoveation(params),
+                ) => {
+                    let cache = forward
+                        .hyperbolic_foveation_caches
+                        .get(layer.index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing [hyperbolic_foveation] forward cache for layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let warp_input = match spec.warp_source {
+                        crate::model::HfWarpSource::Previous => current_input,
+                        crate::model::HfWarpSource::NetworkInput => input,
+                    };
+                    let auxiliary_gradient = hf_auxiliary_param_gradients
+                        .and_then(|gradients| gradients.get(layer.index))
+                        .and_then(Option::as_deref);
+                    let (warp_gradient, predictor_gradient, param_gradient) =
+                        backward_hyperbolic_foveation(
+                            spec,
+                            params,
+                            warp_input,
+                            &grad,
+                            cache,
+                            auxiliary_gradient,
+                        )?;
+                    let Some(slot) = param_gradients.get_mut(layer.index) else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing [hyperbolic_foveation] parameter-gradient slot for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    *slot = LayerParams::HyperbolicFoveation(param_gradient);
+                    match spec.warp_source {
+                        crate::model::HfWarpSource::Previous => accumulate_previous_gradient(
+                            layer.index,
+                            &warp_gradient,
+                            &mut input_gradient,
+                            &mut layer_output_gradients,
+                        )?,
+                        crate::model::HfWarpSource::NetworkInput => {
+                            accumulate_tensor(&mut input_gradient, &warp_gradient)?
+                        }
+                    }
+                    if let Some((source_layer, source_gradient)) = predictor_gradient {
+                        if let Some(source_layer) = source_layer {
+                            let Some(destination) = layer_output_gradients.get_mut(source_layer)
+                            else {
+                                return Err(Error::InvalidConfig(format!(
+                                    "[hyperbolic_foveation] predictor source layer #{source_layer} is unavailable during backward"
+                                )));
+                            };
+                            accumulate_tensor(destination, &source_gradient)?;
+                        } else {
+                            accumulate_previous_gradient(
+                                layer.index,
+                                &source_gradient,
+                                &mut input_gradient,
+                                &mut layer_output_gradients,
+                            )?;
+                        }
+                    }
+                }
                 (LayerKind::RecursiveBlock(spec), LayerParams::RecursiveBlock(params)) => {
                     let cache = forward
                         .recursive_block_caches
@@ -5174,11 +5334,55 @@ impl ExecutableNetwork {
         )
     }
 
+    /// Accumulate ordinary seeded backward plus source-derived hyperbolic-
+    /// foveation small-box and strength regularizers from the original YOLO labels.
+    pub fn backward_accumulate_seeded_with_hf_auxiliary_gradients(
+        &mut self,
+        input: &Tensor,
+        forward: &ForwardResult,
+        layer_output_gradient_seeds: &[Option<Tensor>],
+        labels: &[Vec<crate::train::YoloLabel>],
+    ) -> Result<BackwardResult> {
+        let auxiliary_gradients =
+            hyperbolic_foveation_auxiliary_param_gradients(&self.network, forward, labels)?;
+        self.backward_accumulate_seeded_with_attention_and_hf_auxiliary(
+            input,
+            forward,
+            layer_output_gradient_seeds,
+            Some(&auxiliary_gradients),
+            |d_context, _, attention| crate::vit::attention_backward(d_context, attention),
+        )
+    }
+
     pub(crate) fn backward_accumulate_seeded_with_attention<F>(
         &mut self,
         input: &Tensor,
         forward: &ForwardResult,
         layer_output_gradient_seeds: &[Option<Tensor>],
+        attention_backward: F,
+    ) -> Result<BackwardResult>
+    where
+        F: FnMut(
+            &[f32],
+            &[f32],
+            &crate::vit::AttentionCache,
+        ) -> std::result::Result<Vec<f32>, String>,
+    {
+        self.backward_accumulate_seeded_with_attention_and_hf_auxiliary(
+            input,
+            forward,
+            layer_output_gradient_seeds,
+            None,
+            attention_backward,
+        )
+    }
+
+    fn backward_accumulate_seeded_with_attention_and_hf_auxiliary<F>(
+        &mut self,
+        input: &Tensor,
+        forward: &ForwardResult,
+        layer_output_gradient_seeds: &[Option<Tensor>],
+        hf_auxiliary_param_gradients: Option<&[Option<Vec<f32>>]>,
         mut attention_backward: F,
     ) -> Result<BackwardResult>
     where
@@ -5196,9 +5400,11 @@ impl ExecutableNetwork {
             input,
             forward,
             layer_output_gradient_seeds,
+            hf_auxiliary_param_gradients,
             &mut attention_backward,
-        )?;
+        );
         self.workspace = ws;
+        let result = result?;
         self.update_convolution_batch_norm_running_stats(input, forward)?;
         self.accumulate_train_buffers(&result.param_gradients)?;
         Ok(result)
@@ -5588,6 +5794,21 @@ impl ExecutableNetwork {
                         )));
                     };
                     accumulate_recursive_block_train_buffers(spec, train, gradient)?;
+                }
+                (LayerKind::HyperbolicFoveation(_), LayerParams::HyperbolicFoveation(gradient)) => {
+                    let Some(LayerTrainBuffers::HyperbolicFoveation(train)) =
+                        self.train_buffers.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing hyperbolic-foveation train buffers for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    accumulate_vec(&mut train.hf_param_updates, &gradient.hf_params)?;
+                    accumulate_vec(&mut train.pred_w1_updates, &gradient.pred_w1)?;
+                    accumulate_vec(&mut train.pred_b1_updates, &gradient.pred_b1)?;
+                    accumulate_vec(&mut train.pred_w2_updates, &gradient.pred_w2)?;
+                    accumulate_vec(&mut train.pred_b2_updates, &gradient.pred_b2)?;
                 }
                 (LayerKind::BatchNorm(_), LayerParams::BatchNorm(gradient)) => {
                     let Some(LayerTrainBuffers::BatchNorm(train)) =
@@ -6796,6 +7017,16 @@ fn host_adam_scalar_capacity(params: &LayerParams) -> usize {
                     .map(host_adam_scalar_capacity)
                     .sum::<usize>()
         }
+        LayerParams::HyperbolicFoveation(params) => {
+            if params.pred_b1.is_empty() {
+                params.hf_params.len()
+            } else {
+                params.pred_w1.len()
+                    + params.pred_b1.len()
+                    + params.pred_w2.len()
+                    + params.pred_b2.len()
+            }
+        }
         LayerParams::BatchNorm(params) => params.scales.len() + params.biases.len(),
         LayerParams::Convolutional(params) => convolutional_parameter_count(params),
         LayerParams::Connected(params) => connected_parameter_count(params),
@@ -7013,6 +7244,93 @@ fn validate_recursive_body_adam_state(
             layer.kind.name()
         ))),
     }
+}
+
+fn validate_hyperbolic_foveation_adam_slot(
+    name: &str,
+    moments: &Option<(Vec<f32>, Vec<f32>)>,
+    expected_len: usize,
+) -> Result<()> {
+    match moments {
+        Some((first, second)) if first.len() == expected_len && second.len() == expected_len => {
+            Ok(())
+        }
+        Some((first, second)) => Err(Error::Weights(format!(
+            "hyperbolic-foveation Adam {name} moments have lengths {}/{}, expected {expected_len}",
+            first.len(),
+            second.len()
+        ))),
+        None if expected_len == 0 => Ok(()),
+        None => Err(Error::Weights(format!(
+            "hyperbolic-foveation Adam {name} moments are missing (expected {expected_len})"
+        ))),
+    }
+}
+
+fn validate_hyperbolic_foveation_adam_state(
+    layer: &crate::model::Layer,
+    params: &LayerParams,
+    state: &HostAdamLayerState,
+) -> Result<()> {
+    let (LayerKind::HyperbolicFoveation(spec), LayerParams::HyperbolicFoveation(params)) =
+        (&layer.kind, params)
+    else {
+        return Err(Error::Weights(
+            "hyperbolic-foveation Adam state does not match layer parameters".to_owned(),
+        ));
+    };
+    validate_hyperbolic_foveation_param_layout(spec, params)
+        .map_err(|error| Error::Weights(error.to_string()))?;
+    if spec.pred_hidden == 0 {
+        validate_hyperbolic_foveation_adam_slot("weight", &state.weights, 0)?;
+        validate_hyperbolic_foveation_adam_slot(
+            "global parameter",
+            &state.biases,
+            params.hf_params.len(),
+        )?;
+        validate_hyperbolic_foveation_adam_slot("scale", &state.scales, 0)?;
+        if !state.children.is_empty() {
+            return Err(Error::Weights(
+                "hyperbolic-foveation Adam state has unexpected predictor children".to_owned(),
+            ));
+        }
+    } else {
+        validate_hyperbolic_foveation_adam_slot("weight", &state.weights, 0)?;
+        validate_hyperbolic_foveation_adam_slot("bias", &state.biases, 0)?;
+        validate_hyperbolic_foveation_adam_slot("scale", &state.scales, 0)?;
+        if state.children.len() != 2 {
+            return Err(Error::Weights(format!(
+                "hyperbolic-foveation Adam predictor has {} states, expected 2",
+                state.children.len()
+            )));
+        }
+        for (index, child) in state.children.iter().enumerate() {
+            if !child.children.is_empty() || child.scales.is_some() {
+                return Err(Error::Weights(format!(
+                    "hyperbolic-foveation Adam predictor child {index} has unexpected nested state"
+                )));
+            }
+            validate_hyperbolic_foveation_adam_slot(
+                "predictor matrix",
+                &child.weights,
+                if index == 0 {
+                    params.pred_w1.len()
+                } else {
+                    params.pred_w2.len()
+                },
+            )?;
+            validate_hyperbolic_foveation_adam_slot(
+                "predictor bias",
+                &child.biases,
+                if index == 0 {
+                    params.pred_b1.len()
+                } else {
+                    params.pred_b2.len()
+                },
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_recursive_block_adam_state(
@@ -7495,6 +7813,7 @@ where
     /// Darknet), upsample (also `reverse`) and yolo-style pass-through layers;
     /// any other layer returns `UnsupportedLayer` (use `forward_compact`).
     pub fn forward_compact_f16(&self, input: &Tensor) -> Result<GpuForwardSummary> {
+        reject_gpu_hyperbolic_foveation(&self.network, "f16 inference")?;
         let expected = self.network.net.input_shape();
         if input.shape != expected {
             return Err(Error::InvalidConfig(format!(
@@ -9038,6 +9357,7 @@ where
         batch: usize,
         sync_host_weights: bool,
     ) -> Result<()> {
+        reject_gpu_hyperbolic_foveation(&self.network, "optimizer updates")?;
         if self.network.net.muon {
             return Err(Error::InvalidConfig(
                 "[net] muon=1 GPU optimizer updates are not implemented in the Stage-1 CPU Muon port"
@@ -10463,6 +10783,7 @@ where
         training: bool,
         host_copies: bool,
     ) -> Result<GpuForwardState<B::Tensor>> {
+        reject_gpu_hyperbolic_foveation(&self.network, "execution")?;
         let has_batch_normalized_recurrent = self.network.layers.iter().any(|layer| {
             matches!(&layer.kind, LayerKind::Rnn(spec) if spec.batch_normalize)
                 || matches!(&layer.kind, LayerKind::Lstm(spec) if spec.batch_normalize)
@@ -12279,6 +12600,7 @@ where
                 wmhf_caches: vec![None; self.network.layers.len()],
                 clifford_caches: vec![None; self.network.layers.len()],
                 recursive_block_caches: vec![None; self.network.layers.len()],
+                hyperbolic_foveation_caches: vec![None; self.network.layers.len()],
                 vit_caches,
                 swin_caches,
                 tucker_attention_caches,
@@ -12292,6 +12614,7 @@ where
     }
 
     pub fn forward_compact(&self, input: &Tensor) -> Result<GpuForwardSummary> {
+        reject_gpu_hyperbolic_foveation(&self.network, "compact inference")?;
         if let Some(layer) = self
             .network
             .layers
@@ -12913,6 +13236,7 @@ where
         forward: &GpuForwardState<B::Tensor>,
         layer_output_gradient_seeds: &[Option<Tensor>],
     ) -> Result<()> {
+        reject_gpu_hyperbolic_foveation(&self.network, "backward and updates")?;
         let loss_scale = self.network.net.loss_scale;
         if loss_scale == 1.0 || !(loss_scale > 0.0 && loss_scale.is_finite()) {
             return self.backward_accumulate_gpu_unscaled(forward, layer_output_gradient_seeds);
@@ -16979,6 +17303,30 @@ fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
                 controller_biases: vec![0.0; controller_outputs],
             })
         }
+        LayerKind::HyperbolicFoveation(spec) => {
+            let param_count = spec.param_count();
+            let mut hf_params = vec![0.0; param_count];
+            hf_params[0] = spec.init_cx;
+            hf_params[1] = spec.init_cy;
+            match spec.radius_mode {
+                crate::model::HfRadiusMode::Isotropic => hf_params[2] = spec.init_radius,
+                crate::model::HfRadiusMode::Anisotropic => {
+                    hf_params[2] = spec.init_radius_x;
+                    hf_params[3] = spec.init_radius_y;
+                }
+            }
+            hf_params[param_count - 1] = spec.init_strength;
+            let input_dim = spec
+                .predictor_input_dim()
+                .expect("validated hyperbolic-foveation predictor dimensions");
+            LayerParams::HyperbolicFoveation(HyperbolicFoveationParams {
+                hf_params,
+                pred_w1: vec![0.0; spec.pred_hidden * input_dim],
+                pred_b1: vec![0.0; spec.pred_hidden],
+                pred_w2: vec![0.0; param_count * spec.pred_hidden],
+                pred_b2: hyperbolic_foveation_predictor_initial_biases(spec),
+            })
+        }
         LayerKind::BatchNorm(_) => {
             LayerParams::BatchNorm(default_batchnorm_params(layer.input_shape.channels))
         }
@@ -17202,6 +17550,19 @@ fn default_layer_train_buffers(layer: &crate::model::Layer) -> LayerTrainBuffers
                 controller_bias_updates: vec![0.0; controller_outputs],
             })
         }
+        LayerKind::HyperbolicFoveation(spec) => {
+            let param_count = spec.param_count();
+            let input_dim = spec
+                .predictor_input_dim()
+                .expect("validated hyperbolic-foveation predictor dimensions");
+            LayerTrainBuffers::HyperbolicFoveation(HyperbolicFoveationTrainBuffers {
+                hf_param_updates: vec![0.0; param_count],
+                pred_w1_updates: vec![0.0; spec.pred_hidden * input_dim],
+                pred_b1_updates: vec![0.0; spec.pred_hidden],
+                pred_w2_updates: vec![0.0; param_count * spec.pred_hidden],
+                pred_b2_updates: vec![0.0; if spec.pred_hidden > 0 { param_count } else { 0 }],
+            })
+        }
         LayerKind::BatchNorm(_) => LayerTrainBuffers::BatchNorm(default_batchnorm_train_buffers(
             layer.input_shape.channels,
         )),
@@ -17404,6 +17765,514 @@ fn default_layer_train_buffers(layer: &crate::model::Layer) -> LayerTrainBuffers
         }
         _ => LayerTrainBuffers::None,
     }
+}
+
+pub(crate) fn hyperbolic_foveation_predictor_initial_biases(
+    spec: &crate::model::HyperbolicFoveationSpec,
+) -> Vec<f32> {
+    if spec.pred_hidden == 0 {
+        return Vec::new();
+    }
+    let param_count = spec.param_count();
+    let mut biases = vec![0.0; param_count];
+    let center_logit = |center: f32| (center.clamp(-0.899, 0.899) / 0.9).atanh();
+    biases[0] = center_logit(spec.init_cx);
+    biases[1] = center_logit(spec.init_cy);
+    let inverse_softplus = |value: f32| {
+        let safe = value.max(1.0e-6);
+        if safe > 20.0 {
+            safe
+        } else {
+            safe.exp_m1().ln()
+        }
+    };
+    let radius_x = spec.init_radius_x.clamp(0.1, 2.0);
+    biases[2] = inverse_softplus((radius_x - 0.1) * 0.5);
+    if spec.radius_mode == crate::model::HfRadiusMode::Anisotropic {
+        let radius_y = spec.init_radius_y.clamp(0.1, 2.0);
+        biases[3] = inverse_softplus((radius_y - 0.1) * 0.5);
+    }
+    let strength = spec.init_strength.clamp(1.0e-4, 1.0 - 1.0e-4);
+    biases[param_count - 1] = (strength / (1.0 - strength)).ln();
+    biases
+}
+
+fn clamp_hyperbolic_foveation_params(
+    spec: &crate::model::HyperbolicFoveationSpec,
+    params: &mut HyperbolicFoveationParams,
+) {
+    params.hf_params[0] = params.hf_params[0].clamp(-0.9, 0.9);
+    params.hf_params[1] = params.hf_params[1].clamp(-0.9, 0.9);
+    match spec.radius_mode {
+        crate::model::HfRadiusMode::Isotropic => {
+            params.hf_params[2] = params.hf_params[2].clamp(0.1, 2.0);
+        }
+        crate::model::HfRadiusMode::Anisotropic => {
+            params.hf_params[2] = params.hf_params[2].clamp(0.1, 2.0);
+            params.hf_params[3] = params.hf_params[3].clamp(0.1, 2.0);
+        }
+    }
+    let strength = params.hf_params.len() - 1;
+    params.hf_params[strength] = params.hf_params[strength].clamp(0.0, 1.0);
+}
+
+pub(crate) fn validate_hyperbolic_foveation_param_layout(
+    spec: &crate::model::HyperbolicFoveationSpec,
+    params: &HyperbolicFoveationParams,
+) -> Result<()> {
+    let input_dim = spec.predictor_input_dim().ok_or_else(|| {
+        Error::InvalidConfig(
+            "[hyperbolic_foveation] predictor input dimension overflows".to_owned(),
+        )
+    })?;
+    let expected = [
+        spec.param_count(),
+        spec.pred_hidden.saturating_mul(input_dim),
+        spec.pred_hidden,
+        spec.param_count().saturating_mul(spec.pred_hidden),
+        if spec.pred_hidden > 0 {
+            spec.param_count()
+        } else {
+            0
+        },
+    ];
+    let actual = [
+        params.hf_params.len(),
+        params.pred_w1.len(),
+        params.pred_b1.len(),
+        params.pred_w2.len(),
+        params.pred_b2.len(),
+    ];
+    if actual != expected {
+        return Err(Error::InvalidConfig(format!(
+            "[hyperbolic_foveation] parameter layout mismatch: expected {expected:?}, got {actual:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn hyperbolic_foveation_params_from_values(
+    values: &[f32],
+    spec: &crate::model::HyperbolicFoveationSpec,
+) -> Result<crate::hyperbolic_foveation::HfParams> {
+    if values.len() != spec.param_count() || values.iter().any(|value| !value.is_finite()) {
+        return Err(Error::InvalidConfig(format!(
+            "[hyperbolic_foveation] expected {} finite parameters, got {}",
+            spec.param_count(),
+            values.len()
+        )));
+    }
+    let (radius_x, radius_y, strength_index) = match spec.radius_mode {
+        crate::model::HfRadiusMode::Isotropic => (values[2], values[2], 3),
+        crate::model::HfRadiusMode::Anisotropic => (values[2], values[3], 4),
+    };
+    Ok(crate::hyperbolic_foveation::HfParams {
+        center_x: values[0].clamp(-0.9, 0.9),
+        center_y: values[1].clamp(-0.9, 0.9),
+        radius_x: radius_x.clamp(0.1, 2.0),
+        radius_y: radius_y.clamp(0.1, 2.0),
+        strength: values[strength_index].clamp(0.0, 1.0),
+        alpha: spec.alpha,
+        p_exp: spec.p_exp,
+        radius_mode: spec.radius_mode,
+    })
+}
+
+fn hyperbolic_foveation_auxiliary_param_gradients(
+    network: &Network,
+    forward: &ForwardResult,
+    labels: &[Vec<crate::train::YoloLabel>],
+) -> Result<Vec<Option<Vec<f32>>>> {
+    let batch = network.net.batch.max(1);
+    if labels.len() != batch {
+        return Err(Error::InvalidConfig(format!(
+            "[hyperbolic_foveation] auxiliary label batch mismatch: expected {batch}, got {}",
+            labels.len()
+        )));
+    }
+    let has_truth_layer = network.layers.iter().any(|layer| {
+        matches!(
+            layer.kind,
+            LayerKind::Yolo(_) | LayerKind::GaussianYolo(_) | LayerKind::ObbYolo(_)
+        )
+    });
+    let mut gradients = vec![None; network.layers.len()];
+    for layer in &network.layers {
+        let LayerKind::HyperbolicFoveation(spec) = &layer.kind else {
+            continue;
+        };
+        if spec.tiny_center_loss == 0.0
+            && spec.tiny_radius_loss == 0.0
+            && spec.tiny_strength_loss == 0.0
+            && spec.strength_zero_loss == 0.0
+        {
+            continue;
+        }
+        let count = spec.param_count();
+        let cache = forward
+            .hyperbolic_foveation_caches
+            .get(layer.index)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "missing [hyperbolic_foveation] auxiliary cache for layer #{}",
+                    layer.index
+                ))
+            })?;
+        if cache.params_per_batch.len() != batch * count {
+            return Err(Error::InvalidConfig(format!(
+                "[hyperbolic_foveation] layer #{} auxiliary parameter count mismatch",
+                layer.index
+            )));
+        }
+
+        let mut targets = vec![None; batch];
+        if has_truth_layer && spec.small_box_px > 0.0 && spec.small_box_strength > 0.0 {
+            for (batch_index, batch_labels) in labels.iter().enumerate() {
+                if batch_labels.iter().any(|label| {
+                    !label.x.is_finite()
+                        || !label.y.is_finite()
+                        || !label.w.is_finite()
+                        || !label.h.is_finite()
+                }) {
+                    return Err(Error::InvalidConfig(format!(
+                        "[hyperbolic_foveation] layer #{} received non-finite labels",
+                        layer.index
+                    )));
+                }
+                let tiny = batch_labels
+                    .iter()
+                    .filter(|label| {
+                        label.w * layer.output_shape.width as f32 > 0.0
+                            && label.h * layer.output_shape.height as f32 > 0.0
+                            && label.w * (layer.output_shape.width as f32) < spec.small_box_px
+                            && label.h * (layer.output_shape.height as f32) < spec.small_box_px
+                    })
+                    .collect::<Vec<_>>();
+                if tiny.is_empty() {
+                    continue;
+                }
+                let mut total_weight = 0.0f32;
+                let mut target_x = 0.0f32;
+                let mut target_y = 0.0f32;
+                for label in &tiny {
+                    let width = label.w * layer.output_shape.width as f32;
+                    let height = label.h * layer.output_shape.height as f32;
+                    let weight = 1.0 / (width * height).max(1.0);
+                    target_x += weight * (2.0 * label.x - 1.0);
+                    target_y += weight * (2.0 * label.y - 1.0);
+                    total_weight += weight;
+                }
+                if !total_weight.is_finite() || total_weight <= 0.0 {
+                    return Err(Error::InvalidConfig(format!(
+                        "[hyperbolic_foveation] layer #{} tiny-box target has invalid total weight",
+                        layer.index
+                    )));
+                }
+                target_x /= total_weight;
+                target_y /= total_weight;
+                let mut target_radius = 0.25f32;
+                for label in &tiny {
+                    let dx = 2.0 * label.x - 1.0 - target_x;
+                    let dy = 2.0 * label.y - 1.0 - target_y;
+                    target_radius = target_radius
+                        .max((dx * dx + dy * dy).sqrt() + 2.0 * label.w.max(label.h) + 0.15);
+                }
+                let mut target = vec![0.0; count];
+                target[0] = target_x.clamp(-0.9, 0.9);
+                target[1] = target_y.clamp(-0.9, 0.9);
+                target[2] = target_radius.clamp(0.1, 2.0);
+                if spec.radius_mode == crate::model::HfRadiusMode::Anisotropic {
+                    target[3] = target[2];
+                }
+                target[count - 1] = spec.small_box_strength.clamp(0.0, 1.0);
+                targets[batch_index] = Some(target);
+            }
+        }
+        let tiny_image_count = targets.iter().filter(|target| target.is_some()).count();
+        let mut auxiliary = vec![0.0; batch * count];
+        for batch_index in 0..batch {
+            let start = batch_index * count;
+            let current = &cache.params_per_batch[start..start + count];
+            if let Some(target) = &targets[batch_index] {
+                let norm = 1.0 / tiny_image_count as f32;
+                auxiliary[start] += norm * spec.tiny_center_loss * (current[0] - target[0]);
+                auxiliary[start + 1] += norm * spec.tiny_center_loss * (current[1] - target[1]);
+                auxiliary[start + 2] += norm * spec.tiny_radius_loss * (current[2] - target[2]);
+                if spec.radius_mode == crate::model::HfRadiusMode::Anisotropic {
+                    auxiliary[start + 3] += norm * spec.tiny_radius_loss * (current[3] - target[3]);
+                }
+                auxiliary[start + count - 1] +=
+                    norm * spec.tiny_strength_loss * (current[count - 1] - target[count - 1]);
+            }
+            if spec.strength_zero_loss > 0.0 && current[count - 1] > 0.0 {
+                auxiliary[start + count - 1] += spec.strength_zero_loss;
+            }
+        }
+        if auxiliary.iter().any(|value| *value != 0.0) {
+            gradients[layer.index] = Some(auxiliary);
+        }
+    }
+    Ok(gradients)
+}
+
+fn forward_hyperbolic_foveation(
+    network: &Network,
+    layer: &crate::model::Layer,
+    spec: &crate::model::HyperbolicFoveationSpec,
+    params: &HyperbolicFoveationParams,
+    network_input: &Tensor,
+    current_input: &Tensor,
+    layer_outputs: &[Tensor],
+) -> Result<(Tensor, HyperbolicFoveationForwardCache)> {
+    validate_hyperbolic_foveation_param_layout(spec, params)?;
+    let warp_input = match spec.warp_source {
+        crate::model::HfWarpSource::Previous => current_input,
+        crate::model::HfWarpSource::NetworkInput => network_input,
+    };
+    if warp_input.shape != layer.output_shape {
+        return Err(Error::InvalidConfig(format!(
+            "[hyperbolic_foveation] warp source shape mismatch: expected {}, got {}",
+            layer.output_shape, warp_input.shape
+        )));
+    }
+    let predictor_source = match spec.pred_source_layer {
+        Some(index) => layer_outputs.get(index).ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "[hyperbolic_foveation] predictor source layer #{index} is unavailable"
+            ))
+        })?,
+        None => current_input,
+    };
+    if predictor_source.shape != spec.pred_input_shape {
+        return Err(Error::InvalidConfig(format!(
+            "[hyperbolic_foveation] predictor source shape mismatch: expected {}, got {}",
+            spec.pred_input_shape, predictor_source.shape
+        )));
+    }
+
+    let predictor = if spec.pred_hidden > 0 {
+        Some(crate::hyperbolic_foveation::predictor_forward_nchw(
+            &predictor_source.data,
+            predictor_source.shape.batch,
+            predictor_source.shape.channels,
+            predictor_source.shape.height,
+            predictor_source.shape.width,
+            spec.downsample,
+            spec.pred_hidden,
+            spec.param_count(),
+            &params.pred_w1,
+            &params.pred_b1,
+            &params.pred_w2,
+            &params.pred_b2,
+        )?)
+    } else {
+        None
+    };
+    let mut params_per_batch = if let Some(predictor) = &predictor {
+        predictor.constrained_params.clone()
+    } else {
+        let mut values = Vec::with_capacity(warp_input.shape.batch * spec.param_count());
+        for _ in 0..warp_input.shape.batch {
+            values.extend_from_slice(&params.hf_params);
+        }
+        values
+    };
+    if params_per_batch.len() != warp_input.shape.batch * spec.param_count() {
+        return Err(Error::InvalidConfig(
+            "[hyperbolic_foveation] per-batch parameter count mismatch".to_owned(),
+        ));
+    }
+    let params_for_grid = params_per_batch
+        .chunks_exact(spec.param_count())
+        .map(|values| hyperbolic_foveation_params_from_values(values, spec))
+        .collect::<Result<Vec<_>>>()?;
+    let grid = crate::hyperbolic_foveation::sampling_grid_nchw(
+        &params_for_grid,
+        warp_input.shape.batch,
+        warp_input.shape.height,
+        warp_input.shape.width,
+        spec.inverse_method,
+        spec.nr_iters,
+        spec.nr_eta,
+    )?;
+    let output_data = crate::hyperbolic_foveation::warp_nchw(
+        &warp_input.data,
+        warp_input.shape.batch,
+        warp_input.shape.channels,
+        warp_input.shape.height,
+        warp_input.shape.width,
+        &grid,
+    )?;
+    let output = Tensor::from_data(layer.output_shape, output_data)?;
+    if network.layers.get(layer.index).is_none() {
+        return Err(Error::InvalidConfig(format!(
+            "[hyperbolic_foveation] layer #{} is not part of its network",
+            layer.index
+        )));
+    }
+    Ok((
+        output,
+        HyperbolicFoveationForwardCache {
+            grid,
+            params_per_batch: std::mem::take(&mut params_per_batch),
+            predictor,
+        },
+    ))
+}
+
+fn backward_hyperbolic_foveation(
+    spec: &crate::model::HyperbolicFoveationSpec,
+    params: &HyperbolicFoveationParams,
+    warp_input: &Tensor,
+    output_gradient: &Tensor,
+    cache: &HyperbolicFoveationForwardCache,
+    auxiliary_param_gradients: Option<&[f32]>,
+) -> Result<(
+    Tensor,
+    Option<(Option<usize>, Tensor)>,
+    HyperbolicFoveationParams,
+)> {
+    validate_hyperbolic_foveation_param_layout(spec, params)?;
+    if output_gradient.shape != warp_input.shape {
+        return Err(Error::InvalidConfig(format!(
+            "[hyperbolic_foveation] output gradient shape {} does not match warp source {}",
+            output_gradient.shape, warp_input.shape
+        )));
+    }
+    let per_batch = spec.param_count();
+    if cache.params_per_batch.len() != warp_input.shape.batch * per_batch {
+        return Err(Error::InvalidConfig(
+            "[hyperbolic_foveation] cached per-batch parameter layout mismatch".to_owned(),
+        ));
+    }
+    if auxiliary_param_gradients
+        .is_some_and(|gradients| gradients.len() != warp_input.shape.batch * per_batch)
+    {
+        return Err(Error::InvalidConfig(
+            "[hyperbolic_foveation] auxiliary parameter-gradient layout mismatch".to_owned(),
+        ));
+    }
+    let params_for_grid = cache
+        .params_per_batch
+        .chunks_exact(per_batch)
+        .map(|values| hyperbolic_foveation_params_from_values(values, spec))
+        .collect::<Result<Vec<_>>>()?;
+    let (warp_grad, semantic_gradients) =
+        crate::hyperbolic_foveation::warp_backward_with_param_gradients(
+            &warp_input.data,
+            &output_gradient.data,
+            warp_input.shape.batch,
+            warp_input.shape.channels,
+            warp_input.shape.height,
+            warp_input.shape.width,
+            &cache.grid,
+            &params_for_grid,
+            spec.inverse_method,
+            spec.nr_iters,
+            spec.nr_eta,
+        )?;
+    let warp_input_gradient = Tensor::from_data(warp_input.shape, warp_grad.input)?;
+    let mut gradient = HyperbolicFoveationParams {
+        hf_params: vec![0.0; per_batch],
+        pred_w1: vec![0.0; params.pred_w1.len()],
+        pred_b1: vec![0.0; params.pred_b1.len()],
+        pred_w2: vec![0.0; params.pred_w2.len()],
+        pred_b2: vec![0.0; params.pred_b2.len()],
+    };
+    let predictor_gradient = if spec.pred_hidden > 0 {
+        let predictor = cache.predictor.as_ref().ok_or_else(|| {
+            Error::InvalidConfig(
+                "[hyperbolic_foveation] missing predictor forward cache".to_owned(),
+            )
+        })?;
+        let mut constrained_seed = vec![0.0; warp_input.shape.batch * per_batch];
+        for (batch_index, semantic) in semantic_gradients.iter().enumerate() {
+            let start = batch_index * per_batch;
+            constrained_seed[start] = semantic[0];
+            constrained_seed[start + 1] = semantic[1];
+            constrained_seed[start + 2] = semantic[2];
+            match spec.radius_mode {
+                crate::model::HfRadiusMode::Isotropic => {
+                    constrained_seed[start + 3] = semantic[4];
+                }
+                crate::model::HfRadiusMode::Anisotropic => {
+                    constrained_seed[start + 3] = semantic[3];
+                    constrained_seed[start + 4] = semantic[4];
+                }
+            }
+            if let Some(auxiliary) = auxiliary_param_gradients {
+                let extra = &auxiliary[start..start + per_batch];
+                constrained_seed[start] += extra[0];
+                constrained_seed[start + 1] += extra[1];
+                constrained_seed[start + 2] += extra[2];
+                if spec.radius_mode == crate::model::HfRadiusMode::Anisotropic {
+                    constrained_seed[start + 3] += extra[3];
+                }
+                constrained_seed[start + per_batch - 1] += extra[per_batch - 1];
+            }
+        }
+        let predictor_source_gradient = crate::hyperbolic_foveation::predictor_backward_nchw(
+            (
+                spec.pred_input_shape.batch,
+                spec.pred_input_shape.channels,
+                spec.pred_input_shape.height,
+                spec.pred_input_shape.width,
+            ),
+            spec.downsample,
+            spec.pred_hidden,
+            per_batch,
+            &params.pred_w1,
+            &params.pred_w2,
+            predictor,
+            &constrained_seed,
+        )?;
+        gradient.pred_w1 = predictor_source_gradient.w1;
+        gradient.pred_b1 = predictor_source_gradient.b1;
+        gradient.pred_w2 = predictor_source_gradient.w2;
+        gradient.pred_b2 = predictor_source_gradient.b2;
+        Some((
+            spec.pred_source_layer,
+            Tensor::from_data(spec.pred_input_shape, predictor_source_gradient.source)?,
+        ))
+    } else {
+        if cache.predictor.is_some() {
+            return Err(Error::InvalidConfig(
+                "[hyperbolic_foveation] unexpected predictor forward cache".to_owned(),
+            ));
+        }
+        for semantic in &semantic_gradients {
+            if params.hf_params[0] > -0.9 && params.hf_params[0] < 0.9 {
+                gradient.hf_params[0] += semantic[0];
+            }
+            if params.hf_params[1] > -0.9 && params.hf_params[1] < 0.9 {
+                gradient.hf_params[1] += semantic[1];
+            }
+            gradient.hf_params[2] += semantic[2];
+            match spec.radius_mode {
+                crate::model::HfRadiusMode::Isotropic => {
+                    if params.hf_params[3] > 0.0 && params.hf_params[3] < 1.0 {
+                        gradient.hf_params[3] += semantic[4];
+                    }
+                }
+                crate::model::HfRadiusMode::Anisotropic => {
+                    gradient.hf_params[3] += semantic[3];
+                    if params.hf_params[4] > 0.0 && params.hf_params[4] < 1.0 {
+                        gradient.hf_params[4] += semantic[4];
+                    }
+                }
+            }
+        }
+        if let Some(auxiliary) = auxiliary_param_gradients {
+            for values in auxiliary.chunks_exact(per_batch) {
+                for (gradient, extra) in gradient.hf_params.iter_mut().zip(values) {
+                    *gradient += extra;
+                }
+            }
+        }
+        None
+    };
+    Ok((warp_input_gradient, predictor_gradient, gradient))
 }
 
 /// `[moe_convolutional]`'s parameters: one ordinary convolution per expert plus
@@ -18718,6 +19587,54 @@ fn apply_host_adam_layer(
     adam: &AdamParams,
 ) -> Result<()> {
     match (params, train) {
+        (
+            LayerParams::HyperbolicFoveation(params),
+            LayerTrainBuffers::HyperbolicFoveation(train),
+        ) => {
+            let LayerKind::HyperbolicFoveation(spec) = kind else {
+                return Err(Error::InvalidConfig(
+                    "hyperbolic-foveation parameters do not match layer kind during Adam update"
+                        .to_owned(),
+                ));
+            };
+            validate_hyperbolic_foveation_param_layout(spec, params)?;
+            if spec.pred_hidden > 0 {
+                let first = host_adam_child(state, 0);
+                apply_host_adam(
+                    &mut params.pred_w1,
+                    &mut train.pred_w1_updates,
+                    &mut first.weights,
+                    adam,
+                )?;
+                apply_host_adam_non_weight(
+                    &mut params.pred_b1,
+                    &mut train.pred_b1_updates,
+                    &mut first.biases,
+                    adam,
+                )?;
+                let second = host_adam_child(state, 1);
+                apply_host_adam(
+                    &mut params.pred_w2,
+                    &mut train.pred_w2_updates,
+                    &mut second.weights,
+                    adam,
+                )?;
+                apply_host_adam_non_weight(
+                    &mut params.pred_b2,
+                    &mut train.pred_b2_updates,
+                    &mut second.biases,
+                    adam,
+                )?;
+            } else {
+                apply_host_adam_non_weight(
+                    &mut params.hf_params,
+                    &mut train.hf_param_updates,
+                    &mut state.biases,
+                    adam,
+                )?;
+            }
+            clamp_hyperbolic_foveation_params(spec, params);
+        }
         (LayerParams::RecursiveBlock(params), LayerTrainBuffers::RecursiveBlock(train)) => {
             let LayerKind::RecursiveBlock(spec) = kind else {
                 return Err(Error::InvalidConfig(
@@ -19427,6 +20344,62 @@ fn update_clifford_params(
     }
 }
 
+fn update_hyperbolic_foveation_sgd(
+    spec: &crate::model::HyperbolicFoveationSpec,
+    params: &mut HyperbolicFoveationParams,
+    train: &mut HyperbolicFoveationTrainBuffers,
+    lr: f32,
+    momentum: f32,
+    batch: usize,
+) {
+    let lr = lr * spec.hf_lr_mult;
+    if spec.pred_hidden > 0 {
+        train.hf_param_updates.fill(0.0);
+        sgd_update(
+            &mut params.pred_w1,
+            &mut train.pred_w1_updates,
+            lr,
+            momentum,
+            0.0,
+            batch,
+        );
+        sgd_update(
+            &mut params.pred_b1,
+            &mut train.pred_b1_updates,
+            lr,
+            momentum,
+            0.0,
+            batch,
+        );
+        sgd_update(
+            &mut params.pred_w2,
+            &mut train.pred_w2_updates,
+            lr,
+            momentum,
+            0.0,
+            batch,
+        );
+        sgd_update(
+            &mut params.pred_b2,
+            &mut train.pred_b2_updates,
+            lr,
+            momentum,
+            0.0,
+            batch,
+        );
+    } else {
+        sgd_update(
+            &mut params.hf_params,
+            &mut train.hf_param_updates,
+            lr,
+            momentum,
+            0.0,
+            batch,
+        );
+    }
+    clamp_hyperbolic_foveation_params(spec, params);
+}
+
 fn update_recursive_block_sgd(
     spec: &crate::model::RecursiveBlockSpec,
     params: &mut RecursiveBlockParams,
@@ -19833,6 +20806,22 @@ fn load_weights_into_params(
     for (layer, params) in network.layers.iter().zip(params.iter_mut()) {
         match params {
             LayerParams::None => {}
+            LayerParams::HyperbolicFoveation(hf) => {
+                let LayerKind::HyperbolicFoveation(spec) = &layer.kind else {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} hyperbolic-foveation parameters do not match layer kind",
+                        layer.index
+                    )));
+                };
+                validate_hyperbolic_foveation_param_layout(spec, hf)?;
+                read_f32_into(&mut file, &mut hf.hf_params)?;
+                if spec.pred_hidden > 0 {
+                    read_f32_into(&mut file, &mut hf.pred_w1)?;
+                    read_f32_into(&mut file, &mut hf.pred_b1)?;
+                    read_f32_into(&mut file, &mut hf.pred_w2)?;
+                    read_f32_into(&mut file, &mut hf.pred_b2)?;
+                }
+            }
             LayerParams::RecursiveBlock(recursive) => {
                 let LayerKind::RecursiveBlock(spec) = &layer.kind else {
                     return Err(Error::InvalidConfig(format!(
@@ -43631,4 +44620,7 @@ probability=0.5
                 )
         );
     }
+
+    #[path = "hyperbolic_foveation_runtime_tests.rs"]
+    mod hyperbolic_foveation_runtime_tests;
 }
