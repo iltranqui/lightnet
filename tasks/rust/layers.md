@@ -3269,7 +3269,7 @@ Cross-cutting prerequisites: (1) container layers (moe, eml, recursive_block, wm
 
 ## Phase 4 — hyperbolic / depth / LAYA backbone / DETR
 
-- **hyperbolic_foveation** (2659 LOC; L/XL; learnable radial warp, Newton inverse; also touches detect/mAP reprojection) + **foveation_film** (402; M; needs the former; weights `w_embed, b_embed, w_gamma, b_gamma, w_beta, b_beta` `[report]`).
+- **hyperbolic_foveation** (2659 LOC; L/XL; learnable radial warp, Newton inverse; also touches detect/mAP reprojection) is implemented as Stage-1 CPU support in v0.1.008: strict config/source edges, exact finite-iteration backward, source-order weights, label regularizers, SGD/AdamW/Muon persistence, mAP and axis-aligned/OBB/CARPN detection reprojection, and explicit GPU rejection. `hyperbolic_foveation` (30), `runtime` (231), `weights` (47 core + 2 CLI), and `detect` (36 core + 10 CLI) host filters passed. The `Jev_laya` macro is disabled; no compiled-C++ golden/parity is claimed. **foveation_film** (402; M; needs the former; weights `w_embed, b_embed, w_gamma, b_gamma, w_beta, b_beta` `[report]`) remains open.
 - **depth_anything** (1056 + 536; L; frozen DINOv2 ViT-S/14, exact erf GELU, bicubic/bilinear pos-embed interpolation; loader `load_depth_anything_weights` at `weights.cpp:1433`) + **dpt_head** (664 + 309; L; reassemble + fusion neck + depth head) + **yolo_3d** (use the `depth_3d` branch version: 2989 + 470 + 708; XL; projected 8-vertex cuboids; per user memory the depth-focal-loss design is settled in `yolo3d_depth_focal_loss_design`). `tools/depth_anything/README.md` documents the existing Depth-Anything work; read it before porting.
 - **laya_encoder / laya_head** (L): ModernBERT-style encoder (`tok_embed, embed_norm`, per layer `attn_norm (i>0), Wqkv, Wo, mlp_norm, Wi, Wo_mlp`, `final_norm`; RoPE full/local theta; GeGLU) and head (two pre-norm TransformerEncoderLayers with ReLU FFN + `type_emb[3*H]`) `[report]`. Gated by Open Question 2.
 - **detr_decoder** (1428 + 773; XL; Hungarian matching on the host). Last: user memory says DETR is still broken in C++; port only after the C++ reference works.
@@ -3331,7 +3331,7 @@ genuine *evidence* gaps rather than questions for the user:
 | 2C OBB family | - | unblocked by decision 4; XL, and it also changes data loading, NMS and mAP |
 | 3A transformer family | - | unblocked by decisions 3 and 7; needs the shared kernel set (LayerNorm fwd/bwd, batched GEMM, row-softmax backward, residual/bias epilogues) built once first |
 | 3B conv family | - | Bounded Stage-1 CPU ports integrated: DCNv1/2 reference v0.1.001; single-template DSConv v0.1.002 (multi-template `morph=0/1` remains open); graph-conv v0.1.003; WMHF v0.1.004; CPU Muon v0.1.005; Clifford v0.1.006; recursive_block v0.1.007. `deform_conv` and `dcnv4` remain host fallback pending Stage-2 native GPU. No compiled-C++ golden/parity is claimed for source-derived ports; native GPU and GPU Muon remain Stage 2. |
-| 4 foveation / depth / LAYA / DETR | - | unblocked by decision 2; DETR is still broken in C++, so its reference is the paper, like `dcnv3` |
+| 4 foveation / depth / LAYA / DETR | - | Stage-1 CPU `[hyperbolic_foveation]` is complete in v0.1.008; LAYA encoder/head are implemented. `foveation_film`, Depth-Anything/DPT, YOLO-3D, and DETR remain open; DETR is still broken in C++, so its reference is the paper, like `dcnv3`. |
 
 ### Finding: `[dcnv3]` has no reference implementation anywhere in this repo
 

@@ -57,6 +57,7 @@ file is named inline.
 - [22. CPU Muon hybrid optimizer](#22-cpu-muon-hybrid-optimizer)
 - [23. Clifford Stage-1 CPU reference](#23-clifford-stage-1-cpu-reference)
 - [24. Recursive-block Stage-1 CPU reference](#24-recursive-block-stage-1-cpu-reference)
+- [25. Hyperbolic-foveation Stage-1 CPU reference](#25-hyperbolic-foveation-stage-1-cpu-reference)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -814,6 +815,13 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 - C++ `.weights` omits controller weights/biases (and LoRA values), so controller learning is not restored by Darknet checkpoints. Stage-1 rejects `ouroboros=2` and every explicit `lora_*` option. Rust full BPTT and lattice derivatives intentionally differ from C++ truncated k=1 backward and stop-gradient lattice behavior.
 - Verification: `MEM=3G ./tools/test_host.sh recursive_block` passed 11 core tests, `weights` passed 45 core + 2 CLI tests, `runtime` passed 219 core tests, and `MEM=3G cargo check -p darknet-core -j 4` passed. Tests include all-trainable finite differences for static/controller/lattice branches, dropout mask reproducibility/independence, nested BN running stats, exact body-only weight bytes, optimizer state validation, Muon matrix ordering, and GPU rejection. Targeted rustfmt and `git diff --check` passed. No training, Oxide tests, or feature-specific `cfg_corpus` run; the full host baseline/cfg-corpus status remains non-green/unverified under the memory cap (see `STATUS.md`).
 - Evidence boundary: hand-derived from `Jev_laya`; there is no compiled-C++ golden/parity. CPU-only Stage-1 support is complete for this layer; native GPU and GPU Muon remain Stage 2.
+
+## 25. Hyperbolic-foveation Stage-1 CPU reference
+
+- v0.1.008 (`f7b044bc84c6b19ed5b99cc97633fd859724db74`): integrated strict `[hyperbolic_foveation]` / `[hf]` config and shape handling, source-derived NCHW warp and learned predictor, deterministic init, source-order weights, exact finite-iteration inverse derivatives, alternate predictor/network-input fan-in, label-driven tiny-box/strength regularizers, SGD/AdamW/Muon updates and state validation, and axis-aligned/OBB/CARPN detection plus mAP reprojection.
+- Full and compact GPU execution, f16 inference, GPU backward and optimizer updates explicitly reject this Stage-1 CPU-only layer. No CUDA/Oxide fallback or kernel was added.
+- Verification: `MEM=3G ./tools/test_host.sh hyperbolic_foveation` passed 30 core tests; `runtime` passed 231; `weights` passed 47 core + 2 CLI; `detect` passed 36 core + 10 CLI. Targeted Rustfmt and `git diff --check` passed. No training, Oxide tests, or feature-specific `cfg_corpus` run.
+- Evidence boundary: source-derived from `Jev_laya`; its layer macro is disabled and no compiled-C++ golden/parity is available. `foveation_film`, native GPU support, and the other Phase 4 layers remain open.
 
 ## Not implemented / open (pointer)
 
