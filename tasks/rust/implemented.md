@@ -476,6 +476,11 @@ still NOT RUN (no `Jev_laya` build here; `test_data/laya/` has only the shared
   CPU-matched ViT parameter updates after native attention backward dispatch;
   `MEM=3G ./tools/test_host.sh runtime` — 161 runtime tests pass.
   This is Rust backend evidence, not performance or compiled-C++ parity.
+- v0.0.261 (`7ca5a58e`): added source-derived host E4M3 saturating encode/decode
+  and ExpCast modes 0/1/2 as VC-attention groundwork. Four tests cover every
+  finite E4M3 code round trip, special/subnormal/saturation cases, hand-derived
+  ExpCast outputs, and invalid inputs. `MEM=3G ./tools/test_host.sh vc_attention`
+  passed 4 tests. Helpers are not wired into cfg/runtime; no compiled-C++ parity.
 - Earlier focused evidence: full host unit suites pass (`darknet-core` 377,
   `darknet-cli` 18); targeted check/build pass with `-j 4`. The full
   `cfg_corpus` integration run exceeded a 30-minute timeout. C++ dump parity NOT
