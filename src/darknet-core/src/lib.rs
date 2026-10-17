@@ -57,6 +57,7 @@ pub mod model;
 pub mod modern_yolo;
 pub mod names;
 pub mod onnx;
+pub use onnx::{OnnxOptions, export_onnx};
 pub mod obb_geometry;
 pub mod obb_labels;
 pub use obb_labels::{ObbLabel, flip_obb_labels, load_obb_labels, rotate_obb_labels};

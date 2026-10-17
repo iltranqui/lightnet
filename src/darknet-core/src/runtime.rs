@@ -36,7 +36,7 @@ use darknet_cuda::{
     F32TensorOpsBackend, NanInfMode, SgdUpdateItem, dropout_unit,
 };
 
-const BATCH_NORM_EPSILON: f32 = 0.000_01;
+pub(crate) const BATCH_NORM_EPSILON: f32 = 0.000_01;
 /// Rolling-stat EMA keep factor of the GPU batch-statistics training path:
 /// C++ CUDA `scal_ongpu(.99)` + `axpy_ongpu(.01)` / cuDNN factor `.01`.
 const BATCH_NORM_ROLLING_KEEP: f32 = 0.99;
@@ -14086,7 +14086,7 @@ fn resolve_convolutional_params<'a>(
     }
 }
 
-fn fold_convolutional_params_for_inference(
+pub(crate) fn fold_convolutional_params_for_inference(
     spec: &ConvolutionalSpec,
     params: &ConvolutionalParams,
     input_channels: usize,
