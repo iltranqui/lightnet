@@ -189,8 +189,9 @@ Immediately next, in dependency order:
   tests, `runtime` 171, and `weights` 33. Coverage includes input/all-parameter/
   state finite differences, causal convolution, MSA clip derivatives, weight
   initialization/decay, serialization, Adam-state persistence, and FakeBackend
-  parity. No native kernel or compiled-C++ golden. `kimi_kda` remains open.
-  MiniMax sparse attention is a shared option, not a standalone layer in the
+  parity. No native kernel or compiled-C++ golden. Kimi KDA is integrated in
+  v0.0.272; see `implemented.md` §8. MiniMax sparse attention is a shared
+  option, not a standalone layer in the
   audited C++ branch; ViT, Tucker, and MambaVision now integrate it according
   to their source contracts.
 - [x] Container-conv cache prerequisite: device convolution params are keyed by

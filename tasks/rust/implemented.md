@@ -40,6 +40,7 @@ file is named inline.
   - [`[vit]` reference layer path (Phase 3A)](#vit-reference-layer-path-phase-3a)
   - [`[tucker_attention]` reference layer path (Phase 3A)](#tucker_attention-reference-layer-path-phase-3a)
   - [`[mambavision]` reference layer path (Phase 3A)](#mambavision-reference-layer-path-phase-3a)
+  - [`[kimi_kda]` reference layer path (Phase 3A)](#kimi_kda-reference-layer-path-phase-3a)
 - [9. Inference parity — LegoGears_v2 (the final target)](#9-inference-parity--legogears_v2-the-final-target)
 - [10. Data augmentation (`augmentation-audit.md`)](#10-data-augmentation-augmentation-auditmd)
 - [11. Housekeeping](#11-housekeeping)
@@ -454,8 +455,8 @@ still NOT RUN (no `Jev_laya` build here; `test_data/laya/` has only the shared
 - Batched-GEMM wrapper `linear_f32` (torch `nn.Linear` layout, bias as GEMM
   `beta=1`) (`593ea30a`).
 - Row-softmax backward already existed. The shared set supports `vit`,
-  `swin`/`transformer`, Tucker, and MambaVision reference paths; `kimi_kda`
-  remains open. MiniMax sparse attention is an optional shared utility, not a
+  `swin`/`transformer`, Tucker, MambaVision, and Kimi KDA reference paths.
+  MiniMax sparse attention is an optional shared utility, not a
   standalone layer in the audited C++ branch; it is wired into ViT, Tucker, and
   MambaVision.
 
@@ -570,8 +571,8 @@ still NOT RUN (no `Jev_laya` build here; `test_data/laya/` has only the shared
   passed 14 tests; `weights` passed 32 and `runtime` 168, including FakeBackend
   CPU forward/backward/update parity and Adam fallback. Source-derived from
   `Jev_laya`/`jepa`; no compiled-C++ golden or parity claim.
-- `kimi_kda` remains open. MiniMax sparse attention is a shared option rather
-  than a standalone layer, and its source enablement must be audited in each
+- MiniMax sparse attention is a shared option rather than a standalone layer,
+  and its source enablement must be audited in each
   future attention integration. VC native-kernel/evidence follow-ups also
   remain; see `todo.md`, `vit_plan.md`, and `swin_plan.md`.
 
@@ -598,6 +599,23 @@ still NOT RUN (no `Jev_laya` build here; `test_data/laya/` has only the shared
   `MEM=3G ./tools/test_host.sh runtime` — 171 pass;
   `MEM=3G ./tools/test_host.sh weights` — 33 pass. No native MambaVision
   kernel or owning-branch compiled-C++ golden/parity.
+
+### `[kimi_kda]` reference layer path (Phase 3A)
+
+- v0.0.272 (`3d7202bf`): added strict aliases/config and identity-shape checks,
+  source-order biases/weights, deterministic source-bounded initialization, CPU
+  low-rank causal scan plus shared/routed experts, and exact backward of the
+  Rust forward (including router load-balance cost and piecewise key-normalization
+  behavior). SGD/Adam, optimizer-state persistence, `.weights`, and GPU f32 host
+  fallback are integrated; no native Kimi kernel exists.
+- Tests cover hand-computed forward, finite differences for input and every
+  parameter with the auxiliary cost, key-norm floor and top-k edge cases,
+  parser errors, initialization bounds, source-order weight round-trip, optimizer
+  persistence, and CPU/FakeBackend forward/backward/update parity.
+- Evidence: `MEM=3G ./tools/test_host.sh kimi_kda` — 10 pass;
+  `MEM=3G ./tools/test_host.sh runtime` — 173 pass;
+  `MEM=3G ./tools/test_host.sh weights` — 34 pass. Hand-derived from `Jev_laya`;
+  no owning-branch compiled-C++ golden or parity claim.
 
 ## 9. Inference parity — LegoGears_v2 (the final target)
 
