@@ -169,11 +169,12 @@ Immediately next, in dependency order:
   whole-network CPU fallback (see `implemented.md` §8). VC source audit confirmed
   the key-centering/LSE mismatch and padded-query `sq` read risk. v0.0.261 adds
   host E4M3/ExpCast primitives; v0.0.262 adds V-Smooth math, v0.0.263 the
-  online quantized-row derivative, and v0.0.264 Q/K scale-gradient chaining.
-  Full head/batch VC forward/cache assembly and cfg/runtime integration remain
-  open. Also open: `swin`/`transformer`, `tucker_attention`, `mambavision`,
-  `kimi_kda`, and `minimax_sparse_attention` on the shared LayerNorm/GEMM set
-  (already built).
+  online quantized-row derivative, v0.0.264 Q/K scale-gradient chaining, and
+  v0.0.265 single batch-head forward/cache/backward composition with O(T*C)
+  state and Q/K/V finite differences. Batch/head dispatch, cfg/runtime and
+  backend fallback integration remain open; keep VC keys rejected. Also open:
+  `swin`/`transformer`, `tucker_attention`, `mambavision`, `kimi_kda`, and
+  `minimax_sparse_attention` on the shared LayerNorm/GEMM set (already built).
 - [x] Container-conv cache prerequisite: device convolution params are keyed by
   owner layer + expert slot; `warm_device_conv_params` warms each MoE expert,
   and host-updated experts invalidate/re-upload their slots. FakeBackend test

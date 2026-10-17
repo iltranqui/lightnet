@@ -501,6 +501,13 @@ still NOT RUN (no `Jev_laya` build here; `test_data/laya/` has only the shared
   boundary/tie cases error. `MEM=3G ./tools/test_host.sh vc_attention` passed
   12 tests, including finite differences of Q/K scale paths with a key
   permutation and score-clamp masks. Still not assembled into full attention.
+- v0.0.265 (`fabcfba5`): composed those pieces into a single batch-head CPU
+  reference forward/cache/backward with O(T*C) retained state; online rows are
+  recomputed in backward. LSE is explicitly for the centered, configured-clamp
+  score rows, not ordinary uncentered logits. `MEM=3G ./tools/test_host.sh
+  vc_attention` passed 13 tests, including Q/K/V finite differences over 128
+  keys with a key permutation. This remains reference math, not cfg/runtime or
+  compiled-C++ parity.
 - Earlier focused evidence: full host unit suites pass (`darknet-core` 377,
   `darknet-cli` 18); targeted check/build pass with `-j 4`. The full
   `cfg_corpus` integration run exceeded a 30-minute timeout. C++ dump parity NOT
