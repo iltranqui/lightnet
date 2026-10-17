@@ -463,14 +463,24 @@ still NOT RUN (no `Jev_laya` build here; `test_data/laya/` has only the shared
   (global norm clip 5, matrix + learned-position decay, 0.1x mHC LR/clamp).
 - `weights.rs`/runtime: modern save and header-versioned legacy loading for the
   12-float mHC suffix; exact-size and round-trip tests cover both.
-- GPU f32 uses host round-trip forward and CPU backward fallback. FakeBackend
-  parity covers a preceding-convolution chain.
-- Evidence: `MEM=3G ./tools/test_host.sh vit` — 23 pass; full host unit suites
-  pass (`darknet-core` 377, `darknet-cli` 18); targeted check/build pass with
-  `-j 4`. The full `cfg_corpus` integration run exceeded a 30-minute timeout.
-  C++ dump parity NOT RUN (no owning-branch executable).
-- Still open: flash/vc-attention variants and native oxide kernels; those are
-  not represented as complete by this reference-path milestone.
+- GPU f32 uses a host round-trip for non-attention math. Standard flash
+  attention dispatches native Oxide forward and recompute-based dQ/dK/dV
+  backward for supported head dimensions inside the whole-network CPU fallback;
+  unsupported dimensions and other ViT derivatives remain host-side. FakeBackend
+  and Oxide runtime-chain parity cover a preceding-convolution chain.
+- v0.0.260 (`16e95d9a`): native flash backward and runtime dispatch. Evidence:
+  `MEM=3G ./tools/test_host.sh vit` — 28 pass;
+  `MEM=3G ./tools/test_oxide.sh --test oxide_layernorm` — 14 pass, including
+  host/Oxide backward parity, central finite differences, and clamp masks;
+  `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain` — 22 pass, including
+  CPU-matched ViT parameter updates after native attention backward dispatch.
+  This is Rust backend evidence, not performance or compiled-C++ parity.
+- Earlier focused evidence: full host unit suites pass (`darknet-core` 377,
+  `darknet-cli` 18); targeted check/build pass with `-j 4`. The full
+  `cfg_corpus` integration run exceeded a 30-minute timeout. C++ dump parity NOT
+  RUN (no owning-branch executable).
+- Still open: VC quantized attention/source-contract resolution and the other
+  named Phase 3A attention layers; see `todo.md`/`vit_plan.md`.
 
 ## 9. Inference parity — LegoGears_v2 (the final target)
 
