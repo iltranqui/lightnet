@@ -52,6 +52,7 @@ file is named inline.
 - [17. DCNv4 CPU reference and GPU f32 host fallback](#17-dcnv4-cpu-reference-and-gpu-f32-host-fallback)
 - [18. DCNv1 and DCNv2 CPU reference and GPU f32 host fallback](#18-dcnv1-and-dcnv2-cpu-reference-and-gpu-f32-host-fallback)
 - [19. DSConv single-template Stage-1 CPU reference](#19-dsconv-single-template-stage-1-cpu-reference)
+- [20. Graph-convolution Stage-1 CPU reference](#20-graph-convolution-stage-1-cpu-reference)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -776,6 +777,12 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 - v0.1.002 (`f49cfc56f571329c14f6b43224d635199b6cca1b`): integrated `[dsconv]` / `[dynamic_snake_conv]` with strict source-derived config/shape handling, source-order weights, seeded initialization, NCHW CPU forward for `morph=0/1/2`, exact backward of the Rust forward, activation handling, SGD source-rate groups, and Adam with persisted moments. Multi-template `morph=0/1` explicitly rejects; `morph=2` follows the source normalization to one template.
 - Verification: `MEM=3G ./tools/test_host.sh dsconv` passed 12 core tests, `weights` passed 40 core tests, and `runtime` passed 187 runtime tests. Coverage includes named hand-computed NCHW axes, finite differences for input and every parameter block across all morphs, integer/border derivative conventions, exact source-order bytes/file length, seeded initialization, update rates/gates, optimizer-state round trip, and explicit GPU rejection. Targeted `rustfmt --check --edition 2024` and `git diff --check` passed. No training or Oxide tests were run.
 - Source contract: hand-derived from `Jev_laya`; no compiled-C++ golden/parity. Stage-1 CPU only: no GPU path, no full multi-template/drop-mask gradients, and CPU Muon remains a cross-cutting requirement. Do not claim full DSConv parity or v0.1 completion.
+
+## 20. Graph-convolution Stage-1 CPU reference
+
+- v0.1.003 (`f9a90bd5940f0dfce40e4e2ded0d7c1838f50e11`): integrated `[graph_conv]` / `[graph_convolutional]` with strict source-derived config/shape validation, grouped NCHW projections, uniform valid-neighbor means or learned masked-softmax edges, optional center projection, source-order weights, seeded initialization, BN/activation, exact backward of the Rust forward, SGD, and Adam with persisted moments. GPU execution and updates reject explicitly.
+- Verification: `MEM=3G ./tools/test_host.sh graph_conv` passed 14 tests; `weights` passed 42; `runtime` passed 192. Coverage includes non-square NCHW hand math, grouped projection and learned-edge finite differences across input and all trainable blocks, uniform-mode border finite differences and zero upstream, finite-difference bias, preceding-convolution gradient accumulation, BN/rolling statistics, every optional weight-block combination with exact file size/trailing-byte checks, optimizer updates/state round trip, and GPU rejection. Targeted Rustfmt and `git diff --check` passed. No Oxide tests, training, or `cfg_corpus` run.
+- Source contract: hand-derived from `Jev_laya`; `LAYER_GRAPH_CONV` is disabled in the source branch and there is no compiled-C++ golden, so no compiled-C++ parity is claimed. Adam is a Rust extension; CBN uses ordinary CPU BN semantics. Stage-1 CPU only; native GPU paths and GPU Muon belong to Stage 2, and CPU Muon remains a cross-cutting Stage-1 requirement.
 
 ## Not implemented / open (pointer)
 

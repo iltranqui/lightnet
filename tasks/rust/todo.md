@@ -401,12 +401,13 @@ Immediately next, in dependency order:
   deferred. Still open: broader OBB GPU training/validation, remaining cfg/training-
   option wiring, source-faithful geometric augmentation/label transforms, and any
   unimplemented OBB source paths.
-- [ ] Phase 3B CPU family (remaining): `dsconv` single-template CPU support is
-  integrated in v0.1.002 (`implemented.md` §19): `morph=0/1/2` work, but
-  multi-template `morph=0/1` remains an explicit unsupported follow-up. Next
-  are `graph_conv`, `wmhf`, `clifford`, and `recursive_block`. DCNv1/2 CPU
-  reference is integrated in v0.1.001 (`implemented.md` §18); its GPU path is
-  still host fallback. `[dcnv4]` is integrated in v0.0.273–v0.0.274
+- [ ] Phase 3B CPU family (remaining): `graph_conv` CPU support is integrated
+  in v0.1.003 (`implemented.md` §20), hand-derived from `Jev_laya` with no
+  compiled-C++ golden and no GPU path. Next are `wmhf`, `clifford`, and
+  `recursive_block`. `dsconv` is integrated in v0.1.002 (`implemented.md` §19)
+  for single-template `morph=0/1/2`; multi-template `morph=0/1` remains open.
+  DCNv1/2 CPU reference is integrated in v0.1.001 (`implemented.md` §18); its
+  GPU path is still host fallback. `[dcnv4]` is integrated in v0.0.273–v0.0.274
   (`implemented.md` §17), also host fallback. Native GPU support belongs to
   Stage 2 after all Stage-1 CPU layers are done.
 - [ ] CPU Muon: write the update-rule/spec first (Newton–Schulz coefficients and
@@ -423,6 +424,7 @@ Immediately next, in dependency order:
 - [x] `dcnv4_plan.md` — source-audited CPU/reference + GPU f32 host-fallback implementation completed in v0.0.273; v0.0.274 matches the deformable-layer `try_fix_nan` config default. No native kernel or compiled-C++ parity.
 - [x] `deform_conv_plan.md` — bounded DCNv1/2 CPU reference and f32 host-fallback implementation completed in v0.1.001. No native kernel or compiled-C++ parity; CPU Muon remains a cross-cutting Stage-1 item.
 - [x] `dsconv_plan.md` — bounded single-template CPU implementation completed in v0.1.002; multi-template modes and CPU Muon remain open. No native kernel or compiled-C++ parity.
+- [x] `graph_conv_plan.md` — Stage-1 CPU implementation completed in v0.1.003; CPU Muon remains open and native GPU support is Stage 2. No compiled-C++ parity.
 - [ ] `gui_plan.md` — egui DarkMark replacement (M0–M6, not started).
 
 ## Known evidence gaps (not user questions)
