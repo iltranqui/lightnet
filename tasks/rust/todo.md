@@ -165,15 +165,16 @@ Immediately next, in dependency order:
   `laya_loss`, `laya_encoder`, `laya_head`) — all done; see `implemented.md` §5.
 - [~] Phase 3A: `[vit]` reference path is implemented: CPU forward/backward,
   header-aware weights, SGD, and GPU f32 host round-trip. Standard flash
-  attention now has native Oxide forward and dQ/dK/dV primitives inside the
+  attention has native Oxide forward and dQ/dK/dV primitives inside the
   whole-network CPU fallback (see `implemented.md` §8). VC source audit confirmed
-  the key-centering/LSE mismatch and padded-query `sq` read risk. v0.0.261 adds
-  host E4M3/ExpCast primitives; v0.0.262 adds V-Smooth math, v0.0.263 the
-  online quantized-row derivative, v0.0.264 Q/K scale-gradient chaining, and
-  v0.0.265 single batch-head forward/cache/backward composition with O(T*C)
-  state and Q/K/V finite differences; v0.0.266 adds B×H QKV packing/unpacking
-  and per-head caches. Config/runtime and device/backend fallback integration
-  remain open; keep VC keys rejected. Also open:
+  the key-centering/LSE and padded-query `sq` risks; Rust avoids the padded query
+  and defines the centered/clamped-score derivative contract explicitly.
+  v0.0.261–v0.0.266 added and tested the VC quantization, V-Smooth, online-row,
+  Q/K-scale, head composition, and B×H packing primitives. v0.0.267 wires strict
+  cfg aliases/modes/permutations and CPU/GPU host-reference forward/backward;
+  `vc_attention` (16 filtered tests) and `vit` (32) pass. GPU VC deliberately
+  falls back to the Rust host reference on all devices/head sizes; no native VC
+  kernel or compiled-C++ parity is claimed. Also open:
   `swin`/`transformer`, `tucker_attention`, `mambavision`, `kimi_kda`, and
   `minimax_sparse_attention` on the shared LayerNorm/GEMM set (already built).
 - [x] Container-conv cache prerequisite: device convolution params are keyed by

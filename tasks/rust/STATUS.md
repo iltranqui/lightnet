@@ -53,6 +53,7 @@ Latest increments:
 - v0.0.264 (`9a085535`): added Q/K quantization and score-scale backward chaining through `sq` and centered-key `sk`. `MEM=3G ./tools/test_host.sh vc_attention` passed 12 tests, including permuted-key finite differences and score-clamp masking. Full head/cache remains open; no compiled-C++ parity.
 - v0.0.265 (`fabcfba5`): composed a single batch-head VC forward/cache/backward with O(T*C) state and recomputed online rows; LSE is explicitly for centered/clamped scores. `MEM=3G ./tools/test_host.sh vc_attention` passed 13 tests, including Q/K/V finite differences across two KV tiles with key permutation. Batch/head dispatch, cfg/runtime and backend fallback remain open; no compiled-C++ parity.
 - v0.0.266 (`fc47742d`): added B×H QKV packing/unpacking around VC head references with one O(T*C) cache per head. `MEM=3G ./tools/test_host.sh vc_attention` passed 14 tests, including B=2/H=2 forward and fused-gradient mapping. Config/runtime and backend fallback remain open; no compiled-C++ parity.
+- v0.0.267 (`3c6f5c76`): wired `[vit]` VC config aliases/validation, ExpCast modes, and source 8×8 spatial token ordering into CPU and GPU host-round-trip dispatch. GPU paths deliberately bypass standard flash device kernels and use the Rust VC reference for forward; backward uses its per-head cache and exact piecewise derivative, with explicit errors at undefined points. `MEM=3G ./tools/test_host.sh vc_attention` passed 16 filtered tests; `MEM=3G ./tools/test_host.sh vit` passed 32, including config and CPU/FakeBackend runtime forward/backward. No native VC kernel or compiled-C++ parity is claimed.
 - v0.0.251 (`968c1beb`; gate incomplete): added source-derived OBB weighted NMS. Reference is `raptor:src-lib/box.cpp` (`diounms_sort`, not `yolo_layer.cpp`): `overlap = obb_iou - (d²/c²)^beta_nms`, where `obb_iou = detection_obb_iou(i,j)`, `d²` is center-distance squared, and `c²` is the enclosing AABB diagonal squared; merge weights are `w_i = prob_i[k]` and `w_j = prob_j[k] * obb_iou`, used to average box x/y/w/h and the keeper front point. Source enum spelling is `OBB_W_NMS`; cfg aliases are `obb_w` and `obb_wnms`. The four `weighted_merge_*` tests and the cfg/multi-head-beta tests passed. Its OBB-filtered run had 131/132 core tests and 3/3 CLI tests pass; the loader failure is resolved by v0.0.252 below. No compiled-C++ parity is claimed.
 - v0.0.252 (`fae49267`): omitted OBB `jitter` now defaults to zero while other detector heads retain their existing default; configured unsupported geometric augmentation remains rejected. The seeded flip/loader tests pass, including the prior `obb_batch_loader_applies_configured_seeded_flips_to_images_and_labels` failure.
 - v0.0.253 (`31219aba`): implemented the parsed `ciou_obb_mul` training route. Source `raptor:src-lib/box.cpp` defines `L = max(0, 1 - S)`, `S = clamp(CIoU_obb * cos_half_theta, 0, 1)`; `raptor:src-lib/yolo_layer_obb.cpp` and `dx_box_ciou_obb_multiplicative_loss` define six decoded-geometry central differences with `eps = 1e-3 * (abs(value) + 1)`, clamping perturbed width/height to at least `1e-6`. Rust chains these gradients through the box/front channels, scales/clips deltas, and routes front-anchor offsets through both passes. The cfg now builds both training configs instead of rejecting the loss. `ciou_obb_mul` tests and direct `cargo test -p darknet-core -p darknet-cli -j 2 -- obb_` passed (135 core + 3 CLI); uncapped because the user systemd bus is unavailable. No compiled-C++ parity is claimed.
@@ -642,9 +643,12 @@ believing a `cfg_corpus` failure.
 
 1. The LAYA family is **complete** (`laya_scorer`, `laya_marker_gather`,
    `laya_act_head`, `laya_loss`, `laya_encoder`, `laya_head`). The `[vit]`
-   reference path is now wired; remaining Phase 3A work is flash/vc-attention
-   fast paths and `swin`/`transformer`, `tucker_attention`, `mambavision`,
-   `kimi_kda`, `minimax_sparse_attention` on the shared LayerNorm/GEMM set.
+   reference path, standard flash primitives, and VC config/runtime reference
+   dispatch are wired. VC uses its Rust reference on CPU and GPU host-round-trip
+   paths; native VC device kernels and compiled-C++ parity are unavailable.
+   Remaining Phase 3A work is `swin`/`transformer`, `tucker_attention`,
+   `mambavision`, `kimi_kda`, and `minimax_sparse_attention` on the shared
+   LayerNorm/GEMM set.
    **Order matters:** `[laya_scorer]`'s `weights=` is only usable together with
    `[laya_encoder]` + `[laya_head]` (the shared-file offset is computed past
    their blobs), so those two come next even though the plan files them under
@@ -663,9 +667,11 @@ believing a `cfg_corpus` failure.
    (`linear_f32`) are all in, each with a host default plus GPU parity tests.
    That unblocks `vit`, `swin`/`transformer`, `tucker_attention`, `mambavision`,
    `kimi_kda`, `minimax_sparse_attention` and the LAYA encoder/head. Standard
-   `flash_attention` now has native Oxide forward/backward primitives. VC remains
-   gated on resolving its quantized-forward derivative and source-level LSE risks;
-   see `vit_plan.md` and `vit_notes.md`.
+   `flash_attention` has native Oxide forward/backward primitives. VC now has
+   strict config/runtime integration and uses its centered/clamped-score Rust
+   LSE contract with exact piecewise backward; GPU execution intentionally falls
+   back to this host reference for every device/head dimension. Native VC kernels,
+   broader Phase 3A layers, and compiled-C++ parity remain open.
 4. Phase 2B `moe_convolutional` (weights order verified) has partial Oxide
    training support; BN backward and SGD/Adam updates use backend ops. Then
    port `eml_convolutional` (an activation, not a `LayerKind`; save order **re-read

@@ -513,6 +513,18 @@ still NOT RUN (no `Jev_laya` build here; `test_data/laya/` has only the shared
   gradients in fused QKV order. `MEM=3G ./tools/test_host.sh vc_attention`
   passed 14 tests, including B=2/H=2 mapping and cache-shape coverage. Config,
   runtime, device fallback, and compiled-C++ parity remain open.
+- v0.0.267 (`3c6f5c76`): integrated VC aliases (`vc_attention`/`vc`,
+  `vc_expcast`/`expcast`) and strict mode/permutation validation into `[vit]`,
+  enforcing the flash-attention prerequisite. Added the source 8×8 full-windows-
+  first spatial ordering and routed CPU/GPU ViT forwards through the VC reference;
+  GPU paths bypass standard flash kernels, and backward consumes the matching VC
+  cache via the exact piecewise derivative. Unsupported GPU devices/head sizes
+  are handled by the host reference (no native VC kernel). `MEM=3G
+  ./tools/test_host.sh vc_attention` passed 16 filtered tests and
+  `MEM=3G ./tools/test_host.sh vit` passed 32, including config validation,
+  callback bypass, spatial-order, and FakeBackend runtime forward/backward tests.
+  No compiled-C++ parity is claimed; remaining Phase 3A layers and native VC
+  kernels remain open.
 - Earlier focused evidence: full host unit suites pass (`darknet-core` 377,
   `darknet-cli` 18); targeted check/build pass with `-j 4`. The full
   `cfg_corpus` integration run exceeded a 30-minute timeout. C++ dump parity NOT
