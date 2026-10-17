@@ -872,7 +872,13 @@ fn bench_train(cfg: &str, steps: usize, warmup: usize) -> Result<(), Box<dyn std
                 let t1 = Instant::now();
                 exec.backward_accumulate_seeded(&input, &forward, &seeds)?;
                 let t2 = Instant::now();
-                exec.update_weights(lr, momentum, decay, batch);
+                if exec.network.net.muon {
+                    exec.update_weights_muon(lr, batch)?;
+                } else if exec.network.net.adam {
+                    exec.update_weights_adam(lr, batch)?;
+                } else {
+                    exec.update_weights(lr, momentum, decay, batch);
+                }
                 let t3 = Instant::now();
                 if let Some(prefix) = &parity_prefix {
                     if parity_steps.contains(&(step + 1)) {
@@ -2219,6 +2225,15 @@ fn run_detector_train_cpu(
         .unwrap_or_else(|| PathBuf::from("."));
     fs::create_dir_all(&backup_dir)?;
     let base_name = cfg_base_name(cfg);
+    let optimizer_state_path = backup_dir.join(format!("{base_name}_optimizer.state"));
+    if executable.network.net.muon && !options.clear && optimizer_state_path.exists() {
+        executable.load_optimizer_state(&optimizer_state_path)?;
+        println!(
+            "resumed optimizer state (Adam step {}) from {}",
+            executable.adam_step(),
+            optimizer_state_path.display()
+        );
+    }
     let images_per_iteration =
         executable.network.net.batch.max(1) * executable.network.net.subdivisions.max(1);
     let mut batch_num = (seen as usize)
@@ -2358,14 +2373,18 @@ fn run_detector_train_cpu(
                 &yolo.layer_output_gradient_seeds,
             )?;
         }
-        executable.update_weights(
-            lr,
-            executable.network.net.momentum,
-            executable.network.net.decay,
-            // C++ update_network: batch * subdivisions (gradients are summed
-            // over every subdivision before the step).
-            images_per_iteration,
-        );
+        if executable.network.net.muon {
+            executable.update_weights_muon(lr, images_per_iteration)?;
+        } else {
+            executable.update_weights(
+                lr,
+                executable.network.net.momentum,
+                executable.network.net.decay,
+                // C++ update_network: batch * subdivisions (gradients are summed
+                // over every subdivision before the step).
+                images_per_iteration,
+            );
+        }
 
         batch_num += 1;
         seen += images_per_iteration as u64;
@@ -2418,6 +2437,9 @@ fn run_detector_train_cpu(
                 if validation.record(&report, batch_num, seen)? {
                     let checkpoint = backup_dir.join(format!("{base_name}_best.weights"));
                     save_weights(&executable.network, &executable.params, &checkpoint, seen)?;
+                    if executable.network.net.muon {
+                        executable.save_optimizer_state(&optimizer_state_path)?;
+                    }
                     println!("saved {}", checkpoint.display());
                 }
             }
@@ -2434,6 +2456,9 @@ fn run_detector_train_cpu(
                 &base_name,
                 seen,
             )?;
+            if executable.network.net.muon {
+                executable.save_optimizer_state(&optimizer_state_path)?;
+            }
         }
 
         if executable.network.net.max_batches != 0
@@ -2451,6 +2476,9 @@ fn run_detector_train_cpu(
         seen,
     )?;
     println!("saved {}", final_checkpoint.display());
+    if executable.network.net.muon {
+        executable.save_optimizer_state(&optimizer_state_path)?;
+    }
     loss_log.save_last(
         &executable.network,
         &executable.params,
@@ -2515,7 +2543,10 @@ fn run_detector_train_cpu_obb(
     fs::create_dir_all(&backup_dir)?;
     let base_name = cfg_base_name(cfg);
     let optimizer_state_path = backup_dir.join(format!("{base_name}_optimizer.state"));
-    if executable.network.net.adam && !options.clear && optimizer_state_path.exists() {
+    if (executable.network.net.adam || executable.network.net.muon)
+        && !options.clear
+        && optimizer_state_path.exists()
+    {
         executable.load_optimizer_state(&optimizer_state_path)?;
         println!(
             "resumed optimizer state (Adam step {}) from {}",
@@ -2549,7 +2580,9 @@ fn run_detector_train_cpu_obb(
 
     println!(
         "OBB CPU trainer: {} with direct resize and seeded horizontal flips",
-        if executable.network.net.adam {
+        if executable.network.net.muon {
+            "Muon/AdamW"
+        } else if executable.network.net.adam {
             "Adam"
         } else {
             "SGD"
@@ -2596,7 +2629,9 @@ fn run_detector_train_cpu_obb(
                 &delta_batch.layer_output_gradient_seeds,
             )?;
         }
-        if executable.network.net.adam {
+        if executable.network.net.muon {
+            executable.update_weights_muon(learning_rate, images_per_iteration)?;
+        } else if executable.network.net.adam {
             executable.update_weights_adam(learning_rate, images_per_iteration)?;
         } else {
             executable.update_weights(
@@ -2656,6 +2691,9 @@ fn run_detector_train_cpu_obb(
                 if validation.record(&report, batch_num, seen)? {
                     let checkpoint = backup_dir.join(format!("{base_name}_best.weights"));
                     save_weights(&executable.network, &executable.params, &checkpoint, seen)?;
+                    if executable.network.net.muon {
+                        executable.save_optimizer_state(&optimizer_state_path)?;
+                    }
                     println!("saved {}", checkpoint.display());
                 }
             }
@@ -2672,7 +2710,7 @@ fn run_detector_train_cpu_obb(
                 &base_name,
                 seen,
             )?;
-            if executable.network.net.adam {
+            if executable.network.net.adam || executable.network.net.muon {
                 executable.save_optimizer_state(&optimizer_state_path)?;
             }
         }
@@ -2698,7 +2736,7 @@ fn run_detector_train_cpu_obb(
         &base_name,
         seen,
     )?;
-    if executable.network.net.adam {
+    if executable.network.net.adam || executable.network.net.muon {
         executable.save_optimizer_state(&optimizer_state_path)?;
     }
     Ok(())

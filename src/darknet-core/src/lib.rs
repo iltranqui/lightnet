@@ -62,6 +62,8 @@ pub mod mambavision;
 pub(crate) mod maxpool_depth;
 pub mod model;
 pub mod modern_yolo;
+pub(crate) mod muon;
+pub(crate) mod muon_runtime;
 pub mod names;
 pub mod onnx;
 pub use onnx::{OnnxOptions, export_onnx};

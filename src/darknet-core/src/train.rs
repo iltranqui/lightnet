@@ -591,7 +591,9 @@ pub fn train_obb_yolo_batch_step(
         &forward,
         &delta_batch.layer_output_gradient_seeds,
     )?;
-    if executable.network.net.adam {
+    if executable.network.net.muon {
+        executable.update_weights_muon(learning_rate, batch.input.shape.batch)?;
+    } else if executable.network.net.adam {
         executable.update_weights_adam(learning_rate, batch.input.shape.batch)?;
     } else {
         executable.update_weights(
@@ -794,7 +796,9 @@ pub fn train_obb_yolo_subdivisions(
             return Err(error);
         }
     };
-    if executable.network.net.adam {
+    if executable.network.net.muon {
+        executable.update_weights_muon(learning_rate, update_batch_size)?;
+    } else if executable.network.net.adam {
         executable.update_weights_adam(learning_rate, update_batch_size)?;
     } else {
         executable.update_weights(

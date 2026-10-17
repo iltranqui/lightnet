@@ -69,12 +69,16 @@ pub struct NetConfig {
     pub num_sigmas_reject_badlabels: f32,
     /// `adam=1` (C++ `net.adam`); SGD with momentum otherwise.
     pub adam: bool,
-    /// `B1`/`B2`/`eps` (only read when `adam=1`, like C++).
+    /// AdamW fallback `B1`/`B2`/`eps` (read for `adam=1` or `muon=1`).
     pub adam_b1: f32,
     pub adam_b2: f32,
     pub adam_eps: f32,
     /// Rust extension `decoupled_decay=1`: AdamW instead of C++'s L2-in-the-moments.
     pub decoupled_decay: bool,
+    /// Rust CPU hybrid Muon/AdamW optimizer (`muon=1`).
+    pub muon: bool,
+    /// Additive Muon momentum coefficient (`muon_momentum`, default 0.95).
+    pub muon_momentum: f32,
     /// `loss_scale` (C++ default 1): gradients are scaled by this and the
     /// update divides it back out.
     pub loss_scale: f32,
@@ -175,6 +179,76 @@ impl NetConfig {
         let batch = section.get_usize("batch", 1)? / subdivisions * time_steps;
         let max_batches = section.get_usize("max_batches", 0)?;
         let adam = section.get_usize("adam", 0)? != 0;
+        let muon_value = section.get_usize("muon", 0)?;
+        if muon_value > 1 {
+            return Err(Error::InvalidConfig(format!(
+                "invalid muon={muon_value} in [net] on line {}; expected 0 or 1",
+                section.line
+            )));
+        }
+        let muon = muon_value != 0;
+        if muon && adam {
+            return Err(Error::InvalidConfig(
+                "[net] muon=1 conflicts with adam=1; Muon uses its AdamW fallback automatically"
+                    .to_owned(),
+            ));
+        }
+        let decoupled_decay_value = section.get_usize("decoupled_decay", 0)?;
+        if muon && decoupled_decay_value > 1 {
+            return Err(Error::InvalidConfig(format!(
+                "invalid decoupled_decay={decoupled_decay_value} with muon=1 in [net]; expected 1"
+            )));
+        }
+        if muon && section.get("decoupled_decay").is_some() && decoupled_decay_value == 0 {
+            return Err(Error::InvalidConfig(
+                "[net] muon=1 requires AdamW; explicit decoupled_decay=0 conflicts".to_owned(),
+            ));
+        }
+        let muon_momentum = match section.get("muon_momentum") {
+            Some(_) if !muon => {
+                return Err(Error::InvalidConfig(
+                    "[net] muon_momentum requires muon=1".to_owned(),
+                ));
+            }
+            Some(_) => section.get_f32("muon_momentum", 0.95)?,
+            None => 0.95,
+        };
+        if muon && (!muon_momentum.is_finite() || !(0.0..1.0).contains(&muon_momentum)) {
+            return Err(Error::InvalidConfig(
+                "[net] muon_momentum must be finite and in [0, 1)".to_owned(),
+            ));
+        }
+        let adam_b1 = if adam || muon {
+            section.get_f32("b1", 0.9)?
+        } else {
+            0.9
+        };
+        let adam_b2 = if adam || muon {
+            section.get_f32("b2", 0.999)?
+        } else {
+            0.999
+        };
+        let adam_eps = if adam || muon {
+            section.get_f32("eps", 0.000001)?
+        } else {
+            0.000001
+        };
+        let decay = section.get_f32("decay", 0.0005)?;
+        if muon
+            && (!adam_b1.is_finite()
+                || !(0.0..1.0).contains(&adam_b1)
+                || !adam_b2.is_finite()
+                || !(0.0..1.0).contains(&adam_b2)
+                || !adam_eps.is_finite()
+                || adam_eps <= 0.0
+                || !decay.is_finite()
+                || decay < 0.0)
+        {
+            return Err(Error::InvalidConfig(
+                "[net] Muon requires finite B1/B2 in [0, 1), positive eps, and non-negative finite decay"
+                    .to_owned(),
+            ));
+        }
         let obb = section.get_i64("obb", 0)?;
         if !(0..=1).contains(&obb) {
             return Err(Error::InvalidConfig(format!(
@@ -193,7 +267,7 @@ impl NetConfig {
             learning_rate: section.get_f32("learning_rate", 0.001)?,
             learning_rate_min: section.get_f32("learning_rate_min", 0.00001)?,
             momentum: section.get_f32("momentum", 0.9)?,
-            decay: section.get_f32("decay", 0.0005)?,
+            decay,
             max_batches,
             burn_in: section.get_usize("burn_in", 0)?,
             power: section.get_f32("power", 4.0)?,
@@ -210,22 +284,12 @@ impl NetConfig {
                 .get_f32("badlabels_rejection_percentage", 0.0)?,
             num_sigmas_reject_badlabels: section.get_f32("num_sigmas_reject_badlabels", 0.0)?,
             adam,
-            adam_b1: if adam {
-                section.get_f32("b1", 0.9)?
-            } else {
-                0.9
-            },
-            adam_b2: if adam {
-                section.get_f32("b2", 0.999)?
-            } else {
-                0.999
-            },
-            adam_eps: if adam {
-                section.get_f32("eps", 0.000001)?
-            } else {
-                0.000001
-            },
-            decoupled_decay: section.get_usize("decoupled_decay", 0)? != 0,
+            adam_b1,
+            adam_b2,
+            adam_eps,
+            decoupled_decay: muon || decoupled_decay_value != 0,
+            muon,
+            muon_momentum,
             loss_scale: section.get_f32("loss_scale", 1.0)?,
             try_fix_nan: section.get_usize("try_fix_nan", 0)? != 0,
             label_smooth_eps: section.get_f32("label_smooth_eps", 0.0)?,
@@ -8232,6 +8296,52 @@ mod tests {
         assert_eq!(network.net.equidistant_point, 0);
         assert_eq!(network.net.badlabels_rejection_percentage, 0.0);
         assert_eq!(network.net.num_sigmas_reject_badlabels, 0.0);
+    }
+
+    #[test]
+    fn muon_config_enables_adamw_and_rejects_conflicting_or_invalid_values() {
+        let network = build(
+            r#"[net]
+width=1
+height=1
+channels=2
+muon=1
+[connected]
+output=2
+"#,
+        )
+        .expect("Muon config should parse");
+        assert!(network.net.muon);
+        assert!(!network.net.adam);
+        assert!(network.net.decoupled_decay);
+        assert_eq!(network.net.muon_momentum, 0.95);
+
+        for cfg in [
+            "[net]\nwidth=1\nheight=1\nchannels=1\nmuon=2\n",
+            "[net]\nwidth=1\nheight=1\nchannels=1\nmuon=1\nadam=1\n",
+            "[net]\nwidth=1\nheight=1\nchannels=1\nmuon=1\ndecoupled_decay=0\n",
+            "[net]\nwidth=1\nheight=1\nchannels=1\nmuon=1\nmuon_momentum=1\n",
+            "[net]\nwidth=1\nheight=1\nchannels=1\nmuon_momentum=0.9\n",
+            "[net]\nwidth=1\nheight=1\nchannels=1\nmuon=1\nb1=1\n",
+            "[net]\nwidth=1\nheight=1\nchannels=1\nmuon=1\neps=0\n",
+            "[net]\nwidth=1\nheight=1\nchannels=1\nmuon=1\ndecay=-0.1\n",
+        ] {
+            assert!(build(cfg).is_err(), "invalid config should reject: {cfg}");
+        }
+
+        let explicit = build(
+            "[net]\nwidth=1\nheight=1\nchannels=1\nmuon=1\nmuon_momentum=0.8\nb1=0.8\nb2=0.95\neps=0.001\ndecoupled_decay=1\n",
+        )
+        .expect("explicit Muon config should parse");
+        assert_eq!(explicit.net.muon_momentum, 0.8);
+        assert_eq!(
+            (
+                explicit.net.adam_b1,
+                explicit.net.adam_b2,
+                explicit.net.adam_eps
+            ),
+            (0.8, 0.95, 0.001)
+        );
     }
 
     #[test]

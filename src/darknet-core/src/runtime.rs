@@ -30,6 +30,8 @@ use crate::model::{
     DropblockSpec, EmlConvolutionalSpec, GraphConvSpec, GruSpec, LayerKind, LocalSpec, LrPolicy,
     LstmSpec, NetConfig, Network, RnnSpec, RouteSpec, TensorShape,
 };
+use crate::muon::MuonMatrixState;
+use crate::muon_runtime::{MuonLayerState, apply_staged_layer, matrix_shapes, stage_layer};
 use crate::weights::WeightsHeader;
 use darknet_cuda::{
     AdamParams, AdamUpdateItem, ElementwiseLaunchConfig, F16TensorOpsBackend, F32ActivationKind,
@@ -936,8 +938,10 @@ pub struct ExecutableNetwork {
     /// DropBlock ramp and the `dont_update`/`burnin_update` gates (see
     /// [`ExecutableNetwork::set_train_iteration`]).
     train_iteration: usize,
-    /// CPU Adam optimizer state, persisted separately from Darknet weights.
+    /// CPU AdamW fallback state, persisted separately from Darknet weights.
     host_adam_state: Vec<Option<HostAdamLayerState>>,
+    /// CPU Muon momentum, one state per eligible matrix block.
+    muon_state: Vec<Option<MuonLayerState>>,
     adam_step: u32,
 }
 
@@ -965,6 +969,7 @@ impl ExecutableNetwork {
             workspace,
             train_iteration: 0,
             host_adam_state: (0..layer_count).map(|_| None).collect(),
+            muon_state: (0..layer_count).map(|_| None).collect(),
             adam_step: 0,
         }
     }
@@ -991,10 +996,30 @@ impl ExecutableNetwork {
         self.adam_step = step;
     }
 
-    /// Save CPU Adam moments in the shared DNOPT sidecar format.
+    /// Save CPU AdamW fallback and Muon state in the shared DNOPT sidecar format.
     pub fn save_optimizer_state(&self, path: impl AsRef<Path>) -> Result<()> {
+        if !self.network.net.muon
+            && self
+                .muon_state
+                .iter()
+                .flatten()
+                .any(|state| !state.matrices.is_empty())
+        {
+            return Err(Error::Weights(
+                "cannot save Muon momentum while [net] muon=0".to_owned(),
+            ));
+        }
+        if self.network.net.muon && self.muon_state.len() != self.network.layers.len() {
+            return Err(Error::Weights(
+                "Muon optimizer state layer count does not match the network".to_owned(),
+            ));
+        }
         let mut file = std::io::BufWriter::with_capacity(1 << 20, File::create(path)?);
-        file.write_all(b"DNOPT3\0\0")?;
+        file.write_all(if self.network.net.muon {
+            b"DNOPT6\0\0"
+        } else {
+            b"DNOPT3\0\0"
+        })?;
         file.write_all(&self.adam_step.to_le_bytes())?;
         file.write_all(&0u64.to_le_bytes())?; // no device-resident moments
 
@@ -1015,11 +1040,35 @@ impl ExecutableNetwork {
             )?;
         }
         file.write_all(&0u64.to_le_bytes())?; // no device MoE moments
+        if self.network.net.muon {
+            file.write_all(&0u64.to_le_bytes())?; // no device EML moments
+            let entries: Vec<usize> = self
+                .muon_state
+                .iter()
+                .enumerate()
+                .filter_map(|(index, state)| {
+                    state
+                        .as_ref()
+                        .filter(|state| !state.matrices.is_empty())
+                        .map(|_| index)
+                })
+                .collect();
+            file.write_all(&(entries.len() as u64).to_le_bytes())?;
+            for index in entries {
+                file.write_all(&(index as u64).to_le_bytes())?;
+                write_muon_layer_state(
+                    &mut file,
+                    self.muon_state[index]
+                        .as_ref()
+                        .expect("filtered to a non-empty state above"),
+                )?;
+            }
+        }
         file.flush()?;
         Ok(())
     }
 
-    /// Restore CPU Adam moments from a host-only DNOPT sidecar.
+    /// Restore CPU AdamW fallback and Muon momentum from a host-only DNOPT sidecar.
     pub fn load_optimizer_state(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let mut file = File::open(path)?;
         let mut magic = [0u8; 8];
@@ -1030,6 +1079,7 @@ impl ExecutableNetwork {
             b"DNOPT3\0\0" => 3,
             b"DNOPT4\0\0" => 4,
             b"DNOPT5\0\0" => 5,
+            b"DNOPT6\0\0" => 6,
             _ => return Err(Error::Weights("bad optimizer state magic".to_owned())),
         };
         let mut bytes4 = [0u8; 4];
@@ -1087,8 +1137,77 @@ impl ExecutableNetwork {
                 ));
             }
         }
+        let mut muon_state: Vec<Option<MuonLayerState>> =
+            (0..self.network.layers.len()).map(|_| None).collect();
+        if version >= 6 {
+            file.read_exact(&mut bytes8)?;
+            let count = usize::try_from(u64::from_le_bytes(bytes8))
+                .map_err(|_| Error::Weights("Muon layer count is too large".to_owned()))?;
+            if count > self.network.layers.len() {
+                return Err(Error::Weights(
+                    "Muon layer count exceeds network size".to_owned(),
+                ));
+            }
+            let mut seen = vec![false; self.network.layers.len()];
+            for _ in 0..count {
+                file.read_exact(&mut bytes8)?;
+                let index = usize::try_from(u64::from_le_bytes(bytes8))
+                    .map_err(|_| Error::Weights("Muon layer index is too large".to_owned()))?;
+                if index >= self.network.layers.len() || seen[index] {
+                    return Err(Error::Weights(
+                        "Muon layer index is invalid or repeated".to_owned(),
+                    ));
+                }
+                seen[index] = true;
+                let capacity = host_adam_scalar_capacity(&self.params[index]);
+                muon_state[index] = Some(read_muon_layer_state(&mut file, capacity)?);
+            }
+        }
+        if !self.network.net.muon
+            && muon_state
+                .iter()
+                .flatten()
+                .any(|state| !state.matrices.is_empty())
+        {
+            return Err(Error::Weights(
+                "optimizer sidecar contains Muon state but [net] muon=0".to_owned(),
+            ));
+        }
+        let mut restored_step = step;
+        if self.network.net.muon && version < 6 {
+            // DNOPT1-5 have no Muon momentum. Do not reinterpret their Adam
+            // moments as Muon state; start both optimizer components fresh.
+            host_state.fill(None);
+            restored_step = 0;
+        } else if self.network.net.muon {
+            for (index, state) in muon_state.iter().enumerate() {
+                let Some(state) = state else {
+                    continue;
+                };
+                let layer = &self.network.layers[index];
+                let expected = matrix_shapes(
+                    &layer.kind,
+                    layer.input_shape,
+                    layer.output_shape,
+                    &mut self.params[index],
+                    &mut self.train_buffers[index],
+                )
+                .map_err(|error| Error::Weights(format!("invalid Muon layer layout: {error}")))?;
+                let found: Vec<(usize, usize)> = state
+                    .matrices
+                    .iter()
+                    .map(|matrix| (matrix.rows, matrix.cols))
+                    .collect();
+                if found != expected {
+                    return Err(Error::Weights(format!(
+                        "Muon state matrix shapes for layer {index} are {found:?}, expected {expected:?}"
+                    )));
+                }
+            }
+        }
         self.host_adam_state = host_state;
-        self.adam_step = step;
+        self.muon_state = muon_state;
+        self.adam_step = restored_step;
         Ok(())
     }
 
@@ -1672,9 +1791,10 @@ impl ExecutableNetwork {
     /// The global step advances once for this optimizer update, independent of
     /// how many subdivisions contributed to the buffers.
     pub fn update_weights_adam(&mut self, lr: f32, batch: usize) -> Result<()> {
-        if !self.network.net.adam {
+        if !self.network.net.adam || self.network.net.muon {
             return Err(Error::InvalidConfig(
-                "CPU Adam update requires [net] adam=1".to_owned(),
+                "CPU Adam update requires [net] adam=1 and muon=0; use update_weights_muon for muon=1"
+                    .to_owned(),
             ));
         }
         if !lr.is_finite() || lr < 0.0 {
@@ -1742,6 +1862,119 @@ impl ExecutableNetwork {
                 &mut self.train_buffers[index],
                 state,
                 &layer_adam,
+            )?;
+            if options.clip > 0.0
+                && let LayerParams::Convolutional(params) = &mut self.params[index]
+            {
+                params.weights = darknet_cuda::host_ops::constrain(&params.weights, options.clip);
+            }
+        }
+        self.adam_step = step;
+        Ok(())
+    }
+
+    /// Apply the opt-in hybrid CPU optimizer: Muon for eligible matrix blocks,
+    /// AdamW for all remaining trainable parameters.
+    pub fn update_weights_muon(&mut self, lr: f32, batch: usize) -> Result<()> {
+        let net = self.network.net.clone();
+        if !net.muon || net.adam || !net.decoupled_decay {
+            return Err(Error::InvalidConfig(
+                "CPU Muon update requires [net] muon=1, adam=0, and AdamW fallback".to_owned(),
+            ));
+        }
+        if !lr.is_finite() || lr < 0.0 {
+            return Err(Error::InvalidConfig(
+                "CPU Muon learning rate must be finite and non-negative".to_owned(),
+            ));
+        }
+        if !net.muon_momentum.is_finite() || !(0.0..1.0).contains(&net.muon_momentum) {
+            return Err(Error::InvalidConfig(
+                "CPU Muon momentum must be finite and in [0, 1)".to_owned(),
+            ));
+        }
+        if !net.decay.is_finite() || net.decay < 0.0 {
+            return Err(Error::InvalidConfig(
+                "CPU Muon AdamW decay must be finite and non-negative".to_owned(),
+            ));
+        }
+        let step = self
+            .adam_step
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidConfig("CPU Muon step counter overflowed".to_owned()))?;
+        let loss_scale = if net.loss_scale > 0.0 && net.loss_scale.is_finite() {
+            net.loss_scale
+        } else {
+            1.0
+        };
+        let adam = AdamParams {
+            lr,
+            beta1: net.adam_b1,
+            beta2: net.adam_b2,
+            eps: net.adam_eps * loss_scale,
+            decay: net.decay,
+            batch,
+            step,
+            decoupled_decay: true,
+        };
+        let layer_count = self.network.layers.len();
+        if self.host_adam_state.len() != layer_count {
+            self.host_adam_state = (0..layer_count).map(|_| None).collect();
+        }
+        if self.muon_state.len() != layer_count {
+            self.muon_state = (0..layer_count).map(|_| None).collect();
+        }
+
+        let iteration_num = self.train_iteration as i64 + 1;
+        let burn_in = net.burn_in;
+        for index in 0..layer_count {
+            let layer = self.network.layers[index].clone();
+            let options = layer.train;
+            if !options.updates_at(iteration_num, burn_in) {
+                continue;
+            }
+            prepare_muon_layer_gradients(
+                &layer.kind,
+                options,
+                &mut self.params[index],
+                &mut self.train_buffers[index],
+            )?;
+            let layer_adam = AdamParams {
+                lr: lr * options.learning_rate_scale,
+                ..adam
+            };
+            let staged = {
+                let state = self.muon_state[index].get_or_insert_with(MuonLayerState::default);
+                stage_layer(
+                    &layer.kind,
+                    layer.input_shape,
+                    layer.output_shape,
+                    &mut self.params[index],
+                    &mut self.train_buffers[index],
+                    state,
+                    layer_adam.lr,
+                    batch,
+                    loss_scale,
+                    net.muon_momentum,
+                )?
+            };
+            let adam_state =
+                self.host_adam_state[index].get_or_insert_with(HostAdamLayerState::default);
+            apply_host_adam_layer(
+                &layer.kind,
+                &mut self.params[index],
+                &mut self.train_buffers[index],
+                adam_state,
+                &layer_adam,
+            )?;
+            let muon_state = self.muon_state[index].get_or_insert_with(MuonLayerState::default);
+            apply_staged_layer(
+                &layer.kind,
+                layer.input_shape,
+                layer.output_shape,
+                &mut self.params[index],
+                &mut self.train_buffers[index],
+                muon_state,
+                staged,
             )?;
             if options.clip > 0.0
                 && let LayerParams::Convolutional(params) = &mut self.params[index]
@@ -5700,6 +5933,75 @@ fn write_host_adam_moments(
     Ok(())
 }
 
+fn write_muon_layer_state(file: &mut impl Write, state: &MuonLayerState) -> Result<()> {
+    file.write_all(&(state.matrices.len() as u64).to_le_bytes())?;
+    for matrix in &state.matrices {
+        if matrix.rows == 0
+            || matrix.cols == 0
+            || matrix.rows.checked_mul(matrix.cols) != Some(matrix.momentum.len())
+            || matrix.momentum.iter().any(|value| !value.is_finite())
+        {
+            return Err(Error::Weights(
+                "cannot save malformed or non-finite Muon momentum".to_owned(),
+            ));
+        }
+        file.write_all(&(matrix.rows as u64).to_le_bytes())?;
+        file.write_all(&(matrix.cols as u64).to_le_bytes())?;
+        file.write_all(&(matrix.momentum.len() as u64).to_le_bytes())?;
+        for value in &matrix.momentum {
+            file.write_all(&value.to_le_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+fn read_muon_layer_state(file: &mut File, max_tensor_len: usize) -> Result<MuonLayerState> {
+    let mut bytes8 = [0u8; 8];
+    file.read_exact(&mut bytes8)?;
+    let count = usize::try_from(u64::from_le_bytes(bytes8))
+        .map_err(|_| Error::Weights("Muon matrix count is too large".to_owned()))?;
+    if count == 0 || count > max_tensor_len {
+        return Err(Error::Weights(
+            "Muon matrix count is empty or exceeds layer parameter capacity".to_owned(),
+        ));
+    }
+    let mut matrices = Vec::with_capacity(count);
+    for _ in 0..count {
+        file.read_exact(&mut bytes8)?;
+        let rows = usize::try_from(u64::from_le_bytes(bytes8))
+            .map_err(|_| Error::Weights("Muon matrix row count is too large".to_owned()))?;
+        file.read_exact(&mut bytes8)?;
+        let cols = usize::try_from(u64::from_le_bytes(bytes8))
+            .map_err(|_| Error::Weights("Muon matrix column count is too large".to_owned()))?;
+        file.read_exact(&mut bytes8)?;
+        let len = usize::try_from(u64::from_le_bytes(bytes8))
+            .map_err(|_| Error::Weights("Muon momentum length is too large".to_owned()))?;
+        if rows == 0 || cols == 0 || rows.checked_mul(cols) != Some(len) || len > max_tensor_len {
+            return Err(Error::Weights(
+                "Muon momentum shape is malformed or exceeds layer parameter capacity".to_owned(),
+            ));
+        }
+        let mut momentum = Vec::with_capacity(len);
+        for _ in 0..len {
+            let mut bytes4 = [0u8; 4];
+            file.read_exact(&mut bytes4)?;
+            let value = f32::from_le_bytes(bytes4);
+            if !value.is_finite() {
+                return Err(Error::Weights(
+                    "Muon momentum contains a non-finite value".to_owned(),
+                ));
+            }
+            momentum.push(value);
+        }
+        matrices.push(MuonMatrixState {
+            rows,
+            cols,
+            momentum,
+        });
+    }
+    Ok(MuonLayerState { matrices })
+}
+
 fn write_host_adam_state(file: &mut impl Write, state: &HostAdamLayerState) -> Result<()> {
     write_host_adam_moments(file, &state.weights)?;
     write_host_adam_moments(file, &state.biases)?;
@@ -6734,6 +7036,11 @@ where
     /// C++-compatible and carries only parameters plus `seen`; this sidecar
     /// preserves optimizer state on resume.
     pub fn save_optimizer_state(&self, path: impl AsRef<Path>) -> Result<()> {
+        if self.network.net.muon {
+            return Err(Error::Weights(
+                "GPU optimizer sidecars do not persist CPU Muon state".to_owned(),
+            ));
+        }
         let mut file = std::io::BufWriter::with_capacity(1 << 20, File::create(path)?);
         let has_moe_scale_moments = self
             .moe_adam_state
@@ -6844,6 +7151,11 @@ where
     /// from the sidecar keep `None` moments (Adam will initialise them on the
     /// next step), and the step counter is restored as stored.
     pub fn load_optimizer_state(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        if self.network.net.muon {
+            return Err(Error::Weights(
+                "GPU optimizer state loading is unsupported for [net] muon=1".to_owned(),
+            ));
+        }
         let mut file = File::open(path)?;
         let mut magic = [0u8; 8];
         file.read_exact(&mut magic)?;
@@ -7565,6 +7877,12 @@ where
         batch: usize,
         sync_host_weights: bool,
     ) -> Result<()> {
+        if self.network.net.muon {
+            return Err(Error::InvalidConfig(
+                "[net] muon=1 GPU optimizer updates are not implemented in the Stage-1 CPU Muon port"
+                    .to_owned(),
+            ));
+        }
         if let Some(layer) = self
             .network
             .layers
@@ -17058,6 +17376,39 @@ fn apply_host_adam_swin(
     Ok(())
 }
 
+fn prepare_muon_layer_gradients(
+    kind: &LayerKind,
+    options: crate::model::LayerTrainOptions,
+    params: &LayerParams,
+    train: &mut LayerTrainBuffers,
+) -> Result<()> {
+    if options.grad_centr
+        && let (LayerParams::Convolutional(params), LayerTrainBuffers::Convolutional(train)) =
+            (params, &mut *train)
+        && params.batch_norm.is_some()
+    {
+        let filter_size = params.weights.len() / params.biases.len().max(1);
+        if filter_size > 0 {
+            train.weight_updates =
+                darknet_cuda::host_ops::gradient_centralization(&train.weight_updates, filter_size);
+        }
+    }
+    match (kind, train) {
+        (LayerKind::Vit(spec), LayerTrainBuffers::Vit(train)) => {
+            sanitize_vit_updates(&mut train.updates, spec.learned_pos_embed);
+            let scale = vit_update_clip_scale(&train.updates, 5.0, spec.learned_pos_embed);
+            scale_vit_updates(&mut train.updates, scale);
+        }
+        (LayerKind::Swin(_), LayerTrainBuffers::Swin(train)) => {
+            sanitize_swin_updates(&mut train.updates);
+            let scale = swin_update_clip_scale(&train.updates, 5.0);
+            scale_swin_updates(&mut train.updates, scale);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn apply_host_adam_mambavision(
     params: &mut crate::mambavision::MambaVisionParams,
     train: &mut MambaVisionTrainBuffers,
@@ -25298,13 +25649,14 @@ mod tests {
     use crate::model::{
         Activation, ConvolutionalSpec, LayerKind, LrPolicy, NetConfig, Network, TensorShape,
     };
+    use crate::muon::MuonMatrixState;
     use crate::train::{YoloLabel, compute_yolo_training_loss};
     use darknet_cuda::{ElementwiseLaunchConfig, F32ActivationKind, F32TensorOpsBackend};
 
     use super::{
         ConvolutionalParams, ExecutableNetwork, ForwardResult, GpuExecutableNetwork,
-        HostAdamLayerState, LayerParams, LayerTrainBuffers, Tensor, compute_learning_rate,
-        sgd_update,
+        HostAdamLayerState, LayerParams, LayerTrainBuffers, MuonLayerState, Tensor,
+        compute_learning_rate, sgd_update, write_muon_layer_state,
     };
 
     fn fill_wmhf_test_params(executable: &mut ExecutableNetwork) {
@@ -31268,6 +31620,8 @@ mod tests {
             adam_b2: 0.999,
             adam_eps: 1e-6,
             decoupled_decay: false,
+            muon: false,
+            muon_momentum: 0.95,
             loss_scale: 1.0,
             try_fix_nan: false,
         };
@@ -38485,6 +38839,176 @@ mod tests {
     }
 
     #[test]
+    fn cpu_muon_hybrid_uses_adamw_fallback_and_round_trips_dnopt6() {
+        fn build() -> ExecutableNetwork {
+            let network = Network::from_config(
+                ConfigFile::parse_str(
+                    "muon.cfg",
+                    r#"[net]
+width=1
+height=1
+channels=1
+batch=1
+muon=1
+loss_scale=2
+decay=0.1
+[connected]
+output=1
+batch_normalize=1
+activation=linear
+"#,
+                )
+                .expect("Muon cfg"),
+            )
+            .expect("Muon network");
+            ExecutableNetwork::new(network)
+        }
+        fn set_updates(executable: &mut ExecutableNetwork, values: [f32; 3]) {
+            let LayerTrainBuffers::Connected(train) = &mut executable.train_buffers[0] else {
+                panic!("connected train buffers");
+            };
+            train.weight_updates[0] = values[0];
+            train.bias_updates[0] = values[1];
+            let batch_norm = train.batch_norm.as_mut().expect("connected BN train");
+            batch_norm.scale_updates[0] = values[2];
+        }
+
+        let mut original = build();
+        let LayerParams::Connected(params) = &mut original.params[0] else {
+            panic!("connected parameters");
+        };
+        params.weights[0] = 2.0;
+        params.biases[0] = 3.0;
+        let batch_norm = params.batch_norm.as_mut().expect("connected BN params");
+        batch_norm.scales[0] = 1.0;
+        batch_norm.biases[0] = -1.0;
+        set_updates(&mut original, [4.0, 2.0, 3.0]);
+        original.update_weights_muon(0.1, 2).expect("Muon update");
+
+        let LayerParams::Connected(params) = &original.params[0] else {
+            unreachable!()
+        };
+        assert!((params.weights[0] - 1.993_928_7).abs() < 2e-6);
+        assert!((params.biases[0] - 3.1).abs() < 2e-6);
+        let batch_norm = params.batch_norm.as_ref().unwrap();
+        assert!((batch_norm.scales[0] - 1.1).abs() < 2e-6);
+        assert_eq!(batch_norm.biases[0], -1.0);
+        assert_eq!(original.adam_step(), 1);
+        assert_eq!(original.muon_state[0].as_ref().unwrap().matrices.len(), 1);
+        assert_eq!(
+            original.muon_state[0].as_ref().unwrap().matrices[0].momentum,
+            [1.0]
+        );
+
+        let dir = std::env::temp_dir().join(format!("darknet-muon-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("muon.state");
+        original.save_optimizer_state(&path).expect("save DNOPT6");
+        assert_eq!(&std::fs::read(&path).unwrap()[..8], b"DNOPT6\0\0");
+
+        let mut resumed = build();
+        resumed.params = original.params.clone();
+        resumed.load_optimizer_state(&path).expect("load DNOPT6");
+        assert_eq!(resumed.adam_step(), original.adam_step());
+        assert_eq!(resumed.muon_state, original.muon_state);
+        assert_eq!(resumed.host_adam_state, original.host_adam_state);
+
+        original.zero_train_buffers();
+        resumed.zero_train_buffers();
+        set_updates(&mut original, [-2.0, -1.0, -3.0]);
+        set_updates(&mut resumed, [-2.0, -1.0, -3.0]);
+        original
+            .update_weights_muon(0.1, 2)
+            .expect("original next step");
+        resumed
+            .update_weights_muon(0.1, 2)
+            .expect("resumed next step");
+        assert_eq!(resumed.params, original.params);
+        assert_eq!(resumed.muon_state, original.muon_state);
+        assert_eq!(resumed.host_adam_state, original.host_adam_state);
+
+        let legacy_cfg = r#"[net]
+width=1
+height=1
+channels=1
+batch=1
+adam=1
+decoupled_decay=1
+loss_scale=2
+decay=0.1
+[connected]
+output=1
+batch_normalize=1
+activation=linear
+"#;
+        let legacy_network = Network::from_config(
+            ConfigFile::parse_str("legacy-adam.cfg", legacy_cfg).expect("legacy cfg"),
+        )
+        .expect("legacy network");
+        let mut legacy = ExecutableNetwork::new(legacy_network);
+        set_updates(&mut legacy, [1.0, 2.0, 3.0]);
+        legacy
+            .update_weights_adam(0.1, 2)
+            .expect("legacy Adam update");
+        let legacy_path = dir.join("legacy-v3.state");
+        legacy
+            .save_optimizer_state(&legacy_path)
+            .expect("save DNOPT3");
+        assert_eq!(&std::fs::read(&legacy_path).unwrap()[..8], b"DNOPT3\0\0");
+        let mut migrated = build();
+        migrated
+            .load_optimizer_state(&legacy_path)
+            .expect("Muon reads DNOPT3");
+        assert_eq!(migrated.adam_step(), 0);
+        assert!(migrated.host_adam_state.iter().all(Option::is_none));
+        assert!(migrated.muon_state.iter().all(Option::is_none));
+
+        let mut malformed = Vec::new();
+        malformed.extend_from_slice(b"DNOPT6\0\0");
+        malformed.extend_from_slice(&1u32.to_le_bytes());
+        for count in [0u64, 0, 0, 0, 1] {
+            malformed.extend_from_slice(&count.to_le_bytes());
+        }
+        malformed.extend_from_slice(&0u64.to_le_bytes());
+        write_muon_layer_state(
+            &mut malformed,
+            &MuonLayerState {
+                matrices: vec![MuonMatrixState {
+                    rows: 2,
+                    cols: 1,
+                    momentum: vec![0.0; 2],
+                }],
+            },
+        )
+        .expect("encode malformed-shape state");
+        let malformed_path = dir.join("malformed-v6.state");
+        std::fs::write(&malformed_path, malformed).unwrap();
+        let mut invalid = build();
+        let error = invalid
+            .load_optimizer_state(&malformed_path)
+            .expect_err("wrong Muon matrix shape must reject");
+        assert!(error.to_string().contains("matrix shapes"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn gpu_muon_optimizer_update_is_rejected_explicitly() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "muon.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=1\nmuon=1\n[connected]\noutput=1\n",
+            )
+            .expect("Muon cfg"),
+        )
+        .expect("Muon network");
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        let error = gpu
+            .update_weights_gpu(0.01, 0.9, 0.0005, 1)
+            .expect_err("GPU Muon is deferred");
+        assert!(error.to_string().contains("muon=1 GPU optimizer updates"));
+    }
+
+    #[test]
     fn optimizer_state_round_trips_adam_moments() {
         let dir = std::env::temp_dir().join(format!("darknet-opt-state-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -39874,6 +40398,18 @@ mod tests {
         let r = keyed_step(&keyed_cfg("", "", "train_only_bn=1\n"), 5);
         assert_eq!(r[0], init(0));
         assert_eq!(r[1], init(1));
+
+        let mut muon = keyed_cpu(&keyed_cfg("muon=1\n", "", "train_only_bn=1\n"));
+        let before = muon.params.clone();
+        muon.set_train_iteration(5);
+        muon.update_weights_muon(0.1, 1).unwrap();
+        assert_eq!(
+            muon.params, before,
+            "train_only_bn freezes Muon and fallback"
+        );
+        assert!(muon.muon_state.iter().all(Option::is_none));
+        assert!(muon.host_adam_state.iter().all(Option::is_none));
+        assert_eq!(muon.adam_step(), 1, "the global update step still advances");
     }
 
     #[test]
