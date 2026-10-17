@@ -98,6 +98,7 @@ pub mod runtime;
 pub(crate) mod segmentation;
 pub(crate) mod shortcut_weights;
 pub mod train;
+pub(crate) mod vc_attention;
 pub(crate) mod vit;
 pub mod weights;
 
