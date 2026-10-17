@@ -396,6 +396,402 @@ fn probability_code_boundary(u: f32, mode: ExpCastMode) -> bool {
     }
 }
 
+const VC_QK_CLAMP: f32 = 128.0;
+const VC_LOG2_E: f32 = 1.4426950408889634;
+
+#[derive(Clone, Debug)]
+pub(crate) struct QuantizedQkCache {
+    tokens: usize,
+    channels: usize,
+    q_codes: Vec<u8>,
+    k_codes: Vec<u8>,
+    q_scales: Vec<f32>,
+    k_scale: f32,
+    q_active: Vec<bool>,
+    k_active: Vec<bool>,
+    q_scale_max_channels: Vec<usize>,
+    q_scale_max_signs: Vec<f32>,
+    q_scale_ties: Vec<bool>,
+    q_zero_scales: Vec<bool>,
+    k_scale_max_position: usize,
+    k_scale_max_channel: usize,
+    k_scale_max_sign: f32,
+    k_scale_tie: bool,
+    k_zero_scale: bool,
+    q_code_boundary: bool,
+    k_code_boundary: bool,
+    q_clamp_boundaries: Vec<bool>,
+    k_clamp_boundaries: Vec<bool>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct QkScaleGradients {
+    q_scales: Vec<f32>,
+    k_scale: f32,
+}
+
+/// Quantize one head's Q/K tensors using VC's row-wise Q scale and centered,
+/// per-tensor K scale. The optional permutation is applied only to K rows.
+pub(crate) fn quantize_qk(
+    q_raw: &[f32],
+    k_raw: &[f32],
+    tokens: usize,
+    channels: usize,
+    permutation: Option<&[usize]>,
+) -> Result<QuantizedQkCache, String> {
+    if tokens == 0 || channels == 0 {
+        return Err("VC Q/K quantization requires positive token and channel counts".into());
+    }
+    let expected = tokens
+        .checked_mul(channels)
+        .ok_or("VC Q/K tensor size overflow")?;
+    if q_raw.len() != expected || k_raw.len() != expected {
+        return Err(format!(
+            "VC Q/K tensors have lengths {} and {}, expected {expected}",
+            q_raw.len(),
+            k_raw.len()
+        ));
+    }
+    let permutation = match permutation {
+        Some(permutation) => {
+            if permutation.len() != tokens {
+                return Err(format!(
+                    "VC Q/K permutation has {} entries, expected {tokens}",
+                    permutation.len()
+                ));
+            }
+            let mut seen = vec![false; tokens];
+            for &token in permutation {
+                if token >= tokens || seen[token] {
+                    return Err("VC Q/K permutation is not a token bijection".into());
+                }
+                seen[token] = true;
+            }
+            permutation.to_vec()
+        }
+        None => (0..tokens).collect(),
+    };
+
+    let mut q_values = vec![0.0; expected];
+    let mut k_values = vec![0.0; expected];
+    let mut q_active = vec![false; expected];
+    let mut k_active = vec![false; expected];
+    let mut q_clamp_boundaries = vec![false; tokens];
+    let mut k_clamp_boundaries = vec![false; channels];
+    for index in 0..expected {
+        let raw_q = q_raw[index];
+        let raw_k = k_raw[index];
+        let token = index / channels;
+        let channel = index % channels;
+        q_active[index] = raw_q.is_finite() && raw_q.abs() < VC_QK_CLAMP;
+        k_active[index] = raw_k.is_finite() && raw_k.abs() < VC_QK_CLAMP;
+        q_clamp_boundaries[token] |= raw_q.is_finite() && raw_q.abs() == VC_QK_CLAMP;
+        k_clamp_boundaries[channel] |= raw_k.is_finite() && raw_k.abs() == VC_QK_CLAMP;
+        q_values[index] = if raw_q.is_finite() {
+            raw_q.clamp(-VC_QK_CLAMP, VC_QK_CLAMP)
+        } else {
+            0.0
+        };
+        k_values[index] = if raw_k.is_finite() {
+            raw_k.clamp(-VC_QK_CLAMP, VC_QK_CLAMP)
+        } else {
+            0.0
+        };
+    }
+
+    let mut q_scales = vec![1.0; tokens];
+    let mut q_scale_max_channels = vec![0; tokens];
+    let mut q_scale_max_signs = vec![0.0; tokens];
+    let mut q_scale_ties = vec![false; tokens];
+    let mut q_zero_scales = vec![false; tokens];
+    let mut q_codes = vec![0; expected];
+    let mut q_code_boundary = false;
+    for token in 0..tokens {
+        let row = &q_values[token * channels..(token + 1) * channels];
+        let mut maximum = 0.0f32;
+        let mut maximum_channel = 0;
+        let mut maxima = 0usize;
+        for (channel, value) in row.iter().copied().enumerate() {
+            let magnitude = value.abs();
+            if magnitude > maximum {
+                maximum = magnitude;
+                maximum_channel = channel;
+                maxima = 1;
+            } else if magnitude == maximum {
+                maxima += 1;
+            }
+        }
+        if maximum == 0.0 {
+            q_zero_scales[token] = true;
+        } else {
+            q_scales[token] = maximum / 448.0;
+            q_scale_max_channels[token] = maximum_channel;
+            q_scale_max_signs[token] = row[maximum_channel].signum();
+            q_scale_ties[token] = maxima > 1;
+        }
+        for channel in 0..channels {
+            let index = token * channels + channel;
+            let normalized = q_values[index] / q_scales[token];
+            q_code_boundary |= e4m3_quantization_boundary(normalized);
+            q_codes[index] = e4m3_encode_bits(normalized);
+        }
+    }
+
+    let mut key_means = vec![0.0; channels];
+    for channel in 0..channels {
+        for token in 0..tokens {
+            key_means[channel] += k_values[token * channels + channel];
+        }
+        key_means[channel] /= tokens as f32;
+    }
+    let mut maximum = 0.0f32;
+    let mut maximum_position = 0;
+    let mut maximum_channel = 0;
+    let mut maxima = 0usize;
+    for position in 0..tokens {
+        let original = permutation[position];
+        for channel in 0..channels {
+            let residual = k_values[original * channels + channel] - key_means[channel];
+            let magnitude = residual.abs();
+            if magnitude > maximum {
+                maximum = magnitude;
+                maximum_position = original;
+                maximum_channel = channel;
+                maxima = 1;
+            } else if magnitude == maximum {
+                maxima += 1;
+            }
+        }
+    }
+    let k_zero_scale = maximum == 0.0;
+    let k_scale = if k_zero_scale { 1.0 } else { maximum / 448.0 };
+    let k_scale_max_sign = if k_zero_scale {
+        0.0
+    } else {
+        (k_values[maximum_position * channels + maximum_channel] - key_means[maximum_channel])
+            .signum()
+    };
+    let k_scale_tie = !k_zero_scale && maxima > 1;
+    let mut k_codes = vec![0; expected];
+    let mut k_code_boundary = false;
+    for position in 0..tokens {
+        let original = permutation[position];
+        for channel in 0..channels {
+            let residual = k_values[original * channels + channel] - key_means[channel];
+            let normalized = residual / k_scale;
+            let index = position * channels + channel;
+            k_code_boundary |= e4m3_quantization_boundary(normalized);
+            k_codes[index] = e4m3_encode_bits(normalized);
+        }
+    }
+
+    Ok(QuantizedQkCache {
+        tokens,
+        channels,
+        q_codes,
+        k_codes,
+        q_scales,
+        k_scale,
+        q_active,
+        k_active,
+        q_scale_max_channels,
+        q_scale_max_signs,
+        q_scale_ties,
+        q_zero_scales,
+        k_scale_max_position: maximum_position,
+        k_scale_max_channel: maximum_channel,
+        k_scale_max_sign,
+        k_scale_tie,
+        k_zero_scale,
+        q_code_boundary,
+        k_code_boundary,
+        q_clamp_boundaries,
+        k_clamp_boundaries,
+    })
+}
+
+/// Compute the source-shaped log2 QK score row, including score clamp.
+pub(crate) fn quantized_qk_log2_scores(
+    cache: &QuantizedQkCache,
+    query: usize,
+    attention_scale: f32,
+    score_clamp: f32,
+) -> Result<Vec<f32>, String> {
+    if query >= cache.tokens {
+        return Err(format!(
+            "VC Q/K query index {query} is outside {} tokens",
+            cache.tokens
+        ));
+    }
+    if !attention_scale.is_finite() || !score_clamp.is_finite() {
+        return Err("VC Q/K score scales must be finite".into());
+    }
+    let factor = cache.q_scales[query] * cache.k_scale * attention_scale * VC_LOG2_E;
+    let clamp = if score_clamp > 0.0 {
+        score_clamp * VC_LOG2_E
+    } else {
+        0.0
+    };
+    let mut scores = vec![0.0; cache.tokens];
+    for (key, score) in scores.iter_mut().enumerate() {
+        let mut dot = 0.0;
+        for channel in 0..cache.channels {
+            let index = query * cache.channels + channel;
+            let key_index = key * cache.channels + channel;
+            dot += e4m3_to_f32(cache.q_codes[index]) * e4m3_to_f32(cache.k_codes[key_index]);
+        }
+        let raw = dot * factor;
+        if !raw.is_finite() {
+            return Err("VC Q/K dot product produced a non-finite score".into());
+        }
+        *score = if clamp > 0.0 {
+            raw.clamp(-clamp, clamp)
+        } else {
+            raw
+        };
+    }
+    Ok(scores)
+}
+
+pub(crate) fn new_qk_scale_gradients(cache: &QuantizedQkCache) -> QkScaleGradients {
+    QkScaleGradients {
+        q_scales: vec![0.0; cache.tokens],
+        k_scale: 0.0,
+    }
+}
+
+/// Accumulate derivatives of one clamped score row into the continuous Q/K
+/// scale factors; E4M3 code paths remain piecewise constant.
+pub(crate) fn accumulate_qk_scale_gradients(
+    cache: &QuantizedQkCache,
+    query: usize,
+    score_grad: &[f32],
+    attention_scale: f32,
+    score_clamp: f32,
+    scale_gradients: &mut QkScaleGradients,
+) -> Result<(), String> {
+    if query >= cache.tokens || score_grad.len() != cache.tokens {
+        return Err("VC Q/K score-gradient shape mismatch".into());
+    }
+    if scale_gradients.q_scales.len() != cache.tokens {
+        return Err("VC Q/K scale-gradient cache shape mismatch".into());
+    }
+    if score_grad.iter().any(|gradient| !gradient.is_finite()) {
+        return Err("VC Q/K score gradients must be finite".into());
+    }
+    if !attention_scale.is_finite() || !score_clamp.is_finite() {
+        return Err("VC Q/K score scales must be finite".into());
+    }
+    let factor = cache.q_scales[query] * cache.k_scale * attention_scale * VC_LOG2_E;
+    let clamp = if score_clamp > 0.0 {
+        score_clamp * VC_LOG2_E
+    } else {
+        0.0
+    };
+    let mut q_scale_grad = 0.0;
+    let mut k_scale_grad = 0.0;
+    for key in 0..cache.tokens {
+        let mut dot = 0.0;
+        for channel in 0..cache.channels {
+            let q_index = query * cache.channels + channel;
+            let k_index = key * cache.channels + channel;
+            dot += e4m3_to_f32(cache.q_codes[q_index]) * e4m3_to_f32(cache.k_codes[k_index]);
+        }
+        let raw = dot * factor;
+        if !raw.is_finite() {
+            return Err("VC Q/K dot product produced a non-finite score".into());
+        }
+        let active = if clamp > 0.0 {
+            if raw.abs() == clamp {
+                return Err(
+                    "VC Q/K score derivative is undefined at the score-clamp boundary".into(),
+                );
+            }
+            raw.abs() < clamp
+        } else {
+            true
+        };
+        if active {
+            let gradient = score_grad[key];
+            q_scale_grad += gradient * dot * cache.k_scale * attention_scale * VC_LOG2_E;
+            k_scale_grad += gradient * dot * cache.q_scales[query] * attention_scale * VC_LOG2_E;
+        }
+    }
+    scale_gradients.q_scales[query] += q_scale_grad;
+    scale_gradients.k_scale += k_scale_grad;
+    Ok(())
+}
+
+/// Chain continuous scale derivatives to raw Q/K, including K centering and
+/// the Q/K clamp masks. Discrete E4M3 codes contribute no straight-through term.
+pub(crate) fn quantized_qk_scale_input_backward(
+    cache: &QuantizedQkCache,
+    scale_gradients: &QkScaleGradients,
+) -> Result<(Vec<f32>, Vec<f32>), String> {
+    if scale_gradients.q_scales.len() != cache.tokens {
+        return Err("VC Q/K scale-gradient cache shape mismatch".into());
+    }
+    if cache.q_code_boundary || cache.k_code_boundary {
+        return Err("VC Q/K derivative is undefined at an E4M3 rounding boundary".into());
+    }
+    if !scale_gradients.k_scale.is_finite()
+        || scale_gradients
+            .q_scales
+            .iter()
+            .any(|gradient| !gradient.is_finite())
+    {
+        return Err("VC Q/K scale gradients must be finite".into());
+    }
+    let mut q_grad = vec![0.0; cache.tokens * cache.channels];
+    let mut k_grad = vec![0.0; cache.tokens * cache.channels];
+
+    for query in 0..cache.tokens {
+        let scale_grad = scale_gradients.q_scales[query];
+        if scale_grad == 0.0 {
+            continue;
+        }
+        if cache.q_zero_scales[query] || cache.q_scale_ties[query] {
+            return Err(format!(
+                "VC Q scale derivative is undefined for zero or tied maximum in query {query}"
+            ));
+        }
+        if cache.q_clamp_boundaries[query] {
+            return Err("VC Q scale derivative is undefined at the Q clamp boundary".into());
+        }
+        let index = query * cache.channels + cache.q_scale_max_channels[query];
+        if cache.q_active[index] {
+            q_grad[index] += scale_grad * cache.q_scale_max_signs[query] / 448.0;
+        }
+    }
+
+    if scale_gradients.k_scale != 0.0 {
+        if cache.k_zero_scale || cache.k_scale_tie {
+            return Err(
+                "VC K scale derivative is undefined for zero or tied residual maximum".into(),
+            );
+        }
+        let channel = cache.k_scale_max_channel;
+        if cache.k_clamp_boundaries[channel] {
+            return Err("VC K scale derivative is undefined at the K clamp boundary".into());
+        }
+        let maximum_token = cache.k_scale_max_position;
+        let sign = cache.k_scale_max_sign / 448.0;
+        for token in 0..cache.tokens {
+            let centered = if token == maximum_token {
+                1.0 - 1.0 / cache.tokens as f32
+            } else {
+                -1.0 / cache.tokens as f32
+            };
+            let original = token;
+            let index = original * cache.channels + channel;
+            if cache.k_active[index] {
+                k_grad[index] += scale_gradients.k_scale * sign * centered;
+            }
+        }
+    }
+    Ok((q_grad, k_grad))
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct QuantizedOnlineRowCache {
     tokens: usize,
@@ -594,9 +990,10 @@ pub(crate) fn quantized_online_row_backward(
 #[cfg(test)]
 mod tests {
     use super::{
-        ExpCastMode, e4m3_encode_bits, e4m3_quantization_boundary, e4m3_to_f32,
-        expcast_probability_code, quantized_online_row_backward, quantized_online_row_forward,
-        vsmooth_backward, vsmooth_forward,
+        ExpCastMode, accumulate_qk_scale_gradients, e4m3_encode_bits, e4m3_quantization_boundary,
+        e4m3_to_f32, expcast_probability_code, new_qk_scale_gradients, quantize_qk,
+        quantized_online_row_backward, quantized_online_row_forward, quantized_qk_log2_scores,
+        quantized_qk_scale_input_backward, vsmooth_backward, vsmooth_forward,
     };
 
     #[test]
@@ -870,5 +1267,123 @@ mod tests {
         let (_, _, cache) =
             quantized_online_row_forward(&scores, &values, 1, ExpCastMode::Order0).unwrap();
         assert!(quantized_online_row_backward(&[1.0], &cache).is_err());
+    }
+
+    #[test]
+    fn qk_scale_chain_matches_finite_differences_with_permuted_keys() {
+        let tokens = 4;
+        let channels = 2;
+        let q = vec![0.51, 0.12, 0.42, -0.17, -0.30, 0.61, 0.20, 0.55];
+        let k = vec![0.23, -0.40, 0.71, 0.14, -0.19, 0.52, 0.08, -0.11];
+        let permutation = [2, 0, 3, 1];
+        let attention_scale = 0.7;
+        let score_clamp = 0.0;
+        let cache = quantize_qk(&q, &k, tokens, channels, Some(&permutation)).unwrap();
+        assert!(!cache.q_code_boundary && !cache.k_code_boundary);
+        let coefficients: Vec<f32> = (0..tokens * tokens)
+            .map(|index| (index as f32 * 0.31).sin() * 0.7)
+            .collect();
+        let mut scale_grads = new_qk_scale_gradients(&cache);
+        for query in 0..tokens {
+            accumulate_qk_scale_gradients(
+                &cache,
+                query,
+                &coefficients[query * tokens..(query + 1) * tokens],
+                attention_scale,
+                score_clamp,
+                &mut scale_grads,
+            )
+            .unwrap();
+        }
+        let (q_grad, k_grad) = quantized_qk_scale_input_backward(&cache, &scale_grads).unwrap();
+        assert!(q_grad.iter().any(|gradient| gradient.abs() > 1.0e-6));
+        assert!(k_grad.iter().any(|gradient| gradient.abs() > 1.0e-6));
+
+        let objective = |q_values: &[f32], k_values: &[f32]| {
+            let cache =
+                quantize_qk(q_values, k_values, tokens, channels, Some(&permutation)).unwrap();
+            let mut total = 0.0;
+            for query in 0..tokens {
+                let scores =
+                    quantized_qk_log2_scores(&cache, query, attention_scale, score_clamp).unwrap();
+                for key in 0..tokens {
+                    total += coefficients[query * tokens + key] * scores[key];
+                }
+            }
+            total
+        };
+        let epsilon = 1.0e-5;
+        let mut checked_q = 0;
+        for index in 0..q.len() {
+            let mut plus = q.clone();
+            let mut minus = q.clone();
+            plus[index] += epsilon;
+            minus[index] -= epsilon;
+            let plus_cache = quantize_qk(&plus, &k, tokens, channels, Some(&permutation)).unwrap();
+            let minus_cache =
+                quantize_qk(&minus, &k, tokens, channels, Some(&permutation)).unwrap();
+            if plus_cache.q_codes != cache.q_codes
+                || minus_cache.q_codes != cache.q_codes
+                || plus_cache.q_scale_max_channels != cache.q_scale_max_channels
+                || minus_cache.q_scale_max_channels != cache.q_scale_max_channels
+            {
+                continue;
+            }
+            let numeric = (objective(&plus, &k) - objective(&minus, &k)) / (2.0 * epsilon);
+            let error = (q_grad[index] - numeric).abs();
+            assert!(
+                error <= 0.003 + 0.06 * numeric.abs(),
+                "Q gradient {index}: analytic {}, numeric {numeric}, error {error}",
+                q_grad[index]
+            );
+            checked_q += 1;
+        }
+        assert_eq!(checked_q, q.len());
+
+        let mut checked_k = 0;
+        for index in 0..k.len() {
+            let mut plus = k.clone();
+            let mut minus = k.clone();
+            plus[index] += epsilon;
+            minus[index] -= epsilon;
+            let plus_cache = quantize_qk(&q, &plus, tokens, channels, Some(&permutation)).unwrap();
+            let minus_cache =
+                quantize_qk(&q, &minus, tokens, channels, Some(&permutation)).unwrap();
+            if plus_cache.k_codes != cache.k_codes
+                || minus_cache.k_codes != cache.k_codes
+                || plus_cache.k_scale_max_position != cache.k_scale_max_position
+                || minus_cache.k_scale_max_position != cache.k_scale_max_position
+                || plus_cache.k_scale_max_channel != cache.k_scale_max_channel
+                || minus_cache.k_scale_max_channel != cache.k_scale_max_channel
+            {
+                continue;
+            }
+            let numeric = (objective(&q, &plus) - objective(&q, &minus)) / (2.0 * epsilon);
+            let error = (k_grad[index] - numeric).abs();
+            assert!(
+                error <= 0.003 + 0.06 * numeric.abs(),
+                "K gradient {index}: analytic {}, numeric {numeric}, error {error}",
+                k_grad[index]
+            );
+            checked_k += 1;
+        }
+        assert_eq!(checked_k, k.len());
+    }
+
+    #[test]
+    fn qk_score_clamp_masks_scale_derivatives() {
+        let tokens = 2;
+        let channels = 2;
+        let q = [0.5, 0.2, -0.4, 0.7];
+        let k = [0.2, -0.3, 0.8, 0.1];
+        let cache = quantize_qk(&q, &k, tokens, channels, None).unwrap();
+        let mut scale_grads = new_qk_scale_gradients(&cache);
+        for query in 0..tokens {
+            accumulate_qk_scale_gradients(&cache, query, &[1.0; 2], 1.0, 1.0e-4, &mut scale_grads)
+                .unwrap();
+        }
+        let (q_grad, k_grad) = quantized_qk_scale_input_backward(&cache, &scale_grads).unwrap();
+        assert!(q_grad.iter().all(|gradient| *gradient == 0.0));
+        assert!(k_grad.iter().all(|gradient| *gradient == 0.0));
     }
 }
