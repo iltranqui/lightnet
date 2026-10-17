@@ -30,6 +30,7 @@ pub(crate) mod contrastive;
 pub(crate) mod dcnv4;
 pub(crate) mod deform_conv;
 pub(crate) mod dsconv;
+pub(crate) mod graph_conv;
 pub use chart::{ChartPoint, write_training_chart};
 pub mod dense_loss;
 pub use dense_loss::{

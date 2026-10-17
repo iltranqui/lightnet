@@ -235,6 +235,26 @@ pub fn initialize_training_params(network: &Network, params: &mut [LayerParams],
                 conv(&mut p.input, &mut rng);
                 conv(&mut p.self_params, &mut rng);
             }
+            LayerParams::GraphConv(p) => {
+                let crate::LayerKind::GraphConv(spec) = &layer.kind else {
+                    unreachable!("graph-conv parameters require a graph-conv layer");
+                };
+                let channels_per_group = layer.input_shape.channels / spec.groups;
+                rng.weights(&mut p.projection.weights, channels_per_group);
+                p.projection.biases.fill(0.0);
+                if let Some(batch_norm) = &mut p.projection.batch_norm {
+                    bn(batch_norm);
+                }
+                if let Some(weights) = &mut p.self_weights {
+                    rng.weights(weights, channels_per_group);
+                }
+                if let Some(kernel) = &mut p.edge_kernel {
+                    rng.weights_with_scale(kernel, 0.001);
+                }
+                if let Some(biases) = &mut p.edge_biases {
+                    biases.fill(0.0);
+                }
+            }
             LayerParams::Dcnv4(p) => {
                 let crate::LayerKind::Dcnv4(spec) = &layer.kind else {
                     unreachable!("DCNv4 parameters require a DCNv4 layer");
@@ -697,6 +717,63 @@ mod tests {
             panic!("Vit params")
         };
         assert_eq!(w.patch_embed, vec![0.25; 4]);
+    }
+
+    #[test]
+    fn graph_conv_initialization_is_seeded_and_uses_source_bounds() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "graph-conv-init.cfg",
+                "[net]\nwidth=3\nheight=2\nchannels=4\n[graph_conv]\nfilters=6\ngroups=2\nsize=3\npad=1\nbatch_normalize=1\nedge_mode=1\ngraph_use_self=1\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut first = ExecutableNetwork::new(network.clone());
+        let mut second = ExecutableNetwork::new(network.clone());
+        initialize_training_params(&network, &mut first.params, 83);
+        initialize_training_params(&network, &mut second.params, 83);
+        assert_eq!(first.params, second.params);
+        let LayerParams::GraphConv(params) = &first.params[0] else {
+            panic!("graph_conv params");
+        };
+        let projection_bound = (2.0f32 / 2.0).sqrt();
+        assert!(
+            params
+                .projection
+                .weights
+                .iter()
+                .all(|value| value.abs() <= projection_bound)
+        );
+        assert!(
+            params
+                .self_weights
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|value| value.abs() <= projection_bound)
+        );
+        assert!(
+            params
+                .edge_kernel
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|value| value.abs() <= 0.001)
+        );
+        assert!(params.projection.biases.iter().all(|value| *value == 0.0));
+        assert!(
+            params
+                .edge_biases
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|value| *value == 0.0)
+        );
+        let batch_norm = params.projection.batch_norm.as_ref().unwrap();
+        assert_eq!(batch_norm.scales, vec![1.0; 6]);
+        assert_eq!(batch_norm.rolling_mean, vec![0.0; 6]);
+        assert_eq!(batch_norm.rolling_variance, vec![0.0; 6]);
     }
 
     #[test]

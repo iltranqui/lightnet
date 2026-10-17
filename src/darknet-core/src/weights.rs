@@ -217,6 +217,32 @@ pub fn save_weights(
                 write_convolutional_params(&mut file, &eml.input)?;
                 write_convolutional_params(&mut file, &eml.self_params)?;
             }
+            (LayerKind::GraphConv(spec), LayerParams::GraphConv(graph)) => {
+                write_convolutional_params(&mut file, &graph.projection)?;
+                match (spec.use_self, &graph.self_weights) {
+                    (true, Some(weights)) => write_f32_slice(&mut file, weights)?,
+                    (false, None) => {}
+                    _ => {
+                        return Err(Error::Weights(format!(
+                            "layer #{} ([graph_conv]) self-weight layout does not match config",
+                            layer.index
+                        )));
+                    }
+                }
+                match (spec.edge_mode, &graph.edge_kernel, &graph.edge_biases) {
+                    (0, None, None) => {}
+                    (1, Some(kernel), Some(biases)) => {
+                        write_f32_slice(&mut file, kernel)?;
+                        write_f32_slice(&mut file, biases)?;
+                    }
+                    _ => {
+                        return Err(Error::Weights(format!(
+                            "layer #{} ([graph_conv]) edge-parameter layout does not match config",
+                            layer.index
+                        )));
+                    }
+                }
+            }
             (LayerKind::Dcnv4(_), LayerParams::Dcnv4(dcnv4)) => {
                 write_f32_slice(&mut file, &dcnv4.biases)?;
                 if let Some(batch_norm) = &dcnv4.batch_norm {
@@ -498,6 +524,140 @@ mod tests {
         );
         let _ = fs::remove_file(modern_path);
         let _ = fs::remove_file(legacy_path);
+    }
+
+    #[test]
+    fn graph_conv_weights_round_trip_in_source_order() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "graph-conv-weights.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=4\n[graph_conv]\nfilters=4\ngroups=2\nsize=3\npad=1\nbatch_normalize=1\nedge_mode=1\ngraph_use_self=1\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let expected_blob_len = network.layers[0].weights().unwrap().byte_len();
+        {
+            let LayerParams::GraphConv(graph) = &mut executable.params[0] else {
+                panic!("graph_conv params");
+            };
+            graph
+                .projection
+                .biases
+                .copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+            let batch_norm = graph.projection.batch_norm.as_mut().unwrap();
+            batch_norm.scales.copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
+            batch_norm
+                .rolling_mean
+                .copy_from_slice(&[9.0, 10.0, 11.0, 12.0]);
+            batch_norm
+                .rolling_variance
+                .copy_from_slice(&[13.0, 14.0, 15.0, 16.0]);
+            graph.projection.weights.copy_from_slice(&[17.0; 8]);
+            graph
+                .self_weights
+                .as_mut()
+                .unwrap()
+                .copy_from_slice(&[18.0; 8]);
+            graph
+                .edge_kernel
+                .as_mut()
+                .unwrap()
+                .copy_from_slice(&[19.0; 72]);
+            graph
+                .edge_biases
+                .as_mut()
+                .unwrap()
+                .copy_from_slice(&[20.0; 18]);
+        }
+        let path = std::env::temp_dir().join(format!(
+            "darknet-graph-conv-weights-{}.weights",
+            std::process::id()
+        ));
+        save_weights(&network, &executable.params, &path, 23).unwrap();
+        let inspection = inspect_weights_file(&network, &path).unwrap();
+        assert_eq!(inspection.header.seen, 23);
+        assert_eq!(inspection.file_size, 20 + expected_blob_len);
+        assert_eq!(inspection.trailing_bytes, 0);
+        assert_eq!(
+            inspection.layers[0]
+                .arrays
+                .iter()
+                .map(|array| (array.name.as_str(), array.len))
+                .collect::<Vec<_>>(),
+            vec![
+                ("biases", 4),
+                ("scales", 4),
+                ("rolling_mean", 4),
+                ("rolling_variance", 4),
+                ("weights", 8),
+                ("graph_self_weights", 8),
+                ("graph_edge_kernel", 72),
+                ("graph_edge_biases", 18),
+            ]
+        );
+        let mut restored = ExecutableNetwork::new(network.clone());
+        restored.load_weights_file(&path).unwrap();
+        assert_eq!(restored.params, executable.params);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn graph_conv_optional_weight_blocks_round_trip_for_all_layouts() {
+        let path = std::env::temp_dir().join(format!(
+            "darknet-graph-conv-layout-{}.weights",
+            std::process::id()
+        ));
+        for batch_normalize in [false, true] {
+            for edge_mode in [0usize, 1] {
+                for use_self in [false, true] {
+                    let config = format!(
+                        "[net]\nwidth=2\nheight=2\nchannels=4\n[graph_conv]\nfilters=4\ngroups=2\nsize=3\npad=1\nbatch_normalize={}\ngraph_edge_mode={edge_mode}\ngraph_use_self={}\n",
+                        usize::from(batch_normalize),
+                        usize::from(use_self),
+                    );
+                    let network = Network::from_config(
+                        ConfigFile::parse_str("graph-conv-layout.cfg", &config).unwrap(),
+                    )
+                    .unwrap();
+                    let executable = ExecutableNetwork::new(network.clone());
+                    save_weights(&network, &executable.params, &path, 0).unwrap();
+                    let inspection = inspect_weights_file(&network, &path).unwrap();
+                    let mut arrays = vec![("biases", 4)];
+                    if batch_normalize {
+                        arrays.extend([
+                            ("scales", 4),
+                            ("rolling_mean", 4),
+                            ("rolling_variance", 4),
+                        ]);
+                    }
+                    arrays.push(("weights", 8));
+                    if use_self {
+                        arrays.push(("graph_self_weights", 8));
+                    }
+                    if edge_mode == 1 {
+                        arrays.extend([("graph_edge_kernel", 72), ("graph_edge_biases", 18)]);
+                    }
+                    let parameter_count: usize = arrays.iter().map(|(_, len)| len).sum();
+                    assert_eq!(inspection.file_size, 20 + 4 * parameter_count as u64);
+                    assert_eq!(inspection.trailing_bytes, 0);
+                    assert_eq!(
+                        inspection.layers[0]
+                            .arrays
+                            .iter()
+                            .map(|array| (array.name.as_str(), array.len))
+                            .collect::<Vec<_>>(),
+                        arrays,
+                        "BN={batch_normalize}, edge_mode={edge_mode}, self={use_self}"
+                    );
+                    let mut restored = ExecutableNetwork::new(network.clone());
+                    restored.load_weights_file(&path).unwrap();
+                    assert_eq!(restored.params, executable.params);
+                }
+            }
+        }
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -1145,7 +1305,8 @@ mod tests {
                     | LayerParams::Vit(_)
                     | LayerParams::Swin(_)
                     | LayerParams::TuckerAttention(_)
-                    | LayerParams::MambaVision(_) => {}
+                    | LayerParams::MambaVision(_)
+                    | LayerParams::GraphConv(_) => {}
                 }
             }
             let path = std::env::temp_dir().join(format!("darknet-{name}-roundtrip.weights"));

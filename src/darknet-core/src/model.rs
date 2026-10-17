@@ -386,6 +386,23 @@ pub struct EmlConvolutionalSpec {
     pub residual: bool,
 }
 
+/// `[graph_conv]` grouped graph aggregation/projection, sourced from `Jev_laya`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphConvSpec {
+    pub filters: usize,
+    pub groups: usize,
+    pub size: usize,
+    pub stride_x: usize,
+    pub stride_y: usize,
+    pub dilation: usize,
+    pub padding: usize,
+    /// 0 = uniform valid-neighbor mean, 1 = learned-edge softmax.
+    pub edge_mode: usize,
+    pub use_self: bool,
+    pub batch_normalize: bool,
+    pub activation: Activation,
+}
+
 /// `[dcnv4]` deformable spatial aggregation, sourced from `Jev_laya`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Dcnv4Spec {
@@ -1328,6 +1345,8 @@ pub enum LayerKind {
     Moe(MoeSpec),
     /// `[eml_convolutional]`: two parallel convolutions and an EML combine.
     EmlConvolutional(EmlConvolutionalSpec),
+    /// `[graph_conv]` / `[graph_convolutional]`: learned valid-neighbor aggregation.
+    GraphConv(GraphConvSpec),
     /// `[dcnv4]` / `[dcnv4_convolutional]`: channel-preserving deformable aggregation.
     Dcnv4(Dcnv4Spec),
     /// `[deform_conv]` / `[deformable_convolutional]`: DCNv1/2 sampling.
@@ -1393,6 +1412,7 @@ impl LayerKind {
             Self::KimiKda(_) => "kimi_kda",
             Self::Moe(_) => "moe_convolutional",
             Self::EmlConvolutional(_) => "eml_convolutional",
+            Self::GraphConv(_) => "graph_conv",
             Self::Dcnv4(_) => "dcnv4",
             Self::DeformConv(_) => "deform_conv",
             Self::DsConv(_) => "dsconv",
@@ -1412,6 +1432,7 @@ impl LayerKind {
     pub fn activation(&self) -> Option<&Activation> {
         match self {
             Self::Convolutional(spec) => Some(&spec.activation),
+            Self::GraphConv(spec) => Some(&spec.activation),
             Self::Dcnv4(spec) => Some(&spec.activation),
             Self::DeformConv(spec) => Some(&spec.activation),
             Self::DsConv(spec) => Some(&spec.activation),
@@ -1934,6 +1955,53 @@ impl Layer {
                 }
                 Some(LayerWeights { entries })
             }
+            LayerKind::GraphConv(spec) => {
+                let channels_per_group = self.input_shape.channels / spec.groups;
+                let kernel_area = spec.size * spec.size;
+                let mut entries = vec![WeightsEntry {
+                    array: WeightsArray::Biases,
+                    len: spec.filters,
+                }];
+                if spec.batch_normalize {
+                    entries.extend([
+                        WeightsEntry {
+                            array: WeightsArray::Scales,
+                            len: spec.filters,
+                        },
+                        WeightsEntry {
+                            array: WeightsArray::RollingMean,
+                            len: spec.filters,
+                        },
+                        WeightsEntry {
+                            array: WeightsArray::RollingVariance,
+                            len: spec.filters,
+                        },
+                    ]);
+                }
+                entries.push(WeightsEntry {
+                    array: WeightsArray::Weights,
+                    len: spec.filters * channels_per_group,
+                });
+                if spec.use_self {
+                    entries.push(WeightsEntry {
+                        array: WeightsArray::Named("graph_self_weights".to_owned()),
+                        len: spec.filters * channels_per_group,
+                    });
+                }
+                if spec.edge_mode == 1 {
+                    entries.extend([
+                        WeightsEntry {
+                            array: WeightsArray::Named("graph_edge_kernel".to_owned()),
+                            len: spec.groups * kernel_area * 2 * channels_per_group,
+                        },
+                        WeightsEntry {
+                            array: WeightsArray::Named("graph_edge_biases".to_owned()),
+                            len: spec.groups * kernel_area,
+                        },
+                    ]);
+                }
+                Some(LayerWeights { entries })
+            }
             LayerKind::Dcnv4(spec) => {
                 let channels = self.input_shape.channels;
                 let (dummy_weights, offset_weights, offset_dim) =
@@ -2359,6 +2427,9 @@ fn parse_layer_kind(
 ) -> Result<LayerKind> {
     let name = section.name.as_str();
     Ok(match name {
+        "graph_conv" | "graph_convolutional" => {
+            LayerKind::GraphConv(parse_graph_conv_spec(section, current)?)
+        }
         "dcnv4" | "dcnv4_convolutional" => LayerKind::Dcnv4(parse_dcnv4_spec(section, current)?),
         "deform_conv" | "deformable_convolutional" => {
             LayerKind::DeformConv(parse_deform_conv_spec(section, current)?)
@@ -3689,6 +3760,33 @@ fn infer_output_shape(
             spec.filters,
             current.batch,
         )),
+        LayerKind::GraphConv(spec) => {
+            let width = dcnv4_output_dim(
+                current.width,
+                spec.padding,
+                spec.size,
+                spec.stride_x,
+                spec.dilation,
+            )
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "[graph_conv] layer #{layer_index}: invalid or empty output width"
+                ))
+            })?;
+            let height = dcnv4_output_dim(
+                current.height,
+                spec.padding,
+                spec.size,
+                spec.stride_y,
+                spec.dilation,
+            )
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "[graph_conv] layer #{layer_index}: invalid or empty output height"
+                ))
+            })?;
+            Ok(TensorShape::new(width, height, spec.filters, current.batch))
+        }
         LayerKind::Dcnv4(spec) => {
             if current.channels == 0 || spec.groups == 0 || current.channels % spec.groups != 0 {
                 return Err(Error::InvalidConfig(format!(
@@ -4748,6 +4846,204 @@ fn deform_conv_output_dim(
     dilation: usize,
 ) -> Option<usize> {
     dcnv4_output_dim(input, padding, size, stride, dilation)
+}
+
+fn reject_unknown_graph_conv_keys(section: &RawSection) -> Result<()> {
+    const ALLOWED: &[&str] = &[
+        "filters",
+        "groups",
+        "size",
+        "stride",
+        "stride_x",
+        "stride_y",
+        "dilation",
+        "pad",
+        "padding",
+        "activation",
+        "batch_normalize",
+        "cbn",
+        "binary",
+        "xnor",
+        "bin_output",
+        "antialiasing",
+        "assisted_excitation",
+        "share_index",
+        "graph_edge_mode",
+        "edge_mode",
+        "graph_use_self",
+        "use_self",
+        "graph_valid_mask_zero",
+        "valid_mask_zero",
+        "stream",
+        "wait_stream",
+        "learning_rate",
+        "dont_update",
+        "burnin_update",
+        "train_only_bn",
+        "clip",
+        "grad_centr",
+    ];
+    if let Some(key) = section
+        .values
+        .keys()
+        .find(|key| !ALLOWED.contains(&key.as_str()))
+    {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {}: unknown option `{key}`",
+            section.name, section.line
+        )));
+    }
+    Ok(())
+}
+
+fn parse_graph_conv_spec(section: &RawSection, input: TensorShape) -> Result<GraphConvSpec> {
+    let line = section.line;
+    reject_unknown_graph_conv_keys(section)?;
+    let invalid = |message: &str| {
+        Error::InvalidConfig(format!("[{}] at line {line}: {message}", section.name))
+    };
+    if input.width == 0 || input.height == 0 || input.channels == 0 {
+        return Err(invalid("preceding layer must output a non-empty image"));
+    }
+
+    let filters = section.get_i64("filters", 1)?;
+    let groups = section.get_i64("groups", 1)?.max(1);
+    let size = section.get_i64("size", 1)?;
+    let stride = section.get_i64("stride", 1)?;
+    let mut stride_x = section.get_i64("stride_x", -1)?;
+    let mut stride_y = section.get_i64("stride_y", -1)?;
+    if stride_x < 1 {
+        stride_x = stride;
+    }
+    if stride_y < 1 {
+        stride_y = stride;
+    }
+    let mut dilation = section.get_i64("dilation", 1)?;
+    if size == 1 {
+        dilation = 1;
+    }
+    let pad = section.get_i64("pad", 0)? != 0;
+    let raw_padding = if pad {
+        size / 2
+    } else {
+        section.get_i64("padding", 0)?
+    };
+    let edge_mode = if section.get("graph_edge_mode").is_some() {
+        section.get_i64("graph_edge_mode", 1)?
+    } else {
+        section.get_i64("edge_mode", 1)?
+    };
+    let use_self = if section.get("graph_use_self").is_some() {
+        section.get_i64("graph_use_self", 1)?
+    } else {
+        section.get_i64("use_self", 1)?
+    } != 0;
+    let valid_mask_zero = if section.get("graph_valid_mask_zero").is_some() {
+        section.get_i64("graph_valid_mask_zero", 1)?
+    } else {
+        section.get_i64("valid_mask_zero", 1)?
+    };
+    let batch_normalize =
+        section.get_i64("batch_normalize", 0)? != 0 || section.get_i64("cbn", 0)? != 0;
+    let activation = Activation::parse(&section.get_str("activation", "logistic"));
+
+    if matches!(activation, Activation::Other(_)) {
+        return Err(invalid("activation name is unsupported"));
+    }
+    if filters <= 0 || size <= 0 || size % 2 == 0 {
+        return Err(invalid(
+            "filters must be positive and size must be positive and odd",
+        ));
+    }
+    if stride_x <= 0 || stride_y <= 0 || dilation <= 0 {
+        return Err(invalid("stride_x, stride_y, and dilation must be positive"));
+    }
+    if raw_padding < 0 {
+        return Err(invalid("padding must be non-negative"));
+    }
+    let filters = usize::try_from(filters).map_err(|_| invalid("filters is out of range"))?;
+    let groups = usize::try_from(groups).map_err(|_| invalid("groups is out of range"))?;
+    let size = usize::try_from(size).map_err(|_| invalid("size is out of range"))?;
+    let stride_x = usize::try_from(stride_x).map_err(|_| invalid("stride_x is out of range"))?;
+    let stride_y = usize::try_from(stride_y).map_err(|_| invalid("stride_y is out of range"))?;
+    let dilation = usize::try_from(dilation).map_err(|_| invalid("dilation is out of range"))?;
+    let padding = usize::try_from(raw_padding).map_err(|_| invalid("padding is out of range"))?;
+    if input.channels % groups != 0 || filters % groups != 0 {
+        return Err(invalid(
+            "groups must divide both input channels and filters",
+        ));
+    }
+    if edge_mode != 0 && edge_mode != 1 {
+        return Err(invalid("graph_edge_mode must be 0 or 1"));
+    }
+    if valid_mask_zero != 1 {
+        return Err(invalid("graph_valid_mask_zero must be 1"));
+    }
+    if section.get_i64("binary", 0)? != 0
+        || section.get_i64("xnor", 0)? != 0
+        || section.get_i64("bin_output", 0)? != 0
+    {
+        return Err(invalid(
+            "binary, xnor, and bin_output modes are unsupported",
+        ));
+    }
+    if section.get_i64("antialiasing", 0)? != 0 {
+        return Err(invalid("antialiasing is unsupported"));
+    }
+    if section.get_f32("assisted_excitation", 0.0)? != 0.0 {
+        return Err(invalid("assisted_excitation is unsupported"));
+    }
+    if section.get_i64("share_index", -1_000_000_000)? != -1_000_000_000 {
+        return Err(invalid("shared graph-convolution layers are unsupported"));
+    }
+    if section.get_f32("grad_centr", 0.0)? != 0.0 {
+        return Err(invalid("grad_centr is unsupported for graph_conv"));
+    }
+    if section.get_f32("clip", 0.0)? != 0.0 {
+        return Err(invalid("clip is unsupported for graph_conv"));
+    }
+
+    let kernel_area = size
+        .checked_mul(size)
+        .ok_or_else(|| invalid("kernel area overflows"))?;
+    let channels_per_group = input.channels / groups;
+    let projection_count = filters
+        .checked_mul(channels_per_group)
+        .ok_or_else(|| invalid("projection parameter count overflows"))?;
+    let self_count = if use_self { projection_count } else { 0 };
+    let edge_count = if edge_mode == 1 {
+        groups
+            .checked_mul(kernel_area)
+            .and_then(|count| count.checked_mul(2))
+            .and_then(|count| count.checked_mul(channels_per_group))
+            .and_then(|count| count.checked_add(groups.checked_mul(kernel_area)?))
+            .ok_or_else(|| invalid("edge parameter count overflows"))?
+    } else {
+        0
+    };
+    projection_count
+        .checked_add(self_count)
+        .and_then(|count| count.checked_add(edge_count))
+        .and_then(|count| count.checked_add(filters))
+        .ok_or_else(|| invalid("parameter count overflows"))?;
+    for (dimension, stride) in [(input.width, stride_x), (input.height, stride_y)] {
+        dcnv4_output_dim(dimension, padding, size, stride, dilation)
+            .ok_or_else(|| invalid("kernel geometry has an invalid or empty output"))?;
+    }
+
+    Ok(GraphConvSpec {
+        filters,
+        groups,
+        size,
+        stride_x,
+        stride_y,
+        dilation,
+        padding,
+        edge_mode: edge_mode as usize,
+        use_self,
+        batch_normalize,
+        activation,
+    })
 }
 
 fn reject_unknown_dsconv_keys(section: &RawSection) -> Result<()> {
@@ -8469,6 +8765,143 @@ mod tests {
                     .net
                     .try_fix_nan
             );
+        }
+    }
+
+    #[test]
+    fn graph_conv_aliases_defaults_geometry_and_source_weight_order() {
+        for alias in ["graph_conv", "graph_convolutional"] {
+            let network = build(&format!(
+                "[net]\nwidth=7\nheight=5\nchannels=4\n[{alias}]\nfilters=6\ngroups=2\nsize=3\nstride_x=2\nstride_y=1\ndilation=2\npadding=1\nedge_mode=0\nuse_self=0\nactivation=linear\n"
+            ))
+            .unwrap_or_else(|error| panic!("[{alias}] should parse: {error}"));
+            let layer = &network.layers[0];
+            let LayerKind::GraphConv(spec) = &layer.kind else {
+                panic!("expected graph-conv layer for [{alias}]");
+            };
+            assert_eq!(layer.kind.name(), "graph_conv");
+            assert_eq!(layer.output_shape, super::TensorShape::new(3, 3, 6, 1));
+            assert_eq!(
+                (
+                    spec.filters,
+                    spec.groups,
+                    spec.size,
+                    spec.stride_x,
+                    spec.stride_y,
+                    spec.dilation,
+                    spec.padding,
+                    spec.edge_mode,
+                    spec.use_self,
+                    spec.batch_normalize,
+                    &spec.activation,
+                ),
+                (
+                    6,
+                    2,
+                    3,
+                    2,
+                    1,
+                    2,
+                    1,
+                    0,
+                    false,
+                    false,
+                    &super::Activation::Linear
+                )
+            );
+            let weights = layer.weights().expect("graph-conv weights");
+            assert_eq!(
+                weights
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.array.name(), entry.len))
+                    .collect::<Vec<_>>(),
+                vec![("biases", 6), ("weights", 12)]
+            );
+        }
+
+        let defaults = build("[net]\nwidth=2\nheight=3\nchannels=4\n[graph_conv]\n")
+            .expect("default graph-conv config");
+        let layer = &defaults.layers[0];
+        let LayerKind::GraphConv(spec) = &layer.kind else {
+            panic!("graph-conv layer");
+        };
+        assert_eq!(layer.output_shape, super::TensorShape::new(2, 3, 1, 1));
+        assert_eq!((spec.edge_mode, spec.use_self, spec.size), (1, true, 1));
+        assert!(!defaults.net.try_fix_nan);
+        assert_eq!(
+            layer
+                .weights()
+                .unwrap()
+                .entries
+                .iter()
+                .map(|entry| (entry.array.name(), entry.len))
+                .collect::<Vec<_>>(),
+            vec![
+                ("biases", 1),
+                ("weights", 4),
+                ("graph_self_weights", 4),
+                ("graph_edge_kernel", 8),
+                ("graph_edge_biases", 1),
+            ]
+        );
+
+        let cbn = build(
+            "[net]\nwidth=1\nheight=1\nchannels=2\n[graph_convolutional]\nfilters=2\ncbn=1\nsize=1\ndilation=0\n",
+        )
+        .expect("CPU CBN config remains ordinary batch norm");
+        let LayerKind::GraphConv(spec) = &cbn.layers[0].kind else {
+            panic!("graph-conv layer");
+        };
+        assert!(spec.batch_normalize);
+        assert_eq!(spec.dilation, 1, "size=1 forces dilation one");
+        assert_eq!(
+            cbn.layers[0]
+                .weights()
+                .unwrap()
+                .entries
+                .iter()
+                .map(|entry| entry.array.name())
+                .collect::<Vec<_>>(),
+            vec![
+                "biases",
+                "scales",
+                "rolling_mean",
+                "rolling_variance",
+                "weights",
+                "graph_self_weights",
+                "graph_edge_kernel",
+                "graph_edge_biases"
+            ]
+        );
+    }
+
+    #[test]
+    fn graph_conv_parser_rejects_unsupported_and_unknown_configuration() {
+        let make = |options: &str| {
+            build(&format!(
+                "[net]\nwidth=3\nheight=2\nchannels=4\n[graph_conv]\n{options}\n"
+            ))
+        };
+        for (options, expected) in [
+            ("filters=0", "filters must be positive"),
+            ("size=2", "positive and odd"),
+            ("stride=0", "must be positive"),
+            ("groups=3", "groups must divide"),
+            ("graph_edge_mode=2", "must be 0 or 1"),
+            ("valid_mask_zero=0", "must be 1"),
+            ("binary=1", "binary, xnor"),
+            ("bin_output=1", "binary, xnor"),
+            ("antialiasing=1", "antialiasing"),
+            ("assisted_excitation=0.1", "assisted_excitation"),
+            ("share_index=0", "shared graph-convolution"),
+            ("grad_centr=1", "grad_centr"),
+            ("clip=1", "clip is unsupported"),
+            ("activation=unsupported", "activation name is unsupported"),
+            ("unknown_option=1", "unknown option"),
+        ] {
+            let error = make(options).expect_err("unsupported graph-conv config must fail");
+            assert!(error.to_string().contains(expected), "{options}: {error}");
         }
     }
 }

@@ -27,8 +27,8 @@ use crate::image::PlanarRgbImage;
 use crate::maxpool_depth::{backward_maxpool_depth, forward_maxpool_depth};
 use crate::model::{
     Activation, ConnectedSpec, ConvolutionalSpec, CrnnSpec, CropSpec, Dcnv4Spec, DeformConvSpec,
-    DropblockSpec, EmlConvolutionalSpec, GruSpec, LayerKind, LocalSpec, LrPolicy, LstmSpec,
-    NetConfig, Network, RnnSpec, RouteSpec, TensorShape,
+    DropblockSpec, EmlConvolutionalSpec, GraphConvSpec, GruSpec, LayerKind, LocalSpec, LrPolicy,
+    LstmSpec, NetConfig, Network, RnnSpec, RouteSpec, TensorShape,
 };
 use crate::weights::WeightsHeader;
 use darknet_cuda::{
@@ -118,7 +118,7 @@ impl Tensor {
         self.shape.channels * self.channel_area()
     }
 
-    fn offset(&self, batch: usize, channel: usize, y: usize, x: usize) -> usize {
+    pub(crate) fn offset(&self, batch: usize, channel: usize, y: usize, x: usize) -> usize {
         // Keep the indexing formula in one place.  CPU layers and host-side
         // GPU checks then cannot accidentally interpret this tensor as NHWC.
         batch * self.batch_stride() + channel * self.channel_area() + y * self.shape.width + x
@@ -227,6 +227,15 @@ pub struct EmlConvolutionalParams {
     pub self_params: ConvolutionalParams,
 }
 
+/// `[graph_conv]` projection, optional self projection, and learned edge scorer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphConvParams {
+    pub projection: ConvolutionalParams,
+    pub self_weights: Option<Vec<f32>>,
+    pub edge_kernel: Option<Vec<f32>>,
+    pub edge_biases: Option<Vec<f32>>,
+}
+
 /// `[dcnv4]` parameters. `dummy_weights` are compatibility-only; the offset
 /// projection is the learned spatial parameter block.
 #[derive(Clone, Debug, PartialEq)]
@@ -293,6 +302,7 @@ pub enum LayerParams {
     /// `[eml_convolutional]`: the `input_layer` and `self_layer` conv blocks.
     EmlConvolutional(EmlConvolutionalParams),
     Dcnv4(Dcnv4Params),
+    GraphConv(GraphConvParams),
     DeformConv(DeformConvParams),
     DsConv(DsConvParams),
 }
@@ -393,6 +403,14 @@ pub struct EmlConvolutionalTrainBuffers {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct GraphConvTrainBuffers {
+    pub projection: ConvolutionalTrainBuffers,
+    pub self_weight_updates: Option<Vec<f32>>,
+    pub edge_kernel_updates: Option<Vec<f32>>,
+    pub edge_bias_updates: Option<Vec<f32>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Dcnv4TrainBuffers {
     pub bias_updates: Vec<f32>,
     pub batch_norm: Option<BatchNormTrainBuffers>,
@@ -465,6 +483,7 @@ pub enum LayerTrainBuffers {
     Moe(MoeTrainBuffers),
     EmlConvolutional(EmlConvolutionalTrainBuffers),
     Dcnv4(Dcnv4TrainBuffers),
+    GraphConv(GraphConvTrainBuffers),
     DeformConv(DeformConvTrainBuffers),
     DsConv(DsConvTrainBuffers),
     Vit(VitTrainBuffers),
@@ -604,6 +623,12 @@ pub(crate) struct DsConvRuntimeCache {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GraphConvRuntimeCache {
+    pub math: crate::graph_conv::GraphConvForwardCache,
+    pub training: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct ForwardResult {
     pub layer_outputs: Vec<Tensor>,
     pub layer_activation_inputs: Vec<Option<Tensor>>,
@@ -621,6 +646,7 @@ pub struct ForwardResult {
     pub(crate) dcnv4_caches: Vec<Option<crate::dcnv4::Dcnv4ForwardCache>>,
     pub(crate) deform_conv_caches: Vec<Option<DeformConvRuntimeCache>>,
     pub(crate) dsconv_caches: Vec<Option<DsConvRuntimeCache>>,
+    pub(crate) graph_conv_caches: Vec<Option<GraphConvRuntimeCache>>,
     pub vit_caches: Vec<Option<crate::vit::VitForwardCache>>,
     pub swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>>,
     pub tucker_attention_caches: Vec<Option<crate::tucker_attention::TuckerAttentionForwardCache>>,
@@ -652,6 +678,7 @@ impl ForwardResult {
             dcnv4_caches: Vec::new(),
             deform_conv_caches: Vec::new(),
             dsconv_caches: Vec::new(),
+            graph_conv_caches: Vec::new(),
             vit_caches: Vec::new(),
             swin_caches: Vec::new(),
             tucker_attention_caches: Vec::new(),
@@ -685,6 +712,7 @@ mod forward_result_from_heads_tests {
         assert!(result.dcnv4_caches.is_empty());
         assert!(result.deform_conv_caches.is_empty());
         assert!(result.dsconv_caches.is_empty());
+        assert!(result.graph_conv_caches.is_empty());
         assert!(result.vit_caches.is_empty());
         assert!(result.swin_caches.is_empty());
         assert!(result.tucker_attention_caches.is_empty());
@@ -1435,6 +1463,38 @@ impl ExecutableNetwork {
                         batch,
                     );
                 }
+                (LayerParams::GraphConv(params), LayerTrainBuffers::GraphConv(train)) => {
+                    let layer_lr = lr * opts.learning_rate_scale;
+                    update_convolutional_params(
+                        &mut params.projection,
+                        &mut train.projection,
+                        layer_lr,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                    match (&mut params.self_weights, &mut train.self_weight_updates) {
+                        (Some(weights), Some(updates)) => {
+                            sgd_update(weights, updates, layer_lr, momentum, decay, batch);
+                        }
+                        (None, None) => {}
+                        _ => unreachable!("validated graph_conv self-weight buffers"),
+                    }
+                    match (&mut params.edge_kernel, &mut train.edge_kernel_updates) {
+                        (Some(weights), Some(updates)) => {
+                            sgd_update(weights, updates, layer_lr, momentum, decay, batch);
+                        }
+                        (None, None) => {}
+                        _ => unreachable!("validated graph_conv edge-kernel buffers"),
+                    }
+                    match (&mut params.edge_biases, &mut train.edge_bias_updates) {
+                        (Some(biases), Some(updates)) => {
+                            sgd_update(biases, updates, layer_lr, momentum, 0.0, batch);
+                        }
+                        (None, None) => {}
+                        _ => unreachable!("validated graph_conv edge-bias buffers"),
+                    }
+                }
                 (LayerParams::Dcnv4(params), LayerTrainBuffers::Dcnv4(train)) => {
                     let layer_lr = lr * opts.learning_rate_scale;
                     sgd_update(
@@ -1882,6 +1942,7 @@ impl ExecutableNetwork {
         let mut dcnv4_caches = Vec::with_capacity(self.network.layers.len());
         let mut deform_conv_caches = Vec::with_capacity(self.network.layers.len());
         let mut dsconv_caches = Vec::with_capacity(self.network.layers.len());
+        let mut graph_conv_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches = Vec::with_capacity(self.network.layers.len());
         let mut swin_caches = Vec::with_capacity(self.network.layers.len());
         let mut tucker_attention_caches = Vec::with_capacity(self.network.layers.len());
@@ -1915,6 +1976,7 @@ impl ExecutableNetwork {
             let mut dcnv4_cache = None;
             let mut deform_conv_cache = None;
             let mut dsconv_cache = None;
+            let mut graph_conv_cache = None;
             let (output, activation_input) = match (&layer.kind, params) {
                 (
                     LayerKind::Convolutional(spec),
@@ -1923,6 +1985,17 @@ impl ExecutableNetwork {
                     let conv =
                         resolve_convolutional_params(&self.network, &self.params, layer.index)?;
                     forward_convolutional_with_cache(spec, conv, current_input, layer.output_shape)
+                }
+                (LayerKind::GraphConv(spec), LayerParams::GraphConv(params)) => {
+                    let (output, activation_input, cache) = forward_graph_conv_with_cache(
+                        spec,
+                        params,
+                        current_input,
+                        layer.output_shape,
+                        training,
+                    )?;
+                    graph_conv_cache = Some(cache);
+                    (output, Some(activation_input))
                 }
                 (LayerKind::Dcnv4(spec), LayerParams::Dcnv4(params)) => {
                     let (output, activation_input, cache) =
@@ -2506,6 +2579,7 @@ impl ExecutableNetwork {
             dcnv4_caches.push(dcnv4_cache);
             deform_conv_caches.push(deform_conv_cache);
             dsconv_caches.push(dsconv_cache);
+            graph_conv_caches.push(graph_conv_cache);
             vit_caches.push(vit_cache);
             swin_caches.push(swin_cache);
             tucker_attention_caches.push(tucker_attention_cache);
@@ -2524,6 +2598,7 @@ impl ExecutableNetwork {
             dcnv4_caches,
             deform_conv_caches,
             dsconv_caches,
+            graph_conv_caches,
             vit_caches,
             swin_caches,
             tucker_attention_caches,
@@ -2764,6 +2839,113 @@ impl ExecutableNetwork {
                     accumulate_previous_gradient(
                         layer.index,
                         &input_grad,
+                        &mut input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::GraphConv(spec), LayerParams::GraphConv(params)) => {
+                    let cache = forward
+                        .graph_conv_caches
+                        .get(layer.index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing [graph_conv] forward cache for layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let preactivation = forward.layer_activation_inputs[layer.index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing [graph_conv] activation cache for layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let output = &forward.layer_outputs[layer.index];
+                    let activation_gradient =
+                        if let Some(normalization) = spec.activation.to_channel_normalization() {
+                            Tensor {
+                                shape: layer.output_shape,
+                                data: darknet_cuda::host_ops::normalize_channels_backward(
+                                    &preactivation.data,
+                                    &output.data,
+                                    &grad.data,
+                                    layer.output_shape.batch,
+                                    layer.output_shape.channels,
+                                    layer.output_shape.width * layer.output_shape.height,
+                                    normalization,
+                                    GradMode::from_env() == GradMode::Cpp,
+                                ),
+                            }
+                        } else {
+                            apply_output_activation_gradient(
+                                output,
+                                &grad,
+                                &spec.activation,
+                                "graph_conv",
+                                Some(preactivation),
+                            )?
+                        };
+                    let (raw_gradient, bias_gradient, batch_norm_gradient) =
+                        if let Some(batch_norm) = &params.projection.batch_norm {
+                            let mut effective_batch_norm = batch_norm.clone();
+                            effective_batch_norm
+                                .biases
+                                .clone_from(&params.projection.biases);
+                            let (raw_gradient, mut batch_norm_gradient) = backward_batchnorm(
+                                &effective_batch_norm,
+                                &cache.math.raw_output,
+                                &activation_gradient,
+                                cache.training,
+                            )?;
+                            let bias_gradient = std::mem::take(&mut batch_norm_gradient.biases);
+                            batch_norm_gradient.biases.fill(0.0);
+                            (raw_gradient, bias_gradient, Some(batch_norm_gradient))
+                        } else {
+                            let mut bias_gradient = vec![0.0; spec.filters];
+                            for batch in 0..layer.output_shape.batch {
+                                for filter in 0..spec.filters {
+                                    for y in 0..layer.output_shape.height {
+                                        for x in 0..layer.output_shape.width {
+                                            bias_gradient[filter] +=
+                                                activation_gradient.get(batch, filter, y, x);
+                                        }
+                                    }
+                                }
+                            }
+                            (activation_gradient, bias_gradient, None)
+                        };
+                    let math_gradient = crate::graph_conv::graph_conv_backward(
+                        spec,
+                        current_input,
+                        &params.projection.weights,
+                        params.self_weights.as_deref(),
+                        params.edge_kernel.as_deref(),
+                        &raw_gradient,
+                        &cache.math,
+                    )?;
+                    let gradient = GraphConvParams {
+                        projection: ConvolutionalParams {
+                            biases: bias_gradient,
+                            batch_norm: batch_norm_gradient,
+                            weights: math_gradient.weights,
+                        },
+                        self_weights: math_gradient.self_weights,
+                        edge_kernel: math_gradient.edge_kernel,
+                        edge_biases: math_gradient.edge_biases,
+                    };
+                    let Some(LayerParams::GraphConv(dst)) = param_gradients.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing [graph_conv] gradient slot for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    *dst = gradient;
+                    accumulate_previous_gradient(
+                        layer.index,
+                        &Tensor::from_data(current_input.shape, math_gradient.input)?,
                         &mut input_gradient,
                         &mut layer_output_gradients,
                     )?;
@@ -4315,6 +4497,47 @@ impl ExecutableNetwork {
         }
 
         for layer in &self.network.layers {
+            let LayerKind::GraphConv(spec) = &layer.kind else {
+                continue;
+            };
+            if !spec.batch_normalize {
+                continue;
+            }
+            let cache = forward
+                .graph_conv_caches
+                .get(layer.index)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "missing [graph_conv] forward cache for BN stats at layer #{}",
+                        layer.index
+                    ))
+                })?;
+            if !cache.training {
+                continue;
+            }
+            let (mean, variance) = batchnorm_channel_stats(&cache.math.raw_output);
+            let Some(LayerParams::GraphConv(params)) = self.params.get_mut(layer.index) else {
+                return Err(Error::InvalidConfig(format!(
+                    "missing [graph_conv] params for BN stats at layer #{}",
+                    layer.index
+                )));
+            };
+            let Some(batch_norm) = params.projection.batch_norm.as_mut() else {
+                return Err(Error::InvalidConfig(format!(
+                    "missing [graph_conv] batch-norm params at layer #{}",
+                    layer.index
+                )));
+            };
+            update_batch_norm_running_stats(
+                batch_norm,
+                &mean,
+                &variance,
+                BATCH_NORM_ROLLING_KEEP_CPU,
+            )?;
+        }
+
+        for layer in &self.network.layers {
             let LayerKind::Connected(spec) = &layer.kind else {
                 continue;
             };
@@ -4639,6 +4862,47 @@ impl ExecutableNetwork {
                     accumulate_vec(&mut train.offset_weight_updates, &gradient.offset_weights)?;
                     accumulate_vec(&mut train.offset_bias_updates, &gradient.offset_biases)?;
                 }
+                (LayerKind::GraphConv(_), LayerParams::GraphConv(gradient)) => {
+                    let Some(LayerTrainBuffers::GraphConv(train)) =
+                        self.train_buffers.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing graph_conv train buffers for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    accumulate_convolutional_train_buffer(
+                        &mut train.projection,
+                        &gradient.projection,
+                    )?;
+                    match (&mut train.self_weight_updates, &gradient.self_weights) {
+                        (Some(updates), Some(gradient)) => accumulate_vec(updates, gradient)?,
+                        (None, None) => {}
+                        _ => {
+                            return Err(Error::InvalidConfig(
+                                "graph_conv self-weight train-buffer mismatch".to_owned(),
+                            ));
+                        }
+                    }
+                    match (&mut train.edge_kernel_updates, &gradient.edge_kernel) {
+                        (Some(updates), Some(gradient)) => accumulate_vec(updates, gradient)?,
+                        (None, None) => {}
+                        _ => {
+                            return Err(Error::InvalidConfig(
+                                "graph_conv edge-kernel train-buffer mismatch".to_owned(),
+                            ));
+                        }
+                    }
+                    match (&mut train.edge_bias_updates, &gradient.edge_biases) {
+                        (Some(updates), Some(gradient)) => accumulate_vec(updates, gradient)?,
+                        (None, None) => {}
+                        _ => {
+                            return Err(Error::InvalidConfig(
+                                "graph_conv edge-bias train-buffer mismatch".to_owned(),
+                            ));
+                        }
+                    }
+                }
                 (LayerKind::Dcnv4(_), LayerParams::Dcnv4(gradient)) => {
                     let Some(LayerTrainBuffers::Dcnv4(train)) =
                         self.train_buffers.get_mut(layer.index)
@@ -4930,6 +5194,12 @@ fn host_adam_scalar_capacity(params: &LayerParams) -> usize {
         LayerParams::EmlConvolutional(params) => {
             convolutional_parameter_count(&params.input)
                 + convolutional_parameter_count(&params.self_params)
+        }
+        LayerParams::GraphConv(params) => {
+            convolutional_parameter_count(&params.projection)
+                + params.self_weights.as_ref().map_or(0, Vec::len)
+                + params.edge_kernel.as_ref().map_or(0, Vec::len)
+                + params.edge_biases.as_ref().map_or(0, Vec::len)
         }
         LayerParams::Dcnv4(params) => {
             params.biases.len()
@@ -6847,6 +7117,18 @@ where
             .network
             .layers
             .iter()
+            .find(|layer| matches!(layer.kind, LayerKind::GraphConv(_)))
+        {
+            return Err(Error::UnsupportedLayer {
+                layer_index: layer.index,
+                name: "[graph_conv] GPU updates are not implemented in the Stage-1 CPU port"
+                    .to_owned(),
+            });
+        }
+        if let Some(layer) = self
+            .network
+            .layers
+            .iter()
             .find(|layer| matches!(layer.kind, LayerKind::DsConv(_)))
         {
             return Err(Error::UnsupportedLayer {
@@ -8228,6 +8510,17 @@ where
                 "input shape mismatch: expected {expected}, got {}",
                 input.shape
             )));
+        }
+        if let Some(layer) = self
+            .network
+            .layers
+            .iter()
+            .find(|layer| matches!(layer.kind, LayerKind::GraphConv(_)))
+        {
+            return Err(Error::UnsupportedLayer {
+                layer_index: layer.index,
+                name: "[graph_conv] GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path".to_owned(),
+            });
         }
         if let Some(layer) = self
             .network
@@ -9982,6 +10275,7 @@ where
                 dcnv4_caches,
                 deform_conv_caches,
                 dsconv_caches: vec![None; self.network.layers.len()],
+                graph_conv_caches: vec![None; self.network.layers.len()],
                 vit_caches,
                 swin_caches,
                 tucker_attention_caches,
@@ -10024,6 +10318,17 @@ where
                 layer_index: layer.index,
                 name: "[deform_conv] compact GPU execution is unsupported; use f32 forward"
                     .to_owned(),
+            });
+        }
+        if let Some(layer) = self
+            .network
+            .layers
+            .iter()
+            .find(|layer| matches!(layer.kind, LayerKind::GraphConv(_)))
+        {
+            return Err(Error::UnsupportedLayer {
+                layer_index: layer.index,
+                name: "[graph_conv] GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path".to_owned(),
             });
         }
         if let Some(layer) = self
@@ -14733,6 +15038,9 @@ fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
         LayerKind::Dcnv4(spec) => {
             LayerParams::Dcnv4(default_dcnv4_params(layer.input_shape.channels, spec))
         }
+        LayerKind::GraphConv(spec) => {
+            LayerParams::GraphConv(default_graph_conv_params(layer.input_shape.channels, spec))
+        }
         LayerKind::DeformConv(spec) => {
             LayerParams::DeformConv(default_deform_conv_params(layer.input_shape.channels, spec))
         }
@@ -14934,6 +15242,9 @@ fn default_layer_train_buffers(layer: &crate::model::Layer) -> LayerTrainBuffers
             layer.input_shape.channels,
             spec,
         )),
+        LayerKind::GraphConv(spec) => LayerTrainBuffers::GraphConv(
+            default_graph_conv_train_buffers(layer.input_shape.channels, spec),
+        ),
         LayerKind::DeformConv(spec) => LayerTrainBuffers::DeformConv(
             default_deform_conv_train_buffers(layer.input_shape.channels, spec),
         ),
@@ -15083,6 +15394,47 @@ fn default_moe_train_buffers(
                 )
             })
             .collect(),
+    }
+}
+
+fn default_graph_conv_params(input_channels: usize, spec: &GraphConvSpec) -> GraphConvParams {
+    let channels_per_group = input_channels / spec.groups;
+    let projection_size = spec.filters * channels_per_group;
+    let kernel_area = spec.size * spec.size;
+    GraphConvParams {
+        projection: default_convolutional_params(
+            input_channels,
+            spec.filters,
+            1,
+            spec.groups,
+            spec.batch_normalize,
+        ),
+        self_weights: spec.use_self.then(|| vec![0.0; projection_size]),
+        edge_kernel: (spec.edge_mode == 1)
+            .then(|| vec![0.0; spec.groups * kernel_area * 2 * channels_per_group]),
+        edge_biases: (spec.edge_mode == 1).then(|| vec![0.0; spec.groups * kernel_area]),
+    }
+}
+
+fn default_graph_conv_train_buffers(
+    input_channels: usize,
+    spec: &GraphConvSpec,
+) -> GraphConvTrainBuffers {
+    let channels_per_group = input_channels / spec.groups;
+    let projection_size = spec.filters * channels_per_group;
+    let kernel_area = spec.size * spec.size;
+    GraphConvTrainBuffers {
+        projection: default_convolutional_train_buffers(
+            input_channels,
+            spec.filters,
+            1,
+            spec.groups,
+            spec.batch_normalize,
+        ),
+        self_weight_updates: spec.use_self.then(|| vec![0.0; projection_size]),
+        edge_kernel_updates: (spec.edge_mode == 1)
+            .then(|| vec![0.0; spec.groups * kernel_area * 2 * channels_per_group]),
+        edge_bias_updates: (spec.edge_mode == 1).then(|| vec![0.0; spec.groups * kernel_area]),
     }
 }
 
@@ -16319,6 +16671,46 @@ fn apply_host_adam_layer(
                 adam,
             )?;
         }
+        (LayerParams::GraphConv(params), LayerTrainBuffers::GraphConv(train)) => {
+            apply_host_adam_convolutional(
+                &mut params.projection,
+                &mut train.projection,
+                state,
+                adam,
+            )?;
+            match (&mut params.self_weights, &mut train.self_weight_updates) {
+                (Some(weights), Some(updates)) => apply_host_adam(
+                    weights,
+                    updates,
+                    &mut host_adam_child(state, 0).weights,
+                    adam,
+                )?,
+                (None, None) => {}
+                _ => {
+                    return Err(Error::InvalidConfig(
+                        "graph_conv Adam self-weight mismatch".to_owned(),
+                    ));
+                }
+            }
+            match (
+                &mut params.edge_kernel,
+                &mut train.edge_kernel_updates,
+                &mut params.edge_biases,
+                &mut train.edge_bias_updates,
+            ) {
+                (Some(kernel), Some(kernel_updates), Some(biases), Some(bias_updates)) => {
+                    let edge_state = host_adam_child(state, 1);
+                    apply_host_adam(kernel, kernel_updates, &mut edge_state.weights, adam)?;
+                    apply_host_adam_non_weight(biases, bias_updates, &mut edge_state.biases, adam)?;
+                }
+                (None, None, None, None) => {}
+                _ => {
+                    return Err(Error::InvalidConfig(
+                        "graph_conv Adam edge-parameter mismatch".to_owned(),
+                    ));
+                }
+            }
+        }
         (LayerParams::DeformConv(params), LayerTrainBuffers::DeformConv(train)) => {
             apply_host_adam_convolutional(&mut params.main, &mut train.main, state, adam)?;
             let predictor_adam = AdamParams {
@@ -16856,6 +17248,49 @@ fn load_weights_into_params(
                     read_f32_into(&mut file, &mut batch_norm.rolling_variance)?;
                 }
                 read_f32_into(&mut file, &mut conv.weights)?;
+            }
+            LayerParams::GraphConv(graph) => {
+                let LayerKind::GraphConv(spec) = &layer.kind else {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} graph_conv parameters do not match layer kind",
+                        layer.index
+                    )));
+                };
+                read_convolutional_params(
+                    &mut file,
+                    &mut graph.projection,
+                    layer.input_shape.channels,
+                    spec.filters,
+                    1,
+                    spec.groups,
+                )?;
+                match (spec.use_self, &mut graph.self_weights) {
+                    (true, Some(weights)) => read_f32_into(&mut file, weights)?,
+                    (false, None) => {}
+                    _ => {
+                        return Err(Error::InvalidConfig(format!(
+                            "layer #{} graph_conv self-weight layout does not match config",
+                            layer.index
+                        )));
+                    }
+                }
+                match (
+                    spec.edge_mode,
+                    &mut graph.edge_kernel,
+                    &mut graph.edge_biases,
+                ) {
+                    (0, None, None) => {}
+                    (1, Some(kernel), Some(biases)) => {
+                        read_f32_into(&mut file, kernel)?;
+                        read_f32_into(&mut file, biases)?;
+                    }
+                    _ => {
+                        return Err(Error::InvalidConfig(format!(
+                            "layer #{} graph_conv edge-parameter layout does not match config",
+                            layer.index
+                        )));
+                    }
+                }
             }
             LayerParams::Connected(connected) => {
                 if matches!(&layer.kind, LayerKind::ObbRefine(_)) {
@@ -17525,6 +17960,53 @@ fn forward_dsconv_with_cache(
     }
     apply_convolution_channel_normalization(&mut output, &activation_input, &spec.activation);
     Ok((output, activation_input, DsConvRuntimeCache { math }))
+}
+
+fn forward_graph_conv_with_cache(
+    spec: &GraphConvSpec,
+    params: &GraphConvParams,
+    input: &Tensor,
+    output_shape: TensorShape,
+    training: bool,
+) -> Result<(Tensor, Tensor, GraphConvRuntimeCache)> {
+    let math = crate::graph_conv::graph_conv_forward(
+        spec,
+        input,
+        output_shape,
+        &params.projection.weights,
+        params.self_weights.as_deref(),
+        params.edge_kernel.as_deref(),
+        params.edge_biases.as_deref(),
+    )?;
+    let activation_input = if let Some(batch_norm) = &params.projection.batch_norm {
+        let mut batch_norm = batch_norm.clone();
+        batch_norm.biases.clone_from(&params.projection.biases);
+        forward_batchnorm_with_cache(&batch_norm, &math.raw_output, training)?.0
+    } else {
+        let mut biased = math.raw_output.clone();
+        for batch in 0..output_shape.batch {
+            for filter in 0..output_shape.channels {
+                let start = (batch * output_shape.channels + filter)
+                    * output_shape.height
+                    * output_shape.width;
+                for value in
+                    &mut biased.data[start..start + output_shape.height * output_shape.width]
+                {
+                    *value += params.projection.biases[filter];
+                }
+            }
+        }
+        biased
+    };
+    let mut output = Tensor::zeros(output_shape);
+    for (value, preactivation) in output.data.iter_mut().zip(&activation_input.data) {
+        *value = activate_convolution_value(&spec.activation, *preactivation);
+    }
+    apply_convolution_channel_normalization(&mut output, &activation_input, &spec.activation);
+    // Keep the preactivation independent from the BN input used in the math
+    // cache; backward needs both tensors for activation and BN derivatives.
+    let runtime_cache = GraphConvRuntimeCache { math, training };
+    Ok((output, activation_input, runtime_cache))
 }
 
 fn forward_deform_conv_with_cache(
@@ -24519,6 +25001,310 @@ mod tests {
             0.5 * updated * updated < 0.5 * initial * initial,
             "Darknet update should descend: output {initial} -> {updated}"
         );
+    }
+
+    #[test]
+    fn graph_conv_runtime_nchw_backward_and_gpu_execution_gate() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "graph-conv-runtime.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=1\nbatch=1\n[graph_conv]\nfilters=1\nsize=3\npad=1\nedge_mode=0\ngraph_use_self=1\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        let LayerParams::GraphConv(params) = &mut cpu.params[0] else {
+            panic!("graph_conv params");
+        };
+        params.projection.weights[0] = 0.5;
+        params.projection.biases[0] = 0.25;
+        params.self_weights.as_mut().unwrap()[0] = 0.1;
+        let input =
+            Tensor::from_data(TensorShape::new(2, 2, 1, 1), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let forward = cpu.forward(&input).unwrap();
+        assert_eq!(forward.graph_conv_caches.len(), 1);
+        assert!(forward.graph_conv_caches[0].is_some());
+        assert_eq!(forward.layer_outputs[0].data, vec![1.6, 1.7, 1.8, 1.9]);
+        let seed = Tensor::from_data(forward.layer_outputs[0].shape, vec![1.0; 4]).unwrap();
+        let bias_objective = |network: &mut ExecutableNetwork, bias: f32| {
+            let LayerParams::GraphConv(params) = &mut network.params[0] else {
+                panic!("graph_conv params");
+            };
+            params.projection.biases[0] = bias;
+            network.forward(&input).unwrap().layer_outputs[0]
+                .data
+                .iter()
+                .zip(&seed.data)
+                .map(|(value, gradient)| value * gradient)
+                .sum::<f32>()
+        };
+        let epsilon = 1.0e-3;
+        let bias_plus = bias_objective(&mut cpu, 0.25 + epsilon);
+        let bias_minus = bias_objective(&mut cpu, 0.25 - epsilon);
+        let numeric_bias_gradient = (bias_plus - bias_minus) / (2.0 * epsilon);
+        let _ = bias_objective(&mut cpu, 0.25);
+        assert!((numeric_bias_gradient - 4.0).abs() < 1.0e-3);
+
+        let backward = cpu.backward(&input, &forward, &seed).unwrap();
+        assert_eq!(backward.input_gradient.data, vec![0.6; 4]);
+        let LayerParams::GraphConv(gradient) = &backward.param_gradients[0] else {
+            panic!("graph_conv gradient");
+        };
+        assert_eq!(gradient.projection.biases, vec![4.0]);
+        assert_eq!(gradient.projection.weights, vec![10.0]);
+        assert_eq!(gradient.self_weights.as_deref(), Some(&[10.0][..]));
+
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        let error = gpu
+            .forward(&input)
+            .expect_err("Stage-1 graph_conv must reject GPU execution");
+        assert!(
+            error
+                .to_string()
+                .contains("[graph_conv] GPU execution is not implemented in the Stage-1 CPU port")
+        );
+        let error = gpu
+            .update_weights_gpu(0.01, 0.9, 0.0, 1)
+            .expect_err("Stage-1 graph_conv must reject GPU updates");
+        assert!(
+            error
+                .to_string()
+                .contains("[graph_conv] GPU updates are not implemented in the Stage-1 CPU port")
+        );
+    }
+
+    #[test]
+    fn graph_conv_backward_accumulates_into_preceding_convolution() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "graph-conv-chain.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=1\nbatch=1\n[convolutional]\nfilters=1\nsize=1\nactivation=linear\n[graph_conv]\nfilters=1\nsize=1\nedge_mode=0\ngraph_use_self=0\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::Convolutional(convolution) = &mut executable.params[0] else {
+            panic!("preceding convolution params");
+        };
+        convolution.weights[0] = 2.0;
+        convolution.biases[0] = 0.1;
+        let LayerParams::GraphConv(graph) = &mut executable.params[1] else {
+            panic!("graph_conv params");
+        };
+        graph.projection.weights[0] = 3.0;
+        graph.projection.biases[0] = 0.2;
+
+        let input =
+            Tensor::from_data(TensorShape::new(2, 2, 1, 1), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let forward = executable.forward(&input).unwrap();
+        for (actual, expected) in forward.layer_outputs[1]
+            .data
+            .iter()
+            .zip([6.5, 12.5, 18.5, 24.5])
+        {
+            assert!((actual - expected).abs() < 3.0e-6);
+        }
+        let seed =
+            Tensor::from_data(forward.layer_outputs[1].shape, vec![0.5, 1.0, -0.5, 2.0]).unwrap();
+        let backward = executable.backward(&input, &forward, &seed).unwrap();
+        assert_eq!(backward.input_gradient.data, vec![3.0, 6.0, -3.0, 12.0]);
+        let LayerParams::GraphConv(graph) = &backward.param_gradients[1] else {
+            panic!("graph_conv gradient");
+        };
+        assert!((graph.projection.weights[0] - 18.3).abs() < 1.0e-5);
+        assert_eq!(graph.projection.biases, vec![3.0]);
+        let LayerParams::Convolutional(convolution) = &backward.param_gradients[0] else {
+            panic!("preceding convolution gradient");
+        };
+        assert!((convolution.weights[0] - 27.0).abs() < 1.0e-5);
+        assert_eq!(convolution.biases, vec![9.0]);
+    }
+
+    #[test]
+    fn graph_conv_training_batchnorm_uses_batch_stats_and_updates_rolling_stats() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "graph-conv-bn.cfg",
+                "[net]\nwidth=2\nheight=1\nchannels=1\nbatch=2\n[graph_conv]\nfilters=1\nsize=1\nedge_mode=0\ngraph_use_self=0\nbatch_normalize=1\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::GraphConv(params) = &mut executable.params[0] else {
+            panic!("graph_conv params");
+        };
+        params.projection.weights[0] = 1.0;
+        params.projection.biases[0] = 0.1;
+        params.projection.batch_norm.as_mut().unwrap().scales[0] = 2.0;
+        let input =
+            Tensor::from_data(TensorShape::new(2, 1, 1, 2), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let forward = executable.forward_training(&input).unwrap();
+        let output = &forward.layer_outputs[0];
+        let expected = [
+            2.0 * (-1.5f32 / 1.25001f32.sqrt()) + 0.1,
+            2.0 * (-0.5f32 / 1.25001f32.sqrt()) + 0.1,
+            2.0 * (0.5f32 / 1.25001f32.sqrt()) + 0.1,
+            2.0 * (1.5f32 / 1.25001f32.sqrt()) + 0.1,
+        ];
+        for (actual, expected) in output.data.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1.0e-5);
+        }
+        let seed = Tensor::from_data(output.shape, vec![1.0; output.len()]).unwrap();
+        let backward = executable
+            .backward_accumulate(&input, &forward, &seed)
+            .unwrap();
+        assert!(
+            backward
+                .input_gradient
+                .data
+                .iter()
+                .all(|value| value.abs() < 1.0e-5)
+        );
+        let LayerParams::GraphConv(params) = &executable.params[0] else {
+            panic!("graph_conv params");
+        };
+        let batch_norm = params.projection.batch_norm.as_ref().unwrap();
+        assert!((batch_norm.rolling_mean[0] - 0.25).abs() < 1.0e-6);
+        assert!((batch_norm.rolling_variance[0] - 0.125).abs() < 1.0e-6);
+        let LayerTrainBuffers::GraphConv(train) = &executable.train_buffers[0] else {
+            panic!("graph_conv train buffers");
+        };
+        assert_eq!(train.projection.bias_updates, vec![4.0]);
+        assert!(train.projection.batch_norm.as_ref().unwrap().scale_updates[0].abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn graph_conv_sgd_updates_source_weight_groups_and_momentum() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "graph-conv-sgd.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=1\n[graph_conv]\nsize=1\nedge_mode=1\ngraph_use_self=1\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::GraphConv(params) = &mut executable.params[0] else {
+            panic!("graph_conv params");
+        };
+        params.projection.weights[0] = 1.0;
+        params.projection.biases[0] = 2.0;
+        params.self_weights.as_mut().unwrap()[0] = 1.0;
+        params.edge_kernel.as_mut().unwrap().fill(1.0);
+        params.edge_biases.as_mut().unwrap()[0] = 0.0;
+        let LayerTrainBuffers::GraphConv(train) = &mut executable.train_buffers[0] else {
+            panic!("graph_conv train buffers");
+        };
+        train.projection.weight_updates[0] = 0.5;
+        train.projection.bias_updates[0] = 1.0;
+        train.self_weight_updates.as_mut().unwrap()[0] = 2.0;
+        train.edge_kernel_updates.as_mut().unwrap().fill(3.0);
+        train.edge_bias_updates.as_mut().unwrap()[0] = 4.0;
+
+        executable.update_weights(0.1, 0.5, 0.2, 2);
+        let LayerParams::GraphConv(params) = &executable.params[0] else {
+            panic!("graph_conv params");
+        };
+        let LayerTrainBuffers::GraphConv(train) = &executable.train_buffers[0] else {
+            panic!("graph_conv train buffers");
+        };
+        assert!((params.projection.weights[0] - 1.005).abs() < 1.0e-6);
+        assert!((params.projection.biases[0] - 2.05).abs() < 1.0e-6);
+        assert!((params.self_weights.as_ref().unwrap()[0] - 1.08).abs() < 1.0e-6);
+        assert!((params.edge_kernel.as_ref().unwrap()[0] - 1.13).abs() < 1.0e-6);
+        assert!((params.edge_biases.as_ref().unwrap()[0] - 0.2).abs() < 1.0e-6);
+        assert!((train.projection.weight_updates[0] - 0.05).abs() < 1.0e-6);
+        assert!((train.projection.bias_updates[0] - 0.5).abs() < 1.0e-6);
+        assert!((train.self_weight_updates.as_ref().unwrap()[0] - 0.8).abs() < 1.0e-6);
+        assert!((train.edge_kernel_updates.as_ref().unwrap()[0] - 1.3).abs() < 1.0e-6);
+        assert!((train.edge_bias_updates.as_ref().unwrap()[0] - 2.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn graph_conv_adam_updates_and_persists_all_moment_blocks() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "graph-conv-adam.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=1\nadam=1\n[graph_conv]\nsize=1\nedge_mode=1\ngraph_use_self=1\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let LayerParams::GraphConv(params) = &mut executable.params[0] else {
+            panic!("graph_conv params");
+        };
+        params.projection.weights[0] = 1.0;
+        params.projection.biases[0] = 1.0;
+        params.self_weights.as_mut().unwrap()[0] = 1.0;
+        params.edge_kernel.as_mut().unwrap().fill(1.0);
+        params.edge_biases.as_mut().unwrap()[0] = 1.0;
+        let LayerTrainBuffers::GraphConv(train) = &mut executable.train_buffers[0] else {
+            panic!("graph_conv train buffers");
+        };
+        train.projection.weight_updates[0] = 0.2;
+        train.projection.bias_updates[0] = 0.3;
+        train.self_weight_updates.as_mut().unwrap()[0] = 0.4;
+        train.edge_kernel_updates.as_mut().unwrap().fill(0.5);
+        train.edge_bias_updates.as_mut().unwrap()[0] = 0.6;
+        executable.update_weights_adam(0.01, 1).unwrap();
+        assert_eq!(executable.adam_step(), 1);
+        assert!(
+            executable
+                .train_buffers
+                .iter()
+                .all(|buffers| match buffers {
+                    LayerTrainBuffers::GraphConv(train) => {
+                        train
+                            .projection
+                            .weight_updates
+                            .iter()
+                            .all(|value| *value == 0.0)
+                            && train
+                                .projection
+                                .bias_updates
+                                .iter()
+                                .all(|value| *value == 0.0)
+                            && train
+                                .self_weight_updates
+                                .as_ref()
+                                .unwrap()
+                                .iter()
+                                .all(|value| *value == 0.0)
+                            && train
+                                .edge_kernel_updates
+                                .as_ref()
+                                .unwrap()
+                                .iter()
+                                .all(|value| *value == 0.0)
+                            && train
+                                .edge_bias_updates
+                                .as_ref()
+                                .unwrap()
+                                .iter()
+                                .all(|value| *value == 0.0)
+                    }
+                    LayerTrainBuffers::None => true,
+                    _ => false,
+                })
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "darknet-graph-conv-adam-{}.state",
+            std::process::id()
+        ));
+        let round_trip = path.with_extension("round-trip.state");
+        executable.save_optimizer_state(&path).unwrap();
+        let mut restored = ExecutableNetwork::new(network);
+        restored.load_optimizer_state(&path).unwrap();
+        assert_eq!(restored.adam_step(), executable.adam_step());
+        restored.save_optimizer_state(&round_trip).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), fs::read(&round_trip).unwrap());
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(round_trip);
     }
 
     #[test]
