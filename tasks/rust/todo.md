@@ -365,10 +365,16 @@ Immediately next, in dependency order:
   `MEM=3G ./tools/test_host.sh obb_` also passed 135 core + 4 CLI tests.
   No compiled-C++ parity is established.
   v0.0.258 adds sample-level CARPN mAP dispatch through `obb_detector_map`; focused
-  `obb_map` (5 core), `carpn_map` (3), and `carpn_polygon_iou` (2) host filters pass. Still open: broader OBB GPU training/validation,
-  CARPN network decode and dataset/CLI/training mAP integration, remaining
-  cfg/training-option wiring, source-faithful geometric augmentation/label transforms,
-  and any unimplemented OBB source paths.
+  `obb_map` (5 core), `carpn_map` (3), and `carpn_polygon_iou` (2) host filters pass.
+  v0.0.259 completes CPU CARPN network inference, `detect-image`, and direct
+  `detector map` via real cfg/weights-backed fixture tests; `carpn_refine_cfg` (2),
+  `carpn_refine_weights` (1), `carpn_refine_forward` (3), `carpn_refine_decode` (5),
+  `carpn_map` (6), `carpn_cli` (1), `detect_image_routes_carpn` (1), and
+  `detector_train_rejects_carpn` (1) pass. The legacy `obb_` filter passes 138 core
+  + 4 CLI tests. CARPN Stage-2 training and scheduled `detector train -map` remain
+  deferred. Still open: broader OBB GPU training/validation, remaining cfg/training-
+  option wiring, source-faithful geometric augmentation/label transforms, and any
+  unimplemented OBB source paths.
 - [ ] Phase 3B deformable family: start with `dcnv4` (real C++ forward and
   kernels, weights order `weights.cpp:428`); then `deform_conv`, `dsconv`,
   `graph_conv`, `wmhf`, `clifford`, `recursive_block`.
@@ -377,7 +383,8 @@ Immediately next, in dependency order:
 ## Active and unstarted plans
 
 - [x] `onnx.md` — `darknet-rs export-onnx`; all 21 implementation, verification, and bookkeeping steps are complete.
-- [x] `carpn_map_plan.md` — bounded caller-supplied sample dispatch implemented in v0.0.258; end-to-end CARPN network validation remains blocked by missing Rust stage-2 model/decoder.
+- [x] `carpn_map_plan.md` — bounded caller-supplied sample dispatch implemented in v0.0.258.
+- [x] `carpn_network_map_plan.md` — v0.0.259 completes CPU network inference, `detect-image`, and direct `detector map`; CARPN training/`detector train -map` remain explicitly deferred.
 - [ ] `gui_plan.md` — egui DarkMark replacement (M0–M6, not started).
 
 ## Known evidence gaps (not user questions)

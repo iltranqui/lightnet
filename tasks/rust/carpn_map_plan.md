@@ -75,7 +75,7 @@ Not a pass for this task:
 
 ## Explicitly deferred
 
-End-to-end CARPN validation requires a separate scope with model/config/runtime support for the source `[obb_refine]` stage-2 path, a CARPN network decoder that emits normalized quad detections, integration through `ObbValidationDataset::evaluate` and CLI/training mAP routing, and source-derived fixture tests. The current Rust model has no such layer, so this is not an implementation task hidden inside the evaluator dispatch.
+End-to-end CARPN inference and direct `detector map` are implemented separately in [`carpn_network_map_plan.md`](carpn_network_map_plan.md) (v0.0.259): CPU `[obb_refine]` inference, quadrilateral decoding, `detect-image`, full-forward validation, and generated cfg/weights-backed polygon-mAP fixtures. Rust CARPN training and scheduled `detector train -map` remain deferred until Stage-2 assignment/loss/backward/update support is implemented. Neither scope is hidden inside this caller-supplied evaluator dispatch.
 
 Dataset/model smoke checks and compiled-C++ comparison are blocked until matching assets and a compiled reference build exist. Preserve the known non-green `cfg_corpus` baseline; do not rerun it blindly.
 

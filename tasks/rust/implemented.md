@@ -45,6 +45,7 @@ file is named inline.
 - [13. OBB CPU training gaps (plan-open-items Waves 0–1)](#13-obb-cpu-training-gaps-plan-open-items-waves-01)
 - [14. ONNX export](#14-onnx-export)
 - [15. CARPN sample-level polygon mAP dispatch](#15-carpn-sample-level-polygon-map-dispatch)
+- [16. CARPN CPU network inference and direct mAP](#16-carpn-cpu-network-inference-and-direct-map)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -603,6 +604,12 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 ## 15. CARPN sample-level polygon mAP dispatch
 
 - v0.0.258 (`7681f478`): `obb_detector_map` now dispatches all-CARPN sample sets to the existing polygon evaluator, rejects mixed front-point/CARPN predictions, and preserves the legacy route for empty prediction sets. `MEM=3G ./tools/test_host.sh obb_map` passed 5 core tests, `MEM=3G ./tools/test_host.sh carpn_map` passed 3, and `MEM=3G ./tools/test_host.sh carpn_polygon_iou` passed 2. This is caller-provided sample API support only: Rust CARPN network decoding, CLI/training mAP integration, and compiled-C++ parity remain unsupported/not established.
+
+## 16. CARPN CPU network inference and direct mAP
+
+- v0.0.259 (`29889c5c`): added `[obb_refine]` CPU inference, Stage-2 quadrilateral decoding/NMS, full-forward OBB validation with explicit polygon mAP, `detect-image` integration, and a cfg/weights-backed direct `detector map` route. Generated fixtures verify AP/report counts, a same-AABB/wrong-polygon case (AABB AP 1.0 versus polygon AP 0.0 at IoU 0.6), and required front-point labels even with zero proposals. CARPN `detector train` including `-map` rejects before training because Stage-2 assignment/loss/backward/update support is not implemented. Legacy OBB behavior is preserved (`MEM=3G ./tools/test_host.sh obb_`: 138 core + 4 CLI tests).
+- Focused evidence: `carpn_refine_cfg` (2), `carpn_refine_weights` (1), `carpn_refine_forward` (3), `carpn_proposals_apply` (1), `carpn_refine_decode` (5), `carpn_map` (6), `carpn_cli` (1), `detect_image_routes_carpn` (1), and `detector_train_rejects_carpn` (1) all passed through `MEM=3G ./tools/test_host.sh`. `systemd-run --user --scope -p MemoryHigh=3G cargo build -p darknet-cli -j 4`, targeted `rustfmt --check`, and `git diff --check` passed. Workspace-wide `cargo fmt --check` reports pre-existing formatting differences in unrelated ONNX/CUDA files; those were not reformatted. No full cfg-corpus run was required.
+- Source behavior is hand-derived from `raptor`; there is no compiled-C++ oracle or canonical CARPN cfg/weights/dataset, so no compiled-C++ parity or canonical-dataset result is claimed. GPU CARPN inference and CARPN training/scheduled `detector train -map` remain deferred.
 
 ## Not implemented / open (pointer)
 
