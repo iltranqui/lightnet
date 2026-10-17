@@ -405,6 +405,21 @@ pub struct Dcnv4Spec {
     pub activation: Activation,
 }
 
+/// `[deform_conv]` / `[deformable_convolutional]` (DCNv1 and optional DCNv2 mask).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeformConvSpec {
+    pub filters: usize,
+    pub groups: usize,
+    pub size: usize,
+    pub stride_x: usize,
+    pub stride_y: usize,
+    pub dilation: usize,
+    pub padding: usize,
+    pub batch_normalize: bool,
+    pub use_mask: bool,
+    pub activation: Activation,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConnectedSpec {
     pub output: usize,
@@ -1301,6 +1316,8 @@ pub enum LayerKind {
     EmlConvolutional(EmlConvolutionalSpec),
     /// `[dcnv4]` / `[dcnv4_convolutional]`: channel-preserving deformable aggregation.
     Dcnv4(Dcnv4Spec),
+    /// `[deform_conv]` / `[deformable_convolutional]`: DCNv1/2 sampling.
+    DeformConv(DeformConvSpec),
     Rnn(RnnSpec),
     Gru(GruSpec),
     Lstm(LstmSpec),
@@ -1361,6 +1378,7 @@ impl LayerKind {
             Self::Moe(_) => "moe_convolutional",
             Self::EmlConvolutional(_) => "eml_convolutional",
             Self::Dcnv4(_) => "dcnv4",
+            Self::DeformConv(_) => "deform_conv",
             Self::Rnn(_) => "rnn",
             Self::Gru(_) => "gru",
             Self::Lstm(_) => "lstm",
@@ -1378,6 +1396,7 @@ impl LayerKind {
         match self {
             Self::Convolutional(spec) => Some(&spec.activation),
             Self::Dcnv4(spec) => Some(&spec.activation),
+            Self::DeformConv(spec) => Some(&spec.activation),
             Self::Deconvolutional(spec) => Some(&spec.activation),
             Self::Connected(spec) => Some(&spec.activation),
             Self::Shortcut(spec) => Some(&spec.activation),
@@ -1938,6 +1957,72 @@ impl Layer {
                 ]);
                 Some(LayerWeights { entries })
             }
+            LayerKind::DeformConv(spec) => {
+                let channels = self.input_shape.channels;
+                let kernel_area = spec
+                    .size
+                    .checked_mul(spec.size)
+                    .expect("validated deformable-convolution kernel size");
+                let offset_filters = kernel_area
+                    .checked_mul(2)
+                    .expect("validated deformable-convolution offset count");
+                let main_weights = spec
+                    .filters
+                    .checked_mul(channels / spec.groups)
+                    .and_then(|count| count.checked_mul(kernel_area))
+                    .expect("validated deformable-convolution weight count");
+                let offset_weights = offset_filters
+                    .checked_mul(channels)
+                    .and_then(|count| count.checked_mul(kernel_area))
+                    .expect("validated deformable-convolution offset weight count");
+                let mut entries = vec![WeightsEntry {
+                    array: WeightsArray::Biases,
+                    len: spec.filters,
+                }];
+                if spec.batch_normalize {
+                    entries.extend([
+                        WeightsEntry {
+                            array: WeightsArray::Scales,
+                            len: spec.filters,
+                        },
+                        WeightsEntry {
+                            array: WeightsArray::RollingMean,
+                            len: spec.filters,
+                        },
+                        WeightsEntry {
+                            array: WeightsArray::RollingVariance,
+                            len: spec.filters,
+                        },
+                    ]);
+                }
+                entries.extend([
+                    WeightsEntry {
+                        array: WeightsArray::Weights,
+                        len: main_weights,
+                    },
+                    WeightsEntry {
+                        array: WeightsArray::Named("offset_weights".to_owned()),
+                        len: offset_weights,
+                    },
+                    WeightsEntry {
+                        array: WeightsArray::Named("offset_biases".to_owned()),
+                        len: offset_filters,
+                    },
+                ]);
+                if spec.use_mask {
+                    entries.extend([
+                        WeightsEntry {
+                            array: WeightsArray::Named("mask_weights".to_owned()),
+                            len: kernel_area * channels * kernel_area,
+                        },
+                        WeightsEntry {
+                            array: WeightsArray::Named("mask_biases".to_owned()),
+                            len: kernel_area,
+                        },
+                    ]);
+                }
+                Some(LayerWeights { entries })
+            }
             LayerKind::Crnn(spec) => {
                 let mut entries = Vec::new();
                 append_convolutional_weight_entries(
@@ -2223,6 +2308,9 @@ fn parse_layer_kind(
     let name = section.name.as_str();
     Ok(match name {
         "dcnv4" | "dcnv4_convolutional" => LayerKind::Dcnv4(parse_dcnv4_spec(section, current)?),
+        "deform_conv" | "deformable_convolutional" => {
+            LayerKind::DeformConv(parse_deform_conv_spec(section, current)?)
+        }
         "eml_convolutional" => {
             let line = section.line;
             if current.width == 0 || current.height == 0 || current.channels == 0 {
@@ -3585,6 +3673,47 @@ fn infer_output_shape(
                 current.batch,
             ))
         }
+        LayerKind::DeformConv(spec) => {
+            if current.width == 0 || current.height == 0 || current.channels == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "[deform_conv] layer #{layer_index}: preceding layer must output a non-empty image"
+                )));
+            }
+            if spec.filters == 0
+                || spec.groups == 0
+                || current.channels % spec.groups != 0
+                || spec.filters % spec.groups != 0
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "[deform_conv] layer #{layer_index}: groups must be positive and divide input and output channels"
+                )));
+            }
+            let width = deform_conv_output_dim(
+                current.width,
+                spec.padding,
+                spec.size,
+                spec.stride_x,
+                spec.dilation,
+            )
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "[deform_conv] layer #{layer_index}: invalid or empty output width"
+                ))
+            })?;
+            let height = deform_conv_output_dim(
+                current.height,
+                spec.padding,
+                spec.size,
+                spec.stride_y,
+                spec.dilation,
+            )
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "[deform_conv] layer #{layer_index}: invalid or empty output height"
+                ))
+            })?;
+            Ok(TensorShape::new(width, height, spec.filters, current.batch))
+        }
         LayerKind::EmlConvolutional(spec) => {
             let conv = &spec.branch;
             if conv.filters == 0
@@ -4540,6 +4669,204 @@ fn dcnv4_output_dim(
         .checked_add(1)
 }
 
+fn deform_conv_output_dim(
+    input: usize,
+    padding: usize,
+    size: usize,
+    stride: usize,
+    dilation: usize,
+) -> Option<usize> {
+    dcnv4_output_dim(input, padding, size, stride, dilation)
+}
+
+fn reject_unknown_deform_conv_keys(section: &RawSection) -> Result<()> {
+    const ALLOWED: &[&str] = &[
+        "filters",
+        "groups",
+        "size",
+        "stride",
+        "stride_x",
+        "stride_y",
+        "dilation",
+        "antialiasing",
+        "pad",
+        "padding",
+        "activation",
+        "assisted_excitation",
+        "share_index",
+        "batch_normalize",
+        "cbn",
+        "binary",
+        "xnor",
+        "bin_output",
+        "use_mask",
+        "mask",
+        "flipped",
+        "dot",
+        "angle",
+        "grad_centr",
+        "reverse",
+        "coordconv",
+        "stream",
+        "wait_stream",
+        "learning_rate",
+        "dont_update",
+        "burnin_update",
+        "train_only_bn",
+        "clip",
+    ];
+    if let Some(key) = section
+        .values
+        .keys()
+        .find(|key| !ALLOWED.contains(&key.as_str()))
+    {
+        return Err(Error::InvalidConfig(format!(
+            "[{}] at line {}: unknown option `{key}`",
+            section.name, section.line
+        )));
+    }
+    Ok(())
+}
+
+fn parse_deform_conv_spec(section: &RawSection, input: TensorShape) -> Result<DeformConvSpec> {
+    let line = section.line;
+    reject_unknown_deform_conv_keys(section)?;
+    let invalid = |message: &str| {
+        Error::InvalidConfig(format!("[{}] at line {line}: {message}", section.name))
+    };
+    let filters = section.get_i64("filters", 1)?;
+    let groups = section.get_i64("groups", 1)?;
+    let size = section.get_i64("size", 1)?;
+    let stride = section.get_i64("stride", 1)?;
+    let stride_x = section.get_i64("stride_x", -1)?;
+    let stride_y = section.get_i64("stride_y", -1)?;
+    let dilation = section.get_i64("dilation", 1)?;
+    let pad = section.get_i64("pad", 0)? != 0;
+    let padding = section.get_i64("padding", 0)?;
+    let padding = if pad {
+        usize::try_from(size / 2).map_err(|_| invalid("size must be positive"))?
+    } else {
+        usize::try_from(padding).map_err(|_| invalid("padding must be non-negative"))?
+    };
+    let batch_normalize = section.get_i64("batch_normalize", 0)?;
+    let cbn = section.get_i64("cbn", 0)?;
+    let activation = Activation::parse(&section.get_str("activation", "logistic"));
+    let use_mask = if section.get("use_mask").is_some() {
+        section.get_i64("use_mask", 1)? != 0
+    } else {
+        section.get_i64("mask", 1)? != 0
+    };
+
+    if input.width == 0 || input.height == 0 || input.channels == 0 {
+        return Err(invalid("preceding layer must output a non-empty image"));
+    }
+    if filters <= 0 || groups <= 0 || size <= 0 || stride <= 0 {
+        return Err(invalid(
+            "filters, groups, size, and stride must be positive",
+        ));
+    }
+    if batch_normalize != 0 && batch_normalize != 1 {
+        return Err(invalid(
+            "batch_normalize must be 0 or 1; cross-batch BN is unsupported",
+        ));
+    }
+    if cbn != 0 {
+        return Err(invalid("cbn/cross-batch normalization is unsupported"));
+    }
+    if section.get_i64("binary", 0)? != 0
+        || section.get_i64("xnor", 0)? != 0
+        || section.get_i64("bin_output", 0)? != 0
+    {
+        return Err(invalid(
+            "binary, xnor, and bin_output modes are unsupported",
+        ));
+    }
+    if section.get_i64("antialiasing", 0)? != 0 {
+        return Err(invalid("antialiasing is unsupported"));
+    }
+    if section.get_f32("assisted_excitation", 0.0)? != 0.0 {
+        return Err(invalid("assisted_excitation is unsupported"));
+    }
+    if section.get_i64("share_index", -1_000_000_000)? != -1_000_000_000 {
+        return Err(invalid(
+            "shared deformable-convolution layers are unsupported",
+        ));
+    }
+    if section.get_i64("flipped", 0)? != 0
+        || section.get_f32("dot", 0.0)? != 0.0
+        || section.get_f32("angle", 15.0)? != 15.0
+        || section.get_f32("reverse", 0.0)? != 0.0
+        || section.get_i64("coordconv", 0)? != 0
+    {
+        return Err(invalid(
+            "specialized convolution transforms are unsupported",
+        ));
+    }
+    if section.get_i64("stream", -1)? != -1 || section.get_i64("wait_stream", -1)? != -1 {
+        return Err(invalid("non-default stream execution is unsupported"));
+    }
+    if section.get_i64("grad_centr", 0)? != 0 {
+        return Err(invalid(
+            "grad_centr is unsupported for deformable convolution",
+        ));
+    }
+
+    let size = size as usize;
+    let dilation = if size == 1 {
+        1
+    } else {
+        usize::try_from(dilation).map_err(|_| invalid("dilation must be positive"))?
+    };
+    let stride_x = if stride_x < 1 { stride } else { stride_x };
+    let stride_y = if stride_y < 1 { stride } else { stride_y };
+    let stride_x = usize::try_from(stride_x).map_err(|_| invalid("stride_x must be positive"))?;
+    let stride_y = usize::try_from(stride_y).map_err(|_| invalid("stride_y must be positive"))?;
+    let filters = filters as usize;
+    let groups = groups as usize;
+    if input.channels % groups != 0 || filters % groups != 0 {
+        return Err(invalid(
+            "groups must divide both input channels and filters",
+        ));
+    }
+    let kernel_area = size
+        .checked_mul(size)
+        .ok_or_else(|| invalid("kernel area overflows"))?;
+    let offset_filters = kernel_area
+        .checked_mul(2)
+        .ok_or_else(|| invalid("offset count overflows"))?;
+    let _offset_weights = offset_filters
+        .checked_mul(input.channels)
+        .and_then(|count| count.checked_mul(kernel_area))
+        .ok_or_else(|| invalid("offset weight count overflows"))?;
+    let _main_weights = filters
+        .checked_mul(input.channels / groups)
+        .and_then(|count| count.checked_mul(kernel_area))
+        .ok_or_else(|| invalid("main weight count overflows"))?;
+    if use_mask {
+        kernel_area
+            .checked_mul(input.channels)
+            .and_then(|count| count.checked_mul(kernel_area))
+            .ok_or_else(|| invalid("mask weight count overflows"))?;
+    }
+    if deform_conv_output_dim(input.width, padding, size, stride_x, dilation).is_none()
+        || deform_conv_output_dim(input.height, padding, size, stride_y, dilation).is_none()
+    {
+        return Err(invalid("invalid or empty output geometry"));
+    }
+    Ok(DeformConvSpec {
+        filters,
+        groups,
+        size,
+        stride_x,
+        stride_y,
+        dilation,
+        padding,
+        batch_normalize: batch_normalize != 0,
+        use_mask,
+        activation,
+    })
+}
+
 fn parse_dcnv4_spec(section: &RawSection, input: TensorShape) -> Result<Dcnv4Spec> {
     let line = section.line;
     reject_unknown_dcnv4_keys(section)?;
@@ -5428,6 +5755,229 @@ mod tests {
 
     fn build(text: &str) -> crate::error::Result<Network> {
         Network::from_config(ConfigFile::parse_str("t.cfg", text)?)
+    }
+
+    #[test]
+    fn deform_conv_aliases_defaults_and_source_order_weights() {
+        for alias in ["deform_conv", "deformable_convolutional"] {
+            let network = build(&format!(
+                "[net]\nwidth=5\nheight=4\nchannels=4\n[{alias}]\nfilters=6\ngroups=2\n"
+            ))
+            .unwrap_or_else(|error| panic!("[{alias}] should parse: {error}"));
+            let layer = &network.layers[0];
+            let LayerKind::DeformConv(spec) = &layer.kind else {
+                panic!("expected DCNv1/2 for [{alias}]")
+            };
+            assert_eq!(layer.kind.name(), "deform_conv");
+            assert_eq!(layer.output_shape, super::TensorShape::new(5, 4, 6, 1));
+            assert_eq!(
+                (
+                    spec.filters,
+                    spec.groups,
+                    spec.size,
+                    spec.stride_x,
+                    spec.stride_y,
+                    spec.dilation,
+                    spec.padding,
+                    spec.batch_normalize,
+                    spec.use_mask,
+                    &spec.activation,
+                ),
+                (
+                    6,
+                    2,
+                    1,
+                    1,
+                    1,
+                    1,
+                    0,
+                    false,
+                    true,
+                    &super::Activation::Logistic
+                )
+            );
+            let weights = layer
+                .weights()
+                .expect("deform_conv has serialized parameters");
+            assert_eq!(
+                weights
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.array.name(), entry.len))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("biases", 6),
+                    ("weights", 12),
+                    ("offset_weights", 8),
+                    ("offset_biases", 2),
+                    ("mask_weights", 4),
+                    ("mask_biases", 1),
+                ]
+            );
+            assert_eq!(weights.parameter_count(), 33);
+        }
+    }
+
+    #[test]
+    fn deform_conv_enables_default_try_fix_nan_for_both_aliases() {
+        for alias in ["deform_conv", "deformable_convolutional"] {
+            let default = build(&format!(
+                "[net]\nwidth=2\nheight=2\nchannels=1\n[{alias}]\n"
+            ))
+            .unwrap();
+            assert!(
+                default.net.try_fix_nan,
+                "[{alias}] should enable try_fix_nan"
+            );
+            let disabled = build(&format!(
+                "[net]\nwidth=2\nheight=2\nchannels=1\ntry_fix_nan=0\n[{alias}]\n"
+            ))
+            .unwrap();
+            assert!(!disabled.net.try_fix_nan);
+            let enabled = build(&format!(
+                "[net]\nwidth=2\nheight=2\nchannels=1\ntry_fix_nan=1\n[{alias}]\n"
+            ))
+            .unwrap();
+            assert!(enabled.net.try_fix_nan);
+        }
+    }
+
+    #[test]
+    fn deform_conv_parses_stride_padding_mask_and_dilation_precedence() {
+        let network = build(
+            "[net]\nwidth=8\nheight=7\nchannels=4\n\
+             [deform_conv]\nfilters=6\ngroups=2\nsize=3\nstride=2\n\
+             stride_x=1\nstride_y=3\ndilation=2\npadding=2\npad=1\n\
+             use_mask=0\nmask=1\nactivation=linear\n",
+        )
+        .expect("valid deform_conv geometry should parse");
+        let layer = &network.layers[0];
+        let LayerKind::DeformConv(spec) = &layer.kind else {
+            panic!("expected deform_conv")
+        };
+        assert_eq!(
+            (
+                spec.stride_x,
+                spec.stride_y,
+                spec.dilation,
+                spec.padding,
+                spec.use_mask
+            ),
+            (1, 3, 2, 1, false)
+        );
+        assert_eq!(layer.output_shape, super::TensorShape::new(6, 2, 6, 1));
+        assert_eq!(
+            layer
+                .weights()
+                .unwrap()
+                .entries
+                .iter()
+                .map(|entry| (entry.array.name(), entry.len))
+                .collect::<Vec<_>>(),
+            vec![
+                ("biases", 6),
+                ("weights", 108),
+                ("offset_weights", 648),
+                ("offset_biases", 18),
+            ]
+        );
+
+        let padded = build(
+            "[net]\nwidth=8\nheight=7\nchannels=4\n\
+             [deformable_convolutional]\nfilters=4\nsize=3\nstride=2\n\
+             stride_x=1\nstride_y=3\npadding=2\nmask=0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            padded.layers[0].output_shape,
+            super::TensorShape::new(10, 3, 4, 1)
+        );
+        let LayerKind::DeformConv(spec) = &padded.layers[0].kind else {
+            unreachable!()
+        };
+        assert_eq!(spec.padding, 2);
+        assert!(!spec.use_mask);
+
+        let size_one = build(
+            "[net]\nwidth=4\nheight=4\nchannels=1\n\
+             [deform_conv]\nsize=1\ndilation=7\nuse_mask=1\nmask=0\n",
+        )
+        .unwrap();
+        let LayerKind::DeformConv(spec) = &size_one.layers[0].kind else {
+            unreachable!()
+        };
+        assert_eq!(spec.dilation, 1);
+        assert!(spec.use_mask);
+    }
+
+    #[test]
+    fn deform_conv_batchnorm_weights_match_source_order() {
+        let network = build(
+            "[net]\nwidth=5\nheight=4\nchannels=4\n\
+             [deform_conv]\nfilters=6\ngroups=2\nsize=3\nbatch_normalize=1\nmask=1\n",
+        )
+        .unwrap();
+        let weights = network.layers[0].weights().unwrap();
+        assert_eq!(
+            weights
+                .entries
+                .iter()
+                .map(|entry| (entry.array.name(), entry.len))
+                .collect::<Vec<_>>(),
+            vec![
+                ("biases", 6),
+                ("scales", 6),
+                ("rolling_mean", 6),
+                ("rolling_variance", 6),
+                ("weights", 108),
+                ("offset_weights", 648),
+                ("offset_biases", 18),
+                ("mask_weights", 324),
+                ("mask_biases", 9),
+            ]
+        );
+        assert_eq!(weights.parameter_count(), 1131);
+    }
+
+    #[test]
+    fn deform_conv_rejects_unknown_options_unsupported_modes_and_bad_geometry() {
+        for (options, expected) in [
+            ("mystery=1", "unknown option `mystery`"),
+            ("cbn=1", "cross-batch normalization is unsupported"),
+            (
+                "xnor=1",
+                "binary, xnor, and bin_output modes are unsupported",
+            ),
+            ("antialiasing=1", "antialiasing is unsupported"),
+            (
+                "assisted_excitation=1",
+                "assisted_excitation is unsupported",
+            ),
+            (
+                "share_index=-1",
+                "shared deformable-convolution layers are unsupported",
+            ),
+            (
+                "coordconv=1",
+                "specialized convolution transforms are unsupported",
+            ),
+            ("stream=2", "non-default stream execution is unsupported"),
+            ("grad_centr=1", "grad_centr is unsupported"),
+            (
+                "groups=3",
+                "groups must divide both input channels and filters",
+            ),
+            (
+                "stride=0",
+                "filters, groups, size, and stride must be positive",
+            ),
+            ("padding=-1", "padding must be non-negative"),
+            ("size=9", "invalid or empty output geometry"),
+        ] {
+            let cfg = format!("[net]\nwidth=4\nheight=4\nchannels=4\n[deform_conv]\n{options}\n");
+            let error = build(&cfg).expect_err("invalid deform_conv config must reject");
+            assert!(error.to_string().contains(expected), "{options}: {error}");
+        }
     }
 
     #[test]

@@ -254,6 +254,20 @@ pub fn initialize_training_params(network: &Network, params: &mut [LayerParams],
                     bn(batch_norm);
                 }
             }
+            LayerParams::DeformConv(p) => {
+                let crate::LayerKind::DeformConv(_) = &layer.kind else {
+                    unreachable!("deform_conv parameters require a deform_conv layer");
+                };
+                conv(&mut p.main, &mut rng);
+                rng.weights_with_scale(&mut p.offset_weights, 0.001);
+                p.offset_biases.fill(0.0);
+                if let Some(weights) = &mut p.mask_weights {
+                    rng.weights_with_scale(weights, 0.001);
+                }
+                if let Some(biases) = &mut p.mask_biases {
+                    biases.fill(0.0);
+                }
+            }
             LayerParams::Rnn(p) => {
                 for p in [&mut p.input, &mut p.self_params, &mut p.output] {
                     connected(p, &mut rng);
@@ -364,6 +378,68 @@ mod tests {
             assert_eq!(batch_norm.rolling_mean, vec![0.0, 0.0]);
             assert_eq!(batch_norm.rolling_variance, vec![0.0, 0.0]);
         }
+    }
+
+    #[test]
+    fn deform_conv_initialization_is_seeded_and_uses_source_scales() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "deform-conv-init.cfg",
+                "[net]\nwidth=3\nheight=3\nchannels=4\n[deform_conv]\nfilters=6\ngroups=2\nsize=3\nbatch_normalize=1\nmask=1\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut first = ExecutableNetwork::new(network.clone());
+        let mut second = ExecutableNetwork::new(network.clone());
+        initialize_training_params(&network, &mut first.params, 123);
+        initialize_training_params(&network, &mut second.params, 123);
+        assert_eq!(first.params, second.params);
+        let LayerParams::DeformConv(params) = &first.params[0] else {
+            panic!("deform_conv params")
+        };
+        let fan_in = (4 / 2) * 3 * 3;
+        let main_bound = (2.0f32 / fan_in as f32).sqrt();
+        assert!(
+            params
+                .main
+                .weights
+                .iter()
+                .all(|value| value.abs() <= main_bound)
+        );
+        assert!(params.main.biases.iter().all(|value| *value == 0.0));
+        assert!(
+            params
+                .offset_weights
+                .iter()
+                .all(|value| value.abs() <= 0.001)
+        );
+        assert!(params.offset_biases.iter().all(|value| *value == 0.0));
+        assert!(
+            params
+                .mask_weights
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|value| value.abs() <= 0.001)
+        );
+        assert!(
+            params
+                .mask_biases
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|value| *value == 0.0)
+        );
+        let batch_norm = params.main.batch_norm.as_ref().unwrap();
+        assert!(batch_norm.scales.iter().all(|value| *value == 1.0));
+        assert!(batch_norm.rolling_mean.iter().all(|value| *value == 0.0));
+        assert!(
+            batch_norm
+                .rolling_variance
+                .iter()
+                .all(|value| *value == 0.0)
+        );
     }
 
     #[test]

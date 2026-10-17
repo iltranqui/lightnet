@@ -26,9 +26,9 @@ use crate::error::{Error, Result};
 use crate::image::PlanarRgbImage;
 use crate::maxpool_depth::{backward_maxpool_depth, forward_maxpool_depth};
 use crate::model::{
-    Activation, ConnectedSpec, ConvolutionalSpec, CrnnSpec, CropSpec, Dcnv4Spec, DropblockSpec,
-    EmlConvolutionalSpec, GruSpec, LayerKind, LocalSpec, LrPolicy, LstmSpec, NetConfig, Network,
-    RnnSpec, RouteSpec, TensorShape,
+    Activation, ConnectedSpec, ConvolutionalSpec, CrnnSpec, CropSpec, Dcnv4Spec, DeformConvSpec,
+    DropblockSpec, EmlConvolutionalSpec, GruSpec, LayerKind, LocalSpec, LrPolicy, LstmSpec,
+    NetConfig, Network, RnnSpec, RouteSpec, TensorShape,
 };
 use crate::weights::WeightsHeader;
 use darknet_cuda::{
@@ -238,6 +238,16 @@ pub struct Dcnv4Params {
     pub offset_biases: Vec<f32>,
 }
 
+/// `[deform_conv]` main convolution plus full-channel offset and optional mask predictors.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeformConvParams {
+    pub main: ConvolutionalParams,
+    pub offset_weights: Vec<f32>,
+    pub offset_biases: Vec<f32>,
+    pub mask_weights: Option<Vec<f32>>,
+    pub mask_biases: Option<Vec<f32>>,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayerParams {
@@ -275,6 +285,7 @@ pub enum LayerParams {
     /// `[eml_convolutional]`: the `input_layer` and `self_layer` conv blocks.
     EmlConvolutional(EmlConvolutionalParams),
     Dcnv4(Dcnv4Params),
+    DeformConv(DeformConvParams),
 }
 
 /// The parameters of one `[moe_convolutional]` layer.
@@ -381,6 +392,15 @@ pub struct Dcnv4TrainBuffers {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct DeformConvTrainBuffers {
+    pub main: ConvolutionalTrainBuffers,
+    pub offset_weight_updates: Vec<f32>,
+    pub offset_bias_updates: Vec<f32>,
+    pub mask_weight_updates: Option<Vec<f32>>,
+    pub mask_bias_updates: Option<Vec<f32>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct VitTrainBuffers {
     /// Descending update directions (negative mathematical gradients), in
     /// `VitWeights` block shape/order.
@@ -429,6 +449,7 @@ pub enum LayerTrainBuffers {
     Moe(MoeTrainBuffers),
     EmlConvolutional(EmlConvolutionalTrainBuffers),
     Dcnv4(Dcnv4TrainBuffers),
+    DeformConv(DeformConvTrainBuffers),
     Vit(VitTrainBuffers),
     Swin(SwinTrainBuffers),
     TuckerAttention(TuckerAttentionTrainBuffers),
@@ -554,6 +575,13 @@ pub struct EmlForwardCache {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DeformConvRuntimeCache {
+    pub math: crate::deform_conv::DeformConvForwardCache,
+    pub output_clamp_slope: Vec<f32>,
+    pub output_nondiff_boundary: Vec<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct ForwardResult {
     pub layer_outputs: Vec<Tensor>,
     pub layer_activation_inputs: Vec<Option<Tensor>>,
@@ -569,6 +597,7 @@ pub struct ForwardResult {
     pub moe_caches: Vec<Option<MoeForwardCache>>,
     pub eml_caches: Vec<Option<EmlForwardCache>>,
     pub(crate) dcnv4_caches: Vec<Option<crate::dcnv4::Dcnv4ForwardCache>>,
+    pub(crate) deform_conv_caches: Vec<Option<DeformConvRuntimeCache>>,
     pub vit_caches: Vec<Option<crate::vit::VitForwardCache>>,
     pub swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>>,
     pub tucker_attention_caches: Vec<Option<crate::tucker_attention::TuckerAttentionForwardCache>>,
@@ -598,6 +627,7 @@ impl ForwardResult {
             moe_caches: Vec::new(),
             eml_caches: Vec::new(),
             dcnv4_caches: Vec::new(),
+            deform_conv_caches: Vec::new(),
             vit_caches: Vec::new(),
             swin_caches: Vec::new(),
             tucker_attention_caches: Vec::new(),
@@ -629,6 +659,7 @@ mod forward_result_from_heads_tests {
         assert!(result.moe_caches.is_empty());
         assert!(result.eml_caches.is_empty());
         assert!(result.dcnv4_caches.is_empty());
+        assert!(result.deform_conv_caches.is_empty());
         assert!(result.vit_caches.is_empty());
         assert!(result.swin_caches.is_empty());
         assert!(result.tucker_attention_caches.is_empty());
@@ -1311,6 +1342,47 @@ impl ExecutableNetwork {
                         batch,
                     );
                 }
+                (LayerParams::DeformConv(params), LayerTrainBuffers::DeformConv(train)) => {
+                    let layer_lr = lr * opts.learning_rate_scale;
+                    update_convolutional_params(
+                        &mut params.main,
+                        &mut train.main,
+                        layer_lr,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                    sgd_update(
+                        &mut params.offset_weights,
+                        &mut train.offset_weight_updates,
+                        layer_lr * 0.01,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                    sgd_update(
+                        &mut params.offset_biases,
+                        &mut train.offset_bias_updates,
+                        layer_lr * 0.01,
+                        momentum,
+                        0.0,
+                        batch,
+                    );
+                    match (&mut params.mask_weights, &mut train.mask_weight_updates) {
+                        (Some(weights), Some(updates)) => {
+                            sgd_update(weights, updates, layer_lr * 0.01, momentum, decay, batch);
+                        }
+                        (None, None) => {}
+                        _ => unreachable!("validated deform_conv mask train buffers"),
+                    }
+                    match (&mut params.mask_biases, &mut train.mask_bias_updates) {
+                        (Some(biases), Some(updates)) => {
+                            sgd_update(biases, updates, layer_lr * 0.01, momentum, 0.0, batch);
+                        }
+                        (None, None) => {}
+                        _ => unreachable!("validated deform_conv mask bias buffers"),
+                    }
+                }
                 (LayerParams::Dcnv4(params), LayerTrainBuffers::Dcnv4(train)) => {
                     let layer_lr = lr * opts.learning_rate_scale;
                     sgd_update(
@@ -1756,6 +1828,7 @@ impl ExecutableNetwork {
         let mut moe_caches = Vec::with_capacity(self.network.layers.len());
         let mut eml_caches = Vec::with_capacity(self.network.layers.len());
         let mut dcnv4_caches = Vec::with_capacity(self.network.layers.len());
+        let mut deform_conv_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches = Vec::with_capacity(self.network.layers.len());
         let mut swin_caches = Vec::with_capacity(self.network.layers.len());
         let mut tucker_attention_caches = Vec::with_capacity(self.network.layers.len());
@@ -1787,6 +1860,7 @@ impl ExecutableNetwork {
             let mut mambavision_cache = None;
             let mut kimi_kda_cache = None;
             let mut dcnv4_cache = None;
+            let mut deform_conv_cache = None;
             let (output, activation_input) = match (&layer.kind, params) {
                 (
                     LayerKind::Convolutional(spec),
@@ -1800,6 +1874,16 @@ impl ExecutableNetwork {
                     let (output, activation_input, cache) =
                         forward_dcnv4_with_cache(spec, params, current_input, layer.output_shape)?;
                     dcnv4_cache = Some(cache);
+                    (output, Some(activation_input))
+                }
+                (LayerKind::DeformConv(spec), LayerParams::DeformConv(params)) => {
+                    let (output, activation_input, cache) = forward_deform_conv_with_cache(
+                        spec,
+                        params,
+                        current_input,
+                        layer.output_shape,
+                    )?;
+                    deform_conv_cache = Some(cache);
                     (output, Some(activation_input))
                 }
                 (LayerKind::Deconvolutional(spec), LayerParams::Convolutional(p)) => {
@@ -2360,6 +2444,7 @@ impl ExecutableNetwork {
             moe_caches.push(moe_cache);
             eml_caches.push(eml_cache);
             dcnv4_caches.push(dcnv4_cache);
+            deform_conv_caches.push(deform_conv_cache);
             vit_caches.push(vit_cache);
             swin_caches.push(swin_cache);
             tucker_attention_caches.push(tucker_attention_cache);
@@ -2376,6 +2461,7 @@ impl ExecutableNetwork {
             moe_caches,
             eml_caches,
             dcnv4_caches,
+            deform_conv_caches,
             vit_caches,
             swin_caches,
             tucker_attention_caches,
@@ -2512,6 +2598,13 @@ impl ExecutableNetwork {
                 "forward Kimi KDA cache count mismatch: expected {}, got {}",
                 self.network.layers.len(),
                 forward.kimi_kda_caches.len()
+            )));
+        }
+        if forward.deform_conv_caches.len() != self.network.layers.len() {
+            return Err(Error::InvalidConfig(format!(
+                "forward deform_conv cache count mismatch: expected {}, got {}",
+                self.network.layers.len(),
+                forward.deform_conv_caches.len()
             )));
         }
         if layer_output_gradient_seeds.len() != self.network.layers.len() {
@@ -2712,6 +2805,137 @@ impl ExecutableNetwork {
                         )));
                     };
                     *dst = gradients;
+                    accumulate_previous_gradient(
+                        layer.index,
+                        &Tensor::from_data(current_input.shape, math_gradient.input)?,
+                        &mut input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::DeformConv(spec), LayerParams::DeformConv(params)) => {
+                    let cache = forward
+                        .deform_conv_caches
+                        .get(layer.index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing [deform_conv] forward cache for layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let preactivation = forward.layer_activation_inputs[layer.index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing [deform_conv] activation cache for layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    if spec.activation.to_channel_normalization().is_none()
+                        && grad
+                            .data
+                            .iter()
+                            .zip(&cache.output_nondiff_boundary)
+                            .any(|(gradient, boundary)| *gradient != 0.0 && *boundary)
+                    {
+                        return Err(Error::InvalidConfig(
+                            "[deform_conv] output derivative is undefined at a nonfinite or finite-clamp boundary".to_owned(),
+                        ));
+                    }
+                    let delta =
+                        if let Some(normalization) = spec.activation.to_channel_normalization() {
+                            Tensor {
+                                shape: layer.output_shape,
+                                data: darknet_cuda::host_ops::normalize_channels_backward(
+                                    &preactivation.data,
+                                    &forward.layer_outputs[layer.index].data,
+                                    &grad.data,
+                                    layer.output_shape.batch,
+                                    layer.output_shape.channels,
+                                    layer.output_shape.width * layer.output_shape.height,
+                                    normalization,
+                                    GradMode::from_env() == GradMode::Cpp,
+                                ),
+                            }
+                        } else {
+                            let mut clamped_grad = grad.clone();
+                            for (value, slope) in
+                                clamped_grad.data.iter_mut().zip(&cache.output_clamp_slope)
+                            {
+                                *value *= *slope;
+                            }
+                            apply_output_activation_gradient(
+                                &forward.layer_outputs[layer.index],
+                                &clamped_grad,
+                                &spec.activation,
+                                "deform_conv",
+                                Some(preactivation),
+                            )?
+                        };
+                    let spatial = layer.output_shape.width * layer.output_shape.height;
+                    let mut raw_gradient = delta.clone();
+                    let mut main_bias_gradient = vec![0.0; params.main.biases.len()];
+                    let mut batch_norm_gradient =
+                        params.main.batch_norm.as_ref().map(|bn| BatchNormParams {
+                            biases: vec![0.0; bn.biases.len()],
+                            scales: vec![0.0; bn.scales.len()],
+                            rolling_mean: vec![0.0; bn.rolling_mean.len()],
+                            rolling_variance: vec![0.0; bn.rolling_variance.len()],
+                        });
+                    for b in 0..layer.output_shape.batch {
+                        for channel in 0..layer.output_shape.channels {
+                            let inv_std = params.main.batch_norm.as_ref().map(|bn| {
+                                1.0 / (bn.rolling_variance[channel] + BATCH_NORM_EPSILON).sqrt()
+                            });
+                            for q in 0..spatial {
+                                let index =
+                                    (b * layer.output_shape.channels + channel) * spatial + q;
+                                let dy = delta.data[index];
+                                main_bias_gradient[channel] += dy;
+                                if let (Some(bn), Some(inv_std)) =
+                                    (params.main.batch_norm.as_ref(), inv_std)
+                                {
+                                    let normalized = (cache.math.raw_output[index]
+                                        - bn.rolling_mean[channel])
+                                        * inv_std;
+                                    batch_norm_gradient
+                                        .as_mut()
+                                        .expect("BN gradient allocated")
+                                        .scales[channel] += dy * normalized;
+                                    raw_gradient.data[index] *= bn.scales[channel] * inv_std;
+                                }
+                            }
+                        }
+                    }
+                    let math_gradient = crate::deform_conv::deform_conv_backward(
+                        current_input.shape,
+                        spec,
+                        layer.output_shape,
+                        &cache.math,
+                        &params.main.weights,
+                        &params.offset_weights,
+                        params.mask_weights.as_deref(),
+                        &raw_gradient,
+                    )?;
+                    let gradient = DeformConvParams {
+                        main: ConvolutionalParams {
+                            biases: main_bias_gradient,
+                            batch_norm: batch_norm_gradient,
+                            weights: math_gradient.weights,
+                        },
+                        offset_weights: math_gradient.offset_weights,
+                        offset_biases: math_gradient.offset_biases,
+                        mask_weights: math_gradient.mask_weights,
+                        mask_biases: math_gradient.mask_biases,
+                    };
+                    let Some(LayerParams::DeformConv(dst)) = param_gradients.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing [deform_conv] gradient slot for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    *dst = gradient;
                     accumulate_previous_gradient(
                         layer.index,
                         &Tensor::from_data(current_input.shape, math_gradient.input)?,
@@ -3915,6 +4139,45 @@ impl ExecutableNetwork {
         }
 
         for layer in &self.network.layers {
+            let LayerKind::DeformConv(spec) = &layer.kind else {
+                continue;
+            };
+            if !spec.batch_normalize {
+                continue;
+            }
+            let cache = forward
+                .deform_conv_caches
+                .get(layer.index)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "missing [deform_conv] forward cache for BN stats at layer #{}",
+                        layer.index
+                    ))
+                })?;
+            let raw = Tensor::from_data(layer.output_shape, cache.math.raw_output.clone())?;
+            let (mean, variance) = channel_mean_variance(&raw);
+            let Some(LayerParams::DeformConv(params)) = self.params.get_mut(layer.index) else {
+                return Err(Error::InvalidConfig(format!(
+                    "missing [deform_conv] params for BN stats at layer #{}",
+                    layer.index
+                )));
+            };
+            let Some(batch_norm) = params.main.batch_norm.as_mut() else {
+                return Err(Error::InvalidConfig(format!(
+                    "missing [deform_conv] batch-norm params at layer #{}",
+                    layer.index
+                )));
+            };
+            update_batch_norm_running_stats(
+                batch_norm,
+                &mean,
+                &variance,
+                BATCH_NORM_ROLLING_KEEP_CPU,
+            )?;
+        }
+
+        for layer in &self.network.layers {
             let LayerKind::Connected(spec) = &layer.kind else {
                 continue;
             };
@@ -4194,6 +4457,37 @@ impl ExecutableNetwork {
                         &mut train.self_params,
                         &gradient.self_params,
                     )?;
+                }
+                (LayerKind::DeformConv(_), LayerParams::DeformConv(gradient)) => {
+                    let Some(LayerTrainBuffers::DeformConv(train)) =
+                        self.train_buffers.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing deform_conv train buffers for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    accumulate_convolutional_train_buffer(&mut train.main, &gradient.main)?;
+                    accumulate_vec(&mut train.offset_weight_updates, &gradient.offset_weights)?;
+                    accumulate_vec(&mut train.offset_bias_updates, &gradient.offset_biases)?;
+                    match (&mut train.mask_weight_updates, &gradient.mask_weights) {
+                        (Some(train), Some(gradient)) => accumulate_vec(train, gradient)?,
+                        (None, None) => {}
+                        _ => {
+                            return Err(Error::InvalidConfig(
+                                "deform_conv mask weight gradient mismatch".to_owned(),
+                            ));
+                        }
+                    }
+                    match (&mut train.mask_bias_updates, &gradient.mask_biases) {
+                        (Some(train), Some(gradient)) => accumulate_vec(train, gradient)?,
+                        (None, None) => {}
+                        _ => {
+                            return Err(Error::InvalidConfig(
+                                "deform_conv mask bias gradient mismatch".to_owned(),
+                            ));
+                        }
+                    }
                 }
                 (LayerKind::Dcnv4(_), LayerParams::Dcnv4(gradient)) => {
                     let Some(LayerTrainBuffers::Dcnv4(train)) =
@@ -4495,6 +4789,13 @@ fn host_adam_scalar_capacity(params: &LayerParams) -> usize {
                     .batch_norm
                     .as_ref()
                     .map_or(0, |bn| bn.scales.len() + bn.biases.len())
+        }
+        LayerParams::DeformConv(params) => {
+            convolutional_parameter_count(&params.main)
+                + params.offset_weights.len()
+                + params.offset_biases.len()
+                + params.mask_weights.as_ref().map_or(0, Vec::len)
+                + params.mask_biases.as_ref().map_or(0, Vec::len)
         }
         LayerParams::None
         | LayerParams::LayaScorer(_)
@@ -6417,10 +6718,11 @@ where
                         | LayerParams::Crnn(_)
                         | LayerParams::EmlConvolutional(_)
                         | LayerParams::Dcnv4(_)
+                        | LayerParams::DeformConv(_)
                 )
             }) {
                 return Err(Error::InvalidConfig(
-                    "adam=1 on the GPU path supports convolutional, connected, local, shortcut, DCNv4, MoE, standalone batchnorm, ViT, Swin, Tucker attention, MambaVision, Kimi KDA, and GRU/RNN/LSTM/CRNN layers"
+                    "adam=1 on the GPU path supports convolutional, connected, local, shortcut, deform_conv, DCNv4, MoE, standalone batchnorm, ViT, Swin, Tucker attention, MambaVision, Kimi KDA, and GRU/RNN/LSTM/CRNN layers"
                         .to_string(),
                 ));
             }
@@ -6789,6 +7091,61 @@ where
                         &mut moments.biases,
                         adam,
                     )?;
+                }
+                (LayerParams::DeformConv(params), LayerTrainBuffers::DeformConv(train)) => {
+                    let moments =
+                        moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    apply_host_adam_convolutional(
+                        &mut params.main,
+                        &mut train.main,
+                        moments,
+                        adam,
+                    )?;
+                    let predictor_adam = AdamParams {
+                        lr: adam.lr * 0.01,
+                        ..*adam
+                    };
+                    let offset_state = host_adam_child(moments, 0);
+                    apply_host_adam(
+                        &mut params.offset_weights,
+                        &mut train.offset_weight_updates,
+                        &mut offset_state.weights,
+                        &predictor_adam,
+                    )?;
+                    apply_host_adam_non_weight(
+                        &mut params.offset_biases,
+                        &mut train.offset_bias_updates,
+                        &mut offset_state.biases,
+                        &predictor_adam,
+                    )?;
+                    match (&mut params.mask_weights, &mut train.mask_weight_updates) {
+                        (Some(weights), Some(updates)) => apply_host_adam(
+                            weights,
+                            updates,
+                            &mut host_adam_child(moments, 1).weights,
+                            &predictor_adam,
+                        )?,
+                        (None, None) => {}
+                        _ => {
+                            return Err(Error::InvalidConfig(
+                                "deform_conv Adam mask weight mismatch".to_owned(),
+                            ));
+                        }
+                    }
+                    match (&mut params.mask_biases, &mut train.mask_bias_updates) {
+                        (Some(biases), Some(updates)) => apply_host_adam_non_weight(
+                            biases,
+                            updates,
+                            &mut host_adam_child(moments, 1).biases,
+                            &predictor_adam,
+                        )?,
+                        (None, None) => {}
+                        _ => {
+                            return Err(Error::InvalidConfig(
+                                "deform_conv Adam mask bias mismatch".to_owned(),
+                            ));
+                        }
+                    }
                 }
                 (LayerParams::Dcnv4(params), LayerTrainBuffers::Dcnv4(train)) => {
                     let moments =
@@ -7253,6 +7610,47 @@ where
                         batch,
                     );
                 }
+                (LayerParams::DeformConv(params), LayerTrainBuffers::DeformConv(train)) => {
+                    let layer_lr = lr * layer.train.learning_rate_scale;
+                    update_convolutional_params(
+                        &mut params.main,
+                        &mut train.main,
+                        layer_lr,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                    sgd_update(
+                        &mut params.offset_weights,
+                        &mut train.offset_weight_updates,
+                        layer_lr * 0.01,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                    sgd_update(
+                        &mut params.offset_biases,
+                        &mut train.offset_bias_updates,
+                        layer_lr * 0.01,
+                        momentum,
+                        0.0,
+                        batch,
+                    );
+                    match (&mut params.mask_weights, &mut train.mask_weight_updates) {
+                        (Some(weights), Some(updates)) => {
+                            sgd_update(weights, updates, layer_lr * 0.01, momentum, decay, batch)
+                        }
+                        (None, None) => {}
+                        _ => unreachable!("validated deform_conv mask train buffers"),
+                    }
+                    match (&mut params.mask_biases, &mut train.mask_bias_updates) {
+                        (Some(biases), Some(updates)) => {
+                            sgd_update(biases, updates, layer_lr * 0.01, momentum, 0.0, batch)
+                        }
+                        (None, None) => {}
+                        _ => unreachable!("validated deform_conv mask bias buffers"),
+                    }
+                }
                 (LayerParams::Dcnv4(params), LayerTrainBuffers::Dcnv4(train)) => {
                     let layer_lr = lr * layer.train.learning_rate_scale;
                     sgd_update(
@@ -7704,6 +8102,7 @@ where
         let mut eml_caches: Vec<Option<EmlForwardCache>> =
             Vec::with_capacity(self.network.layers.len());
         let mut dcnv4_caches = Vec::with_capacity(self.network.layers.len());
+        let mut deform_conv_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches: Vec<Option<crate::vit::VitForwardCache>> =
             Vec::with_capacity(self.network.layers.len());
         let mut swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>> =
@@ -7743,6 +8142,7 @@ where
             let mut mambavision_cache = None;
             let mut kimi_kda_cache = None;
             let mut dcnv4_cache = None;
+            let mut deform_conv_cache = None;
             let mut moe_cache = None;
             let mut eml_cache = None;
             let mut gpu_rnn_cache = None;
@@ -8294,6 +8694,31 @@ where
                     self.backend
                         .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
                         .map_err(|err| backend_error("upload DCNv4 output", err))?
+                }
+                (LayerKind::DeformConv(spec), LayerParams::DeformConv(params)) => {
+                    let host_input = self
+                        .download_tensor(current_input, layer.input_shape)
+                        .map_err(|err| backend_error("download deform_conv input", err))?;
+                    let (host_output, host_activation, cache) = forward_deform_conv_with_cache(
+                        spec,
+                        params,
+                        &host_input,
+                        layer.output_shape,
+                    )?;
+                    deform_conv_cache = Some(cache);
+                    activation_input_gpu = Some(
+                        self.backend
+                            .upload_f32(
+                                &tensor_backend_shape(layer.output_shape),
+                                &host_activation.data,
+                            )
+                            .map_err(|err| {
+                                backend_error("upload deform_conv activation cache", err)
+                            })?,
+                    );
+                    self.backend
+                        .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
+                        .map_err(|err| backend_error("upload deform_conv output", err))?
                 }
                 (LayerKind::Vit(spec), LayerParams::Vit(weights)) => {
                     let host_input = self
@@ -9351,6 +9776,7 @@ where
             moe_caches.push(moe_cache);
             eml_caches.push(eml_cache);
             dcnv4_caches.push(dcnv4_cache);
+            deform_conv_caches.push(deform_conv_cache);
             vit_caches.push(vit_cache);
             swin_caches.push(swin_cache);
             tucker_attention_caches.push(tucker_attention_cache);
@@ -9377,6 +9803,7 @@ where
                 moe_caches,
                 eml_caches,
                 dcnv4_caches,
+                deform_conv_caches,
                 vit_caches,
                 swin_caches,
                 tucker_attention_caches,
@@ -9408,6 +9835,18 @@ where
                 "input shape mismatch: expected {expected}, got {}",
                 input.shape
             )));
+        }
+        if let Some(layer) = self
+            .network
+            .layers
+            .iter()
+            .find(|layer| matches!(layer.kind, LayerKind::DeformConv(_)))
+        {
+            return Err(Error::UnsupportedLayer {
+                layer_index: layer.index,
+                name: "[deform_conv] compact GPU execution is unsupported; use f32 forward"
+                    .to_owned(),
+            });
         }
         if self.network.layers.iter().any(|layer| {
             matches!(
@@ -11842,8 +12281,8 @@ where
                         return true;
                     }
                 }
-                // Deconvolution has no device backward yet.
-                LayerKind::Deconvolutional(_) => return true,
+                // These layers use the Rust host reference and have no native device backward.
+                LayerKind::Deconvolutional(_) | LayerKind::DeformConv(_) => return true,
                 // `[laya_marker_gather]` has no device backward yet; keep the
                 // whole net on the CPU backward (forward uses a host round trip).
                 LayerKind::LayaMarkerGather(_) => return true,
@@ -14105,6 +14544,9 @@ fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
         LayerKind::Dcnv4(spec) => {
             LayerParams::Dcnv4(default_dcnv4_params(layer.input_shape.channels, spec))
         }
+        LayerKind::DeformConv(spec) => {
+            LayerParams::DeformConv(default_deform_conv_params(layer.input_shape.channels, spec))
+        }
         LayerKind::Shortcut(spec) => match spec.weight_count(layer.input_shape.channels) {
             0 => LayerParams::None,
             len => LayerParams::Shortcut(ShortcutParams {
@@ -14300,6 +14742,9 @@ fn default_layer_train_buffers(layer: &crate::model::Layer) -> LayerTrainBuffers
             layer.input_shape.channels,
             spec,
         )),
+        LayerKind::DeformConv(spec) => LayerTrainBuffers::DeformConv(
+            default_deform_conv_train_buffers(layer.input_shape.channels, spec),
+        ),
         LayerKind::TuckerAttention(spec) => {
             let params = crate::tucker_attention::TuckerAttentionParams::zeroed(
                 layer.input_shape.channels,
@@ -14458,6 +14903,61 @@ fn default_dcnv4_train_buffers(input_channels: usize, spec: &Dcnv4Spec) -> Dcnv4
         }),
         offset_weight_updates: vec![0.0; offset_weight_count],
         offset_bias_updates: vec![0.0; offset_dim],
+    }
+}
+
+fn deform_conv_layout_counts(
+    input_channels: usize,
+    spec: &DeformConvSpec,
+) -> (usize, usize, usize, usize) {
+    let kernel_area = spec.size * spec.size;
+    let offset_filters = 2 * kernel_area;
+    let column_channels = input_channels * kernel_area;
+    let offset_weights = offset_filters * column_channels;
+    let mask_weights = if spec.use_mask {
+        kernel_area * column_channels
+    } else {
+        0
+    };
+    (kernel_area, offset_filters, offset_weights, mask_weights)
+}
+
+fn default_deform_conv_params(input_channels: usize, spec: &DeformConvSpec) -> DeformConvParams {
+    let (kernel_area, offset_filters, offset_weights, mask_weights) =
+        deform_conv_layout_counts(input_channels, spec);
+    DeformConvParams {
+        main: default_convolutional_params(
+            input_channels,
+            spec.filters,
+            spec.size,
+            spec.groups,
+            spec.batch_normalize,
+        ),
+        offset_weights: vec![0.0; offset_weights],
+        offset_biases: vec![0.0; offset_filters],
+        mask_weights: spec.use_mask.then(|| vec![0.0; mask_weights]),
+        mask_biases: spec.use_mask.then(|| vec![0.0; kernel_area]),
+    }
+}
+
+fn default_deform_conv_train_buffers(
+    input_channels: usize,
+    spec: &DeformConvSpec,
+) -> DeformConvTrainBuffers {
+    let (kernel_area, offset_filters, offset_weights, mask_weights) =
+        deform_conv_layout_counts(input_channels, spec);
+    DeformConvTrainBuffers {
+        main: default_convolutional_train_buffers(
+            input_channels,
+            spec.filters,
+            spec.size,
+            spec.groups,
+            spec.batch_normalize,
+        ),
+        offset_weight_updates: vec![0.0; offset_weights],
+        offset_bias_updates: vec![0.0; offset_filters],
+        mask_weight_updates: spec.use_mask.then(|| vec![0.0; mask_weights]),
+        mask_bias_updates: spec.use_mask.then(|| vec![0.0; kernel_area]),
     }
 }
 
@@ -15587,6 +16087,54 @@ fn apply_host_adam_layer(
                 adam,
             )?;
         }
+        (LayerParams::DeformConv(params), LayerTrainBuffers::DeformConv(train)) => {
+            apply_host_adam_convolutional(&mut params.main, &mut train.main, state, adam)?;
+            let predictor_adam = AdamParams {
+                lr: adam.lr * 0.01,
+                ..*adam
+            };
+            let offset_state = host_adam_child(state, 0);
+            apply_host_adam(
+                &mut params.offset_weights,
+                &mut train.offset_weight_updates,
+                &mut offset_state.weights,
+                &predictor_adam,
+            )?;
+            apply_host_adam_non_weight(
+                &mut params.offset_biases,
+                &mut train.offset_bias_updates,
+                &mut offset_state.biases,
+                &predictor_adam,
+            )?;
+            match (&mut params.mask_weights, &mut train.mask_weight_updates) {
+                (Some(weights), Some(updates)) => apply_host_adam(
+                    weights,
+                    updates,
+                    &mut host_adam_child(state, 1).weights,
+                    &predictor_adam,
+                )?,
+                (None, None) => {}
+                _ => {
+                    return Err(Error::InvalidConfig(
+                        "deform_conv Adam mask weight mismatch".to_owned(),
+                    ));
+                }
+            }
+            match (&mut params.mask_biases, &mut train.mask_bias_updates) {
+                (Some(biases), Some(updates)) => apply_host_adam_non_weight(
+                    biases,
+                    updates,
+                    &mut host_adam_child(state, 1).biases,
+                    &predictor_adam,
+                )?,
+                (None, None) => {}
+                _ => {
+                    return Err(Error::InvalidConfig(
+                        "deform_conv Adam mask bias mismatch".to_owned(),
+                    ));
+                }
+            }
+        }
         (LayerParams::Dcnv4(params), LayerTrainBuffers::Dcnv4(train)) => {
             let offset_adam = AdamParams {
                 lr: adam.lr * 0.01,
@@ -16127,6 +16675,36 @@ fn load_weights_into_params(
                 read_f32_into(&mut file, &mut dcnv4.offset_weights)?;
                 read_f32_into(&mut file, &mut dcnv4.offset_biases)?;
             }
+            LayerParams::DeformConv(deform) => {
+                let LayerKind::DeformConv(spec) = &layer.kind else {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} deform_conv parameters do not match layer kind",
+                        layer.index
+                    )));
+                };
+                read_convolutional_params(
+                    &mut file,
+                    &mut deform.main,
+                    layer.input_shape.channels,
+                    spec.filters,
+                    spec.size,
+                    spec.groups,
+                )?;
+                read_f32_into(&mut file, &mut deform.offset_weights)?;
+                read_f32_into(&mut file, &mut deform.offset_biases)?;
+                match (&mut deform.mask_weights, &mut deform.mask_biases) {
+                    (Some(weights), Some(biases)) => {
+                        read_f32_into(&mut file, weights)?;
+                        read_f32_into(&mut file, biases)?;
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(Error::InvalidConfig(
+                            "deform_conv mask parameter mismatch while loading weights".to_owned(),
+                        ));
+                    }
+                }
+            }
             LayerParams::Shortcut(shortcut) => {
                 read_f32_into(&mut file, &mut shortcut.weights)?;
             }
@@ -16658,6 +17236,71 @@ fn activate_convolution_value(activation: &Activation, value: f32) -> f32 {
     } else {
         activate(activation.clone(), value)
     }
+}
+
+fn forward_deform_conv_with_cache(
+    spec: &DeformConvSpec,
+    params: &DeformConvParams,
+    input: &Tensor,
+    output_shape: TensorShape,
+) -> Result<(Tensor, Tensor, DeformConvRuntimeCache)> {
+    let (raw_output, math) = crate::deform_conv::deform_conv_forward(
+        input,
+        spec,
+        output_shape,
+        &params.main.weights,
+        &params.offset_weights,
+        &params.offset_biases,
+        params.mask_weights.as_deref(),
+        params.mask_biases.as_deref(),
+    )?;
+    let spatial = output_shape.width * output_shape.height;
+    let mut activation_input = Tensor::zeros(output_shape);
+    let mut output = Tensor::zeros(output_shape);
+    let mut output_clamp_slope = vec![0.0; raw_output.data.len()];
+    let mut output_nondiff_boundary = vec![false; raw_output.data.len()];
+    for b in 0..output_shape.batch {
+        for channel in 0..output_shape.channels {
+            let bn = params.main.batch_norm.as_ref();
+            let inv_std =
+                bn.map(|bn| 1.0 / (bn.rolling_variance[channel] + BATCH_NORM_EPSILON).sqrt());
+            for q in 0..spatial {
+                let index = (b * output_shape.channels + channel) * spatial + q;
+                let raw = raw_output.data[index];
+                let preactivation = if let (Some(bn), Some(inv_std)) = (bn, inv_std) {
+                    (raw - bn.rolling_mean[channel]) * inv_std * bn.scales[channel]
+                        + params.main.biases[channel]
+                } else {
+                    raw + params.main.biases[channel]
+                };
+                activation_input.data[index] = preactivation;
+                let activated = activate_convolution_value(&spec.activation, preactivation);
+                output_clamp_slope[index] =
+                    if activated.is_finite() && activated > -10_000.0 && activated < 10_000.0 {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                output_nondiff_boundary[index] =
+                    !activated.is_finite() || activated.abs() == 10_000.0;
+                output.data[index] = if activated.is_finite() {
+                    activated.clamp(-10_000.0, 10_000.0)
+                } else {
+                    0.0
+                };
+            }
+        }
+    }
+    apply_convolution_channel_normalization(&mut output, &activation_input, &spec.activation);
+    Ok((
+        output,
+        activation_input,
+        DeformConvRuntimeCache {
+            math,
+            output_clamp_slope,
+            output_nondiff_boundary,
+        },
+    ))
 }
 
 fn forward_dcnv4_with_cache(
@@ -23361,6 +24004,458 @@ mod tests {
             panic!("DCNv4 params")
         };
         assert!(after.dummy_weights.iter().all(|value| *value == 0.0));
+    }
+
+    #[test]
+    fn deform_conv_backward_rejects_epilogue_clamp_boundary() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "deform-conv-clamp.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=1\n[deform_conv]\nfilters=1\nsize=1\nuse_mask=0\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::DeformConv(params) = &mut executable.params[0] else {
+            panic!("deform_conv params")
+        };
+        params.main.biases[0] = 10_000.0;
+        let input = Tensor::from_data(TensorShape::new(1, 1, 1, 1), vec![0.0]).unwrap();
+        let forward = executable.forward_training(&input).unwrap();
+        assert_eq!(forward.final_output().unwrap().data, vec![10_000.0]);
+        let seeds = [Some(Tensor::filled(input.shape, 1.0))];
+        assert!(
+            executable
+                .backward_accumulate_seeded(&input, &forward, &seeds)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn deform_conv_train_only_bn_gates_all_optimizer_blocks() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "deform-conv-train-only-bn.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=1\n[deform_conv]\nfilters=1\nsize=1\nuse_mask=1\nbatch_normalize=1\ntrain_only_bn=1\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(network.layers[0].train.train_only_bn);
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::DeformConv(params) = &mut executable.params[0] else {
+            panic!("deform_conv params")
+        };
+        params.main.weights[0] = 0.25;
+        let before = executable.params.clone();
+        let LayerTrainBuffers::DeformConv(train) = &mut executable.train_buffers[0] else {
+            panic!("deform_conv train buffers")
+        };
+        train.main.weight_updates.fill(1.0);
+        train.main.bias_updates.fill(1.0);
+        train.offset_weight_updates.fill(1.0);
+        train.offset_bias_updates.fill(1.0);
+        train.mask_weight_updates.as_mut().unwrap().fill(1.0);
+        train.mask_bias_updates.as_mut().unwrap().fill(1.0);
+
+        executable.update_weights(0.1, 0.9, 0.1, 1);
+        assert_eq!(executable.params, before);
+        let LayerTrainBuffers::DeformConv(train) = &executable.train_buffers[0] else {
+            panic!("deform_conv train buffers")
+        };
+        assert!(train.main.weight_updates.iter().all(|value| *value == 1.0));
+        assert!(
+            train
+                .offset_weight_updates
+                .iter()
+                .all(|value| *value == 1.0)
+        );
+        assert!(
+            train
+                .mask_weight_updates
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|value| *value == 1.0)
+        );
+    }
+
+    #[test]
+    fn deform_conv_backward_accumulates_across_microbatches() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "deform-conv-accumulation.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=1\n[deform_conv]\nfilters=1\nsize=1\nuse_mask=0\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::DeformConv(params) = &mut executable.params[0] else {
+            panic!("deform_conv params")
+        };
+        params.main.weights[0] = 0.5;
+        let input = Tensor::from_data(TensorShape::new(1, 1, 1, 1), vec![2.0]).unwrap();
+        let seed = [Some(Tensor::from_data(input.shape, vec![0.75]).unwrap())];
+
+        let first_forward = executable.forward_training(&input).unwrap();
+        executable
+            .backward_accumulate_seeded(&input, &first_forward, &seed)
+            .unwrap();
+        let LayerTrainBuffers::DeformConv(train) = &executable.train_buffers[0] else {
+            panic!("deform_conv train buffers")
+        };
+        let first_weight_update = train.main.weight_updates[0];
+        let first_bias_update = train.main.bias_updates[0];
+
+        let second_forward = executable.forward_training(&input).unwrap();
+        executable
+            .backward_accumulate_seeded(&input, &second_forward, &seed)
+            .unwrap();
+        let LayerTrainBuffers::DeformConv(train) = &executable.train_buffers[0] else {
+            panic!("deform_conv train buffers")
+        };
+        assert_eq!(train.main.weight_updates[0], 2.0 * first_weight_update);
+        assert_eq!(train.main.bias_updates[0], 2.0 * first_bias_update);
+    }
+
+    #[test]
+    fn deform_conv_compact_gpu_path_rejects_explicitly() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "deform-conv-compact.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=1\n[deform_conv]\nfilters=1\nsize=1\nuse_mask=0\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        let input = Tensor::from_data(TensorShape::new(1, 1, 1, 1), vec![1.0]).unwrap();
+        let error = gpu
+            .forward_compact(&input)
+            .expect_err("compact execution must reject deform_conv");
+        assert!(
+            error
+                .to_string()
+                .contains("[deform_conv] compact GPU execution is unsupported")
+        );
+    }
+
+    #[test]
+    fn deform_conv_loss_scale_is_neutral_for_gpu_host_fallback_updates() {
+        let run = |loss_scale: usize| {
+            let network = Network::from_config(
+                ConfigFile::parse_str(
+                    "deform-conv-loss-scale.cfg",
+                    &format!(
+                        "[net]\nwidth=2\nheight=2\nchannels=1\nloss_scale={loss_scale}\n[deform_conv]\nfilters=1\nsize=1\nuse_mask=0\nactivation=linear\n"
+                    ),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+            let LayerParams::DeformConv(params) = &mut gpu.params[0] else {
+                panic!("deform_conv params")
+            };
+            params.main.weights[0] = 0.4;
+            params.main.biases[0] = 0.05;
+            params.offset_weights.copy_from_slice(&[0.02, -0.03]);
+            params.offset_biases.copy_from_slice(&[0.07, -0.04]);
+            let input =
+                Tensor::from_data(TensorShape::new(2, 2, 1, 1), vec![0.1, 0.3, 0.5, 0.7]).unwrap();
+            let forward = gpu.forward_training_with_state(&input).unwrap();
+            let seeds = [Some(
+                Tensor::from_data(input.shape, vec![0.2, -0.3, 0.4, 0.1]).unwrap(),
+            )];
+            gpu.backward_accumulate_seeded_gpu(&forward, &seeds)
+                .unwrap();
+            gpu.update_weights_gpu(0.02, 0.0, 0.01, 1).unwrap();
+            gpu.params
+        };
+
+        assert_eq!(run(1), run(8));
+    }
+
+    #[test]
+    fn deform_conv_sgd_uses_source_rate_groups_and_moves_downhill() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "deform-conv-sgd.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=1\n[deform_conv]\nfilters=1\nsize=1\nuse_mask=1\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::DeformConv(params) = &mut executable.params[0] else {
+            panic!("deform_conv params")
+        };
+        params.main.weights[0] = 0.5;
+        let input = Tensor::from_data(TensorShape::new(1, 1, 1, 1), vec![1.0]).unwrap();
+        let forward = executable.forward_training(&input).unwrap();
+        let initial = forward.final_output().unwrap().data[0];
+        assert!((initial - 0.25).abs() < 1.0e-6);
+        let seeds = [Some(Tensor::filled(input.shape, -initial))];
+        executable
+            .backward_accumulate_seeded(&input, &forward, &seeds)
+            .unwrap();
+        let LayerTrainBuffers::DeformConv(train) = &mut executable.train_buffers[0] else {
+            panic!("deform_conv train buffers")
+        };
+        assert!((train.main.weight_updates[0] + 0.125).abs() < 1.0e-6);
+        train.offset_weight_updates[0] = 1.0;
+        train.offset_bias_updates[0] = 1.0;
+        train.mask_weight_updates.as_mut().unwrap()[0] = 1.0;
+        train.mask_bias_updates.as_mut().unwrap()[0] = 1.0;
+
+        executable.update_weights(0.1, 0.0, 0.0, 1);
+        let LayerParams::DeformConv(params) = &executable.params[0] else {
+            panic!("deform_conv params")
+        };
+        assert!((params.main.weights[0] - 0.4875).abs() < 1.0e-6);
+        assert!((params.main.biases[0] + 0.025).abs() < 1.0e-6);
+        assert!((params.offset_weights[0] - 0.001).abs() < 1.0e-7);
+        assert!((params.offset_biases[0] - 0.001).abs() < 1.0e-7);
+        assert!((params.mask_weights.as_ref().unwrap()[0] - 0.001).abs() < 1.0e-7);
+        assert!((params.mask_biases.as_ref().unwrap()[0] - 0.001).abs() < 1.0e-7);
+        let updated = executable
+            .forward(&input)
+            .unwrap()
+            .final_output()
+            .unwrap()
+            .data[0];
+        assert!(
+            0.5 * updated * updated < 0.5 * initial * initial,
+            "Darknet update should descend: output {initial} -> {updated}"
+        );
+    }
+
+    #[test]
+    fn deform_conv_runtime_backward_and_fake_backend_host_fallback_match() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "deform-conv-runtime.cfg",
+                "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=1\n[convolutional]\nfilters=2\nsize=1\nactivation=linear\n[deform_conv]\nfilters=2\ngroups=2\nsize=1\nuse_mask=1\nbatch_normalize=1\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        let LayerParams::Convolutional(conv) = &mut cpu.params[0] else {
+            panic!("preceding convolution params")
+        };
+        conv.weights.copy_from_slice(&[1.1, -0.7, 0.8, 1.3]);
+        conv.biases.copy_from_slice(&[0.04, -0.03]);
+        let LayerParams::DeformConv(params) = &mut cpu.params[1] else {
+            panic!("deform_conv params")
+        };
+        params.main.weights.copy_from_slice(&[0.9, 1.2]);
+        params.main.biases.copy_from_slice(&[0.07, -0.05]);
+        let batch_norm = params.main.batch_norm.as_mut().unwrap();
+        batch_norm.scales.copy_from_slice(&[1.1, 0.85]);
+        batch_norm.rolling_mean.copy_from_slice(&[0.03, -0.08]);
+        batch_norm.rolling_variance.copy_from_slice(&[0.7, 1.2]);
+        params
+            .offset_weights
+            .copy_from_slice(&[0.001, -0.0007, 0.0008, 0.0004]);
+        params.offset_biases.copy_from_slice(&[0.11, -0.13]);
+        params
+            .mask_weights
+            .as_mut()
+            .unwrap()
+            .copy_from_slice(&[0.03, -0.02]);
+        params
+            .mask_biases
+            .as_mut()
+            .unwrap()
+            .copy_from_slice(&[0.12]);
+
+        let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+        gpu.params = cpu.params.clone();
+        assert!(gpu.requires_cpu_backward_fallback());
+        let input = Tensor::from_data(
+            TensorShape::new(3, 3, 2, 1),
+            (0..18)
+                .map(|index| 0.18 + index as f32 * 0.027 - (index % 4) as f32 * 0.011)
+                .collect(),
+        )
+        .unwrap();
+        let cpu_forward = cpu.forward_training(&input).unwrap();
+        assert!(cpu_forward.deform_conv_caches[1].is_some());
+        let gpu_forward = gpu.forward_training_with_state(&input).unwrap();
+        assert_eq!(
+            gpu_forward.cpu_forward.layer_outputs,
+            cpu_forward.layer_outputs
+        );
+        assert_eq!(
+            gpu_forward.cpu_forward.deform_conv_caches,
+            cpu_forward.deform_conv_caches
+        );
+
+        let seed = Tensor::from_data(
+            TensorShape::new(3, 3, 2, 1),
+            (0..18)
+                .map(|index| 0.14 * ((index % 5) as f32 - 1.8))
+                .collect(),
+        )
+        .unwrap();
+        let seeds = [None, Some(seed.clone())];
+        let base_params = cpu.params.clone();
+        let backward = cpu
+            .backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .unwrap();
+        let LayerParams::DeformConv(updated_params) = &cpu.params[1] else {
+            panic!("deform_conv params")
+        };
+        let updated_bn = updated_params.main.batch_norm.as_ref().unwrap();
+        let LayerParams::DeformConv(original_params) = &base_params[1] else {
+            panic!("original deform_conv params")
+        };
+        let original_bn = original_params.main.batch_norm.as_ref().unwrap();
+        assert_ne!(updated_bn.rolling_mean, original_bn.rolling_mean);
+        assert_ne!(updated_bn.rolling_variance, original_bn.rolling_variance);
+        let LayerParams::DeformConv(gradient) = &backward.param_gradients[1] else {
+            panic!("deform_conv gradients")
+        };
+        let objective = |scale: f32| {
+            let mut executable = ExecutableNetwork::new(network.clone());
+            executable.params = base_params.clone();
+            let LayerParams::DeformConv(params) = &mut executable.params[1] else {
+                panic!("deform_conv params")
+            };
+            params.main.batch_norm.as_mut().unwrap().scales[0] = scale;
+            executable
+                .forward(&input)
+                .unwrap()
+                .final_output()
+                .unwrap()
+                .data
+                .iter()
+                .zip(&seed.data)
+                .map(|(value, grad)| value * grad)
+                .sum::<f32>()
+        };
+        let epsilon = 1.0e-3;
+        let numerical_scale =
+            (objective(1.1 + epsilon) - objective(1.1 - epsilon)) / (2.0 * epsilon);
+        assert!(
+            (gradient.main.batch_norm.as_ref().unwrap().scales[0] - numerical_scale).abs() < 2.0e-3,
+            "BN scale gradient {} differs from finite difference {numerical_scale}",
+            gradient.main.batch_norm.as_ref().unwrap().scales[0]
+        );
+
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .unwrap();
+        let device_buffers = gpu.device_train_buffers.borrow();
+        let conv_train = device_buffers[0].as_ref().expect("device conv gradients");
+        let LayerTrainBuffers::Convolutional(cpu_conv_train) = &cpu.train_buffers[0] else {
+            panic!("preceding convolution train buffers")
+        };
+        assert_eq!(
+            gpu.backend
+                .download_f32(&conv_train.weight_updates)
+                .unwrap(),
+            cpu_conv_train.weight_updates
+        );
+        assert_eq!(
+            gpu.backend.download_f32(&conv_train.bias_updates).unwrap(),
+            cpu_conv_train.bias_updates
+        );
+        drop(device_buffers);
+        assert_eq!(
+            cpu.train_buffers[1],
+            gpu.cpu_fallback_train_buffers.borrow()[1]
+        );
+        assert_eq!(cpu.params, gpu.params);
+        let LayerTrainBuffers::DeformConv(deform_train) = &cpu.train_buffers[1] else {
+            panic!("deform_conv train buffers")
+        };
+        assert!(
+            deform_train
+                .main
+                .weight_updates
+                .iter()
+                .any(|value| *value != 0.0)
+        );
+        assert!(
+            deform_train
+                .offset_weight_updates
+                .iter()
+                .any(|value| *value != 0.0)
+        );
+        assert!(
+            deform_train
+                .mask_weight_updates
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|value| *value != 0.0)
+        );
+
+        cpu.update_weights(0.01, 0.2, 0.01, 1);
+        gpu.update_weights_gpu(0.01, 0.2, 0.01, 1).unwrap();
+        assert_eq!(gpu.params, cpu.params);
+    }
+
+    #[test]
+    fn deform_conv_host_adam_and_optimizer_state_round_trip() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "deform-conv-adam.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=2\nadam=1\ndecay=0.05\n[deform_conv]\nfilters=2\ngroups=2\nsize=1\nuse_mask=1\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        let LayerParams::DeformConv(params) = &mut cpu.params[0] else {
+            panic!("deform_conv params")
+        };
+        params.main.weights.fill(0.25);
+        params.main.biases.fill(0.5);
+        params.offset_weights.fill(0.75);
+        params.offset_biases.fill(1.0);
+        params.mask_weights.as_mut().unwrap().fill(1.25);
+        params.mask_biases.as_mut().unwrap().fill(1.5);
+        let LayerTrainBuffers::DeformConv(train) = &mut cpu.train_buffers[0] else {
+            panic!("deform_conv train buffers")
+        };
+        train.main.weight_updates.fill(-0.2);
+        train.main.bias_updates.fill(-0.3);
+        train.offset_weight_updates.fill(-0.4);
+        train.offset_bias_updates.fill(-0.5);
+        train.mask_weight_updates.as_mut().unwrap().fill(-0.6);
+        train.mask_bias_updates.as_mut().unwrap().fill(-0.7);
+
+        let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+        gpu.params = cpu.params.clone();
+        *gpu.cpu_fallback_train_buffers.borrow_mut() = cpu.train_buffers.clone();
+        cpu.network.layers[0].train.dont_update = 1;
+        gpu.network.layers[0].train.dont_update = 1;
+        let frozen = cpu.params.clone();
+        cpu.update_weights_adam(0.01, 1).unwrap();
+        gpu.update_weights_gpu(0.01, 0.0, 0.05, 1).unwrap();
+        assert_eq!(cpu.params, frozen);
+        assert_eq!(gpu.params, frozen);
+        cpu.network.layers[0].train.dont_update = 0;
+        gpu.network.layers[0].train.dont_update = 0;
+        cpu.update_weights_adam(0.01, 1).unwrap();
+        gpu.update_weights_gpu(0.01, 0.0, 0.05, 1).unwrap();
+        assert_eq!(gpu.params, cpu.params);
+        assert_ne!(gpu.params, frozen);
+
+        let path = std::env::temp_dir().join(format!(
+            "darknet-deform-conv-adam-{}.state",
+            std::process::id()
+        ));
+        cpu.save_optimizer_state(&path).unwrap();
+        let mut restored = ExecutableNetwork::new(network);
+        restored.load_optimizer_state(&path).unwrap();
+        assert_eq!(restored.host_adam_state, cpu.host_adam_state);
+        assert_eq!(restored.adam_step, cpu.adam_step);
+        let _ = fs::remove_file(path);
     }
 
     #[test]

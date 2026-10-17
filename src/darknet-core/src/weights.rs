@@ -228,6 +228,15 @@ pub fn save_weights(
                 write_f32_slice(&mut file, &dcnv4.offset_weights)?;
                 write_f32_slice(&mut file, &dcnv4.offset_biases)?;
             }
+            (LayerKind::DeformConv(_), LayerParams::DeformConv(deform)) => {
+                write_convolutional_params(&mut file, &deform.main)?;
+                write_f32_slice(&mut file, &deform.offset_weights)?;
+                write_f32_slice(&mut file, &deform.offset_biases)?;
+                if let (Some(weights), Some(biases)) = (&deform.mask_weights, &deform.mask_biases) {
+                    write_f32_slice(&mut file, weights)?;
+                    write_f32_slice(&mut file, biases)?;
+                }
+            }
             // C++ `dontsave`: the frozen LAYA layers load from an external
             // shared blob, so nothing is written for them in this stream.
             (LayerKind::LayaEncoder(_), LayerParams::LayaEncoder(_)) => {}
@@ -1005,6 +1014,10 @@ mod tests {
                 "kimi_kda",
                 "[kimi_kda]\nrank=1\nexperts=2\ntop_k=1\nhidden=3\n",
             ),
+            (
+                "deform_conv",
+                "[deform_conv]\nfilters=2\nsize=1\nbatch_normalize=1\nmask=1\nactivation=linear\n",
+            ),
         ] {
             let cfg_text = if name == "crnn" {
                 format!("[net]\nwidth=2\nheight=2\nchannels=1\nbatch=2\ntime_steps=2\n{layer}")
@@ -1049,6 +1062,23 @@ mod tests {
                         dcnv4.dummy_weights.fill(0.2);
                         dcnv4.offset_weights.fill(0.3);
                         dcnv4.offset_biases.fill(0.4);
+                    }
+                    LayerParams::DeformConv(deform) => {
+                        deform.main.biases.fill(0.1);
+                        deform.main.weights.fill(0.25);
+                        if let Some(batch_norm) = &mut deform.main.batch_norm {
+                            batch_norm.scales.fill(0.3);
+                            batch_norm.rolling_mean.fill(0.4);
+                            batch_norm.rolling_variance.fill(0.5);
+                        }
+                        deform.offset_weights.fill(0.6);
+                        deform.offset_biases.fill(0.7);
+                        if let Some(weights) = &mut deform.mask_weights {
+                            weights.fill(0.8);
+                        }
+                        if let Some(biases) = &mut deform.mask_biases {
+                            biases.fill(0.9);
+                        }
                     }
                     LayerParams::Rnn(recurrent) => {
                         for nested in [
@@ -1113,6 +1143,129 @@ mod tests {
                 .expect("recurrent weights load");
             assert_eq!(reloaded.params, executable.params, "{name} weights differ");
             let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn deform_conv_weights_round_trip_with_source_order_and_exact_file_size() {
+        for batch_normalize in [false, true] {
+            for use_mask in [false, true] {
+                let cfg = ConfigFile::parse_str(
+                    "deform-conv-weights.cfg",
+                    &format!(
+                        "[net]\nwidth=3\nheight=3\nchannels=4\nbatch=1\n[deform_conv]\nfilters=4\ngroups=2\nsize=3\npadding=1\nbatch_normalize={}\nuse_mask={}\nactivation=linear\n",
+                        usize::from(batch_normalize),
+                        usize::from(use_mask),
+                    ),
+                )
+                .expect("cfg parses");
+                let network = Network::from_config(cfg).expect("network builds");
+                let mut executable = ExecutableNetwork::new(network.clone());
+                let LayerParams::DeformConv(params) = &mut executable.params[0] else {
+                    panic!("deform_conv params")
+                };
+                for (index, value) in params.main.biases.iter_mut().enumerate() {
+                    *value = 0.11 + index as f32;
+                }
+                for (index, value) in params.main.weights.iter_mut().enumerate() {
+                    *value = 0.22 + index as f32;
+                }
+                let mut expected = params.main.biases.clone();
+                if let Some(batch_norm) = &mut params.main.batch_norm {
+                    for (index, value) in batch_norm.scales.iter_mut().enumerate() {
+                        *value = 0.33 + index as f32;
+                    }
+                    for (index, value) in batch_norm.rolling_mean.iter_mut().enumerate() {
+                        *value = 0.44 + index as f32;
+                    }
+                    for (index, value) in batch_norm.rolling_variance.iter_mut().enumerate() {
+                        *value = 0.55 + index as f32;
+                    }
+                    expected.extend_from_slice(&batch_norm.scales);
+                    expected.extend_from_slice(&batch_norm.rolling_mean);
+                    expected.extend_from_slice(&batch_norm.rolling_variance);
+                }
+                expected.extend_from_slice(&params.main.weights);
+                for (index, value) in params.offset_weights.iter_mut().enumerate() {
+                    *value = 0.66 + index as f32;
+                }
+                for (index, value) in params.offset_biases.iter_mut().enumerate() {
+                    *value = 0.77 + index as f32;
+                }
+                expected.extend_from_slice(&params.offset_weights);
+                expected.extend_from_slice(&params.offset_biases);
+                if let Some(weights) = &mut params.mask_weights {
+                    for (index, value) in weights.iter_mut().enumerate() {
+                        *value = 0.88 + index as f32;
+                    }
+                    expected.extend_from_slice(weights);
+                }
+                if let Some(biases) = &mut params.mask_biases {
+                    for (index, value) in biases.iter_mut().enumerate() {
+                        *value = 0.99 + index as f32;
+                    }
+                    expected.extend_from_slice(biases);
+                }
+
+                let path = std::env::temp_dir().join(format!(
+                    "darknet-deform-conv-weights-{}-{batch_normalize}-{use_mask}.weights",
+                    std::process::id()
+                ));
+                save_weights(&network, &executable.params, &path, 19).expect("weights save");
+                let inspection = inspect_weights_file(&network, &path).expect("weights inspect");
+                let parameter_count = network.layers[0].weights().unwrap().parameter_count();
+                assert_eq!(inspection.file_size, 20 + 4 * parameter_count as u64);
+                assert_eq!(inspection.trailing_bytes, 0);
+                let expected_names = match (batch_normalize, use_mask) {
+                    (false, false) => vec!["biases", "weights", "offset_weights", "offset_biases"],
+                    (false, true) => vec![
+                        "biases",
+                        "weights",
+                        "offset_weights",
+                        "offset_biases",
+                        "mask_weights",
+                        "mask_biases",
+                    ],
+                    (true, false) => vec![
+                        "biases",
+                        "scales",
+                        "rolling_mean",
+                        "rolling_variance",
+                        "weights",
+                        "offset_weights",
+                        "offset_biases",
+                    ],
+                    (true, true) => vec![
+                        "biases",
+                        "scales",
+                        "rolling_mean",
+                        "rolling_variance",
+                        "weights",
+                        "offset_weights",
+                        "offset_biases",
+                        "mask_weights",
+                        "mask_biases",
+                    ],
+                };
+                assert_eq!(
+                    inspection.layers[0]
+                        .arrays
+                        .iter()
+                        .map(|array| array.name.as_str())
+                        .collect::<Vec<_>>(),
+                    expected_names
+                );
+                let bytes = fs::read(&path).expect("read weights file");
+                let stream = bytes[20..]
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                    .collect::<Vec<_>>();
+                assert_eq!(stream, expected, "source-order stream mismatch");
+                let mut reloaded = ExecutableNetwork::new(network);
+                reloaded.load_weights_file(&path).expect("weights load");
+                assert_eq!(reloaded.params, executable.params);
+                let _ = fs::remove_file(path);
+            }
         }
     }
 

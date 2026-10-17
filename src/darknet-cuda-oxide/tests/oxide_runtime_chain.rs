@@ -2567,3 +2567,132 @@ fn dcnv4_f32_host_fallback_matches_cpu_chain_and_updates() {
     assert_eq!(old.dummy_weights, cpu_dcn.dummy_weights);
     assert_eq!(cpu_dcn.dummy_weights, oxide_dcn.dummy_weights);
 }
+
+#[test]
+fn deform_conv_f32_host_fallback_matches_cpu_chain_and_updates() {
+    let net = network(
+        "[net]\nwidth=4\nheight=4\nchannels=2\nbatch=1\n\
+         [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
+         [deform_conv]\nfilters=2\ngroups=2\nsize=1\nmask=1\n\
+         batch_normalize=1\nactivation=linear\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    fill_params(&mut cpu.params);
+    let LayerParams::DeformConv(params) = &mut cpu.params[1] else {
+        panic!("deform_conv parameters")
+    };
+    for (index, weight) in params.main.weights.iter_mut().enumerate() {
+        *weight = 0.8 + index as f32 * 0.17;
+    }
+    params.main.biases.copy_from_slice(&[0.05, -0.03]);
+    let batch_norm = params.main.batch_norm.as_mut().unwrap();
+    batch_norm.scales.copy_from_slice(&[1.1, 0.9]);
+    batch_norm.rolling_mean.copy_from_slice(&[0.02, -0.04]);
+    batch_norm.rolling_variance.copy_from_slice(&[0.8, 1.2]);
+    params
+        .offset_weights
+        .copy_from_slice(&[0.0008, -0.0004, 0.0005, 0.0003]);
+    params.offset_biases.copy_from_slice(&[0.12, -0.09]);
+    params
+        .mask_weights
+        .as_mut()
+        .unwrap()
+        .copy_from_slice(&[0.02, -0.015]);
+    params.mask_biases.as_mut().unwrap().copy_from_slice(&[0.1]);
+
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("Oxide backend"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu()
+        .expect("deform_conv train buffers");
+    let input = patterned(cpu.network.net.input_shape());
+    assert!(gpu.forward_compact(&input).is_err());
+    let cpu_forward = cpu
+        .forward_training(&input)
+        .expect("CPU deform_conv forward");
+    let oxide_forward = gpu
+        .forward_training_with_state(&input)
+        .expect("Oxide deform_conv host-fallback forward");
+    for (index, (cpu_output, oxide_output)) in cpu_forward
+        .layer_outputs
+        .iter()
+        .zip(&oxide_forward.cpu_forward.layer_outputs)
+        .enumerate()
+    {
+        close(
+            &format!("deform_conv host fallback layer {index}"),
+            &cpu_output.data,
+            &oxide_output.data,
+            2e-4,
+        );
+    }
+
+    let seed = Tensor::filled(cpu.network.layers[1].output_shape, 0.13);
+    let mut seeds = vec![None; cpu.network.layers.len()];
+    seeds[1] = Some(seed);
+    cpu.zero_train_buffers();
+    gpu.zero_train_buffers_gpu()
+        .expect("zero deform_conv buffers");
+    let cpu_backward = cpu
+        .backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+        .expect("CPU deform_conv backward");
+    gpu.backward_accumulate_seeded_gpu(&oxide_forward, &seeds)
+        .expect("Oxide deform_conv host-fallback backward");
+    let before = cpu.params.clone();
+    cpu.update_weights(1e-3, 0.0, 0.0, 1);
+    gpu.update_weights_gpu(1e-3, 0.0, 0.0, 1)
+        .expect("Oxide deform_conv host-fallback update");
+
+    let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(oxide_conv)) =
+        (&cpu.params[0], &gpu.params[0])
+    else {
+        panic!("preceding convolution parameters")
+    };
+    close(
+        "deform_conv chain convolution weights",
+        &cpu_conv.weights,
+        &oxide_conv.weights,
+        5e-4,
+    );
+    close(
+        "deform_conv chain convolution biases",
+        &cpu_conv.biases,
+        &oxide_conv.biases,
+        5e-4,
+    );
+    let (
+        LayerParams::DeformConv(old),
+        LayerParams::DeformConv(cpu_deform),
+        LayerParams::DeformConv(oxide_deform),
+    ) = (&before[1], &cpu.params[1], &gpu.params[1])
+    else {
+        panic!("deform_conv parameters")
+    };
+    close(
+        "deform_conv main weights",
+        &cpu_deform.main.weights,
+        &oxide_deform.main.weights,
+        5e-4,
+    );
+    close(
+        "deform_conv offset weights",
+        &cpu_deform.offset_weights,
+        &oxide_deform.offset_weights,
+        5e-4,
+    );
+    close(
+        "deform_conv mask weights",
+        cpu_deform.mask_weights.as_ref().unwrap(),
+        oxide_deform.mask_weights.as_ref().unwrap(),
+        5e-4,
+    );
+    assert_ne!(old.main.weights, cpu_deform.main.weights);
+    assert_ne!(old.offset_weights, cpu_deform.offset_weights);
+    assert_ne!(old.mask_weights, cpu_deform.mask_weights);
+    assert!(
+        cpu_backward
+            .input_gradient
+            .data
+            .iter()
+            .any(|value| *value != 0.0)
+    );
+}
