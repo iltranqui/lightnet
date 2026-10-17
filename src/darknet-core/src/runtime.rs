@@ -510,6 +510,8 @@ pub struct ForwardResult {
     pub moe_caches: Vec<Option<MoeForwardCache>>,
     pub eml_caches: Vec<Option<EmlForwardCache>>,
     pub vit_caches: Vec<Option<crate::vit::VitForwardCache>>,
+    /// Valid proposal metadata and Stage-2 raw outputs for each `[obb_refine]` layer.
+    pub obb_refine_outputs: Vec<crate::carpn::ObbRefineOutput>,
     pub yolo_heads: Vec<YoloHeadOutput>,
     /// The modern anchor-free heads, in layer order.
     pub modern_heads: Vec<ModernHeadOutput>,
@@ -530,6 +532,7 @@ impl ForwardResult {
             moe_caches: Vec::new(),
             eml_caches: Vec::new(),
             vit_caches: Vec::new(),
+            obb_refine_outputs: Vec::new(),
             yolo_heads,
             modern_heads,
         }
@@ -555,6 +558,7 @@ mod forward_result_from_heads_tests {
         assert!(result.moe_caches.is_empty());
         assert!(result.eml_caches.is_empty());
         assert!(result.vit_caches.is_empty());
+        assert!(result.obb_refine_outputs.is_empty());
         assert!(result.yolo_heads.is_empty());
         assert!(result.modern_heads.is_empty());
         assert!(result.final_output().is_none());
@@ -1514,6 +1518,22 @@ impl ExecutableNetwork {
                 input.shape
             )));
         }
+        let has_obb_refine = self
+            .network
+            .layers
+            .iter()
+            .any(|layer| matches!(layer.kind, LayerKind::ObbRefine(_)));
+        if has_obb_refine && training {
+            return Err(Error::InvalidConfig(
+                "Rust training for networks containing [obb_refine] is unsupported until CARPN Stage-2 assignment, loss, backward, and updates are implemented".to_owned(),
+            ));
+        }
+        if has_obb_refine && input.shape.batch != 1 {
+            return Err(Error::InvalidConfig(format!(
+                "CPU CARPN inference currently requires batch size one, got {}",
+                input.shape.batch
+            )));
+        }
 
         let mut layer_outputs = Vec::with_capacity(self.network.layers.len());
         let mut layer_activation_inputs = Vec::with_capacity(self.network.layers.len());
@@ -1525,6 +1545,7 @@ impl ExecutableNetwork {
         let mut moe_caches = Vec::with_capacity(self.network.layers.len());
         let mut eml_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches = Vec::with_capacity(self.network.layers.len());
+        let mut obb_refine_outputs = Vec::new();
         let mut rng_state = 0x9e37_79b9_u64;
 
         for (layer, params) in self.network.layers.iter().zip(&self.params) {
@@ -1572,6 +1593,18 @@ impl ExecutableNetwork {
                 }
                 (LayerKind::Connected(spec), LayerParams::Connected(connected)) => {
                     forward_connected_with_cache(spec, connected, current_input, layer.output_shape)
+                }
+                (LayerKind::ObbRefine(spec), LayerParams::Connected(connected)) => {
+                    let (output, refine_output) = crate::carpn::forward_refine_layer(
+                        &self.network,
+                        layer.index,
+                        spec,
+                        layer.output_shape,
+                        &layer_outputs,
+                        connected,
+                    )?;
+                    obb_refine_outputs.push(refine_output);
+                    (output, None)
                 }
                 (LayerKind::Local(spec), LayerParams::Local(local)) => {
                     forward_local_with_cache(spec, local, current_input, layer.output_shape)?
@@ -2042,6 +2075,7 @@ impl ExecutableNetwork {
             moe_caches,
             eml_caches,
             vit_caches,
+            obb_refine_outputs,
             yolo_heads,
             modern_heads,
         })
@@ -2094,6 +2128,16 @@ impl ExecutableNetwork {
                 "input shape mismatch: expected {expected}, got {}",
                 input.shape
             )));
+        }
+        if self
+            .network
+            .layers
+            .iter()
+            .any(|layer| matches!(layer.kind, LayerKind::ObbRefine(_)))
+        {
+            return Err(Error::InvalidConfig(
+                "backward for networks containing [obb_refine] is unsupported until CARPN Stage-2 gradients and updates are implemented".to_owned(),
+            ));
         }
         if forward.layer_outputs.len() != self.network.layers.len() {
             return Err(Error::InvalidConfig(format!(
@@ -6692,6 +6736,22 @@ where
                 input.shape
             )));
         }
+        if let Some(layer) = self
+            .network
+            .layers
+            .iter()
+            .find(|layer| matches!(layer.kind, LayerKind::ObbRefine(_)))
+        {
+            let message = if training {
+                "GPU CARPN training is unsupported until Stage-2 assignment, backward, and updates are implemented"
+            } else {
+                "GPU CARPN inference is not implemented; use the CPU forward path"
+            };
+            return Err(Error::UnsupportedLayer {
+                layer_index: layer.index,
+                name: format!("[obb_refine]: {message}"),
+            });
+        }
 
         let launch_config = ElementwiseLaunchConfig::default();
         let input_gpu = self
@@ -8223,6 +8283,7 @@ where
                 moe_caches,
                 eml_caches,
                 vit_caches,
+                obb_refine_outputs: Vec::new(),
                 yolo_heads,
                 modern_heads,
             },
@@ -8230,6 +8291,18 @@ where
     }
 
     pub fn forward_compact(&self, input: &Tensor) -> Result<GpuForwardSummary> {
+        if let Some(layer) = self
+            .network
+            .layers
+            .iter()
+            .find(|layer| matches!(layer.kind, LayerKind::ObbRefine(_)))
+        {
+            return Err(Error::UnsupportedLayer {
+                layer_index: layer.index,
+                name: "[obb_refine] GPU inference is not implemented; use the CPU forward path"
+                    .to_owned(),
+            });
+        }
         let expected = self.network.net.input_shape();
         if input.shape != expected {
             return Err(Error::InvalidConfig(format!(
@@ -12759,6 +12832,9 @@ fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
             spec.output,
             spec.batch_normalize,
         )),
+        LayerKind::ObbRefine(spec) => {
+            LayerParams::Connected(default_connected_params(spec.inputs, 5, false))
+        }
         LayerKind::Local(spec) => LayerParams::Local(default_local_params(
             layer.input_shape.channels,
             layer.output_shape.width * layer.output_shape.height,
@@ -14210,13 +14286,24 @@ fn load_weights_into_params(
                 read_f32_into(&mut file, &mut conv.weights)?;
             }
             LayerParams::Connected(connected) => {
-                read_connected_params(
-                    &mut file,
-                    connected,
-                    layer.input_shape.element_count(),
-                    connected.biases.len(),
-                    transpose_connected,
-                )?;
+                if matches!(&layer.kind, LayerKind::ObbRefine(_)) {
+                    if connected.batch_norm.is_some() {
+                        return Err(Error::Weights(format!(
+                            "layer #{} ([obb_refine]) cannot have batch normalization parameters",
+                            layer.index
+                        )));
+                    }
+                    read_f32_into(&mut file, &mut connected.biases)?;
+                    read_f32_into(&mut file, &mut connected.weights)?;
+                } else {
+                    read_connected_params(
+                        &mut file,
+                        connected,
+                        layer.input_shape.element_count(),
+                        connected.biases.len(),
+                        transpose_connected,
+                    )?;
+                }
             }
             LayerParams::Local(local) => {
                 read_f32_into(&mut file, &mut local.biases)?;

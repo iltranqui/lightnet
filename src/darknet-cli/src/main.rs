@@ -16,7 +16,7 @@ use darknet_core::{
     ConfigFile, DataConfig, Detection, DetectionOptions, DetectorAugmentation, ExecutableNetwork,
     ForwardResult, LayerKind, LayerParams, Network, ObbDetection, ObbDetectionGeometry,
     PlanarRgbImage, Tensor, TrainingBatch, YoloLabel, YoloTrainingState, compute_learning_rate,
-    compute_yolo_training_loss_with_state, decode_modern_detections, decode_obb_yolo_detections,
+    compute_yolo_training_loss_with_state, decode_modern_detections, decode_obb_network_detections,
     decode_yolo_detections, initialize_training_params, inspect_weights_file,
     load_augmented_training_batch_from_paths, load_names_file, load_paths_file, save_weights,
 };
@@ -486,9 +486,9 @@ fn decode_image_detections(
                 "detect-image cannot combine OBB YOLO and modern detection heads".to_owned(),
             ));
         }
-        return Ok(ImageDetections::Oriented(decode_obb_yolo_detections(
+        return Ok(ImageDetections::Oriented(decode_obb_network_detections(
             network,
-            &result.yolo_heads,
+            result,
             image_width,
             image_height,
             options,
@@ -1265,7 +1265,22 @@ fn run_detector_map(
     data_path: &str,
     options: &MapOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut executable = ExecutableNetwork::from_path(cfg)?;
+    let (classes, image_count, names, report) = evaluate_detector_map(cfg, data_path, options)?;
+    println!("mAP: {image_count} validation images, {classes} classes (CPU)");
+    print!(
+        "{}",
+        format_map_report(&report, &names, options.iou_threshold)
+    );
+    Ok(())
+}
+
+fn evaluate_detector_map(
+    cfg: &str,
+    data_path: &str,
+    options: &MapOptions,
+) -> Result<(usize, usize, Vec<String>, darknet_core::MapReport), Box<dyn std::error::Error>> {
+    let network = Network::from_path(cfg)?.with_batch(1);
+    let mut executable = ExecutableNetwork::new(network);
     if let Some(weights) = &options.weights {
         let header = executable.load_weights_file(weights)?;
         println!(
@@ -1279,16 +1294,16 @@ fn run_detector_map(
         nms_threshold: options.nms_threshold,
         letterbox: options.letterbox,
     };
-    let (classes, image_count, names, report) = if executable.network.net.obb {
+    if executable.network.net.obb {
         let dataset = darknet_core::ObbValidationDataset::from_data(&executable.network, &data)?;
         let names = map_class_names(&data, dataset.classes)?;
-        let report = dataset.evaluate(
+        let report = dataset.evaluate_with_forward(
             &executable.network,
             detection_options,
             options.iou_threshold,
-            |input| Ok(executable.forward(input)?.yolo_heads),
+            |input| executable.forward(input),
         )?;
-        (dataset.classes, dataset.images.len(), names, report)
+        Ok((dataset.classes, dataset.images.len(), names, report))
     } else {
         let dataset = darknet_core::ValidationDataset::from_data(&executable.network, &data)?;
         let names = map_class_names(&data, dataset.classes)?;
@@ -1298,14 +1313,8 @@ fn run_detector_map(
             options.iou_threshold,
             |input| Ok(executable.forward(input)?.yolo_heads),
         )?;
-        (dataset.classes, dataset.images.len(), names, report)
-    };
-    println!("mAP: {image_count} validation images, {classes} classes (CPU)");
-    print!(
-        "{}",
-        format_map_report(&report, &names, options.iou_threshold)
-    );
-    Ok(())
+        Ok((dataset.classes, dataset.images.len(), names, report))
+    }
 }
 
 fn map_class_names(
@@ -1333,6 +1342,14 @@ fn run_detector_train(
     }
     if !Path::new(data).exists() {
         return Err(format!("data path does not exist: {data}").into());
+    }
+    let network = Network::from_path(cfg)?;
+    if network
+        .layers
+        .iter()
+        .any(|layer| matches!(layer.kind, LayerKind::ObbRefine(_)))
+    {
+        return Err("detector train does not support [obb_refine] until CARPN Stage-2 assignment, loss, backward, and updates are implemented".into());
     }
 
     // Colour must be configured before the first formatted training line.
@@ -3352,8 +3369,8 @@ mod tests {
     use super::{
         DetectionOptions, ImageDetections, MapOptions, MapSchedule, ObbDetectionGeometry,
         TrainOptions, classify_detector_train_paths, decode_image_detections,
-        parse_export_onnx_args,
-        format_obb_detection_line, run_detector_train_cpu, validate_obb_augmentation,
+        evaluate_detector_map, format_obb_detection_line, parse_export_onnx_args,
+        run_detector_train, run_detector_train_cpu, validate_obb_augmentation,
     };
 
     #[test]
@@ -3371,19 +3388,19 @@ mod tests {
         assert_eq!(b.out, std::path::PathBuf::from("o.onnx"));
         assert!(!b.fuse);
         assert!(parse_export_onnx_args(vec!["m.cfg".into()]).is_err());
-        assert!(parse_export_onnx_args(vec![
-            "a.cfg".into(),
-            "b.weights".into(),
-            "--bogus".into(),
-        ])
-        .is_err());
-        assert!(parse_export_onnx_args(vec![
-            "a.cfg".into(),
-            "b.weights".into(),
-            "c.onnx".into(),
-            "d.onnx".into(),
-        ])
-        .is_err());
+        assert!(
+            parse_export_onnx_args(vec!["a.cfg".into(), "b.weights".into(), "--bogus".into(),])
+                .is_err()
+        );
+        assert!(
+            parse_export_onnx_args(vec![
+                "a.cfg".into(),
+                "b.weights".into(),
+                "c.onnx".into(),
+                "d.onnx".into(),
+            ])
+            .is_err()
+        );
     }
 
     fn options(args: &[&str]) -> Result<TrainOptions, Box<dyn std::error::Error>> {
@@ -3444,6 +3461,86 @@ mod tests {
         assert!(quad_tsv.contains("\tcarpn_quad\t0.000000000\t0.100000001"));
         let human = format_obb_detection_line(&quad, "vehicle", false);
         assert!(human.contains("quad=[(0.00,0.10),(0.20,0.30)"), "{human}");
+    }
+
+    #[test]
+    fn detect_image_routes_carpn_forward_and_formats_quadrilateral_output() {
+        use darknet_core::{ConfigFile, ExecutableNetwork, LayerParams, Network, Tensor};
+
+        let cfg = ConfigFile::parse_str(
+            "carpn-detect-cli.cfg",
+            r#"
+                [net]
+                width=1
+                height=1
+                channels=1
+                batch=1
+                obb=1
+                [convolutional]
+                filters=2
+                size=1
+                batch_normalize=0
+                activation=linear
+                [convolutional]
+                filters=8
+                size=1
+                batch_normalize=0
+                activation=linear
+                [obb_yolo]
+                classes=1
+                num=1
+                anchors=1,1
+                new_coords=1
+                [obb_refine]
+                from=0
+                proposal_from=2
+                proposal_topk_train=1
+                proposal_topk_infer=1
+                proposal_capacity=1
+                sample_grid=1
+            "#,
+        )
+        .expect("CARPN cfg parses");
+        let network = Network::from_config(cfg).expect("CARPN network builds");
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let LayerParams::Convolutional(feature) = &mut executable.params[0] else {
+            panic!("feature params");
+        };
+        feature.weights.copy_from_slice(&[1.0, 0.0]);
+        let LayerParams::Convolutional(head) = &mut executable.params[1] else {
+            panic!("head params");
+        };
+        head.weights.fill(0.0);
+        head.biases
+            .copy_from_slice(&[0.5, 0.5, 0.5, 0.5, 0.0, 0.0, 0.9, 0.8]);
+        let input = Tensor::from_data(network.net.input_shape(), vec![1.0]).expect("input");
+        let forward = executable.forward(&input).expect("forward");
+        let decoded = decode_image_detections(
+            &network,
+            &forward,
+            1,
+            1,
+            DetectionOptions {
+                confidence_threshold: 0.1,
+                nms_threshold: 1.1,
+                letterbox: false,
+            },
+        )
+        .expect("CARPN image decoder");
+        let ImageDetections::Oriented(detections) = decoded else {
+            panic!("CARPN cfg must use oriented decoding");
+        };
+        assert_eq!(detections.len(), 1);
+        assert!(matches!(
+            detections[0].geometry,
+            ObbDetectionGeometry::CarpnQuad(_)
+        ));
+        let tsv = format_obb_detection_line(&detections[0], "vehicle", true);
+        assert!(tsv.starts_with("det_obb\tvehicle\t"), "{tsv}");
+        assert!(tsv.contains("\tcarpn_quad\t"), "{tsv}");
+        assert_eq!(tsv.split('\t').count(), 16, "{tsv}");
+        let human = format_obb_detection_line(&detections[0], "vehicle", false);
+        assert!(human.contains("quad=[("), "{human}");
     }
 
     #[test]
@@ -3786,6 +3883,140 @@ mod tests {
             loss_log.lines().any(|line| line.starts_with("2,4,")),
             "{loss_log}"
         );
+    }
+
+    #[test]
+    fn carpn_cli_detector_map_loads_cfg_weights_and_returns_polygon_report() {
+        use darknet_core::{ExecutableNetwork, LayerParams, Network};
+
+        let dir =
+            std::env::temp_dir().join(format!("darknet-cli-carpn-map-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temporary directory");
+        let cfg = dir.join("model.cfg");
+        let data = dir.join("data.data");
+        let image = dir.join("sample.ppm");
+        let label = dir.join("sample.txt");
+        let weights = dir.join("model.weights");
+        std::fs::write(
+            &cfg,
+            r#"
+                [net]
+                width=2
+                height=1
+                channels=3
+                batch=1
+                obb=1
+                [convolutional]
+                filters=2
+                size=1
+                batch_normalize=0
+                activation=linear
+                [convolutional]
+                filters=8
+                size=1
+                batch_normalize=0
+                activation=linear
+                [obb_yolo]
+                classes=1
+                num=1
+                anchors=0.2,0.2
+                new_coords=1
+                max=1
+                [obb_refine]
+                from=0
+                proposal_from=2
+                proposal_topk_train=1
+                proposal_topk_infer=1
+                proposal_capacity=1
+                sample_grid=1
+                front_range=1
+            "#,
+        )
+        .expect("cfg writes");
+        std::fs::write(&image, b"P6\n2 1\n255\n\x80\x40\x20\x80\x40\x20").expect("image writes");
+        std::fs::write(&label, "0 0.25 0.5 0.15811388 0.15811388 0.15 0.4\n")
+            .expect("label writes");
+        std::fs::write(dir.join("valid.txt"), "sample.ppm\n").expect("valid list writes");
+        std::fs::write(&data, "classes=1\nvalid=valid.txt\n").expect("data writes");
+
+        let network = Network::from_path(&cfg)
+            .expect("network builds")
+            .with_batch(1);
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::Convolutional(feature) = &mut executable.params[0] else {
+            panic!("feature parameters");
+        };
+        feature.weights.fill(0.0);
+        feature.biases.fill(0.0);
+        let LayerParams::Convolutional(head) = &mut executable.params[1] else {
+            panic!("proposal parameters");
+        };
+        head.weights.fill(0.0);
+        head.biases
+            .copy_from_slice(&[0.5, 0.5, 0.5, 0.5, 0.0, 0.0, 0.9, 0.8]);
+        darknet_core::save_weights(&executable.network, &executable.params, &weights, 0)
+            .expect("fixed CARPN weights save");
+
+        let options = MapOptions {
+            weights: Some(weights.to_string_lossy().into_owned()),
+            confidence_threshold: 0.1,
+            iou_threshold: 0.5,
+            nms_threshold: 1.0,
+            letterbox: false,
+        };
+        let (classes, image_count, names, report) = evaluate_detector_map(
+            cfg.to_str().expect("cfg path"),
+            data.to_str().expect("data path"),
+            &options,
+        )
+        .expect("CLI detector map CARPN path");
+        assert_eq!((classes, image_count), (1, 1));
+        assert_eq!(names, vec!["class_0".to_owned()]);
+        assert_eq!(report.average_precision, vec![1.0]);
+        assert_eq!(report.detection_counts, vec![1]);
+        assert_eq!(report.true_positives, vec![1]);
+        std::fs::remove_dir_all(dir).expect("temporary directory cleanup");
+    }
+
+    #[test]
+    fn detector_train_rejects_carpn_before_starting_training_or_map() {
+        let dir = std::env::temp_dir().join(format!(
+            "darknet-cli-carpn-train-reject-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temporary directory");
+        let cfg = dir.join("model.cfg");
+        let data = dir.join("data.data");
+        std::fs::write(
+            &cfg,
+            r#"
+                [net]
+                width=1
+                height=1
+                channels=1
+                obb=1
+                [convolutional]
+                filters=8
+                size=1
+                batch_normalize=0
+                [obb_yolo]
+                classes=1
+                num=1
+                anchors=1,1
+                [obb_refine]
+            "#,
+        )
+        .expect("CARPN cfg");
+        std::fs::write(&data, "classes=1\n").expect("data cfg");
+        let error = run_detector_train(
+            cfg.to_str().expect("cfg path"),
+            data.to_str().expect("data path"),
+            &options(&["-map"]).expect("training options"),
+        )
+        .expect_err("CARPN train and train -map must fail before starting");
+        assert!(error.to_string().contains("[obb_refine]"), "{error}");
+        assert!(error.to_string().contains("Stage-2"), "{error}");
+        std::fs::remove_dir_all(dir).expect("temporary directory cleanup");
     }
 
     #[test]

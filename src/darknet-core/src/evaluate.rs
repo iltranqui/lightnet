@@ -1,10 +1,10 @@
 //! Detector validation: one inference per validation image and VOC-style AP.
 use crate::obb_geometry::{BoxObb, box_obb_iou, box_obb_vertices, carpn_polygon_iou};
 use crate::{
-    DataConfig, Detection, DetectionBox, DetectionOptions, Error, LayerKind, Network, ObbDetection,
-    ObbDetectionGeometry, ObbLabel, PlanarRgbImage, Result, Tensor, YoloHeadOutput, YoloLabel,
-    decode_obb_yolo_detections, decode_yolo_detections, load_obb_labels, load_paths_file,
-    load_yolo_labels, replace_image_to_label,
+    DataConfig, Detection, DetectionBox, DetectionOptions, Error, ForwardResult, LayerKind,
+    Network, ObbDetection, ObbDetectionGeometry, ObbLabel, PlanarRgbImage, Result, Tensor,
+    YoloHeadOutput, YoloLabel, decode_obb_network_detections, decode_yolo_detections,
+    load_obb_labels, load_paths_file, load_yolo_labels, replace_image_to_label,
 };
 use std::path::PathBuf;
 
@@ -195,6 +195,22 @@ impl ObbValidationDataset {
         iou_threshold: f32,
         mut infer: impl FnMut(&Tensor) -> Result<Vec<YoloHeadOutput>>,
     ) -> Result<MapReport> {
+        self.evaluate_with_forward(network, options, iou_threshold, |input| {
+            Ok(ForwardResult::from_heads(infer(input)?, Vec::new()))
+        })
+    }
+
+    /// Full-forward variant required for `[obb_refine]` graphs. Legacy OBB
+    /// graphs still use the same Stage-1 decoder through the shared network
+    /// decoder, while CARPN graphs explicitly select polygon mAP even when
+    /// there are no surviving proposals.
+    pub fn evaluate_with_forward(
+        &self,
+        network: &Network,
+        options: DetectionOptions,
+        iou_threshold: f32,
+        mut infer: impl FnMut(&Tensor) -> Result<ForwardResult>,
+    ) -> Result<MapReport> {
         validate_validation_options(network, self.classes, options, iou_threshold)?;
         if obb_validation_classes(network)? != self.classes {
             return Err(invalid(
@@ -211,10 +227,10 @@ impl ObbValidationDataset {
                 image.resize_linear_exact(network.net.width, network.net.height)?
             };
             let input = Tensor::from_data(prepared.shape, prepared.data)?;
-            let heads = infer(&input)?;
-            let mut detections = decode_obb_yolo_detections(
+            let forward = infer(&input)?;
+            let mut detections = decode_obb_network_detections(
                 network,
-                &heads,
+                &forward,
                 image.shape.width,
                 image.shape.height,
                 options,
@@ -240,7 +256,15 @@ impl ObbValidationDataset {
             }
             samples.push((labels.clone(), detections));
         }
-        obb_detector_map(&samples, self.classes, iou_threshold)
+        if network
+            .layers
+            .iter()
+            .any(|layer| matches!(layer.kind, LayerKind::ObbRefine(_)))
+        {
+            carpn_detector_map(&samples, self.classes, iou_threshold)
+        } else {
+            obb_detector_map(&samples, self.classes, iou_threshold)
+        }
     }
 }
 
@@ -656,6 +680,97 @@ mod tests {
         Network::from_config(cfg).expect("OBB validation graph builds")
     }
 
+    fn carpn_validation_fixture(tag: &str) -> (PathBuf, Network, ObbValidationDataset) {
+        let dir = std::env::temp_dir().join(format!(
+            "darknet-carpn-validation-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(
+            dir.join("sample.ppm"),
+            b"P6\n2 1\n255\n\x80\x40\x20\x80\x40\x20",
+        )
+        .expect("validation image writes");
+        std::fs::write(
+            dir.join("sample.txt"),
+            "0 0.25 0.5 0.15811388 0.15811388 0.15 0.4\n",
+        )
+        .expect("CARPN front-point label writes");
+        std::fs::write(dir.join("valid.txt"), "sample.ppm\n").expect("valid list writes");
+        std::fs::write(dir.join("sample.data"), "classes=1\nvalid=valid.txt\n")
+            .expect("data cfg writes");
+        let cfg = crate::cfg::ConfigFile::parse_str(
+            "carpn-validation.cfg",
+            r#"
+                [net]
+                width=2
+                height=1
+                channels=3
+                batch=1
+                obb=1
+                [convolutional]
+                filters=2
+                size=1
+                batch_normalize=0
+                activation=linear
+                [convolutional]
+                filters=8
+                size=1
+                batch_normalize=0
+                activation=linear
+                [obb_yolo]
+                classes=1
+                num=1
+                anchors=0.2,0.2
+                new_coords=1
+                max=1
+                [obb_refine]
+                from=0
+                proposal_from=2
+                proposal_topk_train=1
+                proposal_topk_infer=1
+                proposal_capacity=1
+                sample_grid=1
+                front_range=1
+            "#,
+        )
+        .expect("CARPN cfg parses");
+        let network = Network::from_config(cfg)
+            .expect("CARPN validation graph builds")
+            .with_batch(1);
+        let data = DataConfig::from_path(dir.join("sample.data")).expect("data cfg parses");
+        let dataset = ObbValidationDataset::from_data(&network, &data)
+            .expect("CARPN validation data preflights");
+        (dir, network, dataset)
+    }
+
+    fn carpn_validation_executable(
+        network: Network,
+        objectness: f32,
+        refine_biases: [f32; 5],
+    ) -> crate::runtime::ExecutableNetwork {
+        use crate::runtime::{ExecutableNetwork, LayerParams};
+
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::Convolutional(feature) = &mut executable.params[0] else {
+            panic!("CARPN feature convolution");
+        };
+        feature.weights.fill(0.0);
+        feature.biases.fill(0.0);
+        let LayerParams::Convolutional(head) = &mut executable.params[1] else {
+            panic!("CARPN proposal convolution");
+        };
+        head.weights.fill(0.0);
+        head.biases
+            .copy_from_slice(&[0.5, 0.5, 0.5, 0.5, 0.0, 0.0, objectness, 0.8]);
+        let LayerParams::Connected(refine) = &mut executable.params[3] else {
+            panic!("CARPN refine parameters");
+        };
+        refine.biases.copy_from_slice(&refine_biases);
+        refine.weights.fill(0.0);
+        executable
+    }
+
     #[test]
     fn obb_validation_dataset_runs_one_decode_per_image_and_normalizes_predictions() {
         let dir =
@@ -715,6 +830,177 @@ mod tests {
         assert_eq!(report.mean_average_precision, 1.0);
         assert_eq!(report.ground_truth_counts, vec![2]);
         assert_eq!(report.detection_counts, vec![2]);
+        std::fs::remove_dir_all(dir).expect("temporary validation data is removed");
+    }
+
+    #[test]
+    fn carpn_map_network_validation_executes_full_network_and_scores_polygon_ap() {
+        let (dir, network, dataset) = carpn_validation_fixture("polygon-ap");
+        let executable = carpn_validation_executable(network, 0.9, [0.0; 5]);
+        let mut calls = 0;
+        let report = dataset
+            .evaluate_with_forward(
+                &executable.network,
+                DetectionOptions {
+                    confidence_threshold: 0.1,
+                    nms_threshold: 1.0,
+                    letterbox: false,
+                },
+                0.5,
+                |input| {
+                    calls += 1;
+                    executable.forward(input)
+                },
+            )
+            .expect("full CARPN validation pass");
+        assert_eq!(calls, 1);
+        assert_eq!(report.average_precision, vec![1.0]);
+        assert_eq!(report.ground_truth_counts, vec![1]);
+        assert_eq!(report.detection_counts, vec![1]);
+        assert_eq!(report.true_positives, vec![1]);
+        assert_eq!(report.false_positives, vec![0]);
+        assert_eq!(report.false_negatives, vec![0]);
+        assert!((report.average_iou[0] - 1.0).abs() < 1e-5);
+        std::fs::remove_dir_all(dir).expect("temporary validation data is removed");
+    }
+
+    #[test]
+    fn carpn_map_network_validation_uses_polygon_iou_when_aabb_would_match() {
+        let (dir, network, dataset) = carpn_validation_fixture("polygon-not-aabb");
+        let diagonal_square_raw = [
+            0.0,
+            0.0,
+            2.0f32.sqrt().ln(),
+            1.0 / 2.0f32.sqrt(),
+            1.0 / 2.0f32.sqrt(),
+        ];
+        let executable = carpn_validation_executable(network, 0.9, diagonal_square_raw);
+        let image = PlanarRgbImage::load(&dataset.images[0].0).expect("image");
+        let prepared = image
+            .resize_linear_exact(executable.network.net.width, executable.network.net.height)
+            .expect("preprocess");
+        let input = Tensor::from_data(prepared.shape, prepared.data).expect("input tensor");
+        let forward = executable.forward(&input).expect("network forward");
+        let mut detection = decode_obb_network_detections(
+            &executable.network,
+            &forward,
+            image.shape.width,
+            image.shape.height,
+            DetectionOptions {
+                confidence_threshold: 0.1,
+                nms_threshold: 1.0,
+                letterbox: false,
+            },
+        )
+        .expect("CARPN network decode")
+        .pop()
+        .expect("one proposal");
+        let truth = &dataset.images[0].1[0];
+        let truth_vertices = carpn_truth_vertices(truth);
+        let mut min_x = truth_vertices[0];
+        let mut max_x = truth_vertices[0];
+        let mut min_y = truth_vertices[1];
+        let mut max_y = truth_vertices[1];
+        for vertex in 1..4 {
+            min_x = min_x.min(truth_vertices[vertex * 2]);
+            max_x = max_x.max(truth_vertices[vertex * 2]);
+            min_y = min_y.min(truth_vertices[vertex * 2 + 1]);
+            max_y = max_y.max(truth_vertices[vertex * 2 + 1]);
+        }
+        let truth_aabb = DetectionBox {
+            x: 0.5 * (min_x + max_x),
+            y: 0.5 * (min_y + max_y),
+            w: max_x - min_x,
+            h: max_y - min_y,
+        };
+        detection.detection.bbox.x /= image.shape.width as f32;
+        detection.detection.bbox.w /= image.shape.width as f32;
+        detection.detection.bbox.y /= image.shape.height as f32;
+        detection.detection.bbox.h /= image.shape.height as f32;
+        let ObbDetectionGeometry::CarpnQuad(vertices) = &mut detection.geometry else {
+            panic!("CARPN output geometry");
+        };
+        for point in vertices.chunks_exact_mut(2) {
+            point[0] /= image.shape.width as f32;
+            point[1] /= image.shape.height as f32;
+        }
+        assert!((iou(detection.detection.bbox, truth_aabb) - 1.0).abs() < 1e-5);
+        let ObbDetectionGeometry::CarpnQuad(predicted_vertices) = detection.geometry else {
+            unreachable!();
+        };
+        assert!(carpn_polygon_iou(predicted_vertices, truth_vertices) < 0.6);
+
+        let aabb_fallback = detector_map(
+            &[(
+                vec![YoloLabel {
+                    class_id: 0,
+                    x: truth_aabb.x,
+                    y: truth_aabb.y,
+                    w: truth_aabb.w,
+                    h: truth_aabb.h,
+                }],
+                vec![Detection {
+                    class_id: 0,
+                    confidence: detection.detection.confidence,
+                    objectness: detection.detection.objectness,
+                    bbox: detection.detection.bbox,
+                }],
+            )],
+            1,
+            0.6,
+        )
+        .expect("AABB fallback report");
+        assert_eq!(aabb_fallback.average_precision, vec![1.0]);
+
+        let mut calls = 0;
+        let polygon_report = dataset
+            .evaluate_with_forward(
+                &executable.network,
+                DetectionOptions {
+                    confidence_threshold: 0.1,
+                    nms_threshold: 1.0,
+                    letterbox: false,
+                },
+                0.6,
+                |input| {
+                    calls += 1;
+                    executable.forward(input)
+                },
+            )
+            .expect("polygon CARPN validation");
+        assert_eq!(calls, 1);
+        assert_eq!(polygon_report.average_precision, vec![0.0]);
+        assert_eq!(polygon_report.false_positives, vec![1]);
+        assert_eq!(polygon_report.false_negatives, vec![1]);
+        std::fs::remove_dir_all(dir).expect("temporary validation data is removed");
+    }
+
+    #[test]
+    fn carpn_map_network_validation_requires_front_labels_even_for_zero_proposals() {
+        let (dir, network, _) = carpn_validation_fixture("empty-without-front");
+        std::fs::write(dir.join("sample.txt"), "0 0.25 0.5 0.15811388 0.15811388\n")
+            .expect("front-less label writes");
+        let data = DataConfig::from_path(dir.join("sample.data")).expect("data cfg");
+        let dataset = ObbValidationDataset::from_data(&network, &data).expect("dataset");
+        let executable = carpn_validation_executable(network, 0.005, [0.0; 5]);
+        let mut calls = 0;
+        let error = dataset
+            .evaluate_with_forward(
+                &executable.network,
+                DetectionOptions {
+                    confidence_threshold: 0.001,
+                    nms_threshold: 1.0,
+                    letterbox: false,
+                },
+                0.5,
+                |input| {
+                    calls += 1;
+                    executable.forward(input)
+                },
+            )
+            .expect_err("empty CARPN output still requires front labels");
+        assert_eq!(calls, 1);
+        assert!(error.to_string().contains("front-point"), "{error}");
         std::fs::remove_dir_all(dir).expect("temporary validation data is removed");
     }
 
@@ -901,7 +1187,10 @@ mod tests {
         assert_eq!(dispatched.average_precision, direct.average_precision);
         assert_eq!(dispatched.ground_truth_counts, direct.ground_truth_counts);
         assert_eq!(dispatched.detection_counts, direct.detection_counts);
-        assert_eq!(dispatched.mean_average_precision, direct.mean_average_precision);
+        assert_eq!(
+            dispatched.mean_average_precision,
+            direct.mean_average_precision
+        );
         assert_eq!(dispatched.true_positives, direct.true_positives);
         assert_eq!(dispatched.false_positives, direct.false_positives);
         assert_eq!(dispatched.false_negatives, direct.false_negatives);
@@ -929,10 +1218,7 @@ mod tests {
         let mixed_across_images = obb_detector_map(
             &[
                 (vec![obb_truth(0, Some([0.5, 0.55]))], vec![carpn]),
-                (
-                    vec![obb_truth(0, Some([0.5, 0.55]))],
-                    vec![front_point],
-                ),
+                (vec![obb_truth(0, Some([0.5, 0.55]))], vec![front_point]),
             ],
             1,
             0.5,

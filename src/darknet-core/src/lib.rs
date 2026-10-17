@@ -20,6 +20,7 @@
 pub(crate) mod activation_math;
 pub mod augmentation;
 pub use augmentation::DetectorAugmentation;
+pub mod carpn;
 pub mod centernet;
 pub mod cfg;
 pub(crate) mod channel_shuffle;
@@ -100,17 +101,19 @@ pub mod train;
 pub(crate) mod vit;
 pub mod weights;
 
+pub use carpn::{ObbRefineOutput, ObbRefineProposal};
 pub use cfg::{ConfigFile, RawSection};
 pub use detect::{
     Detection, DetectionBox, DetectionOptions, ObbDetection, ObbDetectionGeometry, apply_obb_nms,
-    decode_modern_detections, decode_obb_yolo_detections, decode_obb_yolo_head,
-    decode_yolo_detections,
+    decode_modern_detections, decode_obb_network_detections, decode_obb_yolo_detections,
+    decode_obb_yolo_head, decode_yolo_detections,
 };
 pub use error::{Error, Result};
 pub use image::PlanarRgbImage;
 pub use model::{
     Activation, CrnnSpec, Layer, LayerKind, LayerWeights, LrPolicy, LstmSpec, NetConfig, Network,
-    RnnSpec, ShortcutWeightsNorm, ShortcutWeightsType, TensorShape, WeightsArray, YoloIouLoss,
+    ObbRefineLoss, ObbRefineSpec, RnnSpec, ShortcutWeightsNorm, ShortcutWeightsType, TensorShape,
+    WeightsArray, YoloIouLoss,
 };
 pub use names::load_names_file;
 pub use runtime::{
@@ -124,12 +127,11 @@ pub use train::{
     DataConfig, ObbTrainingBatch, ObbYoloTrainingDeltaBatch, TrainingBatch, YoloLabel,
     YoloTrainingLoss, YoloTrainingState, compute_obb_yolo_training_deltas,
     ObbYoloTrainingBackward, backward_obb_yolo_training, train_obb_yolo_batch_step,
-    train_obb_yolo_subdivisions,
-    compute_yolo_training_loss, compute_yolo_training_loss_with_state,
-    load_augmented_training_batch_from_paths, load_obb_training_batch,
-    load_obb_training_batch_from_paths, load_obb_training_batch_with_flips_from_paths,
-    load_paths_file, load_training_batch, load_training_batch_from_paths, load_yolo_labels,
-    replace_image_to_label,
+    train_obb_yolo_subdivisions, compute_yolo_training_loss,
+    compute_yolo_training_loss_with_state, load_augmented_training_batch_from_paths,
+    load_obb_training_batch, load_obb_training_batch_from_paths,
+    load_obb_training_batch_with_flips_from_paths, load_paths_file, load_training_batch,
+    load_training_batch_from_paths, load_yolo_labels, replace_image_to_label,
 };
 pub use weights::{WeightsHeader, WeightsInspection, inspect_weights_file, save_weights};
 

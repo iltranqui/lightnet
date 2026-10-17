@@ -6,10 +6,11 @@
 //! post-processing separate from neural-network execution, like the C++
 //! `get_yolo_detections()` and NMS helpers.
 
+use crate::carpn::{ObbRefineOutput, ObbRefineProposal};
 use crate::error::{Error, Result};
-use crate::model::{LayerKind, Network, ObbNmsKind, YoloSpec};
+use crate::model::{LayerKind, Network, ObbNmsKind, ObbRefineSpec, YoloSpec};
 use crate::obb_geometry::{BoxObb, box_obb_iou, carpn_polygon_iou};
-use crate::runtime::{ModernHeadOutput, YoloHeadOutput};
+use crate::runtime::{ForwardResult, ModernHeadOutput, YoloHeadOutput};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DetectionBox {
@@ -203,8 +204,257 @@ pub fn decode_obb_yolo_detections(
     Ok(detections)
 }
 
-/// Decode one six-coordinate legacy OBB YOLO head into per-class detections.
+/// Decode OBB detections from a complete network forward pass.
 ///
+/// Networks with `[obb_refine]` use only typed Stage-2 outputs and return CARPN
+/// quadrilaterals; legacy networks delegate to [`decode_obb_yolo_detections`].
+/// This CPU decoder currently supports batch size one.
+pub fn decode_obb_network_detections(
+    network: &Network,
+    forward: &ForwardResult,
+    image_width: usize,
+    image_height: usize,
+    options: DetectionOptions,
+) -> Result<Vec<ObbDetection>> {
+    let refine_layers = network
+        .layers
+        .iter()
+        .filter(|layer| matches!(layer.kind, LayerKind::ObbRefine(_)))
+        .collect::<Vec<_>>();
+    if refine_layers.is_empty() {
+        return decode_obb_yolo_detections(
+            network,
+            &forward.yolo_heads,
+            image_width,
+            image_height,
+            options,
+        );
+    }
+    if image_width == 0 || image_height == 0 || network.net.width == 0 || network.net.height == 0 {
+        return Err(Error::InvalidConfig(
+            "invalid image or network geometry for CARPN decoding".to_owned(),
+        ));
+    }
+    if forward.obb_refine_outputs.len() != refine_layers.len() {
+        return Err(Error::InvalidConfig(format!(
+            "CARPN forward result has {} refine outputs, expected {}",
+            forward.obb_refine_outputs.len(),
+            refine_layers.len()
+        )));
+    }
+
+    let correction = ObbImageCorrection::new(
+        network.net.width,
+        network.net.height,
+        image_width,
+        image_height,
+        options.letterbox,
+    )?;
+    let mut detections = Vec::new();
+    let mut nms_kind = None;
+    let mut beta_nms = None;
+    for (layer, refine_output) in refine_layers.into_iter().zip(&forward.obb_refine_outputs) {
+        let LayerKind::ObbRefine(spec) = &layer.kind else {
+            unreachable!("filtered refine layers")
+        };
+        validate_refine_output(layer.index, spec, refine_output, forward)?;
+        if nms_kind.is_some_and(|kind| kind != spec.nms_kind) {
+            return Err(Error::InvalidConfig(
+                "CARPN refine layers use different NMS kinds".to_owned(),
+            ));
+        }
+        if matches!(spec.nms_kind, ObbNmsKind::Diou | ObbNmsKind::Weighted) {
+            if beta_nms.is_some_and(|beta| beta != spec.beta_nms) {
+                return Err(Error::InvalidConfig(
+                    "CARPN refine layers use different beta_nms values".to_owned(),
+                ));
+            }
+            beta_nms = Some(spec.beta_nms);
+        }
+        nms_kind = Some(spec.nms_kind);
+
+        let output_tensor = &forward.layer_outputs[layer.index];
+        for proposal in &refine_output.proposals {
+            if proposal.class_id >= spec.classes {
+                return Err(Error::InvalidConfig(format!(
+                    "CARPN proposal class {} is outside configured class count {}",
+                    proposal.class_id, spec.classes
+                )));
+            }
+            let capacity = spec.proposal_capacity;
+            let raw = std::array::from_fn(|channel| {
+                output_tensor.data[channel * capacity + proposal.proposal_index]
+            });
+            if raw != proposal.raw_regression {
+                return Err(Error::InvalidConfig(format!(
+                    "CARPN layer #{} typed proposal {} disagrees with its raw output tensor",
+                    layer.index, proposal.proposal_index
+                )));
+            }
+            if let Some(detection) = decode_carpn_proposal(
+                spec,
+                proposal,
+                raw,
+                image_width,
+                image_height,
+                correction,
+                options.confidence_threshold,
+            )? {
+                detections.push(detection);
+            }
+        }
+    }
+
+    apply_obb_nms_by_kind(
+        &mut detections,
+        options.nms_threshold,
+        nms_kind.unwrap_or(ObbNmsKind::Obb),
+        beta_nms.unwrap_or(0.6),
+    );
+    detections.sort_by(|lhs, rhs| {
+        rhs.detection
+            .confidence
+            .total_cmp(&lhs.detection.confidence)
+    });
+    Ok(detections)
+}
+
+fn validate_refine_output(
+    layer_index: usize,
+    spec: &ObbRefineSpec,
+    output: &ObbRefineOutput,
+    forward: &ForwardResult,
+) -> Result<()> {
+    if output.layer_index != layer_index
+        || output.proposal_count != output.proposals.len()
+        || output.proposal_count > spec.proposal_capacity
+    {
+        return Err(Error::InvalidConfig(format!(
+            "invalid CARPN metadata for layer #{layer_index}"
+        )));
+    }
+    let tensor = forward.layer_outputs.get(layer_index).ok_or_else(|| {
+        Error::InvalidConfig(format!(
+            "CARPN forward result is missing layer #{layer_index} output"
+        ))
+    })?;
+    if tensor.shape.width != spec.proposal_capacity
+        || tensor.shape.height != 1
+        || tensor.shape.channels != 5
+        || tensor.shape.batch != 1
+        || tensor.data.len() != spec.proposal_capacity * 5
+    {
+        return Err(Error::InvalidConfig(format!(
+            "CARPN layer #{layer_index} has invalid raw output tensor shape {}",
+            tensor.shape
+        )));
+    }
+    for (index, proposal) in output.proposals.iter().enumerate() {
+        if proposal.proposal_index != index || proposal.source_layer_index != spec.proposal_layer {
+            return Err(Error::InvalidConfig(format!(
+                "CARPN layer #{layer_index} has invalid proposal/source index metadata"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_carpn_proposal(
+    spec: &ObbRefineSpec,
+    proposal: &ObbRefineProposal,
+    raw: [f32; 5],
+    image_width: usize,
+    image_height: usize,
+    correction: ObbImageCorrection,
+    confidence_threshold: f32,
+) -> Result<Option<ObbDetection>> {
+    if !proposal.score.is_finite() || proposal.score <= confidence_threshold {
+        return Ok(None);
+    }
+    if !spec.front_range.is_finite() || spec.front_range <= 0.0 {
+        return Err(Error::InvalidConfig(
+            "CARPN front_range must be finite and > 0".to_owned(),
+        ));
+    }
+    let anchor_radius = proposal.anchor_radius.max(1e-6);
+    let dr = finite_or_zero(raw[2]).clamp(-5.0, 5.0);
+    let dx = finite_or_zero(raw[0]).clamp(-spec.front_range, spec.front_range);
+    let dy = finite_or_zero(raw[1]).clamp(-spec.front_range, spec.front_range);
+    let dalpha = finite_or_zero(raw[3]).clamp(-spec.front_range, spec.front_range);
+    let dbeta = finite_or_zero(raw[4]).clamp(-spec.front_range, spec.front_range);
+    let center_x = proposal.anchor_x + dx * anchor_radius;
+    let center_y = proposal.anchor_y + dy * anchor_radius;
+    let radius = anchor_radius * dr.exp();
+    if !center_x.is_finite() || !center_y.is_finite() || !radius.is_finite() || radius <= 0.0 {
+        return Err(Error::InvalidConfig(
+            "CARPN proposal has invalid decoded center or radius".to_owned(),
+        ));
+    }
+    let dalpha = (dalpha * radius).clamp(-radius, radius);
+    let dbeta = (dbeta * radius).clamp(-radius, radius);
+    let perp_alpha = (radius * radius - dalpha * dalpha).max(0.0).sqrt();
+    let perp_beta = (radius * radius - dbeta * dbeta).max(0.0).sqrt();
+    let normalized_vertices = [
+        center_x + dalpha,
+        center_y - perp_alpha,
+        center_x + perp_beta,
+        center_y + dbeta,
+        center_x - dalpha,
+        center_y + perp_alpha,
+        center_x - perp_beta,
+        center_y - dbeta,
+    ];
+    let mut vertices = [0.0f32; 8];
+    for vertex in 0..4 {
+        let corrected = correction.correct_front_point(
+            [
+                normalized_vertices[vertex * 2],
+                normalized_vertices[vertex * 2 + 1],
+            ],
+            image_width as f32,
+            image_height as f32,
+        );
+        vertices[vertex * 2] = corrected[0];
+        vertices[vertex * 2 + 1] = corrected[1];
+    }
+    if vertices.iter().any(|coordinate| !coordinate.is_finite()) {
+        return Err(Error::InvalidConfig(
+            "CARPN proposal decodes to non-finite vertices".to_owned(),
+        ));
+    }
+
+    let mut min_x = vertices[0];
+    let mut max_x = vertices[0];
+    let mut min_y = vertices[1];
+    let mut max_y = vertices[1];
+    for vertex in 1..4 {
+        let x = vertices[vertex * 2];
+        let y = vertices[vertex * 2 + 1];
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    let bbox = DetectionBox {
+        x: 0.5 * (min_x + max_x),
+        y: 0.5 * (min_y + max_y),
+        w: (max_x - min_x).max(1e-6),
+        h: (max_y - min_y).max(1e-6),
+    };
+    Ok(Some(ObbDetection {
+        detection: Detection {
+            class_id: proposal.class_id,
+            confidence: proposal.score,
+            objectness: proposal.objectness,
+            bbox,
+        },
+        geometry: ObbDetectionGeometry::CarpnQuad(vertices),
+    }))
+}
+
+/// Decode one six-coordinate legacy OBB YOLO head into per-class detections.
+
 /// `data` is one image's output in the existing Darknet channel-major layout
 /// with six box channels, one objectness channel, and then `classes` channels
 /// per anchor. The returned front point is letterbox-corrected and expressed in
@@ -713,7 +963,7 @@ fn decode_bbox(
     }
 }
 
-fn decode_obb_bbox(
+pub(crate) fn decode_obb_bbox(
     tx: f32,
     ty: f32,
     tw: f32,
@@ -752,7 +1002,7 @@ fn decode_obb_bbox(
     }
 }
 
-fn finite_or_zero(value: f32) -> f32 {
+pub(crate) fn finite_or_zero(value: f32) -> f32 {
     if value.is_finite() { value } else { 0.0 }
 }
 
@@ -1228,7 +1478,7 @@ fn apply_obb_weighted_nms(detections: &mut Vec<ObbDetection>, threshold: f32, be
     detections.truncate(kept);
 }
 
-fn anchor_pair(spec: &YoloSpec, index: usize) -> Result<(f32, f32)> {
+pub(crate) fn anchor_pair(spec: &YoloSpec, index: usize) -> Result<(f32, f32)> {
     let anchor_index = index
         .checked_mul(2)
         .ok_or_else(|| Error::InvalidConfig("anchor index overflow".to_owned()))?;
@@ -1249,7 +1499,7 @@ fn sigmoid(value: f32) -> f32 {
 /// the C++ yolo layer applies the logistic to x, y, objectness and classes in forward;
 /// with `new_coords` it does not (the preceding layer already activated them), so
 /// `get_yolo_detections` reads the values as they are.
-fn head_activation(raw: f32, new_coords: bool) -> f32 {
+pub(crate) fn head_activation(raw: f32, new_coords: bool) -> f32 {
     if new_coords { raw } else { sigmoid(raw) }
 }
 
@@ -2077,5 +2327,195 @@ mod modern_decode_tests {
             format!("{err}").contains("not a modern anchor-free head"),
             "{err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod carpn_decode_tests {
+    use crate::TensorShape;
+    use crate::carpn::ObbRefineProposal;
+    use crate::cfg::ConfigFile;
+    use crate::model::{LayerKind, Network};
+    use crate::runtime::{ExecutableNetwork, ForwardResult, LayerParams, Tensor, YoloHeadOutput};
+
+    use super::{
+        DetectionOptions, ObbDetectionGeometry, ObbImageCorrection, decode_carpn_proposal,
+        decode_obb_network_detections, decode_obb_yolo_detections,
+    };
+
+    fn tiny_carpn_forward(objectness: f32, two_refines: bool) -> (Network, ForwardResult) {
+        let refine = "[obb_refine]\nfrom=0\nproposal_from=2\nproposal_topk_train=2\nproposal_topk_infer=2\nproposal_capacity=2\nsample_grid=1\nfront_range=1\n";
+        let cfg = format!(
+            "[net]\nwidth=2\nheight=1\nchannels=1\nbatch=1\nobb=1\n\
+             [convolutional]\nfilters=2\nsize=1\nbatch_normalize=0\nactivation=linear\n\
+             [convolutional]\nfilters=8\nsize=1\nbatch_normalize=0\nactivation=linear\n\
+             [obb_yolo]\nclasses=1\nnum=1\nmask=0\nanchors=1,1\nnew_coords=1\nmax=1\n{refine}{}",
+            if two_refines { refine } else { "" },
+        );
+        let network =
+            Network::from_config(ConfigFile::parse_str("carpn-decode.cfg", &cfg).expect("cfg"))
+                .expect("network");
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::Convolutional(feature) = &mut executable.params[0] else {
+            panic!("feature convolution");
+        };
+        feature.weights.copy_from_slice(&[2.0, 3.0]);
+        feature.biases.fill(0.0);
+        let LayerParams::Convolutional(head) = &mut executable.params[1] else {
+            panic!("proposal convolution");
+        };
+        head.weights.fill(0.0);
+        head.biases
+            .copy_from_slice(&[0.9, 0.4, 0.5, 0.5, 0.0, 0.0, objectness, 0.8]);
+        let input =
+            Tensor::from_data(executable.network.net.input_shape(), vec![1.0, 2.0]).expect("input");
+        let forward = executable.forward(&input).expect("forward");
+        (executable.network, forward)
+    }
+
+    fn options(confidence_threshold: f32, nms_threshold: f32, letterbox: bool) -> DetectionOptions {
+        DetectionOptions {
+            confidence_threshold,
+            nms_threshold,
+            letterbox,
+        }
+    }
+
+    #[test]
+    fn carpn_refine_decode_uses_stage_two_rows_and_static_anchor_geometry() {
+        let (network, forward) = tiny_carpn_forward(0.9, false);
+        assert_eq!(forward.obb_refine_outputs.len(), 1);
+        assert_eq!(forward.obb_refine_outputs[0].proposal_count, 2);
+        let detections =
+            decode_obb_network_detections(&network, &forward, 2, 1, options(0.1, 1.1, false))
+                .expect("CARPN detections");
+        assert_eq!(detections.len(), 2, "{detections:?}");
+        for (index, detection) in detections.iter().enumerate() {
+            assert_eq!(detection.detection.class_id, 0);
+            assert!((detection.detection.confidence - 0.72).abs() < 1e-6);
+            assert_eq!(detection.detection.objectness, 0.9);
+            let center_x = if index == 0 { 0.5 } else { 1.5 };
+            assert!((detection.detection.bbox.x - center_x).abs() < 1e-5);
+            let radius = 0.5 * 1.25f32.sqrt();
+            assert!((detection.detection.bbox.w - 4.0 * radius).abs() < 1e-5);
+            assert!((detection.detection.bbox.h - 2.0 * radius).abs() < 1e-5);
+            let ObbDetectionGeometry::CarpnQuad(vertices) = detection.geometry else {
+                panic!("CARPN graph must not expose Stage-1 front points");
+            };
+            assert!((vertices[1] - (0.5 - radius)).abs() < 1e-5);
+            assert!((vertices[5] - (0.5 + radius)).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn carpn_refine_decode_corrects_every_vertex_for_letterbox_and_scales_the_aabb() {
+        let (network, _) = tiny_carpn_forward(0.9, false);
+        let LayerKind::ObbRefine(spec) = &network.layers[3].kind else {
+            panic!("CARPN layer");
+        };
+        let proposal = ObbRefineProposal {
+            proposal_index: 0,
+            source_layer_index: spec.proposal_layer,
+            anchor_index: 0,
+            cell_x: 0,
+            cell_y: 0,
+            class_id: 0,
+            objectness: 0.8,
+            class_probability: 0.9,
+            score: 0.72,
+            bbox: [0.5, 0.5, 1.0, 1.0],
+            anchor_x: 0.5,
+            anchor_y: 0.5,
+            anchor_radius: 0.5,
+            raw_regression: [0.0; 5],
+        };
+        let correction = ObbImageCorrection::new(4, 2, 2, 2, true).expect("correction");
+        let detection = decode_carpn_proposal(spec, &proposal, [0.0; 5], 2, 2, correction, 0.1)
+            .expect("decode")
+            .expect("detection");
+        let ObbDetectionGeometry::CarpnQuad(vertices) = detection.geometry else {
+            panic!("CARPN quad");
+        };
+        let expected = [1.0, 0.0, 3.0, 1.0, 1.0, 2.0, -1.0, 1.0];
+        for (actual, expected) in vertices.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+        assert_eq!(detection.detection.bbox.x, 1.0);
+        assert_eq!(detection.detection.bbox.y, 1.0);
+        assert_eq!(detection.detection.bbox.w, 4.0);
+        assert_eq!(detection.detection.bbox.h, 2.0);
+    }
+
+    #[test]
+    fn carpn_refine_decode_stays_explicit_when_no_proposals_survive() {
+        let (network, forward) = tiny_carpn_forward(0.005, false);
+        assert!(!forward.yolo_heads.is_empty());
+        let detections =
+            decode_obb_network_detections(&network, &forward, 2, 1, options(0.001, 0.0, false))
+                .expect("empty CARPN detections");
+        assert!(detections.is_empty());
+
+        let mut incomplete = forward.clone();
+        incomplete.obb_refine_outputs.clear();
+        assert!(
+            decode_obb_network_detections(&network, &incomplete, 2, 1, options(0.001, 0.0, false),)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn carpn_refine_decode_merges_multiple_layers_before_one_nms_pass() {
+        let (network, forward) = tiny_carpn_forward(0.9, true);
+        assert_eq!(forward.obb_refine_outputs.len(), 2);
+        let detections =
+            decode_obb_network_detections(&network, &forward, 2, 1, options(0.1, 0.99, false))
+                .expect("merged CARPN detections");
+        assert_eq!(
+            detections.len(),
+            2,
+            "duplicate layers should suppress once: {detections:?}"
+        );
+    }
+
+    #[test]
+    fn carpn_refine_decode_preserves_legacy_front_point_compatibility() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "legacy-obb.cfg",
+                "[net]\nwidth=1\nheight=1\nchannels=8\nobb=1\n[obb_yolo]\nclasses=1\nnum=1\nanchors=1,1\nnew_coords=1\n",
+            )
+            .expect("cfg"),
+        )
+        .expect("legacy network");
+        let mut data = vec![0.0; 8];
+        data[0] = 0.5;
+        data[1] = 0.5;
+        data[2] = 0.5;
+        data[3] = 0.5;
+        data[4] = 0.1;
+        data[5] = 0.2;
+        data[6] = 0.9;
+        data[7] = 0.8;
+        let head = YoloHeadOutput {
+            layer_index: 0,
+            output: Tensor::from_data(TensorShape::new(1, 1, 8, 1), data).expect("head"),
+        };
+        let legacy = decode_obb_yolo_detections(
+            &network,
+            std::slice::from_ref(&head),
+            1,
+            1,
+            options(0.1, 0.0, false),
+        )
+        .expect("legacy decoder");
+        let forward = ForwardResult::from_heads(vec![head], Vec::new());
+        let network_decode =
+            decode_obb_network_detections(&network, &forward, 1, 1, options(0.1, 0.0, false))
+                .expect("compatibility decoder");
+        assert_eq!(network_decode, legacy);
+        assert!(matches!(
+            network_decode[0].geometry,
+            ObbDetectionGeometry::FrontPoint { .. }
+        ));
     }
 }

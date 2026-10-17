@@ -124,6 +124,16 @@ pub fn save_weights(
             (LayerKind::Connected(_), LayerParams::Connected(connected)) => {
                 write_connected_params(&mut file, connected)?;
             }
+            (LayerKind::ObbRefine(_), LayerParams::Connected(connected)) => {
+                if connected.batch_norm.is_some() {
+                    return Err(Error::Weights(format!(
+                        "layer #{} ([obb_refine]) cannot have batch normalization parameters",
+                        layer.index
+                    )));
+                }
+                write_f32_slice(&mut file, &connected.biases)?;
+                write_f32_slice(&mut file, &connected.weights)?;
+            }
             (LayerKind::Deconvolutional(_), LayerParams::Convolutional(conv)) => {
                 write_f32_slice(&mut file, &conv.biases)?;
                 write_f32_slice(&mut file, &conv.weights)?;
@@ -337,6 +347,115 @@ mod tests {
             write_f32_slice(&mut got, &values).unwrap();
             assert_eq!(got, expected, "len {len}");
         }
+    }
+
+    #[test]
+    fn carpn_refine_weights_round_trip_in_source_order() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "carpn-refine.cfg",
+                r#"
+                    [net]
+                    width=4
+                    height=4
+                    channels=1
+                    batch=1
+                    obb=1
+
+                    [convolutional]
+                    filters=8
+                    size=1
+                    batch_normalize=0
+                    activation=linear
+
+                    [convolutional]
+                    filters=8
+                    size=1
+                    batch_normalize=0
+                    activation=linear
+
+                    [obb_yolo]
+                    classes=1
+                    num=1
+                    anchors=4,2
+                    max=2
+
+                    [obb_refine]
+                    proposal_topk_train=3
+                    proposal_topk_infer=4
+                    proposal_jitter=0
+                    sample_grid=2
+                "#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut executable = ExecutableNetwork::new(network.clone());
+        let stage2_index = network.layers.len() - 1;
+        let LayerParams::Connected(params) = &mut executable.params[stage2_index] else {
+            panic!("CARPN refine parameters use the connected affine storage");
+        };
+        for (i, value) in params.biases.iter_mut().enumerate() {
+            *value = i as f32 + 0.25;
+        }
+        for (i, value) in params.weights.iter_mut().enumerate() {
+            *value = i as f32 * 0.125 - 3.0;
+        }
+
+        let modern_path = std::env::temp_dir().join("darknet-carpn-refine-modern.weights");
+        save_weights(&network, &executable.params, &modern_path, 19).unwrap();
+        assert_eq!(
+            fs::metadata(&modern_path).unwrap().len(),
+            20 + network.total_parameter_count() as u64 * 4
+        );
+        let inspection = inspect_weights_file(&network, &modern_path).unwrap();
+        assert_eq!(inspection.trailing_bytes, 0);
+        let stage2 = inspection
+            .layers
+            .iter()
+            .find(|layer| layer.layer_index == stage2_index)
+            .expect("refine weights are inspected");
+        assert_eq!(
+            stage2
+                .arrays
+                .iter()
+                .map(|array| array.name.as_str())
+                .collect::<Vec<_>>(),
+            ["biases", "weights"]
+        );
+        assert_eq!(
+            stage2
+                .arrays
+                .iter()
+                .map(|array| array.len)
+                .collect::<Vec<_>>(),
+            [5, 5 * 2 * 2 * 8]
+        );
+
+        let mut modern = ExecutableNetwork::new(network.clone());
+        modern.load_weights_file(&modern_path).unwrap();
+        assert_eq!(modern.params, executable.params);
+
+        let legacy_path = std::env::temp_dir().join("darknet-carpn-refine-legacy.weights");
+        let modern_bytes = fs::read(&modern_path).unwrap();
+        let mut legacy_bytes = Vec::with_capacity(modern_bytes.len() - 4);
+        legacy_bytes.extend_from_slice(&0i32.to_le_bytes());
+        legacy_bytes.extend_from_slice(&1i32.to_le_bytes());
+        legacy_bytes.extend_from_slice(&0i32.to_le_bytes());
+        legacy_bytes.extend_from_slice(&19u32.to_le_bytes());
+        legacy_bytes.extend_from_slice(&modern_bytes[20..]);
+        fs::write(&legacy_path, legacy_bytes).unwrap();
+        let mut legacy = ExecutableNetwork::new(network.clone());
+        legacy.load_weights_file(&legacy_path).unwrap();
+        assert_eq!(legacy.params, executable.params);
+        assert_eq!(
+            inspect_weights_file(&network, &legacy_path)
+                .unwrap()
+                .trailing_bytes,
+            0
+        );
+        let _ = fs::remove_file(modern_path);
+        let _ = fs::remove_file(legacy_path);
     }
 
     #[test]

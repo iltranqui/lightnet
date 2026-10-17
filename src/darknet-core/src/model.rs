@@ -914,6 +914,8 @@ impl ObbNmsKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ObbYoloSpec {
     pub yolo: YoloSpec,
+    /// Source maximum labels/detections for this proposal head (`max`, default 200).
+    pub max_boxes: usize,
     /// Optional source `obb_anchors` (u, v) directional prior per global anchor.
     pub front_anchor_offsets: Option<Vec<[f32; 2]>>,
     /// Source `front_loss_normalizer`, including its `front_point_normalizer` alias.
@@ -945,6 +947,39 @@ impl std::ops::Deref for ObbYoloSpec {
     fn deref(&self) -> &Self::Target {
         &self.yolo
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObbRefineLoss {
+    Carpn,
+    CiouObb,
+}
+
+/// Source `[obb_refine]` configuration for the inference-only CARPN stage-2 head.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObbRefineSpec {
+    /// Absolute index of the sampled spatial feature layer.
+    pub feature_layer: usize,
+    /// Absolute index of the OBB-YOLO proposal source layer.
+    pub proposal_layer: usize,
+    pub classes: usize,
+    pub max_boxes: usize,
+    pub proposal_topk_train: usize,
+    pub proposal_topk_infer: usize,
+    pub proposal_jitter: usize,
+    pub sample_grid: usize,
+    pub proposal_capacity: usize,
+    /// Flattened sample count times the feature-layer channel count.
+    pub inputs: usize,
+    pub front_range: f32,
+    pub front_loss_normalizer: f32,
+    pub quality_normalizer: f32,
+    pub proposal_thresh: f32,
+    pub csda_topk: usize,
+    pub anchor_scales: Vec<f32>,
+    pub loss: ObbRefineLoss,
+    pub nms_kind: ObbNmsKind,
+    pub beta_nms: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1112,6 +1147,8 @@ pub enum LayerKind {
     /// Legacy six-coordinate `[obb_yolo]`; inference is decoded separately
     /// from axis-aligned YOLO and training remains unsupported.
     ObbYolo(ObbYoloSpec),
+    /// Inference-only CARPN stage-2 head, sourced by `[obb_yolo]` proposals.
+    ObbRefine(ObbRefineSpec),
     GaussianYolo(YoloSpec),
     Region(RegionSpec),
     Reorg(ReorgSpec),
@@ -1189,6 +1226,7 @@ impl LayerKind {
             Self::Upsample(_) => "upsample",
             Self::Yolo(_) => "yolo",
             Self::ObbYolo(_) => "obb_yolo",
+            Self::ObbRefine(_) => "obb_refine",
             Self::GaussianYolo(_) => "gaussian_yolo",
             Self::Region(_) => "region",
             Self::Reorg(_) => "reorg",
@@ -1408,6 +1446,18 @@ impl Layer {
 
                 Some(LayerWeights { entries })
             }
+            LayerKind::ObbRefine(spec) => Some(LayerWeights {
+                entries: vec![
+                    WeightsEntry {
+                        array: WeightsArray::Biases,
+                        len: 5,
+                    },
+                    WeightsEntry {
+                        array: WeightsArray::Weights,
+                        len: 5 * spec.inputs,
+                    },
+                ],
+            }),
             LayerKind::Connected(spec) => {
                 let outputs = spec.output;
                 let inputs = self.input_shape.element_count();
@@ -2323,6 +2373,7 @@ fn parse_layer_kind(
                 )));
             }
             LayerKind::ObbYolo(ObbYoloSpec {
+                max_boxes,
                 front_anchor_offsets,
                 front_loss_normalizer,
                 covariance_normalizer: section.get_f32("covariance_normalizer", 0.0)?,
@@ -2362,6 +2413,13 @@ fn parse_layer_kind(
                 nms_kind,
             })
         }
+        "obb_refine" => LayerKind::ObbRefine(parse_obb_refine_spec(
+            section,
+            layer_index,
+            current,
+            built_layers,
+            net_obb,
+        )?),
         "gaussian_yolo" => {
             let mask = section.get_usize_list("mask")?;
             let classes = section.get_usize("classes", 20)?;
@@ -3306,6 +3364,12 @@ fn infer_output_shape(
         | LayerKind::ObbYolo(_)
         | LayerKind::GaussianYolo(_)
         | LayerKind::Region(_) => Ok(current),
+        LayerKind::ObbRefine(spec) => Ok(TensorShape::new(
+            spec.proposal_capacity,
+            1,
+            5,
+            current.batch,
+        )),
         LayerKind::Reorg(spec) => {
             if spec.reverse {
                 Ok(TensorShape::new(
@@ -3719,6 +3783,162 @@ fn resolve_relative_layer(layer_index: usize, raw_index: isize) -> Result<usize>
     }
 
     Ok(absolute)
+}
+
+fn parse_obb_refine_spec(
+    section: &RawSection,
+    layer_index: usize,
+    current: TensorShape,
+    built_layers: &[Layer],
+    net_obb: bool,
+) -> Result<ObbRefineSpec> {
+    let line = section.line;
+    let invalid =
+        |message: &str| Error::InvalidConfig(format!("[obb_refine] at line {line}: {message}"));
+    if !net_obb {
+        return Err(invalid("requires obb=1 in [net]"));
+    }
+
+    let feature_ref = section.get_isize("from", -2)?;
+    let feature_layer = resolve_relative_layer(layer_index, feature_ref)
+        .map_err(|_| invalid(&format!("invalid from={feature_ref}")))?;
+    let feature = built_layers
+        .get(feature_layer)
+        .ok_or_else(|| invalid("feature source does not exist"))?;
+    let feature_shape = feature.output_shape;
+    if feature_shape.width == 0 || feature_shape.height == 0 || feature_shape.channels == 0 {
+        return Err(invalid(
+            "from= must reference a non-empty spatial feature layer",
+        ));
+    }
+
+    let proposal_ref = section.get_isize("proposal_from", -1)?;
+    let proposal_layer = if proposal_ref == -1 {
+        built_layers
+            .iter()
+            .rposition(|layer| matches!(layer.kind, LayerKind::ObbYolo(_)))
+            .ok_or_else(|| invalid("requires a preceding [obb_yolo] proposal layer"))?
+    } else {
+        resolve_relative_layer(layer_index, proposal_ref)
+            .map_err(|_| invalid(&format!("invalid proposal_from={proposal_ref}")))?
+    };
+    let proposal = built_layers
+        .get(proposal_layer)
+        .ok_or_else(|| invalid("proposal source does not exist"))?;
+    let LayerKind::ObbYolo(proposal_spec) = &proposal.kind else {
+        return Err(invalid(
+            "proposal_from= must reference a preceding [obb_yolo] layer",
+        ));
+    };
+
+    let classes = section.get_usize("classes", proposal_spec.classes)?;
+    let max_boxes = section.get_usize("max", proposal_spec.max_boxes)?;
+    if classes == 0 || max_boxes == 0 {
+        return Err(invalid("classes and max must be > 0"));
+    }
+    if classes != proposal_spec.classes {
+        return Err(invalid(&format!(
+            "classes={classes} does not match proposal classes={}",
+            proposal_spec.classes
+        )));
+    }
+
+    let proposal_topk_train = section.get_isize("proposal_topk_train", 128)?.max(0) as usize;
+    let proposal_topk_infer = section.get_isize("proposal_topk_infer", 300)?.max(0) as usize;
+    let proposal_jitter = section.get_isize("proposal_jitter", 1)?.max(0) as usize;
+    let sample_grid = section.get_usize("sample_grid", 3)?.max(1);
+    let train_copies = proposal_jitter
+        .checked_add(1)
+        .ok_or_else(|| invalid("proposal_jitter overflows capacity"))?;
+    let minimum_train_capacity = current
+        .batch
+        .checked_mul(max_boxes)
+        .and_then(|capacity| capacity.checked_mul(train_copies))
+        .ok_or_else(|| invalid("default proposal_capacity overflows"))?;
+    let default_capacity = proposal_topk_train
+        .max(proposal_topk_infer)
+        .max(minimum_train_capacity);
+    let proposal_capacity = section.get_usize("proposal_capacity", default_capacity)?;
+    if proposal_capacity == 0 {
+        return Err(invalid("proposal_capacity must be > 0"));
+    }
+    proposal_capacity
+        .checked_mul(5)
+        .ok_or_else(|| invalid("proposal output size overflows"))?;
+    let inputs = sample_grid
+        .checked_mul(sample_grid)
+        .and_then(|samples| samples.checked_mul(feature_shape.channels))
+        .ok_or_else(|| invalid("sample_grid feature count overflows"))?;
+    let _parameter_count = inputs
+        .checked_mul(5)
+        .and_then(|weights| weights.checked_add(5))
+        .ok_or_else(|| invalid("refine parameter count overflows"))?;
+
+    let front_range = section.get_f32("front_range", 1.0)?;
+    if !front_range.is_finite() || front_range <= 0.0 {
+        return Err(invalid("front_range must be finite and > 0"));
+    }
+    let proposal_thresh = section.get_f32("proposal_thresh", 0.01)?;
+    let front_loss_normalizer = section.get_f32("front_loss_normalizer", 1.0)?;
+    let quality_normalizer = section.get_f32("quality_normalizer", 0.0)?;
+    if !proposal_thresh.is_finite()
+        || !front_loss_normalizer.is_finite()
+        || !quality_normalizer.is_finite()
+    {
+        return Err(invalid("proposal and normalization values must be finite"));
+    }
+
+    let representation = section.get_str("representation", "carpn");
+    if !representation.is_empty() && representation != "carpn" {
+        return Err(invalid("only representation=carpn is supported"));
+    }
+    let loss = match section
+        .get_str("loss", "ciou_obb")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "carpn" => ObbRefineLoss::Carpn,
+        "ciou_obb" | "" => ObbRefineLoss::CiouObb,
+        other => {
+            return Err(invalid(&format!(
+                "unsupported loss={other}; expected carpn or ciou_obb"
+            )));
+        }
+    };
+    let csda_topk = section.get_usize("csda_topk", 9)?.max(1);
+    let configured_scales = section.get_f32_list("anchor_scales")?;
+    let anchor_scales = if configured_scales.is_empty() {
+        vec![1.0, 2.0, 4.0]
+    } else {
+        configured_scales
+            .into_iter()
+            .take(3)
+            .map(|scale| if scale > 0.0 { scale } else { 1.0 })
+            .collect()
+    };
+
+    Ok(ObbRefineSpec {
+        feature_layer,
+        proposal_layer,
+        classes,
+        max_boxes,
+        proposal_topk_train,
+        proposal_topk_infer,
+        proposal_jitter,
+        sample_grid,
+        proposal_capacity,
+        inputs,
+        front_range,
+        front_loss_normalizer,
+        quality_normalizer,
+        proposal_thresh,
+        csda_topk,
+        anchor_scales,
+        loss,
+        nms_kind: proposal_spec.nms_kind,
+        beta_nms: proposal_spec.beta_nms,
+    })
 }
 
 fn parse_obb_iou_loss(section: &RawSection) -> Result<(YoloIouLoss, bool, bool)> {
@@ -4904,6 +5124,205 @@ mod tests {
                 "invalid OBB cfg should fail: {cfg}"
             );
         }
+    }
+
+    #[test]
+    fn carpn_refine_cfg_resolves_sources_and_derives_capacity_and_weights() {
+        let network = build(
+            r#"
+                [net]
+                width=4
+                height=4
+                channels=1
+                batch=1
+                obb=1
+
+                [convolutional]
+                filters=8
+                size=1
+                batch_normalize=0
+                activation=linear
+
+                [convolutional]
+                filters=8
+                size=1
+                batch_normalize=0
+                activation=linear
+
+                [obb_yolo]
+                classes=1
+                num=1
+                anchors=4,2
+                max=2
+                nms_kind=diounms
+                beta_nms=1.25
+
+                [obb_refine]
+                proposal_topk_train=3
+                proposal_topk_infer=4
+                proposal_jitter=0
+                sample_grid=2
+            "#,
+        )
+        .expect("valid CARPN refine cfg builds");
+
+        assert_eq!(network.layers[3].kind.name(), "obb_refine");
+        let LayerKind::ObbRefine(spec) = &network.layers[3].kind else {
+            panic!("expected CARPN refine layer");
+        };
+        assert_eq!(spec.feature_layer, 1); // from=-2, independently of proposal source
+        assert_eq!(spec.proposal_layer, 2); // -1 resolves to nearest prior OBB head
+        assert_eq!(spec.classes, 1);
+        assert_eq!(spec.max_boxes, 2);
+        assert_eq!(spec.proposal_topk_train, 3);
+        assert_eq!(spec.proposal_topk_infer, 4);
+        assert_eq!(spec.proposal_jitter, 0);
+        assert_eq!(spec.sample_grid, 2);
+        assert_eq!(spec.proposal_capacity, 4);
+        assert_eq!(spec.inputs, 2 * 2 * 8);
+        assert_eq!(spec.front_range, 1.0);
+        assert_eq!(spec.proposal_thresh, 0.01);
+        assert_eq!(spec.quality_normalizer, 0.0);
+        assert_eq!(spec.anchor_scales, [1.0, 2.0, 4.0]);
+        assert_eq!(spec.nms_kind, ObbNmsKind::Diou);
+        assert_eq!(spec.beta_nms, 1.25);
+        assert_eq!(
+            network.layers[3].output_shape,
+            super::TensorShape::new(4, 1, 5, 1)
+        );
+        let weights = network.layers[3]
+            .weights()
+            .expect("refine layer has weights");
+        assert_eq!(
+            weights
+                .entries
+                .iter()
+                .map(|entry| (entry.array.name(), entry.len))
+                .collect::<Vec<_>>(),
+            [("biases", 5), ("weights", 5 * 2 * 2 * 8)]
+        );
+        assert_eq!(weights.parameter_count(), 5 + 5 * 2 * 2 * 8);
+
+        let absolute = build(
+            r#"
+                [net]
+                width=1
+                height=1
+                channels=1
+                obb=1
+                [convolutional]
+                filters=8
+                size=1
+                batch_normalize=0
+                [convolutional]
+                filters=8
+                size=1
+                batch_normalize=0
+                [obb_yolo]
+                classes=1
+                num=1
+                anchors=1,1
+                [obb_refine]
+                from=0
+                proposal_from=2
+                sample_grid=1
+                proposal_capacity=1
+                anchor_scales=0.5,2,4,8
+            "#,
+        )
+        .expect("absolute source indexes build");
+        let LayerKind::ObbRefine(absolute_spec) = &absolute.layers[3].kind else {
+            panic!("expected CARPN refine layer");
+        };
+        assert_eq!(absolute_spec.feature_layer, 0);
+        assert_eq!(absolute_spec.proposal_layer, 2);
+        assert_eq!(absolute_spec.anchor_scales, [0.5, 2.0, 4.0]);
+    }
+
+    #[test]
+    fn carpn_refine_cfg_rejects_invalid_sources_and_options() {
+        let valid_prefix = r#"
+            [net]
+            width=4
+            height=4
+            channels=1
+            batch=1
+            obb=1
+
+            [convolutional]
+            filters=8
+            size=1
+            batch_normalize=0
+            activation=linear
+
+            [convolutional]
+            filters=8
+            size=1
+            batch_normalize=0
+            activation=linear
+
+            [obb_yolo]
+            classes=1
+            num=1
+            anchors=4,2
+        "#;
+        for options in [
+            "from=-5",
+            "proposal_from=0",
+            "proposal_from=-2",
+            "classes=2",
+            "representation=quad",
+            "loss=unsupported",
+            "front_range=0",
+            "front_range=NaN",
+            "proposal_capacity=0",
+        ] {
+            let cfg = format!("{valid_prefix}\n[obb_refine]\n{options}\n");
+            assert!(
+                build(&cfg).is_err(),
+                "invalid CARPN option accepted: {options}"
+            );
+        }
+
+        let no_proposal = r#"
+            [net]
+            width=4
+            height=4
+            channels=1
+            obb=1
+            [convolutional]
+            filters=8
+            size=1
+            [convolutional]
+            filters=8
+            size=1
+            [obb_refine]
+        "#;
+        assert!(
+            build(no_proposal).is_err(),
+            "a prior OBB proposal head is required"
+        );
+
+        let no_obb_flag = r#"
+            [net]
+            width=4
+            height=4
+            channels=1
+            [convolutional]
+            filters=8
+            size=1
+            [obb_refine]
+        "#;
+        assert!(build(no_obb_flag).is_err(), "[net] obb=1 is required");
+
+        let overflow = format!(
+            "{valid_prefix}\n[obb_yolo]\nmax={}\n[obb_refine]\nproposal_jitter=1\n",
+            usize::MAX
+        );
+        assert!(
+            build(&overflow).is_err(),
+            "default proposal capacity must not overflow"
+        );
     }
 
     #[test]
