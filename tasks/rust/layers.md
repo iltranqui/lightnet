@@ -24,6 +24,32 @@
 
 **Spec:** No separate spec; this document is the spec. Sources to ADAPT (never copy wholesale): C++ on branch `Jev_laya` (`src-lib/`, superset of most layers), `raptor` / `raptor-dev` / `raptor-fp4` / `fog` / `v6-dev-seg` (logistic, regression, segmentation, OBB), `jepa` (swin), `depth_3d` (yolo_3d), `deform`. Read with `git show "branch:path"` (quote it, zsh). Prior art for plan style: `tasks/rust/onnx.md`. State and conventions: `tasks/rust/todo.md` (P5 "CPU-fallback gaps", P8, P9, "C++ parity gap summary"). Per user memory `port-features-adapt-not-replace`: extend the current Rust code in its current style, minimal extras, no wholesale file replacement, no `*_expected` twins; ask before adding optional cfgs/examples (see Open Questions).
 
+## Table of Contents
+
+- [Global Constraints](#global-constraints)
+- [Review Focus](#review-focus)
+- [Findings that correct or refine the research report (spot-checked against the sources)](#findings-that-correct-or-refine-the-research-report-spot-checked-against-the-sources)
+- [Layer Port Contract (the reusable template; later tasks refer to it by letter)](#layer-port-contract-the-reusable-template-later-tasks-refer-to-it-by-letter)
+- [File Structure (Phase 0)](#file-structure-phase-0)
+  - [Task 1: Ten missing elementwise activations (CPU) with exact derivatives](#task-1-ten-missing-elementwise-activations-cpu-with-exact-derivatives)
+  - [Task 2: Unknown activation names are a config error, not identity](#task-2-unknown-activation-names-are-a-config-error-not-identity)
+  - [Task 3: GELU on the GPU (enum, oxide kernel, parity, finite-difference)](#task-3-gelu-on-the-gpu-enum-oxide-kernel-parity-finite-difference)
+  - [Task 4: `maxpool_zero_nonmax` key and `maxpool_depth`](#task-4-maxpool_zero_nonmax-key-and-maxpool_depth)
+  - [Task 5: Standalone `[batchnorm]` can be saved (Rust-only extension, documented)](#task-5-standalone-batchnorm-can-be-saved-rust-only-extension-documented)
+  - [Task 6: `[shortcut]` `weights_type` / `weights_normalization` (CPU, `.weights`, GPU runtime)](#task-6-shortcut-weights_type--weights_normalization-cpu-weights-gpu-runtime)
+  - [Task 7: `[channel_slice]`](#task-7-channel_slice)
+  - [Task 8: `[channel_shuffle]`](#task-8-channel_shuffle)
+  - [Task 9: `[deconvolutional]`](#task-9-deconvolutional)
+  - [Task 10: Dense-truth loss heads: `[cost]` scale, `[logistic]`, `[regression]`](#task-10-dense-truth-loss-heads-cost-scale-logistic-regression)
+  - [Task 11: `[jev_ce]` (soft-target cross-entropy over `groups x candidates`)](#task-11-jev_ce-soft-target-cross-entropy-over-groups-x-candidates)
+  - [Task 12: Bookkeeping and Phase 0 exit check](#task-12-bookkeeping-and-phase-0-exit-check)
+- [Phase 1b — rest of Tier 1 (expand first; all medium)](#phase-1b--rest-of-tier-1-expand-first-all-medium)
+- [Phase 2 — detection heads, MoE/EML/DCNv3, OBB](#phase-2--detection-heads-moeemldcnv3-obb)
+- [Phase 3 — attention family and the rest of the conv family](#phase-3--attention-family-and-the-rest-of-the-conv-family)
+- [Phase 4 — hyperbolic / depth / LAYA backbone / DETR](#phase-4--hyperbolic--depth--laya-backbone--detr)
+- [Consequences for the phase tables](#consequences-for-the-phase-tables)
+  - [Finding: `[dcnv3]` has no reference implementation anywhere in this repo](#finding-dcnv3-has-no-reference-implementation-anywhere-in-this-repo)
+
 ## Global Constraints
 
 - Builds/tests: one cargo command at a time, `-j 2` at most, memory-capped. Host tests ONLY via `./tools/test_host.sh <filter>` (darknet-core + darknet-cli, no GPU; `PKGS=darknet-cuda ./tools/test_host.sh <filter>` for the darknet-cuda crate). GPU tests ONLY via `./tools/test_oxide.sh --test <file> -- <filter>`. Benches via `./tools/bench_oxide.sh`. Never run `cargo` directly, never `-j` above 4, never launch training runs for debugging (static analysis + unit tests + finite differences).
@@ -3236,7 +3262,8 @@ Cross-cutting prerequisites: (1) container layers (moe, eml, recursive_block, cl
 - **kimi_kda** (906 + 687; delta-rule attention + MoE; `biases`, `weights` flat `[report]`) remains open. MiniMax sparse attention is an auxiliary shared utility/config option, not a standalone layer in the audited C++ branch; Rust wires it into ViT, Tucker, and MambaVision, and future attention ports must follow their source config/runtime.
 
 **3B. Conv family** (all L):
-- **deform_conv** (DCNv1/v2; 1654 + 1087): offset conv `[2K]` + optional mask conv `[K]` (sigmoid), bilinear im2col; keys `use_mask`(1), `flipped`, `dot`, `angle`, `grad_centr`, `reverse`, `coordconv`; weights = conv block + `offset_weights/biases` (+ `mask_weights/biases`) `[report]`. **dcnv4** (939 + 1597; `LegoGears_deform` cfg) and **dsconv** (dynamic snake conv; 901 + 714; `extend_scope`, `morph`, templates) and **graph_conv** (1966 + 1619; `graph_edge_mode`, `graph_use_self`; weights include `graph_self_weights`, `graph_edge_kernel/biases`) and **wmhf** (1375 + 548; Haar DWT + EMA scan + IWT, sub-convs; weights order not read) — each gets its own plan after reading its `save_*_weights`.
+- **dcnv4** (`Jev_laya`; `LegoGears_deform` cfg) is integrated in v0.0.273: strict aliases/config/shape, source-order weights, seeded init, CPU grouped deformable sampling and exact backward (including coarse `d_stride` interpolation), BN, SGD/Adam and optimizer-state persistence, plus GPU f32 host fallback. `MEM=3G ./tools/test_host.sh dcnv4`, `weights`, and `runtime` and the targeted `oxide_runtime_chain` fallback test passed; counts were not retained. No native kernel or compiled-C++ golden/parity.
+- **deform_conv** (DCNv1/v2; 1654 + 1087): offset conv `[2K]` + optional mask conv `[K]` (sigmoid), bilinear im2col; keys `use_mask`(1), `flipped`, `dot`, `angle`, `grad_centr`, `reverse`, `coordconv`; weights = conv block + `offset_weights/biases` (+ `mask_weights/biases`) `[report]`. **dsconv** (dynamic snake conv; 901 + 714; `extend_scope`, `morph`, templates), **graph_conv** (1966 + 1619; `graph_edge_mode`, `graph_use_self`; weights include `graph_self_weights`, `graph_edge_kernel/biases`), and **wmhf** (1375 + 548; Haar DWT + EMA scan + IWT, sub-convs; weights order not read) — each gets its own plan after reading its `save_*_weights`.
 - **clifford** (3554 LOC total, XL) and **recursive_block** (3417, XL; body sections, `ouroboros` 0/1/2, conv-LoRA, lattice projection). **Unverified C++ suspicion:** `recursive_block` saves only the body weights for `ouroboros > 0` (`weights.cpp:859-876` shows loops over body layers: conv / connected); confirm before defining the Rust layout. Both are containers: need nested-layer parsing (body sections are consumed by a pre-pass in `darknet_cfg.cpp`), which has no Rust analogue yet.
 
 ## Phase 4 — hyperbolic / depth / LAYA backbone / DETR
@@ -3302,7 +3329,7 @@ genuine *evidence* gaps rather than questions for the user:
 | 2B `dcnv3` | **no reference numerics** | see the finding below - all five branches that carry it have a stub forward/backward/update, so it cannot be a verified port |
 | 2C OBB family | - | unblocked by decision 4; XL, and it also changes data loading, NMS and mAP |
 | 3A transformer family | - | unblocked by decisions 3 and 7; needs the shared kernel set (LayerNorm fwd/bwd, batched GEMM, row-softmax backward, residual/bias epilogues) built once first |
-| 3B conv family | - | `dcnv4` has a real C++ forward; `deform_conv`, `dsconv`, `graph_conv`, `wmhf`, `clifford`, `recursive_block` still to go |
+| 3B conv family | - | `dcnv4` integrated in v0.0.273; `deform_conv`, `dsconv`, `graph_conv`, `wmhf`, `clifford`, `recursive_block` still to go |
 | 4 foveation / depth / LAYA / DETR | - | unblocked by decision 2; DETR is still broken in C++, so its reference is the paper, like `dcnv3` |
 
 ### Finding: `[dcnv3]` has no reference implementation anywhere in this repo
@@ -3314,8 +3341,9 @@ Verified 2026-10-04 on `deform`, `Jev_laya`, `fog`, `jepa` and `depth_3d`:
 "1. No CPU implementation yet").  The plan's "[verified]" weights order
 (`save_dcnv3_weights`, confirmed correct) is the only part that can be ported
 against C++; the numerics would have to come from the InternImage reference
-instead, which is a different contract.  `[dcnv4]` (Phase 3B) is the tractable
-deformable target instead: its CPU forward and GPU kernels are real.
+instead, which is a different contract. `[dcnv4]` (Phase 3B) was the tractable
+deformable target and is now integrated in Rust with a CPU reference and GPU
+f32 host fallback; this does not establish compiled-C++ parity.
 
 # Self-review (writing-plans checklist, run against this document)
 

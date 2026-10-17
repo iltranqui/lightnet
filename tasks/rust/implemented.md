@@ -49,6 +49,7 @@ file is named inline.
 - [14. ONNX export](#14-onnx-export)
 - [15. CARPN sample-level polygon mAP dispatch](#15-carpn-sample-level-polygon-map-dispatch)
 - [16. CARPN CPU network inference and direct mAP](#16-carpn-cpu-network-inference-and-direct-map)
+- [17. DCNv4 CPU reference and GPU f32 host fallback](#17-dcnv4-cpu-reference-and-gpu-f32-host-fallback)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -755,6 +756,11 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 - v0.0.259 (`29889c5c`): added `[obb_refine]` CPU inference, Stage-2 quadrilateral decoding/NMS, full-forward OBB validation with explicit polygon mAP, `detect-image` integration, and a cfg/weights-backed direct `detector map` route. Generated fixtures verify AP/report counts, a same-AABB/wrong-polygon case (AABB AP 1.0 versus polygon AP 0.0 at IoU 0.6), and required front-point labels even with zero proposals. CARPN `detector train` including `-map` rejects before training because Stage-2 assignment/loss/backward/update support is not implemented. Legacy OBB behavior is preserved (`MEM=3G ./tools/test_host.sh obb_`: 138 core + 4 CLI tests).
 - Focused evidence: `carpn_refine_cfg` (2), `carpn_refine_weights` (1), `carpn_refine_forward` (3), `carpn_proposals_apply` (1), `carpn_refine_decode` (5), `carpn_map` (6), `carpn_cli` (1), `detect_image_routes_carpn` (1), and `detector_train_rejects_carpn` (1) all passed through `MEM=3G ./tools/test_host.sh`. `systemd-run --user --scope -p MemoryHigh=3G cargo build -p darknet-cli -j 4`, targeted `rustfmt --check`, and `git diff --check` passed. Workspace-wide `cargo fmt --check` reports pre-existing formatting differences in unrelated ONNX/CUDA files; those were not reformatted. No full cfg-corpus run was required.
 - Source behavior is hand-derived from `raptor`; there is no compiled-C++ oracle or canonical CARPN cfg/weights/dataset, so no compiled-C++ parity or canonical-dataset result is claimed. GPU CARPN inference and CARPN training/scheduled `detector train -map` remain deferred.
+
+## 17. DCNv4 CPU reference and GPU f32 host fallback
+
+- v0.0.273 (`cb96aa49`): integrated strict `[dcnv4]` / `[dcnv4_convolutional]` config and shape support, C++ source-order `.weights`, deterministic initialization, grouped deformable sampling, coarse `d_stride` offset projection and interpolation, optional softmax masks/center removal, and the exact derivative of the Rust forward. Runtime support includes bias/BN/activation, SGD and Adam, persisted optimizer state, and GPU f32 execution through the host fallback. Compatibility dummy weights serialize but are never differentiated or updated; offsets use the source-derived 0.01 learning-rate scale.
+- Verification: `MEM=3G ./tools/test_host.sh dcnv4`, `weights`, and `runtime` passed; the targeted `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_f32_host_fallback_matches_cpu_chain_and_updates` passed. Output counts were not retained. Tests cover hand-computed sampling/grouping/masks, finite differences for input and offset parameters across standard and coarse-stride cases, BN/optimizer behavior, exact-length BN/non-BN weight round trips, and CPU/FakeBackend/Oxide host-fallback parity. Targeted Rustfmt and `git diff --check` passed. No training was run, no native Oxide kernel was added, and no compiled-C++ golden/parity is claimed.
 
 ## Not implemented / open (pointer)
 

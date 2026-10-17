@@ -44,6 +44,7 @@ primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
 Latest increments:
+- v0.0.273 (`cb96aa49`): integrated `[dcnv4]` / `[dcnv4_convolutional]` with strict config/shape handling, source-order weights, seeded initialization, CPU reference forward and exact backward, BN, SGD/Adam with optimizer-state persistence, and GPU f32 host fallback. The focused `dcnv4`, `weights`, and `runtime` host filters and the targeted `oxide_runtime_chain` host-fallback test passed (test counts were not retained in the audit output). Coverage includes finite differences for input/offset projection, BN/optimizer behavior, exact-size round trips, and CPU/FakeBackend/Oxide runtime paths. No native kernel, training run, or compiled-C++ golden/parity.
 - v0.0.271: integrated the source-derived MambaVision reference path: strict cfg/shape handling, explicit per-layer recurrent-state API, exact CPU forward/backward, seeded initialization, SGD/Adam, source-order `.weights`, optimizer-state persistence, and GPU f32 host fallback. `MEM=3G ./tools/test_host.sh mambavision` passed 16 tests, `runtime` 171, and `weights` 33; coverage includes input/all-parameter/state finite differences, causal convolution, MSA clipping, initialization bounds, optimizer decay/persistence, serialization, and FakeBackend parity. No native MambaVision kernel or compiled-C++ golden/parity.
 - v0.0.272 (`3d7202bf`): integrated source-derived Kimi KDA cfg/model support, exact CPU scan/MoE forward/backward including load-balance cost, seeded initialization, SGD/Adam with optimizer-state persistence, source-order weights, and GPU f32 host fallback. `MEM=3G ./tools/test_host.sh kimi_kda` passed 10 tests, `runtime` 173, and `weights` 34. Coverage includes hand math, input/all-parameter finite differences, norm-floor and top-k branches, serialization, initialization, and FakeBackend parity. No native kernel or compiled-C++ golden/parity.
 - v0.0.270 (`ecd4e54e`): added source-derived Tucker local attention with strict cfg aliases/defaults, rank and MSA parsing, zero-padded window forward and exact backward, seeded initialization, SGD/Adam, `.weights` save/load, and GPU f32 host fallback. `MEM=3G ./tools/test_host.sh tucker_attention` passed 14 tests, `weights` 32, and `runtime` 168; coverage includes finite differences for all factor blocks/input/Tanh/MSA, a hand-computed 2×2 window, multi-head math, legacy-header round trip, and FakeBackend CPU forward/backward/update parity. MiniMax sparse attention is a shared option rather than a standalone layer in the audited C++ branch; it is wired for ViT and Tucker. No native Tucker kernel or compiled-C++ golden/parity.
@@ -684,8 +685,9 @@ believing a `cfg_corpus` failure.
    training support; BN backward and SGD/Adam updates use backend ops. Then
    port `eml_convolutional` (an activation, not a `LayerKind`; save order **re-read
    2026-10-05**: `input_layer` then `self_layer`, two full conv blocks).
-5. Phase 3B deformable family — start with `dcnv4` (real C++ forward and
-   kernels; weights order `weights.cpp:428`).
+5. Phase 3B deformable family — `dcnv4` is integrated in v0.0.273; remaining
+   work starts with `deform_conv`, then `dsconv`, `graph_conv`, `wmhf`,
+   `clifford`, and `recursive_block`.
 6. Phase 2C OBB, then Phase 4.
 
 ## Known evidence gaps (not user questions)
