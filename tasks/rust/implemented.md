@@ -63,6 +63,7 @@ file is named inline.
 - [28. Stage-1 axis/layout audit (bounded A1 list)](#28-stage-1-axislayout-audit-bounded-a1-list)
 - [29. Stage-1 axis/layout audit of already-ported layers](#29-stage-1-axislayout-audit-of-already-ported-layers)
 - [30. DPT-head Stage-1 CPU reference](#30-dpt-head-stage-1-cpu-reference)
+- [38. YOLO-3D configuration preparation (not a layer port)](#38-yolo-3d-configuration-preparation-not-a-layer-port)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -920,6 +921,15 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 - Weight parsing remains in `darknet-rs`: `load_weights_file` for inference and `weights-inspect` for a header report. The GUI process never parses `.weights`; it starts `detect-server`, which loads them and reports mismatches as errors.
 - Verification: `darknet-gui-project` 38 tests, `darknet-gui-engine` 4, offline builds of the GUI and CLI.
 - Evidence boundary: mapped actions for features not yet built (mass-delete, homography, merge, heatmaps, screenshots, tiling, jump, delete-image) report "mapped but not implemented" instead of silently doing nothing. Parity is with the DarkMark source, not a running DarkMark.
+
+## 38. YOLO-3D configuration preparation (not a layer port)
+
+- v0.1.024 (`4506e46e`): added `model/yolo_3d_config.rs`, re-exported through `model.rs`, with `Yolo3dSpec`, `Yolo3dGeometrySpec`, `Yolo3dVertexLoss`, `from_section`, checked anchor-entry arithmetic and identity-shape validation. Defaults/keys were checked directly against `depth_3d` at `9c9e0b4b5e0836330a70a0667fd9e161bd1aac1a`, `src-lib/darknet_cfg.cpp:2556-2697` and `yolo_3d.cpp:1275-1394`.
+- Verification: test-first compile failed with E0432/E0425 for the missing types; final `MEM=3G ./tools/test_host.sh yolo_3d_cfg` passed **12 core tests**, and `MEM=3G ./tools/test_host.sh model::` passed **88 core tests**. Both used user systemd `MemoryHigh=3G` scopes and `-j 2`; CLI/integration targets compiled but matched zero tests. Targeted edition-2024 Rustfmt checks and `git diff --check` passed. No training, Oxide, corpus or full-host run.
+- Scope audit: `defaults_match_source` and `retains_projected_and_loader_overrides` pin defaults/overrides; `aliases_follow_existing_section_normalization` covers all four aliases and the existing Rust case-folding convention; `projected_channels_and_identity_shape` pins `A*(5+C+3*K)` with B=2 and a 3x5 grid, but is **not** an A2 numeric axis/decode test. Unknown-key, invalid-value, nonfinite, array, overflow and staged-feature tests cover explicit failure boundaries. `truth_intrinsics_and_projected_options_are_not_staged_out` proves focal/winding/OKS config is accepted; it does not prove truth encoding or losses.
+- Deliberate strictness: finite/range checks, unique masks, exact `2*num` anchors and three edge weights, and bounded source-int storage reject inputs C++ may ignore or default. Zero loss normalizers still disable terms. `map_file`, counters and loader/NMS options are retained metadata only; class-map loading and class-multiplier conversion await network integration.
+- **Still open:** `LayerKind`/network parse and shape dispatch, mixed-head/depth-reference validation, axis-pin registration, labels/truth encoding, forward/backward, loss/decode/evaluator, checkpoint/optimizer proof and CLI/GPU guards. Network construction still rejects this layer (pinned by `preparation_does_not_enable_incomplete_runtime`). This is only the helper portion of plan Step 1; that step and the layer DoD remain incomplete. Depth/metric nondefault config is explicitly rejected pending the second CPU increment.
+- Evidence boundary: hand-derived from source, no compiled-C++ golden. GPU status: none. DSConv multi-template, remaining CPU/axis work, all Stage-2 native GPU/GPU Muon and Stage-3 sparse MoE requirements remain open. The known full-host/corpus baseline remains non-green/unverified.
 
 ## Not implemented / open (pointer)
 

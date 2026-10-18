@@ -440,6 +440,8 @@ Immediately next, in dependency order:
 - [x] `foveation_film_plan.md` — source-derived Stage-1 CPU support and focused verification completed in v0.1.009; no compiled-C++ golden/parity. Native GPU is Stage 2.
 - [x] `depth_anything_plan.md` — source-derived Stage-1 CPU support and focused verification completed in v0.1.010; no compiled-C++ golden/parity. Native GPU is Stage 2.
 - [x] `dpt_head_plan.md` — source-derived Stage-1 CPU support and focused verification completed in v0.1.013; no compiled-C++ golden/parity. Native GPU and GPU Muon remain Stage 2; `[yolo_3d]` remains separate.
+- [x] `[yolo_3d]` config-helper preparation only — v0.1.024: strict source-backed spec/parser and checked shape helpers; 12 `yolo_3d_cfg` and 88 `model::` tests passed under 3G scopes. See `implemented.md` §38; hand-derived from source, no compiled-C++ golden.
+- [ ] `yolo_3d_plan.md` — accepted source transcription/plan exists; finish Step 1 network/enum integration, then labels/truth, loss, runtime/backward, decode/evaluation, optimizer/checkpoint and rejection guards, and the depth/metric CPU increment. Config helpers do not enable the layer. Native GPU remains Stage 2.
 - [x] `muon_plan.md` — Stage-1 CPU hybrid Muon implementation and focused verification completed in v0.1.005. GPU Muon remains Stage 2; no compiled-C++ golden/parity.
 - [ ] `gui_plan.md` — egui DarkMark replacement (M0–M6, not started).
 
