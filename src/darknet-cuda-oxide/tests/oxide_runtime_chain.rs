@@ -2484,7 +2484,7 @@ fn eml_adam_updates_both_device_branches_with_deferred_sync() {
 }
 
 #[test]
-fn dcnv4_f32_host_fallback_matches_cpu_chain_and_updates() {
+fn dcnv4_bn_native_f32_matches_cpu_chain_and_updates() {
     let net = network(
         "[net]\nwidth=4\nheight=4\nchannels=1\nbatch=1\n\
          [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
@@ -2503,6 +2503,12 @@ fn dcnv4_f32_host_fallback_matches_cpu_chain_and_updates() {
     params.offset_biases[0] = 0.13;
     params.offset_biases[1] = 0.19;
     params.offset_biases[2] = 0.8;
+    params.biases.fill(7.0);
+    let bn = params.batch_norm.as_mut().unwrap();
+    bn.biases.fill(9.0);
+    bn.scales.copy_from_slice(&[1.1, -0.7]);
+    bn.rolling_mean.copy_from_slice(&[0.2, -0.1]);
+    bn.rolling_variance.copy_from_slice(&[0.7, 1.3]);
 
     let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("Oxide backend"));
     gpu.params = cpu.params.clone();
@@ -2511,7 +2517,7 @@ fn dcnv4_f32_host_fallback_matches_cpu_chain_and_updates() {
     let cpu_forward = cpu.forward_training(&input).expect("CPU DCNv4 forward");
     let oxide_forward = gpu
         .forward_training_with_state(&input)
-        .expect("Oxide DCNv4 host-fallback forward");
+        .expect("Oxide DCNv4 native BN forward");
     for (index, (cpu_output, oxide_output)) in cpu_forward
         .layer_outputs
         .iter()
@@ -2519,7 +2525,7 @@ fn dcnv4_f32_host_fallback_matches_cpu_chain_and_updates() {
         .enumerate()
     {
         close(
-            &format!("DCNv4 host fallback layer {index}"),
+            &format!("DCNv4 native BN layer {index}"),
             &cpu_output.data,
             &oxide_output.data,
             2e-4,
@@ -2529,8 +2535,10 @@ fn dcnv4_f32_host_fallback_matches_cpu_chain_and_updates() {
     let seed = Tensor::filled(cpu.network.layers[1].output_shape, 0.17);
     assert!(
         cpu.backward(&input, &oxide_forward.cpu_forward, &seed)
-            .is_ok(),
-        "BN variant must retain CPU cache"
+            .unwrap_err()
+            .to_string()
+            .contains("missing [dcnv4] forward cache"),
+        "BN must use native math now"
     );
     let mut seeds = vec![None; cpu.network.layers.len()];
     seeds[1] = Some(seed);
@@ -2540,11 +2548,11 @@ fn dcnv4_f32_host_fallback_matches_cpu_chain_and_updates() {
     cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
         .expect("CPU DCNv4 backward");
     gpu.backward_accumulate_seeded_gpu(&oxide_forward, &seeds)
-        .expect("Oxide DCNv4 host-fallback backward");
+        .expect("Oxide DCNv4 native BN backward");
     let before = cpu.params.clone();
     cpu.update_weights(1e-3, 0.0, 0.0, 1);
     gpu.update_weights_gpu(1e-3, 0.0, 0.0, 1)
-        .expect("Oxide DCNv4 host-fallback update");
+        .expect("Oxide DCNv4 native BN update");
 
     let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(oxide_conv)) =
         (&cpu.params[0], &gpu.params[0])
@@ -2581,6 +2589,25 @@ fn dcnv4_f32_host_fallback_matches_cpu_chain_and_updates() {
         5e-4,
     );
     assert_ne!(old.offset_weights, cpu_dcn.offset_weights);
+    let cb = cpu_dcn.batch_norm.as_ref().unwrap();
+    let gb = oxide_dcn.batch_norm.as_ref().unwrap();
+    close("DCNv4 BN gamma", &cb.scales, &gb.scales, 3e-5);
+    close(
+        "DCNv4 BN rolling mean",
+        &cb.rolling_mean,
+        &gb.rolling_mean,
+        3e-5,
+    );
+    close(
+        "DCNv4 BN rolling variance",
+        &cb.rolling_variance,
+        &gb.rolling_variance,
+        3e-5,
+    );
+    assert_eq!(old.biases, cpu_dcn.biases);
+    assert_eq!(old.biases, oxide_dcn.biases);
+    assert_eq!(cb.biases, vec![9.0; 2]);
+    assert_eq!(gb.biases, cb.biases);
     assert_eq!(old.dummy_weights, cpu_dcn.dummy_weights);
     assert_eq!(cpu_dcn.dummy_weights, oxide_dcn.dummy_weights);
 }
@@ -2589,7 +2616,7 @@ fn dcnv4_f32_host_fallback_matches_cpu_chain_and_updates() {
 fn dcnv4_mixed_network_retains_cpu_cache_and_backward() {
     let net = network(
         "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=1\n\
-        [dcnv4]\nsize=1\npadding=0\nd_stride=2\nsoftmax=0\nactivation=linear\n\
+        [dcnv4]\nsize=1\npadding=0\nd_stride=2\nsoftmax=0\nbatch_normalize=1\nactivation=linear\n\
         [deconvolutional]\nfilters=1\nsize=1\nstride=1\nactivation=linear\n",
     );
     let mut cpu = ExecutableNetwork::new(net.clone());
@@ -2613,14 +2640,15 @@ fn dcnv4_mixed_network_retains_cpu_cache_and_backward() {
 
 #[test]
 fn dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu() {
+    for batch_normalize in [false, true] {
     for adam in [false, true] {
         for (softmax, remove_center, activation) in [(1, 1, "swish"), (0, 0, "leaky")] {
             let net = network(&format!(
                 "[net]\nwidth=5\nheight=3\nchannels=2\nbatch=2\ntry_fix_nan=0\nadam={}\ndecay=0.01\n\
                  [convolutional]\nfilters=4\nsize=1\nactivation=linear\n\
                  [dcnv4]\nsize=3\npadding=2\ndilation=2\ngroups=2\nd_stride=2\n\
-                 softmax={softmax}\nremove_center={remove_center}\noffset_scale=0.75\nactivation={activation}\n",
-                u8::from(adam)
+                 softmax={softmax}\nremove_center={remove_center}\noffset_scale=0.75\nactivation={activation}\nbatch_normalize={}\n",
+                u8::from(adam), u8::from(batch_normalize)
             ));
             let mut cpu = ExecutableNetwork::new(net.clone());
             fill_params(&mut cpu.params);
@@ -2634,6 +2662,13 @@ fn dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu() {
                 *b = 0.43 + (i % 5) as f32 * 0.03;
             }
             p.biases.copy_from_slice(&[0.03, -0.02, 0.05, -0.01]);
+            if let Some(bn) = &mut p.batch_norm {
+                p.biases.fill(7.0);
+                bn.biases.fill(9.0);
+                bn.scales.copy_from_slice(&[0.0,0.9,-1.2,0.6]);
+                bn.rolling_mean.copy_from_slice(&[0.2,-0.1,0.3,-0.2]);
+                bn.rolling_variance.copy_from_slice(&[0.7,1.3,0.6,1.2]);
+            }
             let initial = cpu.params.clone();
             let mut gpu = GpuExecutableNetwork::new(
                 net,
@@ -2725,13 +2760,17 @@ fn dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu() {
                 else {
                     unreachable!()
                 };
-                compare(
-                    "DCNv4 output biases",
-                    &c.biases,
-                    &g.biases,
-                    &bc.biases,
-                    &bg.biases,
-                );
+                if let (Some(cbn),Some(gbn),Some(bcbn),Some(bgbn)) =
+                    (&c.batch_norm,&g.batch_norm,&bc.batch_norm,&bg.batch_norm) {
+                    compare("DCNv4 gamma",&cbn.scales,&gbn.scales,&bcbn.scales,&bgbn.scales);
+                    close("DCNv4 rolling mean",&cbn.rolling_mean,&gbn.rolling_mean,3e-5);
+                    close("DCNv4 rolling variance",&cbn.rolling_variance,&gbn.rolling_variance,3e-5);
+                    assert_eq!(cbn.biases,gbn.biases);
+                    assert_eq!(cbn.biases,vec![9.0;4]);
+                    assert_eq!(c.biases,bc.biases); assert_eq!(g.biases,bg.biases);
+                } else {
+                    compare("DCNv4 output biases",&c.biases,&g.biases,&bc.biases,&bg.biases);
+                }
                 compare(
                     "DCNv4 offset weights",
                     &c.offset_weights,
@@ -2753,6 +2792,7 @@ fn dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu() {
                 assert_eq!(g.dummy_weights, old.dummy_weights);
             }
         }
+    }
     }
 }
 

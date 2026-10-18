@@ -16319,6 +16319,7 @@ where
         }
 
         self.update_gpu_convolution_batch_norm_running_stats_from_forward(forward)?;
+        self.update_dcnv4_rolling_stats_gpu(forward)?;
         if self.network.layers.iter().any(|layer| {
             matches!(&layer.kind, LayerKind::Rnn(spec) if spec.batch_normalize)
                 || matches!(&layer.kind, LayerKind::Lstm(spec) if spec.batch_normalize)
@@ -32503,7 +32504,7 @@ num_dwconv=1
     }
 
     #[test]
-    fn dcnv4_batchnorm_scale_derivative_and_rolling_stats_use_host_fallback() {
+    fn dcnv4_batchnorm_scale_derivative_and_rolling_stats_use_native_defaults() {
         let network = Network::from_config(
             ConfigFile::parse_str(
                 "dcnv4-bn-runtime.cfg",
@@ -32527,6 +32528,7 @@ num_dwconv=1
 
         let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
         gpu.params = cpu.params.clone();
+        assert!(!gpu.requires_cpu_backward_fallback());
         let input =
             Tensor::from_data(TensorShape::new(2, 2, 1, 1), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let cpu_forward = cpu.forward_training(&input).unwrap();
