@@ -19,6 +19,8 @@
 
 pub(crate) mod activation_math;
 pub mod augmentation;
+#[cfg(test)]
+pub(crate) mod axis_fixture;
 pub use augmentation::DetectorAugmentation;
 pub mod carpn;
 pub mod centernet;

@@ -1778,6 +1778,192 @@ impl LayerKind {
     }
 }
 
+/// Axis-coverage decision for one [`LayerKind`] variant.
+///
+/// Every variant must record one: a named `*axis_layout*` test, an explicit
+/// open gap with an owner, or a note that the layer has no C++ counterpart.
+/// The [`LayerKind::axis_pin`] match is exhaustive, so adding a variant fails
+/// the build until it is classified here and in `tasks/rust/axis-coverage.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AxisPin {
+    /// A named `*axis_layout*` test pins this layer's axes.
+    Pinned(&'static str),
+    /// C++ defines the axes but no pin exists yet; value names the tier.
+    Open(&'static str),
+    /// No C++ counterpart; a pin would document Rust's own contract.
+    RustOnly(&'static str),
+}
+
+impl AxisPin {
+    /// Short label for reports and the coverage test.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::Pinned(_) => "pinned",
+            Self::Open(_) => "open",
+            Self::RustOnly(_) => "rust-only",
+        }
+    }
+
+    /// The test name, tier/owner, or reason carried by this decision.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::Pinned(name) => name,
+            Self::Open(owner) => owner,
+            Self::RustOnly(reason) => reason,
+        }
+    }
+}
+
+/// One axis decision per [`LayerKind`] variant, in declaration order, plus the
+/// trailing `Unsupported` variant.
+///
+/// Keep this in sync with `tasks/rust/axis-coverage.md`; that file owns the
+/// evidence, this table is what the test checks.
+pub const AXIS_PINS: &[AxisPin] = &[
+    AxisPin::Open("Tier 1: nested-body geometry and per-pass lattice"),
+    AxisPin::Open("Tier 4: FiLM parameter block to channel mapping"),
+    AxisPin::Open("Tier 4: warp samples (x,y) from (w,h)"),
+    AxisPin::Open("Tier 1: dilated output extent (finding F1)"),
+    AxisPin::Pinned("deconvolutional_axis_layout_maps_input_channels_to_filters_and_batch"),
+    AxisPin::Open("Tier 1: [out][in] weight rows per batch sample"),
+    AxisPin::Open("Tier 1: maxpool_depth and maxpool_zero_nonmax layouts"),
+    AxisPin::Open("Tier 1: window geometry for non-square input"),
+    AxisPin::Open("Tier 1: global H*W reduction per channel, not per sample"),
+    AxisPin::Open("Tier 1: groups split, relative index, concat order"),
+    AxisPin::Pinned("shortcut_axis_layout_uses_nchw_channel_slots_per_batch"),
+    AxisPin::Open("Tier 1: per-axis stride and reverse/downsample"),
+    AxisPin::Open("Tier 2: anchor, entry and cell (y,x) layout"),
+    AxisPin::Open("Tier 2: raptor six-coordinate per-entry order"),
+    AxisPin::Open("Tier 2: proposal row to output row mapping"),
+    AxisPin::Open("Tier 2: mean/variance channel placement"),
+    AxisPin::Open("Tier 2: identity passthrough only; decode unimplemented"),
+    AxisPin::Open("Tier 1: reorg (c,h,w) to (c*s*s,h/s,w/s) order"),
+    AxisPin::Pinned("slice_axis_layout_preserves_batch_channel_and_spatial_order"),
+    AxisPin::Open("Tier 1: group interleave order"),
+    AxisPin::Open("Tier 1: per-group channel reduction"),
+    AxisPin::Open("Tier 1: masked/smooth reduction axis and scale"),
+    AxisPin::Open("Tier 2: raptor logistic_layer.cpp row mapping"),
+    AxisPin::Open("Tier 2: fog regression_layer.cpp target layout"),
+    AxisPin::Open("Tier 2: groups x candidates axis order"),
+    AxisPin::Open("Tier 2: per-pixel channel softmax and mask index"),
+    AxisPin::Open("Tier 2: observable-matrix axis order"),
+    AxisPin::Open("Tier 1: per-sample mask, no shared mask across batch"),
+    AxisPin::Open("Tier 1: broadcast vs crop/pad slot math"),
+    AxisPin::Open("Tier 1: element-wise multiply over C*H*W"),
+    AxisPin::Open("Tier 2: per-sample class rows"),
+    AxisPin::Open("Tier 2: modern head class/obj/box channel split"),
+    AxisPin::Open("Tier 2: DFL bin axis"),
+    AxisPin::Open("Tier 2: per-level channel layout"),
+    AxisPin::Open("Tier 2: heatmap (y,x) not (x,y)"),
+    AxisPin::Pinned("scorer_axis_layout_keeps_batches_channels_and_options_independent"),
+    AxisPin::Pinned("marker_gather_axis_layout_uses_sample_specific_positions"),
+    AxisPin::Pinned("act_head_axis_layout_is_batch_major_over_the_two_layer_mlp"),
+    AxisPin::Pinned("loss_axis_layout_excludes_padding_rows_from_batch_mean"),
+    AxisPin::Pinned("encoder_axis_layout_keeps_batch_and_token_rows_independent"),
+    AxisPin::Pinned("head_axis_layout_preserves_batch_sequence_and_qtype_channels"),
+    AxisPin::Open("Tier 4: DINOv2 patch token order"),
+    AxisPin::Pinned(
+        "dpt_head_axis_layout_batched_nchw_forward_matches_independent_non_square_samples",
+    ),
+    AxisPin::Pinned("patchify_axis_layout_keeps_channel_fastest_order_across_batches"),
+    AxisPin::Pinned("window_partition_axis_layout_is_batch_major_raster_then_channel"),
+    AxisPin::Pinned("axis_layout_keeps_batch_window_token_and_channel_axes_independent"),
+    AxisPin::Pinned("axis_layout_maps_nchw_rows_and_scan_state_per_batch"),
+    AxisPin::Pinned("axis_layout_keeps_nchw_raster_scans_independent_per_batch"),
+    AxisPin::Pinned("cpu_moe_convolutional_axis_layout_keeps_router_and_blend_per_batch"),
+    AxisPin::Pinned("eml_convolutional_axis_layout_preserves_batch_channel_and_spatial_order"),
+    AxisPin::Open("Tier 4: neighbor index order and group split"),
+    AxisPin::Pinned("offset_axis_layout_reads_dx_then_dy_and_keeps_batches_nchw"),
+    AxisPin::Open("Tier 4: offset (dy,dx) channel order"),
+    AxisPin::Open("Tier 4: snake offset axis and morph branch split"),
+    AxisPin::Open("Tier 4: wavelet sub-band split order"),
+    AxisPin::Open("Tier 4: Clifford block order and spatial axis"),
+    AxisPin::Open("Tier 3: per-sample state and step axis"),
+    AxisPin::RustOnly("not in any ELayerType; pin Rust gate/state order"),
+    AxisPin::Open("Tier 3: gate block order f,i,g,o"),
+    AxisPin::Open("Tier 3: conv stage then flatten per step"),
+    AxisPin::RustOnly("GPU-only crop_layer_kernels.cu; no CPU layer"),
+    AxisPin::RustOnly("batchnorm_layer.cpp exists but has no ELayerType"),
+    AxisPin::RustOnly("no C++ layer type"),
+    AxisPin::RustOnly("no C++ layer type; identity passthrough"),
+    AxisPin::RustOnly("not a layer: configs fail in infer_output_shape"),
+];
+
+impl LayerKind {
+    /// This variant's axis-coverage decision. The match is exhaustive on
+    /// purpose: a new variant cannot be added without deciding its axis pin.
+    pub(crate) fn axis_pin(&self) -> AxisPin {
+        let index = match self {
+            Self::RecursiveBlock(_) => 0,
+            Self::FoveationFilm(_) => 1,
+            Self::HyperbolicFoveation(_) => 2,
+            Self::Convolutional(_) => 3,
+            Self::Deconvolutional(_) => 4,
+            Self::Connected(_) => 5,
+            Self::MaxPool(_) => 6,
+            Self::LocalAvgPool(_) => 7,
+            Self::AvgPool => 8,
+            Self::Route(_) => 9,
+            Self::Shortcut(_) => 10,
+            Self::Upsample(_) => 11,
+            Self::Yolo(_) => 12,
+            Self::ObbYolo(_) => 13,
+            Self::ObbRefine(_) => 14,
+            Self::GaussianYolo(_) => 15,
+            Self::Region(_) => 16,
+            Self::Reorg(_) => 17,
+            Self::ChannelSlice(_) => 18,
+            Self::ChannelShuffle(_) => 19,
+            Self::Softmax { .. } => 20,
+            Self::Cost { .. } => 21,
+            Self::Logistic => 22,
+            Self::Regression(_) => 23,
+            Self::JevCe(_) => 24,
+            Self::Segmentation(_) => 25,
+            Self::OmdLoss(_) => 26,
+            Self::Dropout { .. } => 27,
+            Self::ScaleChannels(_) => 28,
+            Self::Sam(_) => 29,
+            Self::Contrastive(_) => 30,
+            Self::Yolox(_) => 31,
+            Self::Ppyoloe(_) => 32,
+            Self::Yolonas(_) => 33,
+            Self::CenterNet(_) => 34,
+            Self::LayaScorer(_) => 35,
+            Self::LayaMarkerGather(_) => 36,
+            Self::LayaActHead(_) => 37,
+            Self::LayaLoss(_) => 38,
+            Self::LayaEncoder(_) => 39,
+            Self::LayaHead(_) => 40,
+            Self::DepthAnything(_) => 41,
+            Self::DptHead(_) => 42,
+            Self::Vit(_) => 43,
+            Self::Swin(_) => 44,
+            Self::TuckerAttention(_) => 45,
+            Self::MambaVision(_) => 46,
+            Self::KimiKda(_) => 47,
+            Self::Moe(_) => 48,
+            Self::EmlConvolutional(_) => 49,
+            Self::GraphConv(_) => 50,
+            Self::Dcnv4(_) => 51,
+            Self::DeformConv(_) => 52,
+            Self::DsConv(_) => 53,
+            Self::Wmhf(_) => 54,
+            Self::Clifford(_) => 55,
+            Self::Rnn(_) => 56,
+            Self::Gru(_) => 57,
+            Self::Lstm(_) => 58,
+            Self::Crnn(_) => 59,
+            Self::Crop(_) => 60,
+            Self::BatchNorm(_) => 61,
+            Self::Local(_) => 62,
+            Self::Detection(_) => 63,
+            Self::Unsupported(_) => 64,
+        };
+        AXIS_PINS[index]
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WeightsArray {
     Biases,
@@ -8509,9 +8695,9 @@ mod tests {
     use crate::cfg::ConfigFile;
 
     use super::{
-        CliffordContextMode, CliffordGffnMode, CliffordGlobalOp, CliffordHigherMode,
-        CliffordInteractionMode, LayerKind, LrPolicy, ModernYoloKind, Network, ObbNmsKind,
-        SegmentationLoss, TensorShape,
+        AXIS_PINS, AxisPin, CliffordContextMode, CliffordGffnMode, CliffordGlobalOp,
+        CliffordHigherMode, CliffordInteractionMode, LayerKind, LrPolicy, ModernYoloKind, Network,
+        ObbNmsKind, SegmentationLoss, TensorShape,
     };
 
     fn build(text: &str) -> crate::error::Result<Network> {
@@ -11324,6 +11510,94 @@ output=2
                 "[{alias}] is unsupported and must not be accepted as an identity layer"
             );
         }
+    }
+
+    #[test]
+    fn every_layer_kind_has_an_axis_pin_decision() {
+        // `LayerKind::axis_pin` matches exhaustively, so a new variant fails the
+        // build until AXIS_PINS has an entry for it. This test checks the table
+        // itself: every pinned entry names a real `*axis_layout*` test, every
+        // open/rust-only entry states an owner or reason, and the counts match
+        // `tasks/rust/axis-coverage.md`.
+        assert_eq!(
+            AXIS_PINS.len(),
+            65,
+            "one axis decision per LayerKind variant plus Unsupported"
+        );
+
+        let mut pinned = std::collections::BTreeSet::new();
+        let mut open = 0usize;
+        let mut rust_only = 0usize;
+        for pin in AXIS_PINS {
+            match pin {
+                AxisPin::Pinned(name) => {
+                    assert!(
+                        name.contains("axis_layout"),
+                        "{name} is not selected by the axis_layout filter"
+                    );
+                    assert!(pinned.insert(*name), "{name} is listed twice");
+                }
+                AxisPin::Open(owner) => {
+                    assert!(!owner.is_empty(), "an open axis gap needs an owner");
+                    open += 1;
+                }
+                AxisPin::RustOnly(reason) => {
+                    assert!(!reason.is_empty(), "a rust-only entry needs a reason");
+                    rust_only += 1;
+                }
+            }
+        }
+
+        assert_eq!(pinned.len(), 18, "pinned variants");
+        assert_eq!(open, 41, "C++-backed variants without an axis pin");
+        assert_eq!(rust_only, 6, "Rust-only variants plus Unsupported");
+
+        // The pinned set is the contract: renaming one of these tests must be a
+        // deliberate edit here, not an accident.
+        let expected: std::collections::BTreeSet<&'static str> = [
+            "deconvolutional_axis_layout_maps_input_channels_to_filters_and_batch",
+            "shortcut_axis_layout_uses_nchw_channel_slots_per_batch",
+            "slice_axis_layout_preserves_batch_channel_and_spatial_order",
+            "scorer_axis_layout_keeps_batches_channels_and_options_independent",
+            "marker_gather_axis_layout_uses_sample_specific_positions",
+            "act_head_axis_layout_is_batch_major_over_the_two_layer_mlp",
+            "loss_axis_layout_excludes_padding_rows_from_batch_mean",
+            "encoder_axis_layout_keeps_batch_and_token_rows_independent",
+            "head_axis_layout_preserves_batch_sequence_and_qtype_channels",
+            "dpt_head_axis_layout_batched_nchw_forward_matches_independent_non_square_samples",
+            "patchify_axis_layout_keeps_channel_fastest_order_across_batches",
+            "window_partition_axis_layout_is_batch_major_raster_then_channel",
+            "axis_layout_keeps_batch_window_token_and_channel_axes_independent",
+            "axis_layout_maps_nchw_rows_and_scan_state_per_batch",
+            "axis_layout_keeps_nchw_raster_scans_independent_per_batch",
+            "cpu_moe_convolutional_axis_layout_keeps_router_and_blend_per_batch",
+            "eml_convolutional_axis_layout_preserves_batch_channel_and_spatial_order",
+            "offset_axis_layout_reads_dx_then_dy_and_keeps_batches_nchw",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(pinned, expected);
+
+        // Spot-check that the exhaustive index match lands on the right entry:
+        // a shifted index would silently classify the wrong variant.
+        let conv = build(
+            "[net]\nwidth=3\nheight=2\nchannels=2\n[convolutional]\nfilters=4\nsize=3\npadding=1\n",
+        )
+        .expect("convolutional builds");
+        assert_eq!(
+            conv.layers[0].kind.axis_pin(),
+            AxisPin::Open("Tier 1: dilated output extent (finding F1)"),
+            "convolutional must map to its own AXIS_PINS entry"
+        );
+        let route = build(
+            "[net]\nwidth=3\nheight=2\nchannels=2\n[convolutional]\nfilters=2\nsize=1\n[route]\nlayers=0\n",
+        )
+        .expect("route builds");
+        assert_eq!(
+            route.layers[1].kind.axis_pin(),
+            AxisPin::Open("Tier 1: groups split, relative index, concat order"),
+            "route must map to its own AXIS_PINS entry"
+        );
     }
 
     #[test]
