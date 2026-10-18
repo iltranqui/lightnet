@@ -11,8 +11,9 @@ members = [
     "src/darknet-core",
     "src/darknet-cuda",
     "src/darknet-examples",
-    # "src/darknet-gui", "src/darknet-gui-engine", "src/darknet-gui-project":
-    # referenced by WIP 8fb5bb1b but absent from the tree; re-add when restored.
+    # `darknet-gui` is opt-in (`-p darknet-gui`): it pulls egui/eframe and is
+    # intentionally not in `default-members`.
+    "src/darknet-gui",
 
     # cuda-oxide (vendored from NVlabs/cuda-oxide, Apache-2.0)
     # Core crates
