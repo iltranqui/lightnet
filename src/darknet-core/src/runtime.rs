@@ -80,6 +80,16 @@ impl GradMode {
 #[path = "runtime/laya_act_gpu.rs"]
 mod laya_act_gpu;
 
+/// Whether the network contains a `[deform_conv]` variant the device path does
+/// not cover yet. Shared by the forward and the backward so they cannot choose
+/// different paths for the same network.
+fn has_host_only_deform(network: &Network) -> bool {
+    network.layers.iter().any(|layer| {
+        matches!(&layer.kind, LayerKind::DeformConv(spec)
+            if spec.dilation != 1 || spec.batch_normalize)
+    })
+}
+
 fn reject_gpu_hyperbolic_foveation(network: &Network, operation: &str) -> Result<()> {
     if let Some(layer) = network.layers.iter().find(|layer| {
         matches!(
@@ -7408,6 +7418,9 @@ where
     device_moe_train_buffers: RefCell<Vec<Option<GpuMoeTrainBuffers<B::Tensor>>>>,
     device_eml_train_buffers: RefCell<Vec<Option<GpuEmlTrainBuffers<B::Tensor>>>>,
     cpu_fallback_train_buffers: RefCell<Vec<LayerTrainBuffers>>,
+    /// One slot per layer; only `[deform_conv]` uses it, and only on the
+    /// device-trainable path (see `DeformDeviceCache`).
+    deform_device_caches: RefCell<Vec<Option<DeformDeviceCache<B::Tensor>>>>,
     /// Per-owner-layer convolution Adam moments (device), created lazily on the
     /// first Adam update.
     adam_state: Vec<Option<GpuAdamLayerState<B::Tensor>>>,
@@ -7427,6 +7440,22 @@ where
     /// Set by [`Self::update_weights_gpu_deferred`]: the backward pass keeps the
     /// BN rolling stats on the device instead of downloading them per step.
     defer_host_sync: bool,
+}
+
+/// Device-resident intermediates of one native `[deform_conv]` forward pass.
+/// They are the operands the native backward needs; produced only when the whole
+/// network is device-trainable (no host-cache fallback), and dropped otherwise.
+#[derive(Clone, Debug)]
+pub struct DeformDeviceCache<T> {
+    pub input_sanitized: T,
+    pub raw_offsets: T,
+    pub mean: T,
+    pub inv_std: T,
+    pub stddev: T,
+    pub normalize: T,
+    pub offsets: T,
+    pub masks: Option<T>,
+    pub mask_logits: Option<T>,
 }
 
 /// First/second moments of one tensor.
@@ -8876,6 +8905,7 @@ where
             device_moe_train_buffers,
             device_eml_train_buffers,
             cpu_fallback_train_buffers,
+            deform_device_caches: RefCell::new(Vec::new()),
             adam_state: Vec::new(),
             moe_adam_state,
             eml_adam_state,
@@ -11399,8 +11429,17 @@ where
                 || matches!(&layer.kind, LayerKind::Lstm(spec) if spec.batch_normalize)
                 || matches!(&layer.kind, LayerKind::Crnn(spec) if spec.batch_normalize)
         });
-        let host_copies =
-            host_copies || self.requires_cpu_backward_fallback() || has_batch_normalized_recurrent;
+        // Device `[deform_conv]` covers dilation 1 without batch norm; anything
+        // else keeps the host path, and the decision is global so the forward
+        // and the backward can never disagree about which path ran.
+        let has_host_only_deform = has_host_only_deform(&self.network);
+        let host_copies = host_copies
+            || self.requires_cpu_backward_fallback()
+            || has_batch_normalized_recurrent
+            || has_host_only_deform;
+        // Path selection for `[deform_conv]` must match the backward's gate
+        // exactly; it is independent of whether host copies are retained.
+        let deform_device = !self.requires_cpu_backward_fallback() && !has_host_only_deform;
         let expected = self.network.net.input_shape();
         if input.shape != expected {
             return Err(Error::InvalidConfig(format!(
@@ -11504,6 +11543,7 @@ where
             Vec::with_capacity(self.network.layers.len());
         let mut dcnv4_caches = Vec::with_capacity(self.network.layers.len());
         let mut deform_conv_caches = Vec::with_capacity(self.network.layers.len());
+        let mut deform_device_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches: Vec<Option<crate::vit::VitForwardCache>> =
             Vec::with_capacity(self.network.layers.len());
         let mut swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>> =
@@ -11544,6 +11584,7 @@ where
             let mut kimi_kda_cache = None;
             let mut dcnv4_cache = None;
             let mut deform_conv_cache = None;
+            let mut deform_device_cache: Option<DeformDeviceCache<B::Tensor>> = None;
             let mut moe_cache = None;
             let mut eml_cache = None;
             let mut gpu_rnn_cache = None;
@@ -12073,6 +12114,217 @@ where
                         .map_err(|err| backend_error("upload DCNv4 output", err))?
                 }
                 (LayerKind::DeformConv(spec), LayerParams::DeformConv(params)) => {
+                    if deform_device {
+                        let geometry = darknet_cuda::host_ops::deform_conv::DeformGeometry {
+                            batch: layer.input_shape.batch,
+                            channels: layer.input_shape.channels,
+                            filters: spec.filters,
+                            channels_per_group: layer.input_shape.channels / spec.groups.max(1),
+                            filters_per_group: spec.filters / spec.groups.max(1),
+                            input_height: layer.input_shape.height,
+                            input_width: layer.input_shape.width,
+                            output_height: layer.output_shape.height,
+                            output_width: layer.output_shape.width,
+                            size: spec.size,
+                            stride_x: spec.stride_x,
+                            stride_y: spec.stride_y,
+                            padding: spec.padding,
+                            dilation: spec.dilation,
+                        };
+                        let kernels = spec.size * spec.size;
+                        let plane = geometry.output_width * geometry.output_height;
+                        let in_shape = tensor_backend_shape(layer.input_shape);
+                        let out_shape = tensor_backend_shape(layer.output_shape);
+                        let sanitized = self
+                            .backend
+                            .deform_sanitize_f32(current_input, &in_shape, launch_config)
+                            .map_err(|err| backend_error("deform_conv sanitize", err))?;
+                        let offset_w = self
+                            .backend
+                            .upload_f32(&[params.offset_weights.len()], &params.offset_weights)
+                            .map_err(|err| backend_error("upload deform offset weights", err))?;
+                        let offset_b = self
+                            .backend
+                            .upload_f32(&[params.offset_biases.len()], &params.offset_biases)
+                            .map_err(|err| backend_error("upload deform offset biases", err))?;
+                        let predictor_shape = [
+                            geometry.batch,
+                            2 * kernels,
+                            geometry.output_height,
+                            geometry.output_width,
+                        ];
+                        let raw_offsets = self
+                            .backend
+                            .bias_add_f32(
+                                &self
+                                    .backend
+                                    .conv2d_f32(
+                                        &sanitized,
+                                        &offset_w,
+                                        &predictor_shape,
+                                        geometry.channels,
+                                        geometry.input_height,
+                                        geometry.input_width,
+                                        2 * kernels,
+                                        geometry.size,
+                                        geometry.stride_x,
+                                        geometry.stride_y,
+                                        geometry.dilation,
+                                        geometry.padding,
+                                        1,
+                                        launch_config,
+                                    )
+                                    .map_err(|err| backend_error("deform offset predictor", err))?,
+                                &offset_b,
+                                2 * kernels,
+                                plane,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("deform offset bias", err))?;
+                        let max_offset = spec.size as f32 * spec.dilation as f32 * 2.0;
+                        let (mean, inv_std, stddev, normalize) = {
+                            let (m, i, n) = self
+                                .backend
+                                .deform_offset_stats(&raw_offsets, 2 * kernels * plane, max_offset, launch_config)
+                                .map_err(|err| backend_error("deform offset stats", err))?;
+                            // `stddev` is not exposed by the trait signature;
+                            // recover it on the host from the small [batch] tensor.
+                            let inv = self
+                                .backend
+                                .download_f32(&i)
+                                .map_err(|err| backend_error("download deform inv_std", err))?;
+                            let std_host: Vec<f32> = inv
+                                .iter()
+                                .map(|&v| if v > 0.0 { 1.0 / v } else { 0.0 })
+                                .collect();
+                            let stddev = self
+                                .backend
+                                .upload_f32(&[std_host.len()], &std_host)
+                                .map_err(|err| backend_error("upload deform stddev", err))?;
+                            (m, i, stddev, n)
+                        };
+                        let offsets = self
+                            .backend
+                            .deform_offset_envelope(
+                                &raw_offsets,
+                                &mean,
+                                &inv_std,
+                                &normalize,
+                                2 * kernels,
+                                plane,
+                                max_offset,
+                                &predictor_shape,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("deform offset envelope", err))?;
+                        let (masks, mask_logits) = if spec.use_mask {
+                            let weights = params
+                                .mask_weights
+                                .as_ref()
+                                .ok_or_else(|| Error::InvalidConfig("[deform_conv]: missing mask weights".to_owned()))?;
+                            let biases = params
+                                .mask_biases
+                                .as_ref()
+                                .ok_or_else(|| Error::InvalidConfig("[deform_conv]: missing mask biases".to_owned()))?;
+                            let w = self
+                                .backend
+                                .upload_f32(&[weights.len()], weights)
+                                .map_err(|err| backend_error("upload deform mask weights", err))?;
+                            let b = self
+                                .backend
+                                .upload_f32(&[biases.len()], biases)
+                                .map_err(|err| backend_error("upload deform mask biases", err))?;
+                            let logits_shape = [
+                                geometry.batch,
+                                kernels,
+                                geometry.output_height,
+                                geometry.output_width,
+                            ];
+                            let logits = self
+                                .backend
+                                .bias_add_f32(
+                                    &self
+                                        .backend
+                                        .conv2d_f32(
+                                            &sanitized,
+                                            &w,
+                                            &logits_shape,
+                                            geometry.channels,
+                                            geometry.input_height,
+                                            geometry.input_width,
+                                            kernels,
+                                            geometry.size,
+                                            geometry.stride_x,
+                                            geometry.stride_y,
+                                            geometry.dilation,
+                                            geometry.padding,
+                                            1,
+                                            launch_config,
+                                        )
+                                        .map_err(|err| backend_error("deform mask predictor", err))?,
+                                    &b,
+                                    kernels,
+                                    plane,
+                                    launch_config,
+                                )
+                                .map_err(|err| backend_error("deform mask bias", err))?;
+                            let masks = self
+                                .backend
+                                .deform_mask_sigmoid(&logits, &logits_shape, launch_config)
+                                .map_err(|err| backend_error("deform mask sigmoid", err))?;
+                            (Some(masks), Some(logits))
+                        } else {
+                            (None, None)
+                        };
+                        let main_w = self
+                            .backend
+                            .upload_f32(&[params.main.weights.len()], &params.main.weights)
+                            .map_err(|err| backend_error("upload deform main weights", err))?;
+                        let empty_masks = self
+                            .backend
+                            .zeros_f32(&[1])
+                            .map_err(|err| backend_error("deform empty masks", err))?;
+                        let raw = self
+                            .backend
+                            .deform_conv_accumulate_f32(
+                                &sanitized,
+                                &offsets,
+                                masks.as_ref().unwrap_or(&empty_masks),
+                                &main_w,
+                                geometry,
+                                masks.is_some(),
+                                &out_shape,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("deform accumulate", err))?;
+                        let main_bias = self
+                            .backend
+                            .upload_f32(&[params.main.biases.len()], &params.main.biases)
+                            .map_err(|err| backend_error("upload deform main biases", err))?;
+                        let biased = self
+                            .backend
+                            .bias_add_f32(&raw, &main_bias, spec.filters, plane, launch_config)
+                            .map_err(|err| backend_error("deform bias add", err))?;
+                        activation_input_gpu = Some(biased.clone());
+                        deform_device_cache = Some(DeformDeviceCache {
+                            input_sanitized: sanitized,
+                            raw_offsets,
+                            mean,
+                            inv_std,
+                            stddev,
+                            normalize,
+                            offsets,
+                            masks,
+                            mask_logits,
+                        });
+                        self.backend
+                            .activation_f32(
+                                &biased,
+                                gpu_activation_kind(layer.index, &spec.activation)?,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("deform activation", err))?
+                    } else {
                     let host_input = self
                         .download_tensor(current_input, layer.input_shape)
                         .map_err(|err| backend_error("download deform_conv input", err))?;
@@ -12096,6 +12348,7 @@ where
                     self.backend
                         .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
                         .map_err(|err| backend_error("upload deform_conv output", err))?
+                    }
                 }
                 (LayerKind::Vit(spec), LayerParams::Vit(weights)) => {
                     let host_input = self
@@ -13154,6 +13407,7 @@ where
             eml_caches.push(eml_cache);
             dcnv4_caches.push(dcnv4_cache);
             deform_conv_caches.push(deform_conv_cache);
+            deform_device_caches.push(deform_device_cache);
             vit_caches.push(vit_cache);
             swin_caches.push(swin_cache);
             tucker_attention_caches.push(tucker_attention_cache);
@@ -13161,6 +13415,7 @@ where
             kimi_kda_caches.push(kimi_kda_cache);
         }
 
+        *self.deform_device_caches.borrow_mut() = deform_device_caches;
         Ok(GpuForwardState {
             input_gpu,
             gpu_layer_outputs,
@@ -13831,7 +14086,7 @@ where
                 layer_output_gradient_seeds.len()
             )));
         }
-        if self.requires_cpu_backward_fallback() {
+        if self.requires_cpu_backward_fallback() || has_host_only_deform(&self.network) {
             return self
                 .backward_accumulate_seeded_gpu_cpu_fallback(forward, layer_output_gradient_seeds);
         }
@@ -15674,6 +15929,350 @@ where
                         &mut layer_output_gradients,
                     )?;
                 }
+                (LayerKind::DeformConv(spec), Some(LayerParams::DeformConv(params))) => {
+                    // Native path. Device forward/backward; the only host hop is
+                    // the batch-coupled offset-normalization Jacobian.
+                    let (main_weights, main_biases, offset_weights) = (
+                        params.main.weights.clone(),
+                        params.main.biases.clone(),
+                        params.offset_weights.clone(),
+                    );
+                    let (mask_weights, mask_biases) =
+                        (params.mask_weights.clone(), params.mask_biases.clone());
+                    // Clone the device intermediates out of the RefCell so the
+                    // following `&mut self` calls can borrow freely.
+                    let (input_sanitized, raw_offsets, mean, inv_std, stddev, normalize, offsets, masks, mask_logits) = {
+                        let caches = self.deform_device_caches.borrow();
+                        let c = caches[layer.index].as_ref().ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing device [deform_conv] cache for layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                        (
+                            c.input_sanitized.clone(),
+                            c.raw_offsets.clone(),
+                            c.mean.clone(),
+                            c.inv_std.clone(),
+                            c.stddev.clone(),
+                            c.normalize.clone(),
+                            c.offsets.clone(),
+                            c.masks.clone(),
+                            c.mask_logits.clone(),
+                        )
+                    };
+                    let plane = layer.output_shape.width * layer.output_shape.height;
+                    let kernels = spec.size * spec.size;
+                    let max_offset = spec.size as f32 * spec.dilation as f32 * 2.0;
+                    // Offset/mask tensors are `[B, 2K, OH, OW]` and `[B, K, OH, OW]`;
+                    // they are NOT the layer output shape.
+                    let offsets_shape = tensor_backend_shape(TensorShape::new(
+                        layer.output_shape.width,
+                        layer.output_shape.height,
+                        2 * kernels,
+                        layer.input_shape.batch,
+                    ));
+                    let masks_shape = tensor_backend_shape(TensorShape::new(
+                        layer.output_shape.width,
+                        layer.output_shape.height,
+                        kernels,
+                        layer.input_shape.batch,
+                    ));
+                    let geometry = darknet_cuda::host_ops::deform_conv::DeformGeometry {
+                        batch: layer.input_shape.batch,
+                        channels: layer.input_shape.channels,
+                        filters: spec.filters,
+                        channels_per_group: layer.input_shape.channels / spec.groups.max(1),
+                        filters_per_group: spec.filters / spec.groups.max(1),
+                        input_height: layer.input_shape.height,
+                        input_width: layer.input_shape.width,
+                        output_height: layer.output_shape.height,
+                        output_width: layer.output_shape.width,
+                        size: spec.size,
+                        stride_x: spec.stride_x,
+                        stride_y: spec.stride_y,
+                        padding: spec.padding,
+                        dilation: spec.dilation,
+                    };
+                    let activation_input = forward.gpu_layer_activation_inputs[layer.index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing activation cache for [deform_conv] layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let kind = gpu_activation_kind(layer.index, &spec.activation)?;
+                    let delta = self
+                        .backend
+                        .activation_backward_f32(activation_input, &grad, kind, config)
+                        .map_err(|err| backend_error("deform activation backward", err))?;
+                    let d_main_bias = self
+                        .backend
+                        .bias_backward_f32(&delta, spec.filters, plane, config)
+                        .map_err(|err| backend_error("deform bias backward", err))?;
+                    let empty = self
+                        .backend
+                        .zeros_f32(&[1])
+                        .map_err(|err| backend_error("deform empty masks", err))?;
+                    let main_w_device = self
+                        .backend
+                        .upload_f32(&[main_weights.len()], &main_weights)
+                        .map_err(|err| backend_error("upload deform main weights", err))?;
+                    let (d_input_a, d_offsets, d_masks, d_main_w) = self
+                        .backend
+                        .deform_conv_accumulate_backward_f32(
+                            &input_sanitized,
+                            &offsets,
+                            masks.as_ref().unwrap_or(&empty),
+                            &main_w_device,
+                            &delta,
+                            geometry,
+                            masks.is_some(),
+                            config,
+                        )
+                        .map_err(|err| backend_error("deform accumulate backward", err))?;
+                    let d_pre = self
+                        .backend
+                        .deform_envelope_pre_backward_f32(
+                            &raw_offsets,
+                            &mean,
+                            &inv_std,
+                            &normalize,
+                            &d_offsets,
+                            2 * kernels,
+                            plane,
+                            max_offset,
+                            &offsets_shape,
+                            config,
+                        )
+                        .map_err(|err| backend_error("deform envelope backward", err))?;
+                    let d_stage1 = {
+                        let d_pre_host = self
+                            .backend
+                            .download_f32(&d_pre)
+                            .map_err(|err| backend_error("download deform d_pre", err))?;
+                        let mean_host = self
+                            .backend
+                            .download_f32(&mean)
+                            .map_err(|err| backend_error("download deform mean", err))?;
+                        let std_host = self
+                            .backend
+                            .download_f32(&stddev)
+                            .map_err(|err| backend_error("download deform stddev", err))?;
+                        let normalize_host = self
+                            .backend
+                            .download_f32(&normalize)
+                            .map_err(|err| backend_error("download deform normalize", err))?;
+                        let raw_host = self
+                            .backend
+                            .download_f32(&raw_offsets)
+                            .map_err(|err| backend_error("download deform raw offsets", err))?;
+                        let stage1: Vec<f32> = raw_host
+                            .iter()
+                            .copied()
+                            .map(darknet_cuda::host_ops::deform_conv::sanitize)
+                            .collect();
+                        let grads =
+                            darknet_cuda::host_ops::deform_conv::offset_normalization_backward(
+                                &stage1,
+                                &mean_host,
+                                &std_host,
+                                &normalize_host,
+                                &d_pre_host,
+                                2 * kernels * plane,
+                            )
+                            .map_err(Error::InvalidConfig)?;
+                        let scaled: Vec<f32> = grads
+                            .iter()
+                            .zip(&raw_host)
+                            .map(|(&d, &raw)| {
+                                let slope = if raw.is_finite() && raw.abs() < 10_000.0 {
+                                    1.0
+                                } else {
+                                    0.0
+                                };
+                                d * slope
+                            })
+                            .collect();
+                        self.backend
+                            .upload_f32(&offsets_shape, &scaled)
+                            .map_err(|err| backend_error("upload deform d_stage1", err))?
+                    };
+                    let off_w_device = self
+                        .backend
+                        .upload_f32(&[offset_weights.len()], &offset_weights)
+                        .map_err(|err| backend_error("upload deform offset weights", err))?;
+                    let (d_input_o, d_off_w, d_off_b) =
+                        self.backend
+                            .deform_predictor_backward_f32(
+                                &input_sanitized,
+                                &off_w_device,
+                                &d_stage1,
+                                layer.input_shape.batch,
+                                layer.input_shape.channels,
+                                2 * kernels,
+                                layer.input_shape.height,
+                                layer.input_shape.width,
+                                layer.output_shape.height,
+                                layer.output_shape.width,
+                                spec.size,
+                                spec.stride_x,
+                                spec.stride_y,
+                                spec.padding,
+                                spec.dilation,
+                                config,
+                            )
+                            .map_err(|err| {
+                                backend_error("deform offset predictor backward", err)
+                            })?;
+                    let (d_input_m, d_mask_w, d_mask_b) = match (
+                        mask_logits.as_ref(),
+                        mask_weights.as_ref(),
+                        mask_biases.as_ref(),
+                    ) {
+                        (Some(logits), Some(weights), Some(_)) => {
+                            let d_logits = self
+                                .backend
+                                .deform_mask_sigmoid_backward_f32(
+                                    logits,
+                                    &d_masks,
+                                    &masks_shape,
+                                    config,
+                                )
+                                .map_err(|err| {
+                                    backend_error("deform mask sigmoid backward", err)
+                                })?;
+                            let w_device = self
+                                .backend
+                                .upload_f32(&[weights.len()], weights)
+                                .map_err(|err| {
+                                    backend_error("upload deform mask weights", err)
+                                })?;
+                            let (d_in, d_w, d_b) = self
+                                .backend
+                                .deform_predictor_backward_f32(
+                                    &input_sanitized,
+                                    &w_device,
+                                    &d_logits,
+                                    layer.input_shape.batch,
+                                    layer.input_shape.channels,
+                                    kernels,
+                                    layer.input_shape.height,
+                                    layer.input_shape.width,
+                                    layer.output_shape.height,
+                                    layer.output_shape.width,
+                                    spec.size,
+                                    spec.stride_x,
+                                    spec.stride_y,
+                                    spec.padding,
+                                    spec.dilation,
+                                    config,
+                                )
+                                .map_err(|err| {
+                                    backend_error("deform mask predictor backward", err)
+                                })?;
+                            (Some(d_in), Some(d_w), Some(d_b))
+                        }
+                        _ => (None, None, None),
+                    };
+                    let mut sum = self
+                        .backend
+                        .vector_add_f32(&d_input_a, &d_input_o, config)
+                        .map_err(|err| backend_error("deform input grad sum", err))?;
+                    if let Some(d_in) = d_input_m.as_ref() {
+                        sum = self
+                            .backend
+                            .vector_add_f32(&sum, d_in, config)
+                            .map_err(|err| backend_error("deform input grad sum", err))?;
+                    }
+                    // The raw (unsanitized) layer input drives the final slope.
+                    let raw_input = if layer.index == 0 {
+                        forward.input_gpu.clone()
+                    } else {
+                        forward.gpu_layer_outputs[layer.index - 1].clone()
+                    };
+                    let d_input = self
+                        .backend
+                        .deform_scale_input_gradient_f32(
+                            &raw_input,
+                            &sum,
+                            &tensor_backend_shape(layer.input_shape),
+                            config,
+                        )
+                        .map_err(|err| backend_error("deform input slope", err))?;
+                    {
+                        let d_main = self
+                            .backend
+                            .download_f32(&d_main_w)
+                            .map_err(|err| backend_error("download deform main w grad", err))?;
+                        let d_bias = self
+                            .backend
+                            .download_f32(&d_main_bias)
+                            .map_err(|err| backend_error("download deform main b grad", err))?;
+                        let d_ow = self
+                            .backend
+                            .download_f32(&d_off_w)
+                            .map_err(|err| backend_error("download deform off w grad", err))?;
+                        let d_ob = self
+                            .backend
+                            .download_f32(&d_off_b)
+                            .map_err(|err| backend_error("download deform off b grad", err))?;
+                        let d_mw = match d_mask_w.as_ref() {
+                            Some(t) => Some(
+                                self.backend
+                                    .download_f32(t)
+                                    .map_err(|err| backend_error("download deform mask w", err))?,
+                            ),
+                            None => None,
+                        };
+                        let d_mb = match d_mask_b.as_ref() {
+                            Some(t) => Some(
+                                self.backend
+                                    .download_f32(t)
+                                    .map_err(|err| backend_error("download deform mask b", err))?,
+                            ),
+                            None => None,
+                        };
+                        let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
+                        let LayerTrainBuffers::DeformConv(train) = &mut buffers[layer.index] else {
+                            return Err(Error::InvalidConfig(format!(
+                                "[deform_conv] layer #{} has no train buffers",
+                                layer.index
+                            )));
+                        };
+                        for (dst, src) in train.main.weight_updates.iter_mut().zip(d_main) {
+                            *dst += src;
+                        }
+                        for (dst, src) in train.main.bias_updates.iter_mut().zip(d_bias) {
+                            *dst += src;
+                        }
+                        for (dst, src) in train.offset_weight_updates.iter_mut().zip(d_ow) {
+                            *dst += src;
+                        }
+                        for (dst, src) in train.offset_bias_updates.iter_mut().zip(d_ob) {
+                            *dst += src;
+                        }
+                        if let (Some(dw), Some(db)) = (d_mw, d_mb) {
+                            if let (Some(dst_w), Some(dst_b)) = (
+                                train.mask_weight_updates.as_mut(),
+                                train.mask_bias_updates.as_mut(),
+                            ) {
+                                for (dst, src) in dst_w.iter_mut().zip(dw) {
+                                    *dst += src;
+                                }
+                                for (dst, src) in dst_b.iter_mut().zip(db) {
+                                    *dst += src;
+                                }
+                            }
+                        }
+                    }
+                    self.accumulate_previous_gpu_gradient(
+                        layer.index,
+                        d_input,
+                        &mut layer_output_gradients,
+                    )?;
+                }
                 _ => {
                     return Err(Error::UnsupportedLayer {
                         layer_index: layer.index,
@@ -15729,8 +16328,10 @@ where
                         return true;
                     }
                 }
-                // These layers use the Rust host reference and have no native device backward.
-                LayerKind::Deconvolutional(_) | LayerKind::DeformConv(_) => return true,
+                // Use the Rust host reference and have no native device backward.
+                // `[deform_conv]` now has one (see the `has_host_only_deform`
+                // guard for the variants that still need the host path).
+                LayerKind::Deconvolutional(_) => return true,
                 // Weighted shortcut parameter reductions stay host-resident,
                 // while input/source gradients use backend elementwise ops.
                 // `[laya_act_head]` and the full ViT backward still use the
@@ -29750,7 +30351,10 @@ mod tests {
         let gpu_output = gpu_forward.cpu_forward.final_output().unwrap();
         let cpu_output = executable.forward(&input).unwrap();
         assert_eq!(gpu_output, cpu_output.final_output().unwrap());
-        assert!(gpu.requires_cpu_backward_fallback());
+        // The native device backward now covers this layer, so the network no
+        // longer forces the host fallback; the comparison below still proves
+        // FakeBackend (host defaults) and CPU agree.
+        assert!(!gpu.requires_cpu_backward_fallback());
     }
 
     #[test]
@@ -31675,7 +32279,10 @@ num_dwconv=1
 
         let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
         gpu.params = cpu.params.clone();
-        assert!(gpu.requires_cpu_backward_fallback());
+        // The native device backward covers this layer, so the network no longer
+        // forces the host fallback; the comparison below still proves FakeBackend
+        // (host defaults) and CPU agree.
+        assert!(!gpu.requires_cpu_backward_fallback());
         let input = Tensor::from_data(
             TensorShape::new(3, 3, 2, 1),
             (0..18)

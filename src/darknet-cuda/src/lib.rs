@@ -9,6 +9,7 @@
 
 pub mod host_ops;
 pub mod laya_act;
+pub use host_ops::bilinear_gather::BilinearGatherGeometry;
 pub use host_ops::{AdamParams, NanInfMode, dropout_unit};
 pub use laya_act::{LayaActBackwardInputs, LayaActHeadGrad};
 
@@ -770,6 +771,393 @@ pub trait F32TensorOpsBackend {
         channel_stride: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Vec<Self::Tensor>, Self::Error>;
+    /// Deformable bilinear gather used by the deformable layer family
+    /// (`[deform_conv]`, `[dcnv4]`, `[dsconv]`, `[graph_conv]`).
+    ///
+    /// `input` is `[B, C, H, W]`; `sample_y` and `sample_x` are `[B, S, OH,
+    /// OW]` positions in input pixels; the result is `[B, S, C, OH, OW]`
+    /// (im2col-style columns). The coordinate contract — including the
+    /// far-outside early-out and zero padding — is
+    /// [`host_ops::bilinear_gather`].
+    ///
+    /// Wired primitives only: no layer runtime calls this yet, and a backend
+    /// that does not override it round-trips through the host reference.
+    fn deform_bilinear_gather_f32(
+        &self,
+        input: &Self::Tensor,
+        sample_y: &Self::Tensor,
+        sample_x: &Self::Tensor,
+        geometry: BilinearGatherGeometry,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        geometry
+            .checked_products()
+            .unwrap_or_else(|err| panic!("{err}"));
+        let host_input = self.download_f32(input)?;
+        let host_y = self.download_f32(sample_y)?;
+        let host_x = self.download_f32(sample_x)?;
+        let values = host_ops::bilinear_gather::forward(&host_input, &host_y, &host_x, &geometry)
+            .unwrap_or_else(|err| panic!("{err}"));
+        let shape = [
+            geometry.batch,
+            geometry.samples,
+            geometry.channels,
+            geometry.output_height,
+            geometry.output_width,
+        ];
+        self.upload_f32(&shape, &values)
+    }
+
+    /// Exact adjoint of [`Self::deform_bilinear_gather_f32`]: returns
+    /// `(d_input, d_sample_y, d_sample_x)` with the coordinate gradients
+    /// summed over channels.
+    fn deform_bilinear_gather_backward_f32(
+        &self,
+        input: &Self::Tensor,
+        sample_y: &Self::Tensor,
+        sample_x: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        geometry: BilinearGatherGeometry,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        geometry
+            .checked_products()
+            .unwrap_or_else(|err| panic!("{err}"));
+        let host_input = self.download_f32(input)?;
+        let host_y = self.download_f32(sample_y)?;
+        let host_x = self.download_f32(sample_x)?;
+        let host_grad = self.download_f32(output_grad)?;
+        let (d_input, d_y, d_x) = host_ops::bilinear_gather::backward(
+            &host_input,
+            &host_y,
+            &host_x,
+            &host_grad,
+            &geometry,
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        let input_shape = [
+            geometry.batch,
+            geometry.channels,
+            geometry.input_height,
+            geometry.input_width,
+        ];
+        let sample_shape = [
+            geometry.batch,
+            geometry.samples,
+            geometry.output_height,
+            geometry.output_width,
+        ];
+        Ok((
+            self.upload_f32(&input_shape, &d_input)?,
+            self.upload_f32(&sample_shape, &d_y)?,
+            self.upload_f32(&sample_shape, &d_x)?,
+        ))
+    }
+
+    /// Source `sanitize`: finite -> clamp to +/-10000, non-finite -> 0.
+    fn deform_sanitize_f32(
+        &self,
+        x: &Self::Tensor,
+        shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let values = self.download_f32(x)?;
+        let out: Vec<f32> = values
+            .into_iter()
+            .map(host_ops::deform_conv::sanitize)
+            .collect();
+        self.upload_f32(shape, &out)
+    }
+
+    /// Per-batch `[deform_conv]` offset statistics: returns
+    /// `(mean, inv_std, normalize)` of length `batch`.
+    fn deform_offset_stats(
+        &self,
+        raw: &Self::Tensor,
+        per_batch: usize,
+        max_offset: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        let values = self.download_f32(raw)?;
+        let stats = host_ops::deform_conv::offset_stats(&values, per_batch, max_offset)
+            .unwrap_or_else(|err| panic!("{err}"));
+        let batch = stats.mean.len();
+        Ok((
+            self.upload_f32(&[batch], &stats.mean)?,
+            self.upload_f32(&[batch], &stats.inv_std)?,
+            self.upload_f32(&[batch], &stats.normalize)?,
+        ))
+    }
+
+    /// Offset envelope: `sanitize -> optional normalize -> sanitize -> lhtan`.
+    #[allow(clippy::too_many_arguments)]
+    fn deform_offset_envelope(
+        &self,
+        raw: &Self::Tensor,
+        mean: &Self::Tensor,
+        inv_std: &Self::Tensor,
+        normalize: &Self::Tensor,
+        planes: usize,
+        spatial: usize,
+        max_offset: f32,
+        shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let values = self.download_f32(raw)?;
+        let mean = self.download_f32(mean)?;
+        let inv_std = self.download_f32(inv_std)?;
+        let normalize = self.download_f32(normalize)?;
+        let out = host_ops::deform_conv::offset_envelope(
+            &values,
+            &mean,
+            &inv_std,
+            &normalize,
+            planes,
+            spatial,
+            max_offset,
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        self.upload_f32(shape, &out)
+    }
+
+    /// `stable_sigmoid(sanitize(logit))`, elementwise.
+    fn deform_mask_sigmoid(
+        &self,
+        raw: &Self::Tensor,
+        shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let values = self.download_f32(raw)?;
+        let out = host_ops::deform_conv::mask_sigmoid(&values);
+        self.upload_f32(shape, &out)
+    }
+
+    /// Deformable accumulation: `sum_c sum_k weight * sample(base + offset) *
+    /// mask`, then `sanitize`. `masks` is ignored when `use_mask` is false.
+    #[allow(clippy::too_many_arguments)]
+    fn deform_conv_accumulate_f32(
+        &self,
+        input: &Self::Tensor,
+        offsets: &Self::Tensor,
+        masks: &Self::Tensor,
+        weights: &Self::Tensor,
+        geometry: host_ops::deform_conv::DeformGeometry,
+        use_mask: bool,
+        shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let input = self.download_f32(input)?;
+        let offsets = self.download_f32(offsets)?;
+        let weights = self.download_f32(weights)?;
+        let masks = if use_mask {
+            Some(self.download_f32(masks)?)
+        } else {
+            None
+        };
+        let out = host_ops::deform_conv::accumulate(
+            &input,
+            &offsets,
+            masks.as_deref(),
+            &weights,
+            &geometry,
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        self.upload_f32(shape, &out)
+    }
+
+    /// Adjoint of [`Self::deform_conv_accumulate_f32`].
+    fn deform_conv_accumulate_backward_f32(
+        &self,
+        input: &Self::Tensor,
+        offsets: &Self::Tensor,
+        masks: &Self::Tensor,
+        weights: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        geometry: host_ops::deform_conv::DeformGeometry,
+        use_mask: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        let input = self.download_f32(input)?;
+        let offsets = self.download_f32(offsets)?;
+        let weights = self.download_f32(weights)?;
+        let masks = if use_mask {
+            Some(self.download_f32(masks)?)
+        } else {
+            None
+        };
+        let grad = self.download_f32(output_grad)?;
+        let out = host_ops::deform_conv::accumulate_backward(
+            &input,
+            &offsets,
+            masks.as_deref(),
+            &weights,
+            &grad,
+            &geometry,
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        let kernels = geometry.kernels();
+        let plane = geometry.plane();
+        let mask_len = geometry.batch * kernels * plane;
+        Ok((
+            self.upload_f32(
+                &[
+                    geometry.batch,
+                    geometry.channels,
+                    geometry.input_height,
+                    geometry.input_width,
+                ],
+                &out.d_input,
+            )?,
+            self.upload_f32(
+                &[
+                    geometry.batch,
+                    2 * kernels,
+                    geometry.output_height,
+                    geometry.output_width,
+                ],
+                &out.d_offsets,
+            )?,
+            self.upload_f32(&[if use_mask { mask_len } else { 0 }], &out.d_masks)?,
+            self.upload_f32(&[out.d_weights.len()], &out.d_weights)?,
+        ))
+    }
+
+    /// Pre-normalization envelope adjoint (lhtan + sanitize slopes).
+    #[allow(clippy::too_many_arguments)]
+    fn deform_envelope_pre_backward_f32(
+        &self,
+        raw: &Self::Tensor,
+        mean: &Self::Tensor,
+        inv_std: &Self::Tensor,
+        normalize: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        planes: usize,
+        spatial: usize,
+        max_offset: f32,
+        shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let out = host_ops::deform_conv::offset_envelope_pre_backward(
+            &self.download_f32(raw)?,
+            &self.download_f32(mean)?,
+            &self.download_f32(inv_std)?,
+            &self.download_f32(normalize)?,
+            &self.download_f32(output_grad)?,
+            planes,
+            spatial,
+            max_offset,
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        self.upload_f32(shape, &out)
+    }
+
+    /// Mask sigmoid adjoint.
+    fn deform_mask_sigmoid_backward_f32(
+        &self,
+        logits: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let out = host_ops::deform_conv::mask_sigmoid_backward(
+            &self.download_f32(logits)?,
+            &self.download_f32(output_grad)?,
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        self.upload_f32(shape, &out)
+    }
+
+    /// Predictor + column-gather adjoint: `(d_input, d_weights, d_biases)`.
+    #[allow(clippy::too_many_arguments)]
+    fn deform_predictor_backward_f32(
+        &self,
+        input: &Self::Tensor,
+        weights: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        filters: usize,
+        in_h: usize,
+        in_w: usize,
+        out_h: usize,
+        out_w: usize,
+        size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        padding: usize,
+        dilation: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        let input_host = self.download_f32(input)?;
+        let kernels = size * size;
+        let column_count = channels * kernels;
+        let columns = host_ops::deform_conv::predictor_columns(
+            &input_host, batch, channels, in_h, in_w, size, stride_x, padding, dilation, out_h,
+            out_w,
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        let out = host_ops::deform_conv::predictor_backward(
+            &input_host,
+            &columns,
+            &self.download_f32(weights)?,
+            &self.download_f32(output_grad)?,
+            batch,
+            channels,
+            filters,
+            in_h,
+            in_w,
+            out_h,
+            out_w,
+            size,
+            stride_x,
+            padding,
+            dilation,
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        Ok((
+            self.upload_f32(&[batch, channels, in_h, in_w], &out.d_input)?,
+            self.upload_f32(&[filters * column_count], &out.d_weights)?,
+            self.upload_f32(&[filters], &out.d_biases)?,
+        ))
+    }
+
+    /// Scale a summed input gradient by the raw input's `sanitize` slope.
+    fn deform_scale_input_gradient_f32(
+        &self,
+        raw: &Self::Tensor,
+        grad: &Self::Tensor,
+        shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let raw = self.download_f32(raw)?;
+        let grad = self.download_f32(grad)?;
+        let out: Vec<f32> = raw
+            .iter()
+            .zip(grad)
+            .map(|(&r, g)| {
+                let slope = if r.is_finite() && r.abs() < 10_000.0 {
+                    1.0
+                } else {
+                    0.0
+                };
+                g * slope
+            })
+            .collect();
+        self.upload_f32(shape, &out)
+    }
+
     fn conv2d_f32(
         &self,
         x: &Self::Tensor,

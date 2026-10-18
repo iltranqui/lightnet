@@ -8,6 +8,7 @@ pub mod bias_scale;
 pub mod conv_direct;
 pub mod conv_implicit;
 pub mod convert;
+pub mod deform_sample;
 pub mod elementwise;
 pub mod gemm;
 pub mod gemm_f16;
