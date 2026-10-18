@@ -30351,10 +30351,9 @@ mod tests {
         let gpu_output = gpu_forward.cpu_forward.final_output().unwrap();
         let cpu_output = executable.forward(&input).unwrap();
         assert_eq!(gpu_output, cpu_output.final_output().unwrap());
-        // The native device backward now covers this layer, so the network no
-        // longer forces the host fallback; the comparison below still proves
-        // FakeBackend (host defaults) and CPU agree.
-        assert!(!gpu.requires_cpu_backward_fallback());
+        // `[vit]` still has no native device backward, so this network must
+        // keep the host fallback.
+        assert!(gpu.requires_cpu_backward_fallback());
     }
 
     #[test]

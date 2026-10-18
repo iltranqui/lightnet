@@ -13,3 +13,5 @@
 - When splitting one OBB loss across box-channel and front-channel passes, each pass must own only its partial gradient; do not write the same front-anchor center-chain term into both passes (2026-10-16).
 - Test filters must match Rust test-name prefixes: `carpn_map` did not select newly named `obb_map_*` dispatcher tests. Check matched-test counts before treating a focused filter as coverage (2026-10-17).
 - Axis fixtures for batch/sequence stacks must account for every normalization stage; the LAYA encoder test's terminal LayerNorm follows the embedding LayerNorm, so its hand expectation must include both (2026-10-17).
+- A bulk text replacement in a 45k-line file can land on the wrong test: replacing `assert!(gpu.requires_cpu_backward_fallback())` intended for the `[deform_conv]` test silently weakened the `[vit]` guard instead. Grep the modified assertion afterwards, and run the filtered suite that owns it (`test_host.sh runtime::`) before committing. (2026-10-18)
+- Do not commit a runtime change without running the `runtime::` host filter from the plan's gate list; the `deform_conv` filter alone does not cover guards in other tests. (2026-10-18)
