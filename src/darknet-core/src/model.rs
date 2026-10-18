@@ -11312,6 +11312,21 @@ output=2
     }
 
     #[test]
+    fn unused_cpp_layer_enum_names_are_not_rust_noop_layers() {
+        let network = build("[network]\nwidth=1\nheight=1\nchannels=1\n")
+            .expect("[network] is top-level metadata, not a layer");
+        assert!(network.layers.is_empty());
+
+        for alias in ["blank", "empty", "silence"] {
+            let cfg = format!("[net]\nwidth=1\nheight=1\nchannels=1\n[{alias}]\n");
+            assert!(
+                build(&cfg).is_err(),
+                "[{alias}] is unsupported and must not be accepted as an identity layer"
+            );
+        }
+    }
+
+    #[test]
     fn dsconv_try_fix_nan_default_covers_both_aliases_and_respects_override() {
         for alias in ["dsconv", "dynamic_snake_conv"] {
             let base = format!("[net]\nwidth=2\nheight=2\nchannels=1\n[{alias}]\nsize=1\n");
