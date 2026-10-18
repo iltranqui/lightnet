@@ -66,6 +66,7 @@ file is named inline.
 - [38. YOLO-3D configuration preparation (not a layer port)](#38-yolo-3d-configuration-preparation-not-a-layer-port)
 - [39. Cuboid labels and deterministic truth helpers](#39-cuboid-labels-and-deterministic-truth-helpers)
 - [40. YOLO-3D raw CPU runtime and fail-closed consumers](#40-yolo-3d-raw-cpu-runtime-and-fail-closed-consumers)
+- [41. Native f32 LAYA marker gather](#41-native-f32-laya-marker-gather)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -995,6 +996,35 @@ Verification commands ran serially under `MemoryHigh=3G` systemd scopes (scripts
 
 - `systemd-run --user --scope -p MemoryHigh=3G cargo check -p darknet-cli --features oxide -j 4` passed. Targeted edition-2024 Rustfmt and `git diff --check` passed. No actual training runs, Oxide tests, corpus or unfiltered host suite; existing warnings remain. Temporary weights/sidecars used RAII cleanup; test logs/source snapshots were removed after recording evidence.
 - **Remaining layer DoD:** projected activations/math, assignments, losses and exact loss derivatives/Cpp-mode deltas; standalone and mixed loss APIs consuming the label helpers; decode and its A2 anchor/entry/vertex pin; projected evaluator; depth/metric consumption and references; end-to-end loss-to-conv/optimizer tests. Parsed map/counter metadata still needs consumption by these APIs. Supplied-seed optimizer tests are not a substitute for full training-loss integration. The current axis decision stays Open; `axis_layout` remains 21, not a new cuboid pin. No compiled-C++ golden exists. Hand-derived from source, no compiled-C++ golden; GPU status none. Stage 1, all-native GPU/GPU Muon Stage 2, and sparse MoE Stage 3 remain incomplete; no overall parity or green full-host claim.
+
+## 41. Native f32 LAYA marker gather
+
+- v0.2.001 (`f56342ca`): operator explicitly requested GPU priority before CPU completion. Added native Oxide f32 forward/backward for `[laya_marker_gather]`, removed full/compact forward's per-operator downloads/CPU math/uploads, and removed this layer from the whole-network CPU-backward fallback gate. No weights, optimizer tensors or config changes. Other GPU layers/GPU Muon and all remaining CPU requirements are still open; parked YOLO-3D activation work is uncommitted and not part of this release.
+- Source inspected directly: `Jev_laya@4af013d2c59d1db54247aeff21f43e1d8d295cda:src-lib/laya_marker_gather_layer.cpp:111-182`. Features are `[B,H,1,T]`; marker channel `2*j`, sequence column zero, chooses each option's position. Masks/extra channels/other sequence columns are ignored. Backward adds duplicate-option gradients in ascending option order to A only, even when A/B alias. Native threads own individual outputs/input gradients, so no atomics/races. Half-away rounding uses f64 before integer conversion; clamp-before-cast handles extreme values safely. NaN -> 0 and infinities -> endpoints preserve the Rust CPU reference's defensive extension, not a claim about C++ `lround` on invalid values.
+
+Scoped requirement-to-artifact audit:
+
+| Requirement | Actual artifacts and verification |
+|---|---|
+| Checked backend contract/default reference | `darknet-cuda/src/host_ops/marker_gather.rs::Layout`, exposed via `host_ops.rs`; two `F32TensorOpsBackend` methods in `darknet-cuda/src/lib.rs`. The generic default remains a host reference for non-Oxide/FakeBackend, consistent with existing ops; Oxide overrides both |
+| Native, device-resident f32 operations | `darknet-cuda-oxide/src/kernels/layers_extra.rs::{marker_position,marker_gather,marker_gather_backward}` and overrides in `src/lib.rs`. Inspection confirms no operator download/upload or host data math; `mixed.rs::f32v` borrows f32 or widens on device. Ordinary full-runtime debug/output downloads remain |
+| Per-sample layout, duplicate/clamped/nonfinite indices, ignored metadata, exact adjoint | `oxide_marker_gather.rs::marker_gather_native_forward_backward_and_raw_input_fd`: B=2, H=3, T=7, K=5, CB=12; tile lengths 32/128/256, ragged lengths, actual GPU forward FD at eight input elements with fixed metadata, exact independent reference output/gradient comparisons |
+| Deterministic reduction and subtle rounding | `marker_gather_native_duplicate_reduction_has_fixed_option_order`: repeated `[1e20,1,-1e20,1]` sum gives 1; `marker_gather_native_rounds_adjacent_half_values_before_clamping`: adjacent f32 values below/at/above 0.5 and 1.5, extremes and NaN/infinities |
+| Errors before unsafe device reads | `marker_gather_native_invalid_layouts_and_storage_error_before_launch`: bad rank/height/batch/T/channel count, zero options/dimensions, checked-product overflow, short feature/marker/gradient storage |
+| Correct runtime routing and no forced CPU backward | `runtime.rs` full/compact/backward thin arms and fallback-gate removal; `runtime/tests/marker_gather_gpu_tests.rs::marker_gather_gpu_uses_device_backward_and_accumulates_only_feature_source` asserts gate false, A/B alias handling plus a direct source seed, full/compact agreement, and upstream update agreement on FakeBackend |
+| Real-device runtime chain | `oxide_runtime_chain.rs::marker_gather_native_full_compact_backward_and_upstream_sgd_match_cpu`: B=2, two upstream convs, distinct A/B references, full/compact output parity, backward and both conv weight/bias gradient updates through SGD |
+
+Test-first evidence: direct Oxide tests initially failed compilation on missing backend methods. The runtime test then failed specifically because marker gather forced CPU backward; it passed after native dispatch integration. Final serial, `MemoryHigh=3G`, script `-j 2` verification on NVIDIA GeForce RTX 4060 Laptop GPU:
+
+| Command | Result |
+|---|---|
+| `MEM=3G ./tools/test_oxide.sh --test oxide_marker_gather` | 4 passed |
+| `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- marker_gather` | 1 passed, 24 filtered |
+| `MEM=3G ./tools/test_oxide.sh --test oxide_layers_extra` | 24 passed |
+| `MEM=3G ./tools/test_host.sh marker_gather` | 12 core passed; 0 CLI matched |
+| `MEM=3G ./tools/test_host.sh runtime::` | 271 core passed; 0 CLI matched |
+
+Targeted edition-2024 Rustfmt and diff checks passed. Tests ran with parked CPU activation code still in the working tree; it is not selected by these filters and adds no GPU dependency. Temporary GPU logs/source snapshot removed after recording results; no weights/sidecars were created by these new tests. No actual training run, benchmark/speedup measurement, unfiltered host/corpus or full Oxide-suite run. GPU status: **native f32 forward/backward/full/compact; f16 remains explicitly unsupported and was not device-tested**. New optimizer evidence is upstream SGD only; this weightless layer has no Muon/Adam parameter blocks, and GPU Muon remains open. Native GPU vs Rust CPU agreement only. Hand-derived from source, no compiled-C++ golden. No overall Stage-1/2/3 completion claim.
 
 ## Not implemented / open (pointer)
 

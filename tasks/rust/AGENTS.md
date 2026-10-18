@@ -22,7 +22,7 @@ Reach full Rust parity with every C++ layer (branch `rust`), in three release li
 2. `v0.2.NNN`: every layer has a native GPU path with a CPU-parity test, host-fallback layers included, plus GPU Muon.
 3. `v0.3.NNN`: opt-in true sparse MoE per `MOE.md`, inference first, never slower than dense.
 
-Done when all three lines are complete, each version has its tests passing and its docs updated (`implemented.md`, `STATUS.md`, `todo.md`, `version-map.tsv`), and no parity is claimed without a C++ golden. Each line starts only after the previous one is complete. Details: [Open Work](#open-work).
+Done when all three lines are complete, each version has its tests passing and its docs updated (`implemented.md`, `STATUS.md`, `todo.md`, `version-map.tsv`), and no parity is claimed without a C++ golden. Default sequencing starts each line after the previous one is complete. **Current operator override: focus on GPU layers now, directly without subagents, while preserving all open CPU requirements.** Follow `gpu_layers_plan.md`; native GPU work is authorized before CPU completion, not evidence that CPU is complete. Details: [Open Work](#open-work).
 
 ## Rules
 
@@ -78,6 +78,7 @@ A `cfg_corpus` timeout is neither a pass nor a failure.
 | `gui_plan.md` | 330 | Merged egui GUI plan (M0–M6), not started; starts after `onnx.md` | Only if user wants the GUI |
 | `archive/` | - | Superseded `gui_iced_plan.md`, `gui_code_phase_plan.md`; the latter holds DarkMark ground-truth tables G1–G17/D1–D16 | Citing `Gn`/`Dn` |
 | `MOE.md` | 150 | True sparse `[moe_convolutional]` plan (opt-in, CPU then GPU, dense-masked as oracle), literature, open questions | Sparse MoE work |
+| `gpu_layers_plan.md` | - | Operator-authorized GPU-first continuation; remaining native layer work and next f16 marker-gather slice | GPU layer work and resume |
 | `runtime_modularization_plan.md` | 125 | Plan to split the 37k-line `runtime.rs` into a `runtime/` module tree (phases P0–P7, no API change) | Refactoring or adding a layer arm in `runtime.rs` |
 | `fp8_fp4.md` | 125 | FP8 GEMM / FP4 emulation design, sm_89 | FP8/FP4 work |
 | `vit_plan.md`, `vit_notes.md` | 71 | `[vit]` subplan and source audit | ViT / attention work |
@@ -99,25 +100,25 @@ A `cfg_corpus` timeout is neither a pass nor a failure.
 
 The [Goal](#goal) is parity with every C++ `ELayerType` (compared on `Jev_laya`; the other branches add no kinds), axis/layout pinned by tests, and GPU support for every layer. Nothing else is in scope (`plan-open-items.md`, "Scope"). Each backlog stub must be expanded into its own plan before dispatch; each layer's Definition of Done includes the axis checklist.
 
-Order of work across the release lines (do not interleave):
+Default order across release lines (the current GPU-priority operator override above supersedes the no-interleaving gate):
 
 1. **v0.1 / Stage 1, CPU for all:** finish every required CPU layer/config/source variant (config, shape, `.weights`, forward, exact backward, axis tests) and CPU Muon before starting Stage 2.
 2. **v0.2 / Stage 2, GPU for all:** give every layer a native GPU path, including layers that currently only have a host round-trip fallback (`swin`, `tucker_attention`, `mambavision`, `kimi_kda`, `dcnv4`, `laya_*`, ...), plus GPU Muon. A host fallback is only interim; completion requires native cuda-oxide kernels with CPU-parity tests (`./tools/test_oxide.sh`). Mark each layer's GPU status (native / host fallback / none) in `implemented.md`.
 3. **v0.3 / Stage 3, sparse MoE:** implement the opt-in true sparse path per `MOE.md`, CPU then GPU, after v0.2 is complete.
 
-At v0.1.026, Stage 1 is not complete; do not start v0.2 or v0.3 implementation.
+Stage 1 remains incomplete at v0.1.026. The operator explicitly authorized GPU priority: v0.2.001 adds native f32 marker gather; continue bounded native work per `gpu_layers_plan.md`, retaining CPU gaps and leaving v0.3 unstarted.
 
 **Muon optimizer (also in scope).** Add Muon next to SGD/Adam wherever it applies: 2D weight matrices (convolution weights viewed as `[out, in*kh*kw]`, `connected`, deconvolutional, attention/MLP projections in `vit`/`swin`/`transformer`/`tucker_attention`/`kimi_kda`/`mambavision`, MoE/EML expert convs, `dcnv4` projections, `laya_*` projections). Biases, BN/norm scales, positional/embedding tables and 1D params stay on Adam/AdamW. Follows the same two stages: CPU first (momentum buffer + Newton-Schulz orthogonalisation, optimizer state saved in the DNOPT sidecar and round-trip tested like Adam moments), then a native GPU kernel. No Muon exists in the repo or on any C++ branch (checked with `git grep`), so the spec must be written first (update rule, NS coefficients/iterations, update-scale convention, per-layer eligibility); state "hand-derived from the paper, no C++ reference".
 
 **Sparse MoE (also in scope):** `[moe_convolutional]` currently runs every expert and masks the output (same as C++). `MOE.md` plans an opt-in true sparse path (CPU first, then GPU) that must equal the dense-masked result.
 
-Current gaps and completed CPU work (see `implemented.md`, `todo.md`, and `STATUS.md`; latest increment is v0.1.026):
+Current gaps and completed CPU work (see `implemented.md`, `todo.md`, and `STATUS.md`; latest CPU increment is v0.1.026; latest GPU increment is v0.2.001):
 
 1. **`[yolo_3d]` remains a partial v0.1 layer, not a complete port.** The `depth_3d` source confirms scope, and `[dpt_head]` is CPU-ported. The accepted `yolo_3d_plan.md` supersedes the draft; S1–S13 are transcribed in `yolo_3d_notes.md`. v0.1.024 adds config/spec/shape helpers; v0.1.025 adds standalone label/truth helpers; v0.1.026 integrates network aliases/shared class-K validation and weightless raw CPU forward/exact supplied-seed backward, with checkpoint/optimizer and legacy consumer/GPU rejection tests (`implemented.md` §§38–40). The `yolo_3d` filter passes 42 core + 1 CLI tests. Next: projected math/assignments/loss and exact derivatives, standalone/mixed training APIs consuming truths and map/counter metadata, decode/evaluator and the A2 output-axis pin; then depth/metric CPU support. Seeded optimizer tests are not full loss-to-conv training evidence; all legacy detector consumers still reject cuboid networks. Axis status remains Open, GPU status none, no compiled-C++ golden. The plan's projected version numbers are stale; use `version-map.tsv` and never reuse them.
 2. **DSConv multi-template `morph=0/1` is required for full source parity and remains an open v0.1 gap.** The executable C++ CPU forward implements multi-view averaging and training-time view dropout (`Jev_laya:src-lib/dsconv_layer.cpp:597-638`), although the header calls it experimental and the CPU backward is a stub. Rust v0.1.002 explicitly rejects it. Treat the variant as a separate Opus-planned task covering cached active views and exact gradients for all offset blocks; do not claim full DSConv parity yet.
 3. The other previously missing Stage-1 CPU ports are implemented within their documented bounds: `deform_conv`, `graph_conv`, `wmhf`, `clifford`, `recursive_block`, `hyperbolic_foveation`, `foveation_film`, `depth_anything`, and `dpt_head`; CPU Muon is recorded in v0.1.005. Their focused tests and evidence boundaries are in `implemented.md` and `STATUS.md`. These do not establish compiled-C++ parity.
 4. The bounded A1 family audit is complete in v0.1.012; DPT's named axis test is in v0.1.013. This is not all-layer axis completion: the current registry has 19 pinned variants, 41 C++-backed Open variants (including partial Yolo3d), 5 Rust-only variants and Unsupported. See `axis-coverage.md`; `axis_layout` passes 21 tests. Resolve all applicable Open contracts as well as per-backlog A2 tests before closing Stage 1.
-5. **v0.2 is incomplete:** every layer needs a native GPU implementation and CPU-parity test, including current host fallbacks; GPU Muon remains open. It cannot start until all v0.1 requirements are resolved.
+5. **v0.2 is incomplete:** every layer needs a native GPU implementation and CPU-parity test, including current host fallbacks; GPU Muon remains open. The current operator override authorizes GPU work now despite unresolved v0.1 requirements; native f32 LAYA marker gather is implemented in v0.2.001 (`implemented.md` §41); next is its explicitly unsupported f16 inference path per `gpu_layers_plan.md`.
 6. **v0.3 is incomplete:** `[moe_convolutional]` still computes every expert; the opt-in sparse path in `MOE.md` is sequenced after v0.2.
 
 **C++ enum boundary:** `NETWORK` is the `[net]`/`[network]` metadata section, not a layer (`Jev_laya:src-lib/darknet_cfg.cpp:817-820`; Rust `NetConfig::from_section` accepts both). `BLANK` and `EMPTY` are marked unused in `darknet_enums.hpp:51-52`; `BLANK` is an internal GPU-fusion sentinel (`darknet_network.cpp:2662-2672`), and the `[blank]` alias falls through the parser's unsupported default. `[empty]`/`[silence]` map to `EMPTY` and also hit that default (`darknet_enums.cpp:60-62`; `darknet_cfg.cpp:947-1157`). They are not missing Rust layer kinds; unsupported cfgs must still error explicitly.
