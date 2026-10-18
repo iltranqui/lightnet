@@ -5356,6 +5356,43 @@ impl F32TensorOpsBackend for OxideBackend {
         Ok(OxideTensorF32::new(out, shape))
     }
 
+    fn laya_act_head_backward_f32(
+        &self,
+        inputs: &darknet_cuda::LayaActBackwardInputs<'_, Self::Tensor>,
+        layout: &darknet_cuda::host_ops::laya_act::MlpLayout,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<darknet_cuda::LayaActHeadGrad<Self::Tensor>, Self::Error> {
+        let op = "laya_act_head_backward_f32";
+        let d = layout.features();
+        if inputs.head.len() != d.head_len
+            || inputs.scorer.len() != d.logits_len
+            || inputs.markers.len() != d.marker_len
+            || inputs.fc1_w.len() != layout.fc1_len()
+            || inputs.fc1_b.len() != layout.fc_dim()
+            || inputs.fc2_w.len() != layout.fc2_len()
+            || inputs.seeds.len() != layout.seed_len()
+        {
+            return Err(shape_err(
+                op,
+                "act-head backward operand storage mismatch".to_owned(),
+            ));
+        }
+        if inputs.fc1_w.shape() != [layout.fc_dim(), layout.inputs()]
+            || inputs.fc1_b.shape() != [layout.fc_dim()]
+            || inputs.fc2_w.shape() != [layout.n_act(), layout.fc_dim()]
+            || (inputs.seeds.shape() != [d.batch, layout.n_act()]
+                && inputs.seeds.shape() != [d.batch, layout.n_act(), 1, 1])
+        {
+            return Err(shape_err(
+                op,
+                "act-head backward matrix/seed metadata mismatch".to_owned(),
+            ));
+        }
+        // Shared composition dispatches back into native Oxide overrides;
+        // all sources are checked before any math, and no data is downloaded.
+        darknet_cuda::laya_act::backward_composed(self, inputs, layout, config)
+    }
+
     fn laya_act_features_f32(
         &self,
         head: &Self::Tensor,

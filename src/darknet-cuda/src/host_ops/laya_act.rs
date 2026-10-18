@@ -1,5 +1,5 @@
-//! Checked layout/reference for CLS plus four detached act-head features.
-//! This is not the MLP or its backward/update contract.
+//! Checked act-head feature reference and immutable MLP geometry.
+//! Gradient composition lives in crate::laya_act; this adds no optimizer updates.
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {
     pub batch: usize,
@@ -110,5 +110,86 @@ impl Layout {
             ]);
         }
         out
+    }
+}
+
+/// Immutable, checked geometry for standalone act-head gradient math.
+/// Construct afresh from the declared source views; callers cannot mutate it
+/// into an unchecked layout after construction.
+#[derive(Clone, Copy, Debug)]
+pub struct MlpLayout {
+    features: Layout,
+    fc_dim: usize,
+    n_act: usize,
+}
+
+impl MlpLayout {
+    pub fn new(
+        head: &[usize],
+        scorer: &[usize],
+        marker: &[usize],
+        fc_dim: usize,
+        n_act: usize,
+    ) -> Result<Self, String> {
+        let features = Layout::new(head, scorer, marker)?;
+        let inputs = features.hidden + 4; // feature layout checked this addition
+        for (a, b) in [
+            (fc_dim, inputs),
+            (n_act, fc_dim),
+            (features.batch, fc_dim),
+            (features.batch, n_act),
+            (features.batch, features.hidden),
+        ] {
+            if a.checked_mul(b)
+                .is_none_or(|n| n == 0 || n > i32::MAX as usize)
+            {
+                return Err("act-head backward: zero/overflow MLP dimensions".into());
+            }
+        }
+        Ok(Self {
+            features,
+            fc_dim,
+            n_act,
+        })
+    }
+    pub fn features(&self) -> Layout {
+        self.features
+    }
+    pub fn fc_dim(&self) -> usize {
+        self.fc_dim
+    }
+    pub fn n_act(&self) -> usize {
+        self.n_act
+    }
+    pub fn inputs(&self) -> usize {
+        self.features.hidden + 4
+    }
+    pub fn fc1_len(&self) -> usize {
+        self.fc_dim * self.inputs()
+    }
+    pub fn fc2_len(&self) -> usize {
+        self.n_act * self.fc_dim
+    }
+    pub fn seed_len(&self) -> usize {
+        self.features.batch * self.n_act
+    }
+    pub fn head_shape(&self) -> [usize; 4] {
+        [
+            self.features.batch,
+            self.features.hidden,
+            1,
+            self.features.head_width,
+        ]
+    }
+    pub fn scorer_shape(&self) -> [usize; 4] {
+        [self.features.batch, 1, 1, self.features.options]
+    }
+    pub fn marker_shape(&self) -> [usize; 4] {
+        [
+            self.features.batch,
+            self.features.marker_channels,
+            1,
+            self.features.marker_width,
+        ]
     }
 }

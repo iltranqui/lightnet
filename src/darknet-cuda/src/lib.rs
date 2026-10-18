@@ -8,7 +8,9 @@
 #![feature(float_erf)]
 
 pub mod host_ops;
+pub mod laya_act;
 pub use host_ops::{AdamParams, NanInfMode, dropout_unit};
+pub use laya_act::{LayaActBackwardInputs, LayaActHeadGrad};
 
 pub const CUTILE_RS_REFERENCE: &str = "https://github.com/NVlabs/cutile-rs";
 pub const DEFAULT_TILE_1D: usize = 256;
@@ -1558,6 +1560,18 @@ pub trait F32TensorOpsBackend {
         let out = host_ops::channel_permute(&host, shape[0], rows, cols, shape[2] * shape[3]);
         self.upload_f32(shape, &out)
     }
+    /// Standalone positive act-head gradients and CLS adjoint, not runtime
+    /// backward/update integration. Oxide checks all resident operand storage
+    /// before composing native dense/exact-GELU/route operations.
+    fn laya_act_head_backward_f32(
+        &self,
+        inputs: &LayaActBackwardInputs<'_, Self::Tensor>,
+        layout: &host_ops::laya_act::MlpLayout,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<LayaActHeadGrad<Self::Tensor>, Self::Error> {
+        laya_act::backward_composed(self, inputs, layout, config)
+    }
+
     /// Build CLS plus four detached LAYA act-head features in [B,H+4,1,1].
     /// This is not the MLP/backward and does not alter parameter update semantics.
     /// Generic backends use this numeric host reference; Oxide overrides it.
