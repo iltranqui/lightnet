@@ -69,6 +69,7 @@ file is named inline.
 - [34. GPU convolution extent parity](#34-gpu-convolution-extent-parity)
 - [35. Annotation GUI (`darknet-gui`)](#35-annotation-gui-darknet-gui)
 - [36. Annotation GUI plan implementation](#36-annotation-gui-plan-implementation)
+- [37. DarkMark hotkey parity and model discovery](#37-darkmark-hotkey-parity-and-model-discovery)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -911,6 +912,14 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 - Verification: `cargo test -p darknet-gui-project` 36, `-p darknet-gui-engine` 4, `-p darknet-cli` 28; offline build of the three GUI crates is warning-free; `cargo metadata --locked` reports 33 members.
 - v0.1.020 (`2640b902`): the overlay's model loader resolves `DARKNET_RS_BIN` before the current executable, so `cargo run -p darknet-gui` can find `darknet-rs`.
 - Evidence boundary: DarkMark compatibility is derived from the `G`/`D` tables, not verified against a running DarkMark (`T1.5` still open). Not wired: add/delete classes from the dialog, delete-image/undo-delete, heatmaps, jump, screenshots, train runner.
+
+## 37. DarkMark hotkey parity and model discovery
+
+- v0.1.021 (`8c536b6d`): the key map is transcribed from `DarkMark/src-darkmark/DMContent.cpp::keyPressed()` (`:1013-2050`) rather than the `G16` summary. Corrections: `r` random sort and `R` alphabetical; `,`/`.` apply `scale_all_marks(+-0.01)`, a normalized delta, not a box-relative factor; `o` is mass-delete mode; `P` homography; `` ` `` merge; `l` labels on/off/auto; `b`/`B` bold/shade; `d` snap-all; `D` snapping toggle; `h`/`H` heatmaps; `j` jump; `s`/`S` screenshots and `F12` window screenshot; `t`, `[`/`]`, `(`/`)` tiling; `y`/`Y` copy neighbour; `Shift+U` undo-delete; `Shift+Delete` delete image; `Escape` cancel. `Tab` skips invisible marks and records the recent class/size; `A` accepts only the selected prediction.
+- `Project` now discovers the project's model files (`G1`): `<name>.cfg` else the first `*.cfg`, and `<name>_best.weights` / `<name>_final.weights` / `<name>.weights` else the first `*.weights`. The GUI prefills the overlay paths from them.
+- Weight parsing remains in `darknet-rs`: `load_weights_file` for inference and `weights-inspect` for a header report. The GUI process never parses `.weights`; it starts `detect-server`, which loads them and reports mismatches as errors.
+- Verification: `darknet-gui-project` 38 tests, `darknet-gui-engine` 4, offline builds of the GUI and CLI.
+- Evidence boundary: mapped actions for features not yet built (mass-delete, homography, merge, heatmaps, screenshots, tiling, jump, delete-image) report "mapped but not implemented" instead of silently doing nothing. Parity is with the DarkMark source, not a running DarkMark.
 
 ## Not implemented / open (pointer)
 
