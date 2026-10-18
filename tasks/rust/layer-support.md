@@ -194,7 +194,6 @@ layer count.
 | Variant | GPU forward | Missing backward piece |
 |---|---|---|
 | `Deconvolutional` | host round trip (`deconv_forward` on host) | device deconv dgrad/wgrad |
-| `DeformConv` | host round trip | device offset/mask sampling backward |
 | `Dcnv4` | host round trip | device deformable backward |
 | `Vit` | host round trip | device attention/MLP backward (flash dQ/dK/dV primitives exist) |
 | `Swin` | host round trip | device windowed-attention backward |
@@ -203,6 +202,11 @@ layer count.
 | `KimiKda` | host round trip | device delta-rule backward |
 | `LayaActHead` | **native f32** composition | runtime backward integration blocked on the open eligibility question (`implemented.md` §43) |
 | `Sam` | host round trip | device backward incomplete: the GPU arm only forwards the incoming gradient (see defect 2) |
+
+`DeformConv` **left this table** in v0.2.007: it now has a native forward *and*
+backward, gated on `dilation == 1` without batch norm. Its remaining limitation
+(one host hop for the batch-coupled normalization Jacobian) is recorded in the
+main matrix row instead.
 | `Connected` | native, but host round trip when activation is unsupported | device path for `revleaky` |
 | `Rnn`/`Crnn` | device, but host when activation unsupported | device kernels for the remaining activations |
 | `Moe` | device | device path for unsupported expert activations |
