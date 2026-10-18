@@ -65,6 +65,7 @@ file is named inline.
 - [30. DPT-head Stage-1 CPU reference](#30-dpt-head-stage-1-cpu-reference)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
+- [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -872,6 +873,13 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 - Verification: `MEM=3G ./tools/test_host.sh every_layer_kind_has_an_axis_pin_decision` passed 1 test; `model::` passed 75; `axis_fixture` passed 3; `axis_layout` passed 19 (unchanged); targeted edition-2024 Rustfmt and `git diff --check` passed.
 - Coverage baseline recorded in `tasks/rust/axis-coverage.md` (local-only): 18 variants pinned by 19 tests, 41 C++-backed variants open, 5 Rust-only extensions, 3 variants not ported. No layer math changed, so no behavior claim is made beyond the new checks.
 - Evidence boundary: enum audited against `Jev_laya:src-lib/darknet_enums.hpp`; `Logistic` is referenced on `raptor`/`raptor-dev` and `Regression` on `fog`, neither on `Jev_laya`. No compiled-C++ golden/parity.
+
+## 33. Convolutional axis pins and the dilation contract
+
+- v0.1.016 (`051021fe`): added `model::tests::convolutional_axis_layout_pins_dilated_extent_and_groups` (C++ extent for dilated/strided non-square input, `batch=2`, and the `[out][in/groups]` weight cardinality for `filters=6, groups=2, C=4`) and `runtime::tests::convolutional_axis_layout_keeps_nchw_and_group_partitions` (channel-swapping 1x1 weights, then `groups=2` partitioning, both over `batch=2`).
+- Verification: `MEM=3G ./tools/test_host.sh convolutional_axis_layout` passed 5; `axis_layout` passed 21 (was 19); `runtime::` passed 261. Full CPU baseline `cargo test -p darknet-core --lib -j 2` passed 897 and `-p darknet-cli` 28; GPU baseline `MEM=3G ./tools/test_oxide.sh --test oxide_parity` passed 11 and `oxide_runtime_chain` 24. Targeted edition-2024 Rustfmt and `git diff --check` passed.
+- Finding F1 retracted: `conv_dim` must keep ignoring dilation because `Jev_laya:src-lib/convolutional_layer.cpp:317` does; applying `dilation*(size-1)` shrank the extent and broke `cfg/resnet152_trident.cfg` at route #244 (`16x16` vs `38x38`). `conv_dim` now documents that, and the pin fails if the term returns. The cuDNN/oxide `pad*dilation` difference is recorded as a source-level inconsistency, not a Rust defect.
+- Evidence boundary: hand-derived from `Jev_laya`; no compiled-C++ golden and no parity claim.
 
 ## Not implemented / open (pointer)
 

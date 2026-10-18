@@ -419,7 +419,8 @@ Immediately next, in dependency order:
 - [x] Stage-1 A1 axis/layout audit of every already-ported family named in `AGENTS.md`: completed in v0.1.012 (`implemented.md` §29), with the initial subset recorded in §28. `STATUS.md` tabulates the source contracts and named tests. Per-backlog axis DoDs for missing-layer ports and the remaining v0.1–v0.3 work stay open.
 - [x] v0.1.014 C++ enum-boundary regression: `[network]` remains top-level metadata, and the unused `[blank]`, `[empty]`, `[silence]` aliases reject rather than becoming identity layers; `model::tests::unused_cpp_layer_enum_names_are_not_rust_noop_layers` passed (see `implemented.md` §31). No compiled-C++ parity is claimed.
 - [x] v0.1.015 axis-coverage gate and shared fixtures: every `LayerKind` variant now records a `Pinned`/`Open`/`RustOnly` decision in `AXIS_PINS`, enforced by the exhaustive `LayerKind::axis_pin` match, and `axis_fixture.rs` supplies the shared sentinel/index helpers (see `implemented.md` §32 and `axis-coverage.md`). Baseline is 18 pinned / 41 open / 5 Rust-only / 3 unported.
-- [ ] Axis tiers 1-4 (see `axis-coverage.md`): add the missing named pins, starting with `[convolutional]`, which also carries finding F1 (dilated output extent ignores `dilation` in `conv_dim`). Each behavior fix gets its own version; do not weaken a pin to match the implementation.
+
+- [x] v0.1.016 convolutional axis pins: NCHW/group partitioning and the dilated-extent contract are pinned; finding F1 was retracted (C++ CPU geometry ignores dilation, cuDNN pads by `pad*dilation`). See `implemented.md` §33 and `axis-coverage.md`.- [ ] Axis tiers 1-4 (see `axis-coverage.md`): add the missing named pins, starting with `[convolutional]`, which also carries finding F1 (dilated output extent ignores `dilation` in `conv_dim`). Each behavior fix gets its own version; do not weaken a pin to match the implementation.
 
 ## Active and unstarted plans
 
