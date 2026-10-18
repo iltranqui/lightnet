@@ -70,6 +70,7 @@ file is named inline.
 - [42. Native f16 marker-gather inference](#42-native-f16-marker-gather-inference)
 - [43. Native detached act-head feature primitive](#43-native-detached-act-head-feature-primitive)
 - [44. Native exact-erf GELU primitives](#44-native-exact-erf-gelu-primitives)
+- [45. Native act-head f32 forward composition](#45-native-act-head-f32-forward-composition)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1104,6 +1105,33 @@ Test-first: new tests initially failed compilation on missing methods. Final ser
 - `MEM=3G ./tools/test_host.sh gelu`: **2 core passed**, 0 CLI matched.
 
 Targeted edition-2024 Rustfmt/diff checks passed; only inserted activation-file blocks were formatted/checked to preserve unrelated existing style. Temporary logs/formatter snippet removed after recording evidence. Generated compiler products remain part of the active incremental build. Parked uncommitted CPU math remained outside this release. No real training, benchmark, full-host/corpus/full-Oxide run or compiled-C++ golden. GPU status: exact-erf f32 forward/backward primitive native; **act-head runtime remains host fallback** and its training-contract question remains unanswered. Next independent work is native act-head f32 forward composition, retaining CPU backward until gradient/update eligibility is resolved and implemented. All broader GPU/GPU Muon, CPU/config/axis and sparse-MoE requirements remain open. Hand-derived from source, no compiled-C++ golden.
+
+## 45. Native act-head f32 forward composition
+
+- v0.2.005 (`79ce20bb`): replaced `[laya_act_head]` full/compact GPU forward's three source downloads, host feature/MLP execution and result upload with shared native composition in `runtime/laya_act_gpu.rs`: native features, connected fc1, dedicated exact-erf GELU, connected fc2. Thin arms in `runtime.rs` retain existing source resolution/use counts. Existing Oxide connected/feature/GELU overrides execute on device; no new backend trait or kernel was needed. Ordinary runtime debug/final output downloads remain.
+- Helper checks source/spec agreement, positive/bounded F/A and checked products plus all four parameter lengths before head uploads/math. Matrix orientation follows source row-major `[F,H+4]` / `[A,F]`, with connected output `[B,F]` used for the strict exact-GELU metadata contract. Final `[B,A]` storage is downloaded with the existing layer's NCHW shape, as with other connected operations.
+- **Deliberately uncached:** all four parameter blocks upload each call, so direct host edits and blob-based parameter replacement are immediately visible. Native compute does not imply fully resident weights or a speedup. Precision inherits the existing connected/GEMM backend configuration; numerical parity tests explicitly select `GemmMode::Fp32`. Other precision/AMP modes were not newly validated or globally changed. F16 remains rejected.
+- CPU-backward fallback and act-head parameter eligibility/update behavior remain unchanged. No native act-head backward, new training buffers, optimizer state or checkpoint/file loader was introduced. In-memory `to_blob/from_blob` replacement is tested, **not shared-file loading**; the existing runtime error's `load_laya_act_head_blob` hint does not identify an implemented loader in core. Do not treat that hint or these forward tests as full `.weights` support. Source-training mismatch/question from §43 remains open.
+
+Scoped requirement-to-artifact audit:
+
+| Requirement | Actual evidence |
+|---|---|
+| No host act-head math in inference forward | `runtime/tests/laya_act_gpu_tests.rs::laya_act_head_gpu_forward_matches_hand_erf_and_retains_cpu_backward`: test-only thread-local probe in `laya_act_head.rs` asserts no CPU act-head calls from full/compact inference; known fc1 values +/-1 give the closed-form erf outputs. Probe is absent in production builds |
+| Keep fallback and existing update behavior | Same FakeBackend test asserts fallback selection remains true, executes backward after GPU training-forward, compares upstream conv SGD updates to CPU and proves a nonzero update; all act-head params remain unchanged. This is preservation evidence on FakeBackend, not native GPU backward proof |
+| Checked parameter geometry, all blocks | `laya_act_head_gpu_forward_rejects_all_parameter_blocks_and_bad_dimensions`: short fc1_w/fc1_b/fc2_w/fc2_b in both paths and a post-construction oversized F fail cleanly. This is runtime defense, not a claim that arbitrary oversized cfgs are safe to initialize |
+| Real-device full/compact CPU-reference agreement | `oxide_laya_act_forward.rs::laya_act_head_native_full_compact_observe_edits_blob_replacement_and_sources`: B=2, H=6/8, K=T=4, F=5, A=3; valid/all-masked/aliased-marker graphs, absolute and relative references, nonprevious head input surviving compact lifetimes, all four blocks edited after warm calls, then blob-based replacement; outputs must actually change and both GPU paths match CPU |
+| Actual native primitive dispatch | Core helper has only validated parameter uploads and backend feature/connected/exact-GELU calls, with no data downloads or host tensor math. Oxide implementations of these operations were directly verified in prior increments; real runtime composition now executes successfully on RTX 4060 |
+| Clean errors and unchanged unsupported dtype | `laya_act_head_native_invalid_parameters_error_cleanly`: real GPU full/compact rejects short fc1 weights; f16 still returns its explicit unsupported-layer error |
+
+Test-first: the host probe failed on the old CPU-forward calls and the malformed-parameter assertion failed before the new helper was wired. Final serial 3G scopes/script `-j 2`:
+
+- `MEM=3G ./tools/test_host.sh laya_act_head`: **11 core passed**, 0 CLI matched.
+- `MEM=3G ./tools/test_host.sh runtime::`: **273 core passed**, 0 CLI matched.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_laya_act_forward`: **2 passed** on RTX 4060 Laptop.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_gelu_erf`: **4 passed** on RTX 4060 Laptop.
+
+Targeted edition-2024 Rustfmt/diff checks passed; only new CPU-module probe blocks were formatted to avoid unrelated style churn. Temporary logs/formatter snippet removed after recording evidence; no file weights/sidecars created. Parked CPU math remained unselected/outside this release. No actual training run, benchmark, full-host/corpus/full-Oxide or compiled-C++ golden. GPU status: **native f32 full/compact forward; CPU backward; frozen/no act-head updates preserved; f16 unsupported**. Next independent work can implement standalone native act-head gradient math without changing runtime eligibility or applying updates until the operator question is resolved. All broader CPU/config/axis, GPU/GPU Muon and sparse-MoE requirements remain open. Hand-derived from source, no compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 
