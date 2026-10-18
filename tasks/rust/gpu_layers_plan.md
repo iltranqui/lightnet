@@ -364,6 +364,18 @@ point, row slot)` for every write and compare against the forward's read of the
 same slot. Two blind rewrites plus one term-level check have narrowed this to
 the write mapping; that is where the third attempt should start.
 
+**Concrete fixture numbers for that attempt** (recomputed from the failing case,
+`softmax=false, remove_center=false`, `size=3, pad=1, scale=0.75`, output cell
+`q=0`, point 7 = `(kw=2, kh=1)`): the fixture offsets are
+`0.37 + ((i*5)%11)*0.03 - 0.15`, so `offsets[14]=0.34` and `offsets[15]=0.49`.
+With `p0_scaled = -0.75` that gives `sx = 1.005` and `sy = 0.3675`. The FD
+perturbs `sx` by `±0.0075`, i.e. it crosses the integer cell boundary at
+`sx = 1.0` (stencil `{0,1}` vs `{1,2}`, both in-bounds, so the interpolant should
+be C1 there — but this is exactly the kind of near-boundary fixture that has
+fooled five earlier comparisons, and it must be excluded before blaming the
+code). Shift the fixture so `sx` lands near a cell *centre* (fractional part
+≈ 0.5) for every point, then re-run the FD before any index work.
+
 ## Verification gates
 
 Use test-first, serial test threads, script `-j 2` and the 3G cap. Add focused real
