@@ -5292,6 +5292,52 @@ impl F32TensorOpsBackend for OxideBackend {
         Ok(OxideTensorF32::new(out, shape))
     }
 
+    fn laya_act_features_f32(
+        &self,
+        head: &Self::Tensor,
+        scorer: &Self::Tensor,
+        markers: &Self::Tensor,
+        head_shape: &[usize],
+        scorer_shape: &[usize],
+        marker_shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let op = "laya_act_features_f32";
+        let d =
+            darknet_cuda::host_ops::laya_act::Layout::new(head_shape, scorer_shape, marker_shape)
+                .map_err(|err| shape_err(op, err))?;
+        if head.len() != d.head_len || scorer.len() != d.logits_len || markers.len() != d.marker_len
+        {
+            return Err(shape_err(
+                op,
+                "tensor storage does not match layout".to_owned(),
+            ));
+        }
+        let head_f = self.f32v(head)?;
+        let scorer_f = self.f32v(scorer)?;
+        let markers_f = self.f32v(markers)?;
+        let mut output = self.alloc_uninit(d.output_len)?;
+        // SAFETY: positive checked shapes/products bound all source reads;
+        // each sample thread owns an entire disjoint output row.
+        unsafe {
+            self.layers_extra.laya_act_features(
+                &self.stream,
+                launch::elementwise(d.batch, config),
+                &head_f.buf,
+                &scorer_f.buf,
+                &markers_f.buf,
+                &mut output,
+                d.hidden,
+                d.options,
+                d.marker_channels,
+                d.head_width,
+                d.marker_width,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, &d.output_shape()))
+    }
+
     fn marker_gather_f32(
         &self,
         features: &Self::Tensor,

@@ -4,6 +4,7 @@
 //! round-trips through the host and still produces the exact result a device
 //! kernel must match.
 
+pub mod laya_act;
 pub mod marker_gather;
 
 /// Deterministic counter-hash RNG for dropout: a splitmix64 finaliser over

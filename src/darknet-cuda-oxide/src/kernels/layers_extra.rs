@@ -37,6 +37,94 @@ pub fn marker_position(value: f32, sequence: usize) -> usize {
 pub mod kernels {
     use super::*;
 
+    /// Source ah_features: one thread per sample, serial option reductions.
+    /// Masked slots retain finite -1e4 logits, even if all slots are masked.
+    #[kernel]
+    pub fn laya_act_features(
+        head: &[f32],
+        logits: &[f32],
+        markers: &[f32],
+        mut output: DisjointSlice<f32>,
+        hidden: usize,
+        options: usize,
+        marker_channels: usize,
+        head_width: usize,
+        marker_width: usize,
+    ) {
+        let b = thread::index_1d().get();
+        if b < output.len() / (hidden + 4) {
+            let first_active = markers[(b * marker_channels + 1) * marker_width] > 0.5;
+            let mut max = if first_active {
+                logits[b * options]
+            } else {
+                -1e4
+            };
+            let mut valid = 0usize;
+            let mut j = 0;
+            while j < options {
+                let active = markers[(b * marker_channels + 2 * j + 1) * marker_width] > 0.5;
+                let z = if active {
+                    logits[b * options + j]
+                } else {
+                    -1e4
+                };
+                if active {
+                    valid += 1;
+                }
+                max = max.max(z);
+                j += 1;
+            }
+            let mut sum = 0.0f32;
+            j = 0;
+            while j < options {
+                let active = markers[(b * marker_channels + 2 * j + 1) * marker_width] > 0.5;
+                let z = if active {
+                    logits[b * options + j]
+                } else {
+                    -1e4
+                };
+                sum += (z - max).exp();
+                j += 1;
+            }
+            let mut top1 = -1.0f32;
+            let mut top2 = -1.0f32;
+            let mut entropy = 0.0f32;
+            j = 0;
+            while j < options {
+                let active = markers[(b * marker_channels + 2 * j + 1) * marker_width] > 0.5;
+                let z = if active {
+                    logits[b * options + j]
+                } else {
+                    -1e4
+                };
+                let p = (z - max).exp() / sum;
+                entropy -= p * p.max(1e-9).ln();
+                if p > top1 {
+                    top2 = top1;
+                    top1 = p;
+                } else if p > top2 {
+                    top2 = p;
+                }
+                j += 1;
+            }
+            let count = if valid < 2 { 2.0 } else { valid as f32 };
+            let base = b * (hidden + 4);
+            // SAFETY: layout/storage are checked by the host. Threads own
+            // disjoint sample rows and write every CLS/summary element once.
+            unsafe {
+                let mut c = 0;
+                while c < hidden {
+                    *output.as_mut_ptr().add(base + c) = head[(b * hidden + c) * head_width];
+                    c += 1;
+                }
+                *output.as_mut_ptr().add(base + hidden) = top1;
+                *output.as_mut_ptr().add(base + hidden + 1) = top1 - top2;
+                *output.as_mut_ptr().add(base + hidden + 2) = entropy / count.ln();
+                *output.as_mut_ptr().add(base + hidden + 3) = count / 255.0;
+            }
+        }
+    }
+
     /// One thread owns each gathered output; both inputs stay device-resident.
     #[kernel]
     pub fn marker_gather(

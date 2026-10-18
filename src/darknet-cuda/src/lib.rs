@@ -1517,6 +1517,31 @@ pub trait F32TensorOpsBackend {
         let out = host_ops::channel_permute(&host, shape[0], rows, cols, shape[2] * shape[3]);
         self.upload_f32(shape, &out)
     }
+    /// Build CLS plus four detached LAYA act-head features in [B,H+4,1,1].
+    /// This is not the MLP/backward and does not alter parameter update semantics.
+    /// Generic backends use this numeric host reference; Oxide overrides it.
+    fn laya_act_features_f32(
+        &self,
+        head: &Self::Tensor,
+        scorer: &Self::Tensor,
+        markers: &Self::Tensor,
+        head_shape: &[usize],
+        scorer_shape: &[usize],
+        marker_shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let layout = host_ops::laya_act::Layout::new(head_shape, scorer_shape, marker_shape)
+            .unwrap_or_else(|err| panic!("{err}"));
+        let head = self.download_f32(head)?;
+        let scorer = self.download_f32(scorer)?;
+        let markers = self.download_f32(markers)?;
+        self.upload_f32(
+            &layout.output_shape(),
+            &layout.forward(&head, &scorer, &markers),
+        )
+    }
+
     /// Gather hidden-state columns using LAYA's per-sample marker metadata.
     /// Oxide overrides this generic host reference with a native device kernel.
     fn marker_gather_f32(
