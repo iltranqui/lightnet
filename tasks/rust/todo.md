@@ -47,8 +47,10 @@ Run `cargo test -p darknet-core --test cfg_corpus -j 2` alone before believing a
 
 ## Backend / kernel follow-ups
 
+- [x] v0.2.002: native f16 marker-gather compact inference, bit-preserving u16 feature copies and quantized marker rounding. RTX 4060 tests: new f16 suite 4, existing f16 runtime 6, f32 gather 4; host gather 12. Scope/limits and named tests: `implemented.md` §42. No f16 training/full-state API or global GPU completion claim.
+
 - [x] v0.2.001: native f32 `[laya_marker_gather]` full/compact forward and deterministic backward, removing its per-operator host round trip and whole-network CPU-backward fallback. Real RTX 4060 tests: direct ops 4, runtime chain 1, extra-layer regression 24; host marker 12/runtime 271. Evidence and limits: `implemented.md` §41.
-- [ ] **Current operator priority: GPU layers now**, directly without subagents; CPU-first sequencing is explicitly overridden, not completed. Continue `gpu_layers_plan.md` for remaining LAYA/transformer/deformable/CPU-only native paths and GPU Muon. Marker gather f16 remains unsupported. Keep parked, uncommitted YOLO-3D activation work separate; all CPU/config/axis requirements remain open, and sparse MoE stays unstarted.
+- [ ] **Current operator priority: GPU layers now**, directly without subagents; CPU-first sequencing is explicitly overridden, not completed. Continue `gpu_layers_plan.md` for remaining LAYA/transformer/deformable/CPU-only native paths and GPU Muon. Marker gather f16 compact inference is native in v0.2.002; continue with LAYA act-head's detached-feature/frozen-update contract and native f32 port. Keep parked, uncommitted YOLO-3D activation work separate; all CPU/config/axis requirements remain open, and sparse MoE stays unstarted.
 
 - [ ] CUDA graph capture: skipped — cuda-core only has raw begin/end capture (no
   instantiate/launch wrapper) and pool addresses are not static.

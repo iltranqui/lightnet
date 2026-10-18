@@ -67,6 +67,7 @@ file is named inline.
 - [39. Cuboid labels and deterministic truth helpers](#39-cuboid-labels-and-deterministic-truth-helpers)
 - [40. YOLO-3D raw CPU runtime and fail-closed consumers](#40-yolo-3d-raw-cpu-runtime-and-fail-closed-consumers)
 - [41. Native f32 LAYA marker gather](#41-native-f32-laya-marker-gather)
+- [42. Native f16 marker-gather inference](#42-native-f16-marker-gather-inference)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1025,6 +1026,30 @@ Test-first evidence: direct Oxide tests initially failed compilation on missing 
 | `MEM=3G ./tools/test_host.sh runtime::` | 271 core passed; 0 CLI matched |
 
 Targeted edition-2024 Rustfmt and diff checks passed. Tests ran with parked CPU activation code still in the working tree; it is not selected by these filters and adds no GPU dependency. Temporary GPU logs/source snapshot removed after recording results; no weights/sidecars were created by these new tests. No actual training run, benchmark/speedup measurement, unfiltered host/corpus or full Oxide-suite run. GPU status: **native f32 forward/backward/full/compact; f16 remains explicitly unsupported and was not device-tested**. New optimizer evidence is upstream SGD only; this weightless layer has no Muon/Adam parameter blocks, and GPU Muon remains open. Native GPU vs Rust CPU agreement only. Hand-derived from source, no compiled-C++ golden. No overall Stage-1/2/3 completion claim.
+
+## 42. Native f16 marker-gather inference
+
+- v0.2.002 (`32822894`): extended the source-backed marker-gather routing contract to native half-storage inference. `F16TensorOpsBackend::marker_gather_f16` has a numeric generic-backend reference default; the Oxide trait override delegates to the native method in `darknet-cuda-oxide/src/half.rs`, with checked shared layout and actual buffer lengths before allocation/launch. `kernels/layers_extra.rs::marker_gather_f16` copies feature u16 payloads exactly and widens only marker metadata on device, using the existing rounded/clamped position helper. No feature floating-point conversion or operator host round trip.
+- `runtime.rs` permits marker gather in the f16 preflight and replaces its rejection arm with native source dispatch using the existing compact lifetime/use-count mechanism. Existing relative-source resolution and A/B alias handling are preserved. Only `forward_compact_f16` exists for this inference API: no new full-state f16 forward or f16 training/backward API is claimed. F32 training/backward remains from v0.2.001; no parameter, optimizer, checkpoint, config, AMP-global setting or dependency change.
+
+Scoped requirement-to-artifact audit (`oxide_marker_gather_f16.rs`):
+
+| Requirement | Actual test/artifact |
+|---|---|
+| Half bits copied exactly, independent batches/channels, ignored metadata | `marker_gather_f16_native_preserves_feature_bits_and_rounds_half_metadata`: B=2, H=3, T=9, K=7, CB=16; independent IEEE-half CPU decoder, three tile sizes and ragged lengths. An explicit assertion requires every feature edge-case to be selected: quiet/signaling NaN payloads, negative zero, smallest/largest subnormal, smallest normal and infinities. Poison masks/extra columns must not be read |
+| Round after half quantization, not before | `marker_gather_f16_native_uses_quantized_not_original_f32_positions`: f32 immediately below .5/1.5 rounds to half .5/1.5 and therefore selects columns 1/2. Direct bit-input test also covers adjacent half values, duplicate, negative, out-of-range, subnormal and NaN/infinite marker positions |
+| Reject invalid dimensions/storage before unsafe launch | `marker_gather_f16_native_rejects_bad_layouts_and_short_storage`: zero/rank/height/batch/T/channel/overflow cases and truncated feature/marker buffers |
+| Runtime preflight, compact lifetimes, positive/negative references, aliased sources | `marker_gather_f16_runtime_handles_nonprevious_sources_and_aliased_metadata`: two identity convs, B=2, hidden=16, T=5, K=4; sources `0,1` and `-2,-2`; exact CPU gather reference on quantized input. Nonprevious feature source must survive until gather |
+| Native dispatch rather than generic host default | UFCS trait calls in direct tests plus source inspection of the trait override, native allocation/launch and u16 kernel; runtime calls the same trait method |
+
+Tests were written before the new trait/operator existed and failed compilation; the three direct native tests passed before the runtime rejection was replaced. Final serial RTX 4060 Laptop runs, all through 3G systemd scopes with script `-j 2`:
+
+- `MEM=3G ./tools/test_oxide.sh --test oxide_marker_gather_f16`: **4 passed**.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16`: **6 passed**, including existing real-cfg inference and unsupported-mode checks.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_marker_gather`: **4 passed** (f32 forward/backward/FD regressions).
+- `MEM=3G ./tools/test_host.sh marker_gather`: **12 core passed**, 0 CLI matched.
+
+Targeted edition-2024 Rustfmt/diff checks passed; only the newly inserted half.rs blocks were formatted/checked to avoid rewriting that file's existing style. Temporary logs/formatter snippet removed after recording evidence. Parked CPU activation code remained in the working tree but was not selected or committed. No training run, benchmark, full-host/corpus/full-Oxide run, new optimizer proof or compiled-C++ golden. GPU status for marker gather: native f32 full/compact forward/backward and native f16 compact inference. Other layers, GPU Muon, remaining CPU/axis work and sparse MoE remain open. Half storage is a Rust backend extension of the inspected C++ routing math; hand-derived from source, no compiled-C++ golden. Next bounded GPU work is native LAYA act-head, starting with its exact detached-feature and frozen/update contract audit.
 
 ## Not implemented / open (pointer)
 
