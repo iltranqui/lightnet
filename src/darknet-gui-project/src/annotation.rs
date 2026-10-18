@@ -281,9 +281,20 @@ impl Annotation {
         );
         root.insert("version".to_owned(), json!(VERSION));
         root.insert("completely_empty".to_owned(), json!(self.completely_empty));
-        let mut text = serde_json::to_string_pretty(&Value::Object(root))
+        // DarkMark writes `dump(1, '\t') + "\n"` (`G3`): one tab per level.
+        // `serde_json`'s pretty printer uses two spaces, so rewrite the leading
+        // indentation. Only line prefixes are touched, never string contents.
+        let pretty = serde_json::to_string_pretty(&Value::Object(root))
             .unwrap_or_else(|_| "{}".to_owned());
-        text.push('\n');
+        let mut text = String::with_capacity(pretty.len());
+        for line in pretty.lines() {
+            let spaces = line.len() - line.trim_start_matches(' ').len();
+            for _ in 0..spaces / 2 {
+                text.push('\t');
+            }
+            text.push_str(&line[spaces..]);
+            text.push('\n');
+        }
         text
     }
 
@@ -465,6 +476,17 @@ mod tests {
         assert!(text.contains("custom_darkmark_field"), "unknown field must survive");
         let again = Annotation::from_json(&text).unwrap();
         assert_eq!(again.marks, annotation.marks);
+    }
+
+    #[test]
+    fn json_uses_tab_indentation_like_darkmark() {
+        let annotation = Annotation::from_json(SAMPLE).unwrap();
+        let text = annotation.to_json();
+        assert!(text.contains("\n\t\"annotation_mode\""), "{text}");
+        assert!(
+            text.lines().all(|line| !line.starts_with(' ')),
+            "no space indentation may remain"
+        );
     }
 
     #[test]
