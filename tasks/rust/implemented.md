@@ -74,6 +74,7 @@ file is named inline.
 - [46. Standalone native act-head gradient math](#46-standalone-native-act-head-gradient-math)
 - [47. Native `[deform_conv]` forward and backward](#47-native-deform_conv-forward-and-backward)
 - [48. DCNv4 native aggregation primitives (offsets given)](#48-dcnv4-native-aggregation-primitives-offsets-given)
+- [49. Native DCNv4 projection and backward composition](#49-native-dcnv4-projection-and-backward-composition)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1214,6 +1215,12 @@ are untouched.
 
 ## 48. DCNv4 native aggregation primitives (offsets given)
 
+**Evidence correction in v0.2.012 (§49):** the v0.2.009–011 stage reference
+and kernels shared the wrong point count/row stride (`size²`, unpadded rows).
+Their stage parity/FD results did not establish real CPU-layer agreement. Both
+host/device layouts are now corrected and those tests rerun; §49 adds the real
+CPU runtime oracle. Keep the original counts below as historical evidence only.
+
 - v0.2.011 (`8fe32a09`): native f32 `OxideBackend::dcnv4_aggregate_backward_native`
   returns NCHW input adjoints and packed `[B, OH*OW, groups*3*K]` offset/mask
   adjoints; device kernel `kernels/dcnv4.rs::backward` owns each row and uses
@@ -1248,6 +1255,55 @@ were not run; existing corpus residuals remain open. No temporary weights,
 optimizer sidecars, models or test logs were created by this slice. Existing
 compiler IR/PTX and older build trees are retained because the backend workflow
 and prior evidence refer to them; no unrelated cleanup was attempted.
+
+## 49. Native DCNv4 projection and backward composition
+
+- v0.2.012 (`c51b25f6`): `dcnv4_forward_native` now composes native coarse projection,
+  replicated-border lattice interpolation and deformable aggregation, returning
+  raw NCHW output and dense NHWC offset cache. `dcnv4_backward_native` returns
+  input plus positive batch-summed offset weight/bias gradients through all
+  three stages. No tensor downloads/host math, runtime fallback removal,
+  epilogue/optimizer behavior change, f16 support or performance claim.
+- Corrected shared aggregation layout: `K=size²-remove_center`, row width
+  `ceil(groups*3*K/8)*8`, matching `Jev_laya:src-lib/dcnv4_layer.cpp:27–36`
+  and real Rust CPU `dcnv4.rs::layout`. The red host layout test observed
+  row width **27 vs expected 32**. Size=1/remove_center now fails explicitly.
+- Checked `Dcnv4Composition` validates source output extents, positive d_stride,
+  finite scale, padded storage/counts, coarse strides and coordinate arithmetic
+  before unsafe launches. New kernels live in `kernels/dcnv4_projection.rs`;
+  wrappers/types in `dcnv4_native.rs`; aggregation kernels remain in `dcnv4.rs`.
+  Input/weight/coarse gradient scatters use atomics: summation order is not
+  bitwise deterministic. Direct-loop correctness kernels, not a speedup claim.
+
+Scoped requirement-to-artifact audit (serial `-j 2`, MemoryHigh=3G user scopes):
+
+| Requirement | Actual evidence |
+|---|---|
+| Real CPU forward and complete math gradients | `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain`: **3 passed**. `native_composition_matches_real_cpu_outputs_and_all_math_gradients` constructs a real one-layer `ExecutableNetwork`, uses its `forward`/`backward` outputs and compares every output, input gradient, offset weight and bias at abs+rel 3e-4 tolerance. Eighteen cases: B=2, non-square 7x5 input, sizes=1/3/5, groups=1/2, stride x/y=2/1, d_stride=1/2/3, dilation=1/2, all four softmax/remove_center combinations where valid (size=1/remove_center is explicitly rejected). No synthetic stage oracle |
+| Packed axes/padding are real, not shared-proxy agreement | `aggregation_layout_uses_active_points_and_eight_aligned_rows` pins K=9/8 and rows=32/24/48; real CPU parameter cardinalities asserted in chain fixtures. Padding biases are set to 20, but padding weight/bias gradients must remain exactly zero; all active parameter gradients compared |
+| Differentiate full native forward, not only aggregation | `native_composition_matches_device_finite_differences`: all four modes, coarse d_stride=2, every bias plus sampled inputs/weights, signed seed objective via actual native forward; epsilon=0.002, abs tolerance 2e-3; derived coordinate margin >0.48 excludes floor-cell seams |
+| Cache/lifetime/input immutability | Real CPU comparison drops original forward input/weight/bias uploads before independent backward uploads to force pool reuse; output and cache remain live and unchanged, input/weights unchanged after backward |
+| Reject malformed descriptors/storage | `native_composition_rejects_bad_descriptors_and_storage`: zero/overflowing d_stride, nonfinite scale, wrong output extent, overflowing padding, oversized kernel; each short forward operand and each short backward operand rejected |
+| Retain aggregation/FD/edge/error coverage after layout fix | `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_aggregate`: **6 passed**, including size=1/remove_center rejection, eight-aligned padding and corrected compact center-removal slots |
+| Host math regression and source-layout pin | `systemd-run --user --scope -p MemoryHigh=3G cargo test -p darknet-cuda --lib -j 2 -- --test-threads=1`: **36 passed** |
+| CPU/runtime behavior preserved | `MEM=3G ./tools/test_host.sh dcnv4`: **17 core passed**, 0 CLI; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4`: **1 passed** (host fallback plus updates). `runtime.rs` unmodified, `Dcnv4` still forces CPU backward fallback |
+| Native execution rather than generic host defaults | Wrappers launch four `dcnv4_projection` device entries plus existing native aggregation/adjoint; wrapper source has no download/CPU math calls. Both new tests exercise an actual Oxide backend |
+
+Targeted Rustfmt and diff checks passed. Initial device compile caught unsupported
+DisjointSlice indexing (changed to owned, bounds-checked pointer writes); first
+CPU-oracle fixture caught `element_count()` excluding batch (fixed full B=2 data
+length). No failed test is left in the slice. No training/data/model downloads,
+weights, sidecars or logs were created; existing compiler IR/PTX and unrelated
+build trees were inspected and retained. No full-host/corpus/full-Oxide or
+compiled-C++ parity claim: **hand-derived from source, no compiled-C++ golden**.
+
+Completion boundary: this completes standalone raw DCNv4 math composition,
+not the handbook's all-layer goal. **Next:** add trait defaults/Oxide overrides,
+wire both forward and backward/cache selection together, apply existing
+bias/activation/BN semantics, then prove two-step optimizer/weight parity before
+removing runtime/optimizer rejection. Matrix remains **host fallback**. Stage-1
+missing variants/axis pins, other Stage-2 native layers/GPU Muon, and Stage-3
+sparse MoE remain open; these selected tests do not cover them.
 
 ## Not implemented / open (pointer)
 

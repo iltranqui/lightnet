@@ -31,14 +31,19 @@ inference (v0.2.001–002). Act-head features/exact-erf primitives are native f3
 Evidence/limits are in `implemented.md` §§41–45. Do not repeat these ports.
 Act-head uses four uncached weight uploads per forward; no residency/speedup
 claim. Runtime backward still uses CPU, act params remain frozen, f16 rejected.
-Latest GPU slice is v0.2.011: DCNv4 native aggregation adjoint (offsets given),
-following host reference v0.2.009 and native forward v0.2.010. Device tests 6,
-host-cuda 35, host `dcnv4` 17 and Oxide runtime fallback regression 1 passed.
-See `implemented.md` §48 for the coverage audit. Native deform_conv was already
-wired in v0.2.007 within its documented bounds; do not repeat that work.
-**Next:** compose the DCNv4 coarse predictor/upsample + aggregation forward and
-backward, compare all gradients against the real CPU `dcnv4_backward`, then
-consider trait/runtime wiring. The aggregation API alone is not a native layer.
+Latest GPU slice is v0.2.012: DCNv4 coarse predictor/upsample + aggregation
+forward/backward composition, verified against real CPU runtime outputs and all
+input/offset parameter gradients in 18 cases. Chain 3, aggregate 6, host-cuda 36,
+host `dcnv4` 17 and Oxide fallback regression 1 passed. **Layout correction:**
+v0.2.009–011 shared a wrong K/row width; current helpers use K=size²-remove_center
+and rows padded to eight (the real CPU contract). Historical stage-only green
+results were not real CPU-layer parity. See `implemented.md` §49 for the audit.
+Native deform_conv was already wired in v0.2.007 within its documented bounds.
+**Next:** add trait defaults/Oxide overrides for DCNv4 composition, wire both
+forward/cache and backward selection together, preserve epilogue/BN and mixed
+fallback behavior, then verify two-step optimizer/weight parity before removing
+runtime/optimizer rejection. `runtime.rs` has not changed; DCNv4 still uses
+host fallback. Standalone raw native math is not a complete native layer.
 Recheck `version-map.tsv` before allocating another version. Earlier wave
 sections below retain historical findings; this resume point takes precedence.
 
@@ -389,11 +394,13 @@ darknet-cuda --lib` 35 passed) using the cell-centre fixture. Native aggregation
 forward (v0.2.010) and adjoint (v0.2.011) now pass host parity and actual-device
 finite differences; 6 device tests cover batches/groups, masks/center removal,
 strided/dilated/edge geometry and malformed operands. Still not wired.
-Next: compose the full coarse predictor + upsample + aggregation forward and
-backward, compare with real `dcnv4_backward` gradients on a cfg, then the runtime
-gate. Preserve `Dcnv4` in `requires_cpu_backward_fallback` until composition and
-optimizer parity pass; parameter gradients cannot be inferred from aggregation
-adjoints alone.
+v0.2.012 now implements native full raw composition, with real CPU output/input/
+parameter-gradient checks and device finite differences. It also corrects the
+shared old aggregation layout (K=size²-remove_center, padded row width). This
+supersedes the stage-only parity claims above; audit in `implemented.md` §49.
+Next: trait defaults/Oxide overrides, then the coordinated runtime forward/cache/
+backward and epilogue gate, then two-step optimizer parity. Preserve `Dcnv4` in
+`requires_cpu_backward_fallback` until the entire integration is proven.
 
 **Concrete fixture numbers for that attempt** (recomputed from the failing case,
 `softmax=false, remove_center=false`, `size=3, pad=1, scale=0.75`, output cell

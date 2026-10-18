@@ -183,11 +183,13 @@ an `UnsupportedLayer`.
 > The only host-resident step in the device path is the batch-serial
 > normalization Jacobian. `[dcnv4]`, `[dsconv]` and `[graph_conv]` remain
 > unwired. DCNv4's smaller cache is `{ offsets, raw_output }`; v0.2.009–011
-> provide host and native aggregation forward/adjoint primitives (offsets given,
-> at most 25 points on device), verified by 6 device tests. Full coarse-predictor/
-> upsample composition, parameter-gradient parity and runtime/update wiring are
-> still missing; its matrix status remains host fallback. See `implemented.md`
-> §48 and `gpu_layers_plan.md`.
+> provide aggregation primitives; v0.2.012 corrects their old shared K/row-stride
+> bug (active points and padding to eight) and composes native coarse projection,
+> upsample and aggregation forward/backward. Real CPU output/input/parameter
+> gradients agree across 18 cases (3 chain tests); aggregate regression 6 passes.
+> Trait/default migration and runtime/cache/epilogue/update wiring remain open,
+> so the matrix status remains host fallback. See `implemented.md` §49 and
+> `gpu_layers_plan.md`.
 
 ## GPU forward but CPU backward
 
@@ -199,7 +201,7 @@ layer count.
 | Variant | GPU forward | Missing backward piece |
 |---|---|---|
 | `Deconvolutional` | host round trip (`deconv_forward` on host) | device deconv dgrad/wgrad |
-| `Dcnv4` | host round trip | full predictor/upsample + aggregation backward composition and runtime wiring (aggregation adjoint exists) |
+| `Dcnv4` | host round trip | trait/default migration, runtime/cache/epilogue/update wiring (native raw composition exists, v0.2.012) |
 | `Vit` | host round trip | device attention/MLP backward (flash dQ/dK/dV primitives exist) |
 | `Swin` | host round trip | device windowed-attention backward |
 | `TuckerAttention` | host round trip | device low-rank factor backward |
