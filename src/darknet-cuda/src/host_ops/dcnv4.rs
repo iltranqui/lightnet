@@ -64,6 +64,40 @@ impl Dcnv4Geometry {
         if self.channels % self.groups != 0 {
             return Err("dcnv4 aggregation: groups must divide channels".to_owned());
         }
+        // Launchers use these extents for allocations and unsafe device indexing.
+        // Reject overflow before any unchecked product in the accessors above.
+        let product = |dims: &[usize]| {
+            dims.iter()
+                .try_fold(1usize, |n, &d| n.checked_mul(d))
+                .filter(|&n| n <= i64::MAX as usize)
+                .ok_or_else(|| "dcnv4 aggregation: dimension product overflow".to_owned())
+        };
+        product(&[self.size, self.size])?;
+        product(&[self.groups, self.size, self.size, 3])?;
+        product(&[self.input_height, self.input_width])?;
+        product(&[
+            self.batch,
+            self.channels,
+            self.input_height,
+            self.input_width,
+        ])?;
+        product(&[self.output_height, self.output_width])?;
+        product(&[
+            self.batch,
+            self.channels,
+            self.output_height,
+            self.output_width,
+        ])?;
+        product(&[
+            self.batch,
+            self.output_height,
+            self.output_width,
+            self.groups,
+            self.size,
+            self.size,
+            3,
+        ])?;
+        product(&[self.dilation, self.size - 1])?;
         Ok(())
     }
 }
@@ -162,10 +196,8 @@ pub fn aggregate(
                         }
                         let ox = row[group_offset + 2 * point];
                         let oy = row[group_offset + 2 * point + 1];
-                        let sx =
-                            p0_x_scaled + (kw as f32 * g.dilation as f32 + ox) * offset_scale;
-                        let sy =
-                            p0_y_scaled + (kh as f32 * g.dilation as f32 + oy) * offset_scale;
+                        let sx = p0_x_scaled + (kw as f32 * g.dilation as f32 + ox) * offset_scale;
+                        let sy = p0_y_scaled + (kh as f32 * g.dilation as f32 + oy) * offset_scale;
                         let mask = masks[point];
                         for d in 0..cpg {
                             let channel = group * cpg + d;
@@ -228,18 +260,22 @@ pub fn aggregate_backward(
                         }
                         let ox = row[group_offset + 2 * point];
                         let oy = row[group_offset + 2 * point + 1];
-                        let sx =
-                            p0_x_scaled + (kw as f32 * g.dilation as f32 + ox) * offset_scale;
-                        let sy =
-                            p0_y_scaled + (kh as f32 * g.dilation as f32 + oy) * offset_scale;
+                        let sx = p0_x_scaled + (kw as f32 * g.dilation as f32 + ox) * offset_scale;
+                        let sy = p0_y_scaled + (kh as f32 * g.dilation as f32 + oy) * offset_scale;
                         let mask = masks[point];
                         let (mut gx, mut gy, mut gm) = (0.0f32, 0.0f32, 0.0f32);
                         for d in 0..cpg {
                             let channel = group * cpg + d;
                             let base = (b * g.channels + channel) * plane;
                             let top = output_grad[(b * g.channels + channel) * spatial + q];
-                            let (value, dy, dx) =
-                                sample_and_slopes(input, base, g.input_height, g.input_width, sy, sx);
+                            let (value, dy, dx) = sample_and_slopes(
+                                input,
+                                base,
+                                g.input_height,
+                                g.input_width,
+                                sy,
+                                sx,
+                            );
                             scatter(
                                 &mut d_input,
                                 base,
@@ -344,19 +380,16 @@ mod tests {
                         .map(|(v, s)| v * s)
                         .sum()
                 };
-                let check = |analytic: f32,
-                             base: f32,
-                             what: &str,
-                             index: usize,
-                             f: &dyn Fn(f32) -> f32| {
-                    let eps = 1e-2f32;
-                    let want = (f(base + eps) - f(base - eps)) / (2.0 * eps);
-                    assert!(
-                        (analytic - want).abs() < 5e-3 + 5e-3 * want.abs(),
-                        "{what}[{index}] sm={softmax} rc={remove_center}: \
+                let check =
+                    |analytic: f32, base: f32, what: &str, index: usize, f: &dyn Fn(f32) -> f32| {
+                        let eps = 1e-2f32;
+                        let want = (f(base + eps) - f(base - eps)) / (2.0 * eps);
+                        assert!(
+                            (analytic - want).abs() < 5e-3 + 5e-3 * want.abs(),
+                            "{what}[{index}] sm={softmax} rc={remove_center}: \
                          analytic {analytic} vs fd {want}"
-                    );
-                };
+                        );
+                    };
                 for i in (0..input.len()).step_by(3) {
                     check(d_input[i], input[i], "d_input", i, &|v| {
                         let mut x = input.clone();

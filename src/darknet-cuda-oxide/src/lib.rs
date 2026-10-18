@@ -99,6 +99,7 @@ pub struct OxideBackend {
     deform_sample: deform_sample::kernels::LoadedModule,
     deform_backward: deform_sample::backward::LoadedModule,
     dcnv4: dcnv4::kernels::LoadedModule,
+    dcnv4_backward: dcnv4::backward::LoadedModule,
     layers_extra: layers_extra::kernels::LoadedModule,
     residual_epilogue: layers_extra::residual::LoadedModule,
     conv_mode: ConvMode,
@@ -522,6 +523,8 @@ impl OxideBackend {
             .map_err(|err| OxideError::Shape(format!("load deform_sample::backward module: {err:?}")))?;
         let dcnv4 = dcnv4::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load dcnv4 module: {err:?}")))?;
+        let dcnv4_backward = dcnv4::backward::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load dcnv4::backward module: {err:?}")))?;
         let residual_epilogue = layers_extra::residual::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load residual epilogue module: {err:?}")))?;
         let layers_extra = layers_extra::kernels::load(&ctx)
@@ -571,6 +574,7 @@ impl OxideBackend {
             deform_sample,
             deform_backward,
             dcnv4,
+            dcnv4_backward,
             residual_epilogue,
             conv_mode: ConvMode::from_env(),
             bwd_fp8: fp8_backward_from_env(),
@@ -3108,6 +3112,84 @@ impl OxideBackend {
                 geometry.output_height,
                 geometry.output_width,
             ],
+        ))
+    }
+
+    /// Device adjoint of [`Self::dcnv4_aggregate_native`]: `(d_input, d_offsets)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dcnv4_aggregate_backward_native(
+        &self,
+        input: &OxideTensorF32,
+        offsets: &OxideTensorF32,
+        output_grad: &OxideTensorF32,
+        geometry: darknet_cuda::host_ops::dcnv4::Dcnv4Geometry,
+        offset_scale: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(OxideTensorF32, OxideTensorF32), OxideError> {
+        let op = "dcnv4_aggregate_backward_native";
+        geometry.checked().map_err(|msg| shape_err(op, msg))?;
+        let points = geometry.kernel_points();
+        if points > crate::kernels::dcnv4::MAX_POINTS {
+            return Err(shape_err(
+                op,
+                format!("kernel area {points} exceeds the device limit"),
+            ));
+        }
+        let plane = geometry.input_height * geometry.input_width;
+        let spatial = geometry.spatial();
+        let offset_dim = geometry.offset_dim();
+        if input.len() != geometry.batch * geometry.channels * plane
+            || offsets.len() != geometry.batch * spatial * offset_dim
+            || output_grad.len() != geometry.batch * geometry.channels * spatial
+        {
+            return Err(shape_err(op, "operand length mismatch".to_owned()));
+        }
+        let d_input = self.alloc(geometry.batch * geometry.channels * plane)?;
+        let d_offsets = self.alloc(geometry.batch * spatial * offset_dim)?;
+        let threads = geometry.batch * geometry.groups * spatial;
+        // SAFETY: one thread per (batch, group, cell); `d_offsets` slots are
+        // owned by that thread, `d_input` is written only by atomic adds into a
+        // zeroed buffer of the validated extent.
+        unsafe {
+            self.dcnv4_backward.dcnv4_aggregate_backward(
+                &self.stream,
+                launch::elementwise(threads, config),
+                &input.buf,
+                &offsets.buf,
+                &output_grad.buf,
+                d_input.cu_deviceptr() as *mut f32,
+                d_offsets.cu_deviceptr() as *mut f32,
+                geometry.channels,
+                geometry.groups,
+                geometry.input_height,
+                geometry.input_width,
+                geometry.output_height,
+                geometry.output_width,
+                geometry.size,
+                geometry.stride_x,
+                geometry.stride_y,
+                geometry.padding,
+                geometry.dilation,
+                u32::from(geometry.softmax),
+                u32::from(geometry.remove_center),
+                offset_scale,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok((
+            OxideTensorF32::new(
+                d_input,
+                &[
+                    geometry.batch,
+                    geometry.channels,
+                    geometry.input_height,
+                    geometry.input_width,
+                ],
+            ),
+            OxideTensorF32::new(
+                d_offsets,
+                &[geometry.batch, geometry.spatial(), geometry.offset_dim()],
+            ),
         ))
     }
 
