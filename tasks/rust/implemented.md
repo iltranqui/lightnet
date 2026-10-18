@@ -71,6 +71,8 @@ file is named inline.
 - [43. Native detached act-head feature primitive](#43-native-detached-act-head-feature-primitive)
 - [44. Native exact-erf GELU primitives](#44-native-exact-erf-gelu-primitives)
 - [45. Native act-head f32 forward composition](#45-native-act-head-f32-forward-composition)
+- [46. Standalone native act-head gradient math](#46-standalone-native-act-head-gradient-math)
+- [47. Native `[deform_conv]` forward and backward](#47-native-deform_conv-forward-and-backward)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1133,10 +1135,88 @@ Test-first: the host probe failed on the old CPU-forward calls and the malformed
 
 Targeted edition-2024 Rustfmt/diff checks passed; only new CPU-module probe blocks were formatted to avoid unrelated style churn. Temporary logs/formatter snippet removed after recording evidence; no file weights/sidecars created. Parked CPU math remained unselected/outside this release. No actual training run, benchmark, full-host/corpus/full-Oxide or compiled-C++ golden. GPU status: **native f32 full/compact forward; CPU backward; frozen/no act-head updates preserved; f16 unsupported**. Next independent work can implement standalone native act-head gradient math without changing runtime eligibility or applying updates until the operator question is resolved. All broader CPU/config/axis, GPU/GPU Muon and sparse-MoE requirements remain open. Hand-derived from source, no compiled-C++ golden.
 
+## 46. Standalone native act-head gradient math
+
+- v0.2.006 (`2ffc33e2`): added `F32TensorOpsBackend::laya_act_head_backward_f32`, typed resident operands/results (`LayaActBackwardInputs`, `LayaActHeadGrad`) and shared composition in `darknet-cuda/src/laya_act.rs`. Immutable `MlpLayout` in `host_ops/laya_act.rs` validates source views and positive/bounded MLP products before construction. Oxide's override in `src/lib.rs` checks all seven buffer lengths and canonical parameter/seed metadata before any math; source storage uses the declared NCHW views, like the existing feature primitive. Seeds accept `[B,A]` or `[B,A,1,1]`.
+- Composition uses existing feature, connected, exact-erf forward/backward, connected-backward and route-copy operations: recompute x/preactivation/hidden, compute fc2 gradients, apply exact activation chain, compute fc1 gradients, extract the first H input-gradient columns as `[B,H]` dcls. All four parameter gradients are positive, **batch-summed**, not averaged or optimizer updates. The last four feature adjoints are discarded; no scorer/marker gradients escape. Fc2 bias **values** are unnecessary for this Jacobian, so are not an operand; fc2 bias gradients are still returned.
+- Existing Oxide overrides for every composed operation use device kernels/private GEMM; no new GPU kernel, host tensor downloads/math, parameter upload, persistent cache, compiler change, runtime dispatch or optimizer mutation was introduced. Generic backends use their own primitive implementations and may execute host references. Verified precision is explicit `GemmMode::Fp32`, not all backend precision/AMP modes.
+
+Scoped requirement-to-artifact audit (`oxide_laya_act_backward.rs`):
+
+| Requirement | Actual evidence |
+|---|---|
+| All four gradients and dcls match CPU, sign and batch convention | `laya_act_backward_native_all_blocks_and_cls_match_cpu_sums_without_updates`: B=2, H=3, K=4, CB=10, T_head=5, T_marker=3, F=5, A=3; mixed/all-masked inputs, signed/zero/nonunit seeds and three tile lengths. Explicit db2=(.5,.5,-1.5) proves sum rather than mean; all result metadata checked and all seven resident operands remain unchanged |
+| Honest oracle domain | CPU `laya_act_head.rs::validate_shapes` requires CB exactly 2*K, whereas native feature views allow extra ignored channels. The first oracle call failed on CB=10; tests now compact only each sample's unused trailing channels for the CPU oracle (CB=8), preserving every read mask value. No CPU validator/schema changed, and no full CPU/config parity for CB>2K is claimed |
+| Actual GPU-forward finite differences | `laya_act_backward_native_matches_actual_gpu_forward_parameter_and_cls_fd`: two selected entries per parameter block (8 total) plus 3 CLS/2 non-CLS input coordinates, epsilon .001 and tolerance .001. Device forward composition is scored directly; scorer/marker buffers remain fixed to honor detach semantics |
+| Checked descriptors/operand storage/layout | `laya_act_backward_native_checks_layout_all_operands_and_seed_metadata`: zero/overflow F/A, invalid head/marker views, each of seven truncated operands, equal-length wrong fc1/fc2/bias/seed metadata. Constructor state is private/immutable, preventing safe mutation into unchecked dimensions |
+| Owned results, not dangling operand views | `laya_act_backward_native_results_outlive_temporary_operand_buffers`: drops all operand buffers, forces allocator-pool reuse with fifteen new uploads and verifies all five gradient outputs afterward |
+| No premature native-runtime/update claim | Runtime source, fallback selection, act-head buffers/eligibility, optimizer/checkpoint handling and f16 rejection are unchanged. Returned dcls is not full sequence scatter; the new API is not called by runtime backward |
+
+Test-first: missing imports/methods failed compilation before implementation. Final serial RTX 4060 Laptop runs, 3G scopes/script `-j 2`:
+
+- `MEM=3G ./tools/test_oxide.sh --test oxide_laya_act_backward`: **4 passed**.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_laya_act_forward`: **2 passed**.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_gelu_erf`: **4 passed**.
+- `MEM=3G ./tools/test_host.sh laya_act_head`: **11 core passed**, 0 CLI matched.
+
+Targeted edition-2024 Rustfmt/diff checks passed. Temporary logs removed after recording evidence; no weight/sidecar files created. Parked CPU math remained unselected/outside this release. No real training, benchmark, unfiltered host/corpus/full-Oxide run or compiled-C++ golden. GPU status: standalone f32 gradient math native; act-head runtime still has native f32 forward plus CPU backward, frozen updates and unsupported f16. Source-training question, full-sequence adjoint routing, runtime/update/file-loading integration and broader CPU/axis/GPU Muon/sparse-MoE work remain open. Hand-derived from source, no compiled-C++ golden.
+
+## 47. Native `[deform_conv]` forward and backward
+
+v0.2.007 (`15fc3f8c9cd96cae8c315fbea78821cac867cd40`). The version map was also
+missing v0.2.006's row; both are appended (indices 306, 307).
+
+- Shared deformable sampling implemented twice and kept in agreement: host
+  contract `darknet_cuda::host_ops::bilinear_gather` (`BilinearGatherGeometry`,
+  `forward`, `backward`, `sample_at`) and device kernels
+  `src/darknet-cuda-oxide/src/kernels/deform_sample.rs`. Contract taken from
+  `darknet_core::deform_conv::bilinear_sample`, including the far-outside
+  zero-gradient early-out, the floor-cell one-sided convention at integers, and
+  NaN propagation.
+- Five forward stages on device: offset/mask predictor (a `groups = 1`
+  convolution — `deform_offset_predict`), per-batch statistics
+  (`deform_offset_stats`, f64, source gate order), envelope
+  (`deform_offset_envelope`: sanitize → optional normalize → sanitize → centered
+  lhtan), mask sigmoid, and the deformable accumulation
+  (`deform_conv_accumulate`, ±10000 sanitize).
+- Four backward stages, each FD-verified in isolation, then composed:
+  accumulation adjoint (4 atomic scatter targets), envelope slope adjoint,
+  the batch-coupled normalization Jacobian (`offset_normalization_backward`),
+  and the predictor + column-gather adjoint.
+- Runtime wiring: `DeformDeviceCache` holds the device intermediates; a single
+  shared predicate (`has_host_only_deform`: `dilation != 1 || batch_normalize`)
+  gates **both** directions; `DeformConv` left
+  `requires_cpu_backward_fallback`; the backward arm composes the trait
+  primitives, performs exactly one host hop (normalization Jacobian + stage-1
+  slope), applies the activation derivative and `bias_backward`, and accumulates
+  into the existing `LayerTrainBuffers::DeformConv` fields.
+
+Scoped requirement-to-artifact audit:
+
+| Requirement | Actual evidence |
+|---|---|
+| Host contract for sampling | `cargo test -p darknet-cuda --lib` (33 tests, 6 for `bilinear_gather`) |
+| Device sampling parity incl. adjoint | `MEM=3G ./tools/test_oxide.sh --test oxide_deform_gather` — 5 passed |
+| Forward stages + composition | `--test oxide_deform_conv_accumulate` 8 passed, `--test oxide_deform_envelope` 14 passed |
+| Forward vs the real CPU runtime | `--test oxide_deform_conv_chain` 3 passed (masked/unmasked + dilation rejection) |
+| Backward stages FD-exact | `cargo test -p darknet-cuda --lib` (accumulation 4 operand groups, envelope both modes, normalization Jacobian through recomputed stats, predictor) |
+| Backward vs the real CPU backward | `--test oxide_deform_conv_backward_chain` 3 passed (main/offset/mask weights and biases) |
+| Device backward composition | included in the same suite's `native_backward_composition_matches_the_cpu_gradients` |
+| Runtime device path end to end | `--test oxide_runtime_chain` 26 passed, incl. `deform_conv_device_path_matches_cpu_chain_and_updates` (forward outputs, one SGD step, every parameter block, "parameters actually moved") and the retained BN host-fallback test |
+| Host path unaffected | `MEM=3G ./tools/test_host.sh deform_conv` 23 passed |
+| Honest scope | `layer-support.md` records `native (dilation 1, no BN) / host otherwise`; the one host hop is documented; no compiled-C++ golden exists |
+
+Deliberately not done: `dilation > 1` and batch-norm variants stay on the host
+path (tested); `f16` is not supported for the layer; no benchmark or speedup
+claim; `[dcnv4]`, `[dsconv]`, `[graph_conv]` and the remaining hard-reject layers
+are untouched.
+
 ## Not implemented / open (pointer)
 
 See `tasks/rust/todo.md` for the deduplicated open list (P8/P9 follow-ups,
 fp16 remainder, hardware-blocked wgmma/tcgen05/NVFP4/multi-GPU, and Stage-2 GPU
 Muon), `layers.md` for Phases 1b–4 (remaining layers),
-`fp8_fp4.md` for FP8 step 5, and `gui_plan.md` for the deferred GUI plan; ONNX
-export is complete.
+`layer-support.md` for the per-`LayerKind` CPU/GPU/f16/axis matrix and the
+current gap lists (GPU hard rejections, forward-but-CPU-backward layers,
+partial device paths), `fp8_fp4.md` for FP8 step 5, and `gui_plan.md` for the
+GUI plan (partly implemented in v0.1.019–v0.1.021); ONNX export is complete.

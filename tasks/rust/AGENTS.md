@@ -67,18 +67,19 @@ A `cfg_corpus` timeout is neither a pass nor a failure.
 
 | File | LOC | Role | Open when |
 |---|---|---|---|
-| `STATUS.md` | 693 | Resume point: ground rules, per-version "Implemented" log, evidence gaps | Need history of a version or an evidence gap |
-| `todo.md` | 437 | Deduplicated open items by area | Choosing next work |
-| `implemented.md` | 612 | Consolidated done ledger (sections 1–15) | Checking whether X exists |
+| `STATUS.md` | 803 | Resume point: ground rules, per-version "Implemented" log, evidence gaps | Need history of a version or an evidence gap |
+| `layer-support.md` | 310 | Per-`LayerKind` CPU/GPU/f16/axis matrix + gap lists; derived from code, not prose. Local-only (`git add -f` to track) | Checking whether a layer has a CPU port, a GPU path, or an axis pin |
+| `todo.md` | 521 | Deduplicated open items by area | Choosing next work |
+| `implemented.md` | 1222 | Consolidated done ledger (sections 1–47) | Checking whether X exists |
 | `plan-open-items.md` | 280 | Waves 0–2 done; remaining scope = layer parity + axis alignment (checklist, backlog) | Dispatching the next layer task |
-| `layers.md` | 3365 | Layer Port Contract (lines 61–97) + Phase 0 TDD recipe + phase tables (end of file) | Porting a layer: read the contract and the tail only |
+| `layers.md` | 3396 | Layer Port Contract (lines 61–97) + Phase 0 TDD recipe + phase tables (end of file) | Porting a layer: read the contract and the tail only |
 | `onnx.md` | 1238 | 21-step ONNX export plan, complete (Rust-runtime numeric checks passed) | Evidence/history for `export-onnx` |
 | `carpn_map_plan.md` | 84 | CARPN sample-level mAP dispatch plan; API implementation complete | Evidence for caller-supplied sample behavior |
-| `carpn_network_map_plan.md` | 127 | CARPN CPU network inference, detection, and direct `detector map` plan; not started; CARPN training/`train -map` deferred | Dispatching the network-level inference work |
-| `gui_plan.md` | 330 | Merged egui GUI plan (M0–M6), not started; starts after `onnx.md` | Only if user wants the GUI |
+| `carpn_network_map_plan.md` | 134 | CARPN CPU network inference, `detect-image`, and direct `detector map`; shipped in v0.0.259; CARPN training/`train -map` deferred | CARPN training work |
+| `gui_plan.md` | 265 | Merged egui GUI plan (M0–M6); partly implemented in v0.1.019 (JSON+txt sidecars, scan/filter/nav/undo, edit model, actions, project creation, class remap, `detect-server` + worker, launcher/canvas/views/class-editor/overlay). Open: class add/delete dialog, mapped-but-unimplemented hotkeys, train runner, DarkMark file diff | GUI work |
 | `archive/` | - | Superseded `gui_iced_plan.md`, `gui_code_phase_plan.md`; the latter holds DarkMark ground-truth tables G1–G17/D1–D16 | Citing `Gn`/`Dn` |
 | `MOE.md` | 150 | True sparse `[moe_convolutional]` plan (opt-in, CPU then GPU, dense-masked as oracle), literature, open questions | Sparse MoE work |
-| `gpu_layers_plan.md` | - | Operator-authorized GPU-first continuation; remaining native layer work; next native act-head gradient math | GPU layer work and resume |
+| `gpu_layers_plan.md` | 315 | Operator-authorized GPU-first continuation; deformable wave 1 forward+backward are implemented and verified but **not wired**; runtime integration plan with exact file:line references at the end | GPU layer work and resume |
 | `runtime_modularization_plan.md` | 125 | Plan to split the 37k-line `runtime.rs` into a `runtime/` module tree (phases P0–P7, no API change) | Refactoring or adding a layer arm in `runtime.rs` |
 | `fp8_fp4.md` | 125 | FP8 GEMM / FP4 emulation design, sm_89 | FP8/FP4 work |
 | `vit_plan.md`, `vit_notes.md` | 71 | `[vit]` subplan and source audit | ViT / attention work |
@@ -89,6 +90,7 @@ A `cfg_corpus` timeout is neither a pass nor a failure.
 
 ## Current State
 
+- Per-kind CPU/GPU/f16/axis status is tabulated in `layer-support.md`; use it instead of re-deriving from plan prose.
 - Waves 0–2 of `plan-open-items.md` are complete: Waves 0–1 (v0.0.247–253) closed the OBB CPU training gaps; Wave 2 implemented ONNX export (`v0.0.254`–`v0.0.257`) and completed docs as `2b998051`; v0.0.258 adds caller-supplied CARPN mAP dispatch.
 - ONNX evidence: `MEM=3G ./tools/test_host.sh onnx` passed 11 core tests; `MEM=3G ./tools/test_host.sh export_onnx_args` passed 1 CLI test; CLI build passed. ONNX Runtime worst relative errors were `3.257e-06` fused, `3.908e-05` unfused, and `3.831e-06` Mish, all under `1e-4`. Rust-runtime parity only, not compiled-C++ parity.
 - `MEM=3G` host tests ran in a user systemd scope. Full baseline remains non-green: four known `cfg_corpus` OOM/timeout cases remain unresolved (CSPX p7-mish and p7-mish_hp SIGKILL/OOM at ~7 GiB; `lstm.train.cfg` and `rnn.train.cfg` hit the 300 s CPU timeout). Do not claim a green host suite.
@@ -112,7 +114,7 @@ Stage 1 remains incomplete at v0.1.026. The operator explicitly authorized GPU p
 
 **Sparse MoE (also in scope):** `[moe_convolutional]` currently runs every expert and masks the output (same as C++). `MOE.md` plans an opt-in true sparse path (CPU first, then GPU) that must equal the dense-masked result.
 
-Current gaps and completed CPU work (see `implemented.md`, `todo.md`, and `STATUS.md`; latest CPU increment is v0.1.026; latest GPU increment is v0.2.005):
+Current gaps and completed CPU work (see `implemented.md`, `todo.md`, `layer-support.md`, and `STATUS.md`; latest CPU increment is v0.1.026; latest GPU increment is v0.2.006):
 
 1. **`[yolo_3d]` remains a partial v0.1 layer, not a complete port.** The `depth_3d` source confirms scope, and `[dpt_head]` is CPU-ported. The accepted `yolo_3d_plan.md` supersedes the draft; S1–S13 are transcribed in `yolo_3d_notes.md`. v0.1.024 adds config/spec/shape helpers; v0.1.025 adds standalone label/truth helpers; v0.1.026 integrates network aliases/shared class-K validation and weightless raw CPU forward/exact supplied-seed backward, with checkpoint/optimizer and legacy consumer/GPU rejection tests (`implemented.md` §§38–40). The `yolo_3d` filter passes 42 core + 1 CLI tests. Next: projected math/assignments/loss and exact derivatives, standalone/mixed training APIs consuming truths and map/counter metadata, decode/evaluator and the A2 output-axis pin; then depth/metric CPU support. Seeded optimizer tests are not full loss-to-conv training evidence; all legacy detector consumers still reject cuboid networks. Axis status remains Open, GPU status none, no compiled-C++ golden. The plan's projected version numbers are stale; use `version-map.tsv` and never reuse them.
 2. **DSConv multi-template `morph=0/1` is required for full source parity and remains an open v0.1 gap.** The executable C++ CPU forward implements multi-view averaging and training-time view dropout (`Jev_laya:src-lib/dsconv_layer.cpp:597-638`), although the header calls it experimental and the CPU backward is a stub. Rust v0.1.002 explicitly rejects it. Treat the variant as a separate Opus-planned task covering cached active views and exact gradients for all offset blocks; do not claim full DSConv parity yet.

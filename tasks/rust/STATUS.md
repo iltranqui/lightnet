@@ -14,7 +14,7 @@ is next. The authoritative plan is `tasks/rust/layers.md`; the FP8/FP4 plan is
 - [Verification commands](#verification-commands)
 - [NEXT (general layer-port roadmap)](#next-general-layer-port-roadmap)
 - [Known evidence gaps (not user questions)](#known-evidence-gaps-not-user-questions)
-- [Task plans: ONNX complete; GUI deferred](#task-plans-onnx-complete-gui-deferred)
+- [Task plans: ONNX complete; GUI partly implemented](#task-plans-onnx-complete-gui-partly-implemented)
 
 ## Ground rules (do not violate)
 
@@ -26,6 +26,8 @@ is next. The authoritative plan is `tasks/rust/layers.md`; the FP8/FP4 plan is
   deviations only under `GradMode::Cpp`.
 - Unknown config = error, never silent identity.
 - Commit only the files a change names.
+- Per-kind CPU/GPU/f16/axis status lives in `layer-support.md` (code-derived).
+  Read it before scheduling layer work; do not re-derive from plan prose.
 
 ## User decisions (2026-10-04) — all Open Questions answered YES
 
@@ -44,7 +46,18 @@ FP8/FP4, layer-port Phases 0 / 1b / 2A / 2B-CPU and the Phase 3A shared
 primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
+**v0.2.007 (`15fc3f8c`)**: native `[deform_conv]` forward and backward on the
+device, gated on `dilation == 1` without batch norm with the host path retained
+for the excluded variants. Evidence: host 33, `oxide_deform_gather` 5,
+`oxide_deform_conv_accumulate` 8, `oxide_deform_envelope` 14,
+`oxide_deform_conv_chain` 3, `oxide_deform_conv_backward_chain` 3,
+`oxide_runtime_chain` 26 (incl. the device-path and the BN host-fallback cases),
+`test_host.sh deform_conv` 23. One host hop remains (the batch-coupled
+normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
+compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
+
 Latest increments:
+- v0.2.006 (`2ffc33e2`): standalone native f32 act-head gradient API returns all four batch-summed parameter gradients plus `[B,H]` dcls, composing native feature/dense/exact-erf/backward/route operations. No runtime/eligibility/update/f16 change. Immutable checked MLP descriptor and native operand/metadata guards added. RTX 4060/Fp32, serial 3G scopes: new backward suite 4 passed, forward regression 2, exact-erf regression 4, host act-head 11. CPU oracle compacts only ignored extra marker channels because its full-helper validator requires exact 2*K; details, GPU FD and allocator-lifetime audit in `implemented.md` §46. Targeted Rustfmt/diff checks passed. Next independent math: full-sequence CLS-adjoint scatter; runtime backward remains CPU and the training question is unanswered. No full-suite/performance/compiled-C++ parity claim.
 - v0.2.005 (`79ce20bb`): act-head f32 full/compact forward now composes native feature, dense and exact-erf GELU ops instead of downloading inputs for host MLP math. Four parameter blocks upload each call (no residency/speedup claim), ensuring warm-call edits and in-memory blob replacement are visible. RTX 4060/Fp32 real tests 2 passed; exact-erf regression 4; host act-head 11 and runtime 273 passed under serial 3G scopes. CPU-call probe, errors, source alias/lifetime and unchanged CPU-backward/frozen-update evidence: `implemented.md` §45. Targeted Rustfmt/diff checks passed. GPU status native f32 forward only; CPU backward remains, f16 rejected, training question and shared-file loader gaps open. Next independent slice: native gradient math without changing optimizer eligibility/application. No full-suite/performance/compiled-C++ parity claim.
 - v0.2.004 (`eec5eab0`): dedicated native f32 exact-erf GELU forward/seeded backward via supported NVIDIA libdevice device-FFI; no compiler changes or tanh/cfg/AMP/f16 semantics changes. RTX 4060, serial 3G scopes: `oxide_gelu_erf` 4 passed, `oxide_grad_methods` 2 passed/1 ignored timed benchmark, act-head feature regression 3 passed, host `gelu` 2 passed. Targeted Rustfmt/diff checks passed. Closed-form, actual GPU FD, nonfinite/error-path and native-linkage audit: `implemented.md` §44. This is a primitive, not runtime integration; act-head still uses host fallback. Next independent slice: native f32 act-head forward composition; preserve CPU backward and current training behavior while the unanswered source-training question is resolved. No full-suite/performance/compiled-C++ parity claim.
 - v0.2.003 (`3de7c327`): standalone native f32 act-head CLS plus detached summary-feature primitive, not yet wired into runtime. RTX 4060, serial 3G scopes: new `oxide_laya_act_features` 3 passed, extra-layer regression 24, f16 gather 4, host `laya_act_head` 9. Targeted Rustfmt/diff checks passed; source/requirement audit in `implemented.md` §43. Audit confirmed C++ act-head trains all four parameter blocks while Rust runtime discards their gradients; the frozen-vs-trainable question remains unanswered, so training behavior is unchanged. Existing GPU GELU is tanh-approximate, not the required exact erf variant. Next independent prerequisite: native exact-erf GELU; full MLP/backward/update and runtime fallback removal remain open. Act-head GPU status still host fallback; no full-layer/full-suite/compiled-C++ parity claim.
@@ -726,15 +739,17 @@ believing a `cfg_corpus` failure.
    `[laya_encoder]` + `[laya_head]` (the shared-file offset is computed past
    their blobs), so those two come next even though the plan files them under
    Phase 4. They also need the Phase 3A prerequisite kernel set.
-2. Phase 2A is done, including `detect::decode_modern_detections` and the
-   `detect-image` merge. Phase 2B `moe_convolutional` has a verified CPU path
-   and partial Oxide forward/backward; no-BN router/expert SGD and Adam are now
-   device-side; BN expert backward and Adam use backend ops, while BN expert
-   SGD remains host-side.
-   Remaining across the phases:
-   `cfg/LegoGears_centernet.cfg` end to end (the cfg lives on `Jev_laya`), then
-   2B's `eml_convolutional`, 2C (OBB), remaining 3A/3B attention and deformable
-   families (shared LayerNorm/GEMM kernel set first), and 4.
+2. Phase 2A is **complete** (yolox, ppyoloe/yolonas shared DFL, centernet,
+   nested-object fix, `detect::decode_modern_detections`, `detect-image` merge).
+   Phase 2B `moe_convolutional` has a verified CPU path and device
+   forward/backward plus device SGD/Adam (v0.0.273–v72 area; see
+   `implemented.md` §7 and `layer-support.md` for the remaining partials).
+   `eml_convolutional` is integrated (`LayerKind::EmlConvolutional`) with
+   device forward/backward and device SGD/Adam; C++ batch-stat BN training
+   remains open.
+   Remaining across the phases: `cfg/LegoGears_centernet.cfg` end to end (the
+   cfg lives on `Jev_laya`), 2C OBB (CARPN Stage-2 training; broader GPU OBB),
+   remaining 3A/3B native GPU work, and 4.
 3. **Phase 3A prerequisite (2) is complete**: LayerNorm fwd/bwd, the fused
    residual/bias epilogue, the row-softmax backward and the batched-GEMM wrapper
    (`linear_f32`) are all in, each with a host default plus GPU parity tests.
@@ -746,10 +761,11 @@ believing a `cfg_corpus` failure.
    LSE contract with exact piecewise backward; GPU execution intentionally falls
    back to this host reference for every device/head dimension. Native VC kernels,
    broader Phase 3A layers, and compiled-C++ parity remain open.
-4. Phase 2B `moe_convolutional` (weights order verified) has partial Oxide
-   training support; BN backward and SGD/Adam updates use backend ops. Then
-   port `eml_convolutional` (an activation, not a `LayerKind`; save order **re-read
-   2026-10-05**: `input_layer` then `self_layer`, two full conv blocks).
+4. Phase 2B `moe_convolutional` (weights order verified) has device
+   forward/backward and device SGD/Adam; see `implemented.md` §7. Ported next
+   was `eml_convolutional`, now a real `LayerKind` (not an activation) with
+   save order **re-read 2026-10-05**: `input_layer` then `self_layer`, two full
+   conv blocks. `[dcnv3]` remains blocked (no reference numerics anywhere).
 5. Phase 3B CPU family — DCNv1/2 CPU reference is integrated in v0.1.001
    (GPU is host fallback only); bounded single-template DSConv CPU support is
    integrated in v0.1.002 (`morph=0/1/2`), while multi-template morph 0/1
@@ -774,11 +790,21 @@ believing a `cfg_corpus` failure.
 - No C++ build of any owning branch is available here, so C++ dump parity is
   "NOT RUN" everywhere.
 
-## Task plans: ONNX complete; GUI deferred
+## Task plans: ONNX complete; GUI partly implemented
 
 - `tasks/rust/onnx.md` (`darknet-rs export-onnx`): all 21 checklist steps are complete (v0.0.254–257; docs committed as `2b998051`). Core/CLI tests, host CLI build, fused/unfused exports, Python syntax, and ONNX Runtime numerical gates are recorded above and in `tasks/rust/todo.md`. Canonical external dataset paths were absent, so available matching local assets were used.
 - `tasks/rust/carpn_map_plan.md`: the bounded caller-supplied sample dispatcher is implemented in v0.0.258. `tasks/rust/carpn_network_map_plan.md`'s CPU inference, `detect-image`, and direct `detector map` milestone is implemented in v0.0.259 with generated cfg/weights-backed polygon-mAP tests. CARPN Stage-2 training and scheduled `detector train -map` remain deferred; no compiled-C++ parity or canonical-dataset evidence is available.
-- `tasks/rust/gui_plan.md` (egui DarkMark replacement, merged 2026-10-17): 0 of M0–M6 done. None of `darknet-gui-project` / `darknet-gui-engine` / `darknet-gui` exist, and there is no `detect-server` CLI arm. Dataset and GPU smoke gates remain environment-dependent.
+- `tasks/rust/gui_plan.md` (egui DarkMark replacement, merged 2026-10-17):
+  **partly implemented in v0.1.019–v0.1.021** — `darknet-gui-project`,
+  `darknet-gui-engine` and `darknet-gui` exist, as does the `detect-server` CLI
+  arm (`src/darknet-cli/src/main.rs:433`), together with JSON+txt sidecars,
+  scan/filter/nav/undo, the `G9`–`G16` edit model, actions, project creation,
+  atomic class remap, `detect-server` + worker, and the
+  launcher/canvas/views/class-editor/overlay shell. Still open: class
+  add/delete from the dialog (engine supports it), the behaviours behind mapped
+  but unimplemented keys (mass-delete, homography, merge, heatmaps, screenshots,
+  tiling, jump, delete-image/undo-delete), the train runner, and the Task 1.5
+  DarkMark file diff. Dataset and GPU smoke gates remain environment-dependent.
 
 The remaining ONNX bookkeeping and the GUI plan do not depend on each other.
 

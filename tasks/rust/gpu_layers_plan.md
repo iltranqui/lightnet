@@ -6,6 +6,9 @@
 - [Resume point](#resume-point)
 - [Act-head contract finding](#act-head-contract-finding)
 - [Next independent slice: native act-head gradient math](#next-independent-slice-native-act-head-gradient-math)
+- [Next slice: deformable conv forward (wave 1, part 3)](#next-slice-deformable-conv-forward-wave-1-part-3)
+- [Runtime integration plan for `[deform_conv]`](#runtime-integration-plan-for-deform_conv)
+- [Next slice: `[dcnv4]` device path (audit result)](#next-slice-dcnv4-device-path-audit-result)
 - [Verification gates](#verification-gates)
 - [Remaining scope](#remaining-scope)
 
@@ -28,7 +31,10 @@ inference (v0.2.001–002). Act-head features/exact-erf primitives are native f3
 Evidence/limits are in `implemented.md` §§41–45. Do not repeat these ports.
 Act-head uses four uncached weight uploads per forward; no residency/speedup
 claim. Runtime backward still uses CPU, act params remain frozen, f16 rejected.
-Next GPU version is v0.2.006; recheck the ledger before allocating.
+Next GPU version is unallocated (the act-head slice reached v0.2.006; the
+deformable wave has landed code but no version or commit yet). Recheck
+`implemented.md` and `version-map.tsv` before allocating a number. The current
+open slice is the deformable conv forward contract below.
 
 ## Act-head contract finding
 
@@ -75,6 +81,260 @@ runtime ignores them. Advance equivalent device math without wiring updates.
 - [ ] Keep runtime fallback selection, act-head training buffers, parameter
   updates/optimizer state and f16 rejection unchanged in this independent slice.
   A native gradient primitive is not native runtime backward or full training.
+
+## Next slice: deformable conv forward (wave 1, part 3)
+
+Status: the shared sampling primitive and the `[deform_conv]` accumulation
+stage are native and green. The host contract lives in
+`darknet_cuda::host_ops::bilinear_gather` (`BilinearGatherGeometry`, `forward`,
+`backward`, trait defaults `deform_bilinear_gather_f32` / `_backward_f32`); the
+device kernels live in `src/darknet-cuda-oxide/src/kernels/deform_sample.rs`.
+`todo.md` holds the test counts and the atomic-scatter caveat. **No layer calls
+any of it yet.** This section is the contract for the first wiring.
+
+Status: the accumulation stage is native and green —
+`deform_conv_accumulate` (kernel) + `OxideBackend::deform_conv_accumulate`
+(checked launcher), 5 device tests in `tests/oxide_deform_conv_accumulate.rs`
+with an independently written reference, plus the earlier `oxide_deform_gather`
+(5) and host contract (18 host tests). Remaining before the runtime can select
+the device path, in dependency order: (1)+(2) predictor columns and the
+offset/mask predictors — **done as `deform_offset_predict`**, which is
+`conv2d_f32` (`groups = 1`, source weight order `[filters][channels][ky][kx]`) +
+`bias_add_f32`; it **rejects `dilation != 1` explicitly** instead of returning a
+mis-shaped tensor (see the finding below); (3) one elementwise kernel for the per-batch conditional
+normalization (`stddev > 1e-12 && (stddev > max_offset || |mean| > max_offset)`),
+`sanitize`, `centered_lhtan` and the mask sigmoid — **done**:
+`deform_offset_envelope` (caller supplies per-batch `mean`/`inv_std`/`normalize`)
+and `deform_mask_sigmoid`, verified by `oxide_deform_envelope` (7 passed); the
+per-batch mean/stddev reduction is now native too (`deform_offset_stats`, one
+thread per batch, f64 accumulation matching the source, serial by design);
+(4) this
+accumulation kernel; (5) the
+existing conv epilogue (bias/BN/activation).
+
+**Composition landed:** `OxideBackend::deform_conv_forward_native` chains all five
+stages and returns the raw output (before the layer's own bias/BN/activation),
+verified by two composed device tests at `TOL_COMPOSED = 1e-4` (GEMM summation
+order in the predictor vs the reference loop; single-stage tests stay at
+`2e-6`). Still deliberately unwired: the composed oracle is a stage-by-stage
+host reference. **True oracle reached:** `oxide_deform_conv_chain` builds a real
+`ExecutableNetwork` from inline cfg text, runs its CPU forward with the
+runtime's own initialized parameters, and matches the native composition (3
+passed: masked, unmasked, and the dilated rejection). Remaining: add the runtime
+forward arm (keeping `DeformConv` in `requires_cpu_backward_fallback` and
+falling back to the host for `dilation > 1`), then update `layer-support.md` to
+`gpu fwd native / gpu bwd cpu`.
+
+### Blocking finding: a native forward alone cannot serve `[deform_conv]`
+
+The CPU backward is the reference and it reads `DeformConvRuntimeCache`, which is
+produced **by the host forward** (`forward_deform_conv_with_cache`).
+`GpuForwardState.cpu_forward` (`runtime.rs:13174`) is assembled from the GPU
+loop's own host artifacts, not from a separate CPU pass, so there is no other
+producer of that cache. Two consequences:
+
+1. Swapping the arm to a device forward removes the cache and breaks the
+   fallback backward (empty or missing cache) — a silent correctness hole, not a
+   compile error.
+2. Recomputing the host forward just to fill the cache would keep the cost the
+   device path is meant to remove, so it buys nothing.
+
+Therefore the wave order must change: **native backward (or a device cache
+producer) comes before the forward wiring**, for `[deform_conv]` and for
+`[dcnv4]` (same structure). The five forward stages stay as tested, unused
+primitives until then; the trait methods are now in place so the wiring is
+mechanical once the backward exists. Do not flip the arm on forward-only
+reasoning.
+
+**Audit result: a cache producer is not cheaper than the backward.**
+`deform_conv_backward` reads 27 cache fields — every intermediate *and* its
+derivative bookkeeping: `raw_output_slope`/`_nondiff_boundary`, `offsets`,
+`input`, `input_slope`/`_nondiff_boundary`, `offset_lhtan_slope`/`_boundary`,
+`offset_map_slope`, `offset_stage2_slope`/`_nondiff_boundary`,
+`offset_normalization_boundary`, `offset_normalized`, `offset_mean`,
+`offset_stddev`, `offset_stage1`, `offset_stage1_slope`/`_nondiff_boundary`,
+`columns`, `masks`. Producing those on device *is* the input-side half of the
+backward, so there is no cheap subset. A forward-only device path for
+`[deform_conv]` is therefore not viable in any form.
+
+**Strategic consequence for the whole wave.** Every layer in
+`requires_cpu_backward_fallback` builds its cache inside its own host forward arm
+(`cpu_forward` is assembled from GPU-loop artifacts, `runtime.rs:13174`), so the
+same wall applies to `dcnv4`, `vit`, `swin`, `tucker`, `mambavision`, `kimi_kda`
+and `laya_act_head`: a native forward cannot be wired without a native backward.
+The "native forward first" staging used for the deformable family is wrong for
+this repo; pick targets by backward tractability instead.
+
+### Finding: the runtime arm needs trait methods, not inherent ones
+
+`GpuExecutableNetwork<B: F32TensorOpsBackend>` is generic over the backend, so a
+`runtime.rs` forward arm cannot call an `OxideBackend`-inherent method such as
+`deform_conv_forward_native`. Wiring the device path therefore requires the five
+stages to be **trait** methods with host-reference defaults first. Those defaults
+now exist (`darknet_cuda::host_ops::deform_conv`: `sanitize`, `centered_lhtan`,
+`stable_sigmoid`, `OffsetStats`/`offset_stats`, `offset_envelope`,
+`mask_sigmoid`, `DeformGeometry`/`accumulate`, 6 unit tests; `bilinear_gather`
+exposes `sample_at` so the gather and the accumulation share one sampler). The
+next slice is mechanical but broad: trait declarations + default bodies + Oxide
+overrides (already written, just need forwarding), then composition in
+`runtime.rs`. Do not try to special-case the Oxide backend in generic code.
+
+### Finding: predictor columns cannot simply reuse `conv2d_f32`
+
+`deform_conv::output_dim` includes the dilated kernel extent:
+`oh = (H + 2*pad - dilation*(size-1) - 1) / stride + 1`. The oxide conv `Geom`
+(`src/darknet-cuda-oxide/src/conv.rs:145`) intentionally does **not** — it uses
+`(H + 2*pad - size) / stride + 1`, matching `[convolutional]` (see
+`axis-coverage.md` finding F1). For `dilation == 1` the two agree, so the offset
+and mask predictors can be built with `conv2d_f32` + `bias_add_f32`. For
+`dilation > 1` they do not: the conv would return a differently shaped tensor,
+so the predictor columns need their own im2col launch (or a conv variant that
+takes an explicit output extent). Do not "fix" `Geom` to include dilation —
+that would break `[convolutional]` and `cfg/resnet152_trident.cfg`; select the
+extent explicitly at the call site instead.
+
+Caught by a fixture assertion in `oxide_deform_conv_accumulate`: the original
+strided+dilated case used a shape `deform_conv` would never produce (4x5 in,
+size 3, stride 2, pad 1, dilation 2 => source extent 1x1, not 2x2). The kernel
+takes `out_h`/`out_w` as given, so it still passed; the test now derives and
+asserts the extent before comparing.
+
+Scope: `[deform_conv]` **forward only** (device), CPU backward unchanged. Do not
+touch `requires_cpu_backward_fallback`, do not remove the host round trip until
+the backward is native, and do not claim the layer is GPU-complete — the whole
+point of this slice is that a native forward alone still de-optimises a network.
+
+Operands and math, from `src/darknet-core/src/deform_conv.rs` (hand-derived from
+`Jev_laya`): output `[B, filters, OH, OW]`; for each output point the base
+sample is the input grid position derived from `stride`/`padding`/`dilation`,
+displaced by the predicted offsets `groups * size^2 * 2` and scaled by the
+optional sigmoid masks `groups * size^2`; offsets pass through the source
+conditional per-image normalization and the `centered_lhtan`/`stable_sigmoid`
+clamps; the sampled value is bilinear with zero padding and the far-outside
+early-out; `out += weight[f, c, ky, kx] * sample`, then the existing conv
+epilogue (bias, BN fold or batch stats, activation).
+
+Kernel shape: one thread per `(b, f, oy, ox)` that loops the kernel points and
+the group's input channels, calling a shared `#[device]` sampler extracted from
+`deform_sample.rs` — do **not** materialise `[B,S,C,OH,OW]` columns for this
+layer (that is `f32 * B*S*C*OH*OW`); the column primitive stays available for
+layers that need it. Reuse the existing epilogue kernels; do not add a second
+activation implementation. Guard every address with the same in-bounds checks
+as the CPU reference and keep the `deform_` device-symbol prefix (PTX symbols
+are global).
+
+Test gates, in this order:
+
+1. New `tests/oxide_deform_conv.rs`: parity against `deform_conv_forward` on a
+tiny real cfg (a `[deform_conv]` section with `groups > 1`, `size=3`,
+stride/dilation/padding variants, masks on and off, `modifier` on and off) plus
+a non-square `W != H` case; tolerance comparable to the conv suites, and an
+explicit assertion that the far-edge samples agree (that is where the early-out
+lives).
+2. `MEM=3G ./tools/test_oxide.sh --test oxide_deform_gather` (regression).
+3. `MEM=3G ./tools/test_host.sh deform_conv` (23 core tests today; must not
+shrink).
+4. `MEM=3G ./tools/test_host.sh runtime::` if the runtime arm changed at all.
+
+Definition of done for this slice: device forward selected for `[deform_conv]`
+networks, CPU backward still selected, every host and device test above passing,
+`layer-support.md` updated to `gpu fwd native / gpu bwd cpu`, and one line in
+`todo.md` with the counts. No compiled-C++ golden exists, so write
+"device vs Rust CPU reference", never "matches C++".
+
+## Runtime integration plan for `[deform_conv]`
+
+The device forward and backward both exist and are verified (`todo.md` holds the
+counts). What remains is the runtime wiring, and it has one condition that the
+earlier "flip the arm" plan missed.
+
+**The cache is the hinge.** `DeformConvRuntimeCache` is only produced by the host
+forward (`runtime.rs:2755`) and only consumed by the CPU backward
+(`runtime.rs:4103`); its length is validated at `3555`. A device forward that
+stops calling the host forward starves that path. So the arm must be
+conditional, not replaced:
+
+- **Fallback active** (any layer in `requires_cpu_backward_fallback`, including
+  `DeformConv` itself while it stays listed): keep the host round trip and the
+  cache exactly as today. No behaviour change.
+- **Whole network device-trainable**: compose the forward from the trait
+  primitives (`deform_sanitize_f32`, `conv2d_f32` + `bias_add_f32` for the
+  predictors, `deform_offset_stats`, `deform_offset_envelope`,
+  `deform_mask_sigmoid`, `deform_conv_accumulate_f32`), keep the intermediates as
+  device tensors, and call `deform_conv_backward_native` from the backward arm.
+  No host cache is produced or needed.
+
+**Ordering that avoids a broken intermediate state:**
+
+1. Add the device backward arm for the device-trainable case, gated on
+   `!requires_cpu_backward_fallback()` **after** removing `DeformConv` from that
+   list — but keep the mixed case working by computing the host cache only when
+   `host_copies` is true.
+2. Gradients must land in the existing `LayerTrainBuffers::DeformConv` fields
+   (`runtime.rs:6441` accumulates them today) so optimizer code at `7576` and
+   `10065` keeps working unchanged.
+3. Then remove `DeformConv` from the GPU-optimizer rejection list (`10065`) only
+   after a two-step weight-parity test passes.
+
+**Tests, in this order:** (a) device backward vs CPU gradients on real params
+(already green, `oxide_deform_conv_backward_chain`); (b) a new
+`oxide_runtime_chain` case running two training steps on a tiny `[deform_conv]`
+network and comparing updated weights against CPU; (c) `test_host.sh deform_conv`
+(23 tests, must not shrink) and `test_host.sh runtime::` because the
+fallback/optimizer arms changed; (d) only then flip `layer-support.md` to
+`gpu fwd native / gpu bwd native (normalization host hop)`.
+
+**Do not** wire the forward alone, and do not remove `DeformConv` from the
+fallback list before the device backward arm exists for the mixed case — either
+mistake produces a network that trains silently wrong rather than failing.
+
+## Next slice: `[dcnv4]` device path (audit result)
+
+`[deform_conv]` is wired (`layer-support.md`), so the question for `[dcnv4]` is
+whether the same template applies. The blocking factor for deform_conv was its
+27-field forward cache; **dcnv4's cache has two fields**
+(`src/darknet-core/src/dcnv4.rs:11`):
+
+```text
+Dcnv4ForwardCache { offsets: Vec<f32>, raw_output: Vec<f32> }
+```
+
+and `dcnv4_backward` reads only those (`:580`, `:607`). So no cache producer is
+needed: `offsets` is the offset-predictor output and `raw_output` is the
+aggregation output, both of which the device forward would already hold.
+
+**What is genuinely new** (cannot be reused from deform_conv):
+
+- the aggregation differs — `d_stride` coarse offsets with interpolation,
+  grouped channel partitions, optional softmax-normalised masks and centre
+  removal (`src-lib/dcnv4_layer.cpp::dcnv4_deformable_forward_cpu`), so the
+  `deform_conv_accumulate` kernel does not apply;
+- the offset predictor is a projection with `d_stride` reduction rather than a
+  same-resolution conv, so the predictor-backward reuse is partial.
+
+**Slice order, mirroring what worked twice already:** (1) host reference for the
+aggregation and its adjoint in `darknet_cuda::host_ops` with finite-difference
+tests; (2) device kernel for aggregation + adjoint, parity against (1);
+(3) compose the full forward/backward and compare against the CPU
+`dcnv4_backward` gradients on a real cfg (the `oxide_deform_conv_backward_chain`
+pattern); (4) only then remove `Dcnv4` from `requires_cpu_backward_fallback` and
+extend the shared path predicate — the current exact fallback path after this
+change is `Dcnv4` in `requires_cpu_backward_fallback` plus the deform-only gate,
+so nothing about dcnv4 should be touched until step (3) is green.
+
+Do not assume deform_conv's accumulated evidence transfers: the sampling
+geometry, mask semantics and offset layout are different code paths in the
+source.
+
+**First host-reference attempt failed its own FD check (negative result).** A
+re-derivation of the aggregation from `dcnv4_forward` produced analytics that
+disagreed with finite differences on `d_offsets` (analytic `0` where the FD said
+`-0.0080`, at a mid-kernel point with both `softmax` and `remove_center` off).
+The module was removed rather than left in the tree with a failing or ignored
+test, and the green baseline re-verified (`cargo test -p darknet-cuda --lib` 33
+passed). Next attempt must transcribe `dcnv4_backward` itself — the `point`
+counter under `remove_center`, the packed offset layout and the coordinate-slope
+scaling are exactly where a forward-only derivation goes wrong.
 
 ## Verification gates
 
