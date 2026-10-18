@@ -857,6 +857,27 @@ mod tests {
     }
 
     #[test]
+    fn offset_axis_layout_reads_dx_then_dy_and_keeps_batches_nchw() {
+        let shape = TensorShape::new(3, 2, 1, 2);
+        let spec = spec(1, 3, 1, 1, false, false, 1.0);
+        let (weight_count, offset_dim) = parameter_counts(1, &spec);
+        let weights = vec![0.0; weight_count];
+        let mut biases = vec![0.0; offset_dim];
+        // The kw-major/kh-minor center point is k=4: (dx,dy) at 8,9 and its
+        // unnormalized mask at 2*9+4. Only this sample contributes.
+        biases[8] = 1.0;
+        biases[2 * 9 + 4] = 1.0;
+        let input = vec![
+            10., 20., 30., 40., 50., 60., 110., 120., 130., 140., 150., 160.,
+        ];
+        let (output, _) = dcnv4_forward(&input, shape, &spec, &weights, &biases).unwrap();
+        // At output (x=0,y=0), dx=1 samples (x=1,y=0); swapping x/y
+        // would instead read (x=0,y=1), and batch 1 has a distinct sentinel.
+        assert_eq!(output[0], 20.0);
+        assert_eq!(output[6], 120.0);
+    }
+
+    #[test]
     fn center_removal_and_epsilon_softmax_match_hand_values() {
         let shape = TensorShape::new(3, 3, 1, 1);
         let mut spec = spec(1, 3, 1, 1, true, false, 1.0);

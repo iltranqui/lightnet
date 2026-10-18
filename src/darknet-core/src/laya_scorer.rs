@@ -572,6 +572,33 @@ mod tests {
     }
 
     #[test]
+    fn scorer_axis_layout_keeps_batches_channels_and_options_independent() {
+        let h = 3;
+        let k = 2;
+        let s = spec(h, k);
+        let w = LayaScorerWeights {
+            ln_w: vec![1.0; h],
+            ln_b: vec![0.0; h],
+            fc1_w: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            fc1_b: vec![0.0; h],
+            fc2_w: vec![1.0; h],
+            fc2_b: 0.5,
+        };
+        // NCHW [B,H,1,K]: batch 0 has one varying and one constant option;
+        // batch 1 is constant at both options.
+        let input = [1., 4., -1., 4., 0., 4., 2., 0., 2., 0., 2., 0.];
+        let out = scorer_forward(&input, &w, &s, 2).unwrap();
+        let a = 1.0 / (2.0f32 / 3.0 + 1e-5).sqrt();
+        let expected0 = gelu_erf(a) + gelu_erf(-a) + gelu_erf(0.0) + 0.5;
+        assert!(
+            (out[0] - expected0).abs() < 1e-5,
+            "{} vs {expected0}",
+            out[0]
+        );
+        assert_eq!(&out[1..], &[0.5, 0.5, 0.5]);
+    }
+
+    #[test]
     fn forward_rejects_mismatched_inputs_and_weights() {
         let s = spec(3, 2);
         let w = LayaScorerWeights::zeroed(3);

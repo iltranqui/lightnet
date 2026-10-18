@@ -178,6 +178,26 @@ mod tests {
         assert_eq!(out, vec![11.0, 11.0, 1.0, 1.0]);
     }
 
+    #[test]
+    fn shortcut_axis_layout_uses_nchw_channel_slots_per_batch() {
+        let input = [
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0,
+        ];
+        let source = [
+            101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 110.0, 120.0, 130.0, 140.0, 150.0, 160.0,
+        ];
+        // [input, source] x [channel 0, channel 1], with 3 spatial cells per channel.
+        let raw = [2.0, 3.0, 5.0, 7.0];
+        let output = weighted_forward(&input, &[&source], 2, 6, &raw, NoNorm, 2);
+        assert_eq!(
+            output,
+            vec![
+                507.0, 514.0, 521.0, 740.0, 750.0, 760.0, 570.0, 640.0, 710.0, 1100.0, 1200.0,
+                1300.0,
+            ]
+        );
+    }
+
     fn loss(
         input: &[f32],
         sources: &[&[f32]],

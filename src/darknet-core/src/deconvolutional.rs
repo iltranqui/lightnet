@@ -117,6 +117,24 @@ mod tests {
     }
 
     #[test]
+    fn deconvolutional_axis_layout_maps_input_channels_to_filters_and_batch() {
+        // C++ stores weights as [input_channel][filter][ky][kx] and outputs NCHW.
+        // Distinct input/filter values and B=2 make a transposed channel or batch axis visible.
+        let input =
+            Tensor::from_data(TensorShape::new(1, 1, 2, 2), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let weights = [11.0, 12.0, 13.0, 21.0, 22.0, 23.0];
+        let output = deconv_forward(
+            &input,
+            &weights,
+            &[100.0, 200.0, 300.0],
+            1,
+            1,
+            TensorShape::new(1, 1, 3, 2),
+        );
+        assert_eq!(output.data, vec![153.0, 256.0, 359.0, 217.0, 324.0, 431.0]);
+    }
+
+    #[test]
     fn overlapping_blocks_accumulate() {
         // k = 3, s = 1 on a 1x2 input: out width 4; the middle columns receive both pixels
         let input = Tensor::from_data(TensorShape::new(2, 1, 1, 1), vec![1.0, 1.0]).unwrap();

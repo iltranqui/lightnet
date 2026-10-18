@@ -38876,6 +38876,61 @@ num_dwconv=1
     }
 
     #[test]
+    fn eml_convolutional_axis_layout_preserves_batch_channel_and_spatial_order() {
+        let cfg = "[net]\nchannels=2\nbatch=2\nheight=2\nwidth=3\n\
+                   [eml_convolutional]\nfilters=2\nsize=1\nbatch_normalize=0\
+                   \nresidual=0\neml_scale=1\neml_clamp=4\neml_eps=0.000001\n";
+        let network = Network::from_config(
+            ConfigFile::parse_str("eml-axis.cfg", cfg).expect("EML cfg parses"),
+        )
+        .expect("EML network builds");
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::EmlConvolutional(params) = &mut executable.params[0] else {
+            panic!("expected EML parameters");
+        };
+        // [out_channel, in_channel, ky, kx]: one branch preserves channels,
+        // the other swaps them, making channel-axis transposition observable.
+        params.input.weights.copy_from_slice(&[1.0, 0.0, 0.0, 1.0]);
+        params.input.biases.copy_from_slice(&[0.1, -0.2]);
+        params
+            .self_params
+            .weights
+            .copy_from_slice(&[0.0, 1.0, 1.0, 0.0]);
+        params.self_params.biases.copy_from_slice(&[0.3, -0.4]);
+
+        // B=2,C=2,H=2,W=3, NCHW with distinct batch/channel/spatial values.
+        let input_values = vec![
+            0.0, 1.0, -1.0, 2.0, 0.5, -0.5, 1.0, -2.0, 0.5, 0.0, -1.0, 2.0, -1.5, 0.25, 1.5, -0.25,
+            2.5, -2.5, 0.75, -0.75, 1.25, -1.25, 3.0, -3.0,
+        ];
+        let shape = executable.network.net.input_shape();
+        let input = Tensor::from_data(shape, input_values.clone()).expect("EML input shape");
+        let forward = executable.forward(&input).expect("EML forward");
+        let output = forward.layer_outputs.get(0).expect("EML output exists");
+        assert_eq!(output.shape, shape);
+
+        let spatial = 6;
+        let channels = 2;
+        let eps = 1.0e-6;
+        let mut expected = Vec::with_capacity(input_values.len());
+        for b in 0..2 {
+            for c in 0..channels {
+                for p in 0..spatial {
+                    let x = input_values[b * channels * spatial + c * spatial + p]
+                        + if c == 0 { 0.1 } else { -0.2 };
+                    let y = input_values[b * channels * spatial + (1 - c) * spatial + p]
+                        + if c == 0 { 0.3 } else { -0.4 };
+                    let softplus_y = y.exp().ln_1p();
+                    expected.push(x.exp() - (softplus_y + eps).ln());
+                }
+            }
+        }
+        for (i, (got, want)) in output.data.iter().zip(expected).enumerate() {
+            assert!((got - want).abs() < 2e-5, "output[{i}]={got}, want {want}");
+        }
+    }
+
+    #[test]
     fn eml_convolutional_cpu_math_gradients_and_gpu_device_sgd_are_integrated() {
         let cfg = "[net]\nchannels=1\nbatch=1\nheight=1\nwidth=2\n\
                    [eml_convolutional]\nfilters=1\nsize=1\nbatch_normalize=1\nresidual=1\n";
@@ -39385,6 +39440,68 @@ num_dwconv=1
         assert!((cache.gates[0] - gate0).abs() < 1e-6, "{:?}", cache.gates);
         assert!((cache.gates[0] + cache.gates[1] - 1.0).abs() < 1e-6);
         assert_eq!(cache.expert_outputs.len(), 2);
+    }
+
+    #[test]
+    fn cpu_moe_convolutional_axis_layout_keeps_router_and_blend_per_batch() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "moe-axis.cfg",
+                "[net]\nchannels=2\nbatch=2\nheight=2\nwidth=3\n\
+                 [moe_convolutional]\nfilters=2\nsize=1\nstride=1\
+                 \nbatch_normalize=0\nactivation=linear\nexperts=2\
+                 \ntop_k=0\nload_balance=0\ntemperature=1\n",
+            )
+            .expect("MoE cfg parses"),
+        )
+        .expect("MoE network builds");
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::Moe(params) = &mut executable.params[0] else {
+            panic!("expected MoE parameters");
+        };
+        params.router_biases = vec![0.0, 0.0];
+        params.router_weights = vec![1.0, 0.0, 0.0, 1.0];
+        params.experts[0].weights = vec![1.0, 0.0, 0.0, 1.0];
+        params.experts[0].biases = vec![0.0, 0.0];
+        params.experts[1].weights = vec![-1.0, 0.0, 0.0, -1.0];
+        params.experts[1].biases = vec![0.0, 0.0];
+
+        // The two samples have distinct global channel means on a non-square grid.
+        let input_values = vec![
+            1.0, 2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 6.0, 3.0, 3.0, 6.0, 0.0,
+        ];
+        let shape = executable.network.net.input_shape();
+        let input = Tensor::from_data(shape, input_values.clone()).expect("MoE input shape");
+        let forward = executable.forward(&input).expect("MoE forward");
+        let output = forward.layer_outputs.get(0).expect("MoE output exists");
+        let cache = forward.moe_caches[0]
+            .as_ref()
+            .expect("router gates are cached per batch row");
+
+        let e = 1.0f32.exp();
+        let e3 = 3.0f32.exp();
+        let expected_gates = [
+            e / (e + 1.0),
+            1.0 / (e + 1.0),
+            1.0 / (e3 + 1.0),
+            e3 / (e3 + 1.0),
+        ];
+        for (i, (got, want)) in cache.gates.iter().zip(expected_gates).enumerate() {
+            assert!((got - want).abs() < 1e-6, "gate[{i}]={got}, want {want}");
+        }
+        for b in 0..2 {
+            let scale = cache.gates[b * 2] - cache.gates[b * 2 + 1];
+            for i in 0..12 {
+                let index = b * 12 + i;
+                let want = scale * input_values[index];
+                assert!(
+                    (output.data[index] - want).abs() < 1e-5,
+                    "output[{index}]={} vs {want}",
+                    output.data[index]
+                );
+            }
+        }
     }
 
     /// Every parameter of `[moe_convolutional]` - router weights, router biases

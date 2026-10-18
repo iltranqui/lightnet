@@ -621,6 +621,26 @@ mod tests {
     }
 
     #[test]
+    fn encoder_axis_layout_keeps_batch_and_token_rows_independent() {
+        let g = geometry(2, 2, 2, 1, 1, 2, 4);
+        let mut w = weights_with_unit_norms(2, 1, 2, 4);
+        // Unit-sentinel embeddings; the zero projections leave the independently
+        // normalized token rows untouched by attention and the MLP residuals.
+        w.tok_embed[0..8].copy_from_slice(&[1., 0., 0., 1., -1., 0., 0., -1.]);
+        // [batch, token-id channel, T] then [batch, mask channel, T].
+        let input = [0., 1., 1., 1., 2., 3., 1., 1.];
+        let out = encoder_forward(&input, &w, &g).unwrap();
+        let embed = 0.5 / (0.25f32 + 1e-5).sqrt();
+        let a = embed / (embed * embed + 1e-5).sqrt();
+        // Output is NCHW [B,H,T]: token rows are transposed back to channels,
+        // without crossing the batch boundary.
+        let expected = [a, -a, -a, a, -a, a, a, -a];
+        for (i, (got, want)) in out.iter().zip(expected).enumerate() {
+            assert!((got - want).abs() < 1e-5, "output[{i}]={got}, want {want}");
+        }
+    }
+
+    #[test]
     fn blob_round_trip_and_count_match_the_scorer_helper() {
         let (hidden, n_layers, intermediate, vocab) = (4usize, 3usize, 6usize, 12usize);
         let w = weights_with_unit_norms(hidden, n_layers, intermediate, vocab);

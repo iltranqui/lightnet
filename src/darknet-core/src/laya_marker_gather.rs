@@ -197,6 +197,16 @@ mod tests {
     }
 
     #[test]
+    fn marker_gather_axis_layout_uses_sample_specific_positions() {
+        // NCHW A=[B,H,T], with B=2,H=1,T=3; each sample points at a
+        // different column of its own sequence.
+        let a = [10., 11., 12., 20., 21., 22.];
+        let b = [1., 1., 1., 1., 1., 1., 2., 2., 2., 1., 1., 1.];
+        let out = forward(&a, &b, 2, 1, 1, 3, 2).unwrap();
+        assert_eq!(out, vec![11., 22.]);
+    }
+
+    #[test]
     fn marker_positions_are_rounded_and_clamped_like_cxx() {
         // C++ std::lround: half away from zero.
         assert_eq!(marker_position(1.4, 5), 1);

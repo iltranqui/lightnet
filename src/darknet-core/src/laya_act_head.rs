@@ -544,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn forward_is_the_two_layer_mlp_over_the_features() {
+    fn act_head_axis_layout_is_batch_major_over_the_two_layer_mlp() {
         let (batch, hidden, k, t, fc_dim, n_act) = (2usize, 4usize, 3usize, 2usize, 5usize, 2usize);
         let head = head_data(batch, hidden, t);
         let logits: Vec<f32> = (0..batch * k).map(|i| (i as f32) * 0.3 - 0.5).collect();
@@ -565,24 +565,32 @@ mod tests {
             n_act,
         )
         .unwrap();
-        // Independent hand computation for sample 0.
+        // Hand-compute both batch rows to pin the batch-major [B,n_act] output
+        // and the channel-major feature gathering for each sample.
         let input = hidden + LAYA_ACT_HEAD_N_FEATS;
-        let mut x = vec![0.0f32; input];
-        features_for_sample(&head, &logits, &marker, 0, hidden, k, 2 * k, t, t, &mut x);
-        let mut hid = vec![0.0f32; fc_dim];
-        for f in 0..fc_dim {
-            let mut acc = w.fc1_b[f];
-            for i in 0..input {
-                acc += w.fc1_w[f * input + i] * x[i];
-            }
-            hid[f] = gelu_erf(acc);
-        }
-        for a in 0..n_act {
-            let mut acc = w.fc2_b[a];
+        for b in 0..batch {
+            let mut x = vec![0.0f32; input];
+            features_for_sample(&head, &logits, &marker, b, hidden, k, 2 * k, t, t, &mut x);
+            let mut hid = vec![0.0f32; fc_dim];
             for f in 0..fc_dim {
-                acc += w.fc2_w[a * fc_dim + f] * hid[f];
+                let mut acc = w.fc1_b[f];
+                for i in 0..input {
+                    acc += w.fc1_w[f * input + i] * x[i];
+                }
+                hid[f] = gelu_erf(acc);
             }
-            assert!((out[a] - acc).abs() < 1e-5, "a={a}: {} vs {acc}", out[a]);
+            for a in 0..n_act {
+                let mut acc = w.fc2_b[a];
+                for f in 0..fc_dim {
+                    acc += w.fc2_w[a * fc_dim + f] * hid[f];
+                }
+                let index = b * n_act + a;
+                assert!(
+                    (out[index] - acc).abs() < 1e-5,
+                    "out[{index}]={} vs {acc}",
+                    out[index]
+                );
+            }
         }
     }
 

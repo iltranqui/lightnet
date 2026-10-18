@@ -456,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn padding_samples_are_left_out_of_the_mean() {
+    fn loss_axis_layout_excludes_padding_rows_from_batch_mean() {
         // Two samples: the second has no valid option, so only sample 0 counts.
         let truth = [1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let out = laya_loss_compute(

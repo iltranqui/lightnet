@@ -545,6 +545,22 @@ mod tests {
     }
 
     #[test]
+    fn head_axis_layout_preserves_batch_sequence_and_qtype_channels() {
+        let g = geometry(2, 2, 2, 1, 1, 2, -1);
+        let mut w = unit_norm_weights(2, 1, 2);
+        w.type_emb
+            .copy_from_slice(&[10., 100., 20., 200., 30., 300.]);
+        // [B,C,T]: hidden channels, mask, then per-sample qtype channel.
+        let input = [
+            1., 2., 10., 20., 1., 1., 0., 0., 100., 200., 1000., 2000., 1., 1., 2., 2.,
+        ];
+        let out = head_forward(&input, &w, &g).unwrap();
+        // With zero projections, residual paths preserve each token plus its
+        // sample's qtype embedding; output is channel-major [B,H,T].
+        assert_eq!(out, vec![11., 12., 110., 120., 130., 230., 1300., 2300.]);
+    }
+
+    #[test]
     fn blob_round_trip_and_count_match_the_scorer_helper() {
         let (hidden, n_layers, ffn_dim) = (4usize, 2usize, 6usize);
         let mut w = unit_norm_weights(hidden, n_layers, ffn_dim);

@@ -62,12 +62,17 @@ mod tests {
     }
 
     #[test]
-    fn slice_copies_the_channel_range_of_every_sample() {
-        // batch 2, 4 channels, 2x1 pixels: value = b*8 + c*2 + p
-        let y = slice_channels(&ramp(TensorShape::new(2, 1, 4, 2)), 1, 3).unwrap();
-        assert_eq!(y.shape, TensorShape::new(2, 1, 2, 2));
-        assert_eq!(y.data, vec![2.0, 3.0, 4.0, 5.0, 10.0, 11.0, 12.0, 13.0]);
-        assert!(slice_channels(&ramp(TensorShape::new(2, 1, 4, 2)), 3, 5).is_err());
+    fn slice_axis_layout_preserves_batch_channel_and_spatial_order() {
+        // NCHW ramp, batch 2, four channels, and a non-square 3x2 grid.
+        // The selected channels must keep each sample's six spatial cells contiguous.
+        let source_shape = TensorShape::new(3, 2, 4, 2);
+        let y = slice_channels(&ramp(source_shape), 1, 3).unwrap();
+        assert_eq!(y.shape, TensorShape::new(3, 2, 2, 2));
+        assert_eq!(
+            y.data,
+            (6..18).chain(30..42).map(|v| v as f32).collect::<Vec<_>>()
+        );
+        assert!(slice_channels(&ramp(source_shape), 3, 5).is_err());
     }
 
     #[test]

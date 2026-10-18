@@ -2205,6 +2205,27 @@ mod tests {
     }
 
     #[test]
+    fn patchify_axis_layout_keeps_channel_fastest_order_across_batches() {
+        // NCHW, B=2, C=2, H=2, W=3, with distinct batch/channel sentinels.
+        let input = vec![
+            1., 2., 3., 4., 5., 6., 101., 102., 103., 104., 105., 106., 201., 202., 203., 204.,
+            205., 206., 301., 302., 303., 304., 305., 306.,
+        ];
+        let (oh, ow, patches) = patchify_nchw(&input, 2, 2, 2, 3, 2, 1, 0).unwrap();
+        assert_eq!((oh, ow), (1, 2));
+        // Each patch is [patch_y, patch_x, channel], tokens are row-major,
+        // and the two batch rows remain independent.
+        assert_eq!(
+            patches,
+            vec![
+                1., 101., 2., 102., 4., 104., 5., 105., 2., 102., 3., 103., 5., 105., 6., 106.,
+                201., 301., 202., 302., 204., 304., 205., 305., 202., 302., 203., 303., 205., 305.,
+                206., 306.,
+            ]
+        );
+    }
+
+    #[test]
     fn patchify_zero_pads_and_rejects_bad_stride() {
         let (oh, ow, patches) = patchify_nchw(&[2.], 1, 1, 1, 1, 3, 1, 1).unwrap();
         assert_eq!((oh, ow), (1, 1));
