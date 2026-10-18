@@ -9,6 +9,7 @@ pub mod conv_direct;
 pub mod conv_implicit;
 pub mod convert;
 pub mod dcnv4;
+pub mod dcnv4_projection;
 pub mod deform_sample;
 pub mod elementwise;
 pub mod gemm;

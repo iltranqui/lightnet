@@ -159,6 +159,9 @@ fn device_adjoint_covers_strided_dilated_and_far_outside_samples() {
     for size in [1, 3, 5] {
         for softmax in [false, true] {
             for remove_center in [false, true] {
+                if size == 1 && remove_center {
+                    continue; // no active points: rejected by the checked launcher
+                }
                 let mut g = geometry(6, 2, softmax, remove_center);
                 g.size = size;
                 g.stride_x = 2;
@@ -230,6 +233,11 @@ fn device_adjoint_rejects_bad_geometry_and_each_short_operand() {
         host::Dcnv4Geometry { groups: 3, ..g },
         host::Dcnv4Geometry { dilation: 0, ..g },
         host::Dcnv4Geometry { size: 7, ..g },
+        host::Dcnv4Geometry {
+            size: 1,
+            remove_center: true,
+            ..g
+        },
         host::Dcnv4Geometry {
             size: usize::MAX,
             ..g

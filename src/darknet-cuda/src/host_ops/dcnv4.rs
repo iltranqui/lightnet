@@ -4,9 +4,10 @@
 //! are separate stages). The contract is transcribed from
 //! `darknet_core::dcnv4::{dcnv4_forward, dcnv4_backward}`, themselves derived
 //! from `dcnv4_deformable_forward_cpu`: per output position the row holds
-//! `[2*K offset pairs, K mask logits]` per group, sampling is bilinear with zero
-//! padding, `remove_center` skips the middle kernel point (whose mask gradient
-//! then stays zero), the softmax denominator adds `1e-6`, and the coordinate
+//! `[2*K coordinates, K mask logits]` per group, K=size²-remove_center, with
+//! the complete row padded to a multiple of eight. Sampling is zero-padded;
+//! `remove_center` skips the middle kernel location without consuming a packed
+//! point slot. The softmax denominator adds `1e-6`, and the coordinate
 //! gradient carries the `offset_scale` factor.
 //!
 //! Fixtures must keep every sample off a cell boundary: a finite difference that
@@ -36,10 +37,10 @@ pub struct Dcnv4Geometry {
 
 impl Dcnv4Geometry {
     pub fn kernel_points(&self) -> usize {
-        self.size * self.size
+        self.size * self.size - usize::from(self.remove_center)
     }
     pub fn offset_dim(&self) -> usize {
-        self.groups * self.kernel_points() * 3
+        (self.groups * self.kernel_points() * 3 + 7) / 8 * 8
     }
     pub fn spatial(&self) -> usize {
         self.output_height * self.output_width
@@ -73,7 +74,18 @@ impl Dcnv4Geometry {
                 .ok_or_else(|| "dcnv4 aggregation: dimension product overflow".to_owned())
         };
         product(&[self.size, self.size])?;
-        product(&[self.groups, self.size, self.size, 3])?;
+        if self.kernel_points() == 0 {
+            return Err("dcnv4 aggregation requires an active kernel point".to_owned());
+        }
+        let raw = product(&[self.groups, self.kernel_points(), 3])?;
+        raw.checked_add(7)
+            .ok_or_else(|| "dcnv4 aggregation: row alignment overflow".to_owned())?;
+        product(&[
+            self.batch,
+            self.output_height,
+            self.output_width,
+            self.offset_dim(),
+        ])?;
         product(&[self.input_height, self.input_width])?;
         product(&[
             self.batch,
@@ -98,6 +110,87 @@ impl Dcnv4Geometry {
             3,
         ])?;
         product(&[self.dilation, self.size - 1])?;
+        Ok(())
+    }
+}
+
+/// Full projection/upsample/aggregation descriptor (before bias/BN/activation).
+/// Launchers must call `checked` before using derived extents.
+#[derive(Clone, Copy, Debug)]
+pub struct Dcnv4Composition {
+    pub geometry: Dcnv4Geometry,
+    pub d_stride: usize,
+    pub offset_scale: f32,
+}
+
+impl Dcnv4Composition {
+    pub fn coarse_height(&self) -> usize {
+        self.geometry.output_height.div_ceil(self.d_stride)
+    }
+    pub fn coarse_width(&self) -> usize {
+        self.geometry.output_width.div_ceil(self.d_stride)
+    }
+    pub fn weight_count(&self) -> usize {
+        self.geometry.offset_dim()
+            * self.geometry.channels
+            * self.geometry.size
+            * self.geometry.size
+    }
+    pub fn checked(&self) -> Result<(), String> {
+        let g = &self.geometry;
+        g.checked()?;
+        if self.d_stride == 0 || !self.offset_scale.is_finite() {
+            return Err(
+                "dcnv4 composition: positive d_stride and finite scale required".to_owned(),
+            );
+        }
+        let bad = || "dcnv4 composition: invalid or overflowing geometry".to_owned();
+        let output_dim = |input: usize, stride: usize| -> Option<usize> {
+            input
+                .checked_add(g.padding.checked_mul(2)?)?
+                .checked_sub(g.dilation.checked_mul(g.size - 1)?)?
+                .checked_sub(1)?
+                .checked_div(stride)?
+                .checked_add(1)
+        };
+        if output_dim(g.input_height, g.stride_y) != Some(g.output_height)
+            || output_dim(g.input_width, g.stride_x) != Some(g.output_width)
+        {
+            return Err(bad());
+        }
+        let count = |dims: &[usize]| -> Result<(), String> {
+            let n = dims
+                .iter()
+                .try_fold(1usize, |n, d| n.checked_mul(*d))
+                .ok_or_else(bad)?;
+            if n > i64::MAX as usize / 4 {
+                return Err(bad());
+            }
+            Ok(())
+        };
+        count(&[g.offset_dim(), g.channels, g.size, g.size])?;
+        count(&[
+            g.batch,
+            self.coarse_height(),
+            self.coarse_width(),
+            g.offset_dim(),
+        ])?;
+        count(&[g.batch, g.input_height, g.input_width, g.channels])?;
+        count(&[g.batch, g.output_height, g.output_width, g.channels])?;
+        count(&[g.batch, g.output_height, g.output_width, g.offset_dim()])?;
+        for (coarse, stride) in [
+            (self.coarse_height(), g.stride_y),
+            (self.coarse_width(), g.stride_x),
+        ] {
+            let step = stride.checked_mul(self.d_stride).ok_or_else(bad)?;
+            let last = (coarse - 1)
+                .checked_mul(step)
+                .and_then(|v| v.checked_add((g.size - 1).checked_mul(g.dilation)?))
+                .ok_or_else(bad)?;
+            if last > i64::MAX as usize {
+                return Err(bad());
+            }
+        }
         Ok(())
     }
 }
@@ -406,6 +499,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn aggregation_layout_uses_active_points_and_eight_aligned_rows() {
+        let mut g = geometry(false, false);
+        assert_eq!(g.kernel_points(), 9);
+        assert_eq!(g.offset_dim(), 32);
+        g.remove_center = true;
+        assert_eq!(g.kernel_points(), 8);
+        assert_eq!(g.offset_dim(), 24);
+        g.groups = 2;
+        assert_eq!(g.offset_dim(), 48);
+        g.size = 1;
+        assert!(
+            g.checked().is_err(),
+            "remove_center must leave an active point"
+        );
     }
 
     #[test]

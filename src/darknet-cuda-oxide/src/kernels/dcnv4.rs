@@ -65,9 +65,9 @@ pub mod kernels {
         offset_scale: f32,
     ) {
         let spatial = out_h * out_w;
-        let points = size * size;
+        let points = size * size - remove_center as usize;
         let cpg = channels / groups;
-        let offset_dim = groups * points * 3;
+        let offset_dim = (groups * points * 3 + 7) / 8 * 8;
         let i = thread::index_1d().get();
         if i >= out.len() / cpg {
             return;
@@ -201,9 +201,9 @@ pub mod backward {
         offset_scale: f32,
     ) {
         let spatial = out_h * out_w;
-        let points = size * size;
+        let points = size * size - remove_center as usize;
         let cpg = channels / groups;
-        let offset_dim = groups * points * 3;
+        let offset_dim = (groups * points * 3 + 7) / 8 * 8;
         let i = thread::index_1d().get();
         if i >= dy.len() / cpg {
             return;

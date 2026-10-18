@@ -3,6 +3,8 @@
 //! `cargo oxide`; plain `cargo build` cannot compile the device code.
 
 pub mod conv;
+mod dcnv4_native;
+pub use dcnv4_native::Dcnv4NativeGradients;
 pub mod fp4;
 pub mod fp8;
 pub mod half;
@@ -100,6 +102,7 @@ pub struct OxideBackend {
     deform_backward: deform_sample::backward::LoadedModule,
     dcnv4: dcnv4::kernels::LoadedModule,
     dcnv4_backward: dcnv4::backward::LoadedModule,
+    dcnv4_projection: kernels::dcnv4_projection::kernels::LoadedModule,
     layers_extra: layers_extra::kernels::LoadedModule,
     residual_epilogue: layers_extra::residual::LoadedModule,
     conv_mode: ConvMode,
@@ -525,6 +528,8 @@ impl OxideBackend {
             .map_err(|err| OxideError::Shape(format!("load dcnv4 module: {err:?}")))?;
         let dcnv4_backward = dcnv4::backward::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load dcnv4::backward module: {err:?}")))?;
+        let dcnv4_projection = kernels::dcnv4_projection::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load dcnv4_projection module: {err:?}")))?;
         let residual_epilogue = layers_extra::residual::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load residual epilogue module: {err:?}")))?;
         let layers_extra = layers_extra::kernels::load(&ctx)
@@ -575,6 +580,7 @@ impl OxideBackend {
             deform_backward,
             dcnv4,
             dcnv4_backward,
+            dcnv4_projection,
             residual_epilogue,
             conv_mode: ConvMode::from_env(),
             bwd_fp8: fp8_backward_from_env(),
