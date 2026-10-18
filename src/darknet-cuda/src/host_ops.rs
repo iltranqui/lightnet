@@ -5,6 +5,7 @@
 //! kernel must match.
 
 pub mod bilinear_gather;
+pub mod dcnv4;
 pub mod deform_conv;
 pub mod gelu_erf;
 pub mod laya_act;
