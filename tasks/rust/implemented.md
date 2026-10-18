@@ -64,6 +64,7 @@ file is named inline.
 - [29. Stage-1 axis/layout audit of already-ported layers](#29-stage-1-axislayout-audit-of-already-ported-layers)
 - [30. DPT-head Stage-1 CPU reference](#30-dpt-head-stage-1-cpu-reference)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
+- [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -864,6 +865,13 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 - v0.1.014 (`fe3a554c`): added `model::tests::unused_cpp_layer_enum_names_are_not_rust_noop_layers`. It pins `[network]` as top-level metadata and ensures `[blank]`, `[empty]`, and `[silence]` are rejected instead of becoming silent identity layers. This is a parser-regression test; no runtime behavior changed.
 - Verification: `MEM=3G ./tools/test_host.sh unused_cpp_layer_enum_names_are_not_rust_noop_layers` passed 1 test; targeted edition-2024 Rustfmt and `git diff --check` passed.
 - Evidence boundary: source-derived from `Jev_laya:src-lib/darknet_enums.cpp` and `darknet_cfg.cpp`; no compiled-C++ golden/parity. The larger v0.1–v0.3 roadmap remains open.
+
+## 32. Axis-coverage gate and shared NCHW fixtures
+
+- v0.1.015 (`e848f4ef`): added `AxisPin` and `AXIS_PINS` in `model.rs` with one decision per `LayerKind` variant (64 variants plus `Unsupported`), and `LayerKind::axis_pin`, whose match is exhaustive so a new variant fails the build until classified. Added `axis_fixture.rs` with `PROBE`/`probe_shape`, `axis_value` (`n*1000+c*100+h*10+w`), `decode_axis_value`, `nchw_index`, and `axis_tensor`, replacing the per-test sentinel loops.
+- Verification: `MEM=3G ./tools/test_host.sh every_layer_kind_has_an_axis_pin_decision` passed 1 test; `model::` passed 75; `axis_fixture` passed 3; `axis_layout` passed 19 (unchanged); targeted edition-2024 Rustfmt and `git diff --check` passed.
+- Coverage baseline recorded in `tasks/rust/axis-coverage.md` (local-only): 18 variants pinned by 19 tests, 41 C++-backed variants open, 5 Rust-only extensions, 3 variants not ported. No layer math changed, so no behavior claim is made beyond the new checks.
+- Evidence boundary: enum audited against `Jev_laya:src-lib/darknet_enums.hpp`; `Logistic` is referenced on `raptor`/`raptor-dev` and `Regression` on `fog`, neither on `Jev_laya`. No compiled-C++ golden/parity.
 
 ## Not implemented / open (pointer)
 
