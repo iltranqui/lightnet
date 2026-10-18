@@ -68,6 +68,7 @@ file is named inline.
 - [40. YOLO-3D raw CPU runtime and fail-closed consumers](#40-yolo-3d-raw-cpu-runtime-and-fail-closed-consumers)
 - [41. Native f32 LAYA marker gather](#41-native-f32-laya-marker-gather)
 - [42. Native f16 marker-gather inference](#42-native-f16-marker-gather-inference)
+- [43. Native detached act-head feature primitive](#43-native-detached-act-head-feature-primitive)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1050,6 +1051,33 @@ Tests were written before the new trait/operator existed and failed compilation;
 - `MEM=3G ./tools/test_host.sh marker_gather`: **12 core passed**, 0 CLI matched.
 
 Targeted edition-2024 Rustfmt/diff checks passed; only the newly inserted half.rs blocks were formatted/checked to avoid rewriting that file's existing style. Temporary logs/formatter snippet removed after recording evidence. Parked CPU activation code remained in the working tree but was not selected or committed. No training run, benchmark, full-host/corpus/full-Oxide run, new optimizer proof or compiled-C++ golden. GPU status for marker gather: native f32 full/compact forward/backward and native f16 compact inference. Other layers, GPU Muon, remaining CPU/axis work and sparse MoE remain open. Half storage is a Rust backend extension of the inspected C++ routing math; hand-derived from source, no compiled-C++ golden. Next bounded GPU work is native LAYA act-head, starting with its exact detached-feature and frozen/update contract audit.
+
+## 43. Native detached act-head feature primitive
+
+- v0.2.003 (`3de7c327`): added the standalone `F32TensorOpsBackend::laya_act_features_f32` operation. `darknet-cuda/src/host_ops/laya_act.rs` owns checked layout and the generic reference, exposed via `host_ops.rs`; Oxide's override in `src/lib.rs` validates actual storage and launches `kernels/layers_extra.rs::laya_act_features`. All input data/reductions stay on device; one thread owns each sample's `[H+4]` row with serial option reductions and no scratch allocation/atomics. `f32v` only borrows or widens on device. This operation is **not yet wired into act-head runtime** and is not the MLP/backward/update port.
+- Source audit: pinned `Jev_laya=4af013d2c59d1db54247aeff21f43e1d8d295cda`, retrieved executable `src-lib/laya_act_head_layer.cpp` with git show. `ah_features` (:29–78) uses CLS column zero plus `[top1, top1-top2, entropy/log(max(valid_count,2)), max(valid_count,2)/255]`; masks use odd channel `2*j+1`, column zero, strict `>0.5`. Masked logits become finite `-1e4`, not excluded/-infinity; softmax includes all K slots, with entropy log floor `1e-9`, no extra temperature or entropy/count clamp. Head/marker sequence lengths are independent.
+- **Newly confirmed full-port gap:** C++ `ah_backward_sample` (:80–122), `backward_laya_act_head_layer` and `update_laya_act_head_layer` (:309–336) accumulate/update all four parameter blocks. Its GPU backward (:344–383) itself uses host math, which is not the native-GPU target. Rust's pure `act_head_backward` returns four parameter gradients, but `runtime.rs::backward_laya_act_head` forwards only dcls; accumulated ActHead params are ignored and no train buffers are allocated. The module's frozen-weight description is therefore not a full source-training contract. A question about including the training fix was asked but not answered; automatic continuation is not treated as approval to change existing frozen behavior. This release changes no training semantics and advances an independent GPU primitive. Full training parity remains unachieved.
+- The existing native `F32ActivationKind::Gelu` is tanh-approximate; CPU act-head uses exact erf-GELU via `laya_scorer::{gelu_erf,gelu_erf_grad}`. A native exact-erf primitive is an independent remaining prerequisite; do not substitute the tanh approximation.
+
+Scoped requirement-to-artifact audit (`oxide_laya_act_features.rs`):
+
+| Requirement | Actual evidence |
+|---|---|
+| Checked geometry, complete storage, safe device output ownership | Shared Layout requires `[B,H,1,T_head]`, `[B,1,1,K>=2]`, `[B,CB>=2K,1,T_marker]`, positive dimensions, shared B and bounded checked products; Oxide override checks all three buffer lengths before device views/launch |
+| Source math, batches/channels/sequence axes, threshold and ignored columns | `laya_act_features_native_matches_source_hand_math_and_cpu_batches`: B=3, H=3, K=4, CB=10, T_head=5, T_marker=3; three tile sizes, poisoned non-CLS/even-mask/unused columns, strict .5 vs .5001 masks, independent CPU helper/reference comparisons |
+| Hand math beyond reference-only parity | Same test explicitly checks (.75,.25) top/gap/entropy/count, all-masked uniform K=4 with normalized entropy **2**, and tied masked logits outranking a valid -10001 score |
+| Rust defensive nonfinite behavior, uncapped count feature | `laya_act_features_native_preserves_rust_nonfinite_policy_and_large_k`: NaN/+Inf/-Inf logits compared by finite values/NaN classification to Rust CPU, not C++ -Ofast behavior; direct K=257 operation proves count/255 can exceed one. Generic host reference also compared to the CPU helper |
+| Invalid input rejection | `laya_act_features_native_rejects_bad_layout_and_truncated_storage`: bad rank/height/scorer channels/K/marker channels/batch, zero size, overflow and three short-buffer cases |
+| No premature native-layer claim | Runtime dispatch/fallback, weights and optimizer membership were not modified. No full-network native act-head execution, native MLP, backward, CLS-adjoint scatter or parameter-update proof is claimed |
+
+Test-first: direct tests failed compilation on the missing backend method before implementation. Final serial RTX 4060 Laptop runs, all via 3G scopes and script `-j 2`:
+
+- `MEM=3G ./tools/test_oxide.sh --test oxide_laya_act_features`: **3 passed**.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_layers_extra`: **24 passed**.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_marker_gather_f16`: **4 passed**.
+- `MEM=3G ./tools/test_host.sh laya_act_head`: **9 core passed**, 0 CLI matched.
+
+Targeted edition-2024 Rustfmt/diff checks passed. Temporary source/log snapshots removed after recording evidence; no weights or sidecars created. Parked uncommitted CPU math remained unselected and outside this release. GPU status: feature primitive native f32; **act-head layer remains host fallback**, f16 unsupported. No new derivative/optimizer/checkpoint proof, training run, benchmark, full-host/corpus/full-Oxide run or compiled-C++ golden. Other GPU layers/GPU Muon, CPU/config/axis gaps and sparse MoE remain open. Hand-derived from source, no compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 

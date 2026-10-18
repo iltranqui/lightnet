@@ -1,6 +1,6 @@
 # Rust Port — Open-Items Execution Plan
 
-> **Current operator instructions:** implement directly without subagents and focus on GPU layers now. This overrides historical delegation/CPU-first sequencing below, without completing or dropping CPU requirements. Resume native GPU work from `gpu_layers_plan.md`; implementation evidence is in `implemented.md` §41. Historical role assignments are not authorization to delegate.
+> **Current operator instructions:** implement directly without subagents and focus on GPU layers now. This overrides historical delegation/CPU-first sequencing below, without completing or dropping CPU requirements. Resume native GPU work from `gpu_layers_plan.md`; implementation evidence is in `implemented.md` §§41–43. Native act-head features are only a primitive, not runtime integration; the source-training mismatch and unanswered behavior question are recorded in §43. Historical role assignments are not authorization to delegate.
 
 **Goal:** Finish only the remaining **layer parity and axis/shape alignment** work in `tasks/rust/` (branch `rust`): every unported layer follows the Layer Port Contract, and every ported layer has an explicit axis/layout check against the C++ source. Waves 0–2 are done; all other open items are out of scope (see [Scope](#scope)).
 

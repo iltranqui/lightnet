@@ -1,4 +1,4 @@
-//! Checked layout/reference for the act-head's detached CLS + four features.
+//! Checked layout/reference for CLS plus four detached act-head features.
 //! This is not the MLP or its backward/update contract.
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {
