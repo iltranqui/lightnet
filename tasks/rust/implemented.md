@@ -63,6 +63,7 @@ file is named inline.
 - [28. Stage-1 axis/layout audit (bounded A1 list)](#28-stage-1-axislayout-audit-bounded-a1-list)
 - [29. Stage-1 axis/layout audit of already-ported layers](#29-stage-1-axislayout-audit-of-already-ported-layers)
 - [30. DPT-head Stage-1 CPU reference](#30-dpt-head-stage-1-cpu-reference)
+- [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -857,6 +858,12 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 - v0.1.013 (`a995fe95`): added CPU `[dpt]` / `[dpt_head]` / `[depth_anything_head]` / `[neck]` parsing and inference, strict config/shape validation, the source-order 66-slot parameter arena, sequential `.weights` handling, zero initialization, NCHW tap-major forward, and analytical backward for the full Rust forward. `GradMode::Cpp` preserves the source no-op. SGD, AdamW and Muon updates/state are integrated; Muon keeps per-slot matrix views, AdamW bias fallback, and matrix decay. GPU execution/backward/updates and unsupported stream settings reject explicitly.
 - Verification: `MEM=3G ./tools/test_host.sh dpt_head` passed 18 tests; `runtime` passed 260; `weights` passed 55 core + 2 CLI; and `axis_layout` passed 19. Tests pin all 66 slot offsets and exact default file length (2,728,513 floats; 10,914,072 bytes including the 20-byte header), batched non-square NCHW/tap axes, independent hand-computed forward, finite differences for input and all nonempty parameter slots, optimizer updates/state round trips, update gates, `GradMode::Cpp`, Depth-Anything chaining, and GPU rejection. Targeted edition-2024 Rustfmt checks and `git diff --check` passed. No training, Oxide tests, or full `cfg_corpus` run.
 - Evidence boundary: hand-derived from `Jev_laya`; no compiled-C++ golden/parity is claimed. This is Stage-1 CPU support only; native GPU and GPU Muon remain Stage 2. `[yolo_3d]` is a separate scope-confirmed backlog item and the v0.1–v0.3 roadmap remains open.
+
+## 31. C++ enum boundary config regression
+
+- v0.1.014 (`fe3a554c`): added `model::tests::unused_cpp_layer_enum_names_are_not_rust_noop_layers`. It pins `[network]` as top-level metadata and ensures `[blank]`, `[empty]`, and `[silence]` are rejected instead of becoming silent identity layers. This is a parser-regression test; no runtime behavior changed.
+- Verification: `MEM=3G ./tools/test_host.sh unused_cpp_layer_enum_names_are_not_rust_noop_layers` passed 1 test; targeted edition-2024 Rustfmt and `git diff --check` passed.
+- Evidence boundary: source-derived from `Jev_laya:src-lib/darknet_enums.cpp` and `darknet_cfg.cpp`; no compiled-C++ golden/parity. The larger v0.1–v0.3 roadmap remains open.
 
 ## Not implemented / open (pointer)
 

@@ -417,6 +417,7 @@ Immediately next, in dependency order:
   golden/parity. GPU Muon is deferred to Stage 2.
 - [~] Phase 4 foveation / depth / DETR: Stage-1 CPU `[hyperbolic_foveation]` is complete in v0.1.008 (`implemented.md` §25), `[foveation_film]` in v0.1.009 (§26), `[depth_anything]` in v0.1.010 (§27), and `[dpt_head]` in v0.1.013 (§30); LAYA encoder/head are already implemented. `[yolo_3d]` and DETR remain open. DETR is still broken in C++ (paper only).
 - [x] Stage-1 A1 axis/layout audit of every already-ported family named in `AGENTS.md`: completed in v0.1.012 (`implemented.md` §29), with the initial subset recorded in §28. `STATUS.md` tabulates the source contracts and named tests. Per-backlog axis DoDs for missing-layer ports and the remaining v0.1–v0.3 work stay open.
+- [x] v0.1.014 C++ enum-boundary regression: `[network]` remains top-level metadata, and the unused `[blank]`, `[empty]`, `[silence]` aliases reject rather than becoming identity layers; `model::tests::unused_cpp_layer_enum_names_are_not_rust_noop_layers` passed (see `implemented.md` §31). No compiled-C++ parity is claimed.
 
 ## Active and unstarted plans
 
