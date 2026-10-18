@@ -1104,9 +1104,17 @@ impl App {
                     ui.label("weights:");
                     ui.add(egui::TextEdit::singleline(&mut self.weights_path).desired_width(240.0));
                     if ui.button("Load model").clicked() {
-                        let bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("darknet-rs"));
+                        // `cargo run -p darknet-gui` puts the GUI binary here, not
+                        // the CLI, so prefer an explicit path.
+                        let bin = std::env::var_os("DARKNET_RS_BIN")
+                            .map(PathBuf::from)
+                            .or_else(|| std::env::current_exe().ok())
+                            .unwrap_or_else(|| PathBuf::from("darknet-rs"));
                         if bin.file_name().and_then(|n| n.to_str()) == Some("darknet-gui") {
-                            self.fail("set DARKNET_RS_BIN to the darknet-rs binary".to_owned());
+                            self.fail(
+                                "set DARKNET_RS_BIN to the darknet-rs binary (cargo build -p darknet-cli)"
+                                    .to_owned(),
+                            );
                         } else {
                             match DetectWorker::spawn(
                                 &bin,
