@@ -184,9 +184,48 @@ pub fn gradient(kind: u32, x: f32) -> f32 {
     }
 }
 
+// Supported device FFI links NVIDIA libdevice directly. Rust's std erf shim
+// is not whitelisted by the custom collector, so do not call std .erf() here.
+#[device]
+unsafe extern "C" {
+    fn __nv_erff(x: f32) -> f32;
+}
+
+#[device]
+pub fn exact_gelu_value(x: f32) -> f32 {
+    // SAFETY: libdevice erff is a pure scalar C-ABI device function.
+    0.5 * x * (1.0 + unsafe { __nv_erff(x * core::f32::consts::FRAC_1_SQRT_2) })
+}
+
+#[device]
+pub fn exact_gelu_slope(x: f32) -> f32 {
+    // SAFETY: same pure scalar libdevice call as the forward.
+    let cdf = 0.5 * (1.0 + unsafe { __nv_erff(x * core::f32::consts::FRAC_1_SQRT_2) });
+    let pdf = (-0.5 * x * x).exp() / (2.0 * core::f32::consts::PI).sqrt();
+    cdf + x * pdf
+}
+
 #[cuda_module]
 pub mod kernels {
     use super::*;
+
+    #[kernel]
+    pub fn gelu_erf(x: &[f32], mut out: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = out.get_mut(idx) {
+            *o = exact_gelu_value(x[i]);
+        }
+    }
+
+    #[kernel]
+    pub fn gelu_erf_backward(x: &[f32], seeds: &[f32], mut out: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = out.get_mut(idx) {
+            *o = seeds[i] * exact_gelu_slope(x[i]);
+        }
+    }
 
     #[kernel]
     pub fn activation(x: &[f32], mut out: DisjointSlice<f32>, kind: u32) {

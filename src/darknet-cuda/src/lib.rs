@@ -4,6 +4,9 @@
 //! operation traits and tensor metadata needed by the core executor; the
 //! optional cuTile bridge supplies a concrete device implementation.
 
+// Same pinned-nightly exact-erf reference as darknet-core's LAYA math.
+#![feature(float_erf)]
+
 pub mod host_ops;
 pub use host_ops::{AdamParams, NanInfMode, dropout_unit};
 
@@ -314,6 +317,44 @@ pub trait F32TensorOpsBackend {
         activation: F32ActivationKind,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error>;
+    /// Exact-erf GELU, separate from F32ActivationKind::Gelu (tanh).
+    /// Generic reference only; Oxide overrides with native libdevice math.
+    fn gelu_erf_f32(
+        &self,
+        input: &Self::Tensor,
+        shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let len = host_ops::gelu_erf::checked_len(shape).unwrap_or_else(|err| panic!("{err}"));
+        let x = self.download_f32(input)?;
+        assert_eq!(x.len(), len);
+        let values: Vec<_> = x.into_iter().map(host_ops::gelu_erf::value).collect();
+        self.upload_f32(shape, &values)
+    }
+
+    /// Seeded exact derivative of gelu_erf_f32 with respect to raw input.
+    fn gelu_erf_backward_f32(
+        &self,
+        input: &Self::Tensor,
+        seeds: &Self::Tensor,
+        shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let len = host_ops::gelu_erf::checked_len(shape).unwrap_or_else(|err| panic!("{err}"));
+        let x = self.download_f32(input)?;
+        let seeds = self.download_f32(seeds)?;
+        assert_eq!(x.len(), len);
+        assert_eq!(seeds.len(), len);
+        let values: Vec<_> = x
+            .into_iter()
+            .zip(seeds)
+            .map(|(x, s)| s * host_ops::gelu_erf::slope(x))
+            .collect();
+        self.upload_f32(shape, &values)
+    }
+
     /// `activation(bias_add(x, bias))` (inference epilogue).  Backends may
     /// fuse it into one launch; the result must equal the composition below.
     fn bias_activation_f32(

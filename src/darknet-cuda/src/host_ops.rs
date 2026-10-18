@@ -4,6 +4,7 @@
 //! round-trips through the host and still produces the exact result a device
 //! kernel must match.
 
+pub mod gelu_erf;
 pub mod laya_act;
 pub mod marker_gather;
 
