@@ -63,11 +63,14 @@ struct Case {
 }
 
 impl Case {
+    // CPU/C++ extent: `convolutional_out_width` ignores dilation. The
+    // reference indexes with `ky * dil - pad`, and out-of-range taps are
+    // skipped, so the values match the host for the same extent.
     fn oh(&self) -> usize {
-        (self.h + 2 * self.pad - (self.dil * (self.k - 1) + 1)) / self.sy + 1
+        (self.h + 2 * self.pad - self.k) / self.sy + 1
     }
     fn ow(&self) -> usize {
-        (self.w + 2 * self.pad - (self.dil * (self.k - 1) + 1)) / self.sx + 1
+        (self.w + 2 * self.pad - self.k) / self.sx + 1
     }
     fn cpg(&self) -> usize {
         self.c / self.groups

@@ -2,8 +2,15 @@
 //! and the launch sequences behind the three `conv2d_*` trait methods.
 //!
 //! Weights are `[filters, channels / groups, k, k]`, tensors NCHW, a single
-//! symmetric `padding`, `out = (in + 2*pad - (dil*(k-1)+1)) / stride + 1`
-//! (identical to the CPU reference in `darknet-core` and the cuTile bridge).
+//! symmetric `padding`, `out = (in + 2*pad - k) / stride + 1`.
+//!
+//! That extent deliberately ignores dilation, matching C++
+//! `convolutional_out_width` in `darknet-core`. The kernels still sample with
+//! `oy*stride + ky*dilation - pad` and zero-fill out-of-bounds taps, which is
+//! what `im2col_cpu_ext` does, so a dilated convolution produces the same
+//! extent and the same values on host and device. Computing
+//! `(in + 2*pad - (dil*(k-1)+1))/stride + 1` here instead made every dilated
+//! convolution fail with a shape mismatch against the CPU-derived output shape.
 //!
 //! The im2col path processes one batch element at a time so the cached
 //! workspace is only `C * k * k * OH * OW` floats.  Weight-gradient batches
@@ -14,9 +21,7 @@ use cuda_core::DeviceBuffer;
 use darknet_cuda::ElementwiseLaunchConfig;
 
 use crate::kernels::conv_direct::WGRAD_THREADS;
-use crate::{
-    GemmArgs, ImplicitConv, OxideBackend, OxideError, OxideTensorF32, launch, launch_err,
-};
+use crate::{GemmArgs, ImplicitConv, OxideBackend, OxideError, OxideTensorF32, launch, launch_err};
 
 /// Which convolution implementation to use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,7 +122,9 @@ impl Geom {
     ) -> Result<Self, OxideError> {
         let bad = |msg: String| OxideError::Shape(format!("{op}: {msg}"));
         if batch == 0 || c == 0 || h == 0 || w == 0 || f == 0 || k == 0 {
-            return Err(bad("non-zero batch, channels, size, filters and kernel required".into()));
+            return Err(bad(
+                "non-zero batch, channels, size, filters and kernel required".into(),
+            ));
         }
         if sx == 0 || sy == 0 || dil == 0 || groups == 0 {
             return Err(bad("stride, dilation and groups must be > 0".into()));
@@ -127,17 +134,31 @@ impl Geom {
                 "channels {c} and filters {f} must be divisible by groups {groups}"
             )));
         }
-        let extent = dil * (k - 1) + 1;
-        if h + 2 * pad < extent || w + 2 * pad < extent {
+        if h + 2 * pad < k || w + 2 * pad < k {
             return Err(bad(format!(
-                "kernel extent {extent} exceeds padded input {}x{}",
+                "kernel {k} exceeds padded input {}x{}",
                 h + 2 * pad,
                 w + 2 * pad
             )));
         }
-        let oh = (h + 2 * pad - extent) / sy + 1;
-        let ow = (w + 2 * pad - extent) / sx + 1;
-        Ok(Self { batch, c, h, w, f, k, sx, sy, dil, pad, groups, oh, ow })
+        // CPU/C++ extent: dilation does not shrink it.
+        let oh = (h + 2 * pad - k) / sy + 1;
+        let ow = (w + 2 * pad - k) / sx + 1;
+        Ok(Self {
+            batch,
+            c,
+            h,
+            w,
+            f,
+            k,
+            sx,
+            sy,
+            dil,
+            pad,
+            groups,
+            oh,
+            ow,
+        })
     }
 
     pub(crate) fn cpg(&self) -> usize {
@@ -179,7 +200,12 @@ pub(crate) fn expect_len(op: &str, what: &str, got: usize, want: usize) -> Resul
     Ok(())
 }
 
-pub(crate) fn expect_shape(op: &str, what: &str, got: &[usize], want: &[usize]) -> Result<(), OxideError> {
+pub(crate) fn expect_shape(
+    op: &str,
+    what: &str,
+    got: &[usize],
+    want: &[usize],
+) -> Result<(), OxideError> {
     if got != want {
         return Err(OxideError::Shape(format!(
             "{op}: {what} shape must be {want:?}, got {got:?}"
@@ -379,7 +405,9 @@ impl OxideBackend {
             let (kg, ohw, fpg) = (g.kg(), g.ohw(), g.fpg());
             // One im2col + one GEMM launch per chunk of images (instances =
             // image x group); the column buffer is bounded by `col_cap_bytes()`.
-            let chunk = (col_cap_bytes() / 4 / g.col_len()).clamp(1, g.batch).min(chunk_limit());
+            let chunk = (col_cap_bytes() / 4 / g.col_len())
+                .clamp(1, g.batch)
+                .min(chunk_limit());
             self.with_workspace(chunk * g.col_len(), |ws| {
                 let mut b0 = 0;
                 while b0 < g.batch {
@@ -474,7 +502,9 @@ impl OxideBackend {
             // group; the instance index is image-major, so `b` and `c` are
             // simple strides), then one col2im per image reading its block of
             // the shared column workspace.
-            let chunk = (col_cap_bytes() / 4 / g.col_len()).clamp(1, g.batch).min(chunk_limit());
+            let chunk = (col_cap_bytes() / 4 / g.col_len())
+                .clamp(1, g.batch)
+                .min(chunk_limit());
             self.with_workspace(chunk * g.col_len(), |ws| {
                 let mut b0 = 0;
                 while b0 < g.batch {
@@ -600,7 +630,9 @@ impl OxideBackend {
             // fixed order (`gemm_splitk_reduce`, deterministic).  The image
             // dimension is folded into `splits`, so `dw` accumulates across
             // chunks with `beta = 1`.
-            let col_chunk = (col_cap_bytes() / 4 / g.col_len()).clamp(1, g.batch).min(chunk_limit());
+            let col_chunk = (col_cap_bytes() / 4 / g.col_len())
+                .clamp(1, g.batch)
+                .min(chunk_limit());
             let part_chunk = (PARTIAL_CAP_BYTES / 4 / (g.f * kg).max(1)).clamp(1, g.batch);
             let chunk = col_chunk.min(part_chunk).min(g.batch);
             self.with_workspace(chunk * g.col_len(), |ws| {

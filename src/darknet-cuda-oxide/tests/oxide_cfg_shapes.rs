@@ -171,14 +171,12 @@ struct Case {
 }
 
 impl Case {
-    fn extent(&self) -> usize {
-        self.dil * (self.k - 1) + 1
-    }
     fn oh(&self) -> usize {
-        (self.h + 2 * self.pad - self.extent()) / self.sy + 1
+        // CPU/C++ extent: dilation does not shrink it.
+        (self.h + 2 * self.pad - self.k) / self.sy + 1
     }
     fn ow(&self) -> usize {
-        (self.w + 2 * self.pad - self.extent()) / self.sx + 1
+        (self.w + 2 * self.pad - self.k) / self.sx + 1
     }
     fn cpg(&self) -> usize {
         self.c / self.groups
@@ -198,9 +196,10 @@ impl Case {
     fn macs(&self) -> usize {
         self.b * self.f * self.cpg() * self.k * self.k * self.oh() * self.ow()
     }
-    /// Smallest spatial size with output >= 1.
+    /// Smallest spatial size with output >= 1; the extent is `k`, not the
+    /// dilated span, because the CPU geometry ignores dilation.
     fn min_hw(&self) -> usize {
-        self.extent().saturating_sub(2 * self.pad).max(1)
+        self.k.saturating_sub(2 * self.pad).max(1)
     }
     fn desc(&self) -> String {
         format!(
@@ -912,56 +911,66 @@ fn cfg_conv_selection_rule_and_picks() {
 #[test]
 fn cfg_conv_dilated_and_non_rule_geometries() {
     let (_, other) = selected();
-    let mut unsupported = vec![];
+    let mut supported = vec![];
     let mut failures = vec![];
     let mut ran = 0usize;
     for mode in [ConvMode::Direct, ConvMode::Gemm] {
         let be = OxideBackend::new().unwrap().with_conv_mode(mode).with_gemm_mode(GemmMode::Fp32);
         for g in other.iter().filter(|g| is_dilated(g)) {
-            // (a) darknet-core convention -> Err on all three entry points.
+            // (a) CPU/C++ convention: raw `pad`, extent ignores dilation, so the
+            // device must reproduce the cfg dimensions and the CPU values.
             let core = g.case(1);
+            if (core.oh(), core.ow()) != (g.out_h, g.out_w) {
+                failures.push(format!(
+                    "{mode:?} line {}: darknet-core dims {}x{} != cfg {}x{}",
+                    g.row, core.oh(), core.ow(), g.out_h, g.out_w
+                ));
+            }
+            let (c, shrunk) = shrink(g, 1, SPATIAL_TRIGGER, MAC_CAP / 2);
+            let o = run_conv_case(&be, &c, 3000 + g.row as u64, Flavor::Fp32);
+            ran += 1;
+            println!(
+                "  dilated {mode:?} line {}: {} fwd {:.2e} dgrad {:.2e} wgrad {:.2e}",
+                g.row, label(g, &c, shrunk), o.max[0], o.max[1], o.max[2]
+            );
+            if !o.failures.is_empty() {
+                failures.push(format!("{mode:?} {}: {}", label(g, &c, shrunk), o.failures.join("; ")));
+            }
+            if mode == ConvMode::Direct {
+                supported.push(format!(
+                    "line {} [{}] {}x{}x{}->f{} k{} s{} dil{} pad{}: {}x{}",
+                    g.row, g.origin, core.c, core.h, core.w, core.f, core.k, core.sx, core.dil,
+                    core.pad, core.oh(), core.ow()
+                ));
+            }
+            // (b) cuDNN `pad*dilation` now over-pads: the cfg output shape must
+            // be rejected instead of silently producing a larger map.
+            let mut eff = g.clone();
+            eff.pad = g.pad * g.dil;
             let xt = be.zeros_f32(&[1, core.c, core.h, core.w]).unwrap();
             let wt = be.zeros_f32(&[core.f, core.cpg(), core.k, core.k]).unwrap();
             let dyt = be.zeros_f32(&[1, core.f, g.out_h, g.out_w]).unwrap();
             let fwd = be.conv2d_f32(&xt, &wt, &[1, core.f, g.out_h, g.out_w], core.c, core.h, core.w, core.f,
-                core.k, core.sx, core.sy, core.dil, core.pad, core.groups, cfg());
+                core.k, core.sx, core.sy, core.dil, eff.pad, core.groups, cfg());
             let dgr = be.conv2d_backward_input_f32(&dyt, &wt, &[1, core.c, core.h, core.w], core.c, core.h,
-                core.w, core.f, core.k, core.sx, core.sy, core.dil, core.pad, core.groups, cfg());
+                core.w, core.f, core.k, core.sx, core.sy, core.dil, eff.pad, core.groups, cfg());
             let wgr = be.conv2d_backward_weights_f32(&xt, &dyt, &[core.f, core.cpg(), core.k, core.k], core.c,
-                core.h, core.w, core.f, core.k, core.sx, core.sy, core.dil, core.pad, core.groups, cfg());
+                core.h, core.w, core.f, core.k, core.sx, core.sy, core.dil, eff.pad, core.groups, cfg());
             if !(fwd.is_err() && dgr.is_err() && wgr.is_err()) {
-                failures.push(format!("{mode:?} line {}: darknet-core-convention call did not return Err on all of fwd/dgrad/wgrad", g.row));
-            }
-            if mode == ConvMode::Direct {
-                unsupported.push(format!(
-                    "line {} [{}] {}x{}x{}->f{} k{} s{} dil{} pad{}: Err under darknet-core dims (oxide dilated dims {}x{} != cfg {}x{})",
-                    g.row, g.origin, core.c, core.h, core.w, core.f, core.k, core.sx, core.dil, core.pad,
-                    core.oh(), core.ow(), g.out_h, g.out_w
+                failures.push(format!(
+                    "{mode:?} line {}: pad*dilation call with cfg dims did not return Err on all of fwd/dgrad/wgrad",
+                    g.row
                 ));
-            }
-            // (b) C++ cuDNN convention pad*dilation: same dims as the cfg, and parity.
-            let mut eff = g.clone();
-            eff.pad = g.pad * g.dil;
-            if (eff.case(1).oh(), eff.case(1).ow()) != (g.out_h, g.out_w) {
-                failures.push(format!("{mode:?} line {}: pad*dil output dims {}x{} != cfg {}x{}", g.row,
-                    eff.case(1).oh(), eff.case(1).ow(), g.out_h, g.out_w));
-            }
-            let (c, shrunk) = shrink(&eff, 1, SPATIAL_TRIGGER, MAC_CAP / 2);
-            let o = run_conv_case(&be, &c, 3000 + g.row as u64, Flavor::Fp32);
-            ran += 1;
-            println!("  dilated {mode:?} line {}: {} fwd {:.2e} dgrad {:.2e} wgrad {:.2e}", g.row, label(&eff, &c, shrunk), o.max[0], o.max[1], o.max[2]);
-            if !o.failures.is_empty() {
-                failures.push(format!("{mode:?} {}: {}", label(&eff, &c, shrunk), o.failures.join("; ")));
             }
         }
     }
-    println!("unsupported/skipped under the darknet-core dilation convention (asserted Err):");
-    for u in &unsupported {
-        println!("  {u}");
+    println!("dilated geometries run under the CPU/C++ convention: {}", supported.len());
+    for s in &supported {
+        println!("  {s}");
     }
-    println!("dilated geometries run via pad*dilation: {ran} (2 modes), failed: {}", failures.len());
+    println!("dilated geometries run: {ran} (2 modes), failed: {}", failures.len());
     println!("non-rule plain geometries (run in the mode tests): {}", plain_extras(&other).len());
-    assert_eq!(unsupported.len(), 6, "expected 6 dilated geometries");
+    assert_eq!(supported.len(), 6, "expected 6 dilated geometries");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 

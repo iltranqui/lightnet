@@ -557,7 +557,9 @@ impl OxideBackend {
     /// `x` is NCHW f16, `weights` is `[filters, kpad]` from
     /// [`OxideBackend::conv_weights_f16`] (`kpad = (c / groups) * k * k`
     /// rounded up to 8), `bias` is f32 `[filters]` (folded batch norm bias).
-    /// Geometry follows the f32 convs: `out = (in + 2 * pad - (dil * (k - 1) + 1)) / stride + 1`.
+    /// Geometry follows the f32 convs: `out = (in + 2 * pad - k) / stride + 1`.
+    /// Like the f32 path, dilation does not shrink the extent; taps outside the
+    /// image are zero-filled, matching `im2col_cpu_ext`.
     /// im2col (zero padded to K and N multiples of 8) and the GEMM run once per
     /// chunk of images (instances = image x group, bounded by `COL_CAP_BYTES`), so every operand row is 16-byte aligned
     /// and `cp.async` always takes the vector path; 1x1 stride-1 convs whose
@@ -590,12 +592,11 @@ impl OxideBackend {
         if c % groups != 0 || f % groups != 0 {
             return Err(bad(format!("channels {c} and filters {f} must be divisible by groups {groups}")));
         }
-        let extent_k = dil * (k - 1) + 1;
-        if h + 2 * pad < extent_k || w + 2 * pad < extent_k {
-            return Err(bad(format!("kernel extent {extent_k} exceeds padded input")));
+        if h + 2 * pad < k || w + 2 * pad < k {
+            return Err(bad(format!("kernel {k} exceeds padded input")));
         }
-        let oh = (h + 2 * pad - extent_k) / sy + 1;
-        let ow = (w + 2 * pad - extent_k) / sx + 1;
+        let oh = (h + 2 * pad - k) / sy + 1;
+        let ow = (w + 2 * pad - k) / sx + 1;
         let plane = c * h * w;
         if x.len() % plane != 0 {
             return Err(bad(format!("input length {} is not a multiple of C*H*W = {plane}", x.len())));

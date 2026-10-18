@@ -147,8 +147,8 @@ struct Case {
     sx: usize, sy: usize, dil: usize, pad: usize, groups: usize,
 }
 impl Case {
-    fn oh(&self) -> usize { (self.h + 2 * self.pad - (self.dil * (self.k - 1) + 1)) / self.sy + 1 }
-    fn ow(&self) -> usize { (self.w + 2 * self.pad - (self.dil * (self.k - 1) + 1)) / self.sx + 1 }
+    fn oh(&self) -> usize { (self.h + 2 * self.pad - self.k) / self.sy + 1 }
+    fn ow(&self) -> usize { (self.w + 2 * self.pad - self.k) / self.sx + 1 }
     fn cpg(&self) -> usize { self.c / self.groups }
     fn x_len(&self) -> usize { self.b * self.c * self.h * self.w }
     fn y_len(&self) -> usize { self.b * self.f * self.oh() * self.ow() }
