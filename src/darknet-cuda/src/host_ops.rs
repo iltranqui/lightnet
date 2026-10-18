@@ -4,6 +4,8 @@
 //! round-trips through the host and still produces the exact result a device
 //! kernel must match.
 
+pub mod marker_gather;
+
 /// Deterministic counter-hash RNG for dropout: a splitmix64 finaliser over
 /// `seed + (index + 1) * golden`, reduced to a uniform f32 in `[0, 1)` with 24
 /// exact bits.  Device kernels reproduce this bit for bit, so a mask depends

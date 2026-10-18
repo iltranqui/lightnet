@@ -18,9 +18,81 @@ pub fn dropout_unit(seed: u64, index: u64) -> f32 {
     (z >> 40) as f32 / 16_777_216.0
 }
 
+/// Match CPU half-away rounding without f32's (x+0.5) halfway rounding error.
+/// Clamp before converting so NaN/infinities cannot poison integer indexing.
+#[device]
+pub fn marker_position(value: f32, sequence: usize) -> usize {
+    let value = value as f64;
+    if !(value >= 0.0) {
+        0
+    } else if value >= (sequence - 1) as f64 {
+        sequence - 1
+    } else {
+        (value + 0.5) as usize
+    }
+}
+
 #[cuda_module]
 pub mod kernels {
     use super::*;
+
+    /// One thread owns each gathered output; both inputs stay device-resident.
+    #[kernel]
+    pub fn marker_gather(
+        features: &[f32],
+        markers: &[f32],
+        mut output: DisjointSlice<f32>,
+        hidden: usize,
+        sequence: usize,
+        marker_channels: usize,
+        options: usize,
+    ) {
+        let i = thread::index_1d().get();
+        if i < output.len() {
+            let j = i % options;
+            let channel = i / options;
+            let b = channel / hidden;
+            let pos = marker_position(markers[(b * marker_channels + 2 * j) * sequence], sequence);
+            // SAFETY: validated NCHW extents bound channel/pos and each thread owns i.
+            unsafe {
+                *output.as_mut_ptr().add(i) = features[channel * sequence + pos];
+            }
+        }
+    }
+
+    /// One thread per input feature. Ascending option reduction is deterministic
+    /// even for duplicate markers, without atomics or cross-thread races.
+    #[kernel]
+    pub fn marker_gather_backward(
+        markers: &[f32],
+        dy: &[f32],
+        mut dx: DisjointSlice<f32>,
+        hidden: usize,
+        sequence: usize,
+        marker_channels: usize,
+        options: usize,
+    ) {
+        let i = thread::index_1d().get();
+        if i < dx.len() {
+            let channel = i / sequence;
+            let b = channel / hidden;
+            let pos = i % sequence;
+            let mut sum = 0.0f32;
+            let mut j = 0;
+            while j < options {
+                let selected =
+                    marker_position(markers[(b * marker_channels + 2 * j) * sequence], sequence);
+                if selected == pos {
+                    sum += dy[channel * options + j];
+                }
+                j += 1;
+            }
+            // SAFETY: the host validates storage; each thread writes one input gradient.
+            unsafe {
+                *dx.as_mut_ptr().add(i) = sum;
+            }
+        }
+    }
 
     /// Copy one contiguous sequence chunk to an independent output tensor.
     #[kernel]

@@ -1517,6 +1517,43 @@ pub trait F32TensorOpsBackend {
         let out = host_ops::channel_permute(&host, shape[0], rows, cols, shape[2] * shape[3]);
         self.upload_f32(shape, &out)
     }
+    /// Gather hidden-state columns using LAYA's per-sample marker metadata.
+    /// Oxide overrides this generic host reference with a native device kernel.
+    fn marker_gather_f32(
+        &self,
+        features: &Self::Tensor,
+        markers: &Self::Tensor,
+        feature_shape: &[usize],
+        marker_shape: &[usize],
+        options: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let layout = host_ops::marker_gather::Layout::new(feature_shape, marker_shape, options)
+            .unwrap_or_else(|err| panic!("{err}"));
+        let features = self.download_f32(features)?;
+        let markers = self.download_f32(markers)?;
+        self.upload_f32(&layout.output_shape(), &layout.forward(&features, &markers))
+    }
+
+    /// Exact feature adjoint; marker indices/masks have no derivative.
+    fn marker_gather_backward_f32(
+        &self,
+        markers: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        feature_shape: &[usize],
+        marker_shape: &[usize],
+        options: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let layout = host_ops::marker_gather::Layout::new(feature_shape, marker_shape, options)
+            .unwrap_or_else(|err| panic!("{err}"));
+        let markers = self.download_f32(markers)?;
+        let dy = self.download_f32(output_grad)?;
+        self.upload_f32(feature_shape, &layout.backward(&markers, &dy))
+    }
+
     /// Inverted dropout: element `i` is zeroed when `dropout_unit(seed, i) <
     /// probability`, otherwise scaled by `1 / (1 - probability)`.  Returns
     /// `(output, mask)` where `mask` holds the per-element multiplier.

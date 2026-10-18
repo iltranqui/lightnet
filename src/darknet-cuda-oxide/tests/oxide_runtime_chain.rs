@@ -149,6 +149,18 @@ fn assert_chain(cfg: &str, seed_layer: usize, what: &str) {
 }
 
 #[test]
+fn marker_gather_native_full_compact_backward_and_upstream_sgd_match_cpu() {
+    assert_chain(
+        "[net]\nwidth=5\nheight=1\nchannels=8\nbatch=2\n\
+         [convolutional]\nfilters=8\nsize=1\nactivation=linear\n\
+         [convolutional]\nfilters=8\nsize=1\nactivation=linear\n\
+         [laya_marker_gather]\nlayers=1,0\nhidden=8\nmax_options=3\n",
+        2,
+        "native marker gather",
+    );
+}
+
+#[test]
 fn chained_conv_activation_stacks_match_cpu_backward() {
     for act in [
         "leaky",

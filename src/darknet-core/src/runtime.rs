@@ -11788,25 +11788,16 @@ where
                         layer_index: layer.index,
                         reference: spec.layers[1],
                     })?;
-                    let host_a = self
-                        .download_tensor(a_source, a_layer.output_shape)
-                        .map_err(|err| backend_error("download laya_marker_gather input A", err))?;
-                    let host_b = self
-                        .download_tensor(b_source, b_layer.output_shape)
-                        .map_err(|err| backend_error("download laya_marker_gather input B", err))?;
-                    let data = crate::laya_marker_gather::forward(
-                        &host_a.data,
-                        &host_b.data,
-                        a_layer.output_shape.batch,
-                        spec.hidden,
-                        spec.max_options,
-                        a_layer.output_shape.width,
-                        b_layer.output_shape.channels,
-                    )
-                    .map_err(Error::InvalidConfig)?;
                     self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
-                        .map_err(|err| backend_error("upload laya_marker_gather output", err))?
+                        .marker_gather_f32(
+                            a_source,
+                            b_source,
+                            &tensor_backend_shape(a_layer.output_shape),
+                            &tensor_backend_shape(b_layer.output_shape),
+                            spec.max_options,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("GPU laya_marker_gather", err))?
                 }
                 (LayerKind::LayaActHead(spec), LayerParams::LayaActHead(weights)) => {
                     let head_index = resolve_relative_layer(layer.index, spec.layers[0])?;
@@ -13550,25 +13541,16 @@ where
                             layer_index: layer.index,
                             reference: spec.layers[1],
                         })?;
-                    let host_a = self
-                        .download_tensor(a_source, a_layer.output_shape)
-                        .map_err(|err| backend_error("download laya_marker_gather input A", err))?;
-                    let host_b = self
-                        .download_tensor(b_source, b_layer.output_shape)
-                        .map_err(|err| backend_error("download laya_marker_gather input B", err))?;
-                    let data = crate::laya_marker_gather::forward(
-                        &host_a.data,
-                        &host_b.data,
-                        a_layer.output_shape.batch,
-                        spec.hidden,
-                        spec.max_options,
-                        a_layer.output_shape.width,
-                        b_layer.output_shape.channels,
-                    )
-                    .map_err(Error::InvalidConfig)?;
                     self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
-                        .map_err(|err| backend_error("upload laya_marker_gather output", err))?
+                        .marker_gather_f32(
+                            a_source,
+                            b_source,
+                            &tensor_backend_shape(a_layer.output_shape),
+                            &tensor_backend_shape(b_layer.output_shape),
+                            spec.max_options,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("GPU laya_marker_gather", err))?
                 }
                 (LayerKind::LayaActHead(spec), LayerParams::LayaActHead(weights)) => {
                     let head_index = resolve_relative_layer(layer.index, spec.layers[0])?;
@@ -14244,11 +14226,38 @@ where
                         )?;
                     }
                 }
-                (LayerKind::LayaMarkerGather(_), Some(LayerParams::None)) => {
-                    return Err(Error::UnsupportedLayer {
+                (LayerKind::LayaMarkerGather(spec), Some(LayerParams::None)) => {
+                    let a_index = resolve_relative_layer(layer.index, spec.layers[0])?;
+                    let b_index = resolve_relative_layer(layer.index, spec.layers[1])?;
+                    let a_layer = self.network.layers.get(a_index).ok_or(Error::InvalidRoute {
                         layer_index: layer.index,
-                        name: "laya_marker_gather GPU backward".to_owned(),
-                    });
+                        reference: spec.layers[0],
+                    })?;
+                    let b_layer = self.network.layers.get(b_index).ok_or(Error::InvalidRoute {
+                        layer_index: layer.index,
+                        reference: spec.layers[1],
+                    })?;
+                    let markers = forward.gpu_layer_outputs.get(b_index).ok_or(Error::InvalidRoute {
+                        layer_index: layer.index,
+                        reference: spec.layers[1],
+                    })?;
+                    let source_grad = self
+                        .backend
+                        .marker_gather_backward_f32(
+                            markers,
+                            &grad,
+                            &tensor_backend_shape(a_layer.output_shape),
+                            &tensor_backend_shape(b_layer.output_shape),
+                            spec.max_options,
+                            config,
+                        )
+                        .map_err(|err| backend_error("GPU laya_marker_gather backward", err))?;
+                    // B contains discrete indices, not differentiable features.
+                    // Do not send another gradient when A and B alias.
+                    self.accumulate_gpu_gradient(
+                        &mut layer_output_gradients[a_index],
+                        source_grad,
+                    )?;
                 }
                 (LayerKind::LayaActHead(_), Some(LayerParams::LayaActHead(_))) => {
                     return Err(Error::UnsupportedLayer {
@@ -15713,9 +15722,6 @@ where
                 }
                 // These layers use the Rust host reference and have no native device backward.
                 LayerKind::Deconvolutional(_) | LayerKind::DeformConv(_) => return true,
-                // `[laya_marker_gather]` has no device backward yet; keep the
-                // whole net on the CPU backward (forward uses a host round trip).
-                LayerKind::LayaMarkerGather(_) => return true,
                 // Weighted shortcut parameter reductions stay host-resident,
                 // while input/source gradients use backend elementwise ops.
                 // `[laya_act_head]` and the full ViT backward still use the
@@ -45730,6 +45736,8 @@ probability=0.5
     mod foveation_film_runtime_tests;
     #[path = "hyperbolic_foveation_runtime_tests.rs"]
     mod hyperbolic_foveation_runtime_tests;
+    #[path = "marker_gather_gpu_tests.rs"]
+    mod marker_gather_gpu_tests;
     #[path = "yolo_3d_runtime_tests.rs"]
     mod yolo_3d_runtime_tests;
 }
