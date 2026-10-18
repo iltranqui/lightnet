@@ -69,6 +69,7 @@ file is named inline.
 - [41. Native f32 LAYA marker gather](#41-native-f32-laya-marker-gather)
 - [42. Native f16 marker-gather inference](#42-native-f16-marker-gather-inference)
 - [43. Native detached act-head feature primitive](#43-native-detached-act-head-feature-primitive)
+- [44. Native exact-erf GELU primitives](#44-native-exact-erf-gelu-primitives)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1078,6 +1079,31 @@ Test-first: direct tests failed compilation on the missing backend method before
 - `MEM=3G ./tools/test_host.sh laya_act_head`: **9 core passed**, 0 CLI matched.
 
 Targeted edition-2024 Rustfmt/diff checks passed. Temporary source/log snapshots removed after recording evidence; no weights or sidecars created. Parked uncommitted CPU math remained unselected and outside this release. GPU status: feature primitive native f32; **act-head layer remains host fallback**, f16 unsupported. No new derivative/optimizer/checkpoint proof, training run, benchmark, full-host/corpus/full-Oxide run or compiled-C++ golden. Other GPU layers/GPU Muon, CPU/config/axis gaps and sparse MoE remain open. Hand-derived from source, no compiled-C++ golden.
+
+## 44. Native exact-erf GELU primitives
+
+- v0.2.004 (`eec5eab0`): added dedicated `F32TensorOpsBackend::{gelu_erf_f32,gelu_erf_backward_f32}`, without changing `F32ActivationKind::Gelu`, activation IDs, cfg behavior or existing AMP/f16 dispatch. `darknet-cuda/src/host_ops/gelu_erf.rs` supplies checked bounded shape products and exact-erf host reference; `host_ops.rs` exposes it and the CUDA contract crate enables `float_erf`, matching the already pinned-nightly core reference. No Cargo/dependency changes.
+- Oxide's overrides in `src/lib.rs` validate positive nonempty declared shapes, actual input/seed metadata and lengths before allocation/launch. `src/kernels/activations.rs` adds dedicated elementwise forward/backward kernels and scalar helpers: y=.5*x*(1+erf(x/sqrt(2))); derivative=normal CDF+x*normal PDF; backward multiplies the supplied seed. Arrays stay on device, with one thread/output and no host math/downloads in the override. Generic trait defaults remain host references for other backends.
+- CPU oracle: `laya_scorer::{gelu_erf,gelu_erf_grad}`; source context is the pinned C++ act-head exact-erf function recorded in §43. The custom collector intentionally rejects Rust's std erf shim, so the GPU uses the supported `#[device] extern "C"` libdevice `__nv_erff` route instead. Inspected generated linked LLVM and confirmed an internal **defined** `__nv_erff` body, not just an unresolved declaration; real-device execution passed. No compiler/bridge changes, approximation or host fallback was added. "Exact-erf" identifies the source variant, not bit-exact CPU/libdevice agreement.
+
+Scoped requirement-to-artifact audit (`oxide_gelu_erf.rs`):
+
+| Requirement | Actual evidence |
+|---|---|
+| Source variant and seeded analytic derivative | `gelu_erf_native_forward_backward_matches_hand_values_and_cpu_not_tanh`: hand y at -1/0/1/2 and derivative at +/-1, full CPU and new host-helper comparisons, nonunit/zero/signed seeds, B=2/C=2/H=3/W=5 and tile lengths 32/128/256 with ragged tails. Existing native tanh GELU stays measurably distinct at x=1 |
+| Differentiate actual device forward, not only a CPU surrogate | `gelu_erf_native_backward_matches_actual_gpu_forward_central_differences`: ten selected coordinates spanning both batches, actual GPU forward dot-product scores, epsilon .001 and absolute derivative tolerance .0005 |
+| Explicit IEEE/nonfinite contract, no silent sanitation | `gelu_erf_native_extremes_and_nonfinite_follow_literal_cpu_formula`: finite +/-MAX, +/-100/15, tiny/subnormal inputs, NaN/infinite inputs and seeds. Literal -Inf*0 forward and Inf*0 derivatives remain NaN as in the CPU formula; no substituted limiting values or clipping |
+| Fail before unsafe device access | `gelu_erf_native_rejects_bad_shape_storage_and_seed_metadata`: empty/zero/overflow shapes, wrong element count, equal-length wrong layout, short input/seed and equal-length seed metadata mismatch |
+| Preserve existing APIs and avoid premature layer completion | Existing enum/kind mappings untouched; no act-head runtime, parameter, optimizer or checkpoint modifications. New f32 primitives only; no new f16 or act-head network integration claimed |
+
+Test-first: new tests initially failed compilation on missing methods. Final serial RTX 4060 Laptop runs, via 3G scopes/script `-j 2`:
+
+- `MEM=3G ./tools/test_oxide.sh --test oxide_gelu_erf`: **4 passed**.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_grad_methods`: **2 passed, 1 ignored** (timed benchmark not run; cases include leaky/logistic/mish and other existing gradient ops, not an all-activation coverage claim).
+- `MEM=3G ./tools/test_oxide.sh --test oxide_laya_act_features`: **3 passed**.
+- `MEM=3G ./tools/test_host.sh gelu`: **2 core passed**, 0 CLI matched.
+
+Targeted edition-2024 Rustfmt/diff checks passed; only inserted activation-file blocks were formatted/checked to preserve unrelated existing style. Temporary logs/formatter snippet removed after recording evidence. Generated compiler products remain part of the active incremental build. Parked uncommitted CPU math remained outside this release. No real training, benchmark, full-host/corpus/full-Oxide run or compiled-C++ golden. GPU status: exact-erf f32 forward/backward primitive native; **act-head runtime remains host fallback** and its training-contract question remains unanswered. Next independent work is native act-head f32 forward composition, retaining CPU backward until gradient/update eligibility is resolved and implemented. All broader GPU/GPU Muon, CPU/config/axis and sparse-MoE requirements remain open. Hand-derived from source, no compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 
