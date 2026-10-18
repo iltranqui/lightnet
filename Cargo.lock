@@ -965,6 +965,7 @@ dependencies = [
  "darknet-cuda",
  "darknet-cuda-oxide",
  "rayon",
+ "serde_json",
 ]
 
 [[package]]
@@ -1006,8 +1007,31 @@ dependencies = [
 name = "darknet-gui"
 version = "0.1.0"
 dependencies = [
+ "darknet-gui-engine",
+ "darknet-gui-project",
  "eframe",
  "image",
+ "imageproc",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "darknet-gui-engine"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "darknet-gui-project"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "imageproc",
+ "regex",
  "serde",
  "serde_json",
 ]

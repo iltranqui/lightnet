@@ -429,6 +429,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        "detect-server" => {
+            let cfg = required_arg(args.next(), "cfg path")?;
+            let weights = required_arg(args.next(), "weights path")?;
+            run_detect_server(&cfg, &weights)?;
+        }
         "export-onnx" => {
             let parsed = parse_export_onnx_args(args.collect())?;
             let network = Network::from_path(&parsed.cfg)?.with_batch(1);
@@ -470,6 +475,117 @@ impl ImageDetections {
             Self::AxisAligned(detections) => detections.len(),
             Self::Oriented(detections) => detections.len(),
         }
+    }
+}
+
+/// `detect-server`: one JSON request per stdin line, one JSON reply per line.
+///
+/// Requests are `{"image": "<path>", "thresh": <f32>}`; replies are
+/// `{"boxes":[{"class","conf","cx","cy","w","h"}]}` with normalized geometry, or
+/// `{"error": "<message>"}`. A bad request or image never terminates the server.
+fn run_detect_server(cfg: &str, weights: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let network = Network::from_path(cfg)?.with_batch(1);
+    if network.net.obb {
+        return Err("detect-server supports detector mode only (OBB is out of scope)".into());
+    }
+    match selected_backend()?.as_str() {
+        "cpu" => {
+            let mut executable = ExecutableNetwork::new(network.clone());
+            executable.load_weights_file(weights)?;
+            serve_detections(&network, |input| executable.forward(input))
+        }
+        #[cfg(feature = "oxide")]
+        "oxide" => {
+            let backend = OxideBackend::new()?;
+            let mut executable = GpuExecutableNetwork::new(network.clone(), backend);
+            executable.load_weights_file(weights)?;
+            serve_detections(&network, |input| executable.forward(input))
+        }
+        other => Err(format!("unsupported detect-server backend: {other}").into()),
+    }
+}
+
+fn serve_detections<F>(
+    network: &Network,
+    mut forward: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnMut(&Tensor) -> darknet_core::Result<ForwardResult>,
+{
+    use std::io::BufRead as _;
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let reply = detect_server_request(network, &line, &mut forward);
+        writeln!(stdout, "{reply}")?;
+        stdout.flush()?;
+    }
+    Ok(())
+}
+
+fn detect_server_request<F>(
+    network: &Network,
+    line: &str,
+    forward: &mut F,
+) -> serde_json::Value
+where
+    F: FnMut(&Tensor) -> darknet_core::Result<ForwardResult>,
+{
+    let request: serde_json::Value = match serde_json::from_str(line) {
+        Ok(value) => value,
+        Err(error) => return serde_json::json!({ "error": format!("invalid request: {error}") }),
+    };
+    let Some(image) = request.get("image").and_then(|value| value.as_str()) else {
+        return serde_json::json!({ "error": "request needs an image path" });
+    };
+    let thresh = request
+        .get("thresh")
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.25) as f32;
+
+    let prepared = match PlanarRgbImage::load(image) {
+        Ok(original) => {
+            let (width, height) = (original.shape.width, original.shape.height);
+            match original.letterbox(network.net.width, network.net.height) {
+                Ok(input) => (input, width, height),
+                Err(error) => return serde_json::json!({ "error": error.to_string() }),
+            }
+        }
+        Err(error) => return serde_json::json!({ "error": error.to_string() }),
+    };
+    let (input, width, height) = prepared;
+    let input: Tensor = input.into();
+    let result = match forward(&input) {
+        Ok(result) => result,
+        Err(error) => return serde_json::json!({ "error": error.to_string() }),
+    };
+    let options = DetectionOptions {
+        confidence_threshold: thresh.clamp(0.0, 1.0),
+        nms_threshold: 0.45,
+        letterbox: true,
+    };
+    match decode_network_detections(network, &result, 0, width, height, options) {
+        Ok(detections) => {
+            let boxes: Vec<serde_json::Value> = detections
+                .iter()
+                .map(|detection| {
+                    serde_json::json!({
+                        "class": detection.class_id,
+                        "conf": detection.confidence,
+                        "cx": detection.bbox.x / width.max(1) as f32,
+                        "cy": detection.bbox.y / height.max(1) as f32,
+                        "w": detection.bbox.w / width.max(1) as f32,
+                        "h": detection.bbox.h / height.max(1) as f32,
+                    })
+                })
+                .collect();
+            serde_json::json!({ "boxes": boxes })
+        }
+        Err(error) => serde_json::json!({ "error": error.to_string() }),
     }
 }
 

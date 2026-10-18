@@ -14,6 +14,8 @@ members = [
     # `darknet-gui` is opt-in (`-p darknet-gui`): it pulls egui/eframe and is
     # intentionally not in `default-members`.
     "src/darknet-gui",
+    "src/darknet-gui-project",
+    "src/darknet-gui-engine",
 
     # cuda-oxide (vendored from NVlabs/cuda-oxide, Apache-2.0)
     # Core crates

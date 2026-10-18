@@ -8,6 +8,7 @@ license.workspace = true
 darknet-core = { path = "../darknet-core" }
 darknet-cuda = { path = "../darknet-cuda" }
 rayon = "1"
+serde_json.workspace = true
 # cuda-oxide backend: optional, only compiles through `cargo oxide`
 # (rustc-codegen-cuda). Build with:
 #   target/debug/cargo-oxide oxide build -- -p darknet-cli --features oxide -j 1
