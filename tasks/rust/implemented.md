@@ -65,6 +65,7 @@ file is named inline.
 - [30. DPT-head Stage-1 CPU reference](#30-dpt-head-stage-1-cpu-reference)
 - [38. YOLO-3D configuration preparation (not a layer port)](#38-yolo-3d-configuration-preparation-not-a-layer-port)
 - [39. Cuboid labels and deterministic truth helpers](#39-cuboid-labels-and-deterministic-truth-helpers)
+- [40. YOLO-3D raw CPU runtime and fail-closed consumers](#40-yolo-3d-raw-cpu-runtime-and-fail-closed-consumers)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -955,6 +956,45 @@ Scoped prompt-to-artifact audit (test names below are in `cuboid_labels/tests.rs
 
 - Boundaries: deterministic caller order replaces source random shuffle; cap is applied before tiny-hull filtering without refilling. Nonfinite/malformed tokens, invalid public values and non-UTF-8 file identities error explicitly. Mosaic callers provide already positioned geometry; no tile sampler, clipping-policy implementation or image augmentation loader is added. Crucially, C++ `blend_truth_mosaic` copies only entries 0–4 and drops the trailing mixed flags too, so mixed mosaic records carry flag zero and are not assigned to either head; this is not a claim of useful mixed-mosaic training.
 - **Not complete:** no network enum/dispatch, mixed-head build validation, output-axis/decode pin, runtime/backward/loss integration, evaluator, optimizer/checkpoint proof, CLI integration or depth/metric consumption. This suite verifies label/truth math, not end-to-end training or any compiled-C++ comparison. Hand-derived from source, no compiled-C++ golden; GPU status none. DSConv variants, remaining CPU/axis requirements, Stage-2 native GPU/GPU Muon and Stage-3 sparse MoE remain open. No overall parity or green full-host claim.
+
+## 40. YOLO-3D raw CPU runtime and fail-closed consumers
+
+- v0.1.026 (`755e5145`): added `LayerKind::Yolo3d`, alias dispatch, identity-shape re-inference, shared classical-YOLO/cuboid class validation and shared cuboid K validation in `model.rs`. `runtime.rs` captures raw `Yolo3dHeadOutput` separately from 2D heads, passes supplied seeds upstream with the exact identity derivative, and keeps head parameters/train buffers/Adam/Muon state empty. `lib.rs` exports the typed output. CPU compact inference uses the full CPU path; all GPU paths remain rejected by the existing Stage-1 guard.
+- `train.rs`, `detect.rs`, `evaluate.rs` and CLI consumers now reject cuboid networks before legacy loss/decode/evaluation can silently discard their heads, including empty caller-supplied head lists. CLI guards cover `detector train`, `detector map`, `detect-image`, and `detect-server`; `detector test` is still an unknown subcommand globally, not a new supported cuboid command. ONNX still rejects through its existing unsupported arm; no ONNX/CUDA source change.
+- Source read directly at pinned `depth_3d=9c9e0b4b5e0836330a70a0667fd9e161bd1aac1a`: `darknet_cfg.cpp:1603-1687` for shared class/K checks and `yolo_3d.cpp:1501-1542,1667-1672` for activation storage/backward. Rust deliberately keeps raw logits per plan D3, unlike C++ in-place activation; activations must be applied inside future loss/decode math. This is not C++ forward-output parity.
+- Test-first: network dispatch tests failed with missing `LayerKind::Yolo3d` before implementation. The required `MEM=3G ./tools/test_host.sh does_not_exist` compile inventory then passed with zero tests: wildcard arms meant the enum alone did not force further integration. Runtime tests later caught unwanted empty Muon state on the weightless head; CPU Adam/Muon now explicitly skip this kind. Final tests prove both head states remain None after updates and DNOPT round trips.
+
+Scoped prompt-to-artifact audit:
+
+| Contract | Actual evidence |
+|---|---|
+| All four aliases, weightless identity shape | `model/yolo_3d_config.rs::yolo_3d_cfg_network_aliases_build_weightless_identity_heads`; replaces the old preparatory unsupported-network test |
+| Shared classes and K, resize/batch/route geometry, honest open axis decision | `yolo_3d_cfg_mixed_network_requires_shared_classes_and_keypoints`, `yolo_3d_cfg_shape_rebuild_preserves_head_and_route_geometry`; exhaustive axis gate now has 66 rows (65 kinds + Unsupported), with 19 pinned/41 open/6 Rust-only-or-sentinel; `axis-coverage.md` updated |
+| Typed raw forward collection, full/training/compact CPU, no head params | `runtime/tests/yolo_3d_runtime_tests.rs::yolo_3d_forward_is_raw_pass_through_and_records_separate_head` (B=2, 3x5 grid, A=2, C=2, K=8) |
+| Exact raw identity backward and preceding conv derivative | `yolo_3d_backward_is_identity_and_reaches_upstream_convolution`: central FD on three conv weights of a raw-output dot product, not a cuboid loss |
+| Mixed head vectors remain disjoint | `yolo_3d_mixed_forward_keeps_the_two_head_collections_disjoint`; this is not mixed loss routing |
+| No checkpoint block or optimizer tensors in head | `yolo_3d_weights_round_trip_exact_length_with_upstream_conv`: 380 bytes (20 + 4*90), trailing_bytes=0; `yolo_3d_seeded_sgd_adam_and_muon_update_only_upstream_weights`: upstream updates, None head buffers/states and DNOPT round trips, using supplied seeds only |
+| Existing 2D/OBB/modern decoders, losses and validation datasets reject graph | `yolo_3d_existing_2d_and_obb_apis_reject_even_empty_head_lists` covers nine entry points without relying on the passed head list |
+| CPU-only boundary | `yolo_3d_rejects_gpu_execution_backward_and_updates` covers full/compact GPU, immediate/deferred update and backward; f16 is checked via the shared preflight helper, not real device execution. Source inspection confirms the f16 entry calls that helper |
+| Constructor and unsupported export | `yolo_3d_from_heads_constructor_has_no_cuboid_outputs`, `yolo_3d_onnx_export_still_rejects`; all ForwardResult constructors compile with the new field |
+| CLI rejection before asset loading/training | `darknet-cli::tests::yolo_3d_cli_rejects_train_map_and_detect_server_before_loading_assets`; malformed data and missing weights prove those three paths reject before use. The detect-image guard is source-inspected, not exercised through a CLI process |
+
+Verification commands ran serially under `MemoryHigh=3G` systemd scopes (scripts `-j 2`):
+
+| `MEM=3G ./tools/test_host.sh <filter>` | Core passed | CLI passed |
+|---|---|---|
+| `yolo_3d` | 42 | 1 |
+| `model::` | 90 | 0 |
+| `runtime::` | 270 | 0 |
+| `yolo` | 106 | 2 |
+| `map` | 27 | 8 |
+| `weights` | 57 | 2 |
+| `axis_layout` | 21 | 0 |
+| `dpt_head` | 18 | 0 |
+| `onnx` | 12 | 1 |
+
+- `systemd-run --user --scope -p MemoryHigh=3G cargo check -p darknet-cli --features oxide -j 4` passed. Targeted edition-2024 Rustfmt and `git diff --check` passed. No actual training runs, Oxide tests, corpus or unfiltered host suite; existing warnings remain. Temporary weights/sidecars used RAII cleanup; test logs/source snapshots were removed after recording evidence.
+- **Remaining layer DoD:** projected activations/math, assignments, losses and exact loss derivatives/Cpp-mode deltas; standalone and mixed loss APIs consuming the label helpers; decode and its A2 anchor/entry/vertex pin; projected evaluator; depth/metric consumption and references; end-to-end loss-to-conv/optimizer tests. Parsed map/counter metadata still needs consumption by these APIs. Supplied-seed optimizer tests are not a substitute for full training-loss integration. The current axis decision stays Open; `axis_layout` remains 21, not a new cuboid pin. No compiled-C++ golden exists. Hand-derived from source, no compiled-C++ golden; GPU status none. Stage 1, all-native GPU/GPU Muon Stage 2, and sparse MoE Stage 3 remain incomplete; no overall parity or green full-host claim.
 
 ## Not implemented / open (pointer)
 
