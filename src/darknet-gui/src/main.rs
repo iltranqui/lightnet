@@ -59,7 +59,6 @@ impl View {
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Settings {
     recent: Vec<String>,
-    show_labels: bool,
 }
 
 impl Settings {
@@ -177,6 +176,7 @@ struct App {
     cfg_path: String,
     weights_path: String,
     worker: Option<DetectWorker>,
+    clipboard: Option<arboard::Clipboard>,
     /// 0 = off, 1 = on, 2 = auto (`p` cycles in that order, like DarkMark).
     prediction_mode: u8,
     /// 0 = off, 1 = on, 2 = auto (`l`).
@@ -223,6 +223,7 @@ impl App {
             cfg_path: String::new(),
             weights_path: String::new(),
             worker: None,
+            clipboard: arboard::Clipboard::new().ok(),
             prediction_mode: 2,
             label_mode: 1,
             bold: false,
@@ -456,12 +457,29 @@ impl App {
             }
             Action::ClipboardCopy => {
                 let text = actions::clipboard_copy(&editor.to_annotation());
-                self.status = text;
-                self.error = false;
+                match self.clipboard.as_mut() {
+                    Some(clipboard) => match clipboard.set_text(text) {
+                        Ok(()) => self.ok("copied marks to the clipboard"),
+                        Err(error) => self.fail(format!("clipboard: {error}")),
+                    },
+                    None => self.fail("no system clipboard available".to_owned()),
+                }
             }
             Action::ClipboardPaste => {
                 let classes = editor.class_names.clone();
-                let text = self.status.clone();
+                let text = match self.clipboard.as_mut() {
+                    Some(clipboard) => match clipboard.get_text() {
+                        Ok(text) => text,
+                        Err(error) => {
+                            self.fail(format!("clipboard: {error}"));
+                            return;
+                        }
+                    },
+                    None => {
+                        self.fail("no system clipboard available".to_owned());
+                        return;
+                    }
+                };
                 match actions::clipboard_paste(&text, editor.width, editor.height, &classes) {
                     Ok(marks) => {
                         for mark in marks {
@@ -1075,7 +1093,14 @@ impl App {
                             ui.selectable_value(&mut self.view, view, view.label());
                         }
                     });
-                ui.checkbox(&mut self.settings.show_labels, "labels");
+                let labels = match self.label_mode {
+                    1 => "labels: on",
+                    2 => "labels: auto",
+                    _ => "labels: off",
+                };
+                if ui.button(labels).clicked() {
+                    self.run_action(Action::ToggleLabels);
+                }
             });
             let color = if self.error { Color32::LIGHT_RED } else { Color32::GRAY };
             ui.colored_label(color, &self.status);
