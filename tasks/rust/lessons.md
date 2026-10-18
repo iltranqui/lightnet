@@ -12,3 +12,4 @@
 - `f32::NAN` is not equal to itself; NaN-preservation tests should assert `.is_nan()` rather than compare whole values with `PartialEq` (2026-10-16).
 - When splitting one OBB loss across box-channel and front-channel passes, each pass must own only its partial gradient; do not write the same front-anchor center-chain term into both passes (2026-10-16).
 - Test filters must match Rust test-name prefixes: `carpn_map` did not select newly named `obb_map_*` dispatcher tests. Check matched-test counts before treating a focused filter as coverage (2026-10-17).
+- Axis fixtures for batch/sequence stacks must account for every normalization stage; the LAYA encoder test's terminal LayerNorm follows the embedding LayerNorm, so its hand expectation must include both (2026-10-17).

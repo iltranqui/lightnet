@@ -60,6 +60,7 @@ file is named inline.
 - [25. Hyperbolic-foveation Stage-1 CPU reference](#25-hyperbolic-foveation-stage-1-cpu-reference)
 - [26. Foveation FiLM Stage-1 CPU reference](#26-foveation-film-stage-1-cpu-reference)
 - [27. Depth-Anything Stage-1 CPU reference](#27-depth-anything-stage-1-cpu-reference)
+- [28. Stage-1 axis/layout audit (bounded A1 list)](#28-stage-1-axislayout-audit-bounded-a1-list)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -836,6 +837,12 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 - v0.1.010 (`f0a3f2391655d120044bd13f6ded6ca6c655971e`): integrated the frozen `[depth_anything]` / `[depth_anything_v2]` / `[dinov2]` / `[dino]` DINOv2 ViT-S/14 encoder with strict config/shape validation, source-derived type-major weights, cfg-relative layer-only `weights=` loading, and separate sequential checkpoint behavior when no external blob is configured. CPU forward covers channel-major NCHW patchification, bicubic positional interpolation, LayerNorm, exact-erf GELU, full multi-head attention, LayerScale residuals, tap-major NCHW output, final norm, and clamp. Rust-mode backward differentiates the full forward to input; `GradMode::Cpp` preserves the source no-op. Frozen weights are inert under SGD/AdamW/Muon; full/compact/f16 GPU execution, GPU backward, and eager/deferred GPU updates reject explicitly. No GPU fallback, CUDA/Oxide path, or dependency was added.
 - Verification: `MEM=3G ./tools/test_host.sh depth_anything` passed 16 tests; `runtime` passed 244; `weights` passed 52. Coverage includes source-order array lengths, a hand-computed tiny transformer, bicubic reference, asymmetric patch and B>1 non-square/tap-major axes, input finite differences and clamp derivatives, alias/default/invalid-config tests, external and sequential weight round trips, frozen optimizer behavior, upstream convolution fan-in, Cpp-vs-analytical backward, and GPU rejection. Targeted edition-2024 Rustfmt and `git diff --check` passed. No training, Oxide, full `cfg_corpus`, or local HuggingFace dump comparison was run.
 - Evidence boundary: hand-derived from `Jev_laya`; no compiled-C++ golden/parity is claimed. Depth-Anything is Stage-1 CPU only; `[dpt_head]`, `[yolo_3d]`, native GPU support, GPU Muon, and the broader v0.1–v0.3 roadmap remain open. The known full host/cfg-corpus baseline remains non-green/unverified under the memory cap.
+
+## 28. Stage-1 axis/layout audit (bounded A1 list)
+
+- v0.1.011 (`a34aef8f`): added hand-computed, named tests for NCHW batch/channel/spatial ordering in ViT patchification, per-image MoE routing/blending, EML branches, DCNv4 offset/group axes, every `laya_*` tensor family, channel slicing, deconvolution, and weighted shortcut. The source-level contracts and test names are tabulated in `STATUS.md`'s Axis audit section. No forward behavior changed.
+- Verification: `MEM=3G ./tools/test_host.sh axis_layout` passed 13 core tests; `MEM=3G ./tools/test_host.sh laya_` passed 66. Targeted edition-2024 Rustfmt checks and `git diff --check` passed.
+- Evidence boundary: hand-derived from `Jev_laya` after `git grep`/`git show`; no compiled-C++ golden/parity is claimed. This closes only the bounded A1 list in the local `plan-open-items.md`; the broader Stage-1 axis audit, per-backlog axis requirements, `[dpt_head]`, native GPU work, GPU Muon, and v0.1–v0.3 remain open.
 
 ## Not implemented / open (pointer)
 
