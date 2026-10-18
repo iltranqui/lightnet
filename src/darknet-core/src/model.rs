@@ -12,6 +12,9 @@ use crate::cfg::{ConfigFile, RawSection};
 use crate::error::{Error, Result};
 use darknet_cuda::{F32ActivationKind, F32ChannelNormalization};
 
+mod yolo_3d_config;
+pub use yolo_3d_config::{Yolo3dGeometrySpec, Yolo3dSpec, Yolo3dVertexLoss};
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TensorShape {
     pub width: usize,
