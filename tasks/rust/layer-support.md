@@ -182,7 +182,12 @@ an `UnsupportedLayer`.
 > parameter block, masked) plus the retained host-fallback test for the BN case.
 > The only host-resident step in the device path is the batch-serial
 > normalization Jacobian. `[dcnv4]`, `[dsconv]` and `[graph_conv]` remain
-> unwired; `dcnv4` has the same cache structure and can follow this template.
+> unwired. DCNv4's smaller cache is `{ offsets, raw_output }`; v0.2.009–011
+> provide host and native aggregation forward/adjoint primitives (offsets given,
+> at most 25 points on device), verified by 6 device tests. Full coarse-predictor/
+> upsample composition, parameter-gradient parity and runtime/update wiring are
+> still missing; its matrix status remains host fallback. See `implemented.md`
+> §48 and `gpu_layers_plan.md`.
 
 ## GPU forward but CPU backward
 
@@ -194,7 +199,7 @@ layer count.
 | Variant | GPU forward | Missing backward piece |
 |---|---|---|
 | `Deconvolutional` | host round trip (`deconv_forward` on host) | device deconv dgrad/wgrad |
-| `Dcnv4` | host round trip | device deformable backward |
+| `Dcnv4` | host round trip | full predictor/upsample + aggregation backward composition and runtime wiring (aggregation adjoint exists) |
 | `Vit` | host round trip | device attention/MLP backward (flash dQ/dK/dV primitives exist) |
 | `Swin` | host round trip | device windowed-attention backward |
 | `TuckerAttention` | host round trip | device low-rank factor backward |

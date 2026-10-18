@@ -31,10 +31,16 @@ inference (v0.2.001–002). Act-head features/exact-erf primitives are native f3
 Evidence/limits are in `implemented.md` §§41–45. Do not repeat these ports.
 Act-head uses four uncached weight uploads per forward; no residency/speedup
 claim. Runtime backward still uses CPU, act params remain frozen, f16 rejected.
-Next GPU version is unallocated (the act-head slice reached v0.2.006; the
-deformable wave has landed code but no version or commit yet). Recheck
-`implemented.md` and `version-map.tsv` before allocating a number. The current
-open slice is the deformable conv forward contract below.
+Latest GPU slice is v0.2.011: DCNv4 native aggregation adjoint (offsets given),
+following host reference v0.2.009 and native forward v0.2.010. Device tests 6,
+host-cuda 35, host `dcnv4` 17 and Oxide runtime fallback regression 1 passed.
+See `implemented.md` §48 for the coverage audit. Native deform_conv was already
+wired in v0.2.007 within its documented bounds; do not repeat that work.
+**Next:** compose the DCNv4 coarse predictor/upsample + aggregation forward and
+backward, compare all gradients against the real CPU `dcnv4_backward`, then
+consider trait/runtime wiring. The aggregation API alone is not a native layer.
+Recheck `version-map.tsv` before allocating another version. Earlier wave
+sections below retain historical findings; this resume point takes precedence.
 
 ## Act-head contract finding
 
@@ -379,10 +385,15 @@ instead of by rewriting.
 **Landed:** `host_ops::dcnv4` (`aggregate` / `aggregate_backward`, plus
 `Dcnv4Geometry` and `group_masks`) is in the tree as v0.2.009 (`e3cfb27d`) and
 FD-green across all four `softmax`/`remove_center` combinations (`cargo test -p
-darknet-cuda --lib` 35 passed) using the cell-centre fixture. Not wired and no
-device kernel yet. Next: device kernel for the aggregation + adjoint, parity
-against this reference, then compose and compare with `dcnv4_backward` gradients
-on a real cfg, then the runtime gate — the same four steps as `[deform_conv]`.
+darknet-cuda --lib` 35 passed) using the cell-centre fixture. Native aggregation
+forward (v0.2.010) and adjoint (v0.2.011) now pass host parity and actual-device
+finite differences; 6 device tests cover batches/groups, masks/center removal,
+strided/dilated/edge geometry and malformed operands. Still not wired.
+Next: compose the full coarse predictor + upsample + aggregation forward and
+backward, compare with real `dcnv4_backward` gradients on a cfg, then the runtime
+gate. Preserve `Dcnv4` in `requires_cpu_backward_fallback` until composition and
+optimizer parity pass; parameter gradients cannot be inferred from aggregation
+adjoints alone.
 
 **Concrete fixture numbers for that attempt** (recomputed from the failing case,
 `softmax=false, remove_center=false`, `size=3, pad=1, scale=0.75`, output cell

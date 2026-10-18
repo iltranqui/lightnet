@@ -73,6 +73,7 @@ file is named inline.
 - [45. Native act-head f32 forward composition](#45-native-act-head-f32-forward-composition)
 - [46. Standalone native act-head gradient math](#46-standalone-native-act-head-gradient-math)
 - [47. Native `[deform_conv]` forward and backward](#47-native-deform_conv-forward-and-backward)
+- [48. DCNv4 native aggregation primitives (offsets given)](#48-dcnv4-native-aggregation-primitives-offsets-given)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1210,6 +1211,43 @@ Deliberately not done: `dilation > 1` and batch-norm variants stay on the host
 path (tested); `f16` is not supported for the layer; no benchmark or speedup
 claim; `[dcnv4]`, `[dsconv]`, `[graph_conv]` and the remaining hard-reject layers
 are untouched.
+
+## 48. DCNv4 native aggregation primitives (offsets given)
+
+- v0.2.011 (`8fe32a09`): native f32 `OxideBackend::dcnv4_aggregate_backward_native`
+  returns NCHW input adjoints and packed `[B, OH*OW, groups*3*K]` offset/mask
+  adjoints; device kernel `kernels/dcnv4.rs::backward` owns each row and uses
+  atomics only for input scatter. Fixed the pending kernel's batch-zero-only
+  thread bound (red test: batch 1 input gradient was 0 instead of 0.67130804).
+  Shared `Dcnv4Geometry::checked` now rejects dimension-product overflow before
+  unsafe launch/allocation arithmetic. No runtime/optimizer behavior changed.
+- v0.2.010 (`7874c225`): added native aggregation forward and its checked
+  launcher, originally verified by 2 device tests. The fixed mask array permits
+  at most 25 kernel points; larger kernels error. This release's 6-test run
+  rechecks that forward, including the strided/dilated/edge fixtures below.
+- v0.2.009 (`e3cfb27d`): added `host_ops::dcnv4::{aggregate,
+  aggregate_backward, Dcnv4Geometry, group_masks}` with host finite differences.
+  The host suite was rerun in this increment (35 passed).
+
+Scoped requirement-to-artifact audit (all commands serial, `-j 2`, 3G user
+systemd scopes; no training runs):
+
+| Requirement | Actual evidence |
+|---|---|
+| Native adjoint, all batches/groups and four mask/center modes | `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_aggregate`: **6 passed**; `device_aggregation_backward_matches_the_host_reference` covers B=2, C/G=2/1 and 4/2, signed/nonunit seeds; compares every input and offset element at 2e-5 absolute + relative tolerance |
+| Different geometry and edge sampling | `device_adjoint_covers_strided_dilated_and_far_outside_samples`: sizes 1/3/5, groups=2, stride x/y=2/3, dilation=2, non-square input, padding=2, signed masks and large displacements outside all edges, all four modes; forward and both adjoints compared |
+| Independent actual-device derivative check | `device_adjoint_matches_device_forward_finite_differences`: every input and packed offset/mask value, B=2/groups=2, all four modes; actual native forward objective with signed seeds; scale=1, coordinate fraction=0.5, epsilon=0.01 (cannot cross floor seams), absolute tolerance 2e-3 |
+| Fail closed before unsafe launch | `device_adjoint_rejects_bad_geometry_and_each_short_operand`: each short operand; zero/nondividing groups, zero batch/dilation, >25 points and overflowing dimensions |
+| Host oracle regression | `systemd-run --user --scope -p MemoryHigh=3G cargo test -p darknet-cuda --lib -j 2 -- --test-threads=1`: **35 passed**, including host DCNv4 finite differences |
+| CPU/runtime behavior preserved | `MEM=3G ./tools/test_host.sh dcnv4`: **17 core passed**, 0 CLI; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4`: **1 passed** (`dcnv4_f32_host_fallback_matches_cpu_chain_and_updates`) |
+| Storage ownership | Launcher validates full lengths and allocates distinct zeroed `d_input`/`d_offsets`; `OxideBackend::alloc` zeros recycled buffers; thread bound derives from full seed length; `d_offsets` has a unique writer per row, input scatter is atomic |
+| Scope and evidence honesty | Runtime still lists `Dcnv4` in `requires_cpu_backward_fallback`; no trait/runtime wiring, predictor/backward composition, native updates, f16, benchmark or speedup claim. Device vs Rust CPU reference; hand-derived from source, no compiled-C++ golden |
+
+Targeted Rustfmt and `git diff --check` passed. Full host/corpus/Oxide suites
+were not run; existing corpus residuals remain open. No temporary weights,
+optimizer sidecars, models or test logs were created by this slice. Existing
+compiler IR/PTX and older build trees are retained because the backend workflow
+and prior evidence refer to them; no unrelated cleanup was attempted.
 
 ## Not implemented / open (pointer)
 
