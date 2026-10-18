@@ -359,10 +359,26 @@ difference of the same expression: `analytic 0.093750 vs fd 0.093751`,
 the aggregate implementation is therefore an **indexing/bookkeeping** error —
 which row/point/channel a contribution is written to — not arithmetic.
 
-**Next attempt must instrument indices, not arithmetic:** dump `(q, group,
-point, row slot)` for every write and compare against the forward's read of the
-same slot. Two blind rewrites plus one term-level check have narrowed this to
-the write mapping; that is where the third attempt should start.
+**Resolved by isolated replication (not an index bug).** A standalone program
+containing the same forward and backward logic (all positions, all points, both
+channels, mask and input scatter included) was run with a **cell-centre fixture**
+(offsets ≈ 0.5…0.58, target offset chosen so `sx = 1.5`, fractional part 0.5):
+
+```text
+sx=1.5 frac=0.5
+analytic=0.093750 fd=0.093758 ratio=0.9999
+```
+
+So the arithmetic **and** the write mapping are correct; the earlier ~1.28× came
+from the fixture, whose target sample sat at `sx = 1.005` and was pushed across
+the integer cell boundary at `1.0` by the ±0.0075 FD perturbation — a
+discontinuity of the *comparison*, not of the code. This is the sixth instance of
+the fixture-seam class in `lessons.md`, and the first one resolved by isolation
+instead of by rewriting.
+
+**Next attempt:** re-add `host_ops::dcnv4` unchanged, with the cell-centre
+fixture (offsets ≈ 0.5…0.58 as above) covering the four `softmax`/`remove_center`
+combinations, and expect FD-green. No index instrumentation is needed.
 
 **Concrete fixture numbers for that attempt** (recomputed from the failing case,
 `softmax=false, remove_center=false`, `size=3, pad=1, scale=0.75`, output cell
