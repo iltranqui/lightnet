@@ -326,15 +326,25 @@ Do not assume deform_conv's accumulated evidence transfers: the sampling
 geometry, mask semantics and offset layout are different code paths in the
 source.
 
-**First host-reference attempt failed its own FD check (negative result).** A
-re-derivation of the aggregation from `dcnv4_forward` produced analytics that
-disagreed with finite differences on `d_offsets` (analytic `0` where the FD said
-`-0.0080`, at a mid-kernel point with both `softmax` and `remove_center` off).
-The module was removed rather than left in the tree with a failing or ignored
-test, and the green baseline re-verified (`cargo test -p darknet-cuda --lib` 33
-passed). Next attempt must transcribe `dcnv4_backward` itself — the `point`
-counter under `remove_center`, the packed offset layout and the coordinate-slope
-scaling are exactly where a forward-only derivation goes wrong.
+**First host-reference attempt failed its own FD check (negative result), and
+the cause is now identified as a fixture defect, not a math error.** The
+aggregation was re-derived from `dcnv4_forward`; the analytics disagreed with
+finite differences on `d_offsets` (analytic `0` where the FD said `-0.0080`, at
+a mid-kernel point with `softmax` and `remove_center` both off). After re-reading
+`dcnv4_backward` and comparing term by term, the adjoint matched the source —
+`dx = hy*(v01-v00) + ly*(v11-v10)`, `dy = hx*(v10-v00) + lx*(v11-v01)`, the packed
+`[2K offsets, K mask logits]` layout, the all-`K` mask write and the softmax
+`p*(d - dot)` transform all agree. What differed was the **fixture**: offsets
+built as `((i*5) % 11) * 0.03 - 0.15` include **exactly zero** values, and the
+base position is integral, so those samples land precisely on the floor-cell
+seam where the analytic slope is one-sided. Same defect class as the four earlier
+fixture failures (`lessons.md`).
+
+So the module was removed for the right reason (no failing test in the tree) but
+the diagnosis was wrong: this is not evidence that a forward-only derivation
+fails. Next attempt should transcribe `dcnv4_backward` anyway (cheapest correct
+route) **and** keep every sample off integer coordinates — e.g. add a constant
++0.37 to the offset bias. The module is otherwise believed correct.
 
 ## Verification gates
 
