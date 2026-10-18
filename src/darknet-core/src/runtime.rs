@@ -29994,6 +29994,86 @@ mod tests {
     }
 
     #[test]
+    fn convolutional_axis_layout_keeps_nchw_and_group_partitions() {
+        use crate::axis_fixture::{axis_tensor, axis_value, nchw_index};
+
+        // Two-channel 1x1 convolution whose weight matrix swaps the channels:
+        // `[out][in][kh][kw]` = [[0,1],[1,0]]. Output channel 0 must then carry
+        // input channel 1 at the same `(n,h,w)`, which pins both the NCHW order
+        // and the weight axis.
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "conv-axis.cfg",
+                "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\n\
+                 [convolutional]\nfilters=2\nsize=1\nstride=1\nbatch_normalize=0\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cpu = ExecutableNetwork::new(network);
+        let LayerParams::Convolutional(params) = &mut cpu.params[0] else {
+            panic!("convolutional params")
+        };
+        params.weights = vec![0.0, 1.0, 1.0, 0.0];
+        params.biases = vec![0.0, 0.0];
+
+        let shape = TensorShape::new(3, 2, 2, 2);
+        let input = Tensor::from_data(shape, axis_tensor(shape)).unwrap();
+        let output = cpu.forward(&input).unwrap().layer_outputs[0].clone();
+        for n in 0..shape.batch {
+            for h in 0..shape.height {
+                for w in 0..shape.width {
+                    assert_eq!(
+                        output.data[nchw_index(shape, n, 0, h, w)],
+                        axis_value(n, 1, h, w),
+                        "output channel 0 at ({n},{h},{w}) must read input channel 1"
+                    );
+                    assert_eq!(
+                        output.data[nchw_index(shape, n, 1, h, w)],
+                        axis_value(n, 0, h, w),
+                        "output channel 1 at ({n},{h},{w}) must read input channel 0"
+                    );
+                }
+            }
+        }
+
+        // `groups=2` partitions channels instead of mixing them: output 0 sees
+        // only input 0 and output 1 only input 1, per sample.
+        let grouped = Network::from_config(
+            ConfigFile::parse_str(
+                "conv-groups-axis.cfg",
+                "[net]\nwidth=2\nheight=1\nchannels=2\nbatch=2\n\
+                 [convolutional]\nfilters=2\nsize=1\ngroups=2\nbatch_normalize=0\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut grouped_cpu = ExecutableNetwork::new(grouped);
+        let LayerParams::Convolutional(params) = &mut grouped_cpu.params[0] else {
+            panic!("grouped convolutional params")
+        };
+        params.weights = vec![2.0, 3.0];
+        params.biases = vec![0.0, 0.0];
+        let shape = TensorShape::new(2, 1, 2, 2);
+        let input = Tensor::from_data(shape, axis_tensor(shape)).unwrap();
+        let output = grouped_cpu.forward(&input).unwrap().layer_outputs[0].clone();
+        for n in 0..shape.batch {
+            for w in 0..shape.width {
+                assert_eq!(
+                    output.data[nchw_index(shape, n, 0, 0, w)],
+                    2.0 * axis_value(n, 0, 0, w),
+                    "group 0 must only see input channel 0 at ({n},{w})"
+                );
+                assert_eq!(
+                    output.data[nchw_index(shape, n, 1, 0, w)],
+                    3.0 * axis_value(n, 1, 0, w),
+                    "group 1 must only see input channel 1 at ({n},{w})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn deform_conv_backward_rejects_epilogue_clamp_boundary() {
         let network = Network::from_config(
             ConfigFile::parse_str(

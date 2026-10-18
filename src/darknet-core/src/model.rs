@@ -1823,7 +1823,7 @@ pub const AXIS_PINS: &[AxisPin] = &[
     AxisPin::Open("Tier 1: nested-body geometry and per-pass lattice"),
     AxisPin::Open("Tier 4: FiLM parameter block to channel mapping"),
     AxisPin::Open("Tier 4: warp samples (x,y) from (w,h)"),
-    AxisPin::Open("Tier 1: dilated output extent (finding F1)"),
+    AxisPin::Pinned("convolutional_axis_layout_pins_dilated_extent_and_groups"),
     AxisPin::Pinned("deconvolutional_axis_layout_maps_input_channels_to_filters_and_batch"),
     AxisPin::Open("Tier 1: [out][in] weight rows per batch sample"),
     AxisPin::Open("Tier 1: maxpool_depth and maxpool_zero_nonmax layouts"),
@@ -6322,6 +6322,12 @@ fn resolve_cfg_path(parent: &Path, raw: &str) -> PathBuf {
 }
 
 fn conv_dim(input: usize, padding: usize, size: usize, stride: usize) -> usize {
+    // C++ `convolutional_out_width`: `(w + 2*pad - size) / stride + 1`.
+    //
+    // Dilation is deliberately absent: the C++ CPU shape function ignores it
+    // even though im2col samples with `dilation` offsets. Only the cuDNN path
+    // changes the extent, by padding with `pad * dilation`. Rust follows the
+    // CPU contract; see `convolutional_axis_layout_pins_dilated_extent_and_groups`.
     ((input + 2 * padding).saturating_sub(size) / stride.max(1)) + 1
 }
 
@@ -11548,13 +11554,14 @@ output=2
             }
         }
 
-        assert_eq!(pinned.len(), 18, "pinned variants");
-        assert_eq!(open, 41, "C++-backed variants without an axis pin");
+        assert_eq!(pinned.len(), 19, "pinned variants");
+        assert_eq!(open, 40, "C++-backed variants without an axis pin");
         assert_eq!(rust_only, 6, "Rust-only variants plus Unsupported");
 
         // The pinned set is the contract: renaming one of these tests must be a
         // deliberate edit here, not an accident.
         let expected: std::collections::BTreeSet<&'static str> = [
+            "convolutional_axis_layout_pins_dilated_extent_and_groups",
             "deconvolutional_axis_layout_maps_input_channels_to_filters_and_batch",
             "shortcut_axis_layout_uses_nchw_channel_slots_per_batch",
             "slice_axis_layout_preserves_batch_channel_and_spatial_order",
@@ -11586,7 +11593,7 @@ output=2
         .expect("convolutional builds");
         assert_eq!(
             conv.layers[0].kind.axis_pin(),
-            AxisPin::Open("Tier 1: dilated output extent (finding F1)"),
+            AxisPin::Pinned("convolutional_axis_layout_pins_dilated_extent_and_groups"),
             "convolutional must map to its own AXIS_PINS entry"
         );
         let route = build(
@@ -11597,6 +11604,48 @@ output=2
             route.layers[1].kind.axis_pin(),
             AxisPin::Open("Tier 1: groups split, relative index, concat order"),
             "route must map to its own AXIS_PINS entry"
+        );
+    }
+
+    #[test]
+    fn convolutional_axis_layout_pins_dilated_extent_and_groups() {
+        // C++ `convolutional_out_width` is `(w + 2*pad - size)/stride + 1` and
+        // deliberately ignores `dilation`, even though im2col samples with
+        // dilation offsets. A 7x5 input with size=3, pad=1, stride=1 therefore
+        // keeps its extent at 7x5 for any dilation. Applying the textbook
+        // `dilation*(size-1)` term here (as the cuDNN path effectively does by
+        // padding with `pad*dilation`) would shrink it to 5x3 and break
+        // `cfg/resnet152_trident.cfg`'s route. This pin exists to keep the CPU
+        // contract.
+        let dilated = build(
+            "[net]\nwidth=7\nheight=5\nchannels=3\n[convolutional]\nfilters=4\nsize=3\nstride=1\npadding=1\ndilation=2\n",
+        )
+        .expect("dilated convolution builds");
+        assert_eq!(
+            dilated.layers[0].output_shape,
+            TensorShape::new(7, 5, 4, 1),
+            "C++ CPU geometry ignores dilation; 5x3 would mean the cuDNN extent leaked in"
+        );
+
+        // Non-square and strided with dilation: width (9-3)/2+1 = 4, height
+        // (8-3)/2+1 = 3.
+        let strided = build(
+            "[net]\nwidth=9\nheight=8\nchannels=2\nbatch=2\n[convolutional]\nfilters=1\nsize=3\nstride=2\ndilation=2\n",
+        )
+        .expect("strided dilated convolution builds");
+        assert_eq!(strided.layers[0].output_shape, TensorShape::new(4, 3, 1, 2));
+
+        // Grouped 1x1 convolution: `filters` is the output channel count and
+        // `groups` splits input channels; a swapped split is rejected here.
+        let grouped = build(
+            "[net]\nwidth=3\nheight=2\nchannels=4\nbatch=2\n[convolutional]\nfilters=6\nsize=1\ngroups=2\n",
+        )
+        .expect("grouped convolution builds");
+        assert_eq!(grouped.layers[0].output_shape, TensorShape::new(3, 2, 6, 2));
+        assert_eq!(
+            grouped.layers[0].weights().unwrap().parameter_count(),
+            18,
+            "grouped 1x1 weights are [out][in/groups][kh][kw] plus biases: 6*2 + 6"
         );
     }
 
