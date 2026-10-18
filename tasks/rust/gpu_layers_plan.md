@@ -376,9 +376,13 @@ discontinuity of the *comparison*, not of the code. This is the sixth instance o
 the fixture-seam class in `lessons.md`, and the first one resolved by isolation
 instead of by rewriting.
 
-**Next attempt:** re-add `host_ops::dcnv4` unchanged, with the cell-centre
-fixture (offsets ≈ 0.5…0.58 as above) covering the four `softmax`/`remove_center`
-combinations, and expect FD-green. No index instrumentation is needed.
+**Landed:** `host_ops::dcnv4` (`aggregate` / `aggregate_backward`, plus
+`Dcnv4Geometry` and `group_masks`) is in the tree as v0.2.009 (`e3cfb27d`) and
+FD-green across all four `softmax`/`remove_center` combinations (`cargo test -p
+darknet-cuda --lib` 35 passed) using the cell-centre fixture. Not wired and no
+device kernel yet. Next: device kernel for the aggregation + adjoint, parity
+against this reference, then compose and compare with `dcnv4_backward` gradients
+on a real cfg, then the runtime gate — the same four steps as `[deform_conv]`.
 
 **Concrete fixture numbers for that attempt** (recomputed from the failing case,
 `softmax=false, remove_center=false`, `size=3, pad=1, scale=0.75`, output cell
