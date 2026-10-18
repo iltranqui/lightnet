@@ -68,6 +68,7 @@ file is named inline.
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
 - [34. GPU convolution extent parity](#34-gpu-convolution-extent-parity)
 - [35. Annotation GUI (`darknet-gui`)](#35-annotation-gui-darknet-gui)
+- [36. Annotation GUI plan implementation](#36-annotation-gui-plan-implementation)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -895,6 +896,20 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 - Semantics: malformed label lines are errors, so a partial read cannot overwrite a file; a degenerate drag creates nothing; an empty annotation deletes the sidecar instead of writing a blank one.
 - Verification: `cargo build -p darknet-gui --offline` and `cargo test -p darknet-gui --offline` pass with 7 tests.
 - Evidence boundary: builds offline against the locally cached eframe. Not implemented: DarkMark `.json` sidecars, class remap, filters/sort, neighbour copy/interpolation/homography, alternate views, launcher, and the `detect-server` prediction overlay.
+
+## 36. Annotation GUI plan implementation
+
+- v0.1.019 (`fcd23bbd`): split the annotator into `darknet-gui-project` (pure logic), `darknet-gui-engine` (child-process inference) and `darknet-gui` (eframe shell), and implemented the plan's milestones:
+  - `annotation.rs`: DarkMark detector JSON (`G3`-`G7`) parsed through `serde_json::Value` so unknown sidecar and mark fields survive; string and integer `annotation_mode`; exactly four points (`D4`); `G4`/`G5` save rules; `.txt` with ten decimals.
+  - `project.rs`: recursive `G2` scan with chart/mask/cache exclusions, `<name>.names`/`.data` preference (`D5`), detector-mode validation, mark index counting `completely_empty` as one.
+  - `filter.rs`, `nav.rs`: tri-state/regex/class/age filters, stable sort, clamped navigation, unmarked walking that stops on the boundary image.
+  - `undo.rs`, `edit.rs`: capped undo/redo and the `G9`-`G16` edit model (smallest-area hit test, corner re-drag with `D8` restore, clamped creation, additive digit classes with refusal, Tab cycling including predictions, accept rules, threshold clamp, nudge/scale/clear/empty/copy).
+  - `actions.rs`, `create.rs`, `classes.rs`: interpolation, clipboard JSON, edge snapping, homography; `G1` project creation; dry-run class remap with backup and atomic rename.
+  - `darknet-gui-engine`: `DetectWorker` JSON-lines protocol with a 30 s timeout, child-exit and malformed-reply errors.
+  - `darknet-cli detect-server`: one request per stdin line, normalized boxes, error objects that keep the server alive, CPU and feature-gated oxide backends.
+  - `darknet-gui`: launcher with persisted recents, new-project dialog, image cache, zoom/pan canvas, six view modes, filters, class editor with dry run, prediction overlay.
+- Verification: `cargo test -p darknet-gui-project` 36, `-p darknet-gui-engine` 4, `-p darknet-cli` 28; offline build of the three GUI crates is warning-free; `cargo metadata --locked` reports 33 members.
+- Evidence boundary: DarkMark compatibility is derived from the `G`/`D` tables, not verified against a running DarkMark (`T1.5` still open). Not wired: add/delete classes from the dialog, delete-image/undo-delete, heatmaps, jump, screenshots, train runner.
 
 ## Not implemented / open (pointer)
 
