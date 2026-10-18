@@ -415,7 +415,7 @@ Immediately next, in dependency order:
   momentum while DNOPT1–5 remain readable. `muon_` (13), `weights` (43), and
   `runtime` (204) host tests passed. No training, Oxide tests, or compiled-C++
   golden/parity. GPU Muon is deferred to Stage 2.
-- [~] Phase 4 foveation / depth / DETR: Stage-1 CPU `[hyperbolic_foveation]` is complete in v0.1.008 (`implemented.md` §25), and `[foveation_film]` in v0.1.009 (`implemented.md` §26); LAYA encoder/head are already implemented. Depth-Anything/DPT, YOLO-3D and DETR remain open. DETR is still broken in C++ (paper only).
+- [~] Phase 4 foveation / depth / DETR: Stage-1 CPU `[hyperbolic_foveation]` is complete in v0.1.008 (`implemented.md` §25), `[foveation_film]` in v0.1.009 (§26), and `[depth_anything]` in v0.1.010 (§27); LAYA encoder/head are already implemented. `[dpt_head]`, YOLO-3D and DETR remain open. DETR is still broken in C++ (paper only).
 
 ## Active and unstarted plans
 
@@ -431,6 +431,7 @@ Immediately next, in dependency order:
 - [x] `recursive_block_plan.md` — source-derived Stage-1 CPU implementation and focused verification completed in v0.1.007; no compiled-C++ golden/parity. Native GPU is Stage 2.
 - [x] `hyperbolic_foveation_plan.md` — source-derived Stage-1 CPU support and verification completed in v0.1.008; no compiled-C++ golden/parity. Native GPU is Stage 2.
 - [x] `foveation_film_plan.md` — source-derived Stage-1 CPU support and focused verification completed in v0.1.009; no compiled-C++ golden/parity. Native GPU is Stage 2.
+- [x] `depth_anything_plan.md` — source-derived Stage-1 CPU support and focused verification completed in v0.1.010; no compiled-C++ golden/parity. Native GPU is Stage 2; `[dpt_head]` remains separate.
 - [x] `muon_plan.md` — Stage-1 CPU hybrid Muon implementation and focused verification completed in v0.1.005. GPU Muon remains Stage 2; no compiled-C++ golden/parity.
 - [ ] `gui_plan.md` — egui DarkMark replacement (M0–M6, not started).
 

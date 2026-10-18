@@ -59,6 +59,7 @@ file is named inline.
 - [24. Recursive-block Stage-1 CPU reference](#24-recursive-block-stage-1-cpu-reference)
 - [25. Hyperbolic-foveation Stage-1 CPU reference](#25-hyperbolic-foveation-stage-1-cpu-reference)
 - [26. Foveation FiLM Stage-1 CPU reference](#26-foveation-film-stage-1-cpu-reference)
+- [27. Depth-Anything Stage-1 CPU reference](#27-depth-anything-stage-1-cpu-reference)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -829,6 +830,12 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 - v0.1.009 (`51e381b8a94ae4e23ecc8054f6045a128f87fc8f`): integrated `[foveation_film]` / `[hf_film]` with strict HF-source resolution, source-order six-block parameters, deterministic initialization, NCHW CPU forward, exact backward, additive HF parameter gradients, learned-predictor/source-feature fan-in, SGD/AdamW/Muon updates, and optimizer state validation/persistence. Full/compact/f16 GPU inference, backward, and optimizer updates reject explicitly; no CUDA/Oxide or host fallback was added.
 - Verification: `MEM=3G ./tools/test_host.sh foveation_film` passed 12 core tests; `runtime` passed 237; `weights` passed 49 core + 2 CLI. Coverage includes NCHW hand math and finite differences, predictor/source finite differences, detached and additive HF gradients, multiple FiLM sources, train-buffer accumulation, initialization identity/seed reproducibility, exact source-order bytes/file size, optimizer state persistence/gating, and GPU rejection. Rustfmt check passed for new math/runtime-test files; `git diff --check` passed. No training, Oxide tests, or feature-specific `cfg_corpus` run.
 - Evidence boundary: hand-derived from `Jev_laya`; `LAYER_FOVEATION_FILM` is disabled, so no compiled-C++ golden/parity is available. C++ SGD has a different sign convention; Rust uses the established downhill-update convention and makes no update-parity claim. Stage-1 CPU only; native GPU support and GPU Muon remain Stage 2. Depth-Anything/DPT, YOLO-3D, and DETR remain open, so the overall roadmap is not complete.
+
+## 27. Depth-Anything Stage-1 CPU reference
+
+- v0.1.010 (`f0a3f2391655d120044bd13f6ded6ca6c655971e`): integrated the frozen `[depth_anything]` / `[depth_anything_v2]` / `[dinov2]` / `[dino]` DINOv2 ViT-S/14 encoder with strict config/shape validation, source-derived type-major weights, cfg-relative layer-only `weights=` loading, and separate sequential checkpoint behavior when no external blob is configured. CPU forward covers channel-major NCHW patchification, bicubic positional interpolation, LayerNorm, exact-erf GELU, full multi-head attention, LayerScale residuals, tap-major NCHW output, final norm, and clamp. Rust-mode backward differentiates the full forward to input; `GradMode::Cpp` preserves the source no-op. Frozen weights are inert under SGD/AdamW/Muon; full/compact/f16 GPU execution, GPU backward, and eager/deferred GPU updates reject explicitly. No GPU fallback, CUDA/Oxide path, or dependency was added.
+- Verification: `MEM=3G ./tools/test_host.sh depth_anything` passed 16 tests; `runtime` passed 244; `weights` passed 52. Coverage includes source-order array lengths, a hand-computed tiny transformer, bicubic reference, asymmetric patch and B>1 non-square/tap-major axes, input finite differences and clamp derivatives, alias/default/invalid-config tests, external and sequential weight round trips, frozen optimizer behavior, upstream convolution fan-in, Cpp-vs-analytical backward, and GPU rejection. Targeted edition-2024 Rustfmt and `git diff --check` passed. No training, Oxide, full `cfg_corpus`, or local HuggingFace dump comparison was run.
+- Evidence boundary: hand-derived from `Jev_laya`; no compiled-C++ golden/parity is claimed. Depth-Anything is Stage-1 CPU only; `[dpt_head]`, `[yolo_3d]`, native GPU support, GPU Muon, and the broader v0.1–v0.3 roadmap remain open. The known full host/cfg-corpus baseline remains non-green/unverified under the memory cap.
 
 ## Not implemented / open (pointer)
 
