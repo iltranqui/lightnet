@@ -30,6 +30,12 @@ pub(crate) mod channel_slice;
 pub mod chart;
 pub mod clifford;
 pub(crate) mod contrastive;
+pub mod cuboid_labels;
+pub use cuboid_labels::{
+    CuboidLabel, MixedLabel, Yolo3dCrop, Yolo3dImageMeta, Yolo3dTruthBatch,
+    encode_mixed_yolo_3d_truths, encode_yolo_3d_truths, load_cuboid_labels,
+    load_pure_cuboid_labels, parse_cuboid_labels, parse_mixed_cuboid_labels,
+};
 pub(crate) mod dcnv4;
 pub(crate) mod deform_conv;
 pub(crate) mod dsconv;
