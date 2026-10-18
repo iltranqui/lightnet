@@ -748,6 +748,51 @@ pub struct LayaHeadSpec {
     pub qtype: i32,
 }
 
+/// Frozen DINOv2 ViT-S/14 feature encoder used by `[depth_anything]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DepthAnythingSpec {
+    pub patch_size: usize,
+    pub dim: usize,
+    pub depth: usize,
+    pub heads: usize,
+    pub mlp_dim: usize,
+    pub pos_grid_h: usize,
+    pub pos_grid_w: usize,
+    pub ln_eps: f32,
+    pub apply_imagenet_norm: bool,
+    pub imagenet_mean: [f32; 3],
+    pub imagenet_std: [f32; 3],
+    pub taps: Vec<usize>,
+    pub output_clamp: f32,
+    /// Resolved path and layer-only tensors from cfg `weights=`. Such weights
+    /// are excluded from the network's sequential checkpoint stream.
+    pub weights_path: Option<PathBuf>,
+    pub external_weights: Option<crate::depth_anything::DepthAnythingWeights>,
+}
+
+impl DepthAnythingSpec {
+    pub fn geometry(&self, input: TensorShape) -> crate::depth_anything::DepthAnythingGeometry {
+        crate::depth_anything::DepthAnythingGeometry {
+            batch: input.batch,
+            height: input.height,
+            width: input.width,
+            patch_size: self.patch_size,
+            dim: self.dim,
+            depth: self.depth,
+            heads: self.heads,
+            mlp_dim: self.mlp_dim,
+            pos_grid_h: self.pos_grid_h,
+            pos_grid_w: self.pos_grid_w,
+            ln_eps: self.ln_eps,
+            apply_imagenet_norm: self.apply_imagenet_norm,
+            imagenet_mean: self.imagenet_mean,
+            imagenet_std: self.imagenet_std,
+            taps: self.taps.clone(),
+            output_clamp: self.output_clamp,
+        }
+    }
+}
+
 /// Token ordering used by the historical VC attention path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VitVcPermutation {
@@ -1564,6 +1609,8 @@ pub enum LayerKind {
     LayaEncoder(LayaEncoderSpec),
     /// `[laya_head]`: frozen LAYA decision head.
     LayaHead(LayaHeadSpec),
+    /// `[depth_anything]`: frozen DINOv2 ViT-S/14 feature encoder.
+    DepthAnything(DepthAnythingSpec),
     /// `[vit]`: global vision transformer with learned patch projection.
     Vit(VitSpec),
     /// `[swin]`, `[swin_block]`, `[transformer]`, `[transformer_block]`.
@@ -1646,6 +1693,7 @@ impl LayerKind {
             Self::LayaLoss(_) => "laya_loss",
             Self::LayaEncoder(_) => "laya_encoder",
             Self::LayaHead(_) => "laya_head",
+            Self::DepthAnything(_) => "depth_anything",
             Self::Vit(_) => "vit",
             Self::Swin(_) => "swin",
             Self::TuckerAttention(_) => "tucker_attention",
@@ -1829,6 +1877,21 @@ impl Layer {
                     .flat_map(|weights| weights.entries)
                     .collect::<Vec<_>>();
                 (!entries.is_empty()).then_some(LayerWeights { entries })
+            }
+            LayerKind::DepthAnything(spec) => {
+                if spec.weights_path.is_some() {
+                    return None;
+                }
+                let geometry = spec.geometry(self.input_shape);
+                let entries = crate::depth_anything::weight_array_sizes(&geometry)
+                    .expect("validated depth_anything weight geometry")
+                    .into_iter()
+                    .map(|(name, len)| WeightsEntry {
+                        array: WeightsArray::Named(name.to_owned()),
+                        len,
+                    })
+                    .collect();
+                Some(LayerWeights { entries })
             }
             LayerKind::HyperbolicFoveation(spec) => {
                 let mut entries = vec![WeightsEntry {
@@ -3266,6 +3329,203 @@ fn validate_recursive_body_keys(section: &RawSection) -> Result<()> {
     Ok(())
 }
 
+fn parse_depth_anything_spec(
+    section: &RawSection,
+    current: TensorShape,
+    cfg_parent: &Path,
+) -> Result<DepthAnythingSpec> {
+    let line = section.line;
+    const ALLOWED_KEYS: &[&str] = &[
+        "variant",
+        "patch_size",
+        "dim",
+        "filters",
+        "depth",
+        "heads",
+        "mlp_dim",
+        "ffn_dim",
+        "pos_grid",
+        "pos_grid_h",
+        "pos_grid_w",
+        "ln_eps",
+        "apply_imagenet_norm",
+        "imagenet_norm",
+        "taps",
+        "mean",
+        "std",
+        "clamp",
+        "weights",
+        "freeze",
+        "stream",
+        "wait_stream",
+        "learning_rate",
+        "dont_update",
+        "burnin_update",
+        "train_only_bn",
+        "clip",
+        "grad_centr",
+    ];
+    if let Some(key) = section
+        .values
+        .keys()
+        .find(|key| !ALLOWED_KEYS.contains(&key.as_str()))
+    {
+        return Err(Error::InvalidConfig(format!(
+            "[depth_anything] at line {line}: unsupported key {key:?}"
+        )));
+    }
+    let freeze = section.get_i64("freeze", 1)?;
+    if !matches!(freeze, 0 | 1) {
+        return Err(Error::InvalidConfig(format!(
+            "[depth_anything] at line {line}: freeze must be 0 or 1, got {freeze}"
+        )));
+    }
+    for key in ["stream", "wait_stream"] {
+        if section.get_i64(key, -1)? != -1 {
+            return Err(Error::InvalidConfig(format!(
+                "[depth_anything] at line {line}: {key} is unsupported by Stage-1 CPU execution"
+            )));
+        }
+    }
+    if current.width == 0 || current.height == 0 || current.channels != 3 {
+        return Err(Error::InvalidConfig(format!(
+            "[depth_anything] at line {line} requires a non-empty NCHW RGB input, got {current}"
+        )));
+    }
+    let variant = section.get_str("variant", "small");
+    if !matches!(
+        variant.as_str(),
+        "small" | "vits" | "depth_anything_v2_small"
+    ) {
+        return Err(Error::InvalidConfig(format!(
+            "[depth_anything] at line {line}: variant={variant} is unsupported; expected small, vits, or depth_anything_v2_small"
+        )));
+    }
+    let dim = section.get_usize("dim", section.get_usize("filters", 384)?)?;
+    let default_mlp_dim = dim.checked_mul(4).ok_or_else(|| {
+        Error::InvalidConfig(format!("[depth_anything] at line {line}: dim*4 overflows"))
+    })?;
+    let mlp_dim = section.get_usize("mlp_dim", section.get_usize("ffn_dim", default_mlp_dim)?)?;
+    let pos_grid = section.get_usize("pos_grid", 37)?;
+    let mean = match section.get_f32_list("mean")? {
+        values if values.is_empty() => [0.485, 0.456, 0.406],
+        values if values.len() == 3 => [values[0], values[1], values[2]],
+        values => {
+            return Err(Error::InvalidConfig(format!(
+                "[depth_anything] at line {line}: mean must contain exactly 3 values, got {}",
+                values.len()
+            )));
+        }
+    };
+    let std = match section.get_f32_list("std")? {
+        values if values.is_empty() => [0.229, 0.224, 0.225],
+        values if values.len() == 3 => [values[0], values[1], values[2]],
+        values => {
+            return Err(Error::InvalidConfig(format!(
+                "[depth_anything] at line {line}: std must contain exactly 3 values, got {}",
+                values.len()
+            )));
+        }
+    };
+    let imagenet_norm = if section.get("apply_imagenet_norm").is_some() {
+        section.get_bool_int("apply_imagenet_norm", true)?
+    } else {
+        section.get_bool_int("imagenet_norm", true)?
+    };
+    let taps = match section.get_usize_list("taps")? {
+        values if values.is_empty() => vec![2, 5, 8, 11],
+        values => values,
+    };
+    let mut spec = DepthAnythingSpec {
+        patch_size: section.get_usize("patch_size", 14)?,
+        dim,
+        depth: section.get_usize("depth", 12)?,
+        heads: section.get_usize("heads", 6)?,
+        mlp_dim,
+        pos_grid_h: section.get_usize("pos_grid_h", pos_grid)?,
+        pos_grid_w: section.get_usize("pos_grid_w", pos_grid)?,
+        ln_eps: section.get_f32("ln_eps", 1.0e-6)?,
+        apply_imagenet_norm: imagenet_norm,
+        imagenet_mean: mean,
+        imagenet_std: std,
+        taps,
+        output_clamp: section.get_f32("clamp", 0.0)?,
+        weights_path: None,
+        external_weights: None,
+    };
+    let geometry = spec.geometry(current);
+    geometry.validate().map_err(|error| {
+        Error::InvalidConfig(format!("[depth_anything] at line {line}: {error}"))
+    })?;
+
+    let raw_weights_path = section.get_str("weights", "");
+    if !raw_weights_path.is_empty() {
+        let weights_path = resolve_depth_anything_weights_path(&raw_weights_path, cfg_parent)
+            .map_err(|error| {
+                Error::InvalidConfig(format!("[depth_anything] at line {line}: {error}"))
+            })?;
+        let bytes = fs::read(&weights_path).map_err(|error| {
+            Error::InvalidConfig(format!(
+                "[depth_anything] at line {line}: could not read weights={} ({error})",
+                weights_path.display()
+            ))
+        })?;
+        const HEADER_BYTES: usize = 20;
+        let payload_bytes = geometry
+            .weight_count()
+            .and_then(|count| {
+                count
+                    .checked_mul(4)
+                    .ok_or_else(|| "weight blob byte size overflows usize".to_owned())
+            })
+            .map_err(|error| {
+                Error::InvalidConfig(format!("[depth_anything] at line {line}: {error}"))
+            })?;
+        let expected_bytes = HEADER_BYTES.checked_add(payload_bytes).ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "[depth_anything] at line {line}: external weight file size overflows"
+            ))
+        })?;
+        if bytes.len() != expected_bytes {
+            return Err(Error::InvalidConfig(format!(
+                "[depth_anything] at line {line}: weights={} has {} bytes, expected exactly {expected_bytes} (20-byte header + {payload_bytes}-byte type-major blob)",
+                weights_path.display(),
+                bytes.len()
+            )));
+        }
+        let blob = bytes[HEADER_BYTES..]
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+            .collect::<Vec<_>>();
+        spec.external_weights = Some(
+            crate::depth_anything::DepthAnythingWeights::from_blob(&blob, &geometry).map_err(
+                |error| Error::InvalidConfig(format!("[depth_anything] at line {line}: {error}")),
+            )?,
+        );
+        spec.weights_path = Some(weights_path);
+    }
+    Ok(spec)
+}
+
+fn resolve_depth_anything_weights_path(raw: &str, cfg_parent: &Path) -> Result<PathBuf> {
+    let requested = PathBuf::from(raw);
+    if requested.exists() {
+        return Ok(requested);
+    }
+    for base in [Some(cfg_parent), cfg_parent.parent()] {
+        let Some(base) = base else {
+            continue;
+        };
+        let candidate = base.join(&requested);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(Error::InvalidConfig(format!(
+        "could not find weights={raw:?} in the working directory, cfg directory, or cfg parent"
+    )))
+}
+
 fn parse_layer_kind(
     section: &RawSection,
     layer_index: usize,
@@ -3277,6 +3537,9 @@ fn parse_layer_kind(
 ) -> Result<LayerKind> {
     let name = section.name.as_str();
     Ok(match name {
+        "depth_anything" | "depth_anything_v2" | "dinov2" | "dino" => {
+            LayerKind::DepthAnything(parse_depth_anything_spec(section, current, cfg_parent)?)
+        }
         "clifford" => LayerKind::Clifford(parse_clifford_spec(section, current)?),
         "foveation_film" | "hf_film" => LayerKind::FoveationFilm(parse_foveation_film_spec(
             section,
@@ -4638,6 +4901,18 @@ fn infer_output_shape(
             Ok(current)
         }
         LayerKind::FoveationFilm(_) => Ok(current),
+        LayerKind::DepthAnything(spec) => {
+            let geometry = spec.geometry(current);
+            geometry.validate().map_err(|error| {
+                Error::InvalidConfig(format!("[depth_anything] layer #{layer_index}: {error}"))
+            })?;
+            Ok(TensorShape::new(
+                current.width / spec.patch_size,
+                current.height / spec.patch_size,
+                geometry.output_channels().map_err(Error::InvalidConfig)?,
+                current.batch,
+            ))
+        }
         LayerKind::HyperbolicFoveation(spec) => match spec.warp_source {
             HfWarpSource::Previous => Ok(current),
             HfWarpSource::NetworkInput => Ok(built_layers

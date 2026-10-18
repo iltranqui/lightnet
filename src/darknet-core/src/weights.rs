@@ -350,7 +350,15 @@ pub fn save_weights(
                     )));
                 }
             }
-            // C++ `dontsave": the frozen LAYA layers load from an external
+            // Cfg-local pretrained encoder weights are deliberately excluded
+            // from the trainable network checkpoint (`dontsave`). Without an
+            // external blob, preserve C++'s sequential source-order format.
+            (LayerKind::DepthAnything(spec), LayerParams::DepthAnything(weights)) => {
+                if spec.weights_path.is_none() {
+                    write_f32_slice(&mut file, weights.as_slice())?;
+                }
+            }
+            // C++ `dontsave`: the frozen LAYA layers load from an external
             // shared blob, so nothing is written for them in this stream.
             (LayerKind::LayaEncoder(_), LayerParams::LayaEncoder(_)) => {}
             (LayerKind::LayaHead(_), LayerParams::LayaHead(_)) => {}
@@ -1555,7 +1563,8 @@ num_dwconv=2
                     | LayerParams::Clifford(_)
                     | LayerParams::RecursiveBlock(_)
                     | LayerParams::HyperbolicFoveation(_)
-                    | LayerParams::FoveationFilm(_) => {}
+                    | LayerParams::FoveationFilm(_)
+                    | LayerParams::DepthAnything(_) => {}
                 }
             }
             let path = std::env::temp_dir().join(format!("darknet-{name}-roundtrip.weights"));

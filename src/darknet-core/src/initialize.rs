@@ -104,6 +104,9 @@ pub fn initialize_training_params(network: &Network, params: &mut [LayerParams],
             // from the shared blob, not from random init.
             LayerParams::LayaEncoder(_) => {}
             LayerParams::LayaHead(_) => {}
+            // Frozen DINOv2 tensors are either loaded from cfg weights= or a
+            // checkpoint; never replace them with a random initialization.
+            LayerParams::DepthAnything(_) => {}
             LayerParams::TuckerAttention(p) => {
                 let channels = layer.input_shape.channels;
                 let bound = (6.0 / (channels as f32 + channels as f32)).sqrt();

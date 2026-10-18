@@ -37,6 +37,7 @@ pub(crate) mod hyperbolic_foveation;
 pub use chart::{ChartPoint, write_training_chart};
 pub use clifford::{CliffordBranchTrainBuffers, CliffordParams, CliffordTrainBuffers};
 pub mod dense_loss;
+pub mod depth_anything;
 pub use dense_loss::{
     DenseTrainingLoss, compute_dense_training_loss, compute_dense_training_loss_at,
 };

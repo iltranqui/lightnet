@@ -260,6 +260,7 @@ fn foveation_film_sources_add_to_each_other_and_existing_hf_auxiliary_gradients(
             &forward,
             &seeds,
             Some(&auxiliary),
+            super::super::GradMode::from_env(),
             &mut attention_backward,
         )
         .unwrap();

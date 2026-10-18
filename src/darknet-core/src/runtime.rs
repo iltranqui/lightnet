@@ -54,8 +54,9 @@ const BATCH_NORM_ROLLING_KEEP_CPU: f32 = 0.9;
 /// exact derivative of its forward. `Analytical` (default) is the exact derivative, `Cpp`
 /// reproduces the C++ shortcut for training parity. Selected by `DARKNET_GRAD_MODE=analytical|cpp`
 /// and read at each backward. Affects only: softmax (C++ passes `dy` through; its cost layer
-/// folds the Jacobian in) and `scale_channels` with `scale_wh=1` (C++ divides the scale gradient
-/// by `w*h`). See `tasks/rust/todo.md` "Analytical gradients everywhere" for the full audit.
+/// folds the Jacobian in), `scale_channels` with `scale_wh=1` (C++ divides the scale gradient
+/// by `w*h`), and frozen `[depth_anything]` (whose source backward callback is a no-op). See
+/// `tasks/rust/todo.md` "Analytical gradients everywhere" for the full audit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum GradMode {
     #[default]
@@ -80,7 +81,9 @@ fn reject_gpu_hyperbolic_foveation(network: &Network, operation: &str) -> Result
     if let Some(layer) = network.layers.iter().find(|layer| {
         matches!(
             layer.kind,
-            LayerKind::HyperbolicFoveation(_) | LayerKind::FoveationFilm(_)
+            LayerKind::HyperbolicFoveation(_)
+                | LayerKind::FoveationFilm(_)
+                | LayerKind::DepthAnything(_)
         )
     }) {
         return Err(Error::UnsupportedLayer {
@@ -382,6 +385,8 @@ pub enum LayerParams {
     LayaEncoder(crate::laya_encoder::LayaEncoderWeights),
     /// `[laya_head]`'s frozen decision-head weights (loaded from its `.weights` blob).
     LayaHead(crate::laya_head::LayaHeadWeights),
+    /// `[depth_anything]` frozen encoder weights in source blob order.
+    DepthAnything(crate::depth_anything::DepthAnythingWeights),
     /// `[vit]` global transformer parameters in the C++ save order.
     Vit(crate::vit::VitWeights),
     /// `[swin]` parameters in the Rust-defined Swin blob order.
@@ -810,6 +815,7 @@ pub struct ForwardResult {
     pub(crate) hyperbolic_foveation_caches: Vec<Option<HyperbolicFoveationForwardCache>>,
     pub(crate) foveation_film_caches: Vec<Option<crate::foveation_film::FoveationFilmForwardCache>>,
     pub vit_caches: Vec<Option<crate::vit::VitForwardCache>>,
+    pub(crate) depth_anything_caches: Vec<Option<crate::depth_anything::DepthAnythingForwardCache>>,
     pub swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>>,
     pub tucker_attention_caches: Vec<Option<crate::tucker_attention::TuckerAttentionForwardCache>>,
     /// Forward tapes include the explicit recurrent scan state for MambaVision.
@@ -847,6 +853,7 @@ impl ForwardResult {
             hyperbolic_foveation_caches: Vec::new(),
             foveation_film_caches: Vec::new(),
             vit_caches: Vec::new(),
+            depth_anything_caches: Vec::new(),
             swin_caches: Vec::new(),
             tucker_attention_caches: Vec::new(),
             mambavision_caches: Vec::new(),
@@ -884,6 +891,7 @@ mod forward_result_from_heads_tests {
         assert!(result.hyperbolic_foveation_caches.is_empty());
         assert!(result.foveation_film_caches.is_empty());
         assert!(result.vit_caches.is_empty());
+        assert!(result.depth_anything_caches.is_empty());
         assert!(result.swin_caches.is_empty());
         assert!(result.tucker_attention_caches.is_empty());
         assert!(result.mambavision_caches.is_empty());
@@ -2475,6 +2483,7 @@ impl ExecutableNetwork {
             Vec::with_capacity(self.network.layers.len());
         let mut foveation_film_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches = Vec::with_capacity(self.network.layers.len());
+        let mut depth_anything_caches = Vec::with_capacity(self.network.layers.len());
         let mut swin_caches = Vec::with_capacity(self.network.layers.len());
         let mut tucker_attention_caches = Vec::with_capacity(self.network.layers.len());
         let mut mambavision_caches = Vec::with_capacity(self.network.layers.len());
@@ -2500,6 +2509,7 @@ impl ExecutableNetwork {
             let mut moe_cache = None;
             let mut eml_cache = None;
             let mut vit_cache = None;
+            let mut depth_anything_cache = None;
             let mut swin_cache = None;
             let mut tucker_attention_cache = None;
             let mut mambavision_cache = None;
@@ -2886,6 +2896,14 @@ impl ExecutableNetwork {
                     kimi_kda_cache = Some(cache);
                     (Tensor::from_data(layer.output_shape, data)?, None)
                 }
+                (LayerKind::DepthAnything(spec), LayerParams::DepthAnything(weights)) => {
+                    let geometry = spec.geometry(current_input.shape);
+                    let (data, cache) =
+                        crate::depth_anything::forward(&current_input.data, weights, &geometry)
+                            .map_err(Error::InvalidConfig)?;
+                    depth_anything_cache = Some(cache);
+                    (Tensor::from_data(layer.output_shape, data)?, None)
+                }
                 (LayerKind::LayaEncoder(spec), LayerParams::LayaEncoder(weights)) => (
                     laya_encoder_forward(spec, weights, current_input, layer.output_shape)?,
                     None,
@@ -3213,6 +3231,7 @@ impl ExecutableNetwork {
             hyperbolic_foveation_caches.push(hyperbolic_foveation_cache);
             foveation_film_caches.push(foveation_film_cache);
             vit_caches.push(vit_cache);
+            depth_anything_caches.push(depth_anything_cache);
             swin_caches.push(swin_cache);
             tucker_attention_caches.push(tucker_attention_cache);
             mambavision_caches.push(mambavision_cache);
@@ -3237,6 +3256,7 @@ impl ExecutableNetwork {
             hyperbolic_foveation_caches,
             foveation_film_caches,
             vit_caches,
+            depth_anything_caches,
             swin_caches,
             tucker_attention_caches,
             mambavision_caches,
@@ -3270,6 +3290,21 @@ impl ExecutableNetwork {
         forward: &ForwardResult,
         layer_output_gradient_seeds: &[Option<Tensor>],
     ) -> Result<BackwardResult> {
+        self.backward_seeded_with_grad_mode(
+            input,
+            forward,
+            layer_output_gradient_seeds,
+            GradMode::from_env(),
+        )
+    }
+
+    fn backward_seeded_with_grad_mode(
+        &self,
+        input: &Tensor,
+        forward: &ForwardResult,
+        layer_output_gradient_seeds: &[Option<Tensor>],
+        grad_mode: GradMode,
+    ) -> Result<BackwardResult> {
         // Allocate a local workspace for this standalone (non-accumulate) backward call.
         // backward_accumulate_seeded reuses the pre-allocated self.workspace instead.
         let mut local_workspace = vec![0.0f32; compute_cpu_workspace_size(&self.network)];
@@ -3283,6 +3318,7 @@ impl ExecutableNetwork {
             forward,
             layer_output_gradient_seeds,
             None,
+            grad_mode,
             &mut attention_backward,
         )
     }
@@ -3294,6 +3330,7 @@ impl ExecutableNetwork {
         forward: &ForwardResult,
         layer_output_gradient_seeds: &[Option<Tensor>],
         hf_auxiliary_param_gradients: Option<&[Option<Vec<f32>>]>,
+        grad_mode: GradMode,
         attention_backward: &mut F,
     ) -> Result<BackwardResult>
     where
@@ -3346,6 +3383,13 @@ impl ExecutableNetwork {
                 "forward crop cache count mismatch: expected {}, got {}",
                 self.network.layers.len(),
                 forward.crop_caches.len()
+            )));
+        }
+        if forward.depth_anything_caches.len() != self.network.layers.len() {
+            return Err(Error::InvalidConfig(format!(
+                "forward [depth_anything] cache count mismatch: expected {}, got {}",
+                self.network.layers.len(),
+                forward.depth_anything_caches.len()
             )));
         }
         if forward.swin_caches.len() != self.network.layers.len() {
@@ -3436,8 +3480,10 @@ impl ExecutableNetwork {
         let mut foveation_hf_auxiliary_gradients: Vec<Option<Vec<f32>>> =
             vec![None; self.network.layers.len()];
         for gradient in &mut param_gradients {
-            if let LayerParams::HyperbolicFoveation(gradient) = gradient {
-                gradient.hf_params.fill(0.0);
+            match gradient {
+                LayerParams::HyperbolicFoveation(gradient) => gradient.hf_params.fill(0.0),
+                LayerParams::DepthAnything(gradient) => gradient.as_mut_slice().fill(0.0),
+                _ => {}
             }
         }
         for (layer, seed) in self.network.layers.iter().zip(layer_output_gradient_seeds) {
@@ -3739,7 +3785,7 @@ impl ExecutableNetwork {
                                     layer.output_shape.channels,
                                     layer.output_shape.width * layer.output_shape.height,
                                     normalization,
-                                    GradMode::from_env() == GradMode::Cpp,
+                                    grad_mode == GradMode::Cpp,
                                 ),
                             }
                         } else {
@@ -3846,7 +3892,7 @@ impl ExecutableNetwork {
                                     layer.output_shape.channels,
                                     layer.output_shape.width * layer.output_shape.height,
                                     normalization,
-                                    GradMode::from_env() == GradMode::Cpp,
+                                    grad_mode == GradMode::Cpp,
                                 ),
                             }
                         } else {
@@ -3962,7 +4008,7 @@ impl ExecutableNetwork {
                                     layer.output_shape.channels,
                                     layer.output_shape.width * layer.output_shape.height,
                                     normalization,
-                                    GradMode::from_env() == GradMode::Cpp,
+                                    grad_mode == GradMode::Cpp,
                                 ),
                             }
                         } else {
@@ -4082,7 +4128,7 @@ impl ExecutableNetwork {
                                     layer.output_shape.channels,
                                     layer.output_shape.width * layer.output_shape.height,
                                     normalization,
-                                    GradMode::from_env() == GradMode::Cpp,
+                                    grad_mode == GradMode::Cpp,
                                 ),
                             }
                         } else {
@@ -4700,7 +4746,7 @@ impl ExecutableNetwork {
                         forward.layer_activation_inputs[layer.index].as_ref(),
                     )?;
                     // C++ also scales the weight gradient by 1/batch (and the optimizer divides again).
-                    let weight_scale = if GradMode::from_env() == GradMode::Cpp {
+                    let weight_scale = if grad_mode == GradMode::Cpp {
                         1.0 / current_input.shape.batch as f32
                     } else {
                         1.0
@@ -4839,7 +4885,7 @@ impl ExecutableNetwork {
                         &params.weights,
                         spec.weights_normalization,
                         spec.weight_slots(current_input.shape.channels),
-                        GradMode::from_env() == GradMode::Cpp,
+                        grad_mode == GradMode::Cpp,
                     );
                     let Some(slot) = param_gradients.get_mut(layer.index) else {
                         return Err(Error::InvalidConfig(format!(
@@ -5047,7 +5093,7 @@ impl ExecutableNetwork {
                             layer.index
                         ))
                     })?;
-                    let input_grad = if GradMode::from_env() == GradMode::Cpp {
+                    let input_grad = if grad_mode == GradMode::Cpp {
                         // C++ passes dy straight through (cost layer folds the Jacobian in).
                         grad.clone()
                     } else {
@@ -5094,7 +5140,7 @@ impl ExecutableNetwork {
                         &grad,
                         forward.layer_activation_inputs[layer.index].as_ref(),
                     )?;
-                    if spec.scale_wh && GradMode::from_env() == GradMode::Cpp {
+                    if spec.scale_wh && grad_mode == GradMode::Cpp {
                         let channel_size = (output.shape.height * output.shape.width) as f32;
                         for v in &mut input_grad.data {
                             *v /= channel_size;
@@ -5341,6 +5387,33 @@ impl ExecutableNetwork {
                         &mut layer_output_gradients,
                     )?;
                 }
+                (LayerKind::DepthAnything(spec), LayerParams::DepthAnything(weights)) => {
+                    let cache = forward
+                        .depth_anything_caches
+                        .get(layer.index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing [depth_anything] forward cache for layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    if let Some(da_input_gradient) = depth_anything_input_gradient(
+                        grad_mode,
+                        spec,
+                        current_input.shape,
+                        &grad.data,
+                        weights,
+                        cache,
+                    )? {
+                        accumulate_previous_gradient(
+                            layer.index,
+                            &da_input_gradient,
+                            &mut input_gradient,
+                            &mut layer_output_gradients,
+                        )?;
+                    }
+                }
                 (LayerKind::LayaEncoder(_), LayerParams::LayaEncoder(_))
                 | (LayerKind::LayaHead(_), LayerParams::LayaHead(_)) => {
                     // Frozen (`freeze=1`): no gradient flows to the input.
@@ -5575,6 +5648,7 @@ impl ExecutableNetwork {
             forward,
             layer_output_gradient_seeds,
             hf_auxiliary_param_gradients,
+            GradMode::from_env(),
             &mut attention_backward,
         );
         self.workspace = ws;
@@ -6454,6 +6528,7 @@ impl ExecutableNetwork {
                 // buffers and contributes no parameter gradient.
                 (_, LayerParams::LayaScorer(_)) => {}
                 (_, LayerParams::LayaActHead(_)) => {}
+                (LayerKind::DepthAnything(_), LayerParams::DepthAnything(_)) => {}
                 _ => {
                     return Err(Error::InvalidConfig(format!(
                         "layer #{} produced gradients incompatible with train buffers",
@@ -7363,7 +7438,8 @@ fn host_adam_scalar_capacity(params: &LayerParams) -> usize {
         | LayerParams::LayaScorer(_)
         | LayerParams::LayaActHead(_)
         | LayerParams::LayaEncoder(_)
-        | LayerParams::LayaHead(_) => 0,
+        | LayerParams::LayaHead(_)
+        | LayerParams::DepthAnything(_) => 0,
     }
 }
 
@@ -12844,6 +12920,7 @@ where
                 hyperbolic_foveation_caches: vec![None; self.network.layers.len()],
                 foveation_film_caches: vec![None; self.network.layers.len()],
                 vit_caches,
+                depth_anything_caches: vec![None; self.network.layers.len()],
                 swin_caches,
                 tucker_attention_caches,
                 mambavision_caches,
@@ -17632,6 +17709,13 @@ fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
         LayerKind::LayaHead(spec) => LayerParams::LayaHead(
             crate::laya_head::LayaHeadWeights::zeroed(spec.hidden, spec.n_layers, spec.ffn_dim),
         ),
+        LayerKind::DepthAnything(spec) => {
+            let geometry = spec.geometry(layer.input_shape);
+            LayerParams::DepthAnything(spec.external_weights.clone().unwrap_or_else(|| {
+                crate::depth_anything::DepthAnythingWeights::zeroed(&geometry)
+                    .expect("validated depth_anything layer geometry")
+            }))
+        }
         LayerKind::Vit(spec) => LayerParams::Vit(
             crate::vit::VitWeights::zeroed(
                 &vit_geometry(layer, spec),
@@ -20473,7 +20557,8 @@ fn apply_host_adam_layer(
         | (LayerParams::LayaScorer(_), LayerTrainBuffers::None)
         | (LayerParams::LayaActHead(_), LayerTrainBuffers::None)
         | (LayerParams::LayaEncoder(_), LayerTrainBuffers::None)
-        | (LayerParams::LayaHead(_), LayerTrainBuffers::None) => {}
+        | (LayerParams::LayaHead(_), LayerTrainBuffers::None)
+        | (LayerParams::DepthAnything(_), LayerTrainBuffers::None) => {}
         _ => {
             return Err(Error::InvalidConfig(format!(
                 "CPU Adam parameter/train-buffer mismatch for {} layer",
@@ -21215,6 +21300,29 @@ fn load_weights_into_params(
                 read_f32_into(&mut file, &mut batch_norm.scales)?;
                 read_f32_into(&mut file, &mut batch_norm.rolling_mean)?;
                 read_f32_into(&mut file, &mut batch_norm.rolling_variance)?;
+            }
+            LayerParams::DepthAnything(weights) => {
+                let LayerKind::DepthAnything(spec) = &layer.kind else {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} depth_anything parameters do not match layer kind",
+                        layer.index
+                    )));
+                };
+                if spec.weights_path.is_none() {
+                    let geometry = spec.geometry(layer.input_shape);
+                    if !weights.matches(&geometry) {
+                        return Err(Error::Weights(format!(
+                            "layer #{} ([depth_anything]) parameter layout does not match config",
+                            layer.index
+                        )));
+                    }
+                    read_f32_into(&mut file, weights.as_mut_slice())?;
+                } else if spec.external_weights.is_none() {
+                    return Err(Error::Weights(format!(
+                        "layer #{} ([depth_anything]) has a weights path but no loaded external blob",
+                        layer.index
+                    )));
+                }
             }
             // The scorer blob does **not** live in the sequential stream: C++
             // seeks past the encoder and head blobs with `laya_open_weights`
@@ -28580,6 +28688,25 @@ fn laya_act_head_forward(
     )
     .map_err(Error::InvalidConfig)?;
     Tensor::from_data(output_shape, data)
+}
+
+/// Apply the explicit source-C++ stop-gradient deviation or the exact Rust
+/// input derivative for the frozen Depth Anything encoder.
+fn depth_anything_input_gradient(
+    mode: GradMode,
+    spec: &crate::model::DepthAnythingSpec,
+    input_shape: TensorShape,
+    output_gradient: &[f32],
+    weights: &crate::depth_anything::DepthAnythingWeights,
+    cache: &crate::depth_anything::DepthAnythingForwardCache,
+) -> Result<Option<Tensor>> {
+    if mode == GradMode::Cpp {
+        return Ok(None);
+    }
+    let geometry = spec.geometry(input_shape);
+    let data = crate::depth_anything::backward(output_gradient, weights, &geometry, cache)
+        .map_err(Error::InvalidConfig)?;
+    Ok(Some(Tensor::from_data(input_shape, data)?))
 }
 
 /// `[laya_encoder]` forward: build the geometry from the spec + input shapes and
@@ -45004,4 +45131,6 @@ probability=0.5
     mod hyperbolic_foveation_runtime_tests;
     #[path = "foveation_film_runtime_tests.rs"]
     mod foveation_film_runtime_tests;
+    #[path = "depth_anything_runtime_tests.rs"]
+    mod depth_anything_runtime_tests;
 }
