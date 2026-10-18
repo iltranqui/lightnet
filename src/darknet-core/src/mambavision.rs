@@ -1713,6 +1713,46 @@ mod tests {
     }
 
     #[test]
+    fn axis_layout_maps_nchw_rows_and_scan_state_per_batch() {
+        let shape = TensorShape::new(2, 1, 2, 2);
+        let spec = spec(2, 2, 1, 1);
+        let mut params = MambaVisionParams::zeroed(2, 2, 1, 1, 1, 1).unwrap();
+        let o = MambaOffsets::new(2, 2, 1, 1, 1, 1).unwrap();
+        params.values[o.ln1_gamma.clone()].fill(1.0);
+        params.values[o.ln2_gamma.clone()].fill(1.0);
+        // Route input channel 0 through the scan x branch, then x_conv into C.
+        params.values[o.in_w.start] = 1.0;
+        params.values[o.conv_x_w.start] = 1.0;
+        params.values[o.x_proj_w.start + 2] = 1.0;
+        params.values[o.out_w.start] = 1.0;
+
+        // NCHW: each token has opposite channel sentinels, with distinct values
+        // across both spatial positions and batches.
+        let input = [1.0, 2.0, -1.0, -2.0, -3.0, 4.0, 3.0, -4.0];
+        let state = MambaVisionState {
+            values: vec![0.4, -0.2],
+        };
+        let forward = mambavision_forward(&input, shape, &spec, &params, Some(&state)).unwrap();
+        let scan_inputs =
+            [1.0_f32, 2.0, -3.0, 4.0].map(|x| silu(x / (x * x + LAYERNORM_EPS).sqrt()));
+        let expected_output = [
+            1.0 + 0.2 * scan_inputs[0],
+            2.0 + 0.1 * scan_inputs[1],
+            -1.0,
+            -2.0,
+            -3.0 - 0.1 * scan_inputs[2],
+            4.0 - 0.05 * scan_inputs[3],
+            3.0,
+            -4.0,
+        ];
+        let expected_state = [0.1, -0.05];
+        for (actual, expected) in forward.output.iter().zip(expected_output) {
+            assert!((actual - expected).abs() < 1.0e-6, "{actual} != {expected}");
+        }
+        assert_eq!(forward.state_out.values, expected_state);
+    }
+
+    #[test]
     fn incoming_state_gradient_matches_finite_difference() {
         let shape = TensorShape::new(2, 1, 2, 1);
         let spec = spec(2, 2, 1, 1);

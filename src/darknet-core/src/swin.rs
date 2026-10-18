@@ -1183,6 +1183,33 @@ mod tests {
     }
 
     #[test]
+    fn window_partition_axis_layout_is_batch_major_raster_then_channel() {
+        let input: Vec<f32> = (0..32).map(|value| value as f32).collect();
+        let windows = window_partition_nchw(&input, 2, 2, 2, 4, 2).unwrap();
+        assert_eq!(
+            windows,
+            [
+                0.0, 8.0, 1.0, 9.0, 4.0, 12.0, 5.0, 13.0, 2.0, 10.0, 3.0, 11.0, 6.0, 14.0, 7.0,
+                15.0, 16.0, 24.0, 17.0, 25.0, 20.0, 28.0, 21.0, 29.0, 18.0, 26.0, 19.0, 27.0, 22.0,
+                30.0, 23.0, 31.0,
+            ]
+        );
+    }
+
+    #[test]
+    fn cyclic_shift_axis_layout_wraps_each_nchw_plane_with_source_signs() {
+        let input: Vec<f32> = (0..24).map(|value| value as f32).collect();
+        let shifted = cyclic_shift_nchw(&input, 2, 2, 2, 3, -1, 1).unwrap();
+        assert_eq!(
+            shifted,
+            [
+                5.0, 3.0, 4.0, 2.0, 0.0, 1.0, 11.0, 9.0, 10.0, 8.0, 6.0, 7.0, 17.0, 15.0, 16.0,
+                14.0, 12.0, 13.0, 23.0, 21.0, 22.0, 20.0, 18.0, 19.0,
+            ]
+        );
+    }
+
+    #[test]
     fn padding_crop_shift_and_partition_obey_adjoint_identities() {
         let x: Vec<f32> = (0..30).map(|value| value as f32 * 0.03 - 0.2).collect();
         let padded_gradient: Vec<f32> = (0..48).map(|value| value as f32 * -0.02 + 0.4).collect();

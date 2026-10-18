@@ -1164,6 +1164,40 @@ mod tests {
     }
 
     #[test]
+    fn axis_layout_keeps_nchw_raster_scans_independent_per_batch() {
+        let mut g = geometry(2, 2, 1, 2);
+        g.activation = Activation::Linear;
+        let mut params = KimiKdaParams::zeroed(g.channels, g.rank, g.experts, g.hidden).unwrap();
+        let o = super::KimiOffsets::new(g.channels, g.rank, g.experts, g.hidden).unwrap();
+        params.biases[o.ln1_gamma..o.ln1_gamma + g.channels].fill(1.0);
+        params.biases[o.bq] = 1.0;
+        params.biases[o.bk] = 1.0;
+        params.biases[o.bdecay] = 3.0_f32.ln();
+        params.weights[o.wv] = 1.0;
+        params.weights[o.wo] = 1.0;
+
+        // NCHW rows become tokens [b0t0,b0t1,b1t0,b1t1], each with two channels.
+        let input = [1.0, 1.0, -1.0, 1.0, 2.0, -2.0, -2.0, 2.0];
+        let (output, _) = kimi_kda_forward(&input, shape(&g), &spec(&g), &params).unwrap();
+        let norm_one = 1.0 / (1.0 + 1.0e-5_f32).sqrt();
+        let norm_two = 2.0 / (4.0 + 1.0e-5_f32).sqrt();
+        // q=k=1, beta=1/2, decay=3/4: h0=v0/2 and h1=h0/4+v1/2.
+        let expected = [
+            1.0 + 0.5 * norm_one,
+            1.0 + 0.125 * norm_one,
+            -1.0,
+            1.0,
+            2.0 + 0.5 * norm_two,
+            -2.0 - 0.375 * norm_two,
+            -2.0,
+            2.0,
+        ];
+        for (actual, expected) in output.iter().zip(expected) {
+            assert!((actual - expected).abs() < 2.0e-5, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
     fn backward_matches_finite_differences_for_input_and_every_parameter() {
         let g = geometry(1, 2, 1, 3);
         let mut params = KimiKdaParams::zeroed(g.channels, g.rank, g.experts, g.hidden).unwrap();

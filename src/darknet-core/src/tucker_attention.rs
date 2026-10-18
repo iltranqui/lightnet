@@ -888,6 +888,52 @@ mod tests {
     }
 
     #[test]
+    fn axis_layout_keeps_batch_window_token_and_channel_axes_independent() {
+        let mut g = geometry(1, 2, 2, false);
+        g.batch = 2;
+        g.heads = 2;
+        g.rank_q = 1;
+        g.rank_k = 1;
+        g.rank_v = 1;
+        g.rank_o = 1;
+        let mut params = TuckerAttentionParams::zeroed(2, 2, 1, 1, 1, 1).unwrap();
+        let o = offsets(&g).unwrap();
+        params.weights[o.q_basis..o.k_basis].copy_from_slice(&[1.0, 0.0]);
+        params.weights[o.k_basis..o.v_basis].copy_from_slice(&[1.0, 0.0]);
+        params.weights[o.v_basis..o.q_core].copy_from_slice(&[1.0, 0.0]);
+        params.weights[o.q_core..o.k_core].copy_from_slice(&[1.0, 0.0]);
+        params.weights[o.k_core..o.v_core].copy_from_slice(&[1.0, 0.0]);
+        params.weights[o.v_core..o.o_core].copy_from_slice(&[1.0, 0.0]);
+        params.weights[o.o_core..o.o_basis].copy_from_slice(&[1.0, 0.0]);
+        params.weights[o.o_basis..o.total].copy_from_slice(&[1.0, 0.0]);
+
+        // NCHW: channel 0 drives attention; channel 1 is an independent sentinel.
+        // Each 1x2 image is padded to one 2x2 window with two zero tokens.
+        let input = [1.0, 2.0, 101.0, 102.0, 10.0, 20.0, 201.0, 202.0];
+        let (output, _) = tucker_attention_forward(&input, &params, &g).unwrap();
+        let window_context = |values: [f32; 2], query: f32| {
+            let scores = [query * values[0], query * values[1], 0.0, 0.0];
+            let maximum = scores.into_iter().fold(f32::NEG_INFINITY, f32::max);
+            let probabilities = scores.map(|score| (score - maximum).exp());
+            (probabilities[0] * values[0] + probabilities[1] * values[1])
+                / probabilities.into_iter().sum::<f32>()
+        };
+        let expected = [
+            1.0 + window_context([1.0, 2.0], 1.0),
+            2.0 + window_context([1.0, 2.0], 2.0),
+            101.0,
+            102.0,
+            10.0 + window_context([10.0, 20.0], 10.0),
+            20.0 + window_context([10.0, 20.0], 20.0),
+            201.0,
+            202.0,
+        ];
+        for (actual, expected) in output.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1.0e-5, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
     fn partial_windows_zero_pad_but_preserve_valid_identity_residuals() {
         let mut g = geometry(3, 3, 2, true);
         g.msa_block_size = 1;
