@@ -85,6 +85,7 @@ fn reject_gpu_hyperbolic_foveation(network: &Network, operation: &str) -> Result
                 | LayerKind::FoveationFilm(_)
                 | LayerKind::DepthAnything(_)
                 | LayerKind::DptHead(_)
+                | LayerKind::Yolo3d(_)
         )
     }) {
         return Err(Error::UnsupportedLayer {
@@ -694,6 +695,13 @@ pub struct YoloHeadOutput {
     pub output: Tensor,
 }
 
+/// A raw-logit projected cuboid head, never placed in the 2D head vector.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Yolo3dHeadOutput {
+    pub layer_index: usize,
+    pub output: Tensor,
+}
+
 /// One of the four modern anchor-free heads (`[yolox]`, `[ppyoloe]`,
 /// `[yolonas]`, `[centernet]`) captured by a forward pass so `detect.rs` can
 /// decode it.  Same shape as [`YoloHeadOutput`]; kept separate so the decode
@@ -838,6 +846,7 @@ pub struct ForwardResult {
     /// Valid proposal metadata and Stage-2 raw outputs for each `[obb_refine]` layer.
     pub obb_refine_outputs: Vec<crate::carpn::ObbRefineOutput>,
     pub yolo_heads: Vec<YoloHeadOutput>,
+    pub yolo_3d_heads: Vec<Yolo3dHeadOutput>,
     /// The modern anchor-free heads, in layer order.
     pub modern_heads: Vec<ModernHeadOutput>,
 }
@@ -874,6 +883,7 @@ impl ForwardResult {
             kimi_kda_caches: Vec::new(),
             obb_refine_outputs: Vec::new(),
             yolo_heads,
+            yolo_3d_heads: Vec::new(),
             modern_heads,
         }
     }
@@ -2094,6 +2104,9 @@ impl ExecutableNetwork {
         let burn_in = self.network.net.burn_in;
         for index in 0..self.network.layers.len() {
             let layer = &self.network.layers[index];
+            if matches!(layer.kind, LayerKind::Yolo3d(_)) {
+                continue; // Weightless head: no Adam or DNOPT state.
+            }
             let options = layer.train;
             if !options.updates_at(iteration_num, burn_in) {
                 continue;
@@ -2197,6 +2210,9 @@ impl ExecutableNetwork {
         let burn_in = net.burn_in;
         for index in 0..layer_count {
             let layer = self.network.layers[index].clone();
+            if matches!(layer.kind, LayerKind::Yolo3d(_)) {
+                continue; // No matrices or AdamW fallback parameters.
+            }
             let options = layer.train;
             if !options.updates_at(iteration_num, burn_in) {
                 continue;
@@ -2553,6 +2569,7 @@ impl ExecutableNetwork {
         let mut crop_caches = Vec::with_capacity(self.network.layers.len());
         let mut recurrent_caches = Vec::with_capacity(self.network.layers.len());
         let mut yolo_heads = Vec::new();
+        let mut yolo_3d_heads = Vec::new();
         let mut modern_heads = Vec::new();
         let mut moe_caches = Vec::with_capacity(self.network.layers.len());
         let mut eml_caches = Vec::with_capacity(self.network.layers.len());
@@ -3169,6 +3186,9 @@ impl ExecutableNetwork {
                     moe_cache = Some(cache_entry);
                     (Tensor::from_data(layer.output_shape, blended)?, None)
                 }
+                // Rust YOLO-family convention: keep raw logits; loss/decode
+                // apply activations. Backward is exactly this identity's derivative.
+                (LayerKind::Yolo3d(_), LayerParams::None) => (current_input.clone(), None),
                 // C++ `memcpy(l.output, state.input, ...)` before any loss work.
                 (LayerKind::OmdLoss(_), LayerParams::None) => (current_input.clone(), None),
                 // `[contrastive]` never touches its output either: all of the
@@ -3291,6 +3311,12 @@ impl ExecutableNetwork {
                 output
             };
 
+            if matches!(layer.kind, LayerKind::Yolo3d(_)) {
+                yolo_3d_heads.push(Yolo3dHeadOutput {
+                    layer_index: layer.index,
+                    output: output.clone(),
+                });
+            }
             if matches!(
                 layer.kind,
                 LayerKind::Yolo(_) | LayerKind::ObbYolo(_) | LayerKind::GaussianYolo(_)
@@ -3358,6 +3384,7 @@ impl ExecutableNetwork {
             kimi_kda_caches,
             obb_refine_outputs,
             yolo_heads,
+            yolo_3d_heads,
             modern_heads,
         })
     }
@@ -5306,7 +5333,8 @@ impl ExecutableNetwork {
                 | (LayerKind::CenterNet(_), LayerParams::None)
                 | (LayerKind::Regression(_), LayerParams::None)
                 | (LayerKind::JevCe(_), LayerParams::None)
-                | (LayerKind::LayaLoss(_), LayerParams::None) => {
+                | (LayerKind::LayaLoss(_), LayerParams::None)
+                | (LayerKind::Yolo3d(_), LayerParams::None) => {
                     accumulate_previous_gradient(
                         layer.index,
                         &grad,
@@ -13154,6 +13182,7 @@ where
                 kimi_kda_caches,
                 obb_refine_outputs: Vec::new(),
                 yolo_heads,
+                yolo_3d_heads: Vec::new(),
                 modern_heads,
             },
         })
@@ -45701,4 +45730,6 @@ probability=0.5
     mod foveation_film_runtime_tests;
     #[path = "hyperbolic_foveation_runtime_tests.rs"]
     mod hyperbolic_foveation_runtime_tests;
+    #[path = "yolo_3d_runtime_tests.rs"]
+    mod yolo_3d_runtime_tests;
 }

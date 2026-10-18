@@ -162,7 +162,7 @@ pub use runtime::{
     MambaVisionTrainBuffers, RecurrentForwardCache, RecursiveBlockForwardCache,
     RecursiveBlockParams, RecursiveBlockTrainBuffers, RnnParams, RnnTrainBuffers, ShortcutParams,
     ShortcutTrainBuffers, Tensor, TuckerAttentionTrainBuffers, WmhfParams, WmhfTrainBuffers,
-    YoloHeadOutput, compute_learning_rate,
+    Yolo3dHeadOutput, YoloHeadOutput, compute_learning_rate,
 };
 pub use swin::SwinWeights;
 pub use swin_block::SwinForwardCache;

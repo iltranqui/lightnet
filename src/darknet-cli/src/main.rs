@@ -240,6 +240,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             let names = load_names_file(&names_path)?;
             let network = Network::from_path(&cfg)?.with_batch(1);
+            network.ensure_no_cuboid_heads("detect-image")?;
             let (net_w, net_h) = (network.net.width, network.net.height);
             let original = PlanarRgbImage::load(&image_path)?;
             let prepared = if letterbox {
@@ -485,6 +486,7 @@ impl ImageDetections {
 /// `{"error": "<message>"}`. A bad request or image never terminates the server.
 fn run_detect_server(cfg: &str, weights: &str) -> Result<(), Box<dyn std::error::Error>> {
     let network = Network::from_path(cfg)?.with_batch(1);
+    network.ensure_no_cuboid_heads("detect-server")?;
     if network.net.obb {
         return Err("detect-server supports detector mode only (OBB is out of scope)".into());
     }
@@ -505,10 +507,7 @@ fn run_detect_server(cfg: &str, weights: &str) -> Result<(), Box<dyn std::error:
     }
 }
 
-fn serve_detections<F>(
-    network: &Network,
-    mut forward: F,
-) -> Result<(), Box<dyn std::error::Error>>
+fn serve_detections<F>(network: &Network, mut forward: F) -> Result<(), Box<dyn std::error::Error>>
 where
     F: FnMut(&Tensor) -> darknet_core::Result<ForwardResult>,
 {
@@ -527,11 +526,7 @@ where
     Ok(())
 }
 
-fn detect_server_request<F>(
-    network: &Network,
-    line: &str,
-    forward: &mut F,
-) -> serde_json::Value
+fn detect_server_request<F>(network: &Network, line: &str, forward: &mut F) -> serde_json::Value
 where
     F: FnMut(&Tensor) -> darknet_core::Result<ForwardResult>,
 {
@@ -1395,6 +1390,7 @@ fn evaluate_detector_map(
     options: &MapOptions,
 ) -> Result<(usize, usize, Vec<String>, darknet_core::MapReport), Box<dyn std::error::Error>> {
     let network = Network::from_path(cfg)?.with_batch(1);
+    network.ensure_no_cuboid_heads("detector map")?;
     let mut executable = ExecutableNetwork::new(network);
     if let Some(weights) = &options.weights {
         let header = executable.load_weights_file(weights)?;
@@ -1459,6 +1455,7 @@ fn run_detector_train(
         return Err(format!("data path does not exist: {data}").into());
     }
     let network = Network::from_path(cfg)?;
+    network.ensure_no_cuboid_heads("detector train")?;
     if network
         .layers
         .iter()
@@ -4344,6 +4341,53 @@ mod tests {
         assert_eq!(report.detection_counts, vec![1]);
         assert_eq!(report.true_positives, vec![1]);
         std::fs::remove_dir_all(dir).expect("temporary directory cleanup");
+    }
+
+    #[test]
+    fn yolo_3d_cli_rejects_train_map_and_detect_server_before_loading_assets() {
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = Fixture(
+            std::env::temp_dir().join(format!("yolo3d-cli-{}-{nanos}", std::process::id())),
+        );
+        std::fs::create_dir(&dir.0).unwrap();
+        let cfg = dir.0.join("model.cfg");
+        let data = dir.0.join("data.data");
+        std::fs::write(&cfg, "[net]\nwidth=3\nheight=5\nchannels=30\n[yolo_3d]\n").unwrap();
+        // Deliberately malformed: rejection must happen before loading data,
+        // weights, images, creating outputs or starting any training work.
+        std::fs::write(&data, "this is not a data config").unwrap();
+        let cfg = cfg.to_str().unwrap();
+        let data = data.to_str().unwrap();
+        let errors = [
+            run_detector_train(cfg, data, &options(&[]).unwrap())
+                .unwrap_err()
+                .to_string(),
+            super::evaluate_detector_map(
+                cfg,
+                data,
+                &super::MapOptions::parse(Vec::<String>::new().into_iter()).unwrap(),
+            )
+            .unwrap_err()
+            .to_string(),
+            super::run_detect_server(cfg, "nonexistent.weights")
+                .unwrap_err()
+                .to_string(),
+        ];
+        for error in errors {
+            assert!(
+                error.contains("[yolo_3d]") && error.contains("not implemented"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

@@ -748,15 +748,70 @@ mod tests {
     }
 
     #[test]
-    fn yolo_3d_cfg_preparation_does_not_enable_incomplete_runtime() {
+    fn yolo_3d_cfg_mixed_network_requires_shared_classes_and_keypoints() {
+        let build =
+            |text: &str| Network::from_config(ConfigFile::parse_str("mixed.cfg", text).unwrap());
+        let mismatch = build("[net]\nwidth=3\nheight=5\nchannels=7\n[yolo]\nclasses=2\nnum=1\n[convolutional]\nsize=1\nfilters=30\n[yolo_3d]\n").unwrap_err().to_string();
+        assert!(
+            mismatch.contains("share classes") && mismatch.contains("yolo_3d"),
+            "{mismatch}"
+        );
+        let mismatch = build("[net]\nwidth=3\nheight=5\nchannels=30\n[yolo_3d]\n[convolutional]\nsize=1\nfilters=18\n[yolo_3d]\nkeypoints=4\n").unwrap_err().to_string();
+        assert!(mismatch.contains("keypoints=8"), "{mismatch}");
+        // A shape-correct graph must still reject mismatching cuboid classes.
+        assert!(build("[net]\nwidth=3\nheight=5\nchannels=30\n[yolo_3d]\n[convolutional]\nsize=1\nfilters=31\n[yolo_3d]\nclasses=2\n").is_err());
+        assert!(build("[net]\nwidth=3\nheight=5\nchannels=30\n[yolo_3d]\n[convolutional]\nsize=1\nfilters=30\n[yolo_3d]\n").is_ok());
+    }
+
+    #[test]
+    fn yolo_3d_cfg_shape_rebuild_preserves_head_and_route_geometry() {
+        let cfg = ConfigFile::parse_str(
+            "resize.cfg",
+            "[net]\nwidth=3\nheight=5\nchannels=30\nbatch=2\n[yolo_3d]\n[route]\nlayers=0\n",
+        )
+        .unwrap();
+        let net = Network::from_config(cfg).unwrap();
+        let resized = net.with_input_size(7, 9).unwrap().with_batch(3);
+        for layer in &resized.layers {
+            assert_eq!(layer.output_shape, TensorShape::new(7, 9, 30, 3));
+        }
+        assert_eq!(
+            resized.layers[0].kind.axis_pin(),
+            super::super::AxisPin::Open(
+                "Tier 2: cuboid anchor/entry/vertex layout; decode pending"
+            )
+        );
+        assert!(net.with_input_size(usize::MAX, 9).is_err());
+    }
+
+    #[test]
+    fn yolo_3d_cfg_network_aliases_build_weightless_identity_heads() {
         let cfg = ConfigFile::parse_str(
             "unwired.cfg",
             "[net]\nwidth=3\nheight=5\nchannels=30\n[yolo_3d]",
         )
         .unwrap();
+        let network = Network::from_config(cfg).unwrap();
         assert!(matches!(
-            Network::from_config(cfg),
-            Err(Error::UnsupportedLayer { layer_index: 0, name }) if name == "yolo_3d"
+            network.layers[0].kind,
+            super::super::LayerKind::Yolo3d(_)
         ));
+        assert_eq!(network.layers[0].kind.name(), "yolo_3d");
+        assert_eq!(
+            network.layers[0].input_shape,
+            network.layers[0].output_shape
+        );
+        assert!(network.layers[0].weights().is_none());
+        for alias in ["yolo3d", "cuboid", "cuboid_yolo"] {
+            let cfg = ConfigFile::parse_str(
+                "alias.cfg",
+                &format!("[net]\nwidth=3\nheight=5\nchannels=30\n[{alias}]"),
+            )
+            .unwrap();
+            assert!(matches!(
+                Network::from_config(cfg).unwrap().layers[0].kind,
+                super::super::LayerKind::Yolo3d(_)
+            ));
+        }
     }
 }

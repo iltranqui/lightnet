@@ -1679,6 +1679,8 @@ pub enum LayerKind {
     BatchNorm(BatchNormSpec),
     Local(LocalSpec),
     Detection(DetectionSpec),
+    /// Weightless projected cuboid head; CPU runtime stores raw logits.
+    Yolo3d(Yolo3dSpec),
     Unsupported(String),
 }
 
@@ -1698,6 +1700,7 @@ impl LayerKind {
             Self::Shortcut(_) => "shortcut",
             Self::Upsample(_) => "upsample",
             Self::Yolo(_) => "yolo",
+            Self::Yolo3d(_) => "yolo_3d",
             Self::ObbYolo(_) => "obb_yolo",
             Self::ObbRefine(_) => "obb_refine",
             Self::GaussianYolo(_) => "gaussian_yolo",
@@ -1889,6 +1892,7 @@ pub const AXIS_PINS: &[AxisPin] = &[
     AxisPin::RustOnly("batchnorm_layer.cpp exists but has no ELayerType"),
     AxisPin::RustOnly("no C++ layer type"),
     AxisPin::RustOnly("no C++ layer type; identity passthrough"),
+    AxisPin::Open("Tier 2: cuboid anchor/entry/vertex layout; decode pending"),
     AxisPin::RustOnly("not a layer: configs fail in infer_output_shape"),
 ];
 
@@ -1961,7 +1965,8 @@ impl LayerKind {
             Self::BatchNorm(_) => 61,
             Self::Local(_) => 62,
             Self::Detection(_) => 63,
-            Self::Unsupported(_) => 64,
+            Self::Yolo3d(_) => 64,
+            Self::Unsupported(_) => 65,
         };
         AXIS_PINS[index]
     }
@@ -3120,6 +3125,29 @@ impl Network {
             section_index += consumed_body_sections + 1;
         }
 
+        // depth_3d:darknet_cfg.cpp:1603-1687: combined heads share class
+        // counts, and every cuboid head shares the same K/truth record size.
+        if let Some((classes, keypoints)) = layers.iter().find_map(|layer| match &layer.kind {
+            LayerKind::Yolo3d(spec) => Some((spec.classes, spec.keypoints)),
+            _ => None,
+        }) {
+            for layer in &layers {
+                let mismatch = match &layer.kind {
+                    LayerKind::Yolo3d(spec) => {
+                        spec.classes != classes || spec.keypoints != keypoints
+                    }
+                    LayerKind::Yolo(spec) => spec.classes != classes,
+                    _ => false,
+                };
+                if mismatch {
+                    return Err(Error::InvalidConfig(format!(
+                        "[yolo_3d] mixed heads must share classes={classes} and cuboid keypoints={keypoints}; mismatch at layer #{}",
+                        layer.index
+                    )));
+                }
+            }
+        }
+
         // C++ `set_train_only_bn`: the flag of a layer also applies to every
         // layer before it.
         let mut train_only_bn = false;
@@ -3133,6 +3161,21 @@ impl Network {
             net,
             layers,
         })
+    }
+
+    /// Guard legacy detector APIs against silently discarding cuboid heads.
+    /// This scans the graph rather than trusting a caller-supplied head list.
+    pub fn ensure_no_cuboid_heads(&self, operation: &str) -> Result<()> {
+        if self
+            .layers
+            .iter()
+            .any(|layer| matches!(layer.kind, LayerKind::Yolo3d(_)))
+        {
+            return Err(Error::InvalidConfig(format!(
+                "[yolo_3d] {operation} requires cuboid-specific loss/decode/evaluation support, which is not implemented yet; refusing to ignore cuboid heads"
+            )));
+        }
+        Ok(())
     }
 
     pub fn weighted_layers(&self) -> impl Iterator<Item = &Layer> {
@@ -3894,6 +3937,9 @@ fn parse_layer_kind(
 ) -> Result<LayerKind> {
     let name = section.name.as_str();
     Ok(match name {
+        "yolo_3d" | "yolo3d" | "cuboid" | "cuboid_yolo" => {
+            LayerKind::Yolo3d(Yolo3dSpec::from_section(section, current)?)
+        }
         "dpt" | "dpt_head" | "depth_anything_head" | "neck" => {
             LayerKind::DptHead(parse_dpt_head_spec(section, current)?)
         }
@@ -5603,6 +5649,7 @@ fn infer_output_shape(
                 ))
             }
         }
+        LayerKind::Yolo3d(spec) => spec.validate_shape(current),
         LayerKind::Yolo(_)
         | LayerKind::ObbYolo(_)
         | LayerKind::GaussianYolo(_)
@@ -11530,7 +11577,7 @@ output=2
         // `tasks/rust/axis-coverage.md`.
         assert_eq!(
             AXIS_PINS.len(),
-            65,
+            66,
             "one axis decision per LayerKind variant plus Unsupported"
         );
 
@@ -11558,7 +11605,7 @@ output=2
         }
 
         assert_eq!(pinned.len(), 19, "pinned variants");
-        assert_eq!(open, 40, "C++-backed variants without an axis pin");
+        assert_eq!(open, 41, "C++-backed variants without an axis pin");
         assert_eq!(rust_only, 6, "Rust-only variants plus Unsupported");
 
         // The pinned set is the contract: renaming one of these tests must be a

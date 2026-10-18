@@ -90,6 +90,7 @@ pub fn decode_yolo_detections(
     image_height: usize,
     options: DetectionOptions,
 ) -> Result<Vec<Detection>> {
+    network.ensure_no_cuboid_heads("axis-aligned YOLO decoding")?;
     let mut detections = Vec::new();
 
     for head in yolo_heads {
@@ -140,6 +141,7 @@ pub fn decode_network_detections(
     image_height: usize,
     options: DetectionOptions,
 ) -> Result<Vec<Detection>> {
+    network.ensure_no_cuboid_heads("axis-aligned network decoding")?;
     if image_width == 0 || image_height == 0 {
         return Err(Error::InvalidConfig(
             "image dimensions must be positive for network detection decoding".to_owned(),
@@ -428,6 +430,7 @@ fn decode_obb_yolo_detections_internal(
     options: DetectionOptions,
     foveation_forward: Option<&ForwardResult>,
 ) -> Result<Vec<ObbDetection>> {
+    network.ensure_no_cuboid_heads("OBB YOLO decoding")?;
     let mut detections = Vec::new();
     let mut nms_kind = None;
     let mut beta_nms = None;
@@ -515,6 +518,7 @@ pub fn decode_obb_network_detections(
     image_height: usize,
     options: DetectionOptions,
 ) -> Result<Vec<ObbDetection>> {
+    network.ensure_no_cuboid_heads("OBB network decoding")?;
     if image_width == 0 || image_height == 0 || network.net.width == 0 || network.net.height == 0 {
         return Err(Error::InvalidConfig(
             "invalid image or network geometry for OBB decoding".to_owned(),
@@ -1058,6 +1062,7 @@ pub fn decode_modern_detections(
     image_height: usize,
     options: DetectionOptions,
 ) -> Result<Vec<Detection>> {
+    network.ensure_no_cuboid_heads("modern detector decoding")?;
     let mut detections = Vec::new();
     for head in modern_heads {
         let layer = network.layers.get(head.layer_index).ok_or_else(|| {

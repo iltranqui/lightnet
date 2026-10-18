@@ -305,6 +305,7 @@ pub fn compute_obb_yolo_training_deltas(
     forward: &ForwardResult,
     labels: &[Vec<ObbLabel>],
 ) -> Result<ObbYoloTrainingDeltaBatch> {
+    network.ensure_no_cuboid_heads("OBB training deltas")?;
     if !network.net.obb {
         return Err(Error::InvalidConfig(
             "OBB YOLO delta generation requires [net] obb=1".to_owned(),
@@ -818,6 +819,7 @@ pub fn compute_yolo_training_loss_with_state(
     iteration: usize,
     state: Option<&mut YoloTrainingState>,
 ) -> Result<YoloTrainingLoss> {
+    network.ensure_no_cuboid_heads("axis-aligned training loss")?;
     if network.net.obb
         || network
             .layers

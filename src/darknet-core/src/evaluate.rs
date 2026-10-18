@@ -57,6 +57,7 @@ pub struct ValidationDataset {
 }
 impl ValidationDataset {
     pub fn from_data(network: &Network, data: &DataConfig) -> Result<Self> {
+        network.ensure_no_cuboid_heads("axis-aligned validation dataset")?;
         if network.net.obb
             || network
                 .layers
@@ -172,6 +173,7 @@ pub struct ObbValidationDataset {
 
 impl ObbValidationDataset {
     pub fn from_data(network: &Network, data: &DataConfig) -> Result<Self> {
+        network.ensure_no_cuboid_heads("OBB validation dataset")?;
         let classes = obb_validation_classes(network)?;
         if data.classes.is_some_and(|configured| configured != classes) {
             return Err(invalid(
