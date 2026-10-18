@@ -106,7 +106,7 @@ with the command given rather than trusting the number.
 | `Moe` | alias | C++ | fwd | exact | pin | native | device | no |
 | `EmlConvolutional` | alias | C++ | fwd | exact | pin | native | device / CPU (BN) | no |
 | `GraphConv` | alias | C++ | fwd | exact | T4 | none | none | no |
-| `Dcnv4` | alias | C++ | fwd | exact | pin | host | cpu | no |
+| `Dcnv4` | alias | C++ | fwd | exact | pin | native (no BN, <=25 points, supported act) / host otherwise | mixed (native math same gate; parameter gradients/updates host) | no |
 | `DeformConv` | alias | C++ | fwd | exact | T4 | native (dilation 1, no BN) / host otherwise | native (same gate; one host hop for the normalization Jacobian) | no |
 | `DsConv` | alias | C++ | fwd | exact | T4 | none | none | no |
 | `Wmhf` | alias | C++ | fwd | exact | T4 | none | none | no |
@@ -181,15 +181,17 @@ an `UnsupportedLayer`.
 > `oxide_runtime_chain` device test (forward outputs, one SGD step, every
 > parameter block, masked) plus the retained host-fallback test for the BN case.
 > The only host-resident step in the device path is the batch-serial
-> normalization Jacobian. `[dcnv4]`, `[dsconv]` and `[graph_conv]` remain
-> unwired. DCNv4's smaller cache is `{ offsets, raw_output }`; v0.2.009–011
-> provide aggregation primitives; v0.2.012 corrects their old shared K/row-stride
-> bug (active points and padding to eight) and composes native coarse projection,
-> upsample and aggregation forward/backward. Real CPU output/input/parameter
-> gradients agree across 18 cases (3 chain tests); aggregate regression 6 passes.
-> Trait/default migration and runtime/cache/epilogue/update wiring remain open,
-> so the matrix status remains host fallback. See `implemented.md` §49 and
-> `gpu_layers_plan.md`.
+> normalization Jacobian. `[dsconv]` and `[graph_conv]` remain unwired.
+> **DCNv4 is now bounded-native in v0.2.013:** no BN, <=25 active points,
+> supported elementwise activation, no other CPU fallback/host-only deform_conv.
+> Both directions share the global gate. Offsets recompute on device during
+> backward; parameter gradients download to host SGD/Adam buffers. BN/large/
+> unsupported-activation/mixed networks keep host caches. Host runtime 278,
+> host DCNv4 22, focused device runtime 3 (two-step SGD/Adam plus BN/mixed),
+> composition 3 and aggregate 6 passed. Full device runtime-chain timed out at
+> 600 s in ViT after 25 preceding tests reported ok; not a full-suite pass.
+> Layout correction/source-oracle evidence is in §49; runtime audit/limits in
+> `implemented.md` §50. Not native optimizer/resident-weight completion.
 
 ## GPU forward but CPU backward
 
@@ -201,7 +203,7 @@ layer count.
 | Variant | GPU forward | Missing backward piece |
 |---|---|---|
 | `Deconvolutional` | host round trip (`deconv_forward` on host) | device deconv dgrad/wgrad |
-| `Dcnv4` | host round trip | trait/default migration, runtime/cache/epilogue/update wiring (native raw composition exists, v0.2.012) |
+| `Dcnv4` excluded/mixed variants | host round trip (BN, >25 points, unsupported activation or another fallback layer) | native BN/remaining activations/large-kernel paths; eligible math is native since v0.2.013 |
 | `Vit` | host round trip | device attention/MLP backward (flash dQ/dK/dV primitives exist) |
 | `Swin` | host round trip | device windowed-attention backward |
 | `TuckerAttention` | host round trip | device low-rank factor backward |
@@ -234,6 +236,7 @@ devices and head sizes (no native kernel at all), even though standard
 | MoE | device forward/backward, device SGD/Adam for router and experts, DNOPT3/4 moments | BN-expert **SGD** still host-side per `STATUS.md`; router parameter values sync to host each step |
 | EML | device forward, device SGD/Adam (DNOPT5), BN scale/beta gradients | BN backward CPU fallback per v71; documents disagree on later state — verify against `implemented.md` §7 before planning |
 | Recurrent | device projections/BPTT, on-device caches and gradient accumulation without BN | BN forward/cache, rolling-stat update and optimizer remain host-side; some parameter-gradient transfers still cross the host |
+| DCNv4 | bounded native f32 forward/backward, two-step SGD/Adam parity (v0.2.013) | BN/unsupported activations/large variants host; offsets recompute, parameter gradients/updates host; compact/f16 absent |
 | Shortcut (weighted) | device input/source gradients, exact normalization derivatives | per-input/per-slot weight gradient vector crosses to host; optimizer host-side |
 | Connected | device GEMM + activation, BN folded at inference | BN training and unsupported activations fall back |
 | `Crop`, `BatchNorm` | device inference | training explicitly rejected |
@@ -243,7 +246,7 @@ devices and head sizes (no native kernel at all), even though standard
 
 | Optimizer | CPU | GPU |
 |---|---|---|
-| SGD (momentum, decay, per-layer rate, gates) | all parameterized layers | device for conv/MoE/EML; host for connected, deconv, recurrent, weighted shortcut, vit, swin, tucker, mamba, kimi, local, batchnorm; n/a for hard rejects |
+| SGD (momentum, decay, per-layer rate, gates) | all parameterized layers | device for conv/MoE/EML; host for connected, deconv, deform_conv, dcnv4, recurrent, weighted shortcut, vit, swin, tucker, mamba, kimi, local, batchnorm; n/a for hard rejects |
 | Adam/AdamW | all parameterized layers; DNOPT1–5 sidecars | device for conv/MoE/EML (+BN scales); host moments for the same list as SGD; DNOPT1–5 readable |
 | Muon | v0.1.005 hybrid on eligible 2-D matrices, DNOPT6 | **absent** — no kernel, no eligibility set, no state format |
 

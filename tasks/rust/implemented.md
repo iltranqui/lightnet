@@ -75,6 +75,7 @@ file is named inline.
 - [47. Native `[deform_conv]` forward and backward](#47-native-deform_conv-forward-and-backward)
 - [48. DCNv4 native aggregation primitives (offsets given)](#48-dcnv4-native-aggregation-primitives-offsets-given)
 - [49. Native DCNv4 projection and backward composition](#49-native-dcnv4-projection-and-backward-composition)
+- [50. Bounded DCNv4 native runtime forward/backward](#50-bounded-dcnv4-native-runtime-forwardbackward)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1304,6 +1305,72 @@ bias/activation/BN semantics, then prove two-step optimizer/weight parity before
 removing runtime/optimizer rejection. Matrix remains **host fallback**. Stage-1
 missing variants/axis pins, other Stage-2 native layers/GPU Muon, and Stage-3
 sparse MoE remain open; these selected tests do not cover them.
+
+## 50. Bounded DCNv4 native runtime forward/backward
+
+- v0.2.013 (`3f3c2226`): generic `dcnv4_forward_f32` / `dcnv4_backward_f32` trait entries
+  have host defaults (`host_ops/dcnv4_composition.rs`) and direct Oxide native
+  overrides. Runtime dispatch is in `runtime/dcnv4_gpu.rs`, with small guarded
+  arms in `runtime.rs`. Eligible f32 networks now execute projection/upsample/
+  aggregation plus bias/activation and input/parameter gradient math on device.
+- Gate: no DCNv4 BN, <=25 active points, supported elementwise activation, no
+  whole-network CPU fallback or host-only deform_conv variant. Both forward and
+  backward use the same global gate. Excluded/mixed networks still produce and
+  consume the original host caches; f16 and compact rejection are unchanged.
+- Backward recomputes offsets **on device** from that forward state's own input
+  and current unchanged parameters; no mutable last-forward cache or public
+  GpuForwardState shape change. Existing contract requires backward before an
+  optimizer update. Projection weights/biases upload again and an unnecessary
+  aggregation output is recomputed. No residency/performance/speedup claim.
+- Parameter gradients download to existing host train buffers; SGD/Adam remain
+  host-side for DCNv4, including the 0.01 predictor rate, gates/momentum/decay
+  and Adam state layout. Dummy weights remain unchanged. GPU Muon is absent;
+  this is bounded native math integration, **not full native-layer completion**.
+
+Requirement-to-artifact checklist (serial builds/tests; user MemoryHigh=3G
+scopes, -j 2 except the -j 4 CLI check):
+
+| Requirement | Inspected evidence |
+|---|---|
+| Backend-generic surface with real native override | `darknet-cuda/src/lib.rs` declares both methods; `darknet-cuda-oxide/src/lib.rs` forwards directly to v0.2.012 native math. Host composition validates geometry/storage and returns positive batch sums |
+| Host default derivative/storage validation | `systemd-run --user --scope -p MemoryHigh=3G cargo test -p darknet-cuda --lib -j 2 -- --test-threads=1`: **37 passed**, including every input/weight/bias FD through recomputed coarse offsets (B=2) and short-storage rejection |
+| Test-first runtime selection | New `dcnv4_gpu_selects_native_math_without_host_cache` first failed the old unconditional fallback assertion; now passes and verifies the CPU cache is absent |
+| No stale offsets or dropped subdivision gradients | `dcnv4_gpu_multiple_forward_states_and_microbatch_accumulation_match_cpu`: forward A then B, backward A then B on a standalone B=2/groups=2 DCNv4; every accumulated output-bias/offset-weight/offset-bias value agrees with CPU |
+| Error before backend math | `dcnv4_gpu_rejects_parameter_storage_before_backend_math` truncates each of three parameter blocks; each returns InvalidConfig, not a panic or unsafe launch |
+| Preserve whole-network fallback | Host tests `dcnv4_gpu_retains_host_cache_for_bn_and_mixed_fallback` (BN, large kernel, channel normalization, deconvolution neighbor) and `dcnv4_gpu_and_host_only_deform_choose_the_same_whole_network_path` verify cache production and successful backward. Real-device BN fallback and mixed deconvolution cases also pass |
+| Mandatory runtime guard regression | `MEM=3G ./tools/test_host.sh runtime::`: **278 passed** (includes muon_runtime matches). Existing ViT fallback, deform_conv device/host gates, optimizer and parked cuboid guard tests remain green |
+| Focused host/DCNv4 regression | `MEM=3G ./tools/test_host.sh dcnv4`: **22 core passed**, 0 CLI; includes prior CPU math/weights/optimizer-state tests |
+| True device dispatch and two optimizer steps | `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4`: **3 passed**. `dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` uses preceding conv + B=2, groups=2, size=3, dilation=2, d_stride=2, signed/nonunit seeds, softmax/remove_center on+off, swish/leaky. Explicit Fp32 GEMM mode; all layer outputs and both steps' updated values/deltas agree; every conv/DCNv4 trainable block actually moves; dummy weights unchanged |
+| Not a hidden CPU backward | In that device test CPU backward on GPU forward artifacts errors specifically for missing DCNv4 cache, while GPU backward and updates succeed; retained BN/mixed cases instead prove CPU backward can consume the GPU-produced host artifacts |
+| Composition/adjoint regressions after trait migration | `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain`: **3 passed** (18 real CPU cases, device FD, errors/lifetimes); `--test oxide_dcnv4_aggregate`: **6 passed** |
+| Integration check | `systemd-run --user --scope -p MemoryHigh=3G cargo check -p darknet-cli --features oxide -j 4`: passed |
+| Formatting/scope/hygiene | Targeted Rustfmt/new-module formatting and `git diff --check` passed; only named GPU/host-default/runtime/test/docs files committed. No parked YOLO-3D, Cargo.lock or .gitignore edits included |
+
+**Full runtime-chain suite remains unverified:** attempted serial
+`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain` timed out at 600 seconds
+while running `vit_flash_attention_runtime_uses_native_forward_and_backward_and_matches_cpu`.
+The 25 preceding tests reported `ok` (including the three DCNv4 cases and the
+existing deform_conv device/host cases), but there is no final suite result.
+No test/build processes survived the timeout. The focused DCNv4 run above then
+completed normally. Do not claim a full runtime-chain/Oxide green baseline or
+infer the cause of the timeout. Full host/corpus were not run; known corpus
+residuals remain unresolved.
+
+Resolved build-only issues: helper needed the existing B::Error Display bound,
+test helper needed its parent-qualified path, and Fp32 is GemmMode (not ConvMode).
+No persistent model/data/log artifact was created intentionally; compiler IR/PTX
+and unrelated build trees are retained because the build workflow/earlier docs
+still reference them. Unit step tests only, no dataset training. **Hand-derived
+from source, no compiled-C++ golden.**
+
+Completion audit boundary: handbook deliverables are full CPU/source variants
+plus axis pins/optimizers, all native GPU layer paths plus GPU Muon, then sparse
+MoE with performance evidence, with per-version docs and C++-golden boundaries.
+This slice only closes bounded DCNv4 f32 runtime math selection. BN, unsupported
+activations/large kernels, compact/f16, native parameter gradients/updates/
+residency and GPU Muon remain open, as do all documented CPU/other-GPU/MoE gaps.
+Next independent DCNv4 slice: native rolling-stat BN affine math and its exact
+adjoint (preserve the CPU DCNv4 rolling-stat semantics, not conv batch stats).
 
 ## Not implemented / open (pointer)
 

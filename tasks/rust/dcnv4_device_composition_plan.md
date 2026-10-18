@@ -42,9 +42,10 @@ complete GPU layer. Hand-derived from source, no compiled-C++ golden.
   actual-device finite differences for all three operand groups.
 - [x] Device chain 3, aggregate 6, host-cuda 36, host dcnv4 17, Oxide runtime
   fallback 1 passed; targeted formatting/diff checks and §49 audit recorded.
-- [ ] Next slice: trait/default migration, coordinated runtime cache/forward/
-  backward selection, epilogue, and two-step optimizer/weight parity. Keep
-  fallback until those tests pass.
+- [x] Bounded runtime integration (v0.2.013), trait/default migration, both
+  dispatch directions, bias/elementwise epilogue and two-step SGD/Adam parity.
+  Evidence/limits: `implemented.md` §50. Remaining variants/native updates are
+  in `dcnv4_runtime_plan.md`; no full native-layer completion.
 
 ## Findings
 
@@ -58,7 +59,8 @@ complete GPU layer. Hand-derived from source, no compiled-C++ golden.
   explicit extents initially; no speed claim without measurements.
 - Offsets are NHWC, input/output NCHW. Weight order `[P,C,ky,kx]`. Upsample
   samples at `(y/d_stride,x/d_stride)` with border replication, not align-corners.
-- Full layer epilogue/BN/activation and optimizer wiring remain later gates.
+- Bounded no-BN runtime bias/elementwise epilogue is wired in v0.2.013;
+  BN/unsupported variants, compact/f16 and native updates/residency remain open.
 
 ## Verification and stop condition
 
