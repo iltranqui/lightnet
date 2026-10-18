@@ -909,6 +909,7 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
   - `darknet-cli detect-server`: one request per stdin line, normalized boxes, error objects that keep the server alive, CPU and feature-gated oxide backends.
   - `darknet-gui`: launcher with persisted recents, new-project dialog, image cache, zoom/pan canvas, six view modes, filters, class editor with dry run, prediction overlay.
 - Verification: `cargo test -p darknet-gui-project` 36, `-p darknet-gui-engine` 4, `-p darknet-cli` 28; offline build of the three GUI crates is warning-free; `cargo metadata --locked` reports 33 members.
+- v0.1.020 (`2640b902`): the overlay's model loader resolves `DARKNET_RS_BIN` before the current executable, so `cargo run -p darknet-gui` can find `darknet-rs`.
 - Evidence boundary: DarkMark compatibility is derived from the `G`/`D` tables, not verified against a running DarkMark (`T1.5` still open). Not wired: add/delete classes from the dialog, delete-image/undo-delete, heatmaps, jump, screenshots, train runner.
 
 ## Not implemented / open (pointer)
