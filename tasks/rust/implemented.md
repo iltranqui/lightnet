@@ -64,6 +64,7 @@ file is named inline.
 - [29. Stage-1 axis/layout audit of already-ported layers](#29-stage-1-axislayout-audit-of-already-ported-layers)
 - [30. DPT-head Stage-1 CPU reference](#30-dpt-head-stage-1-cpu-reference)
 - [38. YOLO-3D configuration preparation (not a layer port)](#38-yolo-3d-configuration-preparation-not-a-layer-port)
+- [39. Cuboid labels and deterministic truth helpers](#39-cuboid-labels-and-deterministic-truth-helpers)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -930,6 +931,30 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 - Deliberate strictness: finite/range checks, unique masks, exact `2*num` anchors and three edge weights, and bounded source-int storage reject inputs C++ may ignore or default. Zero loss normalizers still disable terms. `map_file`, counters and loader/NMS options are retained metadata only; class-map loading and class-multiplier conversion await network integration.
 - **Still open:** `LayerKind`/network parse and shape dispatch, mixed-head/depth-reference validation, axis-pin registration, labels/truth encoding, forward/backward, loss/decode/evaluator, checkpoint/optimizer proof and CLI/GPU guards. Network construction still rejects this layer (pinned by `preparation_does_not_enable_incomplete_runtime`). This is only the helper portion of plan Step 1; that step and the layer DoD remain incomplete. Depth/metric nondefault config is explicitly rejected pending the second CPU increment.
 - Evidence boundary: hand-derived from source, no compiled-C++ golden. GPU status: none. DSConv multi-template, remaining CPU/axis work, all Stage-2 native GPU/GPU Muon and Stage-3 sparse MoE requirements remain open. The known full-host/corpus baseline remains non-green/unverified.
+
+## 39. Cuboid labels and deterministic truth helpers
+
+- v0.1.025 (`8f6178ed`): added `cuboid_labels.rs` and `cuboid_labels/tests.rs`, with public `lib.rs` re-exports. The pure and mixed parsers/loaders preserve source row precedence, clamped coordinates, unknown/absent visibility and source track IDs. Truth helpers encode the 11-float prefix, crop/flip intrinsics, K triplets, padding and mixed ownership, with explicit original/network image sizes. This advances plan Step 2 independently; Step 1 network integration remains open and the existing unsupported-layer regression remains green.
+- Source checked directly: `depth_3d` at `9c9e0b4b`, `data.cpp:500-1250,1335-1505` and `utils.cpp:1292-1303` (64-bit Linux DJB2 track hash). Pure files use a zero-based object ordinal; mixed files use one-based ordinals. `MixedLabel::Box2d` includes `track_id` alongside the existing `YoloLabel`, rather than discarding source metadata as the plan sketch's bare payload would. `Yolo3dImageMeta` additionally takes network W/H for the source one-pixel hull filter.
+- Verification: initial test-first `MEM=3G ./tools/test_host.sh yolo_3d_label` failed to compile with missing-type/function E0422/E0425/E0433. Final `MEM=3G ./tools/test_host.sh yolo_3d` passed **31 core tests** (19 new label/truth + 12 config); `MEM=3G ./tools/test_host.sh label` passed **43 core tests**. Both used `MemoryHigh=3G` systemd scopes, `-j 2`; CLI/integration targets compiled but matched zero tests. Targeted edition-2024 Rustfmt checks and `git diff --check` passed. No training, Oxide, corpus or full-host run.
+
+Scoped prompt-to-artifact audit (test names below are in `cuboid_labels/tests.rs` and start with `yolo_3d_`):
+
+| Requirement | Concrete evidence |
+|---|---|
+| Pure/mixed grammar, class conversion and 2D ambiguity | `label_row_parses_source_layout`, `mixed_label_ambiguous_row_precedence_matches_source` |
+| Hull visibility, coordinate clamps, finite/range errors | `label_unknown_visibility_is_not_absent`, `label_clamps_coordinates_but_rejects_nonfinite_and_malformed_rows` |
+| File I/O/errors and source path/ordinal tracks | `label_file_loaders_preserve_grammar_and_report_io_errors`, `label_source_track_hash_and_pure_mixed_counter_offsets` |
+| Prefix, vertex offsets, padding, independent batches | `truth_prefix_offsets_padding_and_independent_batches`, `truth_each_image_uses_its_own_crop_intrinsics_and_flip` |
+| Focal/crop math and flip without corner permutation | `truth_intrinsics_hand_computed_and_crop`, `truth_flip_mirrors_px_and_negates_geo_without_reordering_vertices` |
+| Clip all corners, transform hull separately | `truth_clipped_absent_corner_zeroes_intrinsics_but_keeps_points`, `truth_cropped_hull_does_not_rebuild_from_clamped_vertices` |
+| Mosaic disables projected fields and mixed flags | `truth_mosaic_drops_fields_after_class`, `truth_mixed_mosaic_also_drops_ownership_like_source` |
+| Mixed ownership and explicit pure-mode 2D rejection | `truth_mixed_ownership_routes_rows_to_heads` (encoding only, not loss routing) |
+| Deterministic cap-before-filter, missing focal, 2D sentinel | `truth_deterministic_cap_before_tiny_filter_and_missing_focal`, `truth_two_dimensional_zero_center_is_source_sentinel` |
+| Public-input/storage overflow and bounds errors | `truth_invalid_public_inputs_are_errors_not_panics`, `truth_inconsistent_public_storage_is_an_error` |
+
+- Boundaries: deterministic caller order replaces source random shuffle; cap is applied before tiny-hull filtering without refilling. Nonfinite/malformed tokens, invalid public values and non-UTF-8 file identities error explicitly. Mosaic callers provide already positioned geometry; no tile sampler, clipping-policy implementation or image augmentation loader is added. Crucially, C++ `blend_truth_mosaic` copies only entries 0–4 and drops the trailing mixed flags too, so mixed mosaic records carry flag zero and are not assigned to either head; this is not a claim of useful mixed-mosaic training.
+- **Not complete:** no network enum/dispatch, mixed-head build validation, output-axis/decode pin, runtime/backward/loss integration, evaluator, optimizer/checkpoint proof, CLI integration or depth/metric consumption. This suite verifies label/truth math, not end-to-end training or any compiled-C++ comparison. Hand-derived from source, no compiled-C++ golden; GPU status none. DSConv variants, remaining CPU/axis requirements, Stage-2 native GPU/GPU Muon and Stage-3 sparse MoE remain open. No overall parity or green full-host claim.
 
 ## Not implemented / open (pointer)
 
