@@ -52,6 +52,10 @@ pub struct Project {
     pub images: Vec<ImageEntry>,
     pub classes: Vec<String>,
     pub data_file: Option<PathBuf>,
+    /// The project's detector config and weights, when they follow `G1`'s
+    /// `<name>.cfg` / `<name>_*.weights` convention.
+    pub cfg_file: Option<PathBuf>,
+    pub weights_file: Option<PathBuf>,
     /// Real-mark counts per image; `completely_empty` counts as one (`G13`).
     pub mark_counts: Vec<usize>,
 }
@@ -102,12 +106,16 @@ impl Project {
             mark_counts.push(mark_count(entry, classes.len())?);
         }
         validate_modes(&images)?;
+        let cfg_file = discover_cfg(&root, &name);
+        let weights_file = discover_weights(&root, &name);
         Ok(Self {
             root,
             name,
             images,
             classes,
             data_file,
+            cfg_file,
+            weights_file,
             mark_counts,
         })
     }
@@ -275,6 +283,32 @@ fn load_data(root: &Path, name: &str) -> Option<PathBuf> {
     } else {
         first_with_extension(root, "data")
     }
+}
+
+/// `G1`: the project config is `<name>.cfg`, else the first `*.cfg`.
+fn discover_cfg(root: &Path, name: &str) -> Option<PathBuf> {
+    let preferred = root.join(format!("{name}.cfg"));
+    if preferred.is_file() {
+        Some(preferred)
+    } else {
+        first_with_extension(root, "cfg")
+    }
+}
+
+/// DarkMark writes `<name>_best.weights` / `<name>_final.weights`; accept
+/// `<name>.weights` and any other `*.weights` too.
+fn discover_weights(root: &Path, name: &str) -> Option<PathBuf> {
+    for candidate in [
+        format!("{name}_best.weights"),
+        format!("{name}_final.weights"),
+        format!("{name}.weights"),
+    ] {
+        let path = root.join(candidate);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    first_with_extension(root, "weights")
 }
 
 fn first_with_extension(dir: &Path, extension: &str) -> Option<PathBuf> {

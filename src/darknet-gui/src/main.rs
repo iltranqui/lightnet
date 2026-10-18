@@ -177,7 +177,15 @@ struct App {
     cfg_path: String,
     weights_path: String,
     worker: Option<DetectWorker>,
-    predictions_enabled: bool,
+    /// 0 = off, 1 = on, 2 = auto (`p` cycles in that order, like DarkMark).
+    prediction_mode: u8,
+    /// 0 = off, 1 = on, 2 = auto (`l`).
+    label_mode: u8,
+    bold: bool,
+    shade: bool,
+    snapping: bool,
+    random_order: Option<Vec<usize>>,
+    show_marks: bool,
     threshold: f32,
     drag_start: Option<Pos2>,
     drag_now: Option<Pos2>,
@@ -215,7 +223,13 @@ impl App {
             cfg_path: String::new(),
             weights_path: String::new(),
             worker: None,
-            predictions_enabled: true,
+            prediction_mode: 2,
+            label_mode: 1,
+            bold: false,
+            shade: false,
+            snapping: true,
+            random_order: None,
+            show_marks: true,
             threshold: 0.25,
             drag_start: None,
             drag_now: None,
@@ -237,6 +251,12 @@ impl App {
         match Project::load(root) {
             Ok(project) => {
                 self.settings.remember(&project.root);
+                if let Some(cfg) = &project.cfg_file {
+                    self.cfg_path = cfg.to_string_lossy().into_owned();
+                }
+                if let Some(weights) = &project.weights_file {
+                    self.weights_path = weights.to_string_lossy().into_owned();
+                }
                 self.project = Some(project);
                 self.cache.clear();
                 self.editor = None;
@@ -297,7 +317,12 @@ impl App {
         if !self.filter_text.trim().is_empty() {
             filter.include = regex::Regex::new(&format!("(?i){}", regex::escape(&self.filter_text))).ok();
         }
-        filter.apply(project, self.sort)
+        let mut indices = filter.apply(project, self.sort);
+        if let Some(order) = &self.random_order {
+            let rank = |index: usize| order.iter().position(|value| *value == index).unwrap_or(usize::MAX);
+            indices.sort_by_key(|index| rank(*index));
+        }
+        indices
     }
 
     fn step_image(&mut self, delta: isize) {
@@ -376,10 +401,12 @@ impl App {
             }
             Action::CopyPrev => self.copy_neighbour(nav::Dir::Previous),
             Action::CopyNext => self.copy_neighbour(nav::Dir::Next),
-            Action::ToggleMarks => {}
-            Action::TogglePredictions => {
-                self.predictions_enabled = !self.predictions_enabled;
-            }
+            Action::ToggleMarks => self.show_marks = !self.show_marks,
+            Action::TogglePredictions => self.prediction_mode = (self.prediction_mode + 1) % 3,
+            Action::ToggleLabels => self.label_mode = (self.label_mode + 1) % 3,
+            Action::ToggleBold => self.bold = !self.bold,
+            Action::ToggleShade => self.shade = !self.shade,
+            Action::ToggleSnapping => self.snapping = !self.snapping,
             Action::AcceptAll => {
                 if editor.accept_all() {
                     self.dirty = true;
@@ -390,16 +417,12 @@ impl App {
                     self.dirty = true;
                 }
             }
-            Action::DeletePredictions => {
-                editor.delete_predictions();
+            Action::Scale(delta) => {
+                editor.scale(delta);
                 self.dirty = true;
             }
             Action::Nudge(dx, dy) => {
                 editor.nudge(dx, dy);
-                self.dirty = true;
-            }
-            Action::Scale(factor) => {
-                editor.scale(factor);
                 self.dirty = true;
             }
             Action::Undo => {
@@ -414,42 +437,91 @@ impl App {
             }
             Action::Save => self.save(),
             Action::ClassMenu => self.show_classes = true,
+            Action::SnapAll => {
+                let Some(image) = self.cache.entries.get(&self.index).map(|entry| entry.gray.clone()) else {
+                    return;
+                };
+                let mut annotation = editor.to_annotation();
+                let moved = actions::snap(
+                    &mut annotation,
+                    &image,
+                    6,
+                    actions::SnapScope::All,
+                );
+                if moved > 0 {
+                    editor.marks = annotation.marks;
+                    self.dirty = true;
+                }
+                self.ok(format!("snapped {moved} edge(s)"));
+            }
             Action::ClipboardCopy => {
                 let text = actions::clipboard_copy(&editor.to_annotation());
-                if let Ok(mut clipboard) = arboard_copy(&text) {
-                    let _ = &mut clipboard;
-                    self.ok("copied marks");
-                } else {
-                    self.status = text;
-                }
+                self.status = text;
+                self.error = false;
             }
             Action::ClipboardPaste => {
-                if let Ok(text) = arboard_paste() {
-                    let classes = editor.class_names.clone();
-                    match actions::clipboard_paste(&text, editor.width, editor.height, &classes) {
-                        Ok(marks) => {
-                            for mark in marks {
-                                editor.marks.push(mark);
-                            }
-                            self.dirty = true;
+                let classes = editor.class_names.clone();
+                let text = self.status.clone();
+                match actions::clipboard_paste(&text, editor.width, editor.height, &classes) {
+                    Ok(marks) => {
+                        for mark in marks {
+                            editor.marks.push(mark);
                         }
-                        Err(error) => self.fail(error),
+                        self.dirty = true;
                     }
+                    Err(error) => self.fail(format!("paste: {error}")),
                 }
             }
             Action::ZoomIn => self.zoom = (self.zoom * 1.1).min(16.0),
             Action::ZoomOut => self.zoom = (self.zoom / 1.1).max(0.1),
-            Action::ZoomAuto => {
+            Action::ZoomToggle => {
+                if (self.zoom - 1.0).abs() < f32::EPSILON {
+                    self.zoom = 2.0;
+                } else {
+                    self.zoom = 1.0;
+                    self.pan = Vec2::ZERO;
+                }
+            }
+            Action::SortRandom => {
+                let visible = self.visible_indices();
+                let mut order = visible.clone();
+                let mut seed = 0x2545_f491_4f6c_dd1du64;
+                for index in (1..order.len()).rev() {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    order.swap(index, (seed % (index as u64 + 1)) as usize);
+                }
+                self.random_order = Some(order);
+            }
+            Action::SortAlphabetical => {
+                self.random_order = None;
+                self.sort = SortKey::Name;
+            }
+            Action::Cancel => {
                 self.zoom = 1.0;
                 self.pan = Vec2::ZERO;
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.selected = None;
+                }
             }
-            Action::SortNext => {
-                self.sort = if self.sort == SortKey::Name { SortKey::MarkCount } else { SortKey::Name };
-            }
-            Action::Heatmap => {}
-            Action::Jump => {}
             Action::Help => self.show_help = true,
-            Action::DeleteImage | Action::UndoDelete => {}
+            Action::DeleteImage
+            | Action::UndoDeleteImage
+            | Action::MassDelete
+            | Action::Homography
+            | Action::Merge
+            | Action::HeatmapCycle
+            | Action::ToggleHeatmap
+            | Action::Jump
+            | Action::Screenshot(_)
+            | Action::WindowScreenshot
+            | Action::ToggleTiling
+            | Action::TileEdge(_)
+            | Action::TileRect(_) => {
+                self.status = format!("{action:?} is mapped but not implemented in this build");
+                self.error = false;
+            }
         }
     }
 
@@ -486,7 +558,7 @@ impl App {
         let (Some(project), Some(editor)) = (&self.project, self.editor.as_mut()) else {
             return;
         };
-        if !self.predictions_enabled {
+        if self.prediction_mode == 0 {
             return;
         }
         let Some(worker) = self.worker.as_mut() else {
@@ -673,7 +745,15 @@ impl App {
 
         if let Some(editor) = &self.editor {
             for mark in &editor.marks {
-                if mark.is_prediction && !self.predictions_enabled {
+                let predictions_visible = match self.prediction_mode {
+                    1 => true,
+                    2 => !editor.has_real_marks(),
+                    _ => false,
+                };
+                if mark.is_prediction && !predictions_visible {
+                    continue;
+                }
+                if !mark.is_prediction && !self.show_marks {
                     continue;
                 }
                 let color = if mark.is_prediction {
@@ -685,12 +765,25 @@ impl App {
                     .selected
                     .and_then(|index| editor.marks.get(index))
                     .is_some_and(|selected| std::ptr::eq(selected, mark));
-                let stroke = Stroke::new(if selected { 3.0_f32 } else { 2.0_f32 }, color);
+                let width = if selected || self.bold { 3.0_f32 } else { 2.0_f32 };
+                let stroke = Stroke::new(width, color);
                 let corners: Vec<Pos2> = mark.points.iter().map(|p| to_screen(*p)).collect();
+                if self.shade {
+                    painter.rect_filled(
+                        Rect::from_two_pos(corners[0], corners[2]),
+                        0.0,
+                        Color32::from_rgba_unmultiplied(0, 0, 0, 96),
+                    );
+                }
                 for index in 0..4 {
                     painter.line_segment([corners[index], corners[(index + 1) % 4]], stroke);
                 }
-                if self.settings.show_labels || mark.is_prediction {
+                let labels_visible = match self.label_mode {
+                    1 => true,
+                    2 => selected || mark.is_prediction,
+                    _ => false,
+                };
+                if labels_visible {
                     let text = if mark.is_prediction {
                         format!("{} {:.2}", editor.class_name(mark.class_id), mark.confidence)
                     } else {
@@ -858,15 +951,6 @@ fn class_color(class_id: usize) -> Color32 {
         Color32::from_rgb(0x8E, 0x9A, 0xE8),
     ];
     PALETTE[class_id % PALETTE.len()]
-}
-
-fn arboard_copy(text: &str) -> Result<(), ()> {
-    let _ = text;
-    Err(())
-}
-
-fn arboard_paste() -> Result<String, ()> {
-    Err(())
 }
 
 impl eframe::App for App {
@@ -1134,7 +1218,14 @@ impl App {
         } else {
             egui::TopBottomPanel::bottom("model").show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.predictions_enabled, "predictions");
+                    let label = match self.prediction_mode {
+                        1 => "predictions: on",
+                        2 => "predictions: auto",
+                        _ => "predictions: off",
+                    };
+                    if ui.button(label).clicked() {
+                        self.run_action(Action::TogglePredictions);
+                    }
                     ui.label(format!("threshold {:.2}", self.threshold));
                     if ui.button("Detect").clicked() {
                         self.detect();

@@ -59,6 +59,8 @@ pub fn create_project(dir: &Path, class_names: &[String]) -> Result<Project, Str
         images: Vec::new(),
         classes: class_names.to_vec(),
         data_file: Some(data_path),
+        cfg_file: None,
+        weights_file: None,
         mark_counts: Vec::new(),
     })
 }

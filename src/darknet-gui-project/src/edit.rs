@@ -282,18 +282,35 @@ impl Editor {
         (mark.width() >= MIN_SIZE && mark.height() >= MIN_SIZE).then_some(mark)
     }
 
-    /// Tab / Shift+Tab cycle all marks including predictions (`G12`).
+    /// Tab / Shift+Tab cycle visible marks, wrapping (`G12`, `:1041-1093`).
+    /// Selecting also records the class and size for the next double-click.
     pub fn cycle(&mut self, backward: bool) {
-        if self.marks.is_empty() {
+        let len = self.marks.len();
+        if len == 0 {
             self.selected = None;
             return;
         }
-        self.selected = match (self.selected, backward) {
-            (None, false) => Some(0),
-            (None, true) => Some(self.marks.len() - 1),
-            (Some(index), false) => Some((index + 1) % self.marks.len()),
-            (Some(index), true) => Some((index + self.marks.len() - 1) % self.marks.len()),
+        let visible = |index: usize| {
+            let mark = &self.marks[index];
+            !mark.is_prediction || mark.confidence >= self.threshold
         };
+        let mut index = match (self.selected, backward) {
+            (None, false) => 0,
+            (None, true) => len - 1,
+            (Some(current), false) => (current + 1) % len,
+            (Some(current), true) => (current + len - 1) % len,
+        };
+        for _ in 0..len {
+            if visible(index) {
+                self.selected = Some(index);
+                let mark = &self.marks[index];
+                self.most_recent_class = mark.class_id;
+                self.most_recent_size = (mark.width(), mark.height());
+                return;
+            }
+            index = if backward { (index + len - 1) % len } else { (index + 1) % len };
+        }
+        self.selected = None;
     }
 
     /// Digit class selection, additive with Ctrl (+10) and Alt (+20) (`G11`,
@@ -368,22 +385,25 @@ impl Editor {
         }
     }
 
-    /// `,`/`.`: scale every real mark by `factor` around its centre; shrink is
-    /// refused below `MIN_SIZE` (`G16`).
-    pub fn scale(&mut self, factor: f32) {
+    /// `,`/`.`: add `delta` (normalized, signed) to every real mark's width and
+    /// height around its centre. DarkMark calls `scale_all_marks(+-0.01)`, so
+    /// the delta is a fraction of the image, not of the box. Shrinking below
+    /// `MIN_SIZE` is refused (`G16`).
+    pub fn scale(&mut self, delta: f32) {
         self.push_undo();
+        let (dx, dy) = (delta * self.width as f32, delta * self.height as f32);
         for mark in &mut self.marks {
             if mark.is_prediction {
                 continue;
             }
-            let center = mark.center();
-            let (width, height) = (mark.width() * factor, mark.height() * factor);
+            let (width, height) = (mark.width() + dx, mark.height() + dy);
             if width < MIN_SIZE || height < MIN_SIZE {
                 continue;
             }
+            let center = mark.center();
             for point in &mut mark.points {
-                point.x = center.x + (point.x - center.x) * factor;
-                point.y = center.y + (point.y - center.y) * factor;
+                point.x = center.x + (point.x - center.x).signum() * width * 0.5;
+                point.y = center.y + (point.y - center.y).signum() * height * 0.5;
             }
         }
     }
@@ -408,7 +428,7 @@ impl Editor {
         true
     }
 
-    /// `A`: accept the selected prediction, or all when nothing is selected (`G14`).
+    /// `A`: accept the selected prediction only; a no-op otherwise (`:1586`).
     pub fn accept_selected(&mut self) -> bool {
         match self.selected {
             Some(index) if index < self.marks.len() && self.marks[index].is_prediction => {
@@ -419,8 +439,7 @@ impl Editor {
                 mark.name = name;
                 true
             }
-            Some(_) => false,
-            None => self.accept_all(),
+            _ => false,
         }
     }
 
@@ -576,6 +595,28 @@ mod tests {
         assert_eq!(editor.threshold, 0.05);
         editor.bump_threshold(10.0);
         assert_eq!(editor.threshold, 0.95);
+    }
+
+    #[test]
+    fn scale_adds_a_normalized_delta_like_darkmark() {
+        let mut editor = editor();
+        editor.marks = vec![mark(0, 40.0, 40.0, 60.0, 60.0)];
+        editor.scale(0.01);
+        let mark = &editor.marks[0];
+        assert!((mark.width() - 21.0).abs() < 1e-4, "width {}", mark.width());
+        assert!((mark.height() - 21.0).abs() < 1e-4);
+        assert!((mark.center().x - 50.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn accept_selected_requires_a_selected_prediction() {
+        let mut editor = editor();
+        let mut prediction = mark(0, 0.0, 0.0, 10.0, 10.0);
+        prediction.is_prediction = true;
+        editor.marks = vec![prediction];
+        assert!(!editor.accept_selected(), "no selection is a no-op");
+        editor.selected = Some(0);
+        assert!(editor.accept_selected());
     }
 
     #[test]
