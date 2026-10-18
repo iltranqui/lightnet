@@ -46,6 +46,12 @@ FP8/FP4, layer-port Phases 0 / 1b / 2A / 2B-CPU and the Phase 3A shared
 primitives, LegoGears_v2 inference parity, the training loop + data pipeline,
 and housekeeping — each with its evidence.
 
+**Unit baseline after v0.2.008 (`38cdb046`)**: `cargo test -p darknet-core --lib
+-j 2` **950 passed**, `cargo test -p darknet-cli -j 2` **29 passed**. That is the
+unit baseline only; the `cfg_corpus` integration suite is still not re-run and
+its four known residuals (two ~7 GiB SIGKILL/OOM cases, two 300 s CPU-timeout
+cases) remain unresolved. Do not read the 950/29 result as a green full suite.
+
 **v0.2.007 (`15fc3f8c`)**: native `[deform_conv]` forward and backward on the
 device, gated on `dilation == 1` without batch norm with the host path retained
 for the excluded variants. Evidence: host 33, `oxide_deform_gather` 5,
