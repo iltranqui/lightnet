@@ -3391,6 +3391,9 @@ fn print_forward_backward_summary(
                         .as_ref()
                         .is_some_and(|updates| updates.iter().any(|value| *value != 0.0))
             }
+            darknet_core::LayerTrainBuffers::DptHead(dpt) => {
+                dpt.weight_updates.iter().any(|value| *value != 0.0)
+            }
             darknet_core::LayerTrainBuffers::HyperbolicFoveation(hf) => {
                 hf.hf_param_updates.iter().any(|value| *value != 0.0)
                     || hf.pred_w1_updates.iter().any(|value| *value != 0.0)

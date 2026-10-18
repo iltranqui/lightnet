@@ -358,6 +358,19 @@ pub fn save_weights(
                     write_f32_slice(&mut file, weights.as_slice())?;
                 }
             }
+            (LayerKind::DptHead(spec), LayerParams::DptHead(weights)) => {
+                let expected =
+                    crate::dpt_head::dpt_head_weight_layout(spec.geometry(layer.input_shape))?
+                        .total;
+                if weights.values.len() != expected {
+                    return Err(Error::Weights(format!(
+                        "layer #{} ([dpt_head]) has {} parameters, expected {expected}",
+                        layer.index,
+                        weights.values.len()
+                    )));
+                }
+                write_f32_slice(&mut file, &weights.values)?;
+            }
             // C++ `dontsave`: the frozen LAYA layers load from an external
             // shared blob, so nothing is written for them in this stream.
             (LayerKind::LayaEncoder(_), LayerParams::LayaEncoder(_)) => {}
@@ -1564,7 +1577,8 @@ num_dwconv=2
                     | LayerParams::RecursiveBlock(_)
                     | LayerParams::HyperbolicFoveation(_)
                     | LayerParams::FoveationFilm(_)
-                    | LayerParams::DepthAnything(_) => {}
+                    | LayerParams::DepthAnything(_)
+                    | LayerParams::DptHead(_) => {}
                 }
             }
             let path = std::env::temp_dir().join(format!("darknet-{name}-roundtrip.weights"));

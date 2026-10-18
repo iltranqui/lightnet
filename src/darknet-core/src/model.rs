@@ -793,6 +793,34 @@ impl DepthAnythingSpec {
     }
 }
 
+/// Four-tap DPT reassemble, feature-fusion neck, and relative-depth head.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DptHeadSpec {
+    pub embed_dim: usize,
+    pub fusion: usize,
+    pub head_hidden: usize,
+    pub patch_size: usize,
+    pub taps: usize,
+    pub neck: [usize; 4],
+    pub reassemble: [usize; 4],
+}
+
+impl DptHeadSpec {
+    pub(crate) fn geometry(&self, input: TensorShape) -> crate::dpt_head::DptHeadGeometry {
+        crate::dpt_head::DptHeadGeometry {
+            batch: input.batch,
+            height: input.height,
+            width: input.width,
+            embed_dim: self.embed_dim,
+            fusion: self.fusion,
+            head_hidden: self.head_hidden,
+            patch_size: self.patch_size,
+            neck: self.neck,
+            reassemble: self.reassemble,
+        }
+    }
+}
+
 /// Token ordering used by the historical VC attention path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VitVcPermutation {
@@ -1611,6 +1639,8 @@ pub enum LayerKind {
     LayaHead(LayaHeadSpec),
     /// `[depth_anything]`: frozen DINOv2 ViT-S/14 feature encoder.
     DepthAnything(DepthAnythingSpec),
+    /// `[dpt]` / `[dpt_head]`: four-tap DPT feature-fusion neck and depth head.
+    DptHead(DptHeadSpec),
     /// `[vit]`: global vision transformer with learned patch projection.
     Vit(VitSpec),
     /// `[swin]`, `[swin_block]`, `[transformer]`, `[transformer_block]`.
@@ -1694,6 +1724,7 @@ impl LayerKind {
             Self::LayaEncoder(_) => "laya_encoder",
             Self::LayaHead(_) => "laya_head",
             Self::DepthAnything(_) => "depth_anything",
+            Self::DptHead(_) => "dpt_head",
             Self::Vit(_) => "vit",
             Self::Swin(_) => "swin",
             Self::TuckerAttention(_) => "tucker_attention",
@@ -1892,6 +1923,22 @@ impl Layer {
                     })
                     .collect();
                 Some(LayerWeights { entries })
+            }
+            LayerKind::DptHead(spec) => {
+                let geometry = spec.geometry(self.input_shape);
+                let layout = crate::dpt_head::dpt_head_weight_layout(geometry)
+                    .expect("validated dpt_head weight geometry");
+                Some(LayerWeights {
+                    entries: layout
+                        .slots
+                        .iter()
+                        .enumerate()
+                        .map(|(slot, range)| WeightsEntry {
+                            array: WeightsArray::Named(crate::dpt_head::dpt_weight_slot_name(slot)),
+                            len: range.len,
+                        })
+                        .collect(),
+                })
             }
             LayerKind::HyperbolicFoveation(spec) => {
                 let mut entries = vec![WeightsEntry {
@@ -3329,6 +3376,127 @@ fn validate_recursive_body_keys(section: &RawSection) -> Result<()> {
     Ok(())
 }
 
+fn parse_dpt_head_spec(section: &RawSection, current: TensorShape) -> Result<DptHeadSpec> {
+    let line = section.line;
+    const ALLOWED_KEYS: &[&str] = &[
+        "embed_dim",
+        "dim",
+        "fusion",
+        "fusion_hidden_size",
+        "head_hidden",
+        "head_hidden_size",
+        "patch_size",
+        "taps",
+        "neck",
+        "reassemble",
+        "stream",
+        "wait_stream",
+        "learning_rate",
+        "dont_update",
+        "burnin_update",
+        "train_only_bn",
+        "clip",
+        "grad_centr",
+    ];
+    if let Some(key) = section
+        .values
+        .keys()
+        .find(|key| !ALLOWED_KEYS.contains(&key.as_str()))
+    {
+        return Err(Error::InvalidConfig(format!(
+            "[dpt_head] at line {line}: unsupported key {key:?}"
+        )));
+    }
+    for key in ["stream", "wait_stream"] {
+        if section.get_i64(key, -1)? != -1 {
+            return Err(Error::InvalidConfig(format!(
+                "[dpt_head] at line {line}: {key} is unsupported by Stage-1 CPU execution"
+            )));
+        }
+    }
+    let embed_dim = section.get_usize("embed_dim", section.get_usize("dim", 384)?)?;
+    let fusion = section.get_usize("fusion", section.get_usize("fusion_hidden_size", 64)?)?;
+    let head_hidden =
+        section.get_usize("head_hidden", section.get_usize("head_hidden_size", 32)?)?;
+    let patch_size = section.get_usize("patch_size", 14)?;
+    let taps = section.get_usize("taps", 4)?;
+    if taps != 4 {
+        return Err(Error::InvalidConfig(format!(
+            "[dpt_head] at line {line}: exactly four taps are required, got {taps}"
+        )));
+    }
+    let neck_values = section.get_usize_list("neck")?;
+    let neck = match neck_values.as_slice() {
+        [] => [48, 96, 192, 384],
+        [a, b, c, d] => [*a, *b, *c, *d],
+        values => {
+            return Err(Error::InvalidConfig(format!(
+                "[dpt_head] at line {line}: neck must contain exactly 4 values, got {}",
+                values.len()
+            )));
+        }
+    };
+    let raw_reassemble = section.get_f32_list("reassemble")?;
+    let raw_reassemble = match raw_reassemble.as_slice() {
+        [] => [4.0, 2.0, 1.0, 0.0],
+        [a, b, c, d] => [*a, *b, *c, *d],
+        values => {
+            return Err(Error::InvalidConfig(format!(
+                "[dpt_head] at line {line}: reassemble must contain exactly 4 values, got {}",
+                values.len()
+            )));
+        }
+    };
+    let mut reassemble = [0usize; 4];
+    for (index, value) in raw_reassemble.into_iter().enumerate() {
+        if !value.is_finite() {
+            return Err(Error::InvalidConfig(format!(
+                "[dpt_head] at line {line}: reassemble[{index}] must be finite"
+            )));
+        }
+        reassemble[index] = if value > 1.0 {
+            let rounded = (value + 0.5).floor();
+            if rounded > usize::MAX as f32 {
+                return Err(Error::InvalidConfig(format!(
+                    "[dpt_head] at line {line}: reassemble[{index}] overflows"
+                )));
+            }
+            rounded as usize
+        } else if value >= 1.0 {
+            1
+        } else {
+            0
+        };
+    }
+    let spec = DptHeadSpec {
+        embed_dim,
+        fusion,
+        head_hidden,
+        patch_size,
+        taps,
+        neck,
+        reassemble,
+    };
+    if current.width == 0 || current.height == 0 || current.batch == 0 {
+        return Err(Error::InvalidConfig(format!(
+            "[dpt_head] at line {line} requires non-empty NCHW tap features, got {current}"
+        )));
+    }
+    let expected_channels = embed_dim.checked_mul(4).ok_or_else(|| {
+        Error::InvalidConfig(format!("[dpt_head] at line {line}: 4*embed_dim overflows"))
+    })?;
+    if current.channels != expected_channels {
+        return Err(Error::InvalidConfig(format!(
+            "[dpt_head] at line {line}: input has {} channels; taps*embed_dim is {expected_channels}",
+            current.channels
+        )));
+    }
+    spec.geometry(current)
+        .validate()
+        .map_err(|error| Error::InvalidConfig(format!("[dpt_head] at line {line}: {error}")))?;
+    Ok(spec)
+}
+
 fn parse_depth_anything_spec(
     section: &RawSection,
     current: TensorShape,
@@ -3537,6 +3705,9 @@ fn parse_layer_kind(
 ) -> Result<LayerKind> {
     let name = section.name.as_str();
     Ok(match name {
+        "dpt" | "dpt_head" | "depth_anything_head" | "neck" => {
+            LayerKind::DptHead(parse_dpt_head_spec(section, current)?)
+        }
         "depth_anything" | "depth_anything_v2" | "dinov2" | "dino" => {
             LayerKind::DepthAnything(parse_depth_anything_spec(section, current, cfg_parent)?)
         }
@@ -4912,6 +5083,19 @@ fn infer_output_shape(
                 geometry.output_channels().map_err(Error::InvalidConfig)?,
                 current.batch,
             ))
+        }
+        LayerKind::DptHead(spec) => {
+            let geometry = spec.geometry(current);
+            geometry.validate().map_err(|error| {
+                Error::InvalidConfig(format!("[dpt_head] layer #{layer_index}: {error}"))
+            })?;
+            let width = geometry.output_width().map_err(|error| {
+                Error::InvalidConfig(format!("[dpt_head] layer #{layer_index}: {error}"))
+            })?;
+            let height = geometry.output_height().map_err(|error| {
+                Error::InvalidConfig(format!("[dpt_head] layer #{layer_index}: {error}"))
+            })?;
+            Ok(TensorShape::new(width, height, 1, current.batch))
         }
         LayerKind::HyperbolicFoveation(spec) => match spec.warp_source {
             HfWarpSource::Previous => Ok(current),

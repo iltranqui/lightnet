@@ -38,9 +38,11 @@ pub use chart::{ChartPoint, write_training_chart};
 pub use clifford::{CliffordBranchTrainBuffers, CliffordParams, CliffordTrainBuffers};
 pub mod dense_loss;
 pub mod depth_anything;
+pub(crate) mod dpt_head;
 pub use dense_loss::{
     DenseTrainingLoss, compute_dense_training_loss, compute_dense_training_loss_at,
 };
+pub use dpt_head::DptHeadWeights;
 pub(crate) mod deconvolutional;
 pub mod detect;
 pub(crate) mod eml_conv_math;

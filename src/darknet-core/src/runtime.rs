@@ -31,8 +31,8 @@ use crate::image::PlanarRgbImage;
 use crate::maxpool_depth::{backward_maxpool_depth, forward_maxpool_depth};
 use crate::model::{
     Activation, ConnectedSpec, ConvolutionalSpec, CrnnSpec, CropSpec, Dcnv4Spec, DeformConvSpec,
-    DropblockSpec, EmlConvolutionalSpec, GraphConvSpec, GruSpec, LayerKind, LocalSpec, LrPolicy,
-    LstmSpec, NetConfig, Network, RnnSpec, RouteSpec, TensorShape,
+    DptHeadSpec, DropblockSpec, EmlConvolutionalSpec, GraphConvSpec, GruSpec, LayerKind, LocalSpec,
+    LrPolicy, LstmSpec, NetConfig, Network, RnnSpec, RouteSpec, TensorShape,
 };
 use crate::muon::MuonMatrixState;
 use crate::muon_runtime::{MuonLayerState, apply_staged_layer, matrix_shapes, stage_layer};
@@ -84,6 +84,7 @@ fn reject_gpu_hyperbolic_foveation(network: &Network, operation: &str) -> Result
             LayerKind::HyperbolicFoveation(_)
                 | LayerKind::FoveationFilm(_)
                 | LayerKind::DepthAnything(_)
+                | LayerKind::DptHead(_)
         )
     }) {
         return Err(Error::UnsupportedLayer {
@@ -387,6 +388,8 @@ pub enum LayerParams {
     LayaHead(crate::laya_head::LayaHeadWeights),
     /// `[depth_anything]` frozen encoder weights in source blob order.
     DepthAnything(crate::depth_anything::DepthAnythingWeights),
+    /// `[dpt_head]` trainable 66-slot source-order neck/head arena.
+    DptHead(crate::dpt_head::DptHeadWeights),
     /// `[vit]` global transformer parameters in the C++ save order.
     Vit(crate::vit::VitWeights),
     /// `[swin]` parameters in the Rust-defined Swin blob order.
@@ -582,6 +585,14 @@ pub struct KimiKdaTrainBuffers {
     pub weight_updates: Vec<f32>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct DptHeadTrainBuffers {
+    /// Momentum/gradient accumulator in the 66 source tensor-slot order.
+    pub weight_updates: Vec<f32>,
+    /// Whether this update window received a nonzero Rust-mode DPT gradient.
+    pub has_gradient: bool,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayerTrainBuffers {
@@ -611,6 +622,7 @@ pub enum LayerTrainBuffers {
     TuckerAttention(TuckerAttentionTrainBuffers),
     MambaVision(MambaVisionTrainBuffers),
     KimiKda(KimiKdaTrainBuffers),
+    DptHead(DptHeadTrainBuffers),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -816,6 +828,7 @@ pub struct ForwardResult {
     pub(crate) foveation_film_caches: Vec<Option<crate::foveation_film::FoveationFilmForwardCache>>,
     pub vit_caches: Vec<Option<crate::vit::VitForwardCache>>,
     pub(crate) depth_anything_caches: Vec<Option<crate::depth_anything::DepthAnythingForwardCache>>,
+    pub(crate) dpt_head_caches: Vec<Option<crate::dpt_head::DptHeadForwardCache>>,
     pub swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>>,
     pub tucker_attention_caches: Vec<Option<crate::tucker_attention::TuckerAttentionForwardCache>>,
     /// Forward tapes include the explicit recurrent scan state for MambaVision.
@@ -854,6 +867,7 @@ impl ForwardResult {
             foveation_film_caches: Vec::new(),
             vit_caches: Vec::new(),
             depth_anything_caches: Vec::new(),
+            dpt_head_caches: Vec::new(),
             swin_caches: Vec::new(),
             tucker_attention_caches: Vec::new(),
             mambavision_caches: Vec::new(),
@@ -892,6 +906,7 @@ mod forward_result_from_heads_tests {
         assert!(result.foveation_film_caches.is_empty());
         assert!(result.vit_caches.is_empty());
         assert!(result.depth_anything_caches.is_empty());
+        assert!(result.dpt_head_caches.is_empty());
         assert!(result.swin_caches.is_empty());
         assert!(result.tucker_attention_caches.is_empty());
         assert!(result.mambavision_caches.is_empty());
@@ -1314,6 +1329,12 @@ impl ExecutableNetwork {
                         &self.params[index],
                         state,
                     )?,
+                    LayerKind::DptHead(_) => validate_dpt_head_adam_state(
+                        &self.network.layers[index],
+                        &self.params[index],
+                        state,
+                        self.network.net.muon,
+                    )?,
                     _ => {}
                 }
             }
@@ -1404,6 +1425,27 @@ impl ExecutableNetwork {
             let layer = &self.network.layers[layer_index];
             let opts = layer.train;
             if !opts.updates_at(iteration_num, burn_in) {
+                continue;
+            }
+            if let (
+                LayerKind::DptHead(spec),
+                LayerParams::DptHead(params),
+                LayerTrainBuffers::DptHead(train),
+            ) = (&layer.kind, &mut *params, &mut *train)
+            {
+                if train.has_gradient {
+                    update_dpt_head_sgd(
+                        spec,
+                        layer.input_shape,
+                        params,
+                        train,
+                        lr * opts.learning_rate_scale,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                    train.has_gradient = false;
+                }
                 continue;
             }
             if let (
@@ -2056,6 +2098,11 @@ impl ExecutableNetwork {
             if !options.updates_at(iteration_num, burn_in) {
                 continue;
             }
+            if let LayerTrainBuffers::DptHead(train) = &self.train_buffers[index]
+                && !train.has_gradient
+            {
+                continue;
+            }
             let layer_adam = AdamParams {
                 lr: lr * options.learning_rate_scale,
                 ..adam
@@ -2076,11 +2123,15 @@ impl ExecutableNetwork {
             let state = self.host_adam_state[index].get_or_insert_with(HostAdamLayerState::default);
             apply_host_adam_layer(
                 &layer.kind,
+                layer.input_shape,
                 &mut self.params[index],
                 &mut self.train_buffers[index],
                 state,
                 &layer_adam,
             )?;
+            if let LayerTrainBuffers::DptHead(train) = &mut self.train_buffers[index] {
+                train.has_gradient = false;
+            }
             if options.clip > 0.0
                 && let LayerParams::Convolutional(params) = &mut self.params[index]
             {
@@ -2150,6 +2201,11 @@ impl ExecutableNetwork {
             if !options.updates_at(iteration_num, burn_in) {
                 continue;
             }
+            if let LayerTrainBuffers::DptHead(train) = &self.train_buffers[index]
+                && !train.has_gradient
+            {
+                continue;
+            }
             prepare_muon_layer_gradients(
                 &layer.kind,
                 options,
@@ -2177,13 +2233,38 @@ impl ExecutableNetwork {
             };
             let adam_state =
                 self.host_adam_state[index].get_or_insert_with(HostAdamLayerState::default);
-            apply_host_adam_layer(
-                &layer.kind,
-                &mut self.params[index],
-                &mut self.train_buffers[index],
-                adam_state,
-                &layer_adam,
-            )?;
+            if matches!(&layer.kind, LayerKind::DptHead(_)) {
+                let (
+                    LayerKind::DptHead(spec),
+                    LayerParams::DptHead(params),
+                    LayerTrainBuffers::DptHead(train),
+                ) = (
+                    &layer.kind,
+                    &mut self.params[index],
+                    &mut self.train_buffers[index],
+                )
+                else {
+                    unreachable!("DPT layer kind and train data must match");
+                };
+                apply_host_adam_dpt(
+                    spec,
+                    layer.input_shape,
+                    params,
+                    train,
+                    adam_state,
+                    &layer_adam,
+                    false,
+                )?;
+            } else {
+                apply_host_adam_layer(
+                    &layer.kind,
+                    layer.input_shape,
+                    &mut self.params[index],
+                    &mut self.train_buffers[index],
+                    adam_state,
+                    &layer_adam,
+                )?;
+            }
             let muon_state = self.muon_state[index].get_or_insert_with(MuonLayerState::default);
             apply_staged_layer(
                 &layer.kind,
@@ -2194,6 +2275,9 @@ impl ExecutableNetwork {
                 muon_state,
                 staged,
             )?;
+            if let LayerTrainBuffers::DptHead(train) = &mut self.train_buffers[index] {
+                train.has_gradient = false;
+            }
             if options.clip > 0.0
                 && let LayerParams::Convolutional(params) = &mut self.params[index]
             {
@@ -2484,6 +2568,7 @@ impl ExecutableNetwork {
         let mut foveation_film_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches = Vec::with_capacity(self.network.layers.len());
         let mut depth_anything_caches = Vec::with_capacity(self.network.layers.len());
+        let mut dpt_head_caches = Vec::with_capacity(self.network.layers.len());
         let mut swin_caches = Vec::with_capacity(self.network.layers.len());
         let mut tucker_attention_caches = Vec::with_capacity(self.network.layers.len());
         let mut mambavision_caches = Vec::with_capacity(self.network.layers.len());
@@ -2510,6 +2595,7 @@ impl ExecutableNetwork {
             let mut eml_cache = None;
             let mut vit_cache = None;
             let mut depth_anything_cache = None;
+            let mut dpt_head_cache = None;
             let mut swin_cache = None;
             let mut tucker_attention_cache = None;
             let mut mambavision_cache = None;
@@ -2904,6 +2990,13 @@ impl ExecutableNetwork {
                     depth_anything_cache = Some(cache);
                     (Tensor::from_data(layer.output_shape, data)?, None)
                 }
+                (LayerKind::DptHead(spec), LayerParams::DptHead(weights)) => {
+                    let geometry = spec.geometry(current_input.shape);
+                    let (data, cache) =
+                        crate::dpt_head::forward(&current_input.data, weights, geometry)?;
+                    dpt_head_cache = Some(cache);
+                    (Tensor::from_data(layer.output_shape, data)?, None)
+                }
                 (LayerKind::LayaEncoder(spec), LayerParams::LayaEncoder(weights)) => (
                     laya_encoder_forward(spec, weights, current_input, layer.output_shape)?,
                     None,
@@ -3232,6 +3325,7 @@ impl ExecutableNetwork {
             foveation_film_caches.push(foveation_film_cache);
             vit_caches.push(vit_cache);
             depth_anything_caches.push(depth_anything_cache);
+            dpt_head_caches.push(dpt_head_cache);
             swin_caches.push(swin_cache);
             tucker_attention_caches.push(tucker_attention_cache);
             mambavision_caches.push(mambavision_cache);
@@ -3257,6 +3351,7 @@ impl ExecutableNetwork {
             foveation_film_caches,
             vit_caches,
             depth_anything_caches,
+            dpt_head_caches,
             swin_caches,
             tucker_attention_caches,
             mambavision_caches,
@@ -3392,6 +3487,13 @@ impl ExecutableNetwork {
                 forward.depth_anything_caches.len()
             )));
         }
+        if forward.dpt_head_caches.len() != self.network.layers.len() {
+            return Err(Error::InvalidConfig(format!(
+                "forward [dpt_head] cache count mismatch: expected {}, got {}",
+                self.network.layers.len(),
+                forward.dpt_head_caches.len()
+            )));
+        }
         if forward.swin_caches.len() != self.network.layers.len() {
             return Err(Error::InvalidConfig(format!(
                 "forward Swin cache count mismatch: expected {}, got {}",
@@ -3483,6 +3585,7 @@ impl ExecutableNetwork {
             match gradient {
                 LayerParams::HyperbolicFoveation(gradient) => gradient.hf_params.fill(0.0),
                 LayerParams::DepthAnything(gradient) => gradient.as_mut_slice().fill(0.0),
+                LayerParams::DptHead(gradient) => gradient.values.fill(0.0),
                 _ => {}
             }
         }
@@ -3662,7 +3765,8 @@ impl ExecutableNetwork {
                         )));
                     };
                     *slot = LayerParams::FoveationFilm(gradients.params);
-                    let layer_input_gradient = Tensor::from_data(layer.input_shape, gradients.input)?;
+                    let layer_input_gradient =
+                        Tensor::from_data(layer.input_shape, gradients.input)?;
                     accumulate_previous_gradient(
                         layer.index,
                         &layer_input_gradient,
@@ -5414,6 +5518,41 @@ impl ExecutableNetwork {
                         )?;
                     }
                 }
+                (LayerKind::DptHead(spec), LayerParams::DptHead(weights)) => {
+                    if grad_mode != GradMode::Cpp {
+                        let cache = forward
+                            .dpt_head_caches
+                            .get(layer.index)
+                            .and_then(Option::as_ref)
+                            .ok_or_else(|| {
+                                Error::InvalidConfig(format!(
+                                    "missing [dpt_head] forward cache for layer #{}",
+                                    layer.index
+                                ))
+                            })?;
+                        let gradients = crate::dpt_head::backward(
+                            &grad.data,
+                            weights,
+                            spec.geometry(current_input.shape),
+                            cache,
+                        )?;
+                        let Some(LayerParams::DptHead(slot)) = param_gradients.get_mut(layer.index)
+                        else {
+                            return Err(Error::InvalidConfig(format!(
+                                "missing [dpt_head] gradient slot for layer #{}",
+                                layer.index
+                            )));
+                        };
+                        slot.values = gradients.weight_updates;
+                        let input_grad = Tensor::from_data(current_input.shape, gradients.input)?;
+                        accumulate_previous_gradient(
+                            layer.index,
+                            &input_grad,
+                            &mut input_gradient,
+                            &mut layer_output_gradients,
+                        )?;
+                    }
+                }
                 (LayerKind::LayaEncoder(_), LayerParams::LayaEncoder(_))
                 | (LayerKind::LayaHead(_), LayerParams::LayaHead(_)) => {
                     // Frozen (`freeze=1`): no gradient flows to the input.
@@ -6058,10 +6197,7 @@ impl ExecutableNetwork {
                     accumulate_vec(&mut train.pred_w2_updates, &gradient.pred_w2)?;
                     accumulate_vec(&mut train.pred_b2_updates, &gradient.pred_b2)?;
                 }
-                (
-                    LayerKind::FoveationFilm(_),
-                    LayerParams::FoveationFilm(gradient),
-                ) => {
+                (LayerKind::FoveationFilm(_), LayerParams::FoveationFilm(gradient)) => {
                     let Some(LayerTrainBuffers::FoveationFilm(train)) =
                         self.train_buffers.get_mut(layer.index)
                     else {
@@ -6529,6 +6665,25 @@ impl ExecutableNetwork {
                 (_, LayerParams::LayaScorer(_)) => {}
                 (_, LayerParams::LayaActHead(_)) => {}
                 (LayerKind::DepthAnything(_), LayerParams::DepthAnything(_)) => {}
+                (LayerKind::DptHead(_), LayerParams::DptHead(gradient)) => {
+                    let Some(LayerTrainBuffers::DptHead(train)) =
+                        self.train_buffers.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing [dpt_head] train buffers for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    if train.weight_updates.len() != gradient.values.len() {
+                        return Err(Error::InvalidConfig(format!(
+                            "[dpt_head] gradient/update length mismatch: {} != {}",
+                            gradient.values.len(),
+                            train.weight_updates.len()
+                        )));
+                    }
+                    train.has_gradient |= gradient.values.iter().any(|&value| value != 0.0);
+                    accumulate_negative_vec(&mut train.weight_updates, &gradient.values)?;
+                }
                 _ => {
                     return Err(Error::InvalidConfig(format!(
                         "layer #{} produced gradients incompatible with train buffers",
@@ -7358,6 +7513,7 @@ fn host_adam_scalar_capacity(params: &LayerParams) -> usize {
         LayerParams::TuckerAttention(params) => params.parameter_count(),
         LayerParams::MambaVision(params) => params.parameter_count(),
         LayerParams::KimiKda(params) => params.parameter_count(),
+        LayerParams::DptHead(params) => params.values.len(),
         LayerParams::Moe(params) => {
             params.router_weights.len()
                 + params.router_biases.len()
@@ -7646,6 +7802,76 @@ fn validate_hyperbolic_foveation_adam_state(
                 },
             )?;
         }
+    }
+    Ok(())
+}
+
+fn validate_dpt_head_adam_state(
+    layer: &crate::model::Layer,
+    params: &LayerParams,
+    state: &HostAdamLayerState,
+    muon_mode: bool,
+) -> Result<()> {
+    let (LayerKind::DptHead(spec), LayerParams::DptHead(params)) = (&layer.kind, params) else {
+        return Err(Error::Weights(
+            "DPT Adam state does not match layer parameters".to_owned(),
+        ));
+    };
+    let layout = crate::dpt_head::dpt_head_weight_layout(spec.geometry(layer.input_shape))
+        .map_err(|error| Error::Weights(error.to_string()))?;
+    for (name, moments) in [
+        ("top-level weights", &state.weights),
+        ("top-level biases", &state.biases),
+        ("top-level scales", &state.scales),
+    ] {
+        validate_host_adam_slot(name, moments, 0)?;
+    }
+    if state.children.len() > crate::dpt_head::DPT_WEIGHT_SLOTS {
+        return Err(Error::Weights(format!(
+            "DPT Adam state has {} child slots, expected at most {}",
+            state.children.len(),
+            crate::dpt_head::DPT_WEIGHT_SLOTS
+        )));
+    }
+    let is_matrix = |slot: usize| crate::dpt_head::DPT_MUON_WEIGHT_SLOTS.contains(&slot);
+    let is_bias = |slot: usize| crate::dpt_head::DPT_BIAS_SLOTS.contains(&slot);
+    for slot in 0..crate::dpt_head::DPT_WEIGHT_SLOTS {
+        let child = state.children.get(slot);
+        let weight_len = if !muon_mode && is_matrix(slot) {
+            layout.get(slot).len
+        } else {
+            0
+        };
+        let bias_len = if is_bias(slot) {
+            layout.get(slot).len
+        } else {
+            0
+        };
+        validate_host_adam_slot(
+            &format!("DPT slot {slot} weight"),
+            &child.and_then(|child| child.weights.clone()),
+            weight_len,
+        )?;
+        validate_host_adam_slot(
+            &format!("DPT slot {slot} bias"),
+            &child.and_then(|child| child.biases.clone()),
+            bias_len,
+        )?;
+        validate_host_adam_slot(
+            &format!("DPT slot {slot} scale"),
+            &child.and_then(|child| child.scales.clone()),
+            0,
+        )?;
+        if child.is_some_and(|child| !child.children.is_empty()) {
+            return Err(Error::Weights(format!(
+                "DPT Adam state slot {slot} unexpectedly contains nested children"
+            )));
+        }
+    }
+    if params.values.len() != layout.total {
+        return Err(Error::Weights(
+            "DPT Adam parameter layout does not match layer geometry".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -12921,6 +13147,7 @@ where
                 foveation_film_caches: vec![None; self.network.layers.len()],
                 vit_caches,
                 depth_anything_caches: vec![None; self.network.layers.len()],
+                dpt_head_caches: vec![None; self.network.layers.len()],
                 swin_caches,
                 tucker_attention_caches,
                 mambavision_caches,
@@ -17716,6 +17943,10 @@ fn default_layer_params(layer: &crate::model::Layer) -> LayerParams {
                     .expect("validated depth_anything layer geometry")
             }))
         }
+        LayerKind::DptHead(spec) => LayerParams::DptHead(
+            crate::dpt_head::DptHeadWeights::zeroed(spec.geometry(layer.input_shape))
+                .expect("validated dpt_head layer geometry"),
+        ),
         LayerKind::Vit(spec) => LayerParams::Vit(
             crate::vit::VitWeights::zeroed(
                 &vit_geometry(layer, spec),
@@ -18086,6 +18317,15 @@ fn default_layer_train_buffers(layer: &crate::model::Layer) -> LayerTrainBuffers
                 weight_updates: vec![0.0; params.weights.len()],
             })
         }
+        LayerKind::DptHead(spec) => {
+            let total = crate::dpt_head::dpt_head_weight_layout(spec.geometry(layer.input_shape))
+                .expect("validated dpt_head weight geometry")
+                .total;
+            LayerTrainBuffers::DptHead(DptHeadTrainBuffers {
+                weight_updates: vec![0.0; total],
+                has_gradient: false,
+            })
+        }
         LayerKind::Swin(spec) => {
             let updates = crate::swin::SwinWeights::zeroed_gradients(
                 layer.input_shape.channels,
@@ -18168,10 +18408,12 @@ pub(crate) fn validate_foveation_film_param_layout(
     let embed_weights = spec
         .embed_dim
         .checked_mul(spec.param_count)
-        .ok_or_else(|| Error::InvalidConfig("[foveation_film] embedding size overflows".to_owned()))?;
-    let channel_weights = channels
-        .checked_mul(spec.embed_dim)
-        .ok_or_else(|| Error::InvalidConfig("[foveation_film] channel size overflows".to_owned()))?;
+        .ok_or_else(|| {
+            Error::InvalidConfig("[foveation_film] embedding size overflows".to_owned())
+        })?;
+    let channel_weights = channels.checked_mul(spec.embed_dim).ok_or_else(|| {
+        Error::InvalidConfig("[foveation_film] channel size overflows".to_owned())
+    })?;
     let actual = (
         params.w_embed.len(),
         params.b_embed.len(),
@@ -19462,6 +19704,48 @@ fn sgd_update(
     }
 }
 
+fn update_dpt_head_sgd(
+    spec: &DptHeadSpec,
+    input_shape: TensorShape,
+    params: &mut crate::dpt_head::DptHeadWeights,
+    train: &mut DptHeadTrainBuffers,
+    lr: f32,
+    momentum: f32,
+    decay: f32,
+    batch: usize,
+) {
+    let Ok(layout) = crate::dpt_head::dpt_head_weight_layout(spec.geometry(input_shape)) else {
+        return;
+    };
+    if params.values.len() != layout.total || train.weight_updates.len() != layout.total {
+        return;
+    }
+    for &index in &crate::dpt_head::DPT_MUON_WEIGHT_SLOTS {
+        let range = layout.get(index);
+        let end = range.start + range.len;
+        sgd_update(
+            &mut params.values[range.start..end],
+            &mut train.weight_updates[range.start..end],
+            lr,
+            momentum,
+            decay,
+            batch,
+        );
+    }
+    for &index in &crate::dpt_head::DPT_BIAS_SLOTS {
+        let range = layout.get(index);
+        let end = range.start + range.len;
+        sgd_update(
+            &mut params.values[range.start..end],
+            &mut train.weight_updates[range.start..end],
+            lr,
+            momentum,
+            0.0,
+            batch,
+        );
+    }
+}
+
 fn update_vit_params(
     params: &mut crate::vit::VitWeights,
     train: &mut VitTrainBuffers,
@@ -19959,8 +20243,66 @@ fn apply_host_adam_mambavision(
     Ok(())
 }
 
+fn apply_host_adam_dpt(
+    spec: &DptHeadSpec,
+    input_shape: TensorShape,
+    params: &mut crate::dpt_head::DptHeadWeights,
+    train: &mut DptHeadTrainBuffers,
+    state: &mut HostAdamLayerState,
+    adam: &AdamParams,
+    include_matrices: bool,
+) -> Result<()> {
+    let layout = crate::dpt_head::dpt_head_weight_layout(spec.geometry(input_shape))?;
+    if params.values.len() != layout.total || train.weight_updates.len() != layout.total {
+        return Err(Error::InvalidConfig(format!(
+            "[dpt_head] Adam parameter/update lengths are {}/{}, expected {}",
+            params.values.len(),
+            train.weight_updates.len(),
+            layout.total
+        )));
+    }
+    if include_matrices {
+        for &index in &crate::dpt_head::DPT_MUON_WEIGHT_SLOTS {
+            let range = layout.get(index);
+            let end = range.start + range.len;
+            let child = host_adam_child(state, index);
+            apply_host_adam(
+                &mut params.values[range.start..end],
+                &mut train.weight_updates[range.start..end],
+                &mut child.weights,
+                adam,
+            )?;
+        }
+    } else if adam.decoupled_decay {
+        // Muon replaces the Adam direction for matrices, not AdamW's
+        // decoupled weight decay. Apply the same multiplicative term as
+        // `adam_update` without creating or advancing matrix Adam moments.
+        let factor = 1.0 - adam.lr * adam.decay;
+        for &index in &crate::dpt_head::DPT_MUON_WEIGHT_SLOTS {
+            let range = layout.get(index);
+            let end = range.start + range.len;
+            for weight in &mut params.values[range.start..end] {
+                *weight *= factor;
+            }
+        }
+    }
+    for &index in &crate::dpt_head::DPT_BIAS_SLOTS {
+        let range = layout.get(index);
+        let end = range.start + range.len;
+        let child = host_adam_child(state, index);
+        apply_host_adam_non_weight(
+            &mut params.values[range.start..end],
+            &mut train.weight_updates[range.start..end],
+            &mut child.biases,
+            adam,
+        )?;
+    }
+    Ok(())
+}
+
 fn apply_host_adam_layer(
     kind: &LayerKind,
+    input_shape: TensorShape,
     params: &mut LayerParams,
     train: &mut LayerTrainBuffers,
     state: &mut HostAdamLayerState,
@@ -20083,6 +20425,7 @@ fn apply_host_adam_layer(
             {
                 apply_host_adam_layer(
                     &layer.kind,
+                    layer.input_shape,
                     params,
                     train,
                     host_adam_child(state, index),
@@ -20507,6 +20850,14 @@ fn apply_host_adam_layer(
                     ));
                 }
             }
+        }
+        (LayerParams::DptHead(params), LayerTrainBuffers::DptHead(train)) => {
+            let LayerKind::DptHead(spec) = kind else {
+                return Err(Error::InvalidConfig(
+                    "DPT parameters do not match layer kind during Adam update".to_owned(),
+                ));
+            };
+            apply_host_adam_dpt(spec, input_shape, params, train, state, adam, true)?;
         }
         (LayerParams::Moe(params), LayerTrainBuffers::Moe(train)) => {
             if params.experts.len() != train.experts.len() {
@@ -21323,6 +21674,24 @@ fn load_weights_into_params(
                         layer.index
                     )));
                 }
+            }
+            LayerParams::DptHead(weights) => {
+                let LayerKind::DptHead(spec) = &layer.kind else {
+                    return Err(Error::InvalidConfig(format!(
+                        "layer #{} [dpt_head] parameters do not match layer kind",
+                        layer.index
+                    )));
+                };
+                let expected =
+                    crate::dpt_head::dpt_head_weight_layout(spec.geometry(layer.input_shape))?
+                        .total;
+                if weights.values.len() != expected {
+                    return Err(Error::Weights(format!(
+                        "layer #{} ([dpt_head]) parameter layout does not match config",
+                        layer.index
+                    )));
+                }
+                read_f32_into(&mut file, &mut weights.values)?;
             }
             // The scorer blob does **not** live in the sequential stream: C++
             // seeks past the encoder and head blobs with `laya_open_weights`
@@ -45244,10 +45613,12 @@ probability=0.5
         );
     }
 
-    #[path = "hyperbolic_foveation_runtime_tests.rs"]
-    mod hyperbolic_foveation_runtime_tests;
-    #[path = "foveation_film_runtime_tests.rs"]
-    mod foveation_film_runtime_tests;
     #[path = "depth_anything_runtime_tests.rs"]
     mod depth_anything_runtime_tests;
+    #[path = "dpt_head_runtime_tests.rs"]
+    mod dpt_head_runtime_tests;
+    #[path = "foveation_film_runtime_tests.rs"]
+    mod foveation_film_runtime_tests;
+    #[path = "hyperbolic_foveation_runtime_tests.rs"]
+    mod hyperbolic_foveation_runtime_tests;
 }

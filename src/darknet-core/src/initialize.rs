@@ -107,6 +107,9 @@ pub fn initialize_training_params(network: &Network, params: &mut [LayerParams],
             // Frozen DINOv2 tensors are either loaded from cfg weights= or a
             // checkpoint; never replace them with a random initialization.
             LayerParams::DepthAnything(_) => {}
+            // The C++ constructor zeroes the entire DPT arena; mirrors, biases,
+            // and inactive source slots must stay zero until loaded/trained.
+            LayerParams::DptHead(p) => p.values.fill(0.0),
             LayerParams::TuckerAttention(p) => {
                 let channels = layer.input_shape.channels;
                 let bound = (6.0 / (channels as f32 + channels as f32)).sqrt();

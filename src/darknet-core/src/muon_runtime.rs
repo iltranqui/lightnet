@@ -112,6 +112,80 @@ fn visit_grouped_convolution(
     Ok(())
 }
 
+fn visit_dpt_head(
+    spec: &crate::model::DptHeadSpec,
+    input_shape: TensorShape,
+    params: &mut crate::dpt_head::DptHeadWeights,
+    train: &mut crate::runtime::DptHeadTrainBuffers,
+    visitor: &mut MatrixVisitor<'_>,
+) -> Result<()> {
+    let geometry = spec.geometry(input_shape);
+    let layout = crate::dpt_head::dpt_head_weight_layout(geometry)?;
+    if params.values.len() != layout.total || train.weight_updates.len() != layout.total {
+        return Err(Error::InvalidConfig(format!(
+            "Muon DPT weights/updates have lengths {}/{}, expected {}",
+            params.values.len(),
+            train.weight_updates.len(),
+            layout.total
+        )));
+    }
+    for &index in &crate::dpt_head::DPT_MUON_WEIGHT_SLOTS {
+        let tap = match index {
+            0 | 2 | 4 | 6 => index / 2,
+            8 | 10 | 14 => (index - 8) / 2,
+            16..=19 => index - 16,
+            _ => 0,
+        };
+        let (rows, cols) = match index {
+            0 | 2 | 4 | 6 => (geometry.neck[tap], geometry.embed_dim),
+            8 | 10 | 14 => (
+                geometry.neck[tap],
+                checked_product(
+                    &[geometry.neck[tap], [4usize, 2, 0, 3][tap].pow(2)],
+                    "DPT resize matrix",
+                )?,
+            ),
+            16..=19 => (
+                geometry.fusion,
+                checked_product(&[geometry.neck[tap], 9], "DPT neck matrix")?,
+            ),
+            20 | 22 | 24 | 26 => (geometry.fusion, geometry.fusion),
+            30 | 32 | 34 | 38 | 40 | 42 | 44 | 46 | 48 | 50 | 52 | 54 | 56 | 58 => (
+                geometry.fusion,
+                checked_product(&[geometry.fusion, 9], "DPT residual matrix")?,
+            ),
+            60 => (
+                geometry.fusion / 2,
+                checked_product(&[geometry.fusion, 9], "DPT head conv1")?,
+            ),
+            62 => (
+                geometry.head_hidden,
+                checked_product(&[geometry.fusion / 2, 9], "DPT head conv2")?,
+            ),
+            64 => (1, geometry.head_hidden),
+            _ => {
+                return Err(Error::InvalidConfig(format!(
+                    "Muon DPT matrix slot {index} has no declared view"
+                )));
+            }
+        };
+        let range = layout.get(index);
+        let end = range
+            .start
+            .checked_add(range.len)
+            .ok_or_else(|| Error::InvalidConfig("Muon DPT weight range overflows".to_owned()))?;
+        visit_matrix(
+            &mut params.values[range.start..end],
+            &mut train.weight_updates[range.start..end],
+            rows,
+            cols,
+            1.0,
+            visitor,
+        )?;
+    }
+    Ok(())
+}
+
 fn visit_connected(
     params: &mut ConnectedParams,
     train: &mut ConnectedTrainBuffers,
@@ -337,6 +411,11 @@ pub(crate) fn visit_muon_matrices(
             1.0,
             visitor,
         ),
+        (
+            LayerKind::DptHead(spec),
+            LayerParams::DptHead(params),
+            LayerTrainBuffers::DptHead(train),
+        ) => visit_dpt_head(spec, input_shape, params, train, visitor),
         (
             LayerKind::Connected(_),
             LayerParams::Connected(params),
