@@ -77,6 +77,9 @@ impl GradMode {
     }
 }
 
+#[path = "runtime/laya_act_gpu.rs"]
+mod laya_act_gpu;
+
 fn reject_gpu_hyperbolic_foveation(network: &Network, operation: &str) -> Result<()> {
     if let Some(layer) = network.layers.iter().find(|layer| {
         matches!(
@@ -11878,33 +11881,18 @@ where
                                 layer_index: layer.index,
                                 reference: spec.layers[2],
                             })?;
-                    let host_head = self
-                        .download_tensor(head_source, head_layer.output_shape)
-                        .map_err(|err| backend_error("download laya_act_head head input", err))?;
-                    let host_scorer = self
-                        .download_tensor(scorer_source, scorer_layer.output_shape)
-                        .map_err(|err| backend_error("download laya_act_head scorer input", err))?;
-                    let host_marker = self
-                        .download_tensor(marker_source, marker_layer.output_shape)
-                        .map_err(|err| backend_error("download laya_act_head marker input", err))?;
-                    let data = crate::laya_act_head::act_head_forward(
-                        &host_head.data,
-                        &host_scorer.data,
-                        &host_marker.data,
+                    laya_act_gpu::forward(
+                        &self.backend,
+                        spec,
                         weights,
-                        head_layer.output_shape.batch,
-                        spec.hidden,
-                        spec.max_options,
-                        marker_layer.output_shape.channels,
-                        head_layer.output_shape.width,
-                        marker_layer.output_shape.width,
-                        spec.fc_dim,
-                        spec.n_act,
-                    )
-                    .map_err(Error::InvalidConfig)?;
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
-                        .map_err(|err| backend_error("upload laya_act_head output", err))?
+                        [head_source, scorer_source, marker_source],
+                        [
+                            head_layer.output_shape,
+                            scorer_layer.output_shape,
+                            marker_layer.output_shape,
+                        ],
+                        launch_config,
+                    )?
                 }
                 (LayerKind::Shortcut(spec), LayerParams::Shortcut(params)) => {
                     let mut inputs = Vec::with_capacity(spec.from.len() + 1);
@@ -13631,33 +13619,18 @@ where
                             layer_index: layer.index,
                             reference: spec.layers[2],
                         })?;
-                    let host_head = self
-                        .download_tensor(head_source, head_layer.output_shape)
-                        .map_err(|err| backend_error("download laya_act_head head input", err))?;
-                    let host_scorer = self
-                        .download_tensor(scorer_source, scorer_layer.output_shape)
-                        .map_err(|err| backend_error("download laya_act_head scorer input", err))?;
-                    let host_marker = self
-                        .download_tensor(marker_source, marker_layer.output_shape)
-                        .map_err(|err| backend_error("download laya_act_head marker input", err))?;
-                    let data = crate::laya_act_head::act_head_forward(
-                        &host_head.data,
-                        &host_scorer.data,
-                        &host_marker.data,
+                    laya_act_gpu::forward(
+                        &self.backend,
+                        spec,
                         weights,
-                        head_layer.output_shape.batch,
-                        spec.hidden,
-                        spec.max_options,
-                        marker_layer.output_shape.channels,
-                        head_layer.output_shape.width,
-                        marker_layer.output_shape.width,
-                        spec.fc_dim,
-                        spec.n_act,
-                    )
-                    .map_err(Error::InvalidConfig)?;
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
-                        .map_err(|err| backend_error("upload laya_act_head output", err))?
+                        [head_source, scorer_source, marker_source],
+                        [
+                            head_layer.output_shape,
+                            scorer_layer.output_shape,
+                            marker_layer.output_shape,
+                        ],
+                        launch_config,
+                    )?
                 }
                 (LayerKind::Shortcut(spec), LayerParams::None) => {
                     let mut accumulated = current_input
@@ -45772,6 +45745,8 @@ probability=0.5
     mod foveation_film_runtime_tests;
     #[path = "hyperbolic_foveation_runtime_tests.rs"]
     mod hyperbolic_foveation_runtime_tests;
+    #[path = "laya_act_gpu_tests.rs"]
+    mod laya_act_gpu_tests;
     #[path = "marker_gather_gpu_tests.rs"]
     mod marker_gather_gpu_tests;
     #[path = "yolo_3d_runtime_tests.rs"]

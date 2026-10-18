@@ -34,6 +34,14 @@ pub const LAYA_ACT_HEAD_N_ACT: usize = 2;
 /// C++ `LAYA_ACT_HEAD_N_FEATS`: `[top1, top1-top2, entropy, k/255]`.
 pub const LAYA_ACT_HEAD_N_FEATS: usize = 4;
 
+#[cfg(test)]
+std::thread_local! { static FORWARD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+#[cfg(test)]
+pub(crate) fn cpu_forward_call_count() -> usize {
+    FORWARD_CALLS.with(std::cell::Cell::get)
+}
+
 /// C++ `laya_act_head_blob_float_count(hidden, fc_dim, n_act)`.
 pub fn blob_float_count(hidden: usize, fc_dim: usize, n_act: usize) -> usize {
     let input = hidden + LAYA_ACT_HEAD_N_FEATS;
@@ -228,6 +236,8 @@ pub fn act_head_forward(
     fc_dim: usize,
     n_act: usize,
 ) -> Result<Vec<f32>, String> {
+    #[cfg(test)]
+    FORWARD_CALLS.with(|n| n.set(n.get() + 1));
     validate_shapes(
         head_out,
         scorer_logits,
