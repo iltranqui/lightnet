@@ -6032,6 +6032,30 @@ impl F32TensorOpsBackend for OxideBackend {
         ))
     }
 
+    fn dcnv4_forward_f32(
+        &self,
+        input: &Self::Tensor,
+        weights: &Self::Tensor,
+        biases: &Self::Tensor,
+        desc: darknet_cuda::host_ops::dcnv4::Dcnv4Composition,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        self.dcnv4_forward_native(input, weights, biases, desc, config)
+    }
+
+    fn dcnv4_backward_f32(
+        &self,
+        input: &Self::Tensor,
+        weights: &Self::Tensor,
+        offsets: &Self::Tensor,
+        seed: &Self::Tensor,
+        desc: darknet_cuda::host_ops::dcnv4::Dcnv4Composition,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let grad = self.dcnv4_backward_native(input, weights, offsets, seed, desc, config)?;
+        Ok((grad.input, grad.offset_weights, grad.offset_biases))
+    }
+
     fn deform_sanitize_f32(
         &self,
         x: &Self::Tensor,

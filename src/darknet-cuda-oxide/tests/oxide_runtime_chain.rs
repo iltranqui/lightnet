@@ -2489,7 +2489,7 @@ fn dcnv4_f32_host_fallback_matches_cpu_chain_and_updates() {
         "[net]\nwidth=4\nheight=4\nchannels=1\nbatch=1\n\
          [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
          [dcnv4]\nsize=1\npadding=0\nd_stride=2\nsoftmax=0\
-         \noffset_scale=0.6\nactivation=linear\n",
+         \noffset_scale=0.6\nbatch_normalize=1\nactivation=linear\n",
     );
     let mut cpu = ExecutableNetwork::new(net.clone());
     darknet_core::initialize_training_params(&net, &mut cpu.params, 73);
@@ -2527,6 +2527,11 @@ fn dcnv4_f32_host_fallback_matches_cpu_chain_and_updates() {
     }
 
     let seed = Tensor::filled(cpu.network.layers[1].output_shape, 0.17);
+    assert!(
+        cpu.backward(&input, &oxide_forward.cpu_forward, &seed)
+            .is_ok(),
+        "BN variant must retain CPU cache"
+    );
     let mut seeds = vec![None; cpu.network.layers.len()];
     seeds[1] = Some(seed);
     cpu.zero_train_buffers();
@@ -2578,6 +2583,177 @@ fn dcnv4_f32_host_fallback_matches_cpu_chain_and_updates() {
     assert_ne!(old.offset_weights, cpu_dcn.offset_weights);
     assert_eq!(old.dummy_weights, cpu_dcn.dummy_weights);
     assert_eq!(cpu_dcn.dummy_weights, oxide_dcn.dummy_weights);
+}
+
+#[test]
+fn dcnv4_mixed_network_retains_cpu_cache_and_backward() {
+    let net = network(
+        "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=1\n\
+        [dcnv4]\nsize=1\npadding=0\nd_stride=2\nsoftmax=0\nactivation=linear\n\
+        [deconvolutional]\nfilters=1\nsize=1\nstride=1\nactivation=linear\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let LayerParams::Dcnv4(p) = &mut cpu.params[0] else {
+        unreachable!()
+    };
+    p.offset_biases[..3].copy_from_slice(&[0.43, 0.57, 0.8]);
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().unwrap());
+    gpu.params = cpu.params.clone();
+    let input = patterned(cpu.network.net.input_shape());
+    let cf = cpu.forward_training(&input).unwrap();
+    let gf = gpu.forward_training_with_state(&input).unwrap();
+    let seed = Tensor::filled(cpu.network.layers[0].output_shape, 0.3);
+    let seeds = [Some(seed), None];
+    // This succeeds only if the host DCNv4 cache survived the mixed forward.
+    cpu.backward_seeded(&input, &gf.cpu_forward, &seeds)
+        .unwrap();
+    cpu.backward_accumulate_seeded(&input, &cf, &seeds).unwrap();
+    gpu.backward_accumulate_seeded_gpu(&gf, &seeds).unwrap();
+}
+
+#[test]
+fn dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu() {
+    for adam in [false, true] {
+        for (softmax, remove_center, activation) in [(1, 1, "swish"), (0, 0, "leaky")] {
+            let net = network(&format!(
+                "[net]\nwidth=5\nheight=3\nchannels=2\nbatch=2\ntry_fix_nan=0\nadam={}\ndecay=0.01\n\
+                 [convolutional]\nfilters=4\nsize=1\nactivation=linear\n\
+                 [dcnv4]\nsize=3\npadding=2\ndilation=2\ngroups=2\nd_stride=2\n\
+                 softmax={softmax}\nremove_center={remove_center}\noffset_scale=0.75\nactivation={activation}\n",
+                u8::from(adam)
+            ));
+            let mut cpu = ExecutableNetwork::new(net.clone());
+            fill_params(&mut cpu.params);
+            let LayerParams::Dcnv4(p) = &mut cpu.params[1] else {
+                unreachable!()
+            };
+            for (i, w) in p.offset_weights.iter_mut().enumerate() {
+                *w = ((i * 7 % 17) as f32 - 8.0) * 0.002;
+            }
+            for (i, b) in p.offset_biases.iter_mut().enumerate() {
+                *b = 0.43 + (i % 5) as f32 * 0.03;
+            }
+            p.biases.copy_from_slice(&[0.03, -0.02, 0.05, -0.01]);
+            let initial = cpu.params.clone();
+            let mut gpu = GpuExecutableNetwork::new(
+                net,
+                OxideBackend::new()
+                    .unwrap()
+                    .with_gemm_mode(darknet_cuda_oxide::GemmMode::Fp32),
+            );
+            gpu.params = cpu.params.clone();
+            gpu.init_train_buffers_gpu().unwrap();
+            for step in 0..2 {
+                let mut input = patterned(cpu.network.net.input_shape());
+                for v in &mut input.data {
+                    *v *= 0.8 + 0.1 * step as f32;
+                }
+                let cf = cpu.forward_training(&input).unwrap();
+                let gf = gpu.forward_training_with_state(&input).unwrap();
+                for (a, b) in cf.layer_outputs.iter().zip(&gf.cpu_forward.layer_outputs) {
+                    close("DCNv4 native runtime output", &a.data, &b.data, 3e-4);
+                }
+                let shape = cpu.network.layers[1].output_shape;
+                let seed = Tensor::from_data(
+                    shape,
+                    (0..shape.batch * shape.element_count())
+                        .map(|i| ((i * 11 % 19) as f32 - 9.0) * 0.17)
+                        .collect(),
+                )
+                .unwrap();
+                // Eligible GPU forward deliberately does not produce a CPU
+                // DCNv4 cache. CPU fallback here would fail, so successful GPU
+                // backward below cannot be a hidden whole-network CPU pass.
+                assert!(
+                    cpu.backward(&input, &gf.cpu_forward, &seed)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("missing [dcnv4] forward cache")
+                );
+                let seeds = [None, Some(seed)];
+                cpu.backward_accumulate_seeded(&input, &cf, &seeds).unwrap();
+                gpu.backward_accumulate_seeded_gpu(&gf, &seeds).unwrap();
+                let before = cpu.params.clone();
+                let before_gpu = gpu.params.clone();
+                if adam {
+                    cpu.update_weights_adam(0.005, 2).unwrap();
+                } else {
+                    cpu.update_weights(0.005, 0.3, 0.01, 2);
+                }
+                gpu.update_weights_gpu(0.005, 0.3, 0.01, 2).unwrap();
+                let compare = |name: &str, c: &[f32], g: &[f32], bc: &[f32], bg: &[f32]| {
+                    close(name, c, g, 2e-5);
+                    for i in 0..c.len() {
+                        let dc = c[i] - bc[i];
+                        let dg = g[i] - bg[i];
+                        assert!(
+                            (dc - dg).abs() <= 5e-7 + 1e-3 * dc.abs(),
+                            "{name} step={step} adam={adam} delta[{i}]: {dc} vs {dg}"
+                        );
+                    }
+                    assert_ne!(bg, g, "{name}: GPU block did not move");
+                };
+                let (
+                    LayerParams::Convolutional(c),
+                    LayerParams::Convolutional(g),
+                    LayerParams::Convolutional(bc),
+                    LayerParams::Convolutional(bg),
+                ) = (&cpu.params[0], &gpu.params[0], &before[0], &before_gpu[0])
+                else {
+                    unreachable!()
+                };
+                compare(
+                    "upstream conv weights",
+                    &c.weights,
+                    &g.weights,
+                    &bc.weights,
+                    &bg.weights,
+                );
+                compare(
+                    "upstream conv biases",
+                    &c.biases,
+                    &g.biases,
+                    &bc.biases,
+                    &bg.biases,
+                );
+                let (
+                    LayerParams::Dcnv4(c),
+                    LayerParams::Dcnv4(g),
+                    LayerParams::Dcnv4(bc),
+                    LayerParams::Dcnv4(bg),
+                ) = (&cpu.params[1], &gpu.params[1], &before[1], &before_gpu[1])
+                else {
+                    unreachable!()
+                };
+                compare(
+                    "DCNv4 output biases",
+                    &c.biases,
+                    &g.biases,
+                    &bc.biases,
+                    &bg.biases,
+                );
+                compare(
+                    "DCNv4 offset weights",
+                    &c.offset_weights,
+                    &g.offset_weights,
+                    &bc.offset_weights,
+                    &bg.offset_weights,
+                );
+                compare(
+                    "DCNv4 offset biases",
+                    &c.offset_biases,
+                    &g.offset_biases,
+                    &bc.offset_biases,
+                    &bg.offset_biases,
+                );
+                let LayerParams::Dcnv4(old) = &initial[1] else {
+                    unreachable!()
+                };
+                assert_eq!(c.dummy_weights, old.dummy_weights);
+                assert_eq!(g.dummy_weights, old.dummy_weights);
+            }
+        }
+    }
 }
 
 #[test]

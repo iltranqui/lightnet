@@ -77,6 +77,8 @@ impl GradMode {
     }
 }
 
+#[path = "runtime/dcnv4_gpu.rs"]
+mod dcnv4_gpu;
 #[path = "runtime/laya_act_gpu.rs"]
 mod laya_act_gpu;
 
@@ -11437,8 +11439,9 @@ where
             || self.requires_cpu_backward_fallback()
             || has_batch_normalized_recurrent
             || has_host_only_deform;
-        // Path selection for `[deform_conv]` must match the backward's gate
-        // exactly; it is independent of whether host copies are retained.
+        // Path selection for both deformable families must match the backward's
+        // gate exactly; independent of whether host copies are retained.
+        // DCNv4's own unsupported variants are in requires_cpu_backward_fallback.
         let deform_device = !self.requires_cpu_backward_fallback() && !has_host_only_deform;
         let expected = self.network.net.input_shape();
         if input.shape != expected {
@@ -12095,23 +12098,30 @@ where
                         .map_err(|err| backend_error("upload laya_loss output", err))?
                 }
                 (LayerKind::Dcnv4(spec), LayerParams::Dcnv4(params)) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download DCNv4 input", err))?;
-                    let (host_output, host_activation, cache) =
-                        forward_dcnv4_with_cache(spec, params, &host_input, layer.output_shape)?;
-                    dcnv4_cache = Some(cache);
-                    activation_input_gpu = Some(
+                    if deform_device {
+                        let (output, pre) =
+                            dcnv4_gpu::forward(&self.backend, current_input, layer, spec, params)?;
+                        activation_input_gpu = Some(pre);
+                        output
+                    } else {
+                        let host_input = self
+                            .download_tensor(current_input, layer.input_shape)
+                            .map_err(|err| backend_error("download DCNv4 input", err))?;
+                        let (host_output, host_activation, cache) =
+                            forward_dcnv4_with_cache(spec, params, &host_input, layer.output_shape)?;
+                        dcnv4_cache = Some(cache);
+                        activation_input_gpu = Some(
+                            self.backend
+                                .upload_f32(
+                                    &tensor_backend_shape(layer.output_shape),
+                                    &host_activation.data,
+                                )
+                                .map_err(|err| backend_error("upload DCNv4 activation cache", err))?,
+                        );
                         self.backend
-                            .upload_f32(
-                                &tensor_backend_shape(layer.output_shape),
-                                &host_activation.data,
-                            )
-                            .map_err(|err| backend_error("upload DCNv4 activation cache", err))?,
-                    );
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
-                        .map_err(|err| backend_error("upload DCNv4 output", err))?
+                            .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
+                            .map_err(|err| backend_error("upload DCNv4 output", err))?
+                    }
                 }
                 (LayerKind::DeformConv(spec), LayerParams::DeformConv(params)) => {
                     if deform_device {
@@ -15929,6 +15939,32 @@ where
                         &mut layer_output_gradients,
                     )?;
                 }
+                (LayerKind::Dcnv4(spec), Some(LayerParams::Dcnv4(params))) => {
+                    let input = if layer.index == 0 {
+                        &forward.input_gpu
+                    } else {
+                        &forward.gpu_layer_outputs[layer.index - 1]
+                    };
+                    let pre = forward.gpu_layer_activation_inputs[layer.index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing DCNv4 activation cache at #{}", layer.index
+                            ))
+                        })?;
+                    let gradients =
+                        dcnv4_gpu::backward(&self.backend, input, pre, &grad, layer, spec, params)?;
+                    {
+                        let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
+                        let LayerTrainBuffers::Dcnv4(train) = &mut buffers[layer.index] else {
+                            return Err(Error::InvalidConfig("missing DCNv4 train buffers".to_owned()));
+                        };
+                        dcnv4_gpu::accumulate(train, &gradients)?;
+                    }
+                    self.accumulate_previous_gpu_gradient(
+                        layer.index, gradients.input, &mut layer_output_gradients,
+                    )?;
+                }
                 (LayerKind::DeformConv(spec), Some(LayerParams::DeformConv(params))) => {
                     // Native path. Device forward/backward; the only host hop is
                     // the batch-coupled offset-normalization Jacobian.
@@ -16331,6 +16367,11 @@ where
                 // Use the Rust host reference and have no native device backward.
                 // `[deform_conv]` now has one (see the `has_host_only_deform`
                 // guard for the variants that still need the host path).
+                LayerKind::Dcnv4(spec) => {
+                    if dcnv4_gpu::needs_host(spec) {
+                        return true;
+                    }
+                }
                 LayerKind::Deconvolutional(_) => return true,
                 // Weighted shortcut parameter reductions stay host-resident,
                 // while input/source gradients use backend elementwise ops.
@@ -16342,8 +16383,7 @@ where
                 | LayerKind::Swin(_)
                 | LayerKind::TuckerAttention(_)
                 | LayerKind::MambaVision(_)
-                | LayerKind::KimiKda(_)
-                | LayerKind::Dcnv4(_) => return true,
+                | LayerKind::KimiKda(_) => return true,
                 // Connected layers are handled on the GPU path with a host
                 // round trip unless their activation or batch norm
                 // (batch-statistics training) is unsupported.
@@ -30516,7 +30556,7 @@ mod tests {
     }
 
     #[test]
-    fn dcnv4_runtime_backward_and_fake_backend_host_fallback_match() {
+    fn dcnv4_runtime_backward_and_fake_backend_native_defaults_match() {
         let network = Network::from_config(
             ConfigFile::parse_str(
                 "dcnv4-runtime.cfg",
@@ -30540,7 +30580,7 @@ mod tests {
         params.biases[0] = 0.07;
         let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
         gpu.params = cpu.params.clone();
-        assert!(gpu.requires_cpu_backward_fallback());
+        assert!(!gpu.requires_cpu_backward_fallback());
 
         let input = Tensor::from_data(
             TensorShape::new(4, 4, 1, 1),
@@ -30554,10 +30594,7 @@ mod tests {
             gpu_forward.cpu_forward.final_output(),
             cpu_forward.final_output()
         );
-        assert_eq!(
-            gpu_forward.cpu_forward.dcnv4_caches,
-            cpu_forward.dcnv4_caches
-        );
+        assert!(gpu_forward.cpu_forward.dcnv4_caches[0].is_none());
 
         let seed = Tensor::from_data(
             TensorShape::new(4, 4, 1, 1),
@@ -46343,6 +46380,8 @@ probability=0.5
         );
     }
 
+    #[path = "dcnv4_gpu_tests.rs"]
+    mod dcnv4_gpu_tests;
     #[path = "depth_anything_runtime_tests.rs"]
     mod depth_anything_runtime_tests;
     #[path = "dpt_head_runtime_tests.rs"]

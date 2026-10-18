@@ -856,6 +856,67 @@ pub trait F32TensorOpsBackend {
         ))
     }
 
+    /// Raw DCNv4 NCHW output and dense NHWC offset cache. Generic backends use
+    /// the host reference; native backends must override both directions.
+    fn dcnv4_forward_f32(
+        &self,
+        input: &Self::Tensor,
+        weights: &Self::Tensor,
+        biases: &Self::Tensor,
+        desc: host_ops::dcnv4::Dcnv4Composition,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        let (out, offsets) = host_ops::dcnv4::composition_forward(
+            &self.download_f32(input)?,
+            &self.download_f32(weights)?,
+            &self.download_f32(biases)?,
+            desc,
+        )
+        .expect("invalid DCNv4 composition operands");
+        let g = desc.geometry;
+        Ok((
+            self.upload_f32(
+                &[g.batch, g.channels, g.output_height, g.output_width],
+                &out,
+            )?,
+            self.upload_f32(&[g.batch, g.spatial(), g.offset_dim()], &offsets)?,
+        ))
+    }
+
+    /// Positive, batch-summed input/offset-weight/offset-bias gradients.
+    fn dcnv4_backward_f32(
+        &self,
+        input: &Self::Tensor,
+        weights: &Self::Tensor,
+        offsets: &Self::Tensor,
+        seed: &Self::Tensor,
+        desc: host_ops::dcnv4::Dcnv4Composition,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        let grad = host_ops::dcnv4::composition_backward(
+            &self.download_f32(input)?,
+            &self.download_f32(weights)?,
+            &self.download_f32(offsets)?,
+            &self.download_f32(seed)?,
+            desc,
+        )
+        .expect("invalid DCNv4 composition backward operands");
+        let g = desc.geometry;
+        Ok((
+            self.upload_f32(
+                &[g.batch, g.channels, g.input_height, g.input_width],
+                &grad.input,
+            )?,
+            self.upload_f32(
+                &[g.offset_dim(), g.channels, g.size, g.size],
+                &grad.offset_weights,
+            )?,
+            self.upload_f32(&[g.offset_dim()], &grad.offset_biases)?,
+        ))
+    }
+
     /// Source `sanitize`: finite -> clamp to +/-10000, non-finite -> 0.
     fn deform_sanitize_f32(
         &self,

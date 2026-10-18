@@ -15,6 +15,9 @@
 //! one and reports a false mismatch (see `tasks/rust/lessons.md`).
 
 use super::bilinear_gather::sample_at;
+#[path = "dcnv4_composition.rs"]
+mod composition;
+pub use composition::{CompositionGradients, composition_backward, composition_forward};
 
 /// Geometry and switches of one aggregation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
