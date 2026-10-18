@@ -31,22 +31,24 @@ inference (v0.2.001–002). Act-head features/exact-erf primitives are native f3
 Evidence/limits are in `implemented.md` §§41–45. Do not repeat these ports.
 Act-head uses four uncached weight uploads per forward; no residency/speedup
 claim. Runtime backward still uses CPU, act params remain frozen, f16 rejected.
-Latest GPU slice is v0.2.013: bounded DCNv4 native runtime math (no BN, <=25
-active points, supported elementwise activation, no other fallback/host-only
-deform_conv). Trait migration and both dispatch directions are wired. Backward
-recomputes offsets on device; parameter gradients and SGD/Adam stay on the host.
-Two-step SGD/Adam agree with CPU, including upstream conv and all active blocks.
-Host-cuda 37, host DCNv4 22, mandatory runtime:: 278; focused device runtime 3,
-composition 3 and aggregate 6 passed. Full runtime-chain timed out at 600 s in
-ViT after 25 preceding tests reported ok; **not a full-suite pass**. Audit/limits
-in `implemented.md` §50; source/layout correction in §49. Native deform_conv was
-already wired in v0.2.007 within its documented bounds; do not repeat these ports.
-**Next independent DCNv4 slice:** native rolling-stat BN affine forward and
-adjoint, matching `forward_dcnv4_with_cache`/CPU backward's frozen rolling-stat
-semantics (do not substitute convolution batch-stat BN). Keep excluded variants'
-host caches and test all parameter blocks/two-step updates before relaxing the
-BN gate. Unsupported activations/large kernels, compact/f16 and native parameter
-updates/residency remain open; this bounded path is not a fully native layer.
+Latest GPU slice is v0.2.014: DCNv4 native rolling-stat BN affine/adjoint plus
+post-backward 0.9 EMA, including unseeded layers. Eligible math (<=25 active
+points, supported elementwise activation, no other fallback/host-only deform_conv)
+is native with BN off/on; ignored ordinary bias/beta and update gates preserved.
+Forward/gradient normalization uses the old rolling values, NOT batch statistics.
+Host-cuda 37, host DCNv4 26, mandatory runtime:: 282; focused device BN 2,
+runtime 3 (eight configs × two SGD/Adam steps), composition 3, aggregate 6 passed.
+Details/source boundaries: `implemented.md` §51; previous runtime/layout audits
+in §§49–50. Parameter gradients/SGD/Adam and EMA metadata stay on the host;
+repeated uploads/raw recomputation remain, no residency/speedup claim. Previous
+full runtime-chain timed out at 600 s in ViT; **not a full-suite pass**.
+**Next independent DCNv4 slice:** native NormalizeChannels* activation/adjoint
+composition using existing backend primitives, after optional BN affine. Audit
+Rust/Cpp gradient-mode choices and zero-norm/tie fixtures; test real CPU/GPU
+forward/backward and optimizer parity before relaxing those activation gates.
+Keep remaining unsupported activations/large kernels and mixed networks on
+host caches. Compact/f16, native parameter updates/residency and GPU Muon remain
+open. Native deform_conv was already wired in v0.2.007; do not repeat these ports.
 Recheck `version-map.tsv` before allocating another version. Earlier wave
 sections below retain historical findings; this resume point takes precedence.
 
@@ -403,10 +405,10 @@ shared old aggregation layout (K=size²-remove_center, padded row width). This
 supersedes the stage-only parity claims above; audit in `implemented.md` §49.
 v0.2.013 wires eligible f32 runtime math and verifies two-step SGD/Adam parity;
 parameter gradients/updates remain host-side and offsets recompute on device.
-`requires_cpu_backward_fallback` is now conditional for DCNv4: BN, >25 active
-points or unsupported elementwise activation still force the host path. Next:
-native rolling-stat BN affine/adjoint, preserving source CPU semantics; audit in
-`implemented.md` §50.
+`requires_cpu_backward_fallback` is conditional for DCNv4: >25 active points
+or unsupported activation still force the host path. v0.2.014 now supports
+rolling-stat BN affine/adjoint and post-backward 0.9 EMA; audit §51. Next:
+NormalizeChannels* activation/adjoint composition; retain all other limits.
 
 **Concrete fixture numbers for that attempt** (recomputed from the failing case,
 `softmax=false, remove_center=false`, `size=3, pad=1, scale=0.75`, output cell

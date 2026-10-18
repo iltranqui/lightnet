@@ -106,7 +106,7 @@ with the command given rather than trusting the number.
 | `Moe` | alias | C++ | fwd | exact | pin | native | device | no |
 | `EmlConvolutional` | alias | C++ | fwd | exact | pin | native | device / CPU (BN) | no |
 | `GraphConv` | alias | C++ | fwd | exact | T4 | none | none | no |
-| `Dcnv4` | alias | C++ | fwd | exact | pin | native (no BN, <=25 points, supported act) / host otherwise | mixed (native math same gate; parameter gradients/updates host) | no |
+| `Dcnv4` | alias | C++ | fwd | exact | pin | native (incl. rolling-stat BN, <=25 points, supported act) / host otherwise | mixed (native math same gate; parameter gradients/updates host) | no |
 | `DeformConv` | alias | C++ | fwd | exact | T4 | native (dilation 1, no BN) / host otherwise | native (same gate; one host hop for the normalization Jacobian) | no |
 | `DsConv` | alias | C++ | fwd | exact | T4 | none | none | no |
 | `Wmhf` | alias | C++ | fwd | exact | T4 | none | none | no |
@@ -182,16 +182,17 @@ an `UnsupportedLayer`.
 > parameter block, masked) plus the retained host-fallback test for the BN case.
 > The only host-resident step in the device path is the batch-serial
 > normalization Jacobian. `[dsconv]` and `[graph_conv]` remain unwired.
-> **DCNv4 is now bounded-native in v0.2.013:** no BN, <=25 active points,
-> supported elementwise activation, no other CPU fallback/host-only deform_conv.
-> Both directions share the global gate. Offsets recompute on device during
-> backward; parameter gradients download to host SGD/Adam buffers. BN/large/
-> unsupported-activation/mixed networks keep host caches. Host runtime 278,
-> host DCNv4 22, focused device runtime 3 (two-step SGD/Adam plus BN/mixed),
-> composition 3 and aggregate 6 passed. Full device runtime-chain timed out at
-> 600 s in ViT after 25 preceding tests reported ok; not a full-suite pass.
-> Layout correction/source-oracle evidence is in §49; runtime audit/limits in
-> `implemented.md` §50. Not native optimizer/resident-weight completion.
+> **DCNv4 is bounded-native in v0.2.013–014:** <=25 active points, supported
+> elementwise activation, optional rolling-stat BN, no other CPU fallback/
+> host-only deform_conv. Both directions share the global gate. BN affine/
+> adjoint and post-backward 0.9 EMA reduce on device (per-channel metadata syncs
+> to host); no batch-stat normalization substitution. Offsets/raw outputs
+> recompute; parameter gradients download to host SGD/Adam buffers. Large/
+> unsupported-activation/mixed networks keep host caches. Host runtime 282,
+> host DCNv4 26, focused device BN 2/runtime 3, composition 3 and aggregate 6
+> passed. Previous full runtime-chain timed out at 600 s in ViT; not a pass.
+> Layout/source-oracle evidence is in §49; runtime/BN audits in `implemented.md`
+> §§50–51. Not native optimizer/resident-weight or C++ training-BN completion.
 
 ## GPU forward but CPU backward
 
@@ -203,7 +204,7 @@ layer count.
 | Variant | GPU forward | Missing backward piece |
 |---|---|---|
 | `Deconvolutional` | host round trip (`deconv_forward` on host) | device deconv dgrad/wgrad |
-| `Dcnv4` excluded/mixed variants | host round trip (BN, >25 points, unsupported activation or another fallback layer) | native BN/remaining activations/large-kernel paths; eligible math is native since v0.2.013 |
+| `Dcnv4` excluded/mixed variants | host round trip (>25 points, unsupported activation or another fallback layer) | remaining activations/large-kernel paths; eligible BN math is native since v0.2.014 |
 | `Vit` | host round trip | device attention/MLP backward (flash dQ/dK/dV primitives exist) |
 | `Swin` | host round trip | device windowed-attention backward |
 | `TuckerAttention` | host round trip | device low-rank factor backward |
@@ -236,7 +237,7 @@ devices and head sizes (no native kernel at all), even though standard
 | MoE | device forward/backward, device SGD/Adam for router and experts, DNOPT3/4 moments | BN-expert **SGD** still host-side per `STATUS.md`; router parameter values sync to host each step |
 | EML | device forward, device SGD/Adam (DNOPT5), BN scale/beta gradients | BN backward CPU fallback per v71; documents disagree on later state — verify against `implemented.md` §7 before planning |
 | Recurrent | device projections/BPTT, on-device caches and gradient accumulation without BN | BN forward/cache, rolling-stat update and optimizer remain host-side; some parameter-gradient transfers still cross the host |
-| DCNv4 | bounded native f32 forward/backward, two-step SGD/Adam parity (v0.2.013) | BN/unsupported activations/large variants host; offsets recompute, parameter gradients/updates host; compact/f16 absent |
+| DCNv4 | bounded native f32 forward/backward incl. rolling-stat BN and 0.9 EMA, two-step SGD/Adam parity (v0.2.014) | unsupported activations/large variants host; offsets/raw stats recompute, parameter gradients/updates host; compact/f16 absent |
 | Shortcut (weighted) | device input/source gradients, exact normalization derivatives | per-input/per-slot weight gradient vector crosses to host; optimizer host-side |
 | Connected | device GEMM + activation, BN folded at inference | BN training and unsupported activations fall back |
 | `Crop`, `BatchNorm` | device inference | training explicitly rejected |

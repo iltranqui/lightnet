@@ -9,11 +9,12 @@
 
 ## Current boundary
 
-Bounded f32 runtime math is wired in v0.2.013; see `implemented.md` §50 for the
-complete requirement-to-artifact audit, test-first evidence, resolved compiler
-issues and the full runtime-chain timeout. Do not repeat trait migration or
-no-BN forward/backward wiring. Native eligibility is no BN, <=25 active points,
-supported elementwise activation and no other CPU fallback/host-only deform_conv.
+Bounded f32 runtime math is wired in v0.2.013 and rolling-stat BN/adjoint/EMA
+is native in v0.2.014; audits in `implemented.md` §§50–51. Do not repeat trait
+migration, forward/backward wiring or BN math. Native eligibility is <=25 active
+points, supported elementwise activation, optional BN and no other CPU fallback/
+host-only deform_conv. BN normalizes with old rolling stats; 0.9 EMA runs after
+backward, including unseeded/gated layers, not in forward.
 
 Parameter gradients and SGD/Adam still cross to host buffers. Backward recomputes
 offsets from that forward state's own input and unchanged current parameters;
@@ -30,19 +31,19 @@ but disclosed. No speedup/residency claim. GPU Muon remains absent.
   `host_ops/dcnv4_composition.rs`: generic surface and host defaults.
 - `src/darknet-cuda-oxide/src/lib.rs`, `src/darknet-cuda-oxide/src/dcnv4_native.rs`:
   native backend surface/overrides; kernels already implement raw math.
-- `src/darknet-core/src/runtime/tests/dcnv4_gpu_tests.rs` and
+- `src/darknet-core/src/runtime/tests/dcnv4_gpu_tests.rs`,
+  `src/darknet-cuda-oxide/tests/oxide_dcnv4_bn.rs` and
   `src/darknet-cuda-oxide/tests/oxide_runtime_chain.rs`: path/cache, multiple
   forward states, accumulation, parameter motion and two-step optimizer parity.
 - Handbook/status/todo/implemented/support matrix/version map: honest scope.
 
 ## Open gates
 
-- [ ] **Next: native DCNv4 rolling-stat BN affine/adjoint.** Audit
-  `forward_dcnv4_with_cache` and CPU DCNv4 backward: stored rolling mean/variance,
-  scale, no beta addition and no batch-stat training substitution. Verify forward,
-  input/scale/predictor gradients, update gates and two steps before removing BN
-  from `needs_host`. Retain mixed-network caches.
-- [ ] Native NormalizeChannels*/unsupported activation and >25-point paths.
+- [ ] **Next: native DCNv4 NormalizeChannels* activations/adjoints.** Use existing
+  backend normalization primitives after optional BN affine, pin gradient-mode
+  semantics and zero/tie cases, verify CPU/GPU derivatives/two-step updates before
+  relaxing activation gates. Retain other unsupported/mixed host caches.
+- [ ] Other unsupported activations and >25-point paths.
 - [ ] Compact/f16 inference and precision-specific tests, preserving current
   explicit rejection until each path is implemented.
 - [ ] Device-resident gradients, optimizer state/updates and reusable weights;

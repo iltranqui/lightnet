@@ -76,6 +76,7 @@ file is named inline.
 - [48. DCNv4 native aggregation primitives (offsets given)](#48-dcnv4-native-aggregation-primitives-offsets-given)
 - [49. Native DCNv4 projection and backward composition](#49-native-dcnv4-projection-and-backward-composition)
 - [50. Bounded DCNv4 native runtime forward/backward](#50-bounded-dcnv4-native-runtime-forwardbackward)
+- [51. Native DCNv4 rolling-stat BN](#51-native-dcnv4-rolling-stat-bn)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1371,6 +1372,67 @@ activations/large kernels, compact/f16, native parameter gradients/updates/
 residency and GPU Muon remain open, as do all documented CPU/other-GPU/MoE gaps.
 Next independent DCNv4 slice: native rolling-stat BN affine math and its exact
 adjoint (preserve the CPU DCNv4 rolling-stat semantics, not conv batch stats).
+
+## 51. Native DCNv4 rolling-stat BN
+
+- v0.2.014 (`ceef2037`): DCNv4's bounded f32 native runtime path now accepts BN. Existing
+  device bias-add/channel-scale/product/reduction primitives implement
+  `xhat=(raw-mean)/sqrt(var+1e-5)`, `pre=xhat*gamma`,
+  `d_raw=delta*gamma/sqrt(var+1e-5)` and `d_gamma=sum(delta*xhat)`.
+  Gamma may be zero or negative; no division by gamma. Ordinary biases and BN
+  beta remain unused and unchanged, matching the existing Rust CPU contract.
+- Native post-backward stats reduction preserves the CPU **0.9 EMA with unbiased
+  variance**, for every DCNv4 BN layer including unseeded/gated layers. It runs
+  after all gradients, never in forward. Reuses only the stats/EMA outputs of
+  `batchnorm_train_forward_f32`; that primitive's batch-normalized output is
+  discarded, not substituted for the layer's rolling-stat normalization.
+  Only per-channel EMA values return to host params (no raw activation download).
+- Code is in `runtime/dcnv4_gpu.rs`; `runtime.rs` adds one post-backward hook and
+  updates the old BN test expectation. Eligibility still excludes >25 points,
+  unsupported activations and whole-network host fallback/host-only deform_conv.
+  Existing SGD/Adam buffers, rate scaling, gates, state encoding and ignored
+  parameter blocks are unchanged. Parameter gradients/updates remain host-side;
+  repeated uploads/raw recomputation and no residency/speedup claim remain.
+
+Scoped prompt-to-artifact checklist (serial, MemoryHigh=3G user scopes, -j 2
+except the -j 4 CLI check):
+
+| Requirement | Concrete evidence |
+|---|---|
+| Test-first BN path relaxation | `dcnv4_bn_gpu_uses_native_path_before_stats_update` first failed the old unconditional BN fallback assertion. Now verifies native selection, no host math cache, no forward EMA update |
+| Real CPU output/input/parameter derivatives and gamma=0 | `dcnv4_bn_native_gradients_match_cpu_including_zero_gamma` compares every input, offset weight/bias and gamma gradient with the real CPU backward (B=2/groups=2, non-square map, zero/negative gamma); gamma=0 derivative must be nonzero; rolling values agree after accumulation |
+| Historical hand expectation and EMA timing retained | Existing `dcnv4_batchnorm_scale_derivative_and_rolling_stats_use_native_defaults` still pins gamma gradient and rolling mean=0.43, variance=0.7966667; CPU/FakeBackend buffers/params agree, now without CPU backward fallback |
+| Unseeded stats, malformed BN metadata | `dcnv4_bn_native_updates_unseeded_stats_and_rejects_bad_bn_storage`: unseeded callback agrees with CPU; truncated beta/gamma/mean/variance or absent BN state return InvalidConfig before backend math |
+| Update gates and ignored fields | `dcnv4_bn_native_preserves_optimizer_gates_but_advances_stats`: SGD and Adam, dont_update/train_only_bn/burnin_update; optimizer leaves all params unchanged relative to post-EMA state, while EMA still advances. Existing/real tests pin ordinary-bias/beta/dummy invariance |
+| Mandatory full host runtime filter | `MEM=3G ./tools/test_host.sh runtime::`: **282 passed**; includes existing mixed fallback/host-only deform guards and all parked tests. Focused `test_host.sh dcnv4`: **26 core passed**, 0 CLI |
+| Actual-device BN derivative check | `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_bn`: **2 passed**. `native_bn_runtime_forward_derivatives_hold_rolling_stats_fixed` differentiates actual GPU runtime forwards: input-adjoint direction via an upstream identity-conv update, sampled predictor weights/biases and both gammas (zero/negative). Supplied-seed lr=1 readout accounts for batch=2 and predictor rate=0.01; FD epsilon=0.002, floor seams excluded; every forward holds EMA fixed |
+| Native unseeded EMA and N=1 variance | Same suite's `native_bn_unseeded_and_single_sample_stats_match_cpu` compares per-channel mean/variance against real CPU for B=2/non-square map and B=1/H=W=1; scale values unchanged |
+| Native selection, two SGD/Adam steps, all blocks | `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4`: **3 passed**. Expanded two-step test covers BN off/on × SGD/Adam × softmax/remove_center on+off, B=2/groups=2, dilation=2/coarse stride=2, swish/leaky, zero/negative gamma, upstream conv and all active DCNv4 blocks moving; rolling stats agree, ordinary biases/beta/dummy invariant |
+| Mixed networks retain original cache/stats path | Same device suite's deconvolution-mixed network now has BN DCNv4 and proves CPU backward can consume GPU-produced host caches. Native BN test proves the opposite (CPU backward fails specifically for missing DCNv4 cache while GPU backward succeeds) |
+| Raw math regressions | `--test oxide_dcnv4_chain`: **3 passed** (18 CPU cases, device FD and guards); `--test oxide_dcnv4_aggregate`: **6 passed**; capped `cargo test -p darknet-cuda --lib -j 2 -- --test-threads=1`: **37 passed** |
+| Native, not a new host math fallback | Inspected Oxide implementations of vector_mul/channel_scale/bias reductions and batchnorm_train_forward: device launches/reductions. Helper downloads only gradients and per-channel EMA values; CPU counterparts remain defaults for generic/FakeBackend |
+| Integration/format/hygiene | Capped `cargo check -p darknet-cli --features oxide -j 4` passed; targeted Rustfmt/diff checks passed; no persistent weights/sidecars/ONNX artifacts found in the work scope. Unrelated user/parked edits excluded |
+
+One compile-only issue was caught and fixed: vector_mul_f32 requires an explicit
+output shape. No failed test remains in these focused gates. No new kernels,
+optimizer formats, public forward-state fields, global AMP/precision semantics
+or dataset training runs. Existing compiler IR/PTX/build trees remain referenced
+and were retained. Full host/corpus/Oxide suites were not run; the previous
+600-second runtime-chain ViT timeout remains unresolved and is not a pass.
+
+Evidence boundary: **device vs existing Rust CPU contract; hand-derived from
+source, no compiled-C++ golden**. C++ DCNv4 calls forward_batchnorm_layer and
+its CPU backward is a stub; this is not evidence of C++ training BN parity.
+Normalize with the current rolling values for a forward/backward pair; do not
+change weights or rolling stats between that pair. Post-backward EMA is state
+maintenance, not part of that forward's differentiated function.
+
+Completion audit: BN math/EMA is closed within this increment, not the full
+handbook objective. CPU source variants/axis pins, native unsupported/large
+DCNv4 paths, compact/f16, device parameter updates/residency, other GPU layers,
+GPU Muon and sparse MoE/performance evidence remain open. Next independent slice:
+native DCNv4 NormalizeChannels* activations/adjoints using existing backend
+primitives, preserving BN ordering and whole-network fallback for other gaps.
 
 ## Not implemented / open (pointer)
 
