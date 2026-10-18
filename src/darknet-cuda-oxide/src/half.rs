@@ -944,6 +944,50 @@ impl OxideBackend {
         self.channel_affine_act_f16(x, None, bias, channels, channel_stride, activation, config)
     }
 
+    /// Native half-storage gather. Feature payloads never pass through f32;
+    /// only marker positions are widened on device before rounding/clamping.
+    pub fn marker_gather_f16(
+        &self,
+        features: &OxideTensorF16,
+        markers: &OxideTensorF16,
+        feature_shape: &[usize],
+        marker_shape: &[usize],
+        options: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF16, OxideError> {
+        let op = "marker_gather_f16";
+        let d = darknet_cuda::host_ops::marker_gather::Layout::new(
+            feature_shape,
+            marker_shape,
+            options,
+        )
+        .map_err(|err| shape_err(op, err))?;
+        if features.len() != d.input_len || markers.len() != d.markers_len {
+            return Err(shape_err(
+                op,
+                "tensor storage does not match layout".to_owned(),
+            ));
+        }
+        let mut output = self.alloc16_uninit(d.output_len)?;
+        // SAFETY: validated NCHW extents/storage bound all reads and each
+        // thread writes one distinct half output, including ragged tails.
+        unsafe {
+            self.layers_extra.marker_gather_f16(
+                &self.stream,
+                launch::elementwise(d.output_len, config),
+                &features.buf,
+                &markers.buf,
+                &mut output,
+                d.hidden,
+                d.sequence,
+                d.marker_channels,
+                d.options,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF16::new(output, &d.output_shape()))
+    }
+
     /// f16 channel concat with the same slice metadata as `route_concat_f32`.
     #[allow(clippy::too_many_arguments)]
     pub fn route_concat_f16(
@@ -1109,6 +1153,26 @@ impl darknet_cuda::F16TensorOpsBackend for OxideBackend {
     ) -> Result<Self::TensorF16, Self::Error> {
         OxideBackend::upsample_f16(
             self, x, output_shape, channels, input_height, input_width, stride, scale, reverse, config,
+        )
+    }
+
+    fn marker_gather_f16(
+        &self,
+        features: &Self::TensorF16,
+        markers: &Self::TensorF16,
+        feature_shape: &[usize],
+        marker_shape: &[usize],
+        options: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error> {
+        OxideBackend::marker_gather_f16(
+            self,
+            features,
+            markers,
+            feature_shape,
+            marker_shape,
+            options,
+            config,
         )
     }
 

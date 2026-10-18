@@ -8380,8 +8380,8 @@ where
     /// activations are stored as binary16 on the device (f32 accumulation,
     /// bias and activation), the yolo heads are widened to f32 on download.
     /// Supports convolutional, maxpool, (local) avgpool, standalone batchnorm,
-    /// route, shortcut (mismatched sources are cropped / zero-padded like
-    /// Darknet), upsample (also `reverse`) and yolo-style pass-through layers;
+    /// route, LAYA marker gather, shortcut (mismatched sources are cropped /
+    /// zero-padded like Darknet), upsample (also `reverse`) and yolo-style pass-through layers;
     /// any other layer returns `UnsupportedLayer` (use `forward_compact`).
     pub fn forward_compact_f16(&self, input: &Tensor) -> Result<GpuForwardSummary> {
         reject_gpu_hyperbolic_foveation(&self.network, "f16 inference")?;
@@ -8407,6 +8407,7 @@ where
                 | LayerKind::AvgPool
                 | LayerKind::BatchNorm(_)
                 | LayerKind::Route(_)
+                | LayerKind::LayaMarkerGather(_)
                 | LayerKind::Upsample(_)
                 | LayerKind::Yolo(_)
                 | LayerKind::ObbYolo(_)
@@ -8691,13 +8692,48 @@ where
                         .map_err(|err| backend_error("f16 route concat", err))?
                 }
                 (LayerKind::LayaMarkerGather(spec), LayerParams::None) => {
-                    return Err(Error::UnsupportedLayer {
-                        layer_index: layer.index,
-                        name: format!(
-                            "laya_marker_gather f16 (hidden={}, max_options={})",
-                            spec.hidden, spec.max_options
-                        ),
-                    });
+                    let a_index = resolve_relative_layer(layer.index, spec.layers[0])?;
+                    let b_index = resolve_relative_layer(layer.index, spec.layers[1])?;
+                    let a_layer = self
+                        .network
+                        .layers
+                        .get(a_index)
+                        .ok_or(Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.layers[0],
+                        })?;
+                    let b_layer = self
+                        .network
+                        .layers
+                        .get(b_index)
+                        .ok_or(Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.layers[1],
+                        })?;
+                    let a_source = gpu_layer_outputs
+                        .get(a_index)
+                        .and_then(Option::as_ref)
+                        .ok_or(Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.layers[0],
+                        })?;
+                    let b_source = gpu_layer_outputs
+                        .get(b_index)
+                        .and_then(Option::as_ref)
+                        .ok_or(Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.layers[1],
+                        })?;
+                    self.backend
+                        .marker_gather_f16(
+                            a_source,
+                            b_source,
+                            &tensor_backend_shape(a_layer.output_shape),
+                            &tensor_backend_shape(b_layer.output_shape),
+                            spec.max_options,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("GPU f16 laya_marker_gather", err))?
                 }
                 (LayerKind::LayaActHead(spec), LayerParams::LayaActHead(_)) => {
                     return Err(Error::UnsupportedLayer {

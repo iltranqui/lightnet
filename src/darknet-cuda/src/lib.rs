@@ -2076,6 +2076,25 @@ pub trait F16TensorOpsBackend: F32TensorOpsBackend {
         channel_stride: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error>;
+    /// LAYA marker gather on half-storage tensors. The generic default is a
+    /// numeric host reference; Oxide overrides it with bit-preserving device copies.
+    fn marker_gather_f16(
+        &self,
+        features: &Self::TensorF16,
+        markers: &Self::TensorF16,
+        feature_shape: &[usize],
+        marker_shape: &[usize],
+        options: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error> {
+        let _ = config;
+        let layout = host_ops::marker_gather::Layout::new(feature_shape, marker_shape, options)
+            .unwrap_or_else(|err| panic!("{err}"));
+        let features = self.download_f16(features)?;
+        let markers = self.download_f16(markers)?;
+        self.upload_f16(&layout.output_shape(), &layout.forward(&features, &markers))
+    }
+
     /// Mean over the in-image taps of each window.
     fn local_avgpool_f16(
         &self,

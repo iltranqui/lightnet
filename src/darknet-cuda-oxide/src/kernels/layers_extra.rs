@@ -6,6 +6,7 @@
 //! scale_channels}_layer.*` and the `darknet-core` CPU runtime; the host
 //! references live in `darknet_cuda::host_ops`.
 
+use super::convert::f16_bits_to_f32;
 use cuda_device::{DisjointSlice, cuda_module, device, kernel, thread};
 
 /// Device twin of `darknet_cuda::dropout_unit`: must stay bit-identical.
@@ -54,6 +55,32 @@ pub mod kernels {
             let b = channel / hidden;
             let pos = marker_position(markers[(b * marker_channels + 2 * j) * sequence], sequence);
             // SAFETY: validated NCHW extents bound channel/pos and each thread owns i.
+            unsafe {
+                *output.as_mut_ptr().add(i) = features[channel * sequence + pos];
+            }
+        }
+    }
+
+    /// Half-storage inference: decode only marker metadata; feature bits are
+    /// copied without floating arithmetic (including NaN payloads/subnormals).
+    #[kernel]
+    pub fn marker_gather_f16(
+        features: &[u16],
+        markers: &[u16],
+        mut output: DisjointSlice<u16>,
+        hidden: usize,
+        sequence: usize,
+        marker_channels: usize,
+        options: usize,
+    ) {
+        let i = thread::index_1d().get();
+        if i < output.len() {
+            let j = i % options;
+            let channel = i / options;
+            let b = channel / hidden;
+            let marker = f16_bits_to_f32(markers[(b * marker_channels + 2 * j) * sequence]);
+            let pos = marker_position(marker, sequence);
+            // SAFETY: checked extents bound the read; one thread owns each output.
             unsafe {
                 *output.as_mut_ptr().add(i) = features[channel * sequence + pos];
             }
