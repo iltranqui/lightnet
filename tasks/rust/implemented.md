@@ -61,6 +61,7 @@ file is named inline.
 - [26. Foveation FiLM Stage-1 CPU reference](#26-foveation-film-stage-1-cpu-reference)
 - [27. Depth-Anything Stage-1 CPU reference](#27-depth-anything-stage-1-cpu-reference)
 - [28. Stage-1 axis/layout audit (bounded A1 list)](#28-stage-1-axislayout-audit-bounded-a1-list)
+- [29. Stage-1 axis/layout audit of already-ported layers](#29-stage-1-axislayout-audit-of-already-ported-layers)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -842,7 +843,13 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 
 - v0.1.011 (`a34aef8f`): added hand-computed, named tests for NCHW batch/channel/spatial ordering in ViT patchification, per-image MoE routing/blending, EML branches, DCNv4 offset/group axes, every `laya_*` tensor family, channel slicing, deconvolution, and weighted shortcut. The source-level contracts and test names are tabulated in `STATUS.md`'s Axis audit section. No forward behavior changed.
 - Verification: `MEM=3G ./tools/test_host.sh axis_layout` passed 13 core tests; `MEM=3G ./tools/test_host.sh laya_` passed 66. Targeted edition-2024 Rustfmt checks and `git diff --check` passed.
-- Evidence boundary: hand-derived from `Jev_laya` after `git grep`/`git show`; no compiled-C++ golden/parity is claimed. This closes only the bounded A1 list in the local `plan-open-items.md`; the broader Stage-1 axis audit, per-backlog axis requirements, `[dpt_head]`, native GPU work, GPU Muon, and v0.1–v0.3 remain open.
+- Evidence boundary: hand-derived from `Jev_laya` after `git grep`/`git show`; no compiled-C++ golden/parity is claimed. This section records the initial subset; the complete A1 audit of already-ported families is in §29. Per-backlog axis requirements for missing layers, `[dpt_head]`, native GPU work, GPU Muon, and v0.1–v0.3 remain open.
+
+## 29. Stage-1 axis/layout audit of already-ported layers
+
+- v0.1.012 (`60db7b444b8db722aa145954919a798169bb45c8`): completed A1 from `AGENTS.md` for all already-ported families: ViT, Swin, Tucker attention, MambaVision, Kimi KDA, MoE, EML, DCNv4, LAYA, channel slice, deconvolution, and shortcut. Added named hand-computed tests for Swin's batch/window/token/channel partition and cyclic-shift axes, Tucker's batch/window/token/channel isolation, MambaVision's NCHW/token/state axes, and Kimi KDA's NCHW raster scan and per-batch reset. No forward behavior changed.
+- Verification: `MEM=3G ./tools/test_host.sh axis_layout` passed 18 core tests; focused suites passed `tucker_attention` (15), `mambavision` (17), and `kimi_kda` (11). Edition-2024 Rustfmt checks for the four touched modules and `git diff --check` passed.
+- Evidence boundary: hand-derived from `Jev_laya` using `git grep`/`git show`; no compiled-C++ golden/parity is claimed. This closes only the A1 audit for already-ported layers. Every missing-layer port still has its own axis/layout DoD; `[dpt_head]`, native GPU work, GPU Muon, and v0.1–v0.3 remain open.
 
 ## Not implemented / open (pointer)
 

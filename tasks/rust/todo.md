@@ -416,7 +416,7 @@ Immediately next, in dependency order:
   `runtime` (204) host tests passed. No training, Oxide tests, or compiled-C++
   golden/parity. GPU Muon is deferred to Stage 2.
 - [~] Phase 4 foveation / depth / DETR: Stage-1 CPU `[hyperbolic_foveation]` is complete in v0.1.008 (`implemented.md` §25), `[foveation_film]` in v0.1.009 (§26), and `[depth_anything]` in v0.1.010 (§27); LAYA encoder/head are already implemented. `[dpt_head]`, YOLO-3D and DETR remain open. DETR is still broken in C++ (paper only).
-- [x] Bounded A1 axis/layout audit from `plan-open-items.md`: v0.1.011 (`implemented.md` §28) pins source-derived ordering for ViT, MoE, EML, DCNv4, LAYA, channel slice, deconvolution, and shortcut. This does not close the broader Stage-1 axis audit listed in `AGENTS.md` or per-backlog axis requirements; see `STATUS.md`.
+- [x] Stage-1 A1 axis/layout audit of every already-ported family named in `AGENTS.md`: completed in v0.1.012 (`implemented.md` §29), with the initial subset recorded in §28. `STATUS.md` tabulates the source contracts and named tests. Per-backlog axis DoDs for missing-layer ports and the remaining v0.1–v0.3 work stay open.
 
 ## Active and unstarted plans
 
