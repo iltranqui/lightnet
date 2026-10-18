@@ -342,9 +342,19 @@ fixture failures (`lessons.md`).
 
 So the module was removed for the right reason (no failing test in the tree) but
 the diagnosis was wrong: this is not evidence that a forward-only derivation
-fails. Next attempt should transcribe `dcnv4_backward` anyway (cheapest correct
-route) **and** keep every sample off integer coordinates — e.g. add a constant
-+0.37 to the offset bias. The module is otherwise believed correct.
+fails. **Second attempt (direct transcription, offsets shifted +0.37) still
+fails FD**, so the seam hypothesis is disproven as the sole cause: with
+`softmax=false, remove_center=false` the analytic `d_offsets[14]` is `0.0637`
+versus an FD of `0.0499` — same sign, ~1.28x, at an x-offset of kernel point 7.
+Both attempts were removed and the green baseline re-verified (33 passed).
+
+That pattern (analytic consistently larger, no seam, no zero) points at a term
+counted more than once rather than a sign or convention error, and it is not
+diagnosable by FD sweeps alone. The next attempt must instrument instead: print
+the per-channel `top * mask * dx` contributions for one position and compare them
+one by one against a literal transcription of `dcnv4_backward`'s inner loop,
+before any FD. Two blind rewrites have now cost more than one instrumented run
+would have.
 
 ## Verification gates
 
