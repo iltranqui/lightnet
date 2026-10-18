@@ -1434,6 +1434,10 @@ GPU Muon and sparse MoE/performance evidence remain open. Next independent slice
 native DCNv4 NormalizeChannels* activations/adjoints using existing backend
 primitives, preserving BN ordering and whole-network fallback for other gaps.
 
+## 52. Native DCNv4 channel-normalization activations
+
+- v0.2.015 (`1fc80f27`): DCNv4's bounded f32 native path now accepts `normalize_channels`, `_softmax` and `_softmax_maxval` activations (after optional rolling-stat BN) using the existing `normalize_channels_f32`/backward primitives; channel output is recomputed on device from the forward preactivation. Exact `SoftmaxMaxval` adjoint gained the max-chain term (epsilon sits outside exp(x-max); first max selected at ties; one-channel case is constant, zero translation derivative) in both host_ops and the Oxide kernel; `GradMode::Cpp` shortcut unchanged. Gates (serial, 3G): darknet-cuda lib 40, host dcnv4 28, `runtime::` 284, `oxide_dcnv4_normalization` 3 (3 norms x BN x SGD/Adam two-step CPU/GPU parity, GPU forward FD with fixed stats, mixed-network CPU cache), `oxide_layers_extra` 25. Not compiled-C++ parity; larger variants, other activations, compact/f16, device updates/residency, GPU Muon remain open.
+
 ## Not implemented / open (pointer)
 
 See `tasks/rust/todo.md` for the deduplicated open list (P8/P9 follow-ups,

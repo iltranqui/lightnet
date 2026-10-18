@@ -31,7 +31,7 @@ inference (v0.2.001–002). Act-head features/exact-erf primitives are native f3
 Evidence/limits are in `implemented.md` §§41–45. Do not repeat these ports.
 Act-head uses four uncached weight uploads per forward; no residency/speedup
 claim. Runtime backward still uses CPU, act params remain frozen, f16 rejected.
-Latest GPU slice is v0.2.014: DCNv4 native rolling-stat BN affine/adjoint plus
+Latest GPU slice is v0.2.015 (native DCNv4 NormalizeChannels* activations/adjoints, implemented.md §52; the 'Next independent DCNv4 slice' below is DONE). Previous, v0.2.014: DCNv4 native rolling-stat BN affine/adjoint plus
 post-backward 0.9 EMA, including unseeded layers. Eligible math (<=25 active
 points, supported elementwise activation, no other fallback/host-only deform_conv)
 is native with BN off/on; ignored ordinary bias/beta and update gates preserved.

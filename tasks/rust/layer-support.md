@@ -204,7 +204,7 @@ layer count.
 | Variant | GPU forward | Missing backward piece |
 |---|---|---|
 | `Deconvolutional` | host round trip (`deconv_forward` on host) | device deconv dgrad/wgrad |
-| `Dcnv4` excluded/mixed variants | host round trip (>25 points, unsupported activation or another fallback layer) | remaining activations/large-kernel paths; eligible BN math is native since v0.2.014 |
+| `Dcnv4` excluded/mixed variants | host round trip (>25 points, unsupported activation or another fallback layer) | remaining activations/large-kernel paths; eligible BN math native since v0.2.014, NormalizeChannels* activations since v0.2.015 |
 | `Vit` | host round trip | device attention/MLP backward (flash dQ/dK/dV primitives exist) |
 | `Swin` | host round trip | device windowed-attention backward |
 | `TuckerAttention` | host round trip | device low-rank factor backward |
@@ -237,7 +237,7 @@ devices and head sizes (no native kernel at all), even though standard
 | MoE | device forward/backward, device SGD/Adam for router and experts, DNOPT3/4 moments | BN-expert **SGD** still host-side per `STATUS.md`; router parameter values sync to host each step |
 | EML | device forward, device SGD/Adam (DNOPT5), BN scale/beta gradients | BN backward CPU fallback per v71; documents disagree on later state — verify against `implemented.md` §7 before planning |
 | Recurrent | device projections/BPTT, on-device caches and gradient accumulation without BN | BN forward/cache, rolling-stat update and optimizer remain host-side; some parameter-gradient transfers still cross the host |
-| DCNv4 | bounded native f32 forward/backward incl. rolling-stat BN and 0.9 EMA, two-step SGD/Adam parity (v0.2.014) | unsupported activations/large variants host; offsets/raw stats recompute, parameter gradients/updates host; compact/f16 absent |
+| DCNv4 | bounded native f32 forward/backward incl. rolling-stat BN and 0.9 EMA, two-step SGD/Adam parity (v0.2.014), NormalizeChannels* activations (v0.2.015) | other unsupported activations/large variants host; offsets/raw stats recompute, parameter gradients/updates host; compact/f16 absent |
 | Shortcut (weighted) | device input/source gradients, exact normalization derivatives | per-input/per-slot weight gradient vector crosses to host; optimizer host-side |
 | Connected | device GEMM + activation, BN folded at inference | BN training and unsupported activations fall back |
 | `Crop`, `BatchNorm` | device inference | training explicitly rejected |
