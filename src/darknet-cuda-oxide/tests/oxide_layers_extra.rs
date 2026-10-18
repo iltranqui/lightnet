@@ -788,6 +788,37 @@ fn weighted_shortcut_products_and_normalization_gradients_match_reference() {
 }
 
 #[test]
+fn maxval_exact_adjoint_has_zero_translation_and_single_channel_derivative() {
+    let be=backend(); let n=F32ChannelNormalization::SoftmaxMaxval;
+    let shape=[2,1,1,2]; let x=[0.3,-1.7,2.4,0.9]; let seed=[1.7,-0.4,2.3,-1.2];
+    let t=be.upload_f32(&shape,&x).unwrap(); let s=be.upload_f32(&shape,&seed).unwrap();
+    let y=be.normalize_channels_f32(&t,&shape,2,1,2,n,cfg()).unwrap();
+    let dx=be.normalize_channels_backward_f32(&t,&y,&s,&shape,2,1,2,n,false,cfg()).unwrap();
+    assert_eq!(be.download_f32(&dx).unwrap(),vec![0.0;4]);
+    let shifted:Vec<_>=x.iter().map(|v| v+0.02).collect();
+    let shifted=be.upload_f32(&shape,&shifted).unwrap();
+    let yy=be.normalize_channels_f32(&shifted,&shape,2,1,2,n,cfg()).unwrap();
+    assert_eq!(be.download_f32(&y).unwrap(),be.download_f32(&yy).unwrap(),"actual GPU forward is constant");
+    for x in [
+        vec![0.2,1.4,-0.7,0.3,1.7,-0.8,0.9,-0.6,1.8,0.5,-0.3,1.6],
+        vec![1.0;12], // first-max-selected tie subgradient, not cross-tie FD
+    ] {
+        let shape=[2,3,1,2];
+        let seed:Vec<_>=(0..12).map(|i| (i%7) as f32*0.3-0.9).collect();
+        let t=be.upload_f32(&shape,&x).unwrap(); let s=be.upload_f32(&shape,&seed).unwrap();
+        let y=be.normalize_channels_f32(&t,&shape,2,3,2,n,cfg()).unwrap();
+        let dx=be.normalize_channels_backward_f32(&t,&y,&s,&shape,2,3,2,n,false,cfg()).unwrap();
+        let dx=be.download_f32(&dx).unwrap();
+        let host=darknet_cuda::host_ops::normalize_channels_backward(&x,&be.download_f32(&y).unwrap(),&seed,2,3,2,n,false);
+        for (g,w) in dx.iter().zip(host) { assert!((g-w).abs()<2e-7); }
+        for b in 0..2 { for q in 0..2 {
+            let sum=(0..3).map(|c| dx[b*6+c*2+q]).sum::<f32>();
+            assert!(sum.abs()<2e-7,"GPU translation derivative {sum}");
+        }}
+    }
+}
+
+#[test]
 fn channel_normalization_forward_backward_exact_and_cpp_match_reference() {
     let be = backend();
     let (batch, channels, spatial) = (2usize, 3usize, 2usize);

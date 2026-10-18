@@ -264,6 +264,50 @@ fn dcnv4_bn_native_preserves_optimizer_gates_but_advances_stats() {
 }
 
 #[test]
+fn dcnv4_channel_normalization_selects_native_math() {
+    let mut network = dcnv4_network("", "");
+    let LayerKind::Dcnv4(spec) = &mut network.layers[0].kind else { unreachable!() };
+    spec.activation=Activation::NormalizeChannelsSoftmaxMaxval;
+    let gpu=GpuExecutableNetwork::new(network.clone(),FakeBackend);
+    assert!(!gpu.requires_cpu_backward_fallback());
+    let input=Tensor::filled(network.net.input_shape(),0.2);
+    let forward=gpu.forward_training_with_state(&input).unwrap();
+    assert!(forward.cpu_forward.dcnv4_caches[0].is_none());
+}
+
+#[test]
+fn dcnv4_channel_normalization_modes_and_edge_columns_match_reference() {
+    use super::super::{GradMode, dcnv4_gpu};
+    for activation in [Activation::NormalizeChannels,Activation::NormalizeChannelsSoftmax,Activation::NormalizeChannelsSoftmaxMaxval] {
+        let mut network=dcnv4_network("", "");
+        let LayerKind::Dcnv4(spec)=&mut network.layers[0].kind else { unreachable!() };
+        spec.activation=activation;
+        let LayerKind::Dcnv4(spec)=&network.layers[0].kind else { unreachable!() };
+        let norm=spec.activation.to_channel_normalization().unwrap();
+        let gpu=GpuExecutableNetwork::new(network.clone(),FakeBackend);
+        let shape=network.layers[0].output_shape;
+        let spatial=shape.height*shape.width;
+        let mut values=vec![0.0;shape.batch*shape.element_count()];
+        for b in 0..shape.batch { for c in 0..shape.channels { for q in 0..spatial {
+            values[(b*shape.channels+c)*spatial+q]=match q%4 {0=>0.0,1=>-1.0,2=>0.5,_=>if c==0 {-0.7} else {1.3}};
+        }}}
+        let seed:Vec<_>=(0..values.len()).map(|i| (i%7) as f32*0.3-0.9).collect();
+        let sh=[shape.batch,shape.channels,shape.height,shape.width];
+        let pre=gpu.backend.upload_f32(&sh,&values).unwrap();
+        let s=gpu.backend.upload_f32(&sh,&seed).unwrap();
+        let output=dcnv4_gpu::activation_output(&gpu.backend,&pre,&network.layers[0],spec).unwrap();
+        let want=darknet_cuda::host_ops::normalize_channels(&values,shape.batch,shape.channels,spatial,norm);
+        assert_eq!(gpu.backend.download_f32(&output).unwrap(),want);
+        for mode in [GradMode::Analytical,GradMode::Cpp] {
+            let g=dcnv4_gpu::activation_delta(&gpu.backend,&pre,&s,&network.layers[0],spec,mode).unwrap();
+            let want=darknet_cuda::host_ops::normalize_channels_backward(&values,&want,&seed,
+                shape.batch,shape.channels,spatial,norm,mode==GradMode::Cpp);
+            assert_eq!(gpu.backend.download_f32(&g).unwrap(),want);
+        }
+    }
+}
+
+#[test]
 fn dcnv4_gpu_selects_native_math_without_host_cache() {
     let network = dcnv4_network("", "");
     let gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
@@ -392,7 +436,7 @@ fn dcnv4_gpu_retains_host_cache_for_excluded_and_mixed_variants() {
     let LayerKind::Dcnv4(spec) = &mut normalized.layers[0].kind else {
         unreachable!()
     };
-    spec.activation = Activation::NormalizeChannels;
+    spec.activation = Activation::Revleaky;
     for network in [
         large,
         normalized,

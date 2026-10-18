@@ -1,4 +1,4 @@
-//! Bounded DCNv4 GPU math: <=25 active points, elementwise activation.
+//! Bounded DCNv4 GPU math: <=25 active points, elementwise/channel activation.
 //! BN normalizes with rolling stats; its 0.9 EMA runs only after backward.
 //! Parameter gradients/SGD/Adam stay host-resident; forward/backward tensor math
 //! is native on Oxide. Backward recomputes offsets, never uses last-forward state.
@@ -12,7 +12,8 @@ pub(super) fn needs_host(spec: &Dcnv4Spec) -> bool {
         .checked_mul(spec.size)
         .and_then(|v| v.checked_sub(usize::from(spec.remove_center)))
         .is_none_or(|points| points > 25)
-        || spec.activation.to_cuda_f32_kind().is_none()
+        || (spec.activation.to_cuda_f32_kind().is_none()
+            && spec.activation.to_channel_normalization().is_none())
 }
 
 fn descriptor(layer: &Layer, spec: &Dcnv4Spec, params: &Dcnv4Params) -> Result<Dcnv4Composition> {
@@ -109,14 +110,42 @@ where
             .bias_add_f32(&raw, &bias, spec.filters, desc.geometry.spatial(), cfg)
             .map_err(|err| backend_error("DCNv4 bias add", err))?
     };
-    let out = backend
-        .activation_f32(
-            &pre,
-            gpu_activation_kind(layer.index, &spec.activation)?,
-            cfg,
-        )
-        .map_err(|err| backend_error("DCNv4 activation", err))?;
+    let out = activation_output(backend, &pre, layer, spec)?;
     Ok((out, pre))
+}
+
+pub(super) fn activation_output<B: F32TensorOpsBackend>(
+    backend: &B, pre: &B::Tensor, layer: &Layer, spec: &Dcnv4Spec,
+) -> Result<B::Tensor> where B::Error: std::fmt::Display {
+    let cfg=ElementwiseLaunchConfig::default();
+    if let Some(norm)=spec.activation.to_channel_normalization() {
+        let s=layer.output_shape;
+        backend.normalize_channels_f32(pre,&tensor_backend_shape(s),s.batch,s.channels,
+            s.height*s.width,norm,cfg)
+            .map_err(|err| backend_error("DCNv4 channel normalization",err))
+    } else {
+        backend.activation_f32(pre,gpu_activation_kind(layer.index,&spec.activation)?,cfg)
+            .map_err(|err| backend_error("DCNv4 activation",err))
+    }
+}
+
+/// Explicit mode supports testing without mutating process-wide environment.
+/// Channel output recomputes on device from this forward's preactivation.
+pub(super) fn activation_delta<B: F32TensorOpsBackend>(
+    backend: &B, pre: &B::Tensor, seed: &B::Tensor, layer: &Layer, spec: &Dcnv4Spec,
+    mode: GradMode,
+) -> Result<B::Tensor> where B::Error: std::fmt::Display {
+    let cfg=ElementwiseLaunchConfig::default();
+    if let Some(norm)=spec.activation.to_channel_normalization() {
+        let s=layer.output_shape;
+        let output=activation_output(backend,pre,layer,spec)?;
+        backend.normalize_channels_backward_f32(pre,&output,seed,&tensor_backend_shape(s),
+            s.batch,s.channels,s.height*s.width,norm,mode==GradMode::Cpp,cfg)
+            .map_err(|err| backend_error("DCNv4 channel-normalization adjoint",err))
+    } else {
+        backend.activation_backward_f32(pre,seed,gpu_activation_kind(layer.index,&spec.activation)?,cfg)
+            .map_err(|err| backend_error("DCNv4 activation backward",err))
+    }
 }
 
 pub(super) struct Gradients<T> {
@@ -157,14 +186,7 @@ where
     let (raw, offsets) = backend
         .dcnv4_forward_f32(input, &weights, &biases, desc, cfg)
         .map_err(|err| backend_error("DCNv4 native offset recomputation", err))?;
-    let delta = backend
-        .activation_backward_f32(
-            pre,
-            seed,
-            gpu_activation_kind(layer.index, &spec.activation)?,
-            cfg,
-        )
-        .map_err(|err| backend_error("DCNv4 activation backward", err))?;
+    let delta = activation_delta(backend, pre, seed, layer, spec, GradMode::from_env())?;
     let (aggregation_grad, biases, scales) = if let Some(bn) = &params.batch_norm {
         let normalized = normalized_raw(backend, &raw, bn, desc.geometry.spatial())?;
         let product = backend

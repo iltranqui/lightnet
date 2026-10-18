@@ -770,9 +770,28 @@ pub fn normalize_channels_backward(
                     }
                     crate::F32ChannelNormalization::Softmax
                     | crate::F32ChannelNormalization::SoftmaxMaxval => {
+                        let mut first_max = 0;
+                        let mut correction = 0.0;
+                        if normalization == crate::F32ChannelNormalization::SoftmaxMaxval {
+                            // eps sits outside exp(x-max), so differentiating
+                            // max does NOT cancel as it would for pure softmax.
+                            // At ties use the forward loop's first-max branch.
+                            let mut maximum = activation_input[base];
+                            for channel in 0..channels {
+                                let index = base + channel * spatial;
+                                if activation_input[index] > maximum {
+                                    maximum = activation_input[index];
+                                    first_max = channel;
+                                }
+                                correction += output[index] * (delta[index] - dot);
+                            }
+                        }
                         for channel in 0..channels {
                             let index = base + channel * spatial;
                             gradient[index] = output[index] * (delta[index] - dot);
+                            if channel == first_max {
+                                gradient[index] -= correction;
+                            }
                         }
                     }
                 }
@@ -1209,6 +1228,65 @@ pub fn channel_permute(x: &[f32], batch: usize, rows: usize, cols: usize, len: u
         }
     }
     out
+}
+
+#[cfg(test)]
+mod channel_normalization_exact_tests {
+    use super::*;
+    use crate::F32ChannelNormalization as N;
+
+    #[test]
+    fn maxval_one_channel_is_constant_but_plain_softmax_is_not() {
+        let x = [0.3, -1.7, 2.4, 0.9];
+        let seed = [1.7, -0.4, 2.3, -1.2];
+        let y = normalize_channels(&x, 2, 1, 2, N::SoftmaxMaxval);
+        let grad = normalize_channels_backward(&x,&y,&seed,2,1,2,N::SoftmaxMaxval,false);
+        assert_eq!(grad,vec![0.0;4],"one-channel maxval forward is constant");
+        let yp = normalize_channels(&x,2,1,2,N::Softmax);
+        let gp = normalize_channels_backward(&x,&yp,&seed,2,1,2,N::Softmax,false);
+        assert!(gp.iter().any(|g| g.abs()>1e-5),"plain softmax epsilon depends on x");
+    }
+
+    #[test]
+    fn maxval_exact_adjoint_matches_f64_fd_and_translation_invariance() {
+        let x = [0.2,1.4, -0.7,0.3, 1.7,-0.8, 0.9,-0.6, 1.8,0.5, -0.3,1.6];
+        let seed = [1.3,-0.4, 0.7,1.8, -1.2,0.3, -0.8,1.1, 0.6,-1.4, 1.7,0.2];
+        let y=normalize_channels(&x,2,3,2,N::SoftmaxMaxval);
+        let g=normalize_channels_backward(&x,&y,&seed,2,3,2,N::SoftmaxMaxval,false);
+        let objective=|v:&[f64]| -> f64 {
+            let mut loss=0.0;
+            for b in 0..2 { for q in 0..2 {
+                let base=b*6+q;
+                let m=(0..3).map(|c| v[base+c*2]).fold(f64::NEG_INFINITY,f64::max);
+                let denom=1e-4+(0..3).map(|c| (v[base+c*2]-m).exp()).sum::<f64>();
+                for c in 0..3 { loss+=(v[base+c*2]-m).exp()/denom*seed[base+c*2] as f64; }
+            }}
+            loss
+        };
+        for i in 0..x.len() {
+            let mut hi:Vec<_>=x.iter().map(|v| *v as f64).collect();
+            let mut lo=hi.clone(); let h=1e-4;
+            hi[i]+=h;lo[i]-=h;
+            let fd=((objective(&hi)-objective(&lo))/(2.0*h)) as f32;
+            assert!((g[i]-fd).abs()<2e-6,"i={i}: {} vs {fd}",g[i]);
+        }
+        for b in 0..2 { for q in 0..2 {
+            let sum=(0..3).map(|c| g[b*6+c*2+q]).sum::<f32>();
+            assert!(sum.abs()<2e-7,"translation derivative {sum}");
+        }}
+    }
+
+    #[test]
+    fn maxval_tie_selects_first_max_and_cpp_shortcut_is_unchanged() {
+        let x=[1.0,1.0,-0.5];let seed=[0.7,-1.3,0.2];
+        let y=normalize_channels(&x,1,3,1,N::SoftmaxMaxval);
+        let dot=y.iter().zip(seed).map(|(v,s)| v*s).sum::<f32>();
+        let mut expected:Vec<_>=y.iter().zip(seed).map(|(v,s)| v*(s-dot)).collect();
+        let correction=expected.iter().sum::<f32>();expected[0]-=correction;
+        assert_eq!(normalize_channels_backward(&x,&y,&seed,1,3,1,N::SoftmaxMaxval,false),expected);
+        let cpp=normalize_channels_backward(&x,&y,&seed,1,3,1,N::SoftmaxMaxval,true);
+        for i in 0..3 { assert_eq!(cpp[i],seed[i]*y[i]*(1.0-y[i])); }
+    }
 }
 
 #[cfg(test)]

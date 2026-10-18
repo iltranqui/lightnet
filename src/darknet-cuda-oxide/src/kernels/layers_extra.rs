@@ -1772,6 +1772,24 @@ pub mod kernels {
                 } else {
                     0.0
                 }
+            } else if normalization == 2 {
+                // epsilon outside exp(x-max) leaves a max-chain term.
+                // First maximum is the selected subgradient at exact ties.
+                let mut maximum = activation_input[base];
+                let mut first_max = 0usize;
+                let mut correction = 0.0f32;
+                k = 0;
+                while k < channels {
+                    let j = base + k * spatial;
+                    if activation_input[j] > maximum {
+                        maximum = activation_input[j];
+                        first_max = k;
+                    }
+                    correction += output[j] * (delta[j] - dot);
+                    k += 1;
+                }
+                let g = y * (delta[i] - dot);
+                if (i / spatial) % channels == first_max { g - correction } else { g }
             } else {
                 y * (delta[i] - dot)
             }
