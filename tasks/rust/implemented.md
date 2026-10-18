@@ -66,6 +66,8 @@ file is named inline.
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
+- [34. GPU convolution extent parity](#34-gpu-convolution-extent-parity)
+- [35. Annotation GUI (`darknet-gui`)](#35-annotation-gui-darknet-gui)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -880,6 +882,19 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 - Verification: `MEM=3G ./tools/test_host.sh convolutional_axis_layout` passed 5; `axis_layout` passed 21 (was 19); `runtime::` passed 261. Full CPU baseline `cargo test -p darknet-core --lib -j 2` passed 897 and `-p darknet-cli` 28; GPU baseline `MEM=3G ./tools/test_oxide.sh --test oxide_parity` passed 11 and `oxide_runtime_chain` 24. Targeted edition-2024 Rustfmt and `git diff --check` passed.
 - Finding F1 retracted: `conv_dim` must keep ignoring dilation because `Jev_laya:src-lib/convolutional_layer.cpp:317` does; applying `dilation*(size-1)` shrank the extent and broke `cfg/resnet152_trident.cfg` at route #244 (`16x16` vs `38x38`). `conv_dim` now documents that, and the pin fails if the term returns. The cuDNN/oxide `pad*dilation` difference is recorded as a source-level inconsistency, not a Rust defect.
 - Evidence boundary: hand-derived from `Jev_laya`; no compiled-C++ golden and no parity claim.
+
+## 34. GPU convolution extent parity
+
+- v0.1.017 (`263fa448`): fixed `Geom::new` in the cuda-oxide conv driver. It computed the textbook dilated span `(in + 2*pad - (dil*(k-1)+1))/stride + 1`, while `darknet-core`'s `conv_dim` and C++ `convolutional_out_width` compute `(in + 2*pad - k)/stride + 1`: dilation changes the sampling offsets, not the extent. The device map was smaller than the caller requested, so `expect_shape` rejected every dilated convolution. f32 and f16 now use the CPU extent; extent validation uses `k`.
+- Verification: `oxide_conv_parity` passed 13 (including `dilation2_pad2`, `fd_dil2`), `oxide_cfg_shapes` 13 (6 dilated geometries, Direct and Gemm, 12 runs, 0 failures), `oxide_gemm_mma` 5, `oxide_half` 13. The `oxide_cfg_shapes` contract was inverted: raw `pad` must reproduce the cfg dimensions and parity, while a `pad*dilation` call with cfg dimensions must be rejected.
+- Evidence boundary: hand-derived from `Jev_laya` and `darknet-core`; no compiled-C++ golden/parity. YOLO heads are pass-through on device (the loss/decode runs on the host), so this was the only conv-side parity gap.
+
+## 35. Annotation GUI (`darknet-gui`)
+
+- v0.1.018 (`0ca7613e`): added the opt-in `darknet-gui` crate (egui/eframe 0.32.3, `glow`), the first slice of `gui_plan.md`. `annotation.rs` holds normalized centre/size marks with a 10-decimal YOLO text round trip and click hit testing; `project.rs` scans a flat image folder, reads class names from the first `*.names` or `classes.txt`, and loads/saves sidecars; `main.rs` is the window with folder open, class and image lists, fit-to-window canvas, drag-to-create, click-to-select, rubber band, and per-image undo.
+- Semantics: malformed label lines are errors, so a partial read cannot overwrite a file; a degenerate drag creates nothing; an empty annotation deletes the sidecar instead of writing a blank one.
+- Verification: `cargo build -p darknet-gui --offline` and `cargo test -p darknet-gui --offline` pass with 7 tests.
+- Evidence boundary: builds offline against the locally cached eframe. Not implemented: DarkMark `.json` sidecars, class remap, filters/sort, neighbour copy/interpolation/homography, alternate views, launcher, and the `detect-server` prediction overlay.
 
 ## Not implemented / open (pointer)
 

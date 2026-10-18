@@ -422,6 +422,8 @@ Immediately next, in dependency order:
 
 - [x] v0.1.016 convolutional axis pins: NCHW/group partitioning and the dilated-extent contract are pinned; finding F1 was retracted (C++ CPU geometry ignores dilation, cuDNN pads by `pad*dilation`). See `implemented.md` §33 and `axis-coverage.md`.- [ ] Axis tiers 1-4 (see `axis-coverage.md`): add the missing named pins, starting with `[convolutional]`, which also carries finding F1 (dilated output extent ignores `dilation` in `conv_dim`). Each behavior fix gets its own version; do not weaken a pin to match the implementation.
 
+- [x] v0.1.017 GPU conv parity: the device extent now follows the CPU for `dilation > 1` (the kernels were already correct). See `implemented.md` §34.
+- [~] `gui_plan.md` — first slice only (v0.1.018): `darknet-gui` opens a folder, annotates boxes, and writes YOLO `.txt`. Still open: DarkMark `.json` compatibility, class remap, filters/sort, copy/interpolate/homography, views (Canny/dot/shade), launcher/project creation, `detect-server` prediction overlay, and the `darknet-gui-engine`/`darknet-gui-project` split.
 ## Active and unstarted plans
 
 - [x] `onnx.md` — `darknet-rs export-onnx`; all 21 implementation, verification, and bookkeeping steps are complete.
