@@ -273,7 +273,11 @@ mod tests {
         let output = value_info("y", &[Dim::Param("batch"), Dim::Fixed(3)]);
         let bytes = model(13, "g", &[n], &[init], &[input], &[output]);
         let top = decode(&bytes);
-        assert!(top.iter().any(|(f, w)| *f == 1 && matches!(w, Wire::Varint(8))), "ir_version 8");
+        assert!(
+            top.iter()
+                .any(|(f, w)| *f == 1 && matches!(w, Wire::Varint(8))),
+            "ir_version 8"
+        );
         let graph = top
             .iter()
             .find_map(|(f, w)| match (f, w) {
@@ -310,6 +314,9 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert_eq!(raw, [1.0f32.to_le_bytes(), (-2.0f32).to_le_bytes()].concat());
+        assert_eq!(
+            raw,
+            [1.0f32.to_le_bytes(), (-2.0f32).to_le_bytes()].concat()
+        );
     }
 }

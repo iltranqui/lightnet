@@ -2,13 +2,11 @@
 
 use crate::error::{Error, Result};
 use crate::model::{
-    Activation, ConvolutionalSpec, Layer, LayerKind, MaxPoolSpec, Network, RouteSpec,
-    ShortcutSpec, TensorShape, UpsampleSpec,
+    Activation, ConvolutionalSpec, Layer, LayerKind, MaxPoolSpec, Network, RouteSpec, ShortcutSpec,
+    TensorShape, UpsampleSpec,
 };
 use crate::onnx::proto::*;
-use crate::runtime::{
-    BATCH_NORM_EPSILON, LayerParams, fold_convolutional_params_for_inference,
-};
+use crate::runtime::{BATCH_NORM_EPSILON, LayerParams, fold_convolutional_params_for_inference};
 
 #[derive(Clone, Copy, Debug)]
 pub struct OnnxOptions {
@@ -165,7 +163,10 @@ impl Exporter<'_> {
 
     fn conv(&mut self, index: usize, layer: &Layer, spec: &ConvolutionalSpec) -> Result<String> {
         if spec.dilation != 1 || spec.share_index.is_some() {
-            return Err(unsupported(index, "convolutional with dilation/share_index"));
+            return Err(unsupported(
+                index,
+                "convolutional with dilation/share_index",
+            ));
         }
         let LayerParams::Convolutional(params) = &self.params[index] else {
             return Err(unsupported(index, "convolutional without parameters"));
@@ -173,7 +174,10 @@ impl Exporter<'_> {
         let input_channels = layer.input_shape.channels;
         let groups = spec.groups.max(1);
         if input_channels % groups != 0 || spec.filters % groups != 0 {
-            return Err(unsupported(index, "convolution with invalid group dimensions"));
+            return Err(unsupported(
+                index,
+                "convolution with invalid group dimensions",
+            ));
         }
         let layer_name = format!("layer_{index:03}");
         let weight_dims = [
@@ -211,8 +215,16 @@ impl Exporter<'_> {
             let channels = [spec.filters as i64];
             self.add_f32(&format!("{layer_name}_bn_scale"), &channels, &bn.scales);
             self.add_f32(&format!("{layer_name}_bn_B"), &channels, &bn.biases);
-            self.add_f32(&format!("{layer_name}_bn_mean"), &channels, &bn.rolling_mean);
-            self.add_f32(&format!("{layer_name}_bn_var"), &channels, &bn.rolling_variance);
+            self.add_f32(
+                &format!("{layer_name}_bn_mean"),
+                &channels,
+                &bn.rolling_mean,
+            );
+            self.add_f32(
+                &format!("{layer_name}_bn_var"),
+                &channels,
+                &bn.rolling_variance,
+            );
             let bn_output = if spec.activation == Activation::Linear {
                 format!("{layer_name}_out")
             } else {
@@ -248,7 +260,12 @@ impl Exporter<'_> {
         }
     }
 
-    fn activation(&mut self, index: usize, activation: &Activation, input: String) -> Result<String> {
+    fn activation(
+        &mut self,
+        index: usize,
+        activation: &Activation,
+        input: String,
+    ) -> Result<String> {
         let name = format!("layer_{index:03}_act");
         let output = format!("layer_{index:03}_out");
         match activation {
@@ -275,11 +292,7 @@ impl Exporter<'_> {
                 self.add_node(
                     "Clip",
                     &name,
-                    &[
-                        input,
-                        format!("{name}_min"),
-                        format!("{name}_max"),
-                    ],
+                    &[input, format!("{name}_min"), format!("{name}_max")],
                     &output,
                     vec![],
                 );
@@ -324,13 +337,17 @@ impl Exporter<'_> {
                 }
                 let channels = self.network.layers[sources[0]].output_shape.channels;
                 if channels % groups != 0 {
-                    return Err(unsupported(index, "route groups do not divide source channels"));
+                    return Err(unsupported(
+                        index,
+                        "route groups do not divide source channels",
+                    ));
                 }
                 let per_group = channels / groups;
                 let start = (spec.group_id * per_group) as i64;
                 let end = start + per_group as i64;
                 let slice_name = format!("layer_{index:03}_slice");
-                for (suffix, value) in [("starts", start), ("ends", end), ("axes", 1), ("steps", 1)] {
+                for (suffix, value) in [("starts", start), ("ends", end), ("axes", 1), ("steps", 1)]
+                {
                     self.add_i64(&format!("{slice_name}_{suffix}"), &[1], &[value]);
                 }
                 let inputs = [
@@ -361,12 +378,7 @@ impl Exporter<'_> {
         }
     }
 
-    fn shortcut(
-        &mut self,
-        index: usize,
-        layer: &Layer,
-        spec: &ShortcutSpec,
-    ) -> Result<String> {
+    fn shortcut(&mut self, index: usize, layer: &Layer, spec: &ShortcutSpec) -> Result<String> {
         if spec.weights_type != crate::model::ShortcutWeightsType::None {
             return Err(unsupported(index, "weighted shortcut"));
         }
@@ -394,16 +406,15 @@ impl Exporter<'_> {
 
     fn upsample(&mut self, index: usize, spec: &UpsampleSpec) -> Result<String> {
         if spec.reverse || spec.stride <= 0 {
-            return Err(unsupported(index, "upsample reverse/downsample or invalid stride"));
+            return Err(unsupported(
+                index,
+                "upsample reverse/downsample or invalid stride",
+            ));
         }
         let name = format!("layer_{index:03}_resize");
         let stride = spec.stride as f32;
         self.add_f32(&format!("{name}_roi"), &[0], &[]);
-        self.add_f32(
-            &format!("{name}_scales"),
-            &[4],
-            &[1.0, 1.0, stride, stride],
-        );
+        self.add_f32(&format!("{name}_scales"), &[4], &[1.0, 1.0, stride, stride]);
         let resized = if spec.scale == 1.0 {
             format!("layer_{index:03}_out")
         } else {
@@ -462,43 +473,74 @@ mod tests {
     const CFG: &str = "\n[net]\nwidth=16\nheight=16\nchannels=3\nbatch=1\n\n[convolutional]\nbatch_normalize=1\nfilters=4\nsize=3\nstride=1\npad=1\nactivation=leaky\n\n[maxpool]\nsize=2\nstride=1\n\n[convolutional]\nfilters=4\nsize=1\nstride=1\npad=1\nactivation=linear\n\n[route]\nlayers=-1\ngroups=2\ngroup_id=1\n\n[convolutional]\nfilters=8\nsize=1\nstride=1\npad=1\nactivation=linear\n\n[route]\nlayers=-1,-3\n\n[upsample]\nstride=2\n\n[yolo]\nmask=0\nanchors=2,3\nclasses=1\nnum=1\n";
 
     fn build(cfg: &str) -> ExecutableNetwork {
-        let network = Network::from_config(ConfigFile::parse_str("test.cfg", cfg).unwrap()).unwrap();
+        let network =
+            Network::from_config(ConfigFile::parse_str("test.cfg", cfg).unwrap()).unwrap();
         ExecutableNetwork::new(network)
     }
 
     fn graph(bytes: &[u8]) -> Vec<(u32, Wire)> {
         let top = decode(bytes);
-        top.iter().find_map(|(field, wire)| match (field, wire) {
-            (7, Wire::Len(bytes)) => Some(decode(bytes)),
-            _ => None,
-        }).unwrap()
+        top.iter()
+            .find_map(|(field, wire)| match (field, wire) {
+                (7, Wire::Len(bytes)) => Some(decode(bytes)),
+                _ => None,
+            })
+            .unwrap()
     }
 
     fn ops(bytes: &[u8]) -> Vec<String> {
         let graph = graph(bytes);
-        graph.iter().filter_map(|(field, wire)| match (field, wire) {
-            (1, Wire::Len(bytes)) => {
-                let node = decode(bytes);
-                node.iter().find_map(|(f, w)| match (f, w) {
-                    (4, Wire::Len(op)) => Some(String::from_utf8(op.clone()).unwrap()),
-                    _ => None,
-                })
-            }
-            _ => None,
-        }).collect()
+        graph
+            .iter()
+            .filter_map(|(field, wire)| match (field, wire) {
+                (1, Wire::Len(bytes)) => {
+                    let node = decode(bytes);
+                    node.iter().find_map(|(f, w)| match (f, w) {
+                        (4, Wire::Len(op)) => Some(String::from_utf8(op.clone()).unwrap()),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
     fn exports_supported_layers_and_preserves_routes() {
         let executable = build(CFG);
-        let bytes = export_onnx(&executable.network, &executable.params, &OnnxOptions::default()).unwrap();
-        assert_eq!(ops(&bytes), ["Conv", "LeakyRelu", "MaxPool", "Conv", "Slice", "Conv", "Concat", "Resize", "Identity"]);
+        let bytes = export_onnx(
+            &executable.network,
+            &executable.params,
+            &OnnxOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            ops(&bytes),
+            [
+                "Conv",
+                "LeakyRelu",
+                "MaxPool",
+                "Conv",
+                "Slice",
+                "Conv",
+                "Concat",
+                "Resize",
+                "Identity"
+            ]
+        );
     }
 
     #[test]
     fn batch_norm_can_be_unfused_and_maxpool_padding_is_asymmetric() {
         let executable = build(CFG);
-        let bytes = export_onnx(&executable.network, &executable.params, &OnnxOptions { fuse_batch_norm: false }).unwrap();
+        let bytes = export_onnx(
+            &executable.network,
+            &executable.params,
+            &OnnxOptions {
+                fuse_batch_norm: false,
+            },
+        )
+        .unwrap();
         let actual = ops(&bytes);
         assert_eq!(&actual[..3], ["Conv", "BatchNormalization", "LeakyRelu"]);
         assert!(actual.contains(&"MaxPool".to_owned()));
@@ -508,23 +550,49 @@ mod tests {
     fn unsupported_layers_and_activations_fail_explicitly() {
         let ramp = CFG.replace("activation=leaky", "activation=ramp");
         let executable = build(&ramp);
-        assert!(export_onnx(&executable.network, &executable.params, &OnnxOptions::default()).is_err());
+        assert!(
+            export_onnx(
+                &executable.network,
+                &executable.params,
+                &OnnxOptions::default()
+            )
+            .is_err()
+        );
         let reversed = CFG.replace("[upsample]\nstride=2", "[upsample]\nstride=-2");
         let executable = build(&reversed);
-        assert!(export_onnx(&executable.network, &executable.params, &OnnxOptions::default()).is_err());
+        assert!(
+            export_onnx(
+                &executable.network,
+                &executable.params,
+                &OnnxOptions::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn mish_uses_opset_18() {
         let cfg = CFG.replace("activation=leaky", "activation=mish");
         let executable = build(&cfg);
-        let bytes = export_onnx(&executable.network, &executable.params, &OnnxOptions::default()).unwrap();
+        let bytes = export_onnx(
+            &executable.network,
+            &executable.params,
+            &OnnxOptions::default(),
+        )
+        .unwrap();
         let top = decode(&bytes);
-        let opset = top.iter().find_map(|(field, wire)| match (field, wire) {
-            (8, Wire::Len(bytes)) => Some(decode(bytes)),
-            _ => None,
-        }).unwrap();
-        assert!(opset.iter().any(|(field, wire)| *field == 2 && matches!(wire, Wire::Varint(18))));
+        let opset = top
+            .iter()
+            .find_map(|(field, wire)| match (field, wire) {
+                (8, Wire::Len(bytes)) => Some(decode(bytes)),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            opset
+                .iter()
+                .any(|(field, wire)| *field == 2 && matches!(wire, Wire::Varint(18)))
+        );
     }
 
     fn unpack_varints(mut bytes: &[u8]) -> Vec<i64> {
@@ -548,41 +616,79 @@ mod tests {
     #[test]
     fn maxpool_padding_is_asymmetric_and_grouped_route_uses_source_channels() {
         let executable = build(CFG);
-        let bytes = export_onnx(&executable.network, &executable.params, &OnnxOptions::default()).unwrap();
+        let bytes = export_onnx(
+            &executable.network,
+            &executable.params,
+            &OnnxOptions::default(),
+        )
+        .unwrap();
         let fields = graph(&bytes);
-        let maxpool_pads = fields.iter().find_map(|(field, wire)| {
-            let Wire::Len(node_bytes) = wire else { return None };
-            if *field != 1 { return None; }
-            let node = decode(node_bytes);
-            let op = node.iter().find_map(|(f, w)| match (f, w) {
-                (4, Wire::Len(value)) => Some(value.as_slice()), _ => None,
-            });
-            if op != Some(b"MaxPool".as_slice()) { return None; }
-            node.iter().filter_map(|(f, w)| match (f, w) {
-                (5, Wire::Len(attr_bytes)) => Some(decode(attr_bytes)), _ => None,
-            }).find_map(|attr| {
-                let is_pads = attr.iter().any(|(f, w)| *f == 1 && matches!(w, Wire::Len(b) if b == b"pads"));
-                if !is_pads { return None; }
-                attr.into_iter().find_map(|(f, w)| match (f, w) {
-                    (8, Wire::Len(values)) => Some(unpack_varints(&values)), _ => None,
-                })
+        let maxpool_pads = fields
+            .iter()
+            .find_map(|(field, wire)| {
+                let Wire::Len(node_bytes) = wire else {
+                    return None;
+                };
+                if *field != 1 {
+                    return None;
+                }
+                let node = decode(node_bytes);
+                let op = node.iter().find_map(|(f, w)| match (f, w) {
+                    (4, Wire::Len(value)) => Some(value.as_slice()),
+                    _ => None,
+                });
+                if op != Some(b"MaxPool".as_slice()) {
+                    return None;
+                }
+                node.iter()
+                    .filter_map(|(f, w)| match (f, w) {
+                        (5, Wire::Len(attr_bytes)) => Some(decode(attr_bytes)),
+                        _ => None,
+                    })
+                    .find_map(|attr| {
+                        let is_pads = attr
+                            .iter()
+                            .any(|(f, w)| *f == 1 && matches!(w, Wire::Len(b) if b == b"pads"));
+                        if !is_pads {
+                            return None;
+                        }
+                        attr.into_iter().find_map(|(f, w)| match (f, w) {
+                            (8, Wire::Len(values)) => Some(unpack_varints(&values)),
+                            _ => None,
+                        })
+                    })
             })
-        }).unwrap();
+            .unwrap();
         assert_eq!(maxpool_pads, [0, 0, 1, 1]);
 
-        let starts = fields.iter().find_map(|(field, wire)| {
-            let Wire::Len(init_bytes) = wire else { return None };
-            if *field != 5 { return None; }
-            let init = decode(init_bytes);
-            let name = init.iter().find_map(|(f, w)| match (f, w) {
-                (8, Wire::Len(name)) => Some(String::from_utf8_lossy(name).into_owned()), _ => None,
-            })?;
-            if !name.ends_with("_starts") { return None; }
-            init.iter().find_map(|(f, w)| match (f, w) {
-                (9, Wire::Len(raw)) => Some((name.clone(), raw.chunks_exact(8).map(|v| i64::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>())), 
-                _ => None,
+        let starts = fields
+            .iter()
+            .find_map(|(field, wire)| {
+                let Wire::Len(init_bytes) = wire else {
+                    return None;
+                };
+                if *field != 5 {
+                    return None;
+                }
+                let init = decode(init_bytes);
+                let name = init.iter().find_map(|(f, w)| match (f, w) {
+                    (8, Wire::Len(name)) => Some(String::from_utf8_lossy(name).into_owned()),
+                    _ => None,
+                })?;
+                if !name.ends_with("_starts") {
+                    return None;
+                }
+                init.iter().find_map(|(f, w)| match (f, w) {
+                    (9, Wire::Len(raw)) => Some((
+                        name.clone(),
+                        raw.chunks_exact(8)
+                            .map(|v| i64::from_le_bytes(v.try_into().unwrap()))
+                            .collect::<Vec<_>>(),
+                    )),
+                    _ => None,
+                })
             })
-        }).unwrap();
+            .unwrap();
         assert_eq!(starts.1, [2]);
     }
 
@@ -590,31 +696,65 @@ mod tests {
     fn nonunit_upsample_scale_emits_mul() {
         let cfg = CFG.replace("[upsample]\nstride=2", "[upsample]\nstride=2\nscale=2");
         let executable = build(&cfg);
-        let bytes = export_onnx(&executable.network, &executable.params, &OnnxOptions::default()).unwrap();
+        let bytes = export_onnx(
+            &executable.network,
+            &executable.params,
+            &OnnxOptions::default(),
+        )
+        .unwrap();
         assert!(ops(&bytes).contains(&"Mul".to_owned()));
     }
 
     #[test]
     fn dilated_convolution_and_mismatched_shortcut_are_rejected() {
-        let cfg = CFG.replace("filters=4\nsize=3\nstride=1", "filters=4\nsize=3\nstride=1\ndilation=2");
+        let cfg = CFG.replace(
+            "filters=4\nsize=3\nstride=1",
+            "filters=4\nsize=3\nstride=1\ndilation=2",
+        );
         let executable = build(&cfg);
-        assert!(export_onnx(&executable.network, &executable.params, &OnnxOptions::default()).is_err());
+        assert!(
+            export_onnx(
+                &executable.network,
+                &executable.params,
+                &OnnxOptions::default()
+            )
+            .is_err()
+        );
 
         let shortcut_cfg = "[net]\nwidth=16\nheight=16\nchannels=3\nbatch=1\n[convolutional]\nfilters=4\nsize=1\nactivation=linear\n[maxpool]\nsize=2\nstride=2\n[shortcut]\nfrom=-2\nactivation=linear\n";
         let executable = build(shortcut_cfg);
-        assert!(export_onnx(&executable.network, &executable.params, &OnnxOptions::default()).is_err());
+        assert!(
+            export_onnx(
+                &executable.network,
+                &executable.params,
+                &OnnxOptions::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn classifier_exports_last_layer_when_no_yolo_exists() {
         let cfg = "[net]\nwidth=8\nheight=8\nchannels=3\nbatch=1\n[convolutional]\nfilters=2\nsize=1\nactivation=linear\n";
         let executable = build(cfg);
-        let bytes = export_onnx(&executable.network, &executable.params, &OnnxOptions::default()).unwrap();
+        let bytes = export_onnx(
+            &executable.network,
+            &executable.params,
+            &OnnxOptions::default(),
+        )
+        .unwrap();
         let top = decode(&bytes);
-        let graph = top.iter().find_map(|(field, wire)| match (field, wire) {
-            (7, Wire::Len(bytes)) => Some(decode(bytes)),
-            _ => None,
-        }).unwrap();
-        assert!(graph.iter().any(|(field, wire)| *field == 12 && matches!(wire, Wire::Len(_))));
+        let graph = top
+            .iter()
+            .find_map(|(field, wire)| match (field, wire) {
+                (7, Wire::Len(bytes)) => Some(decode(bytes)),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            graph
+                .iter()
+                .any(|(field, wire)| *field == 12 && matches!(wire, Wire::Len(_)))
+        );
     }
 }
