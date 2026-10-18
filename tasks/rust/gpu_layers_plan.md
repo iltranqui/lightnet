@@ -349,12 +349,20 @@ versus an FD of `0.0499` — same sign, ~1.28x, at an x-offset of kernel point 7
 Both attempts were removed and the green baseline re-verified (33 passed).
 
 That pattern (analytic consistently larger, no seam, no zero) points at a term
-counted more than once rather than a sign or convention error, and it is not
-diagnosable by FD sweeps alone. The next attempt must instrument instead: print
-the per-channel `top * mask * dx` contributions for one position and compare them
-one by one against a literal transcription of `dcnv4_backward`'s inner loop,
-before any FD. Two blind rewrites have now cost more than one instrumented run
-would have.
+counted more than once rather than a sign or convention error.
+
+**Instrumented term-level check (done, isolated):** a standalone program computed
+the analytic `d_offset_x` for one position/point from `hy*(v01-v00) +
+ly*(v11-v10)`, summed over the two channels, and compared it with a central
+difference of the same expression: `analytic 0.093750 vs fd 0.093751`,
+**ratio 1.0000**. So the gradient *formula* per term is right; the discrepancy in
+the aggregate implementation is therefore an **indexing/bookkeeping** error —
+which row/point/channel a contribution is written to — not arithmetic.
+
+**Next attempt must instrument indices, not arithmetic:** dump `(q, group,
+point, row slot)` for every write and compare against the forward's read of the
+same slot. Two blind rewrites plus one term-level check have narrowed this to
+the write mapping; that is where the third attempt should start.
 
 ## Verification gates
 
