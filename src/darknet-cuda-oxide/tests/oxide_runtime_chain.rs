@@ -3066,6 +3066,68 @@ fn deform_conv_device_path_matches_cpu_chain_and_updates() {
 }
 
 #[test]
+fn gpu_muon_tucker_host_gradient_matrices_match_cpu_across_steps() {
+    let net = network(
+        "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=1\nmuon=1\ndecoupled_decay=1\ndecay=0.0001\n\
+         [tucker_attention]\nfilters=2\nsize=2\nheads=1\nrank_q=1\nrank_k=1\nrank_v=1\nrank_o=1\nactivation=linear\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    darknet_core::initialize_training_params(&net, &mut cpu.params, 47);
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("Tucker train buffers");
+
+    for step in 1..=2 {
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu().expect("zero Tucker buffers");
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).expect("CPU Tucker forward");
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("Oxide Tucker forward");
+        for (cpu_output, gpu_output) in cpu_forward
+            .layer_outputs
+            .iter()
+            .zip(&gpu_forward.cpu_forward.layer_outputs)
+        {
+            close(
+                &format!("Tucker step {step} forward"),
+                &cpu_output.data,
+                &gpu_output.data,
+                3e-4,
+            );
+        }
+        let seed = Tensor::filled(cpu.network.layers[0].output_shape, 0.025 * step as f32);
+        let seeds = [Some(seed)];
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU Tucker backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("Oxide Tucker backward");
+        cpu.update_weights_muon(0.02, 1)
+            .expect("CPU Tucker Muon update");
+        gpu.update_weights_gpu(0.02, 0.9, net.net.decay, 1)
+            .expect("GPU Tucker Muon update");
+        let (LayerParams::TuckerAttention(cpu_tucker), LayerParams::TuckerAttention(gpu_tucker)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("Tucker parameter layout expected");
+        };
+        close(
+            &format!("Tucker weights step {step}"),
+            &gpu_tucker.weights,
+            &cpu_tucker.weights,
+            1e-3,
+        );
+        close(
+            &format!("Tucker biases step {step}"),
+            &gpu_tucker.biases,
+            &cpu_tucker.biases,
+            1e-3,
+        );
+    }
+}
+
+#[test]
 fn gpu_muon_swin_host_gradient_matrices_match_cpu_across_steps() {
     let net = network(
         "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=1\nmuon=1\ndecoupled_decay=1\ndecay=0.0001\n\
