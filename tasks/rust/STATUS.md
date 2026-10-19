@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.039 (`b1fef3f9`): added native Oxide f32 deconvolution forward/backward runtime operations with host fallback for unsupported activations. Actual-GPU CPU-parity chain and host SGD/Adam path tests passed; optimizer staging remains host-side. No full-suite/C++ claim; see `implemented.md` §69.
 - v0.2.038 (`fadfcb95`): actual-GPU CPU parity passed for connected Muon `burnin_update` gating (blocked before burn-in, update after). Other gate variants/connected BN remain open. See `implemented.md` §69.
 - v0.2.037 (`281cdc7c`): deconvolutional GPU Muon eligibility uses Oxide Newton–Schulz with host fallback gradients/state/update; actual-GPU two-step CPU parity and host rejection regression passed. This is not native deconvolution forward/backward. See `implemented.md` §69.
 - v0.2.036 (`86b2fbda`): actual-GPU two-layer `dont_update` gate test passed against CPU across two updates. Other gate variants, connected BN and eligible families remain open. See `implemented.md` §69.

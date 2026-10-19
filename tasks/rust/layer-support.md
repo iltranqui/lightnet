@@ -74,14 +74,14 @@ with the command given rather than trusting the number.
 | Axis open | 41 (Tier 1: 14, Tier 2: 16, Tier 3: 3, Tier 4: 8) |
 | Axis Rust-only | 5 |
 | Incomplete CPU port | 1 (`Yolo3d`); blocked: `Dcnv3`, `DetrDecoder` |
-| GPU Muon | partial hybrid integration: connected matrices use native Oxide momentum/lookahead, Newton–Schulz and direction+decay update; deconvolutional matrices use native Oxide Newton–Schulz with host-fallback gradients; deconvolution momentum/final update/state remain host-side. Connected momentum cached between steps but mirrored to host each update; weights remain host-canonical. Standalone BatchNorm host AdamW fallback; convolution and other parameter families open |
+| GPU Muon | partial hybrid integration: connected matrices use native Oxide momentum/lookahead, Newton–Schulz and direction+decay update; deconvolutional matrices use native Oxide Newton–Schulz with gradients staged through host buffers; deconvolution momentum/final update/state remain host-side. Connected momentum cached between steps but mirrored to host each update; weights remain host-canonical. Standalone BatchNorm host AdamW fallback; convolution and other parameter families open |
 
 ## Matrix
 
 | Kind | cfg | wts | cpu fwd | cpu bwd | axis | gpu fwd | gpu bwd | f16 |
 |---|---|---|---|---|---|---|---|---|
 | `Convolutional` | yes | C++ | fwd | exact | pin | native | device | yes |
-| `Deconvolutional` | yes | C++ | fwd | exact | pin | host | cpu | no |
+| `Deconvolutional` | yes | C++ | fwd | exact | pin | native / host (unsupported act) | native / cpu fallback (unsupported act) | no |
 | `Connected` | yes | C++ | fwd | exact | T1 | native / host (unsupported act) | mixed | no |
 | `MaxPool` | alias | none | fwd | exact | T1 | native (`depth` rejected) | device | yes |
 | `LocalAvgPool` | alias | none | fwd | exact | T1 | native (channel-changing rejected) | device | yes |
@@ -196,14 +196,13 @@ an `UnsupportedLayer`.
 
 ## GPU forward but CPU backward
 
-`runtime.rs:15707 requires_cpu_backward_fallback` forces the **whole network**
+`runtime.rs:17107 requires_cpu_backward_fallback` forces the **whole network**
 onto the CPU backward path when any of these is present. One such layer
 de-optimizes an entire model, which is why this list matters more than the raw
 layer count.
 
 | Variant | GPU forward | Missing backward piece |
 |---|---|---|
-| `Deconvolutional` | host round trip (`deconv_forward` on host) | device deconv dgrad/wgrad |
 | `Dcnv4` excluded/mixed variants | host round trip (>225 points, unsupported activation or another fallback layer) | remaining unsupported/unknown activations and large-kernel paths; BN and NormalizeChannels* math native since v0.2.014/015; Revleaky native since v0.2.026; 225-point bound since v0.2.027 |
 | `Vit` | host round trip | device attention/MLP backward (flash dQ/dK/dV primitives exist) |
 | `Swin` | host round trip | device windowed-attention backward |
@@ -216,7 +215,9 @@ layer count.
 `DeformConv` **left this table** in v0.2.007: it now has a native forward *and*
 backward, gated on `dilation == 1` without batch norm. Its remaining limitation
 (one host hop for the batch-coupled normalization Jacobian) is recorded in the
-main matrix row instead.
+main matrix row instead. `Deconvolutional` left this table in v0.2.039: supported
+f32 activations use native forward/backward; unsupported activations retain the
+whole-network host fallback.
 | `Connected` | native, but host round trip when activation is unsupported | no separate Revleaky gap since its v0.2.026 mapping to Leaky |
 | `Rnn`/`Crnn` | device, but host when activation unsupported | device kernels for the remaining activations |
 | `Moe` | device | device path for unsupported expert activations |
@@ -239,6 +240,7 @@ devices and head sizes (no native kernel at all), even though standard
 | EML | device forward, device SGD/Adam (DNOPT5), BN scale/beta gradients | BN backward CPU fallback per v71; documents disagree on later state — verify against `implemented.md` §7 before planning |
 | Recurrent | device projections/BPTT, on-device caches and gradient accumulation without BN | BN forward/cache, rolling-stat update and optimizer remain host-side; some parameter-gradient transfers still cross the host |
 | DCNv4 | bounded native f32 forward/backward through 15x15/225 points incl. rolling-stat BN and 0.9 EMA, NormalizeChannels*/Revleaky activations, device gradient accumulation and native SGD/Adam updates; learned parameter tensors persist across forwards/updates with snapshot invalidation (v0.2.030), Adam moments bridge through sidecar only at save/load (v0.2.028); two-step CPU parity | >225/unsupported variants host; host-canonical mirrors still download after optimizer updates and rolling stats remain host-managed; compact/f16 absent |
+| Deconvolutional | native Oxide f32 forward, activation, input/weight/bias gradients (v0.2.039); actual-GPU CPU-parity runtime-chain test and two-step optimizer parity | unsupported activations retain whole-network host fallback; weights and gradients cross host boundary for optimizer; no f16 |
 | Shortcut (weighted) | device input/source gradients, exact normalization derivatives | per-input/per-slot weight gradient vector crosses to host; optimizer host-side |
 | Connected | device GEMM + activation, BN folded at inference | BN training and unsupported/unknown activations fall back |
 | `Crop`, `BatchNorm` | device inference | training explicitly rejected |
