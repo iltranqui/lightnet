@@ -1442,7 +1442,7 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 
 ## 53. Extend native DCNv4 kernel bound to 7x7
 
-- v0.2.016: increased the fixed device mask capacity from 25 to 49 points and expanded the native composition CPU-parity test matrix with 7x7 cases. The runtime eligibility gate admits up to 49 active points; >49 remains host-fallback. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain` passed 3 tests (real GPU composition output, input/parameter-gradient CPU parity and error guards, including 7x7); `MEM=3G ./tools/test_host.sh dcnv4` passed 28 core tests including path-selection/fallback regressions. No 7x7 runtime optimizer-parity test, compiled-C++ parity, or performance claim. Other unsupported activations, device updates/residency, compact/f16, GPU Muon and broader parity work remain open.
+- v0.2.016 (`a96d6d95`): increased the fixed device mask capacity from 25 to 49 points and expanded the native composition CPU-parity test matrix with 7x7 cases. The runtime eligibility gate admits up to 49 active points; >49 remains host-fallback. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain` passed 3 tests (real GPU composition output, input/parameter-gradient CPU parity and error guards, including 7x7); `MEM=3G ./tools/test_host.sh dcnv4` passed 28 core tests including path-selection/fallback regressions. No 7x7 runtime optimizer-parity test, compiled-C++ parity, or performance claim. Other unsupported activations, device updates/residency, compact/f16, GPU Muon and broader parity work remain open.
 
 ## Not implemented / open (pointer)
 
