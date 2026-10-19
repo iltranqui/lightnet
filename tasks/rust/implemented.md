@@ -111,6 +111,7 @@ file is named inline.
 - [83. Native GraphConv learned-edge forward primitive](#83-native-graphconv-learned-edge-forward-primitive)
 - [84. Native GraphConv learned-edge adjoints](#84-native-graphconv-learned-edge-adjoints)
 - [85. GraphConv learned-edge runtime path](#85-graphconv-learned-edge-runtime-path)
+- [86. GraphConv center-reference gather primitive](#86-graphconv-center-reference-gather-primitive)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1620,6 +1621,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 85. GraphConv learned-edge runtime path
 
 - v0.2.063: routed learned-edge mode 1 GraphConv through native Oxide aggregation forward/backward for no-self/no-BN supported-activation configurations. Learned edge-kernel/bias gradients are downloaded into existing host optimizer buffers; projection and edge parameters continue to update host-side (SGD/Adam). Actual-Oxide runtime output and updates match CPU across SGD then Adam in `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain graph_conv_learned_runtime_forward_backward_and_updates_match_cpu` (1 test). Unsupported edge modes, self projection, BN, and unsupported activations keep host fallback; compact inference and compiled-C++ golden validation remain open. No full-suite or performance claim.
+
+## 86. GraphConv center-reference gather primitive
+
+- v0.2.064: added checked host and native Oxide center/reference gather and exact input adjoint. Odd-kernel center coordinates use the same stride/padding/dilation mapping as GraphConv; out-of-bounds references are zero, and the adjoint gathers the unique mapped output without atomics. Actual-Oxide forward/backward parity, all-input finite differences, and padded/strided boundary coverage pass in `MEM=3G ./tools/test_oxide.sh --test oxide_graph_conv` (5 tests total). This prepares—but does not yet implement—self-projection runtime support. No compiled-C++ golden/full-suite/performance claim.
 
 ## Not implemented / open (pointer)
 
