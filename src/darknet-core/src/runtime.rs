@@ -10332,9 +10332,6 @@ where
                 (LayerKind::DeformConv(spec), LayerParams::DeformConv(_)) => {
                     spec.batch_normalize
                 }
-                (LayerKind::GraphConv(spec), LayerParams::GraphConv(_)) => {
-                    spec.batch_normalize
-                }
                 _ => !matches!(
                     (kind, *params),
                     (_, LayerParams::None)
@@ -10362,7 +10359,7 @@ where
         }) {
             return Err(Error::UnsupportedLayer {
                 layer_index: index,
-                name: "GPU Muon supports standard convolution, EML, MoE, GraphConv, DCNv4, and deform_conv matrices without BN via host-staged gradients, plus host-gradient local/RNN/LSTM/Kimi/MambaVision/Tucker/Swin/ViT/deconvolutional/connected matrices and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
+                name: "GPU Muon supports standard convolution, EML, MoE, DCNv4, and deform_conv matrices without BN via host-staged gradients, GraphConv matrices including BN through the existing CPU fallback, plus host-gradient local/RNN/LSTM/Kimi/MambaVision/Tucker/Swin/ViT/deconvolutional/connected matrices and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
             });
         }
         let step = self.adam_step.checked_add(1).ok_or_else(|| {
@@ -47172,39 +47169,6 @@ activation=linear
             .contains("other parameter families remain explicitly unsupported"));
         assert_eq!(gpu.params, before);
         assert_eq!(gpu.adam_step, 0);
-
-        let network = Network::from_config(
-            ConfigFile::parse_str(
-                "muon-graph-conv-bn.cfg",
-                r#"[net]
-width=2
-height=2
-channels=2
-batch=1
-muon=1
-decoupled_decay=1
-[graph_conv]
-filters=2
-size=1
-batch_normalize=1
-"#,
-            )
-            .expect("GraphConv Muon cfg should parse"),
-        )
-        .expect("GraphConv Muon network should build");
-        let mut graph_conv = GpuExecutableNetwork::new(network, FakeBackend);
-        graph_conv
-            .init_train_buffers_gpu()
-            .expect("GraphConv Muon buffers should initialize");
-        let before = graph_conv.params.clone();
-        let error = graph_conv
-            .update_weights_gpu(0.01, 0.9, 0.0005, 1)
-            .expect_err("batch-normalized GraphConv Muon staging is not integrated yet");
-        assert!(error
-            .to_string()
-            .contains("other parameter families remain explicitly unsupported"));
-        assert_eq!(graph_conv.params, before);
-        assert_eq!(graph_conv.adam_step, 0);
 
         let network = Network::from_config(
             ConfigFile::parse_str(
