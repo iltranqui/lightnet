@@ -234,6 +234,49 @@ fn graph_conv_learned_host_contract_masks_edges_and_matches_finite_differences()
     let analytic =
         learned_aggregate_backward(&input, &seed, &edge_kernel, &edge_biases, geometry, groups)
             .expect("learned aggregate backward");
+    let seed_device = backend
+        .upload_f32(
+            &[
+                geometry.batch,
+                geometry.channels,
+                geometry.output_height,
+                geometry.output_width,
+            ],
+            &seed,
+        )
+        .expect("upload learned output gradient");
+    let (input_gradient_device, kernel_gradient_device, bias_gradient_device) = backend
+        .graph_conv_learned_aggregate_backward_f32(
+            &input_device,
+            &kernel_device,
+            &biases_device,
+            &seed_device,
+            geometry,
+            groups,
+            config,
+        )
+        .expect("native learned aggregation backward");
+    let input_gradient = backend.download_f32(&input_gradient_device).unwrap();
+    let kernel_gradient = backend.download_f32(&kernel_gradient_device).unwrap();
+    let bias_gradient = backend.download_f32(&bias_gradient_device).unwrap();
+    close(
+        "learned native input gradient",
+        &input_gradient,
+        &analytic.input,
+        4e-5,
+    );
+    close(
+        "learned native kernel gradient",
+        &kernel_gradient,
+        &analytic.edge_kernel,
+        4e-5,
+    );
+    close(
+        "learned native bias gradient",
+        &bias_gradient,
+        &analytic.edge_biases,
+        4e-5,
+    );
     let objective = |input: &[f32], kernel: &[f32], biases: &[f32]| {
         learned_aggregate_forward(input, kernel, biases, geometry, groups)
             .expect("learned aggregate forward")

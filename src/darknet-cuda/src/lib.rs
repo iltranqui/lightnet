@@ -1346,6 +1346,41 @@ pub trait F32TensorOpsBackend {
             &output,
         )
     }
+    /// Exact adjoint of [`Self::graph_conv_learned_aggregate_f32`].
+    fn graph_conv_learned_aggregate_backward_f32(
+        &self,
+        input: &Self::Tensor,
+        edge_kernel: &Self::Tensor,
+        edge_biases: &Self::Tensor,
+        output_gradient: &Self::Tensor,
+        geometry: host_ops::graph_conv::GraphConvAggregationGeometry,
+        groups: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        let gradients = host_ops::graph_conv::learned_aggregate_backward(
+            &self.download_f32(input)?,
+            &self.download_f32(output_gradient)?,
+            &self.download_f32(edge_kernel)?,
+            &self.download_f32(edge_biases)?,
+            geometry,
+            groups,
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        Ok((
+            self.upload_f32(
+                &[
+                    geometry.batch,
+                    geometry.channels,
+                    geometry.input_height,
+                    geometry.input_width,
+                ],
+                &gradients.input,
+            )?,
+            self.upload_f32(&[gradients.edge_kernel.len()], &gradients.edge_kernel)?,
+            self.upload_f32(&[gradients.edge_biases.len()], &gradients.edge_biases)?,
+        ))
+    }
     /// Exact input adjoint of [`Self::graph_conv_aggregate_f32`].
     fn graph_conv_aggregate_backward_f32(
         &self,
