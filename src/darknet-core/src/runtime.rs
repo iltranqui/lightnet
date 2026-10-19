@@ -99,7 +99,6 @@ fn has_host_only_deform(network: &Network) -> bool {
 /// self projection or BN, for activations supported by the f32 backend.
 fn graph_conv_spec_needs_host(spec: &GraphConvSpec) -> bool {
     !matches!(spec.edge_mode, 0 | 1)
-        || spec.use_self
         || spec.batch_normalize
         || (spec.activation.to_channel_normalization().is_none()
             && spec.activation.to_cuda_f32_kind().is_none())
@@ -13222,6 +13221,40 @@ where
                                 launch_config,
                             )
                             .map_err(|err| backend_error("GraphConv pointwise projection", err))?;
+                        let raw = if spec.use_self {
+                            let reference = self.backend
+                                .graph_conv_reference_f32(current_input, geometry, launch_config)
+                                .map_err(|err| backend_error("GraphConv center-reference gather", err))?;
+                            let self_values = params.self_weights.as_deref().ok_or_else(|| {
+                                Error::InvalidConfig("GraphConv self weights are missing".to_owned())
+                            })?;
+                            let self_weights = self.backend
+                                .upload_f32(&weight_shape, self_values)
+                                .map_err(|err| backend_error("upload GraphConv self weights", err))?;
+                            let self_raw = self.backend
+                                .conv2d_f32(
+                                    &reference,
+                                    &self_weights,
+                                    &tensor_backend_shape(layer.output_shape),
+                                    layer.input_shape.channels,
+                                    layer.output_shape.height,
+                                    layer.output_shape.width,
+                                    spec.filters,
+                                    1,
+                                    1,
+                                    1,
+                                    1,
+                                    0,
+                                    groups,
+                                    launch_config,
+                                )
+                                .map_err(|err| backend_error("GraphConv self projection", err))?;
+                            self.backend
+                                .shortcut_add_f32(&raw, &self_raw, launch_config)
+                                .map_err(|err| backend_error("GraphConv projection sum", err))?
+                        } else {
+                            raw
+                        };
                         let biases = self
                             .backend
                             .upload_f32(&[spec.filters], &params.projection.biases)
@@ -15917,6 +15950,68 @@ where
                                 .map_err(|err| backend_error("GraphConv aggregation backward", err))?;
                             (input_gradient, None, None)
                         };
+                    let (input_gradient, self_weight_values) = if spec.use_self {
+                        let reference = self.backend
+                            .graph_conv_reference_f32(current_input, geometry, config)
+                            .map_err(|err| backend_error("GraphConv backward center-reference gather", err))?;
+                        let self_values = params.self_weights.as_deref().ok_or_else(|| {
+                            Error::InvalidConfig("GraphConv self weights are missing".to_owned())
+                        })?;
+                        let self_weights = self.backend
+                            .upload_f32(
+                                &[spec.filters, layer.input_shape.channels / groups, 1, 1],
+                                self_values,
+                            )
+                            .map_err(|err| backend_error("upload GraphConv backward self weights", err))?;
+                        let self_weight_gradient = self.backend
+                            .conv2d_backward_weights_f32(
+                                &reference,
+                                &delta,
+                                &[spec.filters, layer.input_shape.channels / groups, 1, 1],
+                                layer.input_shape.channels,
+                                layer.output_shape.height,
+                                layer.output_shape.width,
+                                spec.filters,
+                                1,
+                                1,
+                                1,
+                                1,
+                                0,
+                                groups,
+                                config,
+                            )
+                            .map_err(|err| backend_error("GraphConv self-weight backward", err))?;
+                        let reference_gradient = self.backend
+                            .conv2d_backward_input_f32(
+                                &delta,
+                                &self_weights,
+                                &aggregate_shape,
+                                layer.input_shape.channels,
+                                layer.output_shape.height,
+                                layer.output_shape.width,
+                                spec.filters,
+                                1,
+                                1,
+                                1,
+                                1,
+                                0,
+                                groups,
+                                config,
+                            )
+                            .map_err(|err| backend_error("GraphConv self-projection input backward", err))?;
+                        let self_input_gradient = self.backend
+                            .graph_conv_reference_backward_f32(&reference_gradient, geometry, config)
+                            .map_err(|err| backend_error("GraphConv center-reference backward", err))?;
+                        let input_gradient = self.backend
+                            .shortcut_add_f32(&input_gradient, &self_input_gradient, config)
+                            .map_err(|err| backend_error("GraphConv self input-gradient sum", err))?;
+                        let values = self.backend
+                            .download_f32(&self_weight_gradient)
+                            .map_err(|err| backend_error("download GraphConv self-weight gradient", err))?;
+                        (input_gradient, Some(values))
+                    } else {
+                        (input_gradient, None)
+                    };
                     let weight_values = self
                         .backend
                         .download_f32(&weight_gradient)
@@ -15950,6 +16045,16 @@ where
                             .zip(bias_values)
                         {
                             *dst += src;
+                        }
+                        if let Some(values) = self_weight_values {
+                            let Some(updates) = train.self_weight_updates.as_mut() else {
+                                return Err(Error::InvalidConfig(
+                                    "missing GraphConv self-weight gradient buffer".to_owned(),
+                                ));
+                            };
+                            for (dst, src) in updates.iter_mut().zip(values) {
+                                *dst += src;
+                            }
                         }
                         if let Some(values) = edge_kernel_values {
                             let Some(updates) = train.edge_kernel_updates.as_mut() else {

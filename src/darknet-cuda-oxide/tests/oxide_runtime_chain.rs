@@ -4919,3 +4919,55 @@ fn graph_conv_learned_runtime_forward_backward_and_updates_match_cpu() {
         close("learned GraphConv edge biases", gpu_params.edge_biases.as_ref().unwrap(), cpu_params.edge_biases.as_ref().unwrap(), 6e-5);
     }
 }
+
+#[test]
+fn graph_conv_self_projection_runtime_forward_backward_and_sgd_adam_match_cpu() {
+    let net = network("[net]\nwidth=4\nheight=3\nchannels=2\nbatch=1\n[graph_conv]\nfilters=2\ngroups=2\nsize=3\npad=1\nedge_mode=0\ngraph_use_self=1\nactivation=linear\n");
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let LayerParams::GraphConv(params) = &mut cpu.params[0] else {
+        panic!("GraphConv parameters expected");
+    };
+    params.projection.weights.copy_from_slice(&[0.3, -0.2]);
+    params.projection.biases.copy_from_slice(&[0.01, -0.03]);
+    params.self_weights.as_mut().unwrap().copy_from_slice(&[-0.15, 0.25]);
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("Oxide backend"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("initialize self GraphConv train buffers");
+    let input = patterned(cpu.network.net.input_shape());
+    let output_shape = cpu.network.layers[0].output_shape;
+    let seeds = [Some(Tensor::filled(output_shape, 0.07))];
+
+    for use_adam in [false, true] {
+        cpu.network.net.adam = use_adam;
+        gpu.network.net.adam = use_adam;
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu().expect("zero self GraphConv gradients");
+        let cpu_forward = cpu.forward_training(&input).expect("CPU self GraphConv forward");
+        let gpu_forward = gpu.forward_training_with_state(&input).expect("Oxide self GraphConv forward");
+        close(
+            "GraphConv self-projection runtime forward",
+            &gpu_forward.cpu_forward.layer_outputs[0].data,
+            &cpu_forward.layer_outputs[0].data,
+            5e-5,
+        );
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU self GraphConv backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("Oxide self GraphConv backward");
+        if use_adam {
+            cpu.update_weights_adam(0.01, 1).expect("CPU self GraphConv Adam");
+            gpu.update_weights_gpu(0.01, 0.9, 0.0, 1).expect("Oxide self GraphConv Adam");
+        } else {
+            cpu.update_weights(0.01, 0.0, 0.0, 1);
+            gpu.update_weights_gpu(0.01, 0.9, 0.0, 1).expect("Oxide self GraphConv SGD");
+        }
+        let (LayerParams::GraphConv(cpu_params), LayerParams::GraphConv(gpu_params)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("GraphConv parameters expected after self update");
+        };
+        close("GraphConv self projection weights", &gpu_params.projection.weights, &cpu_params.projection.weights, 6e-5);
+        close("GraphConv self projection biases", &gpu_params.projection.biases, &cpu_params.projection.biases, 6e-5);
+        close("GraphConv self weights", gpu_params.self_weights.as_ref().unwrap(), cpu_params.self_weights.as_ref().unwrap(), 6e-5);
+    }
+}
