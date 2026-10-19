@@ -1838,6 +1838,7 @@ where
 
 /// Pure exact backward for [`vit_forward`]. The seed uses the same NCHW layout
 /// as the output; returned gradients include input and every trainable tensor.
+#[cfg(test)]
 pub fn vit_backward(
     output_grad: &[f32],
     weights: &VitWeights,

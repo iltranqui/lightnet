@@ -1088,15 +1088,13 @@ pub fn yolox_training_delta(
     settings: &ModernYoloSettings,
 ) -> Result<(Vec<f32>, f32, usize), ModernYoloError> {
     let mut delta = vec![0.0f32; l.len()];
-    let (mut sum_iou, mut sum_iou_loss, mut positives) = (0.0f32, 0.0f32, 0usize);
+    let mut positives = 0usize;
     for b in 0..l.batch {
         let batch = yolox_train_batch(output, truth, l, spec, settings, b)?;
         let out = l.outputs();
         for (dst, src) in delta[b * out..(b + 1) * out].iter_mut().zip(&batch.delta) {
             *dst += src;
         }
-        sum_iou += batch.sum_iou;
-        sum_iou_loss += batch.sum_iou_loss;
         positives += batch.positives;
     }
     for d in delta.iter_mut() {
@@ -1460,7 +1458,7 @@ mod tests {
             coords: 4,
             kind: ModernYoloKind::Yolox,
         };
-        let mut s = dfl_spec(ModernYoloKind::Yolox, 1, 16);
+        let s = dfl_spec(ModernYoloKind::Yolox, 1, 16);
         let settings = ModernYoloSettings::default();
         let mut truth = vec![0.0f32; s.max_boxes * settings.truth_size];
         truth[0] = 0.5;

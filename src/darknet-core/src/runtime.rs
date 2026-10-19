@@ -18301,9 +18301,8 @@ where
                 (LayerKind::DeformConv(spec), Some(LayerParams::DeformConv(params))) => {
                     // Native path. Device forward/backward; the only host hop is
                     // the batch-coupled offset-normalization Jacobian.
-                    let (main_weights, main_biases, offset_weights) = (
+                    let (main_weights, offset_weights) = (
                         params.main.weights.clone(),
-                        params.main.biases.clone(),
                         params.offset_weights.clone(),
                     );
                     let (mask_weights, mask_biases) =
@@ -26824,7 +26823,7 @@ fn forward_wmhf_with_cache(
         training,
     )?;
 
-    let mut dwt = crate::wmhf::haar_dwt(
+    let dwt = crate::wmhf::haar_dwt(
         &global_input.data,
         batch,
         spec.global_channels,
@@ -43584,7 +43583,7 @@ num_dwconv=1
             Tensor::from_data(TensorShape::new(2, 1, 1, 1), vec![0.25, -0.4]).expect("input shape");
         let seed =
             Tensor::from_data(TensorShape::new(2, 1, 1, 1), vec![0.7, -0.35]).expect("seed shape");
-        let mut executable = build();
+        let executable = build();
         let forward = executable.forward(&input).expect("EML CPU forward");
         let objective = |executable: &ExecutableNetwork| {
             executable
@@ -44147,7 +44146,7 @@ num_dwconv=1
             executable
         };
 
-        let mut executable = build();
+        let executable = build();
         // A non-uniform input: an all-equal input would make the global average
         // pool lose the spatial structure and hide most gradient mistakes.
         let input = Tensor::from_data(
@@ -48387,7 +48386,6 @@ batch_normalize=1
             );
         }
         drop(host_states);
-        drop(device_state);
         let legacy_v3_path = dir.join("moe-opt-host-v3.state");
         host_reference
             .save_optimizer_state(&legacy_v3_path)

@@ -2472,9 +2472,8 @@ mod obb_network_decode_tests {
 #[cfg(test)]
 mod modern_decode_tests {
     use super::*;
-    use crate::model::{CenterNetSpec, ModernYoloKind, ModernYoloSpec};
     use crate::runtime::{ModernHeadOutput, Tensor};
-    use crate::{ConfigFile, Network, TensorShape};
+    use crate::{ConfigFile, Network};
 
     fn net(text: &str) -> Network {
         Network::from_config(ConfigFile::parse_str("t.cfg", text).expect("cfg parses"))

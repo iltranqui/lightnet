@@ -845,7 +845,7 @@ mod wiring {
     //! on the CPU and the GPU, and loads its real blob.
 
     use super::*;
-    use crate::{ConfigFile, ExecutableNetwork, LayerParams, Network, Tensor, TensorShape};
+    use crate::{ConfigFile, ExecutableNetwork, LayerParams, Network, Tensor};
 
     fn cfg(hidden: usize, max_options: usize) -> String {
         format!(
@@ -872,7 +872,7 @@ mod wiring {
             "the blob is not the sequential stream"
         );
 
-        let mut exec = ExecutableNetwork::new(network);
+        let exec = ExecutableNetwork::new(network);
         let LayerParams::LayaScorer(_) = &exec.params[1] else {
             panic!("expected scorer params")
         };

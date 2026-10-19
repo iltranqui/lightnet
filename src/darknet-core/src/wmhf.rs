@@ -911,6 +911,7 @@ fn sign_no_zero(value: f32) -> f32 {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn apply_gate(
     fuse: &[f32],
     gate: &[f32],

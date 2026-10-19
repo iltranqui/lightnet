@@ -217,6 +217,6 @@ mod tests {
 
     #[test]
     fn local_rejects_invalid_storage() {
-        assert!(forward(&[1.0], &[], &[], 1, 1, 1, 1, 1, 1, 1, 1, 1, 0).is_err());
+        assert!(forward(&[1.0], &[], &[], 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0).is_err());
     }
 }

@@ -1902,6 +1902,7 @@ pub const AXIS_PINS: &[AxisPin] = &[
 impl LayerKind {
     /// This variant's axis-coverage decision. The match is exhaustive on
     /// purpose: a new variant cannot be added without deciding its axis pin.
+    #[cfg(test)]
     pub(crate) fn axis_pin(&self) -> AxisPin {
         let index = match self {
             Self::RecursiveBlock(_) => 0,

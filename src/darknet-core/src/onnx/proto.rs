@@ -195,7 +195,7 @@ pub(crate) mod testing {
     pub(crate) enum Wire {
         Varint(u64),
         Len(Vec<u8>),
-        Fixed32(u32),
+        Fixed32,
     }
 
     pub(crate) fn decode(mut b: &[u8]) -> Vec<(u32, Wire)> {
@@ -225,7 +225,7 @@ pub(crate) mod testing {
                 5 => {
                     out.push((
                         field,
-                        Wire::Fixed32(u32::from_le_bytes(b[..4].try_into().unwrap())),
+                        Wire::Fixed32,
                     ));
                     b = &b[4..];
                 }

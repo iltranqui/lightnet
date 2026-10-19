@@ -53,7 +53,6 @@ pub fn find_unmarked(project: &Project, from: usize, dir: Dir) -> Option<usize> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn project(name: &str, marks: &[usize]) -> Project {
         let root = std::env::temp_dir().join(format!("darknet-gui-nav-{name}-{}", std::process::id()));

@@ -713,6 +713,7 @@ fn bench_uniform(state: &mut u64) -> f32 {
 
 /// He-style random weights, unit BN scales/variances, zero biases.
 /// All convolution weights, flattened (for the bench weight-delta dump).
+#[cfg(feature = "oxide")]
 fn conv_weight_snapshot(params: &[LayerParams]) -> Vec<f32> {
     let mut v = Vec::new();
     for p in params {

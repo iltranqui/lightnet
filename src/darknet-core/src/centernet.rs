@@ -408,7 +408,7 @@ pub fn centernet_train_batch(
     let net_w = settings.net_width as f32;
     let net_h = settings.net_height as f32;
 
-    let mut read_truth = |t: usize| -> (f32, f32, f32, f32, usize, usize) {
+    let read_truth = |t: usize| -> (f32, f32, f32, f32, usize, usize) {
         let base = b * truths + t * settings.truth_size;
         (
             truth[base],
@@ -845,9 +845,8 @@ mod tests {
             h: 4,
             classes: 1,
         };
-        let mut out = vec![0.0f32; l.len()];
         // The heatmap is sigmoid(0) = 0.5 everywhere: exact centres still push up.
-        let out = centernet_forward(&out, &l);
+        let out = centernet_forward(&vec![0.0f32; l.len()], &l);
         let settings = CenterNetSettings {
             net_width: 4,
             net_height: 4,

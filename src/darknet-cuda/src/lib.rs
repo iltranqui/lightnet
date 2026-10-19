@@ -1163,12 +1163,12 @@ pub trait F32TensorOpsBackend {
         let input_host = self.download_f32(input)?;
         let kernels = size * size;
         let column_count = channels * kernels;
-        let columns = host_ops::deform_conv::predictor_columns(
-            &input_host, batch, channels, in_h, in_w, size, stride_x, padding, dilation, out_h,
+        let columns = host_ops::deform_conv::predictor_columns_xy(
+            &input_host, batch, channels, in_h, in_w, size, stride_x, stride_y, padding, dilation, out_h,
             out_w,
         )
         .unwrap_or_else(|err| panic!("{err}"));
-        let out = host_ops::deform_conv::predictor_backward(
+        let out = host_ops::deform_conv::predictor_backward_xy(
             &input_host,
             &columns,
             &self.download_f32(weights)?,
@@ -1182,6 +1182,7 @@ pub trait F32TensorOpsBackend {
             out_w,
             size,
             stride_x,
+            stride_y,
             padding,
             dilation,
         )

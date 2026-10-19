@@ -945,6 +945,26 @@ pub fn predictor_columns(
     out_h: usize,
     out_w: usize,
 ) -> Result<Vec<f32>, String> {
+    predictor_columns_xy(
+        input, batch, channels, in_h, in_w, size, stride, stride, padding, dilation, out_h, out_w,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn predictor_columns_xy(
+    input: &[f32],
+    batch: usize,
+    channels: usize,
+    in_h: usize,
+    in_w: usize,
+    size: usize,
+    stride_x: usize,
+    stride_y: usize,
+    padding: usize,
+    dilation: usize,
+    out_h: usize,
+    out_w: usize,
+) -> Result<Vec<f32>, String> {
     let kernels = size * size;
     let columns = channels * kernels;
     let plane = out_h * out_w;
@@ -959,9 +979,9 @@ pub fn predictor_columns(
                     let column = (c * size + ky) * size + kx;
                     for oy in 0..out_h {
                         for ox in 0..out_w {
-                            let y = (oy * stride) as isize - (padding * dilation) as isize
+                            let y = (oy * stride_y) as isize - (padding * dilation) as isize
                                 + (ky * dilation) as isize;
-                            let x = (ox * stride) as isize - (padding * dilation) as isize
+                            let x = (ox * stride_x) as isize - (padding * dilation) as isize
                                 + (kx * dilation) as isize;
                             if y >= 0 && y < in_h as isize && x >= 0 && x < in_w as isize {
                                 out[(b * columns + column) * plane + oy * out_w + ox] = input
@@ -1009,6 +1029,31 @@ pub fn predictor_backward(
     padding: usize,
     dilation: usize,
 ) -> Result<PredictorGradients, String> {
+    predictor_backward_xy(
+        input, columns, weights, output_grad, batch, channels, filters, in_h, in_w, out_h, out_w,
+        size, stride, stride, padding, dilation,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn predictor_backward_xy(
+    input: &[f32],
+    columns: &[f32],
+    weights: &[f32],
+    output_grad: &[f32],
+    batch: usize,
+    channels: usize,
+    filters: usize,
+    in_h: usize,
+    in_w: usize,
+    out_h: usize,
+    out_w: usize,
+    size: usize,
+    stride_x: usize,
+    stride_y: usize,
+    padding: usize,
+    dilation: usize,
+) -> Result<PredictorGradients, String> {
     let kernels = size * size;
     let column_count = channels * kernels;
     let plane = out_h * out_w;
@@ -1049,9 +1094,9 @@ pub fn predictor_backward(
                     let column = (c * size + ky) * size + kx;
                     for oy in 0..out_h {
                         for ox in 0..out_w {
-                            let y = (oy * stride) as isize - (padding * dilation) as isize
+                            let y = (oy * stride_y) as isize - (padding * dilation) as isize
                                 + (ky * dilation) as isize;
-                            let x = (ox * stride) as isize - (padding * dilation) as isize
+                            let x = (ox * stride_x) as isize - (padding * dilation) as isize
                                 + (kx * dilation) as isize;
                             if y >= 0 && y < in_h as isize && x >= 0 && x < in_w as isize {
                                 d_input[(b * channels + c) * in_h * in_w
@@ -1178,6 +1223,36 @@ mod predictor_backward_tests {
     }
 
     #[test]
+    fn predictor_columns_and_adjoint_support_distinct_axis_strides() {
+        let input: Vec<f32> = (1..=12).map(|value| value as f32).collect();
+        let columns = predictor_columns_xy(&input, 1, 1, 3, 4, 1, 1, 2, 0, 1, 2, 4).unwrap();
+        assert_eq!(columns, vec![1.0, 2.0, 3.0, 4.0, 9.0, 10.0, 11.0, 12.0]);
+
+        let grad = predictor_backward_xy(
+            &input,
+            &columns,
+            &[2.0],
+            &[1.0; 8],
+            1,
+            1,
+            1,
+            3,
+            4,
+            2,
+            4,
+            1,
+            1,
+            2,
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(grad.d_input, vec![2.0, 2.0, 2.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 2.0, 2.0, 2.0]);
+        assert_eq!(grad.d_weights, vec![52.0]);
+        assert_eq!(grad.d_biases, vec![8.0]);
+    }
+
+    #[test]
     fn predictor_backward_rejects_bad_lengths() {
         let columns = vec![0.0f32; 1 * 9 * 4];
         let input = vec![0.0f32; 4];
@@ -1287,7 +1362,7 @@ pub fn forward(
     let kernels = g.kernels();
     let plane = g.plane();
     let input_sanitized: Vec<f32> = input.iter().copied().map(sanitize).collect();
-    let columns = predictor_columns(
+    let columns = predictor_columns_xy(
         &input_sanitized,
         g.batch,
         g.channels,
@@ -1295,6 +1370,7 @@ pub fn forward(
         g.input_width,
         g.size,
         g.stride_x,
+        g.stride_y,
         g.padding,
         g.dilation,
         g.output_height,
@@ -1414,7 +1490,7 @@ pub fn backward(
         .zip(&fwd.raw_offsets)
         .map(|(&d, &raw)| d * sanitize_slope(raw))
         .collect();
-    let offset_grad = predictor_backward(
+    let offset_grad = predictor_backward_xy(
         &fwd.input_sanitized,
         &fwd.columns,
         offset_weights,
@@ -1428,6 +1504,7 @@ pub fn backward(
         g.output_width,
         g.size,
         g.stride_x,
+        g.stride_y,
         g.padding,
         g.dilation,
     )?;
@@ -1444,7 +1521,7 @@ pub fn backward(
                 .zip(logits)
                 .map(|(&d, &logit)| d * mask_sigmoid_slope(logit))
                 .collect();
-            let grads = predictor_backward(
+            let grads = predictor_backward_xy(
                 &fwd.input_sanitized,
                 &fwd.columns,
                 weights,
@@ -1458,6 +1535,7 @@ pub fn backward(
                 g.output_width,
                 g.size,
                 g.stride_x,
+                g.stride_y,
                 g.padding,
                 g.dilation,
             )?;

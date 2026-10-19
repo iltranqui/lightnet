@@ -223,27 +223,6 @@ pub fn segmentation_loss(
     }
 }
 
-/// Forward plus, when `truth` is given, the loss and seed (C++ `state.truth`).
-pub fn segmentation_forward_loss(
-    input: &[f32],
-    truth: Option<&[f32]>,
-    spec: &SegmentationSpec,
-    batch: usize,
-    spatial: usize,
-    iteration: usize,
-) -> SegmentationOutput {
-    let fwd = segmentation_forward(input, spec, batch, spatial);
-    let Some(truth) = truth else { return fwd };
-    segmentation_loss(
-        &fwd.output,
-        truth,
-        spec,
-        batch,
-        spatial,
-        gate_strength(spec, iteration),
-    )
-}
-
 /// C++ `suppress_correct_pixels_cpu`: scale the delta and loss of every channel
 /// of a pixel by `1 - gate_strength` when the pixel is already correct and
 /// confident.  Works in place and returns the statistics.

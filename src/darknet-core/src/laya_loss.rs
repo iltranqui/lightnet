@@ -560,7 +560,6 @@ mod tests {
         let gap = reward0 - reward1;
         let a0 = gap / 2.0;
         let a1 = -gap / 2.0;
-        let adv = [a0, a1];
         let am = (a0 + a1) / 2.0;
         let var = (a0 - am).powi(2) + (a1 - am).powi(2);
         let sd = (var / 1.0f64).sqrt();

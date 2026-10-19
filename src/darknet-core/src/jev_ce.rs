@@ -36,7 +36,9 @@ pub(crate) fn jev_ce_probs(logits: &[f32], spec: &JevCeSpec, batch: usize) -> Ve
 
 pub(crate) struct JevCeLoss {
     pub mean_ce: f32,
+    #[cfg(test)]
     pub active_groups: usize,
+    #[cfg(test)]
     pub correct: usize,
     /// Darknet descent direction `(t - p) / T`, normalised per sample when `spec.normalize`.
     pub delta: Vec<f32>,
@@ -56,7 +58,9 @@ pub(crate) fn jev_ce_loss(
     };
     let probs = jev_ce_probs(logits, spec, batch);
     let mut delta = vec![0.0f32; logits.len()];
-    let (mut ce_sum, mut active, mut correct) = (0.0f64, 0usize, 0usize);
+    let (mut ce_sum, mut active) = (0.0f64, 0usize);
+    #[cfg(test)]
+    let mut correct = 0usize;
     for b in 0..batch {
         let base = b * spec.groups * spec.candidates;
         let mut sample_active = 0usize;
@@ -71,7 +75,10 @@ pub(crate) fn jev_ce_loss(
             if empty && spec.ignore_empty {
                 continue; // masked group: no loss, no gradient
             }
-            let (mut arg_p, mut arg_t, mut loss) = (0usize, 0usize, 0.0f32);
+            let mut loss = 0.0f32;
+            #[cfg(test)]
+            let (mut arg_p, mut arg_t) = (0usize, 0usize);
+            #[cfg(test)]
             for i in 1..spec.candidates {
                 if probs[at(spec, base, g, i)] > probs[at(spec, base, g, arg_p)] {
                     arg_p = i;
@@ -95,7 +102,10 @@ pub(crate) fn jev_ce_loss(
             }
             ce_sum += loss as f64;
             active += 1;
-            correct += (arg_p == arg_t) as usize;
+            #[cfg(test)]
+            {
+                correct += (arg_p == arg_t) as usize;
+            }
         }
         if spec.normalize {
             let inv = 1.0 / sample_active.max(1) as f32;
@@ -110,7 +120,9 @@ pub(crate) fn jev_ce_loss(
         } else {
             0.0
         },
+        #[cfg(test)]
         active_groups: active,
+        #[cfg(test)]
         correct,
         delta,
     }
