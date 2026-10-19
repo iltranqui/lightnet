@@ -500,8 +500,8 @@ fn dcnv4_gpu_retains_host_cache_for_excluded_and_mixed_variants() {
     let LayerKind::Dcnv4(spec) = &mut large.layers[0].kind else {
         unreachable!()
     };
-    spec.size = 15;
-    spec.padding = 7;
+    spec.size = 17;
+    spec.padding = 8;
     for network in [
         large,
         dcnv4_network(

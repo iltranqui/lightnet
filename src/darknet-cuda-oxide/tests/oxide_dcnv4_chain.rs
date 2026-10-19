@@ -93,6 +93,7 @@ fn native_composition_matches_real_cpu_outputs_and_all_math_gradients() {
         (9, 1, 1, 2),
         (11, 1, 1, 2),
         (13, 1, 1, 2),
+        (15, 1, 1, 2),
     ] {
         for softmax in [false, true] {
             for remove_center in [false, true] {
