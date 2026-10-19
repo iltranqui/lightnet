@@ -110,6 +110,7 @@ file is named inline.
 - [82. GraphConv learned-edge masked-softmax host contract](#82-graphconv-learned-edge-masked-softmax-host-contract)
 - [83. Native GraphConv learned-edge forward primitive](#83-native-graphconv-learned-edge-forward-primitive)
 - [84. Native GraphConv learned-edge adjoints](#84-native-graphconv-learned-edge-adjoints)
+- [85. GraphConv learned-edge runtime path](#85-graphconv-learned-edge-runtime-path)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1615,6 +1616,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 84. Native GraphConv learned-edge adjoints
 
 - v0.2.062: added actual-Oxide learned-edge backward primitives for input, edge-kernel, and edge-bias gradients. Device scratch stores normalized edge weights and masked-softmax logit adjoints; gather/reduction kernels avoid write races. Oxide outputs for all three gradients match the checked host adjoint, whose every input/kernel/bias element is finite-difference checked. `MEM=3G ./tools/test_oxide.sh --test oxide_graph_conv` passes 4 tests. No GraphConv runtime dispatch yet; this is primitive-only and has no compiled-C++ golden/full-suite/performance claim.
+
+## 85. GraphConv learned-edge runtime path
+
+- v0.2.063: routed learned-edge mode 1 GraphConv through native Oxide aggregation forward/backward for no-self/no-BN supported-activation configurations. Learned edge-kernel/bias gradients are downloaded into existing host optimizer buffers; projection and edge parameters continue to update host-side (SGD/Adam). Actual-Oxide runtime output and updates match CPU across SGD then Adam in `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain graph_conv_learned_runtime_forward_backward_and_updates_match_cpu` (1 test). Unsupported edge modes, self projection, BN, and unsupported activations keep host fallback; compact inference and compiled-C++ golden validation remain open. No full-suite or performance claim.
 
 ## Not implemented / open (pointer)
 
