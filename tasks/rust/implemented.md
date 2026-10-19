@@ -106,6 +106,7 @@ file is named inline.
 - [78. Hybrid GPU Muon for non-BN deform_conv](#78-hybrid-gpu-muon-for-non-bn-deform_conv)
 - [79. Native Oxide GraphConv uniform aggregation primitives](#79-native-oxide-graphconv-uniform-aggregation-primitives)
 - [80. GraphConv aggregation coordinate-overflow guards](#80-graphconv-aggregation-coordinate-overflow-guards)
+- [81. Native GPU GraphConv uniform runtime path](#81-native-gpu-graphconv-uniform-runtime-path)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1595,6 +1596,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 80. GraphConv aggregation coordinate-overflow guards
 
 - v0.2.058: strengthened the new GraphConv aggregation geometry validator to reject i64 coordinate arithmetic overflow before kernel launch, including large padding/stride combinations whose tensors appear shape-consistent. The actual-Oxide suite now has 3 passing tests, adding explicit overflow rejection to host-reference parity, finite-difference and malformed-output checks (`MEM=3G ./tools/test_oxide.sh --test oxide_graph_conv`). This hardens only the aggregation primitive; GraphConv runtime remains unwired. No compiled-C++ golden, full-suite or performance claim.
+
+## 81. Native GPU GraphConv uniform runtime path
+
+- v0.2.059: wired native Oxide f32 forward/backward for `[graph_conv]` edge mode 0 with no self projection or BN and backend-supported activation. Aggregation and grouped 1x1 projection/bias/activation run on device; backward computes activation, projection parameter, and aggregation-adjoint gradients on device, then stages projection gradients to host train buffers for SGD/Adam updates. Actual-Oxide runtime parity passed for layer outputs and SGD/Adam parameter updates through GraphConv and an upstream convolution (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain graph_conv_uniform_runtime_forward_backward_and_sgd_match_cpu`); host `graph_conv` filter passed 15 tests including host fallback. Unsupported learned-edge/self/BN/activation variants retain CPU fallback; compact GPU inference remains unsupported. Parameters are uploaded for projection and gradients download at backward; no residency/speedup claim. No compiled-C++ golden or full-suite claim; the broad runtime-chain run had 50 passing tests and one failure (`dcnv4_mixed_network_retains_cpu_cache_and_backward`: missing DCNv4 cache), whose cause remains unverified.
 
 ## Not implemented / open (pointer)
 
