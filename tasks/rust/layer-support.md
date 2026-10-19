@@ -69,7 +69,7 @@ with the command given rather than trusting the number.
 | CPU-only forward, no GPU path (hard reject) | 12 |
 | GPU forward but CPU/mixed backward | 9 |
 | GPU native forward + device backward | 23 |
-| f16 inference | 14 variants (15 section names) |
+| f16 inference | 15 variants (16 section names) |
 | Axis pinned | 24 variants / 27 tests |
 | Axis open | 36 (Tier 1: 10, Tier 2: 15, Tier 3: 3, Tier 4: 8) |
 | Axis Rust-only | 5 |
@@ -91,7 +91,7 @@ with the command given rather than trusting the number.
 | `Upsample` | alias | none | fwd | exact | T1 | native | device | yes |
 | `Reorg` | alias | none | fwd | exact | T1 | native | device | yes (inference) |
 | `ChannelSlice` | yes | none | fwd | exact | pin | native | device | no |
-| `ChannelShuffle` | yes | none | fwd | exact | T1 | native | device | no |
+| `ChannelShuffle` | yes | none | fwd | exact | T1 | native | device | yes (inference) |
 | `Softmax` | alias | none | fwd | exact | T1 | native | device | no |
 | `Dropout` | yes | none | fwd | exact | T1 | native | device | no |
 | `ScaleChannels` | yes | none | fwd | exact | T1 | native | mixed | no |
