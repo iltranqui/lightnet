@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.1.030: pinned LocalAvgPool's window geometry, per-window averaging, batch/channel order and overlap-summed adjoint with a hand-computed non-square B=2 fixture. `MEM=3G ./tools/test_host.sh axis_layout` passed 26; `every_layer_kind_has_an_axis_pin_decision` passed. Ledger has 23 pinned / 37 open C++-backed variants. No compiled-C++ golden; see `implemented.md` §112.
 - v0.1.029: pinned AvgPool's per-sample/per-channel `H*W` reduction and supplied-seed adjoint with a hand-computed non-square B=2 fixture. `axis_layout` passed 25; the axis registry passed. Ledger now has 22 pinned / 38 open C++-backed variants. No compiled-C++ golden; see `implemented.md` §111.
 - v0.1.028: pinned MaxPool depth and spatial axis contracts with hand-computed batch-2 fixtures, including odd kernel, unequal strides, padding, first-wins ties, and `zero_nonmax` backward. `axis_layout` passed 24 and the axis registry passed. Ledger now has 21 pinned / 39 open C++-backed variants. No compiled-C++ golden; see `implemented.md` §110.
 - v0.2.086: native Oxide f32 `maxpool_depth` forward/backward is wired through the full GPU runtime; focused host and actual-Oxide maxpool tests pass. f16 depth pooling remains unsupported; no C++ parity/full-suite claim. See `implemented.md` §109.

@@ -137,6 +137,7 @@ file is named inline.
 - [109. Native GPU maxpool_depth](#109-native-gpu-maxpool_depth)
 - [110. MaxPool axis/layout contract pin](#110-maxpool-axislayout-contract-pin)
 - [111. AvgPool axis/layout contract pin](#111-avgpool-axislayout-contract-pin)
+- [112. LocalAvgPool axis/layout contract pin](#112-localavgpool-axislayout-contract-pin)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1750,6 +1751,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 111. AvgPool axis/layout contract pin
 
 - v0.1.029: pinned the global AvgPool reduction with a hand-computed non-square B=2/C=2 fixture and supplied-seed backward. The named test verifies `[B,C]` output order, per-sample/per-channel `H*W` means, and uniform per-plane gradients; config shape and the axis registry are checked. `MEM=3G ./tools/test_host.sh axis_layout` passed 25; the standalone test and registry test passed. Hand-derived from `Jev_laya:src-lib/avgpool_layer.cpp:51`; no compiled-C++ golden.
+
+## 112. LocalAvgPool axis/layout contract pin
+
+- v0.1.030: pinned local-average pooling with a hand-computed non-square B=2/C=2 fixture covering odd window size, distinct x/y strides, partial edge windows from padding, NCHW output order, and the exact overlap-summed seeded backward. The named config also checks output geometry. `MEM=3G ./tools/test_host.sh axis_layout` passed 26; `MEM=3G ./tools/test_host.sh every_layer_kind_has_an_axis_pin_decision` passed, and the focused test passed. Hand-derived from `Jev_laya:src-lib/maxpool_layer.cpp:440`; no compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 
