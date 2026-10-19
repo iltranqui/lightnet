@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.089: compact f16 inference now supports native `[channel_shuffle]`; batch-2 actual-Oxide output matched f32 with relative max error 2.437e-4. Full `oxide_runtime_f16` suite passed 9 tests. Inference only; see `implemented.md` §116.
 - v0.2.088: compact f16 inference now supports SAM for mapped activations using a native half-storage product/activation kernel. The full `oxide_runtime_f16` suite passed 8 tests; non-adjacent-source SAM relative max error was 6.223e-4. Also corrected compact GPU source lifetime accounting for SAM references. Inference only; see `implemented.md` §115.
 - v0.2.087: compact Oxide f16 inference now supports `maxpool_depth` using native half-storage channel-group max pooling. The full `oxide_runtime_f16` suite passed 7; depth-pool f16 vs f32 relative max error was 2.488e-4. No f16 training/backward or C++ golden claim; see `implemented.md` §113.
 - v0.1.031: pinned Connected's flattened NCHW input, `[out][in]` weight rows, batch-local forward rows, and supplied-seed adjoint with a hand-computed B=2 fixture. `MEM=3G ./tools/test_host.sh axis_layout` passed 27; `every_layer_kind_has_an_axis_pin_decision` passed. Ledger now has 24 pinned / 36 open C++-backed variants. Hand-derived from `Jev_laya:src-lib/connected_layer.cpp:186`; no compiled-C++ golden; see `implemented.md` §114.

@@ -69,7 +69,7 @@ with the command given rather than trusting the number.
 | CPU-only forward, no GPU path (hard reject) | 12 |
 | GPU forward but CPU/mixed backward | 9 |
 | GPU native forward + device backward | 23 |
-| f16 inference | 12 variants (13 section names) |
+| f16 inference | 13 variants (14 section names) |
 | Axis pinned | 24 variants / 27 tests |
 | Axis open | 36 (Tier 1: 10, Tier 2: 15, Tier 3: 3, Tier 4: 8) |
 | Axis Rust-only | 5 |
@@ -266,8 +266,9 @@ BN/norm scales, positional/embedding tables and 1-D params stay Adam/AdamW.
 Accepted by `forward_compact_f16` (`runtime.rs:8389`):
 
 `convolutional` (not `NORM_CHAN*`), `maxpool`, `local_avgpool`, `avgpool`,
-`batchnorm`, `route`, `laya_marker_gather`, `upsample` (incl. `reverse`),
-`shortcut` (with sources), `sam` (supported activation), `yolo`, `obb_yolo`,
+`batchnorm`, `route`, `laya_marker_gather`, `channel_shuffle`,
+`upsample` (incl. `reverse`), `shortcut` (with sources),
+`sam` (supported activation), `yolo`, `obb_yolo`,
 `gaussian_yolo`.
 
 Everything else returns `UnsupportedLayer`. Note this is inference only: f16
