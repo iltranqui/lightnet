@@ -94,6 +94,7 @@ file is named inline.
 - [66. Reuse DCNv4 projection weights from forward during backward](#66-reuse-dcnv4-projection-weights-from-forward-during-backward)
 - [67. Retain native DCNv4 parameters across forwards and updates](#67-retain-native-dcnv4-parameters-across-forwards-and-updates)
 - [68. Native GPU Muon orthogonalization primitive](#68-native-gpu-muon-orthogonalization-primitive)
+- [69. Connected-layer GPU Muon runtime slice](#69-connected-layer-gpu-muon-runtime-slice)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1518,6 +1519,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 68. Native GPU Muon orthogonalization primitive
 
 - v0.2.031 (`b46ad9c8`): added a native Oxide f32 Newton–Schulz orthogonalization primitive exposed through `F32TensorOpsBackend::muon_orthogonalize_f32`; the generic default uses a host reference, while Oxide uses device Frobenius-norm accumulation, transpose/linear-combination kernels and existing GPU GEMM for five paper-coefficient iterations. Actual-GPU parity passed against the host reference for square, tall and wide matrices (including 17x31 and 31x17); zero and invalid-shape cases passed (`MEM=3G ./tools/test_oxide.sh --test oxide_muon`, 2 tests); host-reference zero/non-finite/transpose-equivariance tests also passed (`MEM=3G PKGS=darknet-cuda ./tools/test_host.sh muon_orthogonalize`, 2 tests). This is a standalone matrix primitive, **not** GPU Muon optimizer integration: `update_weights_gpu` still rejects `[net] muon=1`, and GPU momentum/update, hybrid AdamW fallback, runtime layer eligibility/gates and optimizer-sidecar state remain unimplemented. CPU Muon is still v0.1.005. No compiled-C++ golden or full-suite claim.
+
+## 69. Connected-layer GPU Muon runtime slice
+
+- v0.2.032 (`2ddcaa6b`): added opt-in `[net] muon=1` update dispatch for host-resident connected parameters (plus standalone BatchNorm AdamW-only state); eligible dense matrices call the native Oxide Newton–Schulz primitive, while momentum staging, final direction application, host-canonical parameters and optimizer state remain host-side. DNOPT6 save/load now carries GPU Muon momentum in the same host-only layout as CPU Muon. Unsupported parameter families reject before updates, and deferred host synchronization rejects explicitly. Evidence: `MEM=3G ./tools/test_host.sh gpu_muon_` passed 2 tests and `muon_` passed 23; actual-GPU `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_connected_two_step_update_matches_cpu` passed (1), covering two CPU-parity steps plus sidecar save/resume and a third parity step. This is a limited connected-layer runtime slice, not full GPU Muon: other eligible layer families, device-resident momentum/final parameter updates, and broader gate/optimizer coverage remain open. No compiled-C++ golden or full-suite claim.
 
 ## Not implemented / open (pointer)
 

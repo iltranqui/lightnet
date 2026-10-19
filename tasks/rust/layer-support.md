@@ -250,7 +250,7 @@ devices and head sizes (no native kernel at all), even though standard
 |---|---|---|
 | SGD (momentum, decay, per-layer rate, gates) | all parameterized layers | device for conv/MoE/EML and eligible native DCNv4; host for connected, deconv, deform_conv, recurrent, weighted shortcut, vit, swin, tucker, mamba, kimi, local, batchnorm; n/a for hard rejects |
 | Adam/AdamW | all parameterized layers; DNOPT1–5 sidecars | device for conv/MoE/EML/DCNv4 (+BN scales); DCNv4 moments persist on-device between updates and materialize through the existing host sidecar on save; DNOPT1–5 readable |
-| Muon | v0.1.005 hybrid on eligible 2-D matrices, DNOPT6 | **primitive only (v0.2.031)** — native f32 Newton–Schulz orthogonalization has Oxide parity tests; no GPU runtime optimizer update, eligibility dispatch, momentum/state or sidecar integration |
+| Muon | v0.1.005 hybrid on eligible 2-D matrices, DNOPT6 | **partial runtime slice (v0.2.032)** — connected matrices use the native Oxide Newton–Schulz primitive with CPU-parity update/resume tests; standalone BatchNorm stays AdamW fallback. Momentum staging, host-canonical parameter update/state, only connected/BatchNorm supported; other eligible families and device-resident updates remain open |
 
 Muon eligibility (CPU, from `AGENTS.md`): convolution weights viewed as
 `[out, in*kh*kw]`, `connected`, `deconvolutional`, attention/MLP projections in
