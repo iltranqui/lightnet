@@ -977,6 +977,7 @@ where
     pub(crate) gpu_lstm_caches: Vec<Option<GpuLstmBackwardCache<T>>>,
     pub(crate) gpu_moe_caches: Vec<Option<GpuMoeBackwardCache<T>>>,
     pub(crate) gpu_eml_caches: Vec<Option<GpuEmlBackwardCache<T>>>,
+    pub(super) gpu_dcnv4_caches: Vec<Option<dcnv4_gpu::ForwardCache<T>>>,
     pub cpu_forward: ForwardResult,
 }
 
@@ -11545,6 +11546,7 @@ where
         let mut eml_caches: Vec<Option<EmlForwardCache>> =
             Vec::with_capacity(self.network.layers.len());
         let mut dcnv4_caches = Vec::with_capacity(self.network.layers.len());
+        let mut gpu_dcnv4_caches = Vec::with_capacity(self.network.layers.len());
         let mut deform_conv_caches = Vec::with_capacity(self.network.layers.len());
         let mut deform_device_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches: Vec<Option<crate::vit::VitForwardCache>> =
@@ -11586,6 +11588,7 @@ where
             let mut mambavision_cache = None;
             let mut kimi_kda_cache = None;
             let mut dcnv4_cache = None;
+            let mut gpu_dcnv4_cache = None;
             let mut deform_conv_cache = None;
             let mut deform_device_cache: Option<DeformDeviceCache<B::Tensor>> = None;
             let mut moe_cache = None;
@@ -12099,9 +12102,10 @@ where
                 }
                 (LayerKind::Dcnv4(spec), LayerParams::Dcnv4(params)) => {
                     if deform_device {
-                        let (output, pre) =
+                        let (output, pre, cache) =
                             dcnv4_gpu::forward(&self.backend, current_input, layer, spec, params)?;
                         activation_input_gpu = Some(pre);
+                        gpu_dcnv4_cache = Some(cache);
                         output
                     } else {
                         let host_input = self
@@ -13416,6 +13420,7 @@ where
             moe_caches.push(moe_cache);
             eml_caches.push(eml_cache);
             dcnv4_caches.push(dcnv4_cache);
+            gpu_dcnv4_caches.push(gpu_dcnv4_cache);
             deform_conv_caches.push(deform_conv_cache);
             deform_device_caches.push(deform_device_cache);
             vit_caches.push(vit_cache);
@@ -13436,6 +13441,7 @@ where
             gpu_lstm_caches,
             gpu_moe_caches,
             gpu_eml_caches,
+            gpu_dcnv4_caches,
             cpu_forward: ForwardResult {
                 layer_outputs,
                 layer_activation_inputs,
@@ -15952,8 +15958,14 @@ where
                                 "missing DCNv4 activation cache at #{}", layer.index
                             ))
                         })?;
-                    let gradients =
-                        dcnv4_gpu::backward(&self.backend, input, pre, &grad, layer, spec, params)?;
+                    let cache = forward.gpu_dcnv4_caches[layer.index].as_ref().ok_or_else(|| {
+                        Error::InvalidConfig(format!(
+                            "missing GPU DCNv4 forward cache at #{}", layer.index
+                        ))
+                    })?;
+                    let gradients = dcnv4_gpu::backward(
+                        &self.backend, input, pre, &grad, cache, layer, spec, params,
+                    )?;
                     {
                         let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
                         let LayerTrainBuffers::Dcnv4(train) = &mut buffers[layer.index] else {

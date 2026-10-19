@@ -871,6 +871,7 @@ fn gpu_forward_compact_and_updates_explicitly_reject_hf() {
         gpu_lstm_caches: Vec::new(),
         gpu_moe_caches: Vec::new(),
         gpu_eml_caches: Vec::new(),
+        gpu_dcnv4_caches: Vec::new(),
         cpu_forward: ForwardResult::from_heads(Vec::new(), Vec::new()),
     };
     assert!(

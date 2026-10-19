@@ -1,7 +1,8 @@
 //! Bounded DCNv4 GPU math: <=169 active points, elementwise/channel activation.
 //! BN normalizes with rolling stats; its 0.9 EMA runs only after backward.
 //! Parameter gradients/SGD/Adam stay host-resident; forward/backward tensor math
-//! is native on Oxide. Backward recomputes offsets, never uses last-forward state.
+//! is native on Oxide. Each GPU forward state owns its raw and offset tensors for
+//! backward, so projection/aggregation are not redundantly recomputed.
 
 use super::*;
 use crate::model::Layer;
@@ -62,13 +63,19 @@ fn descriptor(layer: &Layer, spec: &Dcnv4Spec, params: &Dcnv4Params) -> Result<D
     Ok(desc)
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ForwardCache<T> {
+    raw: T,
+    offsets: T,
+}
+
 pub(super) fn forward<B: F32TensorOpsBackend>(
     backend: &B,
     input: &B::Tensor,
     layer: &Layer,
     spec: &Dcnv4Spec,
     params: &Dcnv4Params,
-) -> Result<(B::Tensor, B::Tensor)>
+) -> Result<(B::Tensor, B::Tensor, ForwardCache<B::Tensor>)>
 where
     B::Error: std::fmt::Display,
 {
@@ -85,7 +92,7 @@ where
     let biases = backend
         .upload_f32(&[params.offset_biases.len()], &params.offset_biases)
         .map_err(|err| backend_error("upload DCNv4 offset biases", err))?;
-    let (raw, _) = backend
+    let (raw, offsets) = backend
         .dcnv4_forward_f32(input, &weights, &biases, desc, cfg)
         .map_err(|err| backend_error("DCNv4 native raw forward", err))?;
     let pre = if let Some(bn) = &params.batch_norm {
@@ -111,7 +118,7 @@ where
             .map_err(|err| backend_error("DCNv4 bias add", err))?
     };
     let out = activation_output(backend, &pre, layer, spec)?;
-    Ok((out, pre))
+    Ok((out, pre, ForwardCache { raw, offsets }))
 }
 
 pub(super) fn activation_output<B: F32TensorOpsBackend>(
@@ -161,6 +168,7 @@ pub(super) fn backward<B: F32TensorOpsBackend>(
     input: &B::Tensor,
     pre: &B::Tensor,
     seed: &B::Tensor,
+    cache: &ForwardCache<B::Tensor>,
     layer: &Layer,
     spec: &Dcnv4Spec,
     params: &Dcnv4Params,
@@ -178,14 +186,8 @@ where
     let weights = backend
         .upload_f32(&[params.offset_weights.len()], &params.offset_weights)
         .map_err(|err| backend_error("upload DCNv4 backward weights", err))?;
-    let biases = backend
-        .upload_f32(&[params.offset_biases.len()], &params.offset_biases)
-        .map_err(|err| backend_error("upload DCNv4 backward offset biases", err))?;
-    // Recompute on device from this forward state's input. No host-cache hop,
-    // but redundant projection/aggregation work; no residency/speedup claim.
-    let (raw, offsets) = backend
-        .dcnv4_forward_f32(input, &weights, &biases, desc, cfg)
-        .map_err(|err| backend_error("DCNv4 native offset recomputation", err))?;
+    let raw = &cache.raw;
+    let offsets = &cache.offsets;
     let delta = activation_delta(backend, pre, seed, layer, spec, GradMode::from_env())?;
     let (aggregation_grad, biases, scales) = if let Some(bn) = &params.batch_norm {
         let normalized = normalized_raw(backend, &raw, bn, desc.geometry.spatial())?;
@@ -226,7 +228,7 @@ where
         (delta, db, None)
     };
     let (input, dw, db) = backend
-        .dcnv4_backward_f32(input, &weights, &offsets, &aggregation_grad, desc, cfg)
+        .dcnv4_backward_f32(input, &weights, offsets, &aggregation_grad, desc, cfg)
         .map_err(|err| backend_error("DCNv4 native backward", err))?;
     Ok(Gradients {
         input,

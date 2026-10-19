@@ -88,6 +88,7 @@ fn dcnv4_bn_native_gradients_match_cpu_including_zero_gamma() {
         &gf.input_gpu,
         gf.gpu_layer_activation_inputs[0].as_ref().unwrap(),
         &device_seed,
+        gf.gpu_dcnv4_caches[0].as_ref().unwrap(),
         &network.layers[0],
         spec,
         params,
@@ -315,6 +316,7 @@ fn dcnv4_gpu_selects_native_math_without_host_cache() {
     let input = Tensor::filled(network.net.input_shape(), 0.2);
     let forward = gpu.forward_training_with_state(&input).unwrap();
     assert!(forward.cpu_forward.dcnv4_caches[0].is_none());
+    assert!(forward.gpu_dcnv4_caches[0].is_some());
 }
 
 #[test]
@@ -373,6 +375,8 @@ fn dcnv4_gpu_multiple_forward_states_and_microbatch_accumulation_match_cpu() {
     let cb = cpu.forward_training(&b).unwrap();
     let ga = gpu.forward_training_with_state(&a).unwrap();
     let gb = gpu.forward_training_with_state(&b).unwrap();
+    assert!(ga.gpu_dcnv4_caches[0].is_some());
+    assert!(gb.gpu_dcnv4_caches[0].is_some());
     let seeds = [Some(
         Tensor::from_data(
             network.layers[0].output_shape,

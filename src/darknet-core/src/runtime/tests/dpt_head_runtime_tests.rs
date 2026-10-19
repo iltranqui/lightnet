@@ -759,6 +759,7 @@ fn dpt_head_rejects_gpu_execution_backward_and_updates() {
         gpu_lstm_caches: Vec::new(),
         gpu_moe_caches: Vec::new(),
         gpu_eml_caches: Vec::new(),
+        gpu_dcnv4_caches: Vec::new(),
         cpu_forward: ForwardResult::from_heads(Vec::new(), Vec::new()),
     };
     let error = gpu

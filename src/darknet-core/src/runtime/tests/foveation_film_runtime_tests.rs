@@ -517,6 +517,7 @@ fn foveation_film_sgd_adamw_muon_and_gpu_boundary() {
         gpu_lstm_caches: Vec::new(),
         gpu_moe_caches: Vec::new(),
         gpu_eml_caches: Vec::new(),
+        gpu_dcnv4_caches: Vec::new(),
         cpu_forward: ForwardResult::from_heads(Vec::new(), Vec::new()),
     };
     let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
