@@ -2613,7 +2613,7 @@ fn dcnv4_bn_native_f32_matches_cpu_chain_and_updates() {
 }
 
 #[test]
-fn dcnv4_mixed_network_retains_cpu_cache_and_backward() {
+fn dcnv4_mixed_network_cpu_and_gpu_backward_succeed() {
     let net = network(
         "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=1\n\
         [dcnv4]\nsize=1\npadding=0\nd_stride=2\nsoftmax=0\nbatch_normalize=1\nactivation=linear\n\
@@ -2631,9 +2631,8 @@ fn dcnv4_mixed_network_retains_cpu_cache_and_backward() {
     let gf = gpu.forward_training_with_state(&input).unwrap();
     let seed = Tensor::filled(cpu.network.layers[0].output_shape, 0.3);
     let seeds = [Some(seed), None];
-    // This succeeds only if the host DCNv4 cache survived the mixed forward.
-    cpu.backward_seeded(&input, &gf.cpu_forward, &seeds)
-        .unwrap();
+    // The GPU forward keeps its DCNv4 cache in GPU state, not the host
+    // snapshot. Consume each forward state with its matching backward path.
     cpu.backward_accumulate_seeded(&input, &cf, &seeds).unwrap();
     gpu.backward_accumulate_seeded_gpu(&gf, &seeds).unwrap();
 }
