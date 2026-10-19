@@ -502,14 +502,8 @@ fn dcnv4_gpu_retains_host_cache_for_excluded_and_mixed_variants() {
     };
     spec.size = 15;
     spec.padding = 7;
-    let mut normalized = dcnv4_network("", "");
-    let LayerKind::Dcnv4(spec) = &mut normalized.layers[0].kind else {
-        unreachable!()
-    };
-    spec.activation = Activation::Revleaky;
     for network in [
         large,
-        normalized,
         dcnv4_network(
             "",
             "[deconvolutional]\nfilters=2\nsize=1\nstride=1\nactivation=linear\n",
@@ -525,4 +519,17 @@ fn dcnv4_gpu_retains_host_cache_for_excluded_and_mixed_variants() {
         gpu.backward_accumulate_seeded_gpu(&forward, &seeds)
             .unwrap();
     }
+
+    let mut revleaky = dcnv4_network("", "");
+    let LayerKind::Dcnv4(spec) = &mut revleaky.layers[0].kind else {
+        unreachable!()
+    };
+    spec.activation = Activation::Revleaky;
+    let mut gpu = GpuExecutableNetwork::new(revleaky.clone(), FakeBackend);
+    assert!(!gpu.requires_cpu_backward_fallback());
+    let input = Tensor::filled(revleaky.net.input_shape(), -0.3);
+    let forward = gpu.forward_training_with_state(&input).unwrap();
+    assert!(forward.cpu_forward.dcnv4_caches[0].is_none());
+    let seeds = [Some(Tensor::filled(revleaky.layers[0].output_shape, 0.4))];
+    gpu.backward_accumulate_seeded_gpu(&forward, &seeds).unwrap();
 }

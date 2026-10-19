@@ -374,7 +374,9 @@ impl Activation {
             Self::Plse => Some(F32ActivationKind::Plse),
             Self::Stair => Some(F32ActivationKind::Stair),
             Self::Logistic => Some(F32ActivationKind::Logistic),
-            Self::Revleaky => None,
+            // Rust's source-derived Revleaky forward/adjoint match Leaky's
+            // tensor semantics (including the non-positive branch slope).
+            Self::Revleaky => Some(F32ActivationKind::Leaky),
             Self::Relu => Some(F32ActivationKind::Relu),
             Self::Leaky => Some(F32ActivationKind::Leaky),
             Self::Mish => Some(F32ActivationKind::Mish),

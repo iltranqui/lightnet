@@ -1,8 +1,9 @@
 //! Bounded DCNv4 GPU math: <=169 active points, elementwise/channel activation.
 //! BN normalizes with rolling stats; its 0.9 EMA runs only after backward.
-//! Parameter gradients accumulate on-device; parameters and optimizer updates
-//! remain host-resident until the optimizer boundary. Forward/backward tensor
-//! math is native on Oxide. Each GPU forward state owns its raw and offset tensors
+//! Parameter gradients and SGD/Adam math use device tensors; Adam moments and
+//! canonical parameters cross the host boundary for sidecar compatibility.
+//! Forward/backward tensor math is native on Oxide. Each GPU forward state owns
+//! its raw and offset tensors
 //! for backward, so projection/aggregation are not redundantly recomputed.
 
 use super::*;

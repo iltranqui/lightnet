@@ -2645,6 +2645,7 @@ fn dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu() {
         for (softmax, remove_center, activation, size, padding, dilation) in [
             (1, 1, "swish", 3, 2, 2),
             (0, 0, "leaky", 3, 2, 2),
+            (0, 0, "revleaky", 3, 2, 2),
             (0, 0, "leaky", 7, 3, 1),
             (0, 0, "leaky", 9, 4, 1),
             (0, 0, "leaky", 11, 5, 1),
