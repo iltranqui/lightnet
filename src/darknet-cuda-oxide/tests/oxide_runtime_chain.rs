@@ -3207,3 +3207,72 @@ fn gpu_muon_multiple_connected_layers_match_cpu_across_steps() {
         }
     }
 }
+
+#[test]
+fn gpu_muon_connected_update_gate_matches_cpu_on_device() {
+    let net = network(
+        "[net]\nwidth=2\nheight=1\nchannels=1\nbatch=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0005\nloss_scale=8\n\
+         [connected]\noutput=3\nactivation=linear\ndont_update=1\n\
+         [connected]\noutput=2\nactivation=linear\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    for (layer, params) in cpu.params.iter_mut().enumerate() {
+        let LayerParams::Connected(params) = params else {
+            panic!("connected parameters expected");
+        };
+        for (i, weight) in params.weights.iter_mut().enumerate() {
+            *weight = ((i + layer * 5) as f32 * 0.31).sin() * 0.25;
+        }
+        for (i, bias) in params.biases.iter_mut().enumerate() {
+            *bias = ((i + layer) as f32 * 0.27).cos() * 0.08;
+        }
+    }
+    let first_layer_initial = cpu.params[0].clone();
+    let second_layer_initial = cpu.params[1].clone();
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+
+    for step in 1..=2 {
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("Oxide forward");
+        let seed = Tensor::filled(cpu.network.layers[1].output_shape, 0.04 * step as f32);
+        let seeds = [None, Some(seed)];
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("Oxide backward");
+        cpu.update_weights_muon(0.02, 2).expect("CPU Muon update");
+        gpu.update_weights_gpu(0.02, 0.9, net.net.decay, 2)
+            .expect("GPU Muon update");
+        for layer in 0..2 {
+            let (LayerParams::Connected(cpu_params), LayerParams::Connected(gpu_params)) =
+                (&cpu.params[layer], &gpu.params[layer])
+            else {
+                panic!("connected parameters expected after update");
+            };
+            close(
+                &format!("gated GPU Muon layer {layer} weights"),
+                &gpu_params.weights,
+                &cpu_params.weights,
+                8e-4,
+            );
+            close(
+                &format!("gated GPU Muon layer {layer} biases"),
+                &gpu_params.biases,
+                &cpu_params.biases,
+                8e-4,
+            );
+        }
+        if step == 1 {
+            assert_eq!(cpu.params[0], first_layer_initial);
+            assert_eq!(gpu.params[0], first_layer_initial);
+            assert_ne!(cpu.params[1], second_layer_initial);
+            assert_ne!(gpu.params[1], second_layer_initial);
+            cpu.set_train_iteration(1);
+            gpu.set_train_iteration(1);
+        }
+    }
+}
