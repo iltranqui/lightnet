@@ -74,7 +74,7 @@ with the command given rather than trusting the number.
 | Axis open | 41 (Tier 1: 14, Tier 2: 16, Tier 3: 3, Tier 4: 8) |
 | Axis Rust-only | 5 |
 | Incomplete CPU port | 1 (`Yolo3d`); blocked: `Dcnv3`, `DetrDecoder` |
-| GPU Muon | partial runtime integration: native Oxide Newton–Schulz on connected matrices; standalone BatchNorm host AdamW fallback. Other parameter families/device-resident updates open |
+| GPU Muon | partial runtime integration: connected matrices use native Oxide momentum/lookahead, Newton–Schulz and direction+decay update; momentum cached between steps but mirrored to host each update; weights remain host-canonical. Standalone BatchNorm host AdamW fallback; other parameter families open |
 
 ## Matrix
 
@@ -250,7 +250,7 @@ devices and head sizes (no native kernel at all), even though standard
 |---|---|---|
 | SGD (momentum, decay, per-layer rate, gates) | all parameterized layers | device for conv/MoE/EML and eligible native DCNv4; host for connected, deconv, deform_conv, recurrent, weighted shortcut, vit, swin, tucker, mamba, kimi, local, batchnorm; n/a for hard rejects |
 | Adam/AdamW | all parameterized layers; DNOPT1–5 sidecars | device for conv/MoE/EML/DCNv4 (+BN scales); DCNv4 moments persist on-device between updates and materialize through the existing host sidecar on save; DNOPT1–5 readable |
-| Muon | v0.1.005 hybrid on eligible 2-D matrices, DNOPT6 | **partial runtime slice (v0.2.032–033)** — connected matrices use native Oxide Newton–Schulz with actual-GPU CPU-parity update/resume tests; standalone BatchNorm scale/bias uses host AdamW fallback with FakeBackend CPU-parity/state tests. Momentum staging, final update, parameters and optimizer state remain host-side; other eligible families/device-resident updates remain open |
+| Muon | v0.1.005 hybrid on eligible 2-D matrices, DNOPT6 | **partial runtime slice (v0.2.032–034)** — connected matrices use native Oxide momentum/lookahead, Newton–Schulz and final direction+decay update, with actual-GPU multi-step/resume CPU parity. Momentum tensors persist on-device between steps but are mirrored to host each update; connected params remain host-canonical. Standalone BatchNorm scales/biases use host AdamW fallback; other eligible families and multi-layer/gate coverage remain open |
 
 Muon eligibility (CPU, from `AGENTS.md`): convolution weights viewed as
 `[out, in*kh*kw]`, `connected`, `deconvolutional`, attention/MLP projections in
