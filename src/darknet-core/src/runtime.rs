@@ -8413,6 +8413,10 @@ struct GpuDcnv4TrainBuffers<T> {
     offset_weight_updates: T,
     offset_bias_updates: T,
     scale_updates: Option<T>,
+    momentum_bias: T,
+    momentum_offset_weights: T,
+    momentum_offset_biases: T,
+    momentum_scale: Option<T>,
     dirty: bool,
 }
 
@@ -9827,35 +9831,55 @@ where
                 (LayerKind::Dcnv4(spec), LayerParams::Dcnv4(params))
                     if !dcnv4_gpu::needs_host(spec) =>
                 {
-                    if params.offset_weights.is_empty()
-                        || params.offset_biases.is_empty()
-                        || params.biases.len() != spec.filters
-                        || params.batch_norm.is_some() != spec.batch_normalize
-                    {
-                        return Err(Error::InvalidConfig(format!(
-                            "DCNv4 parameter storage mismatch while allocating GPU train buffers at layer #{}",
-                            layer.index
-                        )));
-                    }
+                    let desc = dcnv4_gpu::descriptor(layer, spec, params)?;
+                    let bias_shape = [spec.filters];
+                    let offset_weight_shape = [
+                        desc.geometry.offset_dim(),
+                        desc.geometry.channels,
+                        spec.size,
+                        spec.size,
+                    ];
+                    let offset_bias_shape = [desc.geometry.offset_dim()];
                     let bias_updates = self
                         .backend
-                        .zeros_f32(&[params.biases.len()])
+                        .zeros_f32(&bias_shape)
                         .map_err(|err| backend_error("allocate DCNv4 GPU bias updates", err))?;
                     let offset_weight_updates = self
                         .backend
-                        .zeros_f32(&[params.offset_weights.len()])
+                        .zeros_f32(&offset_weight_shape)
                         .map_err(|err| backend_error("allocate DCNv4 GPU offset weight updates", err))?;
                     let offset_bias_updates = self
                         .backend
-                        .zeros_f32(&[params.offset_biases.len()])
+                        .zeros_f32(&offset_bias_shape)
                         .map_err(|err| backend_error("allocate DCNv4 GPU offset bias updates", err))?;
                     let scale_updates = params
                         .batch_norm
                         .as_ref()
-                        .map(|bn| {
+                        .map(|_| {
                             self.backend
-                                .zeros_f32(&[bn.scales.len()])
+                                .zeros_f32(&bias_shape)
                                 .map_err(|err| backend_error("allocate DCNv4 GPU scale updates", err))
+                        })
+                        .transpose()?;
+                    let momentum_bias = self
+                        .backend
+                        .zeros_f32(&bias_shape)
+                        .map_err(|err| backend_error("allocate DCNv4 GPU bias momentum", err))?;
+                    let momentum_offset_weights = self
+                        .backend
+                        .zeros_f32(&offset_weight_shape)
+                        .map_err(|err| backend_error("allocate DCNv4 GPU offset weight momentum", err))?;
+                    let momentum_offset_biases = self
+                        .backend
+                        .zeros_f32(&offset_bias_shape)
+                        .map_err(|err| backend_error("allocate DCNv4 GPU offset bias momentum", err))?;
+                    let momentum_scale = params
+                        .batch_norm
+                        .as_ref()
+                        .map(|_| {
+                            self.backend
+                                .zeros_f32(&bias_shape)
+                                .map_err(|err| backend_error("allocate DCNv4 GPU scale momentum", err))
                         })
                         .transpose()?;
                     Some(GpuDcnv4TrainBuffers {
@@ -9863,6 +9887,10 @@ where
                         offset_weight_updates,
                         offset_bias_updates,
                         scale_updates,
+                        momentum_bias,
+                        momentum_offset_weights,
+                        momentum_offset_biases,
+                        momentum_scale,
                         dirty: false,
                     })
                 }
@@ -10381,6 +10409,25 @@ where
                 self.host_weights_stale = true;
             }
         }
+        let device_dcnv4_sgd_path =
+            !self.requires_cpu_backward_fallback() && matches!(step, GpuOptimizerStep::Sgd { .. });
+        let mut preserve_device_dcnv4_params = vec![false; self.network.layers.len()];
+        if device_dcnv4_sgd_path {
+            for layer_index in 0..self.network.layers.len() {
+                let layer = &self.network.layers[layer_index];
+                if !matches!(layer.kind, LayerKind::Dcnv4(_))
+                    || !layer.train.updates_at(iteration_num, burn_in)
+                {
+                    continue;
+                }
+                preserve_device_dcnv4_params[layer_index] = self.update_device_dcnv4_sgd(
+                    layer_index,
+                    &step,
+                    config,
+                )?;
+            }
+        }
+
         let device_eml_path = !self.requires_cpu_backward_fallback();
         let mut preserve_device_eml_params = vec![false; self.network.layers.len()];
         if device_eml_path {
@@ -10446,12 +10493,15 @@ where
             self.host_weights_stale = false;
         }
         self.flush_device_moe_gradients_to_host(&preserve_device_moe_params)?;
-        self.flush_device_dcnv4_gradients_to_host()?;
+        if !device_dcnv4_sgd_path {
+            self.flush_device_dcnv4_gradients_to_host()?;
+        }
         if let GpuOptimizerStep::Adam(adam) = step {
             self.update_cpu_fallback_adam(
                 &adam,
                 &preserve_device_moe_params,
                 &preserve_device_eml_params,
+                &preserve_device_dcnv4_params,
             )?;
         } else {
             self.update_cpu_fallback_weights(
@@ -10461,6 +10511,7 @@ where
                 batch,
                 &preserve_device_moe_params,
                 &preserve_device_eml_params,
+                &preserve_device_dcnv4_params,
             );
         }
         Ok(())
@@ -10474,6 +10525,7 @@ where
         adam: &AdamParams,
         device_moe_layers: &[bool],
         device_eml_layers: &[bool],
+        device_dcnv4_layers: &[bool],
     ) -> Result<()> {
         let iteration_num = self.train_iteration as i64 + 1;
         let burn_in = self.network.net.burn_in;
@@ -10488,6 +10540,8 @@ where
                     && device_moe_layers.get(index).copied().unwrap_or(false))
                 || (matches!(layer.kind, LayerKind::EmlConvolutional(_))
                     && device_eml_layers.get(index).copied().unwrap_or(false))
+                || (matches!(layer.kind, LayerKind::Dcnv4(_))
+                    && device_dcnv4_layers.get(index).copied().unwrap_or(false))
             {
                 continue;
             }
@@ -10932,6 +10986,7 @@ where
         batch: usize,
         preserve_device_moe_params: &[bool],
         preserve_device_eml_params: &[bool],
+        preserve_device_dcnv4_params: &[bool],
     ) {
         let iteration_num = self.train_iteration as i64 + 1;
         let burn_in = self.network.net.burn_in;
@@ -10943,7 +10998,13 @@ where
             .zip(&self.network.layers)
             .enumerate()
         {
-            if matches!(layer.kind, LayerKind::Convolutional(_)) {
+            if matches!(layer.kind, LayerKind::Convolutional(_))
+                || (matches!(layer.kind, LayerKind::Dcnv4(_))
+                    && preserve_device_dcnv4_params
+                        .get(layer_index)
+                        .copied()
+                        .unwrap_or(false))
+            {
                 continue;
             }
             if !layer.train.updates_at(iteration_num, burn_in) {
@@ -17494,6 +17555,232 @@ where
         Ok(true)
     }
 
+    /// Run DCNv4 SGD on native tensors while keeping host parameters canonical.
+    /// Adam remains on the host optimizer path after the device-gradient flush.
+    fn update_device_dcnv4_sgd(
+        &mut self,
+        layer_index: usize,
+        step: &GpuOptimizerStep,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<bool> {
+        let GpuOptimizerStep::Sgd {
+            lr,
+            momentum,
+            decay,
+            batch,
+        } = *step
+        else {
+            return Ok(false);
+        };
+        let layer = self.network.layers.get(layer_index).ok_or_else(|| {
+            Error::InvalidConfig(format!("missing DCNv4 layer #{layer_index}"))
+        })?;
+        let (LayerKind::Dcnv4(spec), LayerParams::Dcnv4(params)) =
+            (&layer.kind, &self.params[layer_index])
+        else {
+            return Ok(false);
+        };
+        if dcnv4_gpu::needs_host(spec) {
+            return Ok(false);
+        }
+        let desc = dcnv4_gpu::descriptor(layer, spec, params)?;
+        let train = self
+            .device_dcnv4_train_buffers
+            .borrow()
+            .get(layer_index)
+            .and_then(Clone::clone);
+        let Some(train) = train else {
+            return Err(Error::InvalidConfig(format!(
+                "missing native DCNv4 train buffers at layer #{layer_index}"
+            )));
+        };
+        let bias_shape = [spec.filters];
+        let offset_weight_shape = [
+            desc.geometry.offset_dim(),
+            desc.geometry.channels,
+            spec.size,
+            spec.size,
+        ];
+        let offset_bias_shape = [desc.geometry.offset_dim()];
+        let offset_weights = self
+            .backend
+            .upload_f32(&offset_weight_shape, &params.offset_weights)
+            .map_err(|err| backend_error("upload DCNv4 optimizer offset weights", err))?;
+        let offset_biases = self
+            .backend
+            .upload_f32(&offset_bias_shape, &params.offset_biases)
+            .map_err(|err| backend_error("upload DCNv4 optimizer offset biases", err))?;
+        let layer_lr = lr * layer.train.learning_rate_scale;
+        let offset_weight_sum = self
+            .backend
+            .saxpy_f32(
+                1.0,
+                &train.offset_weight_updates,
+                &train.momentum_offset_weights,
+                config,
+            )
+            .map_err(|err| backend_error("accumulate DCNv4 offset-weight momentum", err))?;
+        let offset_bias_sum = self
+            .backend
+            .saxpy_f32(
+                1.0,
+                &train.offset_bias_updates,
+                &train.momentum_offset_biases,
+                config,
+            )
+            .map_err(|err| backend_error("accumulate DCNv4 offset-bias momentum", err))?;
+        let (next_offset_weights, next_offset_weight_momentum) = self
+            .backend
+            .sgd_update_f32(
+                &offset_weights,
+                &offset_weight_sum,
+                layer_lr * 0.01,
+                momentum,
+                decay,
+                batch,
+                config,
+            )
+            .map_err(|err| backend_error("DCNv4 native SGD offset weights", err))?;
+        let (next_offset_biases, next_offset_bias_momentum) = self
+            .backend
+            .sgd_update_f32(
+                &offset_biases,
+                &offset_bias_sum,
+                layer_lr * 0.01,
+                momentum,
+                0.0,
+                batch,
+                config,
+            )
+            .map_err(|err| backend_error("DCNv4 native SGD offset biases", err))?;
+        let (next_biases, next_bias_momentum, next_scales, next_scale_momentum) =
+            if let Some(bn) = params.batch_norm.as_ref() {
+                let updates = train.scale_updates.as_ref().ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "missing DCNv4 BN scale updates at layer #{layer_index}"
+                    ))
+                })?;
+                let momentum_buffer = train.momentum_scale.as_ref().ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "missing DCNv4 BN scale momentum at layer #{layer_index}"
+                    ))
+                })?;
+                let scale = self
+                    .backend
+                    .upload_f32(&bias_shape, &bn.scales)
+                    .map_err(|err| backend_error("upload DCNv4 optimizer BN scales", err))?;
+                let scale_sum = self
+                    .backend
+                    .saxpy_f32(1.0, updates, momentum_buffer, config)
+                    .map_err(|err| backend_error("accumulate DCNv4 scale momentum", err))?;
+                let (next_scale, next_scale_momentum) = self
+                    .backend
+                    .sgd_update_f32(
+                        &scale,
+                        &scale_sum,
+                        layer_lr,
+                        momentum,
+                        0.0,
+                        batch,
+                        config,
+                    )
+                    .map_err(|err| backend_error("DCNv4 native SGD BN scales", err))?;
+                (None, None, Some(next_scale), Some(next_scale_momentum))
+            } else {
+                let bias = self
+                    .backend
+                    .upload_f32(&bias_shape, &params.biases)
+                    .map_err(|err| backend_error("upload DCNv4 optimizer biases", err))?;
+                let bias_sum = self
+                    .backend
+                    .saxpy_f32(1.0, &train.bias_updates, &train.momentum_bias, config)
+                    .map_err(|err| backend_error("accumulate DCNv4 bias momentum", err))?;
+                let (next_bias, next_bias_momentum) = self
+                    .backend
+                    .sgd_update_f32(
+                        &bias,
+                        &bias_sum,
+                        layer_lr,
+                        momentum,
+                        0.0,
+                        batch,
+                        config,
+                    )
+                    .map_err(|err| backend_error("DCNv4 native SGD biases", err))?;
+                (Some(next_bias), Some(next_bias_momentum), None, None)
+            };
+
+        let offset_weights_host = self
+            .backend
+            .download_f32(&next_offset_weights)
+            .map_err(|err| backend_error("download DCNv4 SGD offset weights", err))?;
+        let offset_biases_host = self
+            .backend
+            .download_f32(&next_offset_biases)
+            .map_err(|err| backend_error("download DCNv4 SGD offset biases", err))?;
+        let biases_host = next_biases
+            .as_ref()
+            .map(|value| self.backend.download_f32(value))
+            .transpose()
+            .map_err(|err| backend_error("download DCNv4 SGD biases", err))?;
+        let scales_host = next_scales
+            .as_ref()
+            .map(|value| self.backend.download_f32(value))
+            .transpose()
+            .map_err(|err| backend_error("download DCNv4 SGD BN scales", err))?;
+
+        let (LayerKind::Dcnv4(_spec), LayerParams::Dcnv4(params)) =
+            (&self.network.layers[layer_index].kind, &mut self.params[layer_index])
+        else {
+            unreachable!("DCNv4 layer metadata was validated above")
+        };
+        params.offset_weights = offset_weights_host;
+        params.offset_biases = offset_biases_host;
+        match (&mut params.batch_norm, scales_host, biases_host) {
+            (Some(bn), Some(scales), None) => bn.scales = scales,
+            (None, None, Some(biases)) => params.biases = biases,
+            _ => {
+                return Err(Error::InvalidConfig(format!(
+                    "DCNv4 SGD parameter update mismatch at layer #{layer_index}"
+                )));
+            }
+        }
+        let mut buffers = self.device_dcnv4_train_buffers.borrow_mut();
+        let slot = buffers
+            .get_mut(layer_index)
+            .and_then(Option::as_mut)
+            .expect("DCNv4 train buffer validated above");
+        slot.momentum_offset_weights = next_offset_weight_momentum;
+        slot.momentum_offset_biases = next_offset_bias_momentum;
+        if let Some(momentum) = next_bias_momentum {
+            slot.momentum_bias = momentum;
+        }
+        if let Some(momentum) = next_scale_momentum {
+            slot.momentum_scale = Some(momentum);
+        }
+        slot.offset_weight_updates = self
+            .backend
+            .zeros_f32(&offset_weight_shape)
+            .map_err(|err| backend_error("clear DCNv4 offset-weight gradients", err))?;
+        slot.offset_bias_updates = self
+            .backend
+            .zeros_f32(&offset_bias_shape)
+            .map_err(|err| backend_error("clear DCNv4 offset-bias gradients", err))?;
+        slot.bias_updates = self
+            .backend
+            .zeros_f32(&bias_shape)
+            .map_err(|err| backend_error("clear DCNv4 bias gradients", err))?;
+        if slot.scale_updates.is_some() {
+            slot.scale_updates = Some(
+                self.backend
+                    .zeros_f32(&bias_shape)
+                    .map_err(|err| backend_error("clear DCNv4 scale gradients", err))?,
+            );
+        }
+        slot.dirty = false;
+        Ok(true)
+    }
+
     fn flush_device_dcnv4_gradients_to_host(&mut self) -> Result<()> {
         type HostGradients = (Vec<f32>, Vec<f32>, Vec<f32>, Option<Vec<f32>>);
         let mut staged = Vec::with_capacity(self.network.layers.len());
@@ -17531,31 +17818,68 @@ where
                         })
                         .transpose()?,
                 );
-                let LayerParams::Dcnv4(params) = &self.params[layer_index] else {
+                let (LayerKind::Dcnv4(spec), LayerParams::Dcnv4(params)) = (
+                    &self.network.layers[layer_index].kind,
+                    &self.params[layer_index],
+                ) else {
                     return Err(Error::InvalidConfig(format!(
-                        "missing DCNv4 params for GPU gradients at layer #{layer_index}"
+                        "missing DCNv4 layer/params for GPU gradients at layer #{layer_index}"
                     )));
                 };
+                let desc = dcnv4_gpu::descriptor(
+                    &self.network.layers[layer_index],
+                    spec,
+                    params,
+                )?;
+                let bias_shape = [spec.filters];
+                let offset_weight_shape = [
+                    desc.geometry.offset_dim(),
+                    desc.geometry.channels,
+                    spec.size,
+                    spec.size,
+                ];
+                let offset_bias_shape = [desc.geometry.offset_dim()];
                 let zeros = GpuDcnv4TrainBuffers {
                     bias_updates: self
                         .backend
-                        .zeros_f32(&[params.biases.len()])
+                        .zeros_f32(&bias_shape)
                         .map_err(|err| backend_error("reset DCNv4 bias updates", err))?,
                     offset_weight_updates: self
                         .backend
-                        .zeros_f32(&[params.offset_weights.len()])
+                        .zeros_f32(&offset_weight_shape)
                         .map_err(|err| backend_error("reset DCNv4 offset weight updates", err))?,
                     offset_bias_updates: self
                         .backend
-                        .zeros_f32(&[params.offset_biases.len()])
+                        .zeros_f32(&offset_bias_shape)
                         .map_err(|err| backend_error("reset DCNv4 offset bias updates", err))?,
                     scale_updates: params
                         .batch_norm
                         .as_ref()
-                        .map(|bn| {
+                        .map(|_| {
                             self.backend
-                                .zeros_f32(&[bn.scales.len()])
+                                .zeros_f32(&bias_shape)
                                 .map_err(|err| backend_error("reset DCNv4 scale updates", err))
+                        })
+                        .transpose()?,
+                    momentum_bias: self
+                        .backend
+                        .zeros_f32(&bias_shape)
+                        .map_err(|err| backend_error("reset DCNv4 bias momentum", err))?,
+                    momentum_offset_weights: self
+                        .backend
+                        .zeros_f32(&offset_weight_shape)
+                        .map_err(|err| backend_error("reset DCNv4 offset weight momentum", err))?,
+                    momentum_offset_biases: self
+                        .backend
+                        .zeros_f32(&offset_bias_shape)
+                        .map_err(|err| backend_error("reset DCNv4 offset bias momentum", err))?,
+                    momentum_scale: params
+                        .batch_norm
+                        .as_ref()
+                        .map(|_| {
+                            self.backend
+                                .zeros_f32(&bias_shape)
+                                .map_err(|err| backend_error("reset DCNv4 scale momentum", err))
                         })
                         .transpose()?,
                     dirty: false,
@@ -41240,7 +41564,7 @@ num_dwconv=1
         }
         drop(cache);
 
-        gpu.update_cpu_fallback_weights(0.1, 0.0, 0.0, 1, &[], &[]);
+        gpu.update_cpu_fallback_weights(0.1, 0.0, 0.0, 1, &[], &[], &[]);
         assert!(gpu.device_conv_params.borrow()[0].is_empty());
         gpu.warm_device_conv_params()
             .expect("rewarm updated experts");

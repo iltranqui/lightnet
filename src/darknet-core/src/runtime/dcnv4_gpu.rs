@@ -18,7 +18,11 @@ pub(super) fn needs_host(spec: &Dcnv4Spec) -> bool {
             && spec.activation.to_channel_normalization().is_none())
 }
 
-fn descriptor(layer: &Layer, spec: &Dcnv4Spec, params: &Dcnv4Params) -> Result<Dcnv4Composition> {
+pub(super) fn descriptor(
+    layer: &Layer,
+    spec: &Dcnv4Spec,
+    params: &Dcnv4Params,
+) -> Result<Dcnv4Composition> {
     let i = layer.input_shape;
     let o = layer.output_shape;
     let desc = Dcnv4Composition {
