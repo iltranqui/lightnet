@@ -1219,6 +1219,83 @@ pub trait F32TensorOpsBackend {
         self.upload_f32(shape, &out)
     }
 
+    /// Bias-free transposed convolution in Darknet `[input, filter, ky, kx]`
+    /// weight order, with NCHW input/output tensors.
+    #[allow(clippy::too_many_arguments)]
+    fn deconvolutional_f32(
+        &self,
+        x: &Self::Tensor,
+        weights: &Self::Tensor,
+        output_shape: &[usize],
+        input_channels: usize,
+        input_height: usize,
+        input_width: usize,
+        filters: usize,
+        kernel_size: usize,
+        stride: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert_eq!(output_shape.len(), 4, "deconvolution output must be NCHW");
+        assert_eq!(output_shape[1], filters, "deconvolution filter count");
+        let batch = output_shape[0];
+        let output = host_ops::deconvolutional::forward(
+            &self.download_f32(x)?,
+            &self.download_f32(weights)?,
+            batch,
+            input_channels,
+            input_height,
+            input_width,
+            filters,
+            kernel_size,
+            stride,
+            output_shape[2],
+            output_shape[3],
+        );
+        self.upload_f32(output_shape, &output)
+    }
+    /// `(dx, dw, db)` of [`Self::deconvolutional_f32`], where `output_grad`
+    /// already includes activation backward.
+    #[allow(clippy::too_many_arguments)]
+    fn deconvolutional_backward_f32(
+        &self,
+        x: &Self::Tensor,
+        weights: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        input_shape: &[usize],
+        output_shape: &[usize],
+        filters: usize,
+        kernel_size: usize,
+        stride: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        assert_eq!(input_shape.len(), 4, "deconvolution input must be NCHW");
+        assert_eq!(output_shape.len(), 4, "deconvolution output must be NCHW");
+        let (batch, channels, input_height, input_width) =
+            (input_shape[0], input_shape[1], input_shape[2], input_shape[3]);
+        assert_eq!(output_shape[0], batch, "deconvolution output batch");
+        assert_eq!(output_shape[1], filters, "deconvolution output filters");
+        let (dx, dw, db) = host_ops::deconvolutional::backward(
+            &self.download_f32(x)?,
+            &self.download_f32(weights)?,
+            &self.download_f32(output_grad)?,
+            batch,
+            channels,
+            input_height,
+            input_width,
+            filters,
+            kernel_size,
+            stride,
+            output_shape[2],
+            output_shape[3],
+        );
+        Ok((
+            self.upload_f32(input_shape, &dx)?,
+            self.upload_f32(&[channels, filters, kernel_size, kernel_size], &dw)?,
+            self.upload_f32(&[filters], &db)?,
+        ))
+    }
     fn conv2d_f32(
         &self,
         x: &Self::Tensor,

@@ -13556,33 +13556,88 @@ where
                         .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
                         .map_err(|err| backend_error("upload sam output", err))?
                 }
-                (LayerKind::Deconvolutional(spec), LayerParams::Convolutional(p)) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download deconvolutional input", err))?;
-                    let pre = crate::deconvolutional::deconv_forward(
-                        &host_input,
-                        &p.weights,
-                        &p.biases,
-                        spec.size,
-                        spec.stride,
-                        layer.output_shape,
-                    );
-                    activation_input_gpu = Some(
+                (LayerKind::Deconvolutional(spec), LayerParams::Convolutional(params)) => {
+                    if spec.activation.to_cuda_f32_kind().is_some() {
+                        let weights = self
+                            .backend
+                            .upload_f32(
+                                &[
+                                    layer.input_shape.channels,
+                                    spec.filters,
+                                    spec.size,
+                                    spec.size,
+                                ],
+                                &params.weights,
+                            )
+                            .map_err(|err| backend_error("upload deconvolutional weights", err))?;
+                        let raw = self
+                            .backend
+                            .deconvolutional_f32(
+                                current_input,
+                                &weights,
+                                &tensor_backend_shape(layer.output_shape),
+                                layer.input_shape.channels,
+                                layer.input_shape.height,
+                                layer.input_shape.width,
+                                spec.filters,
+                                spec.size,
+                                spec.stride,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("GPU deconvolution", err))?;
+                        let bias = self
+                            .backend
+                            .upload_f32(&[spec.filters], &params.biases)
+                            .map_err(|err| backend_error("upload deconvolutional biases", err))?;
+                        let biased = self
+                            .backend
+                            .bias_add_f32(
+                                &raw,
+                                &bias,
+                                spec.filters,
+                                layer.output_shape.height * layer.output_shape.width,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("deconvolution bias add", err))?;
+                        activation_input_gpu = Some(biased.clone());
                         self.backend
-                            .upload_f32(&tensor_backend_shape(layer.output_shape), &pre.data)
-                            .map_err(|err| {
-                                backend_error("upload deconvolutional activation cache", err)
-                            })?,
-                    );
-                    let activated: Vec<f32> = pre
-                        .data
-                        .iter()
-                        .map(|v| activate(spec.activation.clone(), *v))
-                        .collect();
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &activated)
-                        .map_err(|err| backend_error("upload deconvolutional output", err))?
+                            .activation_f32(
+                                &biased,
+                                gpu_activation_kind(layer.index, &spec.activation)?,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("deconvolution activation", err))?
+                    } else {
+                        let host_input = self
+                            .download_tensor(current_input, layer.input_shape)
+                            .map_err(|err| backend_error("download deconvolutional input", err))?;
+                        let pre = crate::deconvolutional::deconv_forward(
+                            &host_input,
+                            &params.weights,
+                            &params.biases,
+                            spec.size,
+                            spec.stride,
+                            layer.output_shape,
+                        );
+                        activation_input_gpu = Some(
+                            self.backend
+                                .upload_f32(
+                                    &tensor_backend_shape(layer.output_shape),
+                                    &pre.data,
+                                )
+                                .map_err(|err| {
+                                    backend_error("upload deconvolutional activation cache", err)
+                                })?,
+                        );
+                        let activated: Vec<f32> = pre
+                            .data
+                            .iter()
+                            .map(|value| activate(spec.activation.clone(), *value))
+                            .collect();
+                        self.backend
+                            .upload_f32(&tensor_backend_shape(layer.output_shape), &activated)
+                            .map_err(|err| backend_error("upload deconvolutional output", err))?
+                    }
                 }
                 (LayerKind::Rnn(spec), LayerParams::Rnn(recurrent)) => {
                     if !spec.batch_normalize
@@ -15640,6 +15695,72 @@ where
                     )?;
                 }
                 (
+                    LayerKind::Deconvolutional(spec),
+                    Some(LayerParams::Convolutional(params)),
+                ) if spec.activation.to_cuda_f32_kind().is_some() => {
+                    let activation_input = forward.gpu_layer_activation_inputs[layer.index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing GPU activation cache for deconvolutional layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+                    let delta = self
+                        .backend
+                        .activation_backward_f32(activation_input, &grad, activation, config)
+                        .map_err(|err| backend_error("GPU deconvolution activation backward", err))?;
+                    let current_input = if layer.index == 0 {
+                        &forward.input_gpu
+                    } else {
+                        forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing previous GPU layer output for deconvolutional layer #{}",
+                                layer.index
+                            ))
+                        })?
+                    };
+                    let weights = self
+                        .backend
+                        .upload_f32(
+                            &[
+                                layer.input_shape.channels,
+                                spec.filters,
+                                spec.size,
+                                spec.size,
+                            ],
+                            &params.weights,
+                        )
+                        .map_err(|err| backend_error("upload deconvolutional weights", err))?;
+                    let (input_grad, weight_grad, bias_grad) = self
+                        .backend
+                        .deconvolutional_backward_f32(
+                            current_input,
+                            &weights,
+                            &delta,
+                            &tensor_backend_shape(layer.input_shape),
+                            &tensor_backend_shape(layer.output_shape),
+                            spec.filters,
+                            spec.size,
+                            spec.stride,
+                            config,
+                        )
+                        .map_err(|err| backend_error("GPU deconvolution backward", err))?;
+                    self.accumulate_deconvolutional_host_gradients(
+                        layer.index,
+                        &weight_grad,
+                        &bias_grad,
+                        params.weights.len(),
+                        params.biases.len(),
+                    )?;
+                    self.accumulate_previous_gpu_gradient(
+                        layer.index,
+                        input_grad,
+                        &mut layer_output_gradients,
+                    )?;
+                }
+                (
                     LayerKind::Connected(spec),
                     Some(LayerParams::Connected(connected)),
                 ) if !spec.batch_normalize && spec.activation.to_cuda_f32_kind().is_some() => {
@@ -17016,7 +17137,11 @@ where
                         return true;
                     }
                 }
-                LayerKind::Deconvolutional(_) => return true,
+                LayerKind::Deconvolutional(spec) => {
+                    if spec.activation.to_cuda_f32_kind().is_none() {
+                        return true;
+                    }
+                }
                 // Weighted shortcut parameter reductions stay host-resident,
                 // while input/source gradients use backend elementwise ops.
                 // `[laya_act_head]` and the full ViT backward still use the
@@ -17237,6 +17362,49 @@ where
             return Ok(());
         }
         self.accumulate_gpu_gradient(&mut layer_output_gradients[layer_index - 1], gradient)
+    }
+
+    /// Download and accumulate deconvolution gradients into the host optimizer
+    /// buffers. The layer math stays native; the existing optimizer owns host params.
+    fn accumulate_deconvolutional_host_gradients(
+        &self,
+        layer_index: usize,
+        weight_grad: &B::Tensor,
+        bias_grad: &B::Tensor,
+        weight_count: usize,
+        bias_count: usize,
+    ) -> Result<()> {
+        let dw = self
+            .backend
+            .download_f32(weight_grad)
+            .map_err(|err| backend_error("download deconvolutional weight gradient", err))?;
+        let db = self
+            .backend
+            .download_f32(bias_grad)
+            .map_err(|err| backend_error("download deconvolutional bias gradient", err))?;
+        if dw.len() != weight_count || db.len() != bias_count {
+            return Err(Error::InvalidConfig(format!(
+                "deconvolutional gradient length mismatch at layer #{layer_index}"
+            )));
+        }
+        let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
+        let Some(LayerTrainBuffers::Convolutional(train)) = buffers.get_mut(layer_index) else {
+            return Err(Error::InvalidConfig(format!(
+                "missing deconvolutional train buffers for layer #{layer_index}"
+            )));
+        };
+        if train.weight_updates.len() != weight_count || train.bias_updates.len() != bias_count {
+            return Err(Error::InvalidConfig(format!(
+                "deconvolutional train buffer mismatch for layer #{layer_index}"
+            )));
+        }
+        for (slot, value) in train.weight_updates.iter_mut().zip(dw) {
+            *slot += value;
+        }
+        for (slot, value) in train.bias_updates.iter_mut().zip(db) {
+            *slot += value;
+        }
+        Ok(())
     }
 
     /// Accumulate a connected layer's host weight/bias gradient into its
@@ -43179,7 +43347,7 @@ num_dwconv=1
     }
 
     #[test]
-    fn deconvolutional_layer_trains_on_cpu_and_gpu_fallback_identically() {
+    fn deconvolutional_layer_trains_on_cpu_and_gpu_native_ops_identically() {
         let network = Network::from_config(
             ConfigFile::parse_str(
                 "inline.cfg",
@@ -43196,8 +43364,8 @@ num_dwconv=1
         gpu.params = cpu.params.clone();
         gpu.init_train_buffers_gpu().unwrap();
         assert!(
-            gpu.requires_cpu_backward_fallback(),
-            "deconvolutional trains through the CPU fallback"
+            !gpu.requires_cpu_backward_fallback(),
+            "supported deconvolutional activation uses the GPU backward path"
         );
 
         let input = patterned_input(cpu.network.net.input_shape());

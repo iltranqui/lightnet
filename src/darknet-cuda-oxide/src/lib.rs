@@ -3,6 +3,7 @@
 //! `cargo oxide`; plain `cargo build` cannot compile the device code.
 
 pub mod conv;
+mod deconvolutional;
 mod dcnv4_native;
 pub use dcnv4_native::Dcnv4NativeGradients;
 pub mod fp4;
@@ -95,6 +96,7 @@ pub struct OxideBackend {
     gemm_mode: GemmMode,
     im2col: im2col::kernels::LoadedModule,
     conv_direct: conv_direct::kernels::LoadedModule,
+    deconvolutional: kernels::deconvolutional::kernels::LoadedModule,
     conv_implicit: conv_implicit::kernels::LoadedModule,
     route: route::kernels::LoadedModule,
     pool: pool::kernels::LoadedModule,
@@ -515,6 +517,8 @@ impl OxideBackend {
             .map_err(|err| OxideError::Shape(format!("load im2col module: {err:?}")))?;
         let conv_direct = conv_direct::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load conv_direct module: {err:?}")))?;
+        let deconvolutional = kernels::deconvolutional::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load deconvolutional module: {err:?}")))?;
         let conv_implicit = conv_implicit::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load conv_implicit module: {err:?}")))?;
         let route = route::kernels::load(&ctx)
@@ -575,6 +579,7 @@ impl OxideBackend {
             },
             im2col,
             conv_direct,
+            deconvolutional,
             conv_implicit,
             route,
             pool,
@@ -5149,6 +5154,63 @@ impl F32TensorOpsBackend for OxideBackend {
             src_offset += input_channels[k];
         }
         Ok(grads)
+    }
+
+    fn deconvolutional_f32(
+        &self,
+        x: &Self::Tensor,
+        weights: &Self::Tensor,
+        output_shape: &[usize],
+        input_channels: usize,
+        input_height: usize,
+        input_width: usize,
+        filters: usize,
+        kernel_size: usize,
+        stride: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let x_f = self.f32v(x)?;
+        let weights_f = self.f32v(weights)?;
+        self.deconvolutional_forward_native(
+            &x_f,
+            &weights_f,
+            output_shape,
+            input_channels,
+            input_height,
+            input_width,
+            filters,
+            kernel_size,
+            stride,
+            config,
+        )
+    }
+
+    fn deconvolutional_backward_f32(
+        &self,
+        x: &Self::Tensor,
+        weights: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        input_shape: &[usize],
+        output_shape: &[usize],
+        filters: usize,
+        kernel_size: usize,
+        stride: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let x_f = self.f32v(x)?;
+        let weights_f = self.f32v(weights)?;
+        let output_grad_f = self.f32v(output_grad)?;
+        self.deconvolutional_backward_native(
+            &x_f,
+            &weights_f,
+            &output_grad_f,
+            input_shape,
+            output_shape,
+            filters,
+            kernel_size,
+            stride,
+            config,
+        )
     }
 
     fn conv2d_f32(

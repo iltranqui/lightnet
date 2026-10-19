@@ -3337,7 +3337,7 @@ fn gpu_muon_connected_burnin_gate_matches_cpu_on_device() {
 }
 
 #[test]
-fn gpu_muon_deconvolution_host_gradients_match_cpu_across_steps() {
+fn gpu_deconvolution_native_forward_backward_and_muon_match_cpu_across_steps() {
     let net = network(
         "[net]\nwidth=2\nheight=2\nchannels=1\nbatch=1\nmuon=1\ndecoupled_decay=1\ndecay=0.0002\nloss_scale=8\n\
          [deconvolutional]\nfilters=1\nsize=2\nstride=2\nactivation=linear\n",
@@ -3355,14 +3355,25 @@ fn gpu_muon_deconvolution_host_gradients_match_cpu_across_steps() {
         let input = patterned(cpu.network.net.input_shape());
         let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
         let gpu_forward = gpu
-            .forward_training_with_state(&input)
-            .expect("Oxide host-fallback deconvolution forward");
+            .forward_training_device(&input)
+            .expect("native Oxide deconvolution forward");
+        assert!(gpu_forward.cpu_forward.layer_outputs[0].data.is_empty());
+        let gpu_output = gpu
+            .backend
+            .download_f32(&gpu_forward.gpu_layer_outputs[0])
+            .expect("download native output for parity assertion");
+        close(
+            "native deconvolution output",
+            &gpu_output,
+            &cpu_forward.layer_outputs[0].data,
+            3e-5,
+        );
         let seed = Tensor::filled(cpu.network.layers[0].output_shape, 0.025 * step as f32);
         let seeds = [Some(seed)];
         cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
             .expect("CPU backward");
         gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
-            .expect("CPU-fallback GPU backward");
+            .expect("native Oxide deconvolution backward");
         cpu.update_weights_muon(0.02, 1).expect("CPU Muon update");
         gpu.update_weights_gpu(0.02, 0.9, net.net.decay, 1)
             .expect("GPU Muon update");
