@@ -5310,6 +5310,24 @@ fn graph_conv_self_projection_runtime_forward_backward_and_sgd_adam_match_cpu() 
 }
 
 #[test]
+fn region_gpu_path_rejects_until_native_cpp_layout_is_implemented() {
+    let net = network(
+        "[net]\nwidth=3\nheight=2\nchannels=7\nbatch=2\n\
+         [region]\nclasses=2\ncoords=4\nnum=1\nsoftmax=1\n",
+    );
+    let input = patterned(net.net.input_shape());
+    let gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("Oxide"));
+    let error = match gpu.forward_training_with_state(&input) {
+        Err(error) => error,
+        Ok(_) => panic!("Region GPU must reject until its native layout path exists"),
+    };
+    assert!(
+        format!("{error:?}").contains("UnsupportedLayer"),
+        "unexpected Region GPU error: {error:?}"
+    );
+}
+
+#[test]
 fn crop_native_training_augmentation_and_backward_match_cpu() {
     let net = network(
         "[net]\nwidth=4\nheight=3\nchannels=1\nbatch=2\nadam=0\n\

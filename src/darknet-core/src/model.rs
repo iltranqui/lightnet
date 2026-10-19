@@ -1475,6 +1475,7 @@ pub struct RegionSpec {
     pub classes: usize,
     pub num: usize,
     pub coords: usize,
+    pub softmax: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1844,7 +1845,7 @@ pub const AXIS_PINS: &[AxisPin] = &[
     AxisPin::Open("Tier 2: raptor six-coordinate per-entry order"),
     AxisPin::Open("Tier 2: proposal row to output row mapping"),
     AxisPin::Open("Tier 2: mean/variance channel placement"),
-    AxisPin::Open("Tier 2: identity passthrough only; decode unimplemented"),
+    AxisPin::Pinned("region_axis_layout_matches_cpp_flatten_objectness_and_classes"),
     AxisPin::Open("Tier 1: reorg (c,h,w) to (c*s*s,h/s,w/s) order"),
     AxisPin::Pinned("slice_axis_layout_preserves_batch_channel_and_spatial_order"),
     AxisPin::Open("Tier 1: group interleave order"),
@@ -4465,6 +4466,7 @@ fn parse_layer_kind(
             classes: section.get_usize("classes", 20)?,
             num: section.get_usize("num", 1)?,
             coords: section.get_usize("coords", 4)?,
+            softmax: section.get_bool_int("softmax", false)?,
         }),
         "reorg" | "reorg3d" => LayerKind::Reorg(ReorgSpec {
             stride: section.get_usize("stride", 1)?,
@@ -5652,10 +5654,26 @@ fn infer_output_shape(
             }
         }
         LayerKind::Yolo3d(spec) => spec.validate_shape(current),
-        LayerKind::Yolo(_)
-        | LayerKind::ObbYolo(_)
-        | LayerKind::GaussianYolo(_)
-        | LayerKind::Region(_) => Ok(current),
+        LayerKind::Yolo(_) | LayerKind::ObbYolo(_) | LayerKind::GaussianYolo(_) => Ok(current),
+        LayerKind::Region(spec) => {
+            let entry_size = spec
+                .coords
+                .checked_add(spec.classes)
+                .and_then(|value| value.checked_add(1))
+                .and_then(|value| value.checked_mul(spec.num))
+                .ok_or_else(|| Error::InvalidConfig("region channel count overflow".to_owned()))?;
+            if spec.classes == 0
+                || spec.coords < 4
+                || spec.num == 0
+                || current.channels != entry_size
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "region expects positive classes/anchors, at least four coordinates, and {} input channels; got {}",
+                    entry_size, current.channels
+                )));
+            }
+            Ok(current)
+        }
         LayerKind::ObbRefine(spec) => Ok(TensorShape::new(
             spec.proposal_capacity,
             1,
@@ -11606,8 +11624,8 @@ output=2
             }
         }
 
-        assert_eq!(pinned.len(), 19, "pinned variants");
-        assert_eq!(open, 41, "C++-backed variants without an axis pin");
+        assert_eq!(pinned.len(), 20, "pinned variants");
+        assert_eq!(open, 40, "C++-backed variants without an axis pin");
         assert_eq!(rust_only, 6, "Rust-only variants plus Unsupported");
 
         // The pinned set is the contract: renaming one of these tests must be a
@@ -11632,6 +11650,7 @@ output=2
             "cpu_moe_convolutional_axis_layout_keeps_router_and_blend_per_batch",
             "eml_convolutional_axis_layout_preserves_batch_channel_and_spatial_order",
             "offset_axis_layout_reads_dx_then_dy_and_keeps_batches_nchw",
+            "region_axis_layout_matches_cpp_flatten_objectness_and_classes",
         ]
         .into_iter()
         .collect();

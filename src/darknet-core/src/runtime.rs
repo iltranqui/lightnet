@@ -32,7 +32,7 @@ use crate::maxpool_depth::{backward_maxpool_depth, forward_maxpool_depth};
 use crate::model::{
     Activation, ConnectedSpec, ConvolutionalSpec, CrnnSpec, CropSpec, Dcnv4Spec, DeformConvSpec,
     DptHeadSpec, DropblockSpec, EmlConvolutionalSpec, GraphConvSpec, GruSpec, LayerKind, LocalSpec,
-    LrPolicy, LstmSpec, NetConfig, Network, RnnSpec, RouteSpec, TensorShape,
+    LrPolicy, LstmSpec, NetConfig, Network, RegionSpec, RnnSpec, RouteSpec, TensorShape,
 };
 use crate::muon::MuonMatrixState;
 use crate::muon_runtime::{
@@ -3241,10 +3241,13 @@ impl ExecutableNetwork {
                 // `[contrastive]` never touches its output either: all of the
                 // work happens in the delta it derives from the input.
                 (LayerKind::Contrastive(_), LayerParams::None) => (current_input.clone(), None),
+                (LayerKind::Region(spec), LayerParams::None) => (
+                    forward_region_layer(spec, current_input, layer.output_shape)?,
+                    None,
+                ),
                 (LayerKind::Yolo(_), LayerParams::None)
                 | (LayerKind::ObbYolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
-                | (LayerKind::Region(_), LayerParams::None)
                 | (LayerKind::Detection(_), LayerParams::None)
                 | (LayerKind::Cost { .. }, LayerParams::None)
                 | (LayerKind::Regression(_), LayerParams::None) => (current_input.clone(), None),
@@ -5364,10 +5367,24 @@ impl ExecutableNetwork {
                     )?;
                     accumulate_tensor(&mut layer_output_gradients[source_index], &source_grad)?;
                 }
+                (LayerKind::Region(spec), LayerParams::None) => {
+                    let output = forward.layer_outputs.get(layer.index).ok_or_else(|| {
+                        Error::InvalidConfig(format!(
+                            "missing [region] output for layer #{}",
+                            layer.index
+                        ))
+                    })?;
+                    let input_grad = backward_region_layer(spec, output, &grad)?;
+                    accumulate_previous_gradient(
+                        layer.index,
+                        &input_grad,
+                        &mut input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
+                }
                 (LayerKind::Yolo(_), LayerParams::None)
                 | (LayerKind::ObbYolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
-                | (LayerKind::Region(_), LayerParams::None)
                 | (LayerKind::Detection(_), LayerParams::None)
                 | (LayerKind::Cost { .. }, LayerParams::None)
                 | (LayerKind::Logistic, LayerParams::None)
@@ -13933,12 +13950,18 @@ where
                         .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
                         .map_err(|err| backend_error("upload yolox output", err))?
                 }
+                // GPU Region does not yet implement the C++ layout/activation.
+                (LayerKind::Region(_), LayerParams::None) => {
+                    return Err(Error::UnsupportedLayer {
+                        layer_index: layer.index,
+                        name: "region".to_owned(),
+                    });
+                }
                 // `[omd_loss]` is a pure pass-through on the forward, exactly as
                 // in C++ (`memcpy(l.output, state.input, ...)`).
                 (LayerKind::Yolo(_), LayerParams::None)
                 | (LayerKind::ObbYolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
-                | (LayerKind::Region(_), LayerParams::None)
                 | (LayerKind::Detection(_), LayerParams::None)
                 | (LayerKind::Cost { .. }, LayerParams::None)
                 | (LayerKind::Regression(_), LayerParams::None)
@@ -15654,10 +15677,15 @@ where
                             .map_err(|err| backend_error("upload sam output", err))?
                     }
                 }
+                (LayerKind::Region(_), LayerParams::None) => {
+                    return Err(Error::UnsupportedLayer {
+                        layer_index: layer.index,
+                        name: "region".to_owned(),
+                    });
+                }
                 (LayerKind::Yolo(_), LayerParams::None)
                 | (LayerKind::ObbYolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
-                | (LayerKind::Region(_), LayerParams::None)
                 | (LayerKind::Detection(_), LayerParams::None)
                 | (LayerKind::Softmax { .. }, LayerParams::None)
                 | (LayerKind::Cost { .. }, LayerParams::None)
@@ -18208,7 +18236,6 @@ where
                 (LayerKind::Yolo(_), Some(LayerParams::None))
                 | (LayerKind::ObbYolo(_), Some(LayerParams::None))
                 | (LayerKind::GaussianYolo(_), Some(LayerParams::None))
-                | (LayerKind::Region(_), Some(LayerParams::None))
                 | (LayerKind::Detection(_), Some(LayerParams::None))
                 | (LayerKind::Cost { .. }, Some(LayerParams::None))
                 | (LayerKind::Logistic, Some(LayerParams::None))
@@ -31152,6 +31179,108 @@ fn forward_softmax(input: &Tensor, groups: usize) -> Result<Tensor> {
     Ok(output)
 }
 
+/// C++ `forward_region_layer` transposes `[channel][spatial]` into
+/// `[spatial][anchor][entry]`, then activates objectness and optional classes.
+fn forward_region_layer(
+    spec: &RegionSpec,
+    input: &Tensor,
+    output_shape: TensorShape,
+) -> Result<Tensor> {
+    let spatial = input.shape.width * input.shape.height;
+    let entries = spec.coords + spec.classes + 1;
+    let channels = entries * spec.num;
+    if input.shape.channels != channels || output_shape != input.shape {
+        return Err(Error::InvalidConfig(
+            "region tensor shape is inconsistent with its specification".to_owned(),
+        ));
+    }
+    let mut output = Tensor::zeros(output_shape);
+    let plane = spatial * channels;
+    for batch in 0..input.shape.batch {
+        let base = batch * plane;
+        for channel in 0..channels {
+            for location in 0..spatial {
+                output.data[base + location * channels + channel] =
+                    input.data[base + channel * spatial + location];
+            }
+        }
+        for location in 0..spatial {
+            for anchor in 0..spec.num {
+                let offset = base + location * channels + anchor * entries;
+                output.data[offset + 4] = 1.0 / (1.0 + (-output.data[offset + 4]).exp());
+                if spec.softmax {
+                    let class_start = offset + 5;
+                    let max_value = output.data[class_start..class_start + spec.classes]
+                        .iter()
+                        .copied()
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum = 0.0;
+                    for value in &mut output.data[class_start..class_start + spec.classes] {
+                        *value = (*value - max_value).exp();
+                        sum += *value;
+                    }
+                    if sum > 0.0 {
+                        for value in &mut output.data[class_start..class_start + spec.classes] {
+                            *value /= sum;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn backward_region_layer(
+    spec: &RegionSpec,
+    output: &Tensor,
+    output_grad: &Tensor,
+) -> Result<Tensor> {
+    if output.shape != output_grad.shape {
+        return Err(Error::InvalidConfig(
+            "region output/gradient shape mismatch".to_owned(),
+        ));
+    }
+    let spatial = output.shape.width * output.shape.height;
+    let entries = spec.coords + spec.classes + 1;
+    let channels = entries * spec.num;
+    if output.shape.channels != channels {
+        return Err(Error::InvalidConfig(
+            "region tensor shape is inconsistent with its specification".to_owned(),
+        ));
+    }
+    let plane = spatial * channels;
+    let mut input_grad = Tensor::zeros(output.shape);
+    for batch in 0..output.shape.batch {
+        let base = batch * plane;
+        for location in 0..spatial {
+            for anchor in 0..spec.num {
+                let offset = base + location * channels + anchor * entries;
+                let mut adjusted = output_grad.data[offset..offset + entries].to_vec();
+                let objectness = output.data[offset + 4];
+                adjusted[4] *= objectness * (1.0 - objectness);
+                if spec.softmax {
+                    let class_start = offset + 5;
+                    let dot = output.data[class_start..class_start + spec.classes]
+                        .iter()
+                        .zip(&output_grad.data[class_start..class_start + spec.classes])
+                        .map(|(prob, grad)| prob * grad)
+                        .sum::<f32>();
+                    for class in 0..spec.classes {
+                        let prob = output.data[class_start + class];
+                        adjusted[5 + class] = prob * (output_grad.data[class_start + class] - dot);
+                    }
+                }
+                for entry in 0..entries {
+                    let channel = anchor * entries + entry;
+                    input_grad.data[base + channel * spatial + location] = adjusted[entry];
+                }
+            }
+        }
+    }
+    Ok(input_grad)
+}
+
 fn check_dropout_probability(probability: f32) -> Result<()> {
     if !(0.0..1.0).contains(&probability) {
         return Err(Error::InvalidConfig(format!(
@@ -33860,6 +33989,97 @@ mod tests {
             panic!("DCNv4 params")
         };
         assert!(after.dummy_weights.iter().all(|value| *value == 0.0));
+    }
+
+    #[test]
+    fn region_axis_layout_matches_cpp_flatten_objectness_and_classes() {
+        use crate::axis_fixture::axis_tensor;
+
+        // C++ `forward_region_layer` copies the NCHW source, applies
+        // `flatten(w*h, num*(coords+classes+1), batch, 1)`, activates each
+        // objectness at entry + 4, and optionally softmaxes classes from +5.
+        // The non-square, two-sample fixture makes both the permutation and
+        // independent sample rows observable.
+        let shape = TensorShape::new(3, 2, 7, 2);
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "region-axis.cfg",
+                "[net]\nwidth=3\nheight=2\nchannels=7\nbatch=2\n\
+                 [region]\nclasses=2\ncoords=4\nnum=1\nsoftmax=1\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let cpu = ExecutableNetwork::new(network);
+        let input_data: Vec<f32> = axis_tensor(shape)
+            .into_iter()
+            .map(|value| value / 1000.0)
+            .collect();
+        let input = Tensor::from_data(shape, input_data.clone()).unwrap();
+        let forward = cpu.forward(&input).unwrap();
+        let output = &forward.layer_outputs[0];
+        let spatial = shape.width * shape.height;
+        let channels = shape.channels;
+        let plane = spatial * channels;
+
+        for batch in 0..shape.batch {
+            for location in 0..spatial {
+                let source = |channel: usize| {
+                    input_data[batch * plane + channel * spatial + location]
+                };
+                let maximum = source(5).max(source(6));
+                let p5 = (source(5) - maximum).exp();
+                let p6 = (source(6) - maximum).exp();
+                let class_sum = p5 + p6;
+                let probabilities = [p5 / class_sum, p6 / class_sum];
+                for channel in 0..channels {
+                    let expected = match channel {
+                        4 => 1.0 / (1.0 + (-source(4)).exp()),
+                        5 => probabilities[0],
+                        6 => probabilities[1],
+                        _ => source(channel),
+                    };
+                    let index = batch * plane + location * channels + channel;
+                    assert!(
+                        (output.data[index] - expected).abs() < 1e-6,
+                        "Region C++ flatten must map sample {batch}, spatial {location}, channel {channel}; got {}, expected {expected}",
+                        output.data[index]
+                    );
+                }
+            }
+        }
+
+        // The supplied-seed backward is the exact adjoint of the Rust/C++
+        // forward transform (the truth-driven Region loss remains separate).
+        let seed_data: Vec<f32> = (0..plane * shape.batch)
+            .map(|index| 0.11 + index as f32 * 0.007)
+            .collect();
+        let seed = Tensor::from_data(shape, seed_data.clone()).unwrap();
+        let backward = cpu.backward(&input, &forward, &seed).unwrap();
+        for batch in 0..shape.batch {
+            for location in 0..spatial {
+                let output_base = batch * plane + location * channels;
+                let objectness = output.data[output_base + 4];
+                let class_dot = output.data[output_base + 5] * seed_data[output_base + 5]
+                    + output.data[output_base + 6] * seed_data[output_base + 6];
+                for channel in 0..channels {
+                    let output_index = output_base + channel;
+                    let input_index = batch * plane + channel * spatial + location;
+                    let expected = match channel {
+                        4 => seed_data[output_index] * objectness * (1.0 - objectness),
+                        5 | 6 => {
+                            let probability = output.data[output_index];
+                            probability * (seed_data[output_index] - class_dot)
+                        }
+                        _ => seed_data[output_index],
+                    };
+                    assert!(
+                        (backward.input_gradient.data[input_index] - expected).abs() < 1e-6,
+                        "Region adjoint must unflatten sample {batch}, spatial {location}, channel {channel}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
