@@ -1837,7 +1837,8 @@ pub trait F32TensorOpsBackend {
     }
     /// Bilinearly sample an NCHW tensor using one source coordinate pair per
     /// batch/output pixel. `input_scales` and `input_offsets` contain one
-    /// affine level adjustment per batch and are applied after interpolation.
+    /// affine level adjustment per batch, applied to each in-bounds input tap;
+    /// out-of-bounds taps remain zero.
     fn crop_bilinear_f32(
         &self,
         x: &Self::Tensor,

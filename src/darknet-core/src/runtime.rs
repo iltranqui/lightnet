@@ -104,6 +104,12 @@ fn graph_conv_spec_needs_host(spec: &GraphConvSpec) -> bool {
             && spec.activation.to_cuda_f32_kind().is_none())
 }
 
+// Geometry and affine input scaling are native; the GPU kernel does not yet
+// implement the training-only HSV/saturation/exposure/RGB-shift adjustments.
+fn crop_training_color_augmentation_unsupported(spec: &CropSpec) -> bool {
+    spec.saturation != 1.0 || spec.exposure != 1.0 || spec.shift != 0.0
+}
+
 fn graph_conv_spec_needs_compact_host(spec: &GraphConvSpec) -> bool {
     !matches!(spec.edge_mode, 0 | 1)
         || (spec.activation.to_channel_normalization().is_none()
@@ -12830,17 +12836,17 @@ where
                     )
                     .map_err(|err| backend_error("avgpool", err))?,
                 (LayerKind::Crop(spec), LayerParams::None) => {
-                    if training {
+                    if training && crop_training_color_augmentation_unsupported(spec) {
                         return Err(Error::UnsupportedLayer {
                             layer_index: layer.index,
-                            name: "crop_gpu_training_augmentation".to_owned(),
+                            name: "crop_gpu_training_color_augmentation".to_owned(),
                         });
                     }
                     let (cache, _) = plan_crop_forward(
                         spec,
                         layer.input_shape,
                         layer.output_shape,
-                        false,
+                        training,
                         &mut rng_state,
                     )?;
                     let source_x = self

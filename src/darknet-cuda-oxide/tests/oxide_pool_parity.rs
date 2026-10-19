@@ -622,8 +622,8 @@ struct CropCase {
     ow: usize,
 }
 
-/// Bilinear sample with zero taps outside the image, then per-batch
-/// `value * scale + offset` (cuTile kernel / trait doc).
+/// Bilinear sample of per-tap affine-adjusted values, preserving zero taps
+/// outside the image like `darknet-core`'s crop sampler.
 fn cpu_crop(x: &[f64], k: &CropCase, sx: &[f32], sy: &[f32], scales: &[f32], offs: &[f32]) -> Vec<f64> {
     let mut out = vec![0.0; k.b * k.c * k.oh * k.ow];
     for bb in 0..k.b {
@@ -637,13 +637,15 @@ fn cpu_crop(x: &[f64], k: &CropCase, sx: &[f32], sy: &[f32], scales: &[f32], off
                         0.0
                     } else {
                         x[((bb * k.c + c) * k.h + ty as usize) * k.w + tx as usize]
+                            * scales[bb] as f64
+                            + offs[bb] as f64
                     }
                 };
                 let v = (1.0 - dy) * (1.0 - dx) * tap(ix, iy)
                     + dy * (1.0 - dx) * tap(ix, iy + 1.0)
                     + (1.0 - dy) * dx * tap(ix + 1.0, iy)
                     + dy * dx * tap(ix + 1.0, iy + 1.0);
-                out[((bb * k.c + c) * k.oh * k.ow) + p] = v * scales[bb] as f64 + offs[bb] as f64;
+                out[((bb * k.c + c) * k.oh * k.ow) + p] = v;
             }
         }
     }

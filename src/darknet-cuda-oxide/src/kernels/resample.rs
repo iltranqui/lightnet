@@ -5,9 +5,9 @@
 //! strided sum; it is written as a gather per output element (the C++ kernel
 //! uses `atomicAdd`), so both directions are deterministic.
 //!
-//! Crop follows the cuTile bridge: bilinear sample with zero taps outside the
-//! image, then a per-batch affine `value * scale + offset`.  Its backward is a
-//! scatter with arbitrary source coordinates and therefore uses float atomics
+//! Crop bilinearly samples per-tap affine-adjusted values while out-of-image
+//! taps remain zero, matching the Rust CPU sampler.  Its backward is a scatter
+//! with arbitrary source coordinates and therefore uses float atomics
 //! (summation order, not the result set, is nondeterministic).
 
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32};
@@ -208,12 +208,13 @@ pub mod kernels {
             let wx = if t & 1 == 1 { dx } else { 1.0 - dx };
             let wy = if t >> 1 == 1 { dy } else { 1.0 - dy };
             if tx >= 0 && tx < in_w as i64 && ty >= 0 && ty < in_h as i64 {
-                value += wy * wx * x[base + ty as usize * in_w + tx as usize];
+                let sample = x[base + ty as usize * in_w + tx as usize] * scales[b] + offsets[b];
+                value += wy * wx * sample;
             }
             t += 1;
         }
         if let Some(o) = out.get_mut(idx) {
-            *o = value * scales[b] + offsets[b];
+            *o = value;
         }
     }
 

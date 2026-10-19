@@ -5296,6 +5296,73 @@ fn graph_conv_self_projection_runtime_forward_backward_and_sgd_adam_match_cpu() 
 }
 
 #[test]
+fn crop_native_training_augmentation_and_backward_match_cpu() {
+    let net = network(
+        "[net]\nwidth=4\nheight=3\nchannels=1\nbatch=2\nadam=0\n\
+         [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
+         [crop]\ncrop_width=3\ncrop_height=2\nflip=1\nangle=17\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+    let input = patterned(cpu.network.net.input_shape());
+    let output_shape = cpu.network.layers[1].output_shape;
+
+    for use_adam in [false, true] {
+        cpu.network.net.adam = use_adam;
+        gpu.network.net.adam = use_adam;
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu().expect("zero crop gradients");
+        let cpu_forward = cpu.forward_training(&input).expect("CPU augmented Crop forward");
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("native augmented Crop forward");
+        close(
+            "Crop training output",
+            &gpu_forward.cpu_forward.layer_outputs[1].data,
+            &cpu_forward.layer_outputs[1].data,
+            5e-5,
+        );
+        let seeds = [None, Some(Tensor::filled(output_shape, 0.07))];
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU augmented Crop backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("native augmented Crop backward");
+        if use_adam {
+            cpu.update_weights_adam(0.01, 1).expect("CPU Crop-chain Adam");
+            gpu.update_weights_gpu(0.01, 0.9, 0.0, 1)
+                .expect("Oxide Crop-chain Adam");
+        } else {
+            cpu.update_weights(0.01, 0.0, 0.0, 1);
+            gpu.update_weights_gpu(0.01, 0.9, 0.0, 1)
+                .expect("Oxide Crop-chain SGD");
+        }
+        let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(gpu_conv)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("convolutional params expected before Crop");
+        };
+        close("Crop-chain convolution weights", &gpu_conv.weights, &cpu_conv.weights, 1e-4);
+        close("Crop-chain convolution biases", &gpu_conv.biases, &cpu_conv.biases, 1e-4);
+    }
+
+    let unsupported_net = network(
+        "[net]\nwidth=4\nheight=3\nchannels=1\nbatch=1\n\
+         [crop]\ncrop_width=3\ncrop_height=2\nsaturation=1.2\n",
+    );
+    let unsupported_gpu = GpuExecutableNetwork::new(
+        unsupported_net.clone(),
+        OxideBackend::new().expect("Oxide"),
+    );
+    let unsupported_input = patterned(unsupported_net.net.input_shape());
+    let error = match unsupported_gpu.forward_training_with_state(&unsupported_input) {
+        Err(error) => error,
+        Ok(_) => panic!("training color adjustment must be explicitly unsupported"),
+    };
+    assert!(error.to_string().contains("crop_gpu_training_color_augmentation"));
+}
+
+#[test]
 fn standalone_batch_norm_native_training_matches_cpu_adam() {
     let net = network(
         "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=2\nadam=1\nb1=0.8\nb2=0.95\neps=0.001\n[batchnorm]\n",
