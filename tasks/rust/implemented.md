@@ -103,6 +103,7 @@ file is named inline.
 - [75. Hybrid GPU Muon for non-BN EML branches](#75-hybrid-gpu-muon-for-non-bn-eml-branches)
 - [76. Hybrid GPU Muon for non-BN MoE](#76-hybrid-gpu-muon-for-non-bn-moe)
 - [77. Hybrid GPU Muon for non-BN DCNv4 offset projection](#77-hybrid-gpu-muon-for-non-bn-dcnv4-offset-projection)
+- [78. Hybrid GPU Muon for non-BN deform_conv](#78-hybrid-gpu-muon-for-non-bn-deform_conv)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1580,6 +1581,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 77. Hybrid GPU Muon for non-BN DCNv4 offset projection
 
 - v0.2.055: extended hybrid GPU Muon to the DCNv4 offset-projection matrix when batch normalization is disabled. The existing per-layer device-gradient flush is now targetable so update-gated layers retain untouched device buffers; eligible accumulated DCNv4 gradients are staged to host, Muon orthogonalizes the offset matrix with the existing 0.01 learning-rate scale, remaining DCNv4 parameters receive the existing AdamW fallback, and updated host parameters are detected/re-uploaded by the DCNv4 snapshot cache on the next forward. Actual-Oxide CPU parity passed across two updates with two accumulated backward calls per step, covering outputs, offset weights/biases and output biases (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_dcnv4_offset_projection_matches_cpu_across_steps`). BN DCNv4 remains explicitly rejected before mutation. This is hybrid: gradients, state and final updates cross the host boundary; no compiled-C++ golden, full-suite or performance claim.
+
+## 78. Hybrid GPU Muon for non-BN deform_conv
+
+- v0.2.056: enabled GPU Muon for supported non-batch-normalized `[deform_conv]` layers. Its native Oxide forward/backward computes parameter gradients; backward currently downloads those gradients into host train buffers, where Muon Newton–Schulz and the existing AdamW fallback/state/update apply. The hybrid path covers the main convolution, offset predictor, and optional mask predictor matrices while biases retain AdamW. Actual-Oxide CPU parity passed across two updates with two accumulated seeded backward calls per step, including a preceding native convolution (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_deform_conv_native_gradients_match_cpu_across_steps`). BN deform_conv remains explicitly rejected before mutation. No compiled-C++ golden, full-suite, or performance claim.
 
 ## Not implemented / open (pointer)
 
