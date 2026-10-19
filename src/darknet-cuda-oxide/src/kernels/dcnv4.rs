@@ -8,13 +8,13 @@
 //!
 //! Kernel points are held in a fixed-size buffer, so `size * size` must not
 //! exceed [`MAX_POINTS`]; the launcher rejects larger kernels explicitly rather
-//! than silently truncating. The current bound covers kernels through 9x9.
+//! than silently truncating. The current bound covers kernels through 11x11.
 
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32};
 use cuda_device::{DisjointSlice, cuda_module, device, kernel, thread};
 
-/// Largest supported kernel area (`size <= 9`).
-pub const MAX_POINTS: usize = 81;
+/// Largest supported kernel area (`size <= 11`).
+pub const MAX_POINTS: usize = 121;
 
 /// Relaxed device-scope `*p += v`.
 ///
