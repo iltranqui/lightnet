@@ -92,6 +92,7 @@ file is named inline.
 - [64. Extend native DCNv4 through 15x15](#64-extend-native-dcnv4-through-15x15)
 - [65. Retain native DCNv4 Adam moments on device](#65-retain-native-dcnv4-adam-moments-on-device)
 - [66. Reuse DCNv4 projection weights from forward during backward](#66-reuse-dcnv4-projection-weights-from-forward-during-backward)
+- [67. Retain native DCNv4 parameters across forwards and updates](#67-retain-native-dcnv4-parameters-across-forwards-and-updates)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1508,6 +1509,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 66. Reuse DCNv4 projection weights from forward during backward
 
 - v0.2.029 (`9b722d35`): each native DCNv4 forward cache now retains the exact uploaded offset-projection weight tensor; backward consumes that tensor rather than uploading the host copy again. This also ensures the adjoint uses the same parameter snapshot as forward if host parameters are changed between the two calls. Focused host DCNv4 tests passed (29), including an assertion that the forward cache holds the expected weights; actual-GPU two-step SGD/Adam CPU parity passed (1 test, 316.19 s). DCNv4 parameters remain host-canonical and are still uploaded for each new forward/optimizer update; this is per-forward lifetime reuse, not persistent network-wide residency or a speedup claim. No compiled-C++ golden; GPU Muon and broad parity gaps remain.
+
+## 67. Retain native DCNv4 parameters across forwards and updates
+
+- v0.2.030 (`6433f57f`): native f32 DCNv4 now caches learned parameter tensors (offset weights/biases, output biases and BN gamma) per layer and reuses them across forwards, backward, rolling-stat recomputation and native SGD/Adam updates. After an optimizer update, the device tensors are replaced in the cache and the existing host-canonical copies are refreshed; the next GPU call needs no parameter upload. Exact host value snapshots detect direct edits to public `params` and trigger a refresh; BN rolling statistics remain separately host-managed. Evidence: `MEM=3G ./tools/test_host.sh dcnv4` passed 29 tests, including measured upload reduction on repeated forward and invalidation after host edits. The actual-GPU two-step SGD/Adam CPU-parity test passed (1, 313.12 s). This retains parameter copies on device but still downloads updates to maintain host canonical state; no speedup or compiled-C++ golden claim. GPU Muon and broader parity requirements remain open.
 
 ## Not implemented / open (pointer)
 
