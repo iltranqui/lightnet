@@ -76,6 +76,79 @@ pub fn first_window(i: usize, stride: usize, size: usize, off: usize) -> i64 {
 pub mod kernels {
     use super::*;
 
+    /// Depth pooling: one thread per output element, strict `>` preserves the
+    /// first channel in each strided channel group on ties.
+    #[kernel]
+    pub fn maxpool_depth_forward(
+        x: &[f32],
+        mut out: DisjointSlice<f32>,
+        input_channels: usize,
+        output_channels: usize,
+        spatial: usize,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= out.len() {
+            return;
+        }
+        let group = i / spatial % output_channels;
+        let batch = i / (output_channels * spatial);
+        let position = i % spatial;
+        let first = (batch * input_channels + group) * spatial + position;
+        let mut best = x[first];
+        let mut channel = group + output_channels;
+        while channel < input_channels {
+            let candidate = x[(batch * input_channels + channel) * spatial + position];
+            if candidate > best {
+                best = candidate;
+            }
+            channel += output_channels;
+        }
+        if let Some(value) = out.get_mut(idx) {
+            *value = best;
+        }
+    }
+
+    /// One thread per input element; each channel belongs to one output group.
+    #[kernel]
+    pub fn maxpool_depth_backward(
+        x: &[f32],
+        dy: &[f32],
+        mut dx: DisjointSlice<f32>,
+        input_channels: usize,
+        output_channels: usize,
+        spatial: usize,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= dx.len() {
+            return;
+        }
+        let channel = i / spatial % input_channels;
+        let batch = i / (input_channels * spatial);
+        let position = i % spatial;
+        let group = channel % output_channels;
+        let first = (batch * input_channels + group) * spatial + position;
+        let mut winner = group;
+        let mut best = x[first];
+        let mut candidate_channel = group + output_channels;
+        while candidate_channel < input_channels {
+            let candidate = x[(batch * input_channels + candidate_channel) * spatial + position];
+            if candidate > best {
+                best = candidate;
+                winner = candidate_channel;
+            }
+            candidate_channel += output_channels;
+        }
+        if let Some(value) = dx.get_mut(idx) {
+            *value = if channel == winner {
+                dy[(batch * output_channels + group) * spatial + position]
+            } else {
+                0.0
+            };
+        }
+    }
+
     /// One thread per output element.
     #[kernel]
     pub fn maxpool_forward(

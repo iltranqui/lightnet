@@ -12800,13 +12800,14 @@ where
                 }
                 (LayerKind::MaxPool(spec), LayerParams::None) => {
                     if spec.depth {
-                        return Err(Error::UnsupportedLayer {
-                            layer_index: layer.index,
-                            name: "maxpool_depth".to_owned(),
-                        });
-                    }
-                    self.backend
-                        .maxpool_f32(
+                        self.backend.maxpool_depth_f32(
+                            current_input,
+                            &tensor_backend_shape(layer.output_shape),
+                            layer.input_shape.channels,
+                            launch_config,
+                        )
+                    } else {
+                        self.backend.maxpool_f32(
                             current_input,
                             &tensor_backend_shape(layer.output_shape),
                             layer.input_shape.channels,
@@ -12818,7 +12819,8 @@ where
                             spec.padding,
                             launch_config,
                         )
-                        .map_err(|err| backend_error("maxpool", err))?
+                    }
+                    .map_err(|err| backend_error("maxpool", err))?
                 }
                 (LayerKind::LocalAvgPool(spec), LayerParams::None) => {
                     if layer.output_shape.channels != layer.input_shape.channels {
@@ -15336,15 +15338,17 @@ where
                     }
                 }
                 (LayerKind::MaxPool(spec), LayerParams::None) => {
+                    let maxpool_input = current_input.expect("maxpool requires current input");
                     if spec.depth {
-                        return Err(Error::UnsupportedLayer {
-                            layer_index: layer.index,
-                            name: "maxpool_depth".to_owned(),
-                        });
-                    }
-                    self.backend
-                        .maxpool_f32(
-                            current_input.expect("maxpool requires current input"),
+                        self.backend.maxpool_depth_f32(
+                            maxpool_input,
+                            &tensor_backend_shape(layer.output_shape),
+                            layer.input_shape.channels,
+                            launch_config,
+                        )
+                    } else {
+                        self.backend.maxpool_f32(
+                            maxpool_input,
                             &tensor_backend_shape(layer.output_shape),
                             layer.input_shape.channels,
                             layer.input_shape.height,
@@ -15355,7 +15359,8 @@ where
                             spec.padding,
                             launch_config,
                         )
-                        .map_err(|err| backend_error("maxpool", err))?
+                    }
+                    .map_err(|err| backend_error("maxpool", err))?
                 }
                 (LayerKind::LocalAvgPool(spec), LayerParams::None) => {
                     if layer.output_shape.channels != layer.input_shape.channels {
@@ -16457,9 +16462,16 @@ where
                                 ))
                             })?
                     };
-                    let input_grad = self
-                        .backend
-                        .maxpool_backward_f32(
+                    let input_grad = if spec.depth {
+                        self.backend.maxpool_depth_backward_f32(
+                            current_input,
+                            &grad,
+                            &tensor_backend_shape(layer.input_shape),
+                            layer.output_shape.channels,
+                            config,
+                        )
+                    } else {
+                        self.backend.maxpool_backward_f32(
                             current_input,
                             &grad,
                             layer.input_shape.channels,
@@ -16471,7 +16483,8 @@ where
                             spec.padding,
                             config,
                         )
-                        .map_err(|err| backend_error("GPU maxpool backward", err))?;
+                    }
+                    .map_err(|err| backend_error("GPU maxpool backward", err))?;
                     self.accumulate_previous_gpu_gradient(
                         layer.index,
                         input_grad,

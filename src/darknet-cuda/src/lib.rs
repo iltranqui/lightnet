@@ -1608,6 +1608,80 @@ pub trait F32TensorOpsBackend {
         padding: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error>;
+    /// Depth pooling: output channel `g` is the max of input channels
+    /// `g, g + output_channels, ...` at each spatial position.
+    fn maxpool_depth_f32(
+        &self,
+        x: &Self::Tensor,
+        output_shape: &[usize],
+        input_channels: usize,
+        _config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let input = self.download_f32(x)?;
+        let batch = output_shape[0];
+        let output_channels = output_shape[1];
+        let height = output_shape[2];
+        let width = output_shape[3];
+        let spatial = height * width;
+        let mut output = vec![0.0; batch * output_channels * spatial];
+        for (index, value) in output.iter_mut().enumerate() {
+            let group = index / spatial % output_channels;
+            let b = index / (output_channels * spatial);
+            let position = index % spatial;
+            let first = (b * input_channels + group) * spatial + position;
+            let mut best = input[first];
+            let mut channel = group + output_channels;
+            while channel < input_channels {
+                let candidate = input[(b * input_channels + channel) * spatial + position];
+                if candidate > best {
+                    best = candidate;
+                }
+                channel += output_channels;
+            }
+            *value = best;
+        }
+        self.upload_f32(output_shape, &output)
+    }
+    /// Adjoint of [`Self::maxpool_depth_f32`], with first-channel tie breaking.
+    fn maxpool_depth_backward_f32(
+        &self,
+        x: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        input_shape: &[usize],
+        output_channels: usize,
+        _config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let input = self.download_f32(x)?;
+        let output_grad = self.download_f32(output_grad)?;
+        let batch = input_shape[0];
+        let input_channels = input_shape[1];
+        let spatial = input_shape[2] * input_shape[3];
+        let mut dx = vec![0.0; batch * input_channels * spatial];
+        for b in 0..batch {
+            for channel in 0..input_channels {
+                let group = channel % output_channels;
+                for position in 0..spatial {
+                    let first = (b * input_channels + group) * spatial + position;
+                    let mut winner = group;
+                    let mut best = input[first];
+                    let mut candidate_channel = group + output_channels;
+                    while candidate_channel < input_channels {
+                        let candidate = input[(b * input_channels + candidate_channel) * spatial + position];
+                        if candidate > best {
+                            best = candidate;
+                            winner = candidate_channel;
+                        }
+                        candidate_channel += output_channels;
+                    }
+                    if channel == winner {
+                        dx[(b * input_channels + channel) * spatial + position] =
+                            output_grad[(b * output_channels + group) * spatial + position];
+                    }
+                }
+            }
+        }
+        self.upload_f32(input_shape, &dx)
+    }
     fn local_avgpool_f32(
         &self,
         x: &Self::Tensor,

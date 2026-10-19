@@ -418,6 +418,76 @@ fn maxpool_zero_nonmax_forward_backward_and_sgd_match_cpu() {
 }
 
 #[test]
+fn maxpool_depth_native_forward_backward_matches_cpu_on_oxide() {
+    let net = network(
+        "[net]\nwidth=2\nheight=1\nchannels=4\nbatch=1\n\
+         [maxpool]\nmaxpool_depth=1\nout_channels=2\n",
+    );
+    let cpu = ExecutableNetwork::new(net.clone());
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("Oxide"));
+    gpu.init_train_buffers_gpu().expect("depth-pool train buffers");
+    let input = Tensor::from_data(
+        TensorShape::new(2, 1, 4, 1),
+        vec![1.0, 5.0, 2.0, 5.0, 3.0, 4.0, 2.0, 9.0],
+    )
+    .expect("depth-pool input");
+    let cpu_forward = cpu.forward_training(&input).expect("CPU depth-pool forward");
+    let gpu_forward = gpu
+        .forward_training_with_state(&input)
+        .expect("Oxide depth-pool forward");
+    let backend = OxideBackend::new().expect("Oxide backend");
+    let gpu_output = backend
+        .download_f32(&gpu_forward.gpu_layer_outputs[0])
+        .expect("download depth-pool output");
+    close(
+        "depth-pool output",
+        &gpu_output,
+        &cpu_forward.layer_outputs[0].data,
+        0.0,
+    );
+    assert_eq!(cpu_forward.layer_outputs[0].data, vec![3.0, 5.0, 2.0, 9.0]);
+    let seed = Tensor::from_data(
+        cpu.network.layers[0].output_shape,
+        vec![1.0, 2.0, 3.0, 4.0],
+    )
+    .expect("depth-pool seed");
+    let seeds = [Some(seed)];
+    let cpu_backward = cpu
+        .backward(&input, &cpu_forward, seeds[0].as_ref().unwrap())
+        .expect("CPU depth-pool backward");
+    gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+        .expect("Oxide depth-pool runtime backward");
+    let input_gpu = backend
+        .upload_f32(&[1, 4, 1, 2], &input.data)
+        .expect("upload depth-pool input");
+    let seed_gpu = backend
+        .upload_f32(&[1, 2, 1, 2], &seeds[0].as_ref().unwrap().data)
+        .expect("upload depth-pool seed");
+    let dx_gpu = backend
+        .maxpool_depth_backward_f32(
+            &input_gpu,
+            &seed_gpu,
+            &[1, 4, 1, 2],
+            2,
+            darknet_cuda::ElementwiseLaunchConfig::default(),
+        )
+        .expect("Oxide depth-pool input gradient");
+    let dx = backend
+        .download_f32(&dx_gpu)
+        .expect("download depth-pool dx");
+    close(
+        "depth-pool input gradient",
+        &dx,
+        &cpu_backward.input_gradient.data,
+        0.0,
+    );
+    assert_eq!(
+        cpu_backward.input_gradient.data,
+        vec![0.0, 2.0, 3.0, 0.0, 1.0, 0.0, 0.0, 4.0]
+    );
+}
+
+#[test]
 fn weighted_shortcut_runtime_matches_cpu_forward_backward_and_sgd() {
     let net = network(
         "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=2\n\
