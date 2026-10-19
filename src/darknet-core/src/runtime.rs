@@ -14806,6 +14806,12 @@ where
                         layer.index
                     )));
                 }
+                (LayerKind::Gru(_), _) => {
+                    return Err(Error::UnsupportedLayer {
+                        layer_index: layer.index,
+                        name: layer.kind.name().to_owned(),
+                    });
+                }
                 (LayerKind::Unsupported(_), _) => {
                     return Err(Error::UnsupportedLayer {
                         layer_index: layer.index,

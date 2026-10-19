@@ -1393,6 +1393,21 @@ fn batch_normalized_rnn_device_backward_matches_cpu_on_oxide() {
 }
 
 #[test]
+fn gru_gpu_path_is_rejected_as_unsupported_not_misconfigured() {
+    let net = network("[net]\nwidth=2\nheight=1\nchannels=1\nbatch=1\n[gru]\noutput=2\nsteps=2\n");
+    let input = patterned(net.net.input_shape());
+    let gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("Oxide"));
+    let error = match gpu.forward_training_with_state(&input) {
+        Err(error) => error,
+        Ok(_) => panic!("GRU must remain explicitly unsupported on GPU until a native path exists"),
+    };
+    assert!(
+        format!("{error:?}").contains("UnsupportedLayer"),
+        "unexpected GRU GPU error: {error:?}"
+    );
+}
+
+#[test]
 fn rnn_recurrent_projections_and_training_backward_match_cpu() {
     let net = network(
         "[net]\ninputs=2\nbatch=2\ntime_steps=2\n\
