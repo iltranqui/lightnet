@@ -133,6 +133,7 @@ file is named inline.
 - [105. Native RNN rolling-stat BN training](#105-native-rnn-rolling-stat-bn-training)
 - [106. Native LSTM rolling-stat BN training](#106-native-lstm-rolling-stat-bn-training)
 - [107. Native CRNN rolling-stat BN training](#107-native-crnn-rolling-stat-bn-training)
+- [108. Hybrid GPU Muon for CRNN matrices](#108-hybrid-gpu-muon-for-crnn-matrices)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1730,6 +1731,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 107. Native CRNN rolling-stat BN training
 
 - v0.2.084: enabled native CRNN recurrent-convolution forward with rolling-stat BN affines folded into the three convolution projections. The existing device CRNN backward path handles BN input/beta/scale adjoints, so the training forward no longer falls back to CPU for supported activations. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain batch_normalized_crnn_device_backward_matches_cpu_on_oxide` passed on Oxide; the FakeBackend `gpu_batch_normalized_crnn_backward_matches_cpu_and_updates_rolling_stats` host test also passed. Coverage includes multi-step output, gradients, parameter updates, rolling stats, upstream convolution and finite-gradient checks. No C++ golden, full-suite or performance claim.
+
+## 108. Hybrid GPU Muon for CRNN matrices
+
+- v0.2.085: enabled CRNN convolution projection matrices in GPU Muon eligibility. Oxide performs the Newton–Schulz orthogonalization; gradients and optimizer state/final updates remain host-managed. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_crnn_device_matrices_match_cpu_across_steps` passed two actual-Oxide updates against CPU Muon with BN enabled, checking forward outputs, all three projection weights/biases, and BN scales. No C++ golden, full-suite or performance claim.
 
 ## Not implemented / open (pointer)
 
