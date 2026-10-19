@@ -35,7 +35,10 @@ use crate::model::{
     LrPolicy, LstmSpec, NetConfig, Network, RnnSpec, RouteSpec, TensorShape,
 };
 use crate::muon::MuonMatrixState;
-use crate::muon_runtime::{MuonLayerState, apply_staged_layer, matrix_shapes, stage_layer};
+use crate::muon_runtime::{
+    MuonLayerState, apply_staged_layer, matrix_shapes, stage_layer,
+    stage_layer_with_orthogonalizer,
+};
 use crate::weights::WeightsHeader;
 use darknet_cuda::{
     AdamParams, AdamUpdateItem, ElementwiseLaunchConfig, F16TensorOpsBackend, F32ActivationKind,
@@ -7439,6 +7442,8 @@ where
     dcnv4_adam_state: Vec<Option<GpuDcnv4AdamState<B::Tensor>>>,
     /// Adam moments for parameters updated by the host fallback.
     host_adam_state: RefCell<Vec<Option<HostAdamLayerState>>>,
+    /// Newton–Schulz momentum for opt-in GPU Muon updates (host sidecar state).
+    muon_state: Vec<Option<MuonLayerState>>,
 
     /// Number of Adam updates applied so far (the 1-based bias-correction `t`).
     adam_step: u32,
@@ -8933,6 +8938,7 @@ where
         let eml_adam_state = (0..network.layers.len()).map(|_| None).collect();
         let dcnv4_adam_state = (0..network.layers.len()).map(|_| None).collect();
         let host_adam_state = RefCell::new((0..network.layers.len()).map(|_| None).collect());
+        let muon_state = (0..network.layers.len()).map(|_| None).collect();
         Self {
             backend,
             network,
@@ -8951,6 +8957,7 @@ where
             eml_adam_state,
             dcnv4_adam_state,
             host_adam_state,
+            muon_state,
             adam_step: 0,
             train_iteration: 0,
             host_weights_stale: false,
@@ -9214,9 +9221,9 @@ where
     /// C++-compatible and carries only parameters plus `seen`; this sidecar
     /// preserves optimizer state on resume.
     pub fn save_optimizer_state(&self, path: impl AsRef<Path>) -> Result<()> {
-        if self.network.net.muon {
+        if self.network.net.muon && self.muon_state.len() != self.network.layers.len() {
             return Err(Error::Weights(
-                "GPU optimizer sidecars do not persist CPU Muon state".to_owned(),
+                "GPU Muon state layer count does not match the network".to_owned(),
             ));
         }
         let mut file = std::io::BufWriter::with_capacity(1 << 20, File::create(path)?);
@@ -9226,7 +9233,9 @@ where
             .flatten()
             .any(|state| state.experts.iter().any(|expert| expert.scales.is_some()));
         let has_eml_moments = self.eml_adam_state.iter().any(Option::is_some);
-        let version = if has_eml_moments {
+        let version = if self.network.net.muon {
+            6
+        } else if has_eml_moments {
             5
         } else if has_moe_scale_moments {
             4
@@ -9234,6 +9243,7 @@ where
             3
         };
         file.write_all(match version {
+            6 => b"DNOPT6\0\0",
             5 => b"DNOPT5\0\0",
             4 => b"DNOPT4\0\0",
             _ => b"DNOPT3\0\0",
@@ -9346,6 +9356,29 @@ where
                 }
             }
         }
+        if version >= 6 {
+            let entries: Vec<usize> = self
+                .muon_state
+                .iter()
+                .enumerate()
+                .filter_map(|(index, state)| {
+                    state
+                        .as_ref()
+                        .filter(|state| !state.matrices.is_empty())
+                        .map(|_| index)
+                })
+                .collect();
+            file.write_all(&(entries.len() as u64).to_le_bytes())?;
+            for index in entries {
+                file.write_all(&(index as u64).to_le_bytes())?;
+                write_muon_layer_state(
+                    &mut file,
+                    self.muon_state[index]
+                        .as_ref()
+                        .expect("filtered to non-empty Muon state"),
+                )?;
+            }
+        }
         file.flush()?;
         Ok(())
     }
@@ -9354,11 +9387,6 @@ where
     /// from the sidecar keep `None` moments (Adam will initialise them on the
     /// next step), and the step counter is restored as stored.
     pub fn load_optimizer_state(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        if self.network.net.muon {
-            return Err(Error::Weights(
-                "GPU optimizer state loading is unsupported for [net] muon=1".to_owned(),
-            ));
-        }
         let mut file = File::open(path)?;
         let mut magic = [0u8; 8];
         file.read_exact(&mut magic)?;
@@ -9368,6 +9396,7 @@ where
             b"DNOPT3\0\0" => 3,
             b"DNOPT4\0\0" => 4,
             b"DNOPT5\0\0" => 5,
+            b"DNOPT6\0\0" => 6,
             _ => return Err(Error::Weights("bad optimizer state magic".to_owned())),
         };
         let mut buf4 = [0u8; 4];
@@ -9527,12 +9556,81 @@ where
                 });
             }
         }
+        let mut muon_state: Vec<Option<MuonLayerState>> =
+            (0..self.network.layers.len()).map(|_| None).collect();
+        if version >= 6 {
+            file.read_exact(&mut buf8)?;
+            let muon_count = usize::try_from(u64::from_le_bytes(buf8))
+                .map_err(|_| Error::Weights("Muon layer count is too large".to_owned()))?;
+            if muon_count > self.network.layers.len() {
+                return Err(Error::Weights(
+                    "Muon layer count exceeds network size".to_owned(),
+                ));
+            }
+            let mut seen = vec![false; self.network.layers.len()];
+            for _ in 0..muon_count {
+                file.read_exact(&mut buf8)?;
+                let index = usize::try_from(u64::from_le_bytes(buf8))
+                    .map_err(|_| Error::Weights("Muon layer index is too large".to_owned()))?;
+                if index >= self.network.layers.len() || seen[index] {
+                    return Err(Error::Weights(
+                        "Muon layer index is invalid or repeated".to_owned(),
+                    ));
+                }
+                seen[index] = true;
+                let capacity = host_adam_scalar_capacity(&self.params[index]);
+                muon_state[index] = Some(read_muon_layer_state(&mut file, capacity)?);
+            }
+        }
+        if !self.network.net.muon
+            && muon_state
+                .iter()
+                .flatten()
+                .any(|state| !state.matrices.is_empty())
+        {
+            return Err(Error::Weights(
+                "optimizer sidecar contains Muon state but [net] muon=0".to_owned(),
+            ));
+        }
+        let mut restored_step = step;
+        if self.network.net.muon && version < 6 {
+            host_state.fill(None);
+            state.fill(None);
+            moe_state.fill(None);
+            eml_state.fill(None);
+            restored_step = 0;
+        } else if self.network.net.muon {
+            for (index, state) in muon_state.iter().enumerate() {
+                let Some(state) = state else { continue };
+                let layer = &self.network.layers[index];
+                let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
+                let expected = matrix_shapes(
+                    &layer.kind,
+                    layer.input_shape,
+                    layer.output_shape,
+                    &mut self.params[index],
+                    &mut buffers[index],
+                )
+                .map_err(|error| Error::Weights(format!("invalid Muon layer layout: {error}")))?;
+                let found: Vec<(usize, usize)> = state
+                    .matrices
+                    .iter()
+                    .map(|matrix| (matrix.rows, matrix.cols))
+                    .collect();
+                if found != expected {
+                    return Err(Error::Weights(format!(
+                        "Muon state matrix shapes for layer {index} are {found:?}, expected {expected:?}"
+                    )));
+                }
+            }
+        }
         *self.host_adam_state.get_mut() = host_state;
         self.adam_state = state;
         self.moe_adam_state = moe_state;
         self.eml_adam_state = eml_state;
         self.dcnv4_adam_state = (0..self.network.layers.len()).map(|_| None).collect();
-        self.adam_step = step;
+        self.muon_state = muon_state;
+        self.adam_step = restored_step;
         Ok(())
     }
 
@@ -10169,6 +10267,142 @@ where
         Ok(())
     }
 
+    fn update_weights_gpu_muon(
+        &mut self,
+        lr: f32,
+        decay: f32,
+        batch: usize,
+    ) -> Result<()> {
+        let net = self.network.net.clone();
+        if !net.muon || net.adam || !net.decoupled_decay {
+            return Err(Error::InvalidConfig(
+                "GPU Muon requires [net] muon=1, adam=0, and AdamW fallback".to_owned(),
+            ));
+        }
+        if !lr.is_finite() || lr < 0.0 || !decay.is_finite() || decay < 0.0 {
+            return Err(Error::InvalidConfig(
+                "GPU Muon learning rate and decay must be finite and non-negative".to_owned(),
+            ));
+        }
+        if !net.muon_momentum.is_finite() || !(0.0..1.0).contains(&net.muon_momentum) {
+            return Err(Error::InvalidConfig(
+                "GPU Muon momentum must be finite and in [0, 1)".to_owned(),
+            ));
+        }
+        if let Some((index, _)) = self.params.iter().enumerate().find(|(_, params)| {
+            !matches!(
+                params,
+                LayerParams::None | LayerParams::BatchNorm(_) | LayerParams::Connected(_)
+            )
+        }) {
+            return Err(Error::UnsupportedLayer {
+                layer_index: index,
+                name: "GPU Muon runtime currently supports host-resident connected and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
+            });
+        }
+        let step = self.adam_step.checked_add(1).ok_or_else(|| {
+            Error::InvalidConfig("GPU Muon step counter overflowed".to_owned())
+        })?;
+        let loss_scale = if net.loss_scale > 0.0 && net.loss_scale.is_finite() {
+            net.loss_scale
+        } else {
+            1.0
+        };
+        let adam = AdamParams {
+            lr,
+            beta1: net.adam_b1,
+            beta2: net.adam_b2,
+            eps: net.adam_eps * loss_scale,
+            decay,
+            batch,
+            step,
+            decoupled_decay: true,
+        };
+        let layer_count = self.network.layers.len();
+        if self.muon_state.len() != layer_count {
+            self.muon_state = (0..layer_count).map(|_| None).collect();
+        }
+        {
+            let host_state = self.host_adam_state.get_mut();
+            if host_state.len() != layer_count {
+                *host_state = (0..layer_count).map(|_| None).collect();
+            }
+        }
+        let iteration_num = self.train_iteration as i64 + 1;
+        let burn_in = net.burn_in;
+        let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
+        for index in 0..layer_count {
+            let layer = self.network.layers[index].clone();
+            if !layer.train.updates_at(iteration_num, burn_in)
+                || matches!(self.params[index], LayerParams::None)
+            {
+                continue;
+            }
+            let options = layer.train;
+            prepare_muon_layer_gradients(
+                &layer.kind,
+                options,
+                &mut self.params[index],
+                &mut buffers[index],
+            )?;
+            let layer_adam = AdamParams {
+                lr: lr * options.learning_rate_scale,
+                ..adam
+            };
+            let staged = {
+                let state = self.muon_state[index].get_or_insert_with(MuonLayerState::default);
+                let backend = &self.backend;
+                stage_layer_with_orthogonalizer(
+                    &layer.kind,
+                    layer.input_shape,
+                    layer.output_shape,
+                    &mut self.params[index],
+                    &mut buffers[index],
+                    state,
+                    layer_adam.lr,
+                    batch,
+                    loss_scale,
+                    net.muon_momentum,
+                    |lookahead, rows, cols| {
+                        let shape = [rows, cols];
+                        let input = backend.upload_f32(&shape, lookahead).map_err(|err| {
+                            backend_error("GPU Muon lookahead upload", err)
+                        })?;
+                        let orthogonal = backend
+                            .muon_orthogonalize_f32(&input, &shape, rows, cols)
+                            .map_err(|err| backend_error("GPU Muon Newton-Schulz", err))?;
+                        backend.download_f32(&orthogonal).map_err(|err| {
+                            backend_error("GPU Muon direction download", err)
+                        })
+                    },
+                )?
+            };
+            let host_state = self.host_adam_state.get_mut();
+            let adam_state = host_state[index].get_or_insert_with(HostAdamLayerState::default);
+            apply_host_adam_layer(
+                &layer.kind,
+                layer.input_shape,
+                &mut self.params[index],
+                &mut buffers[index],
+                adam_state,
+                &layer_adam,
+            )?;
+            let muon_state = self.muon_state[index].get_or_insert_with(MuonLayerState::default);
+            apply_staged_layer(
+                &layer.kind,
+                layer.input_shape,
+                layer.output_shape,
+                &mut self.params[index],
+                &mut buffers[index],
+                muon_state,
+                staged,
+            )?;
+        }
+        self.adam_step = step;
+        self.host_weights_stale = false;
+        Ok(())
+    }
+
     fn update_weights_gpu_impl(
         &mut self,
         lr: f32,
@@ -10179,10 +10413,12 @@ where
     ) -> Result<()> {
         reject_gpu_hyperbolic_foveation(&self.network, "optimizer updates")?;
         if self.network.net.muon {
-            return Err(Error::InvalidConfig(
-                "[net] muon=1 GPU optimizer updates are not implemented in the Stage-1 CPU Muon port"
-                    .to_owned(),
-            ));
+            if !sync_host_weights {
+                return Err(Error::InvalidConfig(
+                    "GPU Muon does not support deferred host synchronization".to_owned(),
+                ));
+            }
+            return self.update_weights_gpu_muon(lr, decay, batch);
         }
         if let Some(layer) = self
             .network
@@ -44937,20 +45173,74 @@ activation=linear
     }
 
     #[test]
-    fn gpu_muon_optimizer_update_is_rejected_explicitly() {
+    fn gpu_muon_connected_update_matches_cpu_and_round_trips_sidecar() {
         let network = Network::from_config(
             ConfigFile::parse_str(
                 "muon.cfg",
-                "[net]\nwidth=1\nheight=1\nchannels=1\nmuon=1\n[connected]\noutput=1\n",
+                "[net]\nwidth=2\nheight=1\nchannels=1\nbatch=2\nmuon=1\n[connected]\noutput=2\n",
             )
             .expect("Muon cfg"),
         )
         .expect("Muon network");
-        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+        let gradients = (vec![0.1, -0.2, 0.3, -0.4], vec![0.05, -0.07]);
+        let (LayerTrainBuffers::Connected(cpu_train), LayerTrainBuffers::Connected(gpu_train)) =
+            (&mut cpu.train_buffers[0], &mut gpu.cpu_fallback_train_buffers.get_mut()[0])
+        else {
+            panic!("connected buffers expected");
+        };
+        cpu_train.weight_updates.clone_from(&gradients.0);
+        cpu_train.bias_updates.clone_from(&gradients.1);
+        gpu_train.weight_updates.clone_from(&gradients.0);
+        gpu_train.bias_updates.clone_from(&gradients.1);
+
+        cpu.update_weights_muon(0.03, 2).expect("CPU Muon");
+        gpu.update_weights_gpu(0.03, 0.9, network.net.decay, 2)
+            .expect("GPU Muon");
+        let (LayerParams::Connected(cpu_params), LayerParams::Connected(gpu_params)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("connected parameters expected");
+        };
+        assert_slice_close("GPU Muon weights", &gpu_params.weights, &cpu_params.weights, 3e-5);
+        assert_slice_close("GPU Muon biases", &gpu_params.biases, &cpu_params.biases, 3e-5);
+        assert_eq!(gpu.muon_state, cpu.muon_state);
+        assert_eq!(gpu.adam_step, cpu.adam_step);
+
+        let dir = std::env::temp_dir().join(format!("darknet-gpu-muon-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gpu_path = dir.join("gpu.state");
+        let cpu_path = dir.join("cpu.state");
+        gpu.save_optimizer_state(&gpu_path).expect("save GPU Muon state");
+        cpu.save_optimizer_state(&cpu_path).expect("save CPU Muon state");
+        assert_eq!(
+            std::fs::read(&gpu_path).unwrap(),
+            std::fs::read(&cpu_path).unwrap(),
+            "host-only GPU Muon sidecar retains the shared DNOPT6 format",
+        );
+        let mut restored = GpuExecutableNetwork::new(network, FakeBackend);
+        restored
+            .load_optimizer_state(&gpu_path)
+            .expect("load GPU Muon state");
+        assert_eq!(restored.muon_state, gpu.muon_state);
+        assert_eq!(restored.host_adam_state, gpu.host_adam_state);
+        assert_eq!(restored.adam_step, gpu.adam_step);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn gpu_muon_rejects_non_connected_parameter_families_before_updating() {
+        let mut gpu = optimizer_net("muon=1\ndecoupled_decay=1");
+        let before = gpu.params.clone();
         let error = gpu
-            .update_weights_gpu(0.01, 0.9, 0.0005, 1)
-            .expect_err("GPU Muon is deferred");
-        assert!(error.to_string().contains("muon=1 GPU optimizer updates"));
+            .update_weights_gpu(0.01, 0.9, 0.0005, 2)
+            .expect_err("convolutional GPU Muon is not integrated yet");
+        assert!(error
+            .to_string()
+            .contains("other parameter families remain explicitly unsupported"));
+        assert_eq!(gpu.params, before);
+        assert_eq!(gpu.adam_step, 0);
     }
 
     #[test]

@@ -5,7 +5,10 @@
 
 use crate::error::{Error, Result};
 use crate::model::{LayerKind, TensorShape};
-use crate::muon::{MuonMatrixState, MuonMatrixStep, compute_muon_matrix_step};
+use crate::muon::{
+    MuonMatrixState, MuonMatrixStep, compute_muon_matrix_step_with_orthogonalizer,
+    newton_schulz_orthogonalize,
+};
 use crate::runtime::{
     ConnectedParams, ConnectedTrainBuffers, ConvolutionalParams, ConvolutionalTrainBuffers,
     LayerParams, LayerTrainBuffers,
@@ -1178,6 +1181,34 @@ pub(crate) fn stage_layer(
     loss_scale: f32,
     momentum: f32,
 ) -> Result<StagedMuonLayer> {
+    stage_layer_with_orthogonalizer(
+        kind,
+        input_shape,
+        output_shape,
+        params,
+        train,
+        state,
+        learning_rate,
+        batch,
+        loss_scale,
+        momentum,
+        newton_schulz_orthogonalize,
+    )
+}
+
+pub(crate) fn stage_layer_with_orthogonalizer(
+    kind: &LayerKind,
+    input_shape: TensorShape,
+    output_shape: TensorShape,
+    params: &mut LayerParams,
+    train: &mut LayerTrainBuffers,
+    state: &MuonLayerState,
+    learning_rate: f32,
+    batch: usize,
+    loss_scale: f32,
+    momentum: f32,
+    mut orthogonalize: impl FnMut(&[f32], usize, usize) -> Result<Vec<f32>>,
+) -> Result<StagedMuonLayer> {
     if !learning_rate.is_finite() || learning_rate < 0.0 {
         return Err(Error::InvalidConfig(
             "Muon learning rate must be finite and non-negative".to_owned(),
@@ -1207,8 +1238,15 @@ pub(crate) fn stage_layer(
                 rows,
                 cols,
                 learning_rate: learning_rate * learning_rate_scale,
-                step: compute_muon_matrix_step(
-                    updates, rows, cols, batch, loss_scale, momentum, &previous,
+                step: compute_muon_matrix_step_with_orthogonalizer(
+                    updates,
+                    rows,
+                    cols,
+                    batch,
+                    loss_scale,
+                    momentum,
+                    &previous,
+                    |matrix, rows, cols| orthogonalize(matrix, rows, cols),
                 )?,
             });
             Ok(())

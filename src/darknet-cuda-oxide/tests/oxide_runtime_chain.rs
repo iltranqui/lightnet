@@ -3064,3 +3064,87 @@ fn deform_conv_device_path_matches_cpu_chain_and_updates() {
         "mask weights unchanged"
     );
 }
+
+#[test]
+fn gpu_muon_connected_two_step_update_matches_cpu() {
+    let net = network(
+        "[net]\nwidth=2\nheight=1\nchannels=1\nbatch=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0005\nloss_scale=8\n\
+         [connected]\noutput=3\nactivation=linear\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    if let LayerParams::Connected(params) = &mut cpu.params[0] {
+        params.weights = vec![0.2, -0.1, 0.3, 0.4, -0.25, 0.15];
+        params.biases = vec![0.03, -0.02, 0.01];
+    } else {
+        panic!("connected parameters expected");
+    }
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+
+    for step in 1..=2 {
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("Oxide forward");
+        let seed = Tensor::filled(cpu.network.layers[0].output_shape, 0.07 * step as f32);
+        let seeds = [Some(seed)];
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("Oxide backward");
+        cpu.update_weights_muon(0.02, 2).expect("CPU Muon update");
+        gpu.update_weights_gpu(0.02, 0.9, net.net.decay, 2)
+            .expect("GPU Muon update");
+        let (LayerParams::Connected(cpu_params), LayerParams::Connected(gpu_params)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("connected parameters expected");
+        };
+        close("GPU Muon connected weights", &gpu_params.weights, &cpu_params.weights, 8e-4);
+        close("GPU Muon connected biases", &gpu_params.biases, &cpu_params.biases, 8e-4);
+    }
+
+    let dir = std::env::temp_dir().join(format!("oxide-runtime-muon-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cpu_state = dir.join("cpu.state");
+    let gpu_state = dir.join("gpu.state");
+    cpu.save_optimizer_state(&cpu_state).expect("save CPU state");
+    gpu.save_optimizer_state(&gpu_state).expect("save GPU state");
+    let mut resumed_cpu = ExecutableNetwork::new(net.clone());
+    resumed_cpu.params = cpu.params.clone();
+    resumed_cpu
+        .load_optimizer_state(&cpu_state)
+        .expect("load CPU state");
+    let mut resumed_gpu =
+        GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide resume"));
+    resumed_gpu.params = gpu.params.clone();
+    resumed_gpu
+        .load_optimizer_state(&gpu_state)
+        .expect("load GPU state");
+    let input = patterned(resumed_cpu.network.net.input_shape());
+    let cpu_forward = resumed_cpu.forward_training(&input).expect("resumed CPU forward");
+    let gpu_forward = resumed_gpu
+        .forward_training_with_state(&input)
+        .expect("resumed GPU forward");
+    let seed = Tensor::filled(resumed_cpu.network.layers[0].output_shape, -0.04);
+    let seeds = [Some(seed)];
+    resumed_cpu
+        .backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+        .expect("resumed CPU backward");
+    resumed_gpu
+        .backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+        .expect("resumed GPU backward");
+    resumed_cpu.update_weights_muon(0.02, 2).expect("resumed CPU update");
+    resumed_gpu
+        .update_weights_gpu(0.02, 0.9, net.net.decay, 2)
+        .expect("resumed GPU update");
+    let (LayerParams::Connected(cpu_params), LayerParams::Connected(gpu_params)) =
+        (&resumed_cpu.params[0], &resumed_gpu.params[0])
+    else {
+        panic!("connected parameters expected after resume");
+    };
+    close("resumed GPU Muon weights", &gpu_params.weights, &cpu_params.weights, 8e-4);
+    close("resumed GPU Muon biases", &gpu_params.biases, &cpu_params.biases, 8e-4);
+    std::fs::remove_dir_all(dir).ok();
+}

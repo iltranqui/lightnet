@@ -151,6 +151,7 @@ impl MuonMatrixStep {
 /// `descent_updates` are Darknet's accumulated *descent* directions (the
 /// opposite sign from a mathematical gradient). They are averaged by `batch`
 /// and unscaled before entering momentum.
+#[cfg(test)]
 pub(crate) fn compute_muon_matrix_step(
     descent_updates: &[f32],
     rows: usize,
@@ -159,6 +160,28 @@ pub(crate) fn compute_muon_matrix_step(
     loss_scale: f32,
     momentum_coefficient: f32,
     state: &MuonMatrixState,
+) -> Result<MuonMatrixStep> {
+    compute_muon_matrix_step_with_orthogonalizer(
+        descent_updates,
+        rows,
+        cols,
+        batch,
+        loss_scale,
+        momentum_coefficient,
+        state,
+        newton_schulz_orthogonalize,
+    )
+}
+
+pub(crate) fn compute_muon_matrix_step_with_orthogonalizer(
+    descent_updates: &[f32],
+    rows: usize,
+    cols: usize,
+    batch: usize,
+    loss_scale: f32,
+    momentum_coefficient: f32,
+    state: &MuonMatrixState,
+    orthogonalize: impl FnOnce(&[f32], usize, usize) -> Result<Vec<f32>>,
 ) -> Result<MuonMatrixStep> {
     let len = checked_matrix_len(rows, cols)?;
     if descent_updates.len() != len {
@@ -209,7 +232,7 @@ pub(crate) fn compute_muon_matrix_step(
         lookahead.push(nesterov_descent);
     }
 
-    let orthogonal = newton_schulz_orthogonalize(&lookahead, rows, cols)?;
+    let orthogonal = orthogonalize(&lookahead, rows, cols)?;
     let update_scale = MUON_SCALE * (rows.max(cols) as f32).sqrt();
     let direction = orthogonal
         .into_iter()
