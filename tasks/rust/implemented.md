@@ -140,6 +140,7 @@ file is named inline.
 - [112. LocalAvgPool axis/layout contract pin](#112-localavgpool-axislayout-contract-pin)
 - [113. Native f16 maxpool_depth inference](#113-native-f16-maxpool_depth-inference)
 - [114. Connected axis/layout contract pin](#114-connected-axislayout-contract-pin)
+- [115. Native f16 SAM inference](#115-native-f16-sam-inference)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1765,6 +1766,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 114. Connected axis/layout contract pin
 
 - v0.1.031: added a named non-square B=2 Connected test with C=2, H=2, W=3 and hand-set `[out][in]` weights. Hand-computed forward sentinels pin flattened NCHW features and batch-major output rows; a supplied seed pins the exact input adjoint per independent sample. Updated the exhaustive axis registry/ledger to 24 pinned and 36 open C++-backed variants. `MEM=3G ./tools/test_host.sh axis_layout` passed 27 tests; `MEM=3G ./tools/test_host.sh every_layer_kind_has_an_axis_pin_decision` passed. Hand-derived from `Jev_laya:src-lib/connected_layer.cpp:186`; no compiled-C++ golden.
+
+## 115. Native f16 SAM inference
+
+- v0.2.088: added a native Oxide f16 SAM product/activation kernel and compact-runtime dispatch for supported activations. Fixed compact GPU source-lifetime accounting to retain/release SAM's explicit source reference as well as its previous-layer input. An actual-Oxide two-convolution + non-adjacent-source SAM case matches f32 compact inference (relative max error 6.223e-4); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed all 8 tests. Inference only; SAM training remains the f32 path. No compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 

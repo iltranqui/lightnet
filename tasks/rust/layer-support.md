@@ -69,9 +69,9 @@ with the command given rather than trusting the number.
 | CPU-only forward, no GPU path (hard reject) | 12 |
 | GPU forward but CPU/mixed backward | 9 |
 | GPU native forward + device backward | 23 |
-| f16 inference | 11 variants (12 section names) |
-| Axis pinned | 20 variants / 22 tests |
-| Axis open | 40 (Tier 1: 14, Tier 2: 15, Tier 3: 3, Tier 4: 8) |
+| f16 inference | 12 variants (13 section names) |
+| Axis pinned | 24 variants / 27 tests |
+| Axis open | 36 (Tier 1: 10, Tier 2: 15, Tier 3: 3, Tier 4: 8) |
 | Axis Rust-only | 5 |
 | Partial/incomplete CPU layers | `Region`, `Detection`, `Yolo3d`; blocked: `Dcnv3`, `DetrDecoder` |
 | GPU Muon | partial hybrid integration: connected matrices use native Oxide momentum/lookahead, Newton–Schulz and direction+decay update; standard non-BN convolution, non-BN EML branches, non-BN MoE router/expert matrices, non-BN GraphConv projection/self/learned-edge matrices with `groups=2` parity, tested `dont_update` gating, and DNOPT6 save/load resume; BN GraphConv forward/backward is native for eligible modes, with rolling stats host-synchronized; Muon state/final updates remain host-managed, non-BN DCNv4 offset projection, non-BN deform_conv main/offset/optional mask matrices, local per-location, RNN, LSTM, deconvolutional, and transformer-family matrices use native Oxide Newton–Schulz with host-managed state/final updates. Convolution/EML/MoE/DCNv4 gradients are downloaded at optimizer boundaries; deform_conv gradients download during native backward. Updated convolution/expert parameters are re-uploaded and DCNv4 snapshots trigger cache refresh on the next forward. BN convolution/EML/MoE/DCNv4/deform_conv remain rejected; GraphConv BN training is native only for eligible edge modes/activations. Connected momentum is cached between steps but mirrored to host each update; weights remain host-canonical. Standalone BatchNorm uses host AdamW fallback; other parameter families open |
@@ -95,7 +95,7 @@ with the command given rather than trusting the number.
 | `Softmax` | alias | none | fwd | exact | T1 | native | device | no |
 | `Dropout` | yes | none | fwd | exact | T1 | native | device | no |
 | `ScaleChannels` | yes | none | fwd | exact | T1 | native | mixed | no |
-| `Sam` | yes | none | fwd | exact | T1 | native f32 / host (unsupported activation) | device / CPU fallback | no |
+| `Sam` | yes | none | fwd | exact | T1 | native f32 / host (unsupported activation) | device / CPU fallback | yes (inference) |
 | `BatchNorm` | yes | C++ | fwd | exact | rust | native inference + batch-statistics training | device backward / host AdamW parameter update | yes |
 | `Crop` | yes | none | fwd | exact | rust | native inference + geometric training (no HSV/color jitter) | device (atomic scatter) | no |
 | `Local` | yes | C++ | fwd | exact | rust | native f32 / host (unsupported activation) | device / CPU fallback | no |
@@ -267,7 +267,8 @@ Accepted by `forward_compact_f16` (`runtime.rs:8389`):
 
 `convolutional` (not `NORM_CHAN*`), `maxpool`, `local_avgpool`, `avgpool`,
 `batchnorm`, `route`, `laya_marker_gather`, `upsample` (incl. `reverse`),
-`shortcut` (with sources), `yolo`, `obb_yolo`, `gaussian_yolo`.
+`shortcut` (with sources), `sam` (supported activation), `yolo`, `obb_yolo`,
+`gaussian_yolo`.
 
 Everything else returns `UnsupportedLayer`. Note this is inference only: f16
 training is the AMP path (`DARKNET_OXIDE_AMP=1`), which keeps f32 masters, and
