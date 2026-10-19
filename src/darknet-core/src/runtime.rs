@@ -14508,12 +14508,7 @@ where
                     output
                 }
                 (LayerKind::Crnn(spec), LayerParams::Crnn(recurrent)) => {
-                    if !spec.batch_normalize
-                        && recurrent.input.batch_norm.is_none()
-                        && recurrent.self_params.batch_norm.is_none()
-                        && recurrent.output.batch_norm.is_none()
-                        && spec.activation.to_cuda_f32_kind().is_some()
-                    {
+                    if spec.activation.to_cuda_f32_kind().is_some() {
                         let (output, cache, device_cache) = forward_crnn_layer_device(
                             &self.backend,
                             spec,
@@ -29086,16 +29081,6 @@ fn forward_crnn_layer_device<B: F32TensorOpsBackend>(
 where
     B::Error: std::fmt::Display,
 {
-    if spec.batch_normalize
-        || params.input.batch_norm.is_some()
-        || params.self_params.batch_norm.is_some()
-        || params.output.batch_norm.is_some()
-    {
-        return Err(Error::UnsupportedLayer {
-            layer_index,
-            name: "batch-normalized CRNN GPU forward".to_owned(),
-        });
-    }
     let sequence_batch = recurrent_sequence_batch(input_shape.batch, spec.steps)?;
     let input_width =
         convolution_output_dim(input_shape.width, spec.padding, spec.size, spec.stride);
@@ -29129,6 +29114,24 @@ where
                     "CRNN {name} parameter shapes are inconsistent with its specification"
                 )));
             }
+            let (weights, biases) = if let Some(batch_norm) = &conv.batch_norm {
+                validate_batchnorm_params(batch_norm, conv_spec.filters)?;
+                let mut weights = conv.weights.clone();
+                let mut biases = conv.biases.clone();
+                let weights_per_filter = grouped_channels * conv_spec.size * conv_spec.size;
+                for filter in 0..conv_spec.filters {
+                    let factor = batch_norm.scales[filter]
+                        / (batch_norm.rolling_variance[filter] + BATCH_NORM_EPSILON).sqrt();
+                    let start = filter * weights_per_filter;
+                    for weight in &mut weights[start..start + weights_per_filter] {
+                        *weight *= factor;
+                    }
+                    biases[filter] -= batch_norm.rolling_mean[filter] * factor;
+                }
+                (weights, biases)
+            } else {
+                (conv.weights.clone(), conv.biases.clone())
+            };
             let weights = backend
                 .upload_f32(
                     &[
@@ -29137,11 +29140,11 @@ where
                         conv_spec.size,
                         conv_spec.size,
                     ],
-                    &conv.weights,
+                    &weights,
                 )
                 .map_err(|err| backend_error("upload CRNN convolution weights", err))?;
             let biases = backend
-                .upload_f32(&[conv_spec.filters], &conv.biases)
+                .upload_f32(&[conv_spec.filters], &biases)
                 .map_err(|err| backend_error("upload CRNN convolution biases", err))?;
             Ok((weights, biases))
         };
@@ -42847,12 +42850,12 @@ num_dwconv=1
         let cpu_forward = cpu.forward_training(&input).expect("CPU CRNN BN forward");
         let gpu_forward = gpu
             .forward_training_device(&input)
-            .expect("GPU CRNN BN host-reference forward");
+            .expect("GPU CRNN BN native recurrent forward");
         assert!(matches!(
             gpu_forward.cpu_forward.recurrent_caches.get(1),
             Some(Some(super::RecurrentForwardCache::Crnn(_)))
         ));
-        assert!(gpu_forward.gpu_crnn_caches[1].is_none());
+        assert!(gpu_forward.gpu_crnn_caches[1].is_some());
         assert_slice_close(
             "BN CRNN output",
             &cpu_forward.layer_outputs[1].data,

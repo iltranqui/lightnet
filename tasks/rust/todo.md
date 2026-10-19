@@ -229,6 +229,11 @@ reference tolerance is `TOL_COMPOSED = 1e-4` rather than the single-stage `2e-6`
 
 ## P8/P9 training follow-ups
 
+- [x] v0.2.084: CRNN training with rolling-stat BN now uses native recurrent
+  convolution forward/backward. `MEM=3G ./tools/test_oxide.sh --test
+  oxide_runtime_chain batch_normalized_crnn_device_backward_matches_cpu_on_oxide`
+  passed; the FakeBackend regression also passed, including output, gradients,
+  parameter updates and rolling-stat checks. No C++ parity; see `implemented.md` §107.
 - [x] v0.2.083: LSTM training with rolling-stat BN now uses native recurrent
   forward and backward; `MEM=3G ./tools/test_oxide.sh --test
   oxide_runtime_chain lstm` passed 4 tests, including
@@ -262,8 +267,9 @@ reference tolerance is `TOL_COMPOSED = 1e-4` rather than the single-stage `2e-6`
   just for dscale.
   RNN rolling-stat BN forward is native for supported activations (inference
   v0.2.080, training v0.2.082), with native BN recurrent backward. LSTM
-  rolling-stat BN inference/training is native (v0.2.081/.083); BN CRNN
-  forward/cache capture remain host-side.
+  rolling-stat BN inference/training is native (v0.2.081/.083); BN CRNN native
+  convolution forward/training is v0.2.084, with host-captured compatibility
+  caches and rolling-stat/optimizer mirrors.
   FakeBackend and real Oxide parity cover parameter, rolling-stat, and upstream
   connected/convolution updates. Dynamic loss-scale finiteness checks include
   host-buffered connected/recurrent gradients. Unsupported recurrent

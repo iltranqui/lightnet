@@ -102,7 +102,7 @@ with the command given rather than trusting the number.
 | `Gru` | yes | Rust | fwd | none | rust | native f32 inference incl. rolling-stat BN | training unsupported (no backward path) | no |
 | `Rnn` | yes | C++ | fwd | exact | T3 | native f32 inference/training incl. rolling-stat BN (supported activations) | mixed (unsupported activation host fallback) | no |
 | `Lstm` | yes | C++ | fwd | exact | T3 | native f32 inference/training incl. rolling-stat BN | mixed (unsupported variants host fallback) | no |
-| `Crnn` | yes | C++ | fwd | exact | T3 | mixed (device w/o BN) | mixed | no |
+| `Crnn` | yes | C++ | fwd | exact | T3 | native f32 inference/training incl. rolling-stat BN (supported activations) | mixed (unsupported activation host fallback) | no |
 | `Moe` | alias | C++ | fwd | exact | pin | native | device | no |
 | `EmlConvolutional` | alias | C++ | fwd | exact | pin | native | device / CPU (BN) | no |
 | `GraphConv` | alias | C++ | fwd | exact | T4 | native f32 supported inference and eligible training incl. BN; host otherwise | native supported BN/no-BN modes / CPU fallback unsupported variants | no |

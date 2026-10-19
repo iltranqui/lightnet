@@ -132,6 +132,7 @@ file is named inline.
 - [104. Native LSTM rolling-stat BN inference](#104-native-lstm-rolling-stat-bn-inference)
 - [105. Native RNN rolling-stat BN training](#105-native-rnn-rolling-stat-bn-training)
 - [106. Native LSTM rolling-stat BN training](#106-native-lstm-rolling-stat-bn-training)
+- [107. Native CRNN rolling-stat BN training](#107-native-crnn-rolling-stat-bn-training)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1725,6 +1726,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 106. Native LSTM rolling-stat BN training
 
 - v0.2.083: routed all LSTM inference and training forwards through native recurrent projections, folding rolling-stat BN affines into each projection. The existing LSTM device backward computes rolling-stat BN gradients, so BN training no longer needs the whole-layer CPU forward/backward fallback. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain lstm` passed 4 tests, including `batch_normalized_lstm_device_backward_matches_cpu_on_oxide` (output and parameter updates vs CPU) and existing non-BN backward/Muon regressions. No C++ golden, full-suite or performance claim.
+
+## 107. Native CRNN rolling-stat BN training
+
+- v0.2.084: enabled native CRNN recurrent-convolution forward with rolling-stat BN affines folded into the three convolution projections. The existing device CRNN backward path handles BN input/beta/scale adjoints, so the training forward no longer falls back to CPU for supported activations. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain batch_normalized_crnn_device_backward_matches_cpu_on_oxide` passed on Oxide; the FakeBackend `gpu_batch_normalized_crnn_backward_matches_cpu_and_updates_rolling_stats` host test also passed. Coverage includes multi-step output, gradients, parameter updates, rolling stats, upstream convolution and finite-gradient checks. No C++ golden, full-suite or performance claim.
 
 ## Not implemented / open (pointer)
 
