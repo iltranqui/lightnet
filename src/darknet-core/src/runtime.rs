@@ -7420,6 +7420,7 @@ where
     device_train_buffers: RefCell<Vec<Option<GpuConvolutionTrainBuffers<B::Tensor>>>>,
     device_moe_train_buffers: RefCell<Vec<Option<GpuMoeTrainBuffers<B::Tensor>>>>,
     device_eml_train_buffers: RefCell<Vec<Option<GpuEmlTrainBuffers<B::Tensor>>>>,
+    device_dcnv4_train_buffers: RefCell<Vec<Option<GpuDcnv4TrainBuffers<B::Tensor>>>>,
     cpu_fallback_train_buffers: RefCell<Vec<LayerTrainBuffers>>,
     /// One slot per layer; only `[deform_conv]` uses it, and only on the
     /// device-trainable path (see `DeformDeviceCache`).
@@ -8404,6 +8405,17 @@ struct GpuEmlTrainBuffers<T> {
     self_params: GpuConvolutionTrainBuffers<T>,
 }
 
+/// Native f32 DCNv4 parameter-gradient accumulators. Optimizer updates remain
+/// host-side for now; gradients cross back only at the optimizer boundary.
+#[derive(Clone, Debug)]
+struct GpuDcnv4TrainBuffers<T> {
+    bias_updates: T,
+    offset_weight_updates: T,
+    offset_bias_updates: T,
+    scale_updates: Option<T>,
+    dirty: bool,
+}
+
 /// f16-storage inference (P6).  Training and every non-inference op stay on
 /// the f32 path.
 impl<B> GpuExecutableNetwork<B>
@@ -8888,6 +8900,7 @@ where
         let device_train_buffers = RefCell::new(vec![None; network.layers.len()]);
         let device_moe_train_buffers = RefCell::new(vec![None; network.layers.len()]);
         let device_eml_train_buffers = RefCell::new(vec![None; network.layers.len()]);
+        let device_dcnv4_train_buffers = RefCell::new(vec![None; network.layers.len()]);
         let cpu_fallback_train_buffers = RefCell::new(
             network
                 .layers
@@ -8907,6 +8920,7 @@ where
             device_train_buffers,
             device_moe_train_buffers,
             device_eml_train_buffers,
+            device_dcnv4_train_buffers,
             cpu_fallback_train_buffers,
             deform_device_caches: RefCell::new(Vec::new()),
             adam_state: Vec::new(),
@@ -9085,6 +9099,37 @@ where
                         return Ok(true);
                     }
                 }
+            }
+        }
+        for entry in self
+            .device_dcnv4_train_buffers
+            .borrow()
+            .iter()
+            .flatten()
+            .filter(|entry| entry.dirty)
+        {
+            if self
+                .backend
+                .any_non_finite_f32(&entry.offset_weight_updates)
+                .map_err(|err| backend_error("DCNv4 gradient finiteness check", err))?
+                || self
+                    .backend
+                    .any_non_finite_f32(&entry.offset_bias_updates)
+                    .map_err(|err| backend_error("DCNv4 gradient finiteness check", err))?
+                || self
+                    .backend
+                    .any_non_finite_f32(&entry.bias_updates)
+                    .map_err(|err| backend_error("DCNv4 gradient finiteness check", err))?
+            {
+                return Ok(true);
+            }
+            if let Some(scales) = &entry.scale_updates
+                && self
+                    .backend
+                    .any_non_finite_f32(scales)
+                    .map_err(|err| backend_error("DCNv4 scale-gradient finiteness check", err))?
+            {
+                return Ok(true);
             }
         }
         let host_gradients = self.cpu_fallback_train_buffers.borrow();
@@ -9776,6 +9821,64 @@ where
         }
         *self.device_train_buffers.get_mut() = train_buffers;
 
+        let mut dcnv4_train_buffers = Vec::with_capacity(self.network.layers.len());
+        for (layer, params) in self.network.layers.iter().zip(&self.params) {
+            let buffers = match (&layer.kind, params) {
+                (LayerKind::Dcnv4(spec), LayerParams::Dcnv4(params))
+                    if !dcnv4_gpu::needs_host(spec) =>
+                {
+                    if params.offset_weights.is_empty()
+                        || params.offset_biases.is_empty()
+                        || params.biases.len() != spec.filters
+                        || params.batch_norm.is_some() != spec.batch_normalize
+                    {
+                        return Err(Error::InvalidConfig(format!(
+                            "DCNv4 parameter storage mismatch while allocating GPU train buffers at layer #{}",
+                            layer.index
+                        )));
+                    }
+                    let bias_updates = self
+                        .backend
+                        .zeros_f32(&[params.biases.len()])
+                        .map_err(|err| backend_error("allocate DCNv4 GPU bias updates", err))?;
+                    let offset_weight_updates = self
+                        .backend
+                        .zeros_f32(&[params.offset_weights.len()])
+                        .map_err(|err| backend_error("allocate DCNv4 GPU offset weight updates", err))?;
+                    let offset_bias_updates = self
+                        .backend
+                        .zeros_f32(&[params.offset_biases.len()])
+                        .map_err(|err| backend_error("allocate DCNv4 GPU offset bias updates", err))?;
+                    let scale_updates = params
+                        .batch_norm
+                        .as_ref()
+                        .map(|bn| {
+                            self.backend
+                                .zeros_f32(&[bn.scales.len()])
+                                .map_err(|err| backend_error("allocate DCNv4 GPU scale updates", err))
+                        })
+                        .transpose()?;
+                    Some(GpuDcnv4TrainBuffers {
+                        bias_updates,
+                        offset_weight_updates,
+                        offset_bias_updates,
+                        scale_updates,
+                        dirty: false,
+                    })
+                }
+                (LayerKind::Dcnv4(_), LayerParams::Dcnv4(_)) => None,
+                (LayerKind::Dcnv4(_), _) => {
+                    return Err(Error::InvalidConfig(format!(
+                        "DCNv4 layer #{} has inconsistent parameters while allocating GPU train buffers",
+                        layer.index
+                    )));
+                }
+                _ => None,
+            };
+            dcnv4_train_buffers.push(buffers);
+        }
+        *self.device_dcnv4_train_buffers.get_mut() = dcnv4_train_buffers;
+
         let mut moe_train_buffers = Vec::with_capacity(self.network.layers.len());
         for (layer, params) in self.network.layers.iter().zip(&self.params) {
             let buffers = match (&layer.kind, params) {
@@ -10343,6 +10446,7 @@ where
             self.host_weights_stale = false;
         }
         self.flush_device_moe_gradients_to_host(&preserve_device_moe_params)?;
+        self.flush_device_dcnv4_gradients_to_host()?;
         if let GpuOptimizerStep::Adam(adam) = step {
             self.update_cpu_fallback_adam(
                 &adam,
@@ -14110,12 +14214,15 @@ where
             let conv = self.device_train_buffers.borrow();
             let moe = self.device_moe_train_buffers.borrow();
             let eml = self.device_eml_train_buffers.borrow();
+            let dcnv4 = self.device_dcnv4_train_buffers.borrow();
             conv.len() != self.network.layers.len()
                 || moe.len() != self.network.layers.len()
                 || eml.len() != self.network.layers.len()
+                || dcnv4.len() != self.network.layers.len()
                 || (conv.iter().all(Option::is_none)
                     && moe.iter().all(Option::is_none)
-                    && eml.iter().all(Option::is_none))
+                    && eml.iter().all(Option::is_none)
+                    && dcnv4.iter().all(Option::is_none))
         };
         if train_buffers_uninitialized {
             self.init_train_buffers_gpu()?;
@@ -15967,11 +16074,16 @@ where
                         &self.backend, input, pre, &grad, cache, layer, spec, params,
                     )?;
                     {
-                        let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
-                        let LayerTrainBuffers::Dcnv4(train) = &mut buffers[layer.index] else {
-                            return Err(Error::InvalidConfig("missing DCNv4 train buffers".to_owned()));
-                        };
-                        dcnv4_gpu::accumulate(train, &gradients)?;
+                        let mut buffers = self.device_dcnv4_train_buffers.borrow_mut();
+                        let train = buffers
+                            .get_mut(layer.index)
+                            .and_then(Option::as_mut)
+                            .ok_or_else(|| {
+                                Error::InvalidConfig(format!(
+                                    "missing GPU DCNv4 train buffers at #{}", layer.index
+                                ))
+                            })?;
+                        dcnv4_gpu::accumulate(&self.backend, train, &gradients)?;
                     }
                     self.accumulate_previous_gpu_gradient(
                         layer.index, gradients.input, &mut layer_output_gradients,
@@ -17382,6 +17494,131 @@ where
         Ok(true)
     }
 
+    fn flush_device_dcnv4_gradients_to_host(&mut self) -> Result<()> {
+        type HostGradients = (Vec<f32>, Vec<f32>, Vec<f32>, Option<Vec<f32>>);
+        let mut staged = Vec::with_capacity(self.network.layers.len());
+        let mut reset = Vec::with_capacity(self.network.layers.len());
+        {
+            let buffers = self.device_dcnv4_train_buffers.borrow();
+            for (layer_index, entry) in buffers.iter().enumerate() {
+                let Some(entry) = entry else {
+                    staged.push(None);
+                    reset.push(None);
+                    continue;
+                };
+                if !entry.dirty {
+                    staged.push(None);
+                    reset.push(Some(entry.clone()));
+                    continue;
+                }
+                let gradients: HostGradients = (
+                    self.backend
+                        .download_f32(&entry.bias_updates)
+                        .map_err(|err| backend_error("download DCNv4 bias updates", err))?,
+                    self.backend
+                        .download_f32(&entry.offset_weight_updates)
+                        .map_err(|err| backend_error("download DCNv4 offset weight updates", err))?,
+                    self.backend
+                        .download_f32(&entry.offset_bias_updates)
+                        .map_err(|err| backend_error("download DCNv4 offset bias updates", err))?,
+                    entry
+                        .scale_updates
+                        .as_ref()
+                        .map(|scales| {
+                            self.backend.download_f32(scales).map_err(|err| {
+                                backend_error("download DCNv4 scale updates", err)
+                            })
+                        })
+                        .transpose()?,
+                );
+                let LayerParams::Dcnv4(params) = &self.params[layer_index] else {
+                    return Err(Error::InvalidConfig(format!(
+                        "missing DCNv4 params for GPU gradients at layer #{layer_index}"
+                    )));
+                };
+                let zeros = GpuDcnv4TrainBuffers {
+                    bias_updates: self
+                        .backend
+                        .zeros_f32(&[params.biases.len()])
+                        .map_err(|err| backend_error("reset DCNv4 bias updates", err))?,
+                    offset_weight_updates: self
+                        .backend
+                        .zeros_f32(&[params.offset_weights.len()])
+                        .map_err(|err| backend_error("reset DCNv4 offset weight updates", err))?,
+                    offset_bias_updates: self
+                        .backend
+                        .zeros_f32(&[params.offset_biases.len()])
+                        .map_err(|err| backend_error("reset DCNv4 offset bias updates", err))?,
+                    scale_updates: params
+                        .batch_norm
+                        .as_ref()
+                        .map(|bn| {
+                            self.backend
+                                .zeros_f32(&[bn.scales.len()])
+                                .map_err(|err| backend_error("reset DCNv4 scale updates", err))
+                        })
+                        .transpose()?,
+                    dirty: false,
+                };
+                staged.push(Some(gradients));
+                reset.push(Some(zeros));
+            }
+        }
+        {
+            let buffers = self.cpu_fallback_train_buffers.borrow();
+            for (layer_index, gradients) in staged.iter().enumerate() {
+                let Some((biases, weights, offset_biases, scales)) = gradients else {
+                    continue;
+                };
+                let Some(LayerTrainBuffers::Dcnv4(train)) = buffers.get(layer_index) else {
+                    return Err(Error::InvalidConfig(format!(
+                        "missing host DCNv4 train buffers for layer #{layer_index}"
+                    )));
+                };
+                if train.bias_updates.len() != biases.len()
+                    || train.offset_weight_updates.len() != weights.len()
+                    || train.offset_bias_updates.len() != offset_biases.len()
+                    || match (&train.batch_norm, scales) {
+                        (Some(bn), Some(scales)) => bn.scale_updates.len() != scales.len(),
+                        (None, None) => false,
+                        _ => true,
+                    }
+                {
+                    return Err(Error::InvalidConfig(format!(
+                        "DCNv4 host train-buffer shape mismatch for layer #{layer_index}"
+                    )));
+                }
+            }
+        }
+        {
+            let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
+            for (layer_index, gradients) in staged.iter().enumerate() {
+                let Some((biases, weights, offset_biases, scales)) = gradients else {
+                    continue;
+                };
+                let LayerTrainBuffers::Dcnv4(train) = &mut buffers[layer_index] else {
+                    unreachable!("validated DCNv4 host train buffers")
+                };
+                for (dst, src) in train.bias_updates.iter_mut().zip(biases) {
+                    *dst += src;
+                }
+                for (dst, src) in train.offset_weight_updates.iter_mut().zip(weights) {
+                    *dst += src;
+                }
+                for (dst, src) in train.offset_bias_updates.iter_mut().zip(offset_biases) {
+                    *dst += src;
+                }
+                if let (Some(bn), Some(scales)) = (&mut train.batch_norm, scales) {
+                    for (dst, src) in bn.scale_updates.iter_mut().zip(scales) {
+                        *dst += src;
+                    }
+                }
+            }
+        }
+        *self.device_dcnv4_train_buffers.borrow_mut() = reset;
+        Ok(())
+    }
+
     fn flush_device_moe_gradients_to_host(&mut self, keep_device_gradients: &[bool]) -> Result<()> {
         type ExpertUpdates = (Vec<f32>, Vec<f32>, Option<Vec<f32>>);
         type HostUpdates = (Vec<f32>, Vec<f32>, Vec<ExpertUpdates>);
@@ -17943,6 +18180,9 @@ where
             *entry = None;
         }
         for entry in self.device_eml_train_buffers.get_mut().iter_mut() {
+            *entry = None;
+        }
+        for entry in self.device_dcnv4_train_buffers.get_mut().iter_mut() {
             *entry = None;
         }
     }
@@ -30677,10 +30917,25 @@ mod tests {
 
         gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
             .unwrap();
-        assert_eq!(
-            cpu.train_buffers,
-            gpu.cpu_fallback_train_buffers.borrow().clone()
-        );
+        let LayerTrainBuffers::Dcnv4(cpu_train) = &cpu.train_buffers[0] else {
+            panic!("DCNv4 train buffers")
+        };
+        {
+            let device_train = gpu.device_dcnv4_train_buffers.borrow();
+            let device_train = device_train[0].as_ref().unwrap();
+            assert_eq!(
+                gpu.backend.download_f32(&device_train.offset_weight_updates).unwrap(),
+                cpu_train.offset_weight_updates
+            );
+            assert_eq!(
+                gpu.backend.download_f32(&device_train.offset_bias_updates).unwrap(),
+                cpu_train.offset_bias_updates
+            );
+            assert_eq!(
+                gpu.backend.download_f32(&device_train.bias_updates).unwrap(),
+                cpu_train.bias_updates
+            );
+        }
         cpu.update_weights(0.01, 0.2, 0.1, 1);
         gpu.update_weights_gpu(0.01, 0.2, 0.1, 1).unwrap();
         assert_eq!(gpu.params, cpu.params);
@@ -32586,9 +32841,26 @@ num_dwconv=1
         gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
             .unwrap();
         assert_eq!(cpu.params, gpu.params);
+        let LayerTrainBuffers::Dcnv4(cpu_train) = &cpu.train_buffers[0] else {
+            panic!("DCNv4 train buffers")
+        };
+        let device_train = gpu.device_dcnv4_train_buffers.borrow();
+        let device_train = device_train[0].as_ref().unwrap();
         assert_eq!(
-            cpu.train_buffers,
-            gpu.cpu_fallback_train_buffers.borrow().clone()
+            gpu.backend.download_f32(&device_train.offset_weight_updates).unwrap(),
+            cpu_train.offset_weight_updates
+        );
+        assert_eq!(
+            gpu.backend.download_f32(&device_train.offset_bias_updates).unwrap(),
+            cpu_train.offset_bias_updates
+        );
+        assert_eq!(
+            gpu.backend.download_f32(&device_train.bias_updates).unwrap(),
+            cpu_train.bias_updates
+        );
+        assert_eq!(
+            gpu.backend.download_f32(device_train.scale_updates.as_ref().unwrap()).unwrap(),
+            cpu_train.batch_norm.as_ref().unwrap().scale_updates
         );
         let LayerParams::Dcnv4(params) = &cpu.params[0] else {
             panic!("DCNv4 params")

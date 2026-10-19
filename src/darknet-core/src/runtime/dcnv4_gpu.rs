@@ -1,8 +1,9 @@
 //! Bounded DCNv4 GPU math: <=169 active points, elementwise/channel activation.
 //! BN normalizes with rolling stats; its 0.9 EMA runs only after backward.
-//! Parameter gradients/SGD/Adam stay host-resident; forward/backward tensor math
-//! is native on Oxide. Each GPU forward state owns its raw and offset tensors for
-//! backward, so projection/aggregation are not redundantly recomputed.
+//! Parameter gradients accumulate on-device; parameters and optimizer updates
+//! remain host-resident until the optimizer boundary. Forward/backward tensor
+//! math is native on Oxide. Each GPU forward state owns its raw and offset tensors
+//! for backward, so projection/aggregation are not redundantly recomputed.
 
 use super::*;
 use crate::model::Layer;
@@ -157,10 +158,10 @@ pub(super) fn activation_delta<B: F32TensorOpsBackend>(
 
 pub(super) struct Gradients<T> {
     pub input: T,
-    pub biases: Vec<f32>,
-    pub weights: Vec<f32>,
-    pub offset_biases: Vec<f32>,
-    pub scales: Option<Vec<f32>>,
+    pub biases: T,
+    pub weights: T,
+    pub offset_biases: T,
+    pub scales: Option<T>,
 }
 
 pub(super) fn backward<B: F32TensorOpsBackend>(
@@ -214,18 +215,15 @@ where
         let d_raw = backend
             .channel_scale_f32(&delta, &gains, spec.filters, desc.geometry.spatial(), cfg)
             .map_err(|err| backend_error("DCNv4 rolling BN adjoint", err))?;
-        let ds = backend
-            .download_f32(&dscale)
-            .map_err(|err| backend_error("download DCNv4 gamma gradient", err))?;
-        (d_raw, vec![0.0; params.biases.len()], Some(ds))
+        let dbias = backend
+            .zeros_f32(&[params.biases.len()])
+            .map_err(|err| backend_error("allocate zero DCNv4 bias gradient", err))?;
+        (d_raw, dbias, Some(dscale))
     } else {
         let bias_grad = backend
             .bias_backward_f32(&delta, spec.filters, desc.geometry.spatial(), cfg)
             .map_err(|err| backend_error("DCNv4 bias backward", err))?;
-        let db = backend
-            .download_f32(&bias_grad)
-            .map_err(|err| backend_error("download DCNv4 bias gradient", err))?;
-        (delta, db, None)
+        (delta, bias_grad, None)
     };
     let (input, dw, db) = backend
         .dcnv4_backward_f32(input, &weights, offsets, &aggregation_grad, desc, cfg)
@@ -234,49 +232,64 @@ where
         input,
         biases,
         scales,
-        weights: backend
-            .download_f32(&dw)
-            .map_err(|err| backend_error("download DCNv4 weight gradient", err))?,
-        offset_biases: backend
-            .download_f32(&db)
-            .map_err(|err| backend_error("download DCNv4 offset bias gradient", err))?,
+        weights: dw,
+        offset_biases: db,
     })
 }
 
-pub(super) fn accumulate<T>(train: &mut Dcnv4TrainBuffers, grad: &Gradients<T>) -> Result<()> {
-    // Check every block before changing any buffer. Dummy weights never receive
-    // a derivative or update; optimizer learning-rate scaling remains unchanged.
-    if train.bias_updates.len() != grad.biases.len()
-        || train.offset_weight_updates.len() != grad.weights.len()
-        || train.offset_bias_updates.len() != grad.offset_biases.len()
-        || match (&train.batch_norm, &grad.scales) {
-            (Some(bn), Some(ds)) => bn.scale_updates.len() != ds.len(),
-            (None, None) => false,
-            _ => true,
-        }
-    {
+pub(super) fn accumulate<B: F32TensorOpsBackend>(
+    backend: &B,
+    train: &mut GpuDcnv4TrainBuffers<B::Tensor>,
+    grad: &Gradients<B::Tensor>,
+) -> Result<()>
+where
+    B::Error: std::fmt::Display,
+{
+    if train.scale_updates.is_some() != grad.scales.is_some() {
         return Err(Error::InvalidConfig(
             "DCNv4 gradient storage mismatch".to_owned(),
         ));
     }
-    if let (Some(bn), Some(ds)) = (&mut train.batch_norm, &grad.scales) {
-        for (dst, src) in bn.scale_updates.iter_mut().zip(ds) {
-            *dst += src;
-        }
+    let cfg = ElementwiseLaunchConfig::default();
+    let add = |name: &'static str, alpha: f32, x: &B::Tensor, y: &B::Tensor| {
+        backend
+            .saxpy_f32(alpha, x, y, cfg)
+            .map_err(|err| backend_error(name, err))
+    };
+    if !train.dirty {
+        // The backend may retain multidimensional gradient layouts. Seed the
+        // accumulator with an exact-layout device copy instead of the flat
+        // zero allocation used for clean buffers.
+        let weights = add("DCNv4 offset-weight gradient initialization", 0.0, &grad.weights, &grad.weights)?;
+        let offset_biases = add("DCNv4 offset-bias gradient initialization", 0.0, &grad.offset_biases, &grad.offset_biases)?;
+        let biases = add("DCNv4 bias gradient initialization", 0.0, &grad.biases, &grad.biases)?;
+        let scales = grad
+            .scales
+            .as_ref()
+            .map(|scales| add("DCNv4 scale gradient initialization", 0.0, scales, scales))
+            .transpose()?;
+        train.offset_weight_updates = weights;
+        train.offset_bias_updates = offset_biases;
+        train.bias_updates = biases;
+        train.scale_updates = scales;
+        train.dirty = true;
+        return Ok(());
     }
-    for (dst, src) in train.bias_updates.iter_mut().zip(&grad.biases) {
-        *dst += src;
-    }
-    for (dst, src) in train.offset_weight_updates.iter_mut().zip(&grad.weights) {
-        *dst += src;
-    }
-    for (dst, src) in train
-        .offset_bias_updates
-        .iter_mut()
-        .zip(&grad.offset_biases)
-    {
-        *dst += src;
-    }
+    // Stage results first so a backend failure cannot partially mutate the
+    // accumulated gradients. The dummy parameter block remains excluded.
+    let weights = add("DCNv4 offset-weight gradient accumulation", 1.0, &grad.weights, &train.offset_weight_updates)?;
+    let offset_biases = add("DCNv4 offset-bias gradient accumulation", 1.0, &grad.offset_biases, &train.offset_bias_updates)?;
+    let biases = add("DCNv4 bias gradient accumulation", 1.0, &grad.biases, &train.bias_updates)?;
+    let scales = match (&grad.scales, &train.scale_updates) {
+        (Some(gradient), Some(updates)) => Some(add("DCNv4 scale gradient accumulation", 1.0, gradient, updates)?),
+        (None, None) => None,
+        _ => unreachable!("validated DCNv4 scale-gradient metadata"),
+    };
+    train.offset_weight_updates = weights;
+    train.offset_bias_updates = offset_biases;
+    train.bias_updates = biases;
+    train.scale_updates = scales;
+    train.dirty = true;
     Ok(())
 }
 

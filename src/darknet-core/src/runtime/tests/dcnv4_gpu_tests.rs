@@ -98,23 +98,24 @@ fn dcnv4_bn_native_gradients_match_cpu_including_zero_gamma() {
         unreachable!()
     };
     let dx = gpu.backend.download_f32(&got.input).unwrap();
+    let weights = gpu.backend.download_f32(&got.weights).unwrap();
+    let offset_biases = gpu.backend.download_f32(&got.offset_biases).unwrap();
+    let scales = gpu.backend.download_f32(got.scales.as_ref().unwrap()).unwrap();
+    let biases = gpu.backend.download_f32(&got.biases).unwrap();
     for (a, b) in [
         (&dx, &want.input_gradient.data),
-        (&got.weights, &wp.offset_weights),
-        (&got.offset_biases, &wp.offset_biases),
-        (
-            got.scales.as_ref().unwrap(),
-            &wp.batch_norm.as_ref().unwrap().scales,
-        ),
+        (&weights, &wp.offset_weights),
+        (&offset_biases, &wp.offset_biases),
+        (&scales, &wp.batch_norm.as_ref().unwrap().scales),
     ] {
         assert_eq!(a.len(), b.len());
         for (x, y) in a.iter().zip(b) {
             assert!((x - y).abs() < 3e-5, "{x} vs {y}");
         }
     }
-    assert_eq!(got.biases, vec![0.0; 2]);
+    assert_eq!(biases, vec![0.0; 2]);
     assert!(
-        got.scales.as_ref().unwrap()[0].abs() > 1e-5,
+        scales[0].abs() > 1e-5,
         "gamma=0 still needs its derivative"
     );
     let before = gpu.params.clone();
@@ -392,14 +393,15 @@ fn dcnv4_gpu_multiple_forward_states_and_microbatch_accumulation_match_cpu() {
         let LayerTrainBuffers::Dcnv4(want) = &cpu.train_buffers[0] else {
             unreachable!()
         };
-        let buffers = gpu.cpu_fallback_train_buffers.borrow();
-        let LayerTrainBuffers::Dcnv4(got) = &buffers[0] else {
-            unreachable!()
-        };
+        let buffers = gpu.device_dcnv4_train_buffers.borrow();
+        let got = buffers[0].as_ref().unwrap();
+        let got_biases = gpu.backend.download_f32(&got.bias_updates).unwrap();
+        let got_weights = gpu.backend.download_f32(&got.offset_weight_updates).unwrap();
+        let got_offset_biases = gpu.backend.download_f32(&got.offset_bias_updates).unwrap();
         for (a, b) in [
-            (&want.bias_updates, &got.bias_updates),
-            (&want.offset_weight_updates, &got.offset_weight_updates),
-            (&want.offset_bias_updates, &got.offset_bias_updates),
+            (&want.bias_updates, &got_biases),
+            (&want.offset_weight_updates, &got_weights),
+            (&want.offset_bias_updates, &got_offset_biases),
         ] {
             assert_eq!(a.len(), b.len());
             for (x, y) in a.iter().zip(b) {
