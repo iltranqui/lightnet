@@ -66,17 +66,29 @@ fn dcnv4_gpu_adam_uses_sidecar_compatible_moments() {
             _ => unreachable!(),
         }
     }
-    assert!(gpu.host_adam_state.borrow()[0].is_some());
+    assert!(gpu.dcnv4_adam_state[0].is_some());
+    assert!(gpu.host_adam_state.borrow()[0].is_none());
     let path = std::env::temp_dir().join(format!(
         "darknet-gpu-dcnv4-adam-{}.state",
+        std::process::id()
+    ));
+    let round_trip = std::env::temp_dir().join(format!(
+        "darknet-gpu-dcnv4-adam-{}-roundtrip.state",
         std::process::id()
     ));
     gpu.save_optimizer_state(&path).unwrap();
     let mut restored = GpuExecutableNetwork::new(network, FakeBackend);
     restored.load_optimizer_state(&path).unwrap();
-    assert_eq!(restored.host_adam_state, gpu.host_adam_state);
+    assert!(restored.dcnv4_adam_state[0].is_none());
+    assert!(restored.host_adam_state.borrow()[0].is_some());
     assert_eq!(restored.adam_step, gpu.adam_step);
+    restored.save_optimizer_state(&round_trip).unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        std::fs::read(&round_trip).unwrap()
+    );
     let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(round_trip);
 }
 
 #[test]

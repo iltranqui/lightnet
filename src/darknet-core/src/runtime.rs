@@ -7432,8 +7432,12 @@ where
     moe_adam_state: Vec<Option<GpuMoeAdamLayerState<B::Tensor>>>,
     /// Device Adam moments for EML's two convolution branches, persisted in DNOPT5.
     eml_adam_state: Vec<Option<GpuEmlAdamLayerState<B::Tensor>>>,
+    /// Persistent device Adam moments for native DCNv4 updates. Sidecar saves
+    /// materialize them into the existing host-compatible representation.
+    dcnv4_adam_state: Vec<Option<GpuDcnv4AdamState<B::Tensor>>>,
     /// Adam moments for parameters updated by the host fallback.
     host_adam_state: RefCell<Vec<Option<HostAdamLayerState>>>,
+
     /// Number of Adam updates applied so far (the 1-based bias-correction `t`).
     adam_step: u32,
     /// See [`ExecutableNetwork::set_train_iteration`].
@@ -8405,8 +8409,18 @@ struct GpuEmlTrainBuffers<T> {
     self_params: GpuConvolutionTrainBuffers<T>,
 }
 
-/// Native f32 DCNv4 parameter-gradient accumulators. Optimizer updates remain
-/// host-side for now; gradients cross back only at the optimizer boundary.
+/// Device-resident DCNv4 Adam moments. They are materialized in the existing
+/// host-sidecar schema only when optimizer state is saved.
+#[derive(Clone, Debug)]
+struct GpuDcnv4AdamState<T> {
+    offset_weights: Option<GpuMoments<T>>,
+    offset_biases: Option<GpuMoments<T>>,
+    biases: Option<GpuMoments<T>>,
+    scales: Option<GpuMoments<T>>,
+}
+
+/// Native f32 DCNv4 parameter-gradient accumulators. Gradients stay on-device
+/// through the native optimizer boundary and flush only for host fallback.
 #[derive(Clone, Debug)]
 struct GpuDcnv4TrainBuffers<T> {
     bias_updates: T,
@@ -8914,6 +8928,7 @@ where
         );
         let moe_adam_state = (0..network.layers.len()).map(|_| None).collect();
         let eml_adam_state = (0..network.layers.len()).map(|_| None).collect();
+        let dcnv4_adam_state = (0..network.layers.len()).map(|_| None).collect();
         let host_adam_state = RefCell::new((0..network.layers.len()).map(|_| None).collect());
         Self {
             backend,
@@ -8930,6 +8945,7 @@ where
             adam_state: Vec::new(),
             moe_adam_state,
             eml_adam_state,
+            dcnv4_adam_state,
             host_adam_state,
             adam_step: 0,
             train_iteration: 0,
@@ -9236,7 +9252,32 @@ where
             self.write_moments(&mut file, state.biases.as_ref(), &filter_shape)?;
             self.write_moments(&mut file, state.scales.as_ref(), &filter_shape)?;
         }
-        let host_states = self.host_adam_state.borrow();
+        let mut host_states = self.host_adam_state.borrow().clone();
+        for (index, device_state) in self.dcnv4_adam_state.iter().enumerate() {
+            let Some(device_state) = device_state else {
+                continue;
+            };
+            let host_state = host_states[index].get_or_insert_with(HostAdamLayerState::default);
+            let download_pair = |pair: &Option<GpuMoments<B::Tensor>>|
+                -> Result<Option<(Vec<f32>, Vec<f32>)>>
+            {
+                let Some((m, v)) = pair else {
+                    return Ok(None);
+                };
+                Ok(Some((
+                    self.backend.download_f32(m).map_err(|err| {
+                        backend_error("download DCNv4 Adam first moment for sidecar", err)
+                    })?,
+                    self.backend.download_f32(v).map_err(|err| {
+                        backend_error("download DCNv4 Adam second moment for sidecar", err)
+                    })?,
+                )))
+            };
+            host_state.weights = download_pair(&device_state.offset_weights)?;
+            host_adam_child(host_state, 0).biases = download_pair(&device_state.offset_biases)?;
+            host_state.biases = download_pair(&device_state.biases)?;
+            host_state.scales = download_pair(&device_state.scales)?;
+        }
         let host_entries: Vec<usize> = host_states
             .iter()
             .enumerate()
@@ -9486,6 +9527,7 @@ where
         self.adam_state = state;
         self.moe_adam_state = moe_state;
         self.eml_adam_state = eml_state;
+        self.dcnv4_adam_state = (0..self.network.layers.len()).map(|_| None).collect();
         self.adam_step = step;
         Ok(())
     }
@@ -17781,8 +17823,8 @@ where
         Ok(true)
     }
 
-    /// Apply DCNv4 Adam using native tensors while keeping host parameters and
-    /// the existing host-sidecar moment representation canonical.
+    /// Apply DCNv4 Adam using native tensors and retain moments on-device.
+    /// Parameters remain host-canonical; sidecar saves materialize moments.
     fn update_device_dcnv4_adam(
         &mut self,
         layer_index: usize,
@@ -17821,14 +17863,18 @@ where
             spec.size,
         ];
         let offset_bias_shape = [desc.geometry.offset_dim()];
-        let mut host_state = self
+        let host_state = self
             .host_adam_state
             .borrow()
             .get(layer_index)
             .cloned()
             .flatten()
             .unwrap_or_default();
-        let offset_bias_state = host_adam_child(&mut host_state, 0).biases.clone();
+        let device_state = self.dcnv4_adam_state[layer_index].clone();
+        let offset_bias_state = host_state
+            .children
+            .first()
+            .and_then(|child| child.biases.clone());
         let upload_pair = |pair: &Option<(Vec<f32>, Vec<f32>)>, shape: &[usize]| {
             let Some((m, v)) = pair else {
                 return Ok(None);
@@ -17848,10 +17894,26 @@ where
                     .map_err(|err| backend_error("upload DCNv4 Adam second moment", err))?,
             )))
         };
-        let mut offset_weight_moments = upload_pair(&host_state.weights, &offset_weight_shape)?;
-        let mut offset_bias_moments = upload_pair(&offset_bias_state, &offset_bias_shape)?;
-        let mut bias_moments = upload_pair(&host_state.biases, &bias_shape)?;
-        let mut scale_moments = upload_pair(&host_state.scales, &bias_shape)?;
+        let (
+            mut offset_weight_moments,
+            mut offset_bias_moments,
+            mut bias_moments,
+            mut scale_moments,
+        ) = if let Some(state) = device_state {
+            (
+                state.offset_weights,
+                state.offset_biases,
+                state.biases,
+                state.scales,
+            )
+        } else {
+            (
+                upload_pair(&host_state.weights, &offset_weight_shape)?,
+                upload_pair(&offset_bias_state, &offset_bias_shape)?,
+                upload_pair(&host_state.biases, &bias_shape)?,
+                upload_pair(&host_state.scales, &bias_shape)?,
+            )
+        };
         let offset_step = GpuOptimizerStep::Adam(AdamParams {
             lr: adam.lr * layer.train.learning_rate_scale * 0.01,
             ..adam
@@ -17948,21 +18010,6 @@ where
             .as_ref()
             .map(|value| download(value, "download DCNv4 Adam BN scales"))
             .transpose()?;
-        let download_pair =
-            |pair: &Option<GpuMoments<B::Tensor>>| -> Result<Option<(Vec<f32>, Vec<f32>)>> {
-                let Some((m, v)) = pair else {
-                    return Ok(None);
-                };
-                Ok(Some((
-                    download(m, "download DCNv4 Adam first moment")?,
-                    download(v, "download DCNv4 Adam second moment")?,
-                )))
-            };
-        host_state.weights = download_pair(&offset_weight_moments)?;
-        host_adam_child(&mut host_state, 0).biases = download_pair(&offset_bias_moments)?;
-        host_state.biases = download_pair(&bias_moments)?;
-        host_state.scales = download_pair(&scale_moments)?;
-
         let LayerParams::Dcnv4(params) = &mut self.params[layer_index] else {
             unreachable!("DCNv4 parameter metadata was validated above")
         };
@@ -17977,7 +18024,13 @@ where
                 )));
             }
         }
-        self.host_adam_state.borrow_mut()[layer_index] = Some(host_state);
+        self.dcnv4_adam_state[layer_index] = Some(GpuDcnv4AdamState {
+            offset_weights: offset_weight_moments,
+            offset_biases: offset_bias_moments,
+            biases: bias_moments,
+            scales: scale_moments,
+        });
+        self.host_adam_state.borrow_mut()[layer_index] = None;
         let mut buffers = self.device_dcnv4_train_buffers.borrow_mut();
         let slot = buffers
             .get_mut(layer_index)
