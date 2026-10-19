@@ -128,6 +128,7 @@ file is named inline.
 - [100. Explicit GPU rejection for GRU training](#100-explicit-gpu-rejection-for-gru-training)
 - [101. Region CPU forward and axis pin](#101-region-cpu-forward-and-axis-pin)
 - [102. Native GRU GPU inference](#102-native-gru-gpu-inference)
+- [103. Native RNN rolling-stat BN inference](#103-native-rnn-rolling-stat-bn-inference)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1705,6 +1706,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 102. Native GRU GPU inference
 
 - v0.2.079: added a native f32 GPU inference composition for `[gru]` using device connected projections, logistic gates, pointwise reset/update equations, sequence slicing and concatenation. Rolling-stat BN is folded into each projection's weights and bias; training remains explicitly rejected because no native backward/cache/update path exists. The actual Oxide tests `gru_native_inference_matches_cpu_for_multiple_steps` and `gru_native_inference_matches_cpu_with_rolling_batch_norm` compare outputs against Rust CPU, and `gru_gpu_training_path_is_rejected_as_unsupported_not_misconfigured` verifies the boundary. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gru` passed 3 tests; host axis tests passed 23. No C++ golden/parity, training parity, full-suite or performance claim.
+
+## 103. Native RNN rolling-stat BN inference
+
+- v0.2.080: native f32 RNN inference now dispatches through device recurrent projections even when batch normalization is enabled. Rolling-stat BN affine parameters are folded into each projection's weights/biases before upload, matching CPU inference. BN training continues on the existing host fallback because its batch-stat/cache semantics are separate. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain rnn` passed 6 tests, including `rnn_native_inference_matches_cpu_with_rolling_batch_norm` plus RNN/CRNN training regressions. Rust CPU reference parity only; no C++ golden, full-suite, or performance claim.
 
 ## Not implemented / open (pointer)
 

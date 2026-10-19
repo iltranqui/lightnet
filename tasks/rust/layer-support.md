@@ -100,7 +100,7 @@ with the command given rather than trusting the number.
 | `Crop` | yes | none | fwd | exact | rust | native inference + geometric training (no HSV/color jitter) | device (atomic scatter) | no |
 | `Local` | yes | C++ | fwd | exact | rust | native f32 / host (unsupported activation) | device / CPU fallback | no |
 | `Gru` | yes | Rust | fwd | none | rust | native f32 inference incl. rolling-stat BN | training unsupported (no backward path) | no |
-| `Rnn` | yes | C++ | fwd | exact | T3 | mixed (device w/o BN) | mixed | no |
+| `Rnn` | yes | C++ | fwd | exact | T3 | native f32 inference incl. rolling-stat BN; native training w/o BN | mixed (BN training fallback) | no |
 | `Lstm` | yes | C++ | fwd | exact | T3 | mixed (device w/o BN) | mixed | no |
 | `Crnn` | yes | C++ | fwd | exact | T3 | mixed (device w/o BN) | mixed | no |
 | `Moe` | alias | C++ | fwd | exact | pin | native | device | no |

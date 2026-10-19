@@ -1261,6 +1261,39 @@ fn chained_mismatched_shortcuts_match_cpu_backward() {
 }
 
 #[test]
+fn rnn_native_inference_matches_cpu_with_rolling_batch_norm() {
+    let net = network(
+        "[net]\ninputs=2\nbatch=2\ntime_steps=2\n[rnn]\nhidden=3\noutput=2\nactivation=tanh\nlogistic=1\nshortcut=1\nbatch_normalize=1\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let LayerParams::Rnn(params) = &mut cpu.params[0] else { panic!("expected RNN parameters"); };
+    for (block_index, block) in [
+        &mut params.input, &mut params.self_params, &mut params.output,
+    ].into_iter().enumerate() {
+        for (index, value) in block.weights.iter_mut().enumerate() {
+            *value = 0.01 * (1 + block_index + index) as f32;
+        }
+        for (index, value) in block.biases.iter_mut().enumerate() {
+            *value = -0.02 * (1 + block_index + index) as f32;
+        }
+        let bn = block.batch_norm.as_mut().expect("RNN BN state");
+        for channel in 0..bn.biases.len() {
+            bn.biases[channel] = 0.03 * (1 + channel) as f32;
+            bn.scales[channel] = 0.7 + 0.05 * channel as f32;
+            bn.rolling_mean[channel] = -0.04 * channel as f32;
+            bn.rolling_variance[channel] = 0.6 + 0.1 * channel as f32;
+        }
+    }
+    let input = patterned(cpu.network.net.input_shape());
+    let expected = cpu.forward(&input).expect("CPU RNN forward").final_output().expect("RNN output").clone();
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+    let gpu_forward = gpu.forward_with_state(&input).expect("native GPU RNN inference with BN");
+    let actual = gpu_forward.cpu_forward.final_output().expect("GPU RNN output");
+    close("native RNN BN inference", &expected.data, &actual.data, 4e-4);
+}
+
+#[test]
 fn batch_normalized_rnn_device_backward_matches_cpu_on_oxide() {
     let net = network(
         "[net]\ninputs=2\nbatch=2\ntime_steps=2\n\

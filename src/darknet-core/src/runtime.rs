@@ -14458,10 +14458,11 @@ where
                     }
                 }
                 (LayerKind::Rnn(spec), LayerParams::Rnn(recurrent)) => {
-                    if !spec.batch_normalize
-                        && recurrent.input.batch_norm.is_none()
-                        && recurrent.self_params.batch_norm.is_none()
-                        && recurrent.output.batch_norm.is_none()
+                    if !training
+                        || (!spec.batch_normalize
+                            && recurrent.input.batch_norm.is_none()
+                            && recurrent.self_params.batch_norm.is_none()
+                            && recurrent.output.batch_norm.is_none())
                     {
                         let (output, cache, device_cache) = forward_rnn_layer_device(
                             &self.backend,
@@ -28252,24 +28253,46 @@ where
         ));
     }
 
-    let input_weights = backend
-        .upload_f32(&[spec.hidden, inputs], &params.input.weights)
-        .map_err(|err| backend_error("upload RNN input weights", err))?;
-    let input_biases = backend
-        .upload_f32(&[spec.hidden], &params.input.biases)
-        .map_err(|err| backend_error("upload RNN input biases", err))?;
-    let self_weights = backend
-        .upload_f32(&[spec.hidden, spec.hidden], &params.self_params.weights)
-        .map_err(|err| backend_error("upload RNN recurrent weights", err))?;
-    let self_biases = backend
-        .upload_f32(&[spec.hidden], &params.self_params.biases)
-        .map_err(|err| backend_error("upload RNN recurrent biases", err))?;
-    let output_weights = backend
-        .upload_f32(&[spec.output, spec.hidden], &params.output.weights)
-        .map_err(|err| backend_error("upload RNN output weights", err))?;
-    let output_biases = backend
-        .upload_f32(&[spec.output], &params.output.biases)
-        .map_err(|err| backend_error("upload RNN output biases", err))?;
+    // Inference batch norm is a per-output affine, so fold rolling statistics
+    // into each recurrent projection before upload. The training BN path stays
+    // on the host because it uses batch statistics and a separate cache contract.
+    let upload_projection = |projection: &ConnectedParams,
+                             outputs: usize,
+                             projection_inputs: usize,
+                             name: &str|
+     -> Result<(B::Tensor, B::Tensor)> {
+        let (weights, biases) = if let Some(batch_norm) = &projection.batch_norm {
+            validate_batchnorm_params(batch_norm, outputs)?;
+            let mut weights = projection.weights.clone();
+            let mut biases = projection.biases.clone();
+            for output in 0..outputs {
+                let factor = batch_norm.scales[output]
+                    / (batch_norm.rolling_variance[output] + BATCH_NORM_EPSILON).sqrt();
+                for weight in
+                    &mut weights[output * projection_inputs..(output + 1) * projection_inputs]
+                {
+                    *weight *= factor;
+                }
+                biases[output] -= batch_norm.rolling_mean[output] * factor;
+            }
+            (weights, biases)
+        } else {
+            (projection.weights.clone(), projection.biases.clone())
+        };
+        let weights = backend
+            .upload_f32(&[outputs, projection_inputs], &weights)
+            .map_err(|err| backend_error(&format!("upload RNN {name} weights"), err))?;
+        let biases = backend
+            .upload_f32(&[outputs], &biases)
+            .map_err(|err| backend_error(&format!("upload RNN {name} biases"), err))?;
+        Ok((weights, biases))
+    };
+    let (input_weights, input_biases) =
+        upload_projection(&params.input, spec.hidden, inputs, "input")?;
+    let (self_weights, self_biases) =
+        upload_projection(&params.self_params, spec.hidden, spec.hidden, "recurrent")?;
+    let (output_weights, output_biases) =
+        upload_projection(&params.output, spec.output, spec.hidden, "output")?;
 
     let input_activation = gpu_activation_kind(layer_index, &spec.activation)?;
     let self_activation = match spec.logistic {
