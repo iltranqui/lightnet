@@ -45230,6 +45230,64 @@ activation=linear
     }
 
     #[test]
+    fn gpu_muon_standalone_batchnorm_matches_cpu_adamw_fallback() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "muon-bn.cfg",
+                concat!(
+                    "[net]\n",
+                    "width=2\nheight=2\nchannels=2\nbatch=1\n",
+                    "muon=1\ndecoupled_decay=1\ndecay=0.0005\n",
+                    "[batchnorm]\n",
+                ),
+            )
+            .expect("BatchNorm Muon cfg"),
+        )
+        .expect("BatchNorm Muon network");
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+        let (LayerParams::BatchNorm(cpu_params), LayerParams::BatchNorm(gpu_params)) =
+            (&mut cpu.params[0], &mut gpu.params[0])
+        else {
+            panic!("standalone BatchNorm parameters expected");
+        };
+        cpu_params.scales.copy_from_slice(&[1.2, 0.8]);
+        cpu_params.biases.copy_from_slice(&[0.2, -0.1]);
+        gpu_params.clone_from(cpu_params);
+        let (LayerTrainBuffers::BatchNorm(cpu_train), LayerTrainBuffers::BatchNorm(gpu_train)) =
+            (&mut cpu.train_buffers[0], &mut gpu.cpu_fallback_train_buffers.get_mut()[0])
+        else {
+            panic!("standalone BatchNorm train buffers expected");
+        };
+        cpu_train.scale_updates.copy_from_slice(&[0.2, -0.3]);
+        cpu_train.bias_updates.copy_from_slice(&[-0.1, 0.25]);
+        gpu_train.clone_from(cpu_train);
+
+        cpu.update_weights_muon(0.01, 1).expect("CPU Muon fallback");
+        gpu.update_weights_gpu(0.01, 0.9, network.net.decay, 1)
+            .expect("GPU Muon fallback");
+        let (LayerParams::BatchNorm(cpu_params), LayerParams::BatchNorm(gpu_params)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("standalone BatchNorm parameters expected after update");
+        };
+        assert_slice_close(
+            "GPU Muon BN scales",
+            &cpu_params.scales,
+            &gpu_params.scales,
+            1e-7,
+        );
+        assert_slice_close(
+            "GPU Muon BN biases",
+            &cpu_params.biases,
+            &gpu_params.biases,
+            1e-7,
+        );
+        assert_eq!(*gpu.host_adam_state.borrow(), cpu.host_adam_state);
+        assert_eq!(gpu.muon_state, cpu.muon_state);
+    }
+
+    #[test]
     fn gpu_muon_rejects_non_connected_parameter_families_before_updating() {
         let mut gpu = optimizer_net("muon=1\ndecoupled_decay=1");
         let before = gpu.params.clone();
