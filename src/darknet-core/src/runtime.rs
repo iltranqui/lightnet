@@ -10300,6 +10300,7 @@ where
                 (_, LayerParams::None)
                     | (LayerKind::BatchNorm(_), LayerParams::BatchNorm(_))
                     | (LayerKind::Connected(_), LayerParams::Connected(_))
+                    | (LayerKind::Vit(_), LayerParams::Vit(_))
                     | (
                         LayerKind::Deconvolutional(_),
                         LayerParams::Convolutional(_)
@@ -10308,7 +10309,7 @@ where
         }) {
             return Err(Error::UnsupportedLayer {
                 layer_index: index,
-                name: "GPU Muon runtime supports host-gradient deconvolutional matrices, connected matrices, and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
+                name: "GPU Muon runtime supports host-gradient ViT/deconvolutional/connected matrices and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
             });
         }
         let step = self.adam_step.checked_add(1).ok_or_else(|| {

@@ -3066,6 +3066,80 @@ fn deform_conv_device_path_matches_cpu_chain_and_updates() {
 }
 
 #[test]
+fn gpu_muon_vit_host_gradient_matrices_match_cpu_across_steps() {
+    let net = network(
+        "[net]\nwidth=2\nheight=2\nchannels=1\nbatch=1\nmuon=1\ndecoupled_decay=1\ndecay=0.0001\n\
+         [vit]\ndim=2\nheads=1\npatch_size=1\npatch_stride=1\nmlp_dim=2\nflash_attention=0\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    darknet_core::initialize_training_params(&net, &mut cpu.params, 41);
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("ViT train buffers");
+
+    for step in 1..=2 {
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu().expect("zero ViT buffers");
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).expect("CPU ViT forward");
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("Oxide ViT forward");
+        for (cpu_output, gpu_output) in cpu_forward
+            .layer_outputs
+            .iter()
+            .zip(&gpu_forward.cpu_forward.layer_outputs)
+        {
+            close(
+                &format!("ViT step {step} forward"),
+                &cpu_output.data,
+                &gpu_output.data,
+                3e-4,
+            );
+        }
+        let seed = Tensor::filled(cpu.network.layers[0].output_shape, 0.04 * step as f32);
+        let seeds = [Some(seed)];
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU ViT backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("Oxide ViT backward");
+        cpu.update_weights_muon(0.02, 1).expect("CPU ViT Muon update");
+        gpu.update_weights_gpu(0.02, 0.9, net.net.decay, 1)
+            .expect("GPU ViT Muon update");
+        let (LayerParams::Vit(cpu_vit), LayerParams::Vit(gpu_vit)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("ViT parameter layout expected");
+        };
+        for (name, cpu_values, gpu_values) in [
+            ("patch embedding", &cpu_vit.patch_embed, &gpu_vit.patch_embed),
+            ("QKV weights", &cpu_vit.qkv_weight, &gpu_vit.qkv_weight),
+            ("attention projection", &cpu_vit.wo, &gpu_vit.wo),
+            ("FFN first weights", &cpu_vit.ffn_w1, &gpu_vit.ffn_w1),
+            ("FFN second weights", &cpu_vit.ffn_w2, &gpu_vit.ffn_w2),
+            ("patch bias", &cpu_vit.patch_bias, &gpu_vit.patch_bias),
+            ("QKV bias", &cpu_vit.qkv_bias, &gpu_vit.qkv_bias),
+            ("attention bias", &cpu_vit.wo_bias, &gpu_vit.wo_bias),
+            ("FFN first bias", &cpu_vit.ffn_b1, &gpu_vit.ffn_b1),
+            ("FFN second bias", &cpu_vit.ffn_b2, &gpu_vit.ffn_b2),
+            ("LN1 gamma", &cpu_vit.ln1_gamma, &gpu_vit.ln1_gamma),
+            ("LN1 beta", &cpu_vit.ln1_beta, &gpu_vit.ln1_beta),
+            ("LN2 gamma", &cpu_vit.ln2_gamma, &gpu_vit.ln2_gamma),
+            ("LN2 beta", &cpu_vit.ln2_beta, &gpu_vit.ln2_beta),
+        ] {
+            close(
+                &format!("ViT {name} step {step}"),
+                gpu_values,
+                cpu_values,
+                1e-3,
+            );
+        }
+        assert_eq!(gpu_vit.pos_embed, cpu_vit.pos_embed);
+        assert_eq!(gpu_vit.mhc, cpu_vit.mhc);
+    }
+}
+
+#[test]
 fn gpu_muon_connected_two_step_update_matches_cpu() {
     let net = network(
         "[net]\nwidth=2\nheight=1\nchannels=1\nbatch=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0005\nloss_scale=8\n\
