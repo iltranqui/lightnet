@@ -119,6 +119,7 @@ file is named inline.
 - [91. Hybrid GPU Muon for non-BN GraphConv matrices](#91-hybrid-gpu-muon-for-non-bn-graphconv-matrices)
 - [92. GraphConv GPU Muon DNOPT6 sidecar resume](#92-graphconv-gpu-muon-dnopt6-sidecar-resume)
 - [93. GraphConv GPU Muon update gate](#93-graphconv-gpu-muon-update-gate)
+- [94. Grouped GraphConv GPU Muon parity](#94-grouped-graphconv-gpu-muon-parity)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1660,6 +1661,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 93. GraphConv GPU Muon update gate
 
 - v0.2.071 (`9aaa30fb`): added actual-Oxide CPU parity for GraphConv Muon with `dont_update=1`. The test runs forward/backward, confirms CPU and Oxide outputs agree, verifies all GraphConv parameters remain unchanged after the gated optimizer call, and confirms the global optimizer step advances. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_graph_conv_dont_update_gate_preserves_parameters` passed 1 test. This covers only the no-BN learned-edge+self variant; other per-layer gates/configurations remain unverified. No compiled-C++ golden/full-suite/performance claim.
+
+## 94. Grouped GraphConv GPU Muon parity
+
+- v0.2.072 (`543d57e0`): strengthened actual-Oxide GraphConv Muon coverage to `groups=2` for learned-edge+self with batch normalization disabled. Two optimizer updates, DNOPT6 save/load, and a resumed third update match CPU for projection/self/edge matrices and biases. The focused test passes: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_graph_conv_matrices_match_cpu_across_steps` (1 test). This pins tested grouped parameter slicing and sidecar continuation, not all GraphConv variants; no compiled-C++ golden/full-suite/performance claim.
 
 ## Not implemented / open (pointer)
 
