@@ -45440,6 +45440,58 @@ activation=linear
     }
 
     #[test]
+    fn gpu_muon_respects_layer_update_gate_without_advancing_layer_state() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "muon-gate.cfg",
+                concat!(
+                    "[net]\n",
+                    "width=2\nheight=1\nchannels=1\nbatch=1\nmuon=1\ndecoupled_decay=1\n",
+                    "[connected]\noutput=2\ndont_update=1\n",
+                ),
+            )
+            .expect("Muon gate cfg"),
+        )
+        .expect("Muon gate network");
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+        if let (LayerParams::Connected(cpu_params), LayerParams::Connected(gpu_params)) =
+            (&mut cpu.params[0], &mut gpu.params[0])
+        {
+            cpu_params.weights.copy_from_slice(&[0.2, -0.1, 0.3, 0.4]);
+            cpu_params.biases.copy_from_slice(&[0.03, -0.02]);
+            gpu_params.clone_from(cpu_params);
+        } else {
+            panic!("connected parameters expected");
+        }
+        if let (
+            LayerTrainBuffers::Connected(cpu_train),
+            LayerTrainBuffers::Connected(gpu_train),
+        ) = (
+            &mut cpu.train_buffers[0],
+            &mut gpu.cpu_fallback_train_buffers.get_mut()[0],
+        ) {
+            cpu_train.weight_updates.fill(0.5);
+            cpu_train.bias_updates.fill(-0.25);
+            gpu_train.clone_from(cpu_train);
+        } else {
+            panic!("connected train buffers expected");
+        }
+        let before = cpu.params.clone();
+        cpu.update_weights_muon(0.01, 1).expect("CPU gated Muon");
+        gpu.update_weights_gpu(0.01, 0.9, network.net.decay, 1)
+            .expect("GPU gated Muon");
+        assert_eq!(cpu.params, before);
+        assert_eq!(gpu.params, before);
+        assert_eq!(cpu.adam_step(), 1);
+        assert_eq!(gpu.adam_step(), 1);
+        assert!(cpu.muon_state.iter().all(Option::is_none));
+        assert!(gpu.muon_state.iter().all(Option::is_none));
+        assert!(cpu.host_adam_state.iter().all(Option::is_none));
+        assert!(gpu.host_adam_state.borrow().iter().all(Option::is_none));
+    }
+
+    #[test]
     fn gpu_muon_rejects_non_connected_parameter_families_before_updating() {
         let mut gpu = optimizer_net("muon=1\ndecoupled_decay=1");
         let before = gpu.params.clone();
