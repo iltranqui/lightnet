@@ -81,6 +81,7 @@ file is named inline.
 - [53. Extend native DCNv4 kernel bound to 7x7](#53-extend-native-dcnv4-kernel-bound-to-7x7)
 - [54. DCNv4 7x7 runtime optimizer parity](#54-dcnv4-7x7-runtime-optimizer-parity)
 - [55. Extend native DCNv4 runtime through 9x9](#55-extend-native-dcnv4-runtime-through-9x9)
+- [56. Extend native DCNv4 runtime through 11x11](#56-extend-native-dcnv4-runtime-through-11x11)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1453,6 +1454,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 55. Extend native DCNv4 runtime through 9x9
 
 - v0.2.018 (`613b243e`): enlarged the fixed native mask buffer and runtime gate from 49 to 81 points. A 9x9 case now passes real-GPU native composition parity against CPU outputs and all math gradients, plus two-step runtime SGD/Adam parity with BN on/off. The over-limit host-fallback fixture now uses 11x11. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain -- native_composition_matches_real_cpu_outputs_and_all_math_gradients` passed; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed; `MEM=3G ./tools/test_host.sh dcnv4` passed 28 core tests. >81 points and unsupported activations remain fallback; no performance or compiled-C++ parity claim.
+
+## 56. Extend native DCNv4 runtime through 11x11
+
+- v0.2.019 (`76242245`): enlarged the native fixed mask capacity/runtime gate from 81 to 121 active points. 11x11 real-GPU composition matches CPU output and all math gradients; runtime two-step SGD/Adam parity passes with BN on/off, and the >121 host-fallback fixture uses 13x13. Gates: focused `oxide_dcnv4_chain` composition test passed, `oxide_runtime_chain` DCNv4 optimizer test passed (~186 s), and `MEM=3G ./tools/test_host.sh dcnv4` passed 28 core tests. No compiled-C++ or performance claim; >121/unsupported variants remain host fallback.
 
 ## Not implemented / open (pointer)
 

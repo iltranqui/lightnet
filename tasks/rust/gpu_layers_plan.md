@@ -31,7 +31,7 @@ inference (v0.2.001–002). Act-head features/exact-erf primitives are native f3
 Evidence/limits are in `implemented.md` §§41–45. Do not repeat these ports.
 Act-head uses four uncached weight uploads per forward; no residency/speedup
 claim. Runtime backward still uses CPU, act params remain frozen, f16 rejected.
-Latest GPU slice is v0.2.018 (`613b243e`): DCNv4 native aggregation/composition/runtime supports through 9x9/81 active points, with two-step SGD/Adam CPU parity and BN on/off (implemented.md §55); >81 remains host fallback. v0.2.017 (`8a3ef3b0`) added equivalent runtime parity at 7x7 (§54), and v0.2.016 (`a96d6d95`) expanded the kernel/runtime bound to 49 points (§53). v0.2.015 added NormalizeChannels* activations/adjoints (§52). Previous, v0.2.014: DCNv4 native rolling-stat BN affine/adjoint plus
+Latest GPU slice is v0.2.019 (`76242245`): DCNv4 native aggregation/composition/runtime supports through 11x11/121 active points, with two-step SGD/Adam CPU parity and BN on/off (implemented.md §56); >121 remains host fallback. v0.2.018 (`613b243e`) extended support through 9x9/81 (§55). v0.2.017 (`8a3ef3b0`) added equivalent runtime parity at 7x7 (§54), and v0.2.016 (`a96d6d95`) expanded the kernel/runtime bound to 49 points (§53). v0.2.015 added NormalizeChannels* activations/adjoints (§52). Previous, v0.2.014: DCNv4 native rolling-stat BN affine/adjoint plus
 post-backward 0.9 EMA, including unseeded layers. Eligible math (<=49 active
 points, supported elementwise activation, no other fallback/host-only deform_conv)
 is native with BN off/on; ignored ordinary bias/beta and update gates preserved.
