@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.037 (`281cdc7c`): deconvolutional GPU Muon eligibility uses Oxide Newton–Schulz with host fallback gradients/state/update; actual-GPU two-step CPU parity and host rejection regression passed. This is not native deconvolution forward/backward. See `implemented.md` §69.
 - v0.2.036 (`86b2fbda`): actual-GPU two-layer `dont_update` gate test passed against CPU across two updates. Other gate variants, connected BN and eligible families remain open. See `implemented.md` §69.
 - v0.2.035 (`cc0c00c1`): actual-GPU CPU parity passed for two connected Muon layers across two steps; FakeBackend `dont_update=1` gate test also passed. GPU-Muon host filter 4 tests and Muon regression filter 25 passed. Other eligible families and actual-device gate coverage remained open. See `implemented.md` §69.
 - v0.2.034 (`f27b370c`): connected GPU Muon now uses native device momentum/lookahead and final direction+decay application, with momentum tensors cached between steps; host mirrors remain for DNOPT6 and weights stay host-canonical. Native `oxide_muon` 3 tests, host `darknet-cuda` Muon 4, GPU-Muon host filter 3, Muon regression filter 24, and actual-GPU connected two-step/resume parity 1 passed. Other eligible families remain unsupported. See `implemented.md` §69; no C++ golden/full-suite claim.
