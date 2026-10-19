@@ -139,6 +139,7 @@ file is named inline.
 - [111. AvgPool axis/layout contract pin](#111-avgpool-axislayout-contract-pin)
 - [112. LocalAvgPool axis/layout contract pin](#112-localavgpool-axislayout-contract-pin)
 - [113. Native f16 maxpool_depth inference](#113-native-f16-maxpool_depth-inference)
+- [114. Connected axis/layout contract pin](#114-connected-axislayout-contract-pin)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1760,6 +1761,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 113. Native f16 `maxpool_depth` inference
 
 - v0.2.087: extended compact Oxide f16 inference for `[maxpool] maxpool_depth=1` with a native half-storage kernel. The channel-group scan widens for comparisons, retains the first channel on ties, and stores the selected half bits without an unnecessary round trip. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed 7 tests; the new depth case matches compact f32 within the suite's 4e-3 tolerance (measured relative max error 2.488e-4). The f32 depth path and backend shape guards remain intact. No f16 training/backward or C++ golden claim.
+
+## 114. Connected axis/layout contract pin
+
+- v0.1.031: added a named non-square B=2 Connected test with C=2, H=2, W=3 and hand-set `[out][in]` weights. Hand-computed forward sentinels pin flattened NCHW features and batch-major output rows; a supplied seed pins the exact input adjoint per independent sample. Updated the exhaustive axis registry/ledger to 24 pinned and 36 open C++-backed variants. `MEM=3G ./tools/test_host.sh axis_layout` passed 27 tests; `MEM=3G ./tools/test_host.sh every_layer_kind_has_an_axis_pin_decision` passed. Hand-derived from `Jev_laya:src-lib/connected_layer.cpp:186`; no compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 

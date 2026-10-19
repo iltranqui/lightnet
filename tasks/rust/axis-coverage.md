@@ -9,17 +9,17 @@ Measured 2026-10-18 against `model.rs` (65 represented variants plus
 `Unsupported`), `Jev_laya:src-lib/darknet_enums.hpp` and the `depth_3d`
 YOLO-3D source. Represented does not imply a complete layer port:
 
-- **23 variants pinned by 25 named tests** (`*axis_layout*`); the extra
+- **24 variants pinned by 27 named tests** (`*axis_layout*`); the extra
   tests are Swin's second axis (`cyclic_shift`) and the two convolutional
   pins (shape and forward).
-- **37 C++-backed variants open** (34 on `Jev_laya`, plus `Logistic` on
+- **36 C++-backed variants open** (33 on `Jev_laya`, plus `Logistic` on
   `raptor`, `Regression` on `fog`, and the partial `Yolo3d` on `depth_3d`).
 - **5 Rust-only extensions** with no C++ layer type to anchor against.
 - **4 layer ports incomplete/partial**: `Yolo3d` has only its raw runtime and
   label/config helpers; Region truth-loss/decode is absent; `Dcnv3` and
   `DetrDecoder` have no variants.
 
-23 + 37 + 5 = 65 represented variants; `Unsupported` is a separate sentinel.
+24 + 36 + 5 = 65 represented variants; `Unsupported` is a separate sentinel.
 `Yolo3d` remains open: identity/seed/checkpoint tests are not a decode-axis pin.
 
 Evidence rule for every row and every new test: **hand-derived from source, no
@@ -31,7 +31,7 @@ compiled-C++ golden**. Do not write "C++ parity".
 - [Axis classes](#axis-classes)
 - [Fixture rules](#fixture-rules)
 - [Summary](#summary)
-- [Pinned variants (23)](#pinned-variants-23)
+- [Pinned variants (24)](#pinned-variants-24)
 - [Open: Tier 1, shape and geometry](#open-tier-1-shape-and-geometry)
 - [Open: Tier 2, heads and losses](#open-tier-2-heads-and-losses)
 - [Open: Tier 3, sequence and recurrent](#open-tier-3-sequence-and-recurrent)
@@ -98,25 +98,26 @@ classes that apply.
 
 | Status | Count | Notes |
 |---|---|---|
-| Pinned | 23 variants / 25 tests | transformer, LAYA, MoE/EML, DCNv4, DPT, conv, maxpool/avgpool, localavgpool, slice/shortcut/deconv |
-| Open, Tier 1 | 11 | route, upsample, reorg, shuffle, scale, connected, softmax, dropout, sam, cost, recursive block |
+| Pinned | 24 variants / 27 tests | transformer, LAYA, MoE/EML, DCNv4, DPT, conv/connected, maxpool/avgpool, localavgpool, slice/shortcut/deconv |
+| Open, Tier 1 | 10 | route, upsample, reorg, shuffle, scale, softmax, dropout, sam, cost, recursive block |
 | Open, Tier 2 | 15 | yolo family including partial yolo_3d, modern heads, OBB, losses, segmentation, contrastive, logistic, regression |
 | Open, Tier 3 | 3 | rnn, lstm, crnn |
 | Open, Tier 4 | 8 | deform_conv, dsconv, graph_conv, wmhf, clifford, hf, foveation_film, depth_anything |
 | Rust-only | 5 | no C++ layer type; pin Rust's own contract |
 | Ports incomplete/partial | 4 | Region truth-loss/decode; yolo_3d partial; dcnv3 and detr_decoder blocked |
 
-`axis_layout` baseline after the GRU Rust-contract and MaxPool/AvgPool/LocalAvgPool pins:
-**26 passed, 945 filtered out** (971 lib tests; run under `MEM=3G`). Every tier below grows
+`axis_layout` baseline after the GRU Rust-contract and MaxPool/AvgPool/LocalAvgPool/Connected pins:
+**27 passed, 945 filtered out** (972 lib tests; run under `MEM=3G`). Every tier below grows
 that count; it must never shrink.
 
-## Pinned variants (23)
+## Pinned variants (24)
 
 | Variant | C++ reference | Axis classes | Pinning test |
 |---|---|---|---|
 | `Convolutional` | `Jev_laya:src-lib/convolutional_layer.cpp:1615`, extent from `convolutional_out_width` at `:317` | geometry, layout, weights, batch | `model.rs` `convolutional_axis_layout_pins_dilated_extent_and_groups`; `runtime.rs` `convolutional_axis_layout_keeps_nchw_and_group_partitions` |
 | `ChannelSlice` | `Jev_laya:src-lib/channel_slice_layer.cpp:95` | layout, concat, batch | `channel_slice.rs:65` `slice_axis_layout_preserves_batch_channel_and_spatial_order` |
 | `Deconvolutional` | `Jev_laya:src-lib/deconvolutional_layer.cpp:154` | layout, weights, batch | `deconvolutional.rs:120` `deconvolutional_axis_layout_maps_input_channels_to_filters_and_batch` |
+| `Connected` | `Jev_laya:src-lib/connected_layer.cpp:186` | weights, layout, batch | `runtime.rs` `connected_axis_layout_keeps_batch_rows_and_output_weight_axes` |
 | `MaxPool` | `Jev_laya:src-lib/maxpool_layer.cpp:309,327` | geometry, reduce, layout, batch | `runtime.rs` `maxpool_axis_layout_pins_depth_channel_batch_and_spatial_order` |
 | `AvgPool` | `Jev_laya:src-lib/avgpool_layer.cpp:51` | reduce, layout, batch | `runtime.rs` `avgpool_axis_layout_reduces_spatial_per_channel_and_batch` |
 | `LocalAvgPool` | `Jev_laya:src-lib/maxpool_layer.cpp:440` | geometry, reduce, layout, batch | `runtime.rs` `local_avgpool_axis_layout_pins_window_and_batch_order` |
@@ -150,7 +151,6 @@ silently changes a downstream `route`/`shortcut`.
 | `Reorg` | `reorg`, `reorg3d` | `reorg_layer.cpp:95` | layout | `(c,h,w)` to `(c*s*s, h/s, w/s)` index order with `s=2`, `H != W` |
 | `ChannelShuffle` | `channel_shuffle` | `channel_shuffle_layer.cpp:95` | layout | group-interleave order, `C` not divisible edge cases rejected |
 | `ScaleChannels` | `scale_channels` | `scale_channels_layer.cpp:73` | layout, concat | broadcast vs crop/pad slot math against a named source layer |
-| `Connected` | `conn`, `connected` | `connected_layer.cpp:186` | weights, layout, batch | weight matrix is `[out][in]` per batch row; `batch=2` rows independent |
 | `Softmax` | `soft`, `softmax` | `softmax_layer.cpp:59` | reduce | `groups` reduction spans `C/groups` per group, not the whole sample |
 | `Dropout` | `dropout` | `dropout_layer.cpp:87` | layout, batch | per-sample mask (no shared mask across batch); inference is identity; DropBlock spatial mask |
 | `Sam` | `sam` | `sam_layer.cpp:69` | layout | element-wise multiply over the full `C*H*W` block |
