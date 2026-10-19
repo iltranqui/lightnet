@@ -126,6 +126,7 @@ file is named inline.
 - [98. Native Crop training geometry](#98-native-crop-training-geometry)
 - [99. DCNv4 mixed-network backward validation](#99-dcnv4-mixed-network-backward-validation)
 - [100. Explicit GPU rejection for GRU](#100-explicit-gpu-rejection-for-gru)
+- [101. Region CPU forward and axis pin](#101-region-cpu-forward-and-axis-pin)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1695,6 +1696,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 100. Explicit GPU rejection for GRU
 
 - v0.2.078 (`57b00348`): added an explicit `UnsupportedLayer` GPU error for `[gru]`, replacing the misleading catch-all parameter/config mismatch. The focused Oxide test `gru_gpu_path_is_rejected_as_unsupported_not_misconfigured` passes. No GRU GPU implementation was added; it remains an open native-GPU requirement. This is error-surface coverage only, not parity/completion evidence.
+
+## 101. Region CPU forward and axis pin
+
+- v0.1.027: hand-ported the CPU portion of `Jev_laya:src-lib/region_layer.cpp:209-235`: C++ `flatten` layout (`blas.cpp:104`), objectness logistic, optional class softmax, and the exact supplied-seed adjoint. `[region] softmax` is parsed and input channels are validated against `num * (coords + classes + 1)`. Named non-square, batch-2 axis test `region_axis_layout_matches_cpp_flatten_objectness_and_classes` checks outputs and adjoints. `MEM=3G ./tools/test_host.sh axis_layout` passed 22 tests; `every_layer_kind_has_an_axis_pin_decision` passed; all 12 cfgs containing `[region]` passed isolated parse/construct/CPU-inference runs. GPU full/compact inference now rejects explicitly; Oxide rejection test passes. Truth-driven Region loss/decode, GPU kernels, and compiled-C++ golden remain open; source-derived, no compiled-C++ parity claim.
 
 ## Not implemented / open (pointer)
 

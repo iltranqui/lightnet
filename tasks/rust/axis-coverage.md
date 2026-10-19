@@ -9,16 +9,17 @@ Measured 2026-10-18 against `model.rs` (65 represented variants plus
 `Unsupported`), `Jev_laya:src-lib/darknet_enums.hpp` and the `depth_3d`
 YOLO-3D source. Represented does not imply a complete layer port:
 
-- **19 variants pinned by 21 named tests** (`*axis_layout*`); the extra
+- **20 variants pinned by 22 named tests** (`*axis_layout*`); the extra
   tests are Swin's second axis (`cyclic_shift`) and the two convolutional
   pins (shape and forward).
-- **41 C++-backed variants open** (38 on `Jev_laya`, plus `Logistic` on
+- **40 C++-backed variants open** (37 on `Jev_laya`, plus `Logistic` on
   `raptor`, `Regression` on `fog`, and the partial `Yolo3d` on `depth_3d`).
 - **5 Rust-only extensions** with no C++ layer type to anchor against.
-- **3 layer ports incomplete**: `Yolo3d` is represented but only its raw
-  runtime and label/config helpers exist; `Dcnv3` and `DetrDecoder` have no variants.
+- **4 layer ports incomplete/partial**: `Yolo3d` has only its raw runtime and
+  label/config helpers; Region truth-loss/decode is absent; `Dcnv3` and
+  `DetrDecoder` have no variants.
 
-19 + 41 + 5 = 65 represented variants; `Unsupported` is a separate sentinel.
+20 + 40 + 5 = 65 represented variants; `Unsupported` is a separate sentinel.
 `Yolo3d` remains open: identity/seed/checkpoint tests are not a decode-axis pin.
 
 Evidence rule for every row and every new test: **hand-derived from source, no
@@ -30,13 +31,13 @@ compiled-C++ golden**. Do not write "C++ parity".
 - [Axis classes](#axis-classes)
 - [Fixture rules](#fixture-rules)
 - [Summary](#summary)
-- [Pinned variants (19)](#pinned-variants-19)
+- [Pinned variants (20)](#pinned-variants-20)
 - [Open: Tier 1, shape and geometry](#open-tier-1-shape-and-geometry)
 - [Open: Tier 2, heads and losses](#open-tier-2-heads-and-losses)
 - [Open: Tier 3, sequence and recurrent](#open-tier-3-sequence-and-recurrent)
 - [Open: Tier 4, recent CPU ports](#open-tier-4-recent-cpu-ports)
 - [Rust-only extensions (5)](#rust-only-extensions-5)
-- [Not complete (3)](#not-complete-3)
+- [Not complete (4)](#not-complete-4)
 - [Weights axis](#weights-axis)
 - [Findings](#findings)
 - [Adding a pin](#adding-a-pin)
@@ -97,19 +98,19 @@ classes that apply.
 
 | Status | Count | Notes |
 |---|---|---|
-| Pinned | 19 variants / 21 tests | transformer, LAYA, MoE/EML, DCNv4, DPT, conv, slice/shortcut/deconv |
+| Pinned | 20 variants / 22 tests | transformer, LAYA, MoE/EML, DCNv4, DPT, conv, slice/shortcut/deconv |
 | Open, Tier 1 | 14 | pool, route, upsample, reorg, shuffle, scale, connected, softmax, dropout, sam, cost, recursive block |
-| Open, Tier 2 | 16 | yolo family including partial yolo_3d, modern heads, OBB, losses, segmentation, contrastive, logistic, regression |
+| Open, Tier 2 | 15 | yolo family including partial yolo_3d, modern heads, OBB, losses, segmentation, contrastive, logistic, regression |
 | Open, Tier 3 | 3 | rnn, lstm, crnn |
 | Open, Tier 4 | 8 | deform_conv, dsconv, graph_conv, wmhf, clifford, hf, foveation_film, depth_anything |
 | Rust-only | 5 | no C++ layer type; pin Rust's own contract |
-| Ports incomplete (overlaps represented Yolo3d) | 3 | yolo_3d raw runtime only; dcnv3, detr_decoder blocked |
+| Ports incomplete/partial | 4 | Region truth-loss/decode; yolo_3d partial; dcnv3 and detr_decoder blocked |
 
-`axis_layout` baseline: **21 passed, 876 filtered out** (897 lib tests), run
-2026-10-18 on `051021fe` under `MEM=3G`. Every tier below grows that count; it
+`axis_layout` baseline after the Region pin: **22 passed, 945 filtered out**
+(967 lib tests), run under `MEM=3G`. Every tier below grows that count; it
 must never shrink.
 
-## Pinned variants (19)
+## Pinned variants (20)
 
 | Variant | C++ reference | Axis classes | Pinning test |
 |---|---|---|---|
@@ -132,6 +133,7 @@ must never shrink.
 | `LayaActHead` | `Jev_laya:src-lib/laya_act_head_layer.cpp:223` | layout, batch | `laya_act_head.rs:547` `act_head_axis_layout_is_batch_major_over_the_two_layer_mlp` |
 | `LayaScorer` | `Jev_laya:src-lib/laya_scorer_layer.cpp:262` (`sc_forward_impl`) | reduce, batch | `laya_scorer.rs:575` `scorer_axis_layout_keeps_batches_channels_and_options_independent` |
 | `LayaLoss` | `Jev_laya:src-lib/laya_loss_layer.cpp:296` (`loss_forward_host`) | batch, reduce | `laya_loss.rs:459` `loss_axis_layout_excludes_padding_rows_from_batch_mean` |
+| `Region` | `Jev_laya:src-lib/region_layer.cpp:209`, `blas.cpp::flatten:104` | head, layout, batch | `runtime.rs` `region_axis_layout_matches_cpp_flatten_objectness_and_classes` |
 
 ## Open: Tier 1, shape and geometry
 
@@ -165,7 +167,6 @@ than failing. Pins here are the highest-value per test.
 | `Yolo3d` | `yolo_3d`, `yolo3d`, `cuboid`, `cuboid_yolo` | `depth_3d@9c9e0b4b:src-lib/yolo_3d.cpp:102-109,1679-1755` | head, layout, batch | raw runtime exists; pin anchor/entry/vertex indexing together with decode; metric channels pending |
 | `Yolo` | `yolo` | `yolo_layer.cpp:957` | head, layout, batch | anchor-major vs entry-major output; `mask` order; cell `(y,x)` iteration; class offset per anchor; `batch=2` |
 | `GaussianYolo` | `gaussian_yolo` | `gaussian_yolo_layer.cpp:505` | head, layout | 4 extra mean/variance channels interleaved per entry |
-| `Region` | `region` | `region_layer.cpp:209` | head, layout | parsed as identity today: pin the passthrough and record that decode/loss are unimplemented |
 | `Yolox` | `yolox` | `src-lib/yolox_layer.cpp` via `modern_yolo_layer.cpp:395` | head, layout | class/obj/box channel split; grid `(y,x)` order; `batch=2` |
 | `Ppyoloe` | `ppyoloe` | `src-lib/ppyoloe_layer.cpp` via `modern_yolo_layer.cpp` | head, layout | DFL bin axis (`4*(reg_max+1)`) ordering; TAL/grid index order |
 | `Yolonas` | `yolonas` | `src-lib/yolonas_layer.cpp` via `modern_yolo_layer.cpp` | head, layout | per-level channel layout and decode order |
@@ -217,10 +218,11 @@ anchor against. Pin Rust's own documented contract and label the row
 | `BatchNorm` | `batchnorm` | `Jev_laya:src-lib/batchnorm_layer.cpp` exists but has no `ELayerType` | channel-axis reduction; `(C)` scale/beta order |
 | `Detection` | `detection` | none | identity passthrough preserves layout |
 
-## Not complete (3)
+## Not complete (4)
 
 | Variant | Reference | Status |
 |---|---|---|
+| `Region` | `Jev_laya:src-lib/region_layer.cpp:209-235,256-390` | CPU flatten/objectness/softmax and seeded adjoint are implemented; truth-driven loss/decode and GPU path remain open |
 | `Yolo3d` | `depth_3d@9c9e0b4b:src-lib/yolo_3d.cpp:1356` | config/labels plus raw runtime only in v0.1.024–026; loss/decode/evaluator and A2 axis DoD remain in `yolo_3d_plan.md` |
 | `Dcnv3` | `dcnv3_layer.cpp:199` | blocked: stubs in all five branches |
 | `DetrDecoder` | `detr_decoder_layer.cpp:479` | blocked: C++ broken |

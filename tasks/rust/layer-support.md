@@ -66,14 +66,14 @@ with the command given rather than trusting the number.
 | Represented `LayerKind` variants | 65 (+`Unsupported`) |
 | CPU forward arm | 65 |
 | CPU standalone parameter backward | all parameterized kinds; head/pass-through kinds own no standalone backward |
-| CPU-only forward, no GPU path (hard reject) | 10 |
+| CPU-only forward, no GPU path (hard reject) | 12 |
 | GPU forward but CPU/mixed backward | 9 |
 | GPU native forward + device backward | 23 |
 | f16 inference | 11 variants (12 section names) |
-| Axis pinned | 19 variants / 21 tests |
-| Axis open | 41 (Tier 1: 14, Tier 2: 16, Tier 3: 3, Tier 4: 8) |
+| Axis pinned | 20 variants / 22 tests |
+| Axis open | 40 (Tier 1: 14, Tier 2: 15, Tier 3: 3, Tier 4: 8) |
 | Axis Rust-only | 5 |
-| Incomplete CPU port | 1 (`Yolo3d`); blocked: `Dcnv3`, `DetrDecoder` |
+| Partial/incomplete CPU layers | `Region`, `Detection`, `Yolo3d`; blocked: `Dcnv3`, `DetrDecoder` |
 | GPU Muon | partial hybrid integration: connected matrices use native Oxide momentum/lookahead, Newton–Schulz and direction+decay update; standard non-BN convolution, non-BN EML branches, non-BN MoE router/expert matrices, non-BN GraphConv projection/self/learned-edge matrices with `groups=2` parity, tested `dont_update` gating, and DNOPT6 save/load resume; BN GraphConv forward/backward is native for eligible modes, with rolling stats host-synchronized; Muon state/final updates remain host-managed, non-BN DCNv4 offset projection, non-BN deform_conv main/offset/optional mask matrices, local per-location, RNN, LSTM, deconvolutional, and transformer-family matrices use native Oxide Newton–Schulz with host-managed state/final updates. Convolution/EML/MoE/DCNv4 gradients are downloaded at optimizer boundaries; deform_conv gradients download during native backward. Updated convolution/expert parameters are re-uploaded and DCNv4 snapshots trigger cache refresh on the next forward. BN convolution/EML/MoE/DCNv4/deform_conv remain rejected; GraphConv BN training is native only for eligible edge modes/activations. Connected momentum is cached between steps but mirrored to host each update; weights remain host-canonical. Standalone BatchNorm uses host AdamW fallback; other parameter families open |
 
 ## Matrix
@@ -134,7 +134,7 @@ with the command given rather than trusting the number.
 | `Logistic` | yes | none | head | head | T2 | native | head | no |
 | `Regression` | yes | none | pass | pass | T2 | pass | pass | no |
 | `Cost` | yes | none | pass + head | head | T1 | pass | pass | no |
-| `Region` | yes | none (C++ has block) | pass | pass | T2 | pass | pass | no |
+| `Region` | yes | none (C++ has block) | flatten + objectness logistic/optional softmax | exact supplied-seed adjoint | pin | none (`UnsupportedLayer`) | none | no |
 | `Detection` | yes | none | pass | pass | rust | pass | pass | no |
 | `Yolo` | yes | none | pass | head | T2 | pass | head | yes |
 | `GaussianYolo` | alias | none | pass | head | T2 | pass | head | yes |
@@ -149,7 +149,7 @@ with the command given rather than trusting the number.
 
 ## GPU hard rejections (no device path at all)
 
-Eleven variants abort before any kernel runs. Source: the explicit rejection
+Twelve variants abort before any kernel runs. Source: the explicit rejection
 paths in `runtime.rs` (including the `Gru` match arm).
 
 | Variant | Rejection message | Why it exists | Work item |
@@ -165,6 +165,7 @@ paths in `runtime.rs` (including the `Gru` match arm).
 | `Yolo3d` | same | raw CPU forward only; loss/decode absent | CPU first, then GPU |
 | `ObbRefine` (CARPN) | `GPU inference is not implemented` / `GPU CARPN training is unsupported` | CPU inference only; Stage-2 training deferred | after CARPN CPU training |
 | `Gru` | `UnsupportedLayer` | No GPU forward/backward path is implemented | recurrent wave |
+| `Region` | `UnsupportedLayer` | Native GPU flatten/objectness/class path is not implemented | detection-head wave |
 
 `Local` has a bounded native f32 forward/backward path since
 v0.2.048; its optimizer remains host-staged and unsupported activations retain
@@ -273,17 +274,18 @@ f16 convolution dgrad/wgrad are implemented there.
 
 ## CPU-only gaps (Stage 1)
 
-Only one layer port is genuinely incomplete; the rest are variants or
-non-layer work.
+Several CPU layer paths remain partial; the rest of the listed gaps are
+variants or non-layer work.
 
 | Item | Detail | Owner |
 |---|---|---|
 | `Yolo3d` | raw forward + label/config helpers + supplied-seed optimizer tests exist; projected math/assignments/loss derivatives, mixed training APIs, decode/evaluator, A2 axis pin, depth/metric consumption do not | `yolo_3d_plan.md` |
 | `DsConv` multi-template `morph=0/1` | executable C++ averages views with training-time view dropout; Rust rejects it; C++ CPU backward is itself a stub | needs its own plan |
-| `Region` / `Detection` | parsed as identity; C++ decode + loss unimplemented in Rust | needs its own plan |
+| `Region` | CPU C++-style flatten/objectness/optional softmax and supplied-seed adjoint are implemented; truth-driven loss/decode and GPU path remain open | detection-head wave |
+| `Detection` | parsed as identity; C++ decode + loss unimplemented in Rust | needs its own plan |
 | `Contrastive` detection branch | needs the yolo head's per-box class ids; `YoloHeadOutput` carries only the raw tensor | blocked on a head-metadata change |
 | CARPN Stage-2 training | `[obb_refine]` inference only; blocks `detector train -map` for CARPN | after `carpn_network_map_plan.md` |
-| Axis pins | 41 open variants (`T1`–`T4`) plus a per-backlog A2 test | `axis-coverage.md` |
+| Axis pins | 40 open variants (`T1`–`T4`) plus a per-backlog A2 test | `axis-coverage.md` |
 | Conv `reverse` / `deform`, adversarial yolo branch | gradients missing | `todo.md` |
 | `Local`, `Gru` training | Rust-only extensions, partial | `todo.md` |
 | EML BN batch-stat training | CPU uses rolling stats, not C++ batch statistics | `implemented.md` §7 |
