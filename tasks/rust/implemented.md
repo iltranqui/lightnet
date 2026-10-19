@@ -123,6 +123,7 @@ file is named inline.
 - [95. GraphConv BN GPU Muon through CPU fallback](#95-graphconv-bn-gpu-muon-through-cpu-fallback)
 - [96. Native GraphConv BN training](#96-native-graphconv-bn-training)
 - [97. Standalone BatchNorm native GPU training](#97-standalone-batchnorm-native-gpu-training)
+- [98. Native Crop training geometry](#98-native-crop-training-geometry)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1680,6 +1681,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 97. Standalone BatchNorm native GPU training
 
 - v0.2.075: standalone `[batchnorm]` training now uses native Oxide batch-statistics forward/backward, caches batch statistics, and synchronizes rolling mean plus the CPU-reference biased rolling variance after backward. Scale/bias optimizer application remains the existing host AdamW fallback. Actual-Oxide output and parameter/stat parity against CPU passed in `standalone_batch_norm_native_training_matches_cpu_adam`; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain batch_norm` passed 9 tests, including recurrent/connected/GraphConv BN regressions. This does not add compiled-C++ golden evidence, native standalone-BN optimizer updates, or full-suite/performance claims.
+
+## 98. Native Crop training geometry
+
+- v0.2.076 (`c815a081`): native Crop training supports random crop coordinates, optional horizontal flip, rotation, and the per-in-bounds-tap affine scaling with zero-valued out-of-bounds taps. Training HSV/saturation/exposure/RGB-shift augmentation remains explicitly rejected. Actual-Oxide runtime parity passes for an augmented Conv→Crop chain over SGD and Adam, comparing crop outputs and upstream Conv updates: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain crop_native_training_augmentation_and_backward_match_cpu` passed. Crop bilinear fwd/bwd primitive parity and FD pass (`oxide_pool_parity crop_bilinear_forward_backward_and_fd`), and host crop filter passed 10 tests. This is Rust CPU/Oxide parity, not compiled-C++ parity; no full-suite/performance claim.
 
 ## Not implemented / open (pointer)
 

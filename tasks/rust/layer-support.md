@@ -97,7 +97,7 @@ with the command given rather than trusting the number.
 | `ScaleChannels` | yes | none | fwd | exact | T1 | native | mixed | no |
 | `Sam` | yes | none | fwd | exact | T1 | native f32 / host (unsupported activation) | device / CPU fallback | no |
 | `BatchNorm` | yes | C++ | fwd | exact | rust | native inference + batch-statistics training | device backward / host AdamW parameter update | yes |
-| `Crop` | yes | none | fwd | exact | rust | inf (training rejected) | device | no |
+| `Crop` | yes | none | fwd | exact | rust | native inference + geometric training (no HSV/color jitter) | device (atomic scatter) | no |
 | `Local` | yes | C++ | fwd | exact | rust | native f32 / host (unsupported activation) | device / CPU fallback | no |
 | `Gru` | yes | C++ | fwd | exact | rust | **none** (falls to "inconsistent") | cpu | no |
 | `Rnn` | yes | C++ | fwd | exact | T3 | mixed (device w/o BN) | mixed | no |
@@ -244,7 +244,7 @@ devices and head sizes (no native kernel at all), even though standard
 | Deconvolutional | native Oxide f32 forward, activation, input/weight/bias gradients (v0.2.039); actual-GPU CPU parity for Muon and two-step SGD/Adam updates (v0.2.040) | unmapped activations retain legacy host route; weights and gradients cross host boundary for optimizer; no f16 |
 | Shortcut (weighted) | device input/source gradients, exact normalization derivatives | per-input/per-slot weight gradient vector crosses to host; optimizer host-side |
 | Connected | device GEMM + activation, BN folded at inference | BN training and unsupported/unknown activations fall back |
-| `Crop`, `BatchNorm` | device inference | training explicitly rejected |
+| `Crop` | device inference and geometric training | training HSV/saturation/exposure/RGB-shift augmentation is explicitly rejected |
 | `MaxPool`, `LocalAvgPool` | device | `maxpool_depth` and channel-changing `local_avgpool` rejected |
 
 ## Optimizer status
@@ -287,7 +287,7 @@ non-layer work.
 | CARPN Stage-2 training | `[obb_refine]` inference only; blocks `detector train -map` for CARPN | after `carpn_network_map_plan.md` |
 | Axis pins | 41 open variants (`T1`–`T4`) plus a per-backlog A2 test | `axis-coverage.md` |
 | Conv `reverse` / `deform`, adversarial yolo branch | gradients missing | `todo.md` |
-| `Local`, `Gru`, `Crop`, `BatchNorm` training | Rust-only extensions, partial | `todo.md` |
+| `Local`, `Gru` training | Rust-only extensions, partial | `todo.md` |
 | EML BN batch-stat training | CPU uses rolling stats, not C++ batch statistics | `implemented.md` §7 |
 
 ## Blocked, not plannable
