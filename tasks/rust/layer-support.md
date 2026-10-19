@@ -106,7 +106,7 @@ with the command given rather than trusting the number.
 | `Moe` | alias | C++ | fwd | exact | pin | native | device | no |
 | `EmlConvolutional` | alias | C++ | fwd | exact | pin | native | device / CPU (BN) | no |
 | `GraphConv` | alias | C++ | fwd | exact | T4 | none | none | no |
-| `Dcnv4` | alias | C++ | fwd | exact | pin | native (incl. rolling-stat BN, <=25 points, supported act) / host otherwise | mixed (native math same gate; parameter gradients/updates host) | no |
+| `Dcnv4` | alias | C++ | fwd | exact | pin | native (incl. rolling-stat BN, <=169 points, supported act) / host otherwise | mixed (native math and device gradient accumulation same gate; parameter/optimizer updates host) | no |
 | `DeformConv` | alias | C++ | fwd | exact | T4 | native (dilation 1, no BN) / host otherwise | native (same gate; one host hop for the normalization Jacobian) | no |
 | `DsConv` | alias | C++ | fwd | exact | T4 | none | none | no |
 | `Wmhf` | alias | C++ | fwd | exact | T4 | none | none | no |
@@ -248,7 +248,7 @@ devices and head sizes (no native kernel at all), even though standard
 | Optimizer | CPU | GPU |
 |---|---|---|
 | SGD (momentum, decay, per-layer rate, gates) | all parameterized layers | device for conv/MoE/EML; host for connected, deconv, deform_conv, dcnv4, recurrent, weighted shortcut, vit, swin, tucker, mamba, kimi, local, batchnorm; n/a for hard rejects |
-| Adam/AdamW | all parameterized layers; DNOPT1–5 sidecars | device for conv/MoE/EML (+BN scales); host moments for the same list as SGD; DNOPT1–5 readable |
+| Adam/AdamW | all parameterized layers; DNOPT1–5 sidecars | device for conv/MoE/EML (+BN scales); host moments for the same list as SGD, including DCNv4 whose gradients accumulate on-device but transfer at optimizer boundary; DNOPT1–5 readable |
 | Muon | v0.1.005 hybrid on eligible 2-D matrices, DNOPT6 | **absent** — no kernel, no eligibility set, no state format |
 
 Muon eligibility (CPU, from `AGENTS.md`): convolution weights viewed as
