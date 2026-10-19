@@ -114,6 +114,7 @@ file is named inline.
 - [86. GraphConv center-reference gather primitive](#86-graphconv-center-reference-gather-primitive)
 - [87. GraphConv self-projection runtime path](#87-graphconv-self-projection-runtime-path)
 - [88. Compact GraphConv inference](#88-compact-graphconv-inference)
+- [89. Compact GraphConv batch-normalization inference](#89-compact-graphconv-batch-normalization-inference)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1635,6 +1636,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 88. Compact GraphConv inference
 
 - v0.2.066: enabled the compact f32 GPU inference path for GraphConv configurations already supported by the native runtime (edge modes 0/1, optional self projection, no BN, supported activation). The compact layer arm composes native aggregation/reference gather, grouped pointwise projections, bias, and activation without a backward cache. Actual-Oxide compact output matches CPU for learned edges plus self projection in `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain graph_conv_compact_inference_matches_cpu_with_learned_edges_and_self` (1 test). Unsupported variants retain an explicit preflight rejection; no C++ golden/full-suite/performance claim.
+
+## 89. Compact GraphConv batch-normalization inference
+
+- v0.2.067: extended compact f32 GraphConv inference to apply batch normalization using rolling mean/variance, gamma, and projection beta. The compact-only eligibility check now permits BN while the training/full-runtime predicate still preserves the existing BN fallback. Actual-Oxide CPU parity passes for learned edges plus self projection and BN in `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain graph_conv_compact_inference_matches_cpu` (2 tests, BN and non-BN). Training BN and compiled-C++ golden remain open; no full-suite/performance claim.
 
 ## Not implemented / open (pointer)
 
