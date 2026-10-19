@@ -74,7 +74,7 @@ with the command given rather than trusting the number.
 | Axis open | 41 (Tier 1: 14, Tier 2: 16, Tier 3: 3, Tier 4: 8) |
 | Axis Rust-only | 5 |
 | Incomplete CPU port | 1 (`Yolo3d`); blocked: `Dcnv3`, `DetrDecoder` |
-| GPU Muon | 0 (no kernel anywhere) |
+| GPU Muon | partial runtime integration: native Oxide Newton–Schulz on connected matrices; standalone BatchNorm host AdamW fallback. Other parameter families/device-resident updates open |
 
 ## Matrix
 
@@ -250,7 +250,7 @@ devices and head sizes (no native kernel at all), even though standard
 |---|---|---|
 | SGD (momentum, decay, per-layer rate, gates) | all parameterized layers | device for conv/MoE/EML and eligible native DCNv4; host for connected, deconv, deform_conv, recurrent, weighted shortcut, vit, swin, tucker, mamba, kimi, local, batchnorm; n/a for hard rejects |
 | Adam/AdamW | all parameterized layers; DNOPT1–5 sidecars | device for conv/MoE/EML/DCNv4 (+BN scales); DCNv4 moments persist on-device between updates and materialize through the existing host sidecar on save; DNOPT1–5 readable |
-| Muon | v0.1.005 hybrid on eligible 2-D matrices, DNOPT6 | **partial runtime slice (v0.2.032)** — connected matrices use the native Oxide Newton–Schulz primitive with CPU-parity update/resume tests; standalone BatchNorm stays AdamW fallback. Momentum staging, host-canonical parameter update/state, only connected/BatchNorm supported; other eligible families and device-resident updates remain open |
+| Muon | v0.1.005 hybrid on eligible 2-D matrices, DNOPT6 | **partial runtime slice (v0.2.032–033)** — connected matrices use native Oxide Newton–Schulz with actual-GPU CPU-parity update/resume tests; standalone BatchNorm scale/bias uses host AdamW fallback with FakeBackend CPU-parity/state tests. Momentum staging, final update, parameters and optimizer state remain host-side; other eligible families/device-resident updates remain open |
 
 Muon eligibility (CPU, from `AGENTS.md`): convolution weights viewed as
 `[out, in*kh*kw]`, `connected`, `deconvolutional`, attention/MLP projections in
