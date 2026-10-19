@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.047 (`fb05dad0`): extended hybrid GPU Muon to KimiKda matrices; actual-Oxide two-step CPU parity and host `gpu_muon_` filter passed. KimiKda layer ops and optimizer state/final updates remain host-side. See `implemented.md` §69.
 - v0.2.046 (`dd40ca39`): extended hybrid GPU Muon to MambaVision matrices; actual-Oxide two-step CPU parity and host `gpu_muon_` filter passed. MambaVision layer ops and optimizer state/final updates remain host-side. See `implemented.md` §69.
 - v0.2.045 (`5bff2104`): extended hybrid GPU Muon to TuckerAttention matrices; actual-Oxide two-step CPU parity and host `gpu_muon_` filter passed. TuckerAttention layer ops and optimizer state/final updates remain host-side. See `implemented.md` §69.
 - v0.2.044 (`32a111b7`): extended hybrid GPU Muon eligibility to Swin matrices; two-step actual-Oxide CPU parity and host `gpu_muon_` regression filter passed. Swin layer ops and optimizer state/final updates remain host-side. See `implemented.md` §69.
