@@ -99,7 +99,7 @@ with the command given rather than trusting the number.
 | `BatchNorm` | yes | C++ | fwd | exact | rust | native inference + batch-statistics training | device backward / host AdamW parameter update | yes |
 | `Crop` | yes | none | fwd | exact | rust | native inference + geometric training (no HSV/color jitter) | device (atomic scatter) | no |
 | `Local` | yes | C++ | fwd | exact | rust | native f32 / host (unsupported activation) | device / CPU fallback | no |
-| `Gru` | yes | C++ | fwd | exact | rust | **none** (falls to "inconsistent") | cpu | no |
+| `Gru` | yes | C++ | fwd | exact | rust | **none** (`UnsupportedLayer`) | cpu | no |
 | `Rnn` | yes | C++ | fwd | exact | T3 | mixed (device w/o BN) | mixed | no |
 | `Lstm` | yes | C++ | fwd | exact | T3 | mixed (device w/o BN) | mixed | no |
 | `Crnn` | yes | C++ | fwd | exact | T3 | mixed (device w/o BN) | mixed | no |
@@ -149,8 +149,8 @@ with the command given rather than trusting the number.
 
 ## GPU hard rejections (no device path at all)
 
-Ten variants abort before any kernel runs. Source: `runtime.rs:83-102`
-(`reject_gpu_hyperbolic_foveation`) and `runtime.rs:11402-11490`.
+Eleven variants abort before any kernel runs. Source: the explicit rejection
+paths in `runtime.rs` (including the `Gru` match arm).
 
 | Variant | Rejection message | Why it exists | Work item |
 |---|---|---|---|
@@ -164,11 +164,9 @@ Ten variants abort before any kernel runs. Source: `runtime.rs:83-102`
 | `DptHead` | same | four-tap fusion neck over DPT features | attention wave |
 | `Yolo3d` | same | raw CPU forward only; loss/decode absent | CPU first, then GPU |
 | `ObbRefine` (CARPN) | `GPU inference is not implemented` / `GPU CARPN training is unsupported` | CPU inference only; Stage-2 training deferred | after CARPN CPU training |
+| `Gru` | `UnsupportedLayer` | No GPU forward/backward path is implemented | recurrent wave |
 
-`Gru` is not in that list but has **no GPU arm** either; it falls through to
-the match's catch-all `InvalidConfig("... and parameter set are inconsistent")`
-(`runtime.rs:13070-13084`). That message is wrong and should be an
-`UnsupportedLayer`. `Local` has a bounded native f32 forward/backward path since
+`Local` has a bounded native f32 forward/backward path since
 v0.2.048; its optimizer remains host-staged and unsupported activations retain
 the legacy host route.
 

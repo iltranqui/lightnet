@@ -125,6 +125,7 @@ file is named inline.
 - [97. Standalone BatchNorm native GPU training](#97-standalone-batchnorm-native-gpu-training)
 - [98. Native Crop training geometry](#98-native-crop-training-geometry)
 - [99. DCNv4 mixed-network backward validation](#99-dcnv4-mixed-network-backward-validation)
+- [100. Explicit GPU rejection for GRU](#100-explicit-gpu-rejection-for-gru)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1690,6 +1691,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 99. DCNv4 mixed-network backward validation
 
 - v0.2.077 (`e583f9d2`): corrected a stale mixed-network regression test that passed the GPU forward's host snapshot to CPU backward, although GPU backward caches intentionally live in `GpuForwardState`. The test now pairs the CPU forward with CPU backward and GPU forward with native GPU backward. Its focused test passes; the complete `oxide_runtime_chain` binary passes 62/62 tests (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain`, 1273.53 seconds). This is scoped Oxide runtime-chain evidence only—not the entire Rust suite, compiled-C++ golden, or overall objective completion.
+
+## 100. Explicit GPU rejection for GRU
+
+- v0.2.078 (`57b00348`): added an explicit `UnsupportedLayer` GPU error for `[gru]`, replacing the misleading catch-all parameter/config mismatch. The focused Oxide test `gru_gpu_path_is_rejected_as_unsupported_not_misconfigured` passes. No GRU GPU implementation was added; it remains an open native-GPU requirement. This is error-surface coverage only, not parity/completion evidence.
 
 ## Not implemented / open (pointer)
 
