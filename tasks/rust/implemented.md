@@ -108,6 +108,7 @@ file is named inline.
 - [80. GraphConv aggregation coordinate-overflow guards](#80-graphconv-aggregation-coordinate-overflow-guards)
 - [81. Native GPU GraphConv uniform runtime path](#81-native-gpu-graphconv-uniform-runtime-path)
 - [82. GraphConv learned-edge masked-softmax host contract](#82-graphconv-learned-edge-masked-softmax-host-contract)
+- [83. Native GraphConv learned-edge forward primitive](#83-native-graphconv-learned-edge-forward-primitive)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1605,6 +1606,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 82. GraphConv learned-edge masked-softmax host contract
 
 - v0.2.060: added checked host references for GraphConv learned-edge mode 1 aggregation and its exact input/edge-kernel/edge-bias adjoint. The contract fixes group-local `[groups, size*size, 2*channels_per_group]` layout, row-major edge order, center-reference zeroing when out of bounds, and masking invalid neighbors before stable softmax. Host-reference finite differences cover every input/kernel/bias element; constant-input masking and malformed group/length rejection pass in `MEM=3G ./tools/test_oxide.sh --test oxide_graph_conv` (4 tests total). This is a contract/reference increment only: **no native learned-edge GPU kernel or runtime integration exists yet**; CPU reference source and hand-derived equations only, no compiled-C++ golden. `PKGS=darknet-cuda MEM=3G ./tools/test_host.sh learned_aggregate` could not run because an unrelated existing unit-test compile error in `host_ops/local.rs` prevents the `darknet-cuda` library test target from compiling; the contract is exercised through the Oxide integration test target instead.
+
+## 83. Native GraphConv learned-edge forward primitive
+
+- v0.2.061: added a native Oxide learned-edge mode 1 forward kernel and backend operation for group-local row-major edge parameters. The kernel computes valid-edge logits, masks invalid spatial neighbors before max-stabilized softmax, and aggregates NCHW values; the backend validates geometry, group divisibility, and parameter extents before launch. Actual-Oxide parity against the checked host reference, including boundary sites, plus malformed group/parameter rejection passes in `MEM=3G ./tools/test_oxide.sh --test oxide_graph_conv` (4 tests total); host-reference input/kernel/bias finite differences also remain green. This is **primitive-only**: no native backward or runtime dispatch yet, and no compiled-C++ golden/full suite/performance claim. The trait's default implementation remains host reference for other backends.
 
 ## Not implemented / open (pointer)
 
