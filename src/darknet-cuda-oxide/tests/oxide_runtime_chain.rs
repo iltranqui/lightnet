@@ -2642,11 +2642,15 @@ fn dcnv4_mixed_network_retains_cpu_cache_and_backward() {
 fn dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu() {
     for batch_normalize in [false, true] {
     for adam in [false, true] {
-        for (softmax, remove_center, activation) in [(1, 1, "swish"), (0, 0, "leaky")] {
+        for (softmax, remove_center, activation, size, padding, dilation) in [
+            (1, 1, "swish", 3, 2, 2),
+            (0, 0, "leaky", 3, 2, 2),
+            (0, 0, "leaky", 7, 3, 1),
+        ] {
             let net = network(&format!(
                 "[net]\nwidth=5\nheight=3\nchannels=2\nbatch=2\ntry_fix_nan=0\nadam={}\ndecay=0.01\n\
                  [convolutional]\nfilters=4\nsize=1\nactivation=linear\n\
-                 [dcnv4]\nsize=3\npadding=2\ndilation=2\ngroups=2\nd_stride=2\n\
+                 [dcnv4]\nsize={size}\npadding={padding}\ndilation={dilation}\ngroups=2\nd_stride=2\n\
                  softmax={softmax}\nremove_center={remove_center}\noffset_scale=0.75\nactivation={activation}\nbatch_normalize={}\n",
                 u8::from(adam), u8::from(batch_normalize)
             ));
