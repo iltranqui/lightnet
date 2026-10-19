@@ -1188,6 +1188,98 @@ impl OxideBackend {
         Ok(x)
     }
 
+    /// Native device momentum and Nesterov-lookahead update for one Muon matrix.
+    pub fn muon_momentum_lookahead_f32(
+        &self,
+        updates: &OxideTensorF32,
+        momentum: &OxideTensorF32,
+        shape: &[usize],
+        batch: usize,
+        loss_scale: f32,
+        coefficient: f32,
+    ) -> Result<(OxideTensorF32, OxideTensorF32), OxideError> {
+        let op = "muon_momentum_lookahead_f32";
+        if updates.len() == 0 || momentum.len() != updates.len()
+            || shape.iter().product::<usize>() != updates.len()
+        {
+            return Err(shape_err(op, "updates, momentum, and shape must have equal nonzero lengths".to_owned()));
+        }
+        if !coefficient.is_finite() || !(0.0..1.0).contains(&coefficient) {
+            return Err(shape_err(op, "momentum coefficient must be finite and in [0, 1)".to_owned()));
+        }
+        let scale = if loss_scale.is_finite() && loss_scale > 0.0 { loss_scale } else { 1.0 };
+        let divisor = batch.max(1) as f32 * scale;
+        if !divisor.is_finite() || divisor <= 0.0 {
+            return Err(shape_err(op, "gradient divisor must be finite and positive".to_owned()));
+        }
+        let config = ElementwiseLaunchConfig::default();
+        let mut next = self.alloc_uninit(updates.len())?;
+        let mut lookahead = self.alloc_uninit(updates.len())?;
+        // SAFETY: all buffers have equal validated lengths; each thread writes a unique output slot.
+        unsafe {
+            self.muon.muon_momentum_lookahead_f32(
+                &self.stream,
+                launch::elementwise(updates.len(), config),
+                &updates.buf,
+                &momentum.buf,
+                &mut next,
+                &mut lookahead,
+                divisor,
+                coefficient,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok((
+            OxideTensorF32::new(next, shape),
+            OxideTensorF32::new(lookahead, shape),
+        ))
+    }
+
+    /// Apply Muon direction and decoupled AdamW decay entirely on the device.
+    pub fn muon_apply_update_f32(
+        &self,
+        weights: &OxideTensorF32,
+        direction: &OxideTensorF32,
+        shape: &[usize],
+        learning_rate: f32,
+        decay: f32,
+        direction_scale: f32,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let op = "muon_apply_update_f32";
+        if weights.len() == 0 || direction.len() != weights.len()
+            || shape.iter().product::<usize>() != weights.len()
+        {
+            return Err(shape_err(op, "weights, direction, and shape must have equal nonzero lengths".to_owned()));
+        }
+        if !learning_rate.is_finite() || learning_rate < 0.0
+            || !decay.is_finite() || decay < 0.0
+            || !direction_scale.is_finite() || direction_scale < 0.0
+        {
+            return Err(shape_err(op, "learning rate, decay, and direction scale must be finite and non-negative".to_owned()));
+        }
+        let decay_factor = 1.0 - learning_rate * decay;
+        if !decay_factor.is_finite() {
+            return Err(shape_err(op, "decoupled decay factor must be finite".to_owned()));
+        }
+        let config = ElementwiseLaunchConfig::default();
+        let mut output = self.alloc_uninit(weights.len())?;
+        // SAFETY: all input/output buffers have equal validated lengths; each thread writes one slot.
+        unsafe {
+            self.muon.muon_apply_update_f32(
+                &self.stream,
+                launch::elementwise(weights.len(), config),
+                &weights.buf,
+                &direction.buf,
+                &mut output,
+                learning_rate,
+                decay_factor,
+                direction_scale,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, shape))
+    }
+
     fn muon_transpose_f32(
         &self, matrix: &OxideTensorF32, rows: usize, cols: usize,
         config: ElementwiseLaunchConfig,
@@ -3655,6 +3747,50 @@ impl F32TensorOpsBackend for OxideBackend {
         }
         let input = self.f32v(matrix)?;
         OxideBackend::muon_orthogonalize_f32(self, &input, rows, cols)
+    }
+
+    fn muon_momentum_lookahead_f32(
+        &self,
+        updates: &Self::Tensor,
+        momentum: &Self::Tensor,
+        shape: &[usize],
+        batch: usize,
+        loss_scale: f32,
+        coefficient: f32,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        let updates = self.f32v(updates)?;
+        let momentum = self.f32v(momentum)?;
+        OxideBackend::muon_momentum_lookahead_f32(
+            self,
+            &updates,
+            &momentum,
+            shape,
+            batch,
+            loss_scale,
+            coefficient,
+        )
+    }
+
+    fn muon_apply_update_f32(
+        &self,
+        weights: &Self::Tensor,
+        direction: &Self::Tensor,
+        shape: &[usize],
+        learning_rate: f32,
+        decay: f32,
+        direction_scale: f32,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let weights = self.f32v(weights)?;
+        let direction = self.f32v(direction)?;
+        OxideBackend::muon_apply_update_f32(
+            self,
+            &weights,
+            &direction,
+            shape,
+            learning_rate,
+            decay,
+            direction_scale,
+        )
     }
 
     fn linear_f32(

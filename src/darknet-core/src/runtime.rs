@@ -7442,8 +7442,10 @@ where
     dcnv4_adam_state: Vec<Option<GpuDcnv4AdamState<B::Tensor>>>,
     /// Adam moments for parameters updated by the host fallback.
     host_adam_state: RefCell<Vec<Option<HostAdamLayerState>>>,
-    /// Newton–Schulz momentum for opt-in GPU Muon updates (host sidecar state).
+    /// Newton–Schulz momentum for opt-in GPU Muon updates (host sidecar mirror).
     muon_state: Vec<Option<MuonLayerState>>,
+    /// Persistent device momentum for connected-layer GPU Muon matrices.
+    device_muon_momentum: RefCell<Vec<Option<B::Tensor>>>,
 
     /// Number of Adam updates applied so far (the 1-based bias-correction `t`).
     adam_step: u32,
@@ -8939,6 +8941,7 @@ where
         let dcnv4_adam_state = (0..network.layers.len()).map(|_| None).collect();
         let host_adam_state = RefCell::new((0..network.layers.len()).map(|_| None).collect());
         let muon_state = (0..network.layers.len()).map(|_| None).collect();
+        let device_muon_momentum = RefCell::new(vec![None; network.layers.len()]);
         Self {
             backend,
             network,
@@ -8958,6 +8961,7 @@ where
             dcnv4_adam_state,
             host_adam_state,
             muon_state,
+            device_muon_momentum,
             adam_step: 0,
             train_iteration: 0,
             host_weights_stale: false,
@@ -9630,6 +9634,7 @@ where
         self.eml_adam_state = eml_state;
         self.dcnv4_adam_state = (0..self.network.layers.len()).map(|_| None).collect();
         self.muon_state = muon_state;
+        *self.device_muon_momentum.borrow_mut() = vec![None; self.network.layers.len()];
         self.adam_step = restored_step;
         Ok(())
     }
@@ -10321,6 +10326,7 @@ where
         let layer_count = self.network.layers.len();
         if self.muon_state.len() != layer_count {
             self.muon_state = (0..layer_count).map(|_| None).collect();
+            *self.device_muon_momentum.borrow_mut() = vec![None; layer_count];
         }
         {
             let host_state = self.host_adam_state.get_mut();
@@ -10349,6 +10355,152 @@ where
                 lr: lr * options.learning_rate_scale,
                 ..adam
             };
+            if let (
+                LayerKind::Connected(spec),
+                LayerParams::Connected(params),
+                LayerTrainBuffers::Connected(train),
+            ) = (
+                &layer.kind,
+                &mut self.params[index],
+                &mut buffers[index],
+            ) {
+                let rows = spec.output;
+                let cols = layer.input_shape.element_count();
+                let shape = [rows, cols];
+                let state = self.muon_state[index].get_or_insert_with(MuonLayerState::default);
+                if state.matrices.len() != 1
+                    || state.matrices[0].rows != rows
+                    || state.matrices[0].cols != cols
+                {
+                    state.matrices = vec![MuonMatrixState::zeroed(rows, cols)?];
+                    let mut device_state = self.device_muon_momentum.borrow_mut();
+                    if device_state.len() != layer_count {
+                        *device_state = vec![None; layer_count];
+                    }
+                    device_state[index] = None;
+                }
+                let prior_momentum = state.matrices[0].momentum.clone();
+                if train
+                    .weight_updates
+                    .iter()
+                    .chain(&prior_momentum)
+                    .chain(&params.weights)
+                    .any(|value| !value.is_finite())
+                {
+                    return Err(Error::InvalidConfig(
+                        "GPU Muon weights, updates, and momentum must be finite".to_owned(),
+                    ));
+                }
+                let momentum_tensor = {
+                    let mut device_state = self.device_muon_momentum.borrow_mut();
+                    if device_state.len() != layer_count {
+                        *device_state = vec![None; layer_count];
+                    }
+                    if device_state[index].is_none() {
+                        device_state[index] = Some(
+                            self.backend
+                                .upload_f32(&shape, &prior_momentum)
+                                .map_err(|err| backend_error("GPU Muon momentum upload", err))?,
+                        );
+                    }
+                    device_state[index]
+                        .as_ref()
+                        .expect("initialized GPU Muon momentum")
+                        .clone()
+                };
+                let updates = self
+                    .backend
+                    .upload_f32(&shape, &train.weight_updates)
+                    .map_err(|err| backend_error("GPU Muon update upload", err))?;
+                let (next_momentum, lookahead) = self
+                    .backend
+                    .muon_momentum_lookahead_f32(
+                        &updates,
+                        &momentum_tensor,
+                        &shape,
+                        batch,
+                        loss_scale,
+                        net.muon_momentum,
+                    )
+                    .map_err(|err| backend_error("GPU Muon momentum/lookahead", err))?;
+                if self
+                    .backend
+                    .any_non_finite_f32(&next_momentum)
+                    .map_err(|err| backend_error("GPU Muon momentum finiteness check", err))?
+                    || self
+                        .backend
+                        .any_non_finite_f32(&lookahead)
+                        .map_err(|err| backend_error("GPU Muon lookahead finiteness check", err))?
+                {
+                    return Err(Error::InvalidConfig(
+                        "GPU Muon momentum update became non-finite".to_owned(),
+                    ));
+                }
+                let orthogonal = self
+                    .backend
+                    .muon_orthogonalize_f32(&lookahead, &shape, rows, cols)
+                    .map_err(|err| backend_error("GPU Muon Newton-Schulz", err))?;
+                if self
+                    .backend
+                    .any_non_finite_f32(&orthogonal)
+                    .map_err(|err| backend_error("GPU Muon direction finiteness check", err))?
+                {
+                    return Err(Error::InvalidConfig(
+                        "GPU Muon Newton-Schulz direction became non-finite".to_owned(),
+                    ));
+                }
+                let weights = self
+                    .backend
+                    .upload_f32(&shape, &params.weights)
+                    .map_err(|err| backend_error("GPU Muon weights upload", err))?;
+                let updated_weights = self
+                    .backend
+                    .muon_apply_update_f32(
+                        &weights,
+                        &orthogonal,
+                        &shape,
+                        layer_adam.lr,
+                        layer_adam.decay,
+                        crate::muon::MUON_SCALE * (rows.max(cols) as f32).sqrt(),
+                    )
+                    .map_err(|err| backend_error("GPU Muon parameter update", err))?;
+                let next_weights = self
+                    .backend
+                    .download_f32(&updated_weights)
+                    .map_err(|err| backend_error("GPU Muon weights download", err))?;
+                let next_momentum_host = self
+                    .backend
+                    .download_f32(&next_momentum)
+                    .map_err(|err| backend_error("GPU Muon momentum mirror download", err))?;
+                if next_weights
+                    .iter()
+                    .chain(&next_momentum_host)
+                    .any(|value| !value.is_finite())
+                {
+                    return Err(Error::InvalidConfig(
+                        "GPU Muon parameter update became non-finite".to_owned(),
+                    ));
+                }
+                params.weights = next_weights;
+                state.matrices[0].momentum = next_momentum_host;
+                train.weight_updates.fill(0.0);
+                let host_adam = AdamParams {
+                    decay: 0.0,
+                    ..layer_adam
+                };
+                let host_state = self.host_adam_state.get_mut();
+                let adam_state = host_state[index].get_or_insert_with(HostAdamLayerState::default);
+                apply_host_adam_layer(
+                    &layer.kind,
+                    layer.input_shape,
+                    &mut self.params[index],
+                    &mut buffers[index],
+                    adam_state,
+                    &host_adam,
+                )?;
+                self.device_muon_momentum.borrow_mut()[index] = Some(next_momentum);
+                continue;
+            }
             let staged = {
                 let state = self.muon_state[index].get_or_insert_with(MuonLayerState::default);
                 let backend = &self.backend;

@@ -45,6 +45,62 @@ fn oxide_muon_orthogonalization_matches_host_reference_across_aspect_ratios() {
 }
 
 #[test]
+fn oxide_muon_momentum_and_final_update_match_host_references() {
+    let backend = OxideBackend::new().expect("backend");
+    let shape = [2, 3];
+    let updates = [0.4, -0.2, 0.15, -0.5, 0.3, 0.1];
+    let old_momentum = [0.1, 0.3, -0.25, 0.2, 0.05, -0.1];
+    let updates_gpu = backend.upload_f32(&shape, &updates).unwrap();
+    let momentum_gpu = backend.upload_f32(&shape, &old_momentum).unwrap();
+    let (next_gpu, lookahead_gpu) = backend
+        .muon_momentum_lookahead_f32(&updates_gpu, &momentum_gpu, &shape, 2, 4.0, 0.9)
+        .unwrap();
+    let (next_expected, lookahead_expected) =
+        host_ops::muon::momentum_lookahead(&updates, &old_momentum, 2, 4.0, 0.9).unwrap();
+    close(
+        "Muon next momentum",
+        &backend.download_f32(&next_gpu).unwrap(),
+        &next_expected,
+        2e-6,
+    );
+    close(
+        "Muon lookahead",
+        &backend.download_f32(&lookahead_gpu).unwrap(),
+        &lookahead_expected,
+        2e-6,
+    );
+
+    let direction = F32TensorOpsBackend::muon_orthogonalize_f32(
+        &backend,
+        &lookahead_gpu,
+        &shape,
+        2,
+        3,
+    )
+    .unwrap();
+    let weights = [0.2, -0.1, 0.3, 0.4, -0.25, 0.15];
+    let weights_gpu = backend.upload_f32(&shape, &weights).unwrap();
+    let updated_gpu = backend
+        .muon_apply_update_f32(&weights_gpu, &direction, &shape, 0.02, 0.0005, 0.2 * 3.0f32.sqrt())
+        .unwrap();
+    let direction_host = host_ops::muon::orthogonalize(&lookahead_expected, 2, 3).unwrap();
+    let updated_expected = host_ops::muon::apply_update(
+        &weights,
+        &direction_host,
+        0.02,
+        0.0005,
+        0.2 * 3.0f32.sqrt(),
+    )
+    .unwrap();
+    close(
+        "Muon device-applied weights",
+        &backend.download_f32(&updated_gpu).unwrap(),
+        &updated_expected,
+        3e-4,
+    );
+}
+
+#[test]
 fn oxide_muon_orthogonalization_preserves_zero_and_rejects_bad_shapes() {
     let backend = OxideBackend::new().expect("backend");
     let zero = backend.zeros_f32(&[2, 3]).unwrap();

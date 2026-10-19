@@ -10,7 +10,7 @@ const NS_STEPS: usize = 5;
 const NS_A: f32 = 3.4445;
 const NS_B: f32 = -4.7750;
 const NS_C: f32 = 2.0315;
-const MUON_SCALE: f32 = 0.2;
+pub(crate) const MUON_SCALE: f32 = 0.2;
 
 /// Persistent momentum state for one logical Muon matrix.
 #[derive(Clone, Debug, Default, PartialEq)]

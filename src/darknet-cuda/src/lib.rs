@@ -1733,6 +1733,55 @@ pub trait F32TensorOpsBackend {
         self.upload_f32(shape, &output)
     }
 
+    /// Compute Darknet Muon's next momentum and Nesterov lookahead tensors.
+    fn muon_momentum_lookahead_f32(
+        &self,
+        updates: &Self::Tensor,
+        momentum: &Self::Tensor,
+        shape: &[usize],
+        batch: usize,
+        loss_scale: f32,
+        coefficient: f32,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        let updates = self.download_f32(updates)?;
+        let momentum = self.download_f32(momentum)?;
+        let (next_momentum, lookahead) = host_ops::muon::momentum_lookahead(
+            &updates,
+            &momentum,
+            batch,
+            loss_scale,
+            coefficient,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(shape.iter().product::<usize>(), next_momentum.len());
+        Ok((
+            self.upload_f32(shape, &next_momentum)?,
+            self.upload_f32(shape, &lookahead)?,
+        ))
+    }
+
+    /// Apply the orthogonalized Muon direction plus decoupled AdamW decay.
+    fn muon_apply_update_f32(
+        &self,
+        weights: &Self::Tensor,
+        direction: &Self::Tensor,
+        shape: &[usize],
+        learning_rate: f32,
+        decay: f32,
+        direction_scale: f32,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let output = host_ops::muon::apply_update(
+            &self.download_f32(weights)?,
+            &self.download_f32(direction)?,
+            learning_rate,
+            decay,
+            direction_scale,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(shape.iter().product::<usize>(), output.len());
+        self.upload_f32(shape, &output)
+    }
+
     /// Fused residual + bias epilogue for a transformer block: over a flat
     /// `rows x cols` row-major slab, `out[i] = residual[i] + y[i] + bias[i % cols]`
     /// with `bias` per **column** (the last dimension, so the row - the token -

@@ -36,6 +36,51 @@ pub mod kernels {
         }
     }
 
+    /// Update momentum and form `mu * next_momentum + gradient` lookahead.
+    #[kernel]
+    pub fn muon_momentum_lookahead_f32(
+        updates: &[f32],
+        old_momentum: &[f32],
+        mut next_momentum: DisjointSlice<f32>,
+        mut lookahead: DisjointSlice<f32>,
+        divisor: f32,
+        coefficient: f32,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i < updates.len() {
+            let gradient = updates[i] / divisor;
+            let next = coefficient * old_momentum[i] + gradient;
+            let nesterov = coefficient * next + gradient;
+            if let Some(dst) = next_momentum.get_mut(idx) {
+                *dst = next;
+            }
+            if let Some(dst) = lookahead.get_mut(thread::index_1d()) {
+                *dst = nesterov;
+            }
+        }
+    }
+
+    /// Apply decoupled decay and a scaled Muon direction.
+    #[kernel]
+    pub fn muon_apply_update_f32(
+        weights: &[f32],
+        direction: &[f32],
+        mut output: DisjointSlice<f32>,
+        learning_rate: f32,
+        decay_factor: f32,
+        direction_scale: f32,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i < weights.len() {
+            if let Some(dst) = output.get_mut(idx) {
+                *dst = decay_factor * weights[i]
+                    + learning_rate * direction_scale * direction[i];
+            }
+        }
+    }
+
     /// Divide a matrix by its Frobenius norm; an all-zero input remains zero.
     #[kernel]
     pub fn muon_normalize_f32(input: &[f32], norm_squared: &[f32], mut output: DisjointSlice<f32>) {
