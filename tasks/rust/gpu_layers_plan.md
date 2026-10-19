@@ -31,7 +31,7 @@ inference (v0.2.001–002). Act-head features/exact-erf primitives are native f3
 Evidence/limits are in `implemented.md` §§41–45. Do not repeat these ports.
 Act-head uses four uncached weight uploads per forward; no residency/speedup
 claim. Runtime backward still uses CPU, act params remain frozen, f16 rejected.
-Latest GPU slice is v0.2.023 (`2ff4544e`): standalone act-head MLP gradients now have a native full-sequence CLS-adjoint scatter (§60; runtime integration remains open). DCNv4 stores raw/offset tensors in each native `GpuForwardState` (§58) and v0.2.022 accumulates bias/offset/BN-scale gradients on-device across microbatches, transferring once at the host optimizer boundary (§59). DCNv4 parameters and SGD/Adam updates remain host-resident; no speedup claim. v0.2.020 (`c99f83d8`) extended native aggregation/composition/runtime through 13x13/169 active points, with two-step SGD/Adam parity and BN on/off (§57); >169 remains host fallback. v0.2.019 (`76242245`) extended through 11x11/121 points (§56). v0.2.018 (`613b243e`) extended support through 9x9/81 (§55). v0.2.017 (`8a3ef3b0`) added equivalent runtime parity at 7x7 (§54), and v0.2.016 (`a96d6d95`) expanded the kernel/runtime bound to 49 points (§53). v0.2.015 added NormalizeChannels* activations/adjoints (§52). Previous, v0.2.014: DCNv4 native rolling-stat BN affine/adjoint plus
+Latest GPU slice is v0.2.023 (`2ff4544e`): standalone act-head MLP gradients now have a native full-sequence CLS-adjoint scatter (§60; runtime integration remains open). DCNv4 stores raw/offset tensors in each native `GpuForwardState` (§58) and v0.2.022 accumulates bias/offset/BN-scale gradients on-device across microbatches, transferring once at the host optimizer boundary (§59). DCNv4 parameters remain host-canonical; v0.2.024 applies eligible SGD updates using device gradients and momentum, while Adam still updates on the host. Parameters are uploaded/downloaded each step; no speedup/residency claim. v0.2.020 (`c99f83d8`) extended native aggregation/composition/runtime through 13x13/169 active points, with two-step SGD/Adam parity and BN on/off (§57); >169 remains host fallback. v0.2.019 (`76242245`) extended through 11x11/121 points (§56). v0.2.018 (`613b243e`) extended support through 9x9/81 (§55). v0.2.017 (`8a3ef3b0`) added equivalent runtime parity at 7x7 (§54), and v0.2.016 (`a96d6d95`) expanded the kernel/runtime bound to 49 points (§53). v0.2.015 added NormalizeChannels* activations/adjoints (§52). Previous, v0.2.014: DCNv4 native rolling-stat BN affine/adjoint plus
 post-backward 0.9 EMA, including unseeded layers. Eligible math (<=169 active
 points, supported elementwise activation, no other fallback/host-only deform_conv)
 is native with BN off/on; ignored ordinary bias/beta and update gates preserved.
@@ -39,12 +39,11 @@ Forward/gradient normalization uses the old rolling values, NOT batch statistics
 Host-cuda 37, host DCNv4 26, mandatory runtime:: 282; focused device BN 2,
 runtime 3 (eight configs × two SGD/Adam steps), composition 3, aggregate 6 passed.
 Details/source boundaries: `implemented.md` §51; previous runtime/layout audits
-in §§49–50. Parameter gradients now accumulate on-device through the optimizer boundary; parameters and SGD/Adam updates plus EMA metadata remain host-side. Weights and norm parameters still upload for math, while v0.2.021's per-forward device cache avoids repeated raw/offset projection. No residency/speedup claim. Previous
+in §§49–50. Parameter gradients accumulate on-device; v0.2.024 also applies eligible SGD on-device, while Adam gradients still transfer to the host optimizer. Parameters remain host-canonical and are uploaded/downloaded for SGD; weights and norm parameters upload for forward/backward math. The per-forward cache avoids repeated raw/offset projection. No residency/speedup claim. Previous
 full runtime-chain timed out at 600 s in ViT; **not a full-suite pass**.
 The NormalizeChannels* activation/adjoint slice is done (v0.2.015). Successive
 bounded increments extended native DCNv4 through 13x13/169 points; larger kernels,
-unsupported activations and mixed networks remain host-cached. Compact/f16 and native parameter updates/residency
-and GPU Muon remain open; device gradients now cross once per optimizer step. Native deform_conv was already wired in v0.2.007; do not repeat these ports.
+unsupported activations and mixed networks remain host-cached. Compact/f16, native Adam updates, persistent parameter residency and GPU Muon remain open; Adam gradients cross once per optimizer step. Native deform_conv was already wired in v0.2.007; do not repeat these ports.
 Recheck `version-map.tsv` before allocating another version. Earlier wave
 sections below retain historical findings; this resume point takes precedence.
 
@@ -433,7 +432,7 @@ No performance/compiled-C++ claim without actual measurements/golden evidence.
 ## Remaining scope
 
 Act-head runtime backward/update/file loading and f16, other LAYA/transformer
-layers, DCNv4/deform/deconvolution host fallbacks, CPU-only layer GPU paths and
-GPU Muon remain open. Each layer needs device forward/backward/update tests as
+layers, DCNv4 Adam and excluded-variant host fallbacks, deform/deconvolution
+host fallbacks, CPU-only layer GPU paths and GPU Muon remain open. Each layer needs device forward/backward/update tests as
 applicable and explicit limits. CPU/config/axis gaps remain open. No green full-
 host/corpus/full-Oxide suite is established; sparse MoE stays unstarted.

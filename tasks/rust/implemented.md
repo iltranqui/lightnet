@@ -86,6 +86,7 @@ file is named inline.
 - [58. Retain native DCNv4 forward cache for backward](#58-retain-native-dcnv4-forward-cache-for-backward)
 - [59. Native DCNv4 gradient accumulation](#59-native-dcnv4-gradient-accumulation)
 - [60. Native act-head CLS adjoint scatter](#60-native-act-head-cls-adjoint-scatter)
+- [61. Native DCNv4 SGD optimizer update](#61-native-dcnv4-sgd-optimizer-update)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1478,6 +1479,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 60. Native act-head CLS adjoint scatter
 
 - v0.2.023 (`2ff4544e`): added a checked backend operation to add the standalone `[B,H]` act-head CLS adjoint into token zero of an existing `[B,H,1,T]` NCHW head gradient. Host reference validates dimensions/storage; Oxide uses a native one-thread-per-output kernel, keeping the full sequence gradient device-resident and leaving scorer/marker summary features detached. Evidence: `systemd-run --user --scope -p MemoryHigh=3G cargo test -p darknet-cuda --lib laya_act -j 2` passed 2; `MEM=3G ./tools/test_host.sh laya_act` passed 11 core tests; `MEM=3G ./tools/test_oxide.sh --test oxide_laya_act_backward` passed 5 on the RTX 4060, including the new actual-device NCHW scatter/parity/error test and the existing MLP gradient parity/FD/guard suite; `git diff --check` passed. This is a primitive, not runtime backward/update integration; f16 and trainable-parameter contract remain unresolved, and no C++ golden or performance claim is made.
+
+## 61. Native DCNv4 SGD optimizer update
+
+- v0.2.024 (`0087d109`): eligible native DCNv4 SGD now combines device-accumulated gradients with device-resident momentum buffers and applies the standard backend SGD update to the offset projection and either ordinary biases or BN scales. The existing 0.01 offset-projection rate, weight decay on offset weights, layer rate scaling, batch handling and update gates are preserved. Parameters remain host-canonical and are uploaded/downloaded per step; Adam still flushes gradients to the existing host optimizer. Whole-network CPU fallback and non-native DCNv4 variants retain the host path. Evidence: `MEM=3G ./tools/test_host.sh dcnv4` passed 28 tests; `MEM=3G ./tools/test_oxide.sh dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed 1 actual-GPU test (RTX 4060, 258.95 s), exercising BN on/off, two-step SGD and Adam parity, multiple kernel sizes and update deltas; `git diff --check` passed. No speedup, parameter residency, compiled-C++ golden or full-suite claim. Native DCNv4 Adam, unsupported/large variants, compact/f16, other GPU layers, CPU gaps, GPU Muon and sparse MoE remain open.
 
 ## Not implemented / open (pointer)
 
