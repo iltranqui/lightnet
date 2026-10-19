@@ -102,6 +102,7 @@ file is named inline.
 - [74. Hybrid GPU Muon for convolution matrices](#74-hybrid-gpu-muon-for-convolution-matrices)
 - [75. Hybrid GPU Muon for non-BN EML branches](#75-hybrid-gpu-muon-for-non-bn-eml-branches)
 - [76. Hybrid GPU Muon for non-BN MoE](#76-hybrid-gpu-muon-for-non-bn-moe)
+- [77. Hybrid GPU Muon for non-BN DCNv4 offset projection](#77-hybrid-gpu-muon-for-non-bn-dcnv4-offset-projection)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1575,6 +1576,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 76. Hybrid GPU Muon for non-BN MoE
 
 - v0.2.054: extended hybrid GPU Muon to the MoE router matrix and all expert convolution matrices when expert batch normalization is disabled. Accumulated router/expert gradients are downloaded from device at the update boundary, Oxide performs Newton–Schulz orthogonalization, host AdamW/Muon updates apply, expert parameters are re-uploaded to their device cache slots, and device accumulators are cleared. Actual-Oxide CPU parity passed over two updates with two accumulated seeded backward calls per step, covering outputs, router weights/biases and every expert's weights/biases (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_moe_device_gradients_match_cpu_across_steps`). BN MoE remains explicitly rejected by the host regression test. Gradients/state/final updates cross the host boundary. No compiled-C++ golden, full-suite, or performance claim.
+
+## 77. Hybrid GPU Muon for non-BN DCNv4 offset projection
+
+- v0.2.055: extended hybrid GPU Muon to the DCNv4 offset-projection matrix when batch normalization is disabled. The existing per-layer device-gradient flush is now targetable so update-gated layers retain untouched device buffers; eligible accumulated DCNv4 gradients are staged to host, Muon orthogonalizes the offset matrix with the existing 0.01 learning-rate scale, remaining DCNv4 parameters receive the existing AdamW fallback, and updated host parameters are detected/re-uploaded by the DCNv4 snapshot cache on the next forward. Actual-Oxide CPU parity passed across two updates with two accumulated backward calls per step, covering outputs, offset weights/biases and output biases (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_dcnv4_offset_projection_matches_cpu_across_steps`). BN DCNv4 remains explicitly rejected before mutation. This is hybrid: gradients, state and final updates cross the host boundary; no compiled-C++ golden, full-suite or performance claim.
 
 ## Not implemented / open (pointer)
 
