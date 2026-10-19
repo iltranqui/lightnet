@@ -112,6 +112,7 @@ file is named inline.
 - [84. Native GraphConv learned-edge adjoints](#84-native-graphconv-learned-edge-adjoints)
 - [85. GraphConv learned-edge runtime path](#85-graphconv-learned-edge-runtime-path)
 - [86. GraphConv center-reference gather primitive](#86-graphconv-center-reference-gather-primitive)
+- [87. GraphConv self-projection runtime path](#87-graphconv-self-projection-runtime-path)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1625,6 +1626,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 86. GraphConv center-reference gather primitive
 
 - v0.2.064: added checked host and native Oxide center/reference gather and exact input adjoint. Odd-kernel center coordinates use the same stride/padding/dilation mapping as GraphConv; out-of-bounds references are zero, and the adjoint gathers the unique mapped output without atomics. Actual-Oxide forward/backward parity, all-input finite differences, and padded/strided boundary coverage pass in `MEM=3G ./tools/test_oxide.sh --test oxide_graph_conv` (5 tests total). This prepares—but does not yet implement—self-projection runtime support. No compiled-C++ golden/full-suite/performance claim.
+
+## 87. GraphConv self-projection runtime path
+
+- v0.2.065: integrated the native center-reference branch into GraphConv no-BN runtime. Self projection now runs as a grouped pointwise convolution added to the neighbor projection; backward computes its weight gradient, gathers its input adjoint through the reference primitive, and accumulates self-weight updates into existing host optimizer buffers. Actual-Oxide runtime forward/backward and parameter parity against CPU pass across SGD and Adam in `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain graph_conv_self_projection_runtime_forward_backward_and_sgd_adam_match_cpu` (1 test). BN, unsupported activations/edge modes, compact inference, and compiled-C++ golden remain open; optimizer gradients/updates are host-staged. No full-suite/performance claim.
 
 ## Not implemented / open (pointer)
 
