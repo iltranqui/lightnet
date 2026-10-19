@@ -3209,6 +3209,75 @@ fn local_native_gpu_training_matches_cpu_across_two_updates() {
 }
 
 #[test]
+fn gpu_muon_convolution_device_gradients_match_cpu_across_steps() {
+    let net = network(
+        "[net]\nwidth=4\nheight=4\nchannels=2\nbatch=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0001\n\
+         [convolutional]\nfilters=2\nsize=3\nstride=1\npadding=1\ngroups=2\nbatch_normalize=0\nactivation=leaky\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    darknet_core::initialize_training_params(&net, &mut cpu.params, 79);
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu()
+        .expect("convolution Muon train buffers");
+
+    for step in 1..=2 {
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu()
+            .expect("zero convolution Muon buffers");
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu
+            .forward_training(&input)
+            .expect("CPU convolution Muon forward");
+        let gpu_forward = gpu
+            .forward_training_device(&input)
+            .expect("Oxide convolution Muon forward");
+        let gpu_output = gpu
+            .backend
+            .download_f32(&gpu_forward.gpu_layer_outputs[0])
+            .expect("download convolution Muon output");
+        close(
+            &format!("convolution Muon output step {step}"),
+            &gpu_output,
+            &cpu_forward.layer_outputs[0].data,
+            2e-4,
+        );
+        for microbatch in 0..2 {
+            let seed = Tensor::filled(
+                cpu.network.layers[0].output_shape,
+                0.03 + step as f32 * 0.01 + microbatch as f32 * 0.005,
+            );
+            let seeds = [Some(seed)];
+            cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+                .expect("CPU convolution Muon backward");
+            gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+                .expect("Oxide convolution Muon backward");
+        }
+        cpu.update_weights_muon(0.01, 2)
+            .expect("CPU convolution Muon update");
+        gpu.update_weights_gpu(0.01, 0.9, net.net.decay, 2)
+            .expect("Oxide convolution Muon update");
+        let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(gpu_conv)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("convolution parameter layout expected");
+        };
+        close(
+            &format!("convolution Muon weights step {step}"),
+            &gpu_conv.weights,
+            &cpu_conv.weights,
+            8e-4,
+        );
+        close(
+            &format!("convolution Muon biases step {step}"),
+            &gpu_conv.biases,
+            &cpu_conv.biases,
+            8e-4,
+        );
+    }
+}
+
+#[test]
 fn gpu_muon_local_location_matrices_match_cpu_across_steps() {
     let net = network(
         "[net]\nwidth=4\nheight=4\nchannels=2\nbatch=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0001\n\

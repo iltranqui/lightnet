@@ -10295,28 +10295,34 @@ where
             ));
         }
         if let Some((index, _)) = self.params.iter().enumerate().find(|(index, params)| {
-            !matches!(
-                (&self.network.layers[*index].kind, *params),
-                (_, LayerParams::None)
-                    | (LayerKind::BatchNorm(_), LayerParams::BatchNorm(_))
-                    | (LayerKind::Connected(_), LayerParams::Connected(_))
-                    | (LayerKind::Local(_), LayerParams::Local(_))
-                    | (LayerKind::Rnn(_), LayerParams::Rnn(_))
-                    | (LayerKind::Lstm(_), LayerParams::Lstm(_))
-                    | (LayerKind::Vit(_), LayerParams::Vit(_))
-                    | (LayerKind::Swin(_), LayerParams::Swin(_))
-                    | (LayerKind::TuckerAttention(_), LayerParams::TuckerAttention(_))
-                    | (LayerKind::MambaVision(_), LayerParams::MambaVision(_))
-                    | (LayerKind::KimiKda(_), LayerParams::KimiKda(_))
-                    | (
-                        LayerKind::Deconvolutional(_),
-                        LayerParams::Convolutional(_)
-                    )
-            )
+            let kind = &self.network.layers[*index].kind;
+            match (kind, *params) {
+                (LayerKind::Convolutional(spec), LayerParams::Convolutional(_)) => {
+                    spec.batch_normalize
+                }
+                _ => !matches!(
+                    (kind, *params),
+                    (_, LayerParams::None)
+                        | (LayerKind::BatchNorm(_), LayerParams::BatchNorm(_))
+                        | (LayerKind::Connected(_), LayerParams::Connected(_))
+                        | (LayerKind::Local(_), LayerParams::Local(_))
+                        | (LayerKind::Rnn(_), LayerParams::Rnn(_))
+                        | (LayerKind::Lstm(_), LayerParams::Lstm(_))
+                        | (LayerKind::Vit(_), LayerParams::Vit(_))
+                        | (LayerKind::Swin(_), LayerParams::Swin(_))
+                        | (LayerKind::TuckerAttention(_), LayerParams::TuckerAttention(_))
+                        | (LayerKind::MambaVision(_), LayerParams::MambaVision(_))
+                        | (LayerKind::KimiKda(_), LayerParams::KimiKda(_))
+                        | (
+                            LayerKind::Deconvolutional(_),
+                            LayerParams::Convolutional(_)
+                        )
+                ),
+            }
         }) {
             return Err(Error::UnsupportedLayer {
                 layer_index: index,
-                name: "GPU Muon runtime supports host-gradient local/RNN/LSTM/Kimi/MambaVision/Tucker/Swin/ViT/deconvolutional/connected matrices and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
+                name: "GPU Muon supports standard convolution matrices without BN via host-staged device gradients, plus host-gradient local/RNN/LSTM/Kimi/MambaVision/Tucker/Swin/ViT/deconvolutional/connected matrices and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
             });
         }
         let step = self.adam_step.checked_add(1).ok_or_else(|| {
@@ -10359,6 +10365,45 @@ where
                 continue;
             }
             let options = layer.train;
+            if let LayerKind::Convolutional(spec) = &layer.kind
+                && !spec.batch_normalize
+            {
+                let device_gradients = {
+                    let device_buffers = self.device_train_buffers.borrow();
+                    let train = device_buffers
+                        .get(index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing device convolution gradients for Muon layer #{index}"
+                            ))
+                        })?;
+                    if train.pending.is_some() || train.scale_updates.is_some() {
+                        return Err(Error::InvalidConfig(format!(
+                            "GPU Muon cannot stage deferred or batch-normalization gradients for convolution layer #{index}"
+                        )));
+                    }
+                    (
+                        self.backend
+                            .download_f32(&train.weight_updates)
+                            .map_err(|err| {
+                                backend_error("download convolution Muon gradients", err)
+                            })?,
+                        self.backend
+                            .download_f32(&train.bias_updates)
+                            .map_err(|err| {
+                                backend_error("download convolution bias gradients", err)
+                            })?,
+                    )
+                };
+                let LayerTrainBuffers::Convolutional(train) = &mut buffers[index] else {
+                    return Err(Error::InvalidConfig(format!(
+                        "convolution Muon layer #{index} has mismatched host train buffers"
+                    )));
+                };
+                train.weight_updates = device_gradients.0;
+                train.bias_updates = device_gradients.1;
+            }
             prepare_muon_layer_gradients(
                 &layer.kind,
                 options,
@@ -10563,6 +10608,38 @@ where
                 muon_state,
                 staged,
             )?;
+            if let (LayerKind::Convolutional(spec), LayerParams::Convolutional(params)) =
+                (&layer.kind, &self.params[index])
+                && !spec.batch_normalize
+            {
+                let refreshed = self.cached_convolution_upload(
+                    spec,
+                    layer.input_shape.channels,
+                    params,
+                    None,
+                )?;
+                self.set_device_conv_params(index, 0, refreshed)?;
+                let mut device_buffers = self.device_train_buffers.borrow_mut();
+                let train = device_buffers[index].as_mut().ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "missing device convolution buffers after Muon layer #{index} update"
+                    ))
+                })?;
+                train.weight_updates = self
+                    .backend
+                    .zeros_f32(&[
+                        spec.filters,
+                        layer.input_shape.channels / spec.groups.max(1),
+                        spec.size,
+                        spec.size,
+                    ])
+                    .map_err(|err| backend_error("zero convolution Muon gradients", err))?;
+                train.bias_updates = self
+                    .backend
+                    .zeros_f32(&[spec.filters])
+                    .map_err(|err| backend_error("zero convolution Muon bias gradients", err))?;
+                train.pending = None;
+            }
         }
         self.adam_step = step;
         self.host_weights_stale = false;
@@ -46030,12 +46107,12 @@ activation=linear
     }
 
     #[test]
-    fn gpu_muon_rejects_convolutional_parameter_family_before_updating() {
+    fn gpu_muon_rejects_batch_normalized_convolution_before_updating() {
         let mut gpu = optimizer_net("muon=1\ndecoupled_decay=1");
         let before = gpu.params.clone();
         let error = gpu
             .update_weights_gpu(0.01, 0.9, 0.0005, 2)
-            .expect_err("convolutional GPU Muon is not integrated yet");
+            .expect_err("batch-normalized convolution Muon staging is not integrated yet");
         assert!(error
             .to_string()
             .contains("other parameter families remain explicitly unsupported"));
