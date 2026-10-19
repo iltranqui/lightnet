@@ -100,6 +100,7 @@ file is named inline.
 - [72. GPU Muon LSTM matrices](#72-gpu-muon-lstm-matrices)
 - [73. Native GPU SAM forward and backward](#73-native-gpu-sam-forward-and-backward)
 - [74. Hybrid GPU Muon for convolution matrices](#74-hybrid-gpu-muon-for-convolution-matrices)
+- [75. Hybrid GPU Muon for non-BN EML branches](#75-hybrid-gpu-muon-for-non-bn-eml-branches)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1565,6 +1566,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 74. Hybrid GPU Muon for convolution matrices
 
 - v0.2.052: extended hybrid GPU Muon to standard convolutional matrices without batch normalization. The optimizer downloads accumulated device weight/bias gradients at the update boundary, runs Oxide Newton–Schulz orthogonalization, applies host-staged AdamW/Muon updates, refreshes cached device parameters, and clears consumed device gradients. Actual-Oxide grouped-convolution parity passed for two updates with two accumulated seeded backward calls per step, including outputs, weights, and biases (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_convolution_device_gradients_match_cpu_across_steps`); `MEM=3G ./tools/test_host.sh gpu_muon_` passed 4, including the explicit BN-convolution rejection. BN convolutions and other convolutional families remain unsupported; gradients/state/final updates cross the host boundary. No compiled-C++ golden, full-suite, or performance claim.
+
+## 75. Hybrid GPU Muon for non-BN EML branches
+
+- v0.2.053: extended hybrid GPU Muon to both non-batch-normalized EML convolution branches. Accumulated device weight/bias gradients are downloaded at the optimizer boundary, each branch's matrices use Oxide Newton–Schulz, host AdamW/Muon updates apply, and updated parameters are re-uploaded to the appropriate device cache slots while gradients are cleared. Actual-Oxide CPU parity passed across two updates with two accumulated seeded backward calls per step, covering outputs, both branches' weights/biases, and a subsequent forward after cache refresh (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_eml_device_gradients_match_cpu_across_steps`). Host `MEM=3G ./tools/test_host.sh gpu_muon_` passed 4 and rejects BN EML/convolution before mutation. BN EML remains unsupported; gradients/state/final updates cross the host boundary. No compiled-C++ golden, full-suite, or performance claim.
 
 ## Not implemented / open (pointer)
 
