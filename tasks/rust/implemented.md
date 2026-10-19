@@ -121,6 +121,7 @@ file is named inline.
 - [93. GraphConv GPU Muon update gate](#93-graphconv-gpu-muon-update-gate)
 - [94. Grouped GraphConv GPU Muon parity](#94-grouped-graphconv-gpu-muon-parity)
 - [95. GraphConv BN GPU Muon through CPU fallback](#95-graphconv-bn-gpu-muon-through-cpu-fallback)
+- [96. Native GraphConv BN training](#96-native-graphconv-bn-training)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1670,6 +1671,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 95. GraphConv BN GPU Muon through CPU fallback
 
 - v0.2.073 (`007d6eed`): enabled GPU Muon updates for batch-normalized GraphConv by using the existing whole-network CPU forward/backward fallback for BN variants, while Oxide supplies matrix orthogonalization. Actual-device two-step parity covers grouped learned edges+self, projection/self/edge matrices and biases, BN gamma/beta, and rolling mean/variance: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_graph_conv_batch_norm_cpu_fallback_matches_cpu` passed 1 test. This is optimizer eligibility over the CPU training fallback—not native GraphConv BN training. Native BN training, other activation/edge/group variants, and compiled-C++ evidence remain open; no full-suite/performance claim.
+
+## 96. Native GraphConv BN training
+
+- v0.2.074: native f32 GraphConv training now supports batch-statistics BN with the eligible edge modes 0/1 and supported activations. GPU forward caches BN statistics; native backward computes input, gamma, beta, projection, self, and learned-edge gradients. Rolling mean/variance return from the device after backward using the CPU GraphConv reference's 0.9 update coefficient. Oxide actual-device parity passed for grouped learned-edge+self across SGD and Adam, including output, trainable parameters and rolling statistics (`graph_conv_batch_norm_native_training_forward_backward_sgd_adam_matches_cpu`); two-step GPU Muon parity also passes (`gpu_muon_graph_conv_batch_norm_native_training_matches_cpu`). `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain graph_conv` passed 9 tests; focused host BN inference and Muon rejection tests passed. Unsupported activations/edge modes retain fallback; other configurations, compiled-C++ golden, full-suite and performance evidence remain open.
 
 ## Not implemented / open (pointer)
 
