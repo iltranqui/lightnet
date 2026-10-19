@@ -105,7 +105,7 @@ with the command given rather than trusting the number.
 | `Crnn` | yes | C++ | fwd | exact | T3 | mixed (device w/o BN) | mixed | no |
 | `Moe` | alias | C++ | fwd | exact | pin | native | device | no |
 | `EmlConvolutional` | alias | C++ | fwd | exact | pin | native | device / CPU (BN) | no |
-| `GraphConv` | alias | C++ | fwd | exact | T4 | native f32 eligible; compact BN inference; host otherwise | device eligible no-BN / CPU fallback BN/unsupported | no |
+| `GraphConv` | alias | C++ | fwd | exact | T4 | native f32 supported inference incl. BN; native no-BN training; host otherwise | device eligible no-BN / CPU fallback BN/unsupported | no |
 | `Dcnv4` | alias | C++ | fwd | exact | pin | native (incl. rolling-stat BN, <=225 points, supported scalar/NormalizeChannels* acts incl. Revleaky) / host otherwise | mixed (native math and SGD/Adam update; learned parameter tensors cached across GPU calls; Adam moments resident between updates, sidecar on save) | no |
 | `DeformConv` | alias | C++ | fwd | exact | T4 | native (dilation 1, no BN) / host otherwise | native (same gate; one host hop for the normalization Jacobian) | no |
 | `DsConv` | alias | C++ | fwd | exact | T4 | none | none | no |
@@ -182,7 +182,7 @@ the legacy host route.
 > `oxide_runtime_chain` device test (forward outputs, one SGD step, every
 > parameter block, masked) plus the retained host-fallback test for the BN case.
 > The only host-resident step in the device path is the batch-serial
-> normalization Jacobian. `[dsconv]` remains unwired. v0.2.059 wires a bounded native Oxide f32 GraphConv runtime path for uniform edge mode 0; v0.2.063 adds learned edge mode 1, and v0.2.065 adds self projection, for supported activations without BN. v0.2.066 adds compact f32 inference for those eligible variants; v0.2.067 extends compact inference to BN using rolling stats, gamma and projection beta. Aggregation, grouped pointwise projections, epilogue and activation run on device for eligible compact inference; training/full-runtime BN remains fallback. Actual-Oxide output and optimizer parity cover no-BN runtime variants, while compact inference has CPU parity for learned+self with and without BN. Unsupported activations/edge modes remain fallback/rejected. Evidence and limits: `implemented.md` §§79–89.
+> normalization Jacobian. `[dsconv]` remains unwired. v0.2.059 wires a bounded native Oxide f32 GraphConv runtime path for uniform edge mode 0; v0.2.063 adds learned edge mode 1, and v0.2.065 adds self projection, for supported activations without BN. v0.2.066 adds compact f32 inference for those eligible variants; v0.2.067 extends compact inference to BN using rolling stats, gamma and projection beta. Aggregation, grouped pointwise projections, epilogue and activation run on device for eligible compact inference; training BN remains fallback. Actual-Oxide output and optimizer parity cover no-BN runtime variants, while full and compact inference have CPU parity for learned+self with and without BN. Unsupported activations/edge modes remain fallback/rejected. Evidence and limits: `implemented.md` §§79–90.
 > **DCNv4 is bounded-native in v0.2.013–014:** <=25 active points, supported
 > elementwise activation, optional rolling-stat BN, no other CPU fallback/
 > host-only deform_conv. Both directions share the global gate. BN affine/

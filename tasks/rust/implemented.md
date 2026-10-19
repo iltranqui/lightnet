@@ -115,6 +115,7 @@ file is named inline.
 - [87. GraphConv self-projection runtime path](#87-graphconv-self-projection-runtime-path)
 - [88. Compact GraphConv inference](#88-compact-graphconv-inference)
 - [89. Compact GraphConv batch-normalization inference](#89-compact-graphconv-batch-normalization-inference)
+- [90. Full GraphConv batch-normalization inference](#90-full-graphconv-batch-normalization-inference)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1640,6 +1641,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 89. Compact GraphConv batch-normalization inference
 
 - v0.2.067: extended compact f32 GraphConv inference to apply batch normalization using rolling mean/variance, gamma, and projection beta. The compact-only eligibility check now permits BN while the training/full-runtime predicate still preserves the existing BN fallback. Actual-Oxide CPU parity passes for learned edges plus self projection and BN in `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain graph_conv_compact_inference_matches_cpu` (2 tests, BN and non-BN). Training BN and compiled-C++ golden remain open; no full-suite/performance claim.
+
+## 90. Full GraphConv batch-normalization inference
+
+- v0.2.068: extended the ordinary f32 GPU inference runtime to execute supported GraphConv variants with BN natively, using rolling statistics, gamma and projection beta; compact inference support from v0.2.067 remains. Training BN and unsupported activation/edge variants retain CPU fallback. A FakeBackend test confirms this inference path avoids constructing the CPU GraphConv cache; actual-Oxide full and compact outputs match CPU in `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain graph_conv_compact_inference_matches_cpu` (2 tests). The focused `MEM=3G ./tools/test_host.sh graph_conv_batchnorm_inference_uses_gpu_backend_without_cpu_cache` passed 1 core test. Hand-derived from the Rust CPU contract; no compiled-C++ golden, full-suite, or performance claim.
 
 ## Not implemented / open (pointer)
 
