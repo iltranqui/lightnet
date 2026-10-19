@@ -85,7 +85,7 @@ with the command given rather than trusting the number.
 | `Connected` | yes | C++ | fwd | exact | T1 | native / host (unsupported act) | mixed | no |
 | `MaxPool` | alias | none | fwd | exact | pin | native f32 incl. depth pooling (f16 depth rejected) | device | yes |
 | `LocalAvgPool` | alias | none | fwd | exact | T1 | native (channel-changing rejected) | device | yes |
-| `AvgPool` | alias | none | fwd | exact | T1 | native | device | yes |
+| `AvgPool` | alias | none | fwd | exact | pin | native | device | yes |
 | `Route` | alias | none | fwd | exact | T1 | native | device | yes |
 | `Shortcut` | alias | C++ | fwd | exact | pin | native | mixed (weight grad host) | yes |
 | `Upsample` | alias | none | fwd | exact | T1 | native | device | yes |
@@ -285,7 +285,7 @@ variants or non-layer work.
 | `Detection` | parsed as identity; C++ decode + loss unimplemented in Rust | needs its own plan |
 | `Contrastive` detection branch | needs the yolo head's per-box class ids; `YoloHeadOutput` carries only the raw tensor | blocked on a head-metadata change |
 | CARPN Stage-2 training | `[obb_refine]` inference only; blocks `detector train -map` for CARPN | after `carpn_network_map_plan.md` |
-| Axis pins | 39 open variants (`T1`–`T4`) plus a per-backlog A2 test | `axis-coverage.md` |
+| Axis pins | 38 open variants (`T1`–`T4`) plus a per-backlog A2 test | `axis-coverage.md` |
 | Conv `reverse` / `deform`, adversarial yolo branch | gradients missing | `todo.md` |
 | `Local`, `Gru` training | Rust-only extensions, partial | `todo.md` |
 | EML BN batch-stat training | CPU uses rolling stats, not C++ batch statistics | `implemented.md` §7 |

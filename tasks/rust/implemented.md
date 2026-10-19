@@ -136,6 +136,7 @@ file is named inline.
 - [108. Hybrid GPU Muon for CRNN matrices](#108-hybrid-gpu-muon-for-crnn-matrices)
 - [109. Native GPU maxpool_depth](#109-native-gpu-maxpool_depth)
 - [110. MaxPool axis/layout contract pin](#110-maxpool-axislayout-contract-pin)
+- [111. AvgPool axis/layout contract pin](#111-avgpool-axislayout-contract-pin)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1745,6 +1746,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 110. MaxPool axis/layout contract pin
 
 - v0.1.028: pinned the MaxPool axis contract to a named non-square, batch-2 hand-computed test covering depth-channel groups, first-wins ties, NCHW batch/channel/spatial order, spatial scan/stride order and `maxpool_zero_nonmax` backward. `MEM=3G ./tools/test_host.sh axis_layout` passed 24 tests; `MEM=3G ./tools/test_host.sh every_layer_kind_has_an_axis_pin_decision` passed. The axis ledger now records 21 pinned variants / 39 open C++ variants / 5 Rust-only extensions. Hand-derived from `Jev_laya:src-lib/maxpool_layer.cpp`; no compiled-C++ golden.
+
+## 111. AvgPool axis/layout contract pin
+
+- v0.1.029: pinned the global AvgPool reduction with a hand-computed non-square B=2/C=2 fixture and supplied-seed backward. The named test verifies `[B,C]` output order, per-sample/per-channel `H*W` means, and uniform per-plane gradients; config shape and the axis registry are checked. `MEM=3G ./tools/test_host.sh axis_layout` passed 25; the standalone test and registry test passed. Hand-derived from `Jev_laya:src-lib/avgpool_layer.cpp:51`; no compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 
