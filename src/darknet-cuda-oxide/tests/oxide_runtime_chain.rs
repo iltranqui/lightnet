@@ -3276,3 +3276,53 @@ fn gpu_muon_connected_update_gate_matches_cpu_on_device() {
         }
     }
 }
+
+#[test]
+fn gpu_muon_deconvolution_host_gradients_match_cpu_across_steps() {
+    let net = network(
+        "[net]\nwidth=2\nheight=2\nchannels=1\nbatch=1\nmuon=1\ndecoupled_decay=1\ndecay=0.0002\nloss_scale=8\n\
+         [deconvolutional]\nfilters=1\nsize=2\nstride=2\nactivation=linear\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let LayerParams::Convolutional(params) = &mut cpu.params[0] else {
+        panic!("deconvolution parameters expected");
+    };
+    params.weights.copy_from_slice(&[0.2, -0.1, 0.3, 0.4]);
+    params.biases.copy_from_slice(&[0.05]);
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+
+    for step in 1..=2 {
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("Oxide host-fallback deconvolution forward");
+        let seed = Tensor::filled(cpu.network.layers[0].output_shape, 0.025 * step as f32);
+        let seeds = [Some(seed)];
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("CPU-fallback GPU backward");
+        cpu.update_weights_muon(0.02, 1).expect("CPU Muon update");
+        gpu.update_weights_gpu(0.02, 0.9, net.net.decay, 1)
+            .expect("GPU Muon update");
+        let (LayerParams::Convolutional(cpu_params), LayerParams::Convolutional(gpu_params)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("deconvolution parameters expected after update");
+        };
+        close(
+            "GPU Muon deconvolution weights",
+            &gpu_params.weights,
+            &cpu_params.weights,
+            8e-4,
+        );
+        close(
+            "GPU Muon deconvolution biases",
+            &gpu_params.biases,
+            &cpu_params.biases,
+            8e-4,
+        );
+    }
+}

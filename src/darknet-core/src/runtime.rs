@@ -10294,15 +10294,21 @@ where
                 "GPU Muon momentum must be finite and in [0, 1)".to_owned(),
             ));
         }
-        if let Some((index, _)) = self.params.iter().enumerate().find(|(_, params)| {
+        if let Some((index, _)) = self.params.iter().enumerate().find(|(index, params)| {
             !matches!(
-                params,
-                LayerParams::None | LayerParams::BatchNorm(_) | LayerParams::Connected(_)
+                (&self.network.layers[*index].kind, *params),
+                (_, LayerParams::None)
+                    | (LayerKind::BatchNorm(_), LayerParams::BatchNorm(_))
+                    | (LayerKind::Connected(_), LayerParams::Connected(_))
+                    | (
+                        LayerKind::Deconvolutional(_),
+                        LayerParams::Convolutional(_)
+                    )
             )
         }) {
             return Err(Error::UnsupportedLayer {
                 layer_index: index,
-                name: "GPU Muon runtime currently supports host-resident connected and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
+                name: "GPU Muon runtime supports host-gradient deconvolutional matrices, connected matrices, and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
             });
         }
         let step = self.adam_step.checked_add(1).ok_or_else(|| {
@@ -45492,7 +45498,7 @@ activation=linear
     }
 
     #[test]
-    fn gpu_muon_rejects_non_connected_parameter_families_before_updating() {
+    fn gpu_muon_rejects_convolutional_parameter_family_before_updating() {
         let mut gpu = optimizer_net("muon=1\ndecoupled_decay=1");
         let before = gpu.params.clone();
         let error = gpu
