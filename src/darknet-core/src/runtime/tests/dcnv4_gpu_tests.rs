@@ -16,6 +16,70 @@ fn dcnv4_network(extra: &str, tail: &str) -> Network {
 }
 
 #[test]
+fn dcnv4_gpu_adam_uses_sidecar_compatible_moments() {
+    let mut network = dcnv4_network("batch_normalize=1", "");
+    network.net.adam = true;
+    network.net.decoupled_decay = true;
+    let mut cpu = ExecutableNetwork::new(network.clone());
+    let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+    gpu.init_train_buffers_gpu().unwrap();
+
+    let LayerTrainBuffers::Dcnv4(cpu_train) = &mut cpu.train_buffers[0] else {
+        unreachable!()
+    };
+    cpu_train.offset_weight_updates.fill(0.025);
+    cpu_train.offset_bias_updates.fill(-0.03);
+    cpu_train.bias_updates.fill(0.04);
+    cpu_train
+        .batch_norm
+        .as_mut()
+        .unwrap()
+        .scale_updates
+        .fill(-0.05);
+    {
+        let mut buffers = gpu.device_dcnv4_train_buffers.borrow_mut();
+        let train = buffers[0].as_mut().unwrap();
+        train.offset_weight_updates.data.fill(0.025);
+        train.offset_bias_updates.data.fill(-0.03);
+        train.bias_updates.data.fill(0.04);
+        train.scale_updates.as_mut().unwrap().data.fill(-0.05);
+        train.dirty = true;
+    }
+
+    cpu.update_weights_adam(0.002, 2).unwrap();
+    gpu.update_weights_gpu(0.002, 0.0, 0.0, 2).unwrap();
+    for (want, got) in cpu.params.iter().zip(&gpu.params) {
+        match (want, got) {
+            (LayerParams::Dcnv4(want), LayerParams::Dcnv4(got)) => {
+                for (a, b) in [
+                    (&want.offset_weights, &got.offset_weights),
+                    (&want.offset_biases, &got.offset_biases),
+                    (&want.biases, &got.biases),
+                    (
+                        &want.batch_norm.as_ref().unwrap().scales,
+                        &got.batch_norm.as_ref().unwrap().scales,
+                    ),
+                ] {
+                    assert_eq!(a, b);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    assert!(gpu.host_adam_state.borrow()[0].is_some());
+    let path = std::env::temp_dir().join(format!(
+        "darknet-gpu-dcnv4-adam-{}.state",
+        std::process::id()
+    ));
+    gpu.save_optimizer_state(&path).unwrap();
+    let mut restored = GpuExecutableNetwork::new(network, FakeBackend);
+    restored.load_optimizer_state(&path).unwrap();
+    assert_eq!(restored.host_adam_state, gpu.host_adam_state);
+    assert_eq!(restored.adam_step, gpu.adam_step);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn dcnv4_bn_gpu_uses_native_path_before_stats_update() {
     let network = dcnv4_network("batch_normalize=1", "");
     let gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
