@@ -98,7 +98,7 @@ fn has_host_only_deform(network: &Network) -> bool {
 /// Native GraphConv runtime currently covers uniform edge averaging without
 /// self projection or BN, for activations supported by the f32 backend.
 fn graph_conv_spec_needs_host(spec: &GraphConvSpec) -> bool {
-    spec.edge_mode != 0
+    !matches!(spec.edge_mode, 0 | 1)
         || spec.use_self
         || spec.batch_normalize
         || (spec.activation.to_channel_normalization().is_none()
@@ -13169,11 +13169,35 @@ where
                             layer.input_shape,
                             layer.output_shape,
                         );
-                        let aggregate = self
-                            .backend
-                            .graph_conv_aggregate_f32(current_input, geometry, launch_config)
-                            .map_err(|err| backend_error("GraphConv uniform aggregation", err))?;
                         let groups = spec.groups.max(1);
+                        let aggregate = if spec.edge_mode == 0 {
+                            self.backend
+                                .graph_conv_aggregate_f32(current_input, geometry, launch_config)
+                                .map_err(|err| backend_error("GraphConv uniform aggregation", err))?
+                        } else {
+                            let edge_kernel_values = params.edge_kernel.as_deref().ok_or_else(|| {
+                                Error::InvalidConfig("GraphConv learned edge kernel is missing".to_owned())
+                            })?;
+                            let edge_bias_values = params.edge_biases.as_deref().ok_or_else(|| {
+                                Error::InvalidConfig("GraphConv learned edge biases are missing".to_owned())
+                            })?;
+                            let edge_kernel = self.backend
+                                .upload_f32(&[edge_kernel_values.len()], edge_kernel_values)
+                                .map_err(|err| backend_error("upload GraphConv edge kernel", err))?;
+                            let edge_biases = self.backend
+                                .upload_f32(&[edge_bias_values.len()], edge_bias_values)
+                                .map_err(|err| backend_error("upload GraphConv edge biases", err))?;
+                            self.backend
+                                .graph_conv_learned_aggregate_f32(
+                                    current_input,
+                                    &edge_kernel,
+                                    &edge_biases,
+                                    geometry,
+                                    groups,
+                                    launch_config,
+                                )
+                                .map_err(|err| backend_error("GraphConv learned aggregation", err))?
+                        };
                         let weight_shape = [spec.filters, layer.input_shape.channels / groups, 1, 1];
                         let weights = self
                             .backend
@@ -15753,18 +15777,44 @@ where
                     } else {
                         &forward.gpu_layer_outputs[layer.index - 1]
                     };
-                    let aggregate = self
-                        .backend
-                        .graph_conv_aggregate_f32(
-                            current_input,
-                            graph_conv_aggregation_geometry(
-                                spec,
-                                layer.input_shape,
-                                layer.output_shape,
-                            ),
-                            config,
+                    let geometry = graph_conv_aggregation_geometry(
+                        spec,
+                        layer.input_shape,
+                        layer.output_shape,
+                    );
+                    let (aggregate, edge_kernel, edge_biases) = if spec.edge_mode == 0 {
+                        (
+                            self.backend
+                                .graph_conv_aggregate_f32(current_input, geometry, config)
+                                .map_err(|err| backend_error("GraphConv backward aggregation", err))?,
+                            None,
+                            None,
                         )
-                        .map_err(|err| backend_error("GraphConv backward aggregation", err))?;
+                    } else {
+                        let edge_kernel_values = params.edge_kernel.as_deref().ok_or_else(|| {
+                            Error::InvalidConfig("GraphConv learned edge kernel is missing".to_owned())
+                        })?;
+                        let edge_bias_values = params.edge_biases.as_deref().ok_or_else(|| {
+                            Error::InvalidConfig("GraphConv learned edge biases are missing".to_owned())
+                        })?;
+                        let edge_kernel = self.backend
+                            .upload_f32(&[edge_kernel_values.len()], edge_kernel_values)
+                            .map_err(|err| backend_error("upload GraphConv backward edge kernel", err))?;
+                        let edge_biases = self.backend
+                            .upload_f32(&[edge_bias_values.len()], edge_bias_values)
+                            .map_err(|err| backend_error("upload GraphConv backward edge biases", err))?;
+                        let aggregate = self.backend
+                            .graph_conv_learned_aggregate_f32(
+                                current_input,
+                                &edge_kernel,
+                                &edge_biases,
+                                geometry,
+                                groups,
+                                config,
+                            )
+                            .map_err(|err| backend_error("GraphConv learned backward aggregation", err))?;
+                        (aggregate, Some(edge_kernel), Some(edge_biases))
+                    };
                     let weights = self
                         .backend
                         .upload_f32(
@@ -15835,18 +15885,38 @@ where
                             config,
                         )
                         .map_err(|err| backend_error("GraphConv projection input backward", err))?;
-                    let input_gradient = self
-                        .backend
-                        .graph_conv_aggregate_backward_f32(
-                            &aggregate_gradient,
-                            graph_conv_aggregation_geometry(
-                                spec,
-                                layer.input_shape,
-                                layer.output_shape,
-                            ),
-                            config,
-                        )
-                        .map_err(|err| backend_error("GraphConv aggregation backward", err))?;
+                    let (input_gradient, edge_kernel_values, edge_bias_values) =
+                        if let (Some(edge_kernel), Some(edge_biases)) =
+                            (edge_kernel.as_ref(), edge_biases.as_ref())
+                        {
+                            let (input_gradient, edge_kernel_gradient, edge_bias_gradient) = self
+                                .backend
+                                .graph_conv_learned_aggregate_backward_f32(
+                                    current_input,
+                                    edge_kernel,
+                                    edge_biases,
+                                    &aggregate_gradient,
+                                    geometry,
+                                    groups,
+                                    config,
+                                )
+                                .map_err(|err| {
+                                    backend_error("GraphConv learned aggregation backward", err)
+                                })?;
+                            let edge_kernel_values = self.backend
+                                .download_f32(&edge_kernel_gradient)
+                                .map_err(|err| backend_error("download GraphConv edge-kernel gradient", err))?;
+                            let edge_bias_values = self.backend
+                                .download_f32(&edge_bias_gradient)
+                                .map_err(|err| backend_error("download GraphConv edge-bias gradient", err))?;
+                            (input_gradient, Some(edge_kernel_values), Some(edge_bias_values))
+                        } else {
+                            let input_gradient = self
+                                .backend
+                                .graph_conv_aggregate_backward_f32(&aggregate_gradient, geometry, config)
+                                .map_err(|err| backend_error("GraphConv aggregation backward", err))?;
+                            (input_gradient, None, None)
+                        };
                     let weight_values = self
                         .backend
                         .download_f32(&weight_gradient)
@@ -15880,6 +15950,26 @@ where
                             .zip(bias_values)
                         {
                             *dst += src;
+                        }
+                        if let Some(values) = edge_kernel_values {
+                            let Some(updates) = train.edge_kernel_updates.as_mut() else {
+                                return Err(Error::InvalidConfig(
+                                    "missing GraphConv edge-kernel gradient buffer".to_owned(),
+                                ));
+                            };
+                            for (dst, src) in updates.iter_mut().zip(values) {
+                                *dst += src;
+                            }
+                        }
+                        if let Some(values) = edge_bias_values {
+                            let Some(updates) = train.edge_bias_updates.as_mut() else {
+                                return Err(Error::InvalidConfig(
+                                    "missing GraphConv edge-bias gradient buffer".to_owned(),
+                                ));
+                            };
+                            for (dst, src) in updates.iter_mut().zip(values) {
+                                *dst += src;
+                            }
                         }
                     }
                     self.accumulate_previous_gpu_gradient(
