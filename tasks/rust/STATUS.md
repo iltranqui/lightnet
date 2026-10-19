@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.027 (`e5217f8a`): native DCNv4 now supports through 15x15/225 active points; GPU composition and runtime two-step SGD/Adam parity with CPU passed, and >225 retains host fallback. Host DCNv4 29; Oxide composition 3; focused actual-GPU runtime 1 passed. No speedup, compiled-C++ or full-suite claim; see `implemented.md` §64.
 - v0.2.026 (`fafa95ae`): `Revleaky` now maps to the existing native Leaky f32 operation with matching Rust forward/backward semantics; DCNv4 actual-device two-step SGD/Adam CPU parity now includes Revleaky. Host DCNv4 29 and focused RTX 4060 runtime test passed. No speedup, compiled-C++ or full-suite claim; see `implemented.md` §63.
 - v0.2.025 (`7c96d45a`): eligible native DCNv4 Adam now runs device optimizer operations while moments round-trip through the existing host-sidecar state; parameters remain host-canonical. Host DCNv4 29 and focused actual-GPU two-step SGD/Adam CPU-parity tests passed. No speedup, compiled-C++ or full-suite claim; see `implemented.md` §62.
 - v0.2.024 (`0087d109`): eligible native DCNv4 SGD now uses device gradients and momentum for updates; Adam and canonical parameters remain host-side. Host DCNv4 28 and focused actual-GPU two-step SGD/Adam CPU-parity test passed. No speedup, compiled-C++ or full-suite claim; see `implemented.md` §61.
