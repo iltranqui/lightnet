@@ -32,7 +32,7 @@ use kernels::{
     activations, amp as amp_k, batchnorm, bias_scale, conv_direct, conv_implicit, convert,
     deform_sample,
     dcnv4, elementwise, gemm, gemm_f8, gemm_f16, gemm_fp4, gemm_mma, half_ops, im2col,
-    layers_extra, optim, pool, quant_fp4, resample, route,
+    layers_extra, muon, optim, pool, quant_fp4, resample, route,
 };
 use tensor::PooledBuf;
 pub use tensor::{OxideTensorF16, OxideTensorF32};
@@ -71,6 +71,7 @@ pub struct OxideBackend {
     layernorm: activations::layernorm::LoadedModule,
     bias_scale: bias_scale::kernels::LoadedModule,
     batchnorm: batchnorm::kernels::LoadedModule,
+    muon: muon::kernels::LoadedModule,
     optim: optim::kernels::LoadedModule,
     gemm: gemm::kernels::LoadedModule,
     gemm_mma: gemm_mma::kernels::LoadedModule,
@@ -488,6 +489,8 @@ impl OxideBackend {
             .map_err(|err| OxideError::Shape(format!("load bias_scale module: {err:?}")))?;
         let batchnorm = batchnorm::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load batchnorm module: {err:?}")))?;
+        let muon = muon::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load Muon module: {err:?}")))?;
         let optim = optim::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load optim module: {err:?}")))?;
         let gemm = gemm::kernels::load(&ctx)
@@ -549,6 +552,7 @@ impl OxideBackend {
             layernorm,
             bias_scale,
             batchnorm,
+            muon,
             optim,
             gemm,
             gemm_mma,
@@ -1124,6 +1128,95 @@ impl OxideBackend {
             .map_err(launch_err)?;
         }
         Ok(())
+    }
+
+    /// Native f32 Newton–Schulz orthogonalization for one row-major matrix.
+    /// Uses five paper-coefficient iterations and the smaller Gram dimension.
+    /// Inputs are expected to be finite; shape errors are returned explicitly.
+    pub fn muon_orthogonalize_f32(
+        &self,
+        matrix: &OxideTensorF32,
+        rows: usize,
+        cols: usize,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let op = "muon_orthogonalize_f32";
+        let len = rows.checked_mul(cols)
+            .ok_or_else(|| shape_err(op, "matrix extent overflow".to_owned()))?;
+        if rows == 0 || cols == 0 || matrix.len() != len {
+            return Err(shape_err(op, format!(
+                "expected non-empty {rows}x{cols} matrix, got {} elements", matrix.len()
+            )));
+        }
+        let config = ElementwiseLaunchConfig::default();
+        let norm_squared = DeviceBuffer::<f32>::zeroed(&self.stream, 1)?;
+        // SAFETY: `norm_squared` is one aligned, zero-initialized scalar and
+        // every input thread contributes through an atomic add.
+        unsafe {
+            self.muon.muon_sum_squares_f32(
+                &self.stream, launch::elementwise(len, config), &matrix.buf,
+                norm_squared.cu_deviceptr() as *mut f32,
+            )
+        }.map_err(launch_err)?;
+        let mut normalized = self.alloc_uninit(len)?;
+        // SAFETY: one thread per matrix element; norm/output extents are valid.
+        unsafe {
+            self.muon.muon_normalize_f32(
+                &self.stream, launch::elementwise(len, config), &matrix.buf,
+                &norm_squared, &mut normalized,
+            )
+        }.map_err(launch_err)?;
+
+        let transposed = rows > cols;
+        let (small, large) = if transposed { (cols, rows) } else { (rows, cols) };
+        let mut x = OxideTensorF32::new(normalized, &[rows, cols]);
+        if transposed { x = self.muon_transpose_f32(&x, rows, cols, config)?; }
+        for _ in 0..5 {
+            let x_t = self.muon_transpose_f32(&x, small, large, config)?;
+            let gram = self.linear_f32(
+                &x, &x, None, &[small, small], small, large, small, config,
+            )?;
+            let ax = self.linear_f32(
+                &gram, &x_t, None, &[small, large], small, small, large, config,
+            )?;
+            let ax_t = self.muon_transpose_f32(&ax, small, large, config)?;
+            let a2x = self.linear_f32(
+                &gram, &ax_t, None, &[small, large], small, small, large, config,
+            )?;
+            x = self.muon_combine_f32(&x, &ax, &a2x, small, large, config)?;
+        }
+        if transposed { x = self.muon_transpose_f32(&x, small, large, config)?; }
+        Ok(x)
+    }
+
+    fn muon_transpose_f32(
+        &self, matrix: &OxideTensorF32, rows: usize, cols: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let mut output = self.alloc_uninit(rows * cols)?;
+        // SAFETY: one thread owns each transposed output element.
+        unsafe {
+            self.muon.muon_transpose_f32(
+                &self.stream, launch::elementwise(rows * cols, config),
+                &matrix.buf, &mut output, rows, cols,
+            )
+        }.map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, &[cols, rows]))
+    }
+
+    fn muon_combine_f32(
+        &self, x: &OxideTensorF32, ax: &OxideTensorF32, a2x: &OxideTensorF32,
+        rows: usize, cols: usize, config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let len = rows * cols;
+        let mut output = self.alloc_uninit(len)?;
+        // SAFETY: all inputs and output have the validated matrix extent.
+        unsafe {
+            self.muon.muon_linear_combination_f32(
+                &self.stream, launch::elementwise(len, config), 3.4445, &x.buf,
+                -4.7750, &ax.buf, 2.0315, &a2x.buf, &mut output,
+            )
+        }.map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, &[rows, cols]))
     }
 
     /// Single dense GEMM on tensors, for tests and future `connected` layers.
@@ -3547,6 +3640,23 @@ impl F32TensorOpsBackend for OxideBackend {
     /// existing fp32 GEMM with `trans_b` so the `[out_features, in_features]`
     /// weight layout is read as `B^T`.  `rows` becomes the GEMM's `m`, so one
     /// launch covers every token of a sequence.
+    fn muon_orthogonalize_f32(
+        &self,
+        matrix: &Self::Tensor,
+        shape: &[usize],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self::Tensor, Self::Error> {
+        if shape.iter().product::<usize>() != rows.saturating_mul(cols) {
+            return Err(shape_err(
+                "muon_orthogonalize_f32",
+                format!("shape {shape:?} does not match {rows}x{cols}"),
+            ));
+        }
+        let input = self.f32v(matrix)?;
+        OxideBackend::muon_orthogonalize_f32(self, &input, rows, cols)
+    }
+
     fn linear_f32(
         &self,
         x: &Self::Tensor,

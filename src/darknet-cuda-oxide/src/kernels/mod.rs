@@ -20,6 +20,7 @@ pub mod gemm_mma;
 pub mod half_ops;
 pub mod im2col;
 pub mod layers_extra;
+pub mod muon;
 pub mod optim;
 pub mod pool;
 pub mod quant_fp4;

@@ -10,6 +10,7 @@ pub mod deform_conv;
 pub mod gelu_erf;
 pub mod laya_act;
 pub mod marker_gather;
+pub mod muon;
 
 /// Deterministic counter-hash RNG for dropout: a splitmix64 finaliser over
 /// `seed + (index + 1) * golden`, reduced to a uniform f32 in `[0, 1)` with 24

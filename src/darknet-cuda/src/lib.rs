@@ -1717,6 +1717,22 @@ pub trait F32TensorOpsBackend {
         )
     }
 
+    /// Newton–Schulz orthogonalization of one row-major Muon matrix.
+    /// Backends without a native matrix path use the CPU reference.
+    fn muon_orthogonalize_f32(
+        &self,
+        matrix: &Self::Tensor,
+        shape: &[usize],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let input = self.download_f32(matrix)?;
+        let output = host_ops::muon::orthogonalize(&input, rows, cols)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(shape.iter().product::<usize>(), output.len());
+        self.upload_f32(shape, &output)
+    }
+
     /// Fused residual + bias epilogue for a transformer block: over a flat
     /// `rows x cols` row-major slab, `out[i] = residual[i] + y[i] + bias[i % cols]`
     /// with `bias` per **column** (the last dimension, so the row - the token -
