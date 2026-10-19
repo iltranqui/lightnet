@@ -3278,6 +3278,79 @@ fn gpu_muon_convolution_device_gradients_match_cpu_across_steps() {
 }
 
 #[test]
+fn gpu_muon_eml_device_gradients_match_cpu_across_steps() {
+    let net = network(
+        "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0001\n\
+         [eml_convolutional]\nfilters=2\nsize=1\nresidual=1\nbatch_normalize=0\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    darknet_core::initialize_training_params(&net, &mut cpu.params, 89);
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("EML Muon train buffers");
+
+    for step in 1..=2 {
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu().expect("zero EML Muon buffers");
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu
+            .forward_training(&input)
+            .expect("CPU EML Muon forward");
+        let gpu_forward = gpu
+            .forward_training_device(&input)
+            .expect("Oxide EML Muon forward");
+        assert!(gpu_forward.cpu_forward.eml_caches[0].is_none());
+        let gpu_output = gpu
+            .backend
+            .download_f32(&gpu_forward.gpu_layer_outputs[0])
+            .expect("download EML Muon output");
+        close(
+            &format!("EML Muon output step {step}"),
+            &gpu_output,
+            &cpu_forward.layer_outputs[0].data,
+            2e-4,
+        );
+        for microbatch in 0..2 {
+            let seed = Tensor::filled(
+                cpu.network.layers[0].output_shape,
+                0.03 + step as f32 * 0.01 + microbatch as f32 * 0.005,
+            );
+            let seeds = [Some(seed)];
+            cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+                .expect("CPU EML Muon backward");
+            gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+                .expect("Oxide EML Muon backward");
+        }
+        cpu.update_weights_muon(0.01, 2)
+            .expect("CPU EML Muon update");
+        gpu.update_weights_gpu(0.01, 0.9, net.net.decay, 2)
+            .expect("Oxide EML Muon update");
+        let (LayerParams::EmlConvolutional(cpu_eml), LayerParams::EmlConvolutional(gpu_eml)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("EML parameter layout expected");
+        };
+        for (name, cpu_branch, gpu_branch) in [
+            ("input", &cpu_eml.input, &gpu_eml.input),
+            ("self", &cpu_eml.self_params, &gpu_eml.self_params),
+        ] {
+            close(
+                &format!("EML {name} Muon weights step {step}"),
+                &gpu_branch.weights,
+                &cpu_branch.weights,
+                8e-4,
+            );
+            close(
+                &format!("EML {name} Muon biases step {step}"),
+                &gpu_branch.biases,
+                &cpu_branch.biases,
+                8e-4,
+            );
+        }
+    }
+}
+
+#[test]
 fn gpu_muon_local_location_matrices_match_cpu_across_steps() {
     let net = network(
         "[net]\nwidth=4\nheight=4\nchannels=2\nbatch=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0001\n\

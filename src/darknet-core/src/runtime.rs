@@ -10300,11 +10300,15 @@ where
                 (LayerKind::Convolutional(spec), LayerParams::Convolutional(_)) => {
                     spec.batch_normalize
                 }
+                (LayerKind::EmlConvolutional(spec), LayerParams::EmlConvolutional(_)) => {
+                    spec.branch.batch_normalize
+                }
                 _ => !matches!(
                     (kind, *params),
                     (_, LayerParams::None)
                         | (LayerKind::BatchNorm(_), LayerParams::BatchNorm(_))
                         | (LayerKind::Connected(_), LayerParams::Connected(_))
+                        | (LayerKind::EmlConvolutional(_), LayerParams::EmlConvolutional(_))
                         | (LayerKind::Local(_), LayerParams::Local(_))
                         | (LayerKind::Rnn(_), LayerParams::Rnn(_))
                         | (LayerKind::Lstm(_), LayerParams::Lstm(_))
@@ -10322,7 +10326,7 @@ where
         }) {
             return Err(Error::UnsupportedLayer {
                 layer_index: index,
-                name: "GPU Muon supports standard convolution matrices without BN via host-staged device gradients, plus host-gradient local/RNN/LSTM/Kimi/MambaVision/Tucker/Swin/ViT/deconvolutional/connected matrices and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
+                name: "GPU Muon supports standard convolution and EML matrices without BN via host-staged device gradients, plus host-gradient local/RNN/LSTM/Kimi/MambaVision/Tucker/Swin/ViT/deconvolutional/connected matrices and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
             });
         }
         let step = self.adam_step.checked_add(1).ok_or_else(|| {
@@ -10403,6 +10407,51 @@ where
                 };
                 train.weight_updates = device_gradients.0;
                 train.bias_updates = device_gradients.1;
+            }
+            if let LayerKind::EmlConvolutional(spec) = &layer.kind
+                && !spec.branch.batch_normalize
+            {
+                let device_gradients = {
+                    let device_buffers = self.device_eml_train_buffers.borrow();
+                    let train = device_buffers
+                        .get(index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing device EML gradients for Muon layer #{index}"
+                            ))
+                        })?;
+                    for branch in [&train.input, &train.self_params] {
+                        if branch.pending.is_some() || branch.scale_updates.is_some() {
+                            return Err(Error::InvalidConfig(format!(
+                                "GPU Muon cannot stage deferred or batch-normalization gradients for EML layer #{index}"
+                            )));
+                        }
+                    }
+                    (
+                        self.backend
+                            .download_f32(&train.input.weight_updates)
+                            .map_err(|err| backend_error("download EML input Muon gradients", err))?,
+                        self.backend
+                            .download_f32(&train.input.bias_updates)
+                            .map_err(|err| backend_error("download EML input bias gradients", err))?,
+                        self.backend
+                            .download_f32(&train.self_params.weight_updates)
+                            .map_err(|err| backend_error("download EML self Muon gradients", err))?,
+                        self.backend
+                            .download_f32(&train.self_params.bias_updates)
+                            .map_err(|err| backend_error("download EML self bias gradients", err))?,
+                    )
+                };
+                let LayerTrainBuffers::EmlConvolutional(train) = &mut buffers[index] else {
+                    return Err(Error::InvalidConfig(format!(
+                        "EML Muon layer #{index} has mismatched host train buffers"
+                    )));
+                };
+                train.input.weight_updates = device_gradients.0;
+                train.input.bias_updates = device_gradients.1;
+                train.self_params.weight_updates = device_gradients.2;
+                train.self_params.bias_updates = device_gradients.3;
             }
             prepare_muon_layer_gradients(
                 &layer.kind,
@@ -10608,6 +10657,42 @@ where
                 muon_state,
                 staged,
             )?;
+            if let (LayerKind::EmlConvolutional(spec), LayerParams::EmlConvolutional(params)) =
+                (&layer.kind, &self.params[index])
+                && !spec.branch.batch_normalize
+            {
+                for (slot, branch) in [&params.input, &params.self_params].into_iter().enumerate() {
+                    let refreshed = self.cached_convolution_upload(
+                        &spec.branch,
+                        layer.input_shape.channels,
+                        branch,
+                        None,
+                    )?;
+                    self.set_device_conv_params(index, slot, refreshed)?;
+                }
+                let mut device_buffers = self.device_eml_train_buffers.borrow_mut();
+                let train = device_buffers[index].as_mut().ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "missing device EML buffers after Muon layer #{index} update"
+                    ))
+                })?;
+                for branch in [&mut train.input, &mut train.self_params] {
+                    branch.weight_updates = self
+                        .backend
+                        .zeros_f32(&[
+                            spec.branch.filters,
+                            layer.input_shape.channels / spec.branch.groups.max(1),
+                            spec.branch.size,
+                            spec.branch.size,
+                        ])
+                        .map_err(|err| backend_error("zero EML Muon gradients", err))?;
+                    branch.bias_updates = self
+                        .backend
+                        .zeros_f32(&[spec.branch.filters])
+                        .map_err(|err| backend_error("zero EML Muon bias gradients", err))?;
+                    branch.pending = None;
+                }
+            }
             if let (LayerKind::Convolutional(spec), LayerParams::Convolutional(params)) =
                 (&layer.kind, &self.params[index])
                 && !spec.batch_normalize
@@ -46107,7 +46192,7 @@ activation=linear
     }
 
     #[test]
-    fn gpu_muon_rejects_batch_normalized_convolution_before_updating() {
+    fn gpu_muon_rejects_batch_normalized_convolution_and_eml_before_updating() {
         let mut gpu = optimizer_net("muon=1\ndecoupled_decay=1");
         let before = gpu.params.clone();
         let error = gpu
@@ -46118,6 +46203,27 @@ activation=linear
             .contains("other parameter families remain explicitly unsupported"));
         assert_eq!(gpu.params, before);
         assert_eq!(gpu.adam_step, 0);
+
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "muon-eml-bn.cfg",
+                "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=1\nmuon=1\ndecoupled_decay=1\n[eml_convolutional]\nfilters=2\nsize=1\nbatch_normalize=1\n",
+            )
+            .expect("EML Muon cfg should parse"),
+        )
+        .expect("EML Muon network should build");
+        let mut eml = GpuExecutableNetwork::new(network, FakeBackend);
+        eml.init_train_buffers_gpu()
+            .expect("EML Muon buffers should initialize");
+        let before = eml.params.clone();
+        let error = eml
+            .update_weights_gpu(0.01, 0.9, 0.0005, 1)
+            .expect_err("batch-normalized EML Muon staging is not integrated yet");
+        assert!(error
+            .to_string()
+            .contains("other parameter families remain explicitly unsupported"));
+        assert_eq!(eml.params, before);
+        assert_eq!(eml.adam_step, 0);
     }
 
     #[test]
