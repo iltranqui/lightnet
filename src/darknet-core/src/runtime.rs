@@ -95,11 +95,18 @@ fn has_host_only_deform(network: &Network) -> bool {
     })
 }
 
-/// Native GraphConv runtime currently covers uniform edge averaging without
-/// self projection or BN, for activations supported by the f32 backend.
+/// Native GraphConv training forward/backward covers supported activations and
+/// edge modes 0/1 without BN; compact inference also supports BN affine using
+/// rolling statistics.
 fn graph_conv_spec_needs_host(spec: &GraphConvSpec) -> bool {
     !matches!(spec.edge_mode, 0 | 1)
         || spec.batch_normalize
+        || (spec.activation.to_channel_normalization().is_none()
+            && spec.activation.to_cuda_f32_kind().is_none())
+}
+
+fn graph_conv_spec_needs_compact_host(spec: &GraphConvSpec) -> bool {
+    !matches!(spec.edge_mode, 0 | 1)
         || (spec.activation.to_channel_normalization().is_none()
             && spec.activation.to_cuda_f32_kind().is_none())
 }
@@ -14874,7 +14881,13 @@ where
             .network
             .layers
             .iter()
-            .find(|layer| matches!(&layer.kind, LayerKind::GraphConv(spec) if graph_conv_spec_needs_host(spec)))
+            .find(|layer| {
+                matches!(
+                    &layer.kind,
+                    LayerKind::GraphConv(spec)
+                        if graph_conv_spec_needs_compact_host(spec)
+                )
+            })
         {
             return Err(Error::UnsupportedLayer {
                 layer_index: layer.index,
@@ -15156,18 +15169,38 @@ where
                             .shortcut_add_f32(&raw, &self_raw, launch_config)
                             .map_err(|err| backend_error("compact GraphConv projection sum", err))?;
                     }
-                    let biases = self.backend
-                        .upload_f32(&[spec.filters], &params.projection.biases)
-                        .map_err(|err| backend_error("compact GraphConv biases", err))?;
-                    let biased = self.backend
-                        .bias_add_f32(
+                    let biased = if spec.batch_normalize {
+                        let mut batch_norm = params
+                            .projection
+                            .batch_norm
+                            .clone()
+                            .ok_or_else(|| {
+                                Error::InvalidConfig(
+                                    "GraphConv batch-norm parameters are missing".to_owned(),
+                                )
+                            })?;
+                        batch_norm.biases.clone_from(&params.projection.biases);
+                        self.forward_batchnorm_inference_gpu(
                             &raw,
-                            &biases,
-                            spec.filters,
-                            layer.output_shape.width * layer.output_shape.height,
+                            layer.output_shape,
+                            &batch_norm,
                             launch_config,
-                        )
-                        .map_err(|err| backend_error("compact GraphConv bias", err))?;
+                        )?
+                    } else {
+                        let biases = self
+                            .backend
+                            .upload_f32(&[spec.filters], &params.projection.biases)
+                            .map_err(|err| backend_error("compact GraphConv biases", err))?;
+                        self.backend
+                            .bias_add_f32(
+                                &raw,
+                                &biases,
+                                spec.filters,
+                                layer.output_shape.width * layer.output_shape.height,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("compact GraphConv bias", err))?
+                    };
                     if let Some(normalization) = spec.activation.to_channel_normalization() {
                         self.backend
                             .normalize_channels_f32(

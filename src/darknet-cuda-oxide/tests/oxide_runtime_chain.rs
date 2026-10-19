@@ -5000,3 +5000,50 @@ fn graph_conv_compact_inference_matches_cpu_with_learned_edges_and_self() {
         6e-5,
     );
 }
+
+#[test]
+fn graph_conv_compact_inference_matches_cpu_with_batch_norm() {
+    let net = network(
+        "[net]\nwidth=4\nheight=3\nchannels=2\nbatch=1\n[graph_conv]\nfilters=2\ngroups=2\nsize=3\npad=1\nedge_mode=1\ngraph_use_self=1\nbatch_normalize=1\nactivation=leaky\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let LayerParams::GraphConv(params) = &mut cpu.params[0] else {
+        panic!("GraphConv parameters expected");
+    };
+    params.projection.weights.copy_from_slice(&[0.3, -0.2]);
+    params.projection.biases.copy_from_slice(&[0.01, -0.03]);
+    params
+        .self_weights
+        .as_mut()
+        .unwrap()
+        .copy_from_slice(&[-0.15, 0.25]);
+    params.edge_kernel.as_mut().unwrap().copy_from_slice(
+        &(0..36)
+            .map(|i| (i as f32 * 0.17).sin() * 0.08)
+            .collect::<Vec<_>>(),
+    );
+    params.edge_biases.as_mut().unwrap().copy_from_slice(
+        &(0..18)
+            .map(|i| (i as f32 * 0.13).cos() * 0.03)
+            .collect::<Vec<_>>(),
+    );
+    let batch_norm = params.projection.batch_norm.as_mut().unwrap();
+    batch_norm.scales.copy_from_slice(&[1.2, 0.85]);
+    batch_norm.rolling_mean.copy_from_slice(&[0.15, -0.1]);
+    batch_norm.rolling_variance.copy_from_slice(&[0.8, 1.1]);
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("Oxide backend"));
+    gpu.params = cpu.params.clone();
+    let input = patterned(cpu.network.net.input_shape());
+    let cpu_output = cpu
+        .forward(&input)
+        .expect("CPU compact GraphConv BN reference");
+    let compact = gpu
+        .forward_compact(&input)
+        .expect("native compact GraphConv BN");
+    close(
+        "GraphConv compact BN inference",
+        &compact.final_output.expect("GraphConv final output").data,
+        &cpu_output.final_output().expect("CPU final output").data,
+        6e-5,
+    );
+}
