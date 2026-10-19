@@ -39040,6 +39040,114 @@ num_dwconv=1
     }
 
     #[test]
+    fn maxpool_axis_layout_pins_depth_channel_batch_and_spatial_order() {
+        // Hand-derived from `Jev_laya:src-lib/maxpool_layer.cpp:327`: output
+        // group g scans input channels g, g+out_c, ... independently at each
+        // (batch,y,x). A tie at b0/g0/y0/x0 must keep channel 2, the first
+        // maximum in that strided group.
+        let depth_net = Network::from_config(
+            ConfigFile::parse_str(
+                "maxpool_depth_axis.cfg",
+                "[net]\nwidth=3\nheight=2\nchannels=5\nbatch=2\n[maxpool]\nmaxpool_depth=1\nout_channels=2\n",
+            )
+            .expect("depth cfg"),
+        )
+        .expect("depth network");
+        assert_eq!(depth_net.layers[0].output_shape, TensorShape::new(3, 2, 2, 2));
+        let depth_shape = TensorShape::new(3, 2, 5, 2);
+        let depth_input = Tensor::from_data(
+            depth_shape,
+            vec![
+                0., 1., 10., 11., 20., 21., 100., 101., 110., 111., 120., 121.,
+                400., 201., 210., 211., 220., 221., 300., 301., 310., 311., 320., 321.,
+                400., 401., 410., 411., 420., 421., 1000., 1001., 1010., 1011., 1020.,
+                1021., 1100., 1101., 1110., 1111., 1120., 1121., 1200., 1201., 1210.,
+                1211., 1220., 1221., 1300., 1301., 1310., 1311., 1320., 1321., 1400.,
+                1401., 1410., 1411., 1420., 1421.,
+            ],
+        )
+        .expect("depth input");
+        let depth_output_shape = TensorShape::new(3, 2, 2, 2);
+        let depth_output = super::forward_maxpool_depth(&depth_input, depth_output_shape)
+            .expect("depth forward");
+        assert_eq!(
+            depth_output.data,
+            vec![
+                400., 401., 410., 411., 420., 421., 300., 301., 310., 311., 320., 321.,
+                1400., 1401., 1410., 1411., 1420., 1421., 1300., 1301., 1310., 1311.,
+                1320., 1321.,
+            ]
+        );
+        let depth_seed = Tensor::from_data(
+            depth_output_shape,
+            (1..=24).map(|value| value as f32).collect(),
+        )
+        .expect("depth seed");
+        let depth_dx = super::backward_maxpool_depth(&depth_input, &depth_seed)
+            .expect("depth backward");
+        assert_eq!(
+            depth_dx.data,
+            vec![
+                0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 1., 0., 0., 0., 0., 0.,
+                7., 8., 9., 10., 11., 12., 0., 2., 3., 4., 5., 6., 0., 0., 0., 0., 0., 0.,
+                0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 19., 20., 21., 22., 23.,
+                24., 13., 14., 15., 16., 17., 18.,
+            ]
+        );
+
+        // The ordinary maxpool branch scans ky then kx and stores NCHW planes.
+        // Non-square 5x3, B=2, C=2 sentinels use odd size=3, unequal strides,
+        // and padding=1. The top-left/bottom-right tie checks first-tap order;
+        // overlapping windows test summed deltas and zero_nonmax.
+        let spatial_net = Network::from_config(
+            ConfigFile::parse_str(
+                "maxpool_spatial_axis.cfg",
+                "[net]\nwidth=5\nheight=3\nchannels=2\nbatch=2\n[maxpool]\nsize=3\nstride_x=2\nstride_y=1\npadding=1\nmaxpool_zero_nonmax=1\n",
+            )
+            .expect("spatial cfg"),
+        )
+        .expect("spatial network");
+        assert_eq!(spatial_net.layers[0].output_shape, TensorShape::new(2, 2, 2, 2));
+        let shape = TensorShape::new(5, 3, 2, 2);
+        let mut spatial_values: Vec<f32> = (0..60)
+            .map(|index| {
+                let batch = index / 30;
+                let channel = index / 15 % 2;
+                let position = index % 15;
+                (batch * 200 + channel * 100 + position + 1) as f32
+            })
+            .collect();
+        spatial_values[0] = 13.0; // ties the first tap with position 12
+        let input = Tensor::from_data(shape, spatial_values).expect("spatial input");
+        let output_shape = TensorShape::new(2, 2, 2, 2);
+        let output = super::forward_maxpool(3, 2, 1, 1, &input, output_shape, false)
+            .expect("spatial maxpool forward");
+        assert_eq!(
+            output.data,
+            vec![
+                13., 15., 13., 15., 113., 115., 113., 115.,
+                213., 215., 213., 215., 313., 315., 313., 315.,
+            ]
+        );
+        let seed = Tensor::from_data(
+            output_shape,
+            (1..=16).map(|value| value as f32).collect(),
+        )
+        .expect("spatial seed");
+        let dx = super::backward_maxpool(3, 2, 1, 1, &input, &seed, false, true)
+            .expect("zero_nonmax backward");
+        assert_eq!(
+            dx.data,
+            vec![
+                1., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 3., 0., 6.,
+                0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 12., 0., 14.,
+                0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 20., 0., 22.,
+                0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 28., 0., 30.,
+            ]
+        );
+    }
+
+    #[test]
     fn maxpool_zero_nonmax_zeroes_non_argmax_inputs() {
         let input = Tensor::from_data(
             TensorShape::new(3, 3, 1, 1),

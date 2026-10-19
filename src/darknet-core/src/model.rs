@@ -1835,7 +1835,7 @@ pub const AXIS_PINS: &[AxisPin] = &[
     AxisPin::Pinned("convolutional_axis_layout_pins_dilated_extent_and_groups"),
     AxisPin::Pinned("deconvolutional_axis_layout_maps_input_channels_to_filters_and_batch"),
     AxisPin::Open("Tier 1: [out][in] weight rows per batch sample"),
-    AxisPin::Open("Tier 1: maxpool_depth and maxpool_zero_nonmax layouts"),
+    AxisPin::Pinned("maxpool_axis_layout_pins_depth_channel_batch_and_spatial_order"),
     AxisPin::Open("Tier 1: window geometry for non-square input"),
     AxisPin::Open("Tier 1: global H*W reduction per channel, not per sample"),
     AxisPin::Open("Tier 1: groups split, relative index, concat order"),
@@ -11625,8 +11625,8 @@ output=2
             }
         }
 
-        assert_eq!(pinned.len(), 20, "pinned variants");
-        assert_eq!(open, 40, "C++-backed variants without an axis pin");
+        assert_eq!(pinned.len(), 21, "pinned variants");
+        assert_eq!(open, 39, "C++-backed variants without an axis pin");
         assert_eq!(rust_only, 6, "Rust-only variants plus Unsupported");
 
         // The pinned set is the contract: renaming one of these tests must be a
@@ -11634,6 +11634,7 @@ output=2
         let expected: std::collections::BTreeSet<&'static str> = [
             "convolutional_axis_layout_pins_dilated_extent_and_groups",
             "deconvolutional_axis_layout_maps_input_channels_to_filters_and_batch",
+            "maxpool_axis_layout_pins_depth_channel_batch_and_spatial_order",
             "shortcut_axis_layout_uses_nchw_channel_slots_per_batch",
             "slice_axis_layout_preserves_batch_channel_and_spatial_order",
             "scorer_axis_layout_keeps_batches_channels_and_options_independent",
@@ -11667,6 +11668,15 @@ output=2
             conv.layers[0].kind.axis_pin(),
             AxisPin::Pinned("convolutional_axis_layout_pins_dilated_extent_and_groups"),
             "convolutional must map to its own AXIS_PINS entry"
+        );
+        let maxpool = build(
+            "[net]\nwidth=3\nheight=2\nchannels=5\nbatch=2\n[maxpool]\nmaxpool_depth=1\nout_channels=2\n",
+        )
+        .expect("maxpool builds");
+        assert_eq!(
+            maxpool.layers[0].kind.axis_pin(),
+            AxisPin::Pinned("maxpool_axis_layout_pins_depth_channel_batch_and_spatial_order"),
+            "maxpool must map to its own AXIS_PINS entry"
         );
         let route = build(
             "[net]\nwidth=3\nheight=2\nchannels=2\n[convolutional]\nfilters=2\nsize=1\n[route]\nlayers=0\n",
