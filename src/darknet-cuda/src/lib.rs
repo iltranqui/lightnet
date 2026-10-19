@@ -3159,6 +3159,15 @@ pub trait F16TensorOpsBackend: F32TensorOpsBackend {
         activation: F32ActivationKind,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error>;
+    /// Channel shuffle permutation over NCHW channel planes.
+    fn channel_shuffle_f16(
+        &self,
+        x: &Self::TensorF16,
+        output_shape: &[usize],
+        channels: usize,
+        groups: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error>;
     /// `f16(activation(x * scale[c] + bias[c]))` per channel (`scale = None`:
     /// bias + activation only); `scale` / `bias` are f32 `[channels]`.
     fn channel_affine_act_f16(

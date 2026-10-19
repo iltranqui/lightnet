@@ -8528,6 +8528,7 @@ where
                 | LayerKind::Route(_)
                 | LayerKind::LayaMarkerGather(_)
                 | LayerKind::Sam(_)
+                | LayerKind::ChannelShuffle(_)
                 | LayerKind::Upsample(_)
                 | LayerKind::Yolo(_)
                 | LayerKind::ObbYolo(_)
@@ -8807,6 +8808,16 @@ where
                     )
                     .map_err(|err| backend_error("f16 sam", err))?
                 }
+                (LayerKind::ChannelShuffle(spec), LayerParams::None) => self
+                    .backend
+                    .channel_shuffle_f16(
+                        current_input.expect("channel_shuffle requires current input"),
+                        &tensor_backend_shape(layer.output_shape),
+                        layer.input_shape.channels,
+                        spec.groups,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("f16 channel_shuffle", err))?,
                 (LayerKind::Route(spec), LayerParams::None) => {
                     let mut route_inputs = Vec::with_capacity(spec.layers.len());
                     let mut route_channel_offsets = Vec::with_capacity(spec.layers.len());

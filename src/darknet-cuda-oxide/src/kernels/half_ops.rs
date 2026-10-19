@@ -243,6 +243,35 @@ pub mod kernels {
         }
     }
 
+    /// NCHW channel shuffle: out channel `j*groups+i` reads input `i*cols+j`.
+    #[kernel]
+    pub fn channel_shuffle_f16(
+        x: &[u16],
+        mut out: DisjointSlice<u16>,
+        channels: usize,
+        groups: usize,
+        spatial: usize,
+    ) {
+        let idx = thread::index_1d();
+        let linear = idx.get();
+        if linear >= out.len() {
+            return;
+        }
+        let plane = channels * spatial;
+        let batch = linear / plane;
+        let output_channel = linear / spatial % channels;
+        let position = linear % spatial;
+        let rows = groups;
+        let cols = channels / groups;
+        let row = output_channel % rows;
+        let col = output_channel / rows;
+        let input_channel = row * cols + col;
+        let value = x[batch * plane + input_channel * spatial + position];
+        if let Some(output) = out.get_mut(idx) {
+            *output = value;
+        }
+    }
+
     /// `out = f16(act(x * scale[c] + bias[c]))`, `c = (i / stride) % channels`
     /// (standalone bias + activation and the folded inference batch norm).
     /// `has_scale == 0` ignores `scale` (any buffer may be passed).

@@ -141,6 +141,13 @@ fn maxpool_depth_f16_inference_matches_f32() {
 }
 
 #[test]
+fn channel_shuffle_f16_inference_matches_f32() {
+    let cfg = "[net]\nwidth=3\nheight=2\nchannels=6\nbatch=2\n\
+        [channel_shuffle]\ngroups=2\n";
+    run_pair("channel_shuffle f16", network(cfg), 37, 1.0, 2e-3);
+}
+
+#[test]
 fn sam_f16_inference_matches_f32() {
     let cfg = "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\n\
         [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\

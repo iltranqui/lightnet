@@ -973,6 +973,45 @@ impl OxideBackend {
         Ok(OxideTensorF16::new(output, output_shape))
     }
 
+    /// Native half-storage NCHW channel shuffle.
+    pub fn channel_shuffle_f16(
+        &self,
+        x: &OxideTensorF16,
+        output_shape: &[usize],
+        channels: usize,
+        groups: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF16, OxideError> {
+        if x.shape() != output_shape
+            || output_shape.len() != 4
+            || channels == 0
+            || groups == 0
+            || channels % groups != 0
+            || output_shape[1] != channels
+            || output_shape[2] == 0
+            || output_shape[3] == 0
+        {
+            return Err(shape_err("channel_shuffle_f16", "incompatible NCHW shape or groups".to_owned()));
+        }
+        let spatial = output_shape[2] * output_shape[3];
+        let mut output = self.alloc16_uninit(x.len())?;
+        // SAFETY: matching nonempty NCHW shape, groups divides channels; the
+        // kernel maps each output channel/position to an in-bounds input.
+        unsafe {
+            self.half_ops.channel_shuffle_f16(
+                &self.stream,
+                launch::elementwise(output.len(), config),
+                &x.buf,
+                &mut output,
+                channels,
+                groups,
+                spatial,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF16::new(output, output_shape))
+    }
+
     /// `f16(act(x * scale[c] + bias[c]))` per channel (`c = (i / channel_stride) % channels`);
     /// `scale = None` is bias + activation only.  The folded inference batch norm.
     pub fn channel_affine_act_f16(
@@ -1335,6 +1374,17 @@ impl darknet_cuda::F16TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error> {
         OxideBackend::sam_f16(self, input, source, output_shape, activation, config)
+    }
+
+    fn channel_shuffle_f16(
+        &self,
+        x: &Self::TensorF16,
+        output_shape: &[usize],
+        channels: usize,
+        groups: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error> {
+        OxideBackend::channel_shuffle_f16(self, x, output_shape, channels, groups, config)
     }
 
     fn channel_affine_act_f16(
