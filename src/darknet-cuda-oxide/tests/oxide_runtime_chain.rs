@@ -4242,6 +4242,84 @@ fn gpu_muon_vit_host_gradient_matrices_match_cpu_across_steps() {
 }
 
 #[test]
+fn gpu_muon_graph_conv_matrices_match_cpu_across_steps() {
+    let net = network(
+        "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0005\n\
+         [graph_conv]\nfilters=2\ngroups=1\nsize=3\npad=1\nedge_mode=1\ngraph_use_self=1\nactivation=leaky\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+
+    for step in 1..=2 {
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).expect("CPU GraphConv forward");
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("Oxide GraphConv forward");
+        close(
+            "GPU Muon GraphConv output",
+            &gpu_forward.cpu_forward.layer_outputs[0].data,
+            &cpu_forward.layer_outputs[0].data,
+            6e-5,
+        );
+        let output_shape = cpu.network.layers[0].output_shape;
+        let seed = Tensor::from_data(
+            output_shape,
+            (0..output_shape.element_count() * output_shape.batch)
+                .map(|index| (index as f32 * 0.37 + step as f32 * 0.19).sin() * 0.3)
+                .collect(),
+        )
+        .unwrap();
+        let seeds = [Some(seed)];
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU GraphConv backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("Oxide GraphConv backward");
+        cpu.update_weights_muon(0.02, 2)
+            .expect("CPU GraphConv Muon");
+        gpu.update_weights_gpu(0.02, 0.9, net.net.decay, 2)
+            .expect("GPU GraphConv Muon");
+
+        let (LayerParams::GraphConv(cpu_params), LayerParams::GraphConv(gpu_params)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("GraphConv parameters expected after Muon update");
+        };
+        close(
+            "GPU Muon GraphConv projection weights",
+            &gpu_params.projection.weights,
+            &cpu_params.projection.weights,
+            8e-4,
+        );
+        close(
+            "GPU Muon GraphConv projection biases",
+            &gpu_params.projection.biases,
+            &cpu_params.projection.biases,
+            8e-4,
+        );
+        close(
+            "GPU Muon GraphConv self weights",
+            gpu_params.self_weights.as_ref().unwrap(),
+            cpu_params.self_weights.as_ref().unwrap(),
+            8e-4,
+        );
+        close(
+            "GPU Muon GraphConv edge kernel",
+            gpu_params.edge_kernel.as_ref().unwrap(),
+            cpu_params.edge_kernel.as_ref().unwrap(),
+            8e-4,
+        );
+        close(
+            "GPU Muon GraphConv edge biases",
+            gpu_params.edge_biases.as_ref().unwrap(),
+            cpu_params.edge_biases.as_ref().unwrap(),
+            8e-4,
+        );
+    }
+}
+
+#[test]
 fn gpu_muon_connected_two_step_update_matches_cpu() {
     let net = network(
         "[net]\nwidth=2\nheight=1\nchannels=1\nbatch=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0005\nloss_scale=8\n\
