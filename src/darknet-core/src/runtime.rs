@@ -14492,49 +14492,20 @@ where
                     }
                 }
                 (LayerKind::Lstm(spec), LayerParams::Lstm(recurrent)) => {
-                    if !training
-                        || (!spec.batch_normalize
-                            && [
-                                &recurrent.wf,
-                                &recurrent.wi,
-                                &recurrent.wg,
-                                &recurrent.wo,
-                                &recurrent.uf,
-                                &recurrent.ui,
-                                &recurrent.ug,
-                                &recurrent.uo,
-                            ]
-                            .iter()
-                            .all(|projection| projection.batch_norm.is_none()))
-                    {
-                        let (output, cache, device_cache) = forward_lstm_layer_device(
-                            &self.backend,
-                            spec,
-                            recurrent,
-                            current_input,
-                            layer.input_shape,
-                            layer.output_shape,
-                            layer.index,
-                            host_copies,
-                            launch_config,
-                        )?;
-                        recurrent_caches.push(cache.map(RecurrentForwardCache::Lstm));
-                        gpu_lstm_cache = Some(device_cache);
-                        output
-                    } else {
-                        let host_input = self
-                            .download_tensor(current_input, layer.input_shape)
-                            .map_err(|err| backend_error("download LSTM input", err))?;
-                        let (host_output, cache) =
-                            forward_lstm_layer(spec, recurrent, &host_input, layer.output_shape)?;
-                        recurrent_caches.push(Some(RecurrentForwardCache::Lstm(cache)));
-                        self.backend
-                            .upload_f32(
-                                &tensor_backend_shape(layer.output_shape),
-                                &host_output.data,
-                            )
-                            .map_err(|err| backend_error("upload LSTM output", err))?
-                    }
+                    let (output, cache, device_cache) = forward_lstm_layer_device(
+                        &self.backend,
+                        spec,
+                        recurrent,
+                        current_input,
+                        layer.input_shape,
+                        layer.output_shape,
+                        layer.index,
+                        host_copies,
+                        launch_config,
+                    )?;
+                    recurrent_caches.push(cache.map(RecurrentForwardCache::Lstm));
+                    gpu_lstm_cache = Some(device_cache);
+                    output
                 }
                 (LayerKind::Crnn(spec), LayerParams::Crnn(recurrent)) => {
                     if !spec.batch_normalize
