@@ -77,6 +77,8 @@ file is named inline.
 - [49. Native DCNv4 projection and backward composition](#49-native-dcnv4-projection-and-backward-composition)
 - [50. Bounded DCNv4 native runtime forward/backward](#50-bounded-dcnv4-native-runtime-forwardbackward)
 - [51. Native DCNv4 rolling-stat BN](#51-native-dcnv4-rolling-stat-bn)
+- [52. Native DCNv4 channel-normalization activations](#52-native-dcnv4-channel-normalization-activations)
+- [53. Extend native DCNv4 kernel bound to 7x7](#53-extend-native-dcnv4-kernel-bound-to-7x7)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1437,6 +1439,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 52. Native DCNv4 channel-normalization activations
 
 - v0.2.015 (`1fc80f27`): DCNv4's bounded f32 native path now accepts `normalize_channels`, `_softmax` and `_softmax_maxval` activations (after optional rolling-stat BN) using the existing `normalize_channels_f32`/backward primitives; channel output is recomputed on device from the forward preactivation. Exact `SoftmaxMaxval` adjoint gained the max-chain term (epsilon sits outside exp(x-max); first max selected at ties; one-channel case is constant, zero translation derivative) in both host_ops and the Oxide kernel; `GradMode::Cpp` shortcut unchanged. Gates (serial, 3G): darknet-cuda lib 40, host dcnv4 28, `runtime::` 284, `oxide_dcnv4_normalization` 3 (3 norms x BN x SGD/Adam two-step CPU/GPU parity, GPU forward FD with fixed stats, mixed-network CPU cache), `oxide_layers_extra` 25. Not compiled-C++ parity; larger variants, other activations, compact/f16, device updates/residency, GPU Muon remain open.
+
+## 53. Extend native DCNv4 kernel bound to 7x7
+
+- v0.2.016: increased the fixed device mask capacity from 25 to 49 points and expanded the native composition CPU-parity test matrix with 7x7 cases. The runtime eligibility gate admits up to 49 active points; >49 remains host-fallback. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain` passed 3 tests (real GPU composition output, input/parameter-gradient CPU parity and error guards, including 7x7); `MEM=3G ./tools/test_host.sh dcnv4` passed 28 core tests including path-selection/fallback regressions. No 7x7 runtime optimizer-parity test, compiled-C++ parity, or performance claim. Other unsupported activations, device updates/residency, compact/f16, GPU Muon and broader parity work remain open.
 
 ## Not implemented / open (pointer)
 

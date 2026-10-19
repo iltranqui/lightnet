@@ -31,8 +31,8 @@ inference (v0.2.001–002). Act-head features/exact-erf primitives are native f3
 Evidence/limits are in `implemented.md` §§41–45. Do not repeat these ports.
 Act-head uses four uncached weight uploads per forward; no residency/speedup
 claim. Runtime backward still uses CPU, act params remain frozen, f16 rejected.
-Latest GPU slice is v0.2.015 (native DCNv4 NormalizeChannels* activations/adjoints, implemented.md §52; the 'Next independent DCNv4 slice' below is DONE). Previous, v0.2.014: DCNv4 native rolling-stat BN affine/adjoint plus
-post-backward 0.9 EMA, including unseeded layers. Eligible math (<=25 active
+Latest GPU slice is v0.2.016 (pending): native DCNv4 aggregation/composition supports up to 49 active points (7x7); runtime eligibility matches, with >49 still host fallback (implemented.md §53). v0.2.015 added NormalizeChannels* activations/adjoints (§52). Previous, v0.2.014: DCNv4 native rolling-stat BN affine/adjoint plus
+post-backward 0.9 EMA, including unseeded layers. Eligible math (<=49 active
 points, supported elementwise activation, no other fallback/host-only deform_conv)
 is native with BN off/on; ignored ordinary bias/beta and update gates preserved.
 Forward/gradient normalization uses the old rolling values, NOT batch statistics.
@@ -42,13 +42,11 @@ Details/source boundaries: `implemented.md` §51; previous runtime/layout audits
 in §§49–50. Parameter gradients/SGD/Adam and EMA metadata stay on the host;
 repeated uploads/raw recomputation remain, no residency/speedup claim. Previous
 full runtime-chain timed out at 600 s in ViT; **not a full-suite pass**.
-**Next independent DCNv4 slice:** native NormalizeChannels* activation/adjoint
-composition using existing backend primitives, after optional BN affine. Audit
-Rust/Cpp gradient-mode choices and zero-norm/tie fixtures; test real CPU/GPU
-forward/backward and optimizer parity before relaxing those activation gates.
-Keep remaining unsupported activations/large kernels and mixed networks on
-host caches. Compact/f16, native parameter updates/residency and GPU Muon remain
-open. Native deform_conv was already wired in v0.2.007; do not repeat these ports.
+The NormalizeChannels* activation/adjoint slice is done (v0.2.015). v0.2.016
+extends aggregation through 7x7 with GPU composition parity and raises the runtime
+eligibility bound to 49 points. Kernels above 7x7, unsupported activations and
+mixed networks remain host-cached. Compact/f16, native parameter updates/residency
+and GPU Muon remain open. Native deform_conv was already wired in v0.2.007; do not repeat these ports.
 Recheck `version-map.tsv` before allocating another version. Earlier wave
 sections below retain historical findings; this resume point takes precedence.
 
