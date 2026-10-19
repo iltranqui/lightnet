@@ -117,6 +117,7 @@ file is named inline.
 - [89. Compact GraphConv batch-normalization inference](#89-compact-graphconv-batch-normalization-inference)
 - [90. Full GraphConv batch-normalization inference](#90-full-graphconv-batch-normalization-inference)
 - [91. Hybrid GPU Muon for non-BN GraphConv matrices](#91-hybrid-gpu-muon-for-non-bn-graphconv-matrices)
+- [92. GraphConv GPU Muon DNOPT6 sidecar resume](#92-graphconv-gpu-muon-dnopt6-sidecar-resume)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1650,6 +1651,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 91. Hybrid GPU Muon for non-BN GraphConv matrices
 
 - v0.2.069 (`d79c3aaf`): enabled GPU Muon for GraphConv projection, self-projection, and learned-edge kernel matrices when BN is disabled. Native Oxide Newton–Schulz orthogonalization is used; GraphConv forward/backward gradients, Muon state, and final parameter updates remain host-staged. Actual-Oxide CPU parity passed over two updates for learned edges plus self projection, comparing projection weights/biases, self weights, edge kernels, and edge biases: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_graph_conv_matrices_match_cpu_across_steps`. A host FakeBackend regression confirms batch-normalized GraphConv rejects before mutation: `MEM=3G ./tools/test_host.sh gpu_muon_rejects_batch_normalized_convolution_eml_moe_dcnv4_and_deform_before_updating` passed 1 core test. BN GraphConv remains unsupported; no compiled-C++ golden, full-suite, or performance claim.
+
+## 92. GraphConv GPU Muon DNOPT6 sidecar resume
+
+- v0.2.070 (`3886b6c2`): extended the GraphConv hybrid GPU Muon parity test through optimizer-state save/load and a resumed third update. CPU and GPU DNOPT6 sidecars are loaded into fresh executables; resumed output and projection/self/edge matrix plus bias updates match CPU. Verified by `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_graph_conv_matrices_match_cpu_across_steps` (1 actual-Oxide test). This verifies the existing sidecar format for the tested learned-edge+self, non-BN variant; other GraphConv variants and full GPU/CPU parity requirements remain open. No compiled-C++ golden, full-suite, or performance claim.
 
 ## Not implemented / open (pointer)
 
