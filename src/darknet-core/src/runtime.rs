@@ -14874,7 +14874,7 @@ where
             .network
             .layers
             .iter()
-            .find(|layer| matches!(layer.kind, LayerKind::GraphConv(_)))
+            .find(|layer| matches!(&layer.kind, LayerKind::GraphConv(spec) if graph_conv_spec_needs_host(spec)))
         {
             return Err(Error::UnsupportedLayer {
                 layer_index: layer.index,
@@ -15064,6 +15064,130 @@ where
                                 launch_config,
                             )
                             .map_err(|err| backend_error("convolution bias + activation", err))?
+                    }
+                }
+                (LayerKind::GraphConv(spec), LayerParams::GraphConv(params)) => {
+                    let input = current_input.expect("GraphConv requires current input");
+                    let groups = spec.groups.max(1);
+                    let geometry = graph_conv_aggregation_geometry(
+                        spec,
+                        layer.input_shape,
+                        layer.output_shape,
+                    );
+                    let aggregate = if spec.edge_mode == 0 {
+                        self.backend
+                            .graph_conv_aggregate_f32(input, geometry, launch_config)
+                            .map_err(|err| backend_error("compact GraphConv aggregation", err))?
+                    } else {
+                        let edge_kernel_values = params.edge_kernel.as_deref().ok_or_else(|| {
+                            Error::InvalidConfig("GraphConv learned edge kernel is missing".to_owned())
+                        })?;
+                        let edge_bias_values = params.edge_biases.as_deref().ok_or_else(|| {
+                            Error::InvalidConfig("GraphConv learned edge biases are missing".to_owned())
+                        })?;
+                        let edge_kernel = self.backend
+                            .upload_f32(&[edge_kernel_values.len()], edge_kernel_values)
+                            .map_err(|err| backend_error("compact GraphConv edge kernel", err))?;
+                        let edge_biases = self.backend
+                            .upload_f32(&[edge_bias_values.len()], edge_bias_values)
+                            .map_err(|err| backend_error("compact GraphConv edge biases", err))?;
+                        self.backend
+                            .graph_conv_learned_aggregate_f32(
+                                input,
+                                &edge_kernel,
+                                &edge_biases,
+                                geometry,
+                                groups,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("compact GraphConv learned aggregation", err))?
+                    };
+                    let weight_shape = [spec.filters, layer.input_shape.channels / groups, 1, 1];
+                    let weights = self.backend
+                        .upload_f32(&weight_shape, &params.projection.weights)
+                        .map_err(|err| backend_error("compact GraphConv projection weights", err))?;
+                    let mut raw = self.backend
+                        .conv2d_f32(
+                            &aggregate,
+                            &weights,
+                            &tensor_backend_shape(layer.output_shape),
+                            layer.input_shape.channels,
+                            layer.output_shape.height,
+                            layer.output_shape.width,
+                            spec.filters,
+                            1,
+                            1,
+                            1,
+                            1,
+                            0,
+                            groups,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("compact GraphConv projection", err))?;
+                    if spec.use_self {
+                        let reference = self.backend
+                            .graph_conv_reference_f32(input, geometry, launch_config)
+                            .map_err(|err| backend_error("compact GraphConv reference gather", err))?;
+                        let self_values = params.self_weights.as_deref().ok_or_else(|| {
+                            Error::InvalidConfig("GraphConv self weights are missing".to_owned())
+                        })?;
+                        let self_weights = self.backend
+                            .upload_f32(&weight_shape, self_values)
+                            .map_err(|err| backend_error("compact GraphConv self weights", err))?;
+                        let self_raw = self.backend
+                            .conv2d_f32(
+                                &reference,
+                                &self_weights,
+                                &tensor_backend_shape(layer.output_shape),
+                                layer.input_shape.channels,
+                                layer.output_shape.height,
+                                layer.output_shape.width,
+                                spec.filters,
+                                1,
+                                1,
+                                1,
+                                1,
+                                0,
+                                groups,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("compact GraphConv self projection", err))?;
+                        raw = self.backend
+                            .shortcut_add_f32(&raw, &self_raw, launch_config)
+                            .map_err(|err| backend_error("compact GraphConv projection sum", err))?;
+                    }
+                    let biases = self.backend
+                        .upload_f32(&[spec.filters], &params.projection.biases)
+                        .map_err(|err| backend_error("compact GraphConv biases", err))?;
+                    let biased = self.backend
+                        .bias_add_f32(
+                            &raw,
+                            &biases,
+                            spec.filters,
+                            layer.output_shape.width * layer.output_shape.height,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("compact GraphConv bias", err))?;
+                    if let Some(normalization) = spec.activation.to_channel_normalization() {
+                        self.backend
+                            .normalize_channels_f32(
+                                &biased,
+                                &tensor_backend_shape(layer.output_shape),
+                                layer.output_shape.batch,
+                                layer.output_shape.channels,
+                                layer.output_shape.width * layer.output_shape.height,
+                                normalization,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("compact GraphConv channel normalization", err))?
+                    } else {
+                        self.backend
+                            .activation_f32(
+                                &biased,
+                                gpu_activation_kind(layer.index, &spec.activation)?,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("compact GraphConv activation", err))?
                     }
                 }
                 (LayerKind::MaxPool(spec), LayerParams::None) => {
