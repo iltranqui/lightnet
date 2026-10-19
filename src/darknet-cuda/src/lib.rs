@@ -3061,6 +3061,14 @@ pub trait F16TensorOpsBackend: F32TensorOpsBackend {
         padding: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error>;
+    /// Depth pooling over strided input-channel groups at each spatial slot.
+    fn maxpool_depth_f16(
+        &self,
+        x: &Self::TensorF16,
+        output_shape: &[usize],
+        input_channels: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error>;
     fn upsample_f16(
         &self,
         x: &Self::TensorF16,

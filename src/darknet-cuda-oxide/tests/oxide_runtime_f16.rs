@@ -128,6 +128,19 @@ fn run_pair(what: &str, net: Network, seed: u64, gain: f32, tol: f32) -> f32 {
 }
 
 #[test]
+fn maxpool_depth_f16_inference_matches_f32() {
+    let cfg = "[net]\nwidth=4\nheight=3\nchannels=5\nbatch=2\n\
+        [maxpool]\nmaxpool_depth=1\nout_channels=2\n";
+    run_pair(
+        "maxpool_depth f16",
+        network(cfg),
+        31,
+        1.0,
+        4e-3,
+    );
+}
+
+#[test]
 fn tiny_net_with_shortcut_maxpool_route_upsample_matches_f32() {
     let cfg = "[net]\nwidth=16\nheight=16\nchannels=3\nbatch=2\n\
         [convolutional]\nbatch_normalize=1\nfilters=8\nsize=3\nstride=1\npad=1\nactivation=leaky\n\

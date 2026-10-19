@@ -8635,15 +8635,17 @@ where
                         .map_err(|err| backend_error("f16 convolution", err))?
                 }
                 (LayerKind::MaxPool(spec), LayerParams::None) => {
+                    let maxpool_input = current_input.expect("maxpool requires current input");
                     if spec.depth {
-                        return Err(Error::UnsupportedLayer {
-                            layer_index: layer.index,
-                            name: "maxpool_depth".to_owned(),
-                        });
-                    }
-                    self.backend
-                        .maxpool_f16(
-                            current_input.expect("maxpool requires current input"),
+                        self.backend.maxpool_depth_f16(
+                            maxpool_input,
+                            &tensor_backend_shape(layer.output_shape),
+                            layer.input_shape.channels,
+                            launch_config,
+                        )
+                    } else {
+                        self.backend.maxpool_f16(
+                            maxpool_input,
                             &tensor_backend_shape(layer.output_shape),
                             layer.input_shape.channels,
                             layer.input_shape.height,
@@ -8654,7 +8656,8 @@ where
                             spec.padding,
                             launch_config,
                         )
-                        .map_err(|err| backend_error("f16 maxpool", err))?
+                    }
+                    .map_err(|err| backend_error("f16 maxpool", err))?
                 }
                 (LayerKind::LocalAvgPool(spec), LayerParams::None) => {
                     if layer.output_shape.channels != layer.input_shape.channels {

@@ -5888,6 +5888,8 @@ impl F32TensorOpsBackend for OxideBackend {
             || output_shape.len() != 4
             || input_channels == 0
             || output_shape[1] == 0
+            || output_shape[2] == 0
+            || output_shape[3] == 0
             || output_shape[1] > input_channels
             || x.shape()[1] != input_channels
             || x.shape()[0] != output_shape[0]
@@ -5931,6 +5933,10 @@ impl F32TensorOpsBackend for OxideBackend {
             || x.shape() != input_shape
             || output_grad.shape().len() != 4
             || output_channels == 0
+            || input_shape[0] == 0
+            || input_shape[1] == 0
+            || input_shape[2] == 0
+            || input_shape[3] == 0
             || output_channels > input_shape[1]
             || output_grad.shape()[0] != input_shape[0]
             || output_grad.shape()[1] != output_channels

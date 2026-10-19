@@ -699,6 +699,51 @@ impl OxideBackend {
         Ok(OxideTensorF16::new(out, &[batch, f, oh, ow]))
     }
 
+    /// f16 depth max pooling over strided channel groups, preserving the first
+    /// channel on ties.
+    pub fn maxpool_depth_f16(
+        &self,
+        x: &OxideTensorF16,
+        output_shape: &[usize],
+        input_channels: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF16, OxideError> {
+        if x.shape().len() != 4
+            || output_shape.len() != 4
+            || input_channels == 0
+            || output_shape[1] == 0
+            || output_shape[2] == 0
+            || output_shape[3] == 0
+            || output_shape[1] > input_channels
+            || x.shape()[1] != input_channels
+            || x.shape()[0] != output_shape[0]
+            || x.shape()[2] != output_shape[2]
+            || x.shape()[3] != output_shape[3]
+        {
+            return Err(shape_err(
+                "maxpool_depth_f16",
+                "incompatible NCHW shapes".to_owned(),
+            ));
+        }
+        let spatial = output_shape[2] * output_shape[3];
+        let mut output = self.alloc16_uninit(output_shape.iter().product())?;
+        // SAFETY: validated nonzero channel/spatial dimensions and matching
+        // batch/spatial extents; one thread writes each output exactly once.
+        unsafe {
+            self.half_ops.maxpool_depth_f16(
+                &self.stream,
+                launch::elementwise(output.len(), config),
+                &x.buf,
+                &mut output,
+                input_channels,
+                output_shape[1],
+                spatial,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF16::new(output, output_shape))
+    }
+
     /// f16 max pool (same window rule as `maxpool_f32`, `off = padding / 2`).
     #[allow(clippy::too_many_arguments)]
     pub fn maxpool_f16(
@@ -1137,6 +1182,16 @@ impl darknet_cuda::F16TensorOpsBackend for OxideBackend {
         OxideBackend::maxpool_f16(
             self, x, output_shape, channels, input_height, input_width, size, stride_x, stride_y, padding, config,
         )
+    }
+
+    fn maxpool_depth_f16(
+        &self,
+        x: &Self::TensorF16,
+        output_shape: &[usize],
+        input_channels: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error> {
+        OxideBackend::maxpool_depth_f16(self, x, output_shape, input_channels, config)
     }
 
     fn upsample_f16(

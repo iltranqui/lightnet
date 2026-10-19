@@ -126,6 +126,42 @@ pub mod kernels {
         }
     }
 
+    /// One thread per output element; first channel wins on ties, matching
+    /// f32 `maxpool_depth_forward` and the CPU reference.
+    #[kernel]
+    pub fn maxpool_depth_f16(
+        x: &[u16],
+        mut out: DisjointSlice<u16>,
+        input_channels: usize,
+        output_channels: usize,
+        spatial: usize,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= out.len() {
+            return;
+        }
+        let group = i / spatial % output_channels;
+        let batch = i / (output_channels * spatial);
+        let position = i % spatial;
+        let first = (batch * input_channels + group) * spatial + position;
+        let mut best_bits = x[first];
+        let mut best = f16_bits_to_f32(best_bits);
+        let mut channel = group + output_channels;
+        while channel < input_channels {
+            let bits = x[(batch * input_channels + channel) * spatial + position];
+            let candidate = f16_bits_to_f32(bits);
+            if candidate > best {
+                best = candidate;
+                best_bits = bits;
+            }
+            channel += output_channels;
+        }
+        if let Some(value) = out.get_mut(idx) {
+            *value = best_bits;
+        }
+    }
+
     /// Nearest upsample; `scale != 1` multiplies in f32 and rounds back.
     #[kernel]
     pub fn upsample_nearest_f16(
