@@ -4317,6 +4317,101 @@ fn gpu_muon_graph_conv_matrices_match_cpu_across_steps() {
             8e-4,
         );
     }
+
+    let dir = std::env::temp_dir().join(format!(
+        "oxide-runtime-graph-conv-muon-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cpu_state = dir.join("cpu.state");
+    let gpu_state = dir.join("gpu.state");
+    cpu.save_optimizer_state(&cpu_state)
+        .expect("save CPU GraphConv Muon state");
+    gpu.save_optimizer_state(&gpu_state)
+        .expect("save GPU GraphConv Muon state");
+
+    let mut resumed_cpu = ExecutableNetwork::new(net.clone());
+    resumed_cpu.params = cpu.params.clone();
+    resumed_cpu
+        .load_optimizer_state(&cpu_state)
+        .expect("load CPU GraphConv Muon state");
+    let mut resumed_gpu =
+        GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide resume"));
+    resumed_gpu.params = gpu.params.clone();
+    resumed_gpu
+        .load_optimizer_state(&gpu_state)
+        .expect("load GPU GraphConv Muon state");
+
+    let input = patterned(resumed_cpu.network.net.input_shape());
+    let cpu_forward = resumed_cpu
+        .forward_training(&input)
+        .expect("resumed CPU GraphConv forward");
+    let gpu_forward = resumed_gpu
+        .forward_training_with_state(&input)
+        .expect("resumed Oxide GraphConv forward");
+    close(
+        "resumed GPU Muon GraphConv output",
+        &gpu_forward.cpu_forward.layer_outputs[0].data,
+        &cpu_forward.layer_outputs[0].data,
+        6e-5,
+    );
+    let output_shape = resumed_cpu.network.layers[0].output_shape;
+    let seed = Tensor::from_data(
+        output_shape,
+        (0..output_shape.element_count() * output_shape.batch)
+            .map(|index| (index as f32 * 0.23 - 0.41).cos() * 0.25)
+            .collect(),
+    )
+    .unwrap();
+    let seeds = [Some(seed)];
+    resumed_cpu
+        .backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+        .expect("resumed CPU GraphConv backward");
+    resumed_gpu
+        .backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+        .expect("resumed Oxide GraphConv backward");
+    resumed_cpu
+        .update_weights_muon(0.02, 2)
+        .expect("resumed CPU GraphConv Muon update");
+    resumed_gpu
+        .update_weights_gpu(0.02, 0.9, net.net.decay, 2)
+        .expect("resumed GPU GraphConv Muon update");
+    let (LayerParams::GraphConv(cpu_params), LayerParams::GraphConv(gpu_params)) =
+        (&resumed_cpu.params[0], &resumed_gpu.params[0])
+    else {
+        panic!("GraphConv parameters expected after resumed Muon update");
+    };
+    close(
+        "resumed GPU Muon GraphConv projection weights",
+        &gpu_params.projection.weights,
+        &cpu_params.projection.weights,
+        8e-4,
+    );
+    close(
+        "resumed GPU Muon GraphConv projection biases",
+        &gpu_params.projection.biases,
+        &cpu_params.projection.biases,
+        8e-4,
+    );
+    close(
+        "resumed GPU Muon GraphConv self weights",
+        gpu_params.self_weights.as_ref().unwrap(),
+        cpu_params.self_weights.as_ref().unwrap(),
+        8e-4,
+    );
+    close(
+        "resumed GPU Muon GraphConv edge kernel",
+        gpu_params.edge_kernel.as_ref().unwrap(),
+        cpu_params.edge_kernel.as_ref().unwrap(),
+        8e-4,
+    );
+    close(
+        "resumed GPU Muon GraphConv edge biases",
+        gpu_params.edge_biases.as_ref().unwrap(),
+        cpu_params.edge_biases.as_ref().unwrap(),
+        8e-4,
+    );
+    std::fs::remove_dir_all(dir).ok();
 }
 
 #[test]
