@@ -107,6 +107,7 @@ file is named inline.
 - [79. Native Oxide GraphConv uniform aggregation primitives](#79-native-oxide-graphconv-uniform-aggregation-primitives)
 - [80. GraphConv aggregation coordinate-overflow guards](#80-graphconv-aggregation-coordinate-overflow-guards)
 - [81. Native GPU GraphConv uniform runtime path](#81-native-gpu-graphconv-uniform-runtime-path)
+- [82. GraphConv learned-edge masked-softmax host contract](#82-graphconv-learned-edge-masked-softmax-host-contract)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1600,6 +1601,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 81. Native GPU GraphConv uniform runtime path
 
 - v0.2.059: wired native Oxide f32 forward/backward for `[graph_conv]` edge mode 0 with no self projection or BN and backend-supported activation. Aggregation and grouped 1x1 projection/bias/activation run on device; backward computes activation, projection parameter, and aggregation-adjoint gradients on device, then stages projection gradients to host train buffers for SGD/Adam updates. Actual-Oxide runtime parity passed for layer outputs and SGD/Adam parameter updates through GraphConv and an upstream convolution (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain graph_conv_uniform_runtime_forward_backward_and_sgd_match_cpu`); host `graph_conv` filter passed 15 tests including host fallback. Unsupported learned-edge/self/BN/activation variants retain CPU fallback; compact GPU inference remains unsupported. Parameters are uploaded for projection and gradients download at backward; no residency/speedup claim. No compiled-C++ golden or full-suite claim; the broad runtime-chain run had 50 passing tests and one failure (`dcnv4_mixed_network_retains_cpu_cache_and_backward`: missing DCNv4 cache), whose cause remains unverified.
+
+## 82. GraphConv learned-edge masked-softmax host contract
+
+- v0.2.060: added checked host references for GraphConv learned-edge mode 1 aggregation and its exact input/edge-kernel/edge-bias adjoint. The contract fixes group-local `[groups, size*size, 2*channels_per_group]` layout, row-major edge order, center-reference zeroing when out of bounds, and masking invalid neighbors before stable softmax. Host-reference finite differences cover every input/kernel/bias element; constant-input masking and malformed group/length rejection pass in `MEM=3G ./tools/test_oxide.sh --test oxide_graph_conv` (4 tests total). This is a contract/reference increment only: **no native learned-edge GPU kernel or runtime integration exists yet**; CPU reference source and hand-derived equations only, no compiled-C++ golden. `PKGS=darknet-cuda MEM=3G ./tools/test_host.sh learned_aggregate` could not run because an unrelated existing unit-test compile error in `host_ops/local.rs` prevents the `darknet-cuda` library test target from compiling; the contract is exercised through the Oxide integration test target instead.
 
 ## Not implemented / open (pointer)
 
