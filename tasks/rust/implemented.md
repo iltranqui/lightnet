@@ -93,6 +93,7 @@ file is named inline.
 - [65. Retain native DCNv4 Adam moments on device](#65-retain-native-dcnv4-adam-moments-on-device)
 - [66. Reuse DCNv4 projection weights from forward during backward](#66-reuse-dcnv4-projection-weights-from-forward-during-backward)
 - [67. Retain native DCNv4 parameters across forwards and updates](#67-retain-native-dcnv4-parameters-across-forwards-and-updates)
+- [68. Native GPU Muon orthogonalization primitive](#68-native-gpu-muon-orthogonalization-primitive)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1513,6 +1514,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 67. Retain native DCNv4 parameters across forwards and updates
 
 - v0.2.030 (`6433f57f`): native f32 DCNv4 now caches learned parameter tensors (offset weights/biases, output biases and BN gamma) per layer and reuses them across forwards, backward, rolling-stat recomputation and native SGD/Adam updates. After an optimizer update, the device tensors are replaced in the cache and the existing host-canonical copies are refreshed; the next GPU call needs no parameter upload. Exact host value snapshots detect direct edits to public `params` and trigger a refresh; BN rolling statistics remain separately host-managed. Evidence: `MEM=3G ./tools/test_host.sh dcnv4` passed 29 tests, including measured upload reduction on repeated forward and invalidation after host edits. The actual-GPU two-step SGD/Adam CPU-parity test passed (1, 313.12 s). This retains parameter copies on device but still downloads updates to maintain host canonical state; no speedup or compiled-C++ golden claim. GPU Muon and broader parity requirements remain open.
+
+## 68. Native GPU Muon orthogonalization primitive
+
+- v0.2.031 (`b46ad9c8`): added a native Oxide f32 Newton–Schulz orthogonalization primitive exposed through `F32TensorOpsBackend::muon_orthogonalize_f32`; the generic default uses a host reference, while Oxide uses device Frobenius-norm accumulation, transpose/linear-combination kernels and existing GPU GEMM for five paper-coefficient iterations. Actual-GPU parity passed against the host reference for square, tall and wide matrices (including 17x31 and 31x17); zero and invalid-shape cases passed (`MEM=3G ./tools/test_oxide.sh --test oxide_muon`, 2 tests); host-reference zero/non-finite/transpose-equivariance tests also passed (`MEM=3G PKGS=darknet-cuda ./tools/test_host.sh muon_orthogonalize`, 2 tests). This is a standalone matrix primitive, **not** GPU Muon optimizer integration: `update_weights_gpu` still rejects `[net] muon=1`, and GPU momentum/update, hybrid AdamW fallback, runtime layer eligibility/gates and optimizer-sidecar state remain unimplemented. CPU Muon is still v0.1.005. No compiled-C++ golden or full-suite claim.
 
 ## Not implemented / open (pointer)
 
