@@ -10307,6 +10307,9 @@ where
                     spec.expert.batch_normalize
                 }
                 (LayerKind::Dcnv4(spec), LayerParams::Dcnv4(_)) => spec.batch_normalize,
+                (LayerKind::DeformConv(spec), LayerParams::DeformConv(_)) => {
+                    spec.batch_normalize
+                }
                 _ => !matches!(
                     (kind, *params),
                     (_, LayerParams::None)
@@ -10323,6 +10326,7 @@ where
                         | (LayerKind::MambaVision(_), LayerParams::MambaVision(_))
                         | (LayerKind::KimiKda(_), LayerParams::KimiKda(_))
                         | (LayerKind::Dcnv4(_), LayerParams::Dcnv4(_))
+                        | (LayerKind::DeformConv(_), LayerParams::DeformConv(_))
                         | (
                             LayerKind::Deconvolutional(_),
                             LayerParams::Convolutional(_)
@@ -10332,7 +10336,7 @@ where
         }) {
             return Err(Error::UnsupportedLayer {
                 layer_index: index,
-                name: "GPU Muon supports standard convolution, EML, MoE, and DCNv4 matrices without BN via host-staged device gradients, plus host-gradient local/RNN/LSTM/Kimi/MambaVision/Tucker/Swin/ViT/deconvolutional/connected matrices and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
+                name: "GPU Muon supports standard convolution, EML, MoE, DCNv4, and deform_conv matrices without BN via host-staged gradients, plus host-gradient local/RNN/LSTM/Kimi/MambaVision/Tucker/Swin/ViT/deconvolutional/connected matrices and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
             });
         }
         let step = self.adam_step.checked_add(1).ok_or_else(|| {
@@ -46335,7 +46339,7 @@ activation=linear
     }
 
     #[test]
-    fn gpu_muon_rejects_batch_normalized_convolution_eml_moe_and_dcnv4_before_updating() {
+    fn gpu_muon_rejects_batch_normalized_convolution_eml_moe_dcnv4_and_deform_before_updating() {
         let mut gpu = optimizer_net("muon=1\ndecoupled_decay=1");
         let before = gpu.params.clone();
         let error = gpu
@@ -46436,6 +46440,41 @@ batch_normalize=1
             .contains("other parameter families remain explicitly unsupported"));
         assert_eq!(dcnv4.params, before);
         assert_eq!(dcnv4.adam_step, 0);
+
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "muon-deform-bn.cfg",
+                r#"[net]
+width=2
+height=2
+channels=2
+batch=1
+muon=1
+decoupled_decay=1
+[deform_conv]
+filters=2
+size=1
+groups=2
+mask=1
+batch_normalize=1
+"#,
+            )
+            .expect("deform_conv Muon cfg should parse"),
+        )
+        .expect("deform_conv Muon network should build");
+        let mut deform = GpuExecutableNetwork::new(network, FakeBackend);
+        deform
+            .init_train_buffers_gpu()
+            .expect("deform_conv Muon buffers should initialize");
+        let before = deform.params.clone();
+        let error = deform
+            .update_weights_gpu(0.01, 0.9, 0.0005, 1)
+            .expect_err("batch-normalized deform_conv Muon staging is not integrated yet");
+        assert!(error
+            .to_string()
+            .contains("other parameter families remain explicitly unsupported"));
+        assert_eq!(deform.params, before);
+        assert_eq!(deform.adam_step, 0);
     }
 
     #[test]

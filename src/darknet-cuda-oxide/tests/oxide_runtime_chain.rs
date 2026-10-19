@@ -3066,6 +3066,146 @@ fn deform_conv_device_path_matches_cpu_chain_and_updates() {
 }
 
 #[test]
+fn gpu_muon_deform_conv_native_gradients_match_cpu_across_steps() {
+    let net = network(
+        r#"[net]
+width=4
+height=4
+channels=2
+batch=1
+muon=1
+decoupled_decay=1
+decay=0.0001
+[convolutional]
+filters=2
+size=1
+activation=linear
+[deform_conv]
+filters=2
+groups=2
+size=3
+mask=1
+batch_normalize=0
+activation=linear
+"#,
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    fill_params(&mut cpu.params);
+    let LayerParams::Convolutional(conv) = &mut cpu.params[0] else {
+        panic!("preceding convolution parameters")
+    };
+    conv.weights.copy_from_slice(&[0.8, -0.2, 0.1, 0.7]);
+    conv.biases.copy_from_slice(&[0.03, -0.02]);
+    let LayerParams::DeformConv(params) = &mut cpu.params[1] else {
+        panic!("deform_conv parameters")
+    };
+    for (index, weight) in params.main.weights.iter_mut().enumerate() {
+        *weight = 0.06 + index as f32 * 0.011;
+    }
+    for (index, bias) in params.main.biases.iter_mut().enumerate() {
+        *bias = 0.05 - index as f32 * 0.08;
+    }
+    for (index, weight) in params.offset_weights.iter_mut().enumerate() {
+        *weight = 0.0008 - index as f32 * 0.00003;
+    }
+    for (index, bias) in params.offset_biases.iter_mut().enumerate() {
+        *bias = 0.12 - index as f32 * 0.003;
+    }
+    for (index, weight) in params.mask_weights.as_mut().unwrap().iter_mut().enumerate() {
+        *weight = 0.02 - index as f32 * 0.0005;
+    }
+    for (index, bias) in params.mask_biases.as_mut().unwrap().iter_mut().enumerate() {
+        *bias = 0.1 - index as f32 * 0.004;
+    }
+
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("deform Muon buffers");
+
+    for step in 1..=2 {
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu().expect("zero deform Muon buffers");
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).expect("CPU deform forward");
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("Oxide deform forward");
+        let output = gpu
+            .backend
+            .download_f32(&gpu_forward.gpu_layer_outputs[1])
+            .expect("download deform output");
+        close(
+            &format!("deform Muon output step {step}"),
+            &output,
+            &cpu_forward.layer_outputs[1].data,
+            5e-4,
+        );
+        for microbatch in 0..2 {
+            let seed = Tensor::filled(
+                cpu.network.layers[1].output_shape,
+                0.08 + step as f32 * 0.01 + microbatch as f32 * 0.005,
+            );
+            let mut seeds = vec![None; 2];
+            seeds[1] = Some(seed);
+            cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+                .expect("CPU deform Muon backward");
+            gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+                .expect("Oxide deform Muon backward");
+        }
+        cpu.update_weights_muon(0.01, 2)
+            .expect("CPU deform Muon update");
+        gpu.update_weights_gpu(0.01, 0.9, net.net.decay, 2)
+            .expect("Oxide deform Muon update");
+
+        let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(gpu_conv)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("preceding convolution parameter layout")
+        };
+        close(
+            &format!("deform Muon upstream weights step {step}"),
+            &gpu_conv.weights,
+            &cpu_conv.weights,
+            1e-3,
+        );
+        close(
+            &format!("deform Muon upstream biases step {step}"),
+            &gpu_conv.biases,
+            &cpu_conv.biases,
+            1e-3,
+        );
+        let (LayerParams::DeformConv(cpu_params), LayerParams::DeformConv(gpu_params)) =
+            (&cpu.params[1], &gpu.params[1])
+        else {
+            panic!("deform_conv parameter layout")
+        };
+        for (name, cpu_values, gpu_values) in [
+            ("main weights", &cpu_params.main.weights, &gpu_params.main.weights),
+            ("main biases", &cpu_params.main.biases, &gpu_params.main.biases),
+            ("offset weights", &cpu_params.offset_weights, &gpu_params.offset_weights),
+            ("offset biases", &cpu_params.offset_biases, &gpu_params.offset_biases),
+            (
+                "mask weights",
+                cpu_params.mask_weights.as_ref().unwrap(),
+                gpu_params.mask_weights.as_ref().unwrap(),
+            ),
+            (
+                "mask biases",
+                cpu_params.mask_biases.as_ref().unwrap(),
+                gpu_params.mask_biases.as_ref().unwrap(),
+            ),
+        ] {
+            close(
+                &format!("deform Muon {name} step {step}"),
+                gpu_values,
+                cpu_values,
+                1e-3,
+            );
+        }
+    }
+}
+
+#[test]
 fn sam_native_gpu_forward_backward_fans_out_source_gradient_matches_cpu_across_steps() {
     let net = network(
         "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=1\n\
