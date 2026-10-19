@@ -96,7 +96,7 @@ with the command given rather than trusting the number.
 | `Dropout` | yes | none | fwd | exact | T1 | native | device | no |
 | `ScaleChannels` | yes | none | fwd | exact | T1 | native | mixed | no |
 | `Sam` | yes | none | fwd | exact | T1 | native f32 / host (unsupported activation) | device / CPU fallback | no |
-| `BatchNorm` | yes | C++ | fwd | exact | rust | inf (training rejected) | device | yes |
+| `BatchNorm` | yes | C++ | fwd | exact | rust | native inference + batch-statistics training | device backward / host AdamW parameter update | yes |
 | `Crop` | yes | none | fwd | exact | rust | inf (training rejected) | device | no |
 | `Local` | yes | C++ | fwd | exact | rust | native f32 / host (unsupported activation) | device / CPU fallback | no |
 | `Gru` | yes | C++ | fwd | exact | rust | **none** (falls to "inconsistent") | cpu | no |

@@ -122,6 +122,7 @@ file is named inline.
 - [94. Grouped GraphConv GPU Muon parity](#94-grouped-graphconv-gpu-muon-parity)
 - [95. GraphConv BN GPU Muon through CPU fallback](#95-graphconv-bn-gpu-muon-through-cpu-fallback)
 - [96. Native GraphConv BN training](#96-native-graphconv-bn-training)
+- [97. Standalone BatchNorm native GPU training](#97-standalone-batchnorm-native-gpu-training)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1675,6 +1676,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 96. Native GraphConv BN training
 
 - v0.2.074: native f32 GraphConv training now supports batch-statistics BN with the eligible edge modes 0/1 and supported activations. GPU forward caches BN statistics; native backward computes input, gamma, beta, projection, self, and learned-edge gradients. Rolling mean/variance return from the device after backward using the CPU GraphConv reference's 0.9 update coefficient. Oxide actual-device parity passed for grouped learned-edge+self across SGD and Adam, including output, trainable parameters and rolling statistics (`graph_conv_batch_norm_native_training_forward_backward_sgd_adam_matches_cpu`); two-step GPU Muon parity also passes (`gpu_muon_graph_conv_batch_norm_native_training_matches_cpu`). `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain graph_conv` passed 9 tests; focused host BN inference and Muon rejection tests passed. Unsupported activations/edge modes retain fallback; other configurations, compiled-C++ golden, full-suite and performance evidence remain open.
+
+## 97. Standalone BatchNorm native GPU training
+
+- v0.2.075: standalone `[batchnorm]` training now uses native Oxide batch-statistics forward/backward, caches batch statistics, and synchronizes rolling mean plus the CPU-reference biased rolling variance after backward. Scale/bias optimizer application remains the existing host AdamW fallback. Actual-Oxide output and parameter/stat parity against CPU passed in `standalone_batch_norm_native_training_matches_cpu_adam`; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain batch_norm` passed 9 tests, including recurrent/connected/GraphConv BN regressions. This does not add compiled-C++ golden evidence, native standalone-BN optimizer updates, or full-suite/performance claims.
 
 ## Not implemented / open (pointer)
 
