@@ -90,6 +90,7 @@ file is named inline.
 - [62. Native DCNv4 Adam optimizer update](#62-native-dcnv4-adam-optimizer-update)
 - [63. Native Revleaky activation mapping](#63-native-revleaky-activation-mapping)
 - [64. Extend native DCNv4 through 15x15](#64-extend-native-dcnv4-through-15x15)
+- [65. Retain native DCNv4 Adam moments on device](#65-retain-native-dcnv4-adam-moments-on-device)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1498,6 +1499,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 64. Extend native DCNv4 through 15x15
 
 - v0.2.027 (`e5217f8a`): raised the native DCNv4 mask capacity and runtime gate from 169 to 225 active points (15x15). Actual GPU composition parity compares outputs and all math gradients against the real CPU layer; the runtime matrix exercises two-step SGD/Adam, BN on/off, and includes the 15x15 case. The >225 fallback guard now uses 17x17. Evidence: `MEM=3G ./tools/test_host.sh dcnv4` passed 29 tests; `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain` passed 3 tests (15x15 included); `MEM=3G ./tools/test_oxide.sh dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed 1 actual-GPU test (301.50 s). Larger kernels/unsupported activations and mixed networks remain host fallback; parameters remain host-canonical. No speedup, compiled-C++ golden or full-suite claim; CPU/axis/Muon and sparse-MoE requirements remain open.
+
+## 65. Retain native DCNv4 Adam moments on device
+
+- v0.2.028 (`d7b0e5cc`): eligible native DCNv4 Adam now reuses device-resident first/second moments between updates instead of downloading/re-uploading them every step. Parameters remain host-canonical and still cross at each optimizer step. `save_optimizer_state` materializes the device moments into the existing host Adam sidecar structure; loading an existing DNOPT sidecar uploads moments lazily on the next native update, with no format bump. Evidence: `MEM=3G ./tools/test_host.sh dcnv4` passed 29 tests, including device-state creation and byte-identical save/load/save sidecar round-trip. Focused actual-GPU two-step SGD/Adam CPU parity passed on rerun (1 test, 300.16 s); its preceding run had one near-threshold parameter-delta failure. No speedup or compiled-C++ golden claim; only DCNv4 Adam moments are resident, not its parameters. GPU Muon, broader GPU work, CPU/axis gaps and sparse MoE remain open.
 
 ## Not implemented / open (pointer)
 

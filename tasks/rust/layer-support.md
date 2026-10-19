@@ -106,7 +106,7 @@ with the command given rather than trusting the number.
 | `Moe` | alias | C++ | fwd | exact | pin | native | device | no |
 | `EmlConvolutional` | alias | C++ | fwd | exact | pin | native | device / CPU (BN) | no |
 | `GraphConv` | alias | C++ | fwd | exact | T4 | none | none | no |
-| `Dcnv4` | alias | C++ | fwd | exact | pin | native (incl. rolling-stat BN, <=225 points, supported scalar/NormalizeChannels* acts incl. Revleaky) / host otherwise | mixed (native math and SGD/Adam update; Adam moments transfer through host sidecar) | no |
+| `Dcnv4` | alias | C++ | fwd | exact | pin | native (incl. rolling-stat BN, <=225 points, supported scalar/NormalizeChannels* acts incl. Revleaky) / host otherwise | mixed (native math and SGD/Adam update; Adam moments resident on device between updates, sidecar on save) | no |
 | `DeformConv` | alias | C++ | fwd | exact | T4 | native (dilation 1, no BN) / host otherwise | native (same gate; one host hop for the normalization Jacobian) | no |
 | `DsConv` | alias | C++ | fwd | exact | T4 | none | none | no |
 | `Wmhf` | alias | C++ | fwd | exact | T4 | none | none | no |
@@ -238,7 +238,7 @@ devices and head sizes (no native kernel at all), even though standard
 | MoE | device forward/backward, device SGD/Adam for router and experts, DNOPT3/4 moments | BN-expert **SGD** still host-side per `STATUS.md`; router parameter values sync to host each step |
 | EML | device forward, device SGD/Adam (DNOPT5), BN scale/beta gradients | BN backward CPU fallback per v71; documents disagree on later state — verify against `implemented.md` §7 before planning |
 | Recurrent | device projections/BPTT, on-device caches and gradient accumulation without BN | BN forward/cache, rolling-stat update and optimizer remain host-side; some parameter-gradient transfers still cross the host |
-| DCNv4 | bounded native f32 forward/backward through 15x15/225 points incl. rolling-stat BN and 0.9 EMA, NormalizeChannels*/Revleaky activations, device gradient accumulation and native SGD/Adam updates (v0.2.027); two-step CPU parity | >225/unsupported variants host; parameters remain host-canonical and Adam moments transfer through host sidecar; compact/f16 absent |
+| DCNv4 | bounded native f32 forward/backward through 15x15/225 points incl. rolling-stat BN and 0.9 EMA, NormalizeChannels*/Revleaky activations, device gradient accumulation and native SGD/Adam updates; Adam moments persist on-device between steps and bridge through sidecar only at save/load (v0.2.028); two-step CPU parity | >225/unsupported variants host; parameters remain host-canonical and upload/download per optimizer step; compact/f16 absent |
 | Shortcut (weighted) | device input/source gradients, exact normalization derivatives | per-input/per-slot weight gradient vector crosses to host; optimizer host-side |
 | Connected | device GEMM + activation, BN folded at inference | BN training and unsupported/unknown activations fall back |
 | `Crop`, `BatchNorm` | device inference | training explicitly rejected |
@@ -249,7 +249,7 @@ devices and head sizes (no native kernel at all), even though standard
 | Optimizer | CPU | GPU |
 |---|---|---|
 | SGD (momentum, decay, per-layer rate, gates) | all parameterized layers | device for conv/MoE/EML and eligible native DCNv4; host for connected, deconv, deform_conv, recurrent, weighted shortcut, vit, swin, tucker, mamba, kimi, local, batchnorm; n/a for hard rejects |
-| Adam/AdamW | all parameterized layers; DNOPT1–5 sidecars | device for conv/MoE/EML/DCNv4 (+BN scales); DCNv4 moments transfer through host sidecar at optimizer boundary; DNOPT1–5 readable |
+| Adam/AdamW | all parameterized layers; DNOPT1–5 sidecars | device for conv/MoE/EML/DCNv4 (+BN scales); DCNv4 moments persist on-device between updates and materialize through the existing host sidecar on save; DNOPT1–5 readable |
 | Muon | v0.1.005 hybrid on eligible 2-D matrices, DNOPT6 | **absent** — no kernel, no eligibility set, no state format |
 
 Muon eligibility (CPU, from `AGENTS.md`): convolution weights viewed as
