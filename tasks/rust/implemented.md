@@ -99,6 +99,7 @@ file is named inline.
 - [71. GPU Muon RNN matrices](#71-gpu-muon-rnn-matrices)
 - [72. GPU Muon LSTM matrices](#72-gpu-muon-lstm-matrices)
 - [73. Native GPU SAM forward and backward](#73-native-gpu-sam-forward-and-backward)
+- [74. Hybrid GPU Muon for convolution matrices](#74-hybrid-gpu-muon-for-convolution-matrices)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1560,6 +1561,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 73. Native GPU SAM forward and backward
 
 - v0.2.051: replaced SAM's host-round-trip forward with native f32 pointwise multiply plus supported activation, and added the exact activation adjoint plus gradients to both the preceding layer and the configured source layer. Unsupported activations retain host forward and whole-network CPU backward fallback. Actual-Oxide two-step SGD parity passed for outputs and both upstream convolution parameter sets; coverage also checks `forward_training_device` and the fan-out source gradient (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- sam_native_gpu_forward_backward_fans_out_source_gradient_matches_cpu_across_steps`). The broad host `sam` filter passed 28 matched tests, though it is not a SAM-specific test. No compiled-C++ golden, full-suite, or performance claim.
+
+## 74. Hybrid GPU Muon for convolution matrices
+
+- v0.2.052: extended hybrid GPU Muon to standard convolutional matrices without batch normalization. The optimizer downloads accumulated device weight/bias gradients at the update boundary, runs Oxide Newton–Schulz orthogonalization, applies host-staged AdamW/Muon updates, refreshes cached device parameters, and clears consumed device gradients. Actual-Oxide grouped-convolution parity passed for two updates with two accumulated seeded backward calls per step, including outputs, weights, and biases (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_convolution_device_gradients_match_cpu_across_steps`); `MEM=3G ./tools/test_host.sh gpu_muon_` passed 4, including the explicit BN-convolution rejection. BN convolutions and other convolutional families remain unsupported; gradients/state/final updates cross the host boundary. No compiled-C++ golden, full-suite, or performance claim.
 
 ## Not implemented / open (pointer)
 
