@@ -129,6 +129,7 @@ file is named inline.
 - [101. Region CPU forward and axis pin](#101-region-cpu-forward-and-axis-pin)
 - [102. Native GRU GPU inference](#102-native-gru-gpu-inference)
 - [103. Native RNN rolling-stat BN inference](#103-native-rnn-rolling-stat-bn-inference)
+- [104. Native LSTM rolling-stat BN inference](#104-native-lstm-rolling-stat-bn-inference)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1710,6 +1711,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 103. Native RNN rolling-stat BN inference
 
 - v0.2.080: native f32 RNN inference now dispatches through device recurrent projections even when batch normalization is enabled. Rolling-stat BN affine parameters are folded into each projection's weights/biases before upload, matching CPU inference. BN training continues on the existing host fallback because its batch-stat/cache semantics are separate. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain rnn` passed 6 tests, including `rnn_native_inference_matches_cpu_with_rolling_batch_norm` plus RNN/CRNN training regressions. Rust CPU reference parity only; no C++ golden, full-suite, or performance claim.
+
+## 104. Native LSTM rolling-stat BN inference
+
+- v0.2.081: native f32 LSTM inference now dispatches through device recurrent projections with rolling-stat BN folded into the four recurrent and four input projection weight/bias pairs. BN training remains on the host fallback. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain lstm` passed 4 tests, including `lstm_native_inference_matches_cpu_with_rolling_batch_norm` and existing LSTM forward/backward/Muon regressions. Rust CPU-reference parity only; no C++ golden, full-suite or performance claim.
 
 ## Not implemented / open (pointer)
 

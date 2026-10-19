@@ -14494,19 +14494,20 @@ where
                     }
                 }
                 (LayerKind::Lstm(spec), LayerParams::Lstm(recurrent)) => {
-                    if !spec.batch_normalize
-                        && [
-                            &recurrent.wf,
-                            &recurrent.wi,
-                            &recurrent.wg,
-                            &recurrent.wo,
-                            &recurrent.uf,
-                            &recurrent.ui,
-                            &recurrent.ug,
-                            &recurrent.uo,
-                        ]
-                        .iter()
-                        .all(|projection| projection.batch_norm.is_none())
+                    if !training
+                        || (!spec.batch_normalize
+                            && [
+                                &recurrent.wf,
+                                &recurrent.wi,
+                                &recurrent.wg,
+                                &recurrent.wo,
+                                &recurrent.uf,
+                                &recurrent.ui,
+                                &recurrent.ug,
+                                &recurrent.uo,
+                            ]
+                            .iter()
+                            .all(|projection| projection.batch_norm.is_none()))
                     {
                         let (output, cache, device_cache) = forward_lstm_layer_device(
                             &self.backend,
@@ -28580,19 +28581,6 @@ fn forward_lstm_layer_device<B: F32TensorOpsBackend>(
 where
     B::Error: std::fmt::Display,
 {
-    if spec.batch_normalize
-        || [
-            &params.wf, &params.wi, &params.wg, &params.wo, &params.uf, &params.ui, &params.ug,
-            &params.uo,
-        ]
-        .iter()
-        .any(|projection| projection.batch_norm.is_some())
-    {
-        return Err(Error::UnsupportedLayer {
-            layer_index,
-            name: "batch-normalized LSTM GPU forward".to_owned(),
-        });
-    }
     let sequence_batch = recurrent_sequence_batch(input_shape.batch, spec.steps)?;
     if output_shape.width != 1 || output_shape.height != 1 || output_shape.channels != spec.output {
         return Err(Error::InvalidConfig(
@@ -28609,11 +28597,27 @@ where
                 "LSTM {name} projection parameter shapes are inconsistent with its specification"
             )));
         }
+        let (weights, biases) = if let Some(batch_norm) = &projection.batch_norm {
+            validate_batchnorm_params(batch_norm, spec.output)?;
+            let mut weights = projection.weights.clone();
+            let mut biases = projection.biases.clone();
+            for output in 0..spec.output {
+                let factor = batch_norm.scales[output]
+                    / (batch_norm.rolling_variance[output] + BATCH_NORM_EPSILON).sqrt();
+                for weight in &mut weights[output * input_features..(output + 1) * input_features] {
+                    *weight *= factor;
+                }
+                biases[output] -= batch_norm.rolling_mean[output] * factor;
+            }
+            (weights, biases)
+        } else {
+            (projection.weights.clone(), projection.biases.clone())
+        };
         let weights = backend
-            .upload_f32(&[spec.output, input_features], &projection.weights)
+            .upload_f32(&[spec.output, input_features], &weights)
             .map_err(|err| backend_error("upload LSTM projection weights", err))?;
         let biases = backend
-            .upload_f32(&[spec.output], &projection.biases)
+            .upload_f32(&[spec.output], &biases)
             .map_err(|err| backend_error("upload LSTM projection biases", err))?;
         Ok((weights, biases))
     };
