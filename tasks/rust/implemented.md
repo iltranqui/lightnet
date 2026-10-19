@@ -118,6 +118,7 @@ file is named inline.
 - [90. Full GraphConv batch-normalization inference](#90-full-graphconv-batch-normalization-inference)
 - [91. Hybrid GPU Muon for non-BN GraphConv matrices](#91-hybrid-gpu-muon-for-non-bn-graphconv-matrices)
 - [92. GraphConv GPU Muon DNOPT6 sidecar resume](#92-graphconv-gpu-muon-dnopt6-sidecar-resume)
+- [93. GraphConv GPU Muon update gate](#93-graphconv-gpu-muon-update-gate)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1655,6 +1656,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 92. GraphConv GPU Muon DNOPT6 sidecar resume
 
 - v0.2.070 (`3886b6c2`): extended the GraphConv hybrid GPU Muon parity test through optimizer-state save/load and a resumed third update. CPU and GPU DNOPT6 sidecars are loaded into fresh executables; resumed output and projection/self/edge matrix plus bias updates match CPU. Verified by `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_graph_conv_matrices_match_cpu_across_steps` (1 actual-Oxide test). This verifies the existing sidecar format for the tested learned-edge+self, non-BN variant; other GraphConv variants and full GPU/CPU parity requirements remain open. No compiled-C++ golden, full-suite, or performance claim.
+
+## 93. GraphConv GPU Muon update gate
+
+- v0.2.071 (`9aaa30fb`): added actual-Oxide CPU parity for GraphConv Muon with `dont_update=1`. The test runs forward/backward, confirms CPU and Oxide outputs agree, verifies all GraphConv parameters remain unchanged after the gated optimizer call, and confirms the global optimizer step advances. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_graph_conv_dont_update_gate_preserves_parameters` passed 1 test. This covers only the no-BN learned-edge+self variant; other per-layer gates/configurations remain unverified. No compiled-C++ golden/full-suite/performance claim.
 
 ## Not implemented / open (pointer)
 
