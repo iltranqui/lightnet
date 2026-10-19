@@ -3066,6 +3066,65 @@ fn deform_conv_device_path_matches_cpu_chain_and_updates() {
 }
 
 #[test]
+fn gpu_muon_mambavision_host_gradient_matrices_match_cpu_across_steps() {
+    let net = network(
+        "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=1\nmuon=1\ndecoupled_decay=1\ndecay=0.0001\n\
+         [mambavision]\nfilters=2\nstate=2\nconv_size=1\ndt_rank=1\nffn_ratio=1\nactivation=linear\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    darknet_core::initialize_training_params(&net, &mut cpu.params, 53);
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("MambaVision train buffers");
+
+    for step in 1..=2 {
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu()
+            .expect("zero MambaVision buffers");
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu
+            .forward_training(&input)
+            .expect("CPU MambaVision forward");
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("Oxide MambaVision forward");
+        for (cpu_output, gpu_output) in cpu_forward
+            .layer_outputs
+            .iter()
+            .zip(&gpu_forward.cpu_forward.layer_outputs)
+        {
+            close(
+                &format!("MambaVision step {step} forward"),
+                &cpu_output.data,
+                &gpu_output.data,
+                3e-4,
+            );
+        }
+        let seed = Tensor::filled(cpu.network.layers[0].output_shape, 0.025 * step as f32);
+        let seeds = [Some(seed)];
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU MambaVision backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("Oxide MambaVision backward");
+        cpu.update_weights_muon(0.02, 1)
+            .expect("CPU MambaVision Muon update");
+        gpu.update_weights_gpu(0.02, 0.9, net.net.decay, 1)
+            .expect("GPU MambaVision Muon update");
+        let (LayerParams::MambaVision(cpu_mamba), LayerParams::MambaVision(gpu_mamba)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("MambaVision parameter layout expected");
+        };
+        close(
+            &format!("MambaVision weights step {step}"),
+            &gpu_mamba.values,
+            &cpu_mamba.values,
+            1e-3,
+        );
+    }
+}
+
+#[test]
 fn gpu_muon_tucker_host_gradient_matrices_match_cpu_across_steps() {
     let net = network(
         "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=1\nmuon=1\ndecoupled_decay=1\ndecay=0.0001\n\
