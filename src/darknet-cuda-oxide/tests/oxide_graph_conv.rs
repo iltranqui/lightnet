@@ -2,7 +2,8 @@ use darknet_cuda::{
     ElementwiseLaunchConfig, F32TensorOpsBackend,
     host_ops::graph_conv::{
         GraphConvAggregationGeometry, aggregate_backward, aggregate_forward,
-        learned_aggregate_backward, learned_aggregate_forward,
+        center_reference_backward, center_reference_forward, learned_aggregate_backward,
+        learned_aggregate_forward,
     },
 };
 use darknet_cuda_oxide::OxideBackend;
@@ -126,6 +127,91 @@ fn graph_conv_uniform_aggregate_forward_backward_matches_reference_and_fd() {
                 input_gradient[index]
             );
         }
+    }
+}
+
+#[test]
+fn graph_conv_center_reference_forward_backward_matches_host_and_fd() {
+    let backend = OxideBackend::new().expect("Oxide backend");
+    let config = ElementwiseLaunchConfig::default();
+    let geometry = GraphConvAggregationGeometry {
+        batch: 2,
+        channels: 3,
+        input_height: 4,
+        input_width: 5,
+        output_height: 4,
+        output_width: 3,
+        size: 3,
+        stride_x: 2,
+        stride_y: 1,
+        dilation: 1,
+        padding: 1,
+    };
+    let input = patterned(geometry.input_len(), 0.23);
+    let input_device = backend
+        .upload_f32(
+            &[
+                geometry.batch,
+                geometry.channels,
+                geometry.input_height,
+                geometry.input_width,
+            ],
+            &input,
+        )
+        .expect("upload GraphConv reference input");
+    let reference_device = backend
+        .graph_conv_reference_f32(&input_device, geometry, config)
+        .expect("native GraphConv reference gather");
+    let reference = backend.download_f32(&reference_device).unwrap();
+    let expected = center_reference_forward(&input, geometry).expect("host center reference");
+    close(
+        "GraphConv center-reference forward",
+        &reference,
+        &expected,
+        2e-6,
+    );
+
+    let output_gradient = patterned(geometry.output_len(), 0.91);
+    let gradient_device = backend
+        .upload_f32(
+            &[
+                geometry.batch,
+                geometry.channels,
+                geometry.output_height,
+                geometry.output_width,
+            ],
+            &output_gradient,
+        )
+        .expect("upload GraphConv reference gradient");
+    let input_gradient_device = backend
+        .graph_conv_reference_backward_f32(&gradient_device, geometry, config)
+        .expect("native GraphConv reference adjoint");
+    let input_gradient = backend.download_f32(&input_gradient_device).unwrap();
+    let expected_gradient = center_reference_backward(&output_gradient, geometry)
+        .expect("host center-reference adjoint");
+    close(
+        "GraphConv center-reference backward",
+        &input_gradient,
+        &expected_gradient,
+        2e-6,
+    );
+
+    let epsilon = 1e-3;
+    for index in 0..input.len() {
+        let mut plus = input.clone();
+        let mut minus = input.clone();
+        plus[index] += epsilon;
+        minus[index] -= epsilon;
+        let plus = center_reference_forward(&plus, geometry).unwrap();
+        let minus = center_reference_forward(&minus, geometry).unwrap();
+        let numeric = plus
+            .iter()
+            .zip(&minus)
+            .zip(&output_gradient)
+            .map(|((&plus, &minus), &seed)| (plus - minus) * seed)
+            .sum::<f32>()
+            / (2.0 * epsilon);
+        assert!((numeric - input_gradient[index]).abs() < 2e-3 * (1.0 + numeric.abs()));
     }
 }
 

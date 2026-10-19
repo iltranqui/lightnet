@@ -1317,6 +1317,53 @@ pub trait F32TensorOpsBackend {
             &output,
         )
     }
+    /// Gather GraphConv's center/reference feature for optional self projection.
+    fn graph_conv_reference_f32(
+        &self,
+        input: &Self::Tensor,
+        geometry: host_ops::graph_conv::GraphConvAggregationGeometry,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let reference = host_ops::graph_conv::center_reference_forward(
+            &self.download_f32(input)?,
+            geometry,
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        self.upload_f32(
+            &[
+                geometry.batch,
+                geometry.channels,
+                geometry.output_height,
+                geometry.output_width,
+            ],
+            &reference,
+        )
+    }
+    /// Exact input adjoint of [`Self::graph_conv_reference_f32`].
+    fn graph_conv_reference_backward_f32(
+        &self,
+        output_gradient: &Self::Tensor,
+        geometry: host_ops::graph_conv::GraphConvAggregationGeometry,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let output_gradient = self.download_f32(output_gradient)?;
+        let input_gradient = host_ops::graph_conv::center_reference_backward(
+            &output_gradient,
+            geometry,
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        self.upload_f32(
+            &[
+                geometry.batch,
+                geometry.channels,
+                geometry.input_height,
+                geometry.input_width,
+            ],
+            &input_gradient,
+        )
+    }
     /// Learned-edge softmax aggregation for graph-convolution edge mode 1.
     fn graph_conv_learned_aggregate_f32(
         &self,

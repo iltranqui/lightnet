@@ -236,6 +236,100 @@ pub fn aggregate_backward(
     Ok(input_gradient)
 }
 
+/// Gather the center/reference feature used by GraphConv's optional self
+/// projection. Out-of-bounds center coordinates produce zero.
+pub fn center_reference_forward(
+    input: &[f32],
+    geometry: GraphConvAggregationGeometry,
+) -> Result<Vec<f32>, String> {
+    let g = geometry.checked()?;
+    if input.len() != g.input_len() {
+        return Err(format!(
+            "graph_conv reference input length mismatch: expected {}, got {}",
+            g.input_len(),
+            input.len()
+        ));
+    }
+    let mut reference = vec![0.0; g.output_len()];
+    let center = g.size / 2;
+    for batch in 0..g.batch {
+        for channel in 0..g.channels {
+            for oy in 0..g.output_height {
+                let iy = oy as i64 * g.stride_y as i64 - g.padding as i64
+                    + center as i64 * g.dilation as i64;
+                if iy < 0 || iy >= g.input_height as i64 {
+                    continue;
+                }
+                for ox in 0..g.output_width {
+                    let ix = ox as i64 * g.stride_x as i64 - g.padding as i64
+                        + center as i64 * g.dilation as i64;
+                    if ix < 0 || ix >= g.input_width as i64 {
+                        continue;
+                    }
+                    let input_index =
+                        ((batch * g.channels + channel) * g.input_height + iy as usize)
+                            * g.input_width
+                            + ix as usize;
+                    let output_index =
+                        ((batch * g.channels + channel) * g.output_height + oy) * g.output_width
+                            + ox;
+                    reference[output_index] = input[input_index];
+                }
+            }
+        }
+    }
+    Ok(reference)
+}
+
+/// Exact adjoint of [`center_reference_forward`].
+pub fn center_reference_backward(
+    output_gradient: &[f32],
+    geometry: GraphConvAggregationGeometry,
+) -> Result<Vec<f32>, String> {
+    let g = geometry.checked()?;
+    if output_gradient.len() != g.output_len() {
+        return Err(format!(
+            "graph_conv reference gradient length mismatch: expected {}, got {}",
+            g.output_len(),
+            output_gradient.len()
+        ));
+    }
+    let mut input_gradient = vec![0.0; g.input_len()];
+    let center_offset = (g.size / 2) as i64 * g.dilation as i64;
+    for batch in 0..g.batch {
+        for channel in 0..g.channels {
+            for iy in 0..g.input_height {
+                let oy_num = iy as i64 + g.padding as i64 - center_offset;
+                if oy_num < 0 || oy_num % g.stride_y as i64 != 0 {
+                    continue;
+                }
+                let oy = (oy_num / g.stride_y as i64) as usize;
+                if oy >= g.output_height {
+                    continue;
+                }
+                for ix in 0..g.input_width {
+                    let ox_num = ix as i64 + g.padding as i64 - center_offset;
+                    if ox_num < 0 || ox_num % g.stride_x as i64 != 0 {
+                        continue;
+                    }
+                    let ox = (ox_num / g.stride_x as i64) as usize;
+                    if ox >= g.output_width {
+                        continue;
+                    }
+                    let input_index =
+                        ((batch * g.channels + channel) * g.input_height + iy) * g.input_width
+                            + ix;
+                    let output_index =
+                        ((batch * g.channels + channel) * g.output_height + oy) * g.output_width
+                            + ox;
+                    input_gradient[input_index] = output_gradient[output_index];
+                }
+            }
+        }
+    }
+    Ok(input_gradient)
+}
+
 /// Validate the learned-edge aggregation layout. Edge kernels are row-major
 /// `[groups, size*size, 2*channels_per_group]` (reference then neighbor).
 fn checked_learned_geometry(

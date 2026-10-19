@@ -45,6 +45,87 @@ impl OxideBackend {
         Ok(OxideTensorF32::new(output, &output_shape))
     }
 
+    pub(crate) fn graph_conv_reference_forward_native(
+        &self,
+        input: &OxideTensorF32,
+        geometry: GraphConvAggregationGeometry,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        const OP: &str = "graph_conv_reference_f32";
+        let g = geometry.checked().map_err(OxideError::Shape)?;
+        let input_shape = [g.batch, g.channels, g.input_height, g.input_width];
+        let output_shape = [g.batch, g.channels, g.output_height, g.output_width];
+        expect_shape(OP, "input", input.shape(), &input_shape)?;
+        expect_len(OP, "input", input.len(), g.input_len())?;
+        let mut reference = self.alloc_uninit(g.output_len())?;
+        // SAFETY: checked geometry bounds coordinates and lengths; each output
+        // location has one owning thread, including zeroed invalid centers.
+        unsafe {
+            self.graph_conv.graph_reference_fwd(
+                &self.stream,
+                launch::elementwise(g.output_len(), config),
+                &input.buf,
+                &mut reference,
+                g.batch,
+                g.channels,
+                g.input_height,
+                g.input_width,
+                g.output_height,
+                g.output_width,
+                g.size,
+                g.stride_x,
+                g.stride_y,
+                g.dilation,
+                g.padding,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(reference, &output_shape))
+    }
+
+    pub(crate) fn graph_conv_reference_backward_native(
+        &self,
+        output_gradient: &OxideTensorF32,
+        geometry: GraphConvAggregationGeometry,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        const OP: &str = "graph_conv_reference_backward_f32";
+        let g = geometry.checked().map_err(OxideError::Shape)?;
+        let output_shape = [g.batch, g.channels, g.output_height, g.output_width];
+        let input_shape = [g.batch, g.channels, g.input_height, g.input_width];
+        expect_shape(
+            OP,
+            "output gradient",
+            output_gradient.shape(),
+            &output_shape,
+        )?;
+        expect_len(OP, "output gradient", output_gradient.len(), g.output_len())?;
+        let mut input_gradient = self.alloc_uninit(g.input_len())?;
+        // SAFETY: checked geometry bounds coordinates and lengths; each input
+        // owns at most one center-reference output contribution.
+        unsafe {
+            self.graph_conv.graph_reference_bwd(
+                &self.stream,
+                launch::elementwise(g.input_len(), config),
+                &output_gradient.buf,
+                &mut input_gradient,
+                g.batch,
+                g.channels,
+                g.input_height,
+                g.input_width,
+                g.output_height,
+                g.output_width,
+                g.size,
+                g.stride_x,
+                g.stride_y,
+                g.dilation,
+                g.padding,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(input_gradient, &input_shape))
+    }
+
     pub(crate) fn graph_conv_learned_aggregate_forward_native(
         &self,
         input: &OxideTensorF32,

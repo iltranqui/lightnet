@@ -56,6 +56,95 @@ pub mod kernels {
         }
     }
 
+    /// Gather the center/reference feature for GraphConv self projection.
+    #[kernel]
+    pub fn graph_reference_fwd(
+        input: &[f32],
+        mut reference: DisjointSlice<f32>,
+        batch: usize,
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        output_height: usize,
+        output_width: usize,
+        size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        dilation: usize,
+        padding: usize,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        let output_len = batch * channels * output_height * output_width;
+        if i >= output_len {
+            return;
+        }
+        let ox = i % output_width;
+        let oy = (i / output_width) % output_height;
+        let channel = (i / (output_width * output_height)) % channels;
+        let b = i / (output_width * output_height * channels);
+        let center = size / 2;
+        let iy = oy as i64 * stride_y as i64 - padding as i64 + center as i64 * dilation as i64;
+        let ix = ox as i64 * stride_x as i64 - padding as i64 + center as i64 * dilation as i64;
+        let value = if iy >= 0 && iy < input_height as i64 && ix >= 0 && ix < input_width as i64 {
+            input[((b * channels + channel) * input_height + iy as usize) * input_width
+                + ix as usize]
+        } else {
+            0.0
+        };
+        if let Some(dst) = reference.get_mut(idx) {
+            *dst = value;
+        }
+    }
+
+    /// Exact gather adjoint of the center/reference extraction.
+    #[kernel]
+    pub fn graph_reference_bwd(
+        output_gradient: &[f32],
+        mut input_gradient: DisjointSlice<f32>,
+        batch: usize,
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        output_height: usize,
+        output_width: usize,
+        size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        dilation: usize,
+        padding: usize,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        let input_len = batch * channels * input_height * input_width;
+        if i >= input_len {
+            return;
+        }
+        let ix = i % input_width;
+        let iy = (i / input_width) % input_height;
+        let channel = (i / (input_width * input_height)) % channels;
+        let b = i / (input_width * input_height * channels);
+        let center_offset = (size / 2) as i64 * dilation as i64;
+        let oy_num = iy as i64 + padding as i64 - center_offset;
+        let ox_num = ix as i64 + padding as i64 - center_offset;
+        let mut gradient = 0.0f32;
+        if oy_num >= 0
+            && oy_num % stride_y as i64 == 0
+            && ox_num >= 0
+            && ox_num % stride_x as i64 == 0
+        {
+            let oy = (oy_num / stride_y as i64) as usize;
+            let ox = (ox_num / stride_x as i64) as usize;
+            if oy < output_height && ox < output_width {
+                gradient = output_gradient
+                    [((b * channels + channel) * output_height + oy) * output_width + ox];
+            }
+        }
+        if let Some(dst) = input_gradient.get_mut(idx) {
+            *dst = gradient;
+        }
+    }
+
     /// Learned edge scoring with invalid-neighbor masking before stable softmax.
     #[kernel]
     pub fn graph_learned_aggregate_fwd(
