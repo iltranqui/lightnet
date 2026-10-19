@@ -992,7 +992,8 @@ where
     pub input_gpu: T,
     pub gpu_layer_outputs: Vec<T>,
     pub gpu_layer_activation_inputs: Vec<Option<T>>,
-    /// Batch-statistics batch-norm state for convolutional and GraphConv layers
+    /// Batch-statistics batch-norm state for standalone BatchNorm, convolutional,
+    /// and GraphConv layers
     /// run by a native training forward; `None` means rolling statistics were
     /// used (inference forward, or a network that needs CPU backward fallback).
     pub gpu_batch_norm_caches: Vec<Option<GpuBatchNormCache<T>>>,
@@ -12389,7 +12390,7 @@ where
         Ok((result.output, cache))
     }
 
-    fn forward_graph_conv_batchnorm_training_gpu(
+    fn forward_batchnorm_training_gpu_from_host_params(
         &self,
         raw_output: &B::Tensor,
         raw_biases: &[f32],
@@ -12878,17 +12879,23 @@ where
                 }
                 (LayerKind::BatchNorm(_), LayerParams::BatchNorm(params)) => {
                     if training {
-                        return Err(Error::UnsupportedLayer {
-                            layer_index: layer.index,
-                            name: "batchnorm_gpu_training".to_owned(),
-                        });
+                        let (output, cache) = self.forward_batchnorm_training_gpu_from_host_params(
+                            current_input,
+                            &params.biases,
+                            params,
+                            layer.output_shape,
+                            launch_config,
+                        )?;
+                        batch_norm_cache = Some(cache);
+                        output
+                    } else {
+                        self.forward_batchnorm_inference_gpu(
+                            current_input,
+                            layer.input_shape,
+                            params,
+                            launch_config,
+                        )?
                     }
-                    self.forward_batchnorm_inference_gpu(
-                        current_input,
-                        layer.input_shape,
-                        params,
-                        launch_config,
-                    )?
                 }
                 (LayerKind::Route(spec), LayerParams::None) => {
                     let mut route_inputs = Vec::with_capacity(spec.layers.len());
@@ -13324,7 +13331,7 @@ where
                                         "GraphConv batch-norm parameters are missing".to_owned(),
                                     )
                                 })?;
-                            let (normalized, cache) = self.forward_graph_conv_batchnorm_training_gpu(
+                            let (normalized, cache) = self.forward_batchnorm_training_gpu_from_host_params(
                                 &raw,
                                 &params.projection.biases,
                                 batch_norm,
@@ -16013,6 +16020,55 @@ where
                         &mut layer_output_gradients,
                     )?;
                 }
+                (LayerKind::BatchNorm(_), Some(LayerParams::BatchNorm(_))) => {
+                    let cache = forward.gpu_batch_norm_caches[layer.index].as_ref().ok_or_else(|| {
+                        Error::InvalidConfig(format!(
+                            "missing GPU batch-norm forward cache for layer #{}",
+                            layer.index
+                        ))
+                    })?;
+                    let (input_gradient, scale_gradient, bias_gradient) = self
+                        .backend
+                        .batchnorm_train_backward_f32(
+                            &grad,
+                            &cache.x_hat,
+                            &cache.variance,
+                            &cache.scales,
+                            &tensor_backend_shape(layer.output_shape),
+                            config,
+                        )
+                        .map_err(|err| backend_error("standalone GPU batch-norm backward", err))?;
+                    let scale_values = self
+                        .backend
+                        .download_f32(&scale_gradient)
+                        .map_err(|err| backend_error("download standalone BN scale gradient", err))?;
+                    let bias_values = self
+                        .backend
+                        .download_f32(&bias_gradient)
+                        .map_err(|err| backend_error("download standalone BN bias gradient", err))?;
+                    {
+                        let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
+                        let Some(LayerTrainBuffers::BatchNorm(train)) =
+                            buffers.get_mut(layer.index)
+                        else {
+                            return Err(Error::InvalidConfig(format!(
+                                "missing standalone BN optimizer buffers for layer #{}",
+                                layer.index
+                            )));
+                        };
+                        for (dst, src) in train.scale_updates.iter_mut().zip(scale_values) {
+                            *dst += src;
+                        }
+                        for (dst, src) in train.bias_updates.iter_mut().zip(bias_values) {
+                            *dst += src;
+                        }
+                    }
+                    self.accumulate_previous_gpu_gradient(
+                        layer.index,
+                        input_gradient,
+                        &mut layer_output_gradients,
+                    )?;
+                }
                 (LayerKind::GraphConv(spec), Some(LayerParams::GraphConv(params))) => {
                     if graph_conv_spec_needs_host(spec) {
                         return Err(Error::InvalidConfig(format!(
@@ -18556,7 +18612,7 @@ where
             }
         }
 
-        self.update_gpu_convolution_batch_norm_running_stats_from_forward(forward)?;
+        self.update_gpu_batch_norm_running_stats_from_forward(forward)?;
         self.update_dcnv4_rolling_stats_gpu(forward)?;
         if self.network.layers.iter().any(|layer| {
             matches!(&layer.kind, LayerKind::Rnn(spec) if spec.batch_normalize)
@@ -20767,7 +20823,7 @@ where
         Ok(())
     }
 
-    fn update_gpu_convolution_batch_norm_running_stats_from_forward(
+    fn update_gpu_batch_norm_running_stats_from_forward(
         &mut self,
         forward: &GpuForwardState<B::Tensor>,
     ) -> Result<()> {
@@ -20775,6 +20831,7 @@ where
         let mut batch_norm_stats = Vec::new();
         let mut batch_norm_rolling = Vec::new();
         let mut graph_conv_batch_norm_rolling = Vec::new();
+        let mut standalone_batch_norm_rolling = Vec::new();
         let mut eml_batch_norm_rolling = Vec::new();
         for layer in &self.network.layers {
             let LayerKind::Convolutional(spec) = &layer.kind else {
@@ -20838,11 +20895,20 @@ where
             if !spec.batch_normalize {
                 continue;
             }
-            if let Some((mean, variance)) = forward.gpu_batch_norm_caches[layer.index]
-                .as_ref()
-                .and_then(|cache| cache.rolling.as_ref())
+            if let Some(cache) = forward.gpu_batch_norm_caches[layer.index].as_ref()
+                && let Some((mean, _)) = cache.rolling.as_ref()
             {
-                graph_conv_batch_norm_rolling.push((layer.index, mean.clone(), variance.clone()));
+                graph_conv_batch_norm_rolling.push((layer.index, mean.clone(), cache.variance.clone()));
+            }
+        }
+        for layer in &self.network.layers {
+            if !matches!(layer.kind, LayerKind::BatchNorm(_)) {
+                continue;
+            }
+            if let Some(cache) = forward.gpu_batch_norm_caches[layer.index].as_ref()
+                && let Some((mean, _)) = cache.rolling.as_ref()
+            {
+                standalone_batch_norm_rolling.push((layer.index, mean.clone(), cache.variance.clone()));
             }
         }
         for layer in &self.network.layers {
@@ -20885,15 +20951,35 @@ where
         for (owner, mean, variance) in batch_norm_rolling {
             self.set_device_batch_norm_rolling_stats(owner, mean, variance)?;
         }
-        for (layer_index, mean, variance) in graph_conv_batch_norm_rolling {
+        for (layer_index, mean, batch_variance) in standalone_batch_norm_rolling {
+            let mean = self
+                .backend
+                .download_f32(&mean)
+                .map_err(|err| backend_error("download standalone BN rolling mean", err))?;
+            let batch_variance = self
+                .backend
+                .download_f32(&batch_variance)
+                .map_err(|err| backend_error("download standalone BN batch variance", err))?;
+            let Some(LayerParams::BatchNorm(params)) = self.params.get_mut(layer_index) else {
+                return Err(Error::InvalidConfig(format!(
+                    "missing standalone BN params for rolling stats at layer #{layer_index}"
+                )));
+            };
+            params.rolling_mean = mean;
+            let update = 1.0 - BATCH_NORM_ROLLING_KEEP_CPU;
+            for (dst, src) in params.rolling_variance.iter_mut().zip(batch_variance) {
+                *dst = BATCH_NORM_ROLLING_KEEP_CPU * *dst + update * src;
+            }
+        }
+        for (layer_index, mean, batch_variance) in graph_conv_batch_norm_rolling {
             let mean = self
                 .backend
                 .download_f32(&mean)
                 .map_err(|err| backend_error("download GraphConv BN rolling mean", err))?;
-            let variance = self
+            let batch_variance = self
                 .backend
-                .download_f32(&variance)
-                .map_err(|err| backend_error("download GraphConv BN rolling variance", err))?;
+                .download_f32(&batch_variance)
+                .map_err(|err| backend_error("download GraphConv BN batch variance", err))?;
             let Some(LayerParams::GraphConv(params)) = self.params.get_mut(layer_index) else {
                 return Err(Error::InvalidConfig(format!(
                     "missing GraphConv params for BN rolling stats at layer #{layer_index}"
@@ -20905,7 +20991,10 @@ where
                 )));
             };
             batch_norm.rolling_mean = mean;
-            batch_norm.rolling_variance = variance;
+            let update = 1.0 - BATCH_NORM_ROLLING_KEEP_CPU;
+            for (dst, src) in batch_norm.rolling_variance.iter_mut().zip(batch_variance) {
+                *dst = BATCH_NORM_ROLLING_KEEP_CPU * *dst + update * src;
+            }
         }
         for (owner, slot, mean, variance) in eml_batch_norm_rolling {
             self.set_device_eml_batch_norm_rolling_stats(owner, slot, mean, variance)?;

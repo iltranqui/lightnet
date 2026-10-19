@@ -5296,6 +5296,60 @@ fn graph_conv_self_projection_runtime_forward_backward_and_sgd_adam_match_cpu() 
 }
 
 #[test]
+fn standalone_batch_norm_native_training_matches_cpu_adam() {
+    let net = network(
+        "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=2\nadam=1\nb1=0.8\nb2=0.95\neps=0.001\n[batchnorm]\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let LayerParams::BatchNorm(params) = &mut cpu.params[0] else {
+        panic!("standalone BatchNorm parameters expected");
+    };
+    params.scales.copy_from_slice(&[1.2, 0.85]);
+    params.biases.copy_from_slice(&[0.2, -0.1]);
+    params.rolling_mean.copy_from_slice(&[0.1, -0.2]);
+    params.rolling_variance.copy_from_slice(&[0.8, 1.1]);
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("Oxide backend"));
+    gpu.params = cpu.params.clone();
+    let input = patterned(cpu.network.net.input_shape());
+    let cpu_forward = cpu.forward_training(&input).expect("CPU BatchNorm forward");
+    let gpu_forward = gpu
+        .forward_training_with_state(&input)
+        .expect("native Oxide BatchNorm forward");
+    assert!(gpu_forward.gpu_batch_norm_caches[0].is_some());
+    close(
+        "standalone BatchNorm training output",
+        &gpu_forward.cpu_forward.layer_outputs[0].data,
+        &cpu_forward.layer_outputs[0].data,
+        3e-5,
+    );
+    let output_shape = cpu.network.layers[0].output_shape;
+    let seed = Tensor::from_data(
+        output_shape,
+        (0..output_shape.element_count() * output_shape.batch)
+            .map(|index| (index as f32 * 0.41).sin() * 0.3)
+            .collect(),
+    )
+    .unwrap();
+    let seeds = [Some(seed)];
+    cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+        .expect("CPU BatchNorm backward");
+    gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+        .expect("native Oxide BatchNorm backward");
+    cpu.update_weights_adam(0.01, 1).expect("CPU BatchNorm Adam");
+    gpu.update_weights_gpu(0.01, 0.9, 0.0, 1)
+        .expect("Oxide BatchNorm Adam fallback");
+    let (LayerParams::BatchNorm(cpu_params), LayerParams::BatchNorm(gpu_params)) =
+        (&cpu.params[0], &gpu.params[0])
+    else {
+        panic!("standalone BatchNorm parameters expected after update");
+    };
+    close("standalone BatchNorm scales", &gpu_params.scales, &cpu_params.scales, 2e-6);
+    close("standalone BatchNorm biases", &gpu_params.biases, &cpu_params.biases, 2e-6);
+    close("standalone BatchNorm rolling mean", &gpu_params.rolling_mean, &cpu_params.rolling_mean, 1e-6);
+    close("standalone BatchNorm rolling variance", &gpu_params.rolling_variance, &cpu_params.rolling_variance, 1e-3);
+}
+
+#[test]
 fn graph_conv_batch_norm_native_training_forward_backward_sgd_adam_matches_cpu() {
     let net = network(
         "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\n[graph_conv]\nfilters=2\ngroups=2\nsize=3\npad=1\nedge_mode=1\ngraph_use_self=1\nbatch_normalize=1\nactivation=leaky\n",
