@@ -10306,6 +10306,7 @@ where
                 (LayerKind::Moe(spec), LayerParams::Moe(_)) => {
                     spec.expert.batch_normalize
                 }
+                (LayerKind::Dcnv4(spec), LayerParams::Dcnv4(_)) => spec.batch_normalize,
                 _ => !matches!(
                     (kind, *params),
                     (_, LayerParams::None)
@@ -10321,6 +10322,7 @@ where
                         | (LayerKind::TuckerAttention(_), LayerParams::TuckerAttention(_))
                         | (LayerKind::MambaVision(_), LayerParams::MambaVision(_))
                         | (LayerKind::KimiKda(_), LayerParams::KimiKda(_))
+                        | (LayerKind::Dcnv4(_), LayerParams::Dcnv4(_))
                         | (
                             LayerKind::Deconvolutional(_),
                             LayerParams::Convolutional(_)
@@ -10330,7 +10332,7 @@ where
         }) {
             return Err(Error::UnsupportedLayer {
                 layer_index: index,
-                name: "GPU Muon supports standard convolution, EML, and MoE matrices without BN via host-staged device gradients, plus host-gradient local/RNN/LSTM/Kimi/MambaVision/Tucker/Swin/ViT/deconvolutional/connected matrices and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
+                name: "GPU Muon supports standard convolution, EML, MoE, and DCNv4 matrices without BN via host-staged device gradients, plus host-gradient local/RNN/LSTM/Kimi/MambaVision/Tucker/Swin/ViT/deconvolutional/connected matrices and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
             });
         }
         let step = self.adam_step.checked_add(1).ok_or_else(|| {
@@ -10364,6 +10366,24 @@ where
         }
         let iteration_num = self.train_iteration as i64 + 1;
         let burn_in = net.burn_in;
+        let dcnv4_muon_layers: Vec<usize> = self
+            .network
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, layer)| {
+                (layer.train.updates_at(iteration_num, burn_in)
+                    && matches!(
+                        (&layer.kind, self.params.get(index)),
+                        (LayerKind::Dcnv4(spec), Some(LayerParams::Dcnv4(_)))
+                            if !spec.batch_normalize
+                    ))
+                .then_some(index)
+            })
+            .collect();
+        for index in dcnv4_muon_layers {
+            self.flush_device_dcnv4_gradients_to_host(Some(index))?;
+        }
         let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
         for index in 0..layer_count {
             let layer = self.network.layers[index].clone();
@@ -11224,7 +11244,7 @@ where
         }
         self.flush_device_moe_gradients_to_host(&preserve_device_moe_params)?;
         if !device_dcnv4_optimizer_path {
-            self.flush_device_dcnv4_gradients_to_host()?;
+            self.flush_device_dcnv4_gradients_to_host(None)?;
         }
         if let GpuOptimizerStep::Adam(adam) = step {
             self.update_cpu_fallback_adam(
@@ -19327,7 +19347,7 @@ where
         Ok(true)
     }
 
-    fn flush_device_dcnv4_gradients_to_host(&mut self) -> Result<()> {
+    fn flush_device_dcnv4_gradients_to_host(&mut self, only_layer: Option<usize>) -> Result<()> {
         type HostGradients = (Vec<f32>, Vec<f32>, Vec<f32>, Option<Vec<f32>>);
         let mut staged = Vec::with_capacity(self.network.layers.len());
         let mut reset = Vec::with_capacity(self.network.layers.len());
@@ -19339,6 +19359,11 @@ where
                     reset.push(None);
                     continue;
                 };
+                if only_layer.is_some_and(|target| target != layer_index) {
+                    staged.push(None);
+                    reset.push(Some(entry.clone()));
+                    continue;
+                }
                 if !entry.dirty {
                     staged.push(None);
                     reset.push(Some(entry.clone()));
@@ -46310,7 +46335,7 @@ activation=linear
     }
 
     #[test]
-    fn gpu_muon_rejects_batch_normalized_convolution_and_eml_before_updating() {
+    fn gpu_muon_rejects_batch_normalized_convolution_eml_moe_and_dcnv4_before_updating() {
         let mut gpu = optimizer_net("muon=1\ndecoupled_decay=1");
         let before = gpu.params.clone();
         let error = gpu
@@ -46376,6 +46401,41 @@ batch_normalize=1
             .contains("other parameter families remain explicitly unsupported"));
         assert_eq!(moe.params, before);
         assert_eq!(moe.adam_step, 0);
+
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "muon-dcnv4-bn.cfg",
+                r#"[net]
+width=2
+height=2
+channels=2
+batch=1
+muon=1
+decoupled_decay=1
+[dcnv4]
+filters=2
+size=1
+groups=2
+d_stride=1
+batch_normalize=1
+"#,
+            )
+            .expect("DCNv4 Muon cfg should parse"),
+        )
+        .expect("DCNv4 Muon network should build");
+        let mut dcnv4 = GpuExecutableNetwork::new(network, FakeBackend);
+        dcnv4
+            .init_train_buffers_gpu()
+            .expect("DCNv4 Muon buffers should initialize");
+        let before = dcnv4.params.clone();
+        let error = dcnv4
+            .update_weights_gpu(0.01, 0.9, 0.0005, 1)
+            .expect_err("batch-normalized DCNv4 Muon staging is not integrated yet");
+        assert!(error
+            .to_string()
+            .contains("other parameter families remain explicitly unsupported"));
+        assert_eq!(dcnv4.params, before);
+        assert_eq!(dcnv4.adam_step, 0);
     }
 
     #[test]

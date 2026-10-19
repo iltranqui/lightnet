@@ -3449,6 +3449,101 @@ activation=leaky
 }
 
 #[test]
+fn gpu_muon_dcnv4_offset_projection_matches_cpu_across_steps() {
+    let net = network(
+        r#"[net]
+width=3
+height=2
+channels=2
+batch=2
+muon=1
+decoupled_decay=1
+decay=0.0001
+[dcnv4]
+filters=2
+size=1
+groups=2
+d_stride=1
+batch_normalize=0
+activation=leaky
+"#,
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let LayerParams::Dcnv4(params) = &mut cpu.params[0] else {
+        panic!("DCNv4 parameters")
+    };
+    for (index, weight) in params.offset_weights.iter_mut().enumerate() {
+        *weight = (index as f32 - 3.0) * 0.004;
+    }
+    for (index, bias) in params.offset_biases.iter_mut().enumerate() {
+        *bias = (index as f32 - 2.0) * 0.03;
+    }
+    params.biases.copy_from_slice(&[0.02, -0.015]);
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("DCNv4 Muon buffers");
+
+    for step in 1..=2 {
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu()
+            .expect("zero DCNv4 Muon buffers");
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).expect("CPU DCNv4 forward");
+        let gpu_forward = gpu
+            .forward_training_device(&input)
+            .expect("Oxide DCNv4 forward");
+        let gpu_output = gpu
+            .backend
+            .download_f32(&gpu_forward.gpu_layer_outputs[0])
+            .expect("download DCNv4 output");
+        close(
+            &format!("DCNv4 Muon output step {step}"),
+            &gpu_output,
+            &cpu_forward.layer_outputs[0].data,
+            3e-4,
+        );
+        for microbatch in 0..2 {
+            let seed = Tensor::filled(
+                cpu.network.layers[0].output_shape,
+                0.035 + step as f32 * 0.006 + microbatch as f32 * 0.003,
+            );
+            let seeds = [Some(seed)];
+            cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+                .expect("CPU DCNv4 Muon backward");
+            gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+                .expect("Oxide DCNv4 Muon backward");
+        }
+        cpu.update_weights_muon(0.01, 2)
+            .expect("CPU DCNv4 Muon update");
+        gpu.update_weights_gpu(0.01, 0.9, net.net.decay, 2)
+            .expect("Oxide DCNv4 Muon update");
+        let (LayerParams::Dcnv4(cpu_params), LayerParams::Dcnv4(gpu_params)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("DCNv4 parameter layout expected");
+        };
+        close(
+            &format!("DCNv4 Muon offset weights step {step}"),
+            &gpu_params.offset_weights,
+            &cpu_params.offset_weights,
+            8e-4,
+        );
+        close(
+            &format!("DCNv4 Muon offset biases step {step}"),
+            &gpu_params.offset_biases,
+            &cpu_params.offset_biases,
+            8e-4,
+        );
+        close(
+            &format!("DCNv4 Muon output biases step {step}"),
+            &gpu_params.biases,
+            &cpu_params.biases,
+            8e-4,
+        );
+    }
+}
+
+#[test]
 fn gpu_muon_local_location_matrices_match_cpu_across_steps() {
     let net = network(
         "[net]\nwidth=4\nheight=4\nchannels=2\nbatch=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0001\n\
