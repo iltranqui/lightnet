@@ -4415,7 +4415,7 @@ fn gpu_muon_graph_conv_matrices_match_cpu_across_steps() {
 }
 
 #[test]
-fn gpu_muon_graph_conv_batch_norm_cpu_fallback_matches_cpu() {
+fn gpu_muon_graph_conv_batch_norm_native_training_matches_cpu() {
     let net = network(
         "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0005\n\
          [graph_conv]\nfilters=2\ngroups=2\nsize=3\npad=1\nedge_mode=1\ngraph_use_self=1\nbatch_normalize=1\nactivation=leaky\n",
@@ -4429,9 +4429,10 @@ fn gpu_muon_graph_conv_batch_norm_cpu_fallback_matches_cpu() {
         let cpu_forward = cpu.forward_training(&input).expect("CPU GraphConv BN forward");
         let gpu_forward = gpu
             .forward_training_with_state(&input)
-            .expect("Oxide GraphConv BN fallback forward");
+            .expect("Oxide GraphConv BN native forward");
+        assert!(gpu_forward.gpu_batch_norm_caches[0].is_some());
         close(
-            "GPU Muon GraphConv BN fallback output",
+            "GPU Muon GraphConv BN native output",
             &gpu_forward.cpu_forward.layer_outputs[0].data,
             &cpu_forward.layer_outputs[0].data,
             3e-5,
@@ -4448,7 +4449,7 @@ fn gpu_muon_graph_conv_batch_norm_cpu_fallback_matches_cpu() {
         cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
             .expect("CPU GraphConv BN backward");
         gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
-            .expect("Oxide GraphConv BN fallback backward");
+            .expect("Oxide GraphConv BN native backward");
         cpu.update_weights_muon(0.02, 2)
             .expect("CPU GraphConv BN Muon update");
         gpu.update_weights_gpu(0.02, 0.9, net.net.decay, 2)
@@ -5291,6 +5292,83 @@ fn graph_conv_self_projection_runtime_forward_backward_and_sgd_adam_match_cpu() 
         close("GraphConv self projection weights", &gpu_params.projection.weights, &cpu_params.projection.weights, 6e-5);
         close("GraphConv self projection biases", &gpu_params.projection.biases, &cpu_params.projection.biases, 6e-5);
         close("GraphConv self weights", gpu_params.self_weights.as_ref().unwrap(), cpu_params.self_weights.as_ref().unwrap(), 6e-5);
+    }
+}
+
+#[test]
+fn graph_conv_batch_norm_native_training_forward_backward_sgd_adam_matches_cpu() {
+    let net = network(
+        "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\n[graph_conv]\nfilters=2\ngroups=2\nsize=3\npad=1\nedge_mode=1\ngraph_use_self=1\nbatch_normalize=1\nactivation=leaky\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let LayerParams::GraphConv(params) = &mut cpu.params[0] else {
+        panic!("GraphConv parameters expected");
+    };
+    params.projection.weights.copy_from_slice(&[0.3, -0.2]);
+    params.projection.biases.copy_from_slice(&[0.01, -0.03]);
+    params.self_weights.as_mut().unwrap().copy_from_slice(&[-0.15, 0.25]);
+    params.edge_kernel.as_mut().unwrap().copy_from_slice(
+        &(0..36).map(|i| (i as f32 * 0.17).sin() * 0.08).collect::<Vec<_>>(),
+    );
+    params.edge_biases.as_mut().unwrap().copy_from_slice(
+        &(0..18).map(|i| (i as f32 * 0.13).cos() * 0.03).collect::<Vec<_>>(),
+    );
+    let batch_norm = params.projection.batch_norm.as_mut().unwrap();
+    batch_norm.scales.copy_from_slice(&[1.2, 0.85]);
+    batch_norm.biases.copy_from_slice(&[0.01, -0.03]);
+    batch_norm.rolling_mean.copy_from_slice(&[0.15, -0.1]);
+    batch_norm.rolling_variance.copy_from_slice(&[0.8, 1.1]);
+
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("Oxide backend"));
+    gpu.params = cpu.params.clone();
+    let input = patterned(cpu.network.net.input_shape());
+    let output_shape = cpu.network.layers[0].output_shape;
+    let seeds = [Some(Tensor::filled(output_shape, 0.07))];
+
+    for use_adam in [false, true] {
+        cpu.network.net.adam = use_adam;
+        gpu.network.net.adam = use_adam;
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu().expect("zero GraphConv BN gradients");
+        let cpu_forward = cpu.forward_training(&input).expect("CPU GraphConv BN forward");
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("native Oxide GraphConv BN forward");
+        assert!(gpu_forward.gpu_batch_norm_caches[0].is_some());
+        close(
+            "GraphConv BN native training output",
+            &gpu_forward.cpu_forward.layer_outputs[0].data,
+            &cpu_forward.layer_outputs[0].data,
+            6e-5,
+        );
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU GraphConv BN backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("native Oxide GraphConv BN backward");
+        if use_adam {
+            cpu.update_weights_adam(0.01, 1).expect("CPU GraphConv BN Adam");
+            gpu.update_weights_gpu(0.01, 0.9, 0.0, 1)
+                .expect("Oxide GraphConv BN Adam");
+        } else {
+            cpu.update_weights(0.01, 0.0, 0.0, 1);
+            gpu.update_weights_gpu(0.01, 0.9, 0.0, 1)
+                .expect("Oxide GraphConv BN SGD");
+        }
+        let (LayerParams::GraphConv(cpu_params), LayerParams::GraphConv(gpu_params)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("GraphConv parameters expected after BN update");
+        };
+        close("GraphConv BN projection weights", &gpu_params.projection.weights, &cpu_params.projection.weights, 8e-4);
+        close("GraphConv BN projection biases", &gpu_params.projection.biases, &cpu_params.projection.biases, 8e-4);
+        close("GraphConv BN self weights", gpu_params.self_weights.as_ref().unwrap(), cpu_params.self_weights.as_ref().unwrap(), 8e-4);
+        close("GraphConv BN edge kernel", gpu_params.edge_kernel.as_ref().unwrap(), cpu_params.edge_kernel.as_ref().unwrap(), 8e-4);
+        close("GraphConv BN edge biases", gpu_params.edge_biases.as_ref().unwrap(), cpu_params.edge_biases.as_ref().unwrap(), 8e-4);
+        let cpu_bn = cpu_params.projection.batch_norm.as_ref().unwrap();
+        let gpu_bn = gpu_params.projection.batch_norm.as_ref().unwrap();
+        close("GraphConv BN gamma", &gpu_bn.scales, &cpu_bn.scales, 8e-4);
+        close("GraphConv BN rolling mean", &gpu_bn.rolling_mean, &cpu_bn.rolling_mean, 1e-6);
+        close("GraphConv BN rolling variance", &gpu_bn.rolling_variance, &cpu_bn.rolling_variance, 1e-3);
     }
 }
 
