@@ -116,6 +116,7 @@ file is named inline.
 - [88. Compact GraphConv inference](#88-compact-graphconv-inference)
 - [89. Compact GraphConv batch-normalization inference](#89-compact-graphconv-batch-normalization-inference)
 - [90. Full GraphConv batch-normalization inference](#90-full-graphconv-batch-normalization-inference)
+- [91. Hybrid GPU Muon for non-BN GraphConv matrices](#91-hybrid-gpu-muon-for-non-bn-graphconv-matrices)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1645,6 +1646,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 90. Full GraphConv batch-normalization inference
 
 - v0.2.068: extended the ordinary f32 GPU inference runtime to execute supported GraphConv variants with BN natively, using rolling statistics, gamma and projection beta; compact inference support from v0.2.067 remains. Training BN and unsupported activation/edge variants retain CPU fallback. A FakeBackend test confirms this inference path avoids constructing the CPU GraphConv cache; actual-Oxide full and compact outputs match CPU in `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain graph_conv_compact_inference_matches_cpu` (2 tests). The focused `MEM=3G ./tools/test_host.sh graph_conv_batchnorm_inference_uses_gpu_backend_without_cpu_cache` passed 1 core test. Hand-derived from the Rust CPU contract; no compiled-C++ golden, full-suite, or performance claim.
+
+## 91. Hybrid GPU Muon for non-BN GraphConv matrices
+
+- v0.2.069 (`d79c3aaf`): enabled GPU Muon for GraphConv projection, self-projection, and learned-edge kernel matrices when BN is disabled. Native Oxide Newton–Schulz orthogonalization is used; GraphConv forward/backward gradients, Muon state, and final parameter updates remain host-staged. Actual-Oxide CPU parity passed over two updates for learned edges plus self projection, comparing projection weights/biases, self weights, edge kernels, and edge biases: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_graph_conv_matrices_match_cpu_across_steps`. A host FakeBackend regression confirms batch-normalized GraphConv rejects before mutation: `MEM=3G ./tools/test_host.sh gpu_muon_rejects_batch_normalized_convolution_eml_moe_dcnv4_and_deform_before_updating` passed 1 core test. BN GraphConv remains unsupported; no compiled-C++ golden, full-suite, or performance claim.
 
 ## Not implemented / open (pointer)
 
