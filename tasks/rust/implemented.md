@@ -109,6 +109,7 @@ file is named inline.
 - [81. Native GPU GraphConv uniform runtime path](#81-native-gpu-graphconv-uniform-runtime-path)
 - [82. GraphConv learned-edge masked-softmax host contract](#82-graphconv-learned-edge-masked-softmax-host-contract)
 - [83. Native GraphConv learned-edge forward primitive](#83-native-graphconv-learned-edge-forward-primitive)
+- [84. Native GraphConv learned-edge adjoints](#84-native-graphconv-learned-edge-adjoints)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1610,6 +1611,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 83. Native GraphConv learned-edge forward primitive
 
 - v0.2.061: added a native Oxide learned-edge mode 1 forward kernel and backend operation for group-local row-major edge parameters. The kernel computes valid-edge logits, masks invalid spatial neighbors before max-stabilized softmax, and aggregates NCHW values; the backend validates geometry, group divisibility, and parameter extents before launch. Actual-Oxide parity against the checked host reference, including boundary sites, plus malformed group/parameter rejection passes in `MEM=3G ./tools/test_oxide.sh --test oxide_graph_conv` (4 tests total); host-reference input/kernel/bias finite differences also remain green. This is **primitive-only**: no native backward or runtime dispatch yet, and no compiled-C++ golden/full suite/performance claim. The trait's default implementation remains host reference for other backends.
+
+## 84. Native GraphConv learned-edge adjoints
+
+- v0.2.062: added actual-Oxide learned-edge backward primitives for input, edge-kernel, and edge-bias gradients. Device scratch stores normalized edge weights and masked-softmax logit adjoints; gather/reduction kernels avoid write races. Oxide outputs for all three gradients match the checked host adjoint, whose every input/kernel/bias element is finite-difference checked. `MEM=3G ./tools/test_oxide.sh --test oxide_graph_conv` passes 4 tests. No GraphConv runtime dispatch yet; this is primitive-only and has no compiled-C++ golden/full-suite/performance claim.
 
 ## Not implemented / open (pointer)
 
