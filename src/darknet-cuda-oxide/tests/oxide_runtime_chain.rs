@@ -3278,6 +3278,65 @@ fn gpu_muon_connected_update_gate_matches_cpu_on_device() {
 }
 
 #[test]
+fn gpu_muon_connected_burnin_gate_matches_cpu_on_device() {
+    let net = network(
+        "[net]\nwidth=2\nheight=1\nchannels=1\nbatch=2\nburn_in=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0005\n\
+         [connected]\noutput=2\nactivation=linear\nburnin_update=1\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let LayerParams::Connected(params) = &mut cpu.params[0] else {
+        panic!("connected parameters expected");
+    };
+    params.weights.copy_from_slice(&[0.2, -0.1, 0.3, 0.4]);
+    params.biases.copy_from_slice(&[0.03, -0.02]);
+    let initial = cpu.params.clone();
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+
+    for (iteration, seed_value) in [(0, 0.03), (2, -0.05)] {
+        cpu.set_train_iteration(iteration);
+        gpu.set_train_iteration(iteration);
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("Oxide forward");
+        let seed = Tensor::filled(cpu.network.layers[0].output_shape, seed_value);
+        let seeds = [Some(seed)];
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("Oxide backward");
+        cpu.update_weights_muon(0.02, 2).expect("CPU Muon update");
+        gpu.update_weights_gpu(0.02, 0.9, net.net.decay, 2)
+            .expect("GPU Muon update");
+        if iteration == 0 {
+            assert_eq!(cpu.params, initial, "CPU burn-in gate must hold");
+            assert_eq!(gpu.params, initial, "GPU burn-in gate must hold");
+            continue;
+        }
+        let (LayerParams::Connected(cpu_params), LayerParams::Connected(gpu_params)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("connected parameters expected after update");
+        };
+        close(
+            "burn-in gated GPU Muon weights",
+            &gpu_params.weights,
+            &cpu_params.weights,
+            8e-4,
+        );
+        close(
+            "burn-in gated GPU Muon biases",
+            &gpu_params.biases,
+            &cpu_params.biases,
+            8e-4,
+        );
+        assert_ne!(gpu.params, initial, "eligible layer should update after burn-in");
+    }
+}
+
+#[test]
 fn gpu_muon_deconvolution_host_gradients_match_cpu_across_steps() {
     let net = network(
         "[net]\nwidth=2\nheight=2\nchannels=1\nbatch=1\nmuon=1\ndecoupled_decay=1\ndecay=0.0002\nloss_scale=8\n\
