@@ -193,3 +193,72 @@ impl MlpLayout {
         ]
     }
 }
+
+/// Add the pooled CLS adjoint into token zero of an existing NCHW head
+/// gradient. `dcls` is `[batch, hidden]`; `head_grad` is `[batch, hidden, 1,
+/// tokens]`. Scorer/marker summary features are detached and receive no gradient.
+pub fn scatter_cls_adjoint(
+    dcls: &[f32],
+    head_grad: &[f32],
+    batch: usize,
+    hidden: usize,
+    tokens: usize,
+) -> Result<Vec<f32>, String> {
+    let cls_len = batch
+        .checked_mul(hidden)
+        .filter(|&len| len > 0 && len <= i32::MAX as usize)
+        .ok_or_else(|| "laya_act_cls_scatter: invalid batch/hidden dimensions".to_owned())?;
+    let full_len = cls_len
+        .checked_mul(tokens)
+        .filter(|&len| tokens > 0 && len <= i32::MAX as usize)
+        .ok_or_else(|| "laya_act_cls_scatter: invalid token count/storage".to_owned())?;
+    if dcls.len() != cls_len || head_grad.len() != full_len {
+        return Err(format!(
+            "laya_act_cls_scatter: expected dcls={cls_len}, head_grad={full_len}, got dcls={}, head_grad={}",
+            dcls.len(),
+            head_grad.len()
+        ));
+    }
+    let mut out = head_grad.to_vec();
+    for b in 0..batch {
+        for h in 0..hidden {
+            let index = (b * hidden + h) * tokens;
+            out[index] += dcls[b * hidden + h];
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scatter_cls_adjoint;
+
+    #[test]
+    fn cls_adjoint_scatter_adds_only_token_zero_in_nchw_layout() {
+        let got = scatter_cls_adjoint(
+            &[1.0, -2.0, 0.5, 3.0],
+            &[
+                0.1, 0.2, 0.3, 0.4, 1.0, 2.0, 3.0, 4.0, -1.0, -2.0, -3.0, -4.0, 5.0, 6.0, 7.0, 8.0,
+                9.0, 10.0, 11.0, 12.0,
+            ],
+            2,
+            2,
+            5,
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                1.1, 0.2, 0.3, 0.4, 1.0, 0.0, 3.0, 4.0, -1.0, -2.0, -2.5, -4.0, 5.0, 6.0, 7.0,
+                11.0, 9.0, 10.0, 11.0, 12.0,
+            ]
+        );
+    }
+
+    #[test]
+    fn cls_adjoint_scatter_rejects_bad_storage_and_overflow() {
+        assert!(scatter_cls_adjoint(&[1.0], &[0.0; 2], 1, 2, 1).is_err());
+        assert!(scatter_cls_adjoint(&[1.0], &[0.0], usize::MAX, 2, 1).is_err());
+        assert!(scatter_cls_adjoint(&[1.0], &[0.0], 1, 1, 0).is_err());
+    }
+}

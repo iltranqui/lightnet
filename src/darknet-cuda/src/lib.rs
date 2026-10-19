@@ -2021,6 +2021,32 @@ pub trait F32TensorOpsBackend {
         laya_act::backward_composed(self, inputs, layout, config)
     }
 
+    /// Add an act-head CLS adjoint into token zero of a full NCHW head
+    /// gradient. Generic backends use a host reference; device backends should
+    /// override this to avoid downloading the sequence gradient.
+    fn laya_act_cls_scatter_f32(
+        &self,
+        dcls: &Self::Tensor,
+        head_grad: &Self::Tensor,
+        batch: usize,
+        hidden: usize,
+        tokens: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let dcls = self.download_f32(dcls)?;
+        let head_grad = self.download_f32(head_grad)?;
+        let scattered = host_ops::laya_act::scatter_cls_adjoint(
+            &dcls,
+            &head_grad,
+            batch,
+            hidden,
+            tokens,
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        self.upload_f32(&[batch, hidden, 1, tokens], &scattered)
+    }
+
     /// Build CLS plus four detached LAYA act-head features in [B,H+4,1,1].
     /// This is not the MLP/backward and does not alter parameter update semantics.
     /// Generic backends use this numeric host reference; Oxide overrides it.

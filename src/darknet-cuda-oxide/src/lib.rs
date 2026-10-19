@@ -6885,6 +6885,61 @@ impl F32TensorOpsBackend for OxideBackend {
         darknet_cuda::laya_act::backward_composed(self, inputs, layout, config)
     }
 
+    fn laya_act_cls_scatter_f32(
+        &self,
+        dcls: &Self::Tensor,
+        head_grad: &Self::Tensor,
+        batch: usize,
+        hidden: usize,
+        tokens: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let op = "laya_act_cls_scatter_f32";
+        let cls_len = batch
+            .checked_mul(hidden)
+            .filter(|&len| batch > 0 && hidden > 0 && len <= i32::MAX as usize)
+            .ok_or_else(|| shape_err(op, "invalid batch/hidden dimensions".to_owned()))?;
+        let full_len = cls_len
+            .checked_mul(tokens)
+            .filter(|&len| tokens > 0 && len <= i32::MAX as usize)
+            .ok_or_else(|| shape_err(op, "invalid token count/storage".to_owned()))?;
+        if dcls.len() != cls_len || head_grad.len() != full_len {
+            return Err(shape_err(
+                op,
+                format!(
+                    "storage mismatch: expected dcls={cls_len}, head_grad={full_len}; got dcls={}, head_grad={}",
+                    dcls.len(),
+                    head_grad.len()
+                ),
+            ));
+        }
+        if (dcls.shape() != [batch, hidden] && dcls.shape() != [batch, hidden, 1, 1])
+            || head_grad.shape() != [batch, hidden, 1, tokens]
+        {
+            return Err(shape_err(
+                op,
+                "expected dcls [B,H] and head gradient [B,H,1,T]".to_owned(),
+            ));
+        }
+        let dcls_f = self.f32v(dcls)?;
+        let head_grad_f = self.f32v(head_grad)?;
+        let mut output = self.alloc_uninit(full_len)?;
+        // SAFETY: dimensions/storage are checked, and each thread writes one
+        // unique output element while reading only in-bounds source values.
+        unsafe {
+            self.layers_extra.laya_act_cls_scatter(
+                &self.stream,
+                launch::elementwise(full_len, config),
+                &dcls_f.buf,
+                &head_grad_f.buf,
+                &mut output,
+                tokens,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, &[batch, hidden, 1, tokens]))
+    }
+
     fn laya_act_features_f32(
         &self,
         head: &Self::Tensor,

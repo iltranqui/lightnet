@@ -307,3 +307,65 @@ fn laya_act_backward_native_results_outlive_temporary_operand_buffers() {
     close(&be.download_f32(&g.fc1_w).unwrap(), &want.fc1_w, 2e-5);
     close(&be.download_f32(&g.fc2_b).unwrap(), &want.fc2_b, 2e-5);
 }
+
+#[test]
+fn laya_act_cls_adjoint_scatter_matches_nchw_host_reference() {
+    let be = backend();
+    let batch = 2;
+    let hidden = 5;
+    let tokens = 7;
+    let dcls: Vec<_> = (0..batch * hidden)
+        .map(|i| (i as f32 * 0.31).sin() - 0.4)
+        .collect();
+    let mut existing: Vec<_> = (0..batch * hidden * tokens)
+        .map(|i| (i as f32 * 0.17).cos() * 0.6)
+        .collect();
+    let want = darknet_cuda::host_ops::laya_act::scatter_cls_adjoint(
+        &dcls, &existing, batch, hidden, tokens,
+    )
+    .unwrap();
+    let dcls_gpu = be.upload_f32(&[batch, hidden], &dcls).unwrap();
+    let existing_gpu = be
+        .upload_f32(&[batch, hidden, 1, tokens], &existing)
+        .unwrap();
+    let got = be
+        .laya_act_cls_scatter_f32(
+            &dcls_gpu,
+            &existing_gpu,
+            batch,
+            hidden,
+            tokens,
+            ElementwiseLaunchConfig::default(),
+        )
+        .unwrap();
+    assert_eq!(got.shape(), [batch, hidden, 1, tokens]);
+    assert_eq!(be.download_f32(&got).unwrap(), want);
+
+    existing[0] += 0.5;
+    let malformed = be
+        .upload_f32(&[batch * hidden * tokens], &existing)
+        .unwrap();
+    assert!(
+        be.laya_act_cls_scatter_f32(
+            &dcls_gpu,
+            &malformed,
+            batch,
+            hidden,
+            tokens,
+            ElementwiseLaunchConfig::default(),
+        )
+        .is_err()
+    );
+    let short = be.upload_f32(&[1], &[0.0]).unwrap();
+    assert!(
+        be.laya_act_cls_scatter_f32(
+            &short,
+            &existing_gpu,
+            batch,
+            hidden,
+            tokens,
+            ElementwiseLaunchConfig::default(),
+        )
+        .is_err()
+    );
+}

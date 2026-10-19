@@ -125,6 +125,32 @@ pub mod kernels {
         }
     }
 
+    /// Scatter the pooled CLS adjoint into token zero of each NCHW channel.
+    /// One thread owns each output element; summary channels are detached.
+    #[kernel]
+    pub fn laya_act_cls_scatter(
+        dcls: &[f32],
+        head_grad: &[f32],
+        mut output: DisjointSlice<f32>,
+        tokens: usize,
+    ) {
+        let i = thread::index_1d();
+        let idx = i.get();
+        if idx < output.len() {
+            let value = head_grad[idx]
+                + if idx % tokens == 0 {
+                    dcls[idx / tokens]
+                } else {
+                    0.0
+                };
+            // SAFETY: host validation proves the source extents and each thread
+            // writes exactly one output element.
+            unsafe {
+                *output.as_mut_ptr().add(idx) = value;
+            }
+        }
+    }
+
     /// One thread owns each gathered output; both inputs stay device-resident.
     #[kernel]
     pub fn marker_gather(
