@@ -1834,7 +1834,7 @@ pub const AXIS_PINS: &[AxisPin] = &[
     AxisPin::Open("Tier 4: warp samples (x,y) from (w,h)"),
     AxisPin::Pinned("convolutional_axis_layout_pins_dilated_extent_and_groups"),
     AxisPin::Pinned("deconvolutional_axis_layout_maps_input_channels_to_filters_and_batch"),
-    AxisPin::Open("Tier 1: [out][in] weight rows per batch sample"),
+    AxisPin::Pinned("connected_axis_layout_keeps_batch_rows_and_output_weight_axes"),
     AxisPin::Pinned("maxpool_axis_layout_pins_depth_channel_batch_and_spatial_order"),
     AxisPin::Pinned("local_avgpool_axis_layout_pins_window_and_batch_order"),
     AxisPin::Pinned("avgpool_axis_layout_reduces_spatial_per_channel_and_batch"),
@@ -11625,8 +11625,8 @@ output=2
             }
         }
 
-        assert_eq!(pinned.len(), 23, "pinned variants");
-        assert_eq!(open, 37, "C++-backed variants without an axis pin");
+        assert_eq!(pinned.len(), 24, "pinned variants");
+        assert_eq!(open, 36, "C++-backed variants without an axis pin");
         assert_eq!(rust_only, 6, "Rust-only variants plus Unsupported");
 
         // The pinned set is the contract: renaming one of these tests must be a
@@ -11634,6 +11634,7 @@ output=2
         let expected: std::collections::BTreeSet<&'static str> = [
             "convolutional_axis_layout_pins_dilated_extent_and_groups",
             "deconvolutional_axis_layout_maps_input_channels_to_filters_and_batch",
+            "connected_axis_layout_keeps_batch_rows_and_output_weight_axes",
             "maxpool_axis_layout_pins_depth_channel_batch_and_spatial_order",
             "avgpool_axis_layout_reduces_spatial_per_channel_and_batch",
             "local_avgpool_axis_layout_pins_window_and_batch_order",
@@ -11670,6 +11671,15 @@ output=2
             conv.layers[0].kind.axis_pin(),
             AxisPin::Pinned("convolutional_axis_layout_pins_dilated_extent_and_groups"),
             "convolutional must map to its own AXIS_PINS entry"
+        );
+        let connected = build(
+            "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\n[connected]\noutput=3\nactivation=linear\n",
+        )
+        .expect("connected builds");
+        assert_eq!(
+            connected.layers[0].kind.axis_pin(),
+            AxisPin::Pinned("connected_axis_layout_keeps_batch_rows_and_output_weight_axes"),
+            "connected must map to its own AXIS_PINS entry"
         );
         let local_avgpool = build(
             "[net]\nwidth=5\nheight=3\nchannels=2\nbatch=2\n[local_avgpool]\nsize=3\nstride_x=2\nstride_y=1\npadding=1\n",

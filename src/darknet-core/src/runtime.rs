@@ -39043,6 +39043,65 @@ num_dwconv=1
     }
 
     #[test]
+    fn connected_axis_layout_keeps_batch_rows_and_output_weight_axes() {
+        // C++ `connected_layer.cpp:186` presents each sample as a flattened
+        // NCHW input row and weights as [output][input]. Distinct sample,
+        // channel, and spatial sentinels make transposes visible.
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "connected_axis.cfg",
+                "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\n[connected]\noutput=3\nactivation=linear\n",
+            )
+            .expect("connected cfg"),
+        )
+        .expect("connected network");
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::Connected(params) = &mut executable.params[0] else {
+            panic!("connected parameters expected");
+        };
+        params.weights[0] = 1.0;
+        params.weights[11] = 0.5;
+        params.weights[12 + 5] = 2.0;
+        params.weights[12 + 6] = 1.0;
+        params.weights[24 + 3] = 1.0;
+        params.weights[24 + 8] = 1.0;
+        params.weights[24 + 10] = -1.0;
+        params.biases.copy_from_slice(&[0.25, -0.5, 1.0]);
+        let input = Tensor::from_data(
+            TensorShape::new(3, 2, 2, 2),
+            vec![
+                1., 2., 3., 4., 5., 6., 11., 12., 13., 14., 15., 16.,
+                101., 102., 103., 104., 105., 106., 111., 112., 113., 114., 115., 116.,
+            ],
+        )
+        .expect("connected axis input");
+        let forward = executable.forward(&input).expect("connected forward");
+        assert_slice_close(
+            "connected batch/output rows",
+            &[9.25, 22.5, 3.0, 159.25, 322.5, 103.0],
+            &forward.layer_outputs[0].data,
+            1e-6,
+        );
+        let seed = Tensor::from_data(
+            TensorShape::new(1, 1, 3, 2),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        )
+        .expect("connected seed");
+        let backward = executable
+            .backward(&input, &forward, &seed)
+            .expect("connected backward");
+        assert_slice_close(
+            "connected [out][in] adjoint per batch row",
+            &[
+                1., 0., 0., 3., 0., 4., 2., 0., 3., 0., -3., 0.5,
+                4., 0., 0., 6., 0., 10., 5., 0., 6., 0., -6., 2.,
+            ],
+            &backward.input_gradient.data,
+            1e-6,
+        );
+    }
+
+    #[test]
     fn local_avgpool_axis_layout_pins_window_and_batch_order() {
         // C++ `maxpool_layer.cpp:440` averages valid taps in each local
         // window. Non-square B=2/C=2 data and unequal axis strides expose any
