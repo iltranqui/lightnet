@@ -91,6 +91,7 @@ file is named inline.
 - [63. Native Revleaky activation mapping](#63-native-revleaky-activation-mapping)
 - [64. Extend native DCNv4 through 15x15](#64-extend-native-dcnv4-through-15x15)
 - [65. Retain native DCNv4 Adam moments on device](#65-retain-native-dcnv4-adam-moments-on-device)
+- [66. Reuse DCNv4 projection weights from forward during backward](#66-reuse-dcnv4-projection-weights-from-forward-during-backward)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1503,6 +1504,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 65. Retain native DCNv4 Adam moments on device
 
 - v0.2.028 (`d7b0e5cc`): eligible native DCNv4 Adam now reuses device-resident first/second moments between updates instead of downloading/re-uploading them every step. Parameters remain host-canonical and still cross at each optimizer step. `save_optimizer_state` materializes the device moments into the existing host Adam sidecar structure; loading an existing DNOPT sidecar uploads moments lazily on the next native update, with no format bump. Evidence: `MEM=3G ./tools/test_host.sh dcnv4` passed 29 tests, including device-state creation and byte-identical save/load/save sidecar round-trip. Focused actual-GPU two-step SGD/Adam CPU parity passed on rerun (1 test, 300.16 s); its preceding run had one near-threshold parameter-delta failure. No speedup or compiled-C++ golden claim; only DCNv4 Adam moments are resident, not its parameters. GPU Muon, broader GPU work, CPU/axis gaps and sparse MoE remain open.
+
+## 66. Reuse DCNv4 projection weights from forward during backward
+
+- v0.2.029 (`9b722d35`): each native DCNv4 forward cache now retains the exact uploaded offset-projection weight tensor; backward consumes that tensor rather than uploading the host copy again. This also ensures the adjoint uses the same parameter snapshot as forward if host parameters are changed between the two calls. Focused host DCNv4 tests passed (29), including an assertion that the forward cache holds the expected weights; actual-GPU two-step SGD/Adam CPU parity passed (1 test, 316.19 s). DCNv4 parameters remain host-canonical and are still uploaded for each new forward/optimizer update; this is per-forward lifetime reuse, not persistent network-wide residency or a speedup claim. No compiled-C++ golden; GPU Muon and broad parity gaps remain.
 
 ## Not implemented / open (pointer)
 
