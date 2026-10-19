@@ -3066,6 +3066,92 @@ fn deform_conv_device_path_matches_cpu_chain_and_updates() {
 }
 
 #[test]
+fn sam_native_gpu_forward_backward_fans_out_source_gradient_matches_cpu_across_steps() {
+    let net = network(
+        "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=1\n\
+         [convolutional]\nfilters=1\nsize=1\nstride=1\npadding=0\nactivation=linear\n\
+         [convolutional]\nfilters=1\nsize=1\nstride=1\npadding=0\nactivation=linear\n\
+         [sam]\nfrom=0\nactivation=leaky\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    for (index, params) in cpu.params.iter_mut().enumerate() {
+        let LayerParams::Convolutional(conv) = params else {
+            continue;
+        };
+        conv.weights.fill(if index == 0 { 0.5 } else { 0.8 });
+        conv.biases.fill(if index == 0 { 0.1 } else { 0.2 });
+    }
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("SAM train buffers");
+
+    for step in 1..=2 {
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu().expect("zero SAM train buffers");
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).expect("CPU SAM forward");
+        let gpu_summary = gpu
+            .forward_training_device(&input)
+            .expect("Oxide SAM training summary");
+        let gpu_final = gpu
+            .backend
+            .download_f32(&gpu_summary.gpu_layer_outputs[2])
+            .expect("download SAM device-summary output");
+        close(
+            &format!("SAM device-summary final output step {step}"),
+            &cpu_forward.final_output().expect("CPU output").data,
+            &gpu_final,
+            2e-4,
+        );
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("Oxide SAM forward");
+        for (index, (cpu_output, gpu_output)) in cpu_forward
+            .layer_outputs
+            .iter()
+            .zip(&gpu_forward.cpu_forward.layer_outputs)
+            .enumerate()
+        {
+            close(
+                &format!("SAM layer {index} forward step {step}"),
+                &cpu_output.data,
+                &gpu_output.data,
+                2e-4,
+            );
+        }
+        let output_shape = cpu.network.layers[2].output_shape;
+        let seed = Tensor::filled(output_shape, 0.07 + step as f32 * 0.01);
+        let seeds = [None, None, Some(seed)];
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU SAM backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("Oxide SAM backward");
+        cpu.update_weights(0.01, 0.0, 0.0001, 1);
+        gpu.update_weights_gpu(0.01, 0.0, 0.0001, 1)
+            .expect("Oxide SAM SGD update");
+        for index in 0..2 {
+            let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(gpu_conv)) =
+                (&cpu.params[index], &gpu.params[index])
+            else {
+                panic!("convolutional parameter layout expected");
+            };
+            close(
+                &format!("SAM conv {index} weights step {step}"),
+                &gpu_conv.weights,
+                &cpu_conv.weights,
+                3e-4,
+            );
+            close(
+                &format!("SAM conv {index} biases step {step}"),
+                &gpu_conv.biases,
+                &cpu_conv.biases,
+                3e-4,
+            );
+        }
+    }
+}
+
+#[test]
 fn local_native_gpu_training_matches_cpu_across_two_updates() {
     let net = network(
         "[net]\nwidth=4\nheight=4\nchannels=2\nbatch=2\n\

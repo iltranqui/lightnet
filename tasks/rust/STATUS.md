@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.051: native f32 SAM forward/backward now uses backend pointwise multiply/activation and fans source-gradient contributions into the correct earlier layer. Actual-Oxide two-step CPU parity passed for both upstream convs and outputs; unsupported activations preserve host fallback. See `implemented.md` §73. No C++ golden/full-suite/performance claim.
 - v0.2.050: extended hybrid GPU Muon to LSTM's four input and four recurrent matrices; actual-Oxide two-step CPU parity and host `gpu_muon_` filter (4) passed. Gradients/state/final updates remain host-staged; no C++ golden/full-suite/performance claim. See `implemented.md` §72.
 - v0.2.049: extended hybrid GPU Muon to RNN input/recurrent/output matrices; actual-Oxide two-step CPU parity and host `gpu_muon_` filter (4) passed. RNN gradients/state/final updates remain host-staged; no C++ golden/full-suite/performance claim. See `implemented.md` §71.
 - v0.2.048: added native Oxide f32 `[local]` forward/backward with supported-activation runtime dispatch and hybrid GPU Muon eligibility for each location-specific matrix. Oxide primitive parity (2), actual-GPU two-step SGD and Muon CPU parity, host `local` filter (11), and host `gpu_muon_` filter (4) passed. Local optimizer updates/state remain host-staged. See `implemented.md` §70; no C++ golden/full-suite/performance claim.

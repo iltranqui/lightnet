@@ -13630,27 +13630,56 @@ where
                                 layer_index: layer.index,
                                 reference: spec.from,
                             })?;
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download sam input", err))?;
-                    let host_source = self
-                        .download_tensor(source_gpu, source_layer.output_shape)
-                        .map_err(|err| backend_error("download sam source", err))?;
-                    let (host_output, host_activation_input) =
-                        forward_sam(spec, &host_input, &host_source, layer.output_shape)?;
-                    if let Some(activation_input) = host_activation_input {
-                        activation_input_gpu = Some(
-                            self.backend
-                                .upload_f32(
-                                    &tensor_backend_shape(layer.output_shape),
-                                    &activation_input.data,
-                                )
-                                .map_err(|err| backend_error("upload sam activation cache", err))?,
-                        );
+                    if layer.input_shape != layer.output_shape
+                        || source_layer.output_shape != layer.output_shape
+                    {
+                        return Err(Error::InvalidConfig(format!(
+                            "sam shape mismatch: input {}, source {}, output {}",
+                            layer.input_shape, source_layer.output_shape, layer.output_shape
+                        )));
                     }
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
-                        .map_err(|err| backend_error("upload sam output", err))?
+                    if let Some(activation) = spec.activation.to_cuda_f32_kind() {
+                        let pre_activation = self
+                            .backend
+                            .vector_mul_f32(
+                                current_input,
+                                source_gpu,
+                                &tensor_backend_shape(layer.output_shape),
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("sam multiply", err))?;
+                        activation_input_gpu = Some(pre_activation.clone());
+                        self.backend
+                            .activation_f32(&pre_activation, activation, launch_config)
+                            .map_err(|err| backend_error("sam activation", err))?
+                    } else {
+                        let host_input = self
+                            .download_tensor(current_input, layer.input_shape)
+                            .map_err(|err| backend_error("download sam input", err))?;
+                        let host_source = self
+                            .download_tensor(source_gpu, source_layer.output_shape)
+                            .map_err(|err| backend_error("download sam source", err))?;
+                        let (host_output, host_activation_input) =
+                            forward_sam(spec, &host_input, &host_source, layer.output_shape)?;
+                        if let Some(activation_input) = host_activation_input {
+                            activation_input_gpu = Some(
+                                self.backend
+                                    .upload_f32(
+                                        &tensor_backend_shape(layer.output_shape),
+                                        &activation_input.data,
+                                    )
+                                    .map_err(|err| {
+                                        backend_error("upload sam activation cache", err)
+                                    })?,
+                            );
+                        }
+                        self.backend
+                            .upload_f32(
+                                &tensor_backend_shape(layer.output_shape),
+                                &host_output.data,
+                            )
+                            .map_err(|err| backend_error("upload sam output", err))?
+                    }
                 }
                 (LayerKind::Deconvolutional(spec), LayerParams::Convolutional(params)) => {
                     if spec.activation.to_cuda_f32_kind().is_some() {
@@ -14358,7 +14387,6 @@ where
                     | LayerKind::LayaEncoder(_)
                     | LayerKind::LayaHead(_)
                     | LayerKind::ScaleChannels(_)
-                    | LayerKind::Sam(_)
                     | LayerKind::Rnn(_)
                     | LayerKind::Lstm(_)
                     | LayerKind::Crnn(_)
@@ -14745,6 +14773,60 @@ where
                         launch_config,
                     )
                     .map_err(|err| backend_error("upsample", err))?,
+                (LayerKind::Sam(spec), LayerParams::None) => {
+                    let source_index = resolve_relative_layer(layer.index, spec.from)?;
+                    let source_layer = self.network.layers.get(source_index).ok_or(
+                        Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.from,
+                        },
+                    )?;
+                    let source_gpu = gpu_layer_outputs
+                        .get(source_index)
+                        .and_then(Option::as_ref)
+                        .ok_or(Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.from,
+                        })?;
+                    if layer.input_shape != layer.output_shape
+                        || source_layer.output_shape != layer.output_shape
+                    {
+                        return Err(Error::InvalidConfig(format!(
+                            "sam shape mismatch: input {}, source {}, output {}",
+                            layer.input_shape, source_layer.output_shape, layer.output_shape
+                        )));
+                    }
+                    let input_gpu = current_input.expect("sam requires current input");
+                    if let Some(activation) = spec.activation.to_cuda_f32_kind() {
+                        let pre_activation = self
+                            .backend
+                            .vector_mul_f32(
+                                input_gpu,
+                                source_gpu,
+                                &tensor_backend_shape(layer.output_shape),
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("sam multiply", err))?;
+                        self.backend
+                            .activation_f32(&pre_activation, activation, launch_config)
+                            .map_err(|err| backend_error("sam activation", err))?
+                    } else {
+                        let host_input = self
+                            .download_tensor(input_gpu, layer.input_shape)
+                            .map_err(|err| backend_error("download sam input", err))?;
+                        let host_source = self
+                            .download_tensor(source_gpu, source_layer.output_shape)
+                            .map_err(|err| backend_error("download sam source", err))?;
+                        let (host_output, _) =
+                            forward_sam(spec, &host_input, &host_source, layer.output_shape)?;
+                        self.backend
+                            .upload_f32(
+                                &tensor_backend_shape(layer.output_shape),
+                                &host_output.data,
+                            )
+                            .map_err(|err| backend_error("upload sam output", err))?
+                    }
+                }
                 (LayerKind::Yolo(_), LayerParams::None)
                 | (LayerKind::ObbYolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
@@ -14754,7 +14836,6 @@ where
                 | (LayerKind::Cost { .. }, LayerParams::None)
                 | (LayerKind::Dropout { .. }, LayerParams::None)
                 | (LayerKind::ScaleChannels(_), LayerParams::None)
-                | (LayerKind::Sam(_), LayerParams::None)
                 | (LayerKind::Contrastive(_), LayerParams::None)
                 | (LayerKind::Yolox(_), LayerParams::None) => current_input
                     .expect("staging layer requires current input")
@@ -15722,6 +15803,71 @@ where
                         layer.index,
                         input_grad,
                         &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::Sam(spec), Some(LayerParams::None)) => {
+                    let source_index = resolve_relative_layer(layer.index, spec.from)?;
+                    let source_layer = self.network.layers.get(source_index).ok_or(
+                        Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.from,
+                        },
+                    )?;
+                    if layer.input_shape != layer.output_shape
+                        || source_layer.output_shape != layer.output_shape
+                    {
+                        return Err(Error::InvalidConfig(format!(
+                            "sam backward shape mismatch: input {}, source {}, output {}",
+                            layer.input_shape, source_layer.output_shape, layer.output_shape
+                        )));
+                    }
+                    let activation_input = forward.gpu_layer_activation_inputs[layer.index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing GPU activation cache for sam layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+                    let delta = self
+                        .backend
+                        .activation_backward_f32(activation_input, &grad, activation, config)
+                        .map_err(|err| backend_error("GPU sam activation backward", err))?;
+                    let source = forward
+                        .gpu_layer_outputs
+                        .get(source_index)
+                        .ok_or(Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.from,
+                        })?;
+                    let current_input = if layer.index == 0 {
+                        &forward.input_gpu
+                    } else {
+                        forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing previous GPU layer output for sam layer #{}",
+                                layer.index
+                            ))
+                        })?
+                    };
+                    let shape = tensor_backend_shape(layer.output_shape);
+                    let input_grad = self
+                        .backend
+                        .vector_mul_f32(&delta, source, &shape, config)
+                        .map_err(|err| backend_error("GPU sam input gradient", err))?;
+                    let source_grad = self
+                        .backend
+                        .vector_mul_f32(&delta, current_input, &shape, config)
+                        .map_err(|err| backend_error("GPU sam source gradient", err))?;
+                    self.accumulate_previous_gpu_gradient(
+                        layer.index,
+                        input_grad,
+                        &mut layer_output_gradients,
+                    )?;
+                    self.accumulate_gpu_gradient(
+                        &mut layer_output_gradients[source_index],
+                        source_grad,
                     )?;
                 }
                 (LayerKind::ScaleChannels(spec), Some(LayerParams::None)) => {
@@ -16843,7 +16989,6 @@ where
                 | (LayerKind::LayaLoss(_), Some(LayerParams::None))
                 | (LayerKind::LayaEncoder(_), Some(LayerParams::LayaEncoder(_)))
                 | (LayerKind::LayaHead(_), Some(LayerParams::LayaHead(_)))
-                | (LayerKind::Sam(_), Some(LayerParams::None))
                 // `[yolox]` applies the C++ `activate_modern_output` (a sigmoid
                 // on the trailing `1 + classes` entries of every cell), which
                 // is a strided sub-range pass, so it goes through the host for
@@ -17328,6 +17473,11 @@ where
                     }
                 }
                 LayerKind::Local(spec) => {
+                    if spec.activation.to_cuda_f32_kind().is_none() {
+                        return true;
+                    }
+                }
+                LayerKind::Sam(spec) => {
                     if spec.activation.to_cuda_f32_kind().is_none() {
                         return true;
                     }

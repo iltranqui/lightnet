@@ -67,8 +67,8 @@ with the command given rather than trusting the number.
 | CPU forward arm | 65 |
 | CPU standalone parameter backward | all parameterized kinds; head/pass-through kinds own no standalone backward |
 | CPU-only forward, no GPU path (hard reject) | 11 |
-| GPU forward but CPU/mixed backward | 10 |
-| GPU native forward + device backward | 22 |
+| GPU forward but CPU/mixed backward | 9 |
+| GPU native forward + device backward | 23 |
 | f16 inference | 11 variants (12 section names) |
 | Axis pinned | 19 variants / 21 tests |
 | Axis open | 41 (Tier 1: 14, Tier 2: 16, Tier 3: 3, Tier 4: 8) |
@@ -95,7 +95,7 @@ with the command given rather than trusting the number.
 | `Softmax` | alias | none | fwd | exact | T1 | native | device | no |
 | `Dropout` | yes | none | fwd | exact | T1 | native | device | no |
 | `ScaleChannels` | yes | none | fwd | exact | T1 | native | mixed | no |
-| `Sam` | yes | none | fwd | exact | T1 | host | staged (source grad unverified) | no |
+| `Sam` | yes | none | fwd | exact | T1 | native f32 / host (unsupported activation) | device / CPU fallback | no |
 | `BatchNorm` | yes | C++ | fwd | exact | rust | inf (training rejected) | device | yes |
 | `Crop` | yes | none | fwd | exact | rust | inf (training rejected) | device | no |
 | `Local` | yes | C++ | fwd | exact | rust | native f32 / host (unsupported activation) | device / CPU fallback | no |
@@ -212,7 +212,7 @@ layer count.
 | `MambaVision` | host round trip | device selective-scan backward |
 | `KimiKda` | host round trip | device delta-rule backward |
 | `LayaActHead` | **native f32** composition | runtime backward integration blocked on the open eligibility question (`implemented.md` §43) |
-| `Sam` | host round trip | device backward incomplete: the GPU arm only forwards the incoming gradient (see defect 2) |
+| `Sam` (unsupported activation) | host round trip | unsupported activation uses the whole-network CPU-backward fallback |
 
 `DeformConv` **left this table** in v0.2.007: it now has a native forward *and*
 backward, gated on `dilation == 1` without batch norm. Its remaining limitation
@@ -308,14 +308,10 @@ non-layer work.
    `InvalidConfig("... and parameter set are inconsistent")` instead of
    `UnsupportedLayer`. `Local` has native f32 forward/backward math, but its
    optimizer remains host-staged.
-2. `Sam` is a host round trip in the GPU **forward**, is absent from
-   `requires_cpu_backward_fallback`, and its GPU backward arm only forwards the
-   incoming gradient to the previous layer (`runtime.rs:15646`). A Sam network
-   also needs the **source**-layer gradient, so that arm cannot be the whole
-   story. `todo.md` P5 says SAM still uses the CPU backward path. One of these
-   three statements is stale — needs a runtime test before any of them is
-   trusted, and Sam should either get a real device arm or join the fallback
-   list.
+2. `Sam` now uses native elementwise forward/backward for supported activations;
+   backward accumulates both the previous-layer and selected-source gradients.
+   Unsupported activations remain on whole-network CPU fallback. Evidence:
+   `sam_native_gpu_forward_backward_fans_out_source_gradient_matches_cpu_across_steps`.
 3. Docs disagree about EML BN backward (v71 says CPU fallback; later notes say
    it was removed) and about MoE BN-expert SGD. Re-check `implemented.md` §7 and
    the `oxide_runtime_chain` BN tests before scheduling.

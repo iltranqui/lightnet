@@ -98,6 +98,7 @@ file is named inline.
 - [70. Native locally connected layer](#70-native-locally-connected-layer)
 - [71. GPU Muon RNN matrices](#71-gpu-muon-rnn-matrices)
 - [72. GPU Muon LSTM matrices](#72-gpu-muon-lstm-matrices)
+- [73. Native GPU SAM forward and backward](#73-native-gpu-sam-forward-and-backward)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -193,9 +194,11 @@ file is named inline.
   `DARKNET_GRAD_MODE=cpp` follows the inspected CUDA diagonal shortcuts (C++ CPU
   custom gradients differ). Parser allows only `[convolutional]`; f16 inference
   explicitly rejects these activations. No compiled-C++ golden is available.
-- SAM still uses the CPU backward path. No-BN RNN/CRNN/LSTM backward uses
-  backend ops; BN RNN/LSTM/CRNN backward also uses backend ops with a host
-  forward/cache upload and host optimizer.
+- SAM uses native f32 pointwise forward/backward for mapped activations,
+  including source-layer gradient fan-out; unsupported activations retain the
+  whole-network CPU backward fallback (v0.2.051, §73). No-BN RNN/CRNN/LSTM
+  backward uses backend ops; BN RNN/LSTM/CRNN backward also uses backend ops
+  with a host forward/cache upload and host optimizer.
 
 ### P6 — FP16 (inference)
 - Decision: additive opt-in `F16TensorOpsBackend` (f16 storage + f32 accumulate),
@@ -1553,6 +1556,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 72. GPU Muon LSTM matrices
 
 - v0.2.050: extended hybrid GPU Muon eligibility to LSTM's four input and four recurrent matrices, using native-device forward/backward and Oxide orthogonalization with host-staged gradients/state/final updates. Actual-GPU two-step CPU parity passed for outputs, all eight weight groups and biases (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_lstm_device_matrices_match_cpu_across_steps`); host `MEM=3G ./tools/test_host.sh gpu_muon_` passed 4. No compiled-C++ golden, full-suite, or performance claim.
+
+## 73. Native GPU SAM forward and backward
+
+- v0.2.051: replaced SAM's host-round-trip forward with native f32 pointwise multiply plus supported activation, and added the exact activation adjoint plus gradients to both the preceding layer and the configured source layer. Unsupported activations retain host forward and whole-network CPU backward fallback. Actual-Oxide two-step SGD parity passed for outputs and both upstream convolution parameter sets; coverage also checks `forward_training_device` and the fan-out source gradient (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- sam_native_gpu_forward_backward_fans_out_source_gradient_matches_cpu_across_steps`). The broad host `sam` filter passed 28 matched tests, though it is not a SAM-specific test. No compiled-C++ golden, full-suite, or performance claim.
 
 ## Not implemented / open (pointer)
 
