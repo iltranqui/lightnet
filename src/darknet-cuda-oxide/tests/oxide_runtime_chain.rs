@@ -3367,6 +3367,50 @@ fn gpu_muon_connected_update_gate_matches_cpu_on_device() {
 }
 
 #[test]
+fn gpu_muon_connected_train_only_bn_gate_matches_cpu_on_device() {
+    let net = network(
+        "[net]\nwidth=2\nheight=1\nchannels=1\nbatch=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0002\n\
+         [connected]\noutput=3\nactivation=linear\ntrain_only_bn=1\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let LayerParams::Connected(params) = &mut cpu.params[0] else {
+        panic!("connected parameters expected");
+    };
+    params
+        .weights
+        .copy_from_slice(&[0.2, -0.1, 0.3, 0.4, -0.25, 0.15]);
+    params.biases.copy_from_slice(&[0.03, -0.02, 0.01]);
+    let initial = cpu.params.clone();
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+
+    for step in 1..=2 {
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
+        let gpu_forward = gpu
+            .forward_training_device(&input)
+            .expect("Oxide connected forward");
+        let seed = Tensor::filled(cpu.network.layers[0].output_shape, 0.03 * step as f32);
+        let seeds = [Some(seed)];
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("Oxide backward");
+        cpu.update_weights_muon(0.02, 2).expect("CPU Muon update");
+        gpu.update_weights_gpu(0.02, 0.9, net.net.decay, 2)
+            .expect("GPU Muon update");
+        assert_eq!(
+            cpu.params, initial,
+            "CPU train_only_bn gate should skip weights"
+        );
+        assert_eq!(
+            gpu.params, initial,
+            "GPU train_only_bn gate should skip weights"
+        );
+    }
+}
+
+#[test]
 fn gpu_muon_connected_burnin_gate_matches_cpu_on_device() {
     let net = network(
         "[net]\nwidth=2\nheight=1\nchannels=1\nbatch=2\nburn_in=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0005\n\
