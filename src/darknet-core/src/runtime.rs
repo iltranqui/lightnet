@@ -39040,6 +39040,69 @@ num_dwconv=1
     }
 
     #[test]
+    fn local_avgpool_axis_layout_pins_window_and_batch_order() {
+        // C++ `maxpool_layer.cpp:440` averages valid taps in each local
+        // window. Non-square B=2/C=2 data and unequal axis strides expose any
+        // x/y, channel, or sample permutation.
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "local_avgpool_axis.cfg",
+                "[net]\nwidth=5\nheight=3\nchannels=2\nbatch=2\n[local_avgpool]\nsize=3\nstride_x=2\nstride_y=1\npadding=1\n",
+            )
+            .expect("local avgpool cfg"),
+        )
+        .expect("local avgpool network");
+        let output_shape = TensorShape::new(2, 2, 2, 2);
+        assert_eq!(network.layers[0].output_shape, output_shape);
+        let executable = ExecutableNetwork::new(network);
+        let values = (0..60)
+            .map(|index| {
+                let plane = index / 15;
+                let position = index % 15;
+                (plane * 100 + position + 1) as f32
+            })
+            .collect();
+        let input = Tensor::from_data(TensorShape::new(5, 3, 2, 2), values)
+            .expect("local avgpool input");
+        let forward = executable
+            .forward(&input)
+            .expect("local avgpool forward");
+        assert_slice_close(
+            "local avgpool NCHW output",
+            &[
+                7.0, 9.0, 9.5, 11.5, 107.0, 109.0, 109.5, 111.5,
+                207.0, 209.0, 209.5, 211.5, 307.0, 309.0, 309.5, 311.5,
+            ],
+            &forward.layer_outputs[0].data,
+            1e-6,
+        );
+        let seeds = Tensor::from_data(
+            output_shape,
+            vec![1.0, 0.0, 0.0, 2.0, 2.0, 0.0, 0.0, 4.0,
+                 3.0, 0.0, 0.0, 6.0, 4.0, 0.0, 0.0, 8.0],
+        )
+        .expect("local avgpool seeds");
+        let backward = executable
+            .backward(&input, &forward, &seeds)
+            .expect("local avgpool backward");
+        let one_plane = [
+            1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 0.0, 0.0,
+            1.0 / 9.0, 1.0 / 9.0, 4.0 / 9.0, 1.0 / 3.0, 1.0 / 3.0,
+            1.0 / 9.0, 1.0 / 9.0, 4.0 / 9.0, 1.0 / 3.0, 1.0 / 3.0,
+        ];
+        let expected: Vec<f32> = [1.0, 2.0, 3.0, 4.0]
+            .into_iter()
+            .flat_map(|scale| one_plane.map(|value| scale * value))
+            .collect();
+        assert_slice_close(
+            "local avgpool per-window input gradient",
+            &expected,
+            &backward.input_gradient.data,
+            1e-6,
+        );
+    }
+
+    #[test]
     fn avgpool_axis_layout_reduces_spatial_per_channel_and_batch() {
         // C++ `avgpool_layer.cpp:51` reduces each NCHW channel plane over H*W,
         // keeping batch and channel as distinct output axes.
