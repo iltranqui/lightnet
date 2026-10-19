@@ -124,6 +124,7 @@ file is named inline.
 - [96. Native GraphConv BN training](#96-native-graphconv-bn-training)
 - [97. Standalone BatchNorm native GPU training](#97-standalone-batchnorm-native-gpu-training)
 - [98. Native Crop training geometry](#98-native-crop-training-geometry)
+- [99. DCNv4 mixed-network backward validation](#99-dcnv4-mixed-network-backward-validation)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1616,7 +1617,7 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 
 ## 81. Native GPU GraphConv uniform runtime path
 
-- v0.2.059: wired native Oxide f32 forward/backward for `[graph_conv]` edge mode 0 with no self projection or BN and backend-supported activation. Aggregation and grouped 1x1 projection/bias/activation run on device; backward computes activation, projection parameter, and aggregation-adjoint gradients on device, then stages projection gradients to host train buffers for SGD/Adam updates. Actual-Oxide runtime parity passed for layer outputs and SGD/Adam parameter updates through GraphConv and an upstream convolution (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain graph_conv_uniform_runtime_forward_backward_and_sgd_match_cpu`); host `graph_conv` filter passed 15 tests including host fallback. Unsupported learned-edge/self/BN/activation variants retain CPU fallback; compact GPU inference remains unsupported. Parameters are uploaded for projection and gradients download at backward; no residency/speedup claim. No compiled-C++ golden or full-suite claim; the broad runtime-chain run had 50 passing tests and one failure (`dcnv4_mixed_network_retains_cpu_cache_and_backward`: missing DCNv4 cache), whose cause remains unverified.
+- v0.2.059: wired native Oxide f32 forward/backward for `[graph_conv]` edge mode 0 with no self projection or BN and backend-supported activation. Aggregation and grouped 1x1 projection/bias/activation run on device; backward computes activation, projection parameter, and aggregation-adjoint gradients on device, then stages projection gradients to host train buffers for SGD/Adam updates. Actual-Oxide runtime parity passed for layer outputs and SGD/Adam parameter updates through GraphConv and an upstream convolution (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain graph_conv_uniform_runtime_forward_backward_and_sgd_match_cpu`); host `graph_conv` filter passed 15 tests including host fallback. Unsupported learned-edge/self/BN/activation variants retain CPU fallback; compact GPU inference remains unsupported. Parameters are uploaded for projection and gradients download at backward; no residency/speedup claim. No compiled-C++ golden or full-suite claim. A prior broad runtime-chain run reported 50 passes and one failure because the test passed a GPU host snapshot (which intentionally omits device caches) to CPU backward; the test now pairs each forward state with its matching backward path, and `dcnv4_mixed_network_cpu_and_gpu_backward_succeed` passes.
 
 ## 82. GraphConv learned-edge masked-softmax host contract
 
@@ -1685,6 +1686,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 98. Native Crop training geometry
 
 - v0.2.076 (`c815a081`): native Crop training supports random crop coordinates, optional horizontal flip, rotation, and the per-in-bounds-tap affine scaling with zero-valued out-of-bounds taps. Training HSV/saturation/exposure/RGB-shift augmentation remains explicitly rejected. Actual-Oxide runtime parity passes for an augmented Conv→Crop chain over SGD and Adam, comparing crop outputs and upstream Conv updates: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain crop_native_training_augmentation_and_backward_match_cpu` passed. Crop bilinear fwd/bwd primitive parity and FD pass (`oxide_pool_parity crop_bilinear_forward_backward_and_fd`), and host crop filter passed 10 tests. This is Rust CPU/Oxide parity, not compiled-C++ parity; no full-suite/performance claim.
+
+## 99. DCNv4 mixed-network backward validation
+
+- v0.2.077 (`e583f9d2`): corrected a stale mixed-network regression test that passed the GPU forward's host snapshot to CPU backward, although GPU backward caches intentionally live in `GpuForwardState`. The test now pairs the CPU forward with CPU backward and GPU forward with native GPU backward. Its focused test passes; the complete `oxide_runtime_chain` binary passes 62/62 tests (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain`, 1273.53 seconds). This is scoped Oxide runtime-chain evidence only—not the entire Rust suite, compiled-C++ golden, or overall objective completion.
 
 ## Not implemented / open (pointer)
 
