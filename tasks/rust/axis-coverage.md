@@ -106,8 +106,8 @@ classes that apply.
 | Rust-only | 5 | no C++ layer type; pin Rust's own contract |
 | Ports incomplete/partial | 4 | Region truth-loss/decode; yolo_3d partial; dcnv3 and detr_decoder blocked |
 
-`axis_layout` baseline after the Region pin: **22 passed, 945 filtered out**
-(967 lib tests), run under `MEM=3G`. Every tier below grows that count; it
+`axis_layout` baseline after the GRU Rust-contract pin: **23 passed, 945 filtered out**
+(968 lib tests), run under `MEM=3G`. Every tier below grows that count; it
 must never shrink.
 
 ## Pinned variants (20)
@@ -206,17 +206,17 @@ Weights order is covered for all of them (see [Weights axis](#weights-axis)).
 
 ## Rust-only extensions (5)
 
-Not in `ELayerType` on any branch (`layers.md:79`), so there is nothing to
-anchor against. Pin Rust's own documented contract and label the row
-`no-C++-reference`; these are exceptions in the coverage gate, not gaps.
+Not in `ELayerType` on any branch (`layers.md:79`), so there is no C++
+layer type to anchor against. Pin Rust's documented contract and record the
+named test; use `no-C++-reference` rather than claiming C++ parity.
 
-| Variant | Aliases | Reference | Required pin |
-|---|---|---|---|
-| `Gru` | `gru` | none | per-sample reset; gate block order |
-| `Crop` | `crop` | GPU-only `Jev_laya:src-lib/crop_layer_kernels.cu` | crop window to output index mapping, `batch=2` |
-| `Local` | `local` | none | per-sample weight sharing; `C*H*W` to `out` layout |
-| `BatchNorm` | `batchnorm` | `Jev_laya:src-lib/batchnorm_layer.cpp` exists but has no `ELayerType` | channel-axis reduction; `(C)` scale/beta order |
-| `Detection` | `detection` | none | identity passthrough preserves layout |
+| Variant | Aliases | Reference | Required pin | Contract test |
+|---|---|---|---|---|
+| `Gru` | `gru` | none | per-sample reset; gate block order | `runtime.rs` `gru_axis_layout_keeps_samples_independent_and_gate_blocks_ordered` |
+| `Crop` | `crop` | GPU-only `Jev_laya:src-lib/crop_layer_kernels.cu` | crop window to output index mapping, `batch=2` | open |
+| `Local` | `local` | none | per-sample weight sharing; `C*H*W` to `out` layout | open |
+| `BatchNorm` | `batchnorm` | `Jev_laya:src-lib/batchnorm_layer.cpp` exists but has no `ELayerType` | channel-axis reduction; `(C)` scale/beta order | open |
+| `Detection` | `detection` | none | identity passthrough preserves layout | open |
 
 ## Not complete (4)
 

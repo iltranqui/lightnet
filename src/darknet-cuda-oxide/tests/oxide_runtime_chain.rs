@@ -1393,13 +1393,72 @@ fn batch_normalized_rnn_device_backward_matches_cpu_on_oxide() {
 }
 
 #[test]
-fn gru_gpu_path_is_rejected_as_unsupported_not_misconfigured() {
+fn gru_native_inference_matches_cpu_for_multiple_steps() {
+    let net = network("[net]\nwidth=2\nheight=1\nchannels=1\nbatch=4\n[gru]\noutput=3\nsteps=2\n");
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let LayerParams::Gru(params) = &mut cpu.params[0] else { panic!("expected GRU parameters"); };
+    for (block_index, block) in [
+        &mut params.input_z, &mut params.state_z, &mut params.input_r,
+        &mut params.state_r, &mut params.input_h, &mut params.state_h,
+    ].into_iter().enumerate() {
+        for (index, value) in block.weights.iter_mut().enumerate() {
+            *value = 0.01 * (1 + block_index + index) as f32;
+        }
+        for (index, value) in block.biases.iter_mut().enumerate() {
+            *value = -0.02 * (1 + block_index + index) as f32;
+        }
+    }
+    let input = patterned(cpu.network.net.input_shape());
+    let expected = cpu.forward(&input).expect("CPU GRU forward").final_output().expect("GRU output").clone();
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+    let gpu_forward = gpu.forward_with_state(&input).expect("native GPU GRU inference");
+    let actual = gpu_forward.cpu_forward.final_output().expect("GPU GRU output");
+    close("native GRU inference", &expected.data, &actual.data, 2e-4);
+}
+
+#[test]
+fn gru_native_inference_matches_cpu_with_rolling_batch_norm() {
+    let net = network(
+        "[net]\nwidth=2\nheight=1\nchannels=1\nbatch=4\n[gru]\noutput=3\nsteps=2\nbatch_normalize=1\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let LayerParams::Gru(params) = &mut cpu.params[0] else { panic!("expected GRU parameters"); };
+    for (block_index, block) in [
+        &mut params.input_z, &mut params.state_z, &mut params.input_r,
+        &mut params.state_r, &mut params.input_h, &mut params.state_h,
+    ].into_iter().enumerate() {
+        for (index, value) in block.weights.iter_mut().enumerate() {
+            *value = 0.01 * (1 + block_index + index) as f32;
+        }
+        for (index, value) in block.biases.iter_mut().enumerate() {
+            *value = -0.02 * (1 + block_index + index) as f32;
+        }
+        let bn = block.batch_norm.as_mut().expect("GRU BN state");
+        for channel in 0..bn.biases.len() {
+            bn.biases[channel] = 0.03 * (1 + channel) as f32;
+            bn.scales[channel] = 0.7 + 0.05 * channel as f32;
+            bn.rolling_mean[channel] = -0.04 * channel as f32;
+            bn.rolling_variance[channel] = 0.6 + 0.1 * channel as f32;
+        }
+    }
+    let input = patterned(cpu.network.net.input_shape());
+    let expected = cpu.forward(&input).expect("CPU GRU forward").final_output().expect("GRU output").clone();
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+    let gpu_forward = gpu.forward_with_state(&input).expect("native GPU GRU inference with BN");
+    let actual = gpu_forward.cpu_forward.final_output().expect("GPU GRU output");
+    close("native GRU BN inference", &expected.data, &actual.data, 3e-4);
+}
+
+#[test]
+fn gru_gpu_training_path_is_rejected_as_unsupported_not_misconfigured() {
     let net = network("[net]\nwidth=2\nheight=1\nchannels=1\nbatch=1\n[gru]\noutput=2\nsteps=2\n");
     let input = patterned(net.net.input_shape());
     let gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("Oxide"));
     let error = match gpu.forward_training_with_state(&input) {
         Err(error) => error,
-        Ok(_) => panic!("GRU must remain explicitly unsupported on GPU until a native path exists"),
+        Ok(_) => panic!("GRU GPU training remains unsupported without native backward support"),
     };
     assert!(
         format!("{error:?}").contains("UnsupportedLayer"),

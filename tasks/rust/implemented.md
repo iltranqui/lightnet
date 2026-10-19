@@ -125,8 +125,9 @@ file is named inline.
 - [97. Standalone BatchNorm native GPU training](#97-standalone-batchnorm-native-gpu-training)
 - [98. Native Crop training geometry](#98-native-crop-training-geometry)
 - [99. DCNv4 mixed-network backward validation](#99-dcnv4-mixed-network-backward-validation)
-- [100. Explicit GPU rejection for GRU](#100-explicit-gpu-rejection-for-gru)
+- [100. Explicit GPU rejection for GRU training](#100-explicit-gpu-rejection-for-gru-training)
 - [101. Region CPU forward and axis pin](#101-region-cpu-forward-and-axis-pin)
+- [102. Native GRU GPU inference](#102-native-gru-gpu-inference)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1693,13 +1694,17 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 
 - v0.2.077 (`e583f9d2`): corrected a stale mixed-network regression test that passed the GPU forward's host snapshot to CPU backward, although GPU backward caches intentionally live in `GpuForwardState`. The test now pairs the CPU forward with CPU backward and GPU forward with native GPU backward. Its focused test passes; the complete `oxide_runtime_chain` binary passes 62/62 tests (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain`, 1273.53 seconds). This is scoped Oxide runtime-chain evidence only—not the entire Rust suite, compiled-C++ golden, or overall objective completion.
 
-## 100. Explicit GPU rejection for GRU
+## 100. Explicit GPU rejection for GRU training
 
-- v0.2.078 (`57b00348`): added an explicit `UnsupportedLayer` GPU error for `[gru]`, replacing the misleading catch-all parameter/config mismatch. The focused Oxide test `gru_gpu_path_is_rejected_as_unsupported_not_misconfigured` passes. No GRU GPU implementation was added; it remains an open native-GPU requirement. This is error-surface coverage only, not parity/completion evidence.
+- v0.2.078 (`57b00348`): added an explicit `UnsupportedLayer` GPU error for `[gru]`, replacing the misleading catch-all parameter/config mismatch. The focused Oxide training-rejection test passes. Native inference was added separately in §102; GPU training/backward remains unsupported.
 
 ## 101. Region CPU forward and axis pin
 
 - v0.1.027: hand-ported the CPU portion of `Jev_laya:src-lib/region_layer.cpp:209-235`: C++ `flatten` layout (`blas.cpp:104`), objectness logistic, optional class softmax, and the exact supplied-seed adjoint. `[region] softmax` is parsed and input channels are validated against `num * (coords + classes + 1)`. Named non-square, batch-2 axis test `region_axis_layout_matches_cpp_flatten_objectness_and_classes` checks outputs and adjoints. `MEM=3G ./tools/test_host.sh axis_layout` passed 22 tests; `every_layer_kind_has_an_axis_pin_decision` passed; all 12 cfgs containing `[region]` passed isolated parse/construct/CPU-inference runs. GPU full/compact inference now rejects explicitly; Oxide rejection test passes. Truth-driven Region loss/decode, GPU kernels, and compiled-C++ golden remain open; source-derived, no compiled-C++ parity claim.
+
+## 102. Native GRU GPU inference
+
+- v0.2.079: added a native f32 GPU inference composition for `[gru]` using device connected projections, logistic gates, pointwise reset/update equations, sequence slicing and concatenation. Rolling-stat BN is folded into each projection's weights and bias; training remains explicitly rejected because no native backward/cache/update path exists. The actual Oxide tests `gru_native_inference_matches_cpu_for_multiple_steps` and `gru_native_inference_matches_cpu_with_rolling_batch_norm` compare outputs against Rust CPU, and `gru_gpu_training_path_is_rejected_as_unsupported_not_misconfigured` verifies the boundary. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gru` passed 3 tests; host axis tests passed 23. No C++ golden/parity, training parity, full-suite or performance claim.
 
 ## Not implemented / open (pointer)
 

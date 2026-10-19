@@ -99,7 +99,7 @@ with the command given rather than trusting the number.
 | `BatchNorm` | yes | C++ | fwd | exact | rust | native inference + batch-statistics training | device backward / host AdamW parameter update | yes |
 | `Crop` | yes | none | fwd | exact | rust | native inference + geometric training (no HSV/color jitter) | device (atomic scatter) | no |
 | `Local` | yes | C++ | fwd | exact | rust | native f32 / host (unsupported activation) | device / CPU fallback | no |
-| `Gru` | yes | C++ | fwd | exact | rust | **none** (`UnsupportedLayer`) | cpu | no |
+| `Gru` | yes | Rust | fwd | none | rust | native f32 inference incl. rolling-stat BN | training unsupported (no backward path) | no |
 | `Rnn` | yes | C++ | fwd | exact | T3 | mixed (device w/o BN) | mixed | no |
 | `Lstm` | yes | C++ | fwd | exact | T3 | mixed (device w/o BN) | mixed | no |
 | `Crnn` | yes | C++ | fwd | exact | T3 | mixed (device w/o BN) | mixed | no |
@@ -164,7 +164,7 @@ paths in `runtime.rs` (including the `Gru` match arm).
 | `DptHead` | same | four-tap fusion neck over DPT features | attention wave |
 | `Yolo3d` | same | raw CPU forward only; loss/decode absent | CPU first, then GPU |
 | `ObbRefine` (CARPN) | `GPU inference is not implemented` / `GPU CARPN training is unsupported` | CPU inference only; Stage-2 training deferred | after CARPN CPU training |
-| `Gru` | `UnsupportedLayer` | No GPU forward/backward path is implemented | recurrent wave |
+| `Gru` training | `UnsupportedLayer` | Native f32 inference (including rolling-stat BN) exists; GPU training/backward remains unsupported | recurrent wave |
 | `Region` | `UnsupportedLayer` | Native GPU flatten/objectness/class path is not implemented | detection-head wave |
 
 `Local` has a bounded native f32 forward/backward path since
@@ -303,10 +303,10 @@ variants or non-layer work.
 
 ## Defects found while deriving this matrix
 
-1. `Gru` has no GPU forward arm and no pre-flight rejection, so it surfaces as
-   `InvalidConfig("... and parameter set are inconsistent")` instead of
-   `UnsupportedLayer`. `Local` has native f32 forward/backward math, but its
-   optimizer remains host-staged.
+1. GRU has native f32 inference including rolling-stat BN, but training is
+   still explicitly rejected because no backward cache/gradient path exists.
+   `Local` has native f32 forward/backward math, but its optimizer remains
+   host-staged.
 2. `Sam` now uses native elementwise forward/backward for supported activations;
    backward accumulates both the previous-layer and selected-source gradients.
    Unsupported activations remain on whole-network CPU fallback. Evidence:

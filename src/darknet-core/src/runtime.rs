@@ -14829,6 +14829,18 @@ where
                         layer.index
                     )));
                 }
+                (LayerKind::Gru(spec), LayerParams::Gru(params)) if !training => {
+                    forward_gru_layer_device(
+                        &self.backend,
+                        current_input,
+                        layer.input_shape,
+                        spec,
+                        params,
+                        layer.output_shape,
+                        layer.index,
+                        launch_config,
+                    )?
+                }
                 (LayerKind::Gru(_), _) => {
                     return Err(Error::UnsupportedLayer {
                         layer_index: layer.index,
@@ -28079,6 +28091,116 @@ fn forward_gru_layer(
         previous_state = state;
     }
     Ok(output)
+}
+
+fn forward_gru_layer_device<B: F32TensorOpsBackend>(
+    backend: &B,
+    input_gpu: &B::Tensor,
+    input_shape: TensorShape,
+    spec: &GruSpec,
+    params: &GruParams,
+    output_shape: TensorShape,
+    layer_index: usize,
+    config: ElementwiseLaunchConfig,
+) -> Result<B::Tensor>
+where
+    B::Error: std::fmt::Display,
+{
+    let sequence_batch = recurrent_sequence_batch(input_shape.batch, spec.steps)?;
+    let inputs = input_shape.element_count();
+    if output_shape.width != 1 || output_shape.height != 1 || output_shape.channels != spec.output {
+        return Err(Error::InvalidConfig("GRU output shape is inconsistent with its specification".to_owned()));
+    }
+    for (name, projection, expected_inputs) in [
+        ("input_z", &params.input_z, inputs), ("state_z", &params.state_z, spec.output),
+        ("input_r", &params.input_r, inputs), ("state_r", &params.state_r, spec.output),
+        ("input_h", &params.input_h, inputs), ("state_h", &params.state_h, spec.output),
+    ] {
+        if projection.weights.len() != expected_inputs * spec.output || projection.biases.len() != spec.output {
+            return Err(Error::InvalidConfig(format!("GRU {name} parameter shape is inconsistent with its specification")));
+        }
+    }
+    let upload_projection = |projection: &ConnectedParams, input_size: usize| -> Result<(B::Tensor, B::Tensor)> {
+        let (weights, biases) = if let Some(batch_norm) = &projection.batch_norm {
+            validate_batchnorm_params(batch_norm, spec.output)?;
+            let mut weights = projection.weights.clone();
+            let mut biases = projection.biases.clone();
+            for output in 0..spec.output {
+                let factor = batch_norm.scales[output]
+                    / (batch_norm.rolling_variance[output] + BATCH_NORM_EPSILON).sqrt();
+                for weight in &mut weights[output * input_size..(output + 1) * input_size] {
+                    *weight *= factor;
+                }
+                biases[output] -= batch_norm.rolling_mean[output] * factor;
+            }
+            (weights, biases)
+        } else {
+            (projection.weights.clone(), projection.biases.clone())
+        };
+        let weights = backend.upload_f32(&[spec.output, input_size], &weights)
+            .map_err(|err| backend_error("upload GRU projection weights", err))?;
+        let biases = backend.upload_f32(&[spec.output], &biases)
+            .map_err(|err| backend_error("upload GRU projection biases", err))?;
+        Ok((weights, biases))
+    };
+    let input_z = upload_projection(&params.input_z, inputs)?;
+    let state_z = upload_projection(&params.state_z, spec.output)?;
+    let input_r = upload_projection(&params.input_r, inputs)?;
+    let state_r = upload_projection(&params.state_r, spec.output)?;
+    let input_h = upload_projection(&params.input_h, inputs)?;
+    let state_h = upload_projection(&params.state_h, spec.output)?;
+    let state_shape = [sequence_batch, spec.output];
+    let activation = gpu_activation_kind(layer_index, &Activation::Logistic)?;
+    let mut previous = backend.zeros_f32(&state_shape)
+        .map_err(|err| backend_error("allocate GRU initial state", err))?;
+    let mut outputs = Vec::with_capacity(spec.steps);
+    for step in 0..spec.steps {
+        let step_input = backend.sequence_slice_f32(
+            input_gpu, &tensor_backend_shape(input_shape), step, spec.steps,
+            &[sequence_batch, inputs], config,
+        ).map_err(|err| backend_error("slice GRU input sequence", err))?;
+        let project = |x: &B::Tensor, pair: &(B::Tensor, B::Tensor), input_size: usize| {
+            backend.connected_f32(x, &pair.0, &pair.1, sequence_batch, input_size, spec.output, config)
+        };
+        let input_z_value = project(&step_input, &input_z, inputs)
+            .map_err(|err| backend_error("GRU update input projection", err))?;
+        let state_z_value = project(&previous, &state_z, spec.output)
+            .map_err(|err| backend_error("GRU update state projection", err))?;
+        let update_pre = backend.vector_add_f32(&input_z_value, &state_z_value, config)
+            .map_err(|err| backend_error("sum GRU update projections", err))?;
+        let update = backend.activation_f32(&update_pre, activation, config)
+            .map_err(|err| backend_error("activate GRU update gate", err))?;
+        let input_r_value = project(&step_input, &input_r, inputs)
+            .map_err(|err| backend_error("GRU reset input projection", err))?;
+        let state_r_value = project(&previous, &state_r, spec.output)
+            .map_err(|err| backend_error("GRU reset state projection", err))?;
+        let reset_pre = backend.vector_add_f32(&input_r_value, &state_r_value, config)
+            .map_err(|err| backend_error("sum GRU reset projections", err))?;
+        let reset = backend.activation_f32(&reset_pre, activation, config)
+            .map_err(|err| backend_error("activate GRU reset gate", err))?;
+        let reset_state = backend.vector_mul_f32(&reset, &previous, &state_shape, config)
+            .map_err(|err| backend_error("apply GRU reset gate", err))?;
+        let input_h_value = project(&step_input, &input_h, inputs)
+            .map_err(|err| backend_error("GRU candidate input projection", err))?;
+        let state_h_value = project(&reset_state, &state_h, spec.output)
+            .map_err(|err| backend_error("GRU candidate state projection", err))?;
+        let candidate_pre = backend.vector_add_f32(&input_h_value, &state_h_value, config)
+            .map_err(|err| backend_error("sum GRU candidate projections", err))?;
+        let candidate = backend.activation_f32(&candidate_pre, activation, config)
+            .map_err(|err| backend_error("activate GRU candidate", err))?;
+        let previous_minus_candidate = backend.saxpy_f32(-1.0, &candidate, &previous, config)
+            .map_err(|err| backend_error("form GRU state difference", err))?;
+        let gated_difference = backend.vector_mul_f32(&update, &previous_minus_candidate, &state_shape, config)
+            .map_err(|err| backend_error("apply GRU update gate", err))?;
+        let state = backend.vector_add_f32(&candidate, &gated_difference, config)
+            .map_err(|err| backend_error("combine GRU candidate and previous state", err))?;
+        outputs.push(state.clone());
+        previous = state;
+    }
+    backend.sequence_concat_f32(
+        &outputs.iter().collect::<Vec<_>>(), &tensor_backend_shape(output_shape),
+        sequence_batch * spec.output, config,
+    ).map_err(|err| backend_error("concatenate GRU outputs", err))
 }
 
 fn recurrent_device_tensor<B: F32TensorOpsBackend>(
@@ -44943,6 +45065,56 @@ num_dwconv=1
             gradient.weights,
             vec![1.0, 2.0, 4.0, 5.0, 4.0, 6.0, 10.0, 12.0]
         );
+    }
+
+    #[test]
+    fn gru_axis_layout_keeps_samples_independent_and_gate_blocks_ordered() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "gru-axis.cfg",
+                "[net]\ninputs=1\nbatch=2\ntime_steps=2\n[gru]\noutput=1\n",
+            )
+            .expect("GRU cfg should parse"),
+        )
+        .expect("GRU network should build");
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::Gru(params) = &mut executable.params[0] else {
+            panic!("expected GRU parameters");
+        };
+        for (projection, weight, bias) in [
+            (&mut params.input_z, 1.0, -0.2),
+            (&mut params.state_z, 0.5, 0.1),
+            (&mut params.input_r, -0.7, 0.3),
+            (&mut params.state_r, 0.4, -0.1),
+            (&mut params.input_h, 0.9, 0.05),
+            (&mut params.state_h, -0.6, 0.2),
+        ] {
+            projection.weights[0] = weight;
+            projection.biases[0] = bias;
+        }
+        let input_values = [0.2_f32, -0.3, 0.7, 0.4];
+        let input = Tensor::from_data(executable.network.net.input_shape(), input_values.to_vec())
+            .expect("GRU input should have the expected shape");
+        let sigmoid = |value: f32| 1.0 / (1.0 + (-value).exp());
+        let mut expected = Vec::with_capacity(4);
+        let mut previous = [0.0_f32; 2];
+        for step in 0..2 {
+            for sample in 0..2 {
+                let x = input_values[step * 2 + sample];
+                let p = previous[sample];
+                let z = sigmoid(x * 1.0 - 0.2 + p * 0.5 + 0.1);
+                let r = sigmoid(x * -0.7 + 0.3 + p * 0.4 - 0.1);
+                let candidate = sigmoid(x * 0.9 + 0.05 + (r * p) * -0.6 + 0.2);
+                let state = z * p + (1.0 - z) * candidate;
+                expected.push(state);
+                previous[sample] = state;
+            }
+        }
+        let forward = executable
+            .forward(&input)
+            .expect("GRU forward should succeed");
+        let actual = forward.final_output().expect("GRU output");
+        assert_slice_close("GRU sample/gate axis layout", &actual.data, &expected, 1e-7);
     }
 
     #[test]
