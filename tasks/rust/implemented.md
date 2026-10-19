@@ -83,6 +83,7 @@ file is named inline.
 - [55. Extend native DCNv4 runtime through 9x9](#55-extend-native-dcnv4-runtime-through-9x9)
 - [56. Extend native DCNv4 runtime through 11x11](#56-extend-native-dcnv4-runtime-through-11x11)
 - [57. Extend native DCNv4 runtime through 13x13](#57-extend-native-dcnv4-runtime-through-13x13)
+- [58. Retain native DCNv4 forward cache for backward](#58-retain-native-dcnv4-forward-cache-for-backward)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1463,6 +1464,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 57. Extend native DCNv4 runtime through 13x13
 
 - v0.2.020 (`c99f83d8`): increased the native fixed mask capacity/runtime gate from 121 to 169 active points. 13x13 real-GPU composition matches CPU outputs and all math gradients; runtime two-step SGD/Adam parity passes with BN on/off, and >169 remains host fallback (exclusion fixture is 15x15). Evidence: focused `oxide_dcnv4_chain` composition and `oxide_runtime_chain` DCNv4 optimizer tests passed; `MEM=3G ./tools/test_host.sh dcnv4` passed 28 core tests. No compiled-C++ or performance claim.
+
+## 58. Retain native DCNv4 forward cache for backward
+
+- v0.2.021 (`7a262a13`): store each native GPU forward's raw aggregation and dense offsets in its `GpuForwardState`; backward consumes that exact cache instead of re-uploading offset biases and recomputing projection/upsampling/aggregation. CPU fallback caches remain separate, and host-resident parameters/gradients/optimizer are unchanged. Per-forward ownership is covered by existing multiple-forward/microbatch tests, with explicit native-cache presence assertions. Gates: `MEM=3G ./tools/test_host.sh dcnv4` passed 28 core tests; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed on the RTX 4060 (1 test, 226 seconds). No speedup measured or claimed; full runtime chain/corpus not run.
 
 ## Not implemented / open (pointer)
 
