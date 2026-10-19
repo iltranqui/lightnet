@@ -5498,6 +5498,25 @@ impl F32TensorOpsBackend for OxideBackend {
         self.graph_conv_aggregate_forward_native(input, geometry, config)
     }
 
+    fn graph_conv_learned_aggregate_f32(
+        &self,
+        input: &Self::Tensor,
+        edge_kernel: &Self::Tensor,
+        edge_biases: &Self::Tensor,
+        geometry: darknet_cuda::host_ops::graph_conv::GraphConvAggregationGeometry,
+        groups: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        self.graph_conv_learned_aggregate_forward_native(
+            input,
+            edge_kernel,
+            edge_biases,
+            geometry,
+            groups,
+            config,
+        )
+    }
+
     fn graph_conv_aggregate_backward_f32(
         &self,
         output_gradient: &Self::Tensor,

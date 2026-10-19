@@ -144,6 +144,8 @@ fn graph_conv_learned_host_contract_masks_edges_and_matches_finite_differences()
         dilation: 1,
         padding: 1,
     };
+    let backend = OxideBackend::new().expect("Oxide backend");
+    let config = ElementwiseLaunchConfig::default();
     let groups = 2;
     let mut input = patterned(geometry.input_len(), 0.1);
     let mut edge_kernel = patterned(36, 0.4)
@@ -155,6 +157,70 @@ fn graph_conv_learned_host_contract_masks_edges_and_matches_finite_differences()
         .map(|value| value * 0.04)
         .collect::<Vec<_>>();
     let seed = patterned(geometry.output_len(), 0.9);
+    let input_device = backend
+        .upload_f32(
+            &[
+                geometry.batch,
+                geometry.channels,
+                geometry.input_height,
+                geometry.input_width,
+            ],
+            &input,
+        )
+        .expect("upload learned graph input");
+    let kernel_device = backend
+        .upload_f32(&[36], &edge_kernel)
+        .expect("upload edge kernel");
+    let biases_device = backend
+        .upload_f32(&[18], &edge_biases)
+        .expect("upload edge biases");
+    let learned_device = backend
+        .graph_conv_learned_aggregate_f32(
+            &input_device,
+            &kernel_device,
+            &biases_device,
+            geometry,
+            groups,
+            config,
+        )
+        .expect("native learned aggregation");
+    let learned_output = backend
+        .download_f32(&learned_device)
+        .expect("download learned output");
+    let expected_output =
+        learned_aggregate_forward(&input, &edge_kernel, &edge_biases, geometry, groups)
+            .expect("learned host reference");
+    close(
+        "learned native forward",
+        &learned_output,
+        &expected_output,
+        3e-5,
+    );
+    assert!(
+        backend
+            .graph_conv_learned_aggregate_f32(
+                &input_device,
+                &kernel_device,
+                &biases_device,
+                geometry,
+                3,
+                config,
+            )
+            .is_err()
+    );
+    let malformed_kernel = backend.upload_f32(&[35], &edge_kernel[..35]).unwrap();
+    assert!(
+        backend
+            .graph_conv_learned_aggregate_f32(
+                &input_device,
+                &malformed_kernel,
+                &biases_device,
+                geometry,
+                groups,
+                config,
+            )
+            .is_err()
+    );
     let ones = vec![1.0; geometry.input_len()];
     let masked_mean =
         learned_aggregate_forward(&ones, &vec![0.0; 36], &vec![0.0; 18], geometry, groups)

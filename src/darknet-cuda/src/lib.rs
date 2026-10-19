@@ -1317,6 +1317,35 @@ pub trait F32TensorOpsBackend {
             &output,
         )
     }
+    /// Learned-edge softmax aggregation for graph-convolution edge mode 1.
+    fn graph_conv_learned_aggregate_f32(
+        &self,
+        input: &Self::Tensor,
+        edge_kernel: &Self::Tensor,
+        edge_biases: &Self::Tensor,
+        geometry: host_ops::graph_conv::GraphConvAggregationGeometry,
+        groups: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let output = host_ops::graph_conv::learned_aggregate_forward(
+            &self.download_f32(input)?,
+            &self.download_f32(edge_kernel)?,
+            &self.download_f32(edge_biases)?,
+            geometry,
+            groups,
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        self.upload_f32(
+            &[
+                geometry.batch,
+                geometry.channels,
+                geometry.output_height,
+                geometry.output_width,
+            ],
+            &output,
+        )
+    }
     /// Exact input adjoint of [`Self::graph_conv_aggregate_f32`].
     fn graph_conv_aggregate_backward_f32(
         &self,

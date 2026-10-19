@@ -56,6 +56,152 @@ pub mod kernels {
         }
     }
 
+    /// Learned edge scoring with invalid-neighbor masking before stable softmax.
+    #[kernel]
+    pub fn graph_learned_aggregate_fwd(
+        input: &[f32],
+        edge_kernel: &[f32],
+        edge_biases: &[f32],
+        mut output: DisjointSlice<f32>,
+        batch: usize,
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        output_height: usize,
+        output_width: usize,
+        size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        dilation: usize,
+        padding: usize,
+        groups: usize,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        let output_len = batch * channels * output_height * output_width;
+        if i >= output_len {
+            return;
+        }
+        let ox = i % output_width;
+        let oy = (i / output_width) % output_height;
+        let channel = (i / (output_width * output_height)) % channels;
+        let b = i / (output_width * output_height * channels);
+        let channels_per_group = channels / groups;
+        let group = channel / channels_per_group;
+        let channel_base = group * channels_per_group;
+        let kernel_area = size * size;
+        let center_edge = (size / 2) * size + size / 2;
+        let ref_y = oy as i64 * stride_y as i64 - padding as i64
+            + (center_edge / size) as i64 * dilation as i64;
+        let ref_x = ox as i64 * stride_x as i64 - padding as i64
+            + (center_edge % size) as i64 * dilation as i64;
+        let reference_valid =
+            ref_y >= 0 && ref_y < input_height as i64 && ref_x >= 0 && ref_x < input_width as i64;
+        let mut maximum = f32::NEG_INFINITY;
+        let mut edge = 0usize;
+        while edge < kernel_area {
+            let ky = edge / size;
+            let kx = edge % size;
+            let iy = oy as i64 * stride_y as i64 - padding as i64 + ky as i64 * dilation as i64;
+            let ix = ox as i64 * stride_x as i64 - padding as i64 + kx as i64 * dilation as i64;
+            if iy >= 0 && iy < input_height as i64 && ix >= 0 && ix < input_width as i64 {
+                let parameter = (group * kernel_area + edge) * 2 * channels_per_group;
+                let mut logit = edge_biases[group * kernel_area + edge];
+                let mut c = 0usize;
+                while c < channels_per_group {
+                    let neighbor = input[((b * channels + channel_base + c) * input_height
+                        + iy as usize)
+                        * input_width
+                        + ix as usize];
+                    let reference = if reference_valid {
+                        input[((b * channels + channel_base + c) * input_height + ref_y as usize)
+                            * input_width
+                            + ref_x as usize]
+                    } else {
+                        0.0
+                    };
+                    logit += edge_kernel[parameter + c] * reference
+                        + edge_kernel[parameter + channels_per_group + c] * neighbor;
+                    c += 1;
+                }
+                maximum = maximum.max(logit);
+            }
+            edge += 1;
+        }
+        let mut denominator = 0.0f32;
+        edge = 0;
+        while edge < kernel_area {
+            let ky = edge / size;
+            let kx = edge % size;
+            let iy = oy as i64 * stride_y as i64 - padding as i64 + ky as i64 * dilation as i64;
+            let ix = ox as i64 * stride_x as i64 - padding as i64 + kx as i64 * dilation as i64;
+            if iy >= 0 && iy < input_height as i64 && ix >= 0 && ix < input_width as i64 {
+                let parameter = (group * kernel_area + edge) * 2 * channels_per_group;
+                let mut logit = edge_biases[group * kernel_area + edge];
+                let mut c = 0usize;
+                while c < channels_per_group {
+                    let neighbor = input[((b * channels + channel_base + c) * input_height
+                        + iy as usize)
+                        * input_width
+                        + ix as usize];
+                    let reference = if reference_valid {
+                        input[((b * channels + channel_base + c) * input_height + ref_y as usize)
+                            * input_width
+                            + ref_x as usize]
+                    } else {
+                        0.0
+                    };
+                    logit += edge_kernel[parameter + c] * reference
+                        + edge_kernel[parameter + channels_per_group + c] * neighbor;
+                    c += 1;
+                }
+                denominator += (logit - maximum).exp();
+            }
+            edge += 1;
+        }
+        let mut aggregate = 0.0f32;
+        if denominator > 0.0 {
+            edge = 0;
+            while edge < kernel_area {
+                let ky = edge / size;
+                let kx = edge % size;
+                let iy = oy as i64 * stride_y as i64 - padding as i64 + ky as i64 * dilation as i64;
+                let ix = ox as i64 * stride_x as i64 - padding as i64 + kx as i64 * dilation as i64;
+                if iy >= 0 && iy < input_height as i64 && ix >= 0 && ix < input_width as i64 {
+                    let parameter = (group * kernel_area + edge) * 2 * channels_per_group;
+                    let mut logit = edge_biases[group * kernel_area + edge];
+                    let mut c = 0usize;
+                    while c < channels_per_group {
+                        let neighbor = input[((b * channels + channel_base + c) * input_height
+                            + iy as usize)
+                            * input_width
+                            + ix as usize];
+                        let reference = if reference_valid {
+                            input[((b * channels + channel_base + c) * input_height
+                                + ref_y as usize)
+                                * input_width
+                                + ref_x as usize]
+                        } else {
+                            0.0
+                        };
+                        logit += edge_kernel[parameter + c] * reference
+                            + edge_kernel[parameter + channels_per_group + c] * neighbor;
+                        c += 1;
+                    }
+                    let alpha = (logit - maximum).exp() / denominator;
+                    let value = input[((b * channels + channel) * input_height + iy as usize)
+                        * input_width
+                        + ix as usize];
+                    aggregate += alpha * value;
+                }
+                edge += 1;
+            }
+        }
+        if let Some(dst) = output.get_mut(idx) {
+            *dst = aggregate;
+        }
+    }
+
     /// Each input element gathers the adjoint contributions of all output sites
     /// for which it is a valid neighbor; no atomics or scratch buffer required.
     #[kernel]
