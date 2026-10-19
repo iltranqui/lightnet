@@ -229,6 +229,7 @@ reference tolerance is `TOL_COMPOSED = 1e-4` rather than the single-stage `2e-6`
 
 ## P8/P9 training follow-ups
 
+- [x] v0.2.090: compact f16 inference supports native Reorg forward/reverse permutations using shared checked geometry, including reverse zero-filled borders. Actual-Oxide batch-2 non-square odd-size output matched f32 (relative max error 4.646e-4); the full f16 suite passed 10 before a shape refinement, and the refined focused test passed. Inference only; no compiled-C++ golden. See `implemented.md` §117.
 - [x] v0.2.089: compact f16 inference supports `[channel_shuffle]` through a native Oxide half-storage permutation; actual-Oxide batch-2 output matched f32 (relative max error 2.437e-4), and the full `oxide_runtime_f16` suite passed 9 tests. Inference only; no compiled-C++ golden. See `implemented.md` §116.
 - [x] v0.2.088: compact f16 inference supports SAM for mapped activations through a native Oxide product/activation kernel. Fixed compact GPU source lifetime accounting for SAM's explicit `from` layer; actual-Oxide two-convolution/non-adjacent-source SAM matches f32 (relative max error 6.223e-4). `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed 8 tests. Inference only; no compiled-C++ golden. See `implemented.md` §115.
 - [x] v0.2.087: compact f16 `maxpool_depth` now uses a native half-storage Oxide kernel. Actual f16-vs-f32 parity passed within the full 7-test `oxide_runtime_f16` suite (relative max error 2.488e-4); no f16 training/backward or C++ golden claim. See `implemented.md` §113.

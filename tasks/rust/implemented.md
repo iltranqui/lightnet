@@ -142,6 +142,7 @@ file is named inline.
 - [114. Connected axis/layout contract pin](#114-connected-axislayout-contract-pin)
 - [115. Native f16 SAM inference](#115-native-f16-sam-inference)
 - [116. Native f16 channel shuffle inference](#116-native-f16-channel-shuffle-inference)
+- [117. Native f16 reorg inference](#117-native-f16-reorg-inference)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1775,6 +1776,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 116. Native f16 channel-shuffle inference
 
 - v0.2.089: added a native Oxide half-storage channel permutation and compact f16 runtime dispatch for `[channel_shuffle]`. Actual-Oxide batch-2/channel-6 output matches f32 compact inference with relative max error 2.437e-4; the full `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` suite passed 9 tests. This is inference only; no compiled-C++ golden.
+
+## 117. Native f16 reorg inference
+
+- v0.2.090: added native Oxide f16 forward and reverse reorg permutations, reusing the checked shared reorg geometry and preserving zero-filled uncovered borders on reverse. Compact f16 dispatch now accepts Reorg. Actual-Oxide batch-2 non-square odd-size forward+reverse case matched f32 compact inference with relative max error 4.646e-4; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed 10 tests before the fixture was refined, and the refined focused test passed. Inference only; no compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 
