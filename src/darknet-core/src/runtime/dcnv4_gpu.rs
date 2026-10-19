@@ -70,6 +70,118 @@ pub(super) fn descriptor(
 }
 
 #[derive(Clone, Debug)]
+struct ParameterSnapshot {
+    offset_weights: Vec<f32>,
+    offset_biases: Vec<f32>,
+    biases: Vec<f32>,
+    scales: Option<Vec<f32>>,
+}
+
+impl ParameterSnapshot {
+    fn matches(&self, other: &Self) -> bool {
+        fn same_values(a: &[f32], b: &[f32]) -> bool {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits())
+        }
+        same_values(&self.offset_weights, &other.offset_weights)
+            && same_values(&self.offset_biases, &other.offset_biases)
+            && same_values(&self.biases, &other.biases)
+            && match (&self.scales, &other.scales) {
+                (Some(a), Some(b)) => same_values(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DeviceParameters<T> {
+    snapshot: ParameterSnapshot,
+    pub(super) offset_weights: T,
+    pub(super) offset_biases: T,
+    pub(super) biases: T,
+    pub(super) scales: Option<T>,
+}
+
+pub(super) fn device_parameters<B: F32TensorOpsBackend>(
+    backend: &B,
+    cached: &mut Option<DeviceParameters<B::Tensor>>,
+    layer: &Layer,
+    spec: &Dcnv4Spec,
+    params: &Dcnv4Params,
+) -> Result<DeviceParameters<B::Tensor>>
+where
+    B::Error: std::fmt::Display,
+{
+    let desc = descriptor(layer, spec, params)?;
+    let snapshot = ParameterSnapshot {
+        offset_weights: params.offset_weights.clone(),
+        offset_biases: params.offset_biases.clone(),
+        biases: params.biases.clone(),
+        scales: params.batch_norm.as_ref().map(|bn| bn.scales.clone()),
+    };
+    if let Some(current) = cached
+        .as_ref()
+        .filter(|current| current.snapshot.matches(&snapshot))
+    {
+        return Ok(current.clone());
+    }
+    let shape = [spec.filters];
+    let value = DeviceParameters {
+        snapshot,
+        offset_weights: backend
+            .upload_f32(
+                &[
+                    desc.geometry.offset_dim(),
+                    desc.geometry.channels,
+                    spec.size,
+                    spec.size,
+                ],
+                &params.offset_weights,
+            )
+            .map_err(|err| backend_error("upload DCNv4 weights", err))?,
+        offset_biases: backend
+            .upload_f32(&[desc.geometry.offset_dim()], &params.offset_biases)
+            .map_err(|err| backend_error("upload DCNv4 offset biases", err))?,
+        biases: backend
+            .upload_f32(&shape, &params.biases)
+            .map_err(|err| backend_error("upload DCNv4 output biases", err))?,
+        scales: params
+            .batch_norm
+            .as_ref()
+            .map(|bn| {
+                backend
+                    .upload_f32(&shape, &bn.scales)
+                    .map_err(|err| backend_error("upload DCNv4 gamma", err))
+            })
+            .transpose()?,
+    };
+    *cached = Some(value.clone());
+    Ok(value)
+}
+
+pub(super) fn store_device_parameters<T>(
+    cached: &mut Option<DeviceParameters<T>>,
+    params: &Dcnv4Params,
+    offset_weights: T,
+    offset_biases: T,
+    biases: T,
+    scales: Option<T>,
+) {
+    *cached = Some(DeviceParameters {
+        snapshot: ParameterSnapshot {
+            offset_weights: params.offset_weights.clone(),
+            offset_biases: params.offset_biases.clone(),
+            biases: params.biases.clone(),
+            scales: params.batch_norm.as_ref().map(|bn| bn.scales.clone()),
+        },
+        offset_weights,
+        offset_biases,
+        biases,
+        scales,
+    });
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct ForwardCache<T> {
     raw: T,
     offsets: T,
@@ -82,6 +194,7 @@ pub(super) fn forward<B: F32TensorOpsBackend>(
     layer: &Layer,
     spec: &Dcnv4Spec,
     params: &Dcnv4Params,
+    device_params: &DeviceParameters<B::Tensor>,
 ) -> Result<(B::Tensor, B::Tensor, ForwardCache<B::Tensor>)>
 where
     B::Error: std::fmt::Display,
@@ -93,39 +206,50 @@ where
     }
     let cfg = ElementwiseLaunchConfig::default();
     let desc = descriptor(layer, spec, params)?;
-    let weights = backend
-        .upload_f32(&[params.offset_weights.len()], &params.offset_weights)
-        .map_err(|err| backend_error("upload DCNv4 weights", err))?;
-    let biases = backend
-        .upload_f32(&[params.offset_biases.len()], &params.offset_biases)
-        .map_err(|err| backend_error("upload DCNv4 offset biases", err))?;
     let (raw, offsets) = backend
-        .dcnv4_forward_f32(input, &weights, &biases, desc, cfg)
+        .dcnv4_forward_f32(
+            input,
+            &device_params.offset_weights,
+            &device_params.offset_biases,
+            desc,
+            cfg,
+        )
         .map_err(|err| backend_error("DCNv4 native raw forward", err))?;
     let pre = if let Some(bn) = &params.batch_norm {
         let normalized = normalized_raw(backend, &raw, bn, desc.geometry.spatial())?;
-        let gamma = backend
-            .upload_f32(&[bn.scales.len()], &bn.scales)
-            .map_err(|err| backend_error("upload DCNv4 gamma", err))?;
+        let gamma = device_params.scales.as_ref().ok_or_else(|| {
+            Error::InvalidConfig("DCNv4 BN gamma is missing from device parameters".to_owned())
+        })?;
         backend
             .channel_scale_f32(
                 &normalized,
-                &gamma,
+                gamma,
                 spec.filters,
                 desc.geometry.spatial(),
                 cfg,
             )
             .map_err(|err| backend_error("DCNv4 rolling BN scale", err))?
     } else {
-        let bias = backend
-            .upload_f32(&[params.biases.len()], &params.biases)
-            .map_err(|err| backend_error("upload DCNv4 output bias", err))?;
         backend
-            .bias_add_f32(&raw, &bias, spec.filters, desc.geometry.spatial(), cfg)
+            .bias_add_f32(
+                &raw,
+                &device_params.biases,
+                spec.filters,
+                desc.geometry.spatial(),
+                cfg,
+            )
             .map_err(|err| backend_error("DCNv4 bias add", err))?
     };
     let out = activation_output(backend, &pre, layer, spec)?;
-    Ok((out, pre, ForwardCache { raw, offsets, weights }))
+    Ok((
+        out,
+        pre,
+        ForwardCache {
+            raw,
+            offsets,
+            weights: device_params.offset_weights.clone(),
+        },
+    ))
 }
 
 pub(super) fn activation_output<B: F32TensorOpsBackend>(
@@ -360,17 +484,25 @@ where
             } else {
                 &forward.gpu_layer_outputs[layer.index - 1]
             };
-            let w = self
-                .backend
-                .upload_f32(&[params.offset_weights.len()], &params.offset_weights)
-                .map_err(|err| backend_error("upload DCNv4 stats weights", err))?;
-            let b = self
-                .backend
-                .upload_f32(&[params.offset_biases.len()], &params.offset_biases)
-                .map_err(|err| backend_error("upload DCNv4 stats biases", err))?;
+            let device_params = {
+                let mut caches = self.dcnv4_device_params.borrow_mut();
+                device_parameters(
+                    &self.backend,
+                    &mut caches[layer.index],
+                    layer,
+                    spec,
+                    params,
+                )?
+            };
             let (raw, _) = self
                 .backend
-                .dcnv4_forward_f32(input, &w, &b, desc, cfg)
+                .dcnv4_forward_f32(
+                    input,
+                    &device_params.offset_weights,
+                    &device_params.offset_biases,
+                    desc,
+                    cfg,
+                )
                 .map_err(|err| backend_error("DCNv4 raw stats recompute", err))?;
             let mean = self
                 .backend

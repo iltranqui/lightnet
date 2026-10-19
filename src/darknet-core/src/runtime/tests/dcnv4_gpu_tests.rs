@@ -67,6 +67,7 @@ fn dcnv4_gpu_adam_uses_sidecar_compatible_moments() {
         }
     }
     assert!(gpu.dcnv4_adam_state[0].is_some());
+    assert!(gpu.dcnv4_device_params.borrow()[0].is_some());
     assert!(gpu.host_adam_state.borrow()[0].is_none());
     let path = std::env::temp_dir().join(format!(
         "darknet-gpu-dcnv4-adam-{}.state",
@@ -386,20 +387,42 @@ fn dcnv4_channel_normalization_modes_and_edge_columns_match_reference() {
 }
 
 #[test]
-fn dcnv4_gpu_selects_native_math_without_host_cache() {
+fn dcnv4_gpu_reuses_parameter_uploads_and_invalidates_on_host_edits() {
     let network = dcnv4_network("", "");
-    let gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+    let mut gpu = GpuExecutableNetwork::new(network.clone(), CountingBackend::default());
     assert!(!gpu.requires_cpu_backward_fallback());
     let input = Tensor::filled(network.net.input_shape(), 0.2);
-    let forward = gpu.forward_training_with_state(&input).unwrap();
-    assert!(forward.cpu_forward.dcnv4_caches[0].is_none());
-    let cache = forward.gpu_dcnv4_caches[0].as_ref().unwrap();
+    let first = gpu.forward_training_with_state(&input).unwrap();
+    assert!(first.cpu_forward.dcnv4_caches[0].is_none());
+    let cache = first.gpu_dcnv4_caches[0].as_ref().unwrap();
     let LayerParams::Dcnv4(params) = &gpu.params[0] else {
         unreachable!()
     };
     assert_eq!(
         gpu.backend.download_f32(&cache.weights).unwrap(),
         params.offset_weights
+    );
+    let uploads_after_first = gpu.backend.upload_count();
+
+    let second = gpu.forward_training_with_state(&input).unwrap();
+    assert!(second.gpu_dcnv4_caches[0].is_some());
+    let uploads_after_second = gpu.backend.upload_count();
+    let first_uploads = uploads_after_first;
+    let second_uploads = uploads_after_second - uploads_after_first;
+    assert!(
+        second_uploads < first_uploads,
+        "repeated forward should reuse DCNv4 parameter tensors: first={first_uploads}, second={second_uploads}"
+    );
+
+    let LayerParams::Dcnv4(params) = &mut gpu.params[0] else {
+        unreachable!()
+    };
+    params.offset_weights[0] += 0.25;
+    gpu.forward_training_with_state(&input).unwrap();
+    let third_uploads = gpu.backend.upload_count() - uploads_after_second;
+    assert!(
+        third_uploads > second_uploads,
+        "a host parameter edit must invalidate and refresh cached tensors"
     );
 }
 
