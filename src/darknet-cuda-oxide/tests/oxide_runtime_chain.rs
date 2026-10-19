@@ -2646,6 +2646,7 @@ fn dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu() {
             (1, 1, "swish", 3, 2, 2),
             (0, 0, "leaky", 3, 2, 2),
             (0, 0, "leaky", 7, 3, 1),
+            (0, 0, "leaky", 9, 4, 1),
         ] {
             let net = network(&format!(
                 "[net]\nwidth=5\nheight=3\nchannels=2\nbatch=2\ntry_fix_nan=0\nadam={}\ndecay=0.01\n\
