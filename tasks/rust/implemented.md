@@ -88,6 +88,7 @@ file is named inline.
 - [60. Native act-head CLS adjoint scatter](#60-native-act-head-cls-adjoint-scatter)
 - [61. Native DCNv4 SGD optimizer update](#61-native-dcnv4-sgd-optimizer-update)
 - [62. Native DCNv4 Adam optimizer update](#62-native-dcnv4-adam-optimizer-update)
+- [63. Native Revleaky activation mapping](#63-native-revleaky-activation-mapping)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1488,6 +1489,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 62. Native DCNv4 Adam optimizer update
 
 - v0.2.025 (`7c96d45a`): eligible native DCNv4 Adam now applies offset projection and ordinary-bias/BN-scale updates through backend optimizer operations. First/second moments reuse the existing `HostAdamLayerState` layout and optimizer-sidecar serialization, uploaded for the device step and returned to the host state afterward; canonical parameters remain host-side. Layer-rate scaling, the 0.01 offset-projection LR factor, Adam/AdamW decay behavior, update gates and host fallback for mixed/unsupported networks are preserved. Evidence: `MEM=3G ./tools/test_host.sh dcnv4` passed 29 tests, including FakeBackend CPU parameter parity and optimizer-sidecar save/load round-trip; `MEM=3G ./tools/test_oxide.sh dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed on RTX 4060 (1 actual-GPU test, 255.16 s), covering two-step SGD/Adam parity with BN on/off and multiple DCNv4 sizes. No full suite, speedup, persistent parameter residency or compiled-C++ golden is claimed; broader CPU/GPU gaps, GPU Muon and sparse MoE remain open.
+
+## 63. Native Revleaky activation mapping
+
+- v0.2.026 (`fafa95ae`): map the source-derived `Activation::Revleaky` scalar semantics to the existing native Leaky f32 backend operation (same positive/negative slopes and non-positive branch), removing its unnecessary device-path rejection for all f32 GPU consumers. DCNv4 now exercises Revleaky through native runtime forward/backward and SGD/Adam updates in the real-device CPU-parity matrix. Evidence: `MEM=3G ./tools/test_host.sh dcnv4` passed 29 tests, including native selection/cache behavior; `MEM=3G ./tools/test_oxide.sh dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed 1 RTX 4060 test (262.86 s) with the added Revleaky case. No compiled-C++ golden, speedup, or full-suite claim; other GPU layer gaps and overall CPU/axis/Muon/sparse-MoE work remain.
 
 ## Not implemented / open (pointer)
 

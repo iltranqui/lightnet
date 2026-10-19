@@ -106,7 +106,7 @@ with the command given rather than trusting the number.
 | `Moe` | alias | C++ | fwd | exact | pin | native | device | no |
 | `EmlConvolutional` | alias | C++ | fwd | exact | pin | native | device / CPU (BN) | no |
 | `GraphConv` | alias | C++ | fwd | exact | T4 | none | none | no |
-| `Dcnv4` | alias | C++ | fwd | exact | pin | native (incl. rolling-stat BN, <=169 points, supported act) / host otherwise | mixed (native math and SGD/Adam update; Adam moments transfer through host sidecar) | no |
+| `Dcnv4` | alias | C++ | fwd | exact | pin | native (incl. rolling-stat BN, <=169 points, supported scalar/NormalizeChannels* acts incl. Revleaky) / host otherwise | mixed (native math and SGD/Adam update; Adam moments transfer through host sidecar) | no |
 | `DeformConv` | alias | C++ | fwd | exact | T4 | native (dilation 1, no BN) / host otherwise | native (same gate; one host hop for the normalization Jacobian) | no |
 | `DsConv` | alias | C++ | fwd | exact | T4 | none | none | no |
 | `Wmhf` | alias | C++ | fwd | exact | T4 | none | none | no |
@@ -204,7 +204,7 @@ layer count.
 | Variant | GPU forward | Missing backward piece |
 |---|---|---|
 | `Deconvolutional` | host round trip (`deconv_forward` on host) | device deconv dgrad/wgrad |
-| `Dcnv4` excluded/mixed variants | host round trip (>25 points, unsupported activation or another fallback layer) | remaining activations/large-kernel paths; eligible BN math native since v0.2.014, NormalizeChannels* activations since v0.2.015 |
+| `Dcnv4` excluded/mixed variants | host round trip (>169 points, unsupported activation or another fallback layer) | remaining unsupported/unknown activations and large-kernel paths; BN and NormalizeChannels* math native since v0.2.014/015; Revleaky native since v0.2.026 |
 | `Vit` | host round trip | device attention/MLP backward (flash dQ/dK/dV primitives exist) |
 | `Swin` | host round trip | device windowed-attention backward |
 | `TuckerAttention` | host round trip | device low-rank factor backward |
@@ -217,14 +217,15 @@ layer count.
 backward, gated on `dilation == 1` without batch norm. Its remaining limitation
 (one host hop for the batch-coupled normalization Jacobian) is recorded in the
 main matrix row instead.
-| `Connected` | native, but host round trip when activation is unsupported | device path for `revleaky` |
+| `Connected` | native, but host round trip when activation is unsupported | no separate Revleaky gap since its v0.2.026 mapping to Leaky |
 | `Rnn`/`Crnn` | device, but host when activation unsupported | device kernels for the remaining activations |
 | `Moe` | device | device path for unsupported expert activations |
 | `ScaleChannels` | device | device path for unsupported activations |
 
-Activation coverage is the quiet limiter: `model.rs:367` maps every activation
-to a device kind except `Revleaky` and the `NormalizeChannels*` family. So
-`convolutional` with `revleaky` also loses its GPU backward.
+Activation coverage is the quiet limiter: `model.rs:367` maps all scalar
+activations, including `Revleaky` (reusing the Leaky f32 op since v0.2.026),
+to device kinds. The `NormalizeChannels*` family uses separate tensor-level
+primitives; unknown `Other` values remain unsupported.
 
 `vc_attention` is worse than "forward only": it is host-reference on **all**
 devices and head sizes (no native kernel at all), even though standard
@@ -239,7 +240,7 @@ devices and head sizes (no native kernel at all), even though standard
 | Recurrent | device projections/BPTT, on-device caches and gradient accumulation without BN | BN forward/cache, rolling-stat update and optimizer remain host-side; some parameter-gradient transfers still cross the host |
 | DCNv4 | bounded native f32 forward/backward incl. rolling-stat BN and 0.9 EMA, NormalizeChannels* activations, device gradient accumulation and native SGD/Adam updates (v0.2.025); two-step CPU parity | other unsupported activations/large variants host; parameters remain host-canonical and Adam moments transfer through host sidecar; compact/f16 absent |
 | Shortcut (weighted) | device input/source gradients, exact normalization derivatives | per-input/per-slot weight gradient vector crosses to host; optimizer host-side |
-| Connected | device GEMM + activation, BN folded at inference | BN training and unsupported activations fall back |
+| Connected | device GEMM + activation, BN folded at inference | BN training and unsupported/unknown activations fall back |
 | `Crop`, `BatchNorm` | device inference | training explicitly rejected |
 | `MaxPool`, `LocalAvgPool` | device | `maxpool_depth` and channel-changing `local_avgpool` rejected |
 
