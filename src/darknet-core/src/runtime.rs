@@ -39040,6 +39040,53 @@ num_dwconv=1
     }
 
     #[test]
+    fn avgpool_axis_layout_reduces_spatial_per_channel_and_batch() {
+        // C++ `avgpool_layer.cpp:51` reduces each NCHW channel plane over H*W,
+        // keeping batch and channel as distinct output axes.
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "avgpool_axis.cfg",
+                "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\n[avgpool]\n",
+            )
+            .expect("avgpool cfg"),
+        )
+        .expect("avgpool network");
+        assert_eq!(network.layers[0].output_shape, TensorShape::new(1, 1, 2, 2));
+        let executable = ExecutableNetwork::new(network);
+        let input = Tensor::from_data(
+            TensorShape::new(3, 2, 2, 2),
+            vec![
+                1., 2., 3., 4., 5., 6., 10., 20., 30., 40., 50., 60.,
+                101., 102., 103., 104., 105., 106., 110., 120., 130., 140., 150., 160.,
+            ],
+        )
+        .expect("avgpool input");
+        let forward = executable.forward(&input).expect("avgpool forward");
+        assert_slice_close(
+            "avgpool NCHW output",
+            &[3.5, 35.0, 103.5, 135.0],
+            &forward.layer_outputs[0].data,
+            1e-6,
+        );
+        let seed = Tensor::from_data(
+            TensorShape::new(1, 1, 2, 2),
+            vec![1.0, 2.0, 3.0, 4.0],
+        )
+        .expect("avgpool seed");
+        let backward = executable
+            .backward(&input, &forward, &seed)
+            .expect("avgpool backward");
+        let expected = [vec![1.0 / 6.0; 6], vec![2.0 / 6.0; 6], vec![3.0 / 6.0; 6], vec![4.0 / 6.0; 6]]
+            .concat();
+        assert_slice_close(
+            "avgpool per-sample channel gradient",
+            &expected,
+            &backward.input_gradient.data,
+            1e-6,
+        );
+    }
+
+    #[test]
     fn maxpool_axis_layout_pins_depth_channel_batch_and_spatial_order() {
         // Hand-derived from `Jev_laya:src-lib/maxpool_layer.cpp:327`: output
         // group g scans input channels g, g+out_c, ... independently at each
