@@ -18,6 +18,7 @@ pub mod gemm_f16;
 pub mod gemm_f8;
 pub mod gemm_fp4;
 pub mod gemm_mma;
+pub mod graph_conv;
 pub mod half_ops;
 pub mod im2col;
 pub mod layers_extra;

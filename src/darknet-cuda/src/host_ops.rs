@@ -9,6 +9,7 @@ pub mod dcnv4;
 pub mod deform_conv;
 pub mod deconvolutional;
 pub mod gelu_erf;
+pub mod graph_conv;
 pub mod laya_act;
 pub mod local;
 pub mod marker_gather;

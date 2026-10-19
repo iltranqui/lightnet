@@ -5,6 +5,7 @@
 pub mod conv;
 mod deconvolutional;
 mod dcnv4_native;
+mod graph_conv;
 pub use dcnv4_native::Dcnv4NativeGradients;
 pub mod fp4;
 pub mod fp8;
@@ -97,6 +98,7 @@ pub struct OxideBackend {
     im2col: im2col::kernels::LoadedModule,
     conv_direct: conv_direct::kernels::LoadedModule,
     local: kernels::local::kernels::LoadedModule,
+    graph_conv: kernels::graph_conv::kernels::LoadedModule,
     deconvolutional: kernels::deconvolutional::kernels::LoadedModule,
     conv_implicit: conv_implicit::kernels::LoadedModule,
     route: route::kernels::LoadedModule,
@@ -520,6 +522,8 @@ impl OxideBackend {
             .map_err(|err| OxideError::Shape(format!("load conv_direct module: {err:?}")))?;
         let local = kernels::local::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load local module: {err:?}")))?;
+        let graph_conv = kernels::graph_conv::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load graph_conv module: {err:?}")))?;
         let deconvolutional = kernels::deconvolutional::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load deconvolutional module: {err:?}")))?;
         let conv_implicit = conv_implicit::kernels::load(&ctx)
@@ -583,6 +587,7 @@ impl OxideBackend {
             im2col,
             conv_direct,
             local,
+            graph_conv,
             deconvolutional,
             conv_implicit,
             route,
@@ -5482,6 +5487,24 @@ impl F32TensorOpsBackend for OxideBackend {
             ),
             OxideTensorF32::new(db, &[locations, filters]),
         ))
+    }
+
+    fn graph_conv_aggregate_f32(
+        &self,
+        input: &Self::Tensor,
+        geometry: darknet_cuda::host_ops::graph_conv::GraphConvAggregationGeometry,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        self.graph_conv_aggregate_forward_native(input, geometry, config)
+    }
+
+    fn graph_conv_aggregate_backward_f32(
+        &self,
+        output_gradient: &Self::Tensor,
+        geometry: darknet_cuda::host_ops::graph_conv::GraphConvAggregationGeometry,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        self.graph_conv_aggregate_backward_native(output_gradient, geometry, config)
     }
 
     fn conv2d_f32(

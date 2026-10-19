@@ -1296,6 +1296,48 @@ pub trait F32TensorOpsBackend {
             self.upload_f32(&[filters], &db)?,
         ))
     }
+    /// Uniform valid-neighbor aggregation for graph-convolution edge mode 0.
+    fn graph_conv_aggregate_f32(
+        &self,
+        input: &Self::Tensor,
+        geometry: host_ops::graph_conv::GraphConvAggregationGeometry,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let input = self.download_f32(input)?;
+        let output = host_ops::graph_conv::aggregate_forward(&input, geometry)
+            .unwrap_or_else(|err| panic!("{err}"));
+        self.upload_f32(
+            &[
+                geometry.batch,
+                geometry.channels,
+                geometry.output_height,
+                geometry.output_width,
+            ],
+            &output,
+        )
+    }
+    /// Exact input adjoint of [`Self::graph_conv_aggregate_f32`].
+    fn graph_conv_aggregate_backward_f32(
+        &self,
+        output_gradient: &Self::Tensor,
+        geometry: host_ops::graph_conv::GraphConvAggregationGeometry,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let output_gradient = self.download_f32(output_gradient)?;
+        let input_gradient = host_ops::graph_conv::aggregate_backward(&output_gradient, geometry)
+            .unwrap_or_else(|err| panic!("{err}"));
+        self.upload_f32(
+            &[
+                geometry.batch,
+                geometry.channels,
+                geometry.input_height,
+                geometry.input_width,
+            ],
+            &input_gradient,
+        )
+    }
     fn conv2d_f32(
         &self,
         x: &Self::Tensor,
