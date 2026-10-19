@@ -148,6 +148,15 @@ fn channel_shuffle_f16_inference_matches_f32() {
 }
 
 #[test]
+fn reorg_f16_forward_and_reverse_non_square_inference_match_f32() {
+    let cfg = "[net]\nwidth=5\nheight=3\nchannels=2\nbatch=2\n\
+        [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
+        [reorg]\nstride=2\n\
+        [reorg]\nstride=2\nreverse=1\n";
+    run_pair("reorg f16 forward+reverse", network(cfg), 43, 0.8, 4e-3);
+}
+
+#[test]
 fn sam_f16_inference_matches_f32() {
     let cfg = "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\n\
         [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\

@@ -8529,6 +8529,7 @@ where
                 | LayerKind::LayaMarkerGather(_)
                 | LayerKind::Sam(_)
                 | LayerKind::ChannelShuffle(_)
+                | LayerKind::Reorg(_)
                 | LayerKind::Upsample(_)
                 | LayerKind::Yolo(_)
                 | LayerKind::ObbYolo(_)
@@ -8818,6 +8819,17 @@ where
                         launch_config,
                     )
                     .map_err(|err| backend_error("f16 channel_shuffle", err))?,
+                (LayerKind::Reorg(spec), LayerParams::None) => self
+                    .backend
+                    .reorg_f16(
+                        current_input.expect("reorg requires current input"),
+                        &tensor_backend_shape(layer.input_shape),
+                        &tensor_backend_shape(layer.output_shape),
+                        spec.stride,
+                        spec.reverse,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("f16 reorg", err))?,
                 (LayerKind::Route(spec), LayerParams::None) => {
                     let mut route_inputs = Vec::with_capacity(spec.layers.len());
                     let mut route_channel_offsets = Vec::with_capacity(spec.layers.len());

@@ -1012,6 +1012,63 @@ impl OxideBackend {
         Ok(OxideTensorF16::new(output, output_shape))
     }
 
+    /// Native f16 reorg permutation; this is inference forward only.
+    pub fn reorg_f16(
+        &self,
+        x: &OxideTensorF16,
+        input_shape: &[usize],
+        output_shape: &[usize],
+        stride: usize,
+        reverse: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF16, OxideError> {
+        let dims = darknet_cuda::host_ops::reorg_dims(input_shape, output_shape, stride, reverse)
+            .map_err(|message| shape_err("reorg_f16", message))?;
+        let to_small = !reverse;
+        let (expected_input, output_len) = if to_small {
+            (dims.big_len(), dims.small_len())
+        } else {
+            (dims.small_len(), dims.big_len())
+        };
+        if x.shape() != input_shape || x.len() != expected_input {
+            return Err(shape_err("reorg_f16", format!("input has shape {:?} and {} elements, expected {input_shape:?} and {expected_input}", x.shape(), x.len())));
+        }
+        let mut output = self.alloc16_uninit(output_len)?;
+        // SAFETY: shared reorg_dims validation establishes all bounds; each
+        // output element is gathered once and reverse borders are zero-filled.
+        unsafe {
+            if to_small {
+                self.half_ops.reorg_to_small_f16(
+                    &self.stream,
+                    launch::elementwise(output_len, config),
+                    &x.buf,
+                    &mut output,
+                    dims.cb,
+                    dims.hb,
+                    dims.wb,
+                    dims.hs,
+                    dims.ws,
+                    dims.stride,
+                )
+            } else {
+                self.half_ops.reorg_to_big_f16(
+                    &self.stream,
+                    launch::elementwise(output_len, config),
+                    &x.buf,
+                    &mut output,
+                    dims.cb,
+                    dims.hb,
+                    dims.wb,
+                    dims.hs,
+                    dims.ws,
+                    dims.stride,
+                )
+            }
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF16::new(output, output_shape))
+    }
+
     /// `f16(act(x * scale[c] + bias[c]))` per channel (`c = (i / channel_stride) % channels`);
     /// `scale = None` is bias + activation only.  The folded inference batch norm.
     pub fn channel_affine_act_f16(
@@ -1385,6 +1442,18 @@ impl darknet_cuda::F16TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error> {
         OxideBackend::channel_shuffle_f16(self, x, output_shape, channels, groups, config)
+    }
+
+    fn reorg_f16(
+        &self,
+        x: &Self::TensorF16,
+        input_shape: &[usize],
+        output_shape: &[usize],
+        stride: usize,
+        reverse: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error> {
+        OxideBackend::reorg_f16(self, x, input_shape, output_shape, stride, reverse, config)
     }
 
     fn channel_affine_act_f16(

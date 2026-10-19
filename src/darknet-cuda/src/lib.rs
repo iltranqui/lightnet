@@ -3168,6 +3168,16 @@ pub trait F16TensorOpsBackend: F32TensorOpsBackend {
         groups: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error>;
+    /// Reorg permutation between spatially large and channel-expanded NCHW tensors.
+    fn reorg_f16(
+        &self,
+        x: &Self::TensorF16,
+        input_shape: &[usize],
+        output_shape: &[usize],
+        stride: usize,
+        reverse: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error>;
     /// `f16(activation(x * scale[c] + bias[c]))` per channel (`scale = None`:
     /// bias + activation only); `scale` / `bias` are f32 `[channels]`.
     fn channel_affine_act_f16(

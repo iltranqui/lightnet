@@ -190,6 +190,76 @@ pub mod kernels {
         }
     }
 
+    /// Big `[b,cb,hb,wb]` to small `[b,cb*s*s,hs,ws]` reorg.
+    #[kernel]
+    pub fn reorg_to_small_f16(
+        big: &[u16],
+        mut small: DisjointSlice<u16>,
+        cb: usize,
+        hb: usize,
+        wb: usize,
+        hs: usize,
+        ws: usize,
+        stride: usize,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= small.len() {
+            return;
+        }
+        let cs = cb * stride * stride;
+        let plane = hs * ws;
+        let bk = i / plane;
+        let r = i % plane;
+        let b = bk / cs;
+        let k = bk % cs;
+        let c2 = k % cb;
+        let off = k / cb;
+        let h2 = (r / ws) * stride + off / stride;
+        let w2 = (r % ws) * stride + off % stride;
+        if let Some(o) = small.get_mut(idx) {
+            *o = big[((b * cb + c2) * hb + h2) * wb + w2];
+        }
+    }
+
+    /// Small to big reorg, zero-filling uncovered bottom/right borders.
+    #[kernel]
+    pub fn reorg_to_big_f16(
+        small: &[u16],
+        mut big: DisjointSlice<u16>,
+        cb: usize,
+        hb: usize,
+        wb: usize,
+        hs: usize,
+        ws: usize,
+        stride: usize,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= big.len() {
+            return;
+        }
+        let plane = hb * wb;
+        let bc = i / plane;
+        let r = i % plane;
+        let b = bc / cb;
+        let c2 = bc % cb;
+        let h2 = r / wb;
+        let w2 = r % wb;
+        let j = h2 / stride;
+        let x = w2 / stride;
+        let value = if j >= hs || x >= ws {
+            0u16
+        } else {
+            let off = (h2 % stride) * stride + w2 % stride;
+            let k = off * cb + c2;
+            small[((b * cb * stride * stride + k) * hs + j) * ws + x]
+        };
+        if let Some(o) = big.get_mut(idx) {
+            *o = value;
+        }
+    }
+
     /// Same strided channel-slice copy as the f32 `route_copy`.
     #[kernel]
     pub fn route_copy_f16(
