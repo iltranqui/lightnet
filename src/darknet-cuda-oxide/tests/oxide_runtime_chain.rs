@@ -4779,3 +4779,79 @@ fn gpu_deconvolution_native_forward_backward_and_muon_match_cpu_across_steps() {
         );
     }
 }
+
+#[test]
+fn graph_conv_uniform_runtime_forward_backward_and_sgd_match_cpu() {
+    let net = network("[net]\nwidth=4\nheight=3\nchannels=2\nbatch=2\n[convolutional]\nfilters=2\nsize=1\nactivation=leaky\n[graph_conv]\nfilters=4\ngroups=2\nsize=3\npad=1\nedge_mode=0\ngraph_use_self=0\nactivation=leaky\n");
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let LayerParams::Convolutional(conv) = &mut cpu.params[0] else {
+        panic!("preceding convolution parameters expected");
+    };
+    conv.weights.copy_from_slice(&[0.2, -0.3, 0.4, 0.1]);
+    conv.biases.copy_from_slice(&[0.05, -0.02]);
+    let LayerParams::GraphConv(graph) = &mut cpu.params[1] else {
+        panic!("GraphConv parameters expected");
+    };
+    graph.projection.weights.copy_from_slice(&[0.3, -0.2, 0.1, 0.4]);
+    graph.projection.biases.copy_from_slice(&[0.01, -0.03, 0.02, 0.04]);
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("GPU train buffers");
+
+    let input = patterned(cpu.network.net.input_shape());
+    let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
+    let gpu_forward = gpu.forward_training_with_state(&input).expect("native GraphConv GPU forward");
+    for (index, (expected, actual)) in cpu_forward.layer_outputs.iter()
+        .zip(&gpu_forward.cpu_forward.layer_outputs).enumerate()
+    {
+        close(&format!("GraphConv chain output layer {index}"), &actual.data, &expected.data, 4e-5);
+    }
+
+    let output_shape = cpu.network.layers[1].output_shape;
+    let seed = Tensor::from_data(
+        output_shape,
+        (0..output_shape.batch * output_shape.element_count())
+            .map(|index| (index as f32 * 0.29).cos() * 0.2)
+            .collect(),
+    ).expect("GraphConv seed");
+    let seeds = [None, Some(seed)];
+    cpu.zero_train_buffers();
+    gpu.zero_train_buffers_gpu().expect("zero GPU buffers");
+    cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds).expect("CPU backward");
+    gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds).expect("native GraphConv GPU backward");
+    cpu.update_weights(0.01, 0.0, 0.0, 1);
+    gpu.update_weights_gpu(0.01, 0.0, 0.0, 1).expect("GraphConv host-staged optimizer update");
+
+    let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(gpu_conv)) =
+        (&cpu.params[0], &gpu.params[0])
+    else { panic!("preceding convolution parameters expected after update"); };
+    close("GraphConv upstream input-gradient weight", &gpu_conv.weights, &cpu_conv.weights, 5e-5);
+    close("GraphConv upstream input-gradient bias", &gpu_conv.biases, &cpu_conv.biases, 5e-5);
+    let (LayerParams::GraphConv(cpu_graph), LayerParams::GraphConv(gpu_graph)) =
+        (&cpu.params[1], &gpu.params[1])
+    else { panic!("GraphConv parameters expected after update"); };
+    close("GraphConv projection weight gradient", &gpu_graph.projection.weights, &cpu_graph.projection.weights, 5e-5);
+    close("GraphConv projection bias gradient", &gpu_graph.projection.biases, &cpu_graph.projection.biases, 5e-5);
+
+    cpu.network.net.adam = true;
+    gpu.network.net.adam = true;
+    cpu.zero_train_buffers();
+    gpu.zero_train_buffers_gpu().expect("zero GraphConv Adam buffers");
+    let cpu_forward = cpu.forward_training(&input).expect("CPU Adam forward");
+    let gpu_forward = gpu.forward_training_with_state(&input).expect("Oxide Adam forward");
+    let seeds = [None, Some(Tensor::filled(output_shape, 0.07))];
+    cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds).expect("CPU Adam backward");
+    gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds).expect("Oxide Adam backward");
+    cpu.update_weights_adam(0.01, 1).expect("CPU GraphConv Adam update");
+    gpu.update_weights_gpu(0.01, 0.9, 0.0, 1).expect("host-staged GraphConv Adam update");
+    let (LayerParams::Convolutional(cpu_conv), LayerParams::Convolutional(gpu_conv)) =
+        (&cpu.params[0], &gpu.params[0])
+    else { panic!("preceding convolution parameters expected after Adam"); };
+    close("GraphConv Adam upstream weights", &gpu_conv.weights, &cpu_conv.weights, 5e-5);
+    close("GraphConv Adam upstream biases", &gpu_conv.biases, &cpu_conv.biases, 5e-5);
+    let (LayerParams::GraphConv(cpu_graph), LayerParams::GraphConv(gpu_graph)) =
+        (&cpu.params[1], &gpu.params[1])
+    else { panic!("GraphConv parameters expected after Adam"); };
+    close("GraphConv Adam projection weights", &gpu_graph.projection.weights, &cpu_graph.projection.weights, 5e-5);
+    close("GraphConv Adam projection biases", &gpu_graph.projection.biases, &cpu_graph.projection.biases, 5e-5);
+}

@@ -95,6 +95,22 @@ fn has_host_only_deform(network: &Network) -> bool {
     })
 }
 
+/// Native GraphConv runtime currently covers uniform edge averaging without
+/// self projection or BN, for activations supported by the f32 backend.
+fn graph_conv_spec_needs_host(spec: &GraphConvSpec) -> bool {
+    spec.edge_mode != 0
+        || spec.use_self
+        || spec.batch_normalize
+        || (spec.activation.to_channel_normalization().is_none()
+            && spec.activation.to_cuda_f32_kind().is_none())
+}
+
+fn has_host_only_graph_conv(network: &Network) -> bool {
+    network.layers.iter().any(|layer| {
+        matches!(&layer.kind, LayerKind::GraphConv(spec) if graph_conv_spec_needs_host(spec))
+    })
+}
+
 fn reject_gpu_hyperbolic_foveation(network: &Network, operation: &str) -> Result<()> {
     if let Some(layer) = network.layers.iter().find(|layer| {
         matches!(
@@ -10894,18 +10910,6 @@ where
             .network
             .layers
             .iter()
-            .find(|layer| matches!(layer.kind, LayerKind::GraphConv(_)))
-        {
-            return Err(Error::UnsupportedLayer {
-                layer_index: layer.index,
-                name: "[graph_conv] GPU updates are not implemented in the Stage-1 CPU port"
-                    .to_owned(),
-            });
-        }
-        if let Some(layer) = self
-            .network
-            .layers
-            .iter()
             .find(|layer| matches!(layer.kind, LayerKind::DsConv(_)))
         {
             return Err(Error::UnsupportedLayer {
@@ -10979,10 +10983,11 @@ where
                         | LayerParams::EmlConvolutional(_)
                         | LayerParams::Dcnv4(_)
                         | LayerParams::DeformConv(_)
+                        | LayerParams::GraphConv(_)
                 )
             }) {
                 return Err(Error::InvalidConfig(
-                    "adam=1 on the GPU path supports convolutional, connected, local, shortcut, deform_conv, DCNv4, MoE, standalone batchnorm, ViT, Swin, Tucker attention, MambaVision, Kimi KDA, and GRU/RNN/LSTM/CRNN layers"
+                    "adam=1 on the GPU path supports convolutional, connected, local, shortcut, deform_conv, DCNv4, MoE, standalone batchnorm, ViT, Swin, Tucker attention, MambaVision, Kimi KDA, GraphConv, and GRU/RNN/LSTM/CRNN layers"
                         .to_string(),
                 ));
             }
@@ -11380,6 +11385,64 @@ where
                         &mut moments.biases,
                         adam,
                     )?;
+                }
+                (LayerParams::GraphConv(params), LayerTrainBuffers::GraphConv(train)) => {
+                    let moments =
+                        moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    apply_host_adam_convolutional(
+                        &mut params.projection,
+                        &mut train.projection,
+                        moments,
+                        adam,
+                    )?;
+                    match (&mut params.self_weights, &mut train.self_weight_updates) {
+                        (Some(weights), Some(updates)) => {
+                            apply_host_adam(
+                                weights,
+                                updates,
+                                &mut host_adam_child(moments, 0).weights,
+                                adam,
+                            )?;
+                        }
+                        (None, None) => {}
+                        _ => {
+                            return Err(Error::InvalidConfig(
+                                "GraphConv Adam self-weight mismatch".to_owned(),
+                            ));
+                        }
+                    }
+                    match (&mut params.edge_kernel, &mut train.edge_kernel_updates) {
+                        (Some(weights), Some(updates)) => {
+                            apply_host_adam(
+                                weights,
+                                updates,
+                                &mut host_adam_child(moments, 1).weights,
+                                adam,
+                            )?;
+                        }
+                        (None, None) => {}
+                        _ => {
+                            return Err(Error::InvalidConfig(
+                                "GraphConv Adam edge-kernel mismatch".to_owned(),
+                            ));
+                        }
+                    }
+                    match (&mut params.edge_biases, &mut train.edge_bias_updates) {
+                        (Some(biases), Some(updates)) => {
+                            apply_host_adam_non_weight(
+                                biases,
+                                updates,
+                                &mut host_adam_child(moments, 1).biases,
+                                adam,
+                            )?;
+                        }
+                        (None, None) => {}
+                        _ => {
+                            return Err(Error::InvalidConfig(
+                                "GraphConv Adam edge-bias mismatch".to_owned(),
+                            ));
+                        }
+                    }
                 }
                 (LayerParams::DeformConv(params), LayerTrainBuffers::DeformConv(train)) => {
                     let moments =
@@ -11924,6 +11987,38 @@ where
                         batch,
                     );
                 }
+                (LayerParams::GraphConv(params), LayerTrainBuffers::GraphConv(train)) => {
+                    let layer_lr = lr * layer.train.learning_rate_scale;
+                    update_convolutional_params(
+                        &mut params.projection,
+                        &mut train.projection,
+                        layer_lr,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                    match (&mut params.self_weights, &mut train.self_weight_updates) {
+                        (Some(weights), Some(updates)) => {
+                            sgd_update(weights, updates, layer_lr, momentum, decay, batch);
+                        }
+                        (None, None) => {}
+                        _ => unreachable!("validated GraphConv self-weight buffers"),
+                    }
+                    match (&mut params.edge_kernel, &mut train.edge_kernel_updates) {
+                        (Some(weights), Some(updates)) => {
+                            sgd_update(weights, updates, layer_lr, momentum, decay, batch);
+                        }
+                        (None, None) => {}
+                        _ => unreachable!("validated GraphConv edge-kernel buffers"),
+                    }
+                    match (&mut params.edge_biases, &mut train.edge_bias_updates) {
+                        (Some(biases), Some(updates)) => {
+                            sgd_update(biases, updates, layer_lr, momentum, 0.0, batch);
+                        }
+                        (None, None) => {}
+                        _ => unreachable!("validated GraphConv edge-bias buffers"),
+                    }
+                }
                 (LayerParams::DeformConv(params), LayerTrainBuffers::DeformConv(train)) => {
                     let layer_lr = lr * layer.train.learning_rate_scale;
                     update_convolutional_params(
@@ -12372,32 +12467,22 @@ where
         // Device `[deform_conv]` covers dilation 1 without batch norm; anything
         // else keeps the host path, and the decision is global so the forward
         // and the backward can never disagree about which path ran.
-        let has_host_only_deform = has_host_only_deform(&self.network);
+        let host_only_deform = has_host_only_deform(&self.network);
         let host_copies = host_copies
             || self.requires_cpu_backward_fallback()
             || has_batch_normalized_recurrent
-            || has_host_only_deform;
+            || host_only_deform
+            || has_host_only_graph_conv(&self.network);
         // Path selection for both deformable families must match the backward's
         // gate exactly; independent of whether host copies are retained.
         // DCNv4's own unsupported variants are in requires_cpu_backward_fallback.
-        let deform_device = !self.requires_cpu_backward_fallback() && !has_host_only_deform;
+        let deform_device = !self.requires_cpu_backward_fallback() && !host_only_deform;
         let expected = self.network.net.input_shape();
         if input.shape != expected {
             return Err(Error::InvalidConfig(format!(
                 "input shape mismatch: expected {expected}, got {}",
                 input.shape
             )));
-        }
-        if let Some(layer) = self
-            .network
-            .layers
-            .iter()
-            .find(|layer| matches!(layer.kind, LayerKind::GraphConv(_)))
-        {
-            return Err(Error::UnsupportedLayer {
-                layer_index: layer.index,
-                name: "[graph_conv] GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path".to_owned(),
-            });
         }
         if let Some(layer) = self
             .network
@@ -12477,6 +12562,7 @@ where
         let mut gpu_lstm_caches = Vec::with_capacity(self.network.layers.len());
         let mut gpu_moe_caches = Vec::with_capacity(self.network.layers.len());
         let mut gpu_eml_caches = Vec::with_capacity(self.network.layers.len());
+        let mut graph_conv_caches = Vec::with_capacity(self.network.layers.len());
         let mut dropout_masks = Vec::with_capacity(self.network.layers.len());
         let mut crop_caches = Vec::with_capacity(self.network.layers.len());
         let mut moe_caches: Vec<Option<MoeForwardCache>> = Vec::new();
@@ -12535,6 +12621,7 @@ where
             let mut gpu_lstm_cache = None;
             let mut gpu_moe_cache = None;
             let mut gpu_eml_cache = None;
+            let mut graph_conv_cache = None;
             let output_gpu = match (&layer.kind, params) {
                 (
                     LayerKind::Convolutional(spec),
@@ -13036,6 +13123,117 @@ where
                     self.backend
                         .upload_f32(&tensor_backend_shape(layer.output_shape), &probs)
                         .map_err(|err| backend_error("upload laya_loss output", err))?
+                }
+                (LayerKind::GraphConv(spec), LayerParams::GraphConv(params)) => {
+                    if graph_conv_spec_needs_host(spec)
+                        || self.requires_cpu_backward_fallback()
+                        || has_host_only_deform(&self.network)
+                    {
+                        let current_host = if layer.index == 0 {
+                            input
+                        } else {
+                            layer_outputs.get(layer.index - 1).ok_or_else(|| {
+                                Error::InvalidConfig(format!(
+                                    "missing host input for GraphConv fallback layer #{}",
+                                    layer.index
+                                ))
+                            })?
+                        };
+                        let (host_output, host_activation, cache) = forward_graph_conv_with_cache(
+                            spec,
+                            params,
+                            current_host,
+                            layer.output_shape,
+                            training,
+                        )?;
+                        graph_conv_cache = Some(cache);
+                        activation_input_gpu = Some(
+                            self.backend
+                                .upload_f32(
+                                    &tensor_backend_shape(layer.output_shape),
+                                    &host_activation.data,
+                                )
+                                .map_err(|err| {
+                                    backend_error("upload GraphConv fallback activation", err)
+                                })?,
+                        );
+                        self.backend
+                            .upload_f32(
+                                &tensor_backend_shape(layer.output_shape),
+                                &host_output.data,
+                            )
+                            .map_err(|err| backend_error("upload GraphConv fallback output", err))?
+                    } else {
+                        let geometry = graph_conv_aggregation_geometry(
+                            spec,
+                            layer.input_shape,
+                            layer.output_shape,
+                        );
+                        let aggregate = self
+                            .backend
+                            .graph_conv_aggregate_f32(current_input, geometry, launch_config)
+                            .map_err(|err| backend_error("GraphConv uniform aggregation", err))?;
+                        let groups = spec.groups.max(1);
+                        let weight_shape = [spec.filters, layer.input_shape.channels / groups, 1, 1];
+                        let weights = self
+                            .backend
+                            .upload_f32(&weight_shape, &params.projection.weights)
+                            .map_err(|err| backend_error("upload GraphConv projection weights", err))?;
+                        let raw = self
+                            .backend
+                            .conv2d_f32(
+                                &aggregate,
+                                &weights,
+                                &tensor_backend_shape(layer.output_shape),
+                                layer.input_shape.channels,
+                                layer.output_shape.height,
+                                layer.output_shape.width,
+                                spec.filters,
+                                1,
+                                1,
+                                1,
+                                1,
+                                0,
+                                groups,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("GraphConv pointwise projection", err))?;
+                        let biases = self
+                            .backend
+                            .upload_f32(&[spec.filters], &params.projection.biases)
+                            .map_err(|err| backend_error("upload GraphConv projection biases", err))?;
+                        let biased = self
+                            .backend
+                            .bias_add_f32(
+                                &raw,
+                                &biases,
+                                spec.filters,
+                                layer.output_shape.width * layer.output_shape.height,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("GraphConv projection bias", err))?;
+                        activation_input_gpu = Some(biased.clone());
+                        if let Some(normalization) = spec.activation.to_channel_normalization() {
+                            self.backend
+                                .normalize_channels_f32(
+                                    &biased,
+                                    &tensor_backend_shape(layer.output_shape),
+                                    layer.output_shape.batch,
+                                    layer.output_shape.channels,
+                                    layer.output_shape.width * layer.output_shape.height,
+                                    normalization,
+                                    launch_config,
+                                )
+                                .map_err(|err| {
+                                    backend_error("GraphConv channel normalization", err)
+                                })?
+                        } else {
+                            let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+                            self.backend
+                                .activation_f32(&biased, activation, launch_config)
+                                .map_err(|err| backend_error("GraphConv activation", err))?
+                        }
+                    }
                 }
                 (LayerKind::Dcnv4(spec), LayerParams::Dcnv4(params)) => {
                     if deform_device {
@@ -14521,6 +14719,7 @@ where
             gpu_lstm_caches.push(gpu_lstm_cache);
             gpu_moe_caches.push(gpu_moe_cache);
             gpu_eml_caches.push(gpu_eml_cache);
+            graph_conv_caches.push(graph_conv_cache);
             if recurrent_caches.len() < layer_outputs.len() {
                 recurrent_caches.push(None);
             }
@@ -14560,7 +14759,7 @@ where
                 dcnv4_caches,
                 deform_conv_caches,
                 dsconv_caches: vec![None; self.network.layers.len()],
-                graph_conv_caches: vec![None; self.network.layers.len()],
+                graph_conv_caches,
                 wmhf_caches: vec![None; self.network.layers.len()],
                 clifford_caches: vec![None; self.network.layers.len()],
                 recursive_block_caches: vec![None; self.network.layers.len()],
@@ -14622,7 +14821,7 @@ where
         {
             return Err(Error::UnsupportedLayer {
                 layer_index: layer.index,
-                name: "[graph_conv] GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path".to_owned(),
+                name: "[graph_conv] compact GPU execution is unsupported; use f32 GPU forward".to_owned(),
             });
         }
         if let Some(layer) = self
@@ -15506,6 +15705,186 @@ where
                     self.accumulate_previous_gpu_gradient(
                         layer.index,
                         input_grad,
+                        &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::GraphConv(spec), Some(LayerParams::GraphConv(params))) => {
+                    if graph_conv_spec_needs_host(spec) {
+                        return Err(Error::InvalidConfig(format!(
+                            "native GraphConv backward reached unsupported layer #{}",
+                            layer.index
+                        )));
+                    }
+                    let activation_input = forward.gpu_layer_activation_inputs[layer.index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing GPU activation cache for GraphConv layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let delta = if let Some(normalization) = spec.activation.to_channel_normalization()
+                    {
+                        self.backend
+                            .normalize_channels_backward_f32(
+                                activation_input,
+                                &forward.gpu_layer_outputs[layer.index],
+                                &grad,
+                                &tensor_backend_shape(layer.output_shape),
+                                layer.output_shape.batch,
+                                layer.output_shape.channels,
+                                layer.output_shape.width * layer.output_shape.height,
+                                normalization,
+                                GradMode::from_env() == GradMode::Cpp,
+                                config,
+                            )
+                            .map_err(|err| {
+                                backend_error("GraphConv channel-normalization backward", err)
+                            })?
+                    } else {
+                        let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+                        self.backend
+                            .activation_backward_f32(activation_input, &grad, activation, config)
+                            .map_err(|err| backend_error("GraphConv activation backward", err))?
+                    };
+                    let groups = spec.groups.max(1);
+                    let current_input = if layer.index == 0 {
+                        &forward.input_gpu
+                    } else {
+                        &forward.gpu_layer_outputs[layer.index - 1]
+                    };
+                    let aggregate = self
+                        .backend
+                        .graph_conv_aggregate_f32(
+                            current_input,
+                            graph_conv_aggregation_geometry(
+                                spec,
+                                layer.input_shape,
+                                layer.output_shape,
+                            ),
+                            config,
+                        )
+                        .map_err(|err| backend_error("GraphConv backward aggregation", err))?;
+                    let weights = self
+                        .backend
+                        .upload_f32(
+                            &[
+                                spec.filters,
+                                layer.input_shape.channels / groups,
+                                1,
+                                1,
+                            ],
+                            &params.projection.weights,
+                        )
+                        .map_err(|err| backend_error("upload GraphConv backward weights", err))?;
+                    let aggregate_shape = [
+                        layer.input_shape.batch,
+                        layer.input_shape.channels,
+                        layer.output_shape.height,
+                        layer.output_shape.width,
+                    ];
+                    let bias_gradient = self
+                        .backend
+                        .bias_backward_f32(
+                            &delta,
+                            spec.filters,
+                            layer.output_shape.width * layer.output_shape.height,
+                            config,
+                        )
+                        .map_err(|err| backend_error("GraphConv bias backward", err))?;
+                    let weight_gradient = self
+                        .backend
+                        .conv2d_backward_weights_f32(
+                            &aggregate,
+                            &delta,
+                            &[
+                                spec.filters,
+                                layer.input_shape.channels / groups,
+                                1,
+                                1,
+                            ],
+                            layer.input_shape.channels,
+                            layer.output_shape.height,
+                            layer.output_shape.width,
+                            spec.filters,
+                            1,
+                            1,
+                            1,
+                            1,
+                            0,
+                            groups,
+                            config,
+                        )
+                        .map_err(|err| backend_error("GraphConv weight backward", err))?;
+                    let aggregate_gradient = self
+                        .backend
+                        .conv2d_backward_input_f32(
+                            &delta,
+                            &weights,
+                            &aggregate_shape,
+                            layer.input_shape.channels,
+                            layer.output_shape.height,
+                            layer.output_shape.width,
+                            spec.filters,
+                            1,
+                            1,
+                            1,
+                            1,
+                            0,
+                            groups,
+                            config,
+                        )
+                        .map_err(|err| backend_error("GraphConv projection input backward", err))?;
+                    let input_gradient = self
+                        .backend
+                        .graph_conv_aggregate_backward_f32(
+                            &aggregate_gradient,
+                            graph_conv_aggregation_geometry(
+                                spec,
+                                layer.input_shape,
+                                layer.output_shape,
+                            ),
+                            config,
+                        )
+                        .map_err(|err| backend_error("GraphConv aggregation backward", err))?;
+                    let weight_values = self
+                        .backend
+                        .download_f32(&weight_gradient)
+                        .map_err(|err| backend_error("download GraphConv weight gradient", err))?;
+                    let bias_values = self
+                        .backend
+                        .download_f32(&bias_gradient)
+                        .map_err(|err| backend_error("download GraphConv bias gradient", err))?;
+                    {
+                        let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
+                        let Some(LayerTrainBuffers::GraphConv(train)) =
+                            buffers.get_mut(layer.index)
+                        else {
+                            return Err(Error::InvalidConfig(format!(
+                                "missing GraphConv host gradient buffers for layer #{}",
+                                layer.index
+                            )));
+                        };
+                        for (dst, src) in train
+                            .projection
+                            .weight_updates
+                            .iter_mut()
+                            .zip(weight_values)
+                        {
+                            *dst += src;
+                        }
+                        for (dst, src) in train
+                            .projection
+                            .bias_updates
+                            .iter_mut()
+                            .zip(bias_values)
+                        {
+                            *dst += src;
+                        }
+                    }
+                    self.accumulate_previous_gpu_gradient(
+                        layer.index,
+                        input_gradient,
                         &mut layer_output_gradients,
                     )?;
                 }
@@ -17786,6 +18165,7 @@ where
                         return true;
                     }
                 }
+                LayerKind::GraphConv(spec) if graph_conv_spec_needs_host(spec) => return true,
                 _ => {}
             }
             if let LayerKind::ScaleChannels(spec) = &layer.kind
@@ -25453,6 +25833,26 @@ fn forward_dsconv_with_cache(
     }
     apply_convolution_channel_normalization(&mut output, &activation_input, &spec.activation);
     Ok((output, activation_input, DsConvRuntimeCache { math }))
+}
+
+fn graph_conv_aggregation_geometry(
+    spec: &GraphConvSpec,
+    input: TensorShape,
+    output: TensorShape,
+) -> darknet_cuda::host_ops::graph_conv::GraphConvAggregationGeometry {
+    darknet_cuda::host_ops::graph_conv::GraphConvAggregationGeometry {
+        batch: input.batch,
+        channels: input.channels,
+        input_height: input.height,
+        input_width: input.width,
+        output_height: output.height,
+        output_width: output.width,
+        size: spec.size,
+        stride_x: spec.stride_x,
+        stride_y: spec.stride_y,
+        dilation: spec.dilation,
+        padding: spec.padding,
+    }
 }
 
 fn forward_graph_conv_with_cache(
@@ -33151,7 +33551,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_conv_runtime_nchw_backward_and_gpu_execution_gate() {
+    fn graph_conv_runtime_nchw_backward_and_gpu_host_fallback_updates_match_cpu() {
         let network = Network::from_config(
             ConfigFile::parse_str(
                 "graph-conv-runtime.cfg",
@@ -33203,22 +33603,25 @@ mod tests {
         assert_eq!(gradient.self_weights.as_deref(), Some(&[10.0][..]));
 
         let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
-        let error = gpu
-            .forward(&input)
-            .expect_err("Stage-1 graph_conv must reject GPU execution");
-        assert!(
-            error
-                .to_string()
-                .contains("[graph_conv] GPU execution is not implemented in the Stage-1 CPU port")
+        gpu.params = cpu.params.clone();
+        let gpu_forward = gpu.forward_training_with_state(&input).unwrap();
+        assert_eq!(
+            gpu_forward.cpu_forward.layer_outputs[0].data,
+            forward.layer_outputs[0].data
         );
-        let error = gpu
-            .update_weights_gpu(0.01, 0.9, 0.0, 1)
-            .expect_err("Stage-1 graph_conv must reject GPU updates");
-        assert!(
-            error
-                .to_string()
-                .contains("[graph_conv] GPU updates are not implemented in the Stage-1 CPU port")
-        );
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu().unwrap();
+        let seeds = [Some(seed.clone())];
+        cpu.backward_accumulate_seeded(&input, &forward, &seeds).unwrap();
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds).unwrap();
+        cpu.update_weights(0.01, 0.9, 0.0, 1);
+        gpu.update_weights_gpu(0.01, 0.9, 0.0, 1).unwrap();
+        let (LayerParams::GraphConv(cpu_params), LayerParams::GraphConv(gpu_params)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("GraphConv parameters expected after GPU update");
+        };
+        assert_eq!(cpu_params, gpu_params);
     }
 
     #[test]
