@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.020 (`c99f83d8`): DCNv4 native/runtime bound now covers 13x13 (169 points), with real-GPU composition output/gradient parity and two-step SGD/Adam CPU parity, BN on/off. Focused oxide tests and host DCNv4 28 pass; >169 remains host fallback. No compiled-C++ or performance claim.
 - v0.2.019 (`76242245`): DCNv4 native/runtime bound is now 121 active points (11x11); real-GPU composition and two-step SGD/Adam CPU parity pass with BN on/off. >121 and unsupported variants retain host fallback; no compiled-C++/performance claim.
 - v0.2.018 (`613b243e`): native DCNv4 supports through 9x9/81 points, with real-GPU composition and two-step runtime SGD/Adam CPU parity (BN on/off). Oxide composition, runtime-chain target and host `dcnv4` (28) pass. >81 and unsupported variants remain host fallback; no compiled-C++ or speedup claim.
 - v0.2.017 (`8a3ef3b0`): actual GPU runtime 7x7 DCNv4 two-step SGD/Adam parity with CPU, BN on/off; native-path/fallback exclusion and parameter movement are covered. Targeted oxide runtime test passed (1, ~108 s). >7x7 remains host; no compiled-C++ or performance claim.

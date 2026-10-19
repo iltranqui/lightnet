@@ -82,6 +82,7 @@ file is named inline.
 - [54. DCNv4 7x7 runtime optimizer parity](#54-dcnv4-7x7-runtime-optimizer-parity)
 - [55. Extend native DCNv4 runtime through 9x9](#55-extend-native-dcnv4-runtime-through-9x9)
 - [56. Extend native DCNv4 runtime through 11x11](#56-extend-native-dcnv4-runtime-through-11x11)
+- [57. Extend native DCNv4 runtime through 13x13](#57-extend-native-dcnv4-runtime-through-13x13)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1458,6 +1459,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 56. Extend native DCNv4 runtime through 11x11
 
 - v0.2.019 (`76242245`): enlarged the native fixed mask capacity/runtime gate from 81 to 121 active points. 11x11 real-GPU composition matches CPU output and all math gradients; runtime two-step SGD/Adam parity passes with BN on/off, and the >121 host-fallback fixture uses 13x13. Gates: focused `oxide_dcnv4_chain` composition test passed, `oxide_runtime_chain` DCNv4 optimizer test passed (~186 s), and `MEM=3G ./tools/test_host.sh dcnv4` passed 28 core tests. No compiled-C++ or performance claim; >121/unsupported variants remain host fallback.
+
+## 57. Extend native DCNv4 runtime through 13x13
+
+- v0.2.020 (`c99f83d8`): increased the native fixed mask capacity/runtime gate from 121 to 169 active points. 13x13 real-GPU composition matches CPU outputs and all math gradients; runtime two-step SGD/Adam parity passes with BN on/off, and >169 remains host fallback (exclusion fixture is 15x15). Evidence: focused `oxide_dcnv4_chain` composition and `oxide_runtime_chain` DCNv4 optimizer tests passed; `MEM=3G ./tools/test_host.sh dcnv4` passed 28 core tests. No compiled-C++ or performance claim.
 
 ## Not implemented / open (pointer)
 
