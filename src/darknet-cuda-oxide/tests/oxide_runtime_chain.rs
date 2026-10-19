@@ -3892,6 +3892,85 @@ fn gpu_muon_local_location_matrices_match_cpu_across_steps() {
 }
 
 #[test]
+fn gpu_muon_crnn_device_matrices_match_cpu_across_steps() {
+    let net = network(
+        "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=2\ntime_steps=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0001\n\
+         [crnn]\nhidden=3\noutput=2\nsize=1\nstride=1\nactivation=tanh\nshortcut=1\nbatch_normalize=1\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    darknet_core::initialize_training_params(&net, &mut cpu.params, 79);
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("CRNN Muon train buffers");
+
+    for step in 1..=2 {
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu().expect("zero CRNN Muon buffers");
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu
+            .forward_training(&input)
+            .expect("CPU CRNN Muon forward");
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("Oxide CRNN Muon forward");
+        for (cpu_output, gpu_output) in cpu_forward
+            .layer_outputs
+            .iter()
+            .zip(&gpu_forward.cpu_forward.layer_outputs)
+        {
+            close(
+                &format!("CRNN Muon step {step} forward"),
+                &cpu_output.data,
+                &gpu_output.data,
+                3e-4,
+            );
+        }
+        let output_shape = cpu.network.layers[0].output_shape;
+        let seed = Tensor::filled(output_shape, 0.014 + step as f32 * 0.003);
+        let seeds = [Some(seed)];
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU CRNN Muon backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("Oxide CRNN Muon backward");
+        cpu.update_weights_muon(0.02, 2)
+            .expect("CPU CRNN Muon update");
+        gpu.update_weights_gpu(0.02, 0.9, net.net.decay, 2)
+            .expect("GPU CRNN Muon update");
+        let (LayerParams::Crnn(cpu_crnn), LayerParams::Crnn(gpu_crnn)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("CRNN parameter layout expected");
+        };
+        for (name, cpu_projection, gpu_projection) in [
+            ("input", &cpu_crnn.input, &gpu_crnn.input),
+            ("self", &cpu_crnn.self_params, &gpu_crnn.self_params),
+            ("output", &cpu_crnn.output, &gpu_crnn.output),
+        ] {
+            close(
+                &format!("CRNN Muon {name} weights step {step}"),
+                &gpu_projection.weights,
+                &cpu_projection.weights,
+                1e-3,
+            );
+            close(
+                &format!("CRNN Muon {name} biases step {step}"),
+                &gpu_projection.biases,
+                &cpu_projection.biases,
+                1e-3,
+            );
+            let cpu_bn = cpu_projection.batch_norm.as_ref().expect("CPU CRNN BN");
+            let gpu_bn = gpu_projection.batch_norm.as_ref().expect("GPU CRNN BN");
+            close(
+                &format!("CRNN Muon {name} BN scales step {step}"),
+                &gpu_bn.scales,
+                &cpu_bn.scales,
+                1e-3,
+            );
+        }
+    }
+}
+
+#[test]
 fn gpu_muon_rnn_device_matrices_match_cpu_across_steps() {
     let net = network(
         "[net]\ninputs=2\nbatch=2\ntime_steps=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0001\n\

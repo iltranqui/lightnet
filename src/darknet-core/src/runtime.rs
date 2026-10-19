@@ -10365,6 +10365,7 @@ where
                         | (LayerKind::Local(_), LayerParams::Local(_))
                         | (LayerKind::Rnn(_), LayerParams::Rnn(_))
                         | (LayerKind::Lstm(_), LayerParams::Lstm(_))
+                        | (LayerKind::Crnn(_), LayerParams::Crnn(_))
                         | (LayerKind::Vit(_), LayerParams::Vit(_))
                         | (LayerKind::Swin(_), LayerParams::Swin(_))
                         | (LayerKind::TuckerAttention(_), LayerParams::TuckerAttention(_))
@@ -10382,7 +10383,7 @@ where
         }) {
             return Err(Error::UnsupportedLayer {
                 layer_index: index,
-                name: "GPU Muon supports standard convolution, EML, MoE, DCNv4, and deform_conv matrices without BN via host-staged gradients, GraphConv matrices including BN through the existing CPU fallback, plus host-gradient local/RNN/LSTM/Kimi/MambaVision/Tucker/Swin/ViT/deconvolutional/connected matrices and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
+                name: "GPU Muon supports standard convolution, EML, MoE, DCNv4, and deform_conv matrices without BN via host-staged gradients, GraphConv matrices including BN through the existing CPU fallback, plus host-gradient local/RNN/LSTM/CRNN/Kimi/MambaVision/Tucker/Swin/ViT/deconvolutional/connected matrices and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
             });
         }
         let step = self.adam_step.checked_add(1).ok_or_else(|| {
