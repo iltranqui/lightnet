@@ -84,6 +84,7 @@ file is named inline.
 - [56. Extend native DCNv4 runtime through 11x11](#56-extend-native-dcnv4-runtime-through-11x11)
 - [57. Extend native DCNv4 runtime through 13x13](#57-extend-native-dcnv4-runtime-through-13x13)
 - [58. Retain native DCNv4 forward cache for backward](#58-retain-native-dcnv4-forward-cache-for-backward)
+- [59. Native DCNv4 gradient accumulation](#59-native-dcnv4-gradient-accumulation)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1468,6 +1469,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 58. Retain native DCNv4 forward cache for backward
 
 - v0.2.021 (`7a262a13`): store each native GPU forward's raw aggregation and dense offsets in its `GpuForwardState`; backward consumes that exact cache instead of re-uploading offset biases and recomputing projection/upsampling/aggregation. CPU fallback caches remain separate, and host-resident parameters/gradients/optimizer are unchanged. Per-forward ownership is covered by existing multiple-forward/microbatch tests, with explicit native-cache presence assertions. Gates: `MEM=3G ./tools/test_host.sh dcnv4` passed 28 core tests; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed on the RTX 4060 (1 test, 226 seconds). No speedup measured or claimed; full runtime chain/corpus not run.
+
+## 59. Native DCNv4 gradient accumulation
+
+- v0.2.022 (`27ab3cfb`): native DCNv4 backward now retains bias, offset-weight, offset-bias and optional BN-scale gradients as device tensors and accumulates them on-device across microbatches. No parameter-gradient downloads occur during backward; gradients transfer once at the host optimizer boundary, where existing SGD/Adam logic and parameter residency remain unchanged. The first gradient seeds an exact-layout device accumulator to avoid opaque backend tensor-shape assumptions. Host tests: `MEM=3G ./tools/test_host.sh dcnv4` passed 28 tests, including gradient and multi-forward/microbatch parity. Real GPU: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed on RTX 4060 (1 test, 225 s), covering two-step SGD/Adam CPU parameter parity through device accumulation. `git diff --check` passed. No speedup, compiled-C++ golden or full-suite claim; optimizer updates/parameter residency, unsupported variants, other GPU layers, CPU gaps, GPU Muon and sparse MoE remain open.
 
 ## Not implemented / open (pointer)
 

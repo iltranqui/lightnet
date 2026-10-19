@@ -31,7 +31,7 @@ inference (v0.2.001–002). Act-head features/exact-erf primitives are native f3
 Evidence/limits are in `implemented.md` §§41–45. Do not repeat these ports.
 Act-head uses four uncached weight uploads per forward; no residency/speedup
 claim. Runtime backward still uses CPU, act params remain frozen, f16 rejected.
-Latest GPU slice is v0.2.021 (`7a262a13`): DCNv4 now stores raw/offset tensors in each native `GpuForwardState` and backward consumes them instead of recomputing projection/aggregation (implemented.md §58). Params/gradients/optimizer remain host-resident; no speedup claim. v0.2.020 (`c99f83d8`) extended native aggregation/composition/runtime through 13x13/169 active points, with two-step SGD/Adam parity and BN on/off (§57); >169 remains host fallback. v0.2.019 (`76242245`) extended through 11x11/121 points (§56). v0.2.018 (`613b243e`) extended support through 9x9/81 (§55). v0.2.017 (`8a3ef3b0`) added equivalent runtime parity at 7x7 (§54), and v0.2.016 (`a96d6d95`) expanded the kernel/runtime bound to 49 points (§53). v0.2.015 added NormalizeChannels* activations/adjoints (§52). Previous, v0.2.014: DCNv4 native rolling-stat BN affine/adjoint plus
+Latest GPU slice is v0.2.022 (`27ab3cfb`): DCNv4 stores raw/offset tensors in each native `GpuForwardState` and backward consumes them rather than recomputing projection/aggregation (§58); v0.2.022 keeps bias/offset/BN-scale gradients device-resident and accumulates across microbatches, transferring once at the host optimizer boundary (§59). Parameters and SGD/Adam updates remain host-resident; no speedup claim. v0.2.020 (`c99f83d8`) extended native aggregation/composition/runtime through 13x13/169 active points, with two-step SGD/Adam parity and BN on/off (§57); >169 remains host fallback. v0.2.019 (`76242245`) extended through 11x11/121 points (§56). v0.2.018 (`613b243e`) extended support through 9x9/81 (§55). v0.2.017 (`8a3ef3b0`) added equivalent runtime parity at 7x7 (§54), and v0.2.016 (`a96d6d95`) expanded the kernel/runtime bound to 49 points (§53). v0.2.015 added NormalizeChannels* activations/adjoints (§52). Previous, v0.2.014: DCNv4 native rolling-stat BN affine/adjoint plus
 post-backward 0.9 EMA, including unseeded layers. Eligible math (<=169 active
 points, supported elementwise activation, no other fallback/host-only deform_conv)
 is native with BN off/on; ignored ordinary bias/beta and update gates preserved.
@@ -39,12 +39,12 @@ Forward/gradient normalization uses the old rolling values, NOT batch statistics
 Host-cuda 37, host DCNv4 26, mandatory runtime:: 282; focused device BN 2,
 runtime 3 (eight configs × two SGD/Adam steps), composition 3, aggregate 6 passed.
 Details/source boundaries: `implemented.md` §51; previous runtime/layout audits
-in §§49–50. Parameter gradients/SGD/Adam and EMA metadata stay on the host; weights and norm parameters still upload for math, but v0.2.021 removes raw/offset projection recomputation by retaining per-forward device cache. No residency/speedup claim. Previous
+in §§49–50. Parameter gradients now accumulate on-device through the optimizer boundary; parameters and SGD/Adam updates plus EMA metadata remain host-side. Weights and norm parameters still upload for math, while v0.2.021's per-forward device cache avoids repeated raw/offset projection. No residency/speedup claim. Previous
 full runtime-chain timed out at 600 s in ViT; **not a full-suite pass**.
 The NormalizeChannels* activation/adjoint slice is done (v0.2.015). Successive
 bounded increments extended native DCNv4 through 13x13/169 points; larger kernels,
-unsupported activations and mixed networks remain host-cached. Compact/f16, native parameter updates/residency
-and GPU Muon remain open. Native deform_conv was already wired in v0.2.007; do not repeat these ports.
+unsupported activations and mixed networks remain host-cached. Compact/f16 and native parameter updates/residency
+and GPU Muon remain open; device gradients now cross once per optimizer step. Native deform_conv was already wired in v0.2.007; do not repeat these ports.
 Recheck `version-map.tsv` before allocating another version. Earlier wave
 sections below retain historical findings; this resume point takes precedence.
 
