@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.086: native Oxide f32 `maxpool_depth` forward/backward is wired through the full GPU runtime; focused host and actual-Oxide maxpool tests pass. f16 depth pooling remains unsupported; no C++ parity/full-suite claim. See `implemented.md` §109.
 - v0.2.085: CRNN convolution projection matrices are eligible for GPU Muon; actual-Oxide two-step CPU parity with BN enabled passes, including outputs, weights, biases and BN scales. Gradients, optimizer state and final updates remain host-managed. No C++ parity/full-suite claim; see `implemented.md` §108.
 - v0.2.084: CRNN training with rolling-stat BN now uses native convolutional recurrent forward/backward. Actual-Oxide CPU output, gradients and parameter updates pass `batch_normalized_crnn_device_backward_matches_cpu_on_oxide`; the host FakeBackend BN regression also passes. No C++ parity/full-suite claim; see `implemented.md` §107.
 - v0.2.083: LSTM BN training now uses the existing native Oxide recurrent forward/backward path with rolling-stat affine folding. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain lstm` passed 4 tests, including BN output/parameter-update CPU parity. No C++ parity/full-suite claim; see `implemented.md` §106.

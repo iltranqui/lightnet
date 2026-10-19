@@ -134,6 +134,7 @@ file is named inline.
 - [106. Native LSTM rolling-stat BN training](#106-native-lstm-rolling-stat-bn-training)
 - [107. Native CRNN rolling-stat BN training](#107-native-crnn-rolling-stat-bn-training)
 - [108. Hybrid GPU Muon for CRNN matrices](#108-hybrid-gpu-muon-for-crnn-matrices)
+- [109. Native GPU maxpool_depth](#109-native-gpu-maxpool_depth)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1735,6 +1736,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 108. Hybrid GPU Muon for CRNN matrices
 
 - v0.2.085: enabled CRNN convolution projection matrices in GPU Muon eligibility. Oxide performs the Newton–Schulz orthogonalization; gradients and optimizer state/final updates remain host-managed. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_crnn_device_matrices_match_cpu_across_steps` passed two actual-Oxide updates against CPU Muon with BN enabled, checking forward outputs, all three projection weights/biases, and BN scales. No C++ golden, full-suite or performance claim.
+
+## 109. Native GPU `maxpool_depth`
+
+- v0.2.086: added native Oxide f32 forward and deterministic backward for depth pooling, preserving the Rust/C++-derived strided-channel grouping and first-wins ties. Full GPU runtime dispatch now supports it in training/inference; f16 remains explicitly unsupported. `MEM=3G ./tools/test_host.sh maxpool_depth` passed 2 CPU/config tests, and `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain maxpool_depth` passed 2 actual-Oxide runtime tests (native forward/backward parity plus ordinary maxpool regression). No compiled-C++ golden, full-suite or performance claim.
 
 ## Not implemented / open (pointer)
 
