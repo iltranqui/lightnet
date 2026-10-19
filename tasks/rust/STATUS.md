@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.023 (`2ff4544e`): added the native Oxide full-sequence CLS-adjoint scatter for act-head gradients (NCHW token-zero additive scatter) and checked host reference. The complete `oxide_laya_act_backward` suite passed 5 on RTX 4060; host `laya_act` 11 and darknet-cuda helper 2 passed. This does not wire runtime backward/updates or resolve act-head training eligibility; no C++/performance claim.
 - v0.2.022 (`27ab3cfb`): native DCNv4 bias/offset/BN-scale gradients accumulate as device tensors across microbatches; one gradient transfer occurs at the host optimizer boundary. SGD/Adam parameter updates/residency remain unchanged. Host DCNv4 28 and focused RTX 4060 two-step runtime SGD/Adam parity passed. No speedup or compiled-C++ claim.
 - v0.2.021 (`7a262a13`): native DCNv4 per-forward GPU state now retains raw output and offsets for backward, eliminating repeated projection/upsampling/aggregation work. Host params/gradients/optimizer remain. Host dcnv4 28 and focused RTX 4060 runtime-chain test pass; no speedup claim.
 - v0.2.020 (`c99f83d8`): DCNv4 native/runtime bound now covers 13x13 (169 points), with real-GPU composition output/gradient parity and two-step SGD/Adam CPU parity, BN on/off. Focused oxide tests and host DCNv4 28 pass; >169 remains host fallback. No compiled-C++ or performance claim.

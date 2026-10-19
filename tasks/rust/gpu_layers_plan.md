@@ -5,7 +5,7 @@
 - [Priority and boundaries](#priority-and-boundaries)
 - [Resume point](#resume-point)
 - [Act-head contract finding](#act-head-contract-finding)
-- [Next independent slice: native act-head gradient math](#next-independent-slice-native-act-head-gradient-math)
+- [Act-head native gradient math and CLS scatter](#act-head-native-gradient-math-and-cls-scatter)
 - [Next slice: deformable conv forward (wave 1, part 3)](#next-slice-deformable-conv-forward-wave-1-part-3)
 - [Runtime integration plan for `[deform_conv]`](#runtime-integration-plan-for-deform_conv)
 - [Next slice: `[dcnv4]` device path (audit result)](#next-slice-dcnv4-device-path-audit-result)
@@ -31,7 +31,7 @@ inference (v0.2.001–002). Act-head features/exact-erf primitives are native f3
 Evidence/limits are in `implemented.md` §§41–45. Do not repeat these ports.
 Act-head uses four uncached weight uploads per forward; no residency/speedup
 claim. Runtime backward still uses CPU, act params remain frozen, f16 rejected.
-Latest GPU slice is v0.2.022 (`27ab3cfb`): DCNv4 stores raw/offset tensors in each native `GpuForwardState` and backward consumes them rather than recomputing projection/aggregation (§58); v0.2.022 keeps bias/offset/BN-scale gradients device-resident and accumulates across microbatches, transferring once at the host optimizer boundary (§59). Parameters and SGD/Adam updates remain host-resident; no speedup claim. v0.2.020 (`c99f83d8`) extended native aggregation/composition/runtime through 13x13/169 active points, with two-step SGD/Adam parity and BN on/off (§57); >169 remains host fallback. v0.2.019 (`76242245`) extended through 11x11/121 points (§56). v0.2.018 (`613b243e`) extended support through 9x9/81 (§55). v0.2.017 (`8a3ef3b0`) added equivalent runtime parity at 7x7 (§54), and v0.2.016 (`a96d6d95`) expanded the kernel/runtime bound to 49 points (§53). v0.2.015 added NormalizeChannels* activations/adjoints (§52). Previous, v0.2.014: DCNv4 native rolling-stat BN affine/adjoint plus
+Latest GPU slice is v0.2.023 (`2ff4544e`): standalone act-head MLP gradients now have a native full-sequence CLS-adjoint scatter (§60; runtime integration remains open). DCNv4 stores raw/offset tensors in each native `GpuForwardState` (§58) and v0.2.022 accumulates bias/offset/BN-scale gradients on-device across microbatches, transferring once at the host optimizer boundary (§59). DCNv4 parameters and SGD/Adam updates remain host-resident; no speedup claim. v0.2.020 (`c99f83d8`) extended native aggregation/composition/runtime through 13x13/169 active points, with two-step SGD/Adam parity and BN on/off (§57); >169 remains host fallback. v0.2.019 (`76242245`) extended through 11x11/121 points (§56). v0.2.018 (`613b243e`) extended support through 9x9/81 (§55). v0.2.017 (`8a3ef3b0`) added equivalent runtime parity at 7x7 (§54), and v0.2.016 (`a96d6d95`) expanded the kernel/runtime bound to 49 points (§53). v0.2.015 added NormalizeChannels* activations/adjoints (§52). Previous, v0.2.014: DCNv4 native rolling-stat BN affine/adjoint plus
 post-backward 0.9 EMA, including unseeded layers. Eligible math (<=169 active
 points, supported elementwise activation, no other fallback/host-only deform_conv)
 is native with BN off/on; ignored ordinary bias/beta and update gates preserved.
@@ -64,35 +64,28 @@ but no such core loader implementation was found. Do not accept the hint as proo
 Native forward precision inherits existing connected/GEMM settings; only explicit
 Fp32 mode was validated for parity. No new global AMP/precision behavior was added.
 
-## Next independent slice: native act-head gradient math
+## Act-head native gradient math and CLS scatter
 
-Pure gradients are independent of optimizer eligibility: CPU's standalone
-act_head_backward already computes all four parameter derivatives even though
-runtime ignores them. Advance equivalent device math without wiring updates.
+Standalone act-head gradients are independent of optimizer eligibility. The
+CPU helper computes all four parameter derivatives even though runtime currently
+uses only the CLS adjoint.
 
-- [ ] Inspect native connected_backward_f32, row/column layout conventions,
-  exact-erf backward and device route/slicing primitives. Define a checked,
-  testable operand/result API before implementation, preferably backend math
-  returning typed device tensors rather than host downloads or a test-only API.
-- [ ] Compose/recompute features, fc1 preactivation, exact-erf hidden activation,
-  fc2 backward, seeded exact-erf backward, then fc1 backward. Return positive
-  parameter gradients in source order plus `[B,H]` CLS adjoints. Validate checked
-  dimensions/storage before each unsafe consumer; do not invent batch averaging.
-- [ ] Scorer/marker summaries are detached constants. Only the first H columns
-  of the feature gradient belong to CLS; discard the last four input derivatives.
-  Existing native route/slice operations may suffice for CLS extraction. Full
-  sequence-column scatter/routing is a later runtime integration requirement.
-- [ ] Test first against CPU act_head_backward for all four blocks and dcls,
-  B>1, nontrivial H/K/T/F/A, masked/all-masked inputs and signed/nonunit seeds.
-  Actual GPU forward finite differences must hold scorer/marker inputs fixed;
-  do not differentiate the detached feature path or confuse alias roles.
-- [ ] Cover malformed shapes/parameter/seed storage and independent input-buffer
-  lifetimes. Prove actual device primitive execution rather than generic host
-  references. Recompute/upload is acceptable initially if correct and disclosed;
-  no cache/speedup claim without evidence.
-- [ ] Keep runtime fallback selection, act-head training buffers, parameter
-  updates/optimizer state and f16 rejection unchanged in this independent slice.
-  A native gradient primitive is not native runtime backward or full training.
+- [x] v0.2.006: typed native MLP composition returns four positive batch-summed
+  parameter gradients plus `[B,H]` `dcls`; CPU parity, actual-GPU finite
+  differences, malformed-storage guards and allocator-lifetime tests are in
+  `implemented.md` §46.
+- [x] v0.2.023: checked backend host reference and native Oxide scatter add
+  `[B,H]` into token zero of an existing NCHW `[B,H,1,T]` gradient; scorer/marker
+  summary derivatives stay detached. `oxide_laya_act_backward` has 5 passing
+  tests, including actual-device scatter parity and shape errors; host references
+  have 2 focused tests. Evidence: `implemented.md` §60.
+- [ ] Runtime backward/update integration remains separate. C++ updates all four
+  act-head parameter blocks while Rust runtime drops those gradients; preserve
+  current behavior until the source-training contract is resolved and do not
+  remove the CPU fallback or start applying updates by inference.
+- [ ] Shared-file loading remains unproven (in-memory blob replacement is not a
+  file-loader test); f16 remains rejected. Native forward parity was validated
+  with explicit Fp32 GEMM only. No full runtime-training or speedup claim.
 
 ## Next slice: deformable conv forward (wave 1, part 3)
 

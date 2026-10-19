@@ -85,6 +85,7 @@ file is named inline.
 - [57. Extend native DCNv4 runtime through 13x13](#57-extend-native-dcnv4-runtime-through-13x13)
 - [58. Retain native DCNv4 forward cache for backward](#58-retain-native-dcnv4-forward-cache-for-backward)
 - [59. Native DCNv4 gradient accumulation](#59-native-dcnv4-gradient-accumulation)
+- [60. Native act-head CLS adjoint scatter](#60-native-act-head-cls-adjoint-scatter)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1473,6 +1474,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 59. Native DCNv4 gradient accumulation
 
 - v0.2.022 (`27ab3cfb`): native DCNv4 backward now retains bias, offset-weight, offset-bias and optional BN-scale gradients as device tensors and accumulates them on-device across microbatches. No parameter-gradient downloads occur during backward; gradients transfer once at the host optimizer boundary, where existing SGD/Adam logic and parameter residency remain unchanged. The first gradient seeds an exact-layout device accumulator to avoid opaque backend tensor-shape assumptions. Host tests: `MEM=3G ./tools/test_host.sh dcnv4` passed 28 tests, including gradient and multi-forward/microbatch parity. Real GPU: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed on RTX 4060 (1 test, 229 s), covering two-step SGD/Adam CPU parameter parity through device accumulation. `git diff --check` passed. No speedup, compiled-C++ golden or full-suite claim; optimizer updates/parameter residency, unsupported variants, other GPU layers, CPU gaps, GPU Muon and sparse MoE remain open.
+
+## 60. Native act-head CLS adjoint scatter
+
+- v0.2.023 (`2ff4544e`): added a checked backend operation to add the standalone `[B,H]` act-head CLS adjoint into token zero of an existing `[B,H,1,T]` NCHW head gradient. Host reference validates dimensions/storage; Oxide uses a native one-thread-per-output kernel, keeping the full sequence gradient device-resident and leaving scorer/marker summary features detached. Evidence: `systemd-run --user --scope -p MemoryHigh=3G cargo test -p darknet-cuda --lib laya_act -j 2` passed 2; `MEM=3G ./tools/test_host.sh laya_act` passed 11 core tests; `MEM=3G ./tools/test_oxide.sh --test oxide_laya_act_backward` passed 5 on the RTX 4060, including the new actual-device NCHW scatter/parity/error test and the existing MLP gradient parity/FD/guard suite; `git diff --check` passed. This is a primitive, not runtime backward/update integration; f16 and trainable-parameter contract remain unresolved, and no C++ golden or performance claim is made.
 
 ## Not implemented / open (pointer)
 
