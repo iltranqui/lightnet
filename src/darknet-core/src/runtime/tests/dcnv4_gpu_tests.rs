@@ -393,7 +393,14 @@ fn dcnv4_gpu_selects_native_math_without_host_cache() {
     let input = Tensor::filled(network.net.input_shape(), 0.2);
     let forward = gpu.forward_training_with_state(&input).unwrap();
     assert!(forward.cpu_forward.dcnv4_caches[0].is_none());
-    assert!(forward.gpu_dcnv4_caches[0].is_some());
+    let cache = forward.gpu_dcnv4_caches[0].as_ref().unwrap();
+    let LayerParams::Dcnv4(params) = &gpu.params[0] else {
+        unreachable!()
+    };
+    assert_eq!(
+        gpu.backend.download_f32(&cache.weights).unwrap(),
+        params.offset_weights
+    );
 }
 
 #[test]

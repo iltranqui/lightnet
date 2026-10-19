@@ -1,10 +1,10 @@
 //! Bounded DCNv4 GPU math: <=225 active points, elementwise/channel activation.
 //! BN normalizes with rolling stats; its 0.9 EMA runs only after backward.
-//! Parameter gradients and SGD/Adam math use device tensors; Adam moments and
-//! canonical parameters cross the host boundary for sidecar compatibility.
-//! Forward/backward tensor math is native on Oxide. Each GPU forward state owns
-//! its raw and offset tensors
-//! for backward, so projection/aggregation are not redundantly recomputed.
+//! Parameter gradients and SGD/Adam math use device tensors; DCNv4 Adam moments
+//! persist on-device between updates and bridge through the host sidecar only
+//! on save/load. Canonical parameters remain host-side. Each GPU forward state
+//! owns raw, offset, and projection-weight tensors for backward, so backward
+//! uses the exact forward weights without another parameter upload.
 
 use super::*;
 use crate::model::Layer;
@@ -73,6 +73,7 @@ pub(super) fn descriptor(
 pub(crate) struct ForwardCache<T> {
     raw: T,
     offsets: T,
+    pub(super) weights: T,
 }
 
 pub(super) fn forward<B: F32TensorOpsBackend>(
@@ -124,7 +125,7 @@ where
             .map_err(|err| backend_error("DCNv4 bias add", err))?
     };
     let out = activation_output(backend, &pre, layer, spec)?;
-    Ok((out, pre, ForwardCache { raw, offsets }))
+    Ok((out, pre, ForwardCache { raw, offsets, weights }))
 }
 
 pub(super) fn activation_output<B: F32TensorOpsBackend>(
@@ -189,9 +190,7 @@ where
     }
     let cfg = ElementwiseLaunchConfig::default();
     let desc = descriptor(layer, spec, params)?;
-    let weights = backend
-        .upload_f32(&[params.offset_weights.len()], &params.offset_weights)
-        .map_err(|err| backend_error("upload DCNv4 backward weights", err))?;
+    let weights = &cache.weights;
     let raw = &cache.raw;
     let offsets = &cache.offsets;
     let delta = activation_delta(backend, pre, seed, layer, spec, GradMode::from_env())?;
@@ -231,7 +230,7 @@ where
         (delta, bias_grad, None)
     };
     let (input, dw, db) = backend
-        .dcnv4_backward_f32(input, &weights, offsets, &aggregation_grad, desc, cfg)
+        .dcnv4_backward_f32(input, weights, offsets, &aggregation_grad, desc, cfg)
         .map_err(|err| backend_error("DCNv4 native backward", err))?;
     Ok(Gradients {
         input,
