@@ -97,6 +97,7 @@ file is named inline.
 - [69. Connected-layer GPU Muon runtime slice](#69-connected-layer-gpu-muon-runtime-slice)
 - [70. Native locally connected layer](#70-native-locally-connected-layer)
 - [71. GPU Muon RNN matrices](#71-gpu-muon-rnn-matrices)
+- [72. GPU Muon LSTM matrices](#72-gpu-muon-lstm-matrices)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1548,6 +1549,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 71. GPU Muon RNN matrices
 
 - v0.2.049: extended hybrid GPU Muon eligibility to RNN's input, recurrent, and output matrices, using the existing native-device RNN forward/backward and Oxide orthogonalization with host-staged gradients/state/final updates. Actual-GPU two-step CPU parity passed for outputs, all three weight groups, and biases (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_rnn_device_matrices_match_cpu_across_steps`); host `MEM=3G ./tools/test_host.sh gpu_muon_` passed 4. No compiled-C++ golden, full-suite, or performance claim.
+
+## 72. GPU Muon LSTM matrices
+
+- v0.2.050: extended hybrid GPU Muon eligibility to LSTM's four input and four recurrent matrices, using native-device forward/backward and Oxide orthogonalization with host-staged gradients/state/final updates. Actual-GPU two-step CPU parity passed for outputs, all eight weight groups and biases (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_lstm_device_matrices_match_cpu_across_steps`); host `MEM=3G ./tools/test_host.sh gpu_muon_` passed 4. No compiled-C++ golden, full-suite, or performance claim.
 
 ## Not implemented / open (pointer)
 

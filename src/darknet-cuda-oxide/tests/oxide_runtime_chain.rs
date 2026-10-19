@@ -3262,6 +3262,83 @@ fn gpu_muon_rnn_device_matrices_match_cpu_across_steps() {
 }
 
 #[test]
+fn gpu_muon_lstm_device_matrices_match_cpu_across_steps() {
+    let net = network(
+        "[net]\ninputs=2\nbatch=2\ntime_steps=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0001\n\
+         [lstm]\noutput=3\nbatch_normalize=0\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    darknet_core::initialize_training_params(&net, &mut cpu.params, 73);
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("LSTM Muon train buffers");
+
+    for step in 1..=2 {
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu()
+            .expect("zero LSTM Muon buffers");
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu
+            .forward_training(&input)
+            .expect("CPU LSTM Muon forward");
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("Oxide LSTM Muon forward");
+        for (cpu_output, gpu_output) in cpu_forward
+            .layer_outputs
+            .iter()
+            .zip(&gpu_forward.cpu_forward.layer_outputs)
+        {
+            close(
+                &format!("LSTM Muon step {step} forward"),
+                &cpu_output.data,
+                &gpu_output.data,
+                3e-4,
+            );
+        }
+        let output_shape = cpu.network.layers[0].output_shape;
+        let seed = Tensor::filled(output_shape, 0.012 + step as f32 * 0.004);
+        let seeds = [Some(seed)];
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU LSTM Muon backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("Oxide LSTM Muon backward");
+        cpu.update_weights_muon(0.02, 2)
+            .expect("CPU LSTM Muon update");
+        gpu.update_weights_gpu(0.02, 0.9, net.net.decay, 2)
+            .expect("GPU LSTM Muon update");
+        let (LayerParams::Lstm(cpu_lstm), LayerParams::Lstm(gpu_lstm)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("LSTM parameter layout expected");
+        };
+        for (name, cpu_projection, gpu_projection) in [
+            ("wf", &cpu_lstm.wf, &gpu_lstm.wf),
+            ("wi", &cpu_lstm.wi, &gpu_lstm.wi),
+            ("wg", &cpu_lstm.wg, &gpu_lstm.wg),
+            ("wo", &cpu_lstm.wo, &gpu_lstm.wo),
+            ("uf", &cpu_lstm.uf, &gpu_lstm.uf),
+            ("ui", &cpu_lstm.ui, &gpu_lstm.ui),
+            ("ug", &cpu_lstm.ug, &gpu_lstm.ug),
+            ("uo", &cpu_lstm.uo, &gpu_lstm.uo),
+        ] {
+            close(
+                &format!("LSTM Muon {name} weights step {step}"),
+                &gpu_projection.weights,
+                &cpu_projection.weights,
+                1e-3,
+            );
+            close(
+                &format!("LSTM Muon {name} biases step {step}"),
+                &gpu_projection.biases,
+                &cpu_projection.biases,
+                1e-3,
+            );
+        }
+    }
+}
+
+#[test]
 fn gpu_muon_kimi_kda_host_gradient_matrices_match_cpu_across_steps() {
     let net = network(
         "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=1\nmuon=1\ndecoupled_decay=1\ndecay=0.0001\n\
