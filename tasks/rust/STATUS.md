@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.044 (`32a111b7`): extended hybrid GPU Muon eligibility to Swin matrices; two-step actual-Oxide CPU parity and host `gpu_muon_` regression filter passed. Swin layer ops and optimizer state/final updates remain host-side. See `implemented.md` §69.
 - v0.2.043 (`506dc9bd`): GPU Muon now supports eligible ViT matrices through native Oxide orthogonalization with host-staged gradients/state/final updates; two-step actual-device CPU parity and host `gpu_muon_` regression filter passed. ViT layer forward/backward remain host-side. See `implemented.md` §69.
 - v0.2.042 (`56bfbe2f`): actual-device connected Muon `train_only_bn` gate matched CPU across two updates; parameters remain unchanged under the gate. Other gates/families remain open. See `implemented.md` §69.
 - v0.2.041 (`4edd8860`): actual-Oxide connected GPU Muon with batch normalization matched CPU for outputs, parameters, scales and rolling stats across two updates. It exercises the host-backward fallback, not native connected BN backward; other Muon families/gates remain open. See `implemented.md` §69.
