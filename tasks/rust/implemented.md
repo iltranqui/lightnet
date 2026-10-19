@@ -87,6 +87,7 @@ file is named inline.
 - [59. Native DCNv4 gradient accumulation](#59-native-dcnv4-gradient-accumulation)
 - [60. Native act-head CLS adjoint scatter](#60-native-act-head-cls-adjoint-scatter)
 - [61. Native DCNv4 SGD optimizer update](#61-native-dcnv4-sgd-optimizer-update)
+- [62. Native DCNv4 Adam optimizer update](#62-native-dcnv4-adam-optimizer-update)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1483,6 +1484,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 61. Native DCNv4 SGD optimizer update
 
 - v0.2.024 (`0087d109`): eligible native DCNv4 SGD now combines device-accumulated gradients with device-resident momentum buffers and applies the standard backend SGD update to the offset projection and either ordinary biases or BN scales. The existing 0.01 offset-projection rate, weight decay on offset weights, layer rate scaling, batch handling and update gates are preserved. Parameters remain host-canonical and are uploaded/downloaded per step; Adam still flushes gradients to the existing host optimizer. Whole-network CPU fallback and non-native DCNv4 variants retain the host path. Evidence: `MEM=3G ./tools/test_host.sh dcnv4` passed 28 tests; `MEM=3G ./tools/test_oxide.sh dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed 1 actual-GPU test (RTX 4060, 258.95 s), exercising BN on/off, two-step SGD and Adam parity, multiple kernel sizes and update deltas; `git diff --check` passed. No speedup, parameter residency, compiled-C++ golden or full-suite claim. Native DCNv4 Adam, unsupported/large variants, compact/f16, other GPU layers, CPU gaps, GPU Muon and sparse MoE remain open.
+
+## 62. Native DCNv4 Adam optimizer update
+
+- v0.2.025 (`7c96d45a`): eligible native DCNv4 Adam now applies offset projection and ordinary-bias/BN-scale updates through backend optimizer operations. First/second moments reuse the existing `HostAdamLayerState` layout and optimizer-sidecar serialization, uploaded for the device step and returned to the host state afterward; canonical parameters remain host-side. Layer-rate scaling, the 0.01 offset-projection LR factor, Adam/AdamW decay behavior, update gates and host fallback for mixed/unsupported networks are preserved. Evidence: `MEM=3G ./tools/test_host.sh dcnv4` passed 29 tests, including FakeBackend CPU parameter parity and optimizer-sidecar save/load round-trip; `MEM=3G ./tools/test_oxide.sh dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed on RTX 4060 (1 actual-GPU test, 255.16 s), covering two-step SGD/Adam parity with BN on/off and multiple DCNv4 sizes. No full suite, speedup, persistent parameter residency or compiled-C++ golden is claimed; broader CPU/GPU gaps, GPU Muon and sparse MoE remain open.
 
 ## Not implemented / open (pointer)
 
