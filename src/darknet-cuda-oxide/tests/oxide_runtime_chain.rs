@@ -3066,6 +3066,84 @@ fn deform_conv_device_path_matches_cpu_chain_and_updates() {
 }
 
 #[test]
+fn gpu_muon_swin_host_gradient_matrices_match_cpu_across_steps() {
+    let net = network(
+        "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=1\nmuon=1\ndecoupled_decay=1\ndecay=0.0001\n\
+         [swin]\nfilters=2\nsize=2\nheads=1\nshift=0\nffn_ratio=1\nactivation=linear\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    darknet_core::initialize_training_params(&net, &mut cpu.params, 43);
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("Swin train buffers");
+
+    for step in 1..=2 {
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu().expect("zero Swin buffers");
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).expect("CPU Swin forward");
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("Oxide Swin forward");
+        for (cpu_output, gpu_output) in cpu_forward
+            .layer_outputs
+            .iter()
+            .zip(&gpu_forward.cpu_forward.layer_outputs)
+        {
+            close(
+                &format!("Swin step {step} forward"),
+                &cpu_output.data,
+                &gpu_output.data,
+                3e-4,
+            );
+        }
+        let seed = Tensor::filled(cpu.network.layers[0].output_shape, 0.035 * step as f32);
+        let seeds = [Some(seed)];
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU Swin backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("Oxide Swin backward");
+        cpu.update_weights_muon(0.02, 1)
+            .expect("CPU Swin Muon update");
+        gpu.update_weights_gpu(0.02, 0.9, net.net.decay, 1)
+            .expect("GPU Swin Muon update");
+        let (LayerParams::Swin(cpu_swin), LayerParams::Swin(gpu_swin)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("Swin parameter layout expected");
+        };
+        for (name, cpu_values, gpu_values) in [
+            ("QKV weights", &cpu_swin.qkv_weight, &gpu_swin.qkv_weight),
+            ("attention projection", &cpu_swin.wo, &gpu_swin.wo),
+            ("FFN first weights", &cpu_swin.ffn_w1, &gpu_swin.ffn_w1),
+            ("FFN second weights", &cpu_swin.ffn_w2, &gpu_swin.ffn_w2),
+            ("QKV bias", &cpu_swin.qkv_bias, &gpu_swin.qkv_bias),
+            ("attention bias", &cpu_swin.wo_bias, &gpu_swin.wo_bias),
+            ("FFN first bias", &cpu_swin.ffn_b1, &gpu_swin.ffn_b1),
+            ("FFN second bias", &cpu_swin.ffn_b2, &gpu_swin.ffn_b2),
+            ("LN1 gamma", &cpu_swin.ln1_gamma, &gpu_swin.ln1_gamma),
+            ("LN1 beta", &cpu_swin.ln1_beta, &gpu_swin.ln1_beta),
+            ("LN2 gamma", &cpu_swin.ln2_gamma, &gpu_swin.ln2_gamma),
+            ("LN2 beta", &cpu_swin.ln2_beta, &gpu_swin.ln2_beta),
+            (
+                "relative position bias",
+                &cpu_swin.relative_position_bias,
+                &gpu_swin.relative_position_bias,
+            ),
+        ] {
+            close(
+                &format!("Swin {name} step {step}"),
+                gpu_values,
+                cpu_values,
+                1e-3,
+            );
+        }
+        assert_eq!(gpu_swin.res_proj, cpu_swin.res_proj);
+        assert_eq!(gpu_swin.mhc, cpu_swin.mhc);
+    }
+}
+
+#[test]
 fn gpu_muon_vit_host_gradient_matrices_match_cpu_across_steps() {
     let net = network(
         "[net]\nwidth=2\nheight=2\nchannels=1\nbatch=1\nmuon=1\ndecoupled_decay=1\ndecay=0.0001\n\
@@ -3103,7 +3181,8 @@ fn gpu_muon_vit_host_gradient_matrices_match_cpu_across_steps() {
             .expect("CPU ViT backward");
         gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
             .expect("Oxide ViT backward");
-        cpu.update_weights_muon(0.02, 1).expect("CPU ViT Muon update");
+        cpu.update_weights_muon(0.02, 1)
+            .expect("CPU ViT Muon update");
         gpu.update_weights_gpu(0.02, 0.9, net.net.decay, 1)
             .expect("GPU ViT Muon update");
         let (LayerParams::Vit(cpu_vit), LayerParams::Vit(gpu_vit)) =
@@ -3112,7 +3191,11 @@ fn gpu_muon_vit_host_gradient_matrices_match_cpu_across_steps() {
             panic!("ViT parameter layout expected");
         };
         for (name, cpu_values, gpu_values) in [
-            ("patch embedding", &cpu_vit.patch_embed, &gpu_vit.patch_embed),
+            (
+                "patch embedding",
+                &cpu_vit.patch_embed,
+                &gpu_vit.patch_embed,
+            ),
             ("QKV weights", &cpu_vit.qkv_weight, &gpu_vit.qkv_weight),
             ("attention projection", &cpu_vit.wo, &gpu_vit.wo),
             ("FFN first weights", &cpu_vit.ffn_w1, &gpu_vit.ffn_w1),
