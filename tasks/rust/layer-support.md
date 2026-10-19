@@ -83,7 +83,7 @@ with the command given rather than trusting the number.
 | `Convolutional` | yes | C++ | fwd | exact | pin | native | device | yes |
 | `Deconvolutional` | yes | C++ | fwd | exact | pin | native / host (unsupported act) | native / cpu fallback (unsupported act) | no |
 | `Connected` | yes | C++ | fwd | exact | T1 | native / host (unsupported act) | mixed | no |
-| `MaxPool` | alias | none | fwd | exact | pin | native f32 incl. depth pooling (f16 depth rejected) | device | yes |
+| `MaxPool` | alias | none | fwd | exact | pin | native f32; compact f16 inference incl. depth pooling | device f32 backward | yes |
 | `LocalAvgPool` | alias | none | fwd | exact | pin | native (channel-changing rejected) | device | yes |
 | `AvgPool` | alias | none | fwd | exact | pin | native | device | yes |
 | `Route` | alias | none | fwd | exact | T1 | native | device | yes |
@@ -244,7 +244,8 @@ devices and head sizes (no native kernel at all), even though standard
 | Shortcut (weighted) | device input/source gradients, exact normalization derivatives | per-input/per-slot weight gradient vector crosses to host; optimizer host-side |
 | Connected | device GEMM + activation, BN folded at inference | BN training and unsupported/unknown activations fall back |
 | `Crop` | device inference and geometric training | training HSV/saturation/exposure/RGB-shift augmentation is explicitly rejected |
-| `MaxPool`, `LocalAvgPool` | device | f16 `maxpool_depth` and channel-changing `local_avgpool` rejected |
+| `MaxPool` | native f32/f16 | no known maxpool variant gap |
+| `LocalAvgPool` | device | channel-changing `local_avgpool` rejected |
 
 ## Optimizer status
 

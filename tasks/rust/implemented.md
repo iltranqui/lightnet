@@ -138,6 +138,7 @@ file is named inline.
 - [110. MaxPool axis/layout contract pin](#110-maxpool-axislayout-contract-pin)
 - [111. AvgPool axis/layout contract pin](#111-avgpool-axislayout-contract-pin)
 - [112. LocalAvgPool axis/layout contract pin](#112-localavgpool-axislayout-contract-pin)
+- [113. Native f16 maxpool_depth inference](#113-native-f16-maxpool_depth-inference)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1755,6 +1756,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 112. LocalAvgPool axis/layout contract pin
 
 - v0.1.030: pinned local-average pooling with a hand-computed non-square B=2/C=2 fixture covering odd window size, distinct x/y strides, partial edge windows from padding, NCHW output order, and the exact overlap-summed seeded backward. The named config also checks output geometry. `MEM=3G ./tools/test_host.sh axis_layout` passed 26; `MEM=3G ./tools/test_host.sh every_layer_kind_has_an_axis_pin_decision` passed, and the focused test passed. Hand-derived from `Jev_laya:src-lib/maxpool_layer.cpp:440`; no compiled-C++ golden.
+
+## 113. Native f16 `maxpool_depth` inference
+
+- v0.2.087: extended compact Oxide f16 inference for `[maxpool] maxpool_depth=1` with a native half-storage kernel. The channel-group scan widens for comparisons, retains the first channel on ties, and stores the selected half bits without an unnecessary round trip. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed 7 tests; the new depth case matches compact f32 within the suite's 4e-3 tolerance (measured relative max error 2.488e-4). The f32 depth path and backend shape guards remain intact. No f16 training/backward or C++ golden claim.
 
 ## Not implemented / open (pointer)
 

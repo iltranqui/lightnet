@@ -229,6 +229,7 @@ reference tolerance is `TOL_COMPOSED = 1e-4` rather than the single-stage `2e-6`
 
 ## P8/P9 training follow-ups
 
+- [x] v0.2.087: compact f16 `maxpool_depth` now uses a native half-storage Oxide kernel. Actual f16-vs-f32 parity passed within the full 7-test `oxide_runtime_f16` suite (relative max error 2.488e-4); no f16 training/backward or C++ golden claim. See `implemented.md` §113.
 - [x] v0.2.086: `maxpool_depth` now has native Oxide f32 forward/backward and full runtime wiring. Host CPU/config filter passed 2; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain maxpool` passed 2, including actual output/input-gradient parity and ordinary maxpool regression. f16 depth pooling remains rejected; no compiled-C++ golden. See `implemented.md` §109.
 - [x] v0.2.085: CRNN projection matrices now participate in GPU Muon. Actual-Oxide two-step CPU parity with BN enabled verifies output, weights, biases and BN scales (`gpu_muon_crnn_device_matrices_match_cpu_across_steps`). Gradients/state/final updates remain host-managed; no C++ golden. See `implemented.md` §108.
 - [x] v0.2.084: CRNN training with rolling-stat BN now uses native recurrent
