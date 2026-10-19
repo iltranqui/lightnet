@@ -65,6 +65,27 @@ impl GraphConvAggregationGeometry {
                 return Err("graph_conv aggregation geometry exceeds i64 indexing".to_owned());
             }
         }
+        let kernel_extent = (self.size - 1).checked_mul(self.dilation);
+        let max_y = (self.output_height - 1)
+            .checked_mul(self.stride_y)
+            .and_then(|v| v.checked_add(kernel_extent?));
+        let max_x = (self.output_width - 1)
+            .checked_mul(self.stride_x)
+            .and_then(|v| v.checked_add(kernel_extent?));
+        let inverse_y = (self.input_height - 1).checked_add(self.padding);
+        let inverse_x = (self.input_width - 1).checked_add(self.padding);
+        if [kernel_extent, max_y, max_x, inverse_y, inverse_x]
+            .into_iter()
+            .flatten()
+            .any(|value| value > i64::MAX as usize)
+            || kernel_extent.is_none()
+            || max_y.is_none()
+            || max_x.is_none()
+            || inverse_y.is_none()
+            || inverse_x.is_none()
+        {
+            return Err("graph_conv aggregation coordinate arithmetic overflows i64".to_owned());
+        }
         let input_len = self
             .batch
             .checked_mul(self.channels)

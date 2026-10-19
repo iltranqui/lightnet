@@ -127,6 +127,24 @@ fn graph_conv_uniform_aggregate_forward_backward_matches_reference_and_fd() {
 }
 
 #[test]
+fn graph_conv_aggregation_rejects_coordinate_overflow() {
+    let geometry = GraphConvAggregationGeometry {
+        batch: 1,
+        channels: 1,
+        input_height: 1,
+        input_width: 1,
+        output_height: 3,
+        output_width: 1,
+        size: 1,
+        stride_x: 1,
+        stride_y: i64::MAX as usize,
+        dilation: 1,
+        padding: i64::MAX as usize,
+    };
+    assert!(geometry.checked().is_err());
+}
+
+#[test]
 fn graph_conv_aggregation_rejects_malformed_shapes() {
     let backend = OxideBackend::new().expect("Oxide backend");
     let geometry = GraphConvAggregationGeometry {
