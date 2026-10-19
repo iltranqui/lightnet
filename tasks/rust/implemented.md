@@ -120,6 +120,7 @@ file is named inline.
 - [92. GraphConv GPU Muon DNOPT6 sidecar resume](#92-graphconv-gpu-muon-dnopt6-sidecar-resume)
 - [93. GraphConv GPU Muon update gate](#93-graphconv-gpu-muon-update-gate)
 - [94. Grouped GraphConv GPU Muon parity](#94-grouped-graphconv-gpu-muon-parity)
+- [95. GraphConv BN GPU Muon through CPU fallback](#95-graphconv-bn-gpu-muon-through-cpu-fallback)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1665,6 +1666,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 94. Grouped GraphConv GPU Muon parity
 
 - v0.2.072 (`543d57e0`): strengthened actual-Oxide GraphConv Muon coverage to `groups=2` for learned-edge+self with batch normalization disabled. Two optimizer updates, DNOPT6 save/load, and a resumed third update match CPU for projection/self/edge matrices and biases. The focused test passes: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_graph_conv_matrices_match_cpu_across_steps` (1 test). This pins tested grouped parameter slicing and sidecar continuation, not all GraphConv variants; no compiled-C++ golden/full-suite/performance claim.
+
+## 95. GraphConv BN GPU Muon through CPU fallback
+
+- v0.2.073 (`007d6eed`): enabled GPU Muon updates for batch-normalized GraphConv by using the existing whole-network CPU forward/backward fallback for BN variants, while Oxide supplies matrix orthogonalization. Actual-device two-step parity covers grouped learned edges+self, projection/self/edge matrices and biases, BN gamma/beta, and rolling mean/variance: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_graph_conv_batch_norm_cpu_fallback_matches_cpu` passed 1 test. This is optimizer eligibility over the CPU training fallback—not native GraphConv BN training. Native BN training, other activation/edge/group variants, and compiled-C++ evidence remain open; no full-suite/performance claim.
 
 ## Not implemented / open (pointer)
 
