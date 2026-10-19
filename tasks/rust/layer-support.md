@@ -68,13 +68,13 @@ with the command given rather than trusting the number.
 | CPU standalone parameter backward | all parameterized kinds; head/pass-through kinds own no standalone backward |
 | CPU-only forward, no GPU path (hard reject) | 11 |
 | GPU forward but CPU/mixed backward | 10 |
-| GPU native forward + device backward | 21 |
+| GPU native forward + device backward | 22 |
 | f16 inference | 11 variants (12 section names) |
 | Axis pinned | 19 variants / 21 tests |
 | Axis open | 41 (Tier 1: 14, Tier 2: 16, Tier 3: 3, Tier 4: 8) |
 | Axis Rust-only | 5 |
 | Incomplete CPU port | 1 (`Yolo3d`); blocked: `Dcnv3`, `DetrDecoder` |
-| GPU Muon | partial hybrid integration: connected matrices use native Oxide momentum/lookahead, Newton–Schulz and direction+decay update; deconvolutional matrices use native Oxide Newton–Schulz with gradients staged through host buffers; deconvolution momentum/final update/state remain host-side. Connected momentum cached between steps but mirrored to host each update; weights remain host-canonical. Standalone BatchNorm host AdamW fallback; convolution and other parameter families open |
+| GPU Muon | partial hybrid integration: connected matrices use native Oxide momentum/lookahead, Newton–Schulz and direction+decay update; local per-location matrices and deconvolutional matrices use native Oxide Newton–Schulz with gradients staged through host buffers; local/deconvolution momentum/final update/state remain host-side. Connected momentum cached between steps but mirrored to host each update; weights remain host-canonical. Standalone BatchNorm host AdamW fallback; convolution and other parameter families open |
 
 ## Matrix
 
@@ -98,7 +98,7 @@ with the command given rather than trusting the number.
 | `Sam` | yes | none | fwd | exact | T1 | host | staged (source grad unverified) | no |
 | `BatchNorm` | yes | C++ | fwd | exact | rust | inf (training rejected) | device | yes |
 | `Crop` | yes | none | fwd | exact | rust | inf (training rejected) | device | no |
-| `Local` | yes | C++ | fwd | exact | rust | **none** (falls to "inconsistent") | cpu | no |
+| `Local` | yes | C++ | fwd | exact | rust | native f32 / host (unsupported activation) | device / CPU fallback | no |
 | `Gru` | yes | C++ | fwd | exact | rust | **none** (falls to "inconsistent") | cpu | no |
 | `Rnn` | yes | C++ | fwd | exact | T3 | mixed (device w/o BN) | mixed | no |
 | `Lstm` | yes | C++ | fwd | exact | T3 | mixed (device w/o BN) | mixed | no |
@@ -166,10 +166,12 @@ Eleven variants abort before any kernel runs. Source: `runtime.rs:83-102`
 | `Yolo3d` | same | raw CPU forward only; loss/decode absent | CPU first, then GPU |
 | `ObbRefine` (CARPN) | `GPU inference is not implemented` / `GPU CARPN training is unsupported` | CPU inference only; Stage-2 training deferred | after CARPN CPU training |
 
-`Local` and `Gru` are not in that list but have **no GPU arm** either; they fall
-through to the match's catch-all `InvalidConfig("... and parameter set are
-inconsistent")` (`runtime.rs:13070-13084`). That message is wrong and should be
-an `UnsupportedLayer`.
+`Gru` is not in that list but has **no GPU arm** either; it falls through to
+the match's catch-all `InvalidConfig("... and parameter set are inconsistent")`
+(`runtime.rs:13070-13084`). That message is wrong and should be an
+`UnsupportedLayer`. `Local` has a bounded native f32 forward/backward path since
+v0.2.048; its optimizer remains host-staged and unsupported activations retain
+the legacy host route.
 
 > **Wave 1 status (deformable sampling) — `[deform_conv]` is wired.** The device
 > forward and backward are live for networks with `dilation == 1` and no batch
@@ -302,10 +304,10 @@ non-layer work.
 
 ## Defects found while deriving this matrix
 
-1. `Gru` and `Local` have no GPU forward arm and no pre-flight rejection, so
-   they surface as `InvalidConfig("... and parameter set are inconsistent")`
-   instead of `UnsupportedLayer`. Misleading, and easy to misdiagnose as a
-   weights/parameter mismatch.
+1. `Gru` has no GPU forward arm and no pre-flight rejection, so it surfaces as
+   `InvalidConfig("... and parameter set are inconsistent")` instead of
+   `UnsupportedLayer`. `Local` has native f32 forward/backward math, but its
+   optimizer remains host-staged.
 2. `Sam` is a host round trip in the GPU **forward**, is absent from
    `requires_cpu_backward_fallback`, and its GPU backward arm only forwards the
    incoming gradient to the previous layer (`runtime.rs:15646`). A Sam network

@@ -95,6 +95,7 @@ file is named inline.
 - [67. Retain native DCNv4 parameters across forwards and updates](#67-retain-native-dcnv4-parameters-across-forwards-and-updates)
 - [68. Native GPU Muon orthogonalization primitive](#68-native-gpu-muon-orthogonalization-primitive)
 - [69. Connected-layer GPU Muon runtime slice](#69-connected-layer-gpu-muon-runtime-slice)
+- [70. Native locally connected layer](#70-native-locally-connected-layer)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1538,6 +1539,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 - v0.2.045 (`5bff2104`): added TuckerAttention matrices to hybrid GPU Muon eligibility. Actual-Oxide two-step CPU parity covers its packed factor weights and biases; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_tucker_host_gradient_matrices_match_cpu_across_steps` passed, and host `gpu_muon_` passed 4. TuckerAttention forward/backward and momentum/final updates remain host-side.
 - v0.2.046 (`dd40ca39`): added MambaVision matrices to hybrid GPU Muon eligibility. Actual-Oxide two-step CPU parity covers its packed parameter vector; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_mambavision_host_gradient_matrices_match_cpu_across_steps` passed, and host `gpu_muon_` passed 4. MambaVision forward/backward and momentum/final updates remain host-side.
 - v0.2.047 (`fb05dad0`): added KimiKda matrices to hybrid GPU Muon eligibility. Actual-Oxide two-step CPU parity covers its packed factor/FFN weights and biases; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_kimi_kda_host_gradient_matrices_match_cpu_across_steps` passed, and host `gpu_muon_` passed 4. KimiKda forward/backward and momentum/final updates remain host-side.
+
+## 70. Native locally connected layer
+
+- v0.2.048: added host-reference and native Oxide f32 locally connected `[local]` forward, input-gradient, weight-gradient and bias-gradient operations, with GPU runtime routing for supported activations. Oxide primitive parity (2 tests) and actual-GPU two-step SGD runtime CPU parity passed; `MEM=3G ./tools/test_host.sh local` passed 11. Fixed the GPU runtime CPU-fallback SGD update gap for local parameters. Extended hybrid GPU Muon to each location-specific local matrix; actual-GPU two-step CPU parity passed under Muon, and `MEM=3G ./tools/test_host.sh gpu_muon_` passed 4. Local optimizer gradients/state/final updates remain host-staged; Muon orthogonalization is native Oxide. Unsupported activations retain the legacy host path. No compiled-C++ golden, full-suite, or performance claim.
 
 ## Not implemented / open (pointer)
 

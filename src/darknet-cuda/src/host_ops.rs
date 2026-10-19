@@ -10,6 +10,7 @@ pub mod deform_conv;
 pub mod deconvolutional;
 pub mod gelu_erf;
 pub mod laya_act;
+pub mod local;
 pub mod marker_gather;
 pub mod muon;
 

@@ -1347,6 +1347,87 @@ pub trait F32TensorOpsBackend {
         groups: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error>;
+    /// Locally connected f32 projection. Weights use `[location, filter, channel, ky, kx]`.
+    #[allow(clippy::too_many_arguments)]
+    fn local_f32(
+        &self,
+        x: &Self::Tensor,
+        weights: &Self::Tensor,
+        biases: &Self::Tensor,
+        input_shape: &[usize],
+        output_shape: &[usize],
+        filters: usize,
+        kernel_size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        padding: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert_eq!(input_shape.len(), 4, "local input must be NCHW");
+        assert_eq!(output_shape.len(), 4, "local output must be NCHW");
+        let values = host_ops::local::forward(
+            &self.download_f32(x)?,
+            &self.download_f32(weights)?,
+            &self.download_f32(biases)?,
+            input_shape[0],
+            input_shape[1],
+            input_shape[2],
+            input_shape[3],
+            filters,
+            output_shape[2],
+            output_shape[3],
+            kernel_size,
+            stride_x,
+            stride_y,
+            padding,
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        self.upload_f32(output_shape, &values)
+    }
+    /// Local input, location-specific weight, and bias gradients for an already
+    /// activation-adjusted output gradient.
+    #[allow(clippy::too_many_arguments)]
+    fn local_backward_f32(
+        &self,
+        x: &Self::Tensor,
+        weights: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        input_shape: &[usize],
+        output_shape: &[usize],
+        filters: usize,
+        kernel_size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        padding: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        assert_eq!(input_shape.len(), 4, "local input must be NCHW");
+        assert_eq!(output_shape.len(), 4, "local output must be NCHW");
+        let (dx, dw, db) = host_ops::local::backward(
+            &self.download_f32(x)?,
+            &self.download_f32(weights)?,
+            &self.download_f32(output_grad)?,
+            input_shape[0],
+            input_shape[1],
+            input_shape[2],
+            input_shape[3],
+            filters,
+            output_shape[2],
+            output_shape[3],
+            kernel_size,
+            stride_x,
+            stride_y,
+            padding,
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        Ok((
+            self.upload_f32(input_shape, &dx)?,
+            self.upload_f32(&[output_shape[2] * output_shape[3], filters, input_shape[1], kernel_size, kernel_size], &dw)?,
+            self.upload_f32(&[output_shape[2] * output_shape[3], filters], &db)?,
+        ))
+    }
     fn maxpool_f32(
         &self,
         x: &Self::Tensor,

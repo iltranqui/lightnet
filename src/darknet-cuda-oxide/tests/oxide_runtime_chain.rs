@@ -3066,6 +3066,131 @@ fn deform_conv_device_path_matches_cpu_chain_and_updates() {
 }
 
 #[test]
+fn local_native_gpu_training_matches_cpu_across_two_updates() {
+    let net = network(
+        "[net]\nwidth=4\nheight=4\nchannels=2\nbatch=2\n\
+         [local]\nfilters=3\nsize=2\nstride=1\npadding=0\nactivation=leaky\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    darknet_core::initialize_training_params(&net, &mut cpu.params, 61);
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("local train buffers");
+    assert_eq!(
+        gpu.params, cpu.params,
+        "GPU initialization changed local params"
+    );
+
+    for step in 0..2 {
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu()
+            .expect("zero GPU local buffers");
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).expect("CPU local forward");
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("Oxide local forward");
+        for (cpu_output, gpu_output) in cpu_forward
+            .layer_outputs
+            .iter()
+            .zip(&gpu_forward.cpu_forward.layer_outputs)
+        {
+            close("local forward", &cpu_output.data, &gpu_output.data, 2e-4);
+        }
+        let output_shape = cpu.network.layers[0].output_shape;
+        let seed = Tensor::filled(output_shape, 0.03 + step as f32 * 0.01);
+        let seeds = [Some(seed)];
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU local backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("Oxide local backward");
+        cpu.update_weights(0.01, 0.0, 0.0, 2);
+        gpu.update_weights_gpu(0.01, 0.0, 0.0, 2)
+            .expect("GPU local update");
+        let (LayerParams::Local(cpu_local), LayerParams::Local(gpu_local)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("local parameter layout expected");
+        };
+        close(
+            "local weights",
+            &gpu_local.weights,
+            &cpu_local.weights,
+            5e-4,
+        );
+        close("local biases", &gpu_local.biases, &cpu_local.biases, 5e-4);
+    }
+}
+
+#[test]
+fn gpu_muon_local_location_matrices_match_cpu_across_steps() {
+    let net = network(
+        "[net]\nwidth=4\nheight=4\nchannels=2\nbatch=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0001\n\
+         [local]\nfilters=3\nsize=2\nstride=1\npadding=0\nactivation=leaky\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    darknet_core::initialize_training_params(&net, &mut cpu.params, 67);
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("local Muon train buffers");
+
+    for step in 1..=2 {
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu()
+            .expect("zero local Muon buffers");
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu
+            .forward_training(&input)
+            .expect("CPU local Muon forward");
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("Oxide local Muon forward");
+        for (cpu_output, gpu_output) in cpu_forward
+            .layer_outputs
+            .iter()
+            .zip(&gpu_forward.cpu_forward.layer_outputs)
+        {
+            close(
+                &format!("local Muon step {step} forward"),
+                &cpu_output.data,
+                &gpu_output.data,
+                2e-4,
+            );
+        }
+        let seed = Tensor::filled(
+            cpu.network.layers[0].output_shape,
+            0.02 + step as f32 * 0.005,
+        );
+        let seeds = [Some(seed)];
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU local Muon backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("Oxide local Muon backward");
+        cpu.update_weights_muon(0.02, 2)
+            .expect("CPU local Muon update");
+        gpu.update_weights_gpu(0.02, 0.9, net.net.decay, 2)
+            .expect("GPU local Muon update");
+        let (LayerParams::Local(cpu_local), LayerParams::Local(gpu_local)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("local parameter layout expected");
+        };
+        close(
+            &format!("local Muon weights step {step}"),
+            &gpu_local.weights,
+            &cpu_local.weights,
+            1e-3,
+        );
+        close(
+            &format!("local Muon biases step {step}"),
+            &gpu_local.biases,
+            &cpu_local.biases,
+            1e-3,
+        );
+    }
+}
+
+#[test]
 fn gpu_muon_kimi_kda_host_gradient_matrices_match_cpu_across_steps() {
     let net = network(
         "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=1\nmuon=1\ndecoupled_decay=1\ndecay=0.0001\n\

@@ -10300,6 +10300,7 @@ where
                 (_, LayerParams::None)
                     | (LayerKind::BatchNorm(_), LayerParams::BatchNorm(_))
                     | (LayerKind::Connected(_), LayerParams::Connected(_))
+                    | (LayerKind::Local(_), LayerParams::Local(_))
                     | (LayerKind::Vit(_), LayerParams::Vit(_))
                     | (LayerKind::Swin(_), LayerParams::Swin(_))
                     | (LayerKind::TuckerAttention(_), LayerParams::TuckerAttention(_))
@@ -10313,7 +10314,7 @@ where
         }) {
             return Err(Error::UnsupportedLayer {
                 layer_index: index,
-                name: "GPU Muon runtime supports host-gradient Kimi/MambaVision/Tucker/Swin/ViT/deconvolutional/connected matrices and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
+                name: "GPU Muon runtime supports host-gradient local/Kimi/MambaVision/Tucker/Swin/ViT/deconvolutional/connected matrices and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
             });
         }
         let step = self.adam_step.checked_add(1).ok_or_else(|| {
@@ -11463,6 +11464,24 @@ where
                 }
                 (LayerParams::Connected(params), LayerTrainBuffers::Connected(train)) => {
                     update_connected_params(params, train, lr, momentum, decay, batch);
+                }
+                (LayerParams::Local(params), LayerTrainBuffers::Local(train)) => {
+                    sgd_update(
+                        &mut params.weights,
+                        &mut train.weight_updates,
+                        lr,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                    sgd_update(
+                        &mut params.biases,
+                        &mut train.bias_updates,
+                        lr,
+                        momentum,
+                        0.0,
+                        batch,
+                    );
                 }
                 (LayerParams::Shortcut(params), LayerTrainBuffers::Shortcut(train)) => {
                     sgd_update(
@@ -13306,6 +13325,76 @@ where
                                 .map_err(|err| backend_error("download dropout mask", err))?,
                         );
                         output
+                    }
+                }
+                (LayerKind::Local(spec), LayerParams::Local(local)) => {
+                    if let Some(activation) = spec.activation.to_cuda_f32_kind() {
+                        let locations = layer.output_shape.width * layer.output_shape.height;
+                        let weights = self
+                            .backend
+                            .upload_f32(
+                                &[
+                                    locations,
+                                    spec.filters,
+                                    layer.input_shape.channels,
+                                    spec.size,
+                                    spec.size,
+                                ],
+                                &local.weights,
+                            )
+                            .map_err(|err| backend_error("upload local weights", err))?;
+                        let biases = self
+                            .backend
+                            .upload_f32(&[locations, spec.filters], &local.biases)
+                            .map_err(|err| backend_error("upload local biases", err))?;
+                        let pre_activation = self
+                            .backend
+                            .local_f32(
+                                current_input,
+                                &weights,
+                                &biases,
+                                &tensor_backend_shape(layer.input_shape),
+                                &tensor_backend_shape(layer.output_shape),
+                                spec.filters,
+                                spec.size,
+                                spec.stride_x,
+                                spec.stride_y,
+                                spec.padding,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("local forward", err))?;
+                        activation_input_gpu = Some(pre_activation.clone());
+                        self.backend
+                            .activation_f32(&pre_activation, activation, launch_config)
+                            .map_err(|err| backend_error("local activation", err))?
+                    } else {
+                        let host_input = self
+                            .download_tensor(current_input, layer.input_shape)
+                            .map_err(|err| backend_error("download local input", err))?;
+                        let (host_output, host_activation_input) = forward_local_with_cache(
+                            spec,
+                            local,
+                            &host_input,
+                            layer.output_shape,
+                        )?;
+                        if let Some(pre_activation) = host_activation_input {
+                            activation_input_gpu = Some(
+                                self.backend
+                                    .upload_f32(
+                                        &tensor_backend_shape(layer.output_shape),
+                                        &pre_activation.data,
+                                    )
+                                    .map_err(|err| {
+                                        backend_error("upload local activation cache", err)
+                                    })?,
+                            );
+                        }
+                        self.backend
+                            .upload_f32(
+                                &tensor_backend_shape(layer.output_shape),
+                                &host_output.data,
+                            )
+                            .map_err(|err| backend_error("upload local output", err))?
                     }
                 }
                 (LayerKind::Connected(spec), LayerParams::Connected(connected)) => {
@@ -15700,6 +15789,76 @@ where
                     )?;
                 }
                 (
+                    LayerKind::Local(spec),
+                    Some(LayerParams::Local(params)),
+                ) if spec.activation.to_cuda_f32_kind().is_some() => {
+                    let activation_input = forward.gpu_layer_activation_inputs[layer.index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing GPU activation cache for local layer #{}",
+                                layer.index
+                            ))
+                        })?;
+                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+                    let delta = self
+                        .backend
+                        .activation_backward_f32(activation_input, &grad, activation, config)
+                        .map_err(|err| backend_error("GPU local activation backward", err))?;
+                    let current_input = if layer.index == 0 {
+                        &forward.input_gpu
+                    } else {
+                        forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing previous GPU layer output for local layer #{}",
+                                layer.index
+                            ))
+                        })?
+                    };
+                    let locations = layer.output_shape.width * layer.output_shape.height;
+                    let weights = self
+                        .backend
+                        .upload_f32(
+                            &[
+                                locations,
+                                spec.filters,
+                                layer.input_shape.channels,
+                                spec.size,
+                                spec.size,
+                            ],
+                            &params.weights,
+                        )
+                        .map_err(|err| backend_error("upload local weights", err))?;
+                    let (input_grad, weight_grad, bias_grad) = self
+                        .backend
+                        .local_backward_f32(
+                            current_input,
+                            &weights,
+                            &delta,
+                            &tensor_backend_shape(layer.input_shape),
+                            &tensor_backend_shape(layer.output_shape),
+                            spec.filters,
+                            spec.size,
+                            spec.stride_x,
+                            spec.stride_y,
+                            spec.padding,
+                            config,
+                        )
+                        .map_err(|err| backend_error("GPU local backward", err))?;
+                    self.accumulate_local_host_gradients(
+                        layer.index,
+                        &weight_grad,
+                        &bias_grad,
+                        params.weights.len(),
+                        params.biases.len(),
+                    )?;
+                    self.accumulate_previous_gpu_gradient(
+                        layer.index,
+                        input_grad,
+                        &mut layer_output_gradients,
+                    )?;
+                }
+                (
                     LayerKind::Deconvolutional(spec),
                     Some(LayerParams::Convolutional(params)),
                 ) if spec.activation.to_cuda_f32_kind().is_some() => {
@@ -17166,6 +17325,11 @@ where
                         return true;
                     }
                 }
+                LayerKind::Local(spec) => {
+                    if spec.activation.to_cuda_f32_kind().is_none() {
+                        return true;
+                    }
+                }
                 _ => {}
             }
             if let LayerKind::ScaleChannels(spec) = &layer.kind
@@ -17401,6 +17565,49 @@ where
         if train.weight_updates.len() != weight_count || train.bias_updates.len() != bias_count {
             return Err(Error::InvalidConfig(format!(
                 "deconvolutional train buffer mismatch for layer #{layer_index}"
+            )));
+        }
+        for (slot, value) in train.weight_updates.iter_mut().zip(dw) {
+            *slot += value;
+        }
+        for (slot, value) in train.bias_updates.iter_mut().zip(db) {
+            *slot += value;
+        }
+        Ok(())
+    }
+
+    /// Accumulate device-computed local gradients into the host optimizer
+    /// buffers; each location retains its own weights and bias parameters.
+    fn accumulate_local_host_gradients(
+        &self,
+        layer_index: usize,
+        weight_grad: &B::Tensor,
+        bias_grad: &B::Tensor,
+        weight_count: usize,
+        bias_count: usize,
+    ) -> Result<()> {
+        let dw = self
+            .backend
+            .download_f32(weight_grad)
+            .map_err(|err| backend_error("download local weight gradient", err))?;
+        let db = self
+            .backend
+            .download_f32(bias_grad)
+            .map_err(|err| backend_error("download local bias gradient", err))?;
+        if dw.len() != weight_count || db.len() != bias_count {
+            return Err(Error::InvalidConfig(format!(
+                "local gradient length mismatch at layer #{layer_index}"
+            )));
+        }
+        let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
+        let Some(LayerTrainBuffers::Local(train)) = buffers.get_mut(layer_index) else {
+            return Err(Error::InvalidConfig(format!(
+                "missing local train buffers for layer #{layer_index}"
+            )));
+        };
+        if train.weight_updates.len() != weight_count || train.bias_updates.len() != bias_count {
+            return Err(Error::InvalidConfig(format!(
+                "local train buffer mismatch for layer #{layer_index}"
             )));
         }
         for (slot, value) in train.weight_updates.iter_mut().zip(dw) {
