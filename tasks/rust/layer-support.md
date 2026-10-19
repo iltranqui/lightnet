@@ -183,7 +183,7 @@ the legacy host route.
 > `oxide_runtime_chain` device test (forward outputs, one SGD step, every
 > parameter block, masked) plus the retained host-fallback test for the BN case.
 > The only host-resident step in the device path is the batch-serial
-> normalization Jacobian. `[dsconv]` and `[graph_conv]` remain unwired.
+> normalization Jacobian. `[dsconv]` and the `[graph_conv]` layer remain unwired. A bounded native Oxide primitive now implements uniform valid-neighbor aggregation and its adjoint for GraphConv edge mode 0 (v0.2.057, `implemented.md` §79), but no GraphConv runtime dispatch, learned-edge/self projection, BN, or optimizer path exists.
 > **DCNv4 is bounded-native in v0.2.013–014:** <=25 active points, supported
 > elementwise activation, optional rolling-stat BN, no other CPU fallback/
 > host-only deform_conv. Both directions share the global gate. BN affine/

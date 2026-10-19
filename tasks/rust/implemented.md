@@ -104,6 +104,7 @@ file is named inline.
 - [76. Hybrid GPU Muon for non-BN MoE](#76-hybrid-gpu-muon-for-non-bn-moe)
 - [77. Hybrid GPU Muon for non-BN DCNv4 offset projection](#77-hybrid-gpu-muon-for-non-bn-dcnv4-offset-projection)
 - [78. Hybrid GPU Muon for non-BN deform_conv](#78-hybrid-gpu-muon-for-non-bn-deform_conv)
+- [79. Native Oxide GraphConv uniform aggregation primitives](#79-native-oxide-graphconv-uniform-aggregation-primitives)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1585,6 +1586,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 78. Hybrid GPU Muon for non-BN deform_conv
 
 - v0.2.056: enabled GPU Muon for supported non-batch-normalized `[deform_conv]` layers. Its native Oxide forward/backward computes parameter gradients; backward currently downloads those gradients into host train buffers, where Muon Newton–Schulz and the existing AdamW fallback/state/update apply. The hybrid path covers the main convolution, offset predictor, and optional mask predictor matrices while biases retain AdamW. Actual-Oxide CPU parity passed across two updates with two accumulated seeded backward calls per step, including a preceding native convolution (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_deform_conv_native_gradients_match_cpu_across_steps`). BN deform_conv remains explicitly rejected before mutation. No compiled-C++ golden, full-suite, or performance claim.
+
+## 79. Native Oxide GraphConv uniform aggregation primitives
+
+- v0.2.057: added checked host-reference and native Oxide f32 forward/adjoint primitives for `[graph_conv]` edge mode 0's uniform valid-neighbor spatial average. NCHW, odd-kernel shape validation covers asymmetric geometry, stride, dilation and padding; backward gathers into unique input-gradient elements without atomics. Actual-device tests pass against the host reference plus finite differences (`MEM=3G ./tools/test_oxide.sh --test oxide_graph_conv`, 2 tests); the existing GraphConv CPU host filter passes 15 tests (`MEM=3G ./tools/test_host.sh graph_conv`). **This does not wire `[graph_conv]` into GPU runtime forward/backward**: learned-edge softmax, self projection, BN, runtime caches, projection epilogue/gradients and optimizer integration remain open. Hand-derived from Rust CPU reference/source, no compiled-C++ golden, no full-suite or performance claim.
 
 ## Not implemented / open (pointer)
 
