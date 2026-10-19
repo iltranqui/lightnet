@@ -74,7 +74,7 @@ with the command given rather than trusting the number.
 | Axis open | 41 (Tier 1: 14, Tier 2: 16, Tier 3: 3, Tier 4: 8) |
 | Axis Rust-only | 5 |
 | Incomplete CPU port | 1 (`Yolo3d`); blocked: `Dcnv3`, `DetrDecoder` |
-| GPU Muon | partial hybrid integration: connected matrices use native Oxide momentum/lookahead, Newton–Schulz and direction+decay update; local per-location matrices and deconvolutional matrices use native Oxide Newton–Schulz with gradients staged through host buffers; local/deconvolution momentum/final update/state remain host-side. Connected momentum cached between steps but mirrored to host each update; weights remain host-canonical. Standalone BatchNorm host AdamW fallback; convolution and other parameter families open |
+| GPU Muon | partial hybrid integration: connected matrices use native Oxide momentum/lookahead, Newton–Schulz and direction+decay update; local per-location, RNN, and deconvolutional matrices use native Oxide Newton–Schulz with gradients staged through host buffers; local/deconvolution momentum/final update/state remain host-side. Connected momentum cached between steps but mirrored to host each update; weights remain host-canonical. Standalone BatchNorm host AdamW fallback; convolution and other parameter families open |
 
 ## Matrix
 

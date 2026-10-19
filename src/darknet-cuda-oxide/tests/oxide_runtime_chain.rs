@@ -3191,6 +3191,77 @@ fn gpu_muon_local_location_matrices_match_cpu_across_steps() {
 }
 
 #[test]
+fn gpu_muon_rnn_device_matrices_match_cpu_across_steps() {
+    let net = network(
+        "[net]\ninputs=2\nbatch=2\ntime_steps=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0001\n\
+         [rnn]\nhidden=3\noutput=2\nactivation=tanh\nlogistic=1\nshortcut=1\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    darknet_core::initialize_training_params(&net, &mut cpu.params, 71);
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("RNN Muon train buffers");
+
+    for step in 1..=2 {
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu().expect("zero RNN Muon buffers");
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu
+            .forward_training(&input)
+            .expect("CPU RNN Muon forward");
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("Oxide RNN Muon forward");
+        for (cpu_output, gpu_output) in cpu_forward
+            .layer_outputs
+            .iter()
+            .zip(&gpu_forward.cpu_forward.layer_outputs)
+        {
+            close(
+                &format!("RNN Muon step {step} forward"),
+                &cpu_output.data,
+                &gpu_output.data,
+                3e-4,
+            );
+        }
+        let output_shape = cpu.network.layers[0].output_shape;
+        let seed = Tensor::filled(output_shape, 0.015 + step as f32 * 0.005);
+        let seeds = [Some(seed)];
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU RNN Muon backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("Oxide RNN Muon backward");
+        cpu.update_weights_muon(0.02, 2)
+            .expect("CPU RNN Muon update");
+        gpu.update_weights_gpu(0.02, 0.9, net.net.decay, 2)
+            .expect("GPU RNN Muon update");
+        let (LayerParams::Rnn(cpu_rnn), LayerParams::Rnn(gpu_rnn)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("RNN parameter layout expected");
+        };
+        for (name, cpu_group, gpu_group) in [
+            ("input", &cpu_rnn.input, &gpu_rnn.input),
+            ("self", &cpu_rnn.self_params, &gpu_rnn.self_params),
+            ("output", &cpu_rnn.output, &gpu_rnn.output),
+        ] {
+            close(
+                &format!("RNN Muon {name} weights step {step}"),
+                &gpu_group.weights,
+                &cpu_group.weights,
+                1e-3,
+            );
+            close(
+                &format!("RNN Muon {name} biases step {step}"),
+                &gpu_group.biases,
+                &cpu_group.biases,
+                1e-3,
+            );
+        }
+    }
+}
+
+#[test]
 fn gpu_muon_kimi_kda_host_gradient_matrices_match_cpu_across_steps() {
     let net = network(
         "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=1\nmuon=1\ndecoupled_decay=1\ndecay=0.0001\n\

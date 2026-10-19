@@ -96,6 +96,7 @@ file is named inline.
 - [68. Native GPU Muon orthogonalization primitive](#68-native-gpu-muon-orthogonalization-primitive)
 - [69. Connected-layer GPU Muon runtime slice](#69-connected-layer-gpu-muon-runtime-slice)
 - [70. Native locally connected layer](#70-native-locally-connected-layer)
+- [71. GPU Muon RNN matrices](#71-gpu-muon-rnn-matrices)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1543,6 +1544,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 70. Native locally connected layer
 
 - v0.2.048: added host-reference and native Oxide f32 locally connected `[local]` forward, input-gradient, weight-gradient and bias-gradient operations, with GPU runtime routing for supported activations. Oxide primitive parity (2 tests) and actual-GPU two-step SGD runtime CPU parity passed; `MEM=3G ./tools/test_host.sh local` passed 11. Fixed the GPU runtime CPU-fallback SGD update gap for local parameters. Extended hybrid GPU Muon to each location-specific local matrix; actual-GPU two-step CPU parity passed under Muon, and `MEM=3G ./tools/test_host.sh gpu_muon_` passed 4. Local optimizer gradients/state/final updates remain host-staged; Muon orthogonalization is native Oxide. Unsupported activations retain the legacy host path. No compiled-C++ golden, full-suite, or performance claim.
+
+## 71. GPU Muon RNN matrices
+
+- v0.2.049: extended hybrid GPU Muon eligibility to RNN's input, recurrent, and output matrices, using the existing native-device RNN forward/backward and Oxide orthogonalization with host-staged gradients/state/final updates. Actual-GPU two-step CPU parity passed for outputs, all three weight groups, and biases (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_rnn_device_matrices_match_cpu_across_steps`); host `MEM=3G ./tools/test_host.sh gpu_muon_` passed 4. No compiled-C++ golden, full-suite, or performance claim.
 
 ## Not implemented / open (pointer)
 

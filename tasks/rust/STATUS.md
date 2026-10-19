@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.049: extended hybrid GPU Muon to RNN input/recurrent/output matrices; actual-Oxide two-step CPU parity and host `gpu_muon_` filter (4) passed. RNN gradients/state/final updates remain host-staged; no C++ golden/full-suite/performance claim. See `implemented.md` §71.
 - v0.2.048: added native Oxide f32 `[local]` forward/backward with supported-activation runtime dispatch and hybrid GPU Muon eligibility for each location-specific matrix. Oxide primitive parity (2), actual-GPU two-step SGD and Muon CPU parity, host `local` filter (11), and host `gpu_muon_` filter (4) passed. Local optimizer updates/state remain host-staged. See `implemented.md` §70; no C++ golden/full-suite/performance claim.
 - v0.2.047 (`fb05dad0`): extended hybrid GPU Muon to KimiKda matrices; actual-Oxide two-step CPU parity and host `gpu_muon_` filter passed. KimiKda layer ops and optimizer state/final updates remain host-side. See `implemented.md` §69.
 - v0.2.046 (`dd40ca39`): extended hybrid GPU Muon to MambaVision matrices; actual-Oxide two-step CPU parity and host `gpu_muon_` filter passed. MambaVision layer ops and optimizer state/final updates remain host-side. See `implemented.md` §69.
