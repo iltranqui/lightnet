@@ -10303,12 +10303,16 @@ where
                 (LayerKind::EmlConvolutional(spec), LayerParams::EmlConvolutional(_)) => {
                     spec.branch.batch_normalize
                 }
+                (LayerKind::Moe(spec), LayerParams::Moe(_)) => {
+                    spec.expert.batch_normalize
+                }
                 _ => !matches!(
                     (kind, *params),
                     (_, LayerParams::None)
                         | (LayerKind::BatchNorm(_), LayerParams::BatchNorm(_))
                         | (LayerKind::Connected(_), LayerParams::Connected(_))
                         | (LayerKind::EmlConvolutional(_), LayerParams::EmlConvolutional(_))
+                        | (LayerKind::Moe(_), LayerParams::Moe(_))
                         | (LayerKind::Local(_), LayerParams::Local(_))
                         | (LayerKind::Rnn(_), LayerParams::Rnn(_))
                         | (LayerKind::Lstm(_), LayerParams::Lstm(_))
@@ -10326,7 +10330,7 @@ where
         }) {
             return Err(Error::UnsupportedLayer {
                 layer_index: index,
-                name: "GPU Muon supports standard convolution and EML matrices without BN via host-staged device gradients, plus host-gradient local/RNN/LSTM/Kimi/MambaVision/Tucker/Swin/ViT/deconvolutional/connected matrices and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
+                name: "GPU Muon supports standard convolution, EML, and MoE matrices without BN via host-staged device gradients, plus host-gradient local/RNN/LSTM/Kimi/MambaVision/Tucker/Swin/ViT/deconvolutional/connected matrices and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
             });
         }
         let step = self.adam_step.checked_add(1).ok_or_else(|| {
@@ -10452,6 +10456,72 @@ where
                 train.input.bias_updates = device_gradients.1;
                 train.self_params.weight_updates = device_gradients.2;
                 train.self_params.bias_updates = device_gradients.3;
+            }
+            if let LayerKind::Moe(spec) = &layer.kind
+                && !spec.expert.batch_normalize
+            {
+                let device_gradients = {
+                    let device_buffers = self.device_moe_train_buffers.borrow();
+                    let train = device_buffers
+                        .get(index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing device MoE gradients for Muon layer #{index}"
+                            ))
+                        })?;
+                    if train.expert_weight_updates.len() != spec.experts
+                        || train.expert_bias_updates.len() != spec.experts
+                        || train.expert_scale_updates.len() != spec.experts
+                        || train.expert_scale_updates.iter().any(Option::is_some)
+                    {
+                        return Err(Error::InvalidConfig(format!(
+                            "GPU Muon MoE gradient layout mismatch at layer #{index}"
+                        )));
+                    }
+                    let experts = train
+                        .expert_weight_updates
+                        .iter()
+                        .zip(&train.expert_bias_updates)
+                        .map(|(weights, biases)| {
+                            Ok((
+                                self.backend.download_f32(weights).map_err(|err| {
+                                    backend_error("download MoE expert Muon gradients", err)
+                                })?,
+                                self.backend.download_f32(biases).map_err(|err| {
+                                    backend_error("download MoE expert bias gradients", err)
+                                })?,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    (
+                        self.backend
+                            .download_f32(&train.router_weight_updates)
+                            .map_err(|err| backend_error("download MoE router Muon gradients", err))?,
+                        self.backend
+                            .download_f32(&train.router_bias_updates)
+                            .map_err(|err| backend_error("download MoE router bias gradients", err))?,
+                        experts,
+                    )
+                };
+                let LayerTrainBuffers::Moe(train) = &mut buffers[index] else {
+                    return Err(Error::InvalidConfig(format!(
+                        "MoE Muon layer #{index} has mismatched host train buffers"
+                    )));
+                };
+                train.router_weight_updates = device_gradients.0;
+                train.router_bias_updates = device_gradients.1;
+                if train.experts.len() != device_gradients.2.len() {
+                    return Err(Error::InvalidConfig(format!(
+                        "MoE Muon host expert count mismatch at layer #{index}"
+                    )));
+                }
+                for (expert, (weights, biases)) in
+                    train.experts.iter_mut().zip(device_gradients.2)
+                {
+                    expert.weight_updates = weights;
+                    expert.bias_updates = biases;
+                }
             }
             prepare_muon_layer_gradients(
                 &layer.kind,
@@ -10657,6 +10727,54 @@ where
                 muon_state,
                 staged,
             )?;
+            if let (LayerKind::Moe(spec), LayerParams::Moe(params)) =
+                (&layer.kind, &self.params[index])
+                && !spec.expert.batch_normalize
+            {
+                for (slot, expert) in params.experts.iter().enumerate() {
+                    let refreshed = self.cached_convolution_upload(
+                        &spec.expert,
+                        layer.input_shape.channels,
+                        expert,
+                        None,
+                    )?;
+                    self.set_device_conv_params(index, slot, refreshed)?;
+                }
+                let mut device_buffers = self.device_moe_train_buffers.borrow_mut();
+                let train = device_buffers[index].as_mut().ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "missing device MoE buffers after Muon layer #{index} update"
+                    ))
+                })?;
+                train.router_weight_updates = self
+                    .backend
+                    .zeros_f32(&[spec.experts, layer.input_shape.channels])
+                    .map_err(|err| backend_error("zero MoE router Muon gradients", err))?;
+                train.router_bias_updates = self
+                    .backend
+                    .zeros_f32(&[spec.experts])
+                    .map_err(|err| backend_error("zero MoE router bias gradients", err))?;
+                train.expert_weight_updates = (0..spec.experts)
+                    .map(|_| {
+                        self.backend
+                            .zeros_f32(&[
+                                spec.expert.filters,
+                                layer.input_shape.channels / spec.expert.groups.max(1),
+                                spec.expert.size,
+                                spec.expert.size,
+                            ])
+                            .map_err(|err| backend_error("zero MoE expert Muon gradients", err))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                train.expert_bias_updates = (0..spec.experts)
+                    .map(|_| {
+                        self.backend
+                            .zeros_f32(&[spec.expert.filters])
+                            .map_err(|err| backend_error("zero MoE expert bias gradients", err))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                train.dirty = false;
+            }
             if let (LayerKind::EmlConvolutional(spec), LayerParams::EmlConvolutional(params)) =
                 (&layer.kind, &self.params[index])
                 && !spec.branch.batch_normalize
@@ -46224,6 +46342,40 @@ activation=linear
             .contains("other parameter families remain explicitly unsupported"));
         assert_eq!(eml.params, before);
         assert_eq!(eml.adam_step, 0);
+
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "muon-moe-bn.cfg",
+                r#"[net]
+width=2
+height=2
+channels=2
+batch=1
+muon=1
+decoupled_decay=1
+[moe_convolutional]
+filters=2
+size=1
+experts=2
+top_k=0
+batch_normalize=1
+"#,
+            )
+            .expect("MoE Muon cfg should parse"),
+        )
+        .expect("MoE Muon network should build");
+        let mut moe = GpuExecutableNetwork::new(network, FakeBackend);
+        moe.init_train_buffers_gpu()
+            .expect("MoE Muon buffers should initialize");
+        let before = moe.params.clone();
+        let error = moe
+            .update_weights_gpu(0.01, 0.9, 0.0005, 1)
+            .expect_err("batch-normalized MoE Muon staging is not integrated yet");
+        assert!(error
+            .to_string()
+            .contains("other parameter families remain explicitly unsupported"));
+        assert_eq!(moe.params, before);
+        assert_eq!(moe.adam_step, 0);
     }
 
     #[test]

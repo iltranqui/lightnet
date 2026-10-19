@@ -3351,6 +3351,104 @@ fn gpu_muon_eml_device_gradients_match_cpu_across_steps() {
 }
 
 #[test]
+fn gpu_muon_moe_device_gradients_match_cpu_across_steps() {
+    let net = network(
+        r#"[net]
+width=3
+height=2
+channels=2
+batch=2
+muon=1
+decoupled_decay=1
+decay=0.0001
+[moe_convolutional]
+filters=2
+size=1
+experts=2
+top_k=0
+load_balance=0.05
+temperature=1.4
+batch_normalize=0
+activation=leaky
+"#,
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    darknet_core::initialize_training_params(&net, &mut cpu.params, 97);
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("MoE Muon train buffers");
+
+    for step in 1..=2 {
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu().expect("zero MoE Muon buffers");
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).expect("CPU MoE Muon forward");
+        let gpu_forward = gpu
+            .forward_training_device(&input)
+            .expect("Oxide MoE Muon forward");
+        assert!(gpu_forward.cpu_forward.moe_caches[0].is_none());
+        let gpu_output = gpu
+            .backend
+            .download_f32(&gpu_forward.gpu_layer_outputs[0])
+            .expect("download MoE Muon output");
+        close(
+            &format!("MoE Muon output step {step}"),
+            &gpu_output,
+            &cpu_forward.layer_outputs[0].data,
+            3e-4,
+        );
+        for microbatch in 0..2 {
+            let seed = Tensor::filled(
+                cpu.network.layers[0].output_shape,
+                0.025 + step as f32 * 0.008 + microbatch as f32 * 0.004,
+            );
+            let seeds = [Some(seed)];
+            cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+                .expect("CPU MoE Muon backward");
+            gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+                .expect("Oxide MoE Muon backward");
+        }
+        cpu.update_weights_muon(0.01, 2)
+            .expect("CPU MoE Muon update");
+        gpu.update_weights_gpu(0.01, 0.9, net.net.decay, 2)
+            .expect("Oxide MoE Muon update");
+        let (LayerParams::Moe(cpu_moe), LayerParams::Moe(gpu_moe)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("MoE parameter layout expected");
+        };
+        close(
+            &format!("MoE router weights step {step}"),
+            &gpu_moe.router_weights,
+            &cpu_moe.router_weights,
+            8e-4,
+        );
+        close(
+            &format!("MoE router biases step {step}"),
+            &gpu_moe.router_biases,
+            &cpu_moe.router_biases,
+            8e-4,
+        );
+        for (index, (cpu_expert, gpu_expert)) in
+            cpu_moe.experts.iter().zip(&gpu_moe.experts).enumerate()
+        {
+            close(
+                &format!("MoE expert {index} weights step {step}"),
+                &gpu_expert.weights,
+                &cpu_expert.weights,
+                8e-4,
+            );
+            close(
+                &format!("MoE expert {index} biases step {step}"),
+                &gpu_expert.biases,
+                &cpu_expert.biases,
+                8e-4,
+            );
+        }
+    }
+}
+
+#[test]
 fn gpu_muon_local_location_matrices_match_cpu_across_steps() {
     let net = network(
         "[net]\nwidth=4\nheight=4\nchannels=2\nbatch=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0001\n\
