@@ -229,6 +229,12 @@ reference tolerance is `TOL_COMPOSED = 1e-4` rather than the single-stage `2e-6`
 
 ## P8/P9 training follow-ups
 
+- [x] v0.2.082: RNN training with rolling-stat BN now uses native device forward
+  projections and the existing native BN recurrent backward. `MEM=3G
+  ./tools/test_oxide.sh --test oxide_runtime_chain rnn` passed 6 tests,
+  including `batch_normalized_rnn_device_backward_matches_cpu_on_oxide` with
+  parameter/update parity. Unsupported recurrent activations keep the CPU path;
+  GPU BN LSTM training remains host fallback.
 - [~] Recurrent GPU execution: no-BN RNN projections and CRNN recurrent
   convolutions use backend forward/backward ops. No-BN LSTM gates/cell products,
   BPTT gate derivatives, connected backward, and recurrent/input-gradient
@@ -250,11 +256,14 @@ reference tolerance is `TOL_COMPOSED = 1e-4` rather than the single-stage `2e-6`
   centering, channel-scale, pointwise-multiply, and channel-reduction ops; the
   Oxide path no longer transfers raw projections/convolutions and deltas to host
   just for dscale.
-  Recurrent BN forward/cache capture, rolling-stat update, and optimizer remain
-  host-side. FakeBackend and real Oxide parity cover parameter, rolling-stat,
-  and upstream connected/convolution updates. Dynamic loss-scale finiteness
-  checks include host-buffered connected/recurrent gradients. Unsupported
-  recurrent activations still use CPU backward.
+  RNN rolling-stat BN forward is now native for supported activations (inference
+  v0.2.080, training v0.2.082); its BN backward uses the existing native
+  projection/BPTT path. BN LSTM forward/training remains host fallback despite
+  native BN inference (v0.2.081); BN CRNN forward/cache capture remain host-side.
+  FakeBackend and real Oxide parity cover parameter, rolling-stat, and upstream
+  connected/convolution updates. Dynamic loss-scale finiteness checks include
+  host-buffered connected/recurrent gradients. Unsupported recurrent
+  activations still use CPU backward.
 - [x] Host Adam: connected, standalone batchnorm, local, weighted shortcut,
   MoE fallback, deconvolutional, GRU/RNN/LSTM/CRNN, and ViT host params use
   per-layer rate scaling and persisted host moments. DNOPT3 also persists

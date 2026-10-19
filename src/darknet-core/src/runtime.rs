@@ -14458,11 +14458,9 @@ where
                     }
                 }
                 (LayerKind::Rnn(spec), LayerParams::Rnn(recurrent)) => {
-                    if !training
-                        || (!spec.batch_normalize
-                            && recurrent.input.batch_norm.is_none()
-                            && recurrent.self_params.batch_norm.is_none()
-                            && recurrent.output.batch_norm.is_none())
+                    if spec.activation.to_cuda_f32_kind().is_some()
+                        && (spec.logistic != 2
+                            || Activation::Loggy.to_cuda_f32_kind().is_some())
                     {
                         let (output, cache, device_cache) = forward_rnn_layer_device(
                             &self.backend,

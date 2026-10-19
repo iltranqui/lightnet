@@ -130,6 +130,7 @@ file is named inline.
 - [102. Native GRU GPU inference](#102-native-gru-gpu-inference)
 - [103. Native RNN rolling-stat BN inference](#103-native-rnn-rolling-stat-bn-inference)
 - [104. Native LSTM rolling-stat BN inference](#104-native-lstm-rolling-stat-bn-inference)
+- [105. Native RNN rolling-stat BN training](#105-native-rnn-rolling-stat-bn-training)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1715,6 +1716,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 104. Native LSTM rolling-stat BN inference
 
 - v0.2.081: native f32 LSTM inference now dispatches through device recurrent projections with rolling-stat BN folded into the four recurrent and four input projection weight/bias pairs. BN training remains on the host fallback. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain lstm` passed 4 tests, including `lstm_native_inference_matches_cpu_with_rolling_batch_norm` and existing LSTM forward/backward/Muon regressions. Rust CPU-reference parity only; no C++ golden, full-suite or performance claim.
+
+## 105. Native RNN rolling-stat BN training
+
+- v0.2.082: extended the device RNN forward to fold each rolling-stat BN affine into its projection during training as well as inference. The existing GPU recurrent backward path already handles rolling-stat BN affine/scale gradients, so BN RNN no longer needs host forward/backward fallback for supported activations. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain rnn` passed 6 tests, including `batch_normalized_rnn_device_backward_matches_cpu_on_oxide` (forward outputs, backward gradients, and parameter updates vs CPU) and existing non-BN RNN/CRNN regressions. Unsupported activations remain host fallback; no C++ golden/full-suite/performance claim.
 
 ## Not implemented / open (pointer)
 
