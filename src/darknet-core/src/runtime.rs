@@ -13131,10 +13131,12 @@ where
                         .map_err(|err| backend_error("upload laya_loss output", err))?
                 }
                 (LayerKind::GraphConv(spec), LayerParams::GraphConv(params)) => {
-                    if graph_conv_spec_needs_host(spec)
-                        || self.requires_cpu_backward_fallback()
-                        || has_host_only_deform(&self.network)
-                    {
+                    let graph_conv_host_fallback = graph_conv_spec_needs_compact_host(spec)
+                        || (training
+                            && (graph_conv_spec_needs_host(spec)
+                                || self.requires_cpu_backward_fallback()
+                                || has_host_only_deform(&self.network)));
+                    if graph_conv_host_fallback {
                         let current_host = if layer.index == 0 {
                             input
                         } else {
@@ -13262,20 +13264,40 @@ where
                         } else {
                             raw
                         };
-                        let biases = self
-                            .backend
-                            .upload_f32(&[spec.filters], &params.projection.biases)
-                            .map_err(|err| backend_error("upload GraphConv projection biases", err))?;
-                        let biased = self
-                            .backend
-                            .bias_add_f32(
+                        let biased = if spec.batch_normalize {
+                            let mut batch_norm = params
+                                .projection
+                                .batch_norm
+                                .clone()
+                                .ok_or_else(|| {
+                                    Error::InvalidConfig(
+                                        "GraphConv batch-norm parameters are missing".to_owned(),
+                                    )
+                                })?;
+                            batch_norm.biases.clone_from(&params.projection.biases);
+                            self.forward_batchnorm_inference_gpu(
                                 &raw,
-                                &biases,
-                                spec.filters,
-                                layer.output_shape.width * layer.output_shape.height,
+                                layer.output_shape,
+                                &batch_norm,
                                 launch_config,
-                            )
-                            .map_err(|err| backend_error("GraphConv projection bias", err))?;
+                            )?
+                        } else {
+                            let biases = self
+                                .backend
+                                .upload_f32(&[spec.filters], &params.projection.biases)
+                                .map_err(|err| {
+                                    backend_error("upload GraphConv projection biases", err)
+                                })?;
+                            self.backend
+                                .bias_add_f32(
+                                    &raw,
+                                    &biases,
+                                    spec.filters,
+                                    layer.output_shape.width * layer.output_shape.height,
+                                    launch_config,
+                                )
+                                .map_err(|err| backend_error("GraphConv projection bias", err))?
+                        };
                         activation_input_gpu = Some(biased.clone());
                         if let Some(normalization) = spec.activation.to_channel_normalization() {
                             self.backend
@@ -34076,6 +34098,47 @@ mod tests {
         };
         assert_eq!(train.projection.bias_updates, vec![4.0]);
         assert!(train.projection.batch_norm.as_ref().unwrap().scale_updates[0].abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn graph_conv_batchnorm_inference_uses_gpu_backend_without_cpu_cache() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "graph-conv-bn-inference.cfg",
+                "[net]\nwidth=2\nheight=1\nchannels=1\nbatch=2\n[graph_conv]\nfilters=1\nsize=1\nedge_mode=0\ngraph_use_self=0\nbatch_normalize=1\nactivation=linear\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        let LayerParams::GraphConv(params) = &mut cpu.params[0] else {
+            panic!("graph_conv params");
+        };
+        params.projection.weights[0] = 0.7;
+        params.projection.biases[0] = -0.15;
+        let batch_norm = params.projection.batch_norm.as_mut().unwrap();
+        batch_norm.scales[0] = 1.4;
+        batch_norm.rolling_mean[0] = 0.25;
+        batch_norm.rolling_variance[0] = 0.6;
+        let input = Tensor::from_data(
+            TensorShape::new(2, 1, 1, 2),
+            vec![0.2, -0.4, 0.8, 0.5],
+        )
+        .unwrap();
+        let cpu_forward = cpu.forward(&input).unwrap();
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        gpu.params = cpu.params.clone();
+        let gpu_forward = gpu.forward_with_state(&input).unwrap();
+        assert!(gpu_forward.cpu_forward.graph_conv_caches[0].is_none());
+        let actual = &gpu_forward.cpu_forward.layer_outputs[0].data;
+        let expected = &cpu_forward.layer_outputs[0].data;
+        assert_eq!(actual.len(), expected.len());
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-6,
+                "GraphConv full BN inference[{index}]: {actual} vs {expected}"
+            );
+        }
     }
 
     #[test]

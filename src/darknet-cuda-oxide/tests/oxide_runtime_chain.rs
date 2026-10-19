@@ -5036,7 +5036,14 @@ fn graph_conv_compact_inference_matches_cpu_with_batch_norm() {
     let input = patterned(cpu.network.net.input_shape());
     let cpu_output = cpu
         .forward(&input)
-        .expect("CPU compact GraphConv BN reference");
+        .expect("CPU GraphConv BN reference");
+    let full = gpu.forward(&input).expect("native full GraphConv BN inference");
+    close(
+        "GraphConv full BN inference",
+        &full.final_output().expect("full GraphConv output").data,
+        &cpu_output.final_output().expect("CPU GraphConv output").data,
+        6e-5,
+    );
     let compact = gpu
         .forward_compact(&input)
         .expect("native compact GraphConv BN");
