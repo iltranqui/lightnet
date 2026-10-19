@@ -232,6 +232,17 @@ pub mod kernels {
         }
     }
 
+    /// `out = f16(act(input * source))` for same-shaped SAM tensors.
+    #[kernel]
+    pub fn sam_f16(input: &[u16], source: &[u16], mut out: DisjointSlice<u16>, kind: u32) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(value) = out.get_mut(idx) {
+            let product = f16_bits_to_f32(input[i]) * f16_bits_to_f32(source[i]);
+            *value = f32_to_f16_bits(activate(kind, product), 0);
+        }
+    }
+
     /// `out = f16(act(x * scale[c] + bias[c]))`, `c = (i / stride) % channels`
     /// (standalone bias + activation and the folded inference batch norm).
     /// `has_scale == 0` ignores `scale` (any buffer may be passed).

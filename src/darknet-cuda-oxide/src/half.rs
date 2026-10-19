@@ -944,6 +944,35 @@ impl OxideBackend {
         Ok(OxideTensorF16::new(out, a.shape()))
     }
 
+    /// f16 SAM product and activation with exact shape checks.
+    pub fn sam_f16(
+        &self,
+        input: &OxideTensorF16,
+        source: &OxideTensorF16,
+        output_shape: &[usize],
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF16, OxideError> {
+        if input.shape() != output_shape || source.shape() != output_shape {
+            return Err(shape_err("sam_f16", "input, source and output shapes must match".to_owned()));
+        }
+        let mut output = self.alloc16_uninit(input.len())?;
+        // SAFETY: all tensors have the same shape and length; one thread writes
+        // each element after widening both half inputs for the product.
+        unsafe {
+            self.half_ops.sam_f16(
+                &self.stream,
+                launch::elementwise(input.len(), config),
+                &input.buf,
+                &source.buf,
+                &mut output,
+                activation_code(activation),
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF16::new(output, output_shape))
+    }
+
     /// `f16(act(x * scale[c] + bias[c]))` per channel (`c = (i / channel_stride) % channels`);
     /// `scale = None` is bias + activation only.  The folded inference batch norm.
     pub fn channel_affine_act_f16(
@@ -1295,6 +1324,17 @@ impl darknet_cuda::F16TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error> {
         OxideBackend::shortcut_add_act_f16(self, a, b, activation, config)
+    }
+
+    fn sam_f16(
+        &self,
+        input: &Self::TensorF16,
+        source: &Self::TensorF16,
+        output_shape: &[usize],
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error> {
+        OxideBackend::sam_f16(self, input, source, output_shape, activation, config)
     }
 
     fn channel_affine_act_f16(

@@ -141,6 +141,15 @@ fn maxpool_depth_f16_inference_matches_f32() {
 }
 
 #[test]
+fn sam_f16_inference_matches_f32() {
+    let cfg = "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\n\
+        [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
+        [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
+        [sam]\nfrom=0\nactivation=leaky\n";
+    run_pair("sam f16", network(cfg), 41, 0.75, 4e-3);
+}
+
+#[test]
 fn tiny_net_with_shortcut_maxpool_route_upsample_matches_f32() {
     let cfg = "[net]\nwidth=16\nheight=16\nchannels=3\nbatch=2\n\
         [convolutional]\nbatch_normalize=1\nfilters=8\nsize=3\nstride=1\npad=1\nactivation=leaky\n\

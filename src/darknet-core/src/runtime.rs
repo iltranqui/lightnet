@@ -8499,7 +8499,7 @@ where
     /// activations are stored as binary16 on the device (f32 accumulation,
     /// bias and activation), the yolo heads are widened to f32 on download.
     /// Supports convolutional, maxpool, (local) avgpool, standalone batchnorm,
-    /// route, LAYA marker gather, shortcut (mismatched sources are cropped /
+    /// route, LAYA marker gather, SAM, shortcut (mismatched sources are cropped /
     /// zero-padded like Darknet), upsample (also `reverse`) and yolo-style pass-through layers;
     /// any other layer returns `UnsupportedLayer` (use `forward_compact`).
     pub fn forward_compact_f16(&self, input: &Tensor) -> Result<GpuForwardSummary> {
@@ -8527,6 +8527,7 @@ where
                 | LayerKind::BatchNorm(_)
                 | LayerKind::Route(_)
                 | LayerKind::LayaMarkerGather(_)
+                | LayerKind::Sam(_)
                 | LayerKind::Upsample(_)
                 | LayerKind::Yolo(_)
                 | LayerKind::ObbYolo(_)
@@ -8772,6 +8773,39 @@ where
                             .map_err(|err| backend_error("f16 shortcut add", err))?;
                     }
                     accumulated
+                }
+                (LayerKind::Sam(spec), LayerParams::None) => {
+                    let source_index = resolve_relative_layer(layer.index, spec.from)?;
+                    let source_layer = self.network.layers.get(source_index).ok_or(
+                        Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.from,
+                        },
+                    )?;
+                    let source = gpu_layer_outputs
+                        .get(source_index)
+                        .and_then(Option::as_ref)
+                        .ok_or(Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.from,
+                        })?;
+                    if layer.input_shape != layer.output_shape
+                        || source_layer.output_shape != layer.output_shape
+                    {
+                        return Err(Error::InvalidConfig(format!(
+                            "sam shape mismatch: input {}, source {}, output {}",
+                            layer.input_shape, source_layer.output_shape, layer.output_shape
+                        )));
+                    }
+                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+                    self.backend.sam_f16(
+                        current_input.expect("sam requires current input"),
+                        source,
+                        &tensor_backend_shape(layer.output_shape),
+                        activation,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("f16 sam", err))?
                 }
                 (LayerKind::Route(spec), LayerParams::None) => {
                     let mut route_inputs = Vec::with_capacity(spec.layers.len());
@@ -26151,6 +26185,10 @@ fn gpu_layer_output_use_counts(network: &Network) -> Result<Vec<usize>> {
                 let source_index = resolve_relative_layer(layer.index, spec.from)?;
                 use_counts[source_index] += 1;
             }
+            LayerKind::Sam(spec) => {
+                let source_index = resolve_relative_layer(layer.index, spec.from)?;
+                use_counts[source_index] += 1;
+            }
             LayerKind::LayaMarkerGather(spec) => {
                 for raw_index in &spec.layers {
                     let source_index = resolve_relative_layer(layer.index, *raw_index)?;
@@ -26216,6 +26254,10 @@ fn release_gpu_sources_for_layer<T: Clone>(
             }
         }
         LayerKind::ChannelSlice(spec) => {
+            let source_index = resolve_relative_layer(layer_index, spec.from)?;
+            release_gpu_source(source_index, remaining_uses, gpu_layer_outputs)?;
+        }
+        LayerKind::Sam(spec) => {
             let source_index = resolve_relative_layer(layer_index, spec.from)?;
             release_gpu_source(source_index, remaining_uses, gpu_layer_outputs)?;
         }

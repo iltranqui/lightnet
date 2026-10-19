@@ -3150,6 +3150,15 @@ pub trait F16TensorOpsBackend: F32TensorOpsBackend {
         activation: F32ActivationKind,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error>;
+    /// SAM inference: `f16(act(input * source))` for same-shaped inputs.
+    fn sam_f16(
+        &self,
+        input: &Self::TensorF16,
+        source: &Self::TensorF16,
+        output_shape: &[usize],
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error>;
     /// `f16(activation(x * scale[c] + bias[c]))` per channel (`scale = None`:
     /// bias + activation only); `scale` / `bias` are f32 `[channels]`.
     fn channel_affine_act_f16(
