@@ -3150,6 +3150,95 @@ fn gpu_muon_connected_two_step_update_matches_cpu() {
 }
 
 #[test]
+fn gpu_muon_connected_batch_norm_matches_cpu_across_steps() {
+    let net = network(
+        "[net]\nwidth=2\nheight=1\nchannels=1\nbatch=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0002\nloss_scale=1\n\
+         [connected]\noutput=3\nbatch_normalize=1\nactivation=linear\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let LayerParams::Connected(params) = &mut cpu.params[0] else {
+        panic!("connected parameters expected");
+    };
+    params.weights.copy_from_slice(&[0.2, -0.1, 0.3, 0.4, -0.25, 0.15]);
+    params.biases.copy_from_slice(&[0.03, -0.02, 0.01]);
+    let bn = params.batch_norm.as_mut().expect("connected BN parameters");
+    bn.scales.copy_from_slice(&[0.7, 1.1, 0.85]);
+    bn.biases.copy_from_slice(&[-0.04, 0.02, 0.06]);
+    bn.rolling_mean.copy_from_slice(&[0.1, -0.05, 0.08]);
+    bn.rolling_variance.copy_from_slice(&[0.8, 1.2, 0.65]);
+
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+    gpu.params = cpu.params.clone();
+    for step in 1..=2 {
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
+        let gpu_forward = gpu
+            .forward_training_device(&input)
+            .expect("Oxide connected BN forward");
+        let gpu_output = gpu
+            .backend
+            .download_f32(&gpu_forward.gpu_layer_outputs[0])
+            .expect("download connected BN output");
+        close(
+            &format!("connected BN forward step {step}"),
+            &gpu_output,
+            &cpu_forward.layer_outputs[0].data,
+            3e-5,
+        );
+        let seed = Tensor::filled(
+            cpu.network.layers[0].output_shape,
+            0.05 * step as f32,
+        );
+        let seeds = [Some(seed)];
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU connected BN backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("GPU Muon connected BN backward");
+        cpu.update_weights_muon(0.02, 2)
+            .expect("CPU connected BN Muon update");
+        gpu.update_weights_gpu(0.02, 0.9, net.net.decay, 2)
+            .expect("GPU connected BN Muon update");
+        let (LayerParams::Connected(cpu_params), LayerParams::Connected(gpu_params)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("connected parameters expected after update");
+        };
+        close(
+            &format!("connected BN Muon weights step {step}"),
+            &gpu_params.weights,
+            &cpu_params.weights,
+            8e-4,
+        );
+        close(
+            &format!("connected BN Muon biases step {step}"),
+            &gpu_params.biases,
+            &cpu_params.biases,
+            8e-4,
+        );
+        let cpu_bn = cpu_params.batch_norm.as_ref().expect("CPU BN state");
+        let gpu_bn = gpu_params.batch_norm.as_ref().expect("GPU BN state");
+        close(
+            &format!("connected BN Muon scales step {step}"),
+            &gpu_bn.scales,
+            &cpu_bn.scales,
+            8e-4,
+        );
+        close(
+            &format!("connected BN Muon rolling mean step {step}"),
+            &gpu_bn.rolling_mean,
+            &cpu_bn.rolling_mean,
+            1e-6,
+        );
+        close(
+            &format!("connected BN Muon rolling variance step {step}"),
+            &gpu_bn.rolling_variance,
+            &cpu_bn.rolling_variance,
+            1e-6,
+        );
+    }
+}
+
+#[test]
 fn gpu_muon_multiple_connected_layers_match_cpu_across_steps() {
     let net = network(
         "[net]\nwidth=2\nheight=1\nchannels=1\nbatch=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0005\nloss_scale=8\n\
