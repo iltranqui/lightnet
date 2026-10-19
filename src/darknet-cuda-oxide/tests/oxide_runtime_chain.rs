@@ -4245,7 +4245,7 @@ fn gpu_muon_vit_host_gradient_matrices_match_cpu_across_steps() {
 fn gpu_muon_graph_conv_matrices_match_cpu_across_steps() {
     let net = network(
         "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0005\n\
-         [graph_conv]\nfilters=2\ngroups=1\nsize=3\npad=1\nedge_mode=1\ngraph_use_self=1\nactivation=leaky\n",
+         [graph_conv]\nfilters=2\ngroups=2\nsize=3\npad=1\nedge_mode=1\ngraph_use_self=1\nactivation=leaky\n",
     );
     let mut cpu = ExecutableNetwork::new(net.clone());
     let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
