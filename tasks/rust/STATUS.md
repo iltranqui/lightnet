@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.041 (`4edd8860`): actual-Oxide connected GPU Muon with batch normalization matched CPU for outputs, parameters, scales and rolling stats across two updates. It exercises the host-backward fallback, not native connected BN backward; other Muon families/gates remain open. See `implemented.md` §69.
 - v0.2.040 (`798d3389`): actual-Oxide deconvolution runtime-chain CPU parity passed for two-step SGD and Adam updates. Optimizer staging remains host-side; focused test only, no full-suite/C++ claim. See `implemented.md` §69.
 - v0.2.039 (`b1fef3f9`): added native Oxide f32 deconvolution forward/backward runtime operations with legacy host routing for unmapped activations. Actual-GPU CPU-parity chain and host SGD/Adam path tests passed; optimizer staging remains host-side. No full-suite/C++ claim; see `implemented.md` §69.
 - v0.2.038 (`fadfcb95`): actual-GPU CPU parity passed for connected Muon `burnin_update` gating (blocked before burn-in, update after). Other gate variants/connected BN remain open. See `implemented.md` §69.
