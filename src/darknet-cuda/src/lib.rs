@@ -1923,6 +1923,74 @@ pub trait F32TensorOpsBackend {
         }
         self.upload_f32(&[batch, experts], &dlogit)
     }
+    /// Run the HF pooled-source MLP and constrain its per-sample parameters.
+    /// The Oxide backend overrides this composite with device pooling, linear
+    /// projections, ReLU, and output constraints.
+    fn hyperbolic_foveation_predictor_f32(
+        &self,
+        input: &Self::Tensor,
+        shape: &[usize],
+        downsample: usize,
+        hidden_count: usize,
+        param_count: usize,
+        w1: &[f32],
+        b1: &[f32],
+        w2: &[f32],
+        b2: &[f32],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert_eq!(shape.len(), 4, "HF predictor expects NCHW source shape");
+        assert!(downsample > 0 && hidden_count > 0 && param_count >= 4);
+        let [batch, channels, height, width] = [shape[0], shape[1], shape[2], shape[3]];
+        let source = self.download_f32(input)?;
+        assert_eq!(source.len(), batch * channels * height * width);
+        let pooled_height = (height / downsample).max(1);
+        let pooled_width = (width / downsample).max(1);
+        let input_dim = channels * pooled_height * pooled_width;
+        let mut pooled = vec![0.0; batch * input_dim];
+        for b in 0..batch {
+            for c in 0..channels {
+                for oy in 0..pooled_height {
+                    for ox in 0..pooled_width {
+                        let mut sum = 0.0;
+                        let mut count = 0usize;
+                        for ky in 0..downsample {
+                            let y = oy * downsample + ky;
+                            for kx in 0..downsample {
+                                let x = ox * downsample + kx;
+                                if y < height && x < width {
+                                    sum += source[((b * channels + c) * height + y) * width + x];
+                                    count += 1;
+                                }
+                            }
+                        }
+                        pooled[b * input_dim + (c * pooled_height + oy) * pooled_width + ox] = sum / count as f32;
+                    }
+                }
+            }
+        }
+        let preactivation = host_ops::linear(&pooled, batch, input_dim, hidden_count, w1, Some(b1));
+        let hidden: Vec<f32> = preactivation.into_iter().map(|value| value.max(0.0)).collect();
+        let raw = host_ops::linear(&hidden, batch, hidden_count, param_count, w2, Some(b2));
+        let constrained: Vec<f32> = raw
+            .into_iter()
+            .enumerate()
+            .map(|(i, value)| {
+                let parameter = i % param_count;
+                if parameter < 2 {
+                    0.9 * value.tanh()
+                } else if parameter + 1 == param_count {
+                    if value >= 0.0 { 1.0 / (1.0 + (-value).exp()) } else { let exp = value.exp(); exp / (1.0 + exp) }
+                } else {
+                    let softplus = if value > 20.0 { value } else { value.exp().ln_1p() };
+                    (2.0 * softplus + 0.1).clamp(0.1, 2.0)
+                }
+            })
+            .collect();
+        self.upload_f32(&[batch, param_count], &constrained)
+    }
+
     /// Generate the isotropic fixed-point HF sampling grid. Other inverse
     /// methods/radius modes continue using the explicit host reference path.
     fn hyperbolic_fixed_point_grid_f32(

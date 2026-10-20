@@ -13003,7 +13003,7 @@ where
                     let host_input = self
                         .download_tensor(current_input, layer.input_shape)
                         .map_err(|err| backend_error("download hyperbolic_foveation input", err))?;
-                    let (_host_output, cache) = forward_hyperbolic_foveation(
+                    let (_host_output, mut cache) = forward_hyperbolic_foveation(
                         &self.network,
                         layer,
                         spec,
@@ -13012,9 +13012,47 @@ where
                         &host_input,
                         &layer_outputs,
                     )?;
-                    let grid = if spec.inverse_method == crate::model::HfInverseMethod::FixedPoint
-                        && spec.radius_mode == crate::model::HfRadiusMode::Isotropic
-                    {
+                    let native_fixed_point = spec.inverse_method == crate::model::HfInverseMethod::FixedPoint
+                        && spec.radius_mode == crate::model::HfRadiusMode::Isotropic;
+                    if native_fixed_point && spec.pred_hidden > 0 {
+                        let predictor_source = if let Some(source_layer) = spec.pred_source_layer {
+                            gpu_layer_outputs.get(source_layer).ok_or_else(|| {
+                                Error::InvalidConfig(format!(
+                                    "[hyperbolic_foveation] predictor source layer #{source_layer} is unavailable on device"
+                                ))
+                            })?
+                        } else {
+                            current_input
+                        };
+                        let predicted = self.backend
+                            .hyperbolic_foveation_predictor_f32(
+                                predictor_source,
+                                &tensor_backend_shape(spec.pred_input_shape),
+                                spec.downsample,
+                                spec.pred_hidden,
+                                spec.param_count(),
+                                &params.pred_w1,
+                                &params.pred_b1,
+                                &params.pred_w2,
+                                &params.pred_b2,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("native HF predictor forward", err))?;
+                        let predicted = self.backend.download_f32(&predicted)
+                            .map_err(|err| backend_error("download native HF predictor parameters", err))?;
+                        if predicted.len() != cache.params_per_batch.len() {
+                            return Err(Error::InvalidConfig(format!(
+                                "native HF predictor produced {} parameters, expected {}",
+                                predicted.len(),
+                                cache.params_per_batch.len()
+                            )));
+                        }
+                        cache.params_per_batch.clone_from(&predicted);
+                        if let Some(predictor_cache) = cache.predictor.as_mut() {
+                            predictor_cache.constrained_params = predicted;
+                        }
+                    }
+                    let grid = if native_fixed_point {
                         let params_per_batch = self.backend
                             .upload_f32(
                                 &[layer.output_shape.batch, 4],
@@ -13047,6 +13085,10 @@ where
                             )
                             .map_err(|err| backend_error("upload hyperbolic_foveation grid", err))?
                     };
+                    if native_fixed_point {
+                        cache.grid = self.backend.download_f32(&grid)
+                            .map_err(|err| backend_error("download native HF grid for backward cache", err))?;
+                    }
                     let warp_input = match spec.warp_source {
                         crate::model::HfWarpSource::Previous => current_input,
                         crate::model::HfWarpSource::NetworkInput => &input_gpu,

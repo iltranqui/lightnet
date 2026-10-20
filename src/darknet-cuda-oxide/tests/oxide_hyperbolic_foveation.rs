@@ -69,6 +69,53 @@ fn hyperbolic_foveation_native_warp_matches_nchw_reference() {
 }
 
 #[test]
+fn hyperbolic_foveation_native_predictor_matches_reference() {
+    let backend = OxideBackend::new().expect("Oxide backend");
+    let shape = [2, 1, 2, 2];
+    let input = [0.1, 0.2, 0.3, 0.4, -0.2, 0.5, 0.7, 0.9];
+    let w1 = [0.5, -0.3];
+    let b1 = [0.1, 0.2];
+    let w2 = [0.2, -0.1, 0.4, 0.3, -0.2, 0.5, 0.7, -0.6];
+    let b2 = [0.03, -0.04, 0.1, -0.2];
+    let input_gpu = backend.upload_f32(&shape, &input).unwrap();
+    let actual = backend
+        .hyperbolic_foveation_predictor_f32(
+            &input_gpu,
+            &shape,
+            2,
+            2,
+            4,
+            &w1,
+            &b1,
+            &w2,
+            &b2,
+            ElementwiseLaunchConfig::default(),
+        )
+        .unwrap();
+    let actual = backend.download_f32(&actual).unwrap();
+    let mut expected = Vec::new();
+    for b in 0..2 {
+        let pooled = input[b * 4..b * 4 + 4].iter().sum::<f32>() / 4.0;
+        let hidden = [(w1[0] * pooled + b1[0]).max(0.0), (w1[1] * pooled + b1[1]).max(0.0)];
+        let raw: Vec<f32> = (0..4)
+            .map(|p| b2[p] + w2[p * 2] * hidden[0] + w2[p * 2 + 1] * hidden[1])
+            .collect();
+        for (p, value) in raw.into_iter().enumerate() {
+            expected.push(if p < 2 {
+                0.9 * value.tanh()
+            } else if p == 3 {
+                if value >= 0.0 { 1.0 / (1.0 + (-value).exp()) } else { let exp = value.exp(); exp / (1.0 + exp) }
+            } else {
+                (2.0 * value.exp().ln_1p() + 0.1).clamp(0.1, 2.0)
+            });
+        }
+    }
+    for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+        assert!((actual - expected).abs() <= 3e-6, "predictor[{index}]: {actual} != {expected}");
+    }
+}
+
+#[test]
 fn hyperbolic_foveation_native_fixed_point_grid_matches_reference() {
     let backend = OxideBackend::new().expect("Oxide backend");
     let batch = 2;

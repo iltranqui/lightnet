@@ -6528,6 +6528,120 @@ impl F32TensorOpsBackend for OxideBackend {
         Ok(OxideTensorF32::new(dlogit, &[batch, experts]))
     }
 
+    fn hyperbolic_foveation_predictor_f32(
+        &self,
+        input: &Self::Tensor,
+        shape: &[usize],
+        downsample: usize,
+        hidden_count: usize,
+        param_count: usize,
+        w1: &[f32],
+        b1: &[f32],
+        w2: &[f32],
+        b2: &[f32],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let source_f = self.f32v(input)?;
+        let source = &*source_f;
+        let op = "hyperbolic_foveation_predictor_f32";
+        if shape.len() != 4 || shape.contains(&0) || downsample == 0 || hidden_count == 0 || param_count < 4 {
+            return Err(shape_err(op, "invalid source shape or predictor dimensions".to_owned()));
+        }
+        let [batch, channels, height, width] = [shape[0], shape[1], shape[2], shape[3]];
+        let input_count = batch
+            .checked_mul(channels)
+            .and_then(|n| n.checked_mul(height))
+            .and_then(|n| n.checked_mul(width))
+            .ok_or_else(|| shape_err(op, "source size overflows".to_owned()))?;
+        if source.len() != input_count {
+            return Err(shape_err(op, format!("source has {} values, expected {input_count}", source.len())));
+        }
+        let pooled_height = (height / downsample).max(1);
+        let pooled_width = (width / downsample).max(1);
+        let input_dim = channels
+            .checked_mul(pooled_height)
+            .and_then(|n| n.checked_mul(pooled_width))
+            .ok_or_else(|| shape_err(op, "pooled predictor size overflows".to_owned()))?;
+        let expected_w1 = hidden_count
+            .checked_mul(input_dim)
+            .ok_or_else(|| shape_err(op, "first projection size overflows".to_owned()))?;
+        let expected_w2 = param_count
+            .checked_mul(hidden_count)
+            .ok_or_else(|| shape_err(op, "second projection size overflows".to_owned()))?;
+        let pooled_count = batch
+            .checked_mul(input_dim)
+            .ok_or_else(|| shape_err(op, "pooled batch size overflows".to_owned()))?;
+        let output_count = batch
+            .checked_mul(param_count)
+            .ok_or_else(|| shape_err(op, "predictor output size overflows".to_owned()))?;
+        if w1.len() != expected_w1
+            || b1.len() != hidden_count
+            || w2.len() != expected_w2
+            || b2.len() != param_count
+        {
+            return Err(shape_err(op, "predictor parameter lengths do not match dimensions".to_owned()));
+        }
+        let mut pooled = self.alloc_uninit(pooled_count)?;
+        // SAFETY: output geometry is bounded by the validated positive source
+        // dimensions and each output element owns its tile reduction.
+        unsafe {
+            self.resample.hyperbolic_predictor_pool(
+                &self.stream,
+                launch::elementwise(pooled_count, config),
+                &source.buf,
+                &mut pooled,
+                channels,
+                height,
+                width,
+                pooled_height,
+                pooled_width,
+                downsample,
+            )
+        }
+        .map_err(launch_err)?;
+        let pooled = OxideTensorF32::new(pooled, &[batch, input_dim]);
+        let w1 = self.upload_f32(&[hidden_count, input_dim], w1)?;
+        let b1 = self.upload_f32(&[hidden_count], b1)?;
+        let preactivation = self.linear_f32(
+            &pooled,
+            &w1,
+            Some(&b1),
+            &[batch, hidden_count],
+            batch,
+            input_dim,
+            hidden_count,
+            config,
+        )?;
+        let hidden = self.activation_f32(&preactivation, F32ActivationKind::Relu, config)?;
+        let w2 = self.upload_f32(&[param_count, hidden_count], w2)?;
+        let b2 = self.upload_f32(&[param_count], b2)?;
+        let raw = self.linear_f32(
+            &hidden,
+            &w2,
+            Some(&b2),
+            &[batch, param_count],
+            batch,
+            hidden_count,
+            param_count,
+            config,
+        )?;
+        let raw_f = self.f32v(&raw)?;
+        let raw = &*raw_f;
+        let mut constrained = self.alloc_uninit(output_count)?;
+        // SAFETY: each output element owns one validated raw parameter value.
+        unsafe {
+            self.resample.hyperbolic_predictor_constrain(
+                &self.stream,
+                launch::elementwise(output_count, config),
+                &raw.buf,
+                &mut constrained,
+                param_count,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(constrained, &[batch, param_count]))
+    }
+
     fn hyperbolic_fixed_point_grid_f32(
         &self,
         params: &Self::Tensor,

@@ -289,6 +289,84 @@ pub mod kernels {
 
     /// Scatter of the crop gradient into the input (`dx` must be zeroed).
     /// `dx` is a raw device pointer because the updates are atomic adds.
+    /// Tile-average NCHW source input into the HF predictor's pooled layout.
+    #[kernel]
+    pub fn hyperbolic_predictor_pool(
+        input: &[f32],
+        mut output: DisjointSlice<f32>,
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        output_height: usize,
+        output_width: usize,
+        factor: usize,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if i >= output.len() {
+            return;
+        }
+        let output_spatial = output_height * output_width;
+        let batch = i / (channels * output_spatial);
+        let rem = i % (channels * output_spatial);
+        let channel = rem / output_spatial;
+        let pixel = rem % output_spatial;
+        let oy = pixel / output_width;
+        let ox = pixel % output_width;
+        let base = (batch * channels + channel) * input_height * input_width;
+        let mut sum = 0.0f32;
+        let mut samples = 0usize;
+        let mut ky = 0usize;
+        while ky < factor {
+            let y = oy * factor + ky;
+            let mut kx = 0usize;
+            while kx < factor {
+                let x = ox * factor + kx;
+                if y < input_height && x < input_width {
+                    sum += input[base + y * input_width + x];
+                    samples += 1;
+                }
+                kx += 1;
+            }
+            ky += 1;
+        }
+        if let Some(value) = output.get_mut(index) {
+            *value = if samples == 0 { 0.0 } else { sum / samples as f32 };
+        }
+    }
+
+    /// Apply the source constraining functions to raw per-sample HF predictor values.
+    #[kernel]
+    pub fn hyperbolic_predictor_constrain(
+        raw: &[f32],
+        mut output: DisjointSlice<f32>,
+        param_count: usize,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if i >= output.len() {
+            return;
+        }
+        let parameter = i % param_count;
+        let value = raw[i];
+        let constrained = if parameter < 2 {
+            0.9 * value.tanh()
+        } else if parameter + 1 == param_count {
+            if value >= 0.0 {
+                1.0 / (1.0 + (-value).exp())
+            } else {
+                let exp = value.exp();
+                exp / (1.0 + exp)
+            }
+        } else {
+            let softplus = if value > 20.0 { value } else { (1.0 + value.exp()).ln() };
+            (2.0 * softplus + 0.1).max(0.1).min(2.0)
+        };
+        if let Some(output) = output.get_mut(index) {
+            *output = constrained;
+        }
+    }
+
     /// Build the inverse sampling grid for isotropic fixed-point HF mode.
     /// One thread owns one scalar coordinate; x/y are recomputed deterministically.
     #[kernel]
