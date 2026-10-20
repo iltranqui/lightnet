@@ -3200,6 +3200,17 @@ pub trait F16TensorOpsBackend: F32TensorOpsBackend {
         activation: F32ActivationKind,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error>;
+    /// Scale source features by per-channel or per-spatial input values, then activate.
+    fn scale_channels_f16(
+        &self,
+        input: &Self::TensorF16,
+        source: &Self::TensorF16,
+        input_shape: &[usize],
+        output_shape: &[usize],
+        scale_wh: bool,
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error>;
     /// Channel shuffle permutation over NCHW channel planes.
     fn channel_shuffle_f16(
         &self,

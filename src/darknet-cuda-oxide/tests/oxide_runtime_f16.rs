@@ -148,6 +148,21 @@ fn channel_shuffle_f16_inference_matches_f32() {
 }
 
 #[test]
+fn scale_channels_f16_inference_matches_f32_for_channel_and_spatial_scales() {
+    let per_channel = "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=2\n\
+        [convolutional]\nfilters=3\nsize=1\nactivation=linear\n\
+        [avgpool]\n\
+        [scale_channels]\nfrom=-2\nactivation=leaky\n";
+    run_pair("scale_channels per-channel f16", network(per_channel), 61, 0.7, 4e-3);
+
+    let per_spatial = "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=2\n\
+        [convolutional]\nfilters=3\nsize=1\nactivation=linear\n\
+        [convolutional]\nfilters=1\nsize=1\nactivation=linear\n\
+        [scale_channels]\nfrom=-2\nscale_wh=1\nactivation=linear\n";
+    run_pair("scale_channels per-spatial f16", network(per_spatial), 67, 0.7, 4e-3);
+}
+
+#[test]
 fn channel_slice_f16_inference_matches_f32() {
     let cfg = "[net]\nwidth=3\nheight=2\nchannels=4\nbatch=2\n\
         [convolutional]\nfilters=4\nsize=1\nactivation=linear\n\

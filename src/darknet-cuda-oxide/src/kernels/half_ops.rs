@@ -415,6 +415,39 @@ pub mod kernels {
         }
     }
 
+    /// Scale source values by per-channel or per-spatial half input, then activate.
+    #[kernel]
+    pub fn scale_channels_f16(
+        input: &[u16],
+        source: &[u16],
+        mut output: DisjointSlice<u16>,
+        input_channels: usize,
+        output_channels: usize,
+        input_spatial: usize,
+        output_spatial: usize,
+        scale_wh: u32,
+        kind: u32,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= output.len() {
+            return;
+        }
+        let output_plane = output_channels * output_spatial;
+        let batch = i / output_plane;
+        let channel = i / output_spatial % output_channels;
+        let position = i % output_spatial;
+        let scale_index = if scale_wh != 0 {
+            batch * input_spatial + position
+        } else {
+            (batch * input_channels + channel) * input_spatial
+        };
+        let product = f16_bits_to_f32(input[scale_index]) * f16_bits_to_f32(source[i]);
+        if let Some(value) = output.get_mut(idx) {
+            *value = f32_to_f16_bits(activate(kind, product), 0);
+        }
+    }
+
     /// NCHW channel shuffle: out channel `j*groups+i` reads input `i*cols+j`.
     #[kernel]
     pub fn channel_shuffle_f16(

@@ -8533,6 +8533,7 @@ where
                 | LayerKind::ChannelShuffle(_)
                 | LayerKind::Reorg(_)
                 | LayerKind::Softmax { .. }
+                | LayerKind::ScaleChannels(_)
                 | LayerKind::Upsample(_)
                 | LayerKind::Yolo(_)
                 | LayerKind::ObbYolo(_)
@@ -8811,6 +8812,28 @@ where
                         launch_config,
                     )
                     .map_err(|err| backend_error("f16 sam", err))?
+                }
+                (LayerKind::ScaleChannels(spec), LayerParams::None) => {
+                    let source_index = resolve_relative_layer(layer.index, spec.from)?;
+                    let source = gpu_layer_outputs
+                        .get(source_index)
+                        .and_then(Option::as_ref)
+                        .ok_or(Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.from,
+                        })?;
+                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+                    self.backend
+                        .scale_channels_f16(
+                            current_input.expect("scale_channels requires current input"),
+                            source,
+                            &tensor_backend_shape(layer.input_shape),
+                            &tensor_backend_shape(layer.output_shape),
+                            spec.scale_wh,
+                            activation,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("f16 scale_channels", err))?
                 }
                 (LayerKind::ChannelSlice(spec), LayerParams::None) => {
                     let source_index = resolve_relative_layer(layer.index, spec.from)?;
@@ -26292,6 +26315,10 @@ fn gpu_layer_output_use_counts(network: &Network) -> Result<Vec<usize>> {
                 let source_index = resolve_relative_layer(layer.index, spec.from)?;
                 use_counts[source_index] += 1;
             }
+            LayerKind::ScaleChannels(spec) => {
+                let source_index = resolve_relative_layer(layer.index, spec.from)?;
+                use_counts[source_index] += 1;
+            }
             LayerKind::Sam(spec) => {
                 let source_index = resolve_relative_layer(layer.index, spec.from)?;
                 use_counts[source_index] += 1;
@@ -26361,6 +26388,10 @@ fn release_gpu_sources_for_layer<T: Clone>(
             }
         }
         LayerKind::ChannelSlice(spec) => {
+            let source_index = resolve_relative_layer(layer_index, spec.from)?;
+            release_gpu_source(source_index, remaining_uses, gpu_layer_outputs)?;
+        }
+        LayerKind::ScaleChannels(spec) => {
             let source_index = resolve_relative_layer(layer_index, spec.from)?;
             release_gpu_source(source_index, remaining_uses, gpu_layer_outputs)?;
         }

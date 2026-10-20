@@ -944,6 +944,63 @@ impl OxideBackend {
         Ok(OxideTensorF16::new(out, a.shape()))
     }
 
+    /// Native f16 scale_channels with per-channel or per-pixel scaling.
+    pub fn scale_channels_f16(
+        &self,
+        input: &OxideTensorF16,
+        source: &OxideTensorF16,
+        input_shape: &[usize],
+        output_shape: &[usize],
+        scale_wh: bool,
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF16, OxideError> {
+        let valid_shapes = input_shape.len() == 4
+            && output_shape.len() == 4
+            && input.shape() == input_shape
+            && source.shape() == output_shape
+            && input.len() == input_shape.iter().product::<usize>()
+            && source.len() == output_shape.iter().product::<usize>()
+            && input_shape[0] == output_shape[0]
+            && output_shape[1] > 0
+            && output_shape[2] > 0
+            && output_shape[3] > 0;
+        let valid_scale = if scale_wh {
+            input_shape[1] == 1
+                && input_shape[2] == output_shape[2]
+                && input_shape[3] == output_shape[3]
+        } else {
+            input_shape[1] == output_shape[1]
+                && input_shape[2] > 0
+                && input_shape[3] > 0
+        };
+        if !valid_shapes || !valid_scale {
+            return Err(shape_err("scale_channels_f16", format!("incompatible input/output shapes {input_shape:?} -> {output_shape:?}, scale_wh={scale_wh}")));
+        }
+        let input_spatial = input_shape[2] * input_shape[3];
+        let output_spatial = output_shape[2] * output_shape[3];
+        let mut output = self.alloc16_uninit(source.len())?;
+        // SAFETY: shape checks ensure the chosen per-channel/per-pixel scale
+        // index is valid; one thread writes each output element exactly once.
+        unsafe {
+            self.half_ops.scale_channels_f16(
+                &self.stream,
+                launch::elementwise(output.len(), config),
+                &input.buf,
+                &source.buf,
+                &mut output,
+                input_shape[1],
+                output_shape[1],
+                input_spatial,
+                output_spatial,
+                scale_wh as u32,
+                activation_code(activation),
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF16::new(output, output_shape))
+    }
+
     /// f16 SAM product and activation with exact shape checks.
     pub fn sam_f16(
         &self,
@@ -1503,6 +1560,28 @@ impl darknet_cuda::F16TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error> {
         OxideBackend::shortcut_add_act_f16(self, a, b, activation, config)
+    }
+
+    fn scale_channels_f16(
+        &self,
+        input: &Self::TensorF16,
+        source: &Self::TensorF16,
+        input_shape: &[usize],
+        output_shape: &[usize],
+        scale_wh: bool,
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error> {
+        OxideBackend::scale_channels_f16(
+            self,
+            input,
+            source,
+            input_shape,
+            output_shape,
+            scale_wh,
+            activation,
+            config,
+        )
     }
 
     fn sam_f16(
