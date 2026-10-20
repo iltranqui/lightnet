@@ -362,6 +362,45 @@ fn foveation_film_runtime_adam_updates_match_cpu() {
 }
 
 #[test]
+fn foveation_film_gpu_compact_f16_and_muon_gates_are_explicit() {
+    let net = network(
+        "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=1\n\
+         [hf]\nparams=fixed\n\
+         [foveation_film]\nembed_dim=2\n",
+    );
+    let input = patterned(net.net.input_shape());
+    let gpu = GpuExecutableNetwork::new(
+        net.clone(),
+        OxideBackend::new().expect("oxide backend"),
+    );
+    assert!(gpu
+        .forward_compact(&input)
+        .unwrap_err()
+        .to_string()
+        .contains("GPU compact inference is not implemented"));
+    assert!(gpu
+        .forward_compact_f16(&input)
+        .unwrap_err()
+        .to_string()
+        .contains("GPU f16 inference is not implemented"));
+
+    let muon_net = network(
+        "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=1\nmuon=1\ndecoupled_decay=1\n\
+         [hf]\nparams=fixed\n\
+         [foveation_film]\nembed_dim=2\n",
+    );
+    let mut muon_gpu = GpuExecutableNetwork::new(
+        muon_net,
+        OxideBackend::new().expect("oxide backend"),
+    );
+    assert!(muon_gpu
+        .update_weights_gpu(0.01, 0.0, 0.0, 1)
+        .unwrap_err()
+        .to_string()
+        .contains("GPU Muon updates are unsupported"));
+}
+
+#[test]
 fn marker_gather_native_full_compact_backward_and_upstream_sgd_match_cpu() {
     assert_chain(
         "[net]\nwidth=5\nheight=1\nchannels=8\nbatch=2\n\
