@@ -4982,6 +4982,17 @@ fn gpu_muon_connected_batch_norm_matches_cpu_across_steps() {
             .expect("CPU connected BN backward");
         gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
             .expect("GPU Muon connected BN backward");
+        let (LayerParams::Connected(cpu_params), LayerParams::Connected(gpu_params)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("connected parameters expected after backward");
+        };
+        close(
+            &format!("connected BN rolling mean before update step {step}"),
+            &gpu_params.batch_norm.as_ref().unwrap().rolling_mean,
+            &cpu_params.batch_norm.as_ref().unwrap().rolling_mean,
+            1e-6,
+        );
         cpu.update_weights_muon(0.02, 2)
             .expect("CPU connected BN Muon update");
         gpu.update_weights_gpu(0.02, 0.9, net.net.decay, 2)
