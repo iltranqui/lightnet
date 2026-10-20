@@ -264,7 +264,7 @@ BN/norm scales, positional/embedding tables and 1-D params stay Adam/AdamW.
 
 Accepted by `forward_compact_f16` (`runtime.rs:8389`):
 
-`convolutional` (not `NORM_CHAN*`), `maxpool`, `local_avgpool`, `avgpool`,
+`convolutional` (including `NORM_CHAN*` with f32 channel reductions), `maxpool`, `local_avgpool`, `avgpool`,
 `batchnorm`, `route`, `channel_slice`, `laya_marker_gather`, `channel_shuffle`,
 `upsample` (incl. `reverse`), `dropout` (inference identity), `reorg` (forward/reverse),
 `shortcut` (with sources), `sam` (supported activation), `scale_channels`, `region`, `softmax`, `yolo`, `obb_yolo`, `gaussian_yolo`.

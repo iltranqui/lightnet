@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.097: compact f16 convolution now supports all three `NORM_CHAN*` activations with native f32 reductions. Full Oxide f16 suite passed 15 tests; relative max errors vs f32 ranged from 4.418e-4 to 4.639e-4. Inference only; see `implemented.md` §124.
 - v0.2.096: compact f16 inference now supports Dropout as a device-resident identity, matching inference semantics. Full Oxide f16 suite passed 15 tests; relative max error vs f32 was 3.890e-4. See `implemented.md` §123.
 - v0.2.095: compact f16 inference now supports native ScaleChannels for per-channel and per-spatial scales. Full Oxide f16 suite passed 14 tests; batch-2 relative max errors vs f32 were 6.633e-4/1.701e-3. Inference only; see `implemented.md` §122.
 - v0.2.094: compact f16 inference now supports native ChannelSlice through half-storage source selection/copy. Full Oxide f16 suite passed 13 tests; batch-2 output relative max error vs f32 was 2.353e-4. Inference only; see `implemented.md` §121.

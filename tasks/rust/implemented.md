@@ -149,6 +149,7 @@ file is named inline.
 - [121. Native f16 channel-slice inference](#121-native-f16-channel-slice-inference)
 - [122. Native f16 scale-channels inference](#122-native-f16-scale-channels-inference)
 - [123. Native f16 dropout inference](#123-native-f16-dropout-inference)
+- [124. Native f16 channel-normalization inference](#124-native-f16-channel-normalization-inference)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1810,6 +1811,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 123. Native f16 dropout inference
 
 - v0.2.096: compact f16 inference now accepts Dropout as a device-resident identity, matching inference semantics without RNG or host round-trip. Actual-Oxide output matched compact f32 (relative max error 3.890e-4); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed 15 tests. Training dropout remains on existing f32 path; no compiled-C++ golden.
+
+## 124. Native f16 channel-normalization inference
+
+- v0.2.097: compact f16 convolution now supports all three convolution-only `NORM_CHAN*` activations through a native half-storage kernel with f32 reductions and half output stores. Actual-Oxide batch-2 outputs matched f32 (relative max errors 4.429e-4, 4.639e-4, 4.418e-4); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed 15 tests. Inference only; no compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 
