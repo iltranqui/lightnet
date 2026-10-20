@@ -575,6 +575,102 @@ fn foveation_film_gpu_muon_dont_update_gate_matches_cpu() {
 }
 
 #[test]
+fn foveation_film_gpu_muon_state_round_trip_matches_cpu() {
+    let net = network(
+        "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=2\nmuon=1\ndecoupled_decay=1\nmuon_momentum=0.6\n\
+         [hf]\nparams=learned\npred_hidden=2\ndownsample=1\ninverse_method=newton\nradius_mode=anisotropic\ninit_cx=0.05\ninit_cy=-0.04\ninit_radius_x=0.8\ninit_radius_y=0.9\ninit_strength=0.3\n\
+         [foveation_film]\nembed_dim=2\nfilm_init_scale=0.25\nbackprop_to_hf=1\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide backend"));
+    gpu.params = cpu.params.clone();
+    let input = patterned(net.net.input_shape());
+    let seed = Tensor::from_data(net.layers[1].output_shape, vec![0.55; 12]).unwrap();
+    let mut seeds = vec![None; net.layers.len()];
+    seeds[1] = Some(seed);
+    let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
+    let gpu_forward = gpu.forward_training_with_state(&input).expect("GPU forward");
+    cpu.zero_train_buffers();
+    gpu.zero_train_buffers_gpu().expect("zero initial GPU gradients");
+    cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds).expect("CPU backward");
+    gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds).expect("GPU backward");
+    cpu.update_weights_muon(0.01, 2).expect("CPU first Muon update");
+    gpu.update_weights_gpu(0.01, 0.0, net.net.decay, 2).expect("GPU first Muon update");
+
+    let dir = std::env::temp_dir().join(format!("oxide-foveation-film-muon-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cpu_state = dir.join("cpu.state");
+    let gpu_state = dir.join("gpu.state");
+    cpu.save_optimizer_state(&cpu_state).expect("save CPU Muon sidecar");
+    gpu.save_optimizer_state(&gpu_state).expect("save GPU Muon sidecar");
+
+    let mut resumed_cpu = ExecutableNetwork::new(net.clone());
+    resumed_cpu.params = cpu.params.clone();
+    resumed_cpu.load_optimizer_state(&cpu_state).expect("load CPU Muon sidecar");
+    let mut resumed_gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("resume backend"));
+    resumed_gpu.params = gpu.params.clone();
+    resumed_gpu.load_optimizer_state(&gpu_state).expect("load GPU Muon sidecar");
+    let cpu_forward = resumed_cpu.forward_training(&input).expect("resumed CPU forward");
+    let gpu_forward = resumed_gpu.forward_training_with_state(&input).expect("resumed GPU forward");
+    close("resumed HF/FiLM output", &cpu_forward.layer_outputs[1].data,
+        &resumed_gpu.backend.download_f32(&gpu_forward.gpu_layer_outputs[1]).unwrap(), 3e-5);
+    resumed_cpu.zero_train_buffers();
+    resumed_gpu.zero_train_buffers_gpu().expect("zero resumed GPU gradients");
+    resumed_cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds).expect("resumed CPU backward");
+    resumed_gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds).expect("resumed GPU backward");
+    resumed_cpu.update_weights_muon(0.01, 2).expect("resumed CPU Muon update");
+    resumed_gpu.update_weights_gpu(0.01, 0.0, net.net.decay, 2).expect("resumed GPU Muon update");
+    let (LayerParams::HyperbolicFoveation(cpu_hf), LayerParams::HyperbolicFoveation(gpu_hf)) =
+        (&resumed_cpu.params[0], &resumed_gpu.params[0]) else { panic!("HF params") };
+    for (name, expected, actual) in [
+        ("HF params", &cpu_hf.hf_params, &gpu_hf.hf_params),
+        ("HF W1", &cpu_hf.pred_w1, &gpu_hf.pred_w1),
+        ("HF B1", &cpu_hf.pred_b1, &gpu_hf.pred_b1),
+        ("HF W2", &cpu_hf.pred_w2, &gpu_hf.pred_w2),
+        ("HF B2", &cpu_hf.pred_b2, &gpu_hf.pred_b2),
+    ] { close(&format!("resumed Muon {name}"), expected, actual, 5e-5); }
+    let (LayerParams::FoveationFilm(cpu_film), LayerParams::FoveationFilm(gpu_film)) =
+        (&resumed_cpu.params[1], &resumed_gpu.params[1]) else { panic!("FiLM params") };
+    for (name, expected, actual) in [
+        ("embedding W", &cpu_film.w_embed, &gpu_film.w_embed),
+        ("embedding B", &cpu_film.b_embed, &gpu_film.b_embed),
+        ("gamma W", &cpu_film.w_gamma, &gpu_film.w_gamma),
+        ("gamma B", &cpu_film.b_gamma, &gpu_film.b_gamma),
+        ("beta W", &cpu_film.w_beta, &gpu_film.w_beta),
+        ("beta B", &cpu_film.b_beta, &gpu_film.b_beta),
+    ] { close(&format!("resumed Muon {name}"), expected, actual, 5e-5); }
+
+    // Compare the restored GPU state against an uninterrupted CPU continuation;
+    // parity between two restored implementations alone would not prove that
+    // the saved momentum actually survived the sidecar boundary.
+    let reference_forward = cpu.forward_training(&input).expect("uninterrupted CPU forward");
+    cpu.zero_train_buffers();
+    cpu.backward_accumulate_seeded(&input, &reference_forward, &seeds)
+        .expect("uninterrupted CPU backward");
+    cpu.update_weights_muon(0.01, 2).expect("uninterrupted CPU Muon update");
+    let (LayerParams::HyperbolicFoveation(reference_hf), LayerParams::HyperbolicFoveation(resumed_hf)) =
+        (&cpu.params[0], &resumed_gpu.params[0]) else { panic!("HF params") };
+    for (name, expected, actual) in [
+        ("HF params", &reference_hf.hf_params, &resumed_hf.hf_params),
+        ("HF W1", &reference_hf.pred_w1, &resumed_hf.pred_w1),
+        ("HF B1", &reference_hf.pred_b1, &resumed_hf.pred_b1),
+        ("HF W2", &reference_hf.pred_w2, &resumed_hf.pred_w2),
+        ("HF B2", &reference_hf.pred_b2, &resumed_hf.pred_b2),
+    ] { close(&format!("uninterrupted vs restored {name}"), expected, actual, 5e-5); }
+    let (LayerParams::FoveationFilm(reference_film), LayerParams::FoveationFilm(resumed_film)) =
+        (&cpu.params[1], &resumed_gpu.params[1]) else { panic!("FiLM params") };
+    for (name, expected, actual) in [
+        ("embedding W", &reference_film.w_embed, &resumed_film.w_embed),
+        ("embedding B", &reference_film.b_embed, &resumed_film.b_embed),
+        ("gamma W", &reference_film.w_gamma, &resumed_film.w_gamma),
+        ("gamma B", &reference_film.b_gamma, &resumed_film.b_gamma),
+        ("beta W", &reference_film.w_beta, &resumed_film.w_beta),
+        ("beta B", &reference_film.b_beta, &resumed_film.b_beta),
+    ] { close(&format!("uninterrupted vs restored {name}"), expected, actual, 5e-5); }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn foveation_film_gpu_sgd_dont_update_gate_matches_cpu() {
     let net = network(
         "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=1\n\
