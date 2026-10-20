@@ -167,8 +167,9 @@ inverse parameter Jacobian is native (v0.2.144), followed by Newton mode
 
 This remains an open plan, not evidence of a complete native layer. Native HF
 coverage includes forward for isotropic and anisotropic modes, native warp
-input/grid adjoints, and native predictor-source/MLP backward. The inverse-point
-HF parameter Jacobian remains host-managed. Compact f16 remains deferred.
+input/grid adjoints, predictor-source/MLP backward, and fixed-point/Newton
+inverse-point parameter Jacobians. Runtime cache/intermediate handling remains
+hybrid; compact f16 remains deferred.
 
 ## Act-head contract finding
 
