@@ -7,7 +7,6 @@
 - [Next slice: native f32 FoveationFilm runtime](#next-slice-native-f32-foveationfilm-runtime)
 - [Act-head contract finding](#act-head-contract-finding)
 - [Act-head native gradient math and CLS scatter](#act-head-native-gradient-math-and-cls-scatter)
-- [Next slice: native f32 LayaHead inference](#next-slice-native-f32-layahead-inference)
 - [Next slice: deformable conv forward (wave 1, part 3)](#next-slice-deformable-conv-forward-wave-1-part-3)
 - [Runtime integration plan for `[deform_conv]`](#runtime-integration-plan-for-deform_conv)
 - [Next slice: `[dcnv4]` device path (audit result)](#next-slice-dcnv4-device-path-audit-result)
@@ -28,7 +27,7 @@ deliverable. Sparse MoE remains unstarted.
 ## Resume point
 
 Marker gather is native in f32 full/compact forward/backward and f16 compact
-inference (v0.2.001–002). v0.2.149 adds compact f16 Logistic sigmoid through the native half-storage channel-affine activation kernel; v0.2.150 adds direct CPU-reference parity. v0.2.151 adds OMD loss inference as a device identity pass-through. The full `oxide_runtime_f16` suite passed 20 tests at that increment; these paths are inference only. v0.2.152 adds group-major JevCe compact f16 inference via native temperature scaling and softmax; v0.2.153 adds native channel-major NCHW group-softmax. Both layouts pass CPU parity. v0.2.154 adds compact f16 LAYA act-head with native half-storage feature extraction and exact-erf GELU; CPU-reference output parity and all 22 f16 tests pass. v0.2.155 adds the standalone native LayaHead masked-attention primitive; runtime composition remains open. Act-head inference now supports f32 and compact f16; training/backward/update and shared-file loading gaps remain. Act-head features/exact-erf primitives are native f32
+inference (v0.2.001–002). v0.2.149 adds compact f16 Logistic sigmoid through the native half-storage channel-affine activation kernel; v0.2.150 adds direct CPU-reference parity. v0.2.151 adds OMD loss inference as a device identity pass-through. The full `oxide_runtime_f16` suite passed 20 tests at that increment; these paths are inference only. v0.2.152 adds group-major JevCe compact f16 inference via native temperature scaling and softmax; v0.2.153 adds native channel-major NCHW group-softmax. Both layouts pass CPU parity. v0.2.154 adds compact f16 LAYA act-head with native half-storage feature extraction and exact-erf GELU; CPU-reference output parity and all 22 f16 tests pass. v0.2.155 adds the native LayaHead masked-attention primitive and v0.2.156 composes it into native full/compact f32 runtime forward. Act-head inference now supports f32 and compact f16; training/backward/update and shared-file loading gaps remain. Act-head features/exact-erf primitives are native f32
 (v0.2.003–004), and full/compact act-head f32 forward is native in v0.2.005.
 Evidence/limits are in `implemented.md` §§41–45. Do not repeat these ports.
 Act-head uses four uncached weight uploads per forward; no residency/speedup
@@ -557,27 +556,6 @@ todo/version-map updates and disposable-artifact cleanup gate each release.
 Distinguish native forward/gradient primitives from complete native layers,
 selected tests from full-suite coverage and Rust CPU agreement from C++ parity.
 No performance/compiled-C++ claim without actual measurements/golden evidence.
-
-## Next slice: native f32 LayaHead inference
-
-The CPU reference `laya_head::head_forward` is a frozen, two-block transformer
-head. v0.2.156 composes its full and compact f32 forward from native Oxide
-operations. Frozen backward behavior is unchanged; there is no input gradient
-or optimizer update. No compiled-C++ parity claim is made.
-
-Bounded implementation and acceptance gates:
-
-1. [x] Re-derive the Rust reference and its C++ source
-   (`Jev_laya:src-lib/laya_head_layer.cpp`): type-embedding selection (fixed
-   `qtype` or input channel), channel-major `[B,C,1,T]` layout, pre-norm
-   LayerNorm, fused QKV, key-padding mask (`mask > 0.5`), per-head scaled
-   softmax attention, output residual, ReLU FFN residual, and exact output
-   layout. Preserve the Rust reference as the numeric oracle; no compiled-C++
-   golden is available. Source audit is recorded in this section.
-2. [x] Add a distinct mask-aware native Oxide attention operation. It keeps online softmax workspace linear in sequence length, skips keys whose mask is `<= 0.5`, and yields zero context for an all-masked row. The actual-device test checks CPU-formula parity and malformed extents (`oxide_laya_head_attention`, 2 tests). Runtime composition remains open.
-3. [x] Compose native type-embedding, LayerNorm, projections, masked attention, residuals, and FFN in `runtime/laya_head_gpu.rs`. Weight and shape extents validate before allocation; weights upload each call so public host edits remain observable. No residency/speedup claim.
-4. [x] Wire full and compact f32 forward dispatch. Preserve frozen-weight backward semantics; this adds no training or optimizer update. The compact path now dispatches native LayaHead instead of falling back through the full host-copy path.
-5. [x] Actual-Oxide parity against the Rust CPU reference covers two heads/two blocks, fixed and input-carried qtype, mixed masks, all-masked rows, nontrivial weights, and malformed weight extents (`oxide_laya_head_forward`: 3 tests). The mask primitive suite has 2 tests; `MEM=3G ./tools/test_host.sh laya_head` passes 9 tests. Compact f16 remains explicitly unsupported. No compiled-C++ golden.
 
 ## Remaining scope
 
