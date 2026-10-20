@@ -5585,21 +5585,77 @@ fn graph_conv_self_projection_runtime_forward_backward_and_sgd_adam_match_cpu() 
 }
 
 #[test]
-fn region_gpu_path_rejects_until_native_cpp_layout_is_implemented() {
-    let net = network(
-        "[net]\nwidth=3\nheight=2\nchannels=7\nbatch=2\n\
-         [region]\nclasses=2\ncoords=4\nnum=1\nsoftmax=1\n",
-    );
-    let input = patterned(net.net.input_shape());
-    let gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("Oxide"));
-    let error = match gpu.forward_training_with_state(&input) {
-        Err(error) => error,
-        Ok(_) => panic!("Region GPU must reject until its native layout path exists"),
-    };
-    assert!(
-        format!("{error:?}").contains("UnsupportedLayer"),
-        "unexpected Region GPU error: {error:?}"
-    );
+fn region_native_gpu_forward_backward_matches_cpu() {
+    for softmax in [false, true] {
+        let cfg = format!(
+            "[net]\nwidth=3\nheight=2\nchannels=7\nbatch=2\n[region]\nclasses=2\ncoords=4\nnum=1\nsoftmax={}\n",
+            usize::from(softmax),
+        );
+        let net = network(&cfg);
+        let cpu = ExecutableNetwork::new(net.clone());
+        let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
+        let input = patterned(net.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).expect("CPU Region forward");
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("native Region GPU forward");
+        let backend = OxideBackend::new().expect("Oxide backend");
+        let gpu_output = backend
+            .download_f32(&gpu_forward.gpu_layer_outputs[0])
+            .expect("download Region output");
+        close(
+            &format!("Region softmax={softmax} output"),
+            &cpu_forward.layer_outputs[0].data,
+            &gpu_output,
+            2e-6,
+        );
+        let compact = gpu.forward_compact(&input).expect("compact Region forward");
+        close(
+            &format!("Region softmax={softmax} compact output"),
+            &cpu_forward.layer_outputs[0].data,
+            &compact.final_output.expect("compact final output").data,
+            2e-6,
+        );
+
+        let output_shape = cpu.network.layers[0].output_shape;
+        let seed = Tensor::from_data(
+            output_shape,
+            (0..output_shape.batch * output_shape.element_count())
+                .map(|i| ((i * 7 % 19) as f32 - 8.0) * 0.03)
+                .collect(),
+        )
+        .expect("Region seed");
+        let cpu_backward = cpu
+            .backward(&input, &cpu_forward, &seed)
+            .expect("CPU Region backward");
+        let seeds = [Some(seed.clone())];
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("native Region GPU backward");
+        let seed_gpu = backend
+            .upload_f32(&[2, 7, 2, 3], &seed.data)
+            .expect("upload Region seed");
+        let input_grad_gpu = backend
+            .region_backward_f32(
+                &gpu_forward.gpu_layer_outputs[0],
+                &seed_gpu,
+                &[2, 7, 2, 3],
+                1,
+                7,
+                2,
+                softmax,
+                darknet_cuda::ElementwiseLaunchConfig::default(),
+            )
+            .expect("Region input-gradient primitive");
+        let input_grad = backend
+            .download_f32(&input_grad_gpu)
+            .expect("download Region input gradient");
+        close(
+            &format!("Region softmax={softmax} input gradient"),
+            &cpu_backward.input_gradient.data,
+            &input_grad,
+            3e-6,
+        );
+    }
 }
 
 #[test]

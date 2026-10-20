@@ -14013,12 +14013,18 @@ where
                         .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
                         .map_err(|err| backend_error("upload yolox output", err))?
                 }
-                // GPU Region does not yet implement the C++ layout/activation.
-                (LayerKind::Region(_), LayerParams::None) => {
-                    return Err(Error::UnsupportedLayer {
-                        layer_index: layer.index,
-                        name: "region".to_owned(),
-                    });
+                (LayerKind::Region(spec), LayerParams::None) => {
+                    self.backend
+                        .region_forward_f32(
+                            current_input,
+                            &tensor_backend_shape(layer.output_shape),
+                            spec.num,
+                            spec.coords + spec.classes + 1,
+                            spec.classes,
+                            spec.softmax,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("GPU Region forward", err))?
                 }
                 // `[omd_loss]` is a pure pass-through on the forward, exactly as
                 // in C++ (`memcpy(l.output, state.input, ...)`).
@@ -15721,12 +15727,18 @@ where
                             .map_err(|err| backend_error("upload sam output", err))?
                     }
                 }
-                (LayerKind::Region(_), LayerParams::None) => {
-                    return Err(Error::UnsupportedLayer {
-                        layer_index: layer.index,
-                        name: "region".to_owned(),
-                    });
-                }
+                (LayerKind::Region(spec), LayerParams::None) => self
+                    .backend
+                    .region_forward_f32(
+                        current_input.expect("region requires current input"),
+                        &tensor_backend_shape(layer.output_shape),
+                        spec.num,
+                        spec.coords + spec.classes + 1,
+                        spec.classes,
+                        spec.softmax,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("GPU Region compact forward", err))?,
                 (LayerKind::Yolo(_), LayerParams::None)
                 | (LayerKind::ObbYolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
@@ -17003,6 +17015,32 @@ where
                             config,
                         )
                         .map_err(|err| backend_error("GPU upsample backward", err))?;
+                    self.accumulate_previous_gpu_gradient(
+                        layer.index,
+                        input_grad,
+                        &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::Region(spec), Some(LayerParams::None)) => {
+                    let output = forward.gpu_layer_outputs.get(layer.index).ok_or_else(|| {
+                        Error::InvalidConfig(format!(
+                            "missing GPU Region output for layer #{}",
+                            layer.index
+                        ))
+                    })?;
+                    let input_grad = self
+                        .backend
+                        .region_backward_f32(
+                            output,
+                            &grad,
+                            &tensor_backend_shape(layer.input_shape),
+                            spec.num,
+                            spec.coords + spec.classes + 1,
+                            spec.classes,
+                            spec.softmax,
+                            config,
+                        )
+                        .map_err(|err| backend_error("GPU Region backward", err))?;
                     self.accumulate_previous_gpu_gradient(
                         layer.index,
                         input_grad,

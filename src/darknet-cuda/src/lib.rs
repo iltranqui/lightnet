@@ -2390,6 +2390,47 @@ pub trait F32TensorOpsBackend {
         let dy = self.download_f32(output_grad)?;
         self.upload_f32(shape, &host_ops::softmax_backward(&y, &dy, group_size))
     }
+    /// Region forward: transpose channel-major detector entries to spatial-
+    /// major `[batch, spatial, anchor, entry]`, then activate objectness and
+    /// optionally class scores. The default is a host reference.
+    fn region_forward_f32(
+        &self,
+        x: &Self::Tensor,
+        shape: &[usize],
+        anchors: usize,
+        entries: usize,
+        classes: usize,
+        softmax_classes: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let host = self.download_f32(x)?;
+        self.upload_f32(
+            shape,
+            &host_ops::region_forward(&host, shape, anchors, entries, classes, softmax_classes),
+        )
+    }
+    /// Exact Rust-forward adjoint for Region, returning channel-major NCHW
+    /// input gradients from the spatial-major activated output and its seed.
+    fn region_backward_f32(
+        &self,
+        output: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        shape: &[usize],
+        anchors: usize,
+        entries: usize,
+        classes: usize,
+        softmax_classes: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let y = self.download_f32(output)?;
+        let dy = self.download_f32(output_grad)?;
+        self.upload_f32(
+            shape,
+            &host_ops::region_backward(&y, &dy, shape, anchors, entries, classes, softmax_classes),
+        )
+    }
     /// Darknet reorg on NCHW `[batch, c, h, w]` shapes.  Non-reverse folds
     /// `stride x stride` spatial blocks into channels (`c * stride^2`, `h /
     /// stride`); `reverse` is the inverse layout.  Channel `k` of the small

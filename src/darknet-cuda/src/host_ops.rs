@@ -50,6 +50,97 @@ pub fn softmax(x: &[f32], group_size: usize) -> Vec<f32> {
     out
 }
 
+/// Rust Region forward reference: transpose NCHW channel planes to
+/// `[batch, spatial, anchor, entry]`, apply sigmoid to objectness and optional
+/// class softmax. This follows the exact CPU runtime contract.
+pub fn region_forward(
+    input: &[f32],
+    shape: &[usize],
+    anchors: usize,
+    entries: usize,
+    classes: usize,
+    softmax_classes: bool,
+) -> Vec<f32> {
+    assert!(shape.len() == 4 && shape[1] == anchors * entries);
+    let (batch, spatial) = (shape[0], shape[2] * shape[3]);
+    assert_eq!(input.len(), batch * shape[1] * spatial);
+    assert!(entries >= classes + 5);
+    let mut output = vec![0.0; input.len()];
+    for b in 0..batch {
+        for s in 0..spatial {
+            for a in 0..anchors {
+                let out_base = (b * spatial + s) * shape[1] + a * entries;
+                for e in 0..entries {
+                    output[out_base + e] = input[(b * shape[1] + a * entries + e) * spatial + s];
+                }
+                output[out_base + 4] = 1.0 / (1.0 + (-output[out_base + 4]).exp());
+                if softmax_classes {
+                    let start = out_base + 5;
+                    let end = start + classes;
+                    let max = output[start..end].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum = 0.0;
+                    for value in &mut output[start..end] {
+                        *value = (*value - max).exp();
+                        sum += *value;
+                    }
+                    if sum > 0.0 {
+                        for value in &mut output[start..end] {
+                            *value /= sum;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    output
+}
+
+/// Exact adjoint of [`region_forward`] under the Rust runtime contract.
+pub fn region_backward(
+    output: &[f32],
+    output_grad: &[f32],
+    shape: &[usize],
+    anchors: usize,
+    entries: usize,
+    classes: usize,
+    softmax_classes: bool,
+) -> Vec<f32> {
+    assert!(shape.len() == 4 && shape[1] == anchors * entries);
+    assert_eq!(output.len(), output_grad.len());
+    let (batch, spatial) = (shape[0], shape[2] * shape[3]);
+    assert_eq!(output.len(), batch * shape[1] * spatial);
+    assert!(entries >= classes + 5);
+    let mut input_grad = vec![0.0; output.len()];
+    for b in 0..batch {
+        for s in 0..spatial {
+            for a in 0..anchors {
+                let base = (b * spatial + s) * shape[1] + a * entries;
+                let class_start = base + 5;
+                let dot = if softmax_classes {
+                    (0..classes)
+                        .map(|c| output[class_start + c] * output_grad[class_start + c])
+                        .sum::<f32>()
+                } else {
+                    0.0
+                };
+                for e in 0..entries {
+                    let grad = if e == 4 {
+                        let p = output[base + 4];
+                        output_grad[base + 4] * p * (1.0 - p)
+                    } else if softmax_classes && (5..5 + classes).contains(&e) {
+                        let p = output[base + e];
+                        p * (output_grad[base + e] - dot)
+                    } else {
+                        output_grad[base + e]
+                    };
+                    input_grad[(b * shape[1] + a * entries + e) * spatial + s] = grad;
+                }
+            }
+        }
+    }
+    input_grad
+}
+
 /// Online-softmax attention for fused QKV `[batch, tokens, 3*channels]`.
 /// Returns context `[batch, tokens, channels]` and natural-log LSE
 /// `[batch, heads, tokens]`; no score/probability matrix is materialized.

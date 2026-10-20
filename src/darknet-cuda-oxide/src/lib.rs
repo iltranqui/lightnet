@@ -7507,6 +7507,106 @@ impl F32TensorOpsBackend for OxideBackend {
         Ok(OxideTensorF32::new(dx, shape))
     }
 
+    fn region_forward_f32(
+        &self,
+        x: &Self::Tensor,
+        shape: &[usize],
+        anchors: usize,
+        entries: usize,
+        classes: usize,
+        softmax_classes: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let x_f = self.f32v(x)?;
+        let x = &*x_f;
+        let op = "region_forward_f32";
+        if shape.len() != 4
+            || shape[1] != anchors.saturating_mul(entries)
+            || shape.iter().product::<usize>() != x.len()
+            || x.shape() != shape
+            || anchors == 0
+            || entries < classes.saturating_add(5)
+            || classes == 0
+            || shape[2] == 0
+            || shape[3] == 0
+        {
+            return Err(shape_err(op, format!("incompatible Region shape/parameters: {shape:?}, anchors={anchors}, entries={entries}, classes={classes}")));
+        }
+        let spatial = shape[2] * shape[3];
+        let groups = shape[0] * spatial * anchors;
+        let mut output = self.alloc_uninit(x.len())?;
+        // SAFETY: shape and Region layout checks establish valid input/output
+        // rows; one thread writes one disjoint anchor/location row.
+        unsafe {
+            self.layers_extra.region_forward(
+                &self.stream,
+                launch::elementwise(groups, config),
+                &x.buf,
+                &mut output,
+                spatial,
+                anchors,
+                entries,
+                classes,
+                softmax_classes as u32,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, shape))
+    }
+
+    fn region_backward_f32(
+        &self,
+        output: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        shape: &[usize],
+        anchors: usize,
+        entries: usize,
+        classes: usize,
+        softmax_classes: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let output_f = self.f32v(output)?;
+        let output = &*output_f;
+        let output_grad_f = self.f32v(output_grad)?;
+        let output_grad = &*output_grad_f;
+        let op = "region_backward_f32";
+        if shape.len() != 4
+            || shape[1] != anchors.saturating_mul(entries)
+            || shape.iter().product::<usize>() != output.len()
+            || output.shape() != shape
+            || output_grad.shape() != shape
+            || output_grad.len() != output.len()
+            || anchors == 0
+            || entries < classes.saturating_add(5)
+            || classes == 0
+            || shape[2] == 0
+            || shape[3] == 0
+        {
+            return Err(shape_err(op, format!("incompatible Region shape/parameters: {shape:?}, anchors={anchors}, entries={entries}, classes={classes}")));
+        }
+        let spatial = shape[2] * shape[3];
+        let groups = shape[0] * spatial * anchors;
+        let mut input_grad = self.alloc_uninit(output.len())?;
+        // SAFETY: each anchor/location thread writes unique channel-major input
+        // slots, and the output/gradient storage shapes were checked above.
+        unsafe {
+            self.layers_extra.region_backward(
+                &self.stream,
+                launch::elementwise(groups, config),
+                &output.buf,
+                &output_grad.buf,
+                &mut input_grad,
+                spatial,
+                anchors,
+                entries,
+                classes,
+                softmax_classes as u32,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(input_grad, shape))
+    }
+
     fn reorg_f32(
         &self,
         x: &Self::Tensor,

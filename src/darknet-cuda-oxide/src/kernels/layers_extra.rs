@@ -1057,6 +1057,117 @@ pub mod kernels {
         }
     }
 
+    /// Region forward. One thread owns a batch/location/anchor group and
+    /// writes its interleaved entries after objectness sigmoid and optional
+    /// class softmax.
+    #[kernel]
+    pub fn region_forward(
+        input: &[f32],
+        mut output: DisjointSlice<f32>,
+        spatial: usize,
+        anchors: usize,
+        entries: usize,
+        classes: usize,
+        softmax_classes: u32,
+    ) {
+        let group = thread::index_1d().get();
+        let groups_per_batch = spatial * anchors;
+        if group >= output.len() / entries {
+            return;
+        }
+        let batch = group / groups_per_batch;
+        let rem = group % groups_per_batch;
+        let location = rem / anchors;
+        let anchor = rem % anchors;
+        let channels = anchors * entries;
+        let source = |entry: usize| {
+            input[(batch * channels + anchor * entries + entry) * spatial + location]
+        };
+        let destination = (batch * spatial + location) * channels + anchor * entries;
+        let mut entry = 0usize;
+        while entry < entries {
+            // SAFETY: this group exclusively owns its `entries`-wide output row.
+            unsafe { *output.as_mut_ptr().add(destination + entry) = source(entry); }
+            entry += 1;
+        }
+        let objectness = source(4);
+        let sigmoid = 1.0 / (1.0 + (-objectness).exp());
+        unsafe { *output.as_mut_ptr().add(destination + 4) = sigmoid; }
+        if softmax_classes != 0 {
+            let mut max_value = f32::NEG_INFINITY;
+            entry = 0;
+            while entry < classes {
+                let value = source(5 + entry);
+                if value > max_value { max_value = value; }
+                entry += 1;
+            }
+            let mut sum = 0.0f32;
+            entry = 0;
+            while entry < classes {
+                let value = (source(5 + entry) - max_value).exp();
+                unsafe { *output.as_mut_ptr().add(destination + 5 + entry) = value; }
+                sum += value;
+                entry += 1;
+            }
+            if sum > 0.0 {
+                entry = 0;
+                while entry < classes {
+                    unsafe { *output.as_mut_ptr().add(destination + 5 + entry) /= sum; }
+                    entry += 1;
+                }
+            }
+        }
+    }
+
+    /// Exact adjoint of `region_forward`, writing channel-major NCHW deltas.
+    #[kernel]
+    pub fn region_backward(
+        output: &[f32],
+        output_grad: &[f32],
+        mut input_grad: DisjointSlice<f32>,
+        spatial: usize,
+        anchors: usize,
+        entries: usize,
+        classes: usize,
+        softmax_classes: u32,
+    ) {
+        let group = thread::index_1d().get();
+        let groups_per_batch = spatial * anchors;
+        if group >= input_grad.len() / entries {
+            return;
+        }
+        let batch = group / groups_per_batch;
+        let rem = group % groups_per_batch;
+        let location = rem / anchors;
+        let anchor = rem % anchors;
+        let channels = anchors * entries;
+        let base = (batch * spatial + location) * channels + anchor * entries;
+        let mut dot = 0.0f32;
+        if softmax_classes != 0 {
+            let mut c = 0usize;
+            while c < classes {
+                dot += output[base + 5 + c] * output_grad[base + 5 + c];
+                c += 1;
+            }
+        }
+        let mut entry = 0usize;
+        while entry < entries {
+            let value = if entry == 4 {
+                let p = output[base + 4];
+                output_grad[base + 4] * p * (1.0 - p)
+            } else if softmax_classes != 0 && entry >= 5 && entry < 5 + classes {
+                let p = output[base + entry];
+                p * (output_grad[base + entry] - dot)
+            } else {
+                output_grad[base + entry]
+            };
+            let target = (batch * channels + anchor * entries + entry) * spatial + location;
+            // SAFETY: each batch/location/anchor/entry maps to one unique input slot.
+            unsafe { *input_grad.as_mut_ptr().add(target) = value; }
+            entry += 1;
+        }
+    }
+
     /// Big `[b, cb, hb, wb]` -> small `[b, cb*s*s, hs, ws]`: one thread per
     /// small element gathers its big source.
     #[kernel]
