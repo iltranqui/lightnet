@@ -19,6 +19,32 @@ fn objective(input: &[f32], gamma: &[f32], beta: &[f32], shape: &[usize], seed: 
         .sum()
 }
 
+fn projection_objective(
+    input: &[f32],
+    groups: &[Vec<f32>; 7],
+    seed: &[f32],
+    dimensions: [usize; 6],
+) -> f32 {
+    let [batch, channels, height, width, param_count, embed_dim] = dimensions;
+    let (output, _, _, _) = foveation_film::forward(
+        input,
+        &groups[0],
+        batch,
+        channels,
+        height,
+        width,
+        param_count,
+        embed_dim,
+        &groups[1],
+        &groups[2],
+        &groups[3],
+        &groups[4],
+        &groups[5],
+        &groups[6],
+    );
+    output.iter().zip(seed).map(|(y, dy)| y * dy).sum()
+}
+
 #[test]
 fn foveation_film_forward_projection_composes_native_linear_and_affine() {
     let backend = OxideBackend::new().expect("Oxide backend");
@@ -145,49 +171,72 @@ fn foveation_film_forward_projection_composes_native_linear_and_affine() {
         &w_gamma,
         &w_beta,
     );
-    for (name, actual, expected) in [
-        (
-            "input gradient",
-            &gradients.input,
-            &expected_gradients.input,
-        ),
-        (
-            "HF gradient",
-            &gradients.hf_params,
-            &expected_gradients.hf_params,
-        ),
-        (
-            "embedding weight gradient",
-            &gradients.w_embed,
-            &expected_gradients.w_embed,
-        ),
-        (
-            "embedding bias gradient",
-            &gradients.b_embed,
-            &expected_gradients.b_embed,
-        ),
-        (
-            "gamma weight gradient",
-            &gradients.w_gamma,
-            &expected_gradients.w_gamma,
-        ),
-        (
-            "gamma bias gradient",
-            &gradients.b_gamma,
-            &expected_gradients.b_gamma,
-        ),
-        (
-            "beta weight gradient",
-            &gradients.w_beta,
-            &expected_gradients.w_beta,
-        ),
-        (
-            "beta bias gradient",
-            &gradients.b_beta,
-            &expected_gradients.b_beta,
-        ),
-    ] {
-        close(&backend.download_f32(actual).unwrap(), expected, 3e-5, name);
+    close(
+        &backend.download_f32(&gradients.input).unwrap(),
+        &expected_gradients.input,
+        3e-5,
+        "input gradient",
+    );
+    let actual_groups = [
+        backend.download_f32(&gradients.hf_params).unwrap(),
+        backend.download_f32(&gradients.w_embed).unwrap(),
+        backend.download_f32(&gradients.b_embed).unwrap(),
+        backend.download_f32(&gradients.w_gamma).unwrap(),
+        backend.download_f32(&gradients.b_gamma).unwrap(),
+        backend.download_f32(&gradients.w_beta).unwrap(),
+        backend.download_f32(&gradients.b_beta).unwrap(),
+    ];
+    let expected_groups = [
+        &expected_gradients.hf_params,
+        &expected_gradients.w_embed,
+        &expected_gradients.b_embed,
+        &expected_gradients.w_gamma,
+        &expected_gradients.b_gamma,
+        &expected_gradients.w_beta,
+        &expected_gradients.b_beta,
+    ];
+    let names = [
+        "HF",
+        "embedding weights",
+        "embedding bias",
+        "gamma weights",
+        "gamma bias",
+        "beta weights",
+        "beta bias",
+    ];
+    let base_groups = [
+        hf_values.clone(),
+        w_embed.clone(),
+        b_embed.clone(),
+        w_gamma.clone(),
+        b_gamma.clone(),
+        w_beta.clone(),
+        b_beta.clone(),
+    ];
+    let dimensions = [batch, channels, shape[2], shape[3], param_count, embed_dim];
+    let step = 1.0e-3;
+    for group in 0..actual_groups.len() {
+        close(
+            &actual_groups[group],
+            expected_groups[group],
+            3e-5,
+            names[group],
+        );
+        for index in 0..base_groups[group].len() {
+            let mut plus = base_groups.clone();
+            let mut minus = base_groups.clone();
+            plus[group][index] += step;
+            minus[group][index] -= step;
+            let numeric = (projection_objective(&input, &plus, &seed, dimensions)
+                - projection_objective(&input, &minus, &seed, dimensions))
+                / (2.0 * step);
+            assert!(
+                (numeric - actual_groups[group][index]).abs() < 3e-3,
+                "{}[{index}] finite difference: {numeric} != {}",
+                names[group],
+                actual_groups[group][index]
+            );
+        }
     }
 }
 
