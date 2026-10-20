@@ -192,6 +192,7 @@ file is named inline.
 - [164. FoveationFilm/HF two-step GPU runtime parity](#164-foveationfilmhf-two-step-gpu-runtime-parity)
 - [165. FoveationFilm actual-Oxide SGD gate](#165-foveationfilm-actual-oxide-sgd-gate)
 - [166. FoveationFilm actual-Oxide Adam burn-in gate](#166-foveationfilm-actual-oxide-adam-burn-in-gate)
+- [167. FoveationFilm actual-Oxide train-only-BN gate](#167-foveationfilm-actual-oxide-train-only-bn-gate)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2025,6 +2026,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 166. FoveationFilm actual-Oxide Adam burn-in gate
 
 - v0.2.130 (`2b2154f5`): actual-Oxide Adam runtime coverage exercises `burnin_update=1` with `burn_in=2`; iteration 0 leaves FiLM parameters unchanged, iteration 1 updates them, and CPU/GPU parameter parity holds at both iterations. The focused test passed. `train_only_bn` actual-runtime coverage and direct gradient-buffer inspection remain open. HF has independent train gates, so the assertion is limited to FiLM parameters. No compiled-C++ golden.
+
+## 167. FoveationFilm actual-Oxide train-only-BN gate
+
+- v0.2.131 (`9b8f2dcc`): actual-Oxide runtime test verifies `train_only_bn=1` suppresses FiLM parameter updates, with CPU/GPU parameter parity after SGD. Test passed. The gate suite now covers compact f32/f16 and Muon rejection, SGD `dont_update`, Adam `burnin_update`, and SGD `train_only_bn`; direct input-gradient/train-buffer inspection remains open. No compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 
