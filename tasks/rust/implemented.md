@@ -154,6 +154,7 @@ file is named inline.
 - [126. Native f16 Cost identity and full ResNet101 coverage](#126-native-f16-cost-identity-and-full-resnet101-coverage)
 - [127. Native f16 Detection and Regression identity paths](#127-native-f16-detection-and-regression-identity-paths)
 - [128. Native connected-layer BN GPU backward](#128-native-connected-layer-bn-gpu-backward)
+- [129. Connected BN GPU backward activation parity](#129-connected-bn-gpu-backward-activation-parity)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1835,6 +1836,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 128. Native connected-layer BN GPU backward
 
 - v0.2.101 (`c2c3acd9`): connected layers with BN no longer force whole-network CPU backward when the activation is supported. Oxide computes the activation/BN adjoint, raw connected input/weight gradients, and BN scale gradients; rolling statistics are updated from the pre-update raw output using the CPU rolling coefficient. BN scale/bias optimizer accumulation and rolling-stat synchronization remain host-managed. Actual-Oxide parity across two Muon updates passed in `gpu_muon_connected_batch_norm_matches_cpu_across_steps`; all five `gpu_muon_connected` Oxide tests and the focused host test passed. Rust CPU-reference parity only; no compiled-C++ golden or speedup claim.
+
+## 129. Connected BN GPU backward activation parity
+
+- v0.2.102 (`93c56f17`): expanded the actual-Oxide two-step connected-BN GPU Muon parity fixture to cover both `linear` and nonlinear `leaky` activation, including outputs, weights, biases, scales and rolling stats. The focused test and all five `gpu_muon_connected` runtime-chain tests passed. Rust CPU-reference parity; no compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 

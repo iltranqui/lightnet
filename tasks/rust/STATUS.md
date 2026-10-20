@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.102: expanded actual-Oxide connected-BN GPU Muon backward parity to `linear` and `leaky` activations; the focused case and all five `gpu_muon_connected` runtime-chain tests pass. Rust CPU-reference parity only; see `implemented.md` §129.
 - v0.2.101: connected-layer BN backward now stays on the GPU path for supported activations, including BN adjoints and rolling-stat updates; BN optimizer accumulation/rolling-stat state remain host-managed. The actual-Oxide two-step Muon parity test, all five `gpu_muon_connected` Oxide tests, and focused host test passed. Rust CPU-reference parity only; see `implemented.md` §128.
 - v0.2.100: compact f16 inference now accepts Detection and Regression identity layers; batch-2 actual-Oxide output matched f32 (relative max error 2.152e-4). Full f16 suite passed 18 tests; see `implemented.md` §127.
 - v0.2.099: compact f16 inference accepts the Cost pass-through identity, enabling full ResNet101 parity through the connected classifier and final cost section. Full Oxide f16 suite passed 17 tests; ResNet101 relative max error was 9.775e-4. See `implemented.md` §126.
