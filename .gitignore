@@ -51,3 +51,8 @@ ciou_surface.svg
 /bridges/rustc-codegen-cuda/examples/*/*.ptx
 /darknet_cuda_oxide*.ll
 /darknet_cuda_oxide*.ptx
+
+# local scratch at repo root
+/dump.txt
+/test.png
+/src-onnx/

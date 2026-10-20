@@ -1007,6 +1007,7 @@ dependencies = [
 name = "darknet-gui"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "darknet-gui-engine",
  "darknet-gui-project",
  "eframe",
