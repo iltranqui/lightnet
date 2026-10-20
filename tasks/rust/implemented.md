@@ -165,6 +165,7 @@ file is named inline.
 - [137. ScaleChannels source and broadcast-axis pin](#137-scalechannels-source-and-broadcast-axis-pin)
 - [138. SAM elementwise axis pin](#138-sam-elementwise-axis-pin)
 - [139. Extend native DCNv4 through 17x17](#139-extend-native-dcnv4-through-17x17)
+- [140. Extend native DCNv4 through 19x19](#140-extend-native-dcnv4-through-19x19)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1890,6 +1891,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 139. Extend native DCNv4 through 17x17
 
 - v0.2.104 (`faa9facb`): raised the fixed native point buffer and runtime gate from 225 to 289 active points. Actual Oxide composition parity now includes 17x17 across batch/group and mask variants; the two-step runtime SGD/Adam matrix covers native 17x17 SGD, while Adam remains tested through 15x15. `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain` passed 3 tests (46.72 s); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed 1 actual-GPU test (383.04 s); `MEM=3G ./tools/test_host.sh dcnv4` passed 31. The runtime suite's first attempt had a near-threshold Adam update-delta mismatch, then a rerun passed; no cause established, so this is recorded as a transient and not used to relax tolerance. Core gate tests prove 17x17 is native-eligible and 19x19 remains host fallback. No compiled-C++ golden, performance or full-suite claim.
+
+## 140. Extend native DCNv4 through 19x19
+
+- v0.2.105 (`07f48534`): raised the native DCNv4 fixed point buffer/runtime gate from 289 to 361 active points. Actual Oxide composition parity covers 19x19 across group/mask variants; the runtime two-step SGD/Adam test covers SGD through 19x19 and Adam through 15x15. The host gate suite verifies 19x19 native and 21x21 fallback. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain` passed 3 tests (49.73 s); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed 1 actual-GPU test (400.75 s); `MEM=3G ./tools/test_host.sh dcnv4` passed 31. CPU-reference parity only; no compiled-C++ golden, speedup or full-suite claim.
 
 ## Not implemented / open (pointer)
 
