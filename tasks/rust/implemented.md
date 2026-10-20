@@ -176,6 +176,7 @@ file is named inline.
 - [148. Native GPU Crop HSV saturation/exposure](#148-native-gpu-crop-hsv-saturationexposure)
 - [149. Extend DCNv4 Adam runtime parity through 17x17](#149-extend-dcnv4-adam-runtime-parity-through-17x17)
 - [150. Extend DCNv4 Adam runtime parity through 19x19](#150-extend-dcnv4-adam-runtime-parity-through-19x19)
+- [151. Extend DCNv4 Adam runtime parity through 21x21](#151-extend-dcnv4-adam-runtime-parity-through-21x21)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1945,6 +1946,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 150. Extend DCNv4 Adam runtime parity through 19x19
 
 - v0.2.115 (`057f905e`): expanded `dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` to include non-BN 19x19 Adam runtime parity. The full focused test passed (1 test; 571.59 s), including SGD through 31x31, non-BN Adam through 19x19, and BN Adam through 15x15. CPU-reference parity only; no compiled-C++ golden or full-suite claim.
+
+## 151. Extend DCNv4 Adam runtime parity through 21x21
+
+- v0.2.116 (`47361cee`): expanded `dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` to include non-BN 21x21 Adam runtime parity. The focused test passed (1 test; 584.18 s), including SGD through 31x31, non-BN Adam through 21x21, and BN Adam through 15x15. CPU-reference parity only; no compiled-C++ golden or full-suite claim.
 
 ## Not implemented / open (pointer)
 

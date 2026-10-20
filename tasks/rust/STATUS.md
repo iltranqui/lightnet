@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.116: extended DCNv4 two-step runtime CPU-reference parity to non-BN Adam at 21x21. Focused runtime test passed (584.18 s); SGD remains covered through 31x31 and BN Adam through 15x15. See `implemented.md` §151. No C++ golden/full-suite claim.
 - v0.2.115: extended DCNv4 two-step runtime CPU-reference parity to non-BN Adam at 19x19. Focused runtime test passed (571.59 s); SGD remains covered through 31x31 and BN Adam through 15x15. See `implemented.md` §150. No C++ golden/full-suite claim.
 - v0.2.114: extended DCNv4 two-step runtime CPU-reference parity to Adam at 17x17 without BN. Focused runtime test passed (562.82 s); SGD remains covered through 31x31 and BN Adam through 15x15. See `implemented.md` §149. No C++ golden/full-suite claim.
 - v0.2.113: native Crop GPU training now applies saturation/exposure HSV transforms in addition to per-channel RGB shift and geometry; actual-Oxide CPU-reference parity covers forward/backward plus SGD/Adam. Crop primitive parity/FD and host crop (10 tests) pass. See `implemented.md` §148. No C++ golden/full-suite claim.
