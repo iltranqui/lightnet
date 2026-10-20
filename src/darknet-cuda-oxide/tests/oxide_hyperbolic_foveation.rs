@@ -208,6 +208,109 @@ fn hyperbolic_foveation_native_predictor_matches_reference() {
 }
 
 #[test]
+fn hyperbolic_foveation_native_predictor_backward_matches_finite_differences() {
+    let backend = OxideBackend::new().expect("Oxide backend");
+    let shape = [2, 1, 3, 5];
+    let downsample = 2;
+    let hidden_count = 2;
+    let param_count = 5;
+    let input: Vec<f32> = (0..30).map(|i| (i as f32 * 0.19).sin() * 0.7).collect();
+    let w1 = [0.35, -0.2, -0.15, 0.4];
+    let b1 = [0.55, 0.42];
+    let w2 = [0.12, -0.07, -0.08, 0.1, 0.04, -0.06, 0.3, -0.2, 0.5, -0.4];
+    let b2 = [0.05, -0.08, -0.15, 0.2, 0.35];
+    let seed: Vec<f32> = (0..10).map(|i| (i as f32 * 0.37).cos() * 0.6).collect();
+    let input_dim = 2;
+    let mut pooled = vec![0.0; 4];
+    for n in 0..2 {
+        for x in 0..2 {
+            let base = n * 15;
+            pooled[n * 2 + x] = (input[base + x * 2] + input[base + x * 2 + 1]
+                + input[base + 5 + x * 2] + input[base + 5 + x * 2 + 1]) / 4.0;
+        }
+    }
+    let mut pre = vec![0.0; 4];
+    let mut hidden = vec![0.0; 4];
+    let mut raw = vec![0.0; 10];
+    for n in 0..2 {
+        for h in 0..hidden_count {
+            pre[n * hidden_count + h] = b1[h] + w1[h * input_dim] * pooled[n * input_dim]
+                + w1[h * input_dim + 1] * pooled[n * input_dim + 1];
+            hidden[n * hidden_count + h] = pre[n * hidden_count + h].max(0.0);
+        }
+        for p in 0..param_count {
+            raw[n * param_count + p] = b2[p] + w2[p * hidden_count] * hidden[n * hidden_count]
+                + w2[p * hidden_count + 1] * hidden[n * hidden_count + 1];
+        }
+    }
+    let pooled_gpu = backend.upload_f32(&[2, input_dim], &pooled).unwrap();
+    let pre_gpu = backend.upload_f32(&[2, hidden_count], &pre).unwrap();
+    let hidden_gpu = backend.upload_f32(&[2, hidden_count], &hidden).unwrap();
+    let raw_gpu = backend.upload_f32(&[2, param_count], &raw).unwrap();
+    let seed_gpu = backend.upload_f32(&[2, param_count], &seed).unwrap();
+    let w1_gpu = backend.upload_f32(&[hidden_count, input_dim], &w1).unwrap();
+    let w2_gpu = backend.upload_f32(&[param_count, hidden_count], &w2).unwrap();
+    let (dsource_gpu, dw1_db1_gpu, dw2_db2_gpu) = backend.hyperbolic_foveation_predictor_backward_f32(
+        &pooled_gpu, &pre_gpu, &hidden_gpu, &raw_gpu, &seed_gpu, &w1_gpu, &w2_gpu,
+        &shape, downsample, hidden_count, param_count, ElementwiseLaunchConfig::default(),
+    ).unwrap();
+    let dsource = backend.download_f32(&dsource_gpu).unwrap();
+    let dw1_db1 = backend.download_f32(&dw1_db1_gpu).unwrap();
+    let dw2_db2 = backend.download_f32(&dw2_db2_gpu).unwrap();
+    let loss = |input: &[f32], w1: &[f32], b1: &[f32], w2: &[f32], b2: &[f32]| {
+        let mut result = 0.0;
+        for n in 0..2 {
+            let base = n * 15;
+            let pool = [
+                (input[base] + input[base + 1] + input[base + 5] + input[base + 6]) * 0.25,
+                (input[base + 2] + input[base + 3] + input[base + 7] + input[base + 8]) * 0.25,
+            ];
+            let h = [
+                (b1[0] + w1[0] * pool[0] + w1[1] * pool[1]).max(0.0),
+                (b1[1] + w1[2] * pool[0] + w1[3] * pool[1]).max(0.0),
+            ];
+            for p in 0..param_count {
+                let r = b2[p] + w2[p * 2] * h[0] + w2[p * 2 + 1] * h[1];
+                let value = if p < 2 { 0.9 * r.tanh() } else if p == 4 {
+                    if r >= 0.0 { 1.0 / (1.0 + (-r).exp()) } else { let e = r.exp(); e / (1.0 + e) }
+                } else { (2.0 * (1.0 + r.exp()).ln() + 0.1).clamp(0.1, 2.0) };
+                result += value * seed[n * param_count + p];
+            }
+        }
+        result
+    };
+    let eps = 2.0e-3;
+    let check = |name: &str, actual: f32, numeric: f32| {
+        assert!((actual - numeric).abs() < 2e-3, "{name}: analytic {actual}, numeric {numeric}");
+    };
+    for index in [0, 3, 5, 14, 17, 29] {
+        let mut plus = input.clone(); let mut minus = input.clone();
+        plus[index] += eps; minus[index] -= eps;
+        check(&format!("dsource[{index}]"), dsource[index], (loss(&plus, &w1, &b1, &w2, &b2) - loss(&minus, &w1, &b1, &w2, &b2)) / (2.0 * eps));
+    }
+    for index in [0, 1, 2, 3] {
+        let mut plus = w1; let mut minus = w1;
+        plus[index] += eps; minus[index] -= eps;
+        check(&format!("dw1[{index}]"), dw1_db1[index], (loss(&input, &plus, &b1, &w2, &b2) - loss(&input, &minus, &b1, &w2, &b2)) / (2.0 * eps));
+    }
+    for index in [0, 1] {
+        let mut plus = b1; let mut minus = b1;
+        plus[index] += eps; minus[index] -= eps;
+        check(&format!("db1[{index}]"), dw1_db1[4 + index], (loss(&input, &w1, &plus, &w2, &b2) - loss(&input, &w1, &minus, &w2, &b2)) / (2.0 * eps));
+    }
+    for index in [0, 3, 7, 9] {
+        let mut plus = w2; let mut minus = w2;
+        plus[index] += eps; minus[index] -= eps;
+        check(&format!("dw2[{index}]"), dw2_db2[index], (loss(&input, &w1, &b1, &plus, &b2) - loss(&input, &w1, &b1, &minus, &b2)) / (2.0 * eps));
+    }
+    for index in [0, 2, 4] {
+        let mut plus = b2; let mut minus = b2;
+        plus[index] += eps; minus[index] -= eps;
+        check(&format!("db2[{index}]"), dw2_db2[10 + index], (loss(&input, &w1, &b1, &w2, &plus) - loss(&input, &w1, &b1, &w2, &minus)) / (2.0 * eps));
+    }
+}
+
+#[test]
 fn hyperbolic_foveation_native_newton_grid_matches_reference() {
     let backend = OxideBackend::new().expect("Oxide backend");
     let (batch, height, width) = (2, 3, 4);
