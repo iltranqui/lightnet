@@ -425,7 +425,7 @@ fn foveation_film_runtime_adam_updates_match_cpu() {
 }
 
 #[test]
-fn foveation_film_gpu_compact_f16_and_muon_gates_are_explicit() {
+fn foveation_film_gpu_compact_f16_rejection_and_muon_support_are_explicit() {
     let net = network(
         "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=1\n\
          [hf]\nparams=fixed\n\
@@ -456,11 +456,88 @@ fn foveation_film_gpu_compact_f16_and_muon_gates_are_explicit() {
         muon_net,
         OxideBackend::new().expect("oxide backend"),
     );
-    assert!(muon_gpu
+    muon_gpu
         .update_weights_gpu(0.01, 0.0, 0.0, 1)
-        .unwrap_err()
-        .to_string()
-        .contains("GPU Muon updates are unsupported"));
+        .expect("GPU Muon accepts the FoveationFilm matrix layout");
+}
+
+#[test]
+fn foveation_film_and_hf_gpu_muon_match_cpu_across_steps() {
+    let net = network(
+        "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=2\nmuon=1\ndecoupled_decay=1\nmuon_momentum=0.6\n\
+         [hf]\nparams=learned\npred_hidden=2\ndownsample=1\ninverse_method=newton\nradius_mode=anisotropic\ninit_cx=0.05\ninit_cy=-0.04\ninit_radius_x=0.8\ninit_radius_y=0.9\ninit_strength=0.3\n\
+         [foveation_film]\nembed_dim=2\nfilm_init_scale=0.25\nbackprop_to_hf=1\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    if let LayerParams::HyperbolicFoveation(params) = &mut cpu.params[0] {
+        params.pred_w1.copy_from_slice(&[
+            0.12, -0.08, 0.05, 0.17, -0.11, 0.09,
+            -0.04, 0.16, 0.13, -0.07, 0.08, 0.14,
+        ]);
+        params.pred_b1.copy_from_slice(&[0.7, 0.6]);
+        params.pred_w2.copy_from_slice(&[
+            0.08, -0.03, 0.04, 0.07, -0.05, 0.06, 0.03, 0.09, -0.02, 0.05,
+        ]);
+        params.pred_b2.copy_from_slice(&[0.1, -0.08, 0.3, 0.2, 0.12]);
+    }
+    if let LayerParams::FoveationFilm(params) = &mut cpu.params[1] {
+        params.w_embed.copy_from_slice(&[
+            0.2, 0.1, -0.1, 0.2, 0.15, 0.05, 0.1, -0.08, 0.07, -0.02,
+        ]);
+        params.b_embed.copy_from_slice(&[0.5, 0.7]);
+        params.w_gamma.copy_from_slice(&[0.1, -0.2]);
+        params.b_gamma[0] = 0.05;
+        params.w_beta.copy_from_slice(&[0.3, 0.2]);
+        params.b_beta[0] = 0.1;
+    }
+    let mut gpu = GpuExecutableNetwork::new(
+        net.clone(), OxideBackend::new().expect("oxide backend"),
+    );
+    gpu.params = cpu.params.clone();
+    let input = patterned(net.net.input_shape());
+    let seed = Tensor::from_data(net.layers[1].output_shape, vec![0.65; 12]).unwrap();
+    let mut seeds = vec![None; net.layers.len()];
+    seeds[1] = Some(seed);
+
+    for step in 1..=2 {
+        let cpu_forward = cpu.forward_training(&input).expect("CPU Muon forward");
+        let gpu_forward = gpu.forward_training_with_state(&input).expect("native HF/FiLM forward");
+        for (index, (expected, actual)) in cpu_forward.layer_outputs.iter()
+            .zip(&gpu_forward.gpu_layer_outputs).enumerate() {
+            close(&format!("Muon step {step} output {index}"), &expected.data,
+                &gpu.backend.download_f32(actual).unwrap(), 3e-5);
+        }
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu().expect("zero GPU Muon gradients");
+        let cpu_backward = cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU Muon backward");
+        let gpu_input_gradient = gpu.backward_accumulate_seeded_gpu_with_input_gradient(&gpu_forward, &seeds)
+            .expect("native HF/FiLM Muon backward").expect("HF input gradient");
+        close(&format!("Muon step {step} input gradient"), &cpu_backward.input_gradient.data,
+            &gpu_input_gradient.data, 4e-5);
+        assert_hf_film_train_buffers(&cpu, &gpu, 0, 1, step);
+        cpu.update_weights_muon(0.01, 2).expect("CPU Muon update");
+        gpu.update_weights_gpu(0.01, 0.0, net.net.decay, 2).expect("GPU Muon update");
+        let (LayerParams::HyperbolicFoveation(cpu_hf), LayerParams::HyperbolicFoveation(gpu_hf)) =
+            (&cpu.params[0], &gpu.params[0]) else { panic!("HF params") };
+        for (name, expected, actual) in [
+            ("HF global params", &cpu_hf.hf_params, &gpu_hf.hf_params),
+            ("HF W1", &cpu_hf.pred_w1, &gpu_hf.pred_w1),
+            ("HF B1", &cpu_hf.pred_b1, &gpu_hf.pred_b1),
+            ("HF W2", &cpu_hf.pred_w2, &gpu_hf.pred_w2),
+            ("HF B2", &cpu_hf.pred_b2, &gpu_hf.pred_b2),
+        ] { close(&format!("Muon step {step} {name}"), expected, actual, 4e-5); }
+        let (LayerParams::FoveationFilm(cpu_film), LayerParams::FoveationFilm(gpu_film)) =
+            (&cpu.params[1], &gpu.params[1]) else { panic!("FiLM params") };
+        for (name, expected, actual) in [
+            ("embedding W", &cpu_film.w_embed, &gpu_film.w_embed),
+            ("embedding B", &cpu_film.b_embed, &gpu_film.b_embed),
+            ("gamma W", &cpu_film.w_gamma, &gpu_film.w_gamma),
+            ("gamma B", &cpu_film.b_gamma, &gpu_film.b_gamma),
+            ("beta W", &cpu_film.w_beta, &gpu_film.w_beta),
+            ("beta B", &cpu_film.b_beta, &gpu_film.b_beta),
+        ] { close(&format!("Muon step {step} {name}"), expected, actual, 4e-5); }
+    }
 }
 
 #[test]

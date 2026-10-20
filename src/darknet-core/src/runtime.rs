@@ -10576,6 +10576,8 @@ where
                     (_, LayerParams::None)
                         | (LayerKind::BatchNorm(_), LayerParams::BatchNorm(_))
                         | (LayerKind::Connected(_), LayerParams::Connected(_))
+                        | (LayerKind::HyperbolicFoveation(_), LayerParams::HyperbolicFoveation(_))
+                        | (LayerKind::FoveationFilm(_), LayerParams::FoveationFilm(_))
                         | (LayerKind::EmlConvolutional(_), LayerParams::EmlConvolutional(_))
                         | (LayerKind::Moe(_), LayerParams::Moe(_))
                         | (LayerKind::Local(_), LayerParams::Local(_))
@@ -11153,17 +11155,6 @@ where
             return Err(Error::UnsupportedLayer {
                 layer_index: layer.index,
                 name: "GPU optimizer updates are unsupported for this layer".to_owned(),
-            });
-        }
-        if self.network.net.muon
-            && let Some(layer) = self.network.layers.iter().find(|layer| {
-                matches!(layer.kind, LayerKind::HyperbolicFoveation(_) | LayerKind::FoveationFilm(_))
-            })
-        {
-            return Err(Error::UnsupportedLayer {
-                layer_index: layer.index,
-                name: "GPU Muon updates are unsupported for [hyperbolic_foveation]/[foveation_film]"
-                    .to_owned(),
             });
         }
         if self.network.net.muon {
