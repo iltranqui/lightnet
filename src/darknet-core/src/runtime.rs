@@ -3737,6 +3737,7 @@ impl ExecutableNetwork {
                             cache,
                             auxiliary_gradient.as_deref(),
                             None,
+                            None,
                             false,
                         )?;
                     let Some(slot) = param_gradients.get_mut(layer.index) else {
@@ -16534,6 +16535,24 @@ where
                             config,
                         )
                         .map_err(|err| backend_error("native HF warp backward", err))?;
+                    let mut native_semantic_gradient = None;
+                    if spec.inverse_method == crate::model::HfInverseMethod::FixedPoint {
+                        let batch = warp_input.shape.batch;
+                        let param_count = spec.param_count();
+                        let params_gpu = self.backend.upload_f32(
+                            &[batch, param_count], &cache.params_per_batch,
+                        ).map_err(|err| backend_error("upload HF inverse parameters", err))?;
+                        let shape = tensor_backend_shape(warp_input.shape);
+                        if let Some(semantic) = self.backend
+                            .hyperbolic_foveation_fixed_point_param_grad_f32(
+                                &params_gpu, &native_grid_gradient, &shape, param_count,
+                                spec.alpha, spec.p_exp, spec.nr_iters, spec.nr_eta, config,
+                            )
+                            .map_err(|err| backend_error("native HF fixed-point parameter adjoint", err))? {
+                            native_semantic_gradient = Some(self.backend.download_f32(&semantic)
+                                .map_err(|err| backend_error("download HF semantic parameter gradients", err))?);
+                        }
+                    }
                     let native_grid_gradient = self.backend.download_f32(&native_grid_gradient)
                         .map_err(|err| backend_error("download native HF grid gradient", err))?;
                     let auxiliary = foveation_hf_auxiliary_gradients
@@ -16542,7 +16561,7 @@ where
                     let (_host_warp_gradient, mut predictor_gradient, mut param_gradient, constrained_seed) =
                         backward_hyperbolic_foveation(
                             spec, params, warp_input, &output_gradient, cache, auxiliary,
-                            Some(&native_grid_gradient),
+                            Some(&native_grid_gradient), native_semantic_gradient.as_deref(),
                             true,
                         )?;
                     if spec.pred_hidden > 0 {
@@ -23648,6 +23667,7 @@ fn backward_hyperbolic_foveation(
     cache: &HyperbolicFoveationForwardCache,
     auxiliary_param_gradients: Option<&[f32]>,
     precomputed_grid_gradient: Option<&[f32]>,
+    precomputed_semantic_gradients: Option<&[f32]>,
     defer_predictor_backward: bool,
 ) -> Result<(
     Tensor,
@@ -23681,7 +23701,17 @@ fn backward_hyperbolic_foveation(
         .map(|values| hyperbolic_foveation_params_from_values(values, spec))
         .collect::<Result<Vec<_>>>()?;
     let (warp_input_gradient_data, semantic_gradients) =
-        if let Some(grid_gradient) = precomputed_grid_gradient {
+        if let Some(semantic) = precomputed_semantic_gradients {
+            if semantic.len() != warp_input.shape.batch * 5 {
+                return Err(Error::InvalidConfig(
+                    "[hyperbolic_foveation] precomputed semantic gradient layout mismatch".to_owned(),
+                ));
+            }
+            let semantic = semantic.chunks_exact(5).map(|values| {
+                [values[0], values[1], values[2], values[3], values[4]]
+            }).collect();
+            (vec![0.0; warp_input.data.len()], semantic)
+        } else if let Some(grid_gradient) = precomputed_grid_gradient {
             let semantic = crate::hyperbolic_foveation::warp_parameter_gradients_from_grid_gradient(
                 grid_gradient,
                 warp_input.shape.batch,

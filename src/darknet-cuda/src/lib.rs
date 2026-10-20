@@ -2337,6 +2337,26 @@ pub trait F32TensorOpsBackend {
         ))
     }
 
+    /// Optionally compute native fixed-point HF inverse parameter gradients
+    /// from the accumulated grid adjoint. The output is `[batch, 5]` in
+    /// semantic `[cx, cy, rx, ry, strength]` order; unsupported backends return
+    /// `None` so callers can retain the host reference path.
+    #[allow(clippy::too_many_arguments)]
+    fn hyperbolic_foveation_fixed_point_param_grad_f32(
+        &self,
+        _params: &Self::Tensor,
+        _grid_gradient: &Self::Tensor,
+        _shape: &[usize],
+        _param_count: usize,
+        _alpha: f32,
+        _p_exp: f32,
+        _iterations: usize,
+        _eta: f32,
+        _config: ElementwiseLaunchConfig,
+    ) -> Result<Option<Self::Tensor>, Self::Error> {
+        Ok(None)
+    }
+
     /// Bilinearly sample an NCHW tensor using one source coordinate pair per
     /// batch/output pixel. `input_scales` contains one affine scale per batch,
     /// and `input_offsets` one affine offset per batch/channel. Saturation and

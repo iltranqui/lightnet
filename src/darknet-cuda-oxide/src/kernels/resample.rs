@@ -500,6 +500,173 @@ pub mod kernels {
         if let Some(out) = output.get_mut(index) { *out = gradient / count as f32; }
     }
 
+    #[derive(Clone, Copy)]
+    struct HfDual5 {
+        value: f32,
+        grad: [f32; 5],
+    }
+
+    #[device]
+    fn hf_dual_const(value: f32) -> HfDual5 { HfDual5 { value, grad: [0.0; 5] } }
+
+    #[device]
+    fn hf_dual_var(value: f32, lane: usize) -> HfDual5 {
+        let mut result = hf_dual_const(value);
+        result.grad[lane] = 1.0;
+        result
+    }
+
+    #[device]
+    fn hf_dual_add(a: HfDual5, b: HfDual5) -> HfDual5 {
+        let mut out = hf_dual_const(a.value + b.value);
+        let mut i = 0usize;
+        while i < 5 { out.grad[i] = a.grad[i] + b.grad[i]; i += 1; }
+        out
+    }
+
+    #[device]
+    fn hf_dual_sub(a: HfDual5, b: HfDual5) -> HfDual5 {
+        let mut out = hf_dual_const(a.value - b.value);
+        let mut i = 0usize;
+        while i < 5 { out.grad[i] = a.grad[i] - b.grad[i]; i += 1; }
+        out
+    }
+
+    #[device]
+    fn hf_dual_mul(a: HfDual5, b: HfDual5) -> HfDual5 {
+        let mut out = hf_dual_const(a.value * b.value);
+        let mut i = 0usize;
+        while i < 5 { out.grad[i] = a.grad[i] * b.value + a.value * b.grad[i]; i += 1; }
+        out
+    }
+
+    #[device]
+    fn hf_dual_div(a: HfDual5, b: HfDual5) -> HfDual5 {
+        let mut out = hf_dual_const(a.value / b.value);
+        let den = b.value * b.value;
+        let mut i = 0usize;
+        while i < 5 { out.grad[i] = (a.grad[i] * b.value - a.value * b.grad[i]) / den; i += 1; }
+        out
+    }
+
+    #[device]
+    fn hf_dual_pow(a: HfDual5, exponent: f32) -> HfDual5 {
+        let value = a.value.powf(exponent);
+        let scale = exponent * a.value.powf(exponent - 1.0);
+        let mut out = hf_dual_const(value);
+        let mut i = 0usize;
+        while i < 5 { out.grad[i] = a.grad[i] * scale; i += 1; }
+        out
+    }
+
+    #[device]
+    fn hf_dual_sqrt(a: HfDual5) -> HfDual5 {
+        let value = a.value.sqrt();
+        let scale = if value <= 1.0e-6 { 0.0 } else { 0.5 / value };
+        let mut out = hf_dual_const(value);
+        let mut i = 0usize;
+        while i < 5 { out.grad[i] = a.grad[i] * scale; i += 1; }
+        out
+    }
+
+    #[device]
+    fn hf_dual_tanh(a: HfDual5) -> HfDual5 {
+        let value = a.value.tanh();
+        let scale = 1.0 - value * value;
+        let mut out = hf_dual_const(value);
+        let mut i = 0usize;
+        while i < 5 { out.grad[i] = a.grad[i] * scale; i += 1; }
+        out
+    }
+
+    #[device]
+    fn hf_dual_clamp(a: HfDual5, minimum: f32, maximum: f32) -> HfDual5 {
+        if a.value <= minimum { hf_dual_const(minimum) }
+        else if a.value >= maximum { hf_dual_const(maximum) }
+        else { a }
+    }
+
+    #[device]
+    fn hf_dual_phi_point(
+        point: [HfDual5; 2], params: [HfDual5; 5], alpha: f32, p_exp: f32,
+        param_count: usize,
+    ) -> [HfDual5; 2] {
+        let cx = params[0];
+        let cy = params[1];
+        let rx = hf_dual_clamp(params[2], 0.1, 2.0);
+        let radius = if param_count == 5 {
+            let ry = hf_dual_clamp(params[3], 0.1, 2.0);
+            let sum = hf_dual_add(hf_dual_pow(rx, 8.0), hf_dual_pow(ry, 8.0));
+            hf_dual_clamp(hf_dual_pow(sum, 0.125), 0.1, 2.0)
+        } else { rx };
+        let strength = params[4];
+        let dx = hf_dual_sub(point[0], cx);
+        let dy = hf_dual_sub(point[1], cy);
+        let r = hf_dual_sqrt(hf_dual_add(hf_dual_mul(dx, dx), hf_dual_mul(dy, dy)));
+        let u = if r.value > 1.0e-6 {
+            hf_dual_div(hf_dual_tanh(hf_dual_mul(hf_dual_const(alpha.max(1.0e-4)), r)), r)
+        } else { hf_dual_const(alpha.max(1.0e-4)) };
+        let weight = if r.value < radius.value {
+            let base = hf_dual_sub(hf_dual_const(1.0), hf_dual_div(r, radius));
+            hf_dual_pow(base, p_exp.max(1.0e-4))
+        } else { hf_dual_const(0.0) };
+        let gain = hf_dual_add(hf_dual_const(1.0), hf_dual_mul(hf_dual_mul(strength, weight), hf_dual_sub(u, hf_dual_const(1.0))));
+        [hf_dual_add(cx, hf_dual_mul(gain, dx)), hf_dual_add(cy, hf_dual_mul(gain, dy))]
+    }
+
+    #[kernel]
+    pub fn hyperbolic_fixed_point_param_grad(
+        params: &[f32], grid_gradient: &[f32], mut output: DisjointSlice<f32>,
+        batch: usize, height: usize, width: usize, param_count: usize,
+        alpha: f32, p_exp: f32, iterations: usize, eta: f32,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if i >= output.len() { return; }
+        let n = i / 5;
+        let lane = i % 5;
+        if n >= batch || (param_count == 4 && lane == 3) {
+            if let Some(out) = output.get_mut(index) { *out = 0.0; }
+            return;
+        }
+        let base = n * param_count;
+        let parameter_duals = [
+            hf_dual_var(params[base].max(-0.9).min(0.9), 0),
+            hf_dual_var(params[base + 1].max(-0.9).min(0.9), 1),
+            hf_dual_var(params[base + 2], 2),
+            hf_dual_var(if param_count == 5 { params[base + 3] } else { params[base + 2] }, 3),
+            hf_dual_var(params[base + param_count - 1].max(0.0).min(1.0), 4),
+        ];
+        let spatial = height * width;
+        let mut sum = 0.0f32;
+        let mut pixel = 0usize;
+        while pixel < spatial {
+            let x = pixel % width;
+            let y = pixel / width;
+            let qx = if width > 1 { 2.0 * x as f32 / (width - 1) as f32 - 1.0 } else { 0.0 };
+            let qy = if height > 1 { 2.0 * y as f32 / (height - 1) as f32 - 1.0 } else { 0.0 };
+            let query = [hf_dual_const(qx), hf_dual_const(qy)];
+            let mut point = [hf_dual_clamp(query[0], -1.0, 1.0), hf_dual_clamp(query[1], -1.0, 1.0)];
+            let mut iteration = 0usize;
+            while iteration < iterations {
+                let mapped = hf_dual_phi_point(point, parameter_duals, alpha, p_exp, param_count);
+                let residual_x = hf_dual_sub(query[0], mapped[0]);
+                let residual_y = hf_dual_sub(query[1], mapped[1]);
+                point[0] = hf_dual_clamp(hf_dual_add(point[0], hf_dual_mul(hf_dual_const(eta), residual_x)), -1.0, 1.0);
+                point[1] = hf_dual_clamp(hf_dual_add(point[1], hf_dual_mul(hf_dual_const(eta), residual_y)), -1.0, 1.0);
+                iteration += 1;
+            }
+            let x_scale = width.saturating_sub(1) as f32 * 0.5;
+            let y_scale = height.saturating_sub(1) as f32 * 0.5;
+            let gx = grid_gradient[(n * spatial + pixel) * 2];
+            let gy = grid_gradient[(n * spatial + pixel) * 2 + 1];
+            let semantic_lane = if param_count == 4 && lane == 3 { 4 } else { lane };
+            sum += gx * x_scale * point[0].grad[semantic_lane] + gy * y_scale * point[1].grad[semantic_lane];
+            pixel += 1;
+        }
+        if let Some(out) = output.get_mut(index) { *out = sum; }
+    }
+
     /// Build the inverse sampling grid for isotropic or anisotropic Newton HF mode.
     #[kernel]
     pub fn hyperbolic_newton_grid(

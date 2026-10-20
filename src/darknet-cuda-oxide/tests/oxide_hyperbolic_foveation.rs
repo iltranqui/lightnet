@@ -311,6 +311,57 @@ fn hyperbolic_foveation_native_predictor_backward_matches_finite_differences() {
 }
 
 #[test]
+fn hyperbolic_foveation_native_fixed_point_param_grad_matches_finite_differences() {
+    let backend = OxideBackend::new().expect("Oxide backend");
+    let (batch, height, width) = (2, 3, 4);
+    let (alpha, p_exp, iterations, eta) = (1.3f32, 2.2f32, 5usize, 0.45f32);
+    let config = ElementwiseLaunchConfig::default();
+    let grid_seed: Vec<f32> = (0..batch * height * width * 2)
+        .map(|i| (i as f32 * 0.31).cos() * 0.4)
+        .collect();
+    let grid_seed_gpu = backend.upload_f32(&[batch, height, width, 2], &grid_seed).unwrap();
+    for param_count in [4usize, 5] {
+        let mut params = Vec::new();
+        for n in 0..batch {
+            let base = [0.12 + n as f32 * 0.03, -0.09 + n as f32 * 0.02, 0.73 + n as f32 * 0.04];
+            params.extend_from_slice(&base);
+            if param_count == 5 { params.push(0.51 + n as f32 * 0.02); }
+            params.push(0.32 + n as f32 * 0.03);
+        }
+        let params_gpu = backend.upload_f32(&[batch, param_count], &params).unwrap();
+        let actual_gpu = backend.hyperbolic_foveation_fixed_point_param_grad_f32(
+            &params_gpu, &grid_seed_gpu, &[batch, 1, height, width], param_count,
+            alpha, p_exp, iterations, eta, config,
+        ).unwrap().expect("native Oxide fixed-point parameter adjoint");
+        let actual = backend.download_f32(&actual_gpu).unwrap();
+        let loss = |values: &[f32]| {
+            let values_gpu = backend.upload_f32(&[batch, param_count], values).unwrap();
+            let grid = backend.hyperbolic_fixed_point_grid_f32(
+                &values_gpu, batch, height, width, param_count, alpha, p_exp,
+                iterations, eta, config,
+            ).unwrap();
+            backend.download_f32(&grid).unwrap().iter().zip(&grid_seed)
+                .map(|(value, seed)| value * seed).sum::<f32>()
+        };
+        let eps = 1.0e-3;
+        for n in 0..batch {
+            for packed_lane in 0..param_count {
+                let semantic_lane = if param_count == 4 && packed_lane == 3 { 4 } else { packed_lane };
+                let index = n * param_count + packed_lane;
+                let mut plus = params.clone();
+                let mut minus = params.clone();
+                plus[index] += eps;
+                minus[index] -= eps;
+                let numeric = (loss(&plus) - loss(&minus)) / (2.0 * eps);
+                let analytic = actual[n * 5 + semantic_lane];
+                assert!((analytic - numeric).abs() < 4e-3,
+                    "param_count={param_count} batch={n} lane={packed_lane}: analytic {analytic}, numeric {numeric}");
+            }
+        }
+    }
+}
+
+#[test]
 fn hyperbolic_foveation_native_newton_grid_matches_reference() {
     let backend = OxideBackend::new().expect("Oxide backend");
     let (batch, height, width) = (2, 3, 4);

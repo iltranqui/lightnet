@@ -6938,6 +6938,53 @@ impl F32TensorOpsBackend for OxideBackend {
         ))
     }
 
+    fn hyperbolic_foveation_fixed_point_param_grad_f32(
+        &self,
+        params: &Self::Tensor,
+        grid_gradient: &Self::Tensor,
+        shape: &[usize],
+        param_count: usize,
+        alpha: f32,
+        p_exp: f32,
+        iterations: usize,
+        eta: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Option<Self::Tensor>, Self::Error> {
+        let params_f = self.f32v(params)?;
+        let params = &*params_f;
+        let grid_f = self.f32v(grid_gradient)?;
+        let grid_gradient = &*grid_f;
+        let op = "hyperbolic_foveation_fixed_point_param_grad_f32";
+        if shape.len() != 4 || shape.contains(&0) {
+            return Err(shape_err(op, format!("expected positive NCHW shape, got {shape:?}")));
+        }
+        if param_count != 4 && param_count != 5 {
+            return Err(shape_err(op, format!("expected 4 or 5 HF parameters, got {param_count}")));
+        }
+        let (batch, height, width) = (shape[0], shape[2], shape[3]);
+        let params_len = batch.checked_mul(param_count)
+            .ok_or_else(|| shape_err(op, "parameter size overflows".to_owned()))?;
+        let grid_len = batch.checked_mul(height).and_then(|n| n.checked_mul(width))
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| shape_err(op, "grid size overflows".to_owned()))?;
+        if params.len() != params_len || grid_gradient.len() != grid_len {
+            return Err(shape_err(op, format!("parameter/grid lengths are {}/{}, expected {params_len}/{grid_len}", params.len(), grid_gradient.len())));
+        }
+        let output_len = batch.checked_mul(5)
+            .ok_or_else(|| shape_err(op, "output size overflows".to_owned()))?;
+        let mut output = self.alloc_uninit(output_len)?;
+        // SAFETY: all tensor lengths and dimensions are checked and each
+        // thread owns one output batch/parameter lane.
+        unsafe {
+            self.resample.hyperbolic_fixed_point_param_grad(
+                &self.stream, launch::elementwise(output_len, config), &params.buf,
+                &grid_gradient.buf, &mut output, batch, height, width, param_count,
+                alpha, p_exp, iterations, eta,
+            )
+        }.map_err(launch_err)?;
+        Ok(Some(OxideTensorF32::new(output, &[batch, 5])))
+    }
+
     fn crop_bilinear_f32(
         &self,
         x: &Self::Tensor,
