@@ -288,6 +288,107 @@ mod tests {
     }
 
     #[test]
+    fn contrastive_axis_layout_pins_cpp_batch_rows_and_embedding_features() {
+        // C++ assigns one embedding row per sample and reads each row's
+        // `embedding_size` contiguous features (`softmax_layer.cpp:265-430`,
+        // `blas.cpp` contrastive helpers). These asymmetric rows make a
+        // sample/feature transpose change cosine pairs and the seeded delta.
+        let s = spec();
+        let batch = 4usize;
+        let embedding_size = 3usize;
+        let input = vec![
+            1.0f32, 0.0, 0.0, // sample 0, class 0
+            0.0, 1.0, 0.0, // sample 1, class 0
+            -1.0, 0.0, 0.0, // sample 2, class 1
+            0.0, -1.0, 0.0, // sample 3, class 1
+        ];
+        let truth = vec![1.0f32, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0];
+        let result = contrastive_forward(
+            &input,
+            Some(&truth),
+            &s,
+            batch,
+            embedding_size,
+            1,
+            false,
+            0.5,
+            true,
+        )
+        .expect("classifier contrastive forward");
+        assert_eq!(result.labels, vec![0, 0, 1, 1]);
+
+        // Independent source-order oracle over [sample][feature] rows.
+        let rows = (0..batch)
+            .map(|sample| &input[sample * embedding_size..(sample + 1) * embedding_size])
+            .collect::<Vec<_>>();
+        let mut similarities = vec![0.0f32; batch * batch];
+        let mut exponentials = vec![0.0f32; batch * batch];
+        for i in 0..batch {
+            for j in 0..batch {
+                if i == j {
+                    continue;
+                }
+                let dot = rows[i].iter().zip(rows[j]).map(|(a, b)| a * b).sum::<f32>();
+                let norm_i = rows[i].iter().map(|v| v * v).sum::<f32>().sqrt();
+                let norm_j = rows[j].iter().map(|v| v * v).sum::<f32>().sqrt();
+                let sim = dot / (norm_i * norm_j);
+                similarities[i * batch + j] = sim;
+                exponentials[i * batch + j] = (sim / s.temperature).exp();
+            }
+        }
+        let mut probabilities = vec![0.0f32; batch * batch];
+        for i in 0..batch {
+            for j in 0..batch {
+                if i == j {
+                    continue;
+                }
+                let denominator = (0..batch)
+                    .filter(|&k| k != i)
+                    .map(|k| exponentials[k * batch + j])
+                    .sum::<f32>();
+                probabilities[i * batch + j] = exponentials[i * batch + j] / denominator;
+            }
+        }
+        let mut expected = vec![0.0f32; batch * embedding_size];
+        for i in 0..batch {
+            let same_count = result
+                .labels
+                .iter()
+                .filter(|&&label| label == result.labels[i])
+                .count();
+            let multiplier = 1.0 / ((same_count - 1) as f32 * s.temperature * 1.0);
+            for j in 0..batch {
+                if j == i || result.labels[j] != result.labels[i] {
+                    continue;
+                }
+                let sim = similarities[i * batch + j];
+                let p = probabilities[i * batch + j];
+                for feature in 0..embedding_size {
+                    expected[i * embedding_size + feature] -=
+                        multiplier * (sim * rows[i][feature] - rows[j][feature]) * (1.0 - p);
+                }
+                for k in 0..batch {
+                    if k == i || k == j {
+                        continue;
+                    }
+                    let sim = similarities[i * batch + k];
+                    let p = probabilities[i * batch + k];
+                    for feature in 0..embedding_size {
+                        expected[i * embedding_size + feature] -=
+                            multiplier * (rows[k][feature] - sim * rows[i][feature]) * p;
+                    }
+                }
+            }
+        }
+        for (index, (&actual, &want)) in result.delta.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - want).abs() <= 1.0e-6 * (1.0 + want.abs()),
+                "contrastive batch/feature axis at flat index {index}: {actual} != {want}"
+            );
+        }
+    }
+
+    #[test]
     fn the_detection_branch_reports_itself_as_unported() {
         let mut s = spec();
         s.yolo_layer = -1;

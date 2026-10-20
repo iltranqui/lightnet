@@ -91,21 +91,28 @@ fn native_raw(cpu: &ExecutableNetwork, input: &Tensor, label: &str) -> Vec<f32> 
     let shape = layer.input_shape;
     let out = layer.output_shape;
     let t_in = backend
-        .upload_f32(&[shape.batch, shape.channels, shape.height, shape.width], &input.data)
+        .upload_f32(
+            &[shape.batch, shape.channels, shape.height, shape.width],
+            &input.data,
+        )
         .unwrap();
-    let t_main = backend.upload_f32(&[params.main.weights.len()], &params.main.weights).unwrap();
+    let t_main = backend
+        .upload_f32(&[params.main.weights.len()], &params.main.weights)
+        .unwrap();
     let t_off_w = backend
         .upload_f32(&[params.offset_weights.len()], &params.offset_weights)
         .unwrap();
     let t_off_b = backend
         .upload_f32(&[params.offset_biases.len()], &params.offset_biases)
         .unwrap();
-    let mask_w = params.mask_weights.as_ref().map(|w| {
-        backend.upload_f32(&[w.len()], w).unwrap()
-    });
-    let mask_b = params.mask_biases.as_ref().map(|b| {
-        backend.upload_f32(&[b.len()], b).unwrap()
-    });
+    let mask_w = params
+        .mask_weights
+        .as_ref()
+        .map(|w| backend.upload_f32(&[w.len()], w).unwrap());
+    let mask_b = params
+        .mask_biases
+        .as_ref()
+        .map(|b| backend.upload_f32(&[b.len()], b).unwrap());
     let masks = match (mask_w.as_ref(), mask_b.as_ref()) {
         (Some(w), Some(b)) => Some((w, b)),
         _ => None,
@@ -185,9 +192,7 @@ fn native_forward_matches_the_cpu_runtime_with_masks() {
 }
 
 #[test]
-fn dilated_layer_parses_but_the_conv_based_predictor_rejects_it() {
-    // The device path must refuse `dilation > 1` rather than return a
-    // mis-shaped tensor, so the runtime can fall back to the host.
+fn dilated_layer_native_forward_matches_cpu_runtime() {
     let cfg_text = UNMASKED.replace("stride=1", "stride=1\ndilation=2");
     let cpu = build(&cfg_text);
     let layer = cpu.network.layers.last().unwrap();
@@ -195,34 +200,12 @@ fn dilated_layer_parses_but_the_conv_based_predictor_rejects_it() {
         panic!("not a deform layer");
     };
     assert_eq!(spec.dilation, 2, "cfg must carry the dilation");
-    let backend = backend();
-    let t_in = backend.upload_f32(&[1], &[0.0]).unwrap();
-    let t_w = backend.upload_f32(&[1], &[0.0]).unwrap();
-    let result = backend.deform_conv_forward_native(
-        &t_in,
-        &t_w,
-        &t_w,
-        &t_w,
-        None,
-        1,
-        1,
-        1,
-        layer.input_shape.height,
-        layer.input_shape.width,
-        layer.output_shape.height,
-        layer.output_shape.width,
-        spec.size,
-        spec.stride_x,
-        spec.stride_y,
-        spec.padding,
-        spec.dilation,
-        cfg(),
-    );
-    match result {
-        Ok(_) => panic!("dilated deform conv must be rejected on the device path"),
-        Err(err) => assert!(
-            format!("{err}").contains("dilation 2 is not supported"),
-            "unexpected error: {err}"
-        ),
-    }
+    let shape = cpu.network.net.input_shape();
+    let data: Vec<f32> = (0..shape.element_count())
+        .map(|i| ((i * 7 % 17) as f32) * 0.125 - 1.0)
+        .collect();
+    let input = Tensor::from_data(shape, data).unwrap();
+    let want = cpu_layer_output(&cpu, &input, "dilated");
+    let got = native_raw(&cpu, &input, "dilated");
+    assert_close("dilated", &got, &want);
 }

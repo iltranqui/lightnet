@@ -224,6 +224,40 @@ file is named inline.
 - [196. LayaScorer native f32 forward](#196-layascorer-native-f32-forward)
 - [197. LayaScorer native f32 input adjoint](#197-layascorer-native-f32-input-adjoint)
 - [198. LayaEncoder native f32 inference](#198-layaencoder-native-f32-inference)
+- [199. Dilated DeformConv native predictors and runtime coverage](#199-dilated-deformconv-native-predictors-and-runtime-coverage)
+- [200. DSConv native f32 runtime integration](#200-dsconv-native-f32-runtime-integration)
+- [201. DSConv hybrid GPU Muon](#201-dsconv-hybrid-gpu-muon)
+- [202. DSConv C++-source axis/layout pin](#202-dsconv-c-source-axislayout-pin)
+- [203. DeformConv C++-source axis/layout pin](#203-deformconv-c-source-axislayout-pin)
+- [204. GraphConv C++-source axis/layout pin](#204-graphconv-c-source-axislayout-pin)
+- [205. WMHF C++-source axis/layout pin](#205-wmhf-c-source-axislayout-pin)
+- [206. Clifford C++-source axis/layout pin](#206-clifford-c-source-axislayout-pin)
+- [207. Native Oxide WMHF Haar DWT primitive](#207-native-oxide-wmhf-haar-dwt-primitive)
+- [208. Native Oxide WMHF four-direction scan forward](#208-native-oxide-wmhf-four-direction-scan-forward)
+- [209. Native Oxide WMHF high-frequency branch](#209-native-oxide-wmhf-high-frequency-branch)
+- [210. DepthAnything axis pin and explicit GPU rejection](#210-depthanything-axis-pin-and-explicit-gpu-rejection)
+- [211. Native Oxide WMHF scan backward](#211-native-oxide-wmhf-scan-backward)
+- [212. Generic backend contracts for WMHF primitives](#212-generic-backend-contracts-for-wmhf-primitives)
+- [213. WMHF scan-forward sequence ownership](#213-wmhf-scan-forward-sequence-ownership)
+- [214. WMHF scan-backward sequence ownership](#214-wmhf-scan-backward-sequence-ownership)
+- [215. WMHF gated fusion primitive](#215-wmhf-gated-fusion-primitive)
+- [216. WMHF channel-split primitive](#216-wmhf-channel-split-primitive)
+- [217. WMHF local-branch concatenation primitive](#217-wmhf-local-branch-concatenation-primitive)
+- [218. RNN C++-source axis pin](#218-rnn-c-source-axis-pin)
+- [219. LSTM C++-source axis pin](#219-lstm-c-source-axis-pin)
+- [220. CRNN C++-source axis pin](#220-crnn-c-source-axis-pin)
+- [221. Contrastive C++-source axis pin](#221-contrastive-c-source-axis-pin)
+- [222. JevCe C++-source axis pin](#222-jevce-c-source-axis-pin)
+- [223. OmdLoss C++-source axis pin](#223-omdloss-c-source-axis-pin)
+- [224. Native CenterNet GPU forward](#224-native-centernet-gpu-forward)
+- [225. Native modern-YOLO GPU activation forward](#225-native-modern-yolo-gpu-activation-forward)
+- [226. Native Segmentation GPU activation forward](#226-native-segmentation-gpu-activation-forward)
+- [227. Native JevCe GPU softmax forward](#227-native-jevce-gpu-softmax-forward)
+- [228. Native LayaLoss GPU softmax forward](#228-native-layaloss-gpu-softmax-forward)
+- [229. Native compact identity heads](#229-native-compact-identity-heads)
+- [230. Native compact Logistic and Softmax](#230-native-compact-logistic-and-softmax)
+- [231. Native compact Reorg and channel routing](#231-native-compact-reorg-and-channel-routing)
+- [232. Native compact ScaleChannels](#232-native-compact-scalechannels)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -956,7 +990,7 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 
 - v0.1.002 (`f49cfc56f571329c14f6b43224d635199b6cca1b`): integrated `[dsconv]` / `[dynamic_snake_conv]` with strict source-derived config/shape handling, source-order weights, seeded initialization, NCHW CPU forward for `morph=0/1/2`, exact backward of the Rust forward, activation handling, SGD source-rate groups, and Adam with persisted moments. Multi-template `morph=0/1` explicitly rejects; `morph=2` follows the source normalization to one template.
 - Verification: `MEM=3G ./tools/test_host.sh dsconv` passed 12 core tests, `weights` passed 40 core tests, and `runtime` passed 187 runtime tests. Coverage includes named hand-computed NCHW axes, finite differences for input and every parameter block across all morphs, integer/border derivative conventions, exact source-order bytes/file length, seeded initialization, update rates/gates, optimizer-state round trip, and explicit GPU rejection. Targeted `rustfmt --check --edition 2024` and `git diff --check` passed. No training or Oxide tests were run.
-- Source contract: hand-derived from `Jev_laya`; no compiled-C++ golden/parity. Stage-1 CPU only: no GPU path or full multi-template/drop-mask gradients. CPU Muon was delivered separately in v0.1.005. Do not claim full DSConv parity or v0.1 completion.
+- Source contract: hand-derived from `Jev_laya`; no compiled-C++ golden/parity. The later bounded single-template f32 GPU runtime path is recorded in §200; full multi-template/drop-mask gradients remain open. CPU Muon was delivered separately in v0.1.005. Do not claim full DSConv parity or v0.1 completion.
 
 ## 20. Graph-convolution Stage-1 CPU reference
 
@@ -2185,6 +2219,177 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 198. LayaEncoder native f32 inference
 
 - v0.2.159 (`e10642c0`): composed native Oxide embedding gather/mask extraction, bias-free LayerNorm, fused-QKV RoPE attention (alternating full/sliding key masks with online softmax), residual projections, exact-erf GeGLU, final normalization, and NCHW packing into both full and compact f32 runtime paths. Actual-device CPU-reference parity covers two batches, three blocks, local-window edges, masked/fully masked rows, and out-of-range IDs; malformed embedding extents reject (`oxide_laya_encoder_forward`: 2 passed). `MEM=3G ./tools/test_host.sh laya_encoder`: 10 passed. Frozen backward remains no-input-gradient; compact f16 unsupported. C++ source audit via `Jev_laya:src-lib/laya_encoder_kernels.cu`; no compiled-C++ golden, no speedup claim.
+
+## 199. Dilated DeformConv native predictors and runtime coverage
+
+- v0.2.160: extended the native deform-convolution offset/mask predictors to use DeformConv's explicitly supplied output extent when `dilation > 1`, without changing ordinary convolution `Geom`. Added an Oxide direct predictor kernel and a host-reference backend default; runtime dispatch now keeps non-BN dilated variants on the device forward/backward path. BN variants remain host-routed. `MEM=3G ./tools/test_host.sh deform_conv` passed 23; `MEM=3G ./tools/test_oxide.sh --test oxide_deform_envelope` passed 14, `oxide_deform_conv_chain` passed 3 (including real CPU-runtime parity for dilation), and focused `oxide_runtime_chain deform_conv_dilated_device_path_matches_cpu_and_updates` passed 1. This verifies Rust CPU-reference/Oxide agreement and one SGD update only; one host normalization-Jacobian hop remains, and there is no compiled-C++ golden, f16 support, full-suite or performance claim.
+
+## 200. DSConv native f32 runtime integration
+
+- Added optional `F32TensorOpsBackend` contracts for native single-template DSConv f32 forward/backward and implemented them with the existing Oxide compositions. `GpuExecutableNetwork` now dispatches runtime f32 forward/backward for supported activations and `templates=1`; backward recomputes rather than retaining forward intermediates. Compact f16 remains rejected. Multi-template morph 0/1 remains unsupported.
+- Runtime backward gradients stage into existing DSConv host train buffers. GPU optimizer routing applies source-rate groups for SGD/Adam; hybrid GPU Muon handles the collapse and offset matrices while biases use the AdamW fallback (see §201).
+- Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_dsconv` passed 11 tests; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain dsconv_native_runtime` passed 2 tests: `dsconv_native_runtime_training_matches_cpu_and_updates` (morph 2, SGD, outputs/gradients/updates) and `dsconv_native_runtime_adam_update_matches_cpu` (morph 1, Adam). `MEM=3G ./tools/test_host.sh dsconv` passed 12 tests after these changes. Rust CPU-reference agreement only; no compiled-C++ golden, benchmark, f16 path, or full-suite claim.
+
+## 201. DSConv hybrid GPU Muon
+
+- Enabled DSConv in the GPU Muon eligibility contract. The existing generic matrix visitor stages the collapse matrix (`[filters, channels*kernel]`) and shared offset predictor (`[2*kernel, channels*9]`) through native Oxide momentum/lookahead and Newton–Schulz orthogonalization; non-matrix biases retain the AdamW fallback. Gradient/state/final parameter handling remains hybrid/host-managed.
+- Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain dsconv_gpu_muon_two_step_update_matches_cpu` passed. Actual-device test covers two update steps, matching CPU forward outputs and all DSConv parameter blocks under Muon+AdamW. No compiled-C++ golden or speedup claim; multi-template DSConv remains unsupported.
+
+## 202. DSConv C++-source axis/layout pin
+
+- Added `dsconv_axis_layout_pins_cpp_snake_branches_batch_channels_and_nchw_outputs`, a named `axis_layout` test using the shared `B=2, C=2, H=2, W=3` sentinel fixture. Saturated offset biases make the source's `morph=0`/`morph=1` sample coordinates exact; the independent hand calculation pins NCHW input/output, batch/channel separation, x/y snake coordinate order, and `morph=2`'s floor/remainder output-filter split.
+- Source contract: `Jev_laya:src-lib/dsconv_layer.cpp:103-167,223-247,324-336`; hand-derived from source, no compiled-C++ golden. `MEM=3G ./tools/test_host.sh dsconv_axis_layout` passed 1 test; `MEM=3G ./tools/test_host.sh dsconv` passed 13 tests; `MEM=3G ./tools/test_host.sh axis_layout` passed 39 tests (946 filtered out).
+
+## 203. DeformConv C++-source axis/layout pin
+
+- Added `deform_conv_axis_layout_pins_cpp_offset_mask_groups_and_batch_nchw` using `B=2,C=2,H=2,W=3`, groups=2, and a masked 3x3 kernel. The independent hand calculation follows C++ offset plane order `(dy,dx)` per kernel point, one mask plane per point, shared predictors across groups, and NCHW batch/filter/spatial output order. Small symmetric offset biases avoid the conditional normalization branch while making x/y order observable; distinct mask logits and sparse main weights expose kernel-point swaps.
+- Source contract: `Jev_laya:src-lib/deform_conv_layer.cpp:518-560,834-852`; hand-derived from source, no compiled-C++ golden. `MEM=3G ./tools/test_host.sh deform_conv_axis_layout` passed 1 test; `MEM=3G ./tools/test_host.sh deform_conv` passed 24 tests; `MEM=3G ./tools/test_host.sh axis_layout` passed 40 tests (946 filtered out).
+
+## 204. GraphConv C++-source axis/layout pin
+
+- Added `graph_conv_axis_layout_pins_cpp_batch_group_neighbor_raster_and_nchw`: a learned-edge softmax fixture with `B=2,C=2,H=2,W=3`, `groups=2`, and distinct per-neighbor/per-group logits. The independent calculation checks row-major `k -> (ky,kx)` neighbor mapping, boundary masking/renormalization, group-specific channels and projections, and NCHW batch/output axes.
+- Source contract: `Jev_laya:src-lib/graph_conv_layer.cpp:55-83,215-224,621-808,823-855`; hand-derived from source, no compiled-C++ golden. `MEM=3G ./tools/test_host.sh graph_conv_axis_layout` passed 1 test; `MEM=3G ./tools/test_host.sh axis_layout` passed 41 tests (946 filtered out).
+
+## 205. WMHF C++-source axis/layout pin
+
+- Added `wmhf_axis_layout_pins_cpp_batch_channel_spatial_and_subband_order`, with a shared `B=2,C=2,H=2,W=3` sentinel fixture. It independently calculates C++ Haar formulas for LL/LH/HL/HH over each NCHW batch/channel/tile position, pinning the four sub-band arrays and their flattened order.
+- Source contract: `Jev_laya:src-lib/wmhf_layer.cpp:274-303` (`dwt_cpu`); hand-derived from source, no compiled-C++ golden. `MEM=3G ./tools/test_host.sh wmhf_axis_layout` passed 1; `MEM=3G ./tools/test_host.sh wmhf` passed 18; `MEM=3G ./tools/test_host.sh axis_layout` passed 42 (946 filtered out).
+
+## 206. Clifford C++-source axis/layout pin
+
+- Added `clifford_axis_layout_pins_cpp_nchw_token_channel_normalization`, checking that channel mean/variance are reduced independently at each `(batch, spatial-token)` and that gamma/beta map by channel in NCHW layout. The fixture uses `B=2,C=2,H=2,W=3` and independently computes the C++ normalization formula.
+- Source contract: `Jev_laya:src-lib/clifford_layer.cpp:311-346,1578-1580`; hand-derived from source, no compiled-C++ golden. `MEM=3G ./tools/test_host.sh clifford_axis_layout` passed 1; `MEM=3G ./tools/test_host.sh clifford` passed 14; `MEM=3G ./tools/test_host.sh axis_layout` passed 43 (946 filtered out).
+
+## 207. Native Oxide WMHF Haar DWT primitive
+
+- Added native Oxide Haar DWT and IWT with both adjoints. DWT produces LL/LH/HL/HH buffers and its adjoint gathers odd-edge corner collisions without atomics; IWT reuses the exact dual pair. These are reusable primitives only; runtime dispatch, high-frequency runtime integration, and the seven-convolution WMHF path remain unsupported on GPU. Scan forward is tracked separately in §208, and high-frequency primitives in §209.
+- Evidence: actual-device parity against independently calculated NCHW formulas for all four operations passed in `MEM=3G ./tools/test_oxide.sh --test oxide_wmhf` (1 test), covering `B=2,C=3,H=3,W=5`. No compiled-C++ golden, runtime CPU/GPU parity, or performance claim.
+
+## 208. Native Oxide WMHF four-direction scan forward
+
+- Added `OxideBackend::wmhf_scan4_forward_f32`: native Oxide math implements source `stable_sigmoid`, the `0.98*sigmoid(raw_a)` recurrence coefficient, four independent horizontal/vertical forward/reverse scans, and the `0.25*(C*state+D*x)` output contribution. No host fallback or runtime dispatch was added.
+- Evidence: actual-device parity against an independent C++-ordered CPU recurrence passed in `MEM=3G ./tools/test_oxide.sh --test oxide_wmhf` (2 tests including Haar DWT/IWT), with batch-2 NCHW data and independently varied channel weights. Scan backward and parameter gradients were still open at this increment; native primitives are now recorded in §211. Performance and compiled-C++ parity remain unverified.
+
+## 209. Native Oxide WMHF high-frequency branch
+
+- Added native f32 `wmhf_high_frequency_forward_f32` and its exact gather adjoint `wmhf_high_frequency_backward_f32`. Forward computes `abs(LH)+abs(HL)+abs(HH)` with nearest 2x tile upsampling; backward reduces all mapped output seeds per coefficient and applies the source `sign_no_zero` convention (zero maps to zero). No atomics, host fallback, or runtime dispatch.
+- Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_wmhf` passed 3 actual-device tests, including odd non-square batched HF forward/backward parity. These remain primitives, not WMHF runtime support; no compiled-C++ golden or performance claim.
+
+## 210. DepthAnything axis pin and explicit GPU rejection
+
+- Added `depth_anything_axis_layout_pins_cpp_patch_tokens_cls_and_nchw_batches`, using `B=2,H=2,W=4,patch_size=2,dim=2`. Its asymmetric projections and distinct positional values verify NCHW channel-major patch extraction, batch-major row-raster patch tokens after CLS, and separate CLS/patch positional embeddings. Existing type-major array-layout and external/sequential weight tests complete the related source-order evidence.
+- Unified Stage-1 GPU rejection messages for DepthAnything/DPT/Yolo3d across GPU execution, backward and optimizer updates. This avoids a generic forward error and prevents backward from proceeding with a fabricated unsupported forward state.
+- Evidence: source references `Jev_laya:src-lib/depth_anything_layer.cpp:300-339` and `src-lib/weights.cpp:1433-1464`; no compiled-C++ golden. `MEM=3G ./tools/test_host.sh depth_anything` passed 18 tests; `MEM=3G ./tools/test_host.sh axis_layout` passed 44 tests (946 filtered out).
+
+## 211. Native Oxide WMHF scan backward
+
+- Added `OxideBackend::wmhf_scan4_backward_f32` with native input and parameter gradient contributions, an input-gradient direction reduction, and `[4,C]` weight-gradient reduction. It differentiates the exact forward recurrence, including the raw sigmoid parameterization and the `0.25` output scale, without atomics. The initial implementation used per-pixel prefix/suffix recomputation; §214 records the sequence-owned rewrite.
+- Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_wmhf` passed 3 actual-device tests. The scan fixture compares forward, input gradients and all channel parameter gradients against independent source-ordered CPU calculations. No scan performance, runtime dispatch, or compiled-C++ golden claim.
+
+## 212. Generic backend contracts for WMHF primitives
+
+- Exposed Oxide WMHF Haar DWT/IWT and adjoints, four-direction scan forward/backward, and high-frequency forward/backward through `F32TensorOpsBackend`. Unsupported backends retain explicit panic defaults; Oxide trait methods dispatch to the already tested native kernels. This provides the generic seam needed for runtime composition but does not add a WMHF runtime arm or change its hard rejection.
+- Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_wmhf` passed 3 tests; high-frequency forward/backward are invoked through fully qualified trait methods in the integration test. No full GPU runtime parity or performance claim.
+
+## 213. WMHF scan-forward sequence ownership
+
+- Reworked the Oxide scan-forward kernel from one thread per direction/pixel (which recomputed the prefix) to one thread per whole row/column sequence. Each thread writes its exclusive direction-plane positions through a raw device pointer; the launch invariant gives each output exactly one writer. The scan recurrence and combine pass are unchanged.
+- Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_wmhf` passed all 3 actual-device formula tests after the rewrite. This is an algorithmic work reduction, not a measured speedup; no performance or compiled-C++ parity claim. WMHF runtime remains open.
+
+## 214. WMHF scan-backward sequence ownership
+
+- Replaced per-pixel prefix/suffix recomputation in scan backward with two sequence-owned kernels: one writes each recurrence state once, then one walks the adjoint recurrence in reverse and writes disjoint per-direction input/parameter partials. Existing reductions combine direction overlaps and channel parameter gradients.
+- Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_wmhf` passed all 3 actual-device formula tests after the rewrite, including scan input and raw-parameter gradients. This removes redundant recurrence work but is not a measured speedup; no performance or compiled-C++ parity claim. WMHF runtime remains open.
+
+## 215. WMHF gated fusion primitive
+
+- Added native Oxide f32 WMHF gated residual fusion and its adjoint: `fuse + freq_scale * gate * projected + optional_shortcut`, with gradients for fuse, gate, projected, and shortcut. Both operations are exposed through `F32TensorOpsBackend`; unsupported backends keep explicit panic defaults.
+- Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_wmhf` passed 4 actual-device tests. The new test invokes trait dispatch for forward/backward and checks both shortcut modes against independent formulas. This is a primitive only, not runtime WMHF integration or performance/C++-parity evidence.
+
+## 216. WMHF channel-split primitive
+
+- Added native Oxide `wmhf_split_channels_f32`, gathering a contiguous channel interval from batched NCHW input into the corresponding `[B,count,H,W]` branch tensor. Exposed through `F32TensorOpsBackend`, with explicit unsupported defaults for other backends.
+- Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_wmhf` passed 5 actual-device tests. The channel-split test uses `B=2,C=4,H=3,W=5`, a nonzero begin channel, and fully qualified trait dispatch against an independent NCHW slice. This is a primitive only; runtime integration remains open.
+
+## 217. WMHF local-branch concatenation primitive
+
+- Added native Oxide `wmhf_concat_local_f32`, joining the 3x/5x/7x depthwise branch tensors along channels as `[B,3C,H,W]` in source order. Exposed through `F32TensorOpsBackend`; unsupported backends retain explicit panic defaults.
+- Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_wmhf` passed 6 actual-device tests. The new test checks batch-major/channel-major branch blocks for `B=2,C=2,H=3,W=5` through trait dispatch. This remains a primitive, not the complete WMHF runtime path.
+
+## 218. RNN C++-source axis pin
+
+- Added `rnn_axis_layout_pins_cpp_step_batch_and_input_channels`, a two-step, two-sample fixture with three input features, two hidden values, and three outputs. It independently computes `[step][sample][feature]` inputs and `[step][sample][output]` order, including sample-local recurrent state and `[out][in]` projections.
+- Source contract: `Jev_laya:src-lib/rnn_layer.cpp:92-133` (`state.input` step advance, state rows, and output-layer slices). Evidence: `MEM=3G ./tools/test_host.sh rnn_axis_layout` passed; `MEM=3G ./tools/test_host.sh axis_layout` passed 45 tests (946 filtered out). Hand-derived from source; no compiled-C++ golden. The pin is unversioned in the current dirty worktree.
+
+## 219. LSTM C++-source axis pin
+
+- Added `lstm_axis_layout_pins_cpp_gate_blocks_steps_and_samples` with two steps, two samples, three input features, and two hidden/cell outputs. Independent formulas exercise separate f/i/g/o input projection blocks, recurrent-cell carry per sample, and time-major output slots.
+- Source contract: `Jev_laya:src-lib/lstm_layer.cpp:46-83,177-260` (separate gate layers, projection combination, cell update, state/output storage). `MEM=3G ./tools/test_host.sh lstm_axis_layout` passed. Hand-derived from source; no compiled-C++ golden; the pin is unversioned in the dirty worktree.
+
+## 220. CRNN C++-source axis pin
+
+- Added `crnn_axis_layout_pins_cpp_spatial_step_and_sample_order`, using `B=2,T=2,C=1,H=2,W=3`, two hidden channels and two output channels. Independent formulas pin per-step NCHW input slicing, per-spatial hidden-state carry, input/self/output convolution channel order, and time-major output storage.
+- Source contract: `Jev_laya:src-lib/crnn_layer.cpp:28-83,165-218` (sub-convolution construction, per-step forward sequence and pointer advancement). `MEM=3G ./tools/test_host.sh crnn_axis_layout` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
+
+## 221. Contrastive C++-source axis pin
+
+- Added `contrastive_axis_layout_pins_cpp_batch_rows_and_embedding_features` with four three-feature embeddings, truth labels in sample-row order, and an independent source-order cosine/probability/delta calculation. Asymmetric vectors make a batch-feature transpose change pair similarities and the resulting sample deltas.
+- Source contract: `Jev_laya:src-lib/softmax_layer.cpp:265-430` (per-sample labels, `get_embedding`, pair loops and batch/time-step exclusion); probability/helper equations are hand-derived from the same branch. `MEM=3G ./tools/test_host.sh contrastive_axis_layout` passed. No compiled-C++ golden; unversioned in the dirty worktree.
+
+## 222. JevCe C++-source axis pin
+
+- Added `jev_ce_axis_layout_pins_cpp_batch_group_candidate_and_layout_order` for two samples, two groups and three candidates in both row-major and channel-major storage. Hand-calculated softmax probabilities and normalized deltas pin sample spans, group/candidate indexing, and empty-group masking.
+- Source contract: `Jev_laya:src-lib/jev_ce_layer.cpp:177-183,311-323` (`at(base,g,i)`, per-group softmax/loss and sample loop). `MEM=3G ./tools/test_host.sh jev_ce_axis_layout` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
+
+## 223. OmdLoss C++-source axis pin
+
+- Added `omd_axis_layout_pins_cpp_nchw_sample_rows_pairs_and_scatter` with two batches, two channels, a non-square 2x3 plane, distinct object pixels and independently checked NCHW feature extraction, sample ordering, pair count and delta scatter. Existing `max_delta_clips_the_injected_delta` checks finite clipping; the sentinel path is `clip_delta`'s `max_delta >= FLT_MAX` branch.
+- Source contract: `Jev_laya:src-lib/omd_loss_layer.cpp:86-95,143-185,189-260`. `MEM=3G ./tools/test_host.sh omd_axis_layout` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
+
+## 224. Native CenterNet GPU forward
+
+- Added `F32TensorOpsBackend::centernet_forward_f32`, an Oxide NCHW kernel applying sigmoid to the first `classes` channels, copying regression planes, and sanitizing non-finite results. Wired both full and compact f32 GPU-runtime arms, replacing full-path host activation and eliminating compact's unsupported-layer gap. Full CenterNet head loss/backward remains host-owned; this is not complete layer GPU support.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_centernet` passed 2 actual-device tests (formula/edge values and malformed shapes). `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain centernet_native_runtime_forward_matches_cpu` passed full and compact actual-runtime CPU-reference parity; `MEM=3G ./tools/test_host.sh centernet` passed 14 host tests. Rustfmt passed for touched Rust files. Hand-derived from source; no compiled-C++ golden; unversioned in dirty worktree.
+
+## 225. Native modern-YOLO GPU activation forward
+
+- Added the shared `F32TensorOpsBackend::modern_yolo_forward_f32` contract and Oxide NCHW kernel: sanitize every value and apply the source's clamped sigmoid only to the trailing objectness/class channels. Wired YOLOX, PP-YOLOE and YOLO-NAS full and compact f32 runtime dispatch; previously these full paths downloaded to host and compact paths passed raw YOLOX through or rejected the other heads. Assignment/loss/backward remains host-owned; this is not full GPU layer completion.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain modern_yolo_native_full_and_compact_forward_match_cpu` passed actual-device batch-2 CPU-reference parity for all three head types in both full and compact execution. `MEM=3G ./tools/test_host.sh modern_yolo` passed 24 tests; `MEM=3G ./tools/test_host.sh gpu_yolox_head` passed the generic CPU-reference backward test. Rustfmt and `git diff --check` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
+
+## 226. Native Segmentation GPU activation forward
+
+- Added a generic `segmentation_forward_f32` contract and Oxide kernel. Binary mode sanitizes each scalar then applies sigmoid; multiclass mode computes stable softmax over the channel axis at each NCHW pixel using `temperature`. Wired full and compact f32 GPU runtime, replacing the full path's host download/activation/upload and compact path's CPU fallback. Loss, correct-pixel gate, and training seed remain host-owned; this is partial GPU support.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain segmentation_native_full_and_compact_forward_match_cpu` passed actual-device CPU-reference parity for binary and three-class heads in full and compact paths; host `MEM=3G ./tools/test_host.sh segmentation` passed 18 tests. Rustfmt and `git diff --check` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
+
+## 227. Native JevCe GPU softmax forward
+
+- Added `jev_ce_forward_f32` to the generic backend contract and a native Oxide group-owned softmax kernel supporting both C++ layouts (`group` and `channel`), per-group temperature scaling, and batch-local spans. Wired full and compact f32 runtime, replacing the host softmax path and compact fallback. Head loss/label smoothing/delta remain host-owned; this is partial GPU support.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain jev_ce_native_full_and_compact_forward_match_cpu_for_both_layouts` passed actual-device batch-2 CPU-reference parity in both layouts and both runtime paths. `MEM=3G ./tools/test_host.sh jev_ce` passed 8 tests, including the existing CPU axis pin. Rustfmt and `git diff --check` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
+
+## 228. Native LayaLoss GPU softmax forward
+
+- Added `laya_loss_forward_f32` to the generic backend and native Oxide contracts. One device thread owns a sample row and computes the stable all-valid K-option softmax with f64 accumulation, matching the CPU helper. Wired full and compact f32 runtime, replacing host probability computation and compact fallback. Truth masking, CE/RLCD loss, seed, and TD(lambda) remain host-owned; partial GPU support only.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain laya_loss_native_full_and_compact_forward_matches_cpu` passed actual-device batch-2 CPU-reference parity in full and compact paths plus the seeded pass-through input-gradient check. `MEM=3G ./tools/test_host.sh laya_loss` passed 11 tests. Rustfmt and `git diff --check` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
+
+## 229. Native compact identity heads
+
+- Removed `OmdLoss` and `Regression` from the f32 compact GPU CPU-fallback allowlist and routed them through the device-resident identity arm, matching their full-runtime pass-through semantics. No kernel is required for these identity heads.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain compact_identity_heads_omd_loss_and_regression_match_cpu` passed actual-device CPU-reference output parity for both. `MEM=3G ./tools/test_host.sh omd_loss` passed 15 tests and `MEM=3G ./tools/test_host.sh regression` passed 1. Rustfmt and `git diff --check` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
+
+## 230. Native compact Logistic and Softmax
+
+- Removed Logistic and grouped Softmax from the f32 compact host-fallback allowlist and added compact dispatch through native `activation_f32(Logistic)` / `softmax_f32`, preserving batch/group geometry. Compact paths had previously routed through `forward_with_state` or an identity arm; these now stay on the compact device path.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain compact_logistic_and_softmax_forward_match_cpu` passed actual-device CPU-reference parity for batch-2 Logistic and grouped Softmax. `MEM=3G ./tools/test_host.sh logistic` passed 7 tests; `MEM=3G ./tools/test_host.sh softmax` passed 12. Rustfmt and `git diff --check` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
+
+## 231. Native compact Reorg and channel routing
+
+- Removed Reorg, ChannelShuffle and ChannelSlice from the f32 compact GPU CPU-fallback allowlist and added compact dispatch through their existing native `reorg_f32`, `channel_shuffle_f32`, and `route_concat_f32` operations. ChannelSlice resolves its source-layer output on device and preserves the configured channel range.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain compact_reorg_shuffle_and_channel_slice_match_cpu` passed actual-device batch-2 CPU-reference parity for all three (including ChannelSlice after a convolution). `MEM=3G ./tools/test_host.sh channel_slice` passed 4 host tests. Rustfmt and `git diff --check` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
+
+## 232. Native compact ScaleChannels
+
+- Removed `ScaleChannels` from the generic f32 compact fallback list and added device dispatch through the existing native `scale_channels_f32` and activation ops. Compact preflight still routes unsupported activations through full runtime; supported modes retain the direct device path and source-layer use accounting.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain compact_reorg_shuffle_channel_slice_and_scale_match_cpu` passed actual-device batch-2 CPU-reference parity for ScaleChannels using a pooled source, together with compact Reorg/ChannelShuffle/ChannelSlice. `MEM=3G ./tools/test_host.sh scale_channels` passed 3 tests. Rustfmt and `git diff --check` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
 
 ## Not implemented / open (pointer)
 

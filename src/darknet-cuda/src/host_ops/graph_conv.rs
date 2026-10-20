@@ -266,13 +266,13 @@ pub fn center_reference_forward(
                     if ix < 0 || ix >= g.input_width as i64 {
                         continue;
                     }
-                    let input_index =
-                        ((batch * g.channels + channel) * g.input_height + iy as usize)
-                            * g.input_width
-                            + ix as usize;
-                    let output_index =
-                        ((batch * g.channels + channel) * g.output_height + oy) * g.output_width
-                            + ox;
+                    let input_index = ((batch * g.channels + channel) * g.input_height
+                        + iy as usize)
+                        * g.input_width
+                        + ix as usize;
+                    let output_index = ((batch * g.channels + channel) * g.output_height + oy)
+                        * g.output_width
+                        + ox;
                     reference[output_index] = input[input_index];
                 }
             }
@@ -317,11 +317,10 @@ pub fn center_reference_backward(
                         continue;
                     }
                     let input_index =
-                        ((batch * g.channels + channel) * g.input_height + iy) * g.input_width
-                            + ix;
-                    let output_index =
-                        ((batch * g.channels + channel) * g.output_height + oy) * g.output_width
-                            + ox;
+                        ((batch * g.channels + channel) * g.input_height + iy) * g.input_width + ix;
+                    let output_index = ((batch * g.channels + channel) * g.output_height + oy)
+                        * g.output_width
+                        + ox;
                     input_gradient[input_index] = output_gradient[output_index];
                 }
             }

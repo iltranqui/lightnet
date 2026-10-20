@@ -838,7 +838,9 @@ fn hf_sgd_update_obeys_dont_update_burnin_and_train_only_bn_gates() {
 fn gpu_forward_is_supported_while_compact_and_updates_reject_hf() {
     let network = seeded_hf_network("isotropic");
     let input = sample_input(network.net.input_shape());
-    let expected = ExecutableNetwork::new(network.clone()).forward(&input).unwrap();
+    let expected = ExecutableNetwork::new(network.clone())
+        .forward(&input)
+        .unwrap();
     let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
     let actual = gpu.forward(&input).expect("HF GPU-reference forward");
     assert_eq!(actual.layer_outputs, expected.layer_outputs);

@@ -70,8 +70,8 @@ with the command given rather than trusting the number.
 | GPU forward but CPU/mixed backward | 11 (9 whole-network fallback + HF/FiLM host helpers) |
 | GPU native forward + device backward | 24 |
 | f16 inference | 28 variants (29 section names) |
-| Axis pinned | 34 C++-backed variants / 38 tests total (includes one Rust-only contract test) |
-| Axis open | 26 (Tier 1: 3, Tier 2: 14, Tier 3: 3, Tier 4: 6) |
+| Axis pinned | 40 C++-backed variants / 44 tests total (includes one Rust-only contract test) |
+| Axis open | 24 (Tier 1: 3, Tier 2: 14, Tier 3: 3, Tier 4: 4) |
 | Axis Rust-only | 5 |
 | Partial/incomplete CPU layers | `Region`, `Detection`, `Yolo3d`; blocked: `Dcnv3`, `DetrDecoder` |
 | GPU Muon | partial hybrid integration: connected matrices use native Oxide momentum/lookahead, Newton–Schulz and direction+decay update; standard non-BN convolution, non-BN EML branches, non-BN MoE router/expert matrices, non-BN GraphConv projection/self/learned-edge matrices with `groups=2` parity, tested `dont_update` gating, and DNOPT6 save/load resume; BN GraphConv forward/backward is native for eligible modes, with rolling stats host-synchronized; Muon state/final updates remain host-managed, non-BN DCNv4 offset projection, non-BN deform_conv main/offset/optional mask matrices, local per-location, RNN, LSTM, deconvolutional, and transformer-family matrices use native Oxide Newton–Schulz with host-managed state/final updates. Convolution/EML/MoE/DCNv4 gradients are downloaded at optimizer boundaries; deform_conv gradients download during native backward. Updated convolution/expert parameters are re-uploaded and DCNv4 snapshots trigger cache refresh on the next forward. BN convolution/EML/MoE/DCNv4/deform_conv remain rejected; GraphConv BN training is native only for eligible edge modes/activations. Connected BN has actual-device output/parameter parity across two Muon updates; supported activations use native connected/BN backward and rolling-stat updates (v0.2.101), while BN gradient accumulation and rolling-stat synchronization remain host-managed. Connected momentum is cached between steps but mirrored to host each update; weights remain host-canonical. Standalone BatchNorm and HF/FiLM use host AdamW fallback; eligible HF/FiLM 2-D matrices use native Oxide orthogonalization with host-managed Muon state/final updates and actual-Oxide parity (v0.2.146); other parameter families open |
@@ -89,12 +89,12 @@ with the command given rather than trusting the number.
 | `Route` | alias | none | fwd | exact | pin | native | device | yes |
 | `Shortcut` | alias | C++ | fwd | exact | pin | native | mixed (weight grad host) | yes |
 | `Upsample` | alias | none | fwd | exact | pin | native | device | yes |
-| `Reorg` | alias | none | fwd | exact | pin (normal forward; C++ reverse path source-defective) | native | device | yes (inference) |
-| `ChannelSlice` | yes | none | fwd | exact | pin | native | device | yes (inference) |
-| `ChannelShuffle` | yes | none | fwd | exact | pin | native | device | yes (inference) |
+| `Reorg` | alias | none | fwd | exact | pin (normal forward; C++ reverse path source-defective) | native full/compact f32 | device | yes (f16 inference) |
+| `ChannelSlice` | yes | none | fwd | exact | pin | native full/compact f32 | device | yes (f16 inference) |
+| `ChannelShuffle` | yes | none | fwd | exact | pin | native full/compact f32 | device | yes (f16 inference) |
 | `Softmax` | alias | none | fwd | exact | pin | native | device | yes (inference) |
 | `Dropout` | yes | none | fwd | exact | T1 | native | device | yes (inference) |
-| `ScaleChannels` | yes | none | fwd | exact | pin | native | mixed | yes (inference) |
+| `ScaleChannels` | yes | none | fwd | exact | pin | native full/compact f32 | mixed | yes (inference) |
 | `Sam` | yes | none | fwd | exact | pin | native f32 / host (unsupported activation) | device / CPU fallback | yes (inference) |
 | `BatchNorm` | yes | C++ | fwd | exact | rust | native inference + batch-statistics training | device backward / host AdamW parameter update | yes |
 | `Crop` | yes | none | fwd | exact | rust | native inference + geometric training, RGB-shift and saturation/exposure HSV augmentation | device (atomic scatter) | no |
@@ -107,8 +107,8 @@ with the command given rather than trusting the number.
 | `EmlConvolutional` | alias | C++ | fwd | exact | pin | native | device / CPU (BN) | no |
 | `GraphConv` | alias | C++ | fwd | exact | T4 | native f32 supported inference and eligible training incl. BN; host otherwise | native supported BN/no-BN modes / CPU fallback unsupported variants | no |
 | `Dcnv4` | alias | C++ | fwd | exact | pin | native (incl. rolling-stat BN, <=961 points, supported scalar/NormalizeChannels* acts incl. Revleaky) / host otherwise | mixed (native math and SGD/Adam update; learned parameter tensors cached across GPU calls; Adam moments resident between updates, sidecar on save) | no |
-| `DeformConv` | alias | C++ | fwd | exact | T4 | native (dilation 1, no BN) / host otherwise | native (same gate; one host hop for the normalization Jacobian) | no |
-| `DsConv` | alias | C++ | fwd | exact | T4 | none | none | no |
+| `DeformConv` | alias | C++ | fwd | exact | T4 | native f32 (all dilation, no BN) / host otherwise | native (same gate; one host hop for the normalization Jacobian) | no |
+| `DsConv` | alias | C++ | fwd | exact | T4 | native Oxide f32 for single-template morph=0/1/2 | native f32 backward; host-staged SGD/Adam and hybrid GPU Muon | no |
 | `Wmhf` | alias | C++ | fwd | exact | T4 | none | none | no |
 | `Clifford` | yes | C++ | fwd | exact | T4 | none | none | no |
 | `RecursiveBlock` | alias | body only | fwd | exact | T1 | none | none | no |
@@ -126,13 +126,13 @@ with the command given rather than trusting the number.
 | `LayaScorer` | yes | C++ source not local | frozen | frozen | pin | native f32 full + compact | native input adjoint | no |
 | `LayaMarkerGather` | yes | none | fwd | exact | pin | native | device | yes |
 | `LayaActHead` | yes | C++ | fwd | exact (CPU path) | pin | native | cpu (primitive native) | yes (compact inference; training unsupported) |
-| `LayaLoss` | yes | none | head | head | pin | native (loss on host) | head | no |
-| `JevCe` | alias | none | head | head | T2 | native (loss on host) | head | yes (f16 inference; both layouts) |
-| `Segmentation` | alias | none | head | head | T2 | native (loss on host) | head | no |
-| `OmdLoss` | alias | none | pass + head | head | T2 | pass | head | yes (inference) |
+| `LayaLoss` | yes | none | head | head | pin | native f32 full + compact row-softmax (loss on host) | head | no |
+| `JevCe` | alias | none | head | head | T2 | native f32 full + compact grouped softmax (loss on host) | head | yes (f16 inference; both layouts) |
+| `Segmentation` | alias | none | head | head | T2 | native f32 full + compact activation (loss on host) | head | no |
+| `OmdLoss` | alias | none | pass + head | head | T2 | native f32 identity full + compact | head | yes (inference) |
 | `Contrastive` | yes | none | pass + head | head | T2 | pass | head | no |
-| `Logistic` | yes | none | head | head | pin | native | head | yes (compact inference) |
-| `Regression` | yes | none | pass | pass | T2 | pass | pass | yes (inference) |
+| `Logistic` | yes | none | head | head | pin | native full/compact f32 | head | yes (compact f16 inference) |
+| `Regression` | yes | none | pass | pass | T2 | native f32 identity full + compact | pass | yes (inference) |
 | `Cost` | yes | none | pass + head | head | T1 | pass | pass | yes (inference) |
 | `Region` | yes | none (C++ has block) | flatten + objectness logistic/optional softmax | exact supplied-seed adjoint | pin | native full/compact f32 | device (exact Rust adjoint) | yes (inference) |
 | `Detection` | yes | none | pass | pass | rust | pass | pass | yes (inference) |
@@ -141,20 +141,21 @@ with the command given rather than trusting the number.
 | `ObbYolo` | yes | none | pass | head | T2 | pass | head | yes |
 | `ObbRefine` | yes | C++ | inf | none | T2 | none | none | no |
 | `Yolo3d` | alias | none | pass (raw logits) | pass (supplied seed) | T2 | none | none | no |
-| `Yolox` | yes | none | pass + head | head | T2 | pass | head | no |
-| `Ppyoloe` | yes | none | pass + head | head | T2 | pass | head | no |
-| `Yolonas` | yes | none | pass + head | head | T2 | pass | head | no |
-| `CenterNet` | yes | none | pass + head | head | T2 | pass | head | no |
+| `Yolox` | yes | none | pass + head | head | T2 | native f32 full + compact sigmoid | head | no |
+| `Ppyoloe` | yes | none | pass + head | head | T2 | native f32 full + compact sigmoid | head | no |
+| `Yolonas` | yes | none | pass + head | head | T2 | native f32 full + compact sigmoid | head | no |
+| `CenterNet` | yes | none | pass + head | head | T2 | native f32 full + compact sigmoid/copy | head | no |
 | `Unsupported` | n/a | n/a | error | n/a | n/a | error | n/a | error |
 
 ## GPU hard rejections (no device path at all)
 
-Nine variants abort before any kernel runs. Source: the explicit rejection
-paths in `runtime.rs` (including the `Gru` match arm).
+Eight variants abort before any kernel runs. Source: the explicit rejection
+paths in `runtime.rs` (including the `Gru` match arm). `DsConv` is no longer a
+f32 hard rejection; compact f16 remains unsupported, and multi-template CPU
+modes remain unsupported.
 
 | Variant | Rejection message | Why it exists | Work item |
 |---|---|---|---|
-| `DsConv` | same | Stage-1 CPU port only (multi-template also unsupported on CPU) | shared sampling wave |
 | `Wmhf` | same | Stage-1 CPU only (DWT + EMA scan + 7 sub-convs) | container/XL wave |
 | `RecursiveBlock` | same | Stage-1 CPU only; full-recurrence gradient | container/XL wave |
 | `Clifford` | same | Stage-1 CPU only (XL mode matrix) | container/XL wave |
@@ -163,6 +164,14 @@ paths in `runtime.rs` (including the `Gru` match arm).
 | `Yolo3d` | same | raw CPU forward only; loss/decode absent | CPU first, then GPU |
 | `ObbRefine` (CARPN) | `GPU inference is not implemented` / `GPU CARPN training is unsupported` | CPU inference only; Stage-2 training deferred | after CARPN CPU training |
 | `Gru` training | `UnsupportedLayer` | Native f32 inference (including rolling-stat BN) exists; GPU training/backward remains unsupported | recurrent wave |
+
+WMHF has Oxide f32 Haar DWT/IWT, scan forward/backward, channel split/local
+branch concatenation, high-frequency branch, and gated-fusion primitives
+exposed through generic backend contracts, but no runtime GPU path; its hard
+rejection remains unchanged. The seven convolution branches remain open. See
+`implemented.md`
+§§207–209, §211–212, §§215–217 and
+`gpu_layers_plan.md`.
 
 `HyperbolicFoveation` and `FoveationFilm` now execute in the full GPU runtime:
 Oxide performs the HF predictor MLP, NCHW bilinear warp, isotropic/anisotropic
@@ -181,8 +190,8 @@ v0.2.048; its optimizer remains host-staged and unsupported activations retain
 the legacy host route.
 
 > **Wave 1 status (deformable sampling) — `[deform_conv]` is wired.** The device
-> forward and backward are live for networks with `dilation == 1` and no batch
-> norm; anything else keeps the host path via a single shared predicate
+> forward and backward are live for f32 networks with any supported dilation and
+> no batch norm; batch-normalized variants keep the host path via a shared predicate
 > (`has_host_only_deform`) used by both the forward and the backward, so they can
 > never disagree about which path ran. Evidence: the five device primitives, the
 > host twins (33 unit tests), the composed backward against the real CPU
@@ -190,7 +199,7 @@ the legacy host route.
 > `oxide_runtime_chain` device test (forward outputs, one SGD step, every
 > parameter block, masked) plus the retained host-fallback test for the BN case.
 > The only host-resident step in the device path is the batch-serial
-> normalization Jacobian. `[dsconv]` remains unwired. v0.2.059 wires a bounded native Oxide f32 GraphConv runtime path for uniform edge mode 0; v0.2.063 adds learned edge mode 1, and v0.2.065 adds self projection, for supported activations without BN. v0.2.066 adds compact f32 inference for those eligible variants; v0.2.067 extends compact inference to BN using rolling stats, gamma and projection beta. Aggregation, grouped pointwise projections, epilogue and activation run on device for eligible compact inference; eligible training BN uses native batch-statistics forward/backward; unsupported variants retain fallback. Actual-Oxide output and optimizer parity cover supported BN and no-BN runtime variants, while full and compact inference have CPU parity for learned+self with and without BN. Unsupported activations/edge modes remain fallback/rejected. Evidence and limits: `implemented.md` §§79–90, 96.
+> normalization Jacobian. `[dsconv]` now has bounded single-template native Oxide f32 runtime forward/backward plus host-staged SGD/Adam and hybrid GPU Muon parity; backward recomputes intermediates. Compact f16 and multi-template remain unsupported; see `implemented.md` §§200–201. v0.2.059 wires a bounded native Oxide f32 GraphConv runtime path for uniform edge mode 0; v0.2.063 adds learned edge mode 1, and v0.2.065 adds self projection, for supported activations without BN. v0.2.066 adds compact f32 inference for those eligible variants; v0.2.067 extends compact inference to BN using rolling stats, gamma and projection beta. Aggregation, grouped pointwise projections, epilogue and activation run on device for eligible compact inference; eligible training BN uses native batch-statistics forward/backward; unsupported variants retain fallback. Actual-Oxide output and optimizer parity cover supported BN and no-BN runtime variants, while full and compact inference have CPU parity for learned+self with and without BN. Unsupported activations/edge modes remain fallback/rejected. Evidence and limits: `implemented.md` §§79–90, 96.
 > **DCNv4 is bounded-native in v0.2.013–014:** <=25 active points, supported
 > elementwise activation, optional rolling-stat BN, no other CPU fallback/
 > host-only deform_conv. Both directions share the global gate. BN affine/
@@ -222,8 +231,9 @@ layer count.
 | `LayaActHead` | **native f32** composition | runtime backward integration blocked on the open eligibility question (`implemented.md` §43) |
 | `Sam` (unsupported activation) | host round trip | unsupported activation uses the whole-network CPU-backward fallback |
 
-`DeformConv` **left this table** in v0.2.007: it now has a native forward *and*
-backward, gated on `dilation == 1` without batch norm. Its remaining limitation
+`DeformConv` **left this table** in v0.2.007: it has a native forward and
+backward for non-BN variants; v0.2.160 extends predictor coverage to dilated
+geometry. Its remaining limitation
 (one host hop for the batch-coupled normalization Jacobian) is recorded in the
 main matrix row instead. `Deconvolutional` left this table in v0.2.039: supported
 f32 activations use native forward/backward; unsupported activations retain the

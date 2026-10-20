@@ -119,7 +119,11 @@ pub fn encode_e2m1(value: f32) -> u8 {
     if value.is_nan() {
         return 0x07;
     }
-    let sign: u8 = if value.to_bits() >> 31 != 0 { 0x08 } else { 0x00 };
+    let sign: u8 = if value.to_bits() >> 31 != 0 {
+        0x08
+    } else {
+        0x00
+    };
     let magnitude = if value.is_infinite() {
         E2M1_MAX
     } else {
@@ -145,7 +149,11 @@ pub fn encode_e2m1(value: f32) -> u8 {
 /// (`fp4sim_choose_global_scale`).
 #[device]
 pub fn choose_global_scale(amax: f32) -> f32 {
-    if amax > 0.0 && amax.is_finite() { amax / GLOBAL_DIVISOR } else { 1.0 }
+    if amax > 0.0 && amax.is_finite() {
+        amax / GLOBAL_DIVISOR
+    } else {
+        1.0
+    }
 }
 
 /// Decoded E4M3 block scale for a block amax, `TwoLevel` mode
@@ -292,13 +300,24 @@ pub mod kernels {
         let mut scale_code = 0u8;
         // SAFETY: `base + block * 16 + 15 < x.len()` is checked by the host
         // through the `rows * k` bound on `id`.
-        quantize_block(&x[base..base + k], k, block * BLOCK, global_scale, &mut codes, &mut scale_code);
+        quantize_block(
+            &x[base..base + k],
+            k,
+            block * BLOCK,
+            global_scale,
+            &mut codes,
+            &mut scale_code,
+        );
         let code_ptr = out_codes.as_mut_ptr();
         let scale_ptr = out_scales.as_mut_ptr();
         let mut b = 0usize;
         while b < 8 {
             // SAFETY: the host sizes `out_codes` at `rows * blocks_per_row * 8`.
-            unsafe { code_ptr.add(row * blocks_per_row * 8 + block * 8 + b).write(codes[b]) };
+            unsafe {
+                code_ptr
+                    .add(row * blocks_per_row * 8 + block * 8 + b)
+                    .write(codes[b])
+            };
             b += 1;
         }
         // SAFETY: the host sizes `out_scales` at `rows * blocks_per_row`.
@@ -325,8 +344,9 @@ pub mod kernels {
         let row = i / k;
         let kk = i % k;
         let block = kk / BLOCK;
-        let code = if kk % 2 == 0 { codes[row * blocks_per_row * 8 + block * 8 + (kk % 16) / 2] & 0x0F }
-        else {
+        let code = if kk % 2 == 0 {
+            codes[row * blocks_per_row * 8 + block * 8 + (kk % 16) / 2] & 0x0F
+        } else {
             codes[row * blocks_per_row * 8 + block * 8 + (kk % 16) / 2] >> 4
         };
         let scale_code = scales[row * blocks_per_row + block] as u32;

@@ -1853,13 +1853,13 @@ pub const AXIS_PINS: &[AxisPin] = &[
     AxisPin::Open("Tier 1: masked/smooth reduction axis and scale"),
     AxisPin::Open("Tier 2: raptor logistic_layer.cpp row mapping"),
     AxisPin::Open("Tier 2: fog regression_layer.cpp target layout"),
-    AxisPin::Open("Tier 2: groups x candidates axis order"),
+    AxisPin::Pinned("jev_ce_axis_layout_pins_cpp_batch_group_candidate_and_layout_order"),
     AxisPin::Open("Tier 2: per-pixel channel softmax and mask index"),
-    AxisPin::Open("Tier 2: observable-matrix axis order"),
+    AxisPin::Pinned("omd_axis_layout_pins_cpp_nchw_sample_rows_pairs_and_scatter"),
     AxisPin::Open("Tier 1: per-sample mask, no shared mask across batch"),
     AxisPin::Open("Tier 1: broadcast vs crop/pad slot math"),
     AxisPin::Open("Tier 1: element-wise multiply over C*H*W"),
-    AxisPin::Open("Tier 2: per-sample class rows"),
+    AxisPin::Pinned("contrastive_axis_layout_pins_cpp_batch_rows_and_embedding_features"),
     AxisPin::Open("Tier 2: modern head class/obj/box channel split"),
     AxisPin::Open("Tier 2: DFL bin axis"),
     AxisPin::Open("Tier 2: per-level channel layout"),
@@ -1887,10 +1887,10 @@ pub const AXIS_PINS: &[AxisPin] = &[
     AxisPin::Open("Tier 4: snake offset axis and morph branch split"),
     AxisPin::Open("Tier 4: wavelet sub-band split order"),
     AxisPin::Open("Tier 4: Clifford block order and spatial axis"),
-    AxisPin::Open("Tier 3: per-sample state and step axis"),
+    AxisPin::Pinned("rnn_axis_layout_pins_cpp_step_batch_and_input_channels"),
     AxisPin::RustOnly("not in any ELayerType; pin Rust gate/state order"),
-    AxisPin::Open("Tier 3: gate block order f,i,g,o"),
-    AxisPin::Open("Tier 3: conv stage then flatten per step"),
+    AxisPin::Pinned("lstm_axis_layout_pins_cpp_gate_blocks_steps_and_samples"),
+    AxisPin::Pinned("crnn_axis_layout_pins_cpp_spatial_step_and_sample_order"),
     AxisPin::RustOnly("GPU-only crop_layer_kernels.cu; no CPU layer"),
     AxisPin::RustOnly("batchnorm_layer.cpp exists but has no ELayerType"),
     AxisPin::RustOnly("no C++ layer type"),
@@ -11625,8 +11625,8 @@ output=2
             }
         }
 
-        assert_eq!(pinned.len(), 24, "pinned variants");
-        assert_eq!(open, 36, "C++-backed variants without an axis pin");
+        assert_eq!(pinned.len(), 30, "pinned variants");
+        assert_eq!(open, 30, "C++-backed variants without an axis pin");
         assert_eq!(rust_only, 6, "Rust-only variants plus Unsupported");
 
         // The pinned set is the contract: renaming one of these tests must be a
@@ -11652,6 +11652,12 @@ output=2
             "axis_layout_keeps_batch_window_token_and_channel_axes_independent",
             "axis_layout_maps_nchw_rows_and_scan_state_per_batch",
             "axis_layout_keeps_nchw_raster_scans_independent_per_batch",
+            "rnn_axis_layout_pins_cpp_step_batch_and_input_channels",
+            "lstm_axis_layout_pins_cpp_gate_blocks_steps_and_samples",
+            "crnn_axis_layout_pins_cpp_spatial_step_and_sample_order",
+            "contrastive_axis_layout_pins_cpp_batch_rows_and_embedding_features",
+            "jev_ce_axis_layout_pins_cpp_batch_group_candidate_and_layout_order",
+            "omd_axis_layout_pins_cpp_nchw_sample_rows_pairs_and_scatter",
             "cpu_moe_convolutional_axis_layout_keeps_router_and_blend_per_batch",
             "eml_convolutional_axis_layout_preserves_batch_channel_and_spatial_order",
             "offset_axis_layout_reads_dx_then_dy_and_keeps_batches_nchw",
@@ -11690,10 +11696,8 @@ output=2
             AxisPin::Pinned("local_avgpool_axis_layout_pins_window_and_batch_order"),
             "local avgpool must map to its own AXIS_PINS entry"
         );
-        let avgpool = build(
-            "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\n[avgpool]\n",
-        )
-        .expect("avgpool builds");
+        let avgpool = build("[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\n[avgpool]\n")
+            .expect("avgpool builds");
         assert_eq!(
             avgpool.layers[0].kind.axis_pin(),
             AxisPin::Pinned("avgpool_axis_layout_reduces_spatial_per_channel_and_batch"),

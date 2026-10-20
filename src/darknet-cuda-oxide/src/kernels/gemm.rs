@@ -135,11 +135,19 @@ pub mod kernels {
                         let e = tid + 256 * r;
                         if !vec_a {
                             // A tile: AS[m_local * 16 + k_local]
-                            let (ml, kl) = if trans_a == 0 { (e / 16, e % 16) } else { (e % 64, e / 64) };
+                            let (ml, kl) = if trans_a == 0 {
+                                (e / 16, e % 16)
+                            } else {
+                                (e % 64, e / 64)
+                            };
                             let gm = row0 + ml;
                             let gk = k0 + kl;
                             let ok = gm < m && gk < kend;
-                            let idx = if trans_a == 0 { gm * lda + gk } else { gk * lda + gm };
+                            let idx = if trans_a == 0 {
+                                gm * lda + gk
+                            } else {
+                                gk * lda + gm
+                            };
                             let src = if ok { a_off + idx } else { 0 };
                             unsafe {
                                 cuda_device::async_copy::cp_async_ca_zfill_4(
@@ -151,11 +159,19 @@ pub mod kernels {
                         }
                         if !vec_b {
                             // B tile: BS[k_local * 64 + n_local]
-                            let (kl2, nl) = if trans_b == 0 { (e / 64, e % 64) } else { (e % 16, e / 16) };
+                            let (kl2, nl) = if trans_b == 0 {
+                                (e / 64, e % 64)
+                            } else {
+                                (e % 16, e / 16)
+                            };
                             let gk2 = k0 + kl2;
                             let gn = col0 + nl;
                             let ok = gk2 < kend && gn < n;
-                            let idx = if trans_b == 0 { gk2 * ldb + gn } else { gn * ldb + gk2 };
+                            let idx = if trans_b == 0 {
+                                gk2 * ldb + gn
+                            } else {
+                                gn * ldb + gk2
+                            };
                             let src = if ok { b_off + idx } else { 0 };
                             unsafe {
                                 cuda_device::async_copy::cp_async_ca_zfill_4(

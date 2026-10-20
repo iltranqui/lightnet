@@ -101,7 +101,11 @@ pub fn offset_stats(raw: &[f32], per_batch: usize, max_offset: f32) -> Result<Of
             stddev > MIN_OFFSET_STDDEV && (stddev > max_offset || mean.abs() > max_offset);
         stats.mean.push(mean as f32);
         stats.stddev.push(stddev as f32);
-        stats.inv_std.push(if normalize { (1.0 / stddev) as f32 } else { 1.0 });
+        stats.inv_std.push(if normalize {
+            (1.0 / stddev) as f32
+        } else {
+            1.0
+        });
         stats.normalize.push(if normalize { 1.0 } else { 0.0 });
     }
     Ok(stats)
@@ -259,7 +263,6 @@ pub fn accumulate(
     }
     Ok(out)
 }
-
 
 /// Gradients of [`accumulate`] with respect to every operand.
 #[derive(Clone, Debug, PartialEq)]
@@ -454,7 +457,10 @@ mod tests {
     fn sigmoid_matches_the_stable_form_and_clamps() {
         assert!((stable_sigmoid(0.0) - 0.5).abs() < 1e-7);
         assert!((stable_sigmoid(f32::NAN) - 0.5).abs() < 1e-7);
-        assert_eq!(stable_sigmoid(1e9).to_bits(), stable_sigmoid(80.0).to_bits());
+        assert_eq!(
+            stable_sigmoid(1e9).to_bits(),
+            stable_sigmoid(80.0).to_bits()
+        );
         assert_eq!(
             stable_sigmoid(-1e9).to_bits(),
             stable_sigmoid(-80.0).to_bits()
@@ -673,7 +679,9 @@ pub fn offset_envelope_backward(
     let per_batch = planes
         .checked_mul(spatial)
         .filter(|&v| v > 0)
-        .ok_or_else(|| "offset_envelope_backward requires positive planes and spatial".to_owned())?;
+        .ok_or_else(|| {
+            "offset_envelope_backward requires positive planes and spatial".to_owned()
+        })?;
     if raw.is_empty()
         || raw.len() % per_batch != 0
         || output_grad.len() != raw.len()
@@ -692,7 +700,11 @@ pub fn offset_envelope_backward(
         } else {
             (v1, 1.0)
         };
-        let v2 = if normalize[b] != 0.0 { sanitize(v2) } else { v2 };
+        let v2 = if normalize[b] != 0.0 {
+            sanitize(v2)
+        } else {
+            v2
+        };
         let d_v2 = grad * centered_lhtan_slope(v2, max_offset)?;
         let slope_sanitize = if normalize[b] != 0.0 {
             sanitize_slope((v1 - mean[b]) * inv_std[b])
@@ -736,23 +748,18 @@ mod envelope_backward_tests {
 
         for normalize in [[0.0f32, 0.0], [1.0, 1.0]] {
             let grad = offset_envelope_backward(
-                &raw,
-                &mean,
-                &inv_std,
-                &normalize,
-                &seed,
-                planes,
-                spatial,
-                max_offset,
+                &raw, &mean, &inv_std, &normalize, &seed, planes, spatial, max_offset,
             )
             .unwrap();
             let objective = |values: &[f32]| -> f32 {
-                offset_envelope(values, &mean, &inv_std, &normalize, planes, spatial, max_offset)
-                    .unwrap()
-                    .iter()
-                    .zip(&seed)
-                    .map(|(v, s)| v * s)
-                    .sum()
+                offset_envelope(
+                    values, &mean, &inv_std, &normalize, planes, spatial, max_offset,
+                )
+                .unwrap()
+                .iter()
+                .zip(&seed)
+                .map(|(v, s)| v * s)
+                .sum()
             };
             for i in 0..raw.len() {
                 check_fd(grad[i], raw[i], "d_raw", i, |v| {
@@ -887,7 +894,11 @@ mod normalization_backward_tests {
             .map(|i| 0.3 + ((i % 5) as f32) * 0.2)
             .collect();
         let (_, stats) = normalize(&stage1, per_batch);
-        assert_eq!(stats.normalize, vec![1.0, 0.0], "fixture must span both modes");
+        assert_eq!(
+            stats.normalize,
+            vec![1.0, 0.0],
+            "fixture must span both modes"
+        );
 
         let grad = offset_normalization_backward(
             &stage1,
@@ -921,7 +932,9 @@ mod normalization_backward_tests {
         let grad = [0.5f32, -0.5, 1.0, 2.0];
         let out = offset_normalization_backward(&stage1, &mean, &std, &off, &grad, 4).unwrap();
         assert_eq!(out, grad.to_vec(), "unnormalized batches pass through");
-        assert!(offset_normalization_backward(&stage1, &mean, &std, &[1.0], &grad[1..], 4).is_err());
+        assert!(
+            offset_normalization_backward(&stage1, &mean, &std, &[1.0], &grad[1..], 4).is_err()
+        );
         assert!(offset_normalization_backward(&stage1, &mean, &[0.0], &[1.0], &grad, 4).is_err());
         assert!(offset_normalization_backward(&stage1, &[], &std, &off, &grad, 4).is_err());
     }
@@ -984,8 +997,8 @@ pub fn predictor_columns_xy(
                             let x = (ox * stride_x) as isize - (padding * dilation) as isize
                                 + (kx * dilation) as isize;
                             if y >= 0 && y < in_h as isize && x >= 0 && x < in_w as isize {
-                                out[(b * columns + column) * plane + oy * out_w + ox] = input
-                                    [(b * channels + c) * in_h * in_w
+                                out[(b * columns + column) * plane + oy * out_w + ox] =
+                                    input[(b * channels + c) * in_h * in_w
                                         + y as usize * in_w
                                         + x as usize];
                             }
@@ -1030,8 +1043,22 @@ pub fn predictor_backward(
     dilation: usize,
 ) -> Result<PredictorGradients, String> {
     predictor_backward_xy(
-        input, columns, weights, output_grad, batch, channels, filters, in_h, in_w, out_h, out_w,
-        size, stride, stride, padding, dilation,
+        input,
+        columns,
+        weights,
+        output_grad,
+        batch,
+        channels,
+        filters,
+        in_h,
+        in_w,
+        out_h,
+        out_w,
+        size,
+        stride,
+        stride,
+        padding,
+        dilation,
     )
 }
 
@@ -1159,21 +1186,8 @@ mod predictor_backward_tests {
         )
         .unwrap();
         let grad = predictor_backward(
-            &input,
-            &columns,
-            &weights,
-            &seed,
-            batch,
-            channels,
-            filters,
-            in_h,
-            in_w,
-            out_h,
-            out_w,
-            size,
-            stride,
-            padding,
-            dilation,
+            &input, &columns, &weights, &seed, batch, channels, filters, in_h, in_w, out_h, out_w,
+            size, stride, padding, dilation,
         )
         .unwrap();
 
@@ -1247,7 +1261,10 @@ mod predictor_backward_tests {
             1,
         )
         .unwrap();
-        assert_eq!(grad.d_input, vec![2.0, 2.0, 2.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 2.0, 2.0, 2.0]);
+        assert_eq!(
+            grad.d_input,
+            vec![2.0, 2.0, 2.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 2.0, 2.0, 2.0]
+        );
         assert_eq!(grad.d_weights, vec![52.0]);
         assert_eq!(grad.d_biases, vec![8.0]);
     }
@@ -1258,28 +1275,32 @@ mod predictor_backward_tests {
         let input = vec![0.0f32; 4];
         let weights = vec![0.0f32; 9];
         let grad = vec![0.0f32; 4];
-        assert!(predictor_backward(
-            &input, &columns, &weights, &grad, 1, 1, 1, 2, 2, 2, 2, 3, 1, 0, 1
-        )
-        .is_ok());
-        assert!(predictor_backward(
-            &input,
-            &columns[1..],
-            &weights,
-            &grad,
-            1,
-            1,
-            1,
-            2,
-            2,
-            2,
-            2,
-            3,
-            1,
-            0,
-            1
-        )
-        .is_err());
+        assert!(
+            predictor_backward(
+                &input, &columns, &weights, &grad, 1, 1, 1, 2, 2, 2, 2, 3, 1, 0, 1
+            )
+            .is_ok()
+        );
+        assert!(
+            predictor_backward(
+                &input,
+                &columns[1..],
+                &weights,
+                &grad,
+                1,
+                1,
+                1,
+                2,
+                2,
+                2,
+                2,
+                3,
+                1,
+                0,
+                1
+            )
+            .is_err()
+        );
     }
 }
 
@@ -1301,7 +1322,9 @@ pub fn offset_envelope_pre_backward(
     let per_batch = planes
         .checked_mul(spatial)
         .filter(|&v| v > 0)
-        .ok_or_else(|| "offset_envelope_pre_backward requires positive planes and spatial".to_owned())?;
+        .ok_or_else(|| {
+            "offset_envelope_pre_backward requires positive planes and spatial".to_owned()
+        })?;
     if raw.is_empty()
         || raw.len() % per_batch != 0
         || output_grad.len() != raw.len()
@@ -1320,7 +1343,11 @@ pub fn offset_envelope_pre_backward(
         } else {
             v1
         };
-        let v2 = if normalize[b] != 0.0 { sanitize(pre) } else { pre };
+        let v2 = if normalize[b] != 0.0 {
+            sanitize(pre)
+        } else {
+            pre
+        };
         let slope = if normalize[b] != 0.0 {
             sanitize_slope(pre)
         } else {
@@ -1509,40 +1536,37 @@ pub fn backward(
         g.dilation,
     )?;
     // Mask path: sigmoid slope of the sanitized logit, then the same predictor.
-    let (d_mask_weights, d_mask_biases, d_input_mask) = match (
-        mask_weights,
-        fwd.mask_logits.as_ref(),
-        fwd.masks.as_ref(),
-    ) {
-        (Some(weights), Some(logits), Some(_)) => {
-            let d_logits: Vec<f32> = accum
-                .d_masks
-                .iter()
-                .zip(logits)
-                .map(|(&d, &logit)| d * mask_sigmoid_slope(logit))
-                .collect();
-            let grads = predictor_backward_xy(
-                &fwd.input_sanitized,
-                &fwd.columns,
-                weights,
-                &d_logits,
-                g.batch,
-                g.channels,
-                kernels,
-                g.input_height,
-                g.input_width,
-                g.output_height,
-                g.output_width,
-                g.size,
-                g.stride_x,
-                g.stride_y,
-                g.padding,
-                g.dilation,
-            )?;
-            (grads.d_weights, grads.d_biases, grads.d_input)
-        }
-        _ => (Vec::new(), Vec::new(), vec![0.0; fwd.input_sanitized.len()]),
-    };
+    let (d_mask_weights, d_mask_biases, d_input_mask) =
+        match (mask_weights, fwd.mask_logits.as_ref(), fwd.masks.as_ref()) {
+            (Some(weights), Some(logits), Some(_)) => {
+                let d_logits: Vec<f32> = accum
+                    .d_masks
+                    .iter()
+                    .zip(logits)
+                    .map(|(&d, &logit)| d * mask_sigmoid_slope(logit))
+                    .collect();
+                let grads = predictor_backward_xy(
+                    &fwd.input_sanitized,
+                    &fwd.columns,
+                    weights,
+                    &d_logits,
+                    g.batch,
+                    g.channels,
+                    kernels,
+                    g.input_height,
+                    g.input_width,
+                    g.output_height,
+                    g.output_width,
+                    g.size,
+                    g.stride_x,
+                    g.stride_y,
+                    g.padding,
+                    g.dilation,
+                )?;
+                (grads.d_weights, grads.d_biases, grads.d_input)
+            }
+            _ => (Vec::new(), Vec::new(), vec![0.0; fwd.input_sanitized.len()]),
+        };
     // The stage functions already applied the *sanitized* input's slope (which
     // is 1); the raw input's slope belongs here, exactly once for the sum.
     let mut d_input = vec![0.0f32; input.len()];
@@ -1619,9 +1643,7 @@ mod composed_backward_tests {
         // The sampling base is integral, so offsets near 0 or an integer put a
         // sample on the floor-cell seam where the analytic slope is one-sided.
         // A +0.37 shift keeps every fractional part near 0.37.
-        let off_b: Vec<f32> = (0..2 * kernels)
-            .map(|i| 0.45 + 0.0005 * i as f32)
-            .collect();
+        let off_b: Vec<f32> = (0..2 * kernels).map(|i| 0.45 + 0.0005 * i as f32).collect();
         let mask_w: Vec<f32> = (0..kernels * g.channels * kernels)
             .map(|i| ((i * 3 % 7) as f32) * 0.05 - 0.15)
             .collect();
@@ -1665,11 +1687,7 @@ mod composed_backward_tests {
             MAX_OFFSET,
         )
         .unwrap();
-        fwd.output
-            .iter()
-            .zip(&f.seed)
-            .map(|(v, s)| v * s)
-            .sum()
+        fwd.output.iter().zip(&f.seed).map(|(v, s)| v * s).sum()
     }
 
     #[test]

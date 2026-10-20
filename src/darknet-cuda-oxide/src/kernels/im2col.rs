@@ -114,7 +114,8 @@ pub mod kernels {
                         if nx >= 0 && (nx as usize) % stride_x == 0 {
                             let ox = nx as usize / stride_x;
                             if ox < out_w {
-                                sum += col[col_base + (c * kk + ky * ksize + kx) * ohw + oy * out_w + ox];
+                                sum += col
+                                    [col_base + (c * kk + ky * ksize + kx) * ohw + oy * out_w + ox];
                             }
                         }
                         kx += 1;

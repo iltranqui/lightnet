@@ -177,7 +177,10 @@ fn dcnv4_bn_native_gradients_match_cpu_including_zero_gamma() {
     let dx = gpu.backend.download_f32(&got.input).unwrap();
     let weights = gpu.backend.download_f32(&got.weights).unwrap();
     let offset_biases = gpu.backend.download_f32(&got.offset_biases).unwrap();
-    let scales = gpu.backend.download_f32(got.scales.as_ref().unwrap()).unwrap();
+    let scales = gpu
+        .backend
+        .download_f32(got.scales.as_ref().unwrap())
+        .unwrap();
     let biases = gpu.backend.download_f32(&got.biases).unwrap();
     for (a, b) in [
         (&dx, &want.input_gradient.data),
@@ -191,10 +194,7 @@ fn dcnv4_bn_native_gradients_match_cpu_including_zero_gamma() {
         }
     }
     assert_eq!(biases, vec![0.0; 2]);
-    assert!(
-        scales[0].abs() > 1e-5,
-        "gamma=0 still needs its derivative"
-    );
+    assert!(scales[0].abs() > 1e-5, "gamma=0 still needs its derivative");
     let before = gpu.params.clone();
     let seeds = [Some(seed)];
     cpu.backward_accumulate_seeded(&input, &cf, &seeds).unwrap();
@@ -345,43 +345,87 @@ fn dcnv4_bn_native_preserves_optimizer_gates_but_advances_stats() {
 #[test]
 fn dcnv4_channel_normalization_selects_native_math() {
     let mut network = dcnv4_network("", "");
-    let LayerKind::Dcnv4(spec) = &mut network.layers[0].kind else { unreachable!() };
-    spec.activation=Activation::NormalizeChannelsSoftmaxMaxval;
-    let gpu=GpuExecutableNetwork::new(network.clone(),FakeBackend);
+    let LayerKind::Dcnv4(spec) = &mut network.layers[0].kind else {
+        unreachable!()
+    };
+    spec.activation = Activation::NormalizeChannelsSoftmaxMaxval;
+    let gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
     assert!(!gpu.requires_cpu_backward_fallback());
-    let input=Tensor::filled(network.net.input_shape(),0.2);
-    let forward=gpu.forward_training_with_state(&input).unwrap();
+    let input = Tensor::filled(network.net.input_shape(), 0.2);
+    let forward = gpu.forward_training_with_state(&input).unwrap();
     assert!(forward.cpu_forward.dcnv4_caches[0].is_none());
 }
 
 #[test]
 fn dcnv4_channel_normalization_modes_and_edge_columns_match_reference() {
     use super::super::{GradMode, dcnv4_gpu};
-    for activation in [Activation::NormalizeChannels,Activation::NormalizeChannelsSoftmax,Activation::NormalizeChannelsSoftmaxMaxval] {
-        let mut network=dcnv4_network("", "");
-        let LayerKind::Dcnv4(spec)=&mut network.layers[0].kind else { unreachable!() };
-        spec.activation=activation;
-        let LayerKind::Dcnv4(spec)=&network.layers[0].kind else { unreachable!() };
-        let norm=spec.activation.to_channel_normalization().unwrap();
-        let gpu=GpuExecutableNetwork::new(network.clone(),FakeBackend);
-        let shape=network.layers[0].output_shape;
-        let spatial=shape.height*shape.width;
-        let mut values=vec![0.0;shape.batch*shape.element_count()];
-        for b in 0..shape.batch { for c in 0..shape.channels { for q in 0..spatial {
-            values[(b*shape.channels+c)*spatial+q]=match q%4 {0=>0.0,1=>-1.0,2=>0.5,_=>if c==0 {-0.7} else {1.3}};
-        }}}
-        let seed:Vec<_>=(0..values.len()).map(|i| (i%7) as f32*0.3-0.9).collect();
-        let sh=[shape.batch,shape.channels,shape.height,shape.width];
-        let pre=gpu.backend.upload_f32(&sh,&values).unwrap();
-        let s=gpu.backend.upload_f32(&sh,&seed).unwrap();
-        let output=dcnv4_gpu::activation_output(&gpu.backend,&pre,&network.layers[0],spec).unwrap();
-        let want=darknet_cuda::host_ops::normalize_channels(&values,shape.batch,shape.channels,spatial,norm);
-        assert_eq!(gpu.backend.download_f32(&output).unwrap(),want);
-        for mode in [GradMode::Analytical,GradMode::Cpp] {
-            let g=dcnv4_gpu::activation_delta(&gpu.backend,&pre,&s,&network.layers[0],spec,mode).unwrap();
-            let want=darknet_cuda::host_ops::normalize_channels_backward(&values,&want,&seed,
-                shape.batch,shape.channels,spatial,norm,mode==GradMode::Cpp);
-            assert_eq!(gpu.backend.download_f32(&g).unwrap(),want);
+    for activation in [
+        Activation::NormalizeChannels,
+        Activation::NormalizeChannelsSoftmax,
+        Activation::NormalizeChannelsSoftmaxMaxval,
+    ] {
+        let mut network = dcnv4_network("", "");
+        let LayerKind::Dcnv4(spec) = &mut network.layers[0].kind else {
+            unreachable!()
+        };
+        spec.activation = activation;
+        let LayerKind::Dcnv4(spec) = &network.layers[0].kind else {
+            unreachable!()
+        };
+        let norm = spec.activation.to_channel_normalization().unwrap();
+        let gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+        let shape = network.layers[0].output_shape;
+        let spatial = shape.height * shape.width;
+        let mut values = vec![0.0; shape.batch * shape.element_count()];
+        for b in 0..shape.batch {
+            for c in 0..shape.channels {
+                for q in 0..spatial {
+                    values[(b * shape.channels + c) * spatial + q] = match q % 4 {
+                        0 => 0.0,
+                        1 => -1.0,
+                        2 => 0.5,
+                        _ => {
+                            if c == 0 {
+                                -0.7
+                            } else {
+                                1.3
+                            }
+                        }
+                    };
+                }
+            }
+        }
+        let seed: Vec<_> = (0..values.len())
+            .map(|i| (i % 7) as f32 * 0.3 - 0.9)
+            .collect();
+        let sh = [shape.batch, shape.channels, shape.height, shape.width];
+        let pre = gpu.backend.upload_f32(&sh, &values).unwrap();
+        let s = gpu.backend.upload_f32(&sh, &seed).unwrap();
+        let output =
+            dcnv4_gpu::activation_output(&gpu.backend, &pre, &network.layers[0], spec).unwrap();
+        let want = darknet_cuda::host_ops::normalize_channels(
+            &values,
+            shape.batch,
+            shape.channels,
+            spatial,
+            norm,
+        );
+        assert_eq!(gpu.backend.download_f32(&output).unwrap(), want);
+        for mode in [GradMode::Analytical, GradMode::Cpp] {
+            let g =
+                dcnv4_gpu::activation_delta(&gpu.backend, &pre, &s, &network.layers[0], spec, mode)
+                    .unwrap();
+            let want = darknet_cuda::host_ops::normalize_channels_backward(
+                &values,
+                &want,
+                &seed,
+                shape.batch,
+                shape.channels,
+                spatial,
+                norm,
+                mode == GradMode::Cpp,
+            );
+            assert_eq!(gpu.backend.download_f32(&g).unwrap(), want);
         }
     }
 }
@@ -502,7 +546,10 @@ fn dcnv4_gpu_multiple_forward_states_and_microbatch_accumulation_match_cpu() {
         let buffers = gpu.device_dcnv4_train_buffers.borrow();
         let got = buffers[0].as_ref().unwrap();
         let got_biases = gpu.backend.download_f32(&got.bias_updates).unwrap();
-        let got_weights = gpu.backend.download_f32(&got.offset_weight_updates).unwrap();
+        let got_weights = gpu
+            .backend
+            .download_f32(&got.offset_weight_updates)
+            .unwrap();
         let got_offset_biases = gpu.backend.download_f32(&got.offset_bias_updates).unwrap();
         for (a, b) in [
             (&want.bias_updates, &got_biases),
@@ -579,5 +626,6 @@ fn dcnv4_gpu_retains_host_cache_for_excluded_and_mixed_variants() {
     let forward = gpu.forward_training_with_state(&input).unwrap();
     assert!(forward.cpu_forward.dcnv4_caches[0].is_none());
     let seeds = [Some(Tensor::filled(revleaky.layers[0].output_shape, 0.4))];
-    gpu.backward_accumulate_seeded_gpu(&forward, &seeds).unwrap();
+    gpu.backward_accumulate_seeded_gpu(&forward, &seeds)
+        .unwrap();
 }

@@ -2,6 +2,17 @@
 
 Approved 2026-10-02. Branch `rust`.
 
+## Table of Contents
+
+- [Context](#context)
+- [Project tree (relevant)](#project-tree-relevant)
+- [Components](#components)
+- [Implementation plan](#implementation-plan)
+- [Verification](#verification)
+- [Open questions](#open-questions)
+- [How to run](#how-to-run)
+- [Phase D conclusion (before enabling fp8 for speed)](#phase-d-conclusion-before-enabling-fp8-for-speed)
+
 ## Context
 `bridges/darknet-cuda-oxide` has TF32 (`gemm_mma.rs`) and FP16/BF16 (`gemm_f16.rs`) mma GEMMs, but no FP8/FP4. Findings:
 - `crates/cuda-device/src/generated/register_mma.rs` already exposes dense FP8 mma, "Requires PTX 8.7 and `sm_89+`", two shapes (verified 2026-10-02):

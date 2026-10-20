@@ -163,44 +163,52 @@ pub mod kernels {
                     while r < 8 {
                         let e = tid + 128 * r;
                         if !vec_a {
-                        let (ml, kl) = if trans_a == 0 {
-                            (e / 16, e % 16)
-                        } else {
-                            (e % 64, e / 64)
-                        };
-                        let gm = row0 + ml;
-                        let gk = k0 + kl;
-                        let ok = gm < m && gk < kend;
-                        let idx = if trans_a == 0 { gm * lda + gk } else { gk * lda + gm };
-                        let src = if ok { a_off + idx } else { 0 };
-                        // SAFETY: in-bounds shared slot; the source is a valid
-                        // element of `a` (index 0 with size 0 when out of range).
-                        unsafe {
-                            cuda_device::async_copy::cp_async_ca_zfill_4(
-                                asp.add(stage * 1280 + ml * 20 + kl),
-                                a.as_ptr().add(src) as *const u8,
-                                if ok { 4 } else { 0 },
-                            );
-                        }
+                            let (ml, kl) = if trans_a == 0 {
+                                (e / 16, e % 16)
+                            } else {
+                                (e % 64, e / 64)
+                            };
+                            let gm = row0 + ml;
+                            let gk = k0 + kl;
+                            let ok = gm < m && gk < kend;
+                            let idx = if trans_a == 0 {
+                                gm * lda + gk
+                            } else {
+                                gk * lda + gm
+                            };
+                            let src = if ok { a_off + idx } else { 0 };
+                            // SAFETY: in-bounds shared slot; the source is a valid
+                            // element of `a` (index 0 with size 0 when out of range).
+                            unsafe {
+                                cuda_device::async_copy::cp_async_ca_zfill_4(
+                                    asp.add(stage * 1280 + ml * 20 + kl),
+                                    a.as_ptr().add(src) as *const u8,
+                                    if ok { 4 } else { 0 },
+                                );
+                            }
                         }
                         if !vec_b {
-                        let (kl2, nl) = if trans_b == 0 {
-                            (e / 64, e % 64)
-                        } else {
-                            (e % 16, e / 16)
-                        };
-                        let gk2 = k0 + kl2;
-                        let gn = col0 + nl;
-                        let ok2 = gk2 < kend && gn < n;
-                        let idx2 = if trans_b == 0 { gk2 * ldb + gn } else { gn * ldb + gk2 };
-                        let src2 = if ok2 { b_off + idx2 } else { 0 };
-                        unsafe {
-                            cuda_device::async_copy::cp_async_ca_zfill_4(
-                                bsp.add(stage * 1152 + kl2 * 72 + nl),
-                                b.as_ptr().add(src2) as *const u8,
-                                if ok2 { 4 } else { 0 },
-                            );
-                        }
+                            let (kl2, nl) = if trans_b == 0 {
+                                (e / 64, e % 64)
+                            } else {
+                                (e % 16, e / 16)
+                            };
+                            let gk2 = k0 + kl2;
+                            let gn = col0 + nl;
+                            let ok2 = gk2 < kend && gn < n;
+                            let idx2 = if trans_b == 0 {
+                                gk2 * ldb + gn
+                            } else {
+                                gn * ldb + gk2
+                            };
+                            let src2 = if ok2 { b_off + idx2 } else { 0 };
+                            unsafe {
+                                cuda_device::async_copy::cp_async_ca_zfill_4(
+                                    bsp.add(stage * 1152 + kl2 * 72 + nl),
+                                    b.as_ptr().add(src2) as *const u8,
+                                    if ok2 { 4 } else { 0 },
+                                );
+                            }
                         }
                         r += 1;
                     }
@@ -223,8 +231,10 @@ pub mod kernels {
                     unroll!(4, ni, {
                         let col = wn + ni * 8 + g;
                         unsafe {
-                            bf[ni][0] = cvt_rna_tf32_f32(f32::from_bits(BS[bo + (ks + t) * 72 + col]));
-                            bf[ni][1] = cvt_rna_tf32_f32(f32::from_bits(BS[bo + (ks + t + 4) * 72 + col]));
+                            bf[ni][0] =
+                                cvt_rna_tf32_f32(f32::from_bits(BS[bo + (ks + t) * 72 + col]));
+                            bf[ni][1] =
+                                cvt_rna_tf32_f32(f32::from_bits(BS[bo + (ks + t + 4) * 72 + col]));
                         }
                     });
                     unroll!(2, mi, {
@@ -234,7 +244,9 @@ pub mod kernels {
                                 cvt_rna_tf32_f32(f32::from_bits(AS[ao + row * 20 + ks + t])),
                                 cvt_rna_tf32_f32(f32::from_bits(AS[ao + (row + 8) * 20 + ks + t])),
                                 cvt_rna_tf32_f32(f32::from_bits(AS[ao + row * 20 + ks + t + 4])),
-                                cvt_rna_tf32_f32(f32::from_bits(AS[ao + (row + 8) * 20 + ks + t + 4])),
+                                cvt_rna_tf32_f32(f32::from_bits(
+                                    AS[ao + (row + 8) * 20 + ks + t + 4],
+                                )),
                             ]
                         };
                         unroll!(4, ni, {

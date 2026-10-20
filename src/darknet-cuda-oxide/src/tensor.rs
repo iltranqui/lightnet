@@ -120,10 +120,11 @@ pub(crate) struct PooledBuf {
 
 impl PooledBuf {
     pub(crate) fn new(buf: DeviceBuffer<f32>, pool: &Arc<BufPool>) -> Self {
-        Self { buf: Some(buf), pool: pool.clone() }
+        Self {
+            buf: Some(buf),
+            pool: pool.clone(),
+        }
     }
-
-
 }
 
 impl Deref for PooledBuf {
@@ -201,7 +202,10 @@ pub(crate) struct PooledBuf16 {
 
 impl PooledBuf16 {
     pub(crate) fn new(buf: DeviceBuffer<u16>, pool: &Arc<BufPool>) -> Self {
-        Self { buf: Some(buf), pool: pool.clone() }
+        Self {
+            buf: Some(buf),
+            pool: pool.clone(),
+        }
     }
 }
 
@@ -238,7 +242,10 @@ pub struct OxideTensorF16 {
 
 impl OxideTensorF16 {
     pub(crate) fn new(buf: PooledBuf16, shape: &[usize]) -> Self {
-        Self { buf: Arc::new(buf), shape: shape.to_vec() }
+        Self {
+            buf: Arc::new(buf),
+            shape: shape.to_vec(),
+        }
     }
 
     pub fn shape(&self) -> &[usize] {

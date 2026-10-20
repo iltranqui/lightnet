@@ -1107,6 +1107,124 @@ mod tests {
     }
 
     #[test]
+    fn deform_conv_axis_layout_pins_cpp_offset_mask_groups_and_batch_nchw() {
+        use crate::axis_fixture::{axis_tensor, nchw_index, probe_shape};
+
+        // C++ `deformable_im2col_cpu` (`deform_conv_layer.cpp:518-560`) stores
+        // offsets as interleaved (dy,dx) planes per kernel point, with each
+        // plane `[out_h,out_w]`; mask planes are one per kernel point. The
+        // forward at `:834-852` shares those fields across convolution groups.
+        let input_shape = probe_shape(); // B=2,C=2,H=2,W=3
+        let input = Tensor::from_data(input_shape, axis_tensor(input_shape)).unwrap();
+        let filters = 2;
+        let groups = 2;
+        let size = 3;
+        let kernel_area = size * size;
+        let output_shape = TensorShape::new(
+            input_shape.width,
+            input_shape.height,
+            filters,
+            input_shape.batch,
+        );
+        let mut config = spec(input_shape.channels, filters, groups, size, true);
+        config.padding = 1;
+        let mut main_weights = vec![0.0; filters * (input_shape.channels / groups) * kernel_area];
+        main_weights[1] = 1.25;
+        main_weights[7] = -0.75;
+        main_weights[kernel_area + 2] = 0.5;
+        main_weights[kernel_area + 6] = 2.0;
+        let predictor_weights = vec![0.0; 2 * kernel_area * input_shape.channels * kernel_area];
+        let mut offset_biases = vec![0.0; 2 * kernel_area];
+        let mut mask_biases = vec![0.0; kernel_area];
+        for k in 0..kernel_area {
+            let signed = k as f32 - 4.0;
+            offset_biases[2 * k] = 0.05 * signed;
+            offset_biases[2 * k + 1] = -0.07 * signed;
+            mask_biases[k] = signed;
+        }
+        let mask_weights = vec![0.0; kernel_area * input_shape.channels * kernel_area];
+
+        let (actual, _) = deform_conv_forward(
+            &input,
+            &config,
+            output_shape,
+            &main_weights,
+            &predictor_weights,
+            &offset_biases,
+            Some(&mask_weights),
+            Some(&mask_biases),
+        )
+        .unwrap();
+
+        let bilinear_from_cpp = |n: usize, c: usize, y: f32, x: f32| {
+            if y < -1.0 || y > input_shape.height as f32 || x < -1.0 || x > input_shape.width as f32
+            {
+                return 0.0;
+            }
+            let y0 = y.floor() as isize;
+            let x0 = x.floor() as isize;
+            let ly = y - y0 as f32;
+            let lx = x - x0 as f32;
+            let mut sample = 0.0;
+            for (iy, wy) in [(y0, 1.0 - ly), (y0 + 1, ly)] {
+                for (ix, wx) in [(x0, 1.0 - lx), (x0 + 1, lx)] {
+                    if iy >= 0
+                        && iy < input_shape.height as isize
+                        && ix >= 0
+                        && ix < input_shape.width as isize
+                    {
+                        sample += wy
+                            * wx
+                            * input.data[nchw_index(input_shape, n, c, iy as usize, ix as usize)];
+                    }
+                }
+            }
+            sample
+        };
+
+        for n in 0..input_shape.batch {
+            for filter in 0..filters {
+                // With C=F=groups=2, C++'s group loop maps output filter f
+                // to input channel f; offsets and masks remain shared.
+                let input_channel = filter;
+                for oy in 0..output_shape.height {
+                    for ox in 0..output_shape.width {
+                        let mut expected = 0.0;
+                        for ky in 0..size {
+                            for kx in 0..size {
+                                let k = ky * size + kx;
+                                let weight = main_weights[filter * kernel_area + k];
+                                if weight == 0.0 {
+                                    continue;
+                                }
+                                let base_y = oy as f32 - config.padding as f32 + ky as f32;
+                                let base_x = ox as f32 - config.padding as f32 + kx as f32;
+                                let sample = bilinear_from_cpp(
+                                    n,
+                                    input_channel,
+                                    base_y + offset_biases[2 * k],
+                                    base_x + offset_biases[2 * k + 1],
+                                );
+                                let mask = 1.0 / (1.0 + (-mask_biases[k]).exp());
+                                expected += weight * sample * mask;
+                            }
+                        }
+                        let output_index = nchw_index(output_shape, n, filter, oy, ox);
+                        assert_close(
+                            actual.data[output_index],
+                            expected,
+                            2.0e-6,
+                            &format!(
+                                "C++ deform_conv axis/layout n={n}, filter={filter}, y={oy}, x={ox} (offset dy/dx, mask-k, groups, NCHW)"
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn grouped_zero_offset_sampling_matches_hand_computation() {
         let input_shape = TensorShape::new(3, 2, 2, 1);
         let output_shape = input_shape;

@@ -1468,7 +1468,7 @@ mod tests {
     use crate::cfg::ConfigFile;
     use crate::model::{CliffordSpec, LayerKind, Network};
 
-    use super::{CliffordParams, Tensor, backward, forward};
+    use super::{CliffordParams, Tensor, backward, forward, layer_norm_forward};
 
     fn build_spec(
         global_op: &str,
@@ -1714,6 +1714,51 @@ drop_path={drop_path}
         }
 
         assert_eq!(output.shape, input.shape);
+    }
+
+    #[test]
+    fn clifford_axis_layout_pins_cpp_nchw_token_channel_normalization() {
+        use crate::axis_fixture::{axis_tensor, nchw_index, probe_shape};
+
+        // The C++ layer calls layernorm_nchw_forward with B,C,HW. It reduces
+        // channels independently at each batch/spatial token, then writes NCHW.
+        // Source: Jev_laya:src-lib/clifford_layer.cpp:311-346,1578-1580.
+        let shape = probe_shape(); // B=2,C=2,H=2,W=3
+        let input_values = axis_tensor(shape);
+        let input = Tensor::from_data(shape, input_values.clone()).unwrap();
+        let gamma = [1.25, -0.75];
+        let beta = [0.2, -0.4];
+        let (normalized, _, _) = layer_norm_forward(&input, &gamma, &beta);
+        let mut expected = vec![0.0; input_values.len()];
+        let spatial = shape.height * shape.width;
+        for n in 0..shape.batch {
+            for y in 0..shape.height {
+                for x in 0..shape.width {
+                    let values = (0..shape.channels)
+                        .map(|c| input_values[nchw_index(shape, n, c, y, x)])
+                        .collect::<Vec<_>>();
+                    let mean = values.iter().sum::<f32>() / shape.channels as f32;
+                    let variance = values
+                        .iter()
+                        .map(|value| (value - mean) * (value - mean))
+                        .sum::<f32>()
+                        / shape.channels as f32;
+                    let inv_std = 1.0 / (variance + 1.0e-5).sqrt();
+                    for c in 0..shape.channels {
+                        let index = nchw_index(shape, n, c, y, x);
+                        expected[index] = (values[c] - mean) * inv_std * gamma[c] + beta[c];
+                    }
+                }
+            }
+        }
+        assert_eq!(normalized.shape, shape);
+        assert_eq!(spatial, 6);
+        for (index, (actual, expected)) in normalized.data.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 2.0e-6,
+                "Clifford C++ NCHW token norm mismatch at flat index {index}: got {actual}, expected {expected}"
+            );
+        }
     }
 
     #[test]

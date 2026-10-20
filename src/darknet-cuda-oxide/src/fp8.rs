@@ -221,7 +221,11 @@ mod tests {
             (0xFE, -448.0),
         ];
         for (bits, want) in cases {
-            assert_eq!(fp8_to_f32(bits, Fp8Format::E4M3), want, "e4m3 code {bits:#04x}");
+            assert_eq!(
+                fp8_to_f32(bits, Fp8Format::E4M3),
+                want,
+                "e4m3 code {bits:#04x}"
+            );
         }
         assert!(fp8_to_f32(0x7F, Fp8Format::E4M3).is_nan());
     }
@@ -240,7 +244,11 @@ mod tests {
             (0xFB, -57344.0),
         ];
         for (bits, want) in cases {
-            assert_eq!(fp8_to_f32(bits, Fp8Format::E5M2), want, "e5m2 code {bits:#04x}");
+            assert_eq!(
+                fp8_to_f32(bits, Fp8Format::E5M2),
+                want,
+                "e5m2 code {bits:#04x}"
+            );
         }
         assert!(fp8_to_f32(0x7C, Fp8Format::E5M2).is_infinite());
         assert!(fp8_to_f32(0x7F, Fp8Format::E5M2).is_nan());
@@ -254,8 +262,16 @@ mod tests {
                 if !v.is_finite() {
                     continue;
                 }
-                assert_eq!(f32_to_fp8(v, fmt), code, "{fmt:?} round trip of code {code:#04x}");
-                assert_eq!(f32_to_fp8(-v, fmt), code | 0x80, "{fmt:?} negative round trip");
+                assert_eq!(
+                    f32_to_fp8(v, fmt),
+                    code,
+                    "{fmt:?} round trip of code {code:#04x}"
+                );
+                assert_eq!(
+                    f32_to_fp8(-v, fmt),
+                    code | 0x80,
+                    "{fmt:?} negative round trip"
+                );
             }
         }
     }

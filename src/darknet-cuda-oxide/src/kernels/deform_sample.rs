@@ -79,7 +79,6 @@ pub fn deform_sample_at(
     value
 }
 
-
 /// Source `sanitize`: finite -> clamp to +/-10000, non-finite -> 0.
 #[device]
 pub fn deform_sanitize(v: f32) -> f32 {
@@ -121,37 +120,41 @@ pub fn deform_stable_sigmoid(value: f32) -> f32 {
 /// Source `sanitize` slope: 1 strictly inside the band, else 0.
 #[device]
 pub fn deform_sanitize_slope(value: f32) -> f32 {
-if value.is_finite() && value > -10_000.0f32 && value < 10_000.0f32 {
-    1.0
-} else {
-    0.0
-}
+    if value.is_finite() && value > -10_000.0f32 && value < 10_000.0f32 {
+        1.0
+    } else {
+        0.0
+    }
 }
 
 /// Slope of `centered_lhtan` including its outer `sanitize`.
 #[device]
 pub fn deform_centered_lhtan_slope(value: f32, max_offset: f32) -> f32 {
-let scaled = value / (2.0 * max_offset) + 0.5;
-let mapped = if scaled < 0.0 {
-    0.001 * scaled
-} else if scaled > 1.0 {
-    1.0 + 0.001 * (scaled - 1.0)
-} else {
-    scaled
-};
-let slope_scaled = if scaled < 0.0 || scaled > 1.0 { 0.001 } else { 1.0 };
-deform_sanitize_slope((2.0 * mapped - 1.0) * max_offset) * slope_scaled
+    let scaled = value / (2.0 * max_offset) + 0.5;
+    let mapped = if scaled < 0.0 {
+        0.001 * scaled
+    } else if scaled > 1.0 {
+        1.0 + 0.001 * (scaled - 1.0)
+    } else {
+        scaled
+    };
+    let slope_scaled = if scaled < 0.0 || scaled > 1.0 {
+        0.001
+    } else {
+        1.0
+    };
+    deform_sanitize_slope((2.0 * mapped - 1.0) * max_offset) * slope_scaled
 }
 
 /// Slope of `stable_sigmoid(sanitize(logit))`.
 #[device]
 pub fn deform_mask_sigmoid_slope(logit: f32) -> f32 {
-let sanitized = deform_sanitize(logit);
-if !(sanitized > -80.0 && sanitized < 80.0) {
-    return 0.0;
-}
-let p = deform_stable_sigmoid(sanitized);
-p * (1.0 - p) * deform_sanitize_slope(logit)
+    let sanitized = deform_sanitize(logit);
+    if !(sanitized > -80.0 && sanitized < 80.0) {
+        return 0.0;
+    }
+    let p = deform_stable_sigmoid(sanitized);
+    p * (1.0 - p) * deform_sanitize_slope(logit)
 }
 
 #[cuda_module]
@@ -256,7 +259,6 @@ pub mod kernels {
         }
     }
 
-
     /// Source `centered_lhtan` value (the derivative parts are not needed for
     /// a forward-only envelope). `max_offset` must be finite and positive.
     #[device]
@@ -271,7 +273,6 @@ pub mod kernels {
         };
         deform_sanitize((2.0 * mapped - 1.0) * max_offset)
     }
-
 
     /// Per-batch offset statistics over the **sanitized** stage-1 offsets,
     /// matching the source f64 accumulation:
@@ -326,10 +327,7 @@ pub mod kernels {
         }
     }
 
-
-
-
-/// `[deform_conv]` offset envelope, one thread per offset element:
+    /// `[deform_conv]` offset envelope, one thread per offset element:
     /// `sanitize -> optional per-batch normalization -> sanitize -> centered
     /// lhtan`. `normalize`/`mean`/`inv_std` are per-batch f32 tensors.
     #[kernel]
@@ -584,9 +582,21 @@ pub mod backward {
         let b = i / per_batch;
         let v1 = deform_sanitize(raw[i]);
         let normalized = normalize[b] != 0.0;
-        let pre = if normalized { (v1 - mean[b]) * inv_std[b] } else { v1 };
-        let v2 = if normalized { deform_sanitize(pre) } else { pre };
-        let slope = if normalized { deform_sanitize_slope(pre) } else { 1.0 };
+        let pre = if normalized {
+            (v1 - mean[b]) * inv_std[b]
+        } else {
+            v1
+        };
+        let v2 = if normalized {
+            deform_sanitize(pre)
+        } else {
+            pre
+        };
+        let slope = if normalized {
+            deform_sanitize_slope(pre)
+        } else {
+            1.0
+        };
         if let Some(o) = out.get_mut(idx) {
             *o = d_out[i] * deform_centered_lhtan_slope(v2, max_offset) * slope;
         }
@@ -594,11 +604,7 @@ pub mod backward {
 
     /// Multiply the summed input gradient by the raw input's `sanitize` slope.
     #[kernel]
-    pub fn deform_scale_input_gradient(
-        raw: &[f32],
-        grad: &[f32],
-        mut out: DisjointSlice<f32>,
-    ) {
+    pub fn deform_scale_input_gradient(raw: &[f32], grad: &[f32], mut out: DisjointSlice<f32>) {
         let idx = thread::index_1d();
         let i = idx.get();
         if i >= out.len() {
@@ -623,6 +629,65 @@ pub mod backward {
         }
         if let Some(o) = out.get_mut(idx) {
             *o = d_out[i] * deform_mask_sigmoid_slope(logits[i]);
+        }
+    }
+
+    /// Direct dilated predictor convolution with the deform_conv output extent.
+    /// Unlike `[convolutional]`, DeformConv's extent accounts for dilation.
+    #[kernel]
+    pub fn deform_predictor_forward_dilated(
+        input: &[f32],
+        weights: &[f32],
+        mut output: DisjointSlice<f32>,
+        batch: usize,
+        channels: usize,
+        filters: usize,
+        in_h: usize,
+        in_w: usize,
+        out_h: usize,
+        out_w: usize,
+        size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        padding: usize,
+        dilation: usize,
+    ) {
+        let index = thread::index_1d().get();
+        let plane = out_h * out_w;
+        if index >= output.len() || index / (plane * filters) >= batch {
+            return;
+        }
+        let position = index % plane;
+        let filter = (index / plane) % filters;
+        let b = index / (plane * filters);
+        let oy = position / out_w;
+        let ox = position % out_w;
+        let mut value = 0.0f32;
+        let mut channel = 0;
+        while channel < channels {
+            let mut ky = 0;
+            while ky < size {
+                let y = (oy * stride_y) as isize - (padding * dilation) as isize
+                    + (ky * dilation) as isize;
+                let mut kx = 0;
+                while kx < size {
+                    let x = (ox * stride_x) as isize - (padding * dilation) as isize
+                        + (kx * dilation) as isize;
+                    if y >= 0 && y < in_h as isize && x >= 0 && x < in_w as isize {
+                        let input_index =
+                            ((b * channels + channel) * in_h + y as usize) * in_w + x as usize;
+                        let weight_index = ((filter * channels + channel) * size + ky) * size + kx;
+                        value += input[input_index] * weights[weight_index];
+                    }
+                    kx += 1;
+                }
+                ky += 1;
+            }
+            channel += 1;
+        }
+        // SAFETY: host validation proves the explicitly-shaped output extent and all operands.
+        unsafe {
+            *output.as_mut_ptr().add(index) = value;
         }
     }
 
@@ -782,10 +847,7 @@ pub mod backward {
             }
             lc += 1;
         }
-        let slope = if raw_sum.is_finite()
-            && raw_sum > -10_000.0f32
-            && raw_sum < 10_000.0f32
-        {
+        let slope = if raw_sum.is_finite() && raw_sum > -10_000.0f32 && raw_sum < 10_000.0f32 {
             1.0f32
         } else {
             0.0f32
@@ -813,7 +875,11 @@ pub mod backward {
                         + (kx * dilation) as f32
                         + dx_off;
                     let mask_index = mask_base + k * plane;
-                    let mask = if use_mask != 0 { masks[mask_index] } else { 1.0 };
+                    let mask = if use_mask != 0 {
+                        masks[mask_index]
+                    } else {
+                        1.0
+                    };
                     let w_index = (filter * channels_per_group + lc) * kernel_area + k;
                     let weight = weights[w_index];
                     let sample = deform_sample_at(input, channel_base, in_h, in_w, y, x);
@@ -861,21 +927,31 @@ pub mod backward {
                         // SAFETY: as above; only in-image taps are touched.
                         unsafe {
                             if has00 {
-                                deform_atomic_add_f32(d_input.add(channel_base + r0 + c0), scale * hy * hx);
+                                deform_atomic_add_f32(
+                                    d_input.add(channel_base + r0 + c0),
+                                    scale * hy * hx,
+                                );
                             }
                             if has01 {
-                                deform_atomic_add_f32(d_input.add(channel_base + r0 + c1), scale * hy * lx);
+                                deform_atomic_add_f32(
+                                    d_input.add(channel_base + r0 + c1),
+                                    scale * hy * lx,
+                                );
                             }
                             if has10 {
-                                deform_atomic_add_f32(d_input.add(channel_base + r1 + c0), scale * ly * hx);
+                                deform_atomic_add_f32(
+                                    d_input.add(channel_base + r1 + c0),
+                                    scale * ly * hx,
+                                );
                             }
                             if has11 {
-                                deform_atomic_add_f32(d_input.add(channel_base + r1 + c1), scale * ly * lx);
+                                deform_atomic_add_f32(
+                                    d_input.add(channel_base + r1 + c1),
+                                    scale * ly * lx,
+                                );
                             }
-                            let dy_slope =
-                                -hx * v00 - lx * v01 + hx * v10 + lx * v11;
-                            let dx_slope =
-                                -hy * v00 + hy * v01 - ly * v10 + ly * v11;
+                            let dy_slope = -hx * v00 - lx * v01 + hx * v10 + lx * v11;
+                            let dx_slope = -hy * v00 + hy * v01 - ly * v10 + ly * v11;
                             deform_atomic_add_f32(
                                 d_offsets.add(offset_base + (2 * k) * plane),
                                 scale * dy_slope,

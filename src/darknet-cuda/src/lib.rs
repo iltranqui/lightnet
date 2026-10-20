@@ -987,13 +987,7 @@ pub trait F32TensorOpsBackend {
         let inv_std = self.download_f32(inv_std)?;
         let normalize = self.download_f32(normalize)?;
         let out = host_ops::deform_conv::offset_envelope(
-            &values,
-            &mean,
-            &inv_std,
-            &normalize,
-            planes,
-            spatial,
-            max_offset,
+            &values, &mean, &inv_std, &normalize, planes, spatial, max_offset,
         )
         .unwrap_or_else(|err| panic!("{err}"));
         self.upload_f32(shape, &out)
@@ -1010,6 +1004,142 @@ pub trait F32TensorOpsBackend {
         let values = self.download_f32(raw)?;
         let out = host_ops::deform_conv::mask_sigmoid(&values);
         self.upload_f32(shape, &out)
+    }
+
+    /// Plain convolution used by deform_conv offset/mask predictors, with the
+    /// source-specific output extent that includes the dilated kernel extent.
+    #[allow(clippy::too_many_arguments)]
+    fn deform_predictor_f32(
+        &self,
+        input: &Self::Tensor,
+        weights: &Self::Tensor,
+        biases: &Self::Tensor,
+        output_shape: &[usize],
+        channels: usize,
+        in_h: usize,
+        in_w: usize,
+        filters: usize,
+        size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        padding: usize,
+        dilation: usize,
+        out_h: usize,
+        out_w: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert!(channels > 0 && in_h > 0 && in_w > 0 && filters > 0 && size > 0);
+        assert!(stride_x > 0 && stride_y > 0 && dilation > 0);
+        let x = self.download_f32(input)?;
+        let w = self.download_f32(weights)?;
+        let b = self.download_f32(biases)?;
+        let per_batch = channels * in_h * in_w;
+        assert!(per_batch > 0 && x.len() % per_batch == 0);
+        let batch = x.len() / per_batch;
+        assert_eq!(w.len(), filters * channels * size * size);
+        assert_eq!(b.len(), filters);
+        assert_eq!(output_shape, [batch, filters, out_h, out_w]);
+        let mut out = vec![0.0; batch * filters * out_h * out_w];
+        for n in 0..batch {
+            for f in 0..filters {
+                for oy in 0..out_h {
+                    for ox in 0..out_w {
+                        let mut value = b[f];
+                        for c in 0..channels {
+                            for ky in 0..size {
+                                for kx in 0..size {
+                                    let y = (oy * stride_y) as isize
+                                        - (padding * dilation) as isize
+                                        + (ky * dilation) as isize;
+                                    let x_idx = (ox * stride_x) as isize
+                                        - (padding * dilation) as isize
+                                        + (kx * dilation) as isize;
+                                    if (0..in_h as isize).contains(&y)
+                                        && (0..in_w as isize).contains(&x_idx)
+                                    {
+                                        let xi = ((n * channels + c) * in_h + y as usize) * in_w
+                                            + x_idx as usize;
+                                        let wi = ((f * channels + c) * size + ky) * size + kx;
+                                        value += x[xi] * w[wi];
+                                    }
+                                }
+                            }
+                        }
+                        out[((n * filters + f) * out_h + oy) * out_w + ox] = value;
+                    }
+                }
+            }
+        }
+        self.upload_f32(output_shape, &out)
+    }
+
+    /// Native single-template DSConv f32 forward, including activation. `None`
+    /// means this backend does not provide the optional native layer path.
+    #[allow(clippy::too_many_arguments)]
+    fn dsconv_forward_native_f32(
+        &self,
+        input: &Self::Tensor,
+        offset_weights: &Self::Tensor,
+        offset_biases: &Self::Tensor,
+        weights: &Self::Tensor,
+        biases: &Self::Tensor,
+        geometry: host_ops::DsConvGeometry,
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Option<Result<Self::Tensor, Self::Error>> {
+        let _ = (
+            input,
+            offset_weights,
+            offset_biases,
+            weights,
+            biases,
+            geometry,
+            activation,
+            config,
+        );
+        None
+    }
+
+    /// Native DSConv f32 adjoint. Returns `(d_input, d_collapse_weights,
+    /// d_collapse_biases, d_offset_weights, d_offset_biases)`; `None` means the
+    /// backend does not provide native DSConv backward.
+    #[allow(clippy::too_many_arguments)]
+    fn dsconv_backward_native_f32(
+        &self,
+        input: &Self::Tensor,
+        offset_weights: &Self::Tensor,
+        offset_biases: &Self::Tensor,
+        weights: &Self::Tensor,
+        biases: &Self::Tensor,
+        output_gradient: &Self::Tensor,
+        geometry: host_ops::DsConvGeometry,
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Option<
+        Result<
+            (
+                Self::Tensor,
+                Self::Tensor,
+                Self::Tensor,
+                Self::Tensor,
+                Self::Tensor,
+            ),
+            Self::Error,
+        >,
+    > {
+        let _ = (
+            input,
+            offset_weights,
+            offset_biases,
+            weights,
+            biases,
+            output_gradient,
+            geometry,
+            activation,
+            config,
+        );
+        None
     }
 
     /// Deformable accumulation: `sum_c sum_k weight * sample(base + offset) *
@@ -1177,7 +1307,17 @@ pub trait F32TensorOpsBackend {
         let kernels = size * size;
         let column_count = channels * kernels;
         let columns = host_ops::deform_conv::predictor_columns_xy(
-            &input_host, batch, channels, in_h, in_w, size, stride_x, stride_y, padding, dilation, out_h,
+            &input_host,
+            batch,
+            channels,
+            in_h,
+            in_w,
+            size,
+            stride_x,
+            stride_y,
+            padding,
+            dilation,
+            out_h,
             out_w,
         )
         .unwrap_or_else(|err| panic!("{err}"));
@@ -1286,8 +1426,12 @@ pub trait F32TensorOpsBackend {
         let _ = config;
         assert_eq!(input_shape.len(), 4, "deconvolution input must be NCHW");
         assert_eq!(output_shape.len(), 4, "deconvolution output must be NCHW");
-        let (batch, channels, input_height, input_width) =
-            (input_shape[0], input_shape[1], input_shape[2], input_shape[3]);
+        let (batch, channels, input_height, input_width) = (
+            input_shape[0],
+            input_shape[1],
+            input_shape[2],
+            input_shape[3],
+        );
         assert_eq!(output_shape[0], batch, "deconvolution output batch");
         assert_eq!(output_shape[1], filters, "deconvolution output filters");
         let (dx, dw, db) = host_ops::deconvolutional::backward(
@@ -1339,11 +1483,9 @@ pub trait F32TensorOpsBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
         let _ = config;
-        let reference = host_ops::graph_conv::center_reference_forward(
-            &self.download_f32(input)?,
-            geometry,
-        )
-        .unwrap_or_else(|err| panic!("{err}"));
+        let reference =
+            host_ops::graph_conv::center_reference_forward(&self.download_f32(input)?, geometry)
+                .unwrap_or_else(|err| panic!("{err}"));
         self.upload_f32(
             &[
                 geometry.batch,
@@ -1363,11 +1505,9 @@ pub trait F32TensorOpsBackend {
     ) -> Result<Self::Tensor, Self::Error> {
         let _ = config;
         let output_gradient = self.download_f32(output_gradient)?;
-        let input_gradient = host_ops::graph_conv::center_reference_backward(
-            &output_gradient,
-            geometry,
-        )
-        .unwrap_or_else(|err| panic!("{err}"));
+        let input_gradient =
+            host_ops::graph_conv::center_reference_backward(&output_gradient, geometry)
+                .unwrap_or_else(|err| panic!("{err}"));
         self.upload_f32(
             &[
                 geometry.batch,
@@ -1591,7 +1731,16 @@ pub trait F32TensorOpsBackend {
         .unwrap_or_else(|err| panic!("{err}"));
         Ok((
             self.upload_f32(input_shape, &dx)?,
-            self.upload_f32(&[output_shape[2] * output_shape[3], filters, input_shape[1], kernel_size, kernel_size], &dw)?,
+            self.upload_f32(
+                &[
+                    output_shape[2] * output_shape[3],
+                    filters,
+                    input_shape[1],
+                    kernel_size,
+                    kernel_size,
+                ],
+                &dw,
+            )?,
             self.upload_f32(&[output_shape[2] * output_shape[3], filters], &db)?,
         ))
     }
@@ -1679,7 +1828,8 @@ pub trait F32TensorOpsBackend {
                     let mut best = input[first];
                     let mut candidate_channel = group + output_channels;
                     while candidate_channel < input_channels {
-                        let candidate = input[(b * input_channels + candidate_channel) * spatial + position];
+                        let candidate =
+                            input[(b * input_channels + candidate_channel) * spatial + position];
                         if candidate > best {
                             best = candidate;
                             winner = candidate_channel;
@@ -1965,13 +2115,17 @@ pub trait F32TensorOpsBackend {
                                 }
                             }
                         }
-                        pooled[b * input_dim + (c * pooled_height + oy) * pooled_width + ox] = sum / count as f32;
+                        pooled[b * input_dim + (c * pooled_height + oy) * pooled_width + ox] =
+                            sum / count as f32;
                     }
                 }
             }
         }
         let preactivation = host_ops::linear(&pooled, batch, input_dim, hidden_count, w1, Some(b1));
-        let hidden: Vec<f32> = preactivation.into_iter().map(|value| value.max(0.0)).collect();
+        let hidden: Vec<f32> = preactivation
+            .into_iter()
+            .map(|value| value.max(0.0))
+            .collect();
         let raw = host_ops::linear(&hidden, batch, hidden_count, param_count, w2, Some(b2));
         let constrained: Vec<f32> = raw
             .into_iter()
@@ -1981,9 +2135,18 @@ pub trait F32TensorOpsBackend {
                 if parameter < 2 {
                     0.9 * value.tanh()
                 } else if parameter + 1 == param_count {
-                    if value >= 0.0 { 1.0 / (1.0 + (-value).exp()) } else { let exp = value.exp(); exp / (1.0 + exp) }
+                    if value >= 0.0 {
+                        1.0 / (1.0 + (-value).exp())
+                    } else {
+                        let exp = value.exp();
+                        exp / (1.0 + exp)
+                    }
                 } else {
-                    let softplus = if value > 20.0 { value } else { value.exp().ln_1p() };
+                    let softplus = if value > 20.0 {
+                        value
+                    } else {
+                        value.exp().ln_1p()
+                    };
                     (2.0 * softplus + 0.1).clamp(0.1, 2.0)
                 }
             })
@@ -2010,8 +2173,17 @@ pub trait F32TensorOpsBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
         let _ = config;
-        assert_eq!(input_shape.len(), 4, "HF predictor backward expects NCHW shape");
-        let [batch, channels, height, width] = [input_shape[0], input_shape[1], input_shape[2], input_shape[3]];
+        assert_eq!(
+            input_shape.len(),
+            4,
+            "HF predictor backward expects NCHW shape"
+        );
+        let [batch, channels, height, width] = [
+            input_shape[0],
+            input_shape[1],
+            input_shape[2],
+            input_shape[3],
+        ];
         assert!(downsample > 0 && hidden_count > 0 && param_count >= 4);
         let pooled_h = (height / downsample).max(1);
         let pooled_w = (width / downsample).max(1);
@@ -2040,15 +2212,28 @@ pub trait F32TensorOpsBackend {
             for p in 0..param_count {
                 let r = raw[n * param_count + p];
                 let derivative = if p < 2 {
-                    let t = r.tanh(); 0.9 * (1.0 - t * t)
+                    let t = r.tanh();
+                    0.9 * (1.0 - t * t)
                 } else if p + 1 == param_count {
-                    let s = if r >= 0.0 { 1.0 / (1.0 + (-r).exp()) } else { let e = r.exp(); e / (1.0 + e) };
+                    let s = if r >= 0.0 {
+                        1.0 / (1.0 + (-r).exp())
+                    } else {
+                        let e = r.exp();
+                        e / (1.0 + e)
+                    };
                     s * (1.0 - s)
                 } else {
                     let sp = if r > 20.0 { r } else { r.exp().ln_1p() };
                     let value = 2.0 * sp + 0.1;
-                    if value <= 0.1 || value >= 2.0 { 0.0 } else {
-                        let s = if r >= 0.0 { 1.0 / (1.0 + (-r).exp()) } else { let e = r.exp(); e / (1.0 + e) };
+                    if value <= 0.1 || value >= 2.0 {
+                        0.0
+                    } else {
+                        let s = if r >= 0.0 {
+                            1.0 / (1.0 + (-r).exp())
+                        } else {
+                            let e = r.exp();
+                            e / (1.0 + e)
+                        };
                         2.0 * s
                     }
                 };
@@ -2060,8 +2245,12 @@ pub trait F32TensorOpsBackend {
             }
             let mut dhidden = vec![0.0; hidden_count];
             for h in 0..hidden_count {
-                for p in 0..param_count { dhidden[h] += draw[p] * w2[p * hidden_count + h]; }
-                if pre[n * hidden_count + h] <= 0.0 { dhidden[h] = 0.0; }
+                for p in 0..param_count {
+                    dhidden[h] += draw[p] * w2[p * hidden_count + h];
+                }
+                if pre[n * hidden_count + h] <= 0.0 {
+                    dhidden[h] = 0.0;
+                }
                 db1[h] += dhidden[h];
                 for i in 0..input_dim {
                     dw1[h * input_dim + i] += dhidden[h] * pooled[n * input_dim + i];
@@ -2069,7 +2258,9 @@ pub trait F32TensorOpsBackend {
             }
             let mut dpooled = vec![0.0; input_dim];
             for i in 0..input_dim {
-                for h in 0..hidden_count { dpooled[i] += dhidden[h] * w1[h * input_dim + i]; }
+                for h in 0..hidden_count {
+                    dpooled[i] += dhidden[h] * w1[h * input_dim + i];
+                }
             }
             for c in 0..channels {
                 for py in 0..pooled_h {
@@ -2122,12 +2313,26 @@ pub trait F32TensorOpsBackend {
             let cx = params[b * param_count].clamp(-0.9, 0.9);
             let cy = params[b * param_count + 1].clamp(-0.9, 0.9);
             let rx = params[b * param_count + 2].clamp(0.1, 2.0);
-            let radius = if param_count == 5 { (rx.powf(8.0) + params[b * param_count + 3].clamp(0.1, 2.0).powf(8.0)).powf(0.125).clamp(0.1, 2.0) } else { rx.max(1e-4) };
+            let radius = if param_count == 5 {
+                (rx.powf(8.0) + params[b * param_count + 3].clamp(0.1, 2.0).powf(8.0))
+                    .powf(0.125)
+                    .clamp(0.1, 2.0)
+            } else {
+                rx.max(1e-4)
+            };
             let strength = params[b * param_count + param_count - 1].clamp(0.0, 1.0);
             for y in 0..height {
-                let qy = if height > 1 { 2.0 * y as f32 / (height - 1) as f32 - 1.0 } else { 0.0 };
+                let qy = if height > 1 {
+                    2.0 * y as f32 / (height - 1) as f32 - 1.0
+                } else {
+                    0.0
+                };
                 for x in 0..width {
-                    let qx = if width > 1 { 2.0 * x as f32 / (width - 1) as f32 - 1.0 } else { 0.0 };
+                    let qx = if width > 1 {
+                        2.0 * x as f32 / (width - 1) as f32 - 1.0
+                    } else {
+                        0.0
+                    };
                     let mut px = qx.clamp(-1.0, 1.0);
                     let mut py = qy.clamp(-1.0, 1.0);
                     for _ in 0..iterations {
@@ -2137,12 +2342,27 @@ pub trait F32TensorOpsBackend {
                         let (u, du_dr) = if r > 1.0e-6 {
                             let ar = alpha.max(1.0e-4) * r;
                             let tanh = ar.tanh();
-                            (tanh / r, (alpha.max(1.0e-4) * (1.0 - tanh * tanh) * r - tanh) / (r * r))
-                        } else { (alpha.max(1.0e-4), 0.0) };
+                            (
+                                tanh / r,
+                                (alpha.max(1.0e-4) * (1.0 - tanh * tanh) * r - tanh) / (r * r),
+                            )
+                        } else {
+                            (alpha.max(1.0e-4), 0.0)
+                        };
                         let (weight, dw_dr) = if r < radius {
                             let base = (1.0 - r / radius).max(0.0);
-                            (base.powf(p_exp.max(1.0e-4)), if r > 1.0e-6 { -(p_exp.max(1.0e-4) / radius) * base.powf((p_exp.max(1.0e-4) - 1.0).max(0.0)) } else { 0.0 })
-                        } else { (0.0, 0.0) };
+                            (
+                                base.powf(p_exp.max(1.0e-4)),
+                                if r > 1.0e-6 {
+                                    -(p_exp.max(1.0e-4) / radius)
+                                        * base.powf((p_exp.max(1.0e-4) - 1.0).max(0.0))
+                                } else {
+                                    0.0
+                                },
+                            )
+                        } else {
+                            (0.0, 0.0)
+                        };
                         let gain = 1.0 + strength * weight * (u - 1.0);
                         let dg = strength * (dw_dr * (u - 1.0) + weight * du_dr);
                         let mut jac = [[gain, 0.0], [0.0, gain]];
@@ -2192,26 +2412,52 @@ pub trait F32TensorOpsBackend {
         let _ = config;
         let params = self.download_f32(params)?;
         assert!(param_count == 4 || param_count == 5);
-        assert_eq!(params.len(), batch * param_count, "HF fixed-point parameter length");
+        assert_eq!(
+            params.len(),
+            batch * param_count,
+            "HF fixed-point parameter length"
+        );
         let mut grid = vec![0.0; batch * height * width * 2];
         for b in 0..batch {
             let cx = params[b * param_count].clamp(-0.9, 0.9);
             let cy = params[b * param_count + 1].clamp(-0.9, 0.9);
             let rx = params[b * param_count + 2].clamp(0.1, 2.0);
-            let radius = if param_count == 5 { (rx.powf(8.0) + params[b * param_count + 3].clamp(0.1, 2.0).powf(8.0)).powf(0.125).clamp(0.1, 2.0) } else { rx };
+            let radius = if param_count == 5 {
+                (rx.powf(8.0) + params[b * param_count + 3].clamp(0.1, 2.0).powf(8.0))
+                    .powf(0.125)
+                    .clamp(0.1, 2.0)
+            } else {
+                rx
+            };
             let strength = params[b * param_count + param_count - 1].clamp(0.0, 1.0);
             for y in 0..height {
-                let qy = if height > 1 { 2.0 * y as f32 / (height - 1) as f32 - 1.0 } else { 0.0 };
+                let qy = if height > 1 {
+                    2.0 * y as f32 / (height - 1) as f32 - 1.0
+                } else {
+                    0.0
+                };
                 for x in 0..width {
-                    let qx = if width > 1 { 2.0 * x as f32 / (width - 1) as f32 - 1.0 } else { 0.0 };
+                    let qx = if width > 1 {
+                        2.0 * x as f32 / (width - 1) as f32 - 1.0
+                    } else {
+                        0.0
+                    };
                     let mut px = qx.clamp(-1.0, 1.0);
                     let mut py = qy.clamp(-1.0, 1.0);
                     for _ in 0..iterations {
                         let dx = px - cx;
                         let dy = py - cy;
                         let r = (dx * dx + dy * dy).sqrt();
-                        let u = if r > 1.0e-6 { (alpha.max(1.0e-4) * r).tanh() / r } else { alpha.max(1.0e-4) };
-                        let weight = if r < radius { (1.0 - r / radius).max(0.0).powf(p_exp.max(1.0e-4)) } else { 0.0 };
+                        let u = if r > 1.0e-6 {
+                            (alpha.max(1.0e-4) * r).tanh() / r
+                        } else {
+                            alpha.max(1.0e-4)
+                        };
+                        let weight = if r < radius {
+                            (1.0 - r / radius).max(0.0).powf(p_exp.max(1.0e-4))
+                        } else {
+                            0.0
+                        };
                         let gain = 1.0 + strength * weight * (u - 1.0);
                         px = (px + eta * (qx - (cx + gain * dx))).clamp(-1.0, 1.0);
                         py = (py + eta * (qy - (cy + gain * dy))).clamp(-1.0, 1.0);
@@ -2240,7 +2486,11 @@ pub trait F32TensorOpsBackend {
         let input = self.download_f32(input)?;
         let grid = self.download_f32(grid)?;
         let spatial = height * width;
-        assert_eq!(input.len(), batch * channels * spatial, "HF warp input length");
+        assert_eq!(
+            input.len(),
+            batch * channels * spatial,
+            "HF warp input length"
+        );
         assert_eq!(grid.len(), batch * spatial * 2, "HF warp grid length");
         let mut output = vec![0.0; input.len()];
         for b in 0..batch {
@@ -2287,8 +2537,16 @@ pub trait F32TensorOpsBackend {
         let grid = self.download_f32(grid)?;
         let output_gradient = self.download_f32(output_gradient)?;
         let spatial = height * width;
-        assert_eq!(input.len(), batch * channels * spatial, "HF warp input length");
-        assert_eq!(output_gradient.len(), input.len(), "HF warp output-gradient length");
+        assert_eq!(
+            input.len(),
+            batch * channels * spatial,
+            "HF warp input length"
+        );
+        assert_eq!(
+            output_gradient.len(),
+            input.len(),
+            "HF warp output-gradient length"
+        );
         assert_eq!(grid.len(), batch * spatial * 2, "HF warp grid length");
         let mut input_gradient = vec![0.0; input.len()];
         let mut grid_gradient = vec![0.0; grid.len()];
@@ -2307,24 +2565,30 @@ pub trait F32TensorOpsBackend {
                         let base = (b * channels + c) * spatial;
                         let seed = output_gradient[base + pixel];
                         let value = |row: isize, col: isize| -> f32 {
-                            if row >= 0 && row < height as isize && col >= 0 && col < width as isize {
+                            if row >= 0 && row < height as isize && col >= 0 && col < width as isize
+                            {
                                 input[base + row as usize * width + col as usize]
-                            } else { 0.0 }
+                            } else {
+                                0.0
+                            }
                         };
                         let v00 = value(y0, x0);
                         let v01 = value(y0, x0 + 1);
                         let v10 = value(y0 + 1, x0);
                         let v11 = value(y0 + 1, x0 + 1);
                         grid_gradient[gi] += seed * ((1.0 - fy) * (v01 - v00) + fy * (v11 - v10));
-                        grid_gradient[gi + 1] += seed * ((1.0 - fx) * (v10 - v00) + fx * (v11 - v01));
+                        grid_gradient[gi + 1] +=
+                            seed * ((1.0 - fx) * (v10 - v00) + fx * (v11 - v01));
                         for (row, col, weight) in [
                             (y0, x0, (1.0 - fy) * (1.0 - fx)),
                             (y0, x0 + 1, (1.0 - fy) * fx),
                             (y0 + 1, x0, fy * (1.0 - fx)),
                             (y0 + 1, x0 + 1, fy * fx),
                         ] {
-                            if row >= 0 && row < height as isize && col >= 0 && col < width as isize {
-                                input_gradient[base + row as usize * width + col as usize] += seed * weight;
+                            if row >= 0 && row < height as isize && col >= 0 && col < width as isize
+                            {
+                                input_gradient[base + row as usize * width + col as usize] +=
+                                    seed * weight;
                             }
                         }
                     }
@@ -2422,6 +2686,206 @@ pub trait F32TensorOpsBackend {
             config,
         );
         panic!("crop_bilinear_backward_f32 is not implemented by this CUDA backend")
+    }
+    /// Native WMHF Haar analysis transform and its four source-ordered sub-bands.
+    fn wmhf_haar_dwt_f32(
+        &self,
+        input: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = (input, batch, channels, height, width, config);
+        panic!("wmhf_haar_dwt_f32 is not implemented by this CUDA backend")
+    }
+    /// Exact input adjoint of WMHF Haar DWT.
+    fn wmhf_haar_dwt_backward_f32(
+        &self,
+        ll_grad: &Self::Tensor,
+        lh_grad: &Self::Tensor,
+        hl_grad: &Self::Tensor,
+        hh_grad: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = (
+            ll_grad, lh_grad, hl_grad, hh_grad, batch, channels, height, width, config,
+        );
+        panic!("wmhf_haar_dwt_backward_f32 is not implemented by this CUDA backend")
+    }
+    /// Native WMHF Haar synthesis and its exact input-gradient adjoint.
+    fn wmhf_haar_iwt_f32(
+        &self,
+        ll: &Self::Tensor,
+        lh: &Self::Tensor,
+        hl: &Self::Tensor,
+        hh: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = (ll, lh, hl, hh, batch, channels, height, width, config);
+        panic!("wmhf_haar_iwt_f32 is not implemented by this CUDA backend")
+    }
+    fn wmhf_haar_iwt_backward_f32(
+        &self,
+        output_grad: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = (output_grad, batch, channels, height, width, config);
+        panic!("wmhf_haar_iwt_backward_f32 is not implemented by this CUDA backend")
+    }
+    /// Four-direction WMHF EMA scan forward and exact input/weight adjoint.
+    fn wmhf_scan4_forward_f32(
+        &self,
+        input: &Self::Tensor,
+        weights: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = (input, weights, batch, channels, height, width, config);
+        panic!("wmhf_scan4_forward_f32 is not implemented by this CUDA backend")
+    }
+    fn wmhf_scan4_backward_f32(
+        &self,
+        input: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        weights: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = (
+            input,
+            output_grad,
+            weights,
+            batch,
+            channels,
+            height,
+            width,
+            config,
+        );
+        panic!("wmhf_scan4_backward_f32 is not implemented by this CUDA backend")
+    }
+    /// High-frequency WMHF magnitude sum and nearest-tile upsampling.
+    fn wmhf_high_frequency_forward_f32(
+        &self,
+        lh: &Self::Tensor,
+        hl: &Self::Tensor,
+        hh: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = (lh, hl, hh, batch, channels, height, width, config);
+        panic!("wmhf_high_frequency_forward_f32 is not implemented by this CUDA backend")
+    }
+    fn wmhf_high_frequency_backward_f32(
+        &self,
+        output_grad: &Self::Tensor,
+        lh: &Self::Tensor,
+        hl: &Self::Tensor,
+        hh: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = (
+            output_grad,
+            lh,
+            hl,
+            hh,
+            batch,
+            channels,
+            height,
+            width,
+            config,
+        );
+        panic!("wmhf_high_frequency_backward_f32 is not implemented by this CUDA backend")
+    }
+    /// Gather a contiguous NCHW channel range for a WMHF branch.
+    fn wmhf_split_channels_f32(
+        &self,
+        input: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        begin: usize,
+        count: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = (input, batch, channels, height, width, begin, count, config);
+        panic!("wmhf_split_channels_f32 is not implemented by this CUDA backend")
+    }
+    /// Concatenate WMHF 3x/5x/7x local branch tensors in channel-major order.
+    fn wmhf_concat_local_f32(
+        &self,
+        branch3: &Self::Tensor,
+        branch5: &Self::Tensor,
+        branch7: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = (
+            branch3, branch5, branch7, batch, channels, height, width, config,
+        );
+        panic!("wmhf_concat_local_f32 is not implemented by this CUDA backend")
+    }
+    /// WMHF gated residual fusion and its exact adjoint.
+    fn wmhf_apply_gate_f32(
+        &self,
+        fuse: &Self::Tensor,
+        gate: &Self::Tensor,
+        projected: &Self::Tensor,
+        shortcut: Option<&Self::Tensor>,
+        freq_scale: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = (fuse, gate, projected, shortcut, freq_scale, config);
+        panic!("wmhf_apply_gate_f32 is not implemented by this CUDA backend")
+    }
+    fn wmhf_apply_gate_backward_f32(
+        &self,
+        output_grad: &Self::Tensor,
+        gate: &Self::Tensor,
+        projected: &Self::Tensor,
+        freq_scale: f32,
+        use_shortcut: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = (
+            output_grad,
+            gate,
+            projected,
+            freq_scale,
+            use_shortcut,
+            config,
+        );
+        panic!("wmhf_apply_gate_backward_f32 is not implemented by this CUDA backend")
     }
     fn upsample_f32(
         &self,
@@ -2587,14 +3051,9 @@ pub trait F32TensorOpsBackend {
     ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
         let updates = self.download_f32(updates)?;
         let momentum = self.download_f32(momentum)?;
-        let (next_momentum, lookahead) = host_ops::muon::momentum_lookahead(
-            &updates,
-            &momentum,
-            batch,
-            loss_scale,
-            coefficient,
-        )
-        .unwrap_or_else(|error| panic!("{error}"));
+        let (next_momentum, lookahead) =
+            host_ops::muon::momentum_lookahead(&updates, &momentum, batch, loss_scale, coefficient)
+                .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(shape.iter().product::<usize>(), next_momentum.len());
         Ok((
             self.upload_f32(shape, &next_momentum)?,
@@ -2829,7 +3288,8 @@ pub trait F32TensorOpsBackend {
                     for d in 0..head_dim {
                         let mut value = 0.0f32;
                         for key in 0..tokens {
-                            let vi = (b * tokens + key) * 3 * channels + 2 * channels + head_start + d;
+                            let vi =
+                                (b * tokens + key) * 3 * channels + 2 * channels + head_start + d;
                             value += scores[key] * inv_sum * qkv[vi];
                         }
                         output[(b * tokens + query) * channels + head_start + d] = value;
@@ -2860,7 +3320,10 @@ pub trait F32TensorOpsBackend {
         assert_eq!(type_embedding.len(), 3 * hidden);
         let source = self.download_f32(input)?;
         assert_eq!(source.len(), batch * channels * tokens);
-        let (mut tokens_out, mut mask) = (vec![0.0; batch * tokens * hidden], vec![0.0; batch * tokens]);
+        let (mut tokens_out, mut mask) = (
+            vec![0.0; batch * tokens * hidden],
+            vec![0.0; batch * tokens],
+        );
         for b in 0..batch {
             let selected = if qtype >= 0 {
                 qtype as usize
@@ -2870,8 +3333,9 @@ pub trait F32TensorOpsBackend {
             for t in 0..tokens {
                 mask[b * tokens + t] = source[(b * channels + hidden) * tokens + t];
                 for h in 0..hidden {
-                    tokens_out[(b * tokens + t) * hidden + h] =
-                        source[(b * channels + h) * tokens + t] + type_embedding[selected * hidden + h];
+                    tokens_out[(b * tokens + t) * hidden + h] = source
+                        [(b * channels + h) * tokens + t]
+                        + type_embedding[selected * hidden + h];
                 }
             }
         }
@@ -2900,7 +3364,8 @@ pub trait F32TensorOpsBackend {
         for b in 0..batch {
             for t in 0..sequence {
                 for h in 0..hidden {
-                    output[(b * hidden + h) * sequence + t] = tokens[(b * sequence + t) * hidden + h];
+                    output[(b * hidden + h) * sequence + t] =
+                        tokens[(b * sequence + t) * hidden + h];
                 }
             }
         }
@@ -3104,7 +3569,8 @@ pub trait F32TensorOpsBackend {
                     for d in 0..hd {
                         let mut value = 0.0;
                         for key in 0..sequence {
-                            let v = qkv[(b * sequence + key) * 3 * hidden + 2 * hidden + head * hd + d];
+                            let v =
+                                qkv[(b * sequence + key) * 3 * hidden + 2 * hidden + head * hd + d];
                             value += scores[key] * v;
                         }
                         output[(b * sequence + query) * hidden + head * hd + d] = value / sum;
@@ -3157,7 +3623,8 @@ pub trait F32TensorOpsBackend {
         for b in 0..batch {
             for t in 0..sequence {
                 for h in 0..hidden {
-                    output[(b * hidden + h) * sequence + t] = tokens[(b * sequence + t) * hidden + h];
+                    output[(b * hidden + h) * sequence + t] =
+                        tokens[(b * sequence + t) * hidden + h];
                 }
             }
         }
@@ -3246,6 +3713,190 @@ pub trait F32TensorOpsBackend {
         let y = self.download_f32(output)?;
         let dy = self.download_f32(output_grad)?;
         self.upload_f32(shape, &host_ops::softmax_backward(&y, &dy, group_size))
+    }
+    /// CenterNet forward: apply sigmoid to the first `classes` NCHW channels,
+    /// preserve regression channels, then zero non-finite values. The default
+    /// is a host reference; native backends should keep this pass on-device.
+    fn centernet_forward_f32(
+        &self,
+        x: &Self::Tensor,
+        shape: &[usize],
+        classes: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        // The runtime validates `[batch, channels, height, width]` and the
+        // class extent before dispatch, as it does for the CPU reference.
+        let input = self.download_f32(x)?;
+        let spatial = shape[2] * shape[3];
+        let mut output = input;
+        for b in 0..shape[0] {
+            let base = b * shape[1] * spatial;
+            for i in 0..shape[1] * spatial {
+                let value = if i < classes * spatial {
+                    1.0 / (1.0 + (-output[base + i]).exp())
+                } else {
+                    output[base + i]
+                };
+                output[base + i] = if value.is_finite() { value } else { 0.0 };
+            }
+        }
+        self.upload_f32(shape, &output)
+    }
+    /// Apply the shared YOLOX/PP-YOLOE/YOLO-NAS output activation in NCHW
+    /// layout: sanitize all entries, then sigmoid the trailing objectness and
+    /// class planes with logits clamped to [-30, 30].
+    fn modern_yolo_forward_f32(
+        &self,
+        x: &Self::Tensor,
+        shape: &[usize],
+        classes: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let input = self.download_f32(x)?;
+        let channels = shape[1];
+        let spatial = shape[2] * shape[3];
+        let class_begin = channels.saturating_sub(classes + 1);
+        let mut output = input;
+        for b in 0..shape[0] {
+            let base = b * channels * spatial;
+            for c in 0..channels {
+                for p in 0..spatial {
+                    let index = base + c * spatial + p;
+                    let mut value = output[index];
+                    if !value.is_finite() {
+                        value = 0.0;
+                    }
+                    if c >= class_begin {
+                        value = 1.0 / (1.0 + (-value.clamp(-30.0, 30.0)).exp());
+                    }
+                    output[index] = value;
+                }
+            }
+        }
+        self.upload_f32(shape, &output)
+    }
+    /// Segmentation activation: binary sigmoid or per-pixel NCHW softmax.
+    fn segmentation_forward_f32(
+        &self,
+        x: &Self::Tensor,
+        shape: &[usize],
+        classes: usize,
+        temperature: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let input = self.download_f32(x)?;
+        let (batch, channels, spatial) = (shape[0], shape[1], shape[2] * shape[3]);
+        let mut output = vec![0.0; input.len()];
+        let temp = temperature.max(1.0e-6);
+        for b in 0..batch {
+            let base = b * channels * spatial;
+            for p in 0..spatial {
+                if classes == 1 {
+                    let v = input[base + p];
+                    let v = if v.is_finite() { v } else { 0.0 };
+                    output[base + p] = 1.0 / (1.0 + (-v).exp());
+                } else {
+                    let mut max = f32::NEG_INFINITY;
+                    for c in 0..classes {
+                        let value = input[base + c * spatial + p] / temp;
+                        if value > max {
+                            max = value;
+                        }
+                    }
+                    let mut sum = 0.0;
+                    for c in 0..classes {
+                        let index = base + c * spatial + p;
+                        let value = (input[index] / temp - max).exp();
+                        output[index] = value;
+                        sum += value;
+                    }
+                    for c in 0..classes {
+                        output[base + c * spatial + p] /= sum;
+                    }
+                }
+            }
+        }
+        self.upload_f32(shape, &output)
+    }
+    /// Temperature-scaled grouped softmax for `[jev_ce]`, preserving either
+    /// group-major or channel-major storage within each batch sample.
+    fn jev_ce_forward_f32(
+        &self,
+        x: &Self::Tensor,
+        shape: &[usize],
+        groups: usize,
+        candidates: usize,
+        temperature: f32,
+        channel_major: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let input = self.download_f32(x)?;
+        let mut output = vec![0.0; input.len()];
+        let temp = temperature.max(1.0e-6);
+        for b in 0..shape[0] {
+            let base = b * groups * candidates;
+            for g in 0..groups {
+                let index = |i: usize| {
+                    if channel_major {
+                        base + i * groups + g
+                    } else {
+                        base + g * candidates + i
+                    }
+                };
+                let mut max = f32::NEG_INFINITY;
+                for i in 0..candidates {
+                    let value = input[index(i)];
+                    if value > max {
+                        max = value;
+                    }
+                }
+                let mut sum = 0.0f32;
+                for i in 0..candidates {
+                    let value = ((input[index(i)] - max) / temp).exp();
+                    output[index(i)] = value;
+                    sum += value;
+                }
+                for i in 0..candidates {
+                    output[index(i)] /= sum;
+                }
+            }
+        }
+        self.upload_f32(shape, &output)
+    }
+    /// LayaLoss inference forward: stable row softmax over each sample's K
+    /// option logits. Training losses and masks remain outside this operation.
+    fn laya_loss_forward_f32(
+        &self,
+        x: &Self::Tensor,
+        shape: &[usize],
+        max_options: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let input = self.download_f32(x)?;
+        let batch = shape[0];
+        let mut output = vec![0.0; input.len()];
+        for b in 0..batch {
+            let base = b * max_options;
+            let mut maximum = -1.0e300f64;
+            for i in 0..max_options {
+                maximum = maximum.max(input[base + i] as f64);
+            }
+            let mut exponentials = vec![0.0f64; max_options];
+            let mut sum = 0.0f64;
+            for i in 0..max_options {
+                exponentials[i] = (input[base + i] as f64 - maximum).exp();
+                sum += exponentials[i];
+            }
+            for i in 0..max_options {
+                output[base + i] = (exponentials[i] / sum) as f32;
+            }
+        }
+        self.upload_f32(shape, &output)
     }
     /// Region forward: transpose channel-major detector entries to spatial-
     /// major `[batch, spatial, anchor, entry]`, then activate objectness and
@@ -3386,14 +4037,9 @@ pub trait F32TensorOpsBackend {
         let _ = config;
         let dcls = self.download_f32(dcls)?;
         let head_grad = self.download_f32(head_grad)?;
-        let scattered = host_ops::laya_act::scatter_cls_adjoint(
-            &dcls,
-            &head_grad,
-            batch,
-            hidden,
-            tokens,
-        )
-        .unwrap_or_else(|err| panic!("{err}"));
+        let scattered =
+            host_ops::laya_act::scatter_cls_adjoint(&dcls, &head_grad, batch, hidden, tokens)
+                .unwrap_or_else(|err| panic!("{err}"));
         self.upload_f32(&[batch, hidden, 1, tokens], &scattered)
     }
 
@@ -3554,7 +4200,10 @@ pub trait F32TensorOpsBackend {
         let x = self.download_f32(input)?;
         let gamma = self.download_f32(gamma)?;
         let beta = self.download_f32(beta)?;
-        self.upload_f32(shape, &host_ops::foveation_film::affine(&x, &gamma, &beta, shape))
+        self.upload_f32(
+            shape,
+            &host_ops::foveation_film::affine(&x, &gamma, &beta, shape),
+        )
     }
     /// Full FiLM projection, returning `(output, embedding, gamma, beta)`.
     /// HF inputs are `[B,P]`, and the output is NCHW; all projection weights
@@ -3576,7 +4225,10 @@ pub trait F32TensorOpsBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
         let _ = config;
-        assert!(shape.len() == 4, "foveation_film_forward_f32: shape must be NCHW");
+        assert!(
+            shape.len() == 4,
+            "foveation_film_forward_f32: shape must be NCHW"
+        );
         let (batch, channels, height, width) = (shape[0], shape[1], shape[2], shape[3]);
         let x = self.download_f32(input)?;
         let hf = self.download_f32(hf_params)?;
@@ -3587,8 +4239,20 @@ pub trait F32TensorOpsBackend {
         let wb = self.download_f32(w_beta)?;
         let bb = self.download_f32(b_beta)?;
         let (output, embedding, gamma, beta) = host_ops::foveation_film::forward(
-            &x, &hf, batch, channels, height, width, param_count, embed_dim,
-            &we, &be, &wg, &bg, &wb, &bb,
+            &x,
+            &hf,
+            batch,
+            channels,
+            height,
+            width,
+            param_count,
+            embed_dim,
+            &we,
+            &be,
+            &wg,
+            &bg,
+            &wb,
+            &bb,
         );
         Ok((
             self.upload_f32(shape, &output)?,
@@ -3615,7 +4279,10 @@ pub trait F32TensorOpsBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<FoveationFilmGradients<Self::Tensor>, Self::Error> {
         let _ = config;
-        assert!(shape.len() == 4, "foveation_film_backward_f32: shape must be NCHW");
+        assert!(
+            shape.len() == 4,
+            "foveation_film_backward_f32: shape must be NCHW"
+        );
         let (batch, channels, height, width) = (shape[0], shape[1], shape[2], shape[3]);
         let x = self.download_f32(input)?;
         let dy = self.download_f32(output_gradient)?;
@@ -3626,8 +4293,20 @@ pub trait F32TensorOpsBackend {
         let wg = self.download_f32(w_gamma)?;
         let wb = self.download_f32(w_beta)?;
         let grads = host_ops::foveation_film::backward(
-            &x, &dy, &hf, &embed, &g, batch, channels, height, width,
-            param_count, embed_dim, &we, &wg, &wb,
+            &x,
+            &dy,
+            &hf,
+            &embed,
+            &g,
+            batch,
+            channels,
+            height,
+            width,
+            param_count,
+            embed_dim,
+            &we,
+            &wg,
+            &wb,
         );
         Ok(FoveationFilmGradients {
             input: self.upload_f32(shape, &grads.input)?,

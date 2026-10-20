@@ -35,7 +35,8 @@ use super::unroll::unroll;
 use cuda_device::convert::cvt_f16x2_f32;
 use cuda_device::shared::cvta_generic_to_shared_u32;
 use cuda_device::wmma::{
-    ldmatrix_x4_shared_u32, ldmatrix_x4_trans_shared_u32, mma_m16n8k16_f32_bf16, mma_m16n8k16_f32_f16,
+    ldmatrix_x4_shared_u32, ldmatrix_x4_trans_shared_u32, mma_m16n8k16_f32_bf16,
+    mma_m16n8k16_f32_f16,
 };
 use cuda_device::{DisjointSlice, SharedArray, cuda_module, kernel, thread};
 
@@ -117,8 +118,10 @@ pub mod kernels {
         let b_off = b_base + (inst % b_mod) * b_stride;
         let c_off = c_base + (inst_all % c_mod) * c_stride;
 
-        let vec_a = (if trans_a == 0 { k % 8 == 0 } else { m % 8 == 0 }) && lda % 8 == 0 && a_off % 8 == 0;
-        let vec_b = (if trans_b == 0 { n % 8 == 0 } else { k % 8 == 0 }) && ldb % 8 == 0 && b_off % 8 == 0;
+        let vec_a =
+            (if trans_a == 0 { k % 8 == 0 } else { m % 8 == 0 }) && lda % 8 == 0 && a_off % 8 == 0;
+        let vec_b =
+            (if trans_b == 0 { n % 8 == 0 } else { k % 8 == 0 }) && ldb % 8 == 0 && b_off % 8 == 0;
 
         let idx8 = lane / 8;
         let r8 = lane % 8;
@@ -197,16 +200,28 @@ pub mod kernels {
                     let mut r = 0usize;
                     while r < 16 {
                         let e = tid + 128 * r;
-                        let (ml, kl) = if trans_a == 0 { (e / 32, e % 32) } else { (e % 64, e / 64) };
+                        let (ml, kl) = if trans_a == 0 {
+                            (e / 32, e % 32)
+                        } else {
+                            (e % 64, e / 64)
+                        };
                         let gm = row0 + ml;
                         let gk = k0 + kl;
                         let ok = gm < m && gk < kend;
                         let v = if ok {
-                            if trans_a == 0 { a[a_off + gm * lda + gk] } else { a[a_off + gk * lda + gm] }
+                            if trans_a == 0 {
+                                a[a_off + gm * lda + gk]
+                            } else {
+                                a[a_off + gk * lda + gm]
+                            }
                         } else {
                             0u16
                         };
-                        let sidx = if trans_a == 0 { ml * 40 + kl } else { kl * 72 + ml };
+                        let sidx = if trans_a == 0 {
+                            ml * 40 + kl
+                        } else {
+                            kl * 72 + ml
+                        };
                         // SAFETY: in-bounds shared slot (< 2560 per stage).
                         unsafe {
                             *ash.add(stage * 2560 + sidx) = v;
@@ -218,16 +233,28 @@ pub mod kernels {
                     let mut r = 0usize;
                     while r < 16 {
                         let e = tid + 128 * r;
-                        let (kl, nl) = if trans_b == 0 { (e / 64, e % 64) } else { (e % 32, e / 32) };
+                        let (kl, nl) = if trans_b == 0 {
+                            (e / 64, e % 64)
+                        } else {
+                            (e % 32, e / 32)
+                        };
                         let gk = k0 + kl;
                         let gn = col0 + nl;
                         let ok = gn < n && gk < kend;
                         let v = if ok {
-                            if trans_b == 0 { b[b_off + gk * ldb + gn] } else { b[b_off + gn * ldb + gk] }
+                            if trans_b == 0 {
+                                b[b_off + gk * ldb + gn]
+                            } else {
+                                b[b_off + gn * ldb + gk]
+                            }
                         } else {
                             0u16
                         };
-                        let sidx = if trans_b == 0 { kl * 72 + nl } else { nl * 40 + kl };
+                        let sidx = if trans_b == 0 {
+                            kl * 72 + nl
+                        } else {
+                            nl * 40 + kl
+                        };
                         unsafe {
                             *bsh.add(stage * 2560 + sidx) = v;
                         }
@@ -244,50 +271,64 @@ pub mod kernels {
 
             macro_rules! compute_tile {
                 ($mma:ident) => {
-            if it > 0 {
-                let so = ((it - 1) & 1) * 2560;
-                unroll!(2, kk, {
-                    let ks = kk * 16;
-                    let mut bf = [[0u32; 2]; 4];
-                    unroll!(2, nj, {
-                        let regs = if trans_b == 0 {
-                            let kr = ks + (idx8 & 1) * 8 + r8;
-                            let nc = wn + nj * 16 + (idx8 >> 1) * 8;
-                            // SAFETY: all lanes participate; addresses are
-                            // 16-byte aligned rows inside the stage.
-                            unsafe { ldmatrix_x4_trans_shared_u32(sb + 2 * (so + kr * 72 + nc) as u32) }
-                        } else {
-                            let nr = wn + nj * 16 + (idx8 >> 1) * 8 + r8;
-                            let kc = ks + (idx8 & 1) * 8;
-                            unsafe { ldmatrix_x4_shared_u32(sb + 2 * (so + nr * 40 + kc) as u32) }
-                        };
-                        bf[nj * 2] = [regs[0], regs[1]];
-                        bf[nj * 2 + 1] = [regs[2], regs[3]];
-                    });
-                    unroll!(2, mi, {
-                        let af = if trans_a == 0 {
-                            let row = wm + mi * 16 + (lane % 16);
-                            let col = ks + (lane / 16) * 8;
-                            unsafe { ldmatrix_x4_shared_u32(sa + 2 * (so + row * 40 + col) as u32) }
-                        } else {
-                            let kr = ks + (idx8 >> 1) * 8 + r8;
-                            let mc = wm + mi * 16 + (idx8 & 1) * 8;
-                            unsafe { ldmatrix_x4_trans_shared_u32(sa + 2 * (so + kr * 72 + mc) as u32) }
-                        };
-                        unroll!(4, ni, {
-                            let o = (mi * 4 + ni) * 4;
-                            let cin = [acc[o], acc[o + 1], acc[o + 2], acc[o + 3]];
-                            // SAFETY: all 32 lanes reach this call together;
-                            // fragments follow the documented m16n8k16 layout.
-                            let d = unsafe { $mma(cin, af, bf[ni]) };
-                            acc[o] = d[0];
-                            acc[o + 1] = d[1];
-                            acc[o + 2] = d[2];
-                            acc[o + 3] = d[3];
+                    if it > 0 {
+                        let so = ((it - 1) & 1) * 2560;
+                        unroll!(2, kk, {
+                            let ks = kk * 16;
+                            let mut bf = [[0u32; 2]; 4];
+                            unroll!(2, nj, {
+                                let regs = if trans_b == 0 {
+                                    let kr = ks + (idx8 & 1) * 8 + r8;
+                                    let nc = wn + nj * 16 + (idx8 >> 1) * 8;
+                                    // SAFETY: all lanes participate; addresses are
+                                    // 16-byte aligned rows inside the stage.
+                                    unsafe {
+                                        ldmatrix_x4_trans_shared_u32(
+                                            sb + 2 * (so + kr * 72 + nc) as u32,
+                                        )
+                                    }
+                                } else {
+                                    let nr = wn + nj * 16 + (idx8 >> 1) * 8 + r8;
+                                    let kc = ks + (idx8 & 1) * 8;
+                                    unsafe {
+                                        ldmatrix_x4_shared_u32(sb + 2 * (so + nr * 40 + kc) as u32)
+                                    }
+                                };
+                                bf[nj * 2] = [regs[0], regs[1]];
+                                bf[nj * 2 + 1] = [regs[2], regs[3]];
+                            });
+                            unroll!(2, mi, {
+                                let af = if trans_a == 0 {
+                                    let row = wm + mi * 16 + (lane % 16);
+                                    let col = ks + (lane / 16) * 8;
+                                    unsafe {
+                                        ldmatrix_x4_shared_u32(
+                                            sa + 2 * (so + row * 40 + col) as u32,
+                                        )
+                                    }
+                                } else {
+                                    let kr = ks + (idx8 >> 1) * 8 + r8;
+                                    let mc = wm + mi * 16 + (idx8 & 1) * 8;
+                                    unsafe {
+                                        ldmatrix_x4_trans_shared_u32(
+                                            sa + 2 * (so + kr * 72 + mc) as u32,
+                                        )
+                                    }
+                                };
+                                unroll!(4, ni, {
+                                    let o = (mi * 4 + ni) * 4;
+                                    let cin = [acc[o], acc[o + 1], acc[o + 2], acc[o + 3]];
+                                    // SAFETY: all 32 lanes reach this call together;
+                                    // fragments follow the documented m16n8k16 layout.
+                                    let d = unsafe { $mma(cin, af, bf[ni]) };
+                                    acc[o] = d[0];
+                                    acc[o + 1] = d[1];
+                                    acc[o + 2] = d[2];
+                                    acc[o + 3] = d[3];
+                                });
+                            });
                         });
-                    });
-                });
-            }
+                    }
                 };
             }
             if bf16 == 0 {
@@ -318,7 +359,8 @@ pub mod kernels {
                         }
                     } else if gm < m && gn < n_store {
                         let idx = c_off + gm * ldc + gn;
-                        let v = alpha * acc[(mi * 4 + ni) * 4 + j] + bias[(inst % bias_mod) * bias_stride + gm];
+                        let v = alpha * acc[(mi * 4 + ni) * 4 + j]
+                            + bias[(inst % bias_mod) * bias_stride + gm];
                         let y = crate::kernels::activations::activate(act, v);
                         // SAFETY: as above, for the f16 output.
                         unsafe {

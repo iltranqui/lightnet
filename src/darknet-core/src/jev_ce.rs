@@ -147,6 +147,79 @@ mod tests {
     }
 
     #[test]
+    fn jev_ce_axis_layout_pins_cpp_batch_group_candidate_and_layout_order() {
+        // C++ uses `at(base,g,i)` to select group/candidate slots in either
+        // row-major or channel-major order (`jev_ce_layer.cpp:177-183`), while
+        // each sample owns an independent `groups*candidates` span.
+        let (batch, groups, candidates) = (2usize, 2usize, 3usize);
+        for channel_major in [false, true] {
+            let mut s = spec(groups, candidates);
+            s.temperature = 0.7;
+            s.channel_major = channel_major;
+            let at = |base: usize, group: usize, candidate: usize| {
+                if channel_major {
+                    base + candidate * groups + group
+                } else {
+                    base + group * candidates + candidate
+                }
+            };
+            let mut logits = vec![0.0f32; batch * groups * candidates];
+            let mut truth = vec![0.0f32; logits.len()];
+            for b in 0..batch {
+                let base = b * groups * candidates;
+                for g in 0..groups {
+                    for i in 0..candidates {
+                        logits[at(base, g, i)] = 0.17 * b as f32 + 0.41 * g as f32
+                            - 0.23 * i as f32
+                            + 0.07 * (i * g) as f32;
+                    }
+                }
+            }
+            truth[at(0, 0, 2)] = 1.0; // sample 0, group 0 -> candidate 2
+            // sample 0, group 1 is deliberately empty/masked
+            truth[at(6, 0, 1)] = 1.0; // sample 1, group 0 -> candidate 1
+            truth[at(6, 1, 0)] = 1.0; // sample 1, group 1 -> candidate 0
+
+            let probabilities = jev_ce_probs(&logits, &s, batch);
+            let loss = jev_ce_loss(&logits, &truth, &s, batch);
+            assert_eq!(loss.active_groups, 3);
+            for b in 0..batch {
+                let active_groups = if b == 0 { 1.0 } else { 2.0 };
+                let base = b * groups * candidates;
+                for g in 0..groups {
+                    let max = (0..candidates)
+                        .map(|i| logits[at(base, g, i)])
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let exp = (0..candidates)
+                        .map(|i| ((logits[at(base, g, i)] - max) / s.temperature).exp())
+                        .collect::<Vec<_>>();
+                    let sum = exp.iter().sum::<f32>();
+                    for i in 0..candidates {
+                        let index = at(base, g, i);
+                        let want_p = exp[i] / sum;
+                        assert!(
+                            (probabilities[index] - want_p).abs() < 1.0e-6,
+                            "probability at sample={b}, group={g}, candidate={i}: {} != {want_p}",
+                            probabilities[index]
+                        );
+                        let target = truth[index];
+                        let want_delta = if target == 0.0 && b == 0 && g == 1 {
+                            0.0
+                        } else {
+                            (target - want_p) / s.temperature / active_groups
+                        };
+                        assert!(
+                            (loss.delta[index] - want_delta).abs() < 1.0e-6,
+                            "delta at sample={b}, group={g}, candidate={i}: {} != {want_delta}",
+                            loss.delta[index]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn uniform_logits_give_ln3_loss_and_descent_delta() {
         let s = spec(1, 3);
         let l = jev_ce_loss(&[0.0, 0.0, 0.0], &[1.0, 0.0, 0.0], &s, 1);

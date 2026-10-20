@@ -856,6 +856,97 @@ mod tests {
     }
 
     #[test]
+    fn graph_conv_axis_layout_pins_cpp_batch_group_neighbor_raster_and_nchw() {
+        use crate::axis_fixture::{axis_tensor, nchw_index, probe_shape};
+
+        // C++ `graph_neighbor_coord` maps k to (ky=k/size,kx=k%size), and
+        // learned-edge rows are indexed [group][neighbor_k] before the
+        // valid-neighbor softmax (`graph_conv_layer.cpp:64-80,215-224,742-808).
+        let input_shape = probe_shape(); // B=2,C=2,H=2,W=3
+        let input = Tensor::from_data(input_shape, axis_tensor(input_shape)).unwrap();
+        let filters = 2;
+        let groups = 2;
+        let size = 3;
+        let kernel_area = size * size;
+        let output_shape = TensorShape::new(
+            input_shape.width,
+            input_shape.height,
+            filters,
+            input_shape.batch,
+        );
+        let config = spec(2, filters, groups, size, 1, 1, false);
+        let projection_weights = [1.5, -0.75];
+        let edge_kernel = vec![0.0; groups * kernel_area * 2];
+        let mut edge_biases = vec![0.0; groups * kernel_area];
+        for group in 0..groups {
+            for k in 0..kernel_area {
+                let raster_value = if group == 0 { k } else { kernel_area - 1 - k };
+                edge_biases[group * kernel_area + k] = raster_value as f32;
+            }
+        }
+
+        let output = graph_conv_forward(
+            &config,
+            &input,
+            output_shape,
+            &projection_weights,
+            None,
+            Some(&edge_kernel),
+            Some(&edge_biases),
+        )
+        .unwrap()
+        .raw_output;
+
+        for n in 0..input_shape.batch {
+            for group in 0..groups {
+                for oy in 0..output_shape.height {
+                    for ox in 0..output_shape.width {
+                        let mut valid = Vec::new();
+                        for k in 0..kernel_area {
+                            let ky = k / size;
+                            let kx = k % size;
+                            let iy = oy as isize - 1 + ky as isize;
+                            let ix = ox as isize - 1 + kx as isize;
+                            if iy >= 0
+                                && iy < input_shape.height as isize
+                                && ix >= 0
+                                && ix < input_shape.width as isize
+                            {
+                                valid.push((k, iy as usize, ix as usize));
+                            }
+                        }
+                        let max_logit = valid
+                            .iter()
+                            .map(|(k, _, _)| edge_biases[group * kernel_area + k])
+                            .fold(f32::NEG_INFINITY, f32::max);
+                        let denominator = valid
+                            .iter()
+                            .map(|(k, _, _)| {
+                                (edge_biases[group * kernel_area + k] - max_logit).exp()
+                            })
+                            .sum::<f32>();
+                        let mut aggregate = 0.0;
+                        for (k, iy, ix) in valid {
+                            let alpha = (edge_biases[group * kernel_area + k] - max_logit).exp()
+                                / denominator;
+                            aggregate +=
+                                alpha * input.data[nchw_index(input_shape, n, group, iy, ix)];
+                        }
+                        let expected = projection_weights[group] * aggregate;
+                        let output_index = nchw_index(output_shape, n, group, oy, ox);
+                        let actual = output.data[output_index];
+                        assert!(
+                            (actual - expected).abs()
+                                <= 2.0e-5 * (1.0 + actual.abs().max(expected.abs())),
+                            "C++ graph_conv axis/order mismatch at (n,group,y,x)=({n},{group},{oy},{ox}): got {actual}, expected {expected}; k raster and NCHW batch/group axes are independently varied"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn grouped_projection_keeps_nchw_channels_inside_each_group() {
         let spec = spec(4, 4, 2, 1, 0, 0, false);
         let input = Tensor::from_data(

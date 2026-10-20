@@ -257,9 +257,8 @@ pub mod kernels {
         let c = (i / channel_stride) % channels;
         let inv_std = 1.0 / (variance[c] + EPSILON).sqrt();
         if let Some(o) = dx.get_mut(idx) {
-            *o = f2h(
-                scale[c] * inv_std / n * (n * h2f(dy[i]) - sum_dy[c] - h2f(x_hat[i]) * sum_dy_xhat[c]),
-            );
+            *o = f2h(scale[c] * inv_std / n
+                * (n * h2f(dy[i]) - sum_dy[c] - h2f(x_hat[i]) * sum_dy_xhat[c]));
         }
     }
 
@@ -310,7 +309,8 @@ pub mod kernels {
                         if nx >= 0 && (nx as usize) % stride_x == 0 {
                             let ox = nx as usize / stride_x;
                             if ox < out_w {
-                                sum += col[col_base + (c * kk + ky * ksize + kx) * ohw + oy * out_w + ox];
+                                sum += col
+                                    [col_base + (c * kk + ky * ksize + kx) * ohw + oy * out_w + ox];
                             }
                         }
                         kx += 1;
@@ -366,7 +366,16 @@ pub mod kernels {
             let mut ox = ox_lo;
             while ox <= ox_hi {
                 let best = window_argmax_h(
-                    x, bc * plane, h, w, oy as usize, ox as usize, size, stride_x, stride_y, off,
+                    x,
+                    bc * plane,
+                    h,
+                    w,
+                    oy as usize,
+                    ox as usize,
+                    size,
+                    stride_x,
+                    stride_y,
+                    off,
                 );
                 if best == i {
                     sum += h2f(dy[(bc * out_h + oy as usize) * out_w + ox as usize]);

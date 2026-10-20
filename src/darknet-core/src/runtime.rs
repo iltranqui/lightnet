@@ -36,8 +36,7 @@ use crate::model::{
 };
 use crate::muon::MuonMatrixState;
 use crate::muon_runtime::{
-    MuonLayerState, apply_staged_layer, matrix_shapes, stage_layer,
-    stage_layer_with_orthogonalizer,
+    MuonLayerState, apply_staged_layer, matrix_shapes, stage_layer, stage_layer_with_orthogonalizer,
 };
 use crate::weights::WeightsHeader;
 use darknet_cuda::{
@@ -84,10 +83,10 @@ impl GradMode {
 mod dcnv4_gpu;
 #[path = "runtime/laya_act_gpu.rs"]
 mod laya_act_gpu;
+mod laya_encoder_gpu;
 #[path = "runtime/laya_head_gpu.rs"]
 mod laya_head_gpu;
 mod laya_scorer_gpu;
-mod laya_encoder_gpu;
 
 /// Whether the network contains a `[deform_conv]` variant the device path does
 /// not cover yet. Shared by the forward and the backward so they cannot choose
@@ -95,7 +94,7 @@ mod laya_encoder_gpu;
 fn has_host_only_deform(network: &Network) -> bool {
     network.layers.iter().any(|layer| {
         matches!(&layer.kind, LayerKind::DeformConv(spec)
-            if spec.dilation != 1 || spec.batch_normalize)
+            if spec.batch_normalize)
     })
 }
 
@@ -108,7 +107,6 @@ fn graph_conv_spec_needs_host(spec: &GraphConvSpec) -> bool {
             && spec.activation.to_cuda_f32_kind().is_none())
 }
 
-
 fn graph_conv_spec_needs_compact_host(spec: &GraphConvSpec) -> bool {
     !matches!(spec.edge_mode, 0 | 1)
         || (spec.activation.to_channel_normalization().is_none()
@@ -119,6 +117,24 @@ fn has_host_only_graph_conv(network: &Network) -> bool {
     network.layers.iter().any(|layer| {
         matches!(&layer.kind, LayerKind::GraphConv(spec) if graph_conv_spec_needs_host(spec))
     })
+}
+
+fn reject_gpu_stage1_cpu_layers(network: &Network, operation: &str) -> Result<()> {
+    if let Some(layer) = network.layers.iter().find(|layer| {
+        matches!(
+            layer.kind,
+            LayerKind::DepthAnything(_) | LayerKind::DptHead(_) | LayerKind::Yolo3d(_)
+        )
+    }) {
+        return Err(Error::UnsupportedLayer {
+            layer_index: layer.index,
+            name: format!(
+                "[{}] GPU {operation} is not implemented in Stage-1 CPU support",
+                layer.kind.name()
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn reject_gpu_hyperbolic_foveation(network: &Network, operation: &str) -> Result<()> {
@@ -8858,12 +8874,14 @@ where
                 }
                 (LayerKind::Sam(spec), LayerParams::None) => {
                     let source_index = resolve_relative_layer(layer.index, spec.from)?;
-                    let source_layer = self.network.layers.get(source_index).ok_or(
-                        Error::InvalidRoute {
-                            layer_index: layer.index,
-                            reference: spec.from,
-                        },
-                    )?;
+                    let source_layer =
+                        self.network
+                            .layers
+                            .get(source_index)
+                            .ok_or(Error::InvalidRoute {
+                                layer_index: layer.index,
+                                reference: spec.from,
+                            })?;
                     let source = gpu_layer_outputs
                         .get(source_index)
                         .and_then(Option::as_ref)
@@ -8880,14 +8898,15 @@ where
                         )));
                     }
                     let activation = gpu_activation_kind(layer.index, &spec.activation)?;
-                    self.backend.sam_f16(
-                        current_input.expect("sam requires current input"),
-                        source,
-                        &tensor_backend_shape(layer.output_shape),
-                        activation,
-                        launch_config,
-                    )
-                    .map_err(|err| backend_error("f16 sam", err))?
+                    self.backend
+                        .sam_f16(
+                            current_input.expect("sam requires current input"),
+                            source,
+                            &tensor_backend_shape(layer.output_shape),
+                            activation,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("f16 sam", err))?
                 }
                 (LayerKind::ScaleChannels(spec), LayerParams::None) => {
                     let source_index = resolve_relative_layer(layer.index, spec.from)?;
@@ -8943,8 +8962,8 @@ where
                     )
                     .map_err(|err| backend_error("f16 softmax", err))?,
                 (LayerKind::JevCe(spec), LayerParams::None) => {
-                    let per_sample = layer.input_shape.element_count()
-                        / layer.input_shape.batch.max(1);
+                    let per_sample =
+                        layer.input_shape.element_count() / layer.input_shape.batch.max(1);
                     let scale = self
                         .backend
                         .upload_f32(&[1], &[1.0 / spec.temperature.max(1.0e-6)])
@@ -9131,24 +9150,30 @@ where
                     let head_index = resolve_relative_layer(layer.index, spec.layers[0])?;
                     let scorer_index = resolve_relative_layer(layer.index, spec.layers[1])?;
                     let marker_index = resolve_relative_layer(layer.index, spec.layers[2])?;
-                    let head_layer = self.network.layers.get(head_index).ok_or(
-                        Error::InvalidRoute {
-                            layer_index: layer.index,
-                            reference: spec.layers[0],
-                        },
-                    )?;
-                    let scorer_layer = self.network.layers.get(scorer_index).ok_or(
-                        Error::InvalidRoute {
-                            layer_index: layer.index,
-                            reference: spec.layers[1],
-                        },
-                    )?;
-                    let marker_layer = self.network.layers.get(marker_index).ok_or(
-                        Error::InvalidRoute {
-                            layer_index: layer.index,
-                            reference: spec.layers[2],
-                        },
-                    )?;
+                    let head_layer =
+                        self.network
+                            .layers
+                            .get(head_index)
+                            .ok_or(Error::InvalidRoute {
+                                layer_index: layer.index,
+                                reference: spec.layers[0],
+                            })?;
+                    let scorer_layer =
+                        self.network
+                            .layers
+                            .get(scorer_index)
+                            .ok_or(Error::InvalidRoute {
+                                layer_index: layer.index,
+                                reference: spec.layers[1],
+                            })?;
+                    let marker_layer =
+                        self.network
+                            .layers
+                            .get(marker_index)
+                            .ok_or(Error::InvalidRoute {
+                                layer_index: layer.index,
+                                reference: spec.layers[2],
+                            })?;
                     let head_source = gpu_layer_outputs
                         .get(head_index)
                         .and_then(Option::as_ref)
@@ -9345,9 +9370,7 @@ where
     /// (for example native convolution buffers) are intentionally not included.
     /// The borrow reflects buffers after host fallback work and any explicit
     /// device-to-host gradient flushes.
-    pub fn host_fallback_train_buffers(
-        &self,
-    ) -> std::cell::Ref<'_, [LayerTrainBuffers]> {
+    pub fn host_fallback_train_buffers(&self) -> std::cell::Ref<'_, [LayerTrainBuffers]> {
         std::cell::Ref::map(self.cpu_fallback_train_buffers.borrow(), |buffers| {
             buffers.as_slice()
         })
@@ -9655,21 +9678,20 @@ where
                 continue;
             };
             let host_state = host_states[index].get_or_insert_with(HostAdamLayerState::default);
-            let download_pair = |pair: &Option<GpuMoments<B::Tensor>>|
-                -> Result<Option<(Vec<f32>, Vec<f32>)>>
-            {
-                let Some((m, v)) = pair else {
-                    return Ok(None);
+            let download_pair =
+                |pair: &Option<GpuMoments<B::Tensor>>| -> Result<Option<(Vec<f32>, Vec<f32>)>> {
+                    let Some((m, v)) = pair else {
+                        return Ok(None);
+                    };
+                    Ok(Some((
+                        self.backend.download_f32(m).map_err(|err| {
+                            backend_error("download DCNv4 Adam first moment for sidecar", err)
+                        })?,
+                        self.backend.download_f32(v).map_err(|err| {
+                            backend_error("download DCNv4 Adam second moment for sidecar", err)
+                        })?,
+                    )))
                 };
-                Ok(Some((
-                    self.backend.download_f32(m).map_err(|err| {
-                        backend_error("download DCNv4 Adam first moment for sidecar", err)
-                    })?,
-                    self.backend.download_f32(v).map_err(|err| {
-                        backend_error("download DCNv4 Adam second moment for sidecar", err)
-                    })?,
-                )))
-            };
             host_state.weights = download_pair(&device_state.offset_weights)?;
             host_adam_child(host_state, 0).biases = download_pair(&device_state.offset_biases)?;
             host_state.biases = download_pair(&device_state.biases)?;
@@ -10375,18 +10397,20 @@ where
                     let offset_weight_updates = self
                         .backend
                         .zeros_f32(&offset_weight_shape)
-                        .map_err(|err| backend_error("allocate DCNv4 GPU offset weight updates", err))?;
-                    let offset_bias_updates = self
-                        .backend
-                        .zeros_f32(&offset_bias_shape)
-                        .map_err(|err| backend_error("allocate DCNv4 GPU offset bias updates", err))?;
+                        .map_err(|err| {
+                            backend_error("allocate DCNv4 GPU offset weight updates", err)
+                        })?;
+                    let offset_bias_updates =
+                        self.backend.zeros_f32(&offset_bias_shape).map_err(|err| {
+                            backend_error("allocate DCNv4 GPU offset bias updates", err)
+                        })?;
                     let scale_updates = params
                         .batch_norm
                         .as_ref()
                         .map(|_| {
-                            self.backend
-                                .zeros_f32(&bias_shape)
-                                .map_err(|err| backend_error("allocate DCNv4 GPU scale updates", err))
+                            self.backend.zeros_f32(&bias_shape).map_err(|err| {
+                                backend_error("allocate DCNv4 GPU scale updates", err)
+                            })
                         })
                         .transpose()?;
                     let momentum_bias = self
@@ -10396,18 +10420,20 @@ where
                     let momentum_offset_weights = self
                         .backend
                         .zeros_f32(&offset_weight_shape)
-                        .map_err(|err| backend_error("allocate DCNv4 GPU offset weight momentum", err))?;
-                    let momentum_offset_biases = self
-                        .backend
-                        .zeros_f32(&offset_bias_shape)
-                        .map_err(|err| backend_error("allocate DCNv4 GPU offset bias momentum", err))?;
+                        .map_err(|err| {
+                            backend_error("allocate DCNv4 GPU offset weight momentum", err)
+                        })?;
+                    let momentum_offset_biases =
+                        self.backend.zeros_f32(&offset_bias_shape).map_err(|err| {
+                            backend_error("allocate DCNv4 GPU offset bias momentum", err)
+                        })?;
                     let momentum_scale = params
                         .batch_norm
                         .as_ref()
                         .map(|_| {
-                            self.backend
-                                .zeros_f32(&bias_shape)
-                                .map_err(|err| backend_error("allocate DCNv4 GPU scale momentum", err))
+                            self.backend.zeros_f32(&bias_shape).map_err(|err| {
+                                backend_error("allocate DCNv4 GPU scale momentum", err)
+                            })
                         })
                         .transpose()?;
                     Some(GpuDcnv4TrainBuffers {
@@ -10652,12 +10678,7 @@ where
         Ok(())
     }
 
-    fn update_weights_gpu_muon(
-        &mut self,
-        lr: f32,
-        decay: f32,
-        batch: usize,
-    ) -> Result<()> {
+    fn update_weights_gpu_muon(&mut self, lr: f32, decay: f32, batch: usize) -> Result<()> {
         let net = self.network.net.clone();
         if !net.muon || net.adam || !net.decoupled_decay {
             return Err(Error::InvalidConfig(
@@ -10683,21 +10704,23 @@ where
                 (LayerKind::EmlConvolutional(spec), LayerParams::EmlConvolutional(_)) => {
                     spec.branch.batch_normalize
                 }
-                (LayerKind::Moe(spec), LayerParams::Moe(_)) => {
-                    spec.expert.batch_normalize
-                }
+                (LayerKind::Moe(spec), LayerParams::Moe(_)) => spec.expert.batch_normalize,
                 (LayerKind::Dcnv4(spec), LayerParams::Dcnv4(_)) => spec.batch_normalize,
-                (LayerKind::DeformConv(spec), LayerParams::DeformConv(_)) => {
-                    spec.batch_normalize
-                }
+                (LayerKind::DeformConv(spec), LayerParams::DeformConv(_)) => spec.batch_normalize,
                 _ => !matches!(
                     (kind, *params),
                     (_, LayerParams::None)
                         | (LayerKind::BatchNorm(_), LayerParams::BatchNorm(_))
                         | (LayerKind::Connected(_), LayerParams::Connected(_))
-                        | (LayerKind::HyperbolicFoveation(_), LayerParams::HyperbolicFoveation(_))
+                        | (
+                            LayerKind::HyperbolicFoveation(_),
+                            LayerParams::HyperbolicFoveation(_)
+                        )
                         | (LayerKind::FoveationFilm(_), LayerParams::FoveationFilm(_))
-                        | (LayerKind::EmlConvolutional(_), LayerParams::EmlConvolutional(_))
+                        | (
+                            LayerKind::EmlConvolutional(_),
+                            LayerParams::EmlConvolutional(_)
+                        )
                         | (LayerKind::Moe(_), LayerParams::Moe(_))
                         | (LayerKind::Local(_), LayerParams::Local(_))
                         | (LayerKind::Rnn(_), LayerParams::Rnn(_))
@@ -10705,27 +10728,29 @@ where
                         | (LayerKind::Crnn(_), LayerParams::Crnn(_))
                         | (LayerKind::Vit(_), LayerParams::Vit(_))
                         | (LayerKind::Swin(_), LayerParams::Swin(_))
-                        | (LayerKind::TuckerAttention(_), LayerParams::TuckerAttention(_))
+                        | (
+                            LayerKind::TuckerAttention(_),
+                            LayerParams::TuckerAttention(_)
+                        )
                         | (LayerKind::MambaVision(_), LayerParams::MambaVision(_))
                         | (LayerKind::KimiKda(_), LayerParams::KimiKda(_))
                         | (LayerKind::GraphConv(_), LayerParams::GraphConv(_))
                         | (LayerKind::Dcnv4(_), LayerParams::Dcnv4(_))
                         | (LayerKind::DeformConv(_), LayerParams::DeformConv(_))
-                        | (
-                            LayerKind::Deconvolutional(_),
-                            LayerParams::Convolutional(_)
-                        )
+                        | (LayerKind::DsConv(_), LayerParams::DsConv(_))
+                        | (LayerKind::Deconvolutional(_), LayerParams::Convolutional(_))
                 ),
             }
         }) {
             return Err(Error::UnsupportedLayer {
                 layer_index: index,
-                name: "GPU Muon supports standard convolution, EML, MoE, DCNv4, and deform_conv matrices without BN via host-staged gradients, GraphConv matrices including BN through the existing CPU fallback, plus host-gradient local/RNN/LSTM/CRNN/Kimi/MambaVision/Tucker/Swin/ViT/deconvolutional/connected matrices and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
+                name: "GPU Muon supports standard convolution, EML, MoE, DCNv4, deform_conv, and single-template DSConv matrices without BN via host-staged gradients, GraphConv matrices including BN through the existing CPU fallback, plus host-gradient local/RNN/LSTM/CRNN/Kimi/MambaVision/Tucker/Swin/ViT/deconvolutional/connected matrices and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
             });
         }
-        let step = self.adam_step.checked_add(1).ok_or_else(|| {
-            Error::InvalidConfig("GPU Muon step counter overflowed".to_owned())
-        })?;
+        let step = self
+            .adam_step
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidConfig("GPU Muon step counter overflowed".to_owned()))?;
         let loss_scale = if net.loss_scale > 0.0 && net.loss_scale.is_finite() {
             net.loss_scale
         } else {
@@ -10843,16 +10868,24 @@ where
                     (
                         self.backend
                             .download_f32(&train.input.weight_updates)
-                            .map_err(|err| backend_error("download EML input Muon gradients", err))?,
+                            .map_err(|err| {
+                                backend_error("download EML input Muon gradients", err)
+                            })?,
                         self.backend
                             .download_f32(&train.input.bias_updates)
-                            .map_err(|err| backend_error("download EML input bias gradients", err))?,
+                            .map_err(|err| {
+                                backend_error("download EML input bias gradients", err)
+                            })?,
                         self.backend
                             .download_f32(&train.self_params.weight_updates)
-                            .map_err(|err| backend_error("download EML self Muon gradients", err))?,
+                            .map_err(|err| {
+                                backend_error("download EML self Muon gradients", err)
+                            })?,
                         self.backend
                             .download_f32(&train.self_params.bias_updates)
-                            .map_err(|err| backend_error("download EML self bias gradients", err))?,
+                            .map_err(|err| {
+                                backend_error("download EML self bias gradients", err)
+                            })?,
                     )
                 };
                 let LayerTrainBuffers::EmlConvolutional(train) = &mut buffers[index] else {
@@ -10905,10 +10938,14 @@ where
                     (
                         self.backend
                             .download_f32(&train.router_weight_updates)
-                            .map_err(|err| backend_error("download MoE router Muon gradients", err))?,
+                            .map_err(|err| {
+                                backend_error("download MoE router Muon gradients", err)
+                            })?,
                         self.backend
                             .download_f32(&train.router_bias_updates)
-                            .map_err(|err| backend_error("download MoE router bias gradients", err))?,
+                            .map_err(|err| {
+                                backend_error("download MoE router bias gradients", err)
+                            })?,
                         experts,
                     )
                 };
@@ -10924,8 +10961,7 @@ where
                         "MoE Muon host expert count mismatch at layer #{index}"
                     )));
                 }
-                for (expert, (weights, biases)) in
-                    train.experts.iter_mut().zip(device_gradients.2)
+                for (expert, (weights, biases)) in train.experts.iter_mut().zip(device_gradients.2)
                 {
                     expert.weight_updates = weights;
                     expert.bias_updates = biases;
@@ -10945,11 +10981,8 @@ where
                 LayerKind::Connected(spec),
                 LayerParams::Connected(params),
                 LayerTrainBuffers::Connected(train),
-            ) = (
-                &layer.kind,
-                &mut self.params[index],
-                &mut buffers[index],
-            ) {
+            ) = (&layer.kind, &mut self.params[index], &mut buffers[index])
+            {
                 let rows = spec.output;
                 let cols = layer.input_shape.element_count();
                 let shape = [rows, cols];
@@ -11103,15 +11136,15 @@ where
                     net.muon_momentum,
                     |lookahead, rows, cols| {
                         let shape = [rows, cols];
-                        let input = backend.upload_f32(&shape, lookahead).map_err(|err| {
-                            backend_error("GPU Muon lookahead upload", err)
-                        })?;
+                        let input = backend
+                            .upload_f32(&shape, lookahead)
+                            .map_err(|err| backend_error("GPU Muon lookahead upload", err))?;
                         let orthogonal = backend
                             .muon_orthogonalize_f32(&input, &shape, rows, cols)
                             .map_err(|err| backend_error("GPU Muon Newton-Schulz", err))?;
-                        backend.download_f32(&orthogonal).map_err(|err| {
-                            backend_error("GPU Muon direction download", err)
-                        })
+                        backend
+                            .download_f32(&orthogonal)
+                            .map_err(|err| backend_error("GPU Muon direction download", err))
                     },
                 )?
             };
@@ -11223,12 +11256,8 @@ where
                 (&layer.kind, &self.params[index])
                 && !spec.batch_normalize
             {
-                let refreshed = self.cached_convolution_upload(
-                    spec,
-                    layer.input_shape.channels,
-                    params,
-                    None,
-                )?;
+                let refreshed =
+                    self.cached_convolution_upload(spec, layer.input_shape.channels, params, None)?;
                 self.set_device_conv_params(index, 0, refreshed)?;
                 let mut device_buffers = self.device_train_buffers.borrow_mut();
                 let train = device_buffers[index].as_mut().ok_or_else(|| {
@@ -11265,17 +11294,7 @@ where
         batch: usize,
         sync_host_weights: bool,
     ) -> Result<()> {
-        if let Some(layer) = self.network.layers.iter().find(|layer| {
-            matches!(
-                layer.kind,
-                LayerKind::DepthAnything(_) | LayerKind::DptHead(_) | LayerKind::Yolo3d(_)
-            )
-        }) {
-            return Err(Error::UnsupportedLayer {
-                layer_index: layer.index,
-                name: "GPU optimizer updates are unsupported for this layer".to_owned(),
-            });
-        }
+        reject_gpu_stage1_cpu_layers(&self.network, "optimizer updates")?;
         if self.network.net.muon {
             if !sync_host_weights {
                 return Err(Error::InvalidConfig(
@@ -11283,17 +11302,6 @@ where
                 ));
             }
             return self.update_weights_gpu_muon(lr, decay, batch);
-        }
-        if let Some(layer) = self
-            .network
-            .layers
-            .iter()
-            .find(|layer| matches!(layer.kind, LayerKind::DsConv(_)))
-        {
-            return Err(Error::UnsupportedLayer {
-                layer_index: layer.index,
-                name: "[dsconv] GPU updates are not implemented in the Stage-1 CPU port".to_owned(),
-            });
         }
         if let Some(layer) = self
             .network
@@ -11363,11 +11371,12 @@ where
                         | LayerParams::EmlConvolutional(_)
                         | LayerParams::Dcnv4(_)
                         | LayerParams::DeformConv(_)
+                        | LayerParams::DsConv(_)
                         | LayerParams::GraphConv(_)
                 )
             }) {
                 return Err(Error::InvalidConfig(
-                    "adam=1 on the GPU path supports convolutional, connected, local, shortcut, deform_conv, DCNv4, MoE, standalone batchnorm, ViT, Swin, Tucker attention, MambaVision, Kimi KDA, GraphConv, GRU/RNN/LSTM/CRNN, and host-updated HF/FiLM layers"
+                    "adam=1 on the GPU path supports convolutional, connected, local, shortcut, deform_conv, DSConv, DCNv4, MoE, standalone batchnorm, ViT, Swin, Tucker attention, MambaVision, Kimi KDA, GraphConv, GRU/RNN/LSTM/CRNN, and host-updated HF/FiLM layers"
                         .to_string(),
                 ));
             }
@@ -11692,8 +11701,14 @@ where
             };
             let adam = &layer_adam;
             match (&mut self.params[index], &mut buffers[index]) {
-                (params @ LayerParams::HyperbolicFoveation(_), train @ LayerTrainBuffers::HyperbolicFoveation(_))
-                | (params @ LayerParams::FoveationFilm(_), train @ LayerTrainBuffers::FoveationFilm(_)) => {
+                (
+                    params @ LayerParams::HyperbolicFoveation(_),
+                    train @ LayerTrainBuffers::HyperbolicFoveation(_),
+                )
+                | (
+                    params @ LayerParams::FoveationFilm(_),
+                    train @ LayerTrainBuffers::FoveationFilm(_),
+                ) => {
                     let moments =
                         moments_all[index].get_or_insert_with(HostAdamLayerState::default);
                     apply_host_adam_layer(
@@ -11890,6 +11905,33 @@ where
                             ));
                         }
                     }
+                }
+                (LayerParams::DsConv(params), LayerTrainBuffers::DsConv(train)) => {
+                    let moments =
+                        moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    apply_host_adam_convolutional(
+                        &mut params.collapse,
+                        &mut train.collapse,
+                        moments,
+                        adam,
+                    )?;
+                    let offset_adam = AdamParams {
+                        lr: adam.lr * 0.01,
+                        ..*adam
+                    };
+                    let offset_state = host_adam_child(moments, 0);
+                    apply_host_adam(
+                        &mut params.offset_weights,
+                        &mut train.offset_weight_updates,
+                        &mut offset_state.weights,
+                        &offset_adam,
+                    )?;
+                    apply_host_adam_non_weight(
+                        &mut params.offset_biases,
+                        &mut train.offset_bias_updates,
+                        &mut offset_state.biases,
+                        &offset_adam,
+                    )?;
                 }
                 (LayerParams::Dcnv4(params), LayerTrainBuffers::Dcnv4(train)) => {
                     let moments =
@@ -12477,6 +12519,33 @@ where
                         _ => unreachable!("validated deform_conv mask bias buffers"),
                     }
                 }
+                (LayerParams::DsConv(params), LayerTrainBuffers::DsConv(train)) => {
+                    let layer_lr = lr * layer.train.learning_rate_scale;
+                    update_convolutional_params(
+                        &mut params.collapse,
+                        &mut train.collapse,
+                        layer_lr,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                    sgd_update(
+                        &mut params.offset_weights,
+                        &mut train.offset_weight_updates,
+                        layer_lr * 0.01,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                    sgd_update(
+                        &mut params.offset_biases,
+                        &mut train.offset_bias_updates,
+                        layer_lr * 0.01,
+                        momentum,
+                        0.0,
+                        batch,
+                    );
+                }
                 (LayerParams::Dcnv4(params), LayerTrainBuffers::Dcnv4(train)) => {
                     let layer_lr = lr * layer.train.learning_rate_scale;
                     sgd_update(
@@ -12925,25 +12994,15 @@ where
         training: bool,
         host_copies: bool,
     ) -> Result<GpuForwardState<B::Tensor>> {
-        if let Some(layer) = self.network.layers.iter().find(|layer| {
-            matches!(
-                layer.kind,
-                LayerKind::DepthAnything(_) | LayerKind::DptHead(_) | LayerKind::Yolo3d(_)
-            )
-        }) {
-            return Err(Error::UnsupportedLayer {
-                layer_index: layer.index,
-                name: "GPU execution is unsupported for this layer; use the CPU forward path".to_owned(),
-            });
-        }
+        reject_gpu_stage1_cpu_layers(&self.network, "execution")?;
         let has_batch_normalized_recurrent = self.network.layers.iter().any(|layer| {
             matches!(&layer.kind, LayerKind::Rnn(spec) if spec.batch_normalize)
                 || matches!(&layer.kind, LayerKind::Lstm(spec) if spec.batch_normalize)
                 || matches!(&layer.kind, LayerKind::Crnn(spec) if spec.batch_normalize)
         });
-        // Device `[deform_conv]` covers dilation 1 without batch norm; anything
-        // else keeps the host path, and the decision is global so the forward
-        // and the backward can never disagree about which path ran.
+        // Device `[deform_conv]` covers dilated and non-dilated non-BN paths;
+        // batch-normalized variants keep the host path. This global decision
+        // makes forward and backward choose the same cache producer.
         let host_only_deform = has_host_only_deform(&self.network);
         let has_hyperbolic_foveation = self
             .network
@@ -12966,17 +13025,6 @@ where
                 "input shape mismatch: expected {expected}, got {}",
                 input.shape
             )));
-        }
-        if let Some(layer) = self
-            .network
-            .layers
-            .iter()
-            .find(|layer| matches!(layer.kind, LayerKind::DsConv(_)))
-        {
-            return Err(Error::UnsupportedLayer {
-                layer_index: layer.index,
-                name: "[dsconv] GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path".to_owned(),
-            });
         }
         if let Some(layer) = self
             .network
@@ -13140,7 +13188,8 @@ where
                         } else {
                             current_input
                         };
-                        let predicted = self.backend
+                        let predicted = self
+                            .backend
                             .hyperbolic_foveation_predictor_f32(
                                 predictor_source,
                                 &tensor_backend_shape(spec.pred_input_shape),
@@ -13154,8 +13203,9 @@ where
                                 launch_config,
                             )
                             .map_err(|err| backend_error("native HF predictor forward", err))?;
-                        let predicted = self.backend.download_f32(&predicted)
-                            .map_err(|err| backend_error("download native HF predictor parameters", err))?;
+                        let predicted = self.backend.download_f32(&predicted).map_err(|err| {
+                            backend_error("download native HF predictor parameters", err)
+                        })?;
                         if predicted.len() != cache.params_per_batch.len() {
                             return Err(Error::InvalidConfig(format!(
                                 "native HF predictor produced {} parameters, expected {}",
@@ -13169,14 +13219,16 @@ where
                         }
                     }
                     let grid = if native_grid_supported {
-                        let params_per_batch = self.backend
+                        let params_per_batch = self
+                            .backend
                             .upload_f32(
                                 &[layer.output_shape.batch, spec.param_count()],
                                 &cache.params_per_batch,
                             )
                             .map_err(|err| backend_error("upload HF isotropic parameters", err))?;
                         match spec.inverse_method {
-                            crate::model::HfInverseMethod::FixedPoint => self.backend
+                            crate::model::HfInverseMethod::FixedPoint => self
+                                .backend
                                 .hyperbolic_fixed_point_grid_f32(
                                     &params_per_batch,
                                     layer.output_shape.batch,
@@ -13190,7 +13242,8 @@ where
                                     launch_config,
                                 )
                                 .map_err(|err| backend_error("native HF fixed-point grid", err))?,
-                            crate::model::HfInverseMethod::Newton => self.backend
+                            crate::model::HfInverseMethod::Newton => self
+                                .backend
                                 .hyperbolic_newton_grid_f32(
                                     &params_per_batch,
                                     layer.output_shape.batch,
@@ -13219,14 +13272,16 @@ where
                             .map_err(|err| backend_error("upload hyperbolic_foveation grid", err))?
                     };
                     if native_grid_supported {
-                        cache.grid = self.backend.download_f32(&grid)
-                            .map_err(|err| backend_error("download native HF grid for backward cache", err))?;
+                        cache.grid = self.backend.download_f32(&grid).map_err(|err| {
+                            backend_error("download native HF grid for backward cache", err)
+                        })?;
                     }
                     let warp_input = match spec.warp_source {
                         crate::model::HfWarpSource::Previous => current_input,
                         crate::model::HfWarpSource::NetworkInput => &input_gpu,
                     };
-                    let output = self.backend
+                    let output = self
+                        .backend
                         .hyperbolic_foveation_warp_f32(
                             warp_input,
                             &grid,
@@ -13249,28 +13304,38 @@ where
                         })?;
                     let batch = layer.input_shape.batch;
                     let channels = layer.input_shape.channels;
-                    let hf_params = self.backend
+                    let hf_params = self
+                        .backend
                         .upload_f32(&[batch, spec.param_count], &hf_cache.params_per_batch)
                         .map_err(|err| backend_error("upload FoveationFilm HF parameters", err))?;
-                    let w_embed = self.backend
+                    let w_embed = self
+                        .backend
                         .upload_f32(&[spec.embed_dim, spec.param_count], &params.w_embed)
-                        .map_err(|err| backend_error("upload FoveationFilm embedding weights", err))?;
-                    let b_embed = self.backend
+                        .map_err(|err| {
+                            backend_error("upload FoveationFilm embedding weights", err)
+                        })?;
+                    let b_embed = self
+                        .backend
                         .upload_f32(&[spec.embed_dim], &params.b_embed)
                         .map_err(|err| backend_error("upload FoveationFilm embedding bias", err))?;
-                    let w_gamma = self.backend
+                    let w_gamma = self
+                        .backend
                         .upload_f32(&[channels, spec.embed_dim], &params.w_gamma)
                         .map_err(|err| backend_error("upload FoveationFilm gamma weights", err))?;
-                    let b_gamma = self.backend
+                    let b_gamma = self
+                        .backend
                         .upload_f32(&[channels], &params.b_gamma)
                         .map_err(|err| backend_error("upload FoveationFilm gamma bias", err))?;
-                    let w_beta = self.backend
+                    let w_beta = self
+                        .backend
                         .upload_f32(&[channels, spec.embed_dim], &params.w_beta)
                         .map_err(|err| backend_error("upload FoveationFilm beta weights", err))?;
-                    let b_beta = self.backend
+                    let b_beta = self
+                        .backend
                         .upload_f32(&[channels], &params.b_beta)
                         .map_err(|err| backend_error("upload FoveationFilm beta bias", err))?;
-                    let (output, embedding, gamma, beta) = self.backend
+                    let (output, embedding, gamma, beta) = self
+                        .backend
                         .foveation_film_forward_f32(
                             current_input,
                             &hf_params,
@@ -13393,30 +13458,28 @@ where
                             .map_err(|err| backend_error("convolution activation", err))?
                     }
                 }
-                (LayerKind::MaxPool(spec), LayerParams::None) => {
-                    if spec.depth {
-                        self.backend.maxpool_depth_f32(
-                            current_input,
-                            &tensor_backend_shape(layer.output_shape),
-                            layer.input_shape.channels,
-                            launch_config,
-                        )
-                    } else {
-                        self.backend.maxpool_f32(
-                            current_input,
-                            &tensor_backend_shape(layer.output_shape),
-                            layer.input_shape.channels,
-                            layer.input_shape.height,
-                            layer.input_shape.width,
-                            spec.size,
-                            spec.stride_x,
-                            spec.stride_y,
-                            spec.padding,
-                            launch_config,
-                        )
-                    }
-                    .map_err(|err| backend_error("maxpool", err))?
+                (LayerKind::MaxPool(spec), LayerParams::None) => if spec.depth {
+                    self.backend.maxpool_depth_f32(
+                        current_input,
+                        &tensor_backend_shape(layer.output_shape),
+                        layer.input_shape.channels,
+                        launch_config,
+                    )
+                } else {
+                    self.backend.maxpool_f32(
+                        current_input,
+                        &tensor_backend_shape(layer.output_shape),
+                        layer.input_shape.channels,
+                        layer.input_shape.height,
+                        layer.input_shape.width,
+                        spec.size,
+                        spec.stride_x,
+                        spec.stride_y,
+                        spec.padding,
+                        launch_config,
+                    )
                 }
+                .map_err(|err| backend_error("maxpool", err))?,
                 (LayerKind::LocalAvgPool(spec), LayerParams::None) => {
                     if layer.output_shape.channels != layer.input_shape.channels {
                         return Err(Error::UnsupportedLayer {
@@ -13474,10 +13537,14 @@ where
                         .backend
                         .upload_f32(&[cache.input_offsets.len()], &cache.input_offsets)
                         .map_err(|err| backend_error("upload crop input offsets", err))?;
-                    let input_saturations: Vec<f32> =
-                        adjustments.iter().map(|adjustment| adjustment.saturation).collect();
-                    let input_exposures: Vec<f32> =
-                        adjustments.iter().map(|adjustment| adjustment.exposure).collect();
+                    let input_saturations: Vec<f32> = adjustments
+                        .iter()
+                        .map(|adjustment| adjustment.saturation)
+                        .collect();
+                    let input_exposures: Vec<f32> = adjustments
+                        .iter()
+                        .map(|adjustment| adjustment.exposure)
+                        .collect();
                     let input_saturations = self
                         .backend
                         .upload_f32(&[input_saturations.len()], &input_saturations)
@@ -13509,13 +13576,14 @@ where
                 }
                 (LayerKind::BatchNorm(_), LayerParams::BatchNorm(params)) => {
                     if training {
-                        let (output, cache) = self.forward_batchnorm_training_gpu_from_host_params(
-                            current_input,
-                            &params.biases,
-                            params,
-                            layer.output_shape,
-                            launch_config,
-                        )?;
+                        let (output, cache) = self
+                            .forward_batchnorm_training_gpu_from_host_params(
+                                current_input,
+                                &params.biases,
+                                params,
+                                layer.output_shape,
+                                launch_config,
+                            )?;
                         batch_norm_cache = Some(cache);
                         output
                     } else {
@@ -13791,32 +13859,27 @@ where
                         launch_config,
                     )
                     .map_err(|err| backend_error("upsample", err))?,
-                (LayerKind::JevCe(spec), LayerParams::None) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download jev_ce input", err))?;
-                    let probs = crate::jev_ce::jev_ce_probs(
-                        &host_input.data,
-                        spec,
-                        layer.input_shape.batch,
-                    );
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &probs)
-                        .map_err(|err| backend_error("upload jev_ce output", err))?
-                }
-                (LayerKind::LayaLoss(spec), LayerParams::None) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download laya_loss input", err))?;
-                    let probs = crate::laya_loss::laya_probs(
-                        &host_input.data,
-                        layer.input_shape.batch,
+                (LayerKind::JevCe(spec), LayerParams::None) => self
+                    .backend
+                    .jev_ce_forward_f32(
+                        current_input,
+                        &tensor_backend_shape(layer.output_shape),
+                        spec.groups,
+                        spec.candidates,
+                        spec.temperature,
+                        spec.channel_major,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("JevCe forward", err))?,
+                (LayerKind::LayaLoss(spec), LayerParams::None) => self
+                    .backend
+                    .laya_loss_forward_f32(
+                        current_input,
+                        &tensor_backend_shape(layer.output_shape),
                         spec.max_options,
-                    );
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &probs)
-                        .map_err(|err| backend_error("upload laya_loss output", err))?
-                }
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("LayaLoss forward", err))?,
                 (LayerKind::GraphConv(spec), LayerParams::GraphConv(params)) => {
                     let graph_conv_host_fallback = graph_conv_spec_needs_compact_host(spec)
                         || (training
@@ -13868,20 +13931,34 @@ where
                         let aggregate = if spec.edge_mode == 0 {
                             self.backend
                                 .graph_conv_aggregate_f32(current_input, geometry, launch_config)
-                                .map_err(|err| backend_error("GraphConv uniform aggregation", err))?
+                                .map_err(|err| {
+                                    backend_error("GraphConv uniform aggregation", err)
+                                })?
                         } else {
-                            let edge_kernel_values = params.edge_kernel.as_deref().ok_or_else(|| {
-                                Error::InvalidConfig("GraphConv learned edge kernel is missing".to_owned())
-                            })?;
-                            let edge_bias_values = params.edge_biases.as_deref().ok_or_else(|| {
-                                Error::InvalidConfig("GraphConv learned edge biases are missing".to_owned())
-                            })?;
-                            let edge_kernel = self.backend
+                            let edge_kernel_values =
+                                params.edge_kernel.as_deref().ok_or_else(|| {
+                                    Error::InvalidConfig(
+                                        "GraphConv learned edge kernel is missing".to_owned(),
+                                    )
+                                })?;
+                            let edge_bias_values =
+                                params.edge_biases.as_deref().ok_or_else(|| {
+                                    Error::InvalidConfig(
+                                        "GraphConv learned edge biases are missing".to_owned(),
+                                    )
+                                })?;
+                            let edge_kernel = self
+                                .backend
                                 .upload_f32(&[edge_kernel_values.len()], edge_kernel_values)
-                                .map_err(|err| backend_error("upload GraphConv edge kernel", err))?;
-                            let edge_biases = self.backend
+                                .map_err(|err| {
+                                    backend_error("upload GraphConv edge kernel", err)
+                                })?;
+                            let edge_biases = self
+                                .backend
                                 .upload_f32(&[edge_bias_values.len()], edge_bias_values)
-                                .map_err(|err| backend_error("upload GraphConv edge biases", err))?;
+                                .map_err(|err| {
+                                    backend_error("upload GraphConv edge biases", err)
+                                })?;
                             self.backend
                                 .graph_conv_learned_aggregate_f32(
                                     current_input,
@@ -13891,13 +13968,18 @@ where
                                     groups,
                                     launch_config,
                                 )
-                                .map_err(|err| backend_error("GraphConv learned aggregation", err))?
+                                .map_err(|err| {
+                                    backend_error("GraphConv learned aggregation", err)
+                                })?
                         };
-                        let weight_shape = [spec.filters, layer.input_shape.channels / groups, 1, 1];
+                        let weight_shape =
+                            [spec.filters, layer.input_shape.channels / groups, 1, 1];
                         let weights = self
                             .backend
                             .upload_f32(&weight_shape, &params.projection.weights)
-                            .map_err(|err| backend_error("upload GraphConv projection weights", err))?;
+                            .map_err(|err| {
+                                backend_error("upload GraphConv projection weights", err)
+                            })?;
                         let raw = self
                             .backend
                             .conv2d_f32(
@@ -13918,16 +14000,25 @@ where
                             )
                             .map_err(|err| backend_error("GraphConv pointwise projection", err))?;
                         let raw = if spec.use_self {
-                            let reference = self.backend
+                            let reference = self
+                                .backend
                                 .graph_conv_reference_f32(current_input, geometry, launch_config)
-                                .map_err(|err| backend_error("GraphConv center-reference gather", err))?;
+                                .map_err(|err| {
+                                    backend_error("GraphConv center-reference gather", err)
+                                })?;
                             let self_values = params.self_weights.as_deref().ok_or_else(|| {
-                                Error::InvalidConfig("GraphConv self weights are missing".to_owned())
+                                Error::InvalidConfig(
+                                    "GraphConv self weights are missing".to_owned(),
+                                )
                             })?;
-                            let self_weights = self.backend
+                            let self_weights = self
+                                .backend
                                 .upload_f32(&weight_shape, self_values)
-                                .map_err(|err| backend_error("upload GraphConv self weights", err))?;
-                            let self_raw = self.backend
+                                .map_err(|err| {
+                                    backend_error("upload GraphConv self weights", err)
+                                })?;
+                            let self_raw = self
+                                .backend
                                 .conv2d_f32(
                                     &reference,
                                     &self_weights,
@@ -13952,30 +14043,25 @@ where
                             raw
                         };
                         let biased = if spec.batch_normalize && training {
-                            let batch_norm = params
-                                .projection
-                                .batch_norm
-                                .as_ref()
-                                .ok_or_else(|| {
+                            let batch_norm =
+                                params.projection.batch_norm.as_ref().ok_or_else(|| {
                                     Error::InvalidConfig(
                                         "GraphConv batch-norm parameters are missing".to_owned(),
                                     )
                                 })?;
-                            let (normalized, cache) = self.forward_batchnorm_training_gpu_from_host_params(
-                                &raw,
-                                &params.projection.biases,
-                                batch_norm,
-                                layer.output_shape,
-                                launch_config,
-                            )?;
+                            let (normalized, cache) = self
+                                .forward_batchnorm_training_gpu_from_host_params(
+                                    &raw,
+                                    &params.projection.biases,
+                                    batch_norm,
+                                    layer.output_shape,
+                                    launch_config,
+                                )?;
                             batch_norm_cache = Some(cache);
                             normalized
                         } else if spec.batch_normalize {
-                            let mut batch_norm = params
-                                .projection
-                                .batch_norm
-                                .clone()
-                                .ok_or_else(|| {
+                            let mut batch_norm =
+                                params.projection.batch_norm.clone().ok_or_else(|| {
                                     Error::InvalidConfig(
                                         "GraphConv batch-norm parameters are missing".to_owned(),
                                     )
@@ -14054,8 +14140,12 @@ where
                         let host_input = self
                             .download_tensor(current_input, layer.input_shape)
                             .map_err(|err| backend_error("download DCNv4 input", err))?;
-                        let (host_output, host_activation, cache) =
-                            forward_dcnv4_with_cache(spec, params, &host_input, layer.output_shape)?;
+                        let (host_output, host_activation, cache) = forward_dcnv4_with_cache(
+                            spec,
+                            params,
+                            &host_input,
+                            layer.output_shape,
+                        )?;
                         dcnv4_cache = Some(cache);
                         activation_input_gpu = Some(
                             self.backend
@@ -14063,12 +14153,77 @@ where
                                     &tensor_backend_shape(layer.output_shape),
                                     &host_activation.data,
                                 )
-                                .map_err(|err| backend_error("upload DCNv4 activation cache", err))?,
+                                .map_err(|err| {
+                                    backend_error("upload DCNv4 activation cache", err)
+                                })?,
                         );
                         self.backend
-                            .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
+                            .upload_f32(
+                                &tensor_backend_shape(layer.output_shape),
+                                &host_output.data,
+                            )
                             .map_err(|err| backend_error("upload DCNv4 output", err))?
                     }
+                }
+                (LayerKind::DsConv(spec), LayerParams::DsConv(params)) => {
+                    let activation = spec.activation.to_cuda_f32_kind().ok_or_else(|| {
+                        Error::UnsupportedLayer {
+                            layer_index: layer.index,
+                            name: format!(
+                                "[dsconv] unsupported GPU activation {:?}",
+                                spec.activation
+                            ),
+                        }
+                    })?;
+                    let geometry = darknet_cuda::host_ops::DsConvGeometry {
+                        batch: layer.input_shape.batch,
+                        channels: layer.input_shape.channels,
+                        filters: spec.filters,
+                        input_height: layer.input_shape.height,
+                        input_width: layer.input_shape.width,
+                        kernel_size: spec.size,
+                        extend_scope: spec.extend_scope,
+                        morph: spec.morph,
+                    };
+                    let offset_channels = 2 * spec.size;
+                    let offset_weights = self
+                        .backend
+                        .upload_f32(
+                            &[offset_channels, layer.input_shape.channels, 3, 3],
+                            &params.offset_weights,
+                        )
+                        .map_err(|err| backend_error("upload DSConv offset weights", err))?;
+                    let offset_biases = self
+                        .backend
+                        .upload_f32(&[offset_channels], &params.offset_biases)
+                        .map_err(|err| backend_error("upload DSConv offset biases", err))?;
+                    let weights = self
+                        .backend
+                        .upload_f32(
+                            &[spec.filters, layer.input_shape.channels, spec.size],
+                            &params.collapse.weights,
+                        )
+                        .map_err(|err| backend_error("upload DSConv collapse weights", err))?;
+                    let biases = self
+                        .backend
+                        .upload_f32(&[spec.filters], &params.collapse.biases)
+                        .map_err(|err| backend_error("upload DSConv collapse biases", err))?;
+                    self.backend
+                        .dsconv_forward_native_f32(
+                            current_input,
+                            &offset_weights,
+                            &offset_biases,
+                            &weights,
+                            &biases,
+                            geometry,
+                            activation,
+                            launch_config,
+                        )
+                        .ok_or_else(|| Error::UnsupportedLayer {
+                            layer_index: layer.index,
+                            name: "backend does not provide native f32 [dsconv]".to_owned(),
+                        })?
+                        .map_err(|err| backend_error("native DSConv forward", err))?
                 }
                 (LayerKind::DeformConv(spec), LayerParams::DeformConv(params)) => {
                     if deform_device {
@@ -14112,37 +14267,35 @@ where
                         ];
                         let raw_offsets = self
                             .backend
-                            .bias_add_f32(
-                                &self
-                                    .backend
-                                    .conv2d_f32(
-                                        &sanitized,
-                                        &offset_w,
-                                        &predictor_shape,
-                                        geometry.channels,
-                                        geometry.input_height,
-                                        geometry.input_width,
-                                        2 * kernels,
-                                        geometry.size,
-                                        geometry.stride_x,
-                                        geometry.stride_y,
-                                        geometry.dilation,
-                                        geometry.padding,
-                                        1,
-                                        launch_config,
-                                    )
-                                    .map_err(|err| backend_error("deform offset predictor", err))?,
+                            .deform_predictor_f32(
+                                &sanitized,
+                                &offset_w,
                                 &offset_b,
+                                &predictor_shape,
+                                geometry.channels,
+                                geometry.input_height,
+                                geometry.input_width,
                                 2 * kernels,
-                                plane,
+                                geometry.size,
+                                geometry.stride_x,
+                                geometry.stride_y,
+                                geometry.padding,
+                                geometry.dilation,
+                                geometry.output_height,
+                                geometry.output_width,
                                 launch_config,
                             )
-                            .map_err(|err| backend_error("deform offset bias", err))?;
+                            .map_err(|err| backend_error("deform offset predictor", err))?;
                         let max_offset = spec.size as f32 * spec.dilation as f32 * 2.0;
                         let (mean, inv_std, stddev, normalize) = {
                             let (m, i, n) = self
                                 .backend
-                                .deform_offset_stats(&raw_offsets, 2 * kernels * plane, max_offset, launch_config)
+                                .deform_offset_stats(
+                                    &raw_offsets,
+                                    2 * kernels * plane,
+                                    max_offset,
+                                    launch_config,
+                                )
                                 .map_err(|err| backend_error("deform offset stats", err))?;
                             // `stddev` is not exposed by the trait signature;
                             // recover it on the host from the small [batch] tensor.
@@ -14175,14 +14328,16 @@ where
                             )
                             .map_err(|err| backend_error("deform offset envelope", err))?;
                         let (masks, mask_logits) = if spec.use_mask {
-                            let weights = params
-                                .mask_weights
-                                .as_ref()
-                                .ok_or_else(|| Error::InvalidConfig("[deform_conv]: missing mask weights".to_owned()))?;
-                            let biases = params
-                                .mask_biases
-                                .as_ref()
-                                .ok_or_else(|| Error::InvalidConfig("[deform_conv]: missing mask biases".to_owned()))?;
+                            let weights = params.mask_weights.as_ref().ok_or_else(|| {
+                                Error::InvalidConfig(
+                                    "[deform_conv]: missing mask weights".to_owned(),
+                                )
+                            })?;
+                            let biases = params.mask_biases.as_ref().ok_or_else(|| {
+                                Error::InvalidConfig(
+                                    "[deform_conv]: missing mask biases".to_owned(),
+                                )
+                            })?;
                             let w = self
                                 .backend
                                 .upload_f32(&[weights.len()], weights)
@@ -14199,32 +14354,25 @@ where
                             ];
                             let logits = self
                                 .backend
-                                .bias_add_f32(
-                                    &self
-                                        .backend
-                                        .conv2d_f32(
-                                            &sanitized,
-                                            &w,
-                                            &logits_shape,
-                                            geometry.channels,
-                                            geometry.input_height,
-                                            geometry.input_width,
-                                            kernels,
-                                            geometry.size,
-                                            geometry.stride_x,
-                                            geometry.stride_y,
-                                            geometry.dilation,
-                                            geometry.padding,
-                                            1,
-                                            launch_config,
-                                        )
-                                        .map_err(|err| backend_error("deform mask predictor", err))?,
+                                .deform_predictor_f32(
+                                    &sanitized,
+                                    &w,
                                     &b,
+                                    &logits_shape,
+                                    geometry.channels,
+                                    geometry.input_height,
+                                    geometry.input_width,
                                     kernels,
-                                    plane,
+                                    geometry.size,
+                                    geometry.stride_x,
+                                    geometry.stride_y,
+                                    geometry.padding,
+                                    geometry.dilation,
+                                    geometry.output_height,
+                                    geometry.output_width,
                                     launch_config,
                                 )
-                                .map_err(|err| backend_error("deform mask bias", err))?;
+                                .map_err(|err| backend_error("deform mask predictor", err))?;
                             let masks = self
                                 .backend
                                 .deform_mask_sigmoid(&logits, &logits_shape, launch_config)
@@ -14282,29 +14430,32 @@ where
                             )
                             .map_err(|err| backend_error("deform activation", err))?
                     } else {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download deform_conv input", err))?;
-                    let (host_output, host_activation, cache) = forward_deform_conv_with_cache(
-                        spec,
-                        params,
-                        &host_input,
-                        layer.output_shape,
-                    )?;
-                    deform_conv_cache = Some(cache);
-                    activation_input_gpu = Some(
+                        let host_input = self
+                            .download_tensor(current_input, layer.input_shape)
+                            .map_err(|err| backend_error("download deform_conv input", err))?;
+                        let (host_output, host_activation, cache) = forward_deform_conv_with_cache(
+                            spec,
+                            params,
+                            &host_input,
+                            layer.output_shape,
+                        )?;
+                        deform_conv_cache = Some(cache);
+                        activation_input_gpu = Some(
+                            self.backend
+                                .upload_f32(
+                                    &tensor_backend_shape(layer.output_shape),
+                                    &host_activation.data,
+                                )
+                                .map_err(|err| {
+                                    backend_error("upload deform_conv activation cache", err)
+                                })?,
+                        );
                         self.backend
                             .upload_f32(
                                 &tensor_backend_shape(layer.output_shape),
-                                &host_activation.data,
+                                &host_output.data,
                             )
-                            .map_err(|err| {
-                                backend_error("upload deform_conv activation cache", err)
-                            })?,
-                    );
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
-                        .map_err(|err| backend_error("upload deform_conv output", err))?
+                            .map_err(|err| backend_error("upload deform_conv output", err))?
                     }
                 }
                 (LayerKind::Vit(spec), LayerParams::Vit(weights)) => {
@@ -14476,24 +14627,16 @@ where
                         launch_config,
                     )
                     .map_err(|err| backend_error("logistic", err))?,
-                // Host round trip for now: the per-pixel softmax over a
-                // strided channel axis and the binary sanitise+logistic are both
-                // one-elementwise passes until a kernel is written, exactly like
-                // the `sam` head.
-                (LayerKind::Segmentation(spec), LayerParams::None) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download segmentation input", err))?;
-                    let out = crate::segmentation::segmentation_forward(
-                        &host_input.data,
-                        spec,
-                        layer.input_shape.batch,
-                        layer.input_shape.width * layer.input_shape.height,
-                    );
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &out.output)
-                        .map_err(|err| backend_error("upload segmentation output", err))?
-                }
+                (LayerKind::Segmentation(spec), LayerParams::None) => self
+                    .backend
+                    .segmentation_forward_f32(
+                        current_input,
+                        &tensor_backend_shape(layer.output_shape),
+                        spec.classes,
+                        spec.temperature,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("segmentation forward", err))?,
                 (LayerKind::LayaScorer(spec), LayerParams::LayaScorer(weights)) => {
                     laya_scorer_gpu::forward(
                         &self.backend,
@@ -14505,59 +14648,40 @@ where
                         launch_config,
                     )?
                 }
-                // `[centernet]`'s sigmoid is a strided channel sub-range, so
-                // it goes through the host like the other modern heads.
-                (LayerKind::CenterNet(spec), LayerParams::None) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download centernet input", err))?;
-                    let layout = crate::centernet::CenterNetLayout::for_spec(
-                        layer.input_shape.batch,
-                        layer.input_shape.width,
-                        layer.input_shape.height,
-                        spec,
-                    );
-                    let data = crate::centernet::centernet_forward(&host_input.data, &layout);
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
-                        .map_err(|err| backend_error("upload centernet output", err))?
-                }
-                // `[yolox]` / `[ppyoloe]` / `[yolonas]` apply the C++
-                // `activate_modern_output`, a strided sub-range pass, so they
-                // go through the host for now (same choice as `[contrastive]`).
+                // Native strided NCHW sigmoid for heatmap channels; regression
+                // channels are copied and all output values are sanitized.
+                (LayerKind::CenterNet(spec), LayerParams::None) => self
+                    .backend
+                    .centernet_forward_f32(
+                        current_input,
+                        &tensor_backend_shape(layer.input_shape),
+                        spec.classes,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("CenterNet forward", err))?,
                 (LayerKind::Yolox(spec), LayerParams::None)
                 | (LayerKind::Ppyoloe(spec), LayerParams::None)
-                | (LayerKind::Yolonas(spec), LayerParams::None) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download yolox input", err))?;
-                    let layout = crate::modern_yolo::ModernLayout::for_spec(
-                        layer.input_shape.batch,
-                        layer.input_shape.width,
-                        layer.input_shape.height,
-                        spec,
-                    );
-                    let mut data = host_input.data;
-                    if data.len() == layout.len() {
-                        crate::modern_yolo::activate_modern_output(&mut data, &layout);
-                    }
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
-                        .map_err(|err| backend_error("upload yolox output", err))?
-                }
-                (LayerKind::Region(spec), LayerParams::None) => {
-                    self.backend
-                        .region_forward_f32(
-                            current_input,
-                            &tensor_backend_shape(layer.output_shape),
-                            spec.num,
-                            spec.coords + spec.classes + 1,
-                            spec.classes,
-                            spec.softmax,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("GPU Region forward", err))?
-                }
+                | (LayerKind::Yolonas(spec), LayerParams::None) => self
+                    .backend
+                    .modern_yolo_forward_f32(
+                        current_input,
+                        &tensor_backend_shape(layer.output_shape),
+                        spec.classes,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("modern-YOLO forward", err))?,
+                (LayerKind::Region(spec), LayerParams::None) => self
+                    .backend
+                    .region_forward_f32(
+                        current_input,
+                        &tensor_backend_shape(layer.output_shape),
+                        spec.num,
+                        spec.coords + spec.classes + 1,
+                        spec.classes,
+                        spec.softmax,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("GPU Region forward", err))?,
                 // `[omd_loss]` is a pure pass-through on the forward, exactly as
                 // in C++ (`memcpy(l.output, state.input, ...)`).
                 (LayerKind::Yolo(_), LayerParams::None)
@@ -14667,12 +14791,8 @@ where
                         let host_input = self
                             .download_tensor(current_input, layer.input_shape)
                             .map_err(|err| backend_error("download local input", err))?;
-                        let (host_output, host_activation_input) = forward_local_with_cache(
-                            spec,
-                            local,
-                            &host_input,
-                            layer.output_shape,
-                        )?;
+                        let (host_output, host_activation_input) =
+                            forward_local_with_cache(spec, local, &host_input, layer.output_shape)?;
                         if let Some(pre_activation) = host_activation_input {
                             activation_input_gpu = Some(
                                 self.backend
@@ -15040,10 +15160,7 @@ where
                         );
                         activation_input_gpu = Some(
                             self.backend
-                                .upload_f32(
-                                    &tensor_backend_shape(layer.output_shape),
-                                    &pre.data,
-                                )
+                                .upload_f32(&tensor_backend_shape(layer.output_shape), &pre.data)
                                 .map_err(|err| {
                                     backend_error("upload deconvolutional activation cache", err)
                                 })?,
@@ -15060,8 +15177,7 @@ where
                 }
                 (LayerKind::Rnn(spec), LayerParams::Rnn(recurrent)) => {
                     if spec.activation.to_cuda_f32_kind().is_some()
-                        && (spec.logistic != 2
-                            || Activation::Loggy.to_cuda_f32_kind().is_some())
+                        && (spec.logistic != 2 || Activation::Loggy.to_cuda_f32_kind().is_some())
                     {
                         let (output, cache, device_cache) = forward_rnn_layer_device(
                             &self.backend,
@@ -15591,21 +15707,17 @@ where
                     .to_owned(),
             });
         }
-        if let Some(layer) = self
-            .network
-            .layers
-            .iter()
-            .find(|layer| {
-                matches!(
-                    &layer.kind,
-                    LayerKind::GraphConv(spec)
-                        if graph_conv_spec_needs_compact_host(spec)
-                )
-            })
-        {
+        if let Some(layer) = self.network.layers.iter().find(|layer| {
+            matches!(
+                &layer.kind,
+                LayerKind::GraphConv(spec)
+                    if graph_conv_spec_needs_compact_host(spec)
+            )
+        }) {
             return Err(Error::UnsupportedLayer {
                 layer_index: layer.index,
-                name: "[graph_conv] compact GPU execution is unsupported; use f32 GPU forward".to_owned(),
+                name: "[graph_conv] compact GPU execution is unsupported; use f32 GPU forward"
+                    .to_owned(),
             });
         }
         if let Some(layer) = self
@@ -15616,7 +15728,8 @@ where
         {
             return Err(Error::UnsupportedLayer {
                 layer_index: layer.index,
-                name: "[dsconv] GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path".to_owned(),
+                name: "[dsconv] compact f16 GPU execution is unsupported; use f32 GPU execution"
+                    .to_owned(),
             });
         }
         if let Some(layer) = self
@@ -15656,23 +15769,11 @@ where
         if self.network.layers.iter().any(|layer| {
             matches!(
                 layer.kind,
-                LayerKind::Connected(_)
-                    | LayerKind::Deconvolutional(_)
+                LayerKind::Deconvolutional(_)
                     | LayerKind::EmlConvolutional(_)
                     | LayerKind::Dcnv4(_)
-                    | LayerKind::Reorg(_)
-                    | LayerKind::ChannelSlice(_)
-                    | LayerKind::ChannelShuffle(_)
-                    | LayerKind::Softmax { .. }
-                    | LayerKind::Logistic
-                    | LayerKind::Segmentation(_)
-                    | LayerKind::OmdLoss(_)
                     | LayerKind::Contrastive(_)
-                    | LayerKind::Regression(_)
-                    | LayerKind::JevCe(_)
-                    | LayerKind::LayaLoss(_)
                     | LayerKind::LayaEncoder(_)
-                    | LayerKind::ScaleChannels(_)
                     | LayerKind::Rnn(_)
                     | LayerKind::Lstm(_)
                     | LayerKind::Crnn(_)
@@ -15681,6 +15782,16 @@ where
                             | crate::model::ShortcutWeightsType::PerChannel,
                         ..
                     })
+            )
+        }) || self.network.layers.iter().any(|layer| {
+            matches!(
+                &layer.kind,
+                LayerKind::ScaleChannels(spec)
+                    if spec.activation.to_cuda_f32_kind().is_none()
+            ) || matches!(
+                &layer.kind,
+                LayerKind::Connected(spec)
+                    if spec.activation.to_cuda_f32_kind().is_none()
             )
         }) {
             let state = self.forward_with_state(input)?;
@@ -15805,16 +15916,23 @@ where
                             .graph_conv_aggregate_f32(input, geometry, launch_config)
                             .map_err(|err| backend_error("compact GraphConv aggregation", err))?
                     } else {
-                        let edge_kernel_values = params.edge_kernel.as_deref().ok_or_else(|| {
-                            Error::InvalidConfig("GraphConv learned edge kernel is missing".to_owned())
-                        })?;
+                        let edge_kernel_values =
+                            params.edge_kernel.as_deref().ok_or_else(|| {
+                                Error::InvalidConfig(
+                                    "GraphConv learned edge kernel is missing".to_owned(),
+                                )
+                            })?;
                         let edge_bias_values = params.edge_biases.as_deref().ok_or_else(|| {
-                            Error::InvalidConfig("GraphConv learned edge biases are missing".to_owned())
+                            Error::InvalidConfig(
+                                "GraphConv learned edge biases are missing".to_owned(),
+                            )
                         })?;
-                        let edge_kernel = self.backend
+                        let edge_kernel = self
+                            .backend
                             .upload_f32(&[edge_kernel_values.len()], edge_kernel_values)
                             .map_err(|err| backend_error("compact GraphConv edge kernel", err))?;
-                        let edge_biases = self.backend
+                        let edge_biases = self
+                            .backend
                             .upload_f32(&[edge_bias_values.len()], edge_bias_values)
                             .map_err(|err| backend_error("compact GraphConv edge biases", err))?;
                         self.backend
@@ -15826,13 +15944,19 @@ where
                                 groups,
                                 launch_config,
                             )
-                            .map_err(|err| backend_error("compact GraphConv learned aggregation", err))?
+                            .map_err(|err| {
+                                backend_error("compact GraphConv learned aggregation", err)
+                            })?
                     };
                     let weight_shape = [spec.filters, layer.input_shape.channels / groups, 1, 1];
-                    let weights = self.backend
+                    let weights = self
+                        .backend
                         .upload_f32(&weight_shape, &params.projection.weights)
-                        .map_err(|err| backend_error("compact GraphConv projection weights", err))?;
-                    let mut raw = self.backend
+                        .map_err(|err| {
+                            backend_error("compact GraphConv projection weights", err)
+                        })?;
+                    let mut raw = self
+                        .backend
                         .conv2d_f32(
                             &aggregate,
                             &weights,
@@ -15851,16 +15975,21 @@ where
                         )
                         .map_err(|err| backend_error("compact GraphConv projection", err))?;
                     if spec.use_self {
-                        let reference = self.backend
+                        let reference = self
+                            .backend
                             .graph_conv_reference_f32(input, geometry, launch_config)
-                            .map_err(|err| backend_error("compact GraphConv reference gather", err))?;
+                            .map_err(|err| {
+                                backend_error("compact GraphConv reference gather", err)
+                            })?;
                         let self_values = params.self_weights.as_deref().ok_or_else(|| {
                             Error::InvalidConfig("GraphConv self weights are missing".to_owned())
                         })?;
-                        let self_weights = self.backend
+                        let self_weights = self
+                            .backend
                             .upload_f32(&weight_shape, self_values)
                             .map_err(|err| backend_error("compact GraphConv self weights", err))?;
-                        let self_raw = self.backend
+                        let self_raw = self
+                            .backend
                             .conv2d_f32(
                                 &reference,
                                 &self_weights,
@@ -15877,17 +16006,19 @@ where
                                 groups,
                                 launch_config,
                             )
-                            .map_err(|err| backend_error("compact GraphConv self projection", err))?;
-                        raw = self.backend
+                            .map_err(|err| {
+                                backend_error("compact GraphConv self projection", err)
+                            })?;
+                        raw = self
+                            .backend
                             .shortcut_add_f32(&raw, &self_raw, launch_config)
-                            .map_err(|err| backend_error("compact GraphConv projection sum", err))?;
+                            .map_err(|err| {
+                                backend_error("compact GraphConv projection sum", err)
+                            })?;
                     }
                     let biased = if spec.batch_normalize {
-                        let mut batch_norm = params
-                            .projection
-                            .batch_norm
-                            .clone()
-                            .ok_or_else(|| {
+                        let mut batch_norm =
+                            params.projection.batch_norm.clone().ok_or_else(|| {
                                 Error::InvalidConfig(
                                     "GraphConv batch-norm parameters are missing".to_owned(),
                                 )
@@ -15925,7 +16056,9 @@ where
                                 normalization,
                                 launch_config,
                             )
-                            .map_err(|err| backend_error("compact GraphConv channel normalization", err))?
+                            .map_err(|err| {
+                                backend_error("compact GraphConv channel normalization", err)
+                            })?
                     } else {
                         self.backend
                             .activation_f32(
@@ -16241,12 +16374,14 @@ where
                     .map_err(|err| backend_error("upsample", err))?,
                 (LayerKind::Sam(spec), LayerParams::None) => {
                     let source_index = resolve_relative_layer(layer.index, spec.from)?;
-                    let source_layer = self.network.layers.get(source_index).ok_or(
-                        Error::InvalidRoute {
-                            layer_index: layer.index,
-                            reference: spec.from,
-                        },
-                    )?;
+                    let source_layer =
+                        self.network
+                            .layers
+                            .get(source_index)
+                            .ok_or(Error::InvalidRoute {
+                                layer_index: layer.index,
+                                reference: spec.from,
+                            })?;
                     let source_gpu = gpu_layer_outputs
                         .get(source_index)
                         .and_then(Option::as_ref)
@@ -16293,6 +16428,37 @@ where
                             .map_err(|err| backend_error("upload sam output", err))?
                     }
                 }
+                (LayerKind::LayaLoss(spec), LayerParams::None) => self
+                    .backend
+                    .laya_loss_forward_f32(
+                        current_input.expect("LayaLoss requires current input"),
+                        &tensor_backend_shape(layer.output_shape),
+                        spec.max_options,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("GPU LayaLoss compact forward", err))?,
+                (LayerKind::JevCe(spec), LayerParams::None) => self
+                    .backend
+                    .jev_ce_forward_f32(
+                        current_input.expect("JevCe requires current input"),
+                        &tensor_backend_shape(layer.output_shape),
+                        spec.groups,
+                        spec.candidates,
+                        spec.temperature,
+                        spec.channel_major,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("GPU JevCe compact forward", err))?,
+                (LayerKind::Segmentation(spec), LayerParams::None) => self
+                    .backend
+                    .segmentation_forward_f32(
+                        current_input.expect("segmentation requires current input"),
+                        &tensor_backend_shape(layer.output_shape),
+                        spec.classes,
+                        spec.temperature,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("GPU segmentation compact forward", err))?,
                 (LayerKind::Region(spec), LayerParams::None) => self
                     .backend
                     .region_forward_f32(
@@ -16305,16 +16471,184 @@ where
                         launch_config,
                     )
                     .map_err(|err| backend_error("GPU Region compact forward", err))?,
+                (LayerKind::CenterNet(spec), LayerParams::None) => self
+                    .backend
+                    .centernet_forward_f32(
+                        current_input.expect("CenterNet requires current input"),
+                        &tensor_backend_shape(layer.output_shape),
+                        spec.classes,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("GPU CenterNet compact forward", err))?,
+                (LayerKind::Yolox(spec), LayerParams::None)
+                | (LayerKind::Ppyoloe(spec), LayerParams::None)
+                | (LayerKind::Yolonas(spec), LayerParams::None) => self
+                    .backend
+                    .modern_yolo_forward_f32(
+                        current_input.expect("modern-YOLO requires current input"),
+                        &tensor_backend_shape(layer.output_shape),
+                        spec.classes,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("modern-YOLO compact forward", err))?,
+                (LayerKind::Connected(spec), LayerParams::Connected(connected)) => {
+                    let inputs = layer.input_shape.element_count();
+                    if connected.weights.len() != spec.output * inputs
+                        || connected.biases.len() != spec.output
+                    {
+                        return Err(Error::InvalidConfig(format!(
+                            "connected layer #{} expects {} weights and {} biases, got {} and {}",
+                            layer.index,
+                            spec.output * inputs,
+                            spec.output,
+                            connected.weights.len(),
+                            connected.biases.len()
+                        )));
+                    }
+                    let (weights, biases) = match connected.batch_norm.as_ref() {
+                        Some(bn) => {
+                            let mut weights = connected.weights.clone();
+                            let mut biases = connected.biases.clone();
+                            for (o, row) in weights.chunks_mut(inputs).enumerate() {
+                                let k = bn.scales[o]
+                                    / (bn.rolling_variance[o] + BATCH_NORM_EPSILON).sqrt();
+                                row.iter_mut().for_each(|w| *w *= k);
+                                biases[o] -= bn.rolling_mean[o] * k;
+                            }
+                            (weights, biases)
+                        }
+                        None => (connected.weights.clone(), connected.biases.clone()),
+                    };
+                    let weights_gpu = self
+                        .backend
+                        .upload_f32(&[spec.output, inputs], &weights)
+                        .map_err(|err| backend_error("compact connected weights", err))?;
+                    let biases_gpu = self
+                        .backend
+                        .upload_f32(&[spec.output], &biases)
+                        .map_err(|err| backend_error("compact connected biases", err))?;
+                    let pre_activation = self
+                        .backend
+                        .connected_f32(
+                            current_input.expect("Connected requires current input"),
+                            &weights_gpu,
+                            &biases_gpu,
+                            layer.input_shape.batch,
+                            inputs,
+                            spec.output,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("compact connected", err))?;
+                    self.backend
+                        .activation_f32(
+                            &pre_activation,
+                            gpu_activation_kind(layer.index, &spec.activation)?,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("compact connected activation", err))?
+                }
+                (LayerKind::ScaleChannels(spec), LayerParams::None) => {
+                    let source_index = resolve_relative_layer(layer.index, spec.from)?;
+                    let source = gpu_layer_outputs
+                        .get(source_index)
+                        .and_then(Option::as_ref)
+                        .ok_or(Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.from,
+                        })?;
+                    let pre_activation = self
+                        .backend
+                        .scale_channels_f32(
+                            current_input.expect("ScaleChannels requires current input"),
+                            source,
+                            &tensor_backend_shape(layer.output_shape),
+                            spec.scale_wh,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("GPU ScaleChannels compact", err))?;
+                    self.backend
+                        .activation_f32(
+                            &pre_activation,
+                            gpu_activation_kind(layer.index, &spec.activation)?,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("GPU ScaleChannels compact activation", err))?
+                }
+                (LayerKind::Reorg(spec), LayerParams::None) => {
+                    if spec.stride == 0 {
+                        return Err(Error::InvalidConfig(
+                            "reorg stride cannot be zero".to_owned(),
+                        ));
+                    }
+                    self.backend
+                        .reorg_f32(
+                            current_input.expect("Reorg requires current input"),
+                            &tensor_backend_shape(layer.input_shape),
+                            &tensor_backend_shape(layer.output_shape),
+                            spec.stride,
+                            spec.reverse,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("GPU Reorg compact forward", err))?
+                }
+                (LayerKind::ChannelShuffle(spec), LayerParams::None) => self
+                    .backend
+                    .channel_shuffle_f32(
+                        current_input.expect("ChannelShuffle requires current input"),
+                        &tensor_backend_shape(layer.input_shape),
+                        spec.groups,
+                        false,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("GPU ChannelShuffle compact forward", err))?,
+                (LayerKind::ChannelSlice(spec), LayerParams::None) => {
+                    let source_index = resolve_relative_layer(layer.index, spec.from)?;
+                    let source = gpu_layer_outputs
+                        .get(source_index)
+                        .and_then(Option::as_ref)
+                        .ok_or(Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.from,
+                        })?;
+                    let source_channels = self.network.layers[source_index].output_shape.channels;
+                    self.backend
+                        .route_concat_f32(
+                            &[source],
+                            &[spec.start],
+                            &[spec.end - spec.start],
+                            &[source_channels],
+                            &tensor_backend_shape(layer.output_shape),
+                            layer.output_shape.width * layer.output_shape.height,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("GPU ChannelSlice compact forward", err))?
+                }
+                (LayerKind::Logistic, LayerParams::None) => self
+                    .backend
+                    .activation_f32(
+                        current_input.expect("Logistic requires current input"),
+                        darknet_cuda::F32ActivationKind::Logistic,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("GPU Logistic compact forward", err))?,
+                (LayerKind::Softmax { groups }, LayerParams::None) => self
+                    .backend
+                    .softmax_f32(
+                        current_input.expect("Softmax requires current input"),
+                        &tensor_backend_shape(layer.output_shape),
+                        softmax_group_size(layer.input_shape, *groups)?,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("GPU Softmax compact forward", err))?,
                 (LayerKind::Yolo(_), LayerParams::None)
                 | (LayerKind::ObbYolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
                 | (LayerKind::Detection(_), LayerParams::None)
-                | (LayerKind::Softmax { .. }, LayerParams::None)
                 | (LayerKind::Cost { .. }, LayerParams::None)
                 | (LayerKind::Dropout { .. }, LayerParams::None)
-                | (LayerKind::ScaleChannels(_), LayerParams::None)
-                | (LayerKind::Contrastive(_), LayerParams::None)
-                | (LayerKind::Yolox(_), LayerParams::None) => current_input
+                | (LayerKind::OmdLoss(_), LayerParams::None)
+                | (LayerKind::Regression(_), LayerParams::None)
+                | (LayerKind::Contrastive(_), LayerParams::None) => current_input
                     .expect("staging layer requires current input")
                     .clone(),
                 (LayerKind::Connected(_), _)
@@ -16442,6 +16776,7 @@ where
         forward: &GpuForwardState<B::Tensor>,
         layer_output_gradient_seeds: &[Option<Tensor>],
     ) -> Result<()> {
+        reject_gpu_stage1_cpu_layers(&self.network, "backward")?;
         if layer_output_gradient_seeds.len() != self.network.layers.len() {
             return Err(Error::InvalidConfig(format!(
                 "GPU backward seed count mismatch: expected {}, got {}",
@@ -19339,10 +19674,8 @@ where
                 | (LayerKind::LayaLoss(_), Some(LayerParams::None))
                 | (LayerKind::LayaEncoder(_), Some(LayerParams::LayaEncoder(_)))
                 | (LayerKind::LayaHead(_), Some(LayerParams::LayaHead(_)))
-                // `[yolox]` applies the C++ `activate_modern_output` (a sigmoid
-                // on the trailing `1 + classes` entries of every cell), which
-                // is a strided sub-range pass, so it goes through the host for
-                // now like the other host-round-trip heads.
+                // Modern YOLO head loss/backward is host-owned; its forward
+                // activation now runs natively on the device.
                 | (LayerKind::Yolox(_), Some(LayerParams::None))
                 | (LayerKind::Ppyoloe(_), Some(LayerParams::None))
                 | (LayerKind::Yolonas(_), Some(LayerParams::None))
@@ -19388,6 +19721,112 @@ where
                     }
                     self.accumulate_previous_gpu_gradient(
                         layer.index, gradients.input, &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::DsConv(spec), Some(LayerParams::DsConv(params))) => {
+                    let activation = spec.activation.to_cuda_f32_kind().ok_or_else(|| {
+                        Error::UnsupportedLayer {
+                            layer_index: layer.index,
+                            name: format!("[dsconv] unsupported GPU activation {:?}", spec.activation),
+                        }
+                    })?;
+                    let input = if layer.index == 0 {
+                        &forward.input_gpu
+                    } else {
+                        &forward.gpu_layer_outputs[layer.index - 1]
+                    };
+                    let geometry = darknet_cuda::host_ops::DsConvGeometry {
+                        batch: layer.input_shape.batch,
+                        channels: layer.input_shape.channels,
+                        filters: spec.filters,
+                        input_height: layer.input_shape.height,
+                        input_width: layer.input_shape.width,
+                        kernel_size: spec.size,
+                        extend_scope: spec.extend_scope,
+                        morph: spec.morph,
+                    };
+                    let offset_channels = 2 * spec.size;
+                    let offset_weights = self
+                        .backend
+                        .upload_f32(
+                            &[offset_channels, layer.input_shape.channels, 3, 3],
+                            &params.offset_weights,
+                        )
+                        .map_err(|err| backend_error("upload DSConv offset weights", err))?;
+                    let offset_biases = self
+                        .backend
+                        .upload_f32(&[offset_channels], &params.offset_biases)
+                        .map_err(|err| backend_error("upload DSConv offset biases", err))?;
+                    let weights = self
+                        .backend
+                        .upload_f32(
+                            &[spec.filters, layer.input_shape.channels, spec.size],
+                            &params.collapse.weights,
+                        )
+                        .map_err(|err| backend_error("upload DSConv collapse weights", err))?;
+                    let biases = self
+                        .backend
+                        .upload_f32(&[spec.filters], &params.collapse.biases)
+                        .map_err(|err| backend_error("upload DSConv collapse biases", err))?;
+                    let (d_input, d_weights, d_biases, d_offset_weights, d_offset_biases) = self
+                        .backend
+                        .dsconv_backward_native_f32(
+                            input,
+                            &offset_weights,
+                            &offset_biases,
+                            &weights,
+                            &biases,
+                            &grad,
+                            geometry,
+                            activation,
+                            config,
+                        )
+                        .ok_or_else(|| Error::UnsupportedLayer {
+                            layer_index: layer.index,
+                            name: "backend does not provide native f32 [dsconv] backward".to_owned(),
+                        })?
+                        .map_err(|err| backend_error("native DSConv backward", err))?;
+                    let d_weights = self
+                        .backend
+                        .download_f32(&d_weights)
+                        .map_err(|err| backend_error("download DSConv collapse gradients", err))?;
+                    let d_biases = self
+                        .backend
+                        .download_f32(&d_biases)
+                        .map_err(|err| backend_error("download DSConv collapse bias gradients", err))?;
+                    let d_offset_weights = self
+                        .backend
+                        .download_f32(&d_offset_weights)
+                        .map_err(|err| backend_error("download DSConv offset gradients", err))?;
+                    let d_offset_biases = self
+                        .backend
+                        .download_f32(&d_offset_biases)
+                        .map_err(|err| backend_error("download DSConv offset bias gradients", err))?;
+                    {
+                        let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
+                        let LayerTrainBuffers::DsConv(train) = &mut buffers[layer.index] else {
+                            return Err(Error::InvalidConfig(format!(
+                                "[dsconv] layer #{} has no train buffers",
+                                layer.index
+                            )));
+                        };
+                        for (dst, src) in train.collapse.weight_updates.iter_mut().zip(d_weights) {
+                            *dst += src;
+                        }
+                        for (dst, src) in train.collapse.bias_updates.iter_mut().zip(d_biases) {
+                            *dst += src;
+                        }
+                        for (dst, src) in train.offset_weight_updates.iter_mut().zip(d_offset_weights) {
+                            *dst += src;
+                        }
+                        for (dst, src) in train.offset_bias_updates.iter_mut().zip(d_offset_biases) {
+                            *dst += src;
+                        }
+                    }
+                    self.accumulate_previous_gpu_gradient(
+                        layer.index,
+                        d_input,
+                        &mut layer_output_gradients,
                     )?;
                 }
                 (LayerKind::DeformConv(spec), Some(LayerParams::DeformConv(params))) => {
@@ -20034,12 +20473,15 @@ where
     ) -> Result<()> {
         if layer_index == 0 {
             if self.capture_input_gradient.get() {
-                let input_gradient = self.download_tensor(&gradient, self.network.net.input_shape())
+                let input_gradient = self
+                    .download_tensor(&gradient, self.network.net.input_shape())
                     .map_err(|err| backend_error("download captured GPU input gradient", err))?;
                 let mut captured = self.captured_input_gradient.borrow_mut();
                 if let Some(existing) = captured.as_mut() {
                     if existing.shape != input_gradient.shape {
-                        return Err(Error::InvalidConfig("captured GPU input-gradient shape mismatch".to_owned()));
+                        return Err(Error::InvalidConfig(
+                            "captured GPU input-gradient shape mismatch".to_owned(),
+                        ));
                     }
                     accumulate_vec(&mut existing.data, &input_gradient.data)?;
                 } else {
@@ -20928,9 +21370,10 @@ where
         else {
             return Ok(false);
         };
-        let layer = self.network.layers.get(layer_index).ok_or_else(|| {
-            Error::InvalidConfig(format!("missing DCNv4 layer #{layer_index}"))
-        })?;
+        let layer =
+            self.network.layers.get(layer_index).ok_or_else(|| {
+                Error::InvalidConfig(format!("missing DCNv4 layer #{layer_index}"))
+            })?;
         let (LayerKind::Dcnv4(spec), LayerParams::Dcnv4(params)) =
             (&layer.kind, &self.params[layer_index])
         else {
@@ -21034,15 +21477,7 @@ where
                     .map_err(|err| backend_error("accumulate DCNv4 scale momentum", err))?;
                 let (next_scale, next_scale_momentum) = self
                     .backend
-                    .sgd_update_f32(
-                        scale,
-                        &scale_sum,
-                        layer_lr,
-                        momentum,
-                        0.0,
-                        batch,
-                        config,
-                    )
+                    .sgd_update_f32(scale, &scale_sum, layer_lr, momentum, 0.0, batch, config)
                     .map_err(|err| backend_error("DCNv4 native SGD BN scales", err))?;
                 (None, None, Some(next_scale), Some(next_scale_momentum))
             } else {
@@ -21053,15 +21488,7 @@ where
                     .map_err(|err| backend_error("accumulate DCNv4 bias momentum", err))?;
                 let (next_bias, next_bias_momentum) = self
                     .backend
-                    .sgd_update_f32(
-                        bias,
-                        &bias_sum,
-                        layer_lr,
-                        momentum,
-                        0.0,
-                        batch,
-                        config,
-                    )
+                    .sgd_update_f32(bias, &bias_sum, layer_lr, momentum, 0.0, batch, config)
                     .map_err(|err| backend_error("DCNv4 native SGD biases", err))?;
                 (Some(next_bias), Some(next_bias_momentum), None, None)
             };
@@ -21085,9 +21512,10 @@ where
             .transpose()
             .map_err(|err| backend_error("download DCNv4 SGD BN scales", err))?;
 
-        let (LayerKind::Dcnv4(_spec), LayerParams::Dcnv4(params)) =
-            (&self.network.layers[layer_index].kind, &mut self.params[layer_index])
-        else {
+        let (LayerKind::Dcnv4(_spec), LayerParams::Dcnv4(params)) = (
+            &self.network.layers[layer_index].kind,
+            &mut self.params[layer_index],
+        ) else {
             unreachable!("DCNv4 layer metadata was validated above")
         };
         params.offset_weights = offset_weights_host;
@@ -21441,7 +21869,9 @@ where
                         .map_err(|err| backend_error("download DCNv4 bias updates", err))?,
                     self.backend
                         .download_f32(&entry.offset_weight_updates)
-                        .map_err(|err| backend_error("download DCNv4 offset weight updates", err))?,
+                        .map_err(|err| {
+                            backend_error("download DCNv4 offset weight updates", err)
+                        })?,
                     self.backend
                         .download_f32(&entry.offset_bias_updates)
                         .map_err(|err| backend_error("download DCNv4 offset bias updates", err))?,
@@ -21449,9 +21879,9 @@ where
                         .scale_updates
                         .as_ref()
                         .map(|scales| {
-                            self.backend.download_f32(scales).map_err(|err| {
-                                backend_error("download DCNv4 scale updates", err)
-                            })
+                            self.backend
+                                .download_f32(scales)
+                                .map_err(|err| backend_error("download DCNv4 scale updates", err))
                         })
                         .transpose()?,
                 );
@@ -21463,11 +21893,7 @@ where
                         "missing DCNv4 layer/params for GPU gradients at layer #{layer_index}"
                     )));
                 };
-                let desc = dcnv4_gpu::descriptor(
-                    &self.network.layers[layer_index],
-                    spec,
-                    params,
-                )?;
+                let desc = dcnv4_gpu::descriptor(&self.network.layers[layer_index], spec, params)?;
                 let bias_shape = [spec.filters];
                 let offset_weight_shape = [
                     desc.geometry.offset_dim(),
@@ -22044,7 +22470,11 @@ where
             if let Some(cache) = forward.gpu_batch_norm_caches[layer.index].as_ref()
                 && let Some((mean, _)) = cache.rolling.as_ref()
             {
-                graph_conv_batch_norm_rolling.push((layer.index, mean.clone(), cache.variance.clone()));
+                graph_conv_batch_norm_rolling.push((
+                    layer.index,
+                    mean.clone(),
+                    cache.variance.clone(),
+                ));
             }
         }
         for layer in &self.network.layers {
@@ -22054,7 +22484,11 @@ where
             if let Some(cache) = forward.gpu_batch_norm_caches[layer.index].as_ref()
                 && let Some((mean, _)) = cache.rolling.as_ref()
             {
-                standalone_batch_norm_rolling.push((layer.index, mean.clone(), cache.variance.clone()));
+                standalone_batch_norm_rolling.push((
+                    layer.index,
+                    mean.clone(),
+                    cache.variance.clone(),
+                ));
             }
         }
         for layer in &self.network.layers {
@@ -22155,16 +22589,17 @@ where
                     layer.index
                 )));
             };
-            let current_input = if layer.index == 0 {
-                &forward.input_gpu
-            } else {
-                forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
+            let current_input =
+                if layer.index == 0 {
+                    &forward.input_gpu
+                } else {
+                    forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
                     Error::InvalidConfig(format!(
                         "missing previous GPU output for connected BN statistics at layer #{}",
                         layer.index
                     ))
                 })?
-            };
+                };
             let inputs = layer.input_shape.element_count();
             let weights = self
                 .backend
@@ -22186,7 +22621,8 @@ where
                     config,
                 )
                 .map_err(|err| backend_error("connected BN raw output for rolling stats", err))?;
-            let (mean, variance) = self.batch_norm_channel_stats_gpu(&raw_output, layer.output_shape)?;
+            let (mean, variance) =
+                self.batch_norm_channel_stats_gpu(&raw_output, layer.output_shape)?;
             let Some(LayerParams::Connected(params)) = self.params.get_mut(layer.index) else {
                 return Err(Error::InvalidConfig(format!(
                     "missing mutable connected params for BN statistics at layer #{}",
@@ -23818,45 +24254,47 @@ fn backward_hyperbolic_foveation(
         .chunks_exact(per_batch)
         .map(|values| hyperbolic_foveation_params_from_values(values, spec))
         .collect::<Result<Vec<_>>>()?;
-    let (warp_input_gradient_data, semantic_gradients) =
-        if let Some(semantic) = precomputed_semantic_gradients {
-            if semantic.len() != warp_input.shape.batch * 5 {
-                return Err(Error::InvalidConfig(
-                    "[hyperbolic_foveation] precomputed semantic gradient layout mismatch".to_owned(),
-                ));
-            }
-            let semantic = semantic.chunks_exact(5).map(|values| {
-                [values[0], values[1], values[2], values[3], values[4]]
-            }).collect();
-            (vec![0.0; warp_input.data.len()], semantic)
-        } else if let Some(grid_gradient) = precomputed_grid_gradient {
-            let semantic = crate::hyperbolic_foveation::warp_parameter_gradients_from_grid_gradient(
-                grid_gradient,
-                warp_input.shape.batch,
-                warp_input.shape.height,
-                warp_input.shape.width,
-                &params_for_grid,
-                spec.inverse_method,
-                spec.nr_iters,
-                spec.nr_eta,
-            )?;
-            (vec![0.0; warp_input.data.len()], semantic)
-        } else {
-            let (warp, semantic) = crate::hyperbolic_foveation::warp_backward_with_param_gradients(
-                &warp_input.data,
-                &output_gradient.data,
-                warp_input.shape.batch,
-                warp_input.shape.channels,
-                warp_input.shape.height,
-                warp_input.shape.width,
-                &cache.grid,
-                &params_for_grid,
-                spec.inverse_method,
-                spec.nr_iters,
-                spec.nr_eta,
-            )?;
-            (warp.input, semantic)
-        };
+    let (warp_input_gradient_data, semantic_gradients) = if let Some(semantic) =
+        precomputed_semantic_gradients
+    {
+        if semantic.len() != warp_input.shape.batch * 5 {
+            return Err(Error::InvalidConfig(
+                "[hyperbolic_foveation] precomputed semantic gradient layout mismatch".to_owned(),
+            ));
+        }
+        let semantic = semantic
+            .chunks_exact(5)
+            .map(|values| [values[0], values[1], values[2], values[3], values[4]])
+            .collect();
+        (vec![0.0; warp_input.data.len()], semantic)
+    } else if let Some(grid_gradient) = precomputed_grid_gradient {
+        let semantic = crate::hyperbolic_foveation::warp_parameter_gradients_from_grid_gradient(
+            grid_gradient,
+            warp_input.shape.batch,
+            warp_input.shape.height,
+            warp_input.shape.width,
+            &params_for_grid,
+            spec.inverse_method,
+            spec.nr_iters,
+            spec.nr_eta,
+        )?;
+        (vec![0.0; warp_input.data.len()], semantic)
+    } else {
+        let (warp, semantic) = crate::hyperbolic_foveation::warp_backward_with_param_gradients(
+            &warp_input.data,
+            &output_gradient.data,
+            warp_input.shape.batch,
+            warp_input.shape.channels,
+            warp_input.shape.height,
+            warp_input.shape.width,
+            &cache.grid,
+            &params_for_grid,
+            spec.inverse_method,
+            spec.nr_iters,
+            spec.nr_eta,
+        )?;
+        (warp.input, semantic)
+    };
     let warp_input_gradient = Tensor::from_data(warp_input.shape, warp_input_gradient_data)?;
     let mut gradient = HyperbolicFoveationParams {
         hf_params: vec![0.0; per_batch],
@@ -23900,29 +24338,29 @@ fn backward_hyperbolic_foveation(
         if defer_predictor_backward {
             Some((spec.pred_source_layer, Tensor::zeros(spec.pred_input_shape)))
         } else {
-        let predictor_source_gradient = crate::hyperbolic_foveation::predictor_backward_nchw(
-            (
-                spec.pred_input_shape.batch,
-                spec.pred_input_shape.channels,
-                spec.pred_input_shape.height,
-                spec.pred_input_shape.width,
-            ),
-            spec.downsample,
-            spec.pred_hidden,
-            per_batch,
-            &params.pred_w1,
-            &params.pred_w2,
-            predictor,
-            &constrained_seed,
-        )?;
-        gradient.pred_w1 = predictor_source_gradient.w1;
-        gradient.pred_b1 = predictor_source_gradient.b1;
-        gradient.pred_w2 = predictor_source_gradient.w2;
-        gradient.pred_b2 = predictor_source_gradient.b2;
-        Some((
-            spec.pred_source_layer,
-            Tensor::from_data(spec.pred_input_shape, predictor_source_gradient.source)?,
-        ))
+            let predictor_source_gradient = crate::hyperbolic_foveation::predictor_backward_nchw(
+                (
+                    spec.pred_input_shape.batch,
+                    spec.pred_input_shape.channels,
+                    spec.pred_input_shape.height,
+                    spec.pred_input_shape.width,
+                ),
+                spec.downsample,
+                spec.pred_hidden,
+                per_batch,
+                &params.pred_w1,
+                &params.pred_w2,
+                predictor,
+                &constrained_seed,
+            )?;
+            gradient.pred_w1 = predictor_source_gradient.w1;
+            gradient.pred_b1 = predictor_source_gradient.b1;
+            gradient.pred_w2 = predictor_source_gradient.w2;
+            gradient.pred_b2 = predictor_source_gradient.b2;
+            Some((
+                spec.pred_source_layer,
+                Tensor::from_data(spec.pred_input_shape, predictor_source_gradient.source)?,
+            ))
         }
     } else {
         if cache.predictor.is_some() {
@@ -23961,7 +24399,12 @@ fn backward_hyperbolic_foveation(
         }
         None
     };
-    Ok((warp_input_gradient, predictor_gradient, gradient, constrained_seed))
+    Ok((
+        warp_input_gradient,
+        predictor_gradient,
+        gradient,
+        constrained_seed,
+    ))
 }
 
 /// `[moe_convolutional]`'s parameters: one ordinary convolution per expert plus
@@ -29319,40 +29762,52 @@ where
     let sequence_batch = recurrent_sequence_batch(input_shape.batch, spec.steps)?;
     let inputs = input_shape.element_count();
     if output_shape.width != 1 || output_shape.height != 1 || output_shape.channels != spec.output {
-        return Err(Error::InvalidConfig("GRU output shape is inconsistent with its specification".to_owned()));
+        return Err(Error::InvalidConfig(
+            "GRU output shape is inconsistent with its specification".to_owned(),
+        ));
     }
     for (name, projection, expected_inputs) in [
-        ("input_z", &params.input_z, inputs), ("state_z", &params.state_z, spec.output),
-        ("input_r", &params.input_r, inputs), ("state_r", &params.state_r, spec.output),
-        ("input_h", &params.input_h, inputs), ("state_h", &params.state_h, spec.output),
+        ("input_z", &params.input_z, inputs),
+        ("state_z", &params.state_z, spec.output),
+        ("input_r", &params.input_r, inputs),
+        ("state_r", &params.state_r, spec.output),
+        ("input_h", &params.input_h, inputs),
+        ("state_h", &params.state_h, spec.output),
     ] {
-        if projection.weights.len() != expected_inputs * spec.output || projection.biases.len() != spec.output {
-            return Err(Error::InvalidConfig(format!("GRU {name} parameter shape is inconsistent with its specification")));
+        if projection.weights.len() != expected_inputs * spec.output
+            || projection.biases.len() != spec.output
+        {
+            return Err(Error::InvalidConfig(format!(
+                "GRU {name} parameter shape is inconsistent with its specification"
+            )));
         }
     }
-    let upload_projection = |projection: &ConnectedParams, input_size: usize| -> Result<(B::Tensor, B::Tensor)> {
-        let (weights, biases) = if let Some(batch_norm) = &projection.batch_norm {
-            validate_batchnorm_params(batch_norm, spec.output)?;
-            let mut weights = projection.weights.clone();
-            let mut biases = projection.biases.clone();
-            for output in 0..spec.output {
-                let factor = batch_norm.scales[output]
-                    / (batch_norm.rolling_variance[output] + BATCH_NORM_EPSILON).sqrt();
-                for weight in &mut weights[output * input_size..(output + 1) * input_size] {
-                    *weight *= factor;
+    let upload_projection =
+        |projection: &ConnectedParams, input_size: usize| -> Result<(B::Tensor, B::Tensor)> {
+            let (weights, biases) = if let Some(batch_norm) = &projection.batch_norm {
+                validate_batchnorm_params(batch_norm, spec.output)?;
+                let mut weights = projection.weights.clone();
+                let mut biases = projection.biases.clone();
+                for output in 0..spec.output {
+                    let factor = batch_norm.scales[output]
+                        / (batch_norm.rolling_variance[output] + BATCH_NORM_EPSILON).sqrt();
+                    for weight in &mut weights[output * input_size..(output + 1) * input_size] {
+                        *weight *= factor;
+                    }
+                    biases[output] -= batch_norm.rolling_mean[output] * factor;
                 }
-                biases[output] -= batch_norm.rolling_mean[output] * factor;
-            }
-            (weights, biases)
-        } else {
-            (projection.weights.clone(), projection.biases.clone())
+                (weights, biases)
+            } else {
+                (projection.weights.clone(), projection.biases.clone())
+            };
+            let weights = backend
+                .upload_f32(&[spec.output, input_size], &weights)
+                .map_err(|err| backend_error("upload GRU projection weights", err))?;
+            let biases = backend
+                .upload_f32(&[spec.output], &biases)
+                .map_err(|err| backend_error("upload GRU projection biases", err))?;
+            Ok((weights, biases))
         };
-        let weights = backend.upload_f32(&[spec.output, input_size], &weights)
-            .map_err(|err| backend_error("upload GRU projection weights", err))?;
-        let biases = backend.upload_f32(&[spec.output], &biases)
-            .map_err(|err| backend_error("upload GRU projection biases", err))?;
-        Ok((weights, biases))
-    };
     let input_z = upload_projection(&params.input_z, inputs)?;
     let state_z = upload_projection(&params.state_z, spec.output)?;
     let input_r = upload_projection(&params.input_r, inputs)?;
@@ -29361,56 +29816,85 @@ where
     let state_h = upload_projection(&params.state_h, spec.output)?;
     let state_shape = [sequence_batch, spec.output];
     let activation = gpu_activation_kind(layer_index, &Activation::Logistic)?;
-    let mut previous = backend.zeros_f32(&state_shape)
+    let mut previous = backend
+        .zeros_f32(&state_shape)
         .map_err(|err| backend_error("allocate GRU initial state", err))?;
     let mut outputs = Vec::with_capacity(spec.steps);
     for step in 0..spec.steps {
-        let step_input = backend.sequence_slice_f32(
-            input_gpu, &tensor_backend_shape(input_shape), step, spec.steps,
-            &[sequence_batch, inputs], config,
-        ).map_err(|err| backend_error("slice GRU input sequence", err))?;
+        let step_input = backend
+            .sequence_slice_f32(
+                input_gpu,
+                &tensor_backend_shape(input_shape),
+                step,
+                spec.steps,
+                &[sequence_batch, inputs],
+                config,
+            )
+            .map_err(|err| backend_error("slice GRU input sequence", err))?;
         let project = |x: &B::Tensor, pair: &(B::Tensor, B::Tensor), input_size: usize| {
-            backend.connected_f32(x, &pair.0, &pair.1, sequence_batch, input_size, spec.output, config)
+            backend.connected_f32(
+                x,
+                &pair.0,
+                &pair.1,
+                sequence_batch,
+                input_size,
+                spec.output,
+                config,
+            )
         };
         let input_z_value = project(&step_input, &input_z, inputs)
             .map_err(|err| backend_error("GRU update input projection", err))?;
         let state_z_value = project(&previous, &state_z, spec.output)
             .map_err(|err| backend_error("GRU update state projection", err))?;
-        let update_pre = backend.vector_add_f32(&input_z_value, &state_z_value, config)
+        let update_pre = backend
+            .vector_add_f32(&input_z_value, &state_z_value, config)
             .map_err(|err| backend_error("sum GRU update projections", err))?;
-        let update = backend.activation_f32(&update_pre, activation, config)
+        let update = backend
+            .activation_f32(&update_pre, activation, config)
             .map_err(|err| backend_error("activate GRU update gate", err))?;
         let input_r_value = project(&step_input, &input_r, inputs)
             .map_err(|err| backend_error("GRU reset input projection", err))?;
         let state_r_value = project(&previous, &state_r, spec.output)
             .map_err(|err| backend_error("GRU reset state projection", err))?;
-        let reset_pre = backend.vector_add_f32(&input_r_value, &state_r_value, config)
+        let reset_pre = backend
+            .vector_add_f32(&input_r_value, &state_r_value, config)
             .map_err(|err| backend_error("sum GRU reset projections", err))?;
-        let reset = backend.activation_f32(&reset_pre, activation, config)
+        let reset = backend
+            .activation_f32(&reset_pre, activation, config)
             .map_err(|err| backend_error("activate GRU reset gate", err))?;
-        let reset_state = backend.vector_mul_f32(&reset, &previous, &state_shape, config)
+        let reset_state = backend
+            .vector_mul_f32(&reset, &previous, &state_shape, config)
             .map_err(|err| backend_error("apply GRU reset gate", err))?;
         let input_h_value = project(&step_input, &input_h, inputs)
             .map_err(|err| backend_error("GRU candidate input projection", err))?;
         let state_h_value = project(&reset_state, &state_h, spec.output)
             .map_err(|err| backend_error("GRU candidate state projection", err))?;
-        let candidate_pre = backend.vector_add_f32(&input_h_value, &state_h_value, config)
+        let candidate_pre = backend
+            .vector_add_f32(&input_h_value, &state_h_value, config)
             .map_err(|err| backend_error("sum GRU candidate projections", err))?;
-        let candidate = backend.activation_f32(&candidate_pre, activation, config)
+        let candidate = backend
+            .activation_f32(&candidate_pre, activation, config)
             .map_err(|err| backend_error("activate GRU candidate", err))?;
-        let previous_minus_candidate = backend.saxpy_f32(-1.0, &candidate, &previous, config)
+        let previous_minus_candidate = backend
+            .saxpy_f32(-1.0, &candidate, &previous, config)
             .map_err(|err| backend_error("form GRU state difference", err))?;
-        let gated_difference = backend.vector_mul_f32(&update, &previous_minus_candidate, &state_shape, config)
+        let gated_difference = backend
+            .vector_mul_f32(&update, &previous_minus_candidate, &state_shape, config)
             .map_err(|err| backend_error("apply GRU update gate", err))?;
-        let state = backend.vector_add_f32(&candidate, &gated_difference, config)
+        let state = backend
+            .vector_add_f32(&candidate, &gated_difference, config)
             .map_err(|err| backend_error("combine GRU candidate and previous state", err))?;
         outputs.push(state.clone());
         previous = state;
     }
-    backend.sequence_concat_f32(
-        &outputs.iter().collect::<Vec<_>>(), &tensor_backend_shape(output_shape),
-        sequence_batch * spec.output, config,
-    ).map_err(|err| backend_error("concatenate GRU outputs", err))
+    backend
+        .sequence_concat_f32(
+            &outputs.iter().collect::<Vec<_>>(),
+            &tensor_backend_shape(output_shape),
+            sequence_batch * spec.output,
+            config,
+        )
+        .map_err(|err| backend_error("concatenate GRU outputs", err))
 }
 
 fn recurrent_device_tensor<B: F32TensorOpsBackend>(
@@ -32962,7 +33446,11 @@ fn plan_crop_forward(
         };
         cache.input_scales[batch] = adjustment.scale;
         for channel in 0..input_shape.channels {
-            let shift = if channel < 3 { adjustment.rgb_shift[channel] } else { 0.0 };
+            let shift = if channel < 3 {
+                adjustment.rgb_shift[channel]
+            } else {
+                0.0
+            };
             cache.input_offsets[batch * input_shape.channels + channel] =
                 adjustment.translate + shift;
         }
@@ -34677,20 +35165,12 @@ fn forward_upsample(
 
     let mut output = Tensor::zeros(output_shape);
     if spec.reverse {
-        let covered_height = output
-            .shape
-            .height
-            .checked_mul(stride)
-            .ok_or_else(|| {
-                Error::InvalidConfig("reverse upsample covered height overflows".to_owned())
-            })?;
-        let covered_width = output
-            .shape
-            .width
-            .checked_mul(stride)
-            .ok_or_else(|| {
-                Error::InvalidConfig("reverse upsample covered width overflows".to_owned())
-            })?;
+        let covered_height = output.shape.height.checked_mul(stride).ok_or_else(|| {
+            Error::InvalidConfig("reverse upsample covered height overflows".to_owned())
+        })?;
+        let covered_width = output.shape.width.checked_mul(stride).ok_or_else(|| {
+            Error::InvalidConfig("reverse upsample covered width overflows".to_owned())
+        })?;
         for b in 0..output.shape.batch {
             for c in 0..output.shape.channels {
                 for y in 0..covered_height {
@@ -34824,10 +35304,9 @@ mod tests {
 
     use super::{
         ConvolutionalParams, ExecutableNetwork, ForwardResult, GpuExecutableNetwork,
-        HostAdamLayerState, LayerParams, LayerTrainBuffers, MuonLayerState, Tensor,
-        backward_reorg, backward_route, backward_softmax, backward_upsample, compute_learning_rate,
-        forward_reorg, forward_route, forward_softmax, forward_upsample, sgd_update,
-        write_muon_layer_state,
+        HostAdamLayerState, LayerParams, LayerTrainBuffers, MuonLayerState, Tensor, backward_reorg,
+        backward_route, backward_softmax, backward_upsample, compute_learning_rate, forward_reorg,
+        forward_route, forward_softmax, forward_upsample, sgd_update, write_muon_layer_state,
     };
 
     fn fill_wmhf_test_params(executable: &mut ExecutableNetwork) {
@@ -35368,15 +35847,21 @@ mod tests {
             let device_train = gpu.device_dcnv4_train_buffers.borrow();
             let device_train = device_train[0].as_ref().unwrap();
             assert_eq!(
-                gpu.backend.download_f32(&device_train.offset_weight_updates).unwrap(),
+                gpu.backend
+                    .download_f32(&device_train.offset_weight_updates)
+                    .unwrap(),
                 cpu_train.offset_weight_updates
             );
             assert_eq!(
-                gpu.backend.download_f32(&device_train.offset_bias_updates).unwrap(),
+                gpu.backend
+                    .download_f32(&device_train.offset_bias_updates)
+                    .unwrap(),
                 cpu_train.offset_bias_updates
             );
             assert_eq!(
-                gpu.backend.download_f32(&device_train.bias_updates).unwrap(),
+                gpu.backend
+                    .download_f32(&device_train.bias_updates)
+                    .unwrap(),
                 cpu_train.bias_updates
             );
         }
@@ -35422,9 +35907,8 @@ mod tests {
 
         for batch in 0..shape.batch {
             for location in 0..spatial {
-                let source = |channel: usize| {
-                    input_data[batch * plane + channel * spatial + location]
-                };
+                let source =
+                    |channel: usize| input_data[batch * plane + channel * spatial + location];
                 let maximum = source(5).max(source(6));
                 let p5 = (source(5) - maximum).exp();
                 let p6 = (source(6) - maximum).exp();
@@ -35848,8 +36332,10 @@ mod tests {
         cpu.zero_train_buffers();
         gpu.zero_train_buffers_gpu().unwrap();
         let seeds = [Some(seed.clone())];
-        cpu.backward_accumulate_seeded(&input, &forward, &seeds).unwrap();
-        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds).unwrap();
+        cpu.backward_accumulate_seeded(&input, &forward, &seeds)
+            .unwrap();
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .unwrap();
         cpu.update_weights(0.01, 0.9, 0.0, 1);
         gpu.update_weights_gpu(0.01, 0.9, 0.0, 1).unwrap();
         let (LayerParams::GraphConv(cpu_params), LayerParams::GraphConv(gpu_params)) =
@@ -35982,11 +36468,8 @@ mod tests {
         batch_norm.scales[0] = 1.4;
         batch_norm.rolling_mean[0] = 0.25;
         batch_norm.rolling_variance[0] = 0.6;
-        let input = Tensor::from_data(
-            TensorShape::new(2, 1, 1, 2),
-            vec![0.2, -0.4, 0.8, 0.5],
-        )
-        .unwrap();
+        let input =
+            Tensor::from_data(TensorShape::new(2, 1, 1, 2), vec![0.2, -0.4, 0.8, 0.5]).unwrap();
         let cpu_forward = cpu.forward(&input).unwrap();
         let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
         gpu.params = cpu.params.clone();
@@ -36135,7 +36618,7 @@ mod tests {
     }
 
     #[test]
-    fn dsconv_runtime_forward_backward_and_gpu_execution_gate() {
+    fn dsconv_runtime_forward_backward_and_native_backend_gate() {
         let network = Network::from_config(
             ConfigFile::parse_str(
                 "dsconv-runtime.cfg",
@@ -36184,22 +36667,14 @@ mod tests {
                 .any(|value| *value != 0.0)
         );
 
-        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        let gpu = GpuExecutableNetwork::new(network, FakeBackend);
         let error = gpu
             .forward(&input)
-            .expect_err("Stage-1 DSConv must reject GPU execution");
+            .expect_err("FakeBackend does not implement native DSConv");
         assert!(
             error
                 .to_string()
-                .contains("[dsconv] GPU execution is not implemented")
-        );
-        let error = gpu
-            .update_weights_gpu(0.01, 0.9, 0.0, 1)
-            .expect_err("Stage-1 DSConv must reject GPU updates");
-        assert!(
-            error
-                .to_string()
-                .contains("[dsconv] GPU updates are not implemented")
+                .contains("backend does not provide native f32 [dsconv]")
         );
     }
 
@@ -37426,19 +37901,27 @@ num_dwconv=1
         let device_train = gpu.device_dcnv4_train_buffers.borrow();
         let device_train = device_train[0].as_ref().unwrap();
         assert_eq!(
-            gpu.backend.download_f32(&device_train.offset_weight_updates).unwrap(),
+            gpu.backend
+                .download_f32(&device_train.offset_weight_updates)
+                .unwrap(),
             cpu_train.offset_weight_updates
         );
         assert_eq!(
-            gpu.backend.download_f32(&device_train.offset_bias_updates).unwrap(),
+            gpu.backend
+                .download_f32(&device_train.offset_bias_updates)
+                .unwrap(),
             cpu_train.offset_bias_updates
         );
         assert_eq!(
-            gpu.backend.download_f32(&device_train.bias_updates).unwrap(),
+            gpu.backend
+                .download_f32(&device_train.bias_updates)
+                .unwrap(),
             cpu_train.bias_updates
         );
         assert_eq!(
-            gpu.backend.download_f32(device_train.scale_updates.as_ref().unwrap()).unwrap(),
+            gpu.backend
+                .download_f32(device_train.scale_updates.as_ref().unwrap())
+                .unwrap(),
             cpu_train.batch_norm.as_ref().unwrap().scale_updates
         );
         let LayerParams::Dcnv4(params) = &cpu.params[0] else {
@@ -38182,7 +38665,10 @@ num_dwconv=1
         let forward = executable.forward(&input).expect("crop forward succeeds");
         assert_eq!(
             forward.final_output().expect("crop output").data,
-            vec![11.0, 12.0, 13.0, 111.0, 112.0, 113.0, 1011.0, 1012.0, 1013.0, 1111.0, 1112.0, 1113.0]
+            vec![
+                11.0, 12.0, 13.0, 111.0, 112.0, 113.0, 1011.0, 1012.0, 1013.0, 1111.0, 1112.0,
+                1113.0
+            ]
         );
         let cache = forward.crop_caches[0]
             .as_ref()
@@ -40371,8 +40857,10 @@ num_dwconv=1
                 (0..channels).flat_map(move |c| {
                     (0..height).flat_map(move |y| {
                         (0..width).map(move |x| {
-                            -1.1 + 0.6 * n as f32 + 0.3 * c as f32
-                                + 0.12 * y as f32 + 0.05 * x as f32
+                            -1.1 + 0.6 * n as f32
+                                + 0.3 * c as f32
+                                + 0.12 * y as f32
+                                + 0.05 * x as f32
                         })
                     })
                 })
@@ -40424,8 +40912,8 @@ num_dwconv=1
         let input = Tensor::from_data(
             TensorShape::new(3, 2, 2, 2),
             vec![
-                1., 2., 3., 4., 5., 6., 11., 12., 13., 14., 15., 16.,
-                101., 102., 103., 104., 105., 106., 111., 112., 113., 114., 115., 116.,
+                1., 2., 3., 4., 5., 6., 11., 12., 13., 14., 15., 16., 101., 102., 103., 104., 105.,
+                106., 111., 112., 113., 114., 115., 116.,
             ],
         )
         .expect("connected axis input");
@@ -40447,8 +40935,8 @@ num_dwconv=1
         assert_slice_close(
             "connected [out][in] adjoint per batch row",
             &[
-                1., 0., 0., 3., 0., 4., 2., 0., 3., 0., -3., 0.5,
-                4., 0., 0., 6., 0., 10., 5., 0., 6., 0., -6., 2.,
+                1., 0., 0., 3., 0., 4., 2., 0., 3., 0., -3., 0.5, 4., 0., 0., 6., 0., 10., 5., 0.,
+                6., 0., -6., 2.,
             ],
             &backward.input_gradient.data,
             1e-6,
@@ -40478,33 +40966,44 @@ num_dwconv=1
                 (plane * 100 + position + 1) as f32
             })
             .collect();
-        let input = Tensor::from_data(TensorShape::new(5, 3, 2, 2), values)
-            .expect("local avgpool input");
-        let forward = executable
-            .forward(&input)
-            .expect("local avgpool forward");
+        let input =
+            Tensor::from_data(TensorShape::new(5, 3, 2, 2), values).expect("local avgpool input");
+        let forward = executable.forward(&input).expect("local avgpool forward");
         assert_slice_close(
             "local avgpool NCHW output",
             &[
-                7.0, 9.0, 9.5, 11.5, 107.0, 109.0, 109.5, 111.5,
-                207.0, 209.0, 209.5, 211.5, 307.0, 309.0, 309.5, 311.5,
+                7.0, 9.0, 9.5, 11.5, 107.0, 109.0, 109.5, 111.5, 207.0, 209.0, 209.5, 211.5, 307.0,
+                309.0, 309.5, 311.5,
             ],
             &forward.layer_outputs[0].data,
             1e-6,
         );
         let seeds = Tensor::from_data(
             output_shape,
-            vec![1.0, 0.0, 0.0, 2.0, 2.0, 0.0, 0.0, 4.0,
-                 3.0, 0.0, 0.0, 6.0, 4.0, 0.0, 0.0, 8.0],
+            vec![
+                1.0, 0.0, 0.0, 2.0, 2.0, 0.0, 0.0, 4.0, 3.0, 0.0, 0.0, 6.0, 4.0, 0.0, 0.0, 8.0,
+            ],
         )
         .expect("local avgpool seeds");
         let backward = executable
             .backward(&input, &forward, &seeds)
             .expect("local avgpool backward");
         let one_plane = [
-            1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 0.0, 0.0,
-            1.0 / 9.0, 1.0 / 9.0, 4.0 / 9.0, 1.0 / 3.0, 1.0 / 3.0,
-            1.0 / 9.0, 1.0 / 9.0, 4.0 / 9.0, 1.0 / 3.0, 1.0 / 3.0,
+            1.0 / 9.0,
+            1.0 / 9.0,
+            1.0 / 9.0,
+            0.0,
+            0.0,
+            1.0 / 9.0,
+            1.0 / 9.0,
+            4.0 / 9.0,
+            1.0 / 3.0,
+            1.0 / 3.0,
+            1.0 / 9.0,
+            1.0 / 9.0,
+            4.0 / 9.0,
+            1.0 / 3.0,
+            1.0 / 3.0,
         ];
         let expected: Vec<f32> = [1.0, 2.0, 3.0, 4.0]
             .into_iter()
@@ -40535,8 +41034,8 @@ num_dwconv=1
         let input = Tensor::from_data(
             TensorShape::new(3, 2, 2, 2),
             vec![
-                1., 2., 3., 4., 5., 6., 10., 20., 30., 40., 50., 60.,
-                101., 102., 103., 104., 105., 106., 110., 120., 130., 140., 150., 160.,
+                1., 2., 3., 4., 5., 6., 10., 20., 30., 40., 50., 60., 101., 102., 103., 104., 105.,
+                106., 110., 120., 130., 140., 150., 160.,
             ],
         )
         .expect("avgpool input");
@@ -40547,16 +41046,18 @@ num_dwconv=1
             &forward.layer_outputs[0].data,
             1e-6,
         );
-        let seed = Tensor::from_data(
-            TensorShape::new(1, 1, 2, 2),
-            vec![1.0, 2.0, 3.0, 4.0],
-        )
-        .expect("avgpool seed");
+        let seed = Tensor::from_data(TensorShape::new(1, 1, 2, 2), vec![1.0, 2.0, 3.0, 4.0])
+            .expect("avgpool seed");
         let backward = executable
             .backward(&input, &forward, &seed)
             .expect("avgpool backward");
-        let expected = [vec![1.0 / 6.0; 6], vec![2.0 / 6.0; 6], vec![3.0 / 6.0; 6], vec![4.0 / 6.0; 6]]
-            .concat();
+        let expected = [
+            vec![1.0 / 6.0; 6],
+            vec![2.0 / 6.0; 6],
+            vec![3.0 / 6.0; 6],
+            vec![4.0 / 6.0; 6],
+        ]
+        .concat();
         assert_slice_close(
             "avgpool per-sample channel gradient",
             &expected,
@@ -40579,29 +41080,30 @@ num_dwconv=1
             .expect("depth cfg"),
         )
         .expect("depth network");
-        assert_eq!(depth_net.layers[0].output_shape, TensorShape::new(3, 2, 2, 2));
+        assert_eq!(
+            depth_net.layers[0].output_shape,
+            TensorShape::new(3, 2, 2, 2)
+        );
         let depth_shape = TensorShape::new(3, 2, 5, 2);
         let depth_input = Tensor::from_data(
             depth_shape,
             vec![
-                0., 1., 10., 11., 20., 21., 100., 101., 110., 111., 120., 121.,
-                400., 201., 210., 211., 220., 221., 300., 301., 310., 311., 320., 321.,
-                400., 401., 410., 411., 420., 421., 1000., 1001., 1010., 1011., 1020.,
-                1021., 1100., 1101., 1110., 1111., 1120., 1121., 1200., 1201., 1210.,
-                1211., 1220., 1221., 1300., 1301., 1310., 1311., 1320., 1321., 1400.,
-                1401., 1410., 1411., 1420., 1421.,
+                0., 1., 10., 11., 20., 21., 100., 101., 110., 111., 120., 121., 400., 201., 210.,
+                211., 220., 221., 300., 301., 310., 311., 320., 321., 400., 401., 410., 411., 420.,
+                421., 1000., 1001., 1010., 1011., 1020., 1021., 1100., 1101., 1110., 1111., 1120.,
+                1121., 1200., 1201., 1210., 1211., 1220., 1221., 1300., 1301., 1310., 1311., 1320.,
+                1321., 1400., 1401., 1410., 1411., 1420., 1421.,
             ],
         )
         .expect("depth input");
         let depth_output_shape = TensorShape::new(3, 2, 2, 2);
-        let depth_output = super::forward_maxpool_depth(&depth_input, depth_output_shape)
-            .expect("depth forward");
+        let depth_output =
+            super::forward_maxpool_depth(&depth_input, depth_output_shape).expect("depth forward");
         assert_eq!(
             depth_output.data,
             vec![
-                400., 401., 410., 411., 420., 421., 300., 301., 310., 311., 320., 321.,
-                1400., 1401., 1410., 1411., 1420., 1421., 1300., 1301., 1310., 1311.,
-                1320., 1321.,
+                400., 401., 410., 411., 420., 421., 300., 301., 310., 311., 320., 321., 1400.,
+                1401., 1410., 1411., 1420., 1421., 1300., 1301., 1310., 1311., 1320., 1321.,
             ]
         );
         let depth_seed = Tensor::from_data(
@@ -40609,15 +41111,15 @@ num_dwconv=1
             (1..=24).map(|value| value as f32).collect(),
         )
         .expect("depth seed");
-        let depth_dx = super::backward_maxpool_depth(&depth_input, &depth_seed)
-            .expect("depth backward");
+        let depth_dx =
+            super::backward_maxpool_depth(&depth_input, &depth_seed).expect("depth backward");
         assert_eq!(
             depth_dx.data,
             vec![
-                0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 1., 0., 0., 0., 0., 0.,
-                7., 8., 9., 10., 11., 12., 0., 2., 3., 4., 5., 6., 0., 0., 0., 0., 0., 0.,
-                0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 19., 20., 21., 22., 23.,
-                24., 13., 14., 15., 16., 17., 18.,
+                0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 1., 0., 0., 0., 0., 0., 7., 8., 9.,
+                10., 11., 12., 0., 2., 3., 4., 5., 6., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0.,
+                0., 0., 0., 0., 0., 0., 0., 19., 20., 21., 22., 23., 24., 13., 14., 15., 16., 17.,
+                18.,
             ]
         );
 
@@ -40633,7 +41135,10 @@ num_dwconv=1
             .expect("spatial cfg"),
         )
         .expect("spatial network");
-        assert_eq!(spatial_net.layers[0].output_shape, TensorShape::new(2, 2, 2, 2));
+        assert_eq!(
+            spatial_net.layers[0].output_shape,
+            TensorShape::new(2, 2, 2, 2)
+        );
         let shape = TensorShape::new(5, 3, 2, 2);
         let mut spatial_values: Vec<f32> = (0..60)
             .map(|index| {
@@ -40651,24 +41156,20 @@ num_dwconv=1
         assert_eq!(
             output.data,
             vec![
-                13., 15., 13., 15., 113., 115., 113., 115.,
-                213., 215., 213., 215., 313., 315., 313., 315.,
+                13., 15., 13., 15., 113., 115., 113., 115., 213., 215., 213., 215., 313., 315.,
+                313., 315.,
             ]
         );
-        let seed = Tensor::from_data(
-            output_shape,
-            (1..=16).map(|value| value as f32).collect(),
-        )
-        .expect("spatial seed");
+        let seed = Tensor::from_data(output_shape, (1..=16).map(|value| value as f32).collect())
+            .expect("spatial seed");
         let dx = super::backward_maxpool(3, 2, 1, 1, &input, &seed, false, true)
             .expect("zero_nonmax backward");
         assert_eq!(
             dx.data,
             vec![
-                1., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 3., 0., 6.,
-                0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 12., 0., 14.,
-                0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 20., 0., 22.,
-                0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 28., 0., 30.,
+                1., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 3., 0., 6., 0., 0., 0., 0., 0., 0.,
+                0., 0., 0., 0., 0., 0., 12., 0., 14., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0.,
+                0., 20., 0., 22., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 28., 0., 30.,
             ]
         );
     }
@@ -43597,6 +44098,90 @@ num_dwconv=1
     }
 
     #[test]
+    fn rnn_axis_layout_pins_cpp_step_batch_and_input_channels() {
+        // C++ `forward_rnn_layer` advances `state.input` by `l.inputs*l.batch`
+        // each step, keeps state rows independent per sample, and writes each
+        // step to its output-layer slice (`rnn_layer.cpp:92-133`).
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "rnn-axis-layout.cfg",
+                "[net]\nwidth=3\nheight=1\nchannels=1\nbatch=2\ntime_steps=2\n[rnn]\nhidden=2\noutput=3\nactivation=linear\n",
+            )
+            .expect("RNN axis config should parse"),
+        )
+        .expect("RNN axis network should build");
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::Rnn(params) = &mut executable.params[0] else {
+            panic!("expected RNN parameters");
+        };
+        params
+            .input
+            .weights
+            .copy_from_slice(&[1.0, 2.0, 4.0, 3.0, 5.0, 7.0]);
+        params
+            .self_params
+            .weights
+            .copy_from_slice(&[0.5, 0.25, 0.2, 0.6]);
+        params
+            .output
+            .weights
+            .copy_from_slice(&[1.0, 0.0, 0.0, 1.0, 2.0, -1.0]);
+        params.input.biases.fill(0.0);
+        params.self_params.biases.fill(0.0);
+        params.output.biases.fill(0.0);
+
+        let sequence_batch = 2;
+        let steps = 2;
+        let inputs = 3;
+        let mut input_values = Vec::with_capacity(steps * sequence_batch * inputs);
+        for step in 0..steps {
+            for sample in 0..sequence_batch {
+                for channel in 0..inputs {
+                    input_values
+                        .push(crate::axis_fixture::axis_value(step, sample, 0, channel) + 1.0);
+                }
+            }
+        }
+        let input = Tensor::from_data(executable.network.net.input_shape(), input_values.clone())
+            .expect("RNN axis input should have the expected shape");
+        let forward = executable
+            .forward(&input)
+            .expect("RNN forward should succeed");
+        let output = forward.final_output().expect("RNN output should exist");
+
+        // Independent source-order calculation: weights are [out][in], the
+        // sequence input is [step][sample][input], and output is
+        // [step][sample][output].
+        let mut expected = vec![0.0; steps * sequence_batch * 3];
+        let mut previous = [[0.0f32; 2]; 2];
+        for step in 0..steps {
+            for sample in 0..sequence_batch {
+                let src = (step * sequence_batch + sample) * inputs;
+                let x = &input_values[src..src + inputs];
+                let mut state = [
+                    x[0] + 2.0 * x[1] + 4.0 * x[2],
+                    3.0 * x[0] + 5.0 * x[1] + 7.0 * x[2],
+                ];
+                state[0] += 0.5 * previous[sample][0] + 0.25 * previous[sample][1];
+                state[1] += 0.2 * previous[sample][0] + 0.6 * previous[sample][1];
+                let dst = (step * sequence_batch + sample) * 3;
+                expected[dst] = state[0];
+                expected[dst + 1] = state[1];
+                expected[dst + 2] = 2.0 * state[0] - state[1];
+                previous[sample] = state;
+            }
+        }
+        assert_eq!(output.shape.batch, 4, "time-major flattened batch");
+        assert_eq!(output.shape.channels, 3);
+        for (index, (&actual, &want)) in output.data.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - want).abs() <= 2.0e-5 * (1.0 + want.abs()),
+                "RNN step/sample/output axis at flat index {index}: {actual} != {want}"
+            );
+        }
+    }
+
+    #[test]
     fn rnn_forward_backward_and_weight_updates_are_wired() {
         let network = Network::from_config(
             ConfigFile::parse_str(
@@ -44075,6 +44660,120 @@ num_dwconv=1
                 &cpu_conv.biases,
                 &gpu_conv.biases,
                 4e-4,
+            );
+        }
+    }
+
+    #[test]
+    fn lstm_axis_layout_pins_cpp_gate_blocks_steps_and_samples() {
+        // C++ constructs and evaluates separate `uf/ui/ug/uo` and
+        // `wf/wi/wg/wo` projections, then forms the cell in f,i,g,o order and
+        // writes time-major output slices (`lstm_layer.cpp:46-83,177-260`).
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "lstm-axis-layout.cfg",
+                "[net]\nwidth=3\nheight=1\nchannels=1\nbatch=2\ntime_steps=2\n[lstm]\noutput=2\n",
+            )
+            .expect("LSTM axis config should parse"),
+        )
+        .expect("LSTM axis network should build");
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::Lstm(params) = &mut executable.params[0] else {
+            panic!("expected LSTM parameters");
+        };
+        for recurrent in [
+            &mut params.wf,
+            &mut params.wi,
+            &mut params.wg,
+            &mut params.wo,
+        ] {
+            recurrent.weights.fill(0.0);
+            recurrent.biases.fill(0.0);
+        }
+        params
+            .uf
+            .weights
+            .copy_from_slice(&[0.11, -0.07, 0.03, -0.05, 0.09, 0.02]);
+        params
+            .ui
+            .weights
+            .copy_from_slice(&[-0.03, 0.08, 0.06, 0.12, -0.04, 0.07]);
+        params
+            .ug
+            .weights
+            .copy_from_slice(&[0.09, 0.02, -0.06, -0.08, 0.05, 0.1]);
+        params
+            .uo
+            .weights
+            .copy_from_slice(&[-0.04, 0.1, 0.03, 0.06, -0.09, 0.02]);
+        params.uf.biases.copy_from_slice(&[0.12, -0.08]);
+        params.ui.biases.copy_from_slice(&[-0.1, 0.14]);
+        params.ug.biases.copy_from_slice(&[0.05, -0.07]);
+        params.uo.biases.copy_from_slice(&[0.03, 0.09]);
+        let uf_weights = params.uf.weights.clone();
+        let ui_weights = params.ui.weights.clone();
+        let ug_weights = params.ug.weights.clone();
+        let uo_weights = params.uo.weights.clone();
+        let uf_biases = params.uf.biases.clone();
+        let ui_biases = params.ui.biases.clone();
+        let ug_biases = params.ug.biases.clone();
+        let uo_biases = params.uo.biases.clone();
+
+        let (steps, samples, inputs, hidden) = (2usize, 2usize, 3usize, 2usize);
+        let mut input_values = Vec::with_capacity(steps * samples * inputs);
+        for step in 0..steps {
+            for sample in 0..samples {
+                for feature in 0..inputs {
+                    input_values.push(
+                        crate::axis_fixture::axis_value(step, sample, 0, feature) * 0.001 + 0.1,
+                    );
+                }
+            }
+        }
+        let input = Tensor::from_data(executable.network.net.input_shape(), input_values.clone())
+            .expect("LSTM axis input should have expected shape");
+        let forward = executable
+            .forward(&input)
+            .expect("LSTM forward should succeed");
+        let output = forward.final_output().expect("LSTM output should exist");
+
+        let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
+        let project = |weights: &[f32], bias: &[f32], feature: usize, input: &[f32]| {
+            bias[feature]
+                + weights[feature * inputs..(feature + 1) * inputs]
+                    .iter()
+                    .zip(input)
+                    .map(|(weight, value)| weight * value)
+                    .sum::<f32>()
+        };
+        let mut expected = vec![0.0; steps * samples * hidden];
+        let mut previous_cell = [[0.0f32; 2]; 2];
+        for step in 0..steps {
+            for sample in 0..samples {
+                let src = (step * samples + sample) * inputs;
+                let x = &input_values[src..src + inputs];
+                for feature in 0..hidden {
+                    let f = sigmoid(project(&uf_weights, &uf_biases, feature, x));
+                    let i = sigmoid(project(&ui_weights, &ui_biases, feature, x));
+                    let g = project(&ug_weights, &ug_biases, feature, x).tanh();
+                    let o = sigmoid(project(&uo_weights, &uo_biases, feature, x));
+                    let cell = f * previous_cell[sample][feature] + i * g;
+                    let state = o * cell.tanh();
+                    expected[(step * samples + sample) * hidden + feature] = state;
+                    previous_cell[sample][feature] = cell;
+                }
+            }
+        }
+        assert_eq!(
+            output.shape.batch,
+            steps * samples,
+            "time-major output batch"
+        );
+        assert_eq!(output.shape.channels, hidden);
+        for (index, (&actual, &want)) in output.data.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - want).abs() <= 2.0e-6 * (1.0 + want.abs()),
+                "LSTM gate/step/sample axis at flat index {index}: {actual} != {want}"
             );
         }
     }
@@ -44606,6 +45305,115 @@ num_dwconv=1
             gpu.gradients_non_finite()
                 .expect("CRNN BN host scale overflow check")
         );
+    }
+
+    #[test]
+    fn crnn_axis_layout_pins_cpp_spatial_step_and_sample_order() {
+        // C++ runs input/self/output convolutions per time step, adds the
+        // per-spatial hidden state, advances the input slice, and appends an
+        // output convolution slice (`crnn_layer.cpp:165-218`).
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "crnn-axis-layout.cfg",
+                "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=2\ntime_steps=2\n[crnn]\nhidden=2\noutput=2\nsize=1\nstride=1\npad=0\nactivation=linear\nshortcut=0\n",
+            )
+            .expect("CRNN axis config should parse"),
+        )
+        .expect("CRNN axis network should build");
+        let mut executable = ExecutableNetwork::new(network);
+        let LayerParams::Crnn(params) = &mut executable.params[0] else {
+            panic!("expected CRNN parameters");
+        };
+        params.input.weights.copy_from_slice(&[0.5, -0.25]);
+        params.input.biases.copy_from_slice(&[0.1, -0.05]);
+        params
+            .self_params
+            .weights
+            .copy_from_slice(&[0.3, 0.1, -0.2, 0.4]);
+        params.self_params.biases.copy_from_slice(&[0.02, -0.03]);
+        params
+            .output
+            .weights
+            .copy_from_slice(&[1.0, -0.5, 0.25, 0.75]);
+        params.output.biases.copy_from_slice(&[-0.01, 0.04]);
+        let input_weights = params.input.weights.clone();
+        let input_biases = params.input.biases.clone();
+        let self_weights = params.self_params.weights.clone();
+        let self_biases = params.self_params.biases.clone();
+        let output_weights = params.output.weights.clone();
+        let output_biases = params.output.biases.clone();
+
+        let (steps, samples, height, width) = (2usize, 2usize, 2usize, 3usize);
+        let area = height * width;
+        let mut input_values = Vec::with_capacity(steps * samples * area);
+        for step in 0..steps {
+            for sample in 0..samples {
+                for y in 0..height {
+                    for x in 0..width {
+                        input_values.push(
+                            crate::axis_fixture::axis_value(step, sample, y, x) * 0.001 + 0.01,
+                        );
+                    }
+                }
+            }
+        }
+        let input = Tensor::from_data(executable.network.net.input_shape(), input_values.clone())
+            .expect("CRNN axis input should have expected shape");
+        let forward = executable
+            .forward(&input)
+            .expect("CRNN forward should succeed");
+        let output = forward.final_output().expect("CRNN output should exist");
+
+        let mut expected = vec![0.0; steps * samples * 2 * area];
+        let mut previous = vec![[0.0f32; 2]; samples * area];
+        for step in 0..steps {
+            for sample in 0..samples {
+                for spatial in 0..area {
+                    let input_index = (step * samples + sample) * area + spatial;
+                    let value = input_values[input_index];
+                    let old = previous[sample * area + spatial];
+                    let state = [
+                        input_weights[0] * value
+                            + input_biases[0]
+                            + self_weights[0] * old[0]
+                            + self_weights[1] * old[1]
+                            + self_biases[0],
+                        input_weights[1] * value
+                            + input_biases[1]
+                            + self_weights[2] * old[0]
+                            + self_weights[3] * old[1]
+                            + self_biases[1],
+                    ];
+                    let dst = (step * samples + sample) * 2 * area + spatial;
+                    expected[dst] = output_weights[0] * state[0]
+                        + output_weights[1] * state[1]
+                        + output_biases[0];
+                    expected[dst + area] = output_weights[2] * state[0]
+                        + output_weights[3] * state[1]
+                        + output_biases[1];
+                    previous[sample * area + spatial] = state;
+                }
+            }
+        }
+        assert_eq!(
+            output.shape.batch,
+            steps * samples,
+            "time-major output batch"
+        );
+        assert_eq!(
+            (
+                output.shape.channels,
+                output.shape.height,
+                output.shape.width
+            ),
+            (2, height, width)
+        );
+        for (index, (&actual, &want)) in output.data.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - want).abs() <= 2.0e-6 * (1.0 + want.abs()),
+                "CRNN time/sample/channel/spatial axis at flat index {index}: {actual} != {want}"
+            );
+        }
     }
 
     #[test]
@@ -45834,11 +46642,15 @@ num_dwconv=1
             panic!("expected route layer");
         };
         let source_shape = TensorShape::new(3, 2, 4, 2);
-        let source0 = Tensor::from_data(source_shape, axis_tensor(source_shape))
-            .expect("first axis source");
+        let source0 =
+            Tensor::from_data(source_shape, axis_tensor(source_shape)).expect("first axis source");
         let source1 = Tensor::from_data(
             source_shape,
-            source0.data.iter().map(|value| -2.0 * value + 0.25).collect(),
+            source0
+                .data
+                .iter()
+                .map(|value| -2.0 * value + 0.25)
+                .collect(),
         )
         .expect("second axis source");
         let sources = vec![source0.clone(), source1.clone()];
@@ -45879,14 +46691,8 @@ num_dwconv=1
         )
         .expect("route seed");
         let mut source_grads = vec![Tensor::zeros(source_shape), Tensor::zeros(source_shape)];
-        backward_route(
-            spec,
-            route_index,
-            &seed,
-            &mut source_grads,
-            &network.layers,
-        )
-        .expect("route gradient scatter");
+        backward_route(spec, route_index, &seed, &mut source_grads, &network.layers)
+            .expect("route gradient scatter");
         for n in 0..2 {
             for c in 0..4 {
                 for h in 0..2 {
@@ -45932,8 +46738,7 @@ num_dwconv=1
         };
         let low_shape = forward_network.net.input_shape();
         let high_shape = forward_network.layers[0].output_shape;
-        let low_input =
-            Tensor::from_data(low_shape, axis_tensor(low_shape)).expect("low input");
+        let low_input = Tensor::from_data(low_shape, axis_tensor(low_shape)).expect("low input");
         let high_output =
             forward_upsample(forward_spec, &low_input, high_shape).expect("upsample forward");
         assert_eq!(high_shape, TensorShape::new(6, 4, 2, 2));
@@ -45951,10 +46756,9 @@ num_dwconv=1
                 }
             }
         }
-        let high_seed =
-            Tensor::from_data(high_shape, axis_tensor(high_shape)).expect("high seed");
-        let low_gradient = backward_upsample(forward_spec, &high_seed, low_shape)
-            .expect("upsample backward");
+        let high_seed = Tensor::from_data(high_shape, axis_tensor(high_shape)).expect("high seed");
+        let low_gradient =
+            backward_upsample(forward_spec, &high_seed, low_shape).expect("upsample backward");
         for n in 0..2 {
             for c in 0..2 {
                 for y in 0..2 {
@@ -46013,10 +46817,9 @@ num_dwconv=1
                 }
             }
         }
-        let low_seed =
-            Tensor::from_data(low_shape, axis_tensor(low_shape)).expect("low seed");
-        let high_gradient = backward_upsample(reverse_spec, &low_seed, high_shape)
-            .expect("reverse adjoint");
+        let low_seed = Tensor::from_data(low_shape, axis_tensor(low_shape)).expect("low seed");
+        let high_gradient =
+            backward_upsample(reverse_spec, &low_seed, high_shape).expect("reverse adjoint");
         for n in 0..2 {
             for c in 0..2 {
                 for y in 0..3 {
@@ -46081,8 +46884,8 @@ num_dwconv=1
         }
         let packed_seed =
             Tensor::from_data(packed_shape, axis_tensor(packed_shape)).expect("packed seed");
-        let input_gradient = backward_reorg(regular_spec, &packed_seed, input_shape)
-            .expect("regular Reorg adjoint");
+        let input_gradient =
+            backward_reorg(regular_spec, &packed_seed, input_shape).expect("regular Reorg adjoint");
         for n in 0..2 {
             for c in 0..2 {
                 for y in 0..2 {
@@ -46110,20 +46913,26 @@ num_dwconv=1
         let input = Tensor::from_data(shape, axis_tensor(shape)).expect("SAM input");
         let source = Tensor::from_data(
             shape,
-            axis_tensor(shape).into_iter().map(|value| value + 0.5).collect(),
+            axis_tensor(shape)
+                .into_iter()
+                .map(|value| value + 0.5)
+                .collect(),
         )
         .expect("named SAM source");
         let seed = Tensor::from_data(
             shape,
-            axis_tensor(shape).into_iter().map(|value| value + 0.25).collect(),
+            axis_tensor(shape)
+                .into_iter()
+                .map(|value| value + 0.25)
+                .collect(),
         )
         .expect("SAM adjoint seed");
         let spec = SamSpec {
             from: 0,
             activation: Activation::Linear,
         };
-        let (output, activation_input) = super::forward_sam(&spec, &input, &source, shape)
-            .expect("SAM forward");
+        let (output, activation_input) =
+            super::forward_sam(&spec, &input, &source, shape).expect("SAM forward");
         let (input_gradient, source_gradient) = super::backward_sam(
             &spec,
             &input,
@@ -46168,8 +46977,8 @@ num_dwconv=1
             } else {
                 TensorShape::new(1, 1, 2, 2)
             };
-            let input = Tensor::from_data(input_shape, axis_tensor(input_shape))
-                .expect("scale input");
+            let input =
+                Tensor::from_data(input_shape, axis_tensor(input_shape)).expect("scale input");
             let spec = ScaleChannelsSpec {
                 from: 0,
                 scale_wh,
@@ -46189,7 +46998,8 @@ num_dwconv=1
                 activation_input.as_ref(),
             )
             .expect("scale_channels backward");
-            let mut expected_input_gradient = vec![0.0; input_shape.element_count() * input_shape.batch];
+            let mut expected_input_gradient =
+                vec![0.0; input_shape.element_count() * input_shape.batch];
             for n in 0..source_shape.batch {
                 for c in 0..source_shape.channels {
                     for h in 0..source_shape.height {
@@ -46309,8 +47119,7 @@ num_dwconv=1
                 for index in start..end {
                     let want = output.data[index] * (seed.data[index] - dot);
                     assert_eq!(
-                        input_gradient.data[index],
-                        want,
+                        input_gradient.data[index], want,
                         "softmax adjoint escaped batch/group at flat index {index}"
                     );
                 }
@@ -49790,9 +50599,10 @@ activation=linear
         let mut cpu = ExecutableNetwork::new(network.clone());
         let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
         let gradients = (vec![0.1, -0.2, 0.3, -0.4], vec![0.05, -0.07]);
-        let (LayerTrainBuffers::Connected(cpu_train), LayerTrainBuffers::Connected(gpu_train)) =
-            (&mut cpu.train_buffers[0], &mut gpu.cpu_fallback_train_buffers.get_mut()[0])
-        else {
+        let (LayerTrainBuffers::Connected(cpu_train), LayerTrainBuffers::Connected(gpu_train)) = (
+            &mut cpu.train_buffers[0],
+            &mut gpu.cpu_fallback_train_buffers.get_mut()[0],
+        ) else {
             panic!("connected buffers expected");
         };
         cpu_train.weight_updates.clone_from(&gradients.0);
@@ -49808,8 +50618,18 @@ activation=linear
         else {
             panic!("connected parameters expected");
         };
-        assert_slice_close("GPU Muon weights", &gpu_params.weights, &cpu_params.weights, 3e-5);
-        assert_slice_close("GPU Muon biases", &gpu_params.biases, &cpu_params.biases, 3e-5);
+        assert_slice_close(
+            "GPU Muon weights",
+            &gpu_params.weights,
+            &cpu_params.weights,
+            3e-5,
+        );
+        assert_slice_close(
+            "GPU Muon biases",
+            &gpu_params.biases,
+            &cpu_params.biases,
+            3e-5,
+        );
         assert_eq!(gpu.muon_state, cpu.muon_state);
         assert_eq!(gpu.adam_step, cpu.adam_step);
 
@@ -49817,8 +50637,10 @@ activation=linear
         std::fs::create_dir_all(&dir).unwrap();
         let gpu_path = dir.join("gpu.state");
         let cpu_path = dir.join("cpu.state");
-        gpu.save_optimizer_state(&gpu_path).expect("save GPU Muon state");
-        cpu.save_optimizer_state(&cpu_path).expect("save CPU Muon state");
+        gpu.save_optimizer_state(&gpu_path)
+            .expect("save GPU Muon state");
+        cpu.save_optimizer_state(&cpu_path)
+            .expect("save CPU Muon state");
         assert_eq!(
             std::fs::read(&gpu_path).unwrap(),
             std::fs::read(&cpu_path).unwrap(),
@@ -49859,9 +50681,10 @@ activation=linear
         cpu_params.scales.copy_from_slice(&[1.2, 0.8]);
         cpu_params.biases.copy_from_slice(&[0.2, -0.1]);
         gpu_params.clone_from(cpu_params);
-        let (LayerTrainBuffers::BatchNorm(cpu_train), LayerTrainBuffers::BatchNorm(gpu_train)) =
-            (&mut cpu.train_buffers[0], &mut gpu.cpu_fallback_train_buffers.get_mut()[0])
-        else {
+        let (LayerTrainBuffers::BatchNorm(cpu_train), LayerTrainBuffers::BatchNorm(gpu_train)) = (
+            &mut cpu.train_buffers[0],
+            &mut gpu.cpu_fallback_train_buffers.get_mut()[0],
+        ) else {
             panic!("standalone BatchNorm train buffers expected");
         };
         cpu_train.scale_updates.copy_from_slice(&[0.2, -0.3]);
@@ -49917,10 +50740,7 @@ activation=linear
         } else {
             panic!("connected parameters expected");
         }
-        if let (
-            LayerTrainBuffers::Connected(cpu_train),
-            LayerTrainBuffers::Connected(gpu_train),
-        ) = (
+        if let (LayerTrainBuffers::Connected(cpu_train), LayerTrainBuffers::Connected(gpu_train)) = (
             &mut cpu.train_buffers[0],
             &mut gpu.cpu_fallback_train_buffers.get_mut()[0],
         ) {
@@ -49951,9 +50771,11 @@ activation=linear
         let error = gpu
             .update_weights_gpu(0.01, 0.9, 0.0005, 2)
             .expect_err("batch-normalized convolution Muon staging is not integrated yet");
-        assert!(error
-            .to_string()
-            .contains("other parameter families remain explicitly unsupported"));
+        assert!(
+            error
+                .to_string()
+                .contains("other parameter families remain explicitly unsupported")
+        );
         assert_eq!(gpu.params, before);
         assert_eq!(gpu.adam_step, 0);
 
@@ -49972,9 +50794,11 @@ activation=linear
         let error = eml
             .update_weights_gpu(0.01, 0.9, 0.0005, 1)
             .expect_err("batch-normalized EML Muon staging is not integrated yet");
-        assert!(error
-            .to_string()
-            .contains("other parameter families remain explicitly unsupported"));
+        assert!(
+            error
+                .to_string()
+                .contains("other parameter families remain explicitly unsupported")
+        );
         assert_eq!(eml.params, before);
         assert_eq!(eml.adam_step, 0);
 
@@ -50006,9 +50830,11 @@ batch_normalize=1
         let error = moe
             .update_weights_gpu(0.01, 0.9, 0.0005, 1)
             .expect_err("batch-normalized MoE Muon staging is not integrated yet");
-        assert!(error
-            .to_string()
-            .contains("other parameter families remain explicitly unsupported"));
+        assert!(
+            error
+                .to_string()
+                .contains("other parameter families remain explicitly unsupported")
+        );
         assert_eq!(moe.params, before);
         assert_eq!(moe.adam_step, 0);
 
@@ -50041,9 +50867,11 @@ batch_normalize=1
         let error = dcnv4
             .update_weights_gpu(0.01, 0.9, 0.0005, 1)
             .expect_err("batch-normalized DCNv4 Muon staging is not integrated yet");
-        assert!(error
-            .to_string()
-            .contains("other parameter families remain explicitly unsupported"));
+        assert!(
+            error
+                .to_string()
+                .contains("other parameter families remain explicitly unsupported")
+        );
         assert_eq!(dcnv4.params, before);
         assert_eq!(dcnv4.adam_step, 0);
 
@@ -50076,9 +50904,11 @@ batch_normalize=1
         let error = deform
             .update_weights_gpu(0.01, 0.9, 0.0005, 1)
             .expect_err("batch-normalized deform_conv Muon staging is not integrated yet");
-        assert!(error
-            .to_string()
-            .contains("other parameter families remain explicitly unsupported"));
+        assert!(
+            error
+                .to_string()
+                .contains("other parameter families remain explicitly unsupported")
+        );
         assert_eq!(deform.params, before);
         assert_eq!(deform.adam_step, 0);
     }
@@ -51128,8 +51958,8 @@ batch_normalize=1
         let shape = TensorShape::new(3, 2, 2, 2);
         let input = Tensor::from_data(shape, axis_tensor(shape)).expect("dropout axis input");
         let mut rng_state = 0xD09B_10C5_u64;
-        let (output, mask) = super::forward_dropout(&input, 0.25, true, &mut rng_state)
-            .expect("training dropout");
+        let (output, mask) =
+            super::forward_dropout(&input, 0.25, true, &mut rng_state).expect("training dropout");
         let mask = mask.expect("training dropout mask");
         assert_eq!(mask.shape, shape);
         for n in 0..shape.batch {
@@ -51158,7 +51988,6 @@ batch_normalize=1
             super::forward_dropout(&input, 0.25, false, &mut rng_state).expect("inference dropout");
         assert_eq!(inference.data, input.data);
         assert!(inference_mask.is_none());
-
     }
 
     #[test]

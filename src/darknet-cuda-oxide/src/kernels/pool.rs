@@ -60,7 +60,11 @@ pub fn window_count(o: usize, stride: usize, size: usize, off: usize, limit: usi
     let start = (o * stride) as i64 - off as i64;
     let lo = if start > 0 { start } else { 0 };
     let end = start + size as i64;
-    let hi = if end < limit as i64 { end } else { limit as i64 };
+    let hi = if end < limit as i64 {
+        end
+    } else {
+        limit as i64
+    };
     if hi > lo { (hi - lo) as usize } else { 0 }
 }
 
@@ -69,7 +73,11 @@ pub fn window_count(o: usize, stride: usize, size: usize, off: usize, limit: usi
 #[device]
 pub fn first_window(i: usize, stride: usize, size: usize, off: usize) -> i64 {
     let need = i as i64 + off as i64 - (size as i64 - 1);
-    if need <= 0 { 0 } else { (need + stride as i64 - 1) / stride as i64 }
+    if need <= 0 {
+        0
+    } else {
+        (need + stride as i64 - 1) / stride as i64
+    }
 }
 
 #[cuda_module]
@@ -184,7 +192,11 @@ pub mod kernels {
             off,
         );
         if let Some(o) = out.get_mut(idx) {
-            *o = if best == usize::MAX { f32::NEG_INFINITY } else { x[best] };
+            *o = if best == usize::MAX {
+                f32::NEG_INFINITY
+            } else {
+                x[best]
+            };
         }
     }
 

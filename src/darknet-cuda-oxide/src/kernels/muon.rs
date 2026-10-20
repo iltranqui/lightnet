@@ -75,8 +75,7 @@ pub mod kernels {
         let i = idx.get();
         if i < weights.len() {
             if let Some(dst) = output.get_mut(idx) {
-                *dst = decay_factor * weights[i]
-                    + learning_rate * direction_scale * direction[i];
+                *dst = decay_factor * weights[i] + learning_rate * direction_scale * direction[i];
             }
         }
     }

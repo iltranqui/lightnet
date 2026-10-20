@@ -161,7 +161,14 @@ fn inside(y: isize, x: isize, height: usize, width: usize) -> bool {
 /// far-outside samples are zero, corners outside the feature map contribute
 /// nothing, and integer coordinates use the floor-selected cell. NaN/infinite
 /// coordinates propagate (no `is_finite` guard), matching the CPU.
-pub fn sample_at(input: &[f32], channel_base: usize, height: usize, width: usize, y: f32, x: f32) -> f32 {
+pub fn sample_at(
+    input: &[f32],
+    channel_base: usize,
+    height: usize,
+    width: usize,
+    y: f32,
+    x: f32,
+) -> f32 {
     let cell = resolve_cell(y, x, height, width);
     if !cell.active {
         return 0.0;

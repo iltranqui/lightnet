@@ -33,17 +33,15 @@
 //! mantissa bits (relative error <= 2^-4 per operand), e5m2 carries 2.
 
 use super::unroll::unroll;
+use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use cuda_device::convert::{
     cvt_f32_f16x2_lo, cvt_rn_f16x2_e4m3x2, cvt_rn_f16x2_e5m2x2, cvt_rn_satfinite_e4m3x2_f32,
     cvt_rn_satfinite_e5m2x2_f32,
 };
-use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use cuda_device::wmma::{
-    mma_m16n8k16_f32_f16,
-    mma_m16n8k16_fp8_f32_e4m3_e4m3, mma_m16n8k16_fp8_f32_e4m3_e5m2,
-    mma_m16n8k16_fp8_f32_e5m2_e4m3, mma_m16n8k16_fp8_f32_e5m2_e5m2,
-    mma_m16n8k32_fp8_f32_e4m3_e4m3, mma_m16n8k32_fp8_f32_e4m3_e5m2,
-    mma_m16n8k32_fp8_f32_e5m2_e4m3, mma_m16n8k32_fp8_f32_e5m2_e5m2,
+    mma_m16n8k16_f32_f16, mma_m16n8k16_fp8_f32_e4m3_e4m3, mma_m16n8k16_fp8_f32_e4m3_e5m2,
+    mma_m16n8k16_fp8_f32_e5m2_e4m3, mma_m16n8k16_fp8_f32_e5m2_e5m2, mma_m16n8k32_fp8_f32_e4m3_e4m3,
+    mma_m16n8k32_fp8_f32_e4m3_e5m2, mma_m16n8k32_fp8_f32_e5m2_e4m3, mma_m16n8k32_fp8_f32_e5m2_e5m2,
 };
 use cuda_device::{DisjointSlice, SharedArray, cuda_module, device, kernel, thread};
 
@@ -99,7 +97,11 @@ pub fn e5m2_bits_to_f32(bits: u8) -> f32 {
 #[device]
 pub fn quantize_f32(value: f32, scale: f32, fmt: u32) -> u8 {
     let scaled = value * scale;
-    if fmt == 0 { f32_to_e4m3_bits(scaled) } else { f32_to_e5m2_bits(scaled) }
+    if fmt == 0 {
+        f32_to_e4m3_bits(scaled)
+    } else {
+        f32_to_e5m2_bits(scaled)
+    }
 }
 
 /// One `mma.m16n8k32` with the FP8 pair selected by `fmt_a` / `fmt_b`.
@@ -168,7 +170,11 @@ pub fn fp8_stage16(
         dst[3] = 0;
         return;
     }
-    let index = if trans == 0 { grow * ldr + gk } else { gk * ldr + grow };
+    let index = if trans == 0 {
+        grow * ldr + gk
+    } else {
+        gk * ldr + grow
+    };
     let src = unsafe { buf.as_ptr().add(base + index) };
     // Only the K-contiguous case can be read as four aligned words; with
     // `trans == 1` the 16 elements are `ldr` bytes apart.
@@ -320,12 +326,7 @@ pub mod kernels {
 
     /// `out[i] = quantize(x[i] * scale, fmt)`, elementwise.
     #[kernel]
-    pub fn fp8_quantize_kernel(
-        x: &[f32],
-        mut out: DisjointSlice<u8>,
-        scale: f32,
-        fmt: u32,
-    ) {
+    pub fn fp8_quantize_kernel(x: &[f32], mut out: DisjointSlice<u8>, scale: f32, fmt: u32) {
         let idx = thread::index_1d();
         let i = idx.get();
         if i >= x.len() {
@@ -345,7 +346,11 @@ pub mod kernels {
             return;
         }
         if let Some(o) = out.get_mut(idx) {
-            *o = if fmt == 0 { e4m3_bits_to_f32(x[i]) } else { e5m2_bits_to_f32(x[i]) };
+            *o = if fmt == 0 {
+                e4m3_bits_to_f32(x[i])
+            } else {
+                e5m2_bits_to_f32(x[i])
+            };
         }
     }
 
@@ -428,8 +433,32 @@ pub mod kernels {
         let mut areg = [0u32; 4];
         let mut breg = [0u32; 4];
         if nk > 0 {
-            fp8_stage16(&mut areg, a, a_off, lda, kend, m, row0, stage_row, kbeg, stage_kb, stage_trans_a);
-            fp8_stage16(&mut breg, b, b_off, ldb, kend, n, col0, stage_row, kbeg, stage_kb, stage_trans_b);
+            fp8_stage16(
+                &mut areg,
+                a,
+                a_off,
+                lda,
+                kend,
+                m,
+                row0,
+                stage_row,
+                kbeg,
+                stage_kb,
+                stage_trans_a,
+            );
+            fp8_stage16(
+                &mut breg,
+                b,
+                b_off,
+                ldb,
+                kend,
+                n,
+                col0,
+                stage_row,
+                kbeg,
+                stage_kb,
+                stage_trans_b,
+            );
         }
 
         let mut it = 0usize;
@@ -442,8 +471,12 @@ pub mod kernels {
                 // strides are multiples of 4 and the shared bases are
                 // 16-byte aligned, so every store is aligned.
                 unsafe {
-                    (asp as *mut u32).add((stage_row * LD_A + stage_kb) / 4 + w).write(areg[w]);
-                    (bsp as *mut u32).add((stage_row * LD_B + stage_kb) / 4 + w).write(breg[w]);
+                    (asp as *mut u32)
+                        .add((stage_row * LD_A + stage_kb) / 4 + w)
+                        .write(areg[w]);
+                    (bsp as *mut u32)
+                        .add((stage_row * LD_B + stage_kb) / 4 + w)
+                        .write(breg[w]);
                 }
             });
             thread::sync_threads();
@@ -451,8 +484,32 @@ pub mod kernels {
             // Prefetch the next tile into registers.
             if it + 1 < nk {
                 let k0 = kbeg + (it + 1) * F8_BK;
-                fp8_stage16(&mut areg, a, a_off, lda, kend, m, row0, stage_row, k0, stage_kb, stage_trans_a);
-                fp8_stage16(&mut breg, b, b_off, ldb, kend, n, col0, stage_row, k0, stage_kb, stage_trans_b);
+                fp8_stage16(
+                    &mut areg,
+                    a,
+                    a_off,
+                    lda,
+                    kend,
+                    m,
+                    row0,
+                    stage_row,
+                    k0,
+                    stage_kb,
+                    stage_trans_a,
+                );
+                fp8_stage16(
+                    &mut breg,
+                    b,
+                    b_off,
+                    ldb,
+                    kend,
+                    n,
+                    col0,
+                    stage_row,
+                    k0,
+                    stage_kb,
+                    stage_trans_b,
+                );
             }
 
             // One mma k step per 32-element tile (F8_BK == 32).

@@ -1006,6 +1006,50 @@ mod tests {
     }
 
     #[test]
+    fn wmhf_axis_layout_pins_cpp_batch_channel_spatial_and_subband_order() {
+        use crate::axis_fixture::{axis_tensor, nchw_index, probe_shape};
+
+        // C++ dwt_cpu uses NCHW inputs and stores bands separately in LL/LH/HL/HH
+        // order, with each 2x2 tile flattened in row-major output order.
+        // Source: Jev_laya:src-lib/wmhf_layer.cpp:274-303.
+        let shape = probe_shape(); // B=2,C=2,H=2,W=3
+        let input = axis_tensor(shape);
+        let coeffs = haar_dwt(
+            &input,
+            shape.batch,
+            shape.channels,
+            shape.height,
+            shape.width,
+        )
+        .unwrap();
+        let mut expected = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        for n in 0..shape.batch {
+            for c in 0..shape.channels {
+                for y in 0..coeffs.height2 {
+                    let y0 = (2 * y).min(shape.height - 1);
+                    let y1 = (y0 + 1).min(shape.height - 1);
+                    for x in 0..coeffs.width2 {
+                        let x0 = (2 * x).min(shape.width - 1);
+                        let x1 = (x0 + 1).min(shape.width - 1);
+                        let v00 = input[nchw_index(shape, n, c, y0, x0)];
+                        let v01 = input[nchw_index(shape, n, c, y0, x1)];
+                        let v10 = input[nchw_index(shape, n, c, y1, x0)];
+                        let v11 = input[nchw_index(shape, n, c, y1, x1)];
+                        expected[0].push(0.5 * (v00 + v01 + v10 + v11));
+                        expected[1].push(0.5 * (v00 - v01 + v10 - v11));
+                        expected[2].push(0.5 * (v00 + v01 - v10 - v11));
+                        expected[3].push(0.5 * (v00 - v01 - v10 + v11));
+                    }
+                }
+            }
+        }
+        assert_slice_close("LL batch/channel/tile order", &coeffs.ll, &expected[0], 0.0);
+        assert_slice_close("LH batch/channel/tile order", &coeffs.lh, &expected[1], 0.0);
+        assert_slice_close("HL batch/channel/tile order", &coeffs.hl, &expected[2], 0.0);
+        assert_slice_close("HH batch/channel/tile order", &coeffs.hh, &expected[3], 0.0);
+    }
+
+    #[test]
     fn wmhf_haar_odd_edge_matches_source_hand_values() {
         let input = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let coeffs = haar_dwt(&input, 1, 1, 3, 2).unwrap();

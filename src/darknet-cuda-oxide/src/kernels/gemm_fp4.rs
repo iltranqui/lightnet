@@ -53,7 +53,11 @@ pub fn decode_row_words(bytes: &[u8; CODE_BYTES_PER_BLOCK], words: &mut [i32; 4]
         unroll!(4, lane, {
             let nibble_index = w * 4 + lane;
             let byte = bytes[nibble_index / 2];
-            let code = if nibble_index & 1 != 0 { byte >> 4 } else { byte & 0x0F };
+            let code = if nibble_index & 1 != 0 {
+                byte >> 4
+            } else {
+                byte & 0x0F
+            };
             packed |= ((e2m1x2_lut(code as u32) as u32) & 0xFF) << (8 * lane);
         });
         words[w] = packed as i32;
@@ -138,7 +142,11 @@ pub mod kernels {
                 // bounds because `i < CODE_TILE`.
                 let byte = if gr < m {
                     unsafe {
-                        *a_codes.as_ptr().add(gr * blocks_per_row * CODE_BYTES_PER_BLOCK + bk * CODE_BYTES_PER_BLOCK + b)
+                        *a_codes.as_ptr().add(
+                            gr * blocks_per_row * CODE_BYTES_PER_BLOCK
+                                + bk * CODE_BYTES_PER_BLOCK
+                                + b,
+                        )
                     }
                 } else {
                     0
@@ -153,7 +161,11 @@ pub mod kernels {
                 let gr = col0 + r;
                 let byte = if gr < n {
                     unsafe {
-                        *b_codes.as_ptr().add(gr * blocks_per_row * CODE_BYTES_PER_BLOCK + bk * CODE_BYTES_PER_BLOCK + b)
+                        *b_codes.as_ptr().add(
+                            gr * blocks_per_row * CODE_BYTES_PER_BLOCK
+                                + bk * CODE_BYTES_PER_BLOCK
+                                + b,
+                        )
                     }
                 } else {
                     0
@@ -166,14 +178,22 @@ pub mod kernels {
                 // SAFETY: `tid < 64` is inside `AS_SCALE`, and `gr < m` puts
                 // the global index inside `a_scales`.
                 unsafe {
-                    assp.add(tid).write(if gr < m { *a_scales.as_ptr().add(gr * blocks_per_row + bk) } else { 0 });
+                    assp.add(tid).write(if gr < m {
+                        *a_scales.as_ptr().add(gr * blocks_per_row + bk)
+                    } else {
+                        0
+                    });
                 }
             }
             if tid < FP4_BN {
                 let gr = col0 + tid;
                 // SAFETY: as above for `BS_SCALE` / `b_scales`.
                 unsafe {
-                    bssp.add(tid).write(if gr < n { *b_scales.as_ptr().add(gr * blocks_per_row + bk) } else { 0 });
+                    bssp.add(tid).write(if gr < n {
+                        *b_scales.as_ptr().add(gr * blocks_per_row + bk)
+                    } else {
+                        0
+                    });
                 }
             }
             thread::sync_threads();
@@ -187,7 +207,9 @@ pub mod kernels {
                 let mut bytes = [0u8; CODE_BYTES_PER_BLOCK];
                 // SAFETY: the staged tile holds `FP4_BM` rows of 8 bytes, so
                 // row `r < 64` is fully readable.
-                unsafe { gather_code_row(&mut bytes, asp as *const u8, CODE_BYTES_PER_BLOCK, r, 0) };
+                unsafe {
+                    gather_code_row(&mut bytes, asp as *const u8, CODE_BYTES_PER_BLOCK, r, 0)
+                };
                 decode_row_words(&bytes, &mut aw[mi]);
                 // SAFETY: `r < 64` is inside `AS_SCALE`.
                 ascale[mi] = decode_e4m3_magnitude(unsafe { *assp.add(r) } as u32);
@@ -196,7 +218,9 @@ pub mod kernels {
                 let col = tx * 4 + ni;
                 let mut bytes = [0u8; CODE_BYTES_PER_BLOCK];
                 // SAFETY: as above for the B tile.
-                unsafe { gather_code_row(&mut bytes, bsp as *const u8, CODE_BYTES_PER_BLOCK, col, 0) };
+                unsafe {
+                    gather_code_row(&mut bytes, bsp as *const u8, CODE_BYTES_PER_BLOCK, col, 0)
+                };
                 decode_row_words(&bytes, &mut bw[ni]);
                 // SAFETY: `col < 64` is inside `BS_SCALE`.
                 bscale[ni] = decode_e4m3_magnitude(unsafe { *bssp.add(col) } as u32);
@@ -216,8 +240,16 @@ pub mod kernels {
             bk += 1;
         }
 
-        let scale_a = if global_a.is_empty() { 1.0 } else { global_a[0] };
-        let scale_b = if global_b.is_empty() { 1.0 } else { global_b[0] };
+        let scale_a = if global_a.is_empty() {
+            1.0
+        } else {
+            global_a[0]
+        };
+        let scale_b = if global_b.is_empty() {
+            1.0
+        } else {
+            global_b[0]
+        };
         let factor = alpha * scale_a * scale_b;
         unroll!(4, mi, {
             let gm = row0 + ty * 4 + mi;
@@ -273,8 +305,20 @@ pub mod kernels {
             // SAFETY: the host sizes both code buffers at
             // `rows * blocks_per_row * 8` and `gm < m`, `gn < n`.
             unsafe {
-                gather_code_row(&mut abytes, a_codes.as_ptr(), a_stride, gm, bk * CODE_BYTES_PER_BLOCK);
-                gather_code_row(&mut bbytes, b_codes.as_ptr(), a_stride, gn, bk * CODE_BYTES_PER_BLOCK);
+                gather_code_row(
+                    &mut abytes,
+                    a_codes.as_ptr(),
+                    a_stride,
+                    gm,
+                    bk * CODE_BYTES_PER_BLOCK,
+                );
+                gather_code_row(
+                    &mut bbytes,
+                    b_codes.as_ptr(),
+                    a_stride,
+                    gn,
+                    bk * CODE_BYTES_PER_BLOCK,
+                );
             }
             let mut aw = [0i32; 4];
             let mut bw = [0i32; 4];
@@ -286,13 +330,27 @@ pub mod kernels {
             });
             // SAFETY: `gm < m` / `gn < n` put both indices inside the scale
             // buffers, which the host sizes at `rows * blocks_per_row`.
-            let sa = decode_e4m3_magnitude(unsafe { *a_scales.as_ptr().add(gm * blocks_per_row + bk) } as u32);
-            let sb = decode_e4m3_magnitude(unsafe { *b_scales.as_ptr().add(gn * blocks_per_row + bk) } as u32);
+            let sa =
+                decode_e4m3_magnitude(
+                    unsafe { *a_scales.as_ptr().add(gm * blocks_per_row + bk) } as u32
+                );
+            let sb =
+                decode_e4m3_magnitude(
+                    unsafe { *b_scales.as_ptr().add(gn * blocks_per_row + bk) } as u32
+                );
             total += dot as f32 * (0.25 * sa * sb);
             bk += 1;
         }
-        let scale_a = if global_a.is_empty() { 1.0 } else { global_a[0] };
-        let scale_b = if global_b.is_empty() { 1.0 } else { global_b[0] };
+        let scale_a = if global_a.is_empty() {
+            1.0
+        } else {
+            global_a[0]
+        };
+        let scale_b = if global_b.is_empty() {
+            1.0
+        } else {
+            global_b[0]
+        };
         let factor = alpha * scale_a * scale_b;
         let dst = c.as_mut_ptr();
         // SAFETY: `gm * ldc + gn` is inside `c` (sized `m * ldc`).

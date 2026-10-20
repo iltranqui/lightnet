@@ -4,9 +4,11 @@
 
 - [Priority and boundaries](#priority-and-boundaries)
 - [Resume point](#resume-point)
-- [Next slice: native f32 FoveationFilm runtime](#next-slice-native-f32-foveationfilm-runtime)
+- [Completed slice: native f32 FoveationFilm runtime](#completed-slice-native-f32-foveationfilm-runtime)
+- [DsConv: bounded native f32 runtime landed; multi-template remains open](#dsconv-bounded-native-f32-runtime-landed-multi-template-remains-open)
 - [Act-head contract finding](#act-head-contract-finding)
 - [Act-head native gradient math and CLS scatter](#act-head-native-gradient-math-and-cls-scatter)
+- [WMHF: native Haar DWT primitive](#wmhf-native-haar-dwt-primitive)
 - [Next slice: deformable conv forward (wave 1, part 3)](#next-slice-deformable-conv-forward-wave-1-part-3)
 - [Runtime integration plan for `[deform_conv]`](#runtime-integration-plan-for-deform_conv)
 - [Next slice: `[dcnv4]` device path (audit result)](#next-slice-dcnv4-device-path-audit-result)
@@ -27,7 +29,7 @@ deliverable. Sparse MoE remains unstarted.
 ## Resume point
 
 Marker gather is native in f32 full/compact forward/backward and f16 compact
-inference (v0.2.001–002). v0.2.149 adds compact f16 Logistic sigmoid through the native half-storage channel-affine activation kernel; v0.2.150 adds direct CPU-reference parity. v0.2.151 adds OMD loss inference as a device identity pass-through. The full `oxide_runtime_f16` suite passed 20 tests at that increment; these paths are inference only. v0.2.152 adds group-major JevCe compact f16 inference via native temperature scaling and softmax; v0.2.153 adds native channel-major NCHW group-softmax. Both layouts pass CPU parity. v0.2.154 adds compact f16 LAYA act-head with native half-storage feature extraction and exact-erf GELU; CPU-reference output parity and all 22 f16 tests pass. v0.2.155 adds the native LayaHead masked-attention primitive and v0.2.156 composes it into native full/compact f32 runtime forward; v0.2.157 adds native full/compact f32 LayaScorer inference and v0.2.158 adds its native input adjoint. v0.2.159 adds native full/compact f32 LayaEncoder inference with RoPE full/sliding attention and GeGLU. Act-head inference now supports f32 and compact f16; training/backward/update and shared-file loading gaps remain. Act-head features/exact-erf primitives are native f32
+inference (v0.2.001–002). v0.2.149 adds compact f16 Logistic sigmoid through the native half-storage channel-affine activation kernel; v0.2.150 adds direct CPU-reference parity. v0.2.151 adds OMD loss inference as a device identity pass-through. The full `oxide_runtime_f16` suite passed 20 tests at that increment; these paths are inference only. v0.2.152 adds group-major JevCe compact f16 inference via native temperature scaling and softmax; v0.2.153 adds native channel-major NCHW group-softmax. Both layouts pass CPU parity. v0.2.154 adds compact f16 LAYA act-head with native half-storage feature extraction and exact-erf GELU; CPU-reference output parity and all 22 f16 tests pass. v0.2.155 adds the native LayaHead masked-attention primitive and v0.2.156 composes it into native full/compact f32 runtime forward; v0.2.157 adds native full/compact f32 LayaScorer inference and v0.2.158 adds its native input adjoint. v0.2.159 adds native full/compact f32 LayaEncoder inference with RoPE full/sliding attention and GeGLU. v0.2.160 adds non-BN DeformConv predictor/runtime support for dilated geometries without changing ordinary conv extents (§199). Act-head inference now supports f32 and compact f16; training/backward/update and shared-file loading gaps remain. Act-head features/exact-erf primitives are native f32
 (v0.2.003–004), and full/compact act-head f32 forward is native in v0.2.005.
 Evidence/limits are in `implemented.md` §§41–45. Do not repeat these ports.
 Act-head uses four uncached weight uploads per forward; no residency/speedup
@@ -80,7 +82,7 @@ unsupported variants and mixed networks remain host-cached. Adam runtime parity 
 Recheck `version-map.tsv` before allocating another version. Earlier wave
 sections below retain historical findings; this resume point takes precedence.
 
-## Next slice: native f32 FoveationFilm runtime
+## Completed slice: native f32 FoveationFilm runtime
 
 `layer-support.md` currently marks `[foveation_film]` GPU `none`; the Rust CPU
 reference already implements exact forward/backward, parameter gradients, and
@@ -190,6 +192,43 @@ but no such core loader implementation was found. Do not accept the hint as proo
 Native forward precision inherits existing connected/GEMM settings; only explicit
 Fp32 mode was validated for parity. No new global AMP/precision behavior was added.
 
+## WMHF: native Haar DWT primitive
+
+Native device primitives now implement Haar DWT/IWT and both exact adjoints.
+DWT writes LL/LH/HL/HH in separate NCHW buffers with odd-edge replication;
+DWT backward is an atomic-free gather. IWT forward reuses that synthesis
+adjoint, and IWT backward reuses DWT. Actual-Oxide parity against independent
+formulas covers all four operations on batch-2, three-channel, odd non-square
+input (`MEM=3G ./tools/test_oxide.sh --test oxide_wmhf`, 3 tests total).
+
+The four-direction scan has native f32 forward and backward primitives.
+Forward assigns one thread to an entire row/column sequence. Backward now
+computes each direction's scan states once per sequence, then one sequence
+thread walks the adjoint recurrence in reverse and writes its disjoint gradient
+partials; gather kernels reduce direction input gradients and channel parameter
+gradients without atomics. Actual-Oxide parity
+against source-ordered CPU formulas passes (`MEM=3G ./tools/test_oxide.sh
+--test oxide_wmhf`, 3 tests total).
+
+The high-frequency energy branch now has native forward and atomic-free
+backward primitives: high-resolution outputs gather their nearest LL/LH/HH
+source tile, while coefficient gradients reduce all high-resolution seeds in
+the corresponding tile and apply the source sign rule. Oxide parity covers
+both directions in `oxide_wmhf`. Native gated residual fusion and its exact
+adjoint now implement `fuse + freq_scale*gate*projected + optional_shortcut`,
+with actual-device formula coverage for both shortcut modes.
+
+The native operations are now exposed through generic `F32TensorOpsBackend`
+contracts; this includes channel extraction for the local/global split and
+3x/5x/7x local-branch concatenation; non-Oxide backends keep explicit
+unsupported defaults. This creates a runtime-composition seam but does not wire
+a WMHF arm.
+
+These are **not** a WMHF runtime path and do not change the explicit GPU
+rejection. Seven convolutions, runtime caching, and CPU-parity runtime dispatch
+remain open. Both scans use sequence-owned work; neither has a performance
+claim. No compiled-C++ golden.
+
 ## Act-head native gradient math and CLS scatter
 
 Standalone act-head gradients are independent of optimizer eligibility. The
@@ -232,8 +271,8 @@ with an independently written reference, plus the earlier `oxide_deform_gather`
 the device path, in dependency order: (1)+(2) predictor columns and the
 offset/mask predictors — **done as `deform_offset_predict`**, which is
 `conv2d_f32` (`groups = 1`, source weight order `[filters][channels][ky][kx]`) +
-`bias_add_f32`; it **rejects `dilation != 1` explicitly** instead of returning a
-mis-shaped tensor (see the finding below); (3) one elementwise kernel for the per-batch conditional
+`bias_add_f32`; it originally rejected `dilation != 1`; v0.2.160 adds a direct native predictor
+kernel using the source extent (see the resolved finding below); (3) one elementwise kernel for the per-batch conditional
 normalization (`stddev > 1e-12 && (stddev > max_offset || |mean| > max_offset)`),
 `sanitize`, `centered_lhtan` and the mask sigmoid — **done**:
 `deform_offset_envelope` (caller supplies per-batch `mean`/`inv_std`/`normalize`)
@@ -251,11 +290,9 @@ order in the predictor vs the reference loop; single-stage tests stay at
 `2e-6`). Still deliberately unwired: the composed oracle is a stage-by-stage
 host reference. **True oracle reached:** `oxide_deform_conv_chain` builds a real
 `ExecutableNetwork` from inline cfg text, runs its CPU forward with the
-runtime's own initialized parameters, and matches the native composition (3
-passed: masked, unmasked, and the dilated rejection). Remaining: add the runtime
-forward arm (keeping `DeformConv` in `requires_cpu_backward_fallback` and
-falling back to the host for `dilation > 1`), then update `layer-support.md` to
-`gpu fwd native / gpu bwd cpu`.
+runtime's own initialized parameters, and matches the native composition (3 passed: masked, unmasked, and dilated CPU-runtime parity). The runtime arm is
+wired for non-BN variants; v0.2.160 removes the dilation-only host fallback.
+BN remains host-routed, with the normalization Jacobian's documented host hop.
 
 ### Blocking finding: a native forward alone cannot serve `[deform_conv]`
 
@@ -311,19 +348,16 @@ next slice is mechanical but broad: trait declarations + default bodies + Oxide
 overrides (already written, just need forwarding), then composition in
 `runtime.rs`. Do not try to special-case the Oxide backend in generic code.
 
-### Finding: predictor columns cannot simply reuse `conv2d_f32`
+### Resolved finding: predictor columns cannot simply reuse `conv2d_f32` (v0.2.160)
 
 `deform_conv::output_dim` includes the dilated kernel extent:
 `oh = (H + 2*pad - dilation*(size-1) - 1) / stride + 1`. The oxide conv `Geom`
 (`src/darknet-cuda-oxide/src/conv.rs:145`) intentionally does **not** — it uses
 `(H + 2*pad - size) / stride + 1`, matching `[convolutional]` (see
 `axis-coverage.md` finding F1). For `dilation == 1` the two agree, so the offset
-and mask predictors can be built with `conv2d_f32` + `bias_add_f32`. For
-`dilation > 1` they do not: the conv would return a differently shaped tensor,
-so the predictor columns need their own im2col launch (or a conv variant that
-takes an explicit output extent). Do not "fix" `Geom` to include dilation —
-that would break `[convolutional]` and `cfg/resnet152_trident.cfg`; select the
-extent explicitly at the call site instead.
+and mask predictors can be built with `conv2d_f32` + `bias_add_f32`. For `dilation > 1` they do not. v0.2.160 resolves this with a direct native
+predictor kernel using the source-specific output extent; ordinary conv `Geom`
+remains unchanged, preserving `[convolutional]` and `cfg/resnet152_trident.cfg`.
 
 Caught by a fixture assertion in `oxide_deform_conv_accumulate`: the original
 strided+dilated case used a shape `deform_conv` would never produce (4x5 in,
@@ -331,10 +365,10 @@ size 3, stride 2, pad 1, dilation 2 => source extent 1x1, not 2x2). The kernel
 takes `out_h`/`out_w` as given, so it still passed; the test now derives and
 asserts the extent before comparing.
 
-Scope: `[deform_conv]` **forward only** (device), CPU backward unchanged. Do not
-touch `requires_cpu_backward_fallback`, do not remove the host round trip until
-the backward is native, and do not claim the layer is GPU-complete — the whole
-point of this slice is that a native forward alone still de-optimises a network.
+Historical scope note (superseded by v0.2.007 and v0.2.160): non-BN f32
+`[deform_conv]` forward/backward are device-dispatched for all supported
+dilation values. Batch-normalized variants remain host-routed; the backward's
+batch-coupled normalization Jacobian retains one host hop.
 
 Operands and math, from `src/darknet-core/src/deform_conv.rs` (hand-derived from
 `Jev_laya`): output `[B, filters, OH, OW]`; for each output point the base
@@ -557,12 +591,80 @@ Distinguish native forward/gradient primitives from complete native layers,
 selected tests from full-suite coverage and Rust CPU agreement from C++ parity.
 No performance/compiled-C++ claim without actual measurements/golden evidence.
 
+## DsConv: bounded native f32 runtime landed; multi-template remains open
+
+`layer-support.md` records native Oxide f32 support for the single-template
+`morph=0/1/2` contract. `templates>1` for morph 0/1 remains an explicit CPU
+gap; compact f16 remains unsupported. Hybrid GPU Muon is now covered for the
+bounded single-template runtime path. Do not claim full DSConv source parity or
+silently accept multi-template modes.
+
+### Required stages
+
+**Progress (runtime wired):** the 3x3 predictor/tanh, snake coordinates,
+border-clamped gather, collapse, and exact Rust-forward adjoints have actual
+Oxide CPU-reference parity (`MEM=3G ./tools/test_oxide.sh --test oxide_dsconv`:
+11 passed). The inherent forward matches an independent CPU formula for all
+morphs; composed backward passes finite differences for input and every
+parameter group across all morphs. Generic f32 runtime forward/backward now
+calls these compositions for single-template layers; backward recomputes the
+intermediates rather than retaining a runtime cache. Bilinear input gradients
+use float atomics (nondeterministic summation order); coordinate writes are
+unique. Actual `GpuExecutableNetwork<OxideBackend>` training tests cover
+morph=2 SGD and morph=1 Adam against `ExecutableNetwork`, including gradients
+and parameter updates; `dsconv_gpu_muon_two_step_update_matches_cpu` verifies
+two-step hybrid GPU Muon parity. No compiled-C++ golden or performance claim.
+
+1. [x] Add host-reference backend contracts plus Oxide kernels for the 3x3 offset
+   predictor, tanh, center-anchored cumulative snake coordinates, border-clamped
+   bilinear sampling, collapse weights/bias, and activation epilogue. Preserve
+   the CPU reference's NCHW axes and `morph=2` split (`floor(filters/2)` x-snake,
+   remainder y-snake).
+2. [x] Add device backward for the exact Rust-forward derivative: input scatter,
+   collapse weight/bias gradients, sample-coordinate gradients, cumulative
+   offset prefix/suffix Jacobian, tanh derivative, offset-predictor weight/bias
+   gradients, and predictor input gradient. Do not copy the known CUDA
+   same-index shortcut; C++ CUDA backward omits the CPU contract's full
+   cumulative-offset Jacobian.
+3. [x] **Done, bounded f32:** wire generic GPU forward/backward and host-staged
+   SGD/Adam integration for single-template layers. Hybrid GPU Muon covers
+   collapse and offset matrices with actual-device two-step CPU parity; other
+   matrix-family Muon coverage remains in the global backlog. Compact f16 and
+   multi-template modes remain unsupported.
+
+### Verification gates
+
+- [x] `MEM=3G ./tools/test_host.sh dsconv` remains green for the CPU oracle
+  (12 passed).
+- [x] Add Oxide primitive parity and finite differences for input, all collapse
+  blocks, all offset blocks, and `morph=0/1/2`, including non-square maps,
+  batch >1, border-clamped coordinates, and unused offset-half zero gradients
+  (`oxide_dsconv`: 11 passed).
+- [x] Runtime parity covers morph=2 SGD, morph=1 Adam, and two-step
+  morph=1 Muon. Remaining: add the optimizer/morph cross-product and explicit
+  compact-f16/multi-template rejection regression tests.
+- [x] Focused Oxide runtime chain via `tools/test_oxide.sh` and host `dsconv`
+  passed serially. Still run `weights` and affected `runtime` filters before a
+  future release commit. No training run; no compiled-C++ golden or full-suite
+  claim is made from focused tests.
+
+Source audit: `Jev_laya:src-lib/dsconv_kernels.cu` has predictor, coordinate,
+collapse, and backward kernels, but its backward shortcuts cumulative offset
+propagation; use `src/darknet-core/src/dsconv.rs` as the Rust derivative oracle.
+No compiled-C++ numerical golden is available. This plan is Stage 2 only and
+preserves the open Stage-1 multi-template and axis/layout work.
+
 ## Remaining scope
 
 Act-head runtime backward/update/file loading, other LAYA/transformer layers,
-DCNv4 Adam and excluded-variant
-host fallbacks, deform host fallbacks,
-deconvolution unsupported-activation fallback, CPU-only layer GPU paths and GPU
-Muon remain open. Each layer needs device forward/backward/update tests as
+CenterNet, modern-YOLO, Segmentation, JevCe and LayaLoss host-owned head
+loss/backward (native full/compact f32 activation forwards landed unversioned
+in §§224–228), DCNv4 Adam and
+excluded-variant host fallbacks,
+batch-normalized DeformConv host fallback,
+deconvolution unsupported-activation fallback, CPU-only layer GPU paths and
+other matrix-family GPU Muon remain open. Dilated non-BN DeformConv
+predictor/runtime coverage landed in
+v0.2.160; see `implemented.md` §199. Each layer needs device forward/backward/update tests as
 applicable and explicit limits. CPU/config/axis gaps remain open. No green full-
 host/corpus/full-Oxide suite is established; sparse MoE stays unstarted.

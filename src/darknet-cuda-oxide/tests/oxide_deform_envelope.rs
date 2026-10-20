@@ -139,11 +139,7 @@ fn envelope_normalize_off_matches_the_source_piecewise_map() {
             cfg(),
         )
         .unwrap();
-    assert_close(
-        "envelope/off",
-        &backend.download_f32(&out).unwrap(),
-        &want,
-    );
+    assert_close("envelope/off", &backend.download_f32(&out).unwrap(), &want);
 }
 
 #[test]
@@ -184,11 +180,7 @@ fn envelope_normalize_on_uses_the_per_batch_stats() {
             cfg(),
         )
         .unwrap();
-    assert_close(
-        "envelope/on",
-        &backend.download_f32(&out).unwrap(),
-        &want,
-    );
+    assert_close("envelope/on", &backend.download_f32(&out).unwrap(), &want);
 }
 
 #[test]
@@ -198,17 +190,23 @@ fn envelope_rejects_bad_operands() {
     let t_ok = backend.upload_f32(&[2], &[0.0; 2]).unwrap();
     let t_short = backend.upload_f32(&[1], &[0.0]).unwrap();
     // Stats length must equal the derived batch.
-    assert!(backend
-        .deform_offset_envelope(&t_raw, &t_short, &t_ok, &t_ok, 2, 4, 1.0, cfg())
-        .is_err());
+    assert!(
+        backend
+            .deform_offset_envelope(&t_raw, &t_short, &t_ok, &t_ok, 2, 4, 1.0, cfg())
+            .is_err()
+    );
     // max_offset must be finite and positive.
-    assert!(backend
-        .deform_offset_envelope(&t_raw, &t_ok, &t_ok, &t_ok, 2, 4, 0.0, cfg())
-        .is_err());
+    assert!(
+        backend
+            .deform_offset_envelope(&t_raw, &t_ok, &t_ok, &t_ok, 2, 4, 0.0, cfg())
+            .is_err()
+    );
     // Raw length must be a multiple of planes*spatial.
-    assert!(backend
-        .deform_offset_envelope(&t_raw, &t_ok, &t_ok, &t_ok, 3, 3, 1.0, cfg())
-        .is_err());
+    assert!(
+        backend
+            .deform_offset_envelope(&t_raw, &t_ok, &t_ok, &t_ok, 3, 3, 1.0, cfg())
+            .is_err()
+    );
 }
 
 #[test]
@@ -246,8 +244,16 @@ fn mask_sigmoid_clamps_the_extremes_and_stays_symmetric() {
         .download_f32(&backend.deform_mask_sigmoid(&t_raw, cfg()).unwrap())
         .unwrap();
     assert!(got.iter().all(|v| !v.is_nan()), "NaN in {got:?}");
-    assert!((0.0..=1.0).contains(&got[0]) && got[0] >= 0.5, "got {}", got[0]);
-    assert!((0.0..=1.0).contains(&got[1]) && got[1] <= 0.5, "got {}", got[1]);
+    assert!(
+        (0.0..=1.0).contains(&got[0]) && got[0] >= 0.5,
+        "got {}",
+        got[0]
+    );
+    assert!(
+        (0.0..=1.0).contains(&got[1]) && got[1] <= 0.5,
+        "got {}",
+        got[1]
+    );
     // Beyond the clamp the value is exactly the clamped value, not a new one.
     assert_eq!(got[2].to_bits(), got[0].to_bits(), "got {got:?}");
     assert_eq!(got[3].to_bits(), got[1].to_bits(), "got {got:?}");
@@ -312,7 +318,11 @@ fn offset_stats_match_the_source_and_are_per_batch() {
         want_norm,
         "normalize flags must match, and differ between batches"
     );
-    assert_eq!(want_norm, vec![0.0, 1.0, 1.0], "fixture must span both gates");
+    assert_eq!(
+        want_norm,
+        vec![0.0, 1.0, 1.0],
+        "fixture must span both gates"
+    );
 
     // Sanitizing before the reduction matters: an out-of-range value must not
     // move the stats beyond the clamp.
@@ -333,15 +343,9 @@ fn offset_stats_match_the_source_and_are_per_batch() {
 fn offset_stats_reject_bad_geometry() {
     let backend = backend();
     let t_raw = backend.upload_f32(&[6], &[0.0; 6]).unwrap();
-    assert!(backend
-        .deform_offset_stats(&t_raw, 0, 1.0, cfg())
-        .is_err());
-    assert!(backend
-        .deform_offset_stats(&t_raw, 4, 1.0, cfg())
-        .is_err());
-    assert!(backend
-        .deform_offset_stats(&t_raw, 3, 0.0, cfg())
-        .is_err());
+    assert!(backend.deform_offset_stats(&t_raw, 0, 1.0, cfg()).is_err());
+    assert!(backend.deform_offset_stats(&t_raw, 4, 1.0, cfg()).is_err());
+    assert!(backend.deform_offset_stats(&t_raw, 3, 0.0, cfg()).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -376,10 +380,10 @@ fn predict(
                     for c in 0..channels {
                         for ky in 0..size {
                             for kx in 0..size {
-                                let y = oy as isize * stride as isize - padding as isize
-                                    + ky as isize;
-                                let x = ox as isize * stride as isize - padding as isize
-                                    + kx as isize;
+                                let y =
+                                    oy as isize * stride as isize - padding as isize + ky as isize;
+                                let x =
+                                    ox as isize * stride as isize - padding as isize + kx as isize;
                                 if y >= 0 && y < in_h as isize && x >= 0 && x < in_w as isize {
                                     let w = weights[((f * channels + c) * size + ky) * size + kx];
                                     let v = input[(b * channels + c) * in_h * in_w
@@ -427,15 +431,24 @@ fn predictor_matches_columns_times_weights_plus_bias() {
     let t_b = backend.upload_f32(&[filters], &biases).unwrap();
     let out = backend
         .deform_offset_predict(
-            &t_in, &t_w, &t_b, channels, in_h, in_w, filters, size, stride, stride, padding, 1,
-            out_h, out_w, cfg(),
+            &t_in,
+            &t_w,
+            &t_b,
+            channels,
+            in_h,
+            in_w,
+            filters,
+            size,
+            stride,
+            stride,
+            padding,
+            1,
+            out_h,
+            out_w,
+            cfg(),
         )
         .unwrap();
-    assert_close(
-        "predictor",
-        &backend.download_f32(&out).unwrap(),
-        &want,
-    );
+    assert_close("predictor", &backend.download_f32(&out).unwrap(), &want);
 }
 
 #[test]
@@ -465,8 +478,21 @@ fn predictor_matches_with_stride_and_no_padding() {
     let t_b = backend.upload_f32(&[filters], &biases).unwrap();
     let out = backend
         .deform_offset_predict(
-            &t_in, &t_w, &t_b, channels, in_h, in_w, filters, size, stride, stride, padding, 1,
-            out_h, out_w, cfg(),
+            &t_in,
+            &t_w,
+            &t_b,
+            channels,
+            in_h,
+            in_w,
+            filters,
+            size,
+            stride,
+            stride,
+            padding,
+            1,
+            out_h,
+            out_w,
+            cfg(),
         )
         .unwrap();
     assert_close(
@@ -477,31 +503,101 @@ fn predictor_matches_with_stride_and_no_padding() {
 }
 
 #[test]
-fn predictor_rejects_dilation_and_bad_operands() {
+fn predictor_supports_source_extent_dilation_and_rejects_bad_operands() {
     let backend = backend();
-    let t_in = backend.upload_f32(&[1, 2, 3, 3], &[0.0; 18]).unwrap();
-    let t_w = backend
-        .upload_f32(&[9, 2, 3, 3], &[0.0; 9 * 2 * 9])
+    let (batch, channels, in_h, in_w, filters, size) =
+        (1usize, 2usize, 3usize, 4usize, 9usize, 3usize);
+    let (stride, padding, dilation) = (1usize, 1usize, 2usize);
+    let (out_h, out_w) = (1usize, 2usize);
+    let input: Vec<f32> = (0..batch * channels * in_h * in_w)
+        .map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.13)
+        .collect();
+    let weights: Vec<f32> = (0..filters * channels * size * size)
+        .map(|i| ((i * 5 % 17) as f32 - 8.0) * 0.007)
+        .collect();
+    let biases: Vec<f32> = (0..filters).map(|i| i as f32 * 0.03 - 0.1).collect();
+    let t_in = backend
+        .upload_f32(&[batch, channels, in_h, in_w], &input)
         .unwrap();
-    let t_b = backend.upload_f32(&[9], &[0.0; 9]).unwrap();
-    // Dilated predictor: rejected rather than silently mis-shaped.
-    let err = match backend.deform_offset_predict(
-        &t_in, &t_w, &t_b, 2, 3, 3, 9, 3, 1, 1, 1, 2, 1, 1, cfg(),
-    ) {
-        Ok(_) => panic!("dilated predictor must be rejected"),
-        Err(err) => err,
-    };
-    let message = format!("{err}");
-    assert!(
-        message.contains("dilation 2 is not supported"),
-        "unexpected error: {message}"
+    let t_w = backend
+        .upload_f32(&[filters, channels, size, size], &weights)
+        .unwrap();
+    let t_b = backend.upload_f32(&[filters], &biases).unwrap();
+    let got = backend
+        .deform_offset_predict(
+            &t_in,
+            &t_w,
+            &t_b,
+            channels,
+            in_h,
+            in_w,
+            filters,
+            size,
+            stride,
+            stride,
+            padding,
+            dilation,
+            out_h,
+            out_w,
+            cfg(),
+        )
+        .unwrap();
+    let mut want = vec![0.0; batch * filters * out_h * out_w];
+    for b in 0..batch {
+        for f in 0..filters {
+            for oy in 0..out_h {
+                for ox in 0..out_w {
+                    let mut value = biases[f];
+                    for c in 0..channels {
+                        for ky in 0..size {
+                            for kx in 0..size {
+                                let y = (oy * stride) as isize - (padding * dilation) as isize
+                                    + (ky * dilation) as isize;
+                                let x = (ox * stride) as isize - (padding * dilation) as isize
+                                    + (kx * dilation) as isize;
+                                if y >= 0 && y < in_h as isize && x >= 0 && x < in_w as isize {
+                                    let xi = ((b * channels + c) * in_h + y as usize) * in_w
+                                        + x as usize;
+                                    let wi = ((f * channels + c) * size + ky) * size + kx;
+                                    value += input[xi] * weights[wi];
+                                }
+                            }
+                        }
+                    }
+                    want[((b * filters + f) * out_h + oy) * out_w + ox] = value;
+                }
+            }
+        }
+    }
+    assert_close(
+        "dilated predictor",
+        &backend.download_f32(&got).unwrap(),
+        &want,
     );
     // Wrong bias length.
-    assert!(backend
-        .deform_offset_predict(
-            &t_in, &t_w, &t_b, 2, 3, 3, 9, 3, 1, 1, 1, 1, 1, 1, cfg(),
-        )
-        .is_err());
+    assert!(
+        backend
+            .deform_offset_predict(
+                &t_in,
+                &t_w,
+                &backend
+                    .upload_f32(&[filters - 1], &biases[..filters - 1])
+                    .unwrap(),
+                channels,
+                in_h,
+                in_w,
+                filters,
+                size,
+                stride,
+                stride,
+                padding,
+                dilation,
+                out_h,
+                out_w,
+                cfg(),
+            )
+            .is_err()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -565,7 +661,8 @@ fn accumulate_ref(
                                         && ix >= 0.0
                                         && ix < in_w as f32
                                     {
-                                        acc += wy * wx
+                                        acc += wy
+                                            * wx
                                             * input[base + iy as usize * in_w + ix as usize];
                                     }
                                 }
@@ -648,19 +745,8 @@ fn composed_reference(
     let masks = if use_mask {
         Some(
             predict(
-                &input_s,
-                &f.mask_w,
-                &f.mask_b,
-                batch,
-                channels,
-                in_h,
-                in_w,
-                kernels,
-                size,
-                stride,
-                padding,
-                out_h,
-                out_w,
+                &input_s, &f.mask_w, &f.mask_b, batch, channels, in_h, in_w, kernels, size, stride,
+                padding, out_h, out_w,
             )
             .iter()
             .map(|&v| stable_sigmoid(sanitize(v)))
@@ -726,8 +812,24 @@ fn composed_backend_run(
     };
     let out = backend
         .deform_conv_forward_native(
-            &t_in, &t_main, &t_off_w, &t_off_b, masks, channels, filters, groups, in_h, in_w,
-            out_h, out_w, size, stride, stride, padding, 1, cfg(),
+            &t_in,
+            &t_main,
+            &t_off_w,
+            &t_off_b,
+            masks,
+            channels,
+            filters,
+            groups,
+            in_h,
+            in_w,
+            out_h,
+            out_w,
+            size,
+            stride,
+            stride,
+            padding,
+            1,
+            cfg(),
         )
         .unwrap();
     backend.download_f32(&out).unwrap()
@@ -834,7 +936,15 @@ fn envelope_pre_backward_matches_the_host_reference_both_modes() {
         let t_seed = backend.upload_f32(&[seed.len()], &seed).unwrap();
         let out = backend
             .deform_envelope_pre_backward(
-                &t_raw, &t_mean, &t_inv, &t_norm, &t_seed, planes, spatial, max_offset, cfg(),
+                &t_raw,
+                &t_mean,
+                &t_inv,
+                &t_norm,
+                &t_seed,
+                planes,
+                spatial,
+                max_offset,
+                cfg(),
             )
             .unwrap();
         assert_close_tol(
@@ -850,11 +960,20 @@ fn envelope_pre_backward_matches_the_host_reference_both_modes() {
 fn mask_sigmoid_backward_matches_the_host_reference() {
     let backend = backend();
     let logits = vec![
-        0.0f32, 1.5, -2.25, 20.0, -20.0, 79.0, -79.0, 80.0, -80.0, 1e6, f32::NAN,
+        0.0f32,
+        1.5,
+        -2.25,
+        20.0,
+        -20.0,
+        79.0,
+        -79.0,
+        80.0,
+        -80.0,
+        1e6,
+        f32::NAN,
     ];
     let seed: Vec<f32> = (0..logits.len()).map(|i| 0.5 + i as f32 * 0.125).collect();
-    let want =
-        darknet_cuda::host_ops::deform_conv::mask_sigmoid_backward(&logits, &seed).unwrap();
+    let want = darknet_cuda::host_ops::deform_conv::mask_sigmoid_backward(&logits, &seed).unwrap();
     let t_logits = backend.upload_f32(&[logits.len()], &logits).unwrap();
     let t_seed = backend.upload_f32(&[seed.len()], &seed).unwrap();
     let out = backend

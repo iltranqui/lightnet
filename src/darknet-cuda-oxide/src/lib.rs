@@ -3,8 +3,8 @@
 //! `cargo oxide`; plain `cargo build` cannot compile the device code.
 
 pub mod conv;
-mod deconvolutional;
 mod dcnv4_native;
+mod deconvolutional;
 mod graph_conv;
 pub use dcnv4_native::Dcnv4NativeGradients;
 pub mod fp4;
@@ -22,9 +22,9 @@ use cuda_core::simt::LaunchConfig;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DriverError};
 use darknet_cuda::{
     AdamParams, AdamUpdateItem, BatchNormTrainForward, BilinearGatherGeometry,
-    FoveationFilmGradients,
     ElementwiseLaunchConfig, F32ActivationKind, F32ChannelNormalization,
-    F32ShortcutWeightNormalization, F32TensorOpsBackend, NanInfMode, SgdUpdateItem,
+    F32ShortcutWeightNormalization, F32TensorOpsBackend, FoveationFilmGradients, NanInfMode,
+    SgdUpdateItem,
 };
 
 pub use conv::ConvMode;
@@ -32,10 +32,9 @@ pub use fp4::Fp4Packed;
 pub use fp8::Fp8Format;
 use kernels::bias_scale::BIAS_BACKWARD_THREADS;
 use kernels::{
-    activations, amp as amp_k, batchnorm, bias_scale, conv_direct, conv_implicit, convert,
-    deform_sample, foveation_film,
-    dcnv4, elementwise, gemm, gemm_f8, gemm_f16, gemm_fp4, gemm_mma, half_ops, im2col,
-    layers_extra, muon, optim, pool, quant_fp4, resample, route,
+    activations, amp as amp_k, batchnorm, bias_scale, conv_direct, conv_implicit, convert, dcnv4,
+    deform_sample, elementwise, foveation_film, gemm, gemm_f8, gemm_f16, gemm_fp4, gemm_mma,
+    half_ops, im2col, layers_extra, muon, optim, pool, quant_fp4, resample, route,
 };
 use tensor::PooledBuf;
 pub use tensor::{OxideTensorF16, OxideTensorF32};
@@ -106,6 +105,7 @@ pub struct OxideBackend {
     pool: pool::kernels::LoadedModule,
     resample: resample::kernels::LoadedModule,
     deform_sample: deform_sample::kernels::LoadedModule,
+    dsconv: kernels::dsconv::kernels::LoadedModule,
     deform_backward: deform_sample::backward::LoadedModule,
     foveation_film: foveation_film::kernels::LoadedModule,
     dcnv4: dcnv4::kernels::LoadedModule,
@@ -486,6 +486,802 @@ fn crop_layout(
 }
 
 impl OxideBackend {
+    /// Native f32 WMHF four-direction scan backward and parameter gradients.
+    pub fn wmhf_scan4_backward_f32(
+        &self,
+        input: &OxideTensorF32,
+        output_grad: &OxideTensorF32,
+        weights: &OxideTensorF32,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(OxideTensorF32, OxideTensorF32), OxideError> {
+        let op = "wmhf_scan4_backward_f32";
+        if batch == 0 || channels == 0 || height == 0 || width == 0 {
+            return Err(shape_err(op, "dimensions must be positive".to_owned()));
+        }
+        let total = batch
+            .checked_mul(channels)
+            .and_then(|value| value.checked_mul(height))
+            .and_then(|value| value.checked_mul(width))
+            .ok_or_else(|| shape_err(op, "tensor element count overflows".to_owned()))?;
+        let direction_len = total
+            .checked_mul(4)
+            .ok_or_else(|| shape_err(op, "direction scratch size overflows".to_owned()))?;
+        let sequences_per_channel = height
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(width.checked_mul(2)?))
+            .ok_or_else(|| shape_err(op, "scan sequence count overflows".to_owned()))?;
+        let sequence_count = batch
+            .checked_mul(channels)
+            .and_then(|value| value.checked_mul(sequences_per_channel))
+            .ok_or_else(|| shape_err(op, "scan sequence count overflows".to_owned()))?;
+        let input = self.f32v(input)?;
+        let output_grad = self.f32v(output_grad)?;
+        let weights = self.f32v(weights)?;
+        if input.shape() != [batch, channels, height, width]
+            || input.len() != total
+            || output_grad.shape() != [batch, channels, height, width]
+            || output_grad.len() != total
+        {
+            return Err(shape_err(
+                op,
+                "input/output-gradient shape mismatch".to_owned(),
+            ));
+        }
+        if weights.shape() != [4, channels] || weights.len() != 4 * channels {
+            return Err(shape_err(op, "scan-weight shape mismatch".to_owned()));
+        }
+        let states = self.alloc_uninit(direction_len)?;
+        let input_parts = self.alloc_uninit(direction_len)?;
+        let da_parts = self.alloc_uninit(direction_len)?;
+        let db_parts = self.alloc_uninit(direction_len)?;
+        let dc_parts = self.alloc_uninit(direction_len)?;
+        let dd_parts = self.alloc_uninit(direction_len)?;
+        let mut input_grad = self.alloc_uninit(total)?;
+        let mut weight_grad = self.alloc_uninit(4 * channels)?;
+        // SAFETY: one row/column sequence owns each state and partial entry in
+        // its direction plane. Follow-up gathers reduce four-way overlaps and
+        // channel parameter contributions.
+        unsafe {
+            self.layers_extra.wmhf_scan4_backward_states(
+                &self.stream,
+                launch::elementwise(sequence_count, config),
+                &input.buf,
+                &weights.buf,
+                states.cu_deviceptr() as *mut f32,
+                batch,
+                channels,
+                height,
+                width,
+            )
+        }
+        .map_err(launch_err)?;
+        unsafe {
+            self.layers_extra.wmhf_scan4_backward_sequences(
+                &self.stream,
+                launch::elementwise(sequence_count, config),
+                &input.buf,
+                &output_grad.buf,
+                &weights.buf,
+                &states,
+                input_parts.cu_deviceptr() as *mut f32,
+                da_parts.cu_deviceptr() as *mut f32,
+                db_parts.cu_deviceptr() as *mut f32,
+                dc_parts.cu_deviceptr() as *mut f32,
+                dd_parts.cu_deviceptr() as *mut f32,
+                batch,
+                channels,
+                height,
+                width,
+            )
+        }
+        .map_err(launch_err)?;
+        unsafe {
+            self.layers_extra.wmhf_scan4_backward_input(
+                &self.stream,
+                launch::elementwise(total, config),
+                &input_parts,
+                &mut input_grad,
+            )
+        }
+        .map_err(launch_err)?;
+        unsafe {
+            self.layers_extra.wmhf_scan4_backward_weights(
+                &self.stream,
+                launch::elementwise(4 * channels, config),
+                &da_parts,
+                &db_parts,
+                &dc_parts,
+                &dd_parts,
+                &mut weight_grad,
+                batch,
+                channels,
+                height,
+                width,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok((
+            OxideTensorF32::new(input_grad, &[batch, channels, height, width]),
+            OxideTensorF32::new(weight_grad, &[4, channels]),
+        ))
+    }
+
+    /// Native f32 WMHF high-frequency magnitude/nearest-upsample branch.
+    pub fn wmhf_high_frequency_forward_f32(
+        &self,
+        lh: &OxideTensorF32,
+        hl: &OxideTensorF32,
+        hh: &OxideTensorF32,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let op = "wmhf_high_frequency_forward_f32";
+        if batch == 0 || channels == 0 || height == 0 || width == 0 {
+            return Err(shape_err(op, "dimensions must be positive".to_owned()));
+        }
+        let height2 = height.div_ceil(2);
+        let width2 = width.div_ceil(2);
+        let coeff_len = batch
+            .checked_mul(channels)
+            .and_then(|value| value.checked_mul(height2))
+            .and_then(|value| value.checked_mul(width2))
+            .ok_or_else(|| shape_err(op, "coefficient count overflows".to_owned()))?;
+        let output_len = batch
+            .checked_mul(channels)
+            .and_then(|value| value.checked_mul(height))
+            .and_then(|value| value.checked_mul(width))
+            .ok_or_else(|| shape_err(op, "output element count overflows".to_owned()))?;
+        let expected_coeff_shape = [batch, channels, height2, width2];
+        let lh = self.f32v(lh)?;
+        let hl = self.f32v(hl)?;
+        let hh = self.f32v(hh)?;
+        for (name, tensor) in [("LH", &*lh), ("HL", &*hl), ("HH", &*hh)] {
+            if tensor.shape() != expected_coeff_shape || tensor.len() != coeff_len {
+                return Err(shape_err(
+                    op,
+                    format!(
+                        "{name} shape/length {:?}/{}, expected {expected_coeff_shape:?}/{coeff_len}",
+                        tensor.shape(),
+                        tensor.len()
+                    ),
+                ));
+            }
+        }
+        let mut output = self.alloc_uninit(output_len)?;
+        // SAFETY: one thread writes each output pixel and reads its checked
+        // nearest-upsampled coefficient cell.
+        unsafe {
+            self.layers_extra.wmhf_high_frequency_forward(
+                &self.stream,
+                launch::elementwise(output_len, config),
+                &lh.buf,
+                &hl.buf,
+                &hh.buf,
+                &mut output,
+                channels,
+                height,
+                width,
+                height2,
+                width2,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(
+            output,
+            &[batch, channels, height, width],
+        ))
+    }
+
+    /// Native gather adjoint for the high-frequency magnitude/upsample branch.
+    pub fn wmhf_high_frequency_backward_f32(
+        &self,
+        output_grad: &OxideTensorF32,
+        lh: &OxideTensorF32,
+        hl: &OxideTensorF32,
+        hh: &OxideTensorF32,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(OxideTensorF32, OxideTensorF32, OxideTensorF32), OxideError> {
+        let op = "wmhf_high_frequency_backward_f32";
+        if batch == 0 || channels == 0 || height == 0 || width == 0 {
+            return Err(shape_err(op, "dimensions must be positive".to_owned()));
+        }
+        let height2 = height.div_ceil(2);
+        let width2 = width.div_ceil(2);
+        let coeff_len = batch
+            .checked_mul(channels)
+            .and_then(|value| value.checked_mul(height2))
+            .and_then(|value| value.checked_mul(width2))
+            .ok_or_else(|| shape_err(op, "coefficient count overflows".to_owned()))?;
+        let output_len = batch
+            .checked_mul(channels)
+            .and_then(|value| value.checked_mul(height))
+            .and_then(|value| value.checked_mul(width))
+            .ok_or_else(|| shape_err(op, "output element count overflows".to_owned()))?;
+        let coeff_shape = [batch, channels, height2, width2];
+        let output_grad = self.f32v(output_grad)?;
+        let lh = self.f32v(lh)?;
+        let hl = self.f32v(hl)?;
+        let hh = self.f32v(hh)?;
+        if output_grad.shape() != [batch, channels, height, width]
+            || output_grad.len() != output_len
+        {
+            return Err(shape_err(
+                op,
+                "output gradient shape/length mismatch".to_owned(),
+            ));
+        }
+        for (name, tensor) in [("LH", &*lh), ("HL", &*hl), ("HH", &*hh)] {
+            if tensor.shape() != coeff_shape || tensor.len() != coeff_len {
+                return Err(shape_err(
+                    op,
+                    format!("{name} coefficient shape/length mismatch"),
+                ));
+            }
+        }
+        let mut lh_grad = self.alloc_uninit(coeff_len)?;
+        let mut hl_grad = self.alloc_uninit(coeff_len)?;
+        let mut hh_grad = self.alloc_uninit(coeff_len)?;
+        // SAFETY: one thread owns each coefficient gradient and gathers all
+        // high-resolution cells mapped to that coefficient.
+        unsafe {
+            self.layers_extra.wmhf_high_frequency_backward(
+                &self.stream,
+                launch::elementwise(coeff_len, config),
+                &output_grad.buf,
+                &lh.buf,
+                &hl.buf,
+                &hh.buf,
+                &mut lh_grad,
+                &mut hl_grad,
+                &mut hh_grad,
+                height,
+                width,
+                height2,
+                width2,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok((
+            OxideTensorF32::new(lh_grad, &coeff_shape),
+            OxideTensorF32::new(hl_grad, &coeff_shape),
+            OxideTensorF32::new(hh_grad, &coeff_shape),
+        ))
+    }
+
+    /// Gather a contiguous NCHW channel range for a WMHF branch.
+    pub fn wmhf_split_channels_f32(
+        &self,
+        input: &OxideTensorF32,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        begin: usize,
+        count: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let op = "wmhf_split_channels_f32";
+        if batch == 0 || channels == 0 || height == 0 || width == 0 || count == 0 {
+            return Err(shape_err(
+                op,
+                "dimensions and channel count must be positive".to_owned(),
+            ));
+        }
+        let end = begin
+            .checked_add(count)
+            .ok_or_else(|| shape_err(op, "channel range overflows".to_owned()))?;
+        if end > channels {
+            return Err(shape_err(op, "channel range exceeds input".to_owned()));
+        }
+        let input_len = batch
+            .checked_mul(channels)
+            .and_then(|value| value.checked_mul(height))
+            .and_then(|value| value.checked_mul(width))
+            .ok_or_else(|| shape_err(op, "input element count overflows".to_owned()))?;
+        let output_len = batch
+            .checked_mul(count)
+            .and_then(|value| value.checked_mul(height))
+            .and_then(|value| value.checked_mul(width))
+            .ok_or_else(|| shape_err(op, "output element count overflows".to_owned()))?;
+        let input = self.f32v(input)?;
+        if input.shape() != [batch, channels, height, width] || input.len() != input_len {
+            return Err(shape_err(op, "input shape/length mismatch".to_owned()));
+        }
+        let mut output = self.alloc_uninit(output_len)?;
+        // SAFETY: each output index gathers one valid source channel/spatial index.
+        unsafe {
+            self.layers_extra.wmhf_split_channels(
+                &self.stream,
+                launch::elementwise(output_len, config),
+                &input.buf,
+                &mut output,
+                channels,
+                height,
+                width,
+                begin,
+                count,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, &[batch, count, height, width]))
+    }
+
+    /// Concatenate the three WMHF local depthwise branch outputs in source order.
+    pub fn wmhf_concat_local_f32(
+        &self,
+        branch3: &OxideTensorF32,
+        branch5: &OxideTensorF32,
+        branch7: &OxideTensorF32,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let op = "wmhf_concat_local_f32";
+        if batch == 0 || channels == 0 || height == 0 || width == 0 {
+            return Err(shape_err(op, "dimensions must be positive".to_owned()));
+        }
+        let branch_len = batch
+            .checked_mul(channels)
+            .and_then(|value| value.checked_mul(height))
+            .and_then(|value| value.checked_mul(width))
+            .ok_or_else(|| shape_err(op, "branch element count overflows".to_owned()))?;
+        let output_channels = channels
+            .checked_mul(3)
+            .ok_or_else(|| shape_err(op, "output channel count overflows".to_owned()))?;
+        let output_len = batch
+            .checked_mul(output_channels)
+            .and_then(|value| value.checked_mul(height))
+            .and_then(|value| value.checked_mul(width))
+            .ok_or_else(|| shape_err(op, "output element count overflows".to_owned()))?;
+        let expected_shape = [batch, channels, height, width];
+        let branch3 = self.f32v(branch3)?;
+        let branch5 = self.f32v(branch5)?;
+        let branch7 = self.f32v(branch7)?;
+        for (name, branch) in [("3x", &*branch3), ("5x", &*branch5), ("7x", &*branch7)] {
+            if branch.shape() != expected_shape || branch.len() != branch_len {
+                return Err(shape_err(
+                    op,
+                    format!("{name} branch shape/length mismatch"),
+                ));
+            }
+        }
+        let mut output = self.alloc_uninit(output_len)?;
+        // SAFETY: each output position selects one valid element from one validated branch.
+        unsafe {
+            self.layers_extra.wmhf_concat_local(
+                &self.stream,
+                launch::elementwise(output_len, config),
+                &branch3.buf,
+                &branch5.buf,
+                &branch7.buf,
+                &mut output,
+                channels,
+                height,
+                width,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(
+            output,
+            &[batch, output_channels, height, width],
+        ))
+    }
+
+    /// Native WMHF gate fusion: `fuse + freq_scale * gate * projected + shortcut`.
+    pub fn wmhf_apply_gate_f32(
+        &self,
+        fuse: &OxideTensorF32,
+        gate: &OxideTensorF32,
+        projected: &OxideTensorF32,
+        shortcut: Option<&OxideTensorF32>,
+        freq_scale: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let op = "wmhf_apply_gate_f32";
+        let fuse = self.f32v(fuse)?;
+        let gate = self.f32v(gate)?;
+        let projected = self.f32v(projected)?;
+        let shortcut = shortcut.map(|tensor| self.f32v(tensor)).transpose()?;
+        if fuse.is_empty()
+            || gate.shape() != fuse.shape()
+            || gate.len() != fuse.len()
+            || projected.shape() != fuse.shape()
+            || projected.len() != fuse.len()
+        {
+            return Err(shape_err(
+                op,
+                "fuse/gate/projected shape mismatch".to_owned(),
+            ));
+        }
+        if let Some(shortcut) = &shortcut {
+            if shortcut.shape() != fuse.shape() || shortcut.len() != fuse.len() {
+                return Err(shape_err(op, "shortcut shape mismatch".to_owned()));
+            }
+        }
+        let mut output = self.alloc_uninit(fuse.len())?;
+        // SAFETY: each output element has one owner; all inputs have identical validated lengths.
+        unsafe {
+            self.layers_extra.wmhf_apply_gate(
+                &self.stream,
+                launch::elementwise(fuse.len(), config),
+                &fuse.buf,
+                &gate.buf,
+                &projected.buf,
+                shortcut.as_ref().map_or(&fuse.buf, |value| &value.buf),
+                &mut output,
+                freq_scale,
+                shortcut.is_some(),
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, fuse.shape()))
+    }
+
+    /// Native exact adjoint of WMHF gate fusion.
+    pub fn wmhf_apply_gate_backward_f32(
+        &self,
+        output_grad: &OxideTensorF32,
+        gate: &OxideTensorF32,
+        projected: &OxideTensorF32,
+        freq_scale: f32,
+        use_shortcut: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<
+        (
+            OxideTensorF32,
+            OxideTensorF32,
+            OxideTensorF32,
+            OxideTensorF32,
+        ),
+        OxideError,
+    > {
+        let op = "wmhf_apply_gate_backward_f32";
+        let output_grad = self.f32v(output_grad)?;
+        let gate = self.f32v(gate)?;
+        let projected = self.f32v(projected)?;
+        if output_grad.is_empty()
+            || gate.shape() != output_grad.shape()
+            || gate.len() != output_grad.len()
+            || projected.shape() != output_grad.shape()
+            || projected.len() != output_grad.len()
+        {
+            return Err(shape_err(
+                op,
+                "gradient/gate/projected shape mismatch".to_owned(),
+            ));
+        }
+        let mut fuse_grad = self.alloc_uninit(output_grad.len())?;
+        let mut gate_grad = self.alloc_uninit(output_grad.len())?;
+        let mut projected_grad = self.alloc_uninit(output_grad.len())?;
+        let mut shortcut_grad = self.alloc_uninit(output_grad.len())?;
+        // SAFETY: each gradient element has one owner and all input extents match.
+        unsafe {
+            self.layers_extra.wmhf_apply_gate_backward(
+                &self.stream,
+                launch::elementwise(output_grad.len(), config),
+                &output_grad.buf,
+                &gate.buf,
+                &projected.buf,
+                &mut fuse_grad,
+                &mut gate_grad,
+                &mut projected_grad,
+                &mut shortcut_grad,
+                freq_scale,
+                use_shortcut,
+            )
+        }
+        .map_err(launch_err)?;
+        let shape = output_grad.shape();
+        Ok((
+            OxideTensorF32::new(fuse_grad, shape),
+            OxideTensorF32::new(gate_grad, shape),
+            OxideTensorF32::new(projected_grad, shape),
+            OxideTensorF32::new(shortcut_grad, shape),
+        ))
+    }
+
+    /// Native f32 WMHF four-direction EMA scan for NCHW tensors and `[4,C]` weights.
+    pub fn wmhf_scan4_forward_f32(
+        &self,
+        input: &OxideTensorF32,
+        weights: &OxideTensorF32,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let op = "wmhf_scan4_forward_f32";
+        if batch == 0 || channels == 0 || height == 0 || width == 0 {
+            return Err(shape_err(
+                op,
+                "batch/channels/height/width must be positive".to_owned(),
+            ));
+        }
+        let total = batch
+            .checked_mul(channels)
+            .and_then(|value| value.checked_mul(height))
+            .and_then(|value| value.checked_mul(width))
+            .ok_or_else(|| shape_err(op, "tensor element count overflows".to_owned()))?;
+        let direction_len = total
+            .checked_mul(4)
+            .ok_or_else(|| shape_err(op, "direction scratch size overflows".to_owned()))?;
+        let sequences_per_channel = height
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(width.checked_mul(2)?))
+            .ok_or_else(|| shape_err(op, "scan sequence count overflows".to_owned()))?;
+        let sequence_count = batch
+            .checked_mul(channels)
+            .and_then(|value| value.checked_mul(sequences_per_channel))
+            .ok_or_else(|| shape_err(op, "scan sequence count overflows".to_owned()))?;
+        let input = self.f32v(input)?;
+        let weights = self.f32v(weights)?;
+        if input.shape() != [batch, channels, height, width] || input.len() != total {
+            return Err(shape_err(
+                op,
+                format!(
+                    "input shape/length are {:?}/{}, expected [{batch},{channels},{height},{width}]/{total}",
+                    input.shape(),
+                    input.len()
+                ),
+            ));
+        }
+        if weights.shape() != [4, channels] || weights.len() != 4 * channels {
+            return Err(shape_err(
+                op,
+                format!(
+                    "weight shape/length are {:?}/{}, expected [{},{}]/{}",
+                    weights.shape(),
+                    weights.len(),
+                    4,
+                    channels,
+                    4 * channels
+                ),
+            ));
+        }
+        let directions = self.alloc_uninit(direction_len)?;
+        let mut output = self.alloc_uninit(total)?;
+        // SAFETY: each sequence has a unique (batch,channel,line,direction)
+        // and writes every element of its disjoint direction plane exactly once.
+        unsafe {
+            self.layers_extra.wmhf_scan4_forward(
+                &self.stream,
+                launch::elementwise(sequence_count, config),
+                &input.buf,
+                &weights.buf,
+                directions.cu_deviceptr() as *mut f32,
+                batch,
+                channels,
+                height,
+                width,
+            )
+        }
+        .map_err(launch_err)?;
+        unsafe {
+            self.layers_extra.wmhf_scan4_combine(
+                &self.stream,
+                launch::elementwise(total, config),
+                &directions,
+                &mut output,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(
+            output,
+            &[batch, channels, height, width],
+        ))
+    }
+
+    /// Native f32 WMHF Haar decomposition for `[B,C,H,W]` input.
+    pub fn wmhf_haar_dwt_f32(
+        &self,
+        input: &OxideTensorF32,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<
+        (
+            OxideTensorF32,
+            OxideTensorF32,
+            OxideTensorF32,
+            OxideTensorF32,
+        ),
+        OxideError,
+    > {
+        let op = "wmhf_haar_dwt_f32";
+        if batch == 0 || channels == 0 || height == 0 || width == 0 {
+            return Err(shape_err(
+                op,
+                "batch/channels/height/width must be positive".to_owned(),
+            ));
+        }
+        let input_len = batch
+            .checked_mul(channels)
+            .and_then(|value| value.checked_mul(height))
+            .and_then(|value| value.checked_mul(width))
+            .ok_or_else(|| shape_err(op, "input element count overflows".to_owned()))?;
+        let height2 = height.div_ceil(2);
+        let width2 = width.div_ceil(2);
+        let output_len = batch
+            .checked_mul(channels)
+            .and_then(|value| value.checked_mul(height2))
+            .and_then(|value| value.checked_mul(width2))
+            .ok_or_else(|| shape_err(op, "output element count overflows".to_owned()))?;
+        let input = self.f32v(input)?;
+        if input.len() != input_len || input.shape() != [batch, channels, height, width] {
+            return Err(shape_err(
+                op,
+                format!(
+                    "input shape/length are {:?}/{}, expected [{batch},{channels},{height},{width}]/{input_len}",
+                    input.shape(),
+                    input.len()
+                ),
+            ));
+        }
+        let mut ll = self.alloc_uninit(output_len)?;
+        let mut lh = self.alloc_uninit(output_len)?;
+        let mut hl = self.alloc_uninit(output_len)?;
+        let mut hh = self.alloc_uninit(output_len)?;
+        // SAFETY: one thread writes the same valid coefficient index in each
+        // sub-band; all input and output extents were checked above.
+        unsafe {
+            self.layers_extra.wmhf_haar_dwt(
+                &self.stream,
+                launch::elementwise(output_len, config),
+                &input.buf,
+                &mut ll,
+                &mut lh,
+                &mut hl,
+                &mut hh,
+                channels,
+                height,
+                width,
+                height2,
+                width2,
+            )
+        }
+        .map_err(launch_err)?;
+        let output_shape = [batch, channels, height2, width2];
+        Ok((
+            OxideTensorF32::new(ll, &output_shape),
+            OxideTensorF32::new(lh, &output_shape),
+            OxideTensorF32::new(hl, &output_shape),
+            OxideTensorF32::new(hh, &output_shape),
+        ))
+    }
+
+    /// Native Haar synthesis using the exact gather adjoint of DWT.
+    pub fn wmhf_haar_iwt_f32(
+        &self,
+        ll: &OxideTensorF32,
+        lh: &OxideTensorF32,
+        hl: &OxideTensorF32,
+        hh: &OxideTensorF32,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        self.wmhf_haar_dwt_backward_f32(ll, lh, hl, hh, batch, channels, height, width, config)
+    }
+
+    /// Native adjoint of Haar synthesis; its sub-bands are exactly the DWT.
+    pub fn wmhf_haar_iwt_backward_f32(
+        &self,
+        output_grad: &OxideTensorF32,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<
+        (
+            OxideTensorF32,
+            OxideTensorF32,
+            OxideTensorF32,
+            OxideTensorF32,
+        ),
+        OxideError,
+    > {
+        self.wmhf_haar_dwt_f32(output_grad, batch, channels, height, width, config)
+    }
+
+    /// Native gather adjoint for four WMHF Haar sub-band gradients.
+    pub fn wmhf_haar_dwt_backward_f32(
+        &self,
+        ll_grad: &OxideTensorF32,
+        lh_grad: &OxideTensorF32,
+        hl_grad: &OxideTensorF32,
+        hh_grad: &OxideTensorF32,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let op = "wmhf_haar_dwt_backward_f32";
+        if batch == 0 || channels == 0 || height == 0 || width == 0 {
+            return Err(shape_err(
+                op,
+                "batch/channels/height/width must be positive".to_owned(),
+            ));
+        }
+        let height2 = height.div_ceil(2);
+        let width2 = width.div_ceil(2);
+        let coeff_len = batch
+            .checked_mul(channels)
+            .and_then(|value| value.checked_mul(height2))
+            .and_then(|value| value.checked_mul(width2))
+            .ok_or_else(|| shape_err(op, "coefficient count overflows".to_owned()))?;
+        let input_len = batch
+            .checked_mul(channels)
+            .and_then(|value| value.checked_mul(height))
+            .and_then(|value| value.checked_mul(width))
+            .ok_or_else(|| shape_err(op, "input gradient count overflows".to_owned()))?;
+        let expected_shape = [batch, channels, height2, width2];
+        let ll_grad = self.f32v(ll_grad)?;
+        let lh_grad = self.f32v(lh_grad)?;
+        let hl_grad = self.f32v(hl_grad)?;
+        let hh_grad = self.f32v(hh_grad)?;
+        for (name, gradient) in [
+            ("LL", &*ll_grad),
+            ("LH", &*lh_grad),
+            ("HL", &*hl_grad),
+            ("HH", &*hh_grad),
+        ] {
+            if gradient.shape() != expected_shape || gradient.len() != coeff_len {
+                return Err(shape_err(
+                    op,
+                    format!(
+                        "{name} gradient shape/length are {:?}/{}, expected {expected_shape:?}/{coeff_len}",
+                        gradient.shape(),
+                        gradient.len()
+                    ),
+                ));
+            }
+        }
+        let mut input_grad = self.alloc_uninit(input_len)?;
+        // SAFETY: one thread owns each input-gradient element and only reads
+        // checked sub-band elements from its corresponding Haar tile.
+        unsafe {
+            self.layers_extra.wmhf_haar_dwt_backward(
+                &self.stream,
+                launch::elementwise(input_len, config),
+                &ll_grad.buf,
+                &lh_grad.buf,
+                &hl_grad.buf,
+                &hh_grad.buf,
+                &mut input_grad,
+                channels,
+                height,
+                width,
+                height2,
+                width2,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(
+            input_grad,
+            &[batch, channels, height, width],
+        ))
+    }
+
     pub fn new() -> Result<Self, OxideError> {
         Self::with_device(0)
     }
@@ -546,8 +1342,11 @@ impl OxideBackend {
             .map_err(|err| OxideError::Shape(format!("load resample module: {err:?}")))?;
         let deform_sample = deform_sample::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load deform_sample module: {err:?}")))?;
-        let deform_backward = deform_sample::backward::load(&ctx)
-            .map_err(|err| OxideError::Shape(format!("load deform_sample::backward module: {err:?}")))?;
+        let deform_backward = deform_sample::backward::load(&ctx).map_err(|err| {
+            OxideError::Shape(format!("load deform_sample::backward module: {err:?}"))
+        })?;
+        let dsconv = kernels::dsconv::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load dsconv module: {err:?}")))?;
         let foveation_film = foveation_film::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load foveation_film module: {err:?}")))?;
         let dcnv4 = dcnv4::kernels::load(&ctx)
@@ -608,6 +1407,7 @@ impl OxideBackend {
             layers_extra,
             deform_sample,
             deform_backward,
+            dsconv,
             foveation_film,
             dcnv4,
             dcnv4_backward,
@@ -1167,12 +1967,17 @@ impl OxideBackend {
         cols: usize,
     ) -> Result<OxideTensorF32, OxideError> {
         let op = "muon_orthogonalize_f32";
-        let len = rows.checked_mul(cols)
+        let len = rows
+            .checked_mul(cols)
             .ok_or_else(|| shape_err(op, "matrix extent overflow".to_owned()))?;
         if rows == 0 || cols == 0 || matrix.len() != len {
-            return Err(shape_err(op, format!(
-                "expected non-empty {rows}x{cols} matrix, got {} elements", matrix.len()
-            )));
+            return Err(shape_err(
+                op,
+                format!(
+                    "expected non-empty {rows}x{cols} matrix, got {} elements",
+                    matrix.len()
+                ),
+            ));
         }
         let config = ElementwiseLaunchConfig::default();
         let norm_squared = DeviceBuffer::<f32>::zeroed(&self.stream, 1)?;
@@ -1180,38 +1985,66 @@ impl OxideBackend {
         // every input thread contributes through an atomic add.
         unsafe {
             self.muon.muon_sum_squares_f32(
-                &self.stream, launch::elementwise(len, config), &matrix.buf,
+                &self.stream,
+                launch::elementwise(len, config),
+                &matrix.buf,
                 norm_squared.cu_deviceptr() as *mut f32,
             )
-        }.map_err(launch_err)?;
+        }
+        .map_err(launch_err)?;
         let mut normalized = self.alloc_uninit(len)?;
         // SAFETY: one thread per matrix element; norm/output extents are valid.
         unsafe {
             self.muon.muon_normalize_f32(
-                &self.stream, launch::elementwise(len, config), &matrix.buf,
-                &norm_squared, &mut normalized,
+                &self.stream,
+                launch::elementwise(len, config),
+                &matrix.buf,
+                &norm_squared,
+                &mut normalized,
             )
-        }.map_err(launch_err)?;
+        }
+        .map_err(launch_err)?;
 
         let transposed = rows > cols;
-        let (small, large) = if transposed { (cols, rows) } else { (rows, cols) };
+        let (small, large) = if transposed {
+            (cols, rows)
+        } else {
+            (rows, cols)
+        };
         let mut x = OxideTensorF32::new(normalized, &[rows, cols]);
-        if transposed { x = self.muon_transpose_f32(&x, rows, cols, config)?; }
+        if transposed {
+            x = self.muon_transpose_f32(&x, rows, cols, config)?;
+        }
         for _ in 0..5 {
             let x_t = self.muon_transpose_f32(&x, small, large, config)?;
-            let gram = self.linear_f32(
-                &x, &x, None, &[small, small], small, large, small, config,
-            )?;
+            let gram =
+                self.linear_f32(&x, &x, None, &[small, small], small, large, small, config)?;
             let ax = self.linear_f32(
-                &gram, &x_t, None, &[small, large], small, small, large, config,
+                &gram,
+                &x_t,
+                None,
+                &[small, large],
+                small,
+                small,
+                large,
+                config,
             )?;
             let ax_t = self.muon_transpose_f32(&ax, small, large, config)?;
             let a2x = self.linear_f32(
-                &gram, &ax_t, None, &[small, large], small, small, large, config,
+                &gram,
+                &ax_t,
+                None,
+                &[small, large],
+                small,
+                small,
+                large,
+                config,
             )?;
             x = self.muon_combine_f32(&x, &ax, &a2x, small, large, config)?;
         }
-        if transposed { x = self.muon_transpose_f32(&x, small, large, config)?; }
+        if transposed {
+            x = self.muon_transpose_f32(&x, small, large, config)?;
+        }
         Ok(x)
     }
 
@@ -1226,18 +2059,32 @@ impl OxideBackend {
         coefficient: f32,
     ) -> Result<(OxideTensorF32, OxideTensorF32), OxideError> {
         let op = "muon_momentum_lookahead_f32";
-        if updates.len() == 0 || momentum.len() != updates.len()
+        if updates.len() == 0
+            || momentum.len() != updates.len()
             || shape.iter().product::<usize>() != updates.len()
         {
-            return Err(shape_err(op, "updates, momentum, and shape must have equal nonzero lengths".to_owned()));
+            return Err(shape_err(
+                op,
+                "updates, momentum, and shape must have equal nonzero lengths".to_owned(),
+            ));
         }
         if !coefficient.is_finite() || !(0.0..1.0).contains(&coefficient) {
-            return Err(shape_err(op, "momentum coefficient must be finite and in [0, 1)".to_owned()));
+            return Err(shape_err(
+                op,
+                "momentum coefficient must be finite and in [0, 1)".to_owned(),
+            ));
         }
-        let scale = if loss_scale.is_finite() && loss_scale > 0.0 { loss_scale } else { 1.0 };
+        let scale = if loss_scale.is_finite() && loss_scale > 0.0 {
+            loss_scale
+        } else {
+            1.0
+        };
         let divisor = batch.max(1) as f32 * scale;
         if !divisor.is_finite() || divisor <= 0.0 {
-            return Err(shape_err(op, "gradient divisor must be finite and positive".to_owned()));
+            return Err(shape_err(
+                op,
+                "gradient divisor must be finite and positive".to_owned(),
+            ));
         }
         let config = ElementwiseLaunchConfig::default();
         let mut next = self.alloc_uninit(updates.len())?;
@@ -1273,20 +2120,34 @@ impl OxideBackend {
         direction_scale: f32,
     ) -> Result<OxideTensorF32, OxideError> {
         let op = "muon_apply_update_f32";
-        if weights.len() == 0 || direction.len() != weights.len()
+        if weights.len() == 0
+            || direction.len() != weights.len()
             || shape.iter().product::<usize>() != weights.len()
         {
-            return Err(shape_err(op, "weights, direction, and shape must have equal nonzero lengths".to_owned()));
+            return Err(shape_err(
+                op,
+                "weights, direction, and shape must have equal nonzero lengths".to_owned(),
+            ));
         }
-        if !learning_rate.is_finite() || learning_rate < 0.0
-            || !decay.is_finite() || decay < 0.0
-            || !direction_scale.is_finite() || direction_scale < 0.0
+        if !learning_rate.is_finite()
+            || learning_rate < 0.0
+            || !decay.is_finite()
+            || decay < 0.0
+            || !direction_scale.is_finite()
+            || direction_scale < 0.0
         {
-            return Err(shape_err(op, "learning rate, decay, and direction scale must be finite and non-negative".to_owned()));
+            return Err(shape_err(
+                op,
+                "learning rate, decay, and direction scale must be finite and non-negative"
+                    .to_owned(),
+            ));
         }
         let decay_factor = 1.0 - learning_rate * decay;
         if !decay_factor.is_finite() {
-            return Err(shape_err(op, "decoupled decay factor must be finite".to_owned()));
+            return Err(shape_err(
+                op,
+                "decoupled decay factor must be finite".to_owned(),
+            ));
         }
         let config = ElementwiseLaunchConfig::default();
         let mut output = self.alloc_uninit(weights.len())?;
@@ -1308,33 +2169,54 @@ impl OxideBackend {
     }
 
     fn muon_transpose_f32(
-        &self, matrix: &OxideTensorF32, rows: usize, cols: usize,
+        &self,
+        matrix: &OxideTensorF32,
+        rows: usize,
+        cols: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF32, OxideError> {
         let mut output = self.alloc_uninit(rows * cols)?;
         // SAFETY: one thread owns each transposed output element.
         unsafe {
             self.muon.muon_transpose_f32(
-                &self.stream, launch::elementwise(rows * cols, config),
-                &matrix.buf, &mut output, rows, cols,
+                &self.stream,
+                launch::elementwise(rows * cols, config),
+                &matrix.buf,
+                &mut output,
+                rows,
+                cols,
             )
-        }.map_err(launch_err)?;
+        }
+        .map_err(launch_err)?;
         Ok(OxideTensorF32::new(output, &[cols, rows]))
     }
 
     fn muon_combine_f32(
-        &self, x: &OxideTensorF32, ax: &OxideTensorF32, a2x: &OxideTensorF32,
-        rows: usize, cols: usize, config: ElementwiseLaunchConfig,
+        &self,
+        x: &OxideTensorF32,
+        ax: &OxideTensorF32,
+        a2x: &OxideTensorF32,
+        rows: usize,
+        cols: usize,
+        config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF32, OxideError> {
         let len = rows * cols;
         let mut output = self.alloc_uninit(len)?;
         // SAFETY: all inputs and output have the validated matrix extent.
         unsafe {
             self.muon.muon_linear_combination_f32(
-                &self.stream, launch::elementwise(len, config), 3.4445, &x.buf,
-                -4.7750, &ax.buf, 2.0315, &a2x.buf, &mut output,
+                &self.stream,
+                launch::elementwise(len, config),
+                3.4445,
+                &x.buf,
+                -4.7750,
+                &ax.buf,
+                2.0315,
+                &a2x.buf,
+                &mut output,
             )
-        }.map_err(launch_err)?;
+        }
+        .map_err(launch_err)?;
         Ok(OxideTensorF32::new(output, &[rows, cols]))
     }
 
@@ -2532,7 +3414,10 @@ impl OxideBackend {
         if offsets.len() != offset_len {
             return Err(shape_err(
                 op,
-                format!("offsets have {} elements, expected {offset_len}", offsets.len()),
+                format!(
+                    "offsets have {} elements, expected {offset_len}",
+                    offsets.len()
+                ),
             ));
         }
         if use_mask && masks.len() != batch * kernels * plane {
@@ -2552,7 +3437,10 @@ impl OxideBackend {
         if weights.len() != weight_len {
             return Err(shape_err(
                 op,
-                format!("weights have {} elements, expected {weight_len}", weights.len()),
+                format!(
+                    "weights have {} elements, expected {weight_len}",
+                    weights.len()
+                ),
             ));
         }
         let out_len = batch
@@ -2592,16 +3480,890 @@ impl OxideBackend {
         Ok(OxideTensorF32::new(out, &[batch, filters, out_h, out_w]))
     }
 
+    /// Build one single-template DSConv morph branch's coordinate maps from
+    /// tanh-transformed `[B,2*K,H,W]` offsets. `morph=2` composes two calls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsconv_coordinate_map_f32(
+        &self,
+        offsets: &OxideTensorF32,
+        batch: usize,
+        height: usize,
+        width: usize,
+        kernel_size: usize,
+        extend_scope: f32,
+        morph: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(OxideTensorF32, OxideTensorF32), OxideError> {
+        let op = "dsconv_coordinate_map_f32";
+        if batch == 0
+            || height == 0
+            || width == 0
+            || kernel_size == 0
+            || kernel_size % 2 == 0
+            || !extend_scope.is_finite()
+            || morph > 1
+        {
+            return Err(shape_err(
+                op,
+                "invalid batch/spatial/kernel/morph geometry".to_owned(),
+            ));
+        }
+        let offset_channels = kernel_size
+            .checked_mul(2)
+            .ok_or_else(|| shape_err(op, "offset channel count overflows".to_owned()))?;
+        if offsets.shape() != [batch, offset_channels, height, width] {
+            return Err(shape_err(
+                op,
+                "offset tensor shape does not match geometry".to_owned(),
+            ));
+        }
+        let output_len = batch
+            .checked_mul(height)
+            .and_then(|n| n.checked_mul(width))
+            .and_then(|n| n.checked_mul(kernel_size))
+            .ok_or_else(|| shape_err(op, "coordinate map length overflows".to_owned()))?;
+        let offsets = self.f32v(offsets)?;
+        let mut y_map = self.alloc_uninit(output_len)?;
+        let mut x_map = self.alloc_uninit(output_len)?;
+        // SAFETY: operand shape and output lengths are validated above; each
+        // thread owns one y/x coordinate pair and all offset taps stay in bounds.
+        unsafe {
+            self.dsconv.dsconv_coordinate_map(
+                &self.stream,
+                launch::elementwise(output_len, config),
+                &offsets.buf,
+                &mut y_map,
+                &mut x_map,
+                batch,
+                height,
+                width,
+                kernel_size,
+                extend_scope,
+                morph,
+            )
+        }
+        .map_err(launch_err)?;
+        let shape = [batch, height, width, kernel_size];
+        Ok((
+            OxideTensorF32::new(y_map, &shape),
+            OxideTensorF32::new(x_map, &shape),
+        ))
+    }
+
+    /// Border-clamped bilinear sampling for the DSConv's deformed tensor,
+    /// returning `[B,C,H,W,K]` in the CPU reference's axis order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsconv_bilinear_sample_f32(
+        &self,
+        input: &OxideTensorF32,
+        y_map: &OxideTensorF32,
+        x_map: &OxideTensorF32,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        kernel_size: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let op = "dsconv_bilinear_sample_f32";
+        if batch == 0 || channels == 0 || height == 0 || width == 0 || kernel_size == 0 {
+            return Err(shape_err(op, "all dimensions must be positive".to_owned()));
+        }
+        let coord_shape = [batch, height, width, kernel_size];
+        if input.shape() != [batch, channels, height, width]
+            || y_map.shape() != coord_shape
+            || x_map.shape() != coord_shape
+        {
+            return Err(shape_err(
+                op,
+                "input and coordinate tensor shapes do not match geometry".to_owned(),
+            ));
+        }
+        let output_len = batch
+            .checked_mul(channels)
+            .and_then(|n| n.checked_mul(height))
+            .and_then(|n| n.checked_mul(width))
+            .and_then(|n| n.checked_mul(kernel_size))
+            .ok_or_else(|| shape_err(op, "sampled tensor length overflows".to_owned()))?;
+        let input = self.f32v(input)?;
+        let y_map = self.f32v(y_map)?;
+        let x_map = self.f32v(x_map)?;
+        let mut sampled = self.alloc_uninit(output_len)?;
+        // SAFETY: exact source/map shapes and output extent were checked above.
+        unsafe {
+            self.dsconv.dsconv_bilinear_sample(
+                &self.stream,
+                launch::elementwise(output_len, config),
+                &input.buf,
+                &y_map.buf,
+                &x_map.buf,
+                &mut sampled,
+                batch,
+                channels,
+                height,
+                width,
+                kernel_size,
+            )
+        }
+        .map_err(launch_err)?;
+        let shape = [batch, channels, height, width, kernel_size];
+        Ok(OxideTensorF32::new(sampled, &shape))
+    }
+
+    /// Adjoint of DSConv's border-clamped bilinear gather. Input gradients use
+    /// float atomics; coordinate gradients are uniquely owned per sample.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsconv_bilinear_backward_f32(
+        &self,
+        input: &OxideTensorF32,
+        y_map: &OxideTensorF32,
+        x_map: &OxideTensorF32,
+        sampled_gradient: &OxideTensorF32,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        kernel_size: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(OxideTensorF32, OxideTensorF32, OxideTensorF32), OxideError> {
+        let op = "dsconv_bilinear_backward_f32";
+        if batch == 0 || channels == 0 || height == 0 || width == 0 || kernel_size == 0 {
+            return Err(shape_err(op, "all dimensions must be positive".to_owned()));
+        }
+        let coord_shape = [batch, height, width, kernel_size];
+        let sampled_shape = [batch, channels, height, width, kernel_size];
+        if input.shape() != [batch, channels, height, width]
+            || y_map.shape() != coord_shape
+            || x_map.shape() != coord_shape
+            || sampled_gradient.shape() != sampled_shape
+        {
+            return Err(shape_err(
+                op,
+                "operand shapes do not match DSConv geometry".to_owned(),
+            ));
+        }
+        let input_len = batch
+            .checked_mul(channels)
+            .and_then(|n| n.checked_mul(height))
+            .and_then(|n| n.checked_mul(width))
+            .ok_or_else(|| shape_err(op, "input gradient length overflows".to_owned()))?;
+        let coord_len = batch
+            .checked_mul(height)
+            .and_then(|n| n.checked_mul(width))
+            .and_then(|n| n.checked_mul(kernel_size))
+            .ok_or_else(|| shape_err(op, "coordinate gradient length overflows".to_owned()))?;
+        let input = self.f32v(input)?;
+        let y_map = self.f32v(y_map)?;
+        let x_map = self.f32v(x_map)?;
+        let sampled_gradient = self.f32v(sampled_gradient)?;
+        let mut input_gradient = self.alloc_zeroed(input_len)?;
+        let mut y_gradient = self.alloc_uninit(coord_len)?;
+        let mut x_gradient = self.alloc_uninit(coord_len)?;
+        // SAFETY: all tensor shapes and gradient extents are checked; output
+        // coordinate writers are unique and input collisions use float atomics.
+        unsafe {
+            self.dsconv.dsconv_bilinear_backward(
+                &self.stream,
+                launch::elementwise(coord_len, config),
+                &input.buf,
+                &y_map.buf,
+                &x_map.buf,
+                &sampled_gradient.buf,
+                &mut input_gradient,
+                &mut y_gradient,
+                &mut x_gradient,
+                batch,
+                channels,
+                height,
+                width,
+                kernel_size,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok((
+            OxideTensorF32::new(input_gradient, &[batch, channels, height, width]),
+            OxideTensorF32::new(y_gradient, &coord_shape),
+            OxideTensorF32::new(x_gradient, &coord_shape),
+        ))
+    }
+
+    /// Backpropagate coordinate-map adjoints through the center-anchored
+    /// cumulative offsets and tanh, preserving the configured morph axes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsconv_offset_map_backward_f32(
+        &self,
+        offsets_tanh: &OxideTensorF32,
+        y_coordinate_gradient: &OxideTensorF32,
+        x_coordinate_gradient: &OxideTensorF32,
+        batch: usize,
+        height: usize,
+        width: usize,
+        kernel_size: usize,
+        extend_scope: f32,
+        morph: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let op = "dsconv_offset_map_backward_f32";
+        if batch == 0
+            || height == 0
+            || width == 0
+            || kernel_size == 0
+            || kernel_size % 2 == 0
+            || !extend_scope.is_finite()
+            || morph > 2
+        {
+            return Err(shape_err(op, "invalid DSConv offset geometry".to_owned()));
+        }
+        let offset_channels = kernel_size
+            .checked_mul(2)
+            .ok_or_else(|| shape_err(op, "offset channel count overflows".to_owned()))?;
+        let coord_shape = [batch, height, width, kernel_size];
+        if offsets_tanh.shape() != [batch, offset_channels, height, width]
+            || y_coordinate_gradient.shape() != coord_shape
+            || x_coordinate_gradient.shape() != coord_shape
+        {
+            return Err(shape_err(
+                op,
+                "operand shapes do not match DSConv geometry".to_owned(),
+            ));
+        }
+        let offset_len = batch
+            .checked_mul(offset_channels)
+            .and_then(|n| n.checked_mul(height))
+            .and_then(|n| n.checked_mul(width))
+            .ok_or_else(|| shape_err(op, "offset gradient length overflows".to_owned()))?;
+        let offsets_tanh = self.f32v(offsets_tanh)?;
+        let y_coordinate_gradient = self.f32v(y_coordinate_gradient)?;
+        let x_coordinate_gradient = self.f32v(x_coordinate_gradient)?;
+        let mut offset_gradient = self.alloc_uninit(offset_len)?;
+        // SAFETY: input and output layouts are validated above; one thread owns
+        // each raw-offset gradient and all cumulative taps are within K.
+        unsafe {
+            self.dsconv.dsconv_offset_map_backward(
+                &self.stream,
+                launch::elementwise(offset_len, config),
+                &offsets_tanh.buf,
+                &y_coordinate_gradient.buf,
+                &x_coordinate_gradient.buf,
+                &mut offset_gradient,
+                batch,
+                height,
+                width,
+                kernel_size,
+                extend_scope,
+                morph,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(
+            offset_gradient,
+            &[batch, offset_channels, height, width],
+        ))
+    }
+
+    /// Collapse DSConv's `[B,C,H,W,K]` sampled tensor with `[F,C,K]` weights.
+    pub fn dsconv_collapse_f32(
+        &self,
+        sampled: &OxideTensorF32,
+        weights: &OxideTensorF32,
+        biases: &OxideTensorF32,
+        batch: usize,
+        channels: usize,
+        filters: usize,
+        height: usize,
+        width: usize,
+        kernel_size: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let op = "dsconv_collapse_f32";
+        if batch == 0
+            || channels == 0
+            || filters == 0
+            || height == 0
+            || width == 0
+            || kernel_size == 0
+        {
+            return Err(shape_err(op, "all dimensions must be positive".to_owned()));
+        }
+        if sampled.shape() != [batch, channels, height, width, kernel_size]
+            || weights.shape() != [filters, channels, kernel_size]
+            || biases.shape() != [filters]
+        {
+            return Err(shape_err(
+                op,
+                "operand shapes do not match DSConv geometry".to_owned(),
+            ));
+        }
+        let output_len = batch
+            .checked_mul(filters)
+            .and_then(|n| n.checked_mul(height))
+            .and_then(|n| n.checked_mul(width))
+            .ok_or_else(|| shape_err(op, "output length overflows".to_owned()))?;
+        let sampled = self.f32v(sampled)?;
+        let weights = self.f32v(weights)?;
+        let biases = self.f32v(biases)?;
+        let mut output = self.alloc_uninit(output_len)?;
+        // SAFETY: operand shapes and output length were checked above.
+        unsafe {
+            self.dsconv.dsconv_collapse(
+                &self.stream,
+                launch::elementwise(output_len, config),
+                &sampled.buf,
+                &weights.buf,
+                &biases.buf,
+                &mut output,
+                batch,
+                channels,
+                filters,
+                height,
+                width,
+                kernel_size,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(
+            output,
+            &[batch, filters, height, width],
+        ))
+    }
+
+    /// Exact adjoints of the linear DSConv collapse for one output-channel
+    /// partition (used separately for the two branches of morph=2).
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsconv_collapse_backward_f32(
+        &self,
+        sampled: &OxideTensorF32,
+        weights: &OxideTensorF32,
+        output_gradient: &OxideTensorF32,
+        batch: usize,
+        channels: usize,
+        filters: usize,
+        height: usize,
+        width: usize,
+        kernel_size: usize,
+        filter_start: usize,
+        filter_count: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(OxideTensorF32, OxideTensorF32, OxideTensorF32), OxideError> {
+        let op = "dsconv_collapse_backward_f32";
+        if batch == 0
+            || channels == 0
+            || filters == 0
+            || height == 0
+            || width == 0
+            || kernel_size == 0
+        {
+            return Err(shape_err(op, "all dimensions must be positive".to_owned()));
+        }
+        if filter_count == 0 || filter_start > filters || filter_count > filters - filter_start {
+            return Err(shape_err(op, "invalid output-channel partition".to_owned()));
+        }
+        if sampled.shape() != [batch, channels, height, width, kernel_size]
+            || weights.shape() != [filters, channels, kernel_size]
+            || output_gradient.shape() != [batch, filters, height, width]
+        {
+            return Err(shape_err(
+                op,
+                "operand shapes do not match DSConv geometry".to_owned(),
+            ));
+        }
+        let sampled_len = batch
+            .checked_mul(channels)
+            .and_then(|n| n.checked_mul(height))
+            .and_then(|n| n.checked_mul(width))
+            .and_then(|n| n.checked_mul(kernel_size))
+            .ok_or_else(|| shape_err(op, "sampled gradient length overflows".to_owned()))?;
+        let weight_len = filters
+            .checked_mul(channels)
+            .and_then(|n| n.checked_mul(kernel_size))
+            .ok_or_else(|| shape_err(op, "weight gradient length overflows".to_owned()))?;
+        let sampled = self.f32v(sampled)?;
+        let weights = self.f32v(weights)?;
+        let output_gradient = self.f32v(output_gradient)?;
+        let mut sampled_gradient = self.alloc_uninit(sampled_len)?;
+        let mut weight_gradient = self.alloc_uninit(weight_len)?;
+        let mut bias_gradient = self.alloc_uninit(filters)?;
+        // SAFETY: all operands were shape-checked; every output element has one writer.
+        unsafe {
+            self.dsconv.dsconv_collapse_backward_sampled(
+                &self.stream,
+                launch::elementwise(sampled_len, config),
+                &weights.buf,
+                &output_gradient.buf,
+                &mut sampled_gradient,
+                batch,
+                channels,
+                filters,
+                height,
+                width,
+                kernel_size,
+                filter_start,
+                filter_count,
+            )
+        }
+        .map_err(launch_err)?;
+        // SAFETY: shape-checked parameter/output gradients; unique parameter writers.
+        unsafe {
+            self.dsconv.dsconv_collapse_backward_weights(
+                &self.stream,
+                launch::elementwise(weight_len, config),
+                &sampled.buf,
+                &output_gradient.buf,
+                &mut weight_gradient,
+                batch,
+                channels,
+                filters,
+                height,
+                width,
+                kernel_size,
+                filter_start,
+                filter_count,
+            )
+        }
+        .map_err(launch_err)?;
+        // SAFETY: one thread owns each bias-gradient channel.
+        unsafe {
+            self.dsconv.dsconv_collapse_backward_biases(
+                &self.stream,
+                launch::elementwise(filters, config),
+                &output_gradient.buf,
+                &mut bias_gradient,
+                batch,
+                filters,
+                height,
+                width,
+                filter_start,
+                filter_count,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok((
+            OxideTensorF32::new(
+                sampled_gradient,
+                &[batch, channels, height, width, kernel_size],
+            ),
+            OxideTensorF32::new(weight_gradient, &[filters, channels, kernel_size]),
+            OxideTensorF32::new(bias_gradient, &[filters]),
+        ))
+    }
+
+    /// Composed DSConv f32 forward for the bounded single-template contract.
+    /// This returns the post-activation layer output but does not retain the
+    /// forward intermediates needed by runtime backward.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsconv_forward_native_f32(
+        &self,
+        input: &OxideTensorF32,
+        offset_weights: &OxideTensorF32,
+        offset_biases: &OxideTensorF32,
+        weights: &OxideTensorF32,
+        biases: &OxideTensorF32,
+        batch: usize,
+        channels: usize,
+        filters: usize,
+        height: usize,
+        width: usize,
+        kernel_size: usize,
+        extend_scope: f32,
+        morph: usize,
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let op = "dsconv_forward_native_f32";
+        if batch == 0
+            || channels == 0
+            || filters == 0
+            || height == 0
+            || width == 0
+            || kernel_size == 0
+            || kernel_size % 2 == 0
+            || !extend_scope.is_finite()
+            || morph > 2
+            || (morph == 2 && filters < 2)
+        {
+            return Err(shape_err(
+                op,
+                "invalid batch, layer, or morph geometry".to_owned(),
+            ));
+        }
+        let offset_channels = kernel_size
+            .checked_mul(2)
+            .ok_or_else(|| shape_err(op, "offset channel count overflows".to_owned()))?;
+        if input.shape() != [batch, channels, height, width]
+            || offset_weights.shape() != [offset_channels, channels, 3, 3]
+            || offset_biases.shape() != [offset_channels]
+            || weights.shape() != [filters, channels, kernel_size]
+            || biases.shape() != [filters]
+        {
+            return Err(shape_err(
+                op,
+                "operand shapes do not match DSConv geometry".to_owned(),
+            ));
+        }
+        let offset_shape = [batch, offset_channels, height, width];
+        let raw_offsets = self.conv2d_f32(
+            input,
+            offset_weights,
+            &offset_shape,
+            channels,
+            height,
+            width,
+            offset_channels,
+            3,
+            1,
+            1,
+            1,
+            1,
+            1,
+            config,
+        )?;
+        let biased_offsets = self.bias_add_f32(
+            &raw_offsets,
+            offset_biases,
+            offset_channels,
+            height * width,
+            config,
+        )?;
+        let offsets_tanh = self.activation_f32(&biased_offsets, F32ActivationKind::Tanh, config)?;
+        let (x_y_map, x_x_map) = self.dsconv_coordinate_map_f32(
+            &offsets_tanh,
+            batch,
+            height,
+            width,
+            kernel_size,
+            extend_scope,
+            0,
+            config,
+        )?;
+        let (y_y_map, y_x_map) = self.dsconv_coordinate_map_f32(
+            &offsets_tanh,
+            batch,
+            height,
+            width,
+            kernel_size,
+            extend_scope,
+            1,
+            config,
+        )?;
+        let sampled_x = self.dsconv_bilinear_sample_f32(
+            input,
+            &x_y_map,
+            &x_x_map,
+            batch,
+            channels,
+            height,
+            width,
+            kernel_size,
+            config,
+        )?;
+        let sampled_y = self.dsconv_bilinear_sample_f32(
+            input,
+            &y_y_map,
+            &y_x_map,
+            batch,
+            channels,
+            height,
+            width,
+            kernel_size,
+            config,
+        )?;
+        let output_len = batch
+            .checked_mul(filters)
+            .and_then(|n| n.checked_mul(height))
+            .and_then(|n| n.checked_mul(width))
+            .ok_or_else(|| shape_err(op, "output length overflows".to_owned()))?;
+        let sampled_x = self.f32v(&sampled_x)?;
+        let sampled_y = self.f32v(&sampled_y)?;
+        let weights = self.f32v(weights)?;
+        let biases = self.f32v(biases)?;
+        let mut raw_output = self.alloc_uninit(output_len)?;
+        // SAFETY: all input/parameter extents and output geometry were checked.
+        unsafe {
+            self.dsconv.dsconv_collapse_morph(
+                &self.stream,
+                launch::elementwise(output_len, config),
+                &sampled_x.buf,
+                &sampled_y.buf,
+                &weights.buf,
+                &biases.buf,
+                &mut raw_output,
+                batch,
+                channels,
+                filters,
+                height,
+                width,
+                kernel_size,
+                morph,
+            )
+        }
+        .map_err(launch_err)?;
+        let raw_output = OxideTensorF32::new(raw_output, &[batch, filters, height, width]);
+        self.activation_f32(&raw_output, activation, config)
+    }
+
+    /// Composed exact adjoint of the bounded single-template DSConv forward.
+    /// Intermediate device values are recomputed; input-sampling scatter uses
+    /// atomics, so only summation order is nondeterministic.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsconv_backward_native_f32(
+        &self,
+        input: &OxideTensorF32,
+        offset_weights: &OxideTensorF32,
+        offset_biases: &OxideTensorF32,
+        weights: &OxideTensorF32,
+        biases: &OxideTensorF32,
+        output_gradient: &OxideTensorF32,
+        batch: usize,
+        channels: usize,
+        filters: usize,
+        height: usize,
+        width: usize,
+        kernel_size: usize,
+        extend_scope: f32,
+        morph: usize,
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<
+        (
+            OxideTensorF32,
+            OxideTensorF32,
+            OxideTensorF32,
+            OxideTensorF32,
+            OxideTensorF32,
+        ),
+        OxideError,
+    > {
+        let op = "dsconv_backward_native_f32";
+        if output_gradient.shape() != [batch, filters, height, width] {
+            return Err(shape_err(
+                op,
+                "output-gradient shape does not match DSConv output".to_owned(),
+            ));
+        }
+        let raw_output = self.dsconv_forward_native_f32(
+            input,
+            offset_weights,
+            offset_biases,
+            weights,
+            biases,
+            batch,
+            channels,
+            filters,
+            height,
+            width,
+            kernel_size,
+            extend_scope,
+            morph,
+            F32ActivationKind::Linear,
+            config,
+        )?;
+        let output_delta =
+            self.activation_backward_f32(&raw_output, output_gradient, activation, config)?;
+
+        // Rebuild predictor offsets and both branch sampling caches.
+        let offset_channels = 2 * kernel_size;
+        let offset_shape = [batch, offset_channels, height, width];
+        let raw_offsets = self.conv2d_f32(
+            input,
+            offset_weights,
+            &offset_shape,
+            channels,
+            height,
+            width,
+            offset_channels,
+            3,
+            1,
+            1,
+            1,
+            1,
+            1,
+            config,
+        )?;
+        let biased_offsets = self.bias_add_f32(
+            &raw_offsets,
+            offset_biases,
+            offset_channels,
+            height * width,
+            config,
+        )?;
+        let offsets_tanh = self.activation_f32(&biased_offsets, F32ActivationKind::Tanh, config)?;
+        let (x_y, x_x) = self.dsconv_coordinate_map_f32(
+            &offsets_tanh,
+            batch,
+            height,
+            width,
+            kernel_size,
+            extend_scope,
+            0,
+            config,
+        )?;
+        let (y_y, y_x) = self.dsconv_coordinate_map_f32(
+            &offsets_tanh,
+            batch,
+            height,
+            width,
+            kernel_size,
+            extend_scope,
+            1,
+            config,
+        )?;
+        let sampled_x = self.dsconv_bilinear_sample_f32(
+            input,
+            &x_y,
+            &x_x,
+            batch,
+            channels,
+            height,
+            width,
+            kernel_size,
+            config,
+        )?;
+        let sampled_y = self.dsconv_bilinear_sample_f32(
+            input,
+            &y_y,
+            &y_x,
+            batch,
+            channels,
+            height,
+            width,
+            kernel_size,
+            config,
+        )?;
+
+        let (x_start, x_count, y_start, y_count) = match morph {
+            0 => (0, filters, 0, 0),
+            1 => (0, 0, 0, filters),
+            2 => (0, filters / 2, filters / 2, filters - filters / 2),
+            _ => return Err(shape_err(op, "morph must be 0, 1, or 2".to_owned())),
+        };
+        let mut grad_weights: Option<OxideTensorF32> = None;
+        let mut grad_biases: Option<OxideTensorF32> = None;
+        let mut grad_input_sampling: Option<OxideTensorF32> = None;
+        let mut grad_offset_map: Option<OxideTensorF32> = None;
+        for (start, count, sampled, y_map, x_map, branch_morph) in [
+            (x_start, x_count, &sampled_x, &x_y, &x_x, 0usize),
+            (y_start, y_count, &sampled_y, &y_y, &y_x, 1usize),
+        ] {
+            if count == 0 {
+                continue;
+            }
+            let (sampled_delta, weight_delta, bias_delta) = self.dsconv_collapse_backward_f32(
+                sampled,
+                weights,
+                &output_delta,
+                batch,
+                channels,
+                filters,
+                height,
+                width,
+                kernel_size,
+                start,
+                count,
+                config,
+            )?;
+            grad_weights = Some(match grad_weights {
+                Some(ref existing) => self.vector_add_f32(existing, &weight_delta, config)?,
+                None => weight_delta,
+            });
+            grad_biases = Some(match grad_biases {
+                Some(ref existing) => self.vector_add_f32(existing, &bias_delta, config)?,
+                None => bias_delta,
+            });
+            let (input_delta, y_coordinate_delta, x_coordinate_delta) = self
+                .dsconv_bilinear_backward_f32(
+                    input,
+                    y_map,
+                    x_map,
+                    &sampled_delta,
+                    batch,
+                    channels,
+                    height,
+                    width,
+                    kernel_size,
+                    config,
+                )?;
+            grad_input_sampling = Some(match grad_input_sampling {
+                Some(ref existing) => self.vector_add_f32(existing, &input_delta, config)?,
+                None => input_delta,
+            });
+            let offset_delta = self.dsconv_offset_map_backward_f32(
+                &offsets_tanh,
+                &y_coordinate_delta,
+                &x_coordinate_delta,
+                batch,
+                height,
+                width,
+                kernel_size,
+                extend_scope,
+                branch_morph,
+                config,
+            )?;
+            grad_offset_map = Some(match grad_offset_map {
+                Some(ref existing) => self.vector_add_f32(existing, &offset_delta, config)?,
+                None => offset_delta,
+            });
+        }
+        let grad_weights =
+            grad_weights.ok_or_else(|| shape_err(op, "no active morph branch".to_owned()))?;
+        let grad_biases =
+            grad_biases.ok_or_else(|| shape_err(op, "no active morph branch".to_owned()))?;
+        let grad_input_sampling = grad_input_sampling
+            .ok_or_else(|| shape_err(op, "no active morph branch".to_owned()))?;
+        let grad_offset_map =
+            grad_offset_map.ok_or_else(|| shape_err(op, "no active morph branch".to_owned()))?;
+        let grad_offset_weights = self.conv2d_backward_weights_f32(
+            input,
+            &grad_offset_map,
+            &[offset_channels, channels, 3, 3],
+            channels,
+            height,
+            width,
+            offset_channels,
+            3,
+            1,
+            1,
+            1,
+            1,
+            1,
+            config,
+        )?;
+        let grad_offset_biases =
+            self.bias_backward_f32(&grad_offset_map, offset_channels, height * width, config)?;
+        let grad_input_predictor = self.conv2d_backward_input_f32(
+            &grad_offset_map,
+            offset_weights,
+            &[batch, channels, height, width],
+            channels,
+            height,
+            width,
+            offset_channels,
+            3,
+            1,
+            1,
+            1,
+            1,
+            1,
+            config,
+        )?;
+        let grad_input =
+            self.vector_add_f32(&grad_input_sampling, &grad_input_predictor, config)?;
+        Ok((
+            grad_input,
+            grad_weights,
+            grad_biases,
+            grad_offset_weights,
+            grad_offset_biases,
+        ))
+    }
+
     /// `[deform_conv]` offset/mask predictor: a plain convolution of the input
     /// with the predictor weights plus its bias — i.e. `W * im2col(x) + b`, the
     /// same quantity `deform_conv::predictor_columns` produces. `groups` is not
     /// a parameter: the source predictor is always dense over all input
     /// channels (`offset_filters = 2*size*size`, `mask_filters = size*size`).
     ///
-    /// `dilation` must be 1. The source predictor extent includes the dilated
-    /// kernel extent while the conv `Geom` deliberately does not (it matches
-    /// `[convolutional]`), so a dilated predictor would silently come back with
-    /// the wrong shape. That case is rejected explicitly instead.
+    /// Dilation greater than one uses an explicitly-shaped native predictor
+    /// kernel because DeformConv's output extent differs from `[convolutional]`.
     #[allow(clippy::too_many_arguments)]
     pub fn deform_offset_predict(
         &self,
@@ -2622,18 +4384,21 @@ impl OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF32, OxideError> {
         let op = "deform_offset_predict";
-        if dilation != 1 {
+        if input_channels == 0
+            || in_h == 0
+            || in_w == 0
+            || filters == 0
+            || size == 0
+            || out_h == 0
+            || out_w == 0
+            || stride_x == 0
+            || stride_y == 0
+            || dilation == 0
+        {
             return Err(shape_err(
                 op,
-                format!(
-                    "dilation {dilation} is not supported by the conv-based predictor; \
-                     the source extent includes the dilated kernel extent and the conv \
-                     extent does not, so the result would be silently mis-shaped"
-                ),
+                "all dimensions, strides and dilation must be positive".to_owned(),
             ));
-        }
-        if input_channels == 0 || in_h == 0 || in_w == 0 || filters == 0 || size == 0 {
-            return Err(shape_err(op, "all dimensions must be positive".to_owned()));
         }
         let per_batch = input_channels
             .checked_mul(in_h)
@@ -2649,6 +4414,15 @@ impl OxideBackend {
             ));
         }
         let batch = input.len() / per_batch;
+        if input.shape() != [batch, input_channels, in_h, in_w] {
+            return Err(shape_err(
+                op,
+                format!(
+                    "input tensor shape {:?} does not match predictor geometry",
+                    input.shape()
+                ),
+            ));
+        }
         let weight_len = filters
             .checked_mul(input_channels)
             .and_then(|v| v.checked_mul(size))
@@ -2657,7 +4431,10 @@ impl OxideBackend {
         if weights.len() != weight_len {
             return Err(shape_err(
                 op,
-                format!("weights have {} elements, expected {weight_len}", weights.len()),
+                format!(
+                    "weights have {} elements, expected {weight_len}",
+                    weights.len()
+                ),
             ));
         }
         if biases.len() != filters {
@@ -2667,22 +4444,57 @@ impl OxideBackend {
             ));
         }
         let shape = [batch, filters, out_h, out_w];
-        let convolved = self.conv2d_f32(
-            input,
-            weights,
-            &shape,
-            input_channels,
-            in_h,
-            in_w,
-            filters,
-            size,
-            stride_x,
-            stride_y,
-            dilation,
-            padding,
-            1,
-            config,
-        )?;
+        let convolved = if dilation == 1 {
+            self.conv2d_f32(
+                input,
+                weights,
+                &shape,
+                input_channels,
+                in_h,
+                in_w,
+                filters,
+                size,
+                stride_x,
+                stride_y,
+                dilation,
+                padding,
+                1,
+                config,
+            )?
+        } else {
+            let output_len = batch
+                .checked_mul(filters)
+                .and_then(|n| n.checked_mul(out_h))
+                .and_then(|n| n.checked_mul(out_w))
+                .ok_or_else(|| shape_err(op, "output length overflows".to_owned()))?;
+            let input = self.f32v(input)?;
+            let weights = self.f32v(weights)?;
+            let mut output = self.alloc_uninit(output_len)?;
+            // SAFETY: checked operand lengths and explicit output shape bound all taps.
+            unsafe {
+                self.deform_backward.deform_predictor_forward_dilated(
+                    &self.stream,
+                    launch::elementwise(output_len, config),
+                    &input.buf,
+                    &weights.buf,
+                    &mut output,
+                    batch,
+                    input_channels,
+                    filters,
+                    in_h,
+                    in_w,
+                    out_h,
+                    out_w,
+                    size,
+                    stride_x,
+                    stride_y,
+                    padding,
+                    dilation,
+                )
+            }
+            .map_err(launch_err)?;
+            OxideTensorF32::new(output, &shape)
+        };
         self.bias_add_f32(&convolved, biases, filters, out_h * out_w, config)
     }
 
@@ -2717,8 +4529,8 @@ impl OxideBackend {
     /// sanitize input -> offset predictor -> per-batch stats -> envelope ->
     /// (optional mask predictor + sigmoid) -> deformable accumulation.
     ///
-    /// `dilation` must be 1 (the predictor is conv-based). The CPU forward and
-    /// backward stay the reference; this is not yet wired into the runtime.
+    /// Dilated predictors use an explicit-extent direct CUDA kernel; the same
+    /// stages are dispatched by the generic runtime for non-BN variants.
     #[allow(clippy::too_many_arguments)]
     pub fn deform_conv_forward_native(
         &self,
@@ -2771,12 +4583,8 @@ impl OxideBackend {
             out_w,
             config,
         )?;
-        let (mean, inv_std, normalize) = self.deform_offset_stats(
-            &raw_offsets,
-            2 * kernel_area * plane,
-            max_offset,
-            config,
-        )?;
+        let (mean, inv_std, normalize) =
+            self.deform_offset_stats(&raw_offsets, 2 * kernel_area * plane, max_offset, config)?;
         let offsets = self.deform_offset_envelope(
             &raw_offsets,
             &mean,
@@ -2853,11 +4661,20 @@ impl OxideBackend {
         geometry: darknet_cuda::host_ops::deform_conv::DeformGeometry,
         use_mask: bool,
         config: ElementwiseLaunchConfig,
-    ) -> Result<(OxideTensorF32, OxideTensorF32, OxideTensorF32, OxideTensorF32), OxideError> {
+    ) -> Result<
+        (
+            OxideTensorF32,
+            OxideTensorF32,
+            OxideTensorF32,
+            OxideTensorF32,
+        ),
+        OxideError,
+    > {
         let op = "deform_conv_accumulate_backward";
         let kernels = geometry.kernels();
         let plane = geometry.plane();
-        let input_len = geometry.batch * geometry.channels * geometry.input_height * geometry.input_width;
+        let input_len =
+            geometry.batch * geometry.channels * geometry.input_height * geometry.input_width;
         let offset_len = geometry.batch * 2 * kernels * plane;
         let mask_len = geometry.batch * kernels * plane;
         let weight_len = geometry.filters * geometry.channels_per_group * kernels;
@@ -2867,7 +4684,10 @@ impl OxideBackend {
             || output_grad.len() != geometry.batch * geometry.filters * plane
             || (use_mask && masks.len() != mask_len)
         {
-            return Err(shape_err(op, "operand length does not match the geometry".to_owned()));
+            return Err(shape_err(
+                op,
+                "operand length does not match the geometry".to_owned(),
+            ));
         }
         let d_input = self.alloc(input_len)?;
         let d_offsets = self.alloc(offset_len)?;
@@ -2907,18 +4727,24 @@ impl OxideBackend {
         .map_err(launch_err)?;
         let mask_shape = [if use_mask { mask_len } else { 0 }];
         Ok((
-            OxideTensorF32::new(d_input, &[
-                geometry.batch,
-                geometry.channels,
-                geometry.input_height,
-                geometry.input_width,
-            ]),
-            OxideTensorF32::new(d_offsets, &[
-                geometry.batch,
-                2 * kernels,
-                geometry.output_height,
-                geometry.output_width,
-            ]),
+            OxideTensorF32::new(
+                d_input,
+                &[
+                    geometry.batch,
+                    geometry.channels,
+                    geometry.input_height,
+                    geometry.input_width,
+                ],
+            ),
+            OxideTensorF32::new(
+                d_offsets,
+                &[
+                    geometry.batch,
+                    2 * kernels,
+                    geometry.output_height,
+                    geometry.output_width,
+                ],
+            ),
             OxideTensorF32::new(d_masks, &mask_shape),
             OxideTensorF32::new(d_weights, &[weight_len]),
         ))
@@ -3024,7 +4850,11 @@ impl OxideBackend {
             return Err(shape_err(op, "raw/gradient length mismatch".to_owned()));
         }
         let batch = raw.len() / per_batch;
-        for (name, tensor) in [("mean", mean), ("inv_std", inv_std), ("normalize", normalize)] {
+        for (name, tensor) in [
+            ("mean", mean),
+            ("inv_std", inv_std),
+            ("normalize", normalize),
+        ] {
             if tensor.len() != batch {
                 return Err(shape_err(
                     op,
@@ -3033,7 +4863,10 @@ impl OxideBackend {
             }
         }
         if !max_offset.is_finite() || max_offset <= 0.0 {
-            return Err(shape_err(op, "max_offset must be finite and positive".to_owned()));
+            return Err(shape_err(
+                op,
+                "max_offset must be finite and positive".to_owned(),
+            ));
         }
         let mut out = self.alloc_uninit(raw.len())?;
         // SAFETY: one thread per element; every operand is length-checked above.
@@ -3164,7 +4997,15 @@ impl OxideBackend {
             )?;
         // 2. lhtan/sanitize slopes (device).
         let d_pre = self.deform_envelope_pre_backward(
-            raw_offsets, mean, inv_std, normalize, &d_offsets, 2 * kernels, plane, max_offset, config,
+            raw_offsets,
+            mean,
+            inv_std,
+            normalize,
+            &d_offsets,
+            2 * kernels,
+            plane,
+            max_offset,
+            config,
         )?;
         // 3. the one host hop: batch-coupled normalization Jacobian + stage-1 slope.
         let stage1_host = self.download_f32(raw_offsets)?;
@@ -3222,8 +5063,7 @@ impl OxideBackend {
         let (d_input_mask, d_mask_weights, d_mask_biases) =
             match (mask_weights, mask_logits, masks.is_some()) {
                 (Some(weights), Some(logits), true) => {
-                    let d_logits =
-                        self.deform_mask_sigmoid_backward(logits, &d_masks, config)?;
+                    let d_logits = self.deform_mask_sigmoid_backward(logits, &d_masks, config)?;
                     let (d_in, d_w, d_b) = self.deform_predictor_backward(
                         input_sanitized,
                         weights,
@@ -3274,9 +5114,7 @@ impl OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF32, OxideError> {
         let op = "dcnv4_aggregate_native";
-        geometry
-            .checked()
-            .map_err(|msg| shape_err(op, msg))?;
+        geometry.checked().map_err(|msg| shape_err(op, msg))?;
         let points = geometry.kernel_points();
         if points > crate::kernels::dcnv4::MAX_POINTS {
             return Err(shape_err(
@@ -5909,7 +7747,10 @@ impl F32TensorOpsBackend for OxideBackend {
             || x.shape()[2] != output_shape[2]
             || x.shape()[3] != output_shape[3]
         {
-            return Err(shape_err("maxpool_depth_f32", "incompatible NCHW shapes".to_owned()));
+            return Err(shape_err(
+                "maxpool_depth_f32",
+                "incompatible NCHW shapes".to_owned(),
+            ));
         }
         let spatial = output_shape[2] * output_shape[3];
         let mut output = self.alloc_uninit(output_shape.iter().product())?;
@@ -5956,7 +7797,10 @@ impl F32TensorOpsBackend for OxideBackend {
             || output_grad.shape()[2] != input_shape[2]
             || output_grad.shape()[3] != input_shape[3]
         {
-            return Err(shape_err("maxpool_depth_backward_f32", "incompatible NCHW shapes".to_owned()));
+            return Err(shape_err(
+                "maxpool_depth_backward_f32",
+                "incompatible NCHW shapes".to_owned(),
+            ));
         }
         let spatial = input_shape[2] * input_shape[3];
         let mut dx = self.alloc_uninit(x.len())?;
@@ -6544,8 +8388,16 @@ impl F32TensorOpsBackend for OxideBackend {
         let source_f = self.f32v(input)?;
         let source = &*source_f;
         let op = "hyperbolic_foveation_predictor_f32";
-        if shape.len() != 4 || shape.contains(&0) || downsample == 0 || hidden_count == 0 || param_count < 4 {
-            return Err(shape_err(op, "invalid source shape or predictor dimensions".to_owned()));
+        if shape.len() != 4
+            || shape.contains(&0)
+            || downsample == 0
+            || hidden_count == 0
+            || param_count < 4
+        {
+            return Err(shape_err(
+                op,
+                "invalid source shape or predictor dimensions".to_owned(),
+            ));
         }
         let [batch, channels, height, width] = [shape[0], shape[1], shape[2], shape[3]];
         let input_count = batch
@@ -6554,7 +8406,10 @@ impl F32TensorOpsBackend for OxideBackend {
             .and_then(|n| n.checked_mul(width))
             .ok_or_else(|| shape_err(op, "source size overflows".to_owned()))?;
         if source.len() != input_count {
-            return Err(shape_err(op, format!("source has {} values, expected {input_count}", source.len())));
+            return Err(shape_err(
+                op,
+                format!("source has {} values, expected {input_count}", source.len()),
+            ));
         }
         let pooled_height = (height / downsample).max(1);
         let pooled_width = (width / downsample).max(1);
@@ -6579,7 +8434,10 @@ impl F32TensorOpsBackend for OxideBackend {
             || w2.len() != expected_w2
             || b2.len() != param_count
         {
-            return Err(shape_err(op, "predictor parameter lengths do not match dimensions".to_owned()));
+            return Err(shape_err(
+                op,
+                "predictor parameter lengths do not match dimensions".to_owned(),
+            ));
         }
         let mut pooled = self.alloc_uninit(pooled_count)?;
         // SAFETY: output geometry is bounded by the validated positive source
@@ -6672,27 +8530,58 @@ impl F32TensorOpsBackend for OxideBackend {
         let w2_f = self.f32v(w2)?;
         let w2 = &*w2_f;
         let op = "hyperbolic_foveation_predictor_backward_f32";
-        if input_shape.len() != 4 || input_shape.contains(&0) || downsample == 0 || hidden_count == 0 || param_count < 4 {
+        if input_shape.len() != 4
+            || input_shape.contains(&0)
+            || downsample == 0
+            || hidden_count == 0
+            || param_count < 4
+        {
             return Err(shape_err(op, "expected positive NCHW shape, downsample, hidden count, and at least four parameters".to_owned()));
         }
-        let (batch, channels, height, width) = (input_shape[0], input_shape[1], input_shape[2], input_shape[3]);
+        let (batch, channels, height, width) = (
+            input_shape[0],
+            input_shape[1],
+            input_shape[2],
+            input_shape[3],
+        );
         let pooled_height = (height / downsample).max(1);
         let pooled_width = (width / downsample).max(1);
-        let input_dim = channels.checked_mul(pooled_height).and_then(|n| n.checked_mul(pooled_width))
+        let input_dim = channels
+            .checked_mul(pooled_height)
+            .and_then(|n| n.checked_mul(pooled_width))
             .ok_or_else(|| shape_err(op, "pooled predictor size overflows".to_owned()))?;
-        let input_count = batch.checked_mul(channels).and_then(|n| n.checked_mul(height)).and_then(|n| n.checked_mul(width))
+        let input_count = batch
+            .checked_mul(channels)
+            .and_then(|n| n.checked_mul(height))
+            .and_then(|n| n.checked_mul(width))
             .ok_or_else(|| shape_err(op, "input size overflows".to_owned()))?;
-        let hidden_count_batch = batch.checked_mul(hidden_count).ok_or_else(|| shape_err(op, "hidden size overflows".to_owned()))?;
-        let param_count_batch = batch.checked_mul(param_count).ok_or_else(|| shape_err(op, "parameter size overflows".to_owned()))?;
-        if pooled.len() != batch * input_dim || pre.len() != hidden_count_batch || hidden.len() != hidden_count_batch
-            || raw.len() != param_count_batch || seed.len() != param_count_batch
-            || w1.len() != hidden_count * input_dim || w2.len() != param_count * hidden_count {
-            return Err(shape_err(op, "predictor cache/weight lengths do not match dimensions".to_owned()));
+        let hidden_count_batch = batch
+            .checked_mul(hidden_count)
+            .ok_or_else(|| shape_err(op, "hidden size overflows".to_owned()))?;
+        let param_count_batch = batch
+            .checked_mul(param_count)
+            .ok_or_else(|| shape_err(op, "parameter size overflows".to_owned()))?;
+        if pooled.len() != batch * input_dim
+            || pre.len() != hidden_count_batch
+            || hidden.len() != hidden_count_batch
+            || raw.len() != param_count_batch
+            || seed.len() != param_count_batch
+            || w1.len() != hidden_count * input_dim
+            || w2.len() != param_count * hidden_count
+        {
+            return Err(shape_err(
+                op,
+                "predictor cache/weight lengths do not match dimensions".to_owned(),
+            ));
         }
         let source_len = input_count;
-        let dw1_len = hidden_count.checked_mul(input_dim).and_then(|n| n.checked_add(hidden_count))
+        let dw1_len = hidden_count
+            .checked_mul(input_dim)
+            .and_then(|n| n.checked_add(hidden_count))
             .ok_or_else(|| shape_err(op, "w1 gradient size overflows".to_owned()))?;
-        let dw2_len = param_count.checked_mul(hidden_count).and_then(|n| n.checked_add(param_count))
+        let dw2_len = param_count
+            .checked_mul(hidden_count)
+            .and_then(|n| n.checked_add(param_count))
             .ok_or_else(|| shape_err(op, "w2 gradient size overflows".to_owned()))?;
         let mut source_grad = self.alloc_uninit(source_len)?;
         let mut w1_grad = self.alloc_uninit(dw1_len)?;
@@ -6701,24 +8590,56 @@ impl F32TensorOpsBackend for OxideBackend {
         // scalar is written by exactly one thread in each kernel.
         unsafe {
             self.resample.hyperbolic_predictor_backward_source(
-                &self.stream, launch::elementwise(source_len, config), &pre.buf, &raw.buf,
-                &seed.buf, &w1.buf, &w2.buf, &mut source_grad, channels, height, width,
-                downsample, pooled_height, pooled_width, hidden_count, param_count,
+                &self.stream,
+                launch::elementwise(source_len, config),
+                &pre.buf,
+                &raw.buf,
+                &seed.buf,
+                &w1.buf,
+                &w2.buf,
+                &mut source_grad,
+                channels,
+                height,
+                width,
+                downsample,
+                pooled_height,
+                pooled_width,
+                hidden_count,
+                param_count,
             )
-        }.map_err(launch_err)?;
+        }
+        .map_err(launch_err)?;
         unsafe {
             self.resample.hyperbolic_predictor_backward_w1(
-                &self.stream, launch::elementwise(dw1_len, config), &pooled.buf, &pre.buf,
-                &raw.buf, &seed.buf, &w2.buf, &mut w1_grad, batch, input_dim,
-                hidden_count, param_count,
+                &self.stream,
+                launch::elementwise(dw1_len, config),
+                &pooled.buf,
+                &pre.buf,
+                &raw.buf,
+                &seed.buf,
+                &w2.buf,
+                &mut w1_grad,
+                batch,
+                input_dim,
+                hidden_count,
+                param_count,
             )
-        }.map_err(launch_err)?;
+        }
+        .map_err(launch_err)?;
         unsafe {
             self.resample.hyperbolic_predictor_backward_w2(
-                &self.stream, launch::elementwise(dw2_len, config), &hidden.buf, &raw.buf,
-                &seed.buf, &mut w2_grad, batch, hidden_count, param_count,
+                &self.stream,
+                launch::elementwise(dw2_len, config),
+                &hidden.buf,
+                &raw.buf,
+                &seed.buf,
+                &mut w2_grad,
+                batch,
+                hidden_count,
+                param_count,
             )
-        }.map_err(launch_err)?;
+        }
+        .map_err(launch_err)?;
         Ok((
             OxideTensorF32::new(source_grad, input_shape),
             OxideTensorF32::new(w1_grad, &[dw1_len]),
@@ -6743,17 +8664,31 @@ impl F32TensorOpsBackend for OxideBackend {
         let params = &*params_f;
         let op = "hyperbolic_newton_grid_f32";
         if batch == 0 || height == 0 || width == 0 {
-            return Err(shape_err(op, "batch and spatial dimensions must be positive".to_owned()));
+            return Err(shape_err(
+                op,
+                "batch and spatial dimensions must be positive".to_owned(),
+            ));
         }
         if param_count != 4 && param_count != 5 {
-            return Err(shape_err(op, format!("expected parameter count 4 or 5, got {param_count}")));
+            return Err(shape_err(
+                op,
+                format!("expected parameter count 4 or 5, got {param_count}"),
+            ));
         }
-        let expected_params = batch.checked_mul(param_count)
+        let expected_params = batch
+            .checked_mul(param_count)
             .ok_or_else(|| shape_err(op, "parameter size overflows".to_owned()))?;
         if params.len() != expected_params {
-            return Err(shape_err(op, format!("expected {expected_params} parameters, got {}", params.len())));
+            return Err(shape_err(
+                op,
+                format!(
+                    "expected {expected_params} parameters, got {}",
+                    params.len()
+                ),
+            ));
         }
-        let grid_len = batch.checked_mul(height)
+        let grid_len = batch
+            .checked_mul(height)
             .and_then(|n| n.checked_mul(width))
             .and_then(|n| n.checked_mul(2))
             .ok_or_else(|| shape_err(op, "grid size overflows".to_owned()))?;
@@ -6796,15 +8731,28 @@ impl F32TensorOpsBackend for OxideBackend {
         let params = &*params_f;
         let op = "hyperbolic_fixed_point_grid_f32";
         if batch == 0 || height == 0 || width == 0 {
-            return Err(shape_err(op, "batch and spatial dimensions must be positive".to_owned()));
+            return Err(shape_err(
+                op,
+                "batch and spatial dimensions must be positive".to_owned(),
+            ));
         }
         if param_count != 4 && param_count != 5 {
-            return Err(shape_err(op, format!("expected parameter count 4 or 5, got {param_count}")));
+            return Err(shape_err(
+                op,
+                format!("expected parameter count 4 or 5, got {param_count}"),
+            ));
         }
-        let expected_params = batch.checked_mul(param_count)
+        let expected_params = batch
+            .checked_mul(param_count)
             .ok_or_else(|| shape_err(op, "parameter size overflows".to_owned()))?;
         if params.len() != expected_params {
-            return Err(shape_err(op, format!("expected {expected_params} parameters, got {}", params.len())));
+            return Err(shape_err(
+                op,
+                format!(
+                    "expected {expected_params} parameters, got {}",
+                    params.len()
+                ),
+            ));
         }
         let grid_len = batch
             .checked_mul(height)
@@ -6846,7 +8794,10 @@ impl F32TensorOpsBackend for OxideBackend {
         let grid = &*grid_f;
         let op = "hyperbolic_foveation_warp_f32";
         if shape.len() != 4 || shape.contains(&0) {
-            return Err(shape_err(op, format!("expected positive NCHW shape, got {shape:?}")));
+            return Err(shape_err(
+                op,
+                format!("expected positive NCHW shape, got {shape:?}"),
+            ));
         }
         let (batch, channels, height, width) = (shape[0], shape[1], shape[2], shape[3]);
         let input_len = batch
@@ -6904,17 +8855,32 @@ impl F32TensorOpsBackend for OxideBackend {
         let dy = &*dy_f;
         let op = "hyperbolic_foveation_warp_backward_f32";
         if shape.len() != 4 || shape.contains(&0) {
-            return Err(shape_err(op, format!("expected positive NCHW shape, got {shape:?}")));
+            return Err(shape_err(
+                op,
+                format!("expected positive NCHW shape, got {shape:?}"),
+            ));
         }
         let (batch, channels, height, width) = (shape[0], shape[1], shape[2], shape[3]);
-        let input_len = batch.checked_mul(channels).and_then(|n| n.checked_mul(height))
+        let input_len = batch
+            .checked_mul(channels)
+            .and_then(|n| n.checked_mul(height))
             .and_then(|n| n.checked_mul(width))
             .ok_or_else(|| shape_err(op, "input size overflows".to_owned()))?;
-        let grid_len = batch.checked_mul(height).and_then(|n| n.checked_mul(width))
+        let grid_len = batch
+            .checked_mul(height)
+            .and_then(|n| n.checked_mul(width))
             .and_then(|n| n.checked_mul(2))
             .ok_or_else(|| shape_err(op, "grid size overflows".to_owned()))?;
         if input.len() != input_len || dy.len() != input_len || grid.len() != grid_len {
-            return Err(shape_err(op, format!("input/gradient/grid lengths are {}/{}/{}, expected {input_len}/{input_len}/{grid_len}", input.len(), dy.len(), grid.len())));
+            return Err(shape_err(
+                op,
+                format!(
+                    "input/gradient/grid lengths are {}/{}/{}, expected {input_len}/{input_len}/{grid_len}",
+                    input.len(),
+                    dy.len(),
+                    grid.len()
+                ),
+            ));
         }
         let input_gradient = self.alloc(input_len)?;
         let mut grid_gradient = self.alloc_uninit(grid_len)?;
@@ -6922,16 +8888,31 @@ impl F32TensorOpsBackend for OxideBackend {
         // scatters target a zeroed buffer, and grid-gradient scalars have unique owners.
         unsafe {
             self.resample.hyperbolic_warp_backward_input(
-                &self.stream, launch::elementwise(input_len, config), &grid.buf, &dy.buf,
-                input_gradient.cu_deviceptr() as *mut f32, channels, height, width,
+                &self.stream,
+                launch::elementwise(input_len, config),
+                &grid.buf,
+                &dy.buf,
+                input_gradient.cu_deviceptr() as *mut f32,
+                channels,
+                height,
+                width,
             )
-        }.map_err(launch_err)?;
+        }
+        .map_err(launch_err)?;
         unsafe {
             self.resample.hyperbolic_warp_backward_grid(
-                &self.stream, launch::elementwise(grid_len, config), &input.buf, &grid.buf,
-                &dy.buf, &mut grid_gradient, channels, height, width,
+                &self.stream,
+                launch::elementwise(grid_len, config),
+                &input.buf,
+                &grid.buf,
+                &dy.buf,
+                &mut grid_gradient,
+                channels,
+                height,
+                width,
             )
-        }.map_err(launch_err)?;
+        }
+        .map_err(launch_err)?;
         Ok((
             OxideTensorF32::new(input_gradient, shape),
             OxideTensorF32::new(grid_gradient, &[batch, height, width, 2]),
@@ -6957,21 +8938,38 @@ impl F32TensorOpsBackend for OxideBackend {
         let grid_gradient = &*grid_f;
         let op = "hyperbolic_foveation_inverse_param_grad_f32";
         if shape.len() != 4 || shape.contains(&0) {
-            return Err(shape_err(op, format!("expected positive NCHW shape, got {shape:?}")));
+            return Err(shape_err(
+                op,
+                format!("expected positive NCHW shape, got {shape:?}"),
+            ));
         }
         if param_count != 4 && param_count != 5 {
-            return Err(shape_err(op, format!("expected 4 or 5 HF parameters, got {param_count}")));
+            return Err(shape_err(
+                op,
+                format!("expected 4 or 5 HF parameters, got {param_count}"),
+            ));
         }
         let (batch, height, width) = (shape[0], shape[2], shape[3]);
-        let params_len = batch.checked_mul(param_count)
+        let params_len = batch
+            .checked_mul(param_count)
             .ok_or_else(|| shape_err(op, "parameter size overflows".to_owned()))?;
-        let grid_len = batch.checked_mul(height).and_then(|n| n.checked_mul(width))
+        let grid_len = batch
+            .checked_mul(height)
+            .and_then(|n| n.checked_mul(width))
             .and_then(|n| n.checked_mul(2))
             .ok_or_else(|| shape_err(op, "grid size overflows".to_owned()))?;
         if params.len() != params_len || grid_gradient.len() != grid_len {
-            return Err(shape_err(op, format!("parameter/grid lengths are {}/{}, expected {params_len}/{grid_len}", params.len(), grid_gradient.len())));
+            return Err(shape_err(
+                op,
+                format!(
+                    "parameter/grid lengths are {}/{}, expected {params_len}/{grid_len}",
+                    params.len(),
+                    grid_gradient.len()
+                ),
+            ));
         }
-        let output_len = batch.checked_mul(5)
+        let output_len = batch
+            .checked_mul(5)
             .ok_or_else(|| shape_err(op, "output size overflows".to_owned()))?;
         let mut output = self.alloc_uninit(output_len)?;
         // SAFETY: all tensor lengths and dimensions are checked and each
@@ -6979,19 +8977,41 @@ impl F32TensorOpsBackend for OxideBackend {
         if newton {
             unsafe {
                 self.resample.hyperbolic_newton_param_grad(
-                    &self.stream, launch::elementwise(output_len, config), &params.buf,
-                    &grid_gradient.buf, &mut output, batch, height, width, param_count,
-                    alpha, p_exp, iterations, eta,
+                    &self.stream,
+                    launch::elementwise(output_len, config),
+                    &params.buf,
+                    &grid_gradient.buf,
+                    &mut output,
+                    batch,
+                    height,
+                    width,
+                    param_count,
+                    alpha,
+                    p_exp,
+                    iterations,
+                    eta,
                 )
-            }.map_err(launch_err)?;
+            }
+            .map_err(launch_err)?;
         } else {
             unsafe {
                 self.resample.hyperbolic_fixed_point_param_grad(
-                    &self.stream, launch::elementwise(output_len, config), &params.buf,
-                    &grid_gradient.buf, &mut output, batch, height, width, param_count,
-                    alpha, p_exp, iterations, eta,
+                    &self.stream,
+                    launch::elementwise(output_len, config),
+                    &params.buf,
+                    &grid_gradient.buf,
+                    &mut output,
+                    batch,
+                    height,
+                    width,
+                    param_count,
+                    alpha,
+                    p_exp,
+                    iterations,
+                    eta,
                 )
-            }.map_err(launch_err)?;
+            }
+            .map_err(launch_err)?;
         }
         Ok(Some(OxideTensorF32::new(output, &[batch, 5])))
     }
@@ -7356,6 +9376,129 @@ impl F32TensorOpsBackend for OxideBackend {
         OxideBackend::deform_mask_sigmoid(self, raw, config)
     }
 
+    fn dsconv_forward_native_f32(
+        &self,
+        input: &Self::Tensor,
+        offset_weights: &Self::Tensor,
+        offset_biases: &Self::Tensor,
+        weights: &Self::Tensor,
+        biases: &Self::Tensor,
+        geometry: darknet_cuda::host_ops::DsConvGeometry,
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Option<Result<Self::Tensor, Self::Error>> {
+        Some(OxideBackend::dsconv_forward_native_f32(
+            self,
+            input,
+            offset_weights,
+            offset_biases,
+            weights,
+            biases,
+            geometry.batch,
+            geometry.channels,
+            geometry.filters,
+            geometry.input_height,
+            geometry.input_width,
+            geometry.kernel_size,
+            geometry.extend_scope,
+            geometry.morph,
+            activation,
+            config,
+        ))
+    }
+
+    fn dsconv_backward_native_f32(
+        &self,
+        input: &Self::Tensor,
+        offset_weights: &Self::Tensor,
+        offset_biases: &Self::Tensor,
+        weights: &Self::Tensor,
+        biases: &Self::Tensor,
+        output_gradient: &Self::Tensor,
+        geometry: darknet_cuda::host_ops::DsConvGeometry,
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Option<
+        Result<
+            (
+                Self::Tensor,
+                Self::Tensor,
+                Self::Tensor,
+                Self::Tensor,
+                Self::Tensor,
+            ),
+            Self::Error,
+        >,
+    > {
+        Some(OxideBackend::dsconv_backward_native_f32(
+            self,
+            input,
+            offset_weights,
+            offset_biases,
+            weights,
+            biases,
+            output_gradient,
+            geometry.batch,
+            geometry.channels,
+            geometry.filters,
+            geometry.input_height,
+            geometry.input_width,
+            geometry.kernel_size,
+            geometry.extend_scope,
+            geometry.morph,
+            activation,
+            config,
+        ))
+    }
+
+    fn deform_predictor_f32(
+        &self,
+        input: &Self::Tensor,
+        weights: &Self::Tensor,
+        biases: &Self::Tensor,
+        output_shape: &[usize],
+        channels: usize,
+        in_h: usize,
+        in_w: usize,
+        filters: usize,
+        size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        padding: usize,
+        dilation: usize,
+        out_h: usize,
+        out_w: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let input = self.f32v(input)?;
+        let weights = self.f32v(weights)?;
+        let biases = self.f32v(biases)?;
+        let per_batch = channels
+            .checked_mul(in_h)
+            .and_then(|n| n.checked_mul(in_w))
+            .filter(|&n| n > 0)
+            .ok_or_else(|| {
+                shape_err("deform_predictor_f32", "input extent overflows".to_owned())
+            })?;
+        if input.len() % per_batch != 0 {
+            return Err(shape_err(
+                "deform_predictor_f32",
+                "input length is not a whole batch".to_owned(),
+            ));
+        }
+        let batch = input.len() / per_batch;
+        if output_shape != [batch, filters, out_h, out_w] {
+            return Err(shape_err(
+                "deform_predictor_f32",
+                "output shape does not match predictor geometry".to_owned(),
+            ));
+        }
+        OxideBackend::deform_offset_predict(
+            self, &input, &weights, &biases, channels, in_h, in_w, filters, size, stride_x,
+            stride_y, padding, dilation, out_h, out_w, config,
+        )
+    }
+
     fn deform_conv_accumulate_f32(
         &self,
         input: &Self::Tensor,
@@ -7417,7 +9560,15 @@ impl F32TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
         OxideBackend::deform_conv_accumulate_backward(
-            self, input, offsets, masks, weights, output_grad, geometry, use_mask, config,
+            self,
+            input,
+            offsets,
+            masks,
+            weights,
+            output_grad,
+            geometry,
+            use_mask,
+            config,
         )
     }
 
@@ -7436,7 +9587,16 @@ impl F32TensorOpsBackend for OxideBackend {
     ) -> Result<Self::Tensor, Self::Error> {
         let _ = shape;
         OxideBackend::deform_envelope_pre_backward(
-            self, raw, mean, inv_std, normalize, output_grad, planes, spatial, max_offset, config,
+            self,
+            raw,
+            mean,
+            inv_std,
+            normalize,
+            output_grad,
+            planes,
+            spatial,
+            max_offset,
+            config,
         )
     }
 
@@ -7471,8 +9631,23 @@ impl F32TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
         OxideBackend::deform_predictor_backward(
-            self, input, weights, output_grad, channels, filters, in_h, in_w, out_h, out_w, size,
-            stride_x, stride_y, padding, dilation, batch, config,
+            self,
+            input,
+            weights,
+            output_grad,
+            channels,
+            filters,
+            in_h,
+            in_w,
+            out_h,
+            out_w,
+            size,
+            stride_x,
+            stride_y,
+            padding,
+            dilation,
+            batch,
+            config,
         )
     }
 
@@ -7485,6 +9660,217 @@ impl F32TensorOpsBackend for OxideBackend {
     ) -> Result<Self::Tensor, Self::Error> {
         let _ = shape;
         OxideBackend::deform_scale_input_gradient(self, raw, grad, config)
+    }
+
+    fn wmhf_haar_dwt_f32(
+        &self,
+        input: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        OxideBackend::wmhf_haar_dwt_f32(self, input, batch, channels, height, width, config)
+    }
+
+    fn wmhf_haar_dwt_backward_f32(
+        &self,
+        ll_grad: &Self::Tensor,
+        lh_grad: &Self::Tensor,
+        hl_grad: &Self::Tensor,
+        hh_grad: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        OxideBackend::wmhf_haar_dwt_backward_f32(
+            self, ll_grad, lh_grad, hl_grad, hh_grad, batch, channels, height, width, config,
+        )
+    }
+
+    fn wmhf_haar_iwt_f32(
+        &self,
+        ll: &Self::Tensor,
+        lh: &Self::Tensor,
+        hl: &Self::Tensor,
+        hh: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        OxideBackend::wmhf_haar_iwt_f32(
+            self, ll, lh, hl, hh, batch, channels, height, width, config,
+        )
+    }
+
+    fn wmhf_haar_iwt_backward_f32(
+        &self,
+        output_grad: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        OxideBackend::wmhf_haar_iwt_backward_f32(
+            self,
+            output_grad,
+            batch,
+            channels,
+            height,
+            width,
+            config,
+        )
+    }
+
+    fn wmhf_scan4_forward_f32(
+        &self,
+        input: &Self::Tensor,
+        weights: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        OxideBackend::wmhf_scan4_forward_f32(
+            self, input, weights, batch, channels, height, width, config,
+        )
+    }
+
+    fn wmhf_scan4_backward_f32(
+        &self,
+        input: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        weights: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        OxideBackend::wmhf_scan4_backward_f32(
+            self,
+            input,
+            output_grad,
+            weights,
+            batch,
+            channels,
+            height,
+            width,
+            config,
+        )
+    }
+
+    fn wmhf_high_frequency_forward_f32(
+        &self,
+        lh: &Self::Tensor,
+        hl: &Self::Tensor,
+        hh: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        OxideBackend::wmhf_high_frequency_forward_f32(
+            self, lh, hl, hh, batch, channels, height, width, config,
+        )
+    }
+
+    fn wmhf_high_frequency_backward_f32(
+        &self,
+        output_grad: &Self::Tensor,
+        lh: &Self::Tensor,
+        hl: &Self::Tensor,
+        hh: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        OxideBackend::wmhf_high_frequency_backward_f32(
+            self,
+            output_grad,
+            lh,
+            hl,
+            hh,
+            batch,
+            channels,
+            height,
+            width,
+            config,
+        )
+    }
+
+    fn wmhf_concat_local_f32(
+        &self,
+        branch3: &Self::Tensor,
+        branch5: &Self::Tensor,
+        branch7: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        OxideBackend::wmhf_concat_local_f32(
+            self, branch3, branch5, branch7, batch, channels, height, width, config,
+        )
+    }
+
+    fn wmhf_split_channels_f32(
+        &self,
+        input: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        begin: usize,
+        count: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        OxideBackend::wmhf_split_channels_f32(
+            self, input, batch, channels, height, width, begin, count, config,
+        )
+    }
+
+    fn wmhf_apply_gate_f32(
+        &self,
+        fuse: &Self::Tensor,
+        gate: &Self::Tensor,
+        projected: &Self::Tensor,
+        shortcut: Option<&Self::Tensor>,
+        freq_scale: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        OxideBackend::wmhf_apply_gate_f32(self, fuse, gate, projected, shortcut, freq_scale, config)
+    }
+
+    fn wmhf_apply_gate_backward_f32(
+        &self,
+        output_grad: &Self::Tensor,
+        gate: &Self::Tensor,
+        projected: &Self::Tensor,
+        freq_scale: f32,
+        use_shortcut: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        OxideBackend::wmhf_apply_gate_backward_f32(
+            self,
+            output_grad,
+            gate,
+            projected,
+            freq_scale,
+            use_shortcut,
+            config,
+        )
     }
 
     fn upsample_f32(
@@ -7831,7 +10217,10 @@ impl F32TensorOpsBackend for OxideBackend {
             || hidden == 0
             || !((0..=2).contains(&qtype) || qtype == -1)
         {
-            return Err(shape_err(op, format!("invalid input shape {input_shape:?}, hidden={hidden}, qtype={qtype}")));
+            return Err(shape_err(
+                op,
+                format!("invalid input shape {input_shape:?}, hidden={hidden}, qtype={qtype}"),
+            ));
         }
         let (batch, channels, sequence) = (input_shape[0], input_shape[1], input_shape[3]);
         let expected_channels = hidden
@@ -7840,12 +10229,21 @@ impl F32TensorOpsBackend for OxideBackend {
         if channels != expected_channels || type_embedding.len() != 3 * hidden {
             return Err(shape_err(
                 op,
-                format!("expected {expected_channels} input channels and {} type embedding values", 3 * hidden),
+                format!(
+                    "expected {expected_channels} input channels and {} type embedding values",
+                    3 * hidden
+                ),
             ));
         }
         let input = self.f32v(input)?;
         if input.shape() != input_shape {
-            return Err(shape_err(op, format!("input tensor shape {:?} does not match {input_shape:?}", input.shape())));
+            return Err(shape_err(
+                op,
+                format!(
+                    "input tensor shape {:?} does not match {input_shape:?}",
+                    input.shape()
+                ),
+            ));
         }
         let input_len = batch
             .checked_mul(channels)
@@ -7859,7 +10257,10 @@ impl F32TensorOpsBackend for OxideBackend {
             .checked_mul(sequence)
             .ok_or_else(|| shape_err(op, "mask length overflows".to_owned()))?;
         if input.len() != input_len {
-            return Err(shape_err(op, format!("input has {} values, expected {input_len}", input.len())));
+            return Err(shape_err(
+                op,
+                format!("input has {} values, expected {input_len}", input.len()),
+            ));
         }
         let type_embedding = self.upload_f32(&[3, hidden], type_embedding)?;
         let mut tokens = self.alloc_uninit(output_len)?;
@@ -7901,12 +10302,25 @@ impl F32TensorOpsBackend for OxideBackend {
             .checked_mul(sequence)
             .and_then(|n| n.checked_mul(hidden))
             .ok_or_else(|| shape_err(op, "tensor length overflows".to_owned()))?;
-        if batch == 0 || sequence == 0 || hidden == 0 || output_shape != [batch, hidden, 1, sequence] {
-            return Err(shape_err(op, format!("invalid output shape {output_shape:?}")));
+        if batch == 0
+            || sequence == 0
+            || hidden == 0
+            || output_shape != [batch, hidden, 1, sequence]
+        {
+            return Err(shape_err(
+                op,
+                format!("invalid output shape {output_shape:?}"),
+            ));
         }
         let tokens = self.f32v(tokens)?;
         if tokens.shape() != [batch * sequence, hidden] || tokens.len() != expected_len {
-            return Err(shape_err(op, format!("token tensor has {} values, expected {expected_len}", tokens.len())));
+            return Err(shape_err(
+                op,
+                format!(
+                    "token tensor has {} values, expected {expected_len}",
+                    tokens.len()
+                ),
+            ));
         }
         let mut output = self.alloc_uninit(expected_len)?;
         // SAFETY: checked equal lengths make the channel-major index map valid.
@@ -7941,7 +10355,10 @@ impl F32TensorOpsBackend for OxideBackend {
             || hidden == 0
             || options == 0
         {
-            return Err(shape_err(op, format!("invalid input shape {input_shape:?}")));
+            return Err(shape_err(
+                op,
+                format!("invalid input shape {input_shape:?}"),
+            ));
         }
         let batch = input_shape[0];
         let len = batch
@@ -7953,7 +10370,14 @@ impl F32TensorOpsBackend for OxideBackend {
             .ok_or_else(|| shape_err(op, "row count overflows usize".to_owned()))?;
         let input = self.f32v(input)?;
         if input.shape() != input_shape || input.len() != len {
-            return Err(shape_err(op, format!("input shape/length mismatch: {:?}/{}", input.shape(), input.len())));
+            return Err(shape_err(
+                op,
+                format!(
+                    "input shape/length mismatch: {:?}/{}",
+                    input.shape(),
+                    input.len()
+                ),
+            ));
         }
         let mut output = self.alloc_uninit(len)?;
         // SAFETY: exact tensor extents bound the channel-major gather indices.
@@ -7984,11 +10408,21 @@ impl F32TensorOpsBackend for OxideBackend {
             .checked_mul(options)
             .ok_or_else(|| shape_err(op, "output length overflows usize".to_owned()))?;
         if batch == 0 || options == 0 || output_shape != [batch, 1, 1, options] {
-            return Err(shape_err(op, format!("invalid output shape {output_shape:?}")));
+            return Err(shape_err(
+                op,
+                format!("invalid output shape {output_shape:?}"),
+            ));
         }
         let logits = self.f32v(logits)?;
         if logits.shape() != [len, 1] || logits.len() != len {
-            return Err(shape_err(op, format!("logit tensor shape/length mismatch: {:?}/{}", logits.shape(), logits.len())));
+            return Err(shape_err(
+                op,
+                format!(
+                    "logit tensor shape/length mismatch: {:?}/{}",
+                    logits.shape(),
+                    logits.len()
+                ),
+            ));
         }
         let mut output = self.alloc_uninit(len)?;
         // SAFETY: logits/output lengths are equal and every thread owns one slot.
@@ -8022,7 +10456,10 @@ impl F32TensorOpsBackend for OxideBackend {
             || hidden == 0
             || vocab == 0
         {
-            return Err(shape_err(op, format!("invalid input shape {input_shape:?}")));
+            return Err(shape_err(
+                op,
+                format!("invalid input shape {input_shape:?}"),
+            ));
         }
         let batch = input_shape[0];
         let sequence = input_shape[3];
@@ -8043,7 +10480,10 @@ impl F32TensorOpsBackend for OxideBackend {
             || embeddings.shape() != [vocab, hidden]
             || embeddings.len() != vocab * hidden
         {
-            return Err(shape_err(op, "input/embedding extents do not match".to_owned()));
+            return Err(shape_err(
+                op,
+                "input/embedding extents do not match".to_owned(),
+            ));
         }
         let mut tokens = self.alloc_uninit(len)?;
         let mut mask = self.alloc_uninit(rows)?;
@@ -8085,11 +10525,17 @@ impl F32TensorOpsBackend for OxideBackend {
     ) -> Result<Self::Tensor, Self::Error> {
         let op = "laya_encoder_attention_f32";
         if batch == 0 || sequence == 0 || hidden == 0 || heads == 0 || hidden % heads != 0 {
-            return Err(shape_err(op, "invalid batch/sequence/hidden/head dimensions".to_owned()));
+            return Err(shape_err(
+                op,
+                "invalid batch/sequence/hidden/head dimensions".to_owned(),
+            ));
         }
         let head_dim = hidden / heads;
         if head_dim % 2 != 0 || head_dim > 128 {
-            return Err(shape_err(op, format!("head dimension {head_dim} must be even and <=128")));
+            return Err(shape_err(
+                op,
+                format!("head dimension {head_dim} must be even and <=128"),
+            ));
         }
         let rows = batch
             .checked_mul(sequence)
@@ -8098,7 +10544,10 @@ impl F32TensorOpsBackend for OxideBackend {
             .checked_mul(hidden)
             .ok_or_else(|| shape_err(op, "output length overflows usize".to_owned()))?;
         if output_shape != [rows, hidden] {
-            return Err(shape_err(op, format!("invalid output shape {output_shape:?}")));
+            return Err(shape_err(
+                op,
+                format!("invalid output shape {output_shape:?}"),
+            ));
         }
         let qkv_len = output_len
             .checked_mul(3)
@@ -8120,7 +10569,10 @@ impl F32TensorOpsBackend for OxideBackend {
             || sin.shape() != [sequence, head_dim / 2]
             || sin.len() != table_len
         {
-            return Err(shape_err(op, "QKV/mask/RoPE extents do not match".to_owned()));
+            return Err(shape_err(
+                op,
+                "QKV/mask/RoPE extents do not match".to_owned(),
+            ));
         }
         let query_heads = rows
             .checked_mul(heads)
@@ -8164,7 +10616,10 @@ impl F32TensorOpsBackend for OxideBackend {
             .checked_mul(intermediate)
             .ok_or_else(|| shape_err(op, "output length overflows usize".to_owned()))?;
         if rows == 0 || intermediate == 0 || output_shape != [rows, intermediate] {
-            return Err(shape_err(op, format!("invalid output shape {output_shape:?}")));
+            return Err(shape_err(
+                op,
+                format!("invalid output shape {output_shape:?}"),
+            ));
         }
         let input = self.f32v(input)?;
         if input.shape() != [rows, 2 * intermediate] || input.len() != input_len {
@@ -8201,8 +10656,15 @@ impl F32TensorOpsBackend for OxideBackend {
         let len = rows
             .checked_mul(hidden)
             .ok_or_else(|| shape_err(op, "output length overflows usize".to_owned()))?;
-        if batch == 0 || sequence == 0 || hidden == 0 || output_shape != [batch, hidden, 1, sequence] {
-            return Err(shape_err(op, format!("invalid output shape {output_shape:?}")));
+        if batch == 0
+            || sequence == 0
+            || hidden == 0
+            || output_shape != [batch, hidden, 1, sequence]
+        {
+            return Err(shape_err(
+                op,
+                format!("invalid output shape {output_shape:?}"),
+            ));
         }
         let tokens = self.f32v(tokens)?;
         if tokens.shape() != [rows, hidden] || tokens.len() != len {
@@ -8240,7 +10702,14 @@ impl F32TensorOpsBackend for OxideBackend {
         }
         let seed = self.f32v(seed)?;
         if seed.shape() != [batch, 1, 1, options] || seed.len() != len {
-            return Err(shape_err(op, format!("seed tensor shape/length mismatch: {:?}/{}", seed.shape(), seed.len())));
+            return Err(shape_err(
+                op,
+                format!(
+                    "seed tensor shape/length mismatch: {:?}/{}",
+                    seed.shape(),
+                    seed.len()
+                ),
+            ));
         }
         Ok(OxideTensorF32 {
             buf: seed.buf.clone(),
@@ -8266,16 +10735,23 @@ impl F32TensorOpsBackend for OxideBackend {
         let rows_count = batch
             .checked_mul(options)
             .ok_or_else(|| shape_err(op, "row count overflows usize".to_owned()))?;
-        if batch == 0
-            || hidden == 0
-            || options == 0
-            || output_shape != [batch, hidden, 1, options]
+        if batch == 0 || hidden == 0 || options == 0 || output_shape != [batch, hidden, 1, options]
         {
-            return Err(shape_err(op, format!("invalid output shape {output_shape:?}")));
+            return Err(shape_err(
+                op,
+                format!("invalid output shape {output_shape:?}"),
+            ));
         }
         let rows = self.f32v(rows)?;
         if rows.shape() != [rows_count, hidden] || rows.len() != len {
-            return Err(shape_err(op, format!("row tensor shape/length mismatch: {:?}/{}", rows.shape(), rows.len())));
+            return Err(shape_err(
+                op,
+                format!(
+                    "row tensor shape/length mismatch: {:?}/{}",
+                    rows.shape(),
+                    rows.len()
+                ),
+            ));
         }
         let mut output = self.alloc_uninit(len)?;
         // SAFETY: equal extents bound all row/channel/option transpose indices.
@@ -8568,6 +11044,227 @@ impl F32TensorOpsBackend for OxideBackend {
         Ok(OxideTensorF32::new(dx, shape))
     }
 
+    fn centernet_forward_f32(
+        &self,
+        x: &Self::Tensor,
+        shape: &[usize],
+        classes: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let x_f = self.f32v(x)?;
+        let x = &*x_f;
+        let op = "centernet_forward_f32";
+        if shape.len() != 4
+            || shape.iter().product::<usize>() != x.len()
+            || x.shape() != shape
+            || shape[0] == 0
+            || shape[1] < classes
+            || classes == 0
+            || shape[2] == 0
+            || shape[3] == 0
+        {
+            return Err(shape_err(
+                op,
+                format!("incompatible CenterNet shape/classes: {shape:?}, {classes}"),
+            ));
+        }
+        let spatial = shape[2] * shape[3];
+        let mut output = self.alloc_uninit(x.len())?;
+        // SAFETY: validated dimensions make the channel/spatial mapping valid;
+        // one thread writes one disjoint output element.
+        unsafe {
+            self.layers_extra.centernet_forward(
+                &self.stream,
+                launch::elementwise(x.len(), config),
+                &x.buf,
+                &mut output,
+                shape[1],
+                spatial,
+                classes,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, shape))
+    }
+
+    fn modern_yolo_forward_f32(
+        &self,
+        x: &Self::Tensor,
+        shape: &[usize],
+        classes: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let x_f = self.f32v(x)?;
+        let x = &*x_f;
+        let op = "modern_yolo_forward_f32";
+        if shape.len() != 4
+            || shape.iter().product::<usize>() != x.len()
+            || x.shape() != shape
+            || shape[0] == 0
+            || shape[1] <= classes
+            || classes == 0
+            || shape[2] == 0
+            || shape[3] == 0
+        {
+            return Err(shape_err(
+                op,
+                format!("incompatible modern-YOLO shape/classes: {shape:?}, {classes}"),
+            ));
+        }
+        let spatial = shape[2] * shape[3];
+        let mut output = self.alloc_uninit(x.len())?;
+        // SAFETY: validated dimensions make the channel/spatial mapping valid;
+        // one thread writes one disjoint output element.
+        unsafe {
+            self.layers_extra.modern_yolo_forward(
+                &self.stream,
+                launch::elementwise(x.len(), config),
+                &x.buf,
+                &mut output,
+                shape[1],
+                spatial,
+                classes,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, shape))
+    }
+
+    fn segmentation_forward_f32(
+        &self,
+        x: &Self::Tensor,
+        shape: &[usize],
+        classes: usize,
+        temperature: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let x_f = self.f32v(x)?;
+        let x = &*x_f;
+        let op = "segmentation_forward_f32";
+        if shape.len() != 4
+            || shape.iter().product::<usize>() != x.len()
+            || x.shape() != shape
+            || shape[0] == 0
+            || shape[1] != classes
+            || classes == 0
+            || shape[2] == 0
+            || shape[3] == 0
+        {
+            return Err(shape_err(
+                op,
+                format!("incompatible segmentation shape/classes: {shape:?}, {classes}"),
+            ));
+        }
+        let spatial = shape[2] * shape[3];
+        let pixels = shape[0] * spatial;
+        let mut output = self.alloc_uninit(x.len())?;
+        // SAFETY: validated dimensions ensure one thread per batch/pixel owns
+        // exactly one slot in every class plane.
+        unsafe {
+            self.layers_extra.segmentation_forward(
+                &self.stream,
+                launch::elementwise(pixels, config),
+                &x.buf,
+                &mut output,
+                shape[1],
+                spatial,
+                classes,
+                temperature,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, shape))
+    }
+
+    fn jev_ce_forward_f32(
+        &self,
+        x: &Self::Tensor,
+        shape: &[usize],
+        groups: usize,
+        candidates: usize,
+        temperature: f32,
+        channel_major: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let x_f = self.f32v(x)?;
+        let x = &*x_f;
+        let op = "jev_ce_forward_f32";
+        if shape.len() != 4
+            || shape.iter().product::<usize>() != x.len()
+            || x.shape() != shape
+            || shape[0] == 0
+            || groups == 0
+            || candidates == 0
+            || groups
+                .checked_mul(candidates)
+                .and_then(|per_sample| per_sample.checked_mul(shape[0]))
+                != Some(x.len())
+        {
+            return Err(shape_err(
+                op,
+                format!(
+                    "incompatible JevCe shape/groups/candidates: {shape:?}, {groups}, {candidates}"
+                ),
+            ));
+        }
+        let work = shape[0] * groups;
+        let mut output = self.alloc_uninit(x.len())?;
+        // SAFETY: every sample/group owns a disjoint candidate range in the
+        // selected storage layout.
+        unsafe {
+            self.layers_extra.jev_ce_forward(
+                &self.stream,
+                launch::elementwise(work, config),
+                &x.buf,
+                &mut output,
+                groups,
+                candidates,
+                temperature,
+                channel_major as u32,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, shape))
+    }
+
+    fn laya_loss_forward_f32(
+        &self,
+        x: &Self::Tensor,
+        shape: &[usize],
+        max_options: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let x_f = self.f32v(x)?;
+        let x = &*x_f;
+        let op = "laya_loss_forward_f32";
+        if shape.len() != 4
+            || shape.iter().product::<usize>() != x.len()
+            || x.shape() != shape
+            || shape[0] == 0
+            || max_options == 0
+            || max_options.checked_mul(shape[0]) != Some(x.len())
+        {
+            return Err(shape_err(
+                op,
+                format!("incompatible LayaLoss shape/options: {shape:?}, {max_options}"),
+            ));
+        }
+        let mut output = self.alloc_uninit(x.len())?;
+        // SAFETY: validated batch/options spans are disjoint; one thread owns
+        // one complete sample row.
+        unsafe {
+            self.layers_extra.laya_loss_forward(
+                &self.stream,
+                launch::elementwise(shape[0], config),
+                &x.buf,
+                &mut output,
+                max_options,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, shape))
+    }
+
     fn region_forward_f32(
         &self,
         x: &Self::Tensor,
@@ -8591,7 +11288,12 @@ impl F32TensorOpsBackend for OxideBackend {
             || shape[2] == 0
             || shape[3] == 0
         {
-            return Err(shape_err(op, format!("incompatible Region shape/parameters: {shape:?}, anchors={anchors}, entries={entries}, classes={classes}")));
+            return Err(shape_err(
+                op,
+                format!(
+                    "incompatible Region shape/parameters: {shape:?}, anchors={anchors}, entries={entries}, classes={classes}"
+                ),
+            ));
         }
         let spatial = shape[2] * shape[3];
         let groups = shape[0] * spatial * anchors;
@@ -8643,7 +11345,12 @@ impl F32TensorOpsBackend for OxideBackend {
             || shape[2] == 0
             || shape[3] == 0
         {
-            return Err(shape_err(op, format!("incompatible Region shape/parameters: {shape:?}, anchors={anchors}, entries={entries}, classes={classes}")));
+            return Err(shape_err(
+                op,
+                format!(
+                    "incompatible Region shape/parameters: {shape:?}, anchors={anchors}, entries={entries}, classes={classes}"
+                ),
+            ));
         }
         let spatial = shape[2] * shape[3];
         let groups = shape[0] * spatial * anchors;
@@ -9301,7 +12008,8 @@ impl F32TensorOpsBackend for OxideBackend {
         })?;
         if input.len() != expected || gamma.len() != channel_count || beta.len() != channel_count {
             return Err(OxideError::Shape(
-                "foveation_film_affine_f32: tensor extents do not match NCHW / [B,C] layouts".to_owned(),
+                "foveation_film_affine_f32: tensor extents do not match NCHW / [B,C] layouts"
+                    .to_owned(),
             ));
         }
         let mut output = self.alloc_uninit(expected)?;
@@ -9345,7 +12053,8 @@ impl F32TensorOpsBackend for OxideBackend {
         }
         if param_count == 0 || embed_dim == 0 {
             return Err(OxideError::Shape(
-                "foveation_film_backward_f32: param_count and embed_dim must be positive".to_owned(),
+                "foveation_film_backward_f32: param_count and embed_dim must be positive"
+                    .to_owned(),
             ));
         }
         let (batch, channels, height, width) = (shape[0], shape[1], shape[2], shape[3]);
@@ -9365,10 +12074,14 @@ impl F32TensorOpsBackend for OxideBackend {
             OxideError::Shape("foveation_film_backward_f32: HF extent overflows".to_owned())
         })?;
         let embed_weights_count = embed_dim.checked_mul(param_count).ok_or_else(|| {
-            OxideError::Shape("foveation_film_backward_f32: embedding weight extent overflows".to_owned())
+            OxideError::Shape(
+                "foveation_film_backward_f32: embedding weight extent overflows".to_owned(),
+            )
         })?;
         let channel_weights_count = channels.checked_mul(embed_dim).ok_or_else(|| {
-            OxideError::Shape("foveation_film_backward_f32: channel weight extent overflows".to_owned())
+            OxideError::Shape(
+                "foveation_film_backward_f32: channel weight extent overflows".to_owned(),
+            )
         })?;
         let input = self.f32v(input)?;
         let input = &*input;
@@ -9390,16 +12103,12 @@ impl F32TensorOpsBackend for OxideBackend {
             || w_beta.len() != channel_weights_count
         {
             return Err(OxideError::Shape(
-                "foveation_film_backward_f32: operand extents do not match configured layouts".to_owned(),
+                "foveation_film_backward_f32: operand extents do not match configured layouts"
+                    .to_owned(),
             ));
         }
-        let (dx, dgamma, dbeta) = self.foveation_film_affine_backward_f32(
-            input,
-            output_gradient,
-            gamma,
-            shape,
-            config,
-        )?;
+        let (dx, dgamma, dbeta) =
+            self.foveation_film_affine_backward_f32(input, output_gradient, gamma, shape, config)?;
         let dgamma_f = self.f32v(&dgamma)?;
         let dgamma_f = &*dgamma_f;
         let dbeta_f = self.f32v(&dbeta)?;
@@ -9509,7 +12218,10 @@ impl F32TensorOpsBackend for OxideBackend {
                 "foveation_film_affine_backward_f32: tensor extent overflows".to_owned(),
             )
         })?;
-        if input.len() != expected || output_gradient.len() != expected || gamma.len() != channel_count {
+        if input.len() != expected
+            || output_gradient.len() != expected
+            || gamma.len() != channel_count
+        {
             return Err(OxideError::Shape(
                 "foveation_film_affine_backward_f32: tensor extents do not match NCHW / [B,C] layouts".to_owned(),
             ));

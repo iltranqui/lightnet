@@ -765,6 +765,106 @@ mod tests {
     }
 
     #[test]
+    fn dsconv_axis_layout_pins_cpp_snake_branches_batch_channels_and_nchw_outputs() {
+        use crate::axis_fixture::{axis_tensor, nchw_index, probe_shape};
+
+        // C++ source: `dsconv_layer.cpp` constructs y offsets in channels
+        // [0,K), x offsets in [K,2K), writes x-snake [b,y,x*K+k] or y-snake
+        // [b,y*K+k,x], then collapses in NCHW at lines 103-167 and 223-247.
+        // Saturated tanh biases make the source's +/-1 cumulative steps exact.
+        let input_shape = probe_shape(); // W=3, H=2, C=2, B=2
+        let input = Tensor::from_data(input_shape, axis_tensor(input_shape)).unwrap();
+        let filters = 3;
+        let kernel = 3;
+        let output_shape = TensorShape::new(
+            input_shape.width,
+            input_shape.height,
+            filters,
+            input_shape.batch,
+        );
+        let mut weights = vec![0.0; filters * input_shape.channels * kernel];
+        for f in 0..filters {
+            for c in 0..input_shape.channels {
+                for k in 0..kernel {
+                    weights[(f * input_shape.channels + c) * kernel + k] =
+                        (1 + f * 50 + c * 10 + k) as f32;
+                }
+            }
+        }
+        let biases = [3.0, 13.0, 23.0];
+        let offset_weights = vec![0.0; 2 * kernel * input_shape.channels * 9];
+        // y offsets = [+1, 0, -1], x offsets = [-1, 0, +1].
+        let offset_biases = [10.0, 0.0, -10.0, -10.0, 0.0, 10.0];
+
+        for morph in 0..=2 {
+            let spec = spec(morph, filters, kernel);
+            let (actual, _) = dsconv_forward(
+                &input,
+                output_shape,
+                &spec,
+                &weights,
+                &biases,
+                &offset_weights,
+                &offset_biases,
+            )
+            .unwrap();
+            let mut expected = vec![0.0; output_shape.batch * output_shape.element_count()];
+            for n in 0..input_shape.batch {
+                for f in 0..filters {
+                    // C++ `morph=2` sends floor(filters/2) channels through
+                    // x-snake and the remainder through y-snake.
+                    let branch = if morph == 2 {
+                        usize::from(f >= filters / 2)
+                    } else {
+                        morph
+                    };
+                    for y in 0..input_shape.height {
+                        for x in 0..input_shape.width {
+                            let mut sum = biases[f];
+                            for c in 0..input_shape.channels {
+                                for k in 0..kernel {
+                                    let (sample_y, sample_x) = if branch == 0 {
+                                        let y_step = [1isize, 0, -1][k];
+                                        (
+                                            (y as isize + y_step)
+                                                .clamp(0, input_shape.height as isize - 1)
+                                                as usize,
+                                            (x as isize + k as isize - 1)
+                                                .clamp(0, input_shape.width as isize - 1)
+                                                as usize,
+                                        )
+                                    } else {
+                                        let x_step = [-1isize, 0, 1][k];
+                                        (
+                                            (y as isize + k as isize - 1)
+                                                .clamp(0, input_shape.height as isize - 1)
+                                                as usize,
+                                            (x as isize + x_step)
+                                                .clamp(0, input_shape.width as isize - 1)
+                                                as usize,
+                                        )
+                                    };
+                                    let input_index =
+                                        nchw_index(input_shape, n, c, sample_y, sample_x);
+                                    let weight_index = (f * input_shape.channels + c) * kernel + k;
+                                    sum += input.data[input_index] * weights[weight_index];
+                                }
+                            }
+                            let output_index = nchw_index(output_shape, n, f, y, x);
+                            assert_eq!(
+                                actual.data[output_index], sum,
+                                "C++ DSConv axis/order mismatch: morph={morph}, output (n,f,y,x)=({n},{f},{y},{x}); a batch/filter/height/width/step swap changes the source-indexed sentinel sum"
+                            );
+                            expected[output_index] = sum;
+                        }
+                    }
+                }
+            }
+            assert_eq!(actual.data, expected, "morph={morph} NCHW output order");
+        }
+    }
+
+    #[test]
     fn dsconv_backward_uses_right_cell_derivative_at_integer_and_zero_at_border() {
         let input =
             Tensor::from_data(TensorShape::new(2, 2, 1, 1), vec![1.0, 4.0, 7.0, 20.0]).unwrap();

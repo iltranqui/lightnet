@@ -72,11 +72,7 @@ pub fn activate(kind: u32, x: f32) -> f32 {
             x
         }
     } else if kind == 15 {
-        if x > 0.0 {
-            x
-        } else {
-            0.01 * x
-        }
+        if x > 0.0 { x } else { 0.01 * x }
     } else if kind == 16 {
         if x < 0.0 {
             0.001 * x
@@ -161,17 +157,9 @@ pub fn gradient(kind: u32, x: f32) -> f32 {
         let sigmoid = 1.0 / (1.0 + (-x).exp());
         2.0 * sigmoid * (1.0 - sigmoid)
     } else if kind == 14 {
-        if x > -1.0 && x < 1.0 {
-            1.0
-        } else {
-            0.0
-        }
+        if x > -1.0 && x < 1.0 { 1.0 } else { 0.0 }
     } else if kind == 15 {
-        if x > 0.0 {
-            1.0
-        } else {
-            0.01
-        }
+        if x > 0.0 { 1.0 } else { 0.01 }
     } else if kind == 16 {
         if x > 0.0 && x < 1.0 { 1.0 } else { 0.001 }
     } else if kind == 17 {
@@ -238,12 +226,7 @@ pub mod kernels {
 
     /// out[i] = delta[i] * gradient(x[i]); `x` is the activation input.
     #[kernel]
-    pub fn activation_backward(
-        x: &[f32],
-        delta: &[f32],
-        mut out: DisjointSlice<f32>,
-        kind: u32,
-    ) {
+    pub fn activation_backward(x: &[f32], delta: &[f32], mut out: DisjointSlice<f32>, kind: u32) {
         let idx = thread::index_1d();
         let i = idx.get();
         if let Some(o) = out.get_mut(idx) {
@@ -367,7 +350,11 @@ pub mod layernorm {
             let xhat = ((if v.is_finite() { v } else { 0.0 }) - mean) * inv_std;
             let g = dy[base + i] * (if has_gamma != 0 { gamma[i] } else { 1.0 }) * inv_std;
             // SAFETY: as above, one owner per output element.
-            unsafe { dx.as_mut_ptr().add(base + i).write(g - mean_g - xhat * mean_gx) };
+            unsafe {
+                dx.as_mut_ptr()
+                    .add(base + i)
+                    .write(g - mean_g - xhat * mean_gx)
+            };
             i += 1;
         }
     }

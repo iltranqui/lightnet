@@ -19,7 +19,11 @@ pub fn sgd_elem(
     fix_w: u32,
 ) {
     let w0 = w[i];
-    let wi = if fix_w != 0 && w0 - w0 != 0.0 { 1.0 / (i as f32 + 1.0) } else { w0 };
+    let wi = if fix_w != 0 && w0 - w0 != 0.0 {
+        1.0 / (i as f32 + 1.0)
+    } else {
+        w0
+    };
     let u_acc = if has_grad != 0 { u[i] + g[i] } else { u[i] };
     let ui = if u_acc - u_acc != 0.0 { 0.0 } else { u_acc };
     let decayed = ui - decay_times_batch * wi;
@@ -54,7 +58,11 @@ pub fn adam_elem(
     fix_w: u32,
 ) {
     let w0 = w[i];
-    let wi = if fix_w != 0 && w0 - w0 != 0.0 { 1.0 / (i as f32 + 1.0) } else { w0 };
+    let wi = if fix_w != 0 && w0 - w0 != 0.0 {
+        1.0 / (i as f32 + 1.0)
+    } else {
+        w0
+    };
     let u_acc = if has_grad != 0 { u[i] + g[i] } else { u[i] };
     let ui = if u_acc - u_acc != 0.0 { 0.0 } else { u_acc };
     let gr = ui - coupled_decay * wi;
@@ -190,7 +198,11 @@ pub mod kernels {
         let i = idx.get();
         if i < w.len() {
             let w0 = w[i];
-            let wi = if fix_w != 0 && w0 - w0 != 0.0 { 1.0 / (i as f32 + 1.0) } else { w0 };
+            let wi = if fix_w != 0 && w0 - w0 != 0.0 {
+                1.0 / (i as f32 + 1.0)
+            } else {
+                w0
+            };
             let u0 = u[i];
             let ui = if u0 - u0 != 0.0 { 0.0 } else { u0 };
             let decayed = ui - decay_times_batch * wi;
@@ -228,7 +240,11 @@ pub mod kernels {
         let i = idx.get();
         if i < w.len() {
             let w0 = w[i];
-            let wi = if fix_w != 0 && w0 - w0 != 0.0 { 1.0 / (i as f32 + 1.0) } else { w0 };
+            let wi = if fix_w != 0 && w0 - w0 != 0.0 {
+                1.0 / (i as f32 + 1.0)
+            } else {
+                w0
+            };
             let u0 = u[i];
             let ui = if u0 - u0 != 0.0 { 0.0 } else { u0 };
             let g = ui - coupled_decay * wi;
@@ -257,23 +273,77 @@ pub mod kernels {
     /// first adds `g_k` to `u_k` (the pending gradient accumulation).
     #[kernel]
     pub fn sanitized_sgd_update3(
-        w0: &[f32], u0: &[f32], g0: &[f32], mut wo0: DisjointSlice<f32>, mut uo0: DisjointSlice<f32>,
-        w1: &[f32], u1: &[f32], g1: &[f32], mut wo1: DisjointSlice<f32>, mut uo1: DisjointSlice<f32>,
-        w2: &[f32], u2: &[f32], g2: &[f32], mut wo2: DisjointSlice<f32>, mut uo2: DisjointSlice<f32>,
-        n0: usize, n1: usize, n2: usize,
-        hg0: u32, hg1: u32, hg2: u32,
+        w0: &[f32],
+        u0: &[f32],
+        g0: &[f32],
+        mut wo0: DisjointSlice<f32>,
+        mut uo0: DisjointSlice<f32>,
+        w1: &[f32],
+        u1: &[f32],
+        g1: &[f32],
+        mut wo1: DisjointSlice<f32>,
+        mut uo1: DisjointSlice<f32>,
+        w2: &[f32],
+        u2: &[f32],
+        g2: &[f32],
+        mut wo2: DisjointSlice<f32>,
+        mut uo2: DisjointSlice<f32>,
+        n0: usize,
+        n1: usize,
+        n2: usize,
+        hg0: u32,
+        hg1: u32,
+        hg2: u32,
         fix0: u32,
         lr_over_batch: f32,
         momentum: f32,
-        decay0: f32, decay1: f32, decay2: f32,
+        decay0: f32,
+        decay1: f32,
+        decay2: f32,
     ) {
         let i = thread::index_1d().get();
         if i < n0 {
-            sgd_elem(w0, u0, g0, wo0.as_mut_ptr(), uo0.as_mut_ptr(), i, hg0, lr_over_batch, momentum, decay0, fix0);
+            sgd_elem(
+                w0,
+                u0,
+                g0,
+                wo0.as_mut_ptr(),
+                uo0.as_mut_ptr(),
+                i,
+                hg0,
+                lr_over_batch,
+                momentum,
+                decay0,
+                fix0,
+            );
         } else if i < n0 + n1 {
-            sgd_elem(w1, u1, g1, wo1.as_mut_ptr(), uo1.as_mut_ptr(), i - n0, hg1, lr_over_batch, momentum, decay1, 0);
+            sgd_elem(
+                w1,
+                u1,
+                g1,
+                wo1.as_mut_ptr(),
+                uo1.as_mut_ptr(),
+                i - n0,
+                hg1,
+                lr_over_batch,
+                momentum,
+                decay1,
+                0,
+            );
         } else if i < n0 + n1 + n2 {
-            sgd_elem(w2, u2, g2, wo2.as_mut_ptr(), uo2.as_mut_ptr(), i - n0 - n1, hg2, lr_over_batch, momentum, decay2, 0);
+            sgd_elem(
+                w2,
+                u2,
+                g2,
+                wo2.as_mut_ptr(),
+                uo2.as_mut_ptr(),
+                i - n0 - n1,
+                hg2,
+                lr_over_batch,
+                momentum,
+                decay2,
+                0,
+            );
         }
     }
 
@@ -281,14 +351,39 @@ pub mod kernels {
     /// `sanitized_sgd_update3`); the decays differ per segment.
     #[kernel]
     pub fn sanitized_adam_update3(
-        w0: &[f32], u0: &[f32], g0: &[f32], m0: &[f32], v0: &[f32],
-        mut wo0: DisjointSlice<f32>, mut mo0: DisjointSlice<f32>, mut vo0: DisjointSlice<f32>, mut uo0: DisjointSlice<f32>,
-        w1: &[f32], u1: &[f32], g1: &[f32], m1: &[f32], v1: &[f32],
-        mut wo1: DisjointSlice<f32>, mut mo1: DisjointSlice<f32>, mut vo1: DisjointSlice<f32>, mut uo1: DisjointSlice<f32>,
-        w2: &[f32], u2: &[f32], g2: &[f32], m2: &[f32], v2: &[f32],
-        mut wo2: DisjointSlice<f32>, mut mo2: DisjointSlice<f32>, mut vo2: DisjointSlice<f32>, mut uo2: DisjointSlice<f32>,
-        n0: usize, n1: usize, n2: usize,
-        hg0: u32, hg1: u32, hg2: u32,
+        w0: &[f32],
+        u0: &[f32],
+        g0: &[f32],
+        m0: &[f32],
+        v0: &[f32],
+        mut wo0: DisjointSlice<f32>,
+        mut mo0: DisjointSlice<f32>,
+        mut vo0: DisjointSlice<f32>,
+        mut uo0: DisjointSlice<f32>,
+        w1: &[f32],
+        u1: &[f32],
+        g1: &[f32],
+        m1: &[f32],
+        v1: &[f32],
+        mut wo1: DisjointSlice<f32>,
+        mut mo1: DisjointSlice<f32>,
+        mut vo1: DisjointSlice<f32>,
+        mut uo1: DisjointSlice<f32>,
+        w2: &[f32],
+        u2: &[f32],
+        g2: &[f32],
+        m2: &[f32],
+        v2: &[f32],
+        mut wo2: DisjointSlice<f32>,
+        mut mo2: DisjointSlice<f32>,
+        mut vo2: DisjointSlice<f32>,
+        mut uo2: DisjointSlice<f32>,
+        n0: usize,
+        n1: usize,
+        n2: usize,
+        hg0: u32,
+        hg1: u32,
+        hg2: u32,
         fix0: u32,
         lr: f32,
         beta1: f32,
@@ -296,17 +391,83 @@ pub mod kernels {
         eps: f32,
         bias_correction1: f32,
         bias_correction2: f32,
-        coupled0: f32, decoupled0: f32,
-        coupled1: f32, decoupled1: f32,
-        coupled2: f32, decoupled2: f32,
+        coupled0: f32,
+        decoupled0: f32,
+        coupled1: f32,
+        decoupled1: f32,
+        coupled2: f32,
+        decoupled2: f32,
     ) {
         let i = thread::index_1d().get();
         if i < n0 {
-            adam_elem(w0, u0, g0, m0, v0, wo0.as_mut_ptr(), mo0.as_mut_ptr(), vo0.as_mut_ptr(), uo0.as_mut_ptr(), i, hg0, lr, beta1, beta2, eps, coupled0, decoupled0, bias_correction1, bias_correction2, fix0);
+            adam_elem(
+                w0,
+                u0,
+                g0,
+                m0,
+                v0,
+                wo0.as_mut_ptr(),
+                mo0.as_mut_ptr(),
+                vo0.as_mut_ptr(),
+                uo0.as_mut_ptr(),
+                i,
+                hg0,
+                lr,
+                beta1,
+                beta2,
+                eps,
+                coupled0,
+                decoupled0,
+                bias_correction1,
+                bias_correction2,
+                fix0,
+            );
         } else if i < n0 + n1 {
-            adam_elem(w1, u1, g1, m1, v1, wo1.as_mut_ptr(), mo1.as_mut_ptr(), vo1.as_mut_ptr(), uo1.as_mut_ptr(), i - n0, hg1, lr, beta1, beta2, eps, coupled1, decoupled1, bias_correction1, bias_correction2, 0);
+            adam_elem(
+                w1,
+                u1,
+                g1,
+                m1,
+                v1,
+                wo1.as_mut_ptr(),
+                mo1.as_mut_ptr(),
+                vo1.as_mut_ptr(),
+                uo1.as_mut_ptr(),
+                i - n0,
+                hg1,
+                lr,
+                beta1,
+                beta2,
+                eps,
+                coupled1,
+                decoupled1,
+                bias_correction1,
+                bias_correction2,
+                0,
+            );
         } else if i < n0 + n1 + n2 {
-            adam_elem(w2, u2, g2, m2, v2, wo2.as_mut_ptr(), mo2.as_mut_ptr(), vo2.as_mut_ptr(), uo2.as_mut_ptr(), i - n0 - n1, hg2, lr, beta1, beta2, eps, coupled2, decoupled2, bias_correction1, bias_correction2, 0);
+            adam_elem(
+                w2,
+                u2,
+                g2,
+                m2,
+                v2,
+                wo2.as_mut_ptr(),
+                mo2.as_mut_ptr(),
+                vo2.as_mut_ptr(),
+                uo2.as_mut_ptr(),
+                i - n0 - n1,
+                hg2,
+                lr,
+                beta1,
+                beta2,
+                eps,
+                coupled2,
+                decoupled2,
+                bias_correction1,
+                bias_correction2,
+                0,
+            );
         }
     }
 

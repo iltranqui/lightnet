@@ -32,7 +32,14 @@ pub unsafe fn atomic_add_f32(p: *mut f32, v: f32) {
 }
 
 #[device]
-fn crop_hsv_component(r: f32, g: f32, b: f32, saturation_scale: f32, exposure_scale: f32, channel: usize) -> f32 {
+fn crop_hsv_component(
+    r: f32,
+    g: f32,
+    b: f32,
+    saturation_scale: f32,
+    exposure_scale: f32,
+    channel: usize,
+) -> f32 {
     let maximum = r.max(g).max(b);
     let minimum = r.min(g).min(b);
     let delta = maximum - minimum;
@@ -331,7 +338,11 @@ pub mod kernels {
             ky += 1;
         }
         if let Some(value) = output.get_mut(index) {
-            *value = if samples == 0 { 0.0 } else { sum / samples as f32 };
+            *value = if samples == 0 {
+                0.0
+            } else {
+                sum / samples as f32
+            };
         }
     }
 
@@ -359,7 +370,11 @@ pub mod kernels {
                 exp / (1.0 + exp)
             }
         } else {
-            let softplus = if value > 20.0 { value } else { (1.0 + value.exp()).ln() };
+            let softplus = if value > 20.0 {
+                value
+            } else {
+                (1.0 + value.exp()).ln()
+            };
             (2.0 * softplus + 0.1).max(0.1).min(2.0)
         };
         if let Some(output) = output.get_mut(index) {
@@ -368,18 +383,39 @@ pub mod kernels {
     }
 
     #[device]
-    fn hyperbolic_predictor_raw_gradient(raw: f32, seed: f32, parameter: usize, param_count: usize) -> f32 {
+    fn hyperbolic_predictor_raw_gradient(
+        raw: f32,
+        seed: f32,
+        parameter: usize,
+        param_count: usize,
+    ) -> f32 {
         let derivative = if parameter < 2 {
             let t = raw.tanh();
             0.9 * (1.0 - t * t)
         } else if parameter + 1 == param_count {
-            let sigmoid = if raw >= 0.0 { 1.0 / (1.0 + (-raw).exp()) } else { let e = raw.exp(); e / (1.0 + e) };
+            let sigmoid = if raw >= 0.0 {
+                1.0 / (1.0 + (-raw).exp())
+            } else {
+                let e = raw.exp();
+                e / (1.0 + e)
+            };
             sigmoid * (1.0 - sigmoid)
         } else {
-            let softplus = if raw > 20.0 { raw } else { (1.0 + raw.exp()).ln() };
+            let softplus = if raw > 20.0 {
+                raw
+            } else {
+                (1.0 + raw.exp()).ln()
+            };
             let value = 2.0 * softplus + 0.1;
-            if value <= 0.1 || value >= 2.0 { 0.0 } else {
-                if raw >= 0.0 { 2.0 / (1.0 + (-raw).exp()) } else { let e = raw.exp(); 2.0 * e / (1.0 + e) }
+            if value <= 0.1 || value >= 2.0 {
+                0.0
+            } else {
+                if raw >= 0.0 {
+                    2.0 / (1.0 + (-raw).exp())
+                } else {
+                    let e = raw.exp();
+                    2.0 * e / (1.0 + e)
+                }
             }
         };
         seed * derivative
@@ -387,29 +423,49 @@ pub mod kernels {
 
     #[device]
     fn hyperbolic_predictor_hidden_gradient(
-        n: usize, h: usize, hidden_count: usize, param_count: usize,
-        preactivation: &[f32], raw: &[f32], seed: &[f32], w2: &[f32],
+        n: usize,
+        h: usize,
+        hidden_count: usize,
+        param_count: usize,
+        preactivation: &[f32],
+        raw: &[f32],
+        seed: &[f32],
+        w2: &[f32],
     ) -> f32 {
         let mut gradient = 0.0f32;
         let mut p = 0usize;
         while p < param_count {
             let delta = hyperbolic_predictor_raw_gradient(
-                raw[n * param_count + p], seed[n * param_count + p], p, param_count,
+                raw[n * param_count + p],
+                seed[n * param_count + p],
+                p,
+                param_count,
             );
             gradient += delta * w2[p * hidden_count + h];
             p += 1;
         }
-        if preactivation[n * hidden_count + h] > 0.0 { gradient } else { 0.0 }
+        if preactivation[n * hidden_count + h] > 0.0 {
+            gradient
+        } else {
+            0.0
+        }
     }
 
     #[kernel]
     pub fn hyperbolic_predictor_backward_w2(
-        hidden: &[f32], raw: &[f32], seed: &[f32], mut output: DisjointSlice<f32>,
-        batch: usize, hidden_count: usize, param_count: usize,
+        hidden: &[f32],
+        raw: &[f32],
+        seed: &[f32],
+        mut output: DisjointSlice<f32>,
+        batch: usize,
+        hidden_count: usize,
+        param_count: usize,
     ) {
         let index = thread::index_1d();
         let i = index.get();
-        if i >= output.len() { return; }
+        if i >= output.len() {
+            return;
+        }
         let matrix_count = param_count * hidden_count;
         let mut value = 0.0f32;
         if i < matrix_count {
@@ -417,7 +473,12 @@ pub mod kernels {
             let h = i % hidden_count;
             let mut n = 0usize;
             while n < batch {
-                let delta = hyperbolic_predictor_raw_gradient(raw[n * param_count + p], seed[n * param_count + p], p, param_count);
+                let delta = hyperbolic_predictor_raw_gradient(
+                    raw[n * param_count + p],
+                    seed[n * param_count + p],
+                    p,
+                    param_count,
+                );
                 value += delta * hidden[n * hidden_count + h];
                 n += 1;
             }
@@ -425,22 +486,38 @@ pub mod kernels {
             let p = i - matrix_count;
             let mut n = 0usize;
             while n < batch {
-                value += hyperbolic_predictor_raw_gradient(raw[n * param_count + p], seed[n * param_count + p], p, param_count);
+                value += hyperbolic_predictor_raw_gradient(
+                    raw[n * param_count + p],
+                    seed[n * param_count + p],
+                    p,
+                    param_count,
+                );
                 n += 1;
             }
         }
-        if let Some(out) = output.get_mut(index) { *out = value; }
+        if let Some(out) = output.get_mut(index) {
+            *out = value;
+        }
     }
 
     #[kernel]
     pub fn hyperbolic_predictor_backward_w1(
-        pooled: &[f32], preactivation: &[f32], raw: &[f32], seed: &[f32], w2: &[f32],
-        mut output: DisjointSlice<f32>, batch: usize, input_dim: usize,
-        hidden_count: usize, param_count: usize,
+        pooled: &[f32],
+        preactivation: &[f32],
+        raw: &[f32],
+        seed: &[f32],
+        w2: &[f32],
+        mut output: DisjointSlice<f32>,
+        batch: usize,
+        input_dim: usize,
+        hidden_count: usize,
+        param_count: usize,
     ) {
         let index = thread::index_1d();
         let i = index.get();
-        if i >= output.len() { return; }
+        if i >= output.len() {
+            return;
+        }
         let matrix_count = hidden_count * input_dim;
         let mut value = 0.0f32;
         if i < matrix_count {
@@ -448,7 +525,16 @@ pub mod kernels {
             let feature = i % input_dim;
             let mut n = 0usize;
             while n < batch {
-                let delta = hyperbolic_predictor_hidden_gradient(n, h, hidden_count, param_count, preactivation, raw, seed, w2);
+                let delta = hyperbolic_predictor_hidden_gradient(
+                    n,
+                    h,
+                    hidden_count,
+                    param_count,
+                    preactivation,
+                    raw,
+                    seed,
+                    w2,
+                );
                 value += delta * pooled[n * input_dim + feature];
                 n += 1;
             }
@@ -456,23 +542,46 @@ pub mod kernels {
             let h = i - matrix_count;
             let mut n = 0usize;
             while n < batch {
-                value += hyperbolic_predictor_hidden_gradient(n, h, hidden_count, param_count, preactivation, raw, seed, w2);
+                value += hyperbolic_predictor_hidden_gradient(
+                    n,
+                    h,
+                    hidden_count,
+                    param_count,
+                    preactivation,
+                    raw,
+                    seed,
+                    w2,
+                );
                 n += 1;
             }
         }
-        if let Some(out) = output.get_mut(index) { *out = value; }
+        if let Some(out) = output.get_mut(index) {
+            *out = value;
+        }
     }
 
     #[kernel]
     pub fn hyperbolic_predictor_backward_source(
-        preactivation: &[f32], raw: &[f32], seed: &[f32], w1: &[f32], w2: &[f32],
-        mut output: DisjointSlice<f32>, channels: usize, height: usize, width: usize,
-        downsample: usize, pooled_height: usize, pooled_width: usize,
-        hidden_count: usize, param_count: usize,
+        preactivation: &[f32],
+        raw: &[f32],
+        seed: &[f32],
+        w1: &[f32],
+        w2: &[f32],
+        mut output: DisjointSlice<f32>,
+        channels: usize,
+        height: usize,
+        width: usize,
+        downsample: usize,
+        pooled_height: usize,
+        pooled_width: usize,
+        hidden_count: usize,
+        param_count: usize,
     ) {
         let index = thread::index_1d();
         let i = index.get();
-        if i >= output.len() { return; }
+        if i >= output.len() {
+            return;
+        }
         let spatial = height * width;
         let batch = i / (channels * spatial);
         let channel = (i / spatial) % channels;
@@ -482,7 +591,9 @@ pub mod kernels {
         let pooled_y = y / downsample;
         let pooled_x = x / downsample;
         if pooled_y >= pooled_height || pooled_x >= pooled_width {
-            if let Some(out) = output.get_mut(index) { *out = 0.0; }
+            if let Some(out) = output.get_mut(index) {
+                *out = 0.0;
+            }
             return;
         }
         let feature = (channel * pooled_height + pooled_y) * pooled_width + pooled_x;
@@ -490,14 +601,25 @@ pub mod kernels {
         let mut gradient = 0.0f32;
         let mut h = 0usize;
         while h < hidden_count {
-            let dh = hyperbolic_predictor_hidden_gradient(batch, h, hidden_count, param_count, preactivation, raw, seed, w2);
+            let dh = hyperbolic_predictor_hidden_gradient(
+                batch,
+                h,
+                hidden_count,
+                param_count,
+                preactivation,
+                raw,
+                seed,
+                w2,
+            );
             gradient += dh * w1[h * input_dim + feature];
             h += 1;
         }
         let y0 = pooled_y * downsample;
         let x0 = pooled_x * downsample;
         let count = (height - y0).min(downsample) * (width - x0).min(downsample);
-        if let Some(out) = output.get_mut(index) { *out = gradient / count as f32; }
+        if let Some(out) = output.get_mut(index) {
+            *out = gradient / count as f32;
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -507,7 +629,12 @@ pub mod kernels {
     }
 
     #[device]
-    fn hf_dual_const(value: f32) -> HfDual5 { HfDual5 { value, grad: [0.0; 5] } }
+    fn hf_dual_const(value: f32) -> HfDual5 {
+        HfDual5 {
+            value,
+            grad: [0.0; 5],
+        }
+    }
 
     #[device]
     fn hf_dual_var(value: f32, lane: usize) -> HfDual5 {
@@ -520,7 +647,10 @@ pub mod kernels {
     fn hf_dual_add(a: HfDual5, b: HfDual5) -> HfDual5 {
         let mut out = hf_dual_const(a.value + b.value);
         let mut i = 0usize;
-        while i < 5 { out.grad[i] = a.grad[i] + b.grad[i]; i += 1; }
+        while i < 5 {
+            out.grad[i] = a.grad[i] + b.grad[i];
+            i += 1;
+        }
         out
     }
 
@@ -528,7 +658,10 @@ pub mod kernels {
     fn hf_dual_sub(a: HfDual5, b: HfDual5) -> HfDual5 {
         let mut out = hf_dual_const(a.value - b.value);
         let mut i = 0usize;
-        while i < 5 { out.grad[i] = a.grad[i] - b.grad[i]; i += 1; }
+        while i < 5 {
+            out.grad[i] = a.grad[i] - b.grad[i];
+            i += 1;
+        }
         out
     }
 
@@ -536,7 +669,10 @@ pub mod kernels {
     fn hf_dual_mul(a: HfDual5, b: HfDual5) -> HfDual5 {
         let mut out = hf_dual_const(a.value * b.value);
         let mut i = 0usize;
-        while i < 5 { out.grad[i] = a.grad[i] * b.value + a.value * b.grad[i]; i += 1; }
+        while i < 5 {
+            out.grad[i] = a.grad[i] * b.value + a.value * b.grad[i];
+            i += 1;
+        }
         out
     }
 
@@ -545,7 +681,10 @@ pub mod kernels {
         let mut out = hf_dual_const(a.value / b.value);
         let den = b.value * b.value;
         let mut i = 0usize;
-        while i < 5 { out.grad[i] = (a.grad[i] * b.value - a.value * b.grad[i]) / den; i += 1; }
+        while i < 5 {
+            out.grad[i] = (a.grad[i] * b.value - a.value * b.grad[i]) / den;
+            i += 1;
+        }
         out
     }
 
@@ -555,7 +694,10 @@ pub mod kernels {
         let scale = exponent * a.value.powf(exponent - 1.0);
         let mut out = hf_dual_const(value);
         let mut i = 0usize;
-        while i < 5 { out.grad[i] = a.grad[i] * scale; i += 1; }
+        while i < 5 {
+            out.grad[i] = a.grad[i] * scale;
+            i += 1;
+        }
         out
     }
 
@@ -565,7 +707,10 @@ pub mod kernels {
         let scale = if value <= 1.0e-6 { 0.0 } else { 0.5 / value };
         let mut out = hf_dual_const(value);
         let mut i = 0usize;
-        while i < 5 { out.grad[i] = a.grad[i] * scale; i += 1; }
+        while i < 5 {
+            out.grad[i] = a.grad[i] * scale;
+            i += 1;
+        }
         out
     }
 
@@ -575,20 +720,30 @@ pub mod kernels {
         let scale = 1.0 - value * value;
         let mut out = hf_dual_const(value);
         let mut i = 0usize;
-        while i < 5 { out.grad[i] = a.grad[i] * scale; i += 1; }
+        while i < 5 {
+            out.grad[i] = a.grad[i] * scale;
+            i += 1;
+        }
         out
     }
 
     #[device]
     fn hf_dual_clamp(a: HfDual5, minimum: f32, maximum: f32) -> HfDual5 {
-        if a.value <= minimum { hf_dual_const(minimum) }
-        else if a.value >= maximum { hf_dual_const(maximum) }
-        else { a }
+        if a.value <= minimum {
+            hf_dual_const(minimum)
+        } else if a.value >= maximum {
+            hf_dual_const(maximum)
+        } else {
+            a
+        }
     }
 
     #[device]
     fn hf_dual_phi_point(
-        point: [HfDual5; 2], params: [HfDual5; 5], alpha: f32, p_exp: f32,
+        point: [HfDual5; 2],
+        params: [HfDual5; 5],
+        alpha: f32,
+        p_exp: f32,
         param_count: usize,
     ) -> [HfDual5; 2] {
         let cx = params[0];
@@ -598,20 +753,38 @@ pub mod kernels {
             let ry = hf_dual_clamp(params[3], 0.1, 2.0);
             let sum = hf_dual_add(hf_dual_pow(rx, 8.0), hf_dual_pow(ry, 8.0));
             hf_dual_clamp(hf_dual_pow(sum, 0.125), 0.1, 2.0)
-        } else { rx };
+        } else {
+            rx
+        };
         let strength = params[4];
         let dx = hf_dual_sub(point[0], cx);
         let dy = hf_dual_sub(point[1], cy);
         let r = hf_dual_sqrt(hf_dual_add(hf_dual_mul(dx, dx), hf_dual_mul(dy, dy)));
         let u = if r.value > 1.0e-6 {
-            hf_dual_div(hf_dual_tanh(hf_dual_mul(hf_dual_const(alpha.max(1.0e-4)), r)), r)
-        } else { hf_dual_const(alpha.max(1.0e-4)) };
+            hf_dual_div(
+                hf_dual_tanh(hf_dual_mul(hf_dual_const(alpha.max(1.0e-4)), r)),
+                r,
+            )
+        } else {
+            hf_dual_const(alpha.max(1.0e-4))
+        };
         let weight = if r.value < radius.value {
             let base = hf_dual_sub(hf_dual_const(1.0), hf_dual_div(r, radius));
             hf_dual_pow(base, p_exp.max(1.0e-4))
-        } else { hf_dual_const(0.0) };
-        let gain = hf_dual_add(hf_dual_const(1.0), hf_dual_mul(hf_dual_mul(strength, weight), hf_dual_sub(u, hf_dual_const(1.0))));
-        [hf_dual_add(cx, hf_dual_mul(gain, dx)), hf_dual_add(cy, hf_dual_mul(gain, dy))]
+        } else {
+            hf_dual_const(0.0)
+        };
+        let gain = hf_dual_add(
+            hf_dual_const(1.0),
+            hf_dual_mul(
+                hf_dual_mul(strength, weight),
+                hf_dual_sub(u, hf_dual_const(1.0)),
+            ),
+        );
+        [
+            hf_dual_add(cx, hf_dual_mul(gain, dx)),
+            hf_dual_add(cy, hf_dual_mul(gain, dy)),
+        ]
     }
 
     #[derive(Clone, Copy)]
@@ -622,7 +795,10 @@ pub mod kernels {
 
     #[device]
     fn hf_dual_phi_eval(
-        point: [HfDual5; 2], params: [HfDual5; 5], alpha: f32, p_exp: f32,
+        point: [HfDual5; 2],
+        params: [HfDual5; 5],
+        alpha: f32,
+        p_exp: f32,
         param_count: usize,
     ) -> HfDualEval {
         let cx = params[0];
@@ -632,8 +808,14 @@ pub mod kernels {
             let ry = hf_dual_clamp(params[3], 0.1, 2.0);
             let sum = hf_dual_add(hf_dual_pow(rx, 8.0), hf_dual_pow(ry, 8.0));
             hf_dual_clamp(hf_dual_pow(sum, 0.125), 0.1, 2.0)
-        } else { rx };
-        let radius = if radius.value < 1.0e-4 { hf_dual_const(1.0e-4) } else { radius };
+        } else {
+            rx
+        };
+        let radius = if radius.value < 1.0e-4 {
+            hf_dual_const(1.0e-4)
+        } else {
+            radius
+        };
         let strength = params[4];
         let dx = hf_dual_sub(point[0], cx);
         let dy = hf_dual_sub(point[1], cy);
@@ -643,25 +825,51 @@ pub mod kernels {
             let tanh = hf_dual_tanh(ar);
             let sech2 = hf_dual_sub(hf_dual_const(1.0), hf_dual_mul(tanh, tanh));
             let du = hf_dual_div(
-                hf_dual_sub(hf_dual_mul(hf_dual_mul(hf_dual_const(alpha.max(1.0e-4)), sech2), r), tanh),
+                hf_dual_sub(
+                    hf_dual_mul(hf_dual_mul(hf_dual_const(alpha.max(1.0e-4)), sech2), r),
+                    tanh,
+                ),
                 hf_dual_mul(r, r),
             );
             (hf_dual_div(tanh, r), du)
-        } else { (hf_dual_const(alpha.max(1.0e-4)), hf_dual_const(0.0)) };
+        } else {
+            (hf_dual_const(alpha.max(1.0e-4)), hf_dual_const(0.0))
+        };
         let (weight, dw_dr) = if r.value < radius.value {
             let unbounded_base = hf_dual_sub(hf_dual_const(1.0), hf_dual_div(r, radius));
-            let base = if unbounded_base.value <= 0.0 { hf_dual_const(0.0) } else { unbounded_base };
+            let base = if unbounded_base.value <= 0.0 {
+                hf_dual_const(0.0)
+            } else {
+                unbounded_base
+            };
             let weight = hf_dual_pow(base, p_exp.max(1.0e-4));
             let dw = if r.value > 1.0e-6 {
                 let factor = hf_dual_div(hf_dual_const(p_exp.max(1.0e-4)), radius);
-                hf_dual_sub(hf_dual_const(0.0), hf_dual_mul(factor, hf_dual_pow(base, (p_exp - 1.0).max(0.0))))
-            } else { hf_dual_const(0.0) };
+                hf_dual_sub(
+                    hf_dual_const(0.0),
+                    hf_dual_mul(factor, hf_dual_pow(base, (p_exp - 1.0).max(0.0))),
+                )
+            } else {
+                hf_dual_const(0.0)
+            };
             (weight, dw)
-        } else { (hf_dual_const(0.0), hf_dual_const(0.0)) };
-        let gain = hf_dual_add(hf_dual_const(1.0), hf_dual_mul(hf_dual_mul(strength, weight), hf_dual_sub(u, hf_dual_const(1.0))));
-        let dg_dr = hf_dual_mul(strength, hf_dual_add(
-            hf_dual_mul(dw_dr, hf_dual_sub(u, hf_dual_const(1.0))), hf_dual_mul(weight, du_dr),
-        ));
+        } else {
+            (hf_dual_const(0.0), hf_dual_const(0.0))
+        };
+        let gain = hf_dual_add(
+            hf_dual_const(1.0),
+            hf_dual_mul(
+                hf_dual_mul(strength, weight),
+                hf_dual_sub(u, hf_dual_const(1.0)),
+            ),
+        );
+        let dg_dr = hf_dual_mul(
+            strength,
+            hf_dual_add(
+                hf_dual_mul(dw_dr, hf_dual_sub(u, hf_dual_const(1.0))),
+                hf_dual_mul(weight, du_dr),
+            ),
+        );
         let mut j00 = gain;
         let mut j01 = hf_dual_const(0.0);
         let mut j10 = hf_dual_const(0.0);
@@ -674,24 +882,39 @@ pub mod kernels {
             j11 = hf_dual_add(j11, hf_dual_mul(hf_dual_mul(d_gain_over_r, dy), dy));
         }
         HfDualEval {
-            point: [hf_dual_add(cx, hf_dual_mul(gain, dx)), hf_dual_add(cy, hf_dual_mul(gain, dy))],
+            point: [
+                hf_dual_add(cx, hf_dual_mul(gain, dx)),
+                hf_dual_add(cy, hf_dual_mul(gain, dy)),
+            ],
             jacobian: [[j00, j01], [j10, j11]],
         }
     }
 
     #[kernel]
     pub fn hyperbolic_newton_param_grad(
-        params: &[f32], grid_gradient: &[f32], mut output: DisjointSlice<f32>,
-        batch: usize, height: usize, width: usize, param_count: usize,
-        alpha: f32, p_exp: f32, iterations: usize, eta: f32,
+        params: &[f32],
+        grid_gradient: &[f32],
+        mut output: DisjointSlice<f32>,
+        batch: usize,
+        height: usize,
+        width: usize,
+        param_count: usize,
+        alpha: f32,
+        p_exp: f32,
+        iterations: usize,
+        eta: f32,
     ) {
         let index = thread::index_1d();
         let i = index.get();
-        if i >= output.len() { return; }
+        if i >= output.len() {
+            return;
+        }
         let n = i / 5;
         let lane = i % 5;
         if n >= batch || (param_count == 4 && lane == 3) {
-            if let Some(out) = output.get_mut(index) { *out = 0.0; }
+            if let Some(out) = output.get_mut(index) {
+                *out = 0.0;
+            }
             return;
         }
         let base = n * param_count;
@@ -699,7 +922,14 @@ pub mod kernels {
             hf_dual_var(params[base].max(-0.9).min(0.9), 0),
             hf_dual_var(params[base + 1].max(-0.9).min(0.9), 1),
             hf_dual_var(params[base + 2], 2),
-            hf_dual_var(if param_count == 5 { params[base + 3] } else { params[base + 2] }, 3),
+            hf_dual_var(
+                if param_count == 5 {
+                    params[base + 3]
+                } else {
+                    params[base + 2]
+                },
+                3,
+            ),
             hf_dual_var(params[base + param_count - 1].max(0.0).min(1.0), 4),
         ];
         let spatial = height * width;
@@ -708,10 +938,21 @@ pub mod kernels {
         while pixel < spatial {
             let x = pixel % width;
             let y = pixel / width;
-            let qx = if width > 1 { 2.0 * x as f32 / (width - 1) as f32 - 1.0 } else { 0.0 };
-            let qy = if height > 1 { 2.0 * y as f32 / (height - 1) as f32 - 1.0 } else { 0.0 };
+            let qx = if width > 1 {
+                2.0 * x as f32 / (width - 1) as f32 - 1.0
+            } else {
+                0.0
+            };
+            let qy = if height > 1 {
+                2.0 * y as f32 / (height - 1) as f32 - 1.0
+            } else {
+                0.0
+            };
             let query = [hf_dual_const(qx), hf_dual_const(qy)];
-            let mut point = [hf_dual_clamp(query[0], -1.0, 1.0), hf_dual_clamp(query[1], -1.0, 1.0)];
+            let mut point = [
+                hf_dual_clamp(query[0], -1.0, 1.0),
+                hf_dual_clamp(query[1], -1.0, 1.0),
+            ];
             let mut iteration = 0usize;
             while iteration < iterations {
                 let eval = hf_dual_phi_eval(point, parameter_duals, alpha, p_exp, param_count);
@@ -723,13 +964,38 @@ pub mod kernels {
                 let j11 = eval.jacobian[1][1];
                 let determinant = hf_dual_sub(hf_dual_mul(j00, j11), hf_dual_mul(j01, j10));
                 if determinant.value.abs() < 1.0e-8 {
-                    point[0] = hf_dual_clamp(hf_dual_add(point[0], hf_dual_mul(hf_dual_const(eta), residual_x)), -1.0, 1.0);
-                    point[1] = hf_dual_clamp(hf_dual_add(point[1], hf_dual_mul(hf_dual_const(eta), residual_y)), -1.0, 1.0);
+                    point[0] = hf_dual_clamp(
+                        hf_dual_add(point[0], hf_dual_mul(hf_dual_const(eta), residual_x)),
+                        -1.0,
+                        1.0,
+                    );
+                    point[1] = hf_dual_clamp(
+                        hf_dual_add(point[1], hf_dual_mul(hf_dual_const(eta), residual_y)),
+                        -1.0,
+                        1.0,
+                    );
                 } else {
-                    let step_x = hf_dual_div(hf_dual_sub(hf_dual_mul(j11, residual_x), hf_dual_mul(j01, residual_y)), determinant);
-                    let step_y = hf_dual_div(hf_dual_add(hf_dual_sub(hf_dual_const(0.0), hf_dual_mul(j10, residual_x)), hf_dual_mul(j00, residual_y)), determinant);
-                    point[0] = hf_dual_clamp(hf_dual_add(point[0], hf_dual_mul(hf_dual_const(eta), step_x)), -1.0, 1.0);
-                    point[1] = hf_dual_clamp(hf_dual_add(point[1], hf_dual_mul(hf_dual_const(eta), step_y)), -1.0, 1.0);
+                    let step_x = hf_dual_div(
+                        hf_dual_sub(hf_dual_mul(j11, residual_x), hf_dual_mul(j01, residual_y)),
+                        determinant,
+                    );
+                    let step_y = hf_dual_div(
+                        hf_dual_add(
+                            hf_dual_sub(hf_dual_const(0.0), hf_dual_mul(j10, residual_x)),
+                            hf_dual_mul(j00, residual_y),
+                        ),
+                        determinant,
+                    );
+                    point[0] = hf_dual_clamp(
+                        hf_dual_add(point[0], hf_dual_mul(hf_dual_const(eta), step_x)),
+                        -1.0,
+                        1.0,
+                    );
+                    point[1] = hf_dual_clamp(
+                        hf_dual_add(point[1], hf_dual_mul(hf_dual_const(eta), step_y)),
+                        -1.0,
+                        1.0,
+                    );
                 }
                 iteration += 1;
             }
@@ -737,26 +1003,45 @@ pub mod kernels {
             let y_scale = height.saturating_sub(1) as f32 * 0.5;
             let gx = grid_gradient[(n * spatial + pixel) * 2];
             let gy = grid_gradient[(n * spatial + pixel) * 2 + 1];
-            let semantic_lane = if param_count == 4 && lane == 3 { 4 } else { lane };
-            sum += gx * x_scale * point[0].grad[semantic_lane] + gy * y_scale * point[1].grad[semantic_lane];
+            let semantic_lane = if param_count == 4 && lane == 3 {
+                4
+            } else {
+                lane
+            };
+            sum += gx * x_scale * point[0].grad[semantic_lane]
+                + gy * y_scale * point[1].grad[semantic_lane];
             pixel += 1;
         }
-        if let Some(out) = output.get_mut(index) { *out = sum; }
+        if let Some(out) = output.get_mut(index) {
+            *out = sum;
+        }
     }
 
     #[kernel]
     pub fn hyperbolic_fixed_point_param_grad(
-        params: &[f32], grid_gradient: &[f32], mut output: DisjointSlice<f32>,
-        batch: usize, height: usize, width: usize, param_count: usize,
-        alpha: f32, p_exp: f32, iterations: usize, eta: f32,
+        params: &[f32],
+        grid_gradient: &[f32],
+        mut output: DisjointSlice<f32>,
+        batch: usize,
+        height: usize,
+        width: usize,
+        param_count: usize,
+        alpha: f32,
+        p_exp: f32,
+        iterations: usize,
+        eta: f32,
     ) {
         let index = thread::index_1d();
         let i = index.get();
-        if i >= output.len() { return; }
+        if i >= output.len() {
+            return;
+        }
         let n = i / 5;
         let lane = i % 5;
         if n >= batch || (param_count == 4 && lane == 3) {
-            if let Some(out) = output.get_mut(index) { *out = 0.0; }
+            if let Some(out) = output.get_mut(index) {
+                *out = 0.0;
+            }
             return;
         }
         let base = n * param_count;
@@ -764,7 +1049,14 @@ pub mod kernels {
             hf_dual_var(params[base].max(-0.9).min(0.9), 0),
             hf_dual_var(params[base + 1].max(-0.9).min(0.9), 1),
             hf_dual_var(params[base + 2], 2),
-            hf_dual_var(if param_count == 5 { params[base + 3] } else { params[base + 2] }, 3),
+            hf_dual_var(
+                if param_count == 5 {
+                    params[base + 3]
+                } else {
+                    params[base + 2]
+                },
+                3,
+            ),
             hf_dual_var(params[base + param_count - 1].max(0.0).min(1.0), 4),
         ];
         let spatial = height * width;
@@ -773,28 +1065,54 @@ pub mod kernels {
         while pixel < spatial {
             let x = pixel % width;
             let y = pixel / width;
-            let qx = if width > 1 { 2.0 * x as f32 / (width - 1) as f32 - 1.0 } else { 0.0 };
-            let qy = if height > 1 { 2.0 * y as f32 / (height - 1) as f32 - 1.0 } else { 0.0 };
+            let qx = if width > 1 {
+                2.0 * x as f32 / (width - 1) as f32 - 1.0
+            } else {
+                0.0
+            };
+            let qy = if height > 1 {
+                2.0 * y as f32 / (height - 1) as f32 - 1.0
+            } else {
+                0.0
+            };
             let query = [hf_dual_const(qx), hf_dual_const(qy)];
-            let mut point = [hf_dual_clamp(query[0], -1.0, 1.0), hf_dual_clamp(query[1], -1.0, 1.0)];
+            let mut point = [
+                hf_dual_clamp(query[0], -1.0, 1.0),
+                hf_dual_clamp(query[1], -1.0, 1.0),
+            ];
             let mut iteration = 0usize;
             while iteration < iterations {
                 let mapped = hf_dual_phi_point(point, parameter_duals, alpha, p_exp, param_count);
                 let residual_x = hf_dual_sub(query[0], mapped[0]);
                 let residual_y = hf_dual_sub(query[1], mapped[1]);
-                point[0] = hf_dual_clamp(hf_dual_add(point[0], hf_dual_mul(hf_dual_const(eta), residual_x)), -1.0, 1.0);
-                point[1] = hf_dual_clamp(hf_dual_add(point[1], hf_dual_mul(hf_dual_const(eta), residual_y)), -1.0, 1.0);
+                point[0] = hf_dual_clamp(
+                    hf_dual_add(point[0], hf_dual_mul(hf_dual_const(eta), residual_x)),
+                    -1.0,
+                    1.0,
+                );
+                point[1] = hf_dual_clamp(
+                    hf_dual_add(point[1], hf_dual_mul(hf_dual_const(eta), residual_y)),
+                    -1.0,
+                    1.0,
+                );
                 iteration += 1;
             }
             let x_scale = width.saturating_sub(1) as f32 * 0.5;
             let y_scale = height.saturating_sub(1) as f32 * 0.5;
             let gx = grid_gradient[(n * spatial + pixel) * 2];
             let gy = grid_gradient[(n * spatial + pixel) * 2 + 1];
-            let semantic_lane = if param_count == 4 && lane == 3 { 4 } else { lane };
-            sum += gx * x_scale * point[0].grad[semantic_lane] + gy * y_scale * point[1].grad[semantic_lane];
+            let semantic_lane = if param_count == 4 && lane == 3 {
+                4
+            } else {
+                lane
+            };
+            sum += gx * x_scale * point[0].grad[semantic_lane]
+                + gy * y_scale * point[1].grad[semantic_lane];
             pixel += 1;
         }
-        if let Some(out) = output.get_mut(index) { *out = sum; }
+        if let Some(out) = output.get_mut(index) {
+            *out = sum;
+        }
     }
 
     /// Build the inverse sampling grid for isotropic or anisotropic Newton HF mode.
@@ -821,16 +1139,31 @@ pub mod kernels {
         let p = pixel % spatial;
         let ox = p % width;
         let oy = p / width;
-        let qx = if width > 1 { 2.0 * ox as f32 / (width - 1) as f32 - 1.0 } else { 0.0 };
-        let qy = if height > 1 { 2.0 * oy as f32 / (height - 1) as f32 - 1.0 } else { 0.0 };
+        let qx = if width > 1 {
+            2.0 * ox as f32 / (width - 1) as f32 - 1.0
+        } else {
+            0.0
+        };
+        let qy = if height > 1 {
+            2.0 * oy as f32 / (height - 1) as f32 - 1.0
+        } else {
+            0.0
+        };
         let cx = params[batch * param_count].max(-0.9).min(0.9);
         let cy = params[batch * param_count + 1].max(-0.9).min(0.9);
         let radius_x = params[batch * param_count + 2].max(0.1).min(2.0);
         let radius = if param_count == 5 {
             let radius_y = params[batch * param_count + 3].max(0.1).min(2.0);
-            (radius_x.powf(8.0) + radius_y.powf(8.0)).powf(0.125).max(0.1).min(2.0)
-        } else { radius_x };
-        let strength = params[batch * param_count + param_count - 1].max(0.0).min(1.0);
+            (radius_x.powf(8.0) + radius_y.powf(8.0))
+                .powf(0.125)
+                .max(0.1)
+                .min(2.0)
+        } else {
+            radius_x
+        };
+        let strength = params[batch * param_count + param_count - 1]
+            .max(0.0)
+            .min(1.0);
         let alpha = alpha.max(1.0e-4);
         let p_exp = p_exp.max(1.0e-4);
         let mut px = qx.max(-1.0).min(1.0);
@@ -940,9 +1273,16 @@ pub mod kernels {
         let radius_x = params[batch * param_count + 2].max(0.1).min(2.0);
         let radius = if param_count == 5 {
             let radius_y = params[batch * param_count + 3].max(0.1).min(2.0);
-            (radius_x.powf(8.0) + radius_y.powf(8.0)).powf(0.125).max(0.1).min(2.0)
-        } else { radius_x };
-        let strength = params[batch * param_count + param_count - 1].max(0.0).min(1.0);
+            (radius_x.powf(8.0) + radius_y.powf(8.0))
+                .powf(0.125)
+                .max(0.1)
+                .min(2.0)
+        } else {
+            radius_x
+        };
+        let strength = params[batch * param_count + param_count - 1]
+            .max(0.0)
+            .min(1.0);
         let mut px = qx.max(-1.0).min(1.0);
         let mut py = qy.max(-1.0).min(1.0);
         let safe_alpha = alpha.max(1.0e-4);
@@ -1023,7 +1363,14 @@ pub mod kernels {
     }
 
     #[device]
-    fn hyperbolic_sample_zero(x: &[f32], base: usize, height: usize, width: usize, y: i64, col: i64) -> f32 {
+    fn hyperbolic_sample_zero(
+        x: &[f32],
+        base: usize,
+        height: usize,
+        width: usize,
+        y: i64,
+        col: i64,
+    ) -> f32 {
         if y >= 0 && y < height as i64 && col >= 0 && col < width as i64 {
             x[base + y as usize * width + col as usize]
         } else {
@@ -1042,7 +1389,9 @@ pub mod kernels {
         width: usize,
     ) {
         let i = thread::index_1d().get();
-        if i >= dy.len() { return; }
+        if i >= dy.len() {
+            return;
+        }
         let spatial = height * width;
         let batch = i / (channels * spatial);
         let channel = (i / spatial) % channels;
@@ -1063,7 +1412,12 @@ pub mod kernels {
             if tx >= 0 && tx < width as i64 && ty >= 0 && ty < height as i64 {
                 let wx = if tap & 1 == 1 { fx } else { 1.0 - fx };
                 let wy = if tap >> 1 == 1 { fy } else { 1.0 - fy };
-                unsafe { atomic_add_f32(dx.add(input_base + ty as usize * width + tx as usize), seed * wy * wx); }
+                unsafe {
+                    atomic_add_f32(
+                        dx.add(input_base + ty as usize * width + tx as usize),
+                        seed * wy * wx,
+                    );
+                }
             }
             tap += 1;
         }
@@ -1083,7 +1437,9 @@ pub mod kernels {
         let scalar = thread::index_1d().get();
         let pixel = scalar / 2;
         let spatial = height * width;
-        if pixel >= grid.len() / 2 { return; }
+        if pixel >= grid.len() / 2 {
+            return;
+        }
         let component = scalar % 2;
         let batch = pixel / spatial;
         let position = pixel % spatial;

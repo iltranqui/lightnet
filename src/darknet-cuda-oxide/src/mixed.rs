@@ -38,14 +38,17 @@ use crate::conv::{Geom, chunk_limit, col_cap_bytes, expect_len, expect_shape};
 use crate::half::HOut;
 use crate::tensor::{PooledBuf, PooledBuf16};
 use crate::{
-    GemmArgs, OxideBackend, OxideError, OxideTensorF16, OxideTensorF32, activation_code, check_channel_layout, launch,
-    launch_err, shape_err, BIAS_BACKWARD_THREADS,
+    BIAS_BACKWARD_THREADS, GemmArgs, OxideBackend, OxideError, OxideTensorF16, OxideTensorF32,
+    activation_code, check_channel_layout, launch, launch_err, shape_err,
 };
 
 /// `DARKNET_OXIDE_AMP=1` (or `true` / `on`).
 pub(crate) fn amp_from_env() -> bool {
     matches!(
-        std::env::var("DARKNET_OXIDE_AMP").unwrap_or_default().to_ascii_lowercase().as_str(),
+        std::env::var("DARKNET_OXIDE_AMP")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
         "1" | "true" | "on" | "yes"
     )
 }
@@ -87,7 +90,11 @@ impl OxideBackend {
 
     /// Wraps an f16 tensor as a (half-storage) trait tensor.
     pub(crate) fn wrap_half(&self, h: OxideTensorF16) -> OxideTensorF32 {
-        OxideTensorF32 { buf: self.empty_f32.clone(), shape: h.shape.clone(), half: Some(h.buf) }
+        OxideTensorF32 {
+            buf: self.empty_f32.clone(),
+            shape: h.shape.clone(),
+            half: Some(h.buf),
+        }
     }
 
     /// The f16 view of a tensor: shares the buffer of a half tensor, rounds an
@@ -95,18 +102,27 @@ impl OxideBackend {
     /// scaled gradient stays visible instead of being clamped).
     pub(crate) fn as_half(&self, t: &OxideTensorF32) -> Result<OxideTensorF16, OxideError> {
         match &t.half {
-            Some(h) => Ok(OxideTensorF16 { buf: h.clone(), shape: t.shape.clone() }),
+            Some(h) => Ok(OxideTensorF16 {
+                buf: h.clone(),
+                shape: t.shape.clone(),
+            }),
             None => self.f32_to_f16(t, false),
         }
     }
 
     /// The f32 view of a tensor: borrowed when it already is f32, else widened
     /// on the device (exact).
-    pub(crate) fn f32v<'a>(&self, t: &'a OxideTensorF32) -> Result<Cow<'a, OxideTensorF32>, OxideError> {
+    pub(crate) fn f32v<'a>(
+        &self,
+        t: &'a OxideTensorF32,
+    ) -> Result<Cow<'a, OxideTensorF32>, OxideError> {
         match &t.half {
             None => Ok(Cow::Borrowed(t)),
             Some(h) => {
-                let wide = self.f16_to_f32(&OxideTensorF16 { buf: h.clone(), shape: t.shape.clone() })?;
+                let wide = self.f16_to_f32(&OxideTensorF16 {
+                    buf: h.clone(),
+                    shape: t.shape.clone(),
+                })?;
                 Ok(Cow::Owned(wide))
             }
         }
@@ -118,7 +134,10 @@ impl OxideBackend {
                 b.zero_async(&self.stream)?;
                 Ok(PooledBuf16::new(b, &self.bufs))
             }
-            None => Ok(PooledBuf16::new(DeviceBuffer::<u16>::zeroed(&self.stream, len)?, &self.bufs)),
+            None => Ok(PooledBuf16::new(
+                DeviceBuffer::<u16>::zeroed(&self.stream, len)?,
+                &self.bufs,
+            )),
         }
     }
 
@@ -134,20 +153,34 @@ impl OxideBackend {
     ) -> Result<OxideTensorF16, OxideError> {
         let ptr = Arc::as_ptr(&w.buf);
         {
-            let cache = self.amp_w16.lock().map_err(|_| shape_err("weights_half", "lock poisoned".into()))?;
+            let cache = self
+                .amp_w16
+                .lock()
+                .map_err(|_| shape_err("weights_half", "lock poisoned".into()))?;
             if let Some(e) = cache.iter().find(|e| {
-                e.key.as_ptr() == ptr && e.key.strong_count() > 0 && e.filters == filters && e.per_filter == per_filter
+                e.key.as_ptr() == ptr
+                    && e.key.strong_count() > 0
+                    && e.filters == filters
+                    && e.per_filter == per_filter
             }) {
                 return Ok(e.half.clone());
             }
         }
         let half = self.conv_weights_f16(w, filters, per_filter)?;
-        let mut cache = self.amp_w16.lock().map_err(|_| shape_err("weights_half", "lock poisoned".into()))?;
+        let mut cache = self
+            .amp_w16
+            .lock()
+            .map_err(|_| shape_err("weights_half", "lock poisoned".into()))?;
         cache.retain(|e| e.key.strong_count() > 0);
         if cache.len() >= W16_CACHE_MAX {
             cache.remove(0);
         }
-        cache.push(W16Entry { key: Arc::downgrade(&w.buf), filters, per_filter, half: half.clone() });
+        cache.push(W16Entry {
+            key: Arc::downgrade(&w.buf),
+            filters,
+            per_filter,
+            half: half.clone(),
+        });
         Ok(half)
     }
 
@@ -175,7 +208,10 @@ impl OxideBackend {
     ) -> Result<OxideTensorF32, OxideError> {
         const OP: &str = "conv2d_f32 (amp)";
         if groups == 0 || c % groups != 0 {
-            return Err(shape_err(OP, format!("channels {c} not divisible by groups {groups}")));
+            return Err(shape_err(
+                OP,
+                format!("channels {c} not divisible by groups {groups}"),
+            ));
         }
         let per_filter = (c / groups) * k * k;
         expect_len(OP, "weights", weights.len(), f * per_filter)?;
@@ -184,7 +220,22 @@ impl OxideBackend {
         let zero_bias = self.alloc(f)?;
         let bias = OxideTensorF32::new(zero_bias, &[f]);
         let out = self.conv2d_bias_act_f16(
-            &xh, &wh, &bias, output_shape, c, h, w, f, k, sx, sy, dil, pad, groups, F32ActivationKind::Linear, config,
+            &xh,
+            &wh,
+            &bias,
+            output_shape,
+            c,
+            h,
+            w,
+            f,
+            k,
+            sx,
+            sy,
+            dil,
+            pad,
+            groups,
+            F32ActivationKind::Linear,
+            config,
         )?;
         Ok(self.wrap_half(out))
     }
@@ -211,7 +262,10 @@ impl OxideBackend {
     ) -> Result<OxideTensorF32, OxideError> {
         const OP: &str = "conv2d_backward_input_f32 (amp)";
         if input_shape.len() != 4 {
-            return Err(shape_err(OP, format!("input shape must be [batch, c, h, w], got {input_shape:?}")));
+            return Err(shape_err(
+                OP,
+                format!("input shape must be [batch, c, h, w], got {input_shape:?}"),
+            ));
         }
         let g = Geom::new(OP, input_shape[0], c, h, w, f, k, sx, sy, dil, pad, groups)?;
         expect_shape(OP, "input", input_shape, &[g.batch, g.c, g.h, g.w])?;
@@ -223,7 +277,9 @@ impl OxideBackend {
         let wh = self.weights_half(weights, g.f, kg)?;
         let mut dx = self.alloc16_uninit(g.x_len())?;
         let plane = g.c * g.h * g.w;
-        let chunk = (col_cap_bytes() / 4 / g.col_len()).clamp(1, g.batch).min(chunk_limit());
+        let chunk = (col_cap_bytes() / 4 / g.col_len())
+            .clamp(1, g.batch)
+            .min(chunk_limit());
         self.with_workspace(chunk * g.col_len(), |ws| {
             let mut b0 = 0;
             while b0 < g.batch {
@@ -303,7 +359,13 @@ impl OxideBackend {
         const OP: &str = "conv2d_backward_weights_f32 (amp)";
         let plane = c.checked_mul(h).and_then(|v| v.checked_mul(w)).unwrap_or(0);
         if plane == 0 || x.len() % plane != 0 {
-            return Err(shape_err(OP, format!("input length {} is not a multiple of C*H*W = {plane}", x.len())));
+            return Err(shape_err(
+                OP,
+                format!(
+                    "input length {} is not a multiple of C*H*W = {plane}",
+                    x.len()
+                ),
+            ));
         }
         let g = Geom::new(OP, x.len() / plane, c, h, w, f, k, sx, sy, dil, pad, groups)?;
         expect_shape(OP, "weight", weight_shape, &[g.f, g.cpg(), g.k, g.k])?;
@@ -314,9 +376,13 @@ impl OxideBackend {
         let xh = self.as_half(x)?;
         let dyh = self.as_half(dy)?;
         let mut dw = self.alloc_uninit(g.w_len())?;
-        let chunk = (col_cap_bytes() / 2 / img_col).clamp(1, g.batch).min(chunk_limit());
-        let mut col_guard =
-            self.half_col.lock().map_err(|_| shape_err(OP, "f16 workspace lock poisoned".into()))?;
+        let chunk = (col_cap_bytes() / 2 / img_col)
+            .clamp(1, g.batch)
+            .min(chunk_limit());
+        let mut col_guard = self
+            .half_col
+            .lock()
+            .map_err(|_| shape_err(OP, "f16 workspace lock poisoned".into()))?;
         if col_guard.as_ref().is_none_or(|b| b.len() < chunk * img_col) {
             *col_guard = Some(DeviceBuffer::<u16>::zeroed(&self.stream, chunk * img_col)?);
         }
@@ -390,7 +456,13 @@ impl OxideBackend {
         channel_stride: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF32, OxideError> {
-        check_channel_layout("bias_add_f32 (amp)", x.len(), Some(bias.len()), channels, channel_stride)?;
+        check_channel_layout(
+            "bias_add_f32 (amp)",
+            x.len(),
+            Some(bias.len()),
+            channels,
+            channel_stride,
+        )?;
         let xh = self.as_half(x)?;
         let bias = self.f32v(bias)?;
         let mut out = self.alloc16_uninit(x.len())?;
@@ -417,7 +489,13 @@ impl OxideBackend {
         channels: usize,
         channel_stride: usize,
     ) -> Result<OxideTensorF32, OxideError> {
-        check_channel_layout("bias_backward_f32 (amp)", grad.len(), None, channels, channel_stride)?;
+        check_channel_layout(
+            "bias_backward_f32 (amp)",
+            grad.len(),
+            None,
+            channels,
+            channel_stride,
+        )?;
         let gh = self.as_half(grad)?;
         let row_groups = grad.len() / channel_stride / channels;
         let mut partial = self.alloc_uninit(channels * BIAS_BACKWARD_THREADS)?;
@@ -525,8 +603,14 @@ impl OxideBackend {
         padding: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF32, OxideError> {
-        let (out_h, out_w) =
-            Self::grad_hw("maxpool_backward_f32 (amp)", output_grad, x.len(), channels, input_height, input_width)?;
+        let (out_h, out_w) = Self::grad_hw(
+            "maxpool_backward_f32 (amp)",
+            output_grad,
+            x.len(),
+            channels,
+            input_height,
+            input_width,
+        )?;
         crate::pool_layout(
             "maxpool_backward_f32 (amp)",
             x.len(),
@@ -578,11 +662,17 @@ impl OxideBackend {
     ) -> Result<OxideTensorF32, OxideError> {
         let op = "upsample_backward_f32 (amp)";
         if stride == 0 || input_shape.len() != 4 || input_shape[1] != channels {
-            return Err(shape_err(op, format!("bad stride {stride} or input shape {input_shape:?}")));
+            return Err(shape_err(
+                op,
+                format!("bad stride {stride} or input shape {input_shape:?}"),
+            ));
         }
         let (batch, in_h, in_w) = (input_shape[0], input_shape[2], input_shape[3]);
         if output_grad.len() != batch * channels * output_height * output_width {
-            return Err(shape_err(op, "gradient size does not match the shapes".to_owned()));
+            return Err(shape_err(
+                op,
+                "gradient size does not match the shapes".to_owned(),
+            ));
         }
         let dyh = self.as_half(output_grad)?;
         let mut dx = self.alloc16_uninit(input_shape.iter().product())?;
@@ -624,12 +714,21 @@ impl OxideBackend {
             || input_total_channels.len() != n
             || channel_stride == 0
         {
-            return Err(shape_err(op, "needs >= 1 input, equal-length metadata and channel_stride > 0".to_owned()));
+            return Err(shape_err(
+                op,
+                "needs >= 1 input, equal-length metadata and channel_stride > 0".to_owned(),
+            ));
         }
         let out_total: usize = input_channels.iter().sum();
         let per_batch = out_total * channel_stride;
         if per_batch == 0 || output_grad.len() % per_batch != 0 {
-            return Err(shape_err(op, format!("gradient length {} not a multiple of {per_batch}", output_grad.len())));
+            return Err(shape_err(
+                op,
+                format!(
+                    "gradient length {} not a multiple of {per_batch}",
+                    output_grad.len()
+                ),
+            ));
         }
         let batch = output_grad.len() / per_batch;
         let gh = self.as_half(output_grad)?;
@@ -641,7 +740,10 @@ impl OxideBackend {
                 || input_channel_offsets[k] + input_channels[k] > input_total_channels[k]
                 || len != batch * input_total_channels[k] * channel_stride
             {
-                return Err(shape_err(op, format!("input {k}: shape {:?} inconsistent", input_shapes[k])));
+                return Err(shape_err(
+                    op,
+                    format!("input {k}: shape {:?} inconsistent", input_shapes[k]),
+                ));
             }
             let mut grad = self.alloc16_zeroed(len)?;
             let count = batch * input_channels[k] * channel_stride;
@@ -687,9 +789,14 @@ impl OxideBackend {
     ) -> Result<BatchNormTrainForward<OxideTensorF32>, OxideError> {
         let op = "batchnorm_train_forward_f32 (amp)";
         let (scales, biases) = (self.f32v(scales)?, self.f32v(biases)?);
-        let (rolling_mean, rolling_variance) = (self.f32v(rolling_mean)?, self.f32v(rolling_variance)?);
-        let (channels, stride, row_groups) =
-            Self::batchnorm_layout(op, shape, x.len(), &[&scales, &biases, &rolling_mean, &rolling_variance])?;
+        let (rolling_mean, rolling_variance) =
+            (self.f32v(rolling_mean)?, self.f32v(rolling_variance)?);
+        let (channels, stride, row_groups) = Self::batchnorm_layout(
+            op,
+            shape,
+            x.len(),
+            &[&scales, &biases, &rolling_mean, &rolling_variance],
+        )?;
         let xh = self.as_half(x)?;
         let n = (row_groups * stride) as f32;
         let block = BIAS_BACKWARD_THREADS as u32;
@@ -711,8 +818,11 @@ impl OxideBackend {
         .map_err(launch_err)?;
         let mut mean = self.alloc_uninit(channels)?;
         // SAFETY: one thread per channel.
-        unsafe { self.batchnorm.bn_mean_finalize(&self.stream, per_channel, &partial, &mut mean, 1.0 / n) }
-            .map_err(launch_err)?;
+        unsafe {
+            self.batchnorm
+                .bn_mean_finalize(&self.stream, per_channel, &partial, &mut mean, 1.0 / n)
+        }
+        .map_err(launch_err)?;
         // SAFETY: as above; every `partial` slot is rewritten.
         unsafe {
             self.amp_k.amp_sq_dev_partial(

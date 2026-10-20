@@ -1211,6 +1211,50 @@ mod tests {
     }
 
     #[test]
+    fn depth_anything_axis_layout_pins_cpp_patch_tokens_cls_and_nchw_batches() {
+        let g = geometry(2, 2, 4, 2, 2, 1, 1, 2, 1, 2, vec![0]);
+        g.validate().unwrap();
+        let mut weights = DepthAnythingWeights::zeroed(&g).unwrap();
+        let offsets = weight_offsets(&g).unwrap();
+        let patch_dim = 3 * g.patch_size * g.patch_size;
+        let values = weights.as_mut_slice();
+        values[offsets.patch_w.range()].fill(0.0);
+        // Project the top-left sample from input channel 0 to embedding 0,
+        // and the top-left sample from input channel 1 to embedding 1.
+        values[offsets.patch_w.start] = 1.0;
+        values[offsets.patch_w.start + patch_dim + g.patch_size * g.patch_size] = 1.0;
+        values[offsets.patch_b.range()].copy_from_slice(&[0.3, -0.4]);
+        values[offsets.cls_token.range()].copy_from_slice(&[7.0, -8.0]);
+        values[offsets.pos_embed.range()].copy_from_slice(&[0.1, -0.2, 10.0, 20.0, 30.0, 40.0]);
+
+        let input = (0..g.input_len().unwrap())
+            .map(|index| (index as f32 * 0.07).sin() + (index % 9) as f32 * 0.13)
+            .collect::<Vec<_>>();
+        let (_, cache) = forward(&input, &weights, &g).unwrap();
+        let tokens = g.token_count().unwrap();
+        let mut expected = vec![0.0; g.batch * tokens * g.dim];
+        for batch in 0..g.batch {
+            expected[batch * tokens * g.dim] = 7.0 + 0.1;
+            expected[batch * tokens * g.dim + 1] = -8.0 - 0.2;
+            for patch_x in 0..g.grid_w() {
+                let token = batch * tokens + 1 + patch_x;
+                let patch_base = (batch * 3) * g.height * g.width + patch_x * g.patch_size;
+                let feature0 = input[patch_base] + 0.3;
+                let feature1 = input[patch_base + g.height * g.width] - 0.4;
+                expected[token * g.dim] = feature0 + 10.0 + 20.0 * patch_x as f32;
+                expected[token * g.dim + 1] = feature1 + 20.0 + 20.0 * patch_x as f32;
+            }
+        }
+        assert_eq!(cache.block_inputs[0].len(), expected.len());
+        for (index, (&actual, &want)) in cache.block_inputs[0].iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - want).abs() < 2.0e-5,
+                "DepthAnything token axis[{index}]: got {actual}, expected {want}; C++ token 0 is CLS and patch rows follow batch-major raster order"
+            );
+        }
+    }
+
+    #[test]
     fn depth_anything_type_major_weight_arrays_match_source_order_and_lengths() {
         let g = geometry(1, 1, 1, 1, 2, 1, 1, 3, 1, 1, vec![0]);
         assert_eq!(

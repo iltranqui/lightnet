@@ -69,7 +69,11 @@ pub mod kernels {
         if let Some(o) = out.get_mut(idx) {
             let r = i / ld;
             let c = i % ld;
-            *o = if c < cols { f32_to_f16_bits(x[r * cols + c], sat) } else { 0 };
+            *o = if c < cols {
+                f32_to_f16_bits(x[r * cols + c], sat)
+            } else {
+                0
+            };
         }
     }
 

@@ -14,7 +14,11 @@ pub fn momentum_lookahead(
     if !coefficient.is_finite() || !(0.0..1.0).contains(&coefficient) {
         return Err("Muon momentum coefficient must be finite and in [0, 1)".to_owned());
     }
-    if updates.iter().chain(momentum).any(|value| !value.is_finite()) {
+    if updates
+        .iter()
+        .chain(momentum)
+        .any(|value| !value.is_finite())
+    {
         return Err("Muon updates and momentum must be finite".to_owned());
     }
     let scale = if loss_scale.is_finite() && loss_scale > 0.0 {
@@ -55,7 +59,11 @@ pub fn apply_update(
     if !direction_scale.is_finite() || direction_scale < 0.0 {
         return Err("Muon direction scale must be finite and non-negative".to_owned());
     }
-    if weights.iter().chain(direction).any(|value| !value.is_finite()) {
+    if weights
+        .iter()
+        .chain(direction)
+        .any(|value| !value.is_finite())
+    {
         return Err("Muon weights and direction must be finite".to_owned());
     }
     let decay_factor = 1.0 - learning_rate * decay;

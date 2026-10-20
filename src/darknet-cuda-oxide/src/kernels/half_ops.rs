@@ -186,7 +186,11 @@ pub mod kernels {
         let ix = (r % out_w) / stride;
         let bits = x[bc * in_h * in_w + iy * in_w + ix];
         if let Some(o) = out.get_mut(idx) {
-            *o = if scale == 1.0 { bits } else { f32_to_f16_bits(scale * f16_bits_to_f32(bits), 0) };
+            *o = if scale == 1.0 {
+                bits
+            } else {
+                f32_to_f16_bits(scale * f16_bits_to_f32(bits), 0)
+            };
         }
     }
 
@@ -212,33 +216,40 @@ pub mod kernels {
         let location = rem / anchors;
         let anchor = rem % anchors;
         let channels = anchors * entries;
-        let source_index = |entry: usize| {
-            (batch * channels + anchor * entries + entry) * spatial + location
-        };
+        let source_index =
+            |entry: usize| (batch * channels + anchor * entries + entry) * spatial + location;
         let destination = (batch * spatial + location) * channels + anchor * entries;
         let mut entry = 0usize;
         while entry < entries {
             let bits = input[source_index(entry)];
             // SAFETY: each group exclusively owns its entries-wide output row.
-            unsafe { *output.as_mut_ptr().add(destination + entry) = bits; }
+            unsafe {
+                *output.as_mut_ptr().add(destination + entry) = bits;
+            }
             entry += 1;
         }
         let objectness = f16_bits_to_f32(input[source_index(4)]);
         let sigmoid = 1.0 / (1.0 + (-objectness).exp());
-        unsafe { *output.as_mut_ptr().add(destination + 4) = f32_to_f16_bits(sigmoid, 0); }
+        unsafe {
+            *output.as_mut_ptr().add(destination + 4) = f32_to_f16_bits(sigmoid, 0);
+        }
         if softmax_classes != 0 {
             let mut max_value = f32::NEG_INFINITY;
             entry = 0;
             while entry < classes {
                 let value = f16_bits_to_f32(input[source_index(5 + entry)]);
-                if value > max_value { max_value = value; }
+                if value > max_value {
+                    max_value = value;
+                }
                 entry += 1;
             }
             let mut sum = 0.0f32;
             entry = 0;
             while entry < classes {
                 let value = (f16_bits_to_f32(input[source_index(5 + entry)]) - max_value).exp();
-                unsafe { *output.as_mut_ptr().add(destination + 5 + entry) = f32_to_f16_bits(value, 0); }
+                unsafe {
+                    *output.as_mut_ptr().add(destination + 5 + entry) = f32_to_f16_bits(value, 0);
+                }
                 sum += value;
                 entry += 1;
             }
@@ -247,7 +258,9 @@ pub mod kernels {
                 while entry < classes {
                     let index = destination + 5 + entry;
                     let value = f16_bits_to_f32(unsafe { *output.as_mut_ptr().add(index) }) / sum;
-                    unsafe { *output.as_mut_ptr().add(index) = f32_to_f16_bits(value, 0); }
+                    unsafe {
+                        *output.as_mut_ptr().add(index) = f32_to_f16_bits(value, 0);
+                    }
                     entry += 1;
                 }
             }
@@ -272,7 +285,9 @@ pub mod kernels {
         let mut i = 0usize;
         while i < group_size {
             let value = f16_bits_to_f32(input[base + i]);
-            if value > max_value { max_value = value; }
+            if value > max_value {
+                max_value = value;
+            }
             i += 1;
         }
         let mut sum = 0.0f32;
@@ -284,7 +299,11 @@ pub mod kernels {
         i = 0;
         while i < group_size {
             let exponential = (f16_bits_to_f32(input[base + i]) - max_value).exp();
-            let probability = if sum > 0.0 { exponential / sum } else { exponential };
+            let probability = if sum > 0.0 {
+                exponential / sum
+            } else {
+                exponential
+            };
             unsafe {
                 *output.as_mut_ptr().add(base + i) = f32_to_f16_bits(probability, 0);
             }
@@ -448,7 +467,10 @@ pub mod kernels {
         let idx = thread::index_1d();
         let i = idx.get();
         if let Some(o) = out.get_mut(idx) {
-            *o = f32_to_f16_bits(activate(kind, f16_bits_to_f32(a[i]) + f16_bits_to_f32(b[i])), 0);
+            *o = f32_to_f16_bits(
+                activate(kind, f16_bits_to_f32(a[i]) + f16_bits_to_f32(b[i])),
+                0,
+            );
         }
     }
 
@@ -731,7 +753,12 @@ pub mod kernels {
 
     /// Flat per-sample crop / zero-pad of a mismatched shortcut source (bit copy).
     #[kernel]
-    pub fn shortcut_fit_f16(x: &[u16], mut out: DisjointSlice<u16>, from_len: usize, to_len: usize) {
+    pub fn shortcut_fit_f16(
+        x: &[u16],
+        mut out: DisjointSlice<u16>,
+        from_len: usize,
+        to_len: usize,
+    ) {
         let idx = thread::index_1d();
         let g = idx.get();
         if let Some(o) = out.get_mut(idx) {

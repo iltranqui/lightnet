@@ -41,7 +41,8 @@ impl Fp4Packed {
     pub fn value(&self, row: usize, kk: usize) -> f32 {
         let blocks = self.blocks_per_row();
         let block = kk / BLOCK;
-        let byte = self.codes[row * blocks * CODE_BYTES_PER_BLOCK + block * CODE_BYTES_PER_BLOCK + (kk % 16) / 2];
+        let byte = self.codes
+            [row * blocks * CODE_BYTES_PER_BLOCK + block * CODE_BYTES_PER_BLOCK + (kk % 16) / 2];
         let code = if kk % 2 == 0 { byte & 0x0F } else { byte >> 4 };
         e2m1_to_f32(code) * e4m3_magnitude(self.scales[row * blocks + block]) * self.global_scale
     }
@@ -70,7 +71,11 @@ pub fn f32_to_e2m1(value: f32) -> u8 {
     if value.is_nan() {
         return 0x07;
     }
-    let sign: u8 = if value.to_bits() >> 31 != 0 { 0x08 } else { 0x00 };
+    let sign: u8 = if value.to_bits() >> 31 != 0 {
+        0x08
+    } else {
+        0x00
+    };
     let magnitude = if value.is_infinite() {
         E2M1_MAX
     } else {
@@ -151,19 +156,39 @@ pub fn quantize_1x16(x: &[f32], rows: usize, k: usize) -> Fp4Packed {
             }
         }
     }
-    Fp4Packed { rows, k, codes, scales, global_scale }
+    Fp4Packed {
+        rows,
+        k,
+        codes,
+        scales,
+        global_scale,
+    }
 }
 
 /// Exact CPU block dot of two packed rows: the i32 `dp4a` result the kernel
 /// computes, i.e. `sum_k (2 * a_k) * (2 * b_k)` over one 16-element block.
 /// `a_row` / `b_row` are *row* indices; elements past `k` are zero coded.
-pub fn block_dot_i32(a: &Fp4Packed, a_row: usize, b: &Fp4Packed, b_row: usize, block: usize) -> i32 {
+pub fn block_dot_i32(
+    a: &Fp4Packed,
+    a_row: usize,
+    b: &Fp4Packed,
+    b_row: usize,
+    block: usize,
+) -> i32 {
     let mut total = 0i32;
     for i in 0..BLOCK {
         let ka = block * BLOCK + i;
         let kb = block * BLOCK + i;
-        let ca = if ka < a.k { packed_code(a, a_row, block, i) } else { 0 };
-        let cb = if kb < b.k { packed_code(b, b_row, block, i) } else { 0 };
+        let ca = if ka < a.k {
+            packed_code(a, a_row, block, i)
+        } else {
+            0
+        };
+        let cb = if kb < b.k {
+            packed_code(b, b_row, block, i)
+        } else {
+            0
+        };
         // `as i32` binds tighter than `*`, so the doubling must happen in f32
         // first: `2 * (e2m1 as i32)` would truncate 0.5 to 0 and silently drop
         // every +-0.5 code from the dot product.
@@ -176,7 +201,8 @@ pub fn block_dot_i32(a: &Fp4Packed, a_row: usize, b: &Fp4Packed, b_row: usize, b
 
 fn packed_code(packed: &Fp4Packed, row: usize, block: usize, i: usize) -> u8 {
     let blocks = packed.blocks_per_row();
-    let byte = packed.codes[row * blocks * CODE_BYTES_PER_BLOCK + block * CODE_BYTES_PER_BLOCK + i / 2];
+    let byte =
+        packed.codes[row * blocks * CODE_BYTES_PER_BLOCK + block * CODE_BYTES_PER_BLOCK + i / 2];
     if i % 2 == 0 { byte & 0x0F } else { byte >> 4 }
 }
 
@@ -244,7 +270,9 @@ mod tests {
     #[test]
     fn quantizer_hand_computed_single_block() {
         // One row, K = 16, amax = 4 -> global = 4 / 2688 = 1/672.
-        let x: Vec<f32> = (0..16).map(|i| if i == 0 { 4.0 } else { (i as f32 - 8.0) * 0.5 }).collect();
+        let x: Vec<f32> = (0..16)
+            .map(|i| if i == 0 { 4.0 } else { (i as f32 - 8.0) * 0.5 })
+            .collect();
         let packed = quantize_1x16(&x, 1, 16);
         assert_eq!(packed.global_scale, 4.0 / 2688.0);
         assert_eq!(packed.codes.len(), 8);
@@ -290,7 +318,9 @@ mod tests {
         // A_dequant[i][j] * B_dequant[j][j]; compare the block-scaled integer
         // path against a plain f32 product of the dequantised matrices.
         let k = 16;
-        let a: Vec<f32> = (0..16).flat_map(|i| [(i as f32 + 1.0) * 0.25; 16]).collect();
+        let a: Vec<f32> = (0..16)
+            .flat_map(|i| [(i as f32 + 1.0) * 0.25; 16])
+            .collect();
         let mut b = vec![0.0f32; 16 * k];
         for j in 0..16 {
             b[j * k + j] = 6.0;
@@ -332,7 +362,11 @@ mod tests {
         let plain = gemm_nt_packed(&pa, &pb, 4, 4, k, 1.0, 0.0, None);
         for i in 0..16 {
             let want = 2.0 * plain[i] + 0.25 * c0[i];
-            assert!((got[i] - want).abs() <= 1e-5 * want.abs().max(1e-3), "[{i}]: {} vs {want}", got[i]);
+            assert!(
+                (got[i] - want).abs() <= 1e-5 * want.abs().max(1e-3),
+                "[{i}]: {} vs {want}",
+                got[i]
+            );
         }
     }
 }
@@ -351,7 +385,13 @@ mod more_tests {
         let mut codes = vec![0x11u8; 16];
         codes[8..16].fill(0x77);
         let scale = crate::fp8::f32_to_fp8(448.0, crate::fp8::Fp8Format::E4M3);
-        let packed = Fp4Packed { rows: 2, k, codes, scales: vec![scale; 2], global_scale: 1.0 };
+        let packed = Fp4Packed {
+            rows: 2,
+            k,
+            codes,
+            scales: vec![scale; 2],
+            global_scale: 1.0,
+        };
         assert_eq!(block_dot_i32(&packed, 0, &packed, 0, 0), 16);
         assert_eq!(block_dot_i32(&packed, 0, &packed, 1, 0), 16 * 12);
         assert_eq!(block_dot_i32(&packed, 1, &packed, 0, 0), 16 * 12);
@@ -367,8 +407,20 @@ mod more_tests {
         }
         let b_codes = vec![0x11u8; 8];
         let scale = crate::fp8::f32_to_fp8(448.0, crate::fp8::Fp8Format::E4M3);
-        let pa = Fp4Packed { rows: 1, k, codes: a_codes, scales: vec![scale], global_scale: 1.0 };
-        let pb = Fp4Packed { rows: 1, k, codes: b_codes, scales: vec![scale], global_scale: 1.0 };
+        let pa = Fp4Packed {
+            rows: 1,
+            k,
+            codes: a_codes,
+            scales: vec![scale],
+            global_scale: 1.0,
+        };
+        let pb = Fp4Packed {
+            rows: 1,
+            k,
+            codes: b_codes,
+            scales: vec![scale],
+            global_scale: 1.0,
+        };
         let mut want = 0i32;
         for code in 0u8..16 {
             want += (2.0 * e2m1_to_f32(code)) as i32 * 1;

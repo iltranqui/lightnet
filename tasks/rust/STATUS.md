@@ -53,14 +53,38 @@ its four known residuals (two ~7 GiB SIGKILL/OOM cases, two 300 s CPU-timeout
 cases) remain unresolved. Do not read the 950/29 result as a green full suite.
 
 **v0.2.007 (`15fc3f8c`)**: native `[deform_conv]` forward and backward on the
-device, gated on `dilation == 1` without batch norm with the host path retained
-for the excluded variants. Evidence: host 33, `oxide_deform_gather` 5,
+device, originally gated on `dilation == 1` without batch norm. v0.2.160 extends
+native predictor geometry to all supported dilation values; BN retains the host
+path. Evidence: host 33, `oxide_deform_gather` 5,
 `oxide_deform_conv_accumulate` 8, `oxide_deform_envelope` 14,
 `oxide_deform_conv_chain` 3, `oxide_deform_conv_backward_chain` 3,
 `oxide_runtime_chain` 26 (incl. the device-path and the BN host-fallback cases),
 `test_host.sh deform_conv` 23. One host hop remains (the batch-coupled
-normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
-compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
+normalization Jacobian). No f16/BN device support, benchmark, or compiled-C++
+golden. Ledger: `implemented.md` §47 and §104; state: `layer-support.md`.
+
+**v0.2.160**: native non-BN DeformConv predictor/runtime paths now cover
+`dilation > 1` using an explicit DeformConv output extent (ordinary convolution
+geometry remains unchanged). Host deform tests 23, Oxide predictor/envelope 14,
+Oxide real-runtime chain 3, and the focused dilated runtime/update test 1 passed.
+One normalization-Jacobian host hop and BN host routing remain; no C++ golden,
+f16, full-suite, or performance claim. See `implemented.md` §199.
+
+**Unversioned working-tree continuation:** DSConv now has bounded single-template
+f32 runtime forward/backward with SGD/Adam and hybrid GPU Muon parity (see
+`implemented.md` §§200–201), plus C++-source-derived batch-2 non-square
+DSConv/DeformConv/GraphConv/WMHF/Clifford axis pins. The full `axis_layout`
+filter passes 50 tests; see `implemented.md` §§202–206, §§210, §§218–223 and
+`axis-coverage.md`. Oxide-only WMHF Haar DWT/IWT primitives, adjoints,
+four-direction scan forward/backward, high-frequency branch forward/backward,
+gated fusion, channel split, and local-branch concatenation pass actual-device checks; all these primitives
+now have generic backend contracts. WMHF remains a GPU runtime rejection;
+convolutions and runtime dispatch are open. CenterNet, YOLOX/PP-YOLOE/YOLO-NAS, Segmentation, JevCe, LayaLoss, OmdLoss and
+Regression, Logistic, grouped Softmax, Reorg, ChannelShuffle, ChannelSlice and
+supported ScaleChannels variants now use native full/compact f32 runtime paths,
+with actual-device CPU parity; head loss/backward remains host-owned. See
+`implemented.md` §§207–209, §211–217, §§224–232 and `gpu_layers_plan.md`. This remains
+uncommitted, with no `version-map.tsv` row.
 
 Latest increments:
 - v0.2.159: LayaEncoder full/compact f32 inference now runs natively on Oxide, including embedding gather, RoPE full/sliding attention, and GeGLU; actual-device parity covers multi-block masks/layout. See `implemented.md` §198.
@@ -946,8 +970,11 @@ believing a `cfg_corpus` failure.
    remains open; graph-conv CPU support is integrated in v0.1.003 and WMHF in
    v0.1.004. CPU Muon is integrated in v0.1.005, Clifford in v0.1.006, and
    `recursive_block` in v0.1.007. The bounded Phase 3B CPU layer ports are
-   complete; DSConv multi-template morph 0/1 remains unsupported. Stage-2 native
-   GPU work for `dcnv4` and `deform_conv` and GPU Muon remains open.
+   complete. DSConv now has bounded native Oxide f32 runtime forward/backward
+   plus actual-device CPU parity for SGD (morph 2) and Adam (morph 1); see
+   `implemented.md` §§200–201. Multi-template morph 0/1 and compact f16 remain
+   open; broader matrix-family GPU Muon and remaining `dcnv4`/`deform_conv`
+   Stage-2 work remain open.
 6. Phase 2C OBB, then Phase 4.
 
 ## Known evidence gaps (not user questions)

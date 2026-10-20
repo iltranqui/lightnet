@@ -602,6 +602,73 @@ mod tests {
     }
 
     #[test]
+    fn omd_axis_layout_pins_cpp_nchw_sample_rows_pairs_and_scatter() {
+        // C++ extracts each object vector through `spatial_index`, keeps
+        // samples in batch/truth order, forms a pair in that order, and scatters
+        // the normalized delta back to the same NCHW pixels (`omd_loss_layer.cpp:86-95,143-185,189-260`).
+        let s = spec();
+        let sh = shape(2, 2, 2, 3);
+        let mut input = Vec::with_capacity(sh.element_count() * sh.batch);
+        for b in 0..sh.batch {
+            for c in 0..sh.channels {
+                for y in 0..sh.height {
+                    for x in 0..sh.width {
+                        input.push((1 + b * 100 + c * 10 + y * sh.width + x) as f32);
+                    }
+                }
+            }
+        }
+        let mut truth = vec![0.0f32; sh.batch * s.max_boxes * s.truth_size];
+        let stride = s.max_boxes * s.truth_size;
+        truth[0..5].copy_from_slice(&[0.5, 0.75, 0.2, 0.2, 0.0]);
+        truth[stride..stride + 5].copy_from_slice(&[0.8, 0.25, 0.2, 0.2, 0.0]);
+        let (output, result) = omd_loss_forward(&input, Some(&truth), &s, &sh, 8, 8, true);
+        assert_eq!(output, input, "[omd_loss] forward is an identity");
+        assert_eq!(result.object_samples, 2);
+        assert_eq!(result.positive_pairs, 1);
+        assert_eq!(result.samples.len(), 2);
+        assert_eq!(
+            (
+                result.samples[0].batch,
+                result.samples[0].row,
+                result.samples[0].col
+            ),
+            (0, 1, 1)
+        );
+        assert_eq!(
+            (
+                result.samples[1].batch,
+                result.samples[1].row,
+                result.samples[1].col
+            ),
+            (1, 0, 2)
+        );
+        assert_eq!(result.samples[0].raw, vec![5.0, 15.0]);
+        assert_eq!(result.samples[1].raw, vec![103.0, 113.0]);
+        for b in 0..sh.batch {
+            for c in 0..sh.channels {
+                for y in 0..sh.height {
+                    for x in 0..sh.width {
+                        let index = spatial_index(&sh, b, c, y, x);
+                        let sampled = (b == 0 && y == 1 && x == 1) || (b == 1 && y == 0 && x == 2);
+                        if sampled {
+                            assert!(
+                                result.delta[index].abs() > 1.0e-6,
+                                "sampled NCHW delta at {index}"
+                            );
+                        } else {
+                            assert_eq!(
+                                result.delta[index], 0.0,
+                                "non-sampled NCHW delta at {index}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn forward_is_a_pass_through_without_truth() {
         let s = spec();
         let sh = shape(2, 3, 2, 2);
@@ -811,6 +878,15 @@ mod tests {
         assert!(
             result.delta.iter().any(|d| d.abs() > 0.0),
             "and something was injected"
+        );
+
+        // C++ FLT_MAX disables clipping rather than acting as a large finite cap.
+        s.max_delta = FLT_MAX;
+        let (_, unlimited) = omd_loss_forward(&input, Some(&truth), &s, &sh, 8, 8, true);
+        assert!(
+            unlimited.delta.iter().any(|d| d.abs() > 0.05),
+            "FLT_MAX sentinel must bypass the preceding 0.05 clip: {:?}",
+            unlimited.delta
         );
     }
 

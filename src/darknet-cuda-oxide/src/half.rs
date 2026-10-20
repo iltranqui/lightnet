@@ -10,12 +10,13 @@ use darknet_cuda::{
 };
 use std::sync::Arc;
 
+use crate::kernels::gemm_f16::{HMMA_BM, HMMA_BN, HMMA_THREADS};
 use crate::tensor::PooledBuf16;
 use crate::{
-    GemmArgs, GemmMode, OxideBackend, OxideError, OxideTensorF16, OxideTensorF32, SPLITK_MAX, SPLITK_MIN_K,
-    SPLITK_TARGET_BLOCKS, activation_code, extent, launch, launch_err, pool_layout, shape_err,
+    GemmArgs, GemmMode, OxideBackend, OxideError, OxideTensorF16, OxideTensorF32, SPLITK_MAX,
+    SPLITK_MIN_K, SPLITK_TARGET_BLOCKS, activation_code, extent, launch, launch_err, pool_layout,
+    shape_err,
 };
-use crate::kernels::gemm_f16::{HMMA_BM, HMMA_BN, HMMA_THREADS};
 
 /// Largest finite binary16 value.
 pub const F16_MAX: f32 = 65504.0;
@@ -28,7 +29,13 @@ pub fn f32_to_f16_bits(x: f32) -> u16 {
     let exp = ((b >> 23) & 0xff) as i32;
     let man = b & 0x007f_ffff;
     if exp == 0xff {
-        return sign | 0x7c00 | if man != 0 { 0x0200 | (man >> 13) as u16 } else { 0 };
+        return sign
+            | 0x7c00
+            | if man != 0 {
+                0x0200 | (man >> 13) as u16
+            } else {
+                0
+            };
     }
     let e = exp - 127 + 15;
     if e >= 0x1f {
@@ -132,7 +139,9 @@ pub(crate) enum HOut<'a> {
 fn f16_shape_len(op: &str, shape: &[usize], len: usize) -> Result<(), OxideError> {
     let expected: usize = shape.iter().product();
     if expected != len {
-        return Err(OxideError::Shape(format!("{op}: shape {shape:?} expects {expected} elements, got {len}")));
+        return Err(OxideError::Shape(format!(
+            "{op}: shape {shape:?} expects {expected} elements, got {len}"
+        )));
     }
     Ok(())
 }
@@ -141,14 +150,21 @@ impl OxideBackend {
     pub(crate) fn alloc16_uninit(&self, len: usize) -> Result<PooledBuf16, OxideError> {
         match self.bufs.take16(len) {
             Some(b) => Ok(PooledBuf16::new(b, &self.bufs)),
-            None => Ok(PooledBuf16::new(DeviceBuffer::<u16>::zeroed(&self.stream, len)?, &self.bufs)),
+            None => Ok(PooledBuf16::new(
+                DeviceBuffer::<u16>::zeroed(&self.stream, len)?,
+                &self.bufs,
+            )),
         }
     }
 
     // ---- conversions -----------------------------------------------------
 
     /// Uploads raw binary16 bit patterns.
-    pub fn upload_f16_bits(&self, shape: &[usize], bits: &[u16]) -> Result<OxideTensorF16, OxideError> {
+    pub fn upload_f16_bits(
+        &self,
+        shape: &[usize],
+        bits: &[u16],
+    ) -> Result<OxideTensorF16, OxideError> {
         f16_shape_len("upload_f16_bits", shape, bits.len())?;
         let mut buf = self.alloc16_uninit(bits.len())?;
         if !bits.is_empty() {
@@ -185,7 +201,11 @@ impl OxideBackend {
 
     /// f32 -> f16 on the device (round to nearest even; overflow -> +-Inf, or
     /// +-65504 with `saturate`; NaN stays NaN).
-    pub fn f32_to_f16(&self, x: &OxideTensorF32, saturate: bool) -> Result<OxideTensorF16, OxideError> {
+    pub fn f32_to_f16(
+        &self,
+        x: &OxideTensorF32,
+        saturate: bool,
+    ) -> Result<OxideTensorF16, OxideError> {
         let mut out = self.alloc16_uninit(x.len())?;
         if x.len() > 0 {
             // SAFETY: one thread per element.
@@ -389,10 +409,22 @@ impl OxideBackend {
         // SAFETY: one thread per element of each operand.
         unsafe {
             self.convert
-                .cvt_f32_to_f16(&self.stream, launch::elementwise(a.len(), cfg), a, &mut ah, 0)
+                .cvt_f32_to_f16(
+                    &self.stream,
+                    launch::elementwise(a.len(), cfg),
+                    a,
+                    &mut ah,
+                    0,
+                )
                 .map_err(launch_err)?;
             self.convert
-                .cvt_f32_to_f16(&self.stream, launch::elementwise(b.len(), cfg), b, &mut bh, 0)
+                .cvt_f32_to_f16(
+                    &self.stream,
+                    launch::elementwise(b.len(), cfg),
+                    b,
+                    &mut bh,
+                    0,
+                )
                 .map_err(launch_err)?;
         }
         self.hgemm(&ah, &bh, HOut::F32(c), g)
@@ -452,7 +484,13 @@ impl OxideBackend {
         {
             return Err(bad("operand buffer too small for the requested view"));
         }
-        if let HOut::F16 { bias, bias_stride, bias_mod, .. } = &out {
+        if let HOut::F16 {
+            bias,
+            bias_stride,
+            bias_mod,
+            ..
+        } = &out
+        {
             let need = (g.count.min(*bias_mod) - 1) * bias_stride + g.m;
             if bias.len() < need {
                 return Err(bad("bias buffer too small"));
@@ -464,14 +502,26 @@ impl OxideBackend {
 
         let tiles = g.m.div_ceil(HMMA_BM) * g.n.div_ceil(HMMA_BN) * g.count;
         let splits = if tiles < SPLITK_TARGET_BLOCKS {
-            SPLITK_TARGET_BLOCKS.div_ceil(tiles).min(g.k / SPLITK_MIN_K).min(SPLITK_MAX).max(1)
+            SPLITK_TARGET_BLOCKS
+                .div_ceil(tiles)
+                .min(g.k / SPLITK_MIN_K)
+                .min(SPLITK_MAX)
+                .max(1)
         } else {
             1
         };
-        let kchunk = if splits > 1 { g.k.div_ceil(splits).next_multiple_of(32) } else { g.k };
+        let kchunk = if splits > 1 {
+            g.k.div_ceil(splits).next_multiple_of(32)
+        } else {
+            g.k
+        };
         let splits = g.k.div_ceil(kchunk);
         let mn = g.m * g.n;
-        let mut ws = if splits > 1 { Some(self.alloc_uninit(splits * g.count * mn)?) } else { None };
+        let mut ws = if splits > 1 {
+            Some(self.alloc_uninit(splits * g.count * mn)?)
+        } else {
+            None
+        };
         let blocks = tiles * splits;
         let cfg = launch::blocks_of(blocks, HMMA_THREADS);
 
@@ -498,12 +548,76 @@ impl OxideBackend {
                 let r = unsafe {
                     match ws.as_mut() {
                         Some(w) => self.gemm_f16.hgemm_f16_mma(
-                            &self.stream, cfg, a, b, &sc.d32, w, &mut sc.d16, m, n, k, n, g.lda, g.ldb, ldc, ta, tb,
-                            alpha, beta, av.0, av.1, av.2, bv.0, bv.1, bv.2, cv.0, cv.1, cv.2, g.count, kchunk, 0, 0, 0, 1, bf,
+                            &self.stream,
+                            cfg,
+                            a,
+                            b,
+                            &sc.d32,
+                            w,
+                            &mut sc.d16,
+                            m,
+                            n,
+                            k,
+                            n,
+                            g.lda,
+                            g.ldb,
+                            ldc,
+                            ta,
+                            tb,
+                            alpha,
+                            beta,
+                            av.0,
+                            av.1,
+                            av.2,
+                            bv.0,
+                            bv.1,
+                            bv.2,
+                            cv.0,
+                            cv.1,
+                            cv.2,
+                            g.count,
+                            kchunk,
+                            0,
+                            0,
+                            0,
+                            1,
+                            bf,
                         ),
                         None => self.gemm_f16.hgemm_f16_mma(
-                            &self.stream, cfg, a, b, &sc.d32, c, &mut sc.d16, m, n, k, n, g.lda, g.ldb, ldc, ta, tb,
-                            alpha, beta, av.0, av.1, av.2, bv.0, bv.1, bv.2, cv.0, cv.1, cv.2, g.count, kchunk, 0, 0, 0, 1, bf,
+                            &self.stream,
+                            cfg,
+                            a,
+                            b,
+                            &sc.d32,
+                            c,
+                            &mut sc.d16,
+                            m,
+                            n,
+                            k,
+                            n,
+                            g.lda,
+                            g.ldb,
+                            ldc,
+                            ta,
+                            tb,
+                            alpha,
+                            beta,
+                            av.0,
+                            av.1,
+                            av.2,
+                            bv.0,
+                            bv.1,
+                            bv.2,
+                            cv.0,
+                            cv.1,
+                            cv.2,
+                            g.count,
+                            kchunk,
+                            0,
+                            0,
+                            0,
+                            1,
+                            bf,
                         ),
                     }
                 };
@@ -514,23 +628,104 @@ impl OxideBackend {
                         self.gemm.gemm_splitk_reduce(
                             &self.stream,
                             launch::elementwise(g.count * mn, ElementwiseLaunchConfig::default()),
-                            &w, c, m, n, g.ldc, g.count, splits, g.alpha, g.beta, g.c.0, g.c.1, g.c.2,
+                            &w,
+                            c,
+                            m,
+                            n,
+                            g.ldc,
+                            g.count,
+                            splits,
+                            g.alpha,
+                            g.beta,
+                            g.c.0,
+                            g.c.1,
+                            g.c.2,
                         )
                     }
                     .map_err(launch_err)?;
                 }
             }
-            HOut::F16 { out: o, bias, bias_stride, bias_mod, act, n_store } => {
+            HOut::F16 {
+                out: o,
+                bias,
+                bias_stride,
+                bias_mod,
+                act,
+                n_store,
+            } => {
                 let r = unsafe {
                     match ws.as_mut() {
                         Some(w) => self.gemm_f16.hgemm_f16_mma(
-                            &self.stream, cfg, a, b, &sc.d32, w, &mut sc.d16, m, n, k, n, g.lda, g.ldb, ldc, ta, tb,
-                            alpha, beta, av.0, av.1, av.2, bv.0, bv.1, bv.2, cv.0, cv.1, cv.2, g.count, kchunk, 0, 0, 0, 1, bf,
+                            &self.stream,
+                            cfg,
+                            a,
+                            b,
+                            &sc.d32,
+                            w,
+                            &mut sc.d16,
+                            m,
+                            n,
+                            k,
+                            n,
+                            g.lda,
+                            g.ldb,
+                            ldc,
+                            ta,
+                            tb,
+                            alpha,
+                            beta,
+                            av.0,
+                            av.1,
+                            av.2,
+                            bv.0,
+                            bv.1,
+                            bv.2,
+                            cv.0,
+                            cv.1,
+                            cv.2,
+                            g.count,
+                            kchunk,
+                            0,
+                            0,
+                            0,
+                            1,
+                            bf,
                         ),
                         None => self.gemm_f16.hgemm_f16_mma(
-                            &self.stream, cfg, a, b, bias, &mut sc.d32, o, m, n, k, n_store, g.lda, g.ldb, ldc, ta, tb,
-                            alpha, beta, av.0, av.1, av.2, bv.0, bv.1, bv.2, cv.0, cv.1, cv.2, g.count, kchunk, 1, act,
-                            bias_stride, bias_mod, 0,
+                            &self.stream,
+                            cfg,
+                            a,
+                            b,
+                            bias,
+                            &mut sc.d32,
+                            o,
+                            m,
+                            n,
+                            k,
+                            n_store,
+                            g.lda,
+                            g.ldb,
+                            ldc,
+                            ta,
+                            tb,
+                            alpha,
+                            beta,
+                            av.0,
+                            av.1,
+                            av.2,
+                            bv.0,
+                            bv.1,
+                            bv.2,
+                            cv.0,
+                            cv.1,
+                            cv.2,
+                            g.count,
+                            kchunk,
+                            1,
+                            act,
+                            bias_stride,
+                            bias_mod,
+                            0,
                         ),
                     }
                 };
@@ -541,8 +736,22 @@ impl OxideBackend {
                         self.gemm_f16.hgemm_splitk_reduce_act16(
                             &self.stream,
                             launch::elementwise(g.count * mn, ElementwiseLaunchConfig::default()),
-                            &w, bias, o, m, n, n_store, g.ldc, g.count, splits, g.alpha, g.c.0, g.c.1, g.c.2, act,
-                            bias_stride, bias_mod,
+                            &w,
+                            bias,
+                            o,
+                            m,
+                            n,
+                            n_store,
+                            g.ldc,
+                            g.count,
+                            splits,
+                            g.alpha,
+                            g.c.0,
+                            g.c.1,
+                            g.c.2,
+                            act,
+                            bias_stride,
+                            bias_mod,
                         )
                     }
                     .map_err(launch_err)?;
@@ -588,11 +797,25 @@ impl OxideBackend {
     ) -> Result<OxideTensorF16, OxideError> {
         const OP: &str = "conv2d_bias_act_f16";
         let bad = |msg: String| OxideError::Shape(format!("{OP}: {msg}"));
-        if c == 0 || h == 0 || w == 0 || f == 0 || k == 0 || sx == 0 || sy == 0 || dil == 0 || groups == 0 {
-            return Err(bad("non-zero channels, size, filters, kernel, stride, dilation and groups required".into()));
+        if c == 0
+            || h == 0
+            || w == 0
+            || f == 0
+            || k == 0
+            || sx == 0
+            || sy == 0
+            || dil == 0
+            || groups == 0
+        {
+            return Err(bad(
+                "non-zero channels, size, filters, kernel, stride, dilation and groups required"
+                    .into(),
+            ));
         }
         if c % groups != 0 || f % groups != 0 {
-            return Err(bad(format!("channels {c} and filters {f} must be divisible by groups {groups}")));
+            return Err(bad(format!(
+                "channels {c} and filters {f} must be divisible by groups {groups}"
+            )));
         }
         if h + 2 * pad < k || w + 2 * pad < k {
             return Err(bad(format!("kernel {k} exceeds padded input")));
@@ -601,11 +824,17 @@ impl OxideBackend {
         let ow = (w + 2 * pad - k) / sx + 1;
         let plane = c * h * w;
         if x.len() % plane != 0 {
-            return Err(bad(format!("input length {} is not a multiple of C*H*W = {plane}", x.len())));
+            return Err(bad(format!(
+                "input length {} is not a multiple of C*H*W = {plane}",
+                x.len()
+            )));
         }
         let batch = x.len() / plane;
         if output_shape != [batch, f, oh, ow] {
-            return Err(bad(format!("output shape must be {:?}, got {output_shape:?}", [batch, f, oh, ow])));
+            return Err(bad(format!(
+                "output shape must be {:?}, got {output_shape:?}",
+                [batch, f, oh, ow]
+            )));
         }
         let (cpg, fpg) = (c / groups, f / groups);
         let kg = cpg * k * k;
@@ -632,8 +861,12 @@ impl OxideBackend {
         // images (bounded by `COL_CAP_BYTES`), so a whole chunk is one im2col
         // launch and one GEMM launch (instances = image x group).
         let img_col = groups * kpad * npad;
-        let chunk = if direct { batch } else { (crate::conv::col_cap_bytes() / 2 / img_col).clamp(1, batch) }
-            .min(crate::conv::chunk_limit());
+        let chunk = if direct {
+            batch
+        } else {
+            (crate::conv::col_cap_bytes() / 2 / img_col).clamp(1, batch)
+        }
+        .min(crate::conv::chunk_limit());
         if !direct {
             let need = chunk * img_col;
             if col_guard.as_ref().is_none_or(|b| b.len() < need) {
@@ -644,7 +877,13 @@ impl OxideBackend {
         while b0 < batch {
             let nb = chunk.min(batch - b0);
             let (b_buf, b_base, b_stride, ldb, n) = if direct {
-                (&*x.buf as &DeviceBuffer<u16>, b0 * plane, kg * ohw, ohw, ohw)
+                (
+                    &*x.buf as &DeviceBuffer<u16>,
+                    b0 * plane,
+                    kg * ohw,
+                    ohw,
+                    ohw,
+                )
             } else {
                 let col = col_guard.as_mut().expect("workspace allocated above");
                 // SAFETY: one thread per column element; `col` holds
@@ -681,7 +920,14 @@ impl OxideBackend {
             self.hgemm(
                 &weights.buf,
                 b_buf,
-                HOut::F16 { out: &mut out, bias: &bias.buf, bias_stride: fpg, bias_mod: groups, act, n_store: ohw },
+                HOut::F16 {
+                    out: &mut out,
+                    bias: &bias.buf,
+                    bias_stride: fpg,
+                    bias_mod: groups,
+                    act,
+                    n_store: ohw,
+                },
                 &GemmArgs {
                     m: fpg,
                     n,
@@ -759,13 +1005,18 @@ impl OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
         if input_shape.len() != 4 || output_shape.len() != 4 || input.shape() != input_shape {
-            return Err(shape_err("connected_f16", format!("expected NCHW input/output, got {input_shape:?} -> {output_shape:?}")));
+            return Err(shape_err(
+                "connected_f16",
+                format!("expected NCHW input/output, got {input_shape:?} -> {output_shape:?}"),
+            ));
         }
         let batch = input_shape[0];
         let inputs = input_shape[1]
             .checked_mul(input_shape[2])
             .and_then(|v| v.checked_mul(input_shape[3]))
-            .ok_or_else(|| shape_err("connected_f16", "input feature count overflows".to_owned()))?;
+            .ok_or_else(|| {
+                shape_err("connected_f16", "input feature count overflows".to_owned())
+            })?;
         let expected_weights = inputs
             .checked_mul(outputs)
             .ok_or_else(|| shape_err("connected_f16", "weight count overflows".to_owned()))?;
@@ -777,7 +1028,14 @@ impl OxideBackend {
             || biases.len() != outputs
             || output_shape != [batch, outputs, 1, 1]
         {
-            return Err(shape_err("connected_f16", format!("incompatible dense dimensions: input={input_shape:?}, output={output_shape:?}, weights={}, biases={}", weights.len(), biases.len())));
+            return Err(shape_err(
+                "connected_f16",
+                format!(
+                    "incompatible dense dimensions: input={input_shape:?}, output={output_shape:?}, weights={}, biases={}",
+                    weights.len(),
+                    biases.len()
+                ),
+            ));
         }
         let mut flat_input = input.clone();
         flat_input.shape = vec![batch, inputs, 1, 1];
@@ -820,7 +1078,15 @@ impl OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
         let (_, out_h, out_w) = pool_layout(
-            "maxpool_f16", x.len(), output_shape, channels, input_height, input_width, size, stride_x, stride_y,
+            "maxpool_f16",
+            x.len(),
+            output_shape,
+            channels,
+            input_height,
+            input_width,
+            size,
+            stride_x,
+            stride_y,
         )?;
         let mut out = self.alloc16_uninit(output_shape.iter().product())?;
         // SAFETY: one thread per output element; reads are bounds-checked.
@@ -861,21 +1127,49 @@ impl OxideBackend {
     ) -> Result<OxideTensorF16, OxideError> {
         let op = "upsample_f16";
         if stride == 0 || channels == 0 || input_height == 0 || input_width == 0 {
-            return Err(shape_err(op, "channels, spatial dims and stride must be > 0".to_owned()));
+            return Err(shape_err(
+                op,
+                "channels, spatial dims and stride must be > 0".to_owned(),
+            ));
         }
         if output_shape.len() != 4 || output_shape[1] != channels {
-            return Err(shape_err(op, format!("output shape {output_shape:?} is not [batch, {channels}, h, w]")));
+            return Err(shape_err(
+                op,
+                format!("output shape {output_shape:?} is not [batch, {channels}, h, w]"),
+            ));
         }
         let (batch, out_h, out_w) = (output_shape[0], output_shape[2], output_shape[3]);
         if x.len() != batch * channels * input_height * input_width {
-            return Err(shape_err(op, format!("input has {} elements, expected {batch}*{channels}*{input_height}*{input_width}", x.len())));
+            return Err(shape_err(
+                op,
+                format!(
+                    "input has {} elements, expected {batch}*{channels}*{input_height}*{input_width}",
+                    x.len()
+                ),
+            ));
         }
         if reverse {
-            if out_h == 0 || out_w == 0 || out_h > input_height.div_ceil(stride) || out_w > input_width.div_ceil(stride) || out_h < input_height / stride || out_w < input_width / stride {
-                return Err(shape_err(op, format!("reverse output {out_h}x{out_w} incompatible with input {input_height}x{input_width} / stride {stride}")));
+            if out_h == 0
+                || out_w == 0
+                || out_h > input_height.div_ceil(stride)
+                || out_w > input_width.div_ceil(stride)
+                || out_h < input_height / stride
+                || out_w < input_width / stride
+            {
+                return Err(shape_err(
+                    op,
+                    format!(
+                        "reverse output {out_h}x{out_w} incompatible with input {input_height}x{input_width} / stride {stride}"
+                    ),
+                ));
             }
         } else if out_h != input_height * stride || out_w != input_width * stride {
-            return Err(shape_err(op, format!("output {out_h}x{out_w} != input {input_height}x{input_width} * stride {stride}")));
+            return Err(shape_err(
+                op,
+                format!(
+                    "output {out_h}x{out_w} != input {input_height}x{input_width} * stride {stride}"
+                ),
+            ));
         }
         let mut out = self.alloc16_uninit(output_shape.iter().product())?;
         // SAFETY: one thread per output element; input reads are in range by
@@ -883,13 +1177,29 @@ impl OxideBackend {
         unsafe {
             if reverse {
                 self.half_ops.upsample_reverse_f16(
-                    &self.stream, launch::elementwise(out.len(), config), &x.buf, &mut out, input_height, input_width,
-                    out_h, out_w, stride, scale,
+                    &self.stream,
+                    launch::elementwise(out.len(), config),
+                    &x.buf,
+                    &mut out,
+                    input_height,
+                    input_width,
+                    out_h,
+                    out_w,
+                    stride,
+                    scale,
                 )
             } else {
                 self.half_ops.upsample_nearest_f16(
-                    &self.stream, launch::elementwise(out.len(), config), &x.buf, &mut out, input_height, input_width,
-                    out_h, out_w, stride, scale,
+                    &self.stream,
+                    launch::elementwise(out.len(), config),
+                    &x.buf,
+                    &mut out,
+                    input_height,
+                    input_width,
+                    out_h,
+                    out_w,
+                    stride,
+                    scale,
                 )
             }
         }
@@ -913,14 +1223,32 @@ impl OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
         let (_, out_h, out_w) = pool_layout(
-            "local_avgpool_f16", x.len(), output_shape, channels, input_height, input_width, size, stride_x, stride_y,
+            "local_avgpool_f16",
+            x.len(),
+            output_shape,
+            channels,
+            input_height,
+            input_width,
+            size,
+            stride_x,
+            stride_y,
         )?;
         let mut out = self.alloc16_uninit(output_shape.iter().product())?;
         // SAFETY: one thread per output element; reads are bounds-checked.
         unsafe {
             self.half_ops.local_avgpool_f16(
-                &self.stream, launch::elementwise(out.len(), config), &x.buf, &mut out, input_height, input_width,
-                out_h, out_w, size, stride_x, stride_y, padding / 2,
+                &self.stream,
+                launch::elementwise(out.len(), config),
+                &x.buf,
+                &mut out,
+                input_height,
+                input_width,
+                out_h,
+                out_w,
+                size,
+                stride_x,
+                stride_y,
+                padding / 2,
             )
         }
         .map_err(launch_err)?;
@@ -939,17 +1267,36 @@ impl OxideBackend {
     ) -> Result<OxideTensorF16, OxideError> {
         let op = "avgpool_f16";
         let area = input_height * input_width;
-        if output_shape.len() != 4 || output_shape[1] != channels || output_shape[2] != 1 || output_shape[3] != 1 {
-            return Err(shape_err(op, format!("output shape {output_shape:?} is not [batch, {channels}, 1, 1]")));
+        if output_shape.len() != 4
+            || output_shape[1] != channels
+            || output_shape[2] != 1
+            || output_shape[3] != 1
+        {
+            return Err(shape_err(
+                op,
+                format!("output shape {output_shape:?} is not [batch, {channels}, 1, 1]"),
+            ));
         }
         let batch = output_shape[0];
         if area == 0 || x.len() != batch * channels * area {
-            return Err(shape_err(op, format!("input has {} elements, expected {batch}*{channels}*{area}", x.len())));
+            return Err(shape_err(
+                op,
+                format!(
+                    "input has {} elements, expected {batch}*{channels}*{area}",
+                    x.len()
+                ),
+            ));
         }
         let mut out = self.alloc16_uninit(batch * channels)?;
         // SAFETY: one thread per (batch, channel) plane, reading `area` elements.
         unsafe {
-            self.half_ops.avgpool_f16(&self.stream, launch::elementwise(out.len(), config), &x.buf, &mut out, area)
+            self.half_ops.avgpool_f16(
+                &self.stream,
+                launch::elementwise(out.len(), config),
+                &x.buf,
+                &mut out,
+                area,
+            )
         }
         .map_err(launch_err)?;
         Ok(OxideTensorF16::new(out, output_shape))
@@ -965,17 +1312,30 @@ impl OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
         let out_len: usize = output_shape.iter().product();
-        if batch == 0 || x.len() % batch != 0 || out_len % batch != 0 || out_len == 0 || x.len() == 0 {
+        if batch == 0
+            || x.len() % batch != 0
+            || out_len % batch != 0
+            || out_len == 0
+            || x.len() == 0
+        {
             return Err(shape_err(
                 "shortcut_fit_f16",
-                format!("batch {batch}, {} source elements and output shape {output_shape:?} are inconsistent", x.len()),
+                format!(
+                    "batch {batch}, {} source elements and output shape {output_shape:?} are inconsistent",
+                    x.len()
+                ),
             ));
         }
         let mut out = self.alloc16_uninit(out_len)?;
         // SAFETY: one thread per output element; reads stay inside `x`.
         unsafe {
             self.half_ops.shortcut_fit_f16(
-                &self.stream, launch::elementwise(out_len, config), &x.buf, &mut out, x.len() / batch, out_len / batch,
+                &self.stream,
+                launch::elementwise(out_len, config),
+                &x.buf,
+                &mut out,
+                x.len() / batch,
+                out_len / batch,
             )
         }
         .map_err(launch_err)?;
@@ -991,13 +1351,21 @@ impl OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
         if a.len() != b.len() {
-            return Err(shape_err("shortcut_add_act_f16", format!("lengths {} and {} differ", a.len(), b.len())));
+            return Err(shape_err(
+                "shortcut_add_act_f16",
+                format!("lengths {} and {} differ", a.len(), b.len()),
+            ));
         }
         let mut out = self.alloc16_uninit(a.len())?;
         // SAFETY: one thread per element.
         unsafe {
             self.half_ops.shortcut_add_act_f16(
-                &self.stream, launch::elementwise(a.len(), config), &a.buf, &b.buf, &mut out, activation_code(activation),
+                &self.stream,
+                launch::elementwise(a.len(), config),
+                &a.buf,
+                &b.buf,
+                &mut out,
+                activation_code(activation),
             )
         }
         .map_err(launch_err)?;
@@ -1019,7 +1387,10 @@ impl OxideBackend {
             || shape[2] == 0
             || shape[3] == 0
         {
-            return Err(shape_err("normalize_channels_f16", format!("expected nonempty NCHW input, got {shape:?}")));
+            return Err(shape_err(
+                "normalize_channels_f16",
+                format!("expected nonempty NCHW input, got {shape:?}"),
+            ));
         }
         let channels = shape[1];
         let spatial = shape[2] * shape[3];
@@ -1071,12 +1442,15 @@ impl OxideBackend {
                 && input_shape[2] == output_shape[2]
                 && input_shape[3] == output_shape[3]
         } else {
-            input_shape[1] == output_shape[1]
-                && input_shape[2] > 0
-                && input_shape[3] > 0
+            input_shape[1] == output_shape[1] && input_shape[2] > 0 && input_shape[3] > 0
         };
         if !valid_shapes || !valid_scale {
-            return Err(shape_err("scale_channels_f16", format!("incompatible input/output shapes {input_shape:?} -> {output_shape:?}, scale_wh={scale_wh}")));
+            return Err(shape_err(
+                "scale_channels_f16",
+                format!(
+                    "incompatible input/output shapes {input_shape:?} -> {output_shape:?}, scale_wh={scale_wh}"
+                ),
+            ));
         }
         let input_spatial = input_shape[2] * input_shape[3];
         let output_spatial = output_shape[2] * output_shape[3];
@@ -1112,7 +1486,10 @@ impl OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
         if input.shape() != output_shape || source.shape() != output_shape {
-            return Err(shape_err("sam_f16", "input, source and output shapes must match".to_owned()));
+            return Err(shape_err(
+                "sam_f16",
+                "input, source and output shapes must match".to_owned(),
+            ));
         }
         let mut output = self.alloc16_uninit(input.len())?;
         // SAFETY: all tensors have the same shape and length; one thread writes
@@ -1149,7 +1526,10 @@ impl OxideBackend {
             || output_shape[2] == 0
             || output_shape[3] == 0
         {
-            return Err(shape_err("channel_shuffle_f16", "incompatible NCHW shape or groups".to_owned()));
+            return Err(shape_err(
+                "channel_shuffle_f16",
+                "incompatible NCHW shape or groups".to_owned(),
+            ));
         }
         let spatial = output_shape[2] * output_shape[3];
         let mut output = self.alloc16_uninit(x.len())?;
@@ -1181,12 +1561,9 @@ impl OxideBackend {
         marker_shape: &[usize],
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
-        let layout = darknet_cuda::host_ops::laya_act::Layout::new(
-            head_shape,
-            scorer_shape,
-            marker_shape,
-        )
-        .map_err(|err| shape_err("laya_act_features_f16", err))?;
+        let layout =
+            darknet_cuda::host_ops::laya_act::Layout::new(head_shape, scorer_shape, marker_shape)
+                .map_err(|err| shape_err("laya_act_features_f16", err))?;
         if head.shape() != head_shape
             || scorer.shape() != scorer_shape
             || marker.shape() != marker_shape
@@ -1261,11 +1638,17 @@ impl OxideBackend {
             || x.len() != shape.iter().product::<usize>()
             || groups == 0
         {
-            return Err(shape_err("softmax_f16", format!("incompatible shape {shape:?} or groups={groups}")));
+            return Err(shape_err(
+                "softmax_f16",
+                format!("incompatible shape {shape:?} or groups={groups}"),
+            ));
         }
         let per_batch = shape[1] * shape[2] * shape[3];
         if per_batch == 0 || per_batch % groups != 0 {
-            return Err(shape_err("softmax_f16", format!("per-sample size {per_batch} is not divisible by groups {groups}")));
+            return Err(shape_err(
+                "softmax_f16",
+                format!("per-sample size {per_batch} is not divisible by groups {groups}"),
+            ));
         }
         let group_size = per_batch / groups;
         let n_groups = shape[0] * groups;
@@ -1348,7 +1731,12 @@ impl OxideBackend {
             || shape[2] == 0
             || shape[3] == 0
         {
-            return Err(shape_err("region_forward_f16", format!("incompatible shape/parameters: {shape:?}, anchors={anchors}, entries={entries}, classes={classes}")));
+            return Err(shape_err(
+                "region_forward_f16",
+                format!(
+                    "incompatible shape/parameters: {shape:?}, anchors={anchors}, entries={entries}, classes={classes}"
+                ),
+            ));
         }
         let spatial = shape[2] * shape[3];
         let groups = shape[0] * spatial * anchors;
@@ -1391,7 +1779,14 @@ impl OxideBackend {
             (dims.small_len(), dims.big_len())
         };
         if x.shape() != input_shape || x.len() != expected_input {
-            return Err(shape_err("reorg_f16", format!("input has shape {:?} and {} elements, expected {input_shape:?} and {expected_input}", x.shape(), x.len())));
+            return Err(shape_err(
+                "reorg_f16",
+                format!(
+                    "input has shape {:?} and {} elements, expected {input_shape:?} and {expected_input}",
+                    x.shape(),
+                    x.len()
+                ),
+            ));
         }
         let mut output = self.alloc16_uninit(output_len)?;
         // SAFETY: shared reorg_dims validation establishes all bounds; each
@@ -1443,18 +1838,35 @@ impl OxideBackend {
     ) -> Result<OxideTensorF16, OxideError> {
         let op = "channel_affine_act_f16";
         if channels == 0 || channel_stride == 0 || x.len() % (channels * channel_stride) != 0 {
-            return Err(shape_err(op, format!("length {} not divisible by {channels} x {channel_stride}", x.len())));
+            return Err(shape_err(
+                op,
+                format!(
+                    "length {} not divisible by {channels} x {channel_stride}",
+                    x.len()
+                ),
+            ));
         }
         if bias.len() != channels || scale.is_some_and(|s| s.len() != channels) {
-            return Err(shape_err(op, format!("per-channel tensors must hold {channels} elements")));
+            return Err(shape_err(
+                op,
+                format!("per-channel tensors must hold {channels} elements"),
+            ));
         }
         let mut out = self.alloc16_uninit(x.len())?;
         let s = scale.unwrap_or(bias);
         // SAFETY: one thread per element; per-channel indices are in range by the checks above.
         unsafe {
             self.half_ops.channel_affine_act_f16(
-                &self.stream, launch::elementwise(x.len(), config), &x.buf, &s.buf, &bias.buf, &mut out, channels,
-                channel_stride, scale.is_some() as u32, activation_code(activation),
+                &self.stream,
+                launch::elementwise(x.len(), config),
+                &x.buf,
+                &s.buf,
+                &bias.buf,
+                &mut out,
+                channels,
+                channel_stride,
+                scale.is_some() as u32,
+                activation_code(activation),
             )
         }
         .map_err(launch_err)?;
@@ -1538,27 +1950,47 @@ impl OxideBackend {
             || input_total_channels.len() != n
             || channel_stride == 0
         {
-            return Err(shape_err(op, "needs >= 1 input, equal-length metadata and channel_stride > 0".to_owned()));
+            return Err(shape_err(
+                op,
+                "needs >= 1 input, equal-length metadata and channel_stride > 0".to_owned(),
+            ));
         }
         let out_total: usize = input_channels.iter().sum();
         let out_len: usize = output_shape.iter().product();
         let mut batch = None;
         for k in 0..n {
-            if input_channels[k] == 0 || input_channel_offsets[k] + input_channels[k] > input_total_channels[k] {
-                return Err(shape_err(op, format!("input {k}: slice outside its channels")));
+            if input_channels[k] == 0
+                || input_channel_offsets[k] + input_channels[k] > input_total_channels[k]
+            {
+                return Err(shape_err(
+                    op,
+                    format!("input {k}: slice outside its channels"),
+                ));
             }
             let per_batch = input_total_channels[k] * channel_stride;
             if inputs[k].len() == 0 || inputs[k].len() % per_batch != 0 {
-                return Err(shape_err(op, format!("input {k} length {} not a multiple of {per_batch}", inputs[k].len())));
+                return Err(shape_err(
+                    op,
+                    format!(
+                        "input {k} length {} not a multiple of {per_batch}",
+                        inputs[k].len()
+                    ),
+                ));
             }
             let b = inputs[k].len() / per_batch;
             if *batch.get_or_insert(b) != b {
-                return Err(shape_err(op, format!("input {k} batch {b} differs from {batch:?}")));
+                return Err(shape_err(
+                    op,
+                    format!("input {k} batch {b} differs from {batch:?}"),
+                ));
             }
         }
         let batch = batch.unwrap_or(0);
         if out_len != batch * out_total * channel_stride {
-            return Err(shape_err(op, format!("output shape {output_shape:?} does not match the inputs")));
+            return Err(shape_err(
+                op,
+                format!("output shape {output_shape:?} does not match the inputs"),
+            ));
         }
         let mut out = self.alloc16_uninit(out_len)?;
         let mut dst_offset = 0usize;
@@ -1591,12 +2023,26 @@ impl OxideBackend {
     /// are padded up to multiples of 8 exactly like the conv path does (so the
     /// 16-byte `cp.async` path runs; unaligned shapes take the slow element
     /// loop), which makes the timed problem slightly larger than `m x n x k`.
-    pub fn bench_gemm_f16(&self, m: usize, n: usize, k: usize, iters: usize) -> Result<f64, OxideError> {
+    pub fn bench_gemm_f16(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        iters: usize,
+    ) -> Result<f64, OxideError> {
         let (n, k) = (n.next_multiple_of(8), k.next_multiple_of(8));
         let a = self.upload_f16_bits(&[m, k], &vec![0x3c00; m * k])?;
         let b = self.upload_f16_bits(&[k, n], &vec![0x3c00; k * n])?;
         let mut c = self.alloc_uninit(m * n)?;
-        let g = GemmArgs { m, n, k, lda: k, ldb: n, ldc: n, ..GemmArgs::default() };
+        let g = GemmArgs {
+            m,
+            n,
+            k,
+            lda: k,
+            ldb: n,
+            ldc: n,
+            ..GemmArgs::default()
+        };
         self.time_gpu_ms(iters, || self.hgemm(&a.buf, &b.buf, HOut::F32(&mut c), &g))
     }
 
@@ -1656,8 +2102,23 @@ impl darknet_cuda::F16TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error> {
         OxideBackend::conv2d_bias_act_f16(
-            self, x, weights, bias, output_shape, channels, input_height, input_width, filters, size, stride_x,
-            stride_y, dilation, padding, groups, activation, config,
+            self,
+            x,
+            weights,
+            bias,
+            output_shape,
+            channels,
+            input_height,
+            input_width,
+            filters,
+            size,
+            stride_x,
+            stride_y,
+            dilation,
+            padding,
+            groups,
+            activation,
+            config,
         )
     }
 
@@ -1708,7 +2169,17 @@ impl darknet_cuda::F16TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error> {
         OxideBackend::maxpool_f16(
-            self, x, output_shape, channels, input_height, input_width, size, stride_x, stride_y, padding, config,
+            self,
+            x,
+            output_shape,
+            channels,
+            input_height,
+            input_width,
+            size,
+            stride_x,
+            stride_y,
+            padding,
+            config,
         )
     }
 
@@ -1735,7 +2206,16 @@ impl darknet_cuda::F16TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error> {
         OxideBackend::upsample_f16(
-            self, x, output_shape, channels, input_height, input_width, stride, scale, reverse, config,
+            self,
+            x,
+            output_shape,
+            channels,
+            input_height,
+            input_width,
+            stride,
+            scale,
+            reverse,
+            config,
         )
     }
 
@@ -1792,7 +2272,13 @@ impl darknet_cuda::F16TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error> {
         OxideBackend::route_concat_f16(
-            self, inputs, input_channel_offsets, input_channels, input_total_channels, output_shape, channel_stride,
+            self,
+            inputs,
+            input_channel_offsets,
+            input_channels,
+            input_total_channels,
+            output_shape,
+            channel_stride,
             config,
         )
     }
@@ -1811,7 +2297,17 @@ impl darknet_cuda::F16TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error> {
         OxideBackend::local_avgpool_f16(
-            self, x, output_shape, channels, input_height, input_width, size, stride_x, stride_y, padding, config,
+            self,
+            x,
+            output_shape,
+            channels,
+            input_height,
+            input_width,
+            size,
+            stride_x,
+            stride_y,
+            padding,
+            config,
         )
     }
 
@@ -1824,7 +2320,15 @@ impl darknet_cuda::F16TensorOpsBackend for OxideBackend {
         input_width: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error> {
-        OxideBackend::avgpool_f16(self, x, output_shape, channels, input_height, input_width, config)
+        OxideBackend::avgpool_f16(
+            self,
+            x,
+            output_shape,
+            channels,
+            input_height,
+            input_width,
+            config,
+        )
     }
 
     fn shortcut_fit_f16(
@@ -1956,6 +2460,15 @@ impl darknet_cuda::F16TensorOpsBackend for OxideBackend {
         activation: F32ActivationKind,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error> {
-        OxideBackend::channel_affine_act_f16(self, x, scale, bias, channels, channel_stride, activation, config)
+        OxideBackend::channel_affine_act_f16(
+            self,
+            x,
+            scale,
+            bias,
+            channels,
+            channel_stride,
+            activation,
+            config,
+        )
     }
 }

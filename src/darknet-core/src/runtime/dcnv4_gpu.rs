@@ -253,36 +253,79 @@ where
 }
 
 pub(super) fn activation_output<B: F32TensorOpsBackend>(
-    backend: &B, pre: &B::Tensor, layer: &Layer, spec: &Dcnv4Spec,
-) -> Result<B::Tensor> where B::Error: std::fmt::Display {
-    let cfg=ElementwiseLaunchConfig::default();
-    if let Some(norm)=spec.activation.to_channel_normalization() {
-        let s=layer.output_shape;
-        backend.normalize_channels_f32(pre,&tensor_backend_shape(s),s.batch,s.channels,
-            s.height*s.width,norm,cfg)
-            .map_err(|err| backend_error("DCNv4 channel normalization",err))
+    backend: &B,
+    pre: &B::Tensor,
+    layer: &Layer,
+    spec: &Dcnv4Spec,
+) -> Result<B::Tensor>
+where
+    B::Error: std::fmt::Display,
+{
+    let cfg = ElementwiseLaunchConfig::default();
+    if let Some(norm) = spec.activation.to_channel_normalization() {
+        let s = layer.output_shape;
+        backend
+            .normalize_channels_f32(
+                pre,
+                &tensor_backend_shape(s),
+                s.batch,
+                s.channels,
+                s.height * s.width,
+                norm,
+                cfg,
+            )
+            .map_err(|err| backend_error("DCNv4 channel normalization", err))
     } else {
-        backend.activation_f32(pre,gpu_activation_kind(layer.index,&spec.activation)?,cfg)
-            .map_err(|err| backend_error("DCNv4 activation",err))
+        backend
+            .activation_f32(
+                pre,
+                gpu_activation_kind(layer.index, &spec.activation)?,
+                cfg,
+            )
+            .map_err(|err| backend_error("DCNv4 activation", err))
     }
 }
 
 /// Explicit mode supports testing without mutating process-wide environment.
 /// Channel output recomputes on device from this forward's preactivation.
 pub(super) fn activation_delta<B: F32TensorOpsBackend>(
-    backend: &B, pre: &B::Tensor, seed: &B::Tensor, layer: &Layer, spec: &Dcnv4Spec,
+    backend: &B,
+    pre: &B::Tensor,
+    seed: &B::Tensor,
+    layer: &Layer,
+    spec: &Dcnv4Spec,
     mode: GradMode,
-) -> Result<B::Tensor> where B::Error: std::fmt::Display {
-    let cfg=ElementwiseLaunchConfig::default();
-    if let Some(norm)=spec.activation.to_channel_normalization() {
-        let s=layer.output_shape;
-        let output=activation_output(backend,pre,layer,spec)?;
-        backend.normalize_channels_backward_f32(pre,&output,seed,&tensor_backend_shape(s),
-            s.batch,s.channels,s.height*s.width,norm,mode==GradMode::Cpp,cfg)
-            .map_err(|err| backend_error("DCNv4 channel-normalization adjoint",err))
+) -> Result<B::Tensor>
+where
+    B::Error: std::fmt::Display,
+{
+    let cfg = ElementwiseLaunchConfig::default();
+    if let Some(norm) = spec.activation.to_channel_normalization() {
+        let s = layer.output_shape;
+        let output = activation_output(backend, pre, layer, spec)?;
+        backend
+            .normalize_channels_backward_f32(
+                pre,
+                &output,
+                seed,
+                &tensor_backend_shape(s),
+                s.batch,
+                s.channels,
+                s.height * s.width,
+                norm,
+                mode == GradMode::Cpp,
+                cfg,
+            )
+            .map_err(|err| backend_error("DCNv4 channel-normalization adjoint", err))
     } else {
-        backend.activation_backward_f32(pre,seed,gpu_activation_kind(layer.index,&spec.activation)?,cfg)
-            .map_err(|err| backend_error("DCNv4 activation backward",err))
+        backend
+            .activation_backward_f32(
+                pre,
+                seed,
+                gpu_activation_kind(layer.index, &spec.activation)?,
+                cfg,
+            )
+            .map_err(|err| backend_error("DCNv4 activation backward", err))
     }
 }
 
@@ -388,9 +431,24 @@ where
         // The backend may retain multidimensional gradient layouts. Seed the
         // accumulator with an exact-layout device copy instead of the flat
         // zero allocation used for clean buffers.
-        let weights = add("DCNv4 offset-weight gradient initialization", 0.0, &grad.weights, &grad.weights)?;
-        let offset_biases = add("DCNv4 offset-bias gradient initialization", 0.0, &grad.offset_biases, &grad.offset_biases)?;
-        let biases = add("DCNv4 bias gradient initialization", 0.0, &grad.biases, &grad.biases)?;
+        let weights = add(
+            "DCNv4 offset-weight gradient initialization",
+            0.0,
+            &grad.weights,
+            &grad.weights,
+        )?;
+        let offset_biases = add(
+            "DCNv4 offset-bias gradient initialization",
+            0.0,
+            &grad.offset_biases,
+            &grad.offset_biases,
+        )?;
+        let biases = add(
+            "DCNv4 bias gradient initialization",
+            0.0,
+            &grad.biases,
+            &grad.biases,
+        )?;
         let scales = grad
             .scales
             .as_ref()
@@ -405,11 +463,31 @@ where
     }
     // Stage results first so a backend failure cannot partially mutate the
     // accumulated gradients. The dummy parameter block remains excluded.
-    let weights = add("DCNv4 offset-weight gradient accumulation", 1.0, &grad.weights, &train.offset_weight_updates)?;
-    let offset_biases = add("DCNv4 offset-bias gradient accumulation", 1.0, &grad.offset_biases, &train.offset_bias_updates)?;
-    let biases = add("DCNv4 bias gradient accumulation", 1.0, &grad.biases, &train.bias_updates)?;
+    let weights = add(
+        "DCNv4 offset-weight gradient accumulation",
+        1.0,
+        &grad.weights,
+        &train.offset_weight_updates,
+    )?;
+    let offset_biases = add(
+        "DCNv4 offset-bias gradient accumulation",
+        1.0,
+        &grad.offset_biases,
+        &train.offset_bias_updates,
+    )?;
+    let biases = add(
+        "DCNv4 bias gradient accumulation",
+        1.0,
+        &grad.biases,
+        &train.bias_updates,
+    )?;
     let scales = match (&grad.scales, &train.scale_updates) {
-        (Some(gradient), Some(updates)) => Some(add("DCNv4 scale gradient accumulation", 1.0, gradient, updates)?),
+        (Some(gradient), Some(updates)) => Some(add(
+            "DCNv4 scale gradient accumulation",
+            1.0,
+            gradient,
+            updates,
+        )?),
         (None, None) => None,
         _ => unreachable!("validated DCNv4 scale-gradient metadata"),
     };
@@ -486,13 +564,7 @@ where
             };
             let device_params = {
                 let mut caches = self.dcnv4_device_params.borrow_mut();
-                device_parameters(
-                    &self.backend,
-                    &mut caches[layer.index],
-                    layer,
-                    spec,
-                    params,
-                )?
+                device_parameters(&self.backend, &mut caches[layer.index], layer, spec, params)?
             };
             let (raw, _) = self
                 .backend
