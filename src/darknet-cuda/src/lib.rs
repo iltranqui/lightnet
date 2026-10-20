@@ -67,6 +67,19 @@ pub enum F32ChannelNormalization {
     SoftmaxMaxval,
 }
 
+/// Gradients from the full FoveationFilm projection backward operation.
+#[derive(Clone, Debug)]
+pub struct FoveationFilmGradients<T> {
+    pub input: T,
+    pub hf_params: T,
+    pub w_embed: T,
+    pub b_embed: T,
+    pub w_gamma: T,
+    pub b_gamma: T,
+    pub w_beta: T,
+    pub b_beta: T,
+}
+
 /// Outputs of [`F32TensorOpsBackend::batchnorm_train_forward_f32`].
 #[derive(Clone, Debug)]
 pub struct BatchNormTrainForward<T> {
@@ -2746,6 +2759,49 @@ pub trait F32TensorOpsBackend {
             self.upload_f32(&[batch, channels], &gamma)?,
             self.upload_f32(&[batch, channels], &beta)?,
         ))
+    }
+    /// Full FiLM projection adjoint, including the optional HF-source vector.
+    #[allow(clippy::too_many_arguments)]
+    fn foveation_film_backward_f32(
+        &self,
+        input: &Self::Tensor,
+        output_gradient: &Self::Tensor,
+        hf_params: &Self::Tensor,
+        embedding: &Self::Tensor,
+        gamma: &Self::Tensor,
+        w_embed: &Self::Tensor,
+        w_gamma: &Self::Tensor,
+        w_beta: &Self::Tensor,
+        shape: &[usize],
+        param_count: usize,
+        embed_dim: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<FoveationFilmGradients<Self::Tensor>, Self::Error> {
+        let _ = config;
+        assert!(shape.len() == 4, "foveation_film_backward_f32: shape must be NCHW");
+        let (batch, channels, height, width) = (shape[0], shape[1], shape[2], shape[3]);
+        let x = self.download_f32(input)?;
+        let dy = self.download_f32(output_gradient)?;
+        let hf = self.download_f32(hf_params)?;
+        let embed = self.download_f32(embedding)?;
+        let g = self.download_f32(gamma)?;
+        let we = self.download_f32(w_embed)?;
+        let wg = self.download_f32(w_gamma)?;
+        let wb = self.download_f32(w_beta)?;
+        let grads = host_ops::foveation_film::backward(
+            &x, &dy, &hf, &embed, &g, batch, channels, height, width,
+            param_count, embed_dim, &we, &wg, &wb,
+        );
+        Ok(FoveationFilmGradients {
+            input: self.upload_f32(shape, &grads.input)?,
+            hf_params: self.upload_f32(&[batch, param_count], &grads.hf_params)?,
+            w_embed: self.upload_f32(&[embed_dim, param_count], &grads.w_embed)?,
+            b_embed: self.upload_f32(&[embed_dim], &grads.b_embed)?,
+            w_gamma: self.upload_f32(&[channels, embed_dim], &grads.w_gamma)?,
+            b_gamma: self.upload_f32(&[channels], &grads.b_gamma)?,
+            w_beta: self.upload_f32(&[channels, embed_dim], &grads.w_beta)?,
+            b_beta: self.upload_f32(&[channels], &grads.b_beta)?,
+        })
     }
     /// Exact adjoint of [`Self::foveation_film_affine_f32`], returning
     /// `(d_input, d_gamma, d_beta)` with the latter two `[batch, channels]`.

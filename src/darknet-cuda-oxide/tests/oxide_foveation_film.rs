@@ -30,7 +30,7 @@ fn foveation_film_forward_projection_composes_native_linear_and_affine() {
     let input: Vec<f32> = (0..shape.iter().product::<usize>())
         .map(|i| (i as f32 * 0.23).sin())
         .collect();
-    let hf = vec![0.7, -0.2, -0.4, 0.9];
+    let hf_values = vec![0.7, -0.2, -0.4, 0.9];
     let w_embed = vec![0.4, -0.1, -0.2, 0.3, 0.15, 0.7];
     let b_embed = vec![0.1, -0.05, 0.2];
     let w_gamma = vec![0.2, -0.1, 0.4, -0.3, 0.25, 0.1, 0.05, 0.2, -0.15];
@@ -38,7 +38,9 @@ fn foveation_film_forward_projection_composes_native_linear_and_affine() {
     let w_beta = vec![-0.1, 0.3, 0.2, 0.15, -0.2, 0.35, 0.4, 0.05, -0.25];
     let b_beta = vec![-0.02, 0.06, 0.03];
     let x = backend.upload_f32(&shape, &input).unwrap();
-    let hf = backend.upload_f32(&[batch, param_count], &hf).unwrap();
+    let hf = backend
+        .upload_f32(&[batch, param_count], &hf_values)
+        .unwrap();
     let w_embed_t = backend
         .upload_f32(&[embed_dim, param_count], &w_embed)
         .unwrap();
@@ -68,7 +70,7 @@ fn foveation_film_forward_projection_composes_native_linear_and_affine() {
         .unwrap();
     let (expected, expected_embedding, expected_gamma, expected_beta) = foveation_film::forward(
         &input,
-        &[0.7, -0.2, -0.4, 0.9],
+        &hf_values,
         batch,
         channels,
         shape[2],
@@ -106,6 +108,87 @@ fn foveation_film_forward_projection_composes_native_linear_and_affine() {
         2e-6,
         "beta",
     );
+
+    let seed: Vec<f32> = (0..input.len())
+        .map(|i| (i as f32 * 0.19).cos() * 0.25)
+        .collect();
+    let dy = backend.upload_f32(&shape, &seed).unwrap();
+    let gradients = backend
+        .foveation_film_backward_f32(
+            &x,
+            &dy,
+            &hf,
+            &embedding,
+            &gamma,
+            &w_embed_t,
+            &w_gamma_t,
+            &w_beta_t,
+            &shape,
+            param_count,
+            embed_dim,
+            ElementwiseLaunchConfig::default(),
+        )
+        .unwrap();
+    let expected_gradients = foveation_film::backward(
+        &input,
+        &seed,
+        &hf_values,
+        &expected_embedding,
+        &expected_gamma,
+        batch,
+        channels,
+        shape[2],
+        shape[3],
+        param_count,
+        embed_dim,
+        &w_embed,
+        &w_gamma,
+        &w_beta,
+    );
+    for (name, actual, expected) in [
+        (
+            "input gradient",
+            &gradients.input,
+            &expected_gradients.input,
+        ),
+        (
+            "HF gradient",
+            &gradients.hf_params,
+            &expected_gradients.hf_params,
+        ),
+        (
+            "embedding weight gradient",
+            &gradients.w_embed,
+            &expected_gradients.w_embed,
+        ),
+        (
+            "embedding bias gradient",
+            &gradients.b_embed,
+            &expected_gradients.b_embed,
+        ),
+        (
+            "gamma weight gradient",
+            &gradients.w_gamma,
+            &expected_gradients.w_gamma,
+        ),
+        (
+            "gamma bias gradient",
+            &gradients.b_gamma,
+            &expected_gradients.b_gamma,
+        ),
+        (
+            "beta weight gradient",
+            &gradients.w_beta,
+            &expected_gradients.w_beta,
+        ),
+        (
+            "beta bias gradient",
+            &gradients.b_beta,
+            &expected_gradients.b_beta,
+        ),
+    ] {
+        close(&backend.download_f32(actual).unwrap(), expected, 3e-5, name);
+    }
 }
 
 #[test]

@@ -80,6 +80,111 @@ pub fn affine(input: &[f32], gamma: &[f32], beta: &[f32], shape: &[usize]) -> Ve
     output
 }
 
+/// Gradients of the full FiLM projection, including the optional source input.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Gradients {
+    pub input: Vec<f32>,
+    pub hf_params: Vec<f32>,
+    pub w_embed: Vec<f32>,
+    pub b_embed: Vec<f32>,
+    pub w_gamma: Vec<f32>,
+    pub b_gamma: Vec<f32>,
+    pub w_beta: Vec<f32>,
+    pub b_beta: Vec<f32>,
+}
+
+/// Exact adjoint of [`forward`] for the piecewise-linear ReLU branch.
+#[allow(clippy::too_many_arguments)]
+pub fn backward(
+    input: &[f32],
+    output_gradient: &[f32],
+    hf_params: &[f32],
+    embedding: &[f32],
+    gamma: &[f32],
+    batch: usize,
+    channels: usize,
+    height: usize,
+    width: usize,
+    param_count: usize,
+    embed_dim: usize,
+    w_embed: &[f32],
+    w_gamma: &[f32],
+    w_beta: &[f32],
+) -> Gradients {
+    let spatial = height * width;
+    assert!(batch > 0 && channels > 0 && spatial > 0);
+    assert!(param_count > 0 && embed_dim > 0);
+    assert_eq!(input.len(), batch * channels * spatial);
+    assert_eq!(output_gradient.len(), input.len());
+    assert_eq!(hf_params.len(), batch * param_count);
+    assert_eq!(embedding.len(), batch * embed_dim);
+    assert_eq!(gamma.len(), batch * channels);
+    assert_eq!(w_embed.len(), embed_dim * param_count);
+    assert_eq!(w_gamma.len(), channels * embed_dim);
+    assert_eq!(w_beta.len(), channels * embed_dim);
+
+    let (input_gradient, gamma_gradient, beta_gradient) = affine_backward(
+        input,
+        output_gradient,
+        gamma,
+        &[batch, channels, height, width],
+    );
+    let mut embedding_gradient = vec![0.0; batch * embed_dim];
+    for b in 0..batch {
+        for c in 0..channels {
+            for j in 0..embed_dim {
+                let dg = gamma_gradient[b * channels + c];
+                let db = beta_gradient[b * channels + c];
+                embedding_gradient[b * embed_dim + j] +=
+                    dg * w_gamma[c * embed_dim + j] + db * w_beta[c * embed_dim + j];
+            }
+        }
+        for j in 0..embed_dim {
+            if embedding[b * embed_dim + j] <= 0.0 {
+                embedding_gradient[b * embed_dim + j] = 0.0;
+            }
+        }
+    }
+
+    let mut gradients = Gradients {
+        input: input_gradient,
+        hf_params: vec![0.0; batch * param_count],
+        w_embed: vec![0.0; embed_dim * param_count],
+        b_embed: vec![0.0; embed_dim],
+        w_gamma: vec![0.0; channels * embed_dim],
+        b_gamma: vec![0.0; channels],
+        w_beta: vec![0.0; channels * embed_dim],
+        b_beta: vec![0.0; channels],
+    };
+    for c in 0..channels {
+        for j in 0..embed_dim {
+            let mut dgamma_weight = 0.0;
+            let mut dbeta_weight = 0.0;
+            for b in 0..batch {
+                dgamma_weight += gamma_gradient[b * channels + c] * embedding[b * embed_dim + j];
+                dbeta_weight += beta_gradient[b * channels + c] * embedding[b * embed_dim + j];
+            }
+            gradients.w_gamma[c * embed_dim + j] = dgamma_weight;
+            gradients.w_beta[c * embed_dim + j] = dbeta_weight;
+        }
+        for b in 0..batch {
+            gradients.b_gamma[c] += gamma_gradient[b * channels + c];
+            gradients.b_beta[c] += beta_gradient[b * channels + c];
+        }
+    }
+    for j in 0..embed_dim {
+        for b in 0..batch {
+            let de = embedding_gradient[b * embed_dim + j];
+            gradients.b_embed[j] += de;
+            for i in 0..param_count {
+                gradients.w_embed[j * param_count + i] += de * hf_params[b * param_count + i];
+                gradients.hf_params[b * param_count + i] += de * w_embed[j * param_count + i];
+            }
+        }
+    }
+    gradients
+}
+
 /// Exact adjoint of [`affine`]. Returns `(d_input, d_gamma, d_beta)`.
 pub fn affine_backward(
     input: &[f32],

@@ -22,6 +22,7 @@ use cuda_core::simt::LaunchConfig;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DriverError};
 use darknet_cuda::{
     AdamParams, AdamUpdateItem, BatchNormTrainForward, BilinearGatherGeometry,
+    FoveationFilmGradients,
     ElementwiseLaunchConfig, F32ActivationKind, F32ChannelNormalization,
     F32ShortcutWeightNormalization, F32TensorOpsBackend, NanInfMode, SgdUpdateItem,
 };
@@ -8292,6 +8293,157 @@ impl F32TensorOpsBackend for OxideBackend {
         }
         .map_err(launch_err)?;
         Ok(OxideTensorF32::new(output, shape))
+    }
+
+    fn foveation_film_backward_f32(
+        &self,
+        input: &Self::Tensor,
+        output_gradient: &Self::Tensor,
+        hf_params: &Self::Tensor,
+        embedding: &Self::Tensor,
+        gamma: &Self::Tensor,
+        w_embed: &Self::Tensor,
+        w_gamma: &Self::Tensor,
+        w_beta: &Self::Tensor,
+        shape: &[usize],
+        param_count: usize,
+        embed_dim: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<FoveationFilmGradients<Self::Tensor>, Self::Error> {
+        if shape.len() != 4 || shape.iter().any(|&dim| dim == 0) {
+            return Err(OxideError::Shape(format!(
+                "foveation_film_backward_f32: expected non-empty NCHW shape, got {shape:?}"
+            )));
+        }
+        if param_count == 0 || embed_dim == 0 {
+            return Err(OxideError::Shape(
+                "foveation_film_backward_f32: param_count and embed_dim must be positive".to_owned(),
+            ));
+        }
+        let (batch, channels, height, width) = (shape[0], shape[1], shape[2], shape[3]);
+        let spatial = height.checked_mul(width).ok_or_else(|| {
+            OxideError::Shape("foveation_film_backward_f32: spatial extent overflows".to_owned())
+        })?;
+        let channel_count = batch.checked_mul(channels).ok_or_else(|| {
+            OxideError::Shape("foveation_film_backward_f32: channel extent overflows".to_owned())
+        })?;
+        let input_count = channel_count.checked_mul(spatial).ok_or_else(|| {
+            OxideError::Shape("foveation_film_backward_f32: input extent overflows".to_owned())
+        })?;
+        let embed_count = batch.checked_mul(embed_dim).ok_or_else(|| {
+            OxideError::Shape("foveation_film_backward_f32: embedding extent overflows".to_owned())
+        })?;
+        let hf_count = batch.checked_mul(param_count).ok_or_else(|| {
+            OxideError::Shape("foveation_film_backward_f32: HF extent overflows".to_owned())
+        })?;
+        let embed_weights_count = embed_dim.checked_mul(param_count).ok_or_else(|| {
+            OxideError::Shape("foveation_film_backward_f32: embedding weight extent overflows".to_owned())
+        })?;
+        let channel_weights_count = channels.checked_mul(embed_dim).ok_or_else(|| {
+            OxideError::Shape("foveation_film_backward_f32: channel weight extent overflows".to_owned())
+        })?;
+        let input = self.f32v(input)?;
+        let input = &*input;
+        let hf_params = self.f32v(hf_params)?;
+        let hf_params = &*hf_params;
+        let embedding = self.f32v(embedding)?;
+        let embedding = &*embedding;
+        let w_embed = self.f32v(w_embed)?;
+        let w_embed = &*w_embed;
+        let w_gamma = self.f32v(w_gamma)?;
+        let w_gamma = &*w_gamma;
+        let w_beta = self.f32v(w_beta)?;
+        let w_beta = &*w_beta;
+        if input.len() != input_count
+            || hf_params.len() != hf_count
+            || embedding.len() != embed_count
+            || w_embed.len() != embed_weights_count
+            || w_gamma.len() != channel_weights_count
+            || w_beta.len() != channel_weights_count
+        {
+            return Err(OxideError::Shape(
+                "foveation_film_backward_f32: operand extents do not match configured layouts".to_owned(),
+            ));
+        }
+        let (dx, dgamma, dbeta) = self.foveation_film_affine_backward_f32(
+            input,
+            output_gradient,
+            gamma,
+            shape,
+            config,
+        )?;
+        let dgamma_f = self.f32v(&dgamma)?;
+        let dgamma_f = &*dgamma_f;
+        let dbeta_f = self.f32v(&dbeta)?;
+        let dbeta_f = &*dbeta_f;
+        let mut d_embedding = self.alloc_uninit(embed_count)?;
+        // Every embedding-gradient element is written by one thread.
+        unsafe {
+            self.foveation_film.film_embedding_backward(
+                &self.stream,
+                launch::elementwise(embed_count, config),
+                &embedding.buf,
+                &dgamma_f.buf,
+                &dbeta_f.buf,
+                &w_gamma.buf,
+                &w_beta.buf,
+                &mut d_embedding,
+                channels,
+                embed_dim,
+            )
+        }
+        .map_err(launch_err)?;
+
+        let dw_embed_count = embed_weights_count;
+        let dw_channel_count = channel_weights_count;
+        let target_count = dw_embed_count
+            .max(embed_dim)
+            .max(dw_channel_count)
+            .max(channels)
+            .max(hf_count);
+        let mut dw_embed = self.alloc_uninit(dw_embed_count)?;
+        let mut db_embed = self.alloc_uninit(embed_dim)?;
+        let mut dw_gamma = self.alloc_uninit(dw_channel_count)?;
+        let mut db_gamma = self.alloc_uninit(channels)?;
+        let mut dw_beta = self.alloc_uninit(dw_channel_count)?;
+        let mut db_beta = self.alloc_uninit(channels)?;
+        let mut dhf = self.alloc_uninit(hf_count)?;
+        // Every output element is owned by a single thread; reductions run in
+        // a fixed order over the batch or embedding axes.
+        unsafe {
+            self.foveation_film.film_projection_backward(
+                &self.stream,
+                launch::elementwise(target_count, config),
+                &hf_params.buf,
+                &embedding.buf,
+                &dgamma_f.buf,
+                &dbeta_f.buf,
+                &d_embedding,
+                &w_embed.buf,
+                &mut dw_embed,
+                &mut db_embed,
+                &mut dw_gamma,
+                &mut db_gamma,
+                &mut dw_beta,
+                &mut db_beta,
+                &mut dhf,
+                batch,
+                channels,
+                param_count,
+                embed_dim,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(FoveationFilmGradients {
+            input: dx,
+            hf_params: OxideTensorF32::new(dhf, &[batch, param_count]),
+            w_embed: OxideTensorF32::new(dw_embed, &[embed_dim, param_count]),
+            b_embed: OxideTensorF32::new(db_embed, &[embed_dim]),
+            w_gamma: OxideTensorF32::new(dw_gamma, &[channels, embed_dim]),
+            b_gamma: OxideTensorF32::new(db_gamma, &[channels]),
+            w_beta: OxideTensorF32::new(dw_beta, &[channels, embed_dim]),
+            b_beta: OxideTensorF32::new(db_beta, &[channels]),
+        })
     }
 
     fn foveation_film_affine_backward_f32(
