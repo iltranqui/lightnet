@@ -102,7 +102,9 @@ Bounded native slice:
    warp/predictor backward remain explicit host operations. Missing sources
    error. FiLM parameter gradients are accumulated in host train buffers.
 4. [x] Add host-fallback SGD/Adam updates for HF/FiLM runtime train buffers;
-   GPU Muon is explicitly rejected. Two-step actual Oxide SGD/Adam runtime
+   at v0.2.127 GPU Muon was explicitly rejected. v0.2.146 enables native Oxide
+   orthogonalization for eligible HF predictor and FiLM matrices with host-
+   managed state/final updates. Two-step actual-Oxide SGD/Adam/Muon runtime
    output/parameter parity passes, with host exact buffer/update parity tests.
 5. [x] Add actual-Oxide rejection tests for compact f32, compact f16, and GPU
    Muon.

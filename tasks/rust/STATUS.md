@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.146: GPU Muon now supports eligible HF predictor and FiLM matrices through native Oxide orthogonalization; two-step learned-anisotropic runtime parity passes. See `implemented.md` §182.
 - v0.2.145: native HF inverse parameter adjoints now cover fixed-point and Newton iterations; isotropic/anisotropic finite differences and actual-Oxide runtime SGD/Adam parity pass. See `implemented.md` §181.
 - v0.2.143: Oxide predictor source/W1/B1/W2/B2 adjoints pass finite-difference checks; see `implemented.md` §179.
 - v0.2.142: native HF predictor backward now covers MLP parameter and source adjoints; actual-Oxide anisotropic SGD/Adam parity and direct input-gradient checks pass. The inverse-point parameter Jacobian remains host-side. See `implemented.md` §178.

@@ -207,6 +207,7 @@ file is named inline.
 - [179. HF predictor adjoint finite differences](#179-hf-predictor-adjoint-finite-differences)
 - [180. Native HF fixed-point parameter adjoint](#180-native-hf-fixed-point-parameter-adjoint)
 - [181. Native HF Newton parameter adjoint](#181-native-hf-newton-parameter-adjoint)
+- [182. GPU Muon for HF/FiLM matrices](#182-gpu-muon-for-hffilm-matrices)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2100,6 +2101,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 181. Native HF Newton parameter adjoint
 
 - v0.2.145 (`9b915184`): extended the Oxide dual-number inverse parameter adjoint through the configured Newton update, including derivatives of the analytic spatial Jacobian and the singular-determinant fixed-point fallback. Runtime now dispatches native parameter adjoints for both fixed-point and Newton methods; unsupported backends retain the host reference. Actual-Oxide finite differences cover every packed parameter for isotropic and anisotropic modes across two batches. Both learned-anisotropic fixed-point SGD and Newton Adam runtime parity tests pass; all 30 focused host HF tests and 8 Oxide HF primitive tests pass. No compiled-C++ or performance claim.
+
+## 182. GPU Muon for HF/FiLM matrices
+
+- v0.2.146 (`f462adad`): removed the GPU-Muon rejection for `[hyperbolic_foveation]` and `[foveation_film]`; their eligible 2-D predictors/projections now use the existing native Oxide orthogonalizer, while non-matrix parameters retain AdamW fallback and momentum/final updates remain host-managed. Added actual-Oxide two-step runtime parity for learned anisotropic HF plus FiLM, checking direct input gradients, every HF/FiLM gradient buffer, and all matrix/bias parameter blocks. The existing compact/f16 rejections remain. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_and_hf_gpu_muon_match_cpu_across_steps` and `... foveation_film_gpu_compact_f16_rejection_and_muon_support_are_explicit` passed. No compiled-C++ or performance claim.
 
 ## Not implemented / open (pointer)
 
