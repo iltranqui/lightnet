@@ -163,6 +163,7 @@ file is named inline.
 - [135. Softmax grouped-reduction axis pin](#135-softmax-grouped-reduction-axis-pin)
 - [136. Dropout element-mask layout evidence and DropBlock finding](#136-dropout-element-mask-layout-evidence-and-dropblock-finding)
 - [137. ScaleChannels source and broadcast-axis pin](#137-scalechannels-source-and-broadcast-axis-pin)
+- [138. SAM elementwise axis pin](#138-sam-elementwise-axis-pin)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1880,6 +1881,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 137. ScaleChannels source and broadcast-axis pin
 
 - v0.1.038 (`189cebae`): hand-derived from `Jev_laya:src-lib/scale_channels_layer.cpp:12-35,73-135` and `blas_kernels.cu:1664-1676`. A named `from=0` source with a batch-2 non-square NCHW sentinel pins both channel-vector broadcast (`scale_wh=0`) and spatial-plane broadcast (`scale_wh=1`), plus input/source adjoint accumulation. `MEM=3G ./tools/test_host.sh scale_channels_axis_layout` passed; full axis filter passed 33. No compiled-C++ golden.
+
+## 138. SAM elementwise axis pin
+
+- v0.1.039 (`3e674de4`): hand-derived from `Jev_laya:src-lib/sam_layer.cpp:69-105` and `blas_kernels.cu:1752-1798`. A batch-2, non-square NCHW sentinel checks the complete elementwise named-source product, input adjoint, and source adjoint at each `(n,c,h,w)`. `MEM=3G ./tools/test_host.sh sam_axis_layout` passed; full axis filter passed 34. No compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 
