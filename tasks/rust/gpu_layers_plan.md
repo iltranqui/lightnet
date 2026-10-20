@@ -97,13 +97,14 @@ Bounded native slice:
 2. [x] Add primitive adjoints for input, all six FiLM parameter blocks, and
    optional HF-parameter gradients. Hyperbolic-Foveation parameter extraction
    remains host-managed.
-3. [x] Integrate runtime forward when the selected HF cache exists and layouts
-   match; HF source evaluation/cache transfer is explicit and missing sources
-   error. GPU backward is still explicitly gated to the CPU fallback.
-4. [ ] Add runtime native-backward parity for input/parameter/HF gradients and
-   SGD/Adam updates. Primitive tests cover actual-device parity and finite
-   differences for every HF/FiLM projection parameter; runtime tests cover
-   batch-2 non-square outputs plus backward-fallback success.
+3. [x] Integrate runtime forward and native FiLM backward when the selected HF
+   cache exists and layouts match; HF source evaluation/cache transfer and HF
+   warp/predictor backward remain explicit host operations. Missing sources
+   error. FiLM parameter gradients are accumulated in host train buffers.
+4. [ ] Verify runtime input/parameter/HF gradients against the CPU through
+   actual Oxide runtime buffers and implement SGD/Adam update support. Primitive
+   tests cover actual-device parity/finite differences; runtime tests cover
+   outputs, HF/FiLM backward dispatch, and host-side exact train-buffer parity.
    Add explicit unsupported-update/compact/f16 gate coverage. No compiled-C++
    GPU-parity claim.
 
@@ -114,6 +115,8 @@ and HF-source adjoints. v0.2.123 integrates the Oxide runtime forward with
 host-computed HF parameters and a deliberate CPU backward fallback. Focused
 actual-device runtime output parity and fallback-backward success pass. v0.2.124
 finite-differences every HF/FiLM projection gradient element in the primitive.
+v0.2.125 dispatches native runtime FiLM backward and applies the host HF
+warp/predictor adjoint; optimizer updates remain rejected.
 
 This remains an open plan, not evidence of a complete native layer; keep
 `layer-support.md` GPU `none` until runtime native backward and optimizer tests

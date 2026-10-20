@@ -187,6 +187,7 @@ file is named inline.
 - [159. Native FoveationFilm full adjoint primitive](#159-native-foveationfilm-full-adjoint-primitive)
 - [160. FoveationFilm runtime native forward](#160-foveationfilm-runtime-native-forward)
 - [161. FoveationFilm projection-adjoint finite differences](#161-foveationfilm-projection-adjoint-finite-differences)
+- [162. FoveationFilm native runtime backward](#162-foveationfilm-native-runtime-backward)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2000,6 +2001,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 161. FoveationFilm projection-adjoint finite differences
 
 - v0.2.124 (`8b421a9e`): extended the actual-Oxide full FiLM projection test to finite-difference every HF-source, embedding, gamma, and beta gradient element against the host forward objective; all 2 `oxide_foveation_film` tests pass. This validates the primitive composition, not a native runtime backward path or compiled-C++ parity.
+
+## 162. FoveationFilm native runtime backward
+
+- v0.2.125: wired the native Oxide FiLM adjoint into runtime backward for input and all six FiLM parameter blocks; source-HF gradients are routed to a host HyperbolicFoveation backward helper, which also accumulates warp/predictor-source gradients. GPU optimizer updates for networks containing these layers remain explicitly rejected. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_native_forward_backward_uses_host_hf_source_cache` passed on actual Oxide; `MEM=3G ./tools/test_host.sh foveation_film` passed all 12 focused tests, including exact train-buffer parity through the hybrid dispatch. Primitive actual-device gradient parity/finite differences remain in `oxide_foveation_film`. No compiled-C++ golden or completed-layer claim; `layer-support.md` remains GPU `none` until optimizer and fallback gates are fully verified.
 
 ## Not implemented / open (pointer)
 
