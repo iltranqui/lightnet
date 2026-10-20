@@ -50107,6 +50107,46 @@ batch_normalize=1
     }
 
     #[test]
+    fn dropout_element_mask_and_adjoint_preserve_nchw_slots() {
+        use crate::axis_fixture::{axis_tensor, nchw_index};
+
+        let shape = TensorShape::new(3, 2, 2, 2);
+        let input = Tensor::from_data(shape, axis_tensor(shape)).expect("dropout axis input");
+        let mut rng_state = 0xD09B_10C5_u64;
+        let (output, mask) = super::forward_dropout(&input, 0.25, true, &mut rng_state)
+            .expect("training dropout");
+        let mask = mask.expect("training dropout mask");
+        assert_eq!(mask.shape, shape);
+        for n in 0..shape.batch {
+            for c in 0..shape.channels {
+                for h in 0..shape.height {
+                    for w in 0..shape.width {
+                        let index = nchw_index(shape, n, c, h, w);
+                        assert_eq!(output.data[index], input.data[index] * mask.data[index]);
+                    }
+                }
+            }
+        }
+        let per_sample = shape.element_count();
+        assert_ne!(
+            &mask.data[..per_sample],
+            &mask.data[per_sample..],
+            "C++ draws one mask value per element across the full batch, not one mask per sample"
+        );
+        let seed = Tensor::from_data(shape, vec![1.0; shape.batch * per_sample])
+            .expect("dropout backward seed");
+        let backward = super::backward_dropout(&seed, Some(&mask)).expect("dropout backward");
+        for index in 0..backward.data.len() {
+            assert_eq!(backward.data[index], mask.data[index]);
+        }
+        let (inference, inference_mask) =
+            super::forward_dropout(&input, 0.25, false, &mut rng_state).expect("inference dropout");
+        assert_eq!(inference.data, input.data);
+        assert!(inference_mask.is_none());
+
+    }
+
+    #[test]
     fn dropblock_reference_zeroes_one_square_per_plane_and_rescales_per_sample() {
         let shape = [2usize, 3, 5, 6];
         let x: Vec<f32> = (0..shape.iter().product::<usize>())
