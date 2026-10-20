@@ -182,6 +182,7 @@ file is named inline.
 - [154. Extend DCNv4 BN Adam runtime parity through 19x19](#154-extend-dcnv4-bn-adam-runtime-parity-through-19x19)
 - [155. Crop batch/spatial axis contract](#155-crop-batchspatial-axis-contract)
 - [156. FoveationFilm axis/layout pin](#156-foveationfilm-axislayout-pin)
+- [157. Native FoveationFilm affine GPU primitive](#157-native-foveationfilm-affine-gpu-primitive)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1975,6 +1976,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 156. FoveationFilm axis/layout pin
 
 - v0.1.041 (`83fd1625`): made `foveation_film_axis_layout_maps_batch_hf_embedding_and_channel_affines` part of the `axis_layout` filter. Its hand-computed NCHW fixture exercises distinct batch HF embeddings and channel-specific gamma/beta projections. `MEM=3G ./tools/test_host.sh axis_layout` passed 36 tests. Derived from `Jev_laya:src-lib/foveation_film_layer.cpp:160-222`; no compiled-C++ golden or parity claim.
+
+## 157. Native FoveationFilm affine GPU primitive
+
+- v0.2.120 (`6433e4a3`): added native Oxide f32 per-sample/per-channel FiLM affine application and its exact input, gamma, and beta adjoints. The primitive preserves `[B,C]` parameters over NCHW spatial planes. Host-reference test passes; `MEM=3G ./tools/test_oxide.sh --test oxide_foveation_film` passed 1 actual-device test covering batch-2 parity and finite differences for input/gamma/beta. Runtime projection, HF-source integration, layer dispatch, and full backward remain open; `layer-support.md` correctly remains GPU `none`. No compiled-C++ golden or full layer claim.
 
 ## Not implemented / open (pointer)
 

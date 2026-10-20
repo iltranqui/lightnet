@@ -106,7 +106,13 @@ Bounded native slice:
    under SGD/Adam. Include device finite differences for the fused primitive
    and explicit fallback-gate coverage. No compiled-C++ GPU-parity claim.
 
-This is an open plan, not evidence of a native path; update
+v0.2.120 implements the first low-level piece: the per-sample NCHW affine
+and exact input/gamma/beta adjoint are native Oxide primitives with host parity
+and finite-difference coverage. Embedding/ReLU and gamma/beta projections,
+source-cache transfer, and runtime dispatch are still open. This does not
+change the layer-support status: FoveationFilm has no native runtime path yet.
+
+This remains an open plan, not evidence of a complete native layer; update
 `layer-support.md` only after runtime dispatch and both forward/backward tests
 pass. Defer compact f16 until the f32 path is complete.
 
