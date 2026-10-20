@@ -69,7 +69,7 @@ with the command given rather than trusting the number.
 | CPU-only forward, no GPU path (hard reject) | 9 |
 | GPU forward but CPU/mixed backward | 11 (9 whole-network fallback + HF/FiLM host helpers) |
 | GPU native forward + device backward | 24 |
-| f16 inference | 25 variants (26 section names) |
+| f16 inference | 26 variants (27 section names) |
 | Axis pinned | 34 C++-backed variants / 38 tests total (includes one Rust-only contract test) |
 | Axis open | 26 (Tier 1: 3, Tier 2: 14, Tier 3: 3, Tier 4: 6) |
 | Axis Rust-only | 5 |
@@ -129,7 +129,7 @@ with the command given rather than trusting the number.
 | `LayaLoss` | yes | none | head | head | pin | native (loss on host) | head | no |
 | `JevCe` | alias | none | head | head | T2 | native (loss on host) | head | no |
 | `Segmentation` | alias | none | head | head | T2 | native (loss on host) | head | no |
-| `OmdLoss` | alias | none | pass + head | head | T2 | pass | head | no |
+| `OmdLoss` | alias | none | pass + head | head | T2 | pass | head | yes (inference) |
 | `Contrastive` | yes | none | pass + head | head | T2 | pass | head | no |
 | `Logistic` | yes | none | head | head | pin | native | head | yes (compact inference) |
 | `Regression` | yes | none | pass | pass | T2 | pass | pass | yes (inference) |

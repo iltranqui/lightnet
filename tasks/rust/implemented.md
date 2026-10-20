@@ -215,6 +215,7 @@ file is named inline.
 - [187. Logistic NCHW/batch axis pin](#187-logistic-nchwbatch-axis-pin)
 - [188. Compact f16 Logistic inference](#188-compact-f16-logistic-inference)
 - [189. Logistic f16 direct CPU-reference parity](#189-logistic-f16-direct-cpu-reference-parity)
+- [190. OMD loss compact f16 inference pass-through](#190-omd-loss-compact-f16-inference-pass-through)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2140,6 +2141,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 189. Logistic f16 direct CPU-reference parity
 
 - v0.2.150 (`1f77db57`): strengthened `logistic_f16_inference_matches_f32` to compare the actual-Oxide compact f16 result directly with `ExecutableNetwork::forward`, alongside the compact-f32 comparison. Focused verification: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16 logistic_f16_inference_matches_f32` passed. This closes CPU-reference evidence for this inference slice only; no compiled-C++ golden or f16 training/backward claim.
+
+## 190. OMD loss compact f16 inference pass-through
+
+- v0.2.151 (`pending`): added `[omd_loss]` to compact f16's allowlist and device-resident identity dispatch. C++ `forward_omd_loss_layer` copies input to output and returns before training-only work when `state.train` is false (`Jev_laya:src-lib/omd_loss_layer.cpp:554-568`). `omd_loss_f16_inference_is_device_identity_and_matches_cpu` compares actual-Oxide f16 directly with `ExecutableNetwork::forward`; the focused test passed, and `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed all 20 tests. Inference only; Rust's OMD training head is still incomplete; no compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 
