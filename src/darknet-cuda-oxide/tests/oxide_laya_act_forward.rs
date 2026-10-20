@@ -131,10 +131,7 @@ fn laya_act_head_native_invalid_parameters_error_cleanly() {
             "{err}"
         );
     }
-    // No unsupported half mode was enabled by the f32 composition.
+    // Compact f16 validates the same frozen head tensors before dispatch.
     let err = gpu.forward_compact_f16(&input).unwrap_err().to_string();
-    assert!(
-        err.contains("laya_act_head") && err.contains("f16"),
-        "{err}"
-    );
+    assert!(err.contains("act-head parameter fc1_w"), "{err}");
 }

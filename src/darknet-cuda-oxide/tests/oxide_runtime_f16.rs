@@ -413,6 +413,64 @@ fn jev_ce_f16_inference_matches_cpu_for_both_layouts() {
 }
 
 #[test]
+fn laya_act_head_f16_inference_matches_cpu() {
+    let cfg = ConfigFile::parse_str(
+        "act-head-f16.cfg",
+        "[net]\nwidth=4\nheight=1\nchannels=4\nbatch=2\n[convolutional]\nfilters=4\nsize=1\nactivation=linear\n[convolutional]\nfilters=1\nsize=1\nactivation=linear\n[convolutional]\nfilters=8\nsize=1\nactivation=linear\n[laya_act_head]\nlayers=0,1,2\nhidden=4\nmax_options=4\nfc_dim=5\nn_act=3\n",
+    )
+    .unwrap();
+    let mut cpu = ExecutableNetwork::new(Network::from_config(cfg).unwrap());
+    for (i, params) in cpu.params.iter_mut().enumerate() {
+        match params {
+            LayerParams::Convolutional(conv) => {
+                conv.weights.fill(0.0);
+                conv.biases.fill(0.0);
+                if i == 0 {
+                    for channel in 0..4 {
+                        conv.weights[channel * 4 + channel] = 1.0;
+                    }
+                } else if i == 1 {
+                    conv.weights[0] = 1.0;
+                } else {
+                    conv.biases.fill(1.0);
+                }
+            }
+            LayerParams::LayaActHead(weights) => {
+                for (i, value) in weights.fc1_w.iter_mut().enumerate() {
+                    *value = ((i % 11) as f32 - 5.0) * 0.04;
+                }
+                weights.fc1_b.copy_from_slice(&[-1.0, 0.0, 1.0, -0.5, 0.5]);
+                for (i, value) in weights.fc2_w.iter_mut().enumerate() {
+                    *value = ((i % 7) as f32 - 3.0) * 0.07;
+                }
+                weights.fc2_b.copy_from_slice(&[0.1, -0.2, 0.3]);
+            }
+            _ => {}
+        }
+    }
+    let mut gpu = GpuExecutableNetwork::new(cpu.network.clone(), OxideBackend::new().unwrap());
+    gpu.params = cpu.params.clone();
+    let input = Tensor::from_data(
+        cpu.network.net.input_shape(),
+        (0..32).map(|i| (i % 13) as f32 * 0.1 - 0.5).collect(),
+    )
+    .unwrap();
+    let expected = cpu.forward(&input).unwrap().final_output().unwrap().clone();
+    let actual = gpu
+        .forward_compact_f16(&input)
+        .unwrap()
+        .final_output
+        .unwrap();
+    assert_eq!(actual.shape, expected.shape);
+    let mut worst = 0.0f32;
+    for (&got, &want) in actual.data.iter().zip(&expected.data) {
+        worst = worst.max((got - want).abs() / want.abs().max(1.0));
+    }
+    eprintln!("act-head compact f16 relative max error: {worst:.3e}");
+    assert!(worst < 8e-3, "relative max error {worst:.3e}");
+}
+
+#[test]
 fn unsupported_layers_still_error_cleanly() {
     // Crop training geometry is not part of compact f16 inference.
     let net = network(

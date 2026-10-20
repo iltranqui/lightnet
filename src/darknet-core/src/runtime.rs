@@ -8542,6 +8542,7 @@ where
                 | LayerKind::Logistic
                 | LayerKind::OmdLoss(_)
                 | LayerKind::JevCe(_)
+                | LayerKind::LayaActHead(_)
                 | LayerKind::Upsample(_)
                 | LayerKind::Yolo(_)
                 | LayerKind::ObbYolo(_)
@@ -9122,14 +9123,61 @@ where
                         )
                         .map_err(|err| backend_error("GPU f16 laya_marker_gather", err))?
                 }
-                (LayerKind::LayaActHead(spec), LayerParams::LayaActHead(_)) => {
-                    return Err(Error::UnsupportedLayer {
-                        layer_index: layer.index,
-                        name: format!(
-                            "laya_act_head f16 (hidden={}, fc_dim={})",
-                            spec.hidden, spec.fc_dim
-                        ),
-                    });
+                (LayerKind::LayaActHead(spec), LayerParams::LayaActHead(weights)) => {
+                    let head_index = resolve_relative_layer(layer.index, spec.layers[0])?;
+                    let scorer_index = resolve_relative_layer(layer.index, spec.layers[1])?;
+                    let marker_index = resolve_relative_layer(layer.index, spec.layers[2])?;
+                    let head_layer = self.network.layers.get(head_index).ok_or(
+                        Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.layers[0],
+                        },
+                    )?;
+                    let scorer_layer = self.network.layers.get(scorer_index).ok_or(
+                        Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.layers[1],
+                        },
+                    )?;
+                    let marker_layer = self.network.layers.get(marker_index).ok_or(
+                        Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.layers[2],
+                        },
+                    )?;
+                    let head_source = gpu_layer_outputs
+                        .get(head_index)
+                        .and_then(Option::as_ref)
+                        .ok_or(Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.layers[0],
+                        })?;
+                    let scorer_source = gpu_layer_outputs
+                        .get(scorer_index)
+                        .and_then(Option::as_ref)
+                        .ok_or(Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.layers[1],
+                        })?;
+                    let marker_source = gpu_layer_outputs
+                        .get(marker_index)
+                        .and_then(Option::as_ref)
+                        .ok_or(Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.layers[2],
+                        })?;
+                    laya_act_gpu::forward_f16(
+                        &self.backend,
+                        spec,
+                        weights,
+                        [head_source, scorer_source, marker_source],
+                        [
+                            head_layer.output_shape,
+                            scorer_layer.output_shape,
+                            marker_layer.output_shape,
+                        ],
+                        launch_config,
+                    )?
                 }
                 (LayerKind::Upsample(spec), LayerParams::None) => self
                     .backend

@@ -6,7 +6,7 @@
 //! scale_channels}_layer.*` and the `darknet-core` CPU runtime; the host
 //! references live in `darknet_cuda::host_ops`.
 
-use super::convert::f16_bits_to_f32;
+use super::convert::{f16_bits_to_f32, f32_to_f16_bits};
 use cuda_device::{DisjointSlice, cuda_module, device, kernel, thread};
 
 /// Device twin of `darknet_cuda::dropout_unit`: must stay bit-identical.
@@ -121,6 +121,68 @@ pub mod kernels {
                 *output.as_mut_ptr().add(base + hidden + 1) = top1 - top2;
                 *output.as_mut_ptr().add(base + hidden + 2) = entropy / count.ln();
                 *output.as_mut_ptr().add(base + hidden + 3) = count / 255.0;
+            }
+        }
+    }
+
+    /// Detached LAYA act-head features from half-storage sources.
+    #[kernel]
+    pub fn laya_act_features_f16(
+        head: &[u16],
+        logits: &[u16],
+        markers: &[u16],
+        mut output: DisjointSlice<u16>,
+        hidden: usize,
+        options: usize,
+        marker_channels: usize,
+        head_width: usize,
+        marker_width: usize,
+    ) {
+        let b = thread::index_1d().get();
+        if b < output.len() / (hidden + 4) {
+            let mut max = f32::NEG_INFINITY;
+            let mut valid = 0usize;
+            let mut j = 0usize;
+            while j < options {
+                let active = f16_bits_to_f32(markers[(b * marker_channels + 2 * j + 1) * marker_width]) > 0.5;
+                let z = if active { f16_bits_to_f32(logits[b * options + j]) } else { -1.0e4 };
+                if active { valid += 1; }
+                max = max.max(z);
+                j += 1;
+            }
+            let mut sum = 0.0f32;
+            j = 0;
+            while j < options {
+                let active = f16_bits_to_f32(markers[(b * marker_channels + 2 * j + 1) * marker_width]) > 0.5;
+                let z = if active { f16_bits_to_f32(logits[b * options + j]) } else { -1.0e4 };
+                sum += (z - max).exp();
+                j += 1;
+            }
+            let mut top1 = -1.0f32;
+            let mut top2 = -1.0f32;
+            let mut entropy = 0.0f32;
+            j = 0;
+            while j < options {
+                let active = f16_bits_to_f32(markers[(b * marker_channels + 2 * j + 1) * marker_width]) > 0.5;
+                let z = if active { f16_bits_to_f32(logits[b * options + j]) } else { -1.0e4 };
+                let p = (z - max).exp() / sum;
+                entropy -= p * p.max(1.0e-9).ln();
+                if p > top1 { top2 = top1; top1 = p; } else if p > top2 { top2 = p; }
+                j += 1;
+            }
+            let count = if valid < 2 { 2.0 } else { valid as f32 };
+            let base = b * (hidden + 4);
+            // SAFETY: layout/storage are validated and each thread owns one row.
+            unsafe {
+                let mut c = 0usize;
+                while c < hidden {
+                    *output.as_mut_ptr().add(base + c) = head[(b * hidden + c) * head_width];
+                    c += 1;
+                }
+                *output.as_mut_ptr().add(base + hidden) = f32_to_f16_bits(top1, 0);
+                *output.as_mut_ptr().add(base + hidden + 1) = f32_to_f16_bits(top1 - top2, 0);
+                *output.as_mut_ptr().add(base + hidden + 2) = f32_to_f16_bits(entropy / count.ln(), 0);
+                *output.as_mut_ptr().add(base + hidden + 3) = f32_to_f16_bits(count / 255.0, 0);
             }
         }
     }

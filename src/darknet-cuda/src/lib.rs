@@ -3686,6 +3686,18 @@ pub trait F16TensorOpsBackend: F32TensorOpsBackend {
         activation: F32ActivationKind,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error>;
+    /// Exact-erf GELU over a half-storage tensor, returning half-storage values.
+    fn gelu_erf_f16(
+        &self,
+        x: &Self::TensorF16,
+        shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error> {
+        let _ = config;
+        let host = self.download_f16(x)?;
+        let output: Vec<_> = host.into_iter().map(host_ops::gelu_erf::value).collect();
+        self.upload_f16(shape, &output)
+    }
     fn maxpool_f16(
         &self,
         x: &Self::TensorF16,
@@ -3746,6 +3758,29 @@ pub trait F16TensorOpsBackend: F32TensorOpsBackend {
         let features = self.download_f16(features)?;
         let markers = self.download_f16(markers)?;
         self.upload_f16(&layout.output_shape(), &layout.forward(&features, &markers))
+    }
+
+    /// Detached LAYA act-head summary features from compact half-storage sources.
+    fn laya_act_features_f16(
+        &self,
+        head: &Self::TensorF16,
+        scorer: &Self::TensorF16,
+        marker: &Self::TensorF16,
+        head_shape: &[usize],
+        scorer_shape: &[usize],
+        marker_shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error> {
+        let _ = config;
+        let layout = host_ops::laya_act::Layout::new(head_shape, scorer_shape, marker_shape)
+            .unwrap_or_else(|err| panic!("{err}"));
+        let head = self.download_f16(head)?;
+        let scorer = self.download_f16(scorer)?;
+        let marker = self.download_f16(marker)?;
+        self.upload_f16(
+            &layout.output_shape(),
+            &layout.forward(&head, &scorer, &marker),
+        )
     }
 
     /// Mean over the in-image taps of each window.

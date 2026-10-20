@@ -3,7 +3,7 @@
 //! arithmetic happens in f32 after an exact widening, results are rounded back
 //! to nearest even (data movement ops are bit copies).
 
-use super::activations::activate;
+use super::activations::{activate, exact_gelu_value};
 use super::convert::{f16_bits_to_f32, f32_to_f16_bits};
 use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
 
@@ -716,6 +716,16 @@ pub mod kernels {
         }
         if let Some(o) = out.get_mut(idx) {
             *o = f32_to_f16_bits(scale * sum, 0);
+        }
+    }
+
+    /// Exact-erf GELU on f16 storage; arithmetic is performed in f32.
+    #[kernel]
+    pub fn gelu_erf_f16(x: &[u16], mut output: DisjointSlice<u16>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(out) = output.get_mut(idx) {
+            *out = f32_to_f16_bits(exact_gelu_value(f16_bits_to_f32(x[i])), 0);
         }
     }
 

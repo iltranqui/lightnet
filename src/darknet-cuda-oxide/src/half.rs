@@ -1170,6 +1170,84 @@ impl OxideBackend {
         Ok(OxideTensorF16::new(output, output_shape))
     }
 
+    /// Native half-storage LAYA act-head feature extraction.
+    pub fn laya_act_features_f16(
+        &self,
+        head: &OxideTensorF16,
+        scorer: &OxideTensorF16,
+        marker: &OxideTensorF16,
+        head_shape: &[usize],
+        scorer_shape: &[usize],
+        marker_shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF16, OxideError> {
+        let layout = darknet_cuda::host_ops::laya_act::Layout::new(
+            head_shape,
+            scorer_shape,
+            marker_shape,
+        )
+        .map_err(|err| shape_err("laya_act_features_f16", err))?;
+        if head.shape() != head_shape
+            || scorer.shape() != scorer_shape
+            || marker.shape() != marker_shape
+            || head.len() != layout.head_len
+            || scorer.len() != layout.logits_len
+            || marker.len() != layout.marker_len
+        {
+            return Err(shape_err(
+                "laya_act_features_f16",
+                "input shapes or lengths disagree with the declared layout".to_owned(),
+            ));
+        }
+        let mut output = self.alloc16_uninit(layout.output_len)?;
+        // SAFETY: the checked layout bounds every source index; one thread
+        // writes one complete, disjoint sample row.
+        unsafe {
+            self.layers_extra.laya_act_features_f16(
+                &self.stream,
+                launch::elementwise(layout.batch, config),
+                &head.buf,
+                &scorer.buf,
+                &marker.buf,
+                &mut output,
+                layout.hidden,
+                layout.options,
+                layout.marker_channels,
+                layout.head_width,
+                layout.marker_width,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF16::new(output, &layout.output_shape()))
+    }
+
+    /// Native exact-erf GELU over half-storage values.
+    pub fn gelu_erf_f16(
+        &self,
+        x: &OxideTensorF16,
+        shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF16, OxideError> {
+        if x.shape() != shape || x.len() != shape.iter().product::<usize>() {
+            return Err(shape_err(
+                "gelu_erf_f16",
+                format!("tensor shape {:?} does not match {shape:?}", x.shape()),
+            ));
+        }
+        let mut output = self.alloc16_uninit(x.len())?;
+        // SAFETY: shape equality validates one input/output element per thread.
+        unsafe {
+            self.half_ops.gelu_erf_f16(
+                &self.stream,
+                launch::elementwise(x.len(), config),
+                &x.buf,
+                &mut output,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF16::new(output, shape))
+    }
+
     /// Native f16 softmax with per-group f32 max/sum/normalization.
     pub fn softmax_f16(
         &self,
@@ -1607,6 +1685,15 @@ impl darknet_cuda::F16TensorOpsBackend for OxideBackend {
         )
     }
 
+    fn gelu_erf_f16(
+        &self,
+        x: &Self::TensorF16,
+        shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error> {
+        OxideBackend::gelu_erf_f16(self, x, shape, config)
+    }
+
     fn maxpool_f16(
         &self,
         x: &Self::TensorF16,
@@ -1668,6 +1755,28 @@ impl darknet_cuda::F16TensorOpsBackend for OxideBackend {
             feature_shape,
             marker_shape,
             options,
+            config,
+        )
+    }
+
+    fn laya_act_features_f16(
+        &self,
+        head: &Self::TensorF16,
+        scorer: &Self::TensorF16,
+        marker: &Self::TensorF16,
+        head_shape: &[usize],
+        scorer_shape: &[usize],
+        marker_shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error> {
+        OxideBackend::laya_act_features_f16(
+            self,
+            head,
+            scorer,
+            marker,
+            head_shape,
+            scorer_shape,
+            marker_shape,
             config,
         )
     }
