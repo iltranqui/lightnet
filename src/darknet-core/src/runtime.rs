@@ -8514,6 +8514,14 @@ where
         for layer in &self.network.layers {
             match &layer.kind {
                 LayerKind::Convolutional(_) => {}
+                LayerKind::Connected(spec) => {
+                    if spec.activation.to_cuda_f32_kind().is_none() {
+                        return Err(Error::UnsupportedLayer {
+                            layer_index: layer.index,
+                            name: format!("{} (f16 inference)", layer.kind.name()),
+                        });
+                    }
+                }
                 LayerKind::MaxPool(_)
                 | LayerKind::LocalAvgPool(_)
                 | LayerKind::AvgPool
@@ -8654,6 +8662,47 @@ where
                     } else {
                         convolution
                     }
+                }
+                (LayerKind::Connected(spec), LayerParams::Connected(params)) => {
+                    let inputs = layer.input_shape.element_count();
+                    if params.weights.len() != spec.output * inputs
+                        || params.biases.len() != spec.output
+                    {
+                        return Err(Error::InvalidConfig(format!(
+                            "connected layer #{} expects {} weights and {} biases, got {} and {}",
+                            layer.index,
+                            spec.output * inputs,
+                            spec.output,
+                            params.weights.len(),
+                            params.biases.len()
+                        )));
+                    }
+                    let (weights, biases) = if let Some(bn) = params.batch_norm.as_ref() {
+                        validate_batchnorm_params(bn, spec.output)?;
+                        let mut weights = params.weights.clone();
+                        let mut biases = params.biases.clone();
+                        for (output, row) in weights.chunks_mut(inputs).enumerate() {
+                            let scale = bn.scales[output]
+                                / (bn.rolling_variance[output] + BATCH_NORM_EPSILON).sqrt();
+                            row.iter_mut().for_each(|weight| *weight *= scale);
+                            biases[output] -= bn.rolling_mean[output] * scale;
+                        }
+                        (weights, biases)
+                    } else {
+                        (params.weights.clone(), params.biases.clone())
+                    };
+                    self.backend
+                        .connected_f16(
+                            current_input.expect("connected requires current input"),
+                            &weights,
+                            &biases,
+                            &tensor_backend_shape(layer.input_shape),
+                            &tensor_backend_shape(layer.output_shape),
+                            spec.output,
+                            gpu_activation_kind(layer.index, &spec.activation)?,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("f16 connected", err))?
                 }
                 (LayerKind::MaxPool(spec), LayerParams::None) => {
                     let maxpool_input = current_input.expect("maxpool requires current input");

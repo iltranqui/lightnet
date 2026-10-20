@@ -3096,6 +3096,17 @@ pub trait F16TensorOpsBackend: F32TensorOpsBackend {
         activation: F32ActivationKind,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error>;
+    fn connected_f16(
+        &self,
+        x: &Self::TensorF16,
+        weights: &[f32],
+        biases: &[f32],
+        input_shape: &[usize],
+        output_shape: &[usize],
+        outputs: usize,
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error>;
     fn maxpool_f16(
         &self,
         x: &Self::TensorF16,

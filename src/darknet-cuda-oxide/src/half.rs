@@ -5,7 +5,9 @@
 //! only: there is no backward on f16 tensors (training stays f32).
 
 use cuda_core::{CudaStream, DeviceBuffer};
-use darknet_cuda::{ElementwiseLaunchConfig, F32ActivationKind, F32ChannelNormalization};
+use darknet_cuda::{
+    ElementwiseLaunchConfig, F32ActivationKind, F32ChannelNormalization, F32TensorOpsBackend,
+};
 use std::sync::Arc;
 
 use crate::tensor::PooledBuf16;
@@ -744,6 +746,64 @@ impl OxideBackend {
         Ok(OxideTensorF16::new(output, output_shape))
     }
 
+    /// Dense `[batch, inputs] x [outputs, inputs]^T` f16 inference.
+    pub fn connected_f16(
+        &self,
+        input: &OxideTensorF16,
+        weights: &[f32],
+        biases: &[f32],
+        input_shape: &[usize],
+        output_shape: &[usize],
+        outputs: usize,
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF16, OxideError> {
+        if input_shape.len() != 4 || output_shape.len() != 4 || input.shape() != input_shape {
+            return Err(shape_err("connected_f16", format!("expected NCHW input/output, got {input_shape:?} -> {output_shape:?}")));
+        }
+        let batch = input_shape[0];
+        let inputs = input_shape[1]
+            .checked_mul(input_shape[2])
+            .and_then(|v| v.checked_mul(input_shape[3]))
+            .ok_or_else(|| shape_err("connected_f16", "input feature count overflows".to_owned()))?;
+        let expected_weights = inputs
+            .checked_mul(outputs)
+            .ok_or_else(|| shape_err("connected_f16", "weight count overflows".to_owned()))?;
+        if outputs == 0
+            || batch == 0
+            || inputs == 0
+            || input.len() != batch * inputs
+            || weights.len() != expected_weights
+            || biases.len() != outputs
+            || output_shape != [batch, outputs, 1, 1]
+        {
+            return Err(shape_err("connected_f16", format!("incompatible dense dimensions: input={input_shape:?}, output={output_shape:?}, weights={}, biases={}", weights.len(), biases.len())));
+        }
+        let mut flat_input = input.clone();
+        flat_input.shape = vec![batch, inputs, 1, 1];
+        let weights_f32 = self.upload_f32(&[outputs, inputs], weights)?;
+        let weights_f16 = self.conv_weights_f16(&weights_f32, outputs, inputs)?;
+        let bias = self.upload_f32(&[outputs], biases)?;
+        self.conv2d_bias_act_f16(
+            &flat_input,
+            &weights_f16,
+            &bias,
+            output_shape,
+            inputs,
+            1,
+            1,
+            outputs,
+            1,
+            1,
+            1,
+            1,
+            0,
+            1,
+            activation,
+            config,
+        )
+    }
+
     /// f16 max pool (same window rule as `maxpool_f32`, `off = padding / 2`).
     #[allow(clippy::too_many_arguments)]
     pub fn maxpool_f16(
@@ -1479,6 +1539,30 @@ impl darknet_cuda::F16TensorOpsBackend for OxideBackend {
         OxideBackend::conv2d_bias_act_f16(
             self, x, weights, bias, output_shape, channels, input_height, input_width, filters, size, stride_x,
             stride_y, dilation, padding, groups, activation, config,
+        )
+    }
+
+    fn connected_f16(
+        &self,
+        x: &Self::TensorF16,
+        weights: &[f32],
+        biases: &[f32],
+        input_shape: &[usize],
+        output_shape: &[usize],
+        outputs: usize,
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error> {
+        OxideBackend::connected_f16(
+            self,
+            x,
+            weights,
+            biases,
+            input_shape,
+            output_shape,
+            outputs,
+            activation,
+            config,
         )
     }
 

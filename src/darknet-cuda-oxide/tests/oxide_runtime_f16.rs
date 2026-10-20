@@ -268,15 +268,56 @@ fn tiny_net_with_avgpool_local_avgpool_batchnorm_reverse_upsample_matches_f32() 
 
 #[test]
 fn unsupported_layers_still_error_cleanly() {
-    // connected layer
+    // Crop training geometry is not part of compact f16 inference.
     let net = network(
         "[net]\nwidth=8\nheight=8\nchannels=2\nbatch=1\n\
-         [convolutional]\nfilters=4\nsize=3\nstride=1\npad=1\nactivation=leaky\n\
-         [connected]\noutput=5\nactivation=linear\n",
+         [crop]\ncrop_width=4\ncrop_height=4\nflip=0\nangle=0\nnoadjust=1\n",
     );
     let exec = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().unwrap());
     let input = input_for(&net, 1);
     assert!(matches!(exec.forward_compact_f16(&input), Err(Error::UnsupportedLayer { .. })));
+}
+
+#[test]
+fn connected_f16_inference_matches_f32_for_flattened_nchw_input() {
+    let cfg = "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\n\
+        [connected]\noutput=5\nactivation=mish\n";
+    let net = network(cfg);
+    let mut exec = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().unwrap());
+    let LayerParams::Connected(params) = &mut exec.params[0] else {
+        panic!("connected parameters expected");
+    };
+    for (i, weight) in params.weights.iter_mut().enumerate() {
+        *weight = ((i as f32 * 0.37).sin()) * 0.15;
+    }
+    params.biases.copy_from_slice(&[0.1, -0.08, 0.03, 0.04, -0.02]);
+    let input = input_for(&net, 73);
+    let want = exec.forward_compact(&input).expect("f32 connected forward");
+    let got = exec.forward_compact_f16(&input).expect("f16 connected forward");
+    compare("connected f16", &want, &got, 5e-3);
+}
+
+#[test]
+fn connected_batchnorm_f16_inference_matches_f32() {
+    let cfg = "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\n\
+        [connected]\noutput=5\nbatch_normalize=1\nactivation=linear\n";
+    let net = network(cfg);
+    let mut exec = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().unwrap());
+    let LayerParams::Connected(params) = &mut exec.params[0] else {
+        panic!("connected parameters expected");
+    };
+    for (i, weight) in params.weights.iter_mut().enumerate() {
+        *weight = ((i as f32 * 0.23).cos()) * 0.12;
+    }
+    params.biases.copy_from_slice(&[0.03, -0.04, 0.02, 0.01, -0.06]);
+    let bn = params.batch_norm.as_mut().expect("connected BN parameters");
+    bn.scales.copy_from_slice(&[0.8, 1.1, -0.7, 0.9, 1.2]);
+    bn.rolling_mean.copy_from_slice(&[0.1, -0.2, 0.05, 0.08, -0.03]);
+    bn.rolling_variance.copy_from_slice(&[0.7, 1.3, 0.9, 1.6, 1.1]);
+    let input = input_for(&net, 79);
+    let want = exec.forward_compact(&input).expect("f32 connected BN forward");
+    let got = exec.forward_compact_f16(&input).expect("f16 connected BN forward");
+    compare("connected BN f16", &want, &got, 5e-3);
 }
 
 #[test]
