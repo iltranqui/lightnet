@@ -152,7 +152,7 @@ silently changes a downstream `route`/`shortcut`.
 | Variant | Aliases | C++ reference | Axis classes | Required pin |
 |---|---|---|---|---|
 | `ScaleChannels` | `scale_channels` | `scale_channels_layer.cpp:73` | layout, concat | broadcast vs crop/pad slot math against a named source layer |
-| `Dropout` | `dropout` | `dropout_layer.cpp:87` | layout, batch | per-sample mask (no shared mask across batch); inference is identity; DropBlock spatial mask |
+| `Dropout` | `dropout` | `Jev_laya:src-lib/dropout_layer.cpp:87-133`; `dropout_layer_kernels.cu:127-167` | layout, batch | Regular per-element mask/inference identity has focused coverage in `runtime.rs` `dropout_element_mask_and_adjoint_preserve_nchw_slots`; complete pin remains open because the DropBlock GPU source indexing is unresolved (F3). |
 | `Sam` | `sam` | `sam_layer.cpp:69` | layout | element-wise multiply over the full `C*H*W` block |
 | `RecursiveBlock` | `recursive_block`, `recurrent_block` | `recursive_block_layer.cpp:1586` | geometry, batch | nested body shapes/`current` propagation; per-pass lattice spatial mapping; `batch=2` independent |
 | `Cost` | `cost` | `cost_layer.cpp:85` | reduce | `MASKED`/`SMOOTH` reduction axis and the `scale` factor; `C` vs `N` layout |
@@ -275,6 +275,19 @@ mapping is not a defensible pin without a compiled oracle. The new Reorg pin
 therefore covers only normal forward plus its adjoint, whose `forward=0/1`
 helper mapping is well-defined. Rust's reverse path remains a separate
 source-inconsistent behavior; do not claim C++ parity for it.
+
+### F3: DropBlock GPU plane indexing — unresolved
+
+The regular CPU dropout loop visits the flat `batch * inputs` range and stores
+one random value per element (`Jev_laya:src-lib/dropout_layer.cpp:87-133`);
+`dropout_element_mask_and_adjoint_preserve_nchw_slots` exercises that Rust
+contract, including inference identity and reuse of the exact mask in backward.
+This does not close Dropout's axis row: the GPU DropBlock kernel at
+`dropout_layer_kernels.cu:25-37` computes `index = b*spatial*f + f*spatial + i`,
+which does not match the ordinary NCHW plane offset `(b*filters + f)*spatial + i`
+for general `batch, filters`. Without a compiled-C++ oracle, the DropBlock
+batch/channel mapping is unresolved; do not treat host DropBlock fixtures as
+C++ parity evidence.
 
 ## Adding a pin
 

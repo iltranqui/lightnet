@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.1.037: added focused standard-Dropout per-element mask/inference/adjoint coverage; test passed. DropBlock remains open because the C++ GPU kernel's batch/channel plane-index expression is unresolved (axis ledger F3); see `implemented.md` §136. No compiled-C++ golden.
 - v0.1.036: pinned Softmax's contiguous per-batch grouped reduction, stable output and grouped adjoint from `softmax_layer.cpp`/`blas.cpp`; focused softmax filter passed 12, full axis filter passed 32. See `implemented.md` §135. Hand-derived, no compiled-C++ golden.
 - v0.1.035: pinned ChannelShuffle's group-row/group-column channel transpose and inverse adjoint across batch/spatial planes. Focused test passed; full axis filter passed 31; see `implemented.md` §134. Hand-derived, no compiled-C++ golden.
 - v0.1.034: pinned Reorg normal-forward channel/offset packing and its adjoint; the full axis filter passed 30. C++ reverse source has an `out_c`/`in_c` divisor defect and remains unpinned; see `implemented.md` §133 and axis ledger F2.
