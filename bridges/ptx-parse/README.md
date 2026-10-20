@@ -82,7 +82,6 @@ re-parsing.
 |-----------------------|------------------------------------------------------------|
 | `cuda-oxide-codegen`  | Reading and patching emitted PTX (`export.rs`, `ptx.rs`)   |
 | `cuda-host`           | Editing embedded PTX artifacts (`embedded.rs`)             |
-| `cuda-intrinsics-gen` | Checking the PTX each generated intrinsic emits            |
 | `cargo-oxide`         | Inspecting PTX for the CLI                                 |
 | `dialect-ptx`         | Projecting parsed source into the structured dialect       |
 | `ptx-schedule`        | Finding schedule-sensitive sites and inserting sleeps      |

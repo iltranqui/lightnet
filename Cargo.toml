@@ -21,7 +21,6 @@ members = [
     # Core crates
     "bridges/cuda-target-spec",
     "bridges/cuda-intrinsics",
-    "bridges/cuda-intrinsics-gen",
     "bridges/ptx-parse",
     "bridges/ptx-schedule",
     "bridges/dialect-ptx",
@@ -60,7 +59,6 @@ default-members = [
     "src/darknet-examples",
     "bridges/cuda-target-spec",
     "bridges/cuda-intrinsics",
-    "bridges/cuda-intrinsics-gen",
     "bridges/ptx-parse",
     "bridges/ptx-schedule",
     "bridges/dialect-ptx",

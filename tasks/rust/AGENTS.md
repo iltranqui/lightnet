@@ -84,7 +84,7 @@ A `cfg_corpus` timeout is neither a pass nor a failure.
 | `fp8_fp4.md` | 125 | FP8 GEMM / FP4 emulation design, sm_89 | FP8/FP4 work |
 | `vit_plan.md`, `vit_notes.md` | 71 | `[vit]` subplan and source audit | ViT / attention work |
 | `augmentation-audit.md` | 59 | C++ detector augmentation semantics | Augmentation work |
-| `task_plan.md`, `notes.md` | 812 | v65–v70 per-milestone plans and notes (`NORM_CHAN*` etc.), superseded by `implemented.md` | Almost never |
+| `carpn_task_plan.md`, `carpn_notes.md` | 812 | v65–v70 per-milestone plans and notes (`NORM_CHAN*` etc.), superseded by `implemented.md` | Almost never |
 | `lessons.md` | 13 | Rules from past corrections | Session start |
 | `version-map.tsv` | 260 | idx, version, old sha, new sha (`-` = none) | Mapping version to commit |
 

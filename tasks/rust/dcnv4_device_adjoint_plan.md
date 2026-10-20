@@ -38,7 +38,7 @@ Use serial, memory-capped builds through `tools/test_oxide.sh` for Oxide.
   from the full output length. Existing parity fixture already has batch=2.
 - Rust skill knowledge directory `~/.Codex/skills/rust-dev-knowledge` is absent;
   repository implementations and tests are the available local references.
-- Root `task_plan.md` and `notes.md` describe earlier CARPN work; preserve them.
+- `carpn_task_plan.md` and `carpn_notes.md` describe earlier CARPN work; preserve them.
 
 ## Status
 

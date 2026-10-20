@@ -7,9 +7,9 @@ contract: the backend recognizes these functions by their generated paths and
 replaces each call with a GPU operation. Their bodies are placeholders and are
 never meant to execute — calling one outside a kernel panics.
 
-The declarations here are produced by `cuda-intrinsics-gen` from
-`intrinsics/catalog.json`, so they are not edited by hand. Adding an intrinsic
-means adding a catalog entry and regenerating, not writing a declaration here.
+The declarations here were produced by `cuda-intrinsics-gen`, which has since been
+removed from this repository (its catalog inputs were already gone). The files are now
+hand-owned: edit them directly.
 
 `cuda-device` wraps these in the safe, typed, documented API that user kernels
 are expected to call.
