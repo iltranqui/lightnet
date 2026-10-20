@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.142: native HF predictor backward now covers MLP parameter and source adjoints; actual-Oxide anisotropic SGD/Adam parity and direct input-gradient checks pass. The inverse-point parameter Jacobian remains host-side. See `implemented.md` §178.
 - v0.2.141: opt-in GPU-backward input-gradient capture is now compared directly with CPU across learned-anisotropic two-step SGD and Newton Adam runtime tests. See `implemented.md` §177; native predictor-source and inverse-point parameter-Jacobian math remain host-side.
 - v0.2.140: runtime consumes the native HF grid adjoint in host inverse-point parameter gradients; actual-Oxide SGD/Adam, 30 host HF, and 12 FiLM tests pass. Native predictor backward and direct runtime input-gradient inspection remain open. See `implemented.md` §176.
 - v0.2.139: added native Oxide HF bilinear-warp input/grid adjoints and runtime input-gradient propagation; primitive reference/finite-difference plus actual-Oxide SGD/Adam parity tests pass. Runtime HF parameter/predictor backward and direct tensor inspection remain open. See `implemented.md` §175.

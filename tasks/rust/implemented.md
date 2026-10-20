@@ -203,6 +203,7 @@ file is named inline.
 - [175. Native HF warp adjoints](#175-native-hf-warp-adjoints)
 - [176. Native HF grid-adjoint consumption](#176-native-hf-grid-adjoint-consumption)
 - [177. Direct HF runtime input-gradient parity](#177-direct-hf-runtime-input-gradient-parity)
+- [178. Native HF predictor backward](#178-native-hf-predictor-backward)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2080,6 +2081,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 177. Direct HF runtime input-gradient parity
 
 - v0.2.141 (`94a23a2a`): added opt-in `backward_accumulate_seeded_gpu_with_input_gradient`, which captures and downloads the accumulated network-input gradient without adding transfers to ordinary training calls. Actual-Oxide tests now compare this tensor directly to CPU after each of two learned-anisotropic fixed-point SGD updates and two learned-anisotropic Newton Adam updates. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_native_forward_backward_uses_host_hf_source_cache` and `... foveation_film_runtime_adam_updates_match_cpu` passed; `MEM=3G ./tools/test_host.sh hyperbolic_foveation` passed 30 tests. Native inverse-point parameter-Jacobian and predictor-source backward remain open. No compiled-C++ or performance claim.
+
+## 178. Native HF predictor backward
+
+- v0.2.142 (`c234a612`): added native Oxide adjoints for predictor output constraints, the second and first MLP projections/ReLU, and the average-pooling source scatter. Runtime now uses native predictor-source and MLP parameter gradients; the inverse-point parameter Jacobian remains a Rust host operation. Actual-Oxide learned-anisotropic fixed-point SGD parity directly checks runtime input gradients and train-buffer/updated parameter parity with `downsample=2` and a non-divisible width; learned-anisotropic Newton Adam parity checks the native predictor backward with two updates. `MEM=3G ./tools/test_host.sh hyperbolic_foveation` passed 30 tests and `MEM=3G ./tools/test_oxide.sh --test oxide_hyperbolic_foveation` passed 6. No compiled-C++ or performance claim.
 
 ## Not implemented / open (pointer)
 

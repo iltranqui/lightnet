@@ -128,9 +128,11 @@ Bounded native slice:
 12. [x] Expose runtime input gradients through an opt-in diagnostic API and
     compare them directly against CPU in actual-Oxide two-step SGD/Adam tests
     (v0.2.141).
-13. [ ] Add native inverse-point parameter Jacobian and predictor-source
-    backward. Runtime consumes the native grid adjoint for HF parameter
-    gradients (v0.2.140), but both transformations remain host-side. Actual-Oxide gates cover
+13. [x] Add native predictor-source and MLP parameter backward (v0.2.142).
+    Actual-Oxide tests directly compare input gradients and parameter gradients
+    to CPU, including downsample=2 with a non-divisible width.
+14. [ ] Add native inverse-point parameter Jacobian. Runtime currently consumes
+    the native grid adjoint through the host Jacobian (v0.2.140). Actual-Oxide gates cover
     compact f32/f16, Muon, SGD `dont_update`, Adam `burnin_update`, and SGD
     `train_only_bn` (v0.2.128–131). No compiled-C++ GPU-parity claim.
 
@@ -154,13 +156,14 @@ native input gradients in HF GPU backward; v0.2.140 consumes the native grid
 adjoint for host inverse-point HF parameter gradients. Actual-Oxide runtime
 tests cover learned anisotropic fixed-point SGD and learned anisotropic Newton
 Adam, comparing predictor and FiLM parameter updates over two steps; direct
-runtime input-gradient parity is now checked (v0.2.141). Predictor-source and
-inverse-point parameter-Jacobian math remain host-managed.
+runtime input-gradient parity is checked (v0.2.141), and the native predictor
+adjoint now covers MLP parameters/source gradients (v0.2.142). Only the
+inverse-point parameter Jacobian remains host-managed.
 
 This remains an open plan, not evidence of a complete native layer. Native HF
-coverage includes forward for isotropic and anisotropic modes plus native warp
-input/grid adjoints; inverse-point HF parameter Jacobian and predictor-source
-backward remain host-managed. Compact f16 remains deferred.
+coverage includes forward for isotropic and anisotropic modes, native warp
+input/grid adjoints, and native predictor-source/MLP backward. The inverse-point
+HF parameter Jacobian remains host-managed. Compact f16 remains deferred.
 
 ## Act-head contract finding
 
