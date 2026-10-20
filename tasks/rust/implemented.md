@@ -156,6 +156,7 @@ file is named inline.
 - [128. Native connected-layer BN GPU backward](#128-native-connected-layer-bn-gpu-backward)
 - [129. Connected BN GPU backward activation parity](#129-connected-bn-gpu-backward-activation-parity)
 - [130. Connected BN GPU backward SGD/Adam parity](#130-connected-bn-gpu-backward-sgdadam-parity)
+- [131. Route source/group axis pin](#131-route-sourcegroup-axis-pin)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1845,6 +1846,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 130. Connected BN GPU backward SGD/Adam parity
 
 - v0.2.103 (`97374ebc`): added actual-Oxide two-step Connected BN backward and optimizer parity for both SGD and Adam with `leaky` activation. Outputs, weights, biases, BN scales, rolling means and rolling variances match the CPU reference. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_connected_bn_backward_matches_cpu_sgd_and_adam` passed. This verifies Rust CPU-reference parity only; no compiled-C++ golden.
+
+## 131. Route source/group axis pin
+
+- v0.1.032 (`6a98ce9b`): hand-derived from `Jev_laya:src-lib/route_layer.cpp:91-139`; named test `route_axis_layout_pins_named_source_order_group_slice_and_delta_scatter` uses batch-2 non-square NCHW sentinel tensors to pin relative named-source order, group selection, channel concatenation and backward delta scatter. `MEM=3G ./tools/test_host.sh route_axis_layout` passed; full `MEM=3G ./tools/test_host.sh axis_layout` passed 28 tests (945 filtered). No compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 
