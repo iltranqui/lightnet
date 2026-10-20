@@ -184,6 +184,7 @@ file is named inline.
 - [156. FoveationFilm axis/layout pin](#156-foveationfilm-axislayout-pin)
 - [157. Native FoveationFilm affine GPU primitive](#157-native-foveationfilm-affine-gpu-primitive)
 - [158. Native FoveationFilm full forward primitive](#158-native-foveationfilm-full-forward-primitive)
+- [159. Native FoveationFilm full adjoint primitive](#159-native-foveationfilm-full-adjoint-primitive)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1985,6 +1986,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 158. Native FoveationFilm full forward primitive
 
 - v0.2.121 (`8b07d40f`): added a backend `foveation_film_forward_f32` operation composing native Oxide HF embedding/ReLU, gamma/beta projections, and the per-sample NCHW affine primitive. Host reference and actual-device CPU-reference parity cover a batch-2 non-square tensor with distinct HF and channel values. `MEM=3G ./tools/test_oxide.sh --test oxide_foveation_film` passed 2 tests, including the affine adjoint finite differences. Runtime HF-source extraction/dispatch and full backward remain open; no native layer-path or compiled-C++ claim.
+
+## 159. Native FoveationFilm full adjoint primitive
+
+- v0.2.122 (`e97bac10`): added native Oxide full FiLM backward primitives for input, HF-source, embedding, gamma, and beta gradients; spatial/batch reductions use fixed-order, one-owner kernels. `MEM=3G ./tools/test_oxide.sh --test oxide_foveation_film` passed 2 actual-device tests covering forward/backward parity against the host reference and affine finite differences; `MEM=3G cargo test -p darknet-cuda --lib foveation_film` passed the batch/channel host-reference test. This remains primitive-only; runtime source-cache transfer and layer dispatch are still open. No compiled-C++ golden or complete-layer claim.
 
 ## Not implemented / open (pointer)
 

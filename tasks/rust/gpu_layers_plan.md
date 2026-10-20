@@ -108,9 +108,10 @@ Bounded native slice:
 
 v0.2.120 implements native per-sample NCHW affine and exact input/gamma/beta
 adjoints; v0.2.121 composes native HF embedding/ReLU and gamma/beta projections
-into a full forward primitive. Host-reference and actual-device parity/FD tests
-pass. Runtime HF-source extraction/transfer, layer dispatch, and full backward
-are still open; FoveationFilm has no native runtime path yet.
+into a full forward primitive; v0.2.122 adds the native full input, parameter,
+and HF-source adjoints. Host-reference and actual-device parity/FD tests pass.
+Runtime HF-source extraction/transfer and layer dispatch remain open; FoveationFilm
+still has no native runtime path.
 
 This remains an open plan, not evidence of a complete native layer; update
 `layer-support.md` only after runtime dispatch and both forward/backward tests
