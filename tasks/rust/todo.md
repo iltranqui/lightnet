@@ -654,8 +654,9 @@ Immediately next, in dependency order:
 - [x] v0.1.029 AvgPool axis contract: named non-square, batch-2 pin for per-channel spatial reduction and the exact seeded adjoint. See `implemented.md` §111.
 - [x] v0.1.031 Connected axis contract: hand-computed B=2 forward and supplied-seed adjoint pin flattened NCHW input, `[out][in]` weight rows, and sample independence. `axis_layout` passed 27; the exhaustive registry test passed. Hand-derived from `Jev_laya:src-lib/connected_layer.cpp:186`; no compiled-C++ golden. See `implemented.md` §114.
 - [x] v0.1.030 LocalAvgPool axis contract: non-square B=2 window/output order, odd kernel, unequal strides, padding, and overlap-summed adjoint are pinned with hand-computed expectations. See `implemented.md` §112.
-- [ ] Axis tiers 1-4 (see `axis-coverage.md`): add the remaining named pins (28 C++-backed variants still open); each behavior fix gets its own version. Do not weaken a pin to match the implementation.
+- [ ] Axis tiers 1-4 (see `axis-coverage.md`): add the remaining named pins (27 C++-backed variants currently open); each behavior fix gets its own version. Do not weaken a pin to match the implementation.
 - [x] **v0.1.040: Crop batch/spatial axis pin.** Named batch-2, two-channel, non-square test asserts center-window output ordering and cached sample coordinates. Axis filter passes 35 tests. Rust contract only; no C++ golden. See `implemented.md` §155.
+- [x] **v0.1.027: HyperbolicFoveation axis/layout pin.** Added a named B=2, C=2, H=2, W=3 source-derived NCHW/grid `(x,y)` test; full axis filter passes 37 tests. No compiled-C++ golden. See `implemented.md` §185.
 - [x] **v0.1.041: FoveationFilm axis/layout pin.** Promoted the hand-computed batch/channel affine test to the named `axis_layout` filter; it pins per-batch HF embedding and per-channel gamma/beta blocks. Axis filter passes 36 tests. Hand-derived from C++ source; no compiled-C++ golden. See `implemented.md` §156.
 
 - [x] v0.1.017 GPU conv parity: the device extent now follows the CPU for `dilation > 1` (the kernels were already correct). See `implemented.md` §34.

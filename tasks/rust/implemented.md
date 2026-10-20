@@ -210,6 +210,7 @@ file is named inline.
 - [182. GPU Muon for HF/FiLM matrices](#182-gpu-muon-for-hffilm-matrices)
 - [183. HF/FiLM GPU Muon update gate](#183-hffilm-gpu-muon-update-gate)
 - [184. HF/FiLM GPU Muon sidecar resume](#184-hffilm-gpu-muon-sidecar-resume)
+- [185. HyperbolicFoveation axis/layout pin](#185-hyperbolicfoveation-axislayout-pin)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2115,6 +2116,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 184. HF/FiLM GPU Muon sidecar resume
 
 - v0.2.148 (`3db27bd9`): actual-Oxide sidecar round-trip test saves after one learned-anisotropic HF/FiLM Muon update, restores into fresh CPU/GPU networks, and checks the resumed GPU update against an uninterrupted CPU continuation. It compares HF global/predictor matrices and biases plus every FiLM projection matrix/bias, so both Muon momentum and AdamW fallback state must survive. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_gpu_muon_state_round_trip_matches_cpu` passed. No compiled-C++ or performance claim.
+
+## 185. HyperbolicFoveation axis/layout pin
+
+- v0.1.027 (`pending`): added `hyperbolic_foveation_axis_layout_keeps_batch_channel_hw_and_grid_xy`, a named source-derived pin using B=2, C=2, H=2, W=3 and unique N/C/H/W sentinels. It hand-computes bilinear outputs from the C++ `map_x/map_y` indexing and NCHW per-channel `cv::remap` loop at `Jev_laya:src-lib/hyperbolic_foveation_layer.cpp:1341-1441`; a probe explicitly distinguishes x/y transposition. `MEM=3G ./tools/test_host.sh hyperbolic_foveation_axis_layout` passed, and `MEM=3G ./tools/test_host.sh axis_layout` passed all 37 tests. Hand-derived from source; no compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 

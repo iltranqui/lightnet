@@ -112,7 +112,7 @@ with the command given rather than trusting the number.
 | `Wmhf` | alias | C++ | fwd | exact | T4 | none | none | no |
 | `Clifford` | yes | C++ | fwd | exact | T4 | none | none | no |
 | `RecursiveBlock` | alias | body only | fwd | exact | T1 | none | none | no |
-| `HyperbolicFoveation` | yes | C++ | fwd | exact | T4 | native Oxide predictor + warp + isotropic/anisotropic fixed-point/Newton grids; native warp, predictor and fixed-point/Newton parameter adjoints | runtime input-gradient parity directly tested; supported hybrid/cache limitations remain | no |
+| `HyperbolicFoveation` | yes | C++ | fwd | exact | pin | native Oxide predictor + warp + isotropic/anisotropic fixed-point/Newton grids; native warp, predictor and fixed-point/Newton parameter adjoints | runtime input-gradient parity directly tested; supported hybrid/cache limitations remain | no |
 | `FoveationFilm` | alias | C++ | fwd | exact | T4 | native Oxide f32 (HF source/cache host-managed) | native FiLM adjoint + host HF backward; host SGD/Adam updates | no |
 | `Vit` | yes | C++ | fwd | exact | pin | host | cpu | no |
 | `Swin` | alias | Rust | fwd | exact | pin | host | cpu | no |

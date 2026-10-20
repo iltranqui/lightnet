@@ -9,17 +9,17 @@ Measured 2026-10-18 against `model.rs` (65 represented variants plus
 `Unsupported`), `Jev_laya:src-lib/darknet_enums.hpp` and the `depth_3d`
 YOLO-3D source. Represented does not imply a complete layer port:
 
-- **31 variants pinned by 34 named tests** (`*axis_layout*`); the extra
-  tests are Swin's second axis (`cyclic_shift`) and the two convolutional
-  pins (shape and forward).
-- **29 C++-backed variants open** (26 on `Jev_laya`, plus `Logistic` on
+- **33 C++-backed variants pinned**; `axis_layout` selects 37 named tests,
+  including the Rust-only Crop contract pin and additional convolution/Swin
+  probes.
+- **27 C++-backed variants open** (24 on `Jev_laya`, plus `Logistic` on
   `raptor`, `Regression` on `fog`, and the partial `Yolo3d` on `depth_3d`).
 - **5 Rust-only extensions** with no C++ layer type to anchor against.
 - **4 layer ports incomplete/partial**: `Yolo3d` has only its raw runtime and
   label/config helpers; Region truth-loss/decode is absent; `Dcnv3` and
   `DetrDecoder` have no variants.
 
-24 + 36 + 5 = 65 represented variants; `Unsupported` is a separate sentinel.
+33 + 27 + 5 = 65 represented variants; `Unsupported` is a separate sentinel.
 `Yolo3d` remains open: identity/seed/checkpoint tests are not a decode-axis pin.
 
 Evidence rule for every row and every new test: **hand-derived from source, no
@@ -31,7 +31,7 @@ compiled-C++ golden**. Do not write "C++ parity".
 - [Axis classes](#axis-classes)
 - [Fixture rules](#fixture-rules)
 - [Summary](#summary)
-- [Pinned variants (31)](#pinned-variants-31)
+- [Pinned variants (33)](#pinned-variants-33)
 - [Open: Tier 1, shape and geometry](#open-tier-1-shape-and-geometry)
 - [Open: Tier 2, heads and losses](#open-tier-2-heads-and-losses)
 - [Open: Tier 3, sequence and recurrent](#open-tier-3-sequence-and-recurrent)
@@ -98,18 +98,18 @@ classes that apply.
 
 | Status | Count | Notes |
 |---|---|---|
-| Pinned | 32 C++-backed variants / 36 tests | transformer, LAYA, MoE/EML, DCNv4, DPT, conv/connected, maxpool/avgpool, localavgpool, route/upsample/reorg/shuffle/softmax/scale/SAM, slice/shortcut/deconv, FoveationFilm; one Rust-only Crop contract test |
+| Pinned | 33 C++-backed variants; 37 `axis_layout` tests total | transformer, LAYA, MoE/EML, DCNv4, DPT, conv/connected, maxpool/avgpool, localavgpool, route/upsample/reorg/shuffle/softmax/scale/SAM, slice/shortcut/deconv, FoveationFilm, HyperbolicFoveation; one Rust-only Crop contract test |
 | Open, Tier 1 | 3 | dropout, cost, recursive block |
 | Open, Tier 2 | 15 | yolo family including partial yolo_3d, modern heads, OBB, losses, segmentation, contrastive, logistic, regression |
 | Open, Tier 3 | 3 | rnn, lstm, crnn |
-| Open, Tier 4 | 7 | deform_conv, dsconv, graph_conv, wmhf, clifford, hf, depth_anything |
+| Open, Tier 4 | 6 | deform_conv, dsconv, graph_conv, wmhf, clifford, depth_anything |
 | Rust-only | 5 | no C++ layer type; pin Rust's own contract |
 | Ports incomplete/partial | 4 | Region truth-loss/decode; yolo_3d partial; dcnv3 and detr_decoder blocked |
 
 `axis_layout` baseline after the GRU Rust-contract and MaxPool/AvgPool/LocalAvgPool/Connected/Route/Upsample/Reorg pins:
-**36 passed, 946 filtered out** (982 lib tests; run under `MEM=3G`). FoveationFilm's hand-computed source-derived pin and Crop's Rust-contract pin are included; every tier below grows that count, which must never shrink.
+**37 passed, 945 filtered out** (982 lib tests; run under `MEM=3G`). FoveationFilm and HyperbolicFoveation have hand-computed source-derived pins; Crop's Rust-contract pin is included. Every tier below grows that count, which must never shrink.
 
-## Pinned variants (32)
+## Pinned variants (33)
 
 | Variant | C++ reference | Axis classes | Pinning test |
 |---|---|---|---|
@@ -145,6 +145,7 @@ classes that apply.
 | `LayaLoss` | `Jev_laya:src-lib/laya_loss_layer.cpp:296` (`loss_forward_host`) | batch, reduce | `laya_loss.rs:459` `loss_axis_layout_excludes_padding_rows_from_batch_mean` |
 | `Region` | `Jev_laya:src-lib/region_layer.cpp:209`, `blas.cpp::flatten:104` | head, layout, batch | `runtime.rs` `region_axis_layout_matches_cpp_flatten_objectness_and_classes` |
 | `FoveationFilm` | `Jev_laya:src-lib/foveation_film_layer.cpp:160-222` | layout, reduce | `foveation_film.rs` `foveation_film_axis_layout_maps_batch_hf_embedding_and_channel_affines` |
+| `HyperbolicFoveation` | `Jev_laya:src-lib/hyperbolic_foveation_layer.cpp:1341-1441` (`map_x/map_y`, `hf_grid`, per-channel `cv::remap`) | layout, geometry, batch | `hyperbolic_foveation.rs` `hyperbolic_foveation_axis_layout_keeps_batch_channel_hw_and_grid_xy` |
 
 ## Open: Tier 1, shape and geometry
 
@@ -200,7 +201,6 @@ Weights order is covered for all of them (see [Weights axis](#weights-axis)).
 | `GraphConv` | `graph_conv_layer.cpp:621` | layout, weights | neighbor index order and group split; optional weight layouts |
 | `Wmhf` | `wmhf_layer.cpp` | layout, reduce | wavelet sub-band split order (LL/LH/HL/HH) and per-band channel mapping |
 | `Clifford` | `clifford_layer.cpp:1569` | layout, reduce | avgpool+DropPath spatial axis; Fourier vs inner/abs/local vs wedge/global block order |
-| `HyperbolicFoveation` | `hyperbolic_foveation_layer.cpp:1341` | layout, geometry | warp samples `(x,y)` from `(w,h)`; source-edge gradient axis; `W != H` |
 | `DepthAnything` | `depth_anything_layer.cpp:806` | token, layout | DINOv2 patch token order and cls-token removal; external vs sequential weight source axis |
 
 ## Rust-only extensions (5)
