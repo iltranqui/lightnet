@@ -45232,6 +45232,59 @@ num_dwconv=1
     }
 
     #[test]
+    fn sam_axis_layout_pins_elementwise_nchw_source_and_adjoint() {
+        use crate::axis_fixture::{axis_tensor, nchw_index};
+        use crate::model::{Activation, SamSpec};
+
+        let shape = TensorShape::new(3, 2, 2, 2);
+        let input = Tensor::from_data(shape, axis_tensor(shape)).expect("SAM input");
+        let source = Tensor::from_data(
+            shape,
+            axis_tensor(shape).into_iter().map(|value| value + 0.5).collect(),
+        )
+        .expect("named SAM source");
+        let seed = Tensor::from_data(
+            shape,
+            axis_tensor(shape).into_iter().map(|value| value + 0.25).collect(),
+        )
+        .expect("SAM adjoint seed");
+        let spec = SamSpec {
+            from: 0,
+            activation: Activation::Linear,
+        };
+        let (output, activation_input) = super::forward_sam(&spec, &input, &source, shape)
+            .expect("SAM forward");
+        let (input_gradient, source_gradient) = super::backward_sam(
+            &spec,
+            &input,
+            &source,
+            &output,
+            &seed,
+            activation_input.as_ref(),
+        )
+        .expect("SAM backward");
+
+        for n in 0..shape.batch {
+            for c in 0..shape.channels {
+                for h in 0..shape.height {
+                    for w in 0..shape.width {
+                        let index = nchw_index(shape, n, c, h, w);
+                        assert_eq!(output.data[index], input.data[index] * source.data[index]);
+                        assert_eq!(
+                            input_gradient.data[index],
+                            seed.data[index] * source.data[index]
+                        );
+                        assert_eq!(
+                            source_gradient.data[index],
+                            seed.data[index] * input.data[index]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn scale_channels_axis_layout_pins_named_source_and_channel_or_spatial_broadcast() {
         use crate::axis_fixture::{axis_tensor, nchw_index};
         use crate::model::{Activation, ScaleChannelsSpec};
