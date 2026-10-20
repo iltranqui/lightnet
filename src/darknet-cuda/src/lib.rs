@@ -2949,6 +2949,45 @@ pub trait F32TensorOpsBackend {
         self.upload_f32(output_shape, &logits)
     }
 
+    /// Reinterpret output-gradient storage `[B,1,1,K]` as connected rows `[B*K,1]`.
+    fn laya_scorer_seed_rows_f32(
+        &self,
+        seed: &Self::Tensor,
+        batch: usize,
+        options: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let values = self.download_f32(seed)?;
+        assert_eq!(values.len(), batch * options);
+        self.upload_f32(&[batch * options, 1], &values)
+    }
+
+    /// Scatter option-row gradients `[B*K,H]` back to input layout `[B,H,1,K]`.
+    fn laya_scorer_pack_input_grad_f32(
+        &self,
+        rows: &Self::Tensor,
+        batch: usize,
+        hidden: usize,
+        options: usize,
+        output_shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert_eq!(output_shape, [batch, hidden, 1, options]);
+        let rows = self.download_f32(rows)?;
+        assert_eq!(rows.len(), batch * options * hidden);
+        let mut output = vec![0.0; rows.len()];
+        for b in 0..batch {
+            for k in 0..options {
+                for h in 0..hidden {
+                    output[(b * hidden + h) * options + k] = rows[(b * options + k) * hidden + h];
+                }
+            }
+        }
+        self.upload_f32(output_shape, &output)
+    }
+
     /// Recompute-based derivative of standard online attention. Inputs are
     /// fused QKV `[B,T,3C]`, context/output gradient `[B,T,C]`, and LSE
     /// `[B,H,T]`; output is fused dQKV `[B,T,3C]`.

@@ -8004,6 +8004,75 @@ impl F32TensorOpsBackend for OxideBackend {
         Ok(OxideTensorF32::new(output, output_shape))
     }
 
+    fn laya_scorer_seed_rows_f32(
+        &self,
+        seed: &Self::Tensor,
+        batch: usize,
+        options: usize,
+        _config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let op = "laya_scorer_seed_rows_f32";
+        let len = batch
+            .checked_mul(options)
+            .ok_or_else(|| shape_err(op, "seed length overflows usize".to_owned()))?;
+        if batch == 0 || options == 0 {
+            return Err(shape_err(op, "batch/options must be positive".to_owned()));
+        }
+        let seed = self.f32v(seed)?;
+        if seed.shape() != [batch, 1, 1, options] || seed.len() != len {
+            return Err(shape_err(op, format!("seed tensor shape/length mismatch: {:?}/{}", seed.shape(), seed.len())));
+        }
+        Ok(OxideTensorF32 {
+            buf: seed.buf.clone(),
+            shape: vec![len, 1],
+            half: None,
+        })
+    }
+
+    fn laya_scorer_pack_input_grad_f32(
+        &self,
+        rows: &Self::Tensor,
+        batch: usize,
+        hidden: usize,
+        options: usize,
+        output_shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let op = "laya_scorer_pack_input_grad_f32";
+        let len = batch
+            .checked_mul(hidden)
+            .and_then(|n| n.checked_mul(options))
+            .ok_or_else(|| shape_err(op, "gradient length overflows usize".to_owned()))?;
+        let rows_count = batch
+            .checked_mul(options)
+            .ok_or_else(|| shape_err(op, "row count overflows usize".to_owned()))?;
+        if batch == 0
+            || hidden == 0
+            || options == 0
+            || output_shape != [batch, hidden, 1, options]
+        {
+            return Err(shape_err(op, format!("invalid output shape {output_shape:?}")));
+        }
+        let rows = self.f32v(rows)?;
+        if rows.shape() != [rows_count, hidden] || rows.len() != len {
+            return Err(shape_err(op, format!("row tensor shape/length mismatch: {:?}/{}", rows.shape(), rows.len())));
+        }
+        let mut output = self.alloc_uninit(len)?;
+        // SAFETY: equal extents bound all row/channel/option transpose indices.
+        unsafe {
+            self.layers_extra.laya_scorer_pack_input_grad(
+                &self.stream,
+                launch::elementwise(len, config),
+                &rows.buf,
+                &mut output,
+                hidden,
+                options,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, output_shape))
+    }
+
     fn laya_head_attention_f32(
         &self,
         qkv: &Self::Tensor,

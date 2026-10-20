@@ -19286,8 +19286,6 @@ where
                         &mut layer_output_gradients,
                     )?;
                 }
-                // `[laya_scorer]`: LayerNorm + two dense layers on the host, so
-                // the gradient round-trips too.
                 (
                     LayerKind::LayaScorer(spec),
                     Some(LayerParams::LayaScorer(weights)),
@@ -19298,27 +19296,19 @@ where
                             reference: -1,
                         },
                     )?;
-                    let host = self
-                        .download_tensor(current, layer.input_shape)
-                        .map_err(|err| backend_error("download laya_scorer input", err))?;
-                    let host_seed = self
-                        .download_tensor(&grad, layer.output_shape)
-                        .map_err(|err| backend_error("download laya_scorer seed", err))?;
-                    let data = crate::laya_scorer::scorer_backward_input(
-                        &host.data,
-                        &host_seed.data,
-                        weights,
+                    let input_gradient = laya_scorer_gpu::backward_input(
+                        &self.backend,
                         spec,
-                        layer.input_shape.batch,
-                    )
-                    .map_err(Error::InvalidConfig)?;
-                    let uploaded = self
-                        .backend
-                        .upload_f32(&tensor_backend_shape(layer.input_shape), &data)
-                        .map_err(|err| backend_error("upload laya_scorer input gradient", err))?;
+                        weights,
+                        current,
+                        &grad,
+                        layer.input_shape,
+                        layer.output_shape,
+                        config,
+                    )?;
                     self.accumulate_previous_gpu_gradient(
                         layer.index,
-                        uploaded,
+                        input_gradient,
                         &mut layer_output_gradients,
                     )?;
                 }

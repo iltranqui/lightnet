@@ -888,6 +888,26 @@ pub mod kernels {
         }
     }
 
+    /// Scatter option rows `[B*K,H]` to channel-major `[B,H,1,K]`.
+    #[kernel]
+    pub fn laya_scorer_pack_input_grad(
+        rows: &[f32],
+        mut output: DisjointSlice<f32>,
+        hidden: usize,
+        options: usize,
+    ) {
+        let index = thread::index_1d().get();
+        if index < output.len() {
+            let batch = index / (hidden * options);
+            let rem = index - batch * hidden * options;
+            let channel = rem / options;
+            let option = rem % options;
+            let source = (batch * options + option) * hidden + channel;
+            // SAFETY: validated equal element counts bound each transpose index.
+            unsafe { *output.as_mut_ptr().add(index) = rows[source]; }
+        }
+    }
+
     /// Pack `[B*K]` option logits into `[B,1,1,K]` (identity in storage).
     #[kernel]
     pub fn laya_scorer_pack(input: &[f32], mut output: DisjointSlice<f32>) {
