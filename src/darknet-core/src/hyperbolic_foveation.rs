@@ -1047,6 +1047,51 @@ pub(crate) fn transform_box_with_jacobian(
     ]
 }
 
+pub(crate) fn warp_parameter_gradients_from_grid_gradient(
+    grid_gradient: &[f32],
+    batch: usize,
+    height: usize,
+    width: usize,
+    params_per_batch: &[HfParams],
+    method: HfInverseMethod,
+    iterations: usize,
+    eta: f32,
+) -> Result<Vec<[f32; 5]>> {
+    let grid_count = checked_numel(&[batch, height, width, 2], "sampling-grid gradient")?;
+    if grid_gradient.len() != grid_count {
+        return Err(invalid(format!(
+            "sampling-grid gradient has {} values, expected {grid_count}", grid_gradient.len()
+        )));
+    }
+    if params_per_batch.len() != batch {
+        return Err(invalid("per-batch parameter count does not match warp batch"));
+    }
+    let mut param_gradients = vec![[0.0; 5]; batch];
+    let width_scale = width.saturating_sub(1) as f32 * 0.5;
+    let height_scale = height.saturating_sub(1) as f32 * 0.5;
+    for n in 0..batch {
+        for y in 0..height {
+            let qy = 2.0 * y as f32 / (height - 1).max(1) as f32 - 1.0;
+            for x in 0..width {
+                let qx = 2.0 * x as f32 / (width - 1).max(1) as f32 - 1.0;
+                let inverse = inverse_point_param_jacobian(
+                    [qx, qy], params_per_batch[n], method, iterations, eta,
+                );
+                let grid_index = ((n * height + y) * width + x) * 2;
+                let grid_seed = [
+                    grid_gradient[grid_index] * width_scale,
+                    grid_gradient[grid_index + 1] * height_scale,
+                ];
+                for parameter in 0..5 {
+                    param_gradients[n][parameter] += grid_seed[0] * inverse.params[0][parameter]
+                        + grid_seed[1] * inverse.params[1][parameter];
+                }
+            }
+        }
+    }
+    Ok(param_gradients)
+}
+
 pub(crate) fn warp_backward_with_param_gradients(
     input: &[f32],
     output_seed: &[f32],
@@ -1061,38 +1106,9 @@ pub(crate) fn warp_backward_with_param_gradients(
     eta: f32,
 ) -> Result<(WarpGradients, Vec<[f32; 5]>)> {
     let warp = warp_nchw_backward(input, output_seed, batch, channels, height, width, grid)?;
-    if params_per_batch.len() != batch {
-        return Err(invalid(
-            "per-batch parameter count does not match warp batch",
-        ));
-    }
-    let mut param_gradients = vec![[0.0; 5]; batch];
-    let width_scale = width.saturating_sub(1) as f32 * 0.5;
-    let height_scale = height.saturating_sub(1) as f32 * 0.5;
-    for n in 0..batch {
-        for y in 0..height {
-            let qy = 2.0 * y as f32 / (height - 1).max(1) as f32 - 1.0;
-            for x in 0..width {
-                let qx = 2.0 * x as f32 / (width - 1).max(1) as f32 - 1.0;
-                let inverse = inverse_point_param_jacobian(
-                    [qx, qy],
-                    params_per_batch[n],
-                    method,
-                    iterations,
-                    eta,
-                );
-                let grid_index = ((n * height + y) * width + x) * 2;
-                let grid_seed = [
-                    warp.grid[grid_index] * width_scale,
-                    warp.grid[grid_index + 1] * height_scale,
-                ];
-                for parameter in 0..5 {
-                    param_gradients[n][parameter] += grid_seed[0] * inverse.params[0][parameter]
-                        + grid_seed[1] * inverse.params[1][parameter];
-                }
-            }
-        }
-    }
+    let param_gradients = warp_parameter_gradients_from_grid_gradient(
+        &warp.grid, batch, height, width, params_per_batch, method, iterations, eta,
+    )?;
     Ok((warp, param_gradients))
 }
 

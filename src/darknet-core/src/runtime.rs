@@ -3736,6 +3736,7 @@ impl ExecutableNetwork {
                             &grad,
                             cache,
                             auxiliary_gradient.as_deref(),
+                            None,
                         )?;
                     let Some(slot) = param_gradients.get_mut(layer.index) else {
                         return Err(Error::InvalidConfig(format!(
@@ -16503,7 +16504,7 @@ where
                         &[warp_input.shape.batch, warp_input.shape.height, warp_input.shape.width, 2],
                         &cache.grid,
                     ).map_err(|err| backend_error("upload HF backward grid", err))?;
-                    let (native_warp_gradient, _native_grid_gradient) = self.backend
+                    let (native_warp_gradient, native_grid_gradient) = self.backend
                         .hyperbolic_foveation_warp_backward_f32(
                             warp_input_gpu,
                             &grid_gpu,
@@ -16512,12 +16513,15 @@ where
                             config,
                         )
                         .map_err(|err| backend_error("native HF warp backward", err))?;
+                    let native_grid_gradient = self.backend.download_f32(&native_grid_gradient)
+                        .map_err(|err| backend_error("download native HF grid gradient", err))?;
                     let auxiliary = foveation_hf_auxiliary_gradients
                         .get(layer.index)
                         .and_then(Option::as_deref);
                     let (_host_warp_gradient, predictor_gradient, param_gradient) =
                         backward_hyperbolic_foveation(
                             spec, params, warp_input, &output_gradient, cache, auxiliary,
+                            Some(&native_grid_gradient),
                         )?;
                     {
                         let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
@@ -23557,6 +23561,7 @@ fn backward_hyperbolic_foveation(
     output_gradient: &Tensor,
     cache: &HyperbolicFoveationForwardCache,
     auxiliary_param_gradients: Option<&[f32]>,
+    precomputed_grid_gradient: Option<&[f32]>,
 ) -> Result<(
     Tensor,
     Option<(Option<usize>, Tensor)>,
@@ -23587,21 +23592,36 @@ fn backward_hyperbolic_foveation(
         .chunks_exact(per_batch)
         .map(|values| hyperbolic_foveation_params_from_values(values, spec))
         .collect::<Result<Vec<_>>>()?;
-    let (warp_grad, semantic_gradients) =
-        crate::hyperbolic_foveation::warp_backward_with_param_gradients(
-            &warp_input.data,
-            &output_gradient.data,
-            warp_input.shape.batch,
-            warp_input.shape.channels,
-            warp_input.shape.height,
-            warp_input.shape.width,
-            &cache.grid,
-            &params_for_grid,
-            spec.inverse_method,
-            spec.nr_iters,
-            spec.nr_eta,
-        )?;
-    let warp_input_gradient = Tensor::from_data(warp_input.shape, warp_grad.input)?;
+    let (warp_input_gradient_data, semantic_gradients) =
+        if let Some(grid_gradient) = precomputed_grid_gradient {
+            let semantic = crate::hyperbolic_foveation::warp_parameter_gradients_from_grid_gradient(
+                grid_gradient,
+                warp_input.shape.batch,
+                warp_input.shape.height,
+                warp_input.shape.width,
+                &params_for_grid,
+                spec.inverse_method,
+                spec.nr_iters,
+                spec.nr_eta,
+            )?;
+            (vec![0.0; warp_input.data.len()], semantic)
+        } else {
+            let (warp, semantic) = crate::hyperbolic_foveation::warp_backward_with_param_gradients(
+                &warp_input.data,
+                &output_gradient.data,
+                warp_input.shape.batch,
+                warp_input.shape.channels,
+                warp_input.shape.height,
+                warp_input.shape.width,
+                &cache.grid,
+                &params_for_grid,
+                spec.inverse_method,
+                spec.nr_iters,
+                spec.nr_eta,
+            )?;
+            (warp.input, semantic)
+        };
+    let warp_input_gradient = Tensor::from_data(warp_input.shape, warp_input_gradient_data)?;
     let mut gradient = HyperbolicFoveationParams {
         hf_params: vec![0.0; per_batch],
         pred_w1: vec![0.0; params.pred_w1.len()],

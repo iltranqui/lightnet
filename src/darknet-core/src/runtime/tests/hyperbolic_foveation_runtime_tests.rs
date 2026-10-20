@@ -835,49 +835,24 @@ fn hf_sgd_update_obeys_dont_update_burnin_and_train_only_bn_gates() {
 }
 
 #[test]
-fn gpu_forward_compact_and_updates_explicitly_reject_hf() {
+fn gpu_forward_is_supported_while_compact_and_updates_reject_hf() {
     let network = seeded_hf_network("isotropic");
     let input = sample_input(network.net.input_shape());
+    let expected = ExecutableNetwork::new(network.clone()).forward(&input).unwrap();
     let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
-    assert!(
-        gpu.forward(&input)
-            .unwrap_err()
-            .to_string()
-            .contains("[hyperbolic_foveation] GPU execution is not implemented")
-    );
+    let actual = gpu.forward(&input).expect("HF GPU-reference forward");
+    assert_eq!(actual.layer_outputs, expected.layer_outputs);
     assert!(
         gpu.forward_compact(&input)
             .unwrap_err()
             .to_string()
             .contains("[hyperbolic_foveation] GPU compact inference is not implemented")
     );
-    assert!(
-        gpu.update_weights_gpu(0.01, 0.9, 0.0, 1)
-            .unwrap_err()
-            .to_string()
-            .contains("[hyperbolic_foveation] GPU optimizer updates is not implemented")
-    );
-    let tensor = FakeTensor {
-        shape: Vec::new(),
-        data: Vec::new(),
-    };
-    let state = crate::runtime::GpuForwardState {
-        input_gpu: tensor,
-        gpu_layer_outputs: Vec::new(),
-        gpu_layer_activation_inputs: Vec::new(),
-        gpu_batch_norm_caches: Vec::new(),
-        gpu_rnn_caches: Vec::new(),
-        gpu_crnn_caches: Vec::new(),
-        gpu_lstm_caches: Vec::new(),
-        gpu_moe_caches: Vec::new(),
-        gpu_eml_caches: Vec::new(),
-        gpu_dcnv4_caches: Vec::new(),
-        cpu_forward: ForwardResult::from_heads(Vec::new(), Vec::new()),
-    };
-    assert!(
-        gpu.backward_accumulate_seeded_gpu(&state, &[])
-            .unwrap_err()
-            .to_string()
-            .contains("[hyperbolic_foveation] GPU backward and updates is not implemented")
-    );
+    let training_forward = gpu.forward_training_with_state(&input).unwrap();
+    let seed = Tensor::zeros(gpu.network.layers[0].output_shape);
+    gpu.zero_train_buffers_gpu().unwrap();
+    gpu.backward_accumulate_seeded_gpu(&training_forward, &[Some(seed)])
+        .expect("HF host-fallback backward with native warp adjoints");
+    gpu.update_weights_gpu(0.01, 0.9, 0.0, 1)
+        .expect("HF host-fallback optimizer update");
 }
