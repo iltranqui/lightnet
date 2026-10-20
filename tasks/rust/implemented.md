@@ -159,6 +159,7 @@ file is named inline.
 - [131. Route source/group axis pin](#131-route-sourcegroup-axis-pin)
 - [132. Upsample axis pin and ragged reverse extent](#132-upsample-axis-pin-and-ragged-reverse-extent)
 - [133. Reorg forward axis pin and reverse-source finding](#133-reorg-forward-axis-pin-and-reverse-source-finding)
+- [134. ChannelShuffle axis pin](#134-channelshuffle-axis-pin)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1860,6 +1861,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 133. Reorg forward axis pin and reverse-source finding
 
 - v0.1.034 (`4842e926`): hand-derived the normal `[reorg]` forward/adjoint from `Jev_laya:src-lib/reorg_layer.cpp:112-128` and `blas.cpp:69-100`. The batch-2 NCHW fixture pins offset-channel packing and both spatial offsets with explicit sentinels; `MEM=3G ./tools/test_host.sh reorg_axis_layout` passed and `MEM=3G ./tools/test_host.sh axis_layout` passed 30 tests. C++ reverse-mode is not pinned: source inspection found its `out_c`/`in_c` divisor defect (documented as axis ledger F2). No compiled-C++ golden.
+
+## 134. ChannelShuffle axis pin
+
+- v0.1.035 (`be9738c2`): hand-derived from `Jev_laya:src-lib/channel_shuffle_layer.cpp:11-20,95-113`; named batch-2 non-square NCHW sentinel test pins the group-row/group-column transpose and exact inverse adjoint across spatial planes. `MEM=3G ./tools/test_host.sh shuffle_axis_layout` passed; full `MEM=3G ./tools/test_host.sh axis_layout` passed 31 tests. No compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 

@@ -9,10 +9,10 @@ Measured 2026-10-18 against `model.rs` (65 represented variants plus
 `Unsupported`), `Jev_laya:src-lib/darknet_enums.hpp` and the `depth_3d`
 YOLO-3D source. Represented does not imply a complete layer port:
 
-- **27 variants pinned by 30 named tests** (`*axis_layout*`); the extra
+- **28 variants pinned by 31 named tests** (`*axis_layout*`); the extra
   tests are Swin's second axis (`cyclic_shift`) and the two convolutional
   pins (shape and forward).
-- **33 C++-backed variants open** (30 on `Jev_laya`, plus `Logistic` on
+- **32 C++-backed variants open** (29 on `Jev_laya`, plus `Logistic` on
   `raptor`, `Regression` on `fog`, and the partial `Yolo3d` on `depth_3d`).
 - **5 Rust-only extensions** with no C++ layer type to anchor against.
 - **4 layer ports incomplete/partial**: `Yolo3d` has only its raw runtime and
@@ -31,7 +31,7 @@ compiled-C++ golden**. Do not write "C++ parity".
 - [Axis classes](#axis-classes)
 - [Fixture rules](#fixture-rules)
 - [Summary](#summary)
-- [Pinned variants (27)](#pinned-variants-27)
+- [Pinned variants (28)](#pinned-variants-28)
 - [Open: Tier 1, shape and geometry](#open-tier-1-shape-and-geometry)
 - [Open: Tier 2, heads and losses](#open-tier-2-heads-and-losses)
 - [Open: Tier 3, sequence and recurrent](#open-tier-3-sequence-and-recurrent)
@@ -98,8 +98,8 @@ classes that apply.
 
 | Status | Count | Notes |
 |---|---|---|
-| Pinned | 27 variants / 30 tests | transformer, LAYA, MoE/EML, DCNv4, DPT, conv/connected, maxpool/avgpool, localavgpool, route/upsample/reorg, slice/shortcut/deconv |
-| Open, Tier 1 | 7 | shuffle, scale, softmax, dropout, sam, cost, recursive block |
+| Pinned | 28 variants / 31 tests | transformer, LAYA, MoE/EML, DCNv4, DPT, conv/connected, maxpool/avgpool, localavgpool, route/upsample/reorg/shuffle, slice/shortcut/deconv |
+| Open, Tier 1 | 6 | scale, softmax, dropout, sam, cost, recursive block |
 | Open, Tier 2 | 15 | yolo family including partial yolo_3d, modern heads, OBB, losses, segmentation, contrastive, logistic, regression |
 | Open, Tier 3 | 3 | rnn, lstm, crnn |
 | Open, Tier 4 | 8 | deform_conv, dsconv, graph_conv, wmhf, clifford, hf, foveation_film, depth_anything |
@@ -107,10 +107,10 @@ classes that apply.
 | Ports incomplete/partial | 4 | Region truth-loss/decode; yolo_3d partial; dcnv3 and detr_decoder blocked |
 
 `axis_layout` baseline after the GRU Rust-contract and MaxPool/AvgPool/LocalAvgPool/Connected/Route/Upsample/Reorg pins:
-**30 passed, 945 filtered out** (975 lib tests; run under `MEM=3G`). Every tier below grows
+**31 passed, 945 filtered out** (976 lib tests; run under `MEM=3G`). Every tier below grows
 that count; it must never shrink.
 
-## Pinned variants (27)
+## Pinned variants (28)
 
 | Variant | C++ reference | Axis classes | Pinning test |
 |---|---|---|---|
@@ -124,6 +124,7 @@ that count; it must never shrink.
 | `Route` | `Jev_laya:src-lib/route_layer.cpp:91-139` | concat, layout, batch | `runtime.rs` `route_axis_layout_pins_named_source_order_group_slice_and_delta_scatter` |
 | `Upsample` | `Jev_laya:src-lib/upsample_layer.cpp:6-28`; `blas.cpp:669-695` | geometry, layout, reduce, batch | `runtime.rs` `upsample_axis_layout_pins_forward_repeat_reverse_sum_and_adjoint` |
 | `Reorg` | `Jev_laya:src-lib/reorg_layer.cpp:112-128`; `blas.cpp:69-100` | layout, batch | `runtime.rs` `reorg_axis_layout_pins_batch_channel_offset_and_adjoint` (normal forward path; reverse source defect noted in F2) |
+| `ChannelShuffle` | `Jev_laya:src-lib/channel_shuffle_layer.cpp:11-20,95-113` | layout, batch | `channel_shuffle.rs` `shuffle_axis_layout_preserves_batch_spatial_planes_and_group_interleave` |
 | `Shortcut` | `Jev_laya:src-lib/shortcut_layer.cpp:171` via `blas.cpp::shortcut_multilayer_cpu` | layout, concat, weights | `shortcut_weights.rs:182` `shortcut_axis_layout_uses_nchw_channel_slots_per_batch` |
 | `Vit` | `Jev_laya:src-lib/vit_layer.cpp:1260` (`vit_patchify_cpu`) | token, layout | `vit.rs:2208` `patchify_axis_layout_keeps_channel_fastest_order_across_batches` |
 | `Swin` | `Jev_laya:src-lib/transformer_layer.cpp:888` (`window_partition`, `cyclic_shift`) | window, layout | `swin.rs:1186` `window_partition_axis_layout_is_batch_major_raster_then_channel`, `swin.rs:1200` `cyclic_shift_axis_layout_wraps_each_nchw_plane_with_source_signs` |
@@ -149,7 +150,6 @@ silently changes a downstream `route`/`shortcut`.
 
 | Variant | Aliases | C++ reference | Axis classes | Required pin |
 |---|---|---|---|---|
-| `ChannelShuffle` | `channel_shuffle` | `channel_shuffle_layer.cpp:95` | layout | group-interleave order, `C` not divisible edge cases rejected |
 | `ScaleChannels` | `scale_channels` | `scale_channels_layer.cpp:73` | layout, concat | broadcast vs crop/pad slot math against a named source layer |
 | `Softmax` | `soft`, `softmax` | `softmax_layer.cpp:59` | reduce | `groups` reduction spans `C/groups` per group, not the whole sample |
 | `Dropout` | `dropout` | `dropout_layer.cpp:87` | layout, batch | per-sample mask (no shared mask across batch); inference is identity; DropBlock spatial mask |
