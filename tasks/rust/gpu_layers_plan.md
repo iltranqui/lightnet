@@ -101,12 +101,13 @@ Bounded native slice:
    cache exists and layouts match; HF source evaluation/cache transfer and HF
    warp/predictor backward remain explicit host operations. Missing sources
    error. FiLM parameter gradients are accumulated in host train buffers.
-4. [ ] Verify runtime input/parameter/HF gradients against the CPU through
-   actual Oxide runtime buffers and implement SGD/Adam update support. Primitive
-   tests cover actual-device parity/finite differences; runtime tests cover
-   outputs, HF/FiLM backward dispatch, and host-side exact train-buffer parity.
-   Add explicit unsupported-update/compact/f16 gate coverage. No compiled-C++
-   GPU-parity claim.
+4. [x] Add host-fallback SGD/Adam updates for HF/FiLM runtime train buffers;
+   GPU Muon is explicitly rejected. Actual Oxide one-step SGD/Adam CPU
+   parameter parity passes, with host exact buffer/update parity tests.
+5. [ ] Verify two-step runtime input/parameter/HF-gradient parity and optimizer
+   state/update gates through actual Oxide runtime buffers; cover compact/f16
+   rejection and retain explicit host HF warp/predictor boundaries. No
+   compiled-C++ GPU-parity claim.
 
 v0.2.120 implements native per-sample NCHW affine and exact input/gamma/beta
 adjoints; v0.2.121 composes native HF embedding/ReLU and gamma/beta projections
@@ -116,11 +117,13 @@ host-computed HF parameters and a deliberate CPU backward fallback. Focused
 actual-device runtime output parity and fallback-backward success pass. v0.2.124
 finite-differences every HF/FiLM projection gradient element in the primitive.
 v0.2.125 dispatches native runtime FiLM backward and applies the host HF
-warp/predictor adjoint; optimizer updates remain rejected.
+warp/predictor adjoint. v0.2.126 adds host SGD/Adam updates for these parameters;
+GPU Muon remains rejected, and two-step runtime parity is not yet covered.
 
-This remains an open plan, not evidence of a complete native layer; keep
-`layer-support.md` GPU `none` until runtime native backward and optimizer tests
-pass. Compact f16 remains deferred.
+This remains an open plan, not evidence of a complete native layer. Update
+`layer-support.md` to reflect the current hybrid host/device path, but do not
+claim native HF kernels or complete two-step optimizer coverage. Compact f16
+remains deferred.
 
 ## Act-head contract finding
 

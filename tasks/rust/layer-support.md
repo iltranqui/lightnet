@@ -66,15 +66,15 @@ with the command given rather than trusting the number.
 | Represented `LayerKind` variants | 65 (+`Unsupported`) |
 | CPU forward arm | 65 |
 | CPU standalone parameter backward | all parameterized kinds; head/pass-through kinds own no standalone backward |
-| CPU-only forward, no GPU path (hard reject) | 11 |
-| GPU forward but CPU/mixed backward | 9 |
+| CPU-only forward, no GPU path (hard reject) | 9 |
+| GPU forward but CPU/mixed backward | 11 (9 whole-network fallback + HF/FiLM host helpers) |
 | GPU native forward + device backward | 24 |
 | f16 inference | 24 variants (25 section names) |
 | Axis pinned | 31 variants / 34 tests |
 | Axis open | 29 (Tier 1: 3, Tier 2: 15, Tier 3: 3, Tier 4: 8) |
 | Axis Rust-only | 5 |
 | Partial/incomplete CPU layers | `Region`, `Detection`, `Yolo3d`; blocked: `Dcnv3`, `DetrDecoder` |
-| GPU Muon | partial hybrid integration: connected matrices use native Oxide momentum/lookahead, Newton–Schulz and direction+decay update; standard non-BN convolution, non-BN EML branches, non-BN MoE router/expert matrices, non-BN GraphConv projection/self/learned-edge matrices with `groups=2` parity, tested `dont_update` gating, and DNOPT6 save/load resume; BN GraphConv forward/backward is native for eligible modes, with rolling stats host-synchronized; Muon state/final updates remain host-managed, non-BN DCNv4 offset projection, non-BN deform_conv main/offset/optional mask matrices, local per-location, RNN, LSTM, deconvolutional, and transformer-family matrices use native Oxide Newton–Schulz with host-managed state/final updates. Convolution/EML/MoE/DCNv4 gradients are downloaded at optimizer boundaries; deform_conv gradients download during native backward. Updated convolution/expert parameters are re-uploaded and DCNv4 snapshots trigger cache refresh on the next forward. BN convolution/EML/MoE/DCNv4/deform_conv remain rejected; GraphConv BN training is native only for eligible edge modes/activations. Connected BN has actual-device output/parameter parity across two Muon updates; supported activations use native connected/BN backward and rolling-stat updates (v0.2.101), while BN gradient accumulation and rolling-stat synchronization remain host-managed. Connected momentum is cached between steps but mirrored to host each update; weights remain host-canonical. Standalone BatchNorm uses host AdamW fallback; other parameter families open |
+| GPU Muon | partial hybrid integration: connected matrices use native Oxide momentum/lookahead, Newton–Schulz and direction+decay update; standard non-BN convolution, non-BN EML branches, non-BN MoE router/expert matrices, non-BN GraphConv projection/self/learned-edge matrices with `groups=2` parity, tested `dont_update` gating, and DNOPT6 save/load resume; BN GraphConv forward/backward is native for eligible modes, with rolling stats host-synchronized; Muon state/final updates remain host-managed, non-BN DCNv4 offset projection, non-BN deform_conv main/offset/optional mask matrices, local per-location, RNN, LSTM, deconvolutional, and transformer-family matrices use native Oxide Newton–Schulz with host-managed state/final updates. Convolution/EML/MoE/DCNv4 gradients are downloaded at optimizer boundaries; deform_conv gradients download during native backward. Updated convolution/expert parameters are re-uploaded and DCNv4 snapshots trigger cache refresh on the next forward. BN convolution/EML/MoE/DCNv4/deform_conv remain rejected; GraphConv BN training is native only for eligible edge modes/activations. Connected BN has actual-device output/parameter parity across two Muon updates; supported activations use native connected/BN backward and rolling-stat updates (v0.2.101), while BN gradient accumulation and rolling-stat synchronization remain host-managed. Connected momentum is cached between steps but mirrored to host each update; weights remain host-canonical. Standalone BatchNorm and HF/FiLM use host AdamW fallback; HF/FiLM Muon remains explicitly unsupported; other parameter families open |
 
 ## Matrix
 
@@ -112,8 +112,8 @@ with the command given rather than trusting the number.
 | `Wmhf` | alias | C++ | fwd | exact | T4 | none | none | no |
 | `Clifford` | yes | C++ | fwd | exact | T4 | none | none | no |
 | `RecursiveBlock` | alias | body only | fwd | exact | T1 | none | none | no |
-| `HyperbolicFoveation` | yes | C++ | fwd | exact | T4 | none | none | no |
-| `FoveationFilm` | alias | C++ | fwd | exact | T4 | none | none | no |
+| `HyperbolicFoveation` | yes | C++ | fwd | exact | T4 | host fallback in hybrid runtime | host warp/predictor backward; per-layer host gradients | no |
+| `FoveationFilm` | alias | C++ | fwd | exact | T4 | native Oxide f32 (HF source/cache host-managed) | native FiLM adjoint + host HF backward; host SGD/Adam updates | no |
 | `Vit` | yes | C++ | fwd | exact | pin | host | cpu | no |
 | `Swin` | alias | Rust | fwd | exact | pin | host | cpu | no |
 | `TuckerAttention` | alias | C++ | fwd | exact | pin | host | cpu | no |
@@ -149,7 +149,7 @@ with the command given rather than trusting the number.
 
 ## GPU hard rejections (no device path at all)
 
-Eleven variants abort before any kernel runs. Source: the explicit rejection
+Nine variants abort before any kernel runs. Source: the explicit rejection
 paths in `runtime.rs` (including the `Gru` match arm).
 
 | Variant | Rejection message | Why it exists | Work item |
@@ -158,13 +158,17 @@ paths in `runtime.rs` (including the `Gru` match arm).
 | `Wmhf` | same | Stage-1 CPU only (DWT + EMA scan + 7 sub-convs) | container/XL wave |
 | `RecursiveBlock` | same | Stage-1 CPU only; full-recurrence gradient | container/XL wave |
 | `Clifford` | same | Stage-1 CPU only (XL mode matrix) | container/XL wave |
-| `HyperbolicFoveation` | `Stage-1 CPU support` | needs Newton-inverse warp kernel + detect/mAP reprojection | XL wave |
-| `FoveationFilm` | same | depends on the HF forward cache | XL wave |
 | `DepthAnything` | same | frozen DINOv2 ViT-S/14 | attention wave (after ViT backward) |
 | `DptHead` | same | four-tap fusion neck over DPT features | attention wave |
 | `Yolo3d` | same | raw CPU forward only; loss/decode absent | CPU first, then GPU |
 | `ObbRefine` (CARPN) | `GPU inference is not implemented` / `GPU CARPN training is unsupported` | CPU inference only; Stage-2 training deferred | after CARPN CPU training |
 | `Gru` training | `UnsupportedLayer` | Native f32 inference (including rolling-stat BN) exists; GPU training/backward remains unsupported | recurrent wave |
+
+`HyperbolicFoveation` and `FoveationFilm` now execute in the full GPU runtime:
+HF sampling/predictor forward and backward remain host helpers; FiLM projections
+and adjoints are native Oxide; SGD/Adam parameter updates are host-side. This is
+a hybrid path, not native HF support or full-layer GPU completion. Muon and
+compact/f16 inference remain rejected.
 
 `Local` has a bounded native f32 forward/backward path since
 v0.2.048; its optimizer remains host-staged and unsupported activations retain
@@ -195,8 +199,9 @@ the legacy host route.
 
 ## GPU forward but CPU backward
 
-`runtime.rs:17107 requires_cpu_backward_fallback` forces the **whole network**
-onto the CPU backward path when any of these is present. One such layer
+`runtime.rs:requires_cpu_backward_fallback` forces the **whole network**
+onto the CPU backward path when any of these is present. Per-layer host helpers
+that do not force a whole-network fallback are noted separately above. One such layer
 de-optimizes an entire model, which is why this list matters more than the raw
 layer count.
 
@@ -250,9 +255,9 @@ devices and head sizes (no native kernel at all), even though standard
 
 | Optimizer | CPU | GPU |
 |---|---|---|
-| SGD (momentum, decay, per-layer rate, gates) | all parameterized layers | device for conv/MoE/EML and eligible native DCNv4; host for connected, deconv, deform_conv, recurrent, weighted shortcut, vit, swin, tucker, mamba, kimi, local, batchnorm; n/a for hard rejects |
-| Adam/AdamW | all parameterized layers; DNOPT1–5 sidecars | device for conv/MoE/EML/DCNv4 (+BN scales); DCNv4 moments persist on-device between updates and materialize through the existing host sidecar on save; DNOPT1–5 readable |
-| Muon | v0.1.005 hybrid on eligible 2-D matrices, DNOPT6 | **partial runtime slice (v0.2.032–074)** — connected matrices use native Oxide momentum/lookahead, Newton–Schulz and final direction+decay update, with actual-GPU multi-step, resume, two-layer, and all three update-gate parity tests. Standard non-BN convolution, non-BN EML branches, non-BN MoE router/expert, non-BN GraphConv projection/self/learned-edge matrices with `groups=2` two-step CPU parity, DNOPT6 sidecar-resume, and `dont_update` gate coverage; BN GraphConv training uses native BN forward/backward with actual-Oxide SGD/Adam and Muon parity, and host-synchronized rolling stats, non-BN DCNv4 offset projection, non-BN deform_conv main/offset/optional mask, local per-location, RNN, LSTM, CRNN convolution projections (including BN matrix/AdamW split), deconvolution, ViT, Swin, TuckerAttention, MambaVision and KimiKda matrices use native Oxide orthogonalization with host-managed state/final updates and actual-GPU CPU parity. Convolution/EML/MoE/DCNv4 gradients transfer from device at the optimizer boundary, while deform_conv gradients download during native backward; convolution/expert caches refresh explicitly and DCNv4 snapshots refresh on the next forward. BN convolution/EML/MoE/DCNv4/deform_conv remain unsupported; eligible GraphConv BN training is native, with unsupported GraphConv variants retaining fallback. Connected BN has actual-device output/parameter parity across two Muon updates; supported activations use native BN backward while optimizer/stat synchronization remains host-managed (v0.2.101). Connected momentum persists on-device but is mirrored to host each update; parameters remain host-canonical. Standalone BatchNorm scales/biases use host AdamW fallback; other families remain open |
+| SGD (momentum, decay, per-layer rate, gates) | all parameterized layers | device for conv/MoE/EML and eligible native DCNv4; host for connected, deconv, deform_conv, recurrent, weighted shortcut, vit, swin, tucker, mamba, kimi, local, batchnorm, HyperbolicFoveation and FoveationFilm; n/a for hard rejects |
+| Adam/AdamW | all parameterized layers; DNOPT1–5 sidecars | device for conv/MoE/EML/DCNv4 (+BN scales); host fallback for HyperbolicFoveation/FoveationFilm and other staged families; DCNv4 moments persist on-device between updates and materialize through the existing host sidecar on save; DNOPT1–5 readable |
+| Muon | v0.1.005 hybrid on eligible 2-D matrices, DNOPT6 | **partial runtime slice (v0.2.032–074)** — connected matrices use native Oxide momentum/lookahead, Newton–Schulz and final direction+decay update, with actual-GPU multi-step, resume, two-layer, and all three update-gate parity tests. Standard non-BN convolution, non-BN EML branches, non-BN MoE router/expert, non-BN GraphConv projection/self/learned-edge matrices with `groups=2` two-step CPU parity, DNOPT6 sidecar-resume, and `dont_update` gate coverage; BN GraphConv training uses native BN forward/backward with actual-Oxide SGD/Adam and Muon parity, and host-synchronized rolling stats, non-BN DCNv4 offset projection, non-BN deform_conv main/offset/optional mask, local per-location, RNN, LSTM, CRNN convolution projections (including BN matrix/AdamW split), deconvolution, ViT, Swin, TuckerAttention, MambaVision and KimiKda matrices use native Oxide orthogonalization with host-managed state/final updates and actual-GPU CPU parity. Convolution/EML/MoE/DCNv4 gradients transfer from device at the optimizer boundary, while deform_conv gradients download during native backward; convolution/expert caches refresh explicitly and DCNv4 snapshots refresh on the next forward. BN convolution/EML/MoE/DCNv4/deform_conv remain unsupported; eligible GraphConv BN training is native, with unsupported GraphConv variants retaining fallback. Connected BN has actual-device output/parameter parity across two Muon updates; supported activations use native BN backward while optimizer/stat synchronization remains host-managed (v0.2.101). Connected momentum persists on-device but is mirrored to host each update; parameters remain host-canonical. Standalone BatchNorm and HF/FiLM use host AdamW fallback; HF/FiLM Muon remains explicitly unsupported |
 
 Muon eligibility (CPU, from `AGENTS.md`): convolution weights viewed as
 `[out, in*kh*kw]`, `connected`, `deconvolutional`, attention/MLP projections in

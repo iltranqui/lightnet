@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.126: added host-fallback SGD/Adam optimizer updates for GPU-runtime HF/FiLM training; actual Oxide one-step SGD/Adam CPU parity passes, as do 12 focused host tests and the Muon rejection gate. Two-step runtime parity remains open. See `implemented.md` §163.
 - v0.2.125: runtime FiLM backward now uses native Oxide input/projection adjoints and routes HF-source gradients through the host HF backward helper; actual-device runtime test plus 12 focused host tests pass. GPU optimizer updates remain rejected. See `implemented.md` §162.
 - v0.2.124: actual-Oxide FoveationFilm full projection backward now finite-differences every HF, embedding, gamma, and beta gradient element against host forward; both focused tests pass. This remains primitive-only; runtime backward uses CPU fallback. See `implemented.md` §161.
 - v0.2.123: integrated native Oxide FoveationFilm runtime forward with host-computed HF source parameters and explicit CPU backward fallback; actual-device runtime parity/backward-fallback plus all 12 focused host tests pass. GPU optimizer, compact/f16 paths, and native layer backward remain open; see `implemented.md` §160.
