@@ -155,6 +155,7 @@ file is named inline.
 - [127. Native f16 Detection and Regression identity paths](#127-native-f16-detection-and-regression-identity-paths)
 - [128. Native connected-layer BN GPU backward](#128-native-connected-layer-bn-gpu-backward)
 - [129. Connected BN GPU backward activation parity](#129-connected-bn-gpu-backward-activation-parity)
+- [130. Connected BN GPU backward SGD/Adam parity](#130-connected-bn-gpu-backward-sgdadam-parity)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1840,6 +1841,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 129. Connected BN GPU backward activation parity
 
 - v0.2.102 (`93c56f17`): expanded the actual-Oxide two-step connected-BN GPU Muon parity fixture to cover both `linear` and nonlinear `leaky` activation, including outputs, weights, biases, scales and rolling stats. The focused test and all five `gpu_muon_connected` runtime-chain tests passed. Rust CPU-reference parity; no compiled-C++ golden.
+
+## 130. Connected BN GPU backward SGD/Adam parity
+
+- v0.2.103 (`97374ebc`): added actual-Oxide two-step Connected BN backward and optimizer parity for both SGD and Adam with `leaky` activation. Outputs, weights, biases, BN scales, rolling means and rolling variances match the CPU reference. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_connected_bn_backward_matches_cpu_sgd_and_adam` passed. This verifies Rust CPU-reference parity only; no compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 
