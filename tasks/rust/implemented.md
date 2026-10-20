@@ -208,6 +208,7 @@ file is named inline.
 - [180. Native HF fixed-point parameter adjoint](#180-native-hf-fixed-point-parameter-adjoint)
 - [181. Native HF Newton parameter adjoint](#181-native-hf-newton-parameter-adjoint)
 - [182. GPU Muon for HF/FiLM matrices](#182-gpu-muon-for-hffilm-matrices)
+- [183. HF/FiLM GPU Muon update gate](#183-hffilm-gpu-muon-update-gate)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2105,6 +2106,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 182. GPU Muon for HF/FiLM matrices
 
 - v0.2.146 (`f462adad`): removed the GPU-Muon rejection for `[hyperbolic_foveation]` and `[foveation_film]`; their eligible 2-D predictors/projections now use the existing native Oxide orthogonalizer, while non-matrix parameters retain AdamW fallback and momentum/final updates remain host-managed. Added actual-Oxide two-step runtime parity for learned anisotropic HF plus FiLM, checking direct input gradients, every HF/FiLM gradient buffer, and all matrix/bias parameter blocks. The existing compact/f16 rejections remain. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_and_hf_gpu_muon_match_cpu_across_steps` and `... foveation_film_gpu_compact_f16_rejection_and_muon_support_are_explicit` passed. No compiled-C++ or performance claim.
+
+## 183. HF/FiLM GPU Muon update gate
+
+- v0.2.147 (`ff29e118`): added actual-Oxide two-step learned-anisotropic HF/FiLM Muon parity with FiLM `dont_update=1`; the first gated step preserves FiLM parameters, then the next update applies. CPU/GPU parameter equality is checked at both steps. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_gpu_muon_dont_update_gate_matches_cpu` passed. This adds gate evidence, not a new native kernel or C++ golden.
 
 ## Not implemented / open (pointer)
 
