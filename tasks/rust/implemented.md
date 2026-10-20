@@ -143,6 +143,7 @@ file is named inline.
 - [115. Native f16 SAM inference](#115-native-f16-sam-inference)
 - [116. Native f16 channel shuffle inference](#116-native-f16-channel-shuffle-inference)
 - [117. Native f16 reorg inference](#117-native-f16-reorg-inference)
+- [118. Native f32 Region GPU execution](#118-native-f32-region-gpu-execution)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1780,6 +1781,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 117. Native f16 reorg inference
 
 - v0.2.090: added native Oxide f16 forward and reverse reorg permutations, reusing the checked shared reorg geometry and preserving zero-filled uncovered borders on reverse. Compact f16 dispatch now accepts Reorg. Actual-Oxide batch-2 non-square odd-size forward+reverse case matched f32 compact inference with relative max error 4.646e-4; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed 10 tests before the fixture was refined, and the refined focused test passed. Inference only; no compiled-C++ golden.
+
+## 118. Native f32 Region GPU execution
+
+- v0.2.091: replaced Region's full/compact GPU hard rejection with native Oxide f32 layout/activation forward and exact Rust-forward input adjoint. Forward transposes channel-major NCHW values to spatial/anchor/entry rows, applies objectness sigmoid and optional class softmax; backward differentiates those transforms and returns NCHW gradients. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain region_native_gpu_forward_backward_matches_cpu` passed actual-Oxide CPU-reference comparisons for full training forward, compact inference and supplied-seed gradients with batch 2, non-square geometry, softmax both off/on. `MEM=3G ./tools/test_host.sh region` passed 2 tests including the hand-derived axis pin. Region truth-driven loss/decode remain absent. C++ GPU backward passes deltas through, unlike this exact derivative of the Rust forward; no compiled-C++ golden or parity claim.
 
 ## Not implemented / open (pointer)
 

@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.091: added native Oxide f32 Region layout/activation forward and exact supplied-seed adjoint; full/compact output and gradients matched CPU on batch-2 non-square cases with softmax off/on. Actual-Oxide focused test and `MEM=3G ./tools/test_host.sh region` passed. Truth-driven Region loss/decode remain open; no compiled-C++ golden; see `implemented.md` §118.
 - v0.2.090: compact f16 inference now supports native Reorg forward/reverse permutations; batch-2 non-square odd-size actual-Oxide output matched f32 with relative max error 4.646e-4. Full f16 suite passed 10 before a shape refinement; the refined Reorg test passed. Inference only; see `implemented.md` §117.
 - v0.2.089: compact f16 inference now supports native `[channel_shuffle]`; batch-2 actual-Oxide output matched f32 with relative max error 2.437e-4. Full `oxide_runtime_f16` suite passed 9 tests. Inference only; see `implemented.md` §116.
 - v0.2.088: compact f16 inference now supports SAM for mapped activations using a native half-storage product/activation kernel. The full `oxide_runtime_f16` suite passed 8 tests; non-adjacent-source SAM relative max error was 6.223e-4. Also corrected compact GPU source lifetime accounting for SAM references. Inference only; see `implemented.md` §115.

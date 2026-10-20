@@ -66,9 +66,9 @@ with the command given rather than trusting the number.
 | Represented `LayerKind` variants | 65 (+`Unsupported`) |
 | CPU forward arm | 65 |
 | CPU standalone parameter backward | all parameterized kinds; head/pass-through kinds own no standalone backward |
-| CPU-only forward, no GPU path (hard reject) | 12 |
+| CPU-only forward, no GPU path (hard reject) | 11 |
 | GPU forward but CPU/mixed backward | 9 |
-| GPU native forward + device backward | 23 |
+| GPU native forward + device backward | 24 |
 | f16 inference | 15 variants (16 section names) |
 | Axis pinned | 24 variants / 27 tests |
 | Axis open | 36 (Tier 1: 10, Tier 2: 15, Tier 3: 3, Tier 4: 8) |
@@ -134,7 +134,7 @@ with the command given rather than trusting the number.
 | `Logistic` | yes | none | head | head | T2 | native | head | no |
 | `Regression` | yes | none | pass | pass | T2 | pass | pass | no |
 | `Cost` | yes | none | pass + head | head | T1 | pass | pass | no |
-| `Region` | yes | none (C++ has block) | flatten + objectness logistic/optional softmax | exact supplied-seed adjoint | pin | none (`UnsupportedLayer`) | none | no |
+| `Region` | yes | none (C++ has block) | flatten + objectness logistic/optional softmax | exact supplied-seed adjoint | pin | native full/compact f32 | device (exact Rust adjoint) | no |
 | `Detection` | yes | none | pass | pass | rust | pass | pass | no |
 | `Yolo` | yes | none | pass | head | T2 | pass | head | yes |
 | `GaussianYolo` | alias | none | pass | head | T2 | pass | head | yes |
@@ -149,7 +149,7 @@ with the command given rather than trusting the number.
 
 ## GPU hard rejections (no device path at all)
 
-Twelve variants abort before any kernel runs. Source: the explicit rejection
+Eleven variants abort before any kernel runs. Source: the explicit rejection
 paths in `runtime.rs` (including the `Gru` match arm).
 
 | Variant | Rejection message | Why it exists | Work item |
@@ -165,7 +165,6 @@ paths in `runtime.rs` (including the `Gru` match arm).
 | `Yolo3d` | same | raw CPU forward only; loss/decode absent | CPU first, then GPU |
 | `ObbRefine` (CARPN) | `GPU inference is not implemented` / `GPU CARPN training is unsupported` | CPU inference only; Stage-2 training deferred | after CARPN CPU training |
 | `Gru` training | `UnsupportedLayer` | Native f32 inference (including rolling-stat BN) exists; GPU training/backward remains unsupported | recurrent wave |
-| `Region` | `UnsupportedLayer` | Native GPU flatten/objectness/class path is not implemented | detection-head wave |
 
 `Local` has a bounded native f32 forward/backward path since
 v0.2.048; its optimizer remains host-staged and unsupported activations retain
@@ -284,7 +283,7 @@ variants or non-layer work.
 |---|---|---|
 | `Yolo3d` | raw forward + label/config helpers + supplied-seed optimizer tests exist; projected math/assignments/loss derivatives, mixed training APIs, decode/evaluator, A2 axis pin, depth/metric consumption do not | `yolo_3d_plan.md` |
 | `DsConv` multi-template `morph=0/1` | executable C++ averages views with training-time view dropout; Rust rejects it; C++ CPU backward is itself a stub | needs its own plan |
-| `Region` | CPU C++-style flatten/objectness/optional softmax and supplied-seed adjoint are implemented; truth-driven loss/decode and GPU path remain open | detection-head wave |
+| `Region` | CPU C++-style flatten/objectness/optional softmax and supplied-seed adjoint are implemented; truth-driven loss/decode remain open | detection-head wave |
 | `Detection` | parsed as identity; C++ decode + loss unimplemented in Rust | needs its own plan |
 | `Contrastive` detection branch | needs the yolo head's per-box class ids; `YoloHeadOutput` carries only the raw tensor | blocked on a head-metadata change |
 | CARPN Stage-2 training | `[obb_refine]` inference only; blocks `detector train -map` for CARPN | after `carpn_network_map_plan.md` |
