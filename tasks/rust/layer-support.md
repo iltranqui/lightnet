@@ -97,7 +97,7 @@ with the command given rather than trusting the number.
 | `ScaleChannels` | yes | none | fwd | exact | pin | native | mixed | yes (inference) |
 | `Sam` | yes | none | fwd | exact | pin | native f32 / host (unsupported activation) | device / CPU fallback | yes (inference) |
 | `BatchNorm` | yes | C++ | fwd | exact | rust | native inference + batch-statistics training | device backward / host AdamW parameter update | yes |
-| `Crop` | yes | none | fwd | exact | rust | native inference + geometric training (no HSV/color jitter) | device (atomic scatter) | no |
+| `Crop` | yes | none | fwd | exact | rust | native inference + geometric training and RGB-shift augmentation; saturation/exposure HSV training still fallback | device (atomic scatter) | no |
 | `Local` | yes | C++ | fwd | exact | rust | native f32 / host (unsupported activation) | device / CPU fallback | no |
 | `Gru` | yes | Rust | fwd | none | rust | native f32 inference incl. rolling-stat BN | training unsupported (no backward path) | no |
 | `Rnn` | yes | C++ | fwd | exact | T3 | native f32 inference/training incl. rolling-stat BN (supported activations) | mixed (unsupported activation host fallback) | no |
@@ -242,7 +242,7 @@ devices and head sizes (no native kernel at all), even though standard
 | Deconvolutional | native Oxide f32 forward, activation, input/weight/bias gradients (v0.2.039); actual-GPU CPU parity for Muon and two-step SGD/Adam updates (v0.2.040) | unmapped activations retain legacy host route; weights and gradients cross host boundary for optimizer; no f16 |
 | Shortcut (weighted) | device input/source gradients, exact normalization derivatives | per-input/per-slot weight gradient vector crosses to host; optimizer host-side |
 | Connected | device GEMM + activation, BN folded at inference | BN training and unsupported/unknown activations fall back |
-| `Crop` | device inference and geometric training | training HSV/saturation/exposure/RGB-shift augmentation is explicitly rejected |
+| `Crop` | device inference and geometric training with per-channel RGB shift | training saturation/exposure HSV adjustment remains explicitly rejected |
 | `MaxPool` | native f32/f16 | no known maxpool variant gap |
 | `LocalAvgPool` | device | channel-changing `local_avgpool` rejected |
 

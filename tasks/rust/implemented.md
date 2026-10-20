@@ -172,6 +172,7 @@ file is named inline.
 - [144. Extend native DCNv4 through 27x27](#144-extend-native-dcnv4-through-27x27)
 - [145. Extend native DCNv4 through 29x29](#145-extend-native-dcnv4-through-29x29)
 - [146. Extend native DCNv4 through 31x31](#146-extend-native-dcnv4-through-31x31)
+- [147. Native GPU Crop RGB-shift augmentation](#147-native-gpu-crop-rgb-shift-augmentation)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1925,6 +1926,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 146. Extend native DCNv4 through 31x31
 
 - v0.2.111 (`4b2761ff`): raised native DCNv4 fixed point buffer/runtime gate from 841 to 961 active points. Actual-Oxide composition parity covers 31x31 across group/mask variants; two-step actual-GPU SGD runtime parity extends through 31x31, while Adam remains covered through 15x15. Host gates verify 31x31 is native eligible and 33x33 falls back. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain` passed 3 tests (103.05 s); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed 1 actual-GPU test (557.47 s); `MEM=3G ./tools/test_host.sh dcnv4` passed 31. CPU-reference parity only; no compiled-C++ golden, speedup or full-suite claim.
+
+## 147. Native GPU Crop RGB-shift augmentation
+
+- v0.2.112 (`4c0c422f`): native Crop GPU training now applies the seeded per-channel RGB shifts for the first three channels while preserving per-batch affine scaling and zero-padding; channels beyond RGB receive no shift. Saturation/exposure HSV adjustments remain explicitly rejected. Actual-Oxide Conv→Crop CPU-reference parity now uses three input channels and nonzero shift, including backward and SGD/Adam updates. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain crop_native_training_augmentation_and_backward_match_cpu`, `MEM=3G ./tools/test_oxide.sh --test oxide_pool_parity crop_bilinear_forward_backward_and_fd`, and `MEM=3G ./tools/test_host.sh crop` passed (1, 1, and 10 tests). No compiled-C++ golden, full-suite, or performance claim. `cargo fmt --all -- --check` could not complete: it reported unrelated pre-existing formatting diffs and then exhausted memory (~10.1 GB allocation); no formatting changes were applied by that check.
 
 ## Not implemented / open (pointer)
 
