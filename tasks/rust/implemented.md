@@ -198,6 +198,7 @@ file is named inline.
 - [170. Native isotropic fixed-point HF grid](#170-native-isotropic-fixed-point-hf-grid)
 - [171. Native HF predictor MLP for fixed-point isotropic mode](#171-native-hf-predictor-mlp-for-fixed-point-isotropic-mode)
 - [172. Native isotropic Newton HF grid](#172-native-isotropic-newton-hf-grid)
+- [173. Native anisotropic HF predictor and inverse grids](#173-native-anisotropic-hf-predictor-and-inverse-grids)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2055,6 +2056,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 172. Native isotropic Newton HF grid
 
 - v0.2.136 (`2231b346`): added native Oxide isotropic Newton inverse-grid generation with analytic Jacobian and singular-determinant fallback, and dispatched isotropic Newton configs in GPU runtime. The host cache now stores the downloaded native grid for HF backward consistency. Actual-Oxide fixed-HF Adam runtime parity passed; the Newton grid primitive passes its 2-batch CPU-formula comparison. `oxide_hyperbolic_foveation` passed 5 tests and focused `MEM=3G ./tools/test_host.sh foveation_film` passed 12. Anisotropic grids, warp adjoints, and direct input-gradient parity remain open. No compiled-C++ or performance claim.
+
+## 173. Native anisotropic HF predictor and inverse grids
+
+- v0.2.137 (`3ec9d833`): extended native Oxide fixed-point and Newton inverse-grid kernels to accept anisotropic HF parameters and apply the source-compatible smooth-max effective radius. GPU runtime now dispatches native predictor, grid, and warp forward for both radius modes. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_hyperbolic_foveation` passed 5 tests including the anisotropic fixed-point CPU-formula comparison; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_native_forward_backward_uses_host_hf_source_cache` passed two-step learned-anisotropic fixed-point SGD CPU parity; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_runtime_adam_updates_match_cpu` passed anisotropic Newton Adam parity; `MEM=3G ./tools/test_host.sh foveation_film` passed 12 tests. HF predictor/warp adjoints and direct runtime input-gradient inspection remain host-managed/open. No compiled-C++ or performance claim.
 
 ## Not implemented / open (pointer)
 
