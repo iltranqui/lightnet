@@ -69,7 +69,7 @@ with the command given rather than trusting the number.
 | CPU-only forward, no GPU path (hard reject) | 11 |
 | GPU forward but CPU/mixed backward | 9 |
 | GPU native forward + device backward | 24 |
-| f16 inference | 20 variants (21 section names) |
+| f16 inference | 21 variants (22 section names) |
 | Axis pinned | 24 variants / 27 tests |
 | Axis open | 36 (Tier 1: 10, Tier 2: 15, Tier 3: 3, Tier 4: 8) |
 | Axis Rust-only | 5 |
@@ -82,7 +82,7 @@ with the command given rather than trusting the number.
 |---|---|---|---|---|---|---|---|---|
 | `Convolutional` | yes | C++ | fwd | exact | pin | native | device | yes |
 | `Deconvolutional` | yes | C++ | fwd | exact | pin | native / host (unsupported act) | native / cpu fallback (unsupported act) | no |
-| `Connected` | yes | C++ | fwd | exact | pin | native / host (unsupported act) | mixed | no |
+| `Connected` | yes | C++ | fwd | exact | pin | native / host (unsupported act) | mixed | yes (inference) |
 | `MaxPool` | alias | none | fwd | exact | pin | native f32; compact f16 inference incl. depth pooling | device f32 backward | yes |
 | `LocalAvgPool` | alias | none | fwd | exact | pin | native (channel-changing rejected) | device | yes |
 | `AvgPool` | alias | none | fwd | exact | pin | native | device | yes |
@@ -265,7 +265,7 @@ BN/norm scales, positional/embedding tables and 1-D params stay Adam/AdamW.
 Accepted by `forward_compact_f16` (`runtime.rs:8389`):
 
 `convolutional` (including `NORM_CHAN*` with f32 channel reductions), `maxpool`, `local_avgpool`, `avgpool`,
-`batchnorm`, `route`, `channel_slice`, `laya_marker_gather`, `channel_shuffle`,
+`batchnorm`, `connected` (incl. folded rolling-stat BN), `route`, `channel_slice`, `laya_marker_gather`, `channel_shuffle`,
 `upsample` (incl. `reverse`), `dropout` (inference identity), `reorg` (forward/reverse),
 `shortcut` (with sources), `sam` (supported activation), `scale_channels`, `region`, `softmax`, `yolo`, `obb_yolo`, `gaussian_yolo`.
 
