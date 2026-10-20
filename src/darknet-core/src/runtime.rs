@@ -8528,6 +8528,7 @@ where
                 | LayerKind::Route(_)
                 | LayerKind::LayaMarkerGather(_)
                 | LayerKind::Sam(_)
+                | LayerKind::Region(_)
                 | LayerKind::ChannelShuffle(_)
                 | LayerKind::Reorg(_)
                 | LayerKind::Upsample(_)
@@ -8809,6 +8810,18 @@ where
                     )
                     .map_err(|err| backend_error("f16 sam", err))?
                 }
+                (LayerKind::Region(spec), LayerParams::None) => self
+                    .backend
+                    .region_forward_f16(
+                        current_input.expect("region requires current input"),
+                        &tensor_backend_shape(layer.output_shape),
+                        spec.num,
+                        spec.coords + spec.classes + 1,
+                        spec.classes,
+                        spec.softmax,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("f16 Region forward", err))?,
                 (LayerKind::ChannelShuffle(spec), LayerParams::None) => self
                     .backend
                     .channel_shuffle_f16(

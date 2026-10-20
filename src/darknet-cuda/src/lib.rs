@@ -3219,6 +3219,24 @@ pub trait F16TensorOpsBackend: F32TensorOpsBackend {
         reverse: bool,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error>;
+    /// Region inference forward in half storage; no f16 backward/training path.
+    fn region_forward_f16(
+        &self,
+        x: &Self::TensorF16,
+        shape: &[usize],
+        anchors: usize,
+        entries: usize,
+        classes: usize,
+        softmax_classes: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error> {
+        let _ = config;
+        let host = self.download_f16(x)?;
+        self.upload_f16(
+            shape,
+            &host_ops::region_forward(&host, shape, anchors, entries, classes, softmax_classes),
+        )
+    }
     /// `f16(activation(x * scale[c] + bias[c]))` per channel (`scale = None`:
     /// bias + activation only); `scale` / `bias` are f32 `[channels]`.
     fn channel_affine_act_f16(

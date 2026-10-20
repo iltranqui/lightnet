@@ -148,6 +148,22 @@ fn channel_shuffle_f16_inference_matches_f32() {
 }
 
 #[test]
+fn region_f16_inference_matches_f32_with_and_without_class_softmax() {
+    for softmax in [0, 1] {
+        let cfg = format!(
+            "[net]\nwidth=3\nheight=2\nchannels=7\nbatch=2\n[region]\nclasses=2\ncoords=4\nnum=1\nsoftmax={softmax}\n",
+        );
+        run_pair(
+            &format!("region f16 softmax={softmax}"),
+            network(&cfg),
+            47 + softmax as u64,
+            0.8,
+            4e-3,
+        );
+    }
+}
+
+#[test]
 fn reorg_f16_forward_and_reverse_non_square_inference_match_f32() {
     let cfg = "[net]\nwidth=5\nheight=3\nchannels=2\nbatch=2\n\
         [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\

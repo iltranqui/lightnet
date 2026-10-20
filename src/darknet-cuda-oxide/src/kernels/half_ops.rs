@@ -190,6 +190,70 @@ pub mod kernels {
         }
     }
 
+    /// Region forward on half-storage values: channel-major NCHW to spatial-
+    /// major entry rows, with f32 sigmoid/optional softmax and half stores.
+    #[kernel]
+    pub fn region_forward_f16(
+        input: &[u16],
+        mut output: DisjointSlice<u16>,
+        spatial: usize,
+        anchors: usize,
+        entries: usize,
+        classes: usize,
+        softmax_classes: u32,
+    ) {
+        let group = thread::index_1d().get();
+        if group >= output.len() / entries {
+            return;
+        }
+        let groups_per_batch = spatial * anchors;
+        let batch = group / groups_per_batch;
+        let rem = group % groups_per_batch;
+        let location = rem / anchors;
+        let anchor = rem % anchors;
+        let channels = anchors * entries;
+        let source_index = |entry: usize| {
+            (batch * channels + anchor * entries + entry) * spatial + location
+        };
+        let destination = (batch * spatial + location) * channels + anchor * entries;
+        let mut entry = 0usize;
+        while entry < entries {
+            let bits = input[source_index(entry)];
+            // SAFETY: each group exclusively owns its entries-wide output row.
+            unsafe { *output.as_mut_ptr().add(destination + entry) = bits; }
+            entry += 1;
+        }
+        let objectness = f16_bits_to_f32(input[source_index(4)]);
+        let sigmoid = 1.0 / (1.0 + (-objectness).exp());
+        unsafe { *output.as_mut_ptr().add(destination + 4) = f32_to_f16_bits(sigmoid, 0); }
+        if softmax_classes != 0 {
+            let mut max_value = f32::NEG_INFINITY;
+            entry = 0;
+            while entry < classes {
+                let value = f16_bits_to_f32(input[source_index(5 + entry)]);
+                if value > max_value { max_value = value; }
+                entry += 1;
+            }
+            let mut sum = 0.0f32;
+            entry = 0;
+            while entry < classes {
+                let value = (f16_bits_to_f32(input[source_index(5 + entry)]) - max_value).exp();
+                unsafe { *output.as_mut_ptr().add(destination + 5 + entry) = f32_to_f16_bits(value, 0); }
+                sum += value;
+                entry += 1;
+            }
+            if sum > 0.0 {
+                entry = 0;
+                while entry < classes {
+                    let index = destination + 5 + entry;
+                    let value = f16_bits_to_f32(unsafe { *output.as_mut_ptr().add(index) }) / sum;
+                    unsafe { *output.as_mut_ptr().add(index) = f32_to_f16_bits(value, 0); }
+                    entry += 1;
+                }
+            }
+        }
+    }
+
     /// Big `[b,cb,hb,wb]` to small `[b,cb*s*s,hs,ws]` reorg.
     #[kernel]
     pub fn reorg_to_small_f16(

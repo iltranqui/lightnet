@@ -1012,6 +1012,51 @@ impl OxideBackend {
         Ok(OxideTensorF16::new(output, output_shape))
     }
 
+    /// Native half-storage Region layout and activation forward.
+    pub fn region_forward_f16(
+        &self,
+        x: &OxideTensorF16,
+        shape: &[usize],
+        anchors: usize,
+        entries: usize,
+        classes: usize,
+        softmax_classes: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF16, OxideError> {
+        if shape.len() != 4
+            || x.shape() != shape
+            || x.len() != shape.iter().product::<usize>()
+            || anchors == 0
+            || entries < classes.saturating_add(5)
+            || classes == 0
+            || shape[1] != anchors.saturating_mul(entries)
+            || shape[2] == 0
+            || shape[3] == 0
+        {
+            return Err(shape_err("region_forward_f16", format!("incompatible shape/parameters: {shape:?}, anchors={anchors}, entries={entries}, classes={classes}")));
+        }
+        let spatial = shape[2] * shape[3];
+        let groups = shape[0] * spatial * anchors;
+        let mut output = self.alloc16_uninit(x.len())?;
+        // SAFETY: shape/layout validation establishes in-bounds channel planes;
+        // one thread writes each spatial/anchor entry row exactly once.
+        unsafe {
+            self.half_ops.region_forward_f16(
+                &self.stream,
+                launch::elementwise(groups, config),
+                &x.buf,
+                &mut output,
+                spatial,
+                anchors,
+                entries,
+                classes,
+                softmax_classes as u32,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF16::new(output, shape))
+    }
+
     /// Native f16 reorg permutation; this is inference forward only.
     pub fn reorg_f16(
         &self,
@@ -1454,6 +1499,28 @@ impl darknet_cuda::F16TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error> {
         OxideBackend::reorg_f16(self, x, input_shape, output_shape, stride, reverse, config)
+    }
+
+    fn region_forward_f16(
+        &self,
+        x: &Self::TensorF16,
+        shape: &[usize],
+        anchors: usize,
+        entries: usize,
+        classes: usize,
+        softmax_classes: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error> {
+        OxideBackend::region_forward_f16(
+            self,
+            x,
+            shape,
+            anchors,
+            entries,
+            classes,
+            softmax_classes,
+            config,
+        )
     }
 
     fn channel_affine_act_f16(
