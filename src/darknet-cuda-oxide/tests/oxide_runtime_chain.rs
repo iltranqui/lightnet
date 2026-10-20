@@ -2870,9 +2870,9 @@ fn dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu() {
             (0, 0, "leaky", 29, 14, 1),
             (0, 0, "leaky", 31, 15, 1),
         ] {
-            // Keep large-kernel runtime optimizer parity on SGD for this slice;
-            // Adam's CPU/GPU delta check remains covered through 15x15.
-            if size >= 17 && adam {
+            // Extend non-BN Adam runtime parity through 17x17. Keep larger
+            // kernels and BN Adam on SGD / the previously verified bound.
+            if adam && (size > 17 || (size >= 17 && batch_normalize)) {
                 continue;
             }
             let net = network(&format!(
