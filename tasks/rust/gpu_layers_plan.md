@@ -128,9 +128,10 @@ Bounded native slice:
 12. [x] Expose runtime input gradients through an opt-in diagnostic API and
     compare them directly against CPU in actual-Oxide two-step SGD/Adam tests
     (v0.2.141).
-13. [x] Add native predictor-source and MLP parameter backward (v0.2.142).
-    Actual-Oxide tests directly compare input gradients and parameter gradients
-    to CPU, including downsample=2 with a non-divisible width.
+13. [x] Add native predictor-source and MLP parameter backward (v0.2.142),
+    with actual-Oxide runtime CPU parity and direct input-gradient checks; add
+    primitive finite differences for source/W1/B1/W2/B2 (v0.2.143), including
+    downsample=2 with an incomplete pooling edge.
 14. [ ] Add native inverse-point parameter Jacobian. Runtime currently consumes
     the native grid adjoint through the host Jacobian (v0.2.140). Actual-Oxide gates cover
     compact f32/f16, Muon, SGD `dont_update`, Adam `burnin_update`, and SGD

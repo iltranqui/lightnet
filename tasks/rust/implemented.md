@@ -204,6 +204,7 @@ file is named inline.
 - [176. Native HF grid-adjoint consumption](#176-native-hf-grid-adjoint-consumption)
 - [177. Direct HF runtime input-gradient parity](#177-direct-hf-runtime-input-gradient-parity)
 - [178. Native HF predictor backward](#178-native-hf-predictor-backward)
+- [179. HF predictor adjoint finite differences](#179-hf-predictor-adjoint-finite-differences)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2085,6 +2086,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 178. Native HF predictor backward
 
 - v0.2.142 (`c234a612`): added native Oxide adjoints for predictor output constraints, the second and first MLP projections/ReLU, and the average-pooling source scatter. Runtime now uses native predictor-source and MLP parameter gradients; the inverse-point parameter Jacobian remains a Rust host operation. Actual-Oxide learned-anisotropic fixed-point SGD parity directly checks runtime input gradients and train-buffer/updated parameter parity with `downsample=2` and a non-divisible width; learned-anisotropic Newton Adam parity checks the native predictor backward with two updates. `MEM=3G ./tools/test_host.sh hyperbolic_foveation` passed 30 tests and `MEM=3G ./tools/test_oxide.sh --test oxide_hyperbolic_foveation` passed 6. No compiled-C++ or performance claim.
+
+## 179. HF predictor adjoint finite differences
+
+- v0.2.143 (`07e22b5b`): added actual-Oxide finite-difference checks for predictor source, W1/B1 and W2/B2 gradients, using a learned two-batch anisotropic-compatible layout with `downsample=2` and an incomplete pooling edge. `MEM=3G ./tools/test_oxide.sh --test oxide_hyperbolic_foveation` passed all 7 tests. This strengthens primitive evidence; runtime CPU parity and host inverse-point parameter Jacobian scope remain as documented in §178. No compiled-C++ or performance claim.
 
 ## Not implemented / open (pointer)
 
