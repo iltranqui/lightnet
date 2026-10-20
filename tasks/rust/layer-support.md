@@ -112,7 +112,7 @@ with the command given rather than trusting the number.
 | `Wmhf` | alias | C++ | fwd | exact | T4 | none | none | no |
 | `Clifford` | yes | C++ | fwd | exact | T4 | none | none | no |
 | `RecursiveBlock` | alias | body only | fwd | exact | T1 | none | none | no |
-| `HyperbolicFoveation` | yes | C++ | fwd | exact | T4 | native Oxide predictor + warp + isotropic/anisotropic fixed-point/Newton grids; native warp input/grid adjoints | host inverse-point parameter Jacobian/predictor-source adjoint; direct runtime input-gradient inspection open | no |
+| `HyperbolicFoveation` | yes | C++ | fwd | exact | T4 | native Oxide predictor + warp + isotropic/anisotropic fixed-point/Newton grids; native warp input/grid adjoints | host inverse-point parameter Jacobian/predictor-source adjoint; runtime input-gradient parity directly tested | no |
 | `FoveationFilm` | alias | C++ | fwd | exact | T4 | native Oxide f32 (HF source/cache host-managed) | native FiLM adjoint + host HF backward; host SGD/Adam updates | no |
 | `Vit` | yes | C++ | fwd | exact | pin | host | cpu | no |
 | `Swin` | alias | Rust | fwd | exact | pin | host | cpu | no |
@@ -169,7 +169,8 @@ Oxide performs the HF predictor MLP, NCHW bilinear warp, isotropic/anisotropic
 fixed-point/Newton grids, native warp input/grid adjoints, and FiLM
 projections/adjoints in the bounded path. The native grid adjoint feeds the
 host inverse-point parameter Jacobian (v0.2.140); predictor-source backward
-and direct runtime input-gradient inspection remain open.
+remains host-managed. Runtime input-gradient parity is directly tested via an
+opt-in diagnostic capture (v0.2.141).
 SGD/Adam parameter updates are host-side. This is a hybrid
 path, not full-layer native HF completion. Muon and compact/f16 inference
 remain rejected.
