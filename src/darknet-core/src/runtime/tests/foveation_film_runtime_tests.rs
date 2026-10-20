@@ -500,11 +500,27 @@ fn foveation_film_sgd_adamw_muon_and_gpu_boundary() {
             .to_string()
             .contains("GPU compact inference is not implemented in Stage-1 CPU support")
     );
+    let mut cpu = ExecutableNetwork::new(network.clone());
+    let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
     let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
-    let state = gpu.forward_with_state(&input).expect("forward state");
-    let seeds = vec![None; network.layers.len()];
+    gpu.params = cpu.params.clone();
+    let state = gpu.forward_training_with_state(&input).expect("forward state");
+    let seed = Tensor::filled(network.layers[1].output_shape, 1.0);
+    let mut seeds = vec![None; network.layers.len()];
+    seeds[1] = Some(seed);
+    cpu.zero_train_buffers();
+    cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+        .expect("CPU reference backward");
+    gpu.zero_train_buffers_gpu().expect("initialize GPU buffers");
     gpu.backward_accumulate_seeded_gpu(&state, &seeds)
-        .expect("CPU backward fallback");
+        .expect("native FiLM and host HF backward");
+    for layer_index in 0..network.layers.len() {
+        assert_eq!(
+            cpu.train_buffers[layer_index],
+            gpu.cpu_fallback_train_buffers.borrow()[layer_index],
+            "hybrid backward train buffers at layer {layer_index}"
+        );
+    }
     assert!(
         gpu.update_weights_gpu(0.01, 0.0, 0.0, 1)
             .unwrap_err()

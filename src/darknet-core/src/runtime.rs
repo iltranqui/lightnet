@@ -12755,11 +12755,17 @@ where
         // else keeps the host path, and the decision is global so the forward
         // and the backward can never disagree about which path ran.
         let host_only_deform = has_host_only_deform(&self.network);
+        let has_hyperbolic_foveation = self
+            .network
+            .layers
+            .iter()
+            .any(|layer| matches!(layer.kind, LayerKind::HyperbolicFoveation(_)));
         let host_copies = host_copies
             || self.requires_cpu_backward_fallback()
             || has_batch_normalized_recurrent
             || host_only_deform
-            || has_host_only_graph_conv(&self.network);
+            || has_host_only_graph_conv(&self.network)
+            || has_hyperbolic_foveation;
         // Path selection for both deformable families must match the backward's
         // gate exactly; independent of whether host copies are retained.
         // DCNv4's own unsupported variants are in requires_cpu_backward_fallback.
@@ -16148,6 +16154,8 @@ where
                 );
             }
         }
+        let mut foveation_hf_auxiliary_gradients: Vec<Option<Vec<f32>>> =
+            vec![None; self.network.layers.len()];
 
         for layer in self.network.layers.iter().rev() {
             let Some(grad) = layer_output_gradients[layer.index].take() else {
@@ -16155,6 +16163,210 @@ where
             };
 
             match (&layer.kind, self.params.get(layer.index)) {
+                (LayerKind::FoveationFilm(spec), Some(LayerParams::FoveationFilm(params))) => {
+                    let film_cache = forward
+                        .cpu_forward
+                        .foveation_film_caches
+                        .get(layer.index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| Error::InvalidConfig(format!(
+                            "missing [foveation_film] forward cache for layer #{}",
+                            layer.index
+                        )))?;
+                    let hf_cache = forward
+                        .cpu_forward
+                        .hyperbolic_foveation_caches
+                        .get(spec.hf_layer)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| Error::InvalidConfig(format!(
+                            "[foveation_film] selected HF layer #{} has no forward cache",
+                            spec.hf_layer
+                        )))?;
+                    let current_input = if layer.index == 0 {
+                        &forward.input_gpu
+                    } else {
+                        forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing previous GPU output for FoveationFilm layer #{}",
+                                layer.index
+                            ))
+                        })?
+                    };
+                    let batch = layer.input_shape.batch;
+                    let channels = layer.input_shape.channels;
+                    let hf_params = self.backend
+                        .upload_f32(&[batch, spec.param_count], &hf_cache.params_per_batch)
+                        .map_err(|err| backend_error("upload FoveationFilm backward HF cache", err))?;
+                    let embedding = self.backend
+                        .upload_f32(&[batch, spec.embed_dim], &film_cache.embedding)
+                        .map_err(|err| backend_error("upload FoveationFilm embedding cache", err))?;
+                    let gamma = self.backend
+                        .upload_f32(&[batch, channels], &film_cache.gamma)
+                        .map_err(|err| backend_error("upload FoveationFilm gamma cache", err))?;
+                    let w_embed = self.backend
+                        .upload_f32(&[spec.embed_dim, spec.param_count], &params.w_embed)
+                        .map_err(|err| backend_error("upload FoveationFilm embedding weights", err))?;
+                    let w_gamma = self.backend
+                        .upload_f32(&[channels, spec.embed_dim], &params.w_gamma)
+                        .map_err(|err| backend_error("upload FoveationFilm gamma weights", err))?;
+                    let w_beta = self.backend
+                        .upload_f32(&[channels, spec.embed_dim], &params.w_beta)
+                        .map_err(|err| backend_error("upload FoveationFilm beta weights", err))?;
+                    let gradients = self.backend
+                        .foveation_film_backward_f32(
+                            current_input,
+                            &grad,
+                            &hf_params,
+                            &embedding,
+                            &gamma,
+                            &w_embed,
+                            &w_gamma,
+                            &w_beta,
+                            &tensor_backend_shape(layer.input_shape),
+                            spec.param_count,
+                            spec.embed_dim,
+                            config,
+                        )
+                        .map_err(|err| backend_error("FoveationFilm native backward", err))?;
+                    let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
+                    let Some(LayerTrainBuffers::FoveationFilm(train)) =
+                        buffers.get_mut(layer.index)
+                    else {
+                        return Err(Error::InvalidConfig(format!(
+                            "missing FoveationFilm train buffers for layer #{}",
+                            layer.index
+                        )));
+                    };
+                    accumulate_vec(&mut train.w_embed_updates, &self.backend.download_f32(&gradients.w_embed)
+                        .map_err(|err| backend_error("download FoveationFilm embedding gradient", err))?)?;
+                    accumulate_vec(&mut train.b_embed_updates, &self.backend.download_f32(&gradients.b_embed)
+                        .map_err(|err| backend_error("download FoveationFilm embedding bias gradient", err))?)?;
+                    accumulate_vec(&mut train.w_gamma_updates, &self.backend.download_f32(&gradients.w_gamma)
+                        .map_err(|err| backend_error("download FoveationFilm gamma gradient", err))?)?;
+                    accumulate_vec(&mut train.b_gamma_updates, &self.backend.download_f32(&gradients.b_gamma)
+                        .map_err(|err| backend_error("download FoveationFilm gamma bias gradient", err))?)?;
+                    accumulate_vec(&mut train.w_beta_updates, &self.backend.download_f32(&gradients.w_beta)
+                        .map_err(|err| backend_error("download FoveationFilm beta gradient", err))?)?;
+                    accumulate_vec(&mut train.b_beta_updates, &self.backend.download_f32(&gradients.b_beta)
+                        .map_err(|err| backend_error("download FoveationFilm beta bias gradient", err))?)?;
+                    drop(buffers);
+                    if spec.backprop_to_hf {
+                        let hf_gradient = self.backend.download_f32(&gradients.hf_params)
+                            .map_err(|err| backend_error("download FoveationFilm HF gradient", err))?;
+                        let slot = foveation_hf_auxiliary_gradients
+                            .get_mut(spec.hf_layer)
+                            .ok_or_else(|| Error::InvalidConfig(format!(
+                                "FoveationFilm selected HF layer #{} is unavailable during backward",
+                                spec.hf_layer
+                            )))?;
+                        if let Some(existing) = slot {
+                            if existing.len() != hf_gradient.len() {
+                                return Err(Error::InvalidConfig(format!(
+                                    "FoveationFilm HF gradient layout mismatch at layer #{}",
+                                    spec.hf_layer
+                                )));
+                            }
+                            for (sum, value) in existing.iter_mut().zip(hf_gradient) {
+                                *sum += value;
+                            }
+                        } else {
+                            *slot = Some(hf_gradient);
+                        }
+                    }
+                    self.accumulate_previous_gpu_gradient(
+                        layer.index,
+                        gradients.input,
+                        &mut layer_output_gradients,
+                    )?;
+                }
+                (
+                    LayerKind::HyperbolicFoveation(spec),
+                    Some(LayerParams::HyperbolicFoveation(params)),
+                ) => {
+                    let cache = forward
+                        .cpu_forward
+                        .hyperbolic_foveation_caches
+                        .get(layer.index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| Error::InvalidConfig(format!(
+                            "missing [hyperbolic_foveation] forward cache for layer #{}",
+                            layer.index
+                        )))?;
+                    let network_input = self.download_tensor(
+                        &forward.input_gpu,
+                        self.network.net.input_shape(),
+                    ).map_err(|err| backend_error("download HF network input", err))?;
+                    let previous_input = if layer.index == 0 {
+                        &network_input
+                    } else {
+                        forward.cpu_forward.layer_outputs.get(layer.index - 1).ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "missing host input for hyperbolic_foveation layer #{}",
+                                layer.index
+                            ))
+                        })?
+                    };
+                    let warp_input = match spec.warp_source {
+                        crate::model::HfWarpSource::Previous => previous_input,
+                        crate::model::HfWarpSource::NetworkInput => &network_input,
+                    };
+                    let output_gradient = self.download_tensor(&grad, layer.output_shape)
+                        .map_err(|err| backend_error("download HF output gradient", err))?;
+                    let auxiliary = foveation_hf_auxiliary_gradients
+                        .get(layer.index)
+                        .and_then(Option::as_deref);
+                    let (warp_gradient, predictor_gradient, param_gradient) =
+                        backward_hyperbolic_foveation(
+                            spec, params, warp_input, &output_gradient, cache, auxiliary,
+                        )?;
+                    {
+                        let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
+                        let Some(LayerTrainBuffers::HyperbolicFoveation(train)) =
+                            buffers.get_mut(layer.index)
+                        else {
+                            return Err(Error::InvalidConfig(format!(
+                                "missing hyperbolic_foveation train buffers for layer #{}",
+                                layer.index
+                            )));
+                        };
+                        accumulate_vec(&mut train.hf_param_updates, &param_gradient.hf_params)?;
+                        accumulate_vec(&mut train.pred_w1_updates, &param_gradient.pred_w1)?;
+                        accumulate_vec(&mut train.pred_b1_updates, &param_gradient.pred_b1)?;
+                        accumulate_vec(&mut train.pred_w2_updates, &param_gradient.pred_w2)?;
+                        accumulate_vec(&mut train.pred_b2_updates, &param_gradient.pred_b2)?;
+                    }
+                    if spec.warp_source == crate::model::HfWarpSource::Previous {
+                        let warp_gradient = self.backend.upload_f32(
+                            &tensor_backend_shape(warp_gradient.shape),
+                            &warp_gradient.data,
+                        ).map_err(|err| backend_error("upload HF warp input gradient", err))?;
+                        self.accumulate_previous_gpu_gradient(
+                            layer.index,
+                            warp_gradient,
+                            &mut layer_output_gradients,
+                        )?;
+                    }
+                    if let Some((source_layer, source_gradient)) = predictor_gradient {
+                        let source_gradient = self.backend.upload_f32(
+                            &tensor_backend_shape(source_gradient.shape),
+                            &source_gradient.data,
+                        ).map_err(|err| backend_error("upload HF predictor source gradient", err))?;
+                        if let Some(source_layer) = source_layer {
+                            let Some(destination) = layer_output_gradients.get_mut(source_layer) else {
+                                return Err(Error::InvalidConfig(format!(
+                                    "HF predictor source layer #{source_layer} is unavailable during backward"
+                                )));
+                            };
+                            self.accumulate_gpu_gradient(destination, source_gradient)?;
+                        } else {
+                            self.accumulate_previous_gpu_gradient(
+                                layer.index,
+                                source_gradient,
+                                &mut layer_output_gradients,
+                            )?;
+                        }
+                    }
+                }
                 (
                     LayerKind::Convolutional(spec),
                     Some(LayerParams::Convolutional(_) | LayerParams::None),
@@ -19193,9 +19405,7 @@ where
                 | LayerKind::Swin(_)
                 | LayerKind::TuckerAttention(_)
                 | LayerKind::MambaVision(_)
-                | LayerKind::KimiKda(_)
-                | LayerKind::HyperbolicFoveation(_)
-                | LayerKind::FoveationFilm(_) => return true,
+                | LayerKind::KimiKda(_) => return true,
                 // Connected layers are handled on the GPU path with a host
                 // round trip unless their activation or batch norm
                 // (batch-statistics training) is unsupported.

@@ -149,7 +149,7 @@ fn assert_chain(cfg: &str, seed_layer: usize, what: &str) {
 }
 
 #[test]
-fn foveation_film_native_forward_uses_host_hf_source_cache() {
+fn foveation_film_native_forward_backward_uses_host_hf_source_cache() {
     let net = network(
         "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=2\n\
          [convolutional]\nfilters=1\nsize=1\nactivation=linear\n\
