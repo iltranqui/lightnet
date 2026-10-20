@@ -231,6 +231,46 @@ fn foveation_film_native_forward_backward_uses_host_hf_source_cache() {
             _ => panic!("FoveationFilm runtime parameter variant mismatch at layer {index}"),
         }
     }
+
+    let cpu_forward = cpu.forward_training(&input).expect("CPU second forward");
+    let gpu_forward = gpu
+        .forward_training_with_state(&input)
+        .expect("native FiLM second forward");
+    for (index, (expected, actual)) in cpu_forward
+        .layer_outputs
+        .iter()
+        .zip(&gpu_forward.cpu_forward.layer_outputs)
+        .enumerate()
+    {
+        close(&format!("FoveationFilm second-step layer {index}"), &expected.data, &actual.data, 2e-5);
+    }
+    cpu.zero_train_buffers();
+    gpu.zero_train_buffers_gpu().expect("zero second-step buffers");
+    cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+        .expect("CPU second backward");
+    gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+        .expect("native second backward");
+    cpu.update_weights(0.001, 0.0, 0.0, 1);
+    gpu.update_weights_gpu(0.001, 0.0, 0.0, 1)
+        .expect("second hybrid SGD update");
+    for (index, (expected, actual)) in cpu.params.iter().zip(&gpu.params).enumerate() {
+        match (expected, actual) {
+            (LayerParams::Convolutional(expected), LayerParams::Convolutional(actual)) => {
+                close("second-step upstream SGD weights", &expected.weights, &actual.weights, 2e-4);
+                close("second-step upstream SGD biases", &expected.biases, &actual.biases, 2e-4);
+            }
+            (LayerParams::HyperbolicFoveation(expected), LayerParams::HyperbolicFoveation(actual)) => {
+                close("second-step HF SGD params", &expected.hf_params, &actual.hf_params, 2e-5);
+                close("second-step HF SGD predictor", &expected.pred_b2, &actual.pred_b2, 2e-5);
+            }
+            (LayerParams::FoveationFilm(expected), LayerParams::FoveationFilm(actual)) => {
+                close("second-step FiLM embedding", &expected.w_embed, &actual.w_embed, 2e-5);
+                close("second-step FiLM gamma", &expected.w_gamma, &actual.w_gamma, 2e-5);
+                close("second-step FiLM beta", &expected.w_beta, &actual.w_beta, 2e-5);
+            }
+            _ => panic!("second-step FoveationFilm parameter mismatch at layer {index}"),
+        }
+    }
 }
 
 #[test]
@@ -284,6 +324,41 @@ fn foveation_film_runtime_adam_updates_match_cpu() {
     close("FoveationFilm Adam embedding", &cpu_film.w_embed, &gpu_film.w_embed, 2e-5);
     close("FoveationFilm Adam gamma", &cpu_film.w_gamma, &gpu_film.w_gamma, 2e-5);
     close("FoveationFilm Adam beta", &cpu_film.w_beta, &gpu_film.w_beta, 2e-5);
+
+    let cpu_forward = cpu.forward_training(&input).expect("CPU second Adam forward");
+    let gpu_forward = gpu
+        .forward_training_with_state(&input)
+        .expect("native second Adam forward");
+    for (expected, actual) in cpu_forward
+        .layer_outputs
+        .iter()
+        .zip(&gpu_forward.cpu_forward.layer_outputs)
+    {
+        close("FoveationFilm second Adam output", &expected.data, &actual.data, 2e-5);
+    }
+    cpu.zero_train_buffers();
+    gpu.zero_train_buffers_gpu().expect("zero second Adam buffers");
+    cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+        .expect("CPU second Adam backward");
+    gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+        .expect("native second Adam backward");
+    cpu.update_weights_adam(0.005, 1).unwrap();
+    gpu.update_weights_gpu(0.005, 0.0, net.net.decay, 1)
+        .expect("second hybrid Adam update");
+    let (LayerParams::HyperbolicFoveation(cpu_hf), LayerParams::HyperbolicFoveation(gpu_hf)) =
+        (&cpu.params[0], &gpu.params[0])
+    else {
+        panic!("expected fixed HF parameter variants");
+    };
+    let (LayerParams::FoveationFilm(cpu_film), LayerParams::FoveationFilm(gpu_film)) =
+        (&cpu.params[1], &gpu.params[1])
+    else {
+        panic!("expected FiLM parameter variants");
+    };
+    close("second-step Adam HF", &cpu_hf.hf_params, &gpu_hf.hf_params, 2e-5);
+    close("second-step Adam embedding", &cpu_film.w_embed, &gpu_film.w_embed, 2e-5);
+    close("second-step Adam gamma", &cpu_film.w_gamma, &gpu_film.w_gamma, 2e-5);
+    close("second-step Adam beta", &cpu_film.w_beta, &gpu_film.w_beta, 2e-5);
 }
 
 #[test]
