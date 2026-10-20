@@ -66,14 +66,14 @@ fn laya_head_masked_attention_matches_reference_including_empty_mask_row() {
     let expected = reference(&qkv, &mask, batch, tokens, channels, heads);
     let backend = OxideBackend::new().expect("oxide backend");
     let qkv_dev = backend
-        .upload_f32(&[batch, tokens, 3 * channels], &qkv)
+        .upload_f32(&[batch * tokens, 3 * channels], &qkv)
         .unwrap();
     let mask_dev = backend.upload_f32(&[batch, tokens], &mask).unwrap();
     let output = backend
         .laya_head_attention_f32(
             &qkv_dev,
             &mask_dev,
-            &[batch, tokens, channels],
+            &[batch * tokens, channels],
             batch,
             tokens,
             channels,
@@ -95,14 +95,14 @@ fn laya_head_masked_attention_matches_reference_including_empty_mask_row() {
 #[test]
 fn laya_head_masked_attention_rejects_bad_extents() {
     let backend = OxideBackend::new().unwrap();
-    let qkv = backend.upload_f32(&[1, 2, 6], &[0.0; 12]).unwrap();
+    let qkv = backend.upload_f32(&[2, 6], &[0.0; 12]).unwrap();
     let short_mask = backend.upload_f32(&[1, 1], &[1.0]).unwrap();
     assert!(
         backend
             .laya_head_attention_f32(
                 &qkv,
                 &short_mask,
-                &[1, 2, 2],
+                &[2, 2],
                 1,
                 2,
                 2,

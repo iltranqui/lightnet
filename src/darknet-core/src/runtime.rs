@@ -84,6 +84,8 @@ impl GradMode {
 mod dcnv4_gpu;
 #[path = "runtime/laya_act_gpu.rs"]
 mod laya_act_gpu;
+#[path = "runtime/laya_head_gpu.rs"]
+mod laya_head_gpu;
 
 /// Whether the network contains a `[deform_conv]` variant the device path does
 /// not cover yet. Shared by the forward and the backward so they cannot choose
@@ -14453,14 +14455,15 @@ where
                         .map_err(|err| backend_error("upload laya_encoder output", err))?
                 }
                 (LayerKind::LayaHead(spec), LayerParams::LayaHead(weights)) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download laya_head input", err))?;
-                    let decoded =
-                        laya_head_forward(spec, weights, &host_input, layer.output_shape)?;
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &decoded.data)
-                        .map_err(|err| backend_error("upload laya_head output", err))?
+                    laya_head_gpu::forward(
+                        &self.backend,
+                        spec,
+                        weights,
+                        current_input,
+                        layer.input_shape,
+                        layer.output_shape,
+                        launch_config,
+                    )?
                 }
                 (LayerKind::Logistic, LayerParams::None) => self
                     .backend
@@ -15680,7 +15683,6 @@ where
                     | LayerKind::JevCe(_)
                     | LayerKind::LayaLoss(_)
                     | LayerKind::LayaEncoder(_)
-                    | LayerKind::LayaHead(_)
                     | LayerKind::ScaleChannels(_)
                     | LayerKind::Rnn(_)
                     | LayerKind::Lstm(_)
@@ -16090,6 +16092,17 @@ where
                             launch_config,
                         )
                         .map_err(|err| backend_error("GPU laya_marker_gather", err))?
+                }
+                (LayerKind::LayaHead(spec), LayerParams::LayaHead(weights)) => {
+                    laya_head_gpu::forward(
+                        &self.backend,
+                        spec,
+                        weights,
+                        current_input.expect("LayaHead requires current input"),
+                        layer.input_shape,
+                        layer.output_shape,
+                        launch_config,
+                    )?
                 }
                 (LayerKind::LayaActHead(spec), LayerParams::LayaActHead(weights)) => {
                     let head_index = resolve_relative_layer(layer.index, spec.layers[0])?;

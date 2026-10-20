@@ -2782,7 +2782,7 @@ pub trait F32TensorOpsBackend {
             channels / heads <= 128,
             "LayaHead attention head dim exceeds 128"
         );
-        assert_eq!(output_shape, [batch, tokens, channels]);
+        assert_eq!(output_shape, [batch * tokens, channels]);
         let qkv = self.download_f32(qkv)?;
         let mask = self.download_f32(mask)?;
         assert_eq!(qkv.len(), batch * tokens * 3 * channels);
@@ -2834,6 +2834,73 @@ pub trait F32TensorOpsBackend {
                         }
                         output[(b * tokens + query) * channels + head_start + d] = value;
                     }
+                }
+            }
+        }
+        self.upload_f32(output_shape, &output)
+    }
+
+    /// Convert channel-major LayaHead input `[B,C,1,T]` to token-major hidden
+    /// states `[B,T,H]`, add the selected type embedding, and extract `[B,T]` mask.
+    fn laya_head_prepare_f32(
+        &self,
+        input: &Self::Tensor,
+        input_shape: &[usize],
+        type_embedding: &[f32],
+        hidden: usize,
+        qtype: i32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        assert!(input_shape.len() == 4 && input_shape[2] == 1);
+        assert!((0..=2).contains(&qtype) || qtype == -1);
+        let (batch, channels, tokens) = (input_shape[0], input_shape[1], input_shape[3]);
+        assert!(batch > 0 && tokens > 0 && hidden > 0);
+        assert_eq!(channels, hidden + if qtype < 0 { 2 } else { 1 });
+        assert_eq!(type_embedding.len(), 3 * hidden);
+        let source = self.download_f32(input)?;
+        assert_eq!(source.len(), batch * channels * tokens);
+        let (mut tokens_out, mut mask) = (vec![0.0; batch * tokens * hidden], vec![0.0; batch * tokens]);
+        for b in 0..batch {
+            let selected = if qtype >= 0 {
+                qtype as usize
+            } else {
+                ((source[(b * channels + hidden + 1) * tokens].round() as i32).clamp(0, 2)) as usize
+            };
+            for t in 0..tokens {
+                mask[b * tokens + t] = source[(b * channels + hidden) * tokens + t];
+                for h in 0..hidden {
+                    tokens_out[(b * tokens + t) * hidden + h] =
+                        source[(b * channels + h) * tokens + t] + type_embedding[selected * hidden + h];
+                }
+            }
+        }
+        Ok((
+            self.upload_f32(&[batch * tokens, hidden], &tokens_out)?,
+            self.upload_f32(&[batch, tokens], &mask)?,
+        ))
+    }
+
+    /// Pack token-major `[B,T,H]` LayaHead states into channel-major
+    /// `[B,H,1,T]` layer output.
+    fn laya_head_pack_f32(
+        &self,
+        tokens: &Self::Tensor,
+        batch: usize,
+        sequence: usize,
+        hidden: usize,
+        output_shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert_eq!(output_shape, [batch, hidden, 1, sequence]);
+        let tokens = self.download_f32(tokens)?;
+        assert_eq!(tokens.len(), batch * sequence * hidden);
+        let mut output = vec![0.0; tokens.len()];
+        for b in 0..batch {
+            for t in 0..sequence {
+                for h in 0..hidden {
+                    output[(b * hidden + h) * sequence + t] = tokens[(b * sequence + t) * hidden + h];
                 }
             }
         }

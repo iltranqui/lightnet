@@ -809,6 +809,65 @@ pub mod kernels {
         }
     }
 
+    /// Reorder and type-condition channel-major LayaHead source features.
+    #[kernel]
+    pub fn laya_head_prepare(
+        input: &[f32],
+        type_embedding: &[f32],
+        mut tokens: DisjointSlice<f32>,
+        mut mask: DisjointSlice<f32>,
+        hidden: usize,
+        channels: usize,
+        sequence: usize,
+        qtype: i32,
+    ) {
+        let index = thread::index_1d().get();
+        if index >= tokens.len() {
+            return;
+        }
+        let b = index / (sequence * hidden);
+        let rem = index - b * sequence * hidden;
+        let t = rem / hidden;
+        let h = rem - t * hidden;
+        let selected = if qtype >= 0 {
+            qtype as usize
+        } else {
+            let raw = input[(b * channels + hidden + 1) * sequence];
+            (raw.round() as i32).max(0).min(2) as usize
+        };
+        let value =
+            input[(b * channels + h) * sequence + t] + type_embedding[selected * hidden + h];
+        // SAFETY: input shape and metadata are checked by the host. Each
+        // thread owns one token feature; h=0 owns the per-token mask write.
+        unsafe {
+            *tokens.as_mut_ptr().add(index) = value;
+            if h == 0 {
+                *mask.as_mut_ptr().add(b * sequence + t) = input[(b * channels + hidden) * sequence + t];
+            }
+        }
+    }
+
+    /// Pack token-major `[B,T,H]` states into NCHW channel-major `[B,H,1,T]`.
+    #[kernel]
+    pub fn laya_head_pack(
+        tokens: &[f32],
+        mut output: DisjointSlice<f32>,
+        sequence: usize,
+        hidden: usize,
+    ) {
+        let index = thread::index_1d().get();
+        if index < output.len() {
+            let b = index / (hidden * sequence);
+            let rem = index - b * hidden * sequence;
+            let h = rem / sequence;
+            let t = rem - h * sequence;
+            let source = (b * sequence + t) * hidden + h;
+            // SAFETY: equal element counts and the inverse NCHW permutation
+            // guarantee source and destination indices are in range.
+            unsafe { *output.as_mut_ptr().add(index) = tokens[source]; }
+        }
+    }
+
     /// LayaHead's masked attention. Skips invalid keys and writes a zero
     /// context for queries whose batch has no valid key. One thread owns one
     /// (batch, head, query) output slice and uses online softmax state.
