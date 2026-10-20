@@ -1994,7 +1994,7 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 
 ## 160. FoveationFilm runtime native forward
 
-- v0.2.123: full GPU runtime now accepts `[hyperbolic_foveation]` as a host fallback source, retains its per-batch HF cache, transfers those parameters to the backend, and dispatches `[foveation_film]` through `foveation_film_forward_f32`. The HF and FiLM backward path is explicitly CPU-fallback gated, and GPU optimizer updates, compact inference, and f16 inference still reject these layers. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_native_forward_uses_host_hf_source_cache` passed on actual Oxide: all layer outputs match the CPU runtime and the backward fallback succeeds. No compiled-C++ golden or complete native layer-training claim; `layer-support.md` remains GPU `none`.
+- v0.2.123: full GPU runtime now accepts `[hyperbolic_foveation]` as a host fallback source, retains its per-batch HF cache, transfers those parameters to the backend, and dispatches `[foveation_film]` through `foveation_film_forward_f32`. The HF and FiLM backward path is explicitly CPU-fallback gated, and GPU optimizer updates, compact inference, and f16 inference still reject these layers. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_native_forward_uses_host_hf_source_cache` passed on actual Oxide: all layer outputs match the CPU runtime and the backward fallback succeeds. `MEM=3G ./tools/test_host.sh foveation_film` passed all 12 focused tests, including the hybrid runtime boundary. No compiled-C++ golden or complete native layer-training claim; `layer-support.md` remains GPU `none`.
 
 ## Not implemented / open (pointer)
 

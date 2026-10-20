@@ -63,7 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
-- v0.2.123: integrated native Oxide FoveationFilm runtime forward with host-computed HF source parameters and explicit CPU backward fallback; focused actual-device runtime parity/backward-fallback test passes. GPU optimizer, compact/f16 paths, and native layer backward remain open; see `implemented.md` §160.
+- v0.2.123: integrated native Oxide FoveationFilm runtime forward with host-computed HF source parameters and explicit CPU backward fallback; actual-device runtime parity/backward-fallback plus all 12 focused host tests pass. GPU optimizer, compact/f16 paths, and native layer backward remain open; see `implemented.md` §160.
 - v0.2.122: added native full FoveationFilm input/source/parameter adjoints with deterministic spatial and batch reductions; the 2 actual-device parity/FD tests and host reference test pass. Runtime integration remains open; see `implemented.md` §159.
 - v0.2.121: added full FoveationFilm forward projection primitive (HF embedding/ReLU, gamma/beta projections, NCHW affine) through native Oxide operations; 2 actual-device parity/FD tests pass. Runtime integration and backward remain open; see `implemented.md` §158.
 - v0.2.120: added native Oxide f32 FiLM per-sample channel affine and exact input/gamma/beta adjoints; host reference and 1 actual-device parity/finite-difference test pass. This is a primitive only; no FoveationFilm layer runtime path yet. See `implemented.md` §157 and `gpu_layers_plan.md`.
