@@ -217,6 +217,7 @@ file is named inline.
 - [189. Logistic f16 direct CPU-reference parity](#189-logistic-f16-direct-cpu-reference-parity)
 - [190. OMD loss compact f16 inference pass-through](#190-omd-loss-compact-f16-inference-pass-through)
 - [191. JevCe group-major compact f16 inference](#191-jevce-group-major-compact-f16-inference)
+- [192. JevCe channel-major compact f16 inference](#192-jevce-channel-major-compact-f16-inference)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2150,6 +2151,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 191. JevCe group-major compact f16 inference
 
 - v0.2.152 (`pending`): added group-major `[jev_ce]` compact-f16 inference using native half-storage temperature scaling followed by the existing f32-accumulation group softmax. Actual-Oxide output matches `ExecutableNetwork::forward` for `B=2`, 2 groups, 3 candidates, temperature 1.5 (relative max error `4.633e-4`); `layout=cm` rejects explicitly. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed all 21 tests. Inference only; truth-driven CE loss/backward remain host/head limitations. No compiled-C++ golden.
+
+## 192. JevCe channel-major compact f16 inference
+
+- v0.2.153 (`pending`): added a native Oxide NCHW channel-major group-softmax kernel and routed f16 JevCe `layout=cm` through it, alongside existing group-major support. Actual-Oxide output matches the CPU inference reference for both layouts with 2 groups, 3 candidates, temperature 1.5 (relative max errors `4.633e-4` / `3.765e-4`); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed all 21 tests. Inference only; CE loss/backward remain outside this path. No compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 

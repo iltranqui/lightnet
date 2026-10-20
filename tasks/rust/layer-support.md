@@ -127,7 +127,7 @@ with the command given rather than trusting the number.
 | `LayaMarkerGather` | yes | none | fwd | exact | pin | native | device | yes |
 | `LayaActHead` | yes | C++ | fwd | exact (CPU path) | pin | native | cpu (primitive native) | no |
 | `LayaLoss` | yes | none | head | head | pin | native (loss on host) | head | no |
-| `JevCe` | alias | none | head | head | T2 | native (loss on host) | head | yes (group-major inference) |
+| `JevCe` | alias | none | head | head | T2 | native (loss on host) | head | yes (f16 inference; both layouts) |
 | `Segmentation` | alias | none | head | head | T2 | native (loss on host) | head | no |
 | `OmdLoss` | alias | none | pass + head | head | T2 | pass | head | yes (inference) |
 | `Contrastive` | yes | none | pass + head | head | T2 | pass | head | no |
@@ -277,11 +277,10 @@ Accepted by `forward_compact_f16` (`runtime.rs:8389`):
 
 `convolutional` (including `NORM_CHAN*` with f32 channel reductions), `maxpool`, `local_avgpool`, `avgpool`,
 `batchnorm`, `connected` (incl. folded rolling-stat BN), `route`, `channel_slice`, `laya_marker_gather`, `channel_shuffle`,
-`upsample` (incl. `reverse`), `dropout`, `cost`, `detection`, and `regression` (inference identities), `jev_ce` (group-major layout only), `reorg` (forward/reverse),
+`upsample` (incl. `reverse`), `dropout`, `cost`, `detection`, and `regression` (inference identities), `jev_ce` (group-major and channel-major layouts), `reorg` (forward/reverse),
 `shortcut` (with sources), `sam` (supported activation), `scale_channels`, `region`, `softmax`, `yolo`, `obb_yolo`, `gaussian_yolo`.
 
-`jev_ce` channel-major layout and everything else return `UnsupportedLayer`.
-Note this is inference only: f16
+Everything else returns `UnsupportedLayer`. Note this is inference only: f16
 training is the AMP path (`DARKNET_OXIDE_AMP=1`), which keeps f32 masters, and
 f16 convolution dgrad/wgrad are implemented there.
 
