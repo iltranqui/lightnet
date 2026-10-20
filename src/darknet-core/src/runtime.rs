@@ -13012,8 +13012,8 @@ where
                         &host_input,
                         &layer_outputs,
                     )?;
-                    let native_isotropic = spec.radius_mode == crate::model::HfRadiusMode::Isotropic;
-                    if native_isotropic && spec.pred_hidden > 0 {
+                    let native_grid_supported = matches!(spec.param_count(), 4 | 5);
+                    if native_grid_supported && spec.pred_hidden > 0 {
                         let predictor_source = if let Some(source_layer) = spec.pred_source_layer {
                             gpu_layer_outputs.get(source_layer).ok_or_else(|| {
                                 Error::InvalidConfig(format!(
@@ -13051,10 +13051,10 @@ where
                             predictor_cache.constrained_params = predicted;
                         }
                     }
-                    let grid = if native_isotropic {
+                    let grid = if native_grid_supported {
                         let params_per_batch = self.backend
                             .upload_f32(
-                                &[layer.output_shape.batch, 4],
+                                &[layer.output_shape.batch, spec.param_count()],
                                 &cache.params_per_batch,
                             )
                             .map_err(|err| backend_error("upload HF isotropic parameters", err))?;
@@ -13065,6 +13065,7 @@ where
                                     layer.output_shape.batch,
                                     layer.output_shape.height,
                                     layer.output_shape.width,
+                                    spec.param_count(),
                                     spec.alpha,
                                     spec.p_exp,
                                     spec.nr_iters,
@@ -13078,6 +13079,7 @@ where
                                     layer.output_shape.batch,
                                     layer.output_shape.height,
                                     layer.output_shape.width,
+                                    spec.param_count(),
                                     spec.alpha,
                                     spec.p_exp,
                                     spec.nr_iters,
@@ -13099,7 +13101,7 @@ where
                             )
                             .map_err(|err| backend_error("upload hyperbolic_foveation grid", err))?
                     };
-                    if native_isotropic {
+                    if native_grid_supported {
                         cache.grid = self.backend.download_f32(&grid)
                             .map_err(|err| backend_error("download native HF grid for backward cache", err))?;
                     }

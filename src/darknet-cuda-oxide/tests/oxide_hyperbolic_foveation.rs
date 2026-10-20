@@ -128,6 +128,7 @@ fn hyperbolic_foveation_native_newton_grid_matches_reference() {
             batch,
             height,
             width,
+            4,
             alpha,
             p_exp,
             iterations,
@@ -205,14 +206,15 @@ fn hyperbolic_foveation_native_fixed_point_grid_matches_reference() {
     let p_exp = 2.2f32;
     let iterations = 7;
     let eta = 0.35f32;
-    let params = [0.05, -0.04, 0.8, 0.3, -0.15, 0.1, 1.2, 0.7];
-    let params_gpu = backend.upload_f32(&[batch, 4], &params).unwrap();
+    let params = [0.05, -0.04, 0.8, 0.7, 0.3, -0.15, 0.1, 1.2, 0.9, 0.7];
+    let params_gpu = backend.upload_f32(&[batch, 5], &params).unwrap();
     let grid = backend
         .hyperbolic_fixed_point_grid_f32(
             &params_gpu,
             batch,
             height,
             width,
+            5,
             alpha,
             p_exp,
             iterations,
@@ -223,10 +225,12 @@ fn hyperbolic_foveation_native_fixed_point_grid_matches_reference() {
     let actual = backend.download_f32(&grid).unwrap();
     let mut expected = vec![0.0; batch * height * width * 2];
     for b in 0..batch {
-        let cx = params[b * 4].clamp(-0.9, 0.9);
-        let cy = params[b * 4 + 1].clamp(-0.9, 0.9);
-        let radius = params[b * 4 + 2].clamp(0.1, 2.0);
-        let strength = params[b * 4 + 3].clamp(0.0, 1.0);
+        let cx = params[b * 5].clamp(-0.9, 0.9);
+        let cy = params[b * 5 + 1].clamp(-0.9, 0.9);
+        let rx = params[b * 5 + 2].clamp(0.1, 2.0);
+        let ry = params[b * 5 + 3].clamp(0.1, 2.0);
+        let radius = (rx.powf(8.0) + ry.powf(8.0)).powf(0.125).clamp(0.1, 2.0);
+        let strength = params[b * 5 + 4].clamp(0.0, 1.0);
         for y in 0..height {
             let qy = 2.0 * y as f32 / (height - 1) as f32 - 1.0;
             for x in 0..width {

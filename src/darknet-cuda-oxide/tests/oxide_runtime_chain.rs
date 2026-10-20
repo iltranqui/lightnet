@@ -192,8 +192,8 @@ fn foveation_film_native_forward_backward_uses_host_hf_source_cache() {
     let net = network(
         "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=2\n\
          [convolutional]\nfilters=1\nsize=1\nactivation=linear\n\
-         [hf]\nparams=learned\npred_hidden=2\ndownsample=1\npred_source_layer=0\ninverse_method=fixed_point\n\
-         init_cx=0.05\ninit_cy=-0.04\ninit_radius=0.8\ninit_strength=0.3\n\
+         [hf]\nparams=learned\npred_hidden=2\ndownsample=1\npred_source_layer=0\ninverse_method=fixed_point\nradius_mode=anisotropic\n\
+         init_cx=0.05\ninit_cy=-0.04\ninit_radius_x=0.8\ninit_radius_y=0.9\ninit_strength=0.3\n\
          [foveation_film]\nembed_dim=2\nfilm_init_scale=0.25\nbackprop_to_hf=1\n",
     );
     let mut cpu = ExecutableNetwork::new(net.clone());
@@ -204,13 +204,15 @@ fn foveation_film_native_forward_backward_uses_host_hf_source_cache() {
     if let LayerParams::HyperbolicFoveation(params) = &mut cpu.params[1] {
         params.pred_w1.fill(0.025);
         params.pred_b1.copy_from_slice(&[0.6, 0.7]);
-        params.pred_w2
-            .copy_from_slice(&[0.08, -0.03, 0.04, 0.07, -0.05, 0.06, 0.03, 0.09]);
-        params.pred_b2.copy_from_slice(&[0.1, -0.08, 0.3, 0.2]);
+        params.pred_w2.copy_from_slice(&[
+            0.08, -0.03, 0.04, 0.07, -0.05, 0.06, 0.03, 0.09, -0.02, 0.05,
+        ]);
+        params.pred_b2.copy_from_slice(&[0.1, -0.08, 0.3, 0.2, 0.12]);
     }
     if let LayerParams::FoveationFilm(params) = &mut cpu.params[2] {
-        params.w_embed
-            .copy_from_slice(&[0.2, 0.1, -0.1, 0.2, 0.15, 0.05, 0.1, -0.08]);
+        params.w_embed.copy_from_slice(&[
+            0.2, 0.1, -0.1, 0.2, 0.15, 0.05, 0.1, -0.08, 0.07, -0.02,
+        ]);
         params.b_embed.copy_from_slice(&[0.5, 0.7]);
         params.w_gamma.copy_from_slice(&[0.1, -0.2]);
         params.b_gamma[0] = 0.05;
@@ -320,7 +322,7 @@ fn foveation_film_native_forward_backward_uses_host_hf_source_cache() {
 fn foveation_film_runtime_adam_updates_match_cpu() {
     let net = network(
         "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=2\nadam=1\n\
-         [hf]\nparams=fixed\ninit_cx=0.05\ninit_cy=-0.04\ninit_radius=0.8\ninit_strength=0.3\n\
+         [hf]\nparams=fixed\nradius_mode=anisotropic\ninit_cx=0.05\ninit_cy=-0.04\ninit_radius_x=0.8\ninit_radius_y=0.9\ninit_strength=0.3\n\
          [foveation_film]\nembed_dim=2\nfilm_init_scale=0.25\n",
     );
     let mut cpu = ExecutableNetwork::new(net.clone());

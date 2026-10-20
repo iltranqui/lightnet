@@ -1991,7 +1991,7 @@ pub trait F32TensorOpsBackend {
         self.upload_f32(&[batch, param_count], &constrained)
     }
 
-    /// Generate the isotropic Newton HF sampling grid. The default backend
+    /// Generate the isotropic or anisotropic Newton HF sampling grid. The default backend
     /// computes the reference grid on the host; Oxide overrides with a kernel.
     fn hyperbolic_newton_grid_f32(
         &self,
@@ -1999,6 +1999,7 @@ pub trait F32TensorOpsBackend {
         batch: usize,
         height: usize,
         width: usize,
+        param_count: usize,
         alpha: f32,
         p_exp: f32,
         iterations: usize,
@@ -2007,13 +2008,15 @@ pub trait F32TensorOpsBackend {
     ) -> Result<Self::Tensor, Self::Error> {
         let _ = config;
         let params = self.download_f32(params)?;
-        assert_eq!(params.len(), batch * 4);
+        assert!(param_count == 4 || param_count == 5);
+        assert_eq!(params.len(), batch * param_count);
         let mut grid = vec![0.0; batch * height * width * 2];
         for b in 0..batch {
-            let cx = params[b * 4].clamp(-0.9, 0.9);
-            let cy = params[b * 4 + 1].clamp(-0.9, 0.9);
-            let radius = params[b * 4 + 2].clamp(0.1, 2.0).max(1.0e-4);
-            let strength = params[b * 4 + 3].clamp(0.0, 1.0);
+            let cx = params[b * param_count].clamp(-0.9, 0.9);
+            let cy = params[b * param_count + 1].clamp(-0.9, 0.9);
+            let rx = params[b * param_count + 2].clamp(0.1, 2.0);
+            let radius = if param_count == 5 { (rx.powf(8.0) + params[b * param_count + 3].clamp(0.1, 2.0).powf(8.0)).powf(0.125).clamp(0.1, 2.0) } else { rx.max(1e-4) };
+            let strength = params[b * param_count + param_count - 1].clamp(0.0, 1.0);
             for y in 0..height {
                 let qy = if height > 1 { 2.0 * y as f32 / (height - 1) as f32 - 1.0 } else { 0.0 };
                 for x in 0..width {
@@ -2065,14 +2068,14 @@ pub trait F32TensorOpsBackend {
         self.upload_f32(&[batch, height, width, 2], &grid)
     }
 
-    /// Generate the isotropic fixed-point HF sampling grid. Other inverse
-    /// methods/radius modes continue using the explicit host reference path.
+    /// Generate an isotropic or anisotropic fixed-point HF sampling grid.
     fn hyperbolic_fixed_point_grid_f32(
         &self,
         params: &Self::Tensor,
         batch: usize,
         height: usize,
         width: usize,
+        param_count: usize,
         alpha: f32,
         p_exp: f32,
         iterations: usize,
@@ -2081,13 +2084,15 @@ pub trait F32TensorOpsBackend {
     ) -> Result<Self::Tensor, Self::Error> {
         let _ = config;
         let params = self.download_f32(params)?;
-        assert_eq!(params.len(), batch * 4, "HF fixed-point parameter length");
+        assert!(param_count == 4 || param_count == 5);
+        assert_eq!(params.len(), batch * param_count, "HF fixed-point parameter length");
         let mut grid = vec![0.0; batch * height * width * 2];
         for b in 0..batch {
-            let cx = params[b * 4].clamp(-0.9, 0.9);
-            let cy = params[b * 4 + 1].clamp(-0.9, 0.9);
-            let radius = params[b * 4 + 2].clamp(0.1, 2.0);
-            let strength = params[b * 4 + 3].clamp(0.0, 1.0);
+            let cx = params[b * param_count].clamp(-0.9, 0.9);
+            let cy = params[b * param_count + 1].clamp(-0.9, 0.9);
+            let rx = params[b * param_count + 2].clamp(0.1, 2.0);
+            let radius = if param_count == 5 { (rx.powf(8.0) + params[b * param_count + 3].clamp(0.1, 2.0).powf(8.0)).powf(0.125).clamp(0.1, 2.0) } else { rx };
+            let strength = params[b * param_count + param_count - 1].clamp(0.0, 1.0);
             for y in 0..height {
                 let qy = if height > 1 { 2.0 * y as f32 / (height - 1) as f32 - 1.0 } else { 0.0 };
                 for x in 0..width {

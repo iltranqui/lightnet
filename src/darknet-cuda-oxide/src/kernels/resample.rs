@@ -367,13 +367,14 @@ pub mod kernels {
         }
     }
 
-    /// Build the inverse sampling grid for isotropic Newton HF mode.
+    /// Build the inverse sampling grid for isotropic or anisotropic Newton HF mode.
     #[kernel]
     pub fn hyperbolic_newton_grid(
         params: &[f32],
         mut grid: DisjointSlice<f32>,
         height: usize,
         width: usize,
+        param_count: usize,
         alpha: f32,
         p_exp: f32,
         iterations: usize,
@@ -392,10 +393,14 @@ pub mod kernels {
         let oy = p / width;
         let qx = if width > 1 { 2.0 * ox as f32 / (width - 1) as f32 - 1.0 } else { 0.0 };
         let qy = if height > 1 { 2.0 * oy as f32 / (height - 1) as f32 - 1.0 } else { 0.0 };
-        let cx = params[batch * 4].max(-0.9).min(0.9);
-        let cy = params[batch * 4 + 1].max(-0.9).min(0.9);
-        let radius = params[batch * 4 + 2].max(0.1).min(2.0).max(1.0e-4);
-        let strength = params[batch * 4 + 3].max(0.0).min(1.0);
+        let cx = params[batch * param_count].max(-0.9).min(0.9);
+        let cy = params[batch * param_count + 1].max(-0.9).min(0.9);
+        let radius_x = params[batch * param_count + 2].max(0.1).min(2.0);
+        let radius = if param_count == 5 {
+            let radius_y = params[batch * param_count + 3].max(0.1).min(2.0);
+            (radius_x.powf(8.0) + radius_y.powf(8.0)).powf(0.125).max(0.1).min(2.0)
+        } else { radius_x };
+        let strength = params[batch * param_count + param_count - 1].max(0.0).min(1.0);
         let alpha = alpha.max(1.0e-4);
         let p_exp = p_exp.max(1.0e-4);
         let mut px = qx.max(-1.0).min(1.0);
@@ -465,7 +470,7 @@ pub mod kernels {
         }
     }
 
-    /// Build the inverse sampling grid for isotropic fixed-point HF mode.
+    /// Build the inverse sampling grid for isotropic or anisotropic fixed-point HF mode.
     /// One thread owns one scalar coordinate; x/y are recomputed deterministically.
     #[kernel]
     pub fn hyperbolic_fixed_point_grid(
@@ -473,6 +478,7 @@ pub mod kernels {
         mut grid: DisjointSlice<f32>,
         height: usize,
         width: usize,
+        param_count: usize,
         alpha: f32,
         p_exp: f32,
         iterations: usize,
@@ -499,10 +505,14 @@ pub mod kernels {
         } else {
             0.0
         };
-        let cx = params[batch * 4].max(-0.9).min(0.9);
-        let cy = params[batch * 4 + 1].max(-0.9).min(0.9);
-        let radius = params[batch * 4 + 2].max(0.1).min(2.0);
-        let strength = params[batch * 4 + 3].max(0.0).min(1.0);
+        let cx = params[batch * param_count].max(-0.9).min(0.9);
+        let cy = params[batch * param_count + 1].max(-0.9).min(0.9);
+        let radius_x = params[batch * param_count + 2].max(0.1).min(2.0);
+        let radius = if param_count == 5 {
+            let radius_y = params[batch * param_count + 3].max(0.1).min(2.0);
+            (radius_x.powf(8.0) + radius_y.powf(8.0)).powf(0.125).max(0.1).min(2.0)
+        } else { radius_x };
+        let strength = params[batch * param_count + param_count - 1].max(0.0).min(1.0);
         let mut px = qx.max(-1.0).min(1.0);
         let mut py = qy.max(-1.0).min(1.0);
         let safe_alpha = alpha.max(1.0e-4);

@@ -6648,6 +6648,7 @@ impl F32TensorOpsBackend for OxideBackend {
         batch: usize,
         height: usize,
         width: usize,
+        param_count: usize,
         alpha: f32,
         p_exp: f32,
         iterations: usize,
@@ -6660,10 +6661,13 @@ impl F32TensorOpsBackend for OxideBackend {
         if batch == 0 || height == 0 || width == 0 {
             return Err(shape_err(op, "batch and spatial dimensions must be positive".to_owned()));
         }
-        let expected_params = batch.checked_mul(4)
+        if param_count != 4 && param_count != 5 {
+            return Err(shape_err(op, format!("expected parameter count 4 or 5, got {param_count}")));
+        }
+        let expected_params = batch.checked_mul(param_count)
             .ok_or_else(|| shape_err(op, "parameter size overflows".to_owned()))?;
         if params.len() != expected_params {
-            return Err(shape_err(op, format!("expected {expected_params} isotropic parameters, got {}", params.len())));
+            return Err(shape_err(op, format!("expected {expected_params} parameters, got {}", params.len())));
         }
         let grid_len = batch.checked_mul(height)
             .and_then(|n| n.checked_mul(width))
@@ -6671,7 +6675,7 @@ impl F32TensorOpsBackend for OxideBackend {
             .ok_or_else(|| shape_err(op, "grid size overflows".to_owned()))?;
         let mut grid = self.alloc_uninit(grid_len)?;
         // SAFETY: each output coordinate is owned by one thread and parameter
-        // rows are validated to contain exactly four isotropic values per batch.
+        // rows are validated to contain four/five values per batch.
         unsafe {
             self.resample.hyperbolic_newton_grid(
                 &self.stream,
@@ -6680,6 +6684,7 @@ impl F32TensorOpsBackend for OxideBackend {
                 &mut grid,
                 height,
                 width,
+                param_count,
                 alpha,
                 p_exp,
                 iterations,
@@ -6696,6 +6701,7 @@ impl F32TensorOpsBackend for OxideBackend {
         batch: usize,
         height: usize,
         width: usize,
+        param_count: usize,
         alpha: f32,
         p_exp: f32,
         iterations: usize,
@@ -6708,11 +6714,13 @@ impl F32TensorOpsBackend for OxideBackend {
         if batch == 0 || height == 0 || width == 0 {
             return Err(shape_err(op, "batch and spatial dimensions must be positive".to_owned()));
         }
-        if params.len() != batch * 4 {
-            return Err(shape_err(
-                op,
-                format!("expected {} isotropic parameters, got {}", batch * 4, params.len()),
-            ));
+        if param_count != 4 && param_count != 5 {
+            return Err(shape_err(op, format!("expected parameter count 4 or 5, got {param_count}")));
+        }
+        let expected_params = batch.checked_mul(param_count)
+            .ok_or_else(|| shape_err(op, "parameter size overflows".to_owned()))?;
+        if params.len() != expected_params {
+            return Err(shape_err(op, format!("expected {expected_params} parameters, got {}", params.len())));
         }
         let grid_len = batch
             .checked_mul(height)
@@ -6730,6 +6738,7 @@ impl F32TensorOpsBackend for OxideBackend {
                 &mut grid,
                 height,
                 width,
+                param_count,
                 alpha,
                 p_exp,
                 iterations,
