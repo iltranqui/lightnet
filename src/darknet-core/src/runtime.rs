@@ -45232,6 +45232,73 @@ num_dwconv=1
     }
 
     #[test]
+    fn scale_channels_axis_layout_pins_named_source_and_channel_or_spatial_broadcast() {
+        use crate::axis_fixture::{axis_tensor, nchw_index};
+        use crate::model::{Activation, ScaleChannelsSpec};
+
+        let source_shape = TensorShape::new(3, 2, 2, 2);
+        let source = Tensor::from_data(source_shape, axis_tensor(source_shape))
+            .expect("named source output");
+        for scale_wh in [false, true] {
+            let input_shape = if scale_wh {
+                TensorShape::new(3, 2, 1, 2)
+            } else {
+                TensorShape::new(1, 1, 2, 2)
+            };
+            let input = Tensor::from_data(input_shape, axis_tensor(input_shape))
+                .expect("scale input");
+            let spec = ScaleChannelsSpec {
+                from: 0,
+                scale_wh,
+                activation: Activation::Linear,
+            };
+            let (output, activation_input) =
+                super::forward_scale_channels(&spec, &input, &source, source_shape)
+                    .expect("scale_channels forward");
+            let seed = Tensor::from_data(source_shape, axis_tensor(source_shape))
+                .expect("scale_channels seed");
+            let (input_gradient, source_gradient) = super::backward_scale_channels(
+                &spec,
+                &input,
+                &source,
+                &output,
+                &seed,
+                activation_input.as_ref(),
+            )
+            .expect("scale_channels backward");
+            let mut expected_input_gradient = vec![0.0; input_shape.element_count() * input_shape.batch];
+            for n in 0..source_shape.batch {
+                for c in 0..source_shape.channels {
+                    for h in 0..source_shape.height {
+                        for w in 0..source_shape.width {
+                            let output_index = nchw_index(source_shape, n, c, h, w);
+                            let input_index = if scale_wh {
+                                nchw_index(input_shape, n, 0, h, w)
+                            } else {
+                                nchw_index(input_shape, n, c, 0, 0)
+                            };
+                            let scale = input.data[input_index];
+                            assert_eq!(
+                                output.data[output_index],
+                                scale * source.data[output_index],
+                                "from=0 output slot mismatch at (n={n},c={c},h={h},w={w}), scale_wh={scale_wh}"
+                            );
+                            assert_eq!(
+                                source_gradient.data[output_index],
+                                seed.data[output_index] * scale,
+                                "named-source adjoint mismatch at (n={n},c={c},h={h},w={w}), scale_wh={scale_wh}"
+                            );
+                            expected_input_gradient[input_index] +=
+                                seed.data[output_index] * source.data[output_index];
+                        }
+                    }
+                }
+            }
+            assert_eq!(input_gradient.data, expected_input_gradient);
+        }
+    }
+
+    #[test]
     fn softmax_axis_layout_pins_per_batch_contiguous_groups_and_adjoint() {
         use crate::axis_fixture::{axis_tensor, decode_axis_value};
 
