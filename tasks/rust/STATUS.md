@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.159: LayaEncoder full/compact f32 inference now runs natively on Oxide, including embedding gather, RoPE full/sliding attention, and GeGLU; actual-device parity covers multi-block masks/layout. See `implemented.md` §198.
 - v0.2.158: LayaScorer GPU backward now computes the frozen layer's input adjoint with native Oxide operations; actual-device preceding-layer/input-gradient parity passes. No scorer parameter updates. See `implemented.md` §197.
 - v0.2.157: LayaScorer full and compact f32 inference now use native Oxide unpack, LayerNorm, connected, exact-erf GELU, and pack operations; actual-device CPU-reference parity passes for multiple batches/options. See `implemented.md` §196.
 - v0.2.156: LayaHead full and compact f32 forward now compose native Oxide type conditioning, LayerNorm, projections, masked attention, residuals, FFN and layout packing; Actual-Oxide CPU-reference parity passes fixed/input qtype and mask cases. See `implemented.md` §195.

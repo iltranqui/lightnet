@@ -223,6 +223,7 @@ file is named inline.
 - [195. LayaHead native f32 forward](#195-layahead-native-f32-forward)
 - [196. LayaScorer native f32 forward](#196-layascorer-native-f32-forward)
 - [197. LayaScorer native f32 input adjoint](#197-layascorer-native-f32-input-adjoint)
+- [198. LayaEncoder native f32 inference](#198-layaencoder-native-f32-inference)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2180,6 +2181,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 197. LayaScorer native f32 input adjoint
 
 - v0.2.158 (`0cd19320`): replaced the GPU runtime's scorer input/seed host round trip with Oxide connected, exact-erf GELU, and LayerNorm input adjoints, including native seed reshape and channel-major input-gradient scatter. Actual-device input gradients match CPU through a preceding convolution with two batches/three options; `oxide_laya_scorer_forward`: 3 passed. `MEM=3G ./tools/test_host.sh laya_scorer`: 16 passed, including the FakeBackend runtime regression. Scorer is frozen: FC/norm parameter gradients remain unused and updates are not enabled. No f16 or compiled-C++ parity.
+
+## 198. LayaEncoder native f32 inference
+
+- v0.2.159 (`e10642c0`): composed native Oxide embedding gather/mask extraction, bias-free LayerNorm, fused-QKV RoPE attention (alternating full/sliding key masks with online softmax), residual projections, exact-erf GeGLU, final normalization, and NCHW packing into both full and compact f32 runtime paths. Actual-device CPU-reference parity covers two batches, three blocks, local-window edges, masked/fully masked rows, and out-of-range IDs; malformed embedding extents reject (`oxide_laya_encoder_forward`: 2 passed). `MEM=3G ./tools/test_host.sh laya_encoder`: 10 passed. Frozen backward remains no-input-gradient; compact f16 unsupported. C++ source audit via `Jev_laya:src-lib/laya_encoder_kernels.cu`; no compiled-C++ golden, no speedup claim.
 
 ## Not implemented / open (pointer)
 

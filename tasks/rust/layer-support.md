@@ -121,7 +121,7 @@ with the command given rather than trusting the number.
 | `KimiKda` | alias | C++ | fwd | exact | pin | host | cpu | no |
 | `DepthAnything` | yes | C++ | frozen | frozen | T4 | none | none | no |
 | `DptHead` | alias | C++ | fwd | exact | pin | none | none | no |
-| `LayaEncoder` | yes | C++ | frozen | frozen | pin | host | cpu | no |
+| `LayaEncoder` | yes | C++ (`Jev_laya` source) | frozen | frozen | pin | native f32 full + compact | none (frozen/no input grad) | no |
 | `LayaHead` | yes | C++ | frozen | frozen | pin | native f32 full + compact | none (frozen/no input grad) | no |
 | `LayaScorer` | yes | C++ source not local | frozen | frozen | pin | native f32 full + compact | native input adjoint | no |
 | `LayaMarkerGather` | yes | none | fwd | exact | pin | native | device | yes |
