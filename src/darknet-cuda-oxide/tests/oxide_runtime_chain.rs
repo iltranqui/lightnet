@@ -52,6 +52,45 @@ fn close(name: &str, a: &[f32], b: &[f32], tol: f32) {
     }
 }
 
+fn assert_hf_film_train_buffers(
+    cpu: &ExecutableNetwork,
+    gpu: &GpuExecutableNetwork<OxideBackend>,
+    hf_index: usize,
+    film_index: usize,
+    step: usize,
+) {
+    let gpu_buffers = gpu.host_fallback_train_buffers();
+    let (LayerTrainBuffers::HyperbolicFoveation(cpu_hf), LayerTrainBuffers::HyperbolicFoveation(gpu_hf)) =
+        (&cpu.train_buffers[hf_index], &gpu_buffers[hf_index])
+    else {
+        panic!("expected HF train buffers")
+    };
+    for (name, expected, actual) in [
+        ("HF params", &cpu_hf.hf_param_updates, &gpu_hf.hf_param_updates),
+        ("HF predictor W1", &cpu_hf.pred_w1_updates, &gpu_hf.pred_w1_updates),
+        ("HF predictor b1", &cpu_hf.pred_b1_updates, &gpu_hf.pred_b1_updates),
+        ("HF predictor W2", &cpu_hf.pred_w2_updates, &gpu_hf.pred_w2_updates),
+        ("HF predictor b2", &cpu_hf.pred_b2_updates, &gpu_hf.pred_b2_updates),
+    ] {
+        close(&format!("step {step} {name} gradients"), expected, actual, 3e-5);
+    }
+    let (LayerTrainBuffers::FoveationFilm(cpu_film), LayerTrainBuffers::FoveationFilm(gpu_film)) =
+        (&cpu.train_buffers[film_index], &gpu_buffers[film_index])
+    else {
+        panic!("expected FoveationFilm train buffers")
+    };
+    for (name, expected, actual) in [
+        ("FiLM embedding W", &cpu_film.w_embed_updates, &gpu_film.w_embed_updates),
+        ("FiLM embedding b", &cpu_film.b_embed_updates, &gpu_film.b_embed_updates),
+        ("FiLM gamma W", &cpu_film.w_gamma_updates, &gpu_film.w_gamma_updates),
+        ("FiLM gamma b", &cpu_film.b_gamma_updates, &gpu_film.b_gamma_updates),
+        ("FiLM beta W", &cpu_film.w_beta_updates, &gpu_film.w_beta_updates),
+        ("FiLM beta b", &cpu_film.b_beta_updates, &gpu_film.b_beta_updates),
+    ] {
+        close(&format!("step {step} {name} gradients"), expected, actual, 3e-5);
+    }
+}
+
 fn conv_stack(act: &str) -> String {
     format!(
         "[net]\nwidth=6\nheight=6\nchannels=2\nbatch=2\n\
@@ -210,6 +249,7 @@ fn foveation_film_native_forward_backward_uses_host_hf_source_cache() {
     gpu.zero_train_buffers_gpu().expect("initialize GPU train buffers");
     gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
         .expect("native FiLM and host HF backward");
+    assert_hf_film_train_buffers(&cpu, &gpu, 1, 2, 1);
     cpu.update_weights(0.001, 0.0, 0.0, 1);
     gpu.update_weights_gpu(0.001, 0.0, 0.0, 1)
         .expect("hybrid SGD update");
@@ -250,6 +290,7 @@ fn foveation_film_native_forward_backward_uses_host_hf_source_cache() {
         .expect("CPU second backward");
     gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
         .expect("native second backward");
+    assert_hf_film_train_buffers(&cpu, &gpu, 1, 2, 2);
     cpu.update_weights(0.001, 0.0, 0.0, 1);
     gpu.update_weights_gpu(0.001, 0.0, 0.0, 1)
         .expect("second hybrid SGD update");
@@ -307,6 +348,7 @@ fn foveation_film_runtime_adam_updates_match_cpu() {
     gpu.zero_train_buffers_gpu().expect("initialize Adam buffers");
     gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
         .expect("native Adam backward");
+    assert_hf_film_train_buffers(&cpu, &gpu, 0, 1, 1);
     cpu.update_weights_adam(0.005, 1).unwrap();
     gpu.update_weights_gpu(0.005, 0.0, net.net.decay, 1)
         .expect("hybrid Adam update");
@@ -342,6 +384,7 @@ fn foveation_film_runtime_adam_updates_match_cpu() {
         .expect("CPU second Adam backward");
     gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
         .expect("native second Adam backward");
+    assert_hf_film_train_buffers(&cpu, &gpu, 0, 1, 2);
     cpu.update_weights_adam(0.005, 1).unwrap();
     gpu.update_weights_gpu(0.005, 0.0, net.net.decay, 1)
         .expect("second hybrid Adam update");

@@ -9215,6 +9215,18 @@ where
         self.train_iteration = iteration;
     }
 
+    /// Inspect host-fallback layer train buffers. Device-resident gradients
+    /// (for example native convolution buffers) are intentionally not included.
+    /// The borrow reflects buffers after host fallback work and any explicit
+    /// device-to-host gradient flushes.
+    pub fn host_fallback_train_buffers(
+        &self,
+    ) -> std::cell::Ref<'_, [LayerTrainBuffers]> {
+        std::cell::Ref::map(self.cpu_fallback_train_buffers.borrow(), |buffers| {
+            buffers.as_slice()
+        })
+    }
+
     /// Adam updates applied so far (the `t` of the next update is this + 1).
     pub fn adam_step(&self) -> u32 {
         self.adam_step
