@@ -415,6 +415,64 @@ pub mod kernels {
         }
     }
 
+    /// NCHW channel normalization over f16 storage with f32 reductions.
+    #[kernel]
+    pub fn normalize_channels_f16(
+        input: &[u16],
+        mut output: DisjointSlice<u16>,
+        channels: usize,
+        spatial: usize,
+        normalization: u32,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= output.len() {
+            return;
+        }
+        let position = i % spatial;
+        let batch = i / (channels * spatial);
+        let base = batch * channels * spatial + position;
+        let value = if normalization == 0 {
+            let mut sum = 0.0001f32;
+            let mut k = 0usize;
+            while k < channels {
+                let x = f16_bits_to_f32(input[base + k * spatial]);
+                if x > 0.0 {
+                    sum += x;
+                }
+                k += 1;
+            }
+            let x = f16_bits_to_f32(input[i]);
+            if x > 0.0 { x / sum } else { 0.0 }
+        } else {
+            let maximum = if normalization == 2 {
+                let mut maximum = -f32::MAX;
+                let mut k = 0usize;
+                while k < channels {
+                    let x = f16_bits_to_f32(input[base + k * spatial]);
+                    if x > maximum || k == 0 {
+                        maximum = x;
+                    }
+                    k += 1;
+                }
+                maximum
+            } else {
+                0.0
+            };
+            let mut sum = 0.0001f32;
+            let mut k = 0usize;
+            while k < channels {
+                sum += (f16_bits_to_f32(input[base + k * spatial]) - maximum).exp();
+                k += 1;
+            }
+            let result = (f16_bits_to_f32(input[i]) - maximum).exp() / sum;
+            if result.is_finite() { result } else { 0.0 }
+        };
+        if let Some(o) = output.get_mut(idx) {
+            *o = f32_to_f16_bits(value, 0);
+        }
+    }
+
     /// Scale source values by per-channel or per-spatial half input, then activate.
     #[kernel]
     pub fn scale_channels_f16(

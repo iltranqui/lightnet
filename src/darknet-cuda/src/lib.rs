@@ -3070,6 +3070,13 @@ pub trait F16TensorOpsBackend: F32TensorOpsBackend {
         per_filter: usize,
     ) -> Result<Self::TensorF16, Self::Error>;
     /// `f16(activation(conv(x, weights) + bias))`; `bias` is f32 `[filters]`.
+    fn normalize_channels_f16(
+        &self,
+        x: &Self::TensorF16,
+        shape: &[usize],
+        normalization: F32ChannelNormalization,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error>;
     fn conv2d_bias_act_f16(
         &self,
         x: &Self::TensorF16,

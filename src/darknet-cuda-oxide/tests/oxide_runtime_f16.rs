@@ -280,29 +280,24 @@ fn unsupported_layers_still_error_cleanly() {
 }
 
 #[test]
-fn channel_normalization_f16_inference_is_explicitly_rejected() {
-    let net = network(
-        r#"
-            [net]
-            width=2
-            height=1
-            channels=2
-            batch=1
-
-            [convolutional]
-            filters=3
-            size=1
-            activation=normalize_channels
-        "#,
-    );
-    let exec = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().unwrap());
-    let error = exec
-        .forward_compact_f16(&input_for(&net, 23))
-        .expect_err("f16 channel normalization is not implemented");
-    assert!(matches!(
-        error,
-        Error::UnsupportedLayer { layer_index: 0, name } if name.contains("NORM_CHAN")
-    ));
+fn channel_normalization_f16_inference_matches_f32() {
+    for activation in [
+        "normalize_channels",
+        "normalize_channels_softmax",
+        "normalize_channels_softmax_maxval",
+    ] {
+        let cfg = format!(
+            "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\n\
+             [convolutional]\nfilters=4\nsize=1\nactivation={activation}\n"
+        );
+        run_pair(
+            &format!("{activation} f16"),
+            network(&cfg),
+            23,
+            0.7,
+            4e-3,
+        );
+    }
 }
 
 #[test]

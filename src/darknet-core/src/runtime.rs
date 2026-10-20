@@ -8513,14 +8513,7 @@ where
         }
         for layer in &self.network.layers {
             match &layer.kind {
-                LayerKind::Convolutional(spec) => {
-                    if spec.activation.to_channel_normalization().is_some() {
-                        return Err(Error::UnsupportedLayer {
-                            layer_index: layer.index,
-                            name: "NORM_CHAN* (f16 inference)".to_owned(),
-                        });
-                    }
-                }
+                LayerKind::Convolutional(_) => {}
                 LayerKind::MaxPool(_)
                 | LayerKind::LocalAvgPool(_)
                 | LayerKind::AvgPool
@@ -8620,8 +8613,14 @@ where
                             w
                         }
                     };
-                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
-                    self.backend
+                    let normalization = spec.activation.to_channel_normalization();
+                    let activation = if normalization.is_some() {
+                        F32ActivationKind::Linear
+                    } else {
+                        gpu_activation_kind(layer.index, &spec.activation)?
+                    };
+                    let convolution = self
+                        .backend
                         .conv2d_bias_act_f16(
                             current_input.expect("convolution requires current input"),
                             &weights16,
@@ -8640,7 +8639,21 @@ where
                             activation,
                             launch_config,
                         )
-                        .map_err(|err| backend_error("f16 convolution", err))?
+                        .map_err(|err| backend_error("f16 convolution", err))?;
+                    if let Some(normalization) = normalization {
+                        self.backend
+                            .normalize_channels_f16(
+                                &convolution,
+                                &tensor_backend_shape(layer.output_shape),
+                                normalization,
+                                launch_config,
+                            )
+                            .map_err(|err| {
+                                backend_error("f16 convolution channel normalization", err)
+                            })?
+                    } else {
+                        convolution
+                    }
                 }
                 (LayerKind::MaxPool(spec), LayerParams::None) => {
                     let maxpool_input = current_input.expect("maxpool requires current input");

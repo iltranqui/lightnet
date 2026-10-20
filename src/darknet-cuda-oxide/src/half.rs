@@ -5,7 +5,7 @@
 //! only: there is no backward on f16 tensors (training stays f32).
 
 use cuda_core::{CudaStream, DeviceBuffer};
-use darknet_cuda::{ElementwiseLaunchConfig, F32ActivationKind};
+use darknet_cuda::{ElementwiseLaunchConfig, F32ActivationKind, F32ChannelNormalization};
 use std::sync::Arc;
 
 use crate::tensor::PooledBuf16;
@@ -944,6 +944,47 @@ impl OxideBackend {
         Ok(OxideTensorF16::new(out, a.shape()))
     }
 
+    /// Native f16-storage channel normalization with f32 reductions.
+    pub fn normalize_channels_f16(
+        &self,
+        input: &OxideTensorF16,
+        shape: &[usize],
+        normalization: F32ChannelNormalization,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF16, OxideError> {
+        if shape.len() != 4
+            || input.shape() != shape
+            || input.len() != shape.iter().product::<usize>()
+            || shape[1] == 0
+            || shape[2] == 0
+            || shape[3] == 0
+        {
+            return Err(shape_err("normalize_channels_f16", format!("expected nonempty NCHW input, got {shape:?}")));
+        }
+        let channels = shape[1];
+        let spatial = shape[2] * shape[3];
+        let code = match normalization {
+            F32ChannelNormalization::Relu => 0,
+            F32ChannelNormalization::Softmax => 1,
+            F32ChannelNormalization::SoftmaxMaxval => 2,
+        };
+        let mut output = self.alloc16_uninit(input.len())?;
+        // SAFETY: the shape validates NCHW strides and each output index is written once.
+        unsafe {
+            self.half_ops.normalize_channels_f16(
+                &self.stream,
+                launch::elementwise(output.len(), config),
+                &input.buf,
+                &mut output,
+                channels,
+                spatial,
+                code,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF16::new(output, shape))
+    }
+
     /// Native f16 scale_channels with per-channel or per-pixel scaling.
     pub fn scale_channels_f16(
         &self,
@@ -1395,6 +1436,16 @@ impl darknet_cuda::F16TensorOpsBackend for OxideBackend {
 
     fn download_f16(&self, tensor: &Self::TensorF16) -> Result<Vec<f32>, Self::Error> {
         OxideBackend::download_f16(self, tensor)
+    }
+
+    fn normalize_channels_f16(
+        &self,
+        x: &Self::TensorF16,
+        shape: &[usize],
+        normalization: F32ChannelNormalization,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error> {
+        OxideBackend::normalize_channels_f16(self, x, shape, normalization, config)
     }
 
     fn conv_weights_f16(
