@@ -148,6 +148,22 @@ fn channel_shuffle_f16_inference_matches_f32() {
 }
 
 #[test]
+fn softmax_f16_inference_matches_f32_for_multiple_group_counts() {
+    for groups in [1, 2] {
+        let cfg = format!(
+            "[net]\nwidth=3\nheight=2\nchannels=4\nbatch=2\n[softmax]\ngroups={groups}\n",
+        );
+        run_pair(
+            &format!("softmax f16 groups={groups}"),
+            network(&cfg),
+            53 + groups as u64,
+            1.0,
+            3e-3,
+        );
+    }
+}
+
+#[test]
 fn region_f16_inference_matches_f32_with_and_without_class_softmax() {
     for softmax in [0, 1] {
         let cfg = format!(

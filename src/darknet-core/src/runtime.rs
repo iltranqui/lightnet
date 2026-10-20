@@ -8531,6 +8531,7 @@ where
                 | LayerKind::Region(_)
                 | LayerKind::ChannelShuffle(_)
                 | LayerKind::Reorg(_)
+                | LayerKind::Softmax { .. }
                 | LayerKind::Upsample(_)
                 | LayerKind::Yolo(_)
                 | LayerKind::ObbYolo(_)
@@ -8810,6 +8811,15 @@ where
                     )
                     .map_err(|err| backend_error("f16 sam", err))?
                 }
+                (LayerKind::Softmax { groups }, LayerParams::None) => self
+                    .backend
+                    .softmax_f16(
+                        current_input.expect("softmax requires current input"),
+                        &tensor_backend_shape(layer.output_shape),
+                        *groups,
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("f16 softmax", err))?,
                 (LayerKind::Region(spec), LayerParams::None) => self
                     .backend
                     .region_forward_f16(

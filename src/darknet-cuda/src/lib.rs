@@ -3209,6 +3209,20 @@ pub trait F16TensorOpsBackend: F32TensorOpsBackend {
         groups: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error>;
+    /// Softmax over `groups` equal contiguous groups per sample, stored as f16.
+    fn softmax_f16(
+        &self,
+        x: &Self::TensorF16,
+        shape: &[usize],
+        groups: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error> {
+        let _ = config;
+        let host = self.download_f16(x)?;
+        let per_batch = shape[1..].iter().product::<usize>();
+        assert!(groups > 0 && per_batch.is_multiple_of(groups));
+        self.upload_f16(shape, &host_ops::softmax(&host, per_batch / groups))
+    }
     /// Reorg permutation between spatially large and channel-expanded NCHW tensors.
     fn reorg_f16(
         &self,

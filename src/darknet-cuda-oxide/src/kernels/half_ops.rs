@@ -254,6 +254,44 @@ pub mod kernels {
         }
     }
 
+    /// Stable softmax over each contiguous group; one thread owns one group,
+    /// reductions use f32 and each final probability rounds once to half.
+    #[kernel]
+    pub fn softmax_forward_f16(
+        input: &[u16],
+        mut output: DisjointSlice<u16>,
+        group_size: usize,
+        n_groups: usize,
+    ) {
+        let group = thread::index_1d().get();
+        if group >= n_groups {
+            return;
+        }
+        let base = group * group_size;
+        let mut max_value = f32::NEG_INFINITY;
+        let mut i = 0usize;
+        while i < group_size {
+            let value = f16_bits_to_f32(input[base + i]);
+            if value > max_value { max_value = value; }
+            i += 1;
+        }
+        let mut sum = 0.0f32;
+        i = 0;
+        while i < group_size {
+            sum += (f16_bits_to_f32(input[base + i]) - max_value).exp();
+            i += 1;
+        }
+        i = 0;
+        while i < group_size {
+            let exponential = (f16_bits_to_f32(input[base + i]) - max_value).exp();
+            let probability = if sum > 0.0 { exponential / sum } else { exponential };
+            unsafe {
+                *output.as_mut_ptr().add(base + i) = f32_to_f16_bits(probability, 0);
+            }
+            i += 1;
+        }
+    }
+
     /// Big `[b,cb,hb,wb]` to small `[b,cb*s*s,hs,ws]` reorg.
     #[kernel]
     pub fn reorg_to_small_f16(
