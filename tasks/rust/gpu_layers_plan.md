@@ -4,6 +4,7 @@
 
 - [Priority and boundaries](#priority-and-boundaries)
 - [Resume point](#resume-point)
+- [Next slice: native f32 FoveationFilm runtime](#next-slice-native-f32-foveationfilm-runtime)
 - [Act-head contract finding](#act-head-contract-finding)
 - [Act-head native gradient math and CLS scatter](#act-head-native-gradient-math-and-cls-scatter)
 - [Next slice: deformable conv forward (wave 1, part 3)](#next-slice-deformable-conv-forward-wave-1-part-3)
@@ -78,6 +79,36 @@ bounded increments extended native DCNv4 through 31x31/961 points; >961,
 unsupported variants and mixed networks remain host-cached. Adam runtime parity above 23x23 without BN / 19x19 with BN is not claimed; SGD is covered through 31x31. Experimental Adam extensions failed reproducibly at non-BN 25x25 (update deltas -9.674579e-6 vs -9.121373e-6 at offset-weight element 4,032,808) and BN 21x21 (-1.6704202e-5 vs -1.3538636e-5 at element 4,501,490), each with two identical failures. BN21 gradient diagnostics showed 1.594983e-4 vs 1.596287e-4 at the failing element, near a coupled-decay cancellation. The same targeted BN21 case passes with `decoupled_decay=1`, confirming that coupled decay amplifies the small gradient difference; this does not resolve parity for the default coupled-decay semantics. Do not raise the Adam bounds or relax tolerances until that discrepancy is resolved. Compact/f16 and GPU Muon remain open; DCNv4 learned tensors now persist on-device across forwards/updates, but host mirrors still download each optimizer step and rolling stats remain host-managed. Adam moments cross the host boundary only for sidecar save/load. Native deform_conv was already wired in v0.2.007; do not repeat these ports.
 Recheck `version-map.tsv` before allocating another version. Earlier wave
 sections below retain historical findings; this resume point takes precedence.
+
+## Next slice: native f32 FoveationFilm runtime
+
+`layer-support.md` currently marks `[foveation_film]` GPU `none`; the Rust CPU
+reference already implements exact forward/backward, parameter gradients, and
+optional HF-source gradients. The C++ GPU wrappers in
+`Jev_laya:src-lib/foveation_film_layer.cpp:331-357` pull tensors to host and
+call the CPU implementation, so they are not a native GPU oracle and must not
+be presented as such.
+
+Bounded native slice:
+
+1. Add Oxide f32 forward math for per-sample HF embedding/ReLU, channel gamma
+   and beta projections, and NCHW affine application; reuse the existing
+   `FoveationFilmForwardCache` contract.
+2. Add native adjoints for input, all six FiLM parameter blocks, and optional
+   HF-parameter gradients. Hyperbolic-Foveation raw-parameter extraction may
+   remain host-managed until that source layer has a native path; make that
+   transfer explicit and keep learned FiLM math/backward on-device.
+3. Integrate only when the selected HF forward cache exists and layouts match;
+   otherwise preserve the established host path. Do not silently substitute
+   zeros or identity for a missing source.
+4. Add actual-Oxide batch-2 non-square runtime CPU-reference parity for output,
+   input/parameter gradients, optional HF gradient, and two optimizer updates
+   under SGD/Adam. Include device finite differences for the fused primitive
+   and explicit fallback-gate coverage. No compiled-C++ GPU-parity claim.
+
+This is an open plan, not evidence of a native path; update
+`layer-support.md` only after runtime dispatch and both forward/backward tests
+pass. Defer compact f16 until the f32 path is complete.
 
 ## Act-head contract finding
 
