@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.118: extended DCNv4 two-step runtime CPU-reference parity to BN Adam at 17x17. Focused runtime test passed (603.29 s), with non-BN Adam through 23x23 and SGD through 31x31. See `implemented.md` §153. No C++ golden/full-suite claim.
 - v0.2.117: extended DCNv4 two-step runtime CPU-reference parity to non-BN Adam at 23x23. The 593.08 s focused rerun passed after the known near-threshold Adam mismatch recurred at size 15 on the first attempt; tolerance unchanged, cause unresolved. SGD remains covered through 31x31, BN Adam through 15x15. See `implemented.md` §152. No C++ golden/full-suite claim.
 - v0.2.116: extended DCNv4 two-step runtime CPU-reference parity to non-BN Adam at 21x21. Focused runtime test passed (584.18 s); SGD remains covered through 31x31 and BN Adam through 15x15. See `implemented.md` §151. No C++ golden/full-suite claim.
 - v0.2.115: extended DCNv4 two-step runtime CPU-reference parity to non-BN Adam at 19x19. Focused runtime test passed (571.59 s); SGD remains covered through 31x31 and BN Adam through 15x15. See `implemented.md` §150. No C++ golden/full-suite claim.

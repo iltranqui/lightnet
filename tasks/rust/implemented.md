@@ -178,6 +178,7 @@ file is named inline.
 - [150. Extend DCNv4 Adam runtime parity through 19x19](#150-extend-dcnv4-adam-runtime-parity-through-19x19)
 - [151. Extend DCNv4 Adam runtime parity through 21x21](#151-extend-dcnv4-adam-runtime-parity-through-21x21)
 - [152. Extend DCNv4 Adam runtime parity through 23x23](#152-extend-dcnv4-adam-runtime-parity-through-23x23)
+- [153. Extend DCNv4 BN Adam runtime parity through 17x17](#153-extend-dcnv4-bn-adam-runtime-parity-through-17x17)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1955,6 +1956,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 152. Extend DCNv4 Adam runtime parity through 23x23
 
 - v0.2.117 (`7653d08f`): expanded `dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` to include non-BN 23x23 Adam runtime parity. The focused test passed on rerun (1 test; 593.08 s), including SGD through 31x31, non-BN Adam through 23x23, and BN Adam through 15x15. The initial attempt repeated the known near-threshold size=15 Adam offset-weight delta mismatch; rerun passed with unchanged tolerance. Cause remains unresolved. CPU-reference parity only; no compiled-C++ golden or full-suite claim.
+
+## 153. Extend DCNv4 BN Adam runtime parity through 17x17
+
+- v0.2.118 (`d95ed8d8`): extended `dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` to include 17x17 Adam with batch normalization. The focused test passed (1 test; 603.29 s), with non-BN Adam through 23x23 and SGD through 31x31. BN Adam beyond 17x17 remains unclaimed. CPU-reference parity only; no compiled-C++ golden or full-suite claim.
 
 ## Not implemented / open (pointer)
 
