@@ -195,6 +195,7 @@ file is named inline.
 - [167. FoveationFilm actual-Oxide train-only-BN gate](#167-foveationfilm-actual-oxide-train-only-bn-gate)
 - [168. FoveationFilm actual-Oxide train-buffer parity](#168-foveationfilm-actual-oxide-train-buffer-parity)
 - [169. Native HyperbolicFoveation bilinear warp](#169-native-hyperbolicfoveation-bilinear-warp)
+- [170. Native isotropic fixed-point HF grid](#170-native-isotropic-fixed-point-hf-grid)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2040,6 +2041,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 169. Native HyperbolicFoveation bilinear warp
 
 - v0.2.133 (`daef7b6a`): added a native Oxide NCHW bilinear-grid gather with zero-padded taps and wired GPU runtime HF forward to use it. HF predictor evaluation and inverse-grid generation remain host-managed; runtime still retains the host CPU forward/cache for HF backward and FiLM source gradients. The actual GPU HF and FiLM outputs match CPU over two-step SGD/Adam runtime tests. `MEM=3G ./tools/test_oxide.sh --test oxide_hyperbolic_foveation` passed 2 primitive/shape tests; focused runtime SGD and Adam tests passed, as did `MEM=3G ./tools/test_host.sh foveation_film` (12). No compiled-C++ or performance claim.
+
+## 170. Native isotropic fixed-point HF grid
+
+- v0.2.134 (`b67db3c0`): added native Oxide fixed-point inverse-grid generation for isotropic HF configs and selected it in GPU runtime forward; Newton and anisotropic configs still upload the host-generated grid. Actual Oxide parity covers a learned HF predictor feeding native grid+warp over two SGD steps. `MEM=3G ./tools/test_oxide.sh --test oxide_hyperbolic_foveation` passed 3 primitive/guard tests; focused runtime SGD passed; `MEM=3G ./tools/test_host.sh foveation_film` passed 12. Native predictor MLP, Newton/anisotropic grid, backward, and direct input-gradient paths remain open. No compiled-C++ or performance claim.
 
 ## Not implemented / open (pointer)
 
