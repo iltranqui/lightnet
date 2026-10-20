@@ -206,6 +206,7 @@ file is named inline.
 - [178. Native HF predictor backward](#178-native-hf-predictor-backward)
 - [179. HF predictor adjoint finite differences](#179-hf-predictor-adjoint-finite-differences)
 - [180. Native HF fixed-point parameter adjoint](#180-native-hf-fixed-point-parameter-adjoint)
+- [181. Native HF Newton parameter adjoint](#181-native-hf-newton-parameter-adjoint)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2095,6 +2096,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 180. Native HF fixed-point parameter adjoint
 
 - v0.2.144 (`64fd3da7`): added an Oxide forward-dual fixed-point inverse-iteration parameter Jacobian for isotropic and anisotropic radii. Runtime consumes it when the native backend implements the optional operation; unsupported backends and Newton mode retain the host reference. Actual-Oxide finite differences cover each packed parameter across two batches for both radius modes; learned-anisotropic fixed-point runtime SGD parity also passes, along with the existing Newton Adam fallback parity. `MEM=3G ./tools/test_host.sh hyperbolic_foveation` passed 30 tests; `MEM=3G ./tools/test_oxide.sh --test oxide_hyperbolic_foveation` passed 8; both focused runtime tests passed. Newton parameter Jacobian remains host-managed; no compiled-C++ or performance claim.
+
+## 181. Native HF Newton parameter adjoint
+
+- v0.2.145 (`9b915184`): extended the Oxide dual-number inverse parameter adjoint through the configured Newton update, including derivatives of the analytic spatial Jacobian and the singular-determinant fixed-point fallback. Runtime now dispatches native parameter adjoints for both fixed-point and Newton methods; unsupported backends retain the host reference. Actual-Oxide finite differences cover every packed parameter for isotropic and anisotropic modes across two batches. Both learned-anisotropic fixed-point SGD and Newton Adam runtime parity tests pass; all 30 focused host HF tests and 8 Oxide HF primitive tests pass. No compiled-C++ or performance claim.
 
 ## Not implemented / open (pointer)
 
