@@ -5044,6 +5044,105 @@ fn connected_bn_muon_matches_cpu(activation: &str) {
 }
 
 #[test]
+fn gpu_connected_bn_backward_matches_cpu_sgd_and_adam() {
+    for adam in [false, true] {
+        let cfg = format!(
+            "[net]\nwidth=2\nheight=1\nchannels=1\nbatch=2\nadam={}\ndecay=0\nloss_scale=1\n\
+             [connected]\noutput=3\nbatch_normalize=1\nactivation=leaky\n",
+            usize::from(adam)
+        );
+        let net = network(&cfg);
+        let mut cpu = ExecutableNetwork::new(net.clone());
+        let LayerParams::Connected(params) = &mut cpu.params[0] else {
+            panic!("connected parameters expected");
+        };
+        params.weights.copy_from_slice(&[0.2, -0.1, 0.3, 0.4, -0.25, 0.15]);
+        params.biases.copy_from_slice(&[0.03, -0.02, 0.01]);
+        let bn = params.batch_norm.as_mut().expect("connected BN parameters");
+        bn.scales.copy_from_slice(&[0.7, 1.1, 0.85]);
+        bn.biases.copy_from_slice(&[-0.04, 0.02, 0.06]);
+        bn.rolling_mean.copy_from_slice(&[0.1, -0.05, 0.08]);
+        bn.rolling_variance.copy_from_slice(&[0.8, 1.2, 0.65]);
+        let mut gpu = GpuExecutableNetwork::new(
+            net.clone(),
+            OxideBackend::new().expect("Oxide"),
+        );
+        gpu.params = cpu.params.clone();
+
+        for step in 1..=2 {
+            let input = patterned(cpu.network.net.input_shape());
+            let cpu_forward = cpu.forward_training(&input).expect("CPU connected BN forward");
+            let gpu_forward = gpu
+                .forward_training_device(&input)
+                .expect("Oxide connected BN forward");
+            let gpu_output = gpu
+                .backend
+                .download_f32(&gpu_forward.gpu_layer_outputs[0])
+                .expect("download connected BN output");
+            close(
+                &format!("connected BN optimizer forward adam={adam} step={step}"),
+                &gpu_output,
+                &cpu_forward.layer_outputs[0].data,
+                3e-5,
+            );
+            let seed =
+                Tensor::filled(cpu.network.layers[0].output_shape, 0.05 * step as f32);
+            let seeds = [Some(seed)];
+            cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+                .expect("CPU connected BN backward");
+            gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+                .expect("GPU connected BN backward");
+            if adam {
+                cpu.update_weights_adam(0.003, 2)
+                    .expect("CPU connected BN Adam update");
+            } else {
+                cpu.update_weights(0.005, 0.3, 0.0, 2);
+            }
+            gpu.update_weights_gpu(if adam { 0.003 } else { 0.005 }, 0.3, 0.0, 2)
+            .expect("GPU connected BN optimizer update");
+            let (LayerParams::Connected(cpu_params), LayerParams::Connected(gpu_params)) =
+                (&cpu.params[0], &gpu.params[0])
+            else {
+                unreachable!();
+            };
+            let label = format!("connected BN adam={adam} step={step}");
+            close(
+                &format!("{label} weights"),
+                &gpu_params.weights,
+                &cpu_params.weights,
+                8e-4,
+            );
+            close(
+                &format!("{label} biases"),
+                &gpu_params.biases,
+                &cpu_params.biases,
+                8e-4,
+            );
+            let cpu_bn = cpu_params.batch_norm.as_ref().expect("CPU BN state");
+            let gpu_bn = gpu_params.batch_norm.as_ref().expect("GPU BN state");
+            close(
+                &format!("{label} scales"),
+                &gpu_bn.scales,
+                &cpu_bn.scales,
+                8e-4,
+            );
+            close(
+                &format!("{label} rolling mean"),
+                &gpu_bn.rolling_mean,
+                &cpu_bn.rolling_mean,
+                1e-6,
+            );
+            close(
+                &format!("{label} rolling variance"),
+                &gpu_bn.rolling_variance,
+                &cpu_bn.rolling_variance,
+                1e-6,
+            );
+        }
+    }
+}
+
+#[test]
 fn gpu_muon_multiple_connected_layers_match_cpu_across_steps() {
     let net = network(
         "[net]\nwidth=2\nheight=1\nchannels=1\nbatch=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0005\nloss_scale=8\n\
