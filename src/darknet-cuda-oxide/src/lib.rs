@@ -8180,6 +8180,67 @@ impl F32TensorOpsBackend for OxideBackend {
         Ok(OxideTensorF32::new(out, shape))
     }
 
+    fn foveation_film_forward_f32(
+        &self,
+        input: &Self::Tensor,
+        hf_params: &Self::Tensor,
+        w_embed: &Self::Tensor,
+        b_embed: &Self::Tensor,
+        w_gamma: &Self::Tensor,
+        b_gamma: &Self::Tensor,
+        w_beta: &Self::Tensor,
+        b_beta: &Self::Tensor,
+        shape: &[usize],
+        param_count: usize,
+        embed_dim: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        if shape.len() != 4 || shape.iter().any(|&dim| dim == 0) {
+            return Err(OxideError::Shape(format!(
+                "foveation_film_forward_f32: expected non-empty NCHW shape, got {shape:?}"
+            )));
+        }
+        let (batch, channels) = (shape[0], shape[1]);
+        if param_count == 0 || embed_dim == 0 {
+            return Err(OxideError::Shape(
+                "foveation_film_forward_f32: param_count and embed_dim must be positive".to_owned(),
+            ));
+        }
+        let embedding_pre = self.linear_f32(
+            hf_params,
+            w_embed,
+            Some(b_embed),
+            &[batch, embed_dim],
+            batch,
+            param_count,
+            embed_dim,
+            config,
+        )?;
+        let embedding = self.activation_f32(&embedding_pre, F32ActivationKind::Relu, config)?;
+        let gamma = self.linear_f32(
+            &embedding,
+            w_gamma,
+            Some(b_gamma),
+            &[batch, channels],
+            batch,
+            embed_dim,
+            channels,
+            config,
+        )?;
+        let beta = self.linear_f32(
+            &embedding,
+            w_beta,
+            Some(b_beta),
+            &[batch, channels],
+            batch,
+            embed_dim,
+            channels,
+            config,
+        )?;
+        let output = self.foveation_film_affine_f32(input, &gamma, &beta, shape, config)?;
+        Ok((output, embedding, gamma, beta))
+    }
+
     fn foveation_film_affine_f32(
         &self,
         input: &Self::Tensor,

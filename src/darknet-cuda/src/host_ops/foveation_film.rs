@@ -1,5 +1,61 @@
 //! Host references for per-sample FiLM affine application and its adjoint.
 
+/// Full FiLM projection reference. Weight layouts are `[embed_dim, param_count]`
+/// and `[channels, embed_dim]`; `input` is NCHW and `hf_params` is `[B,P]`.
+pub fn forward(
+    input: &[f32],
+    hf_params: &[f32],
+    batch: usize,
+    channels: usize,
+    height: usize,
+    width: usize,
+    param_count: usize,
+    embed_dim: usize,
+    w_embed: &[f32],
+    b_embed: &[f32],
+    w_gamma: &[f32],
+    b_gamma: &[f32],
+    w_beta: &[f32],
+    b_beta: &[f32],
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    assert!(batch > 0 && channels > 0 && height > 0 && width > 0);
+    assert!(param_count > 0 && embed_dim > 0);
+    assert_eq!(input.len(), batch * channels * height * width);
+    assert_eq!(hf_params.len(), batch * param_count);
+    assert_eq!(w_embed.len(), embed_dim * param_count);
+    assert_eq!(b_embed.len(), embed_dim);
+    assert_eq!(w_gamma.len(), channels * embed_dim);
+    assert_eq!(b_gamma.len(), channels);
+    assert_eq!(w_beta.len(), channels * embed_dim);
+    assert_eq!(b_beta.len(), channels);
+
+    let mut embedding = vec![0.0; batch * embed_dim];
+    let mut gamma = vec![0.0; batch * channels];
+    let mut beta = vec![0.0; batch * channels];
+    for b in 0..batch {
+        for j in 0..embed_dim {
+            let mut value = b_embed[j];
+            for i in 0..param_count {
+                value += w_embed[j * param_count + i] * hf_params[b * param_count + i];
+            }
+            embedding[b * embed_dim + j] = value.max(0.0);
+        }
+        for c in 0..channels {
+            let mut g = b_gamma[c];
+            let mut be = b_beta[c];
+            for j in 0..embed_dim {
+                let embedded = embedding[b * embed_dim + j];
+                g += w_gamma[c * embed_dim + j] * embedded;
+                be += w_beta[c * embed_dim + j] * embedded;
+            }
+            gamma[b * channels + c] = g;
+            beta[b * channels + c] = be;
+        }
+    }
+    let output = affine(input, &gamma, &beta, &[batch, channels, height, width]);
+    (output, embedding, gamma, beta)
+}
+
 /// Apply channel-wise FiLM parameters laid out as `[batch, channels]` to an
 /// NCHW tensor: `y[b,c,s] = x[b,c,s] * (1 + gamma[b,c]) + beta[b,c]`.
 pub fn affine(input: &[f32], gamma: &[f32], beta: &[f32], shape: &[usize]) -> Vec<f32> {

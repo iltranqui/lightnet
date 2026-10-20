@@ -20,6 +20,95 @@ fn objective(input: &[f32], gamma: &[f32], beta: &[f32], shape: &[usize], seed: 
 }
 
 #[test]
+fn foveation_film_forward_projection_composes_native_linear_and_affine() {
+    let backend = OxideBackend::new().expect("Oxide backend");
+    let shape = [2, 3, 2, 2];
+    let batch = shape[0];
+    let channels = shape[1];
+    let param_count = 2;
+    let embed_dim = 3;
+    let input: Vec<f32> = (0..shape.iter().product::<usize>())
+        .map(|i| (i as f32 * 0.23).sin())
+        .collect();
+    let hf = vec![0.7, -0.2, -0.4, 0.9];
+    let w_embed = vec![0.4, -0.1, -0.2, 0.3, 0.15, 0.7];
+    let b_embed = vec![0.1, -0.05, 0.2];
+    let w_gamma = vec![0.2, -0.1, 0.4, -0.3, 0.25, 0.1, 0.05, 0.2, -0.15];
+    let b_gamma = vec![0.01, -0.03, 0.04];
+    let w_beta = vec![-0.1, 0.3, 0.2, 0.15, -0.2, 0.35, 0.4, 0.05, -0.25];
+    let b_beta = vec![-0.02, 0.06, 0.03];
+    let x = backend.upload_f32(&shape, &input).unwrap();
+    let hf = backend.upload_f32(&[batch, param_count], &hf).unwrap();
+    let w_embed_t = backend
+        .upload_f32(&[embed_dim, param_count], &w_embed)
+        .unwrap();
+    let b_embed_t = backend.upload_f32(&[embed_dim], &b_embed).unwrap();
+    let w_gamma_t = backend
+        .upload_f32(&[channels, embed_dim], &w_gamma)
+        .unwrap();
+    let b_gamma_t = backend.upload_f32(&[channels], &b_gamma).unwrap();
+    let w_beta_t = backend.upload_f32(&[channels, embed_dim], &w_beta).unwrap();
+    let b_beta_t = backend.upload_f32(&[channels], &b_beta).unwrap();
+
+    let (output, embedding, gamma, beta) = backend
+        .foveation_film_forward_f32(
+            &x,
+            &hf,
+            &w_embed_t,
+            &b_embed_t,
+            &w_gamma_t,
+            &b_gamma_t,
+            &w_beta_t,
+            &b_beta_t,
+            &shape,
+            param_count,
+            embed_dim,
+            ElementwiseLaunchConfig::default(),
+        )
+        .unwrap();
+    let (expected, expected_embedding, expected_gamma, expected_beta) = foveation_film::forward(
+        &input,
+        &[0.7, -0.2, -0.4, 0.9],
+        batch,
+        channels,
+        shape[2],
+        shape[3],
+        param_count,
+        embed_dim,
+        &w_embed,
+        &b_embed,
+        &w_gamma,
+        &b_gamma,
+        &w_beta,
+        &b_beta,
+    );
+    close(
+        &backend.download_f32(&output).unwrap(),
+        &expected,
+        2e-6,
+        "output",
+    );
+    close(
+        &backend.download_f32(&embedding).unwrap(),
+        &expected_embedding,
+        1e-6,
+        "embedding",
+    );
+    close(
+        &backend.download_f32(&gamma).unwrap(),
+        &expected_gamma,
+        2e-6,
+        "gamma",
+    );
+    close(
+        &backend.download_f32(&beta).unwrap(),
+        &expected_beta,
+        2e-6,
+        "beta",
+    );
+}
+
+#[test]
 fn foveation_film_affine_forward_backward_and_finite_difference() {
     let backend = OxideBackend::new().expect("Oxide backend");
     let shape = [2, 3, 2, 3];

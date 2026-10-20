@@ -2706,6 +2706,47 @@ pub trait F32TensorOpsBackend {
         let beta = self.download_f32(beta)?;
         self.upload_f32(shape, &host_ops::foveation_film::affine(&x, &gamma, &beta, shape))
     }
+    /// Full FiLM projection, returning `(output, embedding, gamma, beta)`.
+    /// HF inputs are `[B,P]`, and the output is NCHW; all projection weights
+    /// use row-major `[out, in]` layout.
+    #[allow(clippy::too_many_arguments)]
+    fn foveation_film_forward_f32(
+        &self,
+        input: &Self::Tensor,
+        hf_params: &Self::Tensor,
+        w_embed: &Self::Tensor,
+        b_embed: &Self::Tensor,
+        w_gamma: &Self::Tensor,
+        b_gamma: &Self::Tensor,
+        w_beta: &Self::Tensor,
+        b_beta: &Self::Tensor,
+        shape: &[usize],
+        param_count: usize,
+        embed_dim: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        assert!(shape.len() == 4, "foveation_film_forward_f32: shape must be NCHW");
+        let (batch, channels, height, width) = (shape[0], shape[1], shape[2], shape[3]);
+        let x = self.download_f32(input)?;
+        let hf = self.download_f32(hf_params)?;
+        let we = self.download_f32(w_embed)?;
+        let be = self.download_f32(b_embed)?;
+        let wg = self.download_f32(w_gamma)?;
+        let bg = self.download_f32(b_gamma)?;
+        let wb = self.download_f32(w_beta)?;
+        let bb = self.download_f32(b_beta)?;
+        let (output, embedding, gamma, beta) = host_ops::foveation_film::forward(
+            &x, &hf, batch, channels, height, width, param_count, embed_dim,
+            &we, &be, &wg, &bg, &wb, &bb,
+        );
+        Ok((
+            self.upload_f32(shape, &output)?,
+            self.upload_f32(&[batch, embed_dim], &embedding)?,
+            self.upload_f32(&[batch, channels], &gamma)?,
+            self.upload_f32(&[batch, channels], &beta)?,
+        ))
+    }
     /// Exact adjoint of [`Self::foveation_film_affine_f32`], returning
     /// `(d_input, d_gamma, d_beta)` with the latter two `[batch, channels]`.
     fn foveation_film_affine_backward_f32(
