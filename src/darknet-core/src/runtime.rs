@@ -13012,9 +13012,8 @@ where
                         &host_input,
                         &layer_outputs,
                     )?;
-                    let native_fixed_point = spec.inverse_method == crate::model::HfInverseMethod::FixedPoint
-                        && spec.radius_mode == crate::model::HfRadiusMode::Isotropic;
-                    if native_fixed_point && spec.pred_hidden > 0 {
+                    let native_isotropic = spec.radius_mode == crate::model::HfRadiusMode::Isotropic;
+                    if native_isotropic && spec.pred_hidden > 0 {
                         let predictor_source = if let Some(source_layer) = spec.pred_source_layer {
                             gpu_layer_outputs.get(source_layer).ok_or_else(|| {
                                 Error::InvalidConfig(format!(
@@ -13052,26 +13051,41 @@ where
                             predictor_cache.constrained_params = predicted;
                         }
                     }
-                    let grid = if native_fixed_point {
+                    let grid = if native_isotropic {
                         let params_per_batch = self.backend
                             .upload_f32(
                                 &[layer.output_shape.batch, 4],
                                 &cache.params_per_batch,
                             )
-                            .map_err(|err| backend_error("upload HF fixed-point parameters", err))?;
-                        self.backend
-                            .hyperbolic_fixed_point_grid_f32(
-                                &params_per_batch,
-                                layer.output_shape.batch,
-                                layer.output_shape.height,
-                                layer.output_shape.width,
-                                spec.alpha,
-                                spec.p_exp,
-                                spec.nr_iters,
-                                spec.nr_eta,
-                                launch_config,
-                            )
-                            .map_err(|err| backend_error("native HF fixed-point grid", err))?
+                            .map_err(|err| backend_error("upload HF isotropic parameters", err))?;
+                        match spec.inverse_method {
+                            crate::model::HfInverseMethod::FixedPoint => self.backend
+                                .hyperbolic_fixed_point_grid_f32(
+                                    &params_per_batch,
+                                    layer.output_shape.batch,
+                                    layer.output_shape.height,
+                                    layer.output_shape.width,
+                                    spec.alpha,
+                                    spec.p_exp,
+                                    spec.nr_iters,
+                                    spec.nr_eta,
+                                    launch_config,
+                                )
+                                .map_err(|err| backend_error("native HF fixed-point grid", err))?,
+                            crate::model::HfInverseMethod::Newton => self.backend
+                                .hyperbolic_newton_grid_f32(
+                                    &params_per_batch,
+                                    layer.output_shape.batch,
+                                    layer.output_shape.height,
+                                    layer.output_shape.width,
+                                    spec.alpha,
+                                    spec.p_exp,
+                                    spec.nr_iters,
+                                    spec.nr_eta,
+                                    launch_config,
+                                )
+                                .map_err(|err| backend_error("native HF Newton grid", err))?,
+                        }
                     } else {
                         self.backend
                             .upload_f32(
@@ -13085,7 +13099,7 @@ where
                             )
                             .map_err(|err| backend_error("upload hyperbolic_foveation grid", err))?
                     };
-                    if native_fixed_point {
+                    if native_isotropic {
                         cache.grid = self.backend.download_f32(&grid)
                             .map_err(|err| backend_error("download native HF grid for backward cache", err))?;
                     }

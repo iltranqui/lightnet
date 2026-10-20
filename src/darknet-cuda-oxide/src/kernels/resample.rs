@@ -367,6 +367,104 @@ pub mod kernels {
         }
     }
 
+    /// Build the inverse sampling grid for isotropic Newton HF mode.
+    #[kernel]
+    pub fn hyperbolic_newton_grid(
+        params: &[f32],
+        mut grid: DisjointSlice<f32>,
+        height: usize,
+        width: usize,
+        alpha: f32,
+        p_exp: f32,
+        iterations: usize,
+        eta: f32,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if i >= grid.len() {
+            return;
+        }
+        let spatial = height * width;
+        let pixel = i / 2;
+        let batch = pixel / spatial;
+        let p = pixel % spatial;
+        let ox = p % width;
+        let oy = p / width;
+        let qx = if width > 1 { 2.0 * ox as f32 / (width - 1) as f32 - 1.0 } else { 0.0 };
+        let qy = if height > 1 { 2.0 * oy as f32 / (height - 1) as f32 - 1.0 } else { 0.0 };
+        let cx = params[batch * 4].max(-0.9).min(0.9);
+        let cy = params[batch * 4 + 1].max(-0.9).min(0.9);
+        let radius = params[batch * 4 + 2].max(0.1).min(2.0).max(1.0e-4);
+        let strength = params[batch * 4 + 3].max(0.0).min(1.0);
+        let alpha = alpha.max(1.0e-4);
+        let p_exp = p_exp.max(1.0e-4);
+        let mut px = qx.max(-1.0).min(1.0);
+        let mut py = qy.max(-1.0).min(1.0);
+        let mut iteration = 0usize;
+        while iteration < iterations {
+            let dx = px - cx;
+            let dy = py - cy;
+            let r = (dx * dx + dy * dy).sqrt();
+            let (u, du_dr) = if r > 1.0e-6 {
+                let ar = alpha * r;
+                let tanh = ar.tanh();
+                let sech2 = 1.0 - tanh * tanh;
+                (tanh / r, (alpha * sech2 * r - tanh) / (r * r))
+            } else {
+                (alpha, 0.0)
+            };
+            let inside = r < radius;
+            let (weight, dw_dr) = if inside {
+                let base = (1.0 - r / radius).max(0.0);
+                let weight = base.powf(p_exp);
+                let dw = if r > 1.0e-6 {
+                    -(p_exp / radius) * base.powf((p_exp - 1.0).max(0.0))
+                } else {
+                    0.0
+                };
+                (weight, dw)
+            } else {
+                (0.0, 0.0)
+            };
+            let gain = 1.0 + strength * weight * (u - 1.0);
+            let dg_dr = strength * (dw_dr * (u - 1.0) + weight * du_dr);
+            let mut j00 = gain;
+            let mut j01 = 0.0;
+            let mut j10 = 0.0;
+            let mut j11 = gain;
+            if r > 1.0e-6 {
+                let d_gain_over_r = dg_dr / r;
+                j00 += d_gain_over_r * dx * dx;
+                j01 += d_gain_over_r * dx * dy;
+                j10 += d_gain_over_r * dy * dx;
+                j11 += d_gain_over_r * dy * dy;
+            }
+            let mapped_x = cx + gain * dx;
+            let mapped_y = cy + gain * dy;
+            let residual_x = qx - mapped_x;
+            let residual_y = qy - mapped_y;
+            let determinant = j00 * j11 - j01 * j10;
+            if determinant.abs() < 1.0e-8 {
+                px = (px + eta * residual_x).max(-1.0).min(1.0);
+                py = (py + eta * residual_y).max(-1.0).min(1.0);
+            } else {
+                let step_x = (j11 * residual_x - j01 * residual_y) / determinant;
+                let step_y = (-j10 * residual_x + j00 * residual_y) / determinant;
+                px = (px + eta * step_x).max(-1.0).min(1.0);
+                py = (py + eta * step_y).max(-1.0).min(1.0);
+            }
+            iteration += 1;
+        }
+        let value = if i & 1 == 0 {
+            (px + 1.0) * 0.5 * width.saturating_sub(1) as f32
+        } else {
+            (py + 1.0) * 0.5 * height.saturating_sub(1) as f32
+        };
+        if let Some(output) = grid.get_mut(index) {
+            *output = value;
+        }
+    }
+
     /// Build the inverse sampling grid for isotropic fixed-point HF mode.
     /// One thread owns one scalar coordinate; x/y are recomputed deterministically.
     #[kernel]
