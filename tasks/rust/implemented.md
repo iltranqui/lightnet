@@ -209,6 +209,7 @@ file is named inline.
 - [181. Native HF Newton parameter adjoint](#181-native-hf-newton-parameter-adjoint)
 - [182. GPU Muon for HF/FiLM matrices](#182-gpu-muon-for-hffilm-matrices)
 - [183. HF/FiLM GPU Muon update gate](#183-hffilm-gpu-muon-update-gate)
+- [184. HF/FiLM GPU Muon sidecar resume](#184-hffilm-gpu-muon-sidecar-resume)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2110,6 +2111,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 183. HF/FiLM GPU Muon update gate
 
 - v0.2.147 (`ff29e118`): added actual-Oxide two-step learned-anisotropic HF/FiLM Muon parity with FiLM `dont_update=1`; the first gated step preserves FiLM parameters, then the next update applies. CPU/GPU parameter equality is checked at both steps. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_gpu_muon_dont_update_gate_matches_cpu` passed. This adds gate evidence, not a new native kernel or C++ golden.
+
+## 184. HF/FiLM GPU Muon sidecar resume
+
+- v0.2.148 (`3db27bd9`): actual-Oxide sidecar round-trip test saves after one learned-anisotropic HF/FiLM Muon update, restores into fresh CPU/GPU networks, and checks the resumed GPU update against an uninterrupted CPU continuation. It compares HF global/predictor matrices and biases plus every FiLM projection matrix/bias, so both Muon momentum and AdamW fallback state must survive. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_gpu_muon_state_round_trip_matches_cpu` passed. No compiled-C++ or performance claim.
 
 ## Not implemented / open (pointer)
 

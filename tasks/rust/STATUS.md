@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.148: HF/FiLM GPU Muon sidecar resume now matches uninterrupted CPU continuation across predictor and FiLM matrix/bias blocks. See `implemented.md` §184.
 - v0.2.147: added actual-Oxide HF/FiLM Muon `dont_update` gate parity; the gated step preserves Film parameters and the following step resumes updates. See `implemented.md` §183.
 - v0.2.146: GPU Muon now supports eligible HF predictor and FiLM matrices through native Oxide orthogonalization; two-step learned-anisotropic runtime parity passes. See `implemented.md` §182.
 - v0.2.145: native HF inverse parameter adjoints now cover fixed-point and Newton iterations; isotropic/anisotropic finite differences and actual-Oxide runtime SGD/Adam parity pass. See `implemented.md` §181.

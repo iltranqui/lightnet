@@ -105,8 +105,8 @@ Bounded native slice:
    at v0.2.127 GPU Muon was explicitly rejected. v0.2.146 enables native Oxide
    orthogonalization for eligible HF predictor and FiLM matrices with host-
    managed state/final updates. Two-step actual-Oxide SGD/Adam/Muon runtime
-   output/parameter parity and the `dont_update` gate pass; host exact
-   buffer/update parity tests remain in place.
+   output/parameter parity, the `dont_update` gate, and Muon sidecar-resume
+   parity pass; host exact buffer/update parity tests remain in place.
 5. [x] Add actual-Oxide rejection tests for compact f32, compact f16, and GPU
    Muon.
 6. [x] Inspect all HF/FiLM host-fallback parameter-gradient buffers against
