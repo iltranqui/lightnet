@@ -89,7 +89,7 @@ default-members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "GPL-3.0-or-later"  # darknet crates; vendored cuda-oxide crates set Apache-2.0 explicitly
+license = "Apache-2.0"  # darknet crates and vendored cuda-oxide crates
 
 # Note: bridges/rustc-codegen-cuda is NOT a workspace member because it requires
 # special rustc nightly features and a different build process.
