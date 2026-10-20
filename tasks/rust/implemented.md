@@ -191,6 +191,7 @@ file is named inline.
 - [163. FoveationFilm/HF SGD and Adam runtime updates](#163-foveationfilmhf-sgd-and-adam-runtime-updates)
 - [164. FoveationFilm/HF two-step GPU runtime parity](#164-foveationfilmhf-two-step-gpu-runtime-parity)
 - [165. FoveationFilm actual-Oxide SGD gate](#165-foveationfilm-actual-oxide-sgd-gate)
+- [166. FoveationFilm actual-Oxide Adam burn-in gate](#166-foveationfilm-actual-oxide-adam-burn-in-gate)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2020,6 +2021,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 165. FoveationFilm actual-Oxide SGD gate
 
 - v0.2.129 (`a704ede6`): an actual-Oxide runtime test exercises `dont_update` at iteration 0 and verifies that the same layer updates at iteration 1. CPU/GPU parameters match at both iterations; the test passed. Adam/burn-in/train-only-BN actual-runtime gate coverage and direct gradient-buffer inspection remain open. No compiled-C++ golden.
+
+## 166. FoveationFilm actual-Oxide Adam burn-in gate
+
+- v0.2.130 (`2b2154f5`): actual-Oxide Adam runtime coverage exercises `burnin_update=1` with `burn_in=2`; iteration 0 leaves FiLM parameters unchanged, iteration 1 updates them, and CPU/GPU parameter parity holds at both iterations. The focused test passed. `train_only_bn` actual-runtime coverage and direct gradient-buffer inspection remain open. HF has independent train gates, so the assertion is limited to FiLM parameters. No compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 

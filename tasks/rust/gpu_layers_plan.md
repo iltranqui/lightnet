@@ -107,9 +107,10 @@ Bounded native slice:
 5. [x] Add actual-Oxide rejection tests for compact f32, compact f16, and GPU
    Muon.
 6. [ ] Directly inspect actual runtime input gradients and HF/FiLM train
-   buffers; add actual-Oxide Adam/burn-in/train-only-BN gate coverage; retain
-   explicit host HF warp/predictor boundaries. SGD `dont_update` is covered in
-   v0.2.129. No compiled-C++ GPU-parity claim.
+   buffers; add actual-Oxide `train_only_bn` gate coverage; retain explicit
+   host HF warp/predictor boundaries. SGD `dont_update` and Adam
+   `burnin_update` are covered in v0.2.129–130. No compiled-C++ GPU-parity
+   claim.
 
 v0.2.120 implements native per-sample NCHW affine and exact input/gamma/beta
 adjoints; v0.2.121 composes native HF embedding/ReLU and gamma/beta projections
@@ -122,8 +123,8 @@ v0.2.125 dispatches native runtime FiLM backward and applies the host HF
 warp/predictor adjoint. v0.2.126 adds host SGD/Adam updates for these parameters; v0.2.127 adds
 actual-Oxide two-step output/parameter parity for both optimizers; v0.2.128
 adds actual-Oxide compact f32/f16 and Muon rejection tests; v0.2.129 covers
-SGD `dont_update` at actual runtime. Direct gradient-buffer inspection and the
-remaining Adam/SGD gate cases stay open.
+SGD `dont_update` and Adam `burnin_update` at actual runtime. Direct
+gradient-buffer inspection and the `train_only_bn` gate stay open.
 
 This remains an open plan, not evidence of a complete native layer. Update
 `layer-support.md` to reflect the current hybrid host/device path, but do not
