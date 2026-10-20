@@ -146,6 +146,7 @@ file is named inline.
 - [118. Native f32 Region GPU execution](#118-native-f32-region-gpu-execution)
 - [119. Native f16 Region inference](#119-native-f16-region-inference)
 - [120. Native f16 softmax inference](#120-native-f16-softmax-inference)
+- [121. Native f16 channel-slice inference](#121-native-f16-channel-slice-inference)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1795,6 +1796,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 120. Native f16 softmax inference
 
 - v0.2.093: added native Oxide compact f16 softmax, with per-sample equal contiguous groups, f32 max/exp/sum/normalization and one half rounding per result. Actual-Oxide group-count 1 and 2 outputs matched compact f32 (relative max errors 4.106e-4 and 5.549e-4); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed 12 tests. Inference only; no f16 backward/training or compiled-C++ golden.
+
+## 121. Native f16 channel-slice inference
+
+- v0.2.094: compact f16 dispatch now handles `[channel_slice]` by selecting a source tensor and reusing the native half-storage route-concat copy. Actual-Oxide batch-2 output matched f32 compact with relative max error 2.353e-4; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed 13 tests. Inference only; no compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 

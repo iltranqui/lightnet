@@ -229,6 +229,7 @@ reference tolerance is `TOL_COMPOSED = 1e-4` rather than the single-stage `2e-6`
 
 ## P8/P9 training follow-ups
 
+- [x] v0.2.094: compact f16 inference now supports native `[channel_slice]` using source-lifetime tracking and the Oxide half route-concat primitive. Batch-2 actual-Oxide output matched f32 compact (relative max error 2.353e-4); the full f16 suite passed 13 tests. Inference only; no compiled-C++ golden. See `implemented.md` §121.
 - [x] v0.2.093: compact f16 inference now has native Softmax using stable f32 per-group reductions and half output stores. Actual-Oxide group-count 1/2 relative max errors vs f32 were 4.106e-4/5.549e-4; the full f16 suite passed 12 tests. Inference only; no f16 backward/training or compiled-C++ golden. See `implemented.md` §120.
 - [x] v0.2.092: compact f16 Region inference now uses a native half-storage layout/activation kernel, with f32 sigmoid/softmax calculations and half stores. Both softmax off/on actual-Oxide cases matched compact f32 (relative max errors 2.324e-4/2.856e-4); the full f16 suite passed 11. No f16 backward/training, truth-loss/decode, or compiled-C++ golden claim. See `implemented.md` §119.
 - [x] v0.2.091: native Oxide f32 Region full/compact forward and exact Rust adjoint now support the layout transpose, objectness sigmoid, and optional class softmax. Actual-Oxide CPU-reference parity passed for batch-2 non-square cases with softmax off/on; `MEM=3G ./tools/test_host.sh region` passed 2 tests. Truth-driven Region loss/decode remain open; no compiled-C++ golden. See `implemented.md` §118.
