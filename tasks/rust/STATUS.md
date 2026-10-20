@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.129: actual-Oxide HF/FiLM SGD `dont_update` gate parity passes for iteration 0 skip and iteration 1 update. Adam/burn-in/train-only-BN runtime gates and direct gradient-buffer inspection remain open. See `implemented.md` §165.
 - v0.2.128: actual-Oxide rejects HF/FiLM compact f32, compact f16, and GPU Muon as intended; focused gate test passes. Direct runtime input-gradient/train-buffer inspection and SGD/Adam gate coverage remain open. See `implemented.md` §164.
 - v0.2.127: extended actual-Oxide HF/FiLM SGD and Adam runtime parity to two complete forward/backward/update cycles; both focused tests pass. See `implemented.md` §164.
 - v0.2.126: added host-fallback SGD/Adam optimizer updates for GPU-runtime HF/FiLM training; actual Oxide one-step SGD/Adam CPU parity passes, as do 12 focused host tests and the Muon rejection gate. Two-step runtime parity remains open. See `implemented.md` §163.

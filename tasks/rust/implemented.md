@@ -190,6 +190,7 @@ file is named inline.
 - [162. FoveationFilm native runtime backward](#162-foveationfilm-native-runtime-backward)
 - [163. FoveationFilm/HF SGD and Adam runtime updates](#163-foveationfilmhf-sgd-and-adam-runtime-updates)
 - [164. FoveationFilm/HF two-step GPU runtime parity](#164-foveationfilmhf-two-step-gpu-runtime-parity)
+- [165. FoveationFilm actual-Oxide SGD gate](#165-foveationfilm-actual-oxide-sgd-gate)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2015,6 +2016,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 164. FoveationFilm/HF two-step GPU runtime parity
 
 - v0.2.127 (`2792f881`): extended actual-Oxide runtime SGD and Adam tests to two complete forward/backward/update cycles each. Outputs are compared after each forward; HF/FiLM and upstream convolution parameter blocks are compared after updates. Both focused runtime tests passed. v0.2.128 (`01b761b5`) adds actual-Oxide rejection tests for compact f32, compact f16, and GPU Muon. Direct actual-runtime input-gradient/train-buffer inspection and SGD/Adam gate coverage remain open. No compiled-C++ golden.
+
+## 165. FoveationFilm actual-Oxide SGD gate
+
+- v0.2.129 (`a704ede6`): an actual-Oxide runtime test exercises `dont_update` at iteration 0 and verifies that the same layer updates at iteration 1. CPU/GPU parameters match at both iterations; the test passed. Adam/burn-in/train-only-BN actual-runtime gate coverage and direct gradient-buffer inspection remain open. No compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 
