@@ -4939,10 +4939,16 @@ fn gpu_muon_connected_two_step_update_matches_cpu() {
 
 #[test]
 fn gpu_muon_connected_batch_norm_matches_cpu_across_steps() {
-    let net = network(
+    connected_bn_muon_matches_cpu("linear");
+    connected_bn_muon_matches_cpu("leaky");
+}
+
+fn connected_bn_muon_matches_cpu(activation: &str) {
+    let cfg = format!(
         "[net]\nwidth=2\nheight=1\nchannels=1\nbatch=2\nmuon=1\ndecoupled_decay=1\ndecay=0.0002\nloss_scale=1\n\
-         [connected]\noutput=3\nbatch_normalize=1\nactivation=linear\n",
+         [connected]\noutput=3\nbatch_normalize=1\nactivation={activation}\n"
     );
+    let net = network(&cfg);
     let mut cpu = ExecutableNetwork::new(net.clone());
     let LayerParams::Connected(params) = &mut cpu.params[0] else {
         panic!("connected parameters expected");
