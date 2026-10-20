@@ -112,7 +112,7 @@ with the command given rather than trusting the number.
 | `Wmhf` | alias | C++ | fwd | exact | T4 | none | none | no |
 | `Clifford` | yes | C++ | fwd | exact | T4 | none | none | no |
 | `RecursiveBlock` | alias | body only | fwd | exact | T1 | none | none | no |
-| `HyperbolicFoveation` | yes | C++ | fwd | exact | T4 | native Oxide predictor + warp + isotropic fixed-point grid; Newton/anisotropic host-side | host warp/predictor adjoint; per-layer host gradients | no |
+| `HyperbolicFoveation` | yes | C++ | fwd | exact | T4 | native Oxide predictor + warp + isotropic fixed-point/Newton grid; anisotropic host-side | host warp/predictor adjoint; per-layer host gradients | no |
 | `FoveationFilm` | alias | C++ | fwd | exact | T4 | native Oxide f32 (HF source/cache host-managed) | native FiLM adjoint + host HF backward; host SGD/Adam updates | no |
 | `Vit` | yes | C++ | fwd | exact | pin | host | cpu | no |
 | `Swin` | alias | Rust | fwd | exact | pin | host | cpu | no |
@@ -166,7 +166,7 @@ paths in `runtime.rs` (including the `Gru` match arm).
 
 `HyperbolicFoveation` and `FoveationFilm` now execute in the full GPU runtime:
 Oxide performs the HF predictor MLP, NCHW bilinear warp, isotropic
-fixed-point grid, and FiLM projections/adjoints in the bounded path; Newton and
+fixed-point/Newton grids, and FiLM projections/adjoints in the bounded path;
 anisotropic grid variants plus HF warp/predictor backward remain host-managed.
 SGD/Adam parameter updates are host-side. This is a hybrid
 path, not full-layer native HF completion. Muon and compact/f16 inference

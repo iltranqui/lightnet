@@ -118,9 +118,12 @@ Bounded native slice:
 9. [x] Add native HF predictor pooling/MLP/constraints for isotropic
    fixed-point runtime (v0.2.135); learned-HF actual-device two-step SGD parity
    passes.
-10. [ ] Add Newton/anisotropic inverse-grid paths, implement warp adjoints,
-    and inspect runtime input gradients; retain explicit host boundaries until
-    each is verified. Actual-Oxide gates cover compact f32/f16, Muon, SGD
+10. [x] Add native isotropic Newton inverse-grid generation and runtime
+    dispatch (v0.2.136); actual-Oxide Adam parity and primitive CPU-formula
+    parity pass. The downloaded grid is retained for host HF backward.
+11. [ ] Add anisotropic inverse-grid, implement native warp adjoints, and
+    inspect runtime input gradients; preserve explicit host boundaries until
+    verified. Actual-Oxide gates cover compact f32/f16, Muon, SGD
     `dont_update`, Adam `burnin_update`, and SGD `train_only_bn` (v0.2.128–131).
     No compiled-C++ GPU-parity claim.
 
@@ -138,12 +141,13 @@ adds actual-Oxide compact f32/f16 and Muon rejection tests; v0.2.129–131
 cover SGD/Adam update gates. v0.2.132 compares all host HF/FiLM gradient
 buffers against CPU after actual-Oxide backward. v0.2.133 adds native Oxide bilinear warp sampling; v0.2.134 adds isotropic
 fixed-point inverse-grid generation; v0.2.135 adds the predictor MLP for that
-configuration. Newton/anisotropic grid variants and backward remain host-side.
-Direct input-gradient parity and native warp adjoints remain open.
+configuration; v0.2.136 adds isotropic Newton inversion. Anisotropic grids and
+HF backward remain host-managed. Direct input-gradient parity and native warp
+adjoints remain open.
 
 This remains an open plan, not evidence of a complete native layer. Native HF
-coverage is bounded to isotropic fixed-point forward; other inverse modes and
-HF backward remain hybrid/host-managed. Compact f16 remains deferred.
+coverage is bounded to isotropic forward; anisotropic mode and HF backward
+remain hybrid/host-managed. Compact f16 remains deferred.
 
 ## Act-head contract finding
 
