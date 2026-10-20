@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.1.034: pinned Reorg normal-forward channel/offset packing and its adjoint; the full axis filter passed 30. C++ reverse source has an `out_c`/`in_c` divisor defect and remains unpinned; see `implemented.md` §133 and axis ledger F2.
 - v0.1.033: pinned Upsample forward/reverse geometry, scale, adjoints and ragged-tail behavior from `upsample_layer.cpp`/`blas.cpp`; corrected CPU reverse mode to ignore incomplete stride blocks instead of indexing beyond output. Host upsample tests passed 6; full axis filter passed 29; see `implemented.md` §132. Hand-derived, no compiled-C++ golden.
 - v0.1.032: pinned Route relative source order, group slicing and backward scatter from `Jev_laya:src-lib/route_layer.cpp:91-139`; named batch-2 non-square axis test passed. Full axis filter now passes 28 tests; ledger has 25 pinned / 35 open C++-backed variants. Hand-derived, no compiled-C++ golden; see `implemented.md` §131.
 - v0.2.103: added actual-Oxide two-step connected-BN backward/optimizer parity with `leaky` activation for both SGD and Adam; outputs, weights, biases, BN scales and rolling stats match CPU. Focused Oxide test passed; see `implemented.md` §130.

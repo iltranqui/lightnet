@@ -158,6 +158,7 @@ file is named inline.
 - [130. Connected BN GPU backward SGD/Adam parity](#130-connected-bn-gpu-backward-sgdadam-parity)
 - [131. Route source/group axis pin](#131-route-sourcegroup-axis-pin)
 - [132. Upsample axis pin and ragged reverse extent](#132-upsample-axis-pin-and-ragged-reverse-extent)
+- [133. Reorg forward axis pin and reverse-source finding](#133-reorg-forward-axis-pin-and-reverse-source-finding)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1855,6 +1856,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 132. Upsample axis pin and ragged reverse extent
 
 - v0.1.033 (`f20bce66`): hand-derived from `Jev_laya:src-lib/upsample_layer.cpp:6-28` and `blas.cpp:669-695`. The named B=2 non-square axis test pins forward repeat/scale, reverse stride-block summation, adjoints, NCHW axes, integer-floor output extent and ignored ragged trailing cells. It exposed a CPU reverse-mode panic on non-divisible dimensions; forward and adjoint now process only the complete stride-covered region, leaving the ragged tail zero in the adjoint. `MEM=3G ./tools/test_host.sh upsample` passed 6 tests; `MEM=3G ./tools/test_host.sh axis_layout` passed 29. Hand-derived, no compiled-C++ golden.
+
+## 133. Reorg forward axis pin and reverse-source finding
+
+- v0.1.034 (`4842e926`): hand-derived the normal `[reorg]` forward/adjoint from `Jev_laya:src-lib/reorg_layer.cpp:112-128` and `blas.cpp:69-100`. The batch-2 NCHW fixture pins offset-channel packing and both spatial offsets with explicit sentinels; `MEM=3G ./tools/test_host.sh reorg_axis_layout` passed and `MEM=3G ./tools/test_host.sh axis_layout` passed 30 tests. C++ reverse-mode is not pinned: source inspection found its `out_c`/`in_c` divisor defect (documented as axis ledger F2). No compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 
