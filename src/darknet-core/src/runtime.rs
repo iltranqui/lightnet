@@ -8541,19 +8541,13 @@ where
                 | LayerKind::Cost { .. }
                 | LayerKind::Logistic
                 | LayerKind::OmdLoss(_)
+                | LayerKind::JevCe(_)
                 | LayerKind::Upsample(_)
                 | LayerKind::Yolo(_)
                 | LayerKind::ObbYolo(_)
                 | LayerKind::GaussianYolo(_)
                 | LayerKind::Detection(_)
                 | LayerKind::Regression(_) => {}
-                LayerKind::JevCe(spec) if !spec.channel_major => {}
-                LayerKind::JevCe(_) => {
-                    return Err(Error::UnsupportedLayer {
-                        layer_index: layer.index,
-                        name: "jev_ce channel-major layout (f16 inference)".to_owned(),
-                    });
-                }
                 LayerKind::Shortcut(spec) => {
                     if spec.from.is_empty() {
                         return Err(Error::UnsupportedLayer {
@@ -8966,14 +8960,26 @@ where
                             launch_config,
                         )
                         .map_err(|err| backend_error("scale JevCe f16 logits", err))?;
-                    self.backend
-                        .softmax_f16(
-                            &scaled,
-                            &tensor_backend_shape(layer.output_shape),
-                            spec.groups,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("f16 JevCe softmax", err))?
+                    if spec.channel_major {
+                        self.backend
+                            .softmax_channel_major_f16(
+                                &scaled,
+                                &tensor_backend_shape(layer.output_shape),
+                                spec.candidates,
+                                spec.groups,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("f16 JevCe channel-major softmax", err))?
+                    } else {
+                        self.backend
+                            .softmax_f16(
+                                &scaled,
+                                &tensor_backend_shape(layer.output_shape),
+                                spec.groups,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("f16 JevCe softmax", err))?
+                    }
                 }
                 (LayerKind::Region(spec), LayerParams::None) => self
                     .backend

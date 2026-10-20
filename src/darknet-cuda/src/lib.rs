@@ -3831,6 +3831,43 @@ pub trait F16TensorOpsBackend: F32TensorOpsBackend {
         assert!(groups > 0 && per_batch.is_multiple_of(groups));
         self.upload_f16(shape, &host_ops::softmax(&host, per_batch / groups))
     }
+    /// Softmax over candidates in NCHW channel-major storage, with one group
+    /// per spatial location. The generic default is a numeric host reference.
+    fn softmax_channel_major_f16(
+        &self,
+        x: &Self::TensorF16,
+        shape: &[usize],
+        candidates: usize,
+        groups: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error> {
+        let _ = config;
+        assert_eq!(shape.len(), 4);
+        assert_eq!(shape[1], candidates);
+        assert_eq!(shape[2] * shape[3], groups);
+        let input = self.download_f16(x)?;
+        let mut output = input.clone();
+        for batch in 0..shape[0] {
+            for group in 0..groups {
+                let mut max_value = f32::NEG_INFINITY;
+                for candidate in 0..candidates {
+                    let index = batch * candidates * groups + candidate * groups + group;
+                    max_value = max_value.max(input[index]);
+                }
+                let sum = (0..candidates)
+                    .map(|candidate| {
+                        let index = batch * candidates * groups + candidate * groups + group;
+                        (input[index] - max_value).exp()
+                    })
+                    .sum::<f32>();
+                for candidate in 0..candidates {
+                    let index = batch * candidates * groups + candidate * groups + group;
+                    output[index] = (input[index] - max_value).exp() / sum;
+                }
+            }
+        }
+        self.upload_f16(shape, &output)
+    }
     /// Reorg permutation between spatially large and channel-expanded NCHW tensors.
     fn reorg_f16(
         &self,

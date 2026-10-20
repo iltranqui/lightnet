@@ -354,7 +354,7 @@ fn omd_loss_f16_inference_is_device_identity_and_matches_cpu() {
 }
 
 #[test]
-fn jev_ce_f16_inference_matches_cpu_for_group_major_layout() {
+fn jev_ce_f16_inference_matches_cpu_for_both_layouts() {
     let cfg = "[net]\nwidth=6\nheight=1\nchannels=1\nbatch=2\n[jev_ce]\ngroups=2\ntemperature=1.5\n";
     let net = network(cfg);
     run_pair("jev_ce f16", net.clone(), 73, 1.0, 3e-3);
@@ -382,16 +382,34 @@ fn jev_ce_f16_inference_matches_cpu_for_group_major_layout() {
     );
 
     let channel_major = network(
-        "[net]\nwidth=6\nheight=1\nchannels=1\nbatch=2\n[jev_ce]\ngroups=2\nlayout=cm\n",
+        "[net]\nwidth=2\nheight=1\nchannels=3\nbatch=2\n[jev_ce]\ngroups=2\ntemperature=1.5\nlayout=cm\n",
     );
-    let rejected = GpuExecutableNetwork::new(
-        channel_major.clone(),
+    run_pair("jev_ce channel-major f16", channel_major.clone(), 74, 1.0, 3e-3);
+
+    let input = input_for(&channel_major, 74 ^ 0x55);
+    let cpu = ExecutableNetwork::new(channel_major.clone())
+        .forward(&input)
+        .expect("CPU JevCe channel-major reference");
+    let gpu = GpuExecutableNetwork::new(
+        channel_major,
         OxideBackend::new().expect("oxide backend"),
     );
-    assert!(matches!(
-        rejected.forward_compact_f16(&input_for(&channel_major, 74)),
-        Err(Error::UnsupportedLayer { .. })
-    ));
+    let f16 = gpu
+        .forward_compact_f16(&input)
+        .expect("native f16 JevCe channel-major softmax");
+    let cpu_output = &cpu.layer_outputs[0];
+    let f16_output = f16.final_output.as_ref().expect("f16 final output");
+    assert_eq!(cpu_output.shape, f16_output.shape);
+    let scale = max_abs(&cpu_output.data);
+    let diff = cpu_output
+        .data
+        .iter()
+        .zip(&f16_output.data)
+        .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+    assert!(
+        diff <= 3e-3 * scale,
+        "CPU/f16 JevCe channel-major error {diff} > 3e-3 * {scale}"
+    );
 }
 
 #[test]

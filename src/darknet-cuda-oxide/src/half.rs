@@ -1208,6 +1208,47 @@ impl OxideBackend {
         Ok(OxideTensorF16::new(output, shape))
     }
 
+    /// Native f16 softmax across channel-major candidates at each spatial group.
+    pub fn softmax_channel_major_f16(
+        &self,
+        x: &OxideTensorF16,
+        shape: &[usize],
+        candidates: usize,
+        groups: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF16, OxideError> {
+        if shape.len() != 4
+            || x.shape() != shape
+            || x.len() != shape.iter().product::<usize>()
+            || candidates == 0
+            || groups == 0
+            || shape[1] != candidates
+            || shape[2] * shape[3] != groups
+        {
+            return Err(shape_err(
+                "softmax_channel_major_f16",
+                format!("incompatible shape {shape:?}, candidates={candidates}, groups={groups}"),
+            ));
+        }
+        let n_groups = shape[0] * groups;
+        let mut output = self.alloc16_uninit(x.len())?;
+        // SAFETY: validated NCHW dimensions give one disjoint candidate stride
+        // per (batch, spatial-group) thread, and every input/output slot is covered.
+        unsafe {
+            self.half_ops.softmax_channel_major_f16(
+                &self.stream,
+                launch::elementwise(n_groups, config),
+                &x.buf,
+                &mut output,
+                candidates,
+                groups,
+                n_groups,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF16::new(output, shape))
+    }
+
     /// Native half-storage Region layout and activation forward.
     pub fn region_forward_f16(
         &self,
@@ -1761,6 +1802,17 @@ impl darknet_cuda::F16TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::TensorF16, Self::Error> {
         OxideBackend::softmax_f16(self, x, shape, groups, config)
+    }
+
+    fn softmax_channel_major_f16(
+        &self,
+        x: &Self::TensorF16,
+        shape: &[usize],
+        candidates: usize,
+        groups: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error> {
+        OxideBackend::softmax_channel_major_f16(self, x, shape, candidates, groups, config)
     }
 
     fn region_forward_f16(

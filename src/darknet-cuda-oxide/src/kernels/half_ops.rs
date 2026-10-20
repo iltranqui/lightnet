@@ -292,6 +292,54 @@ pub mod kernels {
         }
     }
 
+    /// Softmax across candidates in NCHW channel-major `[B,Candidates,Groups]`
+    /// storage; each thread owns one spatial group.
+    #[kernel]
+    pub fn softmax_channel_major_f16(
+        input: &[u16],
+        mut output: DisjointSlice<u16>,
+        candidates: usize,
+        groups: usize,
+        n_groups: usize,
+    ) {
+        let global_group = thread::index_1d().get();
+        if global_group >= n_groups {
+            return;
+        }
+        let batch = global_group / groups;
+        let group = global_group % groups;
+        let base = batch * candidates * groups + group;
+        let mut max_value = f32::NEG_INFINITY;
+        let mut candidate = 0usize;
+        while candidate < candidates {
+            let value = f16_bits_to_f32(input[base + candidate * groups]);
+            if value > max_value {
+                max_value = value;
+            }
+            candidate += 1;
+        }
+        let mut sum = 0.0f32;
+        candidate = 0;
+        while candidate < candidates {
+            sum += (f16_bits_to_f32(input[base + candidate * groups]) - max_value).exp();
+            candidate += 1;
+        }
+        candidate = 0;
+        while candidate < candidates {
+            let index = base + candidate * groups;
+            let exponential = (f16_bits_to_f32(input[index]) - max_value).exp();
+            let probability = if sum > 0.0 {
+                exponential / sum
+            } else {
+                exponential
+            };
+            unsafe {
+                *output.as_mut_ptr().add(index) = f32_to_f16_bits(probability, 0);
+            }
+            candidate += 1;
+        }
+    }
+
     /// Big `[b,cb,hb,wb]` to small `[b,cb*s*s,hs,ws]` reorg.
     #[kernel]
     pub fn reorg_to_small_f16(
