@@ -129,6 +129,7 @@ pub(crate) mod vc_attention;
 pub(crate) mod vit;
 pub mod weights;
 pub(crate) mod wmhf;
+pub mod yolo_3d;
 
 pub use carpn::{ObbRefineOutput, ObbRefineProposal};
 pub use cfg::{ConfigFile, RawSection};

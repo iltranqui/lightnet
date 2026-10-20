@@ -1,6 +1,6 @@
-//! Source-backed configuration preparation for the Stage-1 cuboid head.
-//! This does not enable network dispatch: the layer remains unsupported until
-//! its loss, decode and runtime contracts are implemented.
+//! Source-backed configuration for the Stage-1 raw CPU cuboid head.
+//! Network dispatch and raw pass-through are available; dedicated training
+//! loss and detection APIs remain unimplemented.
 
 use super::{TensorShape, YoloIouLoss};
 use crate::cfg::RawSection;
@@ -26,7 +26,7 @@ pub struct Yolo3dGeometrySpec {
     pub geo_burn_in: usize,
 }
 
-/// Configuration only; constructing this value does not enable a runtime head.
+/// Parsed cuboid-head configuration; not a complete loss/decode implementation.
 ///
 /// Defaults are hand-derived from `depth_3d` at `9c9e0b4b`,
 /// `src-lib/darknet_cfg.cpp:2556-2697`, no compiled-C++ golden.
@@ -74,7 +74,7 @@ pub struct Yolo3dSpec {
     pub edge_weight: [f32; 3],
     pub loss_3d_normalizer: f32,
     pub shape_normalizer: f32,
-    /// Unresolved filename, not a loaded class mapping. Network integration
+    /// Unresolved filename, not a loaded class mapping. Loss/decode integration
     /// must resolve this relative to the cfg as it does for other YOLO heads.
     pub map_file: Option<String>,
     pub geometry: Yolo3dGeometrySpec,
