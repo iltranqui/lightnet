@@ -2907,6 +2907,48 @@ pub trait F32TensorOpsBackend {
         self.upload_f32(output_shape, &output)
     }
 
+    /// Convert scorer input `[B,H,1,K]` into option rows `[B*K,H]`.
+    fn laya_scorer_unpack_f32(
+        &self,
+        input: &Self::Tensor,
+        input_shape: &[usize],
+        hidden: usize,
+        options: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert_eq!(input_shape.len(), 4);
+        assert_eq!(input_shape[1..], [hidden, 1, options]);
+        let batch = input_shape[0];
+        let source = self.download_f32(input)?;
+        assert_eq!(source.len(), batch * hidden * options);
+        let mut rows = vec![0.0; batch * options * hidden];
+        for b in 0..batch {
+            for k in 0..options {
+                for h in 0..hidden {
+                    rows[(b * options + k) * hidden + h] = source[(b * hidden + h) * options + k];
+                }
+            }
+        }
+        self.upload_f32(&[batch * options, hidden], &rows)
+    }
+
+    /// Rewrap packed option logits `[B*K]` as the layer's `[B,1,1,K]` output.
+    fn laya_scorer_pack_f32(
+        &self,
+        logits: &Self::Tensor,
+        batch: usize,
+        options: usize,
+        output_shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert_eq!(output_shape, [batch, 1, 1, options]);
+        let logits = self.download_f32(logits)?;
+        assert_eq!(logits.len(), batch * options);
+        self.upload_f32(output_shape, &logits)
+    }
+
     /// Recompute-based derivative of standard online attention. Inputs are
     /// fused QKV `[B,T,3C]`, context/output gradient `[B,T,C]`, and LSE
     /// `[B,H,T]`; output is fused dQKV `[B,T,3C]`.

@@ -7924,6 +7924,86 @@ impl F32TensorOpsBackend for OxideBackend {
         Ok(OxideTensorF32::new(output, output_shape))
     }
 
+    fn laya_scorer_unpack_f32(
+        &self,
+        input: &Self::Tensor,
+        input_shape: &[usize],
+        hidden: usize,
+        options: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let op = "laya_scorer_unpack_f32";
+        if input_shape.len() != 4
+            || input_shape[0] == 0
+            || input_shape[1] != hidden
+            || input_shape[2] != 1
+            || input_shape[3] != options
+            || hidden == 0
+            || options == 0
+        {
+            return Err(shape_err(op, format!("invalid input shape {input_shape:?}")));
+        }
+        let batch = input_shape[0];
+        let len = batch
+            .checked_mul(hidden)
+            .and_then(|n| n.checked_mul(options))
+            .ok_or_else(|| shape_err(op, "input length overflows usize".to_owned()))?;
+        let rows = batch
+            .checked_mul(options)
+            .ok_or_else(|| shape_err(op, "row count overflows usize".to_owned()))?;
+        let input = self.f32v(input)?;
+        if input.shape() != input_shape || input.len() != len {
+            return Err(shape_err(op, format!("input shape/length mismatch: {:?}/{}", input.shape(), input.len())));
+        }
+        let mut output = self.alloc_uninit(len)?;
+        // SAFETY: exact tensor extents bound the channel-major gather indices.
+        unsafe {
+            self.layers_extra.laya_scorer_unpack(
+                &self.stream,
+                launch::elementwise(len, config),
+                &input.buf,
+                &mut output,
+                hidden,
+                options,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, &[rows, hidden]))
+    }
+
+    fn laya_scorer_pack_f32(
+        &self,
+        logits: &Self::Tensor,
+        batch: usize,
+        options: usize,
+        output_shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let op = "laya_scorer_pack_f32";
+        let len = batch
+            .checked_mul(options)
+            .ok_or_else(|| shape_err(op, "output length overflows usize".to_owned()))?;
+        if batch == 0 || options == 0 || output_shape != [batch, 1, 1, options] {
+            return Err(shape_err(op, format!("invalid output shape {output_shape:?}")));
+        }
+        let logits = self.f32v(logits)?;
+        if logits.shape() != [len, 1] || logits.len() != len {
+            return Err(shape_err(op, format!("logit tensor shape/length mismatch: {:?}/{}", logits.shape(), logits.len())));
+        }
+        let mut output = self.alloc_uninit(len)?;
+        // SAFETY: logits/output lengths are equal and every thread owns one slot.
+        unsafe {
+            self.layers_extra.laya_scorer_pack(
+                &self.stream,
+                launch::elementwise(len, config),
+                &logits.buf,
+                &mut output,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, output_shape))
+    }
+
     fn laya_head_attention_f32(
         &self,
         qkv: &Self::Tensor,

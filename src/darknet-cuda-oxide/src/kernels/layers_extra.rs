@@ -868,6 +868,36 @@ pub mod kernels {
         }
     }
 
+    /// Unpack channel-major scorer vectors `[B,H,1,K]` into `[B*K,H]` rows.
+    #[kernel]
+    pub fn laya_scorer_unpack(
+        input: &[f32],
+        mut rows: DisjointSlice<f32>,
+        hidden: usize,
+        options: usize,
+    ) {
+        let index = thread::index_1d().get();
+        if index < rows.len() {
+            let row = index / hidden;
+            let channel = index % hidden;
+            let batch = row / options;
+            let option = row % options;
+            let source = (batch * hidden + channel) * options + option;
+            // SAFETY: validated shape extents make both layouts equal-sized.
+            unsafe { *rows.as_mut_ptr().add(index) = input[source]; }
+        }
+    }
+
+    /// Pack `[B*K]` option logits into `[B,1,1,K]` (identity in storage).
+    #[kernel]
+    pub fn laya_scorer_pack(input: &[f32], mut output: DisjointSlice<f32>) {
+        let index = thread::index_1d().get();
+        if index < output.len() {
+            // SAFETY: host validation guarantees equal input/output lengths.
+            unsafe { *output.as_mut_ptr().add(index) = input[index]; }
+        }
+    }
+
     /// LayaHead's masked attention. Skips invalid keys and writes a zero
     /// context for queries whose batch has no valid key. One thread owns one
     /// (batch, head, query) output slice and uses online softmax state.

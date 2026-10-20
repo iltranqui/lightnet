@@ -86,6 +86,7 @@ mod dcnv4_gpu;
 mod laya_act_gpu;
 #[path = "runtime/laya_head_gpu.rs"]
 mod laya_head_gpu;
+mod laya_scorer_gpu;
 
 /// Whether the network contains a `[deform_conv]` variant the device path does
 /// not cover yet. Shared by the forward and the backward so they cannot choose
@@ -14491,30 +14492,16 @@ where
                         .upload_f32(&tensor_backend_shape(layer.output_shape), &out.output)
                         .map_err(|err| backend_error("upload segmentation output", err))?
                 }
-                // `[laya_scorer]` is LayerNorm + two dense layers, so it runs on
-                // `[laya_scorer]` is LayerNorm + two dense layers, so it runs on
-                // the host for now (same choice as `[contrastive]`).
-                (LayerKind::LayaScorer(spec), LayerParams::LayaScorer(_)) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download laya_scorer input", err))?;
-                    let LayerParams::LayaScorer(weights) = &self.params[layer.index] else {
-                        return Err(Error::InvalidConfig(format!(
-                            "layer #{} ([laya_scorer]) is missing its frozen weights",
-                            layer.index
-                        )));
-                    };
-                    let weights = weights.clone();
-                    let data = crate::laya_scorer::scorer_forward(
-                        &host_input.data,
-                        &weights,
+                (LayerKind::LayaScorer(spec), LayerParams::LayaScorer(weights)) => {
+                    laya_scorer_gpu::forward(
+                        &self.backend,
                         spec,
-                        layer.input_shape.batch,
-                    )
-                    .map_err(Error::InvalidConfig)?;
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
-                        .map_err(|err| backend_error("upload laya_scorer output", err))?
+                        weights,
+                        current_input,
+                        layer.input_shape,
+                        layer.output_shape,
+                        launch_config,
+                    )?
                 }
                 // `[centernet]`'s sigmoid is a strided channel sub-range, so
                 // it goes through the host like the other modern heads.
@@ -16099,6 +16086,17 @@ where
                         spec,
                         weights,
                         current_input.expect("LayaHead requires current input"),
+                        layer.input_shape,
+                        layer.output_shape,
+                        launch_config,
+                    )?
+                }
+                (LayerKind::LayaScorer(spec), LayerParams::LayaScorer(weights)) => {
+                    laya_scorer_gpu::forward(
+                        &self.backend,
+                        spec,
+                        weights,
+                        current_input.expect("LayaScorer requires current input"),
                         layer.input_shape,
                         layer.output_shape,
                         launch_config,
@@ -47860,9 +47858,10 @@ num_dwconv=1
     /// the GPU chain must match the CPU one for any seed.
     /// `[yolox]` transforms its input (the trailing `1 + classes` entries of
     /// every cell go through a sigmoid) and its seed reaches the previous layer.
-    /// `[laya_scorer]` is LayerNorm + two dense layers, currently a host round
-    /// trip on the GPU path, so its output and its input gradient must match
-    /// the CPU ones exactly.  (The generic `assert_gpu_layer_chain_matches_cpu`
+    /// `[laya_scorer]` is LayerNorm + two dense layers; this FakeBackend test
+    /// exercises the backend trait's CPU defaults, while Oxide has a separate
+    /// actual-device forward test. Its input gradient remains host-computed.
+    /// (The generic `assert_gpu_layer_chain_matches_cpu`
     /// helper is not used here: it also checks the preceding convolution's
     /// weight gradient, which cancels out for a 1x1 convolution with this
     /// narrow a seed.)
