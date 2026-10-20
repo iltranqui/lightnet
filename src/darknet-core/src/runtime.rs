@@ -40222,6 +40222,52 @@ num_dwconv=1
     }
 
     #[test]
+    fn logistic_axis_layout_keeps_batch_channel_hw_order() {
+        // raptor:src-lib/logistic_layer.cpp copies the contiguous
+        // batch*inputs array then activates each entry in place. The C++ input
+        // shape is NCHW; distinct coordinates and non-square H/W catch any
+        // batch/channel/spatial permutation.
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "logistic_axis.cfg",
+                "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\n[logistic]\n",
+            )
+            .expect("logistic cfg"),
+        )
+        .expect("logistic network");
+        let executable = ExecutableNetwork::new(network);
+        let (batch, channels, height, width) = (2, 2, 2, 3);
+        let input_values: Vec<f32> = (0..batch)
+            .flat_map(|n| {
+                (0..channels).flat_map(move |c| {
+                    (0..height).flat_map(move |y| {
+                        (0..width).map(move |x| {
+                            -1.1 + 0.6 * n as f32 + 0.3 * c as f32
+                                + 0.12 * y as f32 + 0.05 * x as f32
+                        })
+                    })
+                })
+            })
+            .collect();
+        let expected: Vec<f32> = input_values
+            .iter()
+            .map(|&value| 1.0 / (1.0 + (-value).exp()))
+            .collect();
+        let input = Tensor::from_data(
+            TensorShape::new(width, height, channels, batch),
+            input_values,
+        )
+        .expect("logistic axis input");
+        let forward = executable.forward(&input).expect("logistic forward");
+        assert_slice_close(
+            "logistic NCHW batch/channel/HW order",
+            &expected,
+            &forward.layer_outputs[0].data,
+            1e-7,
+        );
+    }
+
+    #[test]
     fn connected_axis_layout_keeps_batch_rows_and_output_weight_axes() {
         // C++ `connected_layer.cpp:186` presents each sample as a flattened
         // NCHW input row and weights as [output][input]. Distinct sample,
