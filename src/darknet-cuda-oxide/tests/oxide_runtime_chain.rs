@@ -2868,6 +2868,7 @@ fn dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu() {
             (0, 0, "leaky", 25, 12, 1),
             (0, 0, "leaky", 27, 13, 1),
             (0, 0, "leaky", 29, 14, 1),
+            (0, 0, "leaky", 31, 15, 1),
         ] {
             // Keep large-kernel runtime optimizer parity on SGD for this slice;
             // Adam's CPU/GPU delta check remains covered through 15x15.
