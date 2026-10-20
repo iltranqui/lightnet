@@ -123,7 +123,7 @@ with the command given rather than trusting the number.
 | `DptHead` | alias | C++ | fwd | exact | pin | none | none | no |
 | `LayaEncoder` | yes | C++ | frozen | frozen | pin | host | cpu | no |
 | `LayaHead` | yes | C++ | frozen | frozen | pin | native f32 full + compact | none (frozen/no input grad) | no |
-| `LayaScorer` | yes | C++ | frozen | frozen | pin | native | device | no |
+| `LayaScorer` | yes | C++ source not local | frozen | frozen | pin | native f32 full + compact | cpu | no |
 | `LayaMarkerGather` | yes | none | fwd | exact | pin | native | device | yes |
 | `LayaActHead` | yes | C++ | fwd | exact (CPU path) | pin | native | cpu (primitive native) | yes (compact inference; training unsupported) |
 | `LayaLoss` | yes | none | head | head | pin | native (loss on host) | head | no |

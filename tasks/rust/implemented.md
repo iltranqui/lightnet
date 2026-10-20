@@ -221,6 +221,7 @@ file is named inline.
 - [193. LAYA act-head compact f16 inference](#193-laya-act-head-compact-f16-inference)
 - [194. LayaHead masked attention primitive](#194-layahead-masked-attention-primitive)
 - [195. LayaHead native f32 forward](#195-layahead-native-f32-forward)
+- [196. LayaScorer native f32 forward](#196-layascorer-native-f32-forward)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2170,6 +2171,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 195. LayaHead native f32 forward
 
 - v0.2.156 (`pending`): composed native Oxide type-embedding/unpack, LayerNorm, QKV/output/FFN projections, mask-aware online attention, residuals, ReLU, and channel-major pack into both full and compact f32 runtime paths. Actual-Oxide output matches the CPU reference for fixed and input-carried qtype, two heads/two blocks, mixed masks and all-masked rows; malformed weight extents reject. `oxide_laya_head_forward`: 3 passed; `oxide_laya_head_attention`: 2 passed; `MEM=3G ./tools/test_host.sh laya_head`: 9 passed. The layer is frozen, so backward remains no-input-gradient/no-update; compact f16 is still rejected. Source-derived Rust-reference parity only; no compiled-C++ golden.
+
+## 196. LayaScorer native f32 forward
+
+- v0.2.157 (`pending`): native Oxide full and compact f32 composition for channel-major option unpack, biased LayerNorm, H→H connected, exact-erf GELU, H→1 connected and output packing. Actual-device outputs match the Rust CPU reference across two batches and three options; malformed weight extents reject (`oxide_laya_scorer_forward`: 2 passed). `MEM=3G ./tools/test_host.sh laya_scorer`: 16 passed, including existing FakeBackend runtime forward/backward tests. Backward remains CPU-computed; no f16 or training/update path. No local C++ source or compiled-C++ golden; do not claim C++ parity.
 
 ## Not implemented / open (pointer)
 
