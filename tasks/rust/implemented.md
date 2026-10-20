@@ -174,6 +174,7 @@ file is named inline.
 - [146. Extend native DCNv4 through 31x31](#146-extend-native-dcnv4-through-31x31)
 - [147. Native GPU Crop RGB-shift augmentation](#147-native-gpu-crop-rgb-shift-augmentation)
 - [148. Native GPU Crop HSV saturation/exposure](#148-native-gpu-crop-hsv-saturationexposure)
+- [149. Extend DCNv4 Adam runtime parity through 17x17](#149-extend-dcnv4-adam-runtime-parity-through-17x17)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1935,6 +1936,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 148. Native GPU Crop HSV saturation/exposure
 
 - v0.2.113 (`e9205b1d`): Oxide Crop now performs the seeded per-tap RGB→HSV saturation/exposure transform and HSV→RGB clamp on device, matching the CPU reference for RGB inputs. Non-RGB channels retain the existing affine/shift behavior. The Crop runtime parity test covers non-default saturation, exposure, RGB shift, geometry, backward, and SGD/Adam updates; standalone primitive parity/FD and host crop tests also pass. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- crop_native_training_augmentation_and_backward_match_cpu` passed 1, `MEM=3G ./tools/test_oxide.sh --test oxide_pool_parity crop_bilinear_forward_backward_and_fd` passed 1, and `MEM=3G ./tools/test_host.sh crop` passed 10. No compiled-C++ golden, full-suite, or performance claim.
+
+## 149. Extend DCNv4 Adam runtime parity through 17x17
+
+- v0.2.114 (`239348ce`): expanded `dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` to include 17x17 Adam runtime parity without BN. The full focused test passed (1 test; 562.82 s), including existing SGD sizes through 31x31 and Adam through 17x17 for non-BN; BN Adam remains covered through 15x15. CPU-reference parity only; no compiled-C++ golden or full-suite claim.
 
 ## Not implemented / open (pointer)
 
