@@ -18,7 +18,6 @@ __pycache__/
 # Visual Studio C++ generated binary of .rc file
 *.aps
 .fastembed_cache
-cutile-rs
 chart.png
 chart_0.png
 chart_1.png

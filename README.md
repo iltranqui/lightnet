@@ -37,6 +37,7 @@ Each folder has a `CONTEXT.md` describing its role; start from `CLAUDE.md` and `
 
 ## Requirements
 
+- Clone with `git clone --recurse-submodules` (the cuTile backend uses the `src/cutile-rs-aot` submodule, NVlabs/cutile-rs v0.2.0).
 - Rust nightly pinned in `rust-toolchain.toml` (installed automatically by `rustup`).
 - For GPU backends: CUDA 13.2 or newer (the repo defaults to `/usr/local/cuda-13.4`, overridable through `CUDA_TOOLKIT_PATH`) and libclang. See `src/darknet-cuda-cutile/README.md` and `src/darknet-cuda-oxide/README.md`.
 

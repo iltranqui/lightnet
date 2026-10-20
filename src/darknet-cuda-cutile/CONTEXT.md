@@ -21,10 +21,11 @@ Concrete `CutileBackend` implementing `darknet_cuda::F32TensorOpsBackend` on top
 
 ## Dependencies
 
-- Depends on: `darknet-cuda`, external `../cutile-rs-aot/*` and `cutile-rs` (gitignored).
+- Depends on: `darknet-cuda` and the git submodule `src/cutile-rs-aot` (NVlabs/cutile-rs, pinned to v0.2.0).
 - Depended on by: nothing in the default build.
 
 ## Constraints
 
+- Fresh clone needs `git submodule update --init src/cutile-rs-aot` (or `git clone --recurse-submodules`).
 - Needs CUDA 13.2+ (13.3 recommended), `CUDA_TOOLKIT_PATH`, libclang.
 - Exercises GPU hardware: run only when the task asks for GPU verification.
