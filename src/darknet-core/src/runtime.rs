@@ -45352,8 +45352,8 @@ num_dwconv=1
     }
 
     #[test]
-    fn dcnv4_native_gate_accepts_19x19_and_rejects_21x21() {
-        for (size, expected_host) in [(19, false), (21, true)] {
+    fn dcnv4_native_gate_accepts_21x21_and_rejects_23x23() {
+        for (size, expected_host) in [(21, false), (23, true)] {
             let padding = size / 2;
             let cfg = format!(
                 "[net]\nwidth=5\nheight=3\nchannels=2\nbatch=1\n\
