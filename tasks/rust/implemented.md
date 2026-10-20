@@ -162,6 +162,7 @@ file is named inline.
 - [134. ChannelShuffle axis pin](#134-channelshuffle-axis-pin)
 - [135. Softmax grouped-reduction axis pin](#135-softmax-grouped-reduction-axis-pin)
 - [136. Dropout element-mask layout evidence and DropBlock finding](#136-dropout-element-mask-layout-evidence-and-dropblock-finding)
+- [137. ScaleChannels source and broadcast-axis pin](#137-scalechannels-source-and-broadcast-axis-pin)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1875,6 +1876,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 136. Dropout element-mask layout evidence and DropBlock finding
 
 - v0.1.037 (`5b9006b5`): added a focused batch-2 non-square NCHW test for standard Dropout's per-element mask, inference identity and same-mask adjoint; `MEM=3G ./tools/test_host.sh dropout_element_mask_and_adjoint_preserve_nchw_slots` passed. This is partial axis evidence, not a closed pin. `axis-coverage.md` F3 records the unresolved DropBlock GPU index expression; no compiled-C++ golden or full DropBlock source parity is claimed.
+
+## 137. ScaleChannels source and broadcast-axis pin
+
+- v0.1.038 (`189cebae`): hand-derived from `Jev_laya:src-lib/scale_channels_layer.cpp:12-35,73-135` and `blas_kernels.cu:1664-1676`. A named `from=0` source with a batch-2 non-square NCHW sentinel pins both channel-vector broadcast (`scale_wh=0`) and spatial-plane broadcast (`scale_wh=1`), plus input/source adjoint accumulation. `MEM=3G ./tools/test_host.sh scale_channels_axis_layout` passed; full axis filter passed 33. No compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 
