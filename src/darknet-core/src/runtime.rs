@@ -33128,10 +33128,24 @@ fn backward_upsample(
 
     let mut input_grad = Tensor::zeros(input_shape);
     if spec.reverse {
+        let covered_height = output_gradient
+            .shape
+            .height
+            .checked_mul(stride)
+            .ok_or_else(|| {
+                Error::InvalidConfig("reverse upsample gradient height overflows".to_owned())
+            })?;
+        let covered_width = output_gradient
+            .shape
+            .width
+            .checked_mul(stride)
+            .ok_or_else(|| {
+                Error::InvalidConfig("reverse upsample gradient width overflows".to_owned())
+            })?;
         for b in 0..input_shape.batch {
             for c in 0..input_shape.channels {
-                for y in 0..input_shape.height {
-                    for x in 0..input_shape.width {
+                for y in 0..covered_height {
+                    for x in 0..covered_width {
                         let src_y = y / stride;
                         let src_x = x / stride;
                         input_grad.set(
@@ -33886,10 +33900,24 @@ fn forward_upsample(
 
     let mut output = Tensor::zeros(output_shape);
     if spec.reverse {
+        let covered_height = output
+            .shape
+            .height
+            .checked_mul(stride)
+            .ok_or_else(|| {
+                Error::InvalidConfig("reverse upsample covered height overflows".to_owned())
+            })?;
+        let covered_width = output
+            .shape
+            .width
+            .checked_mul(stride)
+            .ok_or_else(|| {
+                Error::InvalidConfig("reverse upsample covered width overflows".to_owned())
+            })?;
         for b in 0..output.shape.batch {
             for c in 0..output.shape.channels {
-                for y in 0..input.shape.height {
-                    for x in 0..input.shape.width {
+                for y in 0..covered_height {
+                    for x in 0..covered_width {
                         let dst_y = y / stride;
                         let dst_x = x / stride;
                         let dst = output.offset(b, c, dst_y, dst_x);
@@ -34020,7 +34048,8 @@ mod tests {
     use super::{
         ConvolutionalParams, ExecutableNetwork, ForwardResult, GpuExecutableNetwork,
         HostAdamLayerState, LayerParams, LayerTrainBuffers, MuonLayerState, Tensor,
-        backward_route, compute_learning_rate, forward_route, sgd_update, write_muon_layer_state,
+        backward_route, backward_upsample, compute_learning_rate, forward_route, forward_upsample,
+        sgd_update, write_muon_layer_state,
     };
 
     fn fill_wmhf_test_params(executable: &mut ExecutableNetwork) {
@@ -45008,6 +45037,129 @@ num_dwconv=1
                         };
                         assert_eq!(source_grads[1].data[index], expected_source1);
                         assert_eq!(source_grads[0].data[index], expected_source0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn upsample_axis_layout_pins_forward_repeat_reverse_sum_and_adjoint() {
+        use crate::axis_fixture::{axis_tensor, axis_value, nchw_index};
+
+        let forward_network = Network::from_config(
+            ConfigFile::parse_str(
+                "upsample-axis-forward.cfg",
+                "[net]\nchannels=2\nbatch=2\nheight=2\nwidth=3\n\
+                 [upsample]\nstride=2\nscale=0.5\n",
+            )
+            .expect("forward upsample cfg parses"),
+        )
+        .expect("forward upsample network builds");
+        let LayerKind::Upsample(forward_spec) = &forward_network.layers[0].kind else {
+            panic!("expected forward upsample layer");
+        };
+        let low_shape = forward_network.net.input_shape();
+        let high_shape = forward_network.layers[0].output_shape;
+        let low_input =
+            Tensor::from_data(low_shape, axis_tensor(low_shape)).expect("low input");
+        let high_output =
+            forward_upsample(forward_spec, &low_input, high_shape).expect("upsample forward");
+        assert_eq!(high_shape, TensorShape::new(6, 4, 2, 2));
+        for n in 0..2 {
+            for c in 0..2 {
+                for y in 0..4 {
+                    for x in 0..6 {
+                        let want = 0.5 * axis_value(n, c, y / 2, x / 2);
+                        assert_eq!(
+                            high_output.data[nchw_index(high_shape, n, c, y, x)],
+                            want,
+                            "upsample repeat/scale mismatch at (n={n}, c={c}, y={y}, x={x})"
+                        );
+                    }
+                }
+            }
+        }
+        let high_seed =
+            Tensor::from_data(high_shape, axis_tensor(high_shape)).expect("high seed");
+        let low_gradient = backward_upsample(forward_spec, &high_seed, low_shape)
+            .expect("upsample backward");
+        for n in 0..2 {
+            for c in 0..2 {
+                for y in 0..2 {
+                    for x in 0..3 {
+                        let mut want = 0.0;
+                        for dy in 0..2 {
+                            for dx in 0..2 {
+                                want += high_seed.get(n, c, y * 2 + dy, x * 2 + dx);
+                            }
+                        }
+                        want *= 0.5;
+                        assert_eq!(
+                            low_gradient.get(n, c, y, x),
+                            want,
+                            "upsample adjoint mismatch at (n={n}, c={c}, y={y}, x={x})"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Darknet's negative-stride reverse mode sums each complete stride
+        // block and drops incomplete trailing rows/columns from integer division.
+        let reverse_network = Network::from_config(
+            ConfigFile::parse_str(
+                "upsample-axis-reverse.cfg",
+                "[net]\nchannels=2\nbatch=2\nheight=3\nwidth=5\n\
+                 [upsample]\nstride=-2\nscale=0.25\n",
+            )
+            .expect("reverse upsample cfg parses"),
+        )
+        .expect("reverse upsample network builds");
+        let LayerKind::Upsample(reverse_spec) = &reverse_network.layers[0].kind else {
+            panic!("expected reverse upsample layer");
+        };
+        let high_shape = reverse_network.net.input_shape();
+        let low_shape = reverse_network.layers[0].output_shape;
+        let high_input =
+            Tensor::from_data(high_shape, axis_tensor(high_shape)).expect("high input");
+        let low_output =
+            forward_upsample(reverse_spec, &high_input, low_shape).expect("reverse forward");
+        assert_eq!(low_shape, TensorShape::new(2, 1, 2, 2));
+        for n in 0..2 {
+            for c in 0..2 {
+                for y in 0..1 {
+                    for x in 0..2 {
+                        let mut want = 0.0;
+                        for dy in 0..2 {
+                            for dx in 0..2 {
+                                want += high_input.get(n, c, y * 2 + dy, x * 2 + dx);
+                            }
+                        }
+                        want *= 0.25;
+                        assert_eq!(low_output.get(n, c, y, x), want);
+                    }
+                }
+            }
+        }
+        let low_seed =
+            Tensor::from_data(low_shape, axis_tensor(low_shape)).expect("low seed");
+        let high_gradient = backward_upsample(reverse_spec, &low_seed, high_shape)
+            .expect("reverse adjoint");
+        for n in 0..2 {
+            for c in 0..2 {
+                for y in 0..3 {
+                    for x in 0..5 {
+                        let want = if y < 2 && x < 4 {
+                            0.25 * low_seed.get(n, c, y / 2, x / 2)
+                        } else {
+                            0.0
+                        };
+                        assert_eq!(
+                            high_gradient.get(n, c, y, x),
+                            want,
+                            "reverse adjoint extent mismatch at (n={n}, c={c}, y={y}, x={x})"
+                        );
                     }
                 }
             }
