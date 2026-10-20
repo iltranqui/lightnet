@@ -8529,6 +8529,7 @@ where
                 | LayerKind::LayaMarkerGather(_)
                 | LayerKind::Sam(_)
                 | LayerKind::Region(_)
+                | LayerKind::ChannelSlice(_)
                 | LayerKind::ChannelShuffle(_)
                 | LayerKind::Reorg(_)
                 | LayerKind::Softmax { .. }
@@ -8810,6 +8811,28 @@ where
                         launch_config,
                     )
                     .map_err(|err| backend_error("f16 sam", err))?
+                }
+                (LayerKind::ChannelSlice(spec), LayerParams::None) => {
+                    let source_index = resolve_relative_layer(layer.index, spec.from)?;
+                    let source = gpu_layer_outputs
+                        .get(source_index)
+                        .and_then(Option::as_ref)
+                        .ok_or(Error::InvalidRoute {
+                            layer_index: layer.index,
+                            reference: spec.from,
+                        })?;
+                    let source_channels = self.network.layers[source_index].output_shape.channels;
+                    self.backend
+                        .route_concat_f16(
+                            &[source],
+                            &[spec.start],
+                            &[spec.end - spec.start],
+                            &[source_channels],
+                            &tensor_backend_shape(layer.output_shape),
+                            layer.output_shape.width * layer.output_shape.height,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("f16 channel_slice", err))?
                 }
                 (LayerKind::Softmax { groups }, LayerParams::None) => self
                     .backend

@@ -148,6 +148,14 @@ fn channel_shuffle_f16_inference_matches_f32() {
 }
 
 #[test]
+fn channel_slice_f16_inference_matches_f32() {
+    let cfg = "[net]\nwidth=3\nheight=2\nchannels=4\nbatch=2\n\
+        [convolutional]\nfilters=4\nsize=1\nactivation=linear\n\
+        [channel_slice]\nfrom=0\nstart=1\nend=3\n";
+    run_pair("channel_slice f16", network(cfg), 59, 0.7, 4e-3);
+}
+
+#[test]
 fn softmax_f16_inference_matches_f32_for_multiple_group_counts() {
     for groups in [1, 2] {
         let cfg = format!(
