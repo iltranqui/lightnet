@@ -209,7 +209,81 @@ fn foveation_film_native_forward_backward_uses_host_hf_source_cache() {
         .expect("CPU backward");
     gpu.zero_train_buffers_gpu().expect("initialize GPU train buffers");
     gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
-        .expect("HF/FiLM backward host fallback");
+        .expect("native FiLM and host HF backward");
+    cpu.update_weights(0.001, 0.0, 0.0, 1);
+    gpu.update_weights_gpu(0.001, 0.0, 0.0, 1)
+        .expect("hybrid SGD update");
+    for (index, (expected, actual)) in cpu.params.iter().zip(&gpu.params).enumerate() {
+        match (expected, actual) {
+            (LayerParams::Convolutional(expected), LayerParams::Convolutional(actual)) => {
+                close("FoveationFilm upstream SGD weights", &expected.weights, &actual.weights, 2e-4);
+                close("FoveationFilm upstream SGD biases", &expected.biases, &actual.biases, 2e-4);
+            }
+            (LayerParams::HyperbolicFoveation(expected), LayerParams::HyperbolicFoveation(actual)) => {
+                close("FoveationFilm HF SGD params", &expected.hf_params, &actual.hf_params, 2e-5);
+                close("FoveationFilm HF SGD predictor", &expected.pred_b2, &actual.pred_b2, 2e-5);
+            }
+            (LayerParams::FoveationFilm(expected), LayerParams::FoveationFilm(actual)) => {
+                close("FoveationFilm SGD embedding", &expected.w_embed, &actual.w_embed, 2e-5);
+                close("FoveationFilm SGD gamma", &expected.w_gamma, &actual.w_gamma, 2e-5);
+                close("FoveationFilm SGD beta", &expected.w_beta, &actual.w_beta, 2e-5);
+            }
+            _ => panic!("FoveationFilm runtime parameter variant mismatch at layer {index}"),
+        }
+    }
+}
+
+#[test]
+fn foveation_film_runtime_adam_updates_match_cpu() {
+    let net = network(
+        "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=2\nadam=1\n\
+         [hf]\nparams=fixed\ninit_cx=0.05\ninit_cy=-0.04\ninit_radius=0.8\ninit_strength=0.3\n\
+         [foveation_film]\nembed_dim=2\nfilm_init_scale=0.25\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let mut gpu = GpuExecutableNetwork::new(
+        net.clone(),
+        OxideBackend::new().expect("oxide backend"),
+    );
+    gpu.params = cpu.params.clone();
+    let input = patterned(net.net.input_shape());
+    let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
+    let gpu_forward = gpu
+        .forward_training_with_state(&input)
+        .expect("native FiLM Adam forward");
+    for (expected, actual) in cpu_forward
+        .layer_outputs
+        .iter()
+        .zip(&gpu_forward.cpu_forward.layer_outputs)
+    {
+        close("FoveationFilm Adam output", &expected.data, &actual.data, 2e-5);
+    }
+    let seed = Tensor::from_data(net.layers[1].output_shape, vec![0.6; 12]).unwrap();
+    let mut seeds = vec![None; net.layers.len()];
+    seeds[1] = Some(seed);
+    cpu.zero_train_buffers();
+    cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+        .expect("CPU Adam backward");
+    gpu.zero_train_buffers_gpu().expect("initialize Adam buffers");
+    gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+        .expect("native Adam backward");
+    cpu.update_weights_adam(0.005, 1).unwrap();
+    gpu.update_weights_gpu(0.005, 0.0, net.net.decay, 1)
+        .expect("hybrid Adam update");
+    let (LayerParams::HyperbolicFoveation(cpu_hf), LayerParams::HyperbolicFoveation(gpu_hf)) =
+        (&cpu.params[0], &gpu.params[0])
+    else {
+        panic!("expected fixed HF parameter variants");
+    };
+    let (LayerParams::FoveationFilm(cpu_film), LayerParams::FoveationFilm(gpu_film)) =
+        (&cpu.params[1], &gpu.params[1])
+    else {
+        panic!("expected FiLM parameter variants");
+    };
+    close("FoveationFilm Adam HF", &cpu_hf.hf_params, &gpu_hf.hf_params, 2e-5);
+    close("FoveationFilm Adam embedding", &cpu_film.w_embed, &gpu_film.w_embed, 2e-5);
+    close("FoveationFilm Adam gamma", &cpu_film.w_gamma, &gpu_film.w_gamma, 2e-5);
+    close("FoveationFilm Adam beta", &cpu_film.w_beta, &gpu_film.w_beta, 2e-5);
 }
 
 #[test]

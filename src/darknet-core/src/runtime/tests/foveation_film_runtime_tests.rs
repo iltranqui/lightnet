@@ -521,10 +521,66 @@ fn foveation_film_sgd_adamw_muon_and_gpu_boundary() {
             "hybrid backward train buffers at layer {layer_index}"
         );
     }
+    cpu.update_weights(0.01, 0.0, 0.0, 1);
+    gpu.update_weights_gpu(0.01, 0.0, 0.0, 1)
+        .expect("host SGD updates for HF/FiLM");
+    assert_eq!(cpu.params, gpu.params);
+
+    let adam_network = build_film_network(
+        "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=1\nadam=1\n",
+        "[hf]\nparams=fixed\n[foveation_film]\nembed_dim=2\n",
+    );
+    let mut adam_cpu = ExecutableNetwork::new(adam_network.clone());
+    let adam_input = Tensor::zeros(adam_network.net.input_shape());
+    let adam_cpu_forward = adam_cpu
+        .forward_training(&adam_input)
+        .expect("Adam CPU forward");
+    let mut adam_gpu = GpuExecutableNetwork::new(adam_network.clone(), FakeBackend);
+    adam_gpu.params = adam_cpu.params.clone();
+    let adam_state = adam_gpu
+        .forward_training_with_state(&adam_input)
+        .expect("Adam hybrid GPU forward");
+    let adam_seed = Tensor::filled(adam_network.layers[1].output_shape, 1.0);
+    let mut adam_seeds = vec![None; adam_network.layers.len()];
+    adam_seeds[1] = Some(adam_seed);
+    adam_cpu.zero_train_buffers();
+    adam_cpu
+        .backward_accumulate_seeded(&adam_input, &adam_cpu_forward, &adam_seeds)
+        .expect("Adam CPU backward");
+    adam_gpu
+        .zero_train_buffers_gpu()
+        .expect("initialize Adam hybrid buffers");
+    adam_gpu
+        .backward_accumulate_seeded_gpu(&adam_state, &adam_seeds)
+        .expect("Adam hybrid backward");
+    for layer_index in 0..adam_network.layers.len() {
+        assert_eq!(
+            adam_cpu.train_buffers[layer_index],
+            adam_gpu.cpu_fallback_train_buffers.borrow()[layer_index],
+            "Adam hybrid backward train buffers at layer {layer_index}"
+        );
+    }
+    adam_cpu.update_weights_adam(0.01, 1).unwrap();
+    adam_gpu
+        .update_weights_gpu(0.01, 0.0, adam_network.net.decay, 1)
+        .expect("host Adam updates for HF/FiLM");
+    assert_eq!(
+        adam_cpu.host_adam_state,
+        *adam_gpu.host_adam_state.borrow(),
+        "hybrid host Adam state"
+    );
+    assert_eq!(adam_cpu.params, adam_gpu.params);
+
+    let muon_gpu_network = build_film_network(
+        "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=1\nmuon=1\ndecoupled_decay=1\n",
+        "[hf]\nparams=fixed\n[foveation_film]\nembed_dim=2\n",
+    );
+    let mut muon_gpu = GpuExecutableNetwork::new(muon_gpu_network, FakeBackend);
     assert!(
-        gpu.update_weights_gpu(0.01, 0.0, 0.0, 1)
+        muon_gpu
+            .update_weights_gpu(0.01, 0.0, 0.0, 1)
             .unwrap_err()
             .to_string()
-            .contains("GPU optimizer updates is not implemented in Stage-1 CPU support")
+            .contains("GPU Muon updates are unsupported")
     );
 }

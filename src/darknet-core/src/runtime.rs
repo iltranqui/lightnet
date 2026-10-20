@@ -10426,7 +10426,8 @@ where
     }
 
     /// One optimizer step over device convolutions, EML SGD, and MoE SGD/Adam,
-    /// including BN scales. EML Adam and other fallback layers remain host-side.
+    /// including BN scales. EML Adam, HyperbolicFoveation, and FoveationFilm
+    /// parameters are updated through their host fallback buffers.
     /// The optimizer follows `[net]`: SGD with
     /// momentum by default, Adam with `adam=1` (`B1`/`B2`/`eps`, coupled L2
     /// decay like C++, or AdamW with `decoupled_decay=1`; `lr`/`decay`/`batch`
@@ -11124,7 +11125,28 @@ where
         batch: usize,
         sync_host_weights: bool,
     ) -> Result<()> {
-        reject_gpu_hyperbolic_foveation(&self.network, "optimizer updates")?;
+        if let Some(layer) = self.network.layers.iter().find(|layer| {
+            matches!(
+                layer.kind,
+                LayerKind::DepthAnything(_) | LayerKind::DptHead(_) | LayerKind::Yolo3d(_)
+            )
+        }) {
+            return Err(Error::UnsupportedLayer {
+                layer_index: layer.index,
+                name: "GPU optimizer updates are unsupported for this layer".to_owned(),
+            });
+        }
+        if self.network.net.muon
+            && let Some(layer) = self.network.layers.iter().find(|layer| {
+                matches!(layer.kind, LayerKind::HyperbolicFoveation(_) | LayerKind::FoveationFilm(_))
+            })
+        {
+            return Err(Error::UnsupportedLayer {
+                layer_index: layer.index,
+                name: "GPU Muon updates are unsupported for [hyperbolic_foveation]/[foveation_film]"
+                    .to_owned(),
+            });
+        }
         if self.network.net.muon {
             if !sync_host_weights {
                 return Err(Error::InvalidConfig(
@@ -11207,6 +11229,8 @@ where
                         | LayerParams::Rnn(_)
                         | LayerParams::Lstm(_)
                         | LayerParams::Crnn(_)
+                        | LayerParams::HyperbolicFoveation(_)
+                        | LayerParams::FoveationFilm(_)
                         | LayerParams::EmlConvolutional(_)
                         | LayerParams::Dcnv4(_)
                         | LayerParams::DeformConv(_)
@@ -11214,7 +11238,7 @@ where
                 )
             }) {
                 return Err(Error::InvalidConfig(
-                    "adam=1 on the GPU path supports convolutional, connected, local, shortcut, deform_conv, DCNv4, MoE, standalone batchnorm, ViT, Swin, Tucker attention, MambaVision, Kimi KDA, GraphConv, and GRU/RNN/LSTM/CRNN layers"
+                    "adam=1 on the GPU path supports convolutional, connected, local, shortcut, deform_conv, DCNv4, MoE, standalone batchnorm, ViT, Swin, Tucker attention, MambaVision, Kimi KDA, GraphConv, GRU/RNN/LSTM/CRNN, and host-updated HF/FiLM layers"
                         .to_string(),
                 ));
             }
@@ -11503,9 +11527,8 @@ where
         Ok(())
     }
 
-    /// Adam step for host-resident parameters, including recurrent and MoE
-    /// sub-blocks. Device convolutions are handled by the main loop; unsupported
-    /// host parameter families are rejected.
+    /// Adam step for host-resident parameters, including recurrent, MoE, and
+    /// HF/FiLM parameter blocks. Device convolutions are handled by the main loop.
     fn update_cpu_fallback_adam(
         &mut self,
         adam: &AdamParams,
@@ -11540,6 +11563,19 @@ where
             };
             let adam = &layer_adam;
             match (&mut self.params[index], &mut buffers[index]) {
+                (params @ LayerParams::HyperbolicFoveation(_), train @ LayerTrainBuffers::HyperbolicFoveation(_))
+                | (params @ LayerParams::FoveationFilm(_), train @ LayerTrainBuffers::FoveationFilm(_)) => {
+                    let moments =
+                        moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    apply_host_adam_layer(
+                        &layer.kind,
+                        layer.input_shape,
+                        params,
+                        train,
+                        moments,
+                        adam,
+                    )?;
+                }
                 (LayerParams::BatchNorm(params), LayerTrainBuffers::BatchNorm(train)) => {
                     let moments =
                         moments_all[index].get_or_insert_with(HostAdamLayerState::default);
@@ -12055,6 +12091,31 @@ where
                 continue;
             }
             match (params, train) {
+                (
+                    LayerParams::HyperbolicFoveation(params),
+                    LayerTrainBuffers::HyperbolicFoveation(train),
+                ) => {
+                    let LayerKind::HyperbolicFoveation(spec) = &layer.kind else {
+                        unreachable!("hyperbolic-foveation train buffers match layer kind")
+                    };
+                    update_hyperbolic_foveation_sgd(
+                        spec,
+                        params,
+                        train,
+                        lr * layer.train.learning_rate_scale,
+                        momentum,
+                        batch,
+                    );
+                }
+                (LayerParams::FoveationFilm(params), LayerTrainBuffers::FoveationFilm(train)) => {
+                    update_foveation_film_sgd(
+                        params,
+                        train,
+                        lr * layer.train.learning_rate_scale,
+                        momentum,
+                        batch,
+                    );
+                }
                 (LayerParams::BatchNorm(params), LayerTrainBuffers::BatchNorm(train)) => {
                     update_batchnorm_params(params, train, lr, momentum, batch);
                 }
