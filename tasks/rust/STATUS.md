@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.138: strengthened anisotropic Newton Adam runtime parity to use learned HF parameters and compare every predictor parameter block across two updates. Actual-Oxide test passes; see `implemented.md` §174.
 - v0.2.137: native Oxide predictor plus fixed-point/Newton inverse grids now support isotropic and anisotropic HF forward. Anisotropic learned-HF SGD, anisotropic Newton Adam, primitive parity, and 12 focused host tests pass. HF adjoints and direct runtime input-gradient inspection remain open. See `implemented.md` §173.
 - v0.2.136: native isotropic Newton inverse-grid generation is integrated; actual-Oxide Adam runtime parity and primitive parity pass. Anisotropic modes and HF backward remain incomplete. See `implemented.md` §172.
 - v0.2.135: native HF predictor pooling/MLP/constraints now run for isotropic fixed-point GPU runtime; learned-HF two-step actual-device parity and 4 primitive tests pass. Other predictor/grid modes and HF backward remain host-side. See `implemented.md` §171.

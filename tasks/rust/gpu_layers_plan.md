@@ -119,8 +119,8 @@ Bounded native slice:
    anisotropic fixed-point runtime (v0.2.135, v0.2.137); learned-HF actual-device
    two-step SGD parity passes.
 10. [x] Add native isotropic and anisotropic Newton inverse-grid generation and
-    runtime dispatch (v0.2.136, v0.2.137); actual-Oxide Adam parity and
-    primitive CPU-formula parity pass. The downloaded grid is retained for host
+    runtime dispatch (v0.2.136, v0.2.137); actual-Oxide learned-anisotropic
+    Adam parity (v0.2.138) and primitive CPU-formula parity pass. The downloaded grid is retained for host
     HF backward.
 11. [ ] Implement native warp adjoints and inspect runtime input gradients;
     preserve explicit host boundaries until verified. Actual-Oxide gates cover
@@ -144,7 +144,8 @@ buffers against CPU after actual-Oxide backward. v0.2.133 adds native Oxide bili
 inverse-grid generation; v0.2.135 adds the predictor MLP; v0.2.136 adds Newton
 inversion; v0.2.137 extends both grid methods and learned predictors to
 anisotropic radii. Actual-Oxide runtime tests cover learned anisotropic
-fixed-point SGD and fixed-parameter anisotropic Newton Adam. HF backward remains
+fixed-point SGD and learned anisotropic Newton Adam, comparing predictor and
+FiLM parameter updates over two steps. HF backward remains
 host-managed. Direct input-gradient parity and native warp adjoints remain open.
 
 This remains an open plan, not evidence of a complete native layer. Native HF
