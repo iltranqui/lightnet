@@ -8536,6 +8536,7 @@ where
                 | LayerKind::Softmax { .. }
                 | LayerKind::ScaleChannels(_)
                 | LayerKind::Dropout { .. }
+                | LayerKind::Cost { .. }
                 | LayerKind::Upsample(_)
                 | LayerKind::Yolo(_)
                 | LayerKind::ObbYolo(_)
@@ -8941,8 +8942,9 @@ where
                         launch_config,
                     )
                     .map_err(|err| backend_error("f16 Region forward", err))?,
-                (LayerKind::Dropout { .. }, LayerParams::None) => current_input
-                    .expect("dropout requires current input")
+                (LayerKind::Dropout { .. }, LayerParams::None)
+                | (LayerKind::Cost { .. }, LayerParams::None) => current_input
+                    .expect("identity layer requires current input")
                     .clone(),
                 (LayerKind::ChannelShuffle(spec), LayerParams::None) => self
                     .backend

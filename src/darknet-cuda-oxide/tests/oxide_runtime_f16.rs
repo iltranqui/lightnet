@@ -60,6 +60,27 @@ fn fill(net: &Network, params: &mut [LayerParams], seed: u64, gain: f32) {
                     }
                 }
             }
+            LayerParams::Connected(connected) => {
+                let fan_in = (connected.weights.len() / connected.biases.len().max(1)).max(1);
+                let a = gain * (6.0 / fan_in as f32).sqrt();
+                for weight in &mut connected.weights {
+                    *weight = rng.range(-a, a);
+                }
+                for bias in &mut connected.biases {
+                    *bias = rng.range(-0.1, 0.1);
+                }
+                if let Some(bn) = &mut connected.batch_norm {
+                    for value in &mut bn.scales {
+                        *value = rng.range(0.8, 1.2);
+                    }
+                    for value in &mut bn.rolling_mean {
+                        *value = rng.range(-0.2, 0.2);
+                    }
+                    for value in &mut bn.rolling_variance {
+                        *value = rng.range(0.5, 1.5);
+                    }
+                }
+            }
             LayerParams::BatchNorm(bn) => {
                 for v in &mut bn.scales {
                     *v = rng.range(0.5, 1.5);
@@ -390,7 +411,7 @@ fn real_cfgs_f16_matches_f32() {
     run_pair("yolov4-tiny", real_cfg("yolov4-tiny.cfg", 128, None), 12, 1.0, 5e-3);
     // yolov3: 23 shortcuts, upsample, 3 heads, 75 convolutions.
     run_pair("yolov3", real_cfg("yolov3.cfg", 128, None), 13, 0.5, 5e-3);
-    // resnet101 up to and including the global avgpool: 33 shortcuts, 4 of them
-    // with a resized (zero-padded) source, BN everywhere.
-    run_pair("resnet101 (to avgpool)", real_cfg("resnet101.cfg", 64, Some("[avgpool]")), 14, 0.6, 5e-3);
+    // Full resnet101 exercises connected's flattened-NCHW f16 path after the
+    // global avgpool, with 33 shortcuts and BN throughout the convolutional stem.
+    run_pair("resnet101", real_cfg("resnet101.cfg", 64, None), 14, 0.6, 5e-3);
 }
