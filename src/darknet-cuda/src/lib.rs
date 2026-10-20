@@ -2164,6 +2164,72 @@ pub trait F32TensorOpsBackend {
         self.upload_f32(shape, &output)
     }
 
+    /// Compute input and shared-grid adjoints for the NCHW HF bilinear warp.
+    fn hyperbolic_foveation_warp_backward_f32(
+        &self,
+        input: &Self::Tensor,
+        grid: &Self::Tensor,
+        output_gradient: &Self::Tensor,
+        shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        assert_eq!(shape.len(), 4, "HF warp backward expects NCHW shape");
+        let [batch, channels, height, width] = [shape[0], shape[1], shape[2], shape[3]];
+        let input = self.download_f32(input)?;
+        let grid = self.download_f32(grid)?;
+        let output_gradient = self.download_f32(output_gradient)?;
+        let spatial = height * width;
+        assert_eq!(input.len(), batch * channels * spatial, "HF warp input length");
+        assert_eq!(output_gradient.len(), input.len(), "HF warp output-gradient length");
+        assert_eq!(grid.len(), batch * spatial * 2, "HF warp grid length");
+        let mut input_gradient = vec![0.0; input.len()];
+        let mut grid_gradient = vec![0.0; grid.len()];
+        for b in 0..batch {
+            for y in 0..height {
+                for x in 0..width {
+                    let pixel = y * width + x;
+                    let gi = (b * spatial + pixel) * 2;
+                    let sx = grid[gi];
+                    let sy = grid[gi + 1];
+                    let x0 = sx.floor() as isize;
+                    let y0 = sy.floor() as isize;
+                    let fx = sx - x0 as f32;
+                    let fy = sy - y0 as f32;
+                    for c in 0..channels {
+                        let base = (b * channels + c) * spatial;
+                        let seed = output_gradient[base + pixel];
+                        let value = |row: isize, col: isize| -> f32 {
+                            if row >= 0 && row < height as isize && col >= 0 && col < width as isize {
+                                input[base + row as usize * width + col as usize]
+                            } else { 0.0 }
+                        };
+                        let v00 = value(y0, x0);
+                        let v01 = value(y0, x0 + 1);
+                        let v10 = value(y0 + 1, x0);
+                        let v11 = value(y0 + 1, x0 + 1);
+                        grid_gradient[gi] += seed * ((1.0 - fy) * (v01 - v00) + fy * (v11 - v10));
+                        grid_gradient[gi + 1] += seed * ((1.0 - fx) * (v10 - v00) + fx * (v11 - v01));
+                        for (row, col, weight) in [
+                            (y0, x0, (1.0 - fy) * (1.0 - fx)),
+                            (y0, x0 + 1, (1.0 - fy) * fx),
+                            (y0 + 1, x0, fy * (1.0 - fx)),
+                            (y0 + 1, x0 + 1, fy * fx),
+                        ] {
+                            if row >= 0 && row < height as isize && col >= 0 && col < width as isize {
+                                input_gradient[base + row as usize * width + col as usize] += seed * weight;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok((
+            self.upload_f32(shape, &input_gradient)?,
+            self.upload_f32(&[batch, height, width, 2], &grid_gradient)?,
+        ))
+    }
+
     /// Bilinearly sample an NCHW tensor using one source coordinate pair per
     /// batch/output pixel. `input_scales` contains one affine scale per batch,
     /// and `input_offsets` one affine offset per batch/channel. Saturation and

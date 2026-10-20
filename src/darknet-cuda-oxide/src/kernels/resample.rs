@@ -592,6 +592,97 @@ pub mod kernels {
         }
     }
 
+    #[device]
+    fn hyperbolic_sample_zero(x: &[f32], base: usize, height: usize, width: usize, y: i64, col: i64) -> f32 {
+        if y >= 0 && y < height as i64 && col >= 0 && col < width as i64 {
+            x[base + y as usize * width + col as usize]
+        } else {
+            0.0
+        }
+    }
+
+    /// Scatter the bilinear warp adjoint into the NCHW input tensor.
+    #[kernel]
+    pub fn hyperbolic_warp_backward_input(
+        grid: &[f32],
+        dy: &[f32],
+        dx: *mut f32,
+        channels: usize,
+        height: usize,
+        width: usize,
+    ) {
+        let i = thread::index_1d().get();
+        if i >= dy.len() { return; }
+        let spatial = height * width;
+        let batch = i / (channels * spatial);
+        let channel = (i / spatial) % channels;
+        let pixel = i % spatial;
+        let grid_index = (batch * spatial + pixel) * 2;
+        let sx = grid[grid_index];
+        let sy = grid[grid_index + 1];
+        let ix = floor_i64(sx);
+        let iy = floor_i64(sy);
+        let fx = sx - ix as f32;
+        let fy = sy - iy as f32;
+        let input_base = (batch * channels + channel) * spatial;
+        let seed = dy[i];
+        let mut tap = 0usize;
+        while tap < 4 {
+            let tx = ix + (tap & 1) as i64;
+            let ty = iy + (tap >> 1) as i64;
+            if tx >= 0 && tx < width as i64 && ty >= 0 && ty < height as i64 {
+                let wx = if tap & 1 == 1 { fx } else { 1.0 - fx };
+                let wy = if tap >> 1 == 1 { fy } else { 1.0 - fy };
+                unsafe { atomic_add_f32(dx.add(input_base + ty as usize * width + tx as usize), seed * wy * wx); }
+            }
+            tap += 1;
+        }
+    }
+
+    /// Reduce channel contributions to the shared `(x, y)` grid adjoint.
+    #[kernel]
+    pub fn hyperbolic_warp_backward_grid(
+        x: &[f32],
+        grid: &[f32],
+        dy: &[f32],
+        mut dgrid: DisjointSlice<f32>,
+        channels: usize,
+        height: usize,
+        width: usize,
+    ) {
+        let scalar = thread::index_1d().get();
+        let pixel = scalar / 2;
+        let spatial = height * width;
+        if pixel >= grid.len() / 2 { return; }
+        let component = scalar % 2;
+        let batch = pixel / spatial;
+        let position = pixel % spatial;
+        let grid_index = pixel * 2;
+        let sx = grid[grid_index];
+        let sy = grid[grid_index + 1];
+        let ix = floor_i64(sx);
+        let iy = floor_i64(sy);
+        let fx = sx - ix as f32;
+        let fy = sy - iy as f32;
+        let mut grad_x = 0.0f32;
+        let mut grad_y = 0.0f32;
+        let mut channel = 0usize;
+        while channel < channels {
+            let base = (batch * channels + channel) * spatial;
+            let v00 = hyperbolic_sample_zero(x, base, height, width, iy, ix);
+            let v01 = hyperbolic_sample_zero(x, base, height, width, iy, ix + 1);
+            let v10 = hyperbolic_sample_zero(x, base, height, width, iy + 1, ix);
+            let v11 = hyperbolic_sample_zero(x, base, height, width, iy + 1, ix + 1);
+            let seed = dy[base + position];
+            grad_x += seed * ((1.0 - fy) * (v01 - v00) + fy * (v11 - v10));
+            grad_y += seed * ((1.0 - fx) * (v10 - v00) + fx * (v11 - v01));
+            channel += 1;
+        }
+        if let Some(out) = dgrid.get_mut(thread::index_1d()) {
+            *out = if component == 0 { grad_x } else { grad_y };
+        }
+    }
+
     #[kernel]
     pub fn crop_bilinear_backward(
         dy: &[f32],

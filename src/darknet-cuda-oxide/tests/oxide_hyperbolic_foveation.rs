@@ -36,6 +36,98 @@ fn bilinear_warp_reference(input: &[f32], grid: &[f32], shape: [usize; 4]) -> Ve
     output
 }
 
+fn warp_backward_reference(
+    input: &[f32], grid: &[f32], seed: &[f32], shape: [usize; 4],
+) -> (Vec<f32>, Vec<f32>) {
+    let [batch, channels, height, width] = shape;
+    let spatial = height * width;
+    let mut dx = vec![0.0; input.len()];
+    let mut dg = vec![0.0; grid.len()];
+    for b in 0..batch {
+        for p in 0..spatial {
+            let gi = (b * spatial + p) * 2;
+            let x = grid[gi];
+            let y = grid[gi + 1];
+            let x0 = x.floor() as isize;
+            let y0 = y.floor() as isize;
+            let fx = x - x0 as f32;
+            let fy = y - y0 as f32;
+            for c in 0..channels {
+                let base = (b * channels + c) * spatial;
+                let at = |r: isize, col: isize| {
+                    if r >= 0 && r < height as isize && col >= 0 && col < width as isize {
+                        input[base + r as usize * width + col as usize]
+                    } else { 0.0 }
+                };
+                let (a, b, c, d) = (at(y0, x0), at(y0, x0 + 1), at(y0 + 1, x0), at(y0 + 1, x0 + 1));
+                let g = seed[base + p];
+                dg[gi] += g * ((1.0 - fy) * (b - a) + fy * (d - c));
+                dg[gi + 1] += g * ((1.0 - fx) * (c - a) + fx * (d - b));
+                for (r, col, w) in [
+                    (y0, x0, (1.0 - fy) * (1.0 - fx)),
+                    (y0, x0 + 1, (1.0 - fy) * fx),
+                    (y0 + 1, x0, fy * (1.0 - fx)),
+                    (y0 + 1, x0 + 1, fy * fx),
+                ] {
+                    if r >= 0 && r < height as isize && col >= 0 && col < width as isize {
+                        dx[base + r as usize * width + col as usize] += g * w;
+                    }
+                }
+            }
+        }
+    }
+    (dx, dg)
+}
+
+#[test]
+fn hyperbolic_foveation_native_warp_backward_matches_reference() {
+    let backend = OxideBackend::new().expect("Oxide backend");
+    let shape = [1, 2, 3, 4];
+    let input: Vec<f32> = (0..24).map(|i| (i as f32 * 0.31).sin()).collect();
+    let grid = vec![
+        -0.35, 0.25, 0.4, 0.3, 1.45, 0.4, 3.25, 0.2,
+        0.2, 1.3, 1.4, 1.45, 2.3, 1.25, 3.2, 2.35,
+        -0.2, 2.3, 0.65, 2.4, 1.6, 2.3, 3.4, 2.2,
+    ];
+    let seed: Vec<f32> = (0..24).map(|i| (i as f32 * 0.23).cos()).collect();
+    let input_gpu = backend.upload_f32(&shape, &input).unwrap();
+    let grid_gpu = backend.upload_f32(&[1, 3, 4, 2], &grid).unwrap();
+    let seed_gpu = backend.upload_f32(&shape, &seed).unwrap();
+    let (dx_gpu, dg_gpu) = backend.hyperbolic_foveation_warp_backward_f32(
+        &input_gpu, &grid_gpu, &seed_gpu, &shape, ElementwiseLaunchConfig::default(),
+    ).unwrap();
+    let (expected_dx, expected_dg) = warp_backward_reference(&input, &grid, &seed, shape);
+    let actual_dx = backend.download_f32(&dx_gpu).unwrap();
+    let actual_dg = backend.download_f32(&dg_gpu).unwrap();
+    for (i, (actual, expected)) in actual_dx.iter().zip(&expected_dx).enumerate() {
+        assert!((actual - expected).abs() < 2e-6, "dx[{i}]: {actual} != {expected}");
+    }
+    for (i, (actual, expected)) in actual_dg.iter().zip(&expected_dg).enumerate() {
+        assert!((actual - expected).abs() < 2e-6, "dgrid[{i}]: {actual} != {expected}");
+    }
+    let loss = |input: &[f32], grid: &[f32]| -> f32 {
+        bilinear_warp_reference(input, grid, shape)
+            .iter().zip(&seed).map(|(out, g)| out * g).sum()
+    };
+    let eps = 5.0e-3;
+    for index in [3, 9, 17] {
+        let mut plus = input.clone();
+        let mut minus = input.clone();
+        plus[index] += eps;
+        minus[index] -= eps;
+        let numeric = (loss(&plus, &grid) - loss(&minus, &grid)) / (2.0 * eps);
+        assert!((actual_dx[index] - numeric).abs() < 1e-3, "finite-difference dx[{index}]: {} != {numeric}", actual_dx[index]);
+    }
+    for index in [4, 5, 12, 13] {
+        let mut plus = grid.clone();
+        let mut minus = grid.clone();
+        plus[index] += eps;
+        minus[index] -= eps;
+        let numeric = (loss(&input, &plus) - loss(&input, &minus)) / (2.0 * eps);
+        assert!((actual_dg[index] - numeric).abs() < 1e-3, "finite-difference dgrid[{index}]: {} != {numeric}", actual_dg[index]);
+    }
+}
+
 #[test]
 fn hyperbolic_foveation_native_warp_matches_nchw_reference() {
     let backend = OxideBackend::new().expect("Oxide backend");

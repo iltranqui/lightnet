@@ -16488,10 +16488,34 @@ where
                     };
                     let output_gradient = self.download_tensor(&grad, layer.output_shape)
                         .map_err(|err| backend_error("download HF output gradient", err))?;
+                    let warp_input_gpu = match spec.warp_source {
+                        crate::model::HfWarpSource::Previous if layer.index > 0 => {
+                            forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
+                                Error::InvalidConfig(format!(
+                                    "missing GPU warp source for hyperbolic_foveation layer #{}",
+                                    layer.index
+                                ))
+                            })?
+                        }
+                        _ => &forward.input_gpu,
+                    };
+                    let grid_gpu = self.backend.upload_f32(
+                        &[warp_input.shape.batch, warp_input.shape.height, warp_input.shape.width, 2],
+                        &cache.grid,
+                    ).map_err(|err| backend_error("upload HF backward grid", err))?;
+                    let (native_warp_gradient, _native_grid_gradient) = self.backend
+                        .hyperbolic_foveation_warp_backward_f32(
+                            warp_input_gpu,
+                            &grid_gpu,
+                            &grad,
+                            &tensor_backend_shape(warp_input.shape),
+                            config,
+                        )
+                        .map_err(|err| backend_error("native HF warp backward", err))?;
                     let auxiliary = foveation_hf_auxiliary_gradients
                         .get(layer.index)
                         .and_then(Option::as_deref);
-                    let (warp_gradient, predictor_gradient, param_gradient) =
+                    let (_host_warp_gradient, predictor_gradient, param_gradient) =
                         backward_hyperbolic_foveation(
                             spec, params, warp_input, &output_gradient, cache, auxiliary,
                         )?;
@@ -16512,13 +16536,9 @@ where
                         accumulate_vec(&mut train.pred_b2_updates, &param_gradient.pred_b2)?;
                     }
                     if spec.warp_source == crate::model::HfWarpSource::Previous {
-                        let warp_gradient = self.backend.upload_f32(
-                            &tensor_backend_shape(warp_gradient.shape),
-                            &warp_gradient.data,
-                        ).map_err(|err| backend_error("upload HF warp input gradient", err))?;
                         self.accumulate_previous_gpu_gradient(
                             layer.index,
-                            warp_gradient,
+                            native_warp_gradient,
                             &mut layer_output_gradients,
                         )?;
                     }

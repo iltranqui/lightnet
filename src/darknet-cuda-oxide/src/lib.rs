@@ -6804,6 +6804,56 @@ impl F32TensorOpsBackend for OxideBackend {
         Ok(OxideTensorF32::new(output, shape))
     }
 
+    fn hyperbolic_foveation_warp_backward_f32(
+        &self,
+        input: &Self::Tensor,
+        grid: &Self::Tensor,
+        output_gradient: &Self::Tensor,
+        shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        let input_f = self.f32v(input)?;
+        let input = &*input_f;
+        let grid_f = self.f32v(grid)?;
+        let grid = &*grid_f;
+        let dy_f = self.f32v(output_gradient)?;
+        let dy = &*dy_f;
+        let op = "hyperbolic_foveation_warp_backward_f32";
+        if shape.len() != 4 || shape.contains(&0) {
+            return Err(shape_err(op, format!("expected positive NCHW shape, got {shape:?}")));
+        }
+        let (batch, channels, height, width) = (shape[0], shape[1], shape[2], shape[3]);
+        let input_len = batch.checked_mul(channels).and_then(|n| n.checked_mul(height))
+            .and_then(|n| n.checked_mul(width))
+            .ok_or_else(|| shape_err(op, "input size overflows".to_owned()))?;
+        let grid_len = batch.checked_mul(height).and_then(|n| n.checked_mul(width))
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| shape_err(op, "grid size overflows".to_owned()))?;
+        if input.len() != input_len || dy.len() != input_len || grid.len() != grid_len {
+            return Err(shape_err(op, format!("input/gradient/grid lengths are {}/{}/{}, expected {input_len}/{input_len}/{grid_len}", input.len(), dy.len(), grid.len())));
+        }
+        let input_gradient = self.alloc(input_len)?;
+        let mut grid_gradient = self.alloc_uninit(grid_len)?;
+        // SAFETY: dimensions and lengths are validated; input-gradient atomic
+        // scatters target a zeroed buffer, and grid-gradient scalars have unique owners.
+        unsafe {
+            self.resample.hyperbolic_warp_backward_input(
+                &self.stream, launch::elementwise(input_len, config), &grid.buf, &dy.buf,
+                input_gradient.cu_deviceptr() as *mut f32, channels, height, width,
+            )
+        }.map_err(launch_err)?;
+        unsafe {
+            self.resample.hyperbolic_warp_backward_grid(
+                &self.stream, launch::elementwise(grid_len, config), &input.buf, &grid.buf,
+                &dy.buf, &mut grid_gradient, channels, height, width,
+            )
+        }.map_err(launch_err)?;
+        Ok((
+            OxideTensorF32::new(input_gradient, shape),
+            OxideTensorF32::new(grid_gradient, &[batch, height, width, 2]),
+        ))
+    }
+
     fn crop_bilinear_f32(
         &self,
         x: &Self::Tensor,
