@@ -8501,7 +8501,7 @@ where
     /// Supports convolutional, maxpool, (local) avgpool, standalone batchnorm,
     /// route, LAYA marker gather, SAM, shortcut (mismatched sources are cropped /
     /// zero-padded like Darknet), upsample (also `reverse`), Logistic sigmoid and
-    /// yolo-style pass-through layers;
+    /// OMD loss inference pass-through, and yolo-style pass-through layers;
     /// any other layer returns `UnsupportedLayer` (use `forward_compact`).
     pub fn forward_compact_f16(&self, input: &Tensor) -> Result<GpuForwardSummary> {
         reject_gpu_hyperbolic_foveation(&self.network, "f16 inference")?;
@@ -8539,6 +8539,7 @@ where
                 | LayerKind::Dropout { .. }
                 | LayerKind::Cost { .. }
                 | LayerKind::Logistic
+                | LayerKind::OmdLoss(_)
                 | LayerKind::Upsample(_)
                 | LayerKind::Yolo(_)
                 | LayerKind::ObbYolo(_)
@@ -8965,6 +8966,7 @@ where
                 }
                 (LayerKind::Dropout { .. }, LayerParams::None)
                 | (LayerKind::Cost { .. }, LayerParams::None)
+                | (LayerKind::OmdLoss(_), LayerParams::None)
                 | (LayerKind::Detection(_), LayerParams::None)
                 | (LayerKind::Regression(_), LayerParams::None) => current_input
                     .expect("identity layer requires current input")

@@ -325,6 +325,35 @@ fn logistic_f16_inference_matches_f32() {
 }
 
 #[test]
+fn omd_loss_f16_inference_is_device_identity_and_matches_cpu() {
+    let cfg = "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\n[omd_loss]\n";
+    let net = network(cfg);
+    run_pair("omd_loss f16", net.clone(), 71, 1.0, 2e-3);
+
+    let input = input_for(&net, 71 ^ 0x55);
+    let cpu = ExecutableNetwork::new(net.clone())
+        .forward(&input)
+        .expect("CPU OMD inference reference");
+    let gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("oxide backend"));
+    let f16 = gpu
+        .forward_compact_f16(&input)
+        .expect("f16 OMD inference identity");
+    let cpu_output = &cpu.layer_outputs[0];
+    let f16_output = f16.final_output.as_ref().expect("f16 final output");
+    assert_eq!(cpu_output.shape, f16_output.shape);
+    let scale = max_abs(&cpu_output.data);
+    let diff = cpu_output
+        .data
+        .iter()
+        .zip(&f16_output.data)
+        .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+    assert!(
+        diff <= 2e-3 * scale,
+        "CPU/f16 OMD error {diff} > 2e-3 * {scale}"
+    );
+}
+
+#[test]
 fn unsupported_layers_still_error_cleanly() {
     // Crop training geometry is not part of compact f16 inference.
     let net = network(
