@@ -296,6 +296,12 @@ fn tiny_net_with_avgpool_local_avgpool_batchnorm_reverse_upsample_matches_f32() 
 }
 
 #[test]
+fn logistic_f16_inference_matches_f32() {
+    let cfg = "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\n[logistic]\n";
+    run_pair("logistic f16", network(cfg), 67, 1.0, 2e-3);
+}
+
+#[test]
 fn unsupported_layers_still_error_cleanly() {
     // Crop training geometry is not part of compact f16 inference.
     let net = network(

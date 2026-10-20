@@ -8500,7 +8500,8 @@ where
     /// bias and activation), the yolo heads are widened to f32 on download.
     /// Supports convolutional, maxpool, (local) avgpool, standalone batchnorm,
     /// route, LAYA marker gather, SAM, shortcut (mismatched sources are cropped /
-    /// zero-padded like Darknet), upsample (also `reverse`) and yolo-style pass-through layers;
+    /// zero-padded like Darknet), upsample (also `reverse`), Logistic sigmoid and
+    /// yolo-style pass-through layers;
     /// any other layer returns `UnsupportedLayer` (use `forward_compact`).
     pub fn forward_compact_f16(&self, input: &Tensor) -> Result<GpuForwardSummary> {
         reject_gpu_hyperbolic_foveation(&self.network, "f16 inference")?;
@@ -8537,6 +8538,7 @@ where
                 | LayerKind::ScaleChannels(_)
                 | LayerKind::Dropout { .. }
                 | LayerKind::Cost { .. }
+                | LayerKind::Logistic
                 | LayerKind::Upsample(_)
                 | LayerKind::Yolo(_)
                 | LayerKind::ObbYolo(_)
@@ -8944,6 +8946,23 @@ where
                         launch_config,
                     )
                     .map_err(|err| backend_error("f16 Region forward", err))?,
+                (LayerKind::Logistic, LayerParams::None) => {
+                    let bias = self
+                        .backend
+                        .upload_f32(&[1], &[0.0])
+                        .map_err(|err| backend_error("upload logistic f16 bias", err))?;
+                    self.backend
+                        .channel_affine_act_f16(
+                            current_input.expect("logistic requires current input"),
+                            None,
+                            &bias,
+                            1,
+                            layer.input_shape.element_count() / layer.input_shape.batch.max(1),
+                            F32ActivationKind::Logistic,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("f16 logistic", err))?
+                }
                 (LayerKind::Dropout { .. }, LayerParams::None)
                 | (LayerKind::Cost { .. }, LayerParams::None)
                 | (LayerKind::Detection(_), LayerParams::None)
