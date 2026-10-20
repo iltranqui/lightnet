@@ -1152,6 +1152,61 @@ mod tests {
     }
 
     #[test]
+    fn hyperbolic_foveation_axis_layout_keeps_batch_channel_hw_and_grid_xy() {
+        // C++ forward_hyperbolic_foveation_layer builds map_x/map_y as [H,W],
+        // stores grid[(b*H*W + y*W + x)*2 + {x,y}], then remaps each NCHW
+        // channel plane independently with OpenCV. Hand fixture: B=2,C=2,H=2,W=3.
+        let (batch, channels, height, width) = (2, 2, 2, 3);
+        let input: Vec<f32> = (0..batch)
+            .flat_map(|n| {
+                (0..channels).flat_map(move |c| {
+                    (0..height).flat_map(move |y| {
+                        (0..width).map(move |x| (1000 * n + 100 * c + 10 * y + x) as f32)
+                    })
+                })
+            })
+            .collect();
+        let mut grid = vec![0.0; batch * height * width * 2];
+        for n in 0..batch {
+            for y in 0..height {
+                for x in 0..width {
+                    let index = ((n * height + y) * width + x) * 2;
+                    grid[index] = 0.25 + 0.5 * x as f32 + 0.1 * n as f32;
+                    grid[index + 1] = 0.2 + 0.3 * y as f32 + 0.05 * n as f32;
+                }
+            }
+        }
+        let actual = warp_nchw(&input, batch, channels, height, width, &grid).unwrap();
+        let mut expected = Vec::new();
+        for n in 0..batch {
+            for c in 0..channels {
+                for y in 0..height {
+                    for x in 0..width {
+                        let index = ((n * height + y) * width + x) * 2;
+                        let src_x = grid[index];
+                        let src_y = grid[index + 1];
+                        expected.push(1000.0 * n as f32 + 100.0 * c as f32 + 10.0 * src_y + src_x);
+                    }
+                }
+            }
+        }
+        for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).abs() < 2e-4,
+                "NCHW/grid XY axis at flat {index}: {actual} != {expected}"
+            );
+        }
+        let n1_c0_y1_x2 = ((1 * channels) * height + 1) * width + 2;
+        assert!(
+            (actual[n1_c0_y1_x2] - 1006.85).abs() < 2e-5,
+            "batch/channel/HW probe must sample x=1.35,y=0.55, not swapped x/y"
+        );
+        assert_ne!(batch, 1);
+        assert_ne!(width, height);
+        assert_ne!(channels, height * width);
+    }
+
+    #[test]
     fn phi_jacobian_matches_coordinate_finite_differences() {
         let params = isotropic_params(0.35);
         let point = [0.28, 0.17];
