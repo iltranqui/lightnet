@@ -214,6 +214,7 @@ file is named inline.
 - [186. HF axis fixture matches OpenCV interpolation taps](#186-hf-axis-fixture-matches-opencv-interpolation-taps)
 - [187. Logistic NCHW/batch axis pin](#187-logistic-nchwbatch-axis-pin)
 - [188. Compact f16 Logistic inference](#188-compact-f16-logistic-inference)
+- [189. Logistic f16 direct CPU-reference parity](#189-logistic-f16-direct-cpu-reference-parity)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2135,6 +2136,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 188. Compact f16 Logistic inference
 
 - v0.2.149 (`pending`): added `[logistic]` to the compact f16 allowlist and dispatches its sigmoid through the native half-storage channel-affine activation kernel with a zero bias. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16 logistic_f16_inference_matches_f32` passed (relative max error `3.592e-4`); the full `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` suite passed all 19 tests. Inference only; f16 training/backward remains unsupported. Rust compact-f32 parity, no compiled-C++ golden.
+
+## 189. Logistic f16 direct CPU-reference parity
+
+- v0.2.150 (`1f77db57`): strengthened `logistic_f16_inference_matches_f32` to compare the actual-Oxide compact f16 result directly with `ExecutableNetwork::forward`, alongside the compact-f32 comparison. Focused verification: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16 logistic_f16_inference_matches_f32` passed. This closes CPU-reference evidence for this inference slice only; no compiled-C++ golden or f16 training/backward claim.
 
 ## Not implemented / open (pointer)
 

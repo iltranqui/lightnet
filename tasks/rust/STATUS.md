@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.150: added direct CPU-reference parity to the Logistic f16 test; focused actual-Oxide test passes. See `implemented.md` §189.
 - v0.2.149: compact f16 inference supports native Logistic sigmoid; the full Oxide f16 suite passed 19 tests. See `implemented.md` §188.
 - v0.1.029: added the Logistic NCHW/batch axis pin; the complete axis filter passes 38 tests. See `implemented.md` §187.
 - v0.1.028: adjusted HF pin sample fractions to align with OpenCV's 1/32 `INTER_LINEAR` lookup table; all 37 axis tests pass. See `implemented.md` §186.
