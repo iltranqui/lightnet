@@ -63,7 +63,8 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
-- v0.2.155: native LayaHead masked-attention primitive with online softmax passes actual-Oxide CPU-formula parity for mixed and all-masked rows; 2 focused tests pass. Runtime composition is not done. See `implemented.md` §194.
+- v0.2.156: LayaHead full and compact f32 forward now compose native Oxide type conditioning, LayerNorm, projections, masked attention, residuals, FFN and layout packing; Actual-Oxide CPU-reference parity passes fixed/input qtype and mask cases. See `implemented.md` §195.
+- v0.2.155: native LayaHead masked-attention primitive with online softmax passes actual-Oxide CPU-formula parity for mixed and all-masked rows; 2 focused tests pass. See `implemented.md` §194.
 - v0.2.154: compact f16 LAYA act-head now uses native Oxide feature extraction, connected layers, and exact-erf GELU; actual-device CPU parity passes and the full 22-test f16 suite is green. Inference only; training and weight-file loading remain open. See `implemented.md` §193.
 - v0.2.153: native channel-major compact f16 JevCe softmax now complements group-major support; both layouts pass CPU parity and the 21-test f16 suite. See `implemented.md` §192.
 - v0.2.152: compact f16 JevCe inference uses native temperature scaling plus group-major softmax; CPU parity and full 21-test f16 suite pass. Channel-major layout was explicitly rejected at this release. See `implemented.md` §191.

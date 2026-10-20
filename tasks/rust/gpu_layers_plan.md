@@ -560,10 +560,10 @@ No performance/compiled-C++ claim without actual measurements/golden evidence.
 
 ## Next slice: native f32 LayaHead inference
 
-`LayaHead` remains a host fallback in `layer-support.md`; CPU reference
-`laya_head::head_forward` is a frozen, two-block transformer head. This slice
-adds only native f32 forward and does not alter backward/update policy or claim
-compiled-C++ parity.
+The CPU reference `laya_head::head_forward` is a frozen, two-block transformer
+head. v0.2.156 composes its full and compact f32 forward from native Oxide
+operations. Frozen backward behavior is unchanged; there is no input gradient
+or optimizer update. No compiled-C++ parity claim is made.
 
 Bounded implementation and acceptance gates:
 
@@ -575,16 +575,14 @@ Bounded implementation and acceptance gates:
    layout. Preserve the Rust reference as the numeric oracle; no compiled-C++
    golden is available. Source audit is recorded in this section.
 2. [x] Add a distinct mask-aware native Oxide attention operation. It keeps online softmax workspace linear in sequence length, skips keys whose mask is `<= 0.5`, and yields zero context for an all-masked row. The actual-device test checks CPU-formula parity and malformed extents (`oxide_laya_head_attention`, 2 tests). Runtime composition remains open.
-3. Compose native type-embedding, LayerNorm, projections, masked attention, residuals, and FFN in a dedicated GPU helper. Validate every weight/shape extent before allocation. Upload weights per call so public host edits remain observable; make no residency/speedup claim.
-4. Wire full and compact f32 forward dispatch. Preserve frozen-weight backward semantics and current CPU backward policy; this slice does not add training or optimizer updates.
-5. Add actual-Oxide layer parity against the Rust CPU reference for multiple heads and two blocks, fixed and input-carried qtype, mixed masks, all-masked rows, and nontrivial weights. Add malformed-shape guards and keep f16 rejected until separately implemented. Run `oxide` focused suites and `runtime::` focused host tests.
-
-The attention-mask contract is the main implementation gate: if the current online kernel cannot represent it with a defensible bounded workspace, stop before runtime dispatch and record the blocker rather than falling back silently.
+3. [x] Compose native type-embedding, LayerNorm, projections, masked attention, residuals, and FFN in `runtime/laya_head_gpu.rs`. Weight and shape extents validate before allocation; weights upload each call so public host edits remain observable. No residency/speedup claim.
+4. [x] Wire full and compact f32 forward dispatch. Preserve frozen-weight backward semantics; this adds no training or optimizer update. The compact path now dispatches native LayaHead instead of falling back through the full host-copy path.
+5. [x] Actual-Oxide parity against the Rust CPU reference covers two heads/two blocks, fixed and input-carried qtype, mixed masks, all-masked rows, nontrivial weights, and malformed weight extents (`oxide_laya_head_forward`: 3 tests). The mask primitive suite has 2 tests; `MEM=3G ./tools/test_host.sh laya_head` passes 9 tests. Compact f16 remains explicitly unsupported. No compiled-C++ golden.
 
 ## Remaining scope
 
-Act-head runtime backward/update/file loading, LayaHead native forward
-(planned above), other LAYA/transformer layers, DCNv4 Adam and excluded-variant
+Act-head runtime backward/update/file loading, other LAYA/transformer layers,
+DCNv4 Adam and excluded-variant
 host fallbacks, deform host fallbacks,
 deconvolution unsupported-activation fallback, CPU-only layer GPU paths and GPU
 Muon remain open. Each layer needs device forward/backward/update tests as

@@ -220,6 +220,7 @@ file is named inline.
 - [192. JevCe channel-major compact f16 inference](#192-jevce-channel-major-compact-f16-inference)
 - [193. LAYA act-head compact f16 inference](#193-laya-act-head-compact-f16-inference)
 - [194. LayaHead masked attention primitive](#194-layahead-masked-attention-primitive)
+- [195. LayaHead native f32 forward](#195-layahead-native-f32-forward)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2165,6 +2166,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 194. LayaHead masked attention primitive
 
 - v0.2.155 (`pending`): added `F32TensorOpsBackend::laya_head_attention_f32` with a native Oxide online-softmax kernel for fused QKV and key-padding masks. Actual-Oxide parity against a direct CPU formula covers mixed masks and all-masked rows; shape-extent rejection passes (`oxide_laya_head_attention`: 2 tests). The `LayaHead` runtime remains host-fallback; type embedding, LayerNorm, projections, residuals, FFN, and runtime dispatch are still open. Source audit: Rust `laya_head::head_forward` and `Jev_laya:src-lib/laya_head_layer.cpp`; no compiled-C++ golden.
+
+## 195. LayaHead native f32 forward
+
+- v0.2.156 (`pending`): composed native Oxide type-embedding/unpack, LayerNorm, QKV/output/FFN projections, mask-aware online attention, residuals, ReLU, and channel-major pack into both full and compact f32 runtime paths. Actual-Oxide output matches the CPU reference for fixed and input-carried qtype, two heads/two blocks, mixed masks and all-masked rows; malformed weight extents reject. `oxide_laya_head_forward`: 3 passed; `oxide_laya_head_attention`: 2 passed; `MEM=3G ./tools/test_host.sh laya_head`: 9 passed. The layer is frozen, so backward remains no-input-gradient/no-update; compact f16 is still rejected. Source-derived Rust-reference parity only; no compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 
