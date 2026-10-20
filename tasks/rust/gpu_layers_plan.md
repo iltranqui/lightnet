@@ -102,12 +102,14 @@ Bounded native slice:
    warp/predictor backward remain explicit host operations. Missing sources
    error. FiLM parameter gradients are accumulated in host train buffers.
 4. [x] Add host-fallback SGD/Adam updates for HF/FiLM runtime train buffers;
-   GPU Muon is explicitly rejected. Actual Oxide one-step SGD/Adam CPU
-   parameter parity passes, with host exact buffer/update parity tests.
-5. [ ] Verify two-step runtime input/parameter/HF-gradient parity and optimizer
-   state/update gates through actual Oxide runtime buffers; cover compact/f16
-   rejection and retain explicit host HF warp/predictor boundaries. No
-   compiled-C++ GPU-parity claim.
+   GPU Muon is explicitly rejected. Two-step actual Oxide SGD/Adam runtime
+   output/parameter parity passes, with host exact buffer/update parity tests.
+5. [x] Add actual-Oxide rejection tests for compact f32, compact f16, and GPU
+   Muon.
+6. [ ] Directly inspect actual runtime input gradients and HF/FiLM train
+   buffers, and test SGD/Adam update gates through Oxide runtime; retain
+   explicit host HF warp/predictor boundaries. No compiled-C++ GPU-parity
+   claim.
 
 v0.2.120 implements native per-sample NCHW affine and exact input/gamma/beta
 adjoints; v0.2.121 composes native HF embedding/ReLU and gamma/beta projections
@@ -117,8 +119,10 @@ host-computed HF parameters and a deliberate CPU backward fallback. Focused
 actual-device runtime output parity and fallback-backward success pass. v0.2.124
 finite-differences every HF/FiLM projection gradient element in the primitive.
 v0.2.125 dispatches native runtime FiLM backward and applies the host HF
-warp/predictor adjoint. v0.2.126 adds host SGD/Adam updates for these parameters;
-GPU Muon remains rejected, and two-step runtime parity is not yet covered.
+warp/predictor adjoint. v0.2.126 adds host SGD/Adam updates for these parameters; v0.2.127 adds
+actual-Oxide two-step output/parameter parity for both optimizers; v0.2.128
+adds actual-Oxide compact f32/f16 and Muon rejection tests. Direct runtime
+gradient-buffer and SGD/Adam gate coverage remains open.
 
 This remains an open plan, not evidence of a complete native layer. Update
 `layer-support.md` to reflect the current hybrid host/device path, but do not

@@ -189,6 +189,7 @@ file is named inline.
 - [161. FoveationFilm projection-adjoint finite differences](#161-foveationfilm-projection-adjoint-finite-differences)
 - [162. FoveationFilm native runtime backward](#162-foveationfilm-native-runtime-backward)
 - [163. FoveationFilm/HF SGD and Adam runtime updates](#163-foveationfilmhf-sgd-and-adam-runtime-updates)
+- [164. FoveationFilm/HF two-step GPU runtime parity](#164-foveationfilmhf-two-step-gpu-runtime-parity)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2010,6 +2011,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 163. FoveationFilm/HF SGD and Adam runtime updates
 
 - v0.2.126 (`fb841ac1`): GPU runtime optimizer updates now route host-resident HyperbolicFoveation and FoveationFilm buffers through existing CPU SGD/Adam implementations; GPU Muon remains explicitly rejected for these layers. Added actual-Oxide single-step CPU parity for hybrid SGD (including upstream native convolution) and Adam (HF/FiLM params), plus FakeBackend exact train-buffer/update parity and Muon rejection. `MEM=3G ./tools/test_host.sh foveation_film` passed 12 tests; focused actual-device `oxide_runtime_chain` SGD and Adam tests each pass. No compiled-C++ golden; two-step native runtime coverage and native HF kernels remain open.
+
+## 164. FoveationFilm/HF two-step GPU runtime parity
+
+- v0.2.127 (`2792f881`): extended actual-Oxide runtime SGD and Adam tests to two complete forward/backward/update cycles each. Outputs are compared after each forward; HF/FiLM and upstream convolution parameter blocks are compared after updates. Both focused runtime tests passed. v0.2.128 (`01b761b5`) adds actual-Oxide rejection tests for compact f32, compact f16, and GPU Muon. Direct actual-runtime input-gradient/train-buffer inspection and SGD/Adam gate coverage remain open. No compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 
