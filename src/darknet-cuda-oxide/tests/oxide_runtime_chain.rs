@@ -487,6 +487,41 @@ fn foveation_film_gpu_adam_burnin_gate_matches_cpu() {
 }
 
 #[test]
+fn foveation_film_gpu_train_only_bn_gate_matches_cpu() {
+    let net = network(
+        "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=1\n\
+         [hf]\nparams=fixed\n\
+         [foveation_film]\nembed_dim=2\ntrain_only_bn=1\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let mut gpu = GpuExecutableNetwork::new(
+        net.clone(),
+        OxideBackend::new().expect("oxide backend"),
+    );
+    gpu.params = cpu.params.clone();
+    let initial_film_params = cpu.params[1].clone();
+    let input = patterned(net.net.input_shape());
+    let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
+    let gpu_forward = gpu
+        .forward_training_with_state(&input)
+        .expect("native FiLM forward");
+    let seed = Tensor::from_data(net.layers[1].output_shape, vec![0.8; 6]).unwrap();
+    let mut seeds = vec![None; net.layers.len()];
+    seeds[1] = Some(seed);
+    cpu.zero_train_buffers();
+    gpu.zero_train_buffers_gpu().expect("initialize GPU buffers");
+    cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+        .expect("CPU backward");
+    gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+        .expect("native FiLM backward");
+    cpu.update_weights(0.01, 0.0, 0.0, 1);
+    gpu.update_weights_gpu(0.01, 0.0, 0.0, 1)
+        .expect("GPU-runtime host-fallback SGD");
+    assert_eq!(cpu.params, gpu.params);
+    assert_eq!(cpu.params[1], initial_film_params, "train_only_bn suppresses FiLM updates");
+}
+
+#[test]
 fn marker_gather_native_full_compact_backward_and_upstream_sgd_match_cpu() {
     assert_chain(
         "[net]\nwidth=5\nheight=1\nchannels=8\nbatch=2\n\
