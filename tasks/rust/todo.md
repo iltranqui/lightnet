@@ -229,6 +229,7 @@ reference tolerance is `TOL_COMPOSED = 1e-4` rather than the single-stage `2e-6`
 
 ## P8/P9 training follow-ups
 
+- [x] v0.2.096: compact f16 inference now accepts `[dropout]` as a device-resident identity, matching inference behavior without RNG or host round-trip. Actual-Oxide output matched f32 compact (relative max error 3.890e-4); the full f16 suite passed 15 tests. No f16 training or compiled-C++ golden. See `implemented.md` §123.
 - [x] v0.2.095: compact f16 inference now supports native `[scale_channels]` in per-channel and per-spatial modes, with source-lifetime tracking. Actual-Oxide batch-2 outputs matched f32 compact (relative max errors 6.633e-4/1.701e-3); the full f16 suite passed 14 tests. Inference only; no compiled-C++ golden. See `implemented.md` §122.
 - [x] v0.2.094: compact f16 inference now supports native `[channel_slice]` using source-lifetime tracking and the Oxide half route-concat primitive. Batch-2 actual-Oxide output matched f32 compact (relative max error 2.353e-4); the full f16 suite passed 13 tests. Inference only; no compiled-C++ golden. See `implemented.md` §121.
 - [x] v0.2.093: compact f16 inference now has native Softmax using stable f32 per-group reductions and half output stores. Actual-Oxide group-count 1/2 relative max errors vs f32 were 4.106e-4/5.549e-4; the full f16 suite passed 12 tests. Inference only; no f16 backward/training or compiled-C++ golden. See `implemented.md` §120.
