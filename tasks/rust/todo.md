@@ -229,6 +229,7 @@ reference tolerance is `TOL_COMPOSED = 1e-4` rather than the single-stage `2e-6`
 
 ## P8/P9 training follow-ups
 
+- [x] v0.2.099: compact f16 inference accepts `[cost]` as a device identity, extending real ResNet101 parity through its Connected classifier and Cost section. The full f16 suite passed 17 tests; ResNet101 relative max error vs f32 was 9.775e-4. No compiled-C++ golden. See `implemented.md` §126.
 - [x] v0.2.098: compact f16 inference now supports Connected via NCHW flattening and native Oxide GEMM, with folded rolling-stat BN. Actual-Oxide batch-2 outputs matched f32 compact for non-BN/BN (relative max errors 2.467e-4/3.655e-4); full f16 suite passed 17 tests. Inference only; no compiled-C++ golden. See `implemented.md` §125.
 - [x] v0.2.097: compact f16 convolution now supports all `NORM_CHAN*` activation variants through a native f32-reduction/half-store kernel. Three actual-Oxide outputs matched f32 compact (relative max errors 4.429e-4/4.639e-4/4.418e-4); full f16 suite passed 15 tests. Inference only; no compiled-C++ golden. See `implemented.md` §124.
 - [x] v0.2.096: compact f16 inference now accepts `[dropout]` as a device-resident identity, matching inference behavior without RNG or host round-trip. Actual-Oxide output matched f32 compact (relative max error 3.890e-4); the full f16 suite passed 15 tests. No f16 training or compiled-C++ golden. See `implemented.md` §123.

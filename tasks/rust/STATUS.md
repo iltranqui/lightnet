@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.099: compact f16 inference accepts the Cost pass-through identity, enabling full ResNet101 parity through the connected classifier and final cost section. Full Oxide f16 suite passed 17 tests; ResNet101 relative max error was 9.775e-4. See `implemented.md` §126.
 - v0.2.098: compact f16 Connected inference now uses native Oxide GEMM with NCHW flattening and folded rolling-stat BN. Full f16 suite passed 17 tests; batch-2 relative max errors vs f32 were 2.467e-4 (non-BN) and 3.655e-4 (BN). See `implemented.md` §125.
 - v0.2.097: compact f16 convolution now supports all three `NORM_CHAN*` activations with native f32 reductions. Full Oxide f16 suite passed 15 tests; relative max errors vs f32 ranged from 4.418e-4 to 4.639e-4. Inference only; see `implemented.md` §124.
 - v0.2.096: compact f16 inference now supports Dropout as a device-resident identity, matching inference semantics. Full Oxide f16 suite passed 15 tests; relative max error vs f32 was 3.890e-4. See `implemented.md` §123.

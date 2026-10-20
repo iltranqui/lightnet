@@ -151,6 +151,7 @@ file is named inline.
 - [123. Native f16 dropout inference](#123-native-f16-dropout-inference)
 - [124. Native f16 channel-normalization inference](#124-native-f16-channel-normalization-inference)
 - [125. Native f16 connected inference](#125-native-f16-connected-inference)
+- [126. Native f16 Cost identity and full ResNet101 coverage](#126-native-f16-cost-identity-and-full-resnet101-coverage)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1820,6 +1821,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 125. Native f16 connected inference
 
 - v0.2.098: compact f16 inference now runs Connected through the existing f16 GEMM convolution epilogue after per-sample NCHW flattening. Supports folded rolling-stat BN and mapped scalar activations. Actual-Oxide batch-2 flattened inputs matched f32 for non-BN/BN (relative max errors 2.467e-4/3.655e-4); the full f16 suite passed 17 tests. Inference only; no compiled-C++ golden.
+
+## 126. Native f16 Cost identity and full ResNet101 coverage
+
+- v0.2.099: compact f16 now accepts `[cost]` as an inference identity, allowing the existing ResNet101 f16 parity fixture to run through its final Connected classifier and Cost section instead of stopping at avgpool. The full `real_cfgs_f16_matches_f32` test passed; final ResNet101 relative max error was 9.775e-4. The complete Oxide f16 suite passed 17 tests. Rust compact CPU/f32 references only; no compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 
