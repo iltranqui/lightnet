@@ -6,6 +6,7 @@
 //! scale_channels}_layer.*` and the `darknet-core` CPU runtime; the host
 //! references live in `darknet_cuda::host_ops`.
 
+use super::activations::exact_gelu_value;
 use super::convert::{f16_bits_to_f32, f32_to_f16_bits};
 use cuda_device::{DisjointSlice, cuda_module, device, kernel, thread};
 
@@ -864,6 +865,164 @@ pub mod kernels {
             let source = (b * sequence + t) * hidden + h;
             // SAFETY: equal element counts and the inverse NCHW permutation
             // guarantee source and destination indices are in range.
+            unsafe { *output.as_mut_ptr().add(index) = tokens[source]; }
+        }
+    }
+
+    /// Gather token embeddings and copy the channel-major attention mask.
+    #[kernel]
+    pub fn laya_encoder_embed(
+        input: &[f32],
+        embeddings: &[f32],
+        mut tokens: DisjointSlice<f32>,
+        mut mask: DisjointSlice<f32>,
+        hidden: usize,
+        sequence: usize,
+        vocab: usize,
+    ) {
+        let index = thread::index_1d().get();
+        if index < tokens.len() {
+            let h = index % hidden;
+            let row = index / hidden;
+            let t = row % sequence;
+            let b = row / sequence;
+            let raw_id = input[(b * 2) * sequence + t];
+            let id = (raw_id.round() as i32).max(0).min(vocab as i32 - 1) as usize;
+            // SAFETY: host shape checks validate the input and embedding extents.
+            unsafe {
+                *tokens.as_mut_ptr().add(index) = embeddings[id * hidden + h];
+                if h == 0 {
+                    *mask.as_mut_ptr().add(b * sequence + t) = input[(b * 2 + 1) * sequence + t];
+                }
+            }
+        }
+    }
+
+    /// Rotary, key-masked online attention with optional local-window restriction.
+    #[kernel]
+    pub fn laya_encoder_attention(
+        qkv: &[f32],
+        mask: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        mut output: DisjointSlice<f32>,
+        sequence: usize,
+        hidden: usize,
+        heads: usize,
+        window_radius: usize,
+        sliding: bool,
+    ) {
+        let query_head = thread::index_1d().get();
+        let query_heads = output.len() / (hidden / heads);
+        if query_head >= query_heads {
+            return;
+        }
+        let head_dim = hidden / heads;
+        let half = head_dim / 2;
+        let head = query_head % heads;
+        let row = query_head / heads;
+        let query = row % sequence;
+        let batch = row / sequence;
+        let head_start = head * head_dim;
+        let qrow = row * 3 * hidden + head_start;
+        let out_base = row * hidden + head_start;
+        // SAFETY: each query/head thread owns this non-overlapping output span.
+        unsafe {
+            let out_ptr = output.as_mut_ptr().add(out_base);
+            let mut d = 0;
+            while d < head_dim {
+                *out_ptr.add(d) = 0.0;
+                d += 1;
+            }
+            let mut running_max = f32::NEG_INFINITY;
+            let mut running_sum = 0.0f32;
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let mut key = 0;
+            while key < sequence {
+                if mask[batch * sequence + key] > 0.5
+                    && (!sliding || ((query as isize - key as isize).abs() as usize) <= window_radius)
+                {
+                    let krow = (batch * sequence + key) * 3 * hidden + hidden + head_start;
+                    let mut dot = 0.0f32;
+                    let mut j = 0;
+                    while j < half {
+                        let c_q = cos[query * half + j];
+                        let s_q = sin[query * half + j];
+                        let qa = qkv[qrow + j];
+                        let qb = qkv[qrow + j + half];
+                        let q0 = qa * c_q - qb * s_q;
+                        let q1 = qb * c_q + qa * s_q;
+                        let c_k = cos[key * half + j];
+                        let s_k = sin[key * half + j];
+                        let ka = qkv[krow + j];
+                        let kb = qkv[krow + j + half];
+                        let k0 = ka * c_k - kb * s_k;
+                        let k1 = kb * c_k + ka * s_k;
+                        dot += q0 * k0 + q1 * k1;
+                        j += 1;
+                    }
+                    let score = dot * scale;
+                    let next_max = running_max.max(score);
+                    let alpha = if running_sum == 0.0 { 0.0 } else { (running_max - next_max).exp() };
+                    let probability = (score - next_max).exp();
+                    let vrow = (batch * sequence + key) * 3 * hidden + 2 * hidden + head_start;
+                    d = 0;
+                    while d < head_dim {
+                        let old = *out_ptr.add(d);
+                        *out_ptr.add(d) = old * alpha + probability * qkv[vrow + d];
+                        d += 1;
+                    }
+                    running_sum = running_sum * alpha + probability;
+                    running_max = next_max;
+                }
+                key += 1;
+            }
+            if running_sum > 0.0 {
+                d = 0;
+                while d < head_dim {
+                    *out_ptr.add(d) /= running_sum;
+                    d += 1;
+                }
+            }
+        }
+    }
+
+    /// First-chunk exact-erf GELU multiplied by the raw second GeGLU chunk.
+    #[kernel]
+    pub fn laya_encoder_geglu(
+        input: &[f32],
+        mut output: DisjointSlice<f32>,
+        intermediate: usize,
+    ) {
+        let index = thread::index_1d().get();
+        if index < output.len() {
+            let column = index % intermediate;
+            let row = index / intermediate;
+            let base = row * 2 * intermediate;
+            let x = input[base + column];
+            let gate = input[base + intermediate + column];
+            let value = exact_gelu_value(x);
+            // SAFETY: all rows have the validated doubled intermediate extent.
+            unsafe { *output.as_mut_ptr().add(index) = value * gate; }
+        }
+    }
+
+    /// Pack token-major `[B*T,H]` into channel-major `[B,H,1,T]`.
+    #[kernel]
+    pub fn laya_encoder_pack(
+        tokens: &[f32],
+        mut output: DisjointSlice<f32>,
+        sequence: usize,
+        hidden: usize,
+    ) {
+        let index = thread::index_1d().get();
+        if index < output.len() {
+            let batch = index / (hidden * sequence);
+            let rem = index - batch * hidden * sequence;
+            let h = rem / sequence;
+            let t = rem % sequence;
+            let source = (batch * sequence + t) * hidden + h;
+            // SAFETY: input/output element counts are equal.
             unsafe { *output.as_mut_ptr().add(index) = tokens[source]; }
         }
     }

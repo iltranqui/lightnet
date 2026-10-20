@@ -2988,6 +2988,182 @@ pub trait F32TensorOpsBackend {
         self.upload_f32(output_shape, &output)
     }
 
+    /// Embed token IDs from `[B,2,1,T]` and extract the attention mask.
+    fn laya_encoder_embed_f32(
+        &self,
+        input: &Self::Tensor,
+        embeddings: &Self::Tensor,
+        input_shape: &[usize],
+        hidden: usize,
+        vocab: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        assert!(input_shape.len() == 4 && input_shape[1] == 2 && input_shape[2] == 1);
+        let (batch, sequence) = (input_shape[0], input_shape[3]);
+        let source = self.download_f32(input)?;
+        let embeddings = self.download_f32(embeddings)?;
+        assert_eq!(source.len(), batch * 2 * sequence);
+        assert_eq!(embeddings.len(), vocab * hidden);
+        let mut tokens = vec![0.0; batch * sequence * hidden];
+        let mut mask = vec![0.0; batch * sequence];
+        for b in 0..batch {
+            for t in 0..sequence {
+                let mut id = source[(b * 2) * sequence + t].round() as i64;
+                id = id.clamp(0, vocab as i64 - 1);
+                mask[b * sequence + t] = source[(b * 2 + 1) * sequence + t];
+                tokens[(b * sequence + t) * hidden..(b * sequence + t + 1) * hidden]
+                    .copy_from_slice(&embeddings[id as usize * hidden..(id as usize + 1) * hidden]);
+            }
+        }
+        Ok((
+            self.upload_f32(&[batch * sequence, hidden], &tokens)?,
+            self.upload_f32(&[batch, sequence], &mask)?,
+        ))
+    }
+
+    /// Rotary, masked (optionally sliding-window) online-softmax attention.
+    fn laya_encoder_attention_f32(
+        &self,
+        qkv: &Self::Tensor,
+        mask: &Self::Tensor,
+        cos: &Self::Tensor,
+        sin: &Self::Tensor,
+        batch: usize,
+        sequence: usize,
+        hidden: usize,
+        heads: usize,
+        sliding: bool,
+        window_radius: usize,
+        output_shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert!(batch > 0 && sequence > 0 && hidden > 0 && heads > 0 && hidden % heads == 0);
+        assert_eq!(output_shape, [batch * sequence, hidden]);
+        let hd = hidden / heads;
+        assert_eq!(hd % 2, 0);
+        let qkv = self.download_f32(qkv)?;
+        let mask = self.download_f32(mask)?;
+        let cos = self.download_f32(cos)?;
+        let sin = self.download_f32(sin)?;
+        assert_eq!(qkv.len(), batch * sequence * 3 * hidden);
+        assert_eq!(mask.len(), batch * sequence);
+        assert_eq!(cos.len(), sequence * hd / 2);
+        assert_eq!(sin.len(), cos.len());
+        let mut output = vec![0.0; batch * sequence * hidden];
+        let scale = 1.0 / (hd as f32).sqrt();
+        let half = hd / 2;
+        for b in 0..batch {
+            for head in 0..heads {
+                for query in 0..sequence {
+                    let mut scores = vec![f32::NEG_INFINITY; sequence];
+                    let mut maximum = f32::NEG_INFINITY;
+                    for key in 0..sequence {
+                        if mask[b * sequence + key] <= 0.5
+                            || (sliding && query.abs_diff(key) > window_radius)
+                        {
+                            continue;
+                        }
+                        let qrow = (b * sequence + query) * 3 * hidden + head * hd;
+                        let krow = (b * sequence + key) * 3 * hidden + hidden + head * hd;
+                        let mut dot = 0.0;
+                        for d in 0..hd {
+                            let pair = d % half;
+                            let c = cos[query * half + pair];
+                            let s = sin[query * half + pair];
+                            let qd = if d < half {
+                                qkv[qrow + d] * c - qkv[qrow + d + half] * s
+                            } else {
+                                qkv[qrow + d] * c + qkv[qrow + d - half] * s
+                            };
+                            let kc = cos[key * half + pair];
+                            let ks = sin[key * half + pair];
+                            let kd = if d < half {
+                                qkv[krow + d] * kc - qkv[krow + d + half] * ks
+                            } else {
+                                qkv[krow + d] * kc + qkv[krow + d - half] * ks
+                            };
+                            dot += qd * kd;
+                        }
+                        scores[key] = dot * scale;
+                        maximum = maximum.max(scores[key]);
+                    }
+                    if !maximum.is_finite() {
+                        continue;
+                    }
+                    let mut sum = 0.0;
+                    for score in &mut scores {
+                        if score.is_finite() {
+                            *score = (*score - maximum).exp();
+                            sum += *score;
+                        } else {
+                            *score = 0.0;
+                        }
+                    }
+                    for d in 0..hd {
+                        let mut value = 0.0;
+                        for key in 0..sequence {
+                            let v = qkv[(b * sequence + key) * 3 * hidden + 2 * hidden + head * hd + d];
+                            value += scores[key] * v;
+                        }
+                        output[(b * sequence + query) * hidden + head * hd + d] = value / sum;
+                    }
+                }
+            }
+        }
+        self.upload_f32(output_shape, &output)
+    }
+
+    /// Exact-erf GeGLU, activating the first half and multiplying by the raw second.
+    fn laya_encoder_geglu_f32(
+        &self,
+        input: &Self::Tensor,
+        rows: usize,
+        intermediate: usize,
+        output_shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert_eq!(output_shape, [rows, intermediate]);
+        let input = self.download_f32(input)?;
+        assert_eq!(input.len(), rows * 2 * intermediate);
+        let mut output = vec![0.0; rows * intermediate];
+        for r in 0..rows {
+            for i in 0..intermediate {
+                let a = input[r * 2 * intermediate + i];
+                let gate = input[r * 2 * intermediate + intermediate + i];
+                output[r * intermediate + i] = host_ops::gelu_erf::value(a) * gate;
+            }
+        }
+        self.upload_f32(output_shape, &output)
+    }
+
+    /// Token-major `[B*T,H]` to the layer's NCHW `[B,H,1,T]` output.
+    fn laya_encoder_pack_f32(
+        &self,
+        tokens: &Self::Tensor,
+        batch: usize,
+        sequence: usize,
+        hidden: usize,
+        output_shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert_eq!(output_shape, [batch, hidden, 1, sequence]);
+        let tokens = self.download_f32(tokens)?;
+        assert_eq!(tokens.len(), batch * sequence * hidden);
+        let mut output = vec![0.0; tokens.len()];
+        for b in 0..batch {
+            for t in 0..sequence {
+                for h in 0..hidden {
+                    output[(b * hidden + h) * sequence + t] = tokens[(b * sequence + t) * hidden + h];
+                }
+            }
+        }
+        self.upload_f32(output_shape, &output)
+    }
+
     /// Recompute-based derivative of standard online attention. Inputs are
     /// fused QKV `[B,T,3C]`, context/output gradient `[B,T,C]`, and LSE
     /// `[B,H,T]`; output is fused dQKV `[B,T,3C]`.

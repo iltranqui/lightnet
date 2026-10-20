@@ -87,6 +87,7 @@ mod laya_act_gpu;
 #[path = "runtime/laya_head_gpu.rs"]
 mod laya_head_gpu;
 mod laya_scorer_gpu;
+mod laya_encoder_gpu;
 
 /// Whether the network contains a `[deform_conv]` variant the device path does
 /// not cover yet. Shared by the forward and the backward so they cannot choose
@@ -14446,14 +14447,15 @@ where
                         .map_err(|err| backend_error("upload Kimi KDA output", err))?
                 }
                 (LayerKind::LayaEncoder(spec), LayerParams::LayaEncoder(weights)) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download laya_encoder input", err))?;
-                    let encoded =
-                        laya_encoder_forward(spec, weights, &host_input, layer.output_shape)?;
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &encoded.data)
-                        .map_err(|err| backend_error("upload laya_encoder output", err))?
+                    laya_encoder_gpu::forward(
+                        &self.backend,
+                        spec,
+                        weights,
+                        current_input,
+                        layer.input_shape,
+                        layer.output_shape,
+                        launch_config,
+                    )?
                 }
                 (LayerKind::LayaHead(spec), LayerParams::LayaHead(weights)) => {
                     laya_head_gpu::forward(
@@ -16086,6 +16088,17 @@ where
                         spec,
                         weights,
                         current_input.expect("LayaHead requires current input"),
+                        layer.input_shape,
+                        layer.output_shape,
+                        launch_config,
+                    )?
+                }
+                (LayerKind::LayaEncoder(spec), LayerParams::LayaEncoder(weights)) => {
+                    laya_encoder_gpu::forward(
+                        &self.backend,
+                        spec,
+                        weights,
+                        current_input.expect("LayaEncoder requires current input"),
                         layer.input_shape,
                         layer.output_shape,
                         launch_config,
