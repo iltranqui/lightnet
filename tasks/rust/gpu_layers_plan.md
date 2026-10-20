@@ -122,11 +122,14 @@ Bounded native slice:
     runtime dispatch (v0.2.136, v0.2.137); actual-Oxide learned-anisotropic
     Adam parity (v0.2.138) and primitive CPU-formula parity pass. The downloaded grid is retained for host
     HF backward.
-11. [ ] Implement native warp adjoints and inspect runtime input gradients;
-    preserve explicit host boundaries until verified. Actual-Oxide gates cover
-    compact f32/f16, Muon, SGD
-    `dont_update`, Adam `burnin_update`, and SGD `train_only_bn` (v0.2.128–131).
-    No compiled-C++ GPU-parity claim.
+11. [x] Add native Oxide warp input/grid adjoints and use the input adjoint in
+    HF GPU backward (v0.2.139). Primitive CPU-formula and finite-difference
+    checks pass; two-step SGD/Adam runtime parity passes.
+12. [ ] Expose and compare runtime input gradients directly; replace the
+    remaining host recomputation for HF grid-to-parameter/predictor gradients.
+    Preserve the explicit host boundary until verified. Actual-Oxide gates cover
+    compact f32/f16, Muon, SGD `dont_update`, Adam `burnin_update`, and SGD
+    `train_only_bn` (v0.2.128–131). No compiled-C++ GPU-parity claim.
 
 v0.2.120 implements native per-sample NCHW affine and exact input/gamma/beta
 adjoints; v0.2.121 composes native HF embedding/ReLU and gamma/beta projections
@@ -143,14 +146,18 @@ cover SGD/Adam update gates. v0.2.132 compares all host HF/FiLM gradient
 buffers against CPU after actual-Oxide backward. v0.2.133 adds native Oxide bilinear warp sampling; v0.2.134 adds fixed-point
 inverse-grid generation; v0.2.135 adds the predictor MLP; v0.2.136 adds Newton
 inversion; v0.2.137 extends both grid methods and learned predictors to
-anisotropic radii. Actual-Oxide runtime tests cover learned anisotropic
-fixed-point SGD and learned anisotropic Newton Adam, comparing predictor and
-FiLM parameter updates over two steps. HF backward remains
-host-managed. Direct input-gradient parity and native warp adjoints remain open.
+anisotropic radii. v0.2.139 adds native Oxide warp input/grid adjoints and uses
+native input gradients in HF GPU backward. Actual-Oxide runtime tests cover
+learned anisotropic fixed-point SGD and learned anisotropic Newton Adam,
+comparing predictor and FiLM parameter updates over two steps. HF
+parameter/predictor backward remains host-managed; the native grid adjoint is
+not yet consumed by that path. Direct runtime input-gradient inspection remains
+open.
 
 This remains an open plan, not evidence of a complete native layer. Native HF
-coverage includes forward for isotropic and anisotropic modes; HF backward
-remains hybrid/host-managed. Compact f16 remains deferred.
+coverage includes forward for isotropic and anisotropic modes plus the native
+warp input adjoint; HF parameter/predictor backward remains hybrid/host-managed.
+Compact f16 remains deferred.
 
 ## Act-head contract finding
 

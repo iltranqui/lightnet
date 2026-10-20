@@ -200,6 +200,7 @@ file is named inline.
 - [172. Native isotropic Newton HF grid](#172-native-isotropic-newton-hf-grid)
 - [173. Native anisotropic HF predictor and inverse grids](#173-native-anisotropic-hf-predictor-and-inverse-grids)
 - [174. Learned anisotropic Newton Adam runtime parity](#174-learned-anisotropic-newton-adam-runtime-parity)
+- [175. Native HF warp adjoints](#175-native-hf-warp-adjoints)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2065,6 +2066,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 174. Learned anisotropic Newton Adam runtime parity
 
 - v0.2.138 (`f20078f0`): strengthened the actual-Oxide Newton Adam runtime test to use a learned anisotropic HF predictor and compare all predictor parameter blocks, HF parameters, and FiLM parameters after each of two updates. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_runtime_adam_updates_match_cpu` passed. This validates native predictor + anisotropic Newton forward with CPU-reference optimizer/backward parity; HF warp/predictor adjoints remain host-managed. No compiled-C++ or performance claim.
+
+## 175. Native HF warp adjoints
+
+- v0.2.139 (`e4aed189`): added Oxide input-scatter and shared-grid-reduction adjoints for HF bilinear warp; GPU runtime now uses the native input gradient when propagating through HF. `MEM=3G ./tools/test_oxide.sh --test oxide_hyperbolic_foveation` passed 6 tests, including CPU-formula comparisons and selected input/grid finite differences. Actual-Oxide learned-anisotropic fixed-point SGD and learned-anisotropic Newton Adam two-step runtime parity passed; focused host FoveationFilm tests passed 12. Runtime still computes HF parameter/predictor adjoints through the host reference and currently does not consume the returned native grid adjoint; direct inspection of runtime input-gradient tensors remains open. No compiled-C++ or performance claim.
 
 ## Not implemented / open (pointer)
 
