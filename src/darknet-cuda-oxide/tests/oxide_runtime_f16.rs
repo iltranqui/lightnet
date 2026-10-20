@@ -148,6 +148,14 @@ fn channel_shuffle_f16_inference_matches_f32() {
 }
 
 #[test]
+fn dropout_f16_inference_is_device_identity_like_f32() {
+    let cfg = "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\n\
+        [convolutional]\nfilters=3\nsize=1\nactivation=linear\n\
+        [dropout]\nprobability=0.75\n";
+    run_pair("dropout f16 inference", network(cfg), 71, 0.7, 4e-3);
+}
+
+#[test]
 fn scale_channels_f16_inference_matches_f32_for_channel_and_spatial_scales() {
     let per_channel = "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=2\n\
         [convolutional]\nfilters=3\nsize=1\nactivation=linear\n\
