@@ -247,11 +247,13 @@ fn foveation_film_native_forward_backward_uses_host_hf_source_cache() {
     let mut seeds = vec![None; net.layers.len()];
     seeds[2] = Some(seed);
     cpu.zero_train_buffers();
-    cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+    let cpu_backward = cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
         .expect("CPU backward");
     gpu.zero_train_buffers_gpu().expect("initialize GPU train buffers");
-    gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
-        .expect("native FiLM and host HF backward");
+    let gpu_input_gradient = gpu.backward_accumulate_seeded_gpu_with_input_gradient(&gpu_forward, &seeds)
+        .expect("native FiLM and HF backward")
+        .expect("HF input gradient");
+    close("HF runtime input gradient", &cpu_backward.input_gradient.data, &gpu_input_gradient.data, 3e-5);
     assert_hf_film_train_buffers(&cpu, &gpu, 1, 2, 1);
     cpu.update_weights(0.001, 0.0, 0.0, 1);
     gpu.update_weights_gpu(0.001, 0.0, 0.0, 1)
@@ -290,10 +292,12 @@ fn foveation_film_native_forward_backward_uses_host_hf_source_cache() {
     }
     cpu.zero_train_buffers();
     gpu.zero_train_buffers_gpu().expect("zero second-step buffers");
-    cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+    let cpu_backward = cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
         .expect("CPU second backward");
-    gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
-        .expect("native second backward");
+    let gpu_input_gradient = gpu.backward_accumulate_seeded_gpu_with_input_gradient(&gpu_forward, &seeds)
+        .expect("native second backward")
+        .expect("second HF input gradient");
+    close("second HF runtime input gradient", &cpu_backward.input_gradient.data, &gpu_input_gradient.data, 3e-5);
     assert_hf_film_train_buffers(&cpu, &gpu, 1, 2, 2);
     cpu.update_weights(0.001, 0.0, 0.0, 1);
     gpu.update_weights_gpu(0.001, 0.0, 0.0, 1)
@@ -348,11 +352,13 @@ fn foveation_film_runtime_adam_updates_match_cpu() {
     let mut seeds = vec![None; net.layers.len()];
     seeds[1] = Some(seed);
     cpu.zero_train_buffers();
-    cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+    let cpu_backward = cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
         .expect("CPU Adam backward");
     gpu.zero_train_buffers_gpu().expect("initialize Adam buffers");
-    gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
-        .expect("native Adam backward");
+    let gpu_input_gradient = gpu.backward_accumulate_seeded_gpu_with_input_gradient(&gpu_forward, &seeds)
+        .expect("native Adam backward")
+        .expect("Adam HF input gradient");
+    close("HF Adam runtime input gradient", &cpu_backward.input_gradient.data, &gpu_input_gradient.data, 3e-5);
     assert_hf_film_train_buffers(&cpu, &gpu, 0, 1, 1);
     cpu.update_weights_adam(0.005, 1).unwrap();
     gpu.update_weights_gpu(0.005, 0.0, net.net.decay, 1)

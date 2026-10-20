@@ -17,7 +17,7 @@
 //! each channel contains `height * width` values, and channels are stored in
 //! channel-major order exactly like Darknet's `float *output` arrays.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -7468,6 +7468,8 @@ where
     /// Reusable DCNv4 parameter uploads; snapshots detect public host edits.
     dcnv4_device_params: RefCell<Vec<Option<dcnv4_gpu::DeviceParameters<B::Tensor>>>>,
     cpu_fallback_train_buffers: RefCell<Vec<LayerTrainBuffers>>,
+    capture_input_gradient: Cell<bool>,
+    captured_input_gradient: RefCell<Option<Tensor>>,
     /// One slot per layer; only `[deform_conv]` uses it, and only on the
     /// device-trainable path (see `DeformDeviceCache`).
     deform_device_caches: RefCell<Vec<Option<DeformDeviceCache<B::Tensor>>>>,
@@ -9196,6 +9198,8 @@ where
             device_dcnv4_train_buffers,
             dcnv4_device_params,
             cpu_fallback_train_buffers,
+            capture_input_gradient: Cell::new(false),
+            captured_input_gradient: RefCell::new(None),
             deform_device_caches: RefCell::new(Vec::new()),
             adam_state: Vec::new(),
             moe_adam_state,
@@ -16261,6 +16265,22 @@ where
         })
     }
 
+    /// Accumulate seeded GPU backward and return the network-input gradient.
+    /// This opt-in diagnostic path may download the input gradient; ordinary
+    /// training calls do not retain or transfer it.
+    pub fn backward_accumulate_seeded_gpu_with_input_gradient(
+        &mut self,
+        forward: &GpuForwardState<B::Tensor>,
+        layer_output_gradient_seeds: &[Option<Tensor>],
+    ) -> Result<Option<Tensor>> {
+        *self.captured_input_gradient.borrow_mut() = None;
+        self.capture_input_gradient.set(true);
+        let result = self.backward_accumulate_seeded_gpu(forward, layer_output_gradient_seeds);
+        self.capture_input_gradient.set(false);
+        result?;
+        Ok(self.captured_input_gradient.borrow_mut().take())
+    }
+
     /// Accumulates the layer gradients into the device train buffers.  With
     /// `loss_scale != 1` every seed is multiplied by it first (the matching
     /// division happens in `update_weights_gpu`).
@@ -19666,7 +19686,7 @@ where
                 *train = default_layer_train_buffers(layer);
             }
         }
-        cpu.backward_accumulate_seeded_with_attention(
+        let cpu_backward = cpu.backward_accumulate_seeded_with_attention(
             &input,
             &forward.cpu_forward,
             layer_output_gradient_seeds,
@@ -19745,6 +19765,9 @@ where
                     .map_err(|err| format!("download ViT flash dQKV: {err}"))
             },
         )?;
+        if self.capture_input_gradient.get() {
+            *self.captured_input_gradient.borrow_mut() = Some(cpu_backward.input_gradient);
+        }
 
         let mut device_conv_gradients = Vec::new();
         for (layer, train) in self.network.layers.iter().zip(&cpu.train_buffers) {
@@ -19823,6 +19846,19 @@ where
         layer_output_gradients: &mut [Option<B::Tensor>],
     ) -> Result<()> {
         if layer_index == 0 {
+            if self.capture_input_gradient.get() {
+                let input_gradient = self.download_tensor(&gradient, self.network.net.input_shape())
+                    .map_err(|err| backend_error("download captured GPU input gradient", err))?;
+                let mut captured = self.captured_input_gradient.borrow_mut();
+                if let Some(existing) = captured.as_mut() {
+                    if existing.shape != input_gradient.shape {
+                        return Err(Error::InvalidConfig("captured GPU input-gradient shape mismatch".to_owned()));
+                    }
+                    accumulate_vec(&mut existing.data, &input_gradient.data)?;
+                } else {
+                    *captured = Some(input_gradient);
+                }
+            }
             return Ok(());
         }
         self.accumulate_gpu_gradient(&mut layer_output_gradients[layer_index - 1], gradient)
