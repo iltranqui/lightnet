@@ -6528,6 +6528,61 @@ impl F32TensorOpsBackend for OxideBackend {
         Ok(OxideTensorF32::new(dlogit, &[batch, experts]))
     }
 
+    fn hyperbolic_foveation_warp_f32(
+        &self,
+        input: &Self::Tensor,
+        grid: &Self::Tensor,
+        shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let input_f = self.f32v(input)?;
+        let input = &*input_f;
+        let grid_f = self.f32v(grid)?;
+        let grid = &*grid_f;
+        let op = "hyperbolic_foveation_warp_f32";
+        if shape.len() != 4 || shape.contains(&0) {
+            return Err(shape_err(op, format!("expected positive NCHW shape, got {shape:?}")));
+        }
+        let (batch, channels, height, width) = (shape[0], shape[1], shape[2], shape[3]);
+        let input_len = batch
+            .checked_mul(channels)
+            .and_then(|n| n.checked_mul(height))
+            .and_then(|n| n.checked_mul(width))
+            .ok_or_else(|| shape_err(op, "input size overflows".to_owned()))?;
+        let grid_len = batch
+            .checked_mul(height)
+            .and_then(|n| n.checked_mul(width))
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| shape_err(op, "grid size overflows".to_owned()))?;
+        if input.len() != input_len || grid.len() != grid_len {
+            return Err(shape_err(
+                op,
+                format!(
+                    "input/grid lengths are {}/{}, expected {input_len}/{grid_len}",
+                    input.len(),
+                    grid.len()
+                ),
+            ));
+        }
+        let mut output = self.alloc_uninit(input_len)?;
+        // SAFETY: each output owns one element and only reads validated input
+        // and the corresponding per-batch/pixel grid coordinates.
+        unsafe {
+            self.resample.hyperbolic_warp(
+                &self.stream,
+                launch::elementwise(input_len, config),
+                &input.buf,
+                &grid.buf,
+                &mut output,
+                channels,
+                height,
+                width,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, shape))
+    }
+
     fn crop_bilinear_f32(
         &self,
         x: &Self::Tensor,

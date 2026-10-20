@@ -13003,7 +13003,7 @@ where
                     let host_input = self
                         .download_tensor(current_input, layer.input_shape)
                         .map_err(|err| backend_error("download hyperbolic_foveation input", err))?;
-                    let (host_output, cache) = forward_hyperbolic_foveation(
+                    let (_host_output, cache) = forward_hyperbolic_foveation(
                         &self.network,
                         layer,
                         spec,
@@ -13012,10 +13012,31 @@ where
                         &host_input,
                         &layer_outputs,
                     )?;
+                    let grid = self.backend
+                        .upload_f32(
+                            &[
+                                layer.output_shape.batch,
+                                layer.output_shape.height,
+                                layer.output_shape.width,
+                                2,
+                            ],
+                            &cache.grid,
+                        )
+                        .map_err(|err| backend_error("upload hyperbolic_foveation grid", err))?;
+                    let warp_input = match spec.warp_source {
+                        crate::model::HfWarpSource::Previous => current_input,
+                        crate::model::HfWarpSource::NetworkInput => &input_gpu,
+                    };
+                    let output = self.backend
+                        .hyperbolic_foveation_warp_f32(
+                            warp_input,
+                            &grid,
+                            &tensor_backend_shape(layer.output_shape),
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("native hyperbolic_foveation warp", err))?;
                     hyperbolic_foveation_cache = Some(cache);
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
-                        .map_err(|err| backend_error("upload hyperbolic_foveation output", err))?
+                    output
                 }
                 (LayerKind::FoveationFilm(spec), LayerParams::FoveationFilm(params)) => {
                     let hf_cache = hyperbolic_foveation_caches

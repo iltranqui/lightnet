@@ -230,13 +230,14 @@ fn foveation_film_native_forward_backward_uses_host_hf_source_cache() {
     for (index, (expected, actual)) in cpu_forward
         .layer_outputs
         .iter()
-        .zip(&gpu_forward.cpu_forward.layer_outputs)
+        .zip(&gpu_forward.gpu_layer_outputs)
         .enumerate()
     {
+        let actual = gpu.backend.download_f32(actual).unwrap();
         close(
-            &format!("FoveationFilm runtime layer {index}"),
+            &format!("FoveationFilm actual GPU layer {index}"),
             &expected.data,
-            &actual.data,
+            &actual,
             2e-5,
         );
     }
@@ -279,10 +280,11 @@ fn foveation_film_native_forward_backward_uses_host_hf_source_cache() {
     for (index, (expected, actual)) in cpu_forward
         .layer_outputs
         .iter()
-        .zip(&gpu_forward.cpu_forward.layer_outputs)
+        .zip(&gpu_forward.gpu_layer_outputs)
         .enumerate()
     {
-        close(&format!("FoveationFilm second-step layer {index}"), &expected.data, &actual.data, 2e-5);
+        let actual = gpu.backend.download_f32(actual).unwrap();
+        close(&format!("FoveationFilm actual second-step GPU layer {index}"), &expected.data, &actual, 2e-5);
     }
     cpu.zero_train_buffers();
     gpu.zero_train_buffers_gpu().expect("zero second-step buffers");
@@ -335,9 +337,10 @@ fn foveation_film_runtime_adam_updates_match_cpu() {
     for (expected, actual) in cpu_forward
         .layer_outputs
         .iter()
-        .zip(&gpu_forward.cpu_forward.layer_outputs)
+        .zip(&gpu_forward.gpu_layer_outputs)
     {
-        close("FoveationFilm Adam output", &expected.data, &actual.data, 2e-5);
+        let actual = gpu.backend.download_f32(actual).unwrap();
+        close("FoveationFilm actual GPU Adam output", &expected.data, &actual, 2e-5);
     }
     let seed = Tensor::from_data(net.layers[1].output_shape, vec![0.6; 12]).unwrap();
     let mut seeds = vec![None; net.layers.len()];
@@ -374,9 +377,10 @@ fn foveation_film_runtime_adam_updates_match_cpu() {
     for (expected, actual) in cpu_forward
         .layer_outputs
         .iter()
-        .zip(&gpu_forward.cpu_forward.layer_outputs)
+        .zip(&gpu_forward.gpu_layer_outputs)
     {
-        close("FoveationFilm second Adam output", &expected.data, &actual.data, 2e-5);
+        let actual = gpu.backend.download_f32(actual).unwrap();
+        close("FoveationFilm actual second GPU Adam output", &expected.data, &actual, 2e-5);
     }
     cpu.zero_train_buffers();
     gpu.zero_train_buffers_gpu().expect("zero second Adam buffers");

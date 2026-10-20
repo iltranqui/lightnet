@@ -289,6 +289,51 @@ pub mod kernels {
 
     /// Scatter of the crop gradient into the input (`dx` must be zeroed).
     /// `dx` is a raw device pointer because the updates are atomic adds.
+    /// Gather an NCHW tensor through an HF sampling grid in pixel coordinates.
+    /// Out-of-bounds taps contribute zero, matching the CPU HF bilinear sampler.
+    #[kernel]
+    pub fn hyperbolic_warp(
+        x: &[f32],
+        grid: &[f32],
+        mut output: DisjointSlice<f32>,
+        channels: usize,
+        height: usize,
+        width: usize,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= output.len() {
+            return;
+        }
+        let spatial = height * width;
+        let batch = i / (channels * spatial);
+        let channel = (i / spatial) % channels;
+        let pixel = i % spatial;
+        let grid_index = (batch * spatial + pixel) * 2;
+        let sx = grid[grid_index];
+        let sy = grid[grid_index + 1];
+        let ix = floor_i64(sx);
+        let iy = floor_i64(sy);
+        let fx = sx - ix as f32;
+        let fy = sy - iy as f32;
+        let input_base = (batch * channels + channel) * spatial;
+        let mut value = 0.0f32;
+        let mut tap = 0usize;
+        while tap < 4 {
+            let tx = ix + (tap & 1) as i64;
+            let ty = iy + (tap >> 1) as i64;
+            let wx = if tap & 1 == 1 { fx } else { 1.0 - fx };
+            let wy = if tap >> 1 == 1 { fy } else { 1.0 - fy };
+            if tx >= 0 && tx < width as i64 && ty >= 0 && ty < height as i64 {
+                value += wy * wx * x[input_base + ty as usize * width + tx as usize];
+            }
+            tap += 1;
+        }
+        if let Some(out) = output.get_mut(idx) {
+            *out = value;
+        }
+    }
+
     #[kernel]
     pub fn crop_bilinear_backward(
         dy: &[f32],

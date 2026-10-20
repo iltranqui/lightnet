@@ -1923,6 +1923,52 @@ pub trait F32TensorOpsBackend {
         }
         self.upload_f32(&[batch, experts], &dlogit)
     }
+    /// Bilinearly sample NCHW input through an HF sampling grid in pixel
+    /// coordinates; out-of-bounds taps contribute zero.
+    fn hyperbolic_foveation_warp_f32(
+        &self,
+        input: &Self::Tensor,
+        grid: &Self::Tensor,
+        shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert_eq!(shape.len(), 4, "HF warp expects NCHW shape");
+        let [batch, channels, height, width] = [shape[0], shape[1], shape[2], shape[3]];
+        let input = self.download_f32(input)?;
+        let grid = self.download_f32(grid)?;
+        let spatial = height * width;
+        assert_eq!(input.len(), batch * channels * spatial, "HF warp input length");
+        assert_eq!(grid.len(), batch * spatial * 2, "HF warp grid length");
+        let mut output = vec![0.0; input.len()];
+        for b in 0..batch {
+            for c in 0..channels {
+                for p in 0..spatial {
+                    let grid_index = (b * spatial + p) * 2;
+                    let sx = grid[grid_index];
+                    let sy = grid[grid_index + 1];
+                    let x0 = sx.floor() as isize;
+                    let y0 = sy.floor() as isize;
+                    let dx = sx - x0 as f32;
+                    let dy = sy - y0 as f32;
+                    let base = (b * channels + c) * spatial;
+                    let mut value = 0.0;
+                    for tap in 0..4 {
+                        let tx = x0 + (tap & 1) as isize;
+                        let ty = y0 + (tap >> 1) as isize;
+                        if tx >= 0 && tx < width as isize && ty >= 0 && ty < height as isize {
+                            let wx = if tap & 1 == 1 { dx } else { 1.0 - dx };
+                            let wy = if tap >> 1 == 1 { dy } else { 1.0 - dy };
+                            value += wy * wx * input[base + ty as usize * width + tx as usize];
+                        }
+                    }
+                    output[base + p] = value;
+                }
+            }
+        }
+        self.upload_f32(shape, &output)
+    }
+
     /// Bilinearly sample an NCHW tensor using one source coordinate pair per
     /// batch/output pixel. `input_scales` contains one affine scale per batch,
     /// and `input_offsets` one affine offset per batch/channel. Saturation and
