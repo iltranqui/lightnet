@@ -7813,6 +7813,82 @@ impl F32TensorOpsBackend for OxideBackend {
         ))
     }
 
+    fn laya_head_attention_f32(
+        &self,
+        qkv: &Self::Tensor,
+        mask: &Self::Tensor,
+        output_shape: &[usize],
+        batch: usize,
+        tokens: usize,
+        channels: usize,
+        heads: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let op = "laya_head_attention_f32";
+        if batch == 0 || tokens == 0 || channels == 0 || heads == 0 || channels % heads != 0 {
+            return Err(shape_err(
+                op,
+                "dimensions must be positive and channels divisible by heads".to_owned(),
+            ));
+        }
+        if output_shape != [batch, tokens, channels] {
+            return Err(shape_err(
+                op,
+                format!("output shape {output_shape:?} must be [batch, tokens, channels]"),
+            ));
+        }
+        let rows = batch
+            .checked_mul(tokens)
+            .ok_or_else(|| shape_err(op, "row count overflows usize".to_owned()))?;
+        let output_len = rows
+            .checked_mul(channels)
+            .ok_or_else(|| shape_err(op, "output length overflows usize".to_owned()))?;
+        let qkv_len = output_len
+            .checked_mul(3)
+            .ok_or_else(|| shape_err(op, "QKV length overflows usize".to_owned()))?;
+        let qkv_f = self.f32v(qkv)?;
+        let mask_f = self.f32v(mask)?;
+        if qkv_f.len() != qkv_len || mask_f.len() != rows {
+            return Err(shape_err(
+                op,
+                format!(
+                    "QKV/mask lengths are {}/{}, expected {qkv_len}/{rows}",
+                    qkv_f.len(),
+                    mask_f.len()
+                ),
+            ));
+        }
+        let head_dim = channels / heads;
+        if head_dim > 128 {
+            return Err(shape_err(
+                op,
+                format!("head dimension {head_dim} exceeds the kernel limit 128"),
+            ));
+        }
+        let query_count = batch
+            .checked_mul(heads)
+            .and_then(|n| n.checked_mul(tokens))
+            .ok_or_else(|| shape_err(op, "query count overflows usize".to_owned()))?;
+        let mut output = self.alloc_uninit(output_len)?;
+        // SAFETY: checked dimensions bound every Q/K/V/mask access, and one
+        // query/head thread exclusively writes its output channel interval.
+        unsafe {
+            self.layers_extra.laya_head_attention_forward(
+                &self.stream,
+                launch::elementwise(query_count, config),
+                &qkv_f.buf,
+                &mask_f.buf,
+                &mut output,
+                batch,
+                tokens,
+                channels,
+                heads,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, output_shape))
+    }
+
     fn flash_attention_backward_f32(
         &self,
         qkv: &Self::Tensor,

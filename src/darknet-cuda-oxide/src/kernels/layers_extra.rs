@@ -809,6 +809,82 @@ pub mod kernels {
         }
     }
 
+    /// LayaHead's masked attention. Skips invalid keys and writes a zero
+    /// context for queries whose batch has no valid key. One thread owns one
+    /// (batch, head, query) output slice and uses online softmax state.
+    #[kernel]
+    pub fn laya_head_attention_forward(
+        qkv: &[f32],
+        mask: &[f32],
+        mut output: DisjointSlice<f32>,
+        batch: usize,
+        tokens: usize,
+        channels: usize,
+        heads: usize,
+    ) {
+        let query = thread::index_1d().get();
+        let query_count = batch * heads * tokens;
+        if query >= query_count {
+            return;
+        }
+        let head_dim = channels / heads;
+        let bh = query / tokens;
+        let tq = query - bh * tokens;
+        let b = bh / heads;
+        let h = bh - b * heads;
+        let head_start = h * head_dim;
+        let query_row = b * tokens + tq;
+        let q_base = query_row * 3 * channels + head_start;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut q = [0.0f32; 128];
+        let mut acc = [0.0f32; 128];
+        let mut d = 0usize;
+        while d < head_dim {
+            q[d] = qkv[q_base + d];
+            d += 1;
+        }
+        let mut running_max = f32::NEG_INFINITY;
+        let mut running_sum = 0.0f32;
+        let mut any_valid = false;
+        let mut key = 0usize;
+        while key < tokens {
+            if mask[b * tokens + key] > 0.5 {
+                any_valid = true;
+                let key_row = b * tokens + key;
+                let k_base = key_row * 3 * channels + channels + head_start;
+                let mut dot = 0.0f32;
+                d = 0;
+                while d < head_dim {
+                    dot += q[d] * qkv[k_base + d];
+                    d += 1;
+                }
+                let score = dot * scale;
+                let new_max = running_max.max(score);
+                let correction = (running_max - new_max).exp();
+                let probability = (score - new_max).exp();
+                running_sum = running_sum * correction + probability;
+                let v_base = key_row * 3 * channels + 2 * channels + head_start;
+                d = 0;
+                while d < head_dim {
+                    acc[d] = acc[d] * correction + probability * qkv[v_base + d];
+                    d += 1;
+                }
+                running_max = new_max;
+            }
+            key += 1;
+        }
+        let output_base = query_row * channels + head_start;
+        d = 0;
+        while d < head_dim {
+            let value = if any_valid { acc[d] / running_sum } else { 0.0 };
+            // SAFETY: every (batch, head, query) thread owns disjoint channels.
+            unsafe {
+                *output.as_mut_ptr().add(output_base + d) = value;
+            }
+            d += 1;
+        }
+    }
+
     /// One query row per thread computes dQ and D_i = dot(context_i, dO_i).
     /// The following key-row kernel consumes D_i to form dK and dV without atomics.
     #[kernel]

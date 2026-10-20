@@ -2762,6 +2762,84 @@ pub trait F32TensorOpsBackend {
             self.upload_f32(lse_shape, &lse)?,
         ))
     }
+    /// LayaHead attention: fused QKV with a key-padding mask (`mask > 0.5`).
+    /// Unlike the general flash-attention helper, this preserves unbounded
+    /// source scores and maps an all-masked row to a zero context vector.
+    fn laya_head_attention_f32(
+        &self,
+        qkv: &Self::Tensor,
+        mask: &Self::Tensor,
+        output_shape: &[usize],
+        batch: usize,
+        tokens: usize,
+        channels: usize,
+        heads: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert!(batch > 0 && tokens > 0 && channels > 0 && heads > 0 && channels % heads == 0);
+        assert!(
+            channels / heads <= 128,
+            "LayaHead attention head dim exceeds 128"
+        );
+        assert_eq!(output_shape, [batch, tokens, channels]);
+        let qkv = self.download_f32(qkv)?;
+        let mask = self.download_f32(mask)?;
+        assert_eq!(qkv.len(), batch * tokens * 3 * channels);
+        assert_eq!(mask.len(), batch * tokens);
+        let head_dim = channels / heads;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut output = vec![0.0f32; batch * tokens * channels];
+        let mut scores = vec![0.0f32; tokens];
+        for b in 0..batch {
+            for h in 0..heads {
+                let head_start = h * head_dim;
+                for query in 0..tokens {
+                    let mut max_score = f32::NEG_INFINITY;
+                    let mut any_valid = false;
+                    for key in 0..tokens {
+                        if mask[b * tokens + key] <= 0.5 {
+                            scores[key] = f32::NEG_INFINITY;
+                            continue;
+                        }
+                        any_valid = true;
+                        let mut dot = 0.0f32;
+                        for d in 0..head_dim {
+                            let qi = (b * tokens + query) * 3 * channels + head_start + d;
+                            let ki = (b * tokens + key) * 3 * channels + channels + head_start + d;
+                            dot += qkv[qi] * qkv[ki];
+                        }
+                        let score = dot * scale;
+                        scores[key] = score;
+                        max_score = max_score.max(score);
+                    }
+                    if !any_valid {
+                        continue;
+                    }
+                    let mut sum = 0.0f32;
+                    for score in &mut scores {
+                        if *score != f32::NEG_INFINITY {
+                            *score = (*score - max_score).exp();
+                            sum += *score;
+                        } else {
+                            *score = 0.0;
+                        }
+                    }
+                    let inv_sum = 1.0 / sum;
+                    for d in 0..head_dim {
+                        let mut value = 0.0f32;
+                        for key in 0..tokens {
+                            let vi = (b * tokens + key) * 3 * channels + 2 * channels + head_start + d;
+                            value += scores[key] * inv_sum * qkv[vi];
+                        }
+                        output[(b * tokens + query) * channels + head_start + d] = value;
+                    }
+                }
+            }
+        }
+        self.upload_f32(output_shape, &output)
+    }
+
     /// Recompute-based derivative of standard online attention. Inputs are
     /// fused QKV `[B,T,3C]`, context/output gradient `[B,T,C]`, and LSE
     /// `[B,H,T]`; output is fused dQKV `[B,T,3C]`.
