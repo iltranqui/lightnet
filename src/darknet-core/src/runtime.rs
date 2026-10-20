@@ -34048,8 +34048,8 @@ mod tests {
     use super::{
         ConvolutionalParams, ExecutableNetwork, ForwardResult, GpuExecutableNetwork,
         HostAdamLayerState, LayerParams, LayerTrainBuffers, MuonLayerState, Tensor,
-        backward_route, backward_upsample, compute_learning_rate, forward_route, forward_upsample,
-        sgd_update, write_muon_layer_state,
+        backward_reorg, backward_route, backward_upsample, compute_learning_rate, forward_reorg,
+        forward_route, forward_upsample, sgd_update, write_muon_layer_state,
     };
 
     fn fill_wmhf_test_params(executable: &mut ExecutableNetwork) {
@@ -45164,6 +45164,70 @@ num_dwconv=1
                 }
             }
         }
+    }
+
+    #[test]
+    fn reorg_axis_layout_pins_batch_channel_offset_and_adjoint() {
+        use crate::axis_fixture::{axis_tensor, axis_value, nchw_index};
+
+        let regular_network = Network::from_config(
+            ConfigFile::parse_str(
+                "reorg-axis.cfg",
+                "[net]\nchannels=2\nbatch=2\nheight=2\nwidth=4\n\
+                 [reorg]\nstride=2\n",
+            )
+            .expect("regular Reorg cfg parses"),
+        )
+        .expect("regular Reorg network builds");
+        let LayerKind::Reorg(regular_spec) = &regular_network.layers[0].kind else {
+            panic!("expected regular Reorg layer");
+        };
+        let input_shape = regular_network.net.input_shape();
+        let packed_shape = regular_network.layers[0].output_shape;
+        assert_eq!(packed_shape, TensorShape::new(2, 1, 8, 2));
+        let input = Tensor::from_data(input_shape, axis_tensor(input_shape)).expect("Reorg input");
+        let packed = forward_reorg(2, false, &input, packed_shape).expect("regular Reorg forward");
+
+        // C++ reorg_cpu packs each 2x2 spatial offset into a channel block:
+        // k = input_channel + offset_channel * C, offset=(dy,dx), with dx fastest.
+        for n in 0..2 {
+            for c in 0..8 {
+                let in_channel = c % 2;
+                let offset = c / 2;
+                let dy = offset / 2;
+                let dx = offset % 2;
+                for y in 0..1 {
+                    for x in 0..2 {
+                        let want = axis_value(n, in_channel, y * 2 + dy, x * 2 + dx);
+                        assert_eq!(
+                            packed.data[nchw_index(packed_shape, n, c, y, x)],
+                            want,
+                            "wrong Reorg offset/channel at (n={n}, c={c}, y={y}, x={x})"
+                        );
+                    }
+                }
+            }
+        }
+        let packed_seed =
+            Tensor::from_data(packed_shape, axis_tensor(packed_shape)).expect("packed seed");
+        let input_gradient = backward_reorg(regular_spec, &packed_seed, input_shape)
+            .expect("regular Reorg adjoint");
+        for n in 0..2 {
+            for c in 0..2 {
+                for y in 0..2 {
+                    for x in 0..4 {
+                        let packed_channel = c + ((y % 2) * 2 + (x % 2)) * 2;
+                        let want = packed_seed.get(n, packed_channel, y / 2, x / 2);
+                        assert_eq!(input_gradient.get(n, c, y, x), want);
+                    }
+                }
+            }
+        }
+
+        // The C++ reverse path has a source-level divisor defect: reorg_cpu
+        // computes in_c = out_c / stride^2 although reverse's out_c is already
+        // the reduced channel count. Keep this pin scoped to the valid forward
+        // branch until a compiled-C++ oracle resolves that reverse contract.
     }
 
     #[test]
