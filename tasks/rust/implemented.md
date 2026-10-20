@@ -2174,7 +2174,7 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 
 ## 196. LayaScorer native f32 forward
 
-- v0.2.157 (`pending`): native Oxide full and compact f32 composition for channel-major option unpack, biased LayerNorm, H→H connected, exact-erf GELU, H→1 connected and output packing. Actual-device outputs match the Rust CPU reference across two batches and three options; malformed weight extents reject (`oxide_laya_scorer_forward`: 2 passed). `MEM=3G ./tools/test_host.sh laya_scorer`: 16 passed, including existing FakeBackend runtime forward/backward tests. Backward remains CPU-computed; no f16 or training/update path. No local C++ source or compiled-C++ golden; do not claim C++ parity.
+- v0.2.157 (`c31c616d`): native Oxide full and compact f32 composition for channel-major option unpack, biased LayerNorm, H→H connected, exact-erf GELU, H→1 connected and output packing. Actual-device outputs match the Rust CPU reference across two batches and three options; malformed weight extents reject (`oxide_laya_scorer_forward`: 2 passed). `MEM=3G ./tools/test_host.sh laya_scorer`: 16 passed, including existing FakeBackend runtime forward/backward tests. Backward remains CPU-computed; no f16 or training/update path. No local C++ source or compiled-C++ golden; do not claim C++ parity.
 
 ## Not implemented / open (pointer)
 
