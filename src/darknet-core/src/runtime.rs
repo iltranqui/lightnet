@@ -104,11 +104,6 @@ fn graph_conv_spec_needs_host(spec: &GraphConvSpec) -> bool {
             && spec.activation.to_cuda_f32_kind().is_none())
 }
 
-// Geometry, affine input scaling, and per-channel RGB shift are native; the GPU
-// kernel does not yet implement training-only saturation/exposure adjustments.
-fn crop_training_color_augmentation_unsupported(spec: &CropSpec) -> bool {
-    spec.saturation != 1.0 || spec.exposure != 1.0
-}
 
 fn graph_conv_spec_needs_compact_host(spec: &GraphConvSpec) -> bool {
     !matches!(spec.edge_mode, 0 | 1)
@@ -13057,13 +13052,7 @@ where
                     )
                     .map_err(|err| backend_error("avgpool", err))?,
                 (LayerKind::Crop(spec), LayerParams::None) => {
-                    if training && crop_training_color_augmentation_unsupported(spec) {
-                        return Err(Error::UnsupportedLayer {
-                            layer_index: layer.index,
-                            name: "crop_gpu_training_color_augmentation".to_owned(),
-                        });
-                    }
-                    let (cache, _) = plan_crop_forward(
+                    let (cache, adjustments) = plan_crop_forward(
                         spec,
                         layer.input_shape,
                         layer.output_shape,
@@ -13086,6 +13075,18 @@ where
                         .backend
                         .upload_f32(&[cache.input_offsets.len()], &cache.input_offsets)
                         .map_err(|err| backend_error("upload crop input offsets", err))?;
+                    let input_saturations: Vec<f32> =
+                        adjustments.iter().map(|adjustment| adjustment.saturation).collect();
+                    let input_exposures: Vec<f32> =
+                        adjustments.iter().map(|adjustment| adjustment.exposure).collect();
+                    let input_saturations = self
+                        .backend
+                        .upload_f32(&[input_saturations.len()], &input_saturations)
+                        .map_err(|err| backend_error("upload crop saturations", err))?;
+                    let input_exposures = self
+                        .backend
+                        .upload_f32(&[input_exposures.len()], &input_exposures)
+                        .map_err(|err| backend_error("upload crop exposures", err))?;
                     let output = self
                         .backend
                         .crop_bilinear_f32(
@@ -13098,6 +13099,9 @@ where
                             &source_y,
                             &input_scales,
                             &input_offsets,
+                            &input_saturations,
+                            &input_exposures,
+                            training,
                             launch_config,
                         )
                         .map_err(|err| backend_error("GPU crop", err))?;

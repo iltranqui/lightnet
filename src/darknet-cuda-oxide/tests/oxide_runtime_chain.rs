@@ -5792,7 +5792,7 @@ fn crop_native_training_augmentation_and_backward_match_cpu() {
     let net = network(
         "[net]\nwidth=4\nheight=3\nchannels=3\nbatch=2\nadam=0\n\
          [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
-         [crop]\ncrop_width=3\ncrop_height=2\nflip=1\nangle=17\nshift=0.2\n",
+         [crop]\ncrop_width=3\ncrop_height=2\nflip=1\nangle=17\nshift=0.2\nsaturation=1.35\nexposure=1.25\n",
     );
     let mut cpu = ExecutableNetwork::new(net.clone());
     let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));
@@ -5838,20 +5838,6 @@ fn crop_native_training_augmentation_and_backward_match_cpu() {
         close("Crop-chain convolution biases", &gpu_conv.biases, &cpu_conv.biases, 1e-4);
     }
 
-    let unsupported_net = network(
-        "[net]\nwidth=4\nheight=3\nchannels=1\nbatch=1\n\
-         [crop]\ncrop_width=3\ncrop_height=2\nsaturation=1.2\n",
-    );
-    let unsupported_gpu = GpuExecutableNetwork::new(
-        unsupported_net.clone(),
-        OxideBackend::new().expect("Oxide"),
-    );
-    let unsupported_input = patterned(unsupported_net.net.input_shape());
-    let error = match unsupported_gpu.forward_training_with_state(&unsupported_input) {
-        Err(error) => error,
-        Ok(_) => panic!("training color adjustment must be explicitly unsupported"),
-    };
-    assert!(error.to_string().contains("crop_gpu_training_color_augmentation"));
 }
 
 #[test]

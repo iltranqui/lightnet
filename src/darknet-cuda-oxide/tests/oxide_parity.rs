@@ -443,7 +443,7 @@ fn invalid_shapes_return_error() {
         .expect("upsample output shape is wrong");
     assert!(matches!(err, OxideError::Shape(_)), "{err}");
     let err = b
-        .crop_bilinear_f32(&t, &[4], 1, 2, 2, &t, &t, &t, &t, cfg())
+        .crop_bilinear_f32(&t, &[4], 1, 2, 2, &t, &t, &t, &t, &t, &t, false, cfg())
         .err()
         .expect("crop output shape is not NCHW");
     assert!(matches!(err, OxideError::Shape(_)), "{err}");

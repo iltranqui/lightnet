@@ -1912,8 +1912,9 @@ pub trait F32TensorOpsBackend {
     }
     /// Bilinearly sample an NCHW tensor using one source coordinate pair per
     /// batch/output pixel. `input_scales` contains one affine scale per batch,
-    /// and `input_offsets` one affine offset per batch/channel. Adjustments are
-    /// applied to each in-bounds input tap; out-of-bounds taps remain zero.
+    /// and `input_offsets` one affine offset per batch/channel. Saturation and
+    /// exposure are per-batch HSV adjustments, applied to RGB input taps during
+    /// training when `apply_hsv` is true. Out-of-bounds taps remain zero.
     fn crop_bilinear_f32(
         &self,
         x: &Self::Tensor,
@@ -1925,6 +1926,9 @@ pub trait F32TensorOpsBackend {
         source_y: &Self::Tensor,
         input_scales: &Self::Tensor,
         input_offsets: &Self::Tensor,
+        input_saturations: &Self::Tensor,
+        input_exposures: &Self::Tensor,
+        apply_hsv: bool,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
         let _ = (
@@ -1937,6 +1941,9 @@ pub trait F32TensorOpsBackend {
             source_y,
             input_scales,
             input_offsets,
+            input_saturations,
+            input_exposures,
+            apply_hsv,
             config,
         );
         panic!("crop_bilinear_f32 is not implemented by this CUDA backend")

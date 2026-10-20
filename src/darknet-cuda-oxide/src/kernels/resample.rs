@@ -31,6 +31,57 @@ pub unsafe fn atomic_add_f32(p: *mut f32, v: f32) {
     let _old = cell.fetch_add(v, AtomicOrdering::Relaxed);
 }
 
+#[device]
+fn crop_hsv_component(r: f32, g: f32, b: f32, saturation_scale: f32, exposure_scale: f32, channel: usize) -> f32 {
+    let maximum = r.max(g).max(b);
+    let minimum = r.min(g).min(b);
+    let delta = maximum - minimum;
+    let hue = if maximum == 0.0 {
+        -1.0
+    } else if delta == 0.0 {
+        0.0
+    } else if r == maximum {
+        (g - b) / delta + if g < b { 6.0 } else { 0.0 }
+    } else if g == maximum {
+        (b - r) / delta + 2.0
+    } else {
+        (r - g) / delta + 4.0
+    };
+    let hsv_saturation = if maximum == 0.0 { 0.0 } else { delta / maximum };
+    let hsv_saturation = hsv_saturation * saturation_scale;
+    let value = maximum * exposure_scale;
+    let converted = if hsv_saturation == 0.0 {
+        value
+    } else {
+        let index = hue as i32;
+        let fraction = hue - index as f32;
+        let p = value * (1.0 - hsv_saturation);
+        let q = value * (1.0 - hsv_saturation * fraction);
+        let t = value * (1.0 - hsv_saturation * (1.0 - fraction));
+        match (index, channel) {
+            (0, 0) => value,
+            (0, 1) => t,
+            (0, _) => p,
+            (1, 0) => q,
+            (1, 1) => value,
+            (1, _) => p,
+            (2, 0) => p,
+            (2, 1) => value,
+            (2, _) => t,
+            (3, 0) => p,
+            (3, 1) => q,
+            (3, _) => value,
+            (4, 0) => t,
+            (4, 1) => p,
+            (4, _) => value,
+            (_, 0) => value,
+            (_, 1) => p,
+            (_, _) => q,
+        }
+    };
+    converted.max(0.0).min(1.0)
+}
+
 #[cuda_module]
 pub mod kernels {
     use super::*;
@@ -174,6 +225,9 @@ pub mod kernels {
         source_y: &[f32],
         scales: &[f32],
         offsets: &[f32],
+        saturations: &[f32],
+        exposures: &[f32],
+        apply_hsv: bool,
         mut out: DisjointSlice<f32>,
         channels: usize,
         in_h: usize,
@@ -208,7 +262,22 @@ pub mod kernels {
             let wx = if t & 1 == 1 { dx } else { 1.0 - dx };
             let wy = if t >> 1 == 1 { dy } else { 1.0 - dy };
             if tx >= 0 && tx < in_w as i64 && ty >= 0 && ty < in_h as i64 {
-                let sample = x[base + ty as usize * in_w + tx as usize] * scales[b] + offsets[b * channels + c];
+                let spatial = ty as usize * in_w + tx as usize;
+                let pixel = base + spatial;
+                let image_base = b * channels * in_h * in_w;
+                let raw = if apply_hsv && channels >= 3 && c < 3 {
+                    crop_hsv_component(
+                        x[image_base + spatial],
+                        x[image_base + in_h * in_w + spatial],
+                        x[image_base + 2 * in_h * in_w + spatial],
+                        saturations[b],
+                        exposures[b],
+                        c,
+                    )
+                } else {
+                    x[pixel]
+                };
+                let sample = raw * scales[b] + offsets[b * channels + c];
                 value += wy * wx * sample;
             }
             t += 1;

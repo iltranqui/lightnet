@@ -6534,6 +6534,9 @@ impl F32TensorOpsBackend for OxideBackend {
         source_y: &Self::Tensor,
         input_scales: &Self::Tensor,
         input_offsets: &Self::Tensor,
+        input_saturations: &Self::Tensor,
+        input_exposures: &Self::Tensor,
+        apply_hsv: bool,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
         let x_f = self.f32v(x)?;
@@ -6546,6 +6549,10 @@ impl F32TensorOpsBackend for OxideBackend {
         let input_scales = &*input_scales_f;
         let input_offsets_f = self.f32v(input_offsets)?;
         let input_offsets = &*input_offsets_f;
+        let input_saturations_f = self.f32v(input_saturations)?;
+        let input_saturations = &*input_saturations_f;
+        let input_exposures_f = self.f32v(input_exposures)?;
+        let input_exposures = &*input_exposures_f;
         let op = "crop_bilinear_f32";
         if output_shape.len() != 4 || output_shape[1] != channels {
             return Err(shape_err(
@@ -6565,6 +6572,16 @@ impl F32TensorOpsBackend for OxideBackend {
             (source_x.len(), source_y.len()),
             &[input_scales.len(), input_offsets.len()],
         )?;
+        if input_saturations.len() != batch || input_exposures.len() != batch {
+            return Err(shape_err(
+                op,
+                format!(
+                    "expected one saturation/exposure adjustment per batch ({batch}), got {} and {}",
+                    input_saturations.len(),
+                    input_exposures.len()
+                ),
+            ));
+        }
         if x.len() != batch * channels * input_height * input_width {
             return Err(shape_err(
                 op,
@@ -6586,6 +6603,9 @@ impl F32TensorOpsBackend for OxideBackend {
                 &source_y.buf,
                 &input_scales.buf,
                 &input_offsets.buf,
+                &input_saturations.buf,
+                &input_exposures.buf,
+                apply_hsv,
                 &mut out,
                 channels,
                 input_height,

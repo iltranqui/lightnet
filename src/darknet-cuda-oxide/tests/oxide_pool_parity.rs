@@ -680,11 +680,27 @@ fn crop_bilinear_forward_backward_and_fd() {
         let syt = b.upload_f32(&[coords], &sy).unwrap();
         let st = b.upload_f32(&[k.b], &scales).unwrap();
         let ot = b.upload_f32(&[k.b, k.c], &channel_offsets).unwrap();
+        let sat = b.upload_f32(&[k.b], &vec![1.0; k.b]).unwrap();
+        let exp = b.upload_f32(&[k.b], &vec![1.0; k.b]).unwrap();
         let dyt = b.upload_f32(&[k.b, k.c, k.oh, k.ow], &dy).unwrap();
         let name = format!("crop {}x{}x{}x{}->{}x{}", k.b, k.c, k.h, k.w, k.oh, k.ow);
 
         let y = b
-            .crop_bilinear_f32(&xt, &[k.b, k.c, k.oh, k.ow], k.c, k.h, k.w, &sxt, &syt, &st, &ot, cfg())
+            .crop_bilinear_f32(
+                &xt,
+                &[k.b, k.c, k.oh, k.ow],
+                k.c,
+                k.h,
+                k.w,
+                &sxt,
+                &syt,
+                &st,
+                &ot,
+                &sat,
+                &exp,
+                false,
+                cfg(),
+            )
             .unwrap();
         assert_close(
             &format!("{name} fwd"),
