@@ -149,6 +149,70 @@ fn assert_chain(cfg: &str, seed_layer: usize, what: &str) {
 }
 
 #[test]
+fn foveation_film_native_forward_uses_host_hf_source_cache() {
+    let net = network(
+        "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=2\n\
+         [convolutional]\nfilters=1\nsize=1\nactivation=linear\n\
+         [hf]\nparams=learned\npred_hidden=2\ndownsample=1\npred_source_layer=0\n\
+         init_cx=0.05\ninit_cy=-0.04\ninit_radius=0.8\ninit_strength=0.3\n\
+         [foveation_film]\nembed_dim=2\nfilm_init_scale=0.25\nbackprop_to_hf=1\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    if let LayerParams::Convolutional(params) = &mut cpu.params[0] {
+        params.weights.copy_from_slice(&[0.35]);
+        params.biases.copy_from_slice(&[0.1]);
+    }
+    if let LayerParams::HyperbolicFoveation(params) = &mut cpu.params[1] {
+        params.pred_w1.fill(0.025);
+        params.pred_b1.copy_from_slice(&[0.6, 0.7]);
+        params.pred_w2
+            .copy_from_slice(&[0.08, -0.03, 0.04, 0.07, -0.05, 0.06, 0.03, 0.09]);
+        params.pred_b2.copy_from_slice(&[0.1, -0.08, 0.3, 0.2]);
+    }
+    if let LayerParams::FoveationFilm(params) = &mut cpu.params[2] {
+        params.w_embed
+            .copy_from_slice(&[0.2, 0.1, -0.1, 0.2, 0.15, 0.05, 0.1, -0.08]);
+        params.b_embed.copy_from_slice(&[0.5, 0.7]);
+        params.w_gamma.copy_from_slice(&[0.1, -0.2]);
+        params.b_gamma[0] = 0.05;
+        params.w_beta.copy_from_slice(&[0.3, 0.2]);
+        params.b_beta[0] = 0.1;
+    }
+    let mut gpu = GpuExecutableNetwork::new(
+        net.clone(),
+        OxideBackend::new().expect("oxide backend"),
+    );
+    gpu.params = cpu.params.clone();
+    let input = patterned(net.net.input_shape());
+    let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
+    let gpu_forward = gpu
+        .forward_training_with_state(&input)
+        .expect("native FiLM forward");
+    for (index, (expected, actual)) in cpu_forward
+        .layer_outputs
+        .iter()
+        .zip(&gpu_forward.cpu_forward.layer_outputs)
+        .enumerate()
+    {
+        close(
+            &format!("FoveationFilm runtime layer {index}"),
+            &expected.data,
+            &actual.data,
+            2e-5,
+        );
+    }
+    let seed = Tensor::from_data(net.layers[2].output_shape, vec![0.75; 12]).unwrap();
+    let mut seeds = vec![None; net.layers.len()];
+    seeds[2] = Some(seed);
+    cpu.zero_train_buffers();
+    cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+        .expect("CPU backward");
+    gpu.zero_train_buffers_gpu().expect("initialize GPU train buffers");
+    gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+        .expect("HF/FiLM backward host fallback");
+}
+
+#[test]
 fn marker_gather_native_full_compact_backward_and_upstream_sgd_match_cpu() {
     assert_chain(
         "[net]\nwidth=5\nheight=1\nchannels=8\nbatch=2\n\

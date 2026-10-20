@@ -12735,7 +12735,17 @@ where
         training: bool,
         host_copies: bool,
     ) -> Result<GpuForwardState<B::Tensor>> {
-        reject_gpu_hyperbolic_foveation(&self.network, "execution")?;
+        if let Some(layer) = self.network.layers.iter().find(|layer| {
+            matches!(
+                layer.kind,
+                LayerKind::DepthAnything(_) | LayerKind::DptHead(_) | LayerKind::Yolo3d(_)
+            )
+        }) {
+            return Err(Error::UnsupportedLayer {
+                layer_index: layer.index,
+                name: "GPU execution is unsupported for this layer; use the CPU forward path".to_owned(),
+            });
+        }
         let has_batch_normalized_recurrent = self.network.layers.iter().any(|layer| {
             matches!(&layer.kind, LayerKind::Rnn(spec) if spec.batch_normalize)
                 || matches!(&layer.kind, LayerKind::Lstm(spec) if spec.batch_normalize)
@@ -12861,6 +12871,11 @@ where
         let mut kimi_kda_caches: Vec<Option<crate::kimi_kda::KimiKdaForwardCache>> =
             Vec::with_capacity(self.network.layers.len());
         let mut gpu_batch_norm_caches = Vec::with_capacity(self.network.layers.len());
+        let mut hyperbolic_foveation_caches: Vec<Option<HyperbolicFoveationForwardCache>> =
+            Vec::with_capacity(self.network.layers.len());
+        let mut foveation_film_caches: Vec<
+            Option<crate::foveation_film::FoveationFilmForwardCache>,
+        > = Vec::with_capacity(self.network.layers.len());
         let mut yolo_heads = Vec::new();
         let mut modern_heads = Vec::new();
         let mut rng_state = 0x9e37_79b9_u64;
@@ -12899,7 +12914,92 @@ where
             let mut gpu_moe_cache = None;
             let mut gpu_eml_cache = None;
             let mut graph_conv_cache = None;
+            let mut hyperbolic_foveation_cache = None;
+            let mut foveation_film_cache = None;
             let output_gpu = match (&layer.kind, params) {
+                (
+                    LayerKind::HyperbolicFoveation(spec),
+                    LayerParams::HyperbolicFoveation(params),
+                ) => {
+                    let host_input = self
+                        .download_tensor(current_input, layer.input_shape)
+                        .map_err(|err| backend_error("download hyperbolic_foveation input", err))?;
+                    let (host_output, cache) = forward_hyperbolic_foveation(
+                        &self.network,
+                        layer,
+                        spec,
+                        params,
+                        input,
+                        &host_input,
+                        &layer_outputs,
+                    )?;
+                    hyperbolic_foveation_cache = Some(cache);
+                    self.backend
+                        .upload_f32(&tensor_backend_shape(layer.output_shape), &host_output.data)
+                        .map_err(|err| backend_error("upload hyperbolic_foveation output", err))?
+                }
+                (LayerKind::FoveationFilm(spec), LayerParams::FoveationFilm(params)) => {
+                    let hf_cache = hyperbolic_foveation_caches
+                        .get(spec.hf_layer)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "[foveation_film] selected HF layer #{} has no forward cache",
+                                spec.hf_layer
+                            ))
+                        })?;
+                    let batch = layer.input_shape.batch;
+                    let channels = layer.input_shape.channels;
+                    let hf_params = self.backend
+                        .upload_f32(&[batch, spec.param_count], &hf_cache.params_per_batch)
+                        .map_err(|err| backend_error("upload FoveationFilm HF parameters", err))?;
+                    let w_embed = self.backend
+                        .upload_f32(&[spec.embed_dim, spec.param_count], &params.w_embed)
+                        .map_err(|err| backend_error("upload FoveationFilm embedding weights", err))?;
+                    let b_embed = self.backend
+                        .upload_f32(&[spec.embed_dim], &params.b_embed)
+                        .map_err(|err| backend_error("upload FoveationFilm embedding bias", err))?;
+                    let w_gamma = self.backend
+                        .upload_f32(&[channels, spec.embed_dim], &params.w_gamma)
+                        .map_err(|err| backend_error("upload FoveationFilm gamma weights", err))?;
+                    let b_gamma = self.backend
+                        .upload_f32(&[channels], &params.b_gamma)
+                        .map_err(|err| backend_error("upload FoveationFilm gamma bias", err))?;
+                    let w_beta = self.backend
+                        .upload_f32(&[channels, spec.embed_dim], &params.w_beta)
+                        .map_err(|err| backend_error("upload FoveationFilm beta weights", err))?;
+                    let b_beta = self.backend
+                        .upload_f32(&[channels], &params.b_beta)
+                        .map_err(|err| backend_error("upload FoveationFilm beta bias", err))?;
+                    let (output, embedding, gamma, beta) = self.backend
+                        .foveation_film_forward_f32(
+                            current_input,
+                            &hf_params,
+                            &w_embed,
+                            &b_embed,
+                            &w_gamma,
+                            &b_gamma,
+                            &w_beta,
+                            &b_beta,
+                            &tensor_backend_shape(layer.input_shape),
+                            spec.param_count,
+                            spec.embed_dim,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("FoveationFilm native forward", err))?;
+                    foveation_film_cache = Some(crate::foveation_film::FoveationFilmForwardCache {
+                        embedding: self.backend.download_f32(&embedding).map_err(|err| {
+                            backend_error("download FoveationFilm embedding cache", err)
+                        })?,
+                        gamma: self.backend.download_f32(&gamma).map_err(|err| {
+                            backend_error("download FoveationFilm gamma cache", err)
+                        })?,
+                        beta: self.backend.download_f32(&beta).map_err(|err| {
+                            backend_error("download FoveationFilm beta cache", err)
+                        })?,
+                    });
+                    output
+                }
                 (
                     LayerKind::Convolutional(spec),
                     LayerParams::Convolutional(_) | LayerParams::None,
@@ -15123,6 +15223,8 @@ where
             tucker_attention_caches.push(tucker_attention_cache);
             mambavision_caches.push(mambavision_cache);
             kimi_kda_caches.push(kimi_kda_cache);
+            hyperbolic_foveation_caches.push(hyperbolic_foveation_cache);
+            foveation_film_caches.push(foveation_film_cache);
         }
 
         *self.deform_device_caches.borrow_mut() = deform_device_caches;
@@ -15152,8 +15254,8 @@ where
                 wmhf_caches: vec![None; self.network.layers.len()],
                 clifford_caches: vec![None; self.network.layers.len()],
                 recursive_block_caches: vec![None; self.network.layers.len()],
-                hyperbolic_foveation_caches: vec![None; self.network.layers.len()],
-                foveation_film_caches: vec![None; self.network.layers.len()],
+                hyperbolic_foveation_caches,
+                foveation_film_caches,
                 vit_caches,
                 depth_anything_caches: vec![None; self.network.layers.len()],
                 dpt_head_caches: vec![None; self.network.layers.len()],
@@ -15984,7 +16086,6 @@ where
         forward: &GpuForwardState<B::Tensor>,
         layer_output_gradient_seeds: &[Option<Tensor>],
     ) -> Result<()> {
-        reject_gpu_hyperbolic_foveation(&self.network, "backward and updates")?;
         let loss_scale = self.network.net.loss_scale;
         if loss_scale == 1.0 || !(loss_scale > 0.0 && loss_scale.is_finite()) {
             return self.backward_accumulate_gpu_unscaled(forward, layer_output_gradient_seeds);
@@ -19092,7 +19193,9 @@ where
                 | LayerKind::Swin(_)
                 | LayerKind::TuckerAttention(_)
                 | LayerKind::MambaVision(_)
-                | LayerKind::KimiKda(_) => return true,
+                | LayerKind::KimiKda(_)
+                | LayerKind::HyperbolicFoveation(_)
+                | LayerKind::FoveationFilm(_) => return true,
                 // Connected layers are handled on the GPU path with a host
                 // round trip unless their activation or batch norm
                 // (batch-statistics training) is unsupported.
