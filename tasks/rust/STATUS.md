@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.113: native Crop GPU training now applies saturation/exposure HSV transforms in addition to per-channel RGB shift and geometry; actual-Oxide CPU-reference parity covers forward/backward plus SGD/Adam. Crop primitive parity/FD and host crop (10 tests) pass. See `implemented.md` §148. No C++ golden/full-suite claim.
 - v0.2.112: native Crop training now supports per-channel RGB shift in addition to geometry/affine scaling; saturation/exposure HSV adjustments still reject. Actual-Oxide runtime parity including backward and SGD/Adam updates, crop primitive parity/FD, and host crop (10 tests) pass. See `implemented.md` §147. No C++ golden/full-suite claim.
 - v0.2.111: extended native DCNv4 to 31x31/961 active points; actual-Oxide composition and two-step runtime SGD parity pass, 33x33 falls back, and Adam parity remains through 15x15. See `implemented.md` §146. CPU-reference parity only.
 - v0.2.110: extended native DCNv4 to 29x29/841 active points; actual-Oxide composition and two-step runtime SGD parity pass, 31x31 falls back, and Adam parity remains through 15x15. See `implemented.md` §145. CPU-reference parity only.

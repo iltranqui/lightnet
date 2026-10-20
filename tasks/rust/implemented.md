@@ -173,6 +173,7 @@ file is named inline.
 - [145. Extend native DCNv4 through 29x29](#145-extend-native-dcnv4-through-29x29)
 - [146. Extend native DCNv4 through 31x31](#146-extend-native-dcnv4-through-31x31)
 - [147. Native GPU Crop RGB-shift augmentation](#147-native-gpu-crop-rgb-shift-augmentation)
+- [148. Native GPU Crop HSV saturation/exposure](#148-native-gpu-crop-hsv-saturationexposure)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1930,6 +1931,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 147. Native GPU Crop RGB-shift augmentation
 
 - v0.2.112 (`4c0c422f`): native Crop GPU training now applies the seeded per-channel RGB shifts for the first three channels while preserving per-batch affine scaling and zero-padding; channels beyond RGB receive no shift. Saturation/exposure HSV adjustments remain explicitly rejected. Actual-Oxide Conv→Crop CPU-reference parity now uses three input channels and nonzero shift, including backward and SGD/Adam updates. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain crop_native_training_augmentation_and_backward_match_cpu`, `MEM=3G ./tools/test_oxide.sh --test oxide_pool_parity crop_bilinear_forward_backward_and_fd`, and `MEM=3G ./tools/test_host.sh crop` passed (1, 1, and 10 tests). No compiled-C++ golden, full-suite, or performance claim. `cargo fmt --all -- --check` could not complete: it reported unrelated pre-existing formatting diffs and then exhausted memory (~10.1 GB allocation); no formatting changes were applied by that check.
+
+## 148. Native GPU Crop HSV saturation/exposure
+
+- v0.2.113 (`e9205b1d`): Oxide Crop now performs the seeded per-tap RGB→HSV saturation/exposure transform and HSV→RGB clamp on device, matching the CPU reference for RGB inputs. Non-RGB channels retain the existing affine/shift behavior. The Crop runtime parity test covers non-default saturation, exposure, RGB shift, geometry, backward, and SGD/Adam updates; standalone primitive parity/FD and host crop tests also pass. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- crop_native_training_augmentation_and_backward_match_cpu` passed 1, `MEM=3G ./tools/test_oxide.sh --test oxide_pool_parity crop_bilinear_forward_backward_and_fd` passed 1, and `MEM=3G ./tools/test_host.sh crop` passed 10. No compiled-C++ golden, full-suite, or performance claim.
 
 ## Not implemented / open (pointer)
 
