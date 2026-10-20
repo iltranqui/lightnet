@@ -169,6 +169,8 @@ file is named inline.
 - [141. Extend native DCNv4 through 21x21](#141-extend-native-dcnv4-through-21x21)
 - [142. Extend native DCNv4 through 23x23](#142-extend-native-dcnv4-through-23x23)
 - [143. Extend native DCNv4 through 25x25](#143-extend-native-dcnv4-through-25x25)
+- [144. Extend native DCNv4 through 27x27](#144-extend-native-dcnv4-through-27x27)
+- [145. Extend native DCNv4 through 29x29](#145-extend-native-dcnv4-through-29x29)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1910,6 +1912,14 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 143. Extend native DCNv4 through 25x25
 
 - v0.2.108 (`115166ac`): raised native DCNv4 fixed point buffer/runtime gate from 529 to 625 active points. Actual-Oxide composition parity covers 25x25 across group/mask variants; actual-GPU two-step SGD runtime parity extends through 25x25, while Adam runtime parity remains through 15x15. Host gates verify 25x25 is native eligible and 27x27 falls back. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain` passed 3 tests (67.36 s); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed 1 actual-GPU test (478.65 s); `MEM=3G ./tools/test_host.sh dcnv4` passed 31. Its first runtime attempt hit the previously observed near-threshold Adam offset-weight delta mismatch at size=15; rerun passed, with no tolerance change and cause still unresolved. CPU-reference parity only; no compiled-C++ golden, speedup or full-suite claim.
+
+## 144. Extend native DCNv4 through 27x27
+
+- v0.2.109 (`c1fca5bd`): raised native DCNv4 fixed point buffer/runtime gate from 625 to 729 active points. Actual-Oxide composition parity covers 27x27 across group/mask variants; two-step actual-GPU SGD runtime parity extends through 27x27, while Adam remains covered through 15x15. Host gates verify 27x27 is native eligible and 29x29 falls back. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain` passed 3 tests (76.93 s); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed 1 actual-GPU test (501.28 s); `MEM=3G ./tools/test_host.sh dcnv4` passed 31. CPU-reference parity only; no compiled-C++ golden, speedup or full-suite claim.
+
+## 145. Extend native DCNv4 through 29x29
+
+- v0.2.110 (`ce04496e`): raised native DCNv4 fixed point buffer/runtime gate from 729 to 841 active points. Actual-Oxide composition parity covers 29x29 across group/mask variants; two-step actual-GPU SGD runtime parity extends through 29x29, while Adam remains covered through 15x15. Host gates verify 29x29 is native eligible and 31x31 falls back. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain` passed 3 tests (89.26 s); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed 1 actual-GPU test (518.97 s); `MEM=3G ./tools/test_host.sh dcnv4` passed 31. CPU-reference parity only; no compiled-C++ golden, speedup or full-suite claim.
 
 ## Not implemented / open (pointer)
 
