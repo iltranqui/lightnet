@@ -1156,6 +1156,8 @@ mod tests {
         // C++ forward_hyperbolic_foveation_layer builds map_x/map_y as [H,W],
         // stores grid[(b*H*W + y*W + x)*2 + {x,y}], then remaps each NCHW
         // channel plane independently with OpenCV. Hand fixture: B=2,C=2,H=2,W=3.
+        // Coordinates use multiples of 1/32, so OpenCV's INTER_LINEAR lookup
+        // table and the source-derived bilinear hand calculation agree exactly.
         let (batch, channels, height, width) = (2, 2, 2, 3);
         let input: Vec<f32> = (0..batch)
             .flat_map(|n| {
@@ -1171,8 +1173,8 @@ mod tests {
             for y in 0..height {
                 for x in 0..width {
                     let index = ((n * height + y) * width + x) * 2;
-                    grid[index] = 0.25 + 0.5 * x as f32 + 0.1 * n as f32;
-                    grid[index + 1] = 0.2 + 0.3 * y as f32 + 0.05 * n as f32;
+                    grid[index] = 0.25 + 0.5 * x as f32 + 0.125 * n as f32;
+                    grid[index + 1] = 0.125 + 0.5 * y as f32 + 0.0625 * n as f32;
                 }
             }
         }
@@ -1198,8 +1200,8 @@ mod tests {
         }
         let n1_c0_y1_x2 = ((1 * channels) * height + 1) * width + 2;
         assert!(
-            (actual[n1_c0_y1_x2] - 1006.85).abs() < 2e-5,
-            "batch/channel/HW probe must sample x=1.35,y=0.55, not swapped x/y"
+            (actual[n1_c0_y1_x2] - 1008.25).abs() < 2e-5,
+            "batch/channel/HW probe must sample x=1.375,y=0.6875, not swapped x/y"
         );
         assert_ne!(batch, 1);
         assert_ne!(width, height);
