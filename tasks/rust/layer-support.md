@@ -70,8 +70,8 @@ with the command given rather than trusting the number.
 | GPU forward but CPU/mixed backward | 9 |
 | GPU native forward + device backward | 24 |
 | f16 inference | 24 variants (25 section names) |
-| Axis pinned | 28 variants / 31 tests |
-| Axis open | 32 (Tier 1: 6, Tier 2: 15, Tier 3: 3, Tier 4: 8) |
+| Axis pinned | 29 variants / 32 tests |
+| Axis open | 31 (Tier 1: 5, Tier 2: 15, Tier 3: 3, Tier 4: 8) |
 | Axis Rust-only | 5 |
 | Partial/incomplete CPU layers | `Region`, `Detection`, `Yolo3d`; blocked: `Dcnv3`, `DetrDecoder` |
 | GPU Muon | partial hybrid integration: connected matrices use native Oxide momentum/lookahead, Newton–Schulz and direction+decay update; standard non-BN convolution, non-BN EML branches, non-BN MoE router/expert matrices, non-BN GraphConv projection/self/learned-edge matrices with `groups=2` parity, tested `dont_update` gating, and DNOPT6 save/load resume; BN GraphConv forward/backward is native for eligible modes, with rolling stats host-synchronized; Muon state/final updates remain host-managed, non-BN DCNv4 offset projection, non-BN deform_conv main/offset/optional mask matrices, local per-location, RNN, LSTM, deconvolutional, and transformer-family matrices use native Oxide Newton–Schulz with host-managed state/final updates. Convolution/EML/MoE/DCNv4 gradients are downloaded at optimizer boundaries; deform_conv gradients download during native backward. Updated convolution/expert parameters are re-uploaded and DCNv4 snapshots trigger cache refresh on the next forward. BN convolution/EML/MoE/DCNv4/deform_conv remain rejected; GraphConv BN training is native only for eligible edge modes/activations. Connected BN has actual-device output/parameter parity across two Muon updates; supported activations use native connected/BN backward and rolling-stat updates (v0.2.101), while BN gradient accumulation and rolling-stat synchronization remain host-managed. Connected momentum is cached between steps but mirrored to host each update; weights remain host-canonical. Standalone BatchNorm uses host AdamW fallback; other parameter families open |
@@ -92,7 +92,7 @@ with the command given rather than trusting the number.
 | `Reorg` | alias | none | fwd | exact | pin (normal forward; C++ reverse path source-defective) | native | device | yes (inference) |
 | `ChannelSlice` | yes | none | fwd | exact | pin | native | device | yes (inference) |
 | `ChannelShuffle` | yes | none | fwd | exact | pin | native | device | yes (inference) |
-| `Softmax` | alias | none | fwd | exact | T1 | native | device | yes (inference) |
+| `Softmax` | alias | none | fwd | exact | pin | native | device | yes (inference) |
 | `Dropout` | yes | none | fwd | exact | T1 | native | device | yes (inference) |
 | `ScaleChannels` | yes | none | fwd | exact | T1 | native | mixed | yes (inference) |
 | `Sam` | yes | none | fwd | exact | T1 | native f32 / host (unsupported activation) | device / CPU fallback | yes (inference) |
@@ -286,7 +286,7 @@ variants or non-layer work.
 | `Detection` | parsed as identity; C++ decode + loss unimplemented in Rust | needs its own plan |
 | `Contrastive` detection branch | needs the yolo head's per-box class ids; `YoloHeadOutput` carries only the raw tensor | blocked on a head-metadata change |
 | CARPN Stage-2 training | `[obb_refine]` inference only; blocks `detector train -map` for CARPN | after `carpn_network_map_plan.md` |
-| Axis pins | 32 open variants (`T1`–`T4`) plus a per-backlog A2 test | `axis-coverage.md` |
+| Axis pins | 31 open variants (`T1`–`T4`) plus a per-backlog A2 test | `axis-coverage.md` |
 | Conv `reverse` / `deform`, adversarial yolo branch | gradients missing | `todo.md` |
 | `Local`, `Gru` training | Rust-only extensions, partial | `todo.md` |
 | EML BN batch-stat training | CPU uses rolling stats, not C++ batch statistics | `implemented.md` §7 |

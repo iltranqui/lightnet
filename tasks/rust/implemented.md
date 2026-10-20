@@ -160,6 +160,7 @@ file is named inline.
 - [132. Upsample axis pin and ragged reverse extent](#132-upsample-axis-pin-and-ragged-reverse-extent)
 - [133. Reorg forward axis pin and reverse-source finding](#133-reorg-forward-axis-pin-and-reverse-source-finding)
 - [134. ChannelShuffle axis pin](#134-channelshuffle-axis-pin)
+- [135. Softmax grouped-reduction axis pin](#135-softmax-grouped-reduction-axis-pin)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1865,6 +1866,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 134. ChannelShuffle axis pin
 
 - v0.1.035 (`be9738c2`): hand-derived from `Jev_laya:src-lib/channel_shuffle_layer.cpp:11-20,95-113`; named batch-2 non-square NCHW sentinel test pins the group-row/group-column transpose and exact inverse adjoint across spatial planes. `MEM=3G ./tools/test_host.sh shuffle_axis_layout` passed; full `MEM=3G ./tools/test_host.sh axis_layout` passed 31 tests. No compiled-C++ golden.
+
+## 135. Softmax grouped-reduction axis pin
+
+- v0.1.036 (`8a75e857`): hand-derived from `Jev_laya:src-lib/softmax_layer.cpp:75-85` and `blas.cpp:655-665`. The named batch-2 non-square test pins contiguous per-sample flat groups (not a whole-sample or per-channel reduction), stable probabilities, and the matching grouped adjoint. `MEM=3G ./tools/test_host.sh softmax` passed 12; `MEM=3G ./tools/test_host.sh axis_layout` passed 32. No compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 
