@@ -192,7 +192,7 @@ fn foveation_film_native_forward_backward_uses_host_hf_source_cache() {
     let net = network(
         "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=2\n\
          [convolutional]\nfilters=1\nsize=1\nactivation=linear\n\
-         [hf]\nparams=learned\npred_hidden=2\ndownsample=1\npred_source_layer=0\n\
+         [hf]\nparams=learned\npred_hidden=2\ndownsample=1\npred_source_layer=0\ninverse_method=fixed_point\n\
          init_cx=0.05\ninit_cy=-0.04\ninit_radius=0.8\ninit_strength=0.3\n\
          [foveation_film]\nembed_dim=2\nfilm_init_scale=0.25\nbackprop_to_hf=1\n",
     );

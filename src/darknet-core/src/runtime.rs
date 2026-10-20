@@ -13012,17 +13012,41 @@ where
                         &host_input,
                         &layer_outputs,
                     )?;
-                    let grid = self.backend
-                        .upload_f32(
-                            &[
+                    let grid = if spec.inverse_method == crate::model::HfInverseMethod::FixedPoint
+                        && spec.radius_mode == crate::model::HfRadiusMode::Isotropic
+                    {
+                        let params_per_batch = self.backend
+                            .upload_f32(
+                                &[layer.output_shape.batch, 4],
+                                &cache.params_per_batch,
+                            )
+                            .map_err(|err| backend_error("upload HF fixed-point parameters", err))?;
+                        self.backend
+                            .hyperbolic_fixed_point_grid_f32(
+                                &params_per_batch,
                                 layer.output_shape.batch,
                                 layer.output_shape.height,
                                 layer.output_shape.width,
-                                2,
-                            ],
-                            &cache.grid,
-                        )
-                        .map_err(|err| backend_error("upload hyperbolic_foveation grid", err))?;
+                                spec.alpha,
+                                spec.p_exp,
+                                spec.nr_iters,
+                                spec.nr_eta,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("native HF fixed-point grid", err))?
+                    } else {
+                        self.backend
+                            .upload_f32(
+                                &[
+                                    layer.output_shape.batch,
+                                    layer.output_shape.height,
+                                    layer.output_shape.width,
+                                    2,
+                                ],
+                                &cache.grid,
+                            )
+                            .map_err(|err| backend_error("upload hyperbolic_foveation grid", err))?
+                    };
                     let warp_input = match spec.warp_source {
                         crate::model::HfWarpSource::Previous => current_input,
                         crate::model::HfWarpSource::NetworkInput => &input_gpu,

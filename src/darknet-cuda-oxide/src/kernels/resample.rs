@@ -289,6 +289,78 @@ pub mod kernels {
 
     /// Scatter of the crop gradient into the input (`dx` must be zeroed).
     /// `dx` is a raw device pointer because the updates are atomic adds.
+    /// Build the inverse sampling grid for isotropic fixed-point HF mode.
+    /// One thread owns one scalar coordinate; x/y are recomputed deterministically.
+    #[kernel]
+    pub fn hyperbolic_fixed_point_grid(
+        params: &[f32],
+        mut grid: DisjointSlice<f32>,
+        height: usize,
+        width: usize,
+        alpha: f32,
+        p_exp: f32,
+        iterations: usize,
+        eta: f32,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if i >= grid.len() {
+            return;
+        }
+        let spatial = height * width;
+        let pixel = i / 2;
+        let batch = pixel / spatial;
+        let p = pixel % spatial;
+        let ox = p % width;
+        let oy = p / width;
+        let qx = if width > 1 {
+            2.0 * ox as f32 / (width - 1) as f32 - 1.0
+        } else {
+            0.0
+        };
+        let qy = if height > 1 {
+            2.0 * oy as f32 / (height - 1) as f32 - 1.0
+        } else {
+            0.0
+        };
+        let cx = params[batch * 4].max(-0.9).min(0.9);
+        let cy = params[batch * 4 + 1].max(-0.9).min(0.9);
+        let radius = params[batch * 4 + 2].max(0.1).min(2.0);
+        let strength = params[batch * 4 + 3].max(0.0).min(1.0);
+        let mut px = qx.max(-1.0).min(1.0);
+        let mut py = qy.max(-1.0).min(1.0);
+        let safe_alpha = alpha.max(1.0e-4);
+        let safe_exp = p_exp.max(1.0e-4);
+        let mut step = 0usize;
+        while step < iterations {
+            let dx = px - cx;
+            let dy = py - cy;
+            let radius_from_center = (dx * dx + dy * dy).sqrt();
+            let u = if radius_from_center > 1.0e-6 {
+                (safe_alpha * radius_from_center).tanh() / radius_from_center
+            } else {
+                safe_alpha
+            };
+            let weight = if radius_from_center < radius {
+                (1.0 - radius_from_center / radius).max(0.0).powf(safe_exp)
+            } else {
+                0.0
+            };
+            let gain = 1.0 + strength * weight * (u - 1.0);
+            px = (px + eta * (qx - (cx + gain * dx))).max(-1.0).min(1.0);
+            py = (py + eta * (qy - (cy + gain * dy))).max(-1.0).min(1.0);
+            step += 1;
+        }
+        let value = if i & 1 == 0 {
+            (px + 1.0) * 0.5 * width.saturating_sub(1) as f32
+        } else {
+            (py + 1.0) * 0.5 * height.saturating_sub(1) as f32
+        };
+        if let Some(output) = grid.get_mut(index) {
+            *output = value;
+        }
+    }
+
     /// Gather an NCHW tensor through an HF sampling grid in pixel coordinates.
     /// Out-of-bounds taps contribute zero, matching the CPU HF bilinear sampler.
     #[kernel]

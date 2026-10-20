@@ -6528,6 +6528,56 @@ impl F32TensorOpsBackend for OxideBackend {
         Ok(OxideTensorF32::new(dlogit, &[batch, experts]))
     }
 
+    fn hyperbolic_fixed_point_grid_f32(
+        &self,
+        params: &Self::Tensor,
+        batch: usize,
+        height: usize,
+        width: usize,
+        alpha: f32,
+        p_exp: f32,
+        iterations: usize,
+        eta: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let params_f = self.f32v(params)?;
+        let params = &*params_f;
+        let op = "hyperbolic_fixed_point_grid_f32";
+        if batch == 0 || height == 0 || width == 0 {
+            return Err(shape_err(op, "batch and spatial dimensions must be positive".to_owned()));
+        }
+        if params.len() != batch * 4 {
+            return Err(shape_err(
+                op,
+                format!("expected {} isotropic parameters, got {}", batch * 4, params.len()),
+            ));
+        }
+        let grid_len = batch
+            .checked_mul(height)
+            .and_then(|n| n.checked_mul(width))
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| shape_err(op, "grid size overflows".to_owned()))?;
+        let mut grid = self.alloc_uninit(grid_len)?;
+        // SAFETY: each thread owns one grid scalar, dimensions/parameter lengths
+        // were validated, and every thread reads only its batch parameter row.
+        unsafe {
+            self.resample.hyperbolic_fixed_point_grid(
+                &self.stream,
+                launch::elementwise(grid_len, config),
+                &params.buf,
+                &mut grid,
+                height,
+                width,
+                alpha,
+                p_exp,
+                iterations,
+                eta,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(grid, &[batch, height, width, 2]))
+    }
+
     fn hyperbolic_foveation_warp_f32(
         &self,
         input: &Self::Tensor,

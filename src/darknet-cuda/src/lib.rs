@@ -1923,6 +1923,54 @@ pub trait F32TensorOpsBackend {
         }
         self.upload_f32(&[batch, experts], &dlogit)
     }
+    /// Generate the isotropic fixed-point HF sampling grid. Other inverse
+    /// methods/radius modes continue using the explicit host reference path.
+    fn hyperbolic_fixed_point_grid_f32(
+        &self,
+        params: &Self::Tensor,
+        batch: usize,
+        height: usize,
+        width: usize,
+        alpha: f32,
+        p_exp: f32,
+        iterations: usize,
+        eta: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let params = self.download_f32(params)?;
+        assert_eq!(params.len(), batch * 4, "HF fixed-point parameter length");
+        let mut grid = vec![0.0; batch * height * width * 2];
+        for b in 0..batch {
+            let cx = params[b * 4].clamp(-0.9, 0.9);
+            let cy = params[b * 4 + 1].clamp(-0.9, 0.9);
+            let radius = params[b * 4 + 2].clamp(0.1, 2.0);
+            let strength = params[b * 4 + 3].clamp(0.0, 1.0);
+            for y in 0..height {
+                let qy = if height > 1 { 2.0 * y as f32 / (height - 1) as f32 - 1.0 } else { 0.0 };
+                for x in 0..width {
+                    let qx = if width > 1 { 2.0 * x as f32 / (width - 1) as f32 - 1.0 } else { 0.0 };
+                    let mut px = qx.clamp(-1.0, 1.0);
+                    let mut py = qy.clamp(-1.0, 1.0);
+                    for _ in 0..iterations {
+                        let dx = px - cx;
+                        let dy = py - cy;
+                        let r = (dx * dx + dy * dy).sqrt();
+                        let u = if r > 1.0e-6 { (alpha.max(1.0e-4) * r).tanh() / r } else { alpha.max(1.0e-4) };
+                        let weight = if r < radius { (1.0 - r / radius).max(0.0).powf(p_exp.max(1.0e-4)) } else { 0.0 };
+                        let gain = 1.0 + strength * weight * (u - 1.0);
+                        px = (px + eta * (qx - (cx + gain * dx))).clamp(-1.0, 1.0);
+                        py = (py + eta * (qy - (cy + gain * dy))).clamp(-1.0, 1.0);
+                    }
+                    let index = ((b * height + y) * width + x) * 2;
+                    grid[index] = (px + 1.0) * 0.5 * width.saturating_sub(1) as f32;
+                    grid[index + 1] = (py + 1.0) * 0.5 * height.saturating_sub(1) as f32;
+                }
+            }
+        }
+        self.upload_f32(&[batch, height, width, 2], &grid)
+    }
+
     /// Bilinearly sample NCHW input through an HF sampling grid in pixel
     /// coordinates; out-of-bounds taps contribute zero.
     fn hyperbolic_foveation_warp_f32(
