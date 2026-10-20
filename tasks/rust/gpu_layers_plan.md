@@ -7,6 +7,7 @@
 - [Next slice: native f32 FoveationFilm runtime](#next-slice-native-f32-foveationfilm-runtime)
 - [Act-head contract finding](#act-head-contract-finding)
 - [Act-head native gradient math and CLS scatter](#act-head-native-gradient-math-and-cls-scatter)
+- [Next slice: native f32 LayaHead inference](#next-slice-native-f32-layahead-inference)
 - [Next slice: deformable conv forward (wave 1, part 3)](#next-slice-deformable-conv-forward-wave-1-part-3)
 - [Runtime integration plan for `[deform_conv]`](#runtime-integration-plan-for-deform_conv)
 - [Next slice: `[dcnv4]` device path (audit result)](#next-slice-dcnv4-device-path-audit-result)
@@ -557,10 +558,34 @@ Distinguish native forward/gradient primitives from complete native layers,
 selected tests from full-suite coverage and Rust CPU agreement from C++ parity.
 No performance/compiled-C++ claim without actual measurements/golden evidence.
 
+## Next slice: native f32 LayaHead inference
+
+`LayaHead` remains a host fallback in `layer-support.md`; CPU reference
+`laya_head::head_forward` is a frozen, two-block transformer head. This slice
+adds only native f32 forward and does not alter backward/update policy or claim
+compiled-C++ parity.
+
+Bounded implementation and acceptance gates:
+
+1. Re-derive the Rust reference and its C++ source
+   (`Jev_laya:src-lib/laya_head_layer.cpp`): type-embedding selection (fixed
+   `qtype` or input channel), channel-major `[B,C,1,T]` layout, pre-norm
+   LayerNorm, fused QKV, key-padding mask (`mask > 0.5`), per-head scaled
+   softmax attention, output residual, ReLU FFN residual, and exact output
+   layout. Preserve the Rust reference as the numeric oracle; no compiled-C++
+   golden is available.
+2. Add a mask-aware native Oxide attention operation or safely extend the existing flash-attention operation; unmasked flash attention is insufficient. Match all-masked key behavior (zero context before output-projection bias/residual) and avoid an unbounded `T*T` workspace if the online kernel can be extended without changing numerics.
+3. Compose native type-embedding, LayerNorm, projections, masked attention, residuals, and FFN in a dedicated GPU helper. Validate every weight/shape extent before allocation. Upload weights per call so public host edits remain observable; make no residency/speedup claim.
+4. Wire full and compact f32 forward dispatch. Preserve frozen-weight backward semantics and current CPU backward policy; this slice does not add training or optimizer updates.
+5. Add actual-Oxide parity against the Rust CPU reference for multiple heads and two blocks, fixed and input-carried qtype, mixed masks, all-masked rows, and nontrivial weights. Add malformed-shape guards and keep f16 rejected until separately implemented. Run `oxide` focused suites and `runtime::` focused host tests.
+
+The attention-mask contract is the main implementation gate: if the current online kernel cannot represent it with a defensible bounded workspace, stop before runtime dispatch and record the blocker rather than falling back silently.
+
 ## Remaining scope
 
-Act-head runtime backward/update/file loading, other LAYA/transformer
-layers, DCNv4 Adam and excluded-variant host fallbacks, deform host fallbacks,
+Act-head runtime backward/update/file loading, LayaHead native forward
+(planned above), other LAYA/transformer layers, DCNv4 Adam and excluded-variant
+host fallbacks, deform host fallbacks,
 deconvolution unsupported-activation fallback, CPU-only layer GPU paths and GPU
 Muon remain open. Each layer needs device forward/backward/update tests as
 applicable and explicit limits. CPU/config/axis gaps remain open. No green full-
