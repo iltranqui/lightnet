@@ -112,7 +112,7 @@ with the command given rather than trusting the number.
 | `Wmhf` | alias | C++ | fwd | exact | T4 | none | none | no |
 | `Clifford` | yes | C++ | fwd | exact | T4 | none | none | no |
 | `RecursiveBlock` | alias | body only | fwd | exact | T1 | none | none | no |
-| `HyperbolicFoveation` | yes | C++ | fwd | exact | T4 | host fallback in hybrid runtime | host warp/predictor backward; per-layer host gradients | no |
+| `HyperbolicFoveation` | yes | C++ | fwd | exact | T4 | native Oxide bilinear warp; predictor and inverse-grid generation host-side | host warp/predictor adjoint; per-layer host gradients | no |
 | `FoveationFilm` | alias | C++ | fwd | exact | T4 | native Oxide f32 (HF source/cache host-managed) | native FiLM adjoint + host HF backward; host SGD/Adam updates | no |
 | `Vit` | yes | C++ | fwd | exact | pin | host | cpu | no |
 | `Swin` | alias | Rust | fwd | exact | pin | host | cpu | no |
@@ -165,10 +165,11 @@ paths in `runtime.rs` (including the `Gru` match arm).
 | `Gru` training | `UnsupportedLayer` | Native f32 inference (including rolling-stat BN) exists; GPU training/backward remains unsupported | recurrent wave |
 
 `HyperbolicFoveation` and `FoveationFilm` now execute in the full GPU runtime:
-HF sampling/predictor forward and backward remain host helpers; FiLM projections
-and adjoints are native Oxide; SGD/Adam parameter updates are host-side. This is
-a hybrid path, not native HF support or full-layer GPU completion. Muon and
-compact/f16 inference remain rejected.
+Oxide performs the HF NCHW bilinear warp and FiLM projections/adjoints, while HF
+predictor evaluation, inverse-grid generation, and HF warp/predictor backward
+remain host-managed. SGD/Adam parameter updates are host-side. This is a hybrid
+path, not full-layer native HF completion. Muon and compact/f16 inference
+remain rejected.
 
 `Local` has a bounded native f32 forward/backward path since
 v0.2.048; its optimizer remains host-staged and unsupported activations retain

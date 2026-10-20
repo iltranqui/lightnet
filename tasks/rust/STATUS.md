@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.133: added native Oxide HF bilinear warp and wired GPU runtime forward; predictor/grid generation and backward remain host-side. Actual-device output parity and 2 primitive tests pass. See `implemented.md` §169.
 - v0.2.132: added read-only host-fallback train-buffer inspection and actual-Oxide parity checks for every HF/FiLM gradient buffer under two-step SGD and Adam; both tests pass. Native convolution gradients remain checked indirectly by upstream parameter parity; direct input-gradient inspection remains open. See `implemented.md` §168.
 - v0.2.131: actual-Oxide HF/FiLM `train_only_bn` gate parity passes; FiLM parameters remain unchanged after GPU-runtime SGD. Direct input-gradient/train-buffer inspection remains open. See `implemented.md` §167.
 - v0.2.130: actual-Oxide HF/FiLM Adam `burnin_update=1` gate parity passes: FiLM is held at iteration 0 and updated at iteration 1. `train_only_bn` runtime gate and direct gradient-buffer inspection remain open. See `implemented.md` §166.
