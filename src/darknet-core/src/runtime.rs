@@ -8501,7 +8501,8 @@ where
     /// Supports convolutional, maxpool, (local) avgpool, standalone batchnorm,
     /// route, LAYA marker gather, SAM, shortcut (mismatched sources are cropped /
     /// zero-padded like Darknet), upsample (also `reverse`), Logistic sigmoid and
-    /// OMD loss inference pass-through, and yolo-style pass-through layers;
+    /// OMD loss inference pass-through, group-major JevCe softmax, and yolo-style
+    /// pass-through layers;
     /// any other layer returns `UnsupportedLayer` (use `forward_compact`).
     pub fn forward_compact_f16(&self, input: &Tensor) -> Result<GpuForwardSummary> {
         reject_gpu_hyperbolic_foveation(&self.network, "f16 inference")?;
@@ -8546,6 +8547,13 @@ where
                 | LayerKind::GaussianYolo(_)
                 | LayerKind::Detection(_)
                 | LayerKind::Regression(_) => {}
+                LayerKind::JevCe(spec) if !spec.channel_major => {}
+                LayerKind::JevCe(_) => {
+                    return Err(Error::UnsupportedLayer {
+                        layer_index: layer.index,
+                        name: "jev_ce channel-major layout (f16 inference)".to_owned(),
+                    });
+                }
                 LayerKind::Shortcut(spec) => {
                     if spec.from.is_empty() {
                         return Err(Error::UnsupportedLayer {
@@ -8935,6 +8943,38 @@ where
                         launch_config,
                     )
                     .map_err(|err| backend_error("f16 softmax", err))?,
+                (LayerKind::JevCe(spec), LayerParams::None) => {
+                    let per_sample = layer.input_shape.element_count()
+                        / layer.input_shape.batch.max(1);
+                    let scale = self
+                        .backend
+                        .upload_f32(&[1], &[1.0 / spec.temperature.max(1.0e-6)])
+                        .map_err(|err| backend_error("upload JevCe f16 temperature", err))?;
+                    let bias = self
+                        .backend
+                        .upload_f32(&[1], &[0.0])
+                        .map_err(|err| backend_error("upload JevCe f16 bias", err))?;
+                    let scaled = self
+                        .backend
+                        .channel_affine_act_f16(
+                            current_input.expect("jev_ce requires current input"),
+                            Some(&scale),
+                            &bias,
+                            1,
+                            per_sample,
+                            F32ActivationKind::Linear,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("scale JevCe f16 logits", err))?;
+                    self.backend
+                        .softmax_f16(
+                            &scaled,
+                            &tensor_backend_shape(layer.output_shape),
+                            spec.groups,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("f16 JevCe softmax", err))?
+                }
                 (LayerKind::Region(spec), LayerParams::None) => self
                     .backend
                     .region_forward_f16(

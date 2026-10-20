@@ -354,6 +354,47 @@ fn omd_loss_f16_inference_is_device_identity_and_matches_cpu() {
 }
 
 #[test]
+fn jev_ce_f16_inference_matches_cpu_for_group_major_layout() {
+    let cfg = "[net]\nwidth=6\nheight=1\nchannels=1\nbatch=2\n[jev_ce]\ngroups=2\ntemperature=1.5\n";
+    let net = network(cfg);
+    run_pair("jev_ce f16", net.clone(), 73, 1.0, 3e-3);
+
+    let input = input_for(&net, 73 ^ 0x55);
+    let cpu = ExecutableNetwork::new(net.clone())
+        .forward(&input)
+        .expect("CPU JevCe reference");
+    let gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("oxide backend"));
+    let f16 = gpu
+        .forward_compact_f16(&input)
+        .expect("native f16 JevCe softmax");
+    let cpu_output = &cpu.layer_outputs[0];
+    let f16_output = f16.final_output.as_ref().expect("f16 final output");
+    assert_eq!(cpu_output.shape, f16_output.shape);
+    let scale = max_abs(&cpu_output.data);
+    let diff = cpu_output
+        .data
+        .iter()
+        .zip(&f16_output.data)
+        .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+    assert!(
+        diff <= 3e-3 * scale,
+        "CPU/f16 JevCe error {diff} > 3e-3 * {scale}"
+    );
+
+    let channel_major = network(
+        "[net]\nwidth=6\nheight=1\nchannels=1\nbatch=2\n[jev_ce]\ngroups=2\nlayout=cm\n",
+    );
+    let rejected = GpuExecutableNetwork::new(
+        channel_major.clone(),
+        OxideBackend::new().expect("oxide backend"),
+    );
+    assert!(matches!(
+        rejected.forward_compact_f16(&input_for(&channel_major, 74)),
+        Err(Error::UnsupportedLayer { .. })
+    ));
+}
+
+#[test]
 fn unsupported_layers_still_error_cleanly() {
     // Crop training geometry is not part of compact f16 inference.
     let net = network(
