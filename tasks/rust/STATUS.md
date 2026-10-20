@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.095: compact f16 inference now supports native ScaleChannels for per-channel and per-spatial scales. Full Oxide f16 suite passed 14 tests; batch-2 relative max errors vs f32 were 6.633e-4/1.701e-3. Inference only; see `implemented.md` §122.
 - v0.2.094: compact f16 inference now supports native ChannelSlice through half-storage source selection/copy. Full Oxide f16 suite passed 13 tests; batch-2 output relative max error vs f32 was 2.353e-4. Inference only; see `implemented.md` §121.
 - v0.2.093: compact f16 inference now supports native Softmax with f32 stable group reductions. The full Oxide f16 suite passed 12 tests; group-count 1/2 relative max errors vs f32 were 4.106e-4/5.549e-4. Inference only; see `implemented.md` §120.
 - v0.2.092: compact f16 inference now supports Region's layout transpose, objectness sigmoid and optional class softmax. The full f16 Oxide suite passed 11; batch-2 Region relative max errors vs f32 were 2.324e-4/2.856e-4 with softmax off/on. f16 training/backward and truth-loss/decode remain unsupported; see `implemented.md` §119.

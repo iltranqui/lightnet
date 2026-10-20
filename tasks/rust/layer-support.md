@@ -69,7 +69,7 @@ with the command given rather than trusting the number.
 | CPU-only forward, no GPU path (hard reject) | 11 |
 | GPU forward but CPU/mixed backward | 9 |
 | GPU native forward + device backward | 24 |
-| f16 inference | 18 variants (19 section names) |
+| f16 inference | 19 variants (20 section names) |
 | Axis pinned | 24 variants / 27 tests |
 | Axis open | 36 (Tier 1: 10, Tier 2: 15, Tier 3: 3, Tier 4: 8) |
 | Axis Rust-only | 5 |
@@ -94,7 +94,7 @@ with the command given rather than trusting the number.
 | `ChannelShuffle` | yes | none | fwd | exact | T1 | native | device | yes (inference) |
 | `Softmax` | alias | none | fwd | exact | T1 | native | device | yes (inference) |
 | `Dropout` | yes | none | fwd | exact | T1 | native | device | no |
-| `ScaleChannels` | yes | none | fwd | exact | T1 | native | mixed | no |
+| `ScaleChannels` | yes | none | fwd | exact | T1 | native | mixed | yes (inference) |
 | `Sam` | yes | none | fwd | exact | T1 | native f32 / host (unsupported activation) | device / CPU fallback | yes (inference) |
 | `BatchNorm` | yes | C++ | fwd | exact | rust | native inference + batch-statistics training | device backward / host AdamW parameter update | yes |
 | `Crop` | yes | none | fwd | exact | rust | native inference + geometric training (no HSV/color jitter) | device (atomic scatter) | no |
@@ -267,7 +267,7 @@ Accepted by `forward_compact_f16` (`runtime.rs:8389`):
 `convolutional` (not `NORM_CHAN*`), `maxpool`, `local_avgpool`, `avgpool`,
 `batchnorm`, `route`, `channel_slice`, `laya_marker_gather`, `channel_shuffle`,
 `upsample` (incl. `reverse`), `reorg` (forward/reverse),
-`shortcut` (with sources), `sam` (supported activation), `region`, `softmax`, `yolo`, `obb_yolo`, `gaussian_yolo`.
+`shortcut` (with sources), `sam` (supported activation), `scale_channels`, `region`, `softmax`, `yolo`, `obb_yolo`, `gaussian_yolo`.
 
 Everything else returns `UnsupportedLayer`. Note this is inference only: f16
 training is the AMP path (`DARKNET_OXIDE_AMP=1`), which keeps f32 masters, and
