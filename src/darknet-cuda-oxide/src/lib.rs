@@ -32,7 +32,7 @@ pub use fp8::Fp8Format;
 use kernels::bias_scale::BIAS_BACKWARD_THREADS;
 use kernels::{
     activations, amp as amp_k, batchnorm, bias_scale, conv_direct, conv_implicit, convert,
-    deform_sample,
+    deform_sample, foveation_film,
     dcnv4, elementwise, gemm, gemm_f8, gemm_f16, gemm_fp4, gemm_mma, half_ops, im2col,
     layers_extra, muon, optim, pool, quant_fp4, resample, route,
 };
@@ -106,6 +106,7 @@ pub struct OxideBackend {
     resample: resample::kernels::LoadedModule,
     deform_sample: deform_sample::kernels::LoadedModule,
     deform_backward: deform_sample::backward::LoadedModule,
+    foveation_film: foveation_film::kernels::LoadedModule,
     dcnv4: dcnv4::kernels::LoadedModule,
     dcnv4_backward: dcnv4::backward::LoadedModule,
     dcnv4_projection: kernels::dcnv4_projection::kernels::LoadedModule,
@@ -546,6 +547,8 @@ impl OxideBackend {
             .map_err(|err| OxideError::Shape(format!("load deform_sample module: {err:?}")))?;
         let deform_backward = deform_sample::backward::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load deform_sample::backward module: {err:?}")))?;
+        let foveation_film = foveation_film::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load foveation_film module: {err:?}")))?;
         let dcnv4 = dcnv4::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load dcnv4 module: {err:?}")))?;
         let dcnv4_backward = dcnv4::backward::load(&ctx)
@@ -604,6 +607,7 @@ impl OxideBackend {
             layers_extra,
             deform_sample,
             deform_backward,
+            foveation_film,
             dcnv4,
             dcnv4_backward,
             dcnv4_projection,
@@ -8174,6 +8178,135 @@ impl F32TensorOpsBackend for OxideBackend {
         }
         .map_err(launch_err)?;
         Ok(OxideTensorF32::new(out, shape))
+    }
+
+    fn foveation_film_affine_f32(
+        &self,
+        input: &Self::Tensor,
+        gamma: &Self::Tensor,
+        beta: &Self::Tensor,
+        shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let input = self.f32v(input)?;
+        let input = &*input;
+        let gamma = self.f32v(gamma)?;
+        let gamma = &*gamma;
+        let beta = self.f32v(beta)?;
+        let beta = &*beta;
+        if shape.len() != 4 || shape.iter().any(|&dim| dim == 0) {
+            return Err(OxideError::Shape(format!(
+                "foveation_film_affine_f32: expected non-empty NCHW shape, got {shape:?}"
+            )));
+        }
+        let [batch, channels, height, width] = [shape[0], shape[1], shape[2], shape[3]];
+        let spatial = height.checked_mul(width).ok_or_else(|| {
+            OxideError::Shape("foveation_film_affine_f32: spatial extent overflows".to_owned())
+        })?;
+        let channel_count = batch.checked_mul(channels).ok_or_else(|| {
+            OxideError::Shape("foveation_film_affine_f32: channel extent overflows".to_owned())
+        })?;
+        let expected = channel_count.checked_mul(spatial).ok_or_else(|| {
+            OxideError::Shape("foveation_film_affine_f32: tensor extent overflows".to_owned())
+        })?;
+        if input.len() != expected || gamma.len() != channel_count || beta.len() != channel_count {
+            return Err(OxideError::Shape(
+                "foveation_film_affine_f32: tensor extents do not match NCHW / [B,C] layouts".to_owned(),
+            ));
+        }
+        let mut output = self.alloc_uninit(expected)?;
+        // SAFETY: host validation proves the input and [B,C] operands cover
+        // the full launch; each thread owns exactly one output element.
+        unsafe {
+            self.foveation_film.film_affine(
+                &self.stream,
+                launch::elementwise(expected, config),
+                &input.buf,
+                &gamma.buf,
+                &beta.buf,
+                &mut output,
+                channels,
+                spatial,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, shape))
+    }
+
+    fn foveation_film_affine_backward_f32(
+        &self,
+        input: &Self::Tensor,
+        output_gradient: &Self::Tensor,
+        gamma: &Self::Tensor,
+        shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let input = self.f32v(input)?;
+        let input = &*input;
+        let output_gradient = self.f32v(output_gradient)?;
+        let output_gradient = &*output_gradient;
+        let gamma = self.f32v(gamma)?;
+        let gamma = &*gamma;
+        if shape.len() != 4 || shape.iter().any(|&dim| dim == 0) {
+            return Err(OxideError::Shape(format!(
+                "foveation_film_affine_backward_f32: expected non-empty NCHW shape, got {shape:?}"
+            )));
+        }
+        let [batch, channels, height, width] = [shape[0], shape[1], shape[2], shape[3]];
+        let spatial = height.checked_mul(width).ok_or_else(|| {
+            OxideError::Shape(
+                "foveation_film_affine_backward_f32: spatial extent overflows".to_owned(),
+            )
+        })?;
+        let channel_count = batch.checked_mul(channels).ok_or_else(|| {
+            OxideError::Shape(
+                "foveation_film_affine_backward_f32: channel extent overflows".to_owned(),
+            )
+        })?;
+        let expected = channel_count.checked_mul(spatial).ok_or_else(|| {
+            OxideError::Shape(
+                "foveation_film_affine_backward_f32: tensor extent overflows".to_owned(),
+            )
+        })?;
+        if input.len() != expected || output_gradient.len() != expected || gamma.len() != channel_count {
+            return Err(OxideError::Shape(
+                "foveation_film_affine_backward_f32: tensor extents do not match NCHW / [B,C] layouts".to_owned(),
+            ));
+        }
+        let mut dx = self.alloc_uninit(expected)?;
+        let mut dgamma = self.alloc_uninit(channel_count)?;
+        let mut dbeta = self.alloc_uninit(channel_count)?;
+        // SAFETY: checked extents; dx is element-owned and parameter gradients
+        // are reduced by one thread per sample/channel.
+        unsafe {
+            self.foveation_film.film_affine_dx(
+                &self.stream,
+                launch::elementwise(expected, config),
+                &output_gradient.buf,
+                &gamma.buf,
+                &mut dx,
+                channels,
+                spatial,
+            )
+        }
+        .map_err(launch_err)?;
+        unsafe {
+            self.foveation_film.film_affine_param_grads(
+                &self.stream,
+                launch::elementwise(channel_count, config),
+                &input.buf,
+                &output_gradient.buf,
+                &mut dgamma,
+                &mut dbeta,
+                spatial,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok((
+            OxideTensorF32::new(dx, shape),
+            OxideTensorF32::new(dgamma, &[batch, channels]),
+            OxideTensorF32::new(dbeta, &[batch, channels]),
+        ))
     }
 
     fn scale_channels_f32(

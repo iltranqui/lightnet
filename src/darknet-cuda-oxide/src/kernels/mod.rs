@@ -11,6 +11,7 @@ pub mod convert;
 pub mod dcnv4;
 pub mod dcnv4_projection;
 pub mod deform_sample;
+pub mod foveation_film;
 pub mod deconvolutional;
 pub mod elementwise;
 pub mod gemm;

@@ -2689,6 +2689,46 @@ pub trait F32TensorOpsBackend {
         let host = self.download_f32(x)?;
         self.upload_f32(shape, &host_ops::gradient_centralization(&host, f_size))
     }
+    /// Apply per-sample FiLM channel affine to an NCHW tensor.
+    /// `gamma` and `beta` are `[batch, channels]`; output is
+    /// `input * (1 + gamma) + beta`, broadcast over spatial positions.
+    fn foveation_film_affine_f32(
+        &self,
+        input: &Self::Tensor,
+        gamma: &Self::Tensor,
+        beta: &Self::Tensor,
+        shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let x = self.download_f32(input)?;
+        let gamma = self.download_f32(gamma)?;
+        let beta = self.download_f32(beta)?;
+        self.upload_f32(shape, &host_ops::foveation_film::affine(&x, &gamma, &beta, shape))
+    }
+    /// Exact adjoint of [`Self::foveation_film_affine_f32`], returning
+    /// `(d_input, d_gamma, d_beta)` with the latter two `[batch, channels]`.
+    fn foveation_film_affine_backward_f32(
+        &self,
+        input: &Self::Tensor,
+        output_gradient: &Self::Tensor,
+        gamma: &Self::Tensor,
+        shape: &[usize],
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        let x = self.download_f32(input)?;
+        let gradient = self.download_f32(output_gradient)?;
+        let gamma = self.download_f32(gamma)?;
+        let (dx, dgamma, dbeta) =
+            host_ops::foveation_film::affine_backward(&x, &gradient, &gamma, shape);
+        let batch_channels = [shape[0], shape[1]];
+        Ok((
+            self.upload_f32(shape, &dx)?,
+            self.upload_f32(&batch_channels, &dgamma)?,
+            self.upload_f32(&batch_channels, &dbeta)?,
+        ))
+    }
     /// Darknet scale_channels pre-activation: `out[b,c,y,x] = scale * source`
     /// with `scale` shaped `[batch, h*w]` (`scale_wh`) or `[batch, c]`.
     /// `shape` is the NCHW shape of `source` / the output.

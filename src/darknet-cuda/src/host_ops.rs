@@ -7,6 +7,7 @@
 pub mod bilinear_gather;
 pub mod dcnv4;
 pub mod deform_conv;
+pub mod foveation_film;
 pub mod deconvolutional;
 pub mod gelu_erf;
 pub mod graph_conv;
