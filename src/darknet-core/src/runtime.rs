@@ -34020,7 +34020,7 @@ mod tests {
     use super::{
         ConvolutionalParams, ExecutableNetwork, ForwardResult, GpuExecutableNetwork,
         HostAdamLayerState, LayerParams, LayerTrainBuffers, MuonLayerState, Tensor,
-        compute_learning_rate, sgd_update, write_muon_layer_state,
+        backward_route, compute_learning_rate, forward_route, sgd_update, write_muon_layer_state,
     };
 
     fn fill_wmhf_test_params(executable: &mut ExecutableNetwork) {
@@ -44911,6 +44911,107 @@ num_dwconv=1
         assert!((cache.gates[0] - gate0).abs() < 1e-6, "{:?}", cache.gates);
         assert!((cache.gates[0] + cache.gates[1] - 1.0).abs() < 1e-6);
         assert_eq!(cache.expert_outputs.len(), 2);
+    }
+
+    #[test]
+    fn route_axis_layout_pins_named_source_order_group_slice_and_delta_scatter() {
+        use crate::axis_fixture::{axis_tensor, axis_value, nchw_index};
+
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "route-axis.cfg",
+                "[net]\nchannels=4\nbatch=2\nheight=2\nwidth=3\n\
+                 [maxpool]\nsize=1\nstride=1\n\
+                 [convolutional]\nfilters=4\nsize=1\nstride=1\npad=0\
+                 \nbatch_normalize=0\nactivation=linear\n\
+                 [route]\nlayers=-1,-2\ngroups=2\ngroup_id=1\n",
+            )
+            .expect("route axis cfg parses"),
+        )
+        .expect("route axis network builds");
+        let route_index = 2;
+        let LayerKind::Route(spec) = &network.layers[route_index].kind else {
+            panic!("expected route layer");
+        };
+        let source_shape = TensorShape::new(3, 2, 4, 2);
+        let source0 = Tensor::from_data(source_shape, axis_tensor(source_shape))
+            .expect("first axis source");
+        let source1 = Tensor::from_data(
+            source_shape,
+            source0.data.iter().map(|value| -2.0 * value + 0.25).collect(),
+        )
+        .expect("second axis source");
+        let sources = vec![source0.clone(), source1.clone()];
+        let output_shape = network.layers[route_index].output_shape;
+        let output = forward_route(spec, route_index, &sources, output_shape)
+            .expect("route source selection");
+
+        // C++ route forward visits configured layers in order and, for each
+        // source, copies its selected group into the next output channels.
+        // Thus `layers=-1,-2`, `groups=2`, `group_id=1` yields source1 C=2,3
+        // followed by source0 C=2,3 (not the reverse and not group zero).
+        assert_eq!(output_shape, TensorShape::new(3, 2, 4, 2));
+        for n in 0..2 {
+            for h in 0..2 {
+                for w in 0..3 {
+                    let expected = [
+                        -2.0 * axis_value(n, 2, h, w) + 0.25,
+                        -2.0 * axis_value(n, 3, h, w) + 0.25,
+                        axis_value(n, 2, h, w),
+                        axis_value(n, 3, h, w),
+                    ];
+                    for (c, want) in expected.into_iter().enumerate() {
+                        assert_eq!(
+                            output.data[nchw_index(output_shape, n, c, h, w)],
+                            want,
+                            "wrong route source/group at (n={n}, c={c}, h={h}, w={w})"
+                        );
+                    }
+                }
+            }
+        }
+
+        let seed = Tensor::from_data(
+            output_shape,
+            (0..output_shape.batch * output_shape.element_count())
+                .map(|index| index as f32 + 0.5)
+                .collect(),
+        )
+        .expect("route seed");
+        let mut source_grads = vec![Tensor::zeros(source_shape), Tensor::zeros(source_shape)];
+        backward_route(
+            spec,
+            route_index,
+            &seed,
+            &mut source_grads,
+            &network.layers,
+        )
+        .expect("route gradient scatter");
+        for n in 0..2 {
+            for c in 0..4 {
+                for h in 0..2 {
+                    for w in 0..3 {
+                        let index = nchw_index(source_shape, n, c, h, w);
+                        let expected_source1 = if c == 2 {
+                            seed.get(n, 0, h, w)
+                        } else if c == 3 {
+                            seed.get(n, 1, h, w)
+                        } else {
+                            0.0
+                        };
+                        let expected_source0 = if c == 2 {
+                            seed.get(n, 2, h, w)
+                        } else if c == 3 {
+                            seed.get(n, 3, h, w)
+                        } else {
+                            0.0
+                        };
+                        assert_eq!(source_grads[1].data[index], expected_source1);
+                        assert_eq!(source_grads[0].data[index], expected_source0);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
