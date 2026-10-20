@@ -322,7 +322,7 @@ fn foveation_film_native_forward_backward_uses_host_hf_source_cache() {
 fn foveation_film_runtime_adam_updates_match_cpu() {
     let net = network(
         "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=2\nadam=1\n\
-         [hf]\nparams=fixed\nradius_mode=anisotropic\ninit_cx=0.05\ninit_cy=-0.04\ninit_radius_x=0.8\ninit_radius_y=0.9\ninit_strength=0.3\n\
+         [hf]\nparams=learned\npred_hidden=2\ndownsample=1\ninverse_method=newton\nradius_mode=anisotropic\ninit_cx=0.05\ninit_cy=-0.04\ninit_radius_x=0.8\ninit_radius_y=0.9\ninit_strength=0.3\n\
          [foveation_film]\nembed_dim=2\nfilm_init_scale=0.25\n",
     );
     let mut cpu = ExecutableNetwork::new(net.clone());
@@ -368,6 +368,10 @@ fn foveation_film_runtime_adam_updates_match_cpu() {
         panic!("expected FiLM parameter variants");
     };
     close("FoveationFilm Adam HF", &cpu_hf.hf_params, &gpu_hf.hf_params, 2e-5);
+    close("FoveationFilm Adam predictor w1", &cpu_hf.pred_w1, &gpu_hf.pred_w1, 2e-5);
+    close("FoveationFilm Adam predictor b1", &cpu_hf.pred_b1, &gpu_hf.pred_b1, 2e-5);
+    close("FoveationFilm Adam predictor w2", &cpu_hf.pred_w2, &gpu_hf.pred_w2, 2e-5);
+    close("FoveationFilm Adam predictor b2", &cpu_hf.pred_b2, &gpu_hf.pred_b2, 2e-5);
     close("FoveationFilm Adam embedding", &cpu_film.w_embed, &gpu_film.w_embed, 2e-5);
     close("FoveationFilm Adam gamma", &cpu_film.w_gamma, &gpu_film.w_gamma, 2e-5);
     close("FoveationFilm Adam beta", &cpu_film.w_beta, &gpu_film.w_beta, 2e-5);
@@ -405,6 +409,10 @@ fn foveation_film_runtime_adam_updates_match_cpu() {
         panic!("expected FiLM parameter variants");
     };
     close("second-step Adam HF", &cpu_hf.hf_params, &gpu_hf.hf_params, 2e-5);
+    close("second-step Adam predictor w1", &cpu_hf.pred_w1, &gpu_hf.pred_w1, 2e-5);
+    close("second-step Adam predictor b1", &cpu_hf.pred_b1, &gpu_hf.pred_b1, 2e-5);
+    close("second-step Adam predictor w2", &cpu_hf.pred_w2, &gpu_hf.pred_w2, 2e-5);
+    close("second-step Adam predictor b2", &cpu_hf.pred_b2, &gpu_hf.pred_b2, 2e-5);
     close("second-step Adam embedding", &cpu_film.w_embed, &gpu_film.w_embed, 2e-5);
     close("second-step Adam gamma", &cpu_film.w_gamma, &gpu_film.w_gamma, 2e-5);
     close("second-step Adam beta", &cpu_film.w_beta, &gpu_film.w_beta, 2e-5);
