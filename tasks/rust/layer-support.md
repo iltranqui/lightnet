@@ -106,7 +106,7 @@ with the command given rather than trusting the number.
 | `Moe` | alias | C++ | fwd | exact | pin | native | device | no |
 | `EmlConvolutional` | alias | C++ | fwd | exact | pin | native | device / CPU (BN) | no |
 | `GraphConv` | alias | C++ | fwd | exact | T4 | native f32 supported inference and eligible training incl. BN; host otherwise | native supported BN/no-BN modes / CPU fallback unsupported variants | no |
-| `Dcnv4` | alias | C++ | fwd | exact | pin | native (incl. rolling-stat BN, <=841 points, supported scalar/NormalizeChannels* acts incl. Revleaky) / host otherwise | mixed (native math and SGD/Adam update; learned parameter tensors cached across GPU calls; Adam moments resident between updates, sidecar on save) | no |
+| `Dcnv4` | alias | C++ | fwd | exact | pin | native (incl. rolling-stat BN, <=961 points, supported scalar/NormalizeChannels* acts incl. Revleaky) / host otherwise | mixed (native math and SGD/Adam update; learned parameter tensors cached across GPU calls; Adam moments resident between updates, sidecar on save) | no |
 | `DeformConv` | alias | C++ | fwd | exact | T4 | native (dilation 1, no BN) / host otherwise | native (same gate; one host hop for the normalization Jacobian) | no |
 | `DsConv` | alias | C++ | fwd | exact | T4 | none | none | no |
 | `Wmhf` | alias | C++ | fwd | exact | T4 | none | none | no |
@@ -202,7 +202,7 @@ layer count.
 
 | Variant | GPU forward | Missing backward piece |
 |---|---|---|
-| `Dcnv4` excluded/mixed variants | host round trip (>841 points, unsupported activation or another fallback layer) | remaining unsupported/unknown activations and larger kernels; BN and NormalizeChannels* math native since v0.2.014/015; Revleaky native since v0.2.026; 841-point bound since v0.2.110 |
+| `Dcnv4` excluded/mixed variants | host round trip (>961 points, unsupported activation or another fallback layer) | remaining unsupported/unknown activations and larger kernels; BN and NormalizeChannels* math native since v0.2.014/015; Revleaky native since v0.2.026; 961-point bound since v0.2.111 |
 | `Vit` | host round trip | device attention/MLP backward (flash dQ/dK/dV primitives exist) |
 | `Swin` | host round trip | device windowed-attention backward |
 | `TuckerAttention` | host round trip | device low-rank factor backward |
@@ -238,7 +238,7 @@ devices and head sizes (no native kernel at all), even though standard
 | MoE | device forward/backward, device SGD/Adam for router and experts, DNOPT3/4 moments | BN-expert **SGD** still host-side per `STATUS.md`; router parameter values sync to host each step |
 | EML | device forward, device SGD/Adam (DNOPT5), BN scale/beta gradients | BN backward CPU fallback per v71; documents disagree on later state — verify against `implemented.md` §7 before planning |
 | Recurrent | device projections/BPTT, on-device caches and gradient accumulation without BN | BN forward/cache, rolling-stat update and optimizer remain host-side; some parameter-gradient transfers still cross the host |
-| DCNv4 | bounded native f32 forward/backward through 29x29/841 points incl. rolling-stat BN and 0.9 EMA, NormalizeChannels*/Revleaky activations, device gradient accumulation and native SGD/Adam updates; learned parameter tensors persist across forwards/updates with snapshot invalidation (v0.2.030), Adam moments bridge through sidecar only at save/load (v0.2.028); two-step SGD/Adam CPU parity. Non-BN offset-projection Muon uses device-gradient staging at the optimizer boundary and snapshot-triggered cache refresh; actual-Oxide two-step CPU parity (v0.2.055) | >841/unsupported variants host; runtime SGD parity extends through 29x29, Adam remains covered through 15x15; host-canonical mirrors still download after optimizer updates and rolling stats remain host-managed; compact/f16 absent; BN Muon unsupported |
+| DCNv4 | bounded native f32 forward/backward through 31x31/961 points incl. rolling-stat BN and 0.9 EMA, NormalizeChannels*/Revleaky activations, device gradient accumulation and native SGD/Adam updates; learned parameter tensors persist across forwards/updates with snapshot invalidation (v0.2.030), Adam moments bridge through sidecar only at save/load (v0.2.028); two-step SGD/Adam CPU parity. Non-BN offset-projection Muon uses device-gradient staging at the optimizer boundary and snapshot-triggered cache refresh; actual-Oxide two-step CPU parity (v0.2.055) | >961/unsupported variants host; runtime SGD parity extends through 31x31, Adam remains covered through 15x15; host-canonical mirrors still download after optimizer updates and rolling stats remain host-managed; compact/f16 absent; BN Muon unsupported |
 | Deconvolutional | native Oxide f32 forward, activation, input/weight/bias gradients (v0.2.039); actual-GPU CPU parity for Muon and two-step SGD/Adam updates (v0.2.040) | unmapped activations retain legacy host route; weights and gradients cross host boundary for optimizer; no f16 |
 | Shortcut (weighted) | device input/source gradients, exact normalization derivatives | per-input/per-slot weight gradient vector crosses to host; optimizer host-side |
 | Connected | device GEMM + activation, BN folded at inference | BN training and unsupported/unknown activations fall back |
