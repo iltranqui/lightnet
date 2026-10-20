@@ -6938,7 +6938,7 @@ impl F32TensorOpsBackend for OxideBackend {
         ))
     }
 
-    fn hyperbolic_foveation_fixed_point_param_grad_f32(
+    fn hyperbolic_foveation_inverse_param_grad_f32(
         &self,
         params: &Self::Tensor,
         grid_gradient: &Self::Tensor,
@@ -6948,13 +6948,14 @@ impl F32TensorOpsBackend for OxideBackend {
         p_exp: f32,
         iterations: usize,
         eta: f32,
+        newton: bool,
         config: ElementwiseLaunchConfig,
     ) -> Result<Option<Self::Tensor>, Self::Error> {
         let params_f = self.f32v(params)?;
         let params = &*params_f;
         let grid_f = self.f32v(grid_gradient)?;
         let grid_gradient = &*grid_f;
-        let op = "hyperbolic_foveation_fixed_point_param_grad_f32";
+        let op = "hyperbolic_foveation_inverse_param_grad_f32";
         if shape.len() != 4 || shape.contains(&0) {
             return Err(shape_err(op, format!("expected positive NCHW shape, got {shape:?}")));
         }
@@ -6975,13 +6976,23 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut output = self.alloc_uninit(output_len)?;
         // SAFETY: all tensor lengths and dimensions are checked and each
         // thread owns one output batch/parameter lane.
-        unsafe {
-            self.resample.hyperbolic_fixed_point_param_grad(
-                &self.stream, launch::elementwise(output_len, config), &params.buf,
-                &grid_gradient.buf, &mut output, batch, height, width, param_count,
-                alpha, p_exp, iterations, eta,
-            )
-        }.map_err(launch_err)?;
+        if newton {
+            unsafe {
+                self.resample.hyperbolic_newton_param_grad(
+                    &self.stream, launch::elementwise(output_len, config), &params.buf,
+                    &grid_gradient.buf, &mut output, batch, height, width, param_count,
+                    alpha, p_exp, iterations, eta,
+                )
+            }.map_err(launch_err)?;
+        } else {
+            unsafe {
+                self.resample.hyperbolic_fixed_point_param_grad(
+                    &self.stream, launch::elementwise(output_len, config), &params.buf,
+                    &grid_gradient.buf, &mut output, batch, height, width, param_count,
+                    alpha, p_exp, iterations, eta,
+                )
+            }.map_err(launch_err)?;
+        }
         Ok(Some(OxideTensorF32::new(output, &[batch, 5])))
     }
 

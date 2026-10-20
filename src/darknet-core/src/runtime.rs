@@ -16535,24 +16535,22 @@ where
                             config,
                         )
                         .map_err(|err| backend_error("native HF warp backward", err))?;
-                    let mut native_semantic_gradient = None;
-                    if spec.inverse_method == crate::model::HfInverseMethod::FixedPoint {
-                        let batch = warp_input.shape.batch;
-                        let param_count = spec.param_count();
-                        let params_gpu = self.backend.upload_f32(
-                            &[batch, param_count], &cache.params_per_batch,
-                        ).map_err(|err| backend_error("upload HF inverse parameters", err))?;
-                        let shape = tensor_backend_shape(warp_input.shape);
-                        if let Some(semantic) = self.backend
-                            .hyperbolic_foveation_fixed_point_param_grad_f32(
-                                &params_gpu, &native_grid_gradient, &shape, param_count,
-                                spec.alpha, spec.p_exp, spec.nr_iters, spec.nr_eta, config,
-                            )
-                            .map_err(|err| backend_error("native HF fixed-point parameter adjoint", err))? {
-                            native_semantic_gradient = Some(self.backend.download_f32(&semantic)
-                                .map_err(|err| backend_error("download HF semantic parameter gradients", err))?);
-                        }
-                    }
+                    let batch = warp_input.shape.batch;
+                    let param_count = spec.param_count();
+                    let params_gpu = self.backend.upload_f32(
+                        &[batch, param_count], &cache.params_per_batch,
+                    ).map_err(|err| backend_error("upload HF inverse parameters", err))?;
+                    let shape = tensor_backend_shape(warp_input.shape);
+                    let native_semantic_gradient = self.backend
+                        .hyperbolic_foveation_inverse_param_grad_f32(
+                            &params_gpu, &native_grid_gradient, &shape, param_count,
+                            spec.alpha, spec.p_exp, spec.nr_iters, spec.nr_eta,
+                            spec.inverse_method == crate::model::HfInverseMethod::Newton, config,
+                        )
+                        .map_err(|err| backend_error("native HF inverse parameter adjoint", err))?
+                        .map(|semantic| self.backend.download_f32(&semantic)
+                            .map_err(|err| backend_error("download HF semantic parameter gradients", err)))
+                        .transpose()?;
                     let native_grid_gradient = self.backend.download_f32(&native_grid_gradient)
                         .map_err(|err| backend_error("download native HF grid gradient", err))?;
                     let auxiliary = foveation_hf_auxiliary_gradients

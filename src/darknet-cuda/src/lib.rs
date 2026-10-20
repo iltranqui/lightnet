@@ -2342,7 +2342,7 @@ pub trait F32TensorOpsBackend {
     /// semantic `[cx, cy, rx, ry, strength]` order; unsupported backends return
     /// `None` so callers can retain the host reference path.
     #[allow(clippy::too_many_arguments)]
-    fn hyperbolic_foveation_fixed_point_param_grad_f32(
+    fn hyperbolic_foveation_inverse_param_grad_f32(
         &self,
         _params: &Self::Tensor,
         _grid_gradient: &Self::Tensor,
@@ -2352,6 +2352,7 @@ pub trait F32TensorOpsBackend {
         _p_exp: f32,
         _iterations: usize,
         _eta: f32,
+        _newton: bool,
         _config: ElementwiseLaunchConfig,
     ) -> Result<Option<Self::Tensor>, Self::Error> {
         Ok(None)
