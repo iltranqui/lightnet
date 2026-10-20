@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.1.040: added a named batch-2, non-square Crop axis/layout pin for NCHW and centered-window source coordinates; `MEM=3G ./tools/test_host.sh axis_layout` passed 35 tests. Rust contract only, no C++ golden; see `implemented.md` §155 and `axis-coverage.md`.
 - v0.2.119: extended DCNv4 two-step runtime CPU-reference parity to BN Adam at 19x19. Focused runtime test passed (626.18 s), with non-BN Adam through 23x23 and SGD through 31x31. See `implemented.md` §154. No C++ golden/full-suite claim.
 - v0.2.118: extended DCNv4 two-step runtime CPU-reference parity to BN Adam at 17x17. Focused runtime test passed (603.29 s), with non-BN Adam through 23x23 and SGD through 31x31. See `implemented.md` §153. No C++ golden/full-suite claim.
 - v0.2.117: extended DCNv4 two-step runtime CPU-reference parity to non-BN Adam at 23x23. The 593.08 s focused rerun passed after the known near-threshold Adam mismatch recurred at size 15 on the first attempt; tolerance unchanged, cause unresolved. SGD remains covered through 31x31, BN Adam through 15x15. See `implemented.md` §152. No C++ golden/full-suite claim.

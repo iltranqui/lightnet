@@ -98,7 +98,7 @@ classes that apply.
 
 | Status | Count | Notes |
 |---|---|---|
-| Pinned | 31 variants / 34 tests | transformer, LAYA, MoE/EML, DCNv4, DPT, conv/connected, maxpool/avgpool, localavgpool, route/upsample/reorg/shuffle/softmax/scale/SAM, slice/shortcut/deconv |
+| Pinned | 31 C++-backed variants / 35 tests | transformer, LAYA, MoE/EML, DCNv4, DPT, conv/connected, maxpool/avgpool, localavgpool, route/upsample/reorg/shuffle/softmax/scale/SAM, slice/shortcut/deconv; one Rust-only Crop contract test |
 | Open, Tier 1 | 3 | dropout, cost, recursive block |
 | Open, Tier 2 | 15 | yolo family including partial yolo_3d, modern heads, OBB, losses, segmentation, contrastive, logistic, regression |
 | Open, Tier 3 | 3 | rnn, lstm, crnn |
@@ -107,8 +107,7 @@ classes that apply.
 | Ports incomplete/partial | 4 | Region truth-loss/decode; yolo_3d partial; dcnv3 and detr_decoder blocked |
 
 `axis_layout` baseline after the GRU Rust-contract and MaxPool/AvgPool/LocalAvgPool/Connected/Route/Upsample/Reorg pins:
-**34 passed, 946 filtered out** (980 lib tests; run under `MEM=3G`). Every tier below grows
-that count; it must never shrink.
+**35 passed, 947 filtered out** (982 lib tests; run under `MEM=3G`). The new Crop Rust-contract pin is included; every tier below grows that count, which must never shrink.
 
 ## Pinned variants (31)
 
@@ -213,7 +212,7 @@ named test; use `no-C++-reference` rather than claiming C++ parity.
 | Variant | Aliases | Reference | Required pin | Contract test |
 |---|---|---|---|---|
 | `Gru` | `gru` | none | per-sample reset; gate block order | `runtime.rs` `gru_axis_layout_keeps_samples_independent_and_gate_blocks_ordered` |
-| `Crop` | `crop` | GPU-only `Jev_laya:src-lib/crop_layer_kernels.cu` | crop window to output index mapping, `batch=2` | open |
+| `Crop` | `crop` | Rust-only layer; GPU-only `Jev_laya:src-lib/crop_layer_kernels.cu` | crop window to output index mapping, `batch=2` | `runtime.rs` `crop_axis_layout_maps_batches_channels_and_center_window` (Rust contract; no C++ golden) |
 | `Local` | `local` | none | per-sample weight sharing; `C*H*W` to `out` layout | open |
 | `BatchNorm` | `batchnorm` | `Jev_laya:src-lib/batchnorm_layer.cpp` exists but has no `ELayerType` | channel-axis reduction; `(C)` scale/beta order | open |
 | `Detection` | `detection` | none | identity passthrough preserves layout | open |

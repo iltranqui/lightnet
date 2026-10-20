@@ -180,6 +180,7 @@ file is named inline.
 - [152. Extend DCNv4 Adam runtime parity through 23x23](#152-extend-dcnv4-adam-runtime-parity-through-23x23)
 - [153. Extend DCNv4 BN Adam runtime parity through 17x17](#153-extend-dcnv4-bn-adam-runtime-parity-through-17x17)
 - [154. Extend DCNv4 BN Adam runtime parity through 19x19](#154-extend-dcnv4-bn-adam-runtime-parity-through-19x19)
+- [155. Crop batch/spatial axis contract](#155-crop-batchspatial-axis-contract)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1965,6 +1966,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 154. Extend DCNv4 BN Adam runtime parity through 19x19
 
 - v0.2.119 (`6a92ce33`): expanded `dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` to include 19x19 Adam with batch normalization. The focused test passed (1 test; 626.18 s), with non-BN Adam through 23x23 and SGD through 31x31. BN Adam beyond 19x19 remains unclaimed. CPU-reference parity only; no compiled-C++ golden or full-suite claim.
+
+## 155. Crop batch/spatial axis contract
+
+- v0.1.040 (`9ff0411f`): added `crop_axis_layout_maps_batches_channels_and_center_window`, a hand-computed batch-2, two-channel, non-square center-window fixture. It asserts NCHW sample/channel ordering, output indices, and cached source coordinates. `MEM=3G ./tools/test_host.sh axis_layout` passed 35 tests; the focused test passed. This pins the Rust Crop contract only; no compiled-C++ golden or C++ parity claim.
 
 ## Not implemented / open (pointer)
 
