@@ -38,6 +38,48 @@ mod tests {
     }
 
     #[test]
+    fn shuffle_axis_layout_preserves_batch_spatial_planes_and_group_interleave() {
+        use crate::axis_fixture::{axis_tensor, axis_value};
+
+        let shape = TensorShape::new(3, 2, 6, 2);
+        let input = Tensor::from_data(shape, axis_tensor(shape)).expect("axis input");
+        let output = shuffle_channels(&input, 3, false).expect("forward shuffle");
+        for n in 0..2 {
+            for c in 0..6 {
+                let input_channel = (c % 3) * 2 + c / 3;
+                for h in 0..2 {
+                    for w in 0..3 {
+                        let index = ((n * 6 + c) * 2 + h) * 3 + w;
+                        assert_eq!(
+                            output.data[index],
+                            axis_value(n, input_channel, h, w),
+                            "channel-shuffle axis mismatch at (n={n}, c={c}, h={h}, w={w})"
+                        );
+                    }
+                }
+            }
+        }
+
+        let seed = Tensor::from_data(shape, axis_tensor(shape)).expect("axis seed");
+        let input_gradient = shuffle_channels(&seed, 3, true).expect("shuffle adjoint");
+        for n in 0..2 {
+            for c in 0..6 {
+                let output_channel = (c % 2) * 3 + c / 2;
+                for h in 0..2 {
+                    for w in 0..3 {
+                        let index = ((n * 6 + c) * 2 + h) * 3 + w;
+                        assert_eq!(
+                            input_gradient.data[index],
+                            axis_value(n, output_channel, h, w),
+                            "channel-shuffle adjoint mismatch at (n={n}, c={c}, h={h}, w={w})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn shuffle_permutes_channels_and_inverse_restores() {
         let x = ramp(TensorShape::new(1, 1, 6, 1)); // channel c holds value c
         let y = shuffle_channels(&x, 2, false).unwrap();
