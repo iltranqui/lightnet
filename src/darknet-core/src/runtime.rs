@@ -34048,8 +34048,9 @@ mod tests {
     use super::{
         ConvolutionalParams, ExecutableNetwork, ForwardResult, GpuExecutableNetwork,
         HostAdamLayerState, LayerParams, LayerTrainBuffers, MuonLayerState, Tensor,
-        backward_reorg, backward_route, backward_upsample, compute_learning_rate, forward_reorg,
-        forward_route, forward_upsample, sgd_update, write_muon_layer_state,
+        backward_reorg, backward_route, backward_softmax, backward_upsample, compute_learning_rate,
+        forward_reorg, forward_route, forward_softmax, forward_upsample, sgd_update,
+        write_muon_layer_state,
     };
 
     fn fill_wmhf_test_params(executable: &mut ExecutableNetwork) {
@@ -45228,6 +45229,79 @@ num_dwconv=1
         // computes in_c = out_c / stride^2 although reverse's out_c is already
         // the reduced channel count. Keep this pin scoped to the valid forward
         // branch until a compiled-C++ oracle resolves that reverse contract.
+    }
+
+    #[test]
+    fn softmax_axis_layout_pins_per_batch_contiguous_groups_and_adjoint() {
+        use crate::axis_fixture::{axis_tensor, decode_axis_value};
+
+        let shape = TensorShape::new(3, 2, 4, 2);
+        let input = Tensor::from_data(shape, axis_tensor(shape)).expect("softmax axis input");
+        let groups = 3;
+        let per_batch = shape.element_count();
+        let group_size = per_batch / groups;
+        let output = forward_softmax(&input, groups).expect("grouped softmax forward");
+
+        // C++ passes n=inputs/groups, groups, group_offset=n, and batch_offset=inputs:
+        // every sample is split into contiguous flat groups, not per-channel groups.
+        for batch in 0..shape.batch {
+            for group in 0..groups {
+                let start = batch * per_batch + group * group_size;
+                let end = start + group_size;
+                let max_value = input.data[start..end]
+                    .iter()
+                    .copied()
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let exponentials = input.data[start..end]
+                    .iter()
+                    .map(|value| (value - max_value).exp())
+                    .collect::<Vec<_>>();
+                let denominator = exponentials.iter().sum::<f32>();
+                for (offset, exponential) in exponentials.into_iter().enumerate() {
+                    let index = start + offset;
+                    let (n, c, h, w) = decode_axis_value(input.data[index]);
+                    assert_eq!(n, batch);
+                    assert_eq!(
+                        output.data[index],
+                        exponential / denominator,
+                        "wrong softmax group axis at (n={n}, c={c}, h={h}, w={w})"
+                    );
+                }
+                let sum = output.data[start..end].iter().sum::<f32>();
+                assert!(
+                    (sum - 1.0).abs() < 1e-6,
+                    "batch={batch} group={group} sum={sum}"
+                );
+            }
+        }
+
+        let seed = Tensor::from_data(
+            shape,
+            (0..shape.batch * shape.element_count())
+                .map(|index| 0.25 + index as f32 * 0.1)
+                .collect(),
+        )
+        .expect("softmax axis seed");
+        let input_gradient = backward_softmax(&output, &seed, groups).expect("softmax adjoint");
+        for batch in 0..shape.batch {
+            for group in 0..groups {
+                let start = batch * per_batch + group * group_size;
+                let end = start + group_size;
+                let dot = output.data[start..end]
+                    .iter()
+                    .zip(&seed.data[start..end])
+                    .map(|(probability, gradient)| probability * gradient)
+                    .sum::<f32>();
+                for index in start..end {
+                    let want = output.data[index] * (seed.data[index] - dot);
+                    assert_eq!(
+                        input_gradient.data[index],
+                        want,
+                        "softmax adjoint escaped batch/group at flat index {index}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
