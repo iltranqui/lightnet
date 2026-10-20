@@ -10,7 +10,10 @@
 //! the 25 - 100 layer real cfgs (measured values are printed with
 //! `--nocapture`: worst 1.3e-3 relative; the tolerances leave >= 3.8x headroom).
 
-use darknet_core::{ConfigFile, Error, GpuExecutableNetwork, GpuForwardSummary, LayerParams, Network, Tensor};
+use darknet_core::{
+    ConfigFile, Error, ExecutableNetwork, GpuExecutableNetwork, GpuForwardSummary, LayerParams,
+    Network, Tensor,
+};
 use darknet_cuda_oxide::OxideBackend;
 
 struct Rng(u64);
@@ -298,7 +301,27 @@ fn tiny_net_with_avgpool_local_avgpool_batchnorm_reverse_upsample_matches_f32() 
 #[test]
 fn logistic_f16_inference_matches_f32() {
     let cfg = "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\n[logistic]\n";
-    run_pair("logistic f16", network(cfg), 67, 1.0, 2e-3);
+    let net = network(cfg);
+    run_pair("logistic f16", net.clone(), 67, 1.0, 2e-3);
+
+    let input = input_for(&net, 67 ^ 0x55);
+    let cpu = ExecutableNetwork::new(net.clone())
+        .forward(&input)
+        .expect("CPU logistic reference");
+    let gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("oxide backend"));
+    let f16 = gpu
+        .forward_compact_f16(&input)
+        .expect("native f16 logistic");
+    let cpu_output = &cpu.layer_outputs[0];
+    let f16_output = f16.final_output.as_ref().expect("f16 final output");
+    assert_eq!(cpu_output.shape, f16_output.shape);
+    let scale = max_abs(&cpu_output.data);
+    let diff = cpu_output
+        .data
+        .iter()
+        .zip(&f16_output.data)
+        .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+    assert!(diff <= 2e-3 * scale, "CPU/f16 logistic error {diff} > 2e-3 * {scale}");
 }
 
 #[test]
