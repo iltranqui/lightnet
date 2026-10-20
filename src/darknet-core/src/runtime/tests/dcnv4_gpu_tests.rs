@@ -542,17 +542,23 @@ fn dcnv4_gpu_retains_host_cache_for_excluded_and_mixed_variants() {
     let LayerKind::Dcnv4(spec) = &mut large.layers[0].kind else {
         unreachable!()
     };
-    spec.size = 17;
-    spec.padding = 8;
-    for network in [
+    spec.size = 19;
+    spec.padding = 9;
+    for (network_index, network) in [
         large,
         dcnv4_network(
             "",
-            "[deconvolutional]\nfilters=2\nsize=1\nstride=1\nactivation=linear\n",
+            "[deform_conv]\nfilters=2\ngroups=2\nsize=1\nmask=1\nbatch_normalize=1\nactivation=linear\n",
         ),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
-        assert!(gpu.requires_cpu_backward_fallback());
+        assert!(
+            gpu.requires_cpu_backward_fallback() || super::super::has_host_only_deform(&network),
+            "expected host fallback for case {network_index}"
+        );
         let input = Tensor::filled(network.net.input_shape(), 0.2);
         let forward = gpu.forward_training_with_state(&input).unwrap();
         assert!(forward.cpu_forward.dcnv4_caches[0].is_some());

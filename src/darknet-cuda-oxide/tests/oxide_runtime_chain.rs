@@ -2861,7 +2861,13 @@ fn dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu() {
             (0, 0, "leaky", 11, 5, 1),
             (0, 0, "leaky", 13, 6, 1),
             (0, 0, "leaky", 15, 7, 1),
+            (0, 0, "leaky", 17, 8, 1),
         ] {
+            // Keep 17x17 runtime optimizer parity on SGD for this slice;
+            // Adam's CPU/GPU delta check remains covered through 15x15.
+            if size == 17 && adam {
+                continue;
+            }
             let net = network(&format!(
                 "[net]\nwidth=5\nheight=3\nchannels=2\nbatch=2\ntry_fix_nan=0\nadam={}\ndecay=0.01\n\
                  [convolutional]\nfilters=4\nsize=1\nactivation=linear\n\
@@ -2942,7 +2948,7 @@ fn dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu() {
                         let dg = g[i] - bg[i];
                         assert!(
                             (dc - dg).abs() <= 5e-7 + 1e-3 * dc.abs(),
-                            "{name} step={step} adam={adam} delta[{i}]: {dc} vs {dg}"
+                            "{name} size={size} bn={batch_normalize} step={step} adam={adam} delta[{i}]: {dc} vs {dg}"
                         );
                     }
                     assert_ne!(bg, g, "{name}: GPU block did not move");

@@ -45352,6 +45352,30 @@ num_dwconv=1
     }
 
     #[test]
+    fn dcnv4_native_gate_accepts_17x17_and_rejects_19x19() {
+        for (size, expected_host) in [(17, false), (19, true)] {
+            let padding = size / 2;
+            let cfg = format!(
+                "[net]\nwidth=5\nheight=3\nchannels=2\nbatch=1\n\
+                 [dcnv4]\nfilters=2\nsize={size}\npadding={padding}\n\
+                 groups=1\nd_stride=1\nactivation=linear\n"
+            );
+            let network = Network::from_config(
+                ConfigFile::parse_str("inline.cfg", &cfg).expect("DCNv4 gate cfg"),
+            )
+            .expect("DCNv4 gate network");
+            let LayerKind::Dcnv4(spec) = &network.layers[0].kind else {
+                panic!("expected DCNv4 layer");
+            };
+            assert_eq!(
+                super::dcnv4_gpu::needs_host(spec),
+                expected_host,
+                "unexpected native gate for size={size}"
+            );
+        }
+    }
+
+    #[test]
     fn softmax_axis_layout_pins_per_batch_contiguous_groups_and_adjoint() {
         use crate::axis_fixture::{axis_tensor, decode_axis_value};
 
