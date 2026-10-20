@@ -126,8 +126,10 @@ Bounded native slice:
     HF GPU backward (v0.2.139). Primitive CPU-formula and finite-difference
     checks pass; two-step SGD/Adam runtime parity passes.
 12. [ ] Expose and compare runtime input gradients directly; replace the
-    remaining host recomputation for HF grid-to-parameter/predictor gradients.
-    Preserve the explicit host boundary until verified. Actual-Oxide gates cover
+    remaining host inverse-point parameter Jacobian and predictor backward with
+    native math. Runtime now consumes the native grid adjoint for HF parameter
+    gradients (v0.2.140); the predictor-source adjoint remains host-managed.
+    Actual-Oxide gates cover
     compact f32/f16, Muon, SGD `dont_update`, Adam `burnin_update`, and SGD
     `train_only_bn` (v0.2.128–131). No compiled-C++ GPU-parity claim.
 
@@ -147,17 +149,16 @@ buffers against CPU after actual-Oxide backward. v0.2.133 adds native Oxide bili
 inverse-grid generation; v0.2.135 adds the predictor MLP; v0.2.136 adds Newton
 inversion; v0.2.137 extends both grid methods and learned predictors to
 anisotropic radii. v0.2.139 adds native Oxide warp input/grid adjoints and uses
-native input gradients in HF GPU backward. Actual-Oxide runtime tests cover
-learned anisotropic fixed-point SGD and learned anisotropic Newton Adam,
-comparing predictor and FiLM parameter updates over two steps. HF
-parameter/predictor backward remains host-managed; the native grid adjoint is
-not yet consumed by that path. Direct runtime input-gradient inspection remains
-open.
+native input gradients in HF GPU backward; v0.2.140 consumes the native grid
+adjoint for host inverse-point HF parameter gradients. Actual-Oxide runtime
+tests cover learned anisotropic fixed-point SGD and learned anisotropic Newton
+Adam, comparing predictor and FiLM parameter updates over two steps. Predictor
+backward and direct runtime input-gradient inspection remain open.
 
 This remains an open plan, not evidence of a complete native layer. Native HF
-coverage includes forward for isotropic and anisotropic modes plus the native
-warp input adjoint; HF parameter/predictor backward remains hybrid/host-managed.
-Compact f16 remains deferred.
+coverage includes forward for isotropic and anisotropic modes plus native warp
+input/grid adjoints; inverse-point HF parameter Jacobian and predictor backward
+remain hybrid/host-managed. Compact f16 remains deferred.
 
 ## Act-head contract finding
 

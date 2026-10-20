@@ -201,6 +201,7 @@ file is named inline.
 - [173. Native anisotropic HF predictor and inverse grids](#173-native-anisotropic-hf-predictor-and-inverse-grids)
 - [174. Learned anisotropic Newton Adam runtime parity](#174-learned-anisotropic-newton-adam-runtime-parity)
 - [175. Native HF warp adjoints](#175-native-hf-warp-adjoints)
+- [176. Native HF grid-adjoint consumption](#176-native-hf-grid-adjoint-consumption)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2070,6 +2071,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 175. Native HF warp adjoints
 
 - v0.2.139 (`e4aed189`): added Oxide input-scatter and shared-grid-reduction adjoints for HF bilinear warp; GPU runtime now uses the native input gradient when propagating through HF. `MEM=3G ./tools/test_oxide.sh --test oxide_hyperbolic_foveation` passed 6 tests, including CPU-formula comparisons and selected input/grid finite differences. Actual-Oxide learned-anisotropic fixed-point SGD and learned-anisotropic Newton Adam two-step runtime parity passed; focused host FoveationFilm tests passed 12. Runtime still computes HF parameter/predictor adjoints through the host reference and currently does not consume the returned native grid adjoint; direct inspection of runtime input-gradient tensors remains open. No compiled-C++ or performance claim.
+
+## 176. Native HF grid-adjoint consumption
+
+- v0.2.140 (`9cbe1220`): GPU runtime now downloads the native warp grid adjoint and feeds it to the exact Rust inverse-point parameter Jacobian, avoiding a duplicate host bilinear-warp backward for parameter gradients. HF predictor-source backward and direct runtime input-gradient inspection remain open. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_native_forward_backward_uses_host_hf_source_cache` and `... foveation_film_runtime_adam_updates_match_cpu` passed; `MEM=3G ./tools/test_host.sh hyperbolic_foveation` passed 30 tests after replacing a stale GPU-rejection assertion with forward/backward/update coverage; `MEM=3G ./tools/test_host.sh foveation_film` passed 12. No compiled-C++ or performance claim.
 
 ## Not implemented / open (pointer)
 
