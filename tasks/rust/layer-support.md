@@ -122,7 +122,7 @@ with the command given rather than trusting the number.
 | `DepthAnything` | yes | C++ | frozen | frozen | T4 | none | none | no |
 | `DptHead` | alias | C++ | fwd | exact | pin | none | none | no |
 | `LayaEncoder` | yes | C++ | frozen | frozen | pin | host | cpu | no |
-| `LayaHead` | yes | C++ | frozen | frozen | pin | host | cpu | no |
+| `LayaHead` | yes | C++ | frozen | frozen | pin | host (masked-attention primitive native; runtime not integrated) | cpu | no |
 | `LayaScorer` | yes | C++ | frozen | frozen | pin | native | device | no |
 | `LayaMarkerGather` | yes | none | fwd | exact | pin | native | device | yes |
 | `LayaActHead` | yes | C++ | fwd | exact (CPU path) | pin | native | cpu (primitive native) | yes (compact inference; training unsupported) |

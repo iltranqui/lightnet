@@ -28,7 +28,7 @@ deliverable. Sparse MoE remains unstarted.
 ## Resume point
 
 Marker gather is native in f32 full/compact forward/backward and f16 compact
-inference (v0.2.001–002). v0.2.149 adds compact f16 Logistic sigmoid through the native half-storage channel-affine activation kernel; v0.2.150 adds direct CPU-reference parity. v0.2.151 adds OMD loss inference as a device identity pass-through. The full `oxide_runtime_f16` suite passes 20 tests; these paths are inference only. v0.2.152 adds group-major JevCe compact f16 inference via native temperature scaling and softmax; v0.2.153 adds native channel-major NCHW group-softmax. Both layouts pass CPU parity. v0.2.154 adds compact f16 LAYA act-head with native half-storage feature extraction and exact-erf GELU; CPU-reference output parity and all 22 f16 tests pass. Act-head inference now supports f32 and compact f16; training/backward/update and shared-file loading gaps remain. Act-head features/exact-erf primitives are native f32
+inference (v0.2.001–002). v0.2.149 adds compact f16 Logistic sigmoid through the native half-storage channel-affine activation kernel; v0.2.150 adds direct CPU-reference parity. v0.2.151 adds OMD loss inference as a device identity pass-through. The full `oxide_runtime_f16` suite passed 20 tests at that increment; these paths are inference only. v0.2.152 adds group-major JevCe compact f16 inference via native temperature scaling and softmax; v0.2.153 adds native channel-major NCHW group-softmax. Both layouts pass CPU parity. v0.2.154 adds compact f16 LAYA act-head with native half-storage feature extraction and exact-erf GELU; CPU-reference output parity and all 22 f16 tests pass. v0.2.155 adds the standalone native LayaHead masked-attention primitive; runtime composition remains open. Act-head inference now supports f32 and compact f16; training/backward/update and shared-file loading gaps remain. Act-head features/exact-erf primitives are native f32
 (v0.2.003–004), and full/compact act-head f32 forward is native in v0.2.005.
 Evidence/limits are in `implemented.md` §§41–45. Do not repeat these ports.
 Act-head uses four uncached weight uploads per forward; no residency/speedup
@@ -567,17 +567,17 @@ compiled-C++ parity.
 
 Bounded implementation and acceptance gates:
 
-1. Re-derive the Rust reference and its C++ source
+1. [x] Re-derive the Rust reference and its C++ source
    (`Jev_laya:src-lib/laya_head_layer.cpp`): type-embedding selection (fixed
    `qtype` or input channel), channel-major `[B,C,1,T]` layout, pre-norm
    LayerNorm, fused QKV, key-padding mask (`mask > 0.5`), per-head scaled
    softmax attention, output residual, ReLU FFN residual, and exact output
    layout. Preserve the Rust reference as the numeric oracle; no compiled-C++
-   golden is available.
-2. Add a mask-aware native Oxide attention operation or safely extend the existing flash-attention operation; unmasked flash attention is insufficient. Match all-masked key behavior (zero context before output-projection bias/residual) and avoid an unbounded `T*T` workspace if the online kernel can be extended without changing numerics.
+   golden is available. Source audit is recorded in this section.
+2. [x] Add a distinct mask-aware native Oxide attention operation. It keeps online softmax workspace linear in sequence length, skips keys whose mask is `<= 0.5`, and yields zero context for an all-masked row. The actual-device test checks CPU-formula parity and malformed extents (`oxide_laya_head_attention`, 2 tests). Runtime composition remains open.
 3. Compose native type-embedding, LayerNorm, projections, masked attention, residuals, and FFN in a dedicated GPU helper. Validate every weight/shape extent before allocation. Upload weights per call so public host edits remain observable; make no residency/speedup claim.
 4. Wire full and compact f32 forward dispatch. Preserve frozen-weight backward semantics and current CPU backward policy; this slice does not add training or optimizer updates.
-5. Add actual-Oxide parity against the Rust CPU reference for multiple heads and two blocks, fixed and input-carried qtype, mixed masks, all-masked rows, and nontrivial weights. Add malformed-shape guards and keep f16 rejected until separately implemented. Run `oxide` focused suites and `runtime::` focused host tests.
+5. Add actual-Oxide layer parity against the Rust CPU reference for multiple heads and two blocks, fixed and input-carried qtype, mixed masks, all-masked rows, and nontrivial weights. Add malformed-shape guards and keep f16 rejected until separately implemented. Run `oxide` focused suites and `runtime::` focused host tests.
 
 The attention-mask contract is the main implementation gate: if the current online kernel cannot represent it with a defensible bounded workspace, stop before runtime dispatch and record the blocker rather than falling back silently.
 

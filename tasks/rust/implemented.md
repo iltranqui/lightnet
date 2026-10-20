@@ -219,6 +219,7 @@ file is named inline.
 - [191. JevCe group-major compact f16 inference](#191-jevce-group-major-compact-f16-inference)
 - [192. JevCe channel-major compact f16 inference](#192-jevce-channel-major-compact-f16-inference)
 - [193. LAYA act-head compact f16 inference](#193-laya-act-head-compact-f16-inference)
+- [194. LayaHead masked attention primitive](#194-layahead-masked-attention-primitive)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2160,6 +2161,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 193. LAYA act-head compact f16 inference
 
 - v0.2.154 (`pending`): added native Oxide half-storage LAYA feature extraction and exact-erf GELU, composing the existing f16 connected operation for both MLP layers in compact inference. Actual-Oxide final output matches the CPU reference (relative max error `7.436e-5`); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed all 22 tests, and `oxide_laya_act_forward` passed both tests. Inference only; act-head backward/update and weight-file loading gaps remain open. No compiled-C++ golden.
+
+## 194. LayaHead masked attention primitive
+
+- v0.2.155 (`pending`): added `F32TensorOpsBackend::laya_head_attention_f32` with a native Oxide online-softmax kernel for fused QKV and key-padding masks. Actual-Oxide parity against a direct CPU formula covers mixed masks and all-masked rows; shape-extent rejection passes (`oxide_laya_head_attention`: 2 tests). The `LayaHead` runtime remains host-fallback; type embedding, LayerNorm, projections, residuals, FFN, and runtime dispatch are still open. Source audit: Rust `laya_head::head_forward` and `Jev_laya:src-lib/laya_head_layer.cpp`; no compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 
