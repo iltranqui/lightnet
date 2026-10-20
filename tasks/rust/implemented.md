@@ -1962,7 +1962,7 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 
 ## 152. Extend DCNv4 Adam runtime parity through 23x23
 
-- v0.2.117 (`7653d08f`): expanded `dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` to include non-BN 23x23 Adam runtime parity. The focused test passed on rerun (1 test; 593.08 s), including SGD through 31x31, non-BN Adam through 23x23, and BN Adam through 15x15. The initial attempt repeated the known near-threshold size=15 Adam offset-weight delta mismatch; rerun passed with unchanged tolerance. Cause remains unresolved. CPU-reference parity only; no compiled-C++ golden or full-suite claim.
+- v0.2.117 (`7653d08f`): expanded `dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` to include non-BN 23x23 Adam runtime parity. The focused test passed on rerun (1 test; 593.08 s), including SGD through 31x31, non-BN Adam through 23x23, and BN Adam through 15x15. The initial attempt repeated the known near-threshold size=15 Adam offset-weight delta mismatch; rerun passed with unchanged tolerance. A later full `oxide_runtime_chain` run and targeted rerun both reproduced that size=15 non-BN Adam mismatch, so the passing bound is currently unstable pending cause/fix and clean rerun. Cause remains unresolved. CPU-reference parity only; no compiled-C++ golden or full-suite claim.
 
 ## 153. Extend DCNv4 BN Adam runtime parity through 17x17
 
