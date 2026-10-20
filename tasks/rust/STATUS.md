@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.1.028: adjusted HF pin sample fractions to align with OpenCV's 1/32 `INTER_LINEAR` lookup table; all 37 axis tests pass. See `implemented.md` §186.
 - v0.1.027: added the named HyperbolicFoveation NCHW/grid-axis pin; the full axis filter passes 37 tests. See `implemented.md` §185.
 - v0.2.148: HF/FiLM GPU Muon sidecar resume now matches uninterrupted CPU continuation across predictor and FiLM matrix/bias blocks. See `implemented.md` §184.
 - v0.2.147: added actual-Oxide HF/FiLM Muon `dont_update` gate parity; the gated step preserves Film parameters and the following step resumes updates. See `implemented.md` §183.

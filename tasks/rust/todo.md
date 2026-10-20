@@ -656,6 +656,7 @@ Immediately next, in dependency order:
 - [x] v0.1.030 LocalAvgPool axis contract: non-square B=2 window/output order, odd kernel, unequal strides, padding, and overlap-summed adjoint are pinned with hand-computed expectations. See `implemented.md` §112.
 - [ ] Axis tiers 1-4 (see `axis-coverage.md`): add the remaining named pins (27 C++-backed variants currently open); each behavior fix gets its own version. Do not weaken a pin to match the implementation.
 - [x] **v0.1.040: Crop batch/spatial axis pin.** Named batch-2, two-channel, non-square test asserts center-window output ordering and cached sample coordinates. Axis filter passes 35 tests. Rust contract only; no C++ golden. See `implemented.md` §155.
+- [x] **v0.1.028: HF axis fixture interpolation precision.** Fixture grid fractions now lie on OpenCV's 1/32 `INTER_LINEAR` table; the full 37-test axis filter passes. See `implemented.md` §186.
 - [x] **v0.1.027: HyperbolicFoveation axis/layout pin.** Added a named B=2, C=2, H=2, W=3 source-derived NCHW/grid `(x,y)` test; full axis filter passes 37 tests. No compiled-C++ golden. See `implemented.md` §185.
 - [x] **v0.1.041: FoveationFilm axis/layout pin.** Promoted the hand-computed batch/channel affine test to the named `axis_layout` filter; it pins per-batch HF embedding and per-channel gamma/beta blocks. Axis filter passes 36 tests. Hand-derived from C++ source; no compiled-C++ golden. See `implemented.md` §156.
 

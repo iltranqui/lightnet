@@ -211,6 +211,7 @@ file is named inline.
 - [183. HF/FiLM GPU Muon update gate](#183-hffilm-gpu-muon-update-gate)
 - [184. HF/FiLM GPU Muon sidecar resume](#184-hffilm-gpu-muon-sidecar-resume)
 - [185. HyperbolicFoveation axis/layout pin](#185-hyperbolicfoveation-axislayout-pin)
+- [186. HF axis fixture matches OpenCV interpolation taps](#186-hf-axis-fixture-matches-opencv-interpolation-taps)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2120,6 +2121,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 185. HyperbolicFoveation axis/layout pin
 
 - v0.1.027 (`pending`): added `hyperbolic_foveation_axis_layout_keeps_batch_channel_hw_and_grid_xy`, a named source-derived pin using B=2, C=2, H=2, W=3 and unique N/C/H/W sentinels. It hand-computes bilinear outputs from the C++ `map_x/map_y` indexing and NCHW per-channel `cv::remap` loop at `Jev_laya:src-lib/hyperbolic_foveation_layer.cpp:1341-1441`; a probe explicitly distinguishes x/y transposition. `MEM=3G ./tools/test_host.sh hyperbolic_foveation_axis_layout` passed, and `MEM=3G ./tools/test_host.sh axis_layout` passed all 37 tests. Hand-derived from source; no compiled-C++ golden.
+
+## 186. HF axis fixture matches OpenCV interpolation taps
+
+- v0.1.028 (`42cfdaf3`): refined the HF axis fixture coordinates to exact multiples of OpenCV `INTER_LINEAR`'s 1/32 interpolation table, preventing the hand-computed bilinear expectations from relying on non-table fractions. The updated `MEM=3G ./tools/test_host.sh axis_layout` passed all 37 tests. This is a fixture precision correction; no compiled-C++ golden is available.
 
 ## Not implemented / open (pointer)
 
