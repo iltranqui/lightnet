@@ -401,6 +401,49 @@ fn foveation_film_gpu_compact_f16_and_muon_gates_are_explicit() {
 }
 
 #[test]
+fn foveation_film_gpu_sgd_dont_update_gate_matches_cpu() {
+    let net = network(
+        "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=1\n\
+         [hf]\nparams=fixed\n\
+         [foveation_film]\nembed_dim=2\ndont_update=1\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let mut gpu = GpuExecutableNetwork::new(
+        net.clone(),
+        OxideBackend::new().expect("oxide backend"),
+    );
+    gpu.params = cpu.params.clone();
+    let initial_params = cpu.params.clone();
+    let input = patterned(net.net.input_shape());
+    let seed = Tensor::from_data(net.layers[1].output_shape, vec![0.8; 6]).unwrap();
+    let mut seeds = vec![None; net.layers.len()];
+    seeds[1] = Some(seed);
+
+    for iteration in [0, 1] {
+        cpu.set_train_iteration(iteration);
+        gpu.set_train_iteration(iteration);
+        let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("native FiLM forward");
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu().expect("initialize GPU buffers");
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .expect("CPU backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .expect("native FiLM backward");
+        cpu.update_weights(0.01, 0.0, 0.0, 1);
+        gpu.update_weights_gpu(0.01, 0.0, 0.0, 1)
+            .expect("GPU-runtime host-fallback SGD");
+        assert_eq!(cpu.params, gpu.params, "parameter parity at iteration {iteration}");
+        if iteration == 0 {
+            assert_eq!(cpu.params, initial_params, "dont_update before first iteration");
+        }
+    }
+    assert_ne!(cpu.params, initial_params, "dont_update should allow the next iteration");
+}
+
+#[test]
 fn marker_gather_native_full_compact_backward_and_upstream_sgd_match_cpu() {
     assert_chain(
         "[net]\nwidth=5\nheight=1\nchannels=8\nbatch=2\n\
