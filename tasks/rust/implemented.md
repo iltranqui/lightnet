@@ -216,6 +216,7 @@ file is named inline.
 - [188. Compact f16 Logistic inference](#188-compact-f16-logistic-inference)
 - [189. Logistic f16 direct CPU-reference parity](#189-logistic-f16-direct-cpu-reference-parity)
 - [190. OMD loss compact f16 inference pass-through](#190-omd-loss-compact-f16-inference-pass-through)
+- [191. JevCe group-major compact f16 inference](#191-jevce-group-major-compact-f16-inference)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2145,6 +2146,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 190. OMD loss compact f16 inference pass-through
 
 - v0.2.151 (`pending`): added `[omd_loss]` to compact f16's allowlist and device-resident identity dispatch. C++ `forward_omd_loss_layer` copies input to output and returns before training-only work when `state.train` is false (`Jev_laya:src-lib/omd_loss_layer.cpp:554-568`). `omd_loss_f16_inference_is_device_identity_and_matches_cpu` compares actual-Oxide f16 directly with `ExecutableNetwork::forward`; the focused test passed, and `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed all 20 tests. Inference only; Rust's OMD training head is still incomplete; no compiled-C++ golden.
+
+## 191. JevCe group-major compact f16 inference
+
+- v0.2.152 (`pending`): added group-major `[jev_ce]` compact-f16 inference using native half-storage temperature scaling followed by the existing f32-accumulation group softmax. Actual-Oxide output matches `ExecutableNetwork::forward` for `B=2`, 2 groups, 3 candidates, temperature 1.5 (relative max error `4.633e-4`); `layout=cm` rejects explicitly. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed all 21 tests. Inference only; truth-driven CE loss/backward remain host/head limitations. No compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 

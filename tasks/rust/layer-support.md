@@ -69,7 +69,7 @@ with the command given rather than trusting the number.
 | CPU-only forward, no GPU path (hard reject) | 9 |
 | GPU forward but CPU/mixed backward | 11 (9 whole-network fallback + HF/FiLM host helpers) |
 | GPU native forward + device backward | 24 |
-| f16 inference | 26 variants (27 section names) |
+| f16 inference | 27 variants (28 section names) |
 | Axis pinned | 34 C++-backed variants / 38 tests total (includes one Rust-only contract test) |
 | Axis open | 26 (Tier 1: 3, Tier 2: 14, Tier 3: 3, Tier 4: 6) |
 | Axis Rust-only | 5 |
@@ -127,7 +127,7 @@ with the command given rather than trusting the number.
 | `LayaMarkerGather` | yes | none | fwd | exact | pin | native | device | yes |
 | `LayaActHead` | yes | C++ | fwd | exact (CPU path) | pin | native | cpu (primitive native) | no |
 | `LayaLoss` | yes | none | head | head | pin | native (loss on host) | head | no |
-| `JevCe` | alias | none | head | head | T2 | native (loss on host) | head | no |
+| `JevCe` | alias | none | head | head | T2 | native (loss on host) | head | yes (group-major inference) |
 | `Segmentation` | alias | none | head | head | T2 | native (loss on host) | head | no |
 | `OmdLoss` | alias | none | pass + head | head | T2 | pass | head | yes (inference) |
 | `Contrastive` | yes | none | pass + head | head | T2 | pass | head | no |
@@ -277,10 +277,11 @@ Accepted by `forward_compact_f16` (`runtime.rs:8389`):
 
 `convolutional` (including `NORM_CHAN*` with f32 channel reductions), `maxpool`, `local_avgpool`, `avgpool`,
 `batchnorm`, `connected` (incl. folded rolling-stat BN), `route`, `channel_slice`, `laya_marker_gather`, `channel_shuffle`,
-`upsample` (incl. `reverse`), `dropout`, `cost`, `detection`, and `regression` (inference identities), `reorg` (forward/reverse),
+`upsample` (incl. `reverse`), `dropout`, `cost`, `detection`, and `regression` (inference identities), `jev_ce` (group-major layout only), `reorg` (forward/reverse),
 `shortcut` (with sources), `sam` (supported activation), `scale_channels`, `region`, `softmax`, `yolo`, `obb_yolo`, `gaussian_yolo`.
 
-Everything else returns `UnsupportedLayer`. Note this is inference only: f16
+`jev_ce` channel-major layout and everything else return `UnsupportedLayer`.
+Note this is inference only: f16
 training is the AMP path (`DARKNET_OXIDE_AMP=1`), which keeps f32 masters, and
 f16 convolution dgrad/wgrad are implemented there.
 
@@ -297,7 +298,7 @@ variants or non-layer work.
 | `Detection` | parsed as identity; C++ decode + loss unimplemented in Rust | needs its own plan |
 | `Contrastive` detection branch | needs the yolo head's per-box class ids; `YoloHeadOutput` carries only the raw tensor | blocked on a head-metadata change |
 | CARPN Stage-2 training | `[obb_refine]` inference only; blocks `detector train -map` for CARPN | after `carpn_network_map_plan.md` |
-| Axis pins | 29 open variants (`T1`–`T4`) plus a per-backlog A2 test | `axis-coverage.md` |
+| Axis pins | 26 open variants (`T1`–`T4`) plus a per-backlog A2 test | `axis-coverage.md` |
 | Conv `reverse` / `deform`, adversarial yolo branch | gradients missing | `todo.md` |
 | `Local`, `Gru` training | Rust-only extensions, partial | `todo.md` |
 | EML BN batch-stat training | CPU uses rolling stats, not C++ batch statistics | `implemented.md` §7 |

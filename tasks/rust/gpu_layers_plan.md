@@ -27,7 +27,7 @@ deliverable. Sparse MoE remains unstarted.
 ## Resume point
 
 Marker gather is native in f32 full/compact forward/backward and f16 compact
-inference (v0.2.001–002). v0.2.149 adds compact f16 Logistic sigmoid through the native half-storage channel-affine activation kernel; v0.2.150 adds direct CPU-reference parity. v0.2.151 adds OMD loss inference as a device identity pass-through. The full `oxide_runtime_f16` suite passes 20 tests; these paths are inference only. Act-head features/exact-erf primitives are native f32
+inference (v0.2.001–002). v0.2.149 adds compact f16 Logistic sigmoid through the native half-storage channel-affine activation kernel; v0.2.150 adds direct CPU-reference parity. v0.2.151 adds OMD loss inference as a device identity pass-through. The full `oxide_runtime_f16` suite passes 20 tests; these paths are inference only. v0.2.152 adds group-major JevCe compact f16 inference via native temperature scaling and softmax; channel-major rejects, and the full f16 suite passes 21 tests. Act-head features/exact-erf primitives are native f32
 (v0.2.003–004), and full/compact act-head f32 forward is native in v0.2.005.
 Evidence/limits are in `implemented.md` §§41–45. Do not repeat these ports.
 Act-head uses four uncached weight uploads per forward; no residency/speedup
