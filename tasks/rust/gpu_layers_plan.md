@@ -115,11 +115,14 @@ Bounded native slice:
 8. [x] Add native isotropic fixed-point inverse-grid generation and runtime
    dispatch (v0.2.134). Learned HF predictor parameters feed the native grid
    and warp in the actual-Oxide two-step SGD test.
-9. [ ] Add native HF predictor MLP and Newton/anisotropic inverse-grid paths,
-   then implement warp adjoints and inspect runtime input gradients; retain
-   explicit host boundaries until each is verified. Actual-Oxide gates cover
-   compact f32/f16, Muon, SGD `dont_update`, Adam `burnin_update`, and SGD
-   `train_only_bn` (v0.2.128–131). No compiled-C++ GPU-parity claim.
+9. [x] Add native HF predictor pooling/MLP/constraints for isotropic
+   fixed-point runtime (v0.2.135); learned-HF actual-device two-step SGD parity
+   passes.
+10. [ ] Add Newton/anisotropic inverse-grid paths, implement warp adjoints,
+    and inspect runtime input gradients; retain explicit host boundaries until
+    each is verified. Actual-Oxide gates cover compact f32/f16, Muon, SGD
+    `dont_update`, Adam `burnin_update`, and SGD `train_only_bn` (v0.2.128–131).
+    No compiled-C++ GPU-parity claim.
 
 v0.2.120 implements native per-sample NCHW affine and exact input/gamma/beta
 adjoints; v0.2.121 composes native HF embedding/ReLU and gamma/beta projections
@@ -134,13 +137,13 @@ actual-Oxide two-step output/parameter parity for both optimizers; v0.2.128
 adds actual-Oxide compact f32/f16 and Muon rejection tests; v0.2.129–131
 cover SGD/Adam update gates. v0.2.132 compares all host HF/FiLM gradient
 buffers against CPU after actual-Oxide backward. v0.2.133 adds native Oxide bilinear warp sampling; v0.2.134 adds isotropic
-fixed-point inverse-grid generation. Predictor evaluation, Newton/anisotropic
-grid variants, and backward remain host-side. Direct input-gradient parity and
-native HF predictor/backward kernels remain open.
+fixed-point inverse-grid generation; v0.2.135 adds the predictor MLP for that
+configuration. Newton/anisotropic grid variants and backward remain host-side.
+Direct input-gradient parity and native warp adjoints remain open.
 
-This remains an open plan, not evidence of a complete native layer. The
-current hybrid host/device path does not include native HF kernels or direct
-input-gradient inspection. Compact f16 remains deferred.
+This remains an open plan, not evidence of a complete native layer. Native HF
+coverage is bounded to isotropic fixed-point forward; other inverse modes and
+HF backward remain hybrid/host-managed. Compact f16 remains deferred.
 
 ## Act-head contract finding
 

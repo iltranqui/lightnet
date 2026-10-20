@@ -196,6 +196,7 @@ file is named inline.
 - [168. FoveationFilm actual-Oxide train-buffer parity](#168-foveationfilm-actual-oxide-train-buffer-parity)
 - [169. Native HyperbolicFoveation bilinear warp](#169-native-hyperbolicfoveation-bilinear-warp)
 - [170. Native isotropic fixed-point HF grid](#170-native-isotropic-fixed-point-hf-grid)
+- [171. Native HF predictor MLP for fixed-point isotropic mode](#171-native-hf-predictor-mlp-for-fixed-point-isotropic-mode)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2045,6 +2046,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 170. Native isotropic fixed-point HF grid
 
 - v0.2.134 (`b67db3c0`): added native Oxide fixed-point inverse-grid generation for isotropic HF configs and selected it in GPU runtime forward; Newton and anisotropic configs still upload the host-generated grid. Actual Oxide parity covers a learned HF predictor feeding native grid+warp over two SGD steps. `MEM=3G ./tools/test_oxide.sh --test oxide_hyperbolic_foveation` passed 3 primitive/guard tests; focused runtime SGD passed; `MEM=3G ./tools/test_host.sh foveation_film` passed 12. Native predictor MLP, Newton/anisotropic grid, backward, and direct input-gradient paths remain open. No compiled-C++ or performance claim.
+
+## 171. Native HF predictor MLP for fixed-point isotropic mode
+
+- v0.2.135 (`8dd1ae53`): added Oxide tile-average pooling, batched first/second linear projections, ReLU, and source-compatible predictor constraints. GPU runtime uses the native predictor for learned isotropic fixed-point HF; its parameters feed native inverse-grid and warp ops. Other predictor/grid modes retain host calculations, and the CPU-generated forward cache remains for backward. Actual-device learned-HF two-step SGD output/gradient/update parity passed; `oxide_hyperbolic_foveation` passed 4 tests and `MEM=3G ./tools/test_host.sh foveation_film` passed 12. No compiled-C++ or performance claim.
 
 ## Not implemented / open (pointer)
 

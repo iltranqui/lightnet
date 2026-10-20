@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.135: native HF predictor pooling/MLP/constraints now run for isotropic fixed-point GPU runtime; learned-HF two-step actual-device parity and 4 primitive tests pass. Other predictor/grid modes and HF backward remain host-side. See `implemented.md` §171.
 - v0.2.134: added native isotropic fixed-point HF inverse-grid generation; learned predictor input/runtime parity passes through native grid and warp. Newton/anisotropic and backward remain host-managed. See `implemented.md` §170.
 - v0.2.133: added native Oxide HF bilinear warp and wired GPU runtime forward; predictor/grid generation and backward remain host-side. Actual-device output parity and 2 primitive tests pass. See `implemented.md` §169.
 - v0.2.132: added read-only host-fallback train-buffer inspection and actual-Oxide parity checks for every HF/FiLM gradient buffer under two-step SGD and Adam; both tests pass. Native convolution gradients remain checked indirectly by upstream parameter parity; direct input-gradient inspection remains open. See `implemented.md` §168.
