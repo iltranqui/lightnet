@@ -1,4 +1,4 @@
-//! Bounded DCNv4 GPU math: <=289 active points, elementwise/channel activation.
+//! Bounded DCNv4 GPU math: <=361 active points, elementwise/channel activation.
 //! BN normalizes with rolling stats; its 0.9 EMA runs only after backward.
 //! Parameter gradients and SGD/Adam math use device tensors; DCNv4 Adam moments
 //! persist on-device between updates and bridge through the host sidecar only
@@ -14,7 +14,7 @@ pub(super) fn needs_host(spec: &Dcnv4Spec) -> bool {
     spec.size
         .checked_mul(spec.size)
         .and_then(|v| v.checked_sub(usize::from(spec.remove_center)))
-        .is_none_or(|points| points > 289)
+        .is_none_or(|points| points > 361)
         || (spec.activation.to_cuda_f32_kind().is_none()
             && spec.activation.to_channel_normalization().is_none())
 }
