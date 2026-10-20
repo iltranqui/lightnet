@@ -193,6 +193,7 @@ file is named inline.
 - [165. FoveationFilm actual-Oxide SGD gate](#165-foveationfilm-actual-oxide-sgd-gate)
 - [166. FoveationFilm actual-Oxide Adam burn-in gate](#166-foveationfilm-actual-oxide-adam-burn-in-gate)
 - [167. FoveationFilm actual-Oxide train-only-BN gate](#167-foveationfilm-actual-oxide-train-only-bn-gate)
+- [168. FoveationFilm actual-Oxide train-buffer parity](#168-foveationfilm-actual-oxide-train-buffer-parity)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2030,6 +2031,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 167. FoveationFilm actual-Oxide train-only-BN gate
 
 - v0.2.131 (`9b8f2dcc`): actual-Oxide runtime test verifies `train_only_bn=1` suppresses FiLM parameter updates, with CPU/GPU parameter parity after SGD. Test passed. The gate suite now covers compact f32/f16 and Muon rejection, SGD `dont_update`, Adam `burnin_update`, and SGD `train_only_bn`; direct input-gradient/train-buffer inspection remains open. No compiled-C++ golden.
+
+## 168. FoveationFilm actual-Oxide train-buffer parity
+
+- v0.2.132 (`23d789af`): exposed a read-only snapshot borrow for GPU-runtime host-fallback train buffers and used it to compare every HF and FiLM parameter-gradient buffer against CPU during both actual-Oxide SGD and Adam steps. Both two-step runtime tests pass at `3e-5`; native convolution buffers are intentionally excluded from this accessor and are validated through upstream parameter parity. Direct input-gradient inspection remains open. No compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 

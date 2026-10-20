@@ -106,11 +106,13 @@ Bounded native slice:
    output/parameter parity passes, with host exact buffer/update parity tests.
 5. [x] Add actual-Oxide rejection tests for compact f32, compact f16, and GPU
    Muon.
-6. [ ] Directly inspect actual runtime input gradients and HF/FiLM train
-   buffers; retain explicit host HF warp/predictor boundaries. Actual-Oxide
-   gates now cover compact f32/f16, Muon, SGD `dont_update`, Adam
-   `burnin_update`, and SGD `train_only_bn` (v0.2.128–131). No compiled-C++
-   GPU-parity claim.
+6. [x] Inspect all HF/FiLM host-fallback parameter-gradient buffers against
+   CPU in actual-Oxide two-step SGD and Adam runtime tests (v0.2.132); the
+   accessor explicitly excludes native device buffers.
+7. [ ] Directly inspect the runtime input gradient, retain explicit host HF
+   warp/predictor boundaries, and pursue native HF kernels. Actual-Oxide gates
+   cover compact f32/f16, Muon, SGD `dont_update`, Adam `burnin_update`, and
+   SGD `train_only_bn` (v0.2.128–131). No compiled-C++ GPU-parity claim.
 
 v0.2.120 implements native per-sample NCHW affine and exact input/gamma/beta
 adjoints; v0.2.121 composes native HF embedding/ReLU and gamma/beta projections
@@ -122,14 +124,15 @@ finite-differences every HF/FiLM projection gradient element in the primitive.
 v0.2.125 dispatches native runtime FiLM backward and applies the host HF
 warp/predictor adjoint. v0.2.126 adds host SGD/Adam updates for these parameters; v0.2.127 adds
 actual-Oxide two-step output/parameter parity for both optimizers; v0.2.128
-adds actual-Oxide compact f32/f16 and Muon rejection tests; v0.2.129 covers
-SGD `dont_update` and Adam `burnin_update` at actual runtime. Direct gradient-buffer inspection stays open; all listed update/rejection
-gates have actual-Oxide coverage.
+adds actual-Oxide compact f32/f16 and Muon rejection tests; v0.2.129–131
+cover SGD/Adam update gates. v0.2.132 compares all host HF/FiLM gradient
+buffers against CPU after actual-Oxide backward. Native device buffers are
+excluded by the public inspection accessor; direct input-gradient parity
+remains open.
 
-This remains an open plan, not evidence of a complete native layer. Update
-`layer-support.md` to reflect the current hybrid host/device path, but do not
-claim native HF kernels or complete two-step optimizer coverage. Compact f16
-remains deferred.
+This remains an open plan, not evidence of a complete native layer. The
+current hybrid host/device path does not include native HF kernels or direct
+input-gradient inspection. Compact f16 remains deferred.
 
 ## Act-head contract finding
 
