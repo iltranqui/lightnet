@@ -91,31 +91,31 @@ be presented as such.
 
 Bounded native slice:
 
-1. Add Oxide f32 forward math for per-sample HF embedding/ReLU, channel gamma
-   and beta projections, and NCHW affine application; reuse the existing
+1. [x] Add Oxide f32 forward math for per-sample HF embedding/ReLU, channel
+   gamma/beta projections, and NCHW affine application; reuse the existing
    `FoveationFilmForwardCache` contract.
-2. Add native adjoints for input, all six FiLM parameter blocks, and optional
-   HF-parameter gradients. Hyperbolic-Foveation raw-parameter extraction may
-   remain host-managed until that source layer has a native path; make that
-   transfer explicit and keep learned FiLM math/backward on-device.
-3. Integrate only when the selected HF forward cache exists and layouts match;
-   otherwise preserve the established host path. Do not silently substitute
-   zeros or identity for a missing source.
-4. Add actual-Oxide batch-2 non-square runtime CPU-reference parity for output,
-   input/parameter gradients, optional HF gradient, and two optimizer updates
-   under SGD/Adam. Include device finite differences for the fused primitive
-   and explicit fallback-gate coverage. No compiled-C++ GPU-parity claim.
+2. [x] Add primitive adjoints for input, all six FiLM parameter blocks, and
+   optional HF-parameter gradients. Hyperbolic-Foveation parameter extraction
+   remains host-managed.
+3. [x] Integrate runtime forward when the selected HF cache exists and layouts
+   match; HF source evaluation/cache transfer is explicit and missing sources
+   error. GPU backward is still explicitly gated to the CPU fallback.
+4. [ ] Add runtime native-backward parity for input/parameter/HF gradients and
+   SGD/Adam updates. Primitive tests cover actual-device parity and affine FD;
+   runtime tests cover batch-2 non-square outputs plus backward-fallback success.
+   Add explicit unsupported-update/compact/f16 gate coverage. No compiled-C++
+   GPU-parity claim.
 
 v0.2.120 implements native per-sample NCHW affine and exact input/gamma/beta
 adjoints; v0.2.121 composes native HF embedding/ReLU and gamma/beta projections
-into a full forward primitive; v0.2.122 adds the native full input, parameter,
-and HF-source adjoints. Host-reference and actual-device parity/FD tests pass.
-Runtime HF-source extraction/transfer and layer dispatch remain open; FoveationFilm
-still has no native runtime path.
+into a full forward primitive; v0.2.122 adds full primitive input, parameter,
+and HF-source adjoints. v0.2.123 integrates the Oxide runtime forward with
+host-computed HF parameters and a deliberate CPU backward fallback. Focused
+actual-device runtime output parity and fallback-backward success pass.
 
-This remains an open plan, not evidence of a complete native layer; update
-`layer-support.md` only after runtime dispatch and both forward/backward tests
-pass. Defer compact f16 until the f32 path is complete.
+This remains an open plan, not evidence of a complete native layer; keep
+`layer-support.md` GPU `none` until runtime native backward and optimizer tests
+pass. Compact f16 remains deferred.
 
 ## Act-head contract finding
 
