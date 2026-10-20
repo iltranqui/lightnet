@@ -3728,7 +3728,7 @@ impl ExecutableNetwork {
                             *combined += *film;
                         }
                     }
-                    let (warp_gradient, predictor_gradient, param_gradient) =
+                    let (warp_gradient, predictor_gradient, param_gradient, _) =
                         backward_hyperbolic_foveation(
                             spec,
                             params,
@@ -3737,6 +3737,7 @@ impl ExecutableNetwork {
                             cache,
                             auxiliary_gradient.as_deref(),
                             None,
+                            false,
                         )?;
                     let Some(slot) = param_gradients.get_mut(layer.index) else {
                         return Err(Error::InvalidConfig(format!(
@@ -16538,11 +16539,60 @@ where
                     let auxiliary = foveation_hf_auxiliary_gradients
                         .get(layer.index)
                         .and_then(Option::as_deref);
-                    let (_host_warp_gradient, predictor_gradient, param_gradient) =
+                    let (_host_warp_gradient, mut predictor_gradient, mut param_gradient, constrained_seed) =
                         backward_hyperbolic_foveation(
                             spec, params, warp_input, &output_gradient, cache, auxiliary,
                             Some(&native_grid_gradient),
+                            true,
                         )?;
+                    if spec.pred_hidden > 0 {
+                        let predictor = cache.predictor.as_ref().ok_or_else(|| Error::InvalidConfig(
+                            "missing HF predictor cache for native backward".to_owned(),
+                        ))?;
+                        let batch = warp_input.shape.batch;
+                        let input_dim = predictor.pooled.len() / batch;
+                        let pooled = self.backend.upload_f32(&[batch, input_dim], &predictor.pooled)
+                            .map_err(|err| backend_error("upload HF predictor pooled cache", err))?;
+                        let preactivation = self.backend.upload_f32(&[batch, spec.pred_hidden], &predictor.hidden_preactivation)
+                            .map_err(|err| backend_error("upload HF predictor preactivation cache", err))?;
+                        let hidden = self.backend.upload_f32(&[batch, spec.pred_hidden], &predictor.hidden)
+                            .map_err(|err| backend_error("upload HF predictor hidden cache", err))?;
+                        let raw = self.backend.upload_f32(&[batch, spec.param_count()], &predictor.raw_output)
+                            .map_err(|err| backend_error("upload HF predictor raw cache", err))?;
+                        let seed = self.backend.upload_f32(&[batch, spec.param_count()], &constrained_seed)
+                            .map_err(|err| backend_error("upload HF predictor adjoint seed", err))?;
+                        let w1 = self.backend.upload_f32(&[spec.pred_hidden, input_dim], &params.pred_w1)
+                            .map_err(|err| backend_error("upload HF predictor w1", err))?;
+                        let w2 = self.backend.upload_f32(&[spec.param_count(), spec.pred_hidden], &params.pred_w2)
+                            .map_err(|err| backend_error("upload HF predictor w2", err))?;
+                        let (source_gradient, w1_and_b1, w2_and_b2) = self.backend
+                            .hyperbolic_foveation_predictor_backward_f32(
+                                &pooled, &preactivation, &hidden, &raw, &seed, &w1, &w2,
+                                &tensor_backend_shape(spec.pred_input_shape), spec.downsample,
+                                spec.pred_hidden, spec.param_count(), config,
+                            )
+                            .map_err(|err| backend_error("native HF predictor backward", err))?;
+                        let w1_and_b1 = self.backend.download_f32(&w1_and_b1)
+                            .map_err(|err| backend_error("download HF predictor w1/b1 gradients", err))?;
+                        let w2_and_b2 = self.backend.download_f32(&w2_and_b2)
+                            .map_err(|err| backend_error("download HF predictor w2/b2 gradients", err))?;
+                        let w1_count = param_gradient.pred_w1.len();
+                        let w2_count = param_gradient.pred_w2.len();
+                        if w1_and_b1.len() != w1_count + param_gradient.pred_b1.len()
+                            || w2_and_b2.len() != w2_count + param_gradient.pred_b2.len() {
+                            return Err(Error::InvalidConfig("native HF predictor gradient lengths mismatch".to_owned()));
+                        }
+                        param_gradient.pred_w1.copy_from_slice(&w1_and_b1[..w1_count]);
+                        param_gradient.pred_b1.copy_from_slice(&w1_and_b1[w1_count..]);
+                        param_gradient.pred_w2.copy_from_slice(&w2_and_b2[..w2_count]);
+                        param_gradient.pred_b2.copy_from_slice(&w2_and_b2[w2_count..]);
+                        let source_gradient = self.backend.download_f32(&source_gradient)
+                            .map_err(|err| backend_error("download HF predictor source gradient", err))?;
+                        predictor_gradient = Some((
+                            spec.pred_source_layer,
+                            Tensor::from_data(spec.pred_input_shape, source_gradient)?,
+                        ));
+                    }
                     {
                         let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
                         let Some(LayerTrainBuffers::HyperbolicFoveation(train)) =
@@ -23598,10 +23648,12 @@ fn backward_hyperbolic_foveation(
     cache: &HyperbolicFoveationForwardCache,
     auxiliary_param_gradients: Option<&[f32]>,
     precomputed_grid_gradient: Option<&[f32]>,
+    defer_predictor_backward: bool,
 ) -> Result<(
     Tensor,
     Option<(Option<usize>, Tensor)>,
     HyperbolicFoveationParams,
+    Vec<f32>,
 )> {
     validate_hyperbolic_foveation_param_layout(spec, params)?;
     if output_gradient.shape != warp_input.shape {
@@ -23665,22 +23717,15 @@ fn backward_hyperbolic_foveation(
         pred_w2: vec![0.0; params.pred_w2.len()],
         pred_b2: vec![0.0; params.pred_b2.len()],
     };
-    let predictor_gradient = if spec.pred_hidden > 0 {
-        let predictor = cache.predictor.as_ref().ok_or_else(|| {
-            Error::InvalidConfig(
-                "[hyperbolic_foveation] missing predictor forward cache".to_owned(),
-            )
-        })?;
-        let mut constrained_seed = vec![0.0; warp_input.shape.batch * per_batch];
+    let mut constrained_seed = vec![0.0; warp_input.shape.batch * per_batch];
+    if spec.pred_hidden > 0 {
         for (batch_index, semantic) in semantic_gradients.iter().enumerate() {
             let start = batch_index * per_batch;
             constrained_seed[start] = semantic[0];
             constrained_seed[start + 1] = semantic[1];
             constrained_seed[start + 2] = semantic[2];
             match spec.radius_mode {
-                crate::model::HfRadiusMode::Isotropic => {
-                    constrained_seed[start + 3] = semantic[4];
-                }
+                crate::model::HfRadiusMode::Isotropic => constrained_seed[start + 3] = semantic[4],
                 crate::model::HfRadiusMode::Anisotropic => {
                     constrained_seed[start + 3] = semantic[3];
                     constrained_seed[start + 4] = semantic[4];
@@ -23697,6 +23742,16 @@ fn backward_hyperbolic_foveation(
                 constrained_seed[start + per_batch - 1] += extra[per_batch - 1];
             }
         }
+    }
+    let predictor_gradient = if spec.pred_hidden > 0 {
+        let predictor = cache.predictor.as_ref().ok_or_else(|| {
+            Error::InvalidConfig(
+                "[hyperbolic_foveation] missing predictor forward cache".to_owned(),
+            )
+        })?;
+        if defer_predictor_backward {
+            Some((spec.pred_source_layer, Tensor::zeros(spec.pred_input_shape)))
+        } else {
         let predictor_source_gradient = crate::hyperbolic_foveation::predictor_backward_nchw(
             (
                 spec.pred_input_shape.batch,
@@ -23720,6 +23775,7 @@ fn backward_hyperbolic_foveation(
             spec.pred_source_layer,
             Tensor::from_data(spec.pred_input_shape, predictor_source_gradient.source)?,
         ))
+        }
     } else {
         if cache.predictor.is_some() {
             return Err(Error::InvalidConfig(
@@ -23757,7 +23813,7 @@ fn backward_hyperbolic_foveation(
         }
         None
     };
-    Ok((warp_input_gradient, predictor_gradient, gradient))
+    Ok((warp_input_gradient, predictor_gradient, gradient, constrained_seed))
 }
 
 /// `[moe_convolutional]`'s parameters: one ordinary convolution per expert plus

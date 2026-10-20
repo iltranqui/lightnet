@@ -367,6 +367,139 @@ pub mod kernels {
         }
     }
 
+    #[device]
+    fn hyperbolic_predictor_raw_gradient(raw: f32, seed: f32, parameter: usize, param_count: usize) -> f32 {
+        let derivative = if parameter < 2 {
+            let t = raw.tanh();
+            0.9 * (1.0 - t * t)
+        } else if parameter + 1 == param_count {
+            let sigmoid = if raw >= 0.0 { 1.0 / (1.0 + (-raw).exp()) } else { let e = raw.exp(); e / (1.0 + e) };
+            sigmoid * (1.0 - sigmoid)
+        } else {
+            let softplus = if raw > 20.0 { raw } else { (1.0 + raw.exp()).ln() };
+            let value = 2.0 * softplus + 0.1;
+            if value <= 0.1 || value >= 2.0 { 0.0 } else {
+                if raw >= 0.0 { 2.0 / (1.0 + (-raw).exp()) } else { let e = raw.exp(); 2.0 * e / (1.0 + e) }
+            }
+        };
+        seed * derivative
+    }
+
+    #[device]
+    fn hyperbolic_predictor_hidden_gradient(
+        n: usize, h: usize, hidden_count: usize, param_count: usize,
+        preactivation: &[f32], raw: &[f32], seed: &[f32], w2: &[f32],
+    ) -> f32 {
+        let mut gradient = 0.0f32;
+        let mut p = 0usize;
+        while p < param_count {
+            let delta = hyperbolic_predictor_raw_gradient(
+                raw[n * param_count + p], seed[n * param_count + p], p, param_count,
+            );
+            gradient += delta * w2[p * hidden_count + h];
+            p += 1;
+        }
+        if preactivation[n * hidden_count + h] > 0.0 { gradient } else { 0.0 }
+    }
+
+    #[kernel]
+    pub fn hyperbolic_predictor_backward_w2(
+        hidden: &[f32], raw: &[f32], seed: &[f32], mut output: DisjointSlice<f32>,
+        batch: usize, hidden_count: usize, param_count: usize,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if i >= output.len() { return; }
+        let matrix_count = param_count * hidden_count;
+        let mut value = 0.0f32;
+        if i < matrix_count {
+            let p = i / hidden_count;
+            let h = i % hidden_count;
+            let mut n = 0usize;
+            while n < batch {
+                let delta = hyperbolic_predictor_raw_gradient(raw[n * param_count + p], seed[n * param_count + p], p, param_count);
+                value += delta * hidden[n * hidden_count + h];
+                n += 1;
+            }
+        } else {
+            let p = i - matrix_count;
+            let mut n = 0usize;
+            while n < batch {
+                value += hyperbolic_predictor_raw_gradient(raw[n * param_count + p], seed[n * param_count + p], p, param_count);
+                n += 1;
+            }
+        }
+        if let Some(out) = output.get_mut(index) { *out = value; }
+    }
+
+    #[kernel]
+    pub fn hyperbolic_predictor_backward_w1(
+        pooled: &[f32], preactivation: &[f32], raw: &[f32], seed: &[f32], w2: &[f32],
+        mut output: DisjointSlice<f32>, batch: usize, input_dim: usize,
+        hidden_count: usize, param_count: usize,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if i >= output.len() { return; }
+        let matrix_count = hidden_count * input_dim;
+        let mut value = 0.0f32;
+        if i < matrix_count {
+            let h = i / input_dim;
+            let feature = i % input_dim;
+            let mut n = 0usize;
+            while n < batch {
+                let delta = hyperbolic_predictor_hidden_gradient(n, h, hidden_count, param_count, preactivation, raw, seed, w2);
+                value += delta * pooled[n * input_dim + feature];
+                n += 1;
+            }
+        } else {
+            let h = i - matrix_count;
+            let mut n = 0usize;
+            while n < batch {
+                value += hyperbolic_predictor_hidden_gradient(n, h, hidden_count, param_count, preactivation, raw, seed, w2);
+                n += 1;
+            }
+        }
+        if let Some(out) = output.get_mut(index) { *out = value; }
+    }
+
+    #[kernel]
+    pub fn hyperbolic_predictor_backward_source(
+        preactivation: &[f32], raw: &[f32], seed: &[f32], w1: &[f32], w2: &[f32],
+        mut output: DisjointSlice<f32>, channels: usize, height: usize, width: usize,
+        downsample: usize, pooled_height: usize, pooled_width: usize,
+        hidden_count: usize, param_count: usize,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if i >= output.len() { return; }
+        let spatial = height * width;
+        let batch = i / (channels * spatial);
+        let channel = (i / spatial) % channels;
+        let pixel = i % spatial;
+        let y = pixel / width;
+        let x = pixel % width;
+        let pooled_y = y / downsample;
+        let pooled_x = x / downsample;
+        if pooled_y >= pooled_height || pooled_x >= pooled_width {
+            if let Some(out) = output.get_mut(index) { *out = 0.0; }
+            return;
+        }
+        let feature = (channel * pooled_height + pooled_y) * pooled_width + pooled_x;
+        let input_dim = channels * pooled_height * pooled_width;
+        let mut gradient = 0.0f32;
+        let mut h = 0usize;
+        while h < hidden_count {
+            let dh = hyperbolic_predictor_hidden_gradient(batch, h, hidden_count, param_count, preactivation, raw, seed, w2);
+            gradient += dh * w1[h * input_dim + feature];
+            h += 1;
+        }
+        let y0 = pooled_y * downsample;
+        let x0 = pooled_x * downsample;
+        let count = (height - y0).min(downsample) * (width - x0).min(downsample);
+        if let Some(out) = output.get_mut(index) { *out = gradient / count as f32; }
+    }
+
     /// Build the inverse sampling grid for isotropic or anisotropic Newton HF mode.
     #[kernel]
     pub fn hyperbolic_newton_grid(

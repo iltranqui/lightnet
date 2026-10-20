@@ -6642,6 +6642,90 @@ impl F32TensorOpsBackend for OxideBackend {
         Ok(OxideTensorF32::new(constrained, &[batch, param_count]))
     }
 
+    fn hyperbolic_foveation_predictor_backward_f32(
+        &self,
+        pooled: &Self::Tensor,
+        hidden_preactivation: &Self::Tensor,
+        hidden: &Self::Tensor,
+        raw_output: &Self::Tensor,
+        constrained_seed: &Self::Tensor,
+        w1: &Self::Tensor,
+        w2: &Self::Tensor,
+        input_shape: &[usize],
+        downsample: usize,
+        hidden_count: usize,
+        param_count: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let pooled_f = self.f32v(pooled)?;
+        let pooled = &*pooled_f;
+        let pre_f = self.f32v(hidden_preactivation)?;
+        let pre = &*pre_f;
+        let hidden_f = self.f32v(hidden)?;
+        let hidden = &*hidden_f;
+        let raw_f = self.f32v(raw_output)?;
+        let raw = &*raw_f;
+        let seed_f = self.f32v(constrained_seed)?;
+        let seed = &*seed_f;
+        let w1_f = self.f32v(w1)?;
+        let w1 = &*w1_f;
+        let w2_f = self.f32v(w2)?;
+        let w2 = &*w2_f;
+        let op = "hyperbolic_foveation_predictor_backward_f32";
+        if input_shape.len() != 4 || input_shape.contains(&0) || downsample == 0 || hidden_count == 0 || param_count < 4 {
+            return Err(shape_err(op, "expected positive NCHW shape, downsample, hidden count, and at least four parameters".to_owned()));
+        }
+        let (batch, channels, height, width) = (input_shape[0], input_shape[1], input_shape[2], input_shape[3]);
+        let pooled_height = (height / downsample).max(1);
+        let pooled_width = (width / downsample).max(1);
+        let input_dim = channels.checked_mul(pooled_height).and_then(|n| n.checked_mul(pooled_width))
+            .ok_or_else(|| shape_err(op, "pooled predictor size overflows".to_owned()))?;
+        let input_count = batch.checked_mul(channels).and_then(|n| n.checked_mul(height)).and_then(|n| n.checked_mul(width))
+            .ok_or_else(|| shape_err(op, "input size overflows".to_owned()))?;
+        let hidden_count_batch = batch.checked_mul(hidden_count).ok_or_else(|| shape_err(op, "hidden size overflows".to_owned()))?;
+        let param_count_batch = batch.checked_mul(param_count).ok_or_else(|| shape_err(op, "parameter size overflows".to_owned()))?;
+        if pooled.len() != batch * input_dim || pre.len() != hidden_count_batch || hidden.len() != hidden_count_batch
+            || raw.len() != param_count_batch || seed.len() != param_count_batch
+            || w1.len() != hidden_count * input_dim || w2.len() != param_count * hidden_count {
+            return Err(shape_err(op, "predictor cache/weight lengths do not match dimensions".to_owned()));
+        }
+        let source_len = input_count;
+        let dw1_len = hidden_count.checked_mul(input_dim).and_then(|n| n.checked_add(hidden_count))
+            .ok_or_else(|| shape_err(op, "w1 gradient size overflows".to_owned()))?;
+        let dw2_len = param_count.checked_mul(hidden_count).and_then(|n| n.checked_add(param_count))
+            .ok_or_else(|| shape_err(op, "w2 gradient size overflows".to_owned()))?;
+        let mut source_grad = self.alloc_uninit(source_len)?;
+        let mut w1_grad = self.alloc_uninit(dw1_len)?;
+        let mut w2_grad = self.alloc_uninit(dw2_len)?;
+        // SAFETY: all caches and weights have validated lengths; each output
+        // scalar is written by exactly one thread in each kernel.
+        unsafe {
+            self.resample.hyperbolic_predictor_backward_source(
+                &self.stream, launch::elementwise(source_len, config), &pre.buf, &raw.buf,
+                &seed.buf, &w1.buf, &w2.buf, &mut source_grad, channels, height, width,
+                downsample, pooled_height, pooled_width, hidden_count, param_count,
+            )
+        }.map_err(launch_err)?;
+        unsafe {
+            self.resample.hyperbolic_predictor_backward_w1(
+                &self.stream, launch::elementwise(dw1_len, config), &pooled.buf, &pre.buf,
+                &raw.buf, &seed.buf, &w2.buf, &mut w1_grad, batch, input_dim,
+                hidden_count, param_count,
+            )
+        }.map_err(launch_err)?;
+        unsafe {
+            self.resample.hyperbolic_predictor_backward_w2(
+                &self.stream, launch::elementwise(dw2_len, config), &hidden.buf, &raw.buf,
+                &seed.buf, &mut w2_grad, batch, hidden_count, param_count,
+            )
+        }.map_err(launch_err)?;
+        Ok((
+            OxideTensorF32::new(source_grad, input_shape),
+            OxideTensorF32::new(w1_grad, &[dw1_len]),
+            OxideTensorF32::new(w2_grad, &[dw2_len]),
+        ))
+    }
+
     fn hyperbolic_newton_grid_f32(
         &self,
         params: &Self::Tensor,

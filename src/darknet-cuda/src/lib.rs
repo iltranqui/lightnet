@@ -1991,6 +1991,113 @@ pub trait F32TensorOpsBackend {
         self.upload_f32(&[batch, param_count], &constrained)
     }
 
+    /// Backpropagate through the cached HF pooled-source MLP. Outputs are the
+    /// source adjoint, then summed `w1`, `b1`, `w2`, and `b2` gradients.
+    #[allow(clippy::too_many_arguments)]
+    fn hyperbolic_foveation_predictor_backward_f32(
+        &self,
+        pooled: &Self::Tensor,
+        hidden_preactivation: &Self::Tensor,
+        hidden: &Self::Tensor,
+        raw_output: &Self::Tensor,
+        constrained_seed: &Self::Tensor,
+        w1: &Self::Tensor,
+        w2: &Self::Tensor,
+        input_shape: &[usize],
+        downsample: usize,
+        hidden_count: usize,
+        param_count: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        assert_eq!(input_shape.len(), 4, "HF predictor backward expects NCHW shape");
+        let [batch, channels, height, width] = [input_shape[0], input_shape[1], input_shape[2], input_shape[3]];
+        assert!(downsample > 0 && hidden_count > 0 && param_count >= 4);
+        let pooled_h = (height / downsample).max(1);
+        let pooled_w = (width / downsample).max(1);
+        let input_dim = channels * pooled_h * pooled_w;
+        let pooled = self.download_f32(pooled)?;
+        let pre = self.download_f32(hidden_preactivation)?;
+        let hidden = self.download_f32(hidden)?;
+        let raw = self.download_f32(raw_output)?;
+        let seed = self.download_f32(constrained_seed)?;
+        let w1 = self.download_f32(w1)?;
+        let w2 = self.download_f32(w2)?;
+        assert_eq!(pooled.len(), batch * input_dim);
+        assert_eq!(pre.len(), batch * hidden_count);
+        assert_eq!(hidden.len(), pre.len());
+        assert_eq!(raw.len(), batch * param_count);
+        assert_eq!(seed.len(), raw.len());
+        assert_eq!(w1.len(), hidden_count * input_dim);
+        assert_eq!(w2.len(), param_count * hidden_count);
+        let mut dsource = vec![0.0; batch * channels * height * width];
+        let mut dw1 = vec![0.0; w1.len()];
+        let mut db1 = vec![0.0; hidden_count];
+        let mut dw2 = vec![0.0; w2.len()];
+        let mut db2 = vec![0.0; param_count];
+        for n in 0..batch {
+            let mut draw = vec![0.0; param_count];
+            for p in 0..param_count {
+                let r = raw[n * param_count + p];
+                let derivative = if p < 2 {
+                    let t = r.tanh(); 0.9 * (1.0 - t * t)
+                } else if p + 1 == param_count {
+                    let s = if r >= 0.0 { 1.0 / (1.0 + (-r).exp()) } else { let e = r.exp(); e / (1.0 + e) };
+                    s * (1.0 - s)
+                } else {
+                    let sp = if r > 20.0 { r } else { r.exp().ln_1p() };
+                    let value = 2.0 * sp + 0.1;
+                    if value <= 0.1 || value >= 2.0 { 0.0 } else {
+                        let s = if r >= 0.0 { 1.0 / (1.0 + (-r).exp()) } else { let e = r.exp(); e / (1.0 + e) };
+                        2.0 * s
+                    }
+                };
+                draw[p] = seed[n * param_count + p] * derivative;
+                db2[p] += draw[p];
+                for h in 0..hidden_count {
+                    dw2[p * hidden_count + h] += draw[p] * hidden[n * hidden_count + h];
+                }
+            }
+            let mut dhidden = vec![0.0; hidden_count];
+            for h in 0..hidden_count {
+                for p in 0..param_count { dhidden[h] += draw[p] * w2[p * hidden_count + h]; }
+                if pre[n * hidden_count + h] <= 0.0 { dhidden[h] = 0.0; }
+                db1[h] += dhidden[h];
+                for i in 0..input_dim {
+                    dw1[h * input_dim + i] += dhidden[h] * pooled[n * input_dim + i];
+                }
+            }
+            let mut dpooled = vec![0.0; input_dim];
+            for i in 0..input_dim {
+                for h in 0..hidden_count { dpooled[i] += dhidden[h] * w1[h * input_dim + i]; }
+            }
+            for c in 0..channels {
+                for py in 0..pooled_h {
+                    for px in 0..pooled_w {
+                        let y0 = py * downsample;
+                        let x0 = px * downsample;
+                        let count = (height - y0).min(downsample) * (width - x0).min(downsample);
+                        let value = dpooled[(c * pooled_h + py) * pooled_w + px] / count as f32;
+                        for y in y0..(y0 + downsample).min(height) {
+                            for x in x0..(x0 + downsample).min(width) {
+                                dsource[((n * channels + c) * height + y) * width + x] += value;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut w1_and_b1 = dw1;
+        w1_and_b1.extend(db1);
+        let mut w2_and_b2 = dw2;
+        w2_and_b2.extend(db2);
+        Ok((
+            self.upload_f32(input_shape, &dsource)?,
+            self.upload_f32(&[w1_and_b1.len()], &w1_and_b1)?,
+            self.upload_f32(&[w2_and_b2.len()], &w2_and_b2)?,
+        ))
+    }
+
     /// Generate the isotropic or anisotropic Newton HF sampling grid. The default backend
     /// computes the reference grid on the host; Oxide overrides with a kernel.
     fn hyperbolic_newton_grid_f32(
