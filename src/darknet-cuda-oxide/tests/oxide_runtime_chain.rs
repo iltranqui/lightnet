@@ -5790,9 +5790,9 @@ fn region_native_gpu_forward_backward_matches_cpu() {
 #[test]
 fn crop_native_training_augmentation_and_backward_match_cpu() {
     let net = network(
-        "[net]\nwidth=4\nheight=3\nchannels=1\nbatch=2\nadam=0\n\
+        "[net]\nwidth=4\nheight=3\nchannels=3\nbatch=2\nadam=0\n\
          [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
-         [crop]\ncrop_width=3\ncrop_height=2\nflip=1\nangle=17\n",
+         [crop]\ncrop_width=3\ncrop_height=2\nflip=1\nangle=17\nshift=0.2\n",
     );
     let mut cpu = ExecutableNetwork::new(net.clone());
     let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide"));

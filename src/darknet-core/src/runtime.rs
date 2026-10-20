@@ -104,10 +104,10 @@ fn graph_conv_spec_needs_host(spec: &GraphConvSpec) -> bool {
             && spec.activation.to_cuda_f32_kind().is_none())
 }
 
-// Geometry and affine input scaling are native; the GPU kernel does not yet
-// implement the training-only HSV/saturation/exposure/RGB-shift adjustments.
+// Geometry, affine input scaling, and per-channel RGB shift are native; the GPU
+// kernel does not yet implement training-only saturation/exposure adjustments.
 fn crop_training_color_augmentation_unsupported(spec: &CropSpec) -> bool {
-    spec.saturation != 1.0 || spec.exposure != 1.0 || spec.shift != 0.0
+    spec.saturation != 1.0 || spec.exposure != 1.0
 }
 
 fn graph_conv_spec_needs_compact_host(spec: &GraphConvSpec) -> bool {
@@ -32148,7 +32148,7 @@ fn plan_crop_forward(
         source_x: vec![0.0; samples],
         source_y: vec![0.0; samples],
         input_scales: vec![0.0; input_shape.batch],
-        input_offsets: vec![0.0; input_shape.batch],
+        input_offsets: vec![0.0; input_shape.batch * input_shape.channels],
     };
     let mut adjustments = Vec::with_capacity(input_shape.batch);
     let center_x = input_shape.width as f32 / 2.0;
@@ -32188,7 +32188,11 @@ fn plan_crop_forward(
             }
         };
         cache.input_scales[batch] = adjustment.scale;
-        cache.input_offsets[batch] = adjustment.translate;
+        for channel in 0..input_shape.channels {
+            let shift = if channel < 3 { adjustment.rgb_shift[channel] } else { 0.0 };
+            cache.input_offsets[batch * input_shape.channels + channel] =
+                adjustment.translate + shift;
+        }
         let (dw, dh, flip, angle) = if training {
             let dw = (input_shape.width.saturating_sub(spec.width)) as f32 * random[4];
             let dh = (input_shape.height.saturating_sub(spec.height)) as f32 * random[5];
@@ -32284,7 +32288,7 @@ fn backward_crop(
     if cache.source_x.len() != expected
         || cache.source_y.len() != expected
         || cache.input_scales.len() != output_gradient.shape.batch
-        || cache.input_offsets.len() != output_gradient.shape.batch
+        || cache.input_offsets.len() != output_gradient.shape.batch * output_gradient.shape.channels
     {
         return Err(Error::InvalidConfig(
             "crop cache shape does not match output gradient".to_owned(),

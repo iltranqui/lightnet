@@ -671,12 +671,15 @@ fn crop_bilinear_forward_backward_and_fd() {
         let sy = rng.vec(coords, -1.5, k.h as f32 + 0.5);
         let scales = rng.vec(k.b, 0.5, 2.0);
         let offs = rng.vec(k.b, -1.0, 1.0);
+        let channel_offsets: Vec<f32> = (0..k.b)
+            .flat_map(|batch| std::iter::repeat_n(offs[batch], k.c))
+            .collect();
         let dy = rng.vec(no, -1.0, 1.0);
         let xt = b.upload_f32(&[k.b, k.c, k.h, k.w], &x).unwrap();
         let sxt = b.upload_f32(&[coords], &sx).unwrap();
         let syt = b.upload_f32(&[coords], &sy).unwrap();
         let st = b.upload_f32(&[k.b], &scales).unwrap();
-        let ot = b.upload_f32(&[k.b], &offs).unwrap();
+        let ot = b.upload_f32(&[k.b, k.c], &channel_offsets).unwrap();
         let dyt = b.upload_f32(&[k.b, k.c, k.oh, k.ow], &dy).unwrap();
         let name = format!("crop {}x{}x{}x{}->{}x{}", k.b, k.c, k.h, k.w, k.oh, k.ow);
 

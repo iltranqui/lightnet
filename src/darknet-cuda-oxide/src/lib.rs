@@ -466,10 +466,18 @@ fn crop_layout(
             ),
         ));
     }
-    if adjustments.iter().any(|&len| len != batch) {
+    let valid_adjustments = match adjustments {
+        [scales] => *scales == batch,
+        [scales, offsets] => *scales == batch && *offsets == batch * channels,
+        _ => false,
+    };
+    if !valid_adjustments {
         return Err(shape_err(
             op,
-            format!("per-batch adjustments must have length {batch}, got {adjustments:?}"),
+            format!(
+                "expected per-batch scales ({batch}) and optional per-channel offsets ({}), got {adjustments:?}",
+                batch * channels
+            ),
         ));
     }
     Ok(())

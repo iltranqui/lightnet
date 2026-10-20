@@ -208,7 +208,7 @@ pub mod kernels {
             let wx = if t & 1 == 1 { dx } else { 1.0 - dx };
             let wy = if t >> 1 == 1 { dy } else { 1.0 - dy };
             if tx >= 0 && tx < in_w as i64 && ty >= 0 && ty < in_h as i64 {
-                let sample = x[base + ty as usize * in_w + tx as usize] * scales[b] + offsets[b];
+                let sample = x[base + ty as usize * in_w + tx as usize] * scales[b] + offsets[b * channels + c];
                 value += wy * wx * sample;
             }
             t += 1;
