@@ -37376,6 +37376,53 @@ num_dwconv=1
     }
 
     #[test]
+    fn crop_axis_layout_maps_batches_channels_and_center_window() {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "crop-axis.cfg",
+                r#"
+                    [net]
+                    width=5
+                    height=3
+                    channels=2
+                    batch=2
+
+                    [crop]
+                    crop_width=3
+                    crop_height=1
+                    noadjust=1
+                "#,
+            )
+            .expect("cfg parses"),
+        )
+        .expect("network constructs");
+        let executable = ExecutableNetwork::new(network);
+        let shape = executable.network.net.input_shape();
+        let mut data = vec![0.0; shape.batch * shape.element_count()];
+        for b in 0..shape.batch {
+            for c in 0..shape.channels {
+                for y in 0..shape.height {
+                    for x in 0..shape.width {
+                        data[((b * shape.channels + c) * shape.height + y) * shape.width + x] =
+                            (b * 1000 + c * 100 + y * 10 + x) as f32;
+                    }
+                }
+            }
+        }
+        let input = Tensor::from_data(shape, data).expect("input tensor");
+        let forward = executable.forward(&input).expect("crop forward succeeds");
+        assert_eq!(
+            forward.final_output().expect("crop output").data,
+            vec![11.0, 12.0, 13.0, 111.0, 112.0, 113.0, 1011.0, 1012.0, 1013.0, 1111.0, 1112.0, 1113.0]
+        );
+        let cache = forward.crop_caches[0]
+            .as_ref()
+            .expect("crop coordinate cache");
+        assert_eq!(cache.source_x, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+        assert_eq!(cache.source_y, vec![1.0; 6]);
+    }
+
+    #[test]
     fn crop_layer_applies_darknet_level_adjustment_before_sampling() {
         let network = Network::from_config(
             ConfigFile::parse_str(
