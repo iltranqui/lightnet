@@ -212,6 +212,7 @@ file is named inline.
 - [184. HF/FiLM GPU Muon sidecar resume](#184-hffilm-gpu-muon-sidecar-resume)
 - [185. HyperbolicFoveation axis/layout pin](#185-hyperbolicfoveation-axislayout-pin)
 - [186. HF axis fixture matches OpenCV interpolation taps](#186-hf-axis-fixture-matches-opencv-interpolation-taps)
+- [187. Logistic NCHW/batch axis pin](#187-logistic-nchwbatch-axis-pin)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2125,6 +2126,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 186. HF axis fixture matches OpenCV interpolation taps
 
 - v0.1.028 (`42cfdaf3`): refined the HF axis fixture coordinates to exact multiples of OpenCV `INTER_LINEAR`'s 1/32 interpolation table, preventing the hand-computed bilinear expectations from relying on non-table fractions. The updated `MEM=3G ./tools/test_host.sh axis_layout` passed all 37 tests. This is a fixture precision correction; no compiled-C++ golden is available.
+
+## 187. Logistic NCHW/batch axis pin
+
+- v0.1.029 (`pending`): added `runtime::tests::logistic_axis_layout_keeps_batch_channel_hw_order`, a hand-computed `B=2,C=2,H=2,W=3` sigmoid fixture. The expected values follow the flat `batch*inputs` copy plus elementwise activation in `raptor:src-lib/logistic_layer.cpp:72-77` and `activations.cpp:127-143`; `MEM=3G ./tools/test_host.sh logistic_axis_layout` passed, then `MEM=3G ./tools/test_host.sh axis_layout` passed all 38 tests. Source-derived, not a compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 

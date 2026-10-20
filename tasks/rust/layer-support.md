@@ -131,7 +131,7 @@ with the command given rather than trusting the number.
 | `Segmentation` | alias | none | head | head | T2 | native (loss on host) | head | no |
 | `OmdLoss` | alias | none | pass + head | head | T2 | pass | head | no |
 | `Contrastive` | yes | none | pass + head | head | T2 | pass | head | no |
-| `Logistic` | yes | none | head | head | T2 | native | head | no |
+| `Logistic` | yes | none | head | head | pin | native | head | no |
 | `Regression` | yes | none | pass | pass | T2 | pass | pass | yes (inference) |
 | `Cost` | yes | none | pass + head | head | T1 | pass | pass | yes (inference) |
 | `Region` | yes | none (C++ has block) | flatten + objectness logistic/optional softmax | exact supplied-seed adjoint | pin | native full/compact f32 | device (exact Rust adjoint) | yes (inference) |
