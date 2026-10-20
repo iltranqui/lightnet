@@ -1,3 +1,6 @@
 [submodule "src/cutile-rs-aot"]
 	path = src/cutile-rs-aot
 	url = https://github.com/NVlabs/cutile-rs
+[submodule "third_party/cuda-oxide"]
+	path = third_party/cuda-oxide
+	url = https://github.com/NVlabs/cuda-oxide

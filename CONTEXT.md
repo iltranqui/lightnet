@@ -16,7 +16,7 @@ lightnet/
 ├─ CLAUDE.md             routing table
 ├─ CONTEXT.md            this file
 ├─ src/                  PRODUCT: Darknet Rust port (9 crates)
-├─ bridges/              VENDORED: NVlabs/cuda-oxide crates, treated as opaque
+├─ third_party/          SUBMODULES: cuda-oxide (pinned 7d9c19405), local patches
 ├─ docs/                 reference shelf: architecture, parity, benchmarks
 ├─ cfg/                  factory: model .cfg files
 ├─ tools/                scripts: oxide test/bench/parity helpers
@@ -28,7 +28,7 @@ lightnet/
 ```
 darknet-cli ──► darknet-core ──► darknet-cuda
      │                                ▲
-     ├─(feature oxide)─► darknet-cuda-oxide ──► bridges/cuda-device, cuda-host
+     ├─(feature oxide)─► darknet-cuda-oxide ──► cuda-oxide crates cuda-device, cuda-host
      │                       (not a workspace member)
 darknet-cuda-cutile ───────────────────┘   (not a workspace member)
 darknet-examples ──► darknet-core
@@ -55,5 +55,5 @@ Completed plans stay in place: they are the roadmap.
 
 ## Factory vs product
 
-- Factory (stable across runs): `cfg/`, `tools/`, `bridges/`, `tasks/rust/AGENTS.md`.
+- Factory (stable across runs): `cfg/`, `tools/`, `third_party/`, `tasks/rust/AGENTS.md`.
 - Product (changes with the work): `src/`, `tasks/rust/STATUS.md`, `todo.md`, `implemented.md`.

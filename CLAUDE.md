@@ -14,7 +14,7 @@ Rust port of Darknet/YOLO (branch `rust`) with CPU, cuTile and cuda-oxide GPU ba
 | Zone | Path | Entry file |
 |---|---|---|
 | Product (Darknet port) | `src/darknet-*` | `src/<crate>/CONTEXT.md` |
-| Vendored cuda-oxide | `bridges/*` | `bridges/CONTEXT.md` |
+| cuda-oxide (submodule) | `third_party/cuda-oxide` | `third_party/CONTEXT.md` |
 | Roadmap and plans | `tasks/rust/` | `tasks/rust/CONTEXT.md` |
 | Reference docs | `docs/` | `docs/CONTEXT.md` |
 | Model configs | `cfg/` | `cfg/CONTEXT.md` |
@@ -28,7 +28,7 @@ Whole-repo map: [CONTEXT.md](CONTEXT.md).
 - GPU layer work: `tasks/rust/gpu_layers_plan.md`.
 - Current state after a context reset: `tasks/rust/STATUS.md`.
 - Touch a crate: its `CONTEXT.md` first.
-- Touch `bridges/`: read `bridges/CONTEXT.md` first; it is vendored code.
+- Touch cuda-oxide: read `third_party/CONTEXT.md` first; it is a pinned submodule, not editable here.
 
 ## Hard rules
 

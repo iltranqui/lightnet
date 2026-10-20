@@ -11,9 +11,9 @@ path = "src/lib.rs"
 [dependencies]
 darknet-cuda = { path = "../darknet-cuda" }
 # Device-side intrinsics (thread indexing, slices, barriers).
-cuda-device = { path = "../../bridges/cuda-device" }
+cuda-device = { path = "../../third_party/cuda-oxide/cuda-oxide/crates/cuda-device" }
 # Host-side launch glue used by `#[cuda_module]`.
-cuda-host = { path = "../../bridges/cuda-host" }
+cuda-host = { path = "../../third_party/cuda-oxide/cuda-oxide/crates/cuda-host" }
 # Host-side CUDA driver wrapper.
 cuda-core = "0.3.1"
 

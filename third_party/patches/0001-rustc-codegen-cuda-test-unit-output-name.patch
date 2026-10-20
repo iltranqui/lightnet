@@ -1,0 +1,19 @@
+--- a/cuda-oxide/crates/rustc-codegen-cuda/src/lib.rs
++++ b/cuda-oxide/crates/rustc-codegen-cuda/src/lib.rs
+@@ -657,7 +657,15 @@
+                         output_dir: self.config.ptx_output_dir.clone().unwrap_or_else(|| {
+                             std::env::current_dir().unwrap_or_else(|_| ".".into())
+                         }),
+-                        output_name: tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE).to_string(),
++                        // `lib` and `lib --test` units of one package share the
++                        // crate name and cargo's cwd; give the test harness its
++                        // own intermediate .ll/.ptx/.o names so parallel
++                        // codegen (`-j > 1`) does not race on them.
++                        output_name: if tcx.sess.opts.test {
++                            format!("{}_test", tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE))
++                        } else {
++                            tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE).to_string()
++                        },
+                         verbose: self.config.verbose,
+                         dump_rustc_mir: self.config.dump_rustc_mir,
+                         dump_mir_dialect: self.config.dump_mir_dialect,

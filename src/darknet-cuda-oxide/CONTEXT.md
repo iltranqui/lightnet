@@ -21,7 +21,7 @@ Native GPU path for layers, written as `#[kernel]` functions compiled by the ven
 
 ## Dependencies
 
-- Depends on: `darknet-core`, `darknet-cuda`, `bridges/cuda-device`, `bridges/cuda-host`, `cuda-core`.
+- Depends on: `darknet-core`, `darknet-cuda`, `third_party/cuda-oxide` crates `cuda-device` and `cuda-host`, `cuda-core`.
 - Depended on by: `darknet-cli` (optional feature `oxide`).
 
 ## Constraints

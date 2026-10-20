@@ -27,7 +27,7 @@ cargo build -p cargo-oxide                      # -> target/debug/cargo-oxide
   `systemd-run --user --scope -p MemoryHigh=2G target/debug/cargo-oxide oxide test -- ...`.
   `lib` and `lib --test` used to write the same `darknet_cuda_oxide*.ll/.ptx` files and raced (SIGBUS in
   `opt` with `-j > 1`); the test unit now uses `darknet_cuda_oxide_test*` names
-  (`bridges/rustc-codegen-cuda/src/lib.rs`) and `-j 4 --test oxide_parity` passed (2026-10-01).
+  (`rustc-codegen-cuda/src/lib.rs` in the cuda-oxide submodule) and `-j 4 --test oxide_parity` passed (2026-10-01).
 * One suite: add `--test oxide_parity` after `-j N`, e.g.
   `... -- --manifest-path src/darknet-cuda-oxide/Cargo.toml -j 4 --test oxide_parity -- --test-threads=1`.
 * The generated `darknet_cuda_oxide*.ll` / `.ptx` files in this directory are build products.
