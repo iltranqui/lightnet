@@ -144,6 +144,7 @@ file is named inline.
 - [116. Native f16 channel shuffle inference](#116-native-f16-channel-shuffle-inference)
 - [117. Native f16 reorg inference](#117-native-f16-reorg-inference)
 - [118. Native f32 Region GPU execution](#118-native-f32-region-gpu-execution)
+- [119. Native f16 Region inference](#119-native-f16-region-inference)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1785,6 +1786,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 118. Native f32 Region GPU execution
 
 - v0.2.091: replaced Region's full/compact GPU hard rejection with native Oxide f32 layout/activation forward and exact Rust-forward input adjoint. Forward transposes channel-major NCHW values to spatial/anchor/entry rows, applies objectness sigmoid and optional class softmax; backward differentiates those transforms and returns NCHW gradients. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain region_native_gpu_forward_backward_matches_cpu` passed actual-Oxide CPU-reference comparisons for full training forward, compact inference and supplied-seed gradients with batch 2, non-square geometry, softmax both off/on. `MEM=3G ./tools/test_host.sh region` passed 2 tests including the hand-derived axis pin. Region truth-driven loss/decode remain absent. C++ GPU backward passes deltas through, unlike this exact derivative of the Rust forward; no compiled-C++ golden or parity claim.
+
+## 119. Native f16 Region inference
+
+- v0.2.092: added compact Oxide f16 Region inference with a half-storage channel-layout transpose, f32 objectness sigmoid/optional class softmax, and half stores. Both softmax-disabled/enabled batch-2 cases matched compact f32 (relative max errors 2.324e-4 and 2.856e-4); the full `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` suite passed 11 tests. f16 backward/training and Region truth-loss/decode remain unsupported; no compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 
