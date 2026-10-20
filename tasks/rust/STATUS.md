@@ -63,7 +63,8 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
-- v0.2.157: LayaScorer full and compact f32 inference now use native Oxide unpack, LayerNorm, connected, exact-erf GELU, and pack operations; actual-device CPU-reference parity passes for multiple batches/options. Backward remains host-computed. See `implemented.md` §196.
+- v0.2.158: LayaScorer GPU backward now computes the frozen layer's input adjoint with native Oxide operations; actual-device preceding-layer/input-gradient parity passes. No scorer parameter updates. See `implemented.md` §197.
+- v0.2.157: LayaScorer full and compact f32 inference now use native Oxide unpack, LayerNorm, connected, exact-erf GELU, and pack operations; actual-device CPU-reference parity passes for multiple batches/options. See `implemented.md` §196.
 - v0.2.156: LayaHead full and compact f32 forward now compose native Oxide type conditioning, LayerNorm, projections, masked attention, residuals, FFN and layout packing; Actual-Oxide CPU-reference parity passes fixed/input qtype and mask cases. See `implemented.md` §195.
 - v0.2.155: native LayaHead masked-attention primitive with online softmax passes actual-Oxide CPU-formula parity for mixed and all-masked rows; 2 focused tests pass. See `implemented.md` §194.
 - v0.2.154: compact f16 LAYA act-head now uses native Oxide feature extraction, connected layers, and exact-erf GELU; actual-device CPU parity passes and the full 22-test f16 suite is green. Inference only; training and weight-file loading remain open. See `implemented.md` §193.
