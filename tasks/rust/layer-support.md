@@ -69,9 +69,9 @@ with the command given rather than trusting the number.
 | CPU-only forward, no GPU path (hard reject) | 9 |
 | GPU forward but CPU/mixed backward | 11 (9 whole-network fallback + HF/FiLM host helpers) |
 | GPU native forward + device backward | 24 |
-| f16 inference | 24 variants (25 section names) |
-| Axis pinned | 31 variants / 34 tests |
-| Axis open | 29 (Tier 1: 3, Tier 2: 15, Tier 3: 3, Tier 4: 8) |
+| f16 inference | 25 variants (26 section names) |
+| Axis pinned | 34 C++-backed variants / 38 tests total (includes one Rust-only contract test) |
+| Axis open | 26 (Tier 1: 3, Tier 2: 14, Tier 3: 3, Tier 4: 6) |
 | Axis Rust-only | 5 |
 | Partial/incomplete CPU layers | `Region`, `Detection`, `Yolo3d`; blocked: `Dcnv3`, `DetrDecoder` |
 | GPU Muon | partial hybrid integration: connected matrices use native Oxide momentum/lookahead, Newton–Schulz and direction+decay update; standard non-BN convolution, non-BN EML branches, non-BN MoE router/expert matrices, non-BN GraphConv projection/self/learned-edge matrices with `groups=2` parity, tested `dont_update` gating, and DNOPT6 save/load resume; BN GraphConv forward/backward is native for eligible modes, with rolling stats host-synchronized; Muon state/final updates remain host-managed, non-BN DCNv4 offset projection, non-BN deform_conv main/offset/optional mask matrices, local per-location, RNN, LSTM, deconvolutional, and transformer-family matrices use native Oxide Newton–Schulz with host-managed state/final updates. Convolution/EML/MoE/DCNv4 gradients are downloaded at optimizer boundaries; deform_conv gradients download during native backward. Updated convolution/expert parameters are re-uploaded and DCNv4 snapshots trigger cache refresh on the next forward. BN convolution/EML/MoE/DCNv4/deform_conv remain rejected; GraphConv BN training is native only for eligible edge modes/activations. Connected BN has actual-device output/parameter parity across two Muon updates; supported activations use native connected/BN backward and rolling-stat updates (v0.2.101), while BN gradient accumulation and rolling-stat synchronization remain host-managed. Connected momentum is cached between steps but mirrored to host each update; weights remain host-canonical. Standalone BatchNorm and HF/FiLM use host AdamW fallback; eligible HF/FiLM 2-D matrices use native Oxide orthogonalization with host-managed Muon state/final updates and actual-Oxide parity (v0.2.146); other parameter families open |
@@ -131,7 +131,7 @@ with the command given rather than trusting the number.
 | `Segmentation` | alias | none | head | head | T2 | native (loss on host) | head | no |
 | `OmdLoss` | alias | none | pass + head | head | T2 | pass | head | no |
 | `Contrastive` | yes | none | pass + head | head | T2 | pass | head | no |
-| `Logistic` | yes | none | head | head | pin | native | head | no |
+| `Logistic` | yes | none | head | head | pin | native | head | yes (compact inference) |
 | `Regression` | yes | none | pass | pass | T2 | pass | pass | yes (inference) |
 | `Cost` | yes | none | pass + head | head | T1 | pass | pass | yes (inference) |
 | `Region` | yes | none (C++ has block) | flatten + objectness logistic/optional softmax | exact supplied-seed adjoint | pin | native full/compact f32 | device (exact Rust adjoint) | yes (inference) |
