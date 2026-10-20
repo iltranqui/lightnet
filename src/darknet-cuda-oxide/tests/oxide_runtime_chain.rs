@@ -541,6 +541,40 @@ fn foveation_film_and_hf_gpu_muon_match_cpu_across_steps() {
 }
 
 #[test]
+fn foveation_film_gpu_muon_dont_update_gate_matches_cpu() {
+    let net = network(
+        "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=2\nmuon=1\ndecoupled_decay=1\n\
+         [hf]\nparams=learned\npred_hidden=2\ndownsample=1\ninverse_method=fixed_point\nradius_mode=anisotropic\n\
+         [foveation_film]\nembed_dim=2\ndont_update=1\nbackprop_to_hf=1\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    let mut gpu = GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide backend"));
+    gpu.params = cpu.params.clone();
+    let initial = cpu.params[1].clone();
+    let input = patterned(net.net.input_shape());
+    let seed = Tensor::from_data(net.layers[1].output_shape, vec![0.7; 12]).unwrap();
+    let mut seeds = vec![None; net.layers.len()];
+    seeds[1] = Some(seed);
+    for iteration in [0, 1] {
+        cpu.set_train_iteration(iteration);
+        gpu.set_train_iteration(iteration);
+        let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
+        let gpu_forward = gpu.forward_training_with_state(&input).expect("native GPU forward");
+        cpu.zero_train_buffers();
+        gpu.zero_train_buffers_gpu().expect("zero GPU gradients");
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds).expect("CPU backward");
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds).expect("native GPU backward");
+        cpu.update_weights_muon(0.01, 2).expect("CPU Muon update");
+        gpu.update_weights_gpu(0.01, 0.0, net.net.decay, 2).expect("GPU Muon update");
+        assert_eq!(cpu.params, gpu.params, "Muon's per-layer gate parity at {iteration}");
+        if iteration == 0 {
+            assert_eq!(cpu.params[1], initial, "dont_update preserves FiLM parameters");
+        }
+    }
+    assert_ne!(cpu.params[1], initial, "FiLM update resumes after dont_update gating");
+}
+
+#[test]
 fn foveation_film_gpu_sgd_dont_update_gate_matches_cpu() {
     let net = network(
         "[net]\nwidth=3\nheight=2\nchannels=1\nbatch=1\n\
