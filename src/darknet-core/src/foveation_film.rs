@@ -293,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn forward_matches_hand_computed_nchw_batch_and_channel_affine() {
+    fn foveation_film_axis_layout_maps_batch_hf_embedding_and_channel_affines() {
         let input = input();
         let output = forward(&params(), &input, &hf_params());
 
