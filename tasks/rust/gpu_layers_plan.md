@@ -132,10 +132,14 @@ Bounded native slice:
     with actual-Oxide runtime CPU parity and direct input-gradient checks; add
     primitive finite differences for source/W1/B1/W2/B2 (v0.2.143), including
     downsample=2 with an incomplete pooling edge.
-14. [ ] Add native inverse-point parameter Jacobian. Runtime currently consumes
-    the native grid adjoint through the host Jacobian (v0.2.140). Actual-Oxide gates cover
-    compact f32/f16, Muon, SGD `dont_update`, Adam `burnin_update`, and SGD
-    `train_only_bn` (v0.2.128–131). No compiled-C++ GPU-parity claim.
+14. [ ] Complete native inverse-point parameter Jacobian. The fixed-point
+    Jacobian is now native for isotropic and anisotropic radii (v0.2.144), with
+    actual-Oxide finite differences and runtime parity. Newton inverse-point
+    parameter Jacobian remains host-managed; do not mark this item complete
+    until Newton dual-number differentiation is native and verified. Actual-
+    Oxide gates cover compact f32/f16, Muon, SGD `dont_update`, Adam
+    `burnin_update`, and SGD `train_only_bn` (v0.2.128–131). No compiled-C++
+    GPU-parity claim.
 
 v0.2.120 implements native per-sample NCHW affine and exact input/gamma/beta
 adjoints; v0.2.121 composes native HF embedding/ReLU and gamma/beta projections
@@ -158,8 +162,9 @@ adjoint for host inverse-point HF parameter gradients. Actual-Oxide runtime
 tests cover learned anisotropic fixed-point SGD and learned anisotropic Newton
 Adam, comparing predictor and FiLM parameter updates over two steps; direct
 runtime input-gradient parity is checked (v0.2.141), and the native predictor
-adjoint now covers MLP parameters/source gradients (v0.2.142). Only the
-inverse-point parameter Jacobian remains host-managed.
+adjoint now covers MLP parameters/source gradients (v0.2.142). Fixed-point
+inverse parameter Jacobian is native (v0.2.144); Newton inverse parameter
+Jacobian remains host-managed.
 
 This remains an open plan, not evidence of a complete native layer. Native HF
 coverage includes forward for isotropic and anisotropic modes, native warp

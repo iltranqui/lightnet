@@ -205,6 +205,7 @@ file is named inline.
 - [177. Direct HF runtime input-gradient parity](#177-direct-hf-runtime-input-gradient-parity)
 - [178. Native HF predictor backward](#178-native-hf-predictor-backward)
 - [179. HF predictor adjoint finite differences](#179-hf-predictor-adjoint-finite-differences)
+- [180. Native HF fixed-point parameter adjoint](#180-native-hf-fixed-point-parameter-adjoint)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2090,6 +2091,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 179. HF predictor adjoint finite differences
 
 - v0.2.143 (`07e22b5b`): added actual-Oxide finite-difference checks for predictor source, W1/B1 and W2/B2 gradients, using a learned two-batch anisotropic-compatible layout with `downsample=2` and an incomplete pooling edge. `MEM=3G ./tools/test_oxide.sh --test oxide_hyperbolic_foveation` passed all 7 tests. This strengthens primitive evidence; runtime CPU parity and host inverse-point parameter Jacobian scope remain as documented in §178. No compiled-C++ or performance claim.
+
+## 180. Native HF fixed-point parameter adjoint
+
+- v0.2.144 (`64fd3da7`): added an Oxide forward-dual fixed-point inverse-iteration parameter Jacobian for isotropic and anisotropic radii. Runtime consumes it when the native backend implements the optional operation; unsupported backends and Newton mode retain the host reference. Actual-Oxide finite differences cover each packed parameter across two batches for both radius modes; learned-anisotropic fixed-point runtime SGD parity also passes, along with the existing Newton Adam fallback parity. `MEM=3G ./tools/test_host.sh hyperbolic_foveation` passed 30 tests; `MEM=3G ./tools/test_oxide.sh --test oxide_hyperbolic_foveation` passed 8; both focused runtime tests passed. Newton parameter Jacobian remains host-managed; no compiled-C++ or performance claim.
 
 ## Not implemented / open (pointer)
 
