@@ -152,6 +152,7 @@ file is named inline.
 - [124. Native f16 channel-normalization inference](#124-native-f16-channel-normalization-inference)
 - [125. Native f16 connected inference](#125-native-f16-connected-inference)
 - [126. Native f16 Cost identity and full ResNet101 coverage](#126-native-f16-cost-identity-and-full-resnet101-coverage)
+- [127. Native f16 Detection and Regression identity paths](#127-native-f16-detection-and-regression-identity-paths)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1825,6 +1826,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 126. Native f16 Cost identity and full ResNet101 coverage
 
 - v0.2.099: compact f16 now accepts `[cost]` as an inference identity, allowing the existing ResNet101 f16 parity fixture to run through its final Connected classifier and Cost section instead of stopping at avgpool. The full `real_cfgs_f16_matches_f32` test passed; final ResNet101 relative max error was 9.775e-4. The complete Oxide f16 suite passed 17 tests. Rust compact CPU/f32 references only; no compiled-C++ golden.
+
+## 127. Native f16 Detection and Regression identity paths
+
+- v0.2.100: compact f16 inference now retains `[detection]` and `[regression]` as device-resident identity layers, matching the current CPU/f32 forward contract. Actual-Oxide batch-2 chain parity passed against f32 compact (relative max error 2.152e-4); full Oxide f16 suite passed 18 tests. No compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 
