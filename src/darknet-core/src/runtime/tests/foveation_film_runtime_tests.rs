@@ -492,41 +492,19 @@ fn foveation_film_sgd_adamw_muon_and_gpu_boundary() {
     assert!(f16_rejection.contains("GPU f16 inference is not implemented"));
     let gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
     let input = Tensor::zeros(network.net.input_shape());
-    assert!(
-        gpu.forward(&input)
-            .unwrap_err()
-            .to_string()
-            .contains("GPU execution is not implemented in Stage-1 CPU support")
-    );
+    let forward = gpu.forward(&input).expect("host-source/native FiLM forward");
+    assert_eq!(forward.layer_outputs.len(), network.layers.len());
     assert!(
         gpu.forward_compact(&input)
             .unwrap_err()
             .to_string()
             .contains("GPU compact inference is not implemented in Stage-1 CPU support")
     );
-    let dummy_state = crate::runtime::GpuForwardState {
-        input_gpu: FakeTensor {
-            shape: vec![1, 1, 2, 3],
-            data: vec![0.0; 6],
-        },
-        gpu_layer_outputs: Vec::new(),
-        gpu_layer_activation_inputs: Vec::new(),
-        gpu_batch_norm_caches: Vec::new(),
-        gpu_rnn_caches: Vec::new(),
-        gpu_crnn_caches: Vec::new(),
-        gpu_lstm_caches: Vec::new(),
-        gpu_moe_caches: Vec::new(),
-        gpu_eml_caches: Vec::new(),
-        gpu_dcnv4_caches: Vec::new(),
-        cpu_forward: ForwardResult::from_heads(Vec::new(), Vec::new()),
-    };
     let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
-    assert!(
-        gpu.backward_accumulate_seeded_gpu(&dummy_state, &[])
-            .unwrap_err()
-            .to_string()
-            .contains("GPU backward and updates is not implemented in Stage-1 CPU support")
-    );
+    let state = gpu.forward_with_state(&input).expect("forward state");
+    let seeds = vec![None; network.layers.len()];
+    gpu.backward_accumulate_seeded_gpu(&state, &seeds)
+        .expect("CPU backward fallback");
     assert!(
         gpu.update_weights_gpu(0.01, 0.0, 0.0, 1)
             .unwrap_err()
