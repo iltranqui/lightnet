@@ -2870,9 +2870,9 @@ fn dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu() {
             (0, 0, "leaky", 29, 14, 1),
             (0, 0, "leaky", 31, 15, 1),
         ] {
-            // Extend non-BN Adam runtime parity through 21x21. Keep larger
+            // Extend non-BN Adam runtime parity through 23x23. Keep larger
             // kernels and BN Adam on SGD / the previously verified bound.
-            if adam && (size > 21 || (size >= 17 && batch_normalize)) {
+            if adam && (size > 23 || (size >= 17 && batch_normalize)) {
                 continue;
             }
             let net = network(&format!(
