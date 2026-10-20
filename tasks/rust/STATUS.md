@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.107: extended native DCNv4 to 23x23/529 active points; actual-Oxide composition and two-step runtime SGD parity pass, 25x25 falls back, and Adam parity remains through 15x15. See `implemented.md` §142. CPU-reference parity only.
 - v0.2.106: extended native DCNv4 to 21x21/441 active points; actual-Oxide composition and two-step runtime SGD parity pass, 23x23 falls back, and Adam parity remains through 15x15. See `implemented.md` §141. CPU-reference parity only.
 - v0.2.105: extended native DCNv4 to 19x19/361 active points; actual-Oxide composition and two-step runtime SGD parity pass, 21x21 falls back, and Adam parity remains through 15x15. See `implemented.md` §140. CPU-reference parity only.
 - v0.2.104: extended native DCNv4 to 17x17/289 active points with actual-Oxide composition and runtime SGD parity; Adam runtime remains covered through 15x15, and 19x19 falls back. See `implemented.md` §139. CPU-reference parity only; one initial near-threshold Adam update mismatch passed on rerun, cause unresolved.
