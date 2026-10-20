@@ -101,8 +101,9 @@ Bounded native slice:
    match; HF source evaluation/cache transfer is explicit and missing sources
    error. GPU backward is still explicitly gated to the CPU fallback.
 4. [ ] Add runtime native-backward parity for input/parameter/HF gradients and
-   SGD/Adam updates. Primitive tests cover actual-device parity and affine FD;
-   runtime tests cover batch-2 non-square outputs plus backward-fallback success.
+   SGD/Adam updates. Primitive tests cover actual-device parity and finite
+   differences for every HF/FiLM projection parameter; runtime tests cover
+   batch-2 non-square outputs plus backward-fallback success.
    Add explicit unsupported-update/compact/f16 gate coverage. No compiled-C++
    GPU-parity claim.
 
@@ -111,7 +112,8 @@ adjoints; v0.2.121 composes native HF embedding/ReLU and gamma/beta projections
 into a full forward primitive; v0.2.122 adds full primitive input, parameter,
 and HF-source adjoints. v0.2.123 integrates the Oxide runtime forward with
 host-computed HF parameters and a deliberate CPU backward fallback. Focused
-actual-device runtime output parity and fallback-backward success pass.
+actual-device runtime output parity and fallback-backward success pass. v0.2.124
+finite-differences every HF/FiLM projection gradient element in the primitive.
 
 This remains an open plan, not evidence of a complete native layer; keep
 `layer-support.md` GPU `none` until runtime native backward and optimizer tests

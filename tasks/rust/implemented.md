@@ -186,6 +186,7 @@ file is named inline.
 - [158. Native FoveationFilm full forward primitive](#158-native-foveationfilm-full-forward-primitive)
 - [159. Native FoveationFilm full adjoint primitive](#159-native-foveationfilm-full-adjoint-primitive)
 - [160. FoveationFilm runtime native forward](#160-foveationfilm-runtime-native-forward)
+- [161. FoveationFilm projection-adjoint finite differences](#161-foveationfilm-projection-adjoint-finite-differences)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1995,6 +1996,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 160. FoveationFilm runtime native forward
 
 - v0.2.123: full GPU runtime now accepts `[hyperbolic_foveation]` as a host fallback source, retains its per-batch HF cache, transfers those parameters to the backend, and dispatches `[foveation_film]` through `foveation_film_forward_f32`. The HF and FiLM backward path is explicitly CPU-fallback gated, and GPU optimizer updates, compact inference, and f16 inference still reject these layers. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_native_forward_uses_host_hf_source_cache` passed on actual Oxide: all layer outputs match the CPU runtime and the backward fallback succeeds. `MEM=3G ./tools/test_host.sh foveation_film` passed all 12 focused tests, including the hybrid runtime boundary. No compiled-C++ golden or complete native layer-training claim; `layer-support.md` remains GPU `none`.
+
+## 161. FoveationFilm projection-adjoint finite differences
+
+- v0.2.124 (`8b421a9e`): extended the actual-Oxide full FiLM projection test to finite-difference every HF-source, embedding, gamma, and beta gradient element against the host forward objective; all 2 `oxide_foveation_film` tests pass. This validates the primitive composition, not a native runtime backward path or compiled-C++ parity.
 
 ## Not implemented / open (pointer)
 
