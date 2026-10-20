@@ -27,7 +27,7 @@ deliverable. Sparse MoE remains unstarted.
 ## Resume point
 
 Marker gather is native in f32 full/compact forward/backward and f16 compact
-inference (v0.2.001–002). v0.2.149 adds compact f16 Logistic sigmoid through the native half-storage channel-affine activation kernel; v0.2.150 adds direct CPU-reference parity. v0.2.151 adds OMD loss inference as a device identity pass-through. The full `oxide_runtime_f16` suite passes 20 tests; these paths are inference only. v0.2.152 adds group-major JevCe compact f16 inference via native temperature scaling and softmax; v0.2.153 adds native channel-major NCHW group-softmax. Both layouts pass CPU parity; the full f16 suite passes 21 tests. Act-head features/exact-erf primitives are native f32
+inference (v0.2.001–002). v0.2.149 adds compact f16 Logistic sigmoid through the native half-storage channel-affine activation kernel; v0.2.150 adds direct CPU-reference parity. v0.2.151 adds OMD loss inference as a device identity pass-through. The full `oxide_runtime_f16` suite passes 20 tests; these paths are inference only. v0.2.152 adds group-major JevCe compact f16 inference via native temperature scaling and softmax; v0.2.153 adds native channel-major NCHW group-softmax. Both layouts pass CPU parity. v0.2.154 adds compact f16 LAYA act-head with native half-storage feature extraction and exact-erf GELU; CPU-reference output parity and all 22 f16 tests pass. Act-head inference now supports f32 and compact f16; training/backward/update and shared-file loading gaps remain. Act-head features/exact-erf primitives are native f32
 (v0.2.003–004), and full/compact act-head f32 forward is native in v0.2.005.
 Evidence/limits are in `implemented.md` §§41–45. Do not repeat these ports.
 Act-head uses four uncached weight uploads per forward; no residency/speedup
@@ -210,7 +210,8 @@ uses only the CLS adjoint.
   current behavior until the source-training contract is resolved and do not
   remove the CPU fallback or start applying updates by inference.
 - [ ] Shared-file loading remains unproven (in-memory blob replacement is not a
-  file-loader test); f16 remains rejected. Native forward parity was validated
+  file-loader test). Native compact f16 inference is implemented in v0.2.154;
+  it does not change f32 runtime precision. Native forward parity was validated
   with explicit Fp32 GEMM only. No full runtime-training or speedup claim.
 
 ## Next slice: deformable conv forward (wave 1, part 3)
@@ -558,7 +559,7 @@ No performance/compiled-C++ claim without actual measurements/golden evidence.
 
 ## Remaining scope
 
-Act-head runtime backward/update/file loading and f16, other LAYA/transformer
+Act-head runtime backward/update/file loading, other LAYA/transformer
 layers, DCNv4 Adam and excluded-variant host fallbacks, deform host fallbacks,
 deconvolution unsupported-activation fallback, CPU-only layer GPU paths and GPU
 Muon remain open. Each layer needs device forward/backward/update tests as

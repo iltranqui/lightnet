@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.154: compact f16 LAYA act-head now uses native Oxide feature extraction, connected layers, and exact-erf GELU; actual-device CPU parity passes and the full 22-test f16 suite is green. Inference only; training and weight-file loading remain open. See `implemented.md` §193.
 - v0.2.153: native channel-major compact f16 JevCe softmax now complements group-major support; both layouts pass CPU parity and the 21-test f16 suite. See `implemented.md` §192.
 - v0.2.152: compact f16 JevCe inference uses native temperature scaling plus group-major softmax; CPU parity and full 21-test f16 suite pass. Channel-major layout was explicitly rejected at this release. See `implemented.md` §191.
 - v0.2.151: compact f16 OMD loss inference preserves the source pass-through; actual-Oxide CPU parity and the full 20-test f16 suite pass. See `implemented.md` §190.

@@ -69,7 +69,7 @@ with the command given rather than trusting the number.
 | CPU-only forward, no GPU path (hard reject) | 9 |
 | GPU forward but CPU/mixed backward | 11 (9 whole-network fallback + HF/FiLM host helpers) |
 | GPU native forward + device backward | 24 |
-| f16 inference | 27 variants (28 section names) |
+| f16 inference | 28 variants (29 section names) |
 | Axis pinned | 34 C++-backed variants / 38 tests total (includes one Rust-only contract test) |
 | Axis open | 26 (Tier 1: 3, Tier 2: 14, Tier 3: 3, Tier 4: 6) |
 | Axis Rust-only | 5 |
@@ -125,7 +125,7 @@ with the command given rather than trusting the number.
 | `LayaHead` | yes | C++ | frozen | frozen | pin | host | cpu | no |
 | `LayaScorer` | yes | C++ | frozen | frozen | pin | native | device | no |
 | `LayaMarkerGather` | yes | none | fwd | exact | pin | native | device | yes |
-| `LayaActHead` | yes | C++ | fwd | exact (CPU path) | pin | native | cpu (primitive native) | no |
+| `LayaActHead` | yes | C++ | fwd | exact (CPU path) | pin | native | cpu (primitive native) | yes (compact inference; training unsupported) |
 | `LayaLoss` | yes | none | head | head | pin | native (loss on host) | head | no |
 | `JevCe` | alias | none | head | head | T2 | native (loss on host) | head | yes (f16 inference; both layouts) |
 | `Segmentation` | alias | none | head | head | T2 | native (loss on host) | head | no |
@@ -275,7 +275,7 @@ BN/norm scales, positional/embedding tables and 1-D params stay Adam/AdamW.
 
 Accepted by `forward_compact_f16` (`runtime.rs:8389`):
 
-`convolutional` (including `NORM_CHAN*` with f32 channel reductions), `maxpool`, `local_avgpool`, `avgpool`,
+`convolutional` (including `NORM_CHAN*` with f32 channel reductions), `maxpool`, `local_avgpool`, `avgpool`, `laya_act_head` (compact inference only),
 `batchnorm`, `connected` (incl. folded rolling-stat BN), `route`, `channel_slice`, `laya_marker_gather`, `channel_shuffle`,
 `upsample` (incl. `reverse`), `dropout`, `cost`, `detection`, and `regression` (inference identities), `jev_ce` (group-major and channel-major layouts), `reorg` (forward/reverse),
 `shortcut` (with sources), `sam` (supported activation), `scale_channels`, `region`, `softmax`, `yolo`, `obb_yolo`, `gaussian_yolo`.

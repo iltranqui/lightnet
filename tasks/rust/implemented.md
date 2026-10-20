@@ -218,6 +218,7 @@ file is named inline.
 - [190. OMD loss compact f16 inference pass-through](#190-omd-loss-compact-f16-inference-pass-through)
 - [191. JevCe group-major compact f16 inference](#191-jevce-group-major-compact-f16-inference)
 - [192. JevCe channel-major compact f16 inference](#192-jevce-channel-major-compact-f16-inference)
+- [193. LAYA act-head compact f16 inference](#193-laya-act-head-compact-f16-inference)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2155,6 +2156,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 192. JevCe channel-major compact f16 inference
 
 - v0.2.153 (`pending`): added a native Oxide NCHW channel-major group-softmax kernel and routed f16 JevCe `layout=cm` through it, alongside existing group-major support. Actual-Oxide output matches the CPU inference reference for both layouts with 2 groups, 3 candidates, temperature 1.5 (relative max errors `4.633e-4` / `3.765e-4`); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed all 21 tests. Inference only; CE loss/backward remain outside this path. No compiled-C++ golden.
+
+## 193. LAYA act-head compact f16 inference
+
+- v0.2.154 (`pending`): added native Oxide half-storage LAYA feature extraction and exact-erf GELU, composing the existing f16 connected operation for both MLP layers in compact inference. Actual-Oxide final output matches the CPU reference (relative max error `7.436e-5`); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed all 22 tests, and `oxide_laya_act_forward` passed both tests. Inference only; act-head backward/update and weight-file loading gaps remain open. No compiled-C++ golden.
 
 ## Not implemented / open (pointer)
 
