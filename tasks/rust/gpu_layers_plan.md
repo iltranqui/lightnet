@@ -106,11 +106,11 @@ Bounded native slice:
    under SGD/Adam. Include device finite differences for the fused primitive
    and explicit fallback-gate coverage. No compiled-C++ GPU-parity claim.
 
-v0.2.120 implements the first low-level piece: the per-sample NCHW affine
-and exact input/gamma/beta adjoint are native Oxide primitives with host parity
-and finite-difference coverage. Embedding/ReLU and gamma/beta projections,
-source-cache transfer, and runtime dispatch are still open. This does not
-change the layer-support status: FoveationFilm has no native runtime path yet.
+v0.2.120 implements native per-sample NCHW affine and exact input/gamma/beta
+adjoints; v0.2.121 composes native HF embedding/ReLU and gamma/beta projections
+into a full forward primitive. Host-reference and actual-device parity/FD tests
+pass. Runtime HF-source extraction/transfer, layer dispatch, and full backward
+are still open; FoveationFilm has no native runtime path yet.
 
 This remains an open plan, not evidence of a complete native layer; update
 `layer-support.md` only after runtime dispatch and both forward/backward tests

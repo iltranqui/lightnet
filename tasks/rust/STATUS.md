@@ -63,6 +63,7 @@ normalization Jacobian). No f16, no diluted/BN device support, no benchmark or
 compiled-C++ golden. Ledger: `implemented.md` §47; state: `layer-support.md`.
 
 Latest increments:
+- v0.2.121: added full FoveationFilm forward projection primitive (HF embedding/ReLU, gamma/beta projections, NCHW affine) through native Oxide operations; 2 actual-device parity/FD tests pass. Runtime integration and backward remain open; see `implemented.md` §158.
 - v0.2.120: added native Oxide f32 FiLM per-sample channel affine and exact input/gamma/beta adjoints; host reference and 1 actual-device parity/finite-difference test pass. This is a primitive only; no FoveationFilm layer runtime path yet. See `implemented.md` §157 and `gpu_layers_plan.md`.
 - v0.1.041: promoted the hand-computed FoveationFilm batch/channel affine test into the named `axis_layout` filter; `MEM=3G ./tools/test_host.sh axis_layout` passed 36 tests. Hand-derived from C++ source, no compiled-C++ golden; see `implemented.md` §156 and `axis-coverage.md`.
 - v0.1.040: added a named batch-2, non-square Crop axis/layout pin for NCHW and centered-window source coordinates; `MEM=3G ./tools/test_host.sh axis_layout` passed 35 tests. Rust contract only, no C++ golden; see `implemented.md` §155 and `axis-coverage.md`.

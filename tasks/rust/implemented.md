@@ -183,6 +183,7 @@ file is named inline.
 - [155. Crop batch/spatial axis contract](#155-crop-batchspatial-axis-contract)
 - [156. FoveationFilm axis/layout pin](#156-foveationfilm-axislayout-pin)
 - [157. Native FoveationFilm affine GPU primitive](#157-native-foveationfilm-affine-gpu-primitive)
+- [158. Native FoveationFilm full forward primitive](#158-native-foveationfilm-full-forward-primitive)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -1980,6 +1981,10 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 157. Native FoveationFilm affine GPU primitive
 
 - v0.2.120 (`6433e4a3`): added native Oxide f32 per-sample/per-channel FiLM affine application and its exact input, gamma, and beta adjoints. The primitive preserves `[B,C]` parameters over NCHW spatial planes. Host-reference test passes; `MEM=3G ./tools/test_oxide.sh --test oxide_foveation_film` passed 1 actual-device test covering batch-2 parity and finite differences for input/gamma/beta. Runtime projection, HF-source integration, layer dispatch, and full backward remain open; `layer-support.md` correctly remains GPU `none`. No compiled-C++ golden or full layer claim.
+
+## 158. Native FoveationFilm full forward primitive
+
+- v0.2.121 (`8b07d40f`): added a backend `foveation_film_forward_f32` operation composing native Oxide HF embedding/ReLU, gamma/beta projections, and the per-sample NCHW affine primitive. Host reference and actual-device CPU-reference parity cover a batch-2 non-square tensor with distinct HF and channel values. `MEM=3G ./tools/test_oxide.sh --test oxide_foveation_film` passed 2 tests, including the affine adjoint finite differences. Runtime HF-source extraction/dispatch and full backward remain open; no native layer-path or compiled-C++ claim.
 
 ## Not implemented / open (pointer)
 
