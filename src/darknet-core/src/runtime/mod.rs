@@ -53,6 +53,7 @@ const BATCH_NORM_ROLLING_KEEP: f32 = 0.99;
 const BATCH_NORM_ROLLING_KEEP_CPU: f32 = 0.9;
 
 mod dcnv4_gpu;
+mod loss_scaler;
 mod laya_act_gpu;
 mod laya_encoder_gpu;
 mod laya_head_gpu;
@@ -87,6 +88,7 @@ mod tests;
 
 pub use self::types::*;
 pub use self::gpu_types::*;
+pub use self::loss_scaler::{LossScaler, ScaleStep};
 pub use self::host_adam::*;
 pub use self::exec_core::*;
 pub use self::exec_forward::*;

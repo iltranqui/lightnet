@@ -258,6 +258,7 @@ file is named inline.
 - [230. Native compact Logistic and Softmax](#230-native-compact-logistic-and-softmax)
 - [231. Native compact Reorg and channel routing](#231-native-compact-reorg-and-channel-routing)
 - [232. Native compact ScaleChannels](#232-native-compact-scalechannels)
+- [233. Dynamic mixed-precision loss scaler](#233-dynamic-mixed-precision-loss-scaler)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2390,6 +2391,11 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 
 - Removed `ScaleChannels` from the generic f32 compact fallback list and added device dispatch through the existing native `scale_channels_f32` and activation ops. Compact preflight still routes unsupported activations through full runtime; supported modes retain the direct device path and source-layer use accounting.
 - `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain compact_reorg_shuffle_channel_slice_and_scale_match_cpu` passed actual-device batch-2 CPU-reference parity for ScaleChannels using a pooled source, together with compact Reorg/ChannelShuffle/ChannelSlice. `MEM=3G ./tools/test_host.sh scale_channels` passed 3 tests. Rustfmt and `git diff --check` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
+
+## 233. Dynamic mixed-precision loss scaler
+
+- v0.2.161 adds public `runtime::LossScaler` and `ScaleStep` for the fp16 training hardening path. Non-finite gradients halve the scale with a 1.0 floor, reset growth, and return `Skip`; finite gradients return `Apply` and double every 1000 steps up to 65,536. Constructor and growth caps are enforced; finite updates at the cap reset the growth counter without overflow. CLI integration and training evidence remain open in `plan_fp16.md` Tasks 2–5.
+- Evidence: `PKGS=darknet-core cargo xtask test loss_scaler` passed all 8 focused tests after temporarily adding `use super::*;` to `runtime/tests/mod.rs` to satisfy existing sibling test imports; that test-harness-only edit was removed afterward. Without the temporary import, the existing test module fails to compile on missing imports before tests run. No training/convergence or C++ parity claim.
 
 ## Not implemented / open (pointer)
 

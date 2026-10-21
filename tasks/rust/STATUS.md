@@ -87,6 +87,7 @@ with actual-device CPU parity; head loss/backward remains host-owned. See
 uncommitted, with no `version-map.tsv` row.
 
 Latest increments:
+- v0.2.161: added the core dynamic `LossScaler`/`ScaleStep` API with overflow skip, 1000-step growth, 65,536 cap, and overflow-safe cap handling; all 8 focused tests pass with a temporary import shim for the pre-existing runtime test harness. CLI integration/training remain open. See `implemented.md` §233.
 - v0.2.159: LayaEncoder full/compact f32 inference now runs natively on Oxide, including embedding gather, RoPE full/sliding attention, and GeGLU; actual-device parity covers multi-block masks/layout. See `implemented.md` §198.
 - v0.2.158: LayaScorer GPU backward now computes the frozen layer's input adjoint with native Oxide operations; actual-device preceding-layer/input-gradient parity passes. No scorer parameter updates. See `implemented.md` §197.
 - v0.2.157: LayaScorer full and compact f32 inference now use native Oxide unpack, LayerNorm, connected, exact-erf GELU, and pack operations; actual-device CPU-reference parity passes for multiple batches/options. See `implemented.md` §196.

@@ -297,6 +297,7 @@ reference tolerance is `TOL_COMPOSED = 1e-4` rather than the single-stage `2e-6`
 
 ## P8/P9 training follow-ups
 
+- [x] v0.2.161: added the public fp16 dynamic `LossScaler`/`ScaleStep` core API, including overflow skip/halving, the finite-step growth interval, 65,536 constructor/growth cap, and overflow-safe counter handling at the cap. All 8 focused tests passed with a temporary import shim for the existing runtime test harness; CLI integration and training evidence remain open. See `implemented.md` §233.
 - [x] v0.2.100: compact f16 inference now accepts `[detection]` and `[regression]` identity layers. Actual-Oxide batch-2 output matched f32 compact (relative max error 2.152e-4); full suite passed 18 tests. No compiled-C++ golden. See `implemented.md` §127.
 - [x] v0.2.099: compact f16 inference accepts `[cost]` as a device identity, extending real ResNet101 parity through its Connected classifier and Cost section. The full f16 suite passed 17 tests; ResNet101 relative max error vs f32 was 9.775e-4. No compiled-C++ golden. See `implemented.md` §126.
 - [x] v0.2.098: compact f16 inference now supports Connected via NCHW flattening and native Oxide GEMM, with folded rolling-stat BN. Actual-Oxide batch-2 outputs matched f32 compact for non-BN/BN (relative max errors 2.467e-4/3.655e-4); full f16 suite passed 17 tests. Inference only; no compiled-C++ golden. See `implemented.md` §125.
