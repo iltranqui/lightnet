@@ -18,7 +18,7 @@ Roadmap, plans and status for the Rust port. Entry point is `AGENTS.md`; this fi
 |---|---|
 | State | `STATUS.md`, `todo.md`, `implemented.md`, `version-map.tsv` |
 | Coverage | `layer-support.md`, `layers.md`, `axis-coverage.md` |
-| Plans | `*_plan.md`, `fp8_fp4.md`, `onnx.md`, `plan-open-items.md` |
+| Plans | `*_plan.md`, `plan_fp16.md`, `plan_bf16.md`, `plan_fp8.md`, `AGENTS_fp8.md` (goal for the fp16/bf16/fp8 work), `fp8_fp4.md`, `onnx.md`, `plan-open-items.md` |
 | CARPN history | `carpn_task_plan.md`, `carpn_notes.md` |
 | Lessons | `lessons.md` |
 
