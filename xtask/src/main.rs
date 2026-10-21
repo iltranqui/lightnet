@@ -213,9 +213,9 @@ fn detected_gpu_arch() -> Option<String> {
 /// Pulls the precision flag (`-fp8`, `-fp16`, `-bf16`, also with `--`) out of the
 /// `train_legogears` args and maps it to the oxide backend's env switches.
 /// Everything else passes through to the training script.
-fn precision_env(
-    args: &[String],
-) -> Result<(Vec<String>, Vec<(&'static str, &'static str)>, Vec<String>), String> {
+type PrecisionEnv = Result<(Vec<String>, Vec<(&'static str, &'static str)>, Vec<String>), String>;
+
+fn precision_env(args: &[String]) -> PrecisionEnv {
     let mut rest = Vec::new();
     let mut vars = Vec::new();
     let mut extra = Vec::new();
