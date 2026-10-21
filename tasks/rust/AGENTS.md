@@ -35,6 +35,7 @@ Done when all three lines are complete, each version has its tests passing and i
 - Reference C++ lives on other branches (`raptor*`, `Jev_laya`, `fog`, `v6-dev-*`): read with `git show <branch>:<path>`; use `git grep` first, plan paths go stale.
 - No training runs unless the user asks.
 - Commit only files the task names, never `git add -A`. Message `v0.M.NNN: <what>` (see [Versioning](#versioning)). Leave the user's `.gitignore` edit alone.
+- Commit and tag on green: when an agent (Claude or Codex) has implemented a feature and its named tests pass, it commits and tags it right away, without asking. Details in [Versioning](#versioning), "Commit and tag on green".
 - `tasks/` is in `.git/info/exclude`: only `STATUS.md`, `todo.md`, `layers.md`, `lessons.md`, `fp8_fp4.md` are tracked; the rest are local-only and need `git add -f` to commit.
 - Each edited `.md` needs a TOC.
 - Clean up after each completed step: delete `.weights`, `.backup`, `.onnx`, optimizer sidecars, logs, A/B build trees (e.g. `build/base`, `build/cur`), and other big files once nothing needs them. Keep any file a doc or test still references, and record the evidence in the docs before deleting. `build/` is gitignored, so deleting there is safe, but look at the target first; if unsure, ask.
@@ -62,6 +63,11 @@ A `cfg_corpus` timeout is neither a pass nor a failure.
 - Per version, also add one line with evidence to `implemented.md`, an entry to `STATUS.md` "Latest increments", and tick `todo.md`.
 - Gap: `v0.0.248` (`2941a2ee`, CUDA toolkit path in `.cargo/config.toml`) was out of plan. Gaps in numbering are allowed; never reuse a number.
 - Version commits are `git add`ed by path. Tracked files commit normally; local-only files in `tasks/` need `git add -f`.
+- **Commit and tag on green.** This is a standing authorization for every agent (Claude or Codex) working here; do not ask first. It applies when a new feature is implemented and the tests that cover it were run and passed. Then, in this order:
+  1. Commit the files the task names (by path, never `git add -A`) with the message `v0.M.NNN: <what>`, using the next free number of the active line. Put the tests that were run and their result in the commit body. The docs the version requires (`implemented.md`, `STATUS.md`, `todo.md`) go in the same commit. Keep the harness's attribution trailer.
+  2. Tag that commit with the version, `git tag v0.M.NNN <sha>` (lightweight, local). Never reuse, move or delete a tag; if the tag already exists, stop and re-check the number.
+  3. Append the `version-map.tsv` row with `git rev-parse v0.M.NNN` as `new_sha` and commit it as `docs(rust): version-map v0.M.NNN` (docs-only, no number, no tag).
+  Do not commit or tag when any covered test fails, times out (a `cfg_corpus` timeout is neither pass nor fail), or was not run; report it instead. Docs-only changes are committed as `docs(rust): <what>` with no tag. Commits and tags stay local: pushing, pull requests and history rewrites still need the user's approval.
 
 ## File Map
 
