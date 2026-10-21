@@ -6,6 +6,7 @@ Rust port of Darknet/YOLO (branch `rust`) with CPU, cuTile and cuda-oxide GPU ba
 
 - [Where things live](#where-things-live)
 - [Which file for which task](#which-file-for-which-task)
+- [Commands](#commands)
 - [Hard rules](#hard-rules)
 - [Learned rules](#learned-rules)
 
@@ -30,10 +31,29 @@ Whole-repo map: [CONTEXT.md](CONTEXT.md).
 - Touch a crate: its `CONTEXT.md` first.
 - Touch cuda-oxide: read `third_party/CONTEXT.md` first; it is a pinned submodule, not editable here.
 
+## Commands
+
+`cargo xtask <cmd>` is the preferred way to check, build and test. It applies the memory cap and the thread limit for you, and it falls back to running uncapped, with a warning, when there is no user systemd bus. Use it instead of typing raw `cargo` or `systemd-run` commands. Run `cargo xtask help` for the list.
+
+| Command | Alias | Runs |
+|---|---|---|
+| `cargo xtask check [pkg...]` | `c` | `cargo check` (default: `darknet-cli`, `darknet-core`) |
+| `cargo xtask gpu-check` | `gc` | `cargo check -p darknet-cli --features oxide` |
+| `cargo xtask build [pkg...]` | `b` | `cargo build` (default: `darknet-cli`) |
+| `cargo xtask clippy [pkg...]` | `l` | `cargo clippy` (default: `darknet-cli`, `darknet-core`) |
+| `cargo xtask test [filter...]` | `t`, `host` | host tests, same as `tools/test_host.sh` (`PKGS` overrides the packages) |
+| `cargo xtask oxide [args...]` | `o` | `tools/test_oxide.sh` (GPU tests; args pass through) |
+| `cargo xtask train_legogears [weights] [flags...]` | `train`, `tr` | `tools/train_legogears_oxide.sh`: release oxide build, then LegoGears_v2 training |
+| `cargo xtask fmt` | `f` | `cargo fmt --all` |
+
+Every command exports the detected GPU arch as the advisory `CUDA_OXIDE_DEVICE_ARCH` (unless `CUDA_OXIDE_TARGET` or `CUDA_OXIDE_DEVICE_ARCH` is already set).
+
+Environment: `MEM` (default `3G`), `JOBS` (default 2, clamped to 4; `train_legogears` defaults to 8 build threads, as the operator approved). Start training only when the user asks. Add new commands as arms in `xtask/src/main.rs` and to this table.
+
 ## Hard rules
 
-- Max 4 build threads, wrap builds in `systemd-run --user --scope -p MemoryHigh=3G`.
-- `src/darknet-cuda-oxide` is not a workspace member; build it only with `./tools/test_oxide.sh`.
+- Max 4 build threads, wrap builds in `systemd-run --user --scope -p MemoryHigh=3G`; `cargo xtask` does both (see [Commands](#commands)).
+- `src/darknet-cuda-oxide` is not a workspace member; build it only with `cargo xtask oxide` (`./tools/test_oxide.sh`).
 - Commit only the files a task names, never `git add -A`.
 
 Full rule set lives in `tasks/rust/AGENTS.md`.
@@ -42,4 +62,5 @@ Full rule set lives in `tasks/rust/AGENTS.md`.
 ## Learned rules
 - Delete model weights and other big files from the repository when they are no longer needed.
 - Do not archive or remove completed plans in tasks/rust/; keep them, since they are the project roadmap needed for development.
+- Prefer `cargo xtask` subcommands over raw commands when running or testing this project; they are documented in CLAUDE.md.
 <!-- end claude-reflect -->

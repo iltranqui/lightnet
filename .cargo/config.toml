@@ -1,6 +1,8 @@
 # cuda-oxide: `cargo oxide <cmd>` runs the vendored cargo-oxide driver.
 [alias]
 oxide = "run --package cargo-oxide --"
+# `cargo xtask help`: capped check/build/test/clippy/oxide wrappers.
+xtask = "run --quiet --package xtask --"
 
 # Default CUDA toolkit location for the cutile GPU backend build.
 # `force = false` means an already-exported CUDA_TOOLKIT_PATH always wins;

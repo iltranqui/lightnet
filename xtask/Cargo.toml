@@ -1,0 +1,8 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+description = "Repo task runner: `cargo xtask <cmd>` wraps capped builds and tests."
+
+[dependencies]

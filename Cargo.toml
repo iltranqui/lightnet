@@ -16,6 +16,8 @@ members = [
     "src/darknet-gui",
     "src/darknet-gui-project",
     "src/darknet-gui-engine",
+    # `cargo xtask <cmd>`: capped build/test runner (see .cargo/config.toml alias).
+    "xtask",
 
     # cuda-oxide (vendored from NVlabs/cuda-oxide, Apache-2.0)
     # Core crates
