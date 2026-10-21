@@ -16,7 +16,7 @@ lightnet/
 ├─ CLAUDE.md             routing table
 ├─ CONTEXT.md            this file
 ├─ src/                  PRODUCT: Darknet Rust port (9 crates)
-├─ third_party/          SUBMODULES: cuda-oxide (pinned 7d9c19405), local patches
+├─ third_party/          SUBMODULES: cuda-oxide (pinned 728539f65), local patches
 ├─ docs/                 reference shelf: architecture, parity, benchmarks
 ├─ cfg/                  factory: model .cfg files
 ├─ tools/                scripts: oxide test/bench/parity helpers

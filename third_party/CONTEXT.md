@@ -13,7 +13,7 @@ Pinned git submodules. Treat as upstream code: never edit inside, apply patches 
 
 | Path | Upstream | Pin |
 |---|---|---|
-| `cuda-oxide/` | https://github.com/NVlabs/cuda-oxide | `7d9c19405` (2026-09-29) |
+| `cuda-oxide/` | https://github.com/NVlabs/cuda-oxide | `728539f65` (first upstream fix after `7d9c19405`; its root Cargo.toml paths are repaired) |
 | `patches/` | local | patches to apply on top of the pin, see `patches/README.md` |
 
 The cuTile submodule lives at `src/cutile-rs-aot` (NVlabs/cutile-rs v0.2.0) because `darknet-cuda-cutile` uses a relative path to it.

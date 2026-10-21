@@ -9,7 +9,7 @@
 
 | File | Target | Why |
 |---|---|---|
-| `0001-rustc-codegen-cuda-test-unit-output-name.patch` | `third_party/cuda-oxide` pinned at `7d9c19405` | Names the `lib --test` unit `<crate>_test` so parallel codegen (`-j > 1`) does not race on the shared `.ll`/`.ptx`/`.o` files. Not yet upstream. |
+| `0001-rustc-codegen-cuda-test-unit-output-name.patch` | `third_party/cuda-oxide` pinned at `728539f65` | Names the `lib --test` unit `<crate>_test` so parallel codegen (`-j > 1`) does not race on the shared `.ll`/`.ptx`/`.o` files. Not yet upstream. |
 
 ## Applying
 
