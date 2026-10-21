@@ -25,15 +25,18 @@ case "$KIND" in
         ;;
 esac
 
+source tools/lib_cap.sh  # cwd is the repo root here
+oxide_arch_hint
+
 if [[ ! -x target/debug/cargo-oxide ]]; then
-    systemd-run --user --scope -p MemoryHigh="$MEM" cargo build -p cargo-oxide -j 2
+    capped "$MEM" cargo build -p cargo-oxide -j 2
 fi
 
 mkdir -p target/bench
 LOG="target/bench/${KIND}_$(date +%Y%m%d_%H%M%S).log"
 for run in "${RUNS[@]}"; do
     read -r file name <<<"$run"
-    systemd-run --user --scope -p MemoryHigh="$MEM" \
+    capped "$MEM" \
         target/debug/cargo-oxide oxide test -- \
         --manifest-path src/darknet-cuda-oxide/Cargo.toml -j 2 --release --test "$file" \
         -- --ignored --nocapture --test-threads=1 "$name" 2>&1 | tee -a "$LOG"

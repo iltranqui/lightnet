@@ -8,12 +8,14 @@
 set -euo pipefail
 cd "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
+source tools/lib_cap.sh  # cwd is the repo root here
+oxide_arch_hint
 MEM="${MEM:-3G}"
 export RUSTUP_TOOLCHAIN=nightly-2026-08-28
 
 if [[ ! -x target/debug/cargo-oxide ]]; then
     printf 'Building cargo-oxide helper (missing after a clean build)...\n'
-    systemd-run --user --scope -p MemoryHigh="$MEM" cargo build -p cargo-oxide -j 2
+    capped "$MEM" cargo build -p cargo-oxide -j 2
 fi
 
 CARGO_ARGS=()
@@ -28,7 +30,7 @@ while (($#)); do
     shift
 done
 
-exec systemd-run --user --scope -p MemoryHigh="$MEM" \
+capped "$MEM" \
     target/debug/cargo-oxide oxide test -- \
     --manifest-path src/darknet-cuda-oxide/Cargo.toml -j 2 "${CARGO_ARGS[@]}" \
     -- --test-threads=1 --nocapture "${TEST_ARGS[@]}"

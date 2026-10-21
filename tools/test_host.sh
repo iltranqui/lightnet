@@ -6,10 +6,11 @@
 set -euo pipefail
 cd "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
+source tools/lib_cap.sh  # cwd is the repo root here
 MEM="${MEM:-3G}"
 PKGS=(${PKGS:-darknet-core darknet-cli})
 PKG_FLAGS=()
 for p in "${PKGS[@]}"; do PKG_FLAGS+=(-p "$p"); done
 
-exec systemd-run --user --scope -p MemoryHigh="$MEM" \
+capped "$MEM" \
     cargo test "${PKG_FLAGS[@]}" -j 2 -- "$@"

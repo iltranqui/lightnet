@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build and train LegoGears_v2 using the Rust oxide backend.
 # Usage: ./tools/train_legogears_oxide.sh [initial.weights] [training flags...]
-# Overrides: CFG, DATA, SEED, DARKNET_OXIDE_AMP=1, PROFILE=release|debug
+# Overrides: CFG, DATA, SEED, JOBS (build threads, default 4), DARKNET_OXIDE_AMP=1, PROFILE=release|debug
 #
 # PROFILE defaults to `release`: the trainer's host code (image loader, phase
 # bookkeeping, launch preparation) is a large part of the measured step time,
@@ -16,9 +16,12 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+source tools/lib_cap.sh  # cwd is the repo root here
+oxide_arch_hint
 CFG="${CFG:-../datasets/LegoGears_v2/LegoGears_v2.cfg}"
 DATA="${DATA:-../datasets/LegoGears_v2/LegoGears_v2.data}"
 SEED="${SEED:-42}"
+JOBS="${JOBS:-4}"
 PROFILE="${PROFILE:-release}"
 
 case "$PROFILE" in
@@ -44,18 +47,16 @@ for path in "$CFG" "$DATA"; do
 done
 if [[ ! -x target/debug/cargo-oxide ]]; then
     printf 'Building cargo-oxide helper (missing after a clean build)...\n'
-    systemd-run --user --scope -p MemoryHigh=3G \
-        --setenv=RUSTUP_TOOLCHAIN=nightly-2026-08-28 \
+    capped 3G env RUSTUP_TOOLCHAIN=nightly-2026-08-28 \
         cargo build -p cargo-oxide -j 4
 fi
 
 # Everything after `--` is forwarded to cargo, so `--release` selects the host
 # profile.  Without it the host (loader + phase bookkeeping) is an unoptimized
 # debug build and the profile numbers are not comparable to C++.
-systemd-run --user --scope -p MemoryHigh=3G \
-    --setenv=RUSTUP_TOOLCHAIN=nightly-2026-08-28 \
+capped 3G env RUSTUP_TOOLCHAIN=nightly-2026-08-28 \
     target/debug/cargo-oxide oxide build -- \
-    -p darknet-cli --features oxide -j 4 "${CARGO_PROFILE_FLAG[@]}"
+    -p darknet-cli --features oxide -j "$JOBS" "${CARGO_PROFILE_FLAG[@]}"
 
 printf 'Running %s/%s (PROFILE=%s)\n' "$BIN_DIR" "darknet-rs" "$PROFILE" >&2
 
