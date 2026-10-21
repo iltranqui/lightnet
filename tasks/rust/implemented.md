@@ -260,6 +260,7 @@ file is named inline.
 - [232. Native compact ScaleChannels](#232-native-compact-scalechannels)
 - [233. Dynamic mixed-precision loss scaler](#233-dynamic-mixed-precision-loss-scaler)
 - [234. CLI loss-scale option and LossScaler integration](#234-cli-loss-scale-option-and-lossscaler-integration)
+- [235. FP16 overflow detection for convolution and BN gradients](#235-fp16-overflow-detection-for-convolution-and-bn-gradients)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2402,6 +2403,11 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 
 - v0.2.162 adds `TrainOptions.loss_scale` with `-loss_scale` / `--loss_scale` parsing and finite-positive validation. GPU training applies the configured value and the `LossScaler` cap before its first step; dynamic mode reuses the scaler for overflow skip/halving and finite-step growth, while `-loss_scale` without `-dyn_scale` remains static.
 - Evidence: `PKGS=darknet-cli cargo xtask test parse_train` passed the 3 new parse tests; `cargo xtask check` passed for `darknet-cli` and `darknet-core`. The default test package set still fails before test execution on pre-existing `darknet-core` runtime test import errors; the focused CLI tests were run with `PKGS=darknet-cli`. GPT-6-luna review: OK. No training/convergence claim.
+
+## 235. FP16 overflow detection for convolution and BN gradients
+
+- v0.2.163 adds focused coverage for the existing `GpuExecutableNetwork::gradients_non_finite()` scan of convolution weights, BN bias, and BN scale gradients; no `gpu_state.rs` change was needed. Each test performs finite backward on the small convolution + BN network, then injects infinity into exactly one target buffer before checking detection.
+- Evidence: `PKGS=darknet-core cargo xtask test gradients_non_finite` passed all 3 focused tests twice. Both runs used the permitted temporary `use super::*;` import in `runtime/tests/mod.rs` to bypass pre-existing sibling-test import errors; the shim was removed after each run. The final `git diff --check` passed. The tests were uncapped because `systemd-run --user` was unavailable. Fresh GPT-6-luna review accepted the coverage. No full core-suite or training/convergence claim.
 
 ## Not implemented / open (pointer)
 

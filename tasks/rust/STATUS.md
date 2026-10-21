@@ -87,6 +87,7 @@ with actual-device CPU parity; head loss/backward remains host-owned. See
 uncommitted, with no `version-map.tsv` row.
 
 Latest increments:
+- v0.2.163: pinned the existing non-finite gradient scan for convolution weights, BN bias and BN scale; all 3 focused tests passed, and no runtime logic change was needed. The allowed temporary test import shim was removed after verification. GPT-6-luna review accepted; Phase 1 Task 4 remains and Task 5 training is user-gated. See `implemented.md` §235.
 - v0.2.162: added the `-loss_scale` CLI option and integrated `LossScaler` into GPU training initialization/updates; 3 focused parser tests and `cargo xtask check` pass. The default core test target remains blocked by pre-existing runtime test-harness imports. See `implemented.md` §234.
 - v0.2.161: added the core dynamic `LossScaler`/`ScaleStep` API with overflow skip, 1000-step growth, 65,536 cap, and overflow-safe cap handling; all 8 focused tests pass with a temporary import shim for the pre-existing runtime test harness. CLI integration/training remain open. See `implemented.md` §233.
 - v0.2.159: LayaEncoder full/compact f32 inference now runs natively on Oxide, including embedding gather, RoPE full/sliding attention, and GeGLU; actual-device parity covers multi-block masks/layout. See `implemented.md` §198.

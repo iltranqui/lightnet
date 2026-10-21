@@ -297,6 +297,7 @@ reference tolerance is `TOL_COMPOSED = 1e-4` rather than the single-stage `2e-6`
 
 ## P8/P9 training follow-ups
 
+- [x] v0.2.163: pinned existing `gradients_non_finite()` coverage for convolution weights, BN bias and BN scale with 3 focused tests; all passed using the temporary test import shim, which was removed afterward. No runtime logic change was needed; GPT-6-luna review accepted. Phase 1 Task 4 remains and Task 5 training is user-gated. See `implemented.md` §235.
 - [x] v0.2.162: added `-loss_scale` / `--loss_scale` parsing with validation and integrated the capped `LossScaler` into GPU training; 3 CLI parser tests and `cargo xtask check` pass. The default test package set remains blocked by pre-existing core test-harness imports; no training run was started. See `implemented.md` §234.
 - [x] v0.2.161: added the public fp16 dynamic `LossScaler`/`ScaleStep` core API, including overflow skip/halving, the finite-step growth interval, 65,536 constructor/growth cap, and overflow-safe counter handling at the cap. All 8 focused tests passed with a temporary import shim for the existing runtime test harness; CLI integration and training evidence remain open. See `implemented.md` §233.
 - [x] v0.2.100: compact f16 inference now accepts `[detection]` and `[regression]` identity layers. Actual-Oxide batch-2 output matched f32 compact (relative max error 2.152e-4); full suite passed 18 tests. No compiled-C++ golden. See `implemented.md` §127.
