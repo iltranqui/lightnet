@@ -4,6 +4,7 @@ Goal document for an agent (the "lead") that delegates the implementation of thr
 
 ## Table of Contents
 
+- [Start here](#start-here)
 - [Goal](#goal)
 - [Done when](#done-when)
 - [Plans](#plans)
@@ -13,6 +14,10 @@ Goal document for an agent (the "lead") that delegates the implementation of thr
 - [User-gated actions](#user-gated-actions)
 - [Reporting](#reporting)
 - [Documentation updates](#documentation-updates)
+
+## Start here
+
+Begin at [plan_fp16.md](plan_fp16.md) Task 1. The next free version number is `v0.2.160` (`version-map.tsv` ends at `v0.2.159`); take later numbers from that file. Earlier v0.2 work that `AGENTS.md` lists as unversioned in the working tree keeps its place: do not renumber it, and never reuse a number. Work phases in order and tasks in plan order.
 
 ## Goal
 
@@ -63,6 +68,7 @@ Verified by reading the code:
 - One build or test command at a time. Build threads are capped at 4 (`train_legogears` runs 8, operator-approved); memory is capped at `MemoryHigh=3G`, applied by `cargo xtask` (it warns and runs uncapped when there is no user systemd bus).
 - `src/darknet-cuda-oxide` is not a workspace member: run its tests with `cargo xtask oxide --test <file> [-- <filter>]`.
 - Commit only the files a task names; never `git add -A`. `src/darknet-core/src/runtime/mod.rs` can carry unrelated edits from the user: stage only your hunk with `git add -p`.
+- Commit and tag on green, as in [AGENTS.md](AGENTS.md#versioning) ("Commit and tag on green"): every plan task whose tests pass is committed and tagged at once, by whoever implemented it (Claude or Codex), without asking. Each such task takes the next free `v0.2.NNN` number from `version-map.tsv`; the commit message is `v0.2.NNN: <what>` where `<what>` is the plan step's suggested message, the commit body lists the tests run and their results, and the commit is tagged `v0.2.NNN` (local, lightweight). A task whose tests fail, time out or were not run gets neither a commit nor a tag. Measurement-only or doc-only steps (convergence records) are `docs(rust): <what>` with no tag. Never push.
 - Never edit `third_party/` or `src/cutile-rs-aot` (pinned submodules).
 - Delete weights, backups, logs and other big files a task produces once the evidence is recorded.
 - Do not archive or remove completed plans in `tasks/rust/`; they are the roadmap.
@@ -91,7 +97,7 @@ Ask the user before each of these; do not infer approval from an earlier one:
 
 ## Reporting
 
-At the end of each task, one line: task, tests run and their result, files changed, commit hash. At the end of each phase, a short summary with the measurements (step time, loss and mAP against the baseline) and the verdict against the "Done when" criteria. Report failures with the command output; never describe a failing run as passing.
+At the end of each task, one line: task, tests run and their result, files changed, commit hash and tag (`v0.2.NNN`), or why there is no commit (failing, timed-out or unrun tests). At the end of each phase, a short summary with the measurements (step time, loss and mAP against the baseline) and the verdict against the "Done when" criteria. Report failures with the command output; never describe a failing run as passing.
 
 ## Documentation updates
 
