@@ -19,6 +19,7 @@ usage: cargo xtask <cmd> [args...]
   oxide|o [args...]     ./tools/test_oxide.sh (GPU tests; args pass through)
   train_legogears|train|tr [-fp8|-fp16] [w] [flags]
                         -fp8: DARKNET_OXIDE_GEMM=fp8; -fp16: DARKNET_OXIDE_AMP=1
+                        (-fp16 adds -dyn_scale and -loss_scale 1024 unless supplied)
                         (-bf16: no runtime switch yet, rejected)
                         train LegoGears_v2 on oxide (./tools/train_legogears_oxide.sh;
                         optional initial.weights, extra flags pass to `detector train`)
@@ -100,12 +101,13 @@ fn main() -> ExitCode {
             }
             let mut v = vec!["./tools/train_legogears_oxide.sh".to_owned()];
             match precision_env(&rest) {
-                Ok((rest, vars)) => {
+                Ok((rest, vars, extra)) => {
                     for (k, val) in vars {
                         // SAFETY: single-threaded at this point; no other thread reads the env.
                         unsafe { env::set_var(k, val) };
                     }
                     v.extend(rest);
+                    v.extend(extra);
                 }
                 Err(msg) => {
                     eprintln!("xtask: {msg}");
@@ -213,9 +215,10 @@ fn detected_gpu_arch() -> Option<String> {
 /// Everything else passes through to the training script.
 fn precision_env(
     args: &[String],
-) -> Result<(Vec<String>, Vec<(&'static str, &'static str)>), String> {
+) -> Result<(Vec<String>, Vec<(&'static str, &'static str)>, Vec<String>), String> {
     let mut rest = Vec::new();
     let mut vars = Vec::new();
+    let mut extra = Vec::new();
     let mut seen: Option<&str> = None;
     for a in args {
         let name = match a.as_str() {
@@ -234,7 +237,21 @@ fn precision_env(
         match name {
             "fp8" => vars.push(("DARKNET_OXIDE_GEMM", "fp8")),
             // AMP also selects the f16 tensor-core GEMM.
-            "fp16" => vars.push(("DARKNET_OXIDE_AMP", "1")),
+            "fp16" => {
+                vars.push(("DARKNET_OXIDE_AMP", "1"));
+                if !args
+                    .iter()
+                    .any(|arg| arg == "-dyn_scale" || arg == "--dyn_scale")
+                {
+                    extra.push("-dyn_scale".to_owned());
+                }
+                if !args
+                    .iter()
+                    .any(|arg| arg == "-loss_scale" || arg == "--loss_scale")
+                {
+                    extra.extend(["-loss_scale".to_owned(), "1024".to_owned()]);
+                }
+            }
             _ => {
                 return Err(
                     "-bf16 is not selectable: the backend has bf16 kernels but no \
@@ -244,5 +261,49 @@ fn precision_env(
             }
         }
     }
-    Ok((rest, vars))
+    Ok((rest, vars, extra))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::precision_env;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn fp16_adds_dynamic_loss_scale_flags() {
+        let (rest, vars, extra) = precision_env(&args(&["-fp16"])).unwrap();
+
+        assert!(rest.is_empty());
+        assert_eq!(vars, [("DARKNET_OXIDE_AMP", "1")]);
+        assert_eq!(extra, ["-dyn_scale", "-loss_scale", "1024"]);
+    }
+
+    #[test]
+    fn fp16_respects_user_loss_scale() {
+        let (rest, _, extra) =
+            precision_env(&args(&["-fp16", "-loss_scale", "256"])).unwrap();
+
+        assert_eq!(rest, ["-loss_scale", "256"]);
+        assert_eq!(extra, ["-dyn_scale"]);
+    }
+
+    #[test]
+    fn fp16_respects_user_dyn_scale() {
+        let (rest, _, extra) = precision_env(&args(&["-fp16", "-dyn_scale"])).unwrap();
+
+        assert_eq!(rest, ["-dyn_scale"]);
+        assert_eq!(extra, ["-loss_scale", "1024"]);
+    }
+
+    #[test]
+    fn fp8_adds_no_scaler_flags() {
+        let (rest, vars, extra) = precision_env(&args(&["-fp8"])).unwrap();
+
+        assert!(rest.is_empty());
+        assert_eq!(vars, [("DARKNET_OXIDE_GEMM", "fp8")]);
+        assert!(extra.is_empty());
+    }
 }
