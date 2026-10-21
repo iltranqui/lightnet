@@ -261,6 +261,7 @@ file is named inline.
 - [233. Dynamic mixed-precision loss scaler](#233-dynamic-mixed-precision-loss-scaler)
 - [234. CLI loss-scale option and LossScaler integration](#234-cli-loss-scale-option-and-lossscaler-integration)
 - [235. FP16 overflow detection for convolution and BN gradients](#235-fp16-overflow-detection-for-convolution-and-bn-gradients)
+- [236. xtask fp16 enables dynamic loss scaling](#236-xtask-fp16-enables-dynamic-loss-scaling)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2396,7 +2397,7 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 
 ## 233. Dynamic mixed-precision loss scaler
 
-- v0.2.161 adds public `runtime::LossScaler` and `ScaleStep` for the fp16 training hardening path. Non-finite gradients halve the scale with a 1.0 floor, reset growth, and return `Skip`; finite gradients return `Apply` and double every 1000 steps up to 65,536. Constructor and growth caps are enforced; finite updates at the cap reset the growth counter without overflow. CLI integration and training evidence remain open in `plan_fp16.md` Tasks 2–5.
+- v0.2.161 adds public `runtime::LossScaler` and `ScaleStep` for the fp16 training hardening path. Non-finite gradients halve the scale with a 1.0 floor, reset growth, and return `Skip`; finite gradients return `Apply` and double every 1000 steps up to 65,536. Constructor and growth caps are enforced; finite updates at the cap reset the growth counter without overflow. CLI integration, overflow-detection coverage and xtask scaler defaults were added in v0.2.162–v0.2.164; only Task 5 convergence evidence remains user-gated in `plan_fp16.md`.
 - Evidence: `PKGS=darknet-core cargo xtask test loss_scaler` passed all 8 focused tests after temporarily adding `use super::*;` to `runtime/tests/mod.rs` to satisfy existing sibling test imports; that test-harness-only edit was removed afterward. Without the temporary import, the existing test module fails to compile on missing imports before tests run. No training/convergence or C++ parity claim.
 
 ## 234. CLI loss-scale option and LossScaler integration
@@ -2408,6 +2409,11 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 
 - v0.2.163 adds focused coverage for the existing `GpuExecutableNetwork::gradients_non_finite()` scan of convolution weights, BN bias, and BN scale gradients; no `gpu_state.rs` change was needed. Each test performs finite backward on the small convolution + BN network, then injects infinity into exactly one target buffer before checking detection.
 - Evidence: `PKGS=darknet-core cargo xtask test gradients_non_finite` passed all 3 focused tests twice. Both runs used the permitted temporary `use super::*;` import in `runtime/tests/mod.rs` to bypass pre-existing sibling-test import errors; the shim was removed after each run. The final `git diff --check` passed. The tests were uncapped because `systemd-run --user` was unavailable. Fresh GPT-6-luna review accepted the coverage. No full core-suite or training/convergence claim.
+
+## 236. xtask fp16 enables dynamic loss scaling
+
+- v0.2.164 updates `precision_env` and the `train_legogears` arm so `-fp16` enables `DARKNET_OXIDE_AMP=1` and appends `-dyn_scale` and `-loss_scale 1024` unless each was supplied by the user. User scaler flags remain in pass-through arguments; fp8 adds no scaler arguments. The xtask help and `CLAUDE.md` Commands table document the defaults.
+- Evidence: test-first `PKGS=xtask cargo xtask test` failed with the expected tuple-shape compile errors; after implementation the command passed all 4 new tests. `cargo xtask help` displayed the updated flags, `git diff --check` passed, and fresh GPT-6-luna review accepted the diff. No training run was started.
 
 ## Not implemented / open (pointer)
 
