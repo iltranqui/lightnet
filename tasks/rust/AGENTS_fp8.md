@@ -17,7 +17,7 @@ Goal document for an agent (the "lead") that delegates the implementation of thr
 
 ## Start here
 
-Begin at [plan_fp16.md](plan_fp16.md) Task 1. Commit `05276f9d044640c6aa7c82f7550796fdbf09c951` already uses `v0.2.160`, although that increment has no tag or `version-map.tsv` row. Task 1 uses `v0.2.161`; after it, the next free number is `v0.2.162`. Do not reuse numbers or rewrite the existing commit. Earlier v0.2 work that `AGENTS.md` lists as unversioned in the working tree keeps its place. Work phases in order and tasks in plan order.
+Begin at [plan_fp16.md](plan_fp16.md) Task 1. Commit `05276f9d044640c6aa7c82f7550796fdbf09c951` already uses `v0.2.160`, although that increment has no tag or `version-map.tsv` row. Task 1 is `v0.2.161` and Task 2 is `v0.2.162`; after Task 2, the next free number is `v0.2.163`. Do not reuse numbers or rewrite the existing commit. Earlier v0.2 work that `AGENTS.md` lists as unversioned in the working tree keeps its place. Work phases in order and tasks in plan order.
 
 ## Goal
 
