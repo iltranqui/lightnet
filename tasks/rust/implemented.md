@@ -262,6 +262,7 @@ file is named inline.
 - [234. CLI loss-scale option and LossScaler integration](#234-cli-loss-scale-option-and-lossscaler-integration)
 - [235. FP16 overflow detection for convolution and BN gradients](#235-fp16-overflow-detection-for-convolution-and-bn-gradients)
 - [236. xtask fp16 enables dynamic loss scaling](#236-xtask-fp16-enables-dynamic-loss-scaling)
+- [237. xtask precision environment clippy cleanup](#237-xtask-precision-environment-clippy-cleanup)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2414,6 +2415,11 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 
 - v0.2.164 updates `precision_env` and the `train_legogears` arm so `-fp16` enables `DARKNET_OXIDE_AMP=1` and appends `-dyn_scale` and `-loss_scale 1024` unless each was supplied by the user. User scaler flags remain in pass-through arguments; fp8 adds no scaler arguments. The xtask help and `CLAUDE.md` Commands table document the defaults.
 - Evidence: test-first `PKGS=xtask cargo xtask test` failed with the expected tuple-shape compile errors; after implementation the command passed all 4 new tests. `cargo xtask help` displayed the updated flags, `git diff --check` passed, and fresh GPT-6-luna review accepted the diff. No training run was started.
+
+## 237. xtask precision environment clippy cleanup
+
+- v0.2.165 names the existing three-part `precision_env` result with a local `PrecisionEnv` alias, removing the new `type_complexity` warning without changing behavior or return element order.
+- Evidence: `cargo xtask clippy xtask` passed without warnings, `PKGS=xtask cargo xtask test` passed all 4 fp16/fp8 scaler-flag tests, and `git diff --check` passed. Fresh GPT-6-luna review accepted the change. The default `cargo xtask clippy` remains blocked by three pre-existing `approx_constant` errors in untouched `vc_attention.rs`; default `cargo xtask test` remains blocked by 77 existing core runtime test-harness errors. No training run was started.
 
 ## Not implemented / open (pointer)
 

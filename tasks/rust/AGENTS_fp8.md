@@ -17,7 +17,7 @@ Goal document for an agent (the "lead") that delegates the implementation of thr
 
 ## Start here
 
-Begin at [plan_fp16.md](plan_fp16.md) Task 1. Commit `05276f9d044640c6aa7c82f7550796fdbf09c951` already uses `v0.2.160`, although that increment has no tag or `version-map.tsv` row. Task 1 is `v0.2.161`, Task 2 is `v0.2.162`, Task 3 is `v0.2.163`, and Task 4 is `v0.2.164`; after Task 4, the next free number is `v0.2.165`. Do not reuse numbers or rewrite the existing commit. Earlier v0.2 work that `AGENTS.md` lists as unversioned in the working tree keeps its place. Work phases in order and tasks in plan order.
+Begin at [plan_fp16.md](plan_fp16.md) Task 1. Commit `05276f9d044640c6aa7c82f7550796fdbf09c951` already uses `v0.2.160`, although that increment has no tag or `version-map.tsv` row. Task 1 is `v0.2.161`, Task 2 is `v0.2.162`, Task 3 is `v0.2.163`, Task 4 is `v0.2.164`, and `v0.2.165` is a clippy-cleanup follow-up to Task 4; the next free number is `v0.2.166`. Do not reuse numbers or rewrite the existing commit. Earlier v0.2 work that `AGENTS.md` lists as unversioned in the working tree keeps its place. Work phases in order and tasks in plan order.
 
 ## Goal
 
@@ -58,6 +58,7 @@ Related reading: [fp8_fp4.md](fp8_fp4.md) (earlier fp8 design and the Phase D nu
 Verified by reading the code:
 
 - fp16 AMP exists (`DARKNET_OXIDE_AMP=1`, `src/darknet-cuda-oxide/src/mixed.rs`); all LegoGears_v2 layers except the yolo loss have f16 paths; measured 1.3x faster at batch 16; no convergence run. The public `LossScaler` is integrated with `-loss_scale` in the GPU training loop, focused tests pin non-finite detection for convolution weights, BN bias, and BN scale, and xtask `-fp16` now adds default dynamic scaling flags. Phase 1 Task 5 convergence runs are user-gated.
+- Verification gap: the default `cargo xtask test` still fails to compile on 77 pre-existing runtime test-harness errors, and default `cargo xtask clippy` stops on three `approx_constant` errors in untouched `src/darknet-core/src/vc_attention.rs`. The touched `xtask` package alone now passes clippy without warnings.
 - bf16: only the tensor-core GEMM (f32 output) and the conversion kernels exist.
 - fp8: `DARKNET_OXIDE_GEMM=fp8` works but is slower than fp16 (21 LegoGears convs: 24.2 ms against 3.87 ms) because of per-call host readbacks, per-call weight quantisation and an untuned kernel.
 - `cargo xtask train_legogears` maps `-fp8` to `DARKNET_OXIDE_GEMM=fp8` and `-fp16` to `DARKNET_OXIDE_AMP=1`, adding `-dyn_scale -loss_scale 1024` when the user did not supply those flags; `-bf16` is rejected until Phase 2.

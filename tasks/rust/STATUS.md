@@ -87,6 +87,7 @@ with actual-device CPU parity; head loss/backward remains host-owned. See
 uncommitted, with no `version-map.tsv` row.
 
 Latest increments:
+- v0.2.165: follow-up for v0.2.164 names the `precision_env` tuple type so `cargo xtask clippy xtask` passes without warnings; all 4 xtask tests pass and GPT-6-luna review accepted. Default clippy remains blocked by three unrelated `approx_constant` errors in `vc_attention.rs`; Task 5 training remains user-gated. See `implemented.md` §237.
 - v0.2.164: `cargo xtask train_legogears -fp16` now enables AMP plus default `-dyn_scale -loss_scale 1024`, while preserving user flags; fp8 is unchanged. Four xtask tests pass, help/CLAUDE docs match, and GPT-6-luna review accepted. No training run was started. Phase 1 Task 5 is user-gated. See `implemented.md` §236.
 - v0.2.163: pinned the existing non-finite gradient scan for convolution weights, BN bias and BN scale; all 3 focused tests passed, and no runtime logic change was needed. The allowed temporary test import shim was removed after verification. GPT-6-luna review accepted; Phase 1 Task 5 convergence evidence remains user-gated. See `implemented.md` §235.
 - v0.2.162: added the `-loss_scale` CLI option and integrated `LossScaler` into GPU training initialization/updates; 3 focused parser tests and `cargo xtask check` pass. The default core test target remains blocked by pre-existing runtime test-harness imports. See `implemented.md` §234.

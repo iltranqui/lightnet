@@ -297,6 +297,7 @@ reference tolerance is `TOL_COMPOSED = 1e-4` rather than the single-stage `2e-6`
 
 ## P8/P9 training follow-ups
 
+- [x] v0.2.165: follow-up for Task 4 gives `precision_env`'s three-part result a local alias; `cargo xtask clippy xtask` passes without warnings, all 4 xtask tests pass, and GPT-6-luna review accepted. Default clippy remains blocked by unrelated core errors; Task 5 training is user-gated. See `implemented.md` §237.
 - [x] v0.2.164: xtask `-fp16` now enables AMP and adds default `-dyn_scale -loss_scale 1024` unless supplied; user flags are preserved and fp8 is unchanged. Four xtask tests, help output, and GPT-6-luna review pass. Task 5 training remains user-gated. See `implemented.md` §236.
 - [x] v0.2.163: pinned existing `gradients_non_finite()` coverage for convolution weights, BN bias and BN scale with 3 focused tests; all passed using the temporary test import shim, which was removed afterward. No runtime logic change was needed; GPT-6-luna review accepted. Phase 1 Task 5 convergence evidence remains user-gated. See `implemented.md` §235.
 - [x] v0.2.162: added `-loss_scale` / `--loss_scale` parsing with validation and integrated the capped `LossScaler` into GPU training; 3 CLI parser tests and `cargo xtask check` pass. The default test package set remains blocked by pre-existing core test-harness imports; no training run was started. See `implemented.md` §234.
