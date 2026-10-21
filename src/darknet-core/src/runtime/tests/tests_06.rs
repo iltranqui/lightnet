@@ -2079,6 +2079,52 @@ fn loss_scale_helpers_and_non_finite_detection() {
     assert_eq!(gpu.loss_scale(), 4.0);
 }
 
+fn optimizer_net_with_gradients() -> GpuExecutableNetwork<FakeBackend> {
+    let mut gpu = optimizer_net("");
+    let input = patterned_input(gpu.network.net.input_shape());
+    let forward = gpu.forward_training_with_state(&input).expect("forward");
+    let seeds = optimizer_seeds(&gpu, 1);
+    gpu.backward_accumulate_seeded_gpu(&forward, &seeds)
+        .expect("backward");
+    gpu
+}
+
+#[test]
+fn gradients_non_finite_sees_bn_scale_gradient() {
+    let gpu = optimizer_net_with_gradients();
+    let mut buffers = gpu.device_train_buffers.borrow_mut();
+    let train = buffers[0].as_mut().expect("BN convolution train buffer");
+    train
+        .scale_updates
+        .as_mut()
+        .expect("BN scale updates")
+        .data[0] = f32::INFINITY;
+    drop(buffers);
+    assert!(gpu.gradients_non_finite().expect("finite check"));
+}
+
+#[test]
+fn gradients_non_finite_sees_conv_weight_gradient() {
+    let gpu = optimizer_net_with_gradients();
+    gpu.device_train_buffers.borrow_mut()[0]
+        .as_mut()
+        .expect("convolution train buffer")
+        .weight_updates
+        .data[0] = f32::INFINITY;
+    assert!(gpu.gradients_non_finite().expect("finite check"));
+}
+
+#[test]
+fn gradients_non_finite_sees_bn_bias_gradient() {
+    let gpu = optimizer_net_with_gradients();
+    gpu.device_train_buffers.borrow_mut()[0]
+        .as_mut()
+        .expect("BN convolution train buffer")
+        .bias_updates
+        .data[0] = f32::INFINITY;
+    assert!(gpu.gradients_non_finite().expect("finite check"));
+}
+
 #[test]
 fn cpu_muon_hybrid_uses_adamw_fallback_and_round_trips_dnopt6() {
     fn build() -> ExecutableNetwork {
