@@ -259,6 +259,7 @@ file is named inline.
 - [231. Native compact Reorg and channel routing](#231-native-compact-reorg-and-channel-routing)
 - [232. Native compact ScaleChannels](#232-native-compact-scalechannels)
 - [233. Dynamic mixed-precision loss scaler](#233-dynamic-mixed-precision-loss-scaler)
+- [234. CLI loss-scale option and LossScaler integration](#234-cli-loss-scale-option-and-lossscaler-integration)
 - [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
@@ -2396,6 +2397,11 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 
 - v0.2.161 adds public `runtime::LossScaler` and `ScaleStep` for the fp16 training hardening path. Non-finite gradients halve the scale with a 1.0 floor, reset growth, and return `Skip`; finite gradients return `Apply` and double every 1000 steps up to 65,536. Constructor and growth caps are enforced; finite updates at the cap reset the growth counter without overflow. CLI integration and training evidence remain open in `plan_fp16.md` Tasks 2–5.
 - Evidence: `PKGS=darknet-core cargo xtask test loss_scaler` passed all 8 focused tests after temporarily adding `use super::*;` to `runtime/tests/mod.rs` to satisfy existing sibling test imports; that test-harness-only edit was removed afterward. Without the temporary import, the existing test module fails to compile on missing imports before tests run. No training/convergence or C++ parity claim.
+
+## 234. CLI loss-scale option and LossScaler integration
+
+- v0.2.162 adds `TrainOptions.loss_scale` with `-loss_scale` / `--loss_scale` parsing and finite-positive validation. GPU training applies the configured value and the `LossScaler` cap before its first step; dynamic mode reuses the scaler for overflow skip/halving and finite-step growth, while `-loss_scale` without `-dyn_scale` remains static.
+- Evidence: `PKGS=darknet-cli cargo xtask test parse_train` passed the 3 new parse tests; `cargo xtask check` passed for `darknet-cli` and `darknet-core`. The default test package set still fails before test execution on pre-existing `darknet-core` runtime test import errors; the focused CLI tests were run with `PKGS=darknet-cli`. GPT-6-luna review: OK. No training/convergence claim.
 
 ## Not implemented / open (pointer)
 

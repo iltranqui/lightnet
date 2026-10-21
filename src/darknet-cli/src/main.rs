@@ -1222,6 +1222,8 @@ struct TrainOptions {
     map_iou: f32,
     /// Iterations between periodic checkpoints. Also controls `<name>_last.weights`.
     save_every: usize,
+    /// Initial loss scale for oxide mixed-precision training.
+    loss_scale: Option<f32>,
     /// Dynamic loss scaling on the oxide training path: halve on non-finite
     /// gradients (skipping the step) and double after a long finite streak.
     dynamic_loss_scale: bool,
@@ -1247,6 +1249,7 @@ impl TrainOptions {
             map_thresh: 0.005,
             map_iou: 0.5,
             save_every: 1000,
+            loss_scale: None,
             dynamic_loss_scale: false,
             colour: None,
         };
@@ -1272,6 +1275,16 @@ impl TrainOptions {
                 }
                 "-map" => options.map = true,
                 "-dyn_scale" | "--dynamic_loss_scale" => options.dynamic_loss_scale = true,
+                "-loss_scale" | "--loss_scale" => {
+                    let value = required_arg(args.next(), "loss scale")?;
+                    let scale = value.parse::<f32>().map_err(|_| {
+                        "invalid -loss_scale value (expected a finite positive number)"
+                    })?;
+                    if !scale.is_finite() || scale <= 0.0 {
+                        return Err("-loss_scale must be finite and positive".into());
+                    }
+                    options.loss_scale = Some(scale);
+                }
                 "-save_every" | "--save_every" => {
                     let value = required_arg(args.next(), "save interval")?;
                     let interval = value
@@ -2952,7 +2965,12 @@ fn run_detector_train_gpu(
             optimizer_state_path.display()
         );
     }
-    let mut loss_scale_growth = 0u32;
+    if let Some(scale) = options.loss_scale {
+        executable.set_loss_scale(scale);
+    }
+    let mut scaler = darknet_core::LossScaler::new(executable.loss_scale());
+    // Apply the scaler's initial ceiling before the first forward/backward pass.
+    executable.set_loss_scale(scaler.scale());
     let mut profile = (std::env::var("DARKNET_TRAIN_PROFILE").as_deref() == Ok("1"))
         .then(|| Vec::<[f64; 5]>::with_capacity(20));
     if profile.is_some() {
@@ -3128,14 +3146,19 @@ fn run_detector_train_gpu(
             }
         }
         let start = profile.as_ref().map(|_| Instant::now());
-        if options.dynamic_loss_scale && executable.gradients_non_finite()? {
-            // Overflow: drop the accumulated gradients, skip the step and
-            // halve the scale so the next backward stays representable.
+        let scale_step = if options.dynamic_loss_scale {
+            Some(scaler.update(!executable.gradients_non_finite()?))
+        } else {
+            None
+        };
+        if scale_step == Some(darknet_core::ScaleStep::Skip) {
+            // Overflow: drop the accumulated gradients and skip the update.
             executable.zero_train_buffers_gpu()?;
-            let next = (executable.loss_scale() * 0.5).max(1.0);
-            executable.set_loss_scale(next);
-            loss_scale_growth = 0;
-            println!("{batch_num}: non-finite gradients; loss scale -> {next}");
+            executable.set_loss_scale(scaler.scale());
+            println!(
+                "{batch_num}: non-finite gradients; loss scale -> {}",
+                scaler.scale()
+            );
         } else {
             executable.update_weights_gpu_deferred(
                 lr,
@@ -3145,13 +3168,8 @@ fn run_detector_train_gpu(
                 // over every subdivision before the step).
                 images_per_iteration,
             )?;
-            if options.dynamic_loss_scale {
-                loss_scale_growth += 1;
-                if loss_scale_growth >= 1000 && executable.loss_scale() < 65536.0 {
-                    let next = executable.loss_scale() * 2.0;
-                    executable.set_loss_scale(next);
-                    loss_scale_growth = 0;
-                }
+            if scale_step.is_some() {
+                executable.set_loss_scale(scaler.scale());
             }
         }
         if let Some(start) = start {
@@ -3962,6 +3980,7 @@ mod tests {
                 map_thresh: 0.005,
                 map_iou: 0.5,
                 save_every: 1000,
+                loss_scale: None,
                 dynamic_loss_scale: false,
                 colour: None,
             }
@@ -4071,6 +4090,26 @@ mod tests {
         ] {
             assert!(options(&args).is_err(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn parse_train_loss_scale_option() {
+        assert_eq!(
+            options(&["-loss_scale", "512"]).unwrap().loss_scale,
+            Some(512.0)
+        );
+    }
+
+    #[test]
+    fn parse_train_loss_scale_rejects_non_positive_and_non_finite() {
+        for value in ["0", "-4", "nan", "inf"] {
+            assert!(options(&["-loss_scale", value]).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn parse_train_without_loss_scale_is_none() {
+        assert_eq!(options(&[]).unwrap().loss_scale, None);
     }
 
     #[test]
