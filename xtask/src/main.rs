@@ -17,7 +17,9 @@ usage: cargo xtask <cmd> [args...]
   clippy|l [pkg...]     cargo clippy (default: darknet-cli darknet-core)
   test|host|t [filter...]  host tests, same as tools/test_host.sh (PKGS overrides)
   oxide|o [args...]     ./tools/test_oxide.sh (GPU tests; args pass through)
-  train_legogears|train|tr [w] [flags]
+  train_legogears|train|tr [-fp8|-fp16] [w] [flags]
+                        -fp8: DARKNET_OXIDE_GEMM=fp8; -fp16: DARKNET_OXIDE_AMP=1
+                        (-bf16: no runtime switch yet, rejected)
                         train LegoGears_v2 on oxide (./tools/train_legogears_oxide.sh;
                         optional initial.weights, extra flags pass to `detector train`)
   fmt|f                 cargo fmt --all
@@ -97,7 +99,19 @@ fn main() -> ExitCode {
                 unsafe { env::set_var("JOBS", "8") };
             }
             let mut v = vec!["./tools/train_legogears_oxide.sh".to_owned()];
-            v.extend(rest.clone());
+            match precision_env(&rest) {
+                Ok((rest, vars)) => {
+                    for (k, val) in vars {
+                        // SAFETY: single-threaded at this point; no other thread reads the env.
+                        unsafe { env::set_var(k, val) };
+                    }
+                    v.extend(rest);
+                }
+                Err(msg) => {
+                    eprintln!("xtask: {msg}");
+                    return ExitCode::from(2);
+                }
+            }
             return run(v, &mem, false);
         }
         "fmt" | "f" => vec!["cargo".into(), "fmt".into(), "--all".into()],
@@ -192,4 +206,43 @@ fn detected_gpu_arch() -> Option<String> {
         .filter(char::is_ascii_digit)
         .collect();
     (!cap.is_empty()).then(|| format!("sm_{cap}"))
+}
+
+/// Pulls the precision flag (`-fp8`, `-fp16`, `-bf16`, also with `--`) out of the
+/// `train_legogears` args and maps it to the oxide backend's env switches.
+/// Everything else passes through to the training script.
+fn precision_env(
+    args: &[String],
+) -> Result<(Vec<String>, Vec<(&'static str, &'static str)>), String> {
+    let mut rest = Vec::new();
+    let mut vars = Vec::new();
+    let mut seen: Option<&str> = None;
+    for a in args {
+        let name = match a.as_str() {
+            "-fp8" | "--fp8" => "fp8",
+            "-fp16" | "--fp16" => "fp16",
+            "-bf16" | "--bf16" => "bf16",
+            _ => {
+                rest.push(a.clone());
+                continue;
+            }
+        };
+        if let Some(prev) = seen {
+            return Err(format!("one precision flag only (got {prev} and {name})"));
+        }
+        seen = Some(name);
+        match name {
+            "fp8" => vars.push(("DARKNET_OXIDE_GEMM", "fp8")),
+            // AMP also selects the f16 tensor-core GEMM.
+            "fp16" => vars.push(("DARKNET_OXIDE_AMP", "1")),
+            _ => {
+                return Err(
+                    "-bf16 is not selectable: the backend has bf16 kernels but no \
+                    DARKNET_OXIDE_* switch for them yet (use -fp16 or -fp8)"
+                        .into(),
+                );
+            }
+        }
+    }
+    Ok((rest, vars))
 }
