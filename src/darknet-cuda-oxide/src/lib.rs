@@ -1703,19 +1703,22 @@ impl OxideBackend {
     }
 
     /// `C = alpha * op(A) * op(B) + beta * C` with `A` an f32 operand quantised
-    /// here to e4m3 and `B` already FP8 bytes with its scale pair (byte im2col).
+    /// here to `fmt_a` and `B` already FP8 bytes in `fmt_b` with its scale pair
+    /// (byte im2col).
     pub(crate) fn gemm_fp8_b_bytes(
         &self,
         a: &DeviceBuffer<f32>,
+        fmt_a: Fp8Format,
         bq: &DeviceBuffer<u8>,
+        fmt_b: Fp8Format,
         sb: &DeviceBuffer<f32>,
         c: &mut DeviceBuffer<f32>,
         g: &GemmArgs,
     ) -> Result<(), OxideError> {
         let (ar, ac) = if g.trans_a { (g.k, g.m) } else { (g.m, g.k) };
         let a_len = extent(g.a.0, g.a.1, g.a.2, g.count, ar, ac, g.lda);
-        let (aq, sa) = self.fp8_quantize_operand(a, a_len, Fp8Format::E4M3)?;
-        self.gemm_fp8_args(&aq, bq, c, g, Fp8Format::E4M3, Fp8Format::E4M3, &sa, sb)
+        let (aq, sa) = self.fp8_quantize_operand(a, a_len, fmt_a)?;
+        self.gemm_fp8_args(&aq, bq, c, g, fmt_a, fmt_b, &sa, sb)
     }
 
     /// Quantised copy of a weight tensor, cached by buffer identity and format.

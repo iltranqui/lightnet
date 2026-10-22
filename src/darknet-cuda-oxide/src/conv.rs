@@ -318,6 +318,7 @@ impl OxideBackend {
         g: &Geom,
         x: &DeviceBuffer<f32>,
         amax_off: u32,
+        fmt: Fp8Format,
         col: &mut DeviceBuffer<u8>,
         scale: &mut DeviceBuffer<f32>,
         batch_index: usize,
@@ -346,7 +347,7 @@ impl OxideBackend {
                 g.pad,
                 g.oh,
                 g.ow,
-                Fp8Format::E4M3.code(),
+                fmt.code(),
                 amax_off,
             )
         }
@@ -461,7 +462,7 @@ impl OxideBackend {
                 let mut b0 = 0;
                 while b0 < g.batch {
                     let nb = chunk.min(g.batch - b0);
-                    self.launch_im2col_fp8(&g, &x.buf, amax, &mut cols, &mut scale, b0, nb, config)?;
+                    self.launch_im2col_fp8(&g, &x.buf, amax, Fp8Format::E4M3, &mut cols, &mut scale, b0, nb, config)?;
                     let inst = nb * groups;
                     self.gemm_fp8_args(
                         &wq.bytes,
@@ -716,7 +717,10 @@ impl OxideBackend {
                 .min(chunk_limit());
             let part_chunk = (PARTIAL_CAP_BYTES / 4 / (g.f * kg).max(1)).clamp(1, g.batch);
             let chunk = col_chunk.min(part_chunk).min(g.batch);
-            let byte_col = self.gemm_mode == GemmMode::Fp8 && self.bwd_fp8.is_none();
+            // Byte column in wgrad: the column is the activation operand, so it
+            // takes the recipe's first format and `dy` the second.
+            let byte_col = self.gemm_mode == GemmMode::Fp8;
+            let (col_fmt, dy_fmt) = self.bwd_fp8.unwrap_or((Fp8Format::E4M3, Fp8Format::E4M3));
             let amax = if byte_col {
                 Some(self.fp8_amax_slot(&x.buf, x.len())?)
             } else {
@@ -729,7 +733,7 @@ impl OxideBackend {
                 while b0 < g.batch {
                     let nb = chunk.min(g.batch - b0);
                     if let (Some(amax), Some(cols8), Some(scale)) = (amax.as_ref(), cols8.as_mut(), scale.as_mut()) {
-                        self.launch_im2col_fp8(&g, &x.buf, *amax, cols8, scale, b0, nb, config)?;
+                        self.launch_im2col_fp8(&g, &x.buf, *amax, col_fmt, cols8, scale, b0, nb, config)?;
                     } else {
                         self.launch_im2col(&g, &x.buf, ws, b0, nb, config)?;
                     }
@@ -752,7 +756,7 @@ impl OxideBackend {
                         ..GemmArgs::default()
                     };
                     if let (Some(cols8), Some(scale)) = (cols8.as_ref(), scale.as_ref()) {
-                        self.gemm_fp8_b_bytes(&dy.buf, cols8, scale, &mut partial, &wgrad)?;
+                        self.gemm_fp8_b_bytes(&dy.buf, dy_fmt, cols8, col_fmt, scale, &mut partial, &wgrad)?;
                     } else {
                         self.backward_gemm(&dy.buf, ws, &mut partial, &wgrad)?;
                     }

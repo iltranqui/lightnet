@@ -18,7 +18,7 @@ usage: cargo xtask <cmd> [args...]
   test|host|t [filter...]  host tests, same as tools/test_host.sh (PKGS overrides)
   oxide|o [args...]     ./tools/test_oxide.sh (GPU tests; args pass through)
   train_legogears|train|tr [-fp8|-fp16|-bf16] [w] [flags]
-                        -fp8: DARKNET_OXIDE_GEMM=fp8; -fp16: DARKNET_OXIDE_AMP=1
+                        -fp8: DARKNET_OXIDE_GEMM=fp8 and DARKNET_OXIDE_GEMM_BWD=fp8; -fp16: DARKNET_OXIDE_AMP=1
                         (-fp16 adds -dyn_scale and -loss_scale 1024 unless supplied)
                         -bf16: DARKNET_OXIDE_AMP=bf16, no loss scaling
                         train LegoGears_v2 on oxide (./tools/train_legogears_oxide.sh;
@@ -235,7 +235,11 @@ fn precision_env(args: &[String]) -> PrecisionEnv {
         }
         seen = Some(name);
         match name {
-            "fp8" => vars.push(("DARKNET_OXIDE_GEMM", "fp8")),
+            // e4m3 forward, e5m2 for the incoming gradient (the C++ recipe).
+            "fp8" => {
+                vars.push(("DARKNET_OXIDE_GEMM", "fp8"));
+                vars.push(("DARKNET_OXIDE_GEMM_BWD", "fp8"));
+            }
             // AMP also selects the f16 tensor-core GEMM.
             "fp16" => {
                 vars.push(("DARKNET_OXIDE_AMP", "1"));
@@ -312,7 +316,11 @@ mod tests {
         let (rest, vars, extra) = precision_env(&args(&["-fp8"])).unwrap();
 
         assert!(rest.is_empty());
-        assert_eq!(vars, [("DARKNET_OXIDE_GEMM", "fp8")]);
+        // e4m3 forward plus the e5m2 gradient recipe.
+        assert_eq!(
+            vars,
+            [("DARKNET_OXIDE_GEMM", "fp8"), ("DARKNET_OXIDE_GEMM_BWD", "fp8")]
+        );
         assert!(extra.is_empty());
     }
 }
