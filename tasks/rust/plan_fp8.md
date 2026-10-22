@@ -207,7 +207,7 @@ User-gated, same procedure as [plan_fp16.md Task 5](plan_fp16.md#task-5-converge
 
 ## Progress
 
-Status as of 2026-10-22.
+Status as of 2026-10-22. After Task 2 the overhead work in [Overhead optimisation](#overhead-optimisation) (`v0.2.167` to `v0.2.169`) cut `prec-lego` fp8 from 21.97 ms to 2.23 ms; Task 4 and Task 6 wait for plan_bf16 Tasks 2 and 6 (Task 1 is done, `v0.2.170`).
 
 | Task | Status | Commit or tag |
 |---|---|---|
@@ -224,7 +224,7 @@ Status as of 2026-10-22.
 Task 2 details: the forward and dgrad weight operands are quantised once per weight tensor. The cache is keyed on buffer identity and format, and is reachable only through the weight seams (`gemm_weights_a`, `backward_gemm_weights_a`). `oxide_gemm_f8` passes 24 of 24 (three new cache tests). The 21-conv bench does not exercise the cache, so its speed gain is still unmeasured.
 
 Open issues:
-- **Task 2 speed gain unmeasured.** Needs a conv-level bench that runs the weight-cache path.
+- **Task 2 speed gain unmeasured.** Needs a conv-level bench that runs the weight-cache path (`prec-lego` goes through the uncached tensor path).
 - **Bench test `gemm_bench_low_precision_lego_kernels` uncommitted** (`tests/oxide_gemm_bench.rs`). Added this session.
 - **`bench/` folder untracked.** Written by Haiku agents: `README.md`, `run_bench.sh` (`bash -n` only, never run end to end), and three header-only CSVs. Open decisions: symlink of `third_party/cuda-oxide` into scratch worktrees (script refuses unless `BENCH_SHARE_OXIDE=1`), and deleting the leftover `bench/.work/`. Neither decided.
 - **Kernel time does not beat fp32 on the LegoGears shapes.** End-to-end fp8 is about 9x fp32, mostly overhead (see [LegoGears conv shapes](#legogears-conv-shapes)).

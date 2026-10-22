@@ -344,6 +344,19 @@ Scales linearly (~3.0 ms/image) from batch 16 up.  The `BufPool` cap used to be 
 
 Correctness: `oxide_conv_parity` (13, incl. `conv_parity_implicit`), `oxide_cfg_shapes` (13), `oxide_runtime_chain` (3), `oxide_layers_extra` (17), `oxide_pool_parity` (9), `oxide_parity` (10), `oxide_gemm_mma` (5), `oxide_grad_methods` (2), `oxide_half` (13), `oxide_runtime_f16` (5), `oxide_amp` (11) and `oxide_batchnorm_adam` (13) all pass.
 
+### 7.8 fp8 GEMM overhead (2026-10-22)
+
+`gemm_bench_precisions` (`DARKNET_BENCH_MODES=fp32,fp8`), end to end through the GEMM seam, so fp8 includes amax, quantise and temporaries. `prec-lego` is the 21 LegoGears_v2 conv GEMMs; `prec-sq` is 512, 1024 and 2048 cubed.
+
+| Step | `prec-lego` fp8 | `prec-lego` fp32 | `prec-sq` fp8 | `prec-sq` fp32 |
+| --- | --- | --- | --- | --- |
+| Before (device scales, weight cache) | 21.97 ms | 2.52 ms | | |
+| v0.2.167 pooled temporaries | 3.84 ms | 1.12 ms | 4.44 ms | 4.43 ms |
+| v0.2.168 scale fused into quantise | 2.95 ms | 1.02 ms | 4.68 ms | 4.60 ms |
+| v0.2.169 A+B fused (block-reduced amax) | 2.23 ms | 0.98 ms | 4.16 ms | 4.21 ms |
+
+`nsys` after v0.2.168 (2402 GEMMs): 14022 launches (238 ms host API time) and 4906 memsets (71 ms) against 166 ms of GPU kernel time, so the path was launch-bound; `sgemm_fp8_mma` was 76% of GPU time, amax and quantise about 20%. A first A+B fusion with one atomic per element on adjacent slots doubled the lego time (5.89 ms; the amax kernel averaged 140 us against 3.4 us) and was replaced by the block-reduced version. Numbers are single runs; the fp32 column moved by up to 20% between runs. Remaining ideas and status: `tasks/rust/plan_fp8.md`, "Overhead optimisation". No training run was made.
+
 ## Gradient-method shootout (2026-10-01)
 
 Harness: `src/darknet-cuda-oxide/tests/oxide_grad_methods.rs` (`grad_method_shootout`, ignored; a tiny-shape version of the same

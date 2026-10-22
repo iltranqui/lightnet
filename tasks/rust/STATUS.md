@@ -88,6 +88,10 @@ uncommitted, with no `version-map.tsv` row.
 
 Latest increments:
 - v0.2.166: fp8 forward and dgrad cache quantised weight tensors (identity-keyed, weight seams only); 24 `oxide_gemm_f8` tests pass, including 3 new cache tests. The 21-conv bench does not exercise the cache, so the speed gain is unmeasured. See `implemented.md` §238.
+- v0.2.167: fp8 amax slot, scale pair and quantised bytes come from the buffer pool (no per-operand `cudaMalloc`). `prec-lego` fp8 21.97 ms to 3.84 ms. See `implemented.md` §239.
+- v0.2.168: `fp8_scale_kernel` removed; the quantise kernel derives the factor from the amax slot. `prec-lego` fp8 3.84 ms to 2.95 ms. See `implemented.md` §239.
+- v0.2.169: fp8 A and B share one amax launch (block-reduced, one atomic per block) and one quantise launch. `prec-lego` fp8 2.95 ms to 2.23 ms (fp32 0.98 ms); `oxide_gemm_f8` 25 of 25. See `implemented.md` §239.
+- v0.2.170: `HalfFormat`, `parse_amp_format`, `with_amp_format`, `GemmMode::Bf16` (plan_bf16 Task 1). `oxide_amp` 15 of 15, `oxide_gemm_f8` 26 of 26. bf16 AMP training is not usable yet (activation kernels are f16 only). See `implemented.md` §240.
 - v0.2.165: follow-up for v0.2.164 names the `precision_env` tuple type so `cargo xtask clippy xtask` passes without warnings; all 4 xtask tests pass and GPT-6-luna review accepted. Default clippy remains blocked by three unrelated `approx_constant` errors in `vc_attention.rs`; Task 5 training remains user-gated. See `implemented.md` §237.
 - v0.2.164: `cargo xtask train_legogears -fp16` now enables AMP plus default `-dyn_scale -loss_scale 1024`, while preserving user flags; fp8 is unchanged. Four xtask tests pass, help/CLAUDE docs match, and GPT-6-luna review accepted. No training run was started. Phase 1 Task 5 is user-gated. See `implemented.md` §236.
 - v0.2.163: pinned the existing non-finite gradient scan for convolution weights, BN bias and BN scale; all 3 focused tests passed, and no runtime logic change was needed. The allowed temporary test import shim was removed after verification. GPT-6-luna review accepted; Phase 1 Task 5 convergence evidence remains user-gated. See `implemented.md` §235.

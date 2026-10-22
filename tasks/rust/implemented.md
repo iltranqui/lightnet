@@ -2426,6 +2426,19 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 - v0.2.166 quantises the weight operand of the fp8 conv forward and dgrad once per weight tensor. The copy is keyed on the weight buffer identity and format, with a weak key and the `W16_CACHE_MAX` cap, and refreshes when the optimizer returns a new tensor. Activations are still quantised per call. The cache is reachable only through the weight seams (`gemm_weights_a`, `backward_gemm_weights_a`), never through the generic `gemm_f32`, because pooled activation buffers reuse addresses.
 - Evidence: `cargo xtask oxide --test oxide_gemm_f8` passed 24 of 24 (three new: `fp8_weight_cache_hits_on_second_forward`, `fp8_weight_cache_refreshes_after_update`, `fp8_cached_weights_serve_forward_and_transposed_dgrad`). `gemm_bench_lego` (uncached tensor path) gave fp32 2.04 ms and fp8 18.27 ms over the 21 convs in the same run. That bench cannot show the cache gain; a conv-level measurement is still open. No training run was started.
 
+## 239. fp8 overhead: pooled temporaries, fused scale and A+B quantise
+
+- v0.2.167 takes the fp8 amax slot, scale pair and quantised bytes from the buffer pool (new u8 free list `PooledBuf8`, sharing the byte cap) instead of allocating per operand. The amax slot is an f32 buffer that the kernel reads as `u32` bits.
+- v0.2.168 drops `fp8_scale_kernel`: `fp8_quantize_kernel` derives `factor = max_finite / amax` from the amax slot and writes the `[factor, 1 / factor]` scale pair itself. `fp8_scale_dev` and `fp8_quantize_buffer` became `fp8_quantize_operand`; the host-side `quantize_f32_to_fp8` keeps an explicit-scale kernel (`fp8_quantize_scaled_kernel`).
+- v0.2.169 fuses A and B: `fp8_amax_pair_kernel` (per-block shared-memory reduction, one atomic per block, A and B slots 128 bytes apart) and `fp8_quantize_pair_kernel`. Per GEMM 7 host calls became 4. The first fused attempt (one atomic per element) was slower (lego 5.89 ms) and was reworked after a `gpt-6-sol` review, which also found the operand split used buffer length instead of GEMM extent (out-of-bounds write); pinned by `fp8_pair_quantise_ignores_elements_beyond_the_gemm_extent`.
+- Evidence: `oxide_gemm_f8` 25 of 25 after v0.2.169 (24 after v0.2.167 and v0.2.168). `gemm_bench_precisions` `prec-lego` fp8 total: 21.97 ms before, 3.84 ms after pooling, 2.95 ms after the scale fusion, 2.23 ms after the A+B fusion (fp32 0.98 to 1.12 ms in the same runs). Square total 4.16 ms against fp32 4.21 ms. `nsys` after v0.2.168: 14022 launches and 4906 memsets for 2402 GEMMs, launch-bound (see `plan_fp8.md`, "Overhead optimisation"). No training run was started.
+
+## 240. HalfFormat and GemmMode::Bf16
+
+- v0.2.170 (`plan_bf16.md` Task 1) adds `HalfFormat { F16, Bf16 }`, `parse_amp_format`, `OxideBackend::with_amp_format` and `half_format`, and `GemmMode::Bf16` (`DARKNET_OXIDE_GEMM=bf16`). `DARKNET_OXIDE_AMP` now accepts `bf16`/`bfloat16` as well as the old f16 spellings; garbage and empty mean AMP off. `GemmMode::Bf16` in the f32 API rounds both operands to bf16 and runs the 16-bit tensor-core GEMM with f32 output (`gemm_f32_operands_as_half`).
+- Only the GEMM path is format-aware: the AMP activation kernels still read and write f16, so `DARKNET_OXIDE_AMP=bf16` is not usable for training until `plan_bf16.md` Tasks 4 to 6. `cargo xtask train_legogears -bf16` is still rejected.
+- Evidence: `oxide_amp` 15 of 15 (four new: format parsing, garbage rejection, `with_amp_format` mode selection, `bf16_gemm_mode_tracks_the_f32_gemm_in_the_f32_api`), `oxide_gemm_f8` 26 of 26 (new `gemm_mode_from_env_parses_bf16`). No training run was started.
+
 ## Not implemented / open (pointer)
 
 See `tasks/rust/todo.md` for the deduplicated open list (P8/P9 follow-ups,

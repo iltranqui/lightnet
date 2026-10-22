@@ -16,6 +16,7 @@
 - [Review Focus](#review-focus)
 - [Verified starting state](#verified-starting-state)
 - [File structure](#file-structure)
+- [Progress](#progress)
 - [Tasks](#tasks)
   - [Task 1: HalfFormat, env parsing, GemmMode::Bf16](#task-1-halfformat-env-parsing-gemmmodebf16)
   - [Task 2: Format-aware conversions](#task-2-format-aware-conversions)
@@ -59,6 +60,23 @@
 - Modify `src/darknet-cuda-oxide/src/kernels/amp.rs`, `kernels/half_ops.rs`: `fmt` arguments (training kernels only; inference-only f16 kernels stay f16).
 - Modify tests: `tests/oxide_amp.rs`, `tests/oxide_half.rs`, `tests/oxide_gemm_f8.rs` (GemmMode parsing test lives there).
 - Modify `xtask/src/main.rs`, `CLAUDE.md`, docs as in plan_fp16.
+
+## Progress
+
+Status as of 2026-10-22.
+
+| Task | Status | Commit or tag |
+|---|---|---|
+| 1. HalfFormat, env parsing, GemmMode::Bf16 | done | `v0.2.170` (`97414f8`) |
+| 2. Format-aware conversions | not started | |
+| 3. bf16 output in the 16-bit GEMM | not started | |
+| 4. amp.rs kernels take fmt | not started | |
+| 5. Training half_ops kernels take fmt | not started | |
+| 6. Backend wiring and the AMP suite | not started | |
+| 7. xtask `-bf16` | not started | |
+| 8. Convergence and step-time record | user-gated (training run) | |
+
+Task 1 notes: `oxide_amp` passes 15 of 15 and `oxide_gemm_f8` 26 of 26. `GemmMode::Bf16` in the f32 API goes through `gemm_f32_operands_as_half(.., bf16 = true)`. `DARKNET_OXIDE_AMP=bf16` parses and selects the format, but the AMP activation kernels are still f16 only, so it must not be used for training before Task 4 to 6.
 
 ## Tasks
 

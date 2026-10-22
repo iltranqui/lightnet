@@ -401,6 +401,10 @@ reference tolerance is `TOL_COMPOSED = 1e-4` rather than the single-stage `2e-6`
 ## FP8 / FP4 (`fp8_fp4.md`)
 
 - [x] v0.2.166: forward and dgrad weight operands are quantised once per weight tensor and cached (keyed on buffer identity and format); 24 `oxide_gemm_f8` tests pass. Speed gain not yet measured at conv level. See `implemented.md` §238.
+- [x] v0.2.167 to v0.2.169: fp8 overhead (pooled temporaries, fused scale, fused A+B quantise); `prec-lego` fp8 21.97 ms to 2.23 ms. See `implemented.md` §239.
+- [x] v0.2.170: `HalfFormat` and `GemmMode::Bf16` (plan_bf16 Task 1). See `implemented.md` §240.
+- [ ] fp8 overhead remainder (plan_fp8 "Overhead optimisation"): byte im2col, delayed scaling, CUDA Graphs; re-profile with `nsys` first.
+- [ ] bf16 Tasks 2 to 8 (`plan_bf16.md`).
 - [ ] Step 5: FP8 conv via im2col + LegoGears_v2 mAP vs the C++ FP8 path. Not
   runnable here (no C++ build of `v6-dev-fp8`).
 
