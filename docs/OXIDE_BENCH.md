@@ -548,15 +548,19 @@ Step time: oxide debug median 129 ms (f32) / 113 ms (AMP) vs C++ ~50-60 ms inclu
 
 Deferred from the "go full" scope in this pass (documented in `tasks/rust/todo.md`): mosaic/cutmix, background loader prefetch, weighted shortcut, `reverse`/`deform` conv, device connected/SAM/recurrent backward + Adam with host-fallback layers, adversarial yolo, implicit-GEMM conv, f32 GEMM epilogue.
 
-## 10. fp8 against fp32 training, LegoGears_v2 (2026-10-22)
+## 10. fp8 and bf16 against fp32 training, LegoGears_v2 (2026-10-23)
 
-`cargo xtask train_legogears [-fp8]`, seed 42, 3000 iterations, batch 16, release build, RTX 4060 Laptop. Rows are parsed from the run log and `_loss.csv` by `bench/log_train.sh` into `bench/results_train.csv`. Step time is the median of the per-iteration milliseconds, total is their sum (mAP evaluation excluded).
+`cargo xtask train_legogears [-fp8|-bf16]`, seed 42, 3000 iterations, batch 16, release build (4 build threads), RTX 4060 Laptop, one run at a time. Rows are parsed from each run's log and `_loss.csv` by `bench/log_train.sh` into `bench/results_train.csv`; each run used its own backup directory (`DATA` override), so no earlier rows leak in. Step time is the median of the per-iteration milliseconds, total is their sum (mAP evaluation excluded). fp32, fp8 and bf16 were run interleaved, two rounds, on the final binary (v0.2.172 plus the bf16 mode).
 
-| run | step median | total | final avg loss | mAP@0.50 | F1 |
+| run | step median | total round 1 / 2 | final avg loss | mAP@0.50 (best) | F1 |
 |---|---|---|---|---|---|
-| fp32 | 53.4 ms | 160.9 s | 0.0597 | 99.55% | 0.9935 |
-| fp8 (v0.2.170, before byte im2col) | 57.0 ms | 171.5 s | 0.0585 | 99.50% | 0.9902 |
-| fp8 (v0.2.171, byte im2col) | 50.5 ms | 153.7 s | 0.0594 | 99.74% | 0.9935 |
+| fp32 | 48.9 ms | 147.2 s / 147.0 s | 0.0597 | 99.55% (99.80%) | 0.9935 |
+| fp8 (v0.2.172) | 47.4 ms | 142.8 s / 143.0 s | 0.0580 | 99.55% (99.63%) | 0.9902 |
+| bf16 AMP | 46.0 ms | 138.6 s / 138.6 s | 0.0524 | 99.63% (99.63%) | 0.9935 |
 | fp16 AMP | 70 ms (earlier record, not re-run) | | | | |
 
-Reference chart `results/chart_fp8_optimize_yolo_gpu.png`: 3000 iterations in 88.2 s (about 29 ms), loss 0.0718, mAP 99.39% (best 99.48%), F1 0.9935, titled "Darknet/YOLO v6.0.117". It uses the C++ Darknet chart style, not the Rust `chart.png`, and there is no C++ fp8 build here, so its time is not comparable to a Rust step time; it is an accuracy reference only. The 88.2 s target is not reached. bf16 training is not usable yet (`plan_bf16.md` Tasks 2 to 8 open). Single runs; the fp32 column drifts by up to 20% between runs.
+fp8 is 3.0% faster than fp32 and bf16 5.7% faster; both rounds agree to 0.2%, and the same seed reproduces the loss exactly. Earlier fp8 steps for the record (same protocol, other session, fp32 at 53.4 ms then): v0.2.170 57.0 ms / 171.5 s; v0.2.171 byte im2col 50.5 ms / 153.7 s; bf16 first run 47.3 ms / 144.2 s. The fp32 step moves with the laptop state (53.4 ms in one session, 48.9 ms in the next), so only same-session interleaved numbers are compared. `bench-train` (batch 16, 30 steps, 5 interleaved rounds, medians): fp32 50.9 ms, fp8 49.0 ms (v0.2.172), bf16 47.1 ms.
+
+Accuracy against `results/chart_fp8_optimize_yolo_gpu.png` (mAP 99.39%, best 99.48%, F1 0.9935, loss 0.0718): every run has mAP at or above 99.5%. bf16 and fp32 match the chart's F1; fp8's F1 is 0.9902 (one more false positive, TP 152, FP 3), which meets the 0.99 target but is below the chart's 0.9935. Final avg loss of fp8 and bf16 is within 10% of fp32.
+
+The chart uses the C++ Darknet chart style (title "Darknet/YOLO v6.0.117") and says 3000 iterations in 88.2 s (about 29 ms per iteration). There is no C++ fp8 build here, so that time is not comparable to a Rust step time and the 88.2 s target is not reached (the Rust fp8 and bf16 runs take 143 s and 139 s). Remaining fp8 cost: the fp8 GEMM kernel is only about 1.3x faster than fp32 `sgemm_tiled` here, `im2col` (8 ms per step) and `col2im` are shared with fp32, and fp8 still adds quantise passes for `dy`. fp8 on top of bf16 storage (plan_fp8 Task 6) is not done.
