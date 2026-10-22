@@ -43,12 +43,12 @@ Whole-repo map: [CONTEXT.md](CONTEXT.md).
 | `cargo xtask clippy [pkg...]` | `l` | `cargo clippy` (default: `darknet-cli`, `darknet-core`) |
 | `cargo xtask test [filter...]` | `t`, `host` | host tests, same as `tools/test_host.sh` (`PKGS` overrides the packages) |
 | `cargo xtask oxide [args...]` | `o` | `tools/test_oxide.sh` (GPU tests; args pass through) |
-| `cargo xtask train_legogears [-fp8\|-fp16] [weights] [flags...]` | `train`, `tr` | `tools/train_legogears_oxide.sh`: release oxide build, then LegoGears_v2 training. `-fp8` sets `DARKNET_OXIDE_GEMM=fp8`, `-fp16` sets `DARKNET_OXIDE_AMP=1` (mixed precision) and adds `-dyn_scale -loss_scale 1024` unless supplied; `-bf16` is rejected because the backend has no runtime switch for it yet. Default is fp32 |
+| `cargo xtask train_legogears [-fp8\|-fp16\|-bf16] [weights] [flags...]` | `train`, `tr` | `tools/train_legogears_oxide.sh`: release oxide build, then LegoGears_v2 training. `-fp8` sets `DARKNET_OXIDE_GEMM=fp8`, `-fp16` sets `DARKNET_OXIDE_AMP=1` (mixed precision) and adds `-dyn_scale -loss_scale 1024` unless supplied; `-bf16` sets `DARKNET_OXIDE_AMP=bf16` (no loss scaling). Default is fp32 |
 | `cargo xtask fmt` | `f` | `cargo fmt --all` |
 
 Every command exports the detected GPU arch as the advisory `CUDA_OXIDE_DEVICE_ARCH` (unless `CUDA_OXIDE_TARGET` or `CUDA_OXIDE_DEVICE_ARCH` is already set).
 
-Environment: `MEM` (default `3G`), `JOBS` (default 2, clamped to 4; `train_legogears` defaults to 8 build threads, as the operator approved). Start training only when the user asks. Add new commands as arms in `xtask/src/main.rs` and to this table.
+Environment: `MEM` (default `3G`), `JOBS` (default 2, clamped to 4; `train_legogears` also defaults to 4, per the operator's 4-thread cap). Start training only when the user asks. Add new commands as arms in `xtask/src/main.rs` and to this table.
 
 ## Hard rules
 
@@ -64,4 +64,5 @@ Full rule set lives in `tasks/rust/AGENTS.md`.
 - Do not archive or remove completed plans in tasks/rust/; keep them, since they are the project roadmap needed for development.
 - Prefer `cargo xtask` subcommands over raw commands when running or testing this project; they are documented in CLAUDE.md.
 - After testing a new feature and confirming it works correctly, commit the change with the feature tag, as specified in AGENTS.md and AGENTS_fp8.md.
+- Limit all builds and checks to a maximum of 4 threads in this project.
 <!-- end claude-reflect -->

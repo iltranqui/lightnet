@@ -17,10 +17,10 @@ usage: cargo xtask <cmd> [args...]
   clippy|l [pkg...]     cargo clippy (default: darknet-cli darknet-core)
   test|host|t [filter...]  host tests, same as tools/test_host.sh (PKGS overrides)
   oxide|o [args...]     ./tools/test_oxide.sh (GPU tests; args pass through)
-  train_legogears|train|tr [-fp8|-fp16] [w] [flags]
+  train_legogears|train|tr [-fp8|-fp16|-bf16] [w] [flags]
                         -fp8: DARKNET_OXIDE_GEMM=fp8; -fp16: DARKNET_OXIDE_AMP=1
                         (-fp16 adds -dyn_scale and -loss_scale 1024 unless supplied)
-                        (-bf16: no runtime switch yet, rejected)
+                        -bf16: DARKNET_OXIDE_AMP=bf16, no loss scaling
                         train LegoGears_v2 on oxide (./tools/train_legogears_oxide.sh;
                         optional initial.weights, extra flags pass to `detector train`)
   fmt|f                 cargo fmt --all
@@ -94,10 +94,10 @@ fn main() -> ExitCode {
         // Release build + `detector train` on LegoGears_v2 (oxide backend); the script
         // caps itself. Overrides: CFG, DATA, SEED, PROFILE, DARKNET_OXIDE_AMP.
         "train_legogears" | "train" | "tr" => {
-            // Operator-approved 8 build threads for training (above the usual 4 cap).
+            // Same 4 build thread cap as every other command.
             if env::var_os("JOBS").is_none() {
                 // SAFETY: single-threaded at this point; no other thread reads the env.
-                unsafe { env::set_var("JOBS", "8") };
+                unsafe { env::set_var("JOBS", "4") };
             }
             let mut v = vec!["./tools/train_legogears_oxide.sh".to_owned()];
             match precision_env(&rest) {
@@ -252,13 +252,8 @@ fn precision_env(args: &[String]) -> PrecisionEnv {
                     extra.extend(["-loss_scale".to_owned(), "1024".to_owned()]);
                 }
             }
-            _ => {
-                return Err(
-                    "-bf16 is not selectable: the backend has bf16 kernels but no \
-                    DARKNET_OXIDE_* switch for them yet (use -fp16 or -fp8)"
-                        .into(),
-                );
-            }
+            // bf16 has the f32 exponent range, so no loss scaling flags.
+            _ => vars.push(("DARKNET_OXIDE_AMP", "bf16")),
         }
     }
     Ok((rest, vars, extra))
@@ -270,6 +265,20 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn bf16_sets_amp_bf16_without_scaler_flags() {
+        let (rest, vars, extra) = precision_env(&args(&["-bf16"])).unwrap();
+
+        assert!(rest.is_empty());
+        assert_eq!(vars, [("DARKNET_OXIDE_AMP", "bf16")]);
+        assert!(extra.is_empty());
+    }
+
+    #[test]
+    fn two_precision_flags_are_rejected() {
+        assert!(precision_env(&args(&["-fp16", "-bf16"])).is_err());
     }
 
     #[test]
