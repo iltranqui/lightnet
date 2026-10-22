@@ -21,7 +21,8 @@ use cuda_core::DeviceBuffer;
 use darknet_cuda::ElementwiseLaunchConfig;
 
 use crate::kernels::conv_direct::WGRAD_THREADS;
-use crate::{GemmArgs, ImplicitConv, OxideBackend, OxideError, OxideTensorF32, launch, launch_err};
+use crate::fp8::Fp8Format;
+use crate::{GemmArgs, GemmMode, ImplicitConv, OxideBackend, OxideError, OxideTensorF32, launch, launch_err};
 
 /// Which convolution implementation to use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -309,6 +310,47 @@ impl OxideBackend {
         .map_err(launch_err)
     }
 
+    /// Byte im2col for the FP8 GEMM: gathers and quantises to e4m3 in one pass,
+    /// using the image's amax slot, and writes the column's scale pair.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_im2col_fp8(
+        &self,
+        g: &Geom,
+        x: &DeviceBuffer<f32>,
+        amax: &DeviceBuffer<f32>,
+        col: &mut DeviceBuffer<u8>,
+        scale: &mut DeviceBuffer<f32>,
+        batch_index: usize,
+        images: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(), OxideError> {
+        // SAFETY: as `launch_im2col`, with `col` holding `images * col_len`
+        // bytes and `scale` two words.
+        unsafe {
+            self.im2col.im2col_fp8(
+                &self.stream,
+                launch::blocks_of(images * g.c * g.k * g.k, launch::block_size(config)),
+                x,
+                amax,
+                col,
+                scale,
+                batch_index * g.c * g.h * g.w,
+                g.c,
+                g.h,
+                g.w,
+                g.k,
+                g.sx,
+                g.sy,
+                g.dil,
+                g.pad,
+                g.oh,
+                g.ow,
+                Fp8Format::E4M3.code(),
+            )
+        }
+        .map_err(launch_err)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn conv_forward(
         &self,
@@ -408,6 +450,43 @@ impl OxideBackend {
             let chunk = (col_cap_bytes() / 4 / g.col_len())
                 .clamp(1, g.batch)
                 .min(chunk_limit());
+            if self.gemm_mode == GemmMode::Fp8 {
+                // Quantise while gathering: the column never exists as f32.
+                let wq = self.fp8_weights(weights, Fp8Format::E4M3)?;
+                let amax = self.fp8_amax_slot(&x.buf, x.len())?;
+                let mut cols = self.alloc8_uninit(chunk * g.col_len())?;
+                let mut scale = self.alloc_uninit(2)?;
+                let mut b0 = 0;
+                while b0 < g.batch {
+                    let nb = chunk.min(g.batch - b0);
+                    self.launch_im2col_fp8(&g, &x.buf, &amax, &mut cols, &mut scale, b0, nb, config)?;
+                    let inst = nb * groups;
+                    self.gemm_fp8_args(
+                        &wq.bytes,
+                        &cols,
+                        &mut out,
+                        &GemmArgs {
+                            m: fpg,
+                            n: ohw,
+                            k: kg,
+                            lda: kg,
+                            ldb: ohw,
+                            ldc: ohw,
+                            a: (0, fpg * kg, groups),
+                            b: (0, kg * ohw, inst),
+                            c: (b0 * g.f * ohw, fpg * ohw, inst),
+                            count: inst,
+                            ..GemmArgs::default()
+                        },
+                        Fp8Format::E4M3,
+                        Fp8Format::E4M3,
+                        &wq.scale,
+                        &scale,
+                    )?;
+                    b0 += nb;
+                }
+                return Ok(OxideTensorF32::new(out, &[g.batch, g.f, g.oh, g.ow]));
+            }
             self.with_workspace(chunk * g.col_len(), |ws| {
                 let mut b0 = 0;
                 while b0 < g.batch {
@@ -635,34 +714,46 @@ impl OxideBackend {
                 .min(chunk_limit());
             let part_chunk = (PARTIAL_CAP_BYTES / 4 / (g.f * kg).max(1)).clamp(1, g.batch);
             let chunk = col_chunk.min(part_chunk).min(g.batch);
-            self.with_workspace(chunk * g.col_len(), |ws| {
+            let byte_col = self.gemm_mode == GemmMode::Fp8 && self.bwd_fp8.is_none();
+            let amax = if byte_col {
+                Some(self.fp8_amax_slot(&x.buf, x.len())?)
+            } else {
+                None
+            };
+            let mut cols8 = if byte_col { Some(self.alloc8_uninit(chunk * g.col_len())?) } else { None };
+            let mut scale = if byte_col { Some(self.alloc_uninit(2)?) } else { None };
+            self.with_workspace(if byte_col { 1 } else { chunk * g.col_len() }, |ws| {
                 let mut b0 = 0;
                 while b0 < g.batch {
                     let nb = chunk.min(g.batch - b0);
-                    self.launch_im2col(&g, &x.buf, ws, b0, nb, config)?;
+                    if let (Some(amax), Some(cols8), Some(scale)) = (amax.as_ref(), cols8.as_mut(), scale.as_mut()) {
+                        self.launch_im2col_fp8(&g, &x.buf, amax, cols8, scale, b0, nb, config)?;
+                    } else {
+                        self.launch_im2col(&g, &x.buf, ws, b0, nb, config)?;
+                    }
                     let inst = nb * groups;
                     let mut partial = self.alloc_uninit(inst * fpg * kg)?;
                     // dW_partial[b, g] (fpg x kg) = dy[b, g] (fpg x ohw) * col[b, g]^T (ohw x kg)
-                    self.backward_gemm(
-                        &dy.buf,
-                        ws,
-                        &mut partial,
-                        &GemmArgs {
-                            m: fpg,
-                            n: kg,
-                            k: ohw,
-                            lda: ohw,
-                            ldb: ohw,
-                            ldc: kg,
-                            trans_b: true,
-                            beta: 0.0,
-                            a: (b0 * g.f * ohw, fpg * ohw, inst),
-                            b: (0, kg * ohw, inst),
-                            c: (0, fpg * kg, inst),
-                            count: inst,
-                            ..GemmArgs::default()
-                        },
-                    )?;
+                    let wgrad = GemmArgs {
+                        m: fpg,
+                        n: kg,
+                        k: ohw,
+                        lda: ohw,
+                        ldb: ohw,
+                        ldc: kg,
+                        trans_b: true,
+                        beta: 0.0,
+                        a: (b0 * g.f * ohw, fpg * ohw, inst),
+                        b: (0, kg * ohw, inst),
+                        c: (0, fpg * kg, inst),
+                        count: inst,
+                        ..GemmArgs::default()
+                    };
+                    if let (Some(cols8), Some(scale)) = (cols8.as_ref(), scale.as_ref()) {
+                        self.gemm_fp8_b_bytes(&dy.buf, cols8, scale, &mut partial, &wgrad)?;
+                    } else {
+                        self.backward_gemm(&dy.buf, ws, &mut partial, &wgrad)?;
+                    }
                     // SAFETY: one thread per (group, weight) element; the
                     // partials hold `nb` image blocks for each of `groups`.
                     unsafe {

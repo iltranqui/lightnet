@@ -1628,6 +1628,43 @@ impl OxideBackend {
         Ok(((out_a, scale_a), (out_b, scale_b)))
     }
 
+    /// Absolute maximum of the first `len` elements of `buf` in a pooled,
+    /// zero-started slot (read by the device, never by the host).  Used by the
+    /// byte im2col, which quantises while it gathers.
+    pub(crate) fn fp8_amax_slot(&self, buf: &DeviceBuffer<f32>, len: usize) -> Result<PooledBuf, OxideError> {
+        let mut slot = self.alloc(1)?;
+        if len > 0 {
+            // SAFETY: one thread per element; the zeroed slot is only touched
+            // through `fetch_max`.
+            unsafe {
+                self.gemm_f8.fp8_amax_f32_kernel(
+                    &self.stream,
+                    launch::elementwise(len, ElementwiseLaunchConfig::default()),
+                    buf,
+                    &mut slot,
+                )
+            }
+            .map_err(launch_err)?;
+        }
+        Ok(slot)
+    }
+
+    /// `C = alpha * op(A) * op(B) + beta * C` with `A` an f32 operand quantised
+    /// here to e4m3 and `B` already FP8 bytes with its scale pair (byte im2col).
+    pub(crate) fn gemm_fp8_b_bytes(
+        &self,
+        a: &DeviceBuffer<f32>,
+        bq: &DeviceBuffer<u8>,
+        sb: &DeviceBuffer<f32>,
+        c: &mut DeviceBuffer<f32>,
+        g: &GemmArgs,
+    ) -> Result<(), OxideError> {
+        let (ar, ac) = if g.trans_a { (g.k, g.m) } else { (g.m, g.k) };
+        let a_len = extent(g.a.0, g.a.1, g.a.2, g.count, ar, ac, g.lda);
+        let (aq, sa) = self.fp8_quantize_operand(a, a_len, Fp8Format::E4M3)?;
+        self.gemm_fp8_args(&aq, bq, c, g, Fp8Format::E4M3, Fp8Format::E4M3, &sa, sb)
+    }
+
     /// Quantised copy of a weight tensor, cached by buffer identity and format.
     /// Weight tensors are immutable (an optimizer step returns a new tensor), so
     /// the copy refreshes once per update.  Only weight tensors may use this:

@@ -547,3 +547,16 @@ Acceptance ("final mAP within ~0.5 mAP") is satisfied: every run reaches 100.000
 Step time: oxide debug median 129 ms (f32) / 113 ms (AMP) vs C++ ~50-60 ms including loading. The oxide figure is the debug profile (no release run in this pass) and includes the per-layer host round trips during training described in section 7. This validates the new P9 trainer plumbing end to end: `<name>_loss.csv`, `<name>_map.csv`, `chart.png`, `_last.weights` (with `-save_every`), the Adam resume sidecar `<name>_optimizer.state`, and resume from `_last.weights` (a 30-step run resumed at iteration 31 from `seen=480`).
 
 Deferred from the "go full" scope in this pass (documented in `tasks/rust/todo.md`): mosaic/cutmix, background loader prefetch, weighted shortcut, `reverse`/`deform` conv, device connected/SAM/recurrent backward + Adam with host-fallback layers, adversarial yolo, implicit-GEMM conv, f32 GEMM epilogue.
+
+## 10. fp8 against fp32 training, LegoGears_v2 (2026-10-22)
+
+`cargo xtask train_legogears [-fp8]`, seed 42, 3000 iterations, batch 16, release build, RTX 4060 Laptop. Rows are parsed from the run log and `_loss.csv` by `bench/log_train.sh` into `bench/results_train.csv`. Step time is the median of the per-iteration milliseconds, total is their sum (mAP evaluation excluded).
+
+| run | step median | total | final avg loss | mAP@0.50 | F1 |
+|---|---|---|---|---|---|
+| fp32 | 53.4 ms | 160.9 s | 0.0597 | 99.55% | 0.9935 |
+| fp8 (v0.2.170, before byte im2col) | 57.0 ms | 171.5 s | 0.0585 | 99.50% | 0.9902 |
+| fp8 (v0.2.171, byte im2col) | 50.5 ms | 153.7 s | 0.0594 | 99.74% | 0.9935 |
+| fp16 AMP | 70 ms (earlier record, not re-run) | | | | |
+
+Reference chart `results/chart_fp8_optimize_yolo_gpu.png`: 3000 iterations in 88.2 s (about 29 ms), loss 0.0718, mAP 99.39% (best 99.48%), F1 0.9935, titled "Darknet/YOLO v6.0.117". It uses the C++ Darknet chart style, not the Rust `chart.png`, and there is no C++ fp8 build here, so its time is not comparable to a Rust step time; it is an accuracy reference only. The 88.2 s target is not reached. bf16 training is not usable yet (`plan_bf16.md` Tasks 2 to 8 open). Single runs; the fp32 column drifts by up to 20% between runs.

@@ -87,6 +87,7 @@ with actual-device CPU parity; head loss/backward remains host-owned. See
 uncommitted, with no `version-map.tsv` row.
 
 Latest increments:
+- v0.2.171: fp8 byte im2col (`im2col_fp8`, quantise while gathering) for conv forward and wgrad. 3000-iteration LegoGears_v2 (seed 42): fp8 153.7 s against fp32 160.9 s, mAP 99.74%, F1 0.9935, loss 0.0594 against 0.0597. The real training step is GPU-bound (the GEMM-bench launch-bound finding does not carry over). Delayed scaling, dgrad quantise and bf16 AMP remain open. See `implemented.md` §241.
 - v0.2.166: fp8 forward and dgrad cache quantised weight tensors (identity-keyed, weight seams only); 24 `oxide_gemm_f8` tests pass, including 3 new cache tests. The 21-conv bench does not exercise the cache, so the speed gain is unmeasured. See `implemented.md` §238.
 - v0.2.167: fp8 amax slot, scale pair and quantised bytes come from the buffer pool (no per-operand `cudaMalloc`). `prec-lego` fp8 21.97 ms to 3.84 ms. See `implemented.md` §239.
 - v0.2.168: `fp8_scale_kernel` removed; the quantise kernel derives the factor from the amax slot. `prec-lego` fp8 3.84 ms to 2.95 ms. See `implemented.md` §239.

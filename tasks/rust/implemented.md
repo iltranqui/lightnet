@@ -2439,6 +2439,12 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 - Only the GEMM path is format-aware: the AMP activation kernels still read and write f16, so `DARKNET_OXIDE_AMP=bf16` is not usable for training until `plan_bf16.md` Tasks 4 to 6. `cargo xtask train_legogears -bf16` is still rejected.
 - Evidence: `oxide_amp` 15 of 15 (four new: format parsing, garbage rejection, `with_amp_format` mode selection, `bf16_gemm_mode_tracks_the_f32_gemm_in_the_f32_api`), `oxide_gemm_f8` 26 of 26 (new `gemm_mode_from_env_parses_bf16`). No training run was started.
 
+## 241. fp8 byte im2col (conv forward and wgrad)
+
+- v0.2.171 adds `im2col_fp8` (`kernels/im2col.rs`): one pass gathers the image and writes e4m3 bytes using `factor = 448 / amax(x)`, and block 0 writes the `[factor, 1 / factor]` scale pair. The image amax comes from one `fp8_amax_slot` launch over `x`; the column has the same amax as the image (it repeats image values and adds zero padding), so no amax or quantise pass runs over the column and the column write is 4x smaller. `conv_forward` (weights come from the cache, so only the column is byte) and `conv_backward_weights` (`dy` is quantised as A, the column is B) use it when `GemmMode::Fp8` is on (wgrad also needs `bwd_fp8` unset). `conv_backward_input` is unchanged (its column is a GEMM output, then `col2im`).
+- Profile that motivated it (`nsys`, `bench-train`, batch 16, 21 steps, before): the real step is GPU-bound, not launch-bound as the GEMM-bench profile suggested. fp8 `sgemm_fp8_mma` 374 ms plus amax and quantise kernels 243 ms (about 11.6 ms per step) against fp32 `sgemm_tiled` 499 ms; `im2col` 171 ms in both.
+- Evidence: `oxide_gemm_f8` 26 of 26 (existing conv fp8 vs fp32 tests cover the new path). `bench-train` batch 16, 30 steps, 3 interleaved rounds, medians: fp32 51.1 / 49.8 / 52.4 ms, fp8 50.1 / 50.1 / 50.3 ms (fp8 was about 57 to 60 ms before). Full `cargo xtask train_legogears` seed 42, 3000 iterations (`bench/results_train.csv`): fp32 160.9 s total, median 53.4 ms, final avg loss 0.0597, mAP@0.50 99.55%, F1 0.9935; fp8 before 171.5 s, 57.0 ms, 0.0585, 99.50%, 0.9902; fp8 after 153.7 s, 50.5 ms, 0.0594, 99.74%, 0.9935. The 88.2 s of the target chart is not reached (that chart is not a Rust fp32 or fp8 run, see `docs/OXIDE_BENCH.md` section 10). Margin over fp32 is about 4 to 6%, single run each; the fp32 column drifts by up to 20%.
+
 ## Not implemented / open (pointer)
 
 See `tasks/rust/todo.md` for the deduplicated open list (P8/P9 follow-ups,

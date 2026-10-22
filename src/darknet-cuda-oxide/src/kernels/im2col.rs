@@ -9,6 +9,7 @@
 //! col2im is written as a gather (one thread per input element) so it needs no
 //! atomics and is bit-for-bit deterministic.
 
+use super::gemm_f8::{fp8_factor, quantize_f32};
 use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
 
 #[cuda_module]
@@ -66,6 +67,72 @@ pub mod kernels {
             // SAFETY: one thread per (row, p); `col_base + p < images * col_len`.
             unsafe {
                 *col.as_mut_ptr().add(col_base + p) = v;
+            }
+            p += step;
+        }
+    }
+
+    /// [`im2col`] that writes FP8 bytes: each element is multiplied by
+    /// `factor = max_finite(fmt) / amax[0]` (`amax` is the image's absolute
+    /// maximum, which equals the column's because the column only repeats image
+    /// values and adds zero padding) and rounded to `fmt`.  Block 0, thread 0
+    /// also writes the scale pair `[factor, 1 / factor]` the mma epilogue reads.
+    #[kernel]
+    pub fn im2col_fp8(
+        x: &[f32],
+        amax: &[f32],
+        mut col: DisjointSlice<u8>,
+        mut scale: DisjointSlice<f32>,
+        x_base: usize,
+        channels: usize,
+        h: usize,
+        w: usize,
+        ksize: usize,
+        stride_x: usize,
+        stride_y: usize,
+        dilation: usize,
+        padding: usize,
+        out_h: usize,
+        out_w: usize,
+        fmt: u32,
+    ) {
+        let factor = fp8_factor(amax[0], fmt);
+        let kk = ksize * ksize;
+        let rows_per_image = channels * kk;
+        let row = thread::blockIdx_x() as usize;
+        let image = row / rows_per_image;
+        let r = row % rows_per_image;
+        let c = r / kk;
+        let rem = r % kk;
+        let ky = rem / ksize;
+        let kx = rem % ksize;
+        let ohw = out_h * out_w;
+        let x_img = x_base + image * channels * h * w;
+        let kyd = (ky * dilation) as i64 - padding as i64;
+        let kxd = (kx * dilation) as i64 - padding as i64;
+        let col_base = row * ohw;
+        let tid = thread::threadIdx_x() as usize;
+        let step = thread::blockDim_x() as usize;
+        if row == 0 && tid == 0 {
+            // SAFETY: the host allocates two scale words.
+            unsafe {
+                *scale.as_mut_ptr() = factor;
+                *scale.as_mut_ptr().add(1) = 1.0 / factor;
+            }
+        }
+        let mut p = tid;
+        while p < ohw {
+            let oy = p / out_w;
+            let ox = p % out_w;
+            let iy = (oy * stride_y) as i64 + kyd;
+            let ix = (ox * stride_x) as i64 + kxd;
+            let mut v = 0.0f32;
+            if iy >= 0 && iy < h as i64 && ix >= 0 && ix < w as i64 {
+                v = x[x_img + (c * h + iy as usize) * w + ix as usize];
+            }
+            // SAFETY: one thread per (row, p); `col_base + p < images * col_len`.
+            unsafe {
+                *col.as_mut_ptr().add(col_base + p) = quantize_f32(v, factor, fmt);
             }
             p += step;
         }
