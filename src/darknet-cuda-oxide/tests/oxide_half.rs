@@ -851,3 +851,37 @@ fn f16_gemm_bench() {
         .sum();
     println!("BENCH f16 lego21 total: {total:.4} ms");
 }
+
+/// bf16 operands and bf16 *output* (fused epilogue, including split-K shapes):
+/// the stored value is the f32 result rounded to bf16, so the bound is the f32
+/// accumulation slack plus one bf16 rounding (2^-8 relative, 8x the f16 2^-11).
+#[test]
+fn gemm_bf16_with_bf16_output_matches_reference() {
+    let be = backend();
+    let mut rng = Rng(9191);
+    for case in GEMM_CASES {
+        let (m, n, k) = (case.m, case.n, case.k);
+        for &(ta, tb) in &[(false, false), (false, true), (true, false), (true, true)] {
+            for &alpha in &[1.0f32, -1.5] {
+                let a = round_bf16(&rng.vec(m * k, -1.0, 1.0));
+                let b = round_bf16(&rng.vec(k * n, -1.0, 1.0));
+                let c0 = vec![0.0f32; m * n];
+                let (want, scale) = ref_gemm(&a, &b, &c0, m, n, k, ta, tb, alpha, 0.0);
+                let at = be.f32_to_bf16(&be.upload_f32(&[a.len()], &a).unwrap()).unwrap();
+                let bt = be.f32_to_bf16(&be.upload_f32(&[b.len()], &b).unwrap()).unwrap();
+                let out = be.gemm_bf16_out16(&at, &bt, m, n, k, ta, tb, alpha).unwrap();
+                let bits = be.download_f16_bits(&out).unwrap();
+                for i in 0..m * n {
+                    let got = bf16_bits_to_f32(bits[i]) as f64;
+                    let err = (got - want[i]).abs();
+                    let tol = 2e-5 * scale[i] + want[i].abs() / 256.0 + 1e-6;
+                    assert!(
+                        err <= tol,
+                        "{} ta={ta} tb={tb} alpha={alpha} [{i}]: got {got}, want {}, err {err}, tol {tol}",
+                        case.name, want[i]
+                    );
+                }
+            }
+        }
+    }
+}

@@ -32,7 +32,7 @@
 //! N padding, are not stored).
 
 use super::unroll::unroll;
-use cuda_device::convert::cvt_f16x2_f32;
+use super::convert::f32_to_half_bits;
 use cuda_device::shared::cvta_generic_to_shared_u32;
 use cuda_device::wmma::{
     ldmatrix_x4_shared_u32, ldmatrix_x4_trans_shared_u32, mma_m16n8k16_f32_bf16,
@@ -364,7 +364,7 @@ pub mod kernels {
                         let y = crate::kernels::activations::activate(act, v);
                         // SAFETY: as above, for the f16 output.
                         unsafe {
-                            *c16.as_mut_ptr().add(idx) = (cvt_f16x2_f32(y, 0.0) & 0xFFFF) as u16;
+                            *c16.as_mut_ptr().add(idx) = f32_to_half_bits(y, bf16);
                         }
                     }
                 });
@@ -393,6 +393,7 @@ pub mod kernels {
         act: u32,
         bias_stride: usize,
         bias_mod: usize,
+        fmt: u32,
     ) {
         let e = thread::index_1d().get();
         let mn = m * n;
@@ -414,7 +415,7 @@ pub mod kernels {
                 // SAFETY: one thread per (instance, row, col); extents are
                 // validated by the host launcher.
                 unsafe {
-                    *c16.as_mut_ptr().add(idx) = (cvt_f16x2_f32(y, 0.0) & 0xFFFF) as u16;
+                    *c16.as_mut_ptr().add(idx) = f32_to_half_bits(y, fmt);
                 }
             }
         }

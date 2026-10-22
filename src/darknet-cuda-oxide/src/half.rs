@@ -433,6 +433,50 @@ impl OxideBackend {
         Ok(OxideTensorF32::new(out, &[m, n]))
     }
 
+    /// [`Self::gemm_bf16`] with a bfloat16 *output*: `bf16(alpha * A * B)` from
+    /// the fused-epilogue path (zero bias, linear activation, `beta = 0`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_out16(
+        &self,
+        a: &OxideTensorF16,
+        b: &OxideTensorF16,
+        m: usize,
+        n: usize,
+        k: usize,
+        trans_a: bool,
+        trans_b: bool,
+        alpha: f32,
+    ) -> Result<OxideTensorF16, OxideError> {
+        let mut out = self.alloc16_uninit(m * n)?;
+        let bias = self.alloc(m)?;
+        self.hgemm_ex(
+            &a.buf,
+            &b.buf,
+            HOut::F16 {
+                out: &mut out,
+                bias: &bias,
+                bias_stride: 0,
+                bias_mod: 1,
+                act: 0,
+                n_store: n,
+            },
+            &GemmArgs {
+                m,
+                n,
+                k,
+                lda: if trans_a { m } else { k },
+                ldb: if trans_b { k } else { n },
+                ldc: n,
+                trans_a,
+                trans_b,
+                alpha,
+                ..GemmArgs::default()
+            },
+            true,
+        )?;
+        Ok(OxideTensorF16::new(out, &[m, n]))
+    }
+
     /// `GemmMode::Fp16` / `GemmMode::Bf16` in the f32 API: round both operands
     /// to the 16-bit format on the device (same layout, so leading dims and
     /// views carry over) and run the 16-bit GEMM.  Compute mode only; storage
@@ -491,9 +535,6 @@ impl OxideBackend {
         let bad = |msg: &str| OxideError::Shape(format!("hgemm: {msg}"));
         if g.m == 0 || g.n == 0 || g.k == 0 || g.count == 0 {
             return Err(bad("m, n, k and count must be > 0"));
-        }
-        if bf16 && !matches!(out, HOut::F32(_)) {
-            return Err(bad("bf16 operands support the f32 output only"));
         }
         if g.a.2 == 0 || g.b.2 == 0 || g.c.2 == 0 {
             return Err(bad("instance modulus must be > 0"));
@@ -761,7 +802,7 @@ impl OxideBackend {
                             act,
                             bias_stride,
                             bias_mod,
-                            0,
+                            bf,
                         ),
                     }
                 };
@@ -788,6 +829,7 @@ impl OxideBackend {
                             act,
                             bias_stride,
                             bias_mod,
+                            bf,
                         )
                     }
                     .map_err(launch_err)?;
