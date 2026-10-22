@@ -117,9 +117,6 @@ impl OxideBackend {
     /// off (the GEMM mode is left as it is, like `with_amp(false)`).  `Some`
     /// selects `GemmMode::Fp16` or `GemmMode::Bf16` to match.
     ///
-    /// Only the GEMM path is format-aware so far: the AMP activation kernels
-    /// still read and write f16, so `Some(Bf16)` is not usable for training
-    /// until `plan_bf16.md` Tasks 4 to 6 land.
     pub fn with_amp_format(mut self, format: Option<HalfFormat>) -> Self {
         self.amp = format.is_some();
         if let Some(f) = format {
@@ -148,7 +145,7 @@ impl OxideBackend {
         if t.is_half() {
             return Ok(t.clone());
         }
-        Ok(self.wrap_half(self.f32_to_f16(t, false)?))
+        Ok(self.wrap_half(self.to_half(t, self.half_fmt)?))
     }
 
     /// Wraps an f16 tensor as a (half-storage) trait tensor.
@@ -169,7 +166,7 @@ impl OxideBackend {
                 buf: h.clone(),
                 shape: t.shape.clone(),
             }),
-            None => self.f32_to_f16(t, false),
+            None => self.to_half(t, self.half_fmt),
         }
     }
 
@@ -182,10 +179,13 @@ impl OxideBackend {
         match &t.half {
             None => Ok(Cow::Borrowed(t)),
             Some(h) => {
-                let wide = self.f16_to_f32(&OxideTensorF16 {
-                    buf: h.clone(),
-                    shape: t.shape.clone(),
-                })?;
+                let wide = self.from_half(
+                    &OxideTensorF16 {
+                        buf: h.clone(),
+                        shape: t.shape.clone(),
+                    },
+                    self.half_fmt,
+                )?;
                 Ok(Cow::Owned(wide))
             }
         }
@@ -229,7 +229,7 @@ impl OxideBackend {
                 return Ok(e.half.clone());
             }
         }
-        let half = self.conv_weights_f16(w, filters, per_filter)?;
+        let half = self.conv_weights_half(w, filters, per_filter, self.half_fmt)?;
         let mut cache = self
             .amp_w16
             .lock()
@@ -388,6 +388,7 @@ impl OxideBackend {
                         g.pad,
                         g.oh,
                         g.ow,
+                        self.half_format().code(),
                     )
                 }
                 .map_err(launch_err)?;
@@ -539,6 +540,7 @@ impl OxideBackend {
                 &mut out,
                 channels,
                 channel_stride,
+                self.half_format().code(),
             )
         }
         .map_err(launch_err)?;
@@ -572,6 +574,7 @@ impl OxideBackend {
                 channels,
                 channel_stride,
                 row_groups,
+                self.half_format().code(),
             )
         }
         .map_err(launch_err)?;
@@ -595,6 +598,7 @@ impl OxideBackend {
                 &xh.buf,
                 &mut out,
                 activation_code(activation),
+                self.half_format().code(),
             )
         }
         .map_err(launch_err)?;
@@ -621,6 +625,7 @@ impl OxideBackend {
                 &dh.buf,
                 &mut out,
                 activation_code(activation),
+                self.half_format().code(),
             )
         }
         .map_err(launch_err)?;
@@ -644,6 +649,7 @@ impl OxideBackend {
                 &xh.buf,
                 &yh.buf,
                 &mut out,
+                self.half_format().code(),
             )
         }
         .map_err(launch_err)?;
@@ -703,6 +709,7 @@ impl OxideBackend {
                 stride_x,
                 stride_y,
                 padding / 2,
+                self.half_format().code(),
             )
         }
         .map_err(launch_err)?;
@@ -752,6 +759,7 @@ impl OxideBackend {
                 output_width,
                 stride,
                 scale,
+                self.half_format().code(),
             )
         }
         .map_err(launch_err)?;
@@ -876,6 +884,7 @@ impl OxideBackend {
                 channels,
                 stride,
                 row_groups,
+                self.half_format().code(),
             )
         }
         .map_err(launch_err)?;
@@ -897,6 +906,7 @@ impl OxideBackend {
                 channels,
                 stride,
                 row_groups,
+                self.half_format().code(),
             )
         }
         .map_err(launch_err)?;
@@ -938,6 +948,7 @@ impl OxideBackend {
                 &mut out,
                 channels,
                 stride,
+                self.half_format().code(),
             )
         }
         .map_err(launch_err)?;
@@ -983,6 +994,7 @@ impl OxideBackend {
                 channels,
                 stride,
                 row_groups,
+                self.half_format().code(),
             )
         }
         .map_err(launch_err)?;
@@ -998,6 +1010,7 @@ impl OxideBackend {
                 channels,
                 stride,
                 row_groups,
+                self.half_format().code(),
             )
         }
         .map_err(launch_err)?;
@@ -1018,6 +1031,7 @@ impl OxideBackend {
                 channels,
                 stride,
                 n,
+                self.half_format().code(),
             )
         }
         .map_err(launch_err)?;

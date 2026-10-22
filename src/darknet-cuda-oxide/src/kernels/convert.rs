@@ -98,6 +98,7 @@ pub mod kernels {
         cols: usize,
         ld: usize,
         sat: u32,
+        fmt: u32,
     ) {
         let idx = thread::index_1d();
         let i = idx.get();
@@ -105,7 +106,7 @@ pub mod kernels {
             let r = i / ld;
             let c = i % ld;
             *o = if c < cols {
-                f32_to_f16_bits(x[r * cols + c], sat)
+                if fmt == 0 { f32_to_f16_bits(x[r * cols + c], sat) } else { f32_to_bf16_bits(x[r * cols + c]) }
             } else {
                 0
             };

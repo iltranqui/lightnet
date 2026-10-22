@@ -14,8 +14,8 @@
 //! master weights.  No dataset, no real training.
 
 use darknet_cuda::{AdamParams, ElementwiseLaunchConfig, F32ActivationKind, F32TensorOpsBackend};
-use darknet_cuda_oxide::half::{f16_bits_to_f32, f32_to_f16_bits};
-use darknet_cuda_oxide::{GemmMode, OxideBackend, OxideTensorF32};
+use darknet_cuda_oxide::half::{bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits};
+use darknet_cuda_oxide::{GemmMode, HalfFormat, OxideBackend, OxideTensorF32};
 
 struct Rng(u64);
 
@@ -37,8 +37,23 @@ fn cfg() -> ElementwiseLaunchConfig {
     ElementwiseLaunchConfig::default()
 }
 
+/// The 16-bit format the AMP suite runs in: `DARKNET_TEST_AMP_FMT=bf16` runs
+/// every AMP test in bf16, anything else in f16.
+fn test_fmt() -> HalfFormat {
+    match std::env::var("DARKNET_TEST_AMP_FMT").as_deref() {
+        Ok("bf16") => HalfFormat::Bf16,
+        _ => HalfFormat::F16,
+    }
+}
+
+/// bf16 keeps 8 significant bits against f16's 11, so every error bound is 8x
+/// the f16 bound (stated once, here).
+fn bf16_gradient_bounds_are_8x_f16() -> f64 {
+    if test_fmt() == HalfFormat::Bf16 { 8.0 } else { 1.0 }
+}
+
 fn amp_backend() -> OxideBackend {
-    OxideBackend::new().expect("backend").with_amp(true)
+    OxideBackend::new().expect("backend").with_amp_format(Some(test_fmt()))
 }
 
 fn f32_backend() -> OxideBackend {
@@ -46,7 +61,10 @@ fn f32_backend() -> OxideBackend {
 }
 
 fn r16(v: &[f32]) -> Vec<f32> {
-    v.iter().map(|&x| f16_bits_to_f32(f32_to_f16_bits(x))).collect()
+    match test_fmt() {
+        HalfFormat::F16 => v.iter().map(|&x| f16_bits_to_f32(f32_to_f16_bits(x))).collect(),
+        HalfFormat::Bf16 => v.iter().map(|&x| bf16_bits_to_f32(f32_to_bf16_bits(x))).collect(),
+    }
 }
 
 fn f64s(v: &[f32]) -> Vec<f64> {
@@ -80,6 +98,7 @@ fn nerr(got: &[f32], want: &[f64]) -> f64 {
 
 #[track_caller]
 fn check(name: &str, got: &[f32], want: &[f64], bound: f64) -> f64 {
+    let bound = bound * bf16_gradient_bounds_are_8x_f16();
     let e = nerr(got, want);
     println!("{name}: nerr {e:.3e} (bound {bound:.1e})");
     assert!(e <= bound, "{name}: nerr {e:.3e} exceeds {bound:.1e}");
@@ -708,11 +727,11 @@ fn amp_gradients_track_f32_gradients_on_tiny_conv_bn_net() {
     // forward head output
     let e_out = rel(&out_amp, &out32);
     println!("tiny net head output: nerr {e_out:.3e}");
-    assert!(e_out <= 1e-2, "head output error {e_out:.3e}");
+    assert!(e_out <= 1e-2 * bf16_gradient_bounds_are_8x_f16(), "head output error {e_out:.3e}");
     let mut worst = 0.0f64;
     for (name, e) in grad_errors(&g_amp, &g32) {
         println!("tiny net {name}: nerr {e:.3e}");
-        assert!(e <= NET_GRAD_BOUND, "{name}: nerr {e:.3e} > {NET_GRAD_BOUND:.1e}");
+        assert!(e <= NET_GRAD_BOUND * bf16_gradient_bounds_are_8x_f16(), "{name}: nerr {e:.3e} > {NET_GRAD_BOUND:.1e}");
         worst = worst.max(e);
     }
     println!("tiny net worst gradient nerr {worst:.3e} (bound {NET_GRAD_BOUND:.1e})");
@@ -744,7 +763,7 @@ fn amp_loss_scale_is_neutral_on_gradients() {
     let (_, g2, _) = forward_backward(&amp, &pamp, &x, &target, 512.0);
     for (name, e) in grad_errors(&g1, &g2) {
         println!("loss scale 64 vs 512 {name}: nerr {e:.3e}");
-        assert!(e <= 1e-2, "{name}: {e:.3e}");
+        assert!(e <= 1e-2 * bf16_gradient_bounds_are_8x_f16(), "{name}: {e:.3e}");
     }
 }
 
@@ -758,6 +777,11 @@ fn amp_overflowing_gradients_become_nonfinite_not_garbage() {
     let act_in = up_half(&be, &[B, 6, HW, HW], &vec![0.5f32; B * 6 * HW * HW]);
     let huge = up(&be, &[B, 6, HW, HW], &vec![1.0e7f32; B * 6 * HW * HW]);
     let d = be.activation_backward_f32(&act_in, &huge, F32ActivationKind::Linear, cfg()).unwrap();
+    if test_fmt() == HalfFormat::Bf16 {
+        // amp_bf16_does_not_overflow_where_f16_does: 1e7 is far below the bf16 max.
+        assert!(down(&be, &d).iter().all(|v| v.is_finite()), "1e7 must stay finite in bf16");
+        return;
+    }
     assert!(down(&be, &d).iter().all(|v| v.is_infinite()), "1e7 must overflow f16 to Inf");
     let inp = up_half(&be, &[B, 8, HW, HW], &rng.vec(B * 8 * HW * HW, -1.0, 1.0));
     let dw = be.conv2d_backward_weights_f32(&inp, &d, &W_SHAPES[3], 8, HW, HW, 6, 1, 1, 1, 1, 0, 1, cfg()).unwrap();
@@ -846,7 +870,7 @@ fn amp_sgd_steps_track_f32_master_weights() {
     assert!(l32.last().unwrap() < &l32[0], "f32 loss must decrease");
     assert!(lamp.last().unwrap() < &lamp[0], "AMP loss must decrease");
     for (i, (a, b)) in lamp.iter().zip(&l32).enumerate() {
-        assert!((a - b).abs() <= 0.02 * b.abs().max(1e-6), "step {i}: loss amp {a} vs f32 {b}");
+        assert!((a - b).abs() <= 0.02 * bf16_gradient_bounds_are_8x_f16() * b.abs().max(1e-6), "step {i}: loss amp {a} vs f32 {b}");
     }
     let init: Vec<Vec<f32>> = {
         let mut v: Vec<Vec<f32>> = p0.w.iter().map(|t| down(&f32be, t)).collect();
@@ -863,7 +887,7 @@ fn amp_sgd_steps_track_f32_master_weights() {
         let diff = fin32.iter().zip(finamp).fold(0.0f64, |m, (a, b)| m.max((a - b).abs() as f64));
         let ratio = diff / travelled;
         println!("sgd {name}: |w_amp - w_f32|inf / travelled {ratio:.3e}");
-        assert!(ratio <= SGD_TRACK_BOUND, "{name}: {ratio:.3e} > {SGD_TRACK_BOUND}");
+        assert!(ratio <= SGD_TRACK_BOUND * bf16_gradient_bounds_are_8x_f16(), "{name}: {ratio:.3e} > {SGD_TRACK_BOUND}");
         worst = worst.max(ratio);
     }
     println!("sgd worst tracking ratio {worst:.3e} (bound {SGD_TRACK_BOUND})");
@@ -974,7 +998,7 @@ fn amp_adam_steps_track_f32_master_weights() {
     assert!(lamp.last().unwrap() < &lamp[0], "AMP Adam loss must decrease");
     for (i, (a, b)) in lamp.iter().zip(&l32).enumerate() {
         assert!(
-            (a - b).abs() <= 0.02 * b.abs().max(1e-6),
+            (a - b).abs() <= 0.02 * bf16_gradient_bounds_are_8x_f16() * b.abs().max(1e-6),
             "step {i}: loss amp {a} vs f32 {b}"
         );
     }
@@ -999,7 +1023,7 @@ fn amp_adam_steps_track_f32_master_weights() {
         // Adam barely moves some tensors, so allow the f16 storage rounding
         // floor (2% of the initial magnitude) on top of the 10%-of-travel term.
         let scale = init[t].iter().fold(1e-6f64, |m, a| m.max(a.abs() as f64));
-        let bound = 0.10 * travelled + 0.02 * scale;
+        let bound = bf16_gradient_bounds_are_8x_f16() * (0.10 * travelled + 0.02 * scale);
         println!("adam {name}: |w_amp - w_f32|inf {diff:.3e} bound {bound:.3e}");
         assert!(diff <= bound, "adam {name}: {diff:.3e} > {bound:.3e}");
     }

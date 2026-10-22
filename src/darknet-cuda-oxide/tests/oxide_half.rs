@@ -885,3 +885,21 @@ fn gemm_bf16_with_bf16_output_matches_reference() {
         }
     }
 }
+
+/// An f16-only inference op on a bf16 backend must fail loudly instead of
+/// reading bf16 bits as binary16.
+#[test]
+fn bf16_mode_rejects_f16_only_inference_ops() {
+    use darknet_cuda_oxide::HalfFormat;
+    let be = OxideBackend::new().expect("backend").with_amp_format(Some(HalfFormat::Bf16));
+    let x = be.upload_f16(&[4], &[0.5, 1.0, -1.0, 2.0]).unwrap();
+    let err = be
+        .gelu_erf_f16(&x, &[4], ElementwiseLaunchConfig::default())
+        .err()
+        .expect("gelu_erf_f16 must be rejected in bf16 mode");
+    assert!(err.to_string().contains("bf16"), "{err}");
+    // The same op still works in f16 mode.
+    let f16 = OxideBackend::new().expect("backend").with_amp_format(Some(HalfFormat::F16));
+    let x = f16.upload_f16(&[4], &[0.5, 1.0, -1.0, 2.0]).unwrap();
+    f16.gelu_erf_f16(&x, &[4], ElementwiseLaunchConfig::default()).unwrap();
+}

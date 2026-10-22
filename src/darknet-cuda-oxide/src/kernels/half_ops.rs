@@ -4,7 +4,7 @@
 //! to nearest even (data movement ops are bit copies).
 
 use super::activations::{activate, exact_gelu_value};
-use super::convert::{f16_bits_to_f32, f32_to_f16_bits};
+use super::convert::{f16_bits_to_f32, f32_to_f16_bits, f32_to_half_bits, half_bits_to_f32};
 use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
 
 #[cuda_module]
@@ -88,6 +88,7 @@ pub mod kernels {
         stride_x: usize,
         stride_y: usize,
         off: usize,
+        fmt: u32,
     ) {
         let idx = thread::index_1d();
         let i = idx.get();
@@ -110,7 +111,7 @@ pub mod kernels {
                     let ix = x0 + kx as i64;
                     if ix >= 0 && ix < w as i64 {
                         let bits = x[plane + iy as usize * w + ix as usize];
-                        let v = f16_bits_to_f32(bits);
+                        let v = half_bits_to_f32(bits, fmt);
                         if v > best {
                             best = v;
                             best_bits = bits;
@@ -173,6 +174,7 @@ pub mod kernels {
         out_w: usize,
         stride: usize,
         scale: f32,
+        fmt: u32,
     ) {
         let idx = thread::index_1d();
         let i = idx.get();
@@ -189,7 +191,7 @@ pub mod kernels {
             *o = if scale == 1.0 {
                 bits
             } else {
-                f32_to_f16_bits(scale * f16_bits_to_f32(bits), 0)
+                f32_to_half_bits(scale * half_bits_to_f32(bits, fmt), fmt)
             };
         }
     }

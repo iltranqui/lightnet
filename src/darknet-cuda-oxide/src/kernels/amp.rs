@@ -8,17 +8,12 @@
 //! Per-channel statistics, scales, biases and weight gradients stay f32.
 
 use super::activations::{activate, gradient};
-use super::convert::{f16_bits_to_f32 as h2f, f32_to_f16_bits};
+use super::convert::{f32_to_half_bits, half_bits_to_f32};
 use super::pool::first_window;
 use cuda_device::{DisjointSlice, cuda_module, device, kernel, thread};
 
 /// Must equal `batchnorm.rs` / `darknet_cuda::host_ops::BATCH_NORM_EPSILON`.
 const EPSILON: f32 = 0.000_01;
-
-#[device]
-fn f2h(x: f32) -> u16 {
-    f32_to_f16_bits(x, 0)
-}
 
 /// `window_argmax` of `pool.rs` reading f16 (same window rule, strict `>`).
 #[device]
@@ -33,6 +28,7 @@ fn window_argmax_h(
     stride_x: usize,
     stride_y: usize,
     off: usize,
+    fmt: u32,
 ) -> usize {
     let y0 = (oy * stride_y) as i64 - off as i64;
     let x0 = (ox * stride_x) as i64 - off as i64;
@@ -47,7 +43,7 @@ fn window_argmax_h(
                 let ix = x0 + kx as i64;
                 if ix >= 0 && ix < w as i64 {
                     let idx = plane + iy as usize * w + ix as usize;
-                    let v = h2f(x[idx]);
+                    let v = half_bits_to_f32(x[idx], fmt);
                     if v > best {
                         best = v;
                         best_i = idx;
@@ -73,21 +69,22 @@ pub mod kernels {
         mut out: DisjointSlice<u16>,
         channels: usize,
         channel_stride: usize,
+        fmt: u32,
     ) {
         let idx = thread::index_1d();
         let i = idx.get();
         if let Some(o) = out.get_mut(idx) {
             let c = (i / channel_stride) % channels;
-            *o = f2h(h2f(x[i]) + bias[c]);
+            *o = f32_to_half_bits(half_bits_to_f32(x[i], fmt) + bias[c], fmt);
         }
     }
 
     #[kernel]
-    pub fn amp_activation(x: &[u16], mut out: DisjointSlice<u16>, kind: u32) {
+    pub fn amp_activation(x: &[u16], mut out: DisjointSlice<u16>, kind: u32, fmt: u32) {
         let idx = thread::index_1d();
         let i = idx.get();
         if let Some(o) = out.get_mut(idx) {
-            *o = f2h(activate(kind, h2f(x[i])));
+            *o = f32_to_half_bits(activate(kind, half_bits_to_f32(x[i], fmt)), fmt);
         }
     }
 
@@ -98,20 +95,21 @@ pub mod kernels {
         delta: &[u16],
         mut out: DisjointSlice<u16>,
         kind: u32,
+        fmt: u32,
     ) {
         let idx = thread::index_1d();
         let i = idx.get();
         if let Some(o) = out.get_mut(idx) {
-            *o = f2h(h2f(delta[i]) * gradient(kind, h2f(x[i])));
+            *o = f32_to_half_bits(half_bits_to_f32(delta[i], fmt) * gradient(kind, half_bits_to_f32(x[i], fmt)), fmt);
         }
     }
 
     #[kernel]
-    pub fn amp_vector_add(x: &[u16], y: &[u16], mut out: DisjointSlice<u16>) {
+    pub fn amp_vector_add(x: &[u16], y: &[u16], mut out: DisjointSlice<u16>, fmt: u32) {
         let idx = thread::index_1d();
         let i = idx.get();
         if let Some(o) = out.get_mut(idx) {
-            *o = f2h(h2f(x[i]) + h2f(y[i]));
+            *o = f32_to_half_bits(half_bits_to_f32(x[i], fmt) + half_bits_to_f32(y[i], fmt), fmt);
         }
     }
 
@@ -123,6 +121,7 @@ pub mod kernels {
         channels: usize,
         channel_stride: usize,
         row_groups: usize,
+        fmt: u32,
     ) {
         let idx = thread::index_1d();
         let gid = idx.get();
@@ -135,7 +134,7 @@ pub mod kernels {
                 let base = (g * channels + c) * channel_stride;
                 let mut s = t;
                 while s < channel_stride {
-                    sum += h2f(x[base + s]);
+                    sum += half_bits_to_f32(x[base + s], fmt);
                     s += 256;
                 }
                 g += 1;
@@ -153,6 +152,7 @@ pub mod kernels {
         channels: usize,
         channel_stride: usize,
         row_groups: usize,
+        fmt: u32,
     ) {
         let idx = thread::index_1d();
         let gid = idx.get();
@@ -166,7 +166,7 @@ pub mod kernels {
                 let base = (g * channels + c) * channel_stride;
                 let mut s = t;
                 while s < channel_stride {
-                    let d = h2f(x[base + s]) - m;
+                    let d = half_bits_to_f32(x[base + s], fmt) - m;
                     sum += d * d;
                     s += 256;
                 }
@@ -185,6 +185,7 @@ pub mod kernels {
         channels: usize,
         channel_stride: usize,
         row_groups: usize,
+        fmt: u32,
     ) {
         let idx = thread::index_1d();
         let gid = idx.get();
@@ -197,7 +198,7 @@ pub mod kernels {
                 let base = (g * channels + c) * channel_stride;
                 let mut s = t;
                 while s < channel_stride {
-                    sum += h2f(a[base + s]) * h2f(b[base + s]);
+                    sum += half_bits_to_f32(a[base + s], fmt) * half_bits_to_f32(b[base + s], fmt);
                     s += 256;
                 }
                 g += 1;
@@ -219,6 +220,7 @@ pub mod kernels {
         mut out: DisjointSlice<u16>,
         channels: usize,
         channel_stride: usize,
+        fmt: u32,
     ) {
         let idx = thread::index_1d();
         let i = idx.get();
@@ -226,12 +228,12 @@ pub mod kernels {
             return;
         }
         let c = (i / channel_stride) % channels;
-        let h = (h2f(x[i]) - mean[c]) / (variance[c] + EPSILON).sqrt();
+        let h = (half_bits_to_f32(x[i], fmt) - mean[c]) / (variance[c] + EPSILON).sqrt();
         if let Some(o) = x_hat.get_mut(idx) {
-            *o = f2h(h);
+            *o = f32_to_half_bits(h, fmt);
         }
         if let Some(o) = out.get_mut(thread::index_1d()) {
-            *o = f2h(h * scale[c] + bias[c]);
+            *o = f32_to_half_bits(h * scale[c] + bias[c], fmt);
         }
     }
 
@@ -248,6 +250,7 @@ pub mod kernels {
         channels: usize,
         channel_stride: usize,
         n: f32,
+        fmt: u32,
     ) {
         let idx = thread::index_1d();
         let i = idx.get();
@@ -257,8 +260,8 @@ pub mod kernels {
         let c = (i / channel_stride) % channels;
         let inv_std = 1.0 / (variance[c] + EPSILON).sqrt();
         if let Some(o) = dx.get_mut(idx) {
-            *o = f2h(scale[c] * inv_std / n
-                * (n * h2f(dy[i]) - sum_dy[c] - h2f(x_hat[i]) * sum_dy_xhat[c]));
+            *o = f32_to_half_bits(scale[c] * inv_std / n
+                * (n * half_bits_to_f32(dy[i], fmt) - sum_dy[c] - half_bits_to_f32(x_hat[i], fmt) * sum_dy_xhat[c]), fmt);
         }
     }
 
@@ -281,6 +284,7 @@ pub mod kernels {
         padding: usize,
         out_h: usize,
         out_w: usize,
+        fmt: u32,
     ) {
         let gi = thread::index_1d().get();
         let plane = channels * h * w;
@@ -321,7 +325,7 @@ pub mod kernels {
         }
         // SAFETY: one thread per input element; `gi < dx.len()`.
         unsafe {
-            *dx.as_mut_ptr().add(dx_base + gi) = f2h(sum);
+            *dx.as_mut_ptr().add(dx_base + gi) = f32_to_half_bits(sum, fmt);
         }
     }
 
@@ -339,6 +343,7 @@ pub mod kernels {
         stride_x: usize,
         stride_y: usize,
         off: usize,
+        fmt: u32,
     ) {
         let idx = thread::index_1d();
         let i = idx.get();
@@ -376,16 +381,17 @@ pub mod kernels {
                     stride_x,
                     stride_y,
                     off,
+                    fmt,
                 );
                 if best == i {
-                    sum += h2f(dy[(bc * out_h + oy as usize) * out_w + ox as usize]);
+                    sum += half_bits_to_f32(dy[(bc * out_h + oy as usize) * out_w + ox as usize], fmt);
                 }
                 ox += 1;
             }
             oy += 1;
         }
         if let Some(o) = dx.get_mut(idx) {
-            *o = f2h(sum);
+            *o = f32_to_half_bits(sum, fmt);
         }
     }
 
@@ -401,6 +407,7 @@ pub mod kernels {
         out_w: usize,
         stride: usize,
         scale: f32,
+        fmt: u32,
     ) {
         let idx = thread::index_1d();
         let i = idx.get();
@@ -421,7 +428,7 @@ pub mod kernels {
                 while kx < stride {
                     let ox = ix * stride + kx;
                     if ox < out_w {
-                        sum += h2f(dy[(bc * out_h + oy) * out_w + ox]);
+                        sum += half_bits_to_f32(dy[(bc * out_h + oy) * out_w + ox], fmt);
                     }
                     kx += 1;
                 }
@@ -429,7 +436,7 @@ pub mod kernels {
             ky += 1;
         }
         if let Some(o) = dx.get_mut(idx) {
-            *o = f2h(scale * sum);
+            *o = f32_to_half_bits(scale * sum, fmt);
         }
     }
 }

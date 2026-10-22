@@ -326,6 +326,17 @@ impl OxideBackend {
         filters: usize,
         per_filter: usize,
     ) -> Result<OxideTensorF16, OxideError> {
+        self.conv_weights_half(w, filters, per_filter, HalfFormat::F16)
+    }
+
+    /// [`Self::conv_weights_f16`] in the 16-bit format `fmt`.
+    pub fn conv_weights_half(
+        &self,
+        w: &OxideTensorF32,
+        filters: usize,
+        per_filter: usize,
+        fmt: HalfFormat,
+    ) -> Result<OxideTensorF16, OxideError> {
         if filters == 0 || per_filter == 0 || w.len() != filters * per_filter {
             return Err(shape_err(
                 "conv_weights_f16",
@@ -344,10 +355,22 @@ impl OxideBackend {
                 per_filter,
                 kpad,
                 0,
+                fmt.code(),
             )
         }
         .map_err(launch_err)?;
         Ok(OxideTensorF16::new(out, &[filters, kpad]))
+    }
+
+    /// Inference-only f16 kernels read and write binary16; in bf16 mode they
+    /// would reinterpret bf16 bits, so they refuse instead.
+    pub(crate) fn require_f16(&self, op: &str) -> Result<(), OxideError> {
+        if self.half_fmt == HalfFormat::Bf16 {
+            return Err(OxideError::Shape(format!(
+                "{op}: f16-only inference op, not available in bf16 mode"
+            )));
+        }
+        Ok(())
     }
 
     // ---- GEMM ------------------------------------------------------------
@@ -519,7 +542,7 @@ impl OxideBackend {
         out: HOut,
         g: &GemmArgs,
     ) -> Result<(), OxideError> {
-        self.hgemm_ex(a, b, out, g, false)
+        self.hgemm_ex(a, b, out, g, self.half_fmt == HalfFormat::Bf16)
     }
 
     /// [`Self::hgemm`] with the operand format selectable: `bf16` reads the
@@ -1034,6 +1057,7 @@ impl OxideBackend {
         input_channels: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
+        self.require_f16("maxpool_depth_f16")?;
         if x.shape().len() != 4
             || output_shape.len() != 4
             || input_channels == 0
@@ -1082,6 +1106,7 @@ impl OxideBackend {
         activation: F32ActivationKind,
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
+        self.require_f16("connected_f16")?;
         if input_shape.len() != 4 || output_shape.len() != 4 || input.shape() != input_shape {
             return Err(shape_err(
                 "connected_f16",
@@ -1182,6 +1207,7 @@ impl OxideBackend {
                 stride_x,
                 stride_y,
                 padding / 2,
+                self.half_fmt.code(),
             )
         }
         .map_err(launch_err)?;
@@ -1254,6 +1280,7 @@ impl OxideBackend {
         // the shape checks above (reverse additionally bounds-checks taps).
         unsafe {
             if reverse {
+                self.require_f16("upsample_f16 reverse")?;
                 self.half_ops.upsample_reverse_f16(
                     &self.stream,
                     launch::elementwise(out.len(), config),
@@ -1278,6 +1305,7 @@ impl OxideBackend {
                     out_w,
                     stride,
                     scale,
+                    self.half_fmt.code(),
                 )
             }
         }
@@ -1300,6 +1328,7 @@ impl OxideBackend {
         padding: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
+        self.require_f16("local_avgpool_f16")?;
         let (_, out_h, out_w) = pool_layout(
             "local_avgpool_f16",
             x.len(),
@@ -1343,6 +1372,7 @@ impl OxideBackend {
         input_width: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
+        self.require_f16("avgpool_f16")?;
         let op = "avgpool_f16";
         let area = input_height * input_width;
         if output_shape.len() != 4
@@ -1389,6 +1419,7 @@ impl OxideBackend {
         output_shape: &[usize],
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
+        self.require_f16("shortcut_fit_f16")?;
         let out_len: usize = output_shape.iter().product();
         if batch == 0
             || x.len() % batch != 0
@@ -1428,6 +1459,7 @@ impl OxideBackend {
         activation: F32ActivationKind,
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
+        self.require_f16("shortcut_add_act_f16")?;
         if a.len() != b.len() {
             return Err(shape_err(
                 "shortcut_add_act_f16",
@@ -1458,6 +1490,7 @@ impl OxideBackend {
         normalization: F32ChannelNormalization,
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
+        self.require_f16("normalize_channels_f16")?;
         if shape.len() != 4
             || input.shape() != shape
             || input.len() != shape.iter().product::<usize>()
@@ -1505,6 +1538,7 @@ impl OxideBackend {
         activation: F32ActivationKind,
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
+        self.require_f16("scale_channels_f16")?;
         let valid_shapes = input_shape.len() == 4
             && output_shape.len() == 4
             && input.shape() == input_shape
@@ -1563,6 +1597,7 @@ impl OxideBackend {
         activation: F32ActivationKind,
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
+        self.require_f16("sam_f16")?;
         if input.shape() != output_shape || source.shape() != output_shape {
             return Err(shape_err(
                 "sam_f16",
@@ -1595,6 +1630,7 @@ impl OxideBackend {
         groups: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
+        self.require_f16("channel_shuffle_f16")?;
         if x.shape() != output_shape
             || output_shape.len() != 4
             || channels == 0
@@ -1639,6 +1675,7 @@ impl OxideBackend {
         marker_shape: &[usize],
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
+        self.require_f16("laya_act_features_f16")?;
         let layout =
             darknet_cuda::host_ops::laya_act::Layout::new(head_shape, scorer_shape, marker_shape)
                 .map_err(|err| shape_err("laya_act_features_f16", err))?;
@@ -1683,6 +1720,7 @@ impl OxideBackend {
         shape: &[usize],
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
+        self.require_f16("gelu_erf_f16")?;
         if x.shape() != shape || x.len() != shape.iter().product::<usize>() {
             return Err(shape_err(
                 "gelu_erf_f16",
@@ -1711,6 +1749,7 @@ impl OxideBackend {
         groups: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
+        self.require_f16("softmax_f16")?;
         if shape.len() != 4
             || x.shape() != shape
             || x.len() != shape.iter().product::<usize>()
@@ -1756,6 +1795,7 @@ impl OxideBackend {
         groups: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
+        self.require_f16("softmax_channel_major_f16")?;
         if shape.len() != 4
             || x.shape() != shape
             || x.len() != shape.iter().product::<usize>()
@@ -1799,6 +1839,7 @@ impl OxideBackend {
         softmax_classes: bool,
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
+        self.require_f16("region_forward_f16")?;
         if shape.len() != 4
             || x.shape() != shape
             || x.len() != shape.iter().product::<usize>()
@@ -1848,6 +1889,7 @@ impl OxideBackend {
         reverse: bool,
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
+        self.require_f16("reorg_f16")?;
         let dims = darknet_cuda::host_ops::reorg_dims(input_shape, output_shape, stride, reverse)
             .map_err(|message| shape_err("reorg_f16", message))?;
         let to_small = !reverse;
@@ -1914,6 +1956,7 @@ impl OxideBackend {
         activation: F32ActivationKind,
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF16, OxideError> {
+        self.require_f16("channel_affine_act_f16")?;
         let op = "channel_affine_act_f16";
         if channels == 0 || channel_stride == 0 || x.len() % (channels * channel_stride) != 0 {
             return Err(shape_err(
