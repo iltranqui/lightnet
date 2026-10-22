@@ -324,16 +324,36 @@ pub mod kernels {
         let _ = atomic.fetch_max(magnitude.to_bits(), AtomicOrdering::Relaxed);
     }
 
-    /// `out[i] = quantize(x[i] * scale, fmt)`, elementwise.
+    /// `out[0] = max_finite(fmt) / amax` and `out[1] = 1 / out[0]` from the
+    /// amax slot, falling back to `1, 1` when amax is zero or non-finite.
+    /// Launched with two threads, one per output word.
     #[kernel]
-    pub fn fp8_quantize_kernel(x: &[f32], mut out: DisjointSlice<u8>, scale: f32, fmt: u32) {
+    pub fn fp8_scale_kernel(amax: &[u32], mut out: DisjointSlice<f32>, fmt: u32) {
+        let idx = thread::index_1d();
+        let word = idx.get();
+        let amax = f32::from_bits(amax[0]);
+        let max_finite = if fmt == 0 { 448.0 } else { 57344.0 };
+        let factor = if amax > 0.0 && amax.is_finite() {
+            max_finite / amax
+        } else {
+            1.0
+        };
+        if let Some(o) = out.get_mut(idx) {
+            *o = if word == 0 { factor } else { 1.0 / factor };
+        }
+    }
+
+    /// `out[i] = quantize(x[i] * scale[0], fmt)`, elementwise.  The factor
+    /// lives on the device so the host never reads it back.
+    #[kernel]
+    pub fn fp8_quantize_kernel(x: &[f32], mut out: DisjointSlice<u8>, scale: &[f32], fmt: u32) {
         let idx = thread::index_1d();
         let i = idx.get();
         if i >= x.len() {
             return;
         }
         if let Some(o) = out.get_mut(idx) {
-            *o = quantize_f32(x[i], scale, fmt);
+            *o = quantize_f32(x[i], scale[0], fmt);
         }
     }
 
@@ -386,6 +406,8 @@ pub mod kernels {
         kchunk: usize,
         fmt_a: u32,
         fmt_b: u32,
+        scale_a: &[f32],
+        scale_b: &[f32],
     ) {
         static mut AS: SharedArray<u8, { F8_BM * LD_A }, 16> = SharedArray::UNINIT;
         static mut BS: SharedArray<u8, { F8_BN * LD_B }, 16> = SharedArray::UNINIT;
@@ -562,6 +584,9 @@ pub mod kernels {
                         unsafe {
                             let dst = c.as_mut_ptr().add(idx);
                             let prev = if beta == 0.0 { 0.0 } else { beta * *dst };
+                            // `scale_*[1]` is the reciprocal dequantisation factor:
+                            // the mma works in the quantised domain.
+                            let alpha = alpha * scale_a[1] * scale_b[1];
                             *dst = alpha * acc[(mi * 4 + ni) * 4 + j] + prev;
                         }
                     }

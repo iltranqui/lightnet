@@ -917,3 +917,21 @@ fn fp8_backward_dgrad_and_wgrad_track_the_f32_backward() {
     assert!(worst_w > 0.0, "the FP8 wgrad must actually differ from the f32 one");
     println!("fp8 backward worst relative error: dgrad {worst_d:.4}, wgrad {worst_w:.4}");
 }
+
+#[test]
+fn fp8_gemm_does_not_read_back_to_host() {
+    // The fp8 GEMM derives its per-tensor scales on the device; a host
+    // round trip per call would stall the stream once per operand.
+    let be = OxideBackend::new().expect("backend").with_gemm_mode(GemmMode::Fp8);
+    let (m, n, k) = (256, 256, 256);
+    let mut rng = Rng(0xf8_5ca1_e0);
+    let a = rng.vec(m * k, -2.0, 2.0);
+    let b = rng.vec(k * n, -2.0, 2.0);
+    let c0 = vec![0.0f32; m * n];
+    let ta = be.upload_f32(&[m, k], &a).unwrap();
+    let tb = be.upload_f32(&[k, n], &b).unwrap();
+    let tc = be.upload_f32(&[m, n], &c0).unwrap();
+    let before = be.host_readbacks();
+    let _out = be.gemm_f32(&ta, &tb, &tc, m, n, k, false, false, 1.0, 0.0).unwrap();
+    assert_eq!(be.host_readbacks() - before, 0, "fp8 GEMM read data back to host");
+}

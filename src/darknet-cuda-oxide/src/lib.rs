@@ -16,6 +16,7 @@ pub mod mixed;
 pub mod tensor;
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cuda_core::simt::LaunchConfig;
@@ -88,6 +89,9 @@ pub struct OxideBackend {
     amp: bool,
     /// f16 copies of f32 master weights (keyed by the weight buffer identity).
     amp_w16: Mutex<Vec<mixed::W16Entry>>,
+    /// Device-to-host readbacks issued by the GEMM paths; see
+    /// [`OxideBackend::host_readbacks`].
+    host_readbacks: AtomicU64,
     /// Zero-length f32 buffer shared by every f16-storage tensor.
     empty_f32: Arc<PooledBuf>,
     /// im2col scratch of the f16 conv path and 1-element dummies for the unused
@@ -1387,6 +1391,7 @@ impl OxideBackend {
             amp_k,
             amp,
             amp_w16: Mutex::new(Vec::new()),
+            host_readbacks: AtomicU64::new(0),
             empty_f32,
             half_scratch: Mutex::new(half_scratch),
             half_col: Mutex::new(None),
@@ -1436,6 +1441,12 @@ impl OxideBackend {
         self.gemm_mode
     }
 
+    /// Count of device-to-host readbacks made by the GEMM paths so far.
+    /// Tests compare it before and after a call to pin "no readback" behaviour.
+    pub fn host_readbacks(&self) -> u64 {
+        self.host_readbacks.load(Ordering::Relaxed)
+    }
+
     /// Enable (`Some`) or disable (`None`) the FP8 dgrad / wgrad GEMMs with the
     /// given `(A format, B format)`; see [`fp8_backward_from_env`] for the env
     /// spelling and the C++ recipe this mirrors.
@@ -1469,22 +1480,29 @@ impl OxideBackend {
         self.conv_mode
     }
 
-    /// Largest finite `|x|` over the first `len` elements of a device buffer,
-    /// and the matching quantisation factor `max_finite / amax`.
+    /// `[1, 1]` on the device: the scale pair of an operand that is not
+    /// quantised here (pre-quantised bytes, or an empty operand).
+    fn unit_scale(&self) -> Result<DeviceBuffer<f32>, OxideError> {
+        Ok(DeviceBuffer::<f32>::from_host(&self.stream, &[1.0, 1.0])?)
+    }
+
+    /// Device-side `[factor, 1 / factor]` for the first `len` elements of a
+    /// device buffer, where `factor = max_finite / amax`.  The host never reads
+    /// either word: the quantiser and the mma epilogue consume them in place.
     ///
     /// Note the direction: [`fp8::amax_to_scale`] returns the C++ *divisor*
     /// `amax / max_finite`, and the quantiser multiplies, so the factor passed
     /// to the kernel is its reciprocal.  Getting this backwards maps every
     /// operand onto the bottom of the format's range (an e5m2 typical value
     /// lands below `2^-16` and is flushed) and silently destroys precision.
-    fn fp8_quant_factor(
+    fn fp8_scale_dev(
         &self,
         buf: &DeviceBuffer<f32>,
         len: usize,
         fmt: Fp8Format,
-    ) -> Result<f32, OxideError> {
+    ) -> Result<DeviceBuffer<f32>, OxideError> {
         if len == 0 {
-            return Ok(1.0);
+            return self.unit_scale();
         }
         let mut slot = DeviceBuffer::<u32>::zeroed(&self.stream, 1)?;
         // SAFETY: one thread per element; the single atomic slot is zeroed
@@ -1498,20 +1516,28 @@ impl OxideBackend {
             )
         }
         .map_err(launch_err)?;
-        let amax = f32::from_bits(slot.to_host_vec(&self.stream)?[0]);
-        if amax > 0.0 && amax.is_finite() {
-            Ok(fmt.max_finite() / amax)
-        } else {
-            Ok(1.0)
+        let mut scale = DeviceBuffer::<f32>::zeroed(&self.stream, 2)?;
+        // SAFETY: two threads, one per output word; `slot` holds the amax bits.
+        unsafe {
+            self.gemm_f8.fp8_scale_kernel(
+                &self.stream,
+                launch::elementwise(2, ElementwiseLaunchConfig::default()),
+                &slot,
+                &mut scale,
+                fmt.code(),
+            )
         }
+        .map_err(launch_err)?;
+        Ok(scale)
     }
 
-    /// Quantise a device f32 buffer to `fmt` with one multiply factor.
+    /// Quantise a device f32 buffer to `fmt`, multiplying by the device-side
+    /// factor in `scale[0]`.
     fn fp8_quantize_buffer(
         &self,
         buf: &DeviceBuffer<f32>,
         len: usize,
-        factor: f32,
+        scale: &DeviceBuffer<f32>,
         fmt: Fp8Format,
     ) -> Result<DeviceBuffer<u8>, OxideError> {
         let mut out = DeviceBuffer::<u8>::zeroed(&self.stream, len)?;
@@ -1522,7 +1548,7 @@ impl OxideBackend {
                 launch::elementwise(len, ElementwiseLaunchConfig::default()),
                 buf,
                 &mut out,
-                factor,
+                scale,
                 fmt.code(),
             )
         }
@@ -1547,17 +1573,13 @@ impl OxideBackend {
         let (br, bc) = if g.trans_b { (g.n, g.k) } else { (g.k, g.n) };
         let a_len = extent(g.a.0, g.a.1, g.a.2, g.count, ar, ac, g.lda);
         let b_len = extent(g.b.0, g.b.1, g.b.2, g.count, br, bc, g.ldb);
-        let fa = self.fp8_quant_factor(a, a_len, fmt_a)?;
-        let fb = self.fp8_quant_factor(b, b_len, fmt_b)?;
-        let aq = self.fp8_quantize_buffer(a, a_len, fa, fmt_a)?;
-        let bq = self.fp8_quantize_buffer(b, b_len, fb, fmt_b)?;
-        // The mma works in the quantised domain, so fold the two dequantisation
-        // scales into `alpha` rather than running a separate pass over `c`:
-        // `acc` holds `sum_k a_q * b_q = fa * fb * sum_k a * b` exactly, and the
-        // two factors are powers of two times one rounding each.
-        let mut scaled = *g;
-        scaled.alpha = g.alpha / (fa * fb);
-        self.gemm_fp8_args(&aq, &bq, c, &scaled, fmt_a, fmt_b)
+        let sa = self.fp8_scale_dev(a, a_len, fmt_a)?;
+        let sb = self.fp8_scale_dev(b, b_len, fmt_b)?;
+        let aq = self.fp8_quantize_buffer(a, a_len, &sa, fmt_a)?;
+        let bq = self.fp8_quantize_buffer(b, b_len, &sb, fmt_b)?;
+        // The mma works in the quantised domain: the epilogue multiplies by the
+        // device-side reciprocal factors `sa[1] * sb[1]`, so `c` needs no pass.
+        self.gemm_fp8_args(&aq, &bq, c, g, fmt_a, fmt_b, &sa, &sb)
     }
 
     /// e4m3 x e4m3, the forward format pair.
@@ -2238,7 +2260,7 @@ impl OxideBackend {
         beta: f32,
     ) -> Result<OxideTensorF32, OxideError> {
         let mut out = self.alloc_uninit(c.len())?;
-        out.copy_from_host(&self.stream, &c.buf.to_host_vec(&self.stream)?)?;
+        out.copy_from_device_async(&c.buf, &self.stream)?;
         self.gemm(
             &a.buf,
             &b.buf,
@@ -2302,6 +2324,7 @@ impl OxideBackend {
             return Ok(Vec::new());
         }
         let x = DeviceBuffer::<f32>::from_host(&self.stream, values)?;
+        let s = DeviceBuffer::<f32>::from_host(&self.stream, &[scale])?;
         let mut out = DeviceBuffer::<u8>::zeroed(&self.stream, values.len())?;
         // SAFETY: one thread per element; both buffers have `values.len()`
         // elements.
@@ -2311,7 +2334,7 @@ impl OxideBackend {
                 launch::elementwise(values.len(), ElementwiseLaunchConfig::default()),
                 &x,
                 &mut out,
-                scale,
+                &s,
                 fmt.code(),
             )
         }
@@ -2465,6 +2488,8 @@ impl OxideBackend {
         g: &GemmArgs,
         fmt_a: Fp8Format,
         fmt_b: Fp8Format,
+        scale_a: &DeviceBuffer<f32>,
+        scale_b: &DeviceBuffer<f32>,
     ) -> Result<(), OxideError> {
         let bad = |msg: &str| OxideError::Shape(format!("gemm_fp8: {msg}"));
         if g.m == 0 || g.n == 0 || g.k == 0 || g.count == 0 {
@@ -2557,6 +2582,8 @@ impl OxideBackend {
                 kchunk,
                 fmt_a.code(),
                 fmt_b.code(),
+                scale_a,
+                scale_b,
             )
         }
         .map_err(launch_err)?;
@@ -2617,6 +2644,7 @@ impl OxideBackend {
         let da = DeviceBuffer::<u8>::from_host(&self.stream, a)?;
         let db = DeviceBuffer::<u8>::from_host(&self.stream, b)?;
         let mut out = self.alloc_uninit(m * n)?;
+        let unit = self.unit_scale()?;
         self.gemm_fp8_args(
             &da,
             &db,
@@ -2636,6 +2664,8 @@ impl OxideBackend {
             },
             fmt_a,
             fmt_b,
+            &unit,
+            &unit,
         )?;
         Ok(OxideTensorF32::new(out, &[m, n]))
     }
@@ -2654,6 +2684,7 @@ impl OxideBackend {
         fmt_b: Fp8Format,
     ) -> Result<f64, OxideError> {
         let mut c = self.alloc(m * n)?;
+        let unit = self.unit_scale()?;
         let g = GemmArgs {
             m,
             n,
@@ -2664,7 +2695,7 @@ impl OxideBackend {
             ..GemmArgs::default()
         };
         self.time_gpu_ms(iters, || {
-            self.gemm_fp8_args(&*a, &*b, &mut c, &g, fmt_a, fmt_b)
+            self.gemm_fp8_args(&*a, &*b, &mut c, &g, fmt_a, fmt_b, &unit, &unit)
         })
     }
 
