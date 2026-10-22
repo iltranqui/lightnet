@@ -104,6 +104,18 @@ pub fn quantize_f32(value: f32, scale: f32, fmt: u32) -> u8 {
     }
 }
 
+/// Quantisation factor `max_finite(fmt) / amax` (`fmt` 0 = e4m3, 1 = e5m2);
+/// `1.0` when amax is zero or non-finite.
+#[device]
+pub fn fp8_factor(amax: f32, fmt: u32) -> f32 {
+    let max_finite = if fmt == 0 { 448.0 } else { 57344.0 };
+    if amax > 0.0 && amax.is_finite() {
+        max_finite / amax
+    } else {
+        1.0
+    }
+}
+
 /// One `mma.m16n8k32` with the FP8 pair selected by `fmt_a` / `fmt_b`.
 /// All 32 lanes must call it; `a` / `b` follow the layout documented above.
 #[device]
@@ -209,6 +221,12 @@ pub fn fp8_stage16(
         dst[j / 4] |= (byte as u32) << (8 * (j % 4));
     }
 }
+
+/// Block size of `fp8_amax_pair_kernel` (one tile per block).
+pub const F8_AMAX_BLOCK: usize = 256;
+/// Word offset of operand B's amax slot in the pair kernels: 32 floats = 128
+/// bytes, a separate cache line from A's slot at word 0.
+pub const F8_AMAX_B_SLOT: usize = 32;
 
 #[cuda_module]
 pub mod kernels {
@@ -357,6 +375,102 @@ pub mod kernels {
         }
         if let Some(o) = out.get_mut(idx) {
             *o = quantize_f32(x[i], factor, fmt);
+        }
+    }
+
+    /// `slots[0] = max|a[..a_len]|`, `slots[32] = max|b[..b_len]|` (non-finite
+    /// ignored) in one launch of `ceil(a_len / 256) + ceil(b_len / 256)`
+    /// blocks of 256 threads; whole blocks belong to one operand.  Each block
+    /// reduces its tile in shared memory and issues one atomic.  `slots` is 33
+    /// f32 words, zero on entry; the atomics act on the bit patterns, which
+    /// order like the values for non-negative floats.
+    #[kernel]
+    pub fn fp8_amax_pair_kernel(a: &[f32], b: &[f32], a_len: u32, b_len: u32, mut slots: DisjointSlice<f32>) {
+        static mut SH: SharedArray<u32, 256, 16> = SharedArray::UNINIT;
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SH) };
+        let tid = thread::threadIdx_x() as usize;
+        let block = thread::blockIdx_x() as usize;
+        let a_blocks = (a_len as usize).div_ceil(256);
+        let (is_b, i, len) = if block < a_blocks {
+            (false, block * 256 + tid, a_len as usize)
+        } else {
+            (true, (block - a_blocks) * 256 + tid, b_len as usize)
+        };
+        let mut bits = 0u32;
+        if i < len {
+            let value = if is_b { b[i] } else { a[i] };
+            if value.is_finite() {
+                bits = value.abs().to_bits();
+            }
+        }
+        // SAFETY: `tid < 256`, the shared array's length; every access between
+        // two barriers touches a distinct or read-only slot.
+        unsafe { sh.add(tid).write(bits) };
+        thread::sync_threads();
+        let mut stride = 128usize;
+        while stride > 0 {
+            if tid < stride {
+                let other = unsafe { sh.add(tid + stride).read() };
+                let mine = unsafe { sh.add(tid).read() };
+                if other > mine {
+                    unsafe { sh.add(tid).write(other) };
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        if tid == 0 {
+            let word = if is_b { 32 } else { 0 };
+            // SAFETY: the host passes 33 words; each slot is only touched
+            // through this atomic while the kernel runs.
+            let slot = unsafe { slots.as_mut_ptr().add(word) } as *mut u32;
+            let atomic = unsafe { DeviceAtomicU32::from_ptr(slot) };
+            let _ = atomic.fetch_max(unsafe { sh.read() }, AtomicOrdering::Relaxed);
+        }
+    }
+
+    /// Quantise `a[..a_len]` and `b[..b_len]` in one launch.  Threads
+    /// `[0, max(a_len, 2))` handle `a`, the following `max(b_len, 2)` threads
+    /// handle `b`; the first two threads of each side also write that
+    /// operand's scale pair `[factor, 1 / factor]`.  Factors come from
+    /// `amax[0]` / `amax[32]`.
+    #[kernel]
+    pub fn fp8_quantize_pair_kernel(
+        a: &[f32],
+        b: &[f32],
+        amax: &[f32],
+        mut out_a: DisjointSlice<u8>,
+        mut out_b: DisjointSlice<u8>,
+        mut scale_a: DisjointSlice<f32>,
+        mut scale_b: DisjointSlice<f32>,
+        a_len: u32,
+        b_len: u32,
+        fmt_a: u32,
+        fmt_b: u32,
+    ) {
+        let i = thread::index_1d().get();
+        let (a_len, b_len) = (a_len as usize, b_len as usize);
+        let a_span = if a_len > 2 { a_len } else { 2 };
+        // SAFETY (all raw writes below): the host sizes `out_*` to the operand
+        // lengths and `scale_*` to two words; each thread writes only the slots
+        // its own index selects, so no two threads write the same address.
+        if i < a_span {
+            let factor = fp8_factor(amax[0], fmt_a);
+            if i < 2 {
+                unsafe { scale_a.as_mut_ptr().add(i).write(if i == 0 { factor } else { 1.0 / factor }) };
+            }
+            if i < a_len {
+                unsafe { out_a.as_mut_ptr().add(i).write(quantize_f32(a[i], factor, fmt_a)) };
+            }
+        } else {
+            let j = i - a_span;
+            let factor = fp8_factor(amax[32], fmt_b);
+            if j < 2 {
+                unsafe { scale_b.as_mut_ptr().add(j).write(if j == 0 { factor } else { 1.0 / factor }) };
+            }
+            if j < b_len {
+                unsafe { out_b.as_mut_ptr().add(j).write(quantize_f32(b[j], factor, fmt_b)) };
+            }
         }
     }
 

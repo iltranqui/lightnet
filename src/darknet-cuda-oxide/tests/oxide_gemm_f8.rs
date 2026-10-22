@@ -937,6 +937,32 @@ fn fp8_gemm_does_not_read_back_to_host() {
 }
 
 #[test]
+fn fp8_pair_quantise_ignores_elements_beyond_the_gemm_extent() {
+    // The fused A+B quantiser splits the operands at their GEMM extents, not
+    // at the buffer lengths: a longer buffer must give the same bytes and
+    // scale as an exact one, and its tail must not leak into the amax.
+    let be = OxideBackend::new().expect("backend").with_gemm_mode(GemmMode::Fp8);
+    let (m, n, k) = (48, 40, 96);
+    let mut rng = Rng(0x9a1_4e7);
+    let a = rng.vec(m * k, -1.0, 1.0);
+    let b = rng.vec(k * n, -1.0, 1.0);
+    let c0 = vec![0.0f32; m * n];
+    let run = |a_in: &[f32], b_in: &[f32]| {
+        let ta = be.upload_f32(&[a_in.len()], a_in).unwrap();
+        let tb = be.upload_f32(&[b_in.len()], b_in).unwrap();
+        let tc = be.upload_f32(&[m, n], &c0).unwrap();
+        download(&be, &be.gemm_f32(&ta, &tb, &tc, m, n, k, false, false, 1.0, 0.0).unwrap())
+    };
+    let exact = run(&a, &b);
+    let mut a_long = a.clone();
+    a_long.extend(std::iter::repeat_n(1.0e6f32, 300));
+    let mut b_long = b.clone();
+    b_long.extend(std::iter::repeat_n(1.0e6f32, 300));
+    let padded = run(&a_long, &b_long);
+    assert_eq!(exact, padded, "tail beyond the extent changed the result");
+}
+
+#[test]
 fn fp8_weight_cache_hits_on_second_forward() {
     // The weight operand is quantised once and served from the cache; only
     // the activation operand is quantised on the second forward.

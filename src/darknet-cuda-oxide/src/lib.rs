@@ -1555,6 +1555,71 @@ impl OxideBackend {
         Ok((out, scale))
     }
 
+    /// Quantise two operands together: one zero-fill, one amax launch and one
+    /// quantise launch instead of two of each.  Falls back to the per-operand
+    /// path when either operand is empty.
+    #[allow(clippy::type_complexity)]
+    fn fp8_quantize_pair(
+        &self,
+        a: &DeviceBuffer<f32>,
+        a_len: usize,
+        fmt_a: Fp8Format,
+        b: &DeviceBuffer<f32>,
+        b_len: usize,
+        fmt_b: Fp8Format,
+    ) -> Result<((PooledBuf8, PooledBuf), (PooledBuf8, PooledBuf)), OxideError> {
+        if a_len == 0 || b_len == 0 {
+            return Ok((
+                self.fp8_quantize_operand(a, a_len, fmt_a)?,
+                self.fp8_quantize_operand(b, b_len, fmt_b)?,
+            ));
+        }
+        let mut slots = self.alloc(33)?;
+        // SAFETY: whole 256-thread blocks per operand tile; `slots` is zeroed
+        // and only touched through `fetch_max`.
+        let tile = gemm_f8::F8_AMAX_BLOCK;
+        let blocks = a_len.div_ceil(tile) + b_len.div_ceil(tile);
+        unsafe {
+            self.gemm_f8.fp8_amax_pair_kernel(
+                &self.stream,
+                launch::blocks_of(blocks, tile as u32),
+                a,
+                b,
+                a_len as u32,
+                b_len as u32,
+                &mut slots,
+            )
+        }
+        .map_err(launch_err)?;
+        let mut out_a = self.alloc8_uninit(a_len)?;
+        let mut out_b = self.alloc8_uninit(b_len)?;
+        let mut scale_a = self.alloc_uninit(2)?;
+        let mut scale_b = self.alloc_uninit(2)?;
+        let threads = a_len.max(2) + b_len.max(2);
+        // SAFETY: the kernel writes every byte of both outputs and both words of
+        // both scale pairs, each from a distinct thread.
+        unsafe {
+            self.gemm_f8.fp8_quantize_pair_kernel(
+                &self.stream,
+                launch::elementwise(threads, ElementwiseLaunchConfig::default()),
+                a,
+                b,
+                &slots,
+                &mut out_a,
+                &mut out_b,
+                &mut scale_a,
+                &mut scale_b,
+                a_len as u32,
+                b_len as u32,
+                fmt_a.code(),
+                fmt_b.code(),
+            )
+        }
+        .map_err(launch_err)?;
+        self.fp8_quantize_launches.fetch_add(2, Ordering::Relaxed);
+        Ok(((out_a, scale_a), (out_b, scale_b)))
+    }
+
     /// Quantised copy of a weight tensor, cached by buffer identity and format.
     /// Weight tensors are immutable (an optimizer step returns a new tensor), so
     /// the copy refreshes once per update.  Only weight tensors may use this:
@@ -1698,8 +1763,7 @@ impl OxideBackend {
         let (br, bc) = if g.trans_b { (g.n, g.k) } else { (g.k, g.n) };
         let a_len = extent(g.a.0, g.a.1, g.a.2, g.count, ar, ac, g.lda);
         let b_len = extent(g.b.0, g.b.1, g.b.2, g.count, br, bc, g.ldb);
-        let (aq, sa) = self.fp8_quantize_operand(a, a_len, fmt_a)?;
-        let (bq, sb) = self.fp8_quantize_operand(b, b_len, fmt_b)?;
+        let ((aq, sa), (bq, sb)) = self.fp8_quantize_pair(a, a_len, fmt_a, b, b_len, fmt_b)?;
         // The mma works in the quantised domain: the epilogue multiplies by the
         // device-side reciprocal factors `sa[1] * sb[1]`, so `c` needs no pass.
         self.gemm_fp8_args(&aq, &bq, c, g, fmt_a, fmt_b, &sa, &sb)
