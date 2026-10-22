@@ -31,6 +31,41 @@ pub fn f16_bits_to_f32(h: u16) -> f32 {
     cvt_f32_f16x2_lo(h as u32)
 }
 
+/// f32 -> bf16 bits, round to nearest even; NaN stays NaN, overflow stays
+/// finite up to the f32 range (bf16 has the f32 exponent).
+#[device]
+pub fn f32_to_bf16_bits(x: f32) -> u16 {
+    (cvt_bf16x2_f32(x, 0.0) & 0xFFFF) as u16
+}
+
+/// bf16 bits -> f32 (exact).
+#[device]
+pub fn bf16_bits_to_f32(h: u16) -> f32 {
+    f32::from_bits((h as u32) << 16)
+}
+
+/// 16-bit bits -> f32 for `fmt` (`0` = f16, `1` = bf16), exact.
+#[device]
+pub fn half_bits_to_f32(bits: u16, fmt: u32) -> f32 {
+    if fmt == 0 {
+        f16_bits_to_f32(bits)
+    } else {
+        bf16_bits_to_f32(bits)
+    }
+}
+
+/// f32 -> 16-bit bits for `fmt` (`0` = f16, `1` = bf16), round to nearest even.
+/// f16 overflow becomes +-Inf (no saturation), so a scaled gradient that
+/// overflows stays visible to the loss scaler.
+#[device]
+pub fn f32_to_half_bits(x: f32, fmt: u32) -> u16 {
+    if fmt == 0 {
+        f32_to_f16_bits(x, 0)
+    } else {
+        f32_to_bf16_bits(x)
+    }
+}
+
 #[cuda_module]
 pub mod kernels {
     use super::*;
@@ -74,6 +109,26 @@ pub mod kernels {
             } else {
                 0
             };
+        }
+    }
+
+    /// `out[i] = f32_to_half_bits(x[i], fmt)`; `fmt` 0 = f16, 1 = bf16.
+    #[kernel]
+    pub fn cvt_f32_to_half(x: &[f32], mut out: DisjointSlice<u16>, fmt: u32) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = out.get_mut(idx) {
+            *o = f32_to_half_bits(x[i], fmt);
+        }
+    }
+
+    /// `out[i] = half_bits_to_f32(x[i], fmt)`; `fmt` 0 = f16, 1 = bf16.
+    #[kernel]
+    pub fn cvt_half_to_f32(x: &[u16], mut out: DisjointSlice<f32>, fmt: u32) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = out.get_mut(idx) {
+            *o = half_bits_to_f32(x[i], fmt);
         }
     }
 

@@ -11,6 +11,7 @@ use darknet_cuda::{
 use std::sync::Arc;
 
 use crate::kernels::gemm_f16::{HMMA_BM, HMMA_BN, HMMA_THREADS};
+use crate::mixed::HalfFormat;
 use crate::tensor::PooledBuf16;
 use crate::{
     GemmArgs, GemmMode, OxideBackend, OxideError, OxideTensorF16, OxideTensorF32, SPLITK_MAX,
@@ -270,6 +271,45 @@ impl OxideBackend {
                     launch::elementwise(x.len(), ElementwiseLaunchConfig::default()),
                     &x.buf,
                     &mut out,
+                )
+            }
+            .map_err(launch_err)?;
+        }
+        Ok(OxideTensorF32::new(out, x.shape()))
+    }
+
+    /// f32 -> 16-bit storage in `fmt` (round to nearest even; f16 overflow
+    /// becomes +-Inf, bf16 stays finite up to the f32 range; NaN stays NaN).
+    pub fn to_half(&self, x: &OxideTensorF32, fmt: HalfFormat) -> Result<OxideTensorF16, OxideError> {
+        let mut out = self.alloc16_uninit(x.len())?;
+        if x.len() > 0 {
+            // SAFETY: one thread per element.
+            unsafe {
+                self.convert.cvt_f32_to_half(
+                    &self.stream,
+                    launch::elementwise(x.len(), ElementwiseLaunchConfig::default()),
+                    &x.buf,
+                    &mut out,
+                    fmt.code(),
+                )
+            }
+            .map_err(launch_err)?;
+        }
+        Ok(OxideTensorF16::new(out, x.shape()))
+    }
+
+    /// 16-bit storage in `fmt` -> f32 (exact).
+    pub fn from_half(&self, x: &OxideTensorF16, fmt: HalfFormat) -> Result<OxideTensorF32, OxideError> {
+        let mut out = self.alloc_uninit(x.len())?;
+        if x.len() > 0 {
+            // SAFETY: one thread per element.
+            unsafe {
+                self.convert.cvt_half_to_f32(
+                    &self.stream,
+                    launch::elementwise(x.len(), ElementwiseLaunchConfig::default()),
+                    &x.buf,
+                    &mut out,
+                    fmt.code(),
                 )
             }
             .map_err(launch_err)?;

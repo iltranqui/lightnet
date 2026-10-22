@@ -128,6 +128,50 @@ fn gpu_conversions_match_host_reference() {
     }
 }
 
+#[test]
+fn to_half_from_half_round_trip_both_formats() {
+    use darknet_cuda_oxide::HalfFormat;
+    let b = backend();
+    let vals = [
+        0.0f32, -0.0, 1.0, -1.0, 65504.0, 70000.0, -70000.0, 1.0e-8, 3.0e38, f32::INFINITY, f32::NEG_INFINITY,
+        f32::NAN, 0.1, 1.000_488_3,
+    ];
+    let x = b.upload_f32(&[vals.len()], &vals).unwrap();
+    for (fmt, host) in [
+        (HalfFormat::F16, f32_to_f16_bits as fn(f32) -> u16),
+        (HalfFormat::Bf16, f32_to_bf16_bits as fn(f32) -> u16),
+    ] {
+        let h = b.to_half(&x, fmt).unwrap();
+        let bits = b.download_f16_bits(&h).unwrap();
+        let back = b.download_f32(&b.from_half(&h, fmt).unwrap()).unwrap();
+        for (i, v) in vals.iter().enumerate() {
+            if v.is_nan() {
+                assert!(back[i].is_nan(), "{fmt:?} NaN[{i}]");
+                continue;
+            }
+            assert_eq!(bits[i], host(*v), "{fmt:?} bits of {v:e}");
+            let wide = match fmt {
+                HalfFormat::F16 => f16_bits_to_f32(bits[i]),
+                HalfFormat::Bf16 => bf16_bits_to_f32(bits[i]),
+            };
+            assert!(same_f32(back[i], wide), "{fmt:?} widen of {v:e}");
+        }
+    }
+}
+
+#[test]
+fn bf16_keeps_values_above_f16_max_finite() {
+    use darknet_cuda_oxide::HalfFormat;
+    let b = backend();
+    let x = b.upload_f32(&[3], &[70000.0, -3.0e38, 1.0e-8]).unwrap();
+    let f16 = b.download_f32(&b.from_half(&b.to_half(&x, HalfFormat::F16).unwrap(), HalfFormat::F16).unwrap()).unwrap();
+    let bf = b.download_f32(&b.from_half(&b.to_half(&x, HalfFormat::Bf16).unwrap(), HalfFormat::Bf16).unwrap()).unwrap();
+    assert!(f16[0].is_infinite(), "f16 70000 -> {}", f16[0]);
+    assert!(bf[0].is_finite() && (bf[0] - 70000.0).abs() <= 70000.0 * 4.0e-3, "bf16 70000 -> {}", bf[0]);
+    assert!(bf[1].is_finite() && bf[1] < -2.9e38, "bf16 -3e38 -> {}", bf[1]);
+    assert!(bf[2] > 0.0, "bf16 keeps 1e-8, got {}", bf[2]);
+}
+
 struct GemmCase {
     name: &'static str,
     m: usize,
