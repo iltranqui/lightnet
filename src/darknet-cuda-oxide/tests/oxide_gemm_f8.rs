@@ -935,3 +935,76 @@ fn fp8_gemm_does_not_read_back_to_host() {
     let _out = be.gemm_f32(&ta, &tb, &tc, m, n, k, false, false, 1.0, 0.0).unwrap();
     assert_eq!(be.host_readbacks() - before, 0, "fp8 GEMM read data back to host");
 }
+
+#[test]
+fn fp8_weight_cache_hits_on_second_forward() {
+    // The weight operand is quantised once and served from the cache; only
+    // the activation operand is quantised on the second forward.
+    let be = OxideBackend::new().expect("backend").with_gemm_mode(GemmMode::Fp8);
+    let (m, n, k) = (64, 96, 128);
+    let mut rng = Rng(0x7e1_9a7);
+    let w = be.upload_f32(&[m, k], &rng.vec(m * k, -1.0, 1.0)).unwrap();
+    let x = be.upload_f32(&[k, n], &rng.vec(k * n, -1.0, 1.0)).unwrap();
+    let c = be.upload_f32(&[m, n], &vec![0.0f32; m * n]).unwrap();
+
+    let before = be.fp8_quantize_launches();
+    be.gemm_f32_weights_a(&w, &x, &c, m, n, k, false, false, 1.0, 0.0).unwrap();
+    let first = be.fp8_quantize_launches() - before;
+
+    let before = be.fp8_quantize_launches();
+    be.gemm_f32_weights_a(&w, &x, &c, m, n, k, false, false, 1.0, 0.0).unwrap();
+    let second = be.fp8_quantize_launches() - before;
+
+    assert_eq!(first, 2, "first forward: weight miss + activation");
+    assert_eq!(second, 1, "second forward: activation only, weights cached");
+}
+
+#[test]
+fn fp8_weight_cache_refreshes_after_update() {
+    // An optimizer step returns a new weight tensor. The old tensor is
+    // dropped, so its cache entry must never be served for the new values.
+    let be = OxideBackend::new().expect("backend").with_gemm_mode(GemmMode::Fp8);
+    let (m, n, k) = (64, 96, 128);
+    let mut rng = Rng(0x0_9da7e);
+    let x = be.upload_f32(&[k, n], &rng.vec(k * n, -1.0, 1.0)).unwrap();
+    let c = be.upload_f32(&[m, n], &vec![0.0f32; m * n]).unwrap();
+
+    let w_old = be.upload_f32(&[m, k], &rng.vec(m * k, -1.0, 1.0)).unwrap();
+    let out_old = be.gemm_f32_weights_a(&w_old, &x, &c, m, n, k, false, false, 1.0, 0.0).unwrap();
+    let out_old = download(&be, &out_old);
+    drop(w_old);
+
+    let w_new = be.upload_f32(&[m, k], &rng.vec(m * k, -1.0, 1.0)).unwrap();
+    let before = be.fp8_quantize_launches();
+    let out_new = be.gemm_f32_weights_a(&w_new, &x, &c, m, n, k, false, false, 1.0, 0.0).unwrap();
+    let launches = be.fp8_quantize_launches() - before;
+    let out_new = download(&be, &out_new);
+
+    assert_eq!(launches, 2, "updated weights were not requantised");
+    assert_ne!(out_old, out_new, "output did not change with the weights");
+    let want = download(&be, &be.gemm_f32(&w_new, &x, &c, m, n, k, false, false, 1.0, 0.0).unwrap());
+    assert_eq!(out_new, want, "cached weights differ from the uncached fp8 path");
+}
+
+#[test]
+fn fp8_cached_weights_serve_forward_and_transposed_dgrad() {
+    // One cached copy of the weights must match the uncached fp8 GEMM for both
+    // the plain (forward) and the transposed (dgrad) use.
+    let be = OxideBackend::new().expect("backend").with_gemm_mode(GemmMode::Fp8);
+    let (m, n, k) = (48, 40, 64);
+    let mut rng = Rng(0xd9ad_c4c4);
+    let w = be.upload_f32(&[m, k], &rng.vec(m * k, -1.0, 1.0)).unwrap();
+    let c = be.upload_f32(&[m, n], &vec![0.0f32; m * n]).unwrap();
+    let x_fwd = be.upload_f32(&[k, n], &rng.vec(k * n, -1.0, 1.0)).unwrap();
+    let x_bwd = be.upload_f32(&[m, n], &rng.vec(m * n, -1.0, 1.0)).unwrap();
+
+    let fwd_cached = be.gemm_f32_weights_a(&w, &x_fwd, &c, m, n, k, false, false, 1.0, 0.0).unwrap();
+    let fwd_plain = be.gemm_f32(&w, &x_fwd, &c, m, n, k, false, false, 1.0, 0.0).unwrap();
+    assert_eq!(download(&be, &fwd_cached), download(&be, &fwd_plain), "forward");
+
+    // dgrad: dcol (k x n) = W^T (k x m) * dy (m x n), with W stored m x k.
+    let c_bwd = be.upload_f32(&[k, n], &vec![0.0f32; k * n]).unwrap();
+    let dg_cached = be.gemm_f32_weights_a(&w, &x_bwd, &c_bwd, k, n, m, true, false, 1.0, 0.0).unwrap();
+    let dg_plain = be.gemm_f32(&w, &x_bwd, &c_bwd, k, n, m, true, false, 1.0, 0.0).unwrap();
+    assert_eq!(download(&be, &dg_cached), download(&be, &dg_plain), "transposed dgrad");
+}

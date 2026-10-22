@@ -92,6 +92,12 @@ pub struct OxideBackend {
     /// Device-to-host readbacks issued by the GEMM paths; see
     /// [`OxideBackend::host_readbacks`].
     host_readbacks: AtomicU64,
+    /// Quantised copies of f32 weight tensors for the FP8 GEMM (keyed by the
+    /// weight buffer identity and format); see [`OxideBackend::fp8_weights`].
+    fp8_w: Mutex<Vec<mixed::Fp8WEntry>>,
+    /// Quantise launches issued by the FP8 path; see
+    /// [`OxideBackend::fp8_quantize_launches`].
+    fp8_quantize_launches: AtomicU64,
     /// Zero-length f32 buffer shared by every f16-storage tensor.
     empty_f32: Arc<PooledBuf>,
     /// im2col scratch of the f16 conv path and 1-element dummies for the unused
@@ -1392,6 +1398,8 @@ impl OxideBackend {
             amp,
             amp_w16: Mutex::new(Vec::new()),
             host_readbacks: AtomicU64::new(0),
+            fp8_w: Mutex::new(Vec::new()),
+            fp8_quantize_launches: AtomicU64::new(0),
             empty_f32,
             half_scratch: Mutex::new(half_scratch),
             half_col: Mutex::new(None),
@@ -1445,6 +1453,12 @@ impl OxideBackend {
     /// Tests compare it before and after a call to pin "no readback" behaviour.
     pub fn host_readbacks(&self) -> u64 {
         self.host_readbacks.load(Ordering::Relaxed)
+    }
+
+    /// Count of quantise kernel launches made by the FP8 path so far.  A cached
+    /// weight costs no launch, so tests compare it to pin the weight cache.
+    pub fn fp8_quantize_launches(&self) -> u64 {
+        self.fp8_quantize_launches.load(Ordering::Relaxed)
     }
 
     /// Enable (`Some`) or disable (`None`) the FP8 dgrad / wgrad GEMMs with the
@@ -1553,7 +1567,137 @@ impl OxideBackend {
             )
         }
         .map_err(launch_err)?;
+        self.fp8_quantize_launches.fetch_add(1, Ordering::Relaxed);
         Ok(out)
+    }
+
+    /// Quantised copy of a weight tensor, cached by buffer identity and format.
+    /// Weight tensors are immutable (an optimizer step returns a new tensor), so
+    /// the copy refreshes once per update.  Only weight tensors may use this:
+    /// pooled activation buffers are reused under the same address, so an
+    /// identity key on them would serve stale bytes.
+    pub(crate) fn fp8_weights(&self, w: &OxideTensorF32, fmt: Fp8Format) -> Result<mixed::Fp8Weights, OxideError> {
+        let ptr = Arc::as_ptr(&w.buf);
+        {
+            let cache = self
+                .fp8_w
+                .lock()
+                .map_err(|_| shape_err("fp8_weights", "lock poisoned".into()))?;
+            if let Some(e) = cache
+                .iter()
+                .find(|e| e.key.as_ptr() == ptr && e.key.strong_count() > 0 && e.fmt == fmt)
+            {
+                return Ok(e.value.clone());
+            }
+        }
+        let len = w.len();
+        let scale = self.fp8_scale_dev(&w.buf, len, fmt)?;
+        let bytes = self.fp8_quantize_buffer(&w.buf, len, &scale, fmt)?;
+        let value = mixed::Fp8Weights {
+            bytes: Arc::new(bytes),
+            scale: Arc::new(scale),
+        };
+        let mut cache = self
+            .fp8_w
+            .lock()
+            .map_err(|_| shape_err("fp8_weights", "lock poisoned".into()))?;
+        cache.retain(|e| e.key.strong_count() > 0);
+        if cache.len() >= mixed::W16_CACHE_MAX {
+            cache.remove(0);
+        }
+        cache.push(mixed::Fp8WEntry {
+            key: Arc::downgrade(&w.buf),
+            fmt,
+            value: value.clone(),
+        });
+        Ok(value)
+    }
+
+    /// `C = alpha * W * op(B) + beta * C` where `W` is a weight tensor and its
+    /// quantised copy comes from [`Self::fp8_weights`]; `B` is quantised per call.
+    pub(crate) fn gemm_fp8_weights_a(
+        &self,
+        w: &OxideTensorF32,
+        b: &DeviceBuffer<f32>,
+        c: &mut DeviceBuffer<f32>,
+        g: &GemmArgs,
+        fmt_a: Fp8Format,
+        fmt_b: Fp8Format,
+    ) -> Result<(), OxideError> {
+        let wq = self.fp8_weights(w, fmt_a)?;
+        let (br, bc) = if g.trans_b { (g.n, g.k) } else { (g.k, g.n) };
+        let b_len = extent(g.b.0, g.b.1, g.b.2, g.count, br, bc, g.ldb);
+        let sb = self.fp8_scale_dev(b, b_len, fmt_b)?;
+        let bq = self.fp8_quantize_buffer(b, b_len, &sb, fmt_b)?;
+        self.gemm_fp8_args(&wq.bytes, &bq, c, g, fmt_a, fmt_b, &wq.scale, &sb)
+    }
+
+    /// Forward GEMM seam for a weight operand A (conv forward).  In FP8 mode the
+    /// weights come from the cache; otherwise this is [`Self::gemm`].
+    pub(crate) fn gemm_weights_a(
+        &self,
+        w: &OxideTensorF32,
+        b: &DeviceBuffer<f32>,
+        c: &mut DeviceBuffer<f32>,
+        g: &GemmArgs,
+    ) -> Result<(), OxideError> {
+        if self.gemm_mode == GemmMode::Fp8 {
+            return self.gemm_fp8_weights_a(w, b, c, g, Fp8Format::E4M3, Fp8Format::E4M3);
+        }
+        self.gemm(&w.buf, b, c, g)
+    }
+
+    /// Backward GEMM seam for a weight operand A (conv dgrad).  Uses the FP8
+    /// backward formats when enabled, otherwise [`Self::gemm_weights_a`].
+    pub(crate) fn backward_gemm_weights_a(
+        &self,
+        w: &OxideTensorF32,
+        b: &DeviceBuffer<f32>,
+        c: &mut DeviceBuffer<f32>,
+        g: &GemmArgs,
+    ) -> Result<(), OxideError> {
+        match self.bwd_fp8 {
+            Some((fa, fb)) => self.gemm_fp8_weights_a(w, b, c, g, fa, fb),
+            None => self.gemm_weights_a(w, b, c, g),
+        }
+    }
+
+    /// `C = alpha * A * op(B) + beta * C` with `A` a weight tensor (cached FP8
+    /// copy in FP8 mode).  The tensor-level counterpart of the conv seam.
+    pub fn gemm_f32_weights_a(
+        &self,
+        w: &OxideTensorF32,
+        b: &OxideTensorF32,
+        c: &OxideTensorF32,
+        m: usize,
+        n: usize,
+        k: usize,
+        trans_a: bool,
+        trans_b: bool,
+        alpha: f32,
+        beta: f32,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let mut out = self.alloc_uninit(c.len())?;
+        out.copy_from_device_async(&c.buf, &self.stream)?;
+        self.gemm_weights_a(
+            w,
+            &b.buf,
+            &mut out,
+            &GemmArgs {
+                m,
+                n,
+                k,
+                lda: if trans_a { m } else { k },
+                ldb: if trans_b { k } else { n },
+                ldc: n,
+                trans_a,
+                trans_b,
+                alpha,
+                beta,
+                ..GemmArgs::default()
+            },
+        )?;
+        Ok(OxideTensorF32::new(out, &[m, n]))
     }
 
     /// `C = alpha * op(A) * op(B) + beta * C` with both operands quantised to

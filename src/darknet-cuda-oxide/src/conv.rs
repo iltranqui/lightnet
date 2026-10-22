@@ -414,8 +414,8 @@ impl OxideBackend {
                     let nb = chunk.min(g.batch - b0);
                     self.launch_im2col(&g, &x.buf, ws, b0, nb, config)?;
                     let inst = nb * groups;
-                    self.gemm(
-                        &weights.buf,
+                    self.gemm_weights_a(
+                        weights,
                         ws,
                         &mut out,
                         &GemmArgs {
@@ -511,8 +511,8 @@ impl OxideBackend {
                     let nb = chunk.min(g.batch - b0);
                     let inst = nb * groups;
                     // dcol[b, g] (kg x ohw) = W[g]^T (kg x fpg) * dy[b, g] (fpg x ohw)
-                    self.backward_gemm(
-                        &weights.buf,
+                    self.backward_gemm_weights_a(
+                        weights,
                         &dy.buf,
                         ws,
                         &GemmArgs {

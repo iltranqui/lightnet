@@ -61,7 +61,22 @@ pub(crate) struct W16Entry {
     half: OxideTensorF16,
 }
 
-const W16_CACHE_MAX: usize = 512;
+/// One cached FP8 copy of an f32 weight tensor: the quantised bytes and the
+/// device `[factor, 1 / factor]` pair the GEMM epilogue consumes.
+#[derive(Clone)]
+pub(crate) struct Fp8Weights {
+    pub(crate) bytes: Arc<DeviceBuffer<u8>>,
+    pub(crate) scale: Arc<DeviceBuffer<f32>>,
+}
+
+/// One cached FP8 weight copy, keyed on the weight buffer identity and format.
+pub(crate) struct Fp8WEntry {
+    pub(crate) key: Weak<PooledBuf>,
+    pub(crate) fmt: crate::fp8::Fp8Format,
+    pub(crate) value: Fp8Weights,
+}
+
+pub(crate) const W16_CACHE_MAX: usize = 512;
 
 impl OxideBackend {
     /// Switches the f32 trait API to mixed precision (see the module docs).
