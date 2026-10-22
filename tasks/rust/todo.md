@@ -404,6 +404,7 @@ reference tolerance is `TOL_COMPOSED = 1e-4` rather than the single-stage `2e-6`
 - [x] v0.2.167 to v0.2.169: fp8 overhead (pooled temporaries, fused scale, fused A+B quantise); `prec-lego` fp8 21.97 ms to 2.23 ms. See `implemented.md` §239.
 - [x] v0.2.170: `HalfFormat` and `GemmMode::Bf16` (plan_bf16 Task 1). See `implemented.md` §240.
 - [x] v0.2.171: byte im2col for conv forward and wgrad; fp8 training 153.7 s against fp32 160.9 s. See `implemented.md` §241.
+- [x] v0.2.177: fp8 e5m2 gradients with the byte wgrad column; `-fp8` selects it. See `implemented.md` §243.
 - [x] v0.2.172 to v0.2.176: fp8 amax ring; bf16 AMP training (plan_bf16 Tasks 2 to 8) and `-bf16`. See `implemented.md` §242.
 - [ ] fp8 overhead remainder (plan_fp8 "Overhead optimisation"): delayed scaling, `dy` quantise pass, kernel tuning, fp8 on bf16 storage (plan_fp8 Tasks 4 and 6); fp8 F1 0.9902 against 0.9935 for fp32 and bf16.
 - [ ] bf16 Tasks 2 to 8 (`plan_bf16.md`).
