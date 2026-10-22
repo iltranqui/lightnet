@@ -2421,6 +2421,11 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 - v0.2.165 names the existing three-part `precision_env` result with a local `PrecisionEnv` alias, removing the new `type_complexity` warning without changing behavior or return element order.
 - Evidence: `cargo xtask clippy xtask` passed without warnings, `PKGS=xtask cargo xtask test` passed all 4 fp16/fp8 scaler-flag tests, and `git diff --check` passed. Fresh GPT-6-luna review accepted the change. The default `cargo xtask clippy` remains blocked by three pre-existing `approx_constant` errors in untouched `vc_attention.rs`; default `cargo xtask test` remains blocked by 77 existing core runtime test-harness errors. No training run was started.
 
+## 238. fp8 cached weight operands
+
+- v0.2.166 quantises the weight operand of the fp8 conv forward and dgrad once per weight tensor. The copy is keyed on the weight buffer identity and format, with a weak key and the `W16_CACHE_MAX` cap, and refreshes when the optimizer returns a new tensor. Activations are still quantised per call. The cache is reachable only through the weight seams (`gemm_weights_a`, `backward_gemm_weights_a`), never through the generic `gemm_f32`, because pooled activation buffers reuse addresses.
+- Evidence: `cargo xtask oxide --test oxide_gemm_f8` passed 24 of 24 (three new: `fp8_weight_cache_hits_on_second_forward`, `fp8_weight_cache_refreshes_after_update`, `fp8_cached_weights_serve_forward_and_transposed_dgrad`). `gemm_bench_lego` (uncached tensor path) gave fp32 2.04 ms and fp8 18.27 ms over the 21 convs in the same run. That bench cannot show the cache gain; a conv-level measurement is still open. No training run was started.
+
 ## Not implemented / open (pointer)
 
 See `tasks/rust/todo.md` for the deduplicated open list (P8/P9 follow-ups,

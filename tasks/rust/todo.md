@@ -400,6 +400,7 @@ reference tolerance is `TOL_COMPOSED = 1e-4` rather than the single-stage `2e-6`
 
 ## FP8 / FP4 (`fp8_fp4.md`)
 
+- [x] v0.2.166: forward and dgrad weight operands are quantised once per weight tensor and cached (keyed on buffer identity and format); 24 `oxide_gemm_f8` tests pass. Speed gain not yet measured at conv level. See `implemented.md` §238.
 - [ ] Step 5: FP8 conv via im2col + LegoGears_v2 mAP vs the C++ FP8 path. Not
   runnable here (no C++ build of `v6-dev-fp8`).
 
