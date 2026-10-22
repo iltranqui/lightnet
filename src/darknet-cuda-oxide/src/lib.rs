@@ -1501,26 +1501,28 @@ impl OxideBackend {
         Ok(PooledBuf::new(b, &self.bufs))
     }
 
-    /// Device-side `[factor, 1 / factor]` for the first `len` elements of a
-    /// device buffer, where `factor = max_finite / amax`.  The host never reads
-    /// either word: the quantiser and the mma epilogue consume them in place.
+    /// Quantise the first `len` elements of a device buffer to `fmt`: one amax
+    /// pass, then one quantise pass that derives `factor = max_finite / amax`
+    /// from the amax slot and also writes the device scale pair
+    /// `[factor, 1 / factor]` the mma epilogue consumes.  The host never reads
+    /// either word.
     ///
     /// Note the direction: [`fp8::amax_to_scale`] returns the C++ *divisor*
-    /// `amax / max_finite`, and the quantiser multiplies, so the factor passed
-    /// to the kernel is its reciprocal.  Getting this backwards maps every
-    /// operand onto the bottom of the format's range (an e5m2 typical value
-    /// lands below `2^-16` and is flushed) and silently destroys precision.
-    fn fp8_scale_dev(
+    /// `amax / max_finite`, and the quantiser multiplies, so the factor is its
+    /// reciprocal.  Getting this backwards maps every operand onto the bottom
+    /// of the format's range (an e5m2 typical value lands below `2^-16` and is
+    /// flushed) and silently destroys precision.
+    fn fp8_quantize_operand(
         &self,
         buf: &DeviceBuffer<f32>,
         len: usize,
         fmt: Fp8Format,
-    ) -> Result<PooledBuf, OxideError> {
+    ) -> Result<(PooledBuf8, PooledBuf), OxideError> {
         if len == 0 {
-            return self.unit_scale();
+            return Ok((self.alloc8_uninit(0)?, self.unit_scale()?));
         }
         // Pooled: no cudaMalloc/free per operand.  The slot must start at 0;
-        // the scale pair is fully written by the kernel below.
+        // the scale pair and bytes are fully written by the quantise kernel.
         let mut slot = self.alloc(1)?;
         // SAFETY: one thread per element; the single atomic slot is zeroed
         // above and only read through `fetch_max`.
@@ -1533,46 +1535,24 @@ impl OxideBackend {
             )
         }
         .map_err(launch_err)?;
+        let mut out = self.alloc8_uninit(len)?;
         let mut scale = self.alloc_uninit(2)?;
-        // SAFETY: two threads, one per output word; `slot` holds the amax bits.
+        // SAFETY: one thread per element (at least two, so both scale words are
+        // written); the kernel writes every byte of `out` and both scale words.
         unsafe {
-            self.gemm_f8.fp8_scale_kernel(
+            self.gemm_f8.fp8_quantize_kernel(
                 &self.stream,
-                launch::elementwise(2, ElementwiseLaunchConfig::default()),
+                launch::elementwise(len.max(2), ElementwiseLaunchConfig::default()),
+                buf,
                 &slot,
+                &mut out,
                 &mut scale,
                 fmt.code(),
             )
         }
         .map_err(launch_err)?;
-        Ok(scale)
-    }
-
-    /// Quantise a device f32 buffer to `fmt`, multiplying by the device-side
-    /// factor in `scale[0]`.
-    fn fp8_quantize_buffer(
-        &self,
-        buf: &DeviceBuffer<f32>,
-        len: usize,
-        scale: &DeviceBuffer<f32>,
-        fmt: Fp8Format,
-    ) -> Result<PooledBuf8, OxideError> {
-        let mut out = self.alloc8_uninit(len)?;
-        // SAFETY: one thread per element, and the kernel writes every byte;
-        // both buffers have `len` elements.
-        unsafe {
-            self.gemm_f8.fp8_quantize_kernel(
-                &self.stream,
-                launch::elementwise(len, ElementwiseLaunchConfig::default()),
-                buf,
-                &mut out,
-                scale,
-                fmt.code(),
-            )
-        }
-        .map_err(launch_err)?;
         self.fp8_quantize_launches.fetch_add(1, Ordering::Relaxed);
-        Ok(out)
+        Ok((out, scale))
     }
 
     /// Quantised copy of a weight tensor, cached by buffer identity and format.
@@ -1594,9 +1574,7 @@ impl OxideBackend {
                 return Ok(e.value.clone());
             }
         }
-        let len = w.len();
-        let scale = self.fp8_scale_dev(&w.buf, len, fmt)?;
-        let bytes = self.fp8_quantize_buffer(&w.buf, len, &scale, fmt)?;
+        let (bytes, scale) = self.fp8_quantize_operand(&w.buf, w.len(), fmt)?;
         let value = mixed::Fp8Weights {
             bytes: Arc::new(bytes),
             scale: Arc::new(scale),
@@ -1631,8 +1609,7 @@ impl OxideBackend {
         let wq = self.fp8_weights(w, fmt_a)?;
         let (br, bc) = if g.trans_b { (g.n, g.k) } else { (g.k, g.n) };
         let b_len = extent(g.b.0, g.b.1, g.b.2, g.count, br, bc, g.ldb);
-        let sb = self.fp8_scale_dev(b, b_len, fmt_b)?;
-        let bq = self.fp8_quantize_buffer(b, b_len, &sb, fmt_b)?;
+        let (bq, sb) = self.fp8_quantize_operand(b, b_len, fmt_b)?;
         self.gemm_fp8_args(&wq.bytes, &bq, c, g, fmt_a, fmt_b, &wq.scale, &sb)
     }
 
@@ -1721,10 +1698,8 @@ impl OxideBackend {
         let (br, bc) = if g.trans_b { (g.n, g.k) } else { (g.k, g.n) };
         let a_len = extent(g.a.0, g.a.1, g.a.2, g.count, ar, ac, g.lda);
         let b_len = extent(g.b.0, g.b.1, g.b.2, g.count, br, bc, g.ldb);
-        let sa = self.fp8_scale_dev(a, a_len, fmt_a)?;
-        let sb = self.fp8_scale_dev(b, b_len, fmt_b)?;
-        let aq = self.fp8_quantize_buffer(a, a_len, &sa, fmt_a)?;
-        let bq = self.fp8_quantize_buffer(b, b_len, &sb, fmt_b)?;
+        let (aq, sa) = self.fp8_quantize_operand(a, a_len, fmt_a)?;
+        let (bq, sb) = self.fp8_quantize_operand(b, b_len, fmt_b)?;
         // The mma works in the quantised domain: the epilogue multiplies by the
         // device-side reciprocal factors `sa[1] * sb[1]`, so `c` needs no pass.
         self.gemm_fp8_args(&aq, &bq, c, g, fmt_a, fmt_b, &sa, &sb)
@@ -2477,7 +2452,7 @@ impl OxideBackend {
         // SAFETY: one thread per element; both buffers have `values.len()`
         // elements.
         unsafe {
-            self.gemm_f8.fp8_quantize_kernel(
+            self.gemm_f8.fp8_quantize_scaled_kernel(
                 &self.stream,
                 launch::elementwise(values.len(), ElementwiseLaunchConfig::default()),
                 &x,

@@ -326,13 +326,22 @@ pub mod kernels {
         let _ = atomic.fetch_max(magnitude.to_bits(), AtomicOrdering::Relaxed);
     }
 
-    /// `out[0] = max_finite(fmt) / amax` and `out[1] = 1 / out[0]` from the
-    /// amax slot, falling back to `1, 1` when amax is zero or non-finite.
-    /// Launched with two threads, one per output word.
+    /// `out[i] = quantize(x[i] * factor, fmt)` with `factor = max_finite(fmt) /
+    /// amax` taken from the amax slot (1.0 when amax is zero or non-finite).
+    /// The first two threads also write the operand's device scale pair
+    /// `scale = [factor, 1 / factor]`, which the mma epilogue consumes, so no
+    /// separate scale launch is needed and the host never reads either word.
+    /// The launch must cover at least two threads (block sizes always do).
     #[kernel]
-    pub fn fp8_scale_kernel(amax: &[f32], mut out: DisjointSlice<f32>, fmt: u32) {
+    pub fn fp8_quantize_kernel(
+        x: &[f32],
+        amax: &[f32],
+        mut out: DisjointSlice<u8>,
+        mut scale: DisjointSlice<f32>,
+        fmt: u32,
+    ) {
         let idx = thread::index_1d();
-        let word = idx.get();
+        let i = idx.get();
         let amax = amax[0];
         let max_finite = if fmt == 0 { 448.0 } else { 57344.0 };
         let factor = if amax > 0.0 && amax.is_finite() {
@@ -340,15 +349,21 @@ pub mod kernels {
         } else {
             1.0
         };
+        if let Some(o) = scale.get_mut(thread::index_1d()) {
+            *o = if i == 0 { factor } else { 1.0 / factor };
+        }
+        if i >= x.len() {
+            return;
+        }
         if let Some(o) = out.get_mut(idx) {
-            *o = if word == 0 { factor } else { 1.0 / factor };
+            *o = quantize_f32(x[i], factor, fmt);
         }
     }
 
-    /// `out[i] = quantize(x[i] * scale[0], fmt)`, elementwise.  The factor
-    /// lives on the device so the host never reads it back.
+    /// `out[i] = quantize(x[i] * scale[0], fmt)` with a caller-supplied factor
+    /// (the host-side `quantize_f32_to_fp8` path).
     #[kernel]
-    pub fn fp8_quantize_kernel(x: &[f32], mut out: DisjointSlice<u8>, scale: &[f32], fmt: u32) {
+    pub fn fp8_quantize_scaled_kernel(x: &[f32], mut out: DisjointSlice<u8>, scale: &[f32], fmt: u32) {
         let idx = thread::index_1d();
         let i = idx.get();
         if i >= x.len() {

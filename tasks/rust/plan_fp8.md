@@ -283,7 +283,7 @@ Order set 2026-10-22. Each step is measured with `DARKNET_BENCH_MODES=fp32,fp8 c
 | 0 | Baseline | measured | 21.97 ms (fp32 2.52 ms) |
 | 1 | Profile with `nsys` (time per alloc, memset, launch, quantise kernel); the allocation share is an assumption until then | open | |
 | 2 | Pool the fp8 temporaries: amax slot and scale pair from the f32 pool, quantised bytes from a new u8 free list (`PooledBuf8`, shares the byte cap). The amax slot is now an f32 buffer read as `u32` bits by the atomic | done, `oxide_gemm_f8` 24 of 24 | 3.84 ms (fp32 1.12 ms, re-measured the same run) |
-| 3 | Drop `fp8_scale_kernel`: the quantise kernel derives the factor from the amax slot; also fold the amax-slot zero-fill (3 launches + memset to 1 launch + 1 amax per operand) | open | |
+| 3 | Drop `fp8_scale_kernel`: `fp8_quantize_kernel` reads the amax slot, derives the factor and writes the `[factor, 1/factor]` scale pair itself (per operand: amax + quantise, 2 launches instead of 3). `fp8_scale_dev` and `fp8_quantize_buffer` merged into `fp8_quantize_operand`; the host-side `quantize_f32_to_fp8` keeps an explicit-scale kernel. The amax-slot zero-fill is still a memset | done, `oxide_gemm_f8` 24 of 24 | 2.95 ms (fp32 1.02 ms, same run) |
 | 4 | Byte im2col: quantise the conv input image once, run im2col on u8 (4x less col traffic, one pass fewer). New byte im2col kernel | open, structural | |
 | 5 | Delayed scaling ([Task 3](#task-3-delayed-scaling)): one pass over activations instead of two | open | |
 | 6 | CUDA Graphs for the per-step launch sequence, only if launch overhead is still visible after 3; first check that cuda-oxide exposes graph capture. Pooling (step 2) already makes addresses stable | open | |
