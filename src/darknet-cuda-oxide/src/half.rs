@@ -393,41 +393,37 @@ impl OxideBackend {
         Ok(OxideTensorF32::new(out, &[m, n]))
     }
 
-    /// `GemmMode::Fp16` in the f32 API: round both operands to f16 on the
-    /// device (same layout, so leading dims and views carry over) and run the
-    /// f16 GEMM.  Compute mode only; storage stays f32.
-    pub(crate) fn gemm_f32_operands_as_f16(
+    /// `GemmMode::Fp16` / `GemmMode::Bf16` in the f32 API: round both operands
+    /// to the 16-bit format on the device (same layout, so leading dims and
+    /// views carry over) and run the 16-bit GEMM.  Compute mode only; storage
+    /// stays f32.
+    pub(crate) fn gemm_f32_operands_as_half(
         &self,
         a: &DeviceBuffer<f32>,
         b: &DeviceBuffer<f32>,
         c: &mut DeviceBuffer<f32>,
         g: &GemmArgs,
+        bf16: bool,
     ) -> Result<(), OxideError> {
         let cfg = ElementwiseLaunchConfig::default();
         let mut ah = self.alloc16_uninit(a.len())?;
         let mut bh = self.alloc16_uninit(b.len())?;
-        // SAFETY: one thread per element of each operand.
-        unsafe {
-            self.convert
-                .cvt_f32_to_f16(
-                    &self.stream,
-                    launch::elementwise(a.len(), cfg),
-                    a,
-                    &mut ah,
-                    0,
-                )
-                .map_err(launch_err)?;
-            self.convert
-                .cvt_f32_to_f16(
-                    &self.stream,
-                    launch::elementwise(b.len(), cfg),
-                    b,
-                    &mut bh,
-                    0,
-                )
-                .map_err(launch_err)?;
-        }
-        self.hgemm(&ah, &bh, HOut::F32(c), g)
+        let round = |x: &DeviceBuffer<f32>, out: &mut DeviceBuffer<u16>| {
+            // SAFETY: one thread per element of the operand.
+            unsafe {
+                if bf16 {
+                    self.convert
+                        .cvt_f32_to_bf16(&self.stream, launch::elementwise(x.len(), cfg), x, out)
+                } else {
+                    self.convert
+                        .cvt_f32_to_f16(&self.stream, launch::elementwise(x.len(), cfg), x, out, 0)
+                }
+            }
+            .map_err(launch_err)
+        };
+        round(a, &mut ah)?;
+        round(b, &mut bh)?;
+        self.hgemm_ex(&ah, &bh, HOut::F32(c), g, bf16)
     }
 
     /// Validated f16 GEMM launch (the f16 twin of [`OxideBackend::gemm`],

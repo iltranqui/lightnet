@@ -42,15 +42,43 @@ use crate::{
     activation_code, check_channel_layout, launch, launch_err, shape_err,
 };
 
-/// `DARKNET_OXIDE_AMP=1` (or `true` / `on`).
+/// The 16-bit storage format of mixed-precision mode.  Kernels that read or
+/// write 16-bit data take it as a `fmt: u32` ([`HalfFormat::code`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HalfFormat {
+    F16,
+    Bf16,
+}
+
+impl HalfFormat {
+    /// Kernel argument: `0` = f16, `1` = bf16.
+    pub fn code(self) -> u32 {
+        match self {
+            Self::F16 => 0,
+            Self::Bf16 => 1,
+        }
+    }
+}
+
+/// Parses a `DARKNET_OXIDE_AMP` value, case-insensitively: `1`, `true`, `on`,
+/// `yes`, `fp16`, `f16` select f16; `bf16`, `bfloat16` select bf16; anything
+/// else (including the empty string) means AMP off.
+pub fn parse_amp_format(value: &str) -> Option<HalfFormat> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" | "fp16" | "f16" => Some(HalfFormat::F16),
+        "bf16" | "bfloat16" => Some(HalfFormat::Bf16),
+        _ => None,
+    }
+}
+
+/// `DARKNET_OXIDE_AMP` through [`parse_amp_format`].
+pub(crate) fn amp_format_from_env() -> Option<HalfFormat> {
+    parse_amp_format(&std::env::var("DARKNET_OXIDE_AMP").unwrap_or_default())
+}
+
+/// True when `DARKNET_OXIDE_AMP` selects either 16-bit format.
 pub(crate) fn amp_from_env() -> bool {
-    matches!(
-        std::env::var("DARKNET_OXIDE_AMP")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "on" | "yes"
-    )
+    amp_format_from_env().is_some()
 }
 
 /// One cached f16 copy of an f32 master-weight tensor.
@@ -81,12 +109,32 @@ pub(crate) const W16_CACHE_MAX: usize = 512;
 impl OxideBackend {
     /// Switches the f32 trait API to mixed precision (see the module docs).
     /// Turning it on also selects `GemmMode::Fp16` (the f16 tensor-core GEMM).
-    pub fn with_amp(mut self, on: bool) -> Self {
-        self.amp = on;
-        if on {
-            self.gemm_mode = crate::GemmMode::Fp16;
+    pub fn with_amp(self, on: bool) -> Self {
+        self.with_amp_format(on.then_some(HalfFormat::F16))
+    }
+
+    /// [`Self::with_amp`] with the 16-bit format selectable; `None` turns AMP
+    /// off (the GEMM mode is left as it is, like `with_amp(false)`).  `Some`
+    /// selects `GemmMode::Fp16` or `GemmMode::Bf16` to match.
+    ///
+    /// Only the GEMM path is format-aware so far: the AMP activation kernels
+    /// still read and write f16, so `Some(Bf16)` is not usable for training
+    /// until `plan_bf16.md` Tasks 4 to 6 land.
+    pub fn with_amp_format(mut self, format: Option<HalfFormat>) -> Self {
+        self.amp = format.is_some();
+        if let Some(f) = format {
+            self.half_fmt = f;
+            self.gemm_mode = match f {
+                HalfFormat::F16 => crate::GemmMode::Fp16,
+                HalfFormat::Bf16 => crate::GemmMode::Bf16,
+            };
         }
         self
+    }
+
+    /// The 16-bit storage format in use (`F16` unless AMP selected bf16).
+    pub fn half_format(&self) -> HalfFormat {
+        self.half_fmt
     }
 
     pub fn amp_enabled(&self) -> bool {

@@ -829,6 +829,17 @@ fn gemm_mode_fp4_selector_matches_the_dequantised_reference() {
 }
 
 #[test]
+fn gemm_mode_from_env_parses_bf16() {
+    for value in ["bf16", "BF16", "bfloat16"] {
+        // SAFETY: single-threaded test; the variable is removed below.
+        unsafe { std::env::set_var("DARKNET_OXIDE_GEMM", value) };
+        assert_eq!(GemmMode::from_env(), GemmMode::Bf16, "DARKNET_OXIDE_GEMM={value}");
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("DARKNET_OXIDE_GEMM") };
+    }
+}
+
+#[test]
 fn gemm_mode_from_env_parses_fp8_and_fp4() {
     // `from_env` reads a process-wide variable, so exercise the mapping through
     // the documented spellings by comparing the parse result of a child-free

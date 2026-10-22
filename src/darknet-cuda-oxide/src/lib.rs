@@ -31,6 +31,7 @@ use darknet_cuda::{
 pub use conv::ConvMode;
 pub use fp4::Fp4Packed;
 pub use fp8::Fp8Format;
+pub use mixed::{HalfFormat, parse_amp_format};
 use kernels::bias_scale::BIAS_BACKWARD_THREADS;
 use kernels::{
     activations, amp as amp_k, batchnorm, bias_scale, conv_direct, conv_implicit, convert, dcnv4,
@@ -87,6 +88,8 @@ pub struct OxideBackend {
     amp_k: amp_k::kernels::LoadedModule,
     /// Mixed-precision mode: see [`OxideBackend::with_amp`].
     amp: bool,
+    /// 16-bit format of AMP storage and of the 16-bit GEMM modes.
+    half_fmt: mixed::HalfFormat,
     /// f16 copies of f32 master weights (keyed by the weight buffer identity).
     amp_w16: Mutex<Vec<mixed::W16Entry>>,
     /// Device-to-host readbacks issued by the GEMM paths; see
@@ -151,6 +154,8 @@ pub enum GemmMode {
     Fp32,
     Tf32,
     Fp16,
+    /// bf16 operands on the 16-bit tensor-core GEMM (f32 accumulate and output).
+    Bf16,
     /// Per-tensor e4m3 quantisation followed by `mma.m16n8k32` (sm_89+).
     Fp8,
     /// Packed NVFP4 (E2M1 + E4M3 block scales) emulated with `__dp4a`.
@@ -168,7 +173,7 @@ pub(crate) const SPLITK_MIN_K: usize = 128;
 pub(crate) const SPLITK_MAX: usize = 16;
 
 impl GemmMode {
-    /// `DARKNET_OXIDE_GEMM={fp32,tf32,fp16,fp8,fp4,auto}`; unset or unknown
+    /// `DARKNET_OXIDE_GEMM={fp32,tf32,fp16,bf16,fp8,fp4,auto}`; unset or unknown
     /// means `Fp32`.
     ///
     /// `fp8` quantises each operand to e4m3 per tensor (amax / 448) and runs
@@ -183,6 +188,7 @@ impl GemmMode {
         {
             "tf32" => Self::Tf32,
             "fp16" | "f16" | "half" => Self::Fp16,
+            "bf16" | "bfloat16" => Self::Bf16,
             "fp8" | "e4m3" => Self::Fp8,
             "fp4" | "nvfp4" => Self::Fp4,
             "auto" => Self::Auto,
@@ -192,7 +198,7 @@ impl GemmMode {
 
     pub(crate) fn use_tf32(self, g: &GemmArgs) -> bool {
         match self {
-            Self::Fp32 | Self::Fp16 | Self::Fp8 | Self::Fp4 => false,
+            Self::Fp32 | Self::Fp16 | Self::Bf16 | Self::Fp8 | Self::Fp4 => false,
             Self::Tf32 => true,
             Self::Auto => {
                 g.m.saturating_mul(g.n).saturating_mul(g.k) >= AUTO_TF32_MIN_MACS
@@ -1375,7 +1381,8 @@ impl OxideBackend {
             DeviceBuffer::<f32>::zeroed(&stream, 0)?,
             &bufs,
         ));
-        let amp = mixed::amp_from_env();
+        let amp_format = mixed::amp_format_from_env();
+        let amp = amp_format.is_some();
         Ok(Self {
             _ctx: ctx,
             stream,
@@ -1396,6 +1403,7 @@ impl OxideBackend {
             half_ops,
             amp_k,
             amp,
+            half_fmt: amp_format.unwrap_or(mixed::HalfFormat::F16),
             amp_w16: Mutex::new(Vec::new()),
             host_readbacks: AtomicU64::new(0),
             fp8_w: Mutex::new(Vec::new()),
@@ -1403,10 +1411,10 @@ impl OxideBackend {
             empty_f32,
             half_scratch: Mutex::new(half_scratch),
             half_col: Mutex::new(None),
-            gemm_mode: if amp {
-                GemmMode::Fp16
-            } else {
-                GemmMode::from_env()
+            gemm_mode: match amp_format {
+                Some(mixed::HalfFormat::F16) => GemmMode::Fp16,
+                Some(mixed::HalfFormat::Bf16) => GemmMode::Bf16,
+                None => GemmMode::from_env(),
             },
             im2col,
             conv_direct,
@@ -1885,7 +1893,10 @@ impl OxideBackend {
             return Err(bad("operand buffer too small for the requested view"));
         }
         if self.gemm_mode == GemmMode::Fp16 {
-            return self.gemm_f32_operands_as_f16(a, b, c, g);
+            return self.gemm_f32_operands_as_half(a, b, c, g, false);
+        }
+        if self.gemm_mode == GemmMode::Bf16 {
+            return self.gemm_f32_operands_as_half(a, b, c, g, true);
         }
         if self.gemm_mode == GemmMode::Fp8 {
             return self.gemm_f32_via_fp8(a, b, c, g);

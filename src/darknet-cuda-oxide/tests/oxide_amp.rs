@@ -1004,3 +1004,66 @@ fn amp_adam_steps_track_f32_master_weights() {
         assert!(diff <= bound, "adam {name}: {diff:.3e} > {bound:.3e}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// 16-bit format selection (plan_bf16 Task 1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn amp_format_parses_known_values_case_insensitively() {
+    use darknet_cuda_oxide::{HalfFormat, parse_amp_format};
+    for v in ["1", "true", "TRUE", "on", "On", "yes", "fp16", "FP16", "f16"] {
+        assert_eq!(parse_amp_format(v), Some(HalfFormat::F16), "{v}");
+    }
+    for v in ["bf16", "BF16", "bfloat16", "BFloat16"] {
+        assert_eq!(parse_amp_format(v), Some(HalfFormat::Bf16), "{v}");
+    }
+    assert_eq!(HalfFormat::F16.code(), 0);
+    assert_eq!(HalfFormat::Bf16.code(), 1);
+}
+
+#[test]
+fn amp_format_rejects_garbage_and_empty() {
+    use darknet_cuda_oxide::parse_amp_format;
+    for v in ["", "0", "off", "no", "fp8", "bf17", " bf16", "garbage"] {
+        assert_eq!(parse_amp_format(v), None, "{v:?}");
+    }
+}
+
+#[test]
+fn with_amp_format_selects_the_matching_gemm_mode() {
+    use darknet_cuda_oxide::HalfFormat;
+    let be = OxideBackend::new().expect("backend").with_amp_format(Some(HalfFormat::Bf16));
+    assert!(be.amp_enabled());
+    assert_eq!(be.half_format(), HalfFormat::Bf16);
+    let be = be.with_amp_format(Some(HalfFormat::F16));
+    assert_eq!(be.half_format(), HalfFormat::F16);
+    assert!(be.amp_enabled());
+    assert!(!be.with_amp_format(None).amp_enabled());
+}
+
+#[test]
+fn bf16_gemm_mode_tracks_the_f32_gemm_in_the_f32_api() {
+    let be = OxideBackend::new().expect("backend").with_gemm_mode(GemmMode::Bf16);
+    let (m, n, k) = (40, 56, 96);
+    let mut rng = Rng(0xbf16_0001);
+    let a = rng.vec(m * k, -1.0, 1.0);
+    let b = rng.vec(k * n, -1.0, 1.0);
+    let ta = be.upload_f32(&[m, k], &a).unwrap();
+    let tb = be.upload_f32(&[k, n], &b).unwrap();
+    let tc = be.upload_f32(&[m, n], &vec![0.0f32; m * n]).unwrap();
+    let got = be
+        .download_f32(&be.gemm_f32(&ta, &tb, &tc, m, n, k, false, false, 1.0, 0.0).unwrap())
+        .unwrap();
+    let mut worst = 0.0f64;
+    let mut scale = 0.0f64;
+    for i in 0..m {
+        for j in 0..n {
+            let r: f64 = (0..k).map(|p| a[i * k + p] as f64 * b[p * n + j] as f64).sum();
+            worst = worst.max((got[i * n + j] as f64 - r).abs());
+            scale = scale.max(r.abs());
+        }
+    }
+    // Two bf16 roundings (2^-9 each) over K = 96 random terms.
+    assert!(worst / scale < 1.5e-2, "bf16 GEMM error {}", worst / scale);
+}
