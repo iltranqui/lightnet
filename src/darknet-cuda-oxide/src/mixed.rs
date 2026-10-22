@@ -36,7 +36,7 @@ use darknet_cuda::{BatchNormTrainForward, ElementwiseLaunchConfig, F32Activation
 
 use crate::conv::{Geom, chunk_limit, col_cap_bytes, expect_len, expect_shape};
 use crate::half::HOut;
-use crate::tensor::{PooledBuf, PooledBuf16};
+use crate::tensor::{PooledBuf, PooledBuf16, PooledBuf8};
 use crate::{
     BIAS_BACKWARD_THREADS, GemmArgs, OxideBackend, OxideError, OxideTensorF16, OxideTensorF32,
     activation_code, check_channel_layout, launch, launch_err, shape_err,
@@ -65,8 +65,8 @@ pub(crate) struct W16Entry {
 /// device `[factor, 1 / factor]` pair the GEMM epilogue consumes.
 #[derive(Clone)]
 pub(crate) struct Fp8Weights {
-    pub(crate) bytes: Arc<DeviceBuffer<u8>>,
-    pub(crate) scale: Arc<DeviceBuffer<f32>>,
+    pub(crate) bytes: Arc<PooledBuf8>,
+    pub(crate) scale: Arc<PooledBuf>,
 }
 
 /// One cached FP8 weight copy, keyed on the weight buffer identity and format.

@@ -27,6 +27,12 @@
   - [Task 7: Backward pass review](#task-7-backward-pass-review)
   - [Task 8: xtask -fp8](#task-8-xtask--fp8)
   - [Task 9: Accuracy, speed gate, record](#task-9-accuracy-speed-gate-record)
+- [Progress](#progress)
+- [Open issues (repo-wide)](#open-issues-repo-wide)
+- [Kernel experiment log](#kernel-experiment-log)
+- [LegoGears conv shapes](#legogears-conv-shapes)
+- [Overhead optimisation](#overhead-optimisation)
+- [Review backlog](#review-backlog)
 
 ## Global Constraints
 
@@ -198,3 +204,100 @@ User-gated, same procedure as [plan_fp16.md Task 5](plan_fp16.md#task-5-converge
 - [ ] **Step 2: Gate.** fp8 is declared a speed feature only if all hold: the batch-16 step time is lower than the fp16 AMP step time; loss within 10% of fp32 at the final iteration; mAP within 2 points of fp16. If the speed condition fails after Tasks 1 to 6, document fp8 as numerics-only in [fp8_fp4.md](fp8_fp4.md) and stop; do not keep tuning without a profile (use `nsys` or the bench tests to name the remaining bottleneck first).
 - [ ] **Step 3:** Decide the default scaling mode from the two runs; record the table and verdict in `docs/OXIDE_BENCH.md`; update `implemented.md`, `STATUS.md`, `todo.md`, `version-map.tsv`; delete weights and logs.
 - [ ] **Step 4: Commit** the docs: `docs: record fp8 accuracy and speed gate`.
+
+## Progress
+
+Status as of 2026-10-22.
+
+| Task | Status | Commit or tag |
+|---|---|---|
+| 1. Device-resident scales | done | `87fef93` (`perf(oxide): fp8 scales stay on the device`) |
+| 2. Cached fp8 weights | done | `v0.2.166` (`420dfd9`), docs `05953ba` |
+| 3. Delayed scaling | not started | |
+| 4. Quantise from 16-bit storage | blocked on plan_bf16 Tasks 1, 2 | |
+| 5. Kernel tuning | in progress, no kept change yet | |
+| 6. Compose with AMP | blocked on plan_bf16 Tasks 2, 6 | |
+| 7. Backward pass review | not started | |
+| 8. xtask `-fp8` | not started | |
+| 9. Accuracy and speed gate | user-gated (training run) | |
+
+Task 2 details: the forward and dgrad weight operands are quantised once per weight tensor. The cache is keyed on buffer identity and format, and is reachable only through the weight seams (`gemm_weights_a`, `backward_gemm_weights_a`). `oxide_gemm_f8` passes 24 of 24 (three new cache tests). The 21-conv bench does not exercise the cache, so its speed gain is still unmeasured.
+
+Open issues:
+- **Task 2 speed gain unmeasured.** Needs a conv-level bench that runs the weight-cache path.
+- **Bench test `gemm_bench_low_precision_lego_kernels` uncommitted** (`tests/oxide_gemm_bench.rs`). Added this session.
+- **`bench/` folder untracked.** Written by Haiku agents: `README.md`, `run_bench.sh` (`bash -n` only, never run end to end), and three header-only CSVs. Open decisions: symlink of `third_party/cuda-oxide` into scratch worktrees (script refuses unless `BENCH_SHARE_OXIDE=1`), and deleting the leftover `bench/.work/`. Neither decided.
+- **Kernel time does not beat fp32 on the LegoGears shapes.** End-to-end fp8 is about 9x fp32, mostly overhead (see [LegoGears conv shapes](#legogears-conv-shapes)).
+- **Local-memory spill removed, no speed gain.** Root cause was `fp8_stage16` taking `&mut` register arrays and a runtime-indexed `dst[j / 4]` (see [Kernel experiment log](#kernel-experiment-log)). Both fixes were reverted because kernel time did not improve.
+- **Profile covered one launch only.** The ncu run used the 1024^3 launch (grid 256), not 2048^3.
+- **Codex review ran against an edited file.** It read `gemm_f8.rs` while the padding experiment was applied, so some line references may be off.
+
+## Open issues (repo-wide)
+
+Issues outside the fp8 path that affect how fp8 work is verified or committed. Recorded here so they are not lost; none is fixed by the fp8 work.
+
+- **Default `cargo xtask clippy` fails.** Three `approx_constant` errors in `src/darknet-core/src/vc_attention.rs`, which this work does not touch. Touched crates (`xtask`, `darknet-cuda-oxide`) are clean on their own (source: `implemented.md`, section 237).
+- **Default `cargo xtask test` status unverified.** `implemented.md` (section 237) reports 77 core runtime test-harness errors; `AGENTS_fp8.md` says commit `37ec4b5` made it compile again. Not re-run in this session. Re-check before citing host tests as a gate.
+- **Flaky bf16 parity test.** `oxide_half` `gemm_bf16_parity_all_transposes_alignments_alpha_beta` failed once on `OxideBackend::new()` and passed in 10 later runs; cause unknown (source: `AGENTS_fp8.md`, Current state). Blocks Phase 2 verification.
+- **Uncommitted user edit in `src/darknet-core/src/runtime/mod.rs`** (28 lines, not ours). It was present at the start of the session and is not staged. Commits must stage only named hunks.
+- **Uncommitted bench test** `gemm_bench_low_precision_lego_kernels` in `src/darknet-cuda-oxide/tests/oxide_gemm_bench.rs`. Ours; needs a commit once accepted.
+- **`bench/` folder untracked.** Haiku-written; the script has not been run end to end (see the Progress section for the two undecided items).
+- **Phase 1 Task 5 verdict open.** fp32 and fp16 convergence runs exist (seed 42, 3000 iterations, final mAP 99.55% against 99.63%) but the loss gate (11.7% apart) and the record in `docs/OXIDE_BENCH.md` are not done. Training runs are user-gated.
+- **Commit attribution.** Session reminders named different models (Sonnet 5.5 and Haiku 5.5) for the `Co-Authored-By` line. Commits so far use Sonnet 5.5. Needs a decision from the user.
+- **Process: background waits.** Several long `cargo xtask` runs exceeded the 120 s foreground timeout and were moved to background; results were read from output files. No data loss, but future runs should use `run_in_background` directly.
+
+## Kernel experiment log
+
+Each experiment is measured kernel-only at 2048^3 with `gemm_bench_low_precision_kernels`; a change is kept only if it is at least 5% faster than the current HEAD baseline (2.53 ms, re-measured 2026-10-22).
+
+| Experiment | Result | Decision |
+|---|---|---|
+| `cp.async` 4-byte staging of A into two shared stages, B still via registers | 3.09 ms (slower) | reverted |
+| `fp8_stage16` returns `[u32; 4]` by value (removes the 32-byte `areg`/`breg` local depot) | 2.77 ms and 3.10 ms (slower) | reverted |
+| Same as above plus scalar word gather (removes the 16-byte `dst[j / 4]` local array; 0 local ops in PTX) | 3.10 ms (slower) | reverted |
+| Shared pitch padding, `LD_A` = `LD_B` = 44 bytes (bank conflicts 16 to 4 extra wavefronts per store) | 2.47 ms (2.4%, within the fp32 control's 1.7% drift) | reverted |
+
+Takeaway: removing local memory and reducing store bank conflicts did not reduce kernel time at 2048^3.
+
+## LegoGears conv shapes
+
+Measured 2026-10-22 on the 21 LegoGears_v2 conv GEMMs (`LEGO` in `tests/oxide_gemm_bench.rs`). Two benches: `gemm_bench_low_precision_lego_kernels` (kernel only, operands pre-quantised, new) and `gemm_bench_precisions` `prec-lego` (end to end, includes quantise and allocations).
+
+| Bench | fp32 | fp8 | fp8 / fp32 |
+|---|---|---|---|
+| Kernel only, 21 shapes total | 2.04 ms | 2.17 ms | 1.06 |
+| End to end, 21 shapes total | 2.52 ms | 21.97 ms | 8.7 |
+
+Findings:
+- Kernel time is about 10% of end-to-end fp8 time on these shapes. About 90% is quantise passes, amax and scale kernels, per-call allocations and launches.
+- The kernel alone does not beat fp32 on these shapes. Small M (30 to 128) leaves the 64x64 tile partly empty; N = 35 wastes about 45%; K = 27, 288 and 576 pad to the 32-element BK.
+
+Decision: optimise the overhead first (pool the FP8 temporaries, remove redundant quantise passes, fuse amax into quantise), then retune the kernel for small M and N. Measure each change with `gemm_bench_precisions` and `gemm_bench_low_precision_lego_kernels`, not only 2048^3.
+
+## Overhead optimisation
+
+Order set 2026-10-22. Each step is measured with `DARKNET_BENCH_MODES=fp32,fp8 cargo xtask oxide --test oxide_gemm_bench -- --ignored gemm_bench_precisions` (`prec-lego` TOTAL) and kept only if the fp8 total drops.
+
+| Step | What | Status | prec-lego fp8 total |
+|---|---|---|---|
+| 0 | Baseline | measured | 21.97 ms (fp32 2.52 ms) |
+| 1 | Profile with `nsys` (time per alloc, memset, launch, quantise kernel); the allocation share is an assumption until then | open | |
+| 2 | Pool the fp8 temporaries: amax slot and scale pair from the f32 pool, quantised bytes from a new u8 free list (`PooledBuf8`, shares the byte cap). The amax slot is now an f32 buffer read as `u32` bits by the atomic | done, `oxide_gemm_f8` 24 of 24 | 3.84 ms (fp32 1.12 ms, re-measured the same run) |
+| 3 | Drop `fp8_scale_kernel`: the quantise kernel derives the factor from the amax slot; also fold the amax-slot zero-fill (3 launches + memset to 1 launch + 1 amax per operand) | open | |
+| 4 | Byte im2col: quantise the conv input image once, run im2col on u8 (4x less col traffic, one pass fewer). New byte im2col kernel | open, structural | |
+| 5 | Delayed scaling ([Task 3](#task-3-delayed-scaling)): one pass over activations instead of two | open | |
+| 6 | CUDA Graphs for the per-step launch sequence, only if launch overhead is still visible after 3; first check that cuda-oxide exposes graph capture. Pooling (step 2) already makes addresses stable | open | |
+
+Step 2 removed one `cudaMalloc`/`cudaFree` per operand per GEMM (amax slot, scale pair, byte output). The remaining gap to fp32 (3.4x) is launches and the quantise passes.
+
+## Review backlog
+
+Ranked by the codex review of the fp8 GEMM (gpt-6-sol, high effort, read-only), against the ncu profile in the log above. Confidence is the reviewer's. The order below is the review's; the LegoGears measurements above move item 4 ahead of item 1, because overhead dominates end to end.
+
+1. **Pack B as K-contiguous `[N, K]` while quantising.** Largest kernel gain expected, medium confidence. The NN path gathers B with `ldb`-spaced byte loads before each K tile (`kernels/gemm_f8.rs` `fp8_stage16`, `trans == 1`). Measure the packing pass cost in the full call, since the kernel-only bench assumes operands are pre-quantised. Bench: `gemm_bench_precisions` (fp8 column is end-to-end).
+2. **Two shared K tiles plus `cp.async`**, after item 1. Medium confidence. Verify register count and stalls per variant.
+3. **Shared-store layout, then BK and output tile size.** Modest, low to medium confidence. Locate the conflicting store instruction first. 122 registers per thread limits larger tiles.
+4. **Pool FP8 temporaries; CUDA Graphs for repeated calls.** High confidence for end-to-end gain (`lib.rs` allocates amax slot, scale pair and byte output per uncached operand; weights are cached, f32 outputs and split-K scratch are pooled). Graphs cut launch overhead across about 21 convs per step, not the time inside one GEMM.
+5. **Quantise inside the GEMM load path.** Low expected gain, medium confidence. Repeats conversion across reused tiles and keeps the amax/scale dependency. Try item 1 first.
+
+Instruction boundary (from the same review): FP8 `mma.sync.m16n8k32` is available on sm_89; FP8 `wgmma` requires sm_90a; native `ldmatrix.b8` is not available on Ada. An `ldmatrix.b16` plus repacking variant is possible but has the least direct evidence.

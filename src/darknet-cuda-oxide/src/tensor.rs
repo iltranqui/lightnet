@@ -15,6 +15,8 @@ pub(crate) struct BufPool {
     /// Separate free list for 16-bit (f16 / bf16 bit pattern) buffers; shares
     /// the byte cap with the f32 list.
     free16: Mutex<HashMap<usize, Vec<DeviceBuffer<u16>>>>,
+    /// Separate free list for byte buffers (fp8 operands); shares the byte cap.
+    free8: Mutex<HashMap<usize, Vec<DeviceBuffer<u8>>>>,
     cap_bytes: usize,
 }
 
@@ -31,6 +33,7 @@ impl BufPool {
         Arc::new(Self {
             free: Mutex::new((HashMap::new(), 0)),
             free16: Mutex::new(HashMap::new()),
+            free8: Mutex::new(HashMap::new()),
             cap_bytes,
         })
     }
@@ -47,6 +50,9 @@ impl BufPool {
             g.1 = 0;
         }
         if let Ok(mut g) = self.free16.lock() {
+            g.clear();
+        }
+        if let Ok(mut g) = self.free8.lock() {
             g.clear();
         }
     }
@@ -67,6 +73,32 @@ impl BufPool {
             f.1 = f.1.saturating_sub(buf.num_bytes());
         }
         Some(buf)
+    }
+
+    pub(crate) fn take8(&self, len: usize) -> Option<DeviceBuffer<u8>> {
+        let buf = {
+            let mut g = self.free8.lock().ok()?;
+            g.get_mut(&len)?.pop()?
+        };
+        if let Ok(mut f) = self.free.lock() {
+            f.1 = f.1.saturating_sub(buf.num_bytes());
+        }
+        Some(buf)
+    }
+
+    fn give8(&self, buf: DeviceBuffer<u8>) {
+        if buf.len() == 0 {
+            return;
+        }
+        // The f32 list owns the shared byte counter.
+        let Ok(mut f) = self.free.lock() else { return };
+        if f.1 + buf.num_bytes() > self.cap_bytes {
+            return;
+        }
+        if let Ok(mut g) = self.free8.lock() {
+            f.1 += buf.num_bytes();
+            g.entry(buf.len()).or_default().push(buf);
+        }
     }
 
     fn give16(&self, buf: DeviceBuffer<u16>) {
@@ -226,6 +258,42 @@ impl Drop for PooledBuf16 {
     fn drop(&mut self) {
         if let Some(b) = self.buf.take() {
             self.pool.give16(b);
+        }
+    }
+}
+
+/// A byte device buffer (fp8 operand) that returns to its [`BufPool`] on drop.
+pub(crate) struct PooledBuf8 {
+    buf: Option<DeviceBuffer<u8>>,
+    pool: Arc<BufPool>,
+}
+
+impl PooledBuf8 {
+    pub(crate) fn new(buf: DeviceBuffer<u8>, pool: &Arc<BufPool>) -> Self {
+        Self {
+            buf: Some(buf),
+            pool: pool.clone(),
+        }
+    }
+}
+
+impl Deref for PooledBuf8 {
+    type Target = DeviceBuffer<u8>;
+    fn deref(&self) -> &DeviceBuffer<u8> {
+        self.buf.as_ref().expect("buffer present until drop")
+    }
+}
+
+impl DerefMut for PooledBuf8 {
+    fn deref_mut(&mut self) -> &mut DeviceBuffer<u8> {
+        self.buf.as_mut().expect("buffer present until drop")
+    }
+}
+
+impl Drop for PooledBuf8 {
+    fn drop(&mut self) {
+        if let Some(b) = self.buf.take() {
+            self.pool.give8(b);
         }
     }
 }

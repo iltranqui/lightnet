@@ -37,7 +37,7 @@ use kernels::{
     deform_sample, elementwise, foveation_film, gemm, gemm_f8, gemm_f16, gemm_fp4, gemm_mma,
     half_ops, im2col, layers_extra, muon, optim, pool, quant_fp4, resample, route,
 };
-use tensor::PooledBuf;
+use tensor::{PooledBuf, PooledBuf8};
 pub use tensor::{OxideTensorF16, OxideTensorF32};
 
 #[derive(Debug)]
@@ -1496,8 +1496,9 @@ impl OxideBackend {
 
     /// `[1, 1]` on the device: the scale pair of an operand that is not
     /// quantised here (pre-quantised bytes, or an empty operand).
-    fn unit_scale(&self) -> Result<DeviceBuffer<f32>, OxideError> {
-        Ok(DeviceBuffer::<f32>::from_host(&self.stream, &[1.0, 1.0])?)
+    fn unit_scale(&self) -> Result<PooledBuf, OxideError> {
+        let b = DeviceBuffer::<f32>::from_host(&self.stream, &[1.0, 1.0])?;
+        Ok(PooledBuf::new(b, &self.bufs))
     }
 
     /// Device-side `[factor, 1 / factor]` for the first `len` elements of a
@@ -1514,11 +1515,13 @@ impl OxideBackend {
         buf: &DeviceBuffer<f32>,
         len: usize,
         fmt: Fp8Format,
-    ) -> Result<DeviceBuffer<f32>, OxideError> {
+    ) -> Result<PooledBuf, OxideError> {
         if len == 0 {
             return self.unit_scale();
         }
-        let mut slot = DeviceBuffer::<u32>::zeroed(&self.stream, 1)?;
+        // Pooled: no cudaMalloc/free per operand.  The slot must start at 0;
+        // the scale pair is fully written by the kernel below.
+        let mut slot = self.alloc(1)?;
         // SAFETY: one thread per element; the single atomic slot is zeroed
         // above and only read through `fetch_max`.
         unsafe {
@@ -1530,7 +1533,7 @@ impl OxideBackend {
             )
         }
         .map_err(launch_err)?;
-        let mut scale = DeviceBuffer::<f32>::zeroed(&self.stream, 2)?;
+        let mut scale = self.alloc_uninit(2)?;
         // SAFETY: two threads, one per output word; `slot` holds the amax bits.
         unsafe {
             self.gemm_f8.fp8_scale_kernel(
@@ -1553,9 +1556,10 @@ impl OxideBackend {
         len: usize,
         scale: &DeviceBuffer<f32>,
         fmt: Fp8Format,
-    ) -> Result<DeviceBuffer<u8>, OxideError> {
-        let mut out = DeviceBuffer::<u8>::zeroed(&self.stream, len)?;
-        // SAFETY: one thread per element; both buffers have `len` elements.
+    ) -> Result<PooledBuf8, OxideError> {
+        let mut out = self.alloc8_uninit(len)?;
+        // SAFETY: one thread per element, and the kernel writes every byte;
+        // both buffers have `len` elements.
         unsafe {
             self.gemm_f8.fp8_quantize_kernel(
                 &self.stream,
@@ -2442,7 +2446,7 @@ impl OxideBackend {
             return Ok(0.0);
         }
         let x = DeviceBuffer::<f32>::from_host(&self.stream, values)?;
-        let mut slot = DeviceBuffer::<u32>::zeroed(&self.stream, 1)?;
+        let mut slot = DeviceBuffer::<f32>::zeroed(&self.stream, 1)?;
         // SAFETY: one thread per input element; the single atomic slot is
         // zeroed above and only ever read through `fetch_max`.
         unsafe {
@@ -2454,7 +2458,7 @@ impl OxideBackend {
             )
         }
         .map_err(launch_err)?;
-        Ok(f32::from_bits(slot.to_host_vec(&self.stream)?[0]))
+        Ok(slot.to_host_vec(&self.stream)?[0])
     }
 
     /// `bytes[i] = quantize(values[i] * scale, fmt)`.
@@ -3248,6 +3252,24 @@ impl OxideBackend {
                 self.bufs.flush();
                 match DeviceBuffer::<f32>::zeroed(&self.stream, len) {
                     Ok(b) => Ok(PooledBuf::new(b, &self.bufs)),
+                    Err(_) => Err(OxideError::from(err)),
+                }
+            }
+        }
+    }
+
+    /// Byte buffer with unspecified contents (fp8 operands); same rule as
+    /// [`Self::alloc_uninit`].  Flushes the pool and retries once on OOM.
+    fn alloc8_uninit(&self, len: usize) -> Result<PooledBuf8, OxideError> {
+        if let Some(b) = self.bufs.take8(len) {
+            return Ok(PooledBuf8::new(b, &self.bufs));
+        }
+        match DeviceBuffer::<u8>::zeroed(&self.stream, len) {
+            Ok(b) => Ok(PooledBuf8::new(b, &self.bufs)),
+            Err(err) => {
+                self.bufs.flush();
+                match DeviceBuffer::<u8>::zeroed(&self.stream, len) {
+                    Ok(b) => Ok(PooledBuf8::new(b, &self.bufs)),
                     Err(_) => Err(OxideError::from(err)),
                 }
             }

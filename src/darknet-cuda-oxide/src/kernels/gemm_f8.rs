@@ -306,10 +306,10 @@ pub mod kernels {
     }
 
     /// `out[0] = max(|x[i]|)` over `x`, ignoring non-finite values.  `out` is
-    /// a single `u32` slot that must already hold 0; the kernel finishes with
+    /// a single f32 slot (read as `u32` bits) that must already hold 0; the kernel finishes with
     /// an `atomicMax` on the bit pattern (valid for non-negative floats).
     #[kernel]
-    pub fn fp8_amax_f32_kernel(x: &[f32], mut out: DisjointSlice<u32>) {
+    pub fn fp8_amax_f32_kernel(x: &[f32], mut out: DisjointSlice<f32>) {
         let idx = thread::index_1d();
         let i = idx.get();
         if i >= x.len() {
@@ -319,7 +319,9 @@ pub mod kernels {
         let magnitude = if value.is_finite() { value.abs() } else { 0.0 };
         // SAFETY: the host guarantees `out.len() >= 1`; slot 0 is only ever
         // touched through this atomic while the kernel runs.
-        let slot = out.as_mut_ptr();
+        // The slot is an f32 buffer (so it can come from the f32 pool); an
+        // all-zero word is both 0.0 and the zero bit pattern `fetch_max` needs.
+        let slot = out.as_mut_ptr() as *mut u32;
         let atomic = unsafe { DeviceAtomicU32::from_ptr(slot) };
         let _ = atomic.fetch_max(magnitude.to_bits(), AtomicOrdering::Relaxed);
     }
@@ -328,10 +330,10 @@ pub mod kernels {
     /// amax slot, falling back to `1, 1` when amax is zero or non-finite.
     /// Launched with two threads, one per output word.
     #[kernel]
-    pub fn fp8_scale_kernel(amax: &[u32], mut out: DisjointSlice<f32>, fmt: u32) {
+    pub fn fp8_scale_kernel(amax: &[f32], mut out: DisjointSlice<f32>, fmt: u32) {
         let idx = thread::index_1d();
         let word = idx.get();
-        let amax = f32::from_bits(amax[0]);
+        let amax = amax[0];
         let max_finite = if fmt == 0 { 448.0 } else { 57344.0 };
         let factor = if amax > 0.0 && amax.is_finite() {
             max_finite / amax
