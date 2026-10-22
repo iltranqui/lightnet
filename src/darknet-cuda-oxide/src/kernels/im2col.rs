@@ -95,8 +95,9 @@ pub mod kernels {
         out_h: usize,
         out_w: usize,
         fmt: u32,
+        off: u32,
     ) {
-        let factor = fp8_factor(amax[0], fmt);
+        let factor = fp8_factor(amax[off as usize], fmt);
         let kk = ksize * ksize;
         let rows_per_image = channels * kk;
         let row = thread::blockIdx_x() as usize;

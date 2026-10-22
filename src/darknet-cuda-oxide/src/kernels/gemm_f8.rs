@@ -324,24 +324,47 @@ pub mod kernels {
     }
 
     /// `out[0] = max(|x[i]|)` over `x`, ignoring non-finite values.  `out` is
-    /// a single f32 slot (read as `u32` bits) that must already hold 0; the kernel finishes with
-    /// an `atomicMax` on the bit pattern (valid for non-negative floats).
+    /// a single f32 slot (read as `u32` bits) that must already hold 0.  Each
+    /// 256-thread block reduces in shared memory and issues one `atomicMax` on the
+    /// bit pattern (valid for non-negative floats); launch whole 256-thread blocks.
     #[kernel]
-    pub fn fp8_amax_f32_kernel(x: &[f32], mut out: DisjointSlice<f32>) {
-        let idx = thread::index_1d();
-        let i = idx.get();
-        if i >= x.len() {
-            return;
+    pub fn fp8_amax_f32_kernel(x: &[f32], mut out: DisjointSlice<f32>, off: u32) {
+        static mut SH: SharedArray<u32, 256, 16> = SharedArray::UNINIT;
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SH) };
+        let tid = thread::threadIdx_x() as usize;
+        let i = thread::blockIdx_x() as usize * 256 + tid;
+        let mut bits = 0u32;
+        if i < x.len() {
+            let value = x[i];
+            if value.is_finite() {
+                bits = value.abs().to_bits();
+            }
         }
-        let value = x[i];
-        let magnitude = if value.is_finite() { value.abs() } else { 0.0 };
-        // SAFETY: the host guarantees `out.len() >= 1`; slot 0 is only ever
-        // touched through this atomic while the kernel runs.
-        // The slot is an f32 buffer (so it can come from the f32 pool); an
-        // all-zero word is both 0.0 and the zero bit pattern `fetch_max` needs.
-        let slot = out.as_mut_ptr() as *mut u32;
-        let atomic = unsafe { DeviceAtomicU32::from_ptr(slot) };
-        let _ = atomic.fetch_max(magnitude.to_bits(), AtomicOrdering::Relaxed);
+        // SAFETY: `tid < 256`, the shared array's length; every access between
+        // two barriers touches a distinct or read-only slot.
+        unsafe { sh.add(tid).write(bits) };
+        thread::sync_threads();
+        let mut stride = 128usize;
+        while stride > 0 {
+            if tid < stride {
+                let other = unsafe { sh.add(tid + stride).read() };
+                let mine = unsafe { sh.add(tid).read() };
+                if other > mine {
+                    unsafe { sh.add(tid).write(other) };
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        if tid == 0 {
+            // SAFETY: the host guarantees `out.len() >= 1`; slot 0 is only ever
+            // touched through this atomic while the kernel runs.  The slot is an
+            // f32 buffer; an all-zero word is both 0.0 and the zero bit pattern
+            // `fetch_max` needs.
+            let slot = unsafe { out.as_mut_ptr().add(off as usize) } as *mut u32;
+            let atomic = unsafe { DeviceAtomicU32::from_ptr(slot) };
+            let _ = atomic.fetch_max(unsafe { sh.read() }, AtomicOrdering::Relaxed);
+        }
     }
 
     /// `out[i] = quantize(x[i] * factor, fmt)` with `factor = max_finite(fmt) /
@@ -357,10 +380,11 @@ pub mod kernels {
         mut out: DisjointSlice<u8>,
         mut scale: DisjointSlice<f32>,
         fmt: u32,
+        off: u32,
     ) {
         let idx = thread::index_1d();
         let i = idx.get();
-        let amax = amax[0];
+        let amax = amax[off as usize];
         let max_finite = if fmt == 0 { 448.0 } else { 57344.0 };
         let factor = if amax > 0.0 && amax.is_finite() {
             max_finite / amax
@@ -385,7 +409,14 @@ pub mod kernels {
     /// f32 words, zero on entry; the atomics act on the bit patterns, which
     /// order like the values for non-negative floats.
     #[kernel]
-    pub fn fp8_amax_pair_kernel(a: &[f32], b: &[f32], a_len: u32, b_len: u32, mut slots: DisjointSlice<f32>) {
+    pub fn fp8_amax_pair_kernel(
+        a: &[f32],
+        b: &[f32],
+        a_len: u32,
+        b_len: u32,
+        mut slots: DisjointSlice<f32>,
+        off: u32,
+    ) {
         static mut SH: SharedArray<u32, 256, 16> = SharedArray::UNINIT;
         let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SH) };
         let tid = thread::threadIdx_x() as usize;
@@ -420,7 +451,7 @@ pub mod kernels {
             stride /= 2;
         }
         if tid == 0 {
-            let word = if is_b { 32 } else { 0 };
+            let word = off as usize + if is_b { 32 } else { 0 };
             // SAFETY: the host passes 33 words; each slot is only touched
             // through this atomic while the kernel runs.
             let slot = unsafe { slots.as_mut_ptr().add(word) } as *mut u32;
@@ -447,15 +478,17 @@ pub mod kernels {
         b_len: u32,
         fmt_a: u32,
         fmt_b: u32,
+        off: u32,
     ) {
         let i = thread::index_1d().get();
+        let off = off as usize;
         let (a_len, b_len) = (a_len as usize, b_len as usize);
         let a_span = if a_len > 2 { a_len } else { 2 };
         // SAFETY (all raw writes below): the host sizes `out_*` to the operand
         // lengths and `scale_*` to two words; each thread writes only the slots
         // its own index selects, so no two threads write the same address.
         if i < a_span {
-            let factor = fp8_factor(amax[0], fmt_a);
+            let factor = fp8_factor(amax[off], fmt_a);
             if i < 2 {
                 unsafe { scale_a.as_mut_ptr().add(i).write(if i == 0 { factor } else { 1.0 / factor }) };
             }
@@ -464,7 +497,7 @@ pub mod kernels {
             }
         } else {
             let j = i - a_span;
-            let factor = fp8_factor(amax[32], fmt_b);
+            let factor = fp8_factor(amax[off + 32], fmt_b);
             if j < 2 {
                 unsafe { scale_b.as_mut_ptr().add(j).write(if j == 0 { factor } else { 1.0 / factor }) };
             }

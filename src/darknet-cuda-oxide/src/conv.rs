@@ -317,13 +317,14 @@ impl OxideBackend {
         &self,
         g: &Geom,
         x: &DeviceBuffer<f32>,
-        amax: &DeviceBuffer<f32>,
+        amax_off: u32,
         col: &mut DeviceBuffer<u8>,
         scale: &mut DeviceBuffer<f32>,
         batch_index: usize,
         images: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<(), OxideError> {
+        let ring = self.fp8_ring_guard()?;
         // SAFETY: as `launch_im2col`, with `col` holding `images * col_len`
         // bytes and `scale` two words.
         unsafe {
@@ -331,7 +332,7 @@ impl OxideBackend {
                 &self.stream,
                 launch::blocks_of(images * g.c * g.k * g.k, launch::block_size(config)),
                 x,
-                amax,
+                &ring.buf,
                 col,
                 scale,
                 batch_index * g.c * g.h * g.w,
@@ -346,6 +347,7 @@ impl OxideBackend {
                 g.oh,
                 g.ow,
                 Fp8Format::E4M3.code(),
+                amax_off,
             )
         }
         .map_err(launch_err)
@@ -459,7 +461,7 @@ impl OxideBackend {
                 let mut b0 = 0;
                 while b0 < g.batch {
                     let nb = chunk.min(g.batch - b0);
-                    self.launch_im2col_fp8(&g, &x.buf, &amax, &mut cols, &mut scale, b0, nb, config)?;
+                    self.launch_im2col_fp8(&g, &x.buf, amax, &mut cols, &mut scale, b0, nb, config)?;
                     let inst = nb * groups;
                     self.gemm_fp8_args(
                         &wq.bytes,
@@ -727,7 +729,7 @@ impl OxideBackend {
                 while b0 < g.batch {
                     let nb = chunk.min(g.batch - b0);
                     if let (Some(amax), Some(cols8), Some(scale)) = (amax.as_ref(), cols8.as_mut(), scale.as_mut()) {
-                        self.launch_im2col_fp8(&g, &x.buf, amax, cols8, scale, b0, nb, config)?;
+                        self.launch_im2col_fp8(&g, &x.buf, *amax, cols8, scale, b0, nb, config)?;
                     } else {
                         self.launch_im2col(&g, &x.buf, ws, b0, nb, config)?;
                     }

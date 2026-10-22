@@ -41,6 +41,22 @@ use kernels::{
 use tensor::{PooledBuf, PooledBuf8};
 pub use tensor::{OxideTensorF16, OxideTensorF32};
 
+/// Words per amax slot: the pair kernel uses words `0` and `32`, so a slot is
+/// 64 words (256 bytes) and neighbouring slots never share a cache line.
+pub(crate) const FP8_SLOT_WORDS: usize = 64;
+/// Slots per ring; one memset zeroes all of them once every `FP8_RING_SLOTS`
+/// quantised operands instead of one memset per operand.
+pub(crate) const FP8_RING_SLOTS: usize = 256;
+
+/// A ring of zeroed amax slots.  The amax kernels `fetch_max` into a slot that
+/// must start at 0; a slot is handed out once per lap and the whole ring is
+/// re-zeroed (stream-ordered, so after every kernel that read the previous lap)
+/// when it wraps.
+pub(crate) struct Fp8Ring {
+    pub(crate) buf: DeviceBuffer<f32>,
+    next: usize,
+}
+
 #[derive(Debug)]
 pub enum OxideError {
     Cuda(DriverError),
@@ -98,6 +114,8 @@ pub struct OxideBackend {
     /// Quantised copies of f32 weight tensors for the FP8 GEMM (keyed by the
     /// weight buffer identity and format); see [`OxideBackend::fp8_weights`].
     fp8_w: Mutex<Vec<mixed::Fp8WEntry>>,
+    /// Pre-zeroed amax slots (see [`Fp8Ring`]).
+    fp8_ring: Mutex<Fp8Ring>,
     /// Quantise launches issued by the FP8 path; see
     /// [`OxideBackend::fp8_quantize_launches`].
     fp8_quantize_launches: AtomicU64,
@@ -1376,6 +1394,10 @@ impl OxideBackend {
         let layers_extra = layers_extra::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load layers_extra module: {err:?}")))?;
         let half_scratch = half::HalfScratch::new(&stream)?;
+        let fp8_ring = Fp8Ring {
+            buf: DeviceBuffer::<f32>::zeroed(&stream, FP8_RING_SLOTS * FP8_SLOT_WORDS)?,
+            next: 0,
+        };
         let bufs = tensor::BufPool::new();
         let empty_f32 = Arc::new(PooledBuf::new(
             DeviceBuffer::<f32>::zeroed(&stream, 0)?,
@@ -1407,6 +1429,7 @@ impl OxideBackend {
             amp_w16: Mutex::new(Vec::new()),
             host_readbacks: AtomicU64::new(0),
             fp8_w: Mutex::new(Vec::new()),
+            fp8_ring: Mutex::new(fp8_ring),
             fp8_quantize_launches: AtomicU64::new(0),
             empty_f32,
             half_scratch: Mutex::new(half_scratch),
@@ -1509,6 +1532,27 @@ impl OxideBackend {
         Ok(PooledBuf::new(b, &self.bufs))
     }
 
+    /// Word offset of the next zeroed slot of the amax ring.  Once every
+    /// [`FP8_RING_SLOTS`] calls the whole ring is zero-filled again (one
+    /// memset), which is safe because the stream orders it after every kernel
+    /// of the previous lap.
+    pub(crate) fn fp8_ring_guard(&self) -> Result<std::sync::MutexGuard<'_, Fp8Ring>, OxideError> {
+        self.fp8_ring
+            .lock()
+            .map_err(|_| shape_err("fp8_ring", "lock poisoned".into()))
+    }
+
+    pub(crate) fn fp8_next_slot(&self) -> Result<u32, OxideError> {
+        let mut ring = self.fp8_ring_guard()?;
+        if ring.next == FP8_RING_SLOTS {
+            ring.buf.zero_async(&self.stream)?;
+            ring.next = 0;
+        }
+        let off = ring.next * FP8_SLOT_WORDS;
+        ring.next += 1;
+        Ok(off as u32)
+    }
+
     /// Quantise the first `len` elements of a device buffer to `fmt`: one amax
     /// pass, then one quantise pass that derives `factor = max_finite / amax`
     /// from the amax slot and also writes the device scale pair
@@ -1529,17 +1573,20 @@ impl OxideBackend {
         if len == 0 {
             return Ok((self.alloc8_uninit(0)?, self.unit_scale()?));
         }
-        // Pooled: no cudaMalloc/free per operand.  The slot must start at 0;
-        // the scale pair and bytes are fully written by the quantise kernel.
-        let mut slot = self.alloc(1)?;
-        // SAFETY: one thread per element; the single atomic slot is zeroed
-        // above and only read through `fetch_max`.
+        // Pooled: no cudaMalloc/free per operand.  The amax slot comes zeroed
+        // from the ring; the scale pair and bytes are fully written by the
+        // quantise kernel.
+        let off = self.fp8_next_slot()?;
+        let mut ring = self.fp8_ring_guard()?;
+        // SAFETY: one thread per element; the ring slot is zeroed and only
+        // touched through `fetch_max` while the kernel runs.
         unsafe {
             self.gemm_f8.fp8_amax_f32_kernel(
                 &self.stream,
-                launch::elementwise(len, ElementwiseLaunchConfig::default()),
+                launch::blocks_of(len.div_ceil(gemm_f8::F8_AMAX_BLOCK), gemm_f8::F8_AMAX_BLOCK as u32),
                 buf,
-                &mut slot,
+                &mut ring.buf,
+                off,
             )
         }
         .map_err(launch_err)?;
@@ -1552,10 +1599,11 @@ impl OxideBackend {
                 &self.stream,
                 launch::elementwise(len.max(2), ElementwiseLaunchConfig::default()),
                 buf,
-                &slot,
+                &ring.buf,
                 &mut out,
                 &mut scale,
                 fmt.code(),
+                off,
             )
         }
         .map_err(launch_err)?;
@@ -1582,9 +1630,10 @@ impl OxideBackend {
                 self.fp8_quantize_operand(b, b_len, fmt_b)?,
             ));
         }
-        let mut slots = self.alloc(33)?;
-        // SAFETY: whole 256-thread blocks per operand tile; `slots` is zeroed
-        // and only touched through `fetch_max`.
+        let off = self.fp8_next_slot()?;
+        let mut ring = self.fp8_ring_guard()?;
+        // SAFETY: whole 256-thread blocks per operand tile; the ring slot is
+        // zeroed and only touched through `fetch_max`.
         let tile = gemm_f8::F8_AMAX_BLOCK;
         let blocks = a_len.div_ceil(tile) + b_len.div_ceil(tile);
         unsafe {
@@ -1595,7 +1644,8 @@ impl OxideBackend {
                 b,
                 a_len as u32,
                 b_len as u32,
-                &mut slots,
+                &mut ring.buf,
+                off,
             )
         }
         .map_err(launch_err)?;
@@ -1612,7 +1662,7 @@ impl OxideBackend {
                 launch::elementwise(threads, ElementwiseLaunchConfig::default()),
                 a,
                 b,
-                &slots,
+                &ring.buf,
                 &mut out_a,
                 &mut out_b,
                 &mut scale_a,
@@ -1621,6 +1671,7 @@ impl OxideBackend {
                 b_len as u32,
                 fmt_a.code(),
                 fmt_b.code(),
+                off,
             )
         }
         .map_err(launch_err)?;
@@ -1628,25 +1679,27 @@ impl OxideBackend {
         Ok(((out_a, scale_a), (out_b, scale_b)))
     }
 
-    /// Absolute maximum of the first `len` elements of `buf` in a pooled,
-    /// zero-started slot (read by the device, never by the host).  Used by the
+    /// Absolute maximum of the first `len` elements of `buf` in a ring slot
+    /// (returns its word offset; read by the device, never by the host).  Used by the
     /// byte im2col, which quantises while it gathers.
-    pub(crate) fn fp8_amax_slot(&self, buf: &DeviceBuffer<f32>, len: usize) -> Result<PooledBuf, OxideError> {
-        let mut slot = self.alloc(1)?;
+    pub(crate) fn fp8_amax_slot(&self, buf: &DeviceBuffer<f32>, len: usize) -> Result<u32, OxideError> {
+        let off = self.fp8_next_slot()?;
         if len > 0 {
-            // SAFETY: one thread per element; the zeroed slot is only touched
-            // through `fetch_max`.
+            let mut ring = self.fp8_ring_guard()?;
+            // SAFETY: one thread per element; the ring slot is zeroed and only
+            // touched through `fetch_max`.
             unsafe {
                 self.gemm_f8.fp8_amax_f32_kernel(
                     &self.stream,
-                    launch::elementwise(len, ElementwiseLaunchConfig::default()),
+                    launch::blocks_of(len.div_ceil(gemm_f8::F8_AMAX_BLOCK), gemm_f8::F8_AMAX_BLOCK as u32),
                     buf,
-                    &mut slot,
+                    &mut ring.buf,
+                    off,
                 )
             }
             .map_err(launch_err)?;
         }
-        Ok(slot)
+        Ok(off)
     }
 
     /// `C = alpha * op(A) * op(B) + beta * C` with `A` an f32 operand quantised
@@ -2539,9 +2592,10 @@ impl OxideBackend {
         unsafe {
             self.gemm_f8.fp8_amax_f32_kernel(
                 &self.stream,
-                launch::elementwise(values.len(), ElementwiseLaunchConfig::default()),
+                launch::blocks_of(values.len().div_ceil(gemm_f8::F8_AMAX_BLOCK), gemm_f8::F8_AMAX_BLOCK as u32),
                 &x,
                 &mut slot,
+                0,
             )
         }
         .map_err(launch_err)?;
