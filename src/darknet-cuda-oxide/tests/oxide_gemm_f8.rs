@@ -371,6 +371,52 @@ fn gemm_fp8_e4m3_all_transposes() {
 }
 
 #[test]
+fn gemm_fp8_transposed_large_k_matches_reference() {
+    // Long K walks the vectorised `[k][n]` staging path (aligned 4x4 byte
+    // blocks) over 128 tiles per block; n = 66 / 35 force the guarded edge
+    // blocks and an unaligned row pitch.
+    let be = OxideBackend::new().expect("backend");
+    for &(m, n, k, ta, tb) in &[
+        (96usize, 80usize, 4096usize, false, false),
+        (70, 66, 4096, false, false),
+        (65, 35, 4096, true, false),
+        (64, 64, 4096, false, true),
+    ] {
+        gemm_case(&be, m, n, k, ta, tb, 1.0, Fp8Format::E4M3, Fp8Format::E4M3, 0x5000 + n as u64);
+    }
+}
+
+#[test]
+fn gemm_fp8_nn_is_bitwise_equal_to_nt_on_the_same_data() {
+    // The same B, stored `[k][n]` (NN, register-transposed staging) and `[n][k]`
+    // (NT, plain K-contiguous staging), must give identical bits: both
+    // accumulate in the same K order.
+    let be = OxideBackend::new().expect("backend");
+    for &(m, n, k) in &[(96usize, 80usize, 200usize), (70, 66, 129), (33, 19, 4096), (130, 7, 31)] {
+        let mut rng = Rng(0x6000 + k as u64);
+        let a = rng.vec(m * k, -2.0, 2.0);
+        let b = rng.vec(k * n, -2.0, 2.0);
+        let aq: Vec<u8> = a.iter().map(|x| f32_to_fp8(*x, Fp8Format::E4M3)).collect();
+        let bq: Vec<u8> = b.iter().map(|x| f32_to_fp8(*x, Fp8Format::E4M3)).collect();
+        let mut bt = vec![0u8; k * n];
+        for p in 0..k {
+            for j in 0..n {
+                bt[j * k + p] = bq[p * n + j];
+            }
+        }
+        let nn = be
+            .gemm_fp8(&aq, &bq, m, n, k, false, false, 1.0, Fp8Format::E4M3, Fp8Format::E4M3)
+            .expect("nn");
+        let nt = be
+            .gemm_fp8(&aq, &bt, m, n, k, false, true, 1.0, Fp8Format::E4M3, Fp8Format::E4M3)
+            .expect("nt");
+        let (nn, nt) = (download(&be, &nn), download(&be, &nt));
+        let same = nn.iter().zip(&nt).all(|(x, y)| x.to_bits() == y.to_bits());
+        assert!(same, "{m}x{n}x{k}: NN and NT differ");
+    }
+}
+
+#[test]
 fn gemm_fp8_odd_shapes_and_mixed_formats() {
     let be = OxideBackend::new().expect("backend");
     // Shapes that exercise the K tail (< 32, not a multiple of 32), partial

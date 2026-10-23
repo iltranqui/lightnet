@@ -223,6 +223,70 @@ pub fn fp8_stage16(
     }
 }
 
+/// Stages a `trans == 1` operand tile (stored `[k][n]`, contiguous along N)
+/// as one 4 (k) x 4 (n) byte block per thread, transposed in registers.
+///
+/// `ng` (0..16) picks four columns `col0 + 4 ng ..`, `kg` (0..8) four K rows
+/// `k0 + 4 kg ..`.  `dst[j]` is the word of K-consecutive bytes (bit `8 r` =
+/// k offset `r`) for column `4 ng + j`, ready to store at `[n][k]`.  A full
+/// aligned block takes four word loads instead of sixteen byte loads; edge
+/// blocks fall back to guarded byte loads and zero fill.
+#[allow(clippy::too_many_arguments)]
+#[device]
+pub fn fp8_stage_t4(
+    dst: &mut [u32; 4],
+    buf: &[u8],
+    base: usize,
+    ldr: usize,
+    k: usize,
+    cols: usize,
+    col0: usize,
+    ng: usize,
+    k0: usize,
+    kg: usize,
+) {
+    let gn = col0 + 4 * ng;
+    let gk = k0 + 4 * kg;
+    let at = unsafe { buf.as_ptr().add(base) };
+    if gn + 4 <= cols && gk + 4 <= k && ldr % 4 == 0 && ((at as usize) + gn) % 4 == 0 {
+        // SAFETY: rows `gk..gk + 4` are inside the K extent and the four
+        // columns inside N, so each word is 4 valid, 4-byte aligned bytes.
+        let (w0, w1, w2, w3) = unsafe {
+            (
+                (at.add(gk * ldr + gn) as *const u32).read(),
+                (at.add((gk + 1) * ldr + gn) as *const u32).read(),
+                (at.add((gk + 2) * ldr + gn) as *const u32).read(),
+                (at.add((gk + 3) * ldr + gn) as *const u32).read(),
+            )
+        };
+        let lo02 = (w0 & 0x00FF_00FF) | ((w1 & 0x00FF_00FF) << 8);
+        let lo13 = ((w0 >> 8) & 0x00FF_00FF) | (w1 & 0xFF00_FF00);
+        let hi02 = (w2 & 0x00FF_00FF) | ((w3 & 0x00FF_00FF) << 8);
+        let hi13 = ((w2 >> 8) & 0x00FF_00FF) | (w3 & 0xFF00_FF00);
+        dst[0] = (lo02 & 0xFFFF) | (hi02 << 16);
+        dst[1] = (lo13 & 0xFFFF) | (hi13 << 16);
+        dst[2] = (lo02 >> 16) | (hi02 & 0xFFFF_0000);
+        dst[3] = (lo13 >> 16) | (hi13 & 0xFFFF_0000);
+        return;
+    }
+    dst[0] = 0;
+    dst[1] = 0;
+    dst[2] = 0;
+    dst[3] = 0;
+    for r in 0..4usize {
+        if gk + r >= k {
+            break;
+        }
+        for j in 0..4usize {
+            if gn + j < cols {
+                // SAFETY: element (gk + r, gn + j) of the stored operand.
+                let byte = unsafe { *at.add((gk + r) * ldr + gn + j) };
+                dst[j] |= (byte as u32) << (8 * r);
+            }
+        }
+    }
+}
+
 /// Block size of `fp8_amax_pair_kernel` (one tile per block).
 pub const F8_AMAX_BLOCK: usize = 256;
 /// Amax history slots per quantised tensor role (delayed scaling).
@@ -788,19 +852,23 @@ pub mod kernels {
                 stage_kb,
                 stage_trans_a,
             );
-            fp8_stage16(
-                &mut breg,
-                b,
-                b_off,
-                ldb,
-                kend,
-                n,
-                col0,
-                stage_row,
-                kbeg,
-                stage_kb,
-                stage_trans_b,
-            );
+            if stage_trans_b == 1 {
+                fp8_stage_t4(&mut breg, b, b_off, ldb, kend, n, col0, tid % 16, kbeg, tid / 16);
+            } else {
+                fp8_stage16(
+                    &mut breg,
+                    b,
+                    b_off,
+                    ldb,
+                    kend,
+                    n,
+                    col0,
+                    stage_row,
+                    kbeg,
+                    stage_kb,
+                    stage_trans_b,
+                );
+            }
         }
 
         let mut it = 0usize;
@@ -816,9 +884,14 @@ pub mod kernels {
                     (asp as *mut u32)
                         .add((stage_row * LD_A + stage_kb) / 4 + w)
                         .write(areg[w]);
-                    (bsp as *mut u32)
-                        .add((stage_row * LD_B + stage_kb) / 4 + w)
-                        .write(breg[w]);
+                    // `trans == 1` blocks hold column `4 ng + w`, K bytes
+                    // `4 kg ..`; the others a 16-byte K run of one row.
+                    let boff = if stage_trans_b == 1 {
+                        ((tid % 16) * 4 + w) * LD_B / 4 + tid / 16
+                    } else {
+                        (stage_row * LD_B + stage_kb) / 4 + w
+                    };
+                    (bsp as *mut u32).add(boff).write(breg[w]);
                 }
             });
             thread::sync_threads();
@@ -839,19 +912,23 @@ pub mod kernels {
                     stage_kb,
                     stage_trans_a,
                 );
-                fp8_stage16(
-                    &mut breg,
-                    b,
-                    b_off,
-                    ldb,
-                    kend,
-                    n,
-                    col0,
-                    stage_row,
-                    k0,
-                    stage_kb,
-                    stage_trans_b,
-                );
+                if stage_trans_b == 1 {
+                    fp8_stage_t4(&mut breg, b, b_off, ldb, kend, n, col0, tid % 16, k0, tid / 16);
+                } else {
+                    fp8_stage16(
+                        &mut breg,
+                        b,
+                        b_off,
+                        ldb,
+                        kend,
+                        n,
+                        col0,
+                        stage_row,
+                        k0,
+                        stage_kb,
+                        stage_trans_b,
+                    );
+                }
             }
 
             // One mma k step per 32-element tile (F8_BK == 32).
