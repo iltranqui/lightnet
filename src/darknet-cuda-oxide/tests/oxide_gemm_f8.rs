@@ -1533,3 +1533,77 @@ fn delayed_half_quantises_in_one_launch_f16() {
 fn delayed_half_quantises_in_one_launch_bf16() {
     delayed_half_quantises_in_one_launch(HalfFormat::Bf16);
 }
+
+// ---- Non-finite propagation and tiny amax (codex review, v0.2.188 / v0.2.190) --
+
+const NAN_BYTE: u8 = 0x7f;
+
+/// Data with finite values plus NaN / +-Inf entries (and a finite 16-bit-safe
+/// spike), quantised through every GEMM quantiser: non-finite input must reach
+/// the byte stream as the NaN code (so the GEMM output is non-finite and the
+/// loss scaler sees it), while amax and the scale pair keep ignoring it.
+#[test]
+fn fp8_quantisers_propagate_non_finite_input() {
+    for scaling in [Fp8Scaling::Current, Fp8Scaling::Delayed] {
+        let be = OxideBackend::new().expect("backend").with_fp8_scaling(scaling);
+        let mut rng = Rng(0x0ff1_ce);
+        let mut x = rng.vec(600, -2.0, 2.0);
+        x[3] = f32::INFINITY;
+        x[4] = f32::NEG_INFINITY;
+        x[5] = f32::NAN;
+        x[299] = 1.0e3; // finite spike: saturates, never NaN
+        let amax = x.iter().filter(|v| v.is_finite()).fold(0.0f32, |m, v| m.max(v.abs()));
+        for fmt in [Fp8Format::E4M3, Fp8Format::E5M2] {
+            let key = Some(0xbad_u64 + fmt.code() as u64);
+            let t = be.upload_f32(&[x.len()], &x).unwrap();
+            let (bytes, scale) = be.fp8_quantize_probe(&t, fmt, key).unwrap();
+            let tag = format!("f32 {scaling:?} {fmt:?}");
+            for i in [3usize, 4, 5] {
+                assert!(fp8_to_f32(bytes[i], fmt).is_nan(), "{tag}: element {i} must be NaN, byte {:#x}", bytes[i]);
+            }
+            for (i, &b) in bytes.iter().enumerate() {
+                if ![3, 4, 5].contains(&i) {
+                    assert!(fp8_to_f32(b, fmt).is_finite(), "{tag}: finite input {i} became non-finite");
+                }
+            }
+            if scaling == Fp8Scaling::Current {
+                assert!((scale[0] - fmt_max(fmt) / amax).abs() <= 1e-3 * scale[0], "{tag}: amax must ignore non-finite");
+            }
+            for hfmt in [HalfFormat::F16, HalfFormat::Bf16] {
+                let xh = half_tensor(&be, &x, hfmt);
+                let (hb, _) = be.fp8_quantize_half_probe_keyed(&xh, fmt, hfmt, key.map(|k| k + 77)).unwrap();
+                for i in [3usize, 4, 5] {
+                    assert!(fp8_to_f32(hb[i], fmt).is_nan(), "{tag} {hfmt:?}: element {i} must be NaN, byte {:#x}", hb[i]);
+                }
+                assert!(
+                    hb.iter().enumerate().all(|(i, &b)| [3, 4, 5].contains(&i) || fp8_to_f32(b, fmt).is_finite()),
+                    "{tag} {hfmt:?}: finite input became non-finite"
+                );
+            }
+        }
+    }
+}
+
+fn fmt_max(fmt: Fp8Format) -> f32 {
+    match fmt {
+        Fp8Format::E4M3 => 448.0,
+        Fp8Format::E5M2 => 57344.0,
+    }
+}
+
+/// The two-operand (pair) quantiser of the f32 GEMM selector propagates too.
+#[test]
+fn fp8_gemm_with_inf_operand_is_non_finite() {
+    let be = OxideBackend::new().expect("backend").with_gemm_mode(GemmMode::Fp8);
+    let (m, n, k) = (16usize, 16usize, 32usize);
+    let mut rng = Rng(0x1ff);
+    let mut a = rng.vec(m * k, -1.0, 1.0);
+    let b = rng.vec(k * n, -1.0, 1.0);
+    a[0] = f32::INFINITY;
+    let (ta, tb) = (be.upload_f32(&[m, k], &a).unwrap(), be.upload_f32(&[k, n], &b).unwrap());
+    let c0 = be.upload_f32(&[m, n], &vec![0.0f32; m * n]).unwrap();
+    let c = download(&be, &be.gemm_f32(&ta, &tb, &c0, m, n, k, false, false, 1.0, 0.0).unwrap());
+    assert!(c[..n].iter().all(|v| !v.is_finite()), "row 0 holds the Inf operand: {:?}", &c[..4]);
+    assert!(c[n..].iter().all(|v| v.is_finite()), "other rows must stay finite");
+}
+

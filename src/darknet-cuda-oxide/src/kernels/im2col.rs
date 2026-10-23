@@ -9,7 +9,7 @@
 //! col2im is written as a gather (one thread per input element) so it needs no
 //! atomics and is bit-for-bit deterministic.
 
-use super::gemm_f8::{fp8_factor, quantize_f32};
+use super::gemm_f8::{fp8_factor, quantize_nan_f32};
 use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
 
 #[cuda_module]
@@ -133,7 +133,7 @@ pub mod kernels {
             }
             // SAFETY: one thread per (row, p); `col_base + p < images * col_len`.
             unsafe {
-                *col.as_mut_ptr().add(col_base + p) = quantize_f32(v, factor, fmt);
+                *col.as_mut_ptr().add(col_base + p) = quantize_nan_f32(v, factor, fmt);
             }
             p += step;
         }

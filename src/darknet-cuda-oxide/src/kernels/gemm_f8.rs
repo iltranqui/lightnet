@@ -111,6 +111,24 @@ pub fn quantize_f32(value: f32, scale: f32, fmt: u32) -> u8 {
     }
 }
 
+/// FP8 NaN byte: `0x7f` is NaN in both e4m3 and e5m2.
+const FP8_NAN_BYTE: u8 = 0x7F;
+
+/// [`quantize_f32`] for the GEMM operand quantisers: finite input saturates as
+/// usual, but a non-finite input (the amax pass ignores those) becomes the NaN
+/// code instead of max finite, so an overflowed gradient or activation reaches
+/// the GEMM output as non-finite and the loss scaler's check sees it.  The test
+/// is on the unscaled value: a finite value whose scaled product overflows f32
+/// still saturates.
+#[device]
+pub fn quantize_nan_f32(value: f32, scale: f32, fmt: u32) -> u8 {
+    if value.is_finite() {
+        quantize_f32(value, scale, fmt)
+    } else {
+        FP8_NAN_BYTE
+    }
+}
+
 /// Logical element count `len` of a possibly larger, reused buffer of
 /// `buf_len` elements (never beyond the buffer).
 #[device]
@@ -575,7 +593,7 @@ pub mod kernels {
             return;
         }
         if let Some(o) = out.get_mut(idx) {
-            *o = quantize_f32(half_bits_to_f32(x[i], hfmt), factor, fmt);
+            *o = quantize_nan_f32(half_bits_to_f32(x[i], hfmt), factor, fmt);
         }
     }
 
@@ -605,7 +623,7 @@ pub mod kernels {
             return;
         }
         if let Some(o) = out.get_mut(idx) {
-            *o = quantize_f32(x[i], factor, fmt);
+            *o = quantize_nan_f32(x[i], factor, fmt);
         }
     }
 
@@ -660,7 +678,7 @@ pub mod kernels {
                 bits = value.abs().to_bits();
             }
             if let Some(o) = out.get_mut(idx) {
-                *o = quantize_f32(value, factor, fmt);
+                *o = quantize_nan_f32(value, factor, fmt);
             }
         }
         if let Some(o) = scale.get_mut(thread::index_1d()) {
@@ -750,7 +768,7 @@ pub mod kernels {
                 bits = value.abs().to_bits();
             }
             if let Some(o) = out.get_mut(idx) {
-                *o = quantize_f32(value, factor, fmt);
+                *o = quantize_nan_f32(value, factor, fmt);
             }
         }
         if let Some(o) = scale.get_mut(thread::index_1d()) {
@@ -877,7 +895,7 @@ pub mod kernels {
                 unsafe { scale_a.as_mut_ptr().add(i).write(if i == 0 { factor } else { 1.0 / factor }) };
             }
             if i < a_len {
-                unsafe { out_a.as_mut_ptr().add(i).write(quantize_f32(a[i], factor, fmt_a)) };
+                unsafe { out_a.as_mut_ptr().add(i).write(quantize_nan_f32(a[i], factor, fmt_a)) };
             }
         } else {
             let j = i - a_span;
@@ -886,7 +904,7 @@ pub mod kernels {
                 unsafe { scale_b.as_mut_ptr().add(j).write(if j == 0 { factor } else { 1.0 / factor }) };
             }
             if j < b_len {
-                unsafe { out_b.as_mut_ptr().add(j).write(quantize_f32(b[j], factor, fmt_b)) };
+                unsafe { out_b.as_mut_ptr().add(j).write(quantize_nan_f32(b[j], factor, fmt_b)) };
             }
         }
     }

@@ -1375,3 +1375,53 @@ fn amp_fp8_conv_amax_ignores_stale_workspace_tail() {
     }
 }
 
+
+/// Mirrors `amp_overflowing_gradients_become_nonfinite_not_garbage` with the
+/// conv GEMMs on fp8: the amax ignores Inf and a saturating conversion used to
+/// map Inf to max finite, so an all-Inf `dy` over finite activations gave a
+/// finite weight gradient the loss scaler never saw.  Non-finite inputs must
+/// reach the GEMM output.
+#[test]
+fn amp_fp8_conv_overflowing_gradients_become_nonfinite() {
+    for hfmt in BOTH_FORMATS {
+        let be = fp8_amp_backend(hfmt).with_fp8_backward(Some((Fp8Format::E4M3, Fp8Format::E5M2)));
+        let cs = Cv { b: 2, c: 8, h: 6, w: 6, f: 6, k: 3, s: 1, pad: 1, groups: 1 };
+        let mut rng = Rng(0xf10_f10 + hfmt.code() as u64);
+        let (c, h, ww, f, k, sx, sy, dil, pad, groups) = conv_args(&cs);
+        let (oh, ow) = (cs.oh(), cs.ow());
+        let shape_w = [f, cs.cpg(), k, k];
+        let x = rng.vec(cs.b * c * h * ww, -1.0, 1.0);
+        let xh = be.to_half_storage(&up(&be, &[cs.b, c, h, ww], &x)).unwrap();
+        let wt = up(&be, &shape_w, &rng.vec(f * cs.cpg() * k * k, -0.5, 0.5));
+        let n_dy = cs.b * f * oh * ow;
+        let tag = format!("{hfmt:?}");
+
+        // all-Inf dy over finite activations
+        let dy_inf = be.to_half_storage(&up(&be, &[cs.b, f, oh, ow], &vec![f32::INFINITY; n_dy])).unwrap();
+        let dw = down(&be, &be.conv2d_backward_weights_f32(&xh, &dy_inf, &shape_w, c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap());
+        assert!(dw.iter().any(|v| !v.is_finite()), "{tag}: all-Inf dy must make wgrad non-finite, got {:?}", &dw[..4]);
+        let dx = down(&be, &be.conv2d_backward_input_f32(&dy_inf, &wt, &[cs.b, c, h, ww], c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap());
+        assert!(dx.iter().any(|v| !v.is_finite()), "{tag}: all-Inf dy must make dgrad non-finite");
+
+        // a single NaN / Inf in dy among finite values
+        let mut dy = rng.vec(n_dy, -1.0, 1.0);
+        dy[5] = f32::INFINITY;
+        let dyh = be.to_half_storage(&up(&be, &[cs.b, f, oh, ow], &dy)).unwrap();
+        let dw = down(&be, &be.conv2d_backward_weights_f32(&xh, &dyh, &shape_w, c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap());
+        assert!(dw.iter().any(|v| !v.is_finite()), "{tag}: one Inf in dy must be visible in wgrad");
+
+        // non-finite activation (forward and wgrad)
+        let mut xi = x.clone();
+        xi[7] = f32::INFINITY;
+        let xih = be.to_half_storage(&up(&be, &[cs.b, c, h, ww], &xi)).unwrap();
+        let y = down(&be, &be.conv2d_f32(&xih, &wt, &[cs.b, f, oh, ow], c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap());
+        assert!(y.iter().any(|v| !v.is_finite()), "{tag}: Inf activation must be visible in the forward output");
+        let dyf = be.to_half_storage(&up(&be, &[cs.b, f, oh, ow], &rng.vec(n_dy, -1.0, 1.0))).unwrap();
+        let dw = down(&be, &be.conv2d_backward_weights_f32(&xih, &dyf, &shape_w, c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap());
+        assert!(dw.iter().any(|v| !v.is_finite()), "{tag}: Inf activation must be visible in wgrad");
+
+        // control: finite data stays finite (saturation, not NaN)
+        let dw = down(&be, &be.conv2d_backward_weights_f32(&xh, &dyf, &shape_w, c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap());
+        assert!(dw.iter().all(|v| v.is_finite()), "{tag}: finite data must give a finite wgrad");
+    }
+}
