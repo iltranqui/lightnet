@@ -117,6 +117,8 @@ From `tasks/rust/implemented.md` (section 3 and the Phase D table in [fp8_fp4.md
 - Modify: `src/darknet-cuda-oxide/src/fp8.rs`, `src/darknet-cuda-oxide/src/kernels/gemm_f8.rs`, `src/darknet-cuda-oxide/src/lib.rs`
 - Test: `src/darknet-cuda-oxide/tests/oxide_gemm_f8.rs`
 
+**Done as `v0.2.178`:** no `Fp8ScaleState` struct; the history is one zeroed device buffer (16 slots per key, 4096 keys) in a mutex-guarded map keyed by (source device address, length, format code). Call `n` of a key writes slot `n % 16` and zeroes slot `(n + 2) % 16`; the kernel reads the other 14 slots, so the effective window is 14 calls. Call 0 runs the two-pass current-scaling path with its amax landing in the history. Pair quantisation runs the single-operand path twice; cached weights stay on current scaling. Test seam `fp8_quantize_probe`.
+
 **Interfaces:**
 - Produces: `pub struct Fp8ScaleState` (device buffer of a 16-entry amax history plus a write cursor, one per quantised tensor role); kernel `fp8_quantize_delayed_kernel` that derives the factor from the history maximum, quantises, and records this call's amax into the history in the same pass (one pass over the data instead of amax then quantise). `pub enum Fp8Scaling { Current, Delayed }` chosen by `DARKNET_OXIDE_FP8_SCALING=current|delayed` (default `current`; `Delayed` stays opt-in until Task 9 validates it). Reference recipe: the C++ `fp8_scaling.cpp` (read with `git show v6-dev-fp8:src-fp8/fp8_scaling.cpp`; its history length constant is `kFp8AmaxHistoryLength`).
 
@@ -213,7 +215,7 @@ Status as of 2026-10-22. After Task 2 the overhead work in [Overhead optimisatio
 |---|---|---|
 | 1. Device-resident scales | done | `87fef93` (`perf(oxide): fp8 scales stay on the device`) |
 | 2. Cached fp8 weights | done | `v0.2.166` (`420dfd9`), docs `05953ba` |
-| 3. Delayed scaling | not started | |
+| 3. Delayed scaling | done, opt-in (`DARKNET_OXIDE_FP8_SCALING=delayed`); speed unmeasured | `v0.2.178` (`b74279e`) |
 | 4. Quantise from 16-bit storage | blocked on plan_bf16 Tasks 1, 2 | |
 | 5. Kernel tuning | in progress, no kept change yet | |
 | 6. Compose with AMP | blocked on plan_bf16 Tasks 2, 6 | |
@@ -288,7 +290,7 @@ Order set 2026-10-22. Each step is measured with `DARKNET_BENCH_MODES=fp32,fp8 c
 | 4 | Byte im2col: `im2col_fp8` quantises while it gathers, using the image amax (conv forward and wgrad). v0.2.171 | done, `oxide_gemm_f8` 26 of 26; training step 57.0 to 50.5 ms (fp32 53.4 ms), 3000 iterations 153.7 s against fp32 160.9 s | not measured by the GEMM bench (it feeds f32 operands) |
 | 4b | Pre-zeroed amax slot ring (one memset per 256 operands) and block-reduced single-operand amax. v0.2.172 | done, `oxide_gemm_f8` 26 of 26; `bench-train` fp8 49.0 ms against fp32 50.9 ms; 3000 iterations 143.0 s against 147.1 s | |
 | 4c | wgrad byte column with the e5m2 gradient recipe (column e4m3, `dy` e5m2); `-fp8` sets `DARKNET_OXIDE_GEMM_BWD=fp8`. v0.2.177 | done, `oxide_gemm_f8` 26 of 26; 3000 iterations 142.1 s and 142.9 s against fp32 146.4 s, mAP 99.80% | |
-| 5 | Delayed scaling ([Task 3](#task-3-delayed-scaling)): one pass over activations instead of two | open | |
+| 5 | Delayed scaling ([Task 3](#task-3-delayed-scaling)): one pass over activations instead of two. v0.2.178 | done, opt-in; `oxide_gemm_f8` 31 of 31 (five new). Not yet measured on training; Task 9 decides the default | |
 | 6 | CUDA Graphs for the per-step launch sequence, only if launch overhead is still visible after 3; first check that cuda-oxide exposes graph capture. Pooling (step 2) already makes addresses stable | open | |
 
 Step 1 profile (2026-10-22, `nsys profile` on the `gemm_bench_precisions` binary, `DARKNET_BENCH_MODES=fp8`, 1 round, after steps 2 and 3; square and LegoGears shapes together, 2402 GEMMs). nsys adds tracing overhead to the host API times.

@@ -2456,6 +2456,11 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 - v0.2.177: `conv_backward_weights` keeps the byte im2col whenever `GemmMode::Fp8` is on; with `DARKNET_OXIDE_GEMM_BWD=fp8` the column is quantised to the recipe's first format (e4m3, activations) and `dy` to the second (e5m2, gradient). Before, the recipe fed `dy` to wgrad as e4m3 and the column as e5m2 and dropped the byte path (153.1 s). `launch_im2col_fp8` and `gemm_fp8_b_bytes` take the formats. `cargo xtask train_legogears -fp8` now sets `DARKNET_OXIDE_GEMM_BWD=fp8` as well as `DARKNET_OXIDE_GEMM=fp8`.
 - Evidence: `oxide_gemm_f8` 26 of 26, xtask 6 of 6. Training, seed 42, 3000 iterations: fp8 142.9 s and 142.1 s (47.2 ms), loss 0.0578, mAP 99.80%, F1 0.9902; fp32 146.4 s (48.7 ms) in the same session; fp16 AMP 208.8 s (67.5 ms), mAP 99.63%, F1 0.9902; table in `docs/OXIDE_BENCH.md` section 10. fp8's F1 is one false positive below fp32's 0.9935 (the chart's), and fp16 lands on the same value.
 
+## 244. Delayed fp8 scaling
+
+- v0.2.178: `Fp8Scaling { Current, Delayed }` (`DARKNET_OXIDE_FP8_SCALING`, `with_fp8_scaling`; default `Current`). Delayed keeps a 16-slot f32 amax history per key (source device address, length, format) in one zeroed buffer. `fp8_quantize_delayed_kernel` takes the factor from the history max (slots `w = n % 16` and `z = (n + 2) % 16` excluded, so no read/write race), quantises with saturation, writes the `[factor, 1/factor]` pair, block-reduces its own amax into slot `w` (one atomic per block) and zeroes slot `z`. Call 0 of a key uses the two-pass current path with the amax landing in its slot. Applies to `fp8_quantize_operand` and `fp8_quantize_pair` (pair runs the operand path twice); cached weights and the byte im2col amax stay on current scaling. A full history (4096 keys) falls back to current scaling.
+- Evidence: `oxide_gemm_f8` 31 of 31 (new: `delayed_scaling_matches_current_scaling_on_stationary_data`, `delayed_scaling_saturates_on_a_spike`, `delayed_scaling_first_call_uses_current_amax`, a weights and 16-call ageing test, env parsing). No speed or training measurement.
+
 ## Not implemented / open (pointer)
 
 See `tasks/rust/todo.md` for the deduplicated open list (P8/P9 follow-ups,
