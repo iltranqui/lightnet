@@ -420,6 +420,37 @@ fn amp_fp8_weight_copy_is_refreshed_after_an_update() {
 }
 
 #[test]
+fn amp_fp8_bf16_masters_stay_f32_and_change_after_a_step() {
+    // Target recipe: bf16 storage + fp8 conv GEMMs, optimizer masters always f32.
+    let be = fp8_amp_backend(HalfFormat::Bf16).with_fp8_backward(Some((Fp8Format::E4M3, Fp8Format::E5M2)));
+    let cs = CONV_CASES[3];
+    let mut rng = Rng(0xba5e_f8);
+    let (oh, ow) = (cs.oh(), cs.ow());
+    let x = rng.vec(cs.b * cs.c * cs.h * cs.w, -1.0, 1.0);
+    let w0 = rng.vec(cs.f * cs.cpg() * cs.k * cs.k, -0.5, 0.5);
+    let dy = rng.vec(cs.b * cs.f * oh * ow, -1.0, 1.0);
+    let (c, h, ww, f, k, sx, sy, dil, pad, groups) = conv_args(&cs);
+    let shape_w = [f, cs.cpg(), k, k];
+    let xh = be.to_half_storage(&up(&be, &[cs.b, c, h, ww], &x)).unwrap();
+    let dyh = be.to_half_storage(&up(&be, &[cs.b, f, oh, ow], &dy)).unwrap();
+    let w0t = up(&be, &shape_w, &w0);
+    assert!(!w0t.is_half(), "master weights must be f32");
+    let y0 = down(&be, &be.conv2d_f32(&xh, &w0t, &[cs.b, f, oh, ow], c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap());
+    let dw = be.conv2d_backward_weights_f32(&xh, &dyh, &shape_w, c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap();
+    assert!(!dw.is_half(), "weight gradients must be f32");
+    // The SGD step takes the f32 master and returns an f32 master.
+    let (w1t, _) = be.sgd_update_f32(&w0t, &dw, 0.1, 0.0, 0.0, 1, cfg()).unwrap();
+    assert!(!w1t.is_half(), "SGD result must be an f32 master");
+    let w1 = down(&be, &w1t);
+    assert_eq!(w1.len(), w0.len());
+    assert_ne!(w1, w0, "master weights did not change after the step");
+    let y1 = down(&be, &be.conv2d_f32(&xh, &w1t, &[cs.b, f, oh, ow], c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap());
+    assert_ne!(y0, y1, "fp8 weight copy was not refreshed from the updated master");
+    let e = nerr(&y1, &conv_ref_fwd(&cs, &r16_in(HalfFormat::Bf16, &x), &w1));
+    assert!(e <= FP8_NERR, "forward after the step uses stale weights: nerr {e:.3e}");
+}
+
+#[test]
 fn amp_without_fp8_env_still_uses_fp16_gemm() {
     // No fp8 mode requested: AMP picks the 16-bit tensor-core GEMM exactly as
     // before and nothing is quantised to fp8.
