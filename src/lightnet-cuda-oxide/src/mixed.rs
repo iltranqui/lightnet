@@ -394,7 +394,7 @@ impl OxideBackend {
         // directly (the fp8 GEMM takes any leading dimension); quantise them once.
         let direct = k == 1 && sx == 1 && sy == 1 && pad == 0;
         let direct_q = if direct {
-            Some(self.fp8_quantize_half(&xh.buf, xh.len(), fmt, hfmt)?)
+            Some(self.fp8_quantize_half(&xh.buf, xh.len(), fmt, hfmt, crate::FP8_SITE_HALF_B)?)
         } else {
             None
         };
@@ -447,7 +447,7 @@ impl OxideBackend {
                         )
                     }
                     .map_err(launch_err)?;
-                    col_q = self.fp8_quantize_half(&*col, nb * img_col, fmt, hfmt)?;
+                    col_q = self.fp8_quantize_half(&*col, nb * img_col, fmt, hfmt, crate::FP8_SITE_HALF_B)?;
                     (&*col_q.0, &*col_q.1, 0, kpad * npad, npad)
                 }
             };
@@ -704,7 +704,7 @@ impl OxideBackend {
             }
             .map_err(launch_err)?;
             let col_q = if fp8 {
-                Some(self.fp8_quantize_half(&*col, nb * img_col, col_fmt, self.half_fmt)?)
+                Some(self.fp8_quantize_half(&*col, nb * img_col, col_fmt, self.half_fmt, crate::FP8_SITE_WGRAD_B)?)
             } else {
                 None
             };

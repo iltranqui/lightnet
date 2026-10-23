@@ -101,6 +101,20 @@ pub(crate) struct Fp8Hist {
 
 pub(crate) const FP8_HIST_KEYS: usize = 4096;
 
+/// Stable delayed-history keys, one per logical operand role.  Unlike a buffer
+/// address these survive pool reuse, so the amax history keeps accumulating
+/// across training steps instead of restarting whenever a tensor is reallocated.
+const FP8_SITE_FORWARD_A: u64 = 0x4650_0001;
+const FP8_SITE_FORWARD_B: u64 = 0x4650_0002;
+const FP8_SITE_DGRAD_A: u64 = 0x4650_0003;
+const FP8_SITE_DGRAD_B: u64 = 0x4650_0004;
+const FP8_SITE_WGRAD_A: u64 = 0x4650_0005;
+const FP8_SITE_WGRAD_B: u64 = 0x4650_0006;
+const FP8_SITE_WEIGHTS_B: u64 = 0x4650_0007;
+const FP8_SITE_DY: u64 = 0x4650_0008;
+const FP8_SITE_HALF_A: u64 = 0x4650_0009;
+const FP8_SITE_HALF_B: u64 = 0x4650_000a;
+
 /// Source of a delayed-scaling quantise: f32 storage, or 16-bit storage with
 /// the format that widens it.
 #[derive(Clone, Copy)]
@@ -1652,7 +1666,11 @@ impl OxideBackend {
                     BackwardRole::Dgrad => (fx, fdy),
                     BackwardRole::Wgrad => (fdy, fx),
                 };
-                self.gemm_f32_via_fp8_fmt(a, b, c, g, fa, fb)
+                let (key_a, key_b) = match role {
+                    BackwardRole::Dgrad => (FP8_SITE_DGRAD_A, FP8_SITE_DGRAD_B),
+                    BackwardRole::Wgrad => (FP8_SITE_WGRAD_A, FP8_SITE_WGRAD_B),
+                };
+                self.gemm_f32_via_fp8_fmt(a, b, c, g, fa, fb, key_a, key_b)
             }
             None => self.gemm(a, b, c, g),
         }
@@ -1706,12 +1724,13 @@ impl OxideBackend {
         buf: &DeviceBuffer<f32>,
         len: usize,
         fmt: Fp8Format,
+        site: u64,
     ) -> Result<(PooledBuf8, PooledBuf), OxideError> {
-        self.fp8_quantize_keyed(buf, len, fmt, None)
+        self.fp8_quantize_keyed(buf, len, fmt, Some(site))
     }
 
     /// [`Self::fp8_quantize_operand`] with an optional delayed-history key
-    /// override (tests); `None` keys on the buffer's device address and pool
+    /// override; `None` keys on the buffer's device address and pool
     /// incarnation.
     fn fp8_quantize_keyed(
         &self,
@@ -1937,12 +1956,13 @@ impl OxideBackend {
         len: usize,
         fmt: Fp8Format,
         hfmt: mixed::HalfFormat,
+        site: u64,
     ) -> Result<(PooledBuf8, PooledBuf), OxideError> {
-        self.fp8_quantize_half_keyed(buf, len, fmt, hfmt, None)
+        self.fp8_quantize_half_keyed(buf, len, fmt, hfmt, Some(site))
     }
 
     /// [`Self::fp8_quantize_half`] with an optional delayed-history key
-    /// override (tests); `None` keys on the buffer's device address and pool
+    /// override; `None` keys on the buffer's device address and pool
     /// incarnation.
     fn fp8_quantize_half_keyed(
         &self,
@@ -2054,8 +2074,8 @@ impl OxideBackend {
         let (br, bc) = if g.trans_b { (g.n, g.k) } else { (g.k, g.n) };
         let a_len = extent(g.a.0, g.a.1, g.a.2, g.count, ar, ac, g.lda).min(a.len());
         let b_len = extent(g.b.0, g.b.1, g.b.2, g.count, br, bc, g.ldb).min(b.len());
-        let (aq, sa) = self.fp8_quantize_half(a, a_len, fmt_a, hfmt)?;
-        let (bq, sb) = self.fp8_quantize_half(b, b_len, fmt_b, hfmt)?;
+        let (aq, sa) = self.fp8_quantize_half(a, a_len, fmt_a, hfmt, FP8_SITE_HALF_A)?;
+        let (bq, sb) = self.fp8_quantize_half(b, b_len, fmt_b, hfmt, FP8_SITE_HALF_B)?;
         self.gemm_fp8_args(&aq, &bq, c, g, fmt_a, fmt_b, &sa, &sb)
     }
 
@@ -2111,14 +2131,16 @@ impl OxideBackend {
         a: &DeviceBuffer<f32>,
         a_len: usize,
         fmt_a: Fp8Format,
+        key_a: u64,
         b: &DeviceBuffer<f32>,
         b_len: usize,
         fmt_b: Fp8Format,
+        key_b: u64,
     ) -> Result<((PooledBuf8, PooledBuf), (PooledBuf8, PooledBuf)), OxideError> {
         if a_len == 0 || b_len == 0 || self.fp8_scaling == Fp8Scaling::Delayed {
             return Ok((
-                self.fp8_quantize_operand(a, a_len, fmt_a)?,
-                self.fp8_quantize_operand(b, b_len, fmt_b)?,
+                self.fp8_quantize_operand(a, a_len, fmt_a, key_a)?,
+                self.fp8_quantize_operand(b, b_len, fmt_b, key_b)?,
             ));
         }
         let off = self.fp8_next_slot()?;
@@ -2251,7 +2273,7 @@ impl OxideBackend {
                 return Ok(e.value.clone());
             }
         }
-        let (bytes, scale) = self.fp8_quantize_operand(&dy.buf, dy.len(), fmt)?;
+        let (bytes, scale) = self.fp8_quantize_operand(&dy.buf, dy.len(), fmt, FP8_SITE_DY)?;
         let value = mixed::Fp8Weights {
             bytes: Arc::new(bytes),
             scale: Arc::new(scale),
@@ -2284,7 +2306,7 @@ impl OxideBackend {
                 return Ok(e.value.clone());
             }
         }
-        let (bytes, scale) = self.fp8_quantize_half(&dy.buf, dy.len(), fmt, hfmt)?;
+        let (bytes, scale) = self.fp8_quantize_half(&dy.buf, dy.len(), fmt, hfmt, FP8_SITE_DY)?;
         let value = mixed::Fp8Weights {
             bytes: Arc::new(bytes),
             scale: Arc::new(scale),
@@ -2348,7 +2370,7 @@ impl OxideBackend {
         let wq = self.fp8_weights(w, fmt_a)?;
         let (br, bc) = if g.trans_b { (g.n, g.k) } else { (g.k, g.n) };
         let b_len = extent(g.b.0, g.b.1, g.b.2, g.count, br, bc, g.ldb);
-        let (bq, sb) = self.fp8_quantize_operand(b, b_len, fmt_b)?;
+        let (bq, sb) = self.fp8_quantize_operand(b, b_len, fmt_b, FP8_SITE_WEIGHTS_B)?;
         self.gemm_fp8_args(&wq.bytes, &bq, c, g, fmt_a, fmt_b, &wq.scale, &sb)
     }
 
@@ -2417,12 +2439,15 @@ impl OxideBackend {
         g: &GemmArgs,
         fmt_a: Fp8Format,
         fmt_b: Fp8Format,
+        key_a: u64,
+        key_b: u64,
     ) -> Result<(), OxideError> {
         let (ar, ac) = if g.trans_a { (g.k, g.m) } else { (g.m, g.k) };
         let (br, bc) = if g.trans_b { (g.n, g.k) } else { (g.k, g.n) };
         let a_len = extent(g.a.0, g.a.1, g.a.2, g.count, ar, ac, g.lda);
         let b_len = extent(g.b.0, g.b.1, g.b.2, g.count, br, bc, g.ldb);
-        let ((aq, sa), (bq, sb)) = self.fp8_quantize_pair(a, a_len, fmt_a, b, b_len, fmt_b)?;
+        let ((aq, sa), (bq, sb)) =
+            self.fp8_quantize_pair(a, a_len, fmt_a, key_a, b, b_len, fmt_b, key_b)?;
         // The mma works in the quantised domain: the epilogue multiplies by the
         // device-side reciprocal factors `sa[1] * sb[1]`, so `c` needs no pass.
         self.gemm_fp8_args(&aq, &bq, c, g, fmt_a, fmt_b, &sa, &sb)
@@ -2436,7 +2461,16 @@ impl OxideBackend {
         c: &mut DeviceBuffer<f32>,
         g: &GemmArgs,
     ) -> Result<(), OxideError> {
-        self.gemm_f32_via_fp8_fmt(a, b, c, g, Fp8Format::E4M3, Fp8Format::E4M3)
+        self.gemm_f32_via_fp8_fmt(
+            a,
+            b,
+            c,
+            g,
+            Fp8Format::E4M3,
+            Fp8Format::E4M3,
+            FP8_SITE_FORWARD_A,
+            FP8_SITE_FORWARD_B,
+        )
     }
 
     /// `C = alpha * op(A) * op(B) + beta * C` with both operands quantised to
