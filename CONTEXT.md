@@ -32,6 +32,7 @@ lightnet-cli ──► lightnet-core ──► lightnet-cuda
      │                       (not a workspace member)
 lightnet-cuda-cutile ───────────────────┘   (not a workspace member)
 lightnet-examples ──► lightnet-core
+lightnet-lm ──► lightnet-cuda
 lightnet-gui ──► lightnet-gui-project, lightnet-gui-engine ──(child process)──► lightnet-rs detect-server
 ```
 

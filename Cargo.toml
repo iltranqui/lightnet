@@ -11,6 +11,7 @@ members = [
     "src/lightnet-core",
     "src/lightnet-cuda",
     "src/lightnet-examples",
+    "src/lightnet-lm",
     # `lightnet-gui` is opt-in (`-p lightnet-gui`): it pulls egui/eframe and is
     # intentionally not in `default-members`.
     "src/lightnet-gui",
@@ -59,6 +60,7 @@ default-members = [
     "src/lightnet-core",
     "src/lightnet-cuda",
     "src/lightnet-examples",
+    "src/lightnet-lm",
     "third_party/cuda-oxide/cuda-oxide/crates/cuda-target-spec",
     "third_party/cuda-oxide/cuda-oxide/crates/cuda-intrinsics",
     "third_party/cuda-oxide/cuda-oxide/crates/ptx-parse",

@@ -2329,6 +2329,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lightnet-lm"
+version = "0.1.0"
+dependencies = [
+ "lightnet-cuda",
+]
+
+[[package]]
 name = "linkme"
 version = "0.3.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
