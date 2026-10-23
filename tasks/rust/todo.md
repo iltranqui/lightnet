@@ -409,6 +409,7 @@ reference tolerance is `TOL_COMPOSED = 1e-4` rather than the single-stage `2e-6`
 - [x] v0.2.172 to v0.2.176: fp8 amax ring; bf16 AMP training (plan_bf16 Tasks 2 to 8) and `-bf16`. See `implemented.md` §242.
 - [x] v0.2.178 to v0.2.188: fp8 overhead remainder (plan_fp8 Tasks 3, 4, 5, 6): delayed scaling, `dy` quantise pass, kernel tuning, fp8 on f16/bf16 storage. fp8 F1 0.9902 against 0.9935 for fp32 and bf16. See `implemented.md` §§244–252.
 - [x] v0.2.191: delayed-scaling history includes the buffer-pool incarnation, so a recycled address starts at call 0 instead of inheriting the old tensor's amax. `oxide_gemm_f8` 54 of 54. See `implemented.md` §255.
+- [x] v0.2.192: production quantisers use stable per-role delayed-history keys, so history survives pool reuse across steps; incarnation remains the unkeyed fallback. `oxide_gemm_f8` 54 of 54. See `implemented.md` §256.
 - [x] bf16 Tasks 2 to 8 (`plan_bf16.md`); 3000-iteration run recorded. See `implemented.md` §242.
 - [ ] fp8 Task 9: measure delayed scaling against the default and decide the default. User-gated; current directive is code only. See `AGENTS_fp8.md`.
 - [ ] Step 5: FP8 conv via im2col + LegoGears_v2 mAP vs the C++ FP8 path. Not

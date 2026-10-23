@@ -273,6 +273,7 @@ file is named inline.
 - [253. CPU language-model Phase 1 (plan_llm_decoder Tasks 1-7)](#253-cpu-language-model-phase-1-plan_llm_decoder-tasks-1-7)
 - [254. fp16 convergence verdict (plan_fp16 Task 5)](#254-fp16-convergence-verdict-plan_fp16-task-5)
 - [255. FP8 delayed-history pool-incarnation fix](#255-fp8-delayed-history-pool-incarnation-fix)
+- [256. Stable FP8 delayed-history site keys](#256-stable-fp8-delayed-history-site-keys)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -2588,3 +2589,22 @@ Evidence: `cargo xtask oxide --test oxide_gemm_f8` 54 of 54 (two new
 pool-recycle tests for f16 and bf16); `cargo xtask gpu-check` clean. Both
 uncapped (`systemd-run --user` unavailable), `-j 2`. No training run. Tag
 `v0.2.191`.
+
+## 256. Stable FP8 delayed-history site keys
+
+v0.2.192. Production quantisers now pass a stable per-role key instead of
+falling back to the source buffer address: forward A/B, dgrad A/B, wgrad A/B,
+weights B, dy, and half A/B. The history key is `(site, length, format)`, so it
+survives buffer-pool reallocation and keeps accumulating across training steps,
+while different operand roles can never inherit each other's amax. The
+`v0.2.191` pool incarnation remains as the fallback for unkeyed probe/test
+callers.
+
+Limitation: the key identifies an operand role and length, not an individual
+layer. Layers that share a role and length share one history. This is the
+call-site semantics the plan asked for; per-layer histories would need a layer
+identity carried through the runtime.
+
+Evidence: `cargo xtask oxide --test oxide_gemm_f8` 54 of 54; `cargo xtask
+gpu-check` clean. Both uncapped (`systemd-run --user` unavailable), `-j 2`. No
+training run. Tag `v0.2.192`.
