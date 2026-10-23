@@ -38,6 +38,9 @@ This document is a read-only implementation plan. No files were changed; no buil
   - [Task 11: Causal GQA flash and chunked cross-entropy](#task-11-causal-gqa-flash-and-chunked-cross-entropy)
   - [Task 12: Opt-in decoder FP8](#task-12-opt-in-decoder-fp8)
   - [Task 13: Optional cuTile inference](#task-13-optional-cutile-inference)
+  - [Task 14: Causal sliding-window attention](#task-14-causal-sliding-window-attention)
+  - [Task 15: Optional DSA-style indexer top-k attention](#task-15-optional-dsa-style-indexer-top-k-attention)
+  - [Task 16: Optional NSA-style three-branch attention](#task-16-optional-nsa-style-three-branch-attention)
 - [Progress](#progress)
 - [Open issues](#open-issues)
 
@@ -668,6 +671,91 @@ Split by whole work before tokenizer fitting or shard construction. Group altern
 - [ ] **Step 4: Run** `cargo xtask cutile cutile_lm_`. Expect actual-device tests to pass. If toolchain/device support is unavailable, mark this task blocked and **unverified** without weakening mandatory CPU/oxide gates.
 - [ ] **Step 5: Record evidence and commit/tag** as `v0.M.NNN: integrate optional cuTile decoder inference` only when the named tests are green.
 
+### Task 14: Causal sliding-window attention
+
+Sparse-attention family, stage 1. Context at the Latin pilot (512–1024) does not need it for speed; it is the cheap, exact baseline that Tasks 15 and 16 build on and the way to reach longer contexts later. Prior art in the repo: `lightnet-cuda/src/lib.rs` (`window_radius` mask) and `lightnet-cuda-oxide/src/kernels/layers_extra.rs` (`sliding`) for the bidirectional LAYA encoder; reuse the idea, not the code (that path is non-causal and clamped).
+
+**Files:**
+
+- Create: `src/lightnet-lm/tests/lm_window.rs`, `src/lightnet-cuda-oxide/tests/oxide_lm_window.rs`.
+- Modify: `src/lightnet-lm/src/{config,types,attention,decoder}.rs`, `src/lightnet-cuda-oxide/src/lm.rs`, `src/lightnet-cuda-oxide/src/kernels/lm.rs`.
+- Common version files.
+
+**Interfaces:**
+
+- Consumes: Tasks 3, 4, 7, 11.
+- Produces:
+  - `DecoderConfig` gains `window: usize` (0 = full causal) and `full_every: usize` (every N-th layer keeps full attention, 0 = none); both are accepted by `[decoder]` and rejected when `window == 0 && full_every != 0`.
+  - `causal_gqa` honours the window: key `j` is allowed for query `i` only when `i - window < j <= i` (plus the existing segment and validity rules).
+  - KV-cache keeps at most `window` entries for windowed layers (ring buffer); positions, not slots, drive RoPE.
+  - Oxide flash skips tiles wholly outside the window (the saving is real compute, not only a mask).
+
+- [ ] **Step 1: Write CPU tests.** `lm_window_matches_masked_full` (windowed output equals full attention with the window mask applied, MHA and GQA); `lm_window_gradient` (finite differences on Q/K/V); `lm_window_full_every_layers` (layer pattern, e.g. `full_every=3`); `lm_window_cache_matches_prefix` (ring-buffer cached decode equals full-prefix windowed logits past one full wrap).
+- [ ] **Step 2: Run** `cargo xtask test lm_window_`. Expect missing config fields.
+- [ ] **Step 3: Implement** config, CPU mask, windowed cache.
+- [ ] **Step 4: Write GPU tests.** `oxide_lm_window_matches_cpu` (forward and dQ/dK/dV, partial tiles, packed segments); `oxide_lm_window_skips_tiles` (tile counter or workspace shows work proportional to `T * window`, not `T^2`).
+- [ ] **Step 5: Run** `cargo xtask oxide --test oxide_lm_window`. Expect failures, implement the tile skipping, re-run until green.
+- [ ] **Step 6: Record evidence and commit/tag** as `v0.M.NNN: add causal sliding-window attention`. Speed claims need a separately authorized timing at a context where the window is smaller than the sequence.
+
+### Task 15: Optional DSA-style indexer top-k attention
+
+Reference: DeepSeek Sparse Attention (DeepSeek-V3.2): a lightweight "lightning indexer" scores keys per query with ReLU dot products of small separate query/key projections, a top-k selector keeps about `k` keys (reported 2,048), and attention runs only on those, so core cost is O(L·k). DeepSeek introduced it by continued training of a dense model, which also fits this repo (train dense, switch on, continue). Everything here is **unverified** against the paper; read the V3.2 report before implementing and record any deviation.
+
+**Files:**
+
+- Create: `src/lightnet-lm/src/sparse_dsa.rs`, `src/lightnet-lm/tests/lm_dsa.rs`, `src/lightnet-cuda-oxide/tests/oxide_lm_dsa.rs`.
+- Modify: `src/lightnet-lm/src/{lib,config,types,attention,decoder,checkpoint}.rs`, `src/lightnet-cuda-oxide/src/lm.rs`, `src/lightnet-cuda-oxide/src/kernels/lm.rs`.
+- Common version files.
+
+**Interfaces:**
+
+- Consumes: Tasks 3, 4, 6, 9, 11, 14.
+- Produces:
+  - `DecoderConfig` gains `sparse_topk: usize` (0 = off) and `indexer_heads`, `indexer_dim`.
+  - Per-layer indexer parameters (`Wq_idx`, `Wk_idx`, `w_head`), registered like any other parameter with decay.
+  - `dsa_scores(q_idx, k_idx, w_head, batch, cfg) -> Result<Vec<f32>>`: `I[i,j] = sum_h w_h * relu(q_h[i] . k[j])`, causal and segment masked.
+  - `dsa_select(scores, k) -> Result<Vec<u32>>`: deterministic top-k per query (ties broken by ascending key index; fewer than `k` allowed keys keeps them all).
+  - `causal_gqa_selected(q, k, v, selected, ...)` and its backward over the selected keys only.
+  - An indexer training loss (the indexer is trained to match the dense attention distribution, for example KL on the dense attention scores, with the main loss not backpropagating into the indexer through the selection).
+- Top-k selection is non-differentiable; gradients flow only through the attention over the selected set and through the indexer's own loss.
+- Checkpoint format version bump: indexer tensors and `sparse_topk` are part of checkpoint identity.
+
+- [ ] **Step 1: Write CPU tests.** `lm_dsa_scores_causal` (no future keys scored); `lm_dsa_topk_deterministic_ties`; `lm_dsa_equals_dense_when_k_covers_all` (`k >= T` reproduces dense causal attention bitwise or within `1e-6`); `lm_dsa_gradient_selected_only` (finite differences on Q/K/V with the selection frozen); `lm_dsa_indexer_loss_decreases` (a few synthetic steps lower the KL on a toy fixture); `lm_dsa_checkpoint_roundtrip`.
+- [ ] **Step 2: Run** `cargo xtask test lm_dsa_`. Expect missing APIs.
+- [ ] **Step 3: Implement** the CPU reference (dense scoring, then selection, then gathered attention).
+- [ ] **Step 4: Write GPU tests.** `oxide_lm_dsa_matches_cpu` (scores, selected indices on tie-free data, forward, gradients); `oxide_lm_dsa_workspace` (attention scratch scales with `T * k`, scoring tiled without a full `[T,T]` buffer).
+- [ ] **Step 5: Run** `cargo xtask oxide --test oxide_lm_dsa`, implement tiled scoring, top-k and gathered attention, re-run.
+- [ ] **Step 6: Record evidence and commit/tag** as `v0.M.NNN: add DSA-style indexer top-k attention`. State plainly that no quality or speed claim holds below the context length where `k` is smaller than the sequence.
+
+### Task 16: Optional NSA-style three-branch attention
+
+Reference: Native Sparse Attention (arXiv 2502.11089, ACL 2025): keys/values organised in blocks; three branches (compressed block tokens, top-k selected blocks, sliding window) combined by learned gates, with kernels aligned to GQA groups so all query heads of a group share the selected blocks. Natively trainable (used from pretraining). Hardest of the three; do it only after Tasks 14 and 15 are green and a context length where it matters is a real goal. **Unverified**: read the paper first and record every deviation.
+
+**Files:**
+
+- Create: `src/lightnet-lm/src/sparse_nsa.rs`, `src/lightnet-lm/tests/lm_nsa.rs`, `src/lightnet-cuda-oxide/tests/oxide_lm_nsa.rs`.
+- Modify: `src/lightnet-lm/src/{lib,config,types,attention,decoder,checkpoint}.rs`, `src/lightnet-cuda-oxide/src/lm.rs`, `src/lightnet-cuda-oxide/src/kernels/lm.rs`.
+- Common version files.
+
+**Interfaces:**
+
+- Consumes: Tasks 3, 4, 9, 11, 14, 15.
+- Produces:
+  - `DecoderConfig` gains `nsa_block`, `nsa_stride`, `nsa_select_blocks`, `nsa_window` (all zero = off).
+  - Block compression: a small learned MLP per layer maps each key/value block to one compressed key/value.
+  - Compressed branch: attention over compressed tokens (causal at block granularity); its scores also rank blocks for the selection branch.
+  - Selection branch: top-`n` blocks per query group, shared across the GQA group; attention over the tokens of the selected blocks.
+  - Window branch: Task 14 sliding window.
+  - Gates: per-query sigmoid gate over the three branch outputs (learned linear from the hidden state).
+  - `nsa_attention` and `nsa_attention_backward` CPU reference.
+
+- [ ] **Step 1: Write CPU tests.** `lm_nsa_compression_shapes`; `lm_nsa_block_causality` (a block still being filled is never visible to earlier queries); `lm_nsa_selection_group_shared` (all query heads of a KV group use one block set); `lm_nsa_gradient` (finite differences with selection frozen, all three branches and the gates); `lm_nsa_reduces_to_window_when_other_branches_off`; `lm_nsa_checkpoint_roundtrip`.
+- [ ] **Step 2: Run** `cargo xtask test lm_nsa_`. Expect missing APIs.
+- [ ] **Step 3: Implement** the CPU reference.
+- [ ] **Step 4: Write GPU tests.** `oxide_lm_nsa_matches_cpu` (forward and gradients on tie-free fixtures); `oxide_lm_nsa_workspace` (scratch scales with compressed length plus `n * block`, not `T^2`).
+- [ ] **Step 5: Run** `cargo xtask oxide --test oxide_lm_nsa`, implement the three kernels with GQA-group-shared loads, re-run.
+- [ ] **Step 6: Record evidence and commit/tag** as `v0.M.NNN: add NSA-style three-branch attention`. No quality parity or speed claim without separately authorized runs at matched context.
+
 ## Progress
 
 | Task | Stage | Deliverable | Status | Required evidence |
@@ -685,6 +773,9 @@ Split by whole work before tokenizer fitting or shard construction. Group altern
 | 11 | Causal/GQA flash and CE | Tiled attention, chunking, recomputation | Planned | Numerics and workspace gates |
 | 12 | FP8 | Opt-in projection precision | Planned; accuracy/speed runs user-gated | Kernel/lifecycle tests; later matched runs |
 | 13 | Optional cuTile | Cached f16 inference | Optional; buildability unverified | Actual-device adapter tests |
+| 14 | Sparse attention | Causal sliding window (CPU, cache, oxide tile skipping) | Planned | Masked-full equivalence, tile-skip evidence |
+| 15 | Sparse attention | DSA-style indexer top-k | Optional; paper details unverified | Dense equivalence at `k >= T`, selected-set gradients |
+| 16 | Sparse attention | NSA-style compressed/selected/window branches | Optional; paper details unverified | Group sharing, block causality, gradients |
 
 No implementation task is complete. All runtime and performance results remain **unverified**.
 
@@ -699,5 +790,6 @@ No implementation task is complete. All runtime and performance results remain *
 - **Exactness boundary:** exact resume is required within the same deterministic backend/configuration. CPU↔GPU migration and different GPU reduction implementations use numerical tolerances, not bitwise claims.
 - **Tokenizer dependency:** the proposed normalization dependency/version has not been resolved or built. Record its lockfile resolution and confirm the pinned toolchain before committing Task 2.
 - **Baseline health:** existing full-suite evidence gaps remain separate from this feature’s focused tests. Do not report the entire repository green from LM filters.
+- **Sparse attention scope:** Tasks 14–16 are researched from search summaries (DSA from the DeepSeek-V3.2 write-ups, NSA from arXiv 2502.11089); nothing was read in full. MoBA (block routing) and Trainable Dynamic Mask Sparse Attention (arXiv 2508.02124) are candidates left out; no 2026 papers were found. At the 512–1024 pilot context none of these speeds up training; they pay off only when `k` or the window is smaller than the sequence.
 - **cuTile compatibility:** source assets are available, but adapter build, kernel architecture support, and driver/toolchain compatibility remain unverified. Optional integration must not block the CPU/oxide sequence.
-- **Scope coverage:** Tasks 1–13 cover every requested stage and missing operation. Resident fp16 decoder training is not implied by the bf16 deliverable; adding it requires explicit precision support, overflow/scaler state, and its own end-to-end tests.
+- **Scope coverage:** Tasks 1–13 cover every requested stage and missing operation; Tasks 14–16 add the sparse-attention family. Resident fp16 decoder training is not implied by the bf16 deliverable; adding it requires explicit precision support, overflow/scaler state, and its own end-to-end tests.
