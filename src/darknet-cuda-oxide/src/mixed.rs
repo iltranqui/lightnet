@@ -1,8 +1,9 @@
 //! Mixed-precision (AMP) training mode of the f32 trait API.
 //!
 //! Enabled with [`OxideBackend::with_amp`] / `DARKNET_OXIDE_AMP=1` (which also
-//! selects `GemmMode::Fp16`); default is off and then nothing in this module
-//! runs.  Scheme (the usual NVIDIA AMP recipe):
+//! selects `GemmMode::Fp16`, or keeps `GemmMode::Fp8` when that was asked for:
+//! the conv GEMMs then run fp8 on the 16-bit activations); default is off and
+//! then nothing in this module runs.  Scheme (the usual NVIDIA AMP recipe):
 //!
 //! * f32 master weights, f32 optimizer state, f32 weight / bias / BN-scale
 //!   gradients and f32 BN statistics: the runtime keeps owning those through the
@@ -35,6 +36,7 @@ use cuda_core::DeviceBuffer;
 use darknet_cuda::{BatchNormTrainForward, ElementwiseLaunchConfig, F32ActivationKind};
 
 use crate::conv::{Geom, chunk_limit, col_cap_bytes, expect_len, expect_shape};
+use crate::fp8::Fp8Format;
 use crate::half::HOut;
 use crate::tensor::{PooledBuf, PooledBuf16, PooledBuf8};
 use crate::{
@@ -116,6 +118,15 @@ pub(crate) struct Fp8DyEntry {
     pub(crate) value: Fp8Weights,
 }
 
+/// [`Fp8DyEntry`] for a 16-bit-storage gradient (AMP); keyed on the half buffer.
+pub(crate) struct Fp8DyHalfEntry {
+    pub(crate) key: Weak<PooledBuf16>,
+    pub(crate) len: usize,
+    pub(crate) fmt: crate::fp8::Fp8Format,
+    pub(crate) hfmt: HalfFormat,
+    pub(crate) value: Fp8Weights,
+}
+
 pub(crate) const W16_CACHE_MAX: usize = 512;
 
 impl OxideBackend {
@@ -127,16 +138,20 @@ impl OxideBackend {
 
     /// [`Self::with_amp`] with the 16-bit format selectable; `None` turns AMP
     /// off (the GEMM mode is left as it is, like `with_amp(false)`).  `Some`
-    /// selects `GemmMode::Fp16` or `GemmMode::Bf16` to match.
-    ///
+    /// selects `GemmMode::Fp16` or `GemmMode::Bf16` to match, except that an
+    /// `Fp8` GEMM mode is kept: the AMP conv GEMMs then run fp8 on the 16-bit
+    /// activations (see [`OxideBackend::amp_fp8`]) and the other AMP ops keep
+    /// their 16-bit paths.
     pub fn with_amp_format(mut self, format: Option<HalfFormat>) -> Self {
         self.amp = format.is_some();
         if let Some(f) = format {
             self.half_fmt = f;
-            self.gemm_mode = match f {
-                HalfFormat::F16 => crate::GemmMode::Fp16,
-                HalfFormat::Bf16 => crate::GemmMode::Bf16,
-            };
+            if self.gemm_mode != crate::GemmMode::Fp8 {
+                self.gemm_mode = match f {
+                    HalfFormat::F16 => crate::GemmMode::Fp16,
+                    HalfFormat::Bf16 => crate::GemmMode::Bf16,
+                };
+            }
         }
         self
     }
@@ -290,6 +305,24 @@ impl OxideBackend {
         }
         let per_filter = (c / groups) * k * k;
         expect_len(OP, "weights", weights.len(), f * per_filter)?;
+        if self.amp_fp8() {
+            return self.conv_forward_amp_fp8(
+                x,
+                weights,
+                output_shape,
+                c,
+                h,
+                w,
+                f,
+                k,
+                sx,
+                sy,
+                dil,
+                pad,
+                groups,
+                config,
+            );
+        }
         let xh = self.as_half(x)?;
         let wh = self.weights_half(weights, f, per_filter)?;
         let zero_bias = self.alloc(f)?;
@@ -313,6 +346,137 @@ impl OxideBackend {
             config,
         )?;
         Ok(self.wrap_half(out))
+    }
+
+    /// [`Self::conv_forward_amp`] with fp8 GEMMs: `f16(conv(x, w))` where the
+    /// weights come from the cached e4m3 copy of the f32 master tensor (no
+    /// 16-bit round trip) and the activation operand is quantised straight from
+    /// the 16-bit im2col columns (`fp8_quantize_half`).  The GEMM accumulates in
+    /// f32 into an f32 buffer that is rounded once into the AMP storage format.
+    #[allow(clippy::too_many_arguments)]
+    fn conv_forward_amp_fp8(
+        &self,
+        x: &OxideTensorF32,
+        weights: &OxideTensorF32,
+        output_shape: &[usize],
+        c: usize,
+        h: usize,
+        w: usize,
+        f: usize,
+        k: usize,
+        sx: usize,
+        sy: usize,
+        dil: usize,
+        pad: usize,
+        groups: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        const OP: &str = "conv2d_f32 (amp, fp8)";
+        let plane = c.checked_mul(h).and_then(|v| v.checked_mul(w)).unwrap_or(0);
+        if plane == 0 || x.len() % plane != 0 {
+            return Err(shape_err(
+                OP,
+                format!("input length {} is not a multiple of C*H*W = {plane}", x.len()),
+            ));
+        }
+        let g = Geom::new(OP, x.len() / plane, c, h, w, f, k, sx, sy, dil, pad, groups)?;
+        expect_shape(OP, "output", output_shape, &[g.batch, g.f, g.oh, g.ow])?;
+        expect_len(OP, "weights", weights.len(), g.w_len())?;
+        let (kg, ohw, fpg) = (g.kg(), g.ohw(), g.fpg());
+        let (kpad, npad) = (kg.next_multiple_of(8), ohw.next_multiple_of(8));
+        let img_col = groups * kpad * npad;
+        let hfmt = self.half_fmt;
+        let fmt = Fp8Format::E4M3;
+        let xh = self.as_half(x)?;
+        let wq = self.fp8_weights(weights, fmt)?;
+        let mut out = self.alloc_uninit(g.y_len())?;
+        // A 1x1 stride-1 unpadded conv reads the activations as the B matrix
+        // directly (the fp8 GEMM takes any leading dimension); quantise them once.
+        let direct = k == 1 && sx == 1 && sy == 1 && pad == 0;
+        let direct_q = if direct {
+            Some(self.fp8_quantize_half(&xh.buf, xh.len(), fmt, hfmt)?)
+        } else {
+            None
+        };
+        let chunk = if direct {
+            g.batch
+        } else {
+            (col_cap_bytes() / 2 / img_col).clamp(1, g.batch)
+        }
+        .min(chunk_limit());
+        let mut col_guard = self
+            .half_col
+            .lock()
+            .map_err(|_| shape_err(OP, "f16 workspace lock poisoned".into()))?;
+        if !direct && col_guard.as_ref().is_none_or(|b| b.len() < chunk * img_col) {
+            *col_guard = Some(DeviceBuffer::<u16>::zeroed(&self.stream, chunk * img_col)?);
+        }
+        let mut b0 = 0;
+        while b0 < g.batch {
+            let nb = chunk.min(g.batch - b0);
+            let inst = nb * groups;
+            let col_q;
+            let (bq, sb, b_base, b_stride, ldb) = match &direct_q {
+                Some((bytes, scale)) => (&**bytes, &**scale, b0 * plane, kg * ohw, ohw),
+                None => {
+                    let col = col_guard.as_mut().expect("workspace allocated above");
+                    // SAFETY: one thread per column element; `col` holds
+                    // `chunk * img_col` halves and `xh` covers images `b0..b0 + nb`.
+                    unsafe {
+                        self.half_ops.im2col_f16(
+                            &self.stream,
+                            launch::elementwise(nb * img_col, config),
+                            &xh.buf,
+                            &mut *col,
+                            b0 * plane,
+                            g.h,
+                            g.w,
+                            g.k,
+                            g.sx,
+                            g.sy,
+                            g.dil,
+                            g.pad,
+                            g.oh,
+                            g.ow,
+                            kg,
+                            kpad,
+                            npad,
+                            groups,
+                            nb,
+                            plane,
+                        )
+                    }
+                    .map_err(launch_err)?;
+                    col_q = self.fp8_quantize_half(&*col, nb * img_col, fmt, hfmt)?;
+                    (&*col_q.0, &*col_q.1, 0, kpad * npad, npad)
+                }
+            };
+            self.gemm_fp8_args(
+                &wq.bytes,
+                bq,
+                &mut out,
+                &GemmArgs {
+                    m: fpg,
+                    n: ohw,
+                    k: kg,
+                    lda: kg,
+                    ldb,
+                    ldc: ohw,
+                    a: (0, fpg * kg, groups),
+                    b: (b_base, b_stride, inst),
+                    c: (b0 * g.f * ohw, fpg * ohw, inst),
+                    count: inst,
+                    ..GemmArgs::default()
+                },
+                fmt,
+                fmt,
+                &wq.scale,
+                sb,
+            )?;
+            b0 += nb;
+        }
+        let wide = OxideTensorF32::new(out, &[g.batch, g.f, g.oh, g.ow]);
+        Ok(self.wrap_half(self.to_half(&wide, hfmt)?))
     }
 
     /// dgrad: `dcol = W^T dy` on the f16 GEMM (f32 output), then an f32
@@ -349,7 +513,17 @@ impl OxideBackend {
         let (kg, ohw, fpg) = (g.kg(), g.ohw(), g.fpg());
         let kpad = kg.next_multiple_of(8);
         let dyh = self.as_half(dy)?;
-        let wh = self.weights_half(weights, g.f, kg)?;
+        let fp8 = self.amp_fp8();
+        let (fa, fb) = self.bwd_fp8.unwrap_or((Fp8Format::E4M3, Fp8Format::E4M3));
+        // fp8: the weights come from the cached e4m3 copy of the f32 master and
+        // `dy` is quantised once for dgrad and wgrad (`fp8_dy_half`).
+        let (wh, fp8_q) = if fp8 {
+            let wq = self.fp8_weights(weights, fa)?;
+            let dq = self.fp8_dy_half(&dyh, fb, self.half_fmt)?;
+            (None, Some((wq, dq)))
+        } else {
+            (Some(self.weights_half(weights, g.f, kg)?), None)
+        };
         let mut dx = self.alloc16_uninit(g.x_len())?;
         let plane = g.c * g.h * g.w;
         let chunk = (col_cap_bytes() / 4 / g.col_len())
@@ -361,25 +535,52 @@ impl OxideBackend {
                 let nb = chunk.min(g.batch - b0);
                 let inst = nb * groups;
                 // dcol[img, g] (kg x ohw) = W[g]^T (kg x fpg) * dy[img, g] (fpg x ohw)
-                self.hgemm(
-                    &wh.buf,
-                    &dyh.buf,
-                    HOut::F32(&mut *ws),
-                    &GemmArgs {
-                        m: kg,
-                        n: ohw,
-                        k: fpg,
-                        lda: kpad,
-                        ldb: ohw,
-                        ldc: ohw,
-                        trans_a: true,
-                        a: (0, fpg * kpad, groups),
-                        b: (b0 * g.f * ohw, fpg * ohw, inst),
-                        c: (0, kg * ohw, inst),
-                        count: inst,
-                        ..GemmArgs::default()
-                    },
-                )?;
+                if let Some((wq, dq)) = &fp8_q {
+                    self.gemm_fp8_args(
+                        &wq.bytes,
+                        &dq.bytes,
+                        &mut *ws,
+                        &GemmArgs {
+                            m: kg,
+                            n: ohw,
+                            k: fpg,
+                            lda: kg,
+                            ldb: ohw,
+                            ldc: ohw,
+                            trans_a: true,
+                            a: (0, fpg * kg, groups),
+                            b: (b0 * g.f * ohw, fpg * ohw, inst),
+                            c: (0, kg * ohw, inst),
+                            count: inst,
+                            ..GemmArgs::default()
+                        },
+                        fa,
+                        fb,
+                        &wq.scale,
+                        &dq.scale,
+                    )?;
+                } else {
+                    let wh = wh.as_ref().expect("16-bit weights when not fp8");
+                    self.hgemm(
+                        &wh.buf,
+                        &dyh.buf,
+                        HOut::F32(&mut *ws),
+                        &GemmArgs {
+                            m: kg,
+                            n: ohw,
+                            k: fpg,
+                            lda: kpad,
+                            ldb: ohw,
+                            ldc: ohw,
+                            trans_a: true,
+                            a: (0, fpg * kpad, groups),
+                            b: (b0 * g.f * ohw, fpg * ohw, inst),
+                            c: (0, kg * ohw, inst),
+                            count: inst,
+                            ..GemmArgs::default()
+                        },
+                    )?;
+                }
                 // SAFETY: one thread per input element of the `nb` images; `ws`
                 // holds `nb * col_len` columns and `dx` covers the images.
                 unsafe {
@@ -451,6 +652,15 @@ impl OxideBackend {
         let img_col = groups * kpad * npad;
         let xh = self.as_half(x)?;
         let dyh = self.as_half(dy)?;
+        // fp8: the column is the activation operand (first recipe format), `dy`
+        // the gradient operand (second), shared with the dgrad quantise.
+        let fp8 = self.amp_fp8();
+        let (col_fmt, dy_fmt) = self.bwd_fp8.unwrap_or((Fp8Format::E4M3, Fp8Format::E4M3));
+        let dy_q = if fp8 {
+            Some(self.fp8_dy_half(&dyh, dy_fmt, self.half_fmt)?)
+        } else {
+            None
+        };
         let mut dw = self.alloc_uninit(g.w_len())?;
         let chunk = (col_cap_bytes() / 2 / img_col)
             .clamp(1, g.batch)
@@ -493,29 +703,34 @@ impl OxideBackend {
                 )
             }
             .map_err(launch_err)?;
+            let col_q = if fp8 {
+                Some(self.fp8_quantize_half(&*col, nb * img_col, col_fmt, self.half_fmt)?)
+            } else {
+                None
+            };
             for bi in 0..nb {
                 let b = b0 + bi;
                 // dW[g] (fpg x kg) += dy[b, g] (fpg x ohw) * col[g]^T (ohw x kg)
-                self.hgemm(
-                    &dyh.buf,
-                    &*col,
-                    HOut::F32(&mut dw),
-                    &GemmArgs {
-                        m: fpg,
-                        n: kg,
-                        k: ohw,
-                        lda: ohw,
-                        ldb: npad,
-                        ldc: kg,
-                        trans_b: true,
-                        beta: if b == 0 { 0.0 } else { 1.0 },
-                        a: (b * g.f * ohw, fpg * ohw, groups),
-                        b: (bi * img_col, kpad * npad, groups),
-                        c: (0, fpg * kg, groups),
-                        count: groups,
-                        ..GemmArgs::default()
-                    },
-                )?;
+                let args = GemmArgs {
+                    m: fpg,
+                    n: kg,
+                    k: ohw,
+                    lda: ohw,
+                    ldb: npad,
+                    ldc: kg,
+                    trans_b: true,
+                    beta: if b == 0 { 0.0 } else { 1.0 },
+                    a: (b * g.f * ohw, fpg * ohw, groups),
+                    b: (bi * img_col, kpad * npad, groups),
+                    c: (0, fpg * kg, groups),
+                    count: groups,
+                    ..GemmArgs::default()
+                };
+                if let (Some(dq), Some((cb, cs))) = (&dy_q, &col_q) {
+                    self.gemm_fp8_args(&dq.bytes, cb, &mut dw, &args, dy_fmt, col_fmt, &dq.scale, cs)?;
+                } else {
+                    self.hgemm(&dyh.buf, &*col, HOut::F32(&mut dw), &args)?;
+                }
             }
             b0 += nb;
         }

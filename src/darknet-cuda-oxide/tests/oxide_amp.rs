@@ -15,7 +15,7 @@
 
 use darknet_cuda::{AdamParams, ElementwiseLaunchConfig, F32ActivationKind, F32TensorOpsBackend};
 use darknet_cuda_oxide::half::{bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits};
-use darknet_cuda_oxide::{GemmMode, HalfFormat, OxideBackend, OxideTensorF32};
+use darknet_cuda_oxide::{Fp8Format, GemmMode, HalfFormat, OxideBackend, OxideTensorF32};
 
 struct Rng(u64);
 
@@ -295,6 +295,159 @@ fn amp_weight_copy_is_refreshed_after_an_update() {
     check("after update", &b, &conv_ref_fwd(&cs, &r16(&x), &r16(&w1)), 1e-3);
     // and the old weights are still served correctly
     assert_eq!(run(&w0t), a);
+}
+
+// ------------------------------------------------------------- fp8 convs
+
+const BOTH_FORMATS: [HalfFormat; 2] = [HalfFormat::F16, HalfFormat::Bf16];
+
+/// AMP storage in `hfmt` with the conv GEMMs on fp8 (`DARKNET_OXIDE_GEMM=fp8`
+/// spelled through the builder); `with_amp_format` must keep the fp8 mode.
+fn fp8_amp_backend(hfmt: HalfFormat) -> OxideBackend {
+    let be = OxideBackend::new().expect("backend").with_gemm_mode(GemmMode::Fp8).with_amp_format(Some(hfmt));
+    assert_eq!(be.gemm_mode(), GemmMode::Fp8, "{hfmt:?}: with_amp_format overwrote the fp8 GEMM mode");
+    assert!(be.amp_enabled());
+    assert_eq!(be.half_format(), hfmt);
+    be
+}
+
+/// Error bound of an fp8 conv against the f64 reference on the unrounded
+/// inputs, `max|got - ref| / max|ref|`.  e4m3 keeps 3 mantissa bits (2^-4
+/// relative per operand) and the e5m2 gradient 2; random signs average the
+/// products out, so the worst element lands far under the 0.25 per-element
+/// bound of `gemm_mode_fp8_selector_matches_the_dequantised_reference`.
+const FP8_NERR: f64 = 0.1;
+
+fn r16_in(fmt: HalfFormat, v: &[f32]) -> Vec<f32> {
+    match fmt {
+        HalfFormat::F16 => v.iter().map(|&x| f16_bits_to_f32(f32_to_f16_bits(x))).collect(),
+        HalfFormat::Bf16 => v.iter().map(|&x| bf16_bits_to_f32(f32_to_bf16_bits(x))).collect(),
+    }
+}
+
+#[test]
+fn amp_conv_with_fp8_gemm_tracks_f32_reference() {
+    for hfmt in BOTH_FORMATS {
+        for bwd in [None, Some((Fp8Format::E4M3, Fp8Format::E5M2))] {
+            let be = fp8_amp_backend(hfmt).with_fp8_backward(bwd);
+            let f16_be = OxideBackend::new().expect("backend").with_gemm_mode(GemmMode::Fp32).with_amp_format(Some(hfmt));
+            let mut rng = Rng(0xf8a1_0000 + hfmt.code() as u64);
+            for cs in CONV_CASES {
+                let (oh, ow) = (cs.oh(), cs.ow());
+                let x = rng.vec(cs.b * cs.c * cs.h * cs.w, -1.0, 1.0);
+                let w = rng.vec(cs.f * cs.cpg() * cs.k * cs.k, -0.5, 0.5);
+                let dy = rng.vec(cs.b * cs.f * oh * ow, -1.0, 1.0);
+                let (c, h, ww, f, k, sx, sy, dil, pad, groups) = conv_args(cs);
+                let tag = format!("{hfmt:?} {bwd:?} {cs:?}");
+                let before = be.fp8_quantize_launches();
+
+                let xh = be.to_half_storage(&up(&be, &[cs.b, c, h, ww], &x)).unwrap();
+                let wt = up(&be, &[f, cs.cpg(), k, k], &w);
+                let dyh = be.to_half_storage(&up(&be, &[cs.b, f, oh, ow], &dy)).unwrap();
+                let (xh2, dyh2) = (f16_be.to_half_storage(&up(&f16_be, &[cs.b, c, h, ww], &x)).unwrap(), f16_be.to_half_storage(&up(&f16_be, &[cs.b, f, oh, ow], &dy)).unwrap());
+                let wt2 = up(&f16_be, &[f, cs.cpg(), k, k], &w);
+
+                // forward: 16-bit storage out, fp8 GEMM inside
+                let y = be.conv2d_f32(&xh, &wt, &[cs.b, f, oh, ow], c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap();
+                assert!(y.is_half(), "{tag}: forward output must stay in 16-bit storage");
+                let yv = down(&be, &y);
+                let ye = nerr(&yv, &conv_ref_fwd(cs, &r16_in(hfmt, &x), &w));
+                assert!(ye <= FP8_NERR, "{tag} fwd nerr {ye:.3e}");
+                let y16 = down(&f16_be, &f16_be.conv2d_f32(&xh2, &wt2, &[cs.b, f, oh, ow], c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap());
+                assert_ne!(yv, y16, "{tag}: fwd identical to the 16-bit GEMM, fp8 was not used");
+
+                // dgrad
+                let dx = be.conv2d_backward_input_f32(&dyh, &wt, &[cs.b, c, h, ww], c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap();
+                assert!(dx.is_half(), "{tag}: dgrad output must stay in 16-bit storage");
+                let dxv = down(&be, &dx);
+                let de = nerr(&dxv, &conv_ref_dgrad(cs, &r16_in(hfmt, &dy), &w));
+                assert!(de <= FP8_NERR, "{tag} dgrad nerr {de:.3e}");
+                let dx16 = down(&f16_be, &f16_be.conv2d_backward_input_f32(&dyh2, &wt2, &[cs.b, c, h, ww], c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap());
+                assert_ne!(dxv, dx16, "{tag}: dgrad identical to the 16-bit GEMM");
+
+                // wgrad: f32 weight gradient
+                let dw = be.conv2d_backward_weights_f32(&xh, &dyh, &[f, cs.cpg(), k, k], c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap();
+                assert!(!dw.is_half(), "{tag}: weight gradients must stay f32");
+                let dwv = down(&be, &dw);
+                let we = nerr(&dwv, &conv_ref_wgrad(cs, &r16_in(hfmt, &dy), &r16_in(hfmt, &x)));
+                assert!(we <= FP8_NERR, "{tag} wgrad nerr {we:.3e}");
+                let dw16 = down(&f16_be, &f16_be.conv2d_backward_weights_f32(&xh2, &dyh2, &[f, cs.cpg(), k, k], c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap());
+                assert_ne!(dwv, dw16, "{tag}: wgrad identical to the 16-bit GEMM");
+
+                assert!(be.fp8_quantize_launches() > before, "{tag}: no fp8 quantise launch");
+                assert_eq!(f16_be.fp8_quantize_launches(), 0, "{tag}: the 16-bit backend must not quantise");
+                println!("{tag}: fwd {ye:.2e} dgrad {de:.2e} wgrad {we:.2e}");
+            }
+        }
+    }
+}
+
+#[test]
+fn amp_fp8_weight_copy_is_refreshed_after_an_update() {
+    for hfmt in BOTH_FORMATS {
+        let be = fp8_amp_backend(hfmt);
+        let cs = CONV_CASES[0];
+        let mut rng = Rng(0x57a1e + hfmt.code() as u64);
+        let x = rng.vec(cs.b * cs.c * cs.h * cs.w, -1.0, 1.0);
+        let w0 = rng.vec(cs.f * cs.cpg() * cs.k * cs.k, -0.5, 0.5);
+        let u = rng.vec(w0.len(), -1.0, 1.0);
+        let (c, h, ww, f, k, sx, sy, dil, pad, groups) = conv_args(&cs);
+        let shape_w = [f, cs.cpg(), k, k];
+        let xt = be.to_half_storage(&up(&be, &[cs.b, c, h, ww], &x)).unwrap();
+        let out_shape = [cs.b, f, cs.oh(), cs.ow()];
+        let run = |wt: &OxideTensorF32| {
+            let before = be.fp8_quantize_launches();
+            let y = down(&be, &be.conv2d_f32(&xt, wt, &out_shape, c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap());
+            (y, be.fp8_quantize_launches() - before)
+        };
+        let w0t = up(&be, &shape_w, &w0);
+        let (a, first) = run(&w0t);
+        let (again, second) = run(&w0t);
+        assert_eq!(a, again, "{hfmt:?}: cached fp8 copy must give identical results");
+        assert_eq!(second + 1, first, "{hfmt:?}: the second forward must reuse the cached weight bytes");
+        let ut = up(&be, &shape_w, &u);
+        let (w1t, _) = be.sgd_update_f32(&w0t, &ut, 0.5, 0.0, 0.0, 1, cfg()).unwrap();
+        let w1 = down(&be, &w1t);
+        assert_ne!(w1, w0);
+        let (b, refreshed) = run(&w1t);
+        assert_eq!(refreshed, first, "{hfmt:?}: an updated weight tensor must be quantised again");
+        assert_ne!(a, b, "{hfmt:?}: output did not change after the update");
+        let e = nerr(&b, &conv_ref_fwd(&cs, &r16_in(hfmt, &x), &w1));
+        assert!(e <= FP8_NERR, "{hfmt:?}: after update nerr {e:.3e}");
+        // and the old weights are still served correctly
+        assert_eq!(run(&w0t).0, a);
+    }
+}
+
+#[test]
+fn amp_without_fp8_env_still_uses_fp16_gemm() {
+    // No fp8 mode requested: AMP picks the 16-bit tensor-core GEMM exactly as
+    // before and nothing is quantised to fp8.
+    for hfmt in BOTH_FORMATS {
+        let be = OxideBackend::new().expect("backend").with_gemm_mode(GemmMode::Fp32).with_amp_format(Some(hfmt));
+        let want_mode = if hfmt == HalfFormat::F16 { GemmMode::Fp16 } else { GemmMode::Bf16 };
+        assert_eq!(be.gemm_mode(), want_mode, "{hfmt:?}");
+        let cs = CONV_CASES[3];
+        let mut rng = Rng(0x16_f8);
+        let (oh, ow) = (cs.oh(), cs.ow());
+        let x = rng.vec(cs.b * cs.c * cs.h * cs.w, -1.0, 1.0);
+        let w = rng.vec(cs.f * cs.cpg() * cs.k * cs.k, -0.5, 0.5);
+        let dy = rng.vec(cs.b * cs.f * oh * ow, -1.0, 1.0);
+        let (c, h, ww, f, k, sx, sy, dil, pad, groups) = conv_args(&cs);
+        let xh = be.to_half_storage(&up(&be, &[cs.b, c, h, ww], &x)).unwrap();
+        let wt = up(&be, &[f, cs.cpg(), k, k], &w);
+        let dyh = be.to_half_storage(&up(&be, &[cs.b, f, oh, ow], &dy)).unwrap();
+        let y = be.conv2d_f32(&xh, &wt, &[cs.b, f, oh, ow], c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap();
+        let dx = be.conv2d_backward_input_f32(&dyh, &wt, &[cs.b, c, h, ww], c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap();
+        let dw = be.conv2d_backward_weights_f32(&xh, &dyh, &[f, cs.cpg(), k, k], c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap();
+        // The tight bounds of `amp_conv_forward_dgrad_wgrad_match_f64_reference`.
+        let (rx, rw, rdy) = (r16_in(hfmt, &x), r16_in(hfmt, &w), r16_in(hfmt, &dy));
+        let tol = if hfmt == HalfFormat::Bf16 { 8.0 } else { 1.0 };
+        assert!(nerr(&down(&be, &y), &conv_ref_fwd(&cs, &rx, &rw)) <= 1e-3 * tol, "{hfmt:?} fwd");
+        assert!(nerr(&down(&be, &dx), &conv_ref_dgrad(&cs, &rdy, &rw)) <= 1e-3 * tol, "{hfmt:?} dgrad");
+        assert!(nerr(&down(&be, &dw), &conv_ref_wgrad(&cs, &rdy, &rx)) <= 1e-4 * tol, "{hfmt:?} wgrad");
+        assert_eq!(be.fp8_quantize_launches(), 0, "{hfmt:?}: fp8 ran without being requested");
+    }
 }
 
 // ------------------------------------------------------- elementwise / pool

@@ -159,6 +159,8 @@ pub struct OxideBackend {
     /// Quantised output gradient shared by the dgrad and wgrad of one conv
     /// backward; see [`OxideBackend::fp8_dy`].
     fp8_dy: Mutex<Option<mixed::Fp8DyEntry>>,
+    /// The 16-bit-storage twin of `fp8_dy`; see [`OxideBackend::fp8_dy_half`].
+    fp8_dy_half: Mutex<Option<mixed::Fp8DyHalfEntry>>,
     /// Pre-zeroed amax slots (see [`Fp8Ring`]).
     fp8_ring: Mutex<Fp8Ring>,
     /// Scale selection of the activation quantiser; see [`Fp8Scaling`].
@@ -1479,6 +1481,7 @@ impl OxideBackend {
             host_readbacks: AtomicU64::new(0),
             fp8_w: Mutex::new(Vec::new()),
             fp8_dy: Mutex::new(None),
+            fp8_dy_half: Mutex::new(None),
             fp8_ring: Mutex::new(fp8_ring),
             fp8_scaling: Fp8Scaling::from_env(),
             fp8_hist: Mutex::new(None),
@@ -1486,10 +1489,13 @@ impl OxideBackend {
             empty_f32,
             half_scratch: Mutex::new(half_scratch),
             half_col: Mutex::new(None),
-            gemm_mode: match amp_format {
-                Some(mixed::HalfFormat::F16) => GemmMode::Fp16,
-                Some(mixed::HalfFormat::Bf16) => GemmMode::Bf16,
-                None => GemmMode::from_env(),
+            gemm_mode: match (amp_format, GemmMode::from_env()) {
+                // AMP with `DARKNET_OXIDE_GEMM=fp8`: the conv GEMMs run fp8 on
+                // the 16-bit activations; every other AMP op keeps its path.
+                (Some(_), GemmMode::Fp8) => GemmMode::Fp8,
+                (Some(mixed::HalfFormat::F16), _) => GemmMode::Fp16,
+                (Some(mixed::HalfFormat::Bf16), _) => GemmMode::Bf16,
+                (None, mode) => mode,
             },
             im2col,
             conv_direct,
@@ -1807,6 +1813,12 @@ impl OxideBackend {
         Ok((out, scale))
     }
 
+    /// True when AMP storage is on and the GEMM mode is fp8: the conv GEMMs run
+    /// fp8 on the 16-bit activations ([`Self::fp8_quantize_half`]).
+    pub(crate) fn amp_fp8(&self) -> bool {
+        self.amp && self.gemm_mode == GemmMode::Fp8
+    }
+
     /// [`Self::fp8_quantize_operand_current`] reading 16-bit storage (`hfmt`
     /// says how to widen it): same factor, scale pair and bytes as widening to
     /// f32 first, with no f32 intermediate.  Always current scaling, also when
@@ -2099,6 +2111,40 @@ impl OxideBackend {
         Ok(value)
     }
 
+    /// [`Self::fp8_dy`] for a 16-bit-storage `dy` (AMP): dgrad and wgrad of one
+    /// conv backward share one quantise of the whole gradient.  Keyed on the
+    /// half buffer identity, its length and the formats.
+    pub(crate) fn fp8_dy_half(
+        &self,
+        dy: &OxideTensorF16,
+        fmt: Fp8Format,
+        hfmt: mixed::HalfFormat,
+    ) -> Result<mixed::Fp8Weights, OxideError> {
+        let lock_err = || shape_err("fp8_dy_half", "lock poisoned".into());
+        let ptr = Arc::as_ptr(&dy.buf);
+        {
+            let cache = self.fp8_dy_half.lock().map_err(|_| lock_err())?;
+            if let Some(e) = cache.as_ref().filter(|e| {
+                e.key.as_ptr() == ptr && e.key.strong_count() > 0 && e.len == dy.len() && e.fmt == fmt && e.hfmt == hfmt
+            }) {
+                return Ok(e.value.clone());
+            }
+        }
+        let (bytes, scale) = self.fp8_quantize_half(&dy.buf, dy.len(), fmt, hfmt)?;
+        let value = mixed::Fp8Weights {
+            bytes: Arc::new(bytes),
+            scale: Arc::new(scale),
+        };
+        *self.fp8_dy_half.lock().map_err(|_| lock_err())? = Some(mixed::Fp8DyHalfEntry {
+            key: Arc::downgrade(&dy.buf),
+            len: dy.len(),
+            fmt,
+            hfmt,
+            value: value.clone(),
+        });
+        Ok(value)
+    }
+
     /// wgrad with the column already FP8 bytes (B) and `dy` (A) quantised once
     /// through [`Self::fp8_dy`].
     pub(crate) fn gemm_fp8_dy_a_bytes(
@@ -2161,7 +2207,7 @@ impl OxideBackend {
         c: &mut DeviceBuffer<f32>,
         g: &GemmArgs,
     ) -> Result<(), OxideError> {
-        if self.gemm_mode == GemmMode::Fp8 {
+        if self.gemm_mode == GemmMode::Fp8 && !self.amp {
             return self.gemm_fp8_weights_a(w, b, c, g, Fp8Format::E4M3, Fp8Format::E4M3);
         }
         self.gemm(&w.buf, b, c, g)
@@ -2342,6 +2388,11 @@ impl OxideBackend {
             || extent(g.c.0, g.c.1, g.c.2, g.count, g.m, g.n, g.ldc) > c.len()
         {
             return Err(bad("operand buffer too small for the requested view"));
+        }
+        if self.amp_fp8() {
+            // Only the AMP conv GEMMs are fp8; any other op that reaches the f32
+            // GEMM seam keeps the 16-bit compute path.
+            return self.gemm_f32_operands_as_half(a, b, c, g, self.half_fmt == mixed::HalfFormat::Bf16);
         }
         if self.gemm_mode == GemmMode::Fp16 {
             return self.gemm_f32_operands_as_half(a, b, c, g, false);
