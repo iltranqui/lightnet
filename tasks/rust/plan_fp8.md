@@ -69,7 +69,7 @@ From `tasks/rust/implemented.md` (section 3 and the Phase D table in [fp8_fp4.md
 - No weight cache and no amax history for fp8. The f16 equivalent is `weights_half` (`mixed.rs:148`, keyed on buffer identity).
 - Backward: `DARKNET_OXIDE_GEMM_BWD=fp8` sets `bwd_fp8 = (E4M3, E5M2)` (`lib.rs:199,1417`); `backward_gemm` (`lib.rs:1455`) is called from `conv.rs:514` (dgrad: A = weights, B = dy) and `conv.rs:646` (wgrad: A = dy, B = column buffer). Forward calls `self.gemm` with A = weights at `conv.rs:417`.
 - Kernel `sgemm_fp8_mma` (`kernels/gemm_f8.rs:362`): 64x64 tile, BK 32, 128 threads, single shared-memory buffer, global loads through `fp8_stage16` into registers then `u32` shared stores, two `sync_threads` per K step, scalar fragment reads, a per-byte global loop for the transposed (`trans == 1`) path (`gemm_f8.rs:193-206`), runtime branches on format in `mma_f8_k32`. The fp16 kernel (`kernels/gemm_f16.rs:53`) uses `cp.async` 16-byte copies, two shared stages, `ldmatrix_x4`.
-- AMP forces `GemmMode::Fp16` (`lib.rs:1393`, `mixed.rs:68-72`), so `DARKNET_OXIDE_GEMM=fp8` is ignored under `DARKNET_OXIDE_AMP`.
+- (Before `v0.2.181`) AMP forced `GemmMode::Fp16`, so `DARKNET_OXIDE_GEMM=fp8` was ignored under `DARKNET_OXIDE_AMP`; now an Fp8 mode is kept.
 - Tests: `tests/oxide_gemm_f8.rs` (20 tests including `fragment_layout_*`, `gemm_fp8_e4m3_all_transposes`, `gemm_mode_fp8_selector_matches_the_dequantised_reference`, `fp8_backward_dgrad_and_wgrad_track_the_f32_backward`, `amax_ignores_non_finite_values`); `tests/oxide_gemm_bench.rs` (`gemm_bench_precisions`, `gemm_bench_lego`, `gemm_bench_low_precision_kernels`, all `#[ignore]`).
 
 ## File structure
@@ -134,6 +134,8 @@ From `tasks/rust/implemented.md` (section 3 and the Phase D table in [fp8_fp4.md
 - Modify: `src/darknet-cuda-oxide/src/kernels/gemm_f8.rs`, `src/darknet-cuda-oxide/src/lib.rs`
 - Test: `src/darknet-cuda-oxide/tests/oxide_gemm_f8.rs`
 
+**Done as `v0.2.180`:** kernels `fp8_amax_half_kernel` and `fp8_quantize_half_kernel` (extra `hfmt: u32`); host `fp8_quantize_half` (single operand, current scaling), `gemm_fp8_half_operands(a, b, c, g, fa, fb, hfmt)` (the `hfmt` argument is an addition to the signature below) and the test seams `fp8_quantize_half_probe` and `gemm_fp8_half`. Delayed scaling is not applied to 16-bit operands (there is no half delayed kernel); under `DARKNET_OXIDE_FP8_SCALING=delayed` the AMP activations still quantise with current scaling. `oxide_gemm_f8` 35 of 35 (two new twins, which also check that the GEMM on 16-bit operands is bit-equal to the f32 fp8 selector on the widened values, all four transposes).
+
 **Interfaces:**
 - Consumes: `half_bits_to_f32(bits: u16, fmt: u32)` from plan_bf16 Task 2.
 - Produces: kernels `fp8_amax_half_kernel` and `fp8_quantize_half_kernel` reading `&[u16]` with a `fmt: u32` argument; `fn gemm_fp8_half_operands(&self, a: &OxideTensorF16, b: &OxideTensorF16, c, g: &GemmArgs, fa: Fp8Format, fb: Fp8Format) -> Result<(), OxideError>`.
@@ -164,6 +166,8 @@ One sub-step per commit; each is kept only under the 5% rule in Global Constrain
 - Modify: `src/darknet-cuda-oxide/src/mixed.rs` (`with_amp_format`, `conv_forward_amp`, `conv_backward_input_amp`, `conv_backward_weights_amp`), `src/darknet-cuda-oxide/src/lib.rs` (constructor, `gemm_mode` selection)
 - Test: `src/darknet-cuda-oxide/tests/oxide_amp.rs`
 
+**Done as `v0.2.181`:** `with_amp_format` and the constructor keep an `Fp8` gemm mode (AMP + `DARKNET_OXIDE_GEMM=fp8`). The fp8 conv paths live in `mixed.rs`: `conv_forward_amp_fp8` (weights from `fp8_weights` on the f32 master, activation columns quantised from the 16-bit im2col with `fp8_quantize_half`, f32 accumulate into an f32 buffer that is rounded once into the AMP storage format; 1x1 stride-1 convs quantise the activations once and skip im2col), and the dgrad and wgrad arms of `conv_backward_input_amp` / `conv_backward_weights_amp` (formats `bwd_fp8` or e4m3 x e4m3; `dy` quantised once for both through the new `fp8_dy_half` cache). Under AMP + fp8 the f32 GEMM seam (`gemm`, `gemm_weights_a`) keeps the 16-bit compute path, so non-conv ops are unchanged. Delayed scaling is not applied (see Task 4). `oxide_amp` 18 of 18 in f16 and in bf16 (`DARKNET_TEST_AMP_FMT=bf16`); the fp8 conv error against the f64 reference is 3e-2 to 7e-2 of the largest element (bound 0.1), against about 1e-3 for the 16-bit GEMM. No speed measurement.
+
 **Interfaces:**
 - Consumes: `fp8_weights` (Task 2), `gemm_fp8_half_operands` (Task 4), `HalfFormat` (plan_bf16 Task 1).
 - Produces: under AMP, when `DARKNET_OXIDE_GEMM=fp8`, the conv GEMMs run fp8 on f16/bf16 activations; `with_amp_format` no longer overwrites an `Fp8` gemm mode with `Fp16`/`Bf16`. Non-conv ops keep their AMP paths.
@@ -188,6 +192,8 @@ One sub-step per commit; each is kept only under the 5% rule in Global Constrain
 
 ### Task 8: xtask -fp8
 
+**Done as `v0.2.182`, with one deviation:** plain `-fp8` is unchanged (f32 storage plus fp8 GEMMs, the recorded benchmark config), so the step 1 test below was not written as stated. The combination is selected with two flags, `-fp8 -fp16` (adds `DARKNET_OXIDE_AMP=1` and the `-dyn_scale -loss_scale 1024` rule) or `-fp8 -bf16` (`DARKNET_OXIDE_AMP=bf16`, no scaler flags), in either order; `-fp16 -bf16` and repeated flags stay errors. `PKGS=xtask cargo xtask test` 11 of 11 (five new). `CLAUDE.md` Commands row and `xtask help` updated.
+
 **Files:**
 - Modify: `xtask/src/main.rs`, `CLAUDE.md`
 - Test: `#[cfg(test)]` in `xtask/src/main.rs`
@@ -209,18 +215,18 @@ User-gated, same procedure as [plan_fp16.md Task 5](plan_fp16.md#task-5-converge
 
 ## Progress
 
-Status as of 2026-10-22. After Task 2 the overhead work in [Overhead optimisation](#overhead-optimisation) (`v0.2.167` to `v0.2.169`) cut `prec-lego` fp8 from 21.97 ms to 2.23 ms; Task 4 and Task 6 wait for plan_bf16 Tasks 2 and 6 (Task 1 is done, `v0.2.170`).
+Status as of 2026-10-22. After Task 2 the overhead work in [Overhead optimisation](#overhead-optimisation) (`v0.2.167` to `v0.2.169`) cut `prec-lego` fp8 from 21.97 ms to 2.23 ms; Tasks 4, 6 and 8 landed as `v0.2.180` to `v0.2.182` (bf16 was already done, `v0.2.170`).
 
 | Task | Status | Commit or tag |
 |---|---|---|
 | 1. Device-resident scales | done | `87fef93` (`perf(oxide): fp8 scales stay on the device`) |
 | 2. Cached fp8 weights | done | `v0.2.166` (`420dfd9`), docs `05953ba` |
 | 3. Delayed scaling | done, opt-in (`DARKNET_OXIDE_FP8_SCALING=delayed`); speed unmeasured | `v0.2.178` (`b74279e`) |
-| 4. Quantise from 16-bit storage | blocked on plan_bf16 Tasks 1, 2 | |
+| 4. Quantise from 16-bit storage | done, current scaling only | `v0.2.180` (`5c5dc81`) |
 | 5. Kernel tuning | in progress, no kept change yet | |
-| 6. Compose with AMP | blocked on plan_bf16 Tasks 2, 6 | |
+| 6. Compose with AMP | done, f16 and bf16; speed unmeasured | `v0.2.181` (`eb8919a`) |
 | 7. Backward pass review | not started | |
-| 8. xtask `-fp8` | not started | |
+| 8. xtask `-fp8` | done as `-fp8 -fp16` / `-fp8 -bf16`; plain `-fp8` unchanged | `v0.2.182` (`7fdb817`) |
 | 9. Accuracy and speed gate | user-gated (training run) | |
 
 Task 2 details: the forward and dgrad weight operands are quantised once per weight tensor. The cache is keyed on buffer identity and format, and is reachable only through the weight seams (`gemm_weights_a`, `backward_gemm_weights_a`). `oxide_gemm_f8` passes 24 of 24 (three new cache tests). The 21-conv bench does not exercise the cache, so its speed gain is still unmeasured.

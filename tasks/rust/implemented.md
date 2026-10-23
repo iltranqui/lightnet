@@ -2466,6 +2466,25 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 - v0.2.179: dgrad (weights e4m3 x `dy` e5m2, `dy` = operand B) and wgrad (`dy` e5m2 x byte column e4m3, `dy` = operand A) read the same f32 buffer in the same format, and the bytes are elementwise so one buffer serves both layouts (the transposes live in `GemmArgs`). `OxideBackend::fp8_dy` quantises the whole `dy` through `fp8_quantize_operand` and keeps the latest result (bytes + scale pair) in a one-entry cache keyed on the `Arc` identity (a live `Weak` pins the address), length and format; `backward_gemm_weights_dy` and `gemm_fp8_dy_a_bytes` replace `backward_gemm_weights_a` and `gemm_fp8_b_bytes`. Delayed scaling goes through the same keyed path once per backward. Difference: wgrad used to quantise a prefix of `dy` per image chunk (scale from the prefix amax); it now uses the whole-tensor amax. Single-chunk results are bitwise unchanged; multi-chunk results differ at fp8 rounding level. The f32 wgrad fallback (`GemmMode` not fp8, pair quantise with the column) is unchanged.
 - Evidence: `oxide_gemm_f8` 33 of 33 (new: `fp8_backward_quantises_dy_once`, `fp8_backward_shares_dy_under_delayed_scaling`), `oxide_amp` 15 of 15, `oxide_half` 17 of 17. Quantise launches per dgrad+wgrad (weights cached): 2 before, 1 after; dx and dw bitwise equal to the separate-copy reference.
 
+## 246. fp8 quantisation from 16-bit storage
+
+- v0.2.180: `fp8_amax_half_kernel` and `fp8_quantize_half_kernel` take `&[u16]` and `hfmt` (0 = f16, 1 = bf16) and widen with `half_bits_to_f32`, so the factor, scale pair and bytes equal what the f32 kernels give on the widened tensor (the widening is exact). `fp8_quantize_half` (current scaling), `gemm_fp8_half_operands(a, b, c, g, fa, fb, hfmt)`, test seams `fp8_quantize_half_probe` and `gemm_fp8_half`. Delayed scaling does not cover 16-bit operands.
+- Evidence: `oxide_gemm_f8` 35 of 35 (new: `fp8_from_f16_matches_fp8_from_widened_f32`, `fp8_from_bf16_matches_fp8_from_widened_f32`: byte-identical output, equal scale pair for e4m3 and e5m2 on data with a zero run, a tiny value and an f16-overflowing spike; GEMM bit-equal to the f32 fp8 selector on the widened operands for all four transposes).
+
+## 247. fp8 conv GEMMs under mixed-precision storage
+
+- v0.2.181: AMP with the fp8 GEMM mode: `with_amp_format` and the constructor keep `GemmMode::Fp8`. Forward (`conv_forward_amp_fp8`): cached e4m3 weights from the f32 master, columns quantised from the 16-bit im2col, f32 accumulate, one rounding into the AMP format; 1x1 stride-1 convs skip im2col. dgrad and wgrad use `bwd_fp8` or e4m3 x e4m3, with `dy` quantised once for both (`fp8_dy_half`, one-entry cache on the half buffer identity, length and formats). With AMP + fp8 the f32 GEMM seam keeps the 16-bit compute path, so non-conv ops are unchanged.
+- Evidence: `oxide_amp` 18 of 18, also with `DARKNET_TEST_AMP_FMT=bf16` (new: `amp_conv_with_fp8_gemm_tracks_f32_reference` runs f16 and bf16, with and without the e5m2 gradient recipe, seven conv shapes incl. groups and 1x1: nerr 3e-2 to 7e-2, bound 0.1, and the result differs from the 16-bit GEMM; `amp_fp8_weight_copy_is_refreshed_after_an_update`: second forward saves exactly the weight quantise, an updated tensor is quantised again; `amp_without_fp8_env_still_uses_fp16_gemm`: no fp8 launches). `oxide_gemm_f8` 35 of 35, `oxide_half` 17 of 17 (1 ignored), `oxide_runtime_f16` 22 of 22. No speed measurement.
+
+## 248. xtask -fp8 -fp16 / -fp8 -bf16
+
+- v0.2.182: `precision_env` accepts `-fp8` plus one 16-bit flag in either order: `DARKNET_OXIDE_GEMM=fp8`, `DARKNET_OXIDE_GEMM_BWD=fp8` and the AMP switch of that flag (the `-fp16` `-dyn_scale -loss_scale 1024` rule applies, bf16 adds no flags). Plain `-fp8` is unchanged (f32 storage, the benchmark config).
+- Evidence: `PKGS=xtask cargo xtask test` 11 of 11 (five new).
+
+## 249. fp8 + bf16 master-weight test
+
+- v0.2.183: `amp_fp8_bf16_masters_stay_f32_and_change_after_a_step`: weights, weight gradient and SGD result are f32 (`is_half()` false), the master changes, the fp8 weight copy is refreshed from the updated master. Optimizer ops only accept f32 tensors; the bf16 weight copy and fp8 bytes are caches keyed on the master buffer. Evidence: `oxide_amp` fp8 filter 4 of 4.
+
 ## Not implemented / open (pointer)
 
 See `tasks/rust/todo.md` for the deduplicated open list (P8/P9 follow-ups,
