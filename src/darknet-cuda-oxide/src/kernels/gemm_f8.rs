@@ -138,16 +138,26 @@ pub fn bounded_len(len: u32, buf_len: usize) -> usize {
 }
 
 /// Quantisation factor `max_finite(fmt) / amax` (`fmt` 0 = e4m3, 1 = e5m2);
-/// `1.0` when amax is zero or non-finite.
+/// `1.0` when amax is zero or non-finite.  The factor is clamped to
+/// [`FP8_FACTOR_MAX`]: for `amax` below ~1e-36 the quotient overflows f32, the
+/// factor would be Inf, zeros would become `0 * Inf = NaN` and the reciprocal
+/// scale 0.
 #[device]
 pub fn fp8_factor(amax: f32, fmt: u32) -> f32 {
     let max_finite = if fmt == 0 { 448.0 } else { 57344.0 };
     if amax > 0.0 && amax.is_finite() {
-        max_finite / amax
+        let factor = max_finite / amax;
+        if factor > FP8_FACTOR_MAX { FP8_FACTOR_MAX } else { factor }
     } else {
         1.0
     }
 }
+
+/// Largest quantisation factor, `2^120`: finite with a normal reciprocal
+/// (`2^-120`), and still scales a value of 1e-36 up to ~1.3.  Tensors whose
+/// amax is below `448 / 2^120` (~3.4e-34) are therefore not stretched to the
+/// full format range, which is irrelevant at that magnitude.
+pub const FP8_FACTOR_MAX: f32 = 1.329_227_995_784_916e36;
 
 /// One `mma.m16n8k32` with the FP8 pair selected by `fmt_a` / `fmt_b`.
 /// All 32 lanes must call it; `a` / `b` follow the layout documented above.

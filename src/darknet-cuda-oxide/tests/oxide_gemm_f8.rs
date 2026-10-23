@@ -1607,3 +1607,64 @@ fn fp8_gemm_with_inf_operand_is_non_finite() {
     assert!(c[n..].iter().all(|v| v.is_finite()), "other rows must stay finite");
 }
 
+
+/// bf16 tensor whose values are ~1e-36 (and zeros): `448 / amax` overflows f32,
+/// which used to make the factor Inf, the zeros 0 * Inf = NaN and the
+/// reciprocal 0.  The factor must clamp to a finite value instead.
+fn tiny_amax_gives_finite_scale_pair(hfmt: HalfFormat) {
+    for scaling in [Fp8Scaling::Current, Fp8Scaling::Delayed] {
+        let be = OxideBackend::new().expect("backend").with_fp8_scaling(scaling);
+        let mut x = vec![0.0f32; 512];
+        for (i, v) in x.iter_mut().enumerate() {
+            if i % 3 != 0 {
+                *v = if i % 2 == 0 { 1.0e-36 } else { -0.7e-36 };
+            }
+        }
+        for fmt in [Fp8Format::E4M3, Fp8Format::E5M2] {
+            // several calls so the delayed path leaves its current-scaling start
+            for call in 0..4 {
+                let xh = half_tensor(&be, &x, hfmt);
+                let (bytes, scale) = be.fp8_quantize_half_probe_keyed(&xh, fmt, hfmt, Some(0x71_47)).unwrap();
+                let tag = format!("{hfmt:?} {scaling:?} {fmt:?} call {call}");
+                assert!(scale[0].is_finite() && scale[0] > 0.0, "{tag}: factor {}", scale[0]);
+                assert!(scale[1].is_finite() && scale[1] > 0.0, "{tag}: reciprocal {}", scale[1]);
+                assert!(bytes.iter().all(|&b| fp8_to_f32(b, fmt).is_finite()), "{tag}: NaN or inf byte");
+                assert!(bytes.iter().zip(&x).all(|(&b, &v)| v != 0.0 || b & 0x7f == 0), "{tag}: zeros stay zero");
+            }
+        }
+    }
+    // f32 source, same story
+    let be = OxideBackend::new().expect("backend");
+    let x: Vec<f32> = (0..256).map(|i| if i % 4 == 0 { 0.0 } else { 1.0e-36 }).collect();
+    let t = be.upload_f32(&[x.len()], &x).unwrap();
+    let (bytes, scale) = be.fp8_quantize_probe(&t, Fp8Format::E4M3, None).unwrap();
+    assert!(scale[0].is_finite() && scale[1].is_finite() && scale[1] > 0.0, "f32 scale {scale:?}");
+    assert!(bytes.iter().all(|&b| fp8_to_f32(b, Fp8Format::E4M3).is_finite()), "f32: NaN or inf byte");
+    assert!(bytes.iter().zip(&x).any(|(&b, &v)| v != 0.0 && b & 0x7f != 0), "f32: tiny values flushed to zero");
+}
+
+#[test]
+fn tiny_amax_gives_finite_scale_pair_bf16() {
+    tiny_amax_gives_finite_scale_pair(HalfFormat::Bf16);
+}
+
+#[test]
+fn tiny_amax_gives_finite_scale_pair_f16() {
+    // f16 flushes 1e-36 to zero (amax 0 -> factor 1): still finite, no NaN.
+    tiny_amax_gives_finite_scale_pair(HalfFormat::F16);
+}
+
+/// Through the GEMM: ~1e-36 operands give a finite, correct product.
+#[test]
+fn fp8_gemm_with_tiny_operands_is_finite() {
+    let be = OxideBackend::new().expect("backend").with_gemm_mode(GemmMode::Fp8);
+    let (m, n, k) = (16usize, 16usize, 32usize);
+    let a = vec![1.0e-36f32; m * k];
+    let b = vec![1.0f32; k * n];
+    let (ta, tb) = (be.upload_f32(&[m, k], &a).unwrap(), be.upload_f32(&[k, n], &b).unwrap());
+    let c0 = be.upload_f32(&[m, n], &vec![0.0f32; m * n]).unwrap();
+    let c = download(&be, &be.gemm_f32(&ta, &tb, &c0, m, n, k, false, false, 1.0, 0.0).unwrap());
+    let want = 1.0e-36f64 * k as f64;
+    assert!(c.iter().all(|v| v.is_finite()), "non-finite output {:?}", &c[..4]);
+    assert!(c.iter().all(|&v| ((v as f64) - want).abs() <= 0.1 * want), "got {:?}, want {want:e}", &c[..4]);
+}
