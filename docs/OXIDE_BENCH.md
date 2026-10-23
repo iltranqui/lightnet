@@ -251,6 +251,19 @@ Accuracy of the mode (no training run, same init / input / seeds, `LIGHTNET_BENC
 output deltas (the default synthetic bench, BN gradient explosion) all reduced-precision modes (tf32, fp16 compute, AMP) differ from f32 by 10-30% in the early layers and
 AMP == tf32 there too. Tests: `src/lightnet-cuda-oxide/tests/oxide_amp.rs` (per-op vs f64, tiny net gradients and SGD tracking).
 
+### 7.2.1 Convergence and step-time verdict (2026-10-23)
+
+Seed 42, 3000 iterations, batch 16, release build, one run each; both rows are from the same session (`v0.2.171-7`). Protocol and the other modes are in section 10.
+
+| run | step median | total | final avg loss | mAP@0.50 | F1 |
+|---|---|---|---|---|---|
+| fp32 (`fp32-c`) | 48.7 ms | 146.4 s | 0.059712 | 99.55% | 0.9935 |
+| fp16 AMP (`-fp16`) | 67.5 ms | 208.8 s | 0.052513 | 99.63% | 0.9902 |
+
+Verdict: the accuracy gate passes. fp16's final loss is 12.1% lower than fp32 (the difference is favorable, not a degradation) and mAP is 0.08 points higher; F1 is one false positive lower (152 TP / 3 FP against 153 / 2), the single-detection difference also noted in section 10. The sparse skip-line count was not retained after log cleanup, so it is not part of this record.
+
+Speed does not pass: fp16 is 38% slower than fp32 at batch 16 (67.5 ms against 48.7 ms), so on this build fp16 AMP is an accuracy-equivalent mode, not a speed feature. A static-scale AMP run measured 46 ms earlier; dynamic loss scaling is the main candidate for the gap, but this plan does not require fixing it.
+
 ### 7.3 Training-step host/launch overhead (2026-10-01)
 
 Same driver and conditions as 7.1 (`bench-train`, LegoGears_v2, 20 steps after 3 warm-up, 3 rounds, before/after binaries interleaved per round, oxide f32; AMP rows with `LIGHTNET_OXIDE_AMP=1`).

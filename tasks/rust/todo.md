@@ -297,6 +297,7 @@ reference tolerance is `TOL_COMPOSED = 1e-4` rather than the single-stage `2e-6`
 
 ## P8/P9 training follow-ups
 
+- [x] plan_fp16 Task 5 (docs-only): recorded the seed-42, 3000-iteration fp32/fp16 comparison in `docs/OXIDE_BENCH.md` §7.2.1. fp16 loss 0.0525 vs fp32 0.0597 (12.1% lower, favorable), mAP 99.63% vs 99.55%; accuracy gate passes. fp16 is 67.5 ms vs fp32 48.7 ms, so it is not a speed feature. See `implemented.md` §254.
 - [x] v0.2.165: follow-up for Task 4 gives `precision_env`'s three-part result a local alias; `cargo xtask clippy xtask` passes without warnings, all 4 xtask tests pass, and GPT-6-luna review accepted. Default clippy remains blocked by unrelated core errors; Task 5 training is user-gated. See `implemented.md` §237.
 - [x] v0.2.164: xtask `-fp16` now enables AMP and adds default `-dyn_scale -loss_scale 1024` unless supplied; user flags are preserved and fp8 is unchanged. Four xtask tests, help output, and GPT-6-luna review pass. Task 5 training remains user-gated. See `implemented.md` §236.
 - [x] v0.2.163: pinned existing `gradients_non_finite()` coverage for convolution weights, BN bias and BN scale with 3 focused tests; all passed using the temporary test import shim, which was removed afterward. No runtime logic change was needed; GPT-6-luna review accepted. Phase 1 Task 5 convergence evidence remains user-gated. See `implemented.md` §235.

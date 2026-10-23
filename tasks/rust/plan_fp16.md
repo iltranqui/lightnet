@@ -74,11 +74,11 @@ These were read from the code (the exploration agents' summaries were checked; o
 **Interfaces:**
 - Produces: `pub enum ScaleStep { Apply, Skip }` and `pub struct LossScaler` with `pub fn new(initial: f32) -> Self`, `pub fn scale(&self) -> f32`, `pub fn update(&mut self, grads_finite: bool) -> ScaleStep`. Behaviour is the CLI loop's, lifted verbatim: on non-finite gradients, scale becomes `max(scale * 0.5, 1.0)`, the growth counter resets, result is `Skip`; on finite gradients, the growth counter increments, and when it reaches 1000 and the scale is below 65536 the scale doubles and the counter resets; result is `Apply`.
 
-- [ ] **Step 1: Write the failing tests** in `loss_scaler.rs`: `halves_and_skips_on_overflow` (new(1024.0), `update(false)` returns `Skip`, `scale()` is 512.0), `never_drops_below_one` (new(1.0), `update(false)` leaves `scale()` at 1.0), `doubles_after_1000_finite_steps` (999 finite updates leave the scale unchanged; the 1000th doubles it), `growth_counter_resets_after_overflow` (500 finite, one overflow, then 999 finite leaves the scale unchanged), `caps_at_65536` (new(65536.0) never doubles).
-- [ ] **Step 2: Run to verify it fails.** `PKGS=lightnet-core cargo xtask test loss_scaler` — Expected: compile error, type not defined.
-- [ ] **Step 3: Implement** `LossScaler` as described in Interfaces, in `loss_scaler.rs`; one `u32` growth counter field.
-- [ ] **Step 4: Run to verify it passes.** Same command — Expected: 5 passed.
-- [ ] **Step 5: Commit** `loss_scaler.rs` and the `mod.rs` hunk: `git add src/lightnet-core/src/runtime/loss_scaler.rs && git add -p src/lightnet-core/src/runtime/mod.rs`, message `feat(core): add LossScaler with unit tests`.
+- [x] **Step 1: Write the failing tests** in `loss_scaler.rs`: `halves_and_skips_on_overflow` (new(1024.0), `update(false)` returns `Skip`, `scale()` is 512.0), `never_drops_below_one` (new(1.0), `update(false)` leaves `scale()` at 1.0), `doubles_after_1000_finite_steps` (999 finite updates leave the scale unchanged; the 1000th doubles it), `growth_counter_resets_after_overflow` (500 finite, one overflow, then 999 finite leaves the scale unchanged), `caps_at_65536` (new(65536.0) never doubles).
+- [x] **Step 2: Run to verify it fails.** `PKGS=lightnet-core cargo xtask test loss_scaler` — Expected: compile error, type not defined.
+- [x] **Step 3: Implement** `LossScaler` as described in Interfaces, in `loss_scaler.rs`; one `u32` growth counter field.
+- [x] **Step 4: Run to verify it passes.** Same command — Expected: 5 passed.
+- [x] **Step 5: Commit** `loss_scaler.rs` and the `mod.rs` hunk: `git add src/lightnet-core/src/runtime/loss_scaler.rs && git add -p src/lightnet-core/src/runtime/mod.rs`, message `feat(core): add LossScaler with unit tests`.
 
 ### Task 2: CLI uses LossScaler and takes -loss_scale
 
@@ -134,8 +134,8 @@ These were read from the code (the exploration agents' summaries were checked; o
 
 User-gated: ask the user to run (or confirm you may run) the two trainings; do not start them unprompted.
 
-- [ ] **Step 1: Baseline run.** `cargo xtask train_legogears -map_every 100` (fp32), note the final `avg loss`, the `-map` results, and the `train=... milliseconds` column. Stop after the iteration count the user agrees on.
-- [ ] **Step 2: fp16 run.** `cargo xtask train_legogears -fp16 -map_every 100` with the same seed and iteration count.
-- [ ] **Step 3: Compare** loss at equal iterations (at least iterations 100, 500 and the final one), mAP, step time, and the number of `non-finite gradients` skip lines. Pass criterion: fp16 loss within 10% of fp32 at the final iteration and mAP within 2 points; otherwise record the failure and stop (do not start Phase 2 claims).
-- [ ] **Step 4: Record** the table and verdict in `docs/OXIDE_BENCH.md`, and the version entry in `implemented.md`, `STATUS.md`, `todo.md`, `version-map.tsv`. Delete the weights and logs.
-- [ ] **Step 5: Commit** the doc files, `docs: record fp16 convergence run vs fp32`.
+- [x] **Step 1: Baseline run.** `cargo xtask train_legogears -map_every 100` (fp32), note the final `avg loss`, the `-map` results, and the `train=... milliseconds` column. Stop after the iteration count the user agrees on.
+- [x] **Step 2: fp16 run.** `cargo xtask train_legogears -fp16 -map_every 100` with the same seed and iteration count.
+- [x] **Step 3: Compare** loss at equal iterations (at least iterations 100, 500 and the final one), mAP, step time, and the number of `non-finite gradients` skip lines. Pass criterion: fp16 loss within 10% of fp32 at the final iteration and mAP within 2 points; otherwise record the failure and stop (do not start Phase 2 claims).
+- [x] **Step 4: Record** the table and verdict in `docs/OXIDE_BENCH.md`, and the version entry in `implemented.md`, `STATUS.md`, `todo.md`, `version-map.tsv`. Delete the weights and logs.
+- [x] **Step 5: Commit** the doc files, `docs: record fp16 convergence run vs fp32`.

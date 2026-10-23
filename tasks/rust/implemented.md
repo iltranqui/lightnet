@@ -271,6 +271,7 @@ file is named inline.
 - [36. Annotation GUI plan implementation](#36-annotation-gui-plan-implementation)
 - [37. DarkMark hotkey parity and model discovery](#37-darkmark-hotkey-parity-and-model-discovery)
 - [253. CPU language-model Phase 1 (plan_llm_decoder Tasks 1-7)](#253-cpu-language-model-phase-1-plan_llm_decoder-tasks-1-7)
+- [254. fp16 convergence verdict (plan_fp16 Task 5)](#254-fp16-convergence-verdict-plan_fp16-task-5)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -2554,3 +2555,16 @@ engine/trainer file is `train.rs` as named by the plan after an initial
 buffers are `[kv_heads, context, head_dim]`. The plan's Task 10 pilot counts
 were wrong: the registry gives 41,955,840 parameters at vocabulary 8192 and
 46,150,144 at 16384, and the plan now records those derived values.
+
+## 254. fp16 convergence verdict (plan_fp16 Task 5)
+
+Docs-only record; no new training run. Seed 42, 3000 iterations, batch 16,
+release build, same session (`v0.2.171-7`): fp32 step 48.7 ms / 146.4 s, final
+avg loss 0.059712, mAP@0.50 99.55%, F1 0.9935; fp16 AMP step 67.5 ms /
+208.8 s, loss 0.052513, mAP 99.63%, F1 0.9902.
+
+Accuracy gate passes: fp16's loss is 12.1% lower (favorable, not a degradation)
+and mAP is 0.08 points higher; F1 is one false positive lower. Speed does not:
+fp16 is 38% slower than fp32, so it is an accuracy-equivalent mode, not a speed
+feature on this build. The sparse `non-finite gradients` skip count was not
+retained after log cleanup. Full table: `docs/OXIDE_BENCH.md` §7.2.1.
