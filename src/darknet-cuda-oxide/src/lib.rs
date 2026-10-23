@@ -156,6 +156,9 @@ pub struct OxideBackend {
     /// Quantised copies of f32 weight tensors for the FP8 GEMM (keyed by the
     /// weight buffer identity and format); see [`OxideBackend::fp8_weights`].
     fp8_w: Mutex<Vec<mixed::Fp8WEntry>>,
+    /// Quantised output gradient shared by the dgrad and wgrad of one conv
+    /// backward; see [`OxideBackend::fp8_dy`].
+    fp8_dy: Mutex<Option<mixed::Fp8DyEntry>>,
     /// Pre-zeroed amax slots (see [`Fp8Ring`]).
     fp8_ring: Mutex<Fp8Ring>,
     /// Scale selection of the activation quantiser; see [`Fp8Scaling`].
@@ -1475,6 +1478,7 @@ impl OxideBackend {
             amp_w16: Mutex::new(Vec::new()),
             host_readbacks: AtomicU64::new(0),
             fp8_w: Mutex::new(Vec::new()),
+            fp8_dy: Mutex::new(None),
             fp8_ring: Mutex::new(fp8_ring),
             fp8_scaling: Fp8Scaling::from_env(),
             fp8_hist: Mutex::new(None),
@@ -1894,25 +1898,6 @@ impl OxideBackend {
         Ok(off)
     }
 
-    /// `C = alpha * op(A) * op(B) + beta * C` with `A` an f32 operand quantised
-    /// here to `fmt_a` and `B` already FP8 bytes in `fmt_b` with its scale pair
-    /// (byte im2col).
-    pub(crate) fn gemm_fp8_b_bytes(
-        &self,
-        a: &DeviceBuffer<f32>,
-        fmt_a: Fp8Format,
-        bq: &DeviceBuffer<u8>,
-        fmt_b: Fp8Format,
-        sb: &DeviceBuffer<f32>,
-        c: &mut DeviceBuffer<f32>,
-        g: &GemmArgs,
-    ) -> Result<(), OxideError> {
-        let (ar, ac) = if g.trans_a { (g.k, g.m) } else { (g.m, g.k) };
-        let a_len = extent(g.a.0, g.a.1, g.a.2, g.count, ar, ac, g.lda);
-        let (aq, sa) = self.fp8_quantize_operand(a, a_len, fmt_a)?;
-        self.gemm_fp8_args(&aq, bq, c, g, fmt_a, fmt_b, &sa, sb)
-    }
-
     /// Quantised copy of a weight tensor, cached by buffer identity and format.
     /// Weight tensors are immutable (an optimizer step returns a new tensor), so
     /// the copy refreshes once per update.  Only weight tensors may use this:
@@ -1953,6 +1938,72 @@ impl OxideBackend {
         Ok(value)
     }
 
+    /// Quantised copy of a conv output gradient, shared by the dgrad and the
+    /// wgrad of one backward: the first caller quantises the whole tensor (one
+    /// keyed quantise, so delayed scaling advances its history once), the
+    /// second gets the same bytes and scale pair.  Only the most recent
+    /// gradient is kept.  Valid because tensors are immutable once built and a
+    /// dead tensor's entry is skipped by the `Weak` check.
+    pub(crate) fn fp8_dy(&self, dy: &OxideTensorF32, fmt: Fp8Format) -> Result<mixed::Fp8Weights, OxideError> {
+        let lock_err = || shape_err("fp8_dy", "lock poisoned".into());
+        let ptr = Arc::as_ptr(&dy.buf);
+        {
+            let cache = self.fp8_dy.lock().map_err(|_| lock_err())?;
+            if let Some(e) = cache.as_ref().filter(|e| {
+                e.key.as_ptr() == ptr && e.key.strong_count() > 0 && e.len == dy.len() && e.fmt == fmt
+            }) {
+                return Ok(e.value.clone());
+            }
+        }
+        let (bytes, scale) = self.fp8_quantize_operand(&dy.buf, dy.len(), fmt)?;
+        let value = mixed::Fp8Weights {
+            bytes: Arc::new(bytes),
+            scale: Arc::new(scale),
+        };
+        *self.fp8_dy.lock().map_err(|_| lock_err())? = Some(mixed::Fp8DyEntry {
+            key: Arc::downgrade(&dy.buf),
+            len: dy.len(),
+            fmt,
+            value: value.clone(),
+        });
+        Ok(value)
+    }
+
+    /// wgrad with the column already FP8 bytes (B) and `dy` (A) quantised once
+    /// through [`Self::fp8_dy`].
+    pub(crate) fn gemm_fp8_dy_a_bytes(
+        &self,
+        dy: &OxideTensorF32,
+        fmt_a: Fp8Format,
+        bq: &DeviceBuffer<u8>,
+        fmt_b: Fp8Format,
+        sb: &DeviceBuffer<f32>,
+        c: &mut DeviceBuffer<f32>,
+        g: &GemmArgs,
+    ) -> Result<(), OxideError> {
+        let dq = self.fp8_dy(dy, fmt_a)?;
+        self.gemm_fp8_args(&dq.bytes, bq, c, g, fmt_a, fmt_b, &dq.scale, sb)
+    }
+
+    /// dgrad GEMM: weight operand A (cached FP8 copy) times `dy` as operand B,
+    /// quantised once through [`Self::fp8_dy`].
+    pub(crate) fn backward_gemm_weights_dy(
+        &self,
+        w: &OxideTensorF32,
+        dy: &OxideTensorF32,
+        c: &mut DeviceBuffer<f32>,
+        g: &GemmArgs,
+    ) -> Result<(), OxideError> {
+        match self.bwd_fp8 {
+            Some((fa, fb)) => {
+                let wq = self.fp8_weights(w, fa)?;
+                let dq = self.fp8_dy(dy, fb)?;
+                self.gemm_fp8_args(&wq.bytes, &dq.bytes, c, g, fa, fb, &wq.scale, &dq.scale)
+            }
+            None => self.gemm_weights_a(w, &dy.buf, c, g),
+        }
+    }
+
     /// `C = alpha * W * op(B) + beta * C` where `W` is a weight tensor and its
     /// quantised copy comes from [`Self::fp8_weights`]; `B` is quantised per call.
     pub(crate) fn gemm_fp8_weights_a(
@@ -1984,21 +2035,6 @@ impl OxideBackend {
             return self.gemm_fp8_weights_a(w, b, c, g, Fp8Format::E4M3, Fp8Format::E4M3);
         }
         self.gemm(&w.buf, b, c, g)
-    }
-
-    /// Backward GEMM seam for a weight operand A (conv dgrad).  Uses the FP8
-    /// backward formats when enabled, otherwise [`Self::gemm_weights_a`].
-    pub(crate) fn backward_gemm_weights_a(
-        &self,
-        w: &OxideTensorF32,
-        b: &DeviceBuffer<f32>,
-        c: &mut DeviceBuffer<f32>,
-        g: &GemmArgs,
-    ) -> Result<(), OxideError> {
-        match self.bwd_fp8 {
-            Some((fa, fb)) => self.gemm_fp8_weights_a(w, b, c, g, fa, fb),
-            None => self.gemm_weights_a(w, b, c, g),
-        }
     }
 
     /// `C = alpha * A * op(B) + beta * C` with `A` a weight tensor (cached FP8

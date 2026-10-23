@@ -104,6 +104,18 @@ pub(crate) struct Fp8WEntry {
     pub(crate) value: Fp8Weights,
 }
 
+/// The most recent quantised output gradient of a conv backward: dgrad and
+/// wgrad both read the same `dy` buffer in the same format, so the second one
+/// reuses the first one's bytes and scale pair.  Keyed on the buffer identity
+/// (a live `Weak` pins the allocation, so the address cannot be reused), the
+/// element count and the format.
+pub(crate) struct Fp8DyEntry {
+    pub(crate) key: Weak<PooledBuf>,
+    pub(crate) len: usize,
+    pub(crate) fmt: crate::fp8::Fp8Format,
+    pub(crate) value: Fp8Weights,
+}
+
 pub(crate) const W16_CACHE_MAX: usize = 512;
 
 impl OxideBackend {

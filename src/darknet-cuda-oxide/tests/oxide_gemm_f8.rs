@@ -930,6 +930,84 @@ fn fp8_backward_dgrad_and_wgrad_track_the_f32_backward() {
 }
 
 #[test]
+fn fp8_backward_quantises_dy_once() {
+    // dgrad (dy = operand B) and wgrad (dy = operand A) quantise the same f32
+    // buffer to the same format; one conv backward must quantise it once.
+    // Reference: two identical copies of dy in distinct buffers, which cannot
+    // share, give the previous behaviour (one quantise per GEMM).
+    let fp8 = || {
+        OxideBackend::new()
+            .expect("backend")
+            .with_gemm_mode(GemmMode::Fp8)
+            .with_fp8_backward(Some((Fp8Format::E4M3, Fp8Format::E5M2)))
+    };
+    let cfg = ElementwiseLaunchConfig::default();
+    let mut rng = Rng(0x5ba_2ed1);
+    let (batch, c, h, w, f, k, sx, sy, pad) = (2usize, 32, 16, 16, 64, 3, 2, 2, 1);
+    let oh = (h + 2 * pad - k) / sy + 1;
+    let ow = (w + 2 * pad - k) / sx + 1;
+    let x: Vec<f32> = (0..batch * c * h * w).map(|_| rng.next(0.2, 1.0)).collect();
+    let dy: Vec<f32> = (0..batch * f * oh * ow).map(|_| rng.next(0.2, 1.0)).collect();
+    let wt: Vec<f32> = (0..f * c * k * k).map(|_| rng.next(0.2, 1.0)).collect();
+
+    let run = |be: &OxideBackend, dy_w: &OxideTensorF32, dy_d: &OxideTensorF32| {
+        let tx = be.upload_f32(&[batch, c, h, w], &x).unwrap();
+        let twt = be.upload_f32(&[f, c, k, k], &wt).unwrap();
+        // Warm the weight cache (with a throwaway dy) so only the dy
+        // quantisations of the measured pair are counted.
+        let warm = be.upload_f32(&[batch, f, oh, ow], &dy).unwrap();
+        be.conv2d_backward_input_f32(&warm, &twt, &[batch, c, h, w], c, h, w, f, k, sx, sy, 1, pad, 1, cfg).unwrap();
+        let before = be.fp8_quantize_launches();
+        let dw = be.conv2d_backward_weights_f32(&tx, dy_w, &[f, c, k, k], c, h, w, f, k, sx, sy, 1, pad, 1, cfg).unwrap();
+        let dx = be.conv2d_backward_input_f32(dy_d, &twt, &[batch, c, h, w], c, h, w, f, k, sx, sy, 1, pad, 1, cfg).unwrap();
+        (download(be, &dx), download(be, &dw), be.fp8_quantize_launches() - before)
+    };
+
+    let be = fp8();
+    let shared = be.upload_f32(&[batch, f, oh, ow], &dy).unwrap();
+    let (dx_s, dw_s, n_shared) = run(&be, &shared, &shared);
+
+    let be = fp8();
+    let copy_w = be.upload_f32(&[batch, f, oh, ow], &dy).unwrap();
+    let copy_d = be.upload_f32(&[batch, f, oh, ow], &dy).unwrap();
+    let (dx_r, dw_r, n_separate) = run(&be, &copy_w, &copy_d);
+
+    assert_eq!(n_separate, 2, "reference: one dy quantise per GEMM");
+    assert_eq!(n_shared, 1, "dy must be quantised once per conv backward");
+    assert_eq!(dx_s, dx_r, "dgrad changed bitwise");
+    assert_eq!(dw_s, dw_r, "wgrad changed bitwise");
+}
+
+#[test]
+fn fp8_backward_shares_dy_under_delayed_scaling() {
+    let be = OxideBackend::new()
+        .expect("backend")
+        .with_gemm_mode(GemmMode::Fp8)
+        .with_fp8_scaling(Fp8Scaling::Delayed)
+        .with_fp8_backward(Some((Fp8Format::E4M3, Fp8Format::E5M2)));
+    let cfg = ElementwiseLaunchConfig::default();
+    let mut rng = Rng(0xde1_a7ed);
+    let (batch, c, h, w, f, k, sx, sy, pad) = (2usize, 32, 16, 16, 64, 3, 2, 2, 1);
+    let oh = (h + 2 * pad - k) / sy + 1;
+    let ow = (w + 2 * pad - k) / sx + 1;
+    let tx = be.upload_f32(&[batch, c, h, w], &(0..batch * c * h * w).map(|_| rng.next(0.2, 1.0)).collect::<Vec<_>>()).unwrap();
+    let twt = be.upload_f32(&[f, c, k, k], &(0..f * c * k * k).map(|_| rng.next(0.2, 1.0)).collect::<Vec<_>>()).unwrap();
+    let dy: Vec<f32> = (0..batch * f * oh * ow).map(|_| rng.next(0.2, 1.0)).collect();
+    let step = || {
+        // A fresh gradient tensor per step, as in training.
+        let tdy = be.upload_f32(&[batch, f, oh, ow], &dy).unwrap();
+        let before = be.fp8_quantize_launches();
+        let dw = download(&be, &be.conv2d_backward_weights_f32(&tx, &tdy, &[f, c, k, k], c, h, w, f, k, sx, sy, 1, pad, 1, cfg).unwrap());
+        let dx = download(&be, &be.conv2d_backward_input_f32(&tdy, &twt, &[batch, c, h, w], c, h, w, f, k, sx, sy, 1, pad, 1, cfg).unwrap());
+        assert!(dw.iter().chain(&dx).all(|v| v.is_finite()));
+        be.fp8_quantize_launches() - before
+    };
+    step(); // history empty, weight cache cold
+    assert_eq!(step(), 1, "one keyed dy quantise per backward");
+    assert_eq!(step(), 1, "one keyed dy quantise per backward");
+}
+
+#[test]
 fn fp8_gemm_does_not_read_back_to_host() {
     // The fp8 GEMM derives its per-tensor scales on the device; a host
     // round trip per call would stall the stream once per operand.

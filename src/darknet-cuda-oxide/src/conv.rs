@@ -593,9 +593,9 @@ impl OxideBackend {
                     let nb = chunk.min(g.batch - b0);
                     let inst = nb * groups;
                     // dcol[b, g] (kg x ohw) = W[g]^T (kg x fpg) * dy[b, g] (fpg x ohw)
-                    self.backward_gemm_weights_a(
+                    self.backward_gemm_weights_dy(
                         weights,
-                        &dy.buf,
+                        dy,
                         ws,
                         &GemmArgs {
                             m: kg,
@@ -756,7 +756,7 @@ impl OxideBackend {
                         ..GemmArgs::default()
                     };
                     if let (Some(cols8), Some(scale)) = (cols8.as_ref(), scale.as_ref()) {
-                        self.gemm_fp8_b_bytes(&dy.buf, dy_fmt, cols8, col_fmt, scale, &mut partial, &wgrad)?;
+                        self.gemm_fp8_dy_a_bytes(dy, dy_fmt, cols8, col_fmt, scale, &mut partial, &wgrad)?;
                     } else {
                         self.backward_gemm(&dy.buf, ws, &mut partial, &wgrad)?;
                     }
