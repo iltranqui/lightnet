@@ -22,7 +22,7 @@
 //! differ (`2^-22 * K` relative).
 
 use darknet_cuda_oxide::fp8::{Fp8Format, amax_to_scale, f32_to_fp8, fp8_to_f32};
-use darknet_cuda_oxide::{GemmMode, OxideBackend, OxideTensorF32};
+use darknet_cuda_oxide::{Fp8Scaling, GemmMode, OxideBackend, OxideTensorF32};
 
 /// Relative slack against the *row norm* (`sum_k |a_k| |b_k|`) for the f32
 /// accumulation-order difference between the tensor core and the f64 CPU
@@ -1044,4 +1044,149 @@ fn fp8_cached_weights_serve_forward_and_transposed_dgrad() {
     let dg_cached = be.gemm_f32_weights_a(&w, &x_bwd, &c_bwd, k, n, m, true, false, 1.0, 0.0).unwrap();
     let dg_plain = be.gemm_f32(&w, &x_bwd, &c_bwd, k, n, m, true, false, 1.0, 0.0).unwrap();
     assert_eq!(download(&be, &dg_cached), download(&be, &dg_plain), "transposed dgrad");
+}
+
+// ---- Delayed scaling (plan_fp8 Task 3) ------------------------------------
+
+#[test]
+fn fp8_scaling_defaults_to_current_and_parses_env_spelling() {
+    assert_eq!(Fp8Scaling::from_name(""), Fp8Scaling::Current);
+    assert_eq!(Fp8Scaling::from_name("current"), Fp8Scaling::Current);
+    assert_eq!(Fp8Scaling::from_name("Delayed"), Fp8Scaling::Delayed);
+    assert_eq!(Fp8Scaling::from_name("bogus"), Fp8Scaling::Current);
+    let be = OxideBackend::new().expect("backend").with_fp8_scaling(Fp8Scaling::Delayed);
+    assert_eq!(be.fp8_scaling(), Fp8Scaling::Delayed);
+}
+
+#[test]
+fn delayed_scaling_matches_current_scaling_on_stationary_data() {
+    let cur = OxideBackend::new().expect("backend");
+    let del = OxideBackend::new().expect("backend").with_fp8_scaling(Fp8Scaling::Delayed);
+    let mut rng = Rng(0xde1a_7ed);
+    let x = rng.vec(3000, -3.0, 3.0);
+    let tx_cur = cur.upload_f32(&[x.len()], &x).unwrap();
+    let tx_del = del.upload_f32(&[x.len()], &x).unwrap();
+    let (want_bytes, want_scale) = cur.fp8_quantize_probe(&tx_cur, Fp8Format::E4M3, None).unwrap();
+    for call in 0..20 {
+        let (bytes, scale) = del.fp8_quantize_probe(&tx_del, Fp8Format::E4M3, None).unwrap();
+        // Same tensor every call: the history max equals the tensor's amax, so
+        // the factor, and with it every byte, matches current scaling.  (The
+        // plan allows one e4m3 ulp; stationary data gives exact equality.)
+        assert_eq!(scale, want_scale, "call {call}: scale pair");
+        assert_eq!(bytes, want_bytes, "call {call}: bytes");
+    }
+
+    // Same through the GEMM: 20 calls on fixed operands, outputs equal current.
+    let cur = cur.with_gemm_mode(GemmMode::Fp8);
+    let del = del.with_gemm_mode(GemmMode::Fp8);
+    let (m, n, k) = (64, 48, 96);
+    let a = rng.vec(m * k, -2.0, 2.0);
+    let b = rng.vec(k * n, -2.0, 2.0);
+    let c0 = vec![0.0f32; m * n];
+    let run = |be: &OxideBackend, ta: &OxideTensorF32, tb: &OxideTensorF32, tc: &OxideTensorF32| {
+        download(be, &be.gemm_f32(ta, tb, tc, m, n, k, false, false, 1.0, 0.0).unwrap())
+    };
+    let (ca, cb, cc) = (
+        cur.upload_f32(&[m, k], &a).unwrap(),
+        cur.upload_f32(&[k, n], &b).unwrap(),
+        cur.upload_f32(&[m, n], &c0).unwrap(),
+    );
+    let (da, db, dc) = (
+        del.upload_f32(&[m, k], &a).unwrap(),
+        del.upload_f32(&[k, n], &b).unwrap(),
+        del.upload_f32(&[m, n], &c0).unwrap(),
+    );
+    let want = run(&cur, &ca, &cb, &cc);
+    for call in 0..20 {
+        assert_eq!(run(&del, &da, &db, &dc), want, "gemm call {call}");
+    }
+}
+
+#[test]
+fn delayed_scaling_saturates_on_a_spike() {
+    let be = OxideBackend::new().expect("backend").with_fp8_scaling(Fp8Scaling::Delayed);
+    let mut rng = Rng(0x5b1_4e);
+    let base = rng.vec(1024, -1.0, 1.0);
+    let amax = base.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    // One explicit key stands for one call site whose buffer changes.
+    let key = Some(0x5eed_u64);
+    for _ in 0..4 {
+        let t = be.upload_f32(&[base.len()], &base).unwrap();
+        be.fp8_quantize_probe(&t, Fp8Format::E4M3, key).unwrap();
+    }
+    let mut spiked = base.clone();
+    spiked[7] = 100.0 * amax;
+    spiked[8] = -100.0 * amax;
+    let t = be.upload_f32(&[spiked.len()], &spiked).unwrap();
+    let (bytes, scale) = be.fp8_quantize_probe(&t, Fp8Format::E4M3, key).unwrap();
+    let back = |b: u8| fp8_to_f32(b, Fp8Format::E4M3);
+    assert_eq!(back(bytes[7]), 448.0, "positive spike saturates to max finite");
+    assert_eq!(back(bytes[8]), -448.0, "negative spike saturates to -max finite");
+    assert!(bytes.iter().all(|&b| back(b).is_finite()), "NaN or inf in the output");
+    assert!((scale[0] - 448.0 / amax).abs() <= 1e-3 * scale[0], "factor comes from the history, not the spike");
+
+    // The spike enters the history for the next call.
+    let (_, next) = be.fp8_quantize_probe(&t, Fp8Format::E4M3, key).unwrap();
+    assert!((next[0] - 448.0 / (100.0 * amax)).abs() <= 1e-3 * next[0], "history picked up the spike");
+}
+
+#[test]
+fn delayed_scaling_first_call_uses_current_amax() {
+    let be = OxideBackend::new().expect("backend").with_fp8_scaling(Fp8Scaling::Delayed);
+    let mut rng = Rng(0xf1_257);
+    let x = rng.vec(700, -5.0, 5.0);
+    let amax = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let t = be.upload_f32(&[x.len()], &x).unwrap();
+    let (bytes, scale) = be.fp8_quantize_probe(&t, Fp8Format::E4M3, Some(1)).unwrap();
+    let factor = 448.0 / amax;
+    assert!((scale[0] - factor).abs() <= 1e-6 * factor, "factor {} want {factor}", scale[0]);
+    assert!((scale[1] * scale[0] - 1.0).abs() <= 1e-6);
+    for (i, (&b, &v)) in bytes.iter().zip(&x).enumerate() {
+        assert_eq!(b, f32_to_fp8(v * scale[0], Fp8Format::E4M3), "byte {i}");
+    }
+    // The first call recorded its amax: a second call with a tiny tensor still
+    // scales by the first tensor's amax.
+    // (Same length: the key includes the element count.)
+    let tiny = vec![0.001f32; x.len()];
+    let tt = be.upload_f32(&[x.len()], &tiny).unwrap();
+    let (_, s2) = be.fp8_quantize_probe(&tt, Fp8Format::E4M3, Some(1)).unwrap();
+    assert!((s2[0] - factor).abs() <= 1e-6 * factor, "second call uses history {} want {factor}", s2[0]);
+}
+
+#[test]
+fn delayed_scaling_keeps_weights_on_current_scaling_and_forgets_after_16_calls() {
+    // Weights go through the cache with current scaling even in Delayed mode.
+    let cur = OxideBackend::new().expect("backend").with_gemm_mode(GemmMode::Fp8);
+    let del = OxideBackend::new()
+        .expect("backend")
+        .with_gemm_mode(GemmMode::Fp8)
+        .with_fp8_scaling(Fp8Scaling::Delayed);
+    let (m, n, k) = (64, 96, 128);
+    let mut rng = Rng(0x77_aa);
+    let w = rng.vec(m * k, -1.0, 1.0);
+    let x = rng.vec(k * n, -1.0, 1.0);
+    let c0 = vec![0.0f32; m * n];
+    let go = |be: &OxideBackend| {
+        let tw = be.upload_f32(&[m, k], &w).unwrap();
+        let tx = be.upload_f32(&[k, n], &x).unwrap();
+        let tc = be.upload_f32(&[m, n], &c0).unwrap();
+        download(be, &be.gemm_f32_weights_a(&tw, &tx, &tc, m, n, k, false, false, 1.0, 0.0).unwrap())
+    };
+    // First call: empty history, so the activation also uses its own amax.
+    assert_eq!(go(&cur), go(&del));
+
+    // A spike ages out of the 16-call window: after 16 calls with small data
+    // the factor returns to the small tensor's own amax.
+    let be = &del;
+    let small = vec![1.0f32; 256];
+    let big = vec![50.0f32; 256];
+    let key = Some(9u64);
+    let t = be.upload_f32(&[256], &big).unwrap();
+    be.fp8_quantize_probe(&t, Fp8Format::E4M3, key).unwrap();
+    let t = be.upload_f32(&[256], &small).unwrap();
+    let mut last = [0.0f32; 2];
+    for _ in 0..20 {
+        last = be.fp8_quantize_probe(&t, Fp8Format::E4M3, key).unwrap().1;
+    }
+    assert!((last[0] - 448.0).abs() <= 1e-3, "old spike aged out, factor {}", last[0]);
 }

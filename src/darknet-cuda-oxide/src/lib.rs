@@ -57,6 +57,48 @@ pub(crate) struct Fp8Ring {
     next: usize,
 }
 
+/// How the FP8 quantiser picks a tensor's scale.
+///
+/// `Current` (default) measures the tensor's own amax in a first pass and
+/// quantises in a second.  `Delayed` takes the factor from the maximum of the
+/// last calls' amaxes at the same call site (an amax history) and records this
+/// call's amax in the same single pass; the first call of a site has no history
+/// and measures its own.  Chosen by `DARKNET_OXIDE_FP8_SCALING=current|delayed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Fp8Scaling {
+    #[default]
+    Current,
+    Delayed,
+}
+
+impl Fp8Scaling {
+    /// Parse the env spelling (case-insensitive); anything but `delayed` is `Current`.
+    pub fn from_name(name: &str) -> Self {
+        if name.trim().eq_ignore_ascii_case("delayed") {
+            Self::Delayed
+        } else {
+            Self::Current
+        }
+    }
+
+    fn from_env() -> Self {
+        Self::from_name(&std::env::var("DARKNET_OXIDE_FP8_SCALING").unwrap_or_default())
+    }
+}
+
+/// Device amax histories of the delayed FP8 scaling: `FP8_HIST_KEYS` keys of
+/// `F8_HIST_LEN` slots each in one zeroed buffer.  A key is (source buffer
+/// device pointer, element count, format code); pooled buffers keep their
+/// address per call site in steady state.  When the buffer is full, new keys
+/// fall back to current scaling.
+pub(crate) struct Fp8Hist {
+    buf: DeviceBuffer<f32>,
+    /// key -> (first slot word, calls so far)
+    keys: std::collections::HashMap<(u64, usize, u32), (usize, u64)>,
+}
+
+pub(crate) const FP8_HIST_KEYS: usize = 4096;
+
 #[derive(Debug)]
 pub enum OxideError {
     Cuda(DriverError),
@@ -116,6 +158,10 @@ pub struct OxideBackend {
     fp8_w: Mutex<Vec<mixed::Fp8WEntry>>,
     /// Pre-zeroed amax slots (see [`Fp8Ring`]).
     fp8_ring: Mutex<Fp8Ring>,
+    /// Scale selection of the activation quantiser; see [`Fp8Scaling`].
+    fp8_scaling: Fp8Scaling,
+    /// Amax histories of [`Fp8Scaling::Delayed`], allocated on first use.
+    fp8_hist: Mutex<Option<Fp8Hist>>,
     /// Quantise launches issued by the FP8 path; see
     /// [`OxideBackend::fp8_quantize_launches`].
     fp8_quantize_launches: AtomicU64,
@@ -1430,6 +1476,8 @@ impl OxideBackend {
             host_readbacks: AtomicU64::new(0),
             fp8_w: Mutex::new(Vec::new()),
             fp8_ring: Mutex::new(fp8_ring),
+            fp8_scaling: Fp8Scaling::from_env(),
+            fp8_hist: Mutex::new(None),
             fp8_quantize_launches: AtomicU64::new(0),
             empty_f32,
             half_scratch: Mutex::new(half_scratch),
@@ -1498,6 +1546,34 @@ impl OxideBackend {
     pub fn with_fp8_backward(mut self, formats: Option<(Fp8Format, Fp8Format)>) -> Self {
         self.bwd_fp8 = formats;
         self
+    }
+
+    /// Select current or delayed FP8 scaling (default from
+    /// `DARKNET_OXIDE_FP8_SCALING`).  Cached weights always use current scaling.
+    pub fn with_fp8_scaling(mut self, scaling: Fp8Scaling) -> Self {
+        self.fp8_scaling = scaling;
+        self
+    }
+
+    pub fn fp8_scaling(&self) -> Fp8Scaling {
+        self.fp8_scaling
+    }
+
+    /// Test seam: quantise `x` to `fmt` through the activation quantiser
+    /// (honouring [`Fp8Scaling`]) and return the bytes and the scale pair
+    /// `[factor, 1 / factor]`.  `key` overrides the delayed-history key (the
+    /// source buffer address) so a test can simulate one call site whose buffer
+    /// changes between calls.
+    pub fn fp8_quantize_probe(
+        &self,
+        x: &OxideTensorF32,
+        fmt: Fp8Format,
+        key: Option<u64>,
+    ) -> Result<(Vec<u8>, [f32; 2]), OxideError> {
+        let (bytes, scale) = self.fp8_quantize_keyed(&x.buf, x.len(), fmt, key)?;
+        let bytes = if bytes.len() == 0 { Vec::new() } else { bytes.to_host_vec(&self.stream)? };
+        let scale = scale.to_host_vec(&self.stream)?;
+        Ok((bytes, [scale[0], scale[1]]))
     }
 
     /// The FP8 formats used by the dgrad / wgrad GEMMs, if enabled.
@@ -1570,6 +1646,122 @@ impl OxideBackend {
         len: usize,
         fmt: Fp8Format,
     ) -> Result<(PooledBuf8, PooledBuf), OxideError> {
+        self.fp8_quantize_keyed(buf, len, fmt, None)
+    }
+
+    /// [`Self::fp8_quantize_operand`] with an optional delayed-history key
+    /// override (tests); `None` keys on the buffer's device address.
+    fn fp8_quantize_keyed(
+        &self,
+        buf: &DeviceBuffer<f32>,
+        len: usize,
+        fmt: Fp8Format,
+        key: Option<u64>,
+    ) -> Result<(PooledBuf8, PooledBuf), OxideError> {
+        if self.fp8_scaling == Fp8Scaling::Delayed && len > 0 {
+            if let Some(done) = self.fp8_quantize_delayed(buf, len, fmt, key)? {
+                return Ok(done);
+            }
+        }
+        self.fp8_quantize_operand_current(buf, len, fmt)
+    }
+
+    /// Delayed scaling for one operand; `None` when the history is full and the
+    /// caller should use current scaling.  Call `n` of a key writes slot
+    /// `n % 16` and zeroes slot `(n + 2) % 16`; call 0 (empty history) measures
+    /// its own amax into its slot, then quantises with it (the two-pass path).
+    fn fp8_quantize_delayed(
+        &self,
+        buf: &DeviceBuffer<f32>,
+        len: usize,
+        fmt: Fp8Format,
+        key: Option<u64>,
+    ) -> Result<Option<(PooledBuf8, PooledBuf)>, OxideError> {
+        let hist_len = gemm_f8::F8_HIST_LEN;
+        let mut guard = self
+            .fp8_hist
+            .lock()
+            .map_err(|_| shape_err("fp8_hist", "lock poisoned".into()))?;
+        if guard.is_none() {
+            *guard = Some(Fp8Hist {
+                buf: DeviceBuffer::<f32>::zeroed(&self.stream, FP8_HIST_KEYS * hist_len)?,
+                keys: std::collections::HashMap::new(),
+            });
+        }
+        let hist = guard.as_mut().expect("initialised above");
+        let key = (key.unwrap_or_else(|| buf.cu_deviceptr() as u64), len, fmt.code());
+        let slots_used = hist.keys.len();
+        let entry = match hist.keys.get_mut(&key) {
+            Some(e) => e,
+            None if slots_used < FP8_HIST_KEYS => hist.keys.entry(key).or_insert((slots_used * hist_len, 0)),
+            None => return Ok(None),
+        };
+        let (base, n) = (entry.0, entry.1);
+        entry.1 += 1;
+        let w = (n % hist_len as u64) as u32;
+        let z = ((n + 2) % hist_len as u64) as u32;
+        let mut out = self.alloc8_uninit(len)?;
+        let mut scale = self.alloc_uninit(2)?;
+        if n == 0 {
+            // Empty history: current scaling, with the amax landing in slot `w`.
+            // SAFETY: one thread per element; slot `w` of a fresh key is zero and
+            // only touched through `fetch_max`.
+            unsafe {
+                self.gemm_f8.fp8_amax_f32_kernel(
+                    &self.stream,
+                    launch::blocks_of(len.div_ceil(gemm_f8::F8_AMAX_BLOCK), gemm_f8::F8_AMAX_BLOCK as u32),
+                    buf,
+                    &mut hist.buf,
+                    base as u32 + w,
+                )
+            }
+            .map_err(launch_err)?;
+            // SAFETY: as `fp8_quantize_operand_current`.
+            unsafe {
+                self.gemm_f8.fp8_quantize_kernel(
+                    &self.stream,
+                    launch::elementwise(len.max(2), ElementwiseLaunchConfig::default()),
+                    buf,
+                    &hist.buf,
+                    &mut out,
+                    &mut scale,
+                    fmt.code(),
+                    base as u32 + w,
+                )
+            }
+            .map_err(launch_err)?;
+        } else {
+            let blocks = len.max(2).div_ceil(gemm_f8::F8_AMAX_BLOCK);
+            // SAFETY: whole 256-thread blocks; the kernel reads only history
+            // slots other than `w` / `z`, writes slot `w` atomically and zeroes
+            // `z`, writes every byte of `out` and both scale words.
+            unsafe {
+                self.gemm_f8.fp8_quantize_delayed_kernel(
+                    &self.stream,
+                    launch::blocks_of(blocks, gemm_f8::F8_AMAX_BLOCK as u32),
+                    buf,
+                    &mut hist.buf,
+                    &mut out,
+                    &mut scale,
+                    fmt.code(),
+                    base as u32,
+                    w,
+                    z,
+                )
+            }
+            .map_err(launch_err)?;
+        }
+        self.fp8_quantize_launches.fetch_add(1, Ordering::Relaxed);
+        Ok(Some((out, scale)))
+    }
+
+    /// Current-scaling quantiser of one operand (two passes: amax, quantise).
+    fn fp8_quantize_operand_current(
+        &self,
+        buf: &DeviceBuffer<f32>,
+        len: usize,
+        fmt: Fp8Format,
+    ) -> Result<(PooledBuf8, PooledBuf), OxideError> {
         if len == 0 {
             return Ok((self.alloc8_uninit(0)?, self.unit_scale()?));
         }
@@ -1624,7 +1816,7 @@ impl OxideBackend {
         b_len: usize,
         fmt_b: Fp8Format,
     ) -> Result<((PooledBuf8, PooledBuf), (PooledBuf8, PooledBuf)), OxideError> {
-        if a_len == 0 || b_len == 0 {
+        if a_len == 0 || b_len == 0 || self.fp8_scaling == Fp8Scaling::Delayed {
             return Ok((
                 self.fp8_quantize_operand(a, a_len, fmt_a)?,
                 self.fp8_quantize_operand(b, b_len, fmt_b)?,
@@ -1740,7 +1932,7 @@ impl OxideBackend {
                 return Ok(e.value.clone());
             }
         }
-        let (bytes, scale) = self.fp8_quantize_operand(&w.buf, w.len(), fmt)?;
+        let (bytes, scale) = self.fp8_quantize_operand_current(&w.buf, w.len(), fmt)?;
         let value = mixed::Fp8Weights {
             bytes: Arc::new(bytes),
             scale: Arc::new(scale),

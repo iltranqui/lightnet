@@ -224,6 +224,8 @@ pub fn fp8_stage16(
 
 /// Block size of `fp8_amax_pair_kernel` (one tile per block).
 pub const F8_AMAX_BLOCK: usize = 256;
+/// Amax history slots per quantised tensor role (delayed scaling).
+pub const F8_HIST_LEN: usize = 16;
 /// Word offset of operand B's amax slot in the pair kernels: 32 floats = 128
 /// bytes, a separate cache line from A's slot at word 0.
 pub const F8_AMAX_B_SLOT: usize = 32;
@@ -399,6 +401,92 @@ pub mod kernels {
         }
         if let Some(o) = out.get_mut(idx) {
             *o = quantize_f32(x[i], factor, fmt);
+        }
+    }
+
+    /// Delayed-scaling quantiser: one pass over `x`.  `hist[base..base + 16]`
+    /// is the key's amax history.  Call `n` of a key has `w = n % 16` and
+    /// `z = (n + 2) % 16` (host-computed): the factor is `max_finite(fmt) /
+    /// max(hist[s])` over every slot except `w` and `z`, so nothing read here
+    /// is written by this launch; the block-reduced amax of `x` (non-finite
+    /// ignored) goes into slot `w` with one `atomicMax` per block (the slot was
+    /// zeroed two calls ago), and thread 0 of block 0 zeroes slot `z` for the
+    /// call after next.  An all-zero history gives factor 1.0.  Elements are
+    /// quantised with saturation, so a value above the history max clamps to
+    /// the format's max finite.  The first two threads write the scale pair
+    /// `[factor, 1 / factor]` exactly like [`fp8_quantize_kernel`].  Launch
+    /// whole 256-thread blocks covering `max(x.len(), 2)` threads.
+    #[kernel]
+    pub fn fp8_quantize_delayed_kernel(
+        x: &[f32],
+        mut hist: DisjointSlice<f32>,
+        mut out: DisjointSlice<u8>,
+        mut scale: DisjointSlice<f32>,
+        fmt: u32,
+        base: u32,
+        w: u32,
+        z: u32,
+    ) {
+        static mut SH: SharedArray<u32, 256, 16> = SharedArray::UNINIT;
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SH) };
+        let tid = thread::threadIdx_x() as usize;
+        let idx = thread::index_1d();
+        let i = idx.get();
+        let hp = hist.as_mut_ptr();
+        let mut hmax = 0.0f32;
+        let mut s = 0u32;
+        while s < 16 {
+            if s != w && s != z {
+                // SAFETY: the host passes `base + 16 <= hist.len()`; slots other
+                // than `w` / `z` are not written during this launch.
+                let v = unsafe { hp.add((base + s) as usize).read() };
+                if v > hmax {
+                    hmax = v;
+                }
+            }
+            s += 1;
+        }
+        let factor = fp8_factor(hmax, fmt);
+        let mut bits = 0u32;
+        if i < x.len() {
+            let value = x[i];
+            if value.is_finite() {
+                bits = value.abs().to_bits();
+            }
+            if let Some(o) = out.get_mut(idx) {
+                *o = quantize_f32(value, factor, fmt);
+            }
+        }
+        if let Some(o) = scale.get_mut(thread::index_1d()) {
+            *o = if i == 0 { factor } else { 1.0 / factor };
+        }
+        // SAFETY: `tid < 256`, the shared array's length; every access between
+        // two barriers touches a distinct or read-only slot.
+        unsafe { sh.add(tid).write(bits) };
+        thread::sync_threads();
+        let mut stride = 128usize;
+        while stride > 0 {
+            if tid < stride {
+                let other = unsafe { sh.add(tid + stride).read() };
+                let mine = unsafe { sh.add(tid).read() };
+                if other > mine {
+                    unsafe { sh.add(tid).write(other) };
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        if tid == 0 {
+            // SAFETY: slot `w` is only touched through this atomic during the
+            // launch and holds 0 on entry (zeroed two calls ago).
+            let slot = unsafe { hp.add((base + w) as usize) } as *mut u32;
+            let atomic = unsafe { DeviceAtomicU32::from_ptr(slot) };
+            let _ = atomic.fetch_max(unsafe { sh.read() }, AtomicOrdering::Relaxed);
+            if thread::blockIdx_x() == 0 {
+                // SAFETY: slot `z` is neither read nor written by any other
+                // thread of this launch.
+                unsafe { hp.add((base + z) as usize).write(0.0) };
+            }
         }
     }
 
