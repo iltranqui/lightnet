@@ -22,7 +22,7 @@
 //! differ (`2^-22 * K` relative).
 
 use darknet_cuda_oxide::fp8::{Fp8Format, amax_to_scale, f32_to_fp8, fp8_to_f32};
-use darknet_cuda_oxide::{Fp8Scaling, GemmMode, OxideBackend, OxideTensorF32};
+use darknet_cuda_oxide::{Fp8Scaling, GemmMode, HalfFormat, OxideBackend, OxideTensorF32};
 
 /// Relative slack against the *row norm* (`sum_k |a_k| |b_k|`) for the f32
 /// accumulation-order difference between the tensor core and the f64 CPU
@@ -1267,4 +1267,54 @@ fn delayed_scaling_keeps_weights_on_current_scaling_and_forgets_after_16_calls()
         last = be.fp8_quantize_probe(&t, Fp8Format::E4M3, key).unwrap().1;
     }
     assert!((last[0] - 448.0).abs() <= 1e-3, "old spike aged out, factor {}", last[0]);
+}
+
+/// Quantising 16-bit storage directly must give the bytes and scale pair that
+/// widening to f32 first gives (the widening is exact, so nothing may differ).
+/// The data holds a spike that overflows f16 to inf and a zero run.
+fn fp8_from_half_matches_widened(hfmt: HalfFormat) {
+    let be = OxideBackend::new().expect("backend");
+    let mut rng = Rng(0x16b1_7f8 + hfmt.code() as u64);
+    let mut x = rng.vec(5000, -3.0, 3.0);
+    x[11] = 1.0e6; // inf in f16, finite in bf16
+    x[12] = -1.0e-9;
+    x[100..140].fill(0.0);
+    let xh = be.to_half(&be.upload_f32(&[x.len()], &x).unwrap(), hfmt).unwrap();
+    let wide = be.from_half(&xh, hfmt).unwrap();
+    for fmt in [Fp8Format::E4M3, Fp8Format::E5M2] {
+        let (want_bytes, want_scale) = be.fp8_quantize_probe(&wide, fmt, None).unwrap();
+        let (bytes, scale) = be.fp8_quantize_half_probe(&xh, fmt, hfmt).unwrap();
+        assert_eq!(scale.map(f32::to_bits), want_scale.map(f32::to_bits), "{fmt:?} {hfmt:?}: scale pair");
+        assert_eq!(bytes, want_bytes, "{fmt:?} {hfmt:?}: bytes");
+    }
+
+    // Through the GEMM: half operands against the same values widened into the
+    // f32 fp8 selector, all four transposes, odd shapes.
+    let fp8 = OxideBackend::new().expect("backend").with_gemm_mode(GemmMode::Fp8);
+    for &(ta, tb) in &[(false, false), (false, true), (true, false), (true, true)] {
+        let (m, n, k) = (65usize, 33usize, 129usize);
+        let a = rng.vec(m * k, -2.0, 2.0);
+        let b = rng.vec(k * n, -2.0, 2.0);
+        let ah = be.to_half(&be.upload_f32(&[m, k], &a).unwrap(), hfmt).unwrap();
+        let bh = be.to_half(&be.upload_f32(&[k, n], &b).unwrap(), hfmt).unwrap();
+        let (aw, bw) = (be.from_half(&ah, hfmt).unwrap(), be.from_half(&bh, hfmt).unwrap());
+        let got = download(
+            &be,
+            &be.gemm_fp8_half(&ah, &bh, m, n, k, ta, tb, 0.7, Fp8Format::E4M3, Fp8Format::E4M3, hfmt).unwrap(),
+        );
+        let c0 = fp8.upload_f32(&[m, n], &vec![0.0f32; m * n]).unwrap();
+        let (taw, tbw) = (fp8.upload_f32(&[m, k], &download(&be, &aw)).unwrap(), fp8.upload_f32(&[k, n], &download(&be, &bw)).unwrap());
+        let want = download(&fp8, &fp8.gemm_f32(&taw, &tbw, &c0, m, n, k, ta, tb, 0.7, 0.0).unwrap());
+        assert_eq!(got, want, "{hfmt:?} gemm ta={ta} tb={tb}");
+    }
+}
+
+#[test]
+fn fp8_from_f16_matches_fp8_from_widened_f32() {
+    fp8_from_half_matches_widened(HalfFormat::F16);
+}
+
+#[test]
+fn fp8_from_bf16_matches_fp8_from_widened_f32() {
+    fp8_from_half_matches_widened(HalfFormat::Bf16);
 }

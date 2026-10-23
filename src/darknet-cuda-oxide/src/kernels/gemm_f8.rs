@@ -32,6 +32,7 @@
 //! (see [`crate::fp8`]); products and accumulation are f32.  e4m3 carries 3
 //! mantissa bits (relative error <= 2^-4 per operand), e5m2 carries 2.
 
+use super::convert::half_bits_to_f32;
 use super::unroll::unroll;
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use cuda_device::convert::{
@@ -366,6 +367,73 @@ pub mod kernels {
             let slot = unsafe { out.as_mut_ptr().add(off as usize) } as *mut u32;
             let atomic = unsafe { DeviceAtomicU32::from_ptr(slot) };
             let _ = atomic.fetch_max(unsafe { sh.read() }, AtomicOrdering::Relaxed);
+        }
+    }
+
+    /// [`fp8_amax_f32_kernel`] on 16-bit storage: `hfmt` (`0` = f16, `1` =
+    /// bf16) selects how each `x[i]` is widened (exact), so the slot gets the
+    /// value the f32 kernel would get from the widened tensor.
+    #[kernel]
+    pub fn fp8_amax_half_kernel(x: &[u16], mut out: DisjointSlice<f32>, off: u32, hfmt: u32) {
+        static mut SH: SharedArray<u32, 256, 16> = SharedArray::UNINIT;
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SH) };
+        let tid = thread::threadIdx_x() as usize;
+        let i = thread::blockIdx_x() as usize * 256 + tid;
+        let mut bits = 0u32;
+        if i < x.len() {
+            let value = half_bits_to_f32(x[i], hfmt);
+            if value.is_finite() {
+                bits = value.abs().to_bits();
+            }
+        }
+        // SAFETY: `tid < 256`, the shared array's length; every access between
+        // two barriers touches a distinct or read-only slot.
+        unsafe { sh.add(tid).write(bits) };
+        thread::sync_threads();
+        let mut stride = 128usize;
+        while stride > 0 {
+            if tid < stride {
+                let other = unsafe { sh.add(tid + stride).read() };
+                let mine = unsafe { sh.add(tid).read() };
+                if other > mine {
+                    unsafe { sh.add(tid).write(other) };
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        if tid == 0 {
+            // SAFETY: as `fp8_amax_f32_kernel`.
+            let slot = unsafe { out.as_mut_ptr().add(off as usize) } as *mut u32;
+            let atomic = unsafe { DeviceAtomicU32::from_ptr(slot) };
+            let _ = atomic.fetch_max(unsafe { sh.read() }, AtomicOrdering::Relaxed);
+        }
+    }
+
+    /// [`fp8_quantize_kernel`] reading 16-bit storage (`hfmt` as in
+    /// [`fp8_amax_half_kernel`]): the same factor, scale pair and bytes as the
+    /// f32 kernel gives on the widened tensor.
+    #[kernel]
+    pub fn fp8_quantize_half_kernel(
+        x: &[u16],
+        amax: &[f32],
+        mut out: DisjointSlice<u8>,
+        mut scale: DisjointSlice<f32>,
+        fmt: u32,
+        off: u32,
+        hfmt: u32,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        let factor = fp8_factor(amax[off as usize], fmt);
+        if let Some(o) = scale.get_mut(thread::index_1d()) {
+            *o = if i == 0 { factor } else { 1.0 / factor };
+        }
+        if i >= x.len() {
+            return;
+        }
+        if let Some(o) = out.get_mut(idx) {
+            *o = quantize_f32(half_bits_to_f32(x[i], hfmt), factor, fmt);
         }
     }
 

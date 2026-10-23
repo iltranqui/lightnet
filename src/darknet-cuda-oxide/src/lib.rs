@@ -1807,6 +1807,136 @@ impl OxideBackend {
         Ok((out, scale))
     }
 
+    /// [`Self::fp8_quantize_operand_current`] reading 16-bit storage (`hfmt`
+    /// says how to widen it): same factor, scale pair and bytes as widening to
+    /// f32 first, with no f32 intermediate.  Always current scaling, also when
+    /// [`Fp8Scaling::Delayed`] is selected (there is no half delayed kernel).
+    pub(crate) fn fp8_quantize_half(
+        &self,
+        buf: &DeviceBuffer<u16>,
+        len: usize,
+        fmt: Fp8Format,
+        hfmt: mixed::HalfFormat,
+    ) -> Result<(PooledBuf8, PooledBuf), OxideError> {
+        if len == 0 {
+            return Ok((self.alloc8_uninit(0)?, self.unit_scale()?));
+        }
+        let off = self.fp8_next_slot()?;
+        let mut ring = self.fp8_ring_guard()?;
+        // SAFETY: one thread per element; the ring slot is zeroed and only
+        // touched through `fetch_max` while the kernel runs.
+        unsafe {
+            self.gemm_f8.fp8_amax_half_kernel(
+                &self.stream,
+                launch::blocks_of(len.div_ceil(gemm_f8::F8_AMAX_BLOCK), gemm_f8::F8_AMAX_BLOCK as u32),
+                buf,
+                &mut ring.buf,
+                off,
+                hfmt.code(),
+            )
+        }
+        .map_err(launch_err)?;
+        let mut out = self.alloc8_uninit(len)?;
+        let mut scale = self.alloc_uninit(2)?;
+        // SAFETY: one thread per element (at least two, so both scale words are
+        // written); the kernel writes every byte of `out` and both scale words.
+        unsafe {
+            self.gemm_f8.fp8_quantize_half_kernel(
+                &self.stream,
+                launch::elementwise(len.max(2), ElementwiseLaunchConfig::default()),
+                buf,
+                &ring.buf,
+                &mut out,
+                &mut scale,
+                fmt.code(),
+                off,
+                hfmt.code(),
+            )
+        }
+        .map_err(launch_err)?;
+        self.fp8_quantize_launches.fetch_add(1, Ordering::Relaxed);
+        Ok((out, scale))
+    }
+
+    /// Test seam for [`Self::fp8_quantize_half`]: the bytes and the scale pair
+    /// `[factor, 1 / factor]`.
+    pub fn fp8_quantize_half_probe(
+        &self,
+        x: &OxideTensorF16,
+        fmt: Fp8Format,
+        hfmt: mixed::HalfFormat,
+    ) -> Result<(Vec<u8>, [f32; 2]), OxideError> {
+        let (bytes, scale) = self.fp8_quantize_half(&x.buf, x.len(), fmt, hfmt)?;
+        let bytes = if bytes.len() == 0 { Vec::new() } else { bytes.to_host_vec(&self.stream)? };
+        let scale = scale.to_host_vec(&self.stream)?;
+        Ok((bytes, [scale[0], scale[1]]))
+    }
+
+    /// `C = alpha * op(A) * op(B) + beta * C` with `A` and `B` 16-bit buffers
+    /// (`hfmt`): each is quantised straight from its 16-bit storage to `fmt_a` /
+    /// `fmt_b` and the result accumulates in f32 into `c`.
+    pub(crate) fn gemm_fp8_half_operands(
+        &self,
+        a: &DeviceBuffer<u16>,
+        b: &DeviceBuffer<u16>,
+        c: &mut DeviceBuffer<f32>,
+        g: &GemmArgs,
+        fmt_a: Fp8Format,
+        fmt_b: Fp8Format,
+        hfmt: mixed::HalfFormat,
+    ) -> Result<(), OxideError> {
+        let (ar, ac) = if g.trans_a { (g.k, g.m) } else { (g.m, g.k) };
+        let (br, bc) = if g.trans_b { (g.n, g.k) } else { (g.k, g.n) };
+        let a_len = extent(g.a.0, g.a.1, g.a.2, g.count, ar, ac, g.lda).min(a.len());
+        let b_len = extent(g.b.0, g.b.1, g.b.2, g.count, br, bc, g.ldb).min(b.len());
+        let (aq, sa) = self.fp8_quantize_half(a, a_len, fmt_a, hfmt)?;
+        let (bq, sb) = self.fp8_quantize_half(b, b_len, fmt_b, hfmt)?;
+        self.gemm_fp8_args(&aq, &bq, c, g, fmt_a, fmt_b, &sa, &sb)
+    }
+
+    /// Tensor-level [`Self::gemm_fp8_half_operands`]: `alpha * op(A) * op(B)`
+    /// for dense 16-bit `A` (`m x k`, or `k x m` transposed) and `B`, f32
+    /// result `m x n`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_half(
+        &self,
+        a: &OxideTensorF16,
+        b: &OxideTensorF16,
+        m: usize,
+        n: usize,
+        k: usize,
+        trans_a: bool,
+        trans_b: bool,
+        alpha: f32,
+        fmt_a: Fp8Format,
+        fmt_b: Fp8Format,
+        hfmt: mixed::HalfFormat,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let mut out = self.alloc_uninit(m * n)?;
+        self.gemm_fp8_half_operands(
+            &a.buf,
+            &b.buf,
+            &mut out,
+            &GemmArgs {
+                m,
+                n,
+                k,
+                lda: if trans_a { m } else { k },
+                ldb: if trans_b { k } else { n },
+                ldc: n,
+                trans_a,
+                trans_b,
+                alpha,
+                beta: 0.0,
+                ..GemmArgs::default()
+            },
+            fmt_a,
+            fmt_b,
+            hfmt,
+        )?;
+        Ok(OxideTensorF32::new(out, &[m, n]))
+    }
+
     /// Quantise two operands together: one zero-fill, one amax launch and one
     /// quantise launch instead of two of each.  Falls back to the per-operand
     /// path when either operand is empty.
