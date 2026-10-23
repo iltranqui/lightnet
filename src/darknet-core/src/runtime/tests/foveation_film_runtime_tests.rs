@@ -581,11 +581,8 @@ fn foveation_film_sgd_adamw_muon_and_gpu_boundary() {
         "[hf]\nparams=fixed\n[foveation_film]\nembed_dim=2\n",
     );
     let mut muon_gpu = GpuExecutableNetwork::new(muon_gpu_network, FakeBackend);
-    assert!(
-        muon_gpu
-            .update_weights_gpu(0.01, 0.0, 0.0, 1)
-            .unwrap_err()
-            .to_string()
-            .contains("GPU Muon updates are unsupported")
-    );
+    // v0.2.146 enabled GPU Muon for eligible HF/FiLM 2-D matrices.
+    muon_gpu
+        .update_weights_gpu(0.01, 0.0, 0.0, 1)
+        .expect("GPU Muon update for HF/FiLM matrices");
 }
