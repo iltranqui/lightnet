@@ -12,6 +12,7 @@ Approved 2026-10-02. Branch `rust`.
 - [Open questions](#open-questions)
 - [How to run](#how-to-run)
 - [Phase D conclusion (before enabling fp8 for speed)](#phase-d-conclusion-before-enabling-fp8-for-speed)
+  - [Phase D after kernel tuning (2026-10-23)](#phase-d-after-kernel-tuning-2026-10-23)
 
 ## Context
 `bridges/darknet-cuda-oxide` has TF32 (`gemm_mma.rs`) and FP16/BF16 (`gemm_f16.rs`) mma GEMMs, but no FP8/FP4. Findings:
@@ -128,9 +129,29 @@ cargo test --manifest-path src/darknet-cuda-oxide/Cargo.toml --lib   # 14 host r
 
 ## Phase D conclusion (before enabling fp8 for speed)
 
-At 2048^3 the FP8 `mma` reaches 7020 GF/s against 13485 GF/s for the existing
+At 2048^3 the FP8 `mma` reached 7020 GF/s against 13485 GF/s for the existing
 fp16 `mma.m16n8k16` GEMM and 9560 GF/s for TF32 on this part, and the NVFP4
-emulation is ~15x slower than fp16. The fp8 mode is a **numerics** feature
+emulation is ~15x slower than fp16. The fp8 mode was a **numerics** feature
 here, not a speed feature; and because the per-call quantisation dominates
 below ~1024^3, a usable network-level fp8 mode has to hoist the weight
 quantisation out of the GEMM seam first. Full table in `implemented.md` §3.
+
+### Phase D after kernel tuning (2026-10-23)
+
+`plan_fp8.md` Task 5 (`v0.2.184` to `v0.2.186`) changed the fp8 kernel; the
+conclusion above no longer holds for the kernel alone. Kernel-only (operands
+pre-quantised), `gemm_bench_low_precision_kernels`, RTX 4060 Laptop:
+
+| Version | 2048^3 fp8 kernel | GF/s | against fp16 kernel (13485 GF/s) |
+|---|---|---|---|
+| before (`0afcbe1`) | 2.456 / 2.459 / 2.4705 ms | 7000 | 0.52x |
+| `v0.2.184` register-transposed `[k][n]` staging | 1.258 / 1.266 ms | 13600 | 1.0x |
+| `v0.2.185` cp.async for A, 2 shared stages | 0.991 ms | 17335 | 1.29x |
+| `v0.2.186` e4m3 x e4m3 kernel without the format branch | 0.613 / 0.616 ms | 28000 | 2.1x |
+
+fp32 in the same runs: 3.47 ms (4946 GF/s). `ldmatrix` fragments were tried
+and rejected (0.697 ms). End-to-end `gemm_bench_precisions` `prec-sq` fp8
+total (512, 1024, 2048 cubed): 4.36-4.61 ms before, 1.87 ms after (fp32 4.43
+ms). The 21 LegoGears GEMMs kernel-only: fp8 / fp32 ratio 1.00 before, 0.72-0.75
+after; end to end (`prec-lego`) they are still overhead-bound, about 1.7 ms
+against fp32 1.0 ms. Training-step effect not measured (user-gated).

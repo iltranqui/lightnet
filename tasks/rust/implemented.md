@@ -481,7 +481,7 @@ file is named inline.
   | 2048³ | 5.50 ms | 1.80 ms | 1.274 ms | 5.90 ms | 785 ms |
   | LegoGears_v2 convs (21 total) | 5.95 ms | 4.82 ms | 3.87 ms | 24.2 ms | 1018 ms |
 
-  Conclusions: the FP8 `mma` (7020 GF/s at 2048³) does **not** beat fp16
+  Conclusions (as measured 2026-10-05; superseded for the kernel by §250: 28000 GF/s after tuning): the FP8 `mma` (7020 GF/s at 2048³) did **not** beat fp16
   (13485 GF/s) or TF32 (9560 GF/s) on this part — fp8 is a *numerics* feature
   here, not a speed one; per-call quantisation dominates below ~1024³, so a
   network-level fp8 mode must hoist weight quantisation out of the GEMM seam;
@@ -2484,6 +2484,15 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 249. fp8 + bf16 master-weight test
 
 - v0.2.183: `amp_fp8_bf16_masters_stay_f32_and_change_after_a_step`: weights, weight gradient and SGD result are f32 (`is_half()` false), the master changes, the fp8 weight copy is refreshed from the updated master. Optimizer ops only accept f32 tensors; the bf16 weight copy and fp8 bytes are caches keyed on the master buffer. Evidence: `oxide_amp` fp8 filter 4 of 4.
+
+## 250. fp8 kernel tuning (plan_fp8 Task 5)
+
+- v0.2.184 (`87ae104`): `sgemm_fp8_mma` stages a `[k][n]` operand (NN and TN B) as one 4 (k) x 4 (n) byte block per thread: four aligned word loads, a register byte transpose (`fp8_stage_t4`), four K-contiguous word stores into the `[n][k]` shared tile. Edge, unaligned and non-NN blocks keep the old guarded paths. Accumulation order is unchanged.
+- v0.2.185 (`01ae58f`): two shared stages per operand, one `sync_threads` per K step, 16-byte `cp.async` with zero fill for K-contiguous A (`fp8_issue16`; register path otherwise), B loaded before the mma of the current tile and stored into the next stage after it. A pitch 48 bytes. The same change on the old kernel was 9% slower and was reverted first.
+- v0.2.186 (`b690fb9`): `sgemm_fp8_mma_e4m3` (copy of the body with `mma_f8_k32_e4m3`), launched by `gemm_fp8_args` when both operands are e4m3; `OxideBackend::set_fp8_generic_kernel` is a test seam. `cuda_module` does not see kernels produced by `macro_rules!`, hence the copy.
+- Rejected: `ldmatrix.x4` for A and B (correct, 14% slower; two 8-bit values are one b16 element in the m16n8k32 layout, so the old header claim that `ldmatrix` cannot be used was wrong).
+- Numbers (2048^3 kernel-only): 2.46 ms, then 1.26, 0.991, 0.613 ms = 7000 to 28000 GF/s (fp16 kernel 13485, fp32 4946). 21 LegoGears GEMMs kernel-only fp8 / fp32: 1.00 to 0.72-0.75. `prec-sq` fp8 4.4 to 1.87 ms. Full table and rejected rows in `plan_fp8.md` (Kernel experiment log).
+- Evidence: `oxide_gemm_f8` 38 of 38 (new: `gemm_fp8_transposed_large_k_matches_reference`, `gemm_fp8_nn_is_bitwise_equal_to_nt_on_the_same_data`, `fp8_e4m3_specialised_kernel_matches_generic`). `oxide_amp` 19 of 19 (fp8 conv paths use the new kernels). Not measured: training step (user-gated), ncu stall counters, `oxide_half`.
 
 ## Not implemented / open (pointer)
 

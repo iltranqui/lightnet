@@ -87,6 +87,7 @@ with actual-device CPU parity; head loss/backward remains host-owned. See
 uncommitted, with no `version-map.tsv` row.
 
 Latest increments:
+- v0.2.184 to v0.2.186: fp8 kernel tuning (plan_fp8 Task 5). Register-transposed `[k][n]` staging (`v0.2.184`), cp.async for A with two shared stages (`v0.2.185`), e4m3 x e4m3 kernel without the runtime format branch (`v0.2.186`): 2048^3 kernel-only 2.46 ms to 0.613 ms (7000 to 28000 GF/s; fp16 kernel 13485). `ldmatrix` fragments rejected (14% slower). `oxide_gemm_f8` 38 of 38. Training effect not measured. See `implemented.md` §250.
 - v0.2.178: opt-in delayed fp8 scaling (`DARKNET_OXIDE_FP8_SCALING=delayed`, `Fp8Scaling`, `with_fp8_scaling`): 16-slot amax history per call site, one quantise pass that also records its amax. Default stays current scaling; weights stay current. `oxide_gemm_f8` 31 of 31. No training measurement yet (user-gated, plan_fp8 Task 9). See `implemented.md` §244.
 - v0.2.179: fp8 conv backward quantises `dy` once (`fp8_dy` cache) and reuses the e5m2 bytes and scale pair for dgrad and wgrad; 1 quantise launch per backward instead of 2. `oxide_gemm_f8` 33 of 33. Not timed on training. See `implemented.md` §245.
 - v0.2.180: fp8 quantisation reads f16/bf16 storage directly (`fp8_amax_half_kernel`, `fp8_quantize_half_kernel`, `gemm_fp8_half_operands`); byte-identical to widening to f32 first. Current scaling only. `oxide_gemm_f8` 35 of 35. See `implemented.md` §246.

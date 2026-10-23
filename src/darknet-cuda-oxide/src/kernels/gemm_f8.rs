@@ -4,8 +4,10 @@
 //! `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32` (and the e5m2 /
 //! mixed combinations) is the first FP8 shape Ada exposes; it keeps the
 //! fragment shape of the existing int8 `mma_m16n8k32_s32_s8` kernel (A = 4
-//! registers, B = 2, C = 4), so the fragment loads are byte-wide rather than
-//! `ldmatrix`-based: `ldmatrix` only moves 16-bit elements.
+//! registers, B = 2, C = 4), so the fragment loads here are 32-bit shared
+//! loads.  (`ldmatrix` also works: two adjacent 8-bit values are one 16-bit
+//! element in this layout, and the tuning experiment of `plan_fp8.md` Task 5
+//! sub-step D verified it, but it was 14% slower than the word loads.)
 //!
 //! Layout (`mma.sync` m16n8k32, 8-bit operands).  With `group = lane / 4`
 //! and `thread = lane % 4`:
@@ -20,13 +22,17 @@
 //!
 //! Tiling: 64x64 output block tile, BK = 32 (one mma k step), 128 threads =
 //! 4 warps in a 2x2 grid, each warp owning a 32x32 sub-tile = 2 (m16) x 4
-//! (n8) mma tiles.  Shared memory holds both operand tiles with an 8-byte pad
-//! on the K row stride (32 -> 40) so the four lanes of a group hit different
-//! banks.  Operands are staged through registers: the next K tile is fetched
-//! into per-thread registers while the current one feeds the tensor cores.
-//! `NN` / `NT` / `TN` / `TT` are all supported, batched through the same
-//! `(base, stride, modulus)` views as [`super::gemm_mma`], `beta == 0` never
-//! reads `C`, and out-of-range loads are zero filled.
+//! (n8) mma tiles.  Shared memory holds two stages of both operand tiles with
+//! a 16-byte pad on the K row stride (32 -> 48, bank-conflict free and
+//! 16-byte aligned for `cp.async`), and one `sync_threads` per K step: A is
+//! copied with `cp.async` (when K-contiguous and 16-byte aligned) while B goes
+//! through registers, the `[k][n]` case as register-transposed 4x4 byte blocks
+//! (`fp8_stage_t4`).  `NN` / `NT` / `TN` / `TT` are all supported, batched
+//! through the same `(base, stride, modulus)` views as [`super::gemm_mma`],
+//! `beta == 0` never reads `C`, and out-of-range loads are zero filled.
+//! `sgemm_fp8_mma_e4m3` is a copy of the generic kernel with the e4m3 x e4m3
+//! mma hard-wired (the runtime format `match` cost 38%); keep the two bodies
+//! in sync.
 //!
 //! Accuracy: operands are rounded to the format by the caller-supplied scale
 //! (see [`crate::fp8`]); products and accumulation are f32.  e4m3 carries 3

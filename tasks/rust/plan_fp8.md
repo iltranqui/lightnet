@@ -154,11 +154,11 @@ From `tasks/rust/implemented.md` (section 3 and the Phase D table in [fp8_fp4.md
 
 One sub-step per commit; each is kept only under the 5% rule in Global Constraints. Measure with `cargo xtask oxide --test oxide_gemm_bench -- --ignored gemm_bench_low_precision_kernels` before and after.
 
-- [ ] **Step 1: Sub-step A, staging.** Replace `fp8_stage16` register staging with `cp.async` 16-byte copies into two shared stages and one `sync_threads` per K step, the pattern of `hgemm_f16_mma` (`gemm_f16.rs:161-268`). Tests: all `oxide_gemm_f8` tests unchanged and passing.
-- [ ] **Step 2: Sub-step B, transposed staging.** Replace the per-byte global loop for `trans == 1` (`gemm_f8.rs:193-206`) with a vectorised load plus a shared-memory transpose. Test: `gemm_fp8_e4m3_all_transposes` plus a new `gemm_fp8_transposed_large_k_matches_reference` at K = 4096.
-- [ ] **Step 3: Sub-step C, format specialisation.** Add `sgemm_fp8_mma_e4m3` (both operands e4m3, no runtime format branch) and select it in `gemm_fp8_args` when `fa == fb == E4M3`. Test: `fp8_e4m3_specialised_kernel_matches_generic` bitwise.
-- [ ] **Step 4: Sub-step D, `ldmatrix` fragments (hypothesis).** Two adjacent e4m3 bytes form one 16-bit element, so `ldmatrix.x4` can load the A and B fragments as CUTLASS does for 8-bit types; the header comment of `gemm_f8.rs` says otherwise, so verify with the `fragment_layout_*` tests (`oxide_gemm_f8.rs:158-177`) first. If the layout test passes, keep it; if not, revert and record why in the commit message.
-- [ ] **Step 5: Record** the kernel-only 2048^3 time after each sub-step and the final value against the fp16 kernel (13485 GF/s); update [fp8_fp4.md](fp8_fp4.md) Phase D with the new table.
+- [x] **Step 1: Sub-step A, staging.** Done as `v0.2.185`, applied *after* B. Standalone on the old kernel it was slower (2.68 ms against 2.46 ms, twice) and was reverted: B was still gathered byte by byte, so the cp.async copy of A could not help. On top of B: A is copied with 16-byte `cp.async` (zero fill) when K-contiguous and 16-byte aligned, B stays on registers (stored after the mma of the current tile), two shared stages, one `sync_threads` per K step, pitch 48. 1.26 ms to 0.991 ms.
+- [x] **Step 2: Sub-step B, transposed staging.** Done first, as `v0.2.184`, with a different shape from the text above: no shared-memory transpose. Each thread loads a 4 (k) x 4 (n) byte block as four aligned words, transposes it in registers (`fp8_stage_t4`) and stores four K-contiguous words. Edge and unaligned blocks keep the guarded byte path. Tests added: `gemm_fp8_transposed_large_k_matches_reference` (K = 4096) and `gemm_fp8_nn_is_bitwise_equal_to_nt_on_the_same_data`. 2.46 ms to 1.26 ms.
+- [x] **Step 3: Sub-step C, format specialisation.** Done as `v0.2.186`. `sgemm_fp8_mma_e4m3` is a copy of the generic body with `mma_f8_k32_e4m3` (a macro cannot generate it: `cuda_module` does not see macro-expanded kernels), launched when both operands are e4m3. The runtime format `match` around the 8 mma per K step was the largest single cost left: 0.991 ms to 0.613 ms. Test: `fp8_e4m3_specialised_kernel_matches_generic` (bitwise, through the `set_fp8_generic_kernel` seam).
+- [x] **Step 4: Sub-step D, `ldmatrix` fragments.** Hypothesis confirmed on layout, rejected on speed. Two adjacent 8-bit values are one 16-bit element in the m16n8k32 fragment layout (a0..a3 = rows g / g+8, K bytes 4t.. / 16+4t.. is the m16n8k16 f16 A layout over 16 b16 columns), so `ldmatrix.x4` loads A and B fragments (the header comment's claim that `ldmatrix` cannot be used was wrong). `oxide_gemm_f8` 38 of 38. But 0.613 ms to 0.697 ms (+14%) at 2048^3 and the LegoGears kernel-only fp8 / fp32 ratio 0.72-0.75 to 0.79: reverted. The patch is not kept.
+- [x] **Step 5: Record.** Table below and [fp8_fp4.md](fp8_fp4.md) Phase D. Final 2048^3 kernel-only: 0.613 ms = 28000 GF/s, against 13485 GF/s for the fp16 kernel and 4946 GF/s for fp32 (same run).
 
 ### Task 6: Compose with AMP
 
@@ -215,7 +215,7 @@ User-gated, same procedure as [plan_fp16.md Task 5](plan_fp16.md#task-5-converge
 
 ## Progress
 
-Status as of 2026-10-22. After Task 2 the overhead work in [Overhead optimisation](#overhead-optimisation) (`v0.2.167` to `v0.2.169`) cut `prec-lego` fp8 from 21.97 ms to 2.23 ms; Tasks 4, 6 and 8 landed as `v0.2.180` to `v0.2.182` (bf16 was already done, `v0.2.170`).
+Status as of 2026-10-22. After Task 2 the overhead work in [Overhead optimisation](#overhead-optimisation) (`v0.2.167` to `v0.2.169`) cut `prec-lego` fp8 from 21.97 ms to 2.23 ms; Tasks 4, 6 and 8 landed as `v0.2.180` to `v0.2.182` (bf16 was already done, `v0.2.170`). Task 5 landed as `v0.2.184` to `v0.2.186` on 2026-10-23: the 2048^3 kernel went from 2.46 ms to 0.613 ms.
 
 | Task | Status | Commit or tag |
 |---|---|---|
@@ -223,7 +223,7 @@ Status as of 2026-10-22. After Task 2 the overhead work in [Overhead optimisatio
 | 2. Cached fp8 weights | done | `v0.2.166` (`420dfd9`), docs `05953ba` |
 | 3. Delayed scaling | done, opt-in (`DARKNET_OXIDE_FP8_SCALING=delayed`); speed unmeasured | `v0.2.178` (`b74279e`) |
 | 4. Quantise from 16-bit storage | done, current scaling only | `v0.2.180` (`5c5dc81`) |
-| 5. Kernel tuning | in progress, no kept change yet | |
+| 5. Kernel tuning | done: sub-steps B, A (on B) and C kept, D rejected; 2048^3 kernel 2.46 ms to 0.613 ms (7000 to 28000 GF/s) | `v0.2.184` (`87ae104`), `v0.2.185` (`01ae58f`), `v0.2.186` (`b690fb9`) |
 | 6. Compose with AMP | done, f16 and bf16; speed unmeasured | `v0.2.181` (`eb8919a`) |
 | 7. Backward pass review | not started | |
 | 8. xtask `-fp8` | done as `-fp8 -fp16` / `-fp8 -bf16`; plain `-fp8` unchanged | `v0.2.182` (`7fdb817`) |
@@ -235,7 +235,7 @@ Open issues:
 - **Task 2 speed gain unmeasured.** Needs a conv-level bench that runs the weight-cache path (`prec-lego` goes through the uncached tensor path).
 - **Bench test `gemm_bench_low_precision_lego_kernels` uncommitted** (`tests/oxide_gemm_bench.rs`). Added this session.
 - **`bench/` folder untracked.** Written by Haiku agents: `README.md`, `run_bench.sh` (`bash -n` only, never run end to end), and three header-only CSVs. Open decisions: symlink of `third_party/cuda-oxide` into scratch worktrees (script refuses unless `BENCH_SHARE_OXIDE=1`), and deleting the leftover `bench/.work/`. Neither decided.
-- **Kernel time does not beat fp32 on the LegoGears shapes.** End-to-end fp8 is about 9x fp32, mostly overhead (see [LegoGears conv shapes](#legogears-conv-shapes)).
+- **LegoGears kernel time.** Before Task 5 the fp8 kernel only matched fp32 on the 21 shapes (ratio 1.00); after `v0.2.186` it is 0.72-0.75 of fp32. End-to-end `prec-lego` is still overhead-bound, about 1.7 ms against 1.0 ms (see [LegoGears conv shapes](#legogears-conv-shapes)).
 - **Local-memory spill removed, no speed gain.** Root cause was `fp8_stage16` taking `&mut` register arrays and a runtime-indexed `dst[j / 4]` (see [Kernel experiment log](#kernel-experiment-log)). Both fixes were reverted because kernel time did not improve.
 - **Profile covered one launch only.** The ncu run used the 1024^3 launch (grid 256), not 2048^3.
 - **Codex review ran against an edited file.** It read `gemm_f8.rs` while the padding experiment was applied, so some line references may be off.
@@ -266,6 +266,20 @@ Each experiment is measured kernel-only at 2048^3 with `gemm_bench_low_precision
 | Shared pitch padding, `LD_A` = `LD_B` = 44 bytes (bank conflicts 16 to 4 extra wavefronts per store) | 2.47 ms (2.4%, within the fp32 control's 1.7% drift) | reverted |
 
 Takeaway: removing local memory and reducing store bank conflicts did not reduce kernel time at 2048^3.
+
+Task 5 session (2026-10-23, Sonnet 5.5). Baseline at HEAD `0afcbe1`: 2.456, 2.459, 2.4705 ms (2048^3 kernel-only). Each row is the 2048^3 kernel-only time (two runs when both are given), the LegoGears kernel-only fp8 total as a ratio to the fp32 control in the same run (the laptop clock drifts: absolute 21-conv totals move by 25% between runs while the ratio holds to about 0.05), and `prec-sq` fp8 end to end (fp32 4.43 ms in every run).
+
+| Experiment | 2048^3 kernel | lego kernel fp8 / fp32 | prec-sq fp8 | Decision |
+|---|---|---|---|---|
+| Baseline | 2.456 / 2.459 / 2.4705 ms (7000 GF/s) | 1.00, 1.00 | 4.36 / 4.61 ms | |
+| A standalone: `cp.async` 16 B for A, 2 shared stages, 1 sync per K step, B per-byte gather as before | 2.682 / 2.682 ms (+9%) | 0.91, 1.08 | 4.77 / 4.75 ms | reverted (no gain: B gather is the bottleneck) |
+| B: 4x4 byte blocks loaded as words, register transpose (`v0.2.184`) | 1.258 / 1.266 ms (-49%) | 0.84, 0.91 | 2.63 / 2.75 ms | kept |
+| A on top of B (`v0.2.185`) | 0.991 / 0.991 ms (-21%) | 0.82, 0.83 | 2.41 / 2.39 ms | kept |
+| C probe: generic kernel with the format hard-wired to (0, 0) | 0.612 ms | 0.80 | 1.88 ms | confirms the branch is the cost |
+| C: `sgemm_fp8_mma_e4m3` (`v0.2.186`) | 0.613 / 0.616 ms (-38%) | 0.72, 0.75 | 1.87 / 1.87 ms | kept |
+| D: `ldmatrix.x4` for A and B on top of C | 0.697 ms (+14%) | 0.79 | 2.07 ms | reverted |
+
+Reading: the byte-wise `[k][n]` gather was the bottleneck at 2048^3 (it was NN: B is `[k][n]`), then the per-mma format branch. The earlier local-memory and bank-conflict experiments attacked costs that were hidden behind these two. No ncu run was made; ncu and nsys exist on this machine (`/usr/local/cuda-13.4/bin`) but were not used, so the explanation is from the before/after times and the C probe, not from stall counters. `prec-lego` (end to end) stayed in the 1.6-1.9 ms range against fp32 0.9-1.3 ms in every run: it is overhead-bound and the kernel changes do not show in it. The training-step effect is not measured (training is user-gated).
 
 ## LegoGears conv shapes
 
@@ -324,10 +338,10 @@ Training-step profile (2026-10-22, `nsys` on `bench-train`, batch 16, 21 steps, 
 
 Ranked by the codex review of the fp8 GEMM (gpt-6-sol, high effort, read-only), against the ncu profile in the log above. Confidence is the reviewer's. The order below is the review's; the LegoGears measurements above move item 4 ahead of item 1, because overhead dominates end to end.
 
-1. **Pack B as K-contiguous `[N, K]` while quantising.** Largest kernel gain expected, medium confidence. The NN path gathers B with `ldb`-spaced byte loads before each K tile (`kernels/gemm_f8.rs` `fp8_stage16`, `trans == 1`). Measure the packing pass cost in the full call, since the kernel-only bench assumes operands are pre-quantised. Bench: `gemm_bench_precisions` (fp8 column is end-to-end).
-2. **Two shared K tiles plus `cp.async`**, after item 1. Medium confidence. Verify register count and stalls per variant.
+1. **Pack B as K-contiguous `[N, K]` while quantising.** Largest kernel gain expected, medium confidence. *Partly done differently as `v0.2.184`: the GEMM kernel now transposes 4x4 byte blocks in registers while staging (2.46 ms to 1.26 ms), so the packing pass is not needed for the kernel; packing at quantise time remains an option for the end-to-end path.* The NN path gathers B with `ldb`-spaced byte loads before each K tile (`kernels/gemm_f8.rs` `fp8_stage16`, `trans == 1`). Measure the packing pass cost in the full call, since the kernel-only bench assumes operands are pre-quantised. Bench: `gemm_bench_precisions` (fp8 column is end-to-end).
+2. **Two shared K tiles plus `cp.async`**, after item 1. Medium confidence. *Done as `v0.2.185` (A only; B stays on registers), 1.26 ms to 0.991 ms.* Verify register count and stalls per variant.
 3. **Shared-store layout, then BK and output tile size.** Modest, low to medium confidence. Locate the conflicting store instruction first. 122 registers per thread limits larger tiles.
 4. **Pool FP8 temporaries; CUDA Graphs for repeated calls.** High confidence for end-to-end gain (`lib.rs` allocates amax slot, scale pair and byte output per uncached operand; weights are cached, f32 outputs and split-K scratch are pooled). Graphs cut launch overhead across about 21 convs per step, not the time inside one GEMM.
 5. **Quantise inside the GEMM load path.** Low expected gain, medium confidence. Repeats conversion across reused tiles and keeps the amax/scale dependency. Try item 1 first.
 
-Instruction boundary (from the same review): FP8 `mma.sync.m16n8k32` is available on sm_89; FP8 `wgmma` requires sm_90a; native `ldmatrix.b8` is not available on Ada. An `ldmatrix.b16` plus repacking variant is possible but has the least direct evidence.
+Instruction boundary (from the same review): FP8 `mma.sync.m16n8k32` is available on sm_89; FP8 `wgmma` requires sm_90a; native `ldmatrix.b8` is not available on Ada. An `ldmatrix.b16` plus repacking variant is possible but has the least direct evidence. *Tried in Task 5 sub-step D: no repacking is needed (two 8-bit values are one b16 element in this fragment layout), it is correct, and it is 14% slower than the byte-wide shared loads.*
