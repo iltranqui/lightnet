@@ -15,7 +15,7 @@
 
 use darknet_cuda::{AdamParams, ElementwiseLaunchConfig, F32ActivationKind, F32TensorOpsBackend};
 use darknet_cuda_oxide::half::{bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits};
-use darknet_cuda_oxide::{Fp8Format, GemmMode, HalfFormat, OxideBackend, OxideTensorF32};
+use darknet_cuda_oxide::{Fp8Format, Fp8Scaling, GemmMode, HalfFormat, OxideBackend, OxideTensorF32};
 
 struct Rng(u64);
 
@@ -379,6 +379,54 @@ fn amp_conv_with_fp8_gemm_tracks_f32_reference() {
                 println!("{tag}: fwd {ye:.2e} dgrad {de:.2e} wgrad {we:.2e}");
             }
         }
+    }
+}
+
+/// Delayed FP8 scaling on 16-bit activations and `dy`: repeated forward /
+/// dgrad / wgrad of the same conv (stationary data, so the history is warm
+/// from the second round) track the f64 reference at the current-scaling
+/// bound, and the stand-alone amax passes drop below current scaling's.
+#[test]
+fn amp_conv_with_delayed_fp8_scaling_tracks_f32_reference() {
+    for hfmt in BOTH_FORMATS {
+        let bwd = Some((Fp8Format::E4M3, Fp8Format::E5M2));
+        let be = fp8_amp_backend(hfmt).with_fp8_backward(bwd).with_fp8_scaling(Fp8Scaling::Delayed);
+        let cur = fp8_amp_backend(hfmt).with_fp8_backward(bwd);
+        assert_eq!(be.fp8_scaling(), Fp8Scaling::Delayed);
+        let mut rng = Rng(0xde1a_0000 + hfmt.code() as u64);
+        for cs in CONV_CASES {
+            let (oh, ow) = (cs.oh(), cs.ow());
+            let x = rng.vec(cs.b * cs.c * cs.h * cs.w, -1.0, 1.0);
+            let w = rng.vec(cs.f * cs.cpg() * cs.k * cs.k, -0.5, 0.5);
+            let dy = rng.vec(cs.b * cs.f * oh * ow, -1.0, 1.0);
+            let (c, h, ww, f, k, sx, sy, dil, pad, groups) = conv_args(cs);
+            let (rf, rd, rw) = (
+                conv_ref_fwd(cs, &r16_in(hfmt, &x), &w),
+                conv_ref_dgrad(cs, &r16_in(hfmt, &dy), &w),
+                conv_ref_wgrad(cs, &r16_in(hfmt, &dy), &r16_in(hfmt, &x)),
+            );
+            for (name, backend) in [("delayed", &be), ("current", &cur)] {
+                for round in 0..4 {
+                    let tag = format!("{hfmt:?} {name} round {round} {cs:?}");
+                    let xh = backend.to_half_storage(&up(backend, &[cs.b, c, h, ww], &x)).unwrap();
+                    let wt = up(backend, &[f, cs.cpg(), k, k], &w);
+                    let dyh = backend.to_half_storage(&up(backend, &[cs.b, f, oh, ow], &dy)).unwrap();
+                    let y = backend.conv2d_f32(&xh, &wt, &[cs.b, f, oh, ow], c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap();
+                    assert!(y.is_half(), "{tag}: forward output must stay in 16-bit storage");
+                    let ye = nerr(&down(backend, &y), &rf);
+                    assert!(ye <= FP8_NERR, "{tag} fwd nerr {ye:.3e}");
+                    let dx = backend.conv2d_backward_input_f32(&dyh, &wt, &[cs.b, c, h, ww], c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap();
+                    let de = nerr(&down(backend, &dx), &rd);
+                    assert!(de <= FP8_NERR, "{tag} dgrad nerr {de:.3e}");
+                    let dw = backend.conv2d_backward_weights_f32(&xh, &dyh, &[f, cs.cpg(), k, k], c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap();
+                    let we = nerr(&down(backend, &dw), &rw);
+                    assert!(we <= FP8_NERR, "{tag} wgrad nerr {we:.3e}");
+                }
+            }
+        }
+        let (d, c) = (be.fp8_amax_passes(), cur.fp8_amax_passes());
+        println!("{hfmt:?}: stand-alone amax passes delayed {d} current {c}");
+        assert!(d < c, "{hfmt:?}: delayed scaling made {d} amax passes, current {c}");
     }
 }
 

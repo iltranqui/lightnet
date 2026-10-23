@@ -1396,3 +1396,140 @@ fn fp8_from_f16_matches_fp8_from_widened_f32() {
 fn fp8_from_bf16_matches_fp8_from_widened_f32() {
     fp8_from_half_matches_widened(HalfFormat::Bf16);
 }
+
+// ---- Delayed scaling on 16-bit sources ------------------------------------
+
+fn half_tensor(be: &OxideBackend, x: &[f32], hfmt: HalfFormat) -> darknet_cuda_oxide::OxideTensorF16 {
+    be.to_half(&be.upload_f32(&[x.len()], x).unwrap(), hfmt).unwrap()
+}
+
+/// Same tensor every call: the history max is the tensor's amax, so after the
+/// call-0 current-scaling fallback and through the wrap of the 16-slot history
+/// every call gives current scaling's bytes and scale pair.
+fn delayed_half_matches_current_on_stationary_data(hfmt: HalfFormat) {
+    let cur = OxideBackend::new().expect("backend");
+    let del = OxideBackend::new().expect("backend").with_fp8_scaling(Fp8Scaling::Delayed);
+    let mut rng = Rng(0xde1a_7ed + hfmt.code() as u64);
+    let x = rng.vec(3000, -3.0, 3.0);
+    let (hc, hd) = (half_tensor(&cur, &x, hfmt), half_tensor(&del, &x, hfmt));
+    for fmt in [Fp8Format::E4M3, Fp8Format::E5M2] {
+        let (want_bytes, want_scale) = cur.fp8_quantize_half_probe(&hc, fmt, hfmt).unwrap();
+        for call in 0..20 {
+            let (bytes, scale) = del.fp8_quantize_half_probe(&hd, fmt, hfmt).unwrap();
+            assert_eq!(scale.map(f32::to_bits), want_scale.map(f32::to_bits), "{hfmt:?} {fmt:?} call {call}: scale");
+            assert_eq!(bytes, want_bytes, "{hfmt:?} {fmt:?} call {call}: bytes");
+        }
+    }
+}
+
+#[test]
+fn delayed_half_matches_current_on_stationary_data_f16() {
+    delayed_half_matches_current_on_stationary_data(HalfFormat::F16);
+}
+
+#[test]
+fn delayed_half_matches_current_on_stationary_data_bf16() {
+    delayed_half_matches_current_on_stationary_data(HalfFormat::Bf16);
+}
+
+fn delayed_half_saturates_on_a_spike(hfmt: HalfFormat) {
+    let be = OxideBackend::new().expect("backend").with_fp8_scaling(Fp8Scaling::Delayed);
+    let mut rng = Rng(0x5b1_4e + hfmt.code() as u64);
+    let base = rng.vec(1024, -1.0, 1.0);
+    let amax = base.iter().fold(0.0f32, |m, v| m.max(half_round(hfmt, *v).abs()));
+    let key = Some(0x5eed_u64);
+    for _ in 0..4 {
+        be.fp8_quantize_half_probe_keyed(&half_tensor(&be, &base, hfmt), Fp8Format::E4M3, hfmt, key).unwrap();
+    }
+    let mut spiked = base.clone();
+    spiked[7] = 100.0 * amax;
+    spiked[8] = -100.0 * amax;
+    let t = half_tensor(&be, &spiked, hfmt);
+    let (bytes, scale) = be.fp8_quantize_half_probe_keyed(&t, Fp8Format::E4M3, hfmt, key).unwrap();
+    let back = |b: u8| fp8_to_f32(b, Fp8Format::E4M3);
+    assert_eq!(back(bytes[7]), 448.0, "{hfmt:?}: positive spike saturates to max finite");
+    assert_eq!(back(bytes[8]), -448.0, "{hfmt:?}: negative spike saturates to -max finite");
+    assert!(bytes.iter().all(|&b| back(b).is_finite()), "{hfmt:?}: NaN or inf in the output");
+    assert!((scale[0] - 448.0 / amax).abs() <= 1e-3 * scale[0], "{hfmt:?}: factor comes from the history");
+    let (_, next) = be.fp8_quantize_half_probe_keyed(&t, Fp8Format::E4M3, hfmt, key).unwrap();
+    assert!((next[0] - 448.0 / (100.0 * amax)).abs() <= 2e-3 * next[0], "{hfmt:?}: history picked up the spike");
+}
+
+fn half_round(hfmt: HalfFormat, v: f32) -> f32 {
+    use darknet_cuda_oxide::half::*;
+    match hfmt {
+        HalfFormat::F16 => f16_bits_to_f32(f32_to_f16_bits(v)),
+        HalfFormat::Bf16 => bf16_bits_to_f32(f32_to_bf16_bits(v)),
+    }
+}
+
+#[test]
+fn delayed_half_saturates_on_a_spike_f16() {
+    delayed_half_saturates_on_a_spike(HalfFormat::F16);
+}
+
+#[test]
+fn delayed_half_saturates_on_a_spike_bf16() {
+    delayed_half_saturates_on_a_spike(HalfFormat::Bf16);
+}
+
+fn delayed_half_first_call_uses_current_amax(hfmt: HalfFormat) {
+    let be = OxideBackend::new().expect("backend").with_fp8_scaling(Fp8Scaling::Delayed);
+    let mut rng = Rng(0xf1_257 + hfmt.code() as u64);
+    let x = rng.vec(700, -5.0, 5.0);
+    let amax = x.iter().fold(0.0f32, |m, v| m.max(half_round(hfmt, *v).abs()));
+    let t = half_tensor(&be, &x, hfmt);
+    let (bytes, scale) = be.fp8_quantize_half_probe_keyed(&t, Fp8Format::E4M3, hfmt, Some(1)).unwrap();
+    let factor = 448.0 / amax;
+    assert!((scale[0] - factor).abs() <= 1e-6 * factor, "{hfmt:?}: factor {} want {factor}", scale[0]);
+    assert!((scale[1] * scale[0] - 1.0).abs() <= 1e-6);
+    for (i, (&b, &v)) in bytes.iter().zip(&x).enumerate() {
+        assert_eq!(b, f32_to_fp8(half_round(hfmt, v) * scale[0], Fp8Format::E4M3), "{hfmt:?} byte {i}");
+    }
+    // Call 0 recorded its amax: a tiny tensor of the same length still scales by it.
+    let tt = half_tensor(&be, &vec![0.001f32; x.len()], hfmt);
+    let (_, s2) = be.fp8_quantize_half_probe_keyed(&tt, Fp8Format::E4M3, hfmt, Some(1)).unwrap();
+    assert!((s2[0] - factor).abs() <= 1e-6 * factor, "{hfmt:?}: second call uses history {} want {factor}", s2[0]);
+}
+
+#[test]
+fn delayed_half_first_call_uses_current_amax_f16() {
+    delayed_half_first_call_uses_current_amax(HalfFormat::F16);
+}
+
+#[test]
+fn delayed_half_first_call_uses_current_amax_bf16() {
+    delayed_half_first_call_uses_current_amax(HalfFormat::Bf16);
+}
+
+/// After call 0 the delayed path is one launch: no stand-alone amax pass, one
+/// quantise.  Current scaling runs the amax pass on every call.
+fn delayed_half_quantises_in_one_launch(hfmt: HalfFormat) {
+    let cur = OxideBackend::new().expect("backend");
+    let del = OxideBackend::new().expect("backend").with_fp8_scaling(Fp8Scaling::Delayed);
+    let mut rng = Rng(0x01e_1a + hfmt.code() as u64);
+    let x = rng.vec(2048, -2.0, 2.0);
+    let (hc, hd) = (half_tensor(&cur, &x, hfmt), half_tensor(&del, &x, hfmt));
+    for call in 0..6u64 {
+        let (a0, q0) = (del.fp8_amax_passes(), del.fp8_quantize_launches());
+        del.fp8_quantize_half_probe(&hd, Fp8Format::E4M3, hfmt).unwrap();
+        assert_eq!(del.fp8_quantize_launches() - q0, 1, "{hfmt:?} call {call}: quantise launches");
+        let want_amax = if call == 0 { 1 } else { 0 };
+        assert_eq!(del.fp8_amax_passes() - a0, want_amax, "{hfmt:?} call {call}: stand-alone amax passes");
+
+        let (a0, q0) = (cur.fp8_amax_passes(), cur.fp8_quantize_launches());
+        cur.fp8_quantize_half_probe(&hc, Fp8Format::E4M3, hfmt).unwrap();
+        assert_eq!(cur.fp8_amax_passes() - a0, 1, "{hfmt:?} call {call}: current scaling is two-pass");
+        assert_eq!(cur.fp8_quantize_launches() - q0, 1);
+    }
+}
+
+#[test]
+fn delayed_half_quantises_in_one_launch_f16() {
+    delayed_half_quantises_in_one_launch(HalfFormat::F16);
+}
+
+#[test]
+fn delayed_half_quantises_in_one_launch_bf16() {
+    delayed_half_quantises_in_one_launch(HalfFormat::Bf16);
+}
