@@ -1668,3 +1668,28 @@ fn fp8_gemm_with_tiny_operands_is_finite() {
     assert!(c.iter().all(|v| v.is_finite()), "non-finite output {:?}", &c[..4]);
     assert!(c.iter().all(|&v| ((v as f64) - want).abs() <= 0.1 * want), "got {:?}, want {want:e}", &c[..4]);
 }
+
+#[test]
+fn fp8_backward_formats_follow_the_operand_role() {
+    // Wgrad has `dy` as operand A and the im2col column as operand B.  The
+    // byte-column path (`GemmMode::Fp8`) and the f32-column path (forward in
+    // fp32, backward fp8) must quantise `dy` to e5m2 and the column to e4m3
+    // alike, so they agree bitwise.  Formats following the operand position
+    // would give `dy` e4m3 and the column e5m2 on the f32-column path only.
+    let cfg = ElementwiseLaunchConfig::default();
+    let mut rng = Rng(0x701e_5);
+    let (batch, c, h, w, f, k, sx, sy, pad) = (2usize, 32, 16, 16, 64, 3, 2, 2, 1);
+    let oh = (h + 2 * pad - k) / sy + 1;
+    let ow = (w + 2 * pad - k) / sx + 1;
+    let x: Vec<f32> = (0..batch * c * h * w).map(|_| rng.next(0.2, 1.0)).collect();
+    let dy: Vec<f32> = (0..batch * f * oh * ow).map(|_| rng.next(0.2, 1.0)).collect();
+    let fmts = Some((Fp8Format::E4M3, Fp8Format::E5M2));
+    let wgrad = |be: &OxideBackend| {
+        let tx = be.upload_f32(&[batch, c, h, w], &x).unwrap();
+        let tdy = be.upload_f32(&[batch, f, oh, ow], &dy).unwrap();
+        download(be, &be.conv2d_backward_weights_f32(&tx, &tdy, &[f, c, k, k], c, h, w, f, k, sx, sy, 1, pad, 1, cfg).unwrap())
+    };
+    let bytes = OxideBackend::new().expect("backend").with_gemm_mode(GemmMode::Fp8).with_fp8_backward(fmts);
+    let f32col = OxideBackend::new().expect("backend").with_fp8_backward(fmts);
+    assert_eq!(wgrad(&f32col), wgrad(&bytes), "wgrad formats differ between the column paths");
+}

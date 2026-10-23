@@ -306,6 +306,15 @@ fn fp8_backward_from_env() -> Option<(Fp8Format, Fp8Format)> {
     }
 }
 
+/// Which conv backward GEMM a call belongs to; decides where `dy` sits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BackwardRole {
+    /// `dy` is operand B.
+    Dgrad,
+    /// `dy` is operand A.
+    Wgrad,
+}
+
 /// One (batched) GEMM: `C = alpha * op(A) * op(B) + beta * C`, row-major.
 ///
 /// `op(A)` is `m x k` (stored `k x m` with leading dim `lda` when `trans_a`),
@@ -1624,16 +1633,25 @@ impl OxideBackend {
 
     /// GEMM seam for the conv backward arms: the forward's [`Self::gemm`] mode,
     /// unless the FP8 backward is on, in which case the operands are quantised
-    /// to the configured formats (A = weights or column, B = `dy`).
+    /// to the configured formats.  The configured pair is `(activation or
+    /// weight format, dy format)`; `role` places `dy` as operand B (dgrad) or
+    /// operand A (wgrad) so each tensor keeps its own format.
     pub(crate) fn backward_gemm(
         &self,
+        role: BackwardRole,
         a: &DeviceBuffer<f32>,
         b: &DeviceBuffer<f32>,
         c: &mut DeviceBuffer<f32>,
         g: &GemmArgs,
     ) -> Result<(), OxideError> {
         match self.bwd_fp8 {
-            Some((fa, fb)) => self.gemm_f32_via_fp8_fmt(a, b, c, g, fa, fb),
+            Some((fx, fdy)) => {
+                let (fa, fb) = match role {
+                    BackwardRole::Dgrad => (fx, fdy),
+                    BackwardRole::Wgrad => (fdy, fx),
+                };
+                self.gemm_f32_via_fp8_fmt(a, b, c, g, fa, fb)
+            }
             None => self.gemm(a, b, c, g),
         }
     }

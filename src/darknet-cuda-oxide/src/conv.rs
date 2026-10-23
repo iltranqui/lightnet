@@ -22,7 +22,7 @@ use darknet_cuda::ElementwiseLaunchConfig;
 
 use crate::kernels::conv_direct::WGRAD_THREADS;
 use crate::fp8::Fp8Format;
-use crate::{GemmArgs, GemmMode, ImplicitConv, OxideBackend, OxideError, OxideTensorF32, launch, launch_err};
+use crate::{BackwardRole, GemmArgs, GemmMode, ImplicitConv, OxideBackend, OxideError, OxideTensorF32, launch, launch_err};
 
 /// Which convolution implementation to use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -758,7 +758,7 @@ impl OxideBackend {
                     if let (Some(cols8), Some(scale)) = (cols8.as_ref(), scale.as_ref()) {
                         self.gemm_fp8_dy_a_bytes(dy, dy_fmt, cols8, col_fmt, scale, &mut partial, &wgrad)?;
                     } else {
-                        self.backward_gemm(&dy.buf, ws, &mut partial, &wgrad)?;
+                        self.backward_gemm(BackwardRole::Wgrad, &dy.buf, ws, &mut partial, &wgrad)?;
                     }
                     // SAFETY: one thread per (group, weight) element; the
                     // partials hold `nb` image blocks for each of `groups`.

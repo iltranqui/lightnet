@@ -225,7 +225,7 @@ Status as of 2026-10-22. After Task 2 the overhead work in [Overhead optimisatio
 | 4. Quantise from 16-bit storage | done; current scaling at `v0.2.180`, delayed scaling for 16-bit sources added at `v0.2.187` (`fp8_quantize_delayed_half_kernel`; `oxide_gemm_f8` 46 of 46, `oxide_amp` 20 of 20 in f16 and bf16; speed unmeasured) | `v0.2.180` (`5c5dc81`), `v0.2.187` (`8056b16`) |
 | 5. Kernel tuning | done: sub-steps B, A (on B) and C kept, D rejected; 2048^3 kernel 2.46 ms to 0.613 ms (7000 to 28000 GF/s) | `v0.2.184` (`87ae104`), `v0.2.185` (`01ae58f`), `v0.2.186` (`b690fb9`) |
 | 6. Compose with AMP | done, f16 and bf16; speed unmeasured | `v0.2.181` (`eb8919a`) |
-| 7. Backward pass review | not started | |
+| 7. Backward pass review | done: `BackwardRole` places `dy` per GEMM; wgrad on the f32-column path gave `dy` e4m3 and the column e5m2 before; `oxide_gemm_f8` 52 of 52 | this commit |
 | 8. xtask `-fp8` | done as `-fp8 -fp16` / `-fp8 -bf16`; plain `-fp8` unchanged | `v0.2.182` (`7fdb817`) |
 | 9. Accuracy and speed gate | user-gated (training run) | |
 
