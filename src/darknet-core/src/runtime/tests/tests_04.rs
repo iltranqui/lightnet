@@ -1148,7 +1148,7 @@ fn gpu_batch_normalized_rnn_backward_matches_cpu_and_updates_rolling_stats() {
         gpu_forward.cpu_forward.recurrent_caches.get(1),
         Some(Some(super::RecurrentForwardCache::Rnn(_)))
     ));
-    assert!(gpu_forward.gpu_rnn_caches[1].is_none());
+    assert!(gpu_forward.gpu_rnn_caches[1].is_some());
     assert_slice_close(
         "BN RNN output",
         &cpu_forward.layer_outputs[1].data,
@@ -1875,7 +1875,7 @@ fn gpu_batch_normalized_lstm_backward_matches_cpu_and_updates_rolling_stats() {
         gpu_forward.cpu_forward.recurrent_caches.get(1),
         Some(Some(super::RecurrentForwardCache::Lstm(_)))
     ));
-    assert!(gpu_forward.gpu_lstm_caches[1].is_none());
+    assert!(gpu_forward.gpu_lstm_caches[1].is_some());
     assert_slice_close(
         "BN LSTM output",
         &cpu_forward.layer_outputs[1].data,
