@@ -17,6 +17,10 @@ pub(crate) struct BufPool {
     free16: Mutex<HashMap<usize, Vec<DeviceBuffer<u16>>>>,
     /// Separate free list for byte buffers (fp8 operands); shares the byte cap.
     free8: Mutex<HashMap<usize, Vec<DeviceBuffer<u8>>>>,
+    /// Incarnation of each address seen by a [`PooledBuf`] / [`PooledBuf16`].
+    /// A recycled address gets a new value, so caches keyed by address (FP8
+    /// delayed-scaling history) do not inherit the previous owner's state.
+    incarnations: Mutex<HashMap<usize, u64>>,
     cap_bytes: usize,
 }
 
@@ -34,8 +38,31 @@ impl BufPool {
             free: Mutex::new((HashMap::new(), 0)),
             free16: Mutex::new(HashMap::new()),
             free8: Mutex::new(HashMap::new()),
+            incarnations: Mutex::new(HashMap::new()),
             cap_bytes,
         })
+    }
+
+    /// Bumps and returns the incarnation of `ptr`; called whenever a buffer is
+    /// wrapped for a tensor, so a recycled address never looks like its old
+    /// owner to an address-keyed cache.
+    fn bump_incarnation(&self, ptr: usize) -> u64 {
+        let Ok(mut g) = self.incarnations.lock() else {
+            return 0;
+        };
+        let entry = g.entry(ptr).or_insert(0);
+        *entry = entry.wrapping_add(1);
+        *entry
+    }
+
+    /// Current incarnation of `ptr`, or `0` for a buffer that was not wrapped
+    /// through this pool.
+    pub(crate) fn incarnation(&self, ptr: usize) -> u64 {
+        self.incarnations
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&ptr).copied())
+            .unwrap_or(0)
     }
 
     pub(crate) fn cached_bytes(&self) -> usize {
@@ -152,6 +179,7 @@ pub(crate) struct PooledBuf {
 
 impl PooledBuf {
     pub(crate) fn new(buf: DeviceBuffer<f32>, pool: &Arc<BufPool>) -> Self {
+        pool.bump_incarnation(buf.cu_deviceptr() as usize);
         Self {
             buf: Some(buf),
             pool: pool.clone(),
@@ -234,6 +262,7 @@ pub(crate) struct PooledBuf16 {
 
 impl PooledBuf16 {
     pub(crate) fn new(buf: DeviceBuffer<u16>, pool: &Arc<BufPool>) -> Self {
+        pool.bump_incarnation(buf.cu_deviceptr() as usize);
         Self {
             buf: Some(buf),
             pool: pool.clone(),
@@ -326,5 +355,11 @@ impl OxideTensorF16 {
 
     pub fn is_empty(&self) -> bool {
         self.buf.len() == 0
+    }
+
+    /// Device address of the 16-bit storage (test seam for buffer-pool reuse).
+    #[doc(hidden)]
+    pub fn device_ptr(&self) -> u64 {
+        self.buf.cu_deviceptr() as u64
     }
 }

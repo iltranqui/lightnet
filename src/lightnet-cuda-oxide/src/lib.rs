@@ -88,13 +88,15 @@ impl Fp8Scaling {
 
 /// Device amax histories of the delayed FP8 scaling: `FP8_HIST_KEYS` keys of
 /// `F8_HIST_LEN` slots each in one zeroed buffer.  A key is (source buffer
-/// device pointer, element count, format code); pooled buffers keep their
-/// address per call site in steady state.  When the buffer is full, new keys
-/// fall back to current scaling.
+/// device pointer, pool incarnation, element count, format code).  The
+/// incarnation changes when the pool hands the address to a new tensor, so a
+/// recycled buffer starts a fresh history instead of inheriting the old
+/// owner's amax.  When the buffer is full, new keys fall back to current
+/// scaling.
 pub(crate) struct Fp8Hist {
     buf: DeviceBuffer<f32>,
     /// key -> (first slot word, calls so far)
-    keys: std::collections::HashMap<(u64, usize, u32), (usize, u64)>,
+    keys: std::collections::HashMap<(u64, u64, usize, u32), (usize, u64)>,
 }
 
 pub(crate) const FP8_HIST_KEYS: usize = 4096;
@@ -1612,8 +1614,8 @@ impl OxideBackend {
     /// Test seam: quantise `x` to `fmt` through the activation quantiser
     /// (honouring [`Fp8Scaling`]) and return the bytes and the scale pair
     /// `[factor, 1 / factor]`.  `key` overrides the delayed-history key (the
-    /// source buffer address) so a test can simulate one call site whose buffer
-    /// changes between calls.
+    /// source buffer address plus its pool incarnation) so a test can simulate
+    /// one call site whose buffer changes between calls.
     pub fn fp8_quantize_probe(
         &self,
         x: &OxideTensorF32,
@@ -1709,7 +1711,8 @@ impl OxideBackend {
     }
 
     /// [`Self::fp8_quantize_operand`] with an optional delayed-history key
-    /// override (tests); `None` keys on the buffer's device address.
+    /// override (tests); `None` keys on the buffer's device address and pool
+    /// incarnation.
     fn fp8_quantize_keyed(
         &self,
         buf: &DeviceBuffer<f32>,
@@ -1754,7 +1757,10 @@ impl OxideBackend {
             Fp8Src::F32(b) => (b.cu_deviceptr() as u64, fmt.code()),
             Fp8Src::Half(b, hf) => (b.cu_deviceptr() as u64, fmt.code() | ((hf.code() + 1) << 8)),
         };
-        let key = (key.unwrap_or(ptr), len, code);
+        let key = match key {
+            Some(k) => (k, 0, len, code),
+            None => (ptr, self.bufs.incarnation(ptr as usize), len, code),
+        };
         let slots_used = hist.keys.len();
         let entry = match hist.keys.get_mut(&key) {
             Some(e) => e,
@@ -1923,8 +1929,8 @@ impl OxideBackend {
     /// says how to widen it): same factor, scale pair and bytes as widening to
     /// f32 first, with no f32 intermediate.  Under [`Fp8Scaling::Delayed`] it
     /// takes the one-pass delayed path of [`Self::fp8_quantize_delayed`] (keyed
-    /// on the 16-bit buffer, its length and both formats); current scaling
-    /// otherwise.
+    /// on the 16-bit buffer address, its pool incarnation, its length and both
+    /// formats); current scaling otherwise.
     pub(crate) fn fp8_quantize_half(
         &self,
         buf: &DeviceBuffer<u16>,
@@ -1936,7 +1942,8 @@ impl OxideBackend {
     }
 
     /// [`Self::fp8_quantize_half`] with an optional delayed-history key
-    /// override (tests); `None` keys on the buffer's device address.
+    /// override (tests); `None` keys on the buffer's device address and pool
+    /// incarnation.
     fn fp8_quantize_half_keyed(
         &self,
         buf: &DeviceBuffer<u16>,

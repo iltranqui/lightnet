@@ -1502,6 +1502,37 @@ fn delayed_half_first_call_uses_current_amax_bf16() {
     delayed_half_first_call_uses_current_amax(HalfFormat::Bf16);
 }
 
+/// The pool recycles an address for a new tensor: delayed scaling must start a
+/// fresh history instead of inheriting the previous owner's amax.
+fn delayed_half_forgets_history_when_pool_recycles_address(hfmt: HalfFormat) {
+    let be = OxideBackend::new().expect("backend").with_fp8_scaling(Fp8Scaling::Delayed);
+    let n = 1024;
+    let first = half_tensor(&be, &vec![8.0f32; n], hfmt);
+    let ptr = first.device_ptr();
+    let (_, s1) = be.fp8_quantize_half_probe(&first, Fp8Format::E4M3, hfmt).unwrap();
+    let first_amax = half_round(hfmt, 8.0);
+    assert!((s1[0] - 448.0 / first_amax).abs() <= 1e-6 * s1[0], "{hfmt:?}: first history");
+    drop(first);
+
+    let second = half_tensor(&be, &vec![0.01f32; n], hfmt);
+    assert_eq!(second.device_ptr(), ptr, "{hfmt:?}: pool did not recycle the address");
+    let before = be.fp8_amax_passes();
+    let (_, s2) = be.fp8_quantize_half_probe(&second, Fp8Format::E4M3, hfmt).unwrap();
+    assert_eq!(be.fp8_amax_passes() - before, 1, "{hfmt:?}: recycled buffer must start at call 0");
+    let second_amax = half_round(hfmt, 0.01);
+    assert!((s2[0] - 448.0 / second_amax).abs() <= 1e-6 * s2[0], "{hfmt:?}: second history");
+}
+
+#[test]
+fn delayed_half_forgets_history_when_pool_recycles_address_f16() {
+    delayed_half_forgets_history_when_pool_recycles_address(HalfFormat::F16);
+}
+
+#[test]
+fn delayed_half_forgets_history_when_pool_recycles_address_bf16() {
+    delayed_half_forgets_history_when_pool_recycles_address(HalfFormat::Bf16);
+}
+
 /// After call 0 the delayed path is one launch: no stand-alone amax pass, one
 /// quantise.  Current scaling runs the amax pass on every call.
 fn delayed_half_quantises_in_one_launch(hfmt: HalfFormat) {
