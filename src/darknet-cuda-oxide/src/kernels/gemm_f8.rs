@@ -111,6 +111,14 @@ pub fn quantize_f32(value: f32, scale: f32, fmt: u32) -> u8 {
     }
 }
 
+/// Logical element count `len` of a possibly larger, reused buffer of
+/// `buf_len` elements (never beyond the buffer).
+#[device]
+pub fn bounded_len(len: u32, buf_len: usize) -> usize {
+    let len = len as usize;
+    if len < buf_len { len } else { buf_len }
+}
+
 /// Quantisation factor `max_finite(fmt) / amax` (`fmt` 0 = e4m3, 1 = e5m2);
 /// `1.0` when amax is zero or non-finite.
 #[device]
@@ -457,18 +465,20 @@ pub mod kernels {
         }
     }
 
-    /// `out[0] = max(|x[i]|)` over `x`, ignoring non-finite values.  `out` is
+    /// `out[off] = max(|x[i]|)` over the first `len` elements of `x` (`len` is
+    /// the logical element count: `x` may be a larger, reused buffer whose tail
+    /// holds stale data from an earlier use), ignoring non-finite values.  `out` is
     /// a single f32 slot (read as `u32` bits) that must already hold 0.  Each
     /// 256-thread block reduces in shared memory and issues one `atomicMax` on the
     /// bit pattern (valid for non-negative floats); launch whole 256-thread blocks.
     #[kernel]
-    pub fn fp8_amax_f32_kernel(x: &[f32], mut out: DisjointSlice<f32>, off: u32) {
+    pub fn fp8_amax_f32_kernel(x: &[f32], mut out: DisjointSlice<f32>, off: u32, len: u32) {
         static mut SH: SharedArray<u32, 256, 16> = SharedArray::UNINIT;
         let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SH) };
         let tid = thread::threadIdx_x() as usize;
         let i = thread::blockIdx_x() as usize * 256 + tid;
         let mut bits = 0u32;
-        if i < x.len() {
+        if i < bounded_len(len, x.len()) {
             let value = x[i];
             if value.is_finite() {
                 bits = value.abs().to_bits();
@@ -505,13 +515,13 @@ pub mod kernels {
     /// bf16) selects how each `x[i]` is widened (exact), so the slot gets the
     /// value the f32 kernel would get from the widened tensor.
     #[kernel]
-    pub fn fp8_amax_half_kernel(x: &[u16], mut out: DisjointSlice<f32>, off: u32, hfmt: u32) {
+    pub fn fp8_amax_half_kernel(x: &[u16], mut out: DisjointSlice<f32>, off: u32, hfmt: u32, len: u32) {
         static mut SH: SharedArray<u32, 256, 16> = SharedArray::UNINIT;
         let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SH) };
         let tid = thread::threadIdx_x() as usize;
         let i = thread::blockIdx_x() as usize * 256 + tid;
         let mut bits = 0u32;
-        if i < x.len() {
+        if i < bounded_len(len, x.len()) {
             let value = half_bits_to_f32(x[i], hfmt);
             if value.is_finite() {
                 bits = value.abs().to_bits();
@@ -553,6 +563,7 @@ pub mod kernels {
         fmt: u32,
         off: u32,
         hfmt: u32,
+        len: u32,
     ) {
         let idx = thread::index_1d();
         let i = idx.get();
@@ -560,7 +571,7 @@ pub mod kernels {
         if let Some(o) = scale.get_mut(thread::index_1d()) {
             *o = if i == 0 { factor } else { 1.0 / factor };
         }
-        if i >= x.len() {
+        if i >= bounded_len(len, x.len()) {
             return;
         }
         if let Some(o) = out.get_mut(idx) {
@@ -582,20 +593,15 @@ pub mod kernels {
         mut scale: DisjointSlice<f32>,
         fmt: u32,
         off: u32,
+        len: u32,
     ) {
         let idx = thread::index_1d();
         let i = idx.get();
-        let amax = amax[off as usize];
-        let max_finite = if fmt == 0 { 448.0 } else { 57344.0 };
-        let factor = if amax > 0.0 && amax.is_finite() {
-            max_finite / amax
-        } else {
-            1.0
-        };
+        let factor = fp8_factor(amax[off as usize], fmt);
         if let Some(o) = scale.get_mut(thread::index_1d()) {
             *o = if i == 0 { factor } else { 1.0 / factor };
         }
-        if i >= x.len() {
+        if i >= bounded_len(len, x.len()) {
             return;
         }
         if let Some(o) = out.get_mut(idx) {
@@ -625,6 +631,7 @@ pub mod kernels {
         base: u32,
         w: u32,
         z: u32,
+        len: u32,
     ) {
         static mut SH: SharedArray<u32, 256, 16> = SharedArray::UNINIT;
         let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SH) };
@@ -647,7 +654,7 @@ pub mod kernels {
         }
         let factor = fp8_factor(hmax, fmt);
         let mut bits = 0u32;
-        if i < x.len() {
+        if i < bounded_len(len, x.len()) {
             let value = x[i];
             if value.is_finite() {
                 bits = value.abs().to_bits();
@@ -714,6 +721,7 @@ pub mod kernels {
         w: u32,
         z: u32,
         hfmt: u32,
+        len: u32,
     ) {
         static mut SH: SharedArray<u32, 256, 16> = SharedArray::UNINIT;
         let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SH) };
@@ -736,7 +744,7 @@ pub mod kernels {
         }
         let factor = fp8_factor(hmax, fmt);
         let mut bits = 0u32;
-        if i < x.len() {
+        if i < bounded_len(len, x.len()) {
             let value = half_bits_to_f32(x[i], hfmt);
             if value.is_finite() {
                 bits = value.abs().to_bits();

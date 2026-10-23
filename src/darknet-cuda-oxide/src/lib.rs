@@ -1758,7 +1758,7 @@ impl OxideBackend {
             match src {
                 Fp8Src::F32(buf) => unsafe {
                     self.gemm_f8
-                        .fp8_amax_f32_kernel(&self.stream, amax_grid, buf, &mut hist.buf, base as u32 + w)
+                        .fp8_amax_f32_kernel(&self.stream, amax_grid, buf, &mut hist.buf, base as u32 + w, len as u32)
                         .map_err(launch_err)?;
                     // SAFETY: as `fp8_quantize_operand_current`.
                     self.gemm_f8
@@ -1771,13 +1771,14 @@ impl OxideBackend {
                             &mut scale,
                             fmt.code(),
                             base as u32 + w,
+                            len as u32,
                         )
                         .map_err(launch_err)?;
                 },
                 Fp8Src::Half(buf, hf) => unsafe {
                     self.fp8_amax_passes.fetch_add(1, Ordering::Relaxed);
                     self.gemm_f8
-                        .fp8_amax_half_kernel(&self.stream, amax_grid, buf, &mut hist.buf, base as u32 + w, hf.code())
+                        .fp8_amax_half_kernel(&self.stream, amax_grid, buf, &mut hist.buf, base as u32 + w, hf.code(), len as u32)
                         .map_err(launch_err)?;
                     // SAFETY: as `fp8_quantize_half`.
                     self.gemm_f8
@@ -1791,6 +1792,7 @@ impl OxideBackend {
                             fmt.code(),
                             base as u32 + w,
                             hf.code(),
+                            len as u32,
                         )
                         .map_err(launch_err)?;
                 },
@@ -1815,6 +1817,7 @@ impl OxideBackend {
                             base as u32,
                             w,
                             z,
+                            len as u32,
                         )
                         .map_err(launch_err)?;
                 },
@@ -1832,6 +1835,7 @@ impl OxideBackend {
                             w,
                             z,
                             hf.code(),
+                            len as u32,
                         )
                         .map_err(launch_err)?;
                 },
@@ -1865,6 +1869,7 @@ impl OxideBackend {
                 buf,
                 &mut ring.buf,
                 off,
+                len as u32,
             )
         }
         .map_err(launch_err)?;
@@ -1882,6 +1887,7 @@ impl OxideBackend {
                 &mut scale,
                 fmt.code(),
                 off,
+                len as u32,
             )
         }
         .map_err(launch_err)?;
@@ -1953,6 +1959,7 @@ impl OxideBackend {
                 &mut ring.buf,
                 off,
                 hfmt.code(),
+                len as u32,
             )
         }
         .map_err(launch_err)?;
@@ -1971,6 +1978,7 @@ impl OxideBackend {
                 fmt.code(),
                 off,
                 hfmt.code(),
+                len as u32,
             )
         }
         .map_err(launch_err)?;
@@ -2153,6 +2161,7 @@ impl OxideBackend {
                     buf,
                     &mut ring.buf,
                     off,
+                    len as u32,
                 )
             }
             .map_err(launch_err)?;
@@ -3128,6 +3137,7 @@ impl OxideBackend {
                 &x,
                 &mut slot,
                 0,
+                values.len() as u32,
             )
         }
         .map_err(launch_err)?;

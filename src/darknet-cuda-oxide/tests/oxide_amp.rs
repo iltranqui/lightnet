@@ -1323,3 +1323,55 @@ fn bf16_gemm_mode_tracks_the_f32_gemm_in_the_f32_api() {
     // Two bf16 roundings (2^-9 each) over K = 96 random terms.
     assert!(worst / scale < 1.5e-2, "bf16 GEMM error {}", worst / scale);
 }
+
+// ------------------------------------------- fp8 conv: codex review findings
+
+/// The im2col workspace is reused between convs (and between chunks of one
+/// conv) and only ever grows, so a conv whose logical column count is smaller
+/// than the buffer sees stale columns after its own.  The fp8 amax of the
+/// column must be bounded by the logical element count: a stale spike in the
+/// unused tail must not set the scale (it would round the real activations to
+/// zero).  Call A (batch 3, spike activations) leaves the spike behind; call B
+/// (batch 1, small activations, same geometry) must still track the f64
+/// reference.  `h = w = 7`, `k = 3` makes the column 896 elements, so the
+/// amax launch's 256-multiple rounding reaches into the stale tail.
+#[test]
+fn amp_fp8_conv_amax_ignores_stale_workspace_tail() {
+    for hfmt in BOTH_FORMATS {
+        for scaling in [Fp8Scaling::Current, Fp8Scaling::Delayed] {
+            let be = fp8_amp_backend(hfmt).with_fp8_scaling(scaling).with_fp8_backward(Some((Fp8Format::E4M3, Fp8Format::E5M2)));
+            let big = Cv { b: 3, c: 1, h: 7, w: 7, f: 4, k: 3, s: 1, pad: 1, groups: 1 };
+            let small = Cv { b: 1, ..big };
+            let spike = if hfmt == HalfFormat::F16 { 6.0e4f32 } else { 1.0e12 };
+            let mut rng = Rng(0x57a1_e7a1 + hfmt.code() as u64);
+            let (c, h, ww, f, k, sx, sy, dil, pad, groups) = conv_args(&big);
+            let w = rng.vec(big.f * big.cpg() * k * k, -0.5, 0.5);
+            let wt = up(&be, &[f, big.cpg(), k, k], &w);
+            let (oh, ow) = (big.oh(), big.ow());
+            let tag = format!("{hfmt:?} {scaling:?}");
+
+            // call A: fills the workspace with spike columns (results discarded)
+            let xa = be.to_half_storage(&up(&be, &[big.b, c, h, ww], &vec![spike; big.b * c * h * ww])).unwrap();
+            let dya = be.to_half_storage(&up(&be, &[big.b, f, oh, ow], &rng.vec(big.b * f * oh * ow, -1.0, 1.0))).unwrap();
+            let _ = be.conv2d_f32(&xa, &wt, &[big.b, f, oh, ow], c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap();
+            let _ = be.conv2d_backward_weights_f32(&xa, &dya, &[f, big.cpg(), k, k], c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap();
+
+            // call B: one small image through the (larger) workspace
+            let x = rng.vec(c * h * ww, -0.05, 0.05);
+            let dy = rng.vec(f * oh * ow, -1.0, 1.0);
+            let xb = be.to_half_storage(&up(&be, &[1, c, h, ww], &x)).unwrap();
+            let dyb = be.to_half_storage(&up(&be, &[1, f, oh, ow], &dy)).unwrap();
+            // two rounds so the delayed history is exercised past its start
+            for round in 0..3 {
+                let y = down(&be, &be.conv2d_f32(&xb, &wt, &[1, f, oh, ow], c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap());
+                let ye = nerr(&y, &conv_ref_fwd(&small, &r16_in(hfmt, &x), &w));
+                assert!(ye <= FP8_NERR, "{tag} round {round}: fwd nerr {ye:.3e} (stale tail set the scale)");
+                let dw = down(&be, &be.conv2d_backward_weights_f32(&xb, &dyb, &[f, big.cpg(), k, k], c, h, ww, f, k, sx, sy, dil, pad, groups, cfg()).unwrap());
+                let we = nerr(&dw, &conv_ref_wgrad(&small, &r16_in(hfmt, &dy), &r16_in(hfmt, &x)));
+                assert!(we <= FP8_NERR, "{tag} round {round}: wgrad nerr {we:.3e} (stale tail set the scale)");
+                println!("{tag} round {round}: fwd {ye:.2e} wgrad {we:.2e}");
+            }
+        }
+    }
+}
+
