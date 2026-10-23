@@ -446,7 +446,7 @@ fn probability_code_boundary(u: f32, mode: ExpCastMode) -> bool {
 }
 
 const VC_QK_CLAMP: f32 = 128.0;
-const VC_LOG2_E: f32 = 1.4426950408889634;
+const VC_LOG2_E: f32 = std::f32::consts::LOG2_E;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct QuantizedQkCache {
@@ -1050,7 +1050,7 @@ pub(crate) fn quantized_online_row_forward(
             context[channel] += weight * values[position * channels + channel];
         }
     }
-    let lse = (final_max + normalizer.log2() - 8.0) * 0.6931471805599453;
+    let lse = (final_max + normalizer.log2() - 8.0) * std::f32::consts::LN_2;
     Ok((
         context.clone(),
         lse,
@@ -1123,7 +1123,7 @@ pub(crate) fn quantized_online_row_backward(
                 * (tile_values[tile][channel] - cache.context[channel] * tile_sums[tile]);
         }
         prefix_max_grad[tile] =
-            0.6931471805599453 * prefix_scale * centered_context_dot / normalizer;
+            std::f32::consts::LN_2 * prefix_scale * centered_context_dot / normalizer;
         let begin = tile * V_SMOOTH_TILE_SIZE;
         let end = (begin + V_SMOOTH_TILE_SIZE).min(cache.tokens);
         for position in begin..end {
