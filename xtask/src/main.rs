@@ -18,7 +18,8 @@ usage: cargo xtask <cmd> [args...]
   test|host|t [filter...]  host tests, same as tools/test_host.sh (PKGS overrides)
   oxide|o [args...]     ./tools/test_oxide.sh (GPU tests; args pass through)
   train_legogears|train|tr [-fp8|-fp16|-bf16|-fp8 -fp16|-fp8 -bf16] [w] [flags]
-                        -fp8: DARKNET_OXIDE_GEMM=fp8 and DARKNET_OXIDE_GEMM_BWD=fp8 (f32 storage); -fp16: DARKNET_OXIDE_AMP=1
+                        -fp8: DARKNET_OXIDE_GEMM=fp8 and DARKNET_OXIDE_GEMM_BWD=fp8 (f32 storage; an inherited
+                        DARKNET_OXIDE_AMP is unset, as without any flag); -fp16: DARKNET_OXIDE_AMP=1
                         (-fp16 adds -dyn_scale and -loss_scale 1024 unless supplied)
                         -bf16: DARKNET_OXIDE_AMP=bf16, no loss scaling
                         -fp8 -fp16 / -fp8 -bf16: fp8 convolution GEMMs on 16-bit activation
@@ -94,7 +95,7 @@ fn main() -> ExitCode {
             return run(v, &mem, false);
         }
         // Release build + `detector train` on LegoGears_v2 (oxide backend); the script
-        // caps itself. Overrides: CFG, DATA, SEED, PROFILE, DARKNET_OXIDE_AMP.
+        // caps itself. Overrides: CFG, DATA, SEED, PROFILE. DARKNET_OXIDE_AMP is set or unset from the precision flags.
         "train_legogears" | "train" | "tr" => {
             // Same 4 build thread cap as every other command.
             if env::var_os("JOBS").is_none() {
@@ -104,10 +105,15 @@ fn main() -> ExitCode {
             let mut v = vec!["./tools/train_legogears_oxide.sh".to_owned()];
             match precision_env(&rest) {
                 Ok((rest, vars, extra)) => {
-                    for (k, val) in vars {
+                    apply_precision_env(&vars, |k, val| {
                         // SAFETY: single-threaded at this point; no other thread reads the env.
-                        unsafe { env::set_var(k, val) };
-                    }
+                        unsafe {
+                            match val {
+                                Some(val) => env::set_var(k, val),
+                                None => env::remove_var(k),
+                            }
+                        }
+                    });
                     v.extend(rest);
                     v.extend(extra);
                 }
@@ -276,9 +282,57 @@ fn precision_env(args: &[String]) -> PrecisionEnv {
     Ok((rest, vars, extra))
 }
 
+/// Applies the precision env to the child: every var in `vars` is set, and
+/// `DARKNET_OXIDE_AMP` is removed when no 16-bit flag asked for it, so a value
+/// inherited from the caller's shell cannot turn bare `-fp8` (f32 storage) or
+/// the fp32 default into AMP storage.
+fn apply_precision_env(vars: &[(&'static str, &'static str)], mut set: impl FnMut(&str, Option<&str>)) {
+    for (k, val) in vars {
+        set(k, Some(val));
+    }
+    if !vars.iter().any(|(k, _)| *k == AMP_VAR) {
+        set(AMP_VAR, None);
+    }
+}
+
+const AMP_VAR: &str = "DARKNET_OXIDE_AMP";
+
 #[cfg(test)]
 mod tests {
-    use super::precision_env;
+    use super::{apply_precision_env, precision_env};
+    use std::collections::HashMap;
+
+    /// The child env after `-flags`, starting from an inherited `DARKNET_OXIDE_AMP=bf16`.
+    fn child_env(flags: &[&str]) -> HashMap<String, String> {
+        let (_, vars, _) = precision_env(&args(flags)).unwrap();
+        let mut env = HashMap::from([("DARKNET_OXIDE_AMP".to_owned(), "bf16".to_owned())]);
+        apply_precision_env(&vars, |k, v| match v {
+            Some(v) => {
+                env.insert(k.to_owned(), v.to_owned());
+            }
+            None => {
+                env.remove(k);
+            }
+        });
+        env
+    }
+
+    #[test]
+    fn bare_fp8_and_default_drop_an_inherited_amp() {
+        for flags in [&["-fp8"][..], &[][..]] {
+            let env = child_env(flags);
+            assert!(!env.contains_key("DARKNET_OXIDE_AMP"), "{flags:?}: {env:?}");
+        }
+        assert_eq!(child_env(&["-fp8"]).get("DARKNET_OXIDE_GEMM").map(String::as_str), Some("fp8"));
+    }
+
+    #[test]
+    fn sixteen_bit_flags_override_an_inherited_amp() {
+        assert_eq!(child_env(&["-fp16"])["DARKNET_OXIDE_AMP"], "1");
+        assert_eq!(child_env(&["-bf16"])["DARKNET_OXIDE_AMP"], "bf16");
+        assert_eq!(child_env(&["-fp8", "-fp16"])["DARKNET_OXIDE_AMP"], "1");
+        assert_eq!(child_env(&["-fp8", "-bf16"])["DARKNET_OXIDE_AMP"], "bf16");
+    }
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
