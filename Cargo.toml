@@ -1,21 +1,21 @@
 [workspace]
 resolver = "3"
 exclude = [
-    "src/darknet-cuda-cutile",
-    "src/darknet-cuda-oxide",
+    "src/lightnet-cuda-cutile",
+    "src/lightnet-cuda-oxide",
     "third_party/cuda-oxide/cuda-oxide/crates/rustc-codegen-cuda",
 ]
 members = [
     # Darknet Rust port
-    "src/darknet-cli",
-    "src/darknet-core",
-    "src/darknet-cuda",
-    "src/darknet-examples",
-    # `darknet-gui` is opt-in (`-p darknet-gui`): it pulls egui/eframe and is
+    "src/lightnet-cli",
+    "src/lightnet-core",
+    "src/lightnet-cuda",
+    "src/lightnet-examples",
+    # `lightnet-gui` is opt-in (`-p lightnet-gui`): it pulls egui/eframe and is
     # intentionally not in `default-members`.
-    "src/darknet-gui",
-    "src/darknet-gui-project",
-    "src/darknet-gui-engine",
+    "src/lightnet-gui",
+    "src/lightnet-gui-project",
+    "src/lightnet-gui-engine",
     # `cargo xtask <cmd>`: capped build/test runner (see .cargo/config.toml alias).
     "xtask",
 
@@ -53,12 +53,12 @@ members = [
     # Differential codegen fuzzer support
     "third_party/cuda-oxide/cuda-oxide/crates/fuzzer",
 ]
-# Plain `cargo check/test` skips the heavy iced/wgpu GUI; build it with `-p darknet-gui`.
+# Plain `cargo check/test` skips the heavy iced/wgpu GUI; build it with `-p lightnet-gui`.
 default-members = [
-    "src/darknet-cli",
-    "src/darknet-core",
-    "src/darknet-cuda",
-    "src/darknet-examples",
+    "src/lightnet-cli",
+    "src/lightnet-core",
+    "src/lightnet-cuda",
+    "src/lightnet-examples",
     "third_party/cuda-oxide/cuda-oxide/crates/cuda-target-spec",
     "third_party/cuda-oxide/cuda-oxide/crates/cuda-intrinsics",
     "third_party/cuda-oxide/cuda-oxide/crates/ptx-parse",
@@ -183,5 +183,5 @@ opt-level = 3
 
 # The oxide bridge needs MIR const-propagation (opt-level >= 1) for its float
 # atomics; its own [profile.dev] is ignored when built as a dependency.
-[profile.dev.package.darknet-cuda-oxide]
+[profile.dev.package.lightnet-cuda-oxide]
 opt-level = 1

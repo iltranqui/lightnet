@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build and train LegoGears_v2 using the Rust oxide backend.
 # Usage: ./tools/train_legogears_oxide.sh [initial.weights] [training flags...]
-# Overrides: CFG, DATA, SEED, JOBS (build threads, default 4), DARKNET_OXIDE_AMP=1, PROFILE=release|debug
+# Overrides: CFG, DATA, SEED, JOBS (build threads, default 4), LIGHTNET_OXIDE_AMP=1, PROFILE=release|debug
 #
 # PROFILE defaults to `release`: the trainer's host code (image loader, phase
 # bookkeeping, launch preparation) is a large part of the measured step time,
@@ -56,10 +56,10 @@ fi
 # debug build and the profile numbers are not comparable to C++.
 capped 3G env RUSTUP_TOOLCHAIN=nightly-2026-08-28 \
     target/debug/cargo-oxide oxide build -- \
-    -p darknet-cli --features oxide -j "$JOBS" "${CARGO_PROFILE_FLAG[@]}"
+    -p lightnet-cli --features oxide -j "$JOBS" "${CARGO_PROFILE_FLAG[@]}"
 
-printf 'Running %s/%s (PROFILE=%s)\n' "$BIN_DIR" "darknet-rs" "$PROFILE" >&2
+printf 'Running %s/%s (PROFILE=%s)\n' "$BIN_DIR" "lightnet-rs" "$PROFILE" >&2
 
-export DARKNET_BACKEND=oxide
-exec "$BIN_DIR/darknet-rs" detector train \
+export LIGHTNET_BACKEND=oxide
+exec "$BIN_DIR/lightnet-rs" detector train \
     "$DATA" "$CFG" -seed "$SEED" -dont_show -map "$@"

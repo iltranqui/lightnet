@@ -3,7 +3,7 @@
 usage: oxide_parity_compare.py <prefixA> <prefixB> <step> [ref_step=0]
 Compares the parameter DELTA (step - ref_step) of A against B per tensor kind: relative L2 error
 ||dA-dB|| / ||dB|| and max |dA-dB| / max|dB| (B is the reference), plus mean |d|. Dump layout per conv
-layer (see darknet-cli dump_parity / oxide_bench_cpp parity): biases, [bn biases, scales, mean, var], weights."""
+layer (see lightnet-cli dump_parity / oxide_bench_cpp parity): biases, [bn biases, scales, mean, var], weights."""
 import sys
 import numpy as np
 

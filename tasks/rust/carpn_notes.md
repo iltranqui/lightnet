@@ -16,15 +16,15 @@
 
 ### Rust evaluator and inference
 
-- `src/darknet-core/src/evaluate.rs::ObbValidationDataset::evaluate` currently calls `decode_obb_yolo_detections` with only the inference callback's `yolo_heads`; it normalizes the results and invokes `obb_detector_map`.
+- `src/lightnet-core/src/evaluate.rs::ObbValidationDataset::evaluate` currently calls `decode_obb_yolo_detections` with only the inference callback's `yolo_heads`; it normalizes the results and invokes `obb_detector_map`.
 - `carpn_detector_map` already checks for CARPN quads and front-point labels, computes polygon IoU, and reuses `detector_map_by` for ranking, matching, duplicate handling, AP, and report counters. `obb_detector_map` now dispatches homogeneous CARPN samples and rejects mixed geometry (v0.0.258).
-- `src/darknet-core/src/runtime.rs::ForwardResult` already carries `layer_outputs` and `yolo_heads` in a full forward. `from_heads` is only a compact compatibility constructor and has no feature tensors.
-- `src/darknet-core/src/detect.rs::decode_obb_yolo_detections` only decodes legacy Stage-1 OBB heads to `FrontPoint`. It already has typed `CarpnQuad`, polygon IoU, and geometry-aware OBB NMS utilities but no network CARPN decoder.
+- `src/lightnet-core/src/runtime.rs::ForwardResult` already carries `layer_outputs` and `yolo_heads` in a full forward. `from_heads` is only a compact compatibility constructor and has no feature tensors.
+- `src/lightnet-core/src/detect.rs::decode_obb_yolo_detections` only decodes legacy Stage-1 OBB heads to `FrontPoint`. It already has typed `CarpnQuad`, polygon IoU, and geometry-aware OBB NMS utilities but no network CARPN decoder.
 - `model.rs` has `LayerKind::ObbYolo`, `Layer::weights`, and shape inference, but no `[obb_refine]` model/spec or Stage-2 parameter variant. `weights.rs` supports generic layer inspection/round-trip, so the new layer must join the same path.
 
 ### Rust CLI and training boundary
 
-- `src/darknet-cli/src/main.rs::run_detector_map` routes OBB cfgs through `ObbValidationDataset::evaluate`, but its callback drops everything except `ForwardResult.yolo_heads`.
+- `src/lightnet-cli/src/main.rs::run_detector_map` routes OBB cfgs through `ObbValidationDataset::evaluate`, but its callback drops everything except `ForwardResult.yolo_heads`.
 - `detect-image` also passes only `yolo_heads` to the legacy OBB decoder. Both routes need full Stage-2 outputs for CARPN.
 - The shared training-validation enum in `main.rs` reuses `ObbValidationDataset`. The CPU OBB trainer computes Stage-1 OBB deltas only; OBB CPU `-map` support does not imply `[obb_refine]` training support. The plan must reject training graphs with `[obb_refine]` until Stage-2 assignment/loss/backward/update are implemented.
 - `GpuExecutableNetwork::forward` can retain full outputs; `forward_compact` retains only detector-head summaries. GPU/Oxide CARPN is not included in the CPU-first milestone.

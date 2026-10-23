@@ -1,0 +1,16 @@
+[package]
+name = "lightnet-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "lightnet_core"
+path = "src/lib.rs"
+
+[dependencies]
+lightnet-cuda = { path = "../lightnet-cuda" }
+image = "0.25.10"
+imageproc = "0.26.1"
+mozjpeg = { version = "0.10", default-features = false }
+rayon = "1"

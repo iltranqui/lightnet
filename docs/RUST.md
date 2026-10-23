@@ -48,14 +48,14 @@ lowers the loss. The parity test compiles the repository's actual
 
 ## Workspace Layout
 
-- `src/darknet-core`: model parsing, tensors, weights, inference, training,
+- `src/lightnet-core`: model parsing, tensors, weights, inference, training,
   and CPU/GPU runtime orchestration.
-- `src/darknet-cuda`: backend traits and CUDA-facing tensor abstractions.
-- `src/darknet-cli`: the `darknet-rs` command-line application.
-- `src/darknet-examples`: Rust equivalents of all 11 programs in
+- `src/lightnet-cuda`: backend traits and CUDA-facing tensor abstractions.
+- `src/lightnet-cli`: the `lightnet-rs` command-line application.
+- `src/lightnet-examples`: Rust equivalents of all 11 programs in
   ../src-examples, including image, video, JSON, YOLO-label, keypoint,
   RTSP, and webcam workflows.
-- `src/darknet-cuda-cutile`: optional `cutile-rs` backend.
+- `src/lightnet-cuda-cutile`: optional `cutile-rs` backend.
 
 ## Build and Verify
 
@@ -70,14 +70,14 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
 
 # The optional cuTile bridge is checked separately from the main workspace.
-./src/darknet-cuda-cutile/scripts/check-env.sh
+./src/lightnet-cuda-cutile/scripts/check-env.sh
 RUSTFLAGS=-Dwarnings cargo test \
-  --manifest-path src/darknet-cuda-cutile/Cargo.toml --locked --lib
+  --manifest-path src/lightnet-cuda-cutile/Cargo.toml --locked --lib
 
 # Require the direct C++/Rust fixture instead of allowing a missing compiler
 # to be reported as a portable-development skip.
-DARKNET_CPP_PARITY_REQUIRED=1 \
-  RUSTFLAGS=-Dwarnings cargo test -p darknet-core --test cpp_parity -- --nocapture
+LIGHTNET_CPP_PARITY_REQUIRED=1 \
+  RUSTFLAGS=-Dwarnings cargo test -p lightnet-core --test cpp_parity -- --nocapture
 ```
 
 `toolchain.env` selects the workspace-local Rust 1.97.1 toolchain, Cargo,
@@ -99,17 +99,17 @@ detect-image <cfg> <weights> <names> <image> [threshold] [nms] [letterbox|resize
 Examples:
 
 ```bash
-cargo run -p darknet-cli -- cfg-summary ../cfg/yolov4-tiny.cfg
-cargo run -p darknet-cli -- forward-dummy ../cfg/yolov4-tiny.cfg
-cargo run -p darknet-cli -- detect-image ../cfg/yolov4-tiny.cfg model.weights ../cfg/coco.names frame.ppm
+cargo run -p lightnet-cli -- cfg-summary ../cfg/yolov4-tiny.cfg
+cargo run -p lightnet-cli -- forward-dummy ../cfg/yolov4-tiny.cfg
+cargo run -p lightnet-cli -- detect-image ../cfg/yolov4-tiny.cfg model.weights ../cfg/coco.names frame.ppm
 ```
 
 The example binaries use explicit model arguments:
 
-    cargo run -p darknet-examples --bin darknet_01_inference_images -- <cfg> <weights|-> <names|-> image...
-    cargo run -p darknet-examples --bin darknet_04_process_videos -- <cfg> <weights|-> <names|-> video...
-    cargo run -p darknet-examples --bin darknet_06_images_to_json -- <cfg> <weights|-> <names|-> image...
-    cargo run -p darknet-examples --bin darknet_11_images_to_yolo -- <cfg> <weights|-> <names|-> image...
+    cargo run -p lightnet-examples --bin darknet_01_inference_images -- <cfg> <weights|-> <names|-> image...
+    cargo run -p lightnet-examples --bin darknet_04_process_videos -- <cfg> <weights|-> <names|-> video...
+    cargo run -p lightnet-examples --bin darknet_06_images_to_json -- <cfg> <weights|-> <names|-> image...
+    cargo run -p lightnet-examples --bin darknet_11_images_to_yolo -- <cfg> <weights|-> <names|-> image...
 
 All 11 binaries are named after their C++ counterparts. Video, RTSP, and
 webcam equivalents use ffmpeg and ffprobe for media I/O, while display
@@ -136,8 +136,8 @@ ordering remain in Rust. Common options are --threshold, --nms, --resize,
 The optional bridge is built separately:
 
 ```bash
-./src/darknet-cuda-cutile/scripts/check-env.sh
-cargo check --manifest-path src/darknet-cuda-cutile/Cargo.toml --locked
+./src/lightnet-cuda-cutile/scripts/check-env.sh
+cargo check --manifest-path src/lightnet-cuda-cutile/Cargo.toml --locked
 ```
 
 The bridge is pinned to cutile-rs v0.2.0. Its default JIT path uses the
@@ -164,9 +164,9 @@ input/weight/bias backward gradients, and one SGD update against a scalar
 reference. Run it only on a CUDA host with the driver visible:
 
 ```bash
-export DARKNET_CUTILE_GPU_TEST=1
+export LIGHTNET_CUTILE_GPU_TEST=1
 RUSTFLAGS=-Dwarnings cargo test \
-  --manifest-path src/darknet-cuda-cutile/Cargo.toml --locked --lib \
+  --manifest-path src/lightnet-cuda-cutile/Cargo.toml --locked --lib \
   -- --ignored --nocapture
 ```
 

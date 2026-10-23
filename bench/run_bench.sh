@@ -3,7 +3,7 @@
 # Usage: bench/run_bench.sh <tag-or-branch> [low_precision_kernels|lego|precisions ...]
 # Default benches: low_precision_kernels lego.
 # Env:
-#   DARKNET_BENCH_MODES  lego/precisions modes (default fp32,fp8)
+#   LIGHTNET_BENCH_MODES  lego/precisions modes (default fp32,fp8)
 #   BENCH_SHARE_OXIDE    1 = symlink the main checkout's third_party/cuda-oxide into the
 #                        scratch worktree (OPEN DECISION, default 0: script aborts early)
 # Idempotent: a ref+bench that already has rows is skipped.
@@ -141,7 +141,7 @@ run_one() {
     echo "run $ref $bench ($test)"
     local status=0
     if [[ "$bench" == lego || "$bench" == precisions ]]; then
-        (cd "$wt" && DARKNET_BENCH_MODES="${DARKNET_BENCH_MODES:-fp32,fp8}" \
+        (cd "$wt" && LIGHTNET_BENCH_MODES="${LIGHTNET_BENCH_MODES:-fp32,fp8}" \
             cargo xtask oxide --test oxide_gemm_bench -- --ignored "$test") > "$log" 2>&1 || status=$?
     else
         (cd "$wt" && cargo xtask oxide --test oxide_gemm_bench -- --ignored "$test") > "$log" 2>&1 || status=$?

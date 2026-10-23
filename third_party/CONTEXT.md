@@ -16,7 +16,7 @@ Pinned git submodules. Treat as upstream code: never edit inside, apply patches 
 | `cuda-oxide/` | https://github.com/NVlabs/cuda-oxide | `728539f65` (first upstream fix after `7d9c19405`; its root Cargo.toml paths are repaired) |
 | `patches/` | local | patches to apply on top of the pin, see `patches/README.md` |
 
-The cuTile submodule lives at `src/cutile-rs-aot` (NVlabs/cutile-rs v0.2.0) because `darknet-cuda-cutile` uses a relative path to it.
+The cuTile submodule lives at `src/cutile-rs-aot` (NVlabs/cutile-rs v0.2.0) because `lightnet-cuda-cutile` uses a relative path to it.
 
 Crates are at `third_party/cuda-oxide/cuda-oxide/crates/<name>`.
 
@@ -34,10 +34,10 @@ Crates are at `third_party/cuda-oxide/cuda-oxide/crates/<name>`.
 
 ## Who uses it
 
-`src/darknet-cuda-oxide` (kernels) and the `oxide` feature of `src/darknet-cli`. Build via `./tools/test_oxide.sh`.
+`src/lightnet-cuda-oxide` (kernels) and the `oxide` feature of `src/lightnet-cli`. Build via `./tools/test_oxide.sh`.
 
 ## Constraints
 
 - Fresh clone needs `git submodule update --init --recursive`.
-- Changing the pin can break `darknet-cuda-oxide`; re-run its tests with `-j 1` or `-j 2`.
+- Changing the pin can break `lightnet-cuda-oxide`; re-run its tests with `-j 1` or `-j 2`.
 - The root `Cargo.toml` `[workspace.package]` supplies `authors`, `license` and `repository` that the crates inherit.

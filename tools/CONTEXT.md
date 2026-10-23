@@ -14,7 +14,7 @@ Helper scripts for testing, benchmarking and parity checks.
 | `cargo xtask <cmd>` | Capped `check`, `build`, `clippy`, `test`, `oxide`, `train`, `fmt` wrappers; `cargo xtask help` |
 | `lib_cap.sh` | Sourced by the scripts: `capped <mem> cmd` uses a systemd RAM cap (warns and runs uncapped without a user bus); `oxide_arch_hint` exports the detected GPU arch as `CUDA_OXIDE_DEVICE_ARCH` |
 | `test_host.sh` | CPU test run (`-j 2`) |
-| `test_oxide.sh` | Build and test `darknet-cuda-oxide` through `cargo oxide` |
+| `test_oxide.sh` | Build and test `lightnet-cuda-oxide` through `cargo oxide` |
 | `bench_oxide.sh`, `oxide_bench.py` | cuda-oxide benchmarks; results go to `docs/OXIDE_BENCH.md` |
 | `oxide_parity_data.py`, `oxide_parity_compare.py` | Training-parity run (`docs/OXIDE_BENCH.md` section 8) |
 | `oxide_det_compare.py`, `oxide_map.py` | Detection comparison and mAP for the oxide backend |

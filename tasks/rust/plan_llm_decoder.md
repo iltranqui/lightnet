@@ -6,9 +6,9 @@
 
 **Goal:** Add a trainable decoder-only language model with CPU correctness references, resumable token training, cached generation, resident oxide bf16 training, a reproducible Latin pilot, and separately gated attention/FP8 optimizations.
 
-**Architecture:** Introduce an independent `darknet_lm` crate (new workspace member `src/darknet-lm`) with an API using integer token IDs and contiguous `[batch, time, hidden]` activations. Implement pre-RMSNorm causal GQA blocks with RoPE, SwiGLU, residual connections, sparse next-token cross-entropy, and one shared embedding/output parameter. Keep the existing detector graph, `[transformer]` meaning, and frozen LAYA contracts intact; implement oxide execution against the new decoder contract without host-operation fallbacks.
+**Architecture:** Introduce an independent `lightnet_lm` crate (new workspace member `src/lightnet-lm`) with an API using integer token IDs and contiguous `[batch, time, hidden]` activations. Implement pre-RMSNorm causal GQA blocks with RoPE, SwiGLU, residual connections, sparse next-token cross-entropy, and one shared embedding/output parameter. Keep the existing detector graph, `[transformer]` meaning, and frozen LAYA contracts intact; implement oxide execution against the new decoder contract without host-operation fallbacks.
 
-**Tech Stack:** Existing Rust 2024 workspace and pinned `nightly-2026-08-28`; new `darknet-lm`, plus `darknet-cli`, `darknet-cuda`, and the excluded `darknet-cuda-oxide` bridge. Reuse existing AdamW mathematics and oxide GEMM/precision facilities. Proposed additions are workspace `serde`, `serde_json`, and `sha2` dependencies in `darknet-lm`, plus `unicode-normalization = "0.1"`; the latter dependency and its resolved version are **unverified** until implementation.
+**Tech Stack:** Existing Rust 2024 workspace and pinned `nightly-2026-08-28`; new `lightnet-lm`, plus `lightnet-cli`, `lightnet-cuda`, and the excluded `lightnet-cuda-oxide` bridge. Reuse existing AdamW mathematics and oxide GEMM/precision facilities. Proposed additions are workspace `serde`, `serde_json`, and `sha2` dependencies in `lightnet-lm`, plus `unicode-normalization = "0.1"`; the latter dependency and its resolved version are **unverified** until implementation.
 
 **Spec:** The user-provided scope and staged order, formalized by the contracts below. Intended destination: `tasks/rust/plan_llm_decoder.md`, a proposed file absent during this audit. Repository constraints come from `CLAUDE.md`, `tasks/rust/AGENTS.md`, and the Global Constraints in `tasks/rust/plan_fp16.md`; structure follows `tasks/rust/plan_fp8.md`. `/home/kerrigan/.claude/jobs/c4ec0b42/tmp/llm_latin_gap.md` was read as advisory material and its implementation claims were checked against source.
 
@@ -46,7 +46,7 @@ This document is a read-only implementation plan. No files were changed; no buil
 - Use `cargo xtask` only for checks, builds, tests, formatting, and later authorized execution: `check`, `gpu-check`, `build`, `clippy`, `test`, `oxide`, `fmt`. Never invoke raw Cargo build/test/check commands or `systemd-run` directly.
 - Maximum **4 build threads**, including new commands. One build/test command at a time.
 - Keep `MemoryHigh=3G`; xtask applies the soft cap. Existing runners warn and continue uncapped without a user systemd bus; record that condition rather than claiming a capped run.
-- `src/darknet-cuda-oxide` is **not** a workspace member. Its GPU tests run through `cargo xtask oxide --test <suite>`.
+- `src/lightnet-cuda-oxide` is **not** a workspace member. Its GPU tests run through `cargo xtask oxide --test <suite>`.
 - The current request authorizes planning only. During implementation, normal bounded synthetic tests are permitted; corpus training, tiny-corpus overfit runs, and long benchmarks require a user request.
 - Unknown sections, keys, precision modes, token IDs, and unsupported execution modes return errors. Never silently substitute an identity layer or CPU execution.
 - Backward operations compute exact adjoints of their Rust forward. Sparse CE seeds backward with **target minus prediction**, consistent with existing descent-direction updates.
@@ -77,19 +77,19 @@ This document is a read-only implementation plan. No files were changed; no buil
 | Area | Source checked | Verified finding and planning consequence |
 |---|---|---|
 | Workspace/toolchain | `Cargo.toml`, `rust-toolchain.toml` | Rust edition 2024 and `nightly-2026-08-28`; oxide and cuTile bridges are excluded from the parent workspace. |
-| Vision transformer | `src/darknet-core/src/model.rs` | `SwinSpec` explicitly represents `[swin]`/`[transformer]` windowed attention. Do not reinterpret that configuration as a text decoder. |
-| LAYA | `src/darknet-core/src/laya_encoder.rs`, `src/darknet-core/src/runtime/exec_backward.rs` | Frozen embedding/attention/GeGLU encoder; input IDs are represented as floats in its existing channel-major contract. Its encoder backward arm stops gradient propagation. |
-| CPU transformer primitives | `src/darknet-core/src/vit.rs` | `layer_norm_forward` and `layer_norm_backward` include affine gradients; linear and attention derivatives exist. These are useful references, not a complete trainable causal decoder. |
-| Existing attention | `src/darknet-core/src/vit.rs`, `src/darknet-cuda/src/lib.rs`, `src/darknet-cuda-oxide/src/kernels/layers_extra.rs` | Existing standard flash interfaces use fused equal-width QKV. The inspected oxide forward loops over every key, uses fixed 128-element local arrays, clamps Q/K to ±128, and scores to ±10. New decoder semantics need separate kernels. |
-| GPU training fallback | `src/darknet-core/src/runtime/gpu_backward_support.rs` | `requires_cpu_backward_fallback` includes ViT, Swin, and other attention families. Existing native suboperations do not prove resident decoder training. |
-| Loss direction | `src/darknet-core/src/jev_ce.rs` | `jev_ce_loss` accepts soft targets and writes `(t - probs[idx]) / temperature`. New sparse CE must preserve the descent direction. |
-| AdamW | `src/darknet-cuda/src/host_ops.rs`, `src/darknet-core/src/runtime/param_updates.rs` | `AdamParams` supports decoupled decay; `adam_update` adds the supplied descent direction to weights. Reuse this math with decoder parameter registration. |
-| Existing schedules | `src/darknet-core/src/runtime/exec_accumulate.rs` | `compute_learning_rate` is batch/iteration based, including burn-in and SGDR. Token-count warmup/cosine needs its own explicit contract. |
-| Training data | `src/darknet-core/src/train.rs` | Inspected training batches own images and detector labels. Introduce a separate token loader. |
-| Checkpoints | `src/darknet-core/src/weights.rs`, `src/darknet-core/src/runtime/exec_core.rs` | Legacy f32 `.weights` and DNOPT optimizer state exist. They do not define the proposed decoder’s tokenizer, packing cursor, RNG, or token schedule state. |
-| Precision | `src/darknet-cuda-oxide/src/mixed.rs`, `src/darknet-cuda-oxide/src/half.rs`, `src/darknet-cuda-oxide/src/lib.rs` | `HalfFormat` includes f16/bf16; convolution AMP, selected half operations, and FP8 GEMM facilities exist. “Only GEMM and convolution support reduced precision” is too broad: selected other operations also support it. Resident transformer training remains unestablished. |
-| Oxide dependency boundary | `src/darknet-cuda-oxide/Cargo.toml` | `darknet-core` is currently a **dev-dependency**. The decoder types live in `darknet-lm`, so the bridge needs `darknet-lm` as a normal dependency (explicit manifest change); it does not need `darknet-core`. |
-| cuTile integration | `src/darknet-cuda-cutile/Cargo.toml`, `src/darknet-cuda-cutile/src/ops_elementwise.rs`, `src/darknet-cuda/src/lib.rs` | The adapter does not depend on `cutile-kernels`; inspected activation matches omit current enum variants. Buildability is unverified. |
+| Vision transformer | `src/lightnet-core/src/model.rs` | `SwinSpec` explicitly represents `[swin]`/`[transformer]` windowed attention. Do not reinterpret that configuration as a text decoder. |
+| LAYA | `src/lightnet-core/src/laya_encoder.rs`, `src/lightnet-core/src/runtime/exec_backward.rs` | Frozen embedding/attention/GeGLU encoder; input IDs are represented as floats in its existing channel-major contract. Its encoder backward arm stops gradient propagation. |
+| CPU transformer primitives | `src/lightnet-core/src/vit.rs` | `layer_norm_forward` and `layer_norm_backward` include affine gradients; linear and attention derivatives exist. These are useful references, not a complete trainable causal decoder. |
+| Existing attention | `src/lightnet-core/src/vit.rs`, `src/lightnet-cuda/src/lib.rs`, `src/lightnet-cuda-oxide/src/kernels/layers_extra.rs` | Existing standard flash interfaces use fused equal-width QKV. The inspected oxide forward loops over every key, uses fixed 128-element local arrays, clamps Q/K to ±128, and scores to ±10. New decoder semantics need separate kernels. |
+| GPU training fallback | `src/lightnet-core/src/runtime/gpu_backward_support.rs` | `requires_cpu_backward_fallback` includes ViT, Swin, and other attention families. Existing native suboperations do not prove resident decoder training. |
+| Loss direction | `src/lightnet-core/src/jev_ce.rs` | `jev_ce_loss` accepts soft targets and writes `(t - probs[idx]) / temperature`. New sparse CE must preserve the descent direction. |
+| AdamW | `src/lightnet-cuda/src/host_ops.rs`, `src/lightnet-core/src/runtime/param_updates.rs` | `AdamParams` supports decoupled decay; `adam_update` adds the supplied descent direction to weights. Reuse this math with decoder parameter registration. |
+| Existing schedules | `src/lightnet-core/src/runtime/exec_accumulate.rs` | `compute_learning_rate` is batch/iteration based, including burn-in and SGDR. Token-count warmup/cosine needs its own explicit contract. |
+| Training data | `src/lightnet-core/src/train.rs` | Inspected training batches own images and detector labels. Introduce a separate token loader. |
+| Checkpoints | `src/lightnet-core/src/weights.rs`, `src/lightnet-core/src/runtime/exec_core.rs` | Legacy f32 `.weights` and DNOPT optimizer state exist. They do not define the proposed decoder’s tokenizer, packing cursor, RNG, or token schedule state. |
+| Precision | `src/lightnet-cuda-oxide/src/mixed.rs`, `src/lightnet-cuda-oxide/src/half.rs`, `src/lightnet-cuda-oxide/src/lib.rs` | `HalfFormat` includes f16/bf16; convolution AMP, selected half operations, and FP8 GEMM facilities exist. “Only GEMM and convolution support reduced precision” is too broad: selected other operations also support it. Resident transformer training remains unestablished. |
+| Oxide dependency boundary | `src/lightnet-cuda-oxide/Cargo.toml` | `lightnet-core` is currently a **dev-dependency**. The decoder types live in `lightnet-lm`, so the bridge needs `lightnet-lm` as a normal dependency (explicit manifest change); it does not need `lightnet-core`. |
+| cuTile integration | `src/lightnet-cuda-cutile/Cargo.toml`, `src/lightnet-cuda-cutile/src/ops_elementwise.rs`, `src/lightnet-cuda/src/lib.rs` | The adapter does not depend on `cutile-kernels`; inspected activation matches omit current enum variants. Buildability is unverified. |
 | Vendored cuTile assets | `src/cutile-rs-aot/cutile-kernels/src/{attention,embeddings,norms,positional,kv_cache,pointwise,argmax}.rs` | Forward source exists for embedding, RMSNorm, RoPE, causal/GQA attention, cache writes, gating, and head reduction. RoPE uses split halves; one inspected cache-write entry assumes position zero. Wrappers must respect those contracts. |
 | Runner | `xtask/src/main.rs`, `tools/test_oxide.sh`, `tools/lib_cap.sh` | Existing xtask enforces the thread ceiling and wraps normal checks; oxide tests use the special codegen runner. No generic LM execution or cuTile command currently exists. |
 
@@ -130,7 +130,7 @@ lightnet/
 │   ├── todo.md                                    [existing]
 │   └── version-map.tsv                             [existing]
 ├── src/
-│   ├── darknet-core/
+│   ├── lightnet-core/
 │   │   ├── Cargo.toml                              [existing]
 │   │   ├── CONTEXT.md                              [existing]
 │   │   ├── src/
@@ -150,10 +150,10 @@ lightnet/
 │   │   │   │   ├── exec_accumulate.rs              [existing; reference only]
 │   │   │   │   ├── gpu_backward_support.rs         [existing; reference only]
 │   │   │   │   └── param_updates.rs                [existing; reference only]
-│   │   │   └── (no change: decoder code lives in darknet-lm)
+│   │   │   └── (no change: decoder code lives in lightnet-lm)
 │   │   └── (tests unchanged)
-│   ├── darknet-lm/                                 [new crate, workspace member]
-│   │   ├── Cargo.toml                              deps: darknet-cuda (AdamW), serde, serde_json, sha2, unicode-normalization
+│   ├── lightnet-lm/                                 [new crate, workspace member]
+│   │   ├── Cargo.toml                              deps: lightnet-cuda (AdamW), serde, serde_json, sha2, unicode-normalization
 │   │   ├── CONTEXT.md                              crate map
 │   │   ├── src/
 │   │   │   ├── lib.rs                              public exports
@@ -171,17 +171,17 @@ lightnet/
 │   │   │   ├── sampling.rs                         deterministic token sampling
 │   │   │   └── eval.rs                             loss/byte and diagnostics
 │   │   └── tests/                                  lm_contract, lm_tokenizer, lm_ops, lm_decoder, lm_data, lm_train, lm_generate, lm_eval
-│   ├── darknet-cli/
+│   ├── lightnet-cli/
 │   │   ├── Cargo.toml                              [existing]
 │   │   ├── CONTEXT.md                              [existing]
 │   │   └── src/
 │   │       ├── main.rs                             [existing]
 │   │       └── lm.rs                               [new; CLI and inline tests]
-│   ├── darknet-cuda/
+│   ├── lightnet-cuda/
 │   │   └── src/
 │   │       ├── lib.rs                              [existing; reference only]
 │   │       └── host_ops.rs                          [existing; reuse AdamW]
-│   ├── darknet-cuda-oxide/
+│   ├── lightnet-cuda-oxide/
 │   │   ├── Cargo.toml                              [existing]
 │   │   ├── CONTEXT.md                              [existing]
 │   │   ├── src/
@@ -200,7 +200,7 @@ lightnet/
 │   │       ├── oxide_lm_train.rs                   [new]
 │   │       ├── oxide_lm_flash.rs                   [new]
 │   │       └── oxide_lm_fp8.rs                     [new]
-│   ├── darknet-cuda-cutile/
+│   ├── lightnet-cuda-cutile/
 │   │   ├── Cargo.toml                              [existing; optional]
 │   │   └── src/
 │   │       ├── lib.rs                              [existing; optional]
@@ -249,8 +249,8 @@ lightnet/
 
 **Files:**
 
-- Create: `src/darknet-lm/src/{lib,config,types}.rs`, `src/darknet-lm/tests/lm_contract.rs`, `cfg/llm_smoke.cfg`.
-- Modify: `Cargo.toml` (workspace member `src/darknet-lm`), `src/darknet-lm/Cargo.toml`, `Cargo.lock`.
+- Create: `src/lightnet-lm/src/{lib,config,types}.rs`, `src/lightnet-lm/tests/lm_contract.rs`, `cfg/llm_smoke.cfg`.
+- Modify: `Cargo.toml` (workspace member `src/lightnet-lm`), `src/lightnet-lm/Cargo.toml`, `Cargo.lock`.
 - Common version files from Global Constraints.
 
 **Interfaces:**
@@ -274,15 +274,15 @@ lightnet/
 - [ ] **Step 1: Write contract tests.** `lm_contract_accepts_smoke_geometry` asserts the exact parsed fields; `lm_contract_rejects_invalid_geometry` rejects zero dimensions, odd head dimension, invalid head ratios, NaN epsilon, and overflow; `lm_contract_rejects_unknown_options` rejects a misspelled key and `[transformer]`; `lm_contract_validates_integer_batches` rejects mismatched lengths, out-of-range IDs/targets, invalid positions, and sequence length above context.
 - [ ] **Step 2: Run** `cargo xtask test lm_contract_`. Expect missing-module/API failures; confirm the intended tests are selected once compilation succeeds.
 - [ ] **Step 3: Implement** the interfaces, strict section/key validation, checked allocation arithmetic, and smoke cfg. Keep legacy model parsing untouched.
-- [ ] **Step 4: Run** `cargo xtask test lm_contract_`, then `cargo xtask check darknet-lm`, sequentially. Expect all named tests to pass and check exit status zero.
+- [ ] **Step 4: Run** `cargo xtask test lm_contract_`, then `cargo xtask check lightnet-lm`, sequentially. Expect all named tests to pass and check exit status zero.
 - [ ] **Step 5: Record evidence and commit/tag** the named files as `v0.M.NNN: define decoder token and configuration contracts`.
 
 ### Task 2: Byte-fallback BPE and normalization
 
 **Files:**
 
-- Create: `src/darknet-lm/src/tokenizer.rs`, `src/darknet-lm/tests/lm_tokenizer.rs`, `tasks/rust/llm_data.md`.
-- Modify: `src/darknet-lm/src/lib.rs`, `src/darknet-lm/Cargo.toml`, `Cargo.lock`.
+- Create: `src/lightnet-lm/src/tokenizer.rs`, `src/lightnet-lm/tests/lm_tokenizer.rs`, `tasks/rust/llm_data.md`.
+- Modify: `src/lightnet-lm/src/lib.rs`, `src/lightnet-lm/Cargo.toml`, `Cargo.lock`.
 - Common version files.
 
 **Interfaces:**
@@ -305,15 +305,15 @@ lightnet/
 - [ ] **Step 1: Write tokenizer tests.** `lm_tokenizer_roundtrips_bytes` covers all 256 byte tokens; `lm_tokenizer_preserves_unicode` roundtrips normalized Latin, Greek, combining marks, emoji, and unseen characters; `lm_tokenizer_latin_policy` asserts `"VJV æ œ" → "UIU ae oe"` with folding and NFC composition; `lm_tokenizer_deterministic_merges` asserts identical artifacts under repeated training and document-order permutation; `lm_tokenizer_rejects_corrupt_artifacts` rejects forward merge references, duplicate IDs, and unknown versions; `lm_tokenizer_special_literals_are_text` asserts literal marker text creates no BOS/EOS.
 - [ ] **Step 2: Run** `cargo xtask test lm_tokenizer_`. Expect missing tokenizer APIs.
 - [ ] **Step 3: Implement** the tokenizer and canonical serialization. Add the proposed dependencies, lock their resolution, and document a bounded, explicitly selected tokenizer-training sample rather than loading an entire general corpus into RAM.
-- [ ] **Step 4: Run** `cargo xtask test lm_tokenizer_`, then `cargo xtask check darknet-lm`. Expect all assertions to pass; saved/reloaded hash must match.
+- [ ] **Step 4: Run** `cargo xtask test lm_tokenizer_`, then `cargo xtask check lightnet-lm`. Expect all assertions to pass; saved/reloaded hash must match.
 - [ ] **Step 5: Record evidence and commit/tag** as `v0.M.NNN: add reproducible byte fallback BPE`.
 
 ### Task 3: CPU differentiable decoder operations
 
 **Files:**
 
-- Create: `src/darknet-lm/src/{ops,attention}.rs`, `src/darknet-lm/tests/lm_ops.rs`.
-- Modify: `src/darknet-lm/src/lib.rs`.
+- Create: `src/lightnet-lm/src/{ops,attention}.rs`, `src/lightnet-lm/tests/lm_ops.rs`.
+- Modify: `src/lightnet-lm/src/lib.rs`.
 - Common version files.
 
 **Interfaces:**
@@ -346,8 +346,8 @@ lightnet/
 
 **Files:**
 
-- Create: `src/darknet-lm/src/decoder.rs`, `src/darknet-lm/tests/lm_decoder.rs`.
-- Modify: `src/darknet-lm/src/{lib,types}.rs`.
+- Create: `src/lightnet-lm/src/decoder.rs`, `src/lightnet-lm/tests/lm_decoder.rs`.
+- Modify: `src/lightnet-lm/src/{lib,types}.rs`.
 - Common version files.
 
 **Interfaces:**
@@ -379,8 +379,8 @@ lightnet/
 
 **Files:**
 
-- Create: `src/darknet-lm/src/data.rs`, `src/darknet-lm/tests/lm_data.rs`.
-- Modify: `src/darknet-lm/src/lib.rs`, `tasks/rust/llm_data.md`.
+- Create: `src/lightnet-lm/src/data.rs`, `src/lightnet-lm/tests/lm_data.rs`.
+- Modify: `src/lightnet-lm/src/lib.rs`, `tasks/rust/llm_data.md`.
 - Common version files.
 
 **Interfaces:**
@@ -411,13 +411,13 @@ lightnet/
 
 **Files:**
 
-- Create: `src/darknet-lm/src/{optim,train,checkpoint}.rs`, `src/darknet-lm/tests/lm_train.rs`, `src/darknet-cli/src/lm.rs`.
-- Modify: `src/darknet-lm/src/{lib,types}.rs`, `src/darknet-cli/src/main.rs`, `xtask/src/main.rs`, `CLAUDE.md`.
+- Create: `src/lightnet-lm/src/{optim,train,checkpoint}.rs`, `src/lightnet-lm/tests/lm_train.rs`, `src/lightnet-cli/src/lm.rs`.
+- Modify: `src/lightnet-lm/src/{lib,types}.rs`, `src/lightnet-cli/src/main.rs`, `xtask/src/main.rs`, `CLAUDE.md`.
 - Common version files.
 
 **Interfaces:**
 
-- Consumes: CPU decoder, shard loader, unique parameter registry, existing `darknet_cuda::host_ops::adam_update` and `AdamParams`.
+- Consumes: CPU decoder, shard loader, unique parameter registry, existing `lightnet_cuda::host_ops::adam_update` and `AdamParams`.
 - Produces:
   - `TokenSchedule { warmup_tokens: u64, total_tokens: u64, peak_lr: f64, min_lr: f64 }`.
   - `TokenSchedule::lr(&self, updated_tokens: u64) -> Result<f32>`.
@@ -447,15 +447,15 @@ lightnet/
 - [ ] **Step 3: Add failure/CLI tests.** `lm_train_rejects_nonfinite_atomically` injects NaN into a norm-scale gradient and asserts all parameters/moments/counters remain unchanged; `lm_train_all_ignored_no_step` asserts no update; `lm_train_step_overflow` rejects advancement beyond `u32::MAX`; inline `lm_cli_*` tests assert strict subcommand/flag parsing and reject training options on evaluation commands.
 - [ ] **Step 4: Run** `cargo xtask test lm_train_`, then `cargo xtask test lm_cli_`. Expect missing trainer/checkpoint/CLI APIs.
 - [ ] **Step 5: Implement** training, snapshot validation/publication, and thin CLI commands for tokenizer, shard preparation, CPU train, and resume. An incomplete checkpoint must never replace a valid checkpoint.
-- [ ] **Step 6: Run** the two filters again, then `cargo xtask check darknet-cli`, sequentially. Expect all named tests to pass and check exit status zero.
+- [ ] **Step 6: Run** the two filters again, then `cargo xtask check lightnet-cli`, sequentially. Expect all named tests to pass and check exit status zero.
 - [ ] **Step 7: Record evidence and commit/tag** as `v0.M.NNN: add token training and exact CPU checkpoint resume`. Keep any corpus-overfit demonstration explicitly user-gated.
 
 ### Task 7: CPU KV-cache and sampling
 
 **Files:**
 
-- Create: `src/darknet-lm/src/{cache,sampling}.rs`, `src/darknet-lm/tests/lm_generate.rs`.
-- Modify: `src/darknet-lm/src/{lib,decoder}.rs`, `src/darknet-cli/src/lm.rs`.
+- Create: `src/lightnet-lm/src/{cache,sampling}.rs`, `src/lightnet-lm/tests/lm_generate.rs`.
+- Modify: `src/lightnet-lm/src/{lib,decoder}.rs`, `src/lightnet-cli/src/lm.rs`.
 - Common version files.
 
 **Interfaces:**
@@ -485,8 +485,8 @@ lightnet/
 
 **Files:**
 
-- Create: `src/darknet-cuda-oxide/src/lm.rs`, `src/darknet-cuda-oxide/src/kernels/lm.rs`, `src/darknet-cuda-oxide/tests/oxide_lm_forward.rs`.
-- Modify: `src/darknet-cuda-oxide/Cargo.toml`, `src/darknet-cuda-oxide/src/lib.rs`, `src/darknet-cuda-oxide/src/kernels/mod.rs`.
+- Create: `src/lightnet-cuda-oxide/src/lm.rs`, `src/lightnet-cuda-oxide/src/kernels/lm.rs`, `src/lightnet-cuda-oxide/tests/oxide_lm_forward.rs`.
+- Modify: `src/lightnet-cuda-oxide/Cargo.toml`, `src/lightnet-cuda-oxide/src/lib.rs`, `src/lightnet-cuda-oxide/src/kernels/mod.rs`.
 - Common version files.
 
 **Interfaces:**
@@ -498,7 +498,7 @@ lightnet/
   - `OxideDecoder::download_logits(&self, forward: &DeviceDecoderForward) -> Result<Vec<f32>>`.
   - `OxideDecoder::transfer_stats(&self) -> LmTransferStats`.
   - `LmTransferStats { host_to_device_bytes: u64, device_to_host_bytes: u64 }`.
-- Add `darknet-lm` as a normal dependency of the excluded bridge. `darknet-lm` does not depend on oxide or `darknet-core`.
+- Add `lightnet-lm` as a normal dependency of the excluded bridge. `lightnet-lm` does not depend on oxide or `lightnet-core`.
 - `DeviceDecoderForward` owns logits and backward intermediates on device. Use bf16 working weights/activations, f32 master weights, and f32 normalization/softmax reductions.
 - Implement native embedding, RMSNorm, RoPE, SwiGLU, residual/dropout, tied head, and baseline causal GQA. An initially quadratic attention workspace is permitted and reported explicitly.
 - Transfer counters cover every LM-owned transfer, including explicit readback APIs. No trait host defaults are used.
@@ -515,8 +515,8 @@ lightnet/
 
 **Files:**
 
-- Create: `src/darknet-cuda-oxide/tests/oxide_lm_train.rs`.
-- Modify: `src/darknet-cuda-oxide/src/lm.rs`, `src/darknet-cuda-oxide/src/kernels/lm.rs`, `src/darknet-cli/src/lm.rs`, `xtask/src/main.rs`, `CLAUDE.md`.
+- Create: `src/lightnet-cuda-oxide/tests/oxide_lm_train.rs`.
+- Modify: `src/lightnet-cuda-oxide/src/lm.rs`, `src/lightnet-cuda-oxide/src/kernels/lm.rs`, `src/lightnet-cli/src/lm.rs`, `xtask/src/main.rs`, `CLAUDE.md`.
 - Common version files.
 
 **Interfaces:**
@@ -543,8 +543,8 @@ lightnet/
 
 **Files:**
 
-- Create: `cfg/llm_latin.cfg`, `src/darknet-lm/src/eval.rs`, `src/darknet-lm/tests/lm_eval.rs`, `tasks/rust/llm_eval.md`.
-- Modify: `src/darknet-lm/src/{lib,data}.rs`, `src/darknet-cli/src/lm.rs`, `tasks/rust/llm_data.md`.
+- Create: `cfg/llm_latin.cfg`, `src/lightnet-lm/src/eval.rs`, `src/lightnet-lm/tests/lm_eval.rs`, `tasks/rust/llm_eval.md`.
+- Modify: `src/lightnet-lm/src/{lib,data}.rs`, `src/lightnet-cli/src/lm.rs`, `tasks/rust/llm_data.md`.
 - Common version files.
 
 **Interfaces:**
@@ -584,8 +584,8 @@ Split by whole work before tokenizer fitting or shard construction. Group altern
 
 **Files:**
 
-- Create: `src/darknet-cuda-oxide/tests/oxide_lm_flash.rs`.
-- Modify: `src/darknet-cuda-oxide/src/lm.rs`, `src/darknet-cuda-oxide/src/kernels/lm.rs`, `tasks/rust/llm_eval.md`.
+- Create: `src/lightnet-cuda-oxide/tests/oxide_lm_flash.rs`.
+- Modify: `src/lightnet-cuda-oxide/src/lm.rs`, `src/lightnet-cuda-oxide/src/kernels/lm.rs`, `tasks/rust/llm_eval.md`.
 - Common version files.
 
 **Interfaces:**
@@ -614,8 +614,8 @@ Split by whole work before tokenizer fitting or shard construction. Group altern
 
 **Files:**
 
-- Create: `src/darknet-cuda-oxide/tests/oxide_lm_fp8.rs`.
-- Modify: `src/darknet-cuda-oxide/src/lm.rs`, `src/darknet-cuda-oxide/src/kernels/lm.rs`, `src/darknet-lm/src/checkpoint.rs`, `src/darknet-cli/src/lm.rs`, `tasks/rust/llm_eval.md`.
+- Create: `src/lightnet-cuda-oxide/tests/oxide_lm_fp8.rs`.
+- Modify: `src/lightnet-cuda-oxide/src/lm.rs`, `src/lightnet-cuda-oxide/src/kernels/lm.rs`, `src/lightnet-lm/src/checkpoint.rs`, `src/lightnet-cli/src/lm.rs`, `tasks/rust/llm_eval.md`.
 - Common version files.
 
 **Interfaces:**
@@ -643,8 +643,8 @@ Split by whole work before tokenizer fitting or shard construction. Group altern
 
 **Files:**
 
-- Create: `src/darknet-cuda-cutile/src/lm.rs`.
-- Modify: `src/darknet-cuda-cutile/Cargo.toml`, `src/darknet-cuda-cutile/src/lib.rs`, `src/darknet-cuda-cutile/src/ops_elementwise.rs`, `xtask/src/main.rs`, `CLAUDE.md`.
+- Create: `src/lightnet-cuda-cutile/src/lm.rs`.
+- Modify: `src/lightnet-cuda-cutile/Cargo.toml`, `src/lightnet-cuda-cutile/src/lib.rs`, `src/lightnet-cuda-cutile/src/ops_elementwise.rs`, `xtask/src/main.rs`, `CLAUDE.md`.
 - Common version files.
 - Reuse vendored kernels without editing their source.
 

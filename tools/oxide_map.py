@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate darknet-rs detector output with Darknet detector-map AP semantics."""
+"""Evaluate lightnet-rs detector output with Darknet detector-map AP semantics."""
 
 from __future__ import annotations
 
@@ -92,10 +92,10 @@ def main() -> int:
     parser.add_argument("--weights", type=Path, required=True)
     parser.add_argument("--names", type=Path, required=True)
     parser.add_argument("--valid", type=Path, required=True)
-    parser.add_argument("--binary", type=Path, default=Path("target/debug/darknet-rs"))
+    parser.add_argument("--binary", type=Path, default=Path("target/debug/lightnet-rs"))
     parser.add_argument(
         "--detections-json", type=Path,
-        help="reuse Darknet detector-test JSON instead of running darknet-rs",
+        help="reuse Darknet detector-test JSON instead of running lightnet-rs",
     )
     parser.add_argument("--backend", choices=("cpu", "oxide"), default="cpu")
     parser.add_argument("--gemm", choices=("fp32", "tf32", "fp16", "auto"), default="fp32")
@@ -116,9 +116,9 @@ def main() -> int:
     ]
 
     env = os.environ.copy()
-    env["DARKNET_BACKEND"] = args.backend
-    env["DARKNET_OXIDE_GEMM"] = args.gemm
-    env["DARKNET_DETECT_TSV"] = "1"
+    env["LIGHTNET_BACKEND"] = args.backend
+    env["LIGHTNET_OXIDE_GEMM"] = args.gemm
+    env["LIGHTNET_DETECT_TSV"] = "1"
     json_by_image: dict[Path, list[dict]] = {}
     if args.detections_json:
         json_by_image = {

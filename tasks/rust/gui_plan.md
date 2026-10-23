@@ -1,4 +1,4 @@
-# darknet-gui (egui, DarkMark replacement) Implementation Plan
+# lightnet-gui (egui, DarkMark replacement) Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -21,7 +21,7 @@ install).
 
 **Goal:** A desktop app in Rust that replaces DarkMark's detector-mode labeling: open or create a project, edit boxes with every DarkMark detector hotkey, edit classes, and overlay predictions from the Rust port.
 
-**Architecture:** Three crates. `darknet-gui-project` (pure logic, no UI, fully unit-tested), `darknet-gui-engine` (spawns `darknet-rs detect-server` as a child process, JSON lines), `darknet-gui` (eframe/egui shell, `glow` renderer). Files on disk are byte-compatible with DarkMark so both tools can share a project.
+**Architecture:** Three crates. `lightnet-gui-project` (pure logic, no UI, fully unit-tested), `lightnet-gui-engine` (spawns `lightnet-rs detect-server` as a child process, JSON lines), `lightnet-gui` (eframe/egui shell, `glow` renderer). Files on disk are byte-compatible with DarkMark so both tools can share a project.
 
 **Tech Stack:** Rust nightly-2026-08-28, edition 2024; `eframe`/`egui` with the `glow` feature only (pin an exact version at least 2 weeks old, verify on crates.io in Task 0.1); `serde`, `serde_json` (no `preserve_order`), `image`, `imageproc` (Canny only), `tempfile` (dev).
 
@@ -45,8 +45,8 @@ install).
 
 ## Global Constraints
 
-- Builds: max 4 threads (`-j 2`), `MEM=3G` / `systemd-run --user --scope -p MemoryHigh=3G`, one cargo command at a time. Pure crates: `MEM=3G cargo test -j 2 -p darknet-gui-project`.
-- `darknet-gui-project` and `darknet-gui-engine` are default workspace members; `darknet-gui` is opt-in (`-p darknet-gui`, not in `default-members`).
+- Builds: max 4 threads (`-j 2`), `MEM=3G` / `systemd-run --user --scope -p MemoryHigh=3G`, one cargo command at a time. Pure crates: `MEM=3G cargo test -j 2 -p lightnet-gui-project`.
+- `lightnet-gui-project` and `lightnet-gui-engine` are default workspace members; `lightnet-gui` is opt-in (`-p lightnet-gui`, not in `default-members`).
 - Detector mode only. Non-detector JSON (string or integer `annotation_mode`, kinds `obb`/`segmentor`/`cuboid`) errors and is never overwritten (G6, D3). Unknown JSON fields survive a round trip.
 - Model files come from the project dir (cfg, weights, `.names`). GUI settings live in a separate GUI-owned file; nothing shared with DarkMark's config.
 - Designed for 50,000 images per project: lazy decode, LRU image cache, annotation-count index built on load, no SQLite.
@@ -69,7 +69,7 @@ In v1: draw/move/resize, class keys, zoom/pan, navigation, sort, filters (regex,
 ## File Structure
 
 ```
-src/darknet-gui-project/src/
+src/lightnet-gui-project/src/
   annotation.rs   NormRect, Mark, Annotation; JSON IO; delete-vs-write rules   (T1.1)
   yolo.rs         .txt export, 10 decimals                                      (T1.2)
   project.rs      DataFile, Project load, image scan, mark index, validation    (T1.2)
@@ -81,27 +81,27 @@ src/darknet-gui-project/src/
   actions.rs      snap, nudge, scale, copy, clipboard, interpolate, homography  (T3.2)
   create.rs       create_project (writes .names/.data/.cfg refs)                (T4.1)
   classes.rs      ClassEdit, plan_remap, apply_remap (atomic, backup)           (T5.1)
-src/darknet-gui-engine/src/
+src/lightnet-gui-engine/src/
   detect_worker.rs  spawn detect-server, request/response JSON lines            (T6.2)
-src/darknet-gui/src/
+src/lightnet-gui/src/
   main.rs app.rs canvas.rs cache.rs views.rs launcher.rs settings.rs
-src/darknet-cli/src/main.rs     `detect-server` arm                              (T6.1)
+src/lightnet-cli/src/main.rs     `detect-server` arm                              (T6.1)
 ```
 
-Tests: one integration file per module under each crate's `tests/`; fixtures in `src/darknet-gui-project/tests/fixtures/` (copy a real LegoGears_v2 `.json`/`.txt` pair).
+Tests: one integration file per module under each crate's `tests/`; fixtures in `src/lightnet-gui-project/tests/fixtures/` (copy a real LegoGears_v2 `.json`/`.txt` pair).
 
 ## M0 — WSLg spike
 
 ### Task 0.1: Window opens and draws an image with a box
 
-**Files:** Create `src/darknet-gui/{Cargo.toml,src/main.rs}`; modify root `Cargo.toml` (add members, keep `darknet-gui` out of `default-members`).
+**Files:** Create `src/lightnet-gui/{Cargo.toml,src/main.rs}`; modify root `Cargo.toml` (add members, keep `lightnet-gui` out of `default-members`).
 
-**Produces:** a window showing a PNG texture and one rectangle, run via `cargo run -p darknet-gui -j 2`.
+**Produces:** a window showing a PNG texture and one rectangle, run via `cargo run -p lightnet-gui -j 2`.
 
 - [ ] **Step 1:** Look up the newest `eframe` release at least 2 weeks old; pin it exactly with `default-features = false, features = ["glow", "default_fonts"]`.
 - [ ] **Step 2:** Implement `main()` that loads `sample.png` as an egui texture and paints one `Rect` outline.
-- [ ] **Step 3:** `MEM=3G cargo run -p darknet-gui -j 2`. Pass = window appears, image and box visible, pan by drag works. Fail = record the error; fallback order: `LIBGL_ALWAYS_SOFTWARE=1`, then a native Windows build, then ask the user.
-- [ ] **Step 4:** Record result and RSS in `STATUS.md`; commit `Cargo.toml` and `src/darknet-gui`.
+- [ ] **Step 3:** `MEM=3G cargo run -p lightnet-gui -j 2`. Pass = window appears, image and box visible, pan by drag works. Fail = record the error; fallback order: `LIBGL_ALWAYS_SOFTWARE=1`, then a native Windows build, then ask the user.
+- [ ] **Step 4:** Record result and RSS in `STATUS.md`; commit `Cargo.toml` and `src/lightnet-gui`.
 
 ## M1 — Pure crates: files, filters, undo
 
@@ -160,12 +160,12 @@ Tests: one integration file per module under each crate's `tests/`; fixtures in 
 
 ### Task 2.2: egui canvas, image cache, save policy
 
-**Files:** Create `canvas.rs`, `cache.rs`, `app.rs` in `darknet-gui`.
+**Files:** Create `canvas.rs`, `cache.rs`, `app.rs` in `lightnet-gui`.
 
 **Produces:** `ImageCache::get(&mut self, path) -> TextureHandle` (LRU, 64 images or 1 GiB decoded), canvas with zoom (`+`/`-` 10%, wheel), Ctrl-drag pan, SPACE auto/manual zoom; save on image change, close, Ctrl+Shift+S, with an unsaved indicator (G8, D12).
 
 - [ ] **Step 1:** Unit-test `ImageCache` eviction (`evicts_least_recently_used_over_budget`) with fake loaders.
-- [ ] **Step 2:** Implement canvas and wire `Editor`; run `cargo run -p darknet-gui -j 2`.
+- [ ] **Step 2:** Implement canvas and wire `Editor`; run `cargo run -p lightnet-gui -j 2`.
 - [ ] **Step 3:** Manual smoke by the user: label 5 images on a real project, quit, reload; compare with real DarkMark (Task 1.5 diff again). Commit.
 
 ## M3 — Remaining hotkeys and views
@@ -190,7 +190,7 @@ Tests: one integration file per module under each crate's `tests/`; fixtures in 
 
 ### Task 3.3: View toggles and screenshot
 
-**Files:** Create `views.rs` in `darknet-gui`.
+**Files:** Create `views.rs` in `lightnet-gui`.
 
 - [ ] **Step 1:** Implement B&W, Canny (`imageproc::edges::canny`), dot, bold, shade, label modes, zoom-review, screenshot save. Display-only: never write to the image on disk.
 - [ ] **Step 2:** Unit-test the pure image transforms (`bw_is_luma`, `canny_marks_a_step_edge`); manual smoke for the rest. Commit.
@@ -232,9 +232,9 @@ Tests: one integration file per module under each crate's `tests/`; fixtures in 
 
 ### Task 6.1: `detect-server` in the CLI
 
-**Files:** Modify `src/darknet-cli/src/main.rs` (new arm); test in `src/darknet-cli/tests/`.
+**Files:** Modify `src/lightnet-cli/src/main.rs` (new arm); test in `src/lightnet-cli/tests/`.
 
-**Produces:** `darknet-rs detect-server <cfg> <weights>`: reads `{"image": "<path>", "thresh": f32}` lines on stdin, writes `{"boxes":[{"class":usize,"conf":f32,"cx":f32,"cy":f32,"w":f32,"h":f32}]}` per request, honours `DARKNET_BACKEND=cpu|oxide`; decodes modern heads.
+**Produces:** `lightnet-rs detect-server <cfg> <weights>`: reads `{"image": "<path>", "thresh": f32}` lines on stdin, writes `{"boxes":[{"class":usize,"conf":f32,"cx":f32,"cy":f32,"w":f32,"h":f32}]}` per request, honours `LIGHTNET_BACKEND=cpu|oxide`; decodes modern heads.
 
 - [ ] **Step 1:** Test: `detect_server_answers_one_request_per_line` with a tiny cfg on the CPU backend; `malformed_line_returns_error_object_and_continues`.
 - [ ] **Step 2:** Run FAIL, implement, PASS (`MEM=3G ./tools/test_host.sh detect_server`). Commit.

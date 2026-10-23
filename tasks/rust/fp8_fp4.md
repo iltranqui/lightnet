@@ -15,7 +15,7 @@ Approved 2026-10-02. Branch `rust`.
   - [Phase D after kernel tuning (2026-10-23)](#phase-d-after-kernel-tuning-2026-10-23)
 
 ## Context
-`bridges/darknet-cuda-oxide` has TF32 (`gemm_mma.rs`) and FP16/BF16 (`gemm_f16.rs`) mma GEMMs, but no FP8/FP4. Findings:
+`bridges/lightnet-cuda-oxide` has TF32 (`gemm_mma.rs`) and FP16/BF16 (`gemm_f16.rs`) mma GEMMs, but no FP8/FP4. Findings:
 - `crates/cuda-device/src/generated/register_mma.rs` already exposes dense FP8 mma, "Requires PTX 8.7 and `sm_89+`", two shapes (verified 2026-10-02):
   - **k32 (use this):** `mma_m16n8k32_fp8_{f16,f32}_{e4m3,e5m2}_{e4m3,e5m2}` (lines ~1171-1283) -> `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`; A=[u32;4], B=[u32;2], C=[f32;4] (f16 acc: C=[u32;2]). Same fragment shape as the existing `mma_m16n8k32_s32_s8` in wmma.rs, so int8 layout code is the template.
   - k16: `mma_m16n8k16_fp8_*` (A=[u32;2], B=u32) - fallback only.
@@ -39,8 +39,8 @@ darknet/
 │   │   ├── generated/convert.rs        # e4m3/e5m2 cvt (exists)
 │   │   ├── wmma.rs                     # f16/bf16/tf32/s8 mma (exists)
 │   │   └── dotprod.rs                  # dp4a (exists)
-│   └── darknet-core/                   # F32TensorOpsBackend trait, runtime.rs
-├── bridges/darknet-cuda-oxide/
+│   └── lightnet-core/                   # F32TensorOpsBackend trait, runtime.rs
+├── bridges/lightnet-cuda-oxide/
 │   ├── src/
 │   │   ├── lib.rs                      # backend; dispatches gemm_mma / gemm_f16 (EDIT)
 │   │   ├── conv.rs, mixed.rs           # conv->GEMM callers (EDIT, later)
@@ -64,7 +64,7 @@ darknet/
 | `kernels/gemm_f8.rs` | row-major NN/NT/TN/TT batched GEMM, FP8 in, FP32 acc, epilogue applies sA*sB, writes f32 (or f16) | `mma_m16n8k32_fp8_f32_*`, cp.async, smem; used by backend | k32 fragments with 1-byte elems (A 4 regs, B 2 regs; same layout as the s8 k32 mma): `ldmatrix` is b16-based, may need manual smem loads or ldmatrix + repack; K tile multiple of 32; TN/TT need transpose path |
 | `kernels/quant_fp4.rs` | pack E2M1 pairs/byte + E4M3 scale per 16-block along K; round-to-nearest-even; tensor-level FP32 scale | cvt e4m3; used by gemm_fp4 | match NVFP4 layout & C++ reference rounding exactly |
 | `kernels/gemm_fp4.rs` | CUDA-core emulated GEMM: unpack codes -> int8 (x2, range ±12) via LUT/`prmt`, `dp4a` into i32 per 16-block, scale by sA*sB/4, FP32 acc | dp4a; used by backend `fp4_sim_gemm=simt` | SASS must show IDP.4A, no HMMA; slow-ish by design |
-| Backend wiring (`lib.rs`) | new precision selector (env/cfg e.g. `DARKNET_GEMM=fp8|fp4|tf32|f16`), quantize->GEMM->dequant path, fallback to f32 | above kernels | default stays current; no API twins, extend existing dispatch |
+| Backend wiring (`lib.rs`) | new precision selector (env/cfg e.g. `LIGHTNET_GEMM=fp8|fp4|tf32|f16`), quantize->GEMM->dequant path, fallback to f32 | above kernels | default stays current; no API twins, extend existing dispatch |
 | Tests | numeric parity vs CPU f32 ref and vs C++ FP8/FP4 output on same inputs | all | tolerance from format (e4m3 ~6% rel), exact for FP4 block dot |
 
 ## Implementation plan
@@ -86,7 +86,7 @@ Phase C – FP4 emulation
 Phase D – docs/bench: results table (f32/tf32/f16/fp8/fp4 GEMM TFLOPs on sm_89) into `tasks/rust/todo.md`.
 
 ## Verification
-- Build: `systemd-run --user --scope -p MemoryHigh=3G` + `RUSTUP_TOOLCHAIN=nightly-2026-08-28 target/debug/cargo-oxide oxide test -- --manifest-path bridges/darknet-cuda-oxide/Cargo.toml -j 1` (one build at a time, ≤2 threads).
+- Build: `systemd-run --user --scope -p MemoryHigh=3G` + `RUSTUP_TOOLCHAIN=nightly-2026-08-28 target/debug/cargo-oxide oxide test -- --manifest-path bridges/lightnet-cuda-oxide/Cargo.toml -j 1` (one build at a time, ≤2 threads).
 - Tests: `oxide_gemm_f8`, `oxide_gemm_fp4`, existing parity tests unchanged (no regression to default path).
 - SASS check: HMMA.16816.F32.E4M3.E4M3 present for FP8; IDP.4A and no HMMA for FP4.
 - Bench: `oxide_gemm_bench`, interleaved A/B (laptop noise).
@@ -105,25 +105,25 @@ inventory, the Phase D bench table and the hardware findings are in
 [`implemented.md`](implemented.md) §3.** This section keeps only what a future
 worker needs.
 
-- Default path unchanged: `DARKNET_OXIDE_GEMM` still defaults to `fp32`; the
+- Default path unchanged: `LIGHTNET_OXIDE_GEMM` still defaults to `fp32`; the
   full oxide suite is unchanged (`./tools/test_oxide.sh` -> `EXIT=0`, all
   suites `ok`).
 - **NOT done - step 5**: FP8 conv via im2col plus the LegoGears_v2 mAP
   comparison against the C++ FP8 path (no C++ build of `v6-dev-fp8` here).
 - C++ parity for the FP8/FP4 numerics is **NOT RUN** (no C++ build of
   `v6-dev-fp8` / `raptor-fp4`). The host references in
-  `darknet_cuda_oxide::fp8` / `::fp4` are ports of the C++ recipes and are
+  `lightnet_cuda_oxide::fp8` / `::fp4` are ports of the C++ recipes and are
   bit-exact against the device kernels.
 - `GemmMode::Fp8` / `Fp8Format::{E4M3,E5M2}`, `GemmMode::Fp4` /
-  `fp4::Fp4Packed`, `DARKNET_OXIDE_GEMM=fp8|e4m3|fp4|nvfp4`, and the FP8
-  backward (`DARKNET_OXIDE_GEMM_BWD=fp8`) are all in.
+  `fp4::Fp4Packed`, `LIGHTNET_OXIDE_GEMM=fp8|e4m3|fp4|nvfp4`, and the FP8
+  backward (`LIGHTNET_OXIDE_GEMM_BWD=fp8`) are all in.
 
 ## How to run
 
 ```
 ./tools/test_oxide.sh --test oxide_gemm_f8     # 20 tests
 ./tools/test_oxide.sh --test oxide_gemm_fp4    # 10 tests
-cargo test --manifest-path src/darknet-cuda-oxide/Cargo.toml --lib   # 14 host reference tests
+cargo test --manifest-path src/lightnet-cuda-oxide/Cargo.toml --lib   # 14 host reference tests
 ./tools/test_oxide.sh --test oxide_gemm_bench -- --ignored gemm_bench_precisions   # Phase D table
 ```
 

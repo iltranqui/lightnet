@@ -43,12 +43,12 @@ ciou_surface.svg
 /third_party/cuda-oxide/cuda-oxide/crates/*/target/
 /third_party/cuda-oxide/cuda-oxide/crates/rustc-codegen-cuda/examples/*/target/
 # cuda-oxide build outputs
-/src/darknet-cuda-oxide/*.ll
-/src/darknet-cuda-oxide/*.ptx
+/src/lightnet-cuda-oxide/*.ll
+/src/lightnet-cuda-oxide/*.ptx
 /third_party/cuda-oxide/cuda-oxide/crates/rustc-codegen-cuda/examples/*/*.ll
 /third_party/cuda-oxide/cuda-oxide/crates/rustc-codegen-cuda/examples/*/*.ptx
-/darknet_cuda_oxide*.ll
-/darknet_cuda_oxide*.ptx
+/lightnet_cuda_oxide*.ll
+/lightnet_cuda_oxide*.ptx
 
 # local scratch at repo root
 /dump.txt

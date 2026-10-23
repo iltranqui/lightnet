@@ -2,7 +2,7 @@
 """Compare exported ONNX raw YOLO heads with the Rust runtime's layer dumps.
 
 Usage: tools/onnx_check.py CFG WEIGHTS NAMES IMAGE
-       [--binary target/release/darknet-rs] [--no-fuse] [--tol 1e-4]
+       [--binary target/release/lightnet-rs] [--no-fuse] [--tol 1e-4]
 
 Preprocessing is resize-exact, matching the Rust CPU inference input path.
 This verifies Rust-runtime parity only; it is not a compiled-C++ golden.
@@ -42,7 +42,7 @@ def main() -> int:
     parser.add_argument("weights", type=Path)
     parser.add_argument("names", type=Path)
     parser.add_argument("image", type=Path)
-    parser.add_argument("--binary", default="target/release/darknet-rs")
+    parser.add_argument("--binary", default="target/release/lightnet-rs")
     parser.add_argument("--no-fuse", action="store_true")
     parser.add_argument("--tol", type=float, default=1e-4)
     args = parser.parse_args()
@@ -55,7 +55,7 @@ def main() -> int:
         if args.no_fuse:
             cmd.append("--no-fuse")
         subprocess.run(cmd, check=True)
-        env = dict(os.environ, DARKNET_LAYER_DUMP_DIR=str(dump))
+        env = dict(os.environ, LIGHTNET_LAYER_DUMP_DIR=str(dump))
         subprocess.run(
             [
                 args.binary,

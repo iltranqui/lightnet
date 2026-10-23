@@ -66,7 +66,7 @@ bench/run_bench.sh <tag-or-branch> [low_precision_kernels|lego|precisions ...]
 
 With no bench names it runs `low_precision_kernels` then `lego`. Environment:
 
-- `DARKNET_BENCH_MODES`: modes for lego and precisions. Default `fp32,fp8` (the script sets this if unset).
+- `LIGHTNET_BENCH_MODES`: modes for lego and precisions. Default `fp32,fp8` (the script sets this if unset).
 - `BENCH_SHARE_OXIDE=1`: required for now, see [Open decisions](#open-decisions). Without it the script exits with code 2 before touching anything.
 
 ### Step by step
@@ -77,7 +77,7 @@ With no bench names it runs `low_precision_kernels` then `lego`. Environment:
 4. For each bench: if `results_*.csv` already has rows for this ref and bench, skip it (idempotent).
 5. Prune stale worktree registrations, then `git worktree add --detach` a scratch worktree at `bench/.work/<ref>-<sha12>-<bench>`.
 6. Link the main checkout's `third_party/cuda-oxide` into the worktree (the submodule is pinned, not per ref).
-7. Run `cargo xtask oxide --test oxide_gemm_bench -- --ignored <test>` in the worktree, with `DARKNET_BENCH_MODES` for lego and precisions. Output goes to `bench/.work/<ref>-<bench>.log`. `cargo xtask` applies the memory cap and thread limit.
+7. Run `cargo xtask oxide --test oxide_gemm_bench -- --ignored <test>` in the worktree, with `LIGHTNET_BENCH_MODES` for lego and precisions. Output goes to `bench/.work/<ref>-<bench>.log`. `cargo xtask` applies the memory cap and thread limit.
 8. Parse the printed lines with awk: `KERNELBENCH m.. n.. k..: mode ms ms gf GF/s | ...` for kernels, `BENCH <label> m.. n.. k..: ...` for lego and precisions, and `BENCH <label> TOTAL: mode ms ms | ...` into `*_total` rows.
 9. If the run exited non-zero or no rows parsed: append one line to `failures.csv` (skipped if the same ref and bench already failed) and continue. Otherwise append the rows to the CSV.
 10. Remove the symlink, remove the worktree (`git worktree remove --force`, then `rm -rf` as fallback), prune, and remove `bench/.work` if empty. A `trap` on EXIT does the same on error or interrupt.
@@ -93,7 +93,7 @@ With no bench names it runs `low_precision_kernels` then `lego`. Environment:
 ## Reading the CSVs
 
 - Filter by `bench` and `mode` first, then compare `gflops` for the same `m,n,k` across refs.
-- `ms` is the median of several rounds (`DARKNET_BENCH_ROUNDS`, default 5). Use `ms` for time and `gflops` for throughput; they are not independent.
+- `ms` is the median of several rounds (`LIGHTNET_BENCH_ROUNDS`, default 5). Use `ms` for time and `gflops` for throughput; they are not independent.
 - TOTAL rows (`lego_total`, `precisions_total`) give the sum of the per-shape `ms` across the LegoGears_v2 convs. Use them for whole-network estimates, and do not add them to per-shape rows.
 - Rows from `failures.csv` mean that ref has no numbers for that bench. Check the log in `.work/` if it still exists.
 - Commit date (`date`) is the commit's date, not the tag's creation date.

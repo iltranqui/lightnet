@@ -16,11 +16,11 @@
 - **Phase 0** (Tier 0 = Tasks 1-6, Tier 1 = Tasks 7-11, bookkeeping = Task 12) is fully detailed: bite-sized TDD steps, real code, exact commands, expected output, commits. It also defines the reusable **Layer Port Contract** that every later layer follows.
 - **Phases 1b-4** (Tiers 1b-4, below "Phase sections") are NOT bite-sized. Each lists layers, C++ source, dependencies, exact `.weights` order, math summary, test strategy, kernel needs and difficulty, and ends with **"expand into its own plan before starting"**. Do not execute them from this document.
 
-**Goal:** `darknet-rs` parses, runs (CPU reference + cuda-oxide GPU), trains and loads/saves `.weights` for every Darknet layer type that exists on the other git branches (`Jev_laya`, `raptor*`, `fog`, `jepa`, `v6-dev-seg`, `depth_3d`, `deform`, ...) but is not fully supported on branch `rust` today, with numerics checked against C++ wherever a C++ build of the owning branch is available.
+**Goal:** `lightnet-rs` parses, runs (CPU reference + cuda-oxide GPU), trains and loads/saves `.weights` for every Darknet layer type that exists on the other git branches (`Jev_laya`, `raptor*`, `fog`, `jepa`, `v6-dev-seg`, `depth_3d`, `deform`, ...) but is not fully supported on branch `rust` today, with numerics checked against C++ wherever a C++ build of the owning branch is available.
 
-**Architecture:** Add each layer by the same recipe (the Layer Port Contract): `LayerKind` variant + `*Spec` + parse/shape inference in `model.rs`; pure host math in a small focused module (new file per family, not more lines in the 17k-line `runtime.rs`); thin CPU forward/backward arms in `runtime.rs`; a default host implementation on `F32TensorOpsBackend` (`darknet-cuda`) with an optional cuda-oxide kernel override; GPU runtime arms; `.weights` I/O in the existing `weights.rs`/`load_weights_into_params` order. Backward is always the exact analytical derivative; C++ shortcuts are gated behind `DARKNET_GRAD_MODE=cpp` (existing `GradMode`). Layers with no GPU kernel run on the GPU through a host round trip (download, host op, upload) exactly like `connected`/`sam` do today.
+**Architecture:** Add each layer by the same recipe (the Layer Port Contract): `LayerKind` variant + `*Spec` + parse/shape inference in `model.rs`; pure host math in a small focused module (new file per family, not more lines in the 17k-line `runtime.rs`); thin CPU forward/backward arms in `runtime.rs`; a default host implementation on `F32TensorOpsBackend` (`lightnet-cuda`) with an optional cuda-oxide kernel override; GPU runtime arms; `.weights` I/O in the existing `weights.rs`/`load_weights_into_params` order. Backward is always the exact analytical derivative; C++ shortcuts are gated behind `LIGHTNET_GRAD_MODE=cpp` (existing `GradMode`). Layers with no GPU kernel run on the GPU through a host round trip (download, host op, upload) exactly like `connected`/`sam` do today.
 
-**Tech Stack:** Rust (`darknet-core`, `darknet-cuda`, `darknet-cli`, `src/darknet-cuda-oxide` with cuda-oxide `#[kernel]`s), Python only for the existing `tools/compare_layer_dumps.py`.
+**Tech Stack:** Rust (`lightnet-core`, `lightnet-cuda`, `lightnet-cli`, `src/lightnet-cuda-oxide` with cuda-oxide `#[kernel]`s), Python only for the existing `tools/compare_layer_dumps.py`.
 
 **Spec:** No separate spec; this document is the spec. Sources to ADAPT (never copy wholesale): C++ on branch `Jev_laya` (`src-lib/`, superset of most layers), `raptor` / `raptor-dev` / `raptor-fp4` / `fog` / `v6-dev-seg` (logistic, regression, segmentation, OBB), `jepa` (swin), `depth_3d` (yolo_3d), `deform`. Read with `git show "branch:path"` (quote it, zsh). Prior art for plan style: `tasks/rust/onnx.md`. State and conventions: `tasks/rust/todo.md` (P5 "CPU-fallback gaps", P8, P9, "C++ parity gap summary"). Per user memory `port-features-adapt-not-replace`: extend the current Rust code in its current style, minimal extras, no wholesale file replacement, no `*_expected` twins; ask before adding optional cfgs/examples (see Open Questions).
 
@@ -52,10 +52,10 @@
 
 ## Global Constraints
 
-- Builds/tests: one cargo command at a time, `-j 2` at most, memory-capped. Host tests ONLY via `./tools/test_host.sh <filter>` (darknet-core + darknet-cli, no GPU; `PKGS=darknet-cuda ./tools/test_host.sh <filter>` for the darknet-cuda crate). GPU tests ONLY via `./tools/test_oxide.sh --test <file> -- <filter>`. Benches via `./tools/bench_oxide.sh`. Never run `cargo` directly, never `-j` above 4, never launch training runs for debugging (static analysis + unit tests + finite differences).
+- Builds/tests: one cargo command at a time, `-j 2` at most, memory-capped. Host tests ONLY via `./tools/test_host.sh <filter>` (lightnet-core + lightnet-cli, no GPU; `PKGS=lightnet-cuda ./tools/test_host.sh <filter>` for the lightnet-cuda crate). GPU tests ONLY via `./tools/test_oxide.sh --test <file> -- <filter>`. Benches via `./tools/bench_oxide.sh`. Never run `cargo` directly, never `-j` above 4, never launch training runs for debugging (static analysis + unit tests + finite differences).
 - Backward = exact analytical derivative of the Rust forward. C++ deviations (grad=1 for normalised shortcut weights, deconv double `1/batch`, softmax pass-through, ...) are reproduced ONLY when `GradMode::from_env() == GradMode::Cpp`.
 - `.weights` byte order must match the C++ `save_*_weights` of the owning branch exactly; every layer with weights gets a round-trip test that also asserts the exact file length (`20` header bytes + `4 * parameter_count`).
-- Loss heads follow the existing yolo convention: loss is computed on the host in `darknet-core`, the "seed" gradient is Darknet's descent direction (`target - prediction`), and the layer's backward arm passes the seed through to the previous layer.
+- Loss heads follow the existing yolo convention: loss is computed on the host in `lightnet-core`, the "seed" gradient is Darknet's descent direction (`target - prediction`), and the layer's backward arm passes the seed through to the previous layer.
 - Unknown / unsupported config must be an error, never a silent identity (this plan removes the identity fallback for unknown activations in Task 2).
 - Commit only the files a task names. Every commit message ends with `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`. `docs/` is gitignored (`git add -f` if a doc is ever added; this plan adds none).
 - No new Rust dependencies.
@@ -78,7 +78,7 @@ The five failure modes most likely to bite a user and not obviously covered by "
 | `batchnorm`: "no weights block in weights.rs" | Half true. `Layer::weights()` and `load_weights_into_params` handle `BatchNorm`; `save_weights` has NO `BatchNorm` arm, so saving any net with `[batchnorm]` fails with "inconsistent while saving". Task 5. |
 | gru / local / crop / batchnorm / detection are "legacy layers to finish" | They are NOT in `ELayerType` of `master` or `Jev_laya` (verified in `src-lib/darknet_enums.hpp`), `weights.cpp` has no case for them, and C++ never writes standalone batchnorm/gru/local weights. They are Rust-only extensions with no C++ reference to validate against. Deprioritised to the Deferred appendix. |
 | `maxpool_depth` Unsupported | Rust never parses the flag: `out_channels` (C++ default 1, Rust default = input channels) is used as a proxy and spatial dims are still pooled. Also the C++ key is `maxpool_zero_nonmax`; Rust reads `zero_nonmax`. Task 4. |
-| `DARKNET_LAYER_DUMP_DIR` + `tools/compare_layer_dumps.py` give C++ numerics | The Rust side (`detect-image`) writes dumps. The C++ side exists only in commit `96f662f0` (`src-lib/network_kernels.cu`, GPU inference path `not state.train`), deleted from this branch by `2514cf53`, and absent from every layer branch. See "Verification against C++". |
+| `LIGHTNET_LAYER_DUMP_DIR` + `tools/compare_layer_dumps.py` give C++ numerics | The Rust side (`detect-image`) writes dumps. The C++ side exists only in commit `96f662f0` (`src-lib/network_kernels.cu`, GPU inference path `not state.train`), deleted from this branch by `2514cf53`, and absent from every layer branch. See "Verification against C++". |
 | Jev_laya `weights.cpp` has no TRANSFORMER/SWIN case | Verified (`jepa` has none either). The Rust order must be defined by us (Phase 3). |
 | vit / moe / dcnv3 weight orders | Verified against `Jev_laya:src-lib/weights.cpp` (`save_vit_weights`, `save_moe_convolutional_weights`, `save_dcnv3_weights`). Others in Phases 2-4 are marked "from research report, not re-verified". |
 | Shortcut `weights_normalization` | C++ weight gradient ignores the normalisation (`grad = 1`; the correct sum is commented out in `blas.cpp`). Exact derivative in Task 6, C++ behaviour behind `GradMode::Cpp`. |
@@ -86,9 +86,9 @@ The five failure modes most likely to bite a user and not obviously covered by "
 
 ## Layer Port Contract (the reusable template; later tasks refer to it by letter)
 
-Adding one layer touches the sites below. `grep -n "LayerKind::Reorg" src/darknet-core/src/*.rs` is a good way to find every site of an existing comparable layer. After adding a `LayerKind` variant run `./tools/test_host.sh does_not_exist` once: the compile errors list every non-exhaustive `match`.
+Adding one layer touches the sites below. `grep -n "LayerKind::Reorg" src/lightnet-core/src/*.rs` is a good way to find every site of an existing comparable layer. After adding a `LayerKind` variant run `./tools/test_host.sh does_not_exist` once: the compile errors list every non-exhaustive `match`.
 
-**A. Config / model (`src/darknet-core/src/model.rs`)**
+**A. Config / model (`src/lightnet-core/src/model.rs`)**
 1. `pub struct <Name>Spec { .. }` next to the other specs (~line 255-470) and `LayerKind::<Name>(<Name>Spec)`.
 2. `LayerKind::name()` arm (the cfg section name; it feeds error messages and `weights-inspect`).
 3. `parse_layer_kind` arm (~line 1071-1380) with the C++ keys and defaults. If a C++ default is invalid, require the key and return `Error::InvalidConfig(format!("[{name}] at line {}: ...", section.line))`. Aliases go in the same match arm (`"conv" | "convolutional"` style).
@@ -96,14 +96,14 @@ Adding one layer touches the sites below. `grep -n "LayerKind::Reorg" src/darkne
 5. `Layer::weights()` entries (~line 664-870) IN `.weights` ORDER, only when the layer has weights.
 6. Tests in `model.rs` `mod tests`: parse, shape, invalid-config.
 
-**B. Parameters (only layers with weights).** Reuse an existing `LayerParams`/`LayerTrainBuffers` variant when the byte layout is identical (deconvolutional reuses `Convolutional`). A new variant touches exactly: `runtime.rs` `LayerParams` (~218) and `LayerTrainBuffers` (~290) enums; `default_layer_params` / `default_layer_train_buffers` (~6330/6450; the zero default doubles as the zero gradient accumulator in `backward_seeded_core`); `update_weights` arm (~560-700); `accumulate_train_buffers` arm (~1920-2100); `load_weights_into_params` arm (~7079); `weights.rs` `save_weights` arm AND the exhaustive `LayerParams` list in the `recurrent_weight_blocks_round_trip_in_darknet_order` test; `initialize.rs` arm; `darknet-cli/src/main.rs` (~2361 `LayerTrainBuffers` match). The GPU update path keeps non-convolutional params in `cpu_fallback_train_buffers` (see Task 9 Step 6).
+**B. Parameters (only layers with weights).** Reuse an existing `LayerParams`/`LayerTrainBuffers` variant when the byte layout is identical (deconvolutional reuses `Convolutional`). A new variant touches exactly: `runtime.rs` `LayerParams` (~218) and `LayerTrainBuffers` (~290) enums; `default_layer_params` / `default_layer_train_buffers` (~6330/6450; the zero default doubles as the zero gradient accumulator in `backward_seeded_core`); `update_weights` arm (~560-700); `accumulate_train_buffers` arm (~1920-2100); `load_weights_into_params` arm (~7079); `weights.rs` `save_weights` arm AND the exhaustive `LayerParams` list in the `recurrent_weight_blocks_round_trip_in_darknet_order` test; `initialize.rs` arm; `lightnet-cli/src/main.rs` (~2361 `LayerTrainBuffers` match). The GPU update path keeps non-convolutional params in `cpu_fallback_train_buffers` (see Task 9 Step 6).
 
 **C. CPU reference (`runtime.rs`)**
 1. Forward arm in `forward_with_mode` (~line 880-1130). Return `(Tensor, Option<Tensor>)`: the second value is the pre-activation cache (`Some` whenever the layer has an activation).
 2. Backward arm in `backward_seeded_core` (~1204-1760): accumulate with `accumulate_previous_gradient` (previous layer) and `accumulate_tensor(&mut layer_output_gradients[source_index], ..)` (other layers), never overwrite (C++ `copy_cpu` overwrites in `channel_slice`/`channel_shuffle`; accumulation is the only correct fan-in semantics).
 3. Compact CPU inference (`forward_compact`, preflight list ~line 820-840) automatically falls back to the full `forward` for kinds not in that list. Do NOT add the new kind there.
 
-**D. Backend op (only if there is device work).** Add a method with a DEFAULT host implementation to `F32TensorOpsBackend` in `src/darknet-cuda/src/lib.rs` calling a reference function in `src/darknet-cuda/src/host_ops.rs` (download, compute, upload; see `reorg_f32`). Then override in `src/darknet-cuda-oxide/src/lib.rs` with a kernel from `src/kernels/*.rs`, and add `src/darknet-cuda-oxide/tests/oxide_*.rs` parity + finite-difference tests. Prefer reusing existing ops (e.g. `route_concat_f32` slices channels, `conv2d_backward_input_f32` is a transposed convolution).
+**D. Backend op (only if there is device work).** Add a method with a DEFAULT host implementation to `F32TensorOpsBackend` in `src/lightnet-cuda/src/lib.rs` calling a reference function in `src/lightnet-cuda/src/host_ops.rs` (download, compute, upload; see `reorg_f32`). Then override in `src/lightnet-cuda-oxide/src/lib.rs` with a kernel from `src/kernels/*.rs`, and add `src/lightnet-cuda-oxide/tests/oxide_*.rs` parity + finite-difference tests. Prefer reusing existing ops (e.g. `route_concat_f32` slices channels, `conv2d_backward_input_f32` is a transposed convolution).
 
 **E. GPU runtime (`GpuExecutableNetwork`, `runtime.rs`)**
 1. Training forward arm (`forward_with_state_impl`, ~line 3790-4330). Host-round-trip layers use `self.download_tensor(current_input, layer.input_shape)`, run the CPU function, `self.backend.upload_f32(&tensor_backend_shape(layer.output_shape), &data)`, and set `activation_input_gpu = Some(uploaded pre-activation)` when the layer has an activation (see the `Sam` arm ~4248).
@@ -123,7 +123,7 @@ Adding one layer touches the sites below. `grep -n "LayerKind::Reorg" src/darkne
 ## File Structure (Phase 0)
 
 ```
-src/darknet-core/src/
+src/lightnet-core/src/
 ├── lib.rs                  MODIFY  declare the new modules; re-export dense loss API
 ├── model.rs                MODIFY  Activation variants; LayerKind variants + Specs; parse/shape; weights()
 ├── runtime.rs              MODIFY  activate()/gradient arms; thin CPU+GPU arms per layer; ShortcutParams; tests
@@ -135,15 +135,15 @@ src/darknet-core/src/
 ├── shortcut_weights.rs     CREATE  weighted-shortcut forward/backward with exact normalisation derivative (+ tests)
 ├── jev_ce.rs               CREATE  jev_ce softmax + soft-target CE (+ tests)
 └── dense_loss.rs           CREATE  host loss + seeds for [cost] [logistic] [regression] [jev_ce] (+ tests)
-src/darknet-cuda/src/
+src/lightnet-cuda/src/
 ├── lib.rs                  MODIFY  F32ActivationKind::Gelu; trait op channel_shuffle_f32 (default host impl)
 └── host_ops.rs             MODIFY  channel_permute (+ tests)
-src/darknet-cuda-oxide/
+src/lightnet-cuda-oxide/
 ├── src/kernels/activations.rs  MODIFY  ACT_GELU
 ├── src/kernels/layers_extra.rs MODIFY  channel_permute kernel
 ├── src/lib.rs                  MODIFY  activation_code(Gelu); channel_shuffle_f32 override
 └── tests/oxide_parity.rs, oxide_cfg_shapes.rs, oxide_half.rs, oxide_batchnorm_adam.rs, oxide_layers_extra.rs  MODIFY
-src/darknet-cli/src/main.rs  MODIFY  LayerTrainBuffers::Shortcut arm (~2361)
+src/lightnet-cli/src/main.rs  MODIFY  LayerTrainBuffers::Shortcut arm (~2361)
 tasks/rust/todo.md              MODIFY  pointer to this plan (final task)
 ```
 
@@ -158,10 +158,10 @@ Responsibilities: the `*.rs` math modules know only tensors and numbers (no `Lay
 Adds `gelu elu selu relie plse hardtan lhtan stair hard_mish revleaky`. All ten are cheap on CPU; only `gelu` gets a GPU kernel (Task 3) because every transformer-family layer defaults to it. `normalize_channels*` are NOT elementwise (they need the layer geometry and exist only in `[convolutional]`); Task 2 initially rejected them. v65/v66 now integrate them for CPU and f32 GPU convolution, while other layer types and f16 inference remain explicit errors. `eml` belongs to `eml_convolutional` (Phase 2).
 
 **Files:**
-- Create: `src/darknet-core/src/activation_math.rs`
-- Modify: `src/darknet-core/src/lib.rs` (add `pub(crate) mod activation_math;` after `pub mod error;`)
-- Modify: `src/darknet-core/src/model.rs:213-264` (`Activation` enum, `parse`, `to_cuda_f32_kind`)
-- Modify: `src/darknet-core/src/runtime.rs:10498-10550` (`activation_gradient_from_output`) and `:10601-10622` (`activate`)
+- Create: `src/lightnet-core/src/activation_math.rs`
+- Modify: `src/lightnet-core/src/lib.rs` (add `pub(crate) mod activation_math;` after `pub mod error;`)
+- Modify: `src/lightnet-core/src/model.rs:213-264` (`Activation` enum, `parse`, `to_cuda_f32_kind`)
+- Modify: `src/lightnet-core/src/runtime.rs:10498-10550` (`activation_gradient_from_output`) and `:10601-10622` (`activate`)
 - Test: `activation_math.rs` `mod tests`; `runtime.rs` `mod tests` (after `relu6_and_ramp_follow_cpp_activation_and_gradient`, ~16500)
 
 **Interfaces:**
@@ -178,7 +178,7 @@ Math (C++ `activations.hpp` forward; derivative = exact derivative of that forwa
 - hard_mish: `x>0: x`, `x>-2: x^2/2+x`, else 0; grad `x>0: 1`, `x>-2: x+1`, else 0.
 - revleaky: forward = leaky (`x>0 ? x : 0.1x`), gradient = leaky gradient (C++ CPU does this; the C++ CUDA kernel divides by it, which is not the derivative of anything).
 
-- [ ] **Step 1: Write the failing tests** — create `src/darknet-core/src/activation_math.rs` containing only the test module (the functions do not exist yet):
+- [ ] **Step 1: Write the failing tests** — create `src/lightnet-core/src/activation_math.rs` containing only the test module (the functions do not exist yet):
 
 ```rust
 //! Scalar activations missing from the original Rust set (see tasks/rust/layers.md Task 1).
@@ -490,7 +490,7 @@ Expected: all `activation*`, `relu6_and_ramp...`, `extra_activations_parse_dispa
 - [ ] **Step 9: Commit**
 
 ```bash
-git add src/darknet-core/src/activation_math.rs src/darknet-core/src/lib.rs src/darknet-core/src/model.rs src/darknet-core/src/runtime.rs
+git add src/lightnet-core/src/activation_math.rs src/lightnet-core/src/lib.rs src/lightnet-core/src/model.rs src/lightnet-core/src/runtime.rs
 git commit -m "feat(activations): gelu elu selu relie plse hardtan lhtan stair hard_mish revleaky with exact derivatives
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
@@ -503,8 +503,8 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
 C++ prints an error and falls back to relu; Rust `activate(Other(_))` silently returned the input unchanged, so a typo or an unsupported name trained and inferred wrongly without any message. This task initially made `normalize_channels*` and `eml` explicit errors. Current status: v66 permits `normalize_channels*` only on f32 `[convolutional]`; other layer types and f16 inference remain rejected.
 
 **Files:**
-- Modify: `src/darknet-core/src/model.rs` (new `LayerKind::activation()`; check in `Network::from_config` loop ~line 975-990)
-- Test: `src/darknet-core/src/model.rs` `mod tests`
+- Modify: `src/lightnet-core/src/model.rs` (new `LayerKind::activation()`; check in `Network::from_config` loop ~line 975-990)
+- Test: `src/lightnet-core/src/model.rs` `mod tests`
 
 **Interfaces:**
 - Produces: `impl LayerKind { pub fn activation(&self) -> Option<&Activation> }`.
@@ -589,7 +589,7 @@ Expected: `ok` and `test result: ok` (every shipped cfg uses only known names: l
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/darknet-core/src/model.rs
+git add src/lightnet-core/src/model.rs
 git commit -m "fix(cfg): unknown activation is an error instead of a silent identity
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
@@ -602,17 +602,17 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
 Contract D/E. Every shared device activation (`kernels::activations::activate`/`gradient`) feeds the fused bias+activation, f16, AMP and plain activation kernels, so one device-function edit covers them all.
 
 **Files:**
-- Modify: `src/darknet-cuda/src/lib.rs:14-26` (`F32ActivationKind::Gelu`)
-- Modify: `src/darknet-core/src/model.rs` (`to_cuda_f32_kind`)
-- Modify: `src/darknet-cuda-oxide/src/kernels/activations.rs`, `src/darknet-cuda-oxide/src/lib.rs:200-211`
-- Modify: `src/darknet-core/src/runtime.rs` (`FakeBackend` helpers ~12098-12150; new test)
-- Test: `src/darknet-cuda-oxide/tests/oxide_parity.rs` (+ the three other files with exhaustive `F32ActivationKind` matches)
+- Modify: `src/lightnet-cuda/src/lib.rs:14-26` (`F32ActivationKind::Gelu`)
+- Modify: `src/lightnet-core/src/model.rs` (`to_cuda_f32_kind`)
+- Modify: `src/lightnet-cuda-oxide/src/kernels/activations.rs`, `src/lightnet-cuda-oxide/src/lib.rs:200-211`
+- Modify: `src/lightnet-core/src/runtime.rs` (`FakeBackend` helpers ~12098-12150; new test)
+- Test: `src/lightnet-cuda-oxide/tests/oxide_parity.rs` (+ the three other files with exhaustive `F32ActivationKind` matches)
 
 **Interfaces:**
 - Produces: `F32ActivationKind::Gelu`; `activations::ACT_GELU: u32 = 9`.
 - Consumes: Task 1 `Activation::Gelu`.
 
-- [ ] **Step 1: Write the failing tests.** (a) `src/darknet-core/src/runtime.rs` `mod tests`:
+- [ ] **Step 1: Write the failing tests.** (a) `src/lightnet-core/src/runtime.rs` `mod tests`:
 
 ```rust
     #[test]
@@ -626,7 +626,7 @@ Contract D/E. Every shared device activation (`kernels::activations::activate`/`
     }
 ```
 
-(b) `src/darknet-cuda-oxide/tests/oxide_parity.rs`: change `const KINDS: [F32ActivationKind; 9]` to `; 10]` and append `F32ActivationKind::Gelu,`; add arms to the three reference functions:
+(b) `src/lightnet-cuda-oxide/tests/oxide_parity.rs`: change `const KINDS: [F32ActivationKind; 9]` to `; 10]` and append `F32ActivationKind::Gelu,`; add arms to the three reference functions:
 
 ```rust
         // cpu_activate (f32)
@@ -648,13 +648,13 @@ Run: `./tools/test_host.sh gpu_gelu_convolution` — Expected: FAIL (`layer #0 u
 Run: `./tools/test_oxide.sh --test oxide_parity -- activation` — Expected: FAIL (compile error: no variant `Gelu` in `F32ActivationKind`).
 
 - [ ] **Step 3: Implement.**
-`src/darknet-cuda/src/lib.rs` — after `Ramp,`:
+`src/lightnet-cuda/src/lib.rs` — after `Ramp,`:
 ```rust
     /// tanh-approximation GELU `0.5x(1+tanh(0.797885x+0.035677x^3))`; exact derivative (C++ `gelu_*`).
     Gelu,
 ```
 `model.rs` `to_cuda_f32_kind`: remove `Self::Gelu` from the `=> None` list and add `Self::Gelu => Some(F32ActivationKind::Gelu),`.
-`src/darknet-cuda-oxide/src/kernels/activations.rs`: add `pub const ACT_GELU: u32 = 9;`; in `activate` add before the final `else`:
+`src/lightnet-cuda-oxide/src/kernels/activations.rs`: add `pub const ACT_GELU: u32 = 9;`; in `activate` add before the final `else`:
 ```rust
     } else if kind == 9 {
         0.5 * x * (1.0 + (0.797885 * x + 0.035677 * x * x * x).tanh())
@@ -665,7 +665,7 @@ and in `gradient` before the final `else`:
         let t = (0.797885 * x + 0.035677 * x * x * x).tanh();
         0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * (0.797885 + 3.0 * 0.035677 * x * x)
 ```
-`src/darknet-cuda-oxide/src/lib.rs` `activation_code`: `F32ActivationKind::Gelu => activations::ACT_GELU,`.
+`src/lightnet-cuda-oxide/src/lib.rs` `activation_code`: `F32ActivationKind::Gelu => activations::ACT_GELU,`.
 `runtime.rs` FakeBackend: in `apply_fake_activation` add `F32ActivationKind::Gelu => Activation::Gelu,`; in `fake_activation_gradient` add `F32ActivationKind::Gelu => crate::activation_math::gelu_grad(value),`.
 
 - [ ] **Step 4: Run to verify they pass**
@@ -677,7 +677,7 @@ Run: `./tools/test_oxide.sh --test oxide_cfg_shapes -- activation` and `--test o
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/darknet-cuda/src/lib.rs src/darknet-core/src/model.rs src/darknet-core/src/runtime.rs src/darknet-cuda-oxide/src src/darknet-cuda-oxide/tests
+git add src/lightnet-cuda/src/lib.rs src/lightnet-core/src/model.rs src/lightnet-core/src/runtime.rs src/lightnet-cuda-oxide/src src/lightnet-cuda-oxide/tests
 git commit -m "feat(oxide): GELU activation kernel (forward + exact derivative)
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
@@ -690,8 +690,8 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
 Fixes the key spelling (C++ `maxpool_zero_nonmax`) and implements depth pooling: output channel `g` is the max over input channels `g, g+out_c, g+2*out_c, ...` at the same pixel; spatial size unchanged; C++ ignores `size/stride/padding` in this mode. Depth pooling remains CPU-only; ordinary maxpool with `zero_nonmax` uses the existing GPU argmax-backward operation, which writes zero to every non-argmax input.
 
 **Files:**
-- Modify: `src/darknet-core/src/model.rs` (`MaxPoolSpec` ~283, parse ~1139-1170, `infer_output_shape` ~1408-1424)
-- Modify: `src/darknet-core/src/runtime.rs` (CPU forward ~1017, backward ~1344, compact preflight ~829, three GPU channel checks ~2501/3788/4510)
+- Modify: `src/lightnet-core/src/model.rs` (`MaxPoolSpec` ~283, parse ~1139-1170, `infer_output_shape` ~1408-1424)
+- Modify: `src/lightnet-core/src/runtime.rs` (CPU forward ~1017, backward ~1344, compact preflight ~829, three GPU channel checks ~2501/3788/4510)
 - Test: `model.rs` `mod tests`, `runtime.rs` `mod tests`
 
 **Interfaces:**
@@ -885,7 +885,7 @@ Run: `./tools/test_host.sh maxpool` — Expected: `maxpool_depth_and_zero_nonmax
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/darknet-core/src/model.rs src/darknet-core/src/runtime.rs
+git add src/lightnet-core/src/model.rs src/lightnet-core/src/runtime.rs
 git commit -m "fix(maxpool): C++ key maxpool_zero_nonmax and real maxpool_depth (CPU)
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
@@ -898,7 +898,7 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
 `load_weights_into_params` reads `biases, scales, rolling_mean, rolling_variance`; `save_weights` has no arm, so saving any net with `[batchnorm]` fails. C++ never persists a standalone batchnorm layer (no `BATCHNORM` in `ELayerType`, none in `save_weights_upto`), so this is a Rust extension: a `.weights` file with a `[batchnorm]` layer is NOT readable by C++ and vice versa. Keep it simple: add the missing symmetric arm and state the divergence in the doc comment.
 
 **Files:**
-- Modify: `src/darknet-core/src/weights.rs` (`save_weights` match ~line 98-160; module doc)
+- Modify: `src/lightnet-core/src/weights.rs` (`save_weights` match ~line 98-160; module doc)
 - Test: `weights.rs` `mod tests`
 
 - [ ] **Step 1: Write the failing test** (append to `weights.rs` `mod tests`):
@@ -955,7 +955,7 @@ Run: `./tools/test_host.sh weights` — Expected: all `weights::tests::*` `ok`.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/darknet-core/src/weights.rs
+git add src/lightnet-core/src/weights.rs
 git commit -m "fix(weights): save standalone batchnorm params (Rust-only extension)
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
@@ -968,8 +968,8 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
 C++: `weights_type = none | per_feature | per_channel`, `weights_normalization = none | relu | avg_relu | softmax`. `nweights = (n+1)` (per_feature) or `(n+1)*c` (per_channel), `n = from.len()`, `c` = layer channels; saved right after the layer's turn in layer order (`save_shortcut_weights`, only when `nweights > 0`); initialised to `1.0`. Weight index of input `i` (`i=0` is the previous layer, `1..=n` the `from` layers) at flat element `e`: `e/step + i*layer_step` with `layer_step = nweights/(n+1)`, `step = per_sample/layer_step`. `eps = 1e-4`. Forward: `out[e] = w_0*x_0[e] + sum_i [e < len_i] w_i*x_i[e]`, `w_i` = raw, `relu(w_i)/(eps+sum_j relu(w_j))`, or `exp(w_i-max)/(eps+sum_j exp(w_j-max))`, per slot. The C++ weight gradient is `sum delta*x_i` (ignores the normalisation); the exact gradient is derived in the code comment below. GPU forward composes `channel_scale_f32` + `shortcut_add_f32` in the backend default weighted-sum operation; exact backward and SGD update use the CPU fallback because shortcut parameters are host-resident. FakeBackend and real-device runtime tests cover mismatched fit, forward, backward, and SGD. A dedicated fused oxide kernel/device weight-gradient reduction is only an optional performance follow-up.
 
 **Files:**
-- Create: `src/darknet-core/src/shortcut_weights.rs`
-- Modify: `src/darknet-core/src/lib.rs`, `model.rs` (specs, parse, `Layer::weights()`), `runtime.rs` (params/buffers/arms), `weights.rs`, `initialize.rs`, `src/darknet-cli/src/main.rs`
+- Create: `src/lightnet-core/src/shortcut_weights.rs`
+- Modify: `src/lightnet-core/src/lib.rs`, `model.rs` (specs, parse, `Layer::weights()`), `runtime.rs` (params/buffers/arms), `weights.rs`, `initialize.rs`, `src/lightnet-cli/src/main.rs`
 - Test: `shortcut_weights.rs` `mod tests`; `weights.rs`, `model.rs`, `runtime.rs` tests
 
 **Interfaces:**
@@ -1364,7 +1364,7 @@ in `default_layer_params`, and in `default_layer_train_buffers`:
                     accumulate_vec(&mut train.weight_updates, &gradient.weights)?;
                 }
 ```
-`load_weights_into_params`: `LayerParams::Shortcut(shortcut) => read_f32_into(&mut file, &mut shortcut.weights)?,`. `weights.rs` `save_weights`: `(LayerKind::Shortcut(_), LayerParams::Shortcut(shortcut)) => write_f32_slice(&mut file, &shortcut.weights)?,` and add `| LayerParams::Shortcut(_)` to the exhaustive list in `recurrent_weight_blocks_round_trip_in_darknet_order`. `initialize.rs`: `LayerParams::Shortcut(p) => p.weights.fill(1.0),` (C++ init). `darknet-cli/src/main.rs` (~2361): `darknet_core::LayerTrainBuffers::Shortcut(shortcut) => shortcut.weight_updates.iter().any(|value| *value != 0.0),`.
+`load_weights_into_params`: `LayerParams::Shortcut(shortcut) => read_f32_into(&mut file, &mut shortcut.weights)?,`. `weights.rs` `save_weights`: `(LayerKind::Shortcut(_), LayerParams::Shortcut(shortcut)) => write_f32_slice(&mut file, &shortcut.weights)?,` and add `| LayerParams::Shortcut(_)` to the exhaustive list in `recurrent_weight_blocks_round_trip_in_darknet_order`. `initialize.rs`: `LayerParams::Shortcut(p) => p.weights.fill(1.0),` (C++ init). `lightnet-cli/src/main.rs` (~2361): `lightnet_core::LayerTrainBuffers::Shortcut(shortcut) => shortcut.weight_updates.iter().any(|value| *value != 0.0),`.
 
 - [ ] **Step 6: Implement the CPU arms.** Helper glue in `runtime.rs` near `forward_shortcut_with_cache`:
 
@@ -1525,7 +1525,7 @@ Preflights: the CPU compact list is restricted to `weights_type=None` because we
 - [ ] **Step 9: Commit**
 
 ```bash
-git add src/darknet-core/src/shortcut_weights.rs src/darknet-core/src/lib.rs src/darknet-core/src/model.rs src/darknet-core/src/runtime.rs src/darknet-core/src/weights.rs src/darknet-core/src/initialize.rs src/darknet-cli/src/main.rs
+git add src/lightnet-core/src/shortcut_weights.rs src/lightnet-core/src/lib.rs src/lightnet-core/src/model.rs src/lightnet-core/src/runtime.rs src/lightnet-core/src/weights.rs src/lightnet-core/src/initialize.rs src/lightnet-cli/src/main.rs
 git commit -m "feat(shortcut): weights_type / weights_normalization with exact normalised gradient and .weights block
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
@@ -1540,8 +1540,8 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
 C++ `channel_slice_layer.cpp` (branches `Jev_laya`, `fog`, `raptor`): copies channels `[start, end)` of the OUTPUT of layer `from` (not of the previous layer). Keys `from` (required), `start`, `end`, `axis` (only `1`). C++ defaults `start = end = 2` describe an empty slice that aborts, so both are required here. No weights. C++ backward `copy_cpu`s into `from`'s delta (overwrite); we scatter-ADD (exact, and correct when `from` also feeds other layers). GPU: no new kernel; it is a one-input grouped route, so `route_concat_f32` / `route_backward_f32` (existing, kernels exist) slice and scatter.
 
 **Files:**
-- Create: `src/darknet-core/src/channel_ops.rs`
-- Modify: `src/darknet-core/src/lib.rs` (`pub(crate) mod channel_ops;`), `model.rs`, `runtime.rs`
+- Create: `src/lightnet-core/src/channel_ops.rs`
+- Modify: `src/lightnet-core/src/lib.rs` (`pub(crate) mod channel_ops;`), `model.rs`, `runtime.rs`
 - Test: `channel_ops.rs` `mod tests`, `model.rs` tests, `runtime.rs` tests
 
 **Interfaces:**
@@ -1844,7 +1844,7 @@ Run: `./tools/test_host.sh channel_slice` — Expected: `slice_copies_the_channe
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/darknet-core/src/channel_ops.rs src/darknet-core/src/lib.rs src/darknet-core/src/model.rs src/darknet-core/src/runtime.rs
+git add src/lightnet-core/src/channel_ops.rs src/lightnet-core/src/lib.rs src/lightnet-core/src/model.rs src/lightnet-core/src/runtime.rs
 git commit -m "feat(layers): channel_slice (CPU + GPU via route ops)
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
@@ -1857,9 +1857,9 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
 C++ `channel_shuffle_layer.cpp`: key `groups` (default 2, `c % groups == 0`). With `rows = groups`, `cols = c / groups`: `out_channel[j*rows + i] = in_channel[i*cols + j]`. Backward is the same permutation with `rows`/`cols` swapped (C++ overwrites `state.delta`; we accumulate). No weights. New backend op with a default host implementation and a one-thread-per-output-element oxide kernel.
 
 **Files:**
-- Modify: `src/darknet-cuda/src/host_ops.rs` (`channel_permute` + tests), `src/darknet-cuda/src/lib.rs` (trait op), `src/darknet-cuda-oxide/src/kernels/layers_extra.rs`, `src/darknet-cuda-oxide/src/lib.rs`
-- Modify: `src/darknet-core/src/channel_ops.rs`, `model.rs`, `runtime.rs`
-- Test: `host_ops.rs`, `src/darknet-cuda-oxide/tests/oxide_layers_extra.rs`, `channel_ops.rs`, `model.rs`, `runtime.rs` tests
+- Modify: `src/lightnet-cuda/src/host_ops.rs` (`channel_permute` + tests), `src/lightnet-cuda/src/lib.rs` (trait op), `src/lightnet-cuda-oxide/src/kernels/layers_extra.rs`, `src/lightnet-cuda-oxide/src/lib.rs`
+- Modify: `src/lightnet-core/src/channel_ops.rs`, `model.rs`, `runtime.rs`
+- Test: `host_ops.rs`, `src/lightnet-cuda-oxide/tests/oxide_layers_extra.rs`, `channel_ops.rs`, `model.rs`, `runtime.rs` tests
 
 **Interfaces:**
 - Produces: `host_ops::channel_permute(x: &[f32], batch: usize, rows: usize, cols: usize, len: usize) -> Vec<f32>`; trait op `F32TensorOpsBackend::channel_shuffle_f32(&self, x: &Self::Tensor, shape: &[usize], groups: usize, inverse: bool, config: ElementwiseLaunchConfig) -> Result<Self::Tensor, Self::Error>`; `ChannelShuffleSpec { pub groups: usize }`, `LayerKind::ChannelShuffle(ChannelShuffleSpec)`; `channel_ops::shuffle_channels(x: &Tensor, groups: usize, inverse: bool) -> Result<Tensor>`.
@@ -1962,7 +1962,7 @@ fn channel_shuffle_matches_reference_and_inverse_round_trips() {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `PKGS=darknet-cuda ./tools/test_host.sh channel_permute` — Expected: FAIL (`channel_permute` undefined).
+Run: `PKGS=lightnet-cuda ./tools/test_host.sh channel_permute` — Expected: FAIL (`channel_permute` undefined).
 Run: `./tools/test_oxide.sh --test oxide_layers_extra -- channel_shuffle` — Expected: FAIL (compile error: no method `channel_shuffle_f32`).
 
 - [ ] **Step 3: Implement the host reference and trait op.** `host_ops.rs`:
@@ -1987,7 +1987,7 @@ pub fn channel_permute(x: &[f32], batch: usize, rows: usize, cols: usize, len: u
     out
 }
 ```
-`src/darknet-cuda/src/lib.rs` — add to `F32TensorOpsBackend` next to `reorg_f32`:
+`src/lightnet-cuda/src/lib.rs` — add to `F32TensorOpsBackend` next to `reorg_f32`:
 
 ```rust
     /// `[channel_shuffle]` on NCHW `shape` (see [`host_ops::channel_permute`]): forward
@@ -2033,7 +2033,7 @@ pub fn channel_permute(x: &[f32], batch: usize, rows: usize, cols: usize, len: u
         }
     }
 ```
-`src/darknet-cuda-oxide/src/lib.rs`, in `impl F32TensorOpsBackend for OxideBackend` next to `reorg_f32`:
+`src/lightnet-cuda-oxide/src/lib.rs`, in `impl F32TensorOpsBackend for OxideBackend` next to `reorg_f32`:
 
 ```rust
     fn channel_shuffle_f32(
@@ -2098,7 +2098,7 @@ pub(crate) fn shuffle_channels(x: &Tensor, groups: usize, inverse: bool) -> Resu
     let (rows, cols) = if inverse { (s.channels / groups, groups) } else { (groups, s.channels / groups) };
     Tensor::from_data(
         s,
-        darknet_cuda::host_ops::channel_permute(&x.data, s.batch, rows, cols, s.width * s.height),
+        lightnet_cuda::host_ops::channel_permute(&x.data, s.batch, rows, cols, s.width * s.height),
     )
 }
 ```
@@ -2139,14 +2139,14 @@ plus `| LayerKind::ChannelShuffle(_)` in the `forward_compact` GPU fallback list
 
 - [ ] **Step 6: Run to verify**
 
-Run: `PKGS=darknet-cuda ./tools/test_host.sh channel_permute` — Expected: `ok`.
+Run: `PKGS=lightnet-cuda ./tools/test_host.sh channel_permute` — Expected: `ok`.
 Run: `./tools/test_host.sh channel_shuffle` — Expected: `shuffle_permutes_channels_and_inverse_restores`, `channel_shuffle_requires_divisible_channels`, `gpu_channel_shuffle_matches_cpu_forward_and_backward` all `ok`.
 Run: `./tools/test_oxide.sh --test oxide_layers_extra -- channel_shuffle` — Expected: `channel_shuffle_matches_reference_and_inverse_round_trips ... ok`.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/darknet-cuda src/darknet-core/src/channel_ops.rs src/darknet-core/src/model.rs src/darknet-core/src/runtime.rs src/darknet-cuda-oxide/src src/darknet-cuda-oxide/tests/oxide_layers_extra.rs
+git add src/lightnet-cuda src/lightnet-core/src/channel_ops.rs src/lightnet-core/src/model.rs src/lightnet-core/src/runtime.rs src/lightnet-cuda-oxide/src src/lightnet-cuda-oxide/tests/oxide_layers_extra.rs
 git commit -m "feat(layers): channel_shuffle with host reference op and oxide kernel
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
@@ -2159,8 +2159,8 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
 C++ `deconvolutional_layer.cpp` (`Jev_laya`): transposed convolution. Keys `filters` (n), `size` (k), `stride` (s), `activation` (default `logistic`); `pad`/`padding` are rejected. Output `n x (s*(h-1)+k) x (s*(w-1)+k)`. Weights `[c][n][k][k]`, biases `[n]`, no BN; `.weights` = biases then weights (same layout as a convolution without BN, so `LayerParams::Convolutional` is reused and load/save need no new variant). Math: `out[o, y*s+ky, x*s+kx] += in[ci, y, x] * W[ci, o, ky, kx]`, then `+ bias[o]`, then activation. Backward (delta after the activation derivative): `db[o] = sum delta`, `dW[ci,o,ky,kx] = sum in[ci,y,x]*delta[o,y*s+ky,x*s+kx]`, `dx[ci,y,x] = sum W[ci,o,ky,kx]*delta[o,y*s+ky,x*s+kx]`. C++ additionally multiplies `dW` by `1/batch` and the optimizer divides by `batch` again (double normalisation); the exact gradient omits it; `GradMode::Cpp` reproduces it. GPU: forward via host round trip, backward via the whole-net CPU fallback (`requires_cpu_backward_fallback`), update through `update_cpu_fallback_weights`. (A later optimisation can map this onto `conv2d_backward_input_f32` / `conv2d_f32` / `conv2d_backward_weights_f32`, which are exactly the transposed pair with `filters = c`, `input_channels = n`.)
 
 **Files:**
-- Create: `src/darknet-core/src/deconv.rs`
-- Modify: `src/darknet-core/src/lib.rs`, `model.rs`, `runtime.rs`, `weights.rs`
+- Create: `src/lightnet-core/src/deconv.rs`
+- Modify: `src/lightnet-core/src/lib.rs`, `model.rs`, `runtime.rs`, `weights.rs`
 - Test: `deconv.rs` `mod tests`, `model.rs`, `weights.rs`, `runtime.rs` tests
 
 **Interfaces:**
@@ -2593,7 +2593,7 @@ Run: `./tools/test_host.sh deconv` — Expected: `deconv::tests::*` (3), `deconv
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/darknet-core/src/deconv.rs src/darknet-core/src/lib.rs src/darknet-core/src/model.rs src/darknet-core/src/runtime.rs src/darknet-core/src/weights.rs
+git add src/lightnet-core/src/deconv.rs src/lightnet-core/src/lib.rs src/lightnet-core/src/model.rs src/lightnet-core/src/runtime.rs src/lightnet-core/src/weights.rs
 git commit -m "feat(layers): deconvolutional (CPU exact backward, GPU host round trip, conv-layout weights)
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
@@ -2608,8 +2608,8 @@ Rust has no generic loss hook (only `compute_yolo_training_loss`). This task add
 C++ references: `cost_layer.cpp` (`master`: types `sse` (default), `masked`, `smooth`; `scale` key; `delta = scale * (truth - input)`, `masked` sets input to `SECRET_NUM = -1234` where truth is `SECRET_NUM`), `logistic_layer.cpp` (`raptor`: output = sigmoid(input); with truth `delta = t - p`, `error = -t ln p - (1-t) ln(1-p)`; backward adds delta), `regression_layer.cpp` (`fog`: l2, key `scale` default 1; C++ leaves `l.output` holding the per-element error; Rust passes the prediction through so inference is usable).
 
 **Files:**
-- Create: `src/darknet-core/src/dense_loss.rs`
-- Modify: `src/darknet-core/src/lib.rs` (`pub mod dense_loss;` + re-export `DenseTrainingLoss, compute_dense_training_loss`), `model.rs`, `runtime.rs`
+- Create: `src/lightnet-core/src/dense_loss.rs`
+- Modify: `src/lightnet-core/src/lib.rs` (`pub mod dense_loss;` + re-export `DenseTrainingLoss, compute_dense_training_loss`), `model.rs`, `runtime.rs`
 - Test: `dense_loss.rs` `mod tests`, `model.rs`, `runtime.rs`
 
 **Interfaces:**
@@ -2850,7 +2850,7 @@ CPU backward: add `| (LayerKind::Logistic, LayerParams::None) | (LayerKind::Regr
 ```rust
                 (LayerKind::Logistic, LayerParams::None) => self
                     .backend
-                    .activation_f32(current_input, darknet_cuda::F32ActivationKind::Logistic, launch_config)
+                    .activation_f32(current_input, lightnet_cuda::F32ActivationKind::Logistic, launch_config)
                     .map_err(|err| backend_error("logistic", err))?,
 ```
 GPU backward: add `| (LayerKind::Logistic, Some(LayerParams::None)) | (LayerKind::Regression(_), Some(LayerParams::None))` to the pass-through list at ~5438. Add `| LayerKind::Logistic | LayerKind::Regression(_)` to the `forward_compact` GPU fallback list.
@@ -2862,7 +2862,7 @@ Run: `./tools/test_host.sh dense_loss` / `loss_head_sections` / `gpu_logistic_he
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/darknet-core/src/dense_loss.rs src/darknet-core/src/lib.rs src/darknet-core/src/model.rs src/darknet-core/src/runtime.rs
+git add src/lightnet-core/src/dense_loss.rs src/lightnet-core/src/lib.rs src/lightnet-core/src/model.rs src/lightnet-core/src/runtime.rs
 git commit -m "feat(layers): logistic and regression heads, cost scale, host dense-truth loss
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
@@ -2875,7 +2875,7 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
 C++ `jev_ce_layer.cpp` (`Jev_laya`). Input `groups*candidates` logits per sample; output = `softmax(logits / T)` per group; with truth: loss per active group `-sum t_i ln p_i` (targets normalised per group, optional label smoothing, empty group = masked unless `ignore_empty=0`), `delta = (t - p) / T`, each sample's delta divided by its number of active groups when `normalize=1`; layer `cost = mean CE per active group`; backward adds `scale * delta`. Keys: `groups` (81), `candidates` (inferred as `inputs/groups`), `temperature`/`temp` (1), `normalize` (1), `ignore_empty` (1), `label_smoothing`/`smoothing` ([0,1)), `scale` (1), `layout = group | channel` (+ aliases). GPU: forward host round trip (C++ does the same), backward pass-through.
 
 **Files:**
-- Create: `src/darknet-core/src/jev_ce.rs`
+- Create: `src/lightnet-core/src/jev_ce.rs`
 - Modify: `lib.rs` (`pub(crate) mod jev_ce;`), `model.rs`, `dense_loss.rs`, `runtime.rs`
 - Test: `jev_ce.rs`, `model.rs`, `dense_loss.rs`, `runtime.rs`
 
@@ -3188,12 +3188,12 @@ GPU backward: add `| (LayerKind::JevCe(_), Some(LayerParams::None))` to the pass
 
 - [ ] **Step 6: Run to verify**
 
-Run: `./tools/test_host.sh jev_ce` — Expected: `jev_ce::tests::*` (4), `jev_ce_keys_follow_cpp_defaults_and_validation`, `jev_ce_head_seed_is_scale_times_delta_and_cost_is_mean_ce`, `gpu_jev_ce_head_matches_cpu_forward` all `ok`. Then `./tools/test_host.sh` (whole host suite, several minutes) — Expected: `test result: ok` for `darknet-core` and `darknet-cli` (the whole Phase 0 is now in).
+Run: `./tools/test_host.sh jev_ce` — Expected: `jev_ce::tests::*` (4), `jev_ce_keys_follow_cpp_defaults_and_validation`, `jev_ce_head_seed_is_scale_times_delta_and_cost_is_mean_ce`, `gpu_jev_ce_head_matches_cpu_forward` all `ok`. Then `./tools/test_host.sh` (whole host suite, several minutes) — Expected: `test result: ok` for `lightnet-core` and `lightnet-cli` (the whole Phase 0 is now in).
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/darknet-core/src/jev_ce.rs src/darknet-core/src/lib.rs src/darknet-core/src/model.rs src/darknet-core/src/dense_loss.rs src/darknet-core/src/runtime.rs
+git add src/lightnet-core/src/jev_ce.rs src/lightnet-core/src/lib.rs src/lightnet-core/src/model.rs src/lightnet-core/src/dense_loss.rs src/lightnet-core/src/runtime.rs
 git commit -m "feat(layers): jev_ce soft-target cross-entropy head
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
@@ -3222,11 +3222,11 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
 
 What the repo can and cannot do today, stated honestly:
 
-1. **Rust side.** `darknet-rs detect-image` with `DARKNET_LAYER_DUMP_DIR=<dir>` writes `layers.tsv` + `layer_NNN.f32` (raw f32, one file per layer, inference only). `tools/compare_layer_dumps.py <left> <right> --label ..` compares two dump dirs layer by layer (dims must match, prints `max_abs`/`max_rel`).
+1. **Rust side.** `lightnet-rs detect-image` with `LIGHTNET_LAYER_DUMP_DIR=<dir>` writes `layers.tsv` + `layer_NNN.f32` (raw f32, one file per layer, inference only). `tools/compare_layer_dumps.py <left> <right> --label ..` compares two dump dirs layer by layer (dims must match, prints `max_abs`/`max_rel`).
 2. **C++ side does not exist in the repo any more.** The dump hook was added to `src-lib/network_kernels.cu` (`forward_network_gpu`, branch `rust` history only) by commit `96f662f0`, and the whole C++ tree was removed by `2514cf53`. It is NOT on `Jev_laya`, `raptor`, `fog`, `jepa`, `depth_3d`, ... The hook only runs in inference (`not state.train`) on a CUDA build.
-3. **Therefore, for a layer that lives only on another branch:** (a) `git worktree add ../darknet-<branch> <branch>`; (b) `git -C ../darknet-<branch> apply <(git show 96f662f0 -- src-lib/network_kernels.cu)` (expect to resolve a small conflict); (c) build that C++ (user installs toolchains; ONE build at a time, `-j 2`, memory-capped, per `build_one_at_a_time_low_memory`); (d) run the C++ `darknet detector test` on a tiny cfg with the new layer plus a fixed image with `DARKNET_LAYER_DUMP_DIR=/tmp/cpp`; (e) run the Rust `detect-image` on the same cfg/weights/image with `DARKNET_LAYER_DUMP_DIR=/tmp/rust` and `tools/compare_layer_dumps.py /tmp/cpp /tmp/rust`. Expect `max_abs` around 1e-5 on f32 layers; the C++ CUDA reference runs `cudnn_half=1`, which alone explains up to ~5.7e-3 after convolutions (`tasks/rust/todo.md`), so compare the new layer's output against its own input rather than only the last layer.
-4. **Weights order** is the strongest cross-check and needs no C++ forward: generate weights with the C++ build (`darknet detector train` for one iteration, or any saved `.weights`), run `darknet-rs weights-inspect <cfg> <weights>`: it must report `trailing_bytes 0` and the per-layer array names/lengths must equal the plan. For layers where Rust is the first writer (swin), do the reverse: `save_weights` in Rust, load in the C++ branch build, dump, compare.
-5. **Backward and losses cannot be compared through dumps** (inference only). They are validated by: central finite differences of `L = sum(seed * forward)` in the pure-math module (every task above), CPU-vs-GPU parity on `FakeBackend`/oxide, and hand-derived numbers in tests. C++ gradient shortcuts are reproduced under `DARKNET_GRAD_MODE=cpp` so a future same-init training comparison (needs explicit user OK per the no-debug-training-runs rule) can use them.
+3. **Therefore, for a layer that lives only on another branch:** (a) `git worktree add ../lightnet-<branch> <branch>`; (b) `git -C ../lightnet-<branch> apply <(git show 96f662f0 -- src-lib/network_kernels.cu)` (expect to resolve a small conflict); (c) build that C++ (user installs toolchains; ONE build at a time, `-j 2`, memory-capped, per `build_one_at_a_time_low_memory`); (d) run the C++ `darknet detector test` on a tiny cfg with the new layer plus a fixed image with `LIGHTNET_LAYER_DUMP_DIR=/tmp/cpp`; (e) run the Rust `detect-image` on the same cfg/weights/image with `LIGHTNET_LAYER_DUMP_DIR=/tmp/rust` and `tools/compare_layer_dumps.py /tmp/cpp /tmp/rust`. Expect `max_abs` around 1e-5 on f32 layers; the C++ CUDA reference runs `cudnn_half=1`, which alone explains up to ~5.7e-3 after convolutions (`tasks/rust/todo.md`), so compare the new layer's output against its own input rather than only the last layer.
+4. **Weights order** is the strongest cross-check and needs no C++ forward: generate weights with the C++ build (`darknet detector train` for one iteration, or any saved `.weights`), run `lightnet-rs weights-inspect <cfg> <weights>`: it must report `trailing_bytes 0` and the per-layer array names/lengths must equal the plan. For layers where Rust is the first writer (swin), do the reverse: `save_weights` in Rust, load in the C++ branch build, dump, compare.
+5. **Backward and losses cannot be compared through dumps** (inference only). They are validated by: central finite differences of `L = sum(seed * forward)` in the pure-math module (every task above), CPU-vs-GPU parity on `FakeBackend`/oxide, and hand-derived numbers in tests. C++ gradient shortcuts are reproduced under `LIGHTNET_GRAD_MODE=cpp` so a future same-init training comparison (needs explicit user OK per the no-debug-training-runs rule) can use them.
 6. **When no C++ build of the owning branch is available** (the default in this environment): do the by-construction checks (this plan's formulas were copied from the C++ source with the file named in each task), run all Rust tests, and write one line per skipped parity check under the task in `tasks/rust/todo.md` ("C++ dump parity: NOT RUN, no build of `<branch>`"). Never write "matches C++" without a dump or an inspected `.weights`.
 
 ---
@@ -3242,13 +3242,13 @@ Cross-cutting prerequisites: (1) container layers (moe, eml, recursive_block, wm
 - **segmentation** (alias `segmenter`; `raptor`/`v6-dev-seg`, `src-seg/segmentation_layer.cpp/.hpp`, `seg_gate.cpp/.hpp`, `seg_gate_kernels.cu`; ~657 LOC; difficulty M). Keys `classes`(2), `max_delta`, `delta_normalizer`, `cls_normalizer`, `loss`, `lambda_ce`(1), `ce_normalizer`(1), `gate_enabled`, `gate_t_correct`(.9), `gate_warmup_iters`(1000), `gate_ramp_iters`(2000), `gate_max_compensation`(10). Math: `classes==1` sigmoid + logistic cross-entropy (the Task 10 `logistic` math per pixel), else per-pixel channel softmax (temperature) + softmax CE. Weights none. Needs: a dense mask truth (pixel classes) and a segmentation label loader in the data pipeline (not read yet), `Seg_resnet_1head`/`yolov4-tiny-seg*`/`unet_*` cfgs only if the user wants them (Open Question 1). The gate (`seg_gate*`) was not read; expand-plan step 1 is to read it and decide whether to port or reject `gate_enabled=1`. Kernels: none required (host loss). Depends on Task 10.
 - **omd_loss** (`Jev_laya` `omd_loss_layer.cpp`, 753 LOC; M). Pass-through output; in training builds a supervised pair set (keys `classes`, `truth_size`(6), `lambda`(.03), `margin`(.5), `small_boost`, `max_samples`(128), `pool`, `eps`, `max_delta`(10)) and ADDS metric-learning deltas to the PREVIOUS layer's delta (so it needs the previous layer's features and an extra seed on layer `idx-1`, unlike Task 10 heads). No weights. Tests: hand-built 2-sample pair sets + finite differences of the metric loss. Source not read in detail yet.
 - **LAYA small pieces** (`laya_marker_gather` S, `laya_scorer` S, `laya_act_head` S/M, `laya_loss` M; `Jev_laya`). Scorer = LayerNorm -> Linear(H,H) -> GELU -> Linear(H,1), frozen weights (`load_laya_scorer_weights`, `weights.cpp:1705`); head weights `load_laya_act_head_weights:1736`; loss `ce | rlcd`. **`laya_scorer`/`laya_marker_gather`/`laya_act_head`/`laya_loss`/`laya_encoder`/`laya_head` all done 2026-10-04/05** (`laya_head.rs` + `LayaHeadSpec`, 8 tests: bias LayerNorm, ReLU FFN blocks, type_emb, per-sample qtype, blob round trip, CPU runtime forward/parse). The full LAYA family is complete. **Blocked on Open Question 2**: user memory says the LAYA C++ port (inference `c14aed31`, training `3f903fca`/`b1299940`) lives on another branch and AdamW is required for its training; do not start until the user confirms LAYA belongs in Rust. Needs the shared LayerNorm/GEMM set (Phase 3A) and the exact (erf) vs tanh GELU question settled by reading the C++ scorer.
-- **Deferred Tier 0 leftovers** (do only on demand): (a) `maxpool_zero_nonmax` needs no separate GPU kernel: the existing argmax-only maxpool backward operation inherently zeros non-argmax deltas; real Oxide forward/backward/SGD parity is covered. (b) Rust-only legacy layers `gru` (backward + GPU), `local` (GPU), `batchnorm` (GPU training), `crop` (GPU training): not in any C++ branch's `ELayerType` (verified), 1-4 `cfg/unsupported` files use them, no reference to validate against. (c) `region` (YOLOv2; 12 cfgs under `cfg/unsupported`, `tiny-yolo_xnor.cfg`), `detection` (v1), `cost` classifier training and `contrastive`: Region now has the CPU `flatten`/objectness-logistic/optional class-softmax forward and exact supplied-seed adjoint (v0.1.027; see `implemented.md` §101), but its truth-driven loss/decode and GPU path remain open. Detection stays identity pass-through; Region/Detection loss/decode need a separate plan, and `contrastive_layer.cpp` still needs review. (d) `normalize_channels*` activations are conv-only and geometry-dependent (`activate_array_normalize_channels*` in `activations.cpp`; ReLU/softmax over channels per pixel, `eps=1e-4`). v65 added f32 host/Oxide primitives and v66 integrated CPU/f32-GPU convolution forward/backward, with exact default adjoints and source-derived CUDA shortcut gradients under `DARKNET_GRAD_MODE=cpp`. The parser rejects non-convolution uses; f16 inference is explicitly unsupported. No compiled-C++ golden is available. (e) shortcut optimizer/parameter updates remain host-side.
+- **Deferred Tier 0 leftovers** (do only on demand): (a) `maxpool_zero_nonmax` needs no separate GPU kernel: the existing argmax-only maxpool backward operation inherently zeros non-argmax deltas; real Oxide forward/backward/SGD parity is covered. (b) Rust-only legacy layers `gru` (backward + GPU), `local` (GPU), `batchnorm` (GPU training), `crop` (GPU training): not in any C++ branch's `ELayerType` (verified), 1-4 `cfg/unsupported` files use them, no reference to validate against. (c) `region` (YOLOv2; 12 cfgs under `cfg/unsupported`, `tiny-yolo_xnor.cfg`), `detection` (v1), `cost` classifier training and `contrastive`: Region now has the CPU `flatten`/objectness-logistic/optional class-softmax forward and exact supplied-seed adjoint (v0.1.027; see `implemented.md` §101), but its truth-driven loss/decode and GPU path remain open. Detection stays identity pass-through; Region/Detection loss/decode need a separate plan, and `contrastive_layer.cpp` still needs review. (d) `normalize_channels*` activations are conv-only and geometry-dependent (`activate_array_normalize_channels*` in `activations.cpp`; ReLU/softmax over channels per pixel, `eps=1e-4`). v65 added f32 host/Oxide primitives and v66 integrated CPU/f32-GPU convolution forward/backward, with exact default adjoints and source-derived CUDA shortcut gradients under `LIGHTNET_GRAD_MODE=cpp`. The parser rejects non-convolution uses; f16 inference is explicitly unsupported. No compiled-C++ golden is available. (e) shortcut optimizer/parameter updates remain host-side.
 
 ## Phase 2 — detection heads, MoE/EML/DCNv3, OBB
 
 **2A. Anchor-free heads** (`Jev_laya` `src-lib/modern_yolo_layer.cpp` 1254 LOC + 76-line wrappers `yolox_layer`, `ppyoloe_layer`, `yolonas_layer`; `centernet_layer.cpp` 857; L / M). No weights, no kernels: host decode/assign/loss. Keys `classes`, `max`, `jitter`, `resize`, `reg_max`(16); centernet adds `center_min_radius`, `peak_nms`, `anisotropic_gaussian`, `small_*`, `focal_alpha/beta`, `hm/wh/off_normalizer`, `max_delta`, `delta_normalizer` and needs `classes + 4` filters before it. Math: YOLOX SimOTA assignment + IoU/obj/cls loss; PP-YOLOE/YOLO-NAS distribution-focal-loss box regression with task-aligned assignment; CenterNet focal heatmap + wh + offset. Rust needs: new `LayerKind`s, a decode path next to `decode_yolo_detections` (`detect.rs` only understands yolo heads), evaluation (`evaluate.rs` mAP) for the new outputs, `compute_*_training_loss` modules. **Port the LegoGears nested-object fix** that lives in this file (`class_quality`, smallest-area-wins, min-cell-size gate; user memory `legogears_nested_object_fix`) together with the head. Tests: hand-built targets for assignment, finite differences of each loss term, decode round trip. Order: yolox, then ppyoloe/yolonas (shared DFL), then centernet. **All four are integrated; Phase 2A is complete** (`implemented.md` §6, `layer-support.md`). Remaining 2A-adjacent item: running `cfg/LegoGears_centernet.cfg` end to end (the cfg lives on `Jev_laya`).
 
-**2B. moe_convolutional** (692 + 439 kernel LOC; M). Experts are convolutions; router = global-average-pool -> `Wr*pooled + br`, top-k, temperature softmax gates; `out = sum_e gate_e * expert_e(x)`; load-balance loss `alpha * max(0, E*sum(mean_gate^2) - 1)`. Keys `experts`, `top_k`, `load_balance`, `temperature`. **Weights `[verified]`** (`save_moe_convolutional_weights`): for each expert `e` in `0..total`: the full `save_convolutional_weights` block (biases, [BN scales, rolling mean, rolling variance], weights); then router `biases` (`nbiases`), router `weights` (`nweights`). **CPU done 2026-10-05** (commit `cdf68d00`): `src/darknet-core/src/moe_conv.rs` + `MoeSpec` + `LayerKind::Moe` + runtime `LayerParams::Moe`/`MoeTrainBuffers` (CPU fwd/bwd/update, hand-computed blend test, FD gradient tests). Container-conv reuse turned out **not** to be needed for the CPU path - the experts reuse the existing conv forward/backward directly. For GPU, the `(owner, slot)` cache prerequisite and no-BN Oxide forward/backend backward are implemented. Router/expert gradients and SGD momentum accumulate on-device, and both parameter blocks update there; router parameter values sync to host after each step for forward. No-BN Adam updates also run on-device and persist moments in DNOPT3 (DNOPT2 host moments migrate on first device update); BN expert backward uses backend ops; BN SGD updates weight, beta, and scale on-device with momentum in device buffers; BN Adam also persists scale moments in DNOPT4. **eml_convolutional** (inside `convolutional_layer.cpp:1210-2104`, no cfg users; M): two parallel convs `x`,`y`; `out = scale*(exp(clamp(x,+-c)) - ln(softplus(y)+eps))` (+ input if `residual`); keys `eml_clamp`(4), `eml_eps`(1e-6), `eml_scale`(.1), `residual`(1); activation `eml` = `e^x - ln1p(e^x) - (1 - ln2)` with threshold 2 (`activations.cpp:205`); save order **verified 2026-10-05** (`weights.cpp:775-793` save, `:2000-2015` load): the `EML_CONV` case writes/reads `save_convolutional_weights(l.input_layer)` then `save_convolutional_weights(l.self_layer)`, i.e. two complete conv blocks in that order (biases, [BN scales, mean, var], weights) - the two parallel convs are named `input_layer` and `self_layer`. **dcnv3** (247 + 479; M): conv keys + `offset_scale`; per group `groups*size^2*2` offsets and `groups*size^2` masks (softmax over `K`). **Weights `[verified]`** (`save_dcnv3_weights`): conv `biases(n)`, [BN scales, mean, var], `weights`, then `offset_weights` (`offset_filters*c*k*k`), `offset_biases(offset_filters)`, `mask_weights` (`mask_filters*c*k*k`), `mask_biases(mask_filters)` with `offset_filters = groups*k*k*2`, `mask_filters = groups*k*k`. Kernels: bilinear sampling im2col (reuse `im2col.rs`) for dcnv3.
+**2B. moe_convolutional** (692 + 439 kernel LOC; M). Experts are convolutions; router = global-average-pool -> `Wr*pooled + br`, top-k, temperature softmax gates; `out = sum_e gate_e * expert_e(x)`; load-balance loss `alpha * max(0, E*sum(mean_gate^2) - 1)`. Keys `experts`, `top_k`, `load_balance`, `temperature`. **Weights `[verified]`** (`save_moe_convolutional_weights`): for each expert `e` in `0..total`: the full `save_convolutional_weights` block (biases, [BN scales, rolling mean, rolling variance], weights); then router `biases` (`nbiases`), router `weights` (`nweights`). **CPU done 2026-10-05** (commit `cdf68d00`): `src/lightnet-core/src/moe_conv.rs` + `MoeSpec` + `LayerKind::Moe` + runtime `LayerParams::Moe`/`MoeTrainBuffers` (CPU fwd/bwd/update, hand-computed blend test, FD gradient tests). Container-conv reuse turned out **not** to be needed for the CPU path - the experts reuse the existing conv forward/backward directly. For GPU, the `(owner, slot)` cache prerequisite and no-BN Oxide forward/backend backward are implemented. Router/expert gradients and SGD momentum accumulate on-device, and both parameter blocks update there; router parameter values sync to host after each step for forward. No-BN Adam updates also run on-device and persist moments in DNOPT3 (DNOPT2 host moments migrate on first device update); BN expert backward uses backend ops; BN SGD updates weight, beta, and scale on-device with momentum in device buffers; BN Adam also persists scale moments in DNOPT4. **eml_convolutional** (inside `convolutional_layer.cpp:1210-2104`, no cfg users; M): two parallel convs `x`,`y`; `out = scale*(exp(clamp(x,+-c)) - ln(softplus(y)+eps))` (+ input if `residual`); keys `eml_clamp`(4), `eml_eps`(1e-6), `eml_scale`(.1), `residual`(1); activation `eml` = `e^x - ln1p(e^x) - (1 - ln2)` with threshold 2 (`activations.cpp:205`); save order **verified 2026-10-05** (`weights.cpp:775-793` save, `:2000-2015` load): the `EML_CONV` case writes/reads `save_convolutional_weights(l.input_layer)` then `save_convolutional_weights(l.self_layer)`, i.e. two complete conv blocks in that order (biases, [BN scales, mean, var], weights) - the two parallel convs are named `input_layer` and `self_layer`. **dcnv3** (247 + 479; M): conv keys + `offset_scale`; per group `groups*size^2*2` offsets and `groups*size^2` masks (softmax over `K`). **Weights `[verified]`** (`save_dcnv3_weights`): conv `biases(n)`, [BN scales, mean, var], `weights`, then `offset_weights` (`offset_filters*c*k*k`), `offset_biases(offset_filters)`, `mask_weights` (`mask_filters*c*k*k`), `mask_biases(mask_filters)` with `offset_filters = groups*k*k*2`, `mask_filters = groups*k*k`. Kernels: bilinear sampling im2col (reuse `im2col.rs`) for dcnv3.
 
 **2C. OBB family** (`raptor`, `raptor-dev`, `raptor-fp4`, `origin-github/obb*`; XL, scope-gated by Open Question 4). `obb_yolo` (`yolo_layer.cpp` 1851 lines on raptor, `darknet_cfg_obb.cpp`, `obb_loss.cpp`, `box_obb.cpp`, `obb_covariance_loss_kernels.cu`, `detector_map_obb.cpp`, `calcanchors_obb.cpp`; coords 6, truth size 7 with a front point; needs `[net] obb=1`/`rotate_obb`), `obb_anchorless` (840), `yolo_2stage` (549, after obb_yolo), `obb_refine` (1280, depends on obb_yolo, weights layout not read). Touches data loading (rotated boxes), augmentation, NMS and mAP (`evaluate.rs`), not just the layer. v75 adds legacy front-point rectangle vertices/IoU; v76 adds CARPN quad IoU; v77 adds typed OBB dispatch/NMS; v78 adds head decode; v79 adds label parsing; v80 adds source-derived label rotation; v81 adds cfg/runtime decode; v82 adds direct-resize OBB batch loading; v83 adds standalone OBB AP; v84 adds validation evaluation; v85 adds CPU `detector map`; v86 parses/defaults `nms_kind=obb` and rejects unsupported alternatives; v87 adds a standalone horizontal-mirror label transform; v88 applies caller-selected per-image flips to OBB batch tensors and labels together; v89 adds source-derived direction-free anchor size matching and best-anchor/cell assignment primitives; v90 adds seeded config-driven flips through an OBB-specific batch loader; v91 adds source-layout seven-float truth-row packing with absent-front placeholders and zero padding; v92 enumerates the primary best-anchor and strict-threshold additional per-head positives; v93 selects best-truth and ignore/positive gates from precomputed source-style scores; v94 adds standalone CARPN polygon mAP for normalized quad detections and front-point labels; v96 adds source-style per-cell objectness deltas from the v93 match gates, including ignore smoothing and positive-target override; v97 adds source CIoU-OBB match-quality scoring for decoded geometries; v98 decodes one cell's post-YOLO channels for the source CIoU/default score path; v99 composes per-truth scores with source class-gated ignore and positive-threshold selection for one cell; v100 adds source-style class-channel deltas for positive cells; v101 adds standalone covariance-W2 loss terms and `exp(-loss)` quality scoring for decoded geometries; v102 adds one-cell raw covariance-branch score decoding; v103 adds the source QBBV heatmap and sampled vIoU metric; v104 adds the source QBBV blend and covariance-branch integration; v105 adds the source legacy angular fallback scorer with one-cell decode/blend; v106 adds decoded COBB loss/quality and QBBV blending; v107 adds raw-channel COBB match decoding and source branch gates; v108 adds one-cell covariance-first/COBB/angular score dispatch; v109 composes branch scores with per-truth cell gates; v110 enumerates primary/additional positives across batch slots and multiple heads; v111 maps caller-selected head/cell predictions to batch-specific truths and tagged match gates; v112 traverses a complete batch-major head tensor in source cell/anchor order with callback-bounded memory; v113 emits source objectness deltas for batch/head cells, including ignore and positive overrides; v114 writes them to the objectness channel of one head's delta tensor while preserving other entries; v115 applies source best/additional positive-anchor objectness overrides with class mapping and smooth-mode preservation; v116 writes source class-channel deltas at those positives with existing-target behavior; v117 adds source finite-difference COBB/legacy box deltas and positive-anchor writeback; v118 ports source covariance-W2 analytic geometry gradients; v119 routes those gradients into positive-anchor box-delta writeback; v120 returns `avg_cat` contributions from best/additional class assignments; v121 applies mapped class multipliers to box-delta normalization; v122 applies truth-threshold cell class and box deltas after the all-cell objectness pass; v123 composes ordered delta passes for one complete head; v124 dispatches across multiple head tensors; v125 adds a standalone source center-front-anchor point decoder; v126 routes optional anchor offsets through head matching and box deltas; v127 aggregates per-head `avg_cat`, threshold-positive, and box-positive stats across multi-head dispatch; v128 reports source `net.total_bbox` counts across threshold-cell and best/additional-anchor assignments; v129 adds standalone source front-point CIoU deltas, including raw-channel grid scaling and optional anchor center-chain contributions; v130 writes these deltas to best/additional positive anchor channels with class scaling; v131 writes them to truth-threshold-positive cells with class scaling; v132 composes both front writeback passes in one-head source order; v133 dispatches that composition across multiple heads; v134 aggregates source-normalized front-loss sums/counts across truth-threshold and best/additional passes; v135 parses source `obb_anchors` pair/quadruple forms and retains directional priors in the OBB spec; v136 parses `front_loss_normalizer` with the source alias and default; v137 binds parsed OBB specs to per-head matching, assignment, box, and front-delta configs; v138 supports independent front-delta configs across heads; v139 builds per-layer output-gradient seeds from network OBB forward heads; v140 propagates those deltas through runtime backward to input and parameter gradients; v141 adds a one-subdivision CPU SGD batch step with explicit Adam/subdivision rejection; v142 accumulates configured subdivisions and applies one normalized SGD update; v143 parses OBB per-class counters and routes the resulting class multipliers; v144 parses relative `map=` files and routes class IDs into assignments; v145 parses and routes covariance/COBB/QBBV score options into match and box-delta configs; v146 parses `iou_loss` and dispatches the CIoU-OBB match path by source mode/default conditions; v147 routes `front_loss_normalizer` into covariance match-score length weighting; v148 retains standard `iou_loss` choices and routes them into front-point delta config; v149 retains `iou_thresh_kind` with the source default; v150 tracks `ciou_obb_mul` and rejects it in training-config construction until its distinct loss path is implemented; v151 aggregates source angle-error metrics in front-aware stats across assignments/heads/subdivisions; v152 separates MSE weighted matching scores from the source CIoU-OBB box-delta fallback; v153 accumulates covariance and COBB box-gradient contributions independently when both branches are active; v154 combines their match scores by configured weights when both branches are active; v155 exposes the raw source `sum(delta²)` cost for all-MSE OBB heads; v156 reports the objectness-normalized non-box delta-squared classification component for all modes; v157 permits MSE weighted match scoring and CIoU-OBB box deltas to stay distinct through batch dispatch; v158 aggregates source-style MSE and supported non-MSE costs per head, averaging box loss over best/additional anchor assignments only; v159 routes `detector train` through a bounded CPU OBB SGD loop with subdivisions, supported resize/flip loading, checkpoint and loss-CSV output, and explicit rejection of unsupported modes; v160 writes a separate subdivision-aggregated metrics CSV with assignment-weighted IoU/GIoU and class averages, loss components, front loss, and orientation statistics; v161 routes CPU OBB training `-map` through orientation-aware validation and the shared cadence, logging periodic/final reports and saving best weights. The CLI test verifies `-map_every 2` and final evaluation; `detector_train_` passed 4 CLI tests, `map_` passed 4 CLI + 11 core tests, and `obb_` passed 119 core + 1 CLI test. v162 routes `detect-image` `[net] obb=1` inference through orientation-aware decoding and reports legacy front-point geometry in human and TSV output; mixed OBB/modern heads fail explicitly. The focused dispatch/formatting tests passed, `detect_` passed 2 CLI tests, and `obb_` passed 119 core + 2 CLI tests. v163 accepts source `default` and `cornersnms` OBB NMS using AABB IoU, retaining orientation-aware `obb` and source aliases; the OBB NMS-kind cfg/overlap tests and `MEM=3G ./tools/test_host.sh obb_` (120 core + 2 CLI tests) passed. v164 adds source `greedynms` (fixed 0.6 DIoU exponent) and `diounms` (`beta_nms`, default 0.6) AABB score paths; non-finite betas and mismatched multi-head DIoU betas reject explicitly. The NMS/cfg/multi-head tests and `MEM=3G ./tools/test_host.sh obb_` (122 core + 2 CLI tests) passed. Still open: remaining cfg/training option wiring, broader GPU/optimizer integration and OBB GPU training/`-map`, broader metric/loss logging, source-faithful crop/resize and mosaic label transforms, CARPN Stage-2 training (`detector train -map` for `[obb_refine]`), and the remaining family layers (`obb_anchorless`, `yolo_2stage`). Done and no longer open: weighted OBB NMS (v0.0.251–253) and CARPN CPU network inference, `detect-image`, and direct `detector map` (v0.0.259). No compiled-C++ parity is established. Expand the family incrementally and keep unsupported semantics explicit.
 
@@ -3381,10 +3381,10 @@ Questions at the end of this document rather than on code:
 
 | Phase | Blocked on | Notes |
 |---|---|---|
-| 1b `segmentation` | - | **done 2026-10-04**: `src/darknet-core/src/segmentation.rs` + `SegmentationSpec`, including the C++ correct-pixel gate. The label loader, the `seg_gate` GPU kernel and the cfgs stay open (Open Questions 1 and 5) |
-| 1b `omd_loss` | - | **done 2026-10-04**: `src/darknet-core/src/omd_loss.rs` + `OmdLossSpec`, all three samplers and the metric pair loss. It turned out **not** to need the extra seed on layer `idx-1` the plan assumed: the layer is a plain pass-through in both directions, so its own seed already reaches the previous layer. `show_details` reporting and a real detector cfg are still open |
+| 1b `segmentation` | - | **done 2026-10-04**: `src/lightnet-core/src/segmentation.rs` + `SegmentationSpec`, including the C++ correct-pixel gate. The label loader, the `seg_gate` GPU kernel and the cfgs stay open (Open Questions 1 and 5) |
+| 1b `omd_loss` | - | **done 2026-10-04**: `src/lightnet-core/src/omd_loss.rs` + `OmdLossSpec`, all three samplers and the metric pair loss. It turned out **not** to need the extra seed on layer `idx-1` the plan assumed: the layer is a plain pass-through in both directions, so its own seed already reaches the previous layer. `show_details` reporting and a real detector cfg are still open |
 | 1b `laya_*` | - | **done 2026-10-05**: whole family (`laya_scorer`, `laya_marker_gather`, `laya_act_head`, `laya_loss`, `laya_encoder`, `laya_head`) |
-| 1b deferred (c) `contrastive` | - | **partly done 2026-10-04**: classifier branch ported (`src/darknet-core/src/contrastive.rs`). The detection branch needs the yolo head's per-box class ids, so it reports itself as unported. `region` / `detection` decode+loss still open |
+| 1b deferred (c) `contrastive` | - | **partly done 2026-10-04**: classifier branch ported (`src/lightnet-core/src/contrastive.rs`). The detection branch needs the yolo head's per-box class ids, so it reports itself as unported. `region` / `detection` decode+loss still open |
 | 2A anchor-free heads | nothing left | **complete**, including `decode.rs` / `evaluate.rs` integration (`implemented.md` §6) |
 | 2B `moe_convolutional`, `eml_convolutional`, `dcnv3` | `dcnv3` has no reference | MoE CPU and Oxide forward/backward plus SGD/Adam for no-BN and BN experts; BN expert SGD momentum is device-resident and BN Adam scale moments persist in DNOPT4. `eml` save order verified 2026-10-05 (`input_layer` then `self_layer`) |
 | 2C OBB family | CARPN Stage-2 training + OBB GPU | CPU inference/decode/NMS/mAP done through v0.0.259; training and GPU remain |

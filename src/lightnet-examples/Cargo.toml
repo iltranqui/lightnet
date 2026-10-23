@@ -1,0 +1,11 @@
+[package]
+name = "lightnet-examples"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lightnet-core = { path = "../lightnet-core" }
+image = "0.25.10"
+imageproc = "0.26.1"
+serde_json = "1.0"

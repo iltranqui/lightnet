@@ -20,13 +20,13 @@ Work in progress. Per-layer CPU, GPU, f16 and axis status is tracked in `tasks/r
 
 | Path | Contents |
 |---|---|
-| `src/darknet-core` | Layers, cfg parsing, weights, training, evaluation |
-| `src/darknet-cuda` | Backend-neutral GPU tensor traits |
-| `src/darknet-cuda-cutile` | Optional cuTile GPU backend (not a workspace member) |
-| `src/darknet-cuda-oxide` | Optional cuda-oxide GPU backend (not a workspace member) |
-| `src/darknet-cli` | The `darknet-rs` command-line binary |
-| `src/darknet-examples` | Rust equivalents of the Darknet example programs |
-| `src/darknet-gui*` | Annotation GUI (opt-in) |
+| `src/lightnet-core` | Layers, cfg parsing, weights, training, evaluation |
+| `src/lightnet-cuda` | Backend-neutral GPU tensor traits |
+| `src/lightnet-cuda-cutile` | Optional cuTile GPU backend (not a workspace member) |
+| `src/lightnet-cuda-oxide` | Optional cuda-oxide GPU backend (not a workspace member) |
+| `src/lightnet-cli` | The `lightnet-rs` command-line binary |
+| `src/lightnet-examples` | Rust equivalents of the Darknet example programs |
+| `src/lightnet-gui*` | Annotation GUI (opt-in) |
 | `third_party/cuda-oxide` | [NVlabs/cuda-oxide](https://github.com/NVlabs/cuda-oxide) submodule, pinned to `728539f65` |
 | `cfg/` | Model configs and dataset descriptors |
 | `tools/` | Test, benchmark and parity scripts |
@@ -39,21 +39,21 @@ Each folder has a `CONTEXT.md` describing its role; start from `CLAUDE.md` and `
 
 - Clone with `git clone --recurse-submodules` (submodules: `src/cutile-rs-aot` = NVlabs/cutile-rs v0.2.0, `third_party/cuda-oxide` = NVlabs/cuda-oxide `728539f65`).
 - Rust nightly pinned in `rust-toolchain.toml` (installed automatically by `rustup`).
-- For GPU backends: CUDA 13.2 or newer (the repo defaults to `/usr/local/cuda-13.4`, overridable through `CUDA_TOOLKIT_PATH`) and libclang. See `src/darknet-cuda-cutile/README.md` and `src/darknet-cuda-oxide/README.md`.
+- For GPU backends: CUDA 13.2 or newer (the repo defaults to `/usr/local/cuda-13.4`, overridable through `CUDA_TOOLKIT_PATH`) and libclang. See `src/lightnet-cuda-cutile/README.md` and `src/lightnet-cuda-oxide/README.md`.
 
 ## Build and run
 
 CPU build of the command-line tool:
 
 ```
-cargo build --release -p darknet-cli -j 4
-./target/release/darknet-rs version
-./target/release/darknet-rs cfg-validate cfg/<model>.cfg
-./target/release/darknet-rs detector train <cfg> <data>
-./target/release/darknet-rs detector map <cfg> <data>
+cargo build --release -p lightnet-cli -j 4
+./target/release/lightnet-rs version
+./target/release/lightnet-rs cfg-validate cfg/<model>.cfg
+./target/release/lightnet-rs detector train <cfg> <data>
+./target/release/lightnet-rs detector map <cfg> <data>
 ```
 
-Other subcommands include `cfg-summary`, `names` and `weights-inspect`; see `src/darknet-cli/src/main.rs`. The annotation GUI is opt-in: `cargo build -p darknet-gui`.
+Other subcommands include `cfg-summary`, `names` and `weights-inspect`; see `src/lightnet-cli/src/main.rs`. The annotation GUI is opt-in: `cargo build -p lightnet-gui`.
 
 The cuda-oxide backend is built only through `./tools/test_oxide.sh`.
 
@@ -63,7 +63,7 @@ The cuda-oxide backend is built only through `./tools/test_oxide.sh`.
 ./tools/test_host.sh
 ```
 
-Use at most 4 build threads. GPU tests need a CUDA device and run single-threaded; see `src/darknet-cuda-oxide/README.md`.
+Use at most 4 build threads. GPU tests need a CUDA device and run single-threaded; see `src/lightnet-cuda-oxide/README.md`.
 
 ## Documentation
 

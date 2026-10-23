@@ -14,7 +14,7 @@ Rust port of Darknet/YOLO (branch `rust`) with CPU, cuTile and cuda-oxide GPU ba
 
 | Zone | Path | Entry file |
 |---|---|---|
-| Product (Darknet port) | `src/darknet-*` | `src/<crate>/CONTEXT.md` |
+| Product (Darknet port) | `src/lightnet-*` | `src/<crate>/CONTEXT.md` |
 | cuda-oxide (submodule) | `third_party/cuda-oxide` | `third_party/CONTEXT.md` |
 | Roadmap and plans | `tasks/rust/` | `tasks/rust/CONTEXT.md` |
 | Reference docs | `docs/` | `docs/CONTEXT.md` |
@@ -37,13 +37,13 @@ Whole-repo map: [CONTEXT.md](CONTEXT.md).
 
 | Command | Alias | Runs |
 |---|---|---|
-| `cargo xtask check [pkg...]` | `c` | `cargo check` (default: `darknet-cli`, `darknet-core`) |
-| `cargo xtask gpu-check` | `gc` | `cargo check -p darknet-cli --features oxide` |
-| `cargo xtask build [pkg...]` | `b` | `cargo build` (default: `darknet-cli`) |
-| `cargo xtask clippy [pkg...]` | `l` | `cargo clippy` (default: `darknet-cli`, `darknet-core`) |
+| `cargo xtask check [pkg...]` | `c` | `cargo check` (default: `lightnet-cli`, `lightnet-core`) |
+| `cargo xtask gpu-check` | `gc` | `cargo check -p lightnet-cli --features oxide` |
+| `cargo xtask build [pkg...]` | `b` | `cargo build` (default: `lightnet-cli`) |
+| `cargo xtask clippy [pkg...]` | `l` | `cargo clippy` (default: `lightnet-cli`, `lightnet-core`) |
 | `cargo xtask test [filter...]` | `t`, `host` | host tests, same as `tools/test_host.sh` (`PKGS` overrides the packages) |
 | `cargo xtask oxide [args...]` | `o` | `tools/test_oxide.sh` (GPU tests; args pass through) |
-| `cargo xtask train_legogears [-fp8\|-fp16\|-bf16\|-fp8 -fp16\|-fp8 -bf16] [weights] [flags...]` | `train`, `tr` | `tools/train_legogears_oxide.sh`: release oxide build, then LegoGears_v2 training. `-fp8` sets `DARKNET_OXIDE_GEMM=fp8` and `DARKNET_OXIDE_GEMM_BWD=fp8` (e5m2 gradients), `-fp16` sets `DARKNET_OXIDE_AMP=1` (mixed precision) and adds `-dyn_scale -loss_scale 1024` unless supplied; `-bf16` sets `DARKNET_OXIDE_AMP=bf16` (no loss scaling). Plain `-fp8` and the no-flag default keep f32 storage (an inherited `DARKNET_OXIDE_AMP` is unset for the child); `-fp8 -fp16` and `-fp8 -bf16` (either order) set both groups, i.e. fp8 convolution GEMMs on 16-bit activation storage, with the `-fp16` scaler rule. Default is fp32 |
+| `cargo xtask train_legogears [-fp8\|-fp16\|-bf16\|-fp8 -fp16\|-fp8 -bf16] [weights] [flags...]` | `train`, `tr` | `tools/train_legogears_oxide.sh`: release oxide build, then LegoGears_v2 training. `-fp8` sets `LIGHTNET_OXIDE_GEMM=fp8` and `LIGHTNET_OXIDE_GEMM_BWD=fp8` (e5m2 gradients), `-fp16` sets `LIGHTNET_OXIDE_AMP=1` (mixed precision) and adds `-dyn_scale -loss_scale 1024` unless supplied; `-bf16` sets `LIGHTNET_OXIDE_AMP=bf16` (no loss scaling). Plain `-fp8` and the no-flag default keep f32 storage (an inherited `LIGHTNET_OXIDE_AMP` is unset for the child); `-fp8 -fp16` and `-fp8 -bf16` (either order) set both groups, i.e. fp8 convolution GEMMs on 16-bit activation storage, with the `-fp16` scaler rule. Default is fp32 |
 | `cargo xtask fmt` | `f` | `cargo fmt --all` |
 
 Every command exports the detected GPU arch as the advisory `CUDA_OXIDE_DEVICE_ARCH` (unless `CUDA_OXIDE_TARGET` or `CUDA_OXIDE_DEVICE_ARCH` is already set).
@@ -53,7 +53,7 @@ Environment: `MEM` (default `3G`), `JOBS` (default 2, clamped to 4; `train_legog
 ## Hard rules
 
 - Max 4 build threads, wrap builds in `systemd-run --user --scope -p MemoryHigh=3G`; `cargo xtask` does both (see [Commands](#commands)).
-- `src/darknet-cuda-oxide` is not a workspace member; build it only with `cargo xtask oxide` (`./tools/test_oxide.sh`).
+- `src/lightnet-cuda-oxide` is not a workspace member; build it only with `cargo xtask oxide` (`./tools/test_oxide.sh`).
 - Commit only the files a task names, never `git add -A`.
 
 Full rule set lives in `tasks/rust/AGENTS.md`.

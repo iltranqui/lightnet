@@ -1,0 +1,34 @@
+[package]
+name = "lightnet-cuda-oxide"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[lib]
+name = "lightnet_cuda_oxide"
+path = "src/lib.rs"
+
+[dependencies]
+lightnet-cuda = { path = "../lightnet-cuda" }
+# Device-side intrinsics (thread indexing, slices, barriers).
+cuda-device = { path = "../../third_party/cuda-oxide/cuda-oxide/crates/cuda-device" }
+# Host-side launch glue used by `#[cuda_module]`.
+cuda-host = { path = "../../third_party/cuda-oxide/cuda-oxide/crates/cuda-host" }
+# Host-side CUDA driver wrapper.
+cuda-core = "0.3.1"
+
+[dev-dependencies]
+# Runtime-level tests: `GpuExecutableNetwork<OxideBackend>` vs the CPU
+# `ExecutableNetwork` (tests/oxide_runtime_chain.rs).
+lightnet-core = { path = "../lightnet-core" }
+
+# Keep this CUDA bridge independent from the parent CPU workspace: kernels
+# only compile through `cargo oxide` (rustc-codegen-cuda).
+[workspace]
+
+# `cargo oxide test` compiles with the Cargo-selected profile. At opt-level 0
+# rustc passes `AtomicOrdering::*` through a temporary, which the device
+# importer rejects ("atomic ordering must be a compile-time constant"); the
+# crop backward kernel needs float atomics, so keep MIR const-propagation on.
+[profile.dev]
+opt-level = 1

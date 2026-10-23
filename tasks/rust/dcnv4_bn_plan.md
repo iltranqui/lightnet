@@ -34,9 +34,9 @@ contract, not compiled-C++ training-BN parity (C++ CPU backward is a stub).
 
 ## Files and verification
 
-Keep family math in `src/darknet-core/src/runtime/dcnv4_gpu.rs`, shared hooks in
+Keep family math in `src/lightnet-core/src/runtime/dcnv4_gpu.rs`, shared hooks in
 `runtime.rs` minimal, and update `runtime/tests/dcnv4_gpu_tests.rs`,
-`src/darknet-cuda-oxide/tests/oxide_dcnv4_bn.rs` and `oxide_runtime_chain.rs`.
+`src/lightnet-cuda-oxide/tests/oxide_dcnv4_bn.rs` and `oxide_runtime_chain.rs`.
 Use serial -j 2 (max4), MemoryHigh=3G, test_oxide.sh only for Oxide. No dataset
 training/subagents/unrelated edits or speedup/C++ parity claims. After runtime
 changes run runtime:: and dcnv4 host filters, relevant real-device derivatives,

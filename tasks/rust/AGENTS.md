@@ -28,7 +28,7 @@ Done when all three lines are complete, each version has its tests passing and i
 
 - Max 4 build threads (`-j 4`; repo scripts use `-j 2`). One build/test command at a time, never two in parallel.
 - Cap memory: `systemd-run --user --scope -p MemoryHigh=3G <cmd>` (scripts take `MEM=3G`). If no user systemd bus, run uncapped and say so.
-- `src/darknet-cuda-oxide` is not a workspace member: build/test it only via `./tools/test_oxide.sh` (`cargo oxide`).
+- `src/lightnet-cuda-oxide` is not a workspace member: build/test it only via `./tools/test_oxide.sh` (`cargo oxide`).
 - Backward = exact derivative of the Rust forward. C++ deviations only under `GradMode::Cpp`.
 - Unknown config = error, never silent identity.
 - Never claim C++ parity: no compiled C++ exists here. Write "hand-derived from source, no compiled-C++ golden".
@@ -43,10 +43,10 @@ Done when all three lines are complete, each version has its tests passing and i
 ## Commands
 
 ```
-MEM=3G ./tools/test_host.sh [filter]         # darknet-core + darknet-cli; filter is much faster
+MEM=3G ./tools/test_host.sh [filter]         # lightnet-core + lightnet-cli; filter is much faster
 MEM=3G ./tools/test_oxide.sh --test <name>   # one oxide suite (~15 min for all)
-cargo check -p darknet-cli --features oxide -j 4
-cargo test -p darknet-core --test cfg_corpus -j 2   # run alone; >1 h under load
+cargo check -p lightnet-cli --features oxide -j 4
+cargo test -p lightnet-core --test cfg_corpus -j 2   # run alone; >1 h under load
 ```
 
 A `cfg_corpus` timeout is neither a pass nor a failure.

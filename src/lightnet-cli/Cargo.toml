@@ -1,0 +1,23 @@
+[package]
+name = "lightnet-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lightnet-core = { path = "../lightnet-core" }
+lightnet-cuda = { path = "../lightnet-cuda" }
+rayon = "1"
+serde_json.workspace = true
+# cuda-oxide backend: optional, only compiles through `cargo oxide`
+# (rustc-codegen-cuda). Build with:
+#   target/debug/cargo-oxide oxide build -- -p lightnet-cli --features oxide -j 1
+lightnet-cuda-oxide = { path = "../lightnet-cuda-oxide", optional = true }
+
+[features]
+default = []
+oxide = ["dep:lightnet-cuda-oxide"]
+
+[[bin]]
+name = "lightnet-rs"
+path = "src/main.rs"

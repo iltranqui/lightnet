@@ -20,7 +20,7 @@ Reference shelf: stable explanations and benchmark evidence. Plans and status li
 
 ## Who cites what
 
-`OXIDE_BENCH.md` is cited by `tools/oxide_parity_*.py`, `src/darknet-cli/src/main.rs`, `src/darknet-cuda-oxide/README.md`, `src/darknet-cuda-oxide/tests/oxide_amp.rs` and `tasks/rust/implemented.md`. Do not rename or split it without updating those.
+`OXIDE_BENCH.md` is cited by `tools/oxide_parity_*.py`, `src/lightnet-cli/src/main.rs`, `src/lightnet-cuda-oxide/README.md`, `src/lightnet-cuda-oxide/tests/oxide_amp.rs` and `tasks/rust/implemented.md`. Do not rename or split it without updating those.
 
 ## Constraints
 

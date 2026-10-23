@@ -13,7 +13,7 @@
 
 ## Purpose and boundary
 
-Enable the existing public OBB mAP entry point to score caller-provided CARPN quadrilateral detections against OBB labels, using the already-implemented CARPN polygon IoU helper. The current explicit rejection is in `src/darknet-core/src/evaluate.rs::obb_detector_map` (`CARPN polygon mAP is not implemented for OBB YOLO labels`).
+Enable the existing public OBB mAP entry point to score caller-provided CARPN quadrilateral detections against OBB labels, using the already-implemented CARPN polygon IoU helper. The current explicit rejection is in `src/lightnet-core/src/evaluate.rs::obb_detector_map` (`CARPN polygon mAP is not implemented for OBB YOLO labels`).
 
 This plan is for evaluator dispatch on sample records. It does **not** claim end-to-end inference or CLI/training mAP for a CARPN network: Rust currently has no `obb_refine`/stage-2 model layer or CARPN network decoder, and `decode_obb_yolo_detections` emits only legacy front-point detections.
 

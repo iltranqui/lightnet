@@ -4,7 +4,7 @@
 
 **Goal:** `cargo xtask train_legogears -bf16` trains LegoGears_v2 in bf16 mixed precision (bf16 activations and gradients, f32 master weights), reusing the f16 AMP machinery.
 
-**Architecture:** One 16-bit format per backend, `HalfFormat { F16, Bf16 }`, chosen by `DARKNET_OXIDE_AMP`. Every device kernel that reads or writes 16-bit data takes a `fmt: u32` argument (0 = f16, 1 = bf16), the same pattern `hgemm_f16_mma` already uses for its `bf16: u32` flag. `OxideTensorF16` stays format-agnostic; the backend knows the format.
+**Architecture:** One 16-bit format per backend, `HalfFormat { F16, Bf16 }`, chosen by `LIGHTNET_OXIDE_AMP`. Every device kernel that reads or writes 16-bit data takes a `fmt: u32` argument (0 = f16, 1 = bf16), the same pattern `hgemm_f16_mma` already uses for its `bf16: u32` flag. `OxideTensorF16` stays format-agnostic; the backend knows the format.
 
 **Tech Stack:** Rust, cuda-oxide kernels (`cuda_device::convert::cvt_bf16x2_f32`, `mma_m16n8k16_f32_bf16`), sm_89.
 
@@ -30,7 +30,7 @@
 ## Global Constraints
 
 - Same constraints as [plan_fp16.md](plan_fp16.md#global-constraints): `cargo xtask` only, one build or test at a time, 4 build threads (8 for training), `MemoryHigh=3G`, stage only named files, no unprompted training runs, delete weights and logs after use, update `implemented.md`, `STATUS.md`, `todo.md`, `version-map.tsv` for each version-mapped increment.
-- `src/darknet-cuda-oxide` tests run only through `cargo xtask oxide --test <file> [-- <filter>]`.
+- `src/lightnet-cuda-oxide` tests run only through `cargo xtask oxide --test <file> [-- <filter>]`.
 - f16 behaviour must not change: every existing test in `oxide_amp.rs`, `oxide_half.rs`, `oxide_runtime_f16.rs` passes unmodified at every task boundary.
 - bf16 mode uses no loss scaling (same exponent range as f32); `-bf16` must not add `-dyn_scale`.
 - bf16 has an 8-bit significand against f16's 11: tolerances for bf16 tests are 8x the f16 bounds, no looser.
@@ -39,13 +39,13 @@
 
 - A bf16 run that reaches an f16-only code path (inference `forward_compact_f16`, `half.rs` f16 inference ops) must fail with a clear error, not silently reinterpret bf16 bits as f16.
 - bf16 value rounding: round-to-nearest-even, NaN stays NaN, large f32 values (above f16 max 65504) stay finite in bf16, infinities stay infinities.
-- `DARKNET_OXIDE_AMP` values `bf16`, `BF16`, `fp16`, `1`, `0`, empty, garbage: garbage and empty mean AMP off, not a panic.
-- `DARKNET_OXIDE_GEMM=fp8` together with `DARKNET_OXIDE_AMP=bf16`: the AMP format wins and the combination is reported, not silently ignored (fp8 plan owns the combination; here it must at least not crash).
+- `LIGHTNET_OXIDE_AMP` values `bf16`, `BF16`, `fp16`, `1`, `0`, empty, garbage: garbage and empty mean AMP off, not a panic.
+- `LIGHTNET_OXIDE_GEMM=fp8` together with `LIGHTNET_OXIDE_AMP=bf16`: the AMP format wins and the combination is reported, not silently ignored (fp8 plan owns the combination; here it must at least not crash).
 - Weight cache refresh after an optimizer step in bf16 (stale bf16 copies would train on old weights).
 
 ## Verified starting state
 
-- bf16 exists only as: `mma_m16n8k16_f32_bf16` selected by the `bf16: u32` flag of `hgemm_f16_mma` (`src/darknet-cuda-oxide/src/kernels/gemm_f16.rs:53,334-338`; operands bf16, output f32 only); `cvt_f32_to_bf16`, `cvt_bf16_to_f32` (`kernels/convert.rs:81,90`); host `f32_to_bf16_bits`, `bf16_bits_to_f32`, `f32_to_bf16`, `bf16_to_f32`, `gemm_bf16` (`half.rs:93,102,245,263,359`); `hgemm_ex(a, b, out: HOut, g: &GemmArgs, bf16: bool)` at `half.rs:447`, which rejects bf16 with a non-f32 output at `half.rs:459`. Tests: `gpu_conversions_match_host_reference`, `gemm_bf16_parity_all_transposes_alignments_alpha_beta` in `tests/oxide_half.rs`.
+- bf16 exists only as: `mma_m16n8k16_f32_bf16` selected by the `bf16: u32` flag of `hgemm_f16_mma` (`src/lightnet-cuda-oxide/src/kernels/gemm_f16.rs:53,334-338`; operands bf16, output f32 only); `cvt_f32_to_bf16`, `cvt_bf16_to_f32` (`kernels/convert.rs:81,90`); host `f32_to_bf16_bits`, `bf16_bits_to_f32`, `f32_to_bf16`, `bf16_to_f32`, `gemm_bf16` (`half.rs:93,102,245,263,359`); `hgemm_ex(a, b, out: HOut, g: &GemmArgs, bf16: bool)` at `half.rs:447`, which rejects bf16 with a non-f32 output at `half.rs:459`. Tests: `gpu_conversions_match_host_reference`, `gemm_bf16_parity_all_transposes_alignments_alpha_beta` in `tests/oxide_half.rs`.
 - The f16 epilogue stores are at `gemm_f16.rs:367,417` using `cvt_f16x2_f32`; the split-K reduce is `hgemm_splitk_reduce_act16` (`gemm_f16.rs:379`).
 - AMP training launches these kernels (from `mixed.rs`): `amp_bias_add`, `amp_activation`, `amp_activation_backward`, `amp_vector_add`, `amp_sum_partial`, `amp_sq_dev_partial`, `amp_dot_partial`, `amp_bn_normalize`, `amp_bn_backward_dx`, `amp_col2im`, `amp_maxpool_backward`, `amp_upsample_backward` (all in `kernels/amp.rs`), plus `half_ops.im2col_f16`, `half_ops.route_copy_f16`, and `hgemm`. The forward maxpool and upsample AMP branches are at `lib.rs:7603` and `lib.rs:9888` and use `maxpool_f16` and `upsample_nearest_f16` (`kernels/half_ops.rs:80,167`).
 - f16 conversion helpers used by those kernels: `f32_to_f16_bits` (`kernels/convert.rs:16`), `f16_bits_to_f32` (`kernels/convert.rs:30`), imported as `h2f` in `amp.rs`.
@@ -53,11 +53,11 @@
 
 ## File structure
 
-- Modify `src/darknet-cuda-oxide/src/mixed.rs`: `HalfFormat`, `parse_amp_format`, backend field, call sites.
-- Modify `src/darknet-cuda-oxide/src/lib.rs`: `GemmMode::Bf16`, constructor wiring.
-- Modify `src/darknet-cuda-oxide/src/kernels/convert.rs`: format-aware device helpers and cvt kernels.
-- Modify `src/darknet-cuda-oxide/src/kernels/gemm_f16.rs`, `half.rs`: bf16 output.
-- Modify `src/darknet-cuda-oxide/src/kernels/amp.rs`, `kernels/half_ops.rs`: `fmt` arguments (training kernels only; inference-only f16 kernels stay f16).
+- Modify `src/lightnet-cuda-oxide/src/mixed.rs`: `HalfFormat`, `parse_amp_format`, backend field, call sites.
+- Modify `src/lightnet-cuda-oxide/src/lib.rs`: `GemmMode::Bf16`, constructor wiring.
+- Modify `src/lightnet-cuda-oxide/src/kernels/convert.rs`: format-aware device helpers and cvt kernels.
+- Modify `src/lightnet-cuda-oxide/src/kernels/gemm_f16.rs`, `half.rs`: bf16 output.
+- Modify `src/lightnet-cuda-oxide/src/kernels/amp.rs`, `kernels/half_ops.rs`: `fmt` arguments (training kernels only; inference-only f16 kernels stay f16).
 - Modify tests: `tests/oxide_amp.rs`, `tests/oxide_half.rs`, `tests/oxide_gemm_f8.rs` (GemmMode parsing test lives there).
 - Modify `xtask/src/main.rs`, `CLAUDE.md`, docs as in plan_fp16.
 
@@ -76,21 +76,21 @@ Status as of 2026-10-22.
 | 7. xtask `-bf16` | done | `v0.2.176` (`7ef8322`) |
 | 8. Convergence and step-time record | done (run by the fp8/bf16 goal) | 2026-10-23, `docs/OXIDE_BENCH.md` section 10: 138.6 s, loss 0.0524, mAP 99.63%, F1 0.9935 against fp32 147.1 s |
 
-Task 1 notes: `oxide_amp` passes 15 of 15 and `oxide_gemm_f8` 26 of 26. `GemmMode::Bf16` in the f32 API goes through `gemm_f32_operands_as_half(.., bf16 = true)`. `DARKNET_OXIDE_AMP=bf16` parses and selects the format, but the AMP activation kernels are still f16 only, so it must not be used for training before Task 4 to 6.
+Task 1 notes: `oxide_amp` passes 15 of 15 and `oxide_gemm_f8` 26 of 26. `GemmMode::Bf16` in the f32 API goes through `gemm_f32_operands_as_half(.., bf16 = true)`. `LIGHTNET_OXIDE_AMP=bf16` parses and selects the format, but the AMP activation kernels are still f16 only, so it must not be used for training before Task 4 to 6.
 
 ## Tasks
 
 ### Task 1: HalfFormat, env parsing, GemmMode::Bf16
 
 **Files:**
-- Modify: `src/darknet-cuda-oxide/src/mixed.rs`, `src/darknet-cuda-oxide/src/lib.rs`
-- Test: `src/darknet-cuda-oxide/tests/oxide_amp.rs`, `src/darknet-cuda-oxide/tests/oxide_gemm_f8.rs`
+- Modify: `src/lightnet-cuda-oxide/src/mixed.rs`, `src/lightnet-cuda-oxide/src/lib.rs`
+- Test: `src/lightnet-cuda-oxide/tests/oxide_amp.rs`, `src/lightnet-cuda-oxide/tests/oxide_gemm_f8.rs`
 
 **Interfaces:**
 - Produces: `pub enum HalfFormat { F16, Bf16 }` with `pub fn code(self) -> u32` (F16 = 0, Bf16 = 1); `pub fn parse_amp_format(value: &str) -> Option<HalfFormat>` (`1`, `true`, `on`, `yes`, `fp16`, `f16` give F16, case-insensitive; `bf16`, `bfloat16` give Bf16; anything else None); `OxideBackend::with_amp_format(self, f: Option<HalfFormat>) -> Self`; `OxideBackend::half_format(&self) -> HalfFormat`; `GemmMode::Bf16`.
 - `amp_from_env()` keeps returning `bool` (true when `parse_amp_format` is Some) so existing callers compile; `with_amp(on)` becomes `with_amp_format(on.then_some(HalfFormat::F16))`.
 
-- [ ] **Step 1: Write failing tests:** `amp_format_parses_known_values_case_insensitively` (table of the values above), `amp_format_rejects_garbage_and_empty`, `gemm_mode_from_env_parses_bf16` (mirror `gemm_mode_from_env_parses_fp8_and_fp4` in `oxide_gemm_f8.rs`; `DARKNET_OXIDE_GEMM=bf16` gives `GemmMode::Bf16`).
+- [ ] **Step 1: Write failing tests:** `amp_format_parses_known_values_case_insensitively` (table of the values above), `amp_format_rejects_garbage_and_empty`, `gemm_mode_from_env_parses_bf16` (mirror `gemm_mode_from_env_parses_fp8_and_fp4` in `oxide_gemm_f8.rs`; `LIGHTNET_OXIDE_GEMM=bf16` gives `GemmMode::Bf16`).
 - [ ] **Step 2: Run to verify they fail.** `cargo xtask oxide --test oxide_amp -- amp_format` — Expected: compile error (type missing).
 - [ ] **Step 3: Implement** the items in Interfaces; add the `Bf16` arm to `use_tf32` (false) and any exhaustive `match` the compiler reports; `GemmMode::Bf16` behaves as `Fp16` in the f32-API GEMM path until Task 3 (route it through `gemm_bf16`).
 - [ ] **Step 4: Run to verify they pass,** plus the whole `oxide_amp` and `oxide_gemm_f8` files — Expected: all pass.
@@ -99,8 +99,8 @@ Task 1 notes: `oxide_amp` passes 15 of 15 and `oxide_gemm_f8` 26 of 26. `GemmMod
 ### Task 2: Format-aware conversions
 
 **Files:**
-- Modify: `src/darknet-cuda-oxide/src/kernels/convert.rs`, `src/darknet-cuda-oxide/src/half.rs`
-- Test: `src/darknet-cuda-oxide/tests/oxide_half.rs`
+- Modify: `src/lightnet-cuda-oxide/src/kernels/convert.rs`, `src/lightnet-cuda-oxide/src/half.rs`
+- Test: `src/lightnet-cuda-oxide/tests/oxide_half.rs`
 
 **Interfaces:**
 - Consumes: `HalfFormat::code()` from Task 1.
@@ -115,8 +115,8 @@ Task 1 notes: `oxide_amp` passes 15 of 15 and `oxide_gemm_f8` 26 of 26. `GemmMod
 ### Task 3: bf16 output in the 16-bit GEMM
 
 **Files:**
-- Modify: `src/darknet-cuda-oxide/src/kernels/gemm_f16.rs` (epilogue stores at lines 367 and 417; `hgemm_splitk_reduce_act16` at line 379), `src/darknet-cuda-oxide/src/half.rs` (`hgemm_ex`, line 459)
-- Test: `src/darknet-cuda-oxide/tests/oxide_half.rs`
+- Modify: `src/lightnet-cuda-oxide/src/kernels/gemm_f16.rs` (epilogue stores at lines 367 and 417; `hgemm_splitk_reduce_act16` at line 379), `src/lightnet-cuda-oxide/src/half.rs` (`hgemm_ex`, line 459)
+- Test: `src/lightnet-cuda-oxide/tests/oxide_half.rs`
 
 **Interfaces:**
 - Consumes: `f32_to_half_bits` from Task 2.
@@ -131,8 +131,8 @@ Task 1 notes: `oxide_amp` passes 15 of 15 and `oxide_gemm_f8` 26 of 26. `GemmMod
 ### Task 4: amp.rs kernels take fmt
 
 **Files:**
-- Modify: `src/darknet-cuda-oxide/src/kernels/amp.rs` (12 kernels listed in Verified starting state), their call sites in `src/darknet-cuda-oxide/src/mixed.rs`
-- Test: `src/darknet-cuda-oxide/tests/oxide_amp.rs`
+- Modify: `src/lightnet-cuda-oxide/src/kernels/amp.rs` (12 kernels listed in Verified starting state), their call sites in `src/lightnet-cuda-oxide/src/mixed.rs`
+- Test: `src/lightnet-cuda-oxide/tests/oxide_amp.rs`
 
 **Interfaces:**
 - Consumes: `half_bits_to_f32`, `f32_to_half_bits` from Task 2; `OxideBackend::half_format()` from Task 1.
@@ -147,8 +147,8 @@ Task 1 notes: `oxide_amp` passes 15 of 15 and `oxide_gemm_f8` 26 of 26. `GemmMod
 ### Task 5: Training half_ops kernels take fmt
 
 **Files:**
-- Modify: `src/darknet-cuda-oxide/src/kernels/half_ops.rs` (`im2col_f16`, `route_copy_f16`, `maxpool_f16`, `upsample_nearest_f16`), their callers in `src/darknet-cuda-oxide/src/mixed.rs`, `src/darknet-cuda-oxide/src/half.rs`, `src/darknet-cuda-oxide/src/lib.rs` (AMP branches near lines 7603 and 9888)
-- Test: `src/darknet-cuda-oxide/tests/oxide_half.rs`, `src/darknet-cuda-oxide/tests/oxide_amp.rs`
+- Modify: `src/lightnet-cuda-oxide/src/kernels/half_ops.rs` (`im2col_f16`, `route_copy_f16`, `maxpool_f16`, `upsample_nearest_f16`), their callers in `src/lightnet-cuda-oxide/src/mixed.rs`, `src/lightnet-cuda-oxide/src/half.rs`, `src/lightnet-cuda-oxide/src/lib.rs` (AMP branches near lines 7603 and 9888)
+- Test: `src/lightnet-cuda-oxide/tests/oxide_half.rs`, `src/lightnet-cuda-oxide/tests/oxide_amp.rs`
 
 **Interfaces:**
 - Produces: the four kernels gain a trailing `fmt: u32`. Inference-only f16 kernels (softmax, reorg, region, shortcut, avgpool, `reverse` upsample, gelu, laya) are not touched; their host entry points return `OxideError::Unsupported`-style errors when `half_format()` is Bf16 (use the error type and message style of `unsupported_layers_still_error_cleanly` in `oxide_runtime_f16.rs`).
@@ -162,18 +162,18 @@ Task 1 notes: `oxide_amp` passes 15 of 15 and `oxide_gemm_f8` 26 of 26. `GemmMod
 ### Task 6: Backend wiring and the AMP suite for bf16
 
 **Files:**
-- Modify: `src/darknet-cuda-oxide/src/mixed.rs` (`as_half`, `wrap_half`, `weights_half`, `to_half_storage`), `src/darknet-cuda-oxide/src/lib.rs` (`download_f32`/`upload_f32` widening, constructor reading `amp_format_from_env`)
-- Test: `src/darknet-cuda-oxide/tests/oxide_amp.rs`
+- Modify: `src/lightnet-cuda-oxide/src/mixed.rs` (`as_half`, `wrap_half`, `weights_half`, `to_half_storage`), `src/lightnet-cuda-oxide/src/lib.rs` (`download_f32`/`upload_f32` widening, constructor reading `amp_format_from_env`)
+- Test: `src/lightnet-cuda-oxide/tests/oxide_amp.rs`
 
 **Interfaces:**
 - Consumes: `to_half`, `from_half` (Task 2), `HalfFormat` (Task 1).
-- Produces: `OxideBackend::new()` reads `DARKNET_OXIDE_AMP` through `parse_amp_format`; the constructor sets `gemm_mode` to `Fp16` or `Bf16` to match.
+- Produces: `OxideBackend::new()` reads `LIGHTNET_OXIDE_AMP` through `parse_amp_format`; the constructor sets `gemm_mode` to `Fp16` or `Bf16` to match.
 
 - [ ] **Step 1: Write failing tests** by running the remaining AMP tests for both formats: `amp_weight_copy_is_refreshed_after_an_update`, `amp_gradients_track_f32_gradients_on_tiny_conv_bn_net`, `amp_sgd_steps_track_f32_master_weights`, `amp_adam_steps_track_f32_master_weights`, `amp_overflowing_gradients_become_nonfinite_not_garbage` (for bf16 the overflow test uses a value above 3.4e38 / f32 max is not representable, so assert instead that 1.0e7 stays finite in bf16: name it `amp_bf16_does_not_overflow_where_f16_does`).
 - [ ] **Step 2: Run to verify the bf16 cases fail.** `cargo xtask oxide --test oxide_amp` — Expected: bf16 cases fail on the weight cache and widening paths.
 - [ ] **Step 3: Implement** the format use in the listed methods; `weights_half` converts through `to_half` with the backend format (cache key stays buffer identity; one format per backend means no extra key).
 - [ ] **Step 4: Run to verify it passes.** `cargo xtask oxide --test oxide_amp`, then `cargo xtask oxide --test oxide_half`, then `cargo xtask test` — Expected: all pass.
-- [ ] **Step 5: Commit** `mixed.rs`, `lib.rs`, `oxide_amp.rs`: `feat(oxide): bf16 mixed-precision training mode (DARKNET_OXIDE_AMP=bf16)`.
+- [ ] **Step 5: Commit** `mixed.rs`, `lib.rs`, `oxide_amp.rs`: `feat(oxide): bf16 mixed-precision training mode (LIGHTNET_OXIDE_AMP=bf16)`.
 
 ### Task 7: xtask -bf16
 
@@ -182,9 +182,9 @@ Task 1 notes: `oxide_amp` passes 15 of 15 and `oxide_gemm_f8` 26 of 26. `GemmMod
 - Test: `#[cfg(test)]` in `xtask/src/main.rs`
 
 **Interfaces:**
-- Consumes: the `DARKNET_OXIDE_AMP=bf16` value from Task 6; the three-element return of `precision_env` from plan_fp16 Task 4.
+- Consumes: the `LIGHTNET_OXIDE_AMP=bf16` value from Task 6; the three-element return of `precision_env` from plan_fp16 Task 4.
 
-- [ ] **Step 1: Write failing tests:** `bf16_sets_amp_bf16_without_scaler_flags` (`["-bf16"]` yields env `DARKNET_OXIDE_AMP=bf16` and no extra args), `two_precision_flags_are_rejected` (`["-fp16", "-bf16"]` is an `Err`).
+- [ ] **Step 1: Write failing tests:** `bf16_sets_amp_bf16_without_scaler_flags` (`["-bf16"]` yields env `LIGHTNET_OXIDE_AMP=bf16` and no extra args), `two_precision_flags_are_rejected` (`["-fp16", "-bf16"]` is an `Err`).
 - [ ] **Step 2: Run to verify they fail.** `PKGS=xtask cargo xtask test` — Expected: FAIL (`-bf16` is rejected today).
 - [ ] **Step 3: Implement** the mapping and remove the "no runtime switch" rejection and help text.
 - [ ] **Step 4: Run to verify they pass.** `PKGS=xtask cargo xtask test` — Expected: pass.

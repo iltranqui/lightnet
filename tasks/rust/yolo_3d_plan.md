@@ -39,7 +39,7 @@ Port `[yolo_3d]` to the Rust CPU path to the Stage-1 standard:
 - a clearly named projected-corner evaluator;
 - explicit GPU rejection.
 
-All of this is CPU and library-level in `darknet-core`.
+All of this is CPU and library-level in `lightnet-core`.
 
 **In scope (both increments together are the layer's Definition of Done):**
 
@@ -121,7 +121,7 @@ Write each item into `tasks/rust/yolo_3d_notes.md` with a pinned file:line citat
 ## File tree and ownership
 
 ```
-src/darknet-core/src/
+src/lightnet-core/src/
 ├── lib.rs                MODIFY  declare yolo_3d, yolo_3d_geometry, cuboid_labels; re-export public API
 ├── model.rs              MODIFY  Yolo3dSpec, LayerKind::Yolo3d, name(), parse arm + reject_unknown_yolo_3d_keys,
 │                                 infer_output_shape arm, depth_layer + mixed-head build validation, tests
@@ -138,11 +138,11 @@ src/darknet-core/src/
 │                                 compute_mixed_2d_3d_training_loss, D8 guard in compute_yolo_training_loss_with_state
 ├── detect.rs             MODIFY  Yolo3dDetection, decode_yolo_3d_network_detections, D8 guard in 2D decoders
 └── evaluate.rs           MODIFY  Yolo3dValidationDataset, Yolo3dProjectedMapReport, yolo_3d_projected_map, D8 guard
-src/darknet-cli/src/main.rs  MODIFY  explicit rejection in detector train/map/test for yolo_3d networks + one CLI test
+src/lightnet-cli/src/main.rs  MODIFY  explicit rejection in detector train/map/test for yolo_3d networks + one CLI test
 tasks/rust/yolo_3d_notes.md  CREATE (Step 0)  source transcription S1–S13 (local-only, git add -f when committed)
 ```
 
-Do **not** touch: `onnx/export.rs` and `onnx/proto.rs` (uncommitted user edits), `Cargo.toml`, `Cargo.lock`, `.gitignore`, root `notes.md`/`task_plan.md`/`CLAUDE.md`, `weights.rs` and `initialize.rs` (no new params; the `LayerParams::None` arms at `weights.rs:378` and `initialize.rs:14` already cover the head), `muon_runtime.rs` (no head matrices), and `darknet-cuda*`. If the compile inventory (Step 1) shows an exhaustive match in one of these files, add only the minimal `LayerKind::Yolo3d` arm there, and stop and ask if the file is in the "uncommitted user edits" list.
+Do **not** touch: `onnx/export.rs` and `onnx/proto.rs` (uncommitted user edits), `Cargo.toml`, `Cargo.lock`, `.gitignore`, root `notes.md`/`task_plan.md`/`CLAUDE.md`, `weights.rs` and `initialize.rs` (no new params; the `LayerParams::None` arms at `weights.rs:378` and `initialize.rs:14` already cover the head), `muon_runtime.rs` (no head matrices), and `lightnet-cuda*`. If the compile inventory (Step 1) shows an exhaustive match in one of these files, add only the minimal `LayerKind::Yolo3d` arm there, and stop and ask if the file is in the "uncommitted user edits" list.
 
 **Component roles:**
 
@@ -296,7 +296,7 @@ Every test is new. "Hand" means the numbers are written in the test and derived 
 | guards | `yolo_3d_existing_2d_and_obb_apis_reject_yolo_3d_networks` (train loss, decode, `ValidationDataset::from_data`), `yolo_3d_onnx_export_rejects` (calls `export_onnx`; asserts the existing unsupported error; no export.rs edit) | 1 |
 | GPU | `yolo_3d_rejects_gpu_execution_backward_and_updates` (execution, compact, f16, backward, update) | 1 |
 | eval | `yolo_3d_projected_map_oks8_threshold_boundary`, `yolo_3d_projected_map_duplicate_detection_is_false_positive`, `yolo_3d_projected_map_reports_ap50_and_ap50_95`, `yolo_3d_silhouette_iou_hand_computed`, `yolo_3d_projected_map_flags_network_size_scale` (`evaluate.rs`) | 1 |
-| CLI | `yolo_3d_cli_detector_train_map_test_reject` (`darknet-cli`) | 1 |
+| CLI | `yolo_3d_cli_detector_train_map_test_reject` (`lightnet-cli`) | 1 |
 
 All names start with `yolo_3d_`, so the `yolo_3d` filter selects the whole set. Axis tests also match `axis_layout`.
 

@@ -32,5 +32,5 @@ done
 
 capped "$MEM" \
     target/debug/cargo-oxide oxide test -- \
-    --manifest-path src/darknet-cuda-oxide/Cargo.toml -j 2 "${CARGO_ARGS[@]}" \
+    --manifest-path src/lightnet-cuda-oxide/Cargo.toml -j 2 "${CARGO_ARGS[@]}" \
     -- --test-threads=1 --nocapture "${TEST_ARGS[@]}"

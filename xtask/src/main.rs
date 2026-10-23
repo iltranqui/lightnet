@@ -11,17 +11,17 @@ use std::process::{Command, ExitCode, Stdio};
 const USAGE: &str = "\
 usage: cargo xtask <cmd> [args...]
 
-  check|c [pkg...]      cargo check (default: darknet-cli darknet-core)
-  gpu-check|gc          cargo check -p darknet-cli --features oxide
-  build|b [pkg...]      cargo build (default: darknet-cli)
-  clippy|l [pkg...]     cargo clippy (default: darknet-cli darknet-core)
+  check|c [pkg...]      cargo check (default: lightnet-cli lightnet-core)
+  gpu-check|gc          cargo check -p lightnet-cli --features oxide
+  build|b [pkg...]      cargo build (default: lightnet-cli)
+  clippy|l [pkg...]     cargo clippy (default: lightnet-cli lightnet-core)
   test|host|t [filter...]  host tests, same as tools/test_host.sh (PKGS overrides)
   oxide|o [args...]     ./tools/test_oxide.sh (GPU tests; args pass through)
   train_legogears|train|tr [-fp8|-fp16|-bf16|-fp8 -fp16|-fp8 -bf16] [w] [flags]
-                        -fp8: DARKNET_OXIDE_GEMM=fp8 and DARKNET_OXIDE_GEMM_BWD=fp8 (f32 storage; an inherited
-                        DARKNET_OXIDE_AMP is unset, as without any flag); -fp16: DARKNET_OXIDE_AMP=1
+                        -fp8: LIGHTNET_OXIDE_GEMM=fp8 and LIGHTNET_OXIDE_GEMM_BWD=fp8 (f32 storage; an inherited
+                        LIGHTNET_OXIDE_AMP is unset, as without any flag); -fp16: LIGHTNET_OXIDE_AMP=1
                         (-fp16 adds -dyn_scale and -loss_scale 1024 unless supplied)
-                        -bf16: DARKNET_OXIDE_AMP=bf16, no loss scaling
+                        -bf16: LIGHTNET_OXIDE_AMP=bf16, no loss scaling
                         -fp8 -fp16 / -fp8 -bf16: fp8 convolution GEMMs on 16-bit activation
                         storage (both env sets above; the -fp16 scaler rule applies)
                         train LegoGears_v2 on oxide (./tools/train_legogears_oxide.sh;
@@ -58,7 +58,7 @@ fn main() -> ExitCode {
     let argv: Vec<String> = match cmd.as_str() {
         "check" | "c" => cargo(
             &["check", "-j", &jobs],
-            pkgs(&["darknet-cli", "darknet-core"]),
+            pkgs(&["lightnet-cli", "lightnet-core"]),
         ),
         "gpu-check" | "gc" => cargo(
             &[
@@ -66,19 +66,19 @@ fn main() -> ExitCode {
                 "-j",
                 &jobs,
                 "-p",
-                "darknet-cli",
+                "lightnet-cli",
                 "--features",
                 "oxide",
             ],
             vec![],
         ),
-        "build" | "b" => cargo(&["build", "-j", &jobs], pkgs(&["darknet-cli"])),
+        "build" | "b" => cargo(&["build", "-j", &jobs], pkgs(&["lightnet-cli"])),
         "clippy" | "l" => cargo(
             &["clippy", "-j", &jobs],
-            pkgs(&["darknet-cli", "darknet-core"]),
+            pkgs(&["lightnet-cli", "lightnet-core"]),
         ),
         "test" | "host" | "t" => {
-            let packages = env::var("PKGS").unwrap_or_else(|_| "darknet-core darknet-cli".into());
+            let packages = env::var("PKGS").unwrap_or_else(|_| "lightnet-core lightnet-cli".into());
             let flags = packages
                 .split_whitespace()
                 .flat_map(|p| ["-p".to_owned(), p.to_owned()])
@@ -95,7 +95,7 @@ fn main() -> ExitCode {
             return run(v, &mem, false);
         }
         // Release build + `detector train` on LegoGears_v2 (oxide backend); the script
-        // caps itself. Overrides: CFG, DATA, SEED, PROFILE. DARKNET_OXIDE_AMP is set or unset from the precision flags.
+        // caps itself. Overrides: CFG, DATA, SEED, PROFILE. LIGHTNET_OXIDE_AMP is set or unset from the precision flags.
         "train_legogears" | "train" | "tr" => {
             // Same 4 build thread cap as every other command.
             if env::var_os("JOBS").is_none() {
@@ -255,13 +255,13 @@ fn precision_env(args: &[String]) -> PrecisionEnv {
         // e4m3 forward, e5m2 for the incoming gradient (the C++ recipe).  Alone this
         // keeps f32 storage; with a 16-bit flag the conv GEMMs run fp8 on 16-bit
         // activations (`mixed.rs` keeps the fp8 GEMM mode under AMP).
-        vars.push(("DARKNET_OXIDE_GEMM", "fp8"));
-        vars.push(("DARKNET_OXIDE_GEMM_BWD", "fp8"));
+        vars.push(("LIGHTNET_OXIDE_GEMM", "fp8"));
+        vars.push(("LIGHTNET_OXIDE_GEMM_BWD", "fp8"));
     }
     match half {
         // AMP also selects the f16 tensor-core GEMM (unless fp8 was asked for).
         Some("fp16") => {
-            vars.push(("DARKNET_OXIDE_AMP", "1"));
+            vars.push(("LIGHTNET_OXIDE_AMP", "1"));
             if !args
                 .iter()
                 .any(|arg| arg == "-dyn_scale" || arg == "--dyn_scale")
@@ -276,14 +276,14 @@ fn precision_env(args: &[String]) -> PrecisionEnv {
             }
         }
         // bf16 has the f32 exponent range, so no loss scaling flags.
-        Some(_) => vars.push(("DARKNET_OXIDE_AMP", "bf16")),
+        Some(_) => vars.push(("LIGHTNET_OXIDE_AMP", "bf16")),
         None => {}
     }
     Ok((rest, vars, extra))
 }
 
 /// Applies the precision env to the child: every var in `vars` is set, and
-/// `DARKNET_OXIDE_AMP` is removed when no 16-bit flag asked for it, so a value
+/// `LIGHTNET_OXIDE_AMP` is removed when no 16-bit flag asked for it, so a value
 /// inherited from the caller's shell cannot turn bare `-fp8` (f32 storage) or
 /// the fp32 default into AMP storage.
 fn apply_precision_env(vars: &[(&'static str, &'static str)], mut set: impl FnMut(&str, Option<&str>)) {
@@ -295,17 +295,17 @@ fn apply_precision_env(vars: &[(&'static str, &'static str)], mut set: impl FnMu
     }
 }
 
-const AMP_VAR: &str = "DARKNET_OXIDE_AMP";
+const AMP_VAR: &str = "LIGHTNET_OXIDE_AMP";
 
 #[cfg(test)]
 mod tests {
     use super::{apply_precision_env, precision_env};
     use std::collections::HashMap;
 
-    /// The child env after `-flags`, starting from an inherited `DARKNET_OXIDE_AMP=bf16`.
+    /// The child env after `-flags`, starting from an inherited `LIGHTNET_OXIDE_AMP=bf16`.
     fn child_env(flags: &[&str]) -> HashMap<String, String> {
         let (_, vars, _) = precision_env(&args(flags)).unwrap();
-        let mut env = HashMap::from([("DARKNET_OXIDE_AMP".to_owned(), "bf16".to_owned())]);
+        let mut env = HashMap::from([("LIGHTNET_OXIDE_AMP".to_owned(), "bf16".to_owned())]);
         apply_precision_env(&vars, |k, v| match v {
             Some(v) => {
                 env.insert(k.to_owned(), v.to_owned());
@@ -321,17 +321,17 @@ mod tests {
     fn bare_fp8_and_default_drop_an_inherited_amp() {
         for flags in [&["-fp8"][..], &[][..]] {
             let env = child_env(flags);
-            assert!(!env.contains_key("DARKNET_OXIDE_AMP"), "{flags:?}: {env:?}");
+            assert!(!env.contains_key("LIGHTNET_OXIDE_AMP"), "{flags:?}: {env:?}");
         }
-        assert_eq!(child_env(&["-fp8"]).get("DARKNET_OXIDE_GEMM").map(String::as_str), Some("fp8"));
+        assert_eq!(child_env(&["-fp8"]).get("LIGHTNET_OXIDE_GEMM").map(String::as_str), Some("fp8"));
     }
 
     #[test]
     fn sixteen_bit_flags_override_an_inherited_amp() {
-        assert_eq!(child_env(&["-fp16"])["DARKNET_OXIDE_AMP"], "1");
-        assert_eq!(child_env(&["-bf16"])["DARKNET_OXIDE_AMP"], "bf16");
-        assert_eq!(child_env(&["-fp8", "-fp16"])["DARKNET_OXIDE_AMP"], "1");
-        assert_eq!(child_env(&["-fp8", "-bf16"])["DARKNET_OXIDE_AMP"], "bf16");
+        assert_eq!(child_env(&["-fp16"])["LIGHTNET_OXIDE_AMP"], "1");
+        assert_eq!(child_env(&["-bf16"])["LIGHTNET_OXIDE_AMP"], "bf16");
+        assert_eq!(child_env(&["-fp8", "-fp16"])["LIGHTNET_OXIDE_AMP"], "1");
+        assert_eq!(child_env(&["-fp8", "-bf16"])["LIGHTNET_OXIDE_AMP"], "bf16");
     }
 
     fn args(values: &[&str]) -> Vec<String> {
@@ -343,7 +343,7 @@ mod tests {
         let (rest, vars, extra) = precision_env(&args(&["-bf16"])).unwrap();
 
         assert!(rest.is_empty());
-        assert_eq!(vars, [("DARKNET_OXIDE_AMP", "bf16")]);
+        assert_eq!(vars, [("LIGHTNET_OXIDE_AMP", "bf16")]);
         assert!(extra.is_empty());
     }
 
@@ -357,7 +357,7 @@ mod tests {
         let (rest, vars, extra) = precision_env(&args(&["-fp16"])).unwrap();
 
         assert!(rest.is_empty());
-        assert_eq!(vars, [("DARKNET_OXIDE_AMP", "1")]);
+        assert_eq!(vars, [("LIGHTNET_OXIDE_AMP", "1")]);
         assert_eq!(extra, ["-dyn_scale", "-loss_scale", "1024"]);
     }
 
@@ -386,7 +386,7 @@ mod tests {
         // e4m3 forward plus the e5m2 gradient recipe.
         assert_eq!(
             vars,
-            [("DARKNET_OXIDE_GEMM", "fp8"), ("DARKNET_OXIDE_GEMM_BWD", "fp8")]
+            [("LIGHTNET_OXIDE_GEMM", "fp8"), ("LIGHTNET_OXIDE_GEMM_BWD", "fp8")]
         );
         assert!(extra.is_empty());
     }
@@ -397,9 +397,9 @@ mod tests {
             let (rest, vars, extra) = precision_env(&args(&order)).unwrap();
 
             assert!(rest.is_empty());
-            assert!(vars.contains(&("DARKNET_OXIDE_GEMM", "fp8")), "{order:?}");
-            assert!(vars.contains(&("DARKNET_OXIDE_GEMM_BWD", "fp8")), "{order:?}");
-            assert!(vars.contains(&("DARKNET_OXIDE_AMP", "1")), "{order:?}");
+            assert!(vars.contains(&("LIGHTNET_OXIDE_GEMM", "fp8")), "{order:?}");
+            assert!(vars.contains(&("LIGHTNET_OXIDE_GEMM_BWD", "fp8")), "{order:?}");
+            assert!(vars.contains(&("LIGHTNET_OXIDE_AMP", "1")), "{order:?}");
             assert_eq!(vars.len(), 3, "{order:?}");
             assert_eq!(extra, ["-dyn_scale", "-loss_scale", "1024"], "{order:?}");
         }
@@ -420,9 +420,9 @@ mod tests {
             let (rest, vars, extra) = precision_env(&args(&order)).unwrap();
 
             assert!(rest.is_empty());
-            assert!(vars.contains(&("DARKNET_OXIDE_GEMM", "fp8")), "{order:?}");
-            assert!(vars.contains(&("DARKNET_OXIDE_GEMM_BWD", "fp8")), "{order:?}");
-            assert!(vars.contains(&("DARKNET_OXIDE_AMP", "bf16")), "{order:?}");
+            assert!(vars.contains(&("LIGHTNET_OXIDE_GEMM", "fp8")), "{order:?}");
+            assert!(vars.contains(&("LIGHTNET_OXIDE_GEMM_BWD", "fp8")), "{order:?}");
+            assert!(vars.contains(&("LIGHTNET_OXIDE_AMP", "bf16")), "{order:?}");
             assert_eq!(vars.len(), 3, "{order:?}");
             assert!(extra.is_empty(), "{order:?}");
         }
@@ -432,7 +432,7 @@ mod tests {
     fn plain_fp8_keeps_f32_storage() {
         let (_, vars, _) = precision_env(&args(&["-fp8"])).unwrap();
 
-        assert!(vars.iter().all(|(k, _)| *k != "DARKNET_OXIDE_AMP"));
+        assert!(vars.iter().all(|(k, _)| *k != "LIGHTNET_OXIDE_AMP"));
     }
 
     #[test]

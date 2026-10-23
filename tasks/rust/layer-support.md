@@ -34,16 +34,16 @@ with the command given rather than trusting the number.
 
 | Fact | Source | Re-derive |
 |---|---|---|
-| The 65 represented variants + `Unsupported` | `src/darknet-core/src/model.rs:1579` | `grep -n "pub enum LayerKind" -A 90 src/darknet-core/src/model.rs` |
-| CPU forward arms (all variants) | `src/darknet-core/src/runtime.rs:2310-3300` | `grep -nE "^ {16}\(LayerKind::" src/darknet-core/src/runtime.rs` |
+| The 65 represented variants + `Unsupported` | `src/lightnet-core/src/model.rs:1579` | `grep -n "pub enum LayerKind" -A 90 src/lightnet-core/src/model.rs` |
+| CPU forward arms (all variants) | `src/lightnet-core/src/runtime.rs:2310-3300` | `grep -nE "^ {16}\(LayerKind::" src/lightnet-core/src/runtime.rs` |
 | CPU backward arms | `runtime.rs:3395-6700` | same command, rows between 3395 and 6700 |
 | GPU full/training forward arms | `runtime.rs:11649-13070` (inside `forward_with_state_impl`) | same command, rows between 11537 and 13100 |
 | GPU compact/inference forward arms | `runtime.rs:13436-13717` (inside `forward_compact`, starts 13206) | same command, rows between 13420 and 13740 |
 | GPU backward arms | `runtime.rs:14079-15660` (inside `backward_accumulate_gpu_unscaled`, starts 13822); catch-all at 15668 returns `UnsupportedLayer` | same command, rows between 13820 and 15670 |
-| GPU pre-flight hard rejections | `runtime.rs:83-102`, `runtime.rs:11402-11490`, `runtime.rs:13214-13295` | `grep -n "GPU execution is not implemented" src/darknet-core/src/runtime.rs` |
-| Whole-network CPU-backward fallback | `runtime.rs:15707` | `grep -n "fn requires_cpu_backward_fallback" -A 40 src/darknet-core/src/runtime.rs` |
-| Activation device coverage | `src/darknet-core/src/model.rs:367` | `grep -n "fn to_cuda_f32_kind" -A 30 src/darknet-core/src/model.rs` |
-| f16 compact inference allowlist | `runtime.rs:8389-8440` | `grep -n "fn forward_compact_f16" -A 50 src/darknet-core/src/runtime.rs` |
+| GPU pre-flight hard rejections | `runtime.rs:83-102`, `runtime.rs:11402-11490`, `runtime.rs:13214-13295` | `grep -n "GPU execution is not implemented" src/lightnet-core/src/runtime.rs` |
+| Whole-network CPU-backward fallback | `runtime.rs:15707` | `grep -n "fn requires_cpu_backward_fallback" -A 40 src/lightnet-core/src/runtime.rs` |
+| Activation device coverage | `src/lightnet-core/src/model.rs:367` | `grep -n "fn to_cuda_f32_kind" -A 30 src/lightnet-core/src/model.rs` |
+| f16 compact inference allowlist | `runtime.rs:8389-8440` | `grep -n "fn forward_compact_f16" -A 50 src/lightnet-core/src/runtime.rs` |
 | Axis pin status per variant | `tasks/rust/axis-coverage.md` | that file, "Pinned"/"Open"/"Rust-only" tables |
 
 ## Legend
@@ -291,7 +291,7 @@ Accepted by `forward_compact_f16` (`runtime.rs:8389`):
 `shortcut` (with sources), `sam` (supported activation), `scale_channels`, `region`, `softmax`, `yolo`, `obb_yolo`, `gaussian_yolo`.
 
 Everything else returns `UnsupportedLayer`. Note this is inference only: f16
-training is the AMP path (`DARKNET_OXIDE_AMP=1`), which keeps f32 masters, and
+training is the AMP path (`LIGHTNET_OXIDE_AMP=1`), which keeps f32 masters, and
 f16 convolution dgrad/wgrad are implemented there.
 
 ## CPU-only gaps (Stage 1)

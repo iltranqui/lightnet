@@ -26,13 +26,13 @@ lightnet/
 ## Crate graph
 
 ```
-darknet-cli ──► darknet-core ──► darknet-cuda
+lightnet-cli ──► lightnet-core ──► lightnet-cuda
      │                                ▲
-     ├─(feature oxide)─► darknet-cuda-oxide ──► cuda-oxide crates cuda-device, cuda-host
+     ├─(feature oxide)─► lightnet-cuda-oxide ──► cuda-oxide crates cuda-device, cuda-host
      │                       (not a workspace member)
-darknet-cuda-cutile ───────────────────┘   (not a workspace member)
-darknet-examples ──► darknet-core
-darknet-gui ──► darknet-gui-project, darknet-gui-engine ──(child process)──► darknet-rs detect-server
+lightnet-cuda-cutile ───────────────────┘   (not a workspace member)
+lightnet-examples ──► lightnet-core
+lightnet-gui ──► lightnet-gui-project, lightnet-gui-engine ──(child process)──► lightnet-rs detect-server
 ```
 
 Each crate's role, responsibilities and constraints are in `src/<crate>/CONTEXT.md`.

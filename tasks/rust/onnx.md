@@ -4,11 +4,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** `darknet-rs export-onnx <cfg> <weights> [out.onnx] [--no-fuse]` writes an ONNX file whose raw YOLO head outputs match the Rust CPU runtime with `max_abs / max(max_abs(reference), 1.0) <= 1e-4`, as implemented by `tools/onnx_check.py`. This is Rust-runtime parity only; do not infer compiled-C++ parity.
+**Goal:** `lightnet-rs export-onnx <cfg> <weights> [out.onnx] [--no-fuse]` writes an ONNX file whose raw YOLO head outputs match the Rust CPU runtime with `max_abs / max(max_abs(reference), 1.0) <= 1e-4`, as implemented by `tools/onnx_check.py`. This is Rust-runtime parity only; do not infer compiled-C++ parity.
 
-**Architecture:** A new module `src/darknet-core/src/onnx/` with (1) `proto.rs`: a ~100-line hand-written protobuf wire encoder (no `prost`/`protobuf` dependency), (2) `export.rs`: walks `Network.layers` + `LayerParams` (the same structures the CPU/oxide runtimes use) and emits ONNX nodes/initializers, (3) a CLI subcommand in `darknet-cli`. Batch-norm is folded into conv weights by default using the runtime's existing `fold_convolutional_params_for_inference`. Numeric verification is a Python script (`onnxruntime`) comparing against the existing `DARKNET_LAYER_DUMP_DIR` dumps.
+**Architecture:** A new module `src/lightnet-core/src/onnx/` with (1) `proto.rs`: a ~100-line hand-written protobuf wire encoder (no `prost`/`protobuf` dependency), (2) `export.rs`: walks `Network.layers` + `LayerParams` (the same structures the CPU/oxide runtimes use) and emits ONNX nodes/initializers, (3) a CLI subcommand in `lightnet-cli`. Batch-norm is folded into conv weights by default using the runtime's existing `fold_convolutional_params_for_inference`. Numeric verification is a Python script (`onnxruntime`) comparing against the existing `LIGHTNET_LAYER_DUMP_DIR` dumps.
 
-**Tech Stack:** Rust (darknet-core, darknet-cli), ONNX IR 8 / opset 13 (18 when `mish` is used), Python 3 + `onnx` + `onnxruntime` + `numpy` + `opencv-python` for the check script only (user installs; none are installed today).
+**Tech Stack:** Rust (lightnet-core, lightnet-cli), ONNX IR 8 / opset 13 (18 when `mish` is used), Python 3 + `onnx` + `onnxruntime` + `numpy` + `opencv-python` for the check script only (user installs; none are installed today).
 
 **Spec:** No separate spec. This document is the spec. Reference implementation to ADAPT (not copy): C++ exporter `src-onnx/darknet_onnx.cpp` on branch `master` (`git show master:src-onnx/darknet_onnx.cpp`), design notes in `git show master:README.md` (ONNX section). Per memory `port-features-adapt-not-replace`: extend the Rust code in its current style, no `tl::expected` twins, no extra cfgs/examples.
 
@@ -28,7 +28,7 @@
 ## Global Constraints
 
 - No new Rust dependencies (protobuf is hand-encoded).
-- Builds: host crates only (`darknet-core`, `darknet-cli`, no `--features oxide`); one cargo command at a time, `-j 2`. Prefer `systemd-run --user --scope -p MemoryHigh=3G` or `./tools/test_host.sh <single-filter>` when the WSL user systemd bus is available. If it is unavailable, run the same Cargo command directly, uncapped, and record that limitation; never run two build/test commands concurrently.
+- Builds: host crates only (`lightnet-core`, `lightnet-cli`, no `--features oxide`); one cargo command at a time, `-j 2`. Prefer `systemd-run --user --scope -p MemoryHigh=3G` or `./tools/test_host.sh <single-filter>` when the WSL user systemd bus is available. If it is unavailable, run the same Cargo command directly, uncapped, and record that limitation; never run two build/test commands concurrently.
 - Never run builds with more than 4 jobs; do not launch training runs.
 - ONNX: `ir_version = 8`, default `opset = 13`, `opset = 18` iff any layer uses `mish` (ONNX `Mish` op appeared in opset 18).
 - Tensor layout NCHW, float32 initializers stored as `raw_data` little-endian; dynamic batch dimension named `"batch"`, fixed H/W/C from the cfg.
@@ -49,15 +49,15 @@
 ## File Structure
 
 ```
-src/darknet-core/src/
+src/lightnet-core/src/
 ├── lib.rs                      MODIFY  pub mod onnx; pub use onnx::{export_onnx, OnnxOptions};
 ├── runtime.rs                  MODIFY  fold_convolutional_params_for_inference + BATCH_NORM_EPSILON -> pub(crate)
 └── onnx/
     ├── mod.rs                  CREATE  re-exports
     ├── proto.rs                CREATE  protobuf wire encoder + ONNX message builders (+ test-only decoder)
     └── export.rs               CREATE  Exporter: layers -> nodes/initializers, export_onnx()
-src/darknet-cli/src/main.rs  MODIFY  "export-onnx" subcommand
-tools/onnx_check.py             CREATE  onnxruntime vs DARKNET_LAYER_DUMP_DIR numeric check
+src/lightnet-cli/src/main.rs  MODIFY  "export-onnx" subcommand
+tools/onnx_check.py             CREATE  onnxruntime vs LIGHTNET_LAYER_DUMP_DIR numeric check
 tasks/rust/todo.md              MODIFY  one line pointing at this plan (final task)
 ```
 
@@ -68,9 +68,9 @@ Responsibilities: `proto.rs` knows ONNX *field numbers* only; `export.rs` knows 
 ### Task 1: Protobuf wire encoder + ONNX message builders
 
 **Files:**
-- Create: `src/darknet-core/src/onnx/mod.rs`
-- Create: `src/darknet-core/src/onnx/proto.rs`
-- Modify: `src/darknet-core/src/lib.rs` (add `pub mod onnx;` next to `pub mod weights;` at line 30)
+- Create: `src/lightnet-core/src/onnx/mod.rs`
+- Create: `src/lightnet-core/src/onnx/proto.rs`
+- Modify: `src/lightnet-core/src/lib.rs` (add `pub mod onnx;` next to `pub mod weights;` at line 30)
 
 **Interfaces:**
 - Produces (all `pub(crate)` in `proto.rs`):
@@ -85,14 +85,14 @@ Responsibilities: `proto.rs` knows ONNX *field numbers* only; `export.rs` knows 
 
 ONNX field numbers used (from `onnx.proto3`): ModelProto `ir_version=1 producer_name=2 opset_import=8 graph=7`; OperatorSetIdProto `domain=1 version=2`; GraphProto `node=1 name=2 initializer=5 input=11 output=12`; NodeProto `input=1 output=2 name=3 op_type=4 attribute=5`; AttributeProto `name=1 f=2 i=3 s=4 floats=7 ints=8 type=20` (type enum FLOAT=1 INT=2 STRING=3 INTS=7); TensorProto `dims=1 data_type=2 name=8 raw_data=9` (data_type FLOAT=1 INT64=7); ValueInfoProto `name=1 type=2`; TypeProto `tensor_type=1`; TypeProto.Tensor `elem_type=1 shape=2`; TensorShapeProto `dim=1`; Dimension `dim_value=1 dim_param=2`.
 
-- [x] **Step 1: Write the failing tests** — create `src/darknet-core/src/onnx/mod.rs`:
+- [x] **Step 1: Write the failing tests** — create `src/lightnet-core/src/onnx/mod.rs`:
 
 ```rust
 //! ONNX export of a Darknet network (see tasks/rust/onnx.md).
 pub(crate) mod proto;
 ```
 
-and `src/darknet-core/src/onnx/proto.rs` containing only the test module for now:
+and `src/lightnet-core/src/onnx/proto.rs` containing only the test module for now:
 
 ```rust
 #[cfg(test)]
@@ -140,7 +140,7 @@ mod tests {
 
 - [x] **Step 2: Run to verify failure**
 
-Run: `./tools/test_host.sh varint_matches` (script from the earlier request; equivalent: `systemd-run --user --scope -p MemoryHigh=3G cargo test -p darknet-core -j 2 -- varint_matches`)
+Run: `./tools/test_host.sh varint_matches` (script from the earlier request; equivalent: `systemd-run --user --scope -p MemoryHigh=3G cargo test -p lightnet-core -j 2 -- varint_matches`)
 Expected: FAIL to compile (`Msg`, `testing` not defined).
 
 - [x] **Step 3: Implement** — put this ABOVE the test module in `proto.rs`:
@@ -308,7 +308,7 @@ pub(crate) fn model(
     let mut opset_import = Msg::new();
     opset_import.string(1, "").int(2, opset);
     let mut m = Msg::new();
-    m.int(1, 8).string(2, "darknet-rs").msg(8, &opset_import).msg(7, &graph);
+    m.int(1, 8).string(2, "lightnet-rs").msg(8, &opset_import).msg(7, &graph);
     m.finish()
 }
 
@@ -373,7 +373,7 @@ Expected: 1 test passes per command (3 total).
 - [x] **Step 5: Commit**
 
 ```bash
-git add src/darknet-core/src/onnx src/darknet-core/src/lib.rs
+git add src/lightnet-core/src/onnx src/lightnet-core/src/lib.rs
 git commit -m "feat(onnx): protobuf wire encoder and ONNX message builders"
 ```
 
@@ -382,9 +382,9 @@ git commit -m "feat(onnx): protobuf wire encoder and ONNX message builders"
 ### Task 2: Exporter core — conv (+BN fold), activations, maxpool, routes, shortcut, upsample, yolo
 
 **Files:**
-- Modify: `src/darknet-core/src/runtime.rs` (`const BATCH_NORM_EPSILON` line 37 and `fn fold_convolutional_params_for_inference` line ~7017: add `pub(crate)`)
-- Create: `src/darknet-core/src/onnx/export.rs`
-- Modify: `src/darknet-core/src/onnx/mod.rs`, `src/darknet-core/src/lib.rs`
+- Modify: `src/lightnet-core/src/runtime.rs` (`const BATCH_NORM_EPSILON` line 37 and `fn fold_convolutional_params_for_inference` line ~7017: add `pub(crate)`)
+- Create: `src/lightnet-core/src/onnx/export.rs`
+- Modify: `src/lightnet-core/src/onnx/mod.rs`, `src/lightnet-core/src/lib.rs`
 
 **Interfaces:**
 - Consumes: `proto::{Msg, tensor_f32, tensor_i64, attr_*, node, value_info, Dim, model}` (Task 1); `Network { net: NetConfig{channels,height,width}, layers: Vec<Layer> }`, `Layer { input_shape, output_shape: TensorShape{batch,channels,height,width}, kind }`, `LayerParams::Convolutional(ConvolutionalParams{biases, batch_norm: Option<BatchNormParams{scales,rolling_mean,rolling_variance,biases}>, weights})`, `Error::UnsupportedLayer { layer_index, name }`.
@@ -979,7 +979,7 @@ Expected: each focused filter passes its matching test, then the `onnx` filter p
 - [x] **Step 5: Commit**
 
 ```bash
-git add src/darknet-core/src/onnx src/darknet-core/src/lib.rs src/darknet-core/src/runtime.rs
+git add src/lightnet-core/src/onnx src/lightnet-core/src/lib.rs src/lightnet-core/src/runtime.rs
 git commit -m "feat(onnx): export conv/maxpool/route/shortcut/upsample/yolo layers to ONNX"
 ```
 
@@ -988,12 +988,12 @@ git commit -m "feat(onnx): export conv/maxpool/route/shortcut/upsample/yolo laye
 ### Task 3: `export-onnx` CLI subcommand
 
 **Files:**
-- Modify: `src/darknet-cli/src/main.rs` (new match arm after `"detect-image"` block; usage/help text if there is a list of subcommands — grep `bench-train` to find it)
-- Test: `src/darknet-cli/src/main.rs` `mod tests`
+- Modify: `src/lightnet-cli/src/main.rs` (new match arm after `"detect-image"` block; usage/help text if there is a list of subcommands — grep `bench-train` to find it)
+- Test: `src/lightnet-cli/src/main.rs` `mod tests`
 
 **Interfaces:**
-- Consumes: `darknet_core::{export_onnx, OnnxOptions, Network, ExecutableNetwork}` (`ExecutableNetwork::new(network)`, `.load_weights_file(path)`, pub fields `.network`, `.params`).
-- Produces: CLI `darknet-rs export-onnx <cfg> <weights> [out.onnx] [--no-fuse]`; helper `fn parse_export_onnx_args(args: Vec<String>) -> Result<ExportOnnxArgs, String>`.
+- Consumes: `lightnet_core::{export_onnx, OnnxOptions, Network, ExecutableNetwork}` (`ExecutableNetwork::new(network)`, `.load_weights_file(path)`, pub fields `.network`, `.params`).
+- Produces: CLI `lightnet-rs export-onnx <cfg> <weights> [out.onnx] [--no-fuse]`; helper `fn parse_export_onnx_args(args: Vec<String>) -> Result<ExportOnnxArgs, String>`.
 
 - [x] **Step 1: Write the failing test** (in `main.rs` tests):
 
@@ -1049,10 +1049,10 @@ and the match arm:
     let network = Network::from_path(&parsed.cfg)?.with_batch(1);
     let mut executable = ExecutableNetwork::new(network);
     executable.load_weights_file(&parsed.weights)?;
-    let bytes = darknet_core::export_onnx(
+    let bytes = lightnet_core::export_onnx(
         &executable.network,
         &executable.params,
-        &darknet_core::OnnxOptions { fuse_batch_norm: parsed.fuse },
+        &lightnet_core::OnnxOptions { fuse_batch_norm: parsed.fuse },
     )?;
     fs::write(&parsed.out, &bytes)?;
     println!("wrote {} ({} bytes, batch_norm {})", parsed.out.display(), bytes.len(), if parsed.fuse { "fused" } else { "separate" });
@@ -1064,9 +1064,9 @@ and the match arm:
 - [x] **Step 4: Run to verify pass** — `./tools/test_host.sh export_onnx_args` → 1 passed. Build the host CLI before the smoke test:
 
 ```bash
-cargo build -p darknet-cli -j 2
+cargo build -p lightnet-cli -j 2
 D=/home/kerrigan/src/DarkSuite/datasets/LegoGears_v2
-target/debug/darknet-rs export-onnx "$D/LegoGears_v2.cfg" "$D/LegoGears_augmatch_best.weights" /tmp/lego.onnx
+target/debug/lightnet-rs export-onnx "$D/LegoGears_v2.cfg" "$D/LegoGears_augmatch_best.weights" /tmp/lego.onnx
 test -s /tmp/lego.onnx
 ```
 
@@ -1075,7 +1075,7 @@ Expected: a clear `wrote ...` message and a non-empty `/tmp/lego.onnx`.
 - [x] **Step 5: Commit**
 
 ```bash
-git add src/darknet-cli/src/main.rs
+git add src/lightnet-cli/src/main.rs
 git commit -m "feat(cli): export-onnx subcommand"
 ```
 
@@ -1087,7 +1087,7 @@ git commit -m "feat(cli): export-onnx subcommand"
 - Create: `tools/onnx_check.py`
 
 **Interfaces:**
-- Consumes: `darknet-rs export-onnx`, `darknet-rs detect-image` with `DARKNET_LAYER_DUMP_DIR` (writes `layers.tsv` + `layer_NNN.f32`, raw head for yolo layers), `onnxruntime`.
+- Consumes: `lightnet-rs export-onnx`, `lightnet-rs detect-image` with `LIGHTNET_LAYER_DUMP_DIR` (writes `layers.tsv` + `layer_NNN.f32`, raw head for yolo layers), `onnxruntime`.
 - Produces: exit code 0 iff every `yolo_k` output matches its dumped layer within tolerance.
 
 Prerequisite (user installs, not done by this plan): `pip install onnx onnxruntime numpy opencv-python`.
@@ -1098,8 +1098,8 @@ Prerequisite (user installs, not done by this plan): `pip install onnx onnxrunti
 #!/usr/bin/env python3
 """Check an exported ONNX model against the Rust runtime's own layer dumps.
 
-Usage: tools/onnx_check.py CFG WEIGHTS NAMES IMAGE [--binary target/release/darknet-rs] [--no-fuse] [--tol 1e-4]
-Runs `export-onnx`, runs `detect-image` with DARKNET_LAYER_DUMP_DIR (preprocess
+Usage: tools/onnx_check.py CFG WEIGHTS NAMES IMAGE [--binary target/release/lightnet-rs] [--no-fuse] [--tol 1e-4]
+Runs `export-onnx`, runs `detect-image` with LIGHTNET_LAYER_DUMP_DIR (preprocess
 resize-exact = cv2 INTER_LINEAR_EXACT, same as `detector map`), feeds the same
 pixels to onnxruntime and compares every yolo head.
 """
@@ -1130,7 +1130,7 @@ def main() -> int:
     ap.add_argument("weights", type=Path)
     ap.add_argument("names", type=Path)
     ap.add_argument("image", type=Path)
-    ap.add_argument("--binary", default="target/release/darknet-rs")
+    ap.add_argument("--binary", default="target/release/lightnet-rs")
     ap.add_argument("--no-fuse", action="store_true")
     ap.add_argument("--tol", type=float, default=1e-4)
     args = ap.parse_args()
@@ -1143,7 +1143,7 @@ def main() -> int:
         if args.no_fuse:
             cmd.append("--no-fuse")
         subprocess.run(cmd, check=True)
-        env = dict(os.environ, DARKNET_LAYER_DUMP_DIR=str(dump))
+        env = dict(os.environ, LIGHTNET_LAYER_DUMP_DIR=str(dump))
         subprocess.run(
             [args.binary, "detect-image", str(args.cfg), str(args.weights), str(args.names),
              str(args.image), "0.25", "0.45", "resize-exact"],
@@ -1182,7 +1182,7 @@ if __name__ == "__main__":
 - [x] **Step 3: Run on LegoGears_v2 (needs the deps installed; no GPU required, Rust CPU takes ~40 s per image)**
 
 ```bash
-cargo build --release -p darknet-cli -j 2   # wrap with systemd-run when available; otherwise run uncapped and record it
+cargo build --release -p lightnet-cli -j 2   # wrap with systemd-run when available; otherwise run uncapped and record it
 D=/home/kerrigan/src/DarkSuite/datasets/LegoGears_v2
 IMG="$D/set_03/DSCN2167_frame_000238.jpg"
 python3 tools/onnx_check.py "$D/LegoGears_v2.cfg" "$D/LegoGears_augmatch_best.weights" "$D/LegoGears.names" "$IMG"
@@ -1210,7 +1210,7 @@ git commit -m "feat(onnx): onnxruntime check script against Rust layer dumps"
 
 ```markdown
 ## ONNX export (plan: tasks/rust/onnx.md)
-- [x] Task 1 protobuf encoder (`v0.0.254`), Task 2 exporter (`v0.0.255`), Task 3 CLI (`v0.0.256`), Task 4 numeric checker (`v0.0.257`). `MEM=3G ./tools/test_host.sh onnx` passed 11 core tests; `MEM=3G ./tools/test_host.sh export_onnx_args` passed 1 CLI test; `cargo build -p darknet-cli -j 2` passed. `tools/onnx_check.py` passed fused (worst relative error `3.257e-06`), unfused (`3.908e-05`), and Mish (`3.831e-06`) against Rust layer dumps, all under `1e-4`. Local fixture: `build/logs/verify/lego_cur_cpu/run.cfg` + `run_final.weights`, `build/logs/bench/LegoGears.names`, `artwork/dog.jpg`; the plan's canonical dataset paths are absent. No compiled-C++ parity is claimed.
+- [x] Task 1 protobuf encoder (`v0.0.254`), Task 2 exporter (`v0.0.255`), Task 3 CLI (`v0.0.256`), Task 4 numeric checker (`v0.0.257`). `MEM=3G ./tools/test_host.sh onnx` passed 11 core tests; `MEM=3G ./tools/test_host.sh export_onnx_args` passed 1 CLI test; `cargo build -p lightnet-cli -j 2` passed. `tools/onnx_check.py` passed fused (worst relative error `3.257e-06`), unfused (`3.908e-05`), and Mish (`3.831e-06`) against Rust layer dumps, all under `1e-4`. Local fixture: `build/logs/verify/lego_cur_cpu/run.cfg` + `run_final.weights`, `build/logs/bench/LegoGears.names`, `artwork/dog.jpg`; the plan's canonical dataset paths are absent. No compiled-C++ parity is claimed.
 - Follow-ups NOT in scope: postprocess boxes/confs sub-graph (C++ `populate_graph_postprocess`), fp16 initializers (`bit_size`), INT8, weighted shortcut, mismatched-shape shortcut, dilated conv, connected/softmax/avgpool/reorg.
 ```
 

@@ -1,9 +1,0 @@
-[package]
-name = "darknet-cuda"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[lib]
-name = "darknet_cuda"
-path = "src/lib.rs"

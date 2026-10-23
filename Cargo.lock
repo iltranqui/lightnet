@@ -945,86 +945,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
-name = "darknet-cli"
-version = "0.1.0"
-dependencies = [
- "darknet-core",
- "darknet-cuda",
- "darknet-cuda-oxide",
- "rayon",
- "serde_json",
-]
-
-[[package]]
-name = "darknet-core"
-version = "0.1.0"
-dependencies = [
- "darknet-cuda",
- "image",
- "imageproc",
- "mozjpeg",
- "rayon",
-]
-
-[[package]]
-name = "darknet-cuda"
-version = "0.1.0"
-
-[[package]]
-name = "darknet-cuda-oxide"
-version = "0.1.0"
-dependencies = [
- "cuda-core",
- "cuda-device",
- "cuda-host",
- "darknet-cuda",
-]
-
-[[package]]
-name = "darknet-examples"
-version = "0.1.0"
-dependencies = [
- "darknet-core",
- "image",
- "imageproc",
- "serde_json",
-]
-
-[[package]]
-name = "darknet-gui"
-version = "0.1.0"
-dependencies = [
- "arboard",
- "darknet-gui-engine",
- "darknet-gui-project",
- "eframe",
- "image",
- "imageproc",
- "regex",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "darknet-gui-engine"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "darknet-gui-project"
-version = "0.1.0"
-dependencies = [
- "image",
- "imageproc",
- "regex",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "dashmap"
 version = "6.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2326,6 +2246,86 @@ dependencies = [
  "libc",
  "plain",
  "redox_syscall 0.9.3",
+]
+
+[[package]]
+name = "lightnet-cli"
+version = "0.1.0"
+dependencies = [
+ "lightnet-core",
+ "lightnet-cuda",
+ "lightnet-cuda-oxide",
+ "rayon",
+ "serde_json",
+]
+
+[[package]]
+name = "lightnet-core"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "imageproc",
+ "lightnet-cuda",
+ "mozjpeg",
+ "rayon",
+]
+
+[[package]]
+name = "lightnet-cuda"
+version = "0.1.0"
+
+[[package]]
+name = "lightnet-cuda-oxide"
+version = "0.1.0"
+dependencies = [
+ "cuda-core",
+ "cuda-device",
+ "cuda-host",
+ "lightnet-cuda",
+]
+
+[[package]]
+name = "lightnet-examples"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "imageproc",
+ "lightnet-core",
+ "serde_json",
+]
+
+[[package]]
+name = "lightnet-gui"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "eframe",
+ "image",
+ "imageproc",
+ "lightnet-gui-engine",
+ "lightnet-gui-project",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lightnet-gui-engine"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lightnet-gui-project"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "imageproc",
+ "regex",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -44,7 +44,7 @@ file is named inline.
 - [9. Inference parity — LegoGears_v2 (the final target)](#9-inference-parity--legogears_v2-the-final-target)
 - [10. Data augmentation (`augmentation-audit.md`)](#10-data-augmentation-augmentation-auditmd)
 - [11. Housekeeping](#11-housekeeping)
-- [12. Gradient-shortcut audit (`DARKNET_GRAD_MODE`)](#12-gradient-shortcut-audit-darknet_grad_mode)
+- [12. Gradient-shortcut audit (`LIGHTNET_GRAD_MODE`)](#12-gradient-shortcut-audit-darknet_grad_mode)
 - [13. OBB CPU training gaps (plan-open-items Waves 0–1)](#13-obb-cpu-training-gaps-plan-open-items-waves-01)
 - [14. ONNX export](#14-onnx-export)
 - [15. CARPN sample-level polygon mAP dispatch](#15-carpn-sample-level-polygon-map-dispatch)
@@ -267,7 +267,7 @@ file is named inline.
 - [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
 - [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
 - [34. GPU convolution extent parity](#34-gpu-convolution-extent-parity)
-- [35. Annotation GUI (`darknet-gui`)](#35-annotation-gui-darknet-gui)
+- [35. Annotation GUI (`lightnet-gui`)](#35-annotation-gui-lightnet-gui)
 - [36. Annotation GUI plan implementation](#36-annotation-gui-plan-implementation)
 - [37. DarkMark hotkey parity and model discovery](#37-darkmark-hotkey-parity-and-model-discovery)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
@@ -276,23 +276,23 @@ file is named inline.
 
 - Flattened `rust/` to the repo root, vendored `cuda-oxide`, merged the
   workspace, pinned `nightly-2026-08-28` (`85fb0a91`).
-- Dropped the `darknet-cli` cuTile dependency (the `cutile-rs-aot` checkout is
-  missing; `src/darknet-cuda-cutile` is excluded and does not build — left
+- Dropped the `lightnet-cli` cuTile dependency (the `cutile-rs-aot` checkout is
+  missing; `src/lightnet-cuda-cutile` is excluded and does not build — left
   disabled, re-enable only if the AOT fork returns).
-- `cargo oxide` cannot run from the bridge dir; `src/darknet-cuda-oxide/README.md`
+- `cargo oxide` cannot run from the bridge dir; `src/lightnet-cuda-oxide/README.md`
   rewritten.
 - Build-race SIGBUS fixed via the codegen `output_name = "<crate>_test"` for the
   lib/lib-test `.ll`/`.ptx` race.
 - `clippy-preview` component conflict on the pinned toolchain resolved (clippy
   reinstalled as a non-preview component).
-- `src/darknet-cuda-oxide` is **not** a workspace member: build/test it with
+- `src/lightnet-cuda-oxide` is **not** a workspace member: build/test it with
   `./tools/test_oxide.sh` (`cargo oxide`); `tools/test_host.sh` is the host
   wrapper. Every cargo command uses `-j 4`/`-j 2` and is capped.
 
 ## 2. `cuda-oxide` GPU backend (P0–P9)
 
 ### P0–P1 — scaffold and elementwise
-- P0: `src/darknet-cuda-oxide`, host upload/zeros/download (`e4a42d27`).
+- P0: `src/lightnet-cuda-oxide`, host upload/zeros/download (`e4a42d27`).
 - P1: `bias_add`/`channel_scale`/`bias_backward`, 7 activations fwd+bwd,
   `vector_add`/`shortcut`/`saxpy`, SGD (`e4a42d27`); 7 parity tests.
 - `bias_backward` block reduction decision (2026-10-01): kept the deterministic
@@ -303,7 +303,7 @@ file is named inline.
 - `kernels/gemm.rs` (smem-tiled NN/NT/TN), `kernels/im2col.rs`
   (im2col+col2im with stride/dilation/padding/groups), `kernels/conv_direct.rs`
   (fwd/dgrad/wgrad); wired `conv2d_f32` + `conv2d_backward_{input,weights}_f32`.
-- `DARKNET_OXIDE_CONV={direct,gemm,auto}` heuristic; cached conv workspace.
+- `LIGHTNET_OXIDE_CONV={direct,gemm,auto}` heuristic; cached conv workspace.
 - Real-cfg shape coverage: scanned 101 cfgs / 5845 conv layers / 990 unique
   geometries (`tools/cfg_conv_shapes.py`, `tests/data/*.csv`); C++ cross-check
   3822 convs, 0 mismatches. Tests `cfg_conv_direct/gemm/gemm_tf32`, batch-2
@@ -314,7 +314,7 @@ file is named inline.
 
 ### P2b — Tensor-core GEMM
 - `kernels/gemm_mma.rs` mma.sync + ldmatrix, tf32 inputs, f32 accumulate;
-  `DARKNET_OXIDE_GEMM={fp32,tf32,auto}`; conv fwd/dgrad/wgrad through it.
+  `LIGHTNET_OXIDE_GEMM={fp32,tf32,auto}`; conv fwd/dgrad/wgrad through it.
 - Perf (2026-10-01): root cause of slow GEMMs was un-unrolled `while` loops
   putting accumulator arrays in local memory; new `kernels/unroll.rs` made
   indices constant (tf32 4.1 → 10.8 TFLOP/s at 2048³, 0 stack, 96 regs).
@@ -338,7 +338,7 @@ file is named inline.
   `backward_accumulate_seeded_gpu` incl. `loss_scale`.
 
 ### P4 — CLI + end to end
-- `oxide` feature + `DARKNET_BACKEND=cpu|oxide`; dead cuTile cfg blocks removed.
+- `oxide` feature + `LIGHTNET_BACKEND=cpu|oxide`; dead cuTile cfg blocks removed.
 - LegoGears_v2 inference: oxide == Rust CPU (score diff ≤5e-7, IoU ≥0.99999) ==
   C++ CUDA (score diff ≤4.5e-4, from C++ `cudnn_half=1`).
 - JPEG decode fixed via `mozjpeg` (ISLOW + fancy upsampling): 0 pixel diff vs
@@ -355,7 +355,7 @@ file is named inline.
   is `dropout_unit(seed, i)`, identical on CPU and GPU.
 - `NORM_CHAN*` f32 convolution support: CPU references and native Oxide forward
   and backward are integrated in runtime; exact adjoints are default and
-  `DARKNET_GRAD_MODE=cpp` follows the inspected CUDA diagonal shortcuts (C++ CPU
+  `LIGHTNET_GRAD_MODE=cpp` follows the inspected CUDA diagonal shortcuts (C++ CPU
   custom gradients differ). Parser allows only `[convolutional]`; f16 inference
   explicitly rejects these activations. No compiled-C++ golden is available.
 - SAM uses native f32 pointwise forward/backward for mapped activations,
@@ -397,8 +397,8 @@ file is named inline.
   `burnin_update`, `train_only_bn`, `clip`, `grad_centr`), `try_fix_nan`.
 - Dropout/dropblock fwd+bwd (deterministic counter-hash RNG; DropBlock ramp and
   per-(sample,channel) block placement, exact `dy*mask` backward).
-- Mixed precision training (AMP): `DARKNET_OXIDE_AMP=1`; f16 working copies, f32
-  master weights/optimizer/BN state; `src/darknet-cuda-oxide/src/mixed.rs` +
+- Mixed precision training (AMP): `LIGHTNET_OXIDE_AMP=1`; f16 working copies, f32
+  master weights/optimizer/BN state; `src/lightnet-cuda-oxide/src/mixed.rs` +
   `kernels/amp.rs`; tests `oxide_amp` (10). Bench b16 82.7 → 62.9 ms.
   Real-device runtime-chain test with dropout + dropblock verifies masks,
   activations, backward, and SGD against f32; these stochastic layers remain on
@@ -452,10 +452,10 @@ file is named inline.
 
 - **Phase A**: `kernels/gemm_f8.rs` Ada `mma.m16n8k32` e4m3/e5m2 tiled GEMM
   (64×64, BK=32, NN/NT/TN/TT, batched, split-K), per-tensor quantiser + amax,
-  `GemmMode::Fp8` (`DARKNET_OXIDE_GEMM=fp8`). Fragment layout pinned by a wiring
+  `GemmMode::Fp8` (`LIGHTNET_OXIDE_GEMM=fp8`). Fragment layout pinned by a wiring
   sweep on the real GPU; `src/fp8.rs` host reference.
 - **Phase B**: FP8 dgrad/wgrad (e4m3 weights × e5m2 grads, C++ recipe),
-  `DARKNET_OXIDE_GEMM_BWD=fp8`; 3.1%/2.2% worst relative error vs f32.
+  `LIGHTNET_OXIDE_GEMM_BWD=fp8`; 3.1%/2.2% worst relative error vs f32.
 - **Phase C**: `kernels/quant_fp4.rs` + `kernels/gemm_fp4.rs` packed NVFP4
   (E2M1 + E4M3 block-16 scales + f32 global) via `__dp4a`, **bit-exact** against
   the CPU i32 reference (`src/fp4.rs`); `GemmMode::Fp4`. Emulation only (native
@@ -471,7 +471,7 @@ file is named inline.
   | 1024³ | 0.468 ms / 4593 GF/s | 0.452 ms / 4754 GF/s | 7.35 ms / 292 GF/s |
   | 2048³ | 3.48 ms / 4940 GF/s | 2.45 ms / 7020 GF/s | 54.3 ms / 316 GF/s |
 
-  End-to-end through the `DARKNET_OXIDE_GEMM` selector (fp8/fp4 include their
+  End-to-end through the `LIGHTNET_OXIDE_GEMM` selector (fp8/fp4 include their
   quantisation; fp4 also the host transpose):
 
   | shape | f32 | tf32 | fp16 | fp8 | fp4 |
@@ -553,7 +553,7 @@ C++ dump parity: NOT RUN for any Phase 0 layer (no owning-branch C++ build).
   three CPU paths, route-style use-counts, GPU-f32 host round trip, f16 error,
   GPU backward via CPU fallback. 10 tests (pure gather + exact adjoint +
   `lround` rounding/clamping + duplicate accumulation + runtime fwd/bwd/parse).
-  Evidence: targeted 10 green, `darknet-core --lib` 317/317.
+  Evidence: targeted 10 green, `lightnet-core --lib` 317/317.
 - **`[laya_act_head]`** (2026-10-05, uncommitted): `laya_act_head.rs` +
   `LayaActHeadSpec` + `LayerKind::LayaActHead`. Three route-style inputs
   (`layers=head,scorer,marker`); frozen 2-layer MLP over masked-softmax summary
@@ -565,7 +565,7 @@ C++ dump parity: NOT RUN for any Phase 0 layer (no owning-branch C++ build).
   error, GPU backward via CPU fallback. 9 tests (hand-computed features incl.
   all-invalid options, MLP forward, central-difference backward for all four
   tensors, blob round trip + offset, shape errors, runtime fwd/bwd/parse).
-  Evidence: targeted 9 green, `darknet-core --lib` 326/326.
+  Evidence: targeted 9 green, `lightnet-core --lib` 326/326.
 - **`[laya_loss]`** (2026-10-05, uncommitted): `laya_loss.rs` + `LayaLossSpec`
   + `LayerKind::LayaLoss` + a `dense_loss` arm. Masked soft-target loss over the
   scorer's option logits, `mode=ce` (masked cross-entropy) and `mode=rlcd`
@@ -579,7 +579,7 @@ C++ dump parity: NOT RUN for any Phase 0 layer (no owning-branch C++ build).
   not bit-reproducible). 11 tests (CE hand computation + FD, masking, padding,
   TD(lambda), RLCD hand formula, RNG determinism, shape errors, runtime
   forward/seed and RLCD smoke, parse errors). Evidence: targeted 11 green,
-  `darknet-core --lib` 337/337.
+  `lightnet-core --lib` 337/337.
 - **`[laya_encoder]`** (2026-10-05, uncommitted): `laya_encoder.rs` +
   `LayaEncoderSpec` + `LayerKind::LayaEncoder` + a frozen runtime forward (CPU,
   plus a GPU-f32 host round trip). Frozen ModernBERT-large: token-embedding
@@ -592,7 +592,7 @@ C++ dump parity: NOT RUN for any Phase 0 layer (no owning-branch C++ build).
   RoPE identity-at-0 + norm preservation, zero-weight and pass-through
   invariants, padding-mask attention, blob round trip, shape errors, runtime
   forward vs module, parse errors). Evidence: targeted 9 green,
-  `darknet-core --lib` 346/346.
+  `lightnet-core --lib` 346/346.
 - **`[laya_head]`** (2026-10-05, uncommitted): `laya_head.rs` + `LayaHeadSpec` +
   `LayerKind::LayaHead` + a frozen runtime forward (CPU + GPU-f32 host round
   trip, GPU/CPU backward no-op). Two plain pre-norm `nn.TransformerEncoderLayer`s
@@ -603,7 +603,7 @@ C++ dump parity: NOT RUN for any Phase 0 layer (no owning-branch C++ build).
   8 tests (LayerNorm-with-bias hand computation, zero-projection double-norm
   invariant, type_emb additive, per-sample qtype selection, blob round trip
   matching `head_blob_float_count`, shape errors, runtime forward vs module,
-  parse errors). Evidence: targeted 8 green, `darknet-core --lib` 354/354.
+  parse errors). Evidence: targeted 8 green, `lightnet-core --lib` 354/354.
 
 **The LAYA family is now complete** (`laya_scorer`, `laya_marker_gather`,
 `laya_act_head`, `laya_loss`, `laya_encoder`, `laya_head`).  C++ dump parity is
@@ -662,7 +662,7 @@ still NOT RUN (no `Jev_laya` build here; `test_data/laya/` has only the shared
   inference. v71 added no-BN native backward. v72 added per-branch batch-stat
   BN caches, native BN and convolution backward, scale/beta/weight gradient
   accumulation, and device-produced rolling EMA propagation; parameter
-  optimizers remain host-side. `MEM=3G PKGS=darknet-core
+  optimizers remain host-side. `MEM=3G PKGS=lightnet-core
   ./tools/test_host.sh eml_convolutional` passes 3/3, and
   `./tools/test_oxide.sh --test oxide_runtime_chain` passes 19/19. CPU EML
   training uses rolling stats, unlike the native GPU batch-stat training path;
@@ -753,8 +753,8 @@ still NOT RUN (no `Jev_laya` build here; `test_data/laya/` has only the shared
   callback bypass, spatial-order, and FakeBackend runtime forward/backward tests.
   No compiled-C++ parity is claimed; remaining Phase 3A layers and native VC
   kernels remain open.
-- Earlier focused evidence: full host unit suites pass (`darknet-core` 377,
-  `darknet-cli` 18); targeted check/build pass with `-j 4`. The full
+- Earlier focused evidence: full host unit suites pass (`lightnet-core` 377,
+  `lightnet-cli` 18); targeted check/build pass with `-j 4`. The full
   `cfg_corpus` integration run exceeded a 30-minute timeout. C++ dump parity NOT
   RUN (no owning-branch executable).
 - v0.0.268 (`0bd26bda`): added source-derived Swin geometry, masks, mHC, and
@@ -856,7 +856,7 @@ still NOT RUN (no `Jev_laya` build here; `test_data/laya/` has only the shared
 
 ## 10. Data augmentation (`augmentation-audit.md`)
 
-- Implemented: `crates/darknet-core/src/augmentation.rs` + training-only loader +
+- Implemented: `crates/lightnet-core/src/augmentation.rs` + training-only loader +
   CPU/oxide CLI wiring; jitter/resize margins, letterbox, source-mean padding,
   OpenCV-style u8 bilinear, flip, HSV, box clip/mirror/subpixel filter, max-box
   cap, mixup, multi-scale `random`, seeded SplitMix64, background prefetch, and
@@ -873,11 +873,11 @@ still NOT RUN (no `Jev_laya` build here; `test_data/laya/` has only the shared
 - Stale-box audit (2026-10-01) resolved most open checkboxes with inline
   evidence.
 
-## 12. Gradient-shortcut audit (`DARKNET_GRAD_MODE`)
+## 12. Gradient-shortcut audit (`LIGHTNET_GRAD_MODE`)
 
 Audited line-by-line against `src-lib` on 2026-10-01; `GradMode` lives in
-`src/darknet-core/src/runtime.rs`. Keep exact analytical backward as the default;
-`DARKNET_GRAD_MODE=cpp` reproduces C++ shortcuts for softmax, scale_channels
+`src/lightnet-core/src/runtime.rs`. Keep exact analytical backward as the default;
+`LIGHTNET_GRAD_MODE=cpp` reproduces C++ shortcuts for softmax, scale_channels
 (`scale_wh=1`), and weighted shortcut. Other ops are exact and untouched.
 
 1. **softmax** — `softmax_layer.cpp:97`/`:146` pass `dy` through; exact is
@@ -928,7 +928,7 @@ Audited line-by-line against `src-lib` on 2026-10-01; `GradMode` lives in
 11. **NORM_CHAN_SOFTMAX / NORM_CHAN** CUDA gradients drop the normalization
     cross terms (`activation_kernels.cu:788-874`). v65 added exact standalone
     backend derivatives and v66 wired them into f32 convolution CPU/Oxide
-    runtimes; `DARKNET_GRAD_MODE=cpp` selects the inspected CUDA shortcut. CPU
+    runtimes; `LIGHTNET_GRAD_MODE=cpp` selects the inspected CUDA shortcut. CPU
     C++ custom gradients differ. The parser permits these only on
     `[convolutional]`; f16 inference remains unsupported.
 12. **gelu gradient at the output** (see 4).
@@ -966,7 +966,7 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 
 - v0.0.254 (`fc50aa57`): added a dependency-free protobuf wire encoder and ONNX message builders; varint, signed-int, model wire structure, and raw float tensor tests pass.
 - v0.0.255 (`1b632932`): implemented supported-layer ONNX export for Conv/BN, activations, maxpool, route, shortcut, upsample, and YOLO heads; unsupported constructs fail explicitly. `MEM=3G ./tools/test_host.sh onnx` passed 11 tests, including asymmetric maxpool padding, grouped-route source-channel slicing, separate BN, unsupported dilation/shortcuts, Mish opset 18, and no-YOLO outputs.
-- v0.0.256 (`4a0d99e7`): added `export-onnx` CLI parsing, default output path, `--no-fuse`, argument rejection, and usage text. `MEM=3G ./tools/test_host.sh export_onnx_args` and `systemd-run --user --scope -p MemoryHigh=3G cargo build -p darknet-cli -j 2` passed; fused and unfused model exports from a local matching cfg/weights succeeded.
+- v0.0.256 (`4a0d99e7`): added `export-onnx` CLI parsing, default output path, `--no-fuse`, argument rejection, and usage text. `MEM=3G ./tools/test_host.sh export_onnx_args` and `systemd-run --user --scope -p MemoryHigh=3G cargo build -p lightnet-cli -j 2` passed; fused and unfused model exports from a local matching cfg/weights succeeded.
 - v0.0.257 (`778242ab`): added `tools/onnx_check.py`; syntax check passed. ONNX Runtime checks against Rust CPU layer dumps yielded worst relative errors of `3.257e-06` (fused), `3.908e-05` (unfused), and `3.831e-06` (Mish-opset-18 variant), all below `1e-4`. Verified with local cfg/weights/image because the canonical dataset paths are absent. This is Rust-runtime parity; no compiled-C++ golden exists.
 
 ## 15. CARPN sample-level polygon mAP dispatch
@@ -976,7 +976,7 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 ## 16. CARPN CPU network inference and direct mAP
 
 - v0.0.259 (`29889c5c`): added `[obb_refine]` CPU inference, Stage-2 quadrilateral decoding/NMS, full-forward OBB validation with explicit polygon mAP, `detect-image` integration, and a cfg/weights-backed direct `detector map` route. Generated fixtures verify AP/report counts, a same-AABB/wrong-polygon case (AABB AP 1.0 versus polygon AP 0.0 at IoU 0.6), and required front-point labels even with zero proposals. CARPN `detector train` including `-map` rejects before training because Stage-2 assignment/loss/backward/update support is not implemented. Legacy OBB behavior is preserved (`MEM=3G ./tools/test_host.sh obb_`: 138 core + 4 CLI tests).
-- Focused evidence: `carpn_refine_cfg` (2), `carpn_refine_weights` (1), `carpn_refine_forward` (3), `carpn_proposals_apply` (1), `carpn_refine_decode` (5), `carpn_map` (6), `carpn_cli` (1), `detect_image_routes_carpn` (1), and `detector_train_rejects_carpn` (1) all passed through `MEM=3G ./tools/test_host.sh`. `systemd-run --user --scope -p MemoryHigh=3G cargo build -p darknet-cli -j 4`, targeted `rustfmt --check`, and `git diff --check` passed. Workspace-wide `cargo fmt --check` reports pre-existing formatting differences in unrelated ONNX/CUDA files; those were not reformatted. No full cfg-corpus run was required.
+- Focused evidence: `carpn_refine_cfg` (2), `carpn_refine_weights` (1), `carpn_refine_forward` (3), `carpn_proposals_apply` (1), `carpn_refine_decode` (5), `carpn_map` (6), `carpn_cli` (1), `detect_image_routes_carpn` (1), and `detector_train_rejects_carpn` (1) all passed through `MEM=3G ./tools/test_host.sh`. `systemd-run --user --scope -p MemoryHigh=3G cargo build -p lightnet-cli -j 4`, targeted `rustfmt --check`, and `git diff --check` passed. Workspace-wide `cargo fmt --check` reports pre-existing formatting differences in unrelated ONNX/CUDA files; those were not reformatted. No full cfg-corpus run was required.
 - Source behavior is hand-derived from `raptor`; there is no compiled-C++ oracle or canonical CARPN cfg/weights/dataset, so no compiled-C++ parity or canonical-dataset result is claimed. GPU CARPN inference and CARPN training/scheduled `detector train -map` remain deferred.
 
 ## 17. DCNv4 CPU reference and GPU f32 host fallback
@@ -1027,7 +1027,7 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 
 - v0.1.007 (`94513d426c190ab8b7fb012ee3bf0b5f68ff5e55`): integrated `[recursive_block]` / `[recurrent_block]` with nested body-section consumption, strict option/shape validation, deterministic initialization, per-pass body tapes/dropout masks, and nested BN rolling-stat updates. CPU forward covers static recurrence, controller-gated `ouroboros=1`, and lattice projection; backward is exact for the Rust forward across the full unrolled recurrence, controller, and lattice. SGD, AdamW, Muon traversal/state validation, body-only C++ `.weights` order, and explicit GPU/compact/update rejection are included.
 - C++ `.weights` omits controller weights/biases (and LoRA values), so controller learning is not restored by Darknet checkpoints. Stage-1 rejects `ouroboros=2` and every explicit `lora_*` option. Rust full BPTT and lattice derivatives intentionally differ from C++ truncated k=1 backward and stop-gradient lattice behavior.
-- Verification: `MEM=3G ./tools/test_host.sh recursive_block` passed 11 core tests, `weights` passed 45 core + 2 CLI tests, `runtime` passed 219 core tests, and `MEM=3G cargo check -p darknet-core -j 4` passed. Tests include all-trainable finite differences for static/controller/lattice branches, dropout mask reproducibility/independence, nested BN running stats, exact body-only weight bytes, optimizer state validation, Muon matrix ordering, and GPU rejection. Targeted rustfmt and `git diff --check` passed. No training, Oxide tests, or feature-specific `cfg_corpus` run; the full host baseline/cfg-corpus status remains non-green/unverified under the memory cap (see `STATUS.md`).
+- Verification: `MEM=3G ./tools/test_host.sh recursive_block` passed 11 core tests, `weights` passed 45 core + 2 CLI tests, `runtime` passed 219 core tests, and `MEM=3G cargo check -p lightnet-core -j 4` passed. Tests include all-trainable finite differences for static/controller/lattice branches, dropout mask reproducibility/independence, nested BN running stats, exact body-only weight bytes, optimizer state validation, Muon matrix ordering, and GPU rejection. Targeted rustfmt and `git diff --check` passed. No training, Oxide tests, or feature-specific `cfg_corpus` run; the full host baseline/cfg-corpus status remains non-green/unverified under the memory cap (see `STATUS.md`).
 - Evidence boundary: hand-derived from `Jev_laya`; there is no compiled-C++ golden/parity. CPU-only Stage-1 support is complete for this layer; native GPU and GPU Muon remain Stage 2.
 
 ## 25. Hyperbolic-foveation Stage-1 CPU reference
@@ -1083,44 +1083,44 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 ## 33. Convolutional axis pins and the dilation contract
 
 - v0.1.016 (`051021fe`): added `model::tests::convolutional_axis_layout_pins_dilated_extent_and_groups` (C++ extent for dilated/strided non-square input, `batch=2`, and the `[out][in/groups]` weight cardinality for `filters=6, groups=2, C=4`) and `runtime::tests::convolutional_axis_layout_keeps_nchw_and_group_partitions` (channel-swapping 1x1 weights, then `groups=2` partitioning, both over `batch=2`).
-- Verification: `MEM=3G ./tools/test_host.sh convolutional_axis_layout` passed 5; `axis_layout` passed 21 (was 19); `runtime::` passed 261. Full CPU baseline `cargo test -p darknet-core --lib -j 2` passed 897 and `-p darknet-cli` 28; GPU baseline `MEM=3G ./tools/test_oxide.sh --test oxide_parity` passed 11 and `oxide_runtime_chain` 24. Targeted edition-2024 Rustfmt and `git diff --check` passed.
+- Verification: `MEM=3G ./tools/test_host.sh convolutional_axis_layout` passed 5; `axis_layout` passed 21 (was 19); `runtime::` passed 261. Full CPU baseline `cargo test -p lightnet-core --lib -j 2` passed 897 and `-p lightnet-cli` 28; GPU baseline `MEM=3G ./tools/test_oxide.sh --test oxide_parity` passed 11 and `oxide_runtime_chain` 24. Targeted edition-2024 Rustfmt and `git diff --check` passed.
 - Finding F1 retracted: `conv_dim` must keep ignoring dilation because `Jev_laya:src-lib/convolutional_layer.cpp:317` does; applying `dilation*(size-1)` shrank the extent and broke `cfg/resnet152_trident.cfg` at route #244 (`16x16` vs `38x38`). `conv_dim` now documents that, and the pin fails if the term returns. The cuDNN/oxide `pad*dilation` difference is recorded as a source-level inconsistency, not a Rust defect.
 - Evidence boundary: hand-derived from `Jev_laya`; no compiled-C++ golden and no parity claim.
 
 ## 34. GPU convolution extent parity
 
-- v0.1.017 (`263fa448`): fixed `Geom::new` in the cuda-oxide conv driver. It computed the textbook dilated span `(in + 2*pad - (dil*(k-1)+1))/stride + 1`, while `darknet-core`'s `conv_dim` and C++ `convolutional_out_width` compute `(in + 2*pad - k)/stride + 1`: dilation changes the sampling offsets, not the extent. The device map was smaller than the caller requested, so `expect_shape` rejected every dilated convolution. f32 and f16 now use the CPU extent; extent validation uses `k`.
+- v0.1.017 (`263fa448`): fixed `Geom::new` in the cuda-oxide conv driver. It computed the textbook dilated span `(in + 2*pad - (dil*(k-1)+1))/stride + 1`, while `lightnet-core`'s `conv_dim` and C++ `convolutional_out_width` compute `(in + 2*pad - k)/stride + 1`: dilation changes the sampling offsets, not the extent. The device map was smaller than the caller requested, so `expect_shape` rejected every dilated convolution. f32 and f16 now use the CPU extent; extent validation uses `k`.
 - Verification: `oxide_conv_parity` passed 13 (including `dilation2_pad2`, `fd_dil2`), `oxide_cfg_shapes` 13 (6 dilated geometries, Direct and Gemm, 12 runs, 0 failures), `oxide_gemm_mma` 5, `oxide_half` 13. The `oxide_cfg_shapes` contract was inverted: raw `pad` must reproduce the cfg dimensions and parity, while a `pad*dilation` call with cfg dimensions must be rejected.
-- Evidence boundary: hand-derived from `Jev_laya` and `darknet-core`; no compiled-C++ golden/parity. YOLO heads are pass-through on device (the loss/decode runs on the host), so this was the only conv-side parity gap.
+- Evidence boundary: hand-derived from `Jev_laya` and `lightnet-core`; no compiled-C++ golden/parity. YOLO heads are pass-through on device (the loss/decode runs on the host), so this was the only conv-side parity gap.
 
-## 35. Annotation GUI (`darknet-gui`)
+## 35. Annotation GUI (`lightnet-gui`)
 
-- v0.1.018 (`0ca7613e`): added the opt-in `darknet-gui` crate (egui/eframe 0.32.3, `glow`), the first slice of `gui_plan.md`. `annotation.rs` holds normalized centre/size marks with a 10-decimal YOLO text round trip and click hit testing; `project.rs` scans a flat image folder, reads class names from the first `*.names` or `classes.txt`, and loads/saves sidecars; `main.rs` is the window with folder open, class and image lists, fit-to-window canvas, drag-to-create, click-to-select, rubber band, and per-image undo.
+- v0.1.018 (`0ca7613e`): added the opt-in `lightnet-gui` crate (egui/eframe 0.32.3, `glow`), the first slice of `gui_plan.md`. `annotation.rs` holds normalized centre/size marks with a 10-decimal YOLO text round trip and click hit testing; `project.rs` scans a flat image folder, reads class names from the first `*.names` or `classes.txt`, and loads/saves sidecars; `main.rs` is the window with folder open, class and image lists, fit-to-window canvas, drag-to-create, click-to-select, rubber band, and per-image undo.
 - Semantics: malformed label lines are errors, so a partial read cannot overwrite a file; a degenerate drag creates nothing; an empty annotation deletes the sidecar instead of writing a blank one.
-- Verification: `cargo build -p darknet-gui --offline` and `cargo test -p darknet-gui --offline` pass with 7 tests.
+- Verification: `cargo build -p lightnet-gui --offline` and `cargo test -p lightnet-gui --offline` pass with 7 tests.
 - Evidence boundary: builds offline against the locally cached eframe. Not implemented: DarkMark `.json` sidecars, class remap, filters/sort, neighbour copy/interpolation/homography, alternate views, launcher, and the `detect-server` prediction overlay.
 
 ## 36. Annotation GUI plan implementation
 
-- v0.1.019 (`fcd23bbd`): split the annotator into `darknet-gui-project` (pure logic), `darknet-gui-engine` (child-process inference) and `darknet-gui` (eframe shell), and implemented the plan's milestones:
+- v0.1.019 (`fcd23bbd`): split the annotator into `lightnet-gui-project` (pure logic), `lightnet-gui-engine` (child-process inference) and `lightnet-gui` (eframe shell), and implemented the plan's milestones:
   - `annotation.rs`: DarkMark detector JSON (`G3`-`G7`) parsed through `serde_json::Value` so unknown sidecar and mark fields survive; string and integer `annotation_mode`; exactly four points (`D4`); `G4`/`G5` save rules; `.txt` with ten decimals.
   - `project.rs`: recursive `G2` scan with chart/mask/cache exclusions, `<name>.names`/`.data` preference (`D5`), detector-mode validation, mark index counting `completely_empty` as one.
   - `filter.rs`, `nav.rs`: tri-state/regex/class/age filters, stable sort, clamped navigation, unmarked walking that stops on the boundary image.
   - `undo.rs`, `edit.rs`: capped undo/redo and the `G9`-`G16` edit model (smallest-area hit test, corner re-drag with `D8` restore, clamped creation, additive digit classes with refusal, Tab cycling including predictions, accept rules, threshold clamp, nudge/scale/clear/empty/copy).
   - `actions.rs`, `create.rs`, `classes.rs`: interpolation, clipboard JSON, edge snapping, homography; `G1` project creation; dry-run class remap with backup and atomic rename.
-  - `darknet-gui-engine`: `DetectWorker` JSON-lines protocol with a 30 s timeout, child-exit and malformed-reply errors.
-  - `darknet-cli detect-server`: one request per stdin line, normalized boxes, error objects that keep the server alive, CPU and feature-gated oxide backends.
-  - `darknet-gui`: launcher with persisted recents, new-project dialog, image cache, zoom/pan canvas, six view modes, filters, class editor with dry run, prediction overlay.
-- Verification: `cargo test -p darknet-gui-project` 36, `-p darknet-gui-engine` 4, `-p darknet-cli` 28; offline build of the three GUI crates is warning-free; `cargo metadata --locked` reports 33 members.
-- v0.1.020 (`2640b902`): the overlay's model loader resolves `DARKNET_RS_BIN` before the current executable, so `cargo run -p darknet-gui` can find `darknet-rs`.
+  - `lightnet-gui-engine`: `DetectWorker` JSON-lines protocol with a 30 s timeout, child-exit and malformed-reply errors.
+  - `lightnet-cli detect-server`: one request per stdin line, normalized boxes, error objects that keep the server alive, CPU and feature-gated oxide backends.
+  - `lightnet-gui`: launcher with persisted recents, new-project dialog, image cache, zoom/pan canvas, six view modes, filters, class editor with dry run, prediction overlay.
+- Verification: `cargo test -p lightnet-gui-project` 36, `-p lightnet-gui-engine` 4, `-p lightnet-cli` 28; offline build of the three GUI crates is warning-free; `cargo metadata --locked` reports 33 members.
+- v0.1.020 (`2640b902`): the overlay's model loader resolves `LIGHTNET_RS_BIN` before the current executable, so `cargo run -p lightnet-gui` can find `lightnet-rs`.
 - Evidence boundary: DarkMark compatibility is derived from the `G`/`D` tables, not verified against a running DarkMark (`T1.5` still open). Not wired: add/delete classes from the dialog, delete-image/undo-delete, heatmaps, jump, screenshots, train runner.
 
 ## 37. DarkMark hotkey parity and model discovery
 
 - v0.1.021 (`8c536b6d`): the key map is transcribed from `DarkMark/src-darkmark/DMContent.cpp::keyPressed()` (`:1013-2050`) rather than the `G16` summary. Corrections: `r` random sort and `R` alphabetical; `,`/`.` apply `scale_all_marks(+-0.01)`, a normalized delta, not a box-relative factor; `o` is mass-delete mode; `P` homography; `` ` `` merge; `l` labels on/off/auto; `b`/`B` bold/shade; `d` snap-all; `D` snapping toggle; `h`/`H` heatmaps; `j` jump; `s`/`S` screenshots and `F12` window screenshot; `t`, `[`/`]`, `(`/`)` tiling; `y`/`Y` copy neighbour; `Shift+U` undo-delete; `Shift+Delete` delete image; `Escape` cancel. `Tab` skips invisible marks and records the recent class/size; `A` accepts only the selected prediction.
 - `Project` now discovers the project's model files (`G1`): `<name>.cfg` else the first `*.cfg`, and `<name>_best.weights` / `<name>_final.weights` / `<name>.weights` else the first `*.weights`. The GUI prefills the overlay paths from them.
-- Weight parsing remains in `darknet-rs`: `load_weights_file` for inference and `weights-inspect` for a header report. The GUI process never parses `.weights`; it starts `detect-server`, which loads them and reports mismatches as errors.
-- Verification: `darknet-gui-project` 38 tests, `darknet-gui-engine` 4, offline builds of the GUI and CLI.
+- Weight parsing remains in `lightnet-rs`: `load_weights_file` for inference and `weights-inspect` for a header report. The GUI process never parses `.weights`; it starts `detect-server`, which loads them and reports mismatches as errors.
+- Verification: `lightnet-gui-project` 38 tests, `lightnet-gui-engine` 4, offline builds of the GUI and CLI.
 - Evidence boundary: mapped actions for features not yet built (mass-delete, homography, merge, heatmaps, screenshots, tiling, jump, delete-image) report "mapped but not implemented" instead of silently doing nothing. Parity is with the DarkMark source, not a running DarkMark.
 
 ## 38. YOLO-3D configuration preparation (not a layer port)
@@ -1176,7 +1176,7 @@ Scoped prompt-to-artifact audit:
 | Existing 2D/OBB/modern decoders, losses and validation datasets reject graph | `yolo_3d_existing_2d_and_obb_apis_reject_even_empty_head_lists` covers nine entry points without relying on the passed head list |
 | CPU-only boundary | `yolo_3d_rejects_gpu_execution_backward_and_updates` covers full/compact GPU, immediate/deferred update and backward; f16 is checked via the shared preflight helper, not real device execution. Source inspection confirms the f16 entry calls that helper |
 | Constructor and unsupported export | `yolo_3d_from_heads_constructor_has_no_cuboid_outputs`, `yolo_3d_onnx_export_still_rejects`; all ForwardResult constructors compile with the new field |
-| CLI rejection before asset loading/training | `darknet-cli::tests::yolo_3d_cli_rejects_train_map_and_detect_server_before_loading_assets`; malformed data and missing weights prove those three paths reject before use. The detect-image guard is source-inspected, not exercised through a CLI process |
+| CLI rejection before asset loading/training | `lightnet-cli::tests::yolo_3d_cli_rejects_train_map_and_detect_server_before_loading_assets`; malformed data and missing weights prove those three paths reject before use. The detect-image guard is source-inspected, not exercised through a CLI process |
 
 Verification commands ran serially under `MemoryHigh=3G` systemd scopes (scripts `-j 2`):
 
@@ -1192,7 +1192,7 @@ Verification commands ran serially under `MemoryHigh=3G` systemd scopes (scripts
 | `dpt_head` | 18 | 0 |
 | `onnx` | 12 | 1 |
 
-- `systemd-run --user --scope -p MemoryHigh=3G cargo check -p darknet-cli --features oxide -j 4` passed. Targeted edition-2024 Rustfmt and `git diff --check` passed. No actual training runs, Oxide tests, corpus or unfiltered host suite; existing warnings remain. Temporary weights/sidecars used RAII cleanup; test logs/source snapshots were removed after recording evidence.
+- `systemd-run --user --scope -p MemoryHigh=3G cargo check -p lightnet-cli --features oxide -j 4` passed. Targeted edition-2024 Rustfmt and `git diff --check` passed. No actual training runs, Oxide tests, corpus or unfiltered host suite; existing warnings remain. Temporary weights/sidecars used RAII cleanup; test logs/source snapshots were removed after recording evidence.
 - **Remaining layer DoD:** projected activations/math, assignments, losses and exact loss derivatives/Cpp-mode deltas; standalone and mixed loss APIs consuming the label helpers; decode and its A2 anchor/entry/vertex pin; projected evaluator; depth/metric consumption and references; end-to-end loss-to-conv/optimizer tests. Parsed map/counter metadata still needs consumption by these APIs. Supplied-seed optimizer tests are not a substitute for full training-loss integration. The current axis decision stays Open; `axis_layout` remains 21, not a new cuboid pin. No compiled-C++ golden exists. Hand-derived from source, no compiled-C++ golden; GPU status none. Stage 1, all-native GPU/GPU Muon Stage 2, and sparse MoE Stage 3 remain incomplete; no overall parity or green full-host claim.
 
 ## 41. Native f32 LAYA marker gather
@@ -1204,8 +1204,8 @@ Scoped requirement-to-artifact audit:
 
 | Requirement | Actual artifacts and verification |
 |---|---|
-| Checked backend contract/default reference | `darknet-cuda/src/host_ops/marker_gather.rs::Layout`, exposed via `host_ops.rs`; two `F32TensorOpsBackend` methods in `darknet-cuda/src/lib.rs`. The generic default remains a host reference for non-Oxide/FakeBackend, consistent with existing ops; Oxide overrides both |
-| Native, device-resident f32 operations | `darknet-cuda-oxide/src/kernels/layers_extra.rs::{marker_position,marker_gather,marker_gather_backward}` and overrides in `src/lib.rs`. Inspection confirms no operator download/upload or host data math; `mixed.rs::f32v` borrows f32 or widens on device. Ordinary full-runtime debug/output downloads remain |
+| Checked backend contract/default reference | `lightnet-cuda/src/host_ops/marker_gather.rs::Layout`, exposed via `host_ops.rs`; two `F32TensorOpsBackend` methods in `lightnet-cuda/src/lib.rs`. The generic default remains a host reference for non-Oxide/FakeBackend, consistent with existing ops; Oxide overrides both |
+| Native, device-resident f32 operations | `lightnet-cuda-oxide/src/kernels/layers_extra.rs::{marker_position,marker_gather,marker_gather_backward}` and overrides in `src/lib.rs`. Inspection confirms no operator download/upload or host data math; `mixed.rs::f32v` borrows f32 or widens on device. Ordinary full-runtime debug/output downloads remain |
 | Per-sample layout, duplicate/clamped/nonfinite indices, ignored metadata, exact adjoint | `oxide_marker_gather.rs::marker_gather_native_forward_backward_and_raw_input_fd`: B=2, H=3, T=7, K=5, CB=12; tile lengths 32/128/256, ragged lengths, actual GPU forward FD at eight input elements with fixed metadata, exact independent reference output/gradient comparisons |
 | Deterministic reduction and subtle rounding | `marker_gather_native_duplicate_reduction_has_fixed_option_order`: repeated `[1e20,1,-1e20,1]` sum gives 1; `marker_gather_native_rounds_adjacent_half_values_before_clamping`: adjacent f32 values below/at/above 0.5 and 1.5, extremes and NaN/infinities |
 | Errors before unsafe device reads | `marker_gather_native_invalid_layouts_and_storage_error_before_launch`: bad rank/height/batch/T/channel count, zero options/dimensions, checked-product overflow, short feature/marker/gradient storage |
@@ -1226,7 +1226,7 @@ Targeted edition-2024 Rustfmt and diff checks passed. Tests ran with parked CPU 
 
 ## 42. Native f16 marker-gather inference
 
-- v0.2.002 (`32822894`): extended the source-backed marker-gather routing contract to native half-storage inference. `F16TensorOpsBackend::marker_gather_f16` has a numeric generic-backend reference default; the Oxide trait override delegates to the native method in `darknet-cuda-oxide/src/half.rs`, with checked shared layout and actual buffer lengths before allocation/launch. `kernels/layers_extra.rs::marker_gather_f16` copies feature u16 payloads exactly and widens only marker metadata on device, using the existing rounded/clamped position helper. No feature floating-point conversion or operator host round trip.
+- v0.2.002 (`32822894`): extended the source-backed marker-gather routing contract to native half-storage inference. `F16TensorOpsBackend::marker_gather_f16` has a numeric generic-backend reference default; the Oxide trait override delegates to the native method in `lightnet-cuda-oxide/src/half.rs`, with checked shared layout and actual buffer lengths before allocation/launch. `kernels/layers_extra.rs::marker_gather_f16` copies feature u16 payloads exactly and widens only marker metadata on device, using the existing rounded/clamped position helper. No feature floating-point conversion or operator host round trip.
 - `runtime.rs` permits marker gather in the f16 preflight and replaces its rejection arm with native source dispatch using the existing compact lifetime/use-count mechanism. Existing relative-source resolution and A/B alias handling are preserved. Only `forward_compact_f16` exists for this inference API: no new full-state f16 forward or f16 training/backward API is claimed. F32 training/backward remains from v0.2.001; no parameter, optimizer, checkpoint, config, AMP-global setting or dependency change.
 
 Scoped requirement-to-artifact audit (`oxide_marker_gather_f16.rs`):
@@ -1250,7 +1250,7 @@ Targeted edition-2024 Rustfmt/diff checks passed; only the newly inserted half.r
 
 ## 43. Native detached act-head feature primitive
 
-- v0.2.003 (`3de7c327`): added the standalone `F32TensorOpsBackend::laya_act_features_f32` operation. `darknet-cuda/src/host_ops/laya_act.rs` owns checked layout and the generic reference, exposed via `host_ops.rs`; Oxide's override in `src/lib.rs` validates actual storage and launches `kernels/layers_extra.rs::laya_act_features`. All input data/reductions stay on device; one thread owns each sample's `[H+4]` row with serial option reductions and no scratch allocation/atomics. `f32v` only borrows or widens on device. This operation is **not yet wired into act-head runtime** and is not the MLP/backward/update port.
+- v0.2.003 (`3de7c327`): added the standalone `F32TensorOpsBackend::laya_act_features_f32` operation. `lightnet-cuda/src/host_ops/laya_act.rs` owns checked layout and the generic reference, exposed via `host_ops.rs`; Oxide's override in `src/lib.rs` validates actual storage and launches `kernels/layers_extra.rs::laya_act_features`. All input data/reductions stay on device; one thread owns each sample's `[H+4]` row with serial option reductions and no scratch allocation/atomics. `f32v` only borrows or widens on device. This operation is **not yet wired into act-head runtime** and is not the MLP/backward/update port.
 - Source audit: pinned `Jev_laya=4af013d2c59d1db54247aeff21f43e1d8d295cda`, retrieved executable `src-lib/laya_act_head_layer.cpp` with git show. `ah_features` (:29–78) uses CLS column zero plus `[top1, top1-top2, entropy/log(max(valid_count,2)), max(valid_count,2)/255]`; masks use odd channel `2*j+1`, column zero, strict `>0.5`. Masked logits become finite `-1e4`, not excluded/-infinity; softmax includes all K slots, with entropy log floor `1e-9`, no extra temperature or entropy/count clamp. Head/marker sequence lengths are independent.
 - **Newly confirmed full-port gap:** C++ `ah_backward_sample` (:80–122), `backward_laya_act_head_layer` and `update_laya_act_head_layer` (:309–336) accumulate/update all four parameter blocks. Its GPU backward (:344–383) itself uses host math, which is not the native-GPU target. Rust's pure `act_head_backward` returns four parameter gradients, but `runtime.rs::backward_laya_act_head` forwards only dcls; accumulated ActHead params are ignored and no train buffers are allocated. The module's frozen-weight description is therefore not a full source-training contract. A question about including the training fix was asked but not answered; automatic continuation is not treated as approval to change existing frozen behavior. This release changes no training semantics and advances an independent GPU primitive. Full training parity remains unachieved.
 - The existing native `F32ActivationKind::Gelu` is tanh-approximate; CPU act-head uses exact erf-GELU via `laya_scorer::{gelu_erf,gelu_erf_grad}`. A native exact-erf primitive is an independent remaining prerequisite; do not substitute the tanh approximation.
@@ -1277,7 +1277,7 @@ Targeted edition-2024 Rustfmt/diff checks passed. Temporary source/log snapshots
 
 ## 44. Native exact-erf GELU primitives
 
-- v0.2.004 (`eec5eab0`): added dedicated `F32TensorOpsBackend::{gelu_erf_f32,gelu_erf_backward_f32}`, without changing `F32ActivationKind::Gelu`, activation IDs, cfg behavior or existing AMP/f16 dispatch. `darknet-cuda/src/host_ops/gelu_erf.rs` supplies checked bounded shape products and exact-erf host reference; `host_ops.rs` exposes it and the CUDA contract crate enables `float_erf`, matching the already pinned-nightly core reference. No Cargo/dependency changes.
+- v0.2.004 (`eec5eab0`): added dedicated `F32TensorOpsBackend::{gelu_erf_f32,gelu_erf_backward_f32}`, without changing `F32ActivationKind::Gelu`, activation IDs, cfg behavior or existing AMP/f16 dispatch. `lightnet-cuda/src/host_ops/gelu_erf.rs` supplies checked bounded shape products and exact-erf host reference; `host_ops.rs` exposes it and the CUDA contract crate enables `float_erf`, matching the already pinned-nightly core reference. No Cargo/dependency changes.
 - Oxide's overrides in `src/lib.rs` validate positive nonempty declared shapes, actual input/seed metadata and lengths before allocation/launch. `src/kernels/activations.rs` adds dedicated elementwise forward/backward kernels and scalar helpers: y=.5*x*(1+erf(x/sqrt(2))); derivative=normal CDF+x*normal PDF; backward multiplies the supplied seed. Arrays stay on device, with one thread/output and no host math/downloads in the override. Generic trait defaults remain host references for other backends.
 - CPU oracle: `laya_scorer::{gelu_erf,gelu_erf_grad}`; source context is the pinned C++ act-head exact-erf function recorded in §43. The custom collector intentionally rejects Rust's std erf shim, so the GPU uses the supported `#[device] extern "C"` libdevice `__nv_erff` route instead. Inspected generated linked LLVM and confirmed an internal **defined** `__nv_erff` body, not just an unresolved declaration; real-device execution passed. No compiler/bridge changes, approximation or host fallback was added. "Exact-erf" identifies the source variant, not bit-exact CPU/libdevice agreement.
 
@@ -1329,7 +1329,7 @@ Targeted edition-2024 Rustfmt/diff checks passed; only new CPU-module probe bloc
 
 ## 46. Standalone native act-head gradient math
 
-- v0.2.006 (`2ffc33e2`): added `F32TensorOpsBackend::laya_act_head_backward_f32`, typed resident operands/results (`LayaActBackwardInputs`, `LayaActHeadGrad`) and shared composition in `darknet-cuda/src/laya_act.rs`. Immutable `MlpLayout` in `host_ops/laya_act.rs` validates source views and positive/bounded MLP products before construction. Oxide's override in `src/lib.rs` checks all seven buffer lengths and canonical parameter/seed metadata before any math; source storage uses the declared NCHW views, like the existing feature primitive. Seeds accept `[B,A]` or `[B,A,1,1]`.
+- v0.2.006 (`2ffc33e2`): added `F32TensorOpsBackend::laya_act_head_backward_f32`, typed resident operands/results (`LayaActBackwardInputs`, `LayaActHeadGrad`) and shared composition in `lightnet-cuda/src/laya_act.rs`. Immutable `MlpLayout` in `host_ops/laya_act.rs` validates source views and positive/bounded MLP products before construction. Oxide's override in `src/lib.rs` checks all seven buffer lengths and canonical parameter/seed metadata before any math; source storage uses the declared NCHW views, like the existing feature primitive. Seeds accept `[B,A]` or `[B,A,1,1]`.
 - Composition uses existing feature, connected, exact-erf forward/backward, connected-backward and route-copy operations: recompute x/preactivation/hidden, compute fc2 gradients, apply exact activation chain, compute fc1 gradients, extract the first H input-gradient columns as `[B,H]` dcls. All four parameter gradients are positive, **batch-summed**, not averaged or optimizer updates. The last four feature adjoints are discarded; no scorer/marker gradients escape. Fc2 bias **values** are unnecessary for this Jacobian, so are not an operand; fc2 bias gradients are still returned.
 - Existing Oxide overrides for every composed operation use device kernels/private GEMM; no new GPU kernel, host tensor downloads/math, parameter upload, persistent cache, compiler change, runtime dispatch or optimizer mutation was introduced. Generic backends use their own primitive implementations and may execute host references. Verified precision is explicit `GemmMode::Fp32`, not all backend precision/AMP modes.
 
@@ -1359,10 +1359,10 @@ v0.2.007 (`15fc3f8c9cd96cae8c315fbea78821cac867cd40`). The version map was also
 missing v0.2.006's row; both are appended (indices 306, 307).
 
 - Shared deformable sampling implemented twice and kept in agreement: host
-  contract `darknet_cuda::host_ops::bilinear_gather` (`BilinearGatherGeometry`,
+  contract `lightnet_cuda::host_ops::bilinear_gather` (`BilinearGatherGeometry`,
   `forward`, `backward`, `sample_at`) and device kernels
-  `src/darknet-cuda-oxide/src/kernels/deform_sample.rs`. Contract taken from
-  `darknet_core::deform_conv::bilinear_sample`, including the far-outside
+  `src/lightnet-cuda-oxide/src/kernels/deform_sample.rs`. Contract taken from
+  `lightnet_core::deform_conv::bilinear_sample`, including the far-outside
   zero-gradient early-out, the floor-cell one-sided convention at integers, and
   NaN propagation.
 - Five forward stages on device: offset/mask predictor (a `groups = 1`
@@ -1387,11 +1387,11 @@ Scoped requirement-to-artifact audit:
 
 | Requirement | Actual evidence |
 |---|---|
-| Host contract for sampling | `cargo test -p darknet-cuda --lib` (33 tests, 6 for `bilinear_gather`) |
+| Host contract for sampling | `cargo test -p lightnet-cuda --lib` (33 tests, 6 for `bilinear_gather`) |
 | Device sampling parity incl. adjoint | `MEM=3G ./tools/test_oxide.sh --test oxide_deform_gather` — 5 passed |
 | Forward stages + composition | `--test oxide_deform_conv_accumulate` 8 passed, `--test oxide_deform_envelope` 14 passed |
 | Forward vs the real CPU runtime | `--test oxide_deform_conv_chain` 3 passed (masked/unmasked + dilation rejection) |
-| Backward stages FD-exact | `cargo test -p darknet-cuda --lib` (accumulation 4 operand groups, envelope both modes, normalization Jacobian through recomputed stats, predictor) |
+| Backward stages FD-exact | `cargo test -p lightnet-cuda --lib` (accumulation 4 operand groups, envelope both modes, normalization Jacobian through recomputed stats, predictor) |
 | Backward vs the real CPU backward | `--test oxide_deform_conv_backward_chain` 3 passed (main/offset/mask weights and biases) |
 | Device backward composition | included in the same suite's `native_backward_composition_matches_the_cpu_gradients` |
 | Runtime device path end to end | `--test oxide_runtime_chain` 26 passed, incl. `deform_conv_device_path_matches_cpu_chain_and_updates` (forward outputs, one SGD step, every parameter block, "parameters actually moved") and the retained BN host-fallback test |
@@ -1435,7 +1435,7 @@ systemd scopes; no training runs):
 | Different geometry and edge sampling | `device_adjoint_covers_strided_dilated_and_far_outside_samples`: sizes 1/3/5, groups=2, stride x/y=2/3, dilation=2, non-square input, padding=2, signed masks and large displacements outside all edges, all four modes; forward and both adjoints compared |
 | Independent actual-device derivative check | `device_adjoint_matches_device_forward_finite_differences`: every input and packed offset/mask value, B=2/groups=2, all four modes; actual native forward objective with signed seeds; scale=1, coordinate fraction=0.5, epsilon=0.01 (cannot cross floor seams), absolute tolerance 2e-3 |
 | Fail closed before unsafe launch | `device_adjoint_rejects_bad_geometry_and_each_short_operand`: each short operand; zero/nondividing groups, zero batch/dilation, >25 points and overflowing dimensions |
-| Host oracle regression | `systemd-run --user --scope -p MemoryHigh=3G cargo test -p darknet-cuda --lib -j 2 -- --test-threads=1`: **35 passed**, including host DCNv4 finite differences |
+| Host oracle regression | `systemd-run --user --scope -p MemoryHigh=3G cargo test -p lightnet-cuda --lib -j 2 -- --test-threads=1`: **35 passed**, including host DCNv4 finite differences |
 | CPU/runtime behavior preserved | `MEM=3G ./tools/test_host.sh dcnv4`: **17 core passed**, 0 CLI; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4`: **1 passed** (`dcnv4_f32_host_fallback_matches_cpu_chain_and_updates`) |
 | Storage ownership | Launcher validates full lengths and allocates distinct zeroed `d_input`/`d_offsets`; `OxideBackend::alloc` zeros recycled buffers; thread bound derives from full seed length; `d_offsets` has a unique writer per row, input scatter is atomic |
 | Scope and evidence honesty | Runtime still lists `Dcnv4` in `requires_cpu_backward_fallback`; no trait/runtime wiring, predictor/backward composition, native updates, f16, benchmark or speedup claim. Device vs Rust CPU reference; hand-derived from source, no compiled-C++ golden |
@@ -1475,7 +1475,7 @@ Scoped requirement-to-artifact audit (serial `-j 2`, MemoryHigh=3G user scopes):
 | Cache/lifetime/input immutability | Real CPU comparison drops original forward input/weight/bias uploads before independent backward uploads to force pool reuse; output and cache remain live and unchanged, input/weights unchanged after backward |
 | Reject malformed descriptors/storage | `native_composition_rejects_bad_descriptors_and_storage`: zero/overflowing d_stride, nonfinite scale, wrong output extent, overflowing padding, oversized kernel; each short forward operand and each short backward operand rejected |
 | Retain aggregation/FD/edge/error coverage after layout fix | `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_aggregate`: **6 passed**, including size=1/remove_center rejection, eight-aligned padding and corrected compact center-removal slots |
-| Host math regression and source-layout pin | `systemd-run --user --scope -p MemoryHigh=3G cargo test -p darknet-cuda --lib -j 2 -- --test-threads=1`: **36 passed** |
+| Host math regression and source-layout pin | `systemd-run --user --scope -p MemoryHigh=3G cargo test -p lightnet-cuda --lib -j 2 -- --test-threads=1`: **36 passed** |
 | CPU/runtime behavior preserved | `MEM=3G ./tools/test_host.sh dcnv4`: **17 core passed**, 0 CLI; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4`: **1 passed** (host fallback plus updates). `runtime.rs` unmodified, `Dcnv4` still forces CPU backward fallback |
 | Native execution rather than generic host defaults | Wrappers launch four `dcnv4_projection` device entries plus existing native aggregation/adjoint; wrapper source has no download/CPU math calls. Both new tests exercise an actual Oxide backend |
 
@@ -1521,8 +1521,8 @@ scopes, -j 2 except the -j 4 CLI check):
 
 | Requirement | Inspected evidence |
 |---|---|
-| Backend-generic surface with real native override | `darknet-cuda/src/lib.rs` declares both methods; `darknet-cuda-oxide/src/lib.rs` forwards directly to v0.2.012 native math. Host composition validates geometry/storage and returns positive batch sums |
-| Host default derivative/storage validation | `systemd-run --user --scope -p MemoryHigh=3G cargo test -p darknet-cuda --lib -j 2 -- --test-threads=1`: **37 passed**, including every input/weight/bias FD through recomputed coarse offsets (B=2) and short-storage rejection |
+| Backend-generic surface with real native override | `lightnet-cuda/src/lib.rs` declares both methods; `lightnet-cuda-oxide/src/lib.rs` forwards directly to v0.2.012 native math. Host composition validates geometry/storage and returns positive batch sums |
+| Host default derivative/storage validation | `systemd-run --user --scope -p MemoryHigh=3G cargo test -p lightnet-cuda --lib -j 2 -- --test-threads=1`: **37 passed**, including every input/weight/bias FD through recomputed coarse offsets (B=2) and short-storage rejection |
 | Test-first runtime selection | New `dcnv4_gpu_selects_native_math_without_host_cache` first failed the old unconditional fallback assertion; now passes and verifies the CPU cache is absent |
 | No stale offsets or dropped subdivision gradients | `dcnv4_gpu_multiple_forward_states_and_microbatch_accumulation_match_cpu`: forward A then B, backward A then B on a standalone B=2/groups=2 DCNv4; every accumulated output-bias/offset-weight/offset-bias value agrees with CPU |
 | Error before backend math | `dcnv4_gpu_rejects_parameter_storage_before_backend_math` truncates each of three parameter blocks; each returns InvalidConfig, not a panic or unsafe launch |
@@ -1532,7 +1532,7 @@ scopes, -j 2 except the -j 4 CLI check):
 | True device dispatch and two optimizer steps | `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4`: **3 passed**. `dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` uses preceding conv + B=2, groups=2, size=3, dilation=2, d_stride=2, signed/nonunit seeds, softmax/remove_center on+off, swish/leaky. Explicit Fp32 GEMM mode; all layer outputs and both steps' updated values/deltas agree; every conv/DCNv4 trainable block actually moves; dummy weights unchanged |
 | Not a hidden CPU backward | In that device test CPU backward on GPU forward artifacts errors specifically for missing DCNv4 cache, while GPU backward and updates succeed; retained BN/mixed cases instead prove CPU backward can consume the GPU-produced host artifacts |
 | Composition/adjoint regressions after trait migration | `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain`: **3 passed** (18 real CPU cases, device FD, errors/lifetimes); `--test oxide_dcnv4_aggregate`: **6 passed** |
-| Integration check | `systemd-run --user --scope -p MemoryHigh=3G cargo check -p darknet-cli --features oxide -j 4`: passed |
+| Integration check | `systemd-run --user --scope -p MemoryHigh=3G cargo check -p lightnet-cli --features oxide -j 4`: passed |
 | Formatting/scope/hygiene | Targeted Rustfmt/new-module formatting and `git diff --check` passed; only named GPU/host-default/runtime/test/docs files committed. No parked YOLO-3D, Cargo.lock or .gitignore edits included |
 
 **Full runtime-chain suite remains unverified:** attempted serial
@@ -1597,9 +1597,9 @@ except the -j 4 CLI check):
 | Native unseeded EMA and N=1 variance | Same suite's `native_bn_unseeded_and_single_sample_stats_match_cpu` compares per-channel mean/variance against real CPU for B=2/non-square map and B=1/H=W=1; scale values unchanged |
 | Native selection, two SGD/Adam steps, all blocks | `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4`: **3 passed**. Expanded two-step test covers BN off/on × SGD/Adam × softmax/remove_center on+off, B=2/groups=2, dilation=2/coarse stride=2, swish/leaky, zero/negative gamma, upstream conv and all active DCNv4 blocks moving; rolling stats agree, ordinary biases/beta/dummy invariant |
 | Mixed networks retain original cache/stats path | Same device suite's deconvolution-mixed network now has BN DCNv4 and proves CPU backward can consume GPU-produced host caches. Native BN test proves the opposite (CPU backward fails specifically for missing DCNv4 cache while GPU backward succeeds) |
-| Raw math regressions | `--test oxide_dcnv4_chain`: **3 passed** (18 CPU cases, device FD and guards); `--test oxide_dcnv4_aggregate`: **6 passed**; capped `cargo test -p darknet-cuda --lib -j 2 -- --test-threads=1`: **37 passed** |
+| Raw math regressions | `--test oxide_dcnv4_chain`: **3 passed** (18 CPU cases, device FD and guards); `--test oxide_dcnv4_aggregate`: **6 passed**; capped `cargo test -p lightnet-cuda --lib -j 2 -- --test-threads=1`: **37 passed** |
 | Native, not a new host math fallback | Inspected Oxide implementations of vector_mul/channel_scale/bias reductions and batchnorm_train_forward: device launches/reductions. Helper downloads only gradients and per-channel EMA values; CPU counterparts remain defaults for generic/FakeBackend |
-| Integration/format/hygiene | Capped `cargo check -p darknet-cli --features oxide -j 4` passed; targeted Rustfmt/diff checks passed; no persistent weights/sidecars/ONNX artifacts found in the work scope. Unrelated user/parked edits excluded |
+| Integration/format/hygiene | Capped `cargo check -p lightnet-cli --features oxide -j 4` passed; targeted Rustfmt/diff checks passed; no persistent weights/sidecars/ONNX artifacts found in the work scope. Unrelated user/parked edits excluded |
 
 One compile-only issue was caught and fixed: vector_mul_f32 requires an explicit
 output shape. No failed test remains in these focused gates. No new kernels,
@@ -1624,7 +1624,7 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 
 ## 52. Native DCNv4 channel-normalization activations
 
-- v0.2.015 (`1fc80f27`): DCNv4's bounded f32 native path now accepts `normalize_channels`, `_softmax` and `_softmax_maxval` activations (after optional rolling-stat BN) using the existing `normalize_channels_f32`/backward primitives; channel output is recomputed on device from the forward preactivation. Exact `SoftmaxMaxval` adjoint gained the max-chain term (epsilon sits outside exp(x-max); first max selected at ties; one-channel case is constant, zero translation derivative) in both host_ops and the Oxide kernel; `GradMode::Cpp` shortcut unchanged. Gates (serial, 3G): darknet-cuda lib 40, host dcnv4 28, `runtime::` 284, `oxide_dcnv4_normalization` 3 (3 norms x BN x SGD/Adam two-step CPU/GPU parity, GPU forward FD with fixed stats, mixed-network CPU cache), `oxide_layers_extra` 25. Not compiled-C++ parity; larger variants, other activations, compact/f16, device updates/residency, GPU Muon remain open.
+- v0.2.015 (`1fc80f27`): DCNv4's bounded f32 native path now accepts `normalize_channels`, `_softmax` and `_softmax_maxval` activations (after optional rolling-stat BN) using the existing `normalize_channels_f32`/backward primitives; channel output is recomputed on device from the forward preactivation. Exact `SoftmaxMaxval` adjoint gained the max-chain term (epsilon sits outside exp(x-max); first max selected at ties; one-channel case is constant, zero translation derivative) in both host_ops and the Oxide kernel; `GradMode::Cpp` shortcut unchanged. Gates (serial, 3G): lightnet-cuda lib 40, host dcnv4 28, `runtime::` 284, `oxide_dcnv4_normalization` 3 (3 norms x BN x SGD/Adam two-step CPU/GPU parity, GPU forward FD with fixed stats, mixed-network CPU cache), `oxide_layers_extra` 25. Not compiled-C++ parity; larger variants, other activations, compact/f16, device updates/residency, GPU Muon remain open.
 
 ## 53. Extend native DCNv4 kernel bound to 7x7
 
@@ -1656,7 +1656,7 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 
 ## 60. Native act-head CLS adjoint scatter
 
-- v0.2.023 (`2ff4544e`): added a checked backend operation to add the standalone `[B,H]` act-head CLS adjoint into token zero of an existing `[B,H,1,T]` NCHW head gradient. Host reference validates dimensions/storage; Oxide uses a native one-thread-per-output kernel, keeping the full sequence gradient device-resident and leaving scorer/marker summary features detached. Evidence: `systemd-run --user --scope -p MemoryHigh=3G cargo test -p darknet-cuda --lib laya_act -j 2` passed 2; `MEM=3G ./tools/test_host.sh laya_act` passed 11 core tests; `MEM=3G ./tools/test_oxide.sh --test oxide_laya_act_backward` passed 5 on the RTX 4060, including the new actual-device NCHW scatter/parity/error test and the existing MLP gradient parity/FD/guard suite; `git diff --check` passed. This is a primitive, not runtime backward/update integration; f16 and trainable-parameter contract remain unresolved, and no C++ golden or performance claim is made.
+- v0.2.023 (`2ff4544e`): added a checked backend operation to add the standalone `[B,H]` act-head CLS adjoint into token zero of an existing `[B,H,1,T]` NCHW head gradient. Host reference validates dimensions/storage; Oxide uses a native one-thread-per-output kernel, keeping the full sequence gradient device-resident and leaving scorer/marker summary features detached. Evidence: `systemd-run --user --scope -p MemoryHigh=3G cargo test -p lightnet-cuda --lib laya_act -j 2` passed 2; `MEM=3G ./tools/test_host.sh laya_act` passed 11 core tests; `MEM=3G ./tools/test_oxide.sh --test oxide_laya_act_backward` passed 5 on the RTX 4060, including the new actual-device NCHW scatter/parity/error test and the existing MLP gradient parity/FD/guard suite; `git diff --check` passed. This is a primitive, not runtime backward/update integration; f16 and trainable-parameter contract remain unresolved, and no C++ golden or performance claim is made.
 
 ## 61. Native DCNv4 SGD optimizer update
 
@@ -1688,18 +1688,18 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 
 ## 68. Native GPU Muon orthogonalization primitive
 
-- v0.2.031 (`b46ad9c8`): added a native Oxide f32 Newton–Schulz orthogonalization primitive exposed through `F32TensorOpsBackend::muon_orthogonalize_f32`; the generic default uses a host reference, while Oxide uses device Frobenius-norm accumulation, transpose/linear-combination kernels and existing GPU GEMM for five paper-coefficient iterations. Actual-GPU parity passed against the host reference for square, tall and wide matrices (including 17x31 and 31x17); zero and invalid-shape cases passed (`MEM=3G ./tools/test_oxide.sh --test oxide_muon`, 2 tests); host-reference zero/non-finite/transpose-equivariance tests also passed (`MEM=3G PKGS=darknet-cuda ./tools/test_host.sh muon_orthogonalize`, 2 tests). This is a standalone matrix primitive, **not** GPU Muon optimizer integration: `update_weights_gpu` still rejects `[net] muon=1`, and GPU momentum/update, hybrid AdamW fallback, runtime layer eligibility/gates and optimizer-sidecar state remain unimplemented. CPU Muon is still v0.1.005. No compiled-C++ golden or full-suite claim.
+- v0.2.031 (`b46ad9c8`): added a native Oxide f32 Newton–Schulz orthogonalization primitive exposed through `F32TensorOpsBackend::muon_orthogonalize_f32`; the generic default uses a host reference, while Oxide uses device Frobenius-norm accumulation, transpose/linear-combination kernels and existing GPU GEMM for five paper-coefficient iterations. Actual-GPU parity passed against the host reference for square, tall and wide matrices (including 17x31 and 31x17); zero and invalid-shape cases passed (`MEM=3G ./tools/test_oxide.sh --test oxide_muon`, 2 tests); host-reference zero/non-finite/transpose-equivariance tests also passed (`MEM=3G PKGS=lightnet-cuda ./tools/test_host.sh muon_orthogonalize`, 2 tests). This is a standalone matrix primitive, **not** GPU Muon optimizer integration: `update_weights_gpu` still rejects `[net] muon=1`, and GPU momentum/update, hybrid AdamW fallback, runtime layer eligibility/gates and optimizer-sidecar state remain unimplemented. CPU Muon is still v0.1.005. No compiled-C++ golden or full-suite claim.
 
 ## 69. Connected GPU Muon and deconvolution GPU runtime slices
 
 - v0.2.032 (`2ddcaa6b`): added opt-in `[net] muon=1` update dispatch for host-resident connected parameters (plus standalone BatchNorm AdamW-only state); eligible dense matrices call the native Oxide Newton–Schulz primitive, while momentum staging, final direction application, host-canonical parameters and optimizer state remain host-side. DNOPT6 save/load now carries GPU Muon momentum in the same host-only layout as CPU Muon. Unsupported parameter families reject before updates, and deferred host synchronization rejects explicitly. Evidence at the release: `MEM=3G ./tools/test_host.sh gpu_muon_` passed 2 tests and `muon_` passed 23; actual-GPU `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_connected_two_step_update_matches_cpu` passed (1), covering two CPU-parity steps plus sidecar save/resume and a third parity step. This is a limited connected-layer runtime slice, not full GPU Muon: other eligible layer families, device-resident momentum/final parameter updates, and broader gate/optimizer coverage remain open.
 - v0.2.033 (`d73a87e7`): added standalone BatchNorm GPU-Muon-path parity for scale/bias AdamW fallback and optimizer state using FakeBackend. Follow-up `MEM=3G ./tools/test_host.sh gpu_muon_` passed 3 tests and `muon_` passed 24. This did not expand native GPU layer coverage.
-- v0.2.034 (`f27b370c`): added native Oxide momentum/lookahead and decoupled direction-application ops, then wired connected-layer GPU Muon to keep momentum tensors cached on-device between updates and apply matrix decay/direction on-device. Host momentum mirrors are downloaded per update for DNOPT6 compatibility, and connected weights remain host-canonical (uploaded/downloaded at each step); biases/BN fallback remains host AdamW. Evidence at the release: host `darknet-cuda` Muon 4, `oxide_muon` 3, GPU-Muon host 3, Muon regressions 24, and actual-GPU single-connected two-step/resume parity 1.
+- v0.2.034 (`f27b370c`): added native Oxide momentum/lookahead and decoupled direction-application ops, then wired connected-layer GPU Muon to keep momentum tensors cached on-device between updates and apply matrix decay/direction on-device. Host momentum mirrors are downloaded per update for DNOPT6 compatibility, and connected weights remain host-canonical (uploaded/downloaded at each step); biases/BN fallback remains host AdamW. Evidence at the release: host `lightnet-cuda` Muon 4, `oxide_muon` 3, GPU-Muon host 3, Muon regressions 24, and actual-GPU single-connected two-step/resume parity 1.
 - v0.2.035 (`cc0c00c1`): added actual-GPU CPU-parity coverage for two connected layers over two updates and FakeBackend `dont_update=1` gate behavior (parameters/state remain unchanged while the global step advances). Follow-up `MEM=3G ./tools/test_host.sh gpu_muon_` passed 4 and `muon_` passed 25; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_multiple_connected_layers_match_cpu_across_steps` passed 1. Scope remains connected-only, with host-canonical parameters/state mirror; other eligible families and real-device gate coverage remained open at this release.
 - v0.2.036 (`86b2fbda`): actual-GPU two-layer test now checks `dont_update=1` against CPU across two updates: the gated first layer stays unchanged initially, the ungated second layer updates, then parity holds when the first layer becomes eligible. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_connected_update_gate_matches_cpu_on_device` passed 1. Actual-device coverage for other gate variants/connected BN and other eligible families remains open.
 - v0.2.037 (`281cdc7c`): extended GPU Muon eligibility to deconvolutional matrices, whose forward/backward gradients are host-fallback. The shared hybrid staging path runs Newton–Schulz through Oxide, while momentum, final parameter update, and optimizer state remain host-side. Two-step actual-GPU CPU parity passed with `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_deconvolution_host_gradients_match_cpu_across_steps`; `MEM=3G ./tools/test_host.sh gpu_muon_` passed 4. Convolutional GPU Muon remains explicitly rejected because its gradients are device-resident; other families remain unsupported. This adds GPU Muon eligibility, not a native GPU deconvolution layer path.
 - v0.2.038 (`fadfcb95`): added actual-GPU CPU-parity coverage for the connected-layer `burnin_update=1` gate. A first update within burn-in preserves parameters; after setting the iteration beyond burn-in, the Oxide Muon update changes parameters and matches CPU. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_connected_burnin_gate_matches_cpu_on_device` passed 1. Other gate variants/connected BN remain unverified; no compiled-C++ golden or full-suite claim.
-- v0.2.039 (`b1fef3f9`): added host-reference and native Oxide f32 transposed-convolution forward, input-gradient, weight-gradient and bias-gradient operations, then integrated the backend operations in GPU runtime forward/backward. Supported activations take the GPU path; unmapped activations retain the legacy host route. `MEM=3G PKGS=darknet-cuda ./tools/test_host.sh deconvolutional` passed; `MEM=3G ./tools/test_host.sh deconvolutional_layer_trains_on_cpu_and_gpu_native_ops_identically` and `gpu_adam_updates_deconvolutional_host_parameters` each passed; native Oxide primitive tests compare outputs/gradients and invalid shapes against the host reference; actual-GPU `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_deconvolution_native_forward_backward_and_muon_match_cpu_across_steps` passed (1), including multi-step parity. Optimizer parameter/gradient staging remains host-side; this does not add f16 or compiled-C++ parity. No full-suite claim.
+- v0.2.039 (`b1fef3f9`): added host-reference and native Oxide f32 transposed-convolution forward, input-gradient, weight-gradient and bias-gradient operations, then integrated the backend operations in GPU runtime forward/backward. Supported activations take the GPU path; unmapped activations retain the legacy host route. `MEM=3G PKGS=lightnet-cuda ./tools/test_host.sh deconvolutional` passed; `MEM=3G ./tools/test_host.sh deconvolutional_layer_trains_on_cpu_and_gpu_native_ops_identically` and `gpu_adam_updates_deconvolutional_host_parameters` each passed; native Oxide primitive tests compare outputs/gradients and invalid shapes against the host reference; actual-GPU `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_deconvolution_native_forward_backward_and_muon_match_cpu_across_steps` passed (1), including multi-step parity. Optimizer parameter/gradient staging remains host-side; this does not add f16 or compiled-C++ parity. No full-suite claim.
 - v0.2.040 (`798d3389`): added an actual-Oxide runtime-chain test for native deconvolution forward/backward plus two-step CPU parity under both SGD and Adam. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_deconvolution_native_sgd_and_adam_updates_match_cpu_across_steps` passed (1); optimizer updates still stage through host buffers. This is focused GPU evidence, not full-suite or compiled-C++ parity.
 - v0.2.041 (`4edd8860`): added actual-Oxide CPU-parity coverage for connected GPU Muon with batch normalization, including output, connected weights/biases, BN scales and rolling stats across two updates. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_connected_batch_norm_matches_cpu_across_steps` passed (1). This exercises the existing CPU-backward/host BN optimizer fallback; connected BN backward is not native. Other Muon families and gate variants remain open.
 - v0.2.042 (`56bfbe2f`): added actual-device two-update CPU parity for connected GPU Muon with `train_only_bn=1`; CPU and Oxide both preserve parameters under the propagated gate. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_connected_train_only_bn_gate_matches_cpu_on_device` passed (1). Together with `dont_update` and `burnin_update`, all three layer update gates have connected actual-device coverage; other parameter families remain open.
@@ -1759,7 +1759,7 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 
 ## 82. GraphConv learned-edge masked-softmax host contract
 
-- v0.2.060: added checked host references for GraphConv learned-edge mode 1 aggregation and its exact input/edge-kernel/edge-bias adjoint. The contract fixes group-local `[groups, size*size, 2*channels_per_group]` layout, row-major edge order, center-reference zeroing when out of bounds, and masking invalid neighbors before stable softmax. Host-reference finite differences cover every input/kernel/bias element; constant-input masking and malformed group/length rejection pass in `MEM=3G ./tools/test_oxide.sh --test oxide_graph_conv` (4 tests total). This is a contract/reference increment only: **no native learned-edge GPU kernel or runtime integration exists yet**; CPU reference source and hand-derived equations only, no compiled-C++ golden. `PKGS=darknet-cuda MEM=3G ./tools/test_host.sh learned_aggregate` could not run because an unrelated existing unit-test compile error in `host_ops/local.rs` prevents the `darknet-cuda` library test target from compiling; the contract is exercised through the Oxide integration test target instead.
+- v0.2.060: added checked host references for GraphConv learned-edge mode 1 aggregation and its exact input/edge-kernel/edge-bias adjoint. The contract fixes group-local `[groups, size*size, 2*channels_per_group]` layout, row-major edge order, center-reference zeroing when out of bounds, and masking invalid neighbors before stable softmax. Host-reference finite differences cover every input/kernel/bias element; constant-input masking and malformed group/length rejection pass in `MEM=3G ./tools/test_oxide.sh --test oxide_graph_conv` (4 tests total). This is a contract/reference increment only: **no native learned-edge GPU kernel or runtime integration exists yet**; CPU reference source and hand-derived equations only, no compiled-C++ golden. `PKGS=lightnet-cuda MEM=3G ./tools/test_host.sh learned_aggregate` could not run because an unrelated existing unit-test compile error in `host_ops/local.rs` prevents the `lightnet-cuda` library test target from compiling; the contract is exercised through the Oxide integration test target instead.
 
 ## 83. Native GraphConv learned-edge forward primitive
 
@@ -2067,7 +2067,7 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 
 ## 159. Native FoveationFilm full adjoint primitive
 
-- v0.2.122 (`e97bac10`): added native Oxide full FiLM backward primitives for input, HF-source, embedding, gamma, and beta gradients; spatial/batch reductions use fixed-order, one-owner kernels. `MEM=3G ./tools/test_oxide.sh --test oxide_foveation_film` passed 2 actual-device tests covering forward/backward parity against the host reference and affine finite differences; `MEM=3G cargo test -p darknet-cuda --lib foveation_film` passed the batch/channel host-reference test. This remains primitive-only; runtime source-cache transfer and layer dispatch are still open. No compiled-C++ golden or complete-layer claim.
+- v0.2.122 (`e97bac10`): added native Oxide full FiLM backward primitives for input, HF-source, embedding, gamma, and beta gradients; spatial/batch reductions use fixed-order, one-owner kernels. `MEM=3G ./tools/test_oxide.sh --test oxide_foveation_film` passed 2 actual-device tests covering forward/backward parity against the host reference and affine finite differences; `MEM=3G cargo test -p lightnet-cuda --lib foveation_film` passed the batch/channel host-reference test. This remains primitive-only; runtime source-cache transfer and layer dispatch are still open. No compiled-C++ golden or complete-layer claim.
 
 ## 160. FoveationFilm runtime native forward
 
@@ -2399,21 +2399,21 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 233. Dynamic mixed-precision loss scaler
 
 - v0.2.161 adds public `runtime::LossScaler` and `ScaleStep` for the fp16 training hardening path. Non-finite gradients halve the scale with a 1.0 floor, reset growth, and return `Skip`; finite gradients return `Apply` and double every 1000 steps up to 65,536. Constructor and growth caps are enforced; finite updates at the cap reset the growth counter without overflow. CLI integration, overflow-detection coverage and xtask scaler defaults were added in v0.2.162–v0.2.164; only Task 5 convergence evidence remains user-gated in `plan_fp16.md`.
-- Evidence: `PKGS=darknet-core cargo xtask test loss_scaler` passed all 8 focused tests after temporarily adding `use super::*;` to `runtime/tests/mod.rs` to satisfy existing sibling test imports; that test-harness-only edit was removed afterward. Without the temporary import, the existing test module fails to compile on missing imports before tests run. No training/convergence or C++ parity claim.
+- Evidence: `PKGS=lightnet-core cargo xtask test loss_scaler` passed all 8 focused tests after temporarily adding `use super::*;` to `runtime/tests/mod.rs` to satisfy existing sibling test imports; that test-harness-only edit was removed afterward. Without the temporary import, the existing test module fails to compile on missing imports before tests run. No training/convergence or C++ parity claim.
 
 ## 234. CLI loss-scale option and LossScaler integration
 
 - v0.2.162 adds `TrainOptions.loss_scale` with `-loss_scale` / `--loss_scale` parsing and finite-positive validation. GPU training applies the configured value and the `LossScaler` cap before its first step; dynamic mode reuses the scaler for overflow skip/halving and finite-step growth, while `-loss_scale` without `-dyn_scale` remains static.
-- Evidence: `PKGS=darknet-cli cargo xtask test parse_train` passed the 3 new parse tests; `cargo xtask check` passed for `darknet-cli` and `darknet-core`. The default test package set still fails before test execution on pre-existing `darknet-core` runtime test import errors; the focused CLI tests were run with `PKGS=darknet-cli`. GPT-6-luna review: OK. No training/convergence claim.
+- Evidence: `PKGS=lightnet-cli cargo xtask test parse_train` passed the 3 new parse tests; `cargo xtask check` passed for `lightnet-cli` and `lightnet-core`. The default test package set still fails before test execution on pre-existing `lightnet-core` runtime test import errors; the focused CLI tests were run with `PKGS=lightnet-cli`. GPT-6-luna review: OK. No training/convergence claim.
 
 ## 235. FP16 overflow detection for convolution and BN gradients
 
 - v0.2.163 adds focused coverage for the existing `GpuExecutableNetwork::gradients_non_finite()` scan of convolution weights, BN bias, and BN scale gradients; no `gpu_state.rs` change was needed. Each test performs finite backward on the small convolution + BN network, then injects infinity into exactly one target buffer before checking detection.
-- Evidence: `PKGS=darknet-core cargo xtask test gradients_non_finite` passed all 3 focused tests twice. Both runs used the permitted temporary `use super::*;` import in `runtime/tests/mod.rs` to bypass pre-existing sibling-test import errors; the shim was removed after each run. The final `git diff --check` passed. The tests were uncapped because `systemd-run --user` was unavailable. Fresh GPT-6-luna review accepted the coverage. No full core-suite or training/convergence claim.
+- Evidence: `PKGS=lightnet-core cargo xtask test gradients_non_finite` passed all 3 focused tests twice. Both runs used the permitted temporary `use super::*;` import in `runtime/tests/mod.rs` to bypass pre-existing sibling-test import errors; the shim was removed after each run. The final `git diff --check` passed. The tests were uncapped because `systemd-run --user` was unavailable. Fresh GPT-6-luna review accepted the coverage. No full core-suite or training/convergence claim.
 
 ## 236. xtask fp16 enables dynamic loss scaling
 
-- v0.2.164 updates `precision_env` and the `train_legogears` arm so `-fp16` enables `DARKNET_OXIDE_AMP=1` and appends `-dyn_scale` and `-loss_scale 1024` unless each was supplied by the user. User scaler flags remain in pass-through arguments; fp8 adds no scaler arguments. The xtask help and `CLAUDE.md` Commands table document the defaults.
+- v0.2.164 updates `precision_env` and the `train_legogears` arm so `-fp16` enables `LIGHTNET_OXIDE_AMP=1` and appends `-dyn_scale` and `-loss_scale 1024` unless each was supplied by the user. User scaler flags remain in pass-through arguments; fp8 adds no scaler arguments. The xtask help and `CLAUDE.md` Commands table document the defaults.
 - Evidence: test-first `PKGS=xtask cargo xtask test` failed with the expected tuple-shape compile errors; after implementation the command passed all 4 new tests. `cargo xtask help` displayed the updated flags, `git diff --check` passed, and fresh GPT-6-luna review accepted the diff. No training run was started.
 
 ## 237. xtask precision environment clippy cleanup
@@ -2435,8 +2435,8 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 
 ## 240. HalfFormat and GemmMode::Bf16
 
-- v0.2.170 (`plan_bf16.md` Task 1) adds `HalfFormat { F16, Bf16 }`, `parse_amp_format`, `OxideBackend::with_amp_format` and `half_format`, and `GemmMode::Bf16` (`DARKNET_OXIDE_GEMM=bf16`). `DARKNET_OXIDE_AMP` now accepts `bf16`/`bfloat16` as well as the old f16 spellings; garbage and empty mean AMP off. `GemmMode::Bf16` in the f32 API rounds both operands to bf16 and runs the 16-bit tensor-core GEMM with f32 output (`gemm_f32_operands_as_half`).
-- Only the GEMM path is format-aware: the AMP activation kernels still read and write f16, so `DARKNET_OXIDE_AMP=bf16` is not usable for training until `plan_bf16.md` Tasks 4 to 6. `cargo xtask train_legogears -bf16` is still rejected.
+- v0.2.170 (`plan_bf16.md` Task 1) adds `HalfFormat { F16, Bf16 }`, `parse_amp_format`, `OxideBackend::with_amp_format` and `half_format`, and `GemmMode::Bf16` (`LIGHTNET_OXIDE_GEMM=bf16`). `LIGHTNET_OXIDE_AMP` now accepts `bf16`/`bfloat16` as well as the old f16 spellings; garbage and empty mean AMP off. `GemmMode::Bf16` in the f32 API rounds both operands to bf16 and runs the 16-bit tensor-core GEMM with f32 output (`gemm_f32_operands_as_half`).
+- Only the GEMM path is format-aware: the AMP activation kernels still read and write f16, so `LIGHTNET_OXIDE_AMP=bf16` is not usable for training until `plan_bf16.md` Tasks 4 to 6. `cargo xtask train_legogears -bf16` is still rejected.
 - Evidence: `oxide_amp` 15 of 15 (four new: format parsing, garbage rejection, `with_amp_format` mode selection, `bf16_gemm_mode_tracks_the_f32_gemm_in_the_f32_api`), `oxide_gemm_f8` 26 of 26 (new `gemm_mode_from_env_parses_bf16`). No training run was started.
 
 ## 241. fp8 byte im2col (conv forward and wgrad)
@@ -2448,17 +2448,17 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 242. fp8 amax ring and bf16 mixed-precision training
 
 - v0.2.172 (`57c36cb`): fp8 amax slots come from a ring of 256 pre-zeroed 64-word slots (`Fp8Ring`, `fp8_next_slot`), zero-filled with one memset per lap instead of one `cuMemsetD8Async` per operand (about 124 memsets per training step before). The amax, quantise, pair and `im2col_fp8` kernels take a slot word offset. `fp8_amax_f32_kernel` is block-reduced (shared-memory max, one atomic per block) like the pair kernel. `bench-train` batch 16, 5 interleaved rounds: fp8 49.0 ms (48.0 to 49.6) against fp32 50.9 ms (49.8 to 51.1).
-- v0.2.173 to v0.2.176 (plan_bf16 Tasks 2 to 7; not chronological with v0.2.172, the numbers follow the commit messages): v0.2.173 format-aware conversions (`half_bits_to_f32`, `f32_to_half_bits`, `to_half`, `from_half`; `f983c8e`); v0.2.174 bf16 output from the 16-bit GEMM epilogue and split-K reduce (`hgemm_ex` accepts bf16 with a 16-bit output, `gemm_bf16_out16`; `c51d5b9`); v0.2.175 bf16 AMP mode (`dedebb2`): every `amp_*` kernel, `maxpool_f16` and `upsample_nearest_f16` take a `fmt` argument, AMP storage, weight copies and `hgemm` follow `half_format()`, `conv_weights_half`, and f16-only inference ops (`require_f16`) return an error in bf16 mode (`im2col_f16` and `route_copy_f16` are pure bit copies and needed no change); v0.2.176 `cargo xtask train_legogears -bf16` sets `DARKNET_OXIDE_AMP=bf16` with no loss scaling, and the training build default is 4 threads (`7ef8322`).
-- Evidence: `oxide_half` 17 of 17 (new `gemm_bf16_with_bf16_output_matches_reference`, `bf16_mode_rejects_f16_only_inference_ops`, conversion tests), `oxide_amp` 15 of 15 in both formats (`DARKNET_TEST_AMP_FMT=bf16` runs the whole suite in bf16 with every bound 8x the f16 bound, named `bf16_gradient_bounds_are_8x_f16`), `oxide_runtime_f16` 22 of 22, `oxide_gemm_f8` 26 of 26, xtask 6 of 6. Training, seed 42, 3000 iterations, interleaved, two rounds (`docs/OXIDE_BENCH.md` section 10): fp32 147.1 s, fp8 142.9 s, bf16 138.6 s; mAP@0.50 99.55%, 99.55%, 99.63%; F1 0.9935, 0.9902, 0.9935. The 88.2 s of the reference chart is a C++ Darknet figure and is not reached. Open: fp8 on bf16 storage (plan_fp8 Task 6), delayed scaling, `dy` quantise pass, fp8 kernel tuning.
+- v0.2.173 to v0.2.176 (plan_bf16 Tasks 2 to 7; not chronological with v0.2.172, the numbers follow the commit messages): v0.2.173 format-aware conversions (`half_bits_to_f32`, `f32_to_half_bits`, `to_half`, `from_half`; `f983c8e`); v0.2.174 bf16 output from the 16-bit GEMM epilogue and split-K reduce (`hgemm_ex` accepts bf16 with a 16-bit output, `gemm_bf16_out16`; `c51d5b9`); v0.2.175 bf16 AMP mode (`dedebb2`): every `amp_*` kernel, `maxpool_f16` and `upsample_nearest_f16` take a `fmt` argument, AMP storage, weight copies and `hgemm` follow `half_format()`, `conv_weights_half`, and f16-only inference ops (`require_f16`) return an error in bf16 mode (`im2col_f16` and `route_copy_f16` are pure bit copies and needed no change); v0.2.176 `cargo xtask train_legogears -bf16` sets `LIGHTNET_OXIDE_AMP=bf16` with no loss scaling, and the training build default is 4 threads (`7ef8322`).
+- Evidence: `oxide_half` 17 of 17 (new `gemm_bf16_with_bf16_output_matches_reference`, `bf16_mode_rejects_f16_only_inference_ops`, conversion tests), `oxide_amp` 15 of 15 in both formats (`LIGHTNET_TEST_AMP_FMT=bf16` runs the whole suite in bf16 with every bound 8x the f16 bound, named `bf16_gradient_bounds_are_8x_f16`), `oxide_runtime_f16` 22 of 22, `oxide_gemm_f8` 26 of 26, xtask 6 of 6. Training, seed 42, 3000 iterations, interleaved, two rounds (`docs/OXIDE_BENCH.md` section 10): fp32 147.1 s, fp8 142.9 s, bf16 138.6 s; mAP@0.50 99.55%, 99.55%, 99.63%; F1 0.9935, 0.9902, 0.9935. The 88.2 s of the reference chart is a C++ Darknet figure and is not reached. Open: fp8 on bf16 storage (plan_fp8 Task 6), delayed scaling, `dy` quantise pass, fp8 kernel tuning.
 
 ## 243. fp8 wgrad byte column with the e5m2 gradient recipe
 
-- v0.2.177: `conv_backward_weights` keeps the byte im2col whenever `GemmMode::Fp8` is on; with `DARKNET_OXIDE_GEMM_BWD=fp8` the column is quantised to the recipe's first format (e4m3, activations) and `dy` to the second (e5m2, gradient). Before, the recipe fed `dy` to wgrad as e4m3 and the column as e5m2 and dropped the byte path (153.1 s). `launch_im2col_fp8` and `gemm_fp8_b_bytes` take the formats. `cargo xtask train_legogears -fp8` now sets `DARKNET_OXIDE_GEMM_BWD=fp8` as well as `DARKNET_OXIDE_GEMM=fp8`.
+- v0.2.177: `conv_backward_weights` keeps the byte im2col whenever `GemmMode::Fp8` is on; with `LIGHTNET_OXIDE_GEMM_BWD=fp8` the column is quantised to the recipe's first format (e4m3, activations) and `dy` to the second (e5m2, gradient). Before, the recipe fed `dy` to wgrad as e4m3 and the column as e5m2 and dropped the byte path (153.1 s). `launch_im2col_fp8` and `gemm_fp8_b_bytes` take the formats. `cargo xtask train_legogears -fp8` now sets `LIGHTNET_OXIDE_GEMM_BWD=fp8` as well as `LIGHTNET_OXIDE_GEMM=fp8`.
 - Evidence: `oxide_gemm_f8` 26 of 26, xtask 6 of 6. Training, seed 42, 3000 iterations: fp8 142.9 s and 142.1 s (47.2 ms), loss 0.0578, mAP 99.80%, F1 0.9902; fp32 146.4 s (48.7 ms) in the same session; fp16 AMP 208.8 s (67.5 ms), mAP 99.63%, F1 0.9902; table in `docs/OXIDE_BENCH.md` section 10. fp8's F1 is one false positive below fp32's 0.9935 (the chart's), and fp16 lands on the same value.
 
 ## 244. Delayed fp8 scaling
 
-- v0.2.178: `Fp8Scaling { Current, Delayed }` (`DARKNET_OXIDE_FP8_SCALING`, `with_fp8_scaling`; default `Current`). Delayed keeps a 16-slot f32 amax history per key (source device address, length, format) in one zeroed buffer. `fp8_quantize_delayed_kernel` takes the factor from the history max (slots `w = n % 16` and `z = (n + 2) % 16` excluded, so no read/write race), quantises with saturation, writes the `[factor, 1/factor]` pair, block-reduces its own amax into slot `w` (one atomic per block) and zeroes slot `z`. Call 0 of a key uses the two-pass current path with the amax landing in its slot. Applies to `fp8_quantize_operand` and `fp8_quantize_pair` (pair runs the operand path twice); cached weights and the byte im2col amax stay on current scaling. A full history (4096 keys) falls back to current scaling.
+- v0.2.178: `Fp8Scaling { Current, Delayed }` (`LIGHTNET_OXIDE_FP8_SCALING`, `with_fp8_scaling`; default `Current`). Delayed keeps a 16-slot f32 amax history per key (source device address, length, format) in one zeroed buffer. `fp8_quantize_delayed_kernel` takes the factor from the history max (slots `w = n % 16` and `z = (n + 2) % 16` excluded, so no read/write race), quantises with saturation, writes the `[factor, 1/factor]` pair, block-reduces its own amax into slot `w` (one atomic per block) and zeroes slot `z`. Call 0 of a key uses the two-pass current path with the amax landing in its slot. Applies to `fp8_quantize_operand` and `fp8_quantize_pair` (pair runs the operand path twice); cached weights and the byte im2col amax stay on current scaling. A full history (4096 keys) falls back to current scaling.
 - Evidence: `oxide_gemm_f8` 31 of 31 (new: `delayed_scaling_matches_current_scaling_on_stationary_data`, `delayed_scaling_saturates_on_a_spike`, `delayed_scaling_first_call_uses_current_amax`, a weights and 16-call ageing test, env parsing). No speed or training measurement.
 
 ## 245. fp8 backward quantises dy once
@@ -2474,11 +2474,11 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 ## 247. fp8 conv GEMMs under mixed-precision storage
 
 - v0.2.181: AMP with the fp8 GEMM mode: `with_amp_format` and the constructor keep `GemmMode::Fp8`. Forward (`conv_forward_amp_fp8`): cached e4m3 weights from the f32 master, columns quantised from the 16-bit im2col, f32 accumulate, one rounding into the AMP format; 1x1 stride-1 convs skip im2col. dgrad and wgrad use `bwd_fp8` or e4m3 x e4m3, with `dy` quantised once for both (`fp8_dy_half`, one-entry cache on the half buffer identity, length and formats). With AMP + fp8 the f32 GEMM seam keeps the 16-bit compute path, so non-conv ops are unchanged.
-- Evidence: `oxide_amp` 18 of 18, also with `DARKNET_TEST_AMP_FMT=bf16` (new: `amp_conv_with_fp8_gemm_tracks_f32_reference` runs f16 and bf16, with and without the e5m2 gradient recipe, seven conv shapes incl. groups and 1x1: nerr 3e-2 to 7e-2, bound 0.1, and the result differs from the 16-bit GEMM; `amp_fp8_weight_copy_is_refreshed_after_an_update`: second forward saves exactly the weight quantise, an updated tensor is quantised again; `amp_without_fp8_env_still_uses_fp16_gemm`: no fp8 launches). `oxide_gemm_f8` 35 of 35, `oxide_half` 17 of 17 (1 ignored), `oxide_runtime_f16` 22 of 22. No speed measurement.
+- Evidence: `oxide_amp` 18 of 18, also with `LIGHTNET_TEST_AMP_FMT=bf16` (new: `amp_conv_with_fp8_gemm_tracks_f32_reference` runs f16 and bf16, with and without the e5m2 gradient recipe, seven conv shapes incl. groups and 1x1: nerr 3e-2 to 7e-2, bound 0.1, and the result differs from the 16-bit GEMM; `amp_fp8_weight_copy_is_refreshed_after_an_update`: second forward saves exactly the weight quantise, an updated tensor is quantised again; `amp_without_fp8_env_still_uses_fp16_gemm`: no fp8 launches). `oxide_gemm_f8` 35 of 35, `oxide_half` 17 of 17 (1 ignored), `oxide_runtime_f16` 22 of 22. No speed measurement.
 
 ## 248. xtask -fp8 -fp16 / -fp8 -bf16
 
-- v0.2.182: `precision_env` accepts `-fp8` plus one 16-bit flag in either order: `DARKNET_OXIDE_GEMM=fp8`, `DARKNET_OXIDE_GEMM_BWD=fp8` and the AMP switch of that flag (the `-fp16` `-dyn_scale -loss_scale 1024` rule applies, bf16 adds no flags). Plain `-fp8` is unchanged (f32 storage, the benchmark config).
+- v0.2.182: `precision_env` accepts `-fp8` plus one 16-bit flag in either order: `LIGHTNET_OXIDE_GEMM=fp8`, `LIGHTNET_OXIDE_GEMM_BWD=fp8` and the AMP switch of that flag (the `-fp16` `-dyn_scale -loss_scale 1024` rule applies, bf16 adds no flags). Plain `-fp8` is unchanged (f32 storage, the benchmark config).
 - Evidence: `PKGS=xtask cargo xtask test` 11 of 11 (five new).
 
 ## 249. fp8 + bf16 master-weight test
@@ -2496,19 +2496,19 @@ primitives, preserving BN ordering and whole-network fallback for other gaps.
 
 ## 251. Delayed fp8 scaling on 16-bit sources (plan_fp8 Tasks 3/4/6 follow-up)
 
-- v0.2.187 (`8056b16`): `fp8_quantize_delayed_half_kernel` is `fp8_quantize_delayed_kernel` reading `&[u16]` through `half_bits_to_f32(x[i], hfmt)`: same history protocol (write slot `w = n % 16`, zero slot `z = (n + 2) % 16`, factor from the max of the other 14, saturating quantise, scale pair, block-reduced amax into slot `w`). `fp8_quantize_half` now goes through the delayed path under `DARKNET_OXIDE_FP8_SCALING=delayed`: `fp8_quantize_delayed` takes a source enum (f32 buffer, or 16-bit buffer plus `HalfFormat`). Key is (device pointer of the source buffer, length, format code); a 16-bit source adds `(hfmt + 1) << 8` to the code so it never shares a history with an f32 buffer at the same address. Call 0 of a key runs `fp8_amax_half_kernel` into the history slot, then `fp8_quantize_half_kernel` (two passes, as the f32 path); later calls are one launch.
+- v0.2.187 (`8056b16`): `fp8_quantize_delayed_half_kernel` is `fp8_quantize_delayed_kernel` reading `&[u16]` through `half_bits_to_f32(x[i], hfmt)`: same history protocol (write slot `w = n % 16`, zero slot `z = (n + 2) % 16`, factor from the max of the other 14, saturating quantise, scale pair, block-reduced amax into slot `w`). `fp8_quantize_half` now goes through the delayed path under `LIGHTNET_OXIDE_FP8_SCALING=delayed`: `fp8_quantize_delayed` takes a source enum (f32 buffer, or 16-bit buffer plus `HalfFormat`). Key is (device pointer of the source buffer, length, format code); a 16-bit source adds `(hfmt + 1) << 8` to the code so it never shares a history with an f32 buffer at the same address. Call 0 of a key runs `fp8_amax_half_kernel` into the history slot, then `fp8_quantize_half_kernel` (two passes, as the f32 path); later calls are one launch.
 - Applies to the AMP activation columns, 1x1 activations and `dy` (`fp8_dy_half` still shares one quantise between dgrad and wgrad). Weights are untouched (`fp8_weights`, current scaling from the f32 master). Default (`current`) path is the same kernels in the same order as before.
 - New seams: `OxideBackend::fp8_amax_passes()` (counts stand-alone amax passes of the 16-bit quantiser; `fp8_quantize_launches` counts one per quantise either way so it cannot tell the two paths apart) and `fp8_quantize_half_probe_keyed` (key override).
 - Evidence: `oxide_gemm_f8` 46 of 46 (eight new, f16 and bf16 each: `delayed_half_matches_current_on_stationary_data`, `delayed_half_saturates_on_a_spike`, `delayed_half_first_call_uses_current_amax`, `delayed_half_quantises_in_one_launch`); `oxide_amp` 20 of 20 in f16 and in bf16 (new `amp_conv_with_delayed_fp8_scaling_tracks_f32_reference`: fwd, dgrad, wgrad within 0.1 of the f64 reference over 4 rounds; stand-alone amax passes 14 against 84 for current scaling); `oxide_half` 17 of 17 (1 ignored). Not measured: training step speed or accuracy (user-gated, Task 9).
 
 ## 252. fp8 conv review fixes (codex review of the 16-bit fp8 path)
 
-Four findings, each reproduced on the GPU by a failing test first, then fixed (one commit each). All in `src/darknet-cuda-oxide` unless noted; training effect not measured.
+Four findings, each reproduced on the GPU by a failing test first, then fixed (one commit each). All in `src/lightnet-cuda-oxide` unless noted; training effect not measured.
 
-- v0.2.188 (`5b31be2`): the fp8 amax, quantise and delayed kernels take the logical element count `len` (`bounded_len(len, x.len())`). The AMP im2col workspace (`half_col`) only grows and is reused across chunks and convs, and the amax launch rounds the logical length up to a multiple of 256, so the last block read stale columns past the logical end (only up to 255 of them, and only when `nb * img_col` is not a multiple of 256). A stale spike set the scale and the real activations rounded to zero (reproduced: forward nerr 1.0). Test `amp_fp8_conv_amax_ignores_stale_workspace_tail` (f16, bf16, current and delayed scaling; geometry 1x7x7, k = 3, so the column is 896 elements): call A runs batch 3 with spike activations, call B runs batch 1 with small ones. It reproduces the same condition as a short final chunk without needing `DARKNET_OXIDE_CONV_CHUNK` (a process-wide `OnceLock`, so it cannot be set per test); a test with a forced chunk of 2 was not written.
+- v0.2.188 (`5b31be2`): the fp8 amax, quantise and delayed kernels take the logical element count `len` (`bounded_len(len, x.len())`). The AMP im2col workspace (`half_col`) only grows and is reused across chunks and convs, and the amax launch rounds the logical length up to a multiple of 256, so the last block read stale columns past the logical end (only up to 255 of them, and only when `nb * img_col` is not a multiple of 256). A stale spike set the scale and the real activations rounded to zero (reproduced: forward nerr 1.0). Test `amp_fp8_conv_amax_ignores_stale_workspace_tail` (f16, bf16, current and delayed scaling; geometry 1x7x7, k = 3, so the column is 896 elements): call A runs batch 3 with spike activations, call B runs batch 1 with small ones. It reproduces the same condition as a short final chunk without needing `LIGHTNET_OXIDE_CONV_CHUNK` (a process-wide `OnceLock`, so it cannot be set per test); a test with a forced chunk of 2 was not written.
 - v0.2.189 (`d9b1734`): `quantize_nan_f32` (non-finite input becomes the NaN byte `0x7f`, finite input unchanged, so finite overflow still saturates) is used by every GEMM operand quantiser: current, delayed, half, pair and the byte im2col. The raw cast `quantize_f32_to_fp8` and amax semantics are unchanged (`amax_ignores_non_finite_values` passes). Before, Inf saturated to max finite, so an all-Inf `dy` over finite activations gave a finite `dw` (reproduced: `-403817.75`, ...) and the loss scaler never saw the overflow. Tests: `amp_fp8_conv_overflowing_gradients_become_nonfinite` (wgrad, dgrad, forward; f16 and bf16), `fp8_quantisers_propagate_non_finite_input`, `fp8_gemm_with_inf_operand_is_non_finite`. `delayed_*_saturates_on_a_spike` still passes.
 - v0.2.190 (`ce1e7da`): `fp8_factor` clamps to `FP8_FACTOR_MAX = 2^120`; `fp8_quantize_kernel` uses it instead of its own copy of the formula. Before, amax below ~1e-36 gave an Inf factor (reproduced: `factor inf`, reciprocal 0, GEMM result 0). The host `fp8::amax_to_scale` divides (`amax / max_finite`), so it has no such hole and was left alone. Tests: `tiny_amax_gives_finite_scale_pair_{bf16,f16}`, `fp8_gemm_with_tiny_operands_is_finite`. Tensors with amax below ~3.4e-34 are no longer stretched to the full fp8 range.
-- `8f02e02` (`xtask`, no version number): `cargo xtask train` removes `DARKNET_OXIDE_AMP` from the child env unless a 16-bit flag sets it, so an inherited `DARKNET_OXIDE_AMP=bf16` no longer turns bare `-fp8` (or the no-flag default) into AMP storage. The old comment named `DARKNET_OXIDE_AMP` as an override of the xtask; it no longer is (the script run directly still honours it). Tests `bare_fp8_and_default_drop_an_inherited_amp` (failed before) and `sixteen_bit_flags_override_an_inherited_amp`; `CLAUDE.md` row updated.
+- `8f02e02` (`xtask`, no version number): `cargo xtask train` removes `LIGHTNET_OXIDE_AMP` from the child env unless a 16-bit flag sets it, so an inherited `LIGHTNET_OXIDE_AMP=bf16` no longer turns bare `-fp8` (or the no-flag default) into AMP storage. The old comment named `LIGHTNET_OXIDE_AMP` as an override of the xtask; it no longer is (the script run directly still honours it). Tests `bare_fp8_and_default_drop_an_inherited_amp` (failed before) and `sixteen_bit_flags_override_an_inherited_amp`; `CLAUDE.md` row updated.
 - Evidence: `oxide_gemm_f8` 51 of 51 (46 + 5 new), `oxide_amp` 22 of 22 in f16 and in bf16 (20 + 2 new), `oxide_half` 17 passed, 1 ignored, `oxide_runtime_f16` 22 of 22, `PKGS=xtask cargo xtask test` 13 of 13, `cargo xtask gpu-check` clean. Not run: the rest of the `oxide_*` test files, host core/cli tests, training (user-gated). `systemd-run --user` was unavailable in this session, so the runs were uncapped (thread limit 4 held).
 - Not fixed here: the delayed-scaling history is keyed on the source buffer's device pointer (see `plan_fp8.md`, Open issues).
 

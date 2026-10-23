@@ -24,16 +24,16 @@ but disclosed. No speedup/residency claim. GPU Muon remains absent.
 
 ## Files
 
-- `src/darknet-core/src/runtime/dcnv4_gpu.rs`: eligibility and family math helpers.
-- `src/darknet-core/src/runtime.rs`: shared forward/backward path selection and
+- `src/lightnet-core/src/runtime/dcnv4_gpu.rs`: eligibility and family math helpers.
+- `src/lightnet-core/src/runtime.rs`: shared forward/backward path selection and
   existing host optimizer plumbing; keep dispatch changes small.
-- `src/darknet-cuda/src/lib.rs`, `src/darknet-cuda/src/host_ops/dcnv4.rs`,
+- `src/lightnet-cuda/src/lib.rs`, `src/lightnet-cuda/src/host_ops/dcnv4.rs`,
   `host_ops/dcnv4_composition.rs`: generic surface and host defaults.
-- `src/darknet-cuda-oxide/src/lib.rs`, `src/darknet-cuda-oxide/src/dcnv4_native.rs`:
+- `src/lightnet-cuda-oxide/src/lib.rs`, `src/lightnet-cuda-oxide/src/dcnv4_native.rs`:
   native backend surface/overrides; kernels already implement raw math.
-- `src/darknet-core/src/runtime/tests/dcnv4_gpu_tests.rs`,
-  `src/darknet-cuda-oxide/tests/oxide_dcnv4_bn.rs` and
-  `src/darknet-cuda-oxide/tests/oxide_runtime_chain.rs`: path/cache, multiple
+- `src/lightnet-core/src/runtime/tests/dcnv4_gpu_tests.rs`,
+  `src/lightnet-cuda-oxide/tests/oxide_dcnv4_bn.rs` and
+  `src/lightnet-cuda-oxide/tests/oxide_runtime_chain.rs`: path/cache, multiple
   forward states, accumulation, parameter motion and two-step optimizer parity.
 - Handbook/status/todo/implemented/support matrix/version map: honest scope.
 

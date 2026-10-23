@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare two DARKNET_LAYER_DUMP_DIR exports layer by layer."""
+"""Compare two LIGHTNET_LAYER_DUMP_DIR exports layer by layer."""
 
 from __future__ import annotations
 

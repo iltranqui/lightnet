@@ -6,7 +6,7 @@
 
 **Architecture:** Strictly sequential waves. Wave 0 establishes the baseline (not green; see Progress). Wave 1 closes OBB CPU-training gaps (all in `obb_training.rs` / `train.rs` / `detect.rs` / CLI). Wave 2 executes the two already-written step plans. Everything else is a backlog stub that must be expanded into its own plan before dispatch (`layers.md` rule).
 
-**Tech Stack:** Rust workspace (`darknet-core`, `darknet-cli`, `darknet-cuda`), `src/darknet-cuda-oxide` (not a workspace member, built with `cargo oxide`), nightly-2026-08-28.
+**Tech Stack:** Rust workspace (`lightnet-core`, `lightnet-cli`, `lightnet-cuda`), `src/lightnet-cuda-oxide` (not a workspace member, built with `cargo oxide`), nightly-2026-08-28.
 
 **Spec:** `tasks/rust/STATUS.md` (resume point), `tasks/rust/todo.md` (open items), `tasks/rust/layers.md` (Layer Port Contract, phase tables), `tasks/rust/implemented.md` (done ledger).
 
@@ -41,7 +41,7 @@
 ## Progress (as of 2026-10-16)
 
 - **Task 0.1 complete:** `ForwardResult::from_heads` and the CLI f16 caller were committed as `98003667` (`v0.0.247`); focused test and oxide CLI check passed.
-- **Task 0.2 baseline not green; disposition recorded:** direct uncapped `cargo test -p darknet-core -p darknet-cli -j 2` passed 562/562 core unit tests and 23/23 CLI tests, and other integration targets passed, but `cfg_corpus` failed after 3943.36 s on `cfg/cspx-p7-mish.cfg` and `cfg/cspx-p7-mish_hp.cfg` (child CPU inference failure with empty error) and timed out on `cfg/lstm.train.cfg` and `cfg/rnn.train.cfg` (300 s each). Full evidence is in `STATUS.md`. At the time of this baseline run, the `MEM=3G` wrapper could not reach the WSL user systemd bus, so the command was uncapped. A later user-provided `./tools/test_oxide.sh` log showed `Running scope as unit: ...scope`. Then `MEM=3G ./tools/test_host.sh obb_` ran in a systemd scope and passed 135 core + 4 CLI tests. The full host baseline and `cfg_corpus` have not been rerun under the cap, so this focused pass does not resolve the four corpus cases; they remain non-green and unresolved as behavior. Disposition: accept them as known resource/runtime residuals for scoped follow-on work only; they are not passes or fixed. Do not claim a green full-host baseline.
+- **Task 0.2 baseline not green; disposition recorded:** direct uncapped `cargo test -p lightnet-core -p lightnet-cli -j 2` passed 562/562 core unit tests and 23/23 CLI tests, and other integration targets passed, but `cfg_corpus` failed after 3943.36 s on `cfg/cspx-p7-mish.cfg` and `cfg/cspx-p7-mish_hp.cfg` (child CPU inference failure with empty error) and timed out on `cfg/lstm.train.cfg` and `cfg/rnn.train.cfg` (300 s each). Full evidence is in `STATUS.md`. At the time of this baseline run, the `MEM=3G` wrapper could not reach the WSL user systemd bus, so the command was uncapped. A later user-provided `./tools/test_oxide.sh` log showed `Running scope as unit: ...scope`. Then `MEM=3G ./tools/test_host.sh obb_` ran in a systemd scope and passed 135 core + 4 CLI tests. The full host baseline and `cfg_corpus` have not been rerun under the cap, so this focused pass does not resolve the four corpus cases; they remain non-green and unresolved as behavior. Disposition: accept them as known resource/runtime residuals for scoped follow-on work only; they are not passes or fixed. Do not claim a green full-host baseline.
 - **Wave 1 tasks 1.1–1.4 complete:** OBB CPU Adam (`f9664e63`), photometric augmentation (`5b98fe1c`), weighted OBB NMS (`968c1beb`), OBB default augmentation settings (`fae49267`), and `ciou_obb_mul` (`31219aba`, `v0.0.253`). The previous `jitter` failure is resolved by the zero default for omitted OBB jitter. Current `MEM=3G ./tools/test_host.sh obb_` filter: 135 core + 4 CLI tests pass. Multiplicative source formula and numerical-gradient details are recorded in `STATUS.md`; no compiled-C++ parity is claimed.
 - **WIP snapshot audit:** `git show --stat 8fb5bb1b` lists 35 files. The `obb_` filter exercises OBB model/training/detection/evaluation/augmentation plus CLI OBB paths, not the snapshot's unrelated render scalar, CenterNet, chart, contrastive, deconvolution, dense-loss, LAYA, MoE, Modern YOLO, segmentation, generic weights/runtime, and CUDA areas.
 - **Baseline triage/disposition:** the two CSPX child failures are SIGKILL/global-OOM events (~7 GiB RSS confirmed by kernel logs); `lstm.train.cfg` and `rnn.train.cfg` each request batch 128 × 576 time steps × three 1024-unit recurrent layers and hit the 300 s CPU-inference timeout. A targeted child run of `cspx-p7-mish.cfg` reproduced SIGKILL. Full baseline remains non-green; no parser/model error was reproduced. The controller accepts these four known residuals for scoped follow-on tasks only; no full-host green claim is allowed. The standalone corpus command is not rerun because the full run took >1 hour.
@@ -51,8 +51,8 @@
 `tasks/rust/` holds ~12.9k lines of plans and ledgers. The open items span trivially small (a 3-field struct literal), medium (OBB Adam), and XL (OBB GPU training, DETR, clifford, GUI). Dispatching "the open items" as one job would hand subagents ambiguous, huge tasks and would break the repo's one-build-at-a-time rule. This plan fixes ordering, interfaces, and test gates so each dispatch is small and checkable.
 
 Verified facts that shaped it (status as of 2026-10-17; items marked FIXED were the original blockers):
-- FIXED (`98003667`, v0.0.247): `cargo check -p darknet-cli --features oxide` was broken by `ForwardResult` literal at `main.rs:310` missing `moe_caches`, `eml_caches`, `vit_caches`.
-- The workspace itself did not load at HEAD (dangling `darknet-gui*` members); `Cargo.toml` now has them commented out (uncommitted).
+- FIXED (`98003667`, v0.0.247): `cargo check -p lightnet-cli --features oxide` was broken by `ForwardResult` literal at `main.rs:310` missing `moe_caches`, `eml_caches`, `vit_caches`.
+- The workspace itself did not load at HEAD (dangling `lightnet-gui*` members); `Cargo.toml` now has them commented out (uncommitted).
 - FIXED (`f9664e63`, `5b98fe1c`, `fae49267`): OBB CPU trainer rejected Adam and photometric augmentation; geometric augmentation (`jitter, resize, letter_box, mixup, mosaic, mosaic_bound, random`) is still rejected by design.
 - FIXED (`31219aba`, `968c1beb`): `ciou_obb_mul` was rejected for training; weighted OBB NMS merge was unsupported.
 - Sample-level API dispatch is complete in `v0.0.258` (`evaluate.rs`, `carpn_map_plan.md`): `obb_detector_map` routes homogeneous CARPN sample sets to `carpn_detector_map` and rejects mixed geometry. The source audit and bounded CPU network inference / `detect-image` / direct `detector map` plan are in `carpn_network_map_plan.md`; implementation is not started. CARPN training and scheduled `detector train -map` are deferred until Stage-2 training/backward/update support is separately planned.
@@ -92,7 +92,7 @@ darknet/
 │   └── gui_plan.md          (egui plan M0–M6, Wave 2)
 ├── tools/test_host.sh · test_oxide.sh
 └── src/
-    ├── darknet-core/src/
+    ├── lightnet-core/src/
     │   ├── runtime.rs            ForwardResult (498), ExecutableNetwork::update_weights (745), Adam (5396, 5637, 13236)
     │   ├── train.rs              train_obb_yolo_batch_step (551), train_obb_yolo_subdivisions (728), load_obb_training_batch* (1778-1872)
     │   ├── obb_training.rs       delta writeback passes, loss/metrics
@@ -100,9 +100,9 @@ darknet/
     │   ├── model.rs              ObbNmsKind (881), iou_loss parse (3726)
     │   ├── evaluate.rs           obb_detector_map (419), carpn_detector_map (342)
     │   └── augmentation.rs       photometric + geometric transforms
-    ├── darknet-cli/src/main.rs   f16 ForwardResult (310), run_detector_train_cpu_obb (2392)
-    ├── darknet-cuda/src/host_ops.rs   AdamParams (807), adam_update
-    └── darknet-cuda-oxide/       (Wave 0 only: compile check)
+    ├── lightnet-cli/src/main.rs   f16 ForwardResult (310), run_detector_train_cpu_obb (2392)
+    ├── lightnet-cuda/src/host_ops.rs   AdamParams (807), adam_update
+    └── lightnet-cuda-oxide/       (Wave 0 only: compile check)
 ```
 
 ## Component Breakdown
@@ -125,24 +125,24 @@ Per user CLAUDE.md: **Sonnet** implementers (one per task), **Haiku** for read-o
 ### Task 0.1: Stop the oxide CLI build break and make it unrepeatable
 
 **Files:**
-- Modify: `src/darknet-core/src/runtime.rs` (add constructor next to `impl ForwardResult` at ~518; test module already added after it)
-- Modify: `src/darknet-cli/src/main.rs:310`
+- Modify: `src/lightnet-core/src/runtime.rs` (add constructor next to `impl ForwardResult` at ~518; test module already added after it)
+- Modify: `src/lightnet-cli/src/main.rs:310`
 
 **Interfaces:**
 - Produces: `ForwardResult::from_heads(yolo_heads: Vec<YoloHeadOutput>, modern_heads: Vec<ModernHeadOutput>) -> ForwardResult` — all per-layer cache vectors empty.
 
 - [x] **Step 1:** Write test `forward_result_from_heads_has_empty_caches` (done; asserts all cache vectors empty and `final_output().is_none()`).
 - [x] **Step 2:** Run the filter — compile FAIL (E0599, `from_heads` missing). Done.
-- [x] **Step 3:** Implemented `from_heads`; replaced the literal at `main.rs:310` with `darknet_core::ForwardResult::from_heads(summary.yolo_heads, summary.modern_heads)`.
-- [x] **Step 4:** `cargo test -p darknet-core -j 2 -- forward_result_from_heads` — passed.
-- [x] **Step 5:** `cargo check -p darknet-cli --features oxide -j 4` — passed.
+- [x] **Step 3:** Implemented `from_heads`; replaced the literal at `main.rs:310` with `lightnet_core::ForwardResult::from_heads(summary.yolo_heads, summary.modern_heads)`.
+- [x] **Step 4:** `cargo test -p lightnet-core -j 2 -- forward_result_from_heads` — passed.
+- [x] **Step 5:** `cargo check -p lightnet-cli --features oxide -j 4` — passed.
 - [x] **Step 6:** Committed as `98003667` (`v0.0.247: add ForwardResult::from_heads`).
 
 ### Task 0.2: Host-suite baseline and WIP triage report
 
 **Files:** Modify `tasks/rust/STATUS.md` (new "Baseline 2026-10-16" section with TOC entry if headings change).
 
-- [x] **Step 1 (attempted):** at the time, the `MEM=3G` wrapper could not reach `systemd-run --user`; direct uncapped `cargo test -p darknet-core -p darknet-cli -j 2` passed core unit 562/562 and CLI 23/23, then failed the corpus target on two child CPU-inference failures and two 300 s timeouts. Later, the user Oxide log confirmed systemd scopes start, and `MEM=3G ./tools/test_host.sh obb_` passed 135 core + 4 CLI. The full host baseline/cfg corpus has not been rerun under the cap. Exact original outcomes are in `STATUS.md`.
+- [x] **Step 1 (attempted):** at the time, the `MEM=3G` wrapper could not reach `systemd-run --user`; direct uncapped `cargo test -p lightnet-core -p lightnet-cli -j 2` passed core unit 562/562 and CLI 23/23, then failed the corpus target on two child CPU-inference failures and two 300 s timeouts. Later, the user Oxide log confirmed systemd scopes start, and `MEM=3G ./tools/test_host.sh obb_` passed 135 core + 4 CLI. The full host baseline/cfg corpus has not been rerun under the cap. Exact original outcomes are in `STATUS.md`.
 - [x] **Step 2 (observed in the full run, not rerun standalone):** `cfg_corpus` ran for 3943.36 s and reported the same four cfg failures; standalone rerun omitted to avoid repeating the >1-hour run.
 - [x] **Step 3:** `git show --stat 8fb5bb1b` audited (35 files); filtered OBB coverage gaps are listed in Progress above.
 - [x] **Step 4:** Recorded the baseline result and explicit disposition in `STATUS.md`: the four failures are accepted as known resource/runtime residuals for scoped follow-on work only. Task 0.2 remains non-green and is not a passing baseline; do not claim full-host green.
@@ -155,10 +155,10 @@ All four tasks edit overlapping files; run strictly in order.
 
 ### Task 1.1: Adam for CPU OBB training
 
-**Files:** Modify `src/darknet-core/src/train.rs:564,741`, `src/darknet-core/src/runtime.rs` (host Adam entry), `src/darknet-cli/src/main.rs:2400`; tests in `train.rs` tests.
+**Files:** Modify `src/lightnet-core/src/train.rs:564,741`, `src/lightnet-core/src/runtime.rs` (host Adam entry), `src/lightnet-cli/src/main.rs:2400`; tests in `train.rs` tests.
 
 **Interfaces:**
-- Consumes: `darknet_cuda::host_ops::AdamParams` (`lr, beta1, beta2, eps, decay, batch, step, decoupled_decay`), `apply_host_adam` (`runtime.rs:13236`), `ExecutableNetwork::adam_step()/set_adam_step()`.
+- Consumes: `lightnet_cuda::host_ops::AdamParams` (`lr, beta1, beta2, eps, decay, batch, step, decoupled_decay`), `apply_host_adam` (`runtime.rs:13236`), `ExecutableNetwork::adam_step()/set_adam_step()`.
 - Produces: `ExecutableNetwork::update_weights_adam(&mut self, learning_rate: f32, batch: usize) -> Result<()>` (host-only; increments `adam_step` exactly once).
 
 - [x] **Step 1 (spike):** host Adam can be applied without a GPU backend using the existing `apply_host_adam*` helpers; implementation and evidence are in commit `f9664e63`.
@@ -171,7 +171,7 @@ All four tasks edit overlapping files; run strictly in order.
 
 ### Task 1.2: Photometric augmentation for OBB training
 
-**Files:** Modify `src/darknet-core/src/train.rs` (`load_obb_training_batch_with_flips_from_paths`, ~1872), `src/darknet-cli/src/main.rs:2406-2418`.
+**Files:** Modify `src/lightnet-core/src/train.rs` (`load_obb_training_batch_with_flips_from_paths`, ~1872), `src/lightnet-cli/src/main.rs:2406-2418`.
 
 **Interfaces:** Consumes the existing photometric path in `augmentation.rs` (`apply`, line 257) — reuse; do not copy it. Produces: loader accepts `hue/saturation/exposure` from `DetectorAugmentation`; geometric options (`jitter, resize, letter_box, mixup, mosaic, mosaic_bound, random`) still error.
 
@@ -179,7 +179,7 @@ All four tasks edit overlapping files; run strictly in order.
 
 ### Task 1.3: Weighted OBB NMS merge
 
-**Files:** Modify `src/darknet-core/src/model.rs:881-906` (`ObbNmsKind`), `src/darknet-core/src/detect.rs` (NMS dispatch near line 165-195).
+**Files:** Modify `src/lightnet-core/src/model.rs:881-906` (`ObbNmsKind`), `src/lightnet-core/src/detect.rs` (NMS dispatch near line 165-195).
 
 **Interfaces:** Produces `ObbNmsKind::Weighted` parsed from the source spelling found in step 1.
 
@@ -188,7 +188,7 @@ All four tasks edit overlapping files; run strictly in order.
 
 ### Task 1.4: `ciou_obb_mul` training path
 
-**Files:** Modify `src/darknet-core/src/obb_training.rs` (box regression), `src/darknet-core/src/model.rs` (the rejection test at ~5045 flips to acceptance).
+**Files:** Modify `src/lightnet-core/src/obb_training.rs` (box regression), `src/lightnet-core/src/model.rs` (the rejection test at ~5045 flips to acceptance).
 
 - [x] **Step 1:** Read `raptor:src-lib/box.cpp` and `raptor:src-lib/yolo_layer_obb.cpp`; the source formula is documented in `STATUS.md`.
 - [x] **Step 2:** Added the three-geometry/six-coordinate finite-difference check, `ciou_obb_mul_differs_from_additive`, and parse/build-config assertions.
@@ -269,7 +269,7 @@ Done when: every in-scope v0.1 layer and required source variant is parse+shape+
 ## Verification
 
 - Per task: the stated filter fails first, then passes; then `MEM=3G ./tools/test_host.sh obb_` (OBB tasks) or full `./tools/test_host.sh` (Wave 0).
-- Wave 0 end: `cargo check -p darknet-cli --features oxide -j 4` exits 0.
+- Wave 0 end: `cargo check -p lightnet-cli --features oxide -j 4` exits 0.
 - Wave 1 end: `MEM=3G ./tools/test_host.sh obb_` passed 135 core + 4 CLI tests, including an end-to-end OBB `detector train` CLI test with `adam=1`, exposure augmentation, and two iterations. `Running scope as unit: run-r5e0590e5177c4b5f9508c6e86ca4f304.scope` confirms the host filter ran under the user systemd scope.
 - Bookkeeping per wave: tick `todo.md`, add to `implemented.md` and `STATUS.md` "Latest increments" (vNNN entry stating tests run and "no compiled-C++ parity"), update `version-map.tsv`.
 

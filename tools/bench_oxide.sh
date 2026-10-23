@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Kernel benchmarks (ignored tests in src/darknet-cuda-oxide/tests/oxide_*bench.rs).
+# Kernel benchmarks (ignored tests in src/lightnet-cuda-oxide/tests/oxide_*bench.rs).
 # Usage: ./tools/bench_oxide.sh <micro|conv|gemm-square|gemm-lego|all>
-# Env passed through: DARKNET_BENCH_MODES, DARKNET_BENCH_FILTER, DARKNET_BENCH_ROUNDS,
-#   DARKNET_BENCH_CONV_BATCH, DARKNET_BENCH_TARGET_MS (see tests/oxide_bench.rs header).
+# Env passed through: LIGHTNET_BENCH_MODES, LIGHTNET_BENCH_FILTER, LIGHTNET_BENCH_ROUNDS,
+#   LIGHTNET_BENCH_CONV_BATCH, LIGHTNET_BENCH_TARGET_MS (see tests/oxide_bench.rs header).
 # Modes are interleaved per round (laptop clocks drift); results are BENCHJSON lines,
 # also saved to target/bench/<kind>_<timestamp>.log.  Override: MEM (default 3G).
 set -euo pipefail
@@ -38,7 +38,7 @@ for run in "${RUNS[@]}"; do
     read -r file name <<<"$run"
     capped "$MEM" \
         target/debug/cargo-oxide oxide test -- \
-        --manifest-path src/darknet-cuda-oxide/Cargo.toml -j 2 --release --test "$file" \
+        --manifest-path src/lightnet-cuda-oxide/Cargo.toml -j 2 --release --test "$file" \
         -- --ignored --nocapture --test-threads=1 "$name" 2>&1 | tee -a "$LOG"
 done
 printf 'Saved %s\n' "$LOG" >&2

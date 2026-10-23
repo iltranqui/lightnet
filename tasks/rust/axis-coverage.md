@@ -82,7 +82,7 @@ classes that apply.
 
 ## Fixture rules
 
-- Use the shared helpers in `src/darknet-core/src/axis_fixture.rs`
+- Use the shared helpers in `src/lightnet-core/src/axis_fixture.rs`
   (`axis_tensor`, `nchw_index`, `probe_shape`, `axis_value`) instead of
   hand-writing nested loops. These helpers exist; older pins may retain their
   original explicit fixtures.

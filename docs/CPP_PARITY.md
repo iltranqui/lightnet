@@ -7,7 +7,7 @@ implementation itself.
 
 ## What is compiled
 
-`src/darknet-core/tests/cpp_parity.rs` copies the repository's real
+`src/lightnet-core/tests/cpp_parity.rs` copies the repository's real
 `src-lib/connected_layer.cpp` into a temporary build directory and compiles it
 with:
 
@@ -59,25 +59,25 @@ From `darknet/rust`:
 
 ```bash
 source ../toolchain.env
-RUSTFLAGS=-Dwarnings cargo test -p darknet-core --test cpp_parity -- --nocapture
+RUSTFLAGS=-Dwarnings cargo test -p lightnet-core --test cpp_parity -- --nocapture
 ```
 
 The test discovers `c++`, `g++`, or `clang++`. Use explicit paths when the
 compiler is not on `PATH`:
 
 ```bash
-DARKNET_CXX=/usr/bin/g++ cargo test -p darknet-core --test cpp_parity
+LIGHTNET_CXX=/usr/bin/g++ cargo test -p lightnet-core --test cpp_parity
 ```
 
 If the Rust crate is copied away from the repository root, point it at the C++
 tree explicitly:
 
 ```bash
-DARKNET_CPP_ROOT=/path/to/darknet cargo test -p darknet-core --test cpp_parity
+LIGHTNET_CPP_ROOT=/path/to/darknet cargo test -p lightnet-core --test cpp_parity
 ```
 
 Without a C++ compiler, the test reports a skip so ordinary CPU-only Rust
-development remains portable. Set `DARKNET_CPP_PARITY_REQUIRED=1` in CI or a
+development remains portable. Set `LIGHTNET_CPP_PARITY_REQUIRED=1` in CI or a
 release gate to turn that skip into a failure.
 
 ## Numerical policy
@@ -103,7 +103,7 @@ For another C++ layer:
 3. make the oracle protocol deterministic and text-readable;
 4. compare forward, backward, and parameter/update state separately;
 5. document unsupported branches explicitly;
-6. run the fixture with `DARKNET_CPP_PARITY_REQUIRED=1`.
+6. run the fixture with `LIGHTNET_CPP_PARITY_REQUIRED=1`.
 
 Never silently compare only final detections for a new trainable layer. A wrong
 intermediate layout can still produce plausible boxes while its gradients are

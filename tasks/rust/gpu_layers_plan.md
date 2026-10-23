@@ -20,7 +20,7 @@
 The operator explicitly requested GPU layers now, overriding CPU-first sequencing.
 CPU completeness is not implied. Implement directly without subagents. Pending,
 uncommitted YOLO-3D activation math is parked: do not discard or include it in GPU
-commits (`darknet-core/src/lib.rs`, `model/yolo_3d_config.rs`, `yolo_3d.rs` and its
+commits (`lightnet-core/src/lib.rs`, `model/yolo_3d_config.rs`, `yolo_3d.rs` and its
 tests). Preserve unrelated user edits. One build/test at a time, max four build
 threads, MemoryHigh=3G; Oxide builds/tests only through `tools/test_oxide.sh` /
 cargo-oxide. No training runs. Native math, not new host fallback, is the GPU
@@ -257,9 +257,9 @@ uses only the CLS adjoint.
 
 Status: the shared sampling primitive and the `[deform_conv]` accumulation
 stage are native and green. The host contract lives in
-`darknet_cuda::host_ops::bilinear_gather` (`BilinearGatherGeometry`, `forward`,
+`lightnet_cuda::host_ops::bilinear_gather` (`BilinearGatherGeometry`, `forward`,
 `backward`, trait defaults `deform_bilinear_gather_f32` / `_backward_f32`); the
-device kernels live in `src/darknet-cuda-oxide/src/kernels/deform_sample.rs`.
+device kernels live in `src/lightnet-cuda-oxide/src/kernels/deform_sample.rs`.
 `todo.md` holds the test counts and the atomic-scatter caveat. **No layer calls
 any of it yet.** This section is the contract for the first wiring.
 
@@ -340,7 +340,7 @@ this repo; pick targets by backward tractability instead.
 `runtime.rs` forward arm cannot call an `OxideBackend`-inherent method such as
 `deform_conv_forward_native`. Wiring the device path therefore requires the five
 stages to be **trait** methods with host-reference defaults first. Those defaults
-now exist (`darknet_cuda::host_ops::deform_conv`: `sanitize`, `centered_lhtan`,
+now exist (`lightnet_cuda::host_ops::deform_conv`: `sanitize`, `centered_lhtan`,
 `stable_sigmoid`, `OffsetStats`/`offset_stats`, `offset_envelope`,
 `mask_sigmoid`, `DeformGeometry`/`accumulate`, 6 unit tests; `bilinear_gather`
 exposes `sample_at` so the gather and the accumulation share one sampler). The
@@ -352,7 +352,7 @@ overrides (already written, just need forwarding), then composition in
 
 `deform_conv::output_dim` includes the dilated kernel extent:
 `oh = (H + 2*pad - dilation*(size-1) - 1) / stride + 1`. The oxide conv `Geom`
-(`src/darknet-cuda-oxide/src/conv.rs:145`) intentionally does **not** — it uses
+(`src/lightnet-cuda-oxide/src/conv.rs:145`) intentionally does **not** — it uses
 `(H + 2*pad - size) / stride + 1`, matching `[convolutional]` (see
 `axis-coverage.md` finding F1). For `dilation == 1` the two agree, so the offset
 and mask predictors can be built with `conv2d_f32` + `bias_add_f32`. For `dilation > 1` they do not. v0.2.160 resolves this with a direct native
@@ -370,7 +370,7 @@ Historical scope note (superseded by v0.2.007 and v0.2.160): non-BN f32
 dilation values. Batch-normalized variants remain host-routed; the backward's
 batch-coupled normalization Jacobian retains one host hop.
 
-Operands and math, from `src/darknet-core/src/deform_conv.rs` (hand-derived from
+Operands and math, from `src/lightnet-core/src/deform_conv.rs` (hand-derived from
 `Jev_laya`): output `[B, filters, OH, OW]`; for each output point the base
 sample is the input grid position derived from `stride`/`padding`/`dilation`,
 displaced by the predicted offsets `groups * size^2 * 2` and scaled by the
@@ -459,7 +459,7 @@ mistake produces a network that trains silently wrong rather than failing.
 `[deform_conv]` is wired (`layer-support.md`), so the question for `[dcnv4]` is
 whether the same template applies. The blocking factor for deform_conv was its
 27-field forward cache; **dcnv4's cache has two fields**
-(`src/darknet-core/src/dcnv4.rs:11`):
+(`src/lightnet-core/src/dcnv4.rs:11`):
 
 ```text
 Dcnv4ForwardCache { offsets: Vec<f32>, raw_output: Vec<f32> }
@@ -479,7 +479,7 @@ aggregation output, both of which the device forward would already hold.
   same-resolution conv, so the predictor-backward reuse is partial.
 
 **Slice order, mirroring what worked twice already:** (1) host reference for the
-aggregation and its adjoint in `darknet_cuda::host_ops` with finite-difference
+aggregation and its adjoint in `lightnet_cuda::host_ops` with finite-difference
 tests; (2) device kernel for aggregation + adjoint, parity against (1);
 (3) compose the full forward/backward and compare against the CPU
 `dcnv4_backward` gradients on a real cfg (the `oxide_deform_conv_backward_chain`
@@ -545,7 +545,7 @@ instead of by rewriting.
 **Landed:** `host_ops::dcnv4` (`aggregate` / `aggregate_backward`, plus
 `Dcnv4Geometry` and `group_masks`) is in the tree as v0.2.009 (`e3cfb27d`) and
 FD-green across all four `softmax`/`remove_center` combinations (`cargo test -p
-darknet-cuda --lib` 35 passed) using the cell-centre fixture. Native aggregation
+lightnet-cuda --lib` 35 passed) using the cell-centre fixture. Native aggregation
 forward (v0.2.010) and adjoint (v0.2.011) now pass host parity and actual-device
 finite differences; 6 device tests cover batches/groups, masks/center removal,
 strided/dilated/edge geometry and malformed operands. Still not wired.
@@ -650,7 +650,7 @@ two-step hybrid GPU Muon parity. No compiled-C++ golden or performance claim.
 
 Source audit: `Jev_laya:src-lib/dsconv_kernels.cu` has predictor, coordinate,
 collapse, and backward kernels, but its backward shortcuts cumulative offset
-propagation; use `src/darknet-core/src/dsconv.rs` as the Rust derivative oracle.
+propagation; use `src/lightnet-core/src/dsconv.rs` as the Rust derivative oracle.
 No compiled-C++ numerical golden is available. This plan is Stage 2 only and
 preserves the open Stage-1 multi-template and axis/layout work.
 

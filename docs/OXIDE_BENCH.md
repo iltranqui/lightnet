@@ -2,15 +2,15 @@
 
 Measured 2026-10-01 on an RTX 4060 Laptop (sm_89, 24 SM, driver 610.62, WSL2), git `fcc4d842` + uncommitted P7 work,
 release builds, LegoGears_v2 (224x160x3, 21 convs) with `LegoGears_augmatch_best.weights`.
-Raw data: `tools/oxide_bench.py --out <dir>` writes `results.json` / `results.csv` (git hash, GPU, clocks, driver, `DARKNET_*` env).
+Raw data: `tools/oxide_bench.py --out <dir>` writes `results.json` / `results.csv` (git hash, GPU, clocks, driver, `LIGHTNET_*` env).
 Roofline used for percentages: 15 TFLOP/s fp32, 272 GB/s (marketing peaks; the laptop part does not sustain them, see caveats).
 No training runs were made.
 
 ## Methodology
 
-* Harness: `src/darknet-cuda-oxide/tests/oxide_bench.rs` (ignored tests `bench_micro`, `bench_conv`) + `tools/oxide_bench.py` (driver) +
+* Harness: `src/lightnet-cuda-oxide/tests/oxide_bench.rs` (ignored tests `bench_micro`, `bench_conv`) + `tools/oxide_bench.py` (driver) +
   `tools/oxide_bench_cpp.cpp` (C++ CUDA Darknet probe linking `build/src-lib/libdarknet.so`; built on demand into `target/oxide_bench/`).
-  End-to-end Rust numbers come from `DARKNET_BENCH_ITERS` / `DARKNET_BENCH_BATCH` in `darknet-rs detect-image` (`BENCH_JSON` line).
+  End-to-end Rust numbers come from `LIGHTNET_BENCH_ITERS` / `LIGHTNET_BENCH_BATCH` in `lightnet-rs detect-image` (`BENCH_JSON` line).
 * Micro/conv: warm-up launch, then per sample the mean device time of N back-to-back launches measured with CUDA events on the backend
   stream (N calibrated to ~20 ms), 7 samples, median / min / p95 over the samples. Modes (fp32/tf32, direct/gemm) are interleaved sample by
   sample because laptop clocks drift. Because launches are back to back, the figures include the per-launch gap: sub-30 us items are launch bound.
@@ -30,7 +30,7 @@ No training runs were made.
 | oxide fp16 (f16 storage, P6) | 1.79 / 1.33 / 3.36 | 557 | 18.2 / 15.5 / 21.0 | 878 |
 | C++ CUDA, cuDNN fp16 (default) | 5.40 / 3.69 / 11.0 | 185 | 14.1 / 10.9 / 17.6 | 1132 |
 | C++ CUDA, cuDNN, `cudnn_half=0` | 4.61 / 3.01 / 9.23 | 217 | 14.2 / 10.8 / 17.4 | 1127 |
-| Rust CPU (`darknet-core`, 1 run per round, 2 rounds) | 3371 | 0.3 | 54098 | 0.3 |
+| Rust CPU (`lightnet-core`, 1 run per round, 2 rounds) | 3371 | 0.3 | 54098 | 0.3 |
 
 * fp16 row (added with P6, separate interleaved run of 5 rounds x 100 iters together with oxide fp32/tf32 and both C++ rows; fp32 2.31 / 23.1, tf32 2.33 / 19.6,
   C++ cuDNN fp16 5.06 / 14.0 ms in that run): weights + activations stored as f16, f32 accumulate, bias + activation fused into the GEMM epilogue (no f32 activation
@@ -43,13 +43,13 @@ No training runs were made.
   difference is within noise at b16, so on this net cuDNN fp16 buys little. A true cuDNN-less build was not made.
 * Rust CPU is the unoptimised reference path (single thread), not a performance target.
 * Memory (MB, device): oxide b1 +18 (workspace 4.9, 12.3 cached in the pool), b16 +184 (workspace 4.9, 150 pool); C++ b1 76, b16 348 (332 with `cudnn_half=0`).
-  Pool cap is `DARKNET_OXIDE_POOL_MB` (default 1024).
+  Pool cap is `LIGHTNET_OXIDE_POOL_MB` (default 1024).
 
 ### 1.1 fp16 inference: batched im2col + one GEMM per chunk, more f16 layers, bf16 GEMM (2026-10-01)
 
 Batched f16 conv (`conv2d_bias_act_f16`: one im2col launch and one GEMM launch per chunk of images, instances = image x group, column buffer capped at 32 MB, 1x1 convs with
 aligned K / H*W skip im2col) was already in the tree when this section was written, so the P6 remark above ("per-image im2col + GEMM loop is unchanged") and the b16 fp16 row
-(18.2 ms) are stale. A/B with the existing switch `DARKNET_OXIDE_CONV_CHUNK=1` (= old one-launch-per-image loop), release `darknet-rs`, LegoGears_v2, interleaved, 5 rounds x 100 iters
+(18.2 ms) are stale. A/B with the existing switch `LIGHTNET_OXIDE_CONV_CHUNK=1` (= old one-launch-per-image loop), release `lightnet-rs`, LegoGears_v2, interleaved, 5 rounds x 100 iters
 (`tools/oxide_bench.py --suites e2e --batches 1,16 --variants oxide-fp16,oxide-fp16-loop,cpp-cudnn-half`, results in `target/oxide_bench/f16_batched/`):
 
 | variant | batch 1 median / min / p95 ms | FPS | batch 16 median / min / p95 ms | img/s | device MB delta b1 / b16 |
@@ -67,7 +67,7 @@ bias + activation (one `channel_affine_act_f16` kernel), and `reverse` upsample.
 reorg, softmax, scale_channels, sam, crop, recurrent layers, shortcut without sources. Accuracy vs the f32 path (`tests/oxide_runtime_f16.rs`, random He-initialised weights and BN
 statistics, scale-normalised max error of the yolo heads / final output): tiny nets 2.8e-4 .. 8.8e-4; yolov3-tiny 1.3e-3, yolov4-tiny 1.3e-3, yolov3 (75 convs, 23 shortcuts, 3 heads, 128x128)
 6.2e-4, resnet101 up to the global avgpool (33 shortcuts, 4 resized) 6.7e-4; tolerance 4e-3 (tiny) / 5e-3 (real cfgs). The element ops are tested against f64 references to
-5.2e-4 |ref| + 1e-7 (one binary16 rounding) in `tests/oxide_half.rs`. LegoGears_v2 detections with `DARKNET_OXIDE_GEMM=fp16` on the 80 validation images are byte-identical to the
+5.2e-4 |ref| + 1e-7 (one binary16 rounding) in `tests/oxide_half.rs`. LegoGears_v2 detections with `LIGHTNET_OXIDE_GEMM=fp16` on the 80 validation images are byte-identical to the
 recorded fp16 run (mAP 99.6685%).
 
 bf16 GEMM: `OxideBackend::gemm_bf16` (bf16 operands, f32 accumulate / output, `mma.sync m16n8k16 .bf16`) reuses the f16 kernel through a `bf16` flag; the tensor-core step is
@@ -158,16 +158,16 @@ Findings:
 2. Batched im2col and a batched/grouped GEMM over the image loop (one launch per layer instead of one per image), or an implicit-GEMM conv that skips the column buffer entirely
    (removes the 28% im2col share and the 4.9 MB workspace).
 3. Fuse bias + activation (and BN-folded scale) into the GEMM epilogue: saves 2 launches and 2 full passes over the output per conv.
-4. GEMM: reduce shared-memory bank conflicts and registers (122 regs caps occupancy at ~30%), make tf32 the default for large problems (`DARKNET_OXIDE_GEMM=auto`),
+4. GEMM: reduce shared-memory bank conflicts and registers (122 regs caps occupancy at ~30%), make tf32 the default for large problems (`LIGHTNET_OXIDE_GEMM=auto`),
    keep split-K partials in shared/L2 (an atomics-free two-pass reduce already exists; fuse it into the last block).
 5. Small kernels: block-parallel softmax and global avgpool (14% / 7.5% of bandwidth), tiled maxpool 3x3.
 6. ~~fp16 activations and weights pre-packed per layer~~ done (P6, see the fp16 rows); bf16 only has convert kernels. Batched im2col + one GEMM per chunk is done (1.1: b16 9.5 ms, 1.55x faster than C++ cuDNN fp16), bf16 GEMM exists (1.1); still open: 3-stage cp.async pipeline, implicit-GEMM conv.
 
 ## 6. Not done / caveats
 
-* Training-step time (fwd + bwd + SGD) is now measured with a synthetic driver, see section 7; opt-in mixed-precision training (`DARKNET_OXIDE_AMP=1`) is section 7.2 (no convergence run).
+* Training-step time (fwd + bwd + SGD) is now measured with a synthetic driver, see section 7; opt-in mixed-precision training (`LIGHTNET_OXIDE_AMP=1`) is section 7.2 (no convergence run).
 * fp16 (P6) inference: f16 storage for conv / maxpool / route / upsample (the f16 dgrad/wgrad exist only in the AMP training mode, 7.2), f16 shortcut / avgpool / local_avgpool / batch norm / `reverse` upsample were added later (1.1); connected, reorg, softmax, scale_channels, sam, crop and recurrent layers still make the CLI
-  error with `UnsupportedLayer` under `DARKNET_OXIDE_GEMM=fp16`. Accuracy and detection deltas are in `tasks/rust/todo.md` (P6). cuTile is disabled, so no cuTile column.
+  error with `UnsupportedLayer` under `LIGHTNET_OXIDE_GEMM=fp16`. Accuracy and detection deltas are in `tasks/rust/todo.md` (P6). cuTile is disabled, so no cuTile column.
 * Laptop GPU: clocks at benchmark start were idle (210 MHz, boosting to ~3 GHz under load); sustained clocks and thermals vary between runs, so treat differences below ~5% as noise
   (round medians in `results.json` show the spread, e.g. oxide b1 2.18-2.54 ms).
 * % of roofline uses marketing peaks; fp32 sustained clock may be lower than boost.
@@ -175,7 +175,7 @@ Findings:
 
 ## 7. Training step, synthetic (no dataset, no real training; added 2026-10-01)
 
-Driver: `darknet-rs bench-train <cfg> [steps] [warmup]` (env `DARKNET_BACKEND=cpu|oxide`, `DARKNET_BENCH_BATCH`) and the `train` mode of `tools/oxide_bench_cpp.cpp`
+Driver: `lightnet-rs bench-train <cfg> [steps] [warmup]` (env `LIGHTNET_BACKEND=cpu|oxide`, `LIGHTNET_BENCH_BATCH`) and the `train` mode of `tools/oxide_bench_cpp.cpp`
 (`oxide_bench_cpp <cfg> - <batch> <iters> <warmup> 0 train`, batch from the cfg). Random He-initialised weights, random input in [0,1), SGD lr 1e-4, momentum/decay from the
 cfg. LegoGears_v2 (21 convs + BN, 224x160, 2 yolo heads), batch 1 and 16, 20 timed steps after 3 warm-up, 3 interleaved rounds (each side once per round), fp32 everywhere.
 
@@ -209,7 +209,7 @@ GPU kernel time was only ~6 ms/step at batch 1 (of 65) and ~52 ms/step at batch 
 b1 = 200 small H2D + 200 D2H copies per step and 5200 stream syncs / 13 steps; b16 = 3.6 GB of D2H in 13 steps (every layer output + activation cache downloaded
 by the training forward: 1.4 s of cuMemcpyDtoH = 51% of the API time), and per BN layer per step a full host fold of the BN weights + 4 uploads (backward rolling-stat refresh and update).
 
-Fixes (all in `src/darknet-core/src/runtime.rs`, semantics unchanged, GPU-vs-CPU tests untouched):
+Fixes (all in `src/lightnet-core/src/runtime.rs`, semantics unchanged, GPU-vs-CPU tests untouched):
 1. `forward_training_device`: the CLI/bench training forward downloads only the yolo head outputs (what the host loss reads). Networks that need the CPU backward fallback keep the full host copies. `forward_training_with_state` still returns everything.
 2. BN fold on the device: after an update the BN-folded inference weights are `channel_scale(raw_w, gamma/sqrt(var+eps))` on the GPU (same arithmetic as the host fold) instead of download + host fold + upload; only the small bias vector round-trips.
 3. Lazy fold: `folded_stale` flag on the cached device params; the update and the rolling-stat refresh only mark the folded copies stale, the training forward/backward use the raw tensors, and the fold runs the next time an inference forward needs it.
@@ -232,9 +232,9 @@ Next: a fused sanitize+SGD kernel (and a single multi-tensor launch), keep BN ro
 
 ### 7.2 Mixed-precision (AMP) training step (2026-10-01)
 
-Opt-in: `DARKNET_OXIDE_AMP=1` (implies the f16 tensor-core GEMM; default stays f32), `OxideBackend::with_amp(true)`. f32 master weights and f32 optimizer state, f16 working copies
+Opt-in: `LIGHTNET_OXIDE_AMP=1` (implies the f16 tensor-core GEMM; default stays f32), `OxideBackend::with_amp(true)`. f32 master weights and f32 optimizer state, f16 working copies
 of the conv weights (refreshed per update), f16 activations / gradients, f32 accumulation, BN statistics and reductions in f32, f32 weight / bias / BN-scale gradients; conv fwd /
-dgrad / wgrad on the f16 `mma.sync` GEMM; `[net] loss_scale` as before. Ops without an f16 implementation widen to f32 at the boundary (see `src/darknet-cuda-oxide/src/mixed.rs`).
+dgrad / wgrad on the f16 `mma.sync` GEMM; `[net] loss_scale` as before. Ops without an f16 implementation widen to f32 at the boundary (see `src/lightnet-cuda-oxide/src/mixed.rs`).
 Same driver and conditions as section 7 (`bench-train`, LegoGears_v2, 20 steps after 3 warm-up, 3 rounds interleaved f32 / AMP, run back to back, medians of the per-round medians):
 
 | variant | b1 step ms (rounds) | b1 fwd / bwd / update | b16 step ms (rounds) | b16 fwd / bwd / update | peak device MB b1 / b16 |
@@ -245,15 +245,15 @@ Same driver and conditions as section 7 (`bench-train`, LegoGears_v2, 20 steps a
 AMP is 1.3x faster at b16 (bwd 1.43x) and uses 27% less device memory; at b1 it is within noise (launch-bound, see 7.1). Not optimised yet: wgrad launches one GEMM per image
 (K = H*W per launch), dY has an unaligned row pitch (H*W not a multiple of 8) so the dgrad / wgrad GEMMs take the element-loop load path, BN / bias / activation are standalone
 passes, the f32 `[net]` update path is unchanged. The f32 row here (82.7 ms) is the same code as the 76.3 ms "after" row of 7.1 re-measured later (laptop drift, about +8%).
-Accuracy of the mode (no training run, same init / input / seeds, `DARKNET_BENCH_DUMP` = conv weight deltas after 1-3 SGD steps, `lr 1e-3`): with the trained
+Accuracy of the mode (no training run, same init / input / seeds, `LIGHTNET_BENCH_DUMP` = conv weight deltas after 1-3 SGD steps, `lr 1e-3`): with the trained
 `LegoGears_augmatch_best.weights` the head conv delta differs from f32 by 8.8e-4 (max-normalised) and the first conv by 3.9e-2, exactly the profile of the TF32 f32-API mode
 (5.8e-4 / 3.0e-2), i.e. the AMP error is operand rounding that already exists in the compute-only modes, not an AMP-specific loss; with random He init + random
 output deltas (the default synthetic bench, BN gradient explosion) all reduced-precision modes (tf32, fp16 compute, AMP) differ from f32 by 10-30% in the early layers and
-AMP == tf32 there too. Tests: `src/darknet-cuda-oxide/tests/oxide_amp.rs` (per-op vs f64, tiny net gradients and SGD tracking).
+AMP == tf32 there too. Tests: `src/lightnet-cuda-oxide/tests/oxide_amp.rs` (per-op vs f64, tiny net gradients and SGD tracking).
 
 ### 7.3 Training-step host/launch overhead (2026-10-01)
 
-Same driver and conditions as 7.1 (`bench-train`, LegoGears_v2, 20 steps after 3 warm-up, 3 rounds, before/after binaries interleaved per round, oxide f32; AMP rows with `DARKNET_OXIDE_AMP=1`).
+Same driver and conditions as 7.1 (`bench-train`, LegoGears_v2, 20 steps after 3 warm-up, 3 rounds, before/after binaries interleaved per round, oxide f32; AMP rows with `LIGHTNET_OXIDE_AMP=1`).
 Changes (semantics unchanged):
 1. Fused sanitize + SGD / Adam: `sanitized_sgd_update` / `sanitized_adam_update` kernels (reset_nan_and_inf(updates), optional fix_nan_and_inf(weights), the optimizer, and the zeroed updates for Adam) behind the new defaulted trait methods `sanitized_sgd_update_f32` / `sanitized_adam_update_f32` (default = the old composition, so other backends are untouched). 3 launches + 2 temporaries per tensor become 1 launch.
 2. BN gamma and rolling stats live on the device (`GpuConvolutionLayerParams.bn`): the training forward no longer uploads them, the backward stores the device EMA instead of downloading it, `update_gpu_batch_norm_scales` steps the device gamma, and the inference fold is a device kernel (`batchnorm_fold_f32`: scale and folded bias) instead of a host fold + uploads. The deferred path (`update_weights_gpu_deferred`) now also leaves biases, gamma and rolling stats on the device; `sync_host_weights_from_device` (called before every save, dump and by the bench) copies weights, biases, gamma, mean, variance to the host. The first backward after a fresh `update_weights_gpu` (eager) still downloads the rolling stats; `update_weights_gpu` and the CPU-fallback networks keep the old eager host-visible behaviour.
@@ -267,7 +267,7 @@ Changes (semantics unchanged):
 
 b1 is 1.75x faster (now below the C++ cuDNN 15.7 ms of section 7), b16 1.18x (AMP 1.3x; C++ 45.6 ms). The phase split moves because work is no longer forced to complete inside the update (the yolo-head download of the next forward is the sync point), read totals, not phases.
 nsys (13 steps, per step): b1 launches 690 -> 589, cuMemcpyDtoH 80 -> ~2 steady state (121 total over 13 steps: the first eager step plus the head downloads), cuMemcpyHtoD 87 -> ~3 (195 total), stream syncs 167 -> 24, cuMemsetD8 94 -> ~3 steady state (498 total, 459 of them the zero-fill of fresh pool allocations), kernel time unchanged (5.9 ms). b16: 28 067 -> 26 754 launches, DtoH 1040 -> 121, syncs 2166 -> ~300 total.
-Correctness (no training run): `DARKNET_PARITY_DUMP` of biases, BN gamma / BN bias / rolling mean / rolling variance and weights after steps 1 and 5, batch 2, same init / input / seeds (the step is deterministic: two before runs are byte-identical): before vs after files are byte-identical for f32 and for AMP, and the two yolo head outputs are identical. New tests in `oxide_batchnorm_adam.rs`: fused SGD / Adam bit-identical to the separate launches (with NaN / Inf in updates and weights, `fix_weights` on and off), device BN fold vs the host fold (1e-6). All oxide suites pass individually and in the full run, `cargo test -p darknet-core --lib`: 119 passed.
+Correctness (no training run): `LIGHTNET_PARITY_DUMP` of biases, BN gamma / BN bias / rolling mean / rolling variance and weights after steps 1 and 5, batch 2, same init / input / seeds (the step is deterministic: two before runs are byte-identical): before vs after files are byte-identical for f32 and for AMP, and the two yolo head outputs are identical. New tests in `oxide_batchnorm_adam.rs`: fused SGD / Adam bit-identical to the separate launches (with NaN / Inf in updates and weights, `fix_weights` on and off), device BN fold vs the host fold (1e-6). All oxide suites pass individually and in the full run, `cargo test -p lightnet-core --lib`: 119 passed.
 Not done: CUDA graph capture. `cuda-core 0.3.1` only exposes raw `cuStreamBeginCapture` / `cuStreamEndCapture` (no instantiate / launch wrapper), and a replayable graph needs static buffer addresses (the step allocates from the pool, downloads the yolo heads for the host loss between forward and backward, and bakes lr / Adam step into kernel arguments), so it is not a cheap change. Next launch cuts if wanted: one multi-tensor update launch per layer (-40 launches, about 0.5 ms), fold of the gradient accumulation (`saxpy`, 61 launches) into the update kernel, a fused conv bias + BN + activation epilogue. Remaining host cost at b1: 589 launches x ~16 us = 9 ms of the 12 ms step.
 
 ### 7.4 Multi-tensor update, folded gradient accumulation, fused bias + activation (2026-10-01)
@@ -292,7 +292,7 @@ Changes (all bit-exact, only measured wins kept):
 | inference device memory delta b1 / b16 | 18 / 208 MB | 16 / 168 MB |
 
 Inference b1 is launch bound, so the saved launches show (about 0.35 ms); b16 is kernel bound and moves by 1-2%. The f16 inference path already had the fused epilogue and is untouched.
-Correctness (no training run): `DARKNET_PARITY_DUMP` after steps 1 and 5, batch 2, same init / input / seeds / deltas, previous binary vs new binary: biases, BN gamma / bias, rolling mean / variance, weights and both yolo head outputs are byte-identical for SGD (f32 GEMM), AMP and Adam (`adam=1`). Detections of the 80 validation images (`tools/oxide_map.py --save-detections`, fp32): mAP 99.6685%, `oxide_det_compare.py` vs `target/oxide_f16/det_fp32.tsv` 155 matched, 0 unmatched, max score diff 0, min IoU 1. New tests in `oxide_batchnorm_adam.rs`: multi-tensor SGD / Adam (1-3 tensors, with and without pending gradient, NaN / Inf inputs, coupled and decoupled decay) bit-identical to the per-tensor calls, fused bias + activation bit-identical for all nine activations. All oxide suites pass individually and in the full run; `cargo test -p darknet-core --lib`: 125 passed.
+Correctness (no training run): `LIGHTNET_PARITY_DUMP` after steps 1 and 5, batch 2, same init / input / seeds / deltas, previous binary vs new binary: biases, BN gamma / bias, rolling mean / variance, weights and both yolo head outputs are byte-identical for SGD (f32 GEMM), AMP and Adam (`adam=1`). Detections of the 80 validation images (`tools/oxide_map.py --save-detections`, fp32): mAP 99.6685%, `oxide_det_compare.py` vs `target/oxide_f16/det_fp32.tsv` 155 matched, 0 unmatched, max score diff 0, min IoU 1. New tests in `oxide_batchnorm_adam.rs`: multi-tensor SGD / Adam (1-3 tensors, with and without pending gradient, NaN / Inf inputs, coupled and decoupled decay) bit-identical to the per-tensor calls, fused bias + activation bit-identical for all nine activations. All oxide suites pass individually and in the full run; `cargo test -p lightnet-core --lib`: 125 passed.
 Not done: fusing BN apply + activation in the training forward (the backward needs the pre-activation tensor `biased`, so the fused kernel would have to write both outputs, which saves the read but not the launch's second store; BN statistics need their own pass anyway); the conv GEMM epilogue itself (bias + activation inside the f32 GEMM store like the f16 path) was not attempted, the standalone fused pass is already one launch. A subdivision > 1 run was verified only at the kernel level (pending gradient folded in the multi-tensor kernels, flush order by construction), not end to end. CUDA graph capture stays skipped (7.3).
 
 ### 7.5 Batched weight-gradient im2col (2026-10-02)
@@ -312,7 +312,7 @@ Both backward convolutions now run one GEMM per chunk instead of one per image, 
 Changes (semantics unchanged, all suites green):
 1. **dgrad**: instances are `(image, group)` image-major (`count = nb * groups`), so `b` (dy) and `c` (dcol workspace) use plain instance strides; then one col2im per image reads its `col_base = bi * col_len` block of the shared workspace.  The f32 `col2im` kernel gained the `col_base` parameter.  Was `batch` GEMMs, now `ceil(batch/chunk)`.
 2. **wgrad**: one batched GEMM writes per-`(image, group)` partial `dW` into a workspace (`PARTIAL_CAP_BYTES = 64 MB`), then `gemm_splitk_reduce` (with `splits = nb`, `count = groups`) sums the images in fixed order into `dw`; across chunks `dw` accumulates with `beta = 1`.  This replaced `batch` GEMMs plus the `beta = 1` chain.
-3. **implicit forward** (`DARKNET_OXIDE_CONV=implicit`, `kernels/conv_implicit.rs`, `OxideBackend::gemm_conv_implicit`): generates the im2col `B` tile from `x` on the fly, removing the column buffer and the im2col launch.  Correctness is covered by the new `conv_parity_implicit` (all 13 parity cases + finite differences).
+3. **implicit forward** (`LIGHTNET_OXIDE_CONV=implicit`, `kernels/conv_implicit.rs`, `OxideBackend::gemm_conv_implicit`): generates the im2col `B` tile from `x` on the fly, removing the column buffer and the im2col launch.  Correctness is covered by the new `conv_parity_implicit` (all 13 parity cases + finite differences).
 4. **im2col** (`kernels/im2col.rs`): was one thread per column element with ~6 integer divisions each; now one block per column row `(image, c, ky, kx)` (`blocks_of(rows, ...)`) with threads sweeping the output positions, so the row decode is uniform per block and only two divisions remain per element.  nsys (13-step profile): im2col 129.8 -> 106.3 ms (~18% faster).
 5. **f32 GEMM shared loads** (`kernels/gemm.rs`): the inner loop now reads 4 contiguous `k` of `A` and 4 contiguous `n` of `B` per outer step (per-thread column tile `tx*4 .. +3`), which the compiler widens to 128-bit shared loads — 8 FMA per shared load instead of 2.
 6. **buffer-pool auto-size + OOM retry** (`tensor.rs`, `alloc`): see 7.7.
@@ -327,7 +327,7 @@ A/B (release `bench-train`, LegoGears_v2, 30 steps + 5 warm-up, medians; the "be
 | + vectorised GEMM shared loads | 10.63 | **48.99** (-21% vs before) | 972 |
 | implicit forward (opt-in) | – | 57.4-57.7 (+5% vs materialised) | 970 |
 
-Phase attribution shifts because the batched kernel moves the stream sync point, so read the totals.  The implicit forward is slower because the materialised `B` tile is read with 16-byte `cp.async` (`ldb = ohw`, aligned) while the implicit tile can only issue 4-byte scalar copies: the im2col source column is an arbitrary input-column offset and `cp.async` 16-byte requires 16-byte alignment.  It stays behind `DARKNET_OXIDE_CONV=implicit`, is not picked by `Auto`, and did not replace the materialised path.  `DARKNET_OXIDE_CONV=gemm` still selects the (batched) materialised GEMM path.
+Phase attribution shifts because the batched kernel moves the stream sync point, so read the totals.  The implicit forward is slower because the materialised `B` tile is read with 16-byte `cp.async` (`ldb = ohw`, aligned) while the implicit tile can only issue 4-byte scalar copies: the im2col source column is an arbitrary input-column offset and `cp.async` 16-byte requires 16-byte alignment.  It stays behind `LIGHTNET_OXIDE_CONV=implicit`, is not picked by `Auto`, and did not replace the materialised path.  `LIGHTNET_OXIDE_CONV=gemm` still selects the (batched) materialised GEMM path.
 
 ### 7.7 Batch scaling and the buffer-pool cap (2026-10-05)
 
@@ -340,13 +340,13 @@ Phase attribution shifts because the batched kernel moves the stream sync point,
 | 32 | 95.77 | 78.11 | 17.56 | 2.99 | 1596 |
 | 64 | 192.43 | 132.32 | 58.78 | 3.01 | 2564 |
 
-Scales linearly (~3.0 ms/image) from batch 16 up.  The `BufPool` cap used to be a fixed 1 GiB (`DARKNET_OXIDE_POOL_MB` default 1024), chosen in the 2026-10-01 allocator fix for inference where peaks were 18/184 MB.  Once the live+free footprint exceeds the cap the pool cannot keep freed buffers, so every step re-`cuMemAlloc`/`cuMemFree`d the working set: batch 32 measured **125.05 ms** instead of 95.77 (~30% slower), batch 64 similar.  It is now auto-sized when `DARKNET_OXIDE_POOL_MB` is unset: half of the free device memory (`cuMemGetInfo`), capped at 4 GiB, with the 1 GiB fallback if the query fails.  Because a generous cache can then starve a later larger allocation, `alloc_zeroed` now flushes the pool and retries once on OOM (`BufPool::flush`); this was caught by `cfg_shortcut_shapes` and is covered by the full suite.
+Scales linearly (~3.0 ms/image) from batch 16 up.  The `BufPool` cap used to be a fixed 1 GiB (`LIGHTNET_OXIDE_POOL_MB` default 1024), chosen in the 2026-10-01 allocator fix for inference where peaks were 18/184 MB.  Once the live+free footprint exceeds the cap the pool cannot keep freed buffers, so every step re-`cuMemAlloc`/`cuMemFree`d the working set: batch 32 measured **125.05 ms** instead of 95.77 (~30% slower), batch 64 similar.  It is now auto-sized when `LIGHTNET_OXIDE_POOL_MB` is unset: half of the free device memory (`cuMemGetInfo`), capped at 4 GiB, with the 1 GiB fallback if the query fails.  Because a generous cache can then starve a later larger allocation, `alloc_zeroed` now flushes the pool and retries once on OOM (`BufPool::flush`); this was caught by `cfg_shortcut_shapes` and is covered by the full suite.
 
 Correctness: `oxide_conv_parity` (13, incl. `conv_parity_implicit`), `oxide_cfg_shapes` (13), `oxide_runtime_chain` (3), `oxide_layers_extra` (17), `oxide_pool_parity` (9), `oxide_parity` (10), `oxide_gemm_mma` (5), `oxide_grad_methods` (2), `oxide_half` (13), `oxide_runtime_f16` (5), `oxide_amp` (11) and `oxide_batchnorm_adam` (13) all pass.
 
 ### 7.8 fp8 GEMM overhead (2026-10-22)
 
-`gemm_bench_precisions` (`DARKNET_BENCH_MODES=fp32,fp8`), end to end through the GEMM seam, so fp8 includes amax, quantise and temporaries. `prec-lego` is the 21 LegoGears_v2 conv GEMMs; `prec-sq` is 512, 1024 and 2048 cubed.
+`gemm_bench_precisions` (`LIGHTNET_BENCH_MODES=fp32,fp8`), end to end through the GEMM seam, so fp8 includes amax, quantise and temporaries. `prec-lego` is the 21 LegoGears_v2 conv GEMMs; `prec-sq` is 512, 1024 and 2048 cubed.
 
 | Step | `prec-lego` fp8 | `prec-lego` fp32 | `prec-sq` fp8 | `prec-sq` fp32 |
 | --- | --- | --- | --- | --- |
@@ -359,7 +359,7 @@ Correctness: `oxide_conv_parity` (13, incl. `conv_parity_implicit`), `oxide_cfg_
 
 ## Gradient-method shootout (2026-10-01)
 
-Harness: `src/darknet-cuda-oxide/tests/oxide_grad_methods.rs` (`grad_method_shootout`, ignored; a tiny-shape version of the same
+Harness: `src/lightnet-cuda-oxide/tests/oxide_grad_methods.rs` (`grad_method_shootout`, ignored; a tiny-shape version of the same
 cases runs in the normal suite). RTX 4060 Laptop, debug-profile test binary (kernels are the same), no training runs.
 Per cell: median over 5 interleaved rounds of the mean device time (CUDA events, `time_gpu_ms`, launch gaps included) of one
 full gradient `dL/dx` for `L = sum(dy * f(x))`; error = max abs difference to an independent f64 host reference.
@@ -392,16 +392,16 @@ launch bound, vs 1.4-78 ms), is exact to f32 round-off (<= 2.3e-6) while FD is a
 with n (n+1 or 2n forwards, each ~5 launches here) while analytical stays one or two launches. The smallest FD case (bias, 16 inputs) is the closest at 48x. FD stays selectable only as a verification tool (the tests above), never as a default. The C++
 softmax shortcut is a plain copy and the same speed as the exact Jacobian kernel (0.029 vs 0.036 ms at n=64, 0.030 vs 0.030 at 512),
 so there is no speed reason for it; it exists only for training parity with a cost layer that already folds the Jacobian in
-(`DARKNET_GRAD_MODE=cpp`, default `analytical`).
+(`LIGHTNET_GRAD_MODE=cpp`, default `analytical`).
 
 ## 8. Short GPU training parity (LegoGears_v2, 2026-10-01; 20 SGD steps, no convergence run)
 
 User-approved short run (exception to the no-training-runs rule). Same init weights (`LegoGears_augmatch_best.weights`), same 2 fixed training images (224x160 PNGs, no augmentation, 4 + 2 labels), batch 2,
 subdivisions 1, constant lr 0.00261 (cfg value, burn-in and policy bypassed), momentum 0.9 / decay 0.0005 from the cfg, SGD. Data generated by `tools/oxide_parity_data.py`
 (cfg copy with `batch=2`, `input.bin`, `labels.txt`, `truth.bin`, fixed random yolo deltas in [-0.05, 0.05)).
-Tools: `darknet-rs bench-train` with `DARKNET_BENCH_WEIGHTS / _INPUT / _LABELS / _DELTAS`, `DARKNET_PARITY_DUMP=<prefix>`, `DARKNET_PARITY_STEPS=0,1,5,20` (dumps conv biases / BN scales / rolling stats / weights),
+Tools: `lightnet-rs bench-train` with `LIGHTNET_BENCH_WEIGHTS / _INPUT / _LABELS / _DELTAS`, `LIGHTNET_PARITY_DUMP=<prefix>`, `LIGHTNET_PARITY_STEPS=0,1,5,20` (dumps conv biases / BN scales / rolling stats / weights),
 `oxide_bench_cpp <cfg> <weights> 0 0 0 0 parity <input> <truth> <steps> <lr> <dump prefix> <steps csv> [delta prefix]`, comparison `tools/oxide_parity_compare.py <A> <B> <step>`.
-Variants: oxide f32 (`DARKNET_OXIDE_GEMM=fp32`), oxide tf32, oxide AMP (`DARKNET_OXIDE_AMP=1`), Rust CPU (5 steps only, ~26 s/step at b2), C++ CUDA (`train_network_datum_gpu`, cudnn_half=1, BN not fused = batch statistics).
+Variants: oxide f32 (`LIGHTNET_OXIDE_GEMM=fp32`), oxide tf32, oxide AMP (`LIGHTNET_OXIDE_AMP=1`), Rust CPU (5 steps only, ~26 s/step at b2), C++ CUDA (`train_network_datum_gpu`, cudnn_half=1, BN not fused = batch statistics).
 
 ### 8.1 Real loss: not comparable (finding; superseded by 8.6 after the yolo fixes)
 A first run used the real yolo loss on both sides (Rust `compute_yolo_training_loss_with_state` vs C++ `forward_yolo_layer`). Step 1 on the same weights/input: Rust loss 70.78 vs C++ cost 0.191 (different
@@ -460,7 +460,7 @@ Per-step loss trajectory: with fixed deltas the loss is not defined; the first-o
 ### 8.3 BN rolling statistics: do they follow? Partly, with a real mismatch (diagnosed statically, not fixed)
 The oxide batch-statistics BN training forward matches C++ (same step-1 forward, same deltas). The rolling mean / variance DO follow the batch statistics, but the update is 10x too fast:
 the delta of the rolling mean / variance after step 1 is exactly 10.00x the C++ one in every layer (norm ratio 9.996-10.007 / 9.999-10.002), and oxide/10 matches C++ to 2.0e-3 (mean) / 4.0e-4 (var) relL2.
-Cause: `BATCH_NORM_ROLLING_KEEP = 0.9` in `src/darknet-core/src/runtime.rs` (EMA keep factor, comment says it mirrors the host updates), whereas C++ conv+BN uses 0.99 / 0.01
+Cause: `BATCH_NORM_ROLLING_KEEP = 0.9` in `src/lightnet-core/src/runtime.rs` (EMA keep factor, comment says it mirrors the host updates), whereas C++ conv+BN uses 0.99 / 0.01
 (`scal_ongpu(.99)` in `batchnorm_layer.cpp`, cuDNN factor `.01` in `convolutional_kernels.cu`). The Rust CPU path uses the same 0.9 (CPU/oxide rolling-delta ratio 1.0 in the first layers). Consequence: weights files saved after Rust
 training carry rolling stats that track the last ~10 batches instead of ~100, which changes inference of a short-trained net (noisier) but not training. Fixed afterwards (2026-10-01): GPU path keep factor 0.99 (host/CPU path keeps 0.9, which is what C++ `forward_batchnorm_layer` on the CPU does), pin test `batch_norm_rolling_keep_matches_cpp`; see `tasks/rust/todo.md` P8 follow-up.
 (The "bn_bias" dump column is irrelevant: Rust keeps the BN beta in the conv bias, the BN-struct beta is unused.)
@@ -481,7 +481,7 @@ Not done: loss-trajectory parity (needs 2), >20 steps, C++ fp32 reference, batch
 
 Fixes since 8.1/8.3: no `(2-w*h)` scale on iou-kind box deltas, GPU BN rolling keep 0.99, Rust loss output = C++ `cost` (`train.rs` `yolo_head_cost`: per head `iou_normalizer*mean(1-iou)` [giou kind: `1-giou`; MSE kind: `||delta||^2`]
 `+ obj_normalizer*||delta without the 4 box channels||^2`, mean over yolo heads like `get_network_cost`; `YoloTrainingLoss` also carries `avg_iou`/`box_count`; deltas unchanged), `scale_x_y` now applied to x,y with `new_coords` as in C++.
-Same data / commands as section 8 (data regenerated with `tools/oxide_parity_data.py`; release `darknet-rs` rebuilt; one run each: oxide f32 20 steps, Rust CPU 5 steps, C++ CUDA 20 steps; synthetic-delta oxide f32 rerun, the C++ synthetic dump is unchanged).
+Same data / commands as section 8 (data regenerated with `tools/oxide_parity_data.py`; release `lightnet-rs` rebuilt; one run each: oxide f32 20 steps, Rust CPU 5 steps, C++ CUDA 20 steps; synthetic-delta oxide f32 rerun, the C++ synthetic dump is unchanged).
 
 Real loss (printed `cost` / yolo delta L2), oxide f32 vs C++ (before the fixes: 70.78 vs 0.191 and 8.41 vs 4.25):
 
@@ -512,34 +512,34 @@ Reading. (1) Rolling-stat delta ratio is 1.000 at steps 1 and 5 (was 10.00x befo
 (1.4e-2 / 1.8e-2), i.e. the previous "uncorrelated, relL2 ~1" of 8.1 was entirely the yolo delta scale/definition. (3) At step 20 the real-loss run diverges more (mean 0.23 vs 0.08 synthetic): with a real loss the deltas depend on the
 weights, so the ~1e-2 fp16-vs-fp32 differences feed back (C++ uses cuDNN fp16 conv, oxide f32); same chaotic amplification as before, now also visible in the loss (steps 8-19 differ by up to 8%), not a systematic bias (step-1 loss and delta L2 agree to 1e-3 / 4e-6).
 (4) Rust CPU remains different on purpose of the older design: its conv+BN training forward uses the ROLLING stats (8.4) so weights/loss differ from C++ from step 1 (loss 0.079 vs 0.191), and its rolling EMA keeps 0.9, which is what the C++ CPU path does (ratio 10x vs the C++ GPU 0.99 is therefore expected).
-Update (2026-10-01, static, no run): the formerly remaining differences #3 (iou_thresh extra anchors of another head) and #4 (best-anchor search over all `num` anchors instead of the head masks) are now ported to the C++ behaviour, as are the `delta_normalizer` scaling, the bad-label/equidistant filter order (`ep_loss_threshold` from the pre-update rolling average) and the new_coords inference decode (`detect.rs`: no sigmoid on x/y/objectness/class). None is active in the LegoGears parity cfg (iou_thresh=1, partitioned masks, no new_coords, default delta_normalizer), so the step-1 numbers above are unchanged; `cargo test -p darknet-core --lib` 125 passed. Still open: adversarial branch, `rewritten_bbox`/`total_bbox`/`labels` counters (see todo table).
+Update (2026-10-01, static, no run): the formerly remaining differences #3 (iou_thresh extra anchors of another head) and #4 (best-anchor search over all `num` anchors instead of the head masks) are now ported to the C++ behaviour, as are the `delta_normalizer` scaling, the bad-label/equidistant filter order (`ep_loss_threshold` from the pre-update rolling average) and the new_coords inference decode (`detect.rs`: no sigmoid on x/y/objectness/class). None is active in the LegoGears parity cfg (iou_thresh=1, partitioned masks, no new_coords, default delta_normalizer), so the step-1 numbers above are unchanged; `cargo test -p lightnet-core --lib` 125 passed. Still open: adversarial branch, `rewritten_bbox`/`total_bbox`/`labels` counters (see todo table).
 The residual 6e-4 on the step-1 loss is the fp16 (C++ cudnn_half) vs f32 forward. Not run: oxide AMP/tf32 real-loss, >20 steps, multiple images.
 
 ## Reproduce
 
 ```
-RUSTUP_TOOLCHAIN=nightly-2026-08-28 target/debug/cargo-oxide oxide build -- --release -p darknet-cli --features oxide -j 1   # darknet-rs for e2e
+RUSTUP_TOOLCHAIN=nightly-2026-08-28 target/debug/cargo-oxide oxide build -- --release -p lightnet-cli --features oxide -j 1   # lightnet-rs for e2e
 python3 tools/oxide_bench.py --suites micro,conv --rounds 7 --out target/oxide_bench/micro_conv
 python3 tools/oxide_bench.py --suites e2e --rounds 5 --iters 100 --out target/oxide_bench/e2e   # variants incl. oxide-fp16
 # synthetic training step (section 7)
-DARKNET_BACKEND=oxide DARKNET_BENCH_BATCH=16 target/release/darknet-rs bench-train ../datasets/LegoGears_v2/LegoGears_v2.cfg 20 3
-DARKNET_OXIDE_AMP=1 DARKNET_BACKEND=oxide DARKNET_BENCH_BATCH=16 target/release/darknet-rs bench-train ../datasets/LegoGears_v2/LegoGears_v2.cfg 20 3   # AMP (7.2); DARKNET_BENCH_DUMP=<file> / _WEIGHTS / _LR for A/B of weight deltas
+LIGHTNET_BACKEND=oxide LIGHTNET_BENCH_BATCH=16 target/release/lightnet-rs bench-train ../datasets/LegoGears_v2/LegoGears_v2.cfg 20 3
+LIGHTNET_OXIDE_AMP=1 LIGHTNET_BACKEND=oxide LIGHTNET_BENCH_BATCH=16 target/release/lightnet-rs bench-train ../datasets/LegoGears_v2/LegoGears_v2.cfg 20 3   # AMP (7.2); LIGHTNET_BENCH_DUMP=<file> / _WEIGHTS / _LR for A/B of weight deltas
 target/oxide_bench/oxide_bench_cpp_train ../datasets/LegoGears_v2/LegoGears_v2.cfg - 16 20 3 0 train   # g++ command as in tools/oxide_bench.py ensure_cpp_probe, source tools/oxide_bench_cpp.cpp
 # gradient-method shootout
-RUSTUP_TOOLCHAIN=nightly-2026-08-28 target/debug/cargo-oxide oxide test -- --manifest-path src/darknet-cuda-oxide/Cargo.toml -j 2 --test oxide_grad_methods -- --ignored --nocapture --test-threads=1
+RUSTUP_TOOLCHAIN=nightly-2026-08-28 target/debug/cargo-oxide oxide test -- --manifest-path src/lightnet-cuda-oxide/Cargo.toml -j 2 --test oxide_grad_methods -- --ignored --nocapture --test-threads=1
 # profiles
-DARKNET_BACKEND=oxide DARKNET_BENCH_ITERS=30 nsys profile --stats=false -o nsys target/release/darknet-rs detect-image <cfg> <weights> <names> <png> 0.25 0.45 resize-exact
+LIGHTNET_BACKEND=oxide LIGHTNET_BENCH_ITERS=30 nsys profile --stats=false -o nsys target/release/lightnet-rs detect-image <cfg> <weights> <names> <png> 0.25 0.45 resize-exact
 nsys stats -r cuda_gpu_kern_sum nsys.nsys-rep
 ```
 
 ## 9. P9 convergence run (LegoGears_v2, 3000 iterations, 2026-10-02)
 
-Same cfg (batch 16, subdivisions 1, max_batches 3000, burn_in 1000, steps 2400/2700) and the same init weights (`LegoGears_augmatch_best.weights`) for all three runs, each `-clear -seed 42` (C++ `-clear`), isolated backup dirs, the same 80 train / 80 valid images, mAP at conf 0.005 / IoU 0.5 (`-map` in the Rust CLI, `detector map` for C++). Training ran with `DARKNET_BACKEND=oxide`; C++ is the CUDA build (`build/src-cli/darknet`, cuDNN half ENABLED).
+Same cfg (batch 16, subdivisions 1, max_batches 3000, burn_in 1000, steps 2400/2700) and the same init weights (`LegoGears_augmatch_best.weights`) for all three runs, each `-clear -seed 42` (C++ `-clear`), isolated backup dirs, the same 80 train / 80 valid images, mAP at conf 0.005 / IoU 0.5 (`-map` in the Rust CLI, `detector map` for C++). Training ran with `LIGHTNET_BACKEND=oxide`; C++ is the CUDA build (`build/src-cli/darknet`, cuDNN half ENABLED).
 
 | run | build | median step | last loss | final mAP@0.50 |
 | --- | --- | --- | --- | --- |
 | oxide f32 | debug | 129.1 ms | 0.0296 | 100.0000% |
-| oxide AMP (`DARKNET_OXIDE_AMP=1`) | debug | 113.0 ms | 0.0319 | 100.0000% |
+| oxide AMP (`LIGHTNET_OXIDE_AMP=1`) | debug | 113.0 ms | 0.0319 | 100.0000% |
 | C++ CUDA (cudnn_half=1) | build/src-cli/darknet | ~40-50 ms train + ~10 ms load | 0.019 | 100.0000% |
 
 Acceptance ("final mAP within ~0.5 mAP") is satisfied: every run reaches 100.0000% mAP@0.50 with all five per-class APs at 100.00. Data order and augmentation RNG are not bit-identical to C++ (deterministic SplitMix64 vs C++ `std::random`; the augmentation geometry/HSV path is validated to 1 LSB against OpenCV), so the loss curves differ in detail (oxide average loss ~0.041 vs C++ ~0.021, both decreasing and ending near zero); the final mAP is identical at the resolution this 80-image set provides.
@@ -559,9 +559,9 @@ Deferred from the "go full" scope in this pass (documented in `tasks/rust/todo.m
 | bf16 AMP (`-bf16`) | 46.0 ms | 138.6 s, 138.6 s (2 runs) | 0.0524 | 99.63% (99.63%) | 0.9935 |
 | fp16 AMP (`-fp16`) | 67.5 ms | 208.8 s (1 run) | 0.0525 | 99.63% (99.63%) | 0.9902 |
 
-fp8 is 3.0% faster than fp32 (142.5 s against 146.9 s, mean of the runs) and bf16 5.7% faster; fp16 AMP is 38% slower than fp32 (not profiled; bf16 runs the same kernels without loss scaling and its step is 32% faster than fp16, so loss scaling is a candidate cost). The fp32 step moves with the laptop state (53.4 ms in an earlier session, 48.9 ms in this one), so only same-session numbers are compared. Earlier fp8 variants, same protocol: v0.2.170 57.0 ms / 171.5 s; v0.2.171 byte im2col 50.5 ms / 153.7 s (other session); v0.2.172 e4m3 gradients 47.4 ms / 142.8 s and 143.0 s, mAP 99.55%, F1 0.9902; `DARKNET_OXIDE_GEMM_BWD=fp8` before the v0.2.177 wiring fix (wgrad fed `dy` as e4m3 and the column as e5m2, no byte column) 51.0 ms / 153.1 s, mAP 99.55%, F1 0.9935. `bench-train` (batch 16, 30 steps, 5 interleaved rounds, medians): fp32 50.9 ms, fp8 49.0 ms (v0.2.172), bf16 47.1 ms.
+fp8 is 3.0% faster than fp32 (142.5 s against 146.9 s, mean of the runs) and bf16 5.7% faster; fp16 AMP is 38% slower than fp32 (not profiled; bf16 runs the same kernels without loss scaling and its step is 32% faster than fp16, so loss scaling is a candidate cost). The fp32 step moves with the laptop state (53.4 ms in an earlier session, 48.9 ms in this one), so only same-session numbers are compared. Earlier fp8 variants, same protocol: v0.2.170 57.0 ms / 171.5 s; v0.2.171 byte im2col 50.5 ms / 153.7 s (other session); v0.2.172 e4m3 gradients 47.4 ms / 142.8 s and 143.0 s, mAP 99.55%, F1 0.9902; `LIGHTNET_OXIDE_GEMM_BWD=fp8` before the v0.2.177 wiring fix (wgrad fed `dy` as e4m3 and the column as e5m2, no byte column) 51.0 ms / 153.1 s, mAP 99.55%, F1 0.9935. `bench-train` (batch 16, 30 steps, 5 interleaved rounds, medians): fp32 50.9 ms, fp8 49.0 ms (v0.2.172), bf16 47.1 ms.
 
-v0.2.178 adds opt-in delayed fp8 scaling (`DARKNET_OXIDE_FP8_SCALING=delayed`): the activation quantiser takes its factor from a 16-call amax history and does one pass instead of two. The rows above use the default current scaling; delayed has no training measurement yet.
+v0.2.178 adds opt-in delayed fp8 scaling (`LIGHTNET_OXIDE_FP8_SCALING=delayed`): the activation quantiser takes its factor from a 16-call amax history and does one pass instead of two. The rows above use the default current scaling; delayed has no training measurement yet.
 
 Accuracy against `results/chart_fp8_optimize_yolo_gpu.png` (mAP 99.39%, best 99.48%, F1 0.9935, loss 0.0718) and the goal's targets (mAP >= 99.0%, F1 >= 0.99, loss within 10% of fp32): every run meets all three. fp8 has the highest mAP (99.80%) and a final loss 3% below fp32. Its F1 is 0.9902 against the chart's 0.9935: at confidence 0.25 it has TP 152, FP 3, FN 0, fp32 and bf16 have FP 2; fp16 AMP also lands on 0.9902. That is one false positive out of 155 detections on an 80-image validation set, not a measurable accuracy difference, and the recipe was not tuned to it.
 

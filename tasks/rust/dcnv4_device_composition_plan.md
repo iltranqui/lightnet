@@ -19,16 +19,16 @@ complete GPU layer. Hand-derived from source, no compiled-C++ golden.
 
 ## Files
 
-- `src/darknet-cuda/src/host_ops/dcnv4.rs`: correct active-point count and
+- `src/lightnet-cuda/src/host_ops/dcnv4.rs`: correct active-point count and
   eight-aligned row width, checked composition descriptor.
-- `src/darknet-cuda-oxide/src/kernels/dcnv4.rs`: correct aggregation packing.
-- `src/darknet-cuda-oxide/src/kernels/dcnv4_projection.rs`: native coarse
+- `src/lightnet-cuda-oxide/src/kernels/dcnv4.rs`: correct aggregation packing.
+- `src/lightnet-cuda-oxide/src/kernels/dcnv4_projection.rs`: native coarse
   predictor, upsample, and their adjoints; register in `kernels/mod.rs`.
-- `src/darknet-cuda-oxide/src/dcnv4_native.rs`: checked native composition
+- `src/lightnet-cuda-oxide/src/dcnv4_native.rs`: checked native composition
   entry points/types; module load/export registration in `src/lib.rs`.
-- `src/darknet-cuda-oxide/tests/oxide_dcnv4_aggregate.rs`: retain and strengthen
+- `src/lightnet-cuda-oxide/tests/oxide_dcnv4_aggregate.rs`: retain and strengthen
   aggregation/FD tests for actual packed rows.
-- `src/darknet-cuda-oxide/tests/oxide_dcnv4_chain.rs`: real CPU output/gradient
+- `src/lightnet-cuda-oxide/tests/oxide_dcnv4_chain.rs`: real CPU output/gradient
   oracle, including groups, remove_center, softmax, coarse/odd grids and dilation.
 - Rust handoff documents and `version-map.tsv`: evidence and open wiring gates.
 
