@@ -43,7 +43,7 @@ Whole-repo map: [CONTEXT.md](CONTEXT.md).
 | `cargo xtask clippy [pkg...]` | `l` | `cargo clippy` (default: `darknet-cli`, `darknet-core`) |
 | `cargo xtask test [filter...]` | `t`, `host` | host tests, same as `tools/test_host.sh` (`PKGS` overrides the packages) |
 | `cargo xtask oxide [args...]` | `o` | `tools/test_oxide.sh` (GPU tests; args pass through) |
-| `cargo xtask train_legogears [-fp8\|-fp16\|-bf16] [weights] [flags...]` | `train`, `tr` | `tools/train_legogears_oxide.sh`: release oxide build, then LegoGears_v2 training. `-fp8` sets `DARKNET_OXIDE_GEMM=fp8` and `DARKNET_OXIDE_GEMM_BWD=fp8` (e5m2 gradients), `-fp16` sets `DARKNET_OXIDE_AMP=1` (mixed precision) and adds `-dyn_scale -loss_scale 1024` unless supplied; `-bf16` sets `DARKNET_OXIDE_AMP=bf16` (no loss scaling). Default is fp32 |
+| `cargo xtask train_legogears [-fp8\|-fp16\|-bf16\|-fp8 -fp16\|-fp8 -bf16] [weights] [flags...]` | `train`, `tr` | `tools/train_legogears_oxide.sh`: release oxide build, then LegoGears_v2 training. `-fp8` sets `DARKNET_OXIDE_GEMM=fp8` and `DARKNET_OXIDE_GEMM_BWD=fp8` (e5m2 gradients), `-fp16` sets `DARKNET_OXIDE_AMP=1` (mixed precision) and adds `-dyn_scale -loss_scale 1024` unless supplied; `-bf16` sets `DARKNET_OXIDE_AMP=bf16` (no loss scaling). Plain `-fp8` keeps f32 storage; `-fp8 -fp16` and `-fp8 -bf16` (either order) set both groups, i.e. fp8 convolution GEMMs on 16-bit activation storage, with the `-fp16` scaler rule. Default is fp32 |
 | `cargo xtask fmt` | `f` | `cargo fmt --all` |
 
 Every command exports the detected GPU arch as the advisory `CUDA_OXIDE_DEVICE_ARCH` (unless `CUDA_OXIDE_TARGET` or `CUDA_OXIDE_DEVICE_ARCH` is already set).

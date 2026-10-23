@@ -17,10 +17,12 @@ usage: cargo xtask <cmd> [args...]
   clippy|l [pkg...]     cargo clippy (default: darknet-cli darknet-core)
   test|host|t [filter...]  host tests, same as tools/test_host.sh (PKGS overrides)
   oxide|o [args...]     ./tools/test_oxide.sh (GPU tests; args pass through)
-  train_legogears|train|tr [-fp8|-fp16|-bf16] [w] [flags]
-                        -fp8: DARKNET_OXIDE_GEMM=fp8 and DARKNET_OXIDE_GEMM_BWD=fp8; -fp16: DARKNET_OXIDE_AMP=1
+  train_legogears|train|tr [-fp8|-fp16|-bf16|-fp8 -fp16|-fp8 -bf16] [w] [flags]
+                        -fp8: DARKNET_OXIDE_GEMM=fp8 and DARKNET_OXIDE_GEMM_BWD=fp8 (f32 storage); -fp16: DARKNET_OXIDE_AMP=1
                         (-fp16 adds -dyn_scale and -loss_scale 1024 unless supplied)
                         -bf16: DARKNET_OXIDE_AMP=bf16, no loss scaling
+                        -fp8 -fp16 / -fp8 -bf16: fp8 convolution GEMMs on 16-bit activation
+                        storage (both env sets above; the -fp16 scaler rule applies)
                         train LegoGears_v2 on oxide (./tools/train_legogears_oxide.sh;
                         optional initial.weights, extra flags pass to `detector train`)
   fmt|f                 cargo fmt --all
@@ -210,55 +212,66 @@ fn detected_gpu_arch() -> Option<String> {
     (!cap.is_empty()).then(|| format!("sm_{cap}"))
 }
 
-/// Pulls the precision flag (`-fp8`, `-fp16`, `-bf16`, also with `--`) out of the
-/// `train_legogears` args and maps it to the oxide backend's env switches.
+/// Pulls the precision flags (`-fp8`, `-fp16`, `-bf16`, also with `--`) out of the
+/// `train_legogears` args and maps them to the oxide backend's env switches.
+/// One flag, or `-fp8` together with one 16-bit flag (`-fp8 -fp16`, `-fp8 -bf16`:
+/// fp8 convolutions on 16-bit activation storage); anything else is an error.
 /// Everything else passes through to the training script.
 type PrecisionEnv = Result<(Vec<String>, Vec<(&'static str, &'static str)>, Vec<String>), String>;
 
 fn precision_env(args: &[String]) -> PrecisionEnv {
     let mut rest = Vec::new();
+    let mut fp8 = false;
+    let mut half: Option<&str> = None;
+    for a in args {
+        match a.as_str() {
+            "-fp8" | "--fp8" => {
+                if fp8 {
+                    return Err("-fp8 given twice".into());
+                }
+                fp8 = true;
+            }
+            flag @ ("-fp16" | "--fp16" | "-bf16" | "--bf16") => {
+                let name = if flag.ends_with("fp16") { "fp16" } else { "bf16" };
+                if let Some(prev) = half {
+                    return Err(format!(
+                        "one 16-bit precision flag only (got {prev} and {name})"
+                    ));
+                }
+                half = Some(name);
+            }
+            _ => rest.push(a.clone()),
+        }
+    }
     let mut vars = Vec::new();
     let mut extra = Vec::new();
-    let mut seen: Option<&str> = None;
-    for a in args {
-        let name = match a.as_str() {
-            "-fp8" | "--fp8" => "fp8",
-            "-fp16" | "--fp16" => "fp16",
-            "-bf16" | "--bf16" => "bf16",
-            _ => {
-                rest.push(a.clone());
-                continue;
+    if fp8 {
+        // e4m3 forward, e5m2 for the incoming gradient (the C++ recipe).  Alone this
+        // keeps f32 storage; with a 16-bit flag the conv GEMMs run fp8 on 16-bit
+        // activations (`mixed.rs` keeps the fp8 GEMM mode under AMP).
+        vars.push(("DARKNET_OXIDE_GEMM", "fp8"));
+        vars.push(("DARKNET_OXIDE_GEMM_BWD", "fp8"));
+    }
+    match half {
+        // AMP also selects the f16 tensor-core GEMM (unless fp8 was asked for).
+        Some("fp16") => {
+            vars.push(("DARKNET_OXIDE_AMP", "1"));
+            if !args
+                .iter()
+                .any(|arg| arg == "-dyn_scale" || arg == "--dyn_scale")
+            {
+                extra.push("-dyn_scale".to_owned());
             }
-        };
-        if let Some(prev) = seen {
-            return Err(format!("one precision flag only (got {prev} and {name})"));
+            if !args
+                .iter()
+                .any(|arg| arg == "-loss_scale" || arg == "--loss_scale")
+            {
+                extra.extend(["-loss_scale".to_owned(), "1024".to_owned()]);
+            }
         }
-        seen = Some(name);
-        match name {
-            // e4m3 forward, e5m2 for the incoming gradient (the C++ recipe).
-            "fp8" => {
-                vars.push(("DARKNET_OXIDE_GEMM", "fp8"));
-                vars.push(("DARKNET_OXIDE_GEMM_BWD", "fp8"));
-            }
-            // AMP also selects the f16 tensor-core GEMM.
-            "fp16" => {
-                vars.push(("DARKNET_OXIDE_AMP", "1"));
-                if !args
-                    .iter()
-                    .any(|arg| arg == "-dyn_scale" || arg == "--dyn_scale")
-                {
-                    extra.push("-dyn_scale".to_owned());
-                }
-                if !args
-                    .iter()
-                    .any(|arg| arg == "-loss_scale" || arg == "--loss_scale")
-                {
-                    extra.extend(["-loss_scale".to_owned(), "1024".to_owned()]);
-                }
-            }
-            // bf16 has the f32 exponent range, so no loss scaling flags.
-            _ => vars.push(("DARKNET_OXIDE_AMP", "bf16")),
-        }
+        // bf16 has the f32 exponent range, so no loss scaling flags.
+        Some(_) => vars.push(("DARKNET_OXIDE_AMP", "bf16")),
+        None => {}
     }
     Ok((rest, vars, extra))
 }
@@ -322,5 +335,57 @@ mod tests {
             [("DARKNET_OXIDE_GEMM", "fp8"), ("DARKNET_OXIDE_GEMM_BWD", "fp8")]
         );
         assert!(extra.is_empty());
+    }
+
+    #[test]
+    fn fp8_with_fp16_sets_amp_and_fp8_gemm_and_scaler_flags() {
+        for order in [["-fp8", "-fp16"], ["-fp16", "-fp8"]] {
+            let (rest, vars, extra) = precision_env(&args(&order)).unwrap();
+
+            assert!(rest.is_empty());
+            assert!(vars.contains(&("DARKNET_OXIDE_GEMM", "fp8")), "{order:?}");
+            assert!(vars.contains(&("DARKNET_OXIDE_GEMM_BWD", "fp8")), "{order:?}");
+            assert!(vars.contains(&("DARKNET_OXIDE_AMP", "1")), "{order:?}");
+            assert_eq!(vars.len(), 3, "{order:?}");
+            assert_eq!(extra, ["-dyn_scale", "-loss_scale", "1024"], "{order:?}");
+        }
+    }
+
+    #[test]
+    fn fp8_with_fp16_respects_user_loss_scale() {
+        let (rest, _, extra) =
+            precision_env(&args(&["-fp8", "-fp16", "-loss_scale", "256"])).unwrap();
+
+        assert_eq!(rest, ["-loss_scale", "256"]);
+        assert_eq!(extra, ["-dyn_scale"]);
+    }
+
+    #[test]
+    fn fp8_with_bf16_sets_amp_bf16_and_fp8_gemm_without_scaler_flags() {
+        for order in [["-fp8", "-bf16"], ["--bf16", "--fp8"]] {
+            let (rest, vars, extra) = precision_env(&args(&order)).unwrap();
+
+            assert!(rest.is_empty());
+            assert!(vars.contains(&("DARKNET_OXIDE_GEMM", "fp8")), "{order:?}");
+            assert!(vars.contains(&("DARKNET_OXIDE_GEMM_BWD", "fp8")), "{order:?}");
+            assert!(vars.contains(&("DARKNET_OXIDE_AMP", "bf16")), "{order:?}");
+            assert_eq!(vars.len(), 3, "{order:?}");
+            assert!(extra.is_empty(), "{order:?}");
+        }
+    }
+
+    #[test]
+    fn plain_fp8_keeps_f32_storage() {
+        let (_, vars, _) = precision_env(&args(&["-fp8"])).unwrap();
+
+        assert!(vars.iter().all(|(k, _)| *k != "DARKNET_OXIDE_AMP"));
+    }
+
+    #[test]
+    fn repeated_or_conflicting_16_bit_flags_are_rejected() {
+        assert!(precision_env(&args(&["-fp8", "-fp16", "-bf16"])).is_err());
+        assert!(precision_env(&args(&["-fp8", "-fp8"])).is_err());
+        assert!(precision_env(&args(&["-fp16", "-fp16"])).is_err());
+        assert!(precision_env(&args(&["-bf16", "-fp16", "-fp8"])).is_err());
     }
 }
