@@ -238,6 +238,7 @@ Open issues:
 - **LegoGears kernel time.** Before Task 5 the fp8 kernel only matched fp32 on the 21 shapes (ratio 1.00); after `v0.2.186` it is 0.72-0.75 of fp32. End-to-end `prec-lego` is still overhead-bound, about 1.7 ms against 1.0 ms (see [LegoGears conv shapes](#legogears-conv-shapes)).
 - **Local-memory spill removed, no speed gain.** Root cause was `fp8_stage16` taking `&mut` register arrays and a runtime-indexed `dst[j / 4]` (see [Kernel experiment log](#kernel-experiment-log)). Both fixes were reverted because kernel time did not improve.
 - **Profile covered one launch only.** The ncu run used the 1024^3 launch (grid 256), not 2048^3.
+- **Delayed history keyed on a recycled device pointer (open, not fixed).** `fp8_quantize_delayed` keys the amax history on (source device pointer, length, format). The buffer pool recycles device buffers, so two unrelated tensors of the same length can share a key and the second inherits the first one's history (a stale scale, covered by saturation but not by accuracy). Found in the codex review after `v0.2.187`; the fixes `v0.2.188` to `v0.2.190` (stale-tail amax, non-finite propagation, tiny-amax factor clamp; `implemented.md` §252) do not touch it. Options when it is taken up: key on a call-site id instead of the pointer, or invalidate on pool reuse.
 - **Codex review ran against an edited file.** It read `gemm_f8.rs` while the padding experiment was applied, so some line references may be off.
 
 ## Open issues (repo-wide)
