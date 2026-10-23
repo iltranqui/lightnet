@@ -147,3 +147,47 @@ fn gemm_bench_low_precision_kernels() {
         );
     }
 }
+
+/// Kernel-only fp32 vs fp8-mma over the 21 LegoGears_v2 conv GEMMs (`LEGO`),
+/// operands pre-quantised as in `gemm_bench_low_precision_kernels`.  Separates
+/// kernel time from the quantise / allocation overhead that `gemm_bench_precisions`
+/// includes.
+#[test]
+#[ignore]
+fn gemm_bench_low_precision_lego_kernels() {
+    use darknet_cuda_oxide::fp8::{f32_to_fp8, Fp8Format};
+    let rounds: usize = std::env::var("DARKNET_BENCH_ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    let be = OxideBackend::new().unwrap();
+    let (mut tot32, mut tot8) = (0.0f64, 0.0f64);
+    for &(m, n, k) in LEGO.iter() {
+        let a: Vec<f32> = (0..m * k).map(|i| ((i * 7 % 13) as f32 - 6.0) / 8.0).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i * 5 % 11) as f32 - 5.0) / 8.0).collect();
+        let aq: Vec<u8> = a.iter().map(|v| f32_to_fp8(*v, Fp8Format::E4M3)).collect();
+        let bq: Vec<u8> = b.iter().map(|v| f32_to_fp8(*v, Fp8Format::E4M3)).collect();
+        let flops = 2.0 * (m * n * k) as f64;
+
+        let ta = be.upload_f32(&[m, k], &a).unwrap();
+        let tb = be.upload_f32(&[k, n], &b).unwrap();
+        let iters = ((2e9 / flops) as usize).clamp(20, 400);
+        let mut fp32 = Vec::new();
+        for _ in 0..rounds {
+            fp32.push(be.bench_gemm_f32(&ta, &tb, m, n, k, iters).unwrap());
+        }
+        let mut fp8 = Vec::new();
+        for _ in 0..rounds {
+            fp8.push(be.bench_gemm_fp8_host(&aq, &bq, m, n, k, iters, Fp8Format::E4M3, Fp8Format::E4M3).unwrap());
+        }
+        let fp32_med = median(&mut fp32);
+        let fp8_med = median(&mut fp8);
+        tot32 += fp32_med;
+        tot8 += fp8_med;
+        println!(
+            "LEGOKERNEL m{m} n{n} k{k}: fp32 {:.4} ms {:.0} GF/s | fp8-mma {:.4} ms {:.0} GF/s",
+            fp32_med,
+            flops / fp32_med / 1e6,
+            fp8_med,
+            flops / fp8_med / 1e6
+        );
+    }
+    println!("LEGOKERNEL TOTAL: fp32 {tot32:.4} ms | fp8-mma {tot8:.4} ms");
+}
