@@ -27,6 +27,7 @@ use lightnet_core::{
 use lightnet_cuda_oxide::OxideBackend;
 
 mod colour;
+mod lm;
 
 fn main() {
     let handle = std::thread::Builder::new()
@@ -93,6 +94,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     match command.as_str() {
+        "lm" => {
+            lm::run(args.collect())?;
+        }
         "detector" => {
             let subcommand = required_arg(args.next(), "detector subcommand")?;
             match subcommand.as_str() {
@@ -3646,6 +3650,18 @@ fn print_usage() {
         "  detect-image <cfg> <weights> <names> <image> [thresh] [nms] [resize|letterbox|resize-exact]"
     );
     println!("  export-onnx <cfg> <weights> [out.onnx] [--no-fuse]");
+    println!("  lm tokenizer --documents <tsv> --out <bpe> [--vocab N] [--latin-fold]");
+    println!(
+        "  lm shards --documents <tsv> --tokenizer <bpe> --out <dir> [--split NAME] [--shard-tokens N]"
+    );
+    println!(
+        "  lm train --cfg <cfg> --manifest <manifest> --out <ckpt> [--steps N] [--batch N] [--accum N] ..."
+    );
+    println!("  lm resume --checkpoint <ckpt> --manifest <manifest> --out <ckpt> [--steps N]");
+    println!("  lm eval --checkpoint <ckpt> --manifest <manifest> [--batches N]");
+    println!(
+        "  lm generate --checkpoint <ckpt> --manifest <manifest> [--prompt TEXT] [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--seed S]"
+    );
     println!(
         "env: LIGHTNET_BACKEND=cpu|oxide, LIGHTNET_OXIDE_CONV, LIGHTNET_OXIDE_GEMM, LIGHTNET_OXIDE_AMP=1 (mixed-precision training), LIGHTNET_DETECT_TSV=1"
     );

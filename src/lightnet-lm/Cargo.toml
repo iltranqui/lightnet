@@ -10,3 +10,5 @@ path = "src/lib.rs"
 
 [dependencies]
 lightnet-cuda = { path = "../lightnet-cuda" }
+sha2 = "0.10"
+unicode-normalization = "0.1"

@@ -270,6 +270,7 @@ file is named inline.
 - [35. Annotation GUI (`lightnet-gui`)](#35-annotation-gui-lightnet-gui)
 - [36. Annotation GUI plan implementation](#36-annotation-gui-plan-implementation)
 - [37. DarkMark hotkey parity and model discovery](#37-darkmark-hotkey-parity-and-model-discovery)
+- [253. CPU language-model Phase 1 (plan_llm_decoder Tasks 1-7)](#253-cpu-language-model-phase-1-plan_llm_decoder-tasks-1-7)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -2521,3 +2522,35 @@ Muon), `layers.md` for Phases 1b–4 (remaining layers),
 current gap lists (GPU hard rejections, forward-but-CPU-backward layers,
 partial device paths), `fp8_fp4.md` for FP8 step 5, and `gui_plan.md` for the
 GUI plan (partly implemented in v0.1.019–v0.1.021); ONNX export is complete.
+
+## 253. CPU language-model Phase 1 (plan_llm_decoder Tasks 1-7)
+
+v0.1.042. CPU reference path for the Latin decoder. Crate `src/lightnet-lm`: `config`/`types` (strict
+`[transformer]` geometry and token batches), `tokenizer` (byte-fallback BPE,
+optional u/v-i/j folding before NFC, SHA-256 artifact), `ops`/`attention`
+(RMSNorm, embedding, RoPE, SwiGLU, sparse CE, causal GQA; all adjoints),
+`decoder` (pre-RMSNorm blocks, tied head, seeded dropout, exact backward),
+`data` (v1 token shards, manifest, resumable packing), `optim` (token warmup +
+cosine, global clip), `train` (`CpuEngine`, `Trainer`, AdamW decay groups,
+pending accumulation), `checkpoint` (versioned, checksummed, atomic), `cache`
+(prefill/decode KV cache with revision invalidation), and `sampling`
+(greedy/temperature/top-k/top-p, EOS). CLI: `lightnet-rs lm
+{tokenizer,shards,train,resume,eval,generate}` in `src/lightnet-cli/src/lm.rs`.
+Docs: `tasks/rust/llm_data.md`, `src/lightnet-lm/CONTEXT.md`.
+
+Evidence: `PKGS=lightnet-lm cargo xtask test lm_` 52 of 52 (contract 6,
+tokenizer 7, ops 8, decoder 7, data 6, train 10, generate 8);
+`cargo xtask test lm_cli_` 4 of 4; `cargo xtask check lightnet-cli` clean;
+`cargo xtask clippy lightnet-lm` clean for this crate and the new `lm.rs` has
+no warnings. `systemd-run --user` was unavailable, so the runs were uncapped;
+`-j 2` held. The red phase was not observed per test (Tasks 1-5 were first
+compiled together); only the final green runs are evidence. No corpus
+training, evaluation, generation quality, or performance number was measured.
+
+Deviation from the plan text: no `cargo xtask lm` wrapper was added (the plan
+calls it proposed), so `xtask/src/main.rs` and `CLAUDE.md` are unchanged; the
+engine/trainer file is `train.rs` as named by the plan after an initial
+`engine.rs`; and `KvCache` keeps `batch` as a scalar constrained to one, so its
+buffers are `[kv_heads, context, head_dim]`. The plan's Task 10 pilot counts
+were wrong: the registry gives 41,955,840 parameters at vocabulary 8192 and
+46,150,144 at 16384, and the plan now records those derived values.

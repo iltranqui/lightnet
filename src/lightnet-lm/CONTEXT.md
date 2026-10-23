@@ -1,6 +1,6 @@
 # lightnet-lm
 
-Decoder-only LLM training and inference (pre-RMSNorm causal GQA, RoPE, SwiGLU, tied head). Scaffold only; the work is planned in `tasks/rust/plan_llm_decoder.md`.
+Decoder-only LLM training and inference (pre-RMSNorm causal GQA, RoPE, SwiGLU, tied head). v0.1.042 implements CPU Tasks 1-7, covered by 52 passing `lm_` tests plus 4 CLI parser tests. The plan is `tasks/rust/plan_llm_decoder.md`.
 
 ## Table of Contents
 
@@ -15,7 +15,8 @@ Independent of the detector graph in `lightnet-core`. The `[transformer]` layer 
 
 ## Responsibilities
 
-- Decoder config and token types, byte-fallback BPE, CPU differentiable ops and decoder, token shards, trainer, checkpoints, KV-cache and sampling (planned Tasks 1 to 7).
+- Decoder config and token types, byte-fallback BPE (`tokenizer.rs`), CPU ops (`ops.rs`, `attention.rs`), decoder (`decoder.rs`), token shards/loader (`data.rs`), optimizer (`optim.rs`), engine/trainer (`train.rs`), checkpoints (`checkpoint.rs`), and KV-cache/sampling (`cache.rs`, `sampling.rs`).
+- Public API is re-exported from `lib.rs`; the CLI entry is `lightnet-rs lm` (`src/lightnet-cli/src/lm.rs`).
 - The CPU code is the reference that the oxide and cuTile device engines check against.
 
 ## Dependencies
@@ -26,4 +27,4 @@ Independent of the detector graph in `lightnet-core`. The `[transformer]` layer 
 ## Constraints
 
 - New cross-entropy keeps the repo's descent-direction sign (target minus prediction).
-- Build and test with `cargo xtask check lightnet-lm` and `cargo xtask test`.
+- Build and test with `cargo xtask check lightnet-lm` and `PKGS=lightnet-lm cargo xtask test lm_`.

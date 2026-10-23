@@ -274,10 +274,10 @@ lightnet/
 - Require positive dimensions, `hidden % q_heads == 0`, `q_heads % kv_heads == 0`, even head dimension, finite positive epsilon/theta, and `0 <= dropout < 1`.
 - Smoke geometry: vocabulary 260, context 8, hidden 16, intermediate 32, two layers, four Q heads, two KV heads, theta 10000, epsilon `1e-5`, dropout zero.
 
-- [ ] **Step 1: Write contract tests.** `lm_contract_accepts_smoke_geometry` asserts the exact parsed fields; `lm_contract_rejects_invalid_geometry` rejects zero dimensions, odd head dimension, invalid head ratios, NaN epsilon, and overflow; `lm_contract_rejects_unknown_options` rejects a misspelled key and `[transformer]`; `lm_contract_validates_integer_batches` rejects mismatched lengths, out-of-range IDs/targets, invalid positions, and sequence length above context.
+- [x] **Step 1: Write contract tests.** `lm_contract_accepts_smoke_geometry` asserts the exact parsed fields; `lm_contract_rejects_invalid_geometry` rejects zero dimensions, odd head dimension, invalid head ratios, NaN epsilon, and overflow; `lm_contract_rejects_unknown_options` rejects a misspelled key and `[transformer]`; `lm_contract_validates_integer_batches` rejects mismatched lengths, out-of-range IDs/targets, invalid positions, and sequence length above context.
 - [ ] **Step 2: Run** `cargo xtask test lm_contract_`. Expect missing-module/API failures; confirm the intended tests are selected once compilation succeeds.
-- [ ] **Step 3: Implement** the interfaces, strict section/key validation, checked allocation arithmetic, and smoke cfg. Keep legacy model parsing untouched.
-- [ ] **Step 4: Run** `cargo xtask test lm_contract_`, then `cargo xtask check lightnet-lm`, sequentially. Expect all named tests to pass and check exit status zero.
+- [x] **Step 3: Implement** the interfaces, strict section/key validation, checked allocation arithmetic, and smoke cfg. Keep legacy model parsing untouched.
+- [x] **Step 4: Run** `cargo xtask test lm_contract_`, then `cargo xtask check lightnet-lm`, sequentially. Expect all named tests to pass and check exit status zero.
 - [ ] **Step 5: Record evidence and commit/tag** the named files as `v0.M.NNN: define decoder token and configuration contracts`.
 
 ### Task 2: Byte-fallback BPE and normalization
@@ -305,10 +305,10 @@ lightnet/
 - Normalization always applies NFC and canonical line endings. Optional Latin folding expands `æ/Æ/œ/Œ` and folds `v/V→u/U`, `j/J→i/I`; preserve case otherwise. Preserve macrons.
 - Plain encoding does not interpret special-token spellings as control tokens. Loading validates merge references, ranks, IDs, and artifact version.
 
-- [ ] **Step 1: Write tokenizer tests.** `lm_tokenizer_roundtrips_bytes` covers all 256 byte tokens; `lm_tokenizer_preserves_unicode` roundtrips normalized Latin, Greek, combining marks, emoji, and unseen characters; `lm_tokenizer_latin_policy` asserts `"VJV æ œ" → "UIU ae oe"` with folding and NFC composition; `lm_tokenizer_deterministic_merges` asserts identical artifacts under repeated training and document-order permutation; `lm_tokenizer_rejects_corrupt_artifacts` rejects forward merge references, duplicate IDs, and unknown versions; `lm_tokenizer_special_literals_are_text` asserts literal marker text creates no BOS/EOS.
+- [x] **Step 1: Write tokenizer tests.** `lm_tokenizer_roundtrips_bytes` covers all 256 byte tokens; `lm_tokenizer_preserves_unicode` roundtrips normalized Latin, Greek, combining marks, emoji, and unseen characters; `lm_tokenizer_latin_policy` asserts `"VJV æ œ" → "UIU ae oe"` with folding and NFC composition; `lm_tokenizer_deterministic_merges` asserts identical artifacts under repeated training and document-order permutation; `lm_tokenizer_rejects_corrupt_artifacts` rejects forward merge references, duplicate IDs, and unknown versions; `lm_tokenizer_special_literals_are_text` asserts literal marker text creates no BOS/EOS.
 - [ ] **Step 2: Run** `cargo xtask test lm_tokenizer_`. Expect missing tokenizer APIs.
-- [ ] **Step 3: Implement** the tokenizer and canonical serialization. Add the proposed dependencies, lock their resolution, and document a bounded, explicitly selected tokenizer-training sample rather than loading an entire general corpus into RAM.
-- [ ] **Step 4: Run** `cargo xtask test lm_tokenizer_`, then `cargo xtask check lightnet-lm`. Expect all assertions to pass; saved/reloaded hash must match.
+- [x] **Step 3: Implement** the tokenizer and canonical serialization. Add the proposed dependencies, lock their resolution, and document a bounded, explicitly selected tokenizer-training sample rather than loading an entire general corpus into RAM.
+- [x] **Step 4: Run** `cargo xtask test lm_tokenizer_`, then `cargo xtask check lightnet-lm`. Expect all assertions to pass; saved/reloaded hash must match.
 - [ ] **Step 5: Record evidence and commit/tag** as `v0.M.NNN: add reproducible byte fallback BPE`.
 
 ### Task 3: CPU differentiable decoder operations
@@ -338,11 +338,11 @@ lightnet/
 - CE returns **summed** loss and unnormalized descent seeds `one_hot(target)-softmax`. Ignored rows return zero seed. Stable log-sum-exp computes loss without probability flooring.
 - Invalid/padded query rows return zero attention output; no allowed-key reduction is attempted. Non-finite active logits are errors.
 
-- [ ] **Step 1: Write operation tests.** `lm_ops_rmsnorm_gradient` checks input/scale finite differences; `lm_ops_embedding_scatter_add` uses IDs `[5,5,7]` and asserts row 5 receives two contributions; `lm_ops_rope_adjoint` checks nonzero positions and inverse rotation; `lm_ops_gqa_gradient` checks Q/K/V derivatives and shared-KV summation; `lm_ops_swiglu_gradient` checks both branches; `lm_ops_causality_and_segments` changes future/other-segment values and asserts earlier outputs are unchanged.
-- [ ] **Step 2: Add CE assertions.** `lm_ops_ce_descent_sign` asserts zero logits with target 1 yield seeds `[-0.5,0.5]` and loss `ln(2)`; `lm_ops_ce_matches_negative_finite_difference` compares seeds against the negative numerical loss derivative; `lm_ops_ce_mask_and_extremes` asserts ignored rows are zero, all-ignored loss/count are zero, logits `[1000,-1000]` targeting class 1 yield approximately 2000 loss, and NaN/Inf active logits error.
+- [x] **Step 1: Write operation tests.** `lm_ops_rmsnorm_gradient` checks input/scale finite differences; `lm_ops_embedding_scatter_add` uses IDs `[5,5,7]` and asserts row 5 receives two contributions; `lm_ops_rope_adjoint` checks nonzero positions and inverse rotation; `lm_ops_gqa_gradient` checks Q/K/V derivatives and shared-KV summation; `lm_ops_swiglu_gradient` checks both branches; `lm_ops_causality_and_segments` changes future/other-segment values and asserts earlier outputs are unchanged.
+- [x] **Step 2: Add CE assertions.** `lm_ops_ce_descent_sign` asserts zero logits with target 1 yield seeds `[-0.5,0.5]` and loss `ln(2)`; `lm_ops_ce_matches_negative_finite_difference` compares seeds against the negative numerical loss derivative; `lm_ops_ce_mask_and_extremes` asserts ignored rows are zero, all-ignored loss/count are zero, logits `[1000,-1000]` targeting class 1 yield approximately 2000 loss, and NaN/Inf active logits error.
 - [ ] **Step 3: Run** `cargo xtask test lm_ops_`. Expect missing-operation failures.
-- [ ] **Step 4: Implement** the interfaces without Q/K or score clamps. Use centered differences with perturbation `1e-3` and tolerance `2e-3 + 2e-2*abs(reference)` on small nonsaturated fixtures.
-- [ ] **Step 5: Run** `cargo xtask test lm_ops_`. Expect every named test to pass, including exact sign and boundary assertions.
+- [x] **Step 4: Implement** the interfaces without Q/K or score clamps. Use centered differences with perturbation `1e-3` and tolerance `2e-3 + 2e-2*abs(reference)` on small nonsaturated fixtures.
+- [x] **Step 5: Run** `cargo xtask test lm_ops_`. Expect every named test to pass, including exact sign and boundary assertions.
 - [ ] **Step 6: Record evidence and commit/tag** as `v0.M.NNN: implement differentiable causal decoder operations`.
 
 ### Task 4: CPU trainable decoder and tied head
@@ -371,11 +371,11 @@ lightnet/
 - Canonical parameter order: embedding; each block’s attention norm, Q, K, V, O, MLP norm, gate, up, down; final norm. Head references the embedding ID and owns no second tensor.
 - Matrices decay; RMSNorm scales do not. Dropout applies to attention/MLP branch outputs before residual addition, using inverted scaling and saved masks. Inference disables dropout without consuming RNG.
 
-- [ ] **Step 1: Write decoder tests.** `lm_decoder_full_parameter_gradient` checks every parameter family against negative CE finite differences; `lm_decoder_tied_gradient` asserts the single embedding gradient equals independently calculated gather and head contributions; `lm_decoder_parameter_registry` asserts unique names/IDs, stable order, one embedding allocation, and exact count agreement.
-- [ ] **Step 2: Add behavioral assertions.** `lm_decoder_prefix_causality` asserts prefix logits are invariant to future IDs; `lm_decoder_padding_isolation` asserts valid logits match an unpadded run; `lm_decoder_dropout_replay` asserts equal RNG states reproduce outputs/gradients and inference leaves RNG unchanged; `lm_decoder_seed_step_lowers_loss` applies a small descent update and asserts lower synthetic CE.
+- [x] **Step 1: Write decoder tests.** `lm_decoder_full_parameter_gradient` checks every parameter family against negative CE finite differences; `lm_decoder_tied_gradient` asserts the single embedding gradient equals independently calculated gather and head contributions; `lm_decoder_parameter_registry` asserts unique names/IDs, stable order, one embedding allocation, and exact count agreement.
+- [x] **Step 2: Add behavioral assertions.** `lm_decoder_prefix_causality` asserts prefix logits are invariant to future IDs; `lm_decoder_padding_isolation` asserts valid logits match an unpadded run; `lm_decoder_dropout_replay` asserts equal RNG states reproduce outputs/gradients and inference leaves RNG unchanged; `lm_decoder_seed_step_lowers_loss` applies a small descent update and asserts lower synthetic CE.
 - [ ] **Step 3: Run** `cargo xtask test lm_decoder_`. Expect missing decoder APIs.
-- [ ] **Step 4: Implement** the complete forward/backward and parameter registry. Preserve a single sign convention through every adjoint; add no compensating negation at the optimizer boundary.
-- [ ] **Step 5: Run** `cargo xtask test lm_decoder_`, then `cargo xtask test lm_ops_`. Expect all tests to pass. The single synthetic descent assertion is a unit test, not corpus training evidence.
+- [x] **Step 4: Implement** the complete forward/backward and parameter registry. Preserve a single sign convention through every adjoint; add no compensating negation at the optimizer boundary.
+- [x] **Step 5: Run** `cargo xtask test lm_decoder_`, then `cargo xtask test lm_ops_`. Expect all tests to pass. The single synthetic descent assertion is a unit test, not corpus training evidence.
 - [ ] **Step 6: Record evidence and commit/tag** as `v0.M.NNN: compose trainable CPU decoder with tied embeddings`.
 
 ### Task 5: Token shards and deterministic packing
@@ -403,11 +403,11 @@ lightnet/
 - Pack document fragments into rows with distinct segment IDs and positions reset at each fragment. Final padding uses PAD input, ignored target, `valid=false`.
 - Shuffle documents deterministically; validation uses stable order.
 
-- [ ] **Step 1: Write data tests.** `lm_data_shift_and_pack` asserts exact IDs, targets, positions, segments, and padding for two short documents; `lm_data_long_document_coverage` asserts every body/EOS target occurs exactly once across windows; `lm_data_resume_cursor` asserts restored batches equal uninterrupted batches after a partial document and partially filled row.
-- [ ] **Step 2: Add manifest assertions.** `lm_data_rejects_corruption` rejects truncated shards, invalid IDs, checksum failures, and tokenizer mismatch; `lm_data_split_leakage` rejects the same work or normalized exact duplicate across splits; `lm_data_empty_corpus` errors on no documents while accepting an empty document as BOS→EOS.
+- [x] **Step 1: Write data tests.** `lm_data_shift_and_pack` asserts exact IDs, targets, positions, segments, and padding for two short documents; `lm_data_long_document_coverage` asserts every body/EOS target occurs exactly once across windows; `lm_data_resume_cursor` asserts restored batches equal uninterrupted batches after a partial document and partially filled row.
+- [x] **Step 2: Add manifest assertions.** `lm_data_rejects_corruption` rejects truncated shards, invalid IDs, checksum failures, and tokenizer mismatch; `lm_data_split_leakage` rejects the same work or normalized exact duplicate across splits; `lm_data_empty_corpus` errors on no documents while accepting an empty document as BOS→EOS.
 - [ ] **Step 3: Run** `cargo xtask test lm_data_`. Expect missing loader/shard APIs.
-- [ ] **Step 4: Implement** streaming shard reads, deterministic packing, and restoration validation. Require supplied UTF-8 plaintext exports; document TEI/HTML extraction requirements rather than silently training on markup.
-- [ ] **Step 5: Run** `cargo xtask test lm_data_`, then `cargo xtask test lm_decoder_`. Expect all assertions to pass, including packed-segment isolation.
+- [x] **Step 4: Implement** streaming shard reads, deterministic packing, and restoration validation. Require supplied UTF-8 plaintext exports; document TEI/HTML extraction requirements rather than silently training on markup.
+- [x] **Step 5: Run** `cargo xtask test lm_data_`, then `cargo xtask test lm_decoder_`. Expect all assertions to pass, including packed-segment isolation.
 - [ ] **Step 6: Record evidence and commit/tag** as `v0.M.NNN: add resumable token shards and document packing`.
 
 ### Task 6: Token training and checkpoint resume
@@ -445,12 +445,12 @@ lightnet/
 - New checkpoint format uses a versioned manifest and checksummed little-endian f32 payload. Atomic publication uses a temporary sibling and rename. Serialize tied storage once; preserve pending accumulation.
 - Proposed `cargo xtask lm ...` forwards to the LM CLI under the existing capped runner; allow training only through explicit `lm train`. Preserve existing commands.
 
-- [ ] **Step 1: Write optimizer tests.** `lm_train_token_normalization` compares unequal-size microbatch accumulation with one concatenated effective batch; `lm_train_global_clip_unique_params` asserts gradients `[3,4]` have norm 5 and become `[0.6,0.8]` at cap 1; `lm_train_adamw_groups` matches existing AdamW math, applies no norm-scale decay, and updates tied storage once.
-- [ ] **Step 2: Write schedule/resume tests.** `lm_train_token_schedule` asserts LR values 0, 1, 0.55, and 0.1 at token counts 0, 10, 20, and 30 for warmup 10/total 30/peak 1/min 0.1; `lm_train_resume_mid_accumulation` asserts bit-identical CPU next batches, dropout results, gradients, moments, counters, and parameters after save/resume; `lm_train_checkpoint_validation` rejects mismatched hashes, tensor shapes, versions, truncation, and checksums without mutating the live engine.
-- [ ] **Step 3: Add failure/CLI tests.** `lm_train_rejects_nonfinite_atomically` injects NaN into a norm-scale gradient and asserts all parameters/moments/counters remain unchanged; `lm_train_all_ignored_no_step` asserts no update; `lm_train_step_overflow` rejects advancement beyond `u32::MAX`; inline `lm_cli_*` tests assert strict subcommand/flag parsing and reject training options on evaluation commands.
+- [x] **Step 1: Write optimizer tests.** `lm_train_token_normalization` compares unequal-size microbatch accumulation with one concatenated effective batch; `lm_train_global_clip_unique_params` asserts gradients `[3,4]` have norm 5 and become `[0.6,0.8]` at cap 1; `lm_train_adamw_groups` matches existing AdamW math, applies no norm-scale decay, and updates tied storage once.
+- [x] **Step 2: Write schedule/resume tests.** `lm_train_token_schedule` asserts LR values 0, 1, 0.55, and 0.1 at token counts 0, 10, 20, and 30 for warmup 10/total 30/peak 1/min 0.1; `lm_train_resume_mid_accumulation` asserts bit-identical CPU next batches, dropout results, gradients, moments, counters, and parameters after save/resume; `lm_train_checkpoint_validation` rejects mismatched hashes, tensor shapes, versions, truncation, and checksums without mutating the live engine.
+- [x] **Step 3: Add failure/CLI tests.** `lm_train_rejects_nonfinite_atomically` injects NaN into a norm-scale gradient and asserts all parameters/moments/counters remain unchanged; `lm_train_all_ignored_no_step` asserts no update; `lm_train_step_overflow` rejects advancement beyond `u32::MAX`; inline `lm_cli_*` tests assert strict subcommand/flag parsing and reject training options on evaluation commands.
 - [ ] **Step 4: Run** `cargo xtask test lm_train_`, then `cargo xtask test lm_cli_`. Expect missing trainer/checkpoint/CLI APIs.
-- [ ] **Step 5: Implement** training, snapshot validation/publication, and thin CLI commands for tokenizer, shard preparation, CPU train, and resume. An incomplete checkpoint must never replace a valid checkpoint.
-- [ ] **Step 6: Run** the two filters again, then `cargo xtask check lightnet-cli`, sequentially. Expect all named tests to pass and check exit status zero.
+- [x] **Step 5: Implement** training, snapshot validation/publication, and thin CLI commands for tokenizer, shard preparation, CPU train, and resume. An incomplete checkpoint must never replace a valid checkpoint.
+- [x] **Step 6: Run** the two filters again, then `cargo xtask check lightnet-cli`, sequentially. Expect all named tests to pass and check exit status zero.
 - [ ] **Step 7: Record evidence and commit/tag** as `v0.M.NNN: add token training and exact CPU checkpoint resume`. Keep any corpus-overfit demonstration explicitly user-gated.
 
 ### Task 7: CPU KV-cache and sampling
@@ -477,12 +477,46 @@ lightnet/
 - Temperature zero means greedy with lowest-ID tie break. Otherwise apply temperature, top-k, then smallest descending-probability nucleus reaching top-p; ties sort by token ID. Top-k zero disables that filter. Require finite nonnegative temperature and `0<top_p<=1`.
 - Never sample PAD/BOS/reserved UNK. EOS stops generation and is not printed as text.
 
-- [ ] **Step 1: Write cache tests.** `lm_generate_cached_matches_prefix` checks every next-token logit against full-prefix forward for MHA and GQA within `1e-5 + 1e-5*abs(reference)`; `lm_generate_nonzero_rope_offset` checks multiple decode steps; `lm_generate_cache_validation` rejects overflow, stale model revision, invalid IDs, and nonempty-cache prefill without changing length/content.
-- [ ] **Step 2: Write sampling tests.** `lm_generate_greedy_ties` selects the lowest allowed ID; `lm_generate_seed_replay` reproduces a sampled sequence from equal RNG state; `lm_generate_filters` asserts excluded tokens never occur and a top-p=0.6 nucleus over probabilities `[0.5,0.3,0.2]` keeps the first two; `lm_generate_invalid_distribution` rejects NaN, Inf, invalid settings, and no allowed candidates; `lm_generate_eos_and_empty_prompt` asserts BOS insertion and EOS stopping.
+- [x] **Step 1: Write cache tests.** `lm_generate_cached_matches_prefix` checks every next-token logit against full-prefix forward for MHA and GQA within `1e-5 + 1e-5*abs(reference)`; `lm_generate_nonzero_rope_offset` checks multiple decode steps; `lm_generate_cache_validation` rejects overflow, stale model revision, invalid IDs, and nonempty-cache prefill without changing length/content.
+- [x] **Step 2: Write sampling tests.** `lm_generate_greedy_ties` selects the lowest allowed ID; `lm_generate_seed_replay` reproduces a sampled sequence from equal RNG state; `lm_generate_filters` asserts excluded tokens never occur and a top-p=0.6 nucleus over probabilities `[0.5,0.3,0.2]` keeps the first two; `lm_generate_invalid_distribution` rejects NaN, Inf, invalid settings, and no allowed candidates; `lm_generate_eos_and_empty_prompt` asserts BOS insertion and EOS stopping.
 - [ ] **Step 3: Run** `cargo xtask test lm_generate_`. Expect missing cache/sampling APIs.
-- [ ] **Step 4: Implement** incremental projections, cache validation before writes, sampling, and proposed `lm generate` CLI dispatch.
-- [ ] **Step 5: Run** `cargo xtask test lm_generate_`, then `cargo xtask test lm_cli_`. Expect all named assertions to pass.
+- [x] **Step 4: Implement** incremental projections, cache validation before writes, sampling, and proposed `lm generate` CLI dispatch.
+- [x] **Step 5: Run** `cargo xtask test lm_generate_`, then `cargo xtask test lm_cli_`. Expect all named assertions to pass.
 - [ ] **Step 6: Record evidence and commit/tag** as `v0.M.NNN: add cached CPU generation and seeded sampling`.
+
+#### Phase 1 evidence (Tasks 1-7)
+
+Implemented and verified on 2026-10-24. The named suites pass: `lm_` in
+`lightnet-lm` 52 of 52 (contract 6, tokenizer 7, ops 8, decoder 7, data 6,
+train 10, generate 8), `lm_cli_` 4 of 4, and `cargo xtask check lightnet-cli`
+is clean. `cargo xtask clippy lightnet-lm` is clean for this crate; the CLI's
+new `lm.rs` is clean, while the crate keeps pre-existing `main.rs` warnings.
+`systemd-run --user` was unavailable, so the runs were uncapped; `-j 2` held.
+
+The red phase was not separately observed for Tasks 1-5: their tests and code
+were first compiled together. Tasks 6-7 also went straight to the failing
+compile/test output recorded above rather than a per-test red run. Only the
+final green runs are evidence.
+
+Deviations recorded rather than hidden:
+
+- Task 6 names `train.rs`; the engine/trainer was initially written as
+  `engine.rs` and then renamed to `train.rs`, so the tree matches the plan.
+- No `cargo xtask lm` wrapper was added; the plan calls it "proposed". The
+  commands are reached through `lightnet-rs lm ...`, so `xtask/src/main.rs` and
+  `CLAUDE.md` were not changed for Task 6.
+- `KvCache` stores `batch` as a scalar and requires one, so its buffers are
+  `[kv_heads, context, head_dim]` (the plan's `[batch, kv_heads, context,
+  head_dim]` at batch one).
+- Task 4's `lm_decoder_tied_gradient` originally compared the gather term with a
+  final-norm-only adjoint, which is not the full `d_stream`; the test now checks
+  the head term and the exact `head + gather == embedding gradient` split, while
+  the finite-difference test covers the combined gradient.
+- Task 2's "no repeated pair" fixture used raw bytes 0-255, which are not valid
+  UTF-8 documents; it now uses printable ASCII one-byte documents.
+- The Task 10 pilot parameter counts in this plan were arithmetically wrong.
+  Against the implemented registry they are 41,955,840 at vocabulary 8192 and
+  46,150,144 at vocabulary 16384, not 45,628,928 and 49,823,232.
 
 ### Task 8: Resident oxide bf16 forward
 
@@ -560,7 +594,7 @@ lightnet/
   - CLI preparation/evaluation commands and a user-gated pilot recipe.
 - Pilot cfg: 12 layers, hidden 512, intermediate 1536, eight Q heads, four KV heads, head dimension 64, tied embedding, RMS epsilon `1e-5`, theta 10000, dropout zero.
 - Vocabulary comparisons: 8192 and 16384 total IDs. Context comparisons: 512 and 1024.
-- With the Task 4 parameter registry, exact counts are **45,628,928** at vocabulary 8192 and **49,823,232** at vocabulary 16384. Assert both counts; remain within the requested 30–60M range.
+- With the Task 4 parameter registry, the derived exact counts are **41,955,840** at vocabulary 8192 and **46,150,144** at vocabulary 16384. Assert both counts in Task 10; remain within the requested 30–60M range. The earlier 45,628,928 / 49,823,232 figures in this plan were wrong.
 - Pilot defaults for a later authorized experiment: AdamW β1=0.9, β2=0.95, ε=`1e-8`, matrix decay 0.1, global clip 1.0, peak LR `3e-4`, minimum LR `3e-5`. Token budget and warmup token count must be supplied explicitly and recorded; do not invent a measured optimum.
 
 **Data to provide:**
@@ -760,13 +794,13 @@ Reference: Native Sparse Attention (arXiv 2502.11089, ACL 2025): keys/values org
 
 | Task | Stage | Deliverable | Status | Required evidence |
 |---|---|---|---|---|
-| 1 | Decoder contract/tokenizer | Strict configuration and integer token layout | Planned | Contract tests |
-| 2 | Decoder contract/tokenizer | Byte-fallback BPE and normalization | Planned | Roundtrip, determinism, artifact tests |
-| 3 | CPU trainable decoder | Exact primitive adjoints and descent-sign CE | Planned | Finite differences and sign assertions |
-| 4 | CPU trainable decoder | Complete model with tied head | Planned | Every parameter family, causality, dropout |
-| 5 | Loader/training/resume | Token shards and document packing | Planned | Shift, boundaries, cursor restoration |
-| 6 | Loader/training/resume | AdamW, clipping, token LR, checkpoints | Planned | Accumulation and exact CPU resume |
-| 7 | CPU inference | KV-cache and sampling | Planned | Cached/full-prefix agreement |
+| 1 | Decoder contract/tokenizer | Strict configuration and integer token layout | Implemented (CPU), verified | Contract tests 6 of 6 |
+| 2 | Decoder contract/tokenizer | Byte-fallback BPE and normalization | Implemented (CPU), verified | Tokenizer tests 7 of 7 |
+| 3 | CPU trainable decoder | Exact primitive adjoints and descent-sign CE | Implemented (CPU), verified | Ops tests 8 of 8 |
+| 4 | CPU trainable decoder | Complete model with tied head | Implemented (CPU), verified | Decoder tests 7 of 7 |
+| 5 | Loader/training/resume | Token shards and document packing | Implemented (CPU), verified | Data tests 6 of 6 |
+| 6 | Loader/training/resume | AdamW, clipping, token LR, checkpoints | Implemented (CPU), verified | Train tests 10 of 10; CLI 4 of 4 |
+| 7 | CPU inference | KV-cache and sampling | Implemented (CPU), verified | Generate tests 8 of 8 |
 | 8 | Oxide resident bf16 | Native forward | Planned | Actual-device numerics and transfers |
 | 9 | Oxide resident bf16 | Backward, optimizer, resume | Planned | All-gradient agreement and residency |
 | 10 | Latin pilot/eval | Data contract, cfg, evaluator | Planned; corpus run user-gated | Unit checks; later measured pilot report |
@@ -777,7 +811,7 @@ Reference: Native Sparse Attention (arXiv 2502.11089, ACL 2025): keys/values org
 | 15 | Sparse attention | DSA-style indexer top-k | Optional; paper details unverified | Dense equivalence at `k >= T`, selected-set gradients |
 | 16 | Sparse attention | NSA-style compressed/selected/window branches | Optional; paper details unverified | Group sharing, block causality, gradients |
 
-No implementation task is complete. All runtime and performance results remain **unverified**.
+Tasks 1-7 (CPU reference path) are implemented, verified by their named unit tests, and versioned as v0.1.042. Tasks 8-16 remain unimplemented. No corpus training, evaluation, or performance result has been measured, so all runtime and performance claims remain **unverified**.
 
 ## Open issues
 
@@ -788,7 +822,7 @@ No implementation task is complete. All runtime and performance results remain *
 - **Release-line policy:** AGENTS.md assigns CPU/GPU minor lines to the existing port roadmap, while this is a new feature. Use those CPU/GPU lines consistently and check current tags/mapping before each increment; do not revive the closed line or use the MoE line.
 - **Version-map format:** the inspected mapping tail contains an additional trailing field beyond the handbook’s four-field description. Preserve the live file’s established format when appending; do not rewrite historical rows.
 - **Exactness boundary:** exact resume is required within the same deterministic backend/configuration. CPU↔GPU migration and different GPU reduction implementations use numerical tolerances, not bitwise claims.
-- **Tokenizer dependency:** the proposed normalization dependency/version has not been resolved or built. Record its lockfile resolution and confirm the pinned toolchain before committing Task 2.
+- **Tokenizer dependency (resolved):** `unicode-normalization 0.1` and `sha2 0.10` are resolved in `Cargo.lock`; the pinned toolchain built and passed the `lm_` tests.
 - **Baseline health:** existing full-suite evidence gaps remain separate from this feature’s focused tests. Do not report the entire repository green from LM filters.
 - **Sparse attention scope:** Tasks 14–16 are researched from search summaries (DSA from the DeepSeek-V3.2 write-ups, NSA from arXiv 2502.11089); nothing was read in full. MoBA (block routing) and Trainable Dynamic Mask Sparse Attention (arXiv 2508.02124) are candidates left out; no 2026 papers were found. At the 512–1024 pilot context none of these speeds up training; they pay off only when `k` or the window is smaller than the sequence.
 - **cuTile compatibility:** source assets are available, but adapter build, kernel architecture support, and driver/toolchain compatibility remain unverified. Optional integration must not block the CPU/oxide sequence.

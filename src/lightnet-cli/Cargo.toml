@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 lightnet-core = { path = "../lightnet-core" }
 lightnet-cuda = { path = "../lightnet-cuda" }
+lightnet-lm = { path = "../lightnet-lm" }
 rayon = "1"
 serde_json.workspace = true
 # cuda-oxide backend: optional, only compiles through `cargo oxide`
