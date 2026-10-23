@@ -272,6 +272,7 @@ file is named inline.
 - [37. DarkMark hotkey parity and model discovery](#37-darkmark-hotkey-parity-and-model-discovery)
 - [253. CPU language-model Phase 1 (plan_llm_decoder Tasks 1-7)](#253-cpu-language-model-phase-1-plan_llm_decoder-tasks-1-7)
 - [254. fp16 convergence verdict (plan_fp16 Task 5)](#254-fp16-convergence-verdict-plan_fp16-task-5)
+- [255. FP8 delayed-history pool-incarnation fix](#255-fp8-delayed-history-pool-incarnation-fix)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -2568,3 +2569,22 @@ and mAP is 0.08 points higher; F1 is one false positive lower. Speed does not:
 fp16 is 38% slower than fp32, so it is an accuracy-equivalent mode, not a speed
 feature on this build. The sparse `non-finite gradients` skip count was not
 retained after log cleanup. Full table: `docs/OXIDE_BENCH.md` §7.2.1.
+
+## 255. FP8 delayed-history pool-incarnation fix
+
+v0.2.191. The delayed-scaling amax history is keyed by `(device pointer,
+pool incarnation, length, format)`. `BufPool` now tracks an incarnation per
+address and bumps it in `PooledBuf::new` / `PooledBuf16::new`; a recycled
+address therefore starts a fresh history instead of inheriting the previous
+owner's amax. Explicit test keys use incarnation 0, so the existing
+one-call-site tests still share history across different buffers.
+
+Root cause: the old key was only `(pointer, length, format)`, and the pool
+deliberately recycles buffers of the same length. A new tensor could land on an
+old address and make every delayed call look like call `n > 0`; saturation
+masked it, but the scale was stale.
+
+Evidence: `cargo xtask oxide --test oxide_gemm_f8` 54 of 54 (two new
+pool-recycle tests for f16 and bf16); `cargo xtask gpu-check` clean. Both
+uncapped (`systemd-run --user` unavailable), `-j 2`. No training run. Tag
+`v0.2.191`.
