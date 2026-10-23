@@ -16,7 +16,7 @@ pub mod mixed;
 pub mod tensor;
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cuda_core::simt::LaunchConfig;
@@ -170,6 +170,9 @@ pub struct OxideBackend {
     /// Quantise launches issued by the FP8 path; see
     /// [`OxideBackend::fp8_quantize_launches`].
     fp8_quantize_launches: AtomicU64,
+    /// Test seam: route e4m3 x e4m3 GEMMs through the generic-format kernel;
+    /// see [`OxideBackend::set_fp8_generic_kernel`].
+    fp8_generic_kernel: AtomicBool,
     /// Zero-length f32 buffer shared by every f16-storage tensor.
     empty_f32: Arc<PooledBuf>,
     /// im2col scratch of the f16 conv path and 1-element dummies for the unused
@@ -1486,6 +1489,7 @@ impl OxideBackend {
             fp8_scaling: Fp8Scaling::from_env(),
             fp8_hist: Mutex::new(None),
             fp8_quantize_launches: AtomicU64::new(0),
+            fp8_generic_kernel: AtomicBool::new(false),
             empty_f32,
             half_scratch: Mutex::new(half_scratch),
             half_col: Mutex::new(None),
@@ -1548,6 +1552,13 @@ impl OxideBackend {
     /// weight costs no launch, so tests compare it to pin the weight cache.
     pub fn fp8_quantize_launches(&self) -> u64 {
         self.fp8_quantize_launches.load(Ordering::Relaxed)
+    }
+
+    /// Test seam: `true` makes e4m3 x e4m3 GEMMs use the generic-format
+    /// `sgemm_fp8_mma` instead of the specialised kernel, so tests can compare
+    /// the two bitwise.
+    pub fn set_fp8_generic_kernel(&self, generic: bool) {
+        self.fp8_generic_kernel.store(generic, Ordering::Relaxed);
     }
 
     /// Enable (`Some`) or disable (`None`) the FP8 dgrad / wgrad GEMMs with the
@@ -3253,8 +3264,10 @@ impl OxideBackend {
         let blocks = tiles * splits;
         // SAFETY: extents validated above; each C element has one owner
         // thread and instances writing the same `c` slot are not allowed.
+        macro_rules! launch_f8 {
+            ($kernel:ident) => {
         unsafe {
-            self.gemm_f8.sgemm_fp8_mma(
+            self.gemm_f8.$kernel(
                 &self.stream,
                 launch::blocks_of(blocks, gemm_f8::F8_THREADS),
                 a,
@@ -3287,7 +3300,14 @@ impl OxideBackend {
                 scale_b,
             )
         }
-        .map_err(launch_err)?;
+            };
+        }
+        // The e4m3 x e4m3 kernel has no runtime format `match` in its mma loop.
+        let both_e4m3 = fmt_a == Fp8Format::E4M3
+            && fmt_b == Fp8Format::E4M3
+            && !self.fp8_generic_kernel.load(Ordering::Relaxed);
+        let launched = if both_e4m3 { launch_f8!(sgemm_fp8_mma_e4m3) } else { launch_f8!(sgemm_fp8_mma) };
+        launched.map_err(launch_err)?;
         if let Some(w) = ws {
             // SAFETY: one thread per output element; `c` extent validated above.
             unsafe {

@@ -417,6 +417,38 @@ fn gemm_fp8_nn_is_bitwise_equal_to_nt_on_the_same_data() {
 }
 
 #[test]
+fn fp8_e4m3_specialised_kernel_matches_generic() {
+    // e4m3 x e4m3 normally runs `sgemm_fp8_mma_e4m3`; the seam forces the
+    // generic-format kernel on the same operands. Same tiling, same K order:
+    // the bits must be identical, in all four transposes, with a K tail, a
+    // partial tile and the split-K path (65 x 3 x 200).
+    let be = OxideBackend::new().expect("backend");
+    for &(m, n, k) in &[(96usize, 80usize, 256usize), (65, 3, 200), (130, 70, 129), (64, 64, 4096)] {
+        for &(ta, tb) in &[(false, false), (false, true), (true, false), (true, true)] {
+            let mut rng = Rng(0x7000 + (m * 7 + k) as u64);
+            let a = rng.vec(m * k, -2.0, 2.0);
+            let b = rng.vec(k * n, -2.0, 2.0);
+            let aq: Vec<u8> = a.iter().map(|x| f32_to_fp8(*x, Fp8Format::E4M3)).collect();
+            let bq: Vec<u8> = b.iter().map(|x| f32_to_fp8(*x, Fp8Format::E4M3)).collect();
+            be.set_fp8_generic_kernel(false);
+            let special = be
+                .gemm_fp8(&aq, &bq, m, n, k, ta, tb, 0.75, Fp8Format::E4M3, Fp8Format::E4M3)
+                .expect("specialised");
+            be.set_fp8_generic_kernel(true);
+            let generic = be
+                .gemm_fp8(&aq, &bq, m, n, k, ta, tb, 0.75, Fp8Format::E4M3, Fp8Format::E4M3)
+                .expect("generic");
+            be.set_fp8_generic_kernel(false);
+            let (s, g) = (download(&be, &special), download(&be, &generic));
+            assert!(
+                s.iter().zip(&g).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "{m}x{n}x{k} ta={ta} tb={tb}: specialised and generic kernels differ"
+            );
+        }
+    }
+}
+
+#[test]
 fn gemm_fp8_odd_shapes_and_mixed_formats() {
     let be = OxideBackend::new().expect("backend");
     // Shapes that exercise the K tail (< 32, not a multiple of 32), partial

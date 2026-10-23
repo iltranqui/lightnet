@@ -133,6 +133,13 @@ pub fn mma_f8_k32(c: [f32; 4], a: [u32; 4], b: [u32; 2], fmt_a: u32, fmt_b: u32)
     }
 }
 
+/// [`mma_f8_k32`] fixed to e4m3 x e4m3: no runtime format `match` in the hot loop.
+#[device]
+pub fn mma_f8_k32_e4m3(c: [f32; 4], a: [u32; 4], b: [u32; 2]) -> [f32; 4] {
+    // SAFETY: as [`mma_f8_k32`].
+    unsafe { mma_m16n8k32_fp8_f32_e4m3_e4m3(c, a, b) }
+}
+
 /// One `mma.m16n8k16` with the FP8 pair selected by `fmt_a` / `fmt_b`.
 /// All 32 lanes must call it; `a` is two registers and `b` one.
 #[device]
@@ -1012,6 +1019,242 @@ pub mod kernels {
                     let o = (mi * 4 + ni) * 4;
                     let cin = [acc[o], acc[o + 1], acc[o + 2], acc[o + 3]];
                     let d = mma_f8_k32(cin, af, bf[ni], fmt_a, fmt_b);
+                    acc[o] = d[0];
+                    acc[o + 1] = d[1];
+                    acc[o + 2] = d[2];
+                    acc[o + 3] = d[3];
+                });
+            });
+            if has_next {
+                store_b!(it + 1);
+            }
+            it += 1;
+        }
+
+        unroll!(2, mi, {
+            unroll!(4, ni, {
+                unroll!(4, j, {
+                    let gm = row0 + wm + mi * 16 + g + if j >= 2 { 8 } else { 0 };
+                    let gn = col0 + wn + ni * 8 + 2 * t + (j & 1);
+                    if gm < m && gn < n {
+                        let idx = c_off + gm * ldc + gn;
+                        // SAFETY: each (instance, row, column) has exactly one
+                        // owner thread; the extents are checked by the host.
+                        unsafe {
+                            let dst = c.as_mut_ptr().add(idx);
+                            let prev = if beta == 0.0 { 0.0 } else { beta * *dst };
+                            // `scale_*[1]` is the reciprocal dequantisation factor:
+                            // the mma works in the quantised domain.
+                            let alpha = alpha * scale_a[1] * scale_b[1];
+                            *dst = alpha * acc[(mi * 4 + ni) * 4 + j] + prev;
+                        }
+                    }
+                });
+            });
+        });
+    }
+
+    /// [`sgemm_fp8_mma`] for e4m3 x e4m3 operands: a verbatim copy of its body
+    /// (keep the two in sync; `fp8_e4m3_specialised_kernel_matches_generic` pins
+    /// them bitwise) whose tensor-core step has no runtime format `match`.
+    /// `fmt_a` / `fmt_b` are accepted for signature parity and ignored.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn sgemm_fp8_mma_e4m3(
+        a: &[u8],
+        b: &[u8],
+        mut c: DisjointSlice<f32>,
+        m: usize,
+        n: usize,
+        k: usize,
+        lda: usize,
+        ldb: usize,
+        ldc: usize,
+        trans_a: u32,
+        trans_b: u32,
+        alpha: f32,
+        beta: f32,
+        a_base: usize,
+        a_stride: usize,
+        a_mod: usize,
+        b_base: usize,
+        b_stride: usize,
+        b_mod: usize,
+        c_base: usize,
+        c_stride: usize,
+        c_mod: usize,
+        count: usize,
+        kchunk: usize,
+        _fmt_a: u32,
+        _fmt_b: u32,
+        scale_a: &[f32],
+        scale_b: &[f32],
+    ) {
+        // Two stages per operand; A is 16-byte aligned for `cp.async`.
+        static mut AS: SharedArray<u32, { 2 * F8_BM * LD_A / 4 }, 16> = SharedArray::UNINIT;
+        static mut BS: SharedArray<u32, { 2 * F8_BN * LD_B / 4 }, 16> = SharedArray::UNINIT;
+        let asw = unsafe { SharedArray::as_raw_mut_ptr(&raw mut AS) };
+        let bsw = unsafe { SharedArray::as_raw_mut_ptr(&raw mut BS) };
+        let asp = asw as *mut u8;
+        let bsp = bsw as *mut u8;
+
+        let tid = thread::threadIdx_x() as usize;
+        let warp = tid / 32;
+        let lane = tid % 32;
+        let g = lane / 4;
+        let t = lane % 4;
+        let wm = (warp / 2) * 32;
+        let wn = (warp % 2) * 32;
+
+        let tiles_n = n.div_ceil(F8_BN);
+        let tiles_m = m.div_ceil(F8_BM);
+        let block = thread::blockIdx_x() as usize;
+        let per_instance = tiles_m * tiles_n;
+        let inst_all = block / per_instance;
+        let inst = inst_all % count;
+        let kbeg = (inst_all / count) * kchunk;
+        let kend = if kbeg + kchunk < k { kbeg + kchunk } else { k };
+        let tile = block % per_instance;
+        let row0 = (tile / tiles_n) * F8_BM;
+        let col0 = (tile % tiles_n) * F8_BN;
+
+        // `trans_*` describe the logical GEMM operand ("NN" means B is
+        // stored [k][n]); the staging helper wants "contiguous along K", which
+        // is the complement for B and the same for A.
+        let stage_trans_a = trans_a;
+        let stage_trans_b = 1 - trans_b;
+        let a_off = a_base + (inst % a_mod) * a_stride;
+        let b_off = b_base + (inst % b_mod) * b_stride;
+        let c_off = c_base + (inst_all % c_mod) * c_stride;
+
+        // This thread's 16-byte chunk of each operand tile: `F8_THREADS`
+        // threads cover `F8_BM` rows x `CHUNKS_PER_ROW` chunks exactly.
+        let stage_row = tid / CHUNKS_PER_ROW;
+        let stage_kb = (tid % CHUNKS_PER_ROW) * 16;
+
+        // acc[(mi * 4 + ni) * 4 + j]
+        let mut acc = [0.0f32; 32];
+
+        let vec_a = (stage_trans_a == 0 && lda % 16 == 0 && (a.as_ptr() as usize + a_off) % 16 == 0)
+            as u32;
+        let nk = (kend - kbeg).div_ceil(F8_BK);
+        let mut breg = [0u32; 4];
+        // A goes global -> shared (cp.async when aligned), B through registers.
+        macro_rules! issue_a {
+            ($tile:expr) => {{
+                let tile_i: usize = $tile;
+                // SAFETY: row < 64 and kb + 16 <= 32 <= LD_A inside the stage;
+                // 16-byte aligned (LD_A and the stage size are multiples of 16).
+                unsafe {
+                    fp8_issue16(
+                        asw.add((tile_i & 1) * (F8_BM * LD_A / 4) + (stage_row * LD_A + stage_kb) / 4),
+                        a,
+                        a_off,
+                        lda,
+                        kend,
+                        m,
+                        row0,
+                        stage_row,
+                        kbeg + tile_i * F8_BK,
+                        stage_kb,
+                        stage_trans_a,
+                        vec_a,
+                    );
+                    cuda_device::async_copy::cp_async_commit_group();
+                }
+            }};
+        }
+        macro_rules! load_b {
+            ($tile:expr) => {{
+                let k0 = kbeg + ($tile) * F8_BK;
+                if stage_trans_b == 1 {
+                    fp8_stage_t4(&mut breg, b, b_off, ldb, kend, n, col0, tid % 16, k0, tid / 16);
+                } else {
+                    fp8_stage16(
+                        &mut breg,
+                        b,
+                        b_off,
+                        ldb,
+                        kend,
+                        n,
+                        col0,
+                        stage_row,
+                        k0,
+                        stage_kb,
+                        stage_trans_b,
+                    );
+                }
+            }};
+        }
+        macro_rules! store_b {
+            ($tile:expr) => {{
+                let base = (($tile) & 1) * (F8_BN * LD_B / 4);
+                unroll!(4, w, {
+                    // SAFETY: the offsets stay inside this stage's B tile and
+                    // are word aligned (`LD_B` and `stage_kb` are multiples of 4).
+                    unsafe {
+                        // `trans == 1` blocks hold column `4 ng + w`, K bytes
+                        // `4 kg ..`; the others a 16-byte K run of one row.
+                        let boff = if stage_trans_b == 1 {
+                            ((tid % 16) * 4 + w) * LD_B / 4 + tid / 16
+                        } else {
+                            (stage_row * LD_B + stage_kb) / 4 + w
+                        };
+                        bsw.add(base + boff).write(breg[w]);
+                    }
+                });
+            }};
+        }
+        if nk > 0 {
+            issue_a!(0);
+            load_b!(0);
+            store_b!(0);
+        }
+
+        let mut it = 0usize;
+        while it < nk {
+            // Tile `it` of A is the only group in flight here.
+            unsafe { cuda_device::async_copy::cp_async_wait_group(0) };
+            // Publishes tile `it` (A and B); also proves every warp is done
+            // reading the stage that tile `it + 1` is about to overwrite.
+            thread::sync_threads();
+            let has_next = it + 1 < nk;
+            if has_next {
+                issue_a!(it + 1);
+                load_b!(it + 1);
+            }
+            let asp = unsafe { asp.add((it & 1) * (F8_BM * LD_A)) };
+            let bsp = unsafe { bsp.add((it & 1) * (F8_BN * LD_B)) };
+
+            // One mma k step per 32-element tile (F8_BK == 32).
+            let mut bf = [[0u32; 2]; 4];
+            unroll!(4, ni, {
+                let col = wn + ni * 8 + g;
+                unroll!(2, r, {
+                    let kk = t * 4 + r * 16;
+                    // SAFETY: `col < F8_BN` and `kk + 3 < F8_BK`, so the four
+                    // bytes are inside the staged B tile; `LD_B` is a multiple
+                    // of 4 and `kk` is too, so the word access is aligned.
+                    unsafe {
+                        bf[ni][r] = (bsp.add(col * LD_B + kk) as *const u32).read();
+                    }
+                });
+            });
+            unroll!(2, mi, {
+                let row = wm + mi * 16 + g;
+                let mut af = [0u32; 4];
+                unroll!(2, r, {
+                    let kk = t * 4 + r * 16;
+                    // SAFETY: as above for the A tile.
+                    unsafe {
+                        af[r * 2] = (asp.add(row * LD_A + kk) as *const u32).read();
+                        af[r * 2 + 1] = (asp.add((row + 8) * LD_A + kk) as *const u32).read();
+                    }
+                });
+                unroll!(4, ni, {
+                    let o = (mi * 4 + ni) * 4;
+                    let cin = [acc[o], acc[o + 1], acc[o + 2], acc[o + 3]];
+                    let d = mma_f8_k32_e4m3(cin, af, bf[ni]);
                     acc[o] = d[0];
                     acc[o + 1] = d[1];
                     acc[o + 2] = d[2];
