@@ -58,7 +58,7 @@ pub const F8_THREADS: u32 = 128;
 /// bytes + 8 bytes of bank padding.  A fragment reads are 4 consecutive K
 /// bytes at `m * LD_A + 4t`, so the stride must be a multiple of 4 for the
 /// 32-bit access to stay aligned.
-const LD_A: usize = F8_BK + 8;
+const LD_A: usize = F8_BK + 16;
 /// Shared row stride of the B tile in bytes (B is staged `[n][k]`): 32 data
 /// bytes + 4 bytes of padding.  B is *not* stored `[k][n]` like in global
 /// memory: an mma B register holds four K values of one column, which in the
@@ -283,6 +283,60 @@ pub fn fp8_stage_t4(
                 let byte = unsafe { *at.add((gk + r) * ldr + gn + j) };
                 dst[j] |= (byte as u32) << (8 * r);
             }
+        }
+    }
+}
+
+/// Issues one thread's 16-byte chunk of an operand tile into shared memory
+/// at `dst` (a 16-byte aligned shared word pointer).  `vec != 0`: the operand
+/// is K-contiguous with 16-byte aligned rows (`trans == 0`), so the chunk is
+/// one `cp.async.cg` that zero-fills past the K edge and past the last row;
+/// otherwise the chunk goes through [`fp8_stage16`] and plain shared stores.
+///
+/// # Safety
+/// `dst` points at 4 writable shared words; `vec != 0` requires
+/// `ldr % 16 == 0`, `(buf + base) % 16 == 0` and `k0 + kb` a multiple of 16.
+#[allow(clippy::too_many_arguments)]
+#[device]
+pub unsafe fn fp8_issue16(
+    dst: *mut u32,
+    buf: &[u8],
+    base: usize,
+    ldr: usize,
+    k: usize,
+    rows: usize,
+    row0: usize,
+    row: usize,
+    k0: usize,
+    kb: usize,
+    trans: u32,
+    vec: u32,
+) {
+    if vec != 0 {
+        let grow = row0 + row;
+        let gk = k0 + kb;
+        let remaining = if gk < k { k - gk } else { 0 };
+        let ok = grow < rows && remaining > 0;
+        let bytes = if remaining > 16 { 16 } else { remaining };
+        let src = if ok { base + grow * ldr + gk } else { 0 };
+        // SAFETY: when `ok`, `src` addresses `bytes` valid bytes of `buf`;
+        // otherwise 0 bytes are read (zero fill) from element 0.
+        unsafe {
+            cuda_device::async_copy::cp_async_cg_zfill_16(
+                dst,
+                buf.as_ptr().add(src),
+                if ok { bytes as u32 } else { 0 },
+            );
+        }
+    } else {
+        let mut r = [0u32; 4];
+        fp8_stage16(&mut r, buf, base, ldr, k, rows, row0, row, k0, kb, trans);
+        // SAFETY: the caller guarantees 4 writable shared words at `dst`.
+        unsafe {
+            dst.write(r[0]);
+            dst.add(1).write(r[1]);
+            dst.add(2).write(r[2]);
+            dst.add(3).write(r[3]);
         }
     }
 }
@@ -793,10 +847,13 @@ pub mod kernels {
         scale_a: &[f32],
         scale_b: &[f32],
     ) {
-        static mut AS: SharedArray<u8, { F8_BM * LD_A }, 16> = SharedArray::UNINIT;
-        static mut BS: SharedArray<u8, { F8_BN * LD_B }, 16> = SharedArray::UNINIT;
-        let asp = unsafe { SharedArray::as_raw_mut_ptr(&raw mut AS) };
-        let bsp = unsafe { SharedArray::as_raw_mut_ptr(&raw mut BS) };
+        // Two stages per operand; A is 16-byte aligned for `cp.async`.
+        static mut AS: SharedArray<u32, { 2 * F8_BM * LD_A / 4 }, 16> = SharedArray::UNINIT;
+        static mut BS: SharedArray<u32, { 2 * F8_BN * LD_B / 4 }, 16> = SharedArray::UNINIT;
+        let asw = unsafe { SharedArray::as_raw_mut_ptr(&raw mut AS) };
+        let bsw = unsafe { SharedArray::as_raw_mut_ptr(&raw mut BS) };
+        let asp = asw as *mut u8;
+        let bsp = bsw as *mut u8;
 
         let tid = thread::threadIdx_x() as usize;
         let warp = tid / 32;
@@ -835,83 +892,38 @@ pub mod kernels {
         // acc[(mi * 4 + ni) * 4 + j]
         let mut acc = [0.0f32; 32];
 
+        let vec_a = (stage_trans_a == 0 && lda % 16 == 0 && (a.as_ptr() as usize + a_off) % 16 == 0)
+            as u32;
         let nk = (kend - kbeg).div_ceil(F8_BK);
-        let mut areg = [0u32; 4];
         let mut breg = [0u32; 4];
-        if nk > 0 {
-            fp8_stage16(
-                &mut areg,
-                a,
-                a_off,
-                lda,
-                kend,
-                m,
-                row0,
-                stage_row,
-                kbeg,
-                stage_kb,
-                stage_trans_a,
-            );
-            if stage_trans_b == 1 {
-                fp8_stage_t4(&mut breg, b, b_off, ldb, kend, n, col0, tid % 16, kbeg, tid / 16);
-            } else {
-                fp8_stage16(
-                    &mut breg,
-                    b,
-                    b_off,
-                    ldb,
-                    kend,
-                    n,
-                    col0,
-                    stage_row,
-                    kbeg,
-                    stage_kb,
-                    stage_trans_b,
-                );
-            }
-        }
-
-        let mut it = 0usize;
-        while it < nk {
-            // Publish the staged tile.
-            thread::sync_threads();
-            unroll!(4, w, {
-                // SAFETY: `stage_row < 64` and `stage_kb + 15` is inside both
-                // strides, so each 4-byte store lands inside its tile; both
-                // strides are multiples of 4 and the shared bases are
-                // 16-byte aligned, so every store is aligned.
+        // A goes global -> shared (cp.async when aligned), B through registers.
+        macro_rules! issue_a {
+            ($tile:expr) => {{
+                let tile_i: usize = $tile;
+                // SAFETY: row < 64 and kb + 16 <= 32 <= LD_A inside the stage;
+                // 16-byte aligned (LD_A and the stage size are multiples of 16).
                 unsafe {
-                    (asp as *mut u32)
-                        .add((stage_row * LD_A + stage_kb) / 4 + w)
-                        .write(areg[w]);
-                    // `trans == 1` blocks hold column `4 ng + w`, K bytes
-                    // `4 kg ..`; the others a 16-byte K run of one row.
-                    let boff = if stage_trans_b == 1 {
-                        ((tid % 16) * 4 + w) * LD_B / 4 + tid / 16
-                    } else {
-                        (stage_row * LD_B + stage_kb) / 4 + w
-                    };
-                    (bsp as *mut u32).add(boff).write(breg[w]);
+                    fp8_issue16(
+                        asw.add((tile_i & 1) * (F8_BM * LD_A / 4) + (stage_row * LD_A + stage_kb) / 4),
+                        a,
+                        a_off,
+                        lda,
+                        kend,
+                        m,
+                        row0,
+                        stage_row,
+                        kbeg + tile_i * F8_BK,
+                        stage_kb,
+                        stage_trans_a,
+                        vec_a,
+                    );
+                    cuda_device::async_copy::cp_async_commit_group();
                 }
-            });
-            thread::sync_threads();
-
-            // Prefetch the next tile into registers.
-            if it + 1 < nk {
-                let k0 = kbeg + (it + 1) * F8_BK;
-                fp8_stage16(
-                    &mut areg,
-                    a,
-                    a_off,
-                    lda,
-                    kend,
-                    m,
-                    row0,
-                    stage_row,
-                    k0,
-                    stage_kb,
-                    stage_trans_a,
-                );
+            }};
+        }
+        macro_rules! load_b {
+            ($tile:expr) => {{
+                let k0 = kbeg + ($tile) * F8_BK;
                 if stage_trans_b == 1 {
                     fp8_stage_t4(&mut breg, b, b_off, ldb, kend, n, col0, tid % 16, k0, tid / 16);
                 } else {
@@ -929,7 +941,47 @@ pub mod kernels {
                         stage_trans_b,
                     );
                 }
+            }};
+        }
+        macro_rules! store_b {
+            ($tile:expr) => {{
+                let base = (($tile) & 1) * (F8_BN * LD_B / 4);
+                unroll!(4, w, {
+                    // SAFETY: the offsets stay inside this stage's B tile and
+                    // are word aligned (`LD_B` and `stage_kb` are multiples of 4).
+                    unsafe {
+                        // `trans == 1` blocks hold column `4 ng + w`, K bytes
+                        // `4 kg ..`; the others a 16-byte K run of one row.
+                        let boff = if stage_trans_b == 1 {
+                            ((tid % 16) * 4 + w) * LD_B / 4 + tid / 16
+                        } else {
+                            (stage_row * LD_B + stage_kb) / 4 + w
+                        };
+                        bsw.add(base + boff).write(breg[w]);
+                    }
+                });
+            }};
+        }
+        if nk > 0 {
+            issue_a!(0);
+            load_b!(0);
+            store_b!(0);
+        }
+
+        let mut it = 0usize;
+        while it < nk {
+            // Tile `it` of A is the only group in flight here.
+            unsafe { cuda_device::async_copy::cp_async_wait_group(0) };
+            // Publishes tile `it` (A and B); also proves every warp is done
+            // reading the stage that tile `it + 1` is about to overwrite.
+            thread::sync_threads();
+            let has_next = it + 1 < nk;
+            if has_next {
+                issue_a!(it + 1);
+                load_b!(it + 1);
             }
+            let asp = unsafe { asp.add((it & 1) * (F8_BM * LD_A)) };
+            let bsp = unsafe { bsp.add((it & 1) * (F8_BN * LD_B)) };
 
             // One mma k step per 32-element tile (F8_BK == 32).
             let mut bf = [[0u32; 2]; 4];
@@ -966,6 +1018,9 @@ pub mod kernels {
                     acc[o + 3] = d[3];
                 });
             });
+            if has_next {
+                store_b!(it + 1);
+            }
             it += 1;
         }
 
