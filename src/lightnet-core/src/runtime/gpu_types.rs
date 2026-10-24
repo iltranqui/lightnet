@@ -220,7 +220,7 @@ where
     pub(super) device_eml_train_buffers: RefCell<Vec<Option<GpuEmlTrainBuffers<B::Tensor>>>>,
     pub(super) device_dcnv4_train_buffers: RefCell<Vec<Option<GpuDcnv4TrainBuffers<B::Tensor>>>>,
     /// Reusable DCNv4 parameter uploads; snapshots detect public host edits.
-    pub(super) dcnv4_device_params: RefCell<Vec<Option<dcnv4_gpu::DeviceParameters<B::Tensor>>>>,
+    pub(crate) dcnv4_device_params: RefCell<Vec<Option<dcnv4_gpu::DeviceParameters<B::Tensor>>>>,
     pub(super) cpu_fallback_train_buffers: RefCell<Vec<LayerTrainBuffers>>,
     pub(super) capture_input_gradient: Cell<bool>,
     pub(super) captured_input_gradient: RefCell<Option<Tensor>>,
@@ -521,14 +521,14 @@ pub(super) struct GpuDcnv4AdamState<T> {
 /// Native f32 DCNv4 parameter-gradient accumulators. Gradients stay on-device
 /// through the native optimizer boundary and flush only for host fallback.
 #[derive(Clone, Debug)]
-pub(super) struct GpuDcnv4TrainBuffers<T> {
-    pub(super) bias_updates: T,
-    pub(super) offset_weight_updates: T,
-    pub(super) offset_bias_updates: T,
-    pub(super) scale_updates: Option<T>,
-    pub(super) momentum_bias: T,
-    pub(super) momentum_offset_weights: T,
-    pub(super) momentum_offset_biases: T,
-    pub(super) momentum_scale: Option<T>,
-    pub(super) dirty: bool,
+pub(crate) struct GpuDcnv4TrainBuffers<T> {
+    pub(crate) bias_updates: T,
+    pub(crate) offset_weight_updates: T,
+    pub(crate) offset_bias_updates: T,
+    pub(crate) scale_updates: Option<T>,
+    pub(crate) momentum_bias: T,
+    pub(crate) momentum_offset_weights: T,
+    pub(crate) momentum_offset_biases: T,
+    pub(crate) momentum_scale: Option<T>,
+    pub(crate) dirty: bool,
 }

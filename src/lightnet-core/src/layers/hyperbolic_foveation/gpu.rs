@@ -1,4 +1,6 @@
-use super::*;
+use crate::error::{Error, Result};
+use crate::model::{LayerKind, Network};
+use crate::runtime::*;
 
 pub(crate) fn hyperbolic_foveation_predictor_initial_biases(
     spec: &crate::model::HyperbolicFoveationSpec,
@@ -30,7 +32,7 @@ pub(crate) fn hyperbolic_foveation_predictor_initial_biases(
     biases
 }
 
-pub(super) fn clamp_hyperbolic_foveation_params(
+pub(crate) fn clamp_hyperbolic_foveation_params(
     spec: &crate::model::HyperbolicFoveationSpec,
     params: &mut HyperbolicFoveationParams,
 ) {
@@ -122,7 +124,7 @@ pub(crate) fn validate_hyperbolic_foveation_param_layout(
     Ok(())
 }
 
-pub(super) fn hyperbolic_foveation_params_from_values(
+pub(crate) fn hyperbolic_foveation_params_from_values(
     values: &[f32],
     spec: &crate::model::HyperbolicFoveationSpec,
 ) -> Result<crate::hyperbolic_foveation::HfParams> {
@@ -149,7 +151,7 @@ pub(super) fn hyperbolic_foveation_params_from_values(
     })
 }
 
-pub(super) fn hyperbolic_foveation_auxiliary_param_gradients(
+pub(crate) fn hyperbolic_foveation_auxiliary_param_gradients(
     network: &Network,
     forward: &ForwardResult,
     labels: &[Vec<crate::train::YoloLabel>],
@@ -287,7 +289,7 @@ pub(super) fn hyperbolic_foveation_auxiliary_param_gradients(
     Ok(gradients)
 }
 
-pub(super) fn forward_hyperbolic_foveation(
+pub(crate) fn forward_hyperbolic_foveation(
     network: &Network,
     layer: &crate::model::Layer,
     spec: &crate::model::HyperbolicFoveationSpec,
@@ -392,7 +394,7 @@ pub(super) fn forward_hyperbolic_foveation(
     ))
 }
 
-pub(super) fn backward_hyperbolic_foveation(
+pub(crate) fn backward_hyperbolic_foveation(
     spec: &crate::model::HyperbolicFoveationSpec,
     params: &HyperbolicFoveationParams,
     warp_input: &Tensor,

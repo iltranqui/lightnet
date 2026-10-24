@@ -1,5 +1,5 @@
 //! Native f32 forward composition for frozen `[laya_scorer]` layers.
-use super::{backend_error, tensor_backend_shape};
+use crate::runtime::{backend_error, tensor_backend_shape};
 use crate::error::{Error, Result};
 use crate::laya_scorer::LayaScorerWeights;
 use crate::model::{LayaScorerSpec, TensorShape};
@@ -13,7 +13,7 @@ fn count(name: &str, a: usize, b: usize) -> Result<usize> {
         })
 }
 
-pub(super) fn forward<B: F32TensorOpsBackend>(
+pub(crate) fn forward<B: F32TensorOpsBackend>(
     backend: &B,
     spec: &LayaScorerSpec,
     weights: &LayaScorerWeights,
@@ -136,7 +136,7 @@ where
         .map_err(|e| backend_error("GPU LayaScorer pack", e))
 }
 
-pub(super) fn backward_input<B: F32TensorOpsBackend>(
+pub(crate) fn backward_input<B: F32TensorOpsBackend>(
     backend: &B,
     spec: &LayaScorerSpec,
     weights: &LayaScorerWeights,

@@ -1,5 +1,5 @@
 //! Native f32 frozen LayaHead forward composition.
-use super::{backend_error, tensor_backend_shape};
+use crate::runtime::{backend_error, tensor_backend_shape};
 use crate::error::{Error, Result};
 use crate::laya_head::{LayaHeadGeometry, LayaHeadWeights};
 use crate::model::{LayaHeadSpec, TensorShape};
@@ -13,7 +13,7 @@ fn extent(name: &str, a: usize, b: usize) -> Result<usize> {
         })
 }
 
-pub(super) fn forward<B: F32TensorOpsBackend>(
+pub(crate) fn forward<B: F32TensorOpsBackend>(
     backend: &B,
     spec: &LayaHeadSpec,
     weights: &LayaHeadWeights,

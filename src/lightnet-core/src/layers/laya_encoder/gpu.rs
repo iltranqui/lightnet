@@ -1,5 +1,5 @@
 //! Native f32 inference composition for the frozen LayaEncoder.
-use super::{backend_error, tensor_backend_shape};
+use crate::runtime::{backend_error, tensor_backend_shape};
 use crate::error::{Error, Result};
 use crate::laya_encoder::{LayaEncoderGeometry, LayaEncoderWeights, build_rope_table};
 use crate::model::{LayaEncoderSpec, TensorShape};
@@ -13,7 +13,7 @@ fn count(name: &str, values: &[usize]) -> Result<usize> {
         })
 }
 
-pub(super) fn forward<B: F32TensorOpsBackend>(
+pub(crate) fn forward<B: F32TensorOpsBackend>(
     backend: &B,
     spec: &LayaEncoderSpec,
     weights: &LayaEncoderWeights,

@@ -1,5 +1,5 @@
 //! Native f32 forward composition only. Backward/update semantics stay unchanged.
-use super::{backend_error, tensor_backend_shape};
+use crate::runtime::{backend_error, tensor_backend_shape};
 use crate::error::{Error, Result};
 use crate::laya_act_head::LayaActHeadWeights;
 use crate::model::{LayaActHeadSpec, TensorShape};
@@ -17,7 +17,7 @@ fn count(name: &str, a: usize, b: usize) -> Result<usize> {
         })
 }
 
-pub(super) fn forward<B: F32TensorOpsBackend>(
+pub(crate) fn forward<B: F32TensorOpsBackend>(
     backend: &B,
     spec: &LayaActHeadSpec,
     weights: &LayaActHeadWeights,
@@ -94,7 +94,7 @@ where
         .map_err(|e| backend_error("GPU act fc2", e))
 }
 
-pub(super) fn forward_f16<B: F16TensorOpsBackend>(
+pub(crate) fn forward_f16<B: F16TensorOpsBackend>(
     backend: &B,
     spec: &LayaActHeadSpec,
     weights: &LayaActHeadWeights,

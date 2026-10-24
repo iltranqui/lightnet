@@ -17,43 +17,44 @@
 //! The public re-exports below form the application-facing API.  The modules
 //! remain public for advanced users extending a specific part of the port.
 
+mod layers;
 pub(crate) mod activation_math;
 pub mod augmentation;
 #[cfg(test)]
 pub(crate) mod axis_fixture;
 pub use augmentation::DetectorAugmentation;
-pub mod carpn;
-pub mod centernet;
+pub use layers::carpn;
+pub use layers::centernet;
 pub mod cfg;
-pub(crate) mod channel_shuffle;
-pub(crate) mod channel_slice;
+pub(crate) use layers::channel_shuffle;
+pub(crate) use layers::channel_slice;
 pub mod chart;
-pub mod clifford;
-pub(crate) mod contrastive;
+pub use layers::clifford;
+pub(crate) use layers::contrastive;
 pub mod cuboid_labels;
 pub use cuboid_labels::{
     CuboidLabel, MixedLabel, Yolo3dCrop, Yolo3dImageMeta, Yolo3dTruthBatch,
     encode_mixed_yolo_3d_truths, encode_yolo_3d_truths, load_cuboid_labels,
     load_pure_cuboid_labels, parse_cuboid_labels, parse_mixed_cuboid_labels,
 };
-pub(crate) mod dcnv4;
-pub(crate) mod deform_conv;
-pub(crate) mod dsconv;
-pub(crate) mod foveation_film;
-pub(crate) mod graph_conv;
-pub(crate) mod hyperbolic_foveation;
+pub(crate) use layers::dcnv4;
+pub(crate) use layers::deform_conv;
+pub(crate) use layers::dsconv;
+pub(crate) use layers::foveation_film;
+pub(crate) use layers::graph_conv;
+pub(crate) use layers::hyperbolic_foveation;
 pub use chart::{ChartPoint, write_training_chart};
 pub use clifford::{CliffordBranchTrainBuffers, CliffordParams, CliffordTrainBuffers};
 pub mod dense_loss;
-pub mod depth_anything;
-pub(crate) mod dpt_head;
+pub use layers::depth_anything;
+pub(crate) use layers::dpt_head;
 pub use dense_loss::{
     DenseTrainingLoss, compute_dense_training_loss, compute_dense_training_loss_at,
 };
 pub use dpt_head::DptHeadWeights;
-pub(crate) mod deconvolutional;
+pub(crate) use layers::deconvolutional;
 pub mod detect;
-pub(crate) mod eml_conv_math;
+pub(crate) use layers::eml_conv_math;
 pub mod error;
 pub mod evaluate;
 pub use evaluate::{
@@ -62,21 +63,21 @@ pub use evaluate::{
 };
 pub mod image;
 pub mod initialize;
-pub(crate) mod jev_ce;
-pub mod kimi_kda;
-pub mod laya_act_head;
-pub mod laya_encoder;
-pub mod laya_head;
-pub mod laya_loss;
-pub mod laya_marker_gather;
-pub mod laya_scorer;
+pub(crate) use layers::jev_ce;
+pub use layers::kimi_kda;
+pub use layers::laya_act_head;
+pub use layers::laya_encoder;
+pub use layers::laya_head;
+pub use layers::laya_loss;
+pub use layers::laya_marker_gather;
+pub use layers::laya_scorer;
 pub mod loader_profile;
-pub mod moe_conv;
+pub use layers::moe_conv;
 pub use initialize::initialize_training_params;
-pub mod mambavision;
-pub(crate) mod maxpool_depth;
+pub use layers::mambavision;
+pub(crate) use layers::maxpool_depth;
 pub mod model;
-pub mod modern_yolo;
+pub use layers::modern_yolo;
 pub(crate) mod muon;
 pub(crate) mod muon_runtime;
 pub mod names;
@@ -116,19 +117,18 @@ pub use obb_training::{
     obb_yolo_covariance_prediction_match_score_with_viou, obb_yolo_front_point_regression_deltas,
     obb_yolo_match_score, select_obb_yolo_cell_truth_match, visit_obb_yolo_batch_head_matches,
 };
-pub(crate) mod omd_loss;
+pub(crate) use layers::omd_loss;
 pub mod runtime;
-pub(crate) mod segmentation;
-pub(crate) mod shortcut_weights;
-pub(crate) mod swin;
-pub(crate) mod swin_block;
+pub(crate) use layers::segmentation;
+pub(crate) use layers::shortcut_weights;
+pub(crate) use layers::swin;
+pub(crate) use layers::swin::block as swin_block;
 pub mod train;
-pub(crate) mod tucker_attention;
-#[allow(dead_code)] // VC reference helpers are integrated incrementally.
-pub(crate) mod vc_attention;
-pub(crate) mod vit;
+pub(crate) use layers::tucker_attention;
+pub(crate) use layers::vc_attention;
+pub(crate) use layers::vit;
 pub mod weights;
-pub(crate) mod wmhf;
+pub(crate) use layers::wmhf;
 pub mod yolo_3d;
 
 pub use carpn::{ObbRefineOutput, ObbRefineProposal};

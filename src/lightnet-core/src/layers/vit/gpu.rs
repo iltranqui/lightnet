@@ -1,14 +1,14 @@
 //! Native f32 inference composition for `[vit]` (no cache, no MSA, no VC attention).
-use super::backend_error;
+use crate::runtime::{GpuExecutableNetwork, backend_error, tensor_backend_shape};
 use crate::error::{Error, Result};
-use crate::model::{Activation, TensorShape};
-use crate::vit::{VitGeometry, VitWeights};
+use crate::model::{Activation, Layer, TensorShape};
+use crate::vit::{VitForwardCache, VitGeometry, VitWeights};
 use lightnet_cuda::{ElementwiseLaunchConfig, F32ActivationKind, F32TensorOpsBackend};
 
 const FEATURE_CLIP: f32 = 10.0;
 
 /// Device activation matching `vit::tensor_activation`; `None` keeps the host path.
-pub(super) fn device_activation(activation: &Activation) -> Option<F32ActivationKind> {
+pub(crate) fn device_activation(activation: &Activation) -> Option<F32ActivationKind> {
     use Activation::*;
     Some(match activation {
         Linear => F32ActivationKind::Linear,
@@ -35,7 +35,7 @@ pub(super) fn device_activation(activation: &Activation) -> Option<F32Activation
 }
 
 /// Whether the native inference path covers this geometry.
-pub(super) fn supported(g: &VitGeometry) -> bool {
+pub(crate) fn supported(g: &VitGeometry) -> bool {
     g.msa.is_none()
         && !g.vc_attention
         && g.heads > 0
@@ -44,7 +44,7 @@ pub(super) fn supported(g: &VitGeometry) -> bool {
         && device_activation(&g.activation).is_some()
 }
 
-pub(super) fn forward<B: F32TensorOpsBackend>(
+pub(crate) fn forward<B: F32TensorOpsBackend>(
     backend: &B,
     g: &VitGeometry,
     weights: &VitWeights,
@@ -195,4 +195,68 @@ where
         .vit_tokens_to_nchw_f32(&mixed, g.batch, out_h, out_w, hidden, config)
         .map_err(|e| backend_error("GPU vit output", e))?;
     Ok(out)
+}
+
+impl<B> GpuExecutableNetwork<B>
+where
+    B: F32TensorOpsBackend,
+    B::Error: std::fmt::Display,
+{
+    /// Host ViT forward with a device flash-attention hook; fills the host cache
+    /// that the host backward reads (training, MSA, VC and unmapped activations).
+    pub(crate) fn forward_vit_host(
+        &self,
+        layer: &Layer,
+        geometry: &VitGeometry,
+        weights: &VitWeights,
+        current_input: &B::Tensor,
+    ) -> Result<(B::Tensor, VitForwardCache)> {
+        let host_input = self
+            .download_tensor(current_input, layer.input_shape)
+            .map_err(|err| backend_error("download vit input", err))?;
+        let (data, cache) = crate::vit::vit_forward_with_flash_attention(
+            &host_input.data,
+            weights,
+            geometry,
+            |qkv, batch, tokens, channels, heads| {
+                if channels / heads > 128 {
+                    return crate::vit::attention_forward_flash(qkv, batch, tokens, channels, heads);
+                }
+                let qkv_tensor = self
+                    .backend
+                    .upload_f32(&[batch, tokens, 3 * channels], qkv)
+                    .map_err(|err| format!("upload ViT flash QKV: {err}"))?;
+                let (context_tensor, lse_tensor) = self
+                    .backend
+                    .flash_attention_forward_f32(
+                        &qkv_tensor,
+                        &[batch, tokens, channels],
+                        &[batch, heads, tokens],
+                        batch,
+                        tokens,
+                        channels,
+                        heads,
+                    )
+                    .map_err(|err| format!("ViT flash forward: {err}"))?;
+                let context = self
+                    .backend
+                    .download_f32(&context_tensor)
+                    .map_err(|err| format!("download ViT flash context: {err}"))?;
+                let lse = self
+                    .backend
+                    .download_f32(&lse_tensor)
+                    .map_err(|err| format!("download ViT flash LSE: {err}"))?;
+                let attention = crate::vit::attention_flash_cache_from_lse(
+                    qkv, batch, tokens, channels, heads, &lse,
+                )?;
+                Ok((context, attention))
+            },
+        )
+        .map_err(Error::InvalidConfig)?;
+        let output = self
+            .backend
+            .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
+            .map_err(|err| backend_error("upload vit output", err))?;
+        Ok((output, cache))
+    }
 }

@@ -15,7 +15,7 @@ Owns Darknet's observable contracts: `.cfg` parsing, planar `B x C x H x W` tens
 
 ## Responsibilities
 
-- One module per layer or feature in `src/` (for example `deform_conv.rs`, `dcnv4.rs`, `clifford.rs`, `carpn.rs`, `depth_anything.rs`), plus `cfg.rs`, `image.rs`, `detect.rs`, `evaluate.rs`, `augmentation.rs`.
+- One folder per layer under `src/layers/<layer>/` (for example `deform_conv`, `dcnv4`, `clifford`, `carpn`, `depth_anything`, `vit`): `cpu.rs` is the CPU reference, `gpu.rs` is the runtime glue that drives the Oxide/CUDA backend (present for `dcnv4`, `hyperbolic_foveation`, `laya_act_head`, `laya_encoder`, `laya_head`, `laya_scorer`, `vit`), and `mod.rs` re-exports both. `lib.rs` re-exports each layer at its old path (`crate::vit`, `lightnet_core::clifford`), so callers did not change. `swin` also holds `block.rs`. GPU kernels stay in `lightnet-cuda-oxide`, which cannot host CPU code because it depends on this crate. Per-layer arms inlined in the large `runtime/gpu_forward.rs`, `gpu_backward.rs` and `exec_*.rs` dispatchers have not been extracted. Other modules in `src/`: `cfg.rs`, `image.rs`, `detect.rs`, `evaluate.rs`, `augmentation.rs`.
 - Forward and exact-derivative backward for each layer; C++ deviations only under `GradMode::Cpp`.
 - Dispatch to GPU backends through the traits in `lightnet-cuda`.
 

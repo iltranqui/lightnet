@@ -6,11 +6,14 @@
 //! owns raw, offset, and projection-weight tensors for backward, so backward
 //! uses the exact forward weights without another parameter upload.
 
-use super::*;
+use crate::error::{Error, Result};
+use crate::model::{Dcnv4Spec, LayerKind};
+use crate::runtime::*;
+use lightnet_cuda::{ElementwiseLaunchConfig, F32TensorOpsBackend};
 use crate::model::Layer;
 use lightnet_cuda::host_ops::dcnv4::{Dcnv4Composition, Dcnv4Geometry};
 
-pub(super) fn needs_host(spec: &Dcnv4Spec) -> bool {
+pub(crate) fn needs_host(spec: &Dcnv4Spec) -> bool {
     spec.size
         .checked_mul(spec.size)
         .and_then(|v| v.checked_sub(usize::from(spec.remove_center)))
@@ -19,7 +22,7 @@ pub(super) fn needs_host(spec: &Dcnv4Spec) -> bool {
             && spec.activation.to_channel_normalization().is_none())
 }
 
-pub(super) fn descriptor(
+pub(crate) fn descriptor(
     layer: &Layer,
     spec: &Dcnv4Spec,
     params: &Dcnv4Params,
@@ -94,15 +97,15 @@ impl ParameterSnapshot {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct DeviceParameters<T> {
+pub(crate) struct DeviceParameters<T> {
     snapshot: ParameterSnapshot,
-    pub(super) offset_weights: T,
-    pub(super) offset_biases: T,
-    pub(super) biases: T,
-    pub(super) scales: Option<T>,
+    pub(crate) offset_weights: T,
+    pub(crate) offset_biases: T,
+    pub(crate) biases: T,
+    pub(crate) scales: Option<T>,
 }
 
-pub(super) fn device_parameters<B: F32TensorOpsBackend>(
+pub(crate) fn device_parameters<B: F32TensorOpsBackend>(
     backend: &B,
     cached: &mut Option<DeviceParameters<B::Tensor>>,
     layer: &Layer,
@@ -159,7 +162,7 @@ where
     Ok(value)
 }
 
-pub(super) fn store_device_parameters<T>(
+pub(crate) fn store_device_parameters<T>(
     cached: &mut Option<DeviceParameters<T>>,
     params: &Dcnv4Params,
     offset_weights: T,
@@ -185,10 +188,10 @@ pub(super) fn store_device_parameters<T>(
 pub(crate) struct ForwardCache<T> {
     raw: T,
     offsets: T,
-    pub(super) weights: T,
+    pub(crate) weights: T,
 }
 
-pub(super) fn forward<B: F32TensorOpsBackend>(
+pub(crate) fn forward<B: F32TensorOpsBackend>(
     backend: &B,
     input: &B::Tensor,
     layer: &Layer,
@@ -252,7 +255,7 @@ where
     ))
 }
 
-pub(super) fn activation_output<B: F32TensorOpsBackend>(
+pub(crate) fn activation_output<B: F32TensorOpsBackend>(
     backend: &B,
     pre: &B::Tensor,
     layer: &Layer,
@@ -288,7 +291,7 @@ where
 
 /// Explicit mode supports testing without mutating process-wide environment.
 /// Channel output recomputes on device from this forward's preactivation.
-pub(super) fn activation_delta<B: F32TensorOpsBackend>(
+pub(crate) fn activation_delta<B: F32TensorOpsBackend>(
     backend: &B,
     pre: &B::Tensor,
     seed: &B::Tensor,
@@ -329,7 +332,7 @@ where
     }
 }
 
-pub(super) struct Gradients<T> {
+pub(crate) struct Gradients<T> {
     pub input: T,
     pub biases: T,
     pub weights: T,
@@ -337,7 +340,7 @@ pub(super) struct Gradients<T> {
     pub scales: Option<T>,
 }
 
-pub(super) fn backward<B: F32TensorOpsBackend>(
+pub(crate) fn backward<B: F32TensorOpsBackend>(
     backend: &B,
     input: &B::Tensor,
     pre: &B::Tensor,
@@ -408,7 +411,7 @@ where
     })
 }
 
-pub(super) fn accumulate<B: F32TensorOpsBackend>(
+pub(crate) fn accumulate<B: F32TensorOpsBackend>(
     backend: &B,
     train: &mut GpuDcnv4TrainBuffers<B::Tensor>,
     grad: &Gradients<B::Tensor>,
@@ -537,7 +540,7 @@ where
     /// On Oxide raw statistics reduce on device; only channel EMA values return
     /// to the canonical host parameters. No batch-stat normalization is used
     /// for the actual layer output or its derivatives.
-    pub(super) fn update_dcnv4_rolling_stats_gpu(
+    pub(crate) fn update_dcnv4_rolling_stats_gpu(
         &mut self,
         forward: &GpuForwardState<B::Tensor>,
     ) -> Result<()> {

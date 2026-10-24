@@ -50,15 +50,15 @@ pub(crate) const BATCH_NORM_EPSILON: f32 = 0.000_01;
 const BATCH_NORM_ROLLING_KEEP: f32 = 0.99;
 /// Rolling-stat EMA keep factor of the host (CPU) training path: C++
 /// `forward_batchnorm_layer` uses `scal_cpu(.9)` + `axpy_cpu(.1)`.
-const BATCH_NORM_ROLLING_KEEP_CPU: f32 = 0.9;
+pub(crate) const BATCH_NORM_ROLLING_KEEP_CPU: f32 = 0.9;
 
-mod dcnv4_gpu;
+use crate::layers::dcnv4::gpu as dcnv4_gpu;
 mod loss_scaler;
-mod laya_act_gpu;
-mod laya_encoder_gpu;
-mod vit_gpu;
-mod laya_head_gpu;
-mod laya_scorer_gpu;
+use crate::layers::laya_act_head::gpu as laya_act_gpu;
+use crate::layers::laya_encoder::gpu as laya_encoder_gpu;
+use crate::layers::vit::gpu as vit_gpu;
+use crate::layers::laya_head::gpu as laya_head_gpu;
+use crate::layers::laya_scorer::gpu as laya_scorer_gpu;
 
 mod types;
 mod gpu_types;
@@ -77,7 +77,6 @@ mod gpu_backward_support;
 mod gpu_dense_loss;
 mod gpu_params;
 mod defaults;
-mod hyperbolic_foveation;
 mod param_updates;
 mod weights_io;
 mod forward_layers;
@@ -95,7 +94,7 @@ use self::host_adam::*;
 pub use self::exec_core::*;
 pub use self::exec_accumulate::*;
 use self::defaults::*;
-pub(crate) use self::hyperbolic_foveation::*;
+pub(crate) use crate::layers::hyperbolic_foveation::gpu::*;
 use self::param_updates::*;
 pub(crate) use self::weights_io::*;
 pub(crate) use self::forward_layers::*;

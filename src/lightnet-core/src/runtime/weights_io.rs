@@ -754,7 +754,7 @@ pub(super) fn load_weights_into_params(
     Ok(header)
 }
 
-pub(super) fn tensor_backend_shape(shape: TensorShape) -> [usize; 4] {
+pub(crate) fn tensor_backend_shape(shape: TensorShape) -> [usize; 4] {
     [shape.batch, shape.channels, shape.height, shape.width]
 }
 
@@ -894,7 +894,7 @@ pub(super) fn release_gpu_sources_for_layer<T: Clone>(
     Ok(())
 }
 
-pub(super) fn gpu_activation_kind(layer_index: usize, activation: &Activation) -> Result<F32ActivationKind> {
+pub(crate) fn gpu_activation_kind(layer_index: usize, activation: &Activation) -> Result<F32ActivationKind> {
     activation.to_cuda_f32_kind().ok_or_else(|| {
         Error::InvalidConfig(format!(
             "layer #{layer_index} uses activation {:?}, which the GPU f32 backend does not support",
@@ -903,7 +903,7 @@ pub(super) fn gpu_activation_kind(layer_index: usize, activation: &Activation) -
     })
 }
 
-pub(super) fn backend_error(err_context: &str, err: impl std::fmt::Display) -> Error {
+pub(crate) fn backend_error(err_context: &str, err: impl std::fmt::Display) -> Error {
     Error::Backend(format!("{err_context}: {err}"))
 }
 

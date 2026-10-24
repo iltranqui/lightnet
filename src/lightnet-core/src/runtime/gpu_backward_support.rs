@@ -258,7 +258,7 @@ where
         Ok(())
     }
 
-    pub(super) fn download_tensor(
+    pub(crate) fn download_tensor(
         &self,
         tensor: &B::Tensor,
         shape: TensorShape,

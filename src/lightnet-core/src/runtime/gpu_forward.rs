@@ -1725,143 +1725,38 @@ where
                     )?
                 }
                 (LayerKind::Vit(spec), LayerParams::Vit(weights)) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download vit input", err))?;
-                    let geometry = vit_geometry(layer, spec);
-                    let (data, cache) = crate::vit::vit_forward_with_flash_attention(
-                        &host_input.data,
+                    let (output, cache) = self.forward_vit_host(
+                        layer,
+                        &vit_geometry(layer, spec),
                         weights,
-                        &geometry,
-                        |qkv, batch, tokens, channels, heads| {
-                            if channels / heads > 128 {
-                                return crate::vit::attention_forward_flash(
-                                    qkv, batch, tokens, channels, heads,
-                                );
-                            }
-                            let qkv_tensor = self
-                                .backend
-                                .upload_f32(&[batch, tokens, 3 * channels], qkv)
-                                .map_err(|err| format!("upload ViT flash QKV: {err}"))?;
-                            let (context_tensor, lse_tensor) = self
-                                .backend
-                                .flash_attention_forward_f32(
-                                    &qkv_tensor,
-                                    &[batch, tokens, channels],
-                                    &[batch, heads, tokens],
-                                    batch,
-                                    tokens,
-                                    channels,
-                                    heads,
-                                )
-                                .map_err(|err| format!("ViT flash forward: {err}"))?;
-                            let context = self
-                                .backend
-                                .download_f32(&context_tensor)
-                                .map_err(|err| format!("download ViT flash context: {err}"))?;
-                            let lse = self
-                                .backend
-                                .download_f32(&lse_tensor)
-                                .map_err(|err| format!("download ViT flash LSE: {err}"))?;
-                            let attention = crate::vit::attention_flash_cache_from_lse(
-                                qkv, batch, tokens, channels, heads, &lse,
-                            )?;
-                            Ok((context, attention))
-                        },
-                    )
-                    .map_err(Error::InvalidConfig)?;
+                        current_input,
+                    )?;
                     vit_cache = Some(cache);
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
-                        .map_err(|err| backend_error("upload vit output", err))?
+                    output
                 }
                 (LayerKind::Swin(spec), LayerParams::Swin(weights)) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download swin input", err))?;
-                    let geometry = crate::swin_block::SwinGeometry {
-                        batch: layer.input_shape.batch,
-                        channels: layer.input_shape.channels,
-                        height: layer.input_shape.height,
-                        width: layer.input_shape.width,
-                        filters: spec.filters,
-                        heads: spec.heads,
-                        window: spec.size,
-                        shift: spec.shift,
-                        ffn_ratio: spec.ffn_ratio,
-                        activation: spec.activation.clone(),
-                    };
-                    let (data, cache) =
-                        crate::swin_block::swin_forward(&host_input.data, weights, &geometry)
-                            .map_err(Error::InvalidConfig)?;
+                    let (output, cache) =
+                        self.forward_swin_host(layer, spec, weights, current_input)?;
                     swin_cache = Some(cache);
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
-                        .map_err(|err| backend_error("upload swin output", err))?
+                    output
                 }
                 (LayerKind::TuckerAttention(spec), LayerParams::TuckerAttention(weights)) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download Tucker attention input", err))?;
-                    let geometry = crate::tucker_attention::TuckerGeometry {
-                        batch: layer.input_shape.batch,
-                        channels: layer.input_shape.channels,
-                        height: layer.input_shape.height,
-                        width: layer.input_shape.width,
-                        size: spec.size,
-                        heads: spec.heads,
-                        rank_q: spec.rank_q,
-                        rank_k: spec.rank_k,
-                        rank_v: spec.rank_v,
-                        rank_o: spec.rank_o,
-                        activation: spec.activation.clone(),
-                        msa_enabled: spec.msa_enabled,
-                        msa_block_size: spec.msa_block_size,
-                        msa_topk: spec.msa_topk,
-                    };
-                    let (data, cache) = crate::tucker_attention::tucker_attention_forward(
-                        &host_input.data,
-                        weights,
-                        &geometry,
-                    )
-                    .map_err(Error::InvalidConfig)?;
+                    let (output, cache) =
+                        self.forward_tucker_attention_host(layer, spec, weights, current_input)?;
                     tucker_attention_cache = Some(cache);
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
-                        .map_err(|err| backend_error("upload Tucker attention output", err))?
+                    output
                 }
                 (LayerKind::MambaVision(spec), LayerParams::MambaVision(weights)) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download MambaVision input", err))?;
-                    let forward = crate::mambavision::mambavision_forward(
-                        &host_input.data,
-                        host_input.shape,
-                        spec,
-                        weights,
-                        None,
-                    )
-                    .map_err(Error::InvalidConfig)?;
-                    mambavision_cache = Some(forward.clone());
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &forward.output)
-                        .map_err(|err| backend_error("upload MambaVision output", err))?
+                    let (output, cache) =
+                        self.forward_mambavision_host(layer, spec, weights, current_input)?;
+                    mambavision_cache = Some(cache);
+                    output
                 }
                 (LayerKind::KimiKda(spec), LayerParams::KimiKda(weights)) => {
-                    let host_input = self
-                        .download_tensor(current_input, layer.input_shape)
-                        .map_err(|err| backend_error("download Kimi KDA input", err))?;
-                    let (data, cache) = crate::kimi_kda::kimi_kda_forward(
-                        &host_input.data,
-                        host_input.shape,
-                        spec,
-                        weights,
-                    )
-                    .map_err(Error::InvalidConfig)?;
+                    let (output, cache) =
+                        self.forward_kimi_kda_host(layer, spec, weights, current_input)?;
                     kimi_kda_cache = Some(cache);
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(layer.output_shape), &data)
-                        .map_err(|err| backend_error("upload Kimi KDA output", err))?
+                    output
                 }
                 (LayerKind::LayaEncoder(spec), LayerParams::LayaEncoder(weights)) => {
                     laya_encoder_gpu::forward(
