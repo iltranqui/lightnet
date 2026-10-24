@@ -4729,6 +4729,22 @@ pub trait F16TensorOpsBackend: F32TensorOpsBackend {
         filters: usize,
         per_filter: usize,
     ) -> Result<Self::TensorF16, Self::Error>;
+    /// `f16(activation(deconv(x, weights) + bias))`; `bias` is f32 `[filters]`.
+    fn deconvolutional_f16(
+        &self,
+        x: &Self::TensorF16,
+        weights: &Self::TensorF16,
+        bias: &Self::Tensor,
+        output_shape: &[usize],
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        filters: usize,
+        kernel_size: usize,
+        stride: usize,
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error>;
     /// `f16(activation(conv(x, weights) + bias))`; `bias` is f32 `[filters]`.
     fn normalize_channels_f16(
         &self,

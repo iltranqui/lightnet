@@ -165,6 +165,29 @@ fn maxpool_depth_f16_inference_matches_f32() {
 }
 
 #[test]
+fn deconvolution_f16_inference_matches_f32() {
+    for activation in [
+        "linear",
+        "leaky",
+        "normalize_channels",
+        "normalize_channels_softmax",
+        "normalize_channels_softmax_maxval",
+    ] {
+        let cfg = format!(
+            "[net]\nwidth=2\nheight=2\nchannels=3\nbatch=2\n\
+             [deconvolutional]\nfilters=4\nsize=2\nstride=2\nactivation={activation}\n"
+        );
+        run_pair(
+            &format!("deconvolution {activation} f16"),
+            network(&cfg),
+            37,
+            1.0,
+            4e-3,
+        );
+    }
+}
+
+#[test]
 fn channel_shuffle_f16_inference_matches_f32() {
     let cfg = "[net]\nwidth=3\nheight=2\nchannels=6\nbatch=2\n\
         [channel_shuffle]\ngroups=2\n";

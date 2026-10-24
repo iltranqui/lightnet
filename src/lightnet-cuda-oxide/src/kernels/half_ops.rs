@@ -74,6 +74,71 @@ pub mod kernels {
         }
     }
 
+    /// Fused f16 transposed convolution: `f16(act(conv_t(x, w) + bias))`,
+    /// f32 accumulation. `weights` is the plain `[c, f, k, k]` f32 layout
+    /// rounded to half, matching the f32 deconvolution kernel.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn deconv_bias_act_f16(
+        x: &[u16],
+        weights: &[u16],
+        bias: &[f32],
+        mut output: DisjointSlice<u16>,
+        batch: usize,
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        filters: usize,
+        kernel_size: usize,
+        stride: usize,
+        output_height: usize,
+        output_width: usize,
+        act: u32,
+    ) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= batch * filters * output_height * output_width {
+            return;
+        }
+        let ox = i % output_width;
+        let oy = (i / output_width) % output_height;
+        let f = (i / (output_width * output_height)) % filters;
+        let b = i / (output_width * output_height * filters);
+        let mut sum = bias[f];
+        let mut c = 0usize;
+        while c < channels {
+            let mut ky = 0usize;
+            while ky < kernel_size {
+                let iy_num = oy as i64 - ky as i64;
+                if iy_num >= 0 && (iy_num as usize) % stride == 0 {
+                    let iy = iy_num as usize / stride;
+                    if iy < input_height {
+                        let mut kx = 0usize;
+                        while kx < kernel_size {
+                            let ix_num = ox as i64 - kx as i64;
+                            if ix_num >= 0 && (ix_num as usize) % stride == 0 {
+                                let ix = ix_num as usize / stride;
+                                if ix < input_width {
+                                    let xi =
+                                        ((b * channels + c) * input_height + iy) * input_width + ix;
+                                    let wi =
+                                        ((c * filters + f) * kernel_size + ky) * kernel_size + kx;
+                                    sum += f16_bits_to_f32(x[xi]) * f16_bits_to_f32(weights[wi]);
+                                }
+                            }
+                            kx += 1;
+                        }
+                    }
+                }
+                ky += 1;
+            }
+            c += 1;
+        }
+        if let Some(dst) = output.get_mut(idx) {
+            *dst = f32_to_f16_bits(activate(act, sum), 0);
+        }
+    }
+
     /// Same window rule as the f32 `maxpool_forward` (taps outside the image
     /// skipped, strict `>`, empty window -> -inf).
     #[kernel]

@@ -28,6 +28,16 @@ where
         for layer in &self.network.layers {
             match &layer.kind {
                 LayerKind::Convolutional(_) => {}
+                LayerKind::Deconvolutional(spec) => {
+                    if spec.activation.to_channel_normalization().is_none()
+                        && spec.activation.to_cuda_f32_kind().is_none()
+                    {
+                        return Err(Error::UnsupportedLayer {
+                            layer_index: layer.index,
+                            name: format!("{} (f16 inference)", layer.kind.name()),
+                        });
+                    }
+                }
                 LayerKind::Connected(spec) => {
                     if spec.activation.to_cuda_f32_kind().is_none() {
                         return Err(Error::UnsupportedLayer {
@@ -182,6 +192,73 @@ where
                             })?
                     } else {
                         convolution
+                    }
+                }
+                (LayerKind::Deconvolutional(spec), LayerParams::Convolutional(params)) => {
+                    let cached_w16 = self.f16_conv_weights.borrow()[layer.index]
+                        .as_ref()
+                        .and_then(|shared| shared.downcast_ref::<B::TensorF16>())
+                        .cloned();
+                    let weights16 = match cached_w16 {
+                        Some(w) => w,
+                        None => {
+                            let w = self
+                                .backend
+                                .upload_f16(
+                                    &[
+                                        layer.input_shape.channels,
+                                        spec.filters,
+                                        spec.size,
+                                        spec.size,
+                                    ],
+                                    &params.weights,
+                                )
+                                .map_err(|err| backend_error("upload f16 deconv weights", err))?;
+                            self.f16_conv_weights.borrow_mut()[layer.index] =
+                                Some(std::rc::Rc::new(w.clone()));
+                            w
+                        }
+                    };
+                    let biases = self
+                        .backend
+                        .upload_f32(&[spec.filters], &params.biases)
+                        .map_err(|err| backend_error("upload f16 deconv biases", err))?;
+                    let normalization = spec.activation.to_channel_normalization();
+                    let activation = if normalization.is_some() {
+                        F32ActivationKind::Linear
+                    } else {
+                        gpu_activation_kind(layer.index, &spec.activation)?
+                    };
+                    let deconv = self
+                        .backend
+                        .deconvolutional_f16(
+                            current_input.expect("deconvolution requires current input"),
+                            &weights16,
+                            &biases,
+                            &tensor_backend_shape(layer.output_shape),
+                            layer.input_shape.channels,
+                            layer.input_shape.height,
+                            layer.input_shape.width,
+                            spec.filters,
+                            spec.size,
+                            spec.stride,
+                            activation,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("f16 deconvolution", err))?;
+                    if let Some(normalization) = normalization {
+                        self.backend
+                            .normalize_channels_f16(
+                                &deconv,
+                                &tensor_backend_shape(layer.output_shape),
+                                normalization,
+                                launch_config,
+                            )
+                            .map_err(|err| {
+                                backend_error("f16 deconvolution channel normalization", err)
+                            })?
+                    } else {
+                        deconv
                     }
                 }
                 (LayerKind::Connected(spec), LayerParams::Connected(params)) => {

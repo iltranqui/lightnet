@@ -362,6 +362,117 @@ impl OxideBackend {
         Ok(OxideTensorF16::new(out, &[filters, kpad]))
     }
 
+    /// Fused f16 transposed convolution with f32 bias and activation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deconvolutional_f16(
+        &self,
+        x: &OxideTensorF16,
+        weights: &OxideTensorF16,
+        bias: &OxideTensorF32,
+        output_shape: &[usize],
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        filters: usize,
+        kernel_size: usize,
+        stride: usize,
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF16, OxideError> {
+        self.require_f16("deconvolutional_f16")?;
+        const OP: &str = "deconvolutional_f16";
+        if output_shape.len() != 4 {
+            return Err(shape_err(
+                OP,
+                format!("output shape must be NCHW, got {output_shape:?}"),
+            ));
+        }
+        let batch = output_shape[0];
+        if batch == 0
+            || channels == 0
+            || filters == 0
+            || input_height == 0
+            || input_width == 0
+            || kernel_size == 0
+            || stride == 0
+        {
+            return Err(shape_err(OP, "dimensions must be nonzero".into()));
+        }
+        let expected_height = stride
+            .checked_mul(input_height - 1)
+            .and_then(|v| v.checked_add(kernel_size))
+            .ok_or_else(|| shape_err(OP, "output height overflow".into()))?;
+        let expected_width = stride
+            .checked_mul(input_width - 1)
+            .and_then(|v| v.checked_add(kernel_size))
+            .ok_or_else(|| shape_err(OP, "output width overflow".into()))?;
+        let expected_shape = [batch, filters, expected_height, expected_width];
+        if output_shape != expected_shape {
+            return Err(shape_err(
+                OP,
+                format!("output shape must be {expected_shape:?}, got {output_shape:?}"),
+            ));
+        }
+        let input_len = batch
+            .checked_mul(channels)
+            .and_then(|v| v.checked_mul(input_height))
+            .and_then(|v| v.checked_mul(input_width))
+            .ok_or_else(|| shape_err(OP, "input size overflow".into()))?;
+        let weight_len = channels
+            .checked_mul(filters)
+            .and_then(|v| v.checked_mul(kernel_size))
+            .and_then(|v| v.checked_mul(kernel_size))
+            .ok_or_else(|| shape_err(OP, "weight size overflow".into()))?;
+        let output_len = batch
+            .checked_mul(filters)
+            .and_then(|v| v.checked_mul(expected_height))
+            .and_then(|v| v.checked_mul(expected_width))
+            .ok_or_else(|| shape_err(OP, "output size overflow".into()))?;
+        if x.len() != input_len {
+            return Err(shape_err(
+                OP,
+                format!("input length {} != {input_len}", x.len()),
+            ));
+        }
+        if weights.len() != weight_len {
+            return Err(shape_err(
+                OP,
+                format!("weight length {} != {weight_len}", weights.len()),
+            ));
+        }
+        if bias.len() != filters {
+            return Err(shape_err(
+                OP,
+                format!("bias length {} != filters {filters}", bias.len()),
+            ));
+        }
+        let mut output = self.alloc16_uninit(output_len)?;
+        // SAFETY: validation proves all extents; each output element is
+        // written by exactly one thread.
+        unsafe {
+            self.half_ops.deconv_bias_act_f16(
+                &self.stream,
+                launch::elementwise(output_len, config),
+                &x.buf,
+                &weights.buf,
+                &bias.buf,
+                &mut output,
+                batch,
+                channels,
+                input_height,
+                input_width,
+                filters,
+                kernel_size,
+                stride,
+                expected_height,
+                expected_width,
+                activation_code(activation),
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF16::new(output, output_shape))
+    }
+
     /// Inference-only f16 kernels read and write binary16; in bf16 mode they
     /// would reinterpret bf16 bits, so they refuse instead.
     pub(crate) fn require_f16(&self, op: &str) -> Result<(), OxideError> {
@@ -2201,6 +2312,38 @@ impl lightnet_cuda::F16TensorOpsBackend for OxideBackend {
         per_filter: usize,
     ) -> Result<Self::TensorF16, Self::Error> {
         OxideBackend::conv_weights_f16(self, weights, filters, per_filter)
+    }
+
+    fn deconvolutional_f16(
+        &self,
+        x: &Self::TensorF16,
+        weights: &Self::TensorF16,
+        bias: &OxideTensorF32,
+        output_shape: &[usize],
+        channels: usize,
+        input_height: usize,
+        input_width: usize,
+        filters: usize,
+        kernel_size: usize,
+        stride: usize,
+        activation: F32ActivationKind,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::TensorF16, Self::Error> {
+        OxideBackend::deconvolutional_f16(
+            self,
+            x,
+            weights,
+            bias,
+            output_shape,
+            channels,
+            input_height,
+            input_width,
+            filters,
+            kernel_size,
+            stride,
+            activation,
+            config,
+        )
     }
 
     fn conv2d_bias_act_f16(
