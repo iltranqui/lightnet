@@ -102,5 +102,6 @@ use self::recurrent_forward::*;
 use self::recurrent_backward::*;
 use self::layer_ops::*;
 pub(crate) use self::layer_ops::{
-    forward_sam, forward_scale_channels, resolve_relative_layer, softmax_group_size,
+    forward_sam, forward_scale_channels, plan_crop_forward, resolve_relative_layer,
+    softmax_group_size,
 };

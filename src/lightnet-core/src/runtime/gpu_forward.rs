@@ -720,63 +720,14 @@ where
                     self.forward_avgpool_gpu(layer, current_input, launch_config)?
                 }
                 (LayerKind::Crop(spec), LayerParams::None) => {
-                    let (cache, adjustments) = plan_crop_forward(
+                    let (output, cache) = self.forward_crop_gpu(
+                        layer,
                         spec,
-                        layer.input_shape,
-                        layer.output_shape,
+                        current_input,
                         training,
                         &mut rng_state,
+                        launch_config,
                     )?;
-                    let source_x = self
-                        .backend
-                        .upload_f32(&[cache.source_x.len()], &cache.source_x)
-                        .map_err(|err| backend_error("upload crop source x", err))?;
-                    let source_y = self
-                        .backend
-                        .upload_f32(&[cache.source_y.len()], &cache.source_y)
-                        .map_err(|err| backend_error("upload crop source y", err))?;
-                    let input_scales = self
-                        .backend
-                        .upload_f32(&[cache.input_scales.len()], &cache.input_scales)
-                        .map_err(|err| backend_error("upload crop input scales", err))?;
-                    let input_offsets = self
-                        .backend
-                        .upload_f32(&[cache.input_offsets.len()], &cache.input_offsets)
-                        .map_err(|err| backend_error("upload crop input offsets", err))?;
-                    let input_saturations: Vec<f32> = adjustments
-                        .iter()
-                        .map(|adjustment| adjustment.saturation)
-                        .collect();
-                    let input_exposures: Vec<f32> = adjustments
-                        .iter()
-                        .map(|adjustment| adjustment.exposure)
-                        .collect();
-                    let input_saturations = self
-                        .backend
-                        .upload_f32(&[input_saturations.len()], &input_saturations)
-                        .map_err(|err| backend_error("upload crop saturations", err))?;
-                    let input_exposures = self
-                        .backend
-                        .upload_f32(&[input_exposures.len()], &input_exposures)
-                        .map_err(|err| backend_error("upload crop exposures", err))?;
-                    let output = self
-                        .backend
-                        .crop_bilinear_f32(
-                            current_input,
-                            &tensor_backend_shape(layer.output_shape),
-                            layer.input_shape.channels,
-                            layer.input_shape.height,
-                            layer.input_shape.width,
-                            &source_x,
-                            &source_y,
-                            &input_scales,
-                            &input_offsets,
-                            &input_saturations,
-                            &input_exposures,
-                            training,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("GPU crop", err))?;
                     crop_cache = Some(cache);
                     output
                 }
@@ -820,123 +771,27 @@ where
                         launch_config,
                     )?,
                 (LayerKind::Shortcut(spec), LayerParams::Shortcut(params)) => {
-                    let mut inputs = Vec::with_capacity(spec.from.len() + 1);
-                    inputs.push(current_input.clone());
-                    for raw_index in &spec.from {
-                        let source_index = resolve_relative_layer(layer.index, *raw_index)?;
-                        let source =
-                            gpu_layer_outputs
-                                .get(source_index)
-                                .ok_or(Error::InvalidRoute {
-                                    layer_index: layer.index,
-                                    reference: *raw_index,
-                                })?;
-                        let source_layer =
-                            self.network.layers.get(source_index).ok_or_else(|| {
-                                Error::InvalidConfig(format!(
-                                    "missing source layer #{source_index} for shortcut layer #{}",
-                                    layer.index
-                                ))
-                            })?;
-                        if source_layer.output_shape.batch != layer.output_shape.batch {
-                            return Err(Error::InvalidConfig(format!(
-                                "shortcut layer #{} mixes incompatible batch shapes {} and {}",
-                                layer.index, layer.output_shape, source_layer.output_shape
-                            )));
-                        }
-                        if source_layer.output_shape == layer.output_shape {
-                            inputs.push(source.clone());
-                        } else {
-                            let fitted = self
-                                .backend
-                                .shortcut_fit_f32(
-                                    source,
-                                    layer.output_shape.batch,
-                                    &tensor_backend_shape(layer.output_shape),
-                                    launch_config,
-                                )
-                                .map_err(|err| {
-                                    backend_error("weighted shortcut resize source", err)
-                                })?;
-                            inputs.push(fitted);
-                        }
-                    }
-                    let layer_step = spec.weight_slots(layer.output_shape.channels);
-                    let per_sample = layer.output_shape.element_count();
-                    let effective = crate::shortcut_weights::effective_weights(
-                        &params.weights,
-                        spec.weights_normalization,
-                        layer_step,
-                    );
-                    let refs: Vec<&B::Tensor> = inputs.iter().collect();
-                    let accumulated = self
-                        .backend
-                        .shortcut_weighted_sum_f32(
-                            &refs,
-                            &effective,
-                            layer_step,
-                            per_sample / layer_step,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("weighted shortcut sum", err))?;
-                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
-                    activation_input_gpu = Some(accumulated.clone());
-                    self.backend
-                        .activation_f32(&accumulated, activation, launch_config)
-                        .map_err(|err| backend_error("weighted shortcut activation", err))?
+                    let (output, accumulated) = self.forward_weighted_shortcut_gpu(
+                        layer,
+                        spec,
+                        params,
+                        current_input,
+                        &gpu_layer_outputs,
+                        launch_config,
+                    )?;
+                    activation_input_gpu = Some(accumulated);
+                    output
                 }
                 (LayerKind::Shortcut(spec), LayerParams::None) => {
-                    let mut accumulated = current_input.clone();
-                    for raw_index in &spec.from {
-                        let source_index = resolve_relative_layer(layer.index, *raw_index)?;
-                        let source =
-                            gpu_layer_outputs
-                                .get(source_index)
-                                .ok_or(Error::InvalidRoute {
-                                    layer_index: layer.index,
-                                    reference: *raw_index,
-                                })?;
-                        let source_layer =
-                            self.network.layers.get(source_index).ok_or_else(|| {
-                                Error::InvalidConfig(format!(
-                                    "missing source layer #{source_index} for shortcut layer #{}",
-                                    layer.index
-                                ))
-                            })?;
-                        if source_layer.output_shape.batch != layer.output_shape.batch {
-                            return Err(Error::InvalidConfig(format!(
-                                "shortcut layer #{} mixes incompatible batch shapes {} and {}",
-                                layer.index, layer.output_shape, source_layer.output_shape
-                            )));
-                        }
-                        // Darknet resizes a mismatched source flat per sample
-                        // (crop / zero-pad), then adds it.
-                        let fitted;
-                        let source = if source_layer.output_shape != layer.output_shape {
-                            fitted = self
-                                .backend
-                                .shortcut_fit_f32(
-                                    source,
-                                    layer.output_shape.batch,
-                                    &tensor_backend_shape(layer.output_shape),
-                                    launch_config,
-                                )
-                                .map_err(|err| backend_error("shortcut resize source", err))?;
-                            &fitted
-                        } else {
-                            source
-                        };
-                        accumulated = self
-                            .backend
-                            .shortcut_add_f32(&accumulated, source, launch_config)
-                            .map_err(|err| backend_error("shortcut add", err))?;
-                    }
-
-                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
-                    activation_input_gpu = Some(accumulated.clone());
-                    self.backend
-                        .activation_f32(&accumulated, activation, launch_config)
-                        .map_err(|err| backend_error("shortcut activation", err))?
+                    let (output, accumulated) = self.forward_shortcut_gpu(
+                        layer,
+                        spec,
+                        current_input,
+                        &gpu_layer_outputs,
+                        launch_config,
+                    )?;
+                    activation_input_gpu = Some(accumulated);
+                    output
                 }
                 (LayerKind::Upsample(spec), LayerParams::None) => {
                     self.forward_upsample_gpu(layer, spec, current_input, launch_config)?

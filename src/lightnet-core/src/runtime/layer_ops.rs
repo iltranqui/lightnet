@@ -300,13 +300,13 @@ pub(super) fn crop_sample(input: &Tensor, batch: usize, channel: usize, x: isize
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct CropLevelAdjustment {
-    pub(super) saturation: f32,
-    pub(super) exposure: f32,
-    pub(super) rgb_shift: [f32; 3],
-    pub(super) scale: f32,
-    pub(super) translate: f32,
-    pub(super) apply_hsv: bool,
+pub(crate) struct CropLevelAdjustment {
+    pub(crate) saturation: f32,
+    pub(crate) exposure: f32,
+    pub(crate) rgb_shift: [f32; 3],
+    pub(crate) scale: f32,
+    pub(crate) translate: f32,
+    pub(crate) apply_hsv: bool,
 }
 
 pub(super) fn rgb_to_hsv(rgb: [f32; 3]) -> [f32; 3] {
@@ -409,7 +409,7 @@ pub(super) fn crop_bilinear(
 /// Plans crop coordinates and color-level adjustments without touching tensor
 /// data. The GPU executor uploads this metadata so image samples themselves
 /// stay resident on the device.
-pub(super) fn plan_crop_forward(
+pub(crate) fn plan_crop_forward(
     spec: &CropSpec,
     input_shape: TensorShape,
     output_shape: TensorShape,
