@@ -85,4 +85,69 @@ where
             Ok((output, activation_cache))
         }
     }
+
+    /// Compact inference forward of `[sam]`.
+    pub(crate) fn forward_sam_compact_gpu(
+        &self,
+        layer: &Layer,
+        spec: &SamSpec,
+        gpu_layer_outputs: &[Option<B::Tensor>],
+        current_input: &B::Tensor,
+        launch_config: ElementwiseLaunchConfig,
+    ) -> Result<B::Tensor> {
+        let source_index = resolve_relative_layer(layer.index, spec.from)?;
+        let source_layer =
+            self.network
+                .layers
+                .get(source_index)
+                .ok_or(Error::InvalidRoute {
+                    layer_index: layer.index,
+                    reference: spec.from,
+                })?;
+        let source_gpu = gpu_layer_outputs
+            .get(source_index)
+            .and_then(Option::as_ref)
+            .ok_or(Error::InvalidRoute {
+                layer_index: layer.index,
+                reference: spec.from,
+            })?;
+        if layer.input_shape != layer.output_shape
+            || source_layer.output_shape != layer.output_shape
+        {
+            return Err(Error::InvalidConfig(format!(
+                "sam shape mismatch: input {}, source {}, output {}",
+                layer.input_shape, source_layer.output_shape, layer.output_shape
+            )));
+        }
+        let input_gpu = current_input;
+        Ok(if let Some(activation) = spec.activation.to_cuda_f32_kind() {
+            let pre_activation = self
+                .backend
+                .vector_mul_f32(
+                    input_gpu,
+                    source_gpu,
+                    &tensor_backend_shape(layer.output_shape),
+                    launch_config,
+                )
+                .map_err(|err| backend_error("sam multiply", err))?;
+            self.backend
+                .activation_f32(&pre_activation, activation, launch_config)
+                .map_err(|err| backend_error("sam activation", err))?
+        } else {
+            let host_input = self
+                .download_tensor(input_gpu, layer.input_shape)
+                .map_err(|err| backend_error("download sam input", err))?;
+            let host_source = self
+                .download_tensor(source_gpu, source_layer.output_shape)
+                .map_err(|err| backend_error("download sam source", err))?;
+            let (host_output, _) =
+                forward_sam(spec, &host_input, &host_source, layer.output_shape)?;
+            self.backend
+                .upload_f32(
+                    &tensor_backend_shape(layer.output_shape),
+                    &host_output.data,
+                )
+                .map_err(|err| backend_error("upload sam output", err))?
+        })
+    }
 }

@@ -228,4 +228,69 @@ where
             launch_config,
         )
     }
+
+    /// Compact inference forward of `[laya_act_head]`.
+    pub(crate) fn forward_laya_act_head_compact_gpu(
+        &self,
+        layer: &Layer,
+        spec: &LayaActHeadSpec,
+        weights: &LayaActHeadWeights,
+        gpu_layer_outputs: &[Option<B::Tensor>],
+        launch_config: ElementwiseLaunchConfig,
+    ) -> Result<B::Tensor> {
+        let head_index = resolve_relative_layer(layer.index, spec.layers[0])?;
+        let scorer_index = resolve_relative_layer(layer.index, spec.layers[1])?;
+        let marker_index = resolve_relative_layer(layer.index, spec.layers[2])?;
+        let head_layer = self.network.layers.get(head_index).ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "missing source layer #{head_index} for [laya_act_head] layer #{}",
+                layer.index
+            ))
+        })?;
+        let scorer_layer = self.network.layers.get(scorer_index).ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "missing source layer #{scorer_index} for [laya_act_head] layer #{}",
+                layer.index
+            ))
+        })?;
+        let marker_layer = self.network.layers.get(marker_index).ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "missing source layer #{marker_index} for [laya_act_head] layer #{}",
+                layer.index
+            ))
+        })?;
+        let head_source = gpu_layer_outputs
+            .get(head_index)
+            .and_then(Option::as_ref)
+            .ok_or(Error::InvalidRoute {
+                layer_index: layer.index,
+                reference: spec.layers[0],
+            })?;
+        let scorer_source = gpu_layer_outputs
+            .get(scorer_index)
+            .and_then(Option::as_ref)
+            .ok_or(Error::InvalidRoute {
+                layer_index: layer.index,
+                reference: spec.layers[1],
+            })?;
+        let marker_source = gpu_layer_outputs
+            .get(marker_index)
+            .and_then(Option::as_ref)
+            .ok_or(Error::InvalidRoute {
+                layer_index: layer.index,
+                reference: spec.layers[2],
+            })?;
+        forward(
+            &self.backend,
+            spec,
+            weights,
+            [head_source, scorer_source, marker_source],
+            [
+                head_layer.output_shape,
+                scorer_layer.output_shape,
+                marker_layer.output_shape,
+            ],
+            launch_config,
+        )
+    }
 }

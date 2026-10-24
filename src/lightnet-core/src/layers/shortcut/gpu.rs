@@ -145,4 +145,67 @@ where
             .map_err(|err| backend_error("shortcut activation", err))?;
         Ok((output, accumulated))
     }
+
+    /// Compact inference forward of `[shortcut]` without per-feature weights.
+    pub(crate) fn forward_shortcut_compact_gpu(
+        &self,
+        layer: &Layer,
+        spec: &ShortcutSpec,
+        gpu_layer_outputs: &[Option<B::Tensor>],
+        current_input: &B::Tensor,
+        launch_config: ElementwiseLaunchConfig,
+    ) -> Result<B::Tensor> {
+        let mut accumulated = current_input.clone();
+        for raw_index in &spec.from {
+            let source_index = resolve_relative_layer(layer.index, *raw_index)?;
+            let source = gpu_layer_outputs
+                .get(source_index)
+                .and_then(Option::as_ref)
+                .ok_or(Error::InvalidRoute {
+                    layer_index: layer.index,
+                    reference: *raw_index,
+                })?;
+            let source_layer =
+                self.network.layers.get(source_index).ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "missing source layer #{source_index} for shortcut layer #{}",
+                        layer.index
+                    ))
+                })?;
+            if source_layer.output_shape.batch != layer.output_shape.batch {
+                return Err(Error::InvalidConfig(format!(
+                    "shortcut layer #{} mixes incompatible batch shapes {} and {}",
+                    layer.index, layer.output_shape, source_layer.output_shape
+                )));
+            }
+            // Darknet resizes a mismatched source flat per sample
+            // (crop / zero-pad), then adds it.
+            let fitted;
+            let source = if source_layer.output_shape != layer.output_shape {
+                fitted = self
+                    .backend
+                    .shortcut_fit_f32(
+                        source,
+                        layer.output_shape.batch,
+                        &tensor_backend_shape(layer.output_shape),
+                        launch_config,
+                    )
+                    .map_err(|err| backend_error("shortcut resize source", err))?;
+                &fitted
+            } else {
+                source
+            };
+            accumulated = self
+                .backend
+                .shortcut_add_f32(&accumulated, source, launch_config)
+                .map_err(|err| backend_error("shortcut add", err))?;
+        }
+
+        let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+        let output = self
+            .backend
+            .activation_f32(&accumulated, activation, launch_config)
+            .map_err(|err| backend_error("shortcut activation", err))?;
+        Ok(output)
+    }
 }

@@ -216,46 +216,13 @@ where
                 (LayerKind::Route(spec), LayerParams::None) => {
                     self.forward_route_compact_gpu(layer, spec, &gpu_layer_outputs, launch_config)?
                 }
-                (LayerKind::LayaMarkerGather(spec), LayerParams::None) => {
-                    let a_index = resolve_relative_layer(layer.index, spec.layers[0])?;
-                    let b_index = resolve_relative_layer(layer.index, spec.layers[1])?;
-                    let a_layer = self.network.layers.get(a_index).ok_or_else(|| {
-                        Error::InvalidConfig(format!(
-                            "missing source layer #{a_index} for [laya_marker_gather] layer #{}",
-                            layer.index
-                        ))
-                    })?;
-                    let b_layer = self.network.layers.get(b_index).ok_or_else(|| {
-                        Error::InvalidConfig(format!(
-                            "missing source layer #{b_index} for [laya_marker_gather] layer #{}",
-                            layer.index
-                        ))
-                    })?;
-                    let a_source = gpu_layer_outputs
-                        .get(a_index)
-                        .and_then(Option::as_ref)
-                        .ok_or(Error::InvalidRoute {
-                            layer_index: layer.index,
-                            reference: spec.layers[0],
-                        })?;
-                    let b_source = gpu_layer_outputs
-                        .get(b_index)
-                        .and_then(Option::as_ref)
-                        .ok_or(Error::InvalidRoute {
-                            layer_index: layer.index,
-                            reference: spec.layers[1],
-                        })?;
-                    self.backend
-                        .marker_gather_f32(
-                            a_source,
-                            b_source,
-                            &tensor_backend_shape(a_layer.output_shape),
-                            &tensor_backend_shape(b_layer.output_shape),
-                            spec.max_options,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("GPU laya_marker_gather", err))?
-                }
+                (LayerKind::LayaMarkerGather(spec), LayerParams::None) => self
+                    .forward_laya_marker_gather_compact_gpu(
+                        layer,
+                        spec,
+                        &gpu_layer_outputs,
+                        launch_config,
+                    )?,
                 (LayerKind::LayaHead(spec), LayerParams::LayaHead(weights)) => {
                     laya_head_gpu::forward(
                         &self.backend,
@@ -289,186 +256,35 @@ where
                         launch_config,
                     )?
                 }
-                (LayerKind::LayaActHead(spec), LayerParams::LayaActHead(weights)) => {
-                    let head_index = resolve_relative_layer(layer.index, spec.layers[0])?;
-                    let scorer_index = resolve_relative_layer(layer.index, spec.layers[1])?;
-                    let marker_index = resolve_relative_layer(layer.index, spec.layers[2])?;
-                    let head_layer = self.network.layers.get(head_index).ok_or_else(|| {
-                        Error::InvalidConfig(format!(
-                            "missing source layer #{head_index} for [laya_act_head] layer #{}",
-                            layer.index
-                        ))
-                    })?;
-                    let scorer_layer = self.network.layers.get(scorer_index).ok_or_else(|| {
-                        Error::InvalidConfig(format!(
-                            "missing source layer #{scorer_index} for [laya_act_head] layer #{}",
-                            layer.index
-                        ))
-                    })?;
-                    let marker_layer = self.network.layers.get(marker_index).ok_or_else(|| {
-                        Error::InvalidConfig(format!(
-                            "missing source layer #{marker_index} for [laya_act_head] layer #{}",
-                            layer.index
-                        ))
-                    })?;
-                    let head_source = gpu_layer_outputs
-                        .get(head_index)
-                        .and_then(Option::as_ref)
-                        .ok_or(Error::InvalidRoute {
-                            layer_index: layer.index,
-                            reference: spec.layers[0],
-                        })?;
-                    let scorer_source = gpu_layer_outputs
-                        .get(scorer_index)
-                        .and_then(Option::as_ref)
-                        .ok_or(Error::InvalidRoute {
-                            layer_index: layer.index,
-                            reference: spec.layers[1],
-                        })?;
-                    let marker_source = gpu_layer_outputs
-                        .get(marker_index)
-                        .and_then(Option::as_ref)
-                        .ok_or(Error::InvalidRoute {
-                            layer_index: layer.index,
-                            reference: spec.layers[2],
-                        })?;
-                    laya_act_gpu::forward(
-                        &self.backend,
+                (LayerKind::LayaActHead(spec), LayerParams::LayaActHead(weights)) => self
+                    .forward_laya_act_head_compact_gpu(
+                        layer,
                         spec,
                         weights,
-                        [head_source, scorer_source, marker_source],
-                        [
-                            head_layer.output_shape,
-                            scorer_layer.output_shape,
-                            marker_layer.output_shape,
-                        ],
+                        &gpu_layer_outputs,
                         launch_config,
-                    )?
-                }
-                (LayerKind::Shortcut(spec), LayerParams::None) => {
-                    let mut accumulated = current_input
-                        .expect("shortcut requires current input")
-                        .clone();
-                    for raw_index in &spec.from {
-                        let source_index = resolve_relative_layer(layer.index, *raw_index)?;
-                        let source = gpu_layer_outputs
-                            .get(source_index)
-                            .and_then(Option::as_ref)
-                            .ok_or(Error::InvalidRoute {
-                                layer_index: layer.index,
-                                reference: *raw_index,
-                            })?;
-                        let source_layer =
-                            self.network.layers.get(source_index).ok_or_else(|| {
-                                Error::InvalidConfig(format!(
-                                    "missing source layer #{source_index} for shortcut layer #{}",
-                                    layer.index
-                                ))
-                            })?;
-                        if source_layer.output_shape.batch != layer.output_shape.batch {
-                            return Err(Error::InvalidConfig(format!(
-                                "shortcut layer #{} mixes incompatible batch shapes {} and {}",
-                                layer.index, layer.output_shape, source_layer.output_shape
-                            )));
-                        }
-                        // Darknet resizes a mismatched source flat per sample
-                        // (crop / zero-pad), then adds it.
-                        let fitted;
-                        let source = if source_layer.output_shape != layer.output_shape {
-                            fitted = self
-                                .backend
-                                .shortcut_fit_f32(
-                                    source,
-                                    layer.output_shape.batch,
-                                    &tensor_backend_shape(layer.output_shape),
-                                    launch_config,
-                                )
-                                .map_err(|err| backend_error("shortcut resize source", err))?;
-                            &fitted
-                        } else {
-                            source
-                        };
-                        accumulated = self
-                            .backend
-                            .shortcut_add_f32(&accumulated, source, launch_config)
-                            .map_err(|err| backend_error("shortcut add", err))?;
-                    }
-
-                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
-                    self.backend
-                        .activation_f32(&accumulated, activation, launch_config)
-                        .map_err(|err| backend_error("shortcut activation", err))?
-                }
-                (LayerKind::Upsample(spec), LayerParams::None) => self
-                    .backend
-                    .upsample_f32(
-                        current_input.expect("upsample requires current input"),
-                        &tensor_backend_shape(layer.output_shape),
-                        layer.input_shape.channels,
-                        layer.input_shape.height,
-                        layer.input_shape.width,
-                        spec.stride.unsigned_abs(),
-                        spec.scale,
-                        spec.reverse,
+                    )?,
+                (LayerKind::Shortcut(spec), LayerParams::None) => self
+                    .forward_shortcut_compact_gpu(
+                        layer,
+                        spec,
+                        &gpu_layer_outputs,
+                        current_input.expect("shortcut requires current input"),
                         launch_config,
-                    )
-                    .map_err(|err| backend_error("upsample", err))?,
-                (LayerKind::Sam(spec), LayerParams::None) => {
-                    let source_index = resolve_relative_layer(layer.index, spec.from)?;
-                    let source_layer =
-                        self.network
-                            .layers
-                            .get(source_index)
-                            .ok_or(Error::InvalidRoute {
-                                layer_index: layer.index,
-                                reference: spec.from,
-                            })?;
-                    let source_gpu = gpu_layer_outputs
-                        .get(source_index)
-                        .and_then(Option::as_ref)
-                        .ok_or(Error::InvalidRoute {
-                            layer_index: layer.index,
-                            reference: spec.from,
-                        })?;
-                    if layer.input_shape != layer.output_shape
-                        || source_layer.output_shape != layer.output_shape
-                    {
-                        return Err(Error::InvalidConfig(format!(
-                            "sam shape mismatch: input {}, source {}, output {}",
-                            layer.input_shape, source_layer.output_shape, layer.output_shape
-                        )));
-                    }
-                    let input_gpu = current_input.expect("sam requires current input");
-                    if let Some(activation) = spec.activation.to_cuda_f32_kind() {
-                        let pre_activation = self
-                            .backend
-                            .vector_mul_f32(
-                                input_gpu,
-                                source_gpu,
-                                &tensor_backend_shape(layer.output_shape),
-                                launch_config,
-                            )
-                            .map_err(|err| backend_error("sam multiply", err))?;
-                        self.backend
-                            .activation_f32(&pre_activation, activation, launch_config)
-                            .map_err(|err| backend_error("sam activation", err))?
-                    } else {
-                        let host_input = self
-                            .download_tensor(input_gpu, layer.input_shape)
-                            .map_err(|err| backend_error("download sam input", err))?;
-                        let host_source = self
-                            .download_tensor(source_gpu, source_layer.output_shape)
-                            .map_err(|err| backend_error("download sam source", err))?;
-                        let (host_output, _) =
-                            forward_sam(spec, &host_input, &host_source, layer.output_shape)?;
-                        self.backend
-                            .upload_f32(
-                                &tensor_backend_shape(layer.output_shape),
-                                &host_output.data,
-                            )
-                            .map_err(|err| backend_error("upload sam output", err))?
-                    }
-                }
+                    )?,
+                (LayerKind::Upsample(spec), LayerParams::None) => self.forward_upsample_gpu(
+                    layer,
+                    spec,
+                    current_input.expect("upsample requires current input"),
+                    launch_config,
+                )?,
+                (LayerKind::Sam(spec), LayerParams::None) => self.forward_sam_compact_gpu(
+                    layer,
+                    spec,
+                    &gpu_layer_outputs,
+                    current_input.expect("sam requires current input"),
+                    launch_config,
+                )?,
                 (LayerKind::LayaLoss(spec), LayerParams::None) => self
                     .backend
                     .laya_loss_forward_f32(
