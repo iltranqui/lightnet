@@ -656,7 +656,10 @@ preserves the open Stage-1 multi-template and axis/layout work.
 
 ## Remaining scope
 
-Act-head runtime backward/update/file loading, other LAYA/transformer layers,
+Act-head runtime backward/update/file loading, other LAYA/transformer layers
+(native f32 ViT inference forward landed in v0.2.198, `implemented.md` §262;
+ViT device backward, the compact arm, Swin, Tucker, MambaVision, KimiKda,
+DepthAnything and DptHead remain open),
 CenterNet, modern-YOLO and LayaLoss host-owned head loss/backward (native
 full/compact f32 activation forwards landed unversioned in §§224–228; native
 JevCe loss/delta landed in v0.2.196, §260, and native Segmentation loss/delta in

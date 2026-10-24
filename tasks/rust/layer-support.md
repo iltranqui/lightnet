@@ -66,7 +66,7 @@ with the command given rather than trusting the number.
 | Represented `LayerKind` variants | 65 (+`Unsupported`) |
 | CPU forward arm | 65 |
 | CPU standalone parameter backward | all parameterized kinds; head/pass-through kinds own no standalone backward |
-| CPU-only forward, no GPU path (hard reject) | 9 |
+| CPU-only forward, no GPU path (hard reject) | 7 (`Wmhf`, `Clifford`, `RecursiveBlock`, `DepthAnything`, `DptHead`, `Yolo3d`, `ObbRefine`) plus `Gru` training |
 | GPU forward but CPU/mixed backward | 11 (9 whole-network fallback + HF/FiLM host helpers) |
 | GPU native forward + device backward | 24 |
 | f16 inference | 28 variants (29 section names) |
@@ -149,7 +149,7 @@ with the command given rather than trusting the number.
 
 ## GPU hard rejections (no device path at all)
 
-Eight variants abort before any kernel runs. Source: the explicit rejection
+Seven variants (plus `Gru` training) abort before any kernel runs. Source: the explicit rejection
 paths in `runtime.rs` (including the `Gru` match arm). `DsConv` is no longer a
 f32 hard rejection; compact f16 remains unsupported, and multi-template CPU
 modes remain unsupported.
@@ -250,6 +250,15 @@ Activation coverage is the quiet limiter: `model.rs:367` maps all scalar
 activations, including `Revleaky` (reusing the Leaky f32 op since v0.2.026),
 to device kinds. The `NormalizeChannels*` family uses separate tensor-level
 primitives; unknown `Other` values remain unsupported.
+
+Compact (`forward_compact`) coverage of the transformer family, checked
+2026-10-24: `Vit`, `Swin`, `TuckerAttention`, `MambaVision` and `KimiKda` have
+no compact arm, so compact and f16 inference reject them (`Vit`: "layer #0
+(vit) and parameter set are inconsistent"). `Vit` native inference
+(v0.2.198, `runtime/vit_gpu.rs`) runs only through `forward_with_state` with
+`training=false`; it leaves `vit_cache` empty, so a backward pass needs a
+`forward_training_with_state` forward (host path). `Swin`, `TuckerAttention`,
+`MambaVision` and `KimiKda` are still host round trips in both directions.
 
 `vc_attention` is worse than "forward only": it is host-reference on **all**
 devices and head sizes (no native kernel at all), even though standard
